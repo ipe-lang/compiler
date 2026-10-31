@@ -5672,28 +5672,37 @@ mod tests {
     /// `.md` files under `root` (or `root` itself, when it is already a file),
     /// walked to a depth and count ceiling so a cyclic or runaway tree cannot
     /// hang the scan.
-    fn markdown_files_under(root: &Path) -> Vec<PathBuf> {
+    ///
+    /// A directory or entry the walk cannot read (a missing `root` among them)
+    /// lands in `unread`, never dropped: a scan over the result refuses while
+    /// `unread` is non-empty, so it never certifies a tree it did not read.
+    fn markdown_files_under(root: &Path, unread: &mut Vec<PathBuf>) -> Vec<PathBuf> {
         const MAX_DEPTH: usize = 12;
         const MAX_FILES: usize = 4096;
 
-        fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>, unread: &mut Vec<PathBuf>) {
             assert!(
                 depth <= MAX_DEPTH,
                 "android-build-steps scan: depth ceiling exceeded under {}",
                 dir.display()
             );
             let Ok(entries) = std::fs::read_dir(dir) else {
+                unread.push(dir.to_path_buf());
                 return;
             };
-            for entry in entries.flatten() {
+            for entry in entries {
                 assert!(
                     out.len() <= MAX_FILES,
                     "android-build-steps scan: file-count ceiling exceeded under {}",
                     dir.display()
                 );
+                let Ok(entry) = entry else {
+                    unread.push(dir.to_path_buf());
+                    continue;
+                };
                 let path = entry.path();
                 if path.is_dir() {
-                    walk(&path, depth.saturating_add(1), out);
+                    walk(&path, depth.saturating_add(1), out, unread);
                 } else if path.extension().is_some_and(|ext| ext == "md") {
                     out.push(path);
                 }
@@ -5704,17 +5713,44 @@ mod tests {
             return vec![root.to_path_buf()];
         }
         let mut out = Vec::new();
-        walk(root, 0, &mut out);
+        walk(root, 0, &mut out, unread);
         out
+    }
+
+    /// Each of `files` labelled relative to `repo_root`, with its text; a file
+    /// that cannot be read lands in `unread`, never skipped.
+    fn read_scan_targets(
+        repo_root: &Path,
+        files: Vec<PathBuf>,
+        unread: &mut Vec<PathBuf>,
+    ) -> Vec<(String, String)> {
+        let mut read = Vec::new();
+        for file in files {
+            match std::fs::read_to_string(&file) {
+                Ok(text) => read.push((
+                    file.strip_prefix(repo_root)
+                        .unwrap_or(&file)
+                        .display()
+                        .to_string(),
+                    text,
+                )),
+                Err(_) => unread.push(file),
+            }
+        }
+        read
     }
 
     /// Every file the hand-written-Gradle scan walks: the whole `docs/` tree,
     /// the README, the CLI help pages, and the message catalog — every surface
     /// a build procedure could be hand-copied into.
-    fn gradle_scan_targets(repo_root: &Path, cli_manifest_dir: &Path) -> Vec<PathBuf> {
-        let mut files = markdown_files_under(&repo_root.join("docs"));
+    fn gradle_scan_targets(
+        repo_root: &Path,
+        cli_manifest_dir: &Path,
+        unread: &mut Vec<PathBuf>,
+    ) -> Vec<PathBuf> {
+        let mut files = markdown_files_under(&repo_root.join("docs"), unread);
         files.push(repo_root.join("README.md"));
-        files.extend(markdown_files_under(&cli_manifest_dir.join("help")));
+        files.extend(markdown_files_under(&cli_manifest_dir.join("help"), unread));
         files.push(cli_manifest_dir.join("text/messages.md"));
         files
     }
@@ -5728,18 +5764,13 @@ mod tests {
     fn no_hand_written_gradle_commands() {
         let cli_manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let repo_root = repo_root_for_tests();
+        let mut unread = Vec::new();
+        let targets = gradle_scan_targets(repo_root, cli_manifest_dir, &mut unread);
         let mut hits = Vec::new();
-        for file in gradle_scan_targets(repo_root, cli_manifest_dir) {
-            let Ok(text) = std::fs::read_to_string(&file) else {
-                continue;
-            };
-            let label = file
-                .strip_prefix(repo_root)
-                .unwrap_or(&file)
-                .display()
-                .to_string();
+        for (label, text) in read_scan_targets(repo_root, targets, &mut unread) {
             hits.extend(stray_gradle_lines(&label, &text));
         }
+        assert!(unread.is_empty(), "unread scan targets: {unread:?}");
         assert!(
             hits.is_empty(),
             "hand-written gradlew/gradle-wrapper line(s) outside android-build-steps: {}",
@@ -5791,8 +5822,9 @@ mod tests {
             })
     }
 
-    /// The line that opens `mobile.rs`'s test module.
-    const TEST_MODULE_MARKER: &str = "#[cfg(test)]\nmod tests";
+    /// The lines that open `mobile.rs`'s test module: the whole opener, so a
+    /// sibling `mod tests_*` cannot cut the production part short.
+    const TEST_MODULE_MARKER: &str = "#[cfg(test)]\nmod tests {";
 
     /// The production part of a Rust `source`: the text before its test
     /// module, or `None` when it has none, so the scan fails closed.
@@ -5817,22 +5849,16 @@ mod tests {
     fn no_second_android_api_level_literal() {
         let cli_manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let repo_root = repo_root_for_tests();
-        let mut targets = gradle_scan_targets(repo_root, cli_manifest_dir);
+        let mut unread = Vec::new();
+        let mut targets = gradle_scan_targets(repo_root, cli_manifest_dir, &mut unread);
         targets.push(repo_root.join("src/stdlib/Ipe/Package.ipe"));
         let mut hits = Vec::new();
-        for file in targets {
-            let Ok(text) = std::fs::read_to_string(&file) else {
-                continue;
-            };
-            let label = file
-                .strip_prefix(repo_root)
-                .unwrap_or(&file)
-                .display()
-                .to_string();
+        for (label, text) in read_scan_targets(repo_root, targets, &mut unread) {
             hits.extend(stray_lines(&label, &text, &[STEPS_BLOCK], |line| {
                 names_our_api_level(line) || names_a_literal_sdk_level(line)
             }));
         }
+        assert!(unread.is_empty(), "unread scan targets: {unread:?}");
         let rust =
             stray_rust_sdk_lines("src/ipe-cli/src/pack/mobile.rs", include_str!("mobile.rs"));
         assert!(
@@ -5891,6 +5917,38 @@ mod tests {
             Some(0)
         );
         assert_eq!(stray_rust_sdk_lines("fixture.rs", "fn main() {}\n"), None);
+
+        let sibling = format!(
+            "#[cfg(test)]\nmod tests_support {{}}\nconst X: &str = \"compileSdk {ANDROID_API_LEVEL}\";\n{TEST_MODULE_MARKER}}}\n"
+        );
+        assert_eq!(
+            stray_rust_sdk_lines("fixture.rs", &sibling).map(|hits| hits.len()),
+            Some(1),
+            "a sibling `mod tests_*` does not end the production part"
+        );
+    }
+
+    /// The prose scans refuse a target they cannot read: a missing directory
+    /// and a missing file each land in `unread`, never in an empty, passing scan.
+    #[test]
+    fn scan_targets_record_what_they_cannot_read() {
+        let root = scratch("scan-unread");
+        let missing_dir = root.join("no-such-docs");
+        let mut unread = Vec::new();
+        assert!(markdown_files_under(&missing_dir, &mut unread).is_empty());
+        assert_eq!(unread, vec![missing_dir]);
+
+        let present = root.join("present.md");
+        std::fs::write(&present, "API text\n").expect("write the fixture");
+        let missing_file = root.join("absent.md");
+        let mut unread = Vec::new();
+        let read = read_scan_targets(&root, vec![present, missing_file.clone()], &mut unread);
+        assert_eq!(
+            read,
+            vec![("present.md".to_owned(), "API text\n".to_owned())]
+        );
+        assert_eq!(unread, vec![missing_file]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ── Mount base: every shell URL and handler boundary derives from it ──────
