@@ -81,10 +81,18 @@ mod tests {
         assert!(!CLIENT_JS.contains("el[prop] = v !== \"false\""));
     }
 
-    /// The client folds case before it looks a patched name up in the table.
+    /// The client folds case before it looks a patched name up in the table
+    /// and before it mirrors a `value` onto the field.
+    ///
+    /// Red if either reads the patched name unfolded, so `Checked` drives no
+    /// property or `VALUE` no value, where the wasm writer folds both.
     #[test]
     fn client_js_folds_case_before_the_lookup() {
+        assert!(CLIENT_JS.contains("var lk = String(k).toLowerCase();"));
         assert!(CLIENT_JS.contains("__IPE_LIVE_PROPS, lk)"));
+        assert!(CLIENT_JS.contains("? __IPE_LIVE_PROPS[lk] : null;"));
+        assert!(CLIENT_JS.contains("if (lk === \"value\" && (\"value\" in el)) {"));
+        assert!(!CLIENT_JS.contains("if (k === \"value\""));
     }
 
     #[test]

@@ -201,6 +201,29 @@ mod tests {
         assert!(!is_authority_attr("name"));
     }
 
+    /// `client.js` drops a patch's authority attributes on a field the user is
+    /// editing under every ASCII case spelling, as [`is_authority_attr`] does.
+    ///
+    /// Red if the dirty filter compares the patched name before folding it, so
+    /// `Checked` or `VALUE` stomps a field the user holds.
+    #[test]
+    fn client_dirty_filter_folds_the_authority_names() {
+        let fold = "var lk = String(k).toLowerCase();\n        if (dirty && (";
+        let authority = AUTHORITY_ATTRS
+            .iter()
+            .map(|name| format!("lk === \"{name}\""))
+            .collect::<Vec<_>>()
+            .join(" || ");
+        assert!(
+            CLIENT_JS.contains(&format!("{fold}{authority})) {{")),
+            "client.js filters the folded names of AUTHORITY_ATTRS"
+        );
+        assert!(
+            !CLIENT_JS.contains("if (dirty && (k === "),
+            "client.js filters a dirty field's names unfolded"
+        );
+    }
+
     /// `client.js` splices the same fields and keeps the same authority
     /// attributes when it keeps a live field across its swap.
     #[test]

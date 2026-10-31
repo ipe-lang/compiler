@@ -12,6 +12,8 @@
  *      render drops its `selected` attribute.
  *   3. Presence — a set attribute turns its property on whatever its text,
  *      `"false"` included, as first paint renders it.
+ *   4. Dirty field — a field the user is editing keeps its value and checked
+ *      state against every case spelling of the server's proposal.
  *
  * The patches frames are dispatched on the client's own `EventSource`, diffed
  * from the epoch on screen, onto controls added to the app's root.
@@ -115,6 +117,38 @@ test("checkbox: a set attribute checks whatever its text, as first paint does", 
   await expect(box).toBeChecked();
   await pushPatches(page, [{ id: "e2e-text", attrs: { Checked: null } }]);
   await expect(box).not.toBeChecked();
+  expect(errors.map(String)).toEqual([]);
+});
+
+test("dirty field: no case spelling of an authority attribute stomps the field the user holds", async ({
+  page,
+}) => {
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e));
+  await load(page);
+  await addToRoot(
+    page,
+    '<input type="checkbox" id="ipe-e2e-held" ipe-id="e2e-held">' +
+      '<input type="text" id="ipe-e2e-typed" ipe-id="e2e-typed">',
+  );
+  const box = page.locator("#ipe-e2e-held");
+  const text = page.locator("#ipe-e2e-typed");
+  // A focused field is one the user is editing: the server's proposed
+  // value/checked/selected is dropped under every spelling.
+  await box.focus();
+  await pushPatches(page, [{ id: "e2e-held", attrs: { Checked: "", CHECKED: "" } }]);
+  await expect(box).not.toBeChecked();
+  expect(await box.evaluate((el) => el.hasAttribute("checked"))).toBe(false);
+  await text.focus();
+  await text.evaluate((el) => {
+    el.value = "typed";
+  });
+  await pushPatches(page, [{ id: "e2e-typed", attrs: { VALUE: "server", Value: "server" } }]);
+  expect(await text.evaluate((el) => [el.value, el.hasAttribute("value")])).toEqual(["typed", false]);
+  // Once the user leaves, the folded name drives the field again.
+  await text.blur();
+  await pushPatches(page, [{ id: "e2e-held", attrs: { Checked: "" } }]);
+  await expect(box).toBeChecked();
   expect(errors.map(String)).toEqual([]);
 });
 

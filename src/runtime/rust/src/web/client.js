@@ -1928,10 +1928,12 @@ function __ipeApplyPatches(patches) {
         // field, so the server's proposed value/checked/selected
         // would stomp in-flight keystrokes. Drop them and let the
         // next event round-trip settle the state.
-        if (dirty && (k === "value" || k === "checked" || k === "selected")) {
+        // Names fold ASCII case here as in the DOM, so no spelling of an
+        // authority attribute slips past the filter.
+        var lk = String(k).toLowerCase();
+        if (dirty && (lk === "value" || lk === "checked" || lk === "selected")) {
           continue;
         }
-        var lk = String(k).toLowerCase();
         var prop = Object.prototype.hasOwnProperty.call(__IPE_LIVE_PROPS, lk)
             ? __IPE_LIVE_PROPS[lk] : null;
         // A removal crosses as null; a set as a string, the empty string
@@ -1944,7 +1946,7 @@ function __ipeApplyPatches(patches) {
         } else {
           __ipeNode.setAttr(el, k, v);
           // Sync DOM properties that don't reflect from attrs.
-          if (k === "value" && ("value" in el)) {
+          if (lk === "value" && ("value" in el)) {
             el.value = v;
             valueChanged = true;
           }
