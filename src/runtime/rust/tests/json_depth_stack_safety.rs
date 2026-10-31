@@ -698,9 +698,9 @@ const ALLOWED_SITES: &[(&str, &str, Stack, &str)] = &[
     ),
     (
         "js_port.rs",
-        "native::js_open_session",
+        "native::open_session_with_mint",
         Stack::OneLevel,
-        "reads one reply's fields",
+        "looks up one session stream",
     ),
     (
         "js_port.rs",

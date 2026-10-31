@@ -744,11 +744,11 @@ mod native {
     ///
     /// Semantics:
     ///
-    /// 1. Refuse with `Unavailable` when the owning session already holds
-    ///    [`MAX_OUTSTANDING`] waiters (bounded; it frees as replies arrive).
-    /// 2. Mint a fresh [`PortToken`] for this request. A failed draw, or one
-    ///    that collides with a live waiter, refuses with `Unavailable`; there is
-    ///    no fallback id.
+    /// 1. Mint a fresh [`PortToken`] for this request. A failed draw refuses
+    ///    with `Unavailable`; there is no fallback id.
+    /// 2. Under one registry lock, refuse with `Unavailable` when the owning
+    ///    session already holds [`MAX_OUTSTANDING`] waiters (bounded; it frees
+    ///    as replies arrive) or when the token collides with a live waiter.
     /// 3. Register a one-shot waiter under that token in the OWNING session's
     ///    pending map, then send `payload` outbound as
     ///    `{"__ipe_id": "<token>", "payload": <sealed>}`.
@@ -785,17 +785,6 @@ mod native {
     {
         let owner_sid = scope_sid();
         Box::pin(async move {
-            // Refuse when the ceiling is already reached (fail-closed, no panic).
-            {
-                let mut g = lock_sessions();
-                if let Some(ports) = owner_sid.as_ref().and_then(|s| g.get_mut(&s.0))
-                    && ports.pending.len() >= MAX_OUTSTANDING
-                {
-                    return crate::core::IpeResult::Err(IpeError::unavailable(
-                        "js_request: outstanding waiter ceiling reached".to_owned(),
-                    ));
-                }
-            }
             let Ok(token) = mint() else {
                 return crate::core::IpeResult::Err(entropy_refusal("js_request"));
             };
@@ -815,12 +804,18 @@ mod native {
             });
             let encoded = seal_encode(&JsonVal::from_serde(envelope));
 
-            // Register the one-shot waiter; a token already live is refused,
-            // never overwritten.
+            // Register the one-shot waiter. The ceiling is checked under the
+            // same lock that inserts, so concurrent requests cannot overshoot
+            // it; a token already live is refused, never overwritten.
             let (tx, rx) = oneshot::channel::<JsonVal>();
             if let Some(sid) = &owner_sid {
                 let mut g = lock_sessions();
                 let ports = g.entry(sid.0.clone()).or_insert_with(SessionPorts::new);
+                if ports.pending.len() >= MAX_OUTSTANDING {
+                    return crate::core::IpeResult::Err(IpeError::unavailable(
+                        "js_request: outstanding waiter ceiling reached".to_owned(),
+                    ));
+                }
                 match ports.pending.entry(token) {
                     Entry::Occupied(_) => {
                         return crate::core::IpeResult::Err(entropy_refusal("js_request"));
@@ -897,11 +892,25 @@ mod native {
     /// `js_session_frames`); it fixes the frame type at the type level.
     pub fn js_open_session<T, F>(
         open_cmd: T,
-        _decoder: Decoder<IpeError, F>,
+        decoder: Decoder<IpeError, F>,
     ) -> crate::core::IpeTask<IpeError, i64>
     where
         T: serde::Serialize + Send + 'static,
         F: Send + 'static,
+    {
+        open_session_with_mint(open_cmd, decoder, PortToken::mint)
+    }
+
+    /// [`js_open_session`] with its token drawn through `mint`.
+    pub(crate) fn open_session_with_mint<T, F, M>(
+        open_cmd: T,
+        _decoder: Decoder<IpeError, F>,
+        mint: M,
+    ) -> crate::core::IpeTask<IpeError, i64>
+    where
+        T: serde::Serialize + Send + 'static,
+        F: Send + 'static,
+        M: FnOnce() -> Result<PortToken, EntropyError> + Send + 'static,
     {
         let owner_sid = scope_sid();
         Box::pin(async move {
@@ -910,7 +919,7 @@ mod native {
                     "js_open_session: no session in scope".to_string().into(),
                 );
             };
-            let Ok(token) = PortToken::mint() else {
+            let Ok(token) = mint() else {
                 return crate::core::IpeResult::Err(entropy_refusal("js_open_session"));
             };
             // Refuse at the ceiling (fail-closed, no panic).
@@ -1172,7 +1181,7 @@ pub use native::{
 // Consumed only by the `web`-gated `per_session` test submodule below; gate the
 // re-export to match so a `db`-without-`web` test build has no unused import.
 #[cfg(all(not(target_arch = "wasm32"), test, feature = "web"))]
-pub(crate) use native::{SessionPorts, lock_sessions, request_with_mint};
+pub(crate) use native::{SessionPorts, lock_sessions, open_session_with_mint, request_with_mint};
 
 // ─── Wasm (browser) transport ──────────────────────────────────────────────
 //
@@ -3282,6 +3291,91 @@ mod tests {
             );
             session_close(&sid);
             session_close(&other);
+        }
+
+        // A minted token that is already live refuses the new request and
+        // leaves the live waiter in place: no overwrite, no eviction.
+        #[tokio::test]
+        async fn colliding_request_token_evicts_no_waiter() {
+            tokio::time::pause();
+            let sid = test_sid("8c9d0e1f2a3b8c9d0e1f2a3b8c9d0e1f");
+            session_open(&sid);
+            let Some(token) = PortToken::parse(super::UNMINTED_TOKEN) else {
+                return;
+            };
+            let (tx, mut rx) = tokio::sync::oneshot::channel::<JsonVal>();
+            lock_sessions()
+                .entry(sid.0.clone())
+                .or_insert_with(SessionPorts::new)
+                .pending
+                .insert(token, tx);
+            let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen2 = seen.clone();
+            register_out_sink_for(
+                &sid,
+                Arc::new(move |s: &str| {
+                    seen2
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(s.to_string());
+                }),
+            );
+            let result = with_session(&SessionScope::new(sid.to_string()), || {
+                request_with_mint::<i64, i64, _>(0_i64, int_decoder(), move || Ok(token))
+            })
+            .await;
+            assert!(
+                matches!(&result, crate::IpeResult::Err(e) if *e == IpeError::unavailable(
+                    format!("js_request: {EntropyError}")
+                )),
+                "a colliding token is Unavailable, got {result:?}"
+            );
+            assert!(
+                seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+                "a colliding request sends nothing"
+            );
+            assert!(
+                matches!(
+                    rx.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ),
+                "the live waiter keeps its sender"
+            );
+            assert!(is_pending(&sid, super::UNMINTED_TOKEN));
+            session_close(&sid);
+        }
+
+        // A minted session token that is already live refuses the new open
+        // and leaves the live stream, and its handle, in place.
+        #[tokio::test]
+        async fn colliding_session_token_evicts_no_stream() {
+            let sid = test_sid("9d0e1f2a3b4c9d0e1f2a3b4c9d0e1f2a");
+            session_open(&sid);
+            let (handle, token, out) = open_session_capturing(&sid).await;
+            out.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            let Some(live) = PortToken::parse(&token) else {
+                return;
+            };
+            let result = with_session(&SessionScope::new(sid.to_string()), || {
+                open_session_with_mint::<i64, i64, _>(0_i64, int_decoder(), move || Ok(live))
+            })
+            .await;
+            assert!(
+                matches!(&result, crate::IpeResult::Err(e) if *e == IpeError::unavailable(
+                    format!("js_open_session: {EntropyError}")
+                )),
+                "a colliding session token is Unavailable, got {result:?}"
+            );
+            assert!(
+                out.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+                "a colliding open sends nothing"
+            );
+            assert_eq!(
+                wire_token_of(&sid, handle),
+                token,
+                "the live stream keeps its handle"
+            );
+            session_close(&sid);
         }
 
         // A negative handle never wraps onto a stream: the drain is inert, the
