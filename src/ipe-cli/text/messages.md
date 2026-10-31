@@ -1032,7 +1032,7 @@ ipe.lock: package `{package}` is an index dependency but records a `local` rev �
 
 ## lock-remedy
 
-restore ipe.lock from version control, or delete it and re-run `ipe add` for each dependency
+restore ipe.lock from version control, or delete it and run `ipe add <package>@<requirement>` for each dependency, with the requirement package.ipe declares for it
 
 ## lock-unrecognised-line
 
@@ -1057,6 +1057,10 @@ ipe.lock line {line}: field `{key}` appears twice in one `[[package]]` — {reme
 ## lock-duplicate-package
 
 ipe.lock line {line}: package `{package}` is locked twice — {remedy}
+
+## lock-hidden-character
+
+ipe.lock line {line}: character {column} of the comment is U+{code}, a control or invisible character a viewer shows differently from what ipe reads — {remedy}
 
 ## lock-unrecordable-local-source
 

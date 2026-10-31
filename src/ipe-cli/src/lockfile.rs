@@ -20,6 +20,8 @@
 
 use std::path::{Path, PathBuf};
 
+use ipe_diagnostics::terminal::DisplayHazard;
+
 use crate::CliError;
 use crate::index::{PinnedRev, RemotePath, Sha256Hex, SourceUrl};
 use crate::package_name::PackageName;
@@ -121,10 +123,24 @@ pub enum LockRefusal {
         /// The package locked twice.
         package: PackageName,
     },
+    /// A comment holding a control, bidi, or invisible character.
+    ///
+    /// A viewer draws such a comment as other lines or reordered text while the
+    /// reader ignores it, so a shown lockfile could differ from the read one.
+    HiddenCharacter {
+        /// Where the comment sits.
+        line: LockLine,
+        /// The first hazardous character and its position in the line.
+        hazard: DisplayHazard,
+    },
 }
 
 /// The longest unknown key a refusal echoes, in characters.
 const MAX_KEY_ECHO: usize = 64;
+
+/// The blanks a line may carry around its content: space, tab, and the `\r` a
+/// final CRLF-less line keeps.
+const LINE_BLANKS: [char; 3] = [' ', '\t', '\r'];
 
 /// The header opening one `[[package]]` record.
 const PACKAGE_HEADER: &str = "[[package]]";
@@ -268,6 +284,12 @@ impl std::fmt::Display for LockRefusal {
             Self::DuplicatePackage { line, package } => {
                 crate::text::lock_duplicate_package(line, package, &crate::text::lock_remedy())
             }
+            Self::HiddenCharacter { line, hazard } => crate::text::lock_hidden_character(
+                line,
+                &hazard.position(),
+                &format!("{:04X}", u32::from(hazard.ch())),
+                &crate::text::lock_remedy(),
+            ),
         })
     }
 }
@@ -480,7 +502,8 @@ impl Lockfile {
     /// [`CliError::VersionRefused`] if a `version` is malformed or carries build
     /// metadata; [`CliError::LockRefused`] if a line is outside the lockfile
     /// grammar, a key is unknown, repeated, or outside a record, a package is
-    /// locked twice, a field is missing, a `kind` is unrecognised, or
+    /// locked twice, a comment holds a control or invisible character, a field
+    /// is missing, a `kind` is unrecognised, or
     /// `source`/`rev`/`kind` pair impossibly;
     /// [`CliError::Resolve`] if a name, source URL, rev, or sha256 is malformed.
     pub fn read(project_root: &Path) -> Result<Self, CliError> {
@@ -596,9 +619,20 @@ enum LockLineKind<'a> {
 }
 
 /// Classify one line, refusing every shape the grammar does not admit.
+///
+/// Only [`LINE_BLANKS`] are trimmed, so a Unicode separator or format character
+/// around a header or a field is part of the line and refused with it. A
+/// comment is read by no one but a viewer, so it is refused when it holds a
+/// display hazard.
 fn classify(line: LockLine, raw: &str) -> Result<LockLineKind<'_>, LockRefusal> {
-    let text = raw.trim();
-    if text.is_empty() || text.starts_with('#') {
+    let text = raw.trim_matches(LINE_BLANKS);
+    if text.is_empty() {
+        return Ok(LockLineKind::Ignorable);
+    }
+    if text.starts_with('#') {
+        if let Some(hazard) = DisplayHazard::find(text) {
+            return Err(LockRefusal::HiddenCharacter { line, hazard });
+        }
         return Ok(LockLineKind::Ignorable);
     }
     if text == PACKAGE_HEADER {
@@ -610,7 +644,7 @@ fn classify(line: LockLine, raw: &str) -> Result<LockLineKind<'_>, LockRefusal> 
     let Some((raw_key, raw_value)) = text.split_once('=') else {
         return Err(LockRefusal::UnrecognisedLine { line });
     };
-    let raw_key = raw_key.trim();
+    let raw_key = raw_key.trim_matches(LINE_BLANKS);
     let Some(key) = LockKey::parse(raw_key) else {
         return Err(LockRefusal::UnknownKey {
             line,
@@ -618,7 +652,7 @@ fn classify(line: LockLine, raw: &str) -> Result<LockLineKind<'_>, LockRefusal> 
         });
     };
     let value = raw_value
-        .trim()
+        .trim_matches(LINE_BLANKS)
         .strip_prefix('"')
         .and_then(|v| v.strip_suffix('"'))
         .filter(|v| !v.contains('"'))
@@ -1552,5 +1586,102 @@ mod tests {
             );
         }
         assert_eq!(Lockfile::from_text(&text).expect("reads back"), lock);
+    }
+
+    #[test]
+    fn a_comment_with_a_hidden_character_is_refused() {
+        // ESC sequences that erase the line above, a bare CR that overwrites the
+        // comment, a bidi override, a line separator, a zero-width space, a BOM.
+        for hazard in [
+            "\u{1b}[1A\u{1b}[2K",
+            "\rsha256 = \"0\"",
+            "\u{202E}",
+            "\u{2028}",
+            "\u{200B}",
+            "\u{FEFF}",
+            "\t",
+        ] {
+            let text = format!("{}# note{hazard}end\n", record("mylib"));
+            let refused = refusal_of(&text);
+            assert!(
+                matches!(&refused, Some(LockRefusal::HiddenCharacter { line, hazard: found })
+                    if *line == LockLine(8)
+                        && found.position() == 7
+                        && hazard.starts_with(found.ch())),
+                "{hazard:?}: {refused:?}"
+            );
+        }
+        let plain = format!("{}# note — end\n", record("mylib"));
+        assert_eq!(
+            Lockfile::from_text(&plain)
+                .expect("a plain comment reads")
+                .packages()
+                .len(),
+            1
+        );
+        let shown = Lockfile::from_text(&format!("# a\u{1b}]0;x\u{7}b\n{}", record("mylib")))
+            .unwrap_err()
+            .to_string();
+        assert!(!shown.contains('\u{1b}'), "{shown:?}");
+        assert!(
+            shown.contains("line 1") && shown.contains("U+001B"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_unicode_blank_around_a_line_is_part_of_the_line() {
+        for blank in ["\u{2028}", "\u{3000}", "\u{85}", "\u{FEFF}"] {
+            let header = format!("{blank}{}", record("mylib"));
+            assert_eq!(
+                refusal_of(&header),
+                Some(LockRefusal::UnrecognisedLine { line: LockLine(1) }),
+                "{blank:?}"
+            );
+            let value =
+                record("mylib").replace("kind = \"index\"", &format!("kind = \"index\"{blank}"));
+            assert_eq!(
+                refusal_of(&value),
+                Some(LockRefusal::MalformedValue {
+                    line: LockLine(7),
+                    key: LockKey::Kind,
+                }),
+                "{blank:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn crlf_line_endings_and_ascii_blanks_read_as_written() {
+        let mut lock = Lockfile::default();
+        lock.upsert(dep("http-extras", "1.2.0"));
+        lock.upsert(path_dep("mylocal"));
+        let crlf = lock.render().replace('\n', "\r\n");
+        assert_eq!(Lockfile::from_text(&crlf).expect("CRLF reads"), lock);
+        let unterminated = crlf.strip_suffix('\n').expect("written text ends a line");
+        assert_eq!(
+            Lockfile::from_text(unterminated).expect("a final CR reads"),
+            lock
+        );
+        let spaced = lock
+            .render()
+            .replace(" = ", " \t=\t ")
+            .replace('\n', " \t\n");
+        assert_eq!(
+            Lockfile::from_text(&spaced).expect("ASCII blanks read"),
+            lock
+        );
+    }
+
+    #[test]
+    fn the_remedy_keeps_each_declared_requirement() {
+        let shown = Lockfile::from_text("not valid ipe.lock")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            shown.contains("`ipe add <package>@<requirement>`")
+                && shown.contains("the requirement package.ipe declares"),
+            "a bare `ipe add <package>` would widen the manifest requirement to `*`: {shown}"
+        );
     }
 }

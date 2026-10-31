@@ -1120,6 +1120,8 @@ messages! {
     lock_duplicate_key(line, key, remedy) = "lock-duplicate-key";
     /// An `ipe.lock` package locked by two records.
     lock_duplicate_package(line, package, remedy) = "lock-duplicate-package";
+    /// An `ipe.lock` comment holding a control or invisible character.
+    lock_hidden_character(line, column, code, remedy) = "lock-hidden-character";
     /// A path dependency's `source` cannot be recorded in `ipe.lock`.
     lock_unrecordable_local_source(package, max, raw) = "lock-unrecordable-local-source";
     /// A path dependency names a network share or device.
