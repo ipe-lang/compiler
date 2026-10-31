@@ -1,53 +1,36 @@
-//! Regression guard for the SEAL run-output binary-isolation invariant.
+//! Regression guard for the no-explicit-bin-table invariant the backend SEAL
+//! run-output migration depends on.
 //!
-//! A SEAL test that RUNS an emitted binary and asserts its stdout/exit MUST
-//! execute a binary at a path no concurrent test can write. Every emitted crate
-//! builds a fixed-name `ipe-app`, so the shared warm target
-//! (`IPE_ORACLE_SHARED_TARGET`) holds a single `debug/ipe-app` that parallel
-//! nextest clobbers — a run-output test resolving to the shared target can read a
-//! sibling's binary (a false red, or the worse false green that masks an emit
-//! bug). `seal_e2e::emitted_run_target_dir` therefore ALWAYS returns the isolated
-//! per-slot `out/target`, never the shared path, and consults no environment at
-//! all. This test pins both facts structurally — no env mutation, so it is
-//! deterministic under parallel nextest — so a future edit rerouting the
-//! run-output helper onto the shared warm target breaks the build here, not just
-//! a clobbered assertion two steps downstream.
+//! A SEAL test that RUNS an emitted binary and asserts its stdout/exit now
+//! builds through `seal_e2e::build_and_run_emitted`, which shares the warm
+//! target across goldens by renaming EACH emitted crate's `[package] name`
+//! uniquely before building (`e2e_support::build_and_run_rust`). That rename
+//! only prevents one golden's binary from clobbering another's because the
+//! base emit template (`templates/Cargo.toml`) declares no explicit `[[bin]]`
+//! table and no `autobins = false` — cargo's own default ties the binary's
+//! name to `[package] name`, so renaming the package also renames the
+//! resulting binary artifact. A future template edit that adds an explicit
+//! `[[bin]]` (fixing the binary name independent of the package) would
+//! silently reopen the exact shared-target clobber hazard the migration
+//! closed; this test pins the fact structurally so that edit breaks the build
+//! here, not a run-output assertion two steps downstream.
 
-use std::path::Path;
-
-mod seal_e2e;
-
-/// The run-output target is the isolated per-slot `out/target`, and never any
-/// path an ambient shared warm target could name.
+/// The native emit template declares no `[[bin]]` table and no
+/// `autobins = false` — the binary name follows `[package] name`, which is
+/// what lets a per-golden package rename double as a per-golden binary
+/// rename under the shared warm target.
 #[test]
-fn run_target_is_isolated_never_shared() {
-    // The helper is a pure function of `out_dir`: it must return the isolated
-    // per-slot `out/target` regardless of any ambient `IPE_ORACLE_SHARED_TARGET`.
-    // Asserted for several distinct slots so the guarantee is the per-slot join,
-    // not a coincidental constant.
-    for slot in [
-        "/tmp/ipe-seal-guard-a",
-        "relative/slot-b",
-        "/var/tmp/slot-c",
-    ] {
-        let out = Path::new(slot);
-        assert_eq!(
-            seal_e2e::emitted_run_target_dir(out),
-            out.join("target"),
-            "run-output target must be the isolated per-slot out/target"
-        );
-    }
-
-    // The build-only helper is the one allowed to follow the shared warm target;
-    // the run-output helper must NOT agree with it whenever a shared path is set.
-    // Compare against a representative absolute shared target: the run-output
-    // path must differ, i.e. it never hands a run-output test the clobberable
-    // shared `debug/ipe-app`.
-    let out = Path::new("/tmp/ipe-seal-guard-shared-slot");
-    let shared = Path::new("/tmp/ipe-oracle-shared-target");
-    assert_ne!(
-        seal_e2e::emitted_run_target_dir(out),
-        shared.to_path_buf(),
-        "run-output target must never resolve to the shared warm target"
+fn base_template_has_no_explicit_bin_table() {
+    let template = include_str!("../templates/Cargo.toml");
+    assert!(
+        !template.contains("[[bin]]"),
+        "an explicit [[bin]] table would fix the binary name independent of \
+         [package] name, reopening the shared-target binary-clobber hazard \
+         the per-golden package rename closes:\n{template}"
+    );
+    assert!(
+        !template.contains("autobins"),
+        "autobins = false would disable the implicit package-name-to-binary-\
+         name convention the per-golden rename relies on:\n{template}"
     );
 }

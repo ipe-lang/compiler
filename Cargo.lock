@@ -1726,6 +1726,7 @@ dependencies = [
  "ipe-test-temp",
  "ipe_env",
  "proc-macro2",
+ "quote",
  "serde_json",
  "syn 3.0.9",
 ]

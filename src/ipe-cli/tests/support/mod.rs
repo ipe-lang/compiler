@@ -609,7 +609,8 @@ pub fn build_and_run_emitted_with_stdin(
         .spawn();
     assert!(
         child.is_ok(),
-        "{golden_name}: failed to spawn `{exe}`: {:?}",
+        "{golden_name}: failed to spawn `{}`: {:?}",
+        exe.display(),
         child.as_ref().err()
     );
     let Ok(mut child) = child else {
@@ -777,13 +778,17 @@ fn poll_exit(
         .map(|status| status.map(|status| (status, None)))
 }
 
-/// Build the emitted project at `emitted_dir` and return its binary path.
+/// Build the emitted project at `emitted_dir` and return the guard holding its
+/// binary; the binary's artifacts go when the guard drops.
 ///
 /// # Panics
 /// Fails the calling test if `cargo build` fails, surfacing cargo's stderr.
 #[must_use]
 #[allow(dead_code)] // only deadline-bounded goldens build once and run many times
-pub fn build_emitted_binary_checked(golden_name: &str, emitted_dir: &Path) -> Option<String> {
+pub fn build_emitted_binary_checked(
+    golden_name: &str,
+    emitted_dir: &Path,
+) -> Option<e2e_support::SharedBuild> {
     let exe = e2e_support::build_rust_binary(golden_name, emitted_dir);
     assert!(
         exe.is_ok(),
@@ -806,7 +811,7 @@ pub fn build_emitted_binary_checked(golden_name: &str, emitted_dir: &Path) -> Op
 #[allow(dead_code)] // only deadline-bounded goldens exercise this helper
 pub fn run_with_stdin_deadline(
     golden_name: &str,
-    exe: &str,
+    exe: &Path,
     stdin_bytes: &[u8],
     deadline: std::time::Duration,
 ) -> TimedRunOutcome {
@@ -817,7 +822,8 @@ pub fn run_with_stdin_deadline(
         .spawn();
     assert!(
         child.is_ok(),
-        "{golden_name}: failed to spawn `{exe}`: {:?}",
+        "{golden_name}: failed to spawn `{}`: {:?}",
+        exe.display(),
         child.as_ref().err()
     );
     let Ok(mut child) = child else {
@@ -862,7 +868,8 @@ pub fn run_with_stdin_deadline(
     });
     assert!(
         polled.is_ok(),
-        "{golden_name}: failed to poll `{exe}`: {:?}",
+        "{golden_name}: failed to poll `{}`: {:?}",
+        exe.display(),
         polled.err()
     );
     assert!(
@@ -1045,7 +1052,8 @@ pub fn build_and_run_emitted_capturing_stderr_with_env(
     let output = Command::new(&exe).envs(env.iter().copied()).output();
     assert!(
         output.is_ok(),
-        "{golden_name}: failed to spawn `{exe}`: {:?}",
+        "{golden_name}: failed to spawn `{}`: {:?}",
+        exe.display(),
         output.as_ref().err()
     );
     let Ok(output) = output else {

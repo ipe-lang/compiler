@@ -1442,24 +1442,23 @@ fn end_to_end_static_binary_is_static_and_runs() {
     )
     .expect("static emit");
 
-    // Standalone cargo build, CWD = emitted crate dir. The target dir forwards
-    // the warm shared target: CI exports only IPE_ORACLE_SHARED_TARGET, so a
-    // plain CARGO_TARGET_DIR read would miss it and cold-build the whole dep
-    // tree. `child_shared_target_from_env` resolves that variable (else an
-    // ambient CARGO_TARGET_DIR a local lane set), falling back to an isolated
-    // dir inside the crate so a bare runner stays hermetic.
-    let target_dir = e2e_support::child_shared_target_from_env()
-        .map_or_else(|| out.join("target"), PathBuf::from);
-    let status = std::process::Command::new("cargo")
+    // Standalone cargo build, CWD = emitted crate dir, for a foreign musl
+    // triple: its dependency tree is not the shared target's, so this build
+    // gets its own private tree.
+    let isolated =
+        e2e_support::target::isolated(e2e_support::target::IsolationReason::ForeignTriple)
+            .expect("isolated build target");
+    let target = e2e_support::target::BuildTarget::Isolated(isolated);
+    let status = e2e_support::target::cargo_command(&target)
         .arg("build")
         .args(["--target", plan.triple.as_str()])
-        .env("CARGO_TARGET_DIR", &target_dir)
         .current_dir(&out)
         .status()
         .expect("spawn cargo");
     assert!(status.success(), "cargo build --target musl failed (SEAL)");
 
-    let bin = target_dir
+    let bin = target
+        .path()
         .join(plan.triple.as_str())
         .join("debug")
         .join(ipe::emitted_bin_filename(&out).expect("the emitted manifest names its crate"));
@@ -1505,18 +1504,18 @@ fn ipe_run_static_builds_and_executes_a_static_binary() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("static_run_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    // Forward the warm shared target (IPE_ORACLE_SHARED_TARGET in CI, else an
-    // ambient CARGO_TARGET_DIR a local lane set), staying hermetic inside the
-    // scratch dir when neither is present.
-    let target_dir = e2e_support::child_shared_target_from_env()
-        .map_or_else(|| out.join("target"), PathBuf::from);
+    // The static musl build's dependency tree is not the shared target's: an
+    // exclusive private tree.
+    let isolated =
+        e2e_support::target::isolated(e2e_support::target::IsolationReason::ForeignTriple)
+            .expect("isolated build target");
+    let target = e2e_support::target::BuildTarget::Isolated(isolated);
 
-    let run = std::process::Command::new(support::ipe_bin())
+    let run = e2e_support::target::ipe_command(&support::ipe_bin(), &target)
         .args(["dev", "run"])
         .arg(&project)
         .args(["--static", "--out"])
         .arg(&out)
-        .env("CARGO_TARGET_DIR", &target_dir)
         .output()
         .expect("spawn ipe dev run --static");
     assert!(
@@ -1533,7 +1532,8 @@ fn ipe_run_static_builds_and_executes_a_static_binary() {
 
     // The executed artifact must be genuinely static. `--out` names the output
     // root; the emitted crate is its `rust/` area.
-    let bin = target_dir
+    let bin = target
+        .path()
         .join("x86_64-unknown-linux-musl")
         .join("debug")
         .join(

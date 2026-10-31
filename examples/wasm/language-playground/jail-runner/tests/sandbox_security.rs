@@ -241,7 +241,11 @@ fn warm_and_seed(crate_dir: &Path) {
     let warm_target = warm_root().join("target");
     std::fs::create_dir_all(&warm_home).unwrap();
     std::fs::create_dir_all(&warm_target).unwrap();
-    let build = Command::new("cargo")
+    // A dedicated, durable cross-run cache seeded into the jail, not the
+    // e2e-support shared/isolated target (which is torn down per test or
+    // scoped to one run): only the cargo PROGRAM comes from e2e_support, its
+    // own `--target-dir`/`CARGO_HOME` stay hand-managed.
+    let build = Command::new(e2e_support::target::cargo_program())
         .arg("build")
         .arg("--manifest-path")
         .arg(crate_dir.join("Cargo.toml"))

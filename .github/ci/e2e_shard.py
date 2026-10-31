@@ -19,7 +19,10 @@ runs it.
 Modes:
   --plan    write `plan=<JSON {"K": {"filter", "partition"}}>` to $GITHUB_OUTPUT.
   --lint    fail unless the groups are well formed and ci.yml wires the plan,
-            the shards and the cover exactly.
+            the shards and the cover exactly, every `IPE_E2E` step names a
+            workspace shared target, the `e2e` job frees disk, unpacks and
+            deletes the archive and checks the floor before its shard, and
+            every nextest install pins `NEXTEST_VERSION`.
 
 Every failure exits non-zero; an unwritable output or an unexpected shape is a
 failure, never a pass.
@@ -346,7 +349,34 @@ def allocate(specs: tuple[GroupSpec, ...], times: Times, total: int = TOTAL_SHAR
 GROUPS = allocate(SPECS, load_times())
 SHARDS = shard_total(GROUPS)
 
-ARCHIVE_ARGS = ("--archive-file", "nextest.tar.zst", "--workspace-remap", ".", "--profile", "ci")
+ARCHIVE_FILE = "nextest.tar.zst"
+# Where the `e2e` job unpacks the archive before it deletes it. The archive is
+# about 2.1 GB and its unpacked binaries several times that; holding both for
+# the whole shard is the fixed disk cost the shards died of, so the job unpacks
+# once, removes the archive, and runs from the unpacked copy.
+EXTRACT_DIR = "$RUNNER_TEMP/nextest-x"
+EXTRACT_COMMAND = " ".join(
+    (
+        "cargo nextest list --archive-file",
+        ARCHIVE_FILE,
+        "--workspace-remap . --extract-to",
+        f'"{EXTRACT_DIR}"',
+        "--extract-overwrite -E 'none()'",
+    )
+)
+EXTRACT_RUN = f"{EXTRACT_COMMAND}\nrm -- {ARCHIVE_FILE}"
+ARCHIVE_ARGS = (
+    "--binaries-metadata",
+    f'"{EXTRACT_DIR}/target/nextest/binaries-metadata.json"',
+    "--cargo-metadata",
+    f'"{EXTRACT_DIR}/target/nextest/cargo-metadata.json"',
+    "--target-dir-remap",
+    f'"{EXTRACT_DIR}/target"',
+    "--workspace-remap",
+    ".",
+    "--profile",
+    "ci",
+)
 # `--test-threads=2`: each E2E test drives a memory-heavy emitted-project
 # `cargo build` that itself uses every core; two in flight fit the runner.
 # `--no-tests=fail`: a shard whose selection matches nothing is red, never a
@@ -499,6 +529,160 @@ def wiring_errors(workflow: dict, groups: tuple[tuple[str, str, int], ...] = GRO
     return errors
 
 
+# The e2e job's disk floor and census live in `tools/scripts/e2e-disk.py` (a
+# `.github/ci/` tool may not run inside a test job); `--lint` pins its argv,
+# its place in the job, and that its test-thread term equals `TEST_THREADS`.
+DISK_SCRIPT = "tools/scripts/e2e-disk.py"
+DISK_FLOOR_INVOCATION = f"python3 {DISK_SCRIPT} --disk-floor"
+FREE_DISK_MARKER = "sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL"
+DOWNLOAD_ACTION = "actions/download-artifact@"
+# The nextest every workflow installs. `taiki-e/install-action` installs the
+# latest release unless `tool:` names a version, so an unpinned install changes
+# the flags the shard's unpack-then-run relies on under an unchanged workflow.
+NEXTEST_VERSION = "0.9.146"
+NEXTEST_TOOL = f"nextest@{NEXTEST_VERSION}"
+INSTALL_ACTION = "taiki-e/install-action@"
+NEXTEST_INSTALL_REF = "taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661"
+SHARED_TARGET_VAR = "IPE_ORACLE_SHARED_TARGET"
+SHARED_TARGET_PREFIX = "${{ github.workspace }}/"
+
+
+def _env_of(*scopes: object) -> dict[str, object]:
+    merged: dict[str, object] = {}
+    for scope in scopes:
+        env = scope.get("env") if isinstance(scope, dict) else None
+        if isinstance(env, dict):
+            merged.update(env)
+    return merged
+
+
+def _e2e_armed(value: object) -> bool:
+    """Any `IPE_E2E` other than absent, empty or `0` arms the full tier (fail closed)."""
+    return value is not None and str(value).strip() not in ("", "0")
+
+
+def shared_target_errors(workflow: dict) -> list[str]:
+    """Return every step that arms `IPE_E2E` without a workspace-rooted shared target."""
+    jobs = workflow.get("jobs") if isinstance(workflow, dict) else None
+    if not isinstance(jobs, dict):
+        return ["ci.yml has no jobs"]
+    errors: list[str] = []
+    for job_id, job in jobs.items():
+        for i, step in enumerate(_steps(job)):
+            env = _env_of(workflow, job, step)
+            if not _e2e_armed(env.get("IPE_E2E")):
+                continue
+            shared = env.get(SHARED_TARGET_VAR)
+            where = f"job {job_id!r} step {step.get('name', i)!r}"
+            if not isinstance(shared, str) or not shared.startswith(SHARED_TARGET_PREFIX):
+                errors.append(
+                    f"{where}: arms IPE_E2E without {SHARED_TARGET_VAR} under `{SHARED_TARGET_PREFIX}` "
+                    f"(got {shared!r}); its emitted builds would fall back to private targets"
+                )
+            elif ".." in shared[len(SHARED_TARGET_PREFIX) :].split("/"):
+                errors.append(f"{where}: {SHARED_TARGET_VAR} must stay under the workspace, got {shared!r}")
+    return errors
+
+
+def _index(steps: list[dict], pred) -> list[int]:
+    return [i for i, s in enumerate(steps) if pred(s)]
+
+
+def disk_order_errors(workflow: dict) -> list[str]:
+    """Return why the `e2e` job could hold the archive during its run, skip the
+    floor, or run off the declared order free-disk -> download -> unpack -> floor -> shard."""
+    jobs = workflow.get("jobs") if isinstance(workflow, dict) else None
+    job = jobs.get(E2E_JOB) if isinstance(jobs, dict) else None
+    if not isinstance(job, dict):
+        return [f"ci.yml has no `{E2E_JOB}` job"]
+    steps = _steps(job)
+    order = (
+        ("the free-disk step", _index(steps, lambda s: _runs(s, FREE_DISK_MARKER))),
+        ("the archive download", _index(steps, lambda s: str(s.get("uses", "")).startswith(DOWNLOAD_ACTION))),
+        ("the unpack-then-delete step", _index(steps, lambda s: s.get("run", "").strip() == EXTRACT_RUN)),
+        ("the disk floor", _index(steps, lambda s: s.get("run", "").strip() == DISK_FLOOR_INVOCATION)),
+        ("the shard run", _index(steps, lambda s: _runs(s, RUN_COMMAND))),
+    )
+    errors: list[str] = []
+    last = -1
+    for what, idx in order:
+        if len(idx) != 1:
+            errors.append(f"`{E2E_JOB}`: exactly one step must be {what}, found {len(idx)}")
+            continue
+        step = steps[idx[0]]
+        if "if" in step or "continue-on-error" in step:
+            errors.append(f"`{E2E_JOB}`: {what} must carry no `if:` or `continue-on-error`")
+        if idx[0] < last:
+            errors.append(f"`{E2E_JOB}`: {what} runs out of order (free-disk -> download -> unpack -> floor -> shard)")
+        last = max(last, idx[0])
+    extract = order[2][1]
+    shard = order[4][1]
+    if len(extract) == 1 and len(shard) == 1:
+        for step in steps[extract[0] + 1 : shard[0] + 1]:
+            if ARCHIVE_FILE in json.dumps(step):
+                errors.append(f"`{E2E_JOB}`: a step after the unpack still names `{ARCHIVE_FILE}`; the archive must be gone before the shard runs")
+    return errors
+
+
+def nextest_pin_errors(workflows: dict[str, dict]) -> list[str]:
+    """Return every nextest install that does not pin `NEXTEST_VERSION`."""
+    errors: list[str] = []
+    for name, wf in workflows.items():
+        jobs = wf.get("jobs") if isinstance(wf, dict) else None
+        if not isinstance(jobs, dict):
+            continue
+        for job_id, job in jobs.items():
+            for step in _steps(job):
+                uses = str(step.get("uses", ""))
+                if not uses.startswith(INSTALL_ACTION):
+                    continue
+                with_ = step.get("with") if isinstance(step.get("with"), dict) else {}
+                tool = str(with_.get("tool", "nextest" if uses == NEXTEST_INSTALL_REF else ""))
+                tools = [t for t in re.split(r"[\s,]+", tool) if t]
+                for t in tools:
+                    if t.split("@", 1)[0] in ("nextest", "cargo-nextest") and t != NEXTEST_TOOL:
+                        errors.append(f"{name} job {job_id!r}: nextest install must be `tool: {NEXTEST_TOOL}`, got {t!r}")
+    return errors
+
+
+def load_disk_script():
+    """Load `tools/scripts/e2e-disk.py` as a module."""
+    import importlib.util  # noqa: PLC0415
+
+    spec = importlib.util.spec_from_file_location("e2e_disk", os.path.join(REPO, DISK_SCRIPT))
+    if spec is None or spec.loader is None:
+        raise ShardError(f"{DISK_SCRIPT} is unloadable")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def disk_script_errors(load=load_disk_script) -> list[str]:
+    """Return why the disk floor could budget a thread count other than the shard's."""
+    try:
+        disk = load()
+    except Exception as exc:  # noqa: BLE001  # any load failure is a refusal
+        return [f"{DISK_SCRIPT} is unloadable: {exc}"]
+    if getattr(disk, "TEST_THREADS", None) != TEST_THREADS:
+        return [f"{DISK_SCRIPT} budgets TEST_THREADS={getattr(disk, 'TEST_THREADS', None)!r}, the shard runs {TEST_THREADS}"]
+    if getattr(disk, "EXTRACT_DIR", None) != EXTRACT_DIR:
+        return [f"{DISK_SCRIPT} excludes EXTRACT_DIR={getattr(disk, 'EXTRACT_DIR', None)!r}, the job unpacks to {EXTRACT_DIR}"]
+    return []
+
+
+def _load_workflows() -> dict[str, dict]:
+    sys.path.insert(0, HERE)
+    import strict_yaml  # noqa: PLC0415  # PyYAML-backed; only `--lint` needs it
+
+    out: dict[str, dict] = {}
+    wf_dir = os.path.dirname(CI_WORKFLOW)
+    for name in sorted(os.listdir(wf_dir)):
+        if name.endswith((".yml", ".yaml")):
+            with open(os.path.join(wf_dir, name), encoding="utf-8") as fh:
+                out[name] = strict_yaml.safe_load(fh)
+    return out
+
+
 def lint(path: str = CI_WORKFLOW) -> int:
     """Fail unless ci.yml wires the plan, the shards and the cover exactly."""
     sys.path.insert(0, HERE)
@@ -511,6 +695,11 @@ def lint(path: str = CI_WORKFLOW) -> int:
         print(f"e2e shard lint: ci.yml is unreadable: {exc}", file=sys.stderr)
         return 1
     errors = [*group_errors(GROUPS), *wiring_errors(workflow)]
+    errors += shared_target_errors(workflow) + disk_order_errors(workflow) + disk_script_errors()
+    try:
+        errors += nextest_pin_errors(_load_workflows())
+    except Exception as exc:  # noqa: BLE001  # any read or parse failure is a refusal
+        errors.append(f"a workflow is unreadable: {exc}")
     for err in errors:
         print(f"e2e shard lint: {err}", file=sys.stderr)
     if errors:

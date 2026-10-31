@@ -36,7 +36,6 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -78,7 +77,10 @@ main =
 /// # Errors
 ///
 /// Returns an error on any pipeline or Cargo build failure.
-fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<PathBuf, BoxError> {
+fn compile_and_build(
+    test_name: &str,
+    ipe_source: &str,
+) -> Result<e2e_support::SharedBuild, BoxError> {
     compile_and_build_as(
         test_name,
         ipe_source,
@@ -95,7 +97,7 @@ fn compile_and_build_as(
     test_name: &str,
     ipe_source: &str,
     intent: ipe_backend_rust::BuildIntent,
-) -> Result<PathBuf, BoxError> {
+) -> Result<e2e_support::SharedBuild, BoxError> {
     let fixture = ipe::RootFixture::main(ipe_source).map_err(|e| -> BoxError {
         format!("{test_name}: cannot write the fixture: {e}").into()
     })?;
@@ -116,7 +118,7 @@ fn compile_and_build_as(
     let exe = e2e_support::build_rust_binary(test_name, &out_dir)
         .map_err(|e| -> BoxError { format!("{test_name}: cargo build failed: {e}").into() })?;
 
-    Ok(PathBuf::from(exe))
+    Ok(exe)
 }
 
 /// Reserve an ephemeral loopback port by binding then immediately dropping a

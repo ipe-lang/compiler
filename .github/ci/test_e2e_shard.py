@@ -517,9 +517,12 @@ class WiringTest(unittest.TestCase):
     def test_run_command_is_built_from_the_ssot_args(self) -> None:
         self.assertEqual(
             es.RUN_COMMAND,
-            "cargo nextest run --archive-file nextest.tar.zst --workspace-remap . --profile ci"
+            'cargo nextest run --binaries-metadata "$RUNNER_TEMP/nextest-x/target/nextest/binaries-metadata.json"'
+            ' --cargo-metadata "$RUNNER_TEMP/nextest-x/target/nextest/cargo-metadata.json"'
+            ' --target-dir-remap "$RUNNER_TEMP/nextest-x/target" --workspace-remap . --profile ci'
             ' --no-fail-fast --test-threads=2 --no-tests=fail -E "$SHARD_FILTER" --partition "$SHARD_PARTITION"',
         )
+        self.assertNotIn(es.ARCHIVE_FILE, es.RUN_COMMAND)
 
     def test_missing_jobs_refused(self) -> None:
         self.assertTrue(es.wiring_errors({}))
@@ -644,6 +647,210 @@ class WiringTest(unittest.TestCase):
             with self.subTest(need):
                 self.assertTrue(_refused(lambda j, need=need: j["seal-slice-cover"]["needs"].remove(need), f"must need `{need}`"))
         self.assertTrue(_refused(lambda j: j["seal-slice-cover"].update(needs="changes"), "must need `test-prep`"))
+
+
+ed = _load("e2e_disk", os.path.join(REPO, "tools", "scripts", "e2e-disk.py"))
+SHARED = "${{ github.workspace }}/.cache/oracle-shared-target"
+DISK_E2E_STEPS = [
+    {"uses": "actions/checkout@v7"},
+    {"name": "free", "run": es.FREE_DISK_MARKER + "\ndocker image prune -af"},
+    {"uses": "actions/download-artifact@v8", "with": {"name": "nextest-archive"}},
+    {"name": "unpack", "run": es.EXTRACT_RUN},
+    {"name": "floor", "run": es.DISK_FLOOR_INVOCATION},
+    {"name": "shard", "env": {"IPE_E2E": "1", es.SHARED_TARGET_VAR: SHARED, **es.SHARD_ENV}, "run": es.RUN_COMMAND},
+]
+
+
+def _disk_wf(steps: list[dict] | None = None, **jobs: dict) -> dict:
+    return {"jobs": {"e2e": {"steps": copy.deepcopy(DISK_E2E_STEPS if steps is None else steps)}, **jobs}}
+
+
+class SharedTargetLintTest(unittest.TestCase):
+    def test_wired_e2e_job_passes(self) -> None:
+        self.assertEqual(es.shared_target_errors(_disk_wf()), [])
+        self.assertEqual(es.disk_order_errors(_disk_wf()), [])
+
+    def test_lint_refuses_ipe_e2e_step_without_shared_target(self) -> None:
+        shapes = {
+            "matrix step": {"strategy": {"matrix": {"shard": [1, 2]}}, "steps": [{"name": "m", "env": {"IPE_E2E": "1"}, "run": "x"}]},
+            "single-job step": {"steps": [{"name": "s", "env": {"IPE_E2E": "1"}, "run": "x"}]},
+            "job-level env": {"env": {"IPE_E2E": "1"}, "steps": [{"name": "j", "run": "x"}]},
+            "workflow expression": {"steps": [{"name": "e", "env": {"IPE_E2E": "${{ matrix.e2e }}"}, "run": "x"}]},
+        }
+        for what, job in shapes.items():
+            with self.subTest(what):
+                errors = es.shared_target_errors({"jobs": {"other": job}})
+                self.assertTrue(any("without IPE_ORACLE_SHARED_TARGET" in e for e in errors), errors)
+
+    def test_job_level_shared_target_covers_its_steps(self) -> None:
+        job = {"env": {"IPE_E2E": "1", es.SHARED_TARGET_VAR: SHARED}, "steps": [{"name": "j", "run": "x"}]}
+        self.assertEqual(es.shared_target_errors({"jobs": {"other": job}}), [])
+
+    def test_lint_refuses_relative_or_non_workspace_shared_target(self) -> None:
+        for value in (".cache/t", "/tmp/t", "${{ runner.temp }}/t", "${{ github.workspace }}/../t", ""):
+            with self.subTest(value):
+                job = {"steps": [{"name": "s", "env": {"IPE_E2E": "1", es.SHARED_TARGET_VAR: value}, "run": "x"}]}
+                self.assertTrue(es.shared_target_errors({"jobs": {"other": job}}))
+
+    def test_unarmed_step_needs_no_shared_target(self) -> None:
+        for value in ("", "0"):
+            job = {"steps": [{"name": "s", "env": {"IPE_E2E": value}, "run": "x"}]}
+            self.assertEqual(es.shared_target_errors({"jobs": {"other": job}}), [])
+
+
+def _order_refused(mutate, needle: str) -> bool:
+    steps = copy.deepcopy(DISK_E2E_STEPS)
+    mutate(steps)
+    errors = es.disk_order_errors(_disk_wf(steps))
+    return any(needle in e for e in errors)
+
+
+class DiskOrderLintTest(unittest.TestCase):
+    def test_lint_refuses_step_order_drift(self) -> None:
+        self.assertTrue(_order_refused(lambda s: s.insert(5, s.pop(4)) or s.insert(1, s.pop(4)), "out of order"))
+        self.assertTrue(_order_refused(lambda s: s.insert(1, s.pop(2)), "out of order"))
+
+    def test_lint_refuses_a_missing_or_doubled_step(self) -> None:
+        for i, what in ((1, "free-disk"), (3, "unpack-then-delete"), (4, "disk floor")):
+            with self.subTest(what):
+                self.assertTrue(_order_refused(lambda s, i=i: s.pop(i), f"be {('the ' + what)}"))
+        self.assertTrue(_order_refused(lambda s: s.insert(4, dict(s[4])), "found 2"))
+
+    def test_lint_refuses_a_conditional_floor_or_unpack(self) -> None:
+        for i in (3, 4):
+            with self.subTest(i):
+                self.assertTrue(_order_refused(lambda s, i=i: s[i].update({"if": "always()"}), "no `if:`"))
+                self.assertTrue(_order_refused(lambda s, i=i: s[i].update({"continue-on-error": True}), "no `if:`"))
+
+    def test_lint_refuses_archive_kept_during_run(self) -> None:
+        kept = es.EXTRACT_COMMAND
+        self.assertTrue(_order_refused(lambda s: s[3].update(run=kept), "unpack-then-delete"))
+        self.assertTrue(
+            _order_refused(lambda s: s.insert(4, {"name": "again", "uses": "actions/download-artifact@v8"}), "download")
+        )
+        self.assertTrue(_order_refused(lambda s: s.insert(4, {"name": "cp", "run": "cp x nextest.tar.zst"}), "still names"))
+
+    def test_disk_script_drift_refused(self) -> None:
+        class Drift:
+            TEST_THREADS = es.TEST_THREADS + 1
+            EXTRACT_DIR = es.EXTRACT_DIR
+
+        class DriftDir:
+            TEST_THREADS = es.TEST_THREADS
+            EXTRACT_DIR = "/tmp/x"
+
+        self.assertEqual(es.disk_script_errors(), [])
+        self.assertTrue(es.disk_script_errors(lambda: Drift))
+        self.assertTrue(es.disk_script_errors(lambda: DriftDir))
+
+    def test_disk_floor_invocation_is_the_scripts_own_mode(self) -> None:
+        self.assertEqual(es.DISK_FLOOR_INVOCATION, f"python3 {es.DISK_SCRIPT} --disk-floor")
+
+
+class NextestPinLintTest(unittest.TestCase):
+    def _wf(self, step: dict) -> dict[str, dict]:
+        return {"x.yml": {"jobs": {"j": {"steps": [step]}}}}
+
+    def test_lint_refuses_unpinned_nextest(self) -> None:
+        for step in (
+            {"uses": es.NEXTEST_INSTALL_REF},
+            {"uses": es.NEXTEST_INSTALL_REF, "with": {"tool": "nextest"}},
+            {"uses": "taiki-e/install-action@abc", "with": {"tool": "cargo-deny@1, nextest@0.9.1"}},
+            {"uses": "taiki-e/install-action@abc", "with": {"tool": "cargo-nextest"}},
+        ):
+            with self.subTest(step):
+                self.assertTrue(es.nextest_pin_errors(self._wf(step)))
+
+    def test_pinned_nextest_and_other_tools_pass(self) -> None:
+        for step in (
+            {"uses": es.NEXTEST_INSTALL_REF, "with": {"tool": es.NEXTEST_TOOL}},
+            {"uses": "taiki-e/install-action@abc", "with": {"tool": "cargo-deny@0.20.2"}},
+        ):
+            with self.subTest(step):
+                self.assertEqual(es.nextest_pin_errors(self._wf(step)), [])
+
+
+def _tree(root: str, *dirs: str) -> None:
+    for d in dirs:
+        os.makedirs(os.path.join(root, d), exist_ok=True)
+        with open(os.path.join(root, d, ed.CACHEDIR_TAG), "w", encoding="utf-8") as fh:
+            fh.write("Signature: 8a477f597d28d172789f06886806bc55\n")
+
+
+def _census(roots: list[str], env: dict[str, str]) -> tuple[int, str]:
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+        rc = ed.census(roots, env)
+    return rc, err.getvalue()
+
+
+class CensusTest(unittest.TestCase):
+    def test_census_reports_leftover_target(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            _tree(root, "x/target")
+            rc, err = _census([root], {})
+            self.assertEqual(rc, 1)
+            self.assertIn(os.path.join(root, "x", "target"), err)
+
+    def test_clean_roots_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "a", "b"))
+            self.assertEqual(_census([root, os.path.join(root, "missing")], {})[0], 0)
+
+    def test_census_excludes_shared_target_by_canonical_path(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            _tree(root, "real/shared")
+            os.symlink(os.path.join(root, "real"), os.path.join(root, "link"))
+            env = {"IPE_ORACLE_SHARED_TARGET": os.path.join(root, "link", "shared")}
+            self.assertEqual(_census([root], env)[0], 0)
+
+    def test_census_excludes_the_unpacked_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            _tree(root, "nextest-x/target")
+            self.assertEqual(_census([root], {"RUNNER_TEMP": root})[0], 0)
+            self.assertEqual(_census([root], {})[0], 1)
+
+    def test_census_does_not_follow_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
+            _tree(outside, "t")
+            os.symlink(outside, os.path.join(root, "out"))
+            self.assertEqual(_census([root], {})[0], 0)
+
+    def test_census_depth_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            deep = os.path.join(*(["d"] * (ed.CENSUS_MAX_DEPTH + 2)))
+            os.makedirs(os.path.join(root, deep))
+            rc, err = _census([root], {})
+            self.assertEqual(rc, 1)
+            self.assertIn("deeper than", err)
+
+    def test_census_without_roots_is_a_usage_error(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(ed.main(["--census"]), 2)
+            self.assertEqual(ed.main([]), 2)
+
+
+class DiskFloorTest(unittest.TestCase):
+    def test_disk_floor_refuses_below_budget(self) -> None:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(ed.disk_floor(["/a"], reader=lambda _p: ed.DISK_FLOOR_BYTES - 1), 1)
+            self.assertEqual(ed.disk_floor(["/a"], reader=lambda _p: ed.DISK_FLOOR_BYTES), 0)
+            self.assertEqual(ed.disk_floor(["/a", "/b"], reader=lambda p: 0 if p == "/b" else ed.DISK_FLOOR_BYTES), 1)
+
+    def test_unreadable_mount_is_refused(self) -> None:
+        def boom(_p: str) -> int:
+            raise OSError("gone")
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(ed.disk_floor(["/a"], reader=boom), 1)
+
+    def test_disk_floor_formula_terms(self) -> None:
+        self.assertEqual(ed.DISK_FLOOR_BYTES, sum(b for _, b in ed.DISK_FLOOR_TERMS))
+        self.assertIn(ed.TEST_THREADS * ed.APP_CRATE_BYTES, [b for _, b in ed.DISK_FLOOR_TERMS])
+        self.assertEqual(
+            ed.DISK_FLOOR_BYTES,
+            ed.SHARED_DEP_TREE_BYTES + ed.TEST_THREADS * ed.APP_CRATE_BYTES + ed.ISOLATED_TREE_BYTES + ed.RESULTS_SLACK_BYTES,
+        )
 
 
 if __name__ == "__main__":

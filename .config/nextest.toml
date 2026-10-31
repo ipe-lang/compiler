@@ -68,12 +68,12 @@ path = "junit.xml"
 # server-e2e group uses for the shared cargo target lock.
 #
 # `wasm-external-cargo` (max 1): the wasm-hydration and routed seal tests spawn an external
-# `cargo check --target wasm32-unknown-unknown` on the emitted crate. Run
-# concurrently with the shard's other heavy cargo builds it contends the global
-# cargo registry/target lock and cold-compiles the wasm dependency graph under
-# load — the transient failure a `retries` override used to mask. Serializing it
-# (paired with the test's own stable, warm wasm target dir) removes the race:
-# one wasm check runs at a time, against a target that compiled its deps once.
+# `cargo check --target wasm32-unknown-unknown` on the emitted crate, each into
+# its own `e2e_support::target::isolated` tree (a foreign triple the shared
+# target does not hold). Run concurrently with the shard's other heavy cargo
+# builds it contends the global cargo registry lock and cold-compiles the wasm
+# dependency graph under load — the transient failure a `retries` override used
+# to mask. Serializing it removes the race: one wasm check runs at a time.
 #
 # `windows-junction` (max 2): each member plants a junction through the
 # `output_dir::test_links` helper, which the first caller compiles with a cold
@@ -161,10 +161,10 @@ filter = 'binary(clean_vs_incremental_parity) | binary(per_module_typecheck_pari
 slow-timeout = { period = "60s", terminate-after = 20 }
 
 # The wasm-hydration and routed seals spawn `cargo check --target wasm32-unknown-unknown` on
-# an emitted crate. The contended resource is the global cargo registry/target
-# lock plus a cold wasm-dep compile; serializing the check into its own group —
-# paired with the test's stable, warm wasm target dir — removes the race at its
-# root, so no retry mask is needed and a real failure stays visible.
+# an emitted crate, each into its own isolated tree. The contended resource is
+# the global cargo registry lock plus a cold wasm-dep compile; serializing the
+# check into its own group removes the race at its root, so no retry mask is
+# needed and a real failure stays visible.
 [[profile.ci.overrides]]
 filter = 'test(hydrate_glue_type_name_matches_emitted_struct_and_compiles_for_wasm) | test(routed_web_app_compiles_for_wasm)'
 test-group = 'wasm-external-cargo'

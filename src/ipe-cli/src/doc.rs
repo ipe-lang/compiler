@@ -3388,36 +3388,6 @@ fn synthesize_module(body: &str, source_module: &str, module_imports: &[String])
     out
 }
 
-/// The `CARGO_TARGET_DIR` an `ipe dev run` child spawned by the doc-example gate
-/// should inherit so its build links against the warm shared dependency target.
-///
-/// Resolution mirrors the E2E harness's fail-safe: an absolute
-/// `IPE_ORACLE_SHARED_TARGET` (all CI's e2e/seal jobs export) wins; else an
-/// ambient `CARGO_TARGET_DIR` a local lane set; else `None` (inherit unchanged,
-/// so a bare local run stays hermetic). A non-absolute shared value fails safe
-/// to the ambient value rather than pinning a relative target.
-///
-/// This translation lives in the doc-gate test path only — production `ipe dev run`
-/// never reads `IPE_ORACLE_SHARED_TARGET`; it honours an inherited
-/// `CARGO_TARGET_DIR`, which is exactly what this sets on the child.
-fn child_shared_target_dir() -> Option<std::ffi::OsString> {
-    fn non_empty_absolute(value: &str) -> Option<std::ffi::OsString> {
-        let trimmed = value.trim();
-        (!trimmed.is_empty() && std::path::Path::new(trimmed).is_absolute())
-            .then(|| std::ffi::OsString::from(trimmed))
-    }
-    if let Some(shared) = ipe_env::var("IPE_ORACLE_SHARED_TARGET")
-        .ok()
-        .and_then(|raw| non_empty_absolute(&raw))
-    {
-        return Some(shared);
-    }
-    ipe_env::var("CARGO_TARGET_DIR").ok().and_then(|raw| {
-        let trimmed = raw.trim();
-        (!trimmed.is_empty()).then(|| std::ffi::OsString::from(trimmed))
-    })
-}
-
 /// Run the example project `root` and assert its output matches the `-->`
 /// annotated results (one per line, in order).
 ///
@@ -3445,8 +3415,14 @@ fn run_example_and_check(
     // THE SEAL: sharing ONE warm target is sound because each example is its own
     // project, whose emitted crate is named by its manifest and its own private
     // directory, so no example's app crate is ever reused for another's.
-    if let Some(target) = child_shared_target_dir() {
-        cmd.env("CARGO_TARGET_DIR", target);
+    //
+    // An unset shared target leaves the child's environment as inherited, so an
+    // ambient `CARGO_TARGET_DIR` reaches it unchanged; a blank or relative one
+    // is refused rather than read as "no shared target".
+    let shared = ipe_env::oracle_target::from_env()
+        .map_err(|e| format!("{label}: {}: {e}", ipe_env::oracle_target::SHARED_VAR))?;
+    if let Some(target) = shared {
+        cmd.env("CARGO_TARGET_DIR", target.into_path_buf());
     }
     let out = crate::remote_ingest::run_local(
         cmd,

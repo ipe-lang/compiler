@@ -11,6 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
+use e2e_support::target::{self, BuildTarget, IsolationReason};
 use ipe::{BuildOptions, CliError};
 
 fn scratch(name: &str) -> PathBuf {
@@ -82,20 +83,18 @@ fn wasm32_installed() -> bool {
 
 /// `cargo check --target wasm32-unknown-unknown` on the emitted crate at `out`.
 ///
-/// The external `cargo check` runs against a STABLE wasm target dir that
-/// persists across the run, so the wasm dependency graph compiles once and
-/// stays warm: no first-time registry fetch or cold dep compile happens under
-/// shard load. Paired with the `wasm-external-cargo` serialization group
+/// The external `cargo check` builds into `target` — the caller's own
+/// isolated tree, reused across every call it makes (e.g. a loop over several
+/// fixtures), so the wasm dependency graph compiles once and stays warm within
+/// that one test. Paired with the `wasm-external-cargo` serialization group
 /// (`.config/nextest.toml`) every caller joins, only one wasm `cargo check`
-/// runs at a time, so it never contends the global cargo registry/target lock
-/// with a concurrent build.
+/// runs at a time, so it never contends the global cargo registry lock with a
+/// concurrent build.
 #[allow(clippy::expect_used)] // test helper: a failed cargo spawn IS the failure
-fn cargo_check_wasm(out: &Path, runtime: &Path) -> std::process::ExitStatus {
-    let wasm_target = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("wasm_hydrate_seal_target");
-    std::process::Command::new("cargo")
+fn cargo_check_wasm(out: &Path, runtime: &Path, target: &BuildTarget) -> std::process::ExitStatus {
+    target::cargo_command(target)
         .args(["check", "--target", "wasm32-unknown-unknown"])
         .current_dir(out)
-        .env("CARGO_TARGET_DIR", &wasm_target)
         .env("IPE_RUNTIME_DIR", runtime)
         .status()
         .expect("spawn cargo check")
@@ -469,6 +468,7 @@ fn routed_web_app_with_on_navigate_emits_update_once() {
 /// Gated on `IPE_E2E=1` (needs a working cargo) AND the wasm target.
 #[test]
 #[allow(clippy::expect_used)] // test setup: a failed emit IS the failure
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn routed_web_app_compiles_for_wasm() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
@@ -477,6 +477,13 @@ fn routed_web_app_compiles_for_wasm() {
         return;
     }
     let runtime = e2e_support::require_runtime().into_path_buf();
+    // ONE isolated tree, reused by both fixtures below: the wasm dependency
+    // graph compiles once and stays warm across this test's own loop.
+    let isolated = target::isolated(IsolationReason::ForeignTriple);
+    let Ok(isolated) = isolated else {
+        panic!("isolated build target: {isolated:?}")
+    };
+    let build_target = BuildTarget::Isolated(isolated);
     for (name, source) in [
         ("wasm_routed_seal", ROUTED_APP),
         ("wasm_routed_on_navigate_seal", ROUTED_ON_NAVIGATE_APP),
@@ -484,7 +491,7 @@ fn routed_web_app_compiles_for_wasm() {
         let fixture = write_fixture(source);
         let out = scratch_isolated(name).join("out");
         build_wasm(&fixture, &out).expect("a routed Web.tea must emit under --target wasm");
-        let status = cargo_check_wasm(&out, &runtime);
+        let status = cargo_check_wasm(&out, &runtime, &build_target);
         assert!(
             status.success(),
             "the emitted routed wasm crate `{name}` must `cargo check` for \
@@ -812,6 +819,7 @@ fn server_only_kernel_behind_an_unreached_helper_builds_and_is_not_emitted()
 /// false red.
 #[test]
 #[allow(clippy::expect_used)] // test setup: a failed emit/cargo-spawn IS the failure
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn hydrate_glue_type_name_matches_emitted_struct_and_compiles_for_wasm() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
@@ -847,7 +855,12 @@ fn hydrate_glue_type_name_matches_emitted_struct_and_compiles_for_wasm() {
 
     // THE SEAL: the emitted crate must actually compile for wasm. A glue/type
     // name mismatch is an E0433/E0425 here, turning ipe-exit-0 into a hard red.
-    let status = cargo_check_wasm(&out, &runtime);
+    let isolated = target::isolated(IsolationReason::ForeignTriple);
+    let Ok(isolated) = isolated else {
+        panic!("isolated build target: {isolated:?}")
+    };
+    let build_target = BuildTarget::Isolated(isolated);
+    let status = cargo_check_wasm(&out, &runtime, &build_target);
     assert!(
         status.success(),
         "the emitted wasm-hydration crate must `cargo check` for wasm32-unknown-unknown \

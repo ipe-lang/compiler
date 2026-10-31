@@ -87,8 +87,6 @@ fn assembled_tuple_wrapper_builds_and_runs() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let cargo = ipe_env::var("CARGO").expect("cargo sets CARGO for every test it runs");
-
     // Emit against a package with ONLY the admitted `extent` binding — the
     // emitted wrapper names `::geom::extent`, so `geom` must be a REAL external
     // crate (a path dependency), not a crate-root module (`::geom` = external).
@@ -151,6 +149,7 @@ mod ffi {{
     {ffi_body}
 }}
 
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn main() {{
     match ffi::geom_extent(()) {{
         IpeResult::Ok((n, s, b)) => {{
@@ -178,18 +177,19 @@ fn main() {{
     .expect("Cargo.toml");
     std::fs::write(root.join("src").join("main.rs"), main_rs).expect("main.rs");
 
-    let out = std::process::Command::new(&cargo)
-        .arg("run")
-        .arg("--quiet")
-        .current_dir(&root)
-        .output()
-        .expect("cargo run spawns");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let ran = e2e_support::build_and_run_rust("ffi_multi_result_tuple", &root);
     assert!(
-        out.status.success(),
+        ran.is_ok(),
+        "{}",
+        ran.as_ref().err().map_or("", String::as_str)
+    );
+    let run = ran.expect("asserted Ok above");
+    let stdout = &run.stdout;
+    assert_eq!(
+        run.exit_code,
+        Some(0),
         "the assembled multi-result-tuple wrapper must build and run exit 0.\n\
-         stdout: {stdout}\nstderr: {stderr}"
+         stdout: {stdout}"
     );
     assert!(
         stdout.trim() == "ok 9223372036854775807 wide true",
