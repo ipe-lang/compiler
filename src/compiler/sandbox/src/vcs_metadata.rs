@@ -14,7 +14,9 @@
 //!
 //! Metadata is found at any depth: the parse walks the whole tree once through
 //! held directory handles, never following a link, and carves every entry whose
-//! name a [`VcsKind`] keeps its metadata under. Each entry, and each pointer
+//! name a [`VcsKind`] keeps its metadata under, and every directory Git reads as
+//! a repository by its contents whatever its name (a bare repository: `HEAD`
+//! beside `objects` and `refs`). Each entry, and each pointer
 //! file inside one, is opened once through its held parent, and every fact the
 //! carve records about it is read from that handle; the path recorded is then
 //! proven to name the held object. The walk is bounded by
@@ -354,8 +356,9 @@ pub struct WritableTree {
 
 impl WritableTree {
     /// `tree` with its carve: each [`VcsKind`] entry found at any depth below
-    /// it, and each directory a pointer file names that lies inside `tree` or
-    /// one of `other_grants` (the jail's other writable paths).
+    /// it, each directory below it Git reads as a repository by its contents,
+    /// and each directory a pointer file names that lies inside `tree` or one
+    /// of `other_grants` (the jail's other writable paths).
     ///
     /// The configuration each carved entry's tool reads is scanned against
     /// those grants, with `home` the invoker's home the tool expands `~`
@@ -378,6 +381,8 @@ impl WritableTree {
     ///   not resolve, is no directory, or covers a writable grant.
     /// - [`JailPathError::VcsEntryChanged`] when a carved path no longer names
     ///   the object the parse read through its held parent.
+    /// - [`JailPathError::VcsBareRepositoryTree`] when `tree` itself is a Git
+    ///   repository by its contents, which no carve can cover inside the grant.
     /// - [`JailPathError::VcsConfig`] when a configuration the tool reads names,
     ///   or may name, code inside a writable grant, or cannot be read.
     pub fn parse(
@@ -652,7 +657,8 @@ impl<'g> Carver<'g> {
     }
 
     /// Walk the tree depth-first through held handles, carving every metadata
-    /// entry met and descending every other directory.
+    /// entry and every directory of a bare repository's shape met, and
+    /// descending every other directory.
     ///
     /// The stack holds one frame per open directory, so recursion depth and
     /// open handles stay at [`WalkLimits`]' depth plus one. A matched entry is
@@ -663,6 +669,11 @@ impl<'g> Carver<'g> {
         let root_path = tree.as_path();
         let root =
             HeldDir::open_root(root_path).map_err(|refusal| walk_unreadable(root_path, refusal))?;
+        if is_git_dir_shape(&root, root_path)? {
+            return Err(JailPathError::VcsBareRepositoryTree {
+                path: root_path.to_path_buf(),
+            });
+        }
         let device = (self.device)(&root, root_path)?;
         let mut budget = Budget::new(self.limits);
         let pending = budget.list(&root, root_path)?;
@@ -712,6 +723,11 @@ impl<'g> Carver<'g> {
             };
             if (self.device)(&child, &path)? != device {
                 return Err(JailPathError::VcsWalkCrossDevice { path });
+            }
+            if is_git_dir_shape(&child, &path)? {
+                self.bare_git_at(&child, &path)?;
+                self.within_carve_ceiling(&path)?;
+                continue;
             }
             let pending = match budget.list(&child, &path) {
                 Err(JailPathError::VcsWalkUnreadable {
@@ -773,12 +789,7 @@ impl<'g> Carver<'g> {
                 dot_darcs: self.carve_entry(&entry, identity)?,
             }),
             (VcsKind::Git, Held::Dir(dir)) => {
-                // Git reads `commondir` in every gitdir, the root `.git` dir
-                // included, and takes config and hooks from the dir it names.
-                let commondir =
-                    self.inner_pointer(kind, &dir, &entry, "commondir", false, &mut targets)?;
-                let gitdir = self.carve_entry(&entry, identity)?;
-                Some(VcsRoot::Git { gitdir, commondir })
+                Some(self.git_dir(&dir, &entry, identity, &mut targets)?)
             }
             (VcsKind::Git, Held::File(file)) => {
                 let text = read_pointer(kind, &entry, file)?;
@@ -817,6 +828,41 @@ impl<'g> Carver<'g> {
         }
         self.roots.extend(root);
         Ok(())
+    }
+
+    /// Carve the held directory `dir` at `path`, which git reads as a
+    /// repository by its contents whatever its name ([`is_git_dir_shape`]),
+    /// as a gitdir: whole, with the common dir its `commondir` names.
+    fn bare_git_at(&mut self, dir: &HeldDir, path: &Path) -> Result<(), JailPathError> {
+        let identity = Identity {
+            shape: Shape::Dir,
+            id: dir.id().map_err(|refusal| walk_unreadable(path, refusal))?,
+        };
+        let mut targets = Vec::new();
+        let root = self.git_dir(dir, path, identity, &mut targets)?;
+        for target in targets {
+            self.add(target);
+        }
+        self.roots.push(root);
+        Ok(())
+    }
+
+    /// Carve the gitdir `dir`, held at `entry` with `identity`, and follow its
+    /// `commondir`, pushing an in-grant common dir onto `targets`.
+    ///
+    /// Git reads `commondir` in every gitdir, a root `.git` dir and a bare
+    /// repository included, and takes config and hooks from the dir it names.
+    fn git_dir(
+        &mut self,
+        dir: &HeldDir,
+        entry: &Path,
+        identity: Identity,
+        targets: &mut Vec<CarvePath>,
+    ) -> Result<VcsRoot, JailPathError> {
+        let commondir =
+            self.inner_pointer(VcsKind::Git, dir, entry, "commondir", false, targets)?;
+        let gitdir = self.carve_entry(entry, identity)?;
+        Ok(VcsRoot::Git { gitdir, commondir })
     }
 
     /// Follow the optional pointer file `name` of the held metadata directory
@@ -976,6 +1022,31 @@ impl Held {
             }),
         }
     }
+}
+
+/// Whether git reads the held directory `dir`, at `path`, as a repository by
+/// its contents, whatever its name.
+///
+/// Git's `is_git_directory` takes a directory holding `HEAD` beside `objects`
+/// and `refs`, the latter two looked up in the common dir a `commondir` file
+/// names. Each entry counts when present in any form, read through the held
+/// handle without following a link: git follows a linked `HEAD`, `objects` or
+/// `refs`, and a `commondir` may name them elsewhere, so presence alone is the
+/// shape. A directory holding `HEAD` and `commondir` is a gitdir whatever else
+/// it holds; one holding only two of `HEAD`, `objects` and `refs` is not.
+fn is_git_dir_shape(dir: &HeldDir, path: &Path) -> Result<bool, JailPathError> {
+    let present = |name: &'static str| -> Result<bool, JailPathError> {
+        let probed = path.join(name);
+        let entry = EntryName::new(OsStr::new(name))
+            .ok_or_else(|| walk_unreadable(&probed, OpenRefusal::BadName))?;
+        dir.kind_of(&entry)
+            .map(|kind| kind.is_some())
+            .map_err(|refusal| walk_unreadable(&probed, refusal))
+    };
+    if !present("HEAD")? {
+        return Ok(false);
+    }
+    Ok(present("commondir")? || (present("objects")? && present("refs")?))
 }
 
 /// The entry `name` of `dir`, at `path`, opened once without following a
@@ -2057,6 +2128,123 @@ mod tests {
             ),
             "a parent step in a nested configuration value is refused: {walked:?}"
         );
+    }
+
+    /// `dir` laid out as git's repository shape: `HEAD`, `objects/`, `refs/`.
+    fn bare_shape(dir: &Path) {
+        make_dir(&dir.join("objects"));
+        make_dir(&dir.join("refs"));
+        write(&dir.join("HEAD"), "ref: refs/heads/main\n");
+    }
+
+    #[test]
+    fn a_bare_repository_shape_is_carved() {
+        let fixture = fixture("bare-shape");
+        let bare = fixture.tree.join("vendor").join("x");
+        bare_shape(&bare);
+        let tree = parse(&fixture).expect("a bare repository shape parses");
+        assert_eq!(carved(&tree), vec![bare]);
+    }
+
+    #[test]
+    fn two_of_three_bare_markers_are_not_metadata() {
+        for (absent, label) in [
+            ("objects", "bare-no-objects"),
+            ("refs", "bare-no-refs"),
+            ("HEAD", "bare-no-head"),
+        ] {
+            let fixture = fixture(label);
+            let dir = fixture.tree.join("vendor").join("x");
+            make_dir(&dir);
+            for marker in ["objects", "refs"].into_iter().filter(|m| *m != absent) {
+                make_dir(&dir.join(marker));
+            }
+            if absent != "HEAD" {
+                write(&dir.join("HEAD"), "ref: refs/heads/main\n");
+            }
+            let tree = parse(&fixture).expect("a partial shape parses");
+            assert!(tree.carve().is_empty(), "without {absent}: {tree:?}");
+        }
+    }
+
+    #[test]
+    fn a_head_beside_a_commondir_is_carved_with_its_common_dir() {
+        let fixture = fixture("bare-commondir");
+        let common = fixture.tree.join("vendor").join("common");
+        make_dir(&common);
+        let gitdir = fixture.tree.join("vendor").join("x");
+        make_dir(&gitdir);
+        write(&gitdir.join("HEAD"), "ref: refs/heads/main\n");
+        write(&gitdir.join("commondir"), "../common\n");
+        let tree = parse(&fixture).expect("a commondir gitdir parses");
+        assert_eq!(carved(&tree), vec![gitdir, common]);
+    }
+
+    #[test]
+    fn a_bare_shape_whose_config_runs_a_program_refuses_the_tree() {
+        let fixture = fixture("bare-config");
+        let bare = fixture.tree.join("vendor").join("x");
+        bare_shape(&bare);
+        let named = fixture.tree.join("evil");
+        write(
+            &bare.join("config"),
+            &format!("[core]\n\tfsmonitor = {}\n", named.display()),
+        );
+        let walked = parse(&fixture);
+        assert!(
+            matches!(
+                &walked,
+                Err(JailPathError::VcsConfig(crate::ConfigRefusal::NamesWritableCode {
+                    kind: VcsKind::Git,
+                    named: crate::Named::InGrant(path),
+                    ..
+                })) if *path == named
+            ),
+            "a bare repository's configuration is judged as a gitdir's: {walked:?}"
+        );
+    }
+
+    /// Markers present as links still make the shape (git follows them), and
+    /// a link to a bare repository is never followed by the walk.
+    #[cfg(unix)]
+    #[test]
+    fn a_bare_shape_is_judged_on_held_probes_without_following_links() {
+        let fixture = fixture("bare-links");
+        let elsewhere = fixture.root.join("elsewhere");
+        make_dir(&elsewhere.join("objects"));
+        make_dir(&elsewhere.join("refs"));
+        let linked = fixture.tree.join("vendor").join("linked");
+        make_dir(&linked);
+        write(&linked.join("HEAD"), "ref: refs/heads/main\n");
+        std::os::unix::fs::symlink(elsewhere.join("objects"), linked.join("objects"))
+            .expect("symlink");
+        std::os::unix::fs::symlink(elsewhere.join("refs"), linked.join("refs")).expect("symlink");
+        let outside = fixture.root.join("outside-bare");
+        bare_shape(&outside);
+        std::os::unix::fs::symlink(&outside, fixture.tree.join("vendor").join("link"))
+            .expect("symlink");
+        let tree = parse(&fixture).expect("the linked shapes parse");
+        assert_eq!(carved(&tree), vec![linked]);
+    }
+
+    #[test]
+    fn a_tree_whose_root_is_a_bare_repository_refuses() {
+        let fixture = fixture("bare-root");
+        bare_shape(&fixture.tree);
+        let walked = parse(&fixture);
+        assert!(
+            matches!(
+                &walked,
+                Err(JailPathError::VcsBareRepositoryTree { path }) if *path == fixture.tree
+            ),
+            "{walked:?}"
+        );
+        let shown = walked
+            .map(|_| ())
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(shown.contains("refusing to build the jail"), "{shown}");
     }
 
     #[test]

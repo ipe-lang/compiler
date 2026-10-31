@@ -135,6 +135,13 @@ pub enum JailPathError {
         /// The entry.
         path: PathBuf,
     },
+    /// A writable working tree's root is itself a Git repository by its
+    /// contents (`HEAD` beside `objects` and `refs`), so its hooks and config
+    /// cannot be kept read-only without covering the whole grant.
+    VcsBareRepositoryTree {
+        /// The tree's root.
+        path: PathBuf,
+    },
 }
 
 /// A path shown injectively: `\` doubled, and every control, invisible, or
@@ -249,6 +256,15 @@ impl fmt::Display for JailPathError {
                  inside it could go unprotected; refusing to build the jail: move the working \
                  tree to a folder no sync client manages (a placeholder kept on the device \
                  stays one), or run without the filesystem grant",
+                ShownPath(path)
+            ),
+            Self::VcsBareRepositoryTree { path } => write!(
+                f,
+                "the writable working tree {} is itself a Git repository (it holds HEAD \
+                 beside objects and refs, or a commondir), so the hooks and config Git runs \
+                 from it cannot be kept read-only; refusing to build the jail: run from a \
+                 working tree that is not a bare repository, or run without the filesystem \
+                 grant",
                 ShownPath(path)
             ),
         }
