@@ -18,7 +18,7 @@ Ipê runs programs under a deny-by-default capability model. Every operation tha
 | `filesystem` | Reading or writing the filesystem (files, directories, config files). |
 | `database` | Structured database access (SQL queries, migrations, row decoders). |
 | `env` | Reading or writing process environment variables and argv. |
-| `subprocess` | Spawning or controlling a child process. |
+| `subprocess` | Spawning or controlling a child process; inside the jail, no spawned process can create or join its own namespace, so a tool's own namespace sandbox (Chromium, nested bwrap/podman) must run with it disabled. |
 
 ## Non-determinism
 

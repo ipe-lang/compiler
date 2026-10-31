@@ -1348,10 +1348,10 @@ mod tests {
     fn rendered(profile: &SandboxProfile, seccomp_fd: Option<SeccompFdNumber<'_>>) -> Vec<String> {
         let no_env = |_: &str| None;
         let payload = [OsString::from("/work/tree/target/debug/ipe-app")];
-        let argv = match seccomp_fd {
-            Some(fd) => run_jail_argv(&scope(), profile, &work_mounts(), fd, &no_env, &payload),
-            None => fd_free_argv(&scope(), profile, &work_mounts(), &no_env, &payload),
-        };
+        let argv = seccomp_fd.map_or_else(
+            || fd_free_argv(&scope(), profile, &work_mounts(), &no_env, &payload),
+            |fd| run_jail_argv(&scope(), profile, &work_mounts(), fd, &no_env, &payload),
+        );
         argv.expect("the argv builds")
             .args()
             .iter()

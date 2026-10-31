@@ -535,7 +535,7 @@ const NR_CLONE: u32 = 56;
 /// `clone3`, the same number on every 64-bit ABI.
 const NR_CLONE3: u32 = 435;
 /// `CLONE_NEWUSER | SIGCHLD`: a process clone into a fresh user namespace.
-const CLONE_NEWUSER_PROCESS: u32 = 0x1000_0000 | 17;
+const CLONE_NEWUSER_PROCESS: u32 = 0x1000_0000 | 0x11;
 const EPERM: u32 = 1;
 const ENOSYS: u32 = 38;
 
