@@ -13,8 +13,11 @@
 //! `run_fmt` consume the typed value; the scattered ad-hoc checks they used to
 //! carry are folded into these parses.
 
+use std::path::PathBuf;
+
 use crate::build_plan::{AllocatorChoice, StaticRequestLayer};
 use crate::delivery::{DeliveryError, DeliveryTokens, Shape, TargetSource, TargetTriple};
+use crate::project_root::NonEmpty;
 use crate::verb::Verb;
 use crate::{CliError, text};
 pub use ipe_backend_rust::static_build::StaticTriple;
@@ -1505,12 +1508,15 @@ pub fn parse_health(rest: &[String]) -> Result<HealthArgs, CliError> {
 /// Constructed exclusively by [`parse_fmt`], which rejects invalid combinations
 /// at the boundary (parse, don't validate).
 pub enum FmtMode {
-    /// Format (or check) every `.ipe` file under `path` in place.
-    /// `None` means the current directory `.`. `format` selects how a `--check`
-    /// run reports the unformatted set (human list, or a machine `--json`/`--plain`
-    /// file list); it is [`OutputFormat::Human`] for a plain in-place format.
+    /// Format (or check) every `.ipe` file each of `paths` names, in place.
+    ///
+    /// A file path names that file; a directory path names every `.ipe` under
+    /// it. `None` means the current directory `.`. `format` selects how a
+    /// `--check` run reports the unformatted set (human list, or a machine
+    /// `--json`/`--plain` file list); it is [`OutputFormat::Human`] for a plain
+    /// in-place format.
     InPlace {
-        path: Option<String>,
+        paths: Option<NonEmpty<PathBuf>>,
         check: bool,
         format: OutputFormat,
     },
@@ -1522,13 +1528,14 @@ pub enum FmtMode {
 
 /// Parse `ipe fmt`'s argument tail into a [`FmtMode`].
 ///
-/// * No flags, no path → `InPlace { path: None, check: false }`
-/// * One path → `InPlace { path: Some(…), check: false }`
+/// * No flags, no path → `InPlace { paths: None, check: false }`
+/// * One or more paths → `InPlace { paths: Some(…), check: false }`, in the
+///   order given (the run dedupes them by the file each reaches)
 /// * `--check` → `InPlace { …, check: true }`
 /// * `--check --json` / `--check --plain` → machine list of unformatted files
 /// * `--stdin` → `Stdin`
 /// * `--stdin --check` → `StdinCheck`
-/// * `--stdin` + positional path → error (mutually exclusive)
+/// * `--stdin` + any positional path → error (mutually exclusive)
 ///
 /// A machine output format (`--json` / `--plain`) is meaningful only for a
 /// `--check` scan (it reports which files are unformatted), and never with
@@ -1538,7 +1545,7 @@ pub enum FmtMode {
 /// # Errors
 /// [`CliError::Usage`] / [`CliError::Usage`] naming the exact problem.
 pub fn parse_fmt(rest: &[String]) -> Result<FmtMode, CliError> {
-    let mut path: Option<String> = None;
+    let mut paths: Vec<PathBuf> = Vec::new();
     let mut check = false;
     let mut stdin = false;
     let mut format: Option<OutputFormat> = None;
@@ -1552,15 +1559,11 @@ pub fn parse_fmt(rest: &[String]) -> Result<FmtMode, CliError> {
             flag if flag.starts_with('-') => {
                 return Err(usage_unknown_flag("fmt", flag));
             }
-            positional => {
-                if path.is_some() {
-                    return Err(CliError::Usage(text::msg::fmt_single_path()));
-                }
-                path = Some(positional.to_owned());
-            }
+            positional => paths.push(PathBuf::from(positional)),
         }
     }
-    if stdin && path.is_some() {
+    let paths = NonEmpty::from_vec(paths);
+    if stdin && paths.is_some() {
         return Err(CliError::Usage(text::msg::fmt_stdin_and_path()));
     }
     let format = format.unwrap_or_default();
@@ -1578,7 +1581,7 @@ pub fn parse_fmt(rest: &[String]) -> Result<FmtMode, CliError> {
         }
     } else {
         Ok(FmtMode::InPlace {
-            path,
+            paths,
             check,
             format,
         })
@@ -2063,7 +2066,7 @@ mod tests {
         assert!(matches!(
             m,
             FmtMode::InPlace {
-                path: None,
+                paths: None,
                 check: false,
                 ..
             }
@@ -2073,13 +2076,19 @@ mod tests {
     #[test]
     fn fmt_path_sets_in_place() {
         let m = parse_fmt(&s(&["src"])).expect("fmt src");
-        assert!(matches!(m, FmtMode::InPlace { path: Some(p), check: false, .. } if p == "src"));
+        assert!(
+            matches!(m, FmtMode::InPlace { paths: Some(p), check: false, .. }
+            if p.iter().eq([&PathBuf::from("src")]))
+        );
     }
 
     #[test]
     fn fmt_check_and_path() {
         let m = parse_fmt(&s(&["src", "--check"])).expect("fmt");
-        assert!(matches!(m, FmtMode::InPlace { path: Some(p), check: true, .. } if p == "src"));
+        assert!(
+            matches!(m, FmtMode::InPlace { paths: Some(p), check: true, .. }
+            if p.iter().eq([&PathBuf::from("src")]))
+        );
     }
 
     #[test]
@@ -2100,21 +2109,39 @@ mod tests {
         assert!(matches!(
             m,
             FmtMode::InPlace {
-                path: None,
+                paths: None,
                 check: true,
                 ..
             }
         ));
     }
 
+    /// `--stdin` with any path, first or last among several, is refused.
     #[test]
     fn fmt_stdin_with_path_rejected() {
-        assert!(parse_fmt(&s(&["--stdin", "src"])).is_err());
+        let refusal = text::msg::fmt_stdin_and_path();
+        for args in [
+            &["--stdin", "src"][..],
+            &["a.ipe", "b.ipe", "--stdin"][..],
+            &["--check", "a.ipe", "--stdin", "src"][..],
+        ] {
+            let res = parse_fmt(&s(args));
+            assert!(
+                matches!(&res, Err(CliError::Usage(m)) if *m == refusal),
+                "{args:?}: {:?}",
+                res.err()
+            );
+        }
     }
 
+    /// Several paths are kept in the order given, with `--check` anywhere.
     #[test]
-    fn fmt_two_paths_rejected() {
-        assert!(parse_fmt(&s(&["a", "b"])).is_err());
+    fn fmt_several_paths_in_place() {
+        let m = parse_fmt(&s(&["a.ipe", "--check", "src", "a.ipe"])).expect("fmt paths");
+        assert!(
+            matches!(m, FmtMode::InPlace { paths: Some(p), check: true, .. }
+            if p.iter().eq([&PathBuf::from("a.ipe"), &PathBuf::from("src"), &PathBuf::from("a.ipe")]))
+        );
     }
 
     #[test]

@@ -542,3 +542,168 @@ fn fmt_stdin_at_the_read_cap_is_read() {
         assert_eq!(out.source.len(), cap, "the whole input was read");
     }
 }
+
+// -- several paths ---------------------------------------------------------
+
+/// A non-canonical source of module `name` whose formatted form differs.
+fn dirty_module(name: &str) -> String {
+    format!("module {name} exposing (x)\n\nx =\n  1\n")
+}
+
+/// A fresh, empty scratch directory for one test.
+fn scratch(name: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// `path` as one command-line argument.
+fn arg(path: &std::path::Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+/// The human error screen of `err`, header omitted.
+fn screen_text(err: &CliError) -> String {
+    ipe::screen::error_screen(err, false)
+        .map(|s| s.render(ipe::screen::Header::Omitted))
+        .unwrap_or_default()
+}
+
+/// Several files and a directory are all formatted in one run.
+#[test]
+fn several_paths_are_all_formatted() {
+    let dir = scratch("fmt_several");
+    let sub = dir.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    let a = dir.join("A.ipe");
+    let b = dir.join("B.ipe");
+    let c = sub.join("C.ipe");
+    fs::write(&a, dirty_module("A")).unwrap();
+    fs::write(&b, dirty_module("B")).unwrap();
+    fs::write(&c, dirty_module("C")).unwrap();
+
+    fmt::run_fmt(&[arg(&a), arg(&b), arg(&sub)]).expect("several paths format");
+    for f in [&a, &b, &c] {
+        assert!(
+            fs::read_to_string(f).unwrap().contains("x =\n    1"),
+            "{} not formatted",
+            f.display()
+        );
+    }
+}
+
+/// One unparsable file among several refuses the run and leaves every file,
+/// the formattable ones included, byte-identical.
+#[test]
+fn one_unparsable_file_leaves_every_file_unchanged() {
+    let dir = scratch("fmt_all_or_nothing");
+    let a = dir.join("A.ipe");
+    let bad = dir.join("Bad.ipe");
+    let z = dir.join("Z.ipe");
+    let bad_src = "module Bad exposing (x)\n\nx = = =\n";
+    fs::write(&a, dirty_module("A")).unwrap();
+    fs::write(&bad, bad_src).unwrap();
+    fs::write(&z, dirty_module("Z")).unwrap();
+
+    let res = fmt::run_fmt(&[arg(&a), arg(&bad), arg(&z)]);
+    assert!(res.is_err(), "an unparsable file must refuse the run");
+    assert_eq!(fs::read_to_string(&a).unwrap(), dirty_module("A"));
+    assert_eq!(fs::read_to_string(&bad).unwrap(), bad_src);
+    assert_eq!(fs::read_to_string(&z).unwrap(), dirty_module("Z"));
+
+    // The same set reached through the directory walk is equally all or nothing.
+    let res = fmt::run_fmt(&[arg(&dir)]);
+    assert!(
+        res.is_err(),
+        "an unparsable walked file must refuse the run"
+    );
+    assert_eq!(fs::read_to_string(&a).unwrap(), dirty_module("A"));
+    assert_eq!(fs::read_to_string(&z).unwrap(), dirty_module("Z"));
+}
+
+/// A missing path refuses the run by name before any file is written,
+/// wherever it sits among the arguments.
+#[test]
+fn a_missing_path_writes_nothing() {
+    let dir = scratch("fmt_missing_path");
+    let a = dir.join("A.ipe");
+    fs::write(&a, dirty_module("A")).unwrap();
+    let missing = dir.join("NoSuch.ipe");
+
+    for args in [vec![arg(&a), arg(&missing)], vec![arg(&missing), arg(&a)]] {
+        let res = fmt::run_fmt(&args);
+        assert!(
+            matches!(res, Err(CliError::Usage(ref m)) if m.contains("NoSuch.ipe")),
+            "a missing path must refuse by name: {res:?}"
+        );
+        assert_eq!(fs::read_to_string(&a).unwrap(), dirty_module("A"));
+    }
+}
+
+/// A file reached twice (repeated, or also inside a named directory) is
+/// reported once and formatted once.
+#[test]
+fn a_file_reached_twice_is_handled_once() {
+    let dir = scratch("fmt_dedupe");
+    let a = dir.join("Twice.ipe");
+    fs::write(&a, dirty_module("Twice")).unwrap();
+
+    let res = ipe::run_cli(&[
+        "fmt".to_owned(),
+        "--check".to_owned(),
+        arg(&a),
+        arg(&a),
+        arg(&dir),
+    ]);
+    assert!(matches!(res, Err(CliError::CheckFailed(_))), "{res:?}");
+    let screen = res.as_ref().err().map(screen_text).unwrap_or_default();
+    assert_eq!(
+        screen.matches("Twice.ipe").count(),
+        1,
+        "a duplicate must be listed once:\n{screen}"
+    );
+
+    fmt::run_fmt(&[arg(&a), arg(&dir), arg(&a)]).expect("duplicates format");
+    let once = fs::read_to_string(&a).unwrap();
+    assert_eq!(format_source(&once).unwrap(), once);
+    assert!(once.contains("x =\n    1"), "{once}");
+}
+
+/// `--check` over mixed files fails, names only the dirty one, and writes
+/// nothing; over clean files it passes.
+#[test]
+fn check_over_mixed_files_names_only_the_dirty_ones() {
+    let dir = scratch("fmt_check_mixed");
+    let clean_src = format_source(&dirty_module("Clean")).unwrap();
+    let c1 = dir.join("Clean1.ipe");
+    let c2 = dir.join("Clean2.ipe");
+    let dirty = dir.join("Dirty.ipe");
+    fs::write(&c1, &clean_src).unwrap();
+    fs::write(&c2, &clean_src).unwrap();
+    fs::write(&dirty, dirty_module("Dirty")).unwrap();
+
+    let res = ipe::run_cli(&[
+        "fmt".to_owned(),
+        "--check".to_owned(),
+        arg(&c1),
+        arg(&dirty),
+        arg(&c2),
+    ]);
+    assert!(matches!(res, Err(CliError::CheckFailed(_))), "{res:?}");
+    let screen = res.as_ref().err().map(screen_text).unwrap_or_default();
+    assert!(screen.contains("Dirty.ipe"), "{screen}");
+    assert!(!screen.contains("Clean1.ipe"), "{screen}");
+    assert!(!screen.contains("Clean2.ipe"), "{screen}");
+    assert_eq!(fs::read_to_string(&dirty).unwrap(), dirty_module("Dirty"));
+
+    let res = fmt::run_fmt(&["--check".to_owned(), arg(&c1), arg(&c2)]);
+    assert!(res.is_ok(), "clean files pass --check: {res:?}");
+}
+
+/// `--stdin` with any path is a typed usage refusal.
+#[test]
+fn stdin_with_paths_is_refused() {
+    let res = fmt::run_fmt(&["--stdin".to_owned(), "A.ipe".to_owned(), "B.ipe".to_owned()]);
+    assert!(matches!(res, Err(CliError::Usage(_))), "{res:?}");
+}

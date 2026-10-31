@@ -53,6 +53,7 @@
 //! removal (the AST does not retain user parens), documentation-comment
 //! (`{-| … -}`) re-flowing, and per-import `exposing`-list column wrapping.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
@@ -93,67 +94,194 @@ pub fn run_fmt(rest: &[String]) -> Result<(), CliError> {
         crate::cli_args::FmtMode::Stdin => run_fmt_stdin(false),
         crate::cli_args::FmtMode::StdinCheck => run_fmt_stdin(true),
         crate::cli_args::FmtMode::InPlace {
-            path,
+            paths,
             check,
             format,
-        } => run_fmt_inplace(path.as_deref(), check, format),
+        } => {
+            let roots: Vec<PathBuf> =
+                paths.map_or_else(|| vec![PathBuf::from(".")], |p| p.iter().cloned().collect());
+            run_fmt_inplace(&roots, check, format)
+        }
     }
 }
 
-/// Format every `.ipe` under `root` in place.
+/// The most source and formatted text one in-place run holds before writing.
 ///
-/// `None` means the current directory `.`. Under `--check`, `format` selects how
-/// the unformatted set is reported: the human list (default), or a machine
-/// `--json` / `--plain` file list.
+/// Every rewrite is held until every file has formatted, so the held text is
+/// bounded like a build's summed source read.
+const HELD_REWRITE_BYTES: u64 = crate::source_snapshot::SOURCE_TREE_READ_CAP;
+
+/// Format every `.ipe` file `roots` name, in place, all or nothing.
+///
+/// Every root is resolved and every file formatted before any file is
+/// written: a missing root, an unparsable file or any other refusal leaves
+/// every file as it was. Under `--check`, `format` selects how the unformatted
+/// set is reported: the human list (default), or a machine `--json` / `--plain`
+/// file list.
 fn run_fmt_inplace(
-    path: Option<&str>,
+    roots: &[PathBuf],
     check: bool,
     format: crate::cli_args::OutputFormat,
 ) -> Result<(), CliError> {
-    let root = PathBuf::from(path.unwrap_or("."));
-    // A file reached by walking a directory must stay inside it; only an
-    // explicitly named file may be a symlink to elsewhere.
-    let (walked, files) = match collect_ipe_files(&root)? {
-        FmtTargets::Named(file) => (false, vec![file]),
-        FmtTargets::Walked(files) => (true, files),
-    };
+    let files = collect_fmt_files(roots)?;
     if files.is_empty() {
-        return Err(CliError::Usage(crate::text::msg::fmt_no_files(
-            &root.display(),
+        let named = roots
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Err(CliError::Usage(crate::text::msg::fmt_no_files(&named)));
+    }
+    if check {
+        let mut unformatted: Vec<PathBuf> = Vec::new();
+        format_each(&files, |file, _, _| {
+            unformatted.push(file.path.clone());
+            Ok(())
+        })?;
+        return report_check(&unformatted, format);
+    }
+    let mut plan: Vec<Rewrite<'_>> = Vec::new();
+    let mut held: u64 = 0;
+    format_each(&files, |file, source, formatted| {
+        hold_rewrite(
+            &mut held,
+            HELD_REWRITE_BYTES,
+            &file.path,
+            &source,
+            &formatted,
+        )?;
+        plan.push(Rewrite {
+            file,
+            source,
+            formatted,
+        });
+        Ok(())
+    })?;
+    write_rewrites(plan)
+}
+
+/// One file whose formatted text differs from the source it was read as.
+struct Rewrite<'f> {
+    /// The file, as collected.
+    file: &'f FmtFile,
+    /// The source exactly as read.
+    source: String,
+    /// The formatter's output for `source`.
+    formatted: String,
+}
+
+/// Read and format every file, handing each one that changes to `changed`.
+///
+/// Every refusal is reported and the last one returned, so a caller that
+/// writes only on `Ok` writes nothing when any file is refused. An error from
+/// `changed` stops the run at once.
+fn format_each<'f>(
+    files: &'f [FmtFile],
+    mut changed: impl FnMut(&'f FmtFile, String, String) -> Result<(), CliError>,
+) -> Result<(), CliError> {
+    let mut refusal: Option<CliError> = None;
+    for file in files {
+        let outcome = read_fmt_file(file).and_then(|source| {
+            format_source(&source)
+                .map(|formatted| (source, formatted))
+                .map_err(|e| fmt_err_to_cli(&file.path, e))
+        });
+        match outcome {
+            Err(err) => {
+                if let Some(earlier) = refusal.replace(err) {
+                    crate::screen::report_error(&earlier);
+                }
+            }
+            // After a refusal nothing is written; the rest are formatted only
+            // to report their own refusals.
+            Ok((source, formatted)) if source != formatted && refusal.is_none() => {
+                changed(file, source, formatted)?;
+            }
+            Ok(_) => {}
+        }
+    }
+    refusal.map_or(Ok(()), Err)
+}
+
+/// Charge one held rewrite of `path` to `held`, refusing past `cap` bytes.
+fn hold_rewrite(
+    held: &mut u64,
+    cap: u64,
+    path: &Path,
+    source: &str,
+    formatted: &str,
+) -> Result<(), CliError> {
+    let size = u64::try_from(source.len().saturating_add(formatted.len())).unwrap_or(u64::MAX);
+    *held = held.saturating_add(size);
+    if *held > cap {
+        return Err(CliError::Usage(crate::text::msg::fmt_held_bytes_limit(
+            &cap,
+            &path.display(),
         )));
     }
+    Ok(())
+}
 
-    let mut unformatted: Vec<PathBuf> = Vec::new();
-    for file in &files {
-        let src = if walked {
-            crate::io_bounded::read_walked_source(file)?
-        } else {
-            crate::io_bounded::read_user_named(file, crate::io_bounded::SOURCE_CAP)?
+/// Write every planned rewrite while its file still holds the source it was formatted from.
+///
+/// A file edited since it was read is left as it is and named in the
+/// returned refusal; every other file is still written.
+fn write_rewrites(plan: Vec<Rewrite<'_>>) -> Result<(), CliError> {
+    let mut changed: Vec<PathBuf> = Vec::new();
+    for rewrite in plan {
+        let file = rewrite.file;
+        let written = match &file.origin {
+            FmtOrigin::Named => matches!(
+                crate::driver::rewrite_user_file_if_unchanged(
+                    &file.path,
+                    &rewrite.source,
+                    &rewrite.formatted,
+                    crate::RewriteKind::Lossless,
+                )?,
+                crate::driver::IfUnchanged::Written(_)
+            ),
+            FmtOrigin::Walked(root) => {
+                let unchanged =
+                    crate::io_bounded::read_walked_source(&file.path)? == rewrite.source;
+                if unchanged {
+                    crate::rewrite_walked_file(
+                        root,
+                        &file.path,
+                        &rewrite.formatted,
+                        crate::RewriteKind::Lossless,
+                    )?;
+                }
+                unchanged
+            }
         };
-        let formatted = format_source(&src).map_err(|e| fmt_err_to_cli(file, e))?;
-        if check {
-            if formatted != src {
-                unformatted.push(file.clone());
-            }
-        } else if formatted != src {
-            if walked {
-                crate::rewrite_walked_file(&root, file, &formatted, crate::RewriteKind::Lossless)?;
-            } else {
-                crate::rewrite_user_file(file, &formatted, crate::RewriteKind::Lossless)?;
-            }
+        if written {
             crate::screen::chatter(
                 crate::screen::Stream::Stderr,
                 crate::screen::Tone::Text,
-                &format!("formatted {}", file.display()),
+                &format!("formatted {}", file.path.display()),
             );
+        } else {
+            changed.push(file.path.clone());
         }
     }
-
-    if check {
-        return report_check(&unformatted, format);
+    if changed.is_empty() {
+        return Ok(());
     }
+    let list =
+        crate::text::TerminalBlock::lines(changed.iter().map(|p| format!("  {}", p.display())));
+    Err(CliError::Usage(
+        crate::text::msg::fmt_changed_while_formatting(&list),
+    ))
+}
 
-    Ok(())
+/// Read `file` the way its [`FmtOrigin`] allows.
+fn read_fmt_file(file: &FmtFile) -> Result<String, CliError> {
+    match file.origin {
+        FmtOrigin::Named => {
+            crate::io_bounded::read_user_named(&file.path, crate::io_bounded::SOURCE_CAP)
+        }
+        FmtOrigin::Walked(_) => crate::io_bounded::read_walked_source(&file.path),
+    }
 }
 
 /// Report a `--check` scan's result in the requested [`OutputFormat`].
@@ -321,7 +449,55 @@ fn fmt_err_to_cli(file: &Path, e: FmtError) -> CliError {
     }
 }
 
-/// The files one `ipe fmt` run formats, typed by who named them.
+/// How one file reached an `ipe fmt` run, which decides how it is read and rewritten.
+enum FmtOrigin {
+    /// Named on the command line: a final symlink is followed.
+    Named,
+    /// Found by walking this named directory: it must resolve inside it.
+    Walked(PathBuf),
+}
+
+/// One file an `ipe fmt` run formats.
+struct FmtFile {
+    /// The path as the user named it or the walk reached it.
+    path: PathBuf,
+    /// How it reached the run.
+    origin: FmtOrigin,
+}
+
+/// Every file `roots` name, once each, in the order of the file each path reaches.
+///
+/// Each root is resolved before any file is read, so a missing root refuses
+/// the run. Two paths reaching the same file (a repeated argument, a file
+/// also inside a named directory, a link) keep the first in argument order.
+fn collect_fmt_files(roots: &[PathBuf]) -> Result<Vec<FmtFile>, CliError> {
+    let mut by_file: BTreeMap<PathBuf, FmtFile> = BTreeMap::new();
+    for root in roots {
+        let found = match collect_ipe_files(root)? {
+            FmtTargets::Named(path) => vec![FmtFile {
+                path,
+                origin: FmtOrigin::Named,
+            }],
+            FmtTargets::Walked(paths) => paths
+                .into_iter()
+                .map(|path| FmtFile {
+                    path,
+                    origin: FmtOrigin::Walked(root.clone()),
+                })
+                .collect(),
+        };
+        for file in found {
+            let real = fs::canonicalize(&file.path).map_err(|e| CliError::Io {
+                path: file.path.clone(),
+                source: e,
+            })?;
+            by_file.entry(real).or_insert(file);
+        }
+    }
+    Ok(by_file.into_values().collect())
+}
+
+/// The files one root of an `ipe fmt` run names, typed by who named them.
 enum FmtTargets {
     /// The one file the user named.
     Named(PathBuf),
@@ -385,7 +561,7 @@ mod tests {
     const USAGE_FIRST_LINE: &str = "Format Ipê source files.";
 
     /// The synopsis line of the `ipe fmt` help page.
-    const USAGE_SYNOPSIS: &str = "ipe fmt [<path>]";
+    const USAGE_SYNOPSIS: &str = "ipe fmt [<path>...]";
 
     /// The human error screen of `err`, header omitted.
     fn screen_of(err: &CliError) -> String {
@@ -439,6 +615,24 @@ mod tests {
         let screen = screen_of(&err);
         assert!(screen.contains("src/A.ipe"), "{screen}");
         assert!(screen.contains("src/B.ipe"), "{screen}");
+    }
+
+    /// Held rewrite text is accepted up to the ceiling and refused one byte past it.
+    #[test]
+    fn held_rewrite_text_is_refused_one_byte_past_the_ceiling() {
+        let path = Path::new("A.ipe");
+        let mut held = 0;
+        assert!(hold_rewrite(&mut held, 10, path, "abcd", "efghij").is_ok());
+        assert_eq!(held, 10);
+        let past = hold_rewrite(&mut held, 10, path, "", "x");
+        assert!(
+            matches!(&past, Err(CliError::Usage(m)) if m.contains("A.ipe")),
+            "{past:?}"
+        );
+
+        let mut held = 0;
+        let over = hold_rewrite(&mut held, 10, path, "abcde", "fghijk");
+        assert!(matches!(over, Err(CliError::Usage(_))), "{over:?}");
     }
 
     /// A malformed command line still renders the usage page.

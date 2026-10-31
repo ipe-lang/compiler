@@ -321,10 +321,6 @@ usage: ipe diff <old-path> <new-path>
 
 ipe health: --yes does not compose with --plain / --json (a data form never mutates)
 
-## fmt-single-path
-
-fmt: expected a single <path> argument
-
 ## fmt-stdin-and-path
 
 fmt: --stdin and a <path> argument are mutually exclusive
@@ -1436,7 +1432,16 @@ stdin is not formatted (run `ipe fmt --stdin` to fix)
 
 ## fmt-no-such-path
 
-fmt: no such file or directory: {root}
+fmt: no such file or directory: {root}; nothing was formatted
+
+## fmt-changed-while-formatting
+
+these files changed while `ipe fmt` ran and were left as they are (run `ipe fmt` again):
+{list}
+
+## fmt-held-bytes-limit
+
+fmt: the files to rewrite hold more than {cap} bytes of source and formatted text at `{file}`; nothing was written. Format fewer paths at a time.
 
 ## fmt-output-too-large
 

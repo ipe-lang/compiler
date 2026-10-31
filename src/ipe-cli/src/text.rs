@@ -765,8 +765,6 @@ messages! {
     package_manifest_deps_brace_out_of_range = "package-manifest-deps-brace-out-of-range";
     /// `ipe health --yes` with a data form.
     health_yes_with_format = "health-yes-with-format";
-    /// `ipe fmt` with two paths.
-    fmt_single_path = "fmt-single-path";
     /// `ipe fmt --stdin` with a path.
     fmt_stdin_and_path = "fmt-stdin-and-path";
     /// `ipe fmt --stdin` with a data form.
@@ -1265,6 +1263,10 @@ messages! {
     fmt_stdin_unformatted = "fmt-stdin-unformatted";
     /// `ipe fmt` was given a missing path.
     fmt_no_such_path(root) = "fmt-no-such-path";
+    /// `ipe fmt` left files that changed after they were read.
+    fmt_changed_while_formatting(list: &crate::text::TerminalBlock) = "fmt-changed-while-formatting";
+    /// `ipe fmt` would hold more rewrite text than its ceiling.
+    fmt_held_bytes_limit(cap, file) = "fmt-held-bytes-limit";
     /// `ipe fmt` refused a file whose formatted output would pass its cap.
     fmt_output_too_large(file, cap) = "fmt-output-too-large";
     /// `ipe health` could not locate the home directory.
