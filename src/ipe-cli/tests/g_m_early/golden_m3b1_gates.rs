@@ -20,7 +20,6 @@
 //! match left non-exhaustive, cargo would reject it.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 fn repo_root() -> PathBuf {
     let joined = e2e_support::manifest_dir!().join("..").join("..");
@@ -45,45 +44,29 @@ fn build_ok(fixture: &str, out_suffix: &str) -> PathBuf {
     out
 }
 
-/// Behind `IPE_E2E=1`, build the emitted crate with cargo and assert stdout is
-/// exactly `3\n`. This is the load-bearing soundness check: a dropped or
-/// non-exhaustive match arm would make cargo reject the crate (or change the
-/// printed value), so a green here proves the lowering is correct, not merely
-/// diagnostic-free.
-// The `expect` guards a test-support invariant: `cargo` must spawn for the
-// E2E gate. A spawn failure means the toolchain/environment is broken, not the
-// lowering under test, so aborting is the correct failure signal.
-#[allow(clippy::expect_used)]
-fn assert_e2e_prints_three(out: &Path) {
+/// Behind `IPE_E2E=1`, build the emitted crate through
+/// [`crate::support::build_and_run_emitted`] (the shared target/isolation
+/// routing point — THE SEAL) and assert stdout is exactly `3`. This is the
+/// load-bearing soundness check: a dropped or non-exhaustive match arm would
+/// make cargo reject the crate (or change the printed value), so a green here
+/// proves the lowering is correct, not merely diagnostic-free.
+fn assert_e2e_prints_three(fixture: &str, out: &Path) {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let output = Command::new("cargo")
-        .arg("run")
-        .arg("--quiet")
-        .current_dir(out)
-        .output()
-        .expect("cargo run");
-    assert!(
-        output.status.success(),
-        "emitted crate must build+run; stderr:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        "3",
-        "emitted crate must print 3"
-    );
+    let outcome = crate::support::build_and_run_emitted(fixture, out);
+    assert_eq!(outcome.exit_code, Some(0), "emitted crate must exit 0");
+    assert_eq!(outcome.stdout.trim(), "3", "emitted crate must print 3");
 }
 
 #[test]
 fn multi_arm_tuple_case_lowers_and_runs() {
     let out = build_ok("gate_multiarm", "m3b1_gate_multiarm_emit");
-    assert_e2e_prints_three(&out);
+    assert_e2e_prints_three("gate_multiarm", &out);
 }
 
 #[test]
 fn refutable_tuple_element_lowers_and_runs() {
     let out = build_ok("gate_refutable", "m3b1_gate_refutable_emit");
-    assert_e2e_prints_three(&out);
+    assert_e2e_prints_three("gate_refutable", &out);
 }

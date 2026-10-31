@@ -137,18 +137,22 @@ fn postgres_driver_project_cargo_builds() {
     // Forward the warm shared target (IPE_ORACLE_SHARED_TARGET in CI, else an
     // ambient CARGO_TARGET_DIR a local lane set); fall back to an isolated
     // scratch dir so a bare local run stays hermetic.
-    let target = e2e_support::child_shared_target_from_env().map_or_else(
-        || {
-            std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-                .join("r_class7")
-                .join("postgres_driver_cargo_build")
-        },
-        PathBuf::from,
-    );
+    let build_target = match e2e_support::target::shared() {
+        Ok(Some(shared)) => e2e_support::target::BuildTarget::Shared(shared),
+        Ok(None) => {
+            let isolated = e2e_support::target::isolated(
+                e2e_support::target::IsolationReason::ColdBuildUnderTest,
+            );
+            let Ok(isolated) = isolated else {
+                panic!("isolated build target: {isolated:?}")
+            };
+            e2e_support::target::BuildTarget::Isolated(isolated)
+        }
+        Err(e) => panic!("shared build target: {e}"),
+    };
     #[allow(clippy::expect_used)]
-    let check_output = std::process::Command::new("cargo")
+    let check_output = e2e_support::target::cargo_command(&build_target)
         .arg("check")
-        .env("CARGO_TARGET_DIR", &target)
         .current_dir(&out)
         .output()
         .expect("cargo must spawn");
