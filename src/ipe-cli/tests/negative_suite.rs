@@ -2388,16 +2388,29 @@ fn exposed_type_names<'a>(
 /// Every `(module, type)` pair where a stdlib module brings the type into its
 /// own scope through an `import … exposing (N)` and does not export it.
 ///
-/// Read through the language's own parser. A module exporting `(..)` and a
+/// Read through the language's own parser over every importable stdlib
+/// module, embedded and compiled-source alike. A module exporting `(..)` and a
 /// type the module itself declares are left out, so each pair names a type in
-/// the module's scope by import alone.
-fn stdlib_reimported_unexported_types() -> Vec<(&'static str, String)> {
+/// the module's scope by import alone. The second list names every module the
+/// parser refused, so an unreadable module fails the caller instead of
+/// silently shrinking the enumeration.
+fn stdlib_reimported_unexported_types() -> (Vec<(&'static str, String)>, Vec<&'static str>) {
     use ipe_syntax::Exposing;
 
+    let modules = ipe_stdlib::MODULES
+        .iter()
+        .map(|module| (module.name, module.source))
+        .chain(
+            ipe_stdlib::COMPILED_STD_MODULES
+                .iter()
+                .map(|module| (module.dotted, module.source)),
+        );
     let mut pairs = Vec::new();
-    for module in ipe_stdlib::MODULES {
+    let mut unparsed = Vec::new();
+    for (module_name, source) in modules {
         let mut interner = ipe_intern::Interner::new();
-        let Ok(parsed) = ipe_parse::parse_module(module.source, &mut interner) else {
+        let Ok(parsed) = ipe_parse::parse_module(source, &mut interner) else {
+            unparsed.push(module_name);
             continue;
         };
         let Exposing::List(exports) = &parsed.exposing.value else {
@@ -2419,14 +2432,14 @@ fn stdlib_reimported_unexported_types() -> Vec<(&'static str, String)> {
                     continue;
                 }
                 if let Some(text) = interner.resolve(name) {
-                    pairs.push((module.name, text.to_owned()));
+                    pairs.push((module_name, text.to_owned()));
                 }
             }
         }
     }
     pairs.sort();
     pairs.dedup();
-    pairs
+    (pairs, unparsed)
 }
 
 /// `Main` naming `Q.{ty}` in a signature under `import {module} as Q`.
@@ -2448,7 +2461,11 @@ fn reimport_main(module: &str, ty: Option<&str>) -> String {
 /// named, so it proves nothing here and is skipped; any other code is a failure.
 #[test]
 fn a_type_imported_but_not_reexported_is_no_such_member() {
-    let pairs = stdlib_reimported_unexported_types();
+    let (pairs, unparsed) = stdlib_reimported_unexported_types();
+    assert!(
+        unparsed.is_empty(),
+        "the enumeration must read every stdlib module, the parser refused: {unparsed:?}"
+    );
     let mut seen = 0_usize;
     let mut failures = Vec::new();
     for (module, ty) in &pairs {
