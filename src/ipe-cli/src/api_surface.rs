@@ -932,5 +932,53 @@ mod tests {
             refused(&alias),
             "an uninterned kernel alias name: {alias:?}"
         );
+
+        let union_of = |name, ctor| ipe_canon::ast::Union {
+            home: Vec::new(),
+            name,
+            name_span: ipe_diagnostics::Span::DUMMY,
+            vars: Vec::new(),
+            ctors: vec![ipe_canon::ast::Ctor {
+                name: ctor,
+                index: 0,
+                arity: 0,
+                args: Vec::new(),
+                span: ipe_diagnostics::Span::DUMMY,
+            }],
+        };
+        let with_union = |def| TypedInterface {
+            unions: vec![def],
+            ..empty.clone()
+        };
+        let union_name = project_interface(
+            &with_union(union_of(foreign, foreign)),
+            &[],
+            &interner,
+            &module,
+        );
+        assert!(
+            refused(&union_name),
+            "an uninterned union name: {union_name:?}"
+        );
+
+        let mut named = ipe_intern::Interner::new();
+        let color = named.intern("Color").expect("intern the union name");
+        let uninterned_ctor = foreign_interner
+            .intern("Red")
+            .expect("intern a second foreign name");
+        assert!(
+            named.resolve(uninterned_ctor).is_none(),
+            "the constructor symbol must be foreign to `named`"
+        );
+        let ctor_name = project_interface(
+            &with_union(union_of(color, uninterned_ctor)),
+            &[],
+            &named,
+            &module,
+        );
+        assert!(
+            refused(&ctor_name),
+            "an uninterned constructor name: {ctor_name:?}"
+        );
     }
 }
