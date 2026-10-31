@@ -32,8 +32,9 @@ use ipe_diagnostics::DResult;
 use ipe_intern::{Interner, Symbol};
 
 pub use env::{
-    CtorHome, Env, KernelTypeExport, ModuleCatalog, STDLIB_MODULE_QUALIFIERS, UnionParams, VarHome,
-    bare_import_binds, const_str_eq, kernel_import_binds_last_segment, stdlib_canonical_qualifier,
+    CmdOrSub, CtorHome, Env, KernelTypeExport, ModuleCatalog, STDLIB_MODULE_QUALIFIERS,
+    UnionParams, VarHome, bare_import_binds, cmd_sub_module, const_str_eq,
+    kernel_import_binds_last_segment, stdlib_canonical_qualifier,
 };
 pub use resolve::{
     DO_BIND_MODULE, ModuleOrigin, QualifierForm, import_qualifier_forms, import_qualifiers,

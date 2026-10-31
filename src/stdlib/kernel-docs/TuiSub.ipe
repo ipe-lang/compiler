@@ -1,0 +1,43 @@
+-- | Subscriptions for a terminal UI program.
+--
+-- Everything `Sub` offers (`none`, `batch`, `every`, `map`, `subscribeTopic`,
+-- `subscribeWebSocket`), plus `onKey` for keyboard input. Combine sources
+-- with `Sub.batch`, e.g. `Sub.batch [ Sub.every 1000 Tick, Sub.onKey Key ]`.
+module TeaTuiSub exposing
+    ( onKey
+    )
+
+
+import Ipe.Ffi.Kernel as Kernel
+
+
+-- | Deliver each key the user presses as a `{ kind, value }` record.
+--
+-- `kind` names the key and `value` carries its detail; `value` is `""` unless
+-- noted:
+--
+--   * `"char"` — a printable character; `value` is that character (`"q"`,
+--     `"é"`).
+--   * `"space"` — the space bar (`value` is `""`, not `" "`).
+--   * `"enter"`, `"tab"`, `"backspace"`, `"escape"`, `"delete"`.
+--   * `"up"`, `"down"`, `"left"`, `"right"`, `"home"`, `"end"`, `"pageup"`,
+--     `"pagedown"`.
+--   * `"fn"` — a function key; `value` is its number, `"1"` to `"12"`.
+--   * `"ctrl"` — Ctrl with a letter; `value` is the lowercase letter (`"c"`
+--     for Ctrl-C). Ctrl-H arrives as `"backspace"`, Ctrl-I as `"tab"`, and
+--     Ctrl-J and Ctrl-M as `"enter"`.
+--   * `"paste-start"`, `"paste-end"` — the edges of a bracketed paste.
+--   * `"other"` — any sequence not listed above; `value` is its raw text.
+--
+-- Modifiers are not reported on their own: Shift shows only in the character
+-- it produces, Alt with a character arrives as `"escape"` and then that
+-- character, and a modifier held with a named key (Ctrl-Right) is dropped.
+-- Mouse events never reach `onKey`.
+--
+-- While the view shows focusable controls, the runtime keeps the keys that
+-- drive them: Tab and Shift-Tab (and Up and Down outside a text field) move
+-- focus, Enter and Space activate the focused control, and while a text field
+-- has focus every key goes to the field. A `"ctrl"` key always reaches
+-- `onKey`.
+onKey =
+    Kernel.kernel "TeaTuiSub_onKey"

@@ -7,7 +7,7 @@
 
 /// A decoded key. `kind` values: `enter` / `tab` / `space` / `backspace` /
 /// `escape` / `up` / `down` / `left` / `right` / `home` / `end` / `delete` /
-/// `pageup` / `pagedown` / `fn` (value = number) / `mouse` / `paste-start` /
+/// `pageup` / `pagedown` / `fn` (value = the F-key number, `1`-`12`) / `mouse` / `paste-start` /
 /// `paste-end` / `ctrl` (value = letter) / `char` (value = the character) /
 /// `other` (value = raw bytes lossily).
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -152,8 +152,18 @@ fn decode_csi(buf: &[u8]) -> (TuiKey, usize) {
                         "3" => TuiKey::of("delete"),
                         "5" => TuiKey::of("pageup"),
                         "6" => TuiKey::of("pagedown"),
-                        "11" | "12" | "13" | "14" | "15" | "17" | "18" | "19" | "20" | "21"
-                        | "23" | "24" => TuiKey::val("fn", num.clone()),
+                        "11" => TuiKey::val("fn", "1".into()),
+                        "12" => TuiKey::val("fn", "2".into()),
+                        "13" => TuiKey::val("fn", "3".into()),
+                        "14" => TuiKey::val("fn", "4".into()),
+                        "15" => TuiKey::val("fn", "5".into()),
+                        "17" => TuiKey::val("fn", "6".into()),
+                        "18" => TuiKey::val("fn", "7".into()),
+                        "19" => TuiKey::val("fn", "8".into()),
+                        "20" => TuiKey::val("fn", "9".into()),
+                        "21" => TuiKey::val("fn", "10".into()),
+                        "23" => TuiKey::val("fn", "11".into()),
+                        "24" => TuiKey::val("fn", "12".into()),
                         "200" => TuiKey::of("paste-start"),
                         "201" => TuiKey::of("paste-end"),
                         _ => TuiKey::val("other", lossy(buf.get(..end).unwrap_or(buf))),
@@ -244,6 +254,20 @@ mod tests {
         assert_eq!(decode_key(b"\x1b[3~"), (TuiKey::of("delete"), 4));
         assert_eq!(decode_key(b"\x1b[5~"), (TuiKey::of("pageup"), 4));
         assert_eq!(decode_key(&[]), (TuiKey::of("other"), 0));
+    }
+
+    // Every spelling of a function key yields its F-number, whichever escape
+    // form the terminal sends; a code no F-key owns stays `other`.
+    #[test]
+    fn function_keys_yield_their_f_number() {
+        assert_eq!(decode_key(b"\x1bOP"), (TuiKey::val("fn", "1".into()), 3));
+        assert_eq!(decode_key(b"\x1b[11~"), (TuiKey::val("fn", "1".into()), 5));
+        assert_eq!(decode_key(b"\x1b[15~"), (TuiKey::val("fn", "5".into()), 5));
+        assert_eq!(decode_key(b"\x1b[17~"), (TuiKey::val("fn", "6".into()), 5));
+        assert_eq!(decode_key(b"\x1b[21~"), (TuiKey::val("fn", "10".into()), 5));
+        assert_eq!(decode_key(b"\x1b[24~"), (TuiKey::val("fn", "12".into()), 5));
+        let (k, n) = decode_key(b"\x1b[16~");
+        assert_eq!((k.kind.as_str(), n), ("other", 5));
     }
 
     // `é` (2 bytes) followed by the lead byte of an unrelated, incomplete

@@ -1,0 +1,22 @@
+-- | Subscriptions for a line-oriented terminal program.
+--
+-- Everything `Sub` offers (`none`, `batch`, `every`, `map`, `subscribeTopic`,
+-- `subscribeWebSocket`), plus `onLine` for standard input. Combine sources
+-- with `Sub.batch`, e.g. `Sub.batch [ Sub.every 1000 Tick, Sub.onLine Line ]`.
+module TeaCliSub exposing
+    ( onLine
+    )
+
+
+import Ipe.Ffi.Kernel as Kernel
+
+
+-- | Deliver each line read from standard input, without its line ending.
+--
+-- `Sub.onLine Line` sends `Line "hello"` when the user types `hello` and
+-- presses Enter; a `\r\n` ending is removed as well as `\n`. A final line
+-- with no ending still arrives. A line past the runtime's per-line size
+-- ceiling is skipped, and input stops at the end of the stream or at a line
+-- that is not valid UTF-8.
+onLine =
+    Kernel.kernel "TeaCliSub_onLine"

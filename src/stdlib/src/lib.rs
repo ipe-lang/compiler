@@ -2064,6 +2064,43 @@ pub const DOC_ONLY_MODULES: &[DocOnlyModule] = &[
     },
 ];
 
+/// Prose for the members of one kernel registry qualifier.
+///
+/// The source is doc-only Ipê: `ipe doc` joins each exposed binding's comment
+/// to the kernel member of the same name, and shows the module comment on the
+/// pages of that qualifier. It never adds a member; which members a page lists
+/// is the resolver's export table.
+pub struct KernelDocSource {
+    /// The kernel registry qualifier the prose annotates, e.g. `Cmd` or `TeaTuiSub`.
+    pub qualifier: &'static str,
+    /// The doc-only Ipê source, embedded at compile time.
+    pub source: &'static str,
+}
+
+/// Prose for kernel members that no stdlib veneer documents.
+///
+/// `Cmd` and `Sub` annotate the member set every `Ipe.Tea.<Shape>.Cmd` and
+/// `Ipe.Tea.<Shape>.Sub` module re-exports; `TeaTuiSub` and `TeaCliSub` annotate
+/// the input subscriptions only one shape exposes.
+pub const KERNEL_DOC_SOURCES: &[KernelDocSource] = &[
+    KernelDocSource {
+        qualifier: "Cmd",
+        source: include_str!("../kernel-docs/Cmd.ipe"),
+    },
+    KernelDocSource {
+        qualifier: "Sub",
+        source: include_str!("../kernel-docs/Sub.ipe"),
+    },
+    KernelDocSource {
+        qualifier: "TeaTuiSub",
+        source: include_str!("../kernel-docs/TuiSub.ipe"),
+    },
+    KernelDocSource {
+        qualifier: "TeaCliSub",
+        source: include_str!("../kernel-docs/CliSub.ipe"),
+    },
+];
+
 /// The embedded Ipê source for a compiled-source stdlib module named by its path
 /// SEGMENTS (e.g. `["Std", "Palette"]`), or `None` when the segments name no
 /// compiled-source module.
@@ -2396,6 +2433,34 @@ mod tests {
                 "doc-only module {} must parse: {:?}",
                 m.dotted,
                 parsed.err()
+            );
+        }
+    }
+
+    /// Every kernel prose source parses with the front end that reads user code.
+    #[test]
+    fn every_kernel_doc_source_parses() {
+        for m in KERNEL_DOC_SOURCES {
+            let mut interner = Interner::new();
+            let parsed = ipe_parse::parse_module(m.source, &mut interner);
+            assert!(
+                parsed.is_ok(),
+                "kernel doc source {} must parse: {:?}",
+                m.qualifier,
+                parsed.err()
+            );
+        }
+    }
+
+    /// Each kernel registry qualifier has at most one prose source.
+    #[test]
+    fn kernel_doc_source_qualifiers_are_unique() {
+        let mut seen = std::collections::BTreeSet::new();
+        for m in KERNEL_DOC_SOURCES {
+            assert!(
+                seen.insert(m.qualifier),
+                "kernel doc qualifier {} has two sources",
+                m.qualifier
             );
         }
     }
