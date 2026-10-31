@@ -29,10 +29,10 @@ use crate::code::{
     IPE_P0003, IPE_P0010, IPE_P0011, IPE_P0012, IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016,
     IPE_P0017, IPE_P0018, IPE_P0020, IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041,
     IPE_P0050, IPE_P0060, IPE_P0061, IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066,
-    IPE_P0067, IPE_P0068, IPE_P0069, IPE_P0070, IPE_P0071, IPE_P0072, IPE_P0073, IPE_S0001,
-    IPE_S0002, IPE_S0003, IPE_S0004, IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010,
-    IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018,
-    IPE_T0019, IPE_T0020, IPE_T0021, IPE_T0022, IPE_T0023, IPE_T0024, Severity,
+    IPE_P0067, IPE_P0068, IPE_P0069, IPE_P0070, IPE_P0071, IPE_P0072, IPE_P0073, IPE_P0074,
+    IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004, IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004,
+    IPE_T0010, IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017,
+    IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021, IPE_T0022, IPE_T0023, IPE_T0024, Severity,
 };
 use crate::span::Span;
 use crate::suggest::{Confidence, Hit};
@@ -482,6 +482,12 @@ pub enum ParseError {
     /// around it. Refused in every position, literals included: a program
     /// builds such a character with `Char.fromCode`. [IPE-P0073]
     SourceTerminalControl { ch: char },
+    /// A `Module.Ctor` name where a pattern expects a constructor. Patterns
+    /// take only the bare constructor name; the fix is to bring the type's
+    /// constructors into unqualified scope with `exposing (Type(..))`.
+    /// `qualified` is the full dotted name as written, `bare` the trailing
+    /// unqualified segment. [IPE-P0074]
+    QualifiedCtorInPattern { qualified: Box<str>, bare: Box<str> },
 }
 
 /// Why a source display hazard is refused where it stands.
@@ -2407,6 +2413,9 @@ pub enum Hint {
     /// Explain that a parameter pattern must be irrefutable and suggest binding
     /// the whole value and using `case` (IPE-T0015).
     IrrefutableParameterRequired,
+    /// Suggest `import Module exposing (Type(..))` to bring a type's
+    /// constructors into unqualified scope for use in a pattern (IPE-P0074).
+    QualifiedCtorInPattern,
 }
 
 /// How confidently a [`Suggestion`] can be applied to source, mirroring rustc's
@@ -2831,6 +2840,7 @@ const fn parse_code(msg: &ParseError) -> Code {
         ParseError::LoneCarriageReturn => IPE_P0071,
         ParseError::SourceDisplayHazard { .. } => IPE_P0072,
         ParseError::SourceTerminalControl { .. } => IPE_P0073,
+        ParseError::QualifiedCtorInPattern { .. } => IPE_P0074,
     })
 }
 
@@ -3047,6 +3057,9 @@ fn parse_help(msg: &ParseError) -> Vec<HelpLine> {
         | ParseError::LoneCarriageReturn
         | ParseError::SourceDisplayHazard { .. }
         | ParseError::SourceTerminalControl { .. } => Vec::new(),
+        ParseError::QualifiedCtorInPattern { .. } => {
+            vec![HelpLine::Hint(Hint::QualifiedCtorInPattern)]
+        }
     }
 }
 

@@ -355,6 +355,8 @@ code! {
     IPE_P0072 = "IPE-P0072", "a character that breaks or reorders the displayed source", "IPE-P0072";
     /// a raw C0/C1 control a terminal showing the file runs as a cursor or screen command
     IPE_P0073 = "IPE-P0073", "a control character a terminal runs as a command", "IPE-P0073";
+    /// a `Module.Ctor` constructor reference in pattern position — patterns take the bare name
+    IPE_P0074 = "IPE-P0074", "a qualified constructor in pattern position", "IPE-P0074";
 
     // -----------------------------------------------------------------------
     // Name resolution (IPE-N####)

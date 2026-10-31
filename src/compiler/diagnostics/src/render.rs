@@ -435,6 +435,10 @@ fn parse_prose(msg: &ParseError) -> String {
         | ParseError::SourceDisplayHazard { .. }
         | ParseError::SourceTerminalControl { .. } => lexical_prose(msg),
         ParseError::Unexpected => "I couldn't make sense of this part of the file.".to_string(),
+        ParseError::QualifiedCtorInPattern { qualified, bare } => format!(
+            "`{qualified}` is a constructor, but a pattern can't name it with its \
+             module qualifier — only the bare name `{bare}` is matched here."
+        ),
     }
 }
 
@@ -551,7 +555,8 @@ fn lexical_prose(msg: &ParseError) -> String {
         | ParseError::DocOnUnexported { .. }
         | ParseError::MissingDocString { .. }
         | ParseError::AnnotationWithoutBinding { .. }
-        | ParseError::DuplicateAnnotation { .. } => {
+        | ParseError::DuplicateAnnotation { .. }
+        | ParseError::QualifiedCtorInPattern { .. } => {
             "I couldn't make sense of this part of the file.".to_string()
         }
     }
@@ -1638,6 +1643,9 @@ fn parse_label(msg: &ParseError) -> Option<String> {
         ParseError::DuplicateAnnotation { .. } => {
             Some("this name is already annotated above".to_string())
         }
+        ParseError::QualifiedCtorInPattern { bare, .. } => Some(format!(
+            "patterns match the bare name `{bare}`, not the qualified one"
+        )),
         ParseError::Unexpected
         | ParseError::TooDeep
         | ParseError::SteplessDo
@@ -2602,6 +2610,9 @@ fn hint_text(hint: Hint) -> String {
              bind the whole value and use `case`"
                 .to_string()
         }
+        Hint::QualifiedCtorInPattern => "bring the type's constructors into scope with \
+             `import Module exposing (Type(..))`, then match the bare name"
+            .to_string(),
     }
 }
 
