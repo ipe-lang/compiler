@@ -40,14 +40,14 @@ fn seed_ffi_cache(project_root: &Path) -> bool {
         "functions": [
             {
                 "name": "shift",
-                "params": [{"name": "n", "type": "i64"}],
-                "results": [{"name": "", "type": "i64"}],
+                "params": [{"name": "n", "type": "Int", "ipeType": "Int", "rustType": "i64"}],
+                "results": [{"name": "", "type": "Int", "rustType": "i64"}],
                 "effect": "pure"
             },
             {
                 "name": "clamped",
-                "params": [{"name": "n", "type": "u32"}],
-                "results": [{"name": "", "type": "u32"}],
+                "params": [{"name": "n", "type": "Int", "ipeType": "Int", "rustType": "u32"}],
+                "results": [{"name": "", "type": "Int", "rustType": "u32"}],
                 "effect": "pure"
             }
         ],
@@ -225,6 +225,10 @@ fn a_clamp_requiring_assertion_is_refused() {
     assert!(
         msg.contains("u32") && msg.contains("exact-carrier"),
         "the refusal must name the real carrier and the rule: {msg}"
+    );
+    assert!(
+        !msg.contains("Rust.Ffi.ipe"),
+        "the refusal must not be attributed to the generated module: {msg}"
     );
 }
 
@@ -467,9 +471,14 @@ fn a_result_typed_const_is_refused() {
     let _ = fs::remove_dir_all(&out);
     let err = ipe::build_fixture(&fixture, &out, &runtime)
         .expect_err("a Result-typed .const must be refused");
+    let msg = err.to_string();
     assert!(
-        err.to_string().contains("bare scalar"),
-        "the refusal must name the bare-scalar rule; got: {err}"
+        msg.contains("bare scalar"),
+        "the refusal must name the bare-scalar rule; got: {msg}"
+    );
+    assert!(
+        !msg.contains("Rust.Ffi.ipe"),
+        "the refusal must not be attributed to the generated module: {msg}"
     );
 }
 
@@ -531,4 +540,242 @@ fn const_read_emitted_crate_builds_and_runs() {
     );
 
     let _ = fs::remove_dir_all(&tmp);
+}
+
+// ── carrier identity (home crate, not spelling) ─────────────────────────────
+
+/// Seed `crate_name`'s inspection: one pure `open_client` fn returning the
+/// crate's own opaque `Client` (the same nominal in every seeded crate).
+fn client_crate_doc(crate_name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "pkg": crate_name,
+        "name": crate_name,
+        "version": "0.1.0",
+        "functions": [
+            {
+                "name": "open_client",
+                "params": [{"name": "n", "type": "Int", "ipeType": "Int", "rustType": "i64"}],
+                "results": [{"name": "", "type": "Client", "rustType": format!("{crate_name}::Client")}],
+                "effect": "pure"
+            }
+        ],
+        "errors": [],
+        "transitiveDeps": [
+            {"ident": crate_name, "name": crate_name, "version": "0.1.0"}
+        ]
+    })
+}
+
+/// A project fixture whose `Main` holds `main_ipe`, declaring `field`, with
+/// each inspection in `docs` installed into its FFI cache.
+fn seeded_fixture(main_ipe: &str, field: &str, docs: &[serde_json::Value]) -> RootFixture {
+    let fixture = RootFixture::from_tree(&SourceTree::main(main_ipe).field(field))
+        .expect("the fixture project must be written and resolved");
+    let cache = FfiCache::at_project_root(fixture.path());
+    for doc in docs {
+        assert!(
+            install_from_inspection(&cache, &doc.to_string()).is_ok(),
+            "must seed the fixture project's FFI cache with {doc}"
+        );
+    }
+    fixture
+}
+
+/// Two crates each declaring an opaque `Client`: the generated `Rust.Ffi`
+/// module names each by its home (`Rust.Ta.Client`, `Rust.Tb.Client`).
+const TWO_CLIENTS_MAIN_IPE: &str = "module Main exposing (main)\n\
+    import Ipe.Io as Io\n\
+    import Rust.Ffi\n\
+    import Rust.Ta\n\
+    import Rust.Tb\n\n\
+    openA : Int -> Result Error Rust.Ta.Client\n\
+    openA =\n\
+    \x20   Rust.Ffi.call \"ta::open_client\"\n\n\
+    openB : Int -> Result Error Rust.Tb.Client\n\
+    openB =\n\
+    \x20   Rust.Ffi.call \"tb::open_client\"\n\n\
+    main =\n\
+    \x20   case openA 1 of\n\
+    \x20       Ok _ ->\n\
+    \x20           case openB 2 of\n\
+    \x20               Ok _ -> Io.println \"both-clients\"\n\
+    \x20               Err _ -> Io.println \"err b\"\n\
+    \x20       Err _ -> Io.println \"err a\"\n";
+
+const TWO_CLIENTS_DEPENDENCIES: &str =
+    "rustDependencies = [ rustDep \"ta\" \"=0.1.0\", rustDep \"tb\" \"=0.1.0\" ]";
+
+fn two_clients_fixture() -> RootFixture {
+    seeded_fixture(
+        TWO_CLIENTS_MAIN_IPE,
+        TWO_CLIENTS_DEPENDENCIES,
+        &[client_crate_doc("ta"), client_crate_doc("tb")],
+    )
+}
+
+/// Same-named opaques from two crates are two carriers: each asserted
+/// signature resolves to its own home and the generated module imports both.
+#[test]
+fn same_named_opaques_from_two_crates_are_accepted() {
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let fixture = two_clients_fixture();
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_asserted_two_clients_out");
+    let _ = fs::remove_dir_all(&out);
+    let built = ipe::build_fixture(&fixture, &out, &runtime);
+    assert!(
+        built.is_ok(),
+        "two same-named opaques must build: {:?}",
+        built.err().map(|e| e.to_string())
+    );
+    let ffi_rs = read_emitted(&out, "src/ffi.rs");
+    for carrier in ["::ta::Client", "::tb::Client"] {
+        assert!(
+            ffi_rs.contains(carrier),
+            "each shim must carry its home's carrier {carrier}:\n{ffi_rs}"
+        );
+    }
+}
+
+/// SEAL proof under `IPE_E2E=1`: the two-`Client` program builds against two
+/// real crates and runs.
+#[test]
+fn same_named_opaques_emitted_crate_builds_and_runs() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let fixture = two_clients_fixture();
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_asserted_two_clients_e2e_out");
+    let _ = fs::remove_dir_all(&out);
+    let built = ipe::build_fixture(&fixture, &out, &runtime);
+    assert!(
+        built.is_ok(),
+        "two same-named opaques must build: {:?}",
+        built.err().map(|e| e.to_string())
+    );
+
+    let tmp = scratch("ipec_ffi_asserted_two_clients_e2e");
+    let manifest_path = out.join("Cargo.toml");
+    let mut manifest = fs::read_to_string(&manifest_path).expect("emitted Cargo.toml");
+    for name in ["ta", "tb"] {
+        let dir = tmp.join(name);
+        fs::create_dir_all(dir.join("src")).expect("mkdir crate");
+        fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .expect("crate Cargo.toml");
+        fs::write(
+            dir.join("src/lib.rs"),
+            "#[derive(Clone, Debug, PartialEq)]\n\
+             pub struct Client(pub i64);\n\
+             pub fn open_client(n: i64) -> Client { Client(n) }\n",
+        )
+        .expect("crate lib.rs");
+        let pin = format!("{name} = \"=0.1.0\"");
+        assert!(
+            manifest.contains(&pin),
+            "emitted manifest must pin {name}; got:\n{manifest}"
+        );
+        manifest = manifest.replace(
+            &pin,
+            &format!("{name} = {{ path = {:?} }}", dir.display().to_string()),
+        );
+    }
+    fs::write(&manifest_path, manifest).expect("patched Cargo.toml");
+
+    let cargo = ipe_env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    let run = std::process::Command::new(cargo)
+        .arg("run")
+        .arg("--quiet")
+        .current_dir(&out)
+        .output()
+        .expect("cargo run spawns");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        run.status.success(),
+        "emitted two-client crate must build and run exit 0.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("both-clients"),
+        "both asserted calls must succeed.\nstdout: {stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// A `define` nominal used as an asserted carrier is imported from its home
+/// crate's module.
+#[test]
+fn a_define_nominal_asserted_carrier_is_accepted() {
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let doc = serde_json::json!({
+        "pkg": "td", "name": "td", "version": "0.1.0",
+        "functions": [{
+            "name": "blob_new", "effect": "pure", "isStructCtor": true,
+            "structName": "Blob",
+            "structFields": [{ "name": "data", "type": "Bytes" }],
+            "structDerives": ["Clone"]
+        }],
+        "errors": [],
+        "transitiveDeps": [
+            {"ident": "td", "name": "td", "version": "0.1.0"}
+        ]
+    });
+    let main = "module Main exposing (main)\n\
+        import Ipe.Io as Io\n\
+        import Rust.Ffi\n\
+        import Rust.Td\n\n\
+        blobLen : Rust.Td.Blob -> Result Error Int\n\
+        blobLen =\n\
+        \x20   Rust.Ffi.call \"td::blob_len\"\n\n\
+        main =\n\
+        \x20   Io.println \"define-ok\"\n";
+    let fixture = seeded_fixture(
+        main,
+        "rustDependencies = [ rustDep \"td\" \"=0.1.0\" ]",
+        &[doc],
+    );
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_asserted_define_out");
+    let _ = fs::remove_dir_all(&out);
+    let built = ipe::build_fixture(&fixture, &out, &runtime);
+    assert!(
+        built.is_ok(),
+        "a define-nominal asserted carrier must build: {:?}",
+        built.err().map(|e| e.to_string())
+    );
+}
+
+/// A type alias the module declares is not a foreign carrier, even when its
+/// name is a wire spelling (`Str`): the refusal names the alias and is
+/// attributed to the user's assertion, never to the generated `Rust.Ffi`.
+#[test]
+fn a_local_alias_carrier_is_refused() {
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let main = "module Main exposing (main)\n\
+        import Ipe.Io as Io\n\
+        import Rust.Ffi\n\n\
+        type alias Str = Int\n\n\
+        shifted : Str -> Result Error Int\n\
+        shifted =\n\
+        \x20   Rust.Ffi.call \"tm::shift\"\n\n\
+        main =\n\
+        \x20   case shifted 1 of\n\
+        \x20       Ok _ -> Io.println \"ok\"\n\
+        \x20       Err _ -> Io.println \"err\"\n";
+    let fixture = ffi_fixture(main);
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_asserted_local_alias_out");
+    let _ = fs::remove_dir_all(&out);
+    let built = ipe::build_fixture(&fixture, &out, &runtime);
+    assert!(built.is_err(), "a local alias carrier must be refused");
+    let msg = built.err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(
+        msg.contains("`Str` is a type alias this module declares"),
+        "the refusal must name the alias as the cause: {msg}"
+    );
+    assert!(
+        !msg.contains("Rust.Ffi.ipe"),
+        "the refusal must not be attributed to the generated module: {msg}"
+    );
 }

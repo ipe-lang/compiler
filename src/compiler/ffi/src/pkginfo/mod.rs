@@ -181,6 +181,16 @@ impl Param {
     pub fn rust_type_str(&self) -> &str {
         self.rust_type.as_ref().map_or("", RustTypeExpr::as_str)
     }
+
+    /// The Rust type the inspected signature declares — the inspector's
+    /// `rustType`, or `None` when the document declares none. Never the `type`
+    /// spelling: the inspector writes the Ipê surface view there, so an
+    /// exact-carrier comparison against it would compare the Ipê view, not the
+    /// foreign identity.
+    #[must_use]
+    pub fn signature_rust_type(&self) -> Option<&str> {
+        self.rust_type.as_ref().map(RustTypeExpr::as_str)
+    }
 }
 
 /// A parametric generic block: type-param names, per-param trait bounds, and
