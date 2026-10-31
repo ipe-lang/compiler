@@ -29,7 +29,7 @@ Three knots.
 ## A worked example: a temp-dir scratchpad
 
 The example under
-[`examples/shapes/script/file-scratchpad`](../../examples/shapes/script/file-scratchpad/src/Main.ipe)
+[`examples/shapes/script/file-scratchpad`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/file-scratchpad/src/Main.ipe)
 creates a fresh temp directory, writes two notes, reads one back, and lists the
 directory — a whole session as one `do` block:
 
@@ -92,7 +92,7 @@ would depend on the disk — its result would change run to run, breaking the
 yields the same output. A `Task` *describes* the read; the runtime is the single
 place that performs it, so purity holds everywhere else.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## Writing the working tree under the jail
 

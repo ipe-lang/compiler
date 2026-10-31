@@ -4,8 +4,8 @@
 > reference for **writing `.ipe` programs**: the syntax, the stdlib surface, the
 > shapes, and the idioms. Every import path, module, kernel, type, and function
 > name below is an exact identifier the compiler accepts; use them verbatim. When
-> in doubt, ask the compiler — it is the source of truth (`ipe check`,
-> `ipe doc <Module>`, `ipe explain <CODE>`).
+> in doubt, ask the compiler — it is the source of truth (`ipe type-check`,
+> `ipe doc <Module>`, `ipe doc <CODE>`).
 >
 > This doc does not cover working *on the compiler itself* (its crates, the
 > build/test gate, kernel registration); that is a separate concern with its own
@@ -17,6 +17,7 @@
 module Main exposing (main)
 import Ipe.Task as Task
 import Ipe.Io as Io
+import Ipe.String as String
 
 type Msg = Increment | Decrement
 
@@ -289,7 +290,7 @@ entry boundary (CLI `main`, `Cmd.perform`, HTTP handler return) executes them.
 3. `Task.fail (Error.unexpected ("Operation failed (ref " ++ errId ++ ")"))` — user-facing message.
 
 Per app shape: CLI → `… |> Task.onError reportError` (return the Task directly from `main`);
-Ipe.Http.Server → `Task.onError` recovers to 4xx/5xx Response;
+Ipe.Server.Http → `Task.onError` recovers to 4xx/5xx Response;
 Ipe.Tea.Web → `Cmd.perform task ResultMsg`, dispatch updates
 `notification` / `historyError` in Model.
 
@@ -298,7 +299,7 @@ Ipe.Tea.Web → `Cmd.perform task ResultMsg`, dispatch updates
 Aim for code that is secure, correct, sound, efficient, complete, and readable
 **on the first write** — not code you patch into shape afterwards. The type
 system enforces most of this, so you often meet it as a compile error
-(`ipe explain <CODE>`); knowing it up front skips the round-trip. Four rules
+(`ipe doc <CODE>`); knowing it up front skips the round-trip. Four rules
 carry most of the weight (the snippets below illustrate the *shape* of each
 pattern — they are not literal stdlib signatures; confirm real APIs with
 `ipe doc`):
@@ -402,19 +403,19 @@ app code.
 | `Io` | `Ipe.Io` | readLine, writeStdout, writeStderr, println, eprintln (println/eprintln write a line + trailing newline to stdout/stderr) |
 | `System` | `Ipe.System` | args, getArg, getenv, getenvOr (bare), getenvInt, getenvBool, setenv, unsetenv, cwd, loadEnv, exit |
 | `Process` | `Ipe.Process` | run (subprocess) |
-| `Db` | `Ipe.Db` | open, connect, close, exec, unsafeExecRaw (verbatim-SQL escape hatch; only for DDL that cannot be parameterised — its name marks the raw-SQL injection surface), query, insertRow, getById, updateById, deleteById, findOneByField, findManyByField, findByConditions, unsafeFindWhere, queryDecode, withTransaction (on a writable SQLite database a transaction takes the write lock at its start, so a transaction that finds another writer holding the lock waits out the busy timeout at its start and, past it, fails with details `Database Db.Busy`), migrate (versioned forward-only schema migrations + `_ipe_migrations` + checksum guard), getField, getString, getInt, getBool. **Typed param binding**: `SqlValue` ADT (`SqlString`/`SqlInt`/`SqlFloat`/`SqlBool`/`SqlBytes`/`SqlDecimal`/`SqlTime`/`SqlMoney`/`SqlNull SqlValue`) — mixed-type SQL params as homogeneous `List SqlValue` for `INSERT … VALUES (?, ?, ?)` mixing `String + Maybe Int + Bool`. 8 `fromMaybe*` helpers for nullable columns. `SqlField` (`SetField SqlValue`/`OmitField`) + `Db.updateFields conn table whereCols setFields` for PATCH w/ column-omit; `Db.insertFields conn table fields` = INSERT counterpart (`OmitField` cols drop from SQL so DB applies DEFAULT; all-omit → `INSERT … DEFAULT VALUES`); `Db.upsertFields conn table conflictCols fields` = insert-or-update-in-place (`INSERT … ON CONFLICT (conflictCols) DO UPDATE SET c = excluded.c`, same SQL + semantics on SQLite and Postgres; conflict cols must be `SetField`s and are never in the SET; `OmitField` cols never overwritten; nothing left to SET → `DO NOTHING`; returns rows affected); `Db.insertFieldsReturning conn table fields projection decoder` appends `RETURNING <projection>`, decodes via `Ipe.Db.Decode`. Money serialises lossless as `"ISO_CODE AMOUNT"` TEXT, paired w/ `Db.Decode.money`. `Maybe a` params bind directly (nil/unwrapped). `nullable : Decoder a -> Decoder (Maybe a)`. |
-| `Db.Store` | `Ipe.Db.Store` | Typed, injection-safe table over `Ipe.Db`, derived from ONE `Codec`. `fromCodec` → `Draft` (schema known, deny-by-default: NO read/write). Classify to query: `public` (world-open `Store`, uses `all`/`get`/`insert`/`upsert`/…; `upsert`'s conflict target is the declared key — primary key, else the one `unique` column — never an argument, and a store without one is a typed `Err`) or `secured policy` → `Secured` (read/written ONLY via the authenticated `allAs`/`getAs`/`insertAs`/`updateAs`/`deleteAs`, each taking an `Auth.Principal`). **`Policy` builders**: `ownerColumn .col` (scope all ops to `col = $subject` + force owner on insert; never rewritten), `readOnly p` (reads `p`, every write `never`), `publicRead`/`unrestricted`, `immutable .col` (drop from update SET), `mask .col pred` (project value only when `pred`, else NULL), `alsoInsert`/`alsoUpdate`/`alsoDelete` (open a write path; a secured write the policy refuses returns `0` and writes nothing), `andPolicy` (AND-compose). **Predicate leaves** (`Pred row`): `always`/`never`/`allOf`/`anyOf`/`notPred`/`matchWhere` (lift a `Cond`), the FAIL-CLOSED caller-side `role`/`memberOf`/`claimEquals` (absent role/group/claim DENIES), and `existsIn`/`correlate` (correlated-subquery sharing). `explain policy` → the per-op WHERE as text. Owner filter compiles to bound-param `Sql.column`/`Sql.param`, never interpolation. Guide: `docs/guide/db-store.md` + `db-store-rls-composition.md`. |
+| `Db` | `Ipe.Db` | open, connect, close, exec, query, insertRow, getById, updateById, deleteById, findOneByField, findManyByField, findByConditions, findWhere, queryDecode, withTransaction (on a writable SQLite database a transaction takes the write lock at its start, so a transaction that finds another writer holding the lock waits out the busy timeout at its start and, past it, fails with details `Database Db.Busy`), migrate (versioned forward-only schema migrations + `_ipe_migrations` + checksum guard). The verbatim-SQL escape hatches (`unsafeExecRaw` — only for DDL that cannot be parameterised, its name marks the raw-SQL injection surface — plus `unsafeQuery`/`unsafeGetString`/`unsafeGetInt`/`unsafeGetBool`/`unsafeGetField`) live in `Ipe.Db.Unsafe`, not plain `Ipe.Db` (discloses the `unsafe` capability). **Typed param binding**: `SqlValue` ADT (`SqlString`/`SqlInt`/`SqlFloat`/`SqlBool`/`SqlBytes`/`SqlDecimal`/`SqlTime`/`SqlMoney`/`SqlNull SqlValue`) — mixed-type SQL params as homogeneous `List SqlValue` for `INSERT … VALUES (?, ?, ?)` mixing `String + Maybe Int + Bool`. 8 `fromMaybe*` helpers for nullable columns. `SqlField` (`SetField SqlValue`/`OmitField`) + `Db.updateFields conn table whereCols setFields` for PATCH w/ column-omit; `Db.insertFields conn table fields` = INSERT counterpart (`OmitField` cols drop from SQL so DB applies DEFAULT; all-omit → `INSERT … DEFAULT VALUES`); `Db.upsertFields conn table conflictCols fields` = insert-or-update-in-place (`INSERT … ON CONFLICT (conflictCols) DO UPDATE SET c = excluded.c`, same SQL + semantics on SQLite and Postgres; conflict cols must be `SetField`s and are never in the SET; `OmitField` cols never overwritten; nothing left to SET → `DO NOTHING`; returns rows affected); `Db.insertFieldsReturning conn table fields projection decoder` appends `RETURNING <projection>`, decodes via `Ipe.Db.Decode`. Money serialises lossless as `"ISO_CODE AMOUNT"` TEXT, paired w/ `Db.Decode.money`. `Maybe a` params bind directly (nil/unwrapped). `nullable : Decoder a -> Decoder (Maybe a)`. |
+| `Db.Store` | `Ipe.Db.Store` | Typed, injection-safe table over `Ipe.Db`, derived from ONE `Codec`. `fromCodec` → `Draft` (schema known, deny-by-default: NO read/write). Classify to query: `public` (world-open `Store`, uses `all`/`get`/`insert`/`upsert`/…; `upsert`'s conflict target is the declared key — primary key, else the one `unique` column — never an argument, and a store without one is a typed `Err`) or `secured policy` → `Secured` (read/written ONLY via the authenticated `allAs`/`getAs`/`insertAs`/`updateAs`/`deleteAs`, each taking an `Auth.Principal`). **`Policy` builders**: `ownerColumn .col` (scope all ops to `col = $subject` + force owner on insert; never rewritten), `readOnly p` (reads `p`, every write `never`), `publicRead`/`unrestricted`, `immutable .col` (drop from update SET), `mask .col pred` (project value only when `pred`, else NULL), `alsoInsert`/`alsoUpdate`/`alsoDelete` (open a write path; a secured write the policy refuses returns `0` and writes nothing), `andPolicy` (AND-compose). **Predicate leaves** (`Pred row`): `always`/`never`/`allOf`/`anyOf`/`notPred`/`matchWhere` (lift a `Cond`), the FAIL-CLOSED caller-side `role`/`memberOf`/`claimEquals` (absent role/group/claim DENIES), and `existsIn`/`correlate` (correlated-subquery sharing). `explain policy` → the per-op WHERE as text. Owner filter compiles to bound-param `Sql.column`/`Sql.param`, never interpolation. Guide: `ipe doc guide:db-store` + `ipe doc guide:db-store-rls-composition`. |
 | `Auth` | `Ipe.Auth` | register, login, setRole (Task); subject, claim, hasRole, memberOf (over `Principal`); hashPassword, hashPasswordCost, verifyPassword, passwordStrength, signToken (Result). `login` admits only a hash written at the registration cost (`register`, `hashPassword`): a `hashPasswordCost` hash at another cost is for `verifyPassword` and never logs in until rehashed with `hashPassword`. `verifyToken : Secret -> String -> Result AuthError (Dict String String)` refuses with the closed `AuthError` — `Malformed`, `BadSignature`, `Expired`, `NotYetValid`, `MissingClaim`, `Revoked`, `RevocationUnavailable`, `TooManyCredentials`, `SecretTooShort` — written `Auth.Expired` in an expression; a `case` pattern takes the bare name, so `import Ipe.Auth exposing (AuthError(..))` first; match it with `case`, never parse text. `Expired`/`NotYetValid` are judged before the signature, so they do not prove the token authentic: never answer a client differently for them than for `BadSignature`. Under `Web.withRevocation Web.revocationStore` / `Server.withRevocation` / `IPE_AUTH_REVOCATION=store`, `verifyToken` refuses a token without `sub` or `jti` and binds each token it admits to the running `Web` session or `Server` request; the session ends once a bound token is revoked (`Auth.Revocation`) or past its deadline, and a restored session re-proves its persisted tokens or starts over. |
 | `Log` | `Ipe.Log` | debug, info, warn, error, debugWith, infoWith, warnWith, errorWith — observability only (levelled, timestamped, telemetry-mirrored). For a bare line use `Io.println` / `Io.eprintln`. |
 | `Debug` | `Ipe.Debug` | log : String -> a -> a — DEV-ONLY escape hatch (Elm-style). Prints `"label: value"` to stderr, returns the value unchanged. `ipe release` REJECTS any `Debug.*` use (IPE-L0140); use `ipe dev build` / `ipe dev run` during development. |
 | `Trace` | `Ipe.Trace` | span, event, attr — opt-in app-level tracing spans. Tier-1 spans (HTTP/session/Msg/DB/Auth/Http/File) automatic. |
-| `Server` | `Ipe.Http.Server` | param, queryParam, header, getCookie, static (Layer 3 surface); higher-level `get/post/listen/text/json/html` are kernel-only |
-| `Stream` | `Ipe.Http.Server.Stream` | stream, emit, finish, withContentType — server-side streaming HTTP responses (SSE/LLM token forwarding/chunked downloads). Mirror of `Ipe.Core.Http.Stream`. Sync bridge: `Ipe.Core.Http.Stream.forEachChunk hdl body` drains an upstream stream from inside a plain Ipe.Http.Server handler (relay shape). A handler is cancelled as soon as its body ends for any reason except a server shutdown (client gone, session revoked, deadline), so cleanup must not depend on a failed `emit`. A plain response body that begins with the reserved `__ipe_stream:` prefix is refused with a 500, never served as a stream. |
+| `Server` | `Ipe.Server.Http` | param, queryParam, header, getCookie, static (Layer 3 surface); higher-level `get/post/listen/text/json/html` are kernel-only |
+| `Stream` | `Ipe.Server.Stream` | stream, emit, finish, withContentType — server-side streaming HTTP responses (SSE/LLM token forwarding/chunked downloads). Mirror of `Ipe.Core.Http.Stream`. Sync bridge: `Ipe.Core.Http.Stream.forEachChunk hdl body` drains an upstream stream from inside a plain Ipe.Server.Http handler (relay shape). A handler is cancelled as soon as its body ends for any reason except a server shutdown (client gone, session revoked, deadline), so cleanup must not depend on a failed `emit`. A plain response body that begins with the reserved `__ipe_stream:` prefix is refused with a 500, never served as a stream. |
 | `Middleware` | `Ipe.Http.Middleware` | withCors, withLogging, withBasicAuth, withRateLimit |
 | `Head` | `Ipe.Web.Head` | Per-page `<head>` injection — `title`/`meta`/`metaProperty` (OG)/`link`/`canonical`/`themeColor`/`rss`. Opt in via optional `head : Model -> List (Html msg)` field on `Web.tea` cfg. The verbatim JSON-LD `<script>` hatch `unsafeJsonLd` lives in `Ipe.Web.Head.Unsafe` (discloses the `unsafe` capability). |
 | `Console` | `Ipe.Web.Console` | `Identity` type alias (`{ subject, email, claims : Dict String String }`) for optional row-poly `consoleAuth : Request -> Task Error (Maybe Identity)` field on `Web.tea` cfg. |
 | `RateLimit` | `Ipe.Http.RateLimit` | allow |
-| `WebSocket` | `Ipe.WebSocket` (client) + `Ipe.Http.Server.WebSocket` (server) | Bidirectional sockets. Client: `connect`/`connectWith`/`send`/`sendBinary`/`close`/`closeWithCode` (Task-tier) + `onOpen`/`onMessage`/`onClose`/`onError` (Sub-tier). Server: `upgrade` (returns from a Ipe.Http.Server handler) + `sendToClient`/`sendBinaryToClient`/`broadcast`/`closeClient`. Server production gate: empty `originPatterns` returns 403 when `ENV=production`. |
+| `WebSocket` | `Ipe.WebSocket` (client) + `Ipe.Server.WebSocket` (server) | Bidirectional sockets. Client: `connect`/`connectWith`/`send`/`sendBinary`/`close`/`closeWithCode` (Task-tier) + `onOpen`/`onMessage`/`onClose`/`onError` (Sub-tier). Server: `upgrade` (returns from a Ipe.Server.Http handler) + `sendToClient`/`sendBinaryToClient`/`broadcast`/`closeClient`. Server production gate: empty `originPatterns` returns 403 when `ENV=production`. |
 | `Cache` | `Ipe.Cache` | LRU+TTL in-memory cache, `Cache k v` parametric on key+value. `CacheCfg` w/ `defaultCfg` + `withMaxEntries` (Int) / `withTTL` (`Ipe.Duration`; `Duration.zero` disables) / `withMaxBytes` (`Ipe.ByteSize`; no byte accounting, so `Cache.new` refuses any non-zero cap). `new`/`get`/`put`/`remove`/`clear`/`size`/`stats`. |
 | `Email` | `Ipe.Email` | Resend/SES/SendGrid/SMTP under one `EmailProvider` ADT. `EmailMessage`+`Attachment` records w/ `defaultMessage { from, to, subject }` + `with*` builders (`withCc`/`withBcc`/`withTextBody`/`withHtmlBody`/`withAttachment`/`withReplyTo`). `Email.send provider msg : Task Error String`. |
 | `Compression` | `Ipe.Compression` | `gzip`/`gunzip` (RFC 1952) + `zstdCompress`/`zstdDecompress` (RFC 8478). Operates on `String` (Bytes alias). |
@@ -431,7 +432,7 @@ app code.
 `default*` ctor + `with*` builder per field — always compose via builders
 so future field additions no break call sites.
 
-## Ipe.Tea.Web + Ipe.Http.Server
+## Ipe.Tea.Web + Ipe.Server.Http
 
 ### Web.tea shape
 
@@ -740,7 +741,7 @@ focused/open `<select>` skipped and reconciled on next interaction. Author
 takeaway: leave password fields uncontrolled (no `value`, no `onInput`) and
 they survive re-renders.
 
-### Ipe.Http.Server
+### Ipe.Server.Http
 
 ```elm
 main =
@@ -766,20 +767,20 @@ distinct. A literal breaking this is refused at compile time (IPE-L0156).
 `Handler` alias:
 
 ```elm
-import Ipe.Http.Server exposing (Handler)
+import Ipe.Server.Http exposing (Handler)
 
 getUser : Handler
 getUser req = ...
 ```
 
 `Handler` = transparent alias for `Request -> Task Error Response`,
-exported from `Ipe.Http.Server`. Long-form `: Request -> Task Error
+exported from `Ipe.Server.Http`. Long-form `: Request -> Task Error
 Response` still works. Same pattern works for any function-typed alias:
 `view : Renderer Msg`, `decodeUser : Decoder User`, etc.
 
 ### Dev console
 
-Every Ipe.Tea.Web/Ipe.Http.Server app auto-mounts `Ipe.Ui` dev console at
+Every Ipe.Tea.Web/Ipe.Server.Http app auto-mounts `Ipe.Ui` dev console at
 `/_ipe/console` in dev mode, alongside structured logging, Prometheus
 `/_ipe/metrics` endpoint, distributed tracing. In production (`ENV`≠dev)
 console + banner removed and metrics require auth.
@@ -1228,20 +1229,21 @@ ipe dev watch                      # file-watch rebuild + restart
 ipe type-check src/Main.ipe        # type-check only — no build, no run, no emit
 ipe fmt src/Main.ipe               # opinionated formatter (run after editing .ipe/.ipei)
                                    # test runner: place tests/Main.ipe in the
-                                   #   project root and run `ipe verify` — the
-                                   #   test stage builds and runs it automatically
-ipe db status                      # Ipe.Db migrations: applied / pending / drift
-ipe db migrate                     # apply pending Ipe.Db migrations, then exit
+                                   #   project root; `ipe test` builds + runs it
+                                   #   directly, `ipe verify` runs the whole gate
+                                   #   (format, type-check, build, test)
+ipe test                           # build + run tests/Main.ipe
+ipe verify                         # format + type-check + build + test, in order
+                                   # Ipe.Db migrations run from code, not the CLI:
+                                   #   `Db.migrate conn ms` (see the `Db` row above)
 ipe doc Ipe.List                   # one module's types + values in the terminal
 ipe doc list                       # list every documented module
 ipe doc serve [--port <n>]         # build the HTML site + preview it on loopback
 ipe doc check                      # gate: fail if an exposed binding lacks a doc-comment
-ipe health [--fix] [--verbose]     # project / environment health checks
-ipe console [--port 8025]          # standalone Ipe.Ui console (--tui for the Ipe.Tea.Terminal backend)
+ipe health [--yes]                 # project / environment health checks, consent-gated fixes
+                                   #   (--json / --plain for machine/plain output)
 ipe add <package>                  # add an FFI binding
 ipe remove <package>
-ipe install                        # regen missing FFI + deps
-ipe update                         # update deps
 ipe clean                          # remove ipe's build output (out/, .ipe/)
 ipe lsp                            # JSON-RPC LSP server (stdio)
 ipe version

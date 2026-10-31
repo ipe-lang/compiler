@@ -32,7 +32,7 @@ Write a negative with the prelude's own `negate`: `clamp (negate 40) 125 x`.
 ## A worked example: normalizing sensor readings
 
 The example under
-[`examples/shapes/script/basics-clamp-normalize`](../../examples/shapes/script/basics-clamp-normalize/src/Main.ipe)
+[`examples/shapes/script/basics-clamp-normalize`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/basics-clamp-normalize/src/Main.ipe)
 takes a list of raw thermostat readings — some physically impossible — and pins
 each into the trusted band, sorts them coldest-first, and reports the range.
 
@@ -91,7 +91,7 @@ worth having everywhere; anything larger earns its own import, which is
 [ease of use][principles]: the common path is ceremony-free, the specialized path
 is explicit.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

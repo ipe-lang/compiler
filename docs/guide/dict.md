@@ -29,7 +29,7 @@ Three knots, three ideas.
 ## A worked example: a checkout tally
 
 The example under
-[`examples/shapes/script/dict-inventory`](../../examples/shapes/script/dict-inventory/src/Main.ipe)
+[`examples/shapes/script/dict-inventory`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/dict-inventory/src/Main.ipe)
 turns a flat stream of scanned SKUs into a priced receipt. Two `Dict` idioms
 carry it: `update` to tally, `get` to price.
 
@@ -122,7 +122,7 @@ common "aggregate into a map" loop: the "key absent" and "key present" cases are
 the two constructors of the `Maybe` it hands you, so you cannot write the tally
 that forgets to initialise a new key — the `Nothing` arm is required.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

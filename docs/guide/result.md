@@ -30,7 +30,7 @@ Three knots.
 ## A worked example: a signup-form parser
 
 The example under
-[`examples/shapes/script/result-signup-form`](../../examples/shapes/script/result-signup-form/src/Main.ipe)
+[`examples/shapes/script/result-signup-form`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/result-signup-form/src/Main.ipe)
 parses a raw three-field form into a typed `Account`. The `Account` type is the
 target — and its existence is proof the input was valid, because it can only be
 built from already-parsed fields:
@@ -104,7 +104,7 @@ produces either a complete `Account` or an `Err` — never a partial one. And th
 [soundness][principles] guarantee follows from the type: because failure is an
 `Err` value rather than a panic, no bad input can make the program fall over.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

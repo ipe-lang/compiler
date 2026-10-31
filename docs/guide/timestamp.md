@@ -25,7 +25,7 @@ Three ideas.
 ## A worked example: shift and measure
 
 The example under
-[`examples/shapes/script/timestamp-scheduling`](../../examples/shapes/script/timestamp-scheduling/src/Main.ipe)
+[`examples/shapes/script/timestamp-scheduling`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/timestamp-scheduling/src/Main.ipe)
 takes a fixed instant, shifts it forward by an hour, and measures the span back
 out.
 
@@ -66,7 +66,7 @@ Clamping `diff` to a non-negative `Duration` is [soundness][principles] — the
 "never negative" invariant is enforced at construction, not left to each caller to
 remember.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 [parse]: ../idioms/parse-dont-validate.md
 
 ## References

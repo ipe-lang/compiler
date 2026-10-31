@@ -96,7 +96,7 @@ supported-and-off. Correctness dictates the state is always written, so
 `ariaExpanded`/`ariaChecked`/… render `"true"`/`"false"` rather than reusing the
 omit-on-false `boolAttribute`.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 
@@ -106,5 +106,5 @@ omit-on-false `boolAttribute`.
   same vocabulary in `Ui` terms.
 - **Sibling guides:** [HTML](html.md) — the element tree these attributes attach
   to. [HTML attributes](html-attributes.md) — the typed attribute family.
-- **Concepts:** [Make invalid states unrepresentable](../../PRINCIPLES.md) — the
+- **Concepts:** [Make invalid states unrepresentable](https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md) — the
   principle the closed vocabularies embody.

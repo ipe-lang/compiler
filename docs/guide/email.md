@@ -83,7 +83,7 @@ away there, never carried as a doomed send. And every credential being a sealed
 reach a log line, an error message, or a serialised value, and cannot be baked
 into source.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## Configuration
 

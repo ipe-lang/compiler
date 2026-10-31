@@ -35,7 +35,7 @@ Three knots.
 ## A worked example: signing and verifying
 
 The example under
-[`examples/shapes/script/crypto-sign`](../../examples/shapes/script/crypto-sign/src/Main.ipe)
+[`examples/shapes/script/crypto-sign`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/crypto-sign/src/Main.ipe)
 hashes a string, builds a signing key once, signs a message, and verifies both a
 correct and a tampered signature.
 
@@ -82,7 +82,7 @@ reachable, because a `Mac` is opaque. Generating the AEAD nonce internally is th
 same idea — the single most common way to catastrophically misuse AES-GCM (nonce
 reuse) is removed by never letting the caller supply one.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

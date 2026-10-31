@@ -26,7 +26,7 @@ Three knots.
 ## A worked example: a gzip round-trip
 
 The example under
-[`examples/shapes/script/compression-round-trip`](../../examples/shapes/script/compression-round-trip/src/Main.ipe)
+[`examples/shapes/script/compression-round-trip`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/compression-round-trip/src/Main.ipe)
 compresses a repetitive payload, reports the size it saved, decompresses, and
 confirms the bytes came back identical.
 
@@ -78,7 +78,7 @@ Returning a `Task Error Bytes` rather than a bare value is [correctness][princip
 never a decompressor that trips the process). The lossless round-trip is the
 guarantee the whole module exists to provide.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## Configuration
 

@@ -29,7 +29,7 @@ Three knots.
 ## A worked example: the length of a path
 
 The example under
-[`examples/shapes/script/math-path-length`](../../examples/shapes/script/math-path-length/src/Main.ipe)
+[`examples/shapes/script/math-path-length`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/math-path-length/src/Main.ipe)
 measures the total length of a 2-D path and reports it four ways, then shows NaN
 detection.
 
@@ -96,7 +96,7 @@ The four separate rounding functions are [ease of use][principles] and
 mode argument you might set wrong, each direction is its own named function, so
 the code *says* which rounding it means and a reader cannot misread it.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

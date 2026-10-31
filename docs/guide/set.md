@@ -28,7 +28,7 @@ Three knots trip up a first-time reader; each is one idea.
 ## A worked example: role-based access control
 
 The example under
-[`examples/shapes/script/set-access-control`](../../examples/shapes/script/set-access-control/src/Main.ipe)
+[`examples/shapes/script/set-access-control`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/set-access-control/src/Main.ipe)
 decides whether a user may perform an action, using nothing but set algebra. Each
 role grants a set of permissions; a user's *effective* permissions are the union
 of their roles; an action *requires* a set; access is a subset test.
@@ -131,7 +131,7 @@ every required permission?" loop is easy to get wrong at the boundaries — the
 empty case, the duplicate, the off-by-one. `Set.diff` and `Set.isEmpty` state the
 intent directly and carry no boundaries to fumble.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

@@ -30,7 +30,7 @@ Three knots.
 ## A worked example: a themed stylesheet
 
 The example under
-[`examples/shapes/script/css-theme-stylesheet`](../../examples/shapes/script/css-theme-stylesheet/src/Main.ipe)
+[`examples/shapes/script/css-theme-stylesheet`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/css-theme-stylesheet/src/Main.ipe)
 builds a card rule, a responsive override, and — to show the gate — a rule with
 an injected selector, then renders them.
 
@@ -81,7 +81,7 @@ classic injection sink (`</style>`, `@import` SSRF, `javascript:` URLs), and the
 DSL closes it by construction: an unsafe value becomes an explicit `Dropped`
 state in the type, not a broken string in the page.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

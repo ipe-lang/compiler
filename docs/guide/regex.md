@@ -30,7 +30,7 @@ Three knots.
 ## A worked example: scrubbing a log
 
 The example under
-[`examples/shapes/script/regex-log-scrub`](../../examples/shapes/script/regex-log-scrub/src/Main.ipe)
+[`examples/shapes/script/regex-log-scrub`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/regex-log-scrub/src/Main.ipe)
 redacts sensitive values from log lines before they are stored, and collects the
 raw tokens for an audit trail.
 
@@ -107,7 +107,7 @@ denial-of-service. RE2's linear bound means the time a match takes is bounded by
 the input size, so untrusted input cannot exhaust the machine. That is the
 soundness principle's "bounded by construction" applied to matching.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

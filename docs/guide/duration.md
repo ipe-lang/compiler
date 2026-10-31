@@ -26,7 +26,7 @@ Three knots.
 ## A worked example: a timeout schedule
 
 The example under
-[`examples/shapes/script/duration-timeouts`](../../examples/shapes/script/duration-timeouts/src/Main.ipe)
+[`examples/shapes/script/duration-timeouts`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/duration-timeouts/src/Main.ipe)
 builds a per-stage timeout schedule from unit-explicit spans, including a negative
 one that clamps to zero.
 
@@ -77,7 +77,7 @@ don't validate][principles] run in reverse — the typed value travels through y
 code, and the untyped integer exists only at the runtime edge where a kernel
 demands it.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

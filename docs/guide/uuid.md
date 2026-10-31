@@ -24,7 +24,7 @@ Three knots.
 ## A worked example: minting record ids
 
 The example under
-[`examples/shapes/script/uuid-record-ids`](../../examples/shapes/script/uuid-record-ids/src/Main.ipe)
+[`examples/shapes/script/uuid-record-ids`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/uuid-record-ids/src/Main.ipe)
 mints a batch of time-ordered ids and checks the properties that hold for *any*
 entropy, so it is deterministic despite the randomness.
 
@@ -88,7 +88,7 @@ offering `v4` *and* `v7` as distinct functions is [correctness][principles] made
 explicit — the sortability trade-off is a named choice in the code, not a hidden
 property a reader has to know to reason about.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

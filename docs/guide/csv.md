@@ -27,7 +27,7 @@ Three knots.
 ## A worked example: filtering an export
 
 The example under
-[`examples/shapes/script/csv-report`](../../examples/shapes/script/csv-report/src/Main.ipe)
+[`examples/shapes/script/csv-report`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/csv-report/src/Main.ipe)
 parses an orders export, keeps only the shipped rows, and re-encodes them.
 
 Filtering is an ordinary `List.filter` over the typed `rows`, rebuilt into the
@@ -92,7 +92,7 @@ value with an embedded comma or quote is a classic injection/corruption vector f
 a hand-rolled CSV writer; the library's RFC-4180 quoting closes it by
 construction, and guarantees the output parses back to the same rows.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## Configuration
 

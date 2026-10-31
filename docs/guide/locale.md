@@ -31,7 +31,7 @@ without needing to tour the rest of the API.
 ## A worked example: the Turkish dotless-i
 
 The example under
-[`examples/shapes/script/locale-turkish-i`](../../examples/shapes/script/locale-turkish-i/src/Main.ipe)
+[`examples/shapes/script/locale-turkish-i`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/locale-turkish-i/src/Main.ipe)
 parses two locales at the single boundary — `"tr"` (Turkish) and `"en"` (English)
 — then compares their upper- and lower-casing of the same word, and shows `fromTag`
 returning `Nothing` on a structurally invalid tag.
@@ -107,7 +107,7 @@ a string *given* a locale. `Locale` itself is a pure parse-validated handle; the
 transformation is the string's concern. This keeps `Ipe.Locale` small (only
 `fromTag` and `toTag`) and `Ipe.String` the single home for all text transforms.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

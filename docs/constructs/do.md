@@ -35,26 +35,33 @@ aliased `Task` never stands in for it. Without the import each `<-` is
 
 ## Example
 
-    import Ipe.Io as Io
-    import Ipe.Task
+```ipe
+import Ipe.Io as Io
+import Ipe.Task
 
-    greet : Task Error ()
-    greet =
-        do
-            name <- Io.readLine
-            greeting = "Hello, " ++ name ++ "!"
-            Io.println greeting
+greet : Task Error ()
+greet =
+    do
+        name <- Io.readLine ()
+        greeting = "Hello, " ++ name ++ "!"
+        Io.println greeting
+```
 
 ## Desugaring
 
 The `do` block above is equivalent to:
 
-    greet : Task Error ()
-    greet =
-        Io.readLine
-            |> Task.andThen (\name ->
-                let greeting = "Hello, " ++ name ++ "!" in
-                Io.println greeting)
+```ipe
+import Ipe.Io as Io
+import Ipe.Task
+
+greet : Task Error ()
+greet =
+    Io.readLine ()
+        |> Task.andThen (\name ->
+            let greeting = "Hello, " ++ name ++ "!" in
+            Io.println greeting)
+```
 
 ## Notes
 

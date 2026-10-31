@@ -30,7 +30,7 @@ Three knots.
 ## A worked example: a hit, a miss, and an eviction
 
 The example under
-[`examples/shapes/script/cache-hit-miss`](../../examples/shapes/script/cache-hit-miss/src/Main.ipe)
+[`examples/shapes/script/cache-hit-miss`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/cache-hit-miss/src/Main.ipe)
 creates a two-entry cache of string sessions, reads a hit, forces an LRU eviction
 with a third key, and prints the running stats.
 
@@ -96,7 +96,7 @@ Nothing` and only unreachability is `Err`, a cold cache never makes a program
 fall over — the [soundness][principles] guarantee: an empty cache is the ordinary
 case, handled by a value, not an exception.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

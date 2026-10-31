@@ -27,7 +27,7 @@ Three knots.
 ## A worked example: a checkout span
 
 The example under
-[`examples/shapes/script/trace-checkout-span`](../../examples/shapes/script/trace-checkout-span/src/Main.ipe)
+[`examples/shapes/script/trace-checkout-span`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/trace-checkout-span/src/Main.ipe)
 wraps a two-step checkout in one named span, records an event and an attribute on
 it, and drops a `Debug.log` into the reserve step.
 
@@ -91,7 +91,7 @@ runtime's telemetry ring rather than ad-hoc prints means the trace tree the
 console shows is built from the same values the program ran, with no second,
 drift-prone source of truth.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

@@ -22,7 +22,7 @@ could have mutated between calls. This is what the [Correctness][principles]
 principle means in practice: the same well-typed program with the same input
 yields the same output.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ### Then how does anything happen?
 

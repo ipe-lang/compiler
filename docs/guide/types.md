@@ -134,7 +134,7 @@ proven free of an entire category of crashes. That is the payoff for handling
 every `Maybe`, covering every `case`, and shaping your types to exclude the
 impossible.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## Where to go next
 

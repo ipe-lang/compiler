@@ -27,7 +27,7 @@ Three knots.
 ## A worked example: a league scoreboard
 
 The example under
-[`examples/shapes/script/list-scoreboard`](../../examples/shapes/script/list-scoreboard/src/Main.ipe)
+[`examples/shapes/script/list-scoreboard`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/list-scoreboard/src/Main.ipe)
 turns a flat list of match results into a ranked standings table — the shape of a
 great many real programs: ingest rows, reduce them, sort, present.
 
@@ -133,7 +133,7 @@ says exactly what it does. And returning a `Maybe` from `head`, `find`, and the
 play — the empty and absent cases are values the compiler forces you to handle,
 never a silent out-of-bounds.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

@@ -22,7 +22,7 @@ Two ideas.
 ## A worked example: a fade
 
 The example under
-[`examples/shapes/script/transition-shorthand`](../../examples/shapes/script/transition-shorthand/src/Main.ipe)
+[`examples/shapes/script/transition-shorthand`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/transition-shorthand/src/Main.ipe)
 builds a fade — opacity, 200ms, a 50ms delay, ease-in-out — and renders it.
 
 ```ipe
@@ -56,7 +56,7 @@ string passed through. The easing constructors (`linear`, `easeInOut`,
 `cubicBezier`) are a closed set, so an unknown timing function is a compile error,
 not a silently-ignored typo.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

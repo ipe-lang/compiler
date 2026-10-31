@@ -41,7 +41,7 @@ Three knots.
 ## A worked example: public config in a browser app
 
 The example under
-[`examples/wasm/env-public`](../../examples/wasm/env-public/src/Main.ipe) is a wasm
+[`examples/wasm/env-public`](https://github.com/ipe-lang/compiler/blob/main/examples/wasm/env-public/src/Main.ipe) is a wasm
 web app. Its `package.ipe` allowlists exactly one name:
 
 ```ipe
@@ -83,7 +83,7 @@ For a native program that *should* read the live process environment — command
 tools, servers — reach for [System](system.md) (`getenv`, `getenvOr`) instead;
 `Ipe.Env` is specifically the build-time, wasm-safe surface.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

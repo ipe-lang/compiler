@@ -28,7 +28,7 @@ Three knots.
 ## A worked example: a reproducible character sheet
 
 The example under
-[`examples/shapes/script/random-character-sheet`](../../examples/shapes/script/random-character-sheet/src/Main.ipe)
+[`examples/shapes/script/random-character-sheet`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/random-character-sheet/src/Main.ipe)
 rolls a tabletop character sheet from a seed — three ability scores and six hit
 dice — using the seeded generator tier so the same seed always rolls the same
 character.
@@ -99,7 +99,7 @@ over a point-free convenience that the backend cannot yet soundly box (the
 sanctioned divergence noted in `ipe doc Ipe.Random.Generator`): threading the seed
 by return value is total and lowers cleanly.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 
@@ -112,5 +112,5 @@ by return value is total and lowers cleanly.
   entropy tier returns. [Tuples](tuple.md) — every seeded draw returns a
   `( value, nextSeed )` pair. [Lists](list.md) — `listOf` builds a `List` of draws.
 - **Concepts:** [Types and inference](types.md) — how the `Task` vs pure split is
-  tracked in the type. [Sanctioned divergence](../../PRINCIPLES.md) — why the
+  tracked in the type. [Sanctioned divergence](https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md) — why the
   generator combinators are seed-explicit.

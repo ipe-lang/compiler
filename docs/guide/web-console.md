@@ -32,7 +32,7 @@ Three knots.
 ## A worked example: gating the console
 
 The example under
-[`examples/shapes/web/console-auth`](../../examples/shapes/web/console-auth/src/Main.ipe)
+[`examples/shapes/web/console-auth`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/web/console-auth/src/Main.ipe)
 is a `Web.tea` that supplies a `consoleAuth` callback building an identity with
 the `Ipe.Web.Console` builders.
 
@@ -77,7 +77,7 @@ break existing call sites. And returning `Maybe Identity` inside a `Task` keeps
 authentication an ordinary effect the app composes, reusing the same session
 check the rest of the app already runs — one identity surface, not two.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## Configuration
 

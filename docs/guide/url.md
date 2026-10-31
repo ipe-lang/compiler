@@ -33,7 +33,7 @@ Three knots.
 ## A worked example: parse, narrow, and build
 
 The example under
-[`examples/shapes/script/url-safe-request`](../../examples/shapes/script/url-safe-request/src/Main.ipe)
+[`examples/shapes/script/url-safe-request`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/url-safe-request/src/Main.ipe)
 runs a mix of candidates through `fromString` then `checkScheme`, triages a set
 of relative references through `relative`, and builds one injection-safe query
 from attacker-controlled values.
@@ -143,7 +143,7 @@ query-injection sink instead of documenting it: [security][principles]'s
 fail-closed rule made structural, so the safe encoding is the only encoding a
 caller can reach.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

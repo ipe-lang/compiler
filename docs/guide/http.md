@@ -28,7 +28,7 @@ Three knots.
 ## A worked example: assembling requests
 
 The example under
-[`examples/shapes/script/http-request-builder`](../../examples/shapes/script/http-request-builder/src/Main.ipe)
+[`examples/shapes/script/http-request-builder`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/http-request-builder/src/Main.ipe)
 builds requests from raw string targets, parses inbound verbs, and decodes a
 query string — all without sending.
 
@@ -85,7 +85,7 @@ depend on the runtime guard being on. The closed `HttpMethod` ADT is
 [make invalid states unrepresentable][principles]: there is no "unknown verb"
 value to leak downstream, only a `Nothing` at the one parse point.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## Configuration
 

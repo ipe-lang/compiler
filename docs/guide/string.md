@@ -26,7 +26,7 @@ Three knots.
 ## A worked example: normalising a contact roster
 
 The example under
-[`examples/shapes/script/string-contacts`](../../examples/shapes/script/string-contacts/src/Main.ipe)
+[`examples/shapes/script/string-contacts`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/string-contacts/src/Main.ipe)
 turns a block of raw `Name <email>` lines — mixed case, ragged whitespace, a
 couple of malformed entries — into a clean, validated roster.
 
@@ -124,7 +124,7 @@ pipeline cannot corrupt another caller's copy. And returning `Maybe`/`Bool` from
 the parsers keeps [make invalid states unrepresentable][principles] in force — an
 un-parsable integer or a bad email is a value you handle, not a panic.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

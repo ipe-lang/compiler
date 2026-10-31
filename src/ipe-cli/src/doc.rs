@@ -1940,11 +1940,38 @@ fn build_source_only_module_doc(segments: &[String], source: &str) -> ModuleDoc 
     }
 }
 
+/// Whether `qualifier`'s prelude-registered surface exposes `member`.
+///
+/// [`ipe_canon::PRELUDE_QUALIFIERS`] is the same table
+/// [`ipe_canon`][canon]'s `Env::install_prelude_qualifiers` reads to decide
+/// what resolves off `Qualifier.member` — so a kernel relocated out of a
+/// qualifier's surface after its canon entry was registered (e.g.
+/// `Db.unsafeExecRaw`, moved to `Ipe.Db.Unsafe`) reads as absent here too,
+/// the moment it stops resolving there. One allowlist governs both the
+/// resolver and this doc page, so they cannot drift apart by hand-editing
+/// only one. A qualifier the table doesn't mention is reached through a
+/// different tier (compiled-source or `detect_kernel_alias`) this check
+/// does not govern, so it is treated as exposing every member.
+///
+/// [canon]: ipe_canon
+fn qualifier_exposes_member(qualifier: &str, member: &str) -> bool {
+    match ipe_canon::PRELUDE_QUALIFIERS
+        .iter()
+        .find(|(q, _)| *q == qualifier)
+    {
+        Some((_, members)) => members.contains(&member),
+        None => true,
+    }
+}
+
 /// Resolve one schemed kernel's module path and render its [`ValueDoc`].
 ///
 /// `Ok(None)` for a kernel with no module page: a shape-scoped routing token
-/// ([`KernelHome::ShapeScoped`]) or an internal qualifier
-/// ([`KernelHome::Internal`]) — never an invented `Ipe.<qualifier>` page.
+/// ([`KernelHome::ShapeScoped`]), an internal qualifier
+/// ([`KernelHome::Internal`]) — never an invented `Ipe.<qualifier>` page — or
+/// a kernel [`qualifier_exposes_member`] says the qualifier's own surface no
+/// longer exposes (it renders on its real home's page instead, built
+/// separately from that module's compiled source).
 ///
 /// # Errors
 /// [`CliError::Usage`] when the kernel's qualifier does not resolve to a known
@@ -1960,6 +1987,9 @@ fn kernel_value_doc(
     compiled_by_dotted: &crate::coverage::surface::QualifierModuleMap,
     compiled_by_last_segment: &crate::coverage::surface::QualifierModuleMap,
 ) -> Result<Option<(String, ValueDoc)>, CliError> {
+    if !qualifier_exposes_member(decl.qualifier, decl.name) {
+        return Ok(None);
+    }
     let home = crate::coverage::surface::kernel_module_path(
         decl.qualifier,
         qualifier_to_path,
@@ -5833,6 +5863,49 @@ mod tests {
         assert!(
             invented.is_empty(),
             "kernel docs must only page real stdlib modules, found {invented:?}",
+        );
+    }
+
+    #[test]
+    fn ipe_db_page_excludes_members_relocated_to_ipe_db_unsafe() {
+        // `Db.unsafeExecRaw` (etc.) stopped resolving off a plain `import
+        // Ipe.Db` when it was relocated to `Ipe.Db.Unsafe` — see
+        // `tests/db_unsafe_exec_raw_marker.rs`. The `Ipe.Db` doc page must
+        // agree: a newcomer who tries a name this page lists must never hit
+        // IPE-N0005.
+        let docs = build_kernel_module_docs().expect("the live kernel docs must build");
+        let db_page = docs.get("Ipe.Db").expect("Ipe.Db must have a doc page");
+        let relocated = [
+            "unsafeExecRaw",
+            "unsafeQuery",
+            "unsafeGetString",
+            "unsafeGetInt",
+            "unsafeGetBool",
+            "unsafeGetField",
+        ];
+        for name in relocated {
+            assert!(
+                !db_page.values.iter().any(|v| v.name == name),
+                "Ipe.Db's doc page must not list `{name}` — it was relocated to Ipe.Db.Unsafe \
+                 and no longer resolves off a plain `import Ipe.Db`",
+            );
+        }
+    }
+
+    #[test]
+    fn qualifier_exposes_member_excludes_a_relocated_name_but_not_a_kept_one() {
+        assert!(
+            !qualifier_exposes_member("Db", "unsafeExecRaw"),
+            "unsafeExecRaw was relocated out of the Db qualifier's PRELUDE_QUALIFIERS entry"
+        );
+        assert!(
+            qualifier_exposes_member("Db", "connect"),
+            "connect is still a plain Ipe.Db member"
+        );
+        assert!(
+            qualifier_exposes_member("NotAPreludeQualifier", "anything"),
+            "a qualifier absent from PRELUDE_QUALIFIERS is governed by a different tier, \
+             so it must not be filtered here"
         );
     }
 
