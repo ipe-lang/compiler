@@ -6318,7 +6318,8 @@ version = \"1\"
         let got = scan_asserted(&sources, &[], &ipe_ffi::unify::UnifyReport::default());
         assert!(
             matches!(&got, Err(CliError::Pipeline { .. })),
-            "an asserted call into an uninstalled crate is a pipeline refusal: {got:?}"
+            "an asserted call into an uninstalled crate is a pipeline refusal: {:?}",
+            got.as_ref().err()
         );
         let Err(CliError::Pipeline { file, src, diag }) = &got else {
             return;
