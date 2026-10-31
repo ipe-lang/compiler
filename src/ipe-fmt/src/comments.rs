@@ -299,6 +299,12 @@ pub fn anchored_in<'a>(list: &'a [Comment], mask: &Demoted, lo: usize, hi: usize
         .collect())
 }
 
+/// Print `c` at the end of a code line, after a space.
+pub fn emit_trailing(out: &mut String, c: &Comment) {
+    out.push(' ');
+    out.push_str(&c.text);
+}
+
 /// The leading comments of `list` under `mask` after its last token.
 pub fn end_of_file<'a>(list: &'a [Comment], mask: &Demoted) -> Run<'a> {
     let first = list.partition_point(|c| c.anchor.is_some());

@@ -967,6 +967,17 @@ impl ModuleText {
 // The printer
 // ---------------------------------------------------------------------------
 
+/// Where a definition's signature type sits and whether its source broke it.
+#[derive(Clone, Copy)]
+struct SignatureLayout {
+    /// The source wrote the signature across lines.
+    was_multi: bool,
+    /// The type's first byte.
+    lo: usize,
+    /// The offset just past the type.
+    hi: usize,
+}
+
 struct Printer<'a> {
     interner: &'a Interner,
     /// The source's comments, in source order (so sorted by anchor).
@@ -1113,6 +1124,84 @@ impl<'a> Printer<'a> {
             }
         }
         unplaced
+    }
+
+    /// The kept end-of-line comments owned by the token ending at
+    /// `owner_hi`, each after a space, for the end of the line that token
+    /// ends.
+    fn trail_after(&self, owner_hi: usize) -> String {
+        let owner_end = |c: &&Comment| c.owner().map_or(0, |o| o.hi);
+        let first = self.trails.partition_point(|c| owner_end(c) < owner_hi);
+        let mut out = String::new();
+        let held = self.trails.iter().zip(&self.placed).skip(first);
+        for (c, placed) in held.take_while(|(c, _)| owner_end(c) == owner_hi) {
+            comments::emit_trailing(&mut out, c);
+            placed.set(true);
+        }
+        out
+    }
+
+    /// [`Self::trail_after`] for an owner inside a node ending at `node_hi`;
+    /// empty for the node's own last token, whose comment its enclosing
+    /// composer prints at the line end it opens after the node.
+    fn trail_inside(&self, owner_hi: usize, node_hi: usize) -> String {
+        if owner_hi < node_hi {
+            self.trail_after(owner_hi)
+        } else {
+            String::new()
+        }
+    }
+
+    /// Whether a kept end-of-line comment is owned by a token inside
+    /// `[lo, hi)` short of its end: the node there needs a line end inside
+    /// it.
+    fn forces_break(&self, lo: usize, hi: usize) -> bool {
+        let first = self
+            .trails
+            .partition_point(|c| c.owner().map_or(0, |o| o.lo) < lo);
+        self.trails
+            .get(first)
+            .and_then(|c| c.owner())
+            .is_some_and(|o| o.hi < hi)
+    }
+
+    /// The end of the code token before each depth-0 `separator` of the
+    /// group of code tokens starting at `lo`, then the end of the token
+    /// before the bracket that closes the group, which ends the scan; or
+    /// before `hi`, when no bracket closes it first.
+    fn item_ends(&self, lo: usize, hi: usize, separator: TokenKind) -> Vec<usize> {
+        let first = self.code.partition_point(|t| t.lo < lo);
+        let mut ends = Vec::new();
+        let mut depth = 0usize;
+        let mut prev: Option<usize> = None;
+        for t in self.code.get(first..).unwrap_or_default() {
+            if t.lo >= hi {
+                break;
+            }
+            match t.kind {
+                TokenKind::LParen | TokenKind::LBrace | TokenKind::LBracket => {
+                    depth = depth.saturating_add(1);
+                }
+                TokenKind::RParen | TokenKind::RBrace | TokenKind::RBracket => {
+                    let Some(inner) = depth.checked_sub(1) else {
+                        ends.extend(prev);
+                        return ends;
+                    };
+                    depth = inner;
+                }
+                kind if kind == separator && depth == 0 => ends.extend(prev),
+                _ => {}
+            }
+            prev = Some(t.hi);
+        }
+        ends.extend(prev);
+        ends
+    }
+
+    /// The end of the last code token that starts before byte `pos`, `0`
+    /// when none does.
+    fn end_before(&self, pos: usize) -> usize {
+        self.token_before(pos).map_or(0, |t| t.hi)
     }
 
     /// The last code token that starts before byte `pos`.
@@ -1325,6 +1414,7 @@ impl<'a> Printer<'a> {
             let line = self.import(imp);
             comments::emit(out, &unplaced(travels, &line), zero, Tail::Glued);
             out.push_str(&line);
+            out.push_str(&self.trail_after(imp.span.hi as usize));
             out.push('\n');
         }
     }
@@ -1385,6 +1475,7 @@ impl<'a> Printer<'a> {
         comments::emit(&mut out, &hoisted, zero, hoist_tail(&head));
         comments::emit(&mut out, &head, zero, TOP_LEVEL_HEAD);
         out.push_str(&header);
+        out.push_str(&self.trail_after(self.end_before(first_item)));
         out.push('\n');
 
         self.import_block(&mut out, imports, owned_from);
@@ -1419,6 +1510,9 @@ impl<'a> Printer<'a> {
                     output: item_start..end,
                 });
             }
+            // The declaration's segment ends at its last token, as its input
+            // range does, so a splice keeps the comment after it once.
+            out.push_str(&self.trail_after(self.end_before(owner_end(start))));
             out.push('\n');
         }
 
@@ -1495,7 +1589,11 @@ impl<'a> Printer<'a> {
         };
         let above = |it: &Located<Exposed>| self.anchored(it.span.lo as usize);
         let closing = self.closing_comments(e.span);
-        let commented = !closing.is_empty() || items.iter().any(|it| !above(it).is_empty());
+        let list_hi = e.span.hi as usize;
+        let items_lo = items.first().map_or(list_hi, |it| it.span.lo as usize);
+        let commented = !closing.is_empty()
+            || items.iter().any(|it| !above(it).is_empty())
+            || self.forces_break(items_lo, list_hi);
         // The clause is multi-line iff its items do not all begin on the same
         // source line (a lone `(` or `)` line does not make it multi-line), or
         // it carries a comment it places.
@@ -1514,6 +1612,10 @@ impl<'a> Printer<'a> {
         let mut lead = "( ";
         let mut group: Vec<String> = Vec::new();
         let mut cur_line: Option<usize> = None;
+        // An item that owns an end-of-line comment ended its source line, so
+        // it is the last of its group and its comment ends the group's line.
+        let ends = self.item_ends(items_lo, list_hi, TokenKind::Comma);
+        let ends = (ends.len() == items.len()).then_some(ends);
         for (i, it) in items.iter().enumerate() {
             let line = self.line_of(it.span.lo);
             let run = above(it);
@@ -1526,7 +1628,12 @@ impl<'a> Printer<'a> {
                 comments::emit(&mut out, &run, pad, Tail::Glued);
             }
             cur_line = Some(line);
-            group.push(self.exposed(&it.value));
+            let trail = ends
+                .as_ref()
+                .and_then(|ends| ends.get(i))
+                .map(|&end| self.trail_inside(end, list_hi))
+                .unwrap_or_default();
+            group.push(format!("{}{trail}", self.exposed(&it.value)));
         }
         push_exposing_group(&mut out, &mut group, &mut lead, pad);
         comments::emit(&mut out, &closing, pad, Tail::Glued);
@@ -1593,7 +1700,7 @@ impl<'a> Printer<'a> {
         } = f;
         let head = type_annotation.as_ref().map_or_else(
             || self.sym(name.value),
-            |ann| self.signature(name.value, &ann.value, false),
+            |ann| self.signature(name.value, &ann.value, None),
         );
         // A comment inside the head (outside a record field's own) prints at
         // the start of the body, where a second pass reads it as the body's.
@@ -1647,6 +1754,16 @@ impl<'a> Printer<'a> {
             let run = self.type_comments(&c.value.args, c.span.lo as usize, hi);
             open_line(&mut s, &run, pad);
             let _ = write!(s, "{lead} {}", self.ctor(&c.value));
+            // The constructor's last token is the one before the next `|`; the
+            // last constructor's comment is the declaration's.
+            let trail = uv
+                .ctors
+                .get(idx + 1)
+                .and_then(|next| self.token_before(next.span.lo as usize))
+                .filter(|pipe| pipe.kind == TokenKind::Pipe)
+                .map(|pipe| self.trail_inside(self.end_before(pipe.lo), u.span.hi as usize))
+                .unwrap_or_default();
+            s.push_str(&trail);
         }
         s
     }
@@ -1712,7 +1829,13 @@ impl<'a> Printer<'a> {
             let (lo, hi) = (ann.span.lo as usize, ann.span.hi as usize);
             let inside =
                 self.type_comments(std::slice::from_ref(&ann.value), lo.max(start + 1), hi);
-            s.push_str(&self.signature(v.name.value, &ann.value, self.was_multiline(ann.span)));
+            let layout = Some(SignatureLayout {
+                was_multi: self.was_multiline(ann.span),
+                lo,
+                hi,
+            });
+            s.push_str(&self.signature(v.name.value, &ann.value, layout));
+            s.push_str(&self.trail_after(hi));
             s.push('\n');
             // A comment written between the type annotation and the binding
             // name (e.g. `-- c` in `main : Int\n-- c\nmain = 42`) attaches to
@@ -1755,9 +1878,19 @@ impl<'a> Printer<'a> {
     /// out four-space indented beneath — an arrow chain becomes one segment per
     /// line, the first bare and each subsequent one with a leading `->`. The
     /// modal trigger (`was_multi`) mirrors the record / list / tuple trigger.
-    fn signature(&self, name: ipe_intern::Symbol, ann: &TypeAnnotation, was_multi: bool) -> String {
+    ///
+    /// `layout` is `None` for a head that stays single-line (a `foreign`
+    /// declaration's); otherwise a broken arrow chain keeps each segment's
+    /// end-of-line comment, and a chain owning one inside breaks.
+    fn signature(
+        &self,
+        name: ipe_intern::Symbol,
+        ann: &TypeAnnotation,
+        layout: Option<SignatureLayout>,
+    ) -> String {
         let name = self.sym(name);
-        if !was_multi {
+        let multi = layout.is_some_and(|l| l.was_multi || self.forces_break(l.lo, l.hi));
+        if !multi {
             // Force a single line irrespective of width (elm-format keeps a
             // single-line signature single-line however wide it is). An arrow
             // chain is joined with ` -> `; anything else prints as one atom.
@@ -1773,8 +1906,10 @@ impl<'a> Printer<'a> {
             }
             self.pads.rewind(mark, one);
         }
-        // Multi-line: `name :` then the type at the body column.
-        let body = self.type_multiline(ann, Col::BODY);
+        // Multi-line: `name :` then the type at the body column, each arrow
+        // segment's end-of-line comment at its line end.
+        let trails = layout.map_or_else(Vec::new, |l| self.segment_trails(ann, l.lo, l.hi));
+        let body = self.type_multiline(ann, Col::BODY, &trails);
         format!("{name} :\n{body}")
     }
 
@@ -1783,16 +1918,19 @@ impl<'a> Printer<'a> {
     /// overflows the width budget breaks its arguments one per line (elm-format
     /// indents each argument one tab stop past the applied head); anything else
     /// is a single indented line.
-    fn type_multiline(&self, t: &TypeAnnotation, col: Col) -> String {
+    ///
+    /// `trails[i]` ends an arrow chain's segment `i`'s line.
+    fn type_multiline(&self, t: &TypeAnnotation, col: Col, trails: &[String]) -> String {
         let cur_pad = self.pad(col);
         match t {
             TypeAnnotation::TLambda(_, _) => {
                 let parts = self.arrow_chain(t, col);
-                let mut it = parts.into_iter();
-                let first = it.next().unwrap_or_default();
-                let mut out = format!("{cur_pad}{first}");
-                for p in it {
-                    let _ = write!(out, "\n{cur_pad}-> {p}");
+                let mut out = String::new();
+                for (i, p) in parts.iter().enumerate() {
+                    let lead = if i == 0 { "" } else { "-> " };
+                    let trail = trails.get(i).map_or("", String::as_str);
+                    let sep = if i == 0 { "" } else { "\n" };
+                    let _ = write!(out, "{sep}{cur_pad}{lead}{p}{trail}");
                 }
                 out
             }
@@ -1815,6 +1953,29 @@ impl<'a> Printer<'a> {
             }
             _ => format!("{cur_pad}{}", self.type_app(t, col)),
         }
+    }
+
+    /// The end-of-line comments ending each but the last segment of `ann`'s
+    /// arrow chain, whose type spans `[lo, hi)`: a segment ends at the token
+    /// before its depth-0 `->`.
+    ///
+    /// Empty when the chain's segments are not its depth-0 arrows (a
+    /// parenthesised arrow result), so those comments are demoted.
+    fn segment_trails(&self, ann: &TypeAnnotation, lo: usize, hi: usize) -> Vec<String> {
+        let mut segments = 1usize;
+        let mut cur = ann;
+        while let TypeAnnotation::TLambda(_, b) = cur {
+            segments = segments.saturating_add(1);
+            cur = b;
+        }
+        let ends = self.item_ends(lo, hi, TokenKind::Arrow);
+        if ends.len() != segments {
+            return Vec::new();
+        }
+        ends.iter()
+            .take(segments.saturating_sub(1))
+            .map(|&end| self.trail_inside(end, hi))
+            .collect()
     }
 
     fn type_annotation(&self, t: &TypeAnnotation, col: Col) -> String {
@@ -1968,28 +2129,41 @@ impl<'a> Printer<'a> {
             .map(|(name, _)| self.anchored(name.span.lo as usize))
             .collect();
         let has_field_comments = leading.iter().any(|cs| !cs.is_empty());
+        // A field's last token is the one before its depth-0 `,` or the
+        // closing `}`; a field owning an end-of-line comment ends its line.
+        let first_lo = fields.first().map_or(0, |(n, _)| n.span.lo as usize);
+        let ends = self.item_ends(first_lo, usize::MAX, TokenKind::Comma);
+        let trails: Vec<String> = if ends.len() == fields.len() {
+            ends.iter().map(|&end| self.trail_after(end)).collect()
+        } else {
+            Vec::new()
+        };
+        let kept = ends
+            .last()
+            .is_some_and(|&last| self.forces_break(first_lo, last.saturating_add(1)));
         let one = format!("{{ {} }}", parts.join(", "));
         // Modal, like every other collection: a record type written on one line
         // stays single-line however wide; only a source-multiline record (the
         // `force_multi` trigger), one whose own field broke, or one carrying an
         // inter-field comment (which cannot survive on a single line) lays out
         // one field per leading-comma line.
-        if !force_multi && !has_field_comments && !one.contains('\n') {
+        if !force_multi && !has_field_comments && !kept && !one.contains('\n') {
             return one;
         }
         let pad = self.pad(col);
         let inner = pad;
         let mut out = String::from("{");
         for (i, (part, lead)) in parts.iter().zip(&leading).enumerate() {
+            let trail = trails.get(i).map_or("", String::as_str);
             // The comment block precedes the field it annotates, mirroring the
             // source where the comment sits above its field.
             if i == 0 && lead.is_empty() {
-                let _ = write!(out, " {part}");
+                let _ = write!(out, " {part}{trail}");
                 continue;
             }
             open_line(&mut out, lead, inner);
             let sep = if i == 0 { " " } else { "," };
-            let _ = write!(out, "{sep} {part}");
+            let _ = write!(out, "{sep} {part}{trail}");
         }
         let _ = write!(out, "\n{pad}}}");
         out
