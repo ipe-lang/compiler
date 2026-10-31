@@ -27,7 +27,7 @@ fn repo_root() -> PathBuf {
 
 /// Run `exe` with one session env var set and `stdin` piped, returning
 /// `(exit code, stdout)`.
-fn run_with(exe: &str, var: &str, value: &Path, stdin: &[u8]) -> Option<(Option<i32>, String)> {
+fn run_with(exe: &Path, var: &str, value: &Path, stdin: &[u8]) -> Option<(Option<i32>, String)> {
     use std::io::Write as _;
     let mut child = Command::new(exe)
         .env(var, value)

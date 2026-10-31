@@ -76,7 +76,10 @@ fn dev_loop_options() -> ipe::BuildOptions {
 /// # Errors
 ///
 /// Returns an error on any pipeline or Cargo build failure.
-fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<PathBuf, BoxError> {
+fn compile_and_build(
+    test_name: &str,
+    ipe_source: &str,
+) -> Result<e2e_support::SharedBuild, BoxError> {
     let fixture = ipe::RootFixture::main(ipe_source).map_err(|e| -> BoxError {
         format!("{test_name}: cannot write the fixture: {e}").into()
     })?;
@@ -93,7 +96,7 @@ fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<PathBuf, BoxEr
     let exe = e2e_support::build_rust_binary(test_name, &out_dir)
         .map_err(|e| -> BoxError { format!("{test_name}: cargo build failed: {e}").into() })?;
 
-    Ok(PathBuf::from(exe))
+    Ok(exe)
 }
 
 /// Spawn a minimal HTTP/1.1 fixture server that handles exactly one request and

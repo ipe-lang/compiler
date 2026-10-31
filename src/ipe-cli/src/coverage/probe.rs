@@ -336,11 +336,6 @@ fn stage_outcome(result: Result<(), crate::CliError>) -> StageOutcome {
     }
 }
 
-/// The env var naming the warm shared cargo target the emitted per-probe build
-/// links its dependency tree from, set by the CI e2e / seal-slice jobs. Mirrors
-/// the golden E2E harness (`tools/e2e-support`), which reads the same variable.
-const ORACLE_SHARED_TARGET: &str = "IPE_ORACLE_SHARED_TARGET";
-
 /// Locate the `ipe` binary the probe drives `ipe dev run` through.
 ///
 /// Cargo sets `CARGO_BIN_EXE_ipe` in every integration test's environment,
@@ -362,22 +357,6 @@ fn ipe_binary() -> Result<ProvenBin, ResolveError> {
         .ok()
         .map(|p| (Source::CurrentExe, p));
     resolve_bin_from("ipe", runtime.into_iter().chain(current))
-}
-
-/// The warm shared cargo target for the emitted probe build, or `None` to
-/// inherit the ambient env (isolate).
-///
-/// Returns `Some(path)` only when `IPE_ORACLE_SHARED_TARGET` is a non-empty
-/// absolute path; anything else (absent, relative, whitespace) returns `None`.
-/// This is the same fail-safe the golden harness applies: a relative or empty
-/// value never silently pins the build to a surprising target.
-fn shared_dep_target() -> Option<String> {
-    let raw = ipe_env::var(ORACLE_SHARED_TARGET).ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || !Path::new(trimmed).is_absolute() {
-        return None;
-    }
-    Some(trimmed.to_owned())
 }
 
 /// Build and RUN a probe program, returning whether the emitted crate builds and
@@ -428,8 +407,18 @@ pub fn build_and_run(source: &str, base: &Path) -> StageOutcome {
     // Link the heavy dependency tree from the warm shared target when the CI
     // job offers one; otherwise inherit the ambient env (isolate — the default
     // for a local run).
-    if let Some(target) = shared_dep_target() {
-        cmd.env("CARGO_TARGET_DIR", target);
+    // A blank or relative shared target is refused, never read as "isolate".
+    match ipe_env::oracle_target::from_env() {
+        Ok(Some(target)) => {
+            cmd.env("CARGO_TARGET_DIR", target.into_path_buf());
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return StageOutcome::Failed {
+                code: None,
+                message: format!("{}: {e}", ipe_env::oracle_target::SHARED_VAR),
+            };
+        }
     }
 
     self_run_outcome(cmd, SELF_RUN_LIMITS)
