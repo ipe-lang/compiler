@@ -1608,6 +1608,79 @@ fn json_unknown_key(key: &str) -> String {
     format!("unknown key {shown:?}")
 }
 
+/// The refusal detail for a JSON mirror object that lists one key twice.
+fn json_duplicate_key(key: &str) -> String {
+    let shown: String = key
+        .chars()
+        .take(crate::line_grammar::MAX_KEY_ECHO)
+        .collect();
+    format!("key {shown:?} is listed twice")
+}
+
+/// Scan raw JSON `text` for the first object that lists one key twice,
+/// returning that key, decoded.
+///
+/// `serde_json::Value` keeps only the LAST value of a repeated object key —
+/// the repeat is gone before any reader working from the decoded `Value` can
+/// see it, so checking the decoded form can never catch it. This scan instead
+/// walks the raw text once, keeping one key set per currently-open object (an
+/// open array keeps no set, since a JSON array has no keys), so it catches a
+/// repeat at every nesting level in one pass: the top-level header object,
+/// each `versions` element, and a nested `signature` bundle alike. It is
+/// iterative — a growable `Vec` is the only thing input depth can grow, never
+/// the call stack — so it cannot overflow on a maliciously deep mirror.
+fn find_duplicate_json_key(text: &str) -> Option<String> {
+    let mut stack: Vec<Option<BTreeSet<String>>> = Vec::new();
+    let mut chars = text.char_indices().peekable();
+    while let Some((start, ch)) = chars.next() {
+        match ch {
+            '{' => stack.push(Some(BTreeSet::new())),
+            '[' => stack.push(None),
+            '}' | ']' => {
+                stack.pop();
+            }
+            '"' => {
+                let mut end = None;
+                while let Some((pos, inner)) = chars.next() {
+                    match inner {
+                        '\\' => {
+                            chars.next();
+                        }
+                        '"' => {
+                            end = Some(pos + inner.len_utf8());
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(end) = end else { break };
+                let Some(literal) = text.get(start..end) else {
+                    break;
+                };
+                let mut probe = chars.clone();
+                let mut follows_colon = false;
+                while let Some(&(_, next)) = probe.peek() {
+                    if next.is_whitespace() {
+                        probe.next();
+                    } else {
+                        follows_colon = next == ':';
+                        break;
+                    }
+                }
+                if follows_colon
+                    && let Some(Some(keys)) = stack.last_mut()
+                    && let Ok(decoded) = serde_json::from_str::<String>(literal)
+                    && !keys.insert(decoded.clone())
+                {
+                    return Some(decoded);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Parse the registry's per-package JSON mirror (`/packages/<name>.json`) into
 /// the SAME typed [`IndexEntry`] the TOML reader produces.
 ///
@@ -1630,10 +1703,11 @@ fn json_unknown_key(key: &str) -> String {
 /// ```
 ///
 /// # Errors
-/// [`CliError::Resolve`] when the JSON is malformed, is missing `publisher` or
-/// `versions`, lists zero versions or one version twice, or any per-version
-/// field fails its typed constructor (an unknown or repeated capability, a
-/// non-immutable `rev`, an injection-shaped `source`).
+/// [`CliError::Resolve`] when the JSON is malformed, repeats a key within one
+/// JSON object at any nesting level, is missing `publisher` or `versions`,
+/// lists zero versions or one version twice, or any per-version field fails
+/// its typed constructor (an unknown or repeated capability, a non-immutable
+/// `rev`, an injection-shaped `source`).
 pub fn parse_entry_json(name: &str, text: &str) -> Result<IndexEntry, CliError> {
     let name = &PackageName::parse(name)?;
     let malformed = |detail: &str| {
@@ -1645,6 +1719,12 @@ pub fn parse_entry_json(name: &str, text: &str) -> Result<IndexEntry, CliError> 
 
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| malformed(&format!("not valid JSON: {e}")))?;
+    // `value` already collapsed a repeated object key to its last writer —
+    // this scan runs on the raw text, before that information is lost, so a
+    // repeat is refused rather than silently last-wins at ANY nesting level.
+    if let Some(key) = find_duplicate_json_key(text) {
+        return Err(malformed(&json_duplicate_key(&key)));
+    }
     let object = value
         .as_object()
         .ok_or_else(|| malformed("top level is not a JSON object"))?;
@@ -2855,6 +2935,37 @@ mod tests {
                             "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "signature": null } ] }"#;
         let entry = super::parse_entry_json("x", json).expect("parses");
         assert!(entry.versions.first().expect("v").signature.is_none());
+    }
+
+    /// A repeated object key is refused, never last-wins, at the top-level
+    /// header object AND inside a nested `versions` element — mirroring the
+    /// TOML reader's [`EntryFault::DuplicateKey`].
+    #[test]
+    fn json_mirror_refuses_a_duplicate_key() {
+        use crate::CliError;
+        let sha = "0".repeat(64);
+        let duplicate_name = format!(
+            r#"{{ "name": "http-extras", "name": "http-extras", "publisher": "p",
+                "versions": [ {{ "version": "1.0.0",
+                    "source": "https://example.invalid/x",
+                    "rev": "{FIXTURE_REV}",
+                    "sha256": "{sha}" }} ] }}"#
+        );
+        let err = super::parse_entry_json("http-extras", &duplicate_name)
+            .expect_err("a duplicate top-level key must be refused");
+        assert!(matches!(err, CliError::Resolve(_)), "{err}");
+
+        let duplicate_rev = format!(
+            r#"{{ "name": "http-extras", "publisher": "p",
+                "versions": [ {{ "version": "1.0.0",
+                    "source": "https://example.invalid/x",
+                    "rev": "{FIXTURE_REV}",
+                    "rev": "{FIXTURE_REV}",
+                    "sha256": "{sha}" }} ] }}"#
+        );
+        let err = super::parse_entry_json("http-extras", &duplicate_rev)
+            .expect_err("a duplicate key inside a `versions` element must be refused");
+        assert!(matches!(err, CliError::Resolve(_)), "{err}");
     }
 
     /// A `publisher` that is not login-shaped is refused by both entry readers,
