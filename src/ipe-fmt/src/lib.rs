@@ -13,11 +13,13 @@
 //! at its own boundary.
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Write as _;
 use std::ops::Range;
 
-use comments::{Comment, Run, Tail, comment_multiset, unplaced};
+pub use comments::ends_node;
+use comments::{Comment, CommentKey, Demoted, OwnerTok, Run, Tail, comment_multiset, unplaced};
 pub use faithful::{Owner, RunFault};
 use ipe_diagnostics::{Diagnostic, Located, TokenKind, render};
 use ipe_intern::Interner;
@@ -73,6 +75,9 @@ pub enum RoundTripFault {
     DidNotReparse(Box<Diagnostic>),
     /// The output broke a comment run of one owner.
     CommentRun { owner: Owner, fault: RunFault },
+    /// The printer kept an end-of-line comment at no line end, even with
+    /// every comment it could not keep printed above its next code.
+    UnplacedTrailing,
 }
 
 impl fmt::Display for RoundTripFault {
@@ -95,6 +100,9 @@ impl fmt::Display for RoundTripFault {
                     f,
                     "formatted output broke a comment run of {owner}: {fault}"
                 )
+            }
+            Self::UnplacedTrailing => {
+                f.write_str("formatter could not place an end-of-line comment")
             }
         }
     }
@@ -221,8 +229,34 @@ fn scan_trivia(src: &str) -> Option<Trivia> {
         cursor = hi;
     }
     trivia_comments(src, cursor, src.len(), &mut ranges);
-    let comments = comments::scan(src, ranges, |end| anchor_after(&code, end));
+    let comments = comments::scan(
+        src,
+        ranges,
+        |end| anchor_after(&code, end),
+        |lo, hi| trailing_owner(src, &code, lo, hi),
+    );
     Some(Trivia { comments, code })
+}
+
+/// The token the comment at `[lo, hi)` trails, or `None` when it leads the
+/// code after it.
+///
+/// A comment trails the last code token before it when nothing but spaces
+/// separate them on one line, that token ends a node ([`ends_node`]), and the
+/// line ends after the comment: a `--` comment always ends its line, and a
+/// block comment trails only when a newline or the end of the file follows it
+/// before the next code token (`x {- c -} + y` leads `+ y`).
+fn trailing_owner(src: &str, code: &[CodeToken], lo: usize, hi: usize) -> Option<OwnerTok> {
+    let next = code.partition_point(|t| t.hi <= lo);
+    let t = code.get(next.checked_sub(1)?)?;
+    if !ends_node(t.kind) || src.get(t.hi..lo)?.contains('\n') {
+        return None;
+    }
+    let ends_line = src.get(lo..hi)?.starts_with("--") || {
+        let next_lo = code.get(next).map_or(src.len(), |n| n.lo);
+        next_lo >= src.len() || src.get(hi..next_lo)?.contains('\n')
+    };
+    ends_line.then_some(OwnerTok { lo: t.lo, hi: t.hi })
 }
 
 /// Push the byte range of every comment in the trivia gap `src[from..to]`.
@@ -457,6 +491,7 @@ pub fn verify_rewrite(original: &str, edited: &str) -> Result<Verified, FmtError
         &module,
         &interner,
         &input,
+        original,
         edited,
         OutputCap::for_input(original.len()),
     )
@@ -549,21 +584,108 @@ fn lex_input(src: &str) -> Result<Trivia, FmtError> {
 fn format_guarded<R: Rendering>(
     src: &str,
     cap: OutputCap,
-    render: impl FnOnce(&Printer<'_>, &Module) -> R,
+    render: impl Fn(&Printer<'_>, &Module) -> R,
 ) -> Result<R, FmtError> {
     let mut interner = Interner::new();
     let module = parse_input(src, &mut interner)?;
     let input = lex_input(src)?;
-    let printer = Printer::new(&interner, &input, Some(src), cap);
-    let rendered = render(&printer, &module);
+    let source = Source {
+        interner: &interner,
+        module: &module,
+        trivia: &input,
+        text: src,
+        cap,
+    };
+    let rendered = render_placed(&source, &render)?;
+    verify(&module, &interner, &input, src, rendered.text(), cap)?;
+    Ok(rendered)
+}
 
+/// A parsed source and the ceiling its print is held to.
+struct Source<'s> {
+    interner: &'s Interner,
+    module: &'s Module,
+    trivia: &'s Trivia,
+    text: &'s str,
+    cap: OutputCap,
+}
+
+/// Render `source` with `render`, keeping every end-of-line comment the
+/// layout gives a line end and printing every other one above its next code.
+///
+/// The first pass keeps every end-of-line comment; those it found no line
+/// end for are demoted, and a second pass prints them as leading comments of
+/// their anchor. Two passes at most: a comment the second pass still did not
+/// place is a printer fault, refused rather than written.
+///
+/// # Errors
+/// [`FmtError::Limit`] when a pass would pass the cap;
+/// [`RoundTripFault::UnplacedTrailing`] when the second pass leaves a kept
+/// comment unplaced.
+fn render_placed<R: Rendering>(
+    source: &Source<'_>,
+    render: &impl Fn(&Printer<'_>, &Module) -> R,
+) -> Result<R, FmtError> {
+    let (first, unplaced) = render_pass(source, &Demoted::default(), render)?;
+    if unplaced.is_empty() {
+        return Ok(first);
+    }
+    let demote = if demotion_disabled() {
+        Vec::new()
+    } else {
+        unplaced
+    };
+    let mask = Demoted::of(source.trivia.comments.len(), demote);
+    let (second, left) = render_pass(source, &mask, render)?;
+    if left.is_empty() {
+        Ok(second)
+    } else {
+        Err(FmtError::RoundTrip(RoundTripFault::UnplacedTrailing))
+    }
+}
+
+/// One render of `source` under `mask`, with the ordinals of the kept
+/// comments it left unplaced.
+fn render_pass<R: Rendering>(
+    source: &Source<'_>,
+    mask: &Demoted,
+    render: &impl Fn(&Printer<'_>, &Module) -> R,
+) -> Result<(R, Vec<usize>), FmtError> {
+    let printer = Printer::new(
+        source.interner,
+        source.trivia,
+        Some(source.text),
+        source.cap,
+        mask,
+    );
+    let rendered = render(&printer, source.module);
     // A refused pad rendered empty, so the text alone under-counts: the
     // budget's verdict comes before any guard reads the text.
     if printer.pads.exceeded() {
-        return Err(FmtError::Limit(FmtLimit::OutputBytes { cap }));
+        return Err(FmtError::Limit(FmtLimit::OutputBytes { cap: source.cap }));
     }
-    verify(&module, &interner, &input, rendered.text(), cap)?;
-    Ok(rendered)
+    let unplaced = printer.unplaced_trails(rendered.text());
+    Ok((rendered, unplaced))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by a test to make the second render pass demote nothing, driving
+    /// the bounded-pass refusal.
+    static NO_DEMOTION: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the second render pass is barred from demoting, a test knob.
+#[cfg(test)]
+fn demotion_disabled() -> bool {
+    NO_DEMOTION.with(Cell::get)
+}
+
+/// Whether the second render pass is barred from demoting: never outside
+/// tests.
+#[cfg(not(test))]
+const fn demotion_disabled() -> bool {
+    false
 }
 
 /// Refuse `out` as a print of `module` unless it fits `cap`, carries exactly
@@ -575,6 +697,7 @@ fn verify(
     module: &Module,
     interner: &Interner,
     input: &Trivia,
+    input_src: &str,
     out: &str,
     cap: OutputCap,
 ) -> Result<Verified, FmtError> {
@@ -611,9 +734,16 @@ fn verify(
         Err(diag) => return refuse(RoundTripFault::DidNotReparse(Box::new(diag))),
     };
 
-    // Run guard: every comment run keeps its owner, its inner gaps, and the
-    // run directly above each head keeps its gap to the head.
-    let head_runs = match faithful::check(module, input, &reparsed, &output) {
+    // Run guard: every end-of-line comment stays on its owner's line or moves
+    // above its next code, every comment run keeps its owner, its inner gaps,
+    // and the run directly above each head keeps its gap to the head.
+    let printed = faithful::Printed {
+        input,
+        input_src,
+        output: &output,
+        output_src: out,
+    };
+    let head_runs = match faithful::check(module, &reparsed, &printed) {
         Ok(head_runs) => head_runs,
         Err(faithful::Refusal::DeclCount) => return refuse(RoundTripFault::DifferentAst),
         Err(faithful::Refusal::Run { owner, fault }) => {
@@ -636,13 +766,14 @@ pub(crate) fn format_source_unchecked(src: &str) -> Result<String, FmtError> {
     let mut interner = Interner::new();
     let module = parse_input(src, &mut interner)?;
     let input = lex_input(src)?;
-    Ok(Printer::new(
-        &interner,
-        &input,
-        Some(src),
-        OutputCap::for_input(src.len()),
-    )
-    .module(&module))
+    let source = Source {
+        interner: &interner,
+        module: &module,
+        trivia: &input,
+        text: src,
+        cap: OutputCap::for_input(src.len()),
+    };
+    render_placed(&source, &|p: &Printer<'_>, m: &Module| p.module(m))
 }
 
 #[cfg(test)]
@@ -822,7 +953,8 @@ impl ModuleText {
             comments: Vec::new(),
             code: Vec::new(),
         };
-        let printer = Printer::new(i, &none, None, cap);
+        let mask = Demoted::default();
+        let printer = Printer::new(i, &none, None, cap, &mask);
         let text = printer.module(m);
         if printer.pads.exceeded() || !cap.admits(&text) {
             return Err(FmtError::Limit(FmtLimit::OutputBytes { cap }));
@@ -839,6 +971,13 @@ struct Printer<'a> {
     interner: &'a Interner,
     /// The source's comments, in source order (so sorted by anchor).
     comments: &'a [Comment],
+    /// Which end-of-line comments this render prints as leading comments.
+    mask: &'a Demoted,
+    /// The end-of-line comments this render keeps on their owner's line, in
+    /// source order (so sorted by owner token).
+    trails: Vec<&'a Comment>,
+    /// Whether each of `trails` was printed, by index into `trails`.
+    placed: Vec<Cell<bool>>,
     /// The source's code tokens, in source order.
     code: &'a [CodeToken],
     /// The original source text, used to recover elm-format's MODAL layout
@@ -870,15 +1009,21 @@ struct Printer<'a> {
 }
 
 impl<'a> Printer<'a> {
-    const fn new(
+    fn new(
         interner: &'a Interner,
         trivia: &'a Trivia,
         src: Option<&'a str>,
         cap: OutputCap,
+        mask: &'a Demoted,
     ) -> Self {
+        let trails: Vec<&'a Comment> = trivia.comments.iter().filter(|c| !mask.leads(c)).collect();
+        let placed = trails.iter().map(|_| Cell::new(false)).collect();
         Self {
             interner,
             comments: trivia.comments.as_slice(),
+            mask,
+            trails,
+            placed,
             code: trivia.code.as_slice(),
             src,
             claimed: Cell::new(None),
@@ -918,9 +1063,10 @@ impl<'a> Printer<'a> {
 
     // -- Comment placement ---------------------------------------------------
 
-    /// The comments anchored at a token starting in the byte range `[lo, hi)`.
+    /// The leading comments anchored at a token starting in the byte range
+    /// `[lo, hi)`.
     fn anchored_in(&self, lo: usize, hi: usize) -> Run<'a> {
-        comments::anchored_in(self.comments, lo, hi)
+        comments::anchored_in(self.comments, self.mask, lo, hi)
     }
 
     /// The comments anchored at the token starting at byte `pos`.
@@ -928,9 +1074,45 @@ impl<'a> Printer<'a> {
         self.anchored_in(pos, pos.saturating_add(1))
     }
 
-    /// The comments after the last token of the file.
-    fn trailing(&self) -> Run<'a> {
-        comments::trailing(self.comments)
+    /// The leading comments after the last token of the file.
+    fn end_of_file(&self) -> Run<'a> {
+        comments::end_of_file(self.comments, self.mask)
+    }
+
+    /// The ordinals of the kept end-of-line comments `text`, this printer's
+    /// output, does not hold at the end of their owner's line.
+    ///
+    /// A comment counts as placed only when a render printed it and the
+    /// output re-scans with it trailing a token of its owner's text, so a
+    /// print a composer later discarded never passes for a placement.
+    fn unplaced_trails(&self, text: &str) -> Vec<usize> {
+        if self.trails.is_empty() {
+            return Vec::new();
+        }
+        let printed = scan_trivia(text);
+        let mut held: BTreeMap<(&str, CommentKey<'_>), usize> = BTreeMap::new();
+        for c in printed.iter().flat_map(|t| t.comments.iter()) {
+            if let Some(owner) = c.owner().and_then(|o| text.get(o.lo..o.hi)) {
+                let count = held.entry((owner, c.key())).or_default();
+                *count = count.saturating_add(1);
+            }
+        }
+        let mut unplaced = Vec::new();
+        for (c, placed) in self.trails.iter().zip(&self.placed) {
+            let key = c
+                .owner()
+                .and_then(|o| self.src?.get(o.lo..o.hi))
+                .map(|owner| (owner, c.key()));
+            let found = key
+                .filter(|_| placed.get())
+                .and_then(|key| held.get_mut(&key))
+                .filter(|count| **count > 0);
+            match found {
+                Some(count) => *count = count.saturating_sub(1),
+                None => unplaced.push(c.ord()),
+            }
+        }
+        unplaced
     }
 
     /// The last code token that starts before byte `pos`.
@@ -1241,7 +1423,7 @@ impl<'a> Printer<'a> {
         }
 
         // Trailing comments after the last token.
-        let trailing = self.trailing();
+        let trailing = self.end_of_file();
         if !trailing.is_empty() {
             out.push('\n');
             comments::emit(&mut out, &trailing, zero, Tail::Glued);
@@ -4392,7 +4574,7 @@ mod tests {
     }
 
     /// The `RoundTrip` detail of formatting `src` with `render`.
-    fn refusal(src: &str, render: impl FnOnce(&Printer<'_>, &Module) -> String) -> String {
+    fn refusal(src: &str, render: impl Fn(&Printer<'_>, &Module) -> String) -> String {
         match format_guarded(src, OutputCap::for_input(src.len()), render) {
             Err(FmtError::RoundTrip(fault)) => fault.to_string(),
             other => format!("not a refusal: {other:?}"),
@@ -4713,6 +4895,153 @@ mod tests {
             verify_rewrite("not ipe @@@@", src),
             Err(FmtError::Parse { .. })
         ));
+    }
+
+    /// The owner token text of each comment of `src`, `None` for a leading
+    /// comment.
+    fn trail_owners(src: &str) -> Vec<Option<String>> {
+        scan_comments(src)
+            .iter()
+            .map(|c| {
+                c.owner()
+                    .and_then(|o| src.get(o.lo..o.hi))
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    /// A comment trails the token before it only at a line end and only after
+    /// a token that ends a node; a block comment with code after it on its
+    /// line leads that code.
+    #[test]
+    fn trailing_classifier_pins_its_boundary() {
+        let owner = |text: &str| Some(text.to_owned());
+        assert_eq!(trail_owners("x = a {- c -} + y\n"), vec![None]);
+        assert_eq!(trail_owners("x = a {- c -}\ny = 1\n"), vec![owner("a")]);
+        assert_eq!(trail_owners("x = a {- c -}"), vec![owner("a")]);
+        assert_eq!(trail_owners("x = a {-| d -}\ny = 1\n"), vec![owner("a")]);
+        assert_eq!(trail_owners("x = f y -- c\n"), vec![owner("y")]);
+        assert_eq!(trail_owners("x = (f y) -- c\n"), vec![owner(")")]);
+        assert_eq!(trail_owners("x =\n    1 -- c"), vec![owner("1")]);
+        assert_eq!(
+            trail_owners("x = a {- b -} -- c\n"),
+            vec![owner("a"), owner("a")]
+        );
+        assert_eq!(trail_owners("-- own line\nx = 1\n"), vec![None]);
+        assert_eq!(trail_owners("x = 1\n-- own line\n"), vec![None]);
+    }
+
+    /// A comment after a token that leaves its construct open leads the code
+    /// after it, whatever line it ends.
+    #[test]
+    fn comments_after_open_tokens_lead() {
+        for src in [
+            "x = -- c\n    1\n",
+            "x = case y of -- c\n    _ -> 1\n",
+            "x = a + -- c\n    b\n",
+            "x = ( -- c\n    1)\n",
+            "module M exposing -- c\n    (x)\n",
+            "x = if a then -- c\n    1 else 2\n",
+        ] {
+            assert_eq!(trail_owners(src), vec![None], "{src:?}");
+        }
+    }
+
+    /// `ends_node` is true exactly for the tokens a node can end on.
+    #[test]
+    fn ends_node_names_the_node_final_tokens() {
+        for kind in [
+            TokenKind::Ident,
+            TokenKind::Int,
+            TokenKind::Float,
+            TokenKind::Str,
+            TokenKind::Char,
+            TokenKind::Underscore,
+            TokenKind::RParen,
+            TokenKind::RBracket,
+            TokenKind::RBrace,
+        ] {
+            assert!(ends_node(kind), "{kind:?}");
+        }
+        for kind in [
+            TokenKind::Equals,
+            TokenKind::Of,
+            TokenKind::Then,
+            TokenKind::Arrow,
+            TokenKind::Comma,
+            TokenKind::LParen,
+            TokenKind::PipeGt,
+            TokenKind::Exposing,
+            TokenKind::Eof,
+        ] {
+            assert!(!ends_node(kind), "{kind:?}");
+        }
+    }
+
+    /// The fault detail of `verify_rewrite(original, edited)`.
+    fn rewrite_fault(original: &str, edited: &str) -> Option<(Owner, RunFault)> {
+        match verify_rewrite(original, edited) {
+            Err(FmtError::RoundTrip(RoundTripFault::CommentRun { owner, fault })) => {
+                Some((owner, fault))
+            }
+            _ => None,
+        }
+    }
+
+    const TRAILS_ONE: &str = "module M exposing (x)\n\n\nx =\n    [ 1 -- one\n    , 2\n    ]\n";
+
+    /// A rewrite that moves an end-of-line comment to another line's end is
+    /// refused, though it keeps every comment's text and owner.
+    #[test]
+    fn verify_refuses_an_end_of_line_comment_moved_to_another_line() {
+        let moved = "module M exposing (x)\n\n\nx =\n    [ 1\n    , 2 -- one\n    ]\n";
+        assert_eq!(
+            rewrite_fault(TRAILS_ONE, moved),
+            Some((Owner::Decl(0), RunFault::Attachment))
+        );
+    }
+
+    /// An end-of-line comment may move above its next code, never above any
+    /// other code.
+    #[test]
+    fn verify_accepts_only_a_demotion_above_the_next_code() {
+        let demoted = "module M exposing (x)\n\n\nx =\n    [ 1\n    -- one\n    , 2\n    ]\n";
+        assert!(verify_rewrite(TRAILS_ONE, demoted).is_ok());
+        let hoisted = "module M exposing (x)\n\n\n-- one\nx =\n    [ 1\n    , 2\n    ]\n";
+        assert_eq!(
+            rewrite_fault(TRAILS_ONE, hoisted),
+            Some((Owner::Decl(0), RunFault::Attachment))
+        );
+    }
+
+    /// A leading comment never joins the end of a code line.
+    #[test]
+    fn verify_refuses_a_leading_comment_moved_to_a_line_end() {
+        let leading = "module M exposing (x)\n\n\nx =\n    [ 1\n    -- one\n    , 2\n    ]\n";
+        let gained = "module M exposing (x)\n\n\nx =\n    [ 1 -- one\n    , 2\n    ]\n";
+        assert_eq!(
+            rewrite_fault(leading, gained),
+            Some((Owner::Decl(0), RunFault::Attachment))
+        );
+    }
+
+    /// A second render pass that may not demote leaves an end-of-line comment
+    /// at no line end unplaced, and the formatter refuses rather than run a
+    /// third pass.
+    #[test]
+    fn an_unplaced_end_of_line_comment_after_two_passes_is_refused() {
+        let src = "module M exposing (f)\n\n\nf x =\n    case x of\n        Just -- inner\n            y ->\n            y\n\n        _ ->\n            0\n";
+        NO_DEMOTION.with(|knob| knob.set(true));
+        let refused = format_source(src);
+        NO_DEMOTION.with(|knob| knob.set(false));
+        assert!(
+            matches!(
+                refused,
+                Err(FmtError::RoundTrip(RoundTripFault::UnplacedTrailing))
+            ),
+            "{refused:?}"
+        );
+        assert!(format_source(src).is_ok(), "demotion places it");
     }
 
     /// An operator printed as `?`, the text a symbol the printer cannot

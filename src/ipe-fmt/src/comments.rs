@@ -7,6 +7,8 @@
 use std::fmt;
 use std::fmt::Write as _;
 
+use ipe_diagnostics::TokenKind;
+
 use super::Pad;
 
 /// The whitespace between two comments, or between a comment and its anchor.
@@ -29,6 +31,84 @@ impl Gap {
     }
 }
 
+/// The code token an end-of-line comment follows: the token whose line it
+/// ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnerTok {
+    /// The token's first byte.
+    pub lo: usize,
+    /// The offset just past the token.
+    pub hi: usize,
+}
+
+/// Whether a token of `kind` can be the last token of a printed node.
+///
+/// An end-of-line comment after such a token trails it. Every other token (a
+/// keyword, an opener, a separator, an operator) leaves its construct open: a
+/// comment after it reads as a leading comment of the code that follows.
+#[must_use]
+pub const fn ends_node(kind: TokenKind) -> bool {
+    match kind {
+        TokenKind::Ident
+        | TokenKind::Int
+        | TokenKind::Float
+        | TokenKind::Str
+        | TokenKind::Char
+        | TokenKind::Underscore
+        | TokenKind::RParen
+        | TokenKind::RBracket
+        | TokenKind::RBrace => true,
+        TokenKind::Module
+        | TokenKind::Import
+        | TokenKind::Exposing
+        | TokenKind::As
+        | TokenKind::Type
+        | TokenKind::Foreign
+        | TokenKind::Case
+        | TokenKind::Of
+        | TokenKind::Let
+        | TokenKind::In
+        | TokenKind::If
+        | TokenKind::Then
+        | TokenKind::Else
+        | TokenKind::Do
+        | TokenKind::LParen
+        | TokenKind::LBrace
+        | TokenKind::LBracket
+        | TokenKind::Backslash
+        | TokenKind::DotDot
+        | TokenKind::Dot
+        | TokenKind::Comma
+        | TokenKind::Pipe
+        | TokenKind::Colon
+        | TokenKind::ColonColon
+        | TokenKind::Equals
+        | TokenKind::Arrow
+        | TokenKind::LeftArrow
+        | TokenKind::Minus
+        | TokenKind::Plus
+        | TokenKind::PlusPlus
+        | TokenKind::Star
+        | TokenKind::Slash
+        | TokenKind::SlashEq
+        | TokenKind::SlashSlash
+        | TokenKind::EqEq
+        | TokenKind::Lt
+        | TokenKind::Gt
+        | TokenKind::Le
+        | TokenKind::Ge
+        | TokenKind::AmpAmp
+        | TokenKind::PipePipe
+        | TokenKind::PipeGt
+        | TokenKind::LtPipe
+        | TokenKind::PipeEq
+        | TokenKind::PipeDot
+        | TokenKind::GtGt
+        | TokenKind::LtLt
+        | TokenKind::Eof => false,
+    }
+}
+
 /// A source comment, with where it attaches and the gaps around it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Comment {
@@ -38,8 +118,12 @@ pub struct Comment {
     /// The offset of the comment's first byte in its source.
     start: usize,
     /// The start offset of the first code token after it that can begin a
-    /// printed node, or `None` past the last token.
+    /// printed node, or `None` past the last token: where it prints as a
+    /// leading comment.
     anchor: Option<usize>,
+    /// The token it trails when it is an end-of-line comment after a token
+    /// that ends a node; `None` for a leading comment.
+    owner: Option<OwnerTok>,
     /// The gap after the previous comment; `Adjacent` when code or nothing
     /// precedes it.
     gap_before: Gap,
@@ -53,6 +137,16 @@ impl Comment {
     /// Where the comment attaches.
     pub const fn anchor(&self) -> Option<usize> {
         self.anchor
+    }
+
+    /// The token it trails, `None` for a leading comment.
+    pub const fn owner(&self) -> Option<OwnerTok> {
+        self.owner
+    }
+
+    /// Its index among the source's comments.
+    pub const fn ord(&self) -> usize {
+        self.ord
     }
 
     /// The gap after the previous comment.
@@ -87,12 +181,14 @@ impl fmt::Debug for CommentKey<'_> {
     }
 }
 
-/// The comments whose byte ranges are `ranges` in `src`, in source order,
-/// each attached at `anchor_after` its end.
+/// The comments whose byte ranges are `ranges` in `src`, in source order.
+///
+/// Each is attached at `anchor_after` its end and trails `owner_of` its range.
 pub fn scan(
     src: &str,
     ranges: Vec<(usize, usize)>,
     anchor_after: impl Fn(usize) -> Option<usize>,
+    owner_of: impl Fn(usize, usize) -> Option<OwnerTok>,
 ) -> Vec<Comment> {
     let mut prev_end: Option<usize> = None;
     ranges
@@ -110,6 +206,7 @@ pub fn scan(
                 text: src.get(lo..hi).unwrap_or_default().trim_end().to_owned(),
                 start: lo,
                 anchor: anchor_after(hi),
+                owner: owner_of(lo, hi),
                 gap_before,
                 gap_to_anchor: Gap::of(after.get(..ws_len).unwrap_or_default()),
                 ord,
@@ -161,8 +258,36 @@ impl Run<'_> {
     }
 }
 
-/// The comments of `list` anchored at a token starting in `[lo, hi)`.
-pub fn anchored_in(list: &[Comment], lo: usize, hi: usize) -> Run<'_> {
+/// The end-of-line comments a render prints as leading comments of their
+/// anchor, by comment ordinal.
+///
+/// A render keeps every other end-of-line comment on its owner's line; the
+/// mask names those the layout gave no line end after their owner.
+#[derive(Clone, Debug, Default)]
+pub struct Demoted(Vec<bool>);
+
+impl Demoted {
+    /// The mask demoting the comments whose ordinals are `ords`, out of
+    /// `count` comments.
+    pub fn of(count: usize, ords: impl IntoIterator<Item = usize>) -> Self {
+        let mut mask = vec![false; count];
+        for ord in ords {
+            if let Some(slot) = mask.get_mut(ord) {
+                *slot = true;
+            }
+        }
+        Self(mask)
+    }
+
+    /// Whether `c` prints as a leading comment of its anchor.
+    pub fn leads(&self, c: &Comment) -> bool {
+        c.owner.is_none() || self.0.get(c.ord).copied().unwrap_or(false)
+    }
+}
+
+/// The leading comments of `list` under `mask` anchored at a token starting
+/// in `[lo, hi)`.
+pub fn anchored_in<'a>(list: &'a [Comment], mask: &Demoted, lo: usize, hi: usize) -> Run<'a> {
     let key = |c: &Comment| c.anchor.unwrap_or(usize::MAX);
     let first = list.partition_point(|c| key(c) < lo);
     let end = list.partition_point(|c| key(c) < hi);
@@ -170,20 +295,28 @@ pub fn anchored_in(list: &[Comment], lo: usize, hi: usize) -> Run<'_> {
         .get(first..end.max(first))
         .unwrap_or_default()
         .iter()
+        .filter(|c| mask.leads(c))
         .collect())
 }
 
-/// The comments of `list` after its last token.
-pub fn trailing(list: &[Comment]) -> Run<'_> {
+/// The leading comments of `list` under `mask` after its last token.
+pub fn end_of_file<'a>(list: &'a [Comment], mask: &Demoted) -> Run<'a> {
     let first = list.partition_point(|c| c.anchor.is_some());
-    Run(list.get(first..).unwrap_or_default().iter().collect())
+    Run(list
+        .get(first..)
+        .unwrap_or_default()
+        .iter()
+        .filter(|c| mask.leads(c))
+        .collect())
 }
 
 /// The comments of `owned` that `rendered` does not print, in source order.
 ///
-/// `rendered` is one owner's printing; the comments it prints are matched by
-/// text, the multiset the comment guard compares. A rendering that does not
-/// lex places nothing here: the guard then refuses the whole output.
+/// `rendered` is one owner's printing; the leading comments it prints are
+/// matched by text, the multiset the comment guard compares. An end-of-line
+/// comment it keeps never stands in for a leading one of the same text. A
+/// rendering that does not lex places nothing here: the guard then refuses
+/// the whole output.
 pub fn unplaced<'a>(owned: Run<'a>, rendered: &str) -> Run<'a> {
     if owned.is_empty() {
         return owned;
@@ -191,7 +324,13 @@ pub fn unplaced<'a>(owned: Run<'a>, rendered: &str) -> Run<'a> {
     let Some(printed) = super::scan_trivia(rendered) else {
         return Run::default();
     };
-    let mut printed = comment_multiset(&printed.comments);
+    let mut printed: Vec<CommentKey<'_>> = printed
+        .comments
+        .iter()
+        .filter(|c| c.owner.is_none())
+        .map(Comment::key)
+        .collect();
+    printed.sort_unstable();
     let mut missing = Vec::new();
     for c in owned.0 {
         match printed.binary_search(&c.key()) {

@@ -1,6 +1,7 @@
-//! The run guard: an output keeps every comment with its owner, every
-//! adjacent pair of comments together with its gap, and every run directly
-//! above a head with its gap to that head.
+//! The run guard: an output keeps every end-of-line comment on the line of
+//! the code it follows or moves it above its next code, keeps every comment
+//! with its owner, every adjacent pair of comments together with its gap, and
+//! every run directly above a head with its gap to that head.
 //!
 //! Comments are compared by text, so a permutation among comments of equal
 //! text is invisible to it.
@@ -12,6 +13,18 @@ use ipe_syntax::Module;
 
 use super::comments::{Comment, CommentKey, Gap};
 use super::{CodeToken, Trivia, decl_start, module_decls};
+
+/// An input and the output printed from it, each with its source text.
+pub struct Printed<'a> {
+    /// The input's comments and code tokens.
+    pub input: &'a Trivia,
+    /// The input text.
+    pub input_src: &'a str,
+    /// The output's comments and code tokens.
+    pub output: &'a Trivia,
+    /// The output text.
+    pub output_src: &'a str,
+}
 
 /// The top-level item a comment belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -46,6 +59,9 @@ pub enum RunFault {
     Adjacency,
     /// The run directly above a head changed its comments or its gaps.
     HeadRun,
+    /// An end-of-line comment left the line of the code it follows for any
+    /// place but above its next code, or a comment joined a line's end.
+    Attachment,
 }
 
 impl fmt::Display for RunFault {
@@ -54,6 +70,7 @@ impl fmt::Display for RunFault {
             Self::OwnerMultiset => "a comment moved to another owner",
             Self::Adjacency => "two adjacent comments were split apart or re-spaced",
             Self::HeadRun => "the run above a head changed its comments or its gaps",
+            Self::Attachment => "a comment left the line of the code it follows",
         })
     }
 }
@@ -73,22 +90,126 @@ pub enum Refusal {
 ///
 /// # Errors
 /// [`Refusal::DeclCount`] when the modules differ in declaration count;
-/// [`Refusal::Run`] when a comment changed owner, an adjacent pair split or
+/// [`Refusal::Run`] when an end-of-line comment left its line for any place
+/// but above its next code, a comment changed owner, an adjacent pair split or
 /// re-spaced, or a head run changed.
-pub fn check(
-    module: &Module,
-    input: &Trivia,
-    reparsed: &Module,
-    output: &Trivia,
-) -> Result<usize, Refusal> {
-    let before = Layout::of(module, &input.code);
-    let after = Layout::of(reparsed, &output.code);
+pub fn check(module: &Module, reparsed: &Module, printed: &Printed<'_>) -> Result<usize, Refusal> {
+    let before = Layout::of(module, &printed.input.code);
+    let after = Layout::of(reparsed, &printed.output.code);
     if before.starts.len() != after.starts.len() {
         return Err(Refusal::DeclCount);
     }
-    owners_kept(&before, &input.comments, &after, &output.comments)?;
-    pairs_kept(&before, &input.comments, &after, &output.comments)?;
-    head_runs_kept(&before, &input.comments, &after, &output.comments)
+    let sides = attachment_kept(&before, &after, printed)?;
+    owners_kept(&before, &sides.input, &after, &sides.output)?;
+    pairs_kept(&before, &sides.input.leading, &after, &sides.output.leading)?;
+    head_runs_kept(&before, &sides.input.leading, &after, &sides.output.leading)
+}
+
+/// One side's comments, split by where they print.
+#[derive(Default)]
+struct Placement<'a> {
+    /// The comments printed on their own line, above their anchor, in source
+    /// order.
+    leading: Vec<&'a Comment>,
+    /// The end-of-line comments printed after their owner token.
+    kept: Vec<&'a Comment>,
+}
+
+/// Both sides' placements, as C4 matched them.
+struct Sides<'a> {
+    input: Placement<'a>,
+    output: Placement<'a>,
+}
+
+/// The text of `code`'s token starting at `lo` in `src`.
+fn token_text<'s>(code: &[CodeToken], src: &'s str, lo: usize) -> Option<&'s str> {
+    let i = code.partition_point(|t| t.lo < lo);
+    code.get(i)
+        .filter(|t| t.lo == lo)
+        .and_then(|t| src.get(t.lo..t.hi))
+}
+
+/// An end-of-line comment's identity: its owner token's text and its text.
+type TrailKey<'a> = (&'a str, CommentKey<'a>);
+
+/// A leading comment's identity: its anchor token's text and its text.
+type LeadKey<'a> = (Option<&'a str>, CommentKey<'a>);
+
+/// C4: every end-of-line comment of the output trails a token of the text its
+/// input owner had, and every input end-of-line comment the output does not
+/// keep prints above the code its input anchor names.
+///
+/// Both sides are classified by the same rule, from their text alone, so the
+/// check needs nothing from the printer and judges a caller's splice too.
+fn attachment_kept<'a>(
+    before: &Layout,
+    after: &Layout,
+    printed: &Printed<'a>,
+) -> Result<Sides<'a>, Refusal> {
+    let refuse = |owner| Refusal::Run {
+        owner,
+        fault: RunFault::Attachment,
+    };
+    let (input, output) = (printed.input, printed.output);
+    let trail_key = |c: &'a Comment, src: &'a str| {
+        c.owner()
+            .and_then(|o| src.get(o.lo..o.hi))
+            .map(|owner| (owner, c.key()))
+    };
+    let mut eligible: BTreeMap<TrailKey<'a>, Vec<&'a Comment>> = BTreeMap::new();
+    for c in input.comments.iter().rev() {
+        if let Some(key) = trail_key(c, printed.input_src) {
+            eligible.entry(key).or_default().push(c);
+        }
+    }
+    let mut sides = Sides {
+        input: Placement::default(),
+        output: Placement::default(),
+    };
+    let mut kept_ords: Vec<usize> = Vec::new();
+    for c in &output.comments {
+        let Some(owner) = c.owner() else {
+            sides.output.leading.push(c);
+            continue;
+        };
+        let matched = trail_key(c, printed.output_src)
+            .and_then(|key| eligible.get_mut(&key))
+            .and_then(Vec::pop);
+        let Some(source) = matched else {
+            return Err(refuse(after.owner(Some(owner.lo))));
+        };
+        kept_ords.push(source.ord());
+        sides.input.kept.push(source);
+        sides.output.kept.push(c);
+    }
+    let mut leading_out: BTreeMap<LeadKey<'a>, usize> = BTreeMap::new();
+    for c in &sides.output.leading {
+        let anchor = c
+            .anchor()
+            .and_then(|a| token_text(&output.code, printed.output_src, a));
+        let count = leading_out.entry((anchor, c.key())).or_default();
+        *count = count.saturating_add(1);
+    }
+    kept_ords.sort_unstable();
+    for c in &input.comments {
+        if c.owner().is_some() && kept_ords.binary_search(&c.ord()).is_ok() {
+            continue;
+        }
+        if c.owner().is_some() {
+            let anchor = c
+                .anchor()
+                .and_then(|a| token_text(&input.code, printed.input_src, a));
+            let demoted = leading_out
+                .get_mut(&(anchor, c.key()))
+                .filter(|count| **count > 0);
+            let Some(count) = demoted else {
+                return Err(refuse(before.owner(c.anchor())));
+            };
+            *count = count.saturating_sub(1);
+        }
+        sides.input.leading.push(c);
+    }
+    Ok(sides)
 }
 
 /// Where a module's top-level items start.
@@ -137,11 +258,14 @@ impl Layout {
 }
 
 /// C1: each owner keeps the same multiset of comments.
+///
+/// A leading comment belongs to the item its anchor starts in, an end-of-line
+/// comment to the item its owner token sits in.
 fn owners_kept(
     before: &Layout,
-    input: &[Comment],
+    input: &Placement<'_>,
     after: &Layout,
-    output: &[Comment],
+    output: &Placement<'_>,
 ) -> Result<(), Refusal> {
     let a = owned(before, input);
     let b = owned(after, output);
@@ -164,12 +288,17 @@ fn first_difference(a: &[(Owner, CommentKey<'_>)], b: &[(Owner, CommentKey<'_>)]
     })
 }
 
-/// Each comment of `list` keyed by its owner, sorted.
-fn owned<'a>(layout: &Layout, list: &'a [Comment]) -> Vec<(Owner, CommentKey<'a>)> {
-    let mut v: Vec<(Owner, CommentKey<'a>)> = list
+/// Each comment of `placement` keyed by its owner, sorted.
+fn owned<'a>(layout: &Layout, placement: &Placement<'a>) -> Vec<(Owner, CommentKey<'a>)> {
+    let leading = placement
+        .leading
         .iter()
-        .map(|c| (layout.owner(c.anchor()), c.key()))
-        .collect();
+        .map(|c| (layout.owner(c.anchor()), c.key()));
+    let kept = placement
+        .kept
+        .iter()
+        .map(|c| (layout.owner(c.owner().map(|o| o.lo)), c.key()));
+    let mut v: Vec<(Owner, CommentKey<'a>)> = leading.chain(kept).collect();
     v.sort_unstable();
     v
 }
@@ -181,9 +310,9 @@ type Pair<'a> = (Owner, CommentKey<'a>, Gap, CommentKey<'a>);
 /// with the same gap between its comments.
 fn pairs_kept(
     before: &Layout,
-    input: &[Comment],
+    input: &[&Comment],
     after: &Layout,
-    output: &[Comment],
+    output: &[&Comment],
 ) -> Result<(), Refusal> {
     let need = pairs(before, input);
     let have = pairs(after, output);
@@ -201,7 +330,7 @@ fn pairs_kept(
 }
 
 /// The adjacent pairs of `list`, sorted.
-fn pairs<'a>(layout: &Layout, list: &'a [Comment]) -> Vec<Pair<'a>> {
+fn pairs<'a>(layout: &Layout, list: &[&'a Comment]) -> Vec<Pair<'a>> {
     let mut v: Vec<Pair<'a>> = list
         .windows(2)
         .filter_map(|w| match w {
@@ -220,9 +349,9 @@ fn pairs<'a>(layout: &Layout, list: &'a [Comment]) -> Vec<Pair<'a>> {
 /// before it when comments were hoisted above it.
 fn head_runs_kept(
     before: &Layout,
-    input: &[Comment],
+    input: &[&Comment],
     after: &Layout,
-    output: &[Comment],
+    output: &[&Comment],
 ) -> Result<usize, Refusal> {
     let (anchored_in, anchored_out) = (by_anchor(input), by_anchor(output));
     let mut count = 0usize;
@@ -246,9 +375,9 @@ fn head_runs_kept(
 ///
 /// Built in one pass, so the head-run check costs `O(n log n)` in the comment
 /// count however many heads the module has.
-fn by_anchor(list: &[Comment]) -> BTreeMap<usize, Vec<&Comment>> {
-    let mut runs: BTreeMap<usize, Vec<&Comment>> = BTreeMap::new();
-    for c in list {
+fn by_anchor<'a>(list: &[&'a Comment]) -> BTreeMap<usize, Vec<&'a Comment>> {
+    let mut runs: BTreeMap<usize, Vec<&'a Comment>> = BTreeMap::new();
+    for &c in list {
         if let Some(anchor) = c.anchor() {
             runs.entry(anchor).or_default().push(c);
         }
