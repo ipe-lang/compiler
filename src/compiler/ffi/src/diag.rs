@@ -193,12 +193,21 @@ impl From<AssertedRefusal> for SharedDiag {
     }
 }
 
+/// Renders without the site's text, which a refusal does not hold: the
+/// location is the site's `file:line`, never a column or snippet computed
+/// from absent text.
 impl fmt::Display for AssertedRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let shared: SharedDiag = self.clone().into();
+        let shared = SharedDiag::Ffi {
+            msg: FfiError::AssertedRefused {
+                span: ipe_diagnostics::Span::DUMMY,
+                path: self.path.as_str().into(),
+                detail: self.defect.to_string().into(),
+            },
+        };
         f.write_str(&ipe_diagnostics::render(
             &shared,
-            &self.site.file().to_string_lossy(),
+            &self.site.to_string(),
             "",
         ))
     }

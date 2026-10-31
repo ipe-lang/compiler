@@ -6330,7 +6330,7 @@ version = \"1\"
         assert!(
             matches!(diag.as_ref(), ipe_diagnostics::Diagnostic::Ffi {
                 msg: ipe_diagnostics::FfiError::AssertedRefused { path, .. }
-            } if path.as_str() =="tm::shift")
+            } if path.as_str() == "tm::shift")
                 && src
                     .get(at..)
                     .is_some_and(|rest| rest.starts_with("Rust.Ffi.call")),

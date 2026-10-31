@@ -1351,6 +1351,17 @@ mod tests {
         assert_eq!(refused.site, test_site());
     }
 
+    /// The refusal's own rendering holds no text of the site's file, so it
+    /// names the site's line and draws no location computed from absent text.
+    #[test]
+    fn a_refusal_renders_its_site_line_without_a_located_snippet() {
+        let err = validated(&["Int", "Result Error Int"], "nope::f").expect_err("refused");
+        let text = err.to_string();
+        assert!(text.contains("src/Main.ipe:3"), "{text}");
+        assert!(text.contains("IPE-F4414"), "{text}");
+        assert!(!text.contains("-->"), "{text}");
+    }
+
     #[test]
     fn a_site_line_counts_from_one() {
         let path = std::path::PathBuf::from("src/A.ipe");
