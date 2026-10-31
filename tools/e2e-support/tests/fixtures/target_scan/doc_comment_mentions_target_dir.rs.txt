@@ -1,0 +1,4 @@
+//! Explains why a child inherits CARGO_TARGET_DIR from its parent.
+
+/// Builds the emitted crate; the child inherits CARGO_TARGET_DIR unchanged.
+fn build() {}

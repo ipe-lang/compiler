@@ -1,0 +1,11 @@
+#[test]
+fn builds_and_runs() {
+    let bin = e2e_support::cargo_bin!("ipe");
+    let target = e2e_support::target::shared().unwrap().unwrap();
+    let mut cmd = e2e_support::target::ipe_command(
+        &bin.into_path_buf(),
+        &e2e_support::target::BuildTarget::Shared(target),
+    );
+    let out = cmd.args(["run"]).output().unwrap();
+    assert!(out.status.success());
+}
