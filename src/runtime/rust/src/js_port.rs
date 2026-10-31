@@ -507,9 +507,10 @@ mod native {
 
     /// The generation of one port life, distinguishing overlapping lives of one sid.
     ///
-    /// Internal: it never goes on the wire or into the program.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    pub(crate) struct PortLife(u64);
+    /// Internal: it never goes on the wire or into the program. Only
+    /// [`session_open`] mints one, so a life names exactly one lease.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct PortLife(u64);
 
     impl PortLife {
         /// The next unused life, or `None` once lives are exhausted.
@@ -535,6 +536,13 @@ mod native {
         life: PortLife,
     }
 
+    impl PortLease {
+        /// The life this lease owns; a sink binds only into this life.
+        pub fn life(&self) -> PortLife {
+            self.life
+        }
+    }
+
     impl Drop for PortLease {
         fn drop(&mut self) {
             let ended = {
@@ -550,7 +558,7 @@ mod native {
         }
     }
 
-    /// The refusal [`register_out_sink_for`] answers when no lease holds the sid.
+    /// The refusal [`register_out_sink_for`] answers when the sid's port is not the binder's life.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct PortClosed;
 
@@ -585,6 +593,12 @@ mod native {
         None
     }
 
+    /// The life whose lease holds `sid`'s port, if any.
+    #[cfg(all(test, feature = "web"))]
+    pub(crate) fn life_of(sid: &SessionId) -> Option<PortLife> {
+        lock_sessions().get(&sid.0).map(|p| p.life)
+    }
+
     /// Open a new port life for `sid` and return the lease that owns it.
     ///
     /// The live server calls this once the store has made the session's handle
@@ -603,9 +617,13 @@ mod native {
         })
     }
 
-    /// Install `sid`'s browser-push sink. Called when the live server attaches the
-    /// session's client transport; every subsequent `js_send` whose origin is
-    /// `sid` is delivered to `sink`.
+    /// Install the browser-push sink of `sid`'s port life `life`. Called when the
+    /// live server attaches the session's client transport; every subsequent
+    /// `js_send` whose origin is that life is delivered to `sink`.
+    ///
+    /// The bind is keyed by the life, not the sid: an attach still holding a
+    /// session that another life of the same sid has replaced can never bind
+    /// into the replacing life's endpoints.
     ///
     /// The live server binds while it holds the session entry's lock, and the
     /// frames buffered before the bind are delivered to `sink` here, still under
@@ -613,8 +631,13 @@ mod native {
     ///
     /// # Errors
     ///
-    /// [`PortClosed`] when no lease holds `sid`; no sink is stored.
-    pub fn register_out_sink_for(sid: &SessionId, sink: OutSink) -> Result<(), PortClosed> {
+    /// [`PortClosed`] when no lease holds `sid`, or the lease holding it owns a
+    /// life other than `life`; no sink is stored.
+    pub fn register_out_sink_for(
+        sid: &SessionId,
+        life: PortLife,
+        sink: OutSink,
+    ) -> Result<(), PortClosed> {
         // Take the sink and drain the pre-bind buffer under one lock acquisition,
         // then deliver the drained frames after the guard drops — the sink is a
         // synchronous callback and must never run while the registry mutex is
@@ -622,7 +645,10 @@ mod native {
         // preserves that invariant for every sink shape).
         let buffered = {
             let mut g = lock_sessions();
-            let ports = g.get_mut(&sid.0).ok_or(PortClosed)?;
+            let ports = g
+                .get_mut(&sid.0)
+                .filter(|p| p.life == life)
+                .ok_or(PortClosed)?;
             ports.out_sink = Some(sink.clone());
             std::mem::take(&mut ports.out_pending)
         };
@@ -1282,15 +1308,15 @@ mod native {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::{
-    PortClosed, PortLease, deliver_inbound_for, js_close_session, js_open_session, js_request,
-    js_send, js_send_to_session, js_session_frames, js_subscribe, register_out_sink_for,
-    session_open,
+    PortClosed, PortLease, PortLife, deliver_inbound_for, js_close_session, js_open_session,
+    js_request, js_send, js_send_to_session, js_session_frames, js_subscribe,
+    register_out_sink_for, session_open,
 };
 
 // Consumed only by the `web`-gated `per_session` test submodule below; gate the
 // re-export to match so a `db`-without-`web` test build has no unused import.
 #[cfg(all(not(target_arch = "wasm32"), test, feature = "web"))]
-pub(crate) use native::{lock_sessions, open_session_with_mint, request_with_mint};
+pub(crate) use native::{life_of, lock_sessions, open_session_with_mint, request_with_mint};
 
 // ─── Wasm (browser) transport ──────────────────────────────────────────────
 //
@@ -2781,9 +2807,12 @@ mod tests {
             SessionId::parse(raw).expect("test sid must be valid hex")
         }
 
-        // Bind `sid`'s out-sink; the test holds a lease for `sid`.
+        // Bind the out-sink of `sid`'s current life; the test holds a lease for `sid`.
         fn bind_sink(sid: &SessionId, sink: Arc<dyn Fn(&str) + Send + Sync>) {
-            assert_eq!(register_out_sink_for(sid, sink), Ok(()));
+            let life = life_of(sid);
+            assert!(life.is_some(), "the test holds a lease for the sid");
+            let Some(life) = life else { return };
+            assert_eq!(register_out_sink_for(sid, life, sink), Ok(()));
         }
 
         // Materialise a `js_subscribe` Source the way the Web driver does —
@@ -4190,11 +4219,13 @@ mod tests {
             let sid = test_sid("e0f1a2b3c4d5e0f1a2b3c4d5e0f1a2b3");
             let lease = session_open(&sid);
             assert!(lease.is_some());
+            let Some(lease) = lease else { return };
+            let life = lease.life();
             drop(lease);
 
             assert_eq!(publish_from(&sid, js_send::<i64, i64>(5)), Some(0));
             assert_eq!(
-                register_out_sink_for(&sid, Arc::new(|_s: &str| {})),
+                register_out_sink_for(&sid, life, Arc::new(|_s: &str| {})),
                 Err(PortClosed)
             );
             let requested = with_session(&SessionScope::new(sid.to_string()), || {
@@ -4291,6 +4322,43 @@ mod tests {
             assert!(seen_a.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
             drop(lease_b);
             assert!(!lock_sessions().contains_key(&sid.0));
+        }
+
+        // A bind carrying a superseded life refuses and leaves the sink of the
+        // life that replaced it in place.
+        #[tokio::test]
+        async fn a_bind_with_a_superseded_life_refuses() {
+            let sid = test_sid("c4d5e6f7a8b9c4d5e6f7a8b9c4d5e6f7");
+            let lease_a = session_open(&sid);
+            assert!(lease_a.is_some());
+            let Some(lease_a) = lease_a else { return };
+            let life_a = lease_a.life();
+            let lease_b = session_open(&sid);
+            let seen_b = capture_sink(&sid);
+            let stale: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let stale2 = stale.clone();
+            assert_eq!(
+                register_out_sink_for(
+                    &sid,
+                    life_a,
+                    Arc::new(move |s: &str| {
+                        stale2
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(s.to_string());
+                    }),
+                ),
+                Err(PortClosed)
+            );
+
+            assert_eq!(publish_from(&sid, js_send::<i64, i64>(5)), Some(0));
+            assert_eq!(seen_b.lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
+            assert!(
+                stale.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+                "a superseded life's sink receives nothing"
+            );
+            drop(lease_a);
+            drop(lease_b);
         }
 
         // A drawn handle equal to a live stream's handle refuses the open and
