@@ -50,6 +50,7 @@ pub mod index;
 pub mod init;
 pub mod io_bounded;
 pub mod kernel_schemes;
+pub mod line_grammar;
 pub mod lint;
 pub mod lockfile;
 pub mod login;

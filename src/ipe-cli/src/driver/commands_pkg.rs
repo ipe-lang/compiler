@@ -4853,6 +4853,7 @@ mod admission_tests {
             rev: index::PinnedRev::from_full_sha(
                 &package,
                 "9f2c7b1e0a4d5c6f8b2a1e3d4c5b6a7f8e9d0c1b",
+                crate::index::RevSite::IndexEntry,
             )
             .expect("valid pinned rev"),
             sha256,

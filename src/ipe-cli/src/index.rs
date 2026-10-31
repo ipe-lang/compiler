@@ -21,11 +21,13 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 
+use ipe_diagnostics::terminal::{DisplayHazard, is_display_hazard};
 use ipe_ir::Capability;
 use ipe_path_core::{ElementClass, Namespace, Regime, Volume};
 
 use crate::CliError;
 pub use crate::cache::TreeHashError;
+use crate::line_grammar::{LINE_BLANKS, LineFault, LineKey, LineShape, TextLine, quoted};
 use crate::package_name::PackageName;
 use crate::published_version::{PublishedVersion, require_successor};
 use crate::publisher::{AttestedActor, BlessedPublisher, SelfDeclaredPublisher};
@@ -299,12 +301,56 @@ pub enum SourceKind {
     Local(LocalRepo),
 }
 
+/// Whether `c` may appear in a network source URL.
+///
+/// An RFC 3986 unreserved or reserved character, or `%`. ASCII only, so no
+/// homoglyph, space, quote, backslash, or invisible character reaches a
+/// consent prompt or `git`.
+#[must_use]
+pub const fn is_url_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            '-' | '.'
+                | '_'
+                | '~'
+                | ':'
+                | '/'
+                | '?'
+                | '#'
+                | '['
+                | ']'
+                | '@'
+                | '!'
+                | '$'
+                | '&'
+                | '\''
+                | '('
+                | ')'
+                | '*'
+                | '+'
+                | ','
+                | ';'
+                | '='
+                | '%'
+        )
+}
+
+/// Whether `c` may appear in a recorded local path: anything but `"` and a
+/// [`is_display_hazard`] character, so a path stays inside its quoted line and
+/// displays as the bytes it names.
+#[must_use]
+pub fn is_recordable_path_char(c: char) -> bool {
+    c != '"' && !is_display_hazard(c)
+}
+
 /// Why a raw `source` value was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceRefusal {
     /// The plaintext, unauthenticated `git://` transport.
     Plaintext,
-    /// An injection-shaped value: a leading `-`, a `::`, a control character or `"`.
+    /// An injection-shaped value: a leading `-`, a `::`, or a character outside
+    /// the location's alphabet ([`is_url_char`] or [`is_recordable_path_char`]).
     Invalid,
     /// A network share or a device.
     Remote(RemotePath),
@@ -356,9 +402,10 @@ impl SourceRefusal {
 /// fix. Any value that begins with `-` (option injection) or contains `::`
 /// (git transport helpers such as `ext::` or `fd::`, the real RCE vector) is
 /// rejected at parse time so a malicious index entry can never reach the `git`
-/// subprocess. A control character or `"` is rejected too, so a URL can never
+/// subprocess. A network URL admits only [`is_url_char`] (RFC 3986, ASCII) and a
+/// local location only [`is_recordable_path_char`], so a source can neither
 /// break out of the quoted, line-oriented files (`ipe.lock`, index entries) it
-/// is recorded in. A location naming a network share or a device (`//host/share`,
+/// is recorded in nor display differently from what `git` is handed. A location naming a network share or a device (`//host/share`,
 /// `\\?\UNC\…`, `\\.\…`, `\??\…`, `file://host/…`) has no representation on any
 /// host, so opening a source never contacts a host the transport did not name.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -373,9 +420,9 @@ impl SourceUrl {
     ///
     /// Rejected: `git://` (plaintext, unauthenticated), a leading `-` (git flag
     /// injection), `::` anywhere (transport-helper execution, the RCE vector),
-    /// any control character or `"` (a field break-out where the URL is
-    /// recorded), a network share or device location, and any local location
-    /// that is not absolute on this host.
+    /// a network URL character outside [`is_url_char`] or a local character
+    /// outside [`is_recordable_path_char`], a network share or device location,
+    /// and any local location that is not absolute on this host.
     ///
     /// # Errors
     /// [`CliError::Resolve`] when the value is not an accepted source form.
@@ -391,8 +438,13 @@ impl SourceUrl {
         // Fail closed: absent proof the transport is safe, reject.
         // `-`-leading values would be parsed as git flags; `::` introduces
         // transport helpers (e.g. `ext::`) that execute arbitrary commands.
-        let breaks_out = raw.chars().any(|c| c.is_control() || c == '"');
-        if raw.starts_with('-') || raw.contains("::") || breaks_out {
+        let network = raw.starts_with("https://") || raw.starts_with("ssh://");
+        let alphabet: fn(char) -> bool = if network {
+            is_url_char
+        } else {
+            is_recordable_path_char
+        };
+        if raw.starts_with('-') || raw.contains("::") || !raw.chars().all(alphabet) {
             return Err(SourceRefusal::Invalid);
         }
         let kind = if raw.starts_with("https://") {
@@ -548,6 +600,29 @@ impl std::fmt::Display for CommitId {
     }
 }
 
+/// Where a recorded rev was read, which decides how to recover from a bad one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RevSite {
+    /// A `rev` field of `ipe.lock`.
+    Lockfile,
+    /// A `rev` field of a registry index entry.
+    IndexEntry,
+    /// The commit `git rev-parse` reported for a checkout.
+    GitHead,
+}
+
+impl RevSite {
+    /// The remedy a refused rev read at this site names.
+    #[must_use]
+    pub const fn remedy(self) -> &'static str {
+        match self {
+            Self::Lockfile => crate::text::lock_remedy(),
+            Self::IndexEntry => crate::text::index_entry_remedy(),
+            Self::GitHead => crate::text::index_rev_remedy_sha1(),
+        }
+    }
+}
+
 /// An immutable, resolved commit SHA pinned in a lockfile or index entry.
 ///
 /// The only inhabitants are 40-char lowercase-hex strings. A moving ref
@@ -561,20 +636,21 @@ impl std::fmt::Display for CommitId {
 pub struct PinnedRev(String);
 
 impl PinnedRev {
-    /// Parse a stored rev from a lockfile or index entry, accepting only a
-    /// 40-char lowercase-hex SHA.
+    /// Parse a recorded rev read at `site`, accepting only a 40-char
+    /// lowercase-hex SHA.
     ///
-    /// A stored non-SHA value (e.g. a legacy `"HEAD"` or `"main"`) is a hard
-    /// error — fail closed rather than re-fetching a moving tip. Re-run
-    /// `ipe add` to record an immutable SHA for the dependency.
+    /// A non-SHA value (e.g. a legacy `"HEAD"` or `"main"`) is a hard error —
+    /// fail closed rather than re-fetching a moving tip. The refusal's remedy
+    /// is `site`'s, so it never names the step that produced the value.
     ///
     /// # Errors
     /// [`CliError::Resolve`] when `raw` is not a 40-char lowercase-hex string.
-    pub fn from_full_sha(pkg: &PackageName, raw: &str) -> Result<Self, CliError> {
+    pub fn from_full_sha(pkg: &PackageName, raw: &str, site: RevSite) -> Result<Self, CliError> {
         Self::parse_sha(raw).ok_or_else(|| {
             CliError::Resolve(crate::text::msg::index_rev_not_immutable(
                 pkg,
                 &crate::style::TerminalSafe::sanitize(&format!("{raw:?}")),
+                &site.remedy(),
             ))
         })
     }
@@ -650,12 +726,11 @@ impl RequestedRev {
                 ),
             ));
         }
-        if all_hex_lower {
-            match raw.len() {
-                40 => return Ok(Self::FullSha(PinnedRev::from_full_sha(pkg, raw)?)),
-                4..=39 => return Ok(Self::AbbrevHex(raw.to_owned())),
-                _ => {}
-            }
+        if let Some(full) = PinnedRev::parse_sha(raw) {
+            return Ok(Self::FullSha(full));
+        }
+        if all_hex_lower && (4..=39).contains(&raw.len()) {
+            return Ok(Self::AbbrevHex(raw.to_owned()));
         }
         Ok(Self::Name(raw.to_owned()))
     }
@@ -1214,80 +1289,323 @@ fn parse_publisher(name: &PackageName, claimed: &str) -> Result<SelfDeclaredPubl
     })
 }
 
-/// Parse an entry file's text into a typed [`IndexEntry`]. The format is a
-/// top-level `name`/`publisher` followed by one `[[version]]` table per
-/// published version. Comments (`#`) and blank lines are ignored; unrecognised
-/// keys are ignored (forward-compatible), but a malformed known value is a hard
-/// error.
-fn parse_entry(name: &PackageName, text: &str) -> Result<IndexEntry, CliError> {
-    let mut publisher: Option<String> = None;
-    let mut versions: Vec<RawVersion> = Vec::new();
-    // `None` while reading the top-level table, `Some(idx)` while inside a
-    // `[[version]]` table.
-    let mut current: Option<usize> = None;
+/// The header opening one published version's table in an entry file.
+pub const VERSION_HEADER: &str = "[[version]]";
 
-    for line in text.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+/// The JSON mirror's key for the version list (the entry file spells each
+/// element as a [`VERSION_HEADER`] table instead).
+const JSON_VERSIONS_KEY: &str = "versions";
+
+/// A key of an entry file's header, before the first [`VERSION_HEADER`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeaderKey {
+    /// `name`: the package, equal to the entry file's stem when present.
+    Name,
+    /// `publisher`: the self-declared publisher login.
+    Publisher,
+}
+
+impl HeaderKey {
+    /// Every header key, in the order the writer renders them.
+    pub const ALL: [Self; 2] = [Self::Name, Self::Publisher];
+
+    /// The key as written in an entry file.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Publisher => "publisher",
         }
-        if line == "[[version]]" {
-            versions.push(RawVersion::default());
-            current = Some(versions.len() - 1);
-            continue;
+    }
+}
+
+/// A key of one [`VERSION_HEADER`] table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VersionKey {
+    /// `version`: the [`PublishedVersion`].
+    Version,
+    /// `source`: the [`SourceUrl`].
+    Source,
+    /// `rev`: the [`PinnedRev`].
+    Rev,
+    /// `sha256`: the [`Sha256Hex`] of the source tree.
+    Sha256,
+    /// `capabilities`: a list of [`Capability`] names.
+    Capabilities,
+    /// `signature`: an optional Sigstore bundle.
+    Signature,
+}
+
+impl VersionKey {
+    /// Every version key, in the order the writer renders them.
+    pub const ALL: [Self; 6] = [
+        Self::Version,
+        Self::Source,
+        Self::Rev,
+        Self::Sha256,
+        Self::Capabilities,
+        Self::Signature,
+    ];
+
+    /// The key as written in an entry file.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Version => "version",
+            Self::Source => "source",
+            Self::Rev => "rev",
+            Self::Sha256 => "sha256",
+            Self::Capabilities => "capabilities",
+            Self::Signature => "signature",
         }
-        if line.starts_with('[') {
-            // Any other section closes the current `[[version]]` and is ignored.
-            current = None;
-            continue;
+    }
+}
+
+/// A key of an index entry file, bound by its variant to the one table that
+/// may hold it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryKey {
+    /// A key of the entry's header.
+    Header(HeaderKey),
+    /// A key of one published version's table.
+    Version(VersionKey),
+}
+
+impl EntryKey {
+    /// The key as written in an entry file.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Header(key) => key.as_str(),
+            Self::Version(key) => key.as_str(),
         }
-        let Some((key, raw_val)) = line.split_once('=') else {
-            continue;
-        };
-        let key = key.trim();
-        let raw_val = raw_val.trim();
-        match current {
-            None => {
-                if key == "publisher" {
-                    publisher = Some(unquote(raw_val).to_owned());
-                }
-                // A top-level `name` is informational; the authoritative name is
-                // the file stem the caller asked for.
+    }
+}
+
+impl LineKey for EntryKey {
+    fn parse(raw: &str) -> Option<Self> {
+        HeaderKey::ALL
+            .into_iter()
+            .find(|key| key.as_str() == raw)
+            .map(Self::Header)
+            .or_else(|| {
+                VersionKey::ALL
+                    .into_iter()
+                    .find(|key| key.as_str() == raw)
+                    .map(Self::Version)
+            })
+    }
+}
+
+impl std::fmt::Display for EntryKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Why one line of an index entry file is refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EntryFault {
+    /// Not blank, a comment, the [`VERSION_HEADER`], or a `key = value` field.
+    UnrecognisedLine,
+    /// A field whose key is no [`EntryKey`]; cut to
+    /// [`crate::line_grammar::MAX_KEY_ECHO`] characters.
+    UnknownKey(String),
+    /// A field outside the table its key belongs to.
+    MisplacedKey(EntryKey),
+    /// A field whose value does not have its key's shape.
+    MalformedValue(EntryKey),
+    /// A field its table already holds.
+    DuplicateKey(EntryKey),
+    /// A second [`VERSION_HEADER`] table for a version already listed.
+    DuplicateVersion(PublishedVersion),
+    /// A `name` that is not the package the entry file is read as.
+    NameMismatch,
+    /// A comment holding a control, bidi, or invisible character.
+    HiddenCharacter(DisplayHazard),
+}
+
+/// An index entry file refused by the closed entry grammar.
+///
+/// Rendered through the message catalog; boxed inside
+/// [`CliError::IndexEntryRefused`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntryRefusal {
+    entry: PackageName,
+    line: TextLine,
+    fault: EntryFault,
+}
+
+impl EntryRefusal {
+    /// The refused line.
+    #[must_use]
+    pub const fn line(&self) -> TextLine {
+        self.line
+    }
+
+    /// Why the line is refused.
+    #[must_use]
+    pub const fn fault(&self) -> &EntryFault {
+        &self.fault
+    }
+}
+
+/// Every admitted entry key, as a refusal lists them.
+fn known_entry_keys() -> String {
+    HeaderKey::ALL
+        .into_iter()
+        .map(EntryKey::Header)
+        .chain(VersionKey::ALL.into_iter().map(EntryKey::Version))
+        .map(|key| format!("`{key}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The shape a value of `key` must have, as a refusal names it.
+const fn value_shape(key: EntryKey) -> &'static str {
+    match key {
+        EntryKey::Header(HeaderKey::Name | HeaderKey::Publisher)
+        | EntryKey::Version(
+            VersionKey::Version | VersionKey::Source | VersionKey::Rev | VersionKey::Sha256,
+        ) => crate::text::index_entry_shape_quoted(),
+        EntryKey::Version(VersionKey::Capabilities) => crate::text::index_entry_shape_list(),
+        EntryKey::Version(VersionKey::Signature) => crate::text::index_entry_shape_signature(),
+    }
+}
+
+impl std::fmt::Display for EntryRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { entry, line, fault } = self;
+        let remedy = crate::text::index_entry_remedy();
+        f.write_str(&match fault {
+            EntryFault::UnrecognisedLine => {
+                crate::text::index_entry_unrecognised_line(entry, line, &remedy)
             }
-            Some(idx) => {
-                let Some(record) = versions.get_mut(idx) else {
-                    continue;
-                };
-                match key {
-                    "version" => record.version = Some(unquote(raw_val).to_owned()),
-                    "source" => record.source = Some(unquote(raw_val).to_owned()),
-                    "rev" => record.rev = Some(unquote(raw_val).to_owned()),
-                    "sha256" => record.sha256 = Some(unquote(raw_val).to_owned()),
-                    "capabilities" => record.capabilities = Some(raw_val.to_owned()),
-                    "signature" => record.signature = Some(unquote(raw_val).to_owned()),
-                    _ => {}
-                }
+            EntryFault::UnknownKey(key) => crate::text::index_entry_unknown_key(
+                entry,
+                line,
+                &crate::style::TerminalSafe::sanitize(&key.escape_debug().to_string()),
+                &known_entry_keys(),
+                &remedy,
+            ),
+            EntryFault::MisplacedKey(key @ EntryKey::Header(_)) => {
+                crate::text::index_entry_key_needs_header(entry, line, key, &remedy)
+            }
+            EntryFault::MisplacedKey(key @ EntryKey::Version(_)) => {
+                crate::text::index_entry_key_needs_version(entry, line, key, &remedy)
+            }
+            EntryFault::MalformedValue(key) => crate::text::index_entry_malformed_value(
+                entry,
+                line,
+                key,
+                &value_shape(*key),
+                &remedy,
+            ),
+            EntryFault::DuplicateKey(key) => {
+                crate::text::index_entry_duplicate_key(entry, line, key, &remedy)
+            }
+            EntryFault::DuplicateVersion(version) => {
+                crate::text::index_entry_duplicate_version(entry, line, version, &remedy)
+            }
+            EntryFault::NameMismatch => {
+                crate::text::index_entry_name_mismatch(entry, line, &remedy)
+            }
+            EntryFault::HiddenCharacter(hazard) => crate::text::index_entry_hidden_character(
+                entry,
+                line,
+                &hazard.position(),
+                &format!("{:04X}", u32::from(hazard.ch())),
+                &remedy,
+            ),
+        })
+    }
+}
+
+impl From<EntryRefusal> for CliError {
+    fn from(refusal: EntryRefusal) -> Self {
+        Self::IndexEntryRefused(Box::new(refusal))
+    }
+}
+
+/// Parse an entry file's text into a typed [`IndexEntry`].
+///
+/// The grammar is closed: every line is blank, a comment, the
+/// [`VERSION_HEADER`], or one `key = value` field whose [`EntryKey`] belongs to
+/// the table it sits in — the header's keys before the first version table, a
+/// version's keys inside one. Anything else, a repeated key, a repeated
+/// version, or a `name` other than the package read is an [`EntryRefusal`] naming its
+/// line, never skipped.
+fn parse_entry(name: &PackageName, text: &str) -> Result<IndexEntry, CliError> {
+    let refuse = |line: TextLine, fault: EntryFault| {
+        CliError::from(EntryRefusal {
+            entry: name.clone(),
+            line,
+            fault,
+        })
+    };
+    let mut raw = RawEntry::default();
+    for (index, text_line) in text.lines().enumerate() {
+        let line = TextLine::at(index);
+        match crate::line_grammar::classify::<EntryKey>(text_line, VERSION_HEADER) {
+            Ok(LineShape::Ignorable) => {}
+            Ok(LineShape::Header) => raw.open_version(line),
+            Ok(LineShape::Field(key, value)) => {
+                raw.take(line, key, value)
+                    .map_err(|fault| refuse(line, fault))?;
+            }
+            Err(LineFault::Unrecognised) => return Err(refuse(line, EntryFault::UnrecognisedLine)),
+            Err(LineFault::UnknownKey(key)) => {
+                return Err(refuse(line, EntryFault::UnknownKey(key)));
+            }
+            Err(LineFault::HiddenCharacter(hazard)) => {
+                return Err(refuse(line, EntryFault::HiddenCharacter(hazard)));
             }
         }
     }
+    raw.close_version();
 
-    let publisher = publisher
+    if let Some((line, recorded)) = raw.name
+        && recorded != name.as_str()
+    {
+        return Err(refuse(line, EntryFault::NameMismatch));
+    }
+    let publisher = raw
+        .publisher
         .ok_or_else(|| CliError::Resolve(crate::text::msg::index_entry_missing_publisher(name)))
-        .and_then(|claimed| parse_publisher(name, &claimed))?;
-    if versions.is_empty() {
+        .and_then(|claimed| parse_publisher(name, claimed))?;
+    if raw.versions.is_empty() {
         return Err(CliError::Resolve(
             crate::text::msg::index_entry_no_versions(name),
         ));
     }
-    let versions = versions
-        .into_iter()
-        .map(|raw| raw.into_version(name))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut seen: BTreeSet<PublishedVersion> = BTreeSet::new();
+    let mut versions = Vec::with_capacity(raw.versions.len());
+    for record in raw.versions {
+        let header = record.header;
+        let version = record.into_version(name)?;
+        if !seen.insert(version.version.clone()) {
+            return Err(refuse(
+                header,
+                EntryFault::DuplicateVersion(version.version),
+            ));
+        }
+        versions.push(version);
+    }
 
     Ok(IndexEntry {
         name: name.clone(),
         publisher,
         versions,
     })
+}
+
+/// The refusal detail for a JSON mirror key no [`EntryKey`] admits.
+fn json_unknown_key(key: &str) -> String {
+    let shown: String = key
+        .chars()
+        .take(crate::line_grammar::MAX_KEY_ECHO)
+        .collect();
+    format!("unknown key {shown:?}")
 }
 
 /// Parse the registry's per-package JSON mirror (`/packages/<name>.json`) into
@@ -1330,15 +1648,28 @@ pub fn parse_entry_json(name: &str, text: &str) -> Result<IndexEntry, CliError> 
     let object = value
         .as_object()
         .ok_or_else(|| malformed("top level is not a JSON object"))?;
+    if let Some(key) = object.keys().find(|key| {
+        !HeaderKey::ALL
+            .iter()
+            .any(|known| known.as_str() == key.as_str())
+            && key.as_str() != JSON_VERSIONS_KEY
+    }) {
+        return Err(malformed(&json_unknown_key(key)));
+    }
+    if let Some(recorded) = object.get(HeaderKey::Name.as_str())
+        && recorded.as_str() != Some(name.as_str())
+    {
+        return Err(malformed("`name` names another package"));
+    }
 
     let publisher = object
-        .get("publisher")
+        .get(HeaderKey::Publisher.as_str())
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| malformed("missing string field `publisher`"))
         .and_then(|claimed| parse_publisher(name, claimed))?;
 
     let raw_versions = object
-        .get("versions")
+        .get(JSON_VERSIONS_KEY)
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| malformed("missing array field `versions`"))?;
     if raw_versions.is_empty() {
@@ -1373,6 +1704,13 @@ fn parse_entry_version_json(
     let object = raw
         .as_object()
         .ok_or_else(|| malformed("a `versions` element is not an object".to_owned()))?;
+    if let Some(key) = object.keys().find(|key| {
+        !VersionKey::ALL
+            .iter()
+            .any(|known| known.as_str() == key.as_str())
+    }) {
+        return Err(malformed(json_unknown_key(key)));
+    }
     let field = |key: &str| -> Result<&str, CliError> {
         object
             .get(key)
@@ -1387,7 +1725,7 @@ fn parse_entry_version_json(
     // moving or injection-shaped value can never reach `git` from the JSON path
     // either.
     let source = SourceUrl::parse(name, field("source")?)?;
-    let rev = PinnedRev::from_full_sha(name, field("rev")?)?;
+    let rev = PinnedRev::from_full_sha(name, field("rev")?, RevSite::IndexEntry)?;
     let sha256 = Sha256Hex::parse(name, field("sha256")?)?;
 
     // `capabilities` is an optional array of strings; absent means none. An
@@ -1434,45 +1772,162 @@ fn parse_entry_version_json(
     })
 }
 
-/// The raw per-`[[version]]` fields collected during the line scan, before they
-/// are parsed into the typed [`EntryVersion`].
+/// The fields of an entry file collected during the line scan, borrowed from its
+/// text, before they are parsed into the typed [`IndexEntry`].
 #[derive(Default)]
-struct RawVersion {
-    version: Option<String>,
-    source: Option<String>,
-    rev: Option<String>,
-    sha256: Option<String>,
-    capabilities: Option<String>,
-    signature: Option<String>,
+struct RawEntry<'a> {
+    /// The header's `name` and the line holding it.
+    name: Option<(TextLine, &'a str)>,
+    /// The header's `publisher`.
+    publisher: Option<&'a str>,
+    /// Every closed version table, in file order.
+    versions: Vec<RawVersion<'a>>,
+    /// The version table being read, once the first header is seen.
+    current: Option<RawVersion<'a>>,
 }
 
-impl RawVersion {
+impl<'a> RawEntry<'a> {
+    /// Open a version table whose header sits at `header`, closing the open one.
+    fn open_version(&mut self, header: TextLine) {
+        if let Some(done) = self.current.replace(RawVersion::opened_at(header)) {
+            self.versions.push(done);
+        }
+    }
+
+    /// Close the open version table, if any.
+    fn close_version(&mut self) {
+        if let Some(done) = self.current.take() {
+            self.versions.push(done);
+        }
+    }
+
+    /// Record the field `key = value` read at `line`.
+    fn take(&mut self, line: TextLine, key: EntryKey, value: &'a str) -> Result<(), EntryFault> {
+        match (key, self.current.as_mut()) {
+            (EntryKey::Header(HeaderKey::Name), None) => {
+                fill(&mut self.name, key, quoted(value).map(|name| (line, name)))
+            }
+            (EntryKey::Header(HeaderKey::Publisher), None) => {
+                fill(&mut self.publisher, key, quoted(value))
+            }
+            (EntryKey::Version(version_key), Some(record)) => record.take(version_key, value),
+            (EntryKey::Header(_), Some(_)) | (EntryKey::Version(_), None) => {
+                Err(EntryFault::MisplacedKey(key))
+            }
+        }
+    }
+}
+
+/// Fill an empty `slot` with `value`, the field `key` parsed to its shape.
+///
+/// # Errors
+/// [`EntryFault::MalformedValue`] when `value` did not parse;
+/// [`EntryFault::DuplicateKey`] when the slot is already filled.
+fn fill<T>(slot: &mut Option<T>, key: EntryKey, value: Option<T>) -> Result<(), EntryFault> {
+    let value = value.ok_or(EntryFault::MalformedValue(key))?;
+    if slot.is_some() {
+        return Err(EntryFault::DuplicateKey(key));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+/// The quoted capability names of a `["…", …]` list, or `None` unless the
+/// value is exactly `[]` or a comma-separated list of non-empty quoted names.
+fn capability_items(value: &str) -> Option<Vec<&str>> {
+    let inner = value
+        .strip_prefix('[')?
+        .strip_suffix(']')?
+        .trim_matches(LINE_BLANKS);
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    inner
+        .split(',')
+        .map(|item| quoted(item.trim_matches(LINE_BLANKS)).filter(|item| !item.is_empty()))
+        .collect()
+}
+
+/// The bundle inside a `signature = "…"` value: exactly one outer pair of
+/// quotes stripped. The bundle is JSON and keeps its own quotes; its structure
+/// is [`SignatureBundle::parse`]'s to prove.
+fn signature_text(value: &str) -> Option<&str> {
+    value
+        .strip_prefix('"')?
+        .strip_suffix('"')
+        .filter(|bundle| !bundle.is_empty())
+}
+
+/// The raw fields of one version table, borrowed from the entry text, before
+/// they are parsed into the typed [`EntryVersion`].
+struct RawVersion<'a> {
+    /// Where the table's header sits.
+    header: TextLine,
+    version: Option<&'a str>,
+    source: Option<&'a str>,
+    rev: Option<&'a str>,
+    sha256: Option<&'a str>,
+    capabilities: Option<Vec<&'a str>>,
+    signature: Option<&'a str>,
+}
+
+impl<'a> RawVersion<'a> {
+    /// An empty table whose header sits at `header`.
+    const fn opened_at(header: TextLine) -> Self {
+        Self {
+            header,
+            version: None,
+            source: None,
+            rev: None,
+            sha256: None,
+            capabilities: None,
+            signature: None,
+        }
+    }
+
+    /// Record the field `key = value`, parsed to the key's shape.
+    fn take(&mut self, key: VersionKey, value: &'a str) -> Result<(), EntryFault> {
+        let entry_key = EntryKey::Version(key);
+        match key {
+            VersionKey::Version => fill(&mut self.version, entry_key, quoted(value)),
+            VersionKey::Source => fill(&mut self.source, entry_key, quoted(value)),
+            VersionKey::Rev => fill(&mut self.rev, entry_key, quoted(value)),
+            VersionKey::Sha256 => fill(&mut self.sha256, entry_key, quoted(value)),
+            VersionKey::Capabilities => {
+                fill(&mut self.capabilities, entry_key, capability_items(value))
+            }
+            VersionKey::Signature => fill(&mut self.signature, entry_key, signature_text(value)),
+        }
+    }
+
     /// Turn the collected raw fields into a typed [`EntryVersion`], erroring on a
     /// missing required field, a malformed version, or an unknown capability.
     fn into_version(self, name: &PackageName) -> Result<EntryVersion, CliError> {
-        let missing = |field: &str| {
-            CliError::Resolve(crate::text::msg::index_version_missing_field(name, &field))
+        let missing = |key: VersionKey| {
+            CliError::Resolve(crate::text::msg::index_version_missing_field(
+                name,
+                &key.as_str(),
+            ))
         };
-        let version_str = self.version.ok_or_else(|| missing("version"))?;
-        let version = PublishedVersion::parse(&version_str)
+        let version_str = self.version.ok_or_else(|| missing(VersionKey::Version))?;
+        let version = PublishedVersion::parse(version_str)
             .map_err(|refusal| refusal.for_package(name.as_str()))?;
-        let raw_source = self.source.ok_or_else(|| missing("source"))?;
-        let raw_rev = self.rev.ok_or_else(|| missing("rev"))?;
-        let raw_sha256 = self.sha256.ok_or_else(|| missing("sha256"))?;
+        let raw_source = self.source.ok_or_else(|| missing(VersionKey::Source))?;
+        let raw_rev = self.rev.ok_or_else(|| missing(VersionKey::Rev))?;
+        let raw_sha256 = self.sha256.ok_or_else(|| missing(VersionKey::Sha256))?;
         // Parse-don't-validate: typed constructors reject invalid values at
         // the read boundary before any value can reach `git`.
-        let source = SourceUrl::parse(name, &raw_source)?;
-        let rev = PinnedRev::from_full_sha(name, &raw_rev)?;
+        let source = SourceUrl::parse(name, raw_source)?;
+        let rev = PinnedRev::from_full_sha(name, raw_rev, RevSite::IndexEntry)?;
         // A malformed content hash is refused here, at the cheap structural gate,
         // not deferred to a fetch-time mismatch.
-        let sha256 = Sha256Hex::parse(name, &raw_sha256)?;
-        let capabilities = parse_capabilities(name, self.capabilities.as_deref())?;
+        let sha256 = Sha256Hex::parse(name, raw_sha256)?;
+        let capabilities = parse_capabilities(name, &self.capabilities.unwrap_or_default())?;
         // A present `signature` is parsed into a typed bundle; a malformed one is
         // a hard error, never a silently-dropped field. Absent = unsigned.
         let signature = self
             .signature
-            .as_deref()
-            .map(|raw| crate::signing::SignatureBundle::parse(name.as_str(), raw))
+            .map(|raw| SignatureBundle::parse(name.as_str(), raw))
             .transpose()?;
         Ok(EntryVersion {
             version,
@@ -1485,57 +1940,32 @@ impl RawVersion {
     }
 }
 
-/// Parse a `capabilities = ["network", …]` array value into a typed set via
-/// [`Capability::from_str`]. Absent (or empty) means no capabilities; an unknown
-/// name is a hard error — a typo can never become a silently-dropped capability
-/// the user is then not warned about.
+/// Parse the names of a `capabilities` list into a typed set via
+/// [`Capability::from_str`]. An unknown name is a hard error — a typo can never
+/// become a silently-dropped capability the user is then not warned about.
 fn parse_capabilities(
     name: &PackageName,
-    raw: Option<&str>,
+    items: &[&str],
 ) -> Result<BTreeSet<Capability>, CliError> {
-    let Some(raw) = raw else {
-        return Ok(BTreeSet::new());
-    };
-    let inner = raw
-        .trim()
-        .strip_prefix('[')
-        .and_then(|r| r.strip_suffix(']'))
-        .ok_or_else(|| {
-            CliError::Resolve(crate::text::msg::index_capabilities_not_array(
-                name,
-                &crate::style::TerminalSafe::sanitize(raw),
-            ))
-        })?;
-    let mut set = BTreeSet::new();
-    for token in inner.split(',') {
-        let token = token.trim().trim_matches('"');
-        if token.is_empty() {
-            continue;
-        }
-        let cap = Capability::from_str(token).map_err(|e| {
-            CliError::Resolve(crate::text::msg::index_capability_unknown(
-                name,
-                &crate::style::TerminalSafe::sanitize(&e.to_string()),
-            ))
-        })?;
-        set.insert(cap);
-    }
-    Ok(set)
-}
-
-/// Strip one layer of surrounding double quotes from a scalar value.
-fn unquote(value: &str) -> &str {
-    value
-        .strip_prefix('"')
-        .and_then(|v| v.strip_suffix('"'))
-        .unwrap_or(value)
+    items
+        .iter()
+        .map(|token| {
+            Capability::from_str(token).map_err(|e| {
+                CliError::Resolve(crate::text::msg::index_capability_unknown(
+                    name,
+                    &crate::style::TerminalSafe::sanitize(&e.to_string()),
+                ))
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CommitId, IndexEntry, PackageName, PinnedRev, RequestedRev, RevMismatch, SourceUrl,
-        Transport, check_served, read_entry, resolve_version,
+        CommitId, EntryFault, EntryKey, HeaderKey, IndexEntry, PackageName, PinnedRev,
+        RequestedRev, RevMismatch, RevSite, SourceUrl, Transport, VersionKey, check_served,
+        read_entry, resolve_version,
     };
     use ipe_ir::Capability;
     use std::path::{Path, PathBuf};
@@ -2121,43 +2551,43 @@ mod tests {
             "CommitId must accept branch names as request refs"
         );
         assert!(
-            PinnedRev::from_full_sha(&pn("p"), "HEAD").is_err(),
+            PinnedRev::from_full_sha(&pn("p"), "HEAD", RevSite::IndexEntry).is_err(),
             "PinnedRev must reject HEAD"
         );
         assert!(
-            PinnedRev::from_full_sha(&pn("p"), "main").is_err(),
+            PinnedRev::from_full_sha(&pn("p"), "main", RevSite::IndexEntry).is_err(),
             "PinnedRev must reject branch names"
         );
         assert!(
-            PinnedRev::from_full_sha(&pn("p"), "v1.0").is_err(),
+            PinnedRev::from_full_sha(&pn("p"), "v1.0", RevSite::IndexEntry).is_err(),
             "PinnedRev must reject tag names"
         );
         // Length boundary: 39 and 41 chars must be rejected.
         let short = "a".repeat(39);
         let long = "a".repeat(41);
         assert!(
-            PinnedRev::from_full_sha(&pn("p"), &short).is_err(),
+            PinnedRev::from_full_sha(&pn("p"), &short, RevSite::IndexEntry).is_err(),
             "39-char hex must be rejected"
         );
         assert!(
-            PinnedRev::from_full_sha(&pn("p"), &long).is_err(),
+            PinnedRev::from_full_sha(&pn("p"), &long, RevSite::IndexEntry).is_err(),
             "41-char hex must be rejected"
         );
         // Non-hex characters must be rejected even at length 40.
         let nonhex = format!("{}g", "a".repeat(39));
         assert!(
-            PinnedRev::from_full_sha(&pn("p"), &nonhex).is_err(),
+            PinnedRev::from_full_sha(&pn("p"), &nonhex, RevSite::IndexEntry).is_err(),
             "non-hex char must be rejected"
         );
         // Uppercase is rejected — the stored form must be lowercase hex.
         let upper = "A".repeat(40);
         assert!(
-            PinnedRev::from_full_sha(&pn("p"), &upper).is_err(),
+            PinnedRev::from_full_sha(&pn("p"), &upper, RevSite::IndexEntry).is_err(),
             "uppercase hex must be rejected"
         );
         // A valid 40-char lowercase hex string must be accepted.
         assert!(
-            PinnedRev::from_full_sha(&pn("p"), FIXTURE_REV).is_ok(),
+            PinnedRev::from_full_sha(&pn("p"), FIXTURE_REV, RevSite::IndexEntry).is_ok(),
             "40-char lowercase hex must be accepted"
         );
     }
@@ -2227,18 +2657,19 @@ mod tests {
 
     #[test]
     fn check_served_is_permissive_for_head_and_name() {
-        let served = PinnedRev::from_full_sha(&pn("p"), FIXTURE_REV).unwrap();
+        let served = PinnedRev::from_full_sha(&pn("p"), FIXTURE_REV, RevSite::IndexEntry).unwrap();
         assert!(check_served(&RequestedRev::Head, &served).is_none());
         assert!(check_served(&RequestedRev::Name("main".to_owned()), &served).is_none());
     }
 
     #[test]
     fn check_served_full_sha_agrees_or_refuses() {
-        let served = PinnedRev::from_full_sha(&pn("p"), FIXTURE_REV).unwrap();
+        let served = PinnedRev::from_full_sha(&pn("p"), FIXTURE_REV, RevSite::IndexEntry).unwrap();
         assert!(check_served(&RequestedRev::FullSha(served.clone()), &served).is_none());
 
         let other_sha = "b".repeat(40);
-        let requested = PinnedRev::from_full_sha(&pn("p"), &other_sha).unwrap();
+        let requested =
+            PinnedRev::from_full_sha(&pn("p"), &other_sha, RevSite::IndexEntry).unwrap();
         let mismatch = check_served(&RequestedRev::FullSha(requested), &served);
         assert!(
             matches!(mismatch, Some(RevMismatch::Different { .. })),
@@ -2256,7 +2687,7 @@ mod tests {
 
     #[test]
     fn check_served_abbrev_hex_prefix_match_or_shadowed() {
-        let served = PinnedRev::from_full_sha(&pn("p"), FIXTURE_REV).unwrap();
+        let served = PinnedRev::from_full_sha(&pn("p"), FIXTURE_REV, RevSite::IndexEntry).unwrap();
         let prefix = FIXTURE_REV[..6].to_owned();
         assert!(
             check_served(&RequestedRev::AbbrevHex(prefix), &served).is_none(),
@@ -2337,8 +2768,8 @@ mod tests {
 
     #[test]
     fn a_signed_entry_parses_the_bundle_from_toml() {
-        // The reader's line scan strips one outer layer of quotes from a scalar,
-        // so the bundle is stored as a bare (unquoted) JSON object value.
+        // The bundle is stored as `ipe package publish` renders it: single-line
+        // JSON inside exactly one outer pair of quotes.
         let root = temp_dir("signed-toml");
         let packages = root.join("packages");
         std::fs::create_dir_all(&packages).expect("packages dir");
@@ -2347,7 +2778,7 @@ mod tests {
             format!(
                 "publisher = \"tester\"\n\n[[version]]\nversion = \"1.0.0\"\n\
                  source = \"https://example.invalid/signed\"\nrev = \"{FIXTURE_REV}\"\n\
-                 sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\ncapabilities = []\nsignature = {BUNDLE_JSON}\n"
+                 sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\ncapabilities = []\nsignature = \"{BUNDLE_JSON}\"\n"
             ),
         )
         .expect("write entry");
@@ -2768,6 +3199,295 @@ mod tests {
                 SourceUrl::parse(&pn("p"), "//h/s/r").is_err(),
                 "the production entry point refuses a UNC share on this host"
             );
+        }
+    }
+
+    // --- closed entry grammar: every line outside it is a located refusal ---
+
+    /// A well-formed entry for `http-extras`: header on lines 1-2, one version
+    /// table from line 4.
+    fn closed_fixture() -> String {
+        format!(
+            "name = \"http-extras\"\npublisher = \"tester\"\n\n[[version]]\nversion = \"1.0.0\"\n\
+             source = \"https://example.invalid/http-extras\"\nrev = \"{FIXTURE_REV}\"\n\
+             sha256 = \"{}\"\ncapabilities = [\"network\"]\n",
+            "0".repeat(64)
+        )
+    }
+
+    /// The closed-grammar refusal `text` earns, read as `http-extras`.
+    fn entry_refusal(text: &str) -> Option<super::EntryRefusal> {
+        match super::parse_entry(&pn("http-extras"), text) {
+            Err(crate::CliError::IndexEntryRefused(refusal)) => Some(*refusal),
+            Ok(_) | Err(_) => None,
+        }
+    }
+
+    /// Assert `text` is refused at 1-based `line` with `fault`.
+    fn assert_refused(text: &str, line: usize, fault: &EntryFault) {
+        let refusal = entry_refusal(text);
+        assert_eq!(
+            refusal.as_ref().map(|r| (r.line(), r.fault().clone())),
+            Some((crate::line_grammar::TextLine::numbered(line), fault.clone())),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn the_closed_fixture_and_the_live_schema_example_parse() {
+        assert!(super::parse_entry(&pn("http-extras"), &closed_fixture()).is_ok());
+        let example = "# A complete, valid index entry. It is a schema example \u{2014} \
+                       not a real package.\nname = \"example-package\"\npublisher = \"arthurmaciel\"\n\n\
+                       [[version]]\nversion = \"1.1.0\"\n\
+                       source = \"https://github.com/arthurmaciel/example-package\"\n\
+                       rev = \"1a2b3c4d5e6f70819a2b3c4d5e6f70819a2b3c4d\"\n\
+                       sha256 = \"b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9\"\n\
+                       capabilities = [\"network\", \"clock\"]\n";
+        assert!(super::parse_entry(&pn("example-package"), example).is_ok());
+    }
+
+    #[test]
+    fn entry_garbage_line_is_refused_with_its_line() {
+        let text = closed_fixture().replace("\n\n[[version]]", "\nnot a field\n[[version]]");
+        assert_refused(&text, 3, &EntryFault::UnrecognisedLine);
+        let section = closed_fixture().replace("\n\n[[version]]", "\n[other]\n[[version]]");
+        assert_refused(&section, 3, &EntryFault::UnrecognisedLine);
+        let single = closed_fixture().replace("[[version]]", "[version]");
+        assert_refused(&single, 4, &EntryFault::UnrecognisedLine);
+        let assigned = closed_fixture().replace("[[version]]", "[[version]] = \"1.0.0\"");
+        assert_refused(&assigned, 4, &EntryFault::UnrecognisedLine);
+    }
+
+    #[test]
+    fn entry_unknown_key_is_refused() {
+        let header = closed_fixture().replace("\n\n[[version]]", "\nhomepage = \"x\"\n[[version]]");
+        assert_refused(&header, 3, &EntryFault::UnknownKey("homepage".to_owned()));
+        let version = format!("{}yanked = \"true\"\n", closed_fixture());
+        assert_refused(&version, 10, &EntryFault::UnknownKey("yanked".to_owned()));
+        let long = format!("{}{} = \"x\"\n", closed_fixture(), "k".repeat(200));
+        assert_refused(
+            &long,
+            10,
+            &EntryFault::UnknownKey("k".repeat(crate::line_grammar::MAX_KEY_ECHO)),
+        );
+    }
+
+    #[test]
+    fn entry_key_outside_its_table_is_refused() {
+        let header_in_version = format!("{}publisher = \"other\"\n", closed_fixture());
+        assert_refused(
+            &header_in_version,
+            10,
+            &EntryFault::MisplacedKey(EntryKey::Header(HeaderKey::Publisher)),
+        );
+        let version_before_header = closed_fixture().replace(
+            "publisher = \"tester\"\n",
+            "publisher = \"tester\"\nrev = \"x\"\n",
+        );
+        assert_refused(
+            &version_before_header,
+            3,
+            &EntryFault::MisplacedKey(EntryKey::Version(VersionKey::Rev)),
+        );
+    }
+
+    #[test]
+    fn entry_value_outside_its_shape_is_refused() {
+        let cases = [
+            (
+                "version = \"1.0.0\"",
+                "version = 1.0.0",
+                VersionKey::Version,
+            ),
+            (
+                "version = \"1.0.0\"",
+                "version = \"1.0.0\" # note",
+                VersionKey::Version,
+            ),
+            (
+                "version = \"1.0.0\"",
+                "version = \"1.0\"\"0\"",
+                VersionKey::Version,
+            ),
+            (
+                "capabilities = [\"network\"]",
+                "capabilities = network",
+                VersionKey::Capabilities,
+            ),
+            (
+                "capabilities = [\"network\"]",
+                "capabilities = [network]",
+                VersionKey::Capabilities,
+            ),
+            (
+                "capabilities = [\"network\"]",
+                "capabilities = [\"network\",]",
+                VersionKey::Capabilities,
+            ),
+            (
+                "capabilities = [\"network\"]",
+                "capabilities = [\"\"]",
+                VersionKey::Capabilities,
+            ),
+        ];
+        for (good, bad, key) in cases {
+            let text = closed_fixture().replace(good, bad);
+            let refusal = entry_refusal(&text);
+            assert_eq!(
+                refusal.map(|r| r.fault().clone()),
+                Some(EntryFault::MalformedValue(EntryKey::Version(key))),
+                "{bad}"
+            );
+        }
+        let bare_signature = format!("{}signature = {BUNDLE_JSON}\n", closed_fixture());
+        assert_refused(
+            &bare_signature,
+            10,
+            &EntryFault::MalformedValue(EntryKey::Version(VersionKey::Signature)),
+        );
+    }
+
+    #[test]
+    fn entry_duplicate_key_is_refused() {
+        let header = closed_fixture().replace(
+            "publisher = \"tester\"\n",
+            "publisher = \"tester\"\npublisher = \"attacker\"\n",
+        );
+        assert_refused(
+            &header,
+            3,
+            &EntryFault::DuplicateKey(EntryKey::Header(HeaderKey::Publisher)),
+        );
+        let version = format!("{}sha256 = \"{}\"\n", closed_fixture(), "1".repeat(64));
+        assert_refused(
+            &version,
+            10,
+            &EntryFault::DuplicateKey(EntryKey::Version(VersionKey::Sha256)),
+        );
+    }
+
+    #[test]
+    fn entry_duplicate_version_is_refused_at_its_second_header() {
+        let fixture = closed_fixture();
+        let table = fixture.split_once("\n\n").map_or("", |(_, table)| table);
+        let text = format!("{fixture}\n{table}");
+        let version = crate::published_version::PublishedVersion::parse("1.0.0").ok();
+        assert_eq!(
+            entry_refusal(&text).map(|r| (r.line(), r.fault().clone())),
+            version.map(|v| (
+                crate::line_grammar::TextLine::numbered(11),
+                EntryFault::DuplicateVersion(v)
+            )),
+        );
+    }
+
+    #[test]
+    fn entry_name_naming_another_package_is_refused() {
+        let text = closed_fixture().replace("name = \"http-extras\"", "name = \"other\"");
+        assert_refused(&text, 1, &EntryFault::NameMismatch);
+    }
+
+    #[test]
+    fn entry_hidden_characters_are_refused() {
+        let bidi = format!("# safe \u{202e}evil\n{}", closed_fixture());
+        assert!(matches!(
+            entry_refusal(&bidi).map(|r| (r.line(), r.fault().clone())),
+            Some((line, EntryFault::HiddenCharacter(_)))
+                if line == crate::line_grammar::TextLine::numbered(1)
+        ));
+        let separator = closed_fixture().replace("[[version]]", "\u{2028}[[version]]");
+        assert_refused(&separator, 4, &EntryFault::UnrecognisedLine);
+        let nbsp_key = closed_fixture().replace("\nrev =", "\n\u{a0}rev =");
+        assert!(entry_refusal(&nbsp_key).is_some());
+        let carriage =
+            closed_fixture().replace("[[version]]\n", "[[version]]\rversion = \"9.9.9\"\n");
+        assert!(entry_refusal(&carriage).is_some());
+    }
+
+    #[test]
+    fn entry_refusal_renders_the_line_and_the_remedy() {
+        let text = closed_fixture().replace(
+            "\n\n[[version]]",
+            "\nhome\u{1b}[31mpage = \"x\"\n[[version]]",
+        );
+        let rendered = super::parse_entry(&pn("http-extras"), &text)
+            .err()
+            .map(|err| err.to_string())
+            .unwrap_or_default();
+        assert!(rendered.contains("line 3"), "{rendered}");
+        assert!(
+            rendered.contains(crate::text::index_entry_remedy()),
+            "{rendered}"
+        );
+        assert!(!rendered.contains('\u{1b}'), "{rendered}");
+    }
+
+    #[test]
+    fn json_mirror_refuses_unknown_keys_and_another_name() {
+        let entry = |top: &str, version_extra: &str| {
+            format!(
+                "{{\"name\":\"http-extras\",\"publisher\":\"tester\",{top}\"versions\":[{{\
+                 \"version\":\"1.0.0\",\"source\":\"https://example.invalid/x\",\
+                 \"rev\":\"{FIXTURE_REV}\",\"sha256\":\"{}\",\"capabilities\":[]{version_extra}}}]}}",
+                "0".repeat(64)
+            )
+        };
+        assert!(super::parse_entry_json("http-extras", &entry("", "")).is_ok());
+        for (text, needle) in [
+            (entry("\"homepage\":\"x\",", ""), "homepage"),
+            (entry("", ",\"yanked\":true"), "yanked"),
+            (
+                entry("", "").replace("\"name\":\"http-extras\"", "\"name\":\"other\""),
+                "another package",
+            ),
+        ] {
+            let rendered = super::parse_entry_json("http-extras", &text)
+                .err()
+                .map(|err| err.to_string())
+                .unwrap_or_default();
+            assert!(rendered.contains(needle), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn source_url_refuses_characters_outside_its_alphabet() {
+        for raw in [
+            "https://example.invalid/a b",
+            "https://example.invalid/a\\b",
+            "https://ex\u{430}mple.invalid/x",
+            "https://example.invalid/\u{202e}x",
+            "https://example.invalid/\u{200b}x",
+            "ssh://git@example.invalid/a\u{a0}b",
+        ] {
+            assert!(SourceUrl::parse(&pn("p"), raw).is_err(), "{raw:?}");
+        }
+        assert!(SourceUrl::parse(&pn("p"), "https://example.invalid/a-b_c~d%20e?f=g#h").is_ok());
+        #[cfg(unix)]
+        {
+            assert!(SourceUrl::parse(&pn("p"), "/srv/repo\u{202e}x").is_err());
+            assert!(SourceUrl::parse(&pn("p"), "/srv/repo\u{2066}x").is_err());
+            assert!(SourceUrl::parse(&pn("p"), "/srv/r\u{e9}po with space").is_ok());
+        }
+    }
+
+    #[test]
+    fn rev_remedy_follows_its_site() {
+        let refused = |site: RevSite| {
+            PinnedRev::from_full_sha(&pn("pkg"), "HEAD", site)
+                .err()
+                .map(|err| err.to_string())
+                .unwrap_or_default()
+        };
+        let lock = refused(RevSite::Lockfile);
+        let entry = refused(RevSite::IndexEntry);
+        let head = refused(RevSite::GitHead);
+        for (rendered, remedy) in [
+            (&lock, crate::text::lock_remedy()),
+            (&entry, crate::text::index_entry_remedy()),
+            (&head, crate::text::index_rev_remedy_sha1()),
+        ] {
+            assert!(rendered.ends_with(remedy), "{rendered}");
+            assert!(!rendered.contains("re-run `ipe add`"), "{rendered}");
         }
     }
 }

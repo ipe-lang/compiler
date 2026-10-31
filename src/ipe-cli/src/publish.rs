@@ -42,7 +42,10 @@ use crate::remote_ingest::{
 use crate::scratch::{LeafName, ScratchDir, ScratchFile};
 
 use crate::CliError;
-use crate::index::{self, CommitId, EntryVersion, IndexEntry, PinnedRev, SourceUrl};
+use crate::index::{
+    self, CommitId, EntryVersion, HeaderKey, IndexEntry, PinnedRev, SourceUrl, VersionKey,
+};
+use crate::package_name::PackageName;
 use crate::project::ProjectManifest;
 use crate::published_version::{PublishedVersion, require_successor};
 use crate::publisher::{
@@ -197,22 +200,17 @@ pub fn run_publish(rest: &[String]) -> Result<(), CliError> {
     //    existing entry (refusing a duplicate); `--fresh` writes a single-version
     //    entry (the new version only), used to reset the disposable reserved smoke
     //    probe so its index entry never accumulates.
+    let package_name = PackageName::parse(&manifest.name)?;
     let index_root = crate::resolve::index_root()?;
     let entry_toml = if args.fresh {
-        build_fresh_entry(&manifest.name, &claimed, blessing.as_ref(), &entry_version)?
+        build_fresh_entry(&package_name, &claimed, blessing.as_ref(), &entry_version)?
     } else {
-        merge_into_entry(
-            &index_root,
-            &manifest.name,
-            claimed.as_str(),
-            &entry_version,
-        )?
+        merge_into_entry(&index_root, &package_name, &claimed, &entry_version)?
     };
 
     // 5/6. Open the PR, or under --dry-run print the entry + intended PR. The
     //      entry path, branch and title are built from the parsed name, a single
     //      plain path component, never from the raw manifest string.
-    let package_name = crate::package_name::PackageName::parse(&manifest.name)?;
     let plan = PrPlan {
         index_repo: args.index_repo.clone(),
         entry_file: format!("packages/{package_name}.toml"),
@@ -383,7 +381,7 @@ fn compute_entry_draft(
     // Parse-don't-validate: the typed constructor rejects any value outside the
     // transport allow-list. Publish uses the same gate as the resolver so an
     // entry written by `publish` round-trips through `read_entry` without error.
-    let package_name = crate::package_name::PackageName::parse(&manifest.name)?;
+    let package_name = PackageName::parse(&manifest.name)?;
     let source = SourceUrl::parse(&package_name, &raw_source)
         .map_err(|e| CliError::Usage(text::msg::publish_source_refused(&e)))?;
 
@@ -398,11 +396,11 @@ fn compute_entry_draft(
             .map_err(|e| CliError::Usage(text::msg::publish_rev_refused(&e)))?;
         let raw_sha = resolve_rev_to_sha(source_root, requested.as_str())?;
         refuse_rev_other_than_clean_head(source_root, &raw_sha)?;
-        PinnedRev::from_full_sha(&package_name, &raw_sha)
+        PinnedRev::from_full_sha(&package_name, &raw_sha, crate::index::RevSite::GitHead)
             .map_err(|e| CliError::Usage(text::msg::publish_rev_not_sha(&e)))?
     } else {
         let raw_sha = committed_pushed_head(source_root)?;
-        PinnedRev::from_full_sha(&package_name, &raw_sha)
+        PinnedRev::from_full_sha(&package_name, &raw_sha, crate::index::RevSite::GitHead)
             .map_err(|e| CliError::Usage(text::msg::publish_head_not_sha(&e)))?
     };
 
@@ -477,37 +475,66 @@ fn resolve_rev_to_sha(root: &Path, rev: &str) -> Result<String, CliError> {
     Ok(out.trim().to_owned())
 }
 
-/// Render one [`EntryVersion`] as the `[[version]]` TOML block the index reader
-/// parses, exactly round-tripping through [`crate::index::read_entry`].
+/// Render one [`EntryVersion`] as the version table the index reader parses,
+/// exactly round-tripping through [`crate::index::read_entry`].
 ///
-/// Pure: a function of the version alone, so the rendered bytes are testable
-/// against the reader without any filesystem or network.
+/// Rendered from [`VersionKey::ALL`], the key set the reader admits. Pure: a
+/// function of the version alone, so the rendered bytes are testable against
+/// the reader without any filesystem or network.
 #[must_use]
 pub fn render_entry_version(version: &EntryVersion) -> String {
-    let mut out = String::from("[[version]]\n");
-    let _ = writeln!(out, "version = \"{}\"", version.version);
-    let _ = writeln!(out, "source = \"{}\"", version.source.as_str());
-    let _ = writeln!(out, "rev = \"{}\"", version.rev.as_str());
-    let _ = writeln!(out, "sha256 = \"{}\"", version.sha256);
-    let caps: Vec<String> = version
-        .capabilities
-        .iter()
-        .map(|c| format!("\"{}\"", c.as_str()))
-        .collect();
-    let _ = writeln!(out, "capabilities = [{}]", caps.join(", "));
-    // A signed version carries its Sigstore bundle verbatim (single-line JSON,
-    // so it round-trips through the reader's quote-stripping line scan).
-    if let Some(sig) = &version.signature {
-        let _ = writeln!(out, "signature = \"{}\"", sig.as_str());
+    let mut out = format!("{}\n", index::VERSION_HEADER);
+    for key in VersionKey::ALL {
+        let key_text = key.as_str();
+        match key {
+            VersionKey::Version => {
+                let _ = writeln!(out, "{key_text} = \"{}\"", version.version);
+            }
+            VersionKey::Source => {
+                let _ = writeln!(out, "{key_text} = \"{}\"", version.source.as_str());
+            }
+            VersionKey::Rev => {
+                let _ = writeln!(out, "{key_text} = \"{}\"", version.rev.as_str());
+            }
+            VersionKey::Sha256 => {
+                let _ = writeln!(out, "{key_text} = \"{}\"", version.sha256);
+            }
+            VersionKey::Capabilities => {
+                let caps: Vec<String> = version
+                    .capabilities
+                    .iter()
+                    .map(|c| format!("\"{}\"", c.as_str()))
+                    .collect();
+                let _ = writeln!(out, "{key_text} = [{}]", caps.join(", "));
+            }
+            // A signed version carries its Sigstore bundle verbatim: single-line
+            // JSON inside one outer pair of quotes.
+            VersionKey::Signature => {
+                if let Some(sig) = &version.signature {
+                    let _ = writeln!(out, "{key_text} = \"{}\"", sig.as_str());
+                }
+            }
+        }
     }
     out
 }
 
-/// Render a whole entry file: the `name`/`publisher` header followed by every
-/// version block, in ascending version order.
+/// Render a whole entry file: the header rendered from [`HeaderKey::ALL`]
+/// followed by every version table, in ascending version order.
 #[must_use]
-pub fn render_entry(name: &str, publisher: &str, versions: &[EntryVersion]) -> String {
-    let mut out = format!("name = \"{name}\"\npublisher = \"{publisher}\"\n");
+pub fn render_entry(
+    name: &PackageName,
+    publisher: &SelfDeclaredPublisher,
+    versions: &[EntryVersion],
+) -> String {
+    let mut out = String::new();
+    for key in HeaderKey::ALL {
+        let value = match key {
+            HeaderKey::Name => name.as_str(),
+            HeaderKey::Publisher => publisher.as_str(),
+        };
+        let _ = writeln!(out, "{} = \"{value}\"", key.as_str());
+    }
     let mut ordered: Vec<&EntryVersion> = versions.iter().collect();
     ordered.sort_by(|a, b| a.version.cmp(&b.version));
     for v in ordered {
@@ -544,14 +571,14 @@ fn manifest_published_version(manifest: &ProjectManifest) -> Result<PublishedVer
 /// errors when an existing entry file is present but malformed.
 fn merge_into_entry(
     index_root: &Path,
-    name: &str,
-    publisher: &str,
+    name: &PackageName,
+    publisher: &SelfDeclaredPublisher,
     new_version: &EntryVersion,
 ) -> Result<String, CliError> {
     // An absent entry file ⇒ a first publish. A present-but-malformed entry is a
     // read error we surface rather than silently overwrite.
-    let existing: Option<IndexEntry> = if index::entry_file_exists(index_root, name)? {
-        Some(index::read_entry(index_root, name)?)
+    let existing: Option<IndexEntry> = if index::entry_file_exists(index_root, name.as_str())? {
+        Some(index::read_entry(index_root, name.as_str())?)
     } else {
         None
     };
@@ -559,12 +586,12 @@ fn merge_into_entry(
     let mut versions: Vec<EntryVersion> = existing.map(|e| e.versions).unwrap_or_default();
     if versions.iter().any(|v| v.version == new_version.version) {
         return Err(refuse(Refusal::DuplicateVersion {
-            name: name.to_owned(),
+            name: name.to_string(),
             version: new_version.version.to_string(),
         }));
     }
     require_successor(versions.iter().map(|v| &v.version), &new_version.version)
-        .map_err(|refusal| refusal.for_package(name))?;
+        .map_err(|refusal| refusal.for_package(name.as_str()))?;
     versions.push(new_version.clone());
 
     Ok(render_entry(name, publisher, &versions))
@@ -587,18 +614,18 @@ fn merge_into_entry(
 /// proven blessed publisher (including every `--dry-run`, which carries no
 /// authenticated identity).
 fn build_fresh_entry(
-    name: &str,
+    name: &PackageName,
     claimed: &SelfDeclaredPublisher,
     blessing: Result<&BlessedPublisher, &BlessingRefusal>,
     new_version: &EntryVersion,
 ) -> Result<String, CliError> {
-    if ipe_kernels::reserved_package_prefix_of(name).is_none() {
+    if ipe_kernels::reserved_package_prefix_of(name.as_str()).is_none() {
         return Err(CliError::Usage(text::msg::publish_fresh_refused(&name)));
     }
     match blessing {
         Ok(blessed) if blessed.vouches_for(claimed) => Ok(render_entry(
             name,
-            claimed.as_str(),
+            claimed,
             std::slice::from_ref(new_version),
         )),
         Ok(_) => Err(fresh_needs_blessing(
@@ -611,7 +638,7 @@ fn build_fresh_entry(
 
 /// The `--fresh` refusal for a reserved package whose claimed publisher is not a
 /// proven blessed identity; `reason` says why.
-fn fresh_needs_blessing(name: &str, reason: &dyn std::fmt::Display) -> CliError {
+fn fresh_needs_blessing(name: &PackageName, reason: &dyn std::fmt::Display) -> CliError {
     CliError::Usage(text::msg::publish_fresh_needs_blessing(&name, reason))
 }
 
@@ -1782,6 +1809,7 @@ mod tests {
             rev: PinnedRev::from_full_sha(
                 &pn("http-extras"),
                 "9f2c7b1e0a4d5c6f8b2a1e3d4c5b6a7f8e9d0c1b",
+                crate::index::RevSite::IndexEntry,
             )
             .expect("valid pinned rev"),
             sha256: crate::index::Sha256Hex::parse(
@@ -1814,8 +1842,8 @@ mod tests {
 
         let version = sample_version("1.2.0", caps(&[Capability::Network]));
         let toml = render_entry(
-            "http-extras",
-            "arthurmaciel",
+            &pn("http-extras"),
+            &claim("arthurmaciel"),
             std::slice::from_ref(&version),
         );
         std::fs::write(packages.join("http-extras.toml"), &toml).expect("write entry");
@@ -1845,8 +1873,8 @@ mod tests {
         version.signature = Some(bundle);
 
         let toml = render_entry(
-            "http-extras",
-            "arthurmaciel",
+            &pn("http-extras"),
+            &claim("arthurmaciel"),
             std::slice::from_ref(&version),
         );
         std::fs::write(packages.join("http-extras.toml"), &toml).expect("write entry");
@@ -1860,6 +1888,36 @@ mod tests {
         assert_eq!(&parsed.versions, std::slice::from_ref(&version));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The writer renders every key the closed entry grammar admits, and a
+    /// multi-version entry (empty and full capability lists, signed and
+    /// unsigned) reads back unchanged through that grammar.
+    #[test]
+    fn every_admitted_key_is_rendered_and_reads_back() {
+        let root = temp_dir("every-key");
+        let packages = root.join("packages");
+        std::fs::create_dir_all(&packages).expect("packages dir");
+        let mut signed = sample_version("1.2.0", Capability::ALL.iter().copied().collect());
+        signed.signature = Some(
+            crate::signing::SignatureBundle::parse(
+                "http-extras",
+                r#"{"mediaType":"application/vnd.dev.sigstore.bundle+json;version=0.3","dsseEnvelope":{}}"#,
+            )
+            .expect("valid bundle"),
+        );
+        let versions = [sample_version("1.0.0", BTreeSet::new()), signed];
+        let toml = render_entry(&pn("http-extras"), &claim("arthurmaciel"), &versions);
+        for key in HeaderKey::ALL {
+            assert!(toml.contains(&format!("{} = \"", key.as_str())), "{toml}");
+        }
+        for key in VersionKey::ALL {
+            assert!(toml.contains(&format!("\n{} = ", key.as_str())), "{toml}");
+        }
+        std::fs::write(packages.join("http-extras.toml"), &toml).expect("write entry");
+        let parsed = index::read_entry(&root, "http-extras").expect("entry parses");
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(parsed.versions, versions);
     }
 
     /// The publish-side DSSE statement binds the subject digest to the version's
@@ -1887,7 +1945,11 @@ mod tests {
                 Capability::Clock,
             ]),
         );
-        let toml = render_entry("risky", "arthurmaciel", std::slice::from_ref(&version));
+        let toml = render_entry(
+            &pn("risky"),
+            &claim("arthurmaciel"),
+            std::slice::from_ref(&version),
+        );
         std::fs::write(packages.join("risky.toml"), &toml).expect("write entry");
 
         let parsed = index::read_entry(&root, "risky").expect("entry parses");
@@ -1904,7 +1966,11 @@ mod tests {
         let root = temp_dir("no-caps");
         std::fs::create_dir_all(root.join("packages")).expect("packages dir");
         let version = sample_version("1.0.0", caps(&[]));
-        let toml = render_entry("pure", "arthurmaciel", std::slice::from_ref(&version));
+        let toml = render_entry(
+            &pn("pure"),
+            &claim("arthurmaciel"),
+            std::slice::from_ref(&version),
+        );
         std::fs::write(root.join("packages").join("pure.toml"), &toml).expect("write");
         let parsed = index::read_entry(&root, "pure").expect("entry parses");
         let only = parsed.versions.first().expect("one version");
@@ -1923,13 +1989,17 @@ mod tests {
         let v1 = sample_version("1.2.0", caps(&[Capability::Network]));
         std::fs::write(
             packages.join("http-extras.toml"),
-            render_entry("http-extras", "arthurmaciel", std::slice::from_ref(&v1)),
+            render_entry(
+                &pn("http-extras"),
+                &claim("arthurmaciel"),
+                std::slice::from_ref(&v1),
+            ),
         )
         .expect("write first entry");
 
         let v2 = sample_version("1.3.0", caps(&[Capability::Network, Capability::Clock]));
-        let merged =
-            merge_into_entry(&root, "http-extras", "arthurmaciel", &v2).expect("merge appends");
+        let merged = merge_into_entry(&root, &pn("http-extras"), &claim("arthurmaciel"), &v2)
+            .expect("merge appends");
         std::fs::write(packages.join("http-extras.toml"), &merged).expect("rewrite entry");
 
         let parsed = index::read_entry(&root, "http-extras").expect("entry parses");
@@ -1953,7 +2023,8 @@ mod tests {
         std::fs::create_dir_all(root.join("packages")).expect("packages dir");
 
         let v = sample_version("0.1.0", caps(&[]));
-        let toml = merge_into_entry(&root, "brand-new", "arthurmaciel", &v).expect("first publish");
+        let toml = merge_into_entry(&root, &pn("brand-new"), &claim("arthurmaciel"), &v)
+            .expect("first publish");
         std::fs::write(root.join("packages").join("brand-new.toml"), &toml).expect("write");
 
         let parsed = index::read_entry(&root, "brand-new").expect("entry parses");
@@ -1976,12 +2047,17 @@ mod tests {
         let v1 = sample_version("1.2.0", caps(&[Capability::Network]));
         std::fs::write(
             packages.join("http-extras.toml"),
-            render_entry("http-extras", "arthurmaciel", std::slice::from_ref(&v1)),
+            render_entry(
+                &pn("http-extras"),
+                &claim("arthurmaciel"),
+                std::slice::from_ref(&v1),
+            ),
         )
         .expect("write entry");
 
         let dup = sample_version("1.2.0", caps(&[Capability::Network]));
-        let err = merge_into_entry(&root, "http-extras", "arthurmaciel", &dup).unwrap_err();
+        let err =
+            merge_into_entry(&root, &pn("http-extras"), &claim("arthurmaciel"), &dup).unwrap_err();
         assert!(matches!(
             err,
             CliError::Publish(Refusal::DuplicateVersion { .. })
@@ -2004,14 +2080,19 @@ mod tests {
         ];
         std::fs::write(
             packages.join("http-extras.toml"),
-            render_entry("http-extras", "arthurmaciel", &published),
+            render_entry(&pn("http-extras"), &claim("arthurmaciel"), &published),
         )
         .expect("write entry");
 
         for below in ["1.5.0", "2.0.0-rc.1"] {
             let candidate = sample_version(below, caps(&[]));
-            let err =
-                merge_into_entry(&root, "http-extras", "arthurmaciel", &candidate).unwrap_err();
+            let err = merge_into_entry(
+                &root,
+                &pn("http-extras"),
+                &claim("arthurmaciel"),
+                &candidate,
+            )
+            .unwrap_err();
             assert!(
                 matches!(
                     &err,
@@ -2023,7 +2104,7 @@ mod tests {
         }
 
         let above = sample_version("2.0.1-rc.1", caps(&[]));
-        merge_into_entry(&root, "http-extras", "arthurmaciel", &above)
+        merge_into_entry(&root, &pn("http-extras"), &claim("arthurmaciel"), &above)
             .expect("a prerelease above the greatest version is a successor");
 
         let _ = std::fs::remove_dir_all(&root);
@@ -2085,8 +2166,13 @@ mod tests {
         let v = sample_version("0.0.0-smoke.1", caps(&[]));
         let claimed = claim(ipe_kernels::BLESSED_PUBLISHER);
         let blessing = authenticated_blessing(ipe_kernels::BLESSED_PUBLISHER, &claimed);
-        let toml = build_fresh_entry("ipe-registry-smoke-probe", &claimed, blessing.as_ref(), &v)
-            .expect("reserved + authenticated blessed --fresh is permitted");
+        let toml = build_fresh_entry(
+            &pn("ipe-registry-smoke-probe"),
+            &claimed,
+            blessing.as_ref(),
+            &v,
+        )
+        .expect("reserved + authenticated blessed --fresh is permitted");
         std::fs::write(packages.join("ipe-registry-smoke-probe.toml"), &toml).expect("write");
 
         let parsed =
@@ -2132,8 +2218,13 @@ mod tests {
         blessing: &Result<BlessedPublisher, BlessingRefusal>,
     ) {
         let v = sample_version("0.0.0-smoke.1", caps(&[]));
-        let err = build_fresh_entry("ipe-registry-smoke-probe", claimed, blessing.as_ref(), &v)
-            .expect_err("an unproven blessed claim must reject --fresh");
+        let err = build_fresh_entry(
+            &pn("ipe-registry-smoke-probe"),
+            claimed,
+            blessing.as_ref(),
+            &v,
+        )
+        .expect_err("an unproven blessed claim must reject --fresh");
         assert!(matches!(err, CliError::Usage(_)));
         assert!(format!("{err}").contains("--fresh"), "{err}");
     }
@@ -2146,7 +2237,7 @@ mod tests {
         let v = sample_version("1.0.0", caps(&[]));
         let claimed = claim(ipe_kernels::BLESSED_PUBLISHER);
         let blessing = authenticated_blessing(ipe_kernels::BLESSED_PUBLISHER, &claimed);
-        let err = build_fresh_entry("http-extras", &claimed, blessing.as_ref(), &v)
+        let err = build_fresh_entry(&pn("http-extras"), &claimed, blessing.as_ref(), &v)
             .expect_err("a non-reserved name must reject --fresh");
         assert!(matches!(err, CliError::Usage(_)));
         assert!(format!("{err}").contains("--fresh"), "{err}");
@@ -2239,8 +2330,8 @@ mod tests {
     fn dry_run_prints_the_entry_and_pr_plan() {
         let version = sample_version("1.2.0", caps(&[Capability::Network]));
         let toml = render_entry(
-            "http-extras",
-            "arthurmaciel",
+            &pn("http-extras"),
+            &claim("arthurmaciel"),
             std::slice::from_ref(&version),
         );
         let plan = PrPlan {
@@ -2730,7 +2821,7 @@ mod tests {
         );
         // PinnedRev::from_full_sha must accept it.
         assert!(
-            PinnedRev::from_full_sha(&pn("lib"), &sha).is_ok(),
+            PinnedRev::from_full_sha(&pn("lib"), &sha, crate::index::RevSite::IndexEntry).is_ok(),
             "HEAD SHA must be accepted by PinnedRev"
         );
         let _ = std::fs::remove_dir_all(&repo);
@@ -2833,7 +2924,11 @@ mod tests {
         std::fs::create_dir_all(&packages).expect("packages dir");
 
         let version = sample_version("2.0.0", caps(&[Capability::Network]));
-        let toml = render_entry("mylib", "arthurmaciel", std::slice::from_ref(&version));
+        let toml = render_entry(
+            &pn("mylib"),
+            &claim("arthurmaciel"),
+            std::slice::from_ref(&version),
+        );
         std::fs::write(packages.join("mylib.toml"), &toml).expect("write entry");
 
         let parsed = index::read_entry(&root, "mylib").expect("entry parses");

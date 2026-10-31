@@ -131,7 +131,8 @@ fn version(v: &str, source: &str, rev: &str) -> EntryVersion {
     EntryVersion {
         version: PublishedVersion::parse(v).expect("valid version"),
         source: SourceUrl::parse(&fixture_name("pkg"), source).expect("valid source"),
-        rev: PinnedRev::from_full_sha(&fixture_name("pkg"), rev).expect("valid rev"),
+        rev: PinnedRev::from_full_sha(&fixture_name("pkg"), rev, ipe::index::RevSite::IndexEntry)
+            .expect("valid rev"),
         sha256: Sha256Hex::parse(&fixture_name("pkg"), VALID_SHA).expect("valid digest"),
         capabilities: BTreeSet::new(),
         signature: None,
