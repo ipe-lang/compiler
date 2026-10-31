@@ -3242,22 +3242,22 @@ pub enum StdlibKernel {
     /// `Ui.cells : List (List Char) -> Element msg` — a raw terminal cell grid
     /// embedded as an island inside an `Ipe.Ui` view under `Tui.tea`.
     UiCells,
-    /// `UiCells.none : Cells msg` — empty cell, matching `Ui.none` but returns
-    /// `Cells msg`.
+    /// `UiCells.none : Screen msg` — empty cell, matching `Ui.none` but returns
+    /// `Screen msg`.
     UiCellsNone,
-    /// `UiCells.text : String -> Cells msg` — a text leaf returning `Cells msg`.
+    /// `UiCells.text : String -> Screen msg` — a text leaf returning `Screen msg`.
     UiCellsText,
-    /// `UiCells.el : List (Attribute msg) -> Cells msg -> Cells msg` — a single
-    /// child wrapper returning `Cells msg`.
+    /// `UiCells.el : List (Attribute msg) -> Screen msg -> Screen msg` — a single
+    /// child wrapper returning `Screen msg`.
     UiCellsEl,
-    /// `UiCells.row : List (Attribute msg) -> List (Cells msg) -> Cells msg` — a
-    /// horizontal layout row returning `Cells msg`.
+    /// `UiCells.row : List (Attribute msg) -> List (Screen msg) -> Screen msg` — a
+    /// horizontal layout row returning `Screen msg`.
     UiCellsRow,
-    /// `UiCells.column : List (Attribute msg) -> List (Cells msg) -> Cells msg` —
-    /// a vertical layout column returning `Cells msg`.
+    /// `UiCells.column : List (Attribute msg) -> List (Screen msg) -> Screen msg` —
+    /// a vertical layout column returning `Screen msg`.
     UiCellsColumn,
-    /// `UiCells.cells : List (List Char) -> Cells msg` — a raw character-grid
-    /// island inside a `Cells`-typed Tui view.
+    /// `UiCells.cells : List (List Char) -> Screen msg` — a raw character-grid
+    /// island inside a `Screen`-typed Tui view.
     UiCellsCells,
     // ── Ipe.Ui.Tui cell-native attribute builders ─────────────────────────
     /// `TuiUi.spacing : Int -> Attribute msg` — gap between children, in cells.

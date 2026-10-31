@@ -266,6 +266,7 @@ pub struct BuiltinRow {
     seal: SealClass,
     params: TypeParams,
     qualified_via: &'static [&'static str],
+    declared_in: Option<&'static str>,
     tag: Option<BuiltinTag>,
 }
 
@@ -316,6 +317,16 @@ impl BuiltinRow {
         self.qualified_via
     }
 
+    /// The source module that declares this reserved head as its own type
+    /// (`Ipe.Set` for `Set`), as its dotted path.
+    ///
+    /// That module exports the head whether or not its `exposing` clause lists
+    /// it, so `import <module> as Q` spells it `Q.<name>`.
+    #[must_use]
+    pub const fn declared_in(&self) -> Option<&'static str> {
+        self.declared_in
+    }
+
     /// The tag a kernel type scheme names this head by, if any.
     #[must_use]
     pub const fn tag(&self) -> Option<BuiltinTag> {
@@ -325,6 +336,13 @@ impl BuiltinRow {
     const fn via(self, qualifiers: &'static [&'static str]) -> Self {
         Self {
             qualified_via: qualifiers,
+            ..self
+        }
+    }
+
+    const fn declared_in_module(self, module: &'static str) -> Self {
+        Self {
+            declared_in: Some(module),
             ..self
         }
     }
@@ -358,14 +376,28 @@ impl BuiltinType {
             .map(Self)
     }
 
-    /// The empty-home builtin named `name`, for the unqualified type-name
-    /// resolver.
+    /// The empty-home builtin named `name`.
     ///
-    /// Only that resolver may read a head by its bare name: every other
-    /// identity question goes through [`Self::of_head`].
+    /// Only name resolution reads a head by its bare name: the unqualified
+    /// type-name resolver, the terminal-attribute binding and the re-export
+    /// home. Every other identity question goes through [`Self::of_head`].
     #[must_use]
     pub fn of_bare_name(name: &str) -> Option<Self> {
         bare_row(name).map(Self)
+    }
+
+    /// The reserved heads the source module at `module` declares as its own.
+    ///
+    /// `module` is the module's resolved path as segments; a head's
+    /// [`BuiltinRow::declared_in`] path must match it exactly.
+    pub fn declared_by_module<'a>(module: &'a [&'a str]) -> impl Iterator<Item = Self> + 'a {
+        BUILTIN_TYPES
+            .iter()
+            .filter(move |row| {
+                row.declared_in
+                    .is_some_and(|path| KernelHome::Module(path).matches(module))
+            })
+            .map(Self)
     }
 
     /// The row holding this builtin's facts.
@@ -396,6 +428,7 @@ const fn bare(
         seal,
         params,
         qualified_via: &[],
+        declared_in: None,
         tag: None,
     }
 }
@@ -414,6 +447,7 @@ const fn homed(
         seal,
         params,
         qualified_via: &[],
+        declared_in: None,
         tag: None,
     }
 }
@@ -439,9 +473,12 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
         .via(&["Auth"])
         .tagged(BuiltinTag::AuthError),
     bare("Bool", Reserved, Plain, Exact(0)).tagged(BuiltinTag::Bool),
-    bare("Bytes", Reserved, Plain, Exact(0)).tagged(BuiltinTag::Bytes),
-    bare("Cells", Reserved, Opaque, Exact(1)),
-    bare("Char", Reserved, Plain, Exact(0)).tagged(BuiltinTag::Char),
+    bare("Bytes", Reserved, Plain, Exact(0))
+        .declared_in_module("Ipe.Bytes")
+        .tagged(BuiltinTag::Bytes),
+    bare("Char", Reserved, Plain, Exact(0))
+        .declared_in_module("Ipe.Char")
+        .tagged(BuiltinTag::Char),
     bare("ChunkEvent", Reserved, SealedHandle, Exact(0)).via(&["HttpStream"]),
     bare("CliAttr", Reserved, Opaque, Exact(1)).tagged(BuiltinTag::CliAttr),
     bare("Cmd", Reserved, EffectCarrier, InferredCarrier)
@@ -462,7 +499,9 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
     bare("Cookie", Reserved, Opaque, Exact(0)).tagged(BuiltinTag::ServerCookie),
     bare("CsrfMode", Reserved, Opaque, Exact(0)).tagged(BuiltinTag::CsrfMode),
     // The JS-widget boundary `CustomElement down up`: a use resolves only through the arity gate (IPE-N0031) and the plain-value seal (IPE-N0039).
-    bare("CustomElement", Reserved, Opaque, Exact(2)).tagged(BuiltinTag::CustomElement),
+    bare("CustomElement", Reserved, Opaque, Exact(2))
+        .declared_in_module("Ipe.Ffi.Js.CustomElement")
+        .tagged(BuiltinTag::CustomElement),
     bare("Db", Reserved, Opaque, Exact(0))
         .via(&["Db"])
         .tagged(BuiltinTag::Db),
@@ -478,13 +517,21 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
         .tagged(BuiltinTag::Decoder),
     bare("Deficiency", Reserved, Opaque, Exact(0)).tagged(BuiltinTag::Deficiency),
     bare("Description", Reserved, View, Exact(0)).tagged(BuiltinTag::UiDescription),
-    bare("Dict", Reserved, ValueContainer, Exact(2)).tagged(BuiltinTag::Dict),
+    bare("Dict", Reserved, ValueContainer, Exact(2))
+        .declared_in_module("Ipe.Dict")
+        .tagged(BuiltinTag::Dict),
     // `Ipe.Db.Dsn`'s connection descriptor: carries a `Secret` password and a fail-closed TLS posture.
-    bare("Dsn", Reserved, SecretOrSink, Exact(0)).tagged(BuiltinTag::Dsn),
+    bare("Dsn", Reserved, SecretOrSink, Exact(0))
+        .declared_in_module("Ipe.Db.Dsn")
+        .tagged(BuiltinTag::Dsn),
     bare("Element", Reserved, View, OptionalMessage).tagged(BuiltinTag::UiElement),
     // `Ipe.Email`'s validated address.
-    bare("EmailAddress", Reserved, SecretOrSink, Exact(0)).tagged(BuiltinTag::EmailAddress),
-    bare("Error", Reserved, Opaque, Exact(0)).tagged(BuiltinTag::Error),
+    bare("EmailAddress", Reserved, SecretOrSink, Exact(0))
+        .declared_in_module("Ipe.Email")
+        .tagged(BuiltinTag::EmailAddress),
+    bare("Error", Reserved, Opaque, Exact(0))
+        .declared_in_module("Ipe.Error")
+        .tagged(BuiltinTag::Error),
     bare("ErrorDetails", LoweredBelowGuard, Opaque, Exact(0)).tagged(BuiltinTag::ErrorDetails),
     bare("ErrorInfo", LoweredBelowGuard, Opaque, Exact(0)),
     bare("ErrorKind", LoweredBelowGuard, Opaque, Exact(0)).tagged(BuiltinTag::ErrorKind),
@@ -511,15 +558,21 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
     bare("Length", Reserved, View, Exact(0)).tagged(BuiltinTag::UiLength),
     // `Ipe.Ui.Cli`'s line view `Lines msg` and its line-native attribute.
     bare("Lines", Reserved, Opaque, OptionalMessage).tagged(BuiltinTag::CliLines),
-    bare("List", Reserved, ValueContainer, Exact(1)).tagged(BuiltinTag::List),
+    bare("List", Reserved, ValueContainer, Exact(1))
+        .declared_in_module("Ipe.List")
+        .tagged(BuiltinTag::List),
     // `Ipe.Locale`'s BCP-47 handle.
-    bare("Locale", Reserved, SecretOrSink, Exact(0)).tagged(BuiltinTag::Locale),
+    bare("Locale", Reserved, SecretOrSink, Exact(0))
+        .declared_in_module("Ipe.Locale")
+        .tagged(BuiltinTag::Locale),
     bare("Location", Reserved, View, Exact(0)),
     bare("LogLevel", Reserved, Opaque, Exact(0)).tagged(BuiltinTag::LogLevel),
     bare("Mac", Reserved, SecretOrSink, Exact(0))
         .via(&["Crypto"])
         .tagged(BuiltinTag::CryptoMac),
-    bare("Maybe", Reserved, ValueContainer, Exact(1)).tagged(BuiltinTag::Maybe),
+    bare("Maybe", Reserved, ValueContainer, Exact(1))
+        .declared_in_module("Ipe.Maybe")
+        .tagged(BuiltinTag::Maybe),
     bare("Middleware", KernelImplicit, Opaque, Exact(0)),
     bare("Migration", LoweredBelowGuard, Opaque, Exact(0)).via(&["Db"]),
     // `Basics.Order` names this row through the compiled-source `Ipe.Basics`
@@ -527,7 +580,9 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
     bare("Order", LoweredBelowGuard, Opaque, Exact(0)).tagged(BuiltinTag::Order),
     bare("PanicInfo", LoweredBelowGuard, Opaque, Exact(0)),
     // `Ipe.Path`'s validated path: the traversal and NUL refusal boundary.
-    bare("Path", Reserved, SecretOrSink, Exact(0)).tagged(BuiltinTag::Path),
+    bare("Path", Reserved, SecretOrSink, Exact(0))
+        .declared_in_module("Ipe.Path")
+        .tagged(BuiltinTag::Path),
     bare("Placeholder", LoweredBelowGuard, Opaque, Exact(1)).tagged(BuiltinTag::InputPlaceholder),
     // `Ipe.Auth`'s authenticated subject: the auth mint is its only origin.
     bare("Principal", Reserved, Opaque, Exact(0))
@@ -542,19 +597,25 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
     bare("ReadOnly", Reserved, SealedHandle, Exact(0)).tagged(BuiltinTag::ConnReadOnly),
     bare("ReadWrite", Reserved, SealedHandle, Exact(0)).tagged(BuiltinTag::ConnReadWrite),
     // `Ipe.Regex`'s compiled pattern: `Regex.compile`'s typed refusal is its only origin.
-    bare("Regex", Reserved, SecretOrSink, Exact(0)).tagged(BuiltinTag::Regex),
+    bare("Regex", Reserved, SecretOrSink, Exact(0))
+        .declared_in_module("Ipe.Regex")
+        .tagged(BuiltinTag::Regex),
     // `Ipe.Url`'s same-origin relative reference: the browser-href SSRF boundary.
-    bare("Relative", Reserved, SecretOrSink, Exact(0)).tagged(BuiltinTag::UrlRelative),
+    bare("Relative", Reserved, SecretOrSink, Exact(0))
+        .declared_in_module("Ipe.Url")
+        .tagged(BuiltinTag::UrlRelative),
     bare("Request", Reserved, Opaque, Exact(0))
         .via(&["Server"])
         .tagged(BuiltinTag::ServerRequest),
     bare("Response", Reserved, Opaque, Exact(0)).via(&["Server"]),
-    bare("Result", Reserved, ValueContainer, Exact(2)).tagged(BuiltinTag::Result),
+    bare("Result", Reserved, ValueContainer, Exact(2))
+        .declared_in_module("Ipe.Result")
+        .tagged(BuiltinTag::Result),
     bare("RevocationMode", Reserved, Opaque, Exact(0)).tagged(BuiltinTag::RevocationMode),
     bare("Route", Reserved, Opaque, Exact(0))
         .via(&["Server"])
         .tagged(BuiltinTag::ServerRoute),
-    // `Ipe.Ui.Tui`'s view `Screen msg`; `Cells` is its rendering-model spelling.
+    // `Ipe.Ui.Tui`'s view `Screen msg`, the cell-grid rendering model.
     bare("Screen", Reserved, Opaque, OptionalMessage).tagged(BuiltinTag::Cells),
     // `Ipe.Secret`'s sealed secret string, a security-tier type.
     bare("Secret", Reserved, SecretOrSink, Exact(0))
@@ -562,8 +623,12 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
         .tagged(BuiltinTag::Secret),
     bare("Session", KernelImplicit, Opaque, Exact(0)),
     // `Ipe.Ffi.Js`'s session-stream address: `Js.openSession` is its only origin.
-    bare("SessionHandle", Reserved, Opaque, Exact(0)).tagged(BuiltinTag::SessionHandle),
-    bare("Set", Reserved, ValueContainer, Exact(1)).tagged(BuiltinTag::Set),
+    bare("SessionHandle", Reserved, Opaque, Exact(0))
+        .declared_in_module("Ipe.Ffi.Js")
+        .tagged(BuiltinTag::SessionHandle),
+    bare("Set", Reserved, ValueContainer, Exact(1))
+        .declared_in_module("Ipe.Set")
+        .tagged(BuiltinTag::Set),
     // `Ipe.App`'s config carrier `Setting shape`: the phantom shape keeps a `Web`-only setting out of another shape.
     bare("Setting", Reserved, Opaque, Exact(1)).tagged(BuiltinTag::Setting),
     bare("SqlField", Reserved, SecretOrSink, Exact(0)).tagged(BuiltinTag::SqlField),
@@ -577,7 +642,9 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
     bare("StreamWriter", LoweredBelowGuard, Opaque, Exact(0))
         .via(&["Stream"])
         .tagged(BuiltinTag::StreamWriter),
-    bare("String", Reserved, Plain, Exact(0)).tagged(BuiltinTag::String),
+    bare("String", Reserved, Plain, Exact(0))
+        .declared_in_module("Ipe.String")
+        .tagged(BuiltinTag::String),
     bare("Sub", Reserved, EffectCarrier, InferredCarrier)
         .via(&[
             "TeaCliSub",
@@ -587,16 +654,22 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
             "TeaWorkerSub",
         ])
         .tagged(BuiltinTag::Sub),
-    bare("Task", Reserved, EffectCarrier, InferredCarrier).tagged(BuiltinTag::Task),
+    bare("Task", Reserved, EffectCarrier, InferredCarrier)
+        .declared_in_module("Ipe.Task")
+        .tagged(BuiltinTag::Task),
     bare("TermProfile", Reserved, Opaque, Exact(0)).tagged(BuiltinTag::TermProfile),
     bare("TextSize", Reserved, Opaque, Exact(0)).tagged(BuiltinTag::TextSize),
     bare("TokenSource", Reserved, Opaque, Exact(0)).tagged(BuiltinTag::TokenSource),
     // `Ipe.PubSub`'s phantom topic handle.
-    bare("Topic", Reserved, SealedHandle, Exact(1)).tagged(BuiltinTag::Topic),
+    bare("Topic", Reserved, SealedHandle, Exact(1))
+        .declared_in_module("Ipe.PubSub")
+        .tagged(BuiltinTag::Topic),
     bare("TuiAttr", Reserved, Opaque, Exact(1)).tagged(BuiltinTag::TuiAttr),
     bare("TypeInfo", LoweredBelowGuard, Opaque, Exact(0)),
     // `Ipe.Url`'s validated URL: the scheme and SSRF parse boundary.
-    bare("Url", Reserved, SecretOrSink, Exact(0)).tagged(BuiltinTag::Url),
+    bare("Url", Reserved, SecretOrSink, Exact(0))
+        .declared_in_module("Ipe.Url")
+        .tagged(BuiltinTag::Url),
     bare("VAlign", Reserved, View, Exact(0)),
     bare("VNode", KernelImplicit, Opaque, Exact(0)),
     bare("Value", KernelImplicit, Opaque, Exact(0))
@@ -824,7 +897,9 @@ const fn every_tag_names_one_row(mut rows: &[BuiltinRow]) -> bool {
 /// * a seal class that pins a fixed lowering is reserved — the security-tier
 ///   handles cannot be shadowed;
 /// * a reserved row sits at the empty home, where the name it reserves lives;
-/// * a value container has the exact, non-zero arity the seal recurses over.
+/// * a value container has the exact, non-zero arity the seal recurses over;
+/// * only a reserved row names a declaring module: the module export it
+///   creates is a row binding, which a non-reserved name never needs.
 ///
 /// A row's [`TypeParams`] needs no reservation: canon counts the arguments of
 /// the row a use resolved to, so a user type of the same name is counted by
@@ -840,6 +915,9 @@ const fn roles_partition(mut rows: &[BuiltinRow]) -> bool {
             return false;
         }
         if reserved && !builtin_home {
+            return false;
+        }
+        if row.declared_in.is_some() && !reserved {
             return false;
         }
         if matches!(row.seal, SealClass::ValueContainer) && !matches!(row.params, Exact(n) if n > 0)
@@ -1100,6 +1178,16 @@ mod tests {
                     Exact(0),
                 ),
                 "a value container with nothing to recurse into",
+            ),
+            (
+                bare(
+                    "Order",
+                    BuiltinRole::LoweredBelowGuard,
+                    SealClass::Opaque,
+                    Exact(0),
+                )
+                .declared_in_module("Ipe.Basics"),
+                "a declaring module on a user-declarable row",
             ),
         ] {
             assert!(!roles_partition(&[row]), "{why} must be refused");

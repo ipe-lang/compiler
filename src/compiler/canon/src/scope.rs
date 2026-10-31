@@ -322,8 +322,41 @@ pub enum TypeTarget {
     Union(Vec<Symbol>),
     /// A type alias.
     Alias(AliasBody),
-    /// A builtin row a kernel module exports, minted at the empty home.
-    Builtin(ipe_kernels::BuiltinType),
+    /// A builtin row, with the home its use mints.
+    Builtin(BoundBuiltin),
+}
+
+/// A builtin row a name is bound to, with the home its use mints.
+///
+/// The row decides the use's arity, view alias and seal; the home only names
+/// the carrier (`["Html"]` for the Html attribute, an engine path for a
+/// terminal attribute, the empty home for a kernel export).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundBuiltin {
+    /// The row the name denotes.
+    pub row: ipe_kernels::BuiltinType,
+    /// The home a use of the name mints.
+    pub home: Vec<Symbol>,
+}
+
+impl BoundBuiltin {
+    /// The row `row` minted at the empty home.
+    #[must_use]
+    pub const fn at_empty_home(row: ipe_kernels::BuiltinType) -> Self {
+        Self {
+            row,
+            home: Vec::new(),
+        }
+    }
+}
+
+/// A type a source-module dependency exports, as a qualified use reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QualifiedType {
+    /// A builtin row the dependency re-exports.
+    Builtin(BoundBuiltin),
+    /// A union the dependency declares.
+    Union,
 }
 
 /// The two module-level bare-name namespaces of the module being canonicalised.

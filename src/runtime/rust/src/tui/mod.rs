@@ -1,6 +1,6 @@
 //! Ipe.Terminal — terminal (ANSI cell) backend for the Rust target.
 //!
-//! TEA-shaped (`Tui.tea cfg`): `view : Model -> Cells msg` lowered
+//! TEA-shaped (`Tui.tea cfg`): `view : Model -> Screen msg` lowered
 //! to ANSI cells via the structured `Element<Msg>` tree inside `CellsView<M>`.
 
 pub mod app;
@@ -135,22 +135,22 @@ impl<M> CellsView<M> {
 // Each delegates to the corresponding `ui_*_` helper and wraps the result in
 // `CellsView`.  The wrapper is the only compile-time evidence that a value
 // came from a `Cells`-producing builder, making Web-only builders (which return
-// bare `Element<M>`) an immediate type error inside a `view : M -> Cells Msg`
+// bare `Element<M>`) an immediate type error inside a `view : M -> Screen Msg`
 // function.
 
-/// `Ipe.Ui.Cells.none : Cells msg`
+/// `Ipe.Ui.Cells.none : Screen msg`
 #[must_use]
 pub fn cells_none_<M>() -> CellsView<M> {
     CellsView::new(Element::Empty)
 }
 
-/// `Ipe.Ui.Cells.text : String -> Cells msg`
+/// `Ipe.Ui.Cells.text : String -> Screen msg`
 #[must_use]
 pub fn cells_text_<M>(s: String) -> CellsView<M> {
     CellsView::new(Element::Text(s))
 }
 
-/// `Ipe.Ui.Cells.cells : List (List Char) -> Cells msg`
+/// `Ipe.Ui.Cells.cells : List (List Char) -> Screen msg`
 #[must_use]
 pub fn cells_cells_<M>(grid: Vec<Vec<char>>) -> CellsView<M> {
     CellsView::new(Element::Cells(grid))

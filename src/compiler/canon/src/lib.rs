@@ -36,8 +36,8 @@ pub use env::{
     bare_import_binds, const_str_eq, kernel_import_binds_last_segment, stdlib_canonical_qualifier,
 };
 pub use resolve::{
-    DO_BIND_MODULE, ModuleOrigin, QualifierForm, builtin_empty_home_arity, import_qualifier_forms,
-    import_qualifiers, is_reserved_builtin_type_name, is_stdlib_shared_carrier_type,
+    DO_BIND_MODULE, ModuleOrigin, QualifierForm, import_qualifier_forms, import_qualifiers,
+    is_reserved_builtin_type_name, is_stdlib_shared_carrier_type,
     is_user_type_declaration_forbidden, to_snake_case,
 };
 

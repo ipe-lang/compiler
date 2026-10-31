@@ -1730,8 +1730,8 @@ pub const fn ui_call_shape(k: KernelFn) -> Option<UiEmitPlan> {
             1,
             Guard::RejectInWebShape,
         ),
-        // ── Ipe.Ui.Cells Cells-typed builders. No shape guard: the type system
-        // rejects `Cells msg` where `Element msg` is expected (IPE-T0001).
+        // ── Ipe.Ui.Cells Screen-typed builders. No shape guard: the type system
+        // rejects `Screen msg` where `Element msg` is expected (IPE-T0001).
         KernelFn::UiCellsNone => pos("ipe_runtime::tui::cells_none_", 0),
         KernelFn::UiCellsText => pos("ipe_runtime::tui::cells_text_", 1),
         KernelFn::UiCellsEl => pos("ipe_runtime::tui::cells_el_", 2),
@@ -2183,7 +2183,7 @@ mod tests {
 
     /// The web-shape guard set is exactly `UiCells` — the one kernel that
     /// produces `Element msg` but has no browser denotation. The `UiCells*`
-    /// builders produce `Cells msg`; misuse is caught at the type level
+    /// builders produce `Screen msg`; misuse is caught at the type level
     /// (IPE-T0001) rather than by a runtime guard.
     #[test]
     fn reject_in_web_shape_guard_is_exactly_ui_cells() {
