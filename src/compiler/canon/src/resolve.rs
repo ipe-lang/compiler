@@ -6622,11 +6622,13 @@ enum Unexported {
 }
 
 /// The refusal of `qualifier.name`, a type its dependency does not export:
-/// IPE-N0022 for a private declaration, IPE-N0005 otherwise, both ranked over
-/// the exported names of `types`.
+/// IPE-N0022 for a private declaration, IPE-N0005 otherwise, both naming the
+/// dependency's module path (the module whose `exposing` list decides, not the
+/// importer's spelling of it) and ranked over the exported names of `types`.
 ///
 /// # Errors
-/// [`Diagnostic::CompilerBug`] when a symbol is not interned.
+/// [`Diagnostic::CompilerBug`] when a symbol is not interned or no source
+/// module owns `qualifier`.
 fn unexported_qualified_type(
     why: Unexported,
     qualifier: Symbol,
@@ -6635,7 +6637,21 @@ fn unexported_qualified_type(
     ctx: &TypeCtx,
 ) -> DResult<Diagnostic> {
     let name_s = resolve_or_bug(ctx.interner, name, "ipe_canon::unexported_qualified_type")?;
-    let module = name_str(ctx.interner, qualifier)?;
+    let module = match ctx
+        .env
+        .import_scope
+        .qualifier_owner
+        .get(&qualifier)
+        .map(|claim| &claim.owner)
+    {
+        Some(ModuleIdentity::Source(path)) => path_to_dot_string(ctx.interner, path),
+        Some(ModuleIdentity::Kernel(_)) | None => {
+            return Err(Diagnostic::CompilerBug {
+                where_: "ipe_canon::unexported_qualified_type",
+                detail: "a source qualifier no source module owns".into(),
+            });
+        }
+    };
     let suggestions = Candidates::hints(ranked_names(
         name_s,
         Shape::Flat,
@@ -10036,8 +10052,10 @@ mod html_qualifier_type_home_tests {
     #[derive(Debug, PartialEq, Eq)]
     enum QualifiedOutcome {
         Resolved,
-        NotExposed,
-        NoSuchMember,
+        /// IPE-N0022, naming the module it reports.
+        NotExposed(String),
+        /// IPE-N0005, naming the module it reports.
+        NoSuchMember(String),
         Other,
         /// Building the dependency failed; the failure's rendering.
         Setup(String),
@@ -10078,13 +10096,13 @@ mod html_qualifier_type_home_tests {
         let outcome = match canonicalise_module(&parsed_main, &main_path, &deps, &mut i) {
             Ok(_) => QualifiedOutcome::Resolved,
             Err(Diagnostic::Name {
-                msg: NameError::NameNotExposed { .. },
+                msg: NameError::NameNotExposed { module, .. },
                 ..
-            }) => QualifiedOutcome::NotExposed,
+            }) => QualifiedOutcome::NotExposed(module.into()),
             Err(Diagnostic::Name {
-                msg: NameError::NoSuchMember { .. },
+                msg: NameError::NoSuchMember { module, .. },
                 ..
-            }) => QualifiedOutcome::NoSuchMember,
+            }) => QualifiedOutcome::NoSuchMember(module.into()),
             Err(_) => QualifiedOutcome::Other,
         };
         (private, outcome)
@@ -10093,17 +10111,21 @@ mod html_qualifier_type_home_tests {
     /// A qualified type resolves only through its dependency's export table:
     /// a declared union or alias the dependency does not expose is IPE-N0022,
     /// and any other unexported name, a non-reserved builtin row name included,
-    /// is IPE-N0005. Neither is minted at the qualifier's home.
+    /// is IPE-N0005. Neither is minted at the qualifier's home. Both name the
+    /// dependency's module (`Dep`), whose `exposing` list decides, never the
+    /// importer's alias (`D`).
     #[test]
     fn a_qualified_name_the_dependency_does_not_export_is_refused() {
+        let not_exposed = || QualifiedOutcome::NotExposed("Dep".to_owned());
+        let no_such_member = || QualifiedOutcome::NoSuchMember("Dep".to_owned());
         for (ty, expected) in [
             ("D.Box", QualifiedOutcome::Resolved),
             ("D.Count", QualifiedOutcome::Resolved),
-            ("D.Hidden", QualifiedOutcome::NotExposed),
-            ("D.Tally", QualifiedOutcome::NotExposed),
-            ("D.Nope", QualifiedOutcome::NoSuchMember),
-            ("D.Value", QualifiedOutcome::NoSuchMember),
-            ("D.Order", QualifiedOutcome::NoSuchMember),
+            ("D.Hidden", not_exposed()),
+            ("D.Tally", not_exposed()),
+            ("D.Nope", no_such_member()),
+            ("D.Value", no_such_member()),
+            ("D.Order", no_such_member()),
         ] {
             let (private, outcome) = qualified_use_against_dep(ty);
             assert_eq!(outcome, expected, "{ty}");
