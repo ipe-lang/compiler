@@ -2316,6 +2316,34 @@ mod tests {
     }
 
     #[test]
+    fn a_non_ascii_rust_type_drops_only_its_binding() {
+        let pkg = decode(&base_pkg(&json!([
+            {
+                "name": "nandu",
+                "params": [],
+                "results": [{"name": "", "type": "\u{d1}andu", "rustType": "kw::\u{d1}andu"}],
+                "effect": "pure"
+            },
+            {
+                "name": "shift",
+                "params": [{"name": "n", "type": "Int", "ipeType": "Int", "rustType": "i64"}],
+                "results": [{"name": "", "type": "Int", "rustType": "i64"}],
+                "effect": "pure"
+            }
+        ])))
+        .expect("one unbindable symbol never refuses the package");
+        let names: Vec<&str> = pkg.fns().iter().map(FnInfo::name).collect();
+        assert_eq!(names, vec!["shift"]);
+        assert!(matches!(
+            pkg.dropped(),
+            [Diagnostic::WireMalformed {
+                context,
+                defect: WireDefect::InvalidType { got },
+            }] if context == "function `nandu`" && got == "kw::\u{d1}andu"
+        ));
+    }
+
+    #[test]
     fn an_injection_bearing_recv_rust_type_drops_the_binding() {
         let pkg = decode(&base_pkg(&json!([{
             "name": "major_field",

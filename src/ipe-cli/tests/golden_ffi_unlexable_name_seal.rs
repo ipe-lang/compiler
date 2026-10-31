@@ -1,9 +1,10 @@
 //! THE SEAL for foreign names the Ipê lexer cannot tokenize: a foreign function
 //! whose Rust name is the Ipê keyword `foreign`, and one whose foreign type is
 //! the non-ASCII Rust identifier `Ñandu`, are both legal Rust but neither can
-//! appear in the generated `Rust.Kw` interface module. The interface skips
-//! them, so a program importing the crate still builds against its other
-//! bindings.
+//! appear in the generated `Rust.Kw` interface module. The interface skips the
+//! keyword-named binding, and the decoder drops the binding whose declared
+//! `rustType` lies outside the FFI type grammar, so a program importing the
+//! crate still builds against its other bindings.
 //!
 //! The default gate proves `ipe dev build` exits 0 and the interface names neither
 //! binding. The `IPE_E2E=1` gate proves THE SEAL end to end: the emitted crate
@@ -22,9 +23,10 @@ use ipe::RootFixture;
 use ipe::project_root::SourceTree;
 use ipe_ffi::driver::{FfiCache, install_from_inspection};
 
-/// Seed the project's FFI cache with an inspection for a crate `kw`: `foreign`
-/// (an Ipê keyword), `nandu` (returns the non-ASCII `kw::Ñandu`), and the
-/// ordinary `shift` the program calls.
+/// Seed the project's FFI cache with an inspection for a crate `kw` in the
+/// inspector's shape (`type` = Ipê view, `rustType` = Rust identity):
+/// `foreign` (an Ipê keyword), `nandu` (returns the non-ASCII `kw::Ñandu`),
+/// and the ordinary `shift` the program calls.
 fn seed_ffi_cache(project_root: &Path) -> bool {
     let cache = FfiCache::at_project_root(project_root);
     let doc = serde_json::json!({
@@ -41,7 +43,7 @@ fn seed_ffi_cache(project_root: &Path) -> bool {
             {
                 "name": "nandu",
                 "params": [],
-                "results": [{"name": "", "type": "kw::\u{d1}andu"}],
+                "results": [{"name": "", "type": "\u{d1}andu", "rustType": "kw::\u{d1}andu"}],
                 "effect": "pure"
             },
             {
