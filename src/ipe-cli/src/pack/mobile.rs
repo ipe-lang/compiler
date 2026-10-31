@@ -41,7 +41,7 @@ use crate::output_dir::OwnedDir;
 use crate::project::{BundleId, MobileDelivery, ProjectManifest, PushDelivery, ScreenOrientation};
 use crate::text;
 
-use super::permissions::{self, Platform, RequestGroup, RuntimeRequestGroup};
+use super::permissions::{self, ApiLevel, Platform, RequestGroup, RuntimeRequestGroup};
 
 /// A mobile operating system this packager targets.
 ///
@@ -1730,7 +1730,7 @@ fn render_permission_groups(plan: &AndroidPlan<'_>) -> String {
              new String[] {{{names}}}, {code}, {min_sdk}, {declared});",
             field = group_field(*group),
             code = row.code.get(),
-            min_sdk = row.min_sdk.map_or(0, u32::from),
+            min_sdk = row.min_sdk.map_or(0, |level| u32::from(level.get())),
             declared = plan.groups.contains(&row),
         );
     }
@@ -1793,7 +1793,7 @@ fn render_shell_identity(out: &mut String, plan: &AndroidPlan<'_>) {
         "NOTIFICATIONS_MIN_SDK",
         &RequestGroup::Notifications
             .min_sdk()
-            .map_or(0, u32::from)
+            .map_or(0, |level| u32::from(level.get()))
             .to_string(),
     );
     java_string(out, "LOCAL_ORIGIN", csp::ANDROID_ASSET_ORIGIN);
@@ -2079,6 +2079,54 @@ const ANDROID_GRADLE_PLUGIN_VERSION: &str = "8.5.2";
 /// The oldest Gradle the pinned Android Gradle plugin runs on.
 const ANDROID_GRADLE_MIN_VERSION: &str = "8.7";
 
+/// The API level the shell compiles against and targets.
+const ANDROID_API_LEVEL: ApiLevel = ApiLevel::new(34);
+
+/// The oldest API level the shell installs on.
+const ANDROID_MIN_API_LEVEL: ApiLevel = ApiLevel::new(24);
+
+/// The newest `compileSdk` the pinned Android Gradle plugin supports.
+///
+/// Moves with [`ANDROID_GRADLE_PLUGIN_VERSION`]: an Android Gradle plugin bump
+/// and this level are one review.
+const ANDROID_GRADLE_PLUGIN_MAX_API_LEVEL: ApiLevel = ApiLevel::new(34);
+
+/// The `targetSdk` from which Android ignores `screenOrientation` on large screens.
+///
+/// Reaching it changes what the manifest's `orientation` promises, so the
+/// shell's level stays under it until the `Ipe.Package` orientation contract
+/// is revisited.
+const ANDROID_ORIENTATION_ADVISORY_FROM: ApiLevel = ApiLevel::new(36);
+
+/// The `androidx.webkit` library: the asset loader and the message bridge.
+const ANDROIDX_WEBKIT_VERSION: &str = "1.11.0";
+
+/// The `androidx.appcompat` library the shell's activity extends.
+const ANDROIDX_APPCOMPAT_VERSION: &str = "1.7.0";
+
+/// Whether the Android levels agree: the minimum is under the target, the
+/// target is one the pinned Gradle plugin supports and sits under the
+/// orientation advisory, and every runtime-request level lies above the
+/// minimum and within the target.
+const fn android_levels_agree() -> bool {
+    let min = ANDROID_MIN_API_LEVEL.get();
+    let api = ANDROID_API_LEVEL.get();
+    let mut agree = min < api
+        && api <= ANDROID_GRADLE_PLUGIN_MAX_API_LEVEL.get()
+        && api < ANDROID_ORIENTATION_ADVISORY_FROM.get();
+    let mut rest = RequestGroup::ALL;
+    while let [group, tail @ ..] = rest {
+        if let Some(level) = group.min_sdk() {
+            agree = agree && min < level.get() && level.get() <= api;
+        }
+        rest = tail;
+    }
+    agree
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if an Android API level drifts out of order with the minimum, the Gradle plugin ceiling, the orientation advisory or a runtime-request level [ledger #boundary]
+const _: () = assert!(android_levels_agree());
+
 /// The repositories `settings.gradle` resolves plugins and dependencies from.
 const ANDROID_GRADLE_REPOSITORIES: &str = "pluginManagement {\n\
     \x20   repositories {\n\
@@ -2112,11 +2160,11 @@ fn render_android_build_gradle(plan: &AndroidPlan<'_>) -> String {
         "plugins {{ id 'com.android.application' version '{ANDROID_GRADLE_PLUGIN_VERSION}' }}\n\
          android {{\n\
          \x20   namespace '{ns}'\n\
-         \x20   compileSdk 34\n\
+         \x20   compileSdk {ANDROID_API_LEVEL}\n\
          \x20   defaultConfig {{\n\
          \x20       applicationId '{ns}'\n\
-         \x20       minSdk 24\n\
-         \x20       targetSdk 34\n\
+         \x20       minSdk {ANDROID_MIN_API_LEVEL}\n\
+         \x20       targetSdk {ANDROID_API_LEVEL}\n\
          \x20       versionName '{version}'\n\
          \x20       versionCode 1\n\
          \x20   }}\n\
@@ -2126,8 +2174,8 @@ fn render_android_build_gradle(plan: &AndroidPlan<'_>) -> String {
          \x20   }}\n\
          }}\n\
          dependencies {{\n\
-         \x20   implementation 'androidx.webkit:webkit:1.11.0'\n\
-         \x20   implementation 'androidx.appcompat:appcompat:1.7.0'\n\
+         \x20   implementation 'androidx.webkit:webkit:{ANDROIDX_WEBKIT_VERSION}'\n\
+         \x20   implementation 'androidx.appcompat:appcompat:{ANDROIDX_APPCOMPAT_VERSION}'\n\
          \x20   implementation 'androidx.core:core:{ANDROIDX_CORE_VERSION}'\n\
          {push}\
          }}\n",
@@ -3909,7 +3957,7 @@ public final class IpeApplication extends Application {
 /// android`, and this README) carries verbatim, so neither can hand-write a
 /// `gradlew` line that drifts from the other.
 pub(crate) fn android_build_steps() -> crate::text::Message {
-    crate::text::android_build_steps(&ANDROID_GRADLE_MIN_VERSION)
+    crate::text::android_build_steps(&ANDROID_GRADLE_MIN_VERSION, &ANDROID_API_LEVEL)
 }
 
 /// The Android shell's build/README note.
@@ -5358,6 +5406,47 @@ mod tests {
         assert!(readme.contains(ANDROID_GRADLE_MIN_VERSION), "{readme}");
     }
 
+    /// `app/build.gradle` fills every toolchain number from its one const:
+    /// each API level line and each `AndroidX` library line appears exactly once.
+    #[test]
+    fn android_gradle_renders_each_toolchain_number_from_its_const() {
+        let shell = android(&full_pin());
+        let gradle = text_of(&shell, "app/build.gradle");
+        for expected in [
+            format!("compileSdk {ANDROID_API_LEVEL}"),
+            format!("targetSdk {ANDROID_API_LEVEL}"),
+            format!("minSdk {ANDROID_MIN_API_LEVEL}"),
+            format!("implementation 'androidx.webkit:webkit:{ANDROIDX_WEBKIT_VERSION}'"),
+            format!("implementation 'androidx.appcompat:appcompat:{ANDROIDX_APPCOMPAT_VERSION}'"),
+            format!("implementation 'androidx.core:core:{ANDROIDX_CORE_VERSION}'"),
+        ] {
+            assert_eq!(
+                gradle
+                    .lines()
+                    .filter(|line| line.trim() == expected)
+                    .count(),
+                1,
+                "{expected}: {gradle}"
+            );
+        }
+        assert_eq!(
+            gradle
+                .lines()
+                .filter(|line| line.contains("androidx."))
+                .count(),
+            3,
+            "every AndroidX library is one of the three const-rendered lines: {gradle}"
+        );
+    }
+
+    /// The build steps name the API level the shell compiles against.
+    #[test]
+    fn android_build_steps_name_the_api_level() {
+        let steps = android_build_steps();
+        let level = format!("API {ANDROID_API_LEVEL}");
+        assert!(steps.contains(level.as_str()), "{steps}");
+    }
+
     // ── Icon ──────────────────────────────────────────────────────────────────
 
     #[test]
@@ -5514,9 +5603,7 @@ mod tests {
         );
     }
 
-    /// One `file:line` naming a hand-written Gradle wrapper/build command
-    /// outside its one sanctioned home: the `## android-build-steps` catalog
-    /// section, or a `<!-- android-build-steps -->` marked doc block.
+    /// One `file:line` a line scan refuses outside the regions it skips.
     #[derive(Debug, PartialEq, Eq)]
     struct StrayGradleLine {
         file: String,
@@ -5529,14 +5616,36 @@ mod tests {
         }
     }
 
+    /// The `## android-build-steps` catalog heading: the steps' one source.
+    const STEPS_SECTION: &str = "## android-build-steps";
+
+    /// The doc marker opening a block byte-pinned to the rendered steps.
+    const STEPS_BLOCK: &str = "<!-- android-build-steps -->";
+
     /// Every line of `text` naming `gradlew`/`gradle wrapper` outside the
     /// catalog section or a marked doc block, labelled `file` for the report.
     fn stray_gradle_lines(file: &str, text: &str) -> Vec<StrayGradleLine> {
+        stray_lines(file, text, &[STEPS_SECTION, STEPS_BLOCK], |line| {
+            line.contains("gradlew") || line.contains("gradle wrapper")
+        })
+    }
+
+    /// Every line of `text` that `refused` matches outside the regions the
+    /// `skipped` openers start, labelled `file` for the report.
+    ///
+    /// A skipped region ends at the next `#`/`##` heading or at the closing
+    /// `<!-- /android-build-steps -->` marker.
+    fn stray_lines(
+        file: &str,
+        text: &str,
+        skipped: &[&str],
+        refused: impl Fn(&str) -> bool,
+    ) -> Vec<StrayGradleLine> {
         let mut inside = false;
         let mut hits = Vec::new();
         for (idx, line) in text.lines().enumerate() {
             let trimmed = line.trim();
-            if trimmed == "## android-build-steps" || trimmed == "<!-- android-build-steps -->" {
+            if skipped.contains(&trimmed) {
                 inside = true;
                 continue;
             }
@@ -5550,7 +5659,7 @@ mod tests {
             if inside {
                 continue;
             }
-            if line.contains("gradlew") || line.contains("gradle wrapper") {
+            if refused(line) {
                 hits.push(StrayGradleLine {
                     file: file.to_owned(),
                     line: idx.saturating_add(1),
@@ -5660,6 +5769,128 @@ mod tests {
         let clean =
             "## android-build-steps\n\n1. `gradlew assembleDebug`\n\n## next\n\nno gradle here\n";
         assert!(stray_gradle_lines("fixture.md", clean).is_empty());
+    }
+
+    /// Whether `line` writes one of our API levels as `API <level>`.
+    fn names_our_api_level(line: &str) -> bool {
+        [ANDROID_API_LEVEL, ANDROID_MIN_API_LEVEL]
+            .into_iter()
+            .any(|level| line.contains(&format!("API {level}")))
+    }
+
+    /// Whether `line` writes a Gradle SDK key followed by a literal number.
+    fn names_a_literal_sdk_level(line: &str) -> bool {
+        ["compileSdk ", "targetSdk ", "minSdk "]
+            .into_iter()
+            .any(|key| {
+                line.match_indices(key).any(|(at, _)| {
+                    line.get(at.saturating_add(key.len())..)
+                        .and_then(|rest| rest.bytes().next())
+                        .is_some_and(|byte| byte.is_ascii_digit())
+                })
+            })
+    }
+
+    /// The line that opens `mobile.rs`'s test module.
+    const TEST_MODULE_MARKER: &str = "#[cfg(test)]\nmod tests";
+
+    /// The production part of a Rust `source`: the text before its test
+    /// module, or `None` when it has none, so the scan fails closed.
+    fn production_part(source: &str) -> Option<&str> {
+        source
+            .find(TEST_MODULE_MARKER)
+            .and_then(|at| source.get(..at))
+    }
+
+    /// Every production line of the Rust `source` writing a Gradle SDK key
+    /// with a literal level, or `None` when `source` has no test module.
+    fn stray_rust_sdk_lines(file: &str, source: &str) -> Option<Vec<StrayGradleLine>> {
+        production_part(source).map(|part| stray_lines(file, part, &[], names_a_literal_sdk_level))
+    }
+
+    /// No surface spells one of our Android API levels a second time: the docs,
+    /// README, help, catalog and `Ipe.Package` name `API <level>` only inside the
+    /// block byte-pinned to the rendered steps (the catalog section holds the
+    /// `{api}` placeholder, so a literal there is red too), and the production
+    /// renderer writes no SDK key with a literal number.
+    #[test]
+    fn no_second_android_api_level_literal() {
+        let cli_manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = repo_root_for_tests();
+        let mut targets = gradle_scan_targets(repo_root, cli_manifest_dir);
+        targets.push(repo_root.join("src/stdlib/Ipe/Package.ipe"));
+        let mut hits = Vec::new();
+        for file in targets {
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let label = file
+                .strip_prefix(repo_root)
+                .unwrap_or(&file)
+                .display()
+                .to_string();
+            hits.extend(stray_lines(&label, &text, &[STEPS_BLOCK], |line| {
+                names_our_api_level(line) || names_a_literal_sdk_level(line)
+            }));
+        }
+        let rust =
+            stray_rust_sdk_lines("src/ipe-cli/src/pack/mobile.rs", include_str!("mobile.rs"));
+        assert!(
+            rust.is_some(),
+            "mobile.rs has no `{TEST_MODULE_MARKER}` line to cut the production part at"
+        );
+        hits.extend(rust.into_iter().flatten());
+        assert!(
+            hits.is_empty(),
+            "a second literal of an Android API level outside its const: {}",
+            hits.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    /// The API-level scan refuses a literal level outside the pinned block,
+    /// spares the pinned block and a platform level that is not ours, and
+    /// refuses a Rust source it cannot cut, so it cannot pass vacuously.
+    #[test]
+    fn api_level_scan_finds_a_literal_and_fails_closed() {
+        let refused = |line: &str| names_our_api_level(line) || names_a_literal_sdk_level(line);
+        let ours = format!("Android SDK, API {ANDROID_API_LEVEL}\n");
+        assert_eq!(
+            stray_lines("fixture.md", &ours, &[STEPS_BLOCK], refused),
+            vec![StrayGradleLine {
+                file: "fixture.md".to_owned(),
+                line: 1,
+            }]
+        );
+        let pinned = format!("{STEPS_BLOCK}\n{ours}<!-- /android-build-steps -->\n");
+        assert!(stray_lines("fixture.md", &pinned, &[STEPS_BLOCK], refused).is_empty());
+        let section = format!("{STEPS_SECTION}\n\n{ours}");
+        assert_eq!(
+            stray_lines("fixture.md", &section, &[STEPS_BLOCK], refused).len(),
+            1,
+            "the catalog section is not skipped: it must hold the placeholder"
+        );
+        let platform = ApiLevel::new(ANDROID_API_LEVEL.get().saturating_sub(1));
+        assert_ne!(platform, ANDROID_MIN_API_LEVEL);
+        let not_ours = format!("from API {platform} the OS gates it\n");
+        assert!(stray_lines("fixture.md", &not_ours, &[STEPS_BLOCK], refused).is_empty());
+
+        let rust = format!(
+            "const X: &str = \"compileSdk {ANDROID_API_LEVEL}\";\n{TEST_MODULE_MARKER} {{}}\n"
+        );
+        assert_eq!(
+            stray_rust_sdk_lines("fixture.rs", &rust).map(|hits| hits.len()),
+            Some(1)
+        );
+        let placeholder =
+            format!("const X: &str = \"compileSdk {{api}}\";\n{TEST_MODULE_MARKER} {{}}\n");
+        assert_eq!(
+            stray_rust_sdk_lines("fixture.rs", &placeholder).map(|hits| hits.len()),
+            Some(0)
+        );
+        assert_eq!(stray_rust_sdk_lines("fixture.rs", "fn main() {}\n"), None);
     }
 
     // ── Mount base: every shell URL and handler boundary derives from it ──────

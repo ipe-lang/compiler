@@ -62,10 +62,11 @@ use ipe_runtime_rust::encoding::{
 use crate::CliError;
 use crate::delivery_set::{BinaryTarget, ShipEntry};
 use crate::project::{
-    ApnsEnvironment, BrowserDelivery, BundleId, Capability, DeliveryConfig, DesktopDelivery,
-    EntryShape, FcmApiKey, FcmApplicationId, FcmIdentifierRefusal, FcmIdentifiers, FcmProjectId,
-    FcmSenderId, Install, IpeDep, MobileDelivery, Program, ProjectManifest, PublicEnvAllowlist,
-    PublicEnvName, PushDelivery, RustDep, ScreenOrientation, WasmBundle, WasmConfig, WasmMode,
+    ApnsEnvironment, BUNDLE_ID_EXAMPLE, BrowserDelivery, BundleId, BundleIdRefusal, Capability,
+    DeliveryConfig, DesktopDelivery, EntryShape, FcmApiKey, FcmApplicationId, FcmIdentifierRefusal,
+    FcmIdentifiers, FcmProjectId, FcmSenderId, Install, IpeDep, JAVA_PLATFORM_LABEL,
+    MAX_BUNDLE_ID_LEN, MobileDelivery, Program, ProjectManifest, PublicEnvAllowlist, PublicEnvName,
+    PushDelivery, ReservedBy, RustDep, ScreenOrientation, WasmBundle, WasmConfig, WasmMode,
 };
 use crate::pwa_icon::{self, PwaIconRefusal};
 use crate::text;
@@ -188,6 +189,45 @@ fn base_path_refusal(raw: &str, refusal: &MountBaseRefusal) -> text::Message {
             text::msg::manifest_base_path_reserved_byte(&base, &format!("0x{byte:02X}"))
         }
     }
+}
+
+/// The manifest refusal for a `delivery.mobile.bundleId` that
+/// [`BundleId::parse`] turned away, one catalog message per refusal.
+///
+/// The one composer of every bundle-id refusal: each reason is static data
+/// (a table word, a table prefix, a byte value), never the declared text, and
+/// every text ends with the grammar and its proven example.
+pub(crate) fn bundle_id_refusal(refusal: &BundleIdRefusal) -> text::Message {
+    let reason = match refusal {
+        BundleIdRefusal::Empty => text::msg::manifest_bundle_id_empty(),
+        BundleIdRefusal::TooLong { len } => {
+            text::msg::manifest_bundle_id_too_long(len, &MAX_BUNDLE_ID_LEN)
+        }
+        BundleIdRefusal::Byte { byte } => {
+            text::msg::manifest_bundle_id_byte(&format!("0x{byte:02X}"))
+        }
+        BundleIdRefusal::EmptyLabel => text::msg::manifest_bundle_id_empty_label(),
+        BundleIdRefusal::LabelStartsWithDigit => {
+            text::msg::manifest_bundle_id_label_starts_with_digit()
+        }
+        BundleIdRefusal::OneLabel => text::msg::manifest_bundle_id_one_label(),
+        BundleIdRefusal::ReservedWord { word } => text::msg::manifest_bundle_id_reserved_word(word),
+        BundleIdRefusal::JavaPlatformPackage => {
+            text::msg::manifest_bundle_id_java_platform(&JAVA_PLATFORM_LABEL)
+        }
+        BundleIdRefusal::StoreReserved { prefix } => match prefix.owner() {
+            ReservedBy::AppStore => text::msg::manifest_bundle_id_reserved_app_store(
+                &prefix.spelled(),
+                &BUNDLE_ID_EXAMPLE,
+            ),
+            ReservedBy::GooglePlay => text::msg::manifest_bundle_id_reserved_google_play(
+                &prefix.spelled(),
+                &BUNDLE_ID_EXAMPLE,
+            ),
+        },
+    };
+    let grammar = text::msg::manifest_bundle_id_grammar(&BUNDLE_ID_EXAMPLE, &MAX_BUNDLE_ID_LEN);
+    text::msg::manifest_bundle_id_refused(&reason, &grammar)
 }
 
 /// The manifest refusal for an `icon` that [`pwa_icon::parse`] turned away, one catalog message per refusal.
@@ -1282,12 +1322,8 @@ impl Reader<'_> {
     /// The refusal names the grammar and never echoes the declared text.
     fn bundle_id_field(&self, value: &Expr) -> Result<BundleId, CliError> {
         let raw = self.expect_string(value)?;
-        BundleId::parse(&raw).map_err(|refusal| {
-            self.reject(
-                value.span,
-                &format!("`delivery.mobile.bundleId` is refused: {refusal}"),
-            )
-        })
+        BundleId::parse(&raw)
+            .map_err(|refusal| self.reject(value.span, &bundle_id_refusal(&refusal)))
     }
 
     /// Read `delivery.mobile.orientation`: `Portrait` / `Landscape` / `Any`.
@@ -2461,6 +2497,7 @@ const fn usage(message: text::Message) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::ReservedPrefix;
 
     /// Create a fresh temp project directory with a minimal `src/Main.ipe`, so
     /// the reader's source-root existence check passes. Returns the project root.
@@ -3362,7 +3399,7 @@ mod tests {
     /// the Firebase API key.
     fn push_delivery(api_key: &str) -> String {
         format!(
-            "{{ mobile = {{ bundleId = \"com.example.app\", push = {{ apns = Production, fcm = {{ projectId = \"example-app\", applicationId = \"1:123:android:abc\", apiKey = {api_key:?}, senderId = \"123\" }} }} }} }}"
+            "{{ mobile = {{ bundleId = \"io.acme.app\", push = {{ apns = Production, fcm = {{ projectId = \"example-app\", applicationId = \"1:123:android:abc\", apiKey = {api_key:?}, senderId = \"123\" }} }} }} }}"
         )
     }
 
@@ -3371,7 +3408,7 @@ mod tests {
         let twice_key = refusal_text(
             "push_api_key_twice_refused",
             &delivery_manifest(
-                "{ mobile = { bundleId = \"com.example.app\", push = { apns = Production, fcm = { projectId = \"example-app\", applicationId = \"1:123:android:abc\", apiKey = \"AIza-first\", apiKey = \"AIza-second\", senderId = \"123\" } } } }",
+                "{ mobile = { bundleId = \"io.acme.app\", push = { apns = Production, fcm = { projectId = \"example-app\", applicationId = \"1:123:android:abc\", apiKey = \"AIza-first\", apiKey = \"AIza-second\", senderId = \"123\" } } } }",
                 "JsPort Push",
             ),
         );
@@ -3450,9 +3487,70 @@ mod tests {
         );
         assert!(
             one_label.as_deref().is_some_and(
-                |msg| msg.contains(&crate::project::BundleIdRefusal::OneLabel.to_string())
+                |msg| msg.contains(bundle_id_refusal(&BundleIdRefusal::OneLabel).as_str())
             ),
             "a one-label bundleId is refused with the one-label text: {one_label:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_bundle_id_refusal_text_covers_every_refusal() {
+        for refusal in [
+            BundleIdRefusal::Empty,
+            BundleIdRefusal::TooLong { len: 200 },
+            BundleIdRefusal::Byte { byte: b'-' },
+            BundleIdRefusal::EmptyLabel,
+            BundleIdRefusal::LabelStartsWithDigit,
+            BundleIdRefusal::OneLabel,
+            BundleIdRefusal::ReservedWord { word: "class" },
+            BundleIdRefusal::JavaPlatformPackage,
+            BundleIdRefusal::StoreReserved {
+                prefix: ReservedPrefix::ComApple,
+            },
+            BundleIdRefusal::StoreReserved {
+                prefix: ReservedPrefix::ComExample,
+            },
+        ] {
+            let names = match refusal {
+                BundleIdRefusal::Empty
+                | BundleIdRefusal::EmptyLabel
+                | BundleIdRefusal::LabelStartsWithDigit
+                | BundleIdRefusal::OneLabel => None,
+                BundleIdRefusal::TooLong { .. } => Some("200".to_owned()),
+                BundleIdRefusal::Byte { .. } => Some("0x2D".to_owned()),
+                BundleIdRefusal::ReservedWord { word } => Some(format!("`{word}`")),
+                BundleIdRefusal::JavaPlatformPackage => Some("`java`".to_owned()),
+                BundleIdRefusal::StoreReserved { prefix } => {
+                    Some(format!("`{}`", prefix.spelled()))
+                }
+            };
+            let shown = bundle_id_refusal(&refusal);
+            assert!(
+                shown.contains("`delivery.mobile.bundleId` is refused")
+                    && shown.contains(BUNDLE_ID_EXAMPLE)
+                    && names.as_deref().is_none_or(|name| shown.contains(name)),
+                "{refusal:?}: {shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_bundle_id_under_a_store_prefix_is_refused_without_echo() {
+        let source = delivery_manifest("{ mobile = { bundleId = \"Com.Apple.Shop\" } }", "");
+        let refusal = refusal_text("bundle_id_store_reserved_refused", &source);
+        let at = located_at(&source, "\"Com.Apple.Shop\"");
+        let expected = bundle_id_refusal(&BundleIdRefusal::StoreReserved {
+            prefix: ReservedPrefix::ComApple,
+        });
+        assert!(
+            refusal.as_deref().is_some_and(|msg| {
+                msg.contains(expected.as_str())
+                    && msg.contains(&at)
+                    && msg.contains("`com.apple`")
+                    && !msg.contains("Com.Apple")
+                    && !msg.contains("Shop")
+            }),
+            "a store-reserved bundleId is refused at the field ({at}) by the table spelling, never echoed: {refusal:?}"
         );
     }
 
@@ -3460,7 +3558,10 @@ mod tests {
     fn manifest_bundle_id_refusal_remedy_parses() {
         let manifest = read(
             "bundle_id_remedy_accepted",
-            &delivery_manifest("{ mobile = { bundleId = \"com.example.myapp\" } }", ""),
+            &delivery_manifest(
+                &format!("{{ mobile = {{ bundleId = {BUNDLE_ID_EXAMPLE:?} }} }}"),
+                "",
+            ),
         )
         .expect("the bundleId the refusal text advises parses");
         assert_eq!(
@@ -3470,7 +3571,7 @@ mod tests {
                 .bundle_id
                 .as_ref()
                 .map(BundleId::as_str),
-            Some("com.example.myapp")
+            Some(BUNDLE_ID_EXAMPLE)
         );
         let absent = read(
             "bundle_id_absent",
@@ -3488,10 +3589,7 @@ mod tests {
     fn manifest_push_accept_without_identifiers_is_unconfigured() {
         let manifest = read(
             "push_accept_without_identifiers",
-            &delivery_manifest(
-                "{ mobile = { bundleId = \"com.example.app\" } }",
-                "JsPort Push",
-            ),
+            &delivery_manifest("{ mobile = { bundleId = \"io.acme.app\" } }", "JsPort Push"),
         )
         .expect("the manifest reads; a web-only bundle needs no identifiers");
         assert!(
@@ -3500,7 +3598,7 @@ mod tests {
         );
         let offline = read(
             "push_neither_accept_nor_identifiers",
-            &delivery_manifest("{ mobile = { bundleId = \"com.example.app\" } }", ""),
+            &delivery_manifest("{ mobile = { bundleId = \"io.acme.app\" } }", ""),
         )
         .expect("a manifest without push parses");
         assert!(

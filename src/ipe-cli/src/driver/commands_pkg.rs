@@ -4035,7 +4035,7 @@ mod mobile_base_tests {
     fn delivery_record(base_path: &str, servers: &str, apns: &str) -> String {
         format!(
             "{{ browser = {{ basePath = {base_path:?} }}, servers = [ {servers} ], mobile = {{ \
-             bundleId = \"com.example.app\", push = {{ apns = {apns}, fcm = {{ \
+             bundleId = \"io.acme.app\", push = {{ apns = {apns}, fcm = {{ \
              projectId = \"example-app\", applicationId = \"1:123:android:abc\", \
              apiKey = \"AIza-key_1\", senderId = \"123\" }} }} }} }}"
         )
@@ -4304,7 +4304,7 @@ mod mobile_base_tests {
     /// with identifiers passes.
     #[test]
     fn mobile_gate_refuses_accepted_push_without_identifiers() {
-        let unconfigured = push_project("push_unconfigured", "{ bundleId = \"com.example.app\" }");
+        let unconfigured = push_project("push_unconfigured", "{ bundleId = \"io.acme.app\" }");
         let result = validate_mobile_pack(&unconfigured, delivery::Shape::Web);
         let refusal = text::Message::relay(&pack::mobile::MobileRefusal::PushUnconfigured);
         assert!(
@@ -4314,7 +4314,7 @@ mod mobile_base_tests {
 
         let configured = push_project(
             "push_configured",
-            "{ bundleId = \"com.example.app\", push = { apns = Development, fcm = { \
+            "{ bundleId = \"io.acme.app\", push = { apns = Development, fcm = { \
              projectId = \"example-app\", applicationId = \"1:123:android:abc\", \
              apiKey = \"AIza-key_1\", senderId = \"123\" } } }",
         );

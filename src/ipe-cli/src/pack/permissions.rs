@@ -258,6 +258,32 @@ impl RequestCode {
     }
 }
 
+/// An Android API level.
+///
+/// Its own type so a level is never a request code or a count.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+pub struct ApiLevel(u16);
+
+impl ApiLevel {
+    /// The API level numbered `level`.
+    #[must_use]
+    pub const fn new(level: u16) -> Self {
+        Self(level)
+    }
+
+    /// The level's number, as the Android build and `Build.VERSION.SDK_INT` read it.
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ApiLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// One runtime permission request the shell makes at the moment of use.
 ///
 /// Permissions the OS presents as one prompt share a group, so the shell asks
@@ -303,9 +329,9 @@ impl RequestGroup {
     ///
     /// Below it the permission is granted at install and the shell asks nothing.
     #[must_use]
-    pub const fn min_sdk(self) -> Option<u16> {
+    pub const fn min_sdk(self) -> Option<ApiLevel> {
         match self {
-            Self::Notifications => Some(33),
+            Self::Notifications => Some(ApiLevel(33)),
             Self::Location | Self::RecordAudio | Self::Camera => None,
         }
     }
@@ -333,7 +359,7 @@ pub struct RuntimeRequestGroup {
     /// The stable request code identifying the request.
     pub code: RequestCode,
     /// The first API level at which the request is made, if not every one.
-    pub min_sdk: Option<u16>,
+    pub min_sdk: Option<ApiLevel>,
 }
 
 impl RuntimeRequestGroup {
@@ -1658,7 +1684,7 @@ mod tests {
             web(WebCapability::Push),
         ]);
         let android = derive_permissions(&a, Platform::Android).expect("android");
-        let rows: Vec<(RequestGroup, u16, Option<u16>)> = android
+        let rows: Vec<(RequestGroup, u16, Option<ApiLevel>)> = android
             .android_runtime_request_groups()
             .into_iter()
             .map(|row| (row.group, row.code.get(), row.min_sdk))
@@ -1669,7 +1695,7 @@ mod tests {
             rows,
             vec![
                 (RequestGroup::Location, 1, None),
-                (RequestGroup::Notifications, 2, Some(33)),
+                (RequestGroup::Notifications, 2, Some(ApiLevel::new(33))),
             ]
         );
         assert!(

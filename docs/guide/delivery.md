@@ -45,7 +45,7 @@ package =
     , version = "0.1.0"
     , delivery =
         { desktop = { title = "UI Layout", width = 1024, height = 768 }
-        , mobile = { bundleId = "com.example.uilayout", orientation = Portrait }
+        , mobile = { bundleId = "io.acme.uilayout", orientation = Portrait }
         , browser = { basePath = "/" }
         }
     }
