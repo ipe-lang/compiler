@@ -16,7 +16,9 @@
 //! - **Fail-closed on the undeclared.** A network connect from an isolated
 //!   (network-absent) jail fails — the fresh empty net namespace has no route
 //!   off-host. A `fork`/subprocess from a subprocess-absent jail is EPERM'd by
-//!   the seccomp filter.
+//!   the seccomp filter. A namespace-creating `clone` is EPERM'd and `clone3` is
+//!   `ENOSYS` in every subprocess mode, and the FFI inspection jail refuses
+//!   `unshare`.
 //! - **No false-deny.** A thread-spawning program boots under the isolated jail
 //!   (the seccomp filter allows the thread-create path), and a network connect
 //!   from a network-GRANTED jail is not blocked by the namespace.
@@ -198,10 +200,9 @@ fn run_jailed_inner(
 
     let program = ipe_sandbox::seccomp::subprocess_deny_program(profile.subprocess)
         .expect("x86_64 seccomp program");
-    let bytes = ipe_sandbox::seccomp::program_bytes(&program);
 
     // memfd for the seccomp program, through the launcher's own safe writer.
-    let seccomp = ipe_sandbox::run_jail::write_seccomp_memfd(&bytes).expect("seccomp memfd");
+    let seccomp = ipe_sandbox::run_jail::write_seccomp_memfd(&program).expect("seccomp memfd");
     let fd = seccomp.make_inheritable().expect("seccomp fd inheritable");
 
     let scoped = ipe_test_temp::temp_root().join(format!("ipe-e2e-{}", std::process::id()));
@@ -219,8 +220,8 @@ fn run_jailed_inner(
     // but a home variable, and no profile in this file grants one.
     let host_env = |k: &str| ipe_env::var_os(k);
     let scope = prove(tools).expect("the process cap is proven scoped to the jail");
-    let argv = run_jail_argv(&scope, profile, &mounts, Some(fd), &host_env, payload)
-        .expect("the argv builds");
+    let argv =
+        run_jail_argv(&scope, profile, &mounts, fd, &host_env, payload).expect("the argv builds");
     let (prog, rest) = argv.args().split_first().expect("non-empty argv");
     let mut cmd = Command::new(prog);
     cmd.args(rest);
@@ -483,10 +484,10 @@ fn granted_subprocess_can_fork() {
 #[test]
 fn a_thread_spawning_program_boots_under_the_isolated_jail() {
     let Some(tools) = e2e_tools() else { return };
-    // Prove the seccomp filter's clone3/clone-thread allowance does not
-    // false-deny a threaded program. `nproc` (coreutils) reads /proc and the CPU
-    // affinity; a simpler thread probe is a python one-liner that spawns a
-    // thread (CPython uses pthread_create → clone3 on glibc>=2.34).
+    // Prove the seccomp filter's clone-thread allowance does not false-deny a
+    // threaded program. A python one-liner spawns a thread: CPython's
+    // pthread_create tries clone3 on glibc>=2.34, gets ENOSYS from the filter,
+    // and falls back to a thread clone, which the filter allows.
     let py = "/usr/bin/python3";
     if !Path::new(py).exists() {
         return;
@@ -505,6 +506,165 @@ fn a_thread_spawning_program_boots_under_the_isolated_jail() {
         Some(0),
         "a threaded program must boot under the isolated jail (threads allowed)"
     );
+}
+
+/// The python interpreter the syscall probes run under; `None` skips them.
+fn python3() -> Option<&'static str> {
+    let py = "/usr/bin/python3";
+    Path::new(py).exists().then_some(py)
+}
+
+/// A python probe that exits 0 only when a raw `syscall(nr, args...)` fails
+/// with `errno`. A call that succeeds (a forked child included) exits non-zero.
+fn errno_probe(py: &str, nr: u32, args: &str, errno: u32) -> Vec<OsString> {
+    let script = format!(
+        "import ctypes,sys\n\
+         libc=ctypes.CDLL(None,use_errno=True)\n\
+         r=libc.syscall({nr},{args})\n\
+         sys.exit(0 if r==-1 and ctypes.get_errno()=={errno} else 3)"
+    );
+    vec![
+        OsString::from(py),
+        OsString::from("-c"),
+        OsString::from(script),
+    ]
+}
+
+/// `clone` on `x86_64` (the harness's one target).
+const NR_CLONE: u32 = 56;
+/// `clone3`, the same number on every 64-bit ABI.
+const NR_CLONE3: u32 = 435;
+/// `CLONE_NEWUSER | SIGCHLD`: a process clone into a fresh user namespace.
+const CLONE_NEWUSER_PROCESS: u32 = 0x1000_0000 | 17;
+const EPERM: u32 = 1;
+const ENOSYS: u32 = 38;
+
+#[test]
+fn a_jailed_user_namespace_clone_is_refused() {
+    let Some(tools) = e2e_tools() else { return };
+    let Some(py) = python3() else { return };
+    let payload = errno_probe(
+        py,
+        NR_CLONE,
+        &format!("{CLONE_NEWUSER_PROCESS},0,0,0,0"),
+        EPERM,
+    );
+    for profile in [isolated(), subprocess_granted()] {
+        let code = run_jailed(&tools, &profile, &payload);
+        assert_eq!(
+            code,
+            Some(0),
+            "clone(CLONE_NEWUSER) must fail EPERM (subprocess={})",
+            profile.subprocess
+        );
+    }
+}
+
+#[test]
+fn a_jailed_clone3_is_not_implemented() {
+    let Some(tools) = e2e_tools() else { return };
+    let Some(py) = python3() else { return };
+    // Unfiltered, a zero-size `clone_args` is `EINVAL`; the filter answers first.
+    let payload = errno_probe(py, NR_CLONE3, "0,0", ENOSYS);
+    for profile in [isolated(), subprocess_granted()] {
+        let code = run_jailed(&tools, &profile, &payload);
+        assert_eq!(
+            code,
+            Some(0),
+            "clone3 must fail ENOSYS (subprocess={})",
+            profile.subprocess
+        );
+    }
+}
+
+#[test]
+fn a_subprocess_granted_jail_still_spawns() {
+    let Some(tools) = e2e_tools() else { return };
+    let Some(py) = python3() else { return };
+    // glibc `posix_spawn` tries clone3, gets ENOSYS, and falls back to a
+    // process clone, which a granted jail allows; `subprocess.run` forks.
+    let script = "import os,subprocess,sys\n\
+                  pid=os.posix_spawn('/bin/true',['/bin/true'],{})\n\
+                  _,status=os.waitpid(pid,0)\n\
+                  rc=subprocess.run(['/bin/true']).returncode\n\
+                  sys.exit(0 if status==0 and rc==0 else 1)";
+    let payload = vec![
+        OsString::from(py),
+        OsString::from("-c"),
+        OsString::from(script),
+    ];
+    let code = run_jailed(&tools, &subprocess_granted(), &payload);
+    assert_eq!(
+        code,
+        Some(0),
+        "a subprocess-granted jail must still spawn through the clone fallback"
+    );
+}
+
+#[test]
+fn the_inspection_jail_refuses_unshare() {
+    if e2e_tools().is_none() {
+        return;
+    }
+    let caps = ipe_sandbox::probe();
+    if caps.timeout.is_none() {
+        return;
+    }
+    let unshare = "/usr/bin/unshare";
+    if !Path::new(unshare).exists() {
+        return;
+    }
+    let scoped = ipe_test_temp::temp_root().join(format!("ipe-e2e-inspect-{}", std::process::id()));
+    std::fs::create_dir_all(&scoped).expect("scoped tmp");
+    let spec = ipe_sandbox::JailSpec {
+        network: ipe_sandbox::NetworkPolicy::Denied,
+        scoped_tmp: CanonicalPath::resolve(&scoped).expect("scoped tmp resolves"),
+        registry_cache: None,
+        toolchain: None,
+        toolchain_ro_binds: Vec::new(),
+        homes: ipe_sandbox::HomeMasks::of_invoker().expect("the invoker's homes resolve"),
+        path_prepend: Vec::new(),
+        rustup_home: None,
+        limits: ipe_sandbox::ResourceLimits::default(),
+    };
+    // `clone3` answers `EINVAL` unfiltered (a zero-size `clone_args`) whatever
+    // the host's user-namespace policy, so this probe goes red without the
+    // filter even where the host itself already refuses a nested namespace.
+    let clone3 = python3().map(|py| errno_probe(py, NR_CLONE3, "0,0", ENOSYS));
+    let (control, refused, clone3) = {
+        let _guard = JAIL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let control = ipe_sandbox::run_in_bwrap_jail(&caps, &spec, &[OsString::from("/bin/true")]);
+        let refused = ipe_sandbox::run_in_bwrap_jail(
+            &caps,
+            &spec,
+            &[unshare, "-U", "/bin/true"].map(OsString::from),
+        );
+        let clone3 = clone3.map(|probe| ipe_sandbox::run_in_bwrap_jail(&caps, &spec, &probe));
+        (control, refused, clone3)
+    };
+    let _ = std::fs::remove_dir_all(&scoped);
+    // Control: the inspection jail runs a payload, so the refusal below is the
+    // filter's, not a jail that never started.
+    assert_eq!(
+        control.as_ref().map(|out| out.status),
+        Ok(Some(0)),
+        "the inspection jail must run a no-op payload: {control:?}"
+    );
+    let refused = refused.expect("the inspection jail runs");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        refused.status != Some(0) && stderr.contains("Operation not permitted"),
+        "`unshare -U` must be refused with EPERM inside the inspection jail \
+         (status {:?}): {stderr}",
+        refused.status
+    );
+    if let Some(clone3) = clone3 {
+        assert_eq!(
+            clone3.as_ref().map(|out| out.status),
+            Ok(Some(0)),
+            "clone3 must fail ENOSYS inside the inspection jail: {clone3:?}"
+        );
+    }
 }
 
 /// The skip gate itself, tested without needing a broken environment: only a

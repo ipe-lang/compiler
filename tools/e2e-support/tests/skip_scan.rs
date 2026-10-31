@@ -170,6 +170,26 @@ const ENV_SKIPS: &[(&str, &str, &str)] = &[
         JAIL_ABSENT,
     ),
     (
+        "src/compiler/sandbox/tests/run_jail_e2e.rs",
+        "a_jailed_user_namespace_clone_is_refused",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/compiler/sandbox/tests/run_jail_e2e.rs",
+        "a_jailed_clone3_is_not_implemented",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/compiler/sandbox/tests/run_jail_e2e.rs",
+        "a_subprocess_granted_jail_still_spawns",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/compiler/sandbox/tests/run_jail_e2e.rs",
+        "the_inspection_jail_refuses_unshare",
+        JAIL_ABSENT,
+    ),
+    (
         "src/compiler/sandbox/tests/run_jail_windows_e2e.rs",
         "a_child_spawn_is_denied_under_a_subprocess_withholding_job_but_succeeds_under_control",
         CONTROL_INCONCLUSIVE,
