@@ -1,10 +1,10 @@
 use super::{
-    BuildOptions, BundleHost, CliError, EmittedCrate, OutTarget, RuntimeContext, SettingsSource,
-    apply_fixes_cmd, attribute_canon_errors, attribute_post_link_error, bluegreen_enabled,
-    build_root_into, bundle_delivery, compile_prepared, create_source_root, emit_machine_error,
-    emit_permissions, emit_settings, find_manifest_for_ipe_file, frame_infer_error,
-    gate_decoder_pipelines, home_to_source_map, io_err, resolve_vendored_runtime_dir, run_version,
-    runtime_dep_from_env,
+    BuildOptions, BundleHost, CliError, EmittedCrate, OutTarget, RuntimeContext, RuntimeEmit,
+    SettingsSource, apply_fixes_cmd, attribute_canon_errors, attribute_post_link_error,
+    bluegreen_enabled, build_root_into, bundle_delivery, compile_prepared, create_source_root,
+    emit_machine_error, emit_permissions, emit_settings, find_manifest_for_ipe_file,
+    frame_infer_error, gate_decoder_pipelines, home_to_source_map, io_err,
+    resolve_vendored_runtime_dir, run_version, runtime_dep_from_env,
 };
 use std::num::NonZeroU8;
 
@@ -496,15 +496,11 @@ pub fn run_watch(rest: &[String]) -> Result<(), CliError> {
     // A Tui app with no interactive terminal is refused right here — before
     // any compile or cargo work — same as `ipe dev run`.
     gate_terminal(Verb::DEV_WATCH.name(), delivery.shape())?;
-    // Watch is always a native dependency-model dev build (it never vendors the
-    // runtime tree, nor targets wasm), so — like `ipe dev build` on its default path
-    // — it must NOT require the vendored runtime source subtree. It resolves the
-    // dependency crate root itself via `runtime_embed::resolve` once the loop
-    // starts (see `watch::run`); the vendored tree is honoured only when passed
-    // explicitly with `--runtime`. Requiring `resolve_runtime` up front made
-    // `ipe dev watch` fail to locate the runtime in an installed checkout where the
-    // vendored subtree is absent but the dependency crate root resolves fine.
-    let runtime_dir = resolve_vendored_runtime_dir(args.runtime.clone(), false)?;
+    // Watch is always a native linked dev build (it never vendors the runtime
+    // tree, nor targets wasm): its rebuild emit names the crate root
+    // `runtime_embed::resolve` gives once the loop starts (see `watch::run`), so
+    // no vendored tree is required; one passed with `--runtime` is honoured.
+    let runtime_dir = resolve_vendored_runtime_dir(args.runtime.clone(), RuntimeEmit::Linked)?;
 
     // Fail closed before the watch loop starts: `ipe dev watch` rebuilds with cargo
     // on every change, so a missing toolchain is reported once, up front, with
@@ -1111,26 +1107,6 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
     // The dependency model (native OR wasm) needs no vendored tree — the runtime
     // is a path dependency. Only a dep-model-OFF build vendors the source subtree.
     let runtime_dep = runtime_dep_from_env();
-    let runtime_dir = resolve_vendored_runtime_dir(args.runtime, !runtime_dep)?;
-
-    // Fail closed before emitting: `ipe dev build` compiles the emitted project so a
-    // reported success means the crate actually built. A missing toolchain is a
-    // clear root-cause error now, not an opaque OS spawn error after the
-    // (wasted) emit. The wasm branch delegates to `bundle_wasm`, which resolves
-    // cargo itself, so only the native branch resolves here — the resolved path
-    // is reused for its build.
-    let native_cargo = if compile_target.is_wasm() {
-        None
-    } else {
-        Some(toolchain::require_cargo(toolchain::ToolIntent::Build)?)
-    };
-
-    // Resolved only now, after every refusal above; nothing is created until the
-    // emit writes its crate.
-    let output = resolve_output_root(out.as_deref(), manifest)?;
-    let rust_area = output.area(&[OutputArea::Rust]);
-    let out_dir = rust_area.path()?;
-
     let options = BuildOptions {
         static_plan,
         target: compile_target.ir_target(),
@@ -1149,6 +1125,25 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
         // A developer build links the runtime its environment names.
         runtime_origin: runtime_embed::RuntimeOrigin::Developer,
     };
+    let runtime_dir = resolve_vendored_runtime_dir(args.runtime, options.runtime_emit())?;
+
+    // Fail closed before emitting: `ipe dev build` compiles the emitted project so a
+    // reported success means the crate actually built. A missing toolchain is a
+    // clear root-cause error now, not an opaque OS spawn error after the
+    // (wasted) emit. The wasm branch delegates to `bundle_wasm`, which resolves
+    // cargo itself, so only the native branch resolves here — the resolved path
+    // is reused for its build.
+    let native_cargo = if compile_target.is_wasm() {
+        None
+    } else {
+        Some(toolchain::require_cargo(toolchain::ToolIntent::Build)?)
+    };
+
+    // Resolved only now, after every refusal above; nothing is created until the
+    // emit writes its crate.
+    let output = resolve_output_root(out.as_deref(), manifest)?;
+    let rust_area = output.area(&[OutputArea::Rust]);
+    let out_dir = rust_area.path()?;
 
     // A webview-native `web desktop` delivery links the system webview and
     // selects the webview executor; every other delivery is served.
@@ -1562,15 +1557,14 @@ pub fn run_eject(rest: &[String]) -> Result<(), CliError> {
         });
     }
 
-    let runtime_dir = resolve_vendored_runtime_dir(args.runtime, true)?;
+    let options = eject_options();
+    let runtime_dir = resolve_vendored_runtime_dir(args.runtime, options.runtime_emit())?;
 
     // The ejected project is handed to the user, so it goes to a fresh
     // directory clear of the sources and of every tree ipe owns — never over
     // anything already there. It is claimed before the build, so the emit
     // adopts it and no ancestor is ever marked ipe-owned.
     let target = OutputRoot::fresh(&args.out, &ProjectPaths::from_manifest(manifest))?.claim()?;
-
-    let options = eject_options();
 
     let show_progress = {
         use std::io::IsTerminal as _;
@@ -1891,7 +1885,22 @@ pub fn release_pipeline(
             let rust_area = output.area(&[OutputArea::Release, OutputArea::Rust]);
             let out_dir = rust_area.path()?;
             let runtime_dep = runtime_dep_from_env();
-            let runtime_dir = resolve_vendored_runtime_dir(args.runtime.clone(), !runtime_dep)?;
+            // Emit the Rust wasm project as a release build so the Debug gate fires.
+            let options = BuildOptions {
+                static_plan: None,
+                target: ipe_ir::Target::WasmClient,
+                intent: verb.intent(),
+                runtime_dep,
+                tree_shake_vendored: false,
+                // The debugger is never enabled on a release build.
+                debugger: false,
+                // A release build never carries appearance hot-swap scaffolding.
+                hot_appearance: false,
+                // A developer build links the runtime its environment names.
+                runtime_origin: runtime_embed::RuntimeOrigin::Developer,
+            };
+            let runtime_dir =
+                resolve_vendored_runtime_dir(args.runtime.clone(), options.runtime_emit())?;
 
             let show_progress = {
                 use std::io::IsTerminal as _;
@@ -1908,20 +1917,6 @@ pub fn release_pipeline(
                 );
             }
 
-            // Emit the Rust wasm project as a release build so the Debug gate fires.
-            let options = BuildOptions {
-                static_plan: None,
-                target: ipe_ir::Target::WasmClient,
-                intent: verb.intent(),
-                runtime_dep,
-                tree_shake_vendored: false,
-                // The debugger is never enabled on a release build.
-                debugger: false,
-                // A release build never carries appearance hot-swap scaffolding.
-                hot_appearance: false,
-                // A developer build links the runtime its environment names.
-                runtime_origin: runtime_embed::RuntimeOrigin::Developer,
-            };
             let crate_dir = held.emit(
                 &EmitTarget::Area(rust_area),
                 &runtime_dir,
@@ -1948,7 +1943,22 @@ pub fn release_pipeline(
     // wrapper) and pure-native (plain optimised binary).
     let resolved = consented.resolved();
 
-    let runtime_dir = resolve_vendored_runtime_dir(args.runtime.clone(), false)?;
+    // The pure-native and the jailed path emit the same statically linked app,
+    // so one options value drives both emits and the runtime resolution.
+    let options = BuildOptions {
+        static_plan: Some(ipe_backend_rust::static_build::StaticPlan {
+            triple,
+            c_profile: ipe_backend_rust::static_build::CProfile::WithLibc {
+                allocator: ipe_backend_rust::static_build::StaticAllocator::Dlmalloc,
+            },
+        }),
+        target: ipe_ir::Target::Native,
+        intent: verb.intent(),
+        runtime_dep: runtime_dep_from_env(),
+        tree_shake_vendored: false,
+        ..BuildOptions::default()
+    };
+    let runtime_dir = resolve_vendored_runtime_dir(args.runtime.clone(), options.runtime_emit())?;
 
     let show_progress = {
         use std::io::IsTerminal as _;
@@ -1974,21 +1984,6 @@ pub fn release_pipeline(
 
         let cargo_bin = toolchain::require_cargo(toolchain::ToolIntent::Build)?;
 
-        let app_static_plan = Some(ipe_backend_rust::static_build::StaticPlan {
-            triple,
-            c_profile: ipe_backend_rust::static_build::CProfile::WithLibc {
-                allocator: ipe_backend_rust::static_build::StaticAllocator::Dlmalloc,
-            },
-        });
-
-        let options = BuildOptions {
-            static_plan: app_static_plan,
-            target: ipe_ir::Target::Native,
-            intent: verb.intent(),
-            runtime_dep: runtime_dep_from_env(),
-            tree_shake_vendored: false,
-            ..BuildOptions::default()
-        };
         // A desktop host returned through the bundler above, so this static
         // artifact is the served program.
         let crate_dir = held.emit(
@@ -2079,20 +2074,6 @@ pub fn release_pipeline(
     // Step 1: emit + build the app binary (static, musl, production).
     let app_area = output.area(&[OutputArea::Release, OutputArea::App]);
     let app_out = app_area.path()?;
-    let app_static_plan = Some(ipe_backend_rust::static_build::StaticPlan {
-        triple,
-        c_profile: ipe_backend_rust::static_build::CProfile::WithLibc {
-            allocator: ipe_backend_rust::static_build::StaticAllocator::Dlmalloc,
-        },
-    });
-    let options = BuildOptions {
-        static_plan: app_static_plan,
-        target: ipe_ir::Target::Native,
-        intent: verb.intent(),
-        runtime_dep: runtime_dep_from_env(),
-        tree_shake_vendored: false,
-        ..BuildOptions::default()
-    };
     // A desktop host returned through the bundler above, so this static
     // artifact is the served program.
     let app_dir = held.emit(
@@ -3219,21 +3200,6 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     // The dependency model (native OR wasm) needs no vendored tree — the runtime
     // is a path dependency. Only a dep-model-OFF build vendors the source subtree.
     let runtime_dep = runtime_dep_from_env();
-    let runtime_dir = resolve_vendored_runtime_dir(args.runtime, !runtime_dep)?;
-
-    // Fail closed before emitting: `ipe dev run` shells out to cargo to build the
-    // emitted project, so a missing toolchain is a clear root-cause error now,
-    // not an opaque OS spawn error after the (wasted) compile. The wasm branch
-    // delegates to `bundle_wasm`, which resolves cargo itself, so only the
-    // native branch resolves here — the resolved path is reused for its build.
-    let native_cargo = if wasm_target {
-        None
-    } else {
-        Some(toolchain::require_cargo(toolchain::ToolIntent::Run)?)
-    };
-
-    let rust_area = output.area(&[OutputArea::Rust]);
-
     // `ipe dev run` is a DEVELOPMENT execution, so `Debug.*` is allowed
     // (production = false).
     let options = BuildOptions {
@@ -3251,6 +3217,20 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
         // A developer build links the runtime its environment names.
         runtime_origin: runtime_embed::RuntimeOrigin::Developer,
     };
+    let runtime_dir = resolve_vendored_runtime_dir(args.runtime, options.runtime_emit())?;
+
+    // Fail closed before emitting: `ipe dev run` shells out to cargo to build the
+    // emitted project, so a missing toolchain is a clear root-cause error now,
+    // not an opaque OS spawn error after the (wasted) compile. The wasm branch
+    // delegates to `bundle_wasm`, which resolves cargo itself, so only the
+    // native branch resolves here — the resolved path is reused for its build.
+    let native_cargo = if wasm_target {
+        None
+    } else {
+        Some(toolchain::require_cargo(toolchain::ToolIntent::Run)?)
+    };
+
+    let rust_area = output.area(&[OutputArea::Rust]);
 
     // Nothing is created in the Rust area until the emit writes its crate.
     let out_dir = rust_area.path()?;

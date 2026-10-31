@@ -4591,7 +4591,7 @@ mod tests {
         #[test]
         fn the_ambient_scan_sees_a_vendored_runtime_resolution() {
             let mutated = format!(
-                "{AUDIT_SOURCE}\nfn vendored_tree() -> bool {{ crate::resolve_vendored_runtime_dir(None, true).is_ok() }}\n"
+                "{AUDIT_SOURCE}\nfn vendored_tree() -> bool {{ crate::resolve_vendored_runtime_dir(None, RuntimeEmit::Vendored).is_ok() }}\n"
             );
             let hits = ambient_reads(&mutated).unwrap_or_default();
             assert_eq!(
