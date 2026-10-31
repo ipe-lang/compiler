@@ -1943,6 +1943,28 @@ mod tests {
     }
 
     #[test]
+    fn a_submodule_function_is_not_the_top_level_fact() {
+        // `ta::util::parse_num(u32)` must not stand in for `ta::parse_num`: the
+        // asserted top-level path is left to the shim's rustc check.
+        let mut nested = ta_fn("parse_num", ("Int", "u32"), ("Int", "i64"));
+        if let Some(obj) = nested.as_object_mut() {
+            obj.insert("callPath".to_owned(), serde_json::json!("util::parse_num"));
+        }
+        let ta = inspector_shaped_crate("ta", &serde_json::json!([nested]));
+        assert_eq!(ta.inspected_free_fns.get("parse_num"), None);
+        assert!(
+            validated_in(
+                &["Int", "Result Error Int"],
+                "ta::parse_num",
+                std::slice::from_ref(&ta),
+                &UnifyReport::default(),
+                &LocalTypeNames::default(),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn an_ipe_view_match_over_a_different_rust_type_is_refused() {
         for (sig, path) in [
             (["Int", "Result Error Int"], "ta::narrow"),

@@ -1852,12 +1852,15 @@ pub fn installed_crate_from_pkg(
     }
     // The asserted-call cross-check facts: crate-top-level FREE functions
     // only (no receiver, no accessor shape, no generics) — the one shape an
-    // asserted path can name that inspection also records.
+    // asserted path can name that inspection also records. A function with a
+    // `callPath` lives in a submodule, so its bare name is not a top-level
+    // path's identity.
     let mut inspected_free_fns: std::collections::BTreeMap<String, InspectedFnFact> =
         std::collections::BTreeMap::new();
     for f in pkg.fns() {
         let is_free_fn = f.recv_type().is_empty()
             && f.method_name().is_empty()
+            && f.call_path().is_empty()
             && f.generic().is_none()
             && matches!(f.shape(), crate::pkginfo::FnShape::Plain);
         if is_free_fn {
