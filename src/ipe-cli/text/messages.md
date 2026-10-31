@@ -2578,7 +2578,11 @@ package `{pkg}`: `rev` contains an injection-shaped value, got: {raw}
 
 ## index-rev-not-immutable
 
-package `{pkg}`: recorded `rev` is not an immutable commit SHA (expected 40 lowercase hex chars), got: {raw} — re-run `ipe add` to record an immutable pin
+package `{pkg}`: recorded `rev` is not an immutable commit SHA (expected 40 lowercase hex chars), got: {raw} — {remedy}
+
+## index-rev-remedy-sha1
+
+ipe pins only 40-character SHA-1 commits, so the source repository must use SHA-1 object ids
 
 ## index-rev-mixed-case-hex
 
@@ -2636,9 +2640,57 @@ package `{name}`: {detail}
 
 package `{name}`: a `[[version]]` entry is missing `{field}`
 
-## index-capabilities-not-array
+## index-entry-remedy
 
-package `{name}`: `capabilities` must be a `["…", …]` array, got: {raw}
+an index entry holds only what `ipe package publish` writes; report the entry to the registry's maintainers
+
+## index-entry-unrecognised-line
+
+index entry `{entry}` line {line}: not a comment, a `[[version]]` header, or a `key = value` field — {remedy}
+
+## index-entry-unknown-key
+
+index entry `{entry}` line {line}: unknown field "{key}" — an entry holds only {known}; {remedy}
+
+## index-entry-key-needs-header
+
+index entry `{entry}` line {line}: field `{key}` belongs before the first `[[version]]` — {remedy}
+
+## index-entry-key-needs-version
+
+index entry `{entry}` line {line}: field `{key}` belongs inside a `[[version]]` table — {remedy}
+
+## index-entry-malformed-value
+
+index entry `{entry}` line {line}: field `{key}` must be {shape} — {remedy}
+
+## index-entry-shape-quoted
+
+one double-quoted value with no other `"` and nothing after it
+
+## index-entry-shape-list
+
+a `["…", …]` list of distinct double-quoted capability names, or `[]`
+
+## index-entry-shape-signature
+
+one double-quoted bundle free of control and invisible characters
+
+## index-entry-duplicate-key
+
+index entry `{entry}` line {line}: field `{key}` appears twice in one table — {remedy}
+
+## index-entry-duplicate-version
+
+index entry `{entry}` line {line}: version {version} is listed twice — {remedy}
+
+## index-entry-name-mismatch
+
+index entry `{entry}` line {line}: field `name` names another package — {remedy}
+
+## index-entry-hidden-character
+
+index entry `{entry}` line {line}: character {column} of the comment is U+{code}, a control or invisible character a viewer shows differently from what ipe reads — {remedy}
 
 ## publish-rev-unresolved
 

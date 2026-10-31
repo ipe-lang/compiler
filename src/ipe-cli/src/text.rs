@@ -1837,7 +1837,9 @@ messages! {
     /// An index `rev` shaped like an injection.
     index_rev_injection(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-rev-injection";
     /// A recorded `rev` that is not a full commit SHA.
-    index_rev_not_immutable(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-rev-not-immutable";
+    index_rev_not_immutable(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe, remedy) = "index-rev-not-immutable";
+    /// How to recover from a checkout whose commit is not a SHA-1.
+    index_rev_remedy_sha1 = "index-rev-remedy-sha1";
     /// A requested rev that is hex-shaped but mixed-case.
     index_rev_mixed_case_hex(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-rev-mixed-case-hex";
     /// A full-SHA requested rev that disagrees with the commit git served.
@@ -1868,9 +1870,41 @@ messages! {
         "index-capability-unknown";
     /// A `[[version]]` entry missing a field.
     index_version_missing_field(name: &crate::package_name::PackageName, field) = "index-version-missing-field";
-    /// An index entry `capabilities` that is not an array.
-    index_capabilities_not_array(name: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) =
-        "index-capabilities-not-array";
+    /// How to recover from an index entry the reader refuses.
+    index_entry_remedy = "index-entry-remedy";
+    /// An index entry line outside the entry grammar.
+    index_entry_unrecognised_line(entry: &crate::package_name::PackageName, line, remedy) =
+        "index-entry-unrecognised-line";
+    /// An index entry field with an unknown key.
+    index_entry_unknown_key(entry: &crate::package_name::PackageName, line, key: &crate::style::TerminalSafe, known, remedy) =
+        "index-entry-unknown-key";
+    /// An index entry header field inside a version table.
+    index_entry_key_needs_header(entry: &crate::package_name::PackageName, line, key, remedy) =
+        "index-entry-key-needs-header";
+    /// An index entry version field outside a version table.
+    index_entry_key_needs_version(entry: &crate::package_name::PackageName, line, key, remedy) =
+        "index-entry-key-needs-version";
+    /// An index entry field whose value does not have its key's shape.
+    index_entry_malformed_value(entry: &crate::package_name::PackageName, line, key, shape, remedy) =
+        "index-entry-malformed-value";
+    /// The shape of a one-string index entry value.
+    index_entry_shape_quoted = "index-entry-shape-quoted";
+    /// The shape of an index entry `capabilities` value.
+    index_entry_shape_list = "index-entry-shape-list";
+    /// The shape of an index entry `signature` value.
+    index_entry_shape_signature = "index-entry-shape-signature";
+    /// An index entry field repeated within one table.
+    index_entry_duplicate_key(entry: &crate::package_name::PackageName, line, key, remedy) =
+        "index-entry-duplicate-key";
+    /// An index entry listing one version twice.
+    index_entry_duplicate_version(entry: &crate::package_name::PackageName, line, version, remedy) =
+        "index-entry-duplicate-version";
+    /// An index entry whose `name` is another package.
+    index_entry_name_mismatch(entry: &crate::package_name::PackageName, line, remedy) =
+        "index-entry-name-mismatch";
+    /// An index entry comment holding a control or invisible character.
+    index_entry_hidden_character(entry: &crate::package_name::PackageName, line, column, code, remedy) =
+        "index-entry-hidden-character";
     /// `ipe package publish --rev` naming no commit.
     publish_rev_unresolved(refspec: &crate::style::TerminalSafe, rev: &crate::style::TerminalSafe) =
         "publish-rev-unresolved";
@@ -1953,8 +1987,8 @@ mod tests {
             crate::style::TerminalSafe::sanitize("x\u{1b}[31my\u{7}z\u{9b}\u{1b}]0;t\u{7}");
         let table: [(Message, &str); 8] = [
             (
-                index_rev_not_immutable(&pkg, &hostile),
-                "package `pkg`: recorded `rev` is not an immutable commit SHA (expected 40 lowercase hex chars), got: xyz — re-run `ipe add` to record an immutable pin",
+                index_rev_not_immutable(&pkg, &hostile, &"fix it"),
+                "package `pkg`: recorded `rev` is not an immutable commit SHA (expected 40 lowercase hex chars), got: xyz — fix it",
             ),
             (
                 signature_bundle_malformed(&pkg, &hostile),
