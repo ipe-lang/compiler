@@ -438,6 +438,76 @@ fn routed_web_app_emits_wasm_app_routed() {
     );
 }
 
+/// Build `source` for the wasm target under the manifest's
+/// `delivery.browser.basePath` `base` (`""` is the root, no field) into `out`.
+fn build_wasm_at_base(source: &str, base: &str, out: &Path) -> Result<(), String> {
+    let tree = ipe::project_root::SourceTree::main(source);
+    let tree = if base.is_empty() {
+        tree
+    } else {
+        tree.field(&format!(
+            "delivery = {{ browser = {{ basePath = \"{base}\" }} }}"
+        ))
+    };
+    let fixture = ipe::RootFixture::from_tree(&tree).map_err(|e| format!("{e:?}"))?;
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    ipe::build_fixture_with_options(&fixture, out, &runtime, &wasm_options())
+        .map(drop)
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// A routed wasm client mounts under the build's base: the emitted
+/// `wasm_app_routed` call carries the manifest's `basePath` as its base
+/// literal, and the root build carries the root's `""`, never a dropped
+/// argument the runtime would default.
+#[test]
+#[allow(clippy::expect_used)] // test setup: a failed emit IS the failure
+fn routed_web_app_mounts_under_the_build_base() {
+    for (name, base) in [
+        ("wasm_gate_routed_base_app", "/app"),
+        ("wasm_gate_routed_base_nested", "/a/b-c"),
+        ("wasm_gate_routed_base_root", ""),
+    ] {
+        let out = scratch(name).join("out");
+        build_wasm_at_base(ROUTED_APP, base, &out).expect("a routed Web.tea must emit");
+        let main_rs = std::fs::read_to_string(out.join("src/main.rs")).expect("emitted main.rs");
+        // Layout-blind: the renderer may break the call across lines.
+        let call: String = main_rs
+            .split("wasm_app_routed(")
+            .nth(1)
+            .expect("a routed wasm app calls `wasm_app_routed`")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let tail = format!("}},{base:?}");
+        assert!(
+            call.contains(&format!("{tail})")) || call.contains(&format!("{tail},)")),
+            "base {base:?}: the routed call must end with the base literal {base:?}, got:\n{main_rs}"
+        );
+    }
+}
+
+/// A `basePath` that is not a mount base never reaches the routed client: the
+/// build refuses it, so no emitted bundle can mount from a malformed base.
+#[test]
+fn routed_web_app_refuses_a_malformed_build_base() {
+    for (name, base) in [
+        ("wasm_gate_routed_base_trailing", "/app/"),
+        ("wasm_gate_routed_base_relative", "app"),
+        ("wasm_gate_routed_base_reserved", "/a%20b"),
+    ] {
+        let out = scratch(name).join("out");
+        assert!(
+            build_wasm_at_base(ROUTED_APP, base, &out).is_err(),
+            "basePath {base:?} must be refused at build time"
+        );
+        assert!(
+            !out.join("src/main.rs").exists(),
+            "basePath {base:?}: no routed client may be emitted"
+        );
+    }
+}
+
 /// A routed wasm app with `onNavigate` evaluates `update` once and shares it
 /// between the runtime entry and the generated `set_page`.
 #[test]
@@ -477,13 +547,14 @@ fn routed_web_app_compiles_for_wasm() {
         return;
     }
     let runtime = e2e_support::require_runtime().into_path_buf();
-    for (name, source) in [
-        ("wasm_routed_seal", ROUTED_APP),
-        ("wasm_routed_on_navigate_seal", ROUTED_ON_NAVIGATE_APP),
+    for (name, source, base) in [
+        ("wasm_routed_seal", ROUTED_APP, ""),
+        ("wasm_routed_on_navigate_seal", ROUTED_ON_NAVIGATE_APP, ""),
+        ("wasm_routed_base_seal", ROUTED_APP, "/app"),
     ] {
-        let fixture = write_fixture(source);
         let out = scratch_isolated(name).join("out");
-        build_wasm(&fixture, &out).expect("a routed Web.tea must emit under --target wasm");
+        build_wasm_at_base(source, base, &out)
+            .expect("a routed Web.tea must emit under --target wasm");
         let status = cargo_check_wasm(&out, &runtime);
         assert!(
             status.success(),

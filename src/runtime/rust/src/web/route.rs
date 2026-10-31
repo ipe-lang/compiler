@@ -28,7 +28,10 @@
 
 use std::sync::Arc;
 
-use crate::encoding::{DecodeRefusal, EncodeRefusal, MAX_URL_COMPONENT_LEN, encode_path_segment};
+use crate::encoding::{
+    DecodeRefusal, EncodeRefusal, MAX_URL_COMPONENT_LEN, MountBase, MountBaseRefusal,
+    encode_path_segment,
+};
 pub use crate::encoding::{
     DecodedPath, PatternSeg, RouteParams, RoutePattern, RoutePatternRefusal, RouteSegmentRefusal,
     match_route,
@@ -146,6 +149,19 @@ pub fn located(raw: Option<&str>, base: &DecodedPath) -> LocatedPath {
     raw.map_or(Err(PathMiss::Unreadable), |raw| app_path(raw, base))
 }
 
+/// Parse the base a browser client is served under, refusing as a mount.
+///
+/// The emitter writes the build's [`MountBase`] prefix as the routed client's
+/// base argument, so a well-formed build always parses; a text that is not a
+/// mount base refuses the mount rather than routing from the root.
+///
+/// # Errors
+///
+/// [`MountRefusal::BasePath`] carrying the [`MountBase::parse`] refusal.
+pub fn mount_base(raw: &str) -> Result<MountBase, MountRefusal> {
+    MountBase::parse(raw).map_err(MountRefusal::BasePath)
+}
+
 /// Enter the page a mount's located path names: a miss enters `not_found`.
 pub fn enter_located<Page: Clone, M, C>(
     routes: &[Route<Page>],
@@ -219,8 +235,8 @@ pub fn console_refusal_line(class: &str, refusal: &MountRefusal) -> String {
 pub enum MountRefusal {
     /// The route table holds a malformed pattern.
     RouteTable(RoutePatternRefusal),
-    /// The app base path does not decode.
-    BasePath(DecodeRefusal),
+    /// The app base path is not a mount base.
+    BasePath(MountBaseRefusal),
     /// No `window` (not a browser context).
     NoWindow,
     /// The window has no `document`.
@@ -1305,7 +1321,7 @@ mod tests {
                 pattern: RefusedText::new(HOSTILE),
                 refusal: RouteSegmentRefusal::Decode(bad_escape()),
             }),
-            MountRefusal::BasePath(bad_escape()),
+            MountRefusal::BasePath(MountBaseRefusal::Reserved { byte: 0x1B }),
             MountRefusal::NoWindow,
             MountRefusal::NoDocument,
             MountRefusal::NoBody,
@@ -1364,6 +1380,100 @@ mod tests {
         assert_eq!(app_path("/apple", &app), Err(PathMiss::OutsideBase));
         assert_eq!(app_path("/", &app), Err(PathMiss::OutsideBase));
         assert_eq!(app_path("/other/app", &app), Err(PathMiss::OutsideBase));
+    }
+
+    /// The build's base, as the client parses it, is stripped before matching:
+    /// a path below it locates, a sibling sharing its prefix bytes does not.
+    #[test]
+    #[allow(clippy::expect_used)] // test setup: a refused well-formed base IS the failure
+    fn mount_base_locates_the_client_below_the_build_base() {
+        let app = mount_base("/app").expect("`/app` is a mount base");
+        let base = app.to_decoded();
+        assert_eq!(app_path("/app/x", base), Ok(dp("/x")));
+        assert_eq!(app_path("/app", base), Ok(dp("/")));
+        assert_eq!(app_path("/apple", base), Err(PathMiss::OutsideBase));
+        assert_eq!(app_path("/x", base), Err(PathMiss::OutsideBase));
+        for root in ["", "/"] {
+            let parsed = mount_base(root).expect("the root is a mount base");
+            assert_eq!(parsed, MountBase::root(), "{root:?}");
+        }
+        let entry = |page: Page, (): ()| ((), page);
+        let entered = enter_located(
+            &routes(),
+            &located(Some("/app/apps/x"), base),
+            &Page::NF,
+            (),
+            entry,
+            render,
+        );
+        assert_eq!(entered.cmd, Page::App("x".into()));
+    }
+
+    /// Under a base, a leading `:param` route never captures the base segment:
+    /// the base itself enters the root route.
+    #[test]
+    #[allow(clippy::expect_used)] // test setup: a refused well-formed base IS the failure
+    fn mount_base_is_never_captured_by_a_leading_param() {
+        let rs = vec![
+            Route::new("/", |_| Some(Page::Home)),
+            Route::new("/:slug", |p| Some(Page::App(p[0].clone()))),
+        ];
+        let render_slug = |page: &Page| match page {
+            Page::Home => render_route(&rs, 0, &[]),
+            Page::App(slug) => render_route(&rs, 1, &[RenderArg::Text(slug)]),
+            Page::Two(..) | Page::NF => Err(RenderRefusal::NoRoute),
+        };
+        let app = mount_base("/app").expect("`/app` is a mount base");
+        let entry = |page: Page, (): ()| ((), page);
+        let at_base = enter_located(
+            &rs,
+            &located(Some("/app"), app.to_decoded()),
+            &Page::NF,
+            (),
+            entry,
+            render_slug,
+        );
+        assert_eq!(at_base.cmd, Page::Home);
+        let below = enter_located(
+            &rs,
+            &located(Some("/app/post"), app.to_decoded()),
+            &Page::NF,
+            (),
+            entry,
+            render_slug,
+        );
+        assert_eq!(below.cmd, Page::App("post".into()));
+    }
+
+    /// A text that is not a mount base refuses the mount with its typed
+    /// refusal; it never falls back to the root.
+    #[test]
+    fn malformed_mount_base_refuses_the_mount() {
+        let cases = [
+            ("app", MountBaseRefusal::NoLeadingSlash),
+            ("/app/", MountBaseRefusal::TrailingSlash),
+            ("/a//b", MountBaseRefusal::EmptySegment),
+            ("/a/..", MountBaseRefusal::DotSegment),
+            ("/a%41", MountBaseRefusal::Reserved { byte: b'%' }),
+            ("/a?b", MountBaseRefusal::Reserved { byte: b'?' }),
+        ];
+        for (raw, refusal) in cases {
+            assert_eq!(
+                mount_base(raw),
+                Err(MountRefusal::BasePath(refusal)),
+                "{raw:?}"
+            );
+        }
+        let long = format!("/{}", "a".repeat(crate::encoding::MAX_MOUNT_BASE_LEN));
+        assert_eq!(
+            mount_base(&long),
+            Err(MountRefusal::BasePath(MountBaseRefusal::TooLong {
+                len: long.len()
+            }))
+        );
+        let crate::error::IpeError::Error(kind, _) =
+            crate::error::IpeError::from(MountRefusal::BasePath(MountBaseRefusal::TrailingSlash));
+        assert_eq!(kind, crate::error::IpeErrorKind::InvalidInput);
     }
 
     /// A path the platform could not report is `Unreadable`: a mount enters

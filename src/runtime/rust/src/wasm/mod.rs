@@ -220,17 +220,17 @@ pub struct RoutedPages<Page, FSetPage, FRender> {
 /// `init` receives a `WebReq` synthesised from `location` + cookies, the same
 /// shape `wasm_app` uses.
 ///
-/// Divergence: a routed wasm app is served at the root only. Until the base
-/// path reaches the wasm client, a path below a base is matched with the base
-/// still on it: it enters `notFound`, or the page a pattern with a leading
-/// `:param` segment builds from the base segment (`/:slug` at `/app` enters
-/// `slug = "app"`).
+/// `base` is the build's mount base prefix (`""` for the root): every
+/// address-bar path is located below it, the way the server strips its base,
+/// so a bundle served under `/app` matches `/app/x` as `/x`. A `base` that is
+/// not a mount base refuses the mount.
 pub fn wasm_app_routed<E, Model, Msg, Page, FInit, FUpdate, FView, FSubs, FSetPage, FRender>(
     init: FInit,
     update: FUpdate,
     view: FView,
     subscriptions: FSubs,
     pages: RoutedPages<Page, FSetPage, FRender>,
+    base: &'static str,
 ) -> IpeTask<E, ()>
 where
     E: crate::FromIpeError + 'static,
@@ -246,7 +246,7 @@ where
         + 'static,
 {
     Box::pin(async move {
-        match mount_app_routed(init, update, view, subscriptions, pages) {
+        match mount_app_routed(init, update, view, subscriptions, pages, base) {
             Ok(()) => IpeResult::Ok(()),
             Err(e) => {
                 console_fatal_refusal("MountFailed", &e);
@@ -746,12 +746,15 @@ where
 ///    after `init`'s.
 /// 2. A `popstate` listener is installed so back/forward navigation enters the
 ///    URL (running its entry Cmd).
+/// 3. Every address-bar path is located below `base`, parsed once as a
+///    [`crate::encoding::MountBase`].
 fn mount_app_routed<Model, Msg, Page, FInit, FUpdate, FView, FSubs, FSetPage, FRender>(
     init: FInit,
     update: FUpdate,
     view: FView,
     subscriptions: FSubs,
     pages: RoutedPages<Page, FSetPage, FRender>,
+    base: &str,
 ) -> Result<(), MountRefusal>
 where
     Model: Clone + 'static,
@@ -765,7 +768,7 @@ where
     FRender: Fn(&Page) -> Result<crate::web::route::RoutePath, crate::web::route::RenderRefusal>
         + 'static,
 {
-    use crate::web::route::{DecodedPath, check_route_table, enter_located, navigate};
+    use crate::web::route::{check_route_table, enter_located, mount_base, navigate};
 
     let RoutedPages {
         routes,
@@ -777,14 +780,14 @@ where
     // A malformed literal in the route table fails the mount loudly, with the
     // same refusal the server's `web_app_routed` starts with.
     check_route_table(&routes).map_err(MountRefusal::RouteTable)?;
-    // The client is served at the root: the empty base strips nothing.
-    let base = DecodedPath::parse("").map_err(MountRefusal::BasePath)?;
+    // The build's base, refused whole when malformed: never a root fallback.
+    let base = mount_base(base)?;
 
     let document = document()?;
     let body: web_sys::HtmlElement = document.body().ok_or(MountRefusal::NoBody)?;
 
     let (req, pathname) = synthesize_req(&document)?;
-    let initial = crate::web::route::located(pathname.as_deref(), &base);
+    let initial = crate::web::route::located(pathname.as_deref(), base.to_decoded());
 
     // Seed the model from `init`, then enter the current URL so the `page`
     // field reflects the browser's address bar before the first render. This
@@ -881,7 +884,7 @@ where
 /// [`PathMiss::Unreadable`]: crate::web::route::PathMiss::Unreadable
 fn attach_popstate_listener<Model, Msg>(
     app: &Rc<App<Model, Msg>>,
-    base: crate::web::route::DecodedPath,
+    base: crate::encoding::MountBase,
 ) -> Result<(), MountRefusal>
 where
     Model: Clone + 'static,
@@ -892,7 +895,10 @@ where
     let closure =
         Closure::<dyn Fn(web_sys::PopStateEvent)>::new(move |_ev: web_sys::PopStateEvent| {
             let raw = web_sys::window().and_then(|w| w.location().pathname().ok());
-            navigate_to(&app, &crate::web::route::located(raw.as_deref(), &base));
+            navigate_to(
+                &app,
+                &crate::web::route::located(raw.as_deref(), base.to_decoded()),
+            );
         });
     window
         .add_event_listener_with_callback("popstate", closure.as_ref().unchecked_ref())

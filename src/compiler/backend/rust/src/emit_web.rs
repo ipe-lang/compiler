@@ -436,9 +436,11 @@ fn emit_web_app_inner(
     // (the model lives in the tab), so no store args and no schema tag.
     if ctx.target == ipe_ir::Target::WasmClient {
         if let Some((model_ty, page_ty)) = routed_page_field(ctx, view_e) {
-            // Routed app: emit `wasm_app_routed` with routes, notFound, and
-            // a generated `set_page` closure. The History-API `popstate`
-            // listener is installed by the runtime entry point.
+            // Routed app: emit `wasm_app_routed` with routes, notFound, a
+            // generated `set_page` closure, and the build's mount base, so the
+            // client locates every path below the base the bundle is served
+            // under. The History-API `popstate` listener is installed by the
+            // runtime entry point.
             let routes_e = lookup_field(ctx, fields, "routes")?;
             let not_found_e = lookup_field(ctx, fields, "notFound")?;
             let routes_s = emit_expr_at(ctx, routes_e, indent, child, generics)?;
@@ -458,6 +460,7 @@ fn emit_web_app_inner(
                 generics,
             )?;
             let handler = &update.handler;
+            let base_s = rust_str_lit(ctx.mount_base.prefix());
             let call = format!(
                 "ipe_runtime::wasm::wasm_app_routed(\
                  {init_s}, \
@@ -469,7 +472,8 @@ fn emit_web_app_inner(
                  not_found: {not_found_s}, \
                  set_page: {set_page}, \
                  render: {render_s} \
-                 }}\
+                 }}, \
+                 {base_s}\
                  )"
             );
             return Ok(Some(if update.prelude.is_empty() {
