@@ -16,10 +16,13 @@ ipe_env = { path = "../../src/compiler/env" }
 ipe-test-temp = { path = "../test-temp" }
 
 [dev-dependencies]
-# `skip_scan` reads every test target's syntax tree; span-locations gives real
-# 1-based line numbers outside a proc-macro context.
+# `skip_scan`/`target_scan` read every test target's syntax tree; span-locations
+# gives real 1-based line numbers outside a proc-macro context.
 proc-macro2 = { version = "1", features = ["span-locations"] }
-syn = { version = "3", default-features = false, features = ["full", "visit", "parsing"] }
+syn = { version = "3", default-features = false, features = ["full", "visit", "parsing", "printing"] }
+# `target_scan` re-tokenizes a parsed fn body to run its token-level rules
+# over it; `syn`'s `printing` feature is what gives a parsed node `ToTokens`.
+quote = "1"
 
 [lints]
 workspace = true

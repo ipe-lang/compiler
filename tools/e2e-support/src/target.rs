@@ -238,6 +238,19 @@ pub fn child_shared_target_from_env() -> Option<String> {
     }
 }
 
+/// The `cargo` program to spawn: `$CARGO` when the running cargo set it (the
+/// toolchain actually in use), else the bare name resolved through `PATH`.
+///
+/// The one place that names the `cargo` program for a test-spawned child, so
+/// every other call site — a build through [`cargo_command`], or a probe that
+/// only needs the program itself (`cargo metadata`, a dedicated warm-cache
+/// build with its own target directory) — resolves it the same way instead of
+/// hand-rolling the literal `"cargo"`.
+#[must_use]
+pub fn cargo_program() -> std::ffi::OsString {
+    ipe_env::var_os("CARGO").unwrap_or_else(|| "cargo".into())
+}
+
 /// A `cargo` command building into `target`, with the compiler wrapper
 /// cleared.
 ///
@@ -247,7 +260,7 @@ pub fn child_shared_target_from_env() -> Option<String> {
 /// tests whose scratch directories are removed while it runs.
 #[must_use]
 pub fn cargo_command(target: &BuildTarget) -> Command {
-    let mut cmd = Command::new("cargo");
+    let mut cmd = Command::new(cargo_program());
     cmd.env(TARGET_DIR_VAR, target.path())
         .env("CARGO_BUILD_RUSTC_WRAPPER", "")
         .env("RUSTC_WRAPPER", "");
@@ -260,6 +273,35 @@ pub fn ipe_command(bin: &Path, target: &BuildTarget) -> Command {
     let mut cmd = Command::new(bin);
     cmd.env(TARGET_DIR_VAR, target.path());
     cmd
+}
+
+/// Sets `cmd`'s target-directory variable to `dir`.
+///
+/// For a command [`cargo_command`]/[`ipe_command`] does not fit:
+/// - a test that re-execs itself (rather than spawning `cargo`/`ipe` fresh) to
+///   pin its own environment before an in-process library call drives the
+///   build;
+/// - a `cargo` spawn on a detached thread that must carry an owned, `'static`
+///   directory rather than a borrowed [`BuildTarget`] (which is not `Clone` —
+///   its `Drop` removes the tree it names), so `dir` is cloned from a
+///   [`BuildTarget::path`] taken earlier in the same process;
+/// - a test that builds into a directory it manages entirely itself (a
+///   disposable, already-bounded scratch path it creates and removes, outside
+///   the shared/isolated accounting `shared`/`isolated` provide) — `cargo`/
+///   `ipe` still must not be spawned by a hand-rolled `CARGO_TARGET_DIR`
+///   literal, so this is still the one place that names the variable.
+///
+/// Either way this stays the one place that names the variable, never a
+/// second ad-hoc source.
+pub fn set_target_dir_env(cmd: &mut Command, dir: &Path) {
+    cmd.env(TARGET_DIR_VAR, dir);
+}
+
+/// Removes `cmd`'s target-directory variable, so a child resolves its own
+/// default (e.g. `ipe`'s per-invocation scratch build directory under its
+/// cache base) instead of inheriting this process's ambient `CARGO_TARGET_DIR`.
+pub fn clear_target_dir_env(cmd: &mut Command) {
+    cmd.env_remove(TARGET_DIR_VAR);
 }
 
 /// Whether this process holds an [`IsolatedTarget`].
