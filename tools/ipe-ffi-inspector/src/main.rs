@@ -7688,11 +7688,13 @@ fn emit_display_fromstr_bridges(
                 ipe_type: ipe_ty.clone(),
                 rust_type: rust_ty.clone(),
             }],
+            // `ToString::to_string` returns `String`: the result declares its
+            // Rust identity like every other binding's.
             results: vec![Param {
                 name: String::new(),
                 ty: "String".into(),
                 ipe_type: "String".into(),
-                rust_type: String::new(),
+                rust_type: "String".into(),
             }],
             variadic: false,
             effect: "pure".into(),
@@ -17207,6 +17209,13 @@ mod tests {
             .filter(|f| f.method_name == "to_string")
             .collect();
         assert_eq!(to_strings.len(), 1, "exactly one to_string bridge");
+        assert!(
+            to_strings
+                .iter()
+                .flat_map(|f| f.results.iter())
+                .all(|r| r.rust_type == "String"),
+            "the bridge result must declare its Rust type, never leave it to the Ipê view"
+        );
         assert!(
             functions.iter().all(|f| f.method_name != "fmt"),
             "the bridge must NOT emit a `fmt` binding"
