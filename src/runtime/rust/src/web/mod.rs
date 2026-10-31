@@ -3051,7 +3051,7 @@ async fn take_input<Model, Msg, T>(
 /// entry and an in-flight `update` never overwrite each other's model.
 // Distinct per-session runtime handles (entry, both Msg channel ends, the
 // entry queue, the three Arc'd TEA callbacks, the route entry, the store, the
-// session scope, the revocation watch, the shutdown drain) — bundling them into a struct purely to satisfy the 7-arg heuristic
+// session scope, the revocation watch, the shutdown drain, the port lease) — bundling them into a struct purely to satisfy the 7-arg heuristic
 // would add indirection without clarifying anything.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "web")]
@@ -3079,6 +3079,11 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
     mut revocation: RevocationWatch,
     // The shutdown each turn holds a unit of work on; the parked driver holds none.
     drain: crate::server::shutdown::Drain,
+    // This life's `Ipe.Ffi.Js` port endpoints, opened by the publication once the
+    // store made this session the sid's owner. Held for the driver's whole run:
+    // the driver is the session's single mortal owner, so its exit (every path)
+    // ends the life's endpoints, and a superseded life's exit touches nothing.
+    _port_lease: Option<crate::js_port::PortLease>,
     // Admission-control slot: decrements WebState::session_count on driver exit.
     _slot: SessionSlot,
 ) where
@@ -3097,32 +3102,6 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
     // One keyed subscription runtime per session: a re-evaluation keeps a
     // still-requested `Sub.every` timer and its phase.
     let mut sub_runtime = SubRuntime::new(msg_tx.clone());
-
-    // `Ipe.Ffi.Js` port channel lifecycle. Open this session's inbound/outbound port
-    // endpoints now (before the browser can POST to `/_ipe/port`) and close them
-    // when the driver exits — the driver is the session's single mortal owner (it
-    // exits once the store has evicted the session and no SSE connection pins it),
-    // so binding open/close here drops no-longer-reachable channels without
-    // touching every store backend's eviction path. The guard closes on EVERY exit
-    // path, including the early `return` when the session is already gone.
-    #[cfg(all(feature = "json", feature = "tokio"))]
-    struct PortLifecycle(Option<crate::js_port::SessionId>);
-    #[cfg(all(feature = "json", feature = "tokio"))]
-    impl Drop for PortLifecycle {
-        fn drop(&mut self) {
-            if let Some(port_sid) = &self.0 {
-                crate::js_port::session_close(port_sid);
-            }
-        }
-    }
-    #[cfg(all(feature = "json", feature = "tokio"))]
-    let _port_lifecycle = {
-        let port_sid = crate::js_port::SessionId::parse(&sid);
-        if let Some(ref ps) = port_sid {
-            crate::js_port::session_open(ps);
-        }
-        PortLifecycle(port_sid)
-    };
 
     // Register initial subscriptions at session creation, before the first
     // event. Without this a watch-only session never subscribes until it
@@ -5523,6 +5502,10 @@ mod handlers {
                     return installed;
                 }
             }
+            // The life's port endpoints open now the store holds this session,
+            // before the driver or the seed Cmd can reach them.
+            let port_lease = crate::js_port::SessionId::parse(sid)
+                .and_then(|s| crate::js_port::session_open(&s));
             tokio::spawn(drive_session(
                 Arc::downgrade(&entry),
                 msg_rx,
@@ -5538,6 +5521,7 @@ mod handlers {
                 Arc::clone(&cmds),
                 revocation,
                 drain,
+                port_lease,
                 slot,
             ));
             // Fire the entry Cmd into the loop (batched after init's on a miss).
@@ -5657,30 +5641,35 @@ mod handlers {
             if !st.store.holds(&sid, &entry) {
                 return SessionLost.into_response();
             }
+            // Bind this session's `Ipe.Ffi.Js` outbound port sink to THIS SSE
+            // connection: every `js_send` whose origin is this sid is forwarded to
+            // the browser as an `event: port` frame over the same stream that
+            // carries DOM patches (mirroring how the custom-element served-widget
+            // transport delivers per-session). The sink is keyed by sid in the port
+            // registry, so a frame can only ever reach the session that produced it
+            // — never another session's stream. `try_send` is non-blocking (this
+            // sink runs on the synchronous Cmd-dispatch path): a full SSE buffer
+            // drops the one frame rather than blocking the dispatch loop, the same
+            // fire-and-forget contract the port carries client-side. A sid whose
+            // life no longer holds port endpoints is a lost session, refused
+            // before the stream is attached. The sink binds only while the store
+            // holds this session, under the lock an eviction takes.
+            #[cfg(all(feature = "json", feature = "tokio"))]
+            if let Some(port_sid) = crate::js_port::SessionId::parse(&sid) {
+                let port_tx = tx.clone();
+                let bound = crate::js_port::register_out_sink_for(
+                    &port_sid,
+                    std::sync::Arc::new(move |encoded: &str| {
+                        let _ = port_tx.try_send(SsePatch(sse::frame("port", encoded)));
+                    }),
+                );
+                if bound.is_err() {
+                    return SessionLost.into_response();
+                }
+            }
             e.sse_tx = Some(tx.clone());
             e.liveness.closer.subscribe()
         };
-
-        // Bind this session's `Ipe.Ffi.Js` outbound port sink to THIS SSE
-        // connection: every `js_send` whose origin is this sid is forwarded to
-        // the browser as an `event: port` frame over the same stream that
-        // carries DOM patches (mirroring how the custom-element served-widget
-        // transport delivers per-session). The sink is keyed by sid in the port
-        // registry, so a frame can only ever reach the session that produced it
-        // — never another session's stream. `try_send` is non-blocking (this
-        // sink runs on the synchronous Cmd-dispatch path): a full SSE buffer
-        // drops the one frame rather than blocking the dispatch loop, the same
-        // fire-and-forget contract the port carries client-side.
-        #[cfg(all(feature = "json", feature = "tokio"))]
-        if let Some(port_sid) = crate::js_port::SessionId::parse(&sid) {
-            let port_tx = tx.clone();
-            crate::js_port::register_out_sink_for(
-                &port_sid,
-                std::sync::Arc::new(move |encoded: &str| {
-                    let _ = port_tx.try_send(SsePatch(sse::frame("port", encoded)));
-                }),
-            );
-        }
 
         // Metrics (ipe_web_sse_connections_total /
         // ipe_web_sessions_active). Count the connection and mark the session
@@ -14843,6 +14832,128 @@ mod emitted_router_behavior_tests {
         (utf8_prefix(&bytes).to_owned(), ended)
     }
 
+    fn init_port(_req: WebReq) -> (Model, IpeCmd<Msg>) {
+        (
+            Model {
+                count: 0,
+                last_username: String::new(),
+            },
+            crate::js_port::js_send::<i64, Msg>(7),
+        )
+    }
+
+    /// The production router whose page `init` seeds a port frame.
+    #[allow(clippy::expect_used)] // test helper: the test process sets no base path
+    fn make_port_router(store: Arc<Store>) -> axum::Router {
+        build_web_router::<
+            Model,
+            Msg,
+            fn(WebReq) -> (Model, IpeCmd<Msg>),
+            fn(Msg, Model) -> (Model, IpeCmd<Msg>),
+            fn(Model) -> Html<Msg>,
+            fn(Model) -> IpeSub<Msg>,
+        >(
+            WebState {
+                init: Arc::new(init_port as fn(WebReq) -> (Model, IpeCmd<Msg>)),
+                ..make_state(store)
+            },
+            false,
+        )
+        .map(crate::server::behind_listener)
+        .expect("the unset test base parses")
+    }
+
+    /// A port frame the page's seed Cmd sends before any SSE is attached
+    /// reaches the session's first SSE stream: the life's endpoints are open
+    /// before the seed Cmd runs, and the frame waits in their buffer.
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a fixed request always builds
+    fn a_seed_cmd_port_frame_reaches_the_first_sse() {
+        let _g = crate::web::literal_table::overlay_test_lock();
+        crate::system::locked_set_var("IPE_CSRF", "off");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        rt.block_on(async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, _body) = get(make_port_router(store.clone()), "/", None).await;
+            assert!(!sid.is_empty(), "the page mints a session");
+            let resp = make_port_router(store.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/_ipe/sse?path=%2F")
+                        .header(header::ACCEPT, "text/event-stream")
+                        .header(
+                            header::COOKIE,
+                            format!(
+                                "{}={sid}",
+                                cookie_name_for(&crate::encoding::MountBase::root())
+                            ),
+                        )
+                        .body(Body::empty())
+                        .expect("build SSE GET"),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let (text, _ended) = read_sse(resp.into_body().into_data_stream(), |t| {
+                t.contains("event: port")
+            })
+            .await;
+            assert!(
+                text.contains("event: port\ndata: 7\n"),
+                "the seed Cmd's port frame reaches the first SSE, got {text:?}"
+            );
+        });
+        crate::system::locked_remove_var("IPE_CSRF");
+    }
+
+    /// An SSE for a held session whose port life holds no endpoints is lost
+    /// before it attaches: the session keeps no stream sender, so it stays
+    /// evictable as an unconnected session.
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a fixed request always builds
+    fn an_sse_without_port_endpoints_is_lost_before_it_attaches() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, _body) = get(make_router(store.clone()), "/", None).await;
+            assert!(!sid.is_empty(), "the page mints a session");
+            let ended = crate::js_port::lock_sessions().remove(&sid);
+            assert!(ended.is_some(), "the publication opened the life's port");
+            drop(ended);
+            let resp = make_router(store.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/_ipe/sse?path=%2F")
+                        .header(header::ACCEPT, "text/event-stream")
+                        .header(
+                            header::COOKIE,
+                            format!(
+                                "{}={sid}",
+                                cookie_name_for(&crate::encoding::MountBase::root())
+                            ),
+                        )
+                        .body(Body::empty())
+                        .expect("build SSE GET"),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            assert!(
+                session_of(&store, &sid)
+                    .await
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .sse_tx
+                    .is_none(),
+                "a lost SSE leaves no stream sender on the session"
+            );
+        });
+    }
+
     /// A commit that passes the session's byte ceiling closes the session: its
     /// stream yields the one `closed` frame tagged `over_ceiling`, then ends,
     /// and the session is gone.
@@ -21235,6 +21346,8 @@ mod shutdown_work_tests {
                 cmd: IpeCmd::None,
             });
         let store: Arc<dyn SessionStore<i64, i64>> = store;
+        let port_lease = crate::js_port::SessionId::parse(scope.sid())
+            .and_then(|s| crate::js_port::session_open(&s));
         let driver = tokio::spawn(drive_session(
             Arc::downgrade(&entry),
             msg_rx,
@@ -21250,6 +21363,7 @@ mod shutdown_work_tests {
             cmds,
             RevocationWatch::subscribe(),
             drain,
+            port_lease,
             SessionSlot {
                 count: Arc::new(AtomicUsize::new(1)),
             },
