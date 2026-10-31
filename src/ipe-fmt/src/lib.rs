@@ -1152,6 +1152,18 @@ impl<'a> Printer<'a> {
         }
     }
 
+    /// Whether a kept end-of-line comment is owned by the token ending at
+    /// `owner_hi`.
+    fn trails_at(&self, owner_hi: usize) -> bool {
+        let first = self
+            .trails
+            .partition_point(|c| c.owner().map_or(0, |o| o.hi) < owner_hi);
+        self.trails
+            .get(first)
+            .and_then(|c| c.owner())
+            .is_some_and(|o| o.hi == owner_hi)
+    }
+
     /// Whether a kept end-of-line comment is owned by a token inside
     /// `[lo, hi)` short of its end: the node there needs a line end inside
     /// it.
@@ -2396,12 +2408,13 @@ impl<'a> Printer<'a> {
         for step in &view.steps {
             // A bound or pure statement starts at its binder; a bare run is an
             // expression and carries its own comments.
-            let line = match step {
-                DoStep::Bind(pat, task) => self.do_binding(pat, "<-", task, stmt),
-                DoStep::Let(pat, value) => self.do_binding(pat, "=", value, stmt),
-                DoStep::Run(task) => self.expr(task, stmt),
+            let (line, last) = match step {
+                DoStep::Bind(pat, task) => (self.do_binding(pat, "<-", task, stmt), task),
+                DoStep::Let(pat, value) => (self.do_binding(pat, "=", value, stmt), value),
+                DoStep::Run(task) => (self.expr(task, stmt), task),
             };
-            let _ = write!(out, "\n{stmt_pad}{line}");
+            let trail = self.trail_after(last.span.hi as usize);
+            let _ = write!(out, "\n{stmt_pad}{line}{trail}");
         }
         // With no statement peeled, the result IS the `do`-stamped node: print
         // its own shape, or `expr` would recognise the block again.
@@ -2516,7 +2529,17 @@ impl<'a> Printer<'a> {
         }
         if needs_parens_as_atom(&e.value) {
             let inner = self.expr(e, col.past(1));
-            if inner.contains('\n') {
+            // A written group's last inner token may own an end-of-line
+            // comment: it ends the inner line, the `)` on its own line below.
+            let closing = self
+                .token_before(e.span.hi as usize)
+                .filter(|t| t.kind == TokenKind::RParen && t.hi == e.span.hi as usize);
+            let trail = closing
+                .map(|paren| self.trail_after(self.end_before(paren.lo)))
+                .unwrap_or_default();
+            if !trail.is_empty() {
+                format!("({inner}{trail}\n{})", self.pad(col))
+            } else if inner.contains('\n') {
                 // A multiline compound in parens: the content starts right
                 // after `(`, one column in, and the closing `)` sits on its
                 // own line at the `(` column — elm-format's
@@ -2543,7 +2566,8 @@ impl<'a> Printer<'a> {
         let arg_col = col.tab();
         let arg_one_strs: Vec<String> = args.iter().map(|a| self.expr_atom(a, arg_col)).collect();
         let one = format!("{head_s} {}", arg_one_strs.join(" "));
-        if !has_layout_newline(&one) && !self.was_multiline(span) {
+        let (lo, hi) = (span.lo as usize, span.hi as usize);
+        if !has_layout_newline(&one) && !self.was_multiline(span) && !self.forces_break(lo, hi) {
             return one;
         }
 
@@ -2577,21 +2601,29 @@ impl<'a> Printer<'a> {
         let first_is_block =
             |a: &Expr| matches!(&a.value, Expr_::MultilineStr { raw, .. } if raw.contains('\n'));
         let later_block = |tail_strs: &[String]| tail_strs.iter().any(|s| has_layout_newline(s));
-        let (mut out, rest_strs): (String, &[String]) =
+        // A head owning an end-of-line comment ends its line: it stands alone.
+        let head_hi = head.span.hi as usize;
+        let (mut out, rest, rest_strs): (String, &[Expr], &[String]) =
             match (args.split_first(), arg_one_strs.split_first()) {
-                (Some((first, _)), Some((first_str, tail_strs)))
+                (Some((first, rest)), Some((first_str, tail_strs)))
                     if Self::joins_on_head_line(first, first_str)
                         && head_line_fits(&head_s, first, col)
+                        && !self.trails_at(head_hi)
                         && (is_simple_ref(first)
                             || first_is_block(first)
                             || later_block(tail_strs)) =>
                 {
-                    (format!("{head_s} {first_str}"), tail_strs)
+                    let trail = self.trail_inside(first.span.hi as usize, hi);
+                    (format!("{head_s} {first_str}{trail}"), rest, tail_strs)
                 }
-                _ => (head_s, arg_one_strs.as_slice()),
+                _ => {
+                    let trail = self.trail_inside(head_hi, hi);
+                    (format!("{head_s}{trail}"), args, arg_one_strs.as_slice())
+                }
             };
-        for s in rest_strs {
-            let _ = write!(out, "\n{inner}{s}");
+        for (a, s) in rest.iter().zip(rest_strs) {
+            let trail = self.trail_inside(a.span.hi as usize, hi);
+            let _ = write!(out, "\n{inner}{s}{trail}");
         }
         out
     }
@@ -2715,9 +2747,12 @@ impl<'a> Printer<'a> {
         // Children sit after their parent, so the reverse order assembles
         // every child before the group that holds it.
         let mut texts: Vec<String> = vec![String::new(); groups.0.len()];
+        let operand_end = |i: usize| operands.get(i).map_or(0, |o| o.span.hi as usize);
+        let chain_hi = span.hi as usize;
         for (index, g) in groups.0.iter().enumerate().rev() {
             let mut children = g.children.iter();
             let mut segments: Vec<Item<'a>> = Vec::new();
+            let mut trails: Vec<String> = Vec::new();
             let ends = g.splits.iter().copied().chain(std::iter::once(g.hi));
             let mut start = g.lo;
             for end in ends {
@@ -2742,14 +2777,28 @@ impl<'a> Printer<'a> {
                         .unwrap_or_default()
                 };
                 segments.push((comments, text));
+                trails.push(if g.backward {
+                    String::new()
+                } else {
+                    self.trail_inside(operand_end(end), chain_hi)
+                });
                 start = end + 1;
             }
-            let forced = segments
-                .iter()
-                .any(|(cs, text)| !cs.is_empty() || has_layout_newline(text));
+            // A segment's end-of-line comment needs the line end a broken
+            // group opens after it; a `<|` group ends its lines with the
+            // operator, so its comments are demoted.
+            let group_lo = operands.get(g.lo).map_or(0, |o| o.span.lo as usize);
+            let owns_trail = !g.backward && self.forces_break(group_lo, operand_end(g.hi));
+            let forced = owns_trail
+                || segments
+                    .iter()
+                    .any(|(cs, text)| !cs.is_empty() || has_layout_newline(text));
             let broken = forced || (index == 0 && self.was_multiline(span));
             let line = at.get(g.lo).copied().unwrap_or(col).tab();
-            let text = self.op_group(&ops, g, segments, broken, line);
+            if !broken {
+                trails.clear();
+            }
+            let text = self.op_group(&ops, g, segments, &trails, broken, line);
             if let Some(slot) = texts.get_mut(index) {
                 *slot = text;
             }
@@ -2760,19 +2809,22 @@ impl<'a> Printer<'a> {
     /// Join one operator group's `segments`, the first operand or child
     /// group and then the one right of each split, each with its comments.
     ///
-    /// A `broken` group starts each split's line at `line`.
+    /// A `broken` group starts each split's line at `line`, `trails[i]`
+    /// ending segment `i`'s line.
     fn op_group(
         &self,
         ops: &[String],
         g: &OpGroup,
         segments: Vec<Item<'a>>,
+        trails: &[String],
         broken: bool,
         line: Col,
     ) -> String {
         let mut segments = segments.into_iter();
         let mut out = segments.next().map(|(_, text)| text).unwrap_or_default();
         let pad = self.pad(line);
-        for (&split, (comments, text)) in g.splits.iter().zip(segments) {
+        for (i, (&split, (comments, text))) in g.splits.iter().zip(segments).enumerate() {
+            out.push_str(trails.get(i).map_or("", String::as_str));
             let op = ops.get(split).map_or("", String::as_str);
             if !broken {
                 let _ = write!(out, " {op} {text}");
@@ -2883,7 +2935,18 @@ impl<'a> Printer<'a> {
             let run = self.anchored_in(pat.span.lo as usize, body.span.lo as usize);
             let body_s = self.expr(body, body_col);
             open_line(&mut out, &run, arm_pad);
-            let _ = write!(out, "{} ->\n{body_pad}{body_s}", self.pattern(&pat.value));
+            // The last arm's body ends the `case`: its comment is the
+            // enclosing composer's.
+            let trail = if i + 1 < arms.len() {
+                self.trail_after(body.span.hi as usize)
+            } else {
+                String::new()
+            };
+            let _ = write!(
+                out,
+                "{} ->\n{body_pad}{body_s}{trail}",
+                self.pattern(&pat.value)
+            );
         }
         out
     }
@@ -2921,8 +2984,9 @@ impl<'a> Printer<'a> {
             // elm-format ALWAYS drops a `let` binding's value onto its own
             // four-space-indented line, however short — `x =\n    1`.
             let val = self.expr(value, value_col);
+            let trail = self.trail_after(value.span.hi as usize);
             open_line(&mut out, &run, bind_pad);
-            let _ = write!(out, "{binder} =\n{body_val_pad}{val}");
+            let _ = write!(out, "{binder} =\n{body_val_pad}{val}{trail}");
         }
         let in_pad = self.pad(col);
         let _ = write!(out, "\n{in_pad}in\n{in_pad}{}", self.expr(body, col));
@@ -2956,9 +3020,10 @@ impl<'a> Printer<'a> {
             }
             let _ = write!(
                 out,
-                "{lead} {} then\n{inner}{}\n\n{}",
+                "{lead} {} then\n{inner}{}{}\n\n{}",
                 self.expr(cond, col.past(lead.len() + 1)),
                 self.expr(body, body_col),
+                self.trail_after(body.span.hi as usize),
                 self.pad(col)
             );
         }
@@ -2976,7 +3041,8 @@ impl<'a> Printer<'a> {
     // always multi-line.
     fn tuple(&self, elems: &[Expr], col: Col, span: ipe_diagnostics::Span) -> String {
         let items = self.elements(elems, col.past(2));
-        self.collection("(", ")", &items, span, col)
+        let ends: Vec<usize> = elems.iter().map(|e| e.span.hi as usize).collect();
+        self.collection(("(", ")"), items, &ends, span, col)
     }
 
     fn list(&self, elems: &[Expr], col: Col, span: ipe_diagnostics::Span) -> String {
@@ -2984,7 +3050,8 @@ impl<'a> Printer<'a> {
             return self.with_comments(&self.closing_comments(span), "[]", col);
         }
         let items = self.elements(elems, col.past(2));
-        self.collection("[", "]", &items, span, col)
+        let ends: Vec<usize> = elems.iter().map(|e| e.span.hi as usize).collect();
+        self.collection(("[", "]"), items, &ends, span, col)
     }
 
     fn record(
@@ -2997,7 +3064,8 @@ impl<'a> Printer<'a> {
             return self.with_comments(&self.closing_comments(span), "{}", col);
         }
         let items = self.fields(fields, col.past(2));
-        self.collection("{", "}", &items, span, col)
+        let ends: Vec<usize> = fields.iter().map(|(_, v)| v.span.hi as usize).collect();
+        self.collection(("{", "}"), items, &ends, span, col)
     }
 
     /// Each element of a list or tuple, rendered at `col`, with the comments
@@ -3035,22 +3103,31 @@ impl<'a> Printer<'a> {
     /// A list, tuple or record: single-line when it fits, the source kept it
     /// on one line and no comment is inside; leading-comma multi-line
     /// otherwise.
+    ///
+    /// `ends[i]` is the end of item `i`'s last token; its end-of-line comment
+    /// ends the item's line.
     fn collection(
         &self,
-        open: &str,
-        close: &str,
-        items: &[Item<'a>],
+        (open, close): (&str, &str),
+        mut items: Vec<Item<'a>>,
+        ends: &[usize],
         span: ipe_diagnostics::Span,
         col: Col,
     ) -> String {
+        let (lo, hi) = (span.lo as usize, span.hi as usize);
         let closing = self.closing_comments(span);
-        let commented = !closing.is_empty() || items.iter().any(|(cs, _)| !cs.is_empty());
+        let commented = !closing.is_empty()
+            || items.iter().any(|(cs, _)| !cs.is_empty())
+            || self.forces_break(lo, hi);
         let parts: Vec<&str> = items.iter().map(|(_, s)| s.as_str()).collect();
         let one = format!("{open} {} {close}", parts.join(", "));
         if !commented && !has_layout_newline(&one) && !self.was_multiline(span) {
             return one;
         }
-        comma_multiline(&self.pads, open, close, items, &closing, col)
+        for ((_, part), &end) in items.iter_mut().zip(ends) {
+            part.push_str(&self.trail_inside(end, hi));
+        }
+        comma_multiline(&self.pads, open, close, &items, &closing, col)
     }
 
     fn update(
@@ -3066,7 +3143,10 @@ impl<'a> Printer<'a> {
         let bar_col = col.tab();
         let items = self.fields(fields, bar_col.past(2));
         let closing = self.closing_comments(span);
-        let commented = !closing.is_empty() || items.iter().any(|(cs, _)| !cs.is_empty());
+        let (lo, hi) = (span.lo as usize, span.hi as usize);
+        let commented = !closing.is_empty()
+            || items.iter().any(|(cs, _)| !cs.is_empty())
+            || self.forces_break(lo, hi);
         let parts: Vec<&str> = items.iter().map(|(_, s)| s.as_str()).collect();
         let one = format!("{{ {base_s} | {} }}", parts.join(", "));
         if !commented && !has_layout_newline(&one) && !self.was_multiline(span) {
@@ -3079,10 +3159,11 @@ impl<'a> Printer<'a> {
         let close_pad = self.pad(col);
         let inner = self.pad(bar_col);
         let mut out = format!("{{ {base_s}");
-        for (i, (comments, p)) in items.iter().enumerate() {
+        for (i, ((comments, p), (_, value))) in items.iter().zip(fields).enumerate() {
             let lead = if i == 0 { "|" } else { "," };
             open_line(&mut out, comments, inner);
-            let _ = write!(out, "{lead} {p}");
+            let trail = self.trail_inside(value.span.hi as usize, hi);
+            let _ = write!(out, "{lead} {p}{trail}");
         }
         if closing.is_empty() {
             out.push('\n');
