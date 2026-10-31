@@ -95,7 +95,7 @@
 //!   doc-comments are scanned from the embedded source.
 //! * **Kernel-qualifier** (`ipe_canon::STDLIB_MODULE_QUALIFIERS`): modules backed by the
 //!   kernel registry (e.g. `Ipe.List`, `Ipe.String`). Type signatures come from
-//!   [`crate::kernel_schemes::kernel_schemes`]; doc-comments are absent (signatures
+//!   [`ipe_types::KernelSchemeTable`]; doc-comments are absent (signatures
 //!   are the contract).
 //!
 //! `ipe doc check` exempts stdlib modules from the coverage gate — signatures are
@@ -1506,7 +1506,7 @@ struct Undocumented {
 ///
 /// Project modules go through one `read_tree` walk + `extract_walked`.
 /// Compiled-source stdlib modules go through the same type-checker path.
-/// Kernel-qualifier stdlib modules use [`crate::kernel_schemes::kernel_schemes`]
+/// Kernel-qualifier stdlib modules use [`ipe_types::KernelSchemeTable`]
 /// for signatures.
 ///
 /// Modules are listed in name order: stdlib first (alphabetically), then project.
@@ -1649,7 +1649,7 @@ fn stdlib_module_names() -> Vec<String> {
 ///
 /// Compiled-source modules are type-checked using the same pipeline as project
 /// modules (injecting each individually as a minimal package). Kernel-qualifier
-/// modules use [`crate::kernel_schemes::kernel_schemes`] for type signatures;
+/// modules use [`ipe_types::KernelSchemeTable`] for type signatures;
 /// doc-comments are empty
 /// (signatures are the contract for kernel-backed stdlib).
 ///
@@ -1693,7 +1693,7 @@ fn build_stdlib_docs() -> Result<Vec<ModuleDoc>, CliError> {
     }
 
     // ── Kernel-qualifier stdlib modules ───────────────────────────────────────
-    // Signatures come from `kernel_schemes`; doc-comments are absent for these
+    // Signatures come from the kernel type-scheme table; doc-comments are absent for these
     // compiler-internal modules (signatures are the contract).
     for (name, doc) in build_kernel_module_docs()? {
         modules.entry(name).or_insert(doc);
@@ -1991,36 +1991,38 @@ fn kernel_value_doc(
 
 /// Build [`ModuleDoc`]s for every kernel-qualifier stdlib module.
 ///
-/// Each [`ipe_kernels::StdlibKernel`] is joined against its HM type scheme through
-/// [`crate::kernel_schemes::kernel_schemes`] — the one ipe-cli helper
+/// Each [`ipe_kernels::StdlibKernel`] reads its HM type scheme from its
+/// [`ipe_types::KernelSchemeTable`] row — the table
 /// [`crate::coverage::surface`] also reads, so this page and the coverage
-/// matrix cannot disagree about which kernel is schemed. A kernel the
-/// registry declares [`crate::kernel_schemes::KernelScheme::Unschemed`] is not
-/// callable from well-typed Ipê (`IPE-L0108` refuses it at its call sites), so
-/// it is skipped here rather than rendered. The module each kernel's
-/// qualifier resolves to is read through
-/// [`crate::coverage::surface::kernel_module_path`], the same qualifier
-/// resolution the coverage surface uses.
+/// matrix cannot disagree about which kernel is schemed. A kernel whose row is
+/// [`ipe_types::KernelScheme::Unschemed`] is not callable from well-typed Ipê
+/// (`IPE-L0108` refuses it at its call sites), so it is skipped here rather
+/// than rendered. The module each kernel's qualifier resolves to is read
+/// through [`crate::coverage::surface::kernel_module_path`], the same
+/// qualifier resolution the coverage surface uses.
 fn build_kernel_module_docs() -> Result<BTreeMap<String, ModuleDoc>, CliError> {
     let (qualifier_to_path, compiled_by_dotted, compiled_by_last_segment) =
         crate::coverage::surface::qualifier_lookup_tables();
 
     let mut interner = Interner::new();
-    let schemes = crate::kernel_schemes::kernel_schemes(&mut interner)
-        .map_err(|e| CliError::Usage(text::msg::doc_kernel_table_error(&e)))?;
+    let table = ipe_types::kernel_type_table(&mut interner).map_err(|d| {
+        CliError::Usage(text::msg::doc_kernel_table_error(
+            &ipe_diagnostics::plain_message(&d, ""),
+        ))
+    })?;
 
     // Group by module path and build ValueDoc for each schemed kernel.
     let mut by_module: BTreeMap<String, Vec<ValueDoc>> = BTreeMap::new();
-    for (kernel, scheme) in schemes {
+    for (kernel, scheme) in table.rows() {
         let ty = match scheme {
-            crate::kernel_schemes::KernelScheme::Schemed(ty) => ty,
+            ipe_types::KernelScheme::Schemed(ty) => ty,
             // Not callable from well-typed Ipê (IPE-L0108 refuses it); no
             // page to render it on.
-            crate::kernel_schemes::KernelScheme::Unschemed => continue,
+            ipe_types::KernelScheme::Unschemed => continue,
         };
         let Some((module_path, value_doc)) = kernel_value_doc(
             kernel.decl(),
-            &ty,
+            ty,
             &interner,
             &qualifier_to_path,
             &compiled_by_dotted,

@@ -47,7 +47,7 @@ use ipe_canon::ast as canon;
 use ipe_diagnostics::{DResult, Diagnostic, LowerError, Span, TypeError, WildcardDependence};
 use ipe_intern::{Interner, Symbol};
 
-pub use constrain::{Builtins, kernel_type_table, resolve_scheme};
+pub use constrain::{Builtins, KernelScheme, KernelSchemeTable, kernel_type_table};
 pub use doc::{VarNamer, canon_type_to_doc, letters, ty_to_doc};
 pub use homed::{HomedWarning, InferError, ModuleHome, ProgramDiag};
 pub use pairing::{ArgPairs, ConHead, EmittedHeads, HeadIdentity, TyPairs, paired_ty_children};

@@ -1426,12 +1426,85 @@ impl<'a> Builder<'a> {
     }
 }
 
+/// A wired kernel's HM type scheme, or the registry's explicit "no scheme".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KernelScheme {
+    /// The kernel's resolved inference scheme.
+    Schemed(Ty),
+    /// The registry declares no scheme (a routed / unlowered bucket).
+    ///
+    /// Not callable from well-typed Ipê: IPE-L0108 refuses it at its call
+    /// sites.
+    Unschemed,
+}
+
+/// The kernel type-scheme table: one row per `StdlibKernel::ALL` member.
+///
+/// Rows are in `ALL` order and built at one site (`KernelSchemeTable::build`,
+/// behind [`kernel_type_table`]); there is no public constructor, so a
+/// kernel absent from the table is never "unschemed", only unwired (outside
+/// `ALL`). Readers match [`KernelScheme`] instead of inferring schemed-ness
+/// from presence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KernelSchemeTable {
+    rows: Vec<(StdlibKernel, KernelScheme)>,
+}
+
+impl KernelSchemeTable {
+    /// Derive one row per kernel in `all`, in `all` order.
+    ///
+    /// `resolve` answers each kernel's scheme; `None` becomes an explicit
+    /// [`KernelScheme::Unschemed`] row, never a dropped one.
+    pub(super) fn build(
+        all: &[StdlibKernel],
+        resolve: impl Fn(StdlibKernel) -> Option<Ty>,
+    ) -> Self {
+        Self {
+            rows: all
+                .iter()
+                .map(|&kernel| {
+                    let scheme =
+                        resolve(kernel).map_or(KernelScheme::Unschemed, KernelScheme::Schemed);
+                    (kernel, scheme)
+                })
+                .collect(),
+        }
+    }
+
+    /// Every row, in `StdlibKernel::ALL` order.
+    pub fn rows(&self) -> impl ExactSizeIterator<Item = (StdlibKernel, &KernelScheme)> {
+        self.rows.iter().map(|(kernel, scheme)| (*kernel, scheme))
+    }
+
+    /// The row for `kernel`.
+    ///
+    /// `None` only for a kernel outside `StdlibKernel::ALL` (an unwired
+    /// variant); an unschemed kernel is `Some(KernelScheme::Unschemed)`.
+    #[must_use]
+    pub fn scheme(&self, kernel: StdlibKernel) -> Option<&KernelScheme> {
+        self.rows
+            .iter()
+            .find(|(row_kernel, _)| *row_kernel == kernel)
+            .map(|(_, scheme)| scheme)
+    }
+
+    /// The schemed rows only, in `StdlibKernel::ALL` order.
+    pub fn schemed(&self) -> impl Iterator<Item = (StdlibKernel, &Ty)> {
+        self.rows
+            .iter()
+            .filter_map(|(kernel, scheme)| match scheme {
+                KernelScheme::Schemed(ty) => Some((*kernel, ty)),
+                KernelScheme::Unschemed => None,
+            })
+    }
+}
+
 /// Materialize the full kernel type-scheme table.
 ///
-/// Every [`StdlibKernel`] variant paired with its inference scheme, in
-/// `StdlibKernel::ALL` order, skipping variants the registry deliberately
-/// never schemes (routed / unlowered buckets — those fail closed with
-/// IPE-L0108 at their call sites).
+/// Every `StdlibKernel::ALL` member gets one row, in `ALL` order: its
+/// inference scheme, or [`KernelScheme::Unschemed`] for a variant the registry
+/// deliberately never schemes (routed / unlowered buckets — those fail closed
+/// with IPE-L0108 at their call sites).
 ///
 /// This is the *lift* behind the salsa `kernel_types()` query: the table is
 /// read through the SAME [`Builder::resolve_scheme`] adapter inference uses
@@ -1447,31 +1520,11 @@ impl<'a> Builder<'a> {
 /// # Errors
 /// Propagates the interner-capacity diagnostic from [`Builtins::new`] (the
 /// only fallible step; the scheme reads themselves are total).
-pub fn kernel_type_table(interner: &mut Interner) -> Result<Vec<(StdlibKernel, Ty)>, Diagnostic> {
+pub fn kernel_type_table(interner: &mut Interner) -> Result<KernelSchemeTable, Diagnostic> {
     let builtins = Builtins::new(interner)?;
     let mut uf: UnionFind<Content> = UnionFind::new();
     let builder = Builder::for_scheme_table(&mut uf, interner, builtins);
-    Ok(StdlibKernel::ALL
-        .iter()
-        .filter_map(|&k| builder.resolve_scheme(SchemeKey(k)).map(|ty| (k, ty)))
-        .collect())
-}
-
-/// Resolve a single [`SchemeKey`] to its concrete HM type scheme, outside a full
-/// inference run.
-///
-/// This is the free-function entry to the scheme-by-key bridge: a consumer
-/// holding a [`ipe_kernels::KernelDef`] reads `def.scheme` (a [`SchemeKey`]) and
-/// resolves it here to the same `Ty` inference uses, via the single
-/// [`Builder::resolve_scheme`] interpreter. `Ok(None)` means the kernel has no
-/// scheme (a routed / unlowered bucket).
-///
-/// # Errors
-/// Propagates the interner-capacity diagnostic from [`Builtins::new`] (the only
-/// fallible step; the scheme read itself is total).
-pub fn resolve_scheme(key: SchemeKey, interner: &mut Interner) -> Result<Option<Ty>, Diagnostic> {
-    let builtins = Builtins::new(interner)?;
-    let mut uf: UnionFind<Content> = UnionFind::new();
-    let builder = Builder::for_scheme_table(&mut uf, interner, builtins);
-    Ok(builder.resolve_scheme(key))
+    Ok(KernelSchemeTable::build(StdlibKernel::ALL, |k| {
+        builder.resolve_scheme(SchemeKey(k))
+    }))
 }

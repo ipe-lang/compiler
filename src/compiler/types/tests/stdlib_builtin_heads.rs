@@ -101,7 +101,7 @@ fn kernel_empty_home_names() -> Result<BTreeSet<String>, String> {
     let table = ipe_types::kernel_type_table(&mut interner)
         .map_err(|e| format!("the kernel type table must build: {e:?}"))?;
     let mut names = BTreeSet::new();
-    for (_, ty) in &table {
+    for (_, ty) in table.schemed() {
         empty_home_heads(ty, &interner, &mut names)?;
     }
     if names.is_empty() {

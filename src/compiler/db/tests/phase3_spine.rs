@@ -287,10 +287,15 @@ fn kernel_types_memoized_and_source_independent() {
     let table = kernel_types(&db, root)
         .clone()
         .expect("kernel table must derive");
+    assert_eq!(
+        table.rows().len(),
+        ipe_kernels::StdlibKernel::ALL.len(),
+        "one row per wired kernel, schemed or not"
+    );
     assert!(
-        table.len() > 100,
+        table.schemed().count() > 100,
         "the registry schemes hundreds of kernels, got {}",
-        table.len()
+        table.schemed().count()
     );
     assert_eq!(log.executions_of("kernel_types("), 1);
 
