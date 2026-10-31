@@ -169,12 +169,12 @@ fn ends_node_by_line(src: &str) -> Vec<bool> {
         let hi = lo + line.len();
         let last = tokens
             .iter()
+            .rev()
             .filter(|t| (t.span.lo as usize) >= lo && (t.span.hi as usize) <= hi)
-            .filter_map(|t| match t.class {
+            .find_map(|t| match t.class {
                 TokenClass::Code(kind) => Some(kind),
                 TokenClass::DocComment => None,
-            })
-            .last();
+            });
         ends.push(last.is_some_and(ipe_fmt::ends_node));
         lo = hi + 1;
     }

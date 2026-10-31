@@ -103,8 +103,9 @@ fn every_line_end_slot_keeps_its_comment() {
     }
 }
 
-/// A comment owned inside a one-line collection breaks the collection, so
-/// the comment ends its item's line.
+/// A comment after an item of a collection that shares its line with other
+/// items breaks the collection one item per line, the comment ending its
+/// item's line.
 #[test]
 fn an_interior_comment_breaks_its_collection() {
     formats_to(
