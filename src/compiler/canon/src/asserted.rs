@@ -306,8 +306,15 @@ pub struct LocalTypeNames {
 
 impl LocalTypeNames {
     /// Collect every union and alias name `module` declares.
-    #[must_use]
-    pub fn of_module(module: &ipe_syntax::Module, interner: &ipe_intern::Interner) -> Self {
+    ///
+    /// # Errors
+    /// [`ipe_diagnostics::Diagnostic::CompilerBug`] when a declared name is
+    /// missing from the interner that parsed it: a dropped name would let a
+    /// local type pass as a foreign carrier, so none is ever skipped.
+    pub fn of_module(
+        module: &ipe_syntax::Module,
+        interner: &ipe_intern::Interner,
+    ) -> Result<Self, ipe_diagnostics::Diagnostic> {
         let unions = module
             .unions
             .iter()
@@ -318,7 +325,15 @@ impl LocalTypeNames {
             .map(|a| (a.value.name.value, LocalTypeKind::Alias));
         unions
             .chain(aliases)
-            .filter_map(|(sym, kind)| interner.resolve(sym).map(|name| (name.to_owned(), kind)))
+            .map(|(sym, kind)| {
+                interner
+                    .resolve(sym)
+                    .map(|name| (name.to_owned(), kind))
+                    .ok_or_else(|| ipe_diagnostics::Diagnostic::CompilerBug {
+                        where_: "intern.resolve",
+                        detail: "a declared type name is missing from the interner".to_owned(),
+                    })
+            })
             .collect()
     }
 
@@ -433,7 +448,7 @@ pub fn scan_module(
     }
     Ok(AssertedScan {
         uses,
-        local_types: LocalTypeNames::of_module(module, interner),
+        local_types: LocalTypeNames::of_module(module, interner)?,
     })
 }
 
@@ -767,6 +782,24 @@ mod tests {
             let text = outcome.err().map(|d| d.to_string()).unwrap_or_default();
             assert!(text.contains(rule), "expected `{rule}`, got `{text}`");
         }
+    }
+
+    #[test]
+    fn a_declared_name_missing_from_the_interner_is_a_compiler_bug() {
+        let src = "module M exposing (..)\n\ntype alias Count = Int\n\ntype Shape = Shape Int\n";
+        let mut parsed_with = ipe_intern::Interner::new();
+        let module = ipe_parse::parse_module(src, &mut parsed_with).expect("module parses");
+        let seen = LocalTypeNames::of_module(&module, &parsed_with).expect("names resolve");
+        assert_eq!(seen.kind("Count"), Some(LocalTypeKind::Alias));
+        assert_eq!(seen.kind("Shape"), Some(LocalTypeKind::Union));
+        let empty = ipe_intern::Interner::new();
+        assert!(matches!(
+            LocalTypeNames::of_module(&module, &empty),
+            Err(ipe_diagnostics::Diagnostic::CompilerBug {
+                where_: "intern.resolve",
+                ..
+            })
+        ));
     }
 
     #[test]
