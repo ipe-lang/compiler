@@ -2626,6 +2626,7 @@ mod tests {
             liveness: crate::web::SessionLiveness::default(),
             charge: crate::web::budget::Charge::detached(),
             cmds: Arc::new(crate::web::budget::SessionCmds::new()),
+            port_life: None,
         }))
     }
 
@@ -2836,6 +2837,7 @@ mod tests {
             liveness: crate::web::SessionLiveness::default(),
             charge: crate::web::budget::Charge::detached(),
             cmds: Arc::new(crate::web::budget::SessionCmds::new()),
+            port_life: None,
         }))
     }
 
@@ -4421,6 +4423,7 @@ mod tests {
             liveness: crate::web::SessionLiveness::default(),
             charge: crate::web::budget::Charge::detached(),
             cmds: Arc::new(crate::web::budget::SessionCmds::new()),
+            port_life: None,
             model,
             rendered: crate::web::Rendered::first(crate::web::SessionKeys::distinct(), tree),
             tabs: crate::web::TabSeqs::default(),

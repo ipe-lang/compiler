@@ -49,6 +49,12 @@ impl Carrier {
     /// may write either. Any other capitalised identifier is taken as an opaque
     /// handle name and validated as a `RustIdent`.
     ///
+    /// This is the wire/manifest parser only. It never classifies an Ipê
+    /// annotation: its wire spellings (`Str`, `i64`) are not Ipê type names,
+    /// and a bare handle name here carries no home module. The asserted-call
+    /// boundary classifies annotations through the builtin-row SSOT and the
+    /// crate's resolved opaque types instead.
+    ///
     /// # Errors
     ///
     /// [`WireDefect::InvalidType`] when the spelling is empty, is a bare

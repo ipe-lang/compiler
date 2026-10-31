@@ -1117,7 +1117,7 @@ pub fn prepare(
     let unify = ipe_ffi::unify::unify_foreign_nominals(&mut catalog);
     // Scan for asserted calls BEFORE interface injection, while `sources`
     // holds only project (and stdlib) modules.
-    let ScannedFfi { asserted, consts } = scan_asserted(sources, &catalog)?;
+    let ScannedFfi { asserted, consts } = scan_asserted(sources, &catalog, &unify)?;
     let mut injected = inject_interfaces(sources, &catalog, cache_hint)?;
     let mut assembled = assemble_emit(&catalog)?;
     if !asserted.is_empty() || !consts.is_empty() {
@@ -1194,6 +1194,10 @@ struct ScannedFfi {
 /// (`Rust.Ffi.call "<path>"`) and validate each against the installed-crate
 /// catalog, deduplicating identical assertions.
 ///
+/// Each module's carriers are classified against the catalog, the unify
+/// report's demotion edges (the home of a re-exported opaque), and the type
+/// names that module declares itself.
+///
 /// A module that fails to parse is skipped here: it cannot carry a working
 /// asserted call, and the compile pipeline reports the parse error with full
 /// context moments later.
@@ -1204,6 +1208,7 @@ struct ScannedFfi {
 fn scan_asserted(
     sources: &BTreeMap<Vec<String>, (PathBuf, String)>,
     catalog: &[InstalledCrate],
+    unify: &ipe_ffi::unify::UnifyReport,
 ) -> Result<ScannedFfi, CliError> {
     let mut specs = Vec::new();
     let mut const_specs = Vec::new();
@@ -1221,23 +1226,25 @@ fn scan_asserted(
         let Ok(module) = ipe_parse::parse_module(text, &mut interner) else {
             continue;
         };
-        let uses = ipe_canon::asserted::scan_module(&module, &interner).map_err(|diag| {
-            CliError::Pipeline {
-                file: file.clone(),
-                src: text.clone(),
-                diag: Box::new(diag),
-            }
-        })?;
+        let ipe_canon::asserted::AssertedScan { uses, local_types } =
+            ipe_canon::asserted::scan_module(&module, &interner).map_err(|diag| {
+                CliError::Pipeline {
+                    file: file.clone(),
+                    src: text.clone(),
+                    diag: Box::new(diag),
+                }
+            })?;
+        let scope = ipe_ffi::asserted::CarrierScope::new(catalog, unify, &local_types);
         for u in uses {
             // A native constant reads a bare scalar; every other surface is a
             // forwarder. The classifier carried on the use routes the two.
             if matches!(u.callee, ipe_canon::asserted::AssertedCallee::RustConst) {
                 let spec =
-                    ipe_ffi::asserted::validate_const(u.path, &u.annotation, &interner, catalog)
+                    ipe_ffi::asserted::validate_const(u.path, &u.annotation, &interner, &scope)
                         .map_err(asserted_refused)?;
                 const_specs.push(spec);
             } else {
-                let spec = ipe_ffi::asserted::validate(u.path, &u.annotation, &interner, catalog)
+                let spec = ipe_ffi::asserted::validate(u.path, &u.annotation, &interner, &scope)
                     .map_err(asserted_refused)?;
                 specs.push(spec);
             }
@@ -6283,7 +6290,7 @@ version = \"1\"
         let sources = main_module(
             "shifted : Int -> Result Error Int\nshifted =\n    Rust.Ffi.call \"tm::shift\"\n",
         );
-        let got = scan_asserted(&sources, &[]);
+        let got = scan_asserted(&sources, &[], &ipe_ffi::unify::UnifyReport::default());
         assert!(
             matches!(&got, Err(CliError::FfiPrep(refusal))
                 if matches!(refusal.as_ref(), FfiPrepError::AssertedRefused(diag)
@@ -6298,7 +6305,7 @@ version = \"1\"
         let sources = main_module(
             "main =\n    case (Rust.Ffi.call \"tm::shift\") 1 of\n        Ok _ -> 1\n        Err _ -> 0\n",
         );
-        let got = scan_asserted(&sources, &[]);
+        let got = scan_asserted(&sources, &[], &ipe_ffi::unify::UnifyReport::default());
         assert!(
             matches!(&got, Err(CliError::Pipeline { .. })),
             "a misplaced asserted call stays a span-attributed pipeline error"

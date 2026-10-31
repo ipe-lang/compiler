@@ -34,8 +34,8 @@ fn seed_ffi_cache(project_root: &Path) -> bool {
         "functions": [
             {
                 "name": "foreign",
-                "params": [{"name": "n", "type": "i64"}],
-                "results": [{"name": "", "type": "i64"}],
+                "params": [{"name": "n", "type": "Int", "ipeType": "Int", "rustType": "i64"}],
+                "results": [{"name": "", "type": "Int", "rustType": "i64"}],
                 "effect": "pure"
             },
             {
@@ -46,8 +46,8 @@ fn seed_ffi_cache(project_root: &Path) -> bool {
             },
             {
                 "name": "shift",
-                "params": [{"name": "n", "type": "i64"}],
-                "results": [{"name": "", "type": "i64"}],
+                "params": [{"name": "n", "type": "Int", "ipeType": "Int", "rustType": "i64"}],
+                "results": [{"name": "", "type": "Int", "rustType": "i64"}],
                 "effect": "pure"
             }
         ],

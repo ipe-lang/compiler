@@ -56,49 +56,49 @@ impl AssertedPath {
     /// Parse a `crate::path::function` string.
     ///
     /// # Errors
-    /// A human-readable rule name (the caller wraps it in
-    /// [`ipe_diagnostics::NameError::AssertedCallMalformed`]).
-    pub fn parse(raw: &str) -> Result<Self, String> {
+    /// The [`AssertedPathDefect`] naming the broken rule (the caller renders it
+    /// in [`ipe_diagnostics::NameError::AssertedCallMalformed`]).
+    pub fn parse(raw: &str) -> Result<Self, AssertedPathDefect> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            return Err("the path is empty".to_owned());
+            return Err(AssertedPathDefect::Empty);
         }
         if trimmed != raw {
-            return Err("the path has leading or trailing whitespace".to_owned());
+            return Err(AssertedPathDefect::SurroundingWhitespace);
         }
         let segments: Vec<&str> = raw.split("::").collect();
         if segments.len() < 2 {
-            return Err(format!(
-                "`{raw}` has no `::` — the path must name both the crate and the function \
-                 (`<crate>::<function>`)"
-            ));
+            return Err(AssertedPathDefect::NoCrateSeparator {
+                raw: raw.to_owned(),
+            });
         }
         for seg in &segments {
             if seg.is_empty() {
-                return Err(format!("`{raw}` has an empty path segment"));
+                return Err(AssertedPathDefect::EmptySegment {
+                    raw: raw.to_owned(),
+                });
             }
             let mut chars = seg.chars();
             let head_ok = chars
                 .next()
                 .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
             if !head_ok || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                return Err(format!(
-                    "`{seg}` is not a plain Rust path segment (letters, digits, `_`; \
-                     no generics or spaces)"
-                ));
+                return Err(AssertedPathDefect::NotAPlainSegment {
+                    segment: (*seg).to_owned(),
+                });
             }
             // A lone `_` is the wildcard token, not an identifier; spliced into
             // the shim it would not parse as a path segment.
             if *seg == "_" {
-                return Err("`_` is not an identifier and cannot be a path segment".to_owned());
+                return Err(AssertedPathDefect::WildcardSegment);
             }
             // A segment spelled as a Rust keyword is spliced raw into the
             // generated shim (`::sha2::match(...)`), which cargo cannot parse.
             // Reject it at ipe time rather than emit un-buildable Rust.
             if is_rust_keyword(seg) {
-                return Err(format!(
-                    "`{seg}` is a Rust keyword and cannot be a path segment"
-                ));
+                return Err(AssertedPathDefect::RustKeyword {
+                    segment: (*seg).to_owned(),
+                });
             }
         }
         Ok(Self {
@@ -119,14 +119,13 @@ impl AssertedPath {
     /// `a::b::c`.
     ///
     /// # Errors
-    /// A human-readable rule name (the caller wraps it in
-    /// [`ipe_diagnostics::NameError::AssertedCallMalformed`]).
-    pub fn from_crate_and_path(krate: &str, path: &str) -> Result<Self, String> {
+    /// The [`AssertedPathDefect`] naming the broken rule (the caller renders it
+    /// in [`ipe_diagnostics::NameError::AssertedCallMalformed`]).
+    pub fn from_crate_and_path(krate: &str, path: &str) -> Result<Self, AssertedPathDefect> {
         if krate.contains("::") {
-            return Err(format!(
-                "the crate `{krate}` must be a single identifier, not a `::` path — \
-                 name the item beneath it in the second argument"
-            ));
+            return Err(AssertedPathDefect::CrateNotSingleIdent {
+                krate: krate.to_owned(),
+            });
         }
         Self::parse(&format!("{krate}::{path}"))
     }
@@ -212,6 +211,156 @@ impl AssertedPath {
     }
 }
 
+/// The closed set of rules an asserted-call path can break.
+///
+/// Its rendered text is the detail of the IPE-N0038 diagnostic at the call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssertedPathDefect {
+    /// The path is empty.
+    Empty,
+    /// The path has leading or trailing whitespace.
+    SurroundingWhitespace,
+    /// The path has no `::` separating the crate from the item.
+    NoCrateSeparator {
+        /// The path as written.
+        raw: String,
+    },
+    /// The path has an empty `::` segment.
+    EmptySegment {
+        /// The path as written.
+        raw: String,
+    },
+    /// A segment is not a plain Rust identifier.
+    NotAPlainSegment {
+        /// The offending segment.
+        segment: String,
+    },
+    /// A segment is the lone `_` wildcard token.
+    WildcardSegment,
+    /// A segment is spelled as a Rust keyword.
+    RustKeyword {
+        /// The offending segment.
+        segment: String,
+    },
+    /// The crate half of the two-literal form is itself a `::` path.
+    CrateNotSingleIdent {
+        /// The crate half as written.
+        krate: String,
+    },
+}
+
+impl std::fmt::Display for AssertedPathDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("the path is empty"),
+            Self::SurroundingWhitespace => {
+                f.write_str("the path has leading or trailing whitespace")
+            }
+            Self::NoCrateSeparator { raw } => write!(
+                f,
+                "`{raw}` has no `::` — the path must name both the crate and the function \
+                 (`<crate>::<function>`)"
+            ),
+            Self::EmptySegment { raw } => write!(f, "`{raw}` has an empty path segment"),
+            Self::NotAPlainSegment { segment } => write!(
+                f,
+                "`{segment}` is not a plain Rust path segment (letters, digits, `_`; \
+                 no generics or spaces)"
+            ),
+            Self::WildcardSegment => {
+                f.write_str("`_` is not an identifier and cannot be a path segment")
+            }
+            Self::RustKeyword { segment } => write!(
+                f,
+                "`{segment}` is a Rust keyword and cannot be a path segment"
+            ),
+            Self::CrateNotSingleIdent { krate } => write!(
+                f,
+                "the crate `{krate}` must be a single identifier, not a `::` path — \
+                 name the item beneath it in the second argument"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AssertedPathDefect {}
+
+/// Which kind of declaration a module-local type name is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalTypeKind {
+    /// A `type T = …` union declaration.
+    Union,
+    /// A `type alias T = …` declaration.
+    Alias,
+}
+
+/// The type names one source module declares itself.
+///
+/// The asserted-call boundary refuses an unqualified carrier spelling found
+/// here: a module-local type is never a foreign carrier, even when it shares a
+/// name with a builtin or a crate's opaque type.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalTypeNames {
+    declared: std::collections::BTreeMap<String, LocalTypeKind>,
+}
+
+impl LocalTypeNames {
+    /// Collect every union and alias name `module` declares.
+    ///
+    /// # Errors
+    /// [`ipe_diagnostics::Diagnostic::CompilerBug`] when a declared name is
+    /// missing from the interner that parsed it: a dropped name would let a
+    /// local type pass as a foreign carrier, so none is ever skipped.
+    pub fn of_module(
+        module: &ipe_syntax::Module,
+        interner: &ipe_intern::Interner,
+    ) -> Result<Self, ipe_diagnostics::Diagnostic> {
+        let unions = module
+            .unions
+            .iter()
+            .map(|u| (u.value.name.value, LocalTypeKind::Union));
+        let aliases = module
+            .aliases
+            .iter()
+            .map(|a| (a.value.name.value, LocalTypeKind::Alias));
+        unions
+            .chain(aliases)
+            .map(|(sym, kind)| {
+                interner
+                    .resolve(sym)
+                    .map(|name| (name.to_owned(), kind))
+                    .ok_or_else(|| ipe_diagnostics::Diagnostic::CompilerBug {
+                        where_: "intern.resolve",
+                        detail: "a declared type name is missing from the interner".to_owned(),
+                    })
+            })
+            .collect()
+    }
+
+    /// The kind of the local declaration named `name`, if the module has one.
+    #[must_use]
+    pub fn kind(&self, name: &str) -> Option<LocalTypeKind> {
+        self.declared.get(name).copied()
+    }
+}
+
+impl FromIterator<(String, LocalTypeKind)> for LocalTypeNames {
+    fn from_iter<I: IntoIterator<Item = (String, LocalTypeKind)>>(iter: I) -> Self {
+        Self {
+            declared: iter.into_iter().collect(),
+        }
+    }
+}
+
+/// What [`scan_module`] finds in one module.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AssertedScan {
+    /// Every well-formed asserted-call site, in source order.
+    pub uses: Vec<AssertedUse>,
+    /// The type names the module declares, which no asserted carrier may name.
+    pub local_types: LocalTypeNames,
+}
+
 /// One well-formed asserted-call site found by [`scan_module`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssertedUse {
@@ -244,7 +393,7 @@ pub struct AssertedUse {
 pub fn scan_module(
     module: &ipe_syntax::Module,
     interner: &ipe_intern::Interner,
-) -> Result<Vec<AssertedUse>, ipe_diagnostics::Diagnostic> {
+) -> Result<AssertedScan, ipe_diagnostics::Diagnostic> {
     let mut uses = Vec::new();
     for value in &module.values {
         let v = &value.value;
@@ -297,7 +446,10 @@ pub fn scan_module(
             });
         }
     }
-    Ok(uses)
+    Ok(AssertedScan {
+        uses,
+        local_types: LocalTypeNames::of_module(module, interner)?,
+    })
 }
 
 /// Which asserted-call surface a callee names.
@@ -381,7 +533,7 @@ pub fn read_asserted_path(
                 ));
             };
             let raw = as_str(path_expr)?;
-            AssertedPath::parse(&raw).map_err(|detail| (path_expr.span, detail))
+            AssertedPath::parse(&raw).map_err(|defect| (path_expr.span, defect.to_string()))
         }
         AssertedCallee::RustFn => {
             let [crate_expr, path_expr] = args else {
@@ -395,7 +547,7 @@ pub fn read_asserted_path(
             let krate = as_str(crate_expr)?;
             let path = as_str(path_expr)?;
             AssertedPath::from_crate_and_path(&krate, &path)
-                .map_err(|detail| (path_expr.span, detail))
+                .map_err(|defect| (path_expr.span, defect.to_string()))
         }
         AssertedCallee::RustConst => {
             let [crate_expr, path_expr] = args else {
@@ -409,7 +561,7 @@ pub fn read_asserted_path(
             let krate = as_str(crate_expr)?;
             let path = as_str(path_expr)?;
             AssertedPath::from_crate_and_path(&krate, &path)
-                .map_err(|detail| (path_expr.span, detail))
+                .map_err(|defect| (path_expr.span, defect.to_string()))
         }
     }
 }
@@ -479,15 +631,15 @@ fn fnv1a64(s: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::AssertedPath;
+    use super::{AssertedPath, AssertedPathDefect, LocalTypeKind, LocalTypeNames};
 
     #[test]
     fn every_ssot_keyword_is_rejected_as_a_path_segment() {
         for kw in ipe_intern::RUST_KEYWORDS {
             let raw = format!("some_crate::{kw}");
-            let err = AssertedPath::parse(&raw).err().unwrap_or_default();
+            let err = AssertedPath::parse(&raw).err();
             assert!(
-                err.contains("Rust keyword"),
+                matches!(&err, Some(AssertedPathDefect::RustKeyword { segment }) if segment == kw),
                 "{kw} should be rejected as a Rust keyword, got: {err:?}"
             );
         }
@@ -501,9 +653,9 @@ mod tests {
     #[test]
     fn a_lone_underscore_segment_is_refused() {
         for raw in ["_::frobnicate", "some_crate::_", "some_crate::_::f"] {
-            let err = AssertedPath::parse(raw).err().unwrap_or_default();
+            let err = AssertedPath::parse(raw).err();
             assert!(
-                err.contains("`_` is not an identifier"),
+                matches!(err, Some(AssertedPathDefect::WildcardSegment)),
                 "{raw} should be refused, got: {err:?}"
             );
         }
@@ -571,7 +723,10 @@ mod tests {
     fn a_multi_segment_crate_half_is_refused() {
         // A crate is ONE identifier: `"a::b"` in the crate slot is a mistake,
         // never re-parsed as `a::b::c`.
-        assert!(AssertedPath::from_crate_and_path("a::b", "c").is_err());
+        assert!(matches!(
+            AssertedPath::from_crate_and_path("a::b", "c"),
+            Err(AssertedPathDefect::CrateNotSingleIdent { krate }) if krate == "a::b"
+        ));
     }
 
     #[test]
@@ -600,5 +755,63 @@ mod tests {
         ] {
             assert!(AssertedPath::parse(bad).is_err(), "{bad:?} must be refused");
         }
+    }
+
+    #[test]
+    fn each_path_defect_renders_its_rule() {
+        let cases = [
+            (AssertedPath::parse(""), "the path is empty"),
+            (
+                AssertedPath::parse(" a::b"),
+                "leading or trailing whitespace",
+            ),
+            (AssertedPath::parse("frobnicate"), "has no `::`"),
+            (AssertedPath::parse("a::::b"), "has an empty path segment"),
+            (
+                AssertedPath::parse("a::b<c>"),
+                "is not a plain Rust path segment",
+            ),
+            (AssertedPath::parse("a::_"), "`_` is not an identifier"),
+            (AssertedPath::parse("a::match"), "is a Rust keyword"),
+            (
+                AssertedPath::from_crate_and_path("a::b", "c"),
+                "must be a single identifier",
+            ),
+        ];
+        for (outcome, rule) in cases {
+            let text = outcome.err().map(|d| d.to_string()).unwrap_or_default();
+            assert!(text.contains(rule), "expected `{rule}`, got `{text}`");
+        }
+    }
+
+    #[test]
+    fn a_declared_name_missing_from_the_interner_is_a_compiler_bug() {
+        let src = "module M exposing (..)\n\ntype alias Count = Int\n\ntype Shape = Shape Int\n";
+        let mut parsed_with = ipe_intern::Interner::new();
+        let module = ipe_parse::parse_module(src, &mut parsed_with).expect("module parses");
+        let seen = LocalTypeNames::of_module(&module, &parsed_with).expect("names resolve");
+        assert_eq!(seen.kind("Count"), Some(LocalTypeKind::Alias));
+        assert_eq!(seen.kind("Shape"), Some(LocalTypeKind::Union));
+        let empty = ipe_intern::Interner::new();
+        assert!(matches!(
+            LocalTypeNames::of_module(&module, &empty),
+            Err(ipe_diagnostics::Diagnostic::CompilerBug {
+                where_: "intern.resolve",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn local_type_names_report_their_kind() {
+        let names: LocalTypeNames = [
+            ("Str".to_owned(), LocalTypeKind::Alias),
+            ("Version".to_owned(), LocalTypeKind::Union),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(names.kind("Str"), Some(LocalTypeKind::Alias));
+        assert_eq!(names.kind("Version"), Some(LocalTypeKind::Union));
+        assert_eq!(names.kind("String"), None);
     }
 }

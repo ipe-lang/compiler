@@ -2306,13 +2306,14 @@ fn parse_rustdoc(doc: &serde_json::Value, crate_name: &str, version: &str) -> Pk
             && !associated_ids.contains(item_id.as_str())
             && let Some(ty_node) = const_data.get("type").or_else(|| const_data.get("type_"))
             && let Some(full) = REACHABLE_PATHS.with(|c| c.borrow().get(item_id.as_str()).cloned())
+            && let Some(ty) = rustdoc_type_to_rust_str(ty_node)
         {
             let relative = full
                 .split_once("::")
                 .map_or(full.as_str(), |(_crate_seg, rest)| rest);
             constants.push(Constant {
                 path: relative.to_string(),
-                ty: rustdoc_type_to_rust_str(ty_node),
+                ty,
             });
         }
 
@@ -2343,10 +2344,14 @@ fn parse_rustdoc(doc: &serde_json::Value, crate_name: &str, version: &str) -> Pk
             let self_ipe = for_val
                 .map(|v| rustdoc_type_to_ipe(v, &aliases))
                 .unwrap_or_default();
-            let self_rust = for_val.map(rustdoc_type_to_rust_str).unwrap_or_default();
+            // A Self with no Rust spelling binds nothing: every method below
+            // would carry an empty receiver type.
+            let Some(self_rust) = for_val.and_then(rustdoc_type_to_rust_str) else {
+                continue;
+            };
 
             if ipe_env::var("IPE_FFI_DBG").is_ok() {
-                eprintln!("[DBG0] impl block: self_ipe={self_ipe:?} self_rust={self_ipe:?}");
+                eprintln!("[DBG0] impl block: self_ipe={self_ipe:?} self_rust={self_rust:?}");
             }
             if self_ipe.is_empty() {
                 continue;
@@ -2781,8 +2786,10 @@ fn parse_rustdoc(doc: &serde_json::Value, crate_name: &str, version: &str) -> Pk
                 "resolved_path": { "name": name, "path": name, "id": item_id, "args": null }
             });
             let recv_ipe = rustdoc_type_to_ipe(&recv_path, &aliases);
-            let recv_rust = rustdoc_type_to_rust_str(&recv_path);
-            if recv_ipe.is_empty() || recv_rust.is_empty() {
+            let Some(recv_rust) = rustdoc_type_to_rust_str(&recv_path) else {
+                continue;
+            };
+            if recv_ipe.is_empty() {
                 continue;
             }
 
@@ -2805,13 +2812,15 @@ fn parse_rustdoc(doc: &serde_json::Value, crate_name: &str, version: &str) -> Pk
 
                 // C1 + C5 closed-type-set gate.
                 if let Err(reason) = field_type_eligible(field_ty, index, &clone_nominal_ids) {
-                    record_tail_drop(reason, false, &rustdoc_type_to_rust_str(field_ty));
+                    record_tail_drop(reason, false, &rust_str_for_report(field_ty));
                     continue;
                 }
 
                 let field_ipe = rustdoc_type_to_ipe(field_ty, &aliases);
-                let field_rust = rustdoc_type_to_rust_str(field_ty);
-                if field_ipe.is_empty() || field_rust.is_empty() {
+                let Some(field_rust) = rustdoc_type_to_rust_str(field_ty) else {
+                    continue;
+                };
+                if field_ipe.is_empty() {
                     continue;
                 }
 
@@ -3604,8 +3613,10 @@ fn mirror_into_global_xc_index(doc: &serde_json::Value) {
         if reachable_local_path(self_id).is_none() {
             continue;
         }
-        let self_public_path = rustdoc_type_to_rust_str(for_val);
-        if self_public_path.is_empty() || self_public_path.contains("__ipe_xc_path") {
+        let Some(self_public_path) = rustdoc_type_to_rust_str(for_val) else {
+            continue;
+        };
+        if self_public_path.contains("__ipe_xc_path") {
             continue;
         }
         // B3: freeze the async-Send verdict in the owning crate. Sound proof =
@@ -4142,8 +4153,8 @@ fn resolve_variant_fields(
         let field_name = field_item["name"].as_str().unwrap_or("").to_string();
         let ty = field_item["inner"].get("struct_field")?;
         let ipe = rustdoc_type_to_ipe(ty, aliases);
-        let rust = rustdoc_type_to_rust_str(ty);
-        if ipe.is_empty() || rust.is_empty() {
+        let rust = rustdoc_type_to_rust_str(ty)?;
+        if ipe.is_empty() {
             return None;
         }
         out.push((field_name, ty.clone(), ipe, rust));
@@ -4210,8 +4221,10 @@ fn collect_foreign_type_decls(
                 continue;
             };
             let ipe_name = rustdoc_type_to_ipe(&nominal_path, aliases);
-            let rust_path = rustdoc_type_to_rust_str(&nominal_path);
-            if ipe_name.is_empty() || rust_path.is_empty() {
+            let Some(rust_path) = rustdoc_type_to_rust_str(&nominal_path) else {
+                continue;
+            };
+            if ipe_name.is_empty() {
                 continue;
             }
             // A private field vanishes from `fields`; rustdoc records the
@@ -4240,8 +4253,11 @@ fn collect_foreign_type_decls(
                     continue;
                 };
                 let ipe = rustdoc_type_to_ipe(field_ty, aliases);
-                let rust = rustdoc_type_to_rust_str(field_ty);
-                if ipe.is_empty() || rust.is_empty() {
+                let Some(rust) = rustdoc_type_to_rust_str(field_ty) else {
+                    hidden = true;
+                    continue;
+                };
+                if ipe.is_empty() {
                     hidden = true;
                     continue;
                 }
@@ -4275,8 +4291,10 @@ fn collect_foreign_type_decls(
                 continue; // uninhabited — no value can exist to surface
             }
             let ipe_name = rustdoc_type_to_ipe(&nominal_path, aliases);
-            let rust_path = rustdoc_type_to_rust_str(&nominal_path);
-            if ipe_name.is_empty() || rust_path.is_empty() {
+            let Some(rust_path) = rustdoc_type_to_rust_str(&nominal_path) else {
+                continue;
+            };
+            if ipe_name.is_empty() {
                 continue;
             }
             let mut hidden = false;
@@ -4389,8 +4407,10 @@ fn emit_enum_bindings(
         "resolved_path": { "name": enum_name, "path": enum_name, "id": enum_id, "args": null }
     });
     let enum_ipe = rustdoc_type_to_ipe(&recv_path, aliases);
-    let enum_rust = rustdoc_type_to_rust_str(&recv_path);
-    if enum_ipe.is_empty() || enum_rust.is_empty() {
+    let Some(enum_rust) = rustdoc_type_to_rust_str(&recv_path) else {
+        return;
+    };
+    if enum_ipe.is_empty() {
         return;
     }
 
@@ -5019,7 +5039,7 @@ fn parse_fn_item(
         if let Some(offending) = input_dyn.map(|i| &i[1]).or(output_dyn) {
             record_generic_drop(
                 name,
-                GenericDrop::TraitObjectDrop(rustdoc_type_to_rust_str(offending)),
+                GenericDrop::TraitObjectDrop(rust_str_for_report(offending)),
             );
             return None;
         }
@@ -5060,7 +5080,9 @@ fn parse_fn_item(
         }
         let type_json = subst_generic_json(&input[1], &subst_map, BoundPos::Param);
         let ipe = rustdoc_type_to_ipe(&type_json, aliases);
-        let rust = rustdoc_type_to_rust_str(&type_json);
+        // An unrenderable parameter drops the binding: its Rust type cannot be
+        // declared, and the Ipê view alone names no foreign identity.
+        let rust = rustdoc_type_to_rust_str(&type_json)?;
         // `Self` in a parameter position means "the receiver type" (e.g.
         // `fn signed_duration_since(self, rhs: Self)`, or nested as
         // `Option<Self>`).  `Self` is not valid in a free-function signature,
@@ -5081,7 +5103,8 @@ fn parse_fn_item(
     if !output.is_null() {
         let out_json = subst_generic_json(output, &subst_map, BoundPos::Return);
         let ipe = rustdoc_type_to_ipe(&out_json, aliases);
-        let rust = rustdoc_type_to_rust_str(&out_json);
+        // Same rule for the result.
+        let rust = rustdoc_type_to_rust_str(&out_json)?;
         // Substitute `Self` (possibly nested, e.g. `Option<Self>`) with the
         // concrete receiver type so the wrapper's return type is valid Rust.
         let (recv_ipe, recv_rust) = recv.unwrap_or(("", ""));
@@ -5118,7 +5141,7 @@ fn parse_fn_item(
             && inputs
                 .first()
                 .filter(|i| i[0].as_str() == Some("self"))
-                .is_some_and(|i| rustdoc_type_to_rust_str(&i[1]) == "&mut Self");
+                .is_some_and(|i| rustdoc_type_to_rust_str(&i[1]).as_deref() == Some("&mut Self"));
         if self_is_mut && !recv_rust.is_empty() {
             match results.first() {
                 None => true, // `&mut self -> ()` in-place setter
@@ -6641,7 +6664,9 @@ fn ufcs_trait_path_with_args(trait_node: &serde_json::Value) -> Option<String> {
             arr.iter()
                 .filter_map(|arg| {
                     if let Some(t) = arg.get("type") {
-                        Some(rustdoc_type_to_rust_str(t))
+                        // An unrenderable arg keeps its slot as an empty
+                        // spelling, which the nameability check below refuses.
+                        Some(rustdoc_type_to_rust_str(t).unwrap_or_default())
                     } else if let Some(l) = arg.get("lifetime") {
                         let s = l.as_str().unwrap_or("'a");
                         Some(if s.starts_with('\'') {
@@ -6971,7 +6996,11 @@ fn item_is_type(it: &serde_json::Value) -> bool {
 /// (`Option`, `Result`, `Vec`, …).  A *bare* uppercase token that is neither
 /// means an unresolved type — an impl-level generic (`Tz`), a private crate
 /// type, or an external type with no public path — so the function is dropped.
+/// An empty spelling names no type at all and is never nameable.
 fn type_is_nameable(ty: &str) -> bool {
+    if ty.trim().is_empty() {
+        return false;
+    }
     let b = ty.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -8024,23 +8053,24 @@ fn extract_binding_type(
 // ── rustdoc JSON type → Rust type string ──────────────────────────────
 //
 // Used to populate the `rustType` field in the output JSON that
-// ipe_ffi::pkginfo reads for coercion decisions.
+// ipe_ffi::pkginfo reads for coercion decisions. `None` when any part of the
+// type has no Rust spelling here, so no caller can bind a partial type.
 
 // Large rustdoc-JSON walker; the single dispatch reads clearer whole than split.
 #[allow(clippy::too_many_lines)]
-fn rustdoc_type_to_rust_str(val: &serde_json::Value) -> String {
+fn rustdoc_type_to_rust_str(val: &serde_json::Value) -> Option<String> {
     if val.is_null() {
-        return "()".to_string();
+        return Some("()".to_string());
     }
 
     // [#47(a)] Sentinel for a serde-bound generic reduced to serde_json::Value.
     // Rust type is `serde_json::Value` (fully-qualified — serde_json is always a dep).
     if val.get("__ipe_serde_value").is_some() {
-        return "serde_json::Value".to_string();
+        return Some("serde_json::Value".to_string());
     }
 
     if let Some(prim) = val.get("primitive") {
-        return prim.as_str().unwrap_or("()").to_string();
+        return prim.as_str().map(str::to_string);
     }
 
     if let Some(inner) = val.get("borrowed_ref") {
@@ -8058,17 +8088,21 @@ fn rustdoc_type_to_rust_str(val: &serde_json::Value) -> String {
                 format!("{s} ")
             })
             .unwrap_or_default();
-        return format!(
+        return Some(format!(
             "&{}{}{}",
             lt,
             m,
-            rustdoc_type_to_rust_str(inner_type(inner))
-        );
+            rustdoc_type_to_rust_str(inner_type(inner))?
+        ));
     }
 
     if let Some(inner) = val.get("raw_pointer") {
         let m = if is_mutable(inner) { "mut" } else { "const" };
-        return format!("*{} {}", m, rustdoc_type_to_rust_str(inner_type(inner)));
+        return Some(format!(
+            "*{} {}",
+            m,
+            rustdoc_type_to_rust_str(inner_type(inner))?
+        ));
     }
 
     if let Some(rp) = val.get("resolved_path") {
@@ -8078,7 +8112,7 @@ fn rustdoc_type_to_rust_str(val: &serde_json::Value) -> String {
         // this is the B2 make-or-break: never fall through to `reachable_local_path`
         // (misses cross-crate → bare last segment → E0412/E0433).
         if let Some(xc) = rp.get("__ipe_xc_path").and_then(|p| p.as_str()) {
-            return xc.to_string();
+            return Some(xc.to_string());
         }
         // [WALL 5 / #63] See through a crate-local GENERIC Result/Option alias
         // (`FirestoreResult<FirestoreDb> -> Result<FirestoreDb, FirestoreError>`)
@@ -8145,6 +8179,9 @@ fn rustdoc_type_to_rust_str(val: &serde_json::Value) -> String {
                 .unwrap_or_else(|| raw_name.rsplit("::").next().unwrap_or(raw_name).to_string()),
         };
         let name = name.as_str();
+        if name.is_empty() {
+            return None;
+        }
         let args: Vec<String> = rp
             .get("args")
             .and_then(|a| a.get("angle_bracketed"))
@@ -8158,11 +8195,11 @@ fn rustdoc_type_to_rust_str(val: &serde_json::Value) -> String {
                         } else if let Some(l) = arg.get("lifetime") {
                             // rustdoc JSON already includes the leading apostrophe
                             let s = l.as_str().unwrap_or("'a");
-                            if s.starts_with('\'') {
+                            Some(if s.starts_with('\'') {
                                 s.to_string()
                             } else {
                                 format!("'{s}")
-                            }
+                            })
                         } else {
                             // A const generic arg (e.g. `const CAP: usize`) cannot be
                             // reproduced in emitted Rust: the wrapper has no way to
@@ -8170,41 +8207,53 @@ fn rustdoc_type_to_rust_str(val: &serde_json::Value) -> String {
                             // enclosing type fails `type_is_nameable` — dropping the
                             // binding uniformly instead of emitting a bare unparameterized
                             // type that cargo rejects with E0107.
-                            "ConstGenericArg".to_string()
+                            Some("ConstGenericArg".to_string())
                         }
                     })
-                    .collect()
+                    .collect::<Option<Vec<String>>>()
             })
-            .unwrap_or_default();
-        return if args.is_empty() {
+            .unwrap_or(Some(Vec::new()))?;
+        return Some(if args.is_empty() {
             name.to_string()
         } else {
             format!("{}<{}>", name, args.join(", "))
-        };
+        });
     }
 
     if let Some(items) = val.get("tuple") {
         let parts: Vec<String> = items
-            .as_array()
-            .map(|arr| arr.iter().map(rustdoc_type_to_rust_str).collect())
-            .unwrap_or_default();
-        return format!("({})", parts.join(", "));
+            .as_array()?
+            .iter()
+            .map(rustdoc_type_to_rust_str)
+            .collect::<Option<Vec<String>>>()?;
+        return Some(format!("({})", parts.join(", ")));
     }
 
     if let Some(inner) = val.get("slice") {
-        return format!("[{}]", rustdoc_type_to_rust_str(inner));
+        return Some(format!("[{}]", rustdoc_type_to_rust_str(inner)?));
     }
 
     if let Some(arr) = val.get("array") {
-        let len = arr["len"].as_str().unwrap_or("?");
-        return format!("[{}; {}]", rustdoc_type_to_rust_str(inner_type(arr)), len);
+        let len = arr["len"].as_str()?;
+        return Some(format!(
+            "[{}; {}]",
+            rustdoc_type_to_rust_str(inner_type(arr))?,
+            len
+        ));
     }
 
     if let Some(g) = val.get("generic") {
-        return g.as_str().unwrap_or("_").to_string();
+        return g.as_str().map(str::to_string);
     }
 
-    String::new()
+    // A kind with no Rust spelling here (function pointer, `dyn`/`impl` trait,
+    // qualified associated path, inferred): unrenderable, never a sentinel.
+    None
+}
+
+/// A type's Rust spelling for a drop report only — never for a binding.
+fn rust_str_for_report(val: &serde_json::Value) -> String {
+    rustdoc_type_to_rust_str(val).unwrap_or_else(|| "<unrenderable>".to_string())
 }
 
 // ── String-based type mapping (for primitives) ─────────────────────────
@@ -11448,8 +11497,10 @@ fn self_is_closed_monomorphic(for_val: &serde_json::Value) -> bool {
             return false;
         }
         if let Some(t) = arg.get("type") {
-            let rendered = rustdoc_type_to_rust_str(t);
-            if rendered.is_empty() || !type_is_nameable(&rendered) {
+            let Some(rendered) = rustdoc_type_to_rust_str(t) else {
+                return false;
+            };
+            if !type_is_nameable(&rendered) {
                 return false;
             }
             // A bare single uppercase letter is almost certainly a free tyvar.
@@ -11472,31 +11523,25 @@ fn self_is_closed_monomorphic(for_val: &serde_json::Value) -> bool {
 fn self_path_with_concrete_args(for_val: &serde_json::Value) -> Option<String> {
     let rp = for_val.get("resolved_path")?;
     let base = rp.get("id").and_then(reachable_local_path)?;
-    let args: Vec<String> = rp
+    // All or nothing: a type arg without a nameable spelling, or a const arg,
+    // drops the whole path — a Self with an arg silently omitted names another
+    // impl, or none. Only lifetime args are elided.
+    let mut args: Vec<String> = Vec::new();
+    let arg_nodes = rp
         .get("args")
         .and_then(|a| a.get("angle_bracketed"))
         .and_then(|ab| ab.get("args"))
-        .and_then(|a| a.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|arg| {
-                    if let Some(t) = arg.get("type") {
-                        let s = rustdoc_type_to_rust_str(t);
-                        // is_empty() alone is NOT sufficient — pub(crate) types render
-                        // to a non-empty bare last segment; type_is_nameable gates on
-                        // REACHABLE_PATHS, same as ufcs_trait_path_with_args does.
-                        if s.is_empty() || !type_is_nameable(&s) {
-                            None
-                        } else {
-                            Some(s)
-                        }
-                    } else {
-                        None // skip lifetime args
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+        .and_then(|a| a.as_array());
+    for arg in arg_nodes.into_iter().flatten() {
+        if let Some(t) = arg.get("type") {
+            // Rendering alone is NOT sufficient — pub(crate) types render
+            // to a bare last segment; type_is_nameable gates on
+            // REACHABLE_PATHS, same as ufcs_trait_path_with_args does.
+            args.push(rustdoc_type_to_rust_str(t).filter(|s| type_is_nameable(s))?);
+        } else if arg.get("lifetime").is_none() {
+            return None;
+        }
+    }
     if args.is_empty() {
         Some(base)
     } else {
@@ -12497,13 +12542,12 @@ fn monomorphize_concrete_impl_params(
         let via_all_fields = concrete_id
             .as_ref()
             .is_some_and(|id| concrete_type_all_fields_send(id));
-        if via_send_supertrait || via_explicit_impl || via_all_fields {
-            let rendered = rustdoc_type_to_rust_str(&concrete);
-            if !rendered.is_empty() {
-                PROVABLY_SEND_OPAQUE_NAMES.with(|c| {
-                    c.borrow_mut().insert(rendered);
-                });
-            }
+        if (via_send_supertrait || via_explicit_impl || via_all_fields)
+            && let Some(rendered) = rustdoc_type_to_rust_str(&concrete)
+        {
+            PROVABLY_SEND_OPAQUE_NAMES.with(|c| {
+                c.borrow_mut().insert(rendered);
+            });
         }
         // else: leave it unrecorded — the async Send gate drops it (conservative).
     }
@@ -12618,13 +12662,10 @@ fn register_self_mono_send(trait_key: &str, concrete: &serde_json::Value) {
     let send_ok = EXPLICIT_SEND_TYPE_IDS.with(|s| s.borrow().contains(&id_str))
         || ALL_FIELDS_SEND_TYPE_IDS.with(|s| s.borrow().contains(&id_str))
         || SYNTHETIC_SEND_TYPE_IDS.with(|s| s.borrow().contains(&id_str));
-    if send_ok {
-        let rendered = rustdoc_type_to_rust_str(concrete);
-        if !rendered.is_empty() {
-            PROVABLY_SEND_OPAQUE_NAMES.with(|c| {
-                c.borrow_mut().insert(rendered);
-            });
-        }
+    if send_ok && let Some(rendered) = rustdoc_type_to_rust_str(concrete) {
+        PROVABLY_SEND_OPAQUE_NAMES.with(|c| {
+            c.borrow_mut().insert(rendered);
+        });
     }
 }
 
@@ -13315,6 +13356,11 @@ fn dyn_trait_object_present(val: &serde_json::Value, include_fn: bool) -> bool {
 mod tests {
     use super::*;
 
+    /// A type's Rust spelling, for a node the test builds renderable.
+    fn rust_str(val: &serde_json::Value) -> String {
+        rustdoc_type_to_rust_str(val).expect("the test node renders")
+    }
+
     fn ipe(val: &serde_json::Value) -> String {
         rustdoc_type_to_ipe(val, &HashMap::new())
     }
@@ -13578,10 +13624,7 @@ mod tests {
             );
         });
         let got = xc_unique_for_canon("crate_a::Wire").expect("unique impl resolves");
-        assert_eq!(
-            rustdoc_type_to_rust_str(&got.for_node),
-            "client_crate::RealClient"
-        );
+        assert_eq!(rust_str(&got.for_node), "client_crate::RealClient");
         assert!(got.send_ok);
         // 2 distinct impls → None (ambiguous → drop, the negative-ambiguity case).
         GLOBAL_XC_IMPLS.with(|c| {
@@ -14352,12 +14395,9 @@ mod tests {
         // borrowed `&str` renders `"&str"` — the exact pair argCall keys on.
         // (A regression here — e.g. owned String rendering `"&String"` — would
         // reintroduce the firestore `FirestoreDbOptions::new` E0308.)
-        assert_eq!(rustdoc_type_to_rust_str(&path("String")), "String");
-        assert_eq!(rustdoc_type_to_rust_str(&borrowed(prim("str"))), "&str");
-        assert_eq!(
-            rustdoc_type_to_rust_str(&borrowed(path("String"))),
-            "&String"
-        );
+        assert_eq!(rust_str(&path("String")), "String");
+        assert_eq!(rust_str(&borrowed(prim("str"))), "&str");
+        assert_eq!(rust_str(&borrowed(path("String"))), "&String");
         // Both collapse to the Ipe `String` surface (proving the Ipe type alone
         // CANNOT distinguish owned from borrowed — `rust_type` must).
         assert_eq!(ipe(&path("String")), "String");
@@ -18411,6 +18451,131 @@ mod tests {
         );
     }
 
+    /// A `fn(i64) -> i64` function-pointer rustdoc node — a kind the Rust
+    /// renderer has no spelling for.
+    fn fn_pointer_node() -> serde_json::Value {
+        serde_json::json!({ "function_pointer": {
+            "sig": { "inputs": [["_", prim("i64")]], "output": prim("i64"), "is_c_variadic": false },
+            "generic_params": [],
+            "header": { "is_const": false, "is_unsafe": false, "is_async": false, "abi": "Rust" }
+        } })
+    }
+
+    fn free_fn(inputs: serde_json::Value, output: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "header": { "is_async": false, "is_unsafe": false },
+            "generics": { "params": [], "where_predicates": [] },
+            "sig": { "inputs": inputs, "output": output }
+        })
+    }
+
+    #[test]
+    fn an_unrenderable_param_or_result_drops_the_binding() {
+        // The Ipê view of a function pointer reads `String`; binding it would
+        // leave the declared Rust type empty, which every downstream reader
+        // takes as "nameable" or falls back from to the Ipê view.
+        assert_eq!(rustdoc_type_to_rust_str(&fn_pointer_node()), None);
+        assert_eq!(
+            rustdoc_type_to_rust_str(&path_with_args("Vec", vec![fn_pointer_node()])),
+            None,
+            "a nested unrenderable kind must not render a partial `Vec<>`"
+        );
+        for (label, fd) in [
+            (
+                "param",
+                free_fn(serde_json::json!([["cb", fn_pointer_node()]]), prim("i64")),
+            ),
+            (
+                "nested param",
+                free_fn(
+                    serde_json::json!([["cbs", path_with_args("Vec", vec![fn_pointer_node()])]]),
+                    prim("i64"),
+                ),
+            ),
+            (
+                "result",
+                free_fn(serde_json::json!([["n", prim("i64")]]), fn_pointer_node()),
+            ),
+        ] {
+            let parsed = parse_fn_item("takes_callback", &fd, &HashMap::new(), None);
+            assert!(
+                parsed.is_none(),
+                "an unrenderable {label} must drop the binding, got {:?}",
+                parsed.map(|f| f
+                    .params
+                    .iter()
+                    .chain(&f.results)
+                    .map(|p| p.rust_type.clone())
+                    .collect::<Vec<_>>())
+            );
+        }
+        // Control: the same shape over a renderable type binds.
+        let bound = parse_fn_item(
+            "takes_int",
+            &free_fn(serde_json::json!([["n", prim("i64")]]), prim("i64")),
+            &HashMap::new(),
+            None,
+        )
+        .expect("a renderable signature binds");
+        assert_eq!(
+            bound.params.first().map(|p| p.rust_type.as_str()),
+            Some("i64")
+        );
+    }
+
+    #[test]
+    fn an_empty_rust_type_is_not_nameable() {
+        assert!(!type_is_nameable(""));
+        assert!(!type_is_nameable("  "));
+        assert!(type_is_nameable("i64"));
+    }
+
+    #[test]
+    fn a_self_path_with_an_unnameable_arg_is_dropped_not_shortened() {
+        REACHABLE_PATHS.with(|c| {
+            let mut paths = c.borrow_mut();
+            paths.clear();
+            paths.insert("4242".to_string(), "tm::Holder".to_string());
+        });
+        let holder = |args: serde_json::Value| {
+            serde_json::json!({ "resolved_path": {
+                "name": "Holder", "path": "Holder", "id": 4242,
+                "args": { "angle_bracketed": { "args": args, "bindings": [] } }
+            } })
+        };
+        // Control: a nameable arg and an elided lifetime keep the full path.
+        assert_eq!(
+            self_path_with_concrete_args(&holder(serde_json::json!([
+                { "lifetime": "'a" }, { "type": prim("i64") }
+            ]))),
+            Some("tm::Holder<i64>".to_string())
+        );
+        for (label, args) in [
+            (
+                "unrenderable",
+                serde_json::json!([{ "type": fn_pointer_node() }, { "type": prim("i64") }]),
+            ),
+            (
+                "unnameable",
+                serde_json::json!([
+                    { "type": { "resolved_path": { "name": "Private", "id": 9999, "args": null } } },
+                    { "type": prim("i64") }
+                ]),
+            ),
+            (
+                "const",
+                serde_json::json!([{ "const": { "expr": "4", "value": "4" } }, { "type": prim("i64") }]),
+            ),
+        ] {
+            let got = self_path_with_concrete_args(&holder(args));
+            assert_eq!(
+                got, None,
+                "an {label} arg must drop the path, not shorten it"
+            );
+        }
+        REACHABLE_PATHS.with(|c| c.borrow_mut().clear());
+    }
+
     #[test]
     fn dyn_ref_param_drops() {
         // fn takes_ref(&self, x: &dyn SomeTrait)
@@ -19978,10 +20143,7 @@ mod tests {
 
     #[test]
     fn serde_value_node_to_rust_str_is_serde_json_value() {
-        assert_eq!(
-            rustdoc_type_to_rust_str(&serde_json_value_node()),
-            "serde_json::Value"
-        );
+        assert_eq!(rust_str(&serde_json_value_node()), "serde_json::Value");
     }
 
     // ── R1/R2/R3 regression tests (#48) ──────────────────────────────────────
@@ -20448,15 +20610,14 @@ mod tests {
 
         // DbResult<Db>  →  Result<Db, DbError> (rust)  /  Result DbError Db (ipe)
         let use_site = alias_use(vec![path("Db")]);
-        assert_eq!(rustdoc_type_to_rust_str(&use_site), "Result<Db, DbError>");
+        assert_eq!(rust_str(&use_site), "Result<Db, DbError>");
         assert_eq!(ipe(&use_site), "Result DbError Db");
     }
 
     #[test]
-    fn wall5_result_alias_inner_box_dyn_survives_for_downstream_drop() {
-        // The see-through expands the OUTER Result; the inner Box<dyn …> must be
-        // rendered intact so the (separate) async-Send / nameability gate drops it.
-        // We assert the rendered rust string carries the Box<dyn …> verbatim.
+    fn wall5_result_alias_inner_box_dyn_is_unrenderable() {
+        // The see-through expands the OUTER Result; the inner Box<dyn …> has no
+        // Rust spelling, so the render fails closed for the whole type.
         let body = rp_with_id("Result", 100, vec![generic_node("T"), path("DbError")]);
         install_generic_alias(generic_alias_item("DbResult", &["T"], body));
 
@@ -20469,16 +20630,10 @@ mod tests {
             }
         });
         let use_site = alias_use(vec![boxed_dyn]);
-        let rust = rustdoc_type_to_rust_str(&use_site);
-        assert!(
-            rust.starts_with("Result<"),
-            "outer Result must expand: {rust}"
-        );
-        // The inner stays a Box (the downstream gate, not the see-through, drops it).
-        assert!(
-            rust.contains("Box"),
-            "inner Box must survive expansion: {rust}"
-        );
+        // The inner `dyn` has no Rust spelling here, so the whole expanded type
+        // is unrenderable — never a partial `Result<Box<>, DbError>` a
+        // string-level gate could mistake for nameable.
+        assert_eq!(rustdoc_type_to_rust_str(&use_site), None);
     }
 
     /// [#66] A CYCLIC crate-local alias (`type DbResult<T> = Result<DbResult<T>, E>`)
@@ -20509,14 +20664,14 @@ mod tests {
         // Not yet in the proven-public set → falls to the bare segment (dropped
         // downstream, the pre-fix behaviour).
         GLOBAL_XC_PUBLIC_PATHS.with(|c| c.borrow_mut().clear());
-        assert_eq!(rustdoc_type_to_rust_str(&node), "Customer");
+        assert_eq!(rust_str(&node), "Customer");
         // A SIBLING member crate's reachable walk proved it public → the renderer
         // keeps the crate-qualified path, so the Output is nameable and `send`
         // binds.
         GLOBAL_XC_PUBLIC_PATHS.with(|c| {
             c.borrow_mut().insert("stripe_shared::Customer".to_string());
         });
-        assert_eq!(rustdoc_type_to_rust_str(&node), "stripe_shared::Customer");
+        assert_eq!(rust_str(&node), "stripe_shared::Customer");
         GLOBAL_XC_PUBLIC_PATHS.with(|c| c.borrow_mut().clear());
         EXTERNAL_TYPE_PATH_BY_ID.with(|c| c.borrow_mut().clear());
         EXTERNAL_DEFPATH_BY_ID.with(|c| c.borrow_mut().clear());
@@ -20539,7 +20694,7 @@ mod tests {
         let node = serde_json::json!({
             "resolved_path": { "name": "Secret", "path": "Secret", "id": 778, "args": null }
         });
-        assert_eq!(rustdoc_type_to_rust_str(&node), "Secret");
+        assert_eq!(rust_str(&node), "Secret");
         EXTERNAL_TYPE_PATH_BY_ID.with(|c| c.borrow_mut().clear());
         EXTERNAL_DEFPATH_BY_ID.with(|c| c.borrow_mut().clear());
     }
@@ -20571,7 +20726,7 @@ mod tests {
             "resolved_path": { "name": "Customer", "path": "Customer", "id": 555, "args": null }
         });
         assert_eq!(
-            rustdoc_type_to_rust_str(&node),
+            rust_str(&node),
             "stripe_shared::Customer",
             "the render path must qualify a sibling-defined re-exported Output via identity"
         );
@@ -20587,7 +20742,7 @@ mod tests {
                 .insert("b::Customer".to_string());
         });
         assert_eq!(
-            rustdoc_type_to_rust_str(&node),
+            rust_str(&node),
             "Customer",
             "a real collision stays bare (fail-closed), never a wrong-type pick"
         );
@@ -20603,7 +20758,7 @@ mod tests {
 
         let use_site = alias_use(vec![path("Db")]);
         // Both renderers must return (no infinite recursion) and stay bounded.
-        let rust = rustdoc_type_to_rust_str(&use_site);
+        let rust = rust_str(&use_site);
         let s = ipe(&use_site);
         assert!(
             rust.starts_with("Result<"),
@@ -20634,7 +20789,7 @@ mod tests {
         install_generic_alias(generic_alias_item("Opt", &["T"], body));
         let use_site = alias_use(vec![path("Db")]);
         assert_eq!(ipe(&use_site), "Maybe Db");
-        assert_eq!(rustdoc_type_to_rust_str(&use_site), "Option<Db>");
+        assert_eq!(rust_str(&use_site), "Option<Db>");
     }
 
     #[test]
@@ -20655,7 +20810,7 @@ mod tests {
         GENERIC_ALIAS_MAP.with(|c| *c.borrow_mut() = map);
         // The use site falls through to opaque rendering: the bare alias name.
         let use_site = alias_use(vec![path("Db")]);
-        assert_eq!(rustdoc_type_to_rust_str(&use_site), "DbResult<Db>");
+        assert_eq!(rust_str(&use_site), "DbResult<Db>");
     }
 
     #[test]
@@ -20687,7 +20842,7 @@ mod tests {
             "arity mismatch must yield None (fail closed)"
         );
         // And the rendered string stays the opaque alias (no half-substitution).
-        assert_eq!(rustdoc_type_to_rust_str(&use_site), "DbResult<Db>");
+        assert_eq!(rust_str(&use_site), "DbResult<Db>");
     }
 
     #[test]
@@ -20699,7 +20854,7 @@ mod tests {
         let body = rp_with_id("Result", 100, vec![vec_t, path("DbError")]);
         install_generic_alias(generic_alias_item("DbResult", &["T"], body));
         let use_site = alias_use(vec![path("Db")]);
-        let rust = rustdoc_type_to_rust_str(&use_site);
+        let rust = rust_str(&use_site);
         assert_eq!(rust, "Result<Vec<Db>, DbError>");
         assert!(
             !rust.contains('T') || rust.contains("DbError"),
@@ -20716,9 +20871,9 @@ mod tests {
         install_generic_alias(generic_alias_item("DbResult", &["T"], body));
         let use_site = alias_use(vec![generic_node("Self")]);
         // Rendered with Self intact (subst_self maps it to the receiver downstream).
-        assert_eq!(rustdoc_type_to_rust_str(&use_site), "Result<Self, DbError>");
+        assert_eq!(rust_str(&use_site), "Result<Self, DbError>");
         assert_eq!(
-            subst_self(&rustdoc_type_to_rust_str(&use_site), "Db"),
+            subst_self(&rust_str(&use_site), "Db"),
             "Result<Db, DbError>"
         );
     }
@@ -21945,7 +22100,7 @@ mod tests {
     #[test]
     fn const_arg_in_resolved_path_renders_un_nameable() {
         let val = resolved_path_with_const_arg("::arrayvec::ArrayString");
-        let rendered = rustdoc_type_to_rust_str(&val);
+        let rendered = rust_str(&val);
         assert!(
             rendered.contains("ConstGenericArg"),
             "const arg must poison the rendered type: got {rendered:?}"
@@ -21963,7 +22118,7 @@ mod tests {
         // Use a path that doesn't need id-based resolution so REACHABLE_PATHS
         // is not consulted — raw_name fallback renders the last segment.
         let val = resolved_path_with_type_arg("Option", "i64");
-        let rendered = rustdoc_type_to_rust_str(&val);
+        let rendered = rust_str(&val);
         // The primitive `i64` is lowercase — type_is_nameable accepts it.
         // The outer `Option` is in ALWAYS_NAMEABLE.
         assert!(
