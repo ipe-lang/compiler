@@ -5641,34 +5641,35 @@ mod handlers {
             if !st.store.holds(&sid, &entry) {
                 return SessionLost.into_response();
             }
+            // Bind this session's `Ipe.Ffi.Js` outbound port sink to THIS SSE
+            // connection: every `js_send` whose origin is this sid is forwarded to
+            // the browser as an `event: port` frame over the same stream that
+            // carries DOM patches (mirroring how the custom-element served-widget
+            // transport delivers per-session). The sink is keyed by sid in the port
+            // registry, so a frame can only ever reach the session that produced it
+            // — never another session's stream. `try_send` is non-blocking (this
+            // sink runs on the synchronous Cmd-dispatch path): a full SSE buffer
+            // drops the one frame rather than blocking the dispatch loop, the same
+            // fire-and-forget contract the port carries client-side. A sid whose
+            // life no longer holds port endpoints is a lost session, refused
+            // before the stream is attached. The sink binds only while the store
+            // holds this session, under the lock an eviction takes.
+            #[cfg(all(feature = "json", feature = "tokio"))]
+            if let Some(port_sid) = crate::js_port::SessionId::parse(&sid) {
+                let port_tx = tx.clone();
+                let bound = crate::js_port::register_out_sink_for(
+                    &port_sid,
+                    std::sync::Arc::new(move |encoded: &str| {
+                        let _ = port_tx.try_send(SsePatch(sse::frame("port", encoded)));
+                    }),
+                );
+                if bound.is_err() {
+                    return SessionLost.into_response();
+                }
+            }
             e.sse_tx = Some(tx.clone());
             e.liveness.closer.subscribe()
         };
-
-        // Bind this session's `Ipe.Ffi.Js` outbound port sink to THIS SSE
-        // connection: every `js_send` whose origin is this sid is forwarded to
-        // the browser as an `event: port` frame over the same stream that
-        // carries DOM patches (mirroring how the custom-element served-widget
-        // transport delivers per-session). The sink is keyed by sid in the port
-        // registry, so a frame can only ever reach the session that produced it
-        // — never another session's stream. `try_send` is non-blocking (this
-        // sink runs on the synchronous Cmd-dispatch path): a full SSE buffer
-        // drops the one frame rather than blocking the dispatch loop, the same
-        // fire-and-forget contract the port carries client-side. A sid whose
-        // life no longer holds port endpoints is a lost session.
-        #[cfg(all(feature = "json", feature = "tokio"))]
-        if let Some(port_sid) = crate::js_port::SessionId::parse(&sid) {
-            let port_tx = tx.clone();
-            let bound = crate::js_port::register_out_sink_for(
-                &port_sid,
-                std::sync::Arc::new(move |encoded: &str| {
-                    let _ = port_tx.try_send(SsePatch(sse::frame("port", encoded)));
-                }),
-            );
-            if bound.is_err() {
-                return SessionLost.into_response();
-            }
-        }
 
         // Metrics (ipe_web_sse_connections_total /
         // ipe_web_sessions_active). Count the connection and mark the session
@@ -14907,6 +14908,50 @@ mod emitted_router_behavior_tests {
             );
         });
         crate::system::locked_remove_var("IPE_CSRF");
+    }
+
+    /// An SSE for a held session whose port life holds no endpoints is lost
+    /// before it attaches: the session keeps no stream sender, so it stays
+    /// evictable as an unconnected session.
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a fixed request always builds
+    fn an_sse_without_port_endpoints_is_lost_before_it_attaches() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, _body) = get(make_router(store.clone()), "/", None).await;
+            assert!(!sid.is_empty(), "the page mints a session");
+            let ended = crate::js_port::lock_sessions().remove(&sid);
+            assert!(ended.is_some(), "the publication opened the life's port");
+            drop(ended);
+            let resp = make_router(store.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/_ipe/sse?path=%2F")
+                        .header(header::ACCEPT, "text/event-stream")
+                        .header(
+                            header::COOKIE,
+                            format!(
+                                "{}={sid}",
+                                cookie_name_for(&crate::encoding::MountBase::root())
+                            ),
+                        )
+                        .body(Body::empty())
+                        .expect("build SSE GET"),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            assert!(
+                session_of(&store, &sid)
+                    .await
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .sse_tx
+                    .is_none(),
+                "a lost SSE leaves no stream sender on the session"
+            );
+        });
     }
 
     /// A commit that passes the session's byte ceiling closes the session: its

@@ -2031,27 +2031,82 @@ mod tests {
             );
         }
         // The one counter is the internal life generation, which never leaves
-        // the registry: every atomic counter sits inside `impl PortLife`.
-        let life_start = source.find(concat!("impl Port", "Life {"));
-        assert!(life_start.is_some(), "the life generation is implemented");
-        let Some(life_start) = life_start else {
-            return;
-        };
-        let life_len = source
-            .get(life_start..)
-            .and_then(|rest| rest.find("\n    }\n"))
-            .unwrap_or(0);
-        let counters: Vec<usize> = source
-            .match_indices(concat!("Atomic", "U64"))
-            .map(|(at, _)| at)
-            .collect();
-        assert!(
-            !counters.is_empty()
-                && counters
-                    .iter()
-                    .all(|at| (life_start..life_start + life_len).contains(at)),
-            "an atomic counter outside the life generation: a port id must be minted"
+        // the registry: its `impl` holds one fn, and every integer counter of
+        // any width sits inside it.
+        let life = life_block(source);
+        assert!(!life.is_empty(), "the life generation is implemented");
+        assert_eq!(
+            source
+                .get(life)
+                .map(|block| block.matches(concat!("fn", " ")).count()),
+            Some(1),
+            "the life generation holds its one counter fn only"
         );
+        assert_eq!(
+            counters_outside_life(source),
+            Vec::<usize>::new(),
+            "an integer counter outside the life generation: a port id must be minted"
+        );
+        // The scan sees every counter width, not only the one the life uses.
+        for planted in [
+            concat!("static N: Atomic", "Usize"),
+            concat!("static N: Atomic", "U32"),
+            concat!("static N: Atomic", "I64"),
+            concat!("n: Cell<", "usize>"),
+            concat!("n: Cell<", "i64>"),
+        ] {
+            let probe = format!(
+                "{planted}\n{}\n        fn next() {{}}\n    }}\n",
+                concat!("impl Port", "Life {")
+            );
+            assert!(
+                !counters_outside_life(&probe).is_empty(),
+                "the counter scan misses `{planted}`"
+            );
+        }
+    }
+
+    /// The production part of `source`: everything before this test module.
+    fn production_source(source: &str) -> &str {
+        source
+            .find(concat!(
+                "#[cfg(all(test, not(target_arch = \"wasm32\")))]\nmod ",
+                "tests"
+            ))
+            .and_then(|end| source.get(..end))
+            .unwrap_or(source)
+    }
+
+    /// The byte range of the life generation's `impl` block in `source`; empty when absent.
+    fn life_block(source: &str) -> std::ops::Range<usize> {
+        let source = production_source(source);
+        source
+            .find(concat!("impl Port", "Life {"))
+            .map_or(0..0, |start| {
+                let len = source
+                    .get(start..)
+                    .and_then(|rest| rest.find("\n    }\n"))
+                    .unwrap_or(0);
+                start..start.saturating_add(len)
+            })
+    }
+
+    /// Offsets of every integer counter primitive (an atomic or a `Cell` of
+    /// any integer width) in the production part of `source` that lies
+    /// outside the life generation's `impl` block.
+    fn counters_outside_life(source: &str) -> Vec<usize> {
+        let life = life_block(source);
+        let production = production_source(source);
+        [
+            concat!("Atomic", "U"),
+            concat!("Atomic", "I"),
+            concat!("Cell<", "u"),
+            concat!("Cell<", "i"),
+        ]
+        .into_iter()
+        .flat_map(|needle| production.match_indices(needle).map(|(at, _)| at))
+        .filter(|at| !life.contains(at))
+        .collect()
     }
 
     #[test]
@@ -2123,14 +2178,49 @@ mod tests {
         for needle in [
             concat!("impl Default for ", "SessionPorts"),
             concat!(".or_insert", "_with("),
-            concat!("lock_sessions().", "entry("),
-            concat!("g.", "entry("),
         ] {
             assert!(
                 !source.contains(needle),
                 "no reach may create a sid's entry: found `{needle}`"
             );
         }
+        // Every `entry` reach names its receiver, and the admitted ones are
+        // the inner tables of an entry already held (a session's waiters and
+        // streams, the wasm realm's): a sessions-map entry under any guard
+        // name is refused.
+        let admitted = [
+            "ports.pending",
+            "ports.streams",
+            "sessions.streams",
+            "p.borrow_mut()",
+        ];
+        let receivers = entry_receivers(&source);
+        assert!(
+            !receivers.is_empty() && receivers.iter().all(|r| admitted.contains(&r.as_str())),
+            "no reach may create a sid's entry: `entry` on {receivers:?}"
+        );
+        for planted in ["g", "sessions", "lock_sessions()", "f(g"] {
+            let probe = format!("let _ = {planted}{}sid);\n", concat!(".", "entry("));
+            assert_eq!(
+                entry_receivers(&probe),
+                vec![planted.to_owned()],
+                "the receiver read sees `{planted}`"
+            );
+        }
+    }
+
+    /// The receiver expression before each `.entry(` call in `source`.
+    fn entry_receivers(source: &str) -> Vec<String> {
+        source
+            .match_indices(concat!(".", "entry("))
+            .map(|(at, _)| {
+                let before = source.get(..at).unwrap_or_default();
+                let start = before
+                    .rfind(|c: char| c.is_whitespace() || c == '{' || c == ';')
+                    .map_or(0, |i| i.saturating_add(1));
+                before.get(start..).unwrap_or_default().to_owned()
+            })
+            .collect()
     }
 
     #[test]
