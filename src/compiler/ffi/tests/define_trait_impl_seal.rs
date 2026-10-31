@@ -251,6 +251,7 @@ pub fn ipe_error_from_foreign<T: std::fmt::Debug>(_e: T) -> IpeError {{ IpeError
 
 {label}
 
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn main() {{
     let sprite = match sprite_wrap_spawn(3) {{
         IpeResult::Ok(s) => s,

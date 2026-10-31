@@ -468,6 +468,7 @@ fn routed_web_app_with_on_navigate_emits_update_once() {
 /// Gated on `IPE_E2E=1` (needs a working cargo) AND the wasm target.
 #[test]
 #[allow(clippy::expect_used)] // test setup: a failed emit IS the failure
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn routed_web_app_compiles_for_wasm() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
@@ -818,6 +819,7 @@ fn server_only_kernel_behind_an_unreached_helper_builds_and_is_not_emitted()
 /// false red.
 #[test]
 #[allow(clippy::expect_used)] // test setup: a failed emit/cargo-spawn IS the failure
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn hydrate_glue_type_name_matches_emitted_struct_and_compiles_for_wasm() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;

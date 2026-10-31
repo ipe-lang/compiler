@@ -149,6 +149,7 @@ mod ffi {{
     {ffi_body}
 }}
 
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn main() {{
     match ffi::geom_extent(()) {{
         IpeResult::Ok((n, s, b)) => {{

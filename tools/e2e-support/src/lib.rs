@@ -706,9 +706,11 @@ pub fn build_and_run_rust(golden_name: &str, emitted_dir: &Path) -> Result<RunRe
     build_and_run_rust_with_env(golden_name, emitted_dir, &[])
 }
 
-/// [`build_and_run_rust`], with `envs` additionally set on the `cargo build`
-/// invocation (never on the run of the already-built binary — a build-time
-/// flag like `RUSTFLAGS` has nothing to say to the finished executable).
+/// [`build_and_run_rust`], with `envs` also set on the `cargo build` step.
+///
+/// The variables never reach the run of the already-built binary: a
+/// build-time flag like `RUSTFLAGS` has nothing to say to the finished
+/// executable.
 ///
 /// # Errors
 /// Same as [`build_and_run_rust`].

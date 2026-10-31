@@ -118,6 +118,7 @@ fn postgres_driver_selects_postgres_config_template() {
 /// to the `[database]` driver hardcode `SqlitePool` — source-text greps
 /// alone cannot catch a missing Cargo feature dependency.
 #[test]
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn postgres_driver_project_cargo_builds() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;

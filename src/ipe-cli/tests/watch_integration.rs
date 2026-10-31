@@ -612,6 +612,7 @@ fn watch_proxies_a_hardcoded_port_server_on_an_internal_port() -> Result<(), Box
 /// port the supervisor chose through the relocation var, which outranks both.
 #[cfg(target_os = "linux")]
 #[test]
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn operator_port_vars_never_relocate_a_watched_child() -> Result<(), BoxError> {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         eprintln!("skipping (set IPE_E2E=1 to run)");

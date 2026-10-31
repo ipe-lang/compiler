@@ -93,6 +93,7 @@ fn run_no_arg_empty_dir_is_refused_as_no_manifest() {
 ///
 /// Gated on `IPE_E2E=1` — requires a working cargo and `IPE_RUNTIME_DIR`.
 #[test]
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn build_no_arg_in_project_dir_succeeds() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
@@ -145,6 +146,7 @@ fn build_no_arg_in_project_dir_succeeds() {
 ///
 /// Gated on `IPE_E2E=1`.
 #[test]
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn build_flag_first_no_entry_resolves_default() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;

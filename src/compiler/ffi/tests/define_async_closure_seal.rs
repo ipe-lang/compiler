@@ -214,6 +214,7 @@ async fn crate_awaits(
 
 {result_fn}
 
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn main() {{
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {{

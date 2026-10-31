@@ -120,7 +120,7 @@ pub fn io_bug(path: &Path, e: &std::io::Error) -> Diagnostic {
 /// `CompilerBug` diagnostic, so a caller can propagate it with `?` instead of
 /// `.unwrap()`/`.expect()`/`panic!`.
 #[allow(dead_code)] // only the SEAL test binaries that convert a build/run Err use this
-pub fn build_bug(e: String) -> Diagnostic {
+pub const fn build_bug(e: String) -> Diagnostic {
     Diagnostic::CompilerBug {
         where_: "seal e2e build",
         detail: e,

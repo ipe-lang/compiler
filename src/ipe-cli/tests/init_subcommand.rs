@@ -214,6 +214,7 @@ fn init_lib_scaffold_is_lint_clean() {
 /// project of a single shape (or the `--lib` library), asserting THE SEAL —
 /// `ipe`-accepts must imply `cargo`-builds. `init_args` are the `ipe init` args
 /// after the target; `entry_rel` is the module entry the emitter starts from.
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn assert_scaffold_builds(
     runtime_dir: &std::path::Path,
     tag: &str,

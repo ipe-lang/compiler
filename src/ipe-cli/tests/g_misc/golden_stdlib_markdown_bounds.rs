@@ -494,13 +494,15 @@ fn emit_bounds_program(slug: &str) -> Option<PathBuf> {
     Some(out)
 }
 
-/// The built bounds binary for `slug`, or a panic naming which stage (emit or
-/// build) failed — the caller has already gated the unit tier.
+/// The built bounds binary for `slug`.
+///
+/// A failure names the stage (emit or build) that failed; the caller has
+/// already gated the unit tier.
+#[allow(clippy::expect_used)] // a bounds program that fails to emit or build fails the test
 fn bounds_binary(slug: &str) -> e2e_support::SharedBuild {
-    let dir = emit_bounds_program(slug)
-        .unwrap_or_else(|| panic!("the bounds program must emit for `{slug}`"));
+    let dir = emit_bounds_program(slug).expect("the bounds program must emit");
     build_emitted_binary_checked(&format!("markdown_bounds_{slug}"), &dir)
-        .unwrap_or_else(|| panic!("the bounds program must build for `{slug}`"))
+        .expect("the bounds program must build")
 }
 
 fn run_case(exe: &Path, case: Case, n: usize) -> TimedRunOutcome {

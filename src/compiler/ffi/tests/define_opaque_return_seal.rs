@@ -185,6 +185,7 @@ fn crate_folds_panicking(
     }}
 }}
 
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn main() {{
     // The Ipê function value: on the app side, exactly a
     // `Box<dyn Fn(Counter) -> Result<Counter, IpeError> + Send + Sync + 'static>`.

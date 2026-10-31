@@ -248,6 +248,7 @@ pub fn ipe_error_from_foreign<T: std::fmt::Debug>(_e: T) -> IpeError {{ IpeError
 
 {describe}
 
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn main() {{
     // The constructor builds a real wrapper-crate value; the reader consumes it.
     let engine = match engine_wrap_make(7) {{

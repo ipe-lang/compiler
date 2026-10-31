@@ -198,6 +198,7 @@ const SERVER_SHAPE_SOURCE: &str = "module Main exposing (main)\n\
 /// THE SEAL: a sealed-floor `Direct` program emits a project that
 /// `cargo build --target wasm32-wasip1` accepts. `ipe`-accepts ⇒ cargo-builds.
 #[test]
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn wasi_direct_floor_program_cargo_builds_for_wasip1() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
@@ -283,6 +284,7 @@ fn wasi_http_shape_is_refused_fail_closed() {
 /// wasip1 cross-compile — not the emit helper directly. `ipe`-accepts (exit 0)
 /// ⇒ cargo-builds. Gated on `IPE_E2E=1`.
 #[test]
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn ipe_build_target_wasi_user_path_cargo_builds() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
@@ -378,6 +380,7 @@ fn ipe_build_target_wasi_refuses_non_viable_shape_fail_closed() {
 /// stays fast + offline) AND on the `wasi_run` feature (the embedded engine).
 #[cfg(feature = "wasi_run")]
 #[test]
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn ipe_run_target_wasi_executes_under_wasmtime() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;

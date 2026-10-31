@@ -297,9 +297,11 @@ pub fn set_target_dir_env(cmd: &mut Command, dir: &Path) {
     cmd.env(TARGET_DIR_VAR, dir);
 }
 
-/// Removes `cmd`'s target-directory variable, so a child resolves its own
-/// default (e.g. `ipe`'s per-invocation scratch build directory under its
-/// cache base) instead of inheriting this process's ambient `CARGO_TARGET_DIR`.
+/// Removes `cmd`'s target-directory variable.
+///
+/// The child then resolves its own default (e.g. `ipe`'s per-invocation
+/// scratch build directory under its cache base) instead of inheriting this
+/// process's ambient `CARGO_TARGET_DIR`.
 pub fn clear_target_dir_env(cmd: &mut Command) {
     cmd.env_remove(TARGET_DIR_VAR);
 }

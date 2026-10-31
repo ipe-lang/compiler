@@ -309,8 +309,8 @@ fn concat_pieces(tokens: TokenStream) -> Option<String> {
     let trees: Vec<TokenTree> = tokens.into_iter().collect();
     let mut out = String::new();
     let mut i = 0;
-    while i < trees.len() {
-        match &trees[i] {
+    while let Some(tree) = trees.get(i) {
+        match tree {
             TokenTree::Literal(l) => {
                 out.push_str(&str_value(l)?);
                 i += 1;
@@ -608,7 +608,7 @@ fn a_path_module_target_is_reached_and_scanned() {
         })
         .expect("the root fixture declares a `#[path]` module");
     let text = std::fs::read_to_string(dir.join(&target))
-        .unwrap_or_else(|e| panic!("read the `#[path]` target `{target}`: {e}"));
+        .expect("read the `#[path]` target the root fixture names");
     assert!(rules(&scan_source(&target, &text)).contains(&Rule::CargoLiteral));
 }
 

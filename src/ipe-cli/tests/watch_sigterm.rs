@@ -357,6 +357,7 @@ fn wait_for_exit(
 /// child is gone (killed and reaped), never an orphan holding the port.
 #[cfg(target_os = "linux")]
 #[test]
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn watch_shuts_down_the_supervised_child_on_sigterm_to_only_the_ipe_process() -> Result<(), BoxError>
 {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
@@ -497,6 +498,7 @@ fn spawn_never_installs_a_sigterm_forwarder() -> Result<(), BoxError> {
 /// termination owner's own unit test.
 #[cfg(target_os = "linux")]
 #[test]
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn double_sigterm_during_teardown_ends_the_process_and_every_transfer_group() -> Result<(), BoxError>
 {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
