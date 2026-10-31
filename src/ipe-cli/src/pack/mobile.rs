@@ -5447,6 +5447,20 @@ mod tests {
         assert!(steps.contains(level.as_str()), "{steps}");
     }
 
+    /// The orientation advisory level the shell's `targetSdk` stays under is
+    /// the level the `Ipe.Package` orientation contract names, so neither can
+    /// move without the other.
+    #[test]
+    fn orientation_advisory_level_is_the_one_the_package_doc_names() {
+        let doc = std::fs::read_to_string(repo_root_for_tests().join("src/stdlib/Ipe/Package.ipe"))
+            .expect("read src/stdlib/Ipe/Package.ipe");
+        let named = format!("targeting API {ANDROID_ORIENTATION_ADVISORY_FROM} or later");
+        assert!(
+            doc.contains(named.as_str()),
+            "`Ipe.Package` must name the orientation advisory as {named:?}"
+        );
+    }
+
     // ── Icon ──────────────────────────────────────────────────────────────────
 
     #[test]
