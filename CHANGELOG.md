@@ -10,6 +10,33 @@ Entries below the header are maintained by
 section is generated from Conventional Commit messages and prepended when the
 standing release pull request is merged.
 
+## [0.7.3](https://github.com/ipe-lang/compiler/compare/ipe-v0.7.2...ipe-v0.7.3) (2026-10-31)
+
+
+### Features
+
+* **stdlib:** add Ipe.Remote with its kernels refused until they are backed ([#3895](https://github.com/ipe-lang/compiler/issues/3895)) ([b58665f](https://github.com/ipe-lang/compiler/commit/b58665f37fd9a7133c399745db9732228e5b7b74))
+
+
+### Bug Fixes
+
+* **canon:** a qualified type resolves only through its dependency's export table ([#3917](https://github.com/ipe-lang/compiler/issues/3917)) ([85f5f5d](https://github.com/ipe-lang/compiler/commit/85f5f5da263082f6af1cfbb3557e80a372e4acaf))
+* **canon:** every builtin type spelling binds through its row witness ([#3910](https://github.com/ipe-lang/compiler/issues/3910)) ([4ce2be4](https://github.com/ipe-lang/compiler/commit/4ce2be4ea8072761578dfa9bfa653dbf64f04b57))
+* **canon:** resolve stdlib aliases through their module and add ErrorKind.UpdateRequired ([#3905](https://github.com/ipe-lang/compiler/issues/3905)) ([186dd01](https://github.com/ipe-lang/compiler/commit/186dd01434113cc4d0227419710f8f37ef40cc70))
+* **cli:** ipe.lock reads through one closed grammar ([#3912](https://github.com/ipe-lang/compiler/issues/3912)) ([9ea9289](https://github.com/ipe-lang/compiler/commit/9ea92899f9fb28c259fbacdfdb96a3595b2f71eb))
+* **cli:** make every coverage-matrix probe and the kernel-doc join typed and fallible ([#3909](https://github.com/ipe-lang/compiler/issues/3909)) ([ef9cbf9](https://github.com/ipe-lang/compiler/commit/ef9cbf9eeefda8e8e3969a29893561c7ae42e0b1))
+* **cli:** read index entries through one closed line grammar ([#3918](https://github.com/ipe-lang/compiler/issues/3918)) ([8bab366](https://github.com/ipe-lang/compiler/commit/8bab3663a3afe5cc9093000ef0c31c61ddd89e78))
+* **cli:** render the Android build steps from one catalog entry ([#3913](https://github.com/ipe-lang/compiler/issues/3913)) ([06da48b](https://github.com/ipe-lang/compiler/commit/06da48b5cdb16b1da2ddb1082579c76d35806421))
+* **diagnostics:** make every IPE-N0022 explain block truthful and checked ([#3927](https://github.com/ipe-lang/compiler/issues/3927)) ([b00984a](https://github.com/ipe-lang/compiler/commit/b00984a10672fe9166dddbda6a9b0a3f426a1441))
+* **ffi:** asserted-call carriers resolve to the inspected Rust identity, never a spelling or the Ipê view ([#3925](https://github.com/ipe-lang/compiler/issues/3925)) ([0218ef1](https://github.com/ipe-lang/compiler/commit/0218ef167995a381966cee64a8cc8f58e9fa4f05))
+* **pack:** mobile shells install under the declared bundle id and orientation ([#3906](https://github.com/ipe-lang/compiler/issues/3906)) ([b2bbd89](https://github.com/ipe-lang/compiler/commit/b2bbd891f96e24013eadc14ee4df8845b126d706))
+* **pack:** one source per Android level and one composer per bundle-id refusal ([#3923](https://github.com/ipe-lang/compiler/issues/3923)) ([7f86bdc](https://github.com/ipe-lang/compiler/commit/7f86bdc9fb88a6cab7e9b0899bac65c3d539ac14))
+* **runtime:** a browser port's endpoints live exactly as long as its session life's lease ([#3926](https://github.com/ipe-lang/compiler/issues/3926)) ([21da13b](https://github.com/ipe-lang/compiler/commit/21da13b6554e2d9460e9b00fc5b63f610d997166))
+* **runtime:** a port sink binds only into the session life its entry opened ([#3960](https://github.com/ipe-lang/compiler/issues/3960)) ([da9e0dd](https://github.com/ipe-lang/compiler/commit/da9e0ddf144ed7e7851067edab8d0a8a7fb9434e))
+* **runtime:** browser-port replies route only by an unguessable per-session token ([#3920](https://github.com/ipe-lang/compiler/issues/3920)) ([184cfef](https://github.com/ipe-lang/compiler/commit/184cfefd568d57b0c09530f844e783d04f58eb69))
+* **runtime:** first-party browser port frames are accepted only by their own capability ([#3902](https://github.com/ipe-lang/compiler/issues/3902)) ([c5e1990](https://github.com/ipe-lang/compiler/commit/c5e199092b5fbbda763b82d9db498d42a0ed6778))
+* **types:** the kernel type table yields one typed row per wired kernel ([#3916](https://github.com/ipe-lang/compiler/issues/3916)) ([c882063](https://github.com/ipe-lang/compiler/commit/c8820637f034b49ec92adeade85c42f478f7b0f8))
+
 ## [0.7.2](https://github.com/ipe-lang/compiler/compare/ipe-v0.7.1...ipe-v0.7.2) (2026-10-29)
 
 
