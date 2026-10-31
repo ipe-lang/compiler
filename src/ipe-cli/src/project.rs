@@ -406,9 +406,11 @@ const JAVA_RESERVED_WORDS: &[&str] = &[
     "null",
 ];
 
-/// The first label no bundle id may start with: `java` names the Java
-/// platform's own packages, in which the Android dexer and class loaders refuse
-/// an app's classes (the `R` class of the `namespace` among them).
+/// The first label no bundle id may start with.
+///
+/// `java` names the Java platform's own packages, in which the Android dexer
+/// and class loaders refuse an app's classes (the `R` class of the `namespace`
+/// among them).
 pub const JAVA_PLATFORM_LABEL: &str = "java";
 
 /// The example id every bundle-id refusal advises; a test proves it parses.
