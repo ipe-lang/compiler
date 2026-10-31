@@ -262,11 +262,6 @@ explain/IPE-N0021.md:31
 explain/IPE-N0021.md:37
 explain/IPE-N0021.md:47
 explain/IPE-N0021.md:7
-explain/IPE-N0022.md:18
-explain/IPE-N0022.md:23
-explain/IPE-N0022.md:33
-explain/IPE-N0022.md:39
-explain/IPE-N0022.md:7
 explain/IPE-N0023.md:13
 explain/IPE-N0023.md:21
 explain/IPE-N0023.md:26
