@@ -102,9 +102,6 @@ onKey key =
     else if key.kind == "char" && key.value == "q" then
         Quit
 
-    else if key.kind == "ctrl" && key.value == "c" then
-        Quit
-
     else
         NoOp
 

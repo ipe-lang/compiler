@@ -72,7 +72,31 @@ pub fn decode_key(buf: &[u8]) -> (TuiKey, usize) {
     }
 }
 
+/// Decode one escape sequence, ending it before any C0 control byte inside it.
+///
+/// A control byte is never part of an escape sequence (ECMA-48 executes it in
+/// place), so a sequence a control interrupts ends before it as an `other` key
+/// and the control decodes as its own key next. Without that, a Ctrl-C typed
+/// right after an unfinished sequence would be swallowed into it and never end
+/// the app.
 fn decode_escape(buf: &[u8]) -> (TuiKey, usize) {
+    let (key, consumed) = decode_escape_sequence(buf);
+    let control = buf
+        .get(1..consumed)
+        .and_then(|body| body.iter().position(|b| *b < 0x20));
+    match control {
+        Some(at) => {
+            let end = at + 1;
+            (
+                TuiKey::val("other", lossy(buf.get(..end).unwrap_or(buf))),
+                end,
+            )
+        }
+        None => (key, consumed),
+    }
+}
+
+fn decode_escape_sequence(buf: &[u8]) -> (TuiKey, usize) {
     if buf.len() == 1 {
         return (TuiKey::of("escape"), 1);
     }

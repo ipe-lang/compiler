@@ -60,10 +60,13 @@ static TUI_MOUSE: AtomicBool = AtomicBool::new(false);
 /// `Cmd.perform (System.exit n)` quit would leave the TTY in raw mode + the
 /// alternate screen (needing `reset`). Implements `tuiTeardown`. Never panics.
 fn tui_teardown() {
+    // The stdout lock is taken BEFORE the gate flips, so a `paint` on another
+    // thread either finishes its frame first or sees the session ended and
+    // writes nothing: no frame lands on the main screen after the restore.
+    let mut out = std::io::stdout().lock();
     if !TUI_RESTORE_ACTIVE.swap(false, Ordering::SeqCst) {
         return; // already restored, or never entered
     }
-    let mut out = std::io::stdout();
     if TUI_MOUSE.load(Ordering::SeqCst) {
         let _ = out.write_all(MOUSE_OFF.as_bytes());
     }
@@ -160,6 +163,21 @@ impl Drop for TuiGuard {
 }
 
 fn paint(frame: &str) {
+    let mut out = std::io::stdout().lock();
+    paint_to(&mut out, &TUI_RESTORE_ACTIVE, frame);
+}
+
+/// Write one frame to `out`, the stdout lock's holder, only while the session
+/// `active` gate is still set.
+///
+/// A `System.exit` effect runs `tui_teardown` on a worker thread while the loop
+/// may still be painting; the teardown takes the same lock before it clears
+/// the gate, so a frame painted after the restore (clearing the main screen and
+/// drawing on it) has no path.
+fn paint_to<W: Write>(out: &mut W, active: &AtomicBool, frame: &str) {
+    if !active.load(Ordering::SeqCst) {
+        return;
+    }
     // Clear and frame content are concatenated into one buffer so the terminal
     // emulator receives a single write: the prior content disappears and the new
     // frame appears in one step, never leaving a visible blank between them.
@@ -169,7 +187,6 @@ fn paint(frame: &str) {
     let mut buf = String::with_capacity(CLEAR_HOME.len() + frame.len());
     buf.push_str(CLEAR_HOME);
     buf.push_str(frame);
-    let mut out = std::io::stdout();
     let _ = out.write_all(buf.as_bytes());
     let _ = out.flush();
 }
@@ -2239,7 +2256,7 @@ mod tui_enter_error_tests {
 
 #[cfg(test)]
 mod key_reader_tests {
-    use super::{CliEvent, TuiKey, decode_key, read_keys_from};
+    use super::{AtomicBool, CliEvent, TuiKey, decode_key, paint_to, read_keys_from};
 
     /// The `(kind, value)` events one byte stream yields, in order, with
     /// `"interrupt"` / `"eof"` standing for the two terminal events.
@@ -2295,6 +2312,41 @@ mod key_reader_tests {
     #[test]
     fn a_stream_without_ctrl_c_ends_in_eof() {
         assert_eq!(read_events(b"q"), vec![ev("char", "q"), ev("eof", "")]);
+    }
+
+    // A Ctrl-C typed right after an unfinished escape sequence, read in the
+    // same chunk, still ends the reader: the control byte ends the sequence
+    // instead of being swallowed into it.
+    #[test]
+    fn ctrl_c_inside_an_unfinished_escape_sequence_still_interrupts() {
+        for input in [
+            &b"\x1b[\x03"[..],
+            b"\x1b[1;\x03A",
+            b"\x1b[2\x03~",
+            b"\x1b[<0;1\x03",
+            b"\x1bO\x03",
+        ] {
+            let events = read_events(input);
+            assert_eq!(
+                events.last(),
+                Some(&ev("interrupt", "")),
+                "{input:?} -> {events:?}"
+            );
+        }
+    }
+
+    // A frame painted after the session ended writes nothing, so a `System.exit`
+    // teardown on another thread is never followed by a frame on the main screen.
+    #[test]
+    fn a_paint_after_the_session_ends_writes_nothing() {
+        let ended = AtomicBool::new(false);
+        let mut out: Vec<u8> = Vec::new();
+        paint_to(&mut out, &ended, "frame");
+        assert!(out.is_empty(), "{out:?}");
+
+        let active = AtomicBool::new(true);
+        paint_to(&mut out, &active, "frame");
+        assert!(out.ends_with(b"frame"), "{out:?}");
     }
 
     #[test]
