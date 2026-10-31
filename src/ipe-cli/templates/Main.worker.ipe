@@ -1,7 +1,7 @@
 module Main exposing (main)
 
-import Ipe.String as String
 import Ipe.Io as Io
+import Ipe.String as String
 import Ipe.Task as Task
 import Ipe.Tea.Worker
 import Ipe.Tea.Worker.Cmd as Cmd
