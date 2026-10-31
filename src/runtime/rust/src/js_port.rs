@@ -281,7 +281,6 @@ fn entropy_refusal(call: &str) -> crate::error::IpeError {
 
 /// Where one inbound port frame goes, decided once from its reserved fields.
 #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-client"))]
-#[derive(Debug)]
 pub(crate) enum Inbound {
     /// A reply to the `js_request` waiter holding `token`.
     Reply { token: PortToken, payload: JsonVal },
