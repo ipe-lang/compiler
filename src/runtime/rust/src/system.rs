@@ -824,10 +824,6 @@ pub(crate) const SCRUB_TRUNCATED: &str = "\\…";
 /// most `max_bytes + SCRUB_TRUNCATED.len()` bytes, and an uncut result decodes
 /// to its input, so a hazard in a remote request path or an ingested record
 /// shows as a visible escape and two distinct inputs never record alike.
-#[cfg_attr(
-    not(feature = "web"),
-    allow(dead_code) // only the served request log and console ingest call it
-)]
 pub(crate) fn scrub_log_controls_capped(s: &str, max_bytes: usize) -> String {
     let mut out = String::with_capacity(s.len().min(max_bytes));
     for c in s.chars() {

@@ -1,6 +1,6 @@
 // Ipe.Io — line-oriented stdio. All effectful, so IpeTask-returning.
 use super::{
-    FromIpeError, FromLimitExceeded, IpeError, IpeResult, IpeTask, LimitRefusal, ok_res, str_err,
+    FromIpeError, FromLimitExceeded, IoFailure, IpeError, IpeResult, IpeTask, LimitRefusal, ok_res,
 };
 
 use std::io::{BufRead, Read, Write};
@@ -69,9 +69,10 @@ impl LineRefusal {
             Self::NotUtf8 => E::from_ipe_error(IpeError::invalid_input(format!(
                 "{operation}: the stdin line is not valid UTF-8"
             ))),
-            Self::Io(kind) => E::from_ipe_error(IpeError::io(format!(
-                "{operation}: reading stdin failed: {kind}"
-            ))),
+            Self::Io(kind) => E::from_ipe_error(IpeError::from_io_kind(
+                kind,
+                format!("{operation}: reading stdin failed: {kind}"),
+            )),
         }
     }
 }
@@ -318,7 +319,7 @@ pub fn io_read_secret<E: Send + FromLimitExceeded + FromIpeError + 'static>(
 
 /// `Io.writeStdout : String -> Task Error ()`. Writes verbatim (no newline).
 #[must_use]
-pub fn io_write_stdout<E: Send + From<String> + 'static>(s: String) -> IpeTask<E, ()> {
+pub fn io_write_stdout<E: Send + FromIpeError + 'static>(s: String) -> IpeTask<E, ()> {
     Box::pin(async move {
         let r = (|| {
             let mut out = std::io::stdout();
@@ -327,14 +328,14 @@ pub fn io_write_stdout<E: Send + From<String> + 'static>(s: String) -> IpeTask<E
         })();
         match r {
             Ok(()) => ok_res(()),
-            Err(e) => IpeResult::Err(str_err(&format!("{e}"))),
+            Err(e) => IpeResult::Err(IoFailure::without_path("write to stdout", &e).into_error()),
         }
     })
 }
 
 /// `Io.writeStderr : String -> Task Error ()`. Writes verbatim (no newline).
 #[must_use]
-pub fn io_write_stderr<E: Send + From<String> + 'static>(s: String) -> IpeTask<E, ()> {
+pub fn io_write_stderr<E: Send + FromIpeError + 'static>(s: String) -> IpeTask<E, ()> {
     Box::pin(async move {
         let r = (|| {
             let mut err = std::io::stderr();
@@ -343,7 +344,7 @@ pub fn io_write_stderr<E: Send + From<String> + 'static>(s: String) -> IpeTask<E
         })();
         match r {
             Ok(()) => ok_res(()),
-            Err(e) => IpeResult::Err(str_err(&format!("{e}"))),
+            Err(e) => IpeResult::Err(IoFailure::without_path("write to stderr", &e).into_error()),
         }
     })
 }
@@ -351,7 +352,7 @@ pub fn io_write_stderr<E: Send + From<String> + 'static>(s: String) -> IpeTask<E
 /// `Io.println : String -> Task Error ()`. Writes the message followed by a
 /// single `\n` to stdout, then flushes.
 #[must_use]
-pub fn io_println<E: Send + From<String> + 'static>(msg: String) -> IpeTask<E, ()> {
+pub fn io_println<E: Send + FromIpeError + 'static>(msg: String) -> IpeTask<E, ()> {
     Box::pin(async move {
         let r = (|| {
             let mut out = std::io::stdout();
@@ -361,7 +362,7 @@ pub fn io_println<E: Send + From<String> + 'static>(msg: String) -> IpeTask<E, (
         })();
         match r {
             Ok(()) => ok_res(()),
-            Err(e) => IpeResult::Err(str_err(&format!("{e}"))),
+            Err(e) => IpeResult::Err(IoFailure::without_path("write to stdout", &e).into_error()),
         }
     })
 }
@@ -369,7 +370,7 @@ pub fn io_println<E: Send + From<String> + 'static>(msg: String) -> IpeTask<E, (
 /// `Io.eprintln : String -> Task Error ()`. Writes the message followed by a
 /// single `\n` to stderr, then flushes.
 #[must_use]
-pub fn io_eprintln<E: Send + From<String> + 'static>(msg: String) -> IpeTask<E, ()> {
+pub fn io_eprintln<E: Send + FromIpeError + 'static>(msg: String) -> IpeTask<E, ()> {
     Box::pin(async move {
         let r = (|| {
             let mut err = std::io::stderr();
@@ -379,7 +380,7 @@ pub fn io_eprintln<E: Send + From<String> + 'static>(msg: String) -> IpeTask<E, 
         })();
         match r {
             Ok(()) => ok_res(()),
-            Err(e) => IpeResult::Err(str_err(&format!("{e}"))),
+            Err(e) => IpeResult::Err(IoFailure::without_path("write to stderr", &e).into_error()),
         }
     })
 }

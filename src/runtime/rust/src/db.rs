@@ -884,7 +884,7 @@ where
 
 /// `DbDec.string col` — read column `col` as a String.
 /// Fails with Err when the column is missing OR its value is NULL.
-pub fn db_decode_string<E: From<String> + 'static>(col: String) -> Decoder<E, String> {
+pub fn db_decode_string<E: crate::DecodeErrorSink + 'static>(col: String) -> Decoder<E, String> {
     decode_field(
         col.clone(),
         Decoder::new(
@@ -908,13 +908,13 @@ pub fn db_decode_string<E: From<String> + 'static>(col: String) -> Decoder<E, St
 /// Accepts: JSON Number, or a String representation of an integer or decimal
 /// (e.g. "42", "3.0" → 3). NULL → Err. Parse failure → Err.
 /// Matches `DbDec_int` truthy table (int/int64/float64/string forms).
-pub fn db_decode_int<E: From<String> + 'static>(col: String) -> Decoder<E, i64> {
+pub fn db_decode_int<E: crate::DecodeErrorSink + 'static>(col: String) -> Decoder<E, i64> {
     // Parse-don't-validate: a float source (JSON float or decimal string) is
     // truncated toward zero to an `Int`, but a magnitude past the `i64` range is
     // malformed input, not a value to silently saturate. Rust's `as` cast would
     // clamp `1e30` to `i64::MAX` and report `Ok` — data loss presented as
     // success. Reject it as a typed decode error instead (fail-closed).
-    fn float_to_i64_checked<E: From<String>>(col: &str, f: f64) -> IpeResult<E, i64> {
+    fn float_to_i64_checked<E: crate::DecodeErrorSink>(col: &str, f: f64) -> IpeResult<E, i64> {
         // Both bounds are exclusive: f64 cannot distinguish a boundary from its
         // out-of-range neighbour. `i64::MAX as f64` rounds up to 2^63 and an
         // input just past `i64::MIN` rounds down to `i64::MIN as f64`, so `<=`/
@@ -965,7 +965,7 @@ pub fn db_decode_int<E: From<String> + 'static>(col: String) -> Decoder<E, i64> 
 
 /// `DbDec.float col` — read column `col` as a Float (f64).
 /// Matches `DbDec_float` truthy table (float64/int/int64/string forms).
-pub fn db_decode_float<E: From<String> + 'static>(col: String) -> Decoder<E, f64> {
+pub fn db_decode_float<E: crate::DecodeErrorSink + 'static>(col: String) -> Decoder<E, f64> {
     decode_field(
         col.clone(),
         Decoder::new(
@@ -1001,7 +1001,7 @@ pub fn db_decode_float<E: From<String> + 'static>(col: String) -> Decoder<E, f64
 ///   true  ← "true" | "TRUE" | "True" | "t" | "T" | "1" | JSON true  | int 1  | int64 1
 ///   false ← "false"| "FALSE"| "False"| "f" | "F" | "0" | JSON false | int 0  | int64 0
 /// NULL or unrecognised string → Err.
-pub fn db_decode_bool<E: From<String> + 'static>(col: String) -> Decoder<E, bool> {
+pub fn db_decode_bool<E: crate::DecodeErrorSink + 'static>(col: String) -> Decoder<E, bool> {
     decode_field(
         col.clone(),
         Decoder::new(
@@ -1051,7 +1051,9 @@ pub fn db_decode_bool<E: From<String> + 'static>(col: String) -> Decoder<E, bool
 /// `StdMoneyMoney` from the `(Decimal, String)`.
 ///
 /// Totality: missing column, NULL, bad format, unparseable amount → `Err`.
-pub fn db_decode_money<E: From<String> + 'static>(col: String) -> Decoder<E, (Decimal, String)> {
+pub fn db_decode_money<E: crate::DecodeErrorSink + 'static>(
+    col: String,
+) -> Decoder<E, (Decimal, String)> {
     decode_field(
         col.clone(),
         Decoder::new(
@@ -1108,7 +1110,7 @@ pub fn db_decode_money<E: From<String> + 'static>(col: String) -> Decoder<E, (De
 /// to `db_decode_money` (which returns `Decoder<E, (Decimal, String)>`).
 ///
 /// Totality: missing column, NULL, or unparseable text → `Err(E::from(...))`.
-pub fn db_decode_decimal<E: From<String> + 'static>(col: String) -> Decoder<E, Decimal> {
+pub fn db_decode_decimal<E: crate::DecodeErrorSink + 'static>(col: String) -> Decoder<E, Decimal> {
     decode_field(
         col.clone(),
         Decoder::new(
@@ -1147,7 +1149,7 @@ pub fn db_decode_decimal<E: From<String> + 'static>(col: String) -> Decoder<E, D
 /// back to `Vec<u8>`, closing the `SqlBytes` write-without-read asymmetry.
 ///
 /// Totality: missing column, NULL, or non-hex string → `Err`.
-pub fn db_decode_bytes<E: From<String> + 'static>(col: String) -> Decoder<E, Vec<u8>> {
+pub fn db_decode_bytes<E: crate::DecodeErrorSink + 'static>(col: String) -> Decoder<E, Vec<u8>> {
     decode_field(
         col.clone(),
         Decoder::new(
@@ -1191,7 +1193,7 @@ pub fn db_decode_bytes<E: From<String> + 'static>(col: String) -> Decoder<E, Vec
 ///   → `Ok(Nothing)`, else delegate.
 ///
 /// Totality: every path returns a `IpeResult`; no panic/unwrap.
-pub fn db_decode_nullable<E: From<String> + 'static, T: Send + 'static>(
+pub fn db_decode_nullable<E: crate::DecodeErrorSink + 'static, T: Send + 'static>(
     inner: Decoder<E, T>,
 ) -> Decoder<E, IpeMaybe<T>> {
     let gate_fields = inner.fields.clone();
@@ -1239,7 +1241,11 @@ pub fn db_decode_nullable<E: From<String> + 'static, T: Send + 'static>(
 ///
 /// Totality: missing column or decode error → Err propagated; no panic/unwrap.
 /// Matches `DbDec_required` which delegates to `DbDec_andMap(fieldDec, ctorDec)`.
-pub fn db_decode_required<E: From<String> + 'static, A: 'static + Send, B: 'static + Send>(
+pub fn db_decode_required<
+    E: crate::DecodeErrorSink + 'static,
+    A: 'static + Send,
+    B: 'static + Send,
+>(
     _col: String,
     field_dec: Decoder<E, A>,
     ctor_dec: Decoder<E, Box<dyn FnOnce(A) -> B + Send>>,
@@ -1261,7 +1267,7 @@ pub fn db_decode_required<E: From<String> + 'static, A: 'static + Send, B: 'stat
 /// Totality: NULL/absent → Ok(fallback); present but bad type → Err; ctor Err → Err.
 /// Matches `DbDec_optional`.
 pub fn db_decode_optional<
-    E: From<String> + 'static,
+    E: crate::DecodeErrorSink + 'static,
     A: Clone + 'static + Send + Sync,
     B: 'static + Send,
 >(

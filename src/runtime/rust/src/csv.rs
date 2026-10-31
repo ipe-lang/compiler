@@ -246,11 +246,20 @@ pub fn csv_encode_with_delimiter(delim: String, doc: CsvDoc) -> String {
     encode_delim(&doc, byte)
 }
 
+/// A refused CSV record: a host read failure keeps its I/O kind, anything else is `Decode`.
+fn csv_record_failure(path: &str, error: &::csv::Error) -> KernelFailure {
+    match error.kind() {
+        ::csv::ErrorKind::Io(io) => crate::IoFailure::on_path("read CSV file", path, io).into(),
+        _ => KernelFailure::Decode(error.to_string()),
+    }
+}
+
 fn csv_parse_stream_from_file_sync(path: &str) -> Result<Vec<Vec<String>>, KernelFailure> {
     // Stream rows from a BufReader<File> rather than slurping the whole file
     // into a String first — the csv reader pulls records incrementally, so a
     // large/untrusted file no longer forces a full-file in-memory copy.
-    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let file = std::fs::File::open(path)
+        .map_err(|e| crate::IoFailure::on_path("read CSV file", path, &e))?;
     let mut rdr = ::csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(true)
@@ -265,7 +274,7 @@ fn csv_parse_stream_from_file_sync(path: &str) -> Result<Vec<Vec<String>>, Kerne
     let mut seen_bytes: u64 = 0;
     let mut out = Vec::new();
     for rec in rdr.records() {
-        let r = rec.map_err(|e| e.to_string())?;
+        let r = rec.map_err(|e| csv_record_failure(path, &e))?;
         if out.len() >= max_rows {
             return Err(row_cap_refusal(max_rows).into());
         }

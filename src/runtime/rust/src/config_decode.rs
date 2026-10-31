@@ -17,7 +17,7 @@ use super::*;
 // combinator is JSON-shaped (null => Nothing, else Just, inner error
 // propagated) and lives once, in the always-available `json` module, so
 // JsonDec / Config / Db.Decode share a single implementation.
-pub fn config_nullable<E: From<String> + 'static, T: 'static + Send>(
+pub fn config_nullable<E: DecodeErrorSink + 'static, T: 'static + Send>(
     decoder: Decoder<E, T>,
 ) -> Decoder<E, IpeMaybe<T>> {
     super::json::decode_nullable(decoder)
@@ -26,7 +26,7 @@ pub fn config_nullable<E: From<String> + 'static, T: 'static + Send>(
 // Config.maybe : Decoder a -> Decoder (Maybe a)
 // Unlike `nullable` (which only tolerates null/missing), `maybe` catches ANY
 // decode failure: `Just` on success, `Nothing` on any error. Never fails.
-pub fn config_maybe<E: From<String> + 'static, T: 'static + Send>(
+pub fn config_maybe<E: DecodeErrorSink + 'static, T: 'static + Send>(
     decoder: Decoder<E, T>,
 ) -> Decoder<E, IpeMaybe<T>> {
     let inner_fields = decoder.fields.clone();
@@ -43,7 +43,7 @@ pub fn config_maybe<E: From<String> + 'static, T: 'static + Send>(
 // Decode every object entry into a `Dict String a` (runtime `IpeDict<T>`),
 // applying `decoder` to each value. Non-object input is `Err`; the first entry
 // whose value fails short-circuits with its real error.
-pub fn config_dict<E: From<String> + 'static, T: 'static + Send>(
+pub fn config_dict<E: DecodeErrorSink + 'static, T: 'static + Send>(
     decoder: Decoder<E, T>,
 ) -> Decoder<E, IpeDict<T>> {
     Decoder::new(
@@ -61,24 +61,24 @@ pub fn config_dict<E: From<String> + 'static, T: 'static + Send>(
                 }
                 IpeResult::Ok(out)
             }
-            None => IpeResult::Err(str_err("expected object")),
+            None => IpeResult::Err(E::from_decode_failure("expected object".to_owned())),
         }),
         vec![],
     )
 }
 
-fn run_decoder<E: From<String> + 'static, T>(
+fn run_decoder<E: DecodeErrorSink + 'static, T>(
     parsed: Result<JsonVal, String>,
     decoder: Decoder<E, T>,
 ) -> IpeResult<E, T> {
     match parsed {
         Ok(v) => (decoder.run)(&v),
-        Err(e) => IpeResult::Err(str_err(&e)),
+        Err(e) => IpeResult::Err(E::from_decode_failure(e)),
     }
 }
 
 // Config.decodeJson : String -> Decoder a -> Result Error a
-pub fn config_decode_json<E: From<String> + 'static, T>(
+pub fn config_decode_json<E: DecodeErrorSink + 'static, T>(
     s: String,
     decoder: Decoder<E, T>,
 ) -> IpeResult<E, T> {
@@ -89,7 +89,7 @@ pub fn config_decode_json<E: From<String> + 'static, T>(
 }
 
 // Config.decodeToml : String -> Decoder a -> Result Error a
-pub fn config_decode_toml<E: From<String> + 'static, T>(
+pub fn config_decode_toml<E: DecodeErrorSink + 'static, T>(
     s: String,
     decoder: Decoder<E, T>,
 ) -> IpeResult<E, T> {
@@ -118,7 +118,7 @@ const CONFIG_FILE_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling
 );
 
 // Config.decodeYaml : String -> Decoder a -> Result Error a
-pub fn config_decode_yaml<E: From<String> + FromLimitExceeded + 'static, T>(
+pub fn config_decode_yaml<E: DecodeErrorSink + FromLimitExceeded + 'static, T>(
     s: String,
     decoder: Decoder<E, T>,
 ) -> IpeResult<E, T> {
@@ -292,7 +292,7 @@ impl YamlRefusal {
     }
 
     /// A ceiling breach is `LimitExceeded`; every other refusal is a decode error.
-    fn into_error<E: From<String> + FromLimitExceeded>(self) -> E {
+    fn into_error<E: DecodeErrorSink + FromLimitExceeded>(self) -> E {
         match self.kind {
             YamlRefusalKind::Limit(_) => LimitRefusal::new(self.message()).into_error(),
             YamlRefusalKind::Syntax
@@ -301,7 +301,7 @@ impl YamlRefusal {
             | YamlRefusalKind::MergeKey
             | YamlRefusalKind::UnsupportedTag
             | YamlRefusalKind::NonFiniteFloat
-            | YamlRefusalKind::Other => str_err(&self.message()),
+            | YamlRefusalKind::Other => E::from_decode_failure(self.message()),
         }
     }
 }
@@ -443,10 +443,15 @@ fn config_read_capped(path: &str, cap: u64) -> Result<String, KernelFailure> {
     // gate would pass and the subsequent slurp would read unbounded bytes.
     // Reject non-regular files outright, then bound the read at cap+1 bytes.
     use std::io::Read;
-    let file = std::fs::File::open(path).map_err(|e| format!("{}", e))?;
-    let meta = file.metadata().map_err(|e| format!("{}", e))?;
+    let failed =
+        |e: std::io::Error| KernelFailure::from(IoFailure::on_path("read config file", path, &e));
+    let file = std::fs::File::open(path).map_err(failed)?;
+    let meta = file.metadata().map_err(failed)?;
     if !meta.file_type().is_file() {
-        return Err(format!("config file {:?} is not a regular file", path).into());
+        return Err(failed(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        )));
     }
     if meta.len() > cap {
         return Err(LimitRefusal::new(format!(
@@ -462,7 +467,7 @@ fn config_read_capped(path: &str, cap: u64) -> Result<String, KernelFailure> {
     // or reports a misleading size, the read still can't exceed cap+1 bytes.
     file.take(cap.saturating_add(1))
         .read_to_string(&mut contents)
-        .map_err(|e| format!("{}", e))?;
+        .map_err(failed)?;
     if contents.len() as u64 > cap {
         return Err(LimitRefusal::new(format!(
             "config file {:?} exceeds the {} byte cap (IPE_CONFIG_MAX_BYTES)",
@@ -481,7 +486,10 @@ fn config_read_capped(path: &str, cap: u64) -> Result<String, KernelFailure> {
 // worker thread. The decode dispatch itself runs back on the calling task
 // after the read completes — decoding an already-in-memory, size-capped
 // (≤16 MiB default) string is fast enough not to warrant its own offload.
-pub fn config_load_from_file<E: crate::KernelErrorSink + Send + 'static, T: Send + 'static>(
+pub fn config_load_from_file<
+    E: crate::KernelErrorSink + crate::FromDecodeFailure + Send + 'static,
+    T: Send + 'static,
+>(
     path: crate::path::Path,
     decoder: Decoder<E, T>,
 ) -> IpeTask<E, T> {
@@ -1030,10 +1038,7 @@ mod yaml_tests {
         assert_eq!(syntax.message(), expected);
         assert!(!expected.contains("zq"), "{expected}");
         assert!(!expected.contains("17"), "{expected}");
-        assert_eq!(
-            refusal(src),
-            Some((crate::IpeErrorKind::Unexpected, expected))
-        );
+        assert_eq!(refusal(src), Some((crate::IpeErrorKind::Decode, expected)));
     }
 
     #[test]
