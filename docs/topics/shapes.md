@@ -121,7 +121,7 @@ mobile is `web client <os>`).
 | runtime | host | command | rendered view |
 |---------|------|---------|---------------|
 | served | browser | `ipe dev run` | ![web · served · browser](../assets/shapes/web-served-browser.png) |
-| client | browser | `ipe dev run` (wasm client) | ![web · client · browser](../assets/shapes/web-client-browser.png) |
+| client | browser | `ipe dev build web client` (writes the wasm bundle and prints how to serve it) | ![web · client · browser](../assets/shapes/web-client-browser.png) |
 | served | desktop | `ipe release build web desktop` | same served view, in a WebKitGTK window ![web · served · desktop](../assets/shapes/web-served-browser.png) |
 | client | ios | `ipe release build web client ios` | same client view, in a `WKWebView` ![web · client · iOS](../assets/shapes/web-client-browser.png) |
 | client | android | `ipe release build web client android` | same client view, in an Android `WebView` ![web · client · Android](../assets/shapes/web-client-browser.png) |
