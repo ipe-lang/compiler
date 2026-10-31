@@ -607,6 +607,10 @@ mod native {
     /// session's client transport; every subsequent `js_send` whose origin is
     /// `sid` is delivered to `sink`.
     ///
+    /// The live server binds while it holds the session entry's lock, and the
+    /// frames buffered before the bind are delivered to `sink` here, still under
+    /// that lock: a sink must never take the session entry's lock.
+    ///
     /// # Errors
     ///
     /// [`PortClosed`] when no lease holds `sid`; no sink is stored.
@@ -2054,6 +2058,10 @@ mod tests {
             concat!("static N: Atomic", "I64"),
             concat!("n: Cell<", "usize>"),
             concat!("n: Cell<", "i64>"),
+            concat!("static N: Mutex<", "u64>"),
+            concat!("static N: Mutex<", "i64>"),
+            concat!("static N: RwLock<", "usize>"),
+            concat!("static N: RwLock<", "i32>"),
         ] {
             let probe = format!(
                 "{planted}\n{}\n        fn next() {{}}\n    }}\n",
@@ -2102,11 +2110,443 @@ mod tests {
             concat!("Atomic", "I"),
             concat!("Cell<", "u"),
             concat!("Cell<", "i"),
+            concat!("Mutex<", "u"),
+            concat!("Mutex<", "i"),
+            concat!("RwLock<", "u"),
+            concat!("RwLock<", "i"),
         ]
         .into_iter()
         .flat_map(|needle| production.match_indices(needle).map(|(at, _)| at))
         .filter(|at| !life.contains(at))
         .collect()
+    }
+
+    /// `source` with every string literal emptied and every line cut at its
+    /// first `//` outside a string.
+    fn code_only(source: &str) -> String {
+        let mut out = String::with_capacity(source.len());
+        for line in source.lines() {
+            let mut in_string = false;
+            let mut escaped = false;
+            let mut chars = line.chars().peekable();
+            while let Some(c) = chars.next() {
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if c == '\\' {
+                        escaped = true;
+                    } else if c == '"' {
+                        in_string = false;
+                        out.push(c);
+                    }
+                    continue;
+                }
+                if c == '/' && chars.peek() == Some(&'/') {
+                    break;
+                }
+                if c == '"' {
+                    in_string = true;
+                }
+                out.push(c);
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The byte range of the block whose header is the first `header` in
+    /// `source`, through the `}` at the header line's indentation; empty when
+    /// the header or its close is absent.
+    fn block_of(source: &str, header: &str) -> std::ops::Range<usize> {
+        let Some(start) = source.find(header) else {
+            return 0..0;
+        };
+        let line_start = source
+            .get(..start)
+            .and_then(|before| before.rfind('\n'))
+            .map_or(0, |i| i.saturating_add(1));
+        let indent: String = source
+            .get(line_start..start)
+            .unwrap_or_default()
+            .chars()
+            .take_while(|c| *c == ' ')
+            .collect();
+        let close = format!("\n{indent}}}\n");
+        source
+            .get(start..)
+            .and_then(|rest| rest.find(&close))
+            .map_or(0..0, |len| {
+                start..start.saturating_add(len).saturating_add(close.len())
+            })
+    }
+
+    /// The names of the `fn`s declared in `block`, sorted.
+    fn fn_names(block: &str) -> Vec<String> {
+        let mut names: Vec<String> = block
+            .match_indices("fn ")
+            .filter(|(at, _)| {
+                block
+                    .get(..*at)
+                    .and_then(|before| before.chars().next_back())
+                    .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+            })
+            .map(|(at, _)| {
+                block
+                    .get(at.saturating_add(3)..)
+                    .unwrap_or_default()
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The `Self` constructor shapes: a tuple call, a brace literal, a fn value.
+    const SELF_BUILDS: [&str; 5] = ["Self(", "Self {", "Self{", "(Self)", "Self)"];
+
+    /// Offsets of `needle` in `code` that build a value: a return type
+    /// (`-> Self {` opening a body) is not a build.
+    fn builds_at(code: &str, needle: &str) -> Vec<usize> {
+        code.match_indices(needle)
+            .map(|(at, _)| at)
+            .filter(|at| {
+                !code
+                    .get(..*at)
+                    .is_some_and(|before| before.ends_with("-> "))
+            })
+            .collect()
+    }
+
+    /// Every way `source`'s `impl SessionPorts` block could build a second
+    /// entry: a `Self` literal or a call to `new`, a `fn` beyond `new` and
+    /// `stream_by_handle`, or a trait `impl` for the type. A missing block is
+    /// a fault, never a pass.
+    fn session_ports_impl_faults(source: &str) -> Vec<String> {
+        let code = code_only(production_source(source));
+        let block = block_of(&code, concat!("impl Session", "Ports {"));
+        let Some(body) = code.get(block).filter(|body| !body.is_empty()) else {
+            return vec!["no `impl SessionPorts` block".to_owned()];
+        };
+        let mut faults = Vec::new();
+        for needle in ["Self {", "Self{", "Self::new(", "Self::new)", "Self::new,"] {
+            if !builds_at(body, needle).is_empty() {
+                faults.push(format!("`{needle}` inside `impl SessionPorts`"));
+            }
+        }
+        let names = fn_names(body);
+        if names != ["new", "stream_by_handle"] {
+            faults.push(format!("`impl SessionPorts` declares {names:?}"));
+        }
+        if code.contains(concat!("for Session", "Ports")) {
+            faults.push("a trait impl for SessionPorts".to_owned());
+        }
+        faults
+    }
+
+    /// Every way `source` builds a [`PortHandle`] or a [`PortToken`] other
+    /// than through its own `mint_from` and `parse`, and every
+    /// `PortHandle::parse` whose argument is not the program's `handle: i64`
+    /// parameter. A missing block or constructor is a fault, never a pass.
+    fn handle_construction_faults(source: &str) -> Vec<String> {
+        let code = code_only(production_source(source));
+        let mut faults = Vec::new();
+        for ty in [concat!("Port", "Handle"), concat!("Port", "Token")] {
+            let block = block_of(&code, &format!("impl {ty} {{"));
+            let Some(body) = code.get(block.clone()).filter(|body| !body.is_empty()) else {
+                faults.push(format!("no `impl {ty}` block"));
+                continue;
+            };
+            let mut allowed = Vec::new();
+            for header in ["fn mint_from(", "fn parse("] {
+                let span = block_of(body, header);
+                if span.is_empty() {
+                    faults.push(format!("`impl {ty}` has no `{header}`"));
+                } else {
+                    allowed.push(
+                        span.start.saturating_add(block.start)
+                            ..span.end.saturating_add(block.start),
+                    );
+                }
+            }
+            // Inside the type's own impl, `Self` is built only by its two
+            // constructors.
+            for needle in SELF_BUILDS {
+                for at in builds_at(body, needle) {
+                    let at = at.saturating_add(block.start);
+                    if !allowed.iter().any(|span| span.contains(&at)) {
+                        faults.push(format!("`{needle}` outside {ty}'s constructors"));
+                    }
+                }
+            }
+            // A trait impl for the type builds no `Self`.
+            let trait_header = format!("for {ty} {{");
+            for (at, _) in code.match_indices(&trait_header) {
+                let line = code
+                    .get(..at)
+                    .and_then(|before| before.rfind('\n'))
+                    .map_or(0, |i| i.saturating_add(1));
+                let rest = code.get(line..).unwrap_or_default();
+                let trait_body = rest.get(block_of(rest, &trait_header)).unwrap_or_default();
+                if trait_body.is_empty()
+                    || SELF_BUILDS
+                        .iter()
+                        .any(|needle| !builds_at(trait_body, needle).is_empty())
+                {
+                    faults.push(format!("a trait impl for {ty} builds a value"));
+                }
+            }
+            // Outside its impl the name is never a constructor call, a brace
+            // literal or a fn value; a declaration or a type position is not
+            // a build.
+            for needle in [
+                format!("{ty}("),
+                format!("{ty} {{"),
+                format!("{ty}{{"),
+                format!("({ty})"),
+                format!(", {ty})"),
+            ] {
+                for (at, _) in code.match_indices(&needle) {
+                    let before = code.get(..at).unwrap_or_default();
+                    let declared = before.ends_with("struct ")
+                        || before.ends_with("impl ")
+                        || before.ends_with("for ");
+                    let typed = before.ends_with(": ") || before.ends_with("-> ");
+                    if !(declared || typed) {
+                        faults.push(format!("`{needle}` builds a {ty}"));
+                    }
+                }
+            }
+            // No derive hands out a value the constructors never checked.
+            let derive = code
+                .find(&format!("struct {ty}("))
+                .and_then(|at| code.get(..at))
+                .and_then(|before| before.rfind("#[derive(").and_then(|d| before.get(d..)))
+                .unwrap_or_default();
+            if derive.is_empty() || derive.contains("Default") {
+                faults.push(format!("{ty} derives `Default` or has no derive"));
+            }
+        }
+        // A program handle enters only through the program's own `handle:
+        // i64` parameter, not rebound before the parse.
+        let parse = concat!("PortHandle::", "parse");
+        let call = format!("{parse}(");
+        if code.matches(parse).count() != code.matches(&call).count() {
+            faults.push(format!("`{parse}` used as a fn value"));
+        }
+        for (at, _) in code.match_indices(&call) {
+            let arg = code
+                .get(at.saturating_add(call.len())..)
+                .and_then(|rest| rest.split(')').next())
+                .unwrap_or_default();
+            if arg != "handle" {
+                faults.push(format!("`{call}{arg})` is not the program's handle"));
+                continue;
+            }
+            let before = code.get(..at).unwrap_or_default();
+            let Some(fn_at) = before.rfind("fn ") else {
+                faults.push(format!("`{call}handle)` outside a fn"));
+                continue;
+            };
+            let seg = before.get(fn_at..).unwrap_or_default();
+            let (sig, body) = seg.split_once("{\n").unwrap_or((seg, ""));
+            let body = body
+                .rfind('\n')
+                .and_then(|end| body.get(..end))
+                .unwrap_or_default();
+            if !sig.contains("handle: i64") {
+                faults.push(format!("`{call}handle)` in a fn without `handle: i64`"));
+            }
+            for rebind in [
+                "let handle",
+                "let mut handle",
+                "handle = ",
+                "|handle",
+                "(handle)",
+                "handle,",
+            ] {
+                if body.contains(rebind) {
+                    faults.push(format!("`handle` rebound by `{rebind}` before `{call}`"));
+                }
+            }
+        }
+        faults
+    }
+
+    #[test]
+    fn port_handles_are_built_only_by_their_constructors() {
+        let source = include_str!("js_port.rs");
+        assert_eq!(
+            handle_construction_faults(source),
+            Vec::<String>::new(),
+            "a port handle or token is built only by its mint_from and parse"
+        );
+        // Each planted shape is refused. The needles are split so this test
+        // does not match itself.
+        let parse_site = concat!("PortHandle::parse", "(handle)");
+        let top = "/// Bytes drawn for one [`PortHandle`].\n";
+        let inside = "    /// The handle as the program holds it.\n";
+        let planted: [(&str, String, &str); 14] = [
+            (
+                parse_site,
+                concat!("PortHandle::parse", "(n)").to_owned(),
+                "not the program's handle",
+            ),
+            (
+                parse_site,
+                concat!("Some(handle).and_then(PortHandle::", "parse)").to_owned(),
+                "fn value",
+            ),
+            (
+                top,
+                format!("fn g(n: i64) -> Option<PortHandle> {{\n    {parse_site}\n}}\n{top}"),
+                "without `handle: i64`",
+            ),
+            (
+                top,
+                format!(
+                    "fn g(handle: i64) -> Option<PortHandle> {{\n    let handle = n;\n    {parse_site}\n}}\n{top}"
+                ),
+                "rebound",
+            ),
+            (
+                inside,
+                format!(
+                    "    fn of(n: std::num::NonZeroI64) -> Self {{\n        {}\n    }}\n{inside}",
+                    concat!("Self", "(n)")
+                ),
+                "outside PortHandle's constructors",
+            ),
+            (
+                inside,
+                format!(
+                    "    fn of(n: std::num::NonZeroI64) -> Option<Self> {{\n        Some(n).map({}\n    }}\n{inside}",
+                    concat!("Self", ")")
+                ),
+                "outside PortHandle's constructors",
+            ),
+            (
+                inside,
+                format!(
+                    "    fn of(n: std::num::NonZeroI64) -> Self {{\n        {} 0: n }}\n    }}\n{inside}",
+                    concat!("Self", " {")
+                ),
+                "outside PortHandle's constructors",
+            ),
+            (
+                top,
+                format!(
+                    "fn z(n: std::num::NonZeroI64) -> Option<PortHandle> {{\n    Some({}n))\n}}\n{top}",
+                    concat!("Port", "Handle(")
+                ),
+                "builds a PortHandle",
+            ),
+            (
+                top,
+                format!(
+                    "fn z(n: std::num::NonZeroI64) -> Option<PortHandle> {{\n    Some(n).map{}\n}}\n{top}",
+                    concat!("(Port", "Handle)")
+                ),
+                "builds a PortHandle",
+            ),
+            (
+                top,
+                format!(
+                    "fn z() -> Option<PortToken> {{\n    Some({}[0; 16]))\n}}\n{top}",
+                    concat!("Port", "Token(")
+                ),
+                "builds a PortToken",
+            ),
+            (
+                top,
+                format!(
+                    "impl From<std::num::NonZeroI64> for {} {{\n    fn from(n: std::num::NonZeroI64) -> Self {{\n        {}\n    }}\n}}\n{top}",
+                    concat!("Port", "Handle"),
+                    concat!("Self", "(n)")
+                ),
+                "trait impl for PortHandle",
+            ),
+            (
+                concat!("Debug)]\npub(crate) struct Port", "Handle("),
+                concat!("Debug, Default)]\npub(crate) struct Port", "Handle(").to_owned(),
+                "derives `Default`",
+            ),
+            (
+                concat!("pub(crate) fn parse(raw: ", "i64)"),
+                concat!("pub(crate) fn parse_raw(raw: ", "i64)").to_owned(),
+                "has no `fn parse(`",
+            ),
+            (
+                concat!("impl Port", "Handle {"),
+                concat!("impl Port", "HandleX {").to_owned(),
+                "no `impl PortHandle` block",
+            ),
+        ];
+        for (anchor, replacement, expected) in planted {
+            let probe = source.replacen(anchor, &replacement, 1);
+            assert_ne!(probe, source, "the plant at `{anchor}` took");
+            let faults = handle_construction_faults(&probe);
+            assert!(
+                faults.iter().any(|fault| fault.contains(expected)),
+                "the construction scan misses `{replacement}`: {faults:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_ports_impl_builds_no_second_entry() {
+        let source = include_str!("js_port.rs");
+        assert_eq!(
+            session_ports_impl_faults(source),
+            Vec::<String>::new(),
+            "`impl SessionPorts` holds `new` and `stream_by_handle` only"
+        );
+        // Each planted shape is refused. The needles are split so this test
+        // does not match itself.
+        let stream_doc = "        /// The open stream `handle` names, with its wire token.\n";
+        let planted: [(&str, String, &str); 5] = [
+            (
+                concat!("-> Self {\n            Session", "Ports {"),
+                concat!("-> Self {\n            Self", " {").to_owned(),
+                "`Self {` inside",
+            ),
+            (
+                "            self.streams\n                .iter_mut()",
+                format!(
+                    "            let _ = {}self.life);\n            self.streams\n                .iter_mut()",
+                    concat!("Self::", "new(")
+                ),
+                "`Self::new(` inside",
+            ),
+            (
+                stream_doc,
+                format!("        fn spare() {{}}\n{stream_doc}"),
+                "declares",
+            ),
+            (
+                "    /// The generation of one port life",
+                format!(
+                    "    impl Clone for {} {{\n    }}\n\n    /// The generation of one port life",
+                    concat!("Session", "Ports")
+                ),
+                "trait impl",
+            ),
+            (
+                concat!("impl Session", "Ports {"),
+                concat!("impl Session", "PortsX {").to_owned(),
+                "no `impl SessionPorts` block",
+            ),
+        ];
+        for (anchor, replacement, expected) in planted {
+            let probe = source.replacen(anchor, &replacement, 1);
+            assert_ne!(probe, source, "the plant at `{anchor}` took");
+            let faults = session_ports_impl_faults(&probe);
+            assert!(
+                faults.iter().any(|fault| fault.contains(expected)),
+                "the SessionPorts scan misses `{replacement}`: {faults:?}"
+            );
+        }
     }
 
     #[test]
