@@ -166,9 +166,11 @@ impl<'a> CarrierScope<'a> {
                 format!("crate::ffi::{}::{name}", target.slug),
             ));
         }
-        let edge = self.unify.unified.iter().find(|u| {
-            u.name == name && u.demoted_modules.iter().any(|m| *m == target.module_name)
-        })?;
+        let edge = self
+            .unify
+            .unified
+            .iter()
+            .find(|u| u.name == name && u.demoted_modules.contains(&target.module_name))?;
         let home = self
             .catalog
             .iter()
@@ -1605,8 +1607,7 @@ mod tests {
                 .collect(),
             define_types: BTreeSet::new(),
             bindings: Vec::new(),
-            dep_versions: [(dep_version.0.to_owned(), dep_version.1.to_owned())]
-                .into_iter()
+            dep_versions: std::iter::once((dep_version.0.to_owned(), dep_version.1.to_owned()))
                 .collect(),
             inspected_free_fns: BTreeMap::new(),
             inspected_consts: BTreeMap::new(),
