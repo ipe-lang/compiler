@@ -130,7 +130,7 @@ pub enum LockRefusal {
     HiddenCharacter {
         /// Where the comment sits.
         line: LockLine,
-        /// The first hazardous character and its position in the line.
+        /// The first hazardous character and its position in the comment.
         hazard: DisplayHazard,
     },
 }
