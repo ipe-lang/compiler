@@ -31,11 +31,11 @@ use core::fmt::Write as _;
 
 use crate::code::{Severity, issue_tracker_url, title};
 use crate::diagnostic::{
-    AppShape, Applicability, CaseDefect, CodecAutoRejection, ConsentError, Diagnostic, Expected,
-    ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach, HazardRefusal,
-    HeaderDefect, HelpLine, Hint, IfDefect, ImportedAs, LetDefect, LowerError, MountPrefixFault,
-    NameError, ParseError, RoutePatternDefect, SandboxError, SealRejection, SpanRole,
-    StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc,
+    AppShape, Applicability, CaseDefect, CodecAutoRejection, ConsentError, CtorWithheld,
+    Diagnostic, Expected, ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach,
+    HazardRefusal, HeaderDefect, HelpLine, Hint, IfDefect, ImportedAs, LetDefect, LowerError,
+    MountPrefixFault, NameError, ParseError, RoutePatternDefect, SandboxError, SealRejection,
+    SpanRole, StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc,
     TypeDeclDefect, TypeError, TypeSizeOrigin, WildcardDependence, intercept_context_phrase,
 };
 use crate::span::Span;
@@ -599,6 +599,25 @@ fn name_prose(msg: &NameError) -> String {
         NameError::NameNotExposed { module, name, .. } => {
             format!("`{module}` doesn't expose `{name}`, so no other module can use it.")
         }
+        NameError::CtorNotExposed {
+            module,
+            type_name,
+            why,
+        } => match why {
+            CtorWithheld::Abstract => format!(
+                "`{module}` exports the type `{type_name}` but keeps its constructors private, \
+                 so you can't import them."
+            ),
+            CtorWithheld::Unknown { ctor, .. } => {
+                format!("`{module}` doesn't expose a constructor `{ctor}` of `{type_name}`.")
+            }
+            CtorWithheld::Alias => {
+                format!("`{type_name}` is a type alias, so it has no constructors to import.")
+            }
+            CtorWithheld::Opaque => format!(
+                "`{type_name}` is a built-in opaque type, so it has no constructors to import."
+            ),
+        },
         NameError::ModulePathMismatch { .. } => {
             "This module's declared name doesn't match its path on disk.".to_string()
         }
@@ -1693,6 +1712,20 @@ fn name_label(msg: &NameError) -> Option<String> {
         NameError::NameNotExposed { module, name, .. } => {
             Some(format!("`{module}` does not expose `{name}`"))
         }
+        NameError::CtorNotExposed {
+            module,
+            type_name,
+            why,
+        } => Some(match why {
+            CtorWithheld::Abstract => {
+                format!("`{module}` exposes `{type_name}` without its constructors")
+            }
+            CtorWithheld::Unknown { ctor, .. } => {
+                format!("`{module}` exposes no constructor `{ctor}` under `{type_name}`")
+            }
+            CtorWithheld::Alias => format!("`{type_name}` is a type alias"),
+            CtorWithheld::Opaque => format!("`{type_name}` is an opaque built-in type"),
+        }),
         NameError::ModulePathMismatch { declared, expected } => {
             Some(format!("declared as `{declared}`, expected `{expected}`"))
         }
@@ -3146,6 +3179,110 @@ mod tests {
             msg,
         };
         assert_eq!(diag.code(), crate::code::IPE_N0022);
+    }
+
+    /// A `CtorNotExposed` refusal of `module`'s `type_name` for `why`.
+    fn ctor_refusal(module: &str, type_name: &str, why: CtorWithheld) -> Diagnostic {
+        Diagnostic::Name {
+            span: Span::new(0, 6),
+            msg: NameError::CtorNotExposed {
+                module: module.into(),
+                type_name: type_name.into(),
+                why,
+            },
+        }
+    }
+
+    /// The prose and the help notes of `diag`, a name error.
+    fn prose_and_notes(diag: &Diagnostic) -> (String, Vec<String>) {
+        let Diagnostic::Name { msg, .. } = diag else {
+            return (String::new(), Vec::new());
+        };
+        let notes = diag
+            .help()
+            .into_iter()
+            .map(|line| match line {
+                HelpLine::Note(text) | HelpLine::DidYouMean(text) => text.into_string(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        (name_prose(msg), notes)
+    }
+
+    /// An abstract type's refusal says the constructors are private and names
+    /// both remedies, the second only for a module the user can edit.
+    #[test]
+    fn ctor_not_exposed_abstract_names_the_remedies() {
+        let diag = ctor_refusal("Shape", "Shape", CtorWithheld::Abstract);
+        assert_eq!(diag.code(), crate::code::IPE_N0022);
+        let (prose, notes) = prose_and_notes(&diag);
+        assert_eq!(
+            prose,
+            "`Shape` exports the type `Shape` but keeps its constructors private, so you \
+             can't import them."
+        );
+        assert_eq!(
+            notes,
+            [
+                "Import the type alone, `Shape`, and build values through the functions \
+              `Shape` exposes. If you own `Shape`, export `Shape(..)` in its `module` line."
+            ]
+        );
+        let (_, stdlib) = prose_and_notes(&ctor_refusal("Ipe.Maybe", "T", CtorWithheld::Abstract));
+        assert!(
+            stdlib.iter().all(|note| !note.contains("If you own")),
+            "a stdlib module is not the user's to edit: {stdlib:?}"
+        );
+    }
+
+    /// An unknown constructor offers the close spellings, else the open clause.
+    #[test]
+    fn ctor_not_exposed_unknown_suggests_a_ctor_or_the_open_clause() {
+        let close = ctor_refusal(
+            "Shape",
+            "Shape",
+            CtorWithheld::Unknown {
+                ctor: "Circel".into(),
+                suggestions: Candidates::hints(ranked("Circel", &["Circle", "Square"])),
+            },
+        );
+        let (prose, notes) = prose_and_notes(&close);
+        assert_eq!(
+            prose,
+            "`Shape` doesn't expose a constructor `Circel` of `Shape`."
+        );
+        assert_eq!(notes, ["Circle"]);
+        let far = ctor_refusal(
+            "Shape",
+            "Shape",
+            CtorWithheld::Unknown {
+                ctor: "Nope".into(),
+                suggestions: Candidates::hints(Box::new([])),
+            },
+        );
+        let (_, notes) = prose_and_notes(&far);
+        assert_eq!(
+            notes,
+            ["`Shape(..)` imports every constructor `Shape` exposes under `Shape`."]
+        );
+    }
+
+    /// An alias and an opaque builtin both say to drop the clause.
+    #[test]
+    fn ctor_not_exposed_alias_and_opaque_say_drop_the_clause() {
+        let (prose, notes) = prose_and_notes(&ctor_refusal("Dep", "R", CtorWithheld::Alias));
+        assert_eq!(
+            prose,
+            "`R` is a type alias, so it has no constructors to import."
+        );
+        assert_eq!(notes, ["Write `R` without `(…)`."]);
+        let (prose, notes) =
+            prose_and_notes(&ctor_refusal("Ipe.Dict", "Dict", CtorWithheld::Opaque));
+        assert_eq!(
+            prose,
+            "`Dict` is a built-in opaque type, so it has no constructors to import."
+        );
+        assert_eq!(notes, ["Write `Dict` without `(…)`."]);
     }
 
     fn con(name: &str) -> TyDoc {

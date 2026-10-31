@@ -8,7 +8,7 @@ use std::rc::Rc;
 use ipe_diagnostics::suggest::{Cap, Hit, Policy, Query, Shape, Spelling, Threshold, rank};
 use ipe_diagnostics::{
     AliasExpansionKind, AliasRowFault, Candidates, CmdSubShapeMismatch, CodecAutoRejection,
-    DResult, Diagnostic, EditTarget, ImportedAs, Located, ModulePlacementReason,
+    CtorWithheld, DResult, Diagnostic, EditTarget, ImportedAs, Located, ModulePlacementReason,
     ModulePlacementRejection, NameError, ParseError, SealRejection, SortedNames, Span, StdlibReach,
     TypeError,
 };
@@ -29,6 +29,9 @@ use crate::env::{
 use crate::scope::{
     AliasBody, BoundBuiltin, Clash, ExprTarget, Identity, ModuleScope, Origin, QualifiedType,
     Resolved, Tier, TypeTarget as ScopeType, ValueIdentity,
+};
+use ctor_clause::{
+    CtorFilter, CtorOffer, JudgedCtors, Withheld, exposed_ctor_filter, judge_ctor_clause,
 };
 
 /// The most `did you mean` names attached to an unresolved name, so a wall of
@@ -1972,11 +1975,12 @@ fn wrong_shape_cmd_sub(span: Span, segment: &str, family: CmdOrSub, app: AppSurf
 /// * `exposing (name, …)` binds each named value at [`Tier::Explicit`]. A
 ///   lowercase name that is not a value member of the module is
 ///   [`NameError::NameNotExposed`], never an invented binding.
-/// * `exposing (Type(..))` or `Type(A, …)` binds the constructors the filter
-///   admits of a built-in union with a qualified home (`HttpMethod`'s
-///   `Get`/`Post`) at [`Tier::Explicit`]. Those constructors are otherwise
-///   reachable only qualified (`Http.Post`), so a bare `Post` with no import
-///   never shadows a user constructor.
+/// * `exposing (Type(..))` or `Type(A, …)` is judged against the type's
+///   constructors by [`judge_ctor_clause`], then binds the ones it delivers of a
+///   built-in union with a qualified home (`HttpMethod`'s `Get`/`Post`) at
+///   [`Tier::Explicit`]. Those constructors are otherwise reachable only
+///   qualified (`Http.Post`), so a bare `Post` with no import never shadows a
+///   user constructor.
 ///
 /// Each binding is cloned verbatim from the qualified table, so a bare use
 /// lowers exactly as the qualified `M.member` does. A type exposure binds the
@@ -1986,10 +1990,11 @@ fn wrong_shape_cmd_sub(span: Span, segment: &str, family: CmdOrSub, app: AppSurf
 /// [`inject_dep_exports`], and an unknown `Ipe.*` path was already refused.
 ///
 /// # Errors
-/// [`NameError::NameNotExposed`] for a name the module does not export, or
-/// `T(..)` on a type without constructors; [`NameError::AmbiguousImport`] for
-/// an explicit name another explicit import already binds to a different
-/// definition; or [`Diagnostic::CompilerBug`] if interning exhausts the interner.
+/// [`NameError::NameNotExposed`] for a name the module does not export;
+/// [`NameError::CtorNotExposed`] for a constructor clause the type does not
+/// honour; [`NameError::AmbiguousImport`] for an explicit name another explicit
+/// import already binds to a different definition; or
+/// [`Diagnostic::CompilerBug`] if interning exhausts the interner.
 fn bind_stdlib_kernel_import(
     import: &src::Import,
     env: &mut Env,
@@ -2004,7 +2009,7 @@ fn bind_stdlib_kernel_import(
     let Some(module) = env.kernel_module(dep_path, interner)? else {
         return Ok(());
     };
-    let (member_map, ctor_map) = env.kernel_module_members(module);
+    let (member_map, _) = env.kernel_module_members(module);
     let members: Vec<(Symbol, VarHome)> = member_map.into_iter().collect();
     let kernel_types = Rc::clone(&env.kernel_types);
     let types = kernel_types.get(&module);
@@ -2060,18 +2065,21 @@ fn bind_stdlib_kernel_import(
                         bind_expr(env, name, Tier::Explicit, origin, interner)?;
                     }
                     src::Exposed::Type(type_name, privacy) => {
-                        let export = kernel_type_exposure(
-                            types, *type_name, privacy, item.span, dep_path, interner,
+                        let export =
+                            kernel_type_exposure(types, *type_name, item.span, dep_path, interner)?;
+                        let (offer, pooled) = match export {
+                            KernelTypeExport::Builtin(row) => (
+                                builtin_ctor_offer(*row, interner)?,
+                                builtin_import_ctors(*row, env, interner)?,
+                            ),
+                            KernelTypeExport::Alias(_) => (CtorOffer::Alias, Vec::new()),
+                        };
+                        let judged = judge_import_ctors(
+                            privacy, &offer, dep_path, *type_name, item.span, interner,
                         )?;
                         let origin = kernel_type_origin(export, dep_path, item.span);
                         bind_type(env, *type_name, Tier::Explicit, origin, interner)?;
-                        let filter = exposed_ctor_filter(privacy);
-                        let ctors: Vec<CtorHome> = ctor_map
-                            .values()
-                            .filter(|c| c.type_name == *type_name && filter.admits(c.name))
-                            .cloned()
-                            .collect();
-                        for ctor in ctors {
+                        for ctor in pooled.into_iter().filter(|c| judged.admits(c.name)) {
                             let name = ctor.name;
                             let origin = imported(
                                 ExprTarget::Ctor(ctor.clone()),
@@ -2089,16 +2097,14 @@ fn bind_stdlib_kernel_import(
     Ok(())
 }
 
-/// The type a kernel module exports as `type_name`, admitted by `privacy`.
+/// The type a kernel module exports as `type_name`.
 ///
 /// # Errors
-/// [`NameError::NameNotExposed`] for a name the module does not export, or
-/// `T(..)` on a type without constructors; [`Diagnostic::CompilerBug`] for an
-/// unresolvable symbol.
+/// [`NameError::NameNotExposed`] for a name the module does not export;
+/// [`Diagnostic::CompilerBug`] for an unresolvable symbol.
 fn kernel_type_exposure<'a>(
     types: Option<&'a BTreeMap<&'static str, KernelTypeExport>>,
     type_name: Symbol,
-    privacy: &src::Privacy,
     span: Span,
     dep_path: &[Symbol],
     interner: &Interner,
@@ -2121,22 +2127,6 @@ fn kernel_type_exposure<'a>(
             },
         });
     };
-    // A builtin union's constructors may be ambient (`RedirectPolicy`) rather
-    // than pooled under the module, so the union table decides.
-    let has_ctors = matches!(export, KernelTypeExport::Builtin(_))
-        && crate::builtins::BUILTIN_UNIONS
-            .iter()
-            .any(|union| union.type_name == &*name_s);
-    if !has_ctors && !matches!(privacy, src::Privacy::Private) {
-        return Err(Diagnostic::Name {
-            span,
-            msg: NameError::NameNotExposed {
-                module: path_to_dot_string(interner, dep_path),
-                name: format!("{name_s}(..)").into(),
-                suggestions: Candidates::hints(Box::new([])),
-            },
-        });
-    }
     Ok(export)
 }
 
@@ -2309,38 +2299,233 @@ fn bind_type(
     })
 }
 
-/// Which of a type's constructors an `exposing` clause opens into unqualified
-/// scope. Derived once from a [`src::Privacy`] by [`exposed_ctor_filter`] so both
-/// the built-in and user-dep injectors select the same set by construction: a
-/// `Type(A, B)` subset opens exactly `A`/`B`, never a withheld sibling.
-enum CtorFilter {
-    /// `Type(..)` — every constructor of the type.
-    All,
-    /// `Type(A, B)` — only the named constructors.
-    Only(BTreeSet<Symbol>),
-    /// `Type` (opaque) — no constructors.
-    None,
-}
+/// The constructor selection of an `exposing` clause, on both sides of an import.
+///
+/// The producer side reads a clause through [`exposed_ctor_filter`]. The
+/// importer side holds only a [`JudgedCtors`], which [`judge_ctor_clause`]
+/// builds by comparing the clause against the producer's [`CtorOffer`]: every
+/// constructor the clause names is delivered, or the import is refused.
+mod ctor_clause {
+    use std::collections::BTreeSet;
 
-impl CtorFilter {
-    /// Whether the constructor named `ctor` is opened by this filter.
-    fn admits(&self, ctor: Symbol) -> bool {
-        match self {
-            Self::All => true,
-            Self::Only(set) => set.contains(&ctor),
-            Self::None => false,
+    use ipe_intern::Symbol;
+    use ipe_syntax as src;
+
+    /// Which of a type's constructors an `exposing` clause opens into
+    /// unqualified scope: a `Type(A, B)` subset opens exactly `A`/`B`, never a
+    /// withheld sibling.
+    pub(super) enum CtorFilter {
+        /// `Type(..)`: every constructor of the type.
+        All,
+        /// `Type(A, B)`: only the named constructors.
+        Only(BTreeSet<Symbol>),
+        /// `Type` (opaque): no constructors.
+        None,
+    }
+
+    impl CtorFilter {
+        /// Whether the constructor named `ctor` is opened by this filter.
+        pub(super) fn admits(&self, ctor: Symbol) -> bool {
+            match self {
+                Self::All => true,
+                Self::Only(set) => set.contains(&ctor),
+                Self::None => false,
+            }
+        }
+    }
+
+    /// The constructor filter a module's own `exposing` privacy opens.
+    ///
+    /// Fail-closed: an opaque exposure admits nothing; a subset admits only the
+    /// named constructors.
+    pub(super) fn exposed_ctor_filter(privacy: &src::Privacy) -> CtorFilter {
+        match privacy {
+            src::Privacy::Public => CtorFilter::All,
+            src::Privacy::Private => CtorFilter::None,
+            src::Privacy::PublicCtors(names) => CtorFilter::Only(names.iter().copied().collect()),
+        }
+    }
+
+    /// The constructors a producer offers under one exported type name.
+    pub(super) enum CtorOffer {
+        /// A union, or a builtin union, with at least one constructor exported.
+        Ctors(BTreeSet<Symbol>),
+        /// A union exported without any of its constructors.
+        Abstract,
+        /// A type alias, which never has constructors.
+        Alias,
+        /// A builtin carrier with no constructors.
+        Opaque,
+    }
+
+    /// An importer-side constructor selection, built only by [`judge_ctor_clause`]
+    /// or, for an open import, [`JudgedCtors::open_import`].
+    pub(super) struct JudgedCtors(CtorFilter);
+
+    impl JudgedCtors {
+        /// The selection of `import M exposing (..)`: every constructor `M`
+        /// exposes. The clause names no constructor, so there is none to withhold.
+        pub(super) const fn open_import() -> Self {
+            Self(CtorFilter::All)
+        }
+
+        /// Whether the constructor named `ctor` is delivered.
+        pub(super) fn admits(&self, ctor: Symbol) -> bool {
+            self.0.admits(ctor)
+        }
+    }
+
+    /// Why a constructor clause is refused.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum Withheld<'offer> {
+        /// The type is exported without constructors.
+        Abstract,
+        /// `ctor`, the first named constructor in source order, is not `offered`.
+        Unknown {
+            ctor: Symbol,
+            offered: &'offer BTreeSet<Symbol>,
+        },
+        /// The type is an alias.
+        Alias,
+        /// The type is a builtin carrier with no constructors.
+        Opaque,
+    }
+
+    /// Judge an import's constructor clause `privacy` against the producer's `offer`.
+    ///
+    /// `T` asks for nothing and always passes. `T(..)` asks for every constructor
+    /// the producer exposes and needs at least one. `T(A, …)` needs every named
+    /// constructor among those exposed.
+    ///
+    /// # Errors
+    /// The [`Withheld`] reason when the clause asks for a constructor the offer
+    /// does not hold.
+    pub(super) fn judge_ctor_clause<'offer>(
+        privacy: &src::Privacy,
+        offer: &'offer CtorOffer,
+    ) -> Result<JudgedCtors, Withheld<'offer>> {
+        match (privacy, offer) {
+            (
+                src::Privacy::Private,
+                CtorOffer::Ctors(_) | CtorOffer::Abstract | CtorOffer::Alias | CtorOffer::Opaque,
+            ) => Ok(JudgedCtors(CtorFilter::None)),
+            (src::Privacy::Public, CtorOffer::Ctors(_)) => Ok(JudgedCtors(CtorFilter::All)),
+            (src::Privacy::PublicCtors(names), CtorOffer::Ctors(offered)) => {
+                match names.iter().find(|name| !offered.contains(name)) {
+                    Some(&ctor) => Err(Withheld::Unknown { ctor, offered }),
+                    None => Ok(JudgedCtors(CtorFilter::Only(
+                        names.iter().copied().collect(),
+                    ))),
+                }
+            }
+            (src::Privacy::Public | src::Privacy::PublicCtors(_), CtorOffer::Abstract) => {
+                Err(Withheld::Abstract)
+            }
+            (src::Privacy::Public | src::Privacy::PublicCtors(_), CtorOffer::Alias) => {
+                Err(Withheld::Alias)
+            }
+            (src::Privacy::Public | src::Privacy::PublicCtors(_), CtorOffer::Opaque) => {
+                Err(Withheld::Opaque)
+            }
         }
     }
 }
 
-/// The constructor filter an `exposing` privacy opens. Fail-closed: an opaque
-/// exposure admits nothing; a subset admits only the named constructors.
-fn exposed_ctor_filter(privacy: &src::Privacy) -> CtorFilter {
-    match privacy {
-        src::Privacy::Public => CtorFilter::All,
-        src::Privacy::Private => CtorFilter::None,
-        src::Privacy::PublicCtors(names) => CtorFilter::Only(names.iter().copied().collect()),
+/// Judge an import's constructor clause, refusing it at `span` with IPE-N0022.
+///
+/// # Errors
+/// [`NameError::CtorNotExposed`] when `module` does not expose a constructor
+/// the clause asks for under `type_name`; [`Diagnostic::CompilerBug`] for an
+/// unresolvable symbol.
+fn judge_import_ctors(
+    privacy: &src::Privacy,
+    offer: &CtorOffer,
+    module: &[Symbol],
+    type_name: Symbol,
+    span: Span,
+    interner: &Interner,
+) -> DResult<JudgedCtors> {
+    let withheld = match judge_ctor_clause(privacy, offer) {
+        Ok(judged) => return Ok(judged),
+        Err(withheld) => withheld,
+    };
+    let why = match withheld {
+        Withheld::Abstract => CtorWithheld::Abstract,
+        Withheld::Alias => CtorWithheld::Alias,
+        Withheld::Opaque => CtorWithheld::Opaque,
+        Withheld::Unknown { ctor, offered } => CtorWithheld::Unknown {
+            ctor: name_str(interner, ctor)?,
+            suggestions: Candidates::hints(suggestions(
+                ctor,
+                Shape::Flat,
+                offered.iter().copied(),
+                interner,
+            )),
+        },
+    };
+    Err(Diagnostic::Name {
+        span,
+        msg: NameError::CtorNotExposed {
+            module: path_to_dot_string(interner, module),
+            type_name: name_str(interner, type_name)?,
+            why,
+        },
+    })
+}
+
+/// The constructors a builtin `row` offers: its union's, or none for a carrier.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] if interning a constructor name exhausts the interner.
+fn builtin_ctor_offer(row: BuiltinType, interner: &mut Interner) -> DResult<CtorOffer> {
+    let Some(union) = crate::builtins::builtin_union_of(row) else {
+        return Ok(CtorOffer::Opaque);
+    };
+    let mut ctors = BTreeSet::new();
+    for &(name, _, _) in union.ctors {
+        ctors.insert(interner.intern(name)?);
     }
+    Ok(CtorOffer::Ctors(ctors))
+}
+
+/// The constructors a builtin `row` binds under an explicit import.
+///
+/// A union with a qualified home (`HttpMethod` under `Http`) binds the entries
+/// pooled under that kernel module, the same ones a qualified `Http.Get`
+/// reaches. An ambient union (`Maybe`) is bound at the ambient tier already,
+/// and a carrier has no constructors, so both yield none.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] when a union's qualified home names no kernel module.
+fn builtin_import_ctors(
+    row: BuiltinType,
+    env: &Env,
+    interner: &Interner,
+) -> DResult<Vec<CtorHome>> {
+    let Some(union) = crate::builtins::builtin_union_of(row) else {
+        return Ok(Vec::new());
+    };
+    let Some(qualifier) = union.qualified_home else {
+        return Ok(Vec::new());
+    };
+    let pooled = interner
+        .lookup(qualifier)
+        .and_then(|q| env.kernel_module_of(q))
+        .zip(interner.lookup(union.type_name));
+    let Some((module, type_name)) = pooled else {
+        return Err(Diagnostic::CompilerBug {
+            where_: "ipe_canon::builtin_import_ctors",
+            detail: format!(
+                "builtin union `{}` names qualified home `{qualifier}`, which pools no constructors",
+                union.type_name
+            ),
+        });
+    };
+    let (_, ctors) = env.kernel_module_members(module);
+    Ok(ctors
+        .into_values()
+        .filter(|ctor| ctor.type_name == type_name)
+        .collect())
 }
 
 /// Builtin type names whose lowering (`ipe_lower::ir_type_from_{ty,canon}`)
@@ -4266,22 +4451,68 @@ fn dep_type_target(exported: &crate::ExportedType) -> ScopeType {
     }
 }
 
-/// Bind a dependency's exported type `type_name` and the constructors `filter`
-/// admits at `tier`.
+/// The constructors a dependency offers under its exported type `type_name`.
+///
+/// A source union always declares at least one constructor (the parser refuses
+/// `type T` with no `=`), so a union exported with none of them is abstract.
 ///
 /// # Errors
-/// The clash [`bind_type`] or [`bind_expr`] reports.
+/// [`Diagnostic::CompilerBug`] if interning a builtin constructor name exhausts
+/// the interner.
+fn dep_ctor_offer(
+    dep: &crate::ModuleExports,
+    type_name: Symbol,
+    exported: Option<&crate::ExportedType>,
+    interner: &mut Interner,
+) -> DResult<CtorOffer> {
+    match exported {
+        Some(crate::ExportedType::Union { .. }) => {
+            let ctors: BTreeSet<Symbol> = dep
+                .ctors
+                .values()
+                .filter(|ctor| ctor.type_name == type_name)
+                .map(|ctor| ctor.name)
+                .collect();
+            Ok(if ctors.is_empty() {
+                CtorOffer::Abstract
+            } else {
+                CtorOffer::Ctors(ctors)
+            })
+        }
+        Some(crate::ExportedType::Builtin { row, .. }) => builtin_ctor_offer(*row, interner),
+        None => Ok(CtorOffer::Alias),
+    }
+}
+
+/// Bind a dependency's exported type `type_name` and the constructors `judged`
+/// delivers at `tier`.
+///
+/// A re-exported builtin union with a qualified home binds the constructors
+/// pooled under that home, the ones its own kernel import binds.
+///
+/// # Errors
+/// The clash [`bind_type`] or [`bind_expr`] reports; [`Diagnostic::CompilerBug`]
+/// when a builtin union's qualified home pools no constructors.
 #[allow(clippy::too_many_arguments)] // each argument is one independent fact of the binding
 fn bind_dep_union(
     dep: &crate::ModuleExports,
     type_name: Symbol,
     exported: &crate::ExportedType,
-    filter: &CtorFilter,
+    judged: &JudgedCtors,
     tier: Tier,
     span: Span,
     env: &mut Env,
     interner: &Interner,
 ) -> DResult<()> {
+    let ctors: Vec<CtorHome> = match exported {
+        crate::ExportedType::Union { .. } => dep
+            .ctors
+            .values()
+            .filter(|ctor| ctor.type_name == type_name)
+            .cloned()
+            .collect(),
+        crate::ExportedType::Builtin { row, .. } => builtin_import_ctors(*row, env, interner)?,
+    };
     let origin = imported(
         dep_type_target(exported),
         Identity::Type(exported.home().to_vec()),
@@ -4289,16 +4520,11 @@ fn bind_dep_union(
         span,
     );
     bind_type(env, type_name, tier, origin, interner)?;
-    for ctor in dep.ctors.values() {
-        if ctor.type_name == type_name && filter.admits(ctor.name) {
-            let origin = imported(
-                ExprTarget::Ctor(ctor.clone()),
-                ctor_identity(ctor),
-                &dep.path,
-                span,
-            );
-            bind_expr(env, ctor.name, tier, origin, interner)?;
-        }
+    for ctor in ctors.into_iter().filter(|ctor| judged.admits(ctor.name)) {
+        let identity = ctor_identity(&ctor);
+        let name = ctor.name;
+        let origin = imported(ExprTarget::Ctor(ctor), identity, &dep.path, span);
+        bind_expr(env, name, tier, origin, interner)?;
     }
     Ok(())
 }
@@ -4338,13 +4564,15 @@ fn bind_dep_alias(
 ///   explicit tier, where a second definition under one name is refused at the
 ///   import (IPE-N0024 for a value or constructor, IPE-N0012 for a type).
 /// * IPE-N0022 (`NameNotExposed`) when the exposing list names a value or type
-///   the dep does not export.
+///   the dep does not export, and (`CtorNotExposed`) when a type's constructor
+///   clause asks for a constructor [`judge_ctor_clause`] finds the dep withholds.
 /// * Qualifier installation through [`Env::install_import`] (`import M as Q`,
 ///   or the last segment and dotted path of a bare import).
 ///
 /// # Errors
-/// [`NameError::NameNotExposed`] / [`NameError::AmbiguousImport`] /
-/// [`NameError::DuplicateType`] / [`NameError::DuplicateQualifier`]; or
+/// [`NameError::NameNotExposed`] / [`NameError::CtorNotExposed`] /
+/// [`NameError::AmbiguousImport`] / [`NameError::DuplicateType`] /
+/// [`NameError::DuplicateQualifier`]; or
 /// [`Diagnostic::CompilerBug`] on an unresolvable symbol.
 #[allow(clippy::too_many_lines)] // declarative injection table — splitting would obscure flow
 fn inject_dep_exports(
@@ -4373,7 +4601,7 @@ fn inject_dep_exports(
                     dep,
                     type_name,
                     exported,
-                    &CtorFilter::All,
+                    &JudgedCtors::open_import(),
                     Tier::Open,
                     span,
                     env,
@@ -4431,12 +4659,16 @@ fn inject_dep_exports(
                                 },
                             });
                         }
+                        let offer = dep_ctor_offer(dep, *type_name, exported, interner)?;
+                        let judged = judge_import_ctors(
+                            privacy, &offer, dep_path, *type_name, item.span, interner,
+                        )?;
                         if let Some(exported) = exported {
                             bind_dep_union(
                                 dep,
                                 *type_name,
                                 exported,
-                                &exposed_ctor_filter(privacy),
+                                &judged,
                                 Tier::Explicit,
                                 item.span,
                                 env,
@@ -8902,10 +9134,11 @@ mod suggestion_ranking_tests {
 mod exposed_ctor_subset_tests {
     //! `exposing (Type(subset))` opens ONLY the named constructors unqualified.
     //! Both constructor binders ([`bind_dep_union`], the user-dep path, and
-    //! [`bind_stdlib_kernel_import`], the built-in path) route their
-    //! selection through [`exposed_ctor_filter`], so a withheld sibling stays
-    //! out of unqualified scope by construction — it remains reachable only
-    //! through its qualifier.
+    //! [`bind_stdlib_kernel_import`], the built-in path) take the selection
+    //! [`judge_ctor_clause`] builds, so a withheld sibling stays out of
+    //! unqualified scope by construction — it remains reachable only through its
+    //! qualifier — and a clause naming a constructor the producer does not
+    //! expose is refused at the import (IPE-N0022).
 
     use super::*;
 
@@ -8958,12 +9191,22 @@ mod exposed_ctor_subset_tests {
         assert!(!filter.admits(a.name), "opaque Type opens no constructor");
     }
 
-    /// Canonicalise a producer then an importer against it, returning the
-    /// importer's result. The producer exposes BOTH constructors so `dep.ctors`
-    /// carries A and B; the importer's `exposing` clause is the sole selector.
+    /// The producer of the acceptance pins: it exposes BOTH constructors, so
+    /// `dep.ctors` carries A and B and the importer's clause is the sole selector.
+    const OPEN_PRODUCER: &str = "module Dep exposing (T(..))\n\ntype T = A | B\n";
+
+    /// Canonicalise [`OPEN_PRODUCER`] then an importer against it.
     fn import_against_producer(importer_src: &str) -> (DResult<canon::Module>, Interner) {
+        import_against(OPEN_PRODUCER, importer_src)
+    }
+
+    /// Canonicalise `producer_src` as `Dep`, then `importer_src` against it,
+    /// returning the importer's result.
+    fn import_against(
+        producer_src: &str,
+        importer_src: &str,
+    ) -> (DResult<canon::Module>, Interner) {
         let mut i = Interner::new();
-        let producer_src = "module Dep exposing (T(..))\n\ntype T = A | B\n";
         let dep_path = vec![sym(&mut i, "Dep")];
         let main_path = vec![sym(&mut i, "Main")];
         let mut deps: BTreeMap<Vec<Symbol>, crate::ModuleExports> = BTreeMap::new();
@@ -9060,6 +9303,316 @@ mod exposed_ctor_subset_tests {
             ok_qual.is_ok(),
             "qualified Dep.A stays reachable under opaque T"
         );
+    }
+
+    /// An importer `Main` with `import <import_line>` and `x = <body>`.
+    fn importer(import_line: &str, body: &str) -> String {
+        format!("module Main exposing (x)\n\nimport {import_line}\n\nx =\n    {body}\n")
+    }
+
+    /// The span of `clause`'s first occurrence in `src`.
+    fn span_of(src: &str, clause: &str) -> Span {
+        let lo = src.find(clause).expect("clause occurs in the source");
+        Span {
+            lo: u32::try_from(lo).expect("small source"),
+            hi: u32::try_from(lo + clause.len()).expect("small source"),
+        }
+    }
+
+    /// The refusal `result` carries when it is a `CtorNotExposed`: its span,
+    /// type name and reason.
+    fn ctor_refusal(result: &DResult<canon::Module>) -> Option<(Span, &str, &CtorWithheld)> {
+        match result {
+            Err(Diagnostic::Name {
+                span,
+                msg: NameError::CtorNotExposed { type_name, why, .. },
+            }) => Some((*span, &**type_name, why)),
+            _ => None,
+        }
+    }
+
+    /// The unknown constructor a refusal names, when the reason is `Unknown`.
+    fn unknown_ctor(result: &DResult<canon::Module>) -> Option<&str> {
+        match ctor_refusal(result) {
+            Some((_, _, CtorWithheld::Unknown { ctor, .. })) => Some(&**ctor),
+            _ => None,
+        }
+    }
+
+    /// A producer exporting `T` without its constructors, and `make` to build one.
+    const ABSTRACT_PRODUCER: &str =
+        "module Dep exposing (T, make)\n\ntype T = A | B\n\nmake : T\nmake =\n    A\n";
+
+    /// R1: a constructor of a type exported without constructors is refused at
+    /// the import item, never dropped into a later N0001 at the use.
+    #[test]
+    fn subset_of_abstract_type_is_refused_at_the_item() {
+        let src = importer("Dep exposing (T(A))", "A");
+        let (result, _) = import_against(ABSTRACT_PRODUCER, &src);
+        let refusal = ctor_refusal(&result);
+        assert!(
+            matches!(refusal, Some((_, "T", CtorWithheld::Abstract))),
+            "{result:?}"
+        );
+        assert_eq!(
+            refusal.map(|r| r.0.lo),
+            Some(span_of(&src, "T(A)").lo),
+            "the refusal sits on the import item"
+        );
+    }
+
+    /// R1b: the `Abstract` remedy — import the type alone and build values
+    /// through the functions the module exposes — clears the refusal.
+    #[test]
+    fn abstract_remedy_import_type_alone_is_accepted() {
+        let (result, _) = import_against(
+            ABSTRACT_PRODUCER,
+            &importer("Dep exposing (T, make)", "make"),
+        );
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// R2: `T(..)` over an abstract type is refused.
+    #[test]
+    fn open_clause_on_abstract_type_is_refused() {
+        let (result, _) = import_against(ABSTRACT_PRODUCER, &importer("Dep exposing (T(..))", "0"));
+        assert!(
+            matches!(
+                ctor_refusal(&result),
+                Some((_, "T", CtorWithheld::Abstract))
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// R3: a constructor the type does not declare is refused by name.
+    #[test]
+    fn undeclared_ctor_is_refused() {
+        let (result, _) = import_against_producer(&importer("Dep exposing (T(C))", "0"));
+        assert_eq!(unknown_ctor(&result), Some("C"), "{result:?}");
+    }
+
+    /// R4: a declared constructor the producer keeps private is refused.
+    #[test]
+    fn private_sibling_ctor_is_refused() {
+        let producer = "module Dep exposing (T(A))\n\ntype T = A | B\n";
+        let (result, _) = import_against(producer, &importer("Dep exposing (T(B))", "0"));
+        assert_eq!(unknown_ctor(&result), Some("B"), "{result:?}");
+    }
+
+    /// R5: a lowercase name in a constructor clause is no constructor.
+    #[test]
+    fn lowercase_ctor_name_is_refused() {
+        let (result, _) = import_against_producer(&importer("Dep exposing (T(a))", "0"));
+        assert_eq!(unknown_ctor(&result), Some("a"), "{result:?}");
+    }
+
+    /// R6: one unknown constructor refuses the whole item, before `A` binds.
+    #[test]
+    fn one_unknown_ctor_refuses_the_whole_item() {
+        let (result, _) = import_against_producer(&importer("Dep exposing (T(A, C))", "A"));
+        assert_eq!(unknown_ctor(&result), Some("C"), "{result:?}");
+    }
+
+    /// R7: an alias has no constructors to import.
+    #[test]
+    fn open_clause_on_alias_is_refused() {
+        let producer = "module Dep exposing (R)\n\ntype alias R =\n    { x : Int }\n";
+        let (result, _) = import_against(producer, &importer("Dep exposing (R(..))", "0"));
+        assert!(
+            matches!(ctor_refusal(&result), Some((_, "R", CtorWithheld::Alias))),
+            "{result:?}"
+        );
+    }
+
+    /// Canonicalise `importer_src` against a `Dep` that re-exports the builtin
+    /// `row` as `name`.
+    fn import_against_builtin(
+        name: &str,
+        row: Option<BuiltinType>,
+        importer_src: &str,
+    ) -> DResult<canon::Module> {
+        let mut i = Interner::new();
+        let row = row.expect("the builtin row exists");
+        let dep_path = vec![sym(&mut i, "Dep")];
+        let exports = crate::ModuleExports {
+            path: dep_path.clone(),
+            types: BTreeMap::from([(
+                sym(&mut i, name),
+                crate::ExportedType::Builtin {
+                    home: dep_path.clone(),
+                    row,
+                },
+            )]),
+            ..crate::ModuleExports::default()
+        };
+        let deps = BTreeMap::from([(dep_path, exports)]);
+        let main_path = vec![sym(&mut i, "Main")];
+        let parsed = ipe_parse::parse_module(importer_src, &mut i).expect("importer parses");
+        canonicalise_module(&parsed, &main_path, &deps, &mut i).map(|(module, _)| module)
+    }
+
+    /// R8: a re-exported builtin union offers exactly its own constructors.
+    #[test]
+    fn reexported_builtin_union_judges_its_ctors() {
+        let maybe = BuiltinType::of_bare_name("Maybe");
+        let refused =
+            import_against_builtin("Maybe", maybe, &importer("Dep exposing (Maybe(Some))", "0"));
+        assert_eq!(unknown_ctor(&refused), Some("Some"), "{refused:?}");
+        let accepted = import_against_builtin(
+            "Maybe",
+            maybe,
+            &importer("Dep exposing (Maybe(Just))", "Just 1"),
+        );
+        assert!(accepted.is_ok(), "{accepted:?}");
+    }
+
+    /// R9: a re-exported builtin carrier has no constructors to import.
+    #[test]
+    fn reexported_builtin_carrier_is_opaque() {
+        let result = import_against_builtin(
+            "Dict",
+            BuiltinType::of_bare_name("Dict"),
+            &importer("Dep exposing (Dict(..))", "0"),
+        );
+        assert!(
+            matches!(
+                ctor_refusal(&result),
+                Some((_, "Dict", CtorWithheld::Opaque))
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// R11: the `Ipe.Db.Store` `Order` row is opaque, never the ambient `Order`
+    /// union its name shares.
+    #[test]
+    fn homed_order_row_is_opaque_not_the_ambient_union() {
+        let result = import_against_builtin(
+            "Order",
+            BuiltinType::of_head(&["Ipe", "Db", "Store"], "Order"),
+            &importer("Dep exposing (Order(..))", "0"),
+        );
+        assert!(
+            matches!(
+                ctor_refusal(&result),
+                Some((_, "Order", CtorWithheld::Opaque))
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// A re-exported union with a qualified home binds the constructors pooled
+    /// under that home, and judges a clause against them.
+    #[test]
+    fn reexported_homed_union_binds_its_pooled_ctors() {
+        let method = BuiltinType::of_bare_name("HttpMethod");
+        let accepted = import_against_builtin(
+            "HttpMethod",
+            method,
+            &importer("Dep exposing (HttpMethod(Get))", "Get"),
+        );
+        assert!(accepted.is_ok(), "{accepted:?}");
+        let withheld = import_against_builtin(
+            "HttpMethod",
+            method,
+            &importer("Dep exposing (HttpMethod(Get))", "Post"),
+        );
+        assert!(
+            withheld.is_err(),
+            "a withheld sibling stays unbound: {withheld:?}"
+        );
+        let refused = import_against_builtin(
+            "HttpMethod",
+            method,
+            &importer("Dep exposing (HttpMethod(Bogus))", "0"),
+        );
+        assert_eq!(unknown_ctor(&refused), Some("Bogus"), "{refused:?}");
+    }
+
+    /// Canonicalise `importer_src` with no compiled dependency, so a stdlib
+    /// import goes through the kernel path.
+    fn kernel_import(importer_src: &str) -> DResult<canon::Module> {
+        let mut i = Interner::new();
+        let main_path = vec![sym(&mut i, "Main")];
+        let parsed = ipe_parse::parse_module(importer_src, &mut i).expect("importer parses");
+        canonicalise_module(&parsed, &main_path, &BTreeMap::new(), &mut i).map(|(module, _)| module)
+    }
+
+    /// R10: the kernel path judges a clause against the union's constructors.
+    #[test]
+    fn kernel_union_judges_its_ctors() {
+        let refused = kernel_import(&importer("Ipe.Http exposing (HttpMethod(Bogus))", "0"));
+        assert_eq!(unknown_ctor(&refused), Some("Bogus"), "{refused:?}");
+        let accepted = kernel_import(&importer("Ipe.Http exposing (HttpMethod(Get))", "Get"));
+        assert!(accepted.is_ok(), "{accepted:?}");
+    }
+
+    /// R13: a kernel type without constructors is refused by its kind.
+    #[test]
+    fn kernel_types_without_ctors_are_refused_by_kind() {
+        let alias = kernel_import(&importer("Ipe.Http exposing (HttpResponse(..))", "0"));
+        assert!(
+            matches!(
+                ctor_refusal(&alias),
+                Some((_, "HttpResponse", CtorWithheld::Alias))
+            ),
+            "{alias:?}"
+        );
+        let carrier = kernel_import(&importer("Ipe.Json.Decode exposing (Decoder(..))", "0"));
+        assert!(
+            matches!(
+                ctor_refusal(&carrier),
+                Some((_, "Decoder", CtorWithheld::Opaque))
+            ),
+            "{carrier:?}"
+        );
+    }
+
+    /// R12: every (ask x offer) cell of the judge.
+    #[test]
+    fn judge_table_covers_every_cell() {
+        let mut i = Interner::new();
+        let a = sym(&mut i, "A");
+        let b = sym(&mut i, "B");
+        let c = sym(&mut i, "C");
+        let offered = BTreeSet::from([a, b]);
+        let offers = [
+            CtorOffer::Ctors(offered.clone()),
+            CtorOffer::Abstract,
+            CtorOffer::Alias,
+            CtorOffer::Opaque,
+        ];
+        for offer in &offers {
+            let judged = judge_ctor_clause(&src::Privacy::Private, offer);
+            assert!(
+                judged.is_ok_and(|j| !j.admits(a) && !j.admits(b)),
+                "`T` alone passes and opens nothing"
+            );
+        }
+        let [ctors, abstract_, alias, opaque] = &offers;
+        let all = judge_ctor_clause(&src::Privacy::Public, ctors);
+        assert!(all.is_ok_and(|j| j.admits(a) && j.admits(b)));
+        let subset = judge_ctor_clause(&src::Privacy::PublicCtors(vec![a]), ctors);
+        assert!(subset.is_ok_and(|j| j.admits(a) && !j.admits(b)));
+        assert_eq!(
+            judge_ctor_clause(&src::Privacy::PublicCtors(vec![c, a]), ctors).err(),
+            Some(Withheld::Unknown {
+                ctor: c,
+                offered: &offered
+            })
+        );
+        for ask in [src::Privacy::Public, src::Privacy::PublicCtors(vec![a])] {
+            assert_eq!(
+                judge_ctor_clause(&ask, abstract_).err(),
+                Some(Withheld::Abstract)
+            );
+            assert_eq!(judge_ctor_clause(&ask, alias).err(), Some(Withheld::Alias));
+            assert_eq!(
+                judge_ctor_clause(&ask, opaque).err(),
+                Some(Withheld::Opaque)
+            );
+        }
     }
 }
 

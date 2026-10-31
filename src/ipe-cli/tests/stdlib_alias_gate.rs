@@ -14,6 +14,8 @@
 //! kernel modules; compiled-source modules such as `Ipe.Io` are injected by
 //! the CLI project pipeline this harness does not run.
 
+use std::collections::BTreeMap;
+
 use ipe_canon::{KernelTypeExport, STDLIB_MODULE_QUALIFIERS, bare_import_binds};
 use ipe_diagnostics::{Diagnostic, NameError, StdlibReach};
 use ipe_intern::Interner;
@@ -764,6 +766,61 @@ fn exposing_unknown_kernel_type_is_refused() {
             "{import}: {refused:?}"
         );
     }
+}
+
+/// `import <module> exposing (<clause>)` canonicalised against the module's
+/// embedded compiled source, using `body`.
+fn import_compiled_std(module: &str, clause: &str, body: &str) -> Result<(), Diagnostic> {
+    let mut interner = Interner::new();
+    let segments: Vec<String> = module.split('.').map(String::from).collect();
+    let source = ipe_stdlib::compiled_std_source_segments(&segments).unwrap_or_default();
+    let parsed = ipe_parse::parse_module(source, &mut interner)?;
+    let mut path = Vec::new();
+    for segment in module.split('.') {
+        path.push(interner.intern(segment)?);
+    }
+    let (_, exports) = ipe_canon::canonicalise_module_with_origin(
+        &parsed,
+        &path,
+        &BTreeMap::new(),
+        ipe_canon::ModuleOrigin::EmbeddedStdlib,
+        &mut interner,
+    )?;
+    let deps = BTreeMap::from([(path, exports)]);
+    let main = program(&format!("import {module} exposing ({clause})\n"), body);
+    let parsed = ipe_parse::parse_module(&main, &mut interner)?;
+    let main_path = vec![interner.intern("Main")?];
+    ipe_canon::canonicalise_module(&parsed, &main_path, &deps, &mut interner).map(drop)
+}
+
+/// The ambient builtin unions keep every constructor an import names: the
+/// `Result(..)` and `Maybe(..)` imports across the tree stay accepted.
+#[test]
+fn ambient_union_ctor_imports_are_accepted() -> Result<(), Diagnostic> {
+    import_compiled_std("Ipe.Result", "Result(..)", "Ok 1")?;
+    import_compiled_std("Ipe.Result", "Result(Ok, Err)", "Err 1")?;
+    import_compiled_std("Ipe.Maybe", "Maybe(..)", "Just 1")?;
+    import_compiled_std("Ipe.Maybe", "Maybe(Just)", "Just 1")?;
+    Ok(())
+}
+
+/// A constructor the ambient union does not declare is refused at the import.
+#[test]
+fn ambient_union_unknown_ctor_is_refused() {
+    let refused = import_compiled_std("Ipe.Maybe", "Maybe(Some)", "0");
+    assert!(
+        matches!(
+            &refused,
+            Err(Diagnostic::Name {
+                msg: NameError::CtorNotExposed {
+                    why: ipe_diagnostics::CtorWithheld::Unknown { ctor, .. },
+                    ..
+                },
+                ..
+            }) if &**ctor == "Some"
+        ),
+        "{refused:?}"
+    );
 }
 
 /// A kernel alias takes no type argument: applying one is IPE-N0013.

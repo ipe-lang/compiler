@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 
 use ipe_diagnostics::DResult;
 use ipe_intern::{Interner, Symbol};
-use ipe_kernels::{BUILTIN_TYPES, BuiltinRow, KernelHome};
+use ipe_kernels::{BUILTIN_TYPES, BuiltinRow, BuiltinType, KernelHome};
 
 use crate::env::const_str_eq;
 
@@ -355,6 +355,22 @@ const _: () = assert!(
     "every BUILTIN_UNIONS entry must name a BUILTIN_TYPES row that admits its constructors",
 );
 
+/// The builtin union whose constructors `row` carries, keyed on the row's identity.
+///
+/// A union belongs to the empty-home row of its `type_name`, else to the one
+/// module-home row of that name (the rule [`unions_agree`] asserts at build
+/// time). A module-home row sharing a name with an empty-home union, such as
+/// `Ipe.Db.Store`'s `Order`, is a distinct head and carries no constructors.
+#[must_use]
+pub fn builtin_union_of(row: BuiltinType) -> Option<&'static BuiltinUnion> {
+    let name = row.row().name();
+    let owner = BuiltinType::of_bare_name(name).unwrap_or(row);
+    if owner != row {
+        return None;
+    }
+    BUILTIN_UNIONS.iter().find(|union| union.type_name == name)
+}
+
 /// One interned built-in constructor: its owning union's interned type name plus
 /// its declaration index and payload arity.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -424,11 +440,54 @@ pub fn intern_builtins(interner: &mut Interner) -> DResult<InternedBuiltins> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTH_ERROR_CTORS, BUILTIN_UNIONS, BuiltinUnion, DB_FAILURE_CTORS, intern_builtins,
-        unions_agree,
+        AUTH_ERROR_CTORS, BUILTIN_UNIONS, BuiltinUnion, DB_FAILURE_CTORS, builtin_union_of,
+        intern_builtins, unions_agree,
     };
     use ipe_intern::Interner;
-    use ipe_kernels::BUILTIN_TYPES;
+    use ipe_kernels::{BUILTIN_TYPES, BuiltinRow, BuiltinType, KernelHome};
+
+    /// The row `row` names, looked up through its own head.
+    fn head_of(row: &BuiltinRow) -> Option<BuiltinType> {
+        let home = match row.home() {
+            KernelHome::Builtin => Vec::new(),
+            KernelHome::Module(path) => path.split('.').collect(),
+        };
+        BuiltinType::of_head(&home, row.name())
+    }
+
+    /// Every union is reached from exactly one row, and that row carries its name.
+    #[test]
+    fn every_union_is_reached_from_exactly_one_row() {
+        for union in BUILTIN_UNIONS {
+            let reaching: Vec<&BuiltinRow> = BUILTIN_TYPES
+                .iter()
+                .filter(|row| {
+                    head_of(row)
+                        .and_then(builtin_union_of)
+                        .is_some_and(|hit| core::ptr::eq(hit, union))
+                })
+                .collect();
+            assert_eq!(
+                reaching.len(),
+                1,
+                "`{}` is reached from {} rows",
+                union.type_name,
+                reaching.len()
+            );
+            assert!(reaching.iter().all(|row| row.name() == union.type_name));
+        }
+    }
+
+    /// The `Ipe.Db.Store` `Order` row is its own opaque head, never the ambient
+    /// `Order` union; the empty-home `Order` row is that union.
+    #[test]
+    fn the_homed_order_row_carries_no_union() {
+        let db_order = BuiltinType::of_head(&["Ipe", "Db", "Store"], "Order");
+        assert!(db_order.is_some(), "the `Ipe.Db.Store` `Order` row exists");
+        assert!(db_order.and_then(builtin_union_of).is_none());
+        let order = BuiltinType::of_head(&[], "Order").and_then(builtin_union_of);
+        assert_eq!(order.map(|union| union.type_name), Some("Order"));
+    }
 
     const fn stub_union(
         type_name: &'static str,
