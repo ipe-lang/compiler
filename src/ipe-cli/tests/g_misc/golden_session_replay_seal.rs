@@ -138,7 +138,7 @@ fn record_then_replay_is_deterministic_and_refuses_bad_logs() {
 }
 
 /// A log from a changed program or a truncated log is refused, printing nothing.
-fn assert_bad_logs_are_refused(exe: &str, logs: &Path, typed: &Path) {
+fn assert_bad_logs_are_refused(exe: &Path, logs: &Path, typed: &Path) {
     // A changed program: the log's Msg tag no longer matches.
     let text = std::fs::read_to_string(typed).unwrap_or_default();
     assert!(

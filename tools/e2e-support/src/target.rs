@@ -419,9 +419,11 @@ impl<'a> ArtifactStem<'a> {
     }
 }
 
-/// A built emitted binary and the artifacts it owns. Dropping it removes them:
-/// in the shared target, that package's leaf artifacts (the dependency tree
-/// stays); in an isolated tree, the whole tree it holds.
+/// A built emitted binary and the artifacts it owns.
+///
+/// Dropping it removes them: in the shared target, that package's leaf
+/// artifacts (the dependency tree stays); in an isolated tree, the whole tree
+/// it holds.
 ///
 /// Derefs to the binary's path; hold it for as long as the binary runs.
 #[derive(Debug)]
@@ -657,7 +659,9 @@ mod tests {
 
     #[test]
     fn artifact_stem_refuses_non_hex_and_wrong_width() {
-        let parsed = |s: &str| ArtifactStem::parse(s).map(|stem| stem.name());
+        fn parsed(file_name: &str) -> Option<&str> {
+            ArtifactStem::parse(file_name).map(|stem| stem.name())
+        }
         assert_eq!(parsed(&format!("app_1-{HASH}")), Some("app_1"));
         assert_eq!(parsed(&format!("app_1-{HASH}.d")), Some("app_1"));
         assert_eq!(
@@ -825,6 +829,6 @@ mod tests {
             Some(r#"slow-timeout = { period = "60s", terminate-after = 5 }"#),
             "the budget ISOLATED_LOCK_WAIT is stated against moved"
         );
-        assert!(ISOLATED_LOCK_WAIT < Duration::from_secs(60 * 5));
+        assert!(ISOLATED_LOCK_WAIT < Duration::from_mins(5));
     }
 }

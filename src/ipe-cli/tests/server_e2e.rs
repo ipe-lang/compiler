@@ -36,7 +36,6 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -78,7 +77,10 @@ main =
 /// # Errors
 ///
 /// Returns an error on any pipeline or Cargo build failure.
-fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<PathBuf, BoxError> {
+fn compile_and_build(
+    test_name: &str,
+    ipe_source: &str,
+) -> Result<e2e_support::SharedBuild, BoxError> {
     compile_and_build_as(
         test_name,
         ipe_source,
