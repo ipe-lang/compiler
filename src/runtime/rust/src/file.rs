@@ -1353,18 +1353,27 @@ mod read_file_limit_tests {
             std::process::id()
         ));
         std::fs::write(&p, vec![b'a'; 17]).unwrap();
-        let res = file_read_file_limit_sync(&p.to_string_lossy(), 16);
+        let shown = p.to_string_lossy();
+        let refusals = [
+            (
+                "file exceeds 16-byte limit",
+                file_read_file_limit_sync(&shown, 16),
+            ),
+            (
+                "file exceeds read ceiling of 16 bytes",
+                file_read_file_sync(&shown, 16),
+            ),
+        ];
         let _ = std::fs::remove_file(&p);
-        let message = match res {
-            Err(KernelFailure::LimitExceeded(refusal)) => refusal.message().to_owned(),
-            other => format!("not a LimitExceeded refusal: {other:?}"),
-        };
-        assert!(
-            message.starts_with("file exceeds 16-byte limit"),
-            "{message:?}"
-        );
-        assert!(!message.contains('\u{1b}'), "{message:?}");
-        assert!(message.contains("\\u{1b}[2J\\\"x.txt\""), "{message:?}");
+        for (prefix, res) in refusals {
+            let message = match res {
+                Err(KernelFailure::LimitExceeded(refusal)) => refusal.message().to_owned(),
+                other => format!("not a LimitExceeded refusal: {other:?}"),
+            };
+            assert!(message.starts_with(prefix), "{message:?}");
+            assert!(!message.contains('\u{1b}'), "{message:?}");
+            assert!(message.contains("\\u{1b}[2J\\\"x.txt\""), "{message:?}");
+        }
     }
 
     fn limit_read(name: &str, content: &[u8], limit: i64) -> IpeResult<String, String> {
