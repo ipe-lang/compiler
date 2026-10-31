@@ -456,15 +456,26 @@ mod tests {
     }
 
     /// Every union is reached from exactly one row, and that row carries its name.
+    ///
+    /// Unions are matched by `type_name`, unique across the table: a `const`
+    /// slice has no stable address, so pointer identity cannot witness a hit.
     #[test]
     fn every_union_is_reached_from_exactly_one_row() {
+        let mut names: Vec<&str> = BUILTIN_UNIONS.iter().map(|union| union.type_name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            BUILTIN_UNIONS.len(),
+            "union type names are unique"
+        );
         for union in BUILTIN_UNIONS {
             let reaching: Vec<&BuiltinRow> = BUILTIN_TYPES
                 .iter()
                 .filter(|row| {
                     head_of(row)
                         .and_then(builtin_union_of)
-                        .is_some_and(|hit| core::ptr::eq(hit, union))
+                        .is_some_and(|hit| hit.type_name == union.type_name)
                 })
                 .collect();
             assert_eq!(
