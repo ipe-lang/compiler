@@ -5452,7 +5452,7 @@ mod tests {
             return Err(format!("no `{open}` marker"));
         };
         let after_open = &doc[start.saturating_add(open.len())..];
-        if after_open.find(open).is_some() {
+        if after_open.contains(open) {
             return Err(format!("more than one `{open}` marker"));
         }
         let Some(end) = after_open.find(close) else {
@@ -5497,14 +5497,13 @@ mod tests {
     #[test]
     fn android_build_steps_docs_block_is_rendered_block() {
         let path = repo_root_for_tests().join("docs/guide/delivery.md");
-        let doc = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("{} reads: {e}", path.display()));
+        let doc = std::fs::read_to_string(&path).expect("docs/guide/delivery.md reads");
         let block = marked_block(
             &doc,
             "<!-- android-build-steps -->",
             "<!-- /android-build-steps -->",
         )
-        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        .expect("exactly one android-build-steps marker pair in docs/guide/delivery.md");
         let steps = android_build_steps();
         let rendered: Vec<&str> = steps.lines().collect();
         let doc_lines: Vec<&str> = block.lines().collect();
@@ -5515,9 +5514,9 @@ mod tests {
         );
     }
 
-    /// One file:line naming a hand-written Gradle wrapper/build command outside
-    /// its one sanctioned home: the `## android-build-steps` catalog section,
-    /// or a `<!-- android-build-steps -->` marked doc block.
+    /// One `file:line` naming a hand-written Gradle wrapper/build command
+    /// outside its one sanctioned home: the `## android-build-steps` catalog
+    /// section, or a `<!-- android-build-steps -->` marked doc block.
     #[derive(Debug, PartialEq, Eq)]
     struct StrayGradleLine {
         file: String,
