@@ -196,19 +196,16 @@ fn compute_next(
         TransitionOp::IntAdd => {
             let a = current.as_i64()?;
             let b = resolve_source(source, obj)?.as_i64()?;
-            // Two's-complement wrapping, the single defined semantics of Ipê `+`
-            // on `Int` (`ipe_runtime::math::ipe_int_add`). The compiled arm emits
-            // that wrapping add, so this datum path MUST wrap too — a checked
-            // refuse-on-overflow would silently diverge from the direct compiled
-            // arm at the i64 boundary and break dev == prod.
-            let sum = a.wrapping_add(b);
+            // The one Int `+` definition the compiled arm also emits, so the
+            // datum path and the direct compiled arm agree at the i64 boundary.
+            let sum = crate::math::ipe_int_add(a, b);
             Some(serde_json::Value::from(sum))
         }
         TransitionOp::IntSub => {
             let a = current.as_i64()?;
             let b = resolve_source(source, obj)?.as_i64()?;
-            // Wrapping, matching `ipe_runtime::math::ipe_int_sub` (see `IntAdd`).
-            let diff = a.wrapping_sub(b);
+            // The one Int `-` definition (see `IntAdd`).
+            let diff = crate::math::ipe_int_sub(a, b);
             Some(serde_json::Value::from(diff))
         }
         TransitionOp::BoolNot => {

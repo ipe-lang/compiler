@@ -113,11 +113,13 @@ modBy : Int -> Int -> Int
 divisor.
 
 This follows the mathematical modulo convention (not C-style remainder):
-the result is always in the range `[0, abs divisor)` when `divisor > 0`.
+the result is always in the range `[0, divisor)` when `divisor > 0`, and in
+`(divisor, 0]` when `divisor < 0`.
 
 ```ipe
 modBy 3 10 --> 1
 modBy 3 (-1) --> 2
+modBy (-3) 10 --> -2
 modBy 5 0 --> 0
 ```
 

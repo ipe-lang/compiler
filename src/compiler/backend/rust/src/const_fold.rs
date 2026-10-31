@@ -47,6 +47,7 @@ use std::collections::BTreeMap;
 
 use ipe_intern::{Interner, Symbol};
 use ipe_ir::{BinOp, Callee, Expr, Func, FuncId, KernelFn, ModPath, Pat, Program};
+use ipe_runtime_rust::math::{ipe_int_add, ipe_int_mul, ipe_int_sub};
 
 use crate::emit_ui_plan::{LitKind, appearance_literal_args};
 
@@ -1050,9 +1051,10 @@ fn eval_binop(op: BinOp, l: &ConstValue, r: &ConstValue) -> Option<ConstValue> {
     match (op, l, r) {
         (BinOp::Append, Str(a), Str(b)) => Some(Str(format!("{a}{b}"))),
 
-        (BinOp::IntAdd | BinOp::Add, Int(a), Int(b)) => Some(Int(a.wrapping_add(*b))),
-        (BinOp::IntSub | BinOp::Sub, Int(a), Int(b)) => Some(Int(a.wrapping_sub(*b))),
-        (BinOp::IntMul | BinOp::Mul, Int(a), Int(b)) => Some(Int(a.wrapping_mul(*b))),
+        // The runtime's one Int `+`/`-`/`*` definitions, so a fold cannot drift.
+        (BinOp::IntAdd | BinOp::Add, Int(a), Int(b)) => Some(Int(ipe_int_add(*a, *b))),
+        (BinOp::IntSub | BinOp::Sub, Int(a), Int(b)) => Some(Int(ipe_int_sub(*a, *b))),
+        (BinOp::IntMul | BinOp::Mul, Int(a), Int(b)) => Some(Int(ipe_int_mul(*a, *b))),
         // Integer division is total in the runtime only through the checked
         // helper (`b == 0` and `MIN / -1` are guarded there); rather than
         // reproduce that guard's exact result, division by zero simply does not
