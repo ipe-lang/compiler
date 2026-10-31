@@ -176,8 +176,6 @@ fn the_marker_surfaces_the_type_and_the_emitted_crate_builds_and_runs() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let cargo = ipe_env::var("CARGO").expect("cargo sets CARGO for every test it runs");
-
     // The built inspector binary sits beside the test deps under the target dir;
     // `env!` gives the ffi crate dir, from which the workspace target is
     // reachable. Prefer an explicit override, else look beside the test binary.
@@ -268,18 +266,19 @@ fn main() {{
     );
     std::fs::write(root.join("src").join("main.rs"), main_rs).expect("app main.rs");
 
-    let out = std::process::Command::new(&cargo)
-        .arg("run")
-        .arg("--quiet")
-        .current_dir(&root)
-        .output()
-        .expect("cargo run spawns");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let ran = e2e_support::build_and_run_rust("ffi_define_trait_impl", &root);
     assert!(
-        out.status.success(),
+        ran.is_ok(),
+        "{}",
+        ran.as_ref().err().map_or("", String::as_str)
+    );
+    let run = ran.expect("asserted Ok above");
+    let stdout = &run.stdout;
+    assert_eq!(
+        run.exit_code,
+        Some(0),
         "the emitted app crate + marked-wrapper path dep must build and run exit 0.\n\
-         stdout: {stdout}\nstderr: {stderr}"
+         stdout: {stdout}"
     );
     assert!(
         stdout.contains("sprite@3"),
