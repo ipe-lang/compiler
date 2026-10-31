@@ -22,22 +22,25 @@ import Ipe.Ffi.Kernel as Kernel
 --   * `"enter"`, `"tab"`, `"backspace"`, `"escape"`, `"delete"`.
 --   * `"up"`, `"down"`, `"left"`, `"right"`, `"home"`, `"end"`, `"pageup"`,
 --     `"pagedown"`.
+--   * `"ctrlleft"`, `"ctrlright"` — Left or Right with Ctrl held.
 --   * `"fn"` — a function key; `value` is its number, `"1"` to `"12"`.
 --   * `"ctrl"` — Ctrl with a letter; `value` is the lowercase letter (`"c"`
 --     for Ctrl-C). Ctrl-H arrives as `"backspace"`, Ctrl-I as `"tab"`, and
 --     Ctrl-J and Ctrl-M as `"enter"`.
 --   * `"paste-start"`, `"paste-end"` — the edges of a bracketed paste.
---   * `"other"` — any sequence not listed above; `value` is its raw text.
+--   * `"other"` — any sequence not listed above, Shift-Tab and a control
+--     character such as Ctrl-Space included; `value` is its raw text.
 --
--- Modifiers are not reported on their own: Shift shows only in the character
--- it produces, Alt with a character arrives as `"escape"` and then that
--- character, and a modifier held with a named key (Ctrl-Right) is dropped.
+-- The record carries no modifier flags: Shift shows only in the character it
+-- produces, Alt with a character arrives as `"escape"` and then that
+-- character, and any modifier on a named key other than Ctrl on Left or Right
+-- is dropped, leaving the key (Ctrl-F5 arrives as `"fn"` with `value` `"5"`).
 -- Mouse events never reach `onKey`.
 --
 -- While the view shows focusable controls, the runtime keeps the keys that
 -- drive them: Tab and Shift-Tab (and Up and Down outside a text field) move
 -- focus, Enter and Space activate the focused control, and while a text field
--- has focus every key goes to the field. A `"ctrl"` key always reaches
+-- has focus every other key goes to the field. A `"ctrl"` key always reaches
 -- `onKey`.
 onKey =
     Kernel.kernel "TeaTuiSub_onKey"
