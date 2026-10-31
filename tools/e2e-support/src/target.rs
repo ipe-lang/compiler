@@ -21,7 +21,9 @@ use std::io;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
 pub use ipe_env::oracle_target::SharedTarget;
@@ -84,8 +86,8 @@ pub enum TargetError {
         /// How long this process waited.
         waited: Duration,
     },
-    /// This process already holds an isolated tree; a second would wait on
-    /// its own lock.
+    /// The calling thread already holds an isolated tree; a second would wait
+    /// on its own lock. Other threads of the process wait on the lock instead.
     IsolatedAlreadyHeld,
     /// A filesystem step failed.
     Io {
@@ -113,7 +115,7 @@ impl fmt::Display for TargetError {
                 waited.as_secs()
             ),
             Self::IsolatedAlreadyHeld => {
-                f.write_str("this test process already holds the isolated build target")
+                f.write_str("this test thread already holds the isolated build target")
             }
             Self::Io { op, kind } => write!(f, "isolated build target: {op:?} failed: {kind}"),
         }
@@ -306,8 +308,25 @@ pub fn clear_target_dir_env(cmd: &mut Command) {
     cmd.env_remove(TARGET_DIR_VAR);
 }
 
-/// Whether this process holds an [`IsolatedTarget`].
-static ISOLATED_HELD: AtomicBool = AtomicBool::new(false);
+/// The threads of this process that hold an [`IsolatedTarget`].
+///
+/// A thread asking for a second tree would wait on its own lock, so it is
+/// refused; any other thread waits on the file lock, which conflicts between
+/// two open handles of one process as between two processes.
+static ISOLATED_HOLDERS: Mutex<Vec<ThreadId>> = Mutex::new(Vec::new());
+
+/// [`ISOLATED_HOLDERS`], recovered from a poisoned lock: the list is only
+/// ever pushed to or retained over, so a panic elsewhere leaves it consistent.
+fn isolated_holders() -> MutexGuard<'static, Vec<ThreadId>> {
+    ISOLATED_HOLDERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Drop `holder` from [`ISOLATED_HOLDERS`].
+fn release_holder(holder: ThreadId) {
+    isolated_holders().retain(|h| *h != holder);
+}
 
 /// The sequence number of the next isolated tree in this process.
 static ISOLATED_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -318,6 +337,7 @@ static ISOLATED_SEQ: AtomicU64 = AtomicU64::new(0);
 pub struct IsolatedTarget {
     tree: PathBuf,
     lock: File,
+    holder: ThreadId,
 }
 
 impl IsolatedTarget {
@@ -341,7 +361,7 @@ impl Drop for IsolatedTarget {
         if let Err(e) = self.lock.unlock() {
             eprintln!("e2e-support: could not release the isolated lock: {e}");
         }
-        ISOLATED_HELD.store(false, Ordering::Release);
+        release_holder(self.holder);
     }
 }
 
@@ -350,8 +370,8 @@ impl Drop for IsolatedTarget {
 ///
 /// # Errors
 ///
-/// As [`shared`]; [`TargetError::IsolatedAlreadyHeld`] when this process
-/// already holds one; [`TargetError::IsolatedLockTimedOut`] past
+/// As [`shared`]; [`TargetError::IsolatedAlreadyHeld`] when the calling
+/// thread already holds one; [`TargetError::IsolatedLockTimedOut`] past
 /// [`ISOLATED_LOCK_WAIT`]; [`TargetError::Io`] when a filesystem step fails.
 pub fn isolated(reason: IsolationReason) -> Result<IsolatedTarget, TargetError> {
     let base = shared()?.map_or_else(ipe_test_temp::temp_root, SharedTarget::into_path_buf);
@@ -364,12 +384,17 @@ fn isolated_in(
     reason: IsolationReason,
     wait: Duration,
 ) -> Result<IsolatedTarget, TargetError> {
-    if ISOLATED_HELD.swap(true, Ordering::AcqRel) {
-        return Err(TargetError::IsolatedAlreadyHeld);
+    let holder = thread::current().id();
+    {
+        let mut holders = isolated_holders();
+        if holders.contains(&holder) {
+            return Err(TargetError::IsolatedAlreadyHeld);
+        }
+        holders.push(holder);
     }
-    let held = take_isolated(base, reason, wait);
+    let held = take_isolated(base, reason, wait, holder);
     if held.is_err() {
-        ISOLATED_HELD.store(false, Ordering::Release);
+        release_holder(holder);
     }
     held
 }
@@ -379,6 +404,7 @@ fn take_isolated(
     base: &Path,
     reason: IsolationReason,
     wait: Duration,
+    holder: ThreadId,
 ) -> Result<IsolatedTarget, TargetError> {
     let io = |op| move |e: io::Error| TargetError::Io { op, kind: e.kind() };
     let root = base.join(ISOLATED_DIR);
@@ -409,7 +435,7 @@ fn take_isolated(
     let seq = ISOLATED_SEQ.fetch_add(1, Ordering::Relaxed);
     let tree = root.join(format!("{}-{}-{seq}", reason.slug(), std::process::id()));
     fs::create_dir(&tree).map_err(io(TargetOp::CreateTree))?;
-    Ok(IsolatedTarget { tree, lock })
+    Ok(IsolatedTarget { tree, lock, holder })
 }
 
 /// Take the exclusive lock on `lock`, polling until `wait` has passed.
@@ -788,10 +814,25 @@ mod tests {
         assert!(!stale.exists(), "the stale tree is swept");
         assert!(root.join(".lock").exists(), "the lock file stays");
 
-        // A second isolated tree in the same process is refused, not deadlocked.
+        // A second isolated tree on the holding thread is refused, not
+        // deadlocked.
         assert_eq!(
             isolated_in(&base, IsolationReason::ForeignTriple, Duration::ZERO).map(|_| ()),
             Err(TargetError::IsolatedAlreadyHeld)
+        );
+
+        // Another thread of the same process is not refused: it waits on the
+        // lock, which the main thread's tree keeps it out of until dropped.
+        let peer = std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .spawn_scoped(s, || {
+                    isolated_in(&base, IsolationReason::ForeignTriple, Duration::ZERO).map(|_| ())
+                })
+                .map(std::thread::ScopedJoinHandle::join)
+        });
+        assert!(
+            matches!(peer, Ok(Ok(Err(TargetError::IsolatedLockTimedOut { .. })))),
+            "a peer thread waits on the lock, never the per-thread refusal: {peer:?}"
         );
 
         // The lock wait is bounded: another holder of the lock file keeps a
