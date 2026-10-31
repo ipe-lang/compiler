@@ -2663,11 +2663,11 @@ one double-quoted value with no other `"` and nothing after it
 
 ## index-entry-shape-list
 
-a `["…", …]` list of double-quoted capability names, or `[]`
+a `["…", …]` list of distinct double-quoted capability names, or `[]`
 
 ## index-entry-shape-signature
 
-one double-quoted bundle
+one double-quoted bundle free of control and invisible characters
 
 ## index-entry-duplicate-key
 

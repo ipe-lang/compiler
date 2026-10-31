@@ -1631,9 +1631,9 @@ fn json_unknown_key(key: &str) -> String {
 ///
 /// # Errors
 /// [`CliError::Resolve`] when the JSON is malformed, is missing `publisher` or
-/// `versions`, lists zero versions, or any per-version field fails its typed
-/// constructor (an unknown capability, a non-immutable `rev`, an injection-shaped
-/// `source`).
+/// `versions`, lists zero versions or one version twice, or any per-version
+/// field fails its typed constructor (an unknown or repeated capability, a
+/// non-immutable `rev`, an injection-shaped `source`).
 pub fn parse_entry_json(name: &str, text: &str) -> Result<IndexEntry, CliError> {
     let name = &PackageName::parse(name)?;
     let malformed = |detail: &str| {
@@ -1676,9 +1676,17 @@ pub fn parse_entry_json(name: &str, text: &str) -> Result<IndexEntry, CliError> 
         return Err(malformed("`versions` is empty"));
     }
 
+    let mut seen: BTreeSet<PublishedVersion> = BTreeSet::new();
     let mut versions = Vec::with_capacity(raw_versions.len());
     for raw in raw_versions {
-        versions.push(parse_entry_version_json(name, raw)?);
+        let version = parse_entry_version_json(name, raw)?;
+        if !seen.insert(version.version.clone()) {
+            return Err(malformed(&format!(
+                "version {} is listed twice",
+                version.version
+            )));
+        }
+        versions.push(version);
     }
 
     Ok(IndexEntry {
@@ -1745,7 +1753,11 @@ fn parse_entry_version_json(
                     &crate::style::TerminalSafe::sanitize(&e.to_string()),
                 ))
             })?;
-            capabilities.insert(parsed);
+            if !capabilities.insert(parsed) {
+                return Err(malformed(
+                    "a `capabilities` element is listed twice".to_owned(),
+                ));
+            }
         }
     }
 
@@ -1833,7 +1845,8 @@ fn fill<T>(slot: &mut Option<T>, key: EntryKey, value: Option<T>) -> Result<(), 
 }
 
 /// The quoted capability names of a `["…", …]` list, or `None` unless the
-/// value is exactly `[]` or a comma-separated list of non-empty quoted names.
+/// value is exactly `[]` or a comma-separated list of non-empty quoted names,
+/// none repeated.
 fn capability_items(value: &str) -> Option<Vec<&str>> {
     let inner = value
         .strip_prefix('[')?
@@ -1842,20 +1855,23 @@ fn capability_items(value: &str) -> Option<Vec<&str>> {
     if inner.is_empty() {
         return Some(Vec::new());
     }
-    inner
+    let items: Vec<&str> = inner
         .split(',')
         .map(|item| quoted(item.trim_matches(LINE_BLANKS)).filter(|item| !item.is_empty()))
-        .collect()
+        .collect::<Option<_>>()?;
+    let mut seen = BTreeSet::new();
+    items.iter().all(|item| seen.insert(*item)).then_some(items)
 }
 
 /// The bundle inside a `signature = "…"` value: exactly one outer pair of
-/// quotes stripped. The bundle is JSON and keeps its own quotes; its structure
-/// is [`SignatureBundle::parse`]'s to prove.
+/// quotes stripped, holding no [`is_display_hazard`] character, so the line
+/// displays as the bytes read. The bundle is JSON and keeps its own quotes; its
+/// structure is [`SignatureBundle::parse`]'s to prove.
 fn signature_text(value: &str) -> Option<&str> {
     value
         .strip_prefix('"')?
         .strip_suffix('"')
-        .filter(|bundle| !bundle.is_empty())
+        .filter(|bundle| !bundle.is_empty() && DisplayHazard::find(bundle).is_none())
 }
 
 /// The raw fields of one version table, borrowed from the entry text, before
@@ -3329,6 +3345,11 @@ mod tests {
                 "capabilities = [\"\"]",
                 VersionKey::Capabilities,
             ),
+            (
+                "capabilities = [\"network\"]",
+                "capabilities = [\"network\", \"network\"]",
+                VersionKey::Capabilities,
+            ),
         ];
         for (good, bad, key) in cases {
             let text = closed_fixture().replace(good, bad);
@@ -3345,6 +3366,49 @@ mod tests {
             10,
             &EntryFault::MalformedValue(EntryKey::Version(VersionKey::Signature)),
         );
+        let signed = format!("{}signature = \"{BUNDLE_JSON}\"\n", closed_fixture());
+        assert!(super::parse_entry(&pn("http-extras"), &signed).is_ok());
+        for hazard in ['\u{202e}', '\u{2066}', '\u{200b}', '\t', '\u{7f}'] {
+            let hidden = signed.replace("dsseEnvelope", &format!("dsse{hazard}Envelope"));
+            assert_refused(
+                &hidden,
+                10,
+                &EntryFault::MalformedValue(EntryKey::Version(VersionKey::Signature)),
+            );
+        }
+    }
+
+    #[test]
+    fn json_mirror_refuses_a_repeated_version_or_capability() {
+        let version = |v: &str, caps: &str| {
+            format!(
+                "{{\"version\":\"{v}\",\"source\":\"https://example.invalid/x\",\
+                 \"rev\":\"{FIXTURE_REV}\",\"sha256\":\"{}\",\"capabilities\":[{caps}]}}",
+                "0".repeat(64)
+            )
+        };
+        let entry = |versions: &[String]| {
+            format!(
+                "{{\"name\":\"http-extras\",\"publisher\":\"tester\",\"versions\":[{}]}}",
+                versions.join(",")
+            )
+        };
+        let one = version("1.0.0", "\"network\"");
+        assert!(super::parse_entry_json("http-extras", &entry(std::slice::from_ref(&one))).is_ok());
+        let other_rev = one.replace(FIXTURE_REV, &"1".repeat(40));
+        for (text, needle) in [
+            (entry(&[one, other_rev]), "listed twice"),
+            (
+                entry(&[version("1.0.0", "\"network\",\"network\"")]),
+                "listed twice",
+            ),
+        ] {
+            let rendered = super::parse_entry_json("http-extras", &text)
+                .err()
+                .map(|err| err.to_string())
+                .unwrap_or_default();
+            assert!(rendered.contains(needle), "{rendered}");
+        }
     }
 
     #[test]
