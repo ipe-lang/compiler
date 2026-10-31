@@ -569,11 +569,7 @@ impl<'a> BundleAssembler<'a> {
         let dist = self.profile.dist_dir(&output)?.child(os.as_str())?;
         let shell_root = pack::mobile::materialise(&layout, icon, &dist)?;
 
-        let note = if os.build_runs_on_linux() {
-            crate::text::mobile_android_note()
-        } else {
-            crate::text::mobile_ios_note()
-        };
+        let note = mobile_release_note(os);
         crate::screen::Screen::new(crate::screen::Stream::Stdout)
             .line(
                 crate::screen::Tone::Text,
@@ -587,6 +583,25 @@ impl<'a> BundleAssembler<'a> {
             .emit();
         Ok(())
     }
+}
+
+/// The note shown under a materialised mobile shell: the platform note, and —
+/// for Android, whose toolchain runs on this host — the build steps indented
+/// under it.
+///
+/// One renderer over [`pack::mobile::android_build_steps`] composes the
+/// layout, so the CLI note and the README (`pack::mobile::android_readme`)
+/// both carry the same catalog steps rather than each assembling its own copy.
+fn mobile_release_note(os: pack::mobile::MobileOs) -> String {
+    if !os.build_runs_on_linux() {
+        return crate::text::mobile_ios_note().to_owned();
+    }
+    let mut note = crate::text::mobile_android_note().to_owned();
+    for line in pack::mobile::android_build_steps().lines() {
+        note.push_str("\n    ");
+        note.push_str(line);
+    }
+    note
 }
 
 /// `build|release web desktop [<path>]` — build the app and lay out a
@@ -4589,6 +4604,30 @@ mod pack_gate_tests {
             msg.contains("Program") || msg.contains("program") || msg.contains("Web"),
             "refusal names the shape or the required type: {msg}"
         );
+    }
+
+    // ── Mobile release note ─────────────────────────────────────────────────────
+
+    /// The Android release note carries the wrapper-bootstrap step before the
+    /// debug-build step: a reader who stops at the first command still gets a
+    /// working one, instead of `assembleDebug` failing on a missing `./gradlew`.
+    #[test]
+    fn android_release_note_carries_build_steps_wrapper_first() {
+        let note = mobile_release_note(pack::mobile::MobileOs::Android);
+        let wrapper = note.find("gradle wrapper").expect("wrapper step present");
+        let debug = note.find("assembleDebug").expect("debug step present");
+        assert!(
+            wrapper < debug,
+            "wrapper step must precede assembleDebug: {note}"
+        );
+    }
+
+    /// The iOS release note is unchanged: no Android build steps leak into it.
+    #[test]
+    fn ios_release_note_carries_no_android_build_steps() {
+        let note = mobile_release_note(pack::mobile::MobileOs::Ios);
+        assert!(!note.contains("gradlew"), "{note}");
+        assert!(!note.contains("gradle wrapper"), "{note}");
     }
 
     // ── Mobile capability classification ──────────────────────────────────────

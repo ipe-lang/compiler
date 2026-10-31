@@ -1204,6 +1204,10 @@ messages! {
     release_embedded(path) = "release-embedded";
     /// `ipe release build --bundle` wrote a wrapper and app pair.
     release_bundled(path) = "release-bundled";
+    /// The Android build steps: wrapper bootstrap, debug build, install, store build.
+    ///
+    /// The one rendering every producer (CLI note, README, guide) carries verbatim.
+    android_build_steps(gradle) = "android-build-steps";
     /// The note under a written Android shell project: unsigned, and how to sign it.
     mobile_android_note = "mobile-android-note";
     /// The note under a written iOS shell project.

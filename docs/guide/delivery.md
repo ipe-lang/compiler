@@ -143,14 +143,14 @@ This builds the wasm bundle and materialises a native shell:
   wasm bundle ready at out/release/rust/www/
   bundle size: 196 KB (out/release/rust/www/pkg/ipe_app_bg.wasm)
 packaged `ui-layout` for android → out/release/dist/android/ui-layout-android
-  note: an Android shell project is written here; run `./gradlew assembleDebug`
-        inside it with the Android SDK to produce an APK.
+  note: an unsigned Android Gradle project is written here. To build it:
+    ...
 ```
 
 The Android shell is a ready-to-build Gradle project; the client rides under
 `app/src/main/assets/www/` and a `WebViewAssetLoader` serves it same-origin, so
-there is no remote host and no `file://` access. Finish the APK with
-`./gradlew assembleDebug` where the Android SDK is present.
+there is no remote host and no `file://` access. See
+[Android (emulator)](#android-emulator) below for the build steps.
 
 `ipe release build web client ios` writes the equivalent Xcode project (`WKWebView` +
 `WKURLSchemeHandler`). Its layout and derived-permission manifest are written for
@@ -184,20 +184,22 @@ xvfb-run -a ./out/release/dist/linux/<name>/bin/<name>
 ### Android (emulator)
 
 `release web client android` writes a Gradle project to
-`out/release/dist/android/<name>-android/`. With the Android SDK on `PATH`:
+`out/release/dist/android/<name>-android/`. To **simulate**, boot an emulator
+first (or start one from Android Studio's Device Manager):
 
 ```
-cd out/release/dist/android/<name>-android
-./gradlew assembleDebug          # → app/build/outputs/apk/debug/app-debug.apk
+emulator -avd <your-avd> &
 ```
 
-To **simulate**, boot an emulator and install the debug build onto it:
+With the Android SDK on `PATH`, `cd` into `out/release/dist/android/<name>-android/`
+and:
 
-```
-emulator -avd <your-avd> &       # or start one from Android Studio's Device Manager
-./gradlew installDebug           # builds + installs onto the running emulator/device
-# or: adb install app/build/outputs/apk/debug/app-debug.apk
-```
+<!-- android-build-steps -->
+1. `gradle wrapper` once with Gradle 8.7 or newer — the project ships no wrapper.
+2. `./gradlew assembleDebug` (Android SDK, API 34) builds an APK signed with the SDK's debug key, for local install only.
+3. `./gradlew installDebug` installs it onto a running emulator or device.
+4. Store build: add a `signingConfig` for your keystore to `app/build.gradle`, then run `./gradlew assembleRelease`.
+<!-- /android-build-steps -->
 
 `adb`, `emulator`, and `avdmanager` (to create an AVD once) all ship with the
 Android SDK.
