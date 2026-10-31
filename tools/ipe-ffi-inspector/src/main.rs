@@ -11523,26 +11523,25 @@ fn self_is_closed_monomorphic(for_val: &serde_json::Value) -> bool {
 fn self_path_with_concrete_args(for_val: &serde_json::Value) -> Option<String> {
     let rp = for_val.get("resolved_path")?;
     let base = rp.get("id").and_then(reachable_local_path)?;
-    let args: Vec<String> = rp
+    // All or nothing: a type arg without a nameable spelling, or a const arg,
+    // drops the whole path — a Self with an arg silently omitted names another
+    // impl, or none. Only lifetime args are elided.
+    let mut args: Vec<String> = Vec::new();
+    let arg_nodes = rp
         .get("args")
         .and_then(|a| a.get("angle_bracketed"))
         .and_then(|ab| ab.get("args"))
-        .and_then(|a| a.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|arg| {
-                    if let Some(t) = arg.get("type") {
-                        // Rendering alone is NOT sufficient — pub(crate) types render
-                        // to a bare last segment; type_is_nameable gates on
-                        // REACHABLE_PATHS, same as ufcs_trait_path_with_args does.
-                        rustdoc_type_to_rust_str(t).filter(|s| type_is_nameable(s))
-                    } else {
-                        None // skip lifetime args
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+        .and_then(|a| a.as_array());
+    for arg in arg_nodes.into_iter().flatten() {
+        if let Some(t) = arg.get("type") {
+            // Rendering alone is NOT sufficient — pub(crate) types render
+            // to a bare last segment; type_is_nameable gates on
+            // REACHABLE_PATHS, same as ufcs_trait_path_with_args does.
+            args.push(rustdoc_type_to_rust_str(t).filter(|s| type_is_nameable(s))?);
+        } else if arg.get("lifetime").is_none() {
+            return None;
+        }
+    }
     if args.is_empty() {
         Some(base)
     } else {
@@ -18529,6 +18528,52 @@ mod tests {
         assert!(!type_is_nameable(""));
         assert!(!type_is_nameable("  "));
         assert!(type_is_nameable("i64"));
+    }
+
+    #[test]
+    fn a_self_path_with_an_unnameable_arg_is_dropped_not_shortened() {
+        REACHABLE_PATHS.with(|c| {
+            let mut paths = c.borrow_mut();
+            paths.clear();
+            paths.insert("4242".to_string(), "tm::Holder".to_string());
+        });
+        let holder = |args: serde_json::Value| {
+            serde_json::json!({ "resolved_path": {
+                "name": "Holder", "path": "Holder", "id": 4242,
+                "args": { "angle_bracketed": { "args": args, "bindings": [] } }
+            } })
+        };
+        // Control: a nameable arg and an elided lifetime keep the full path.
+        assert_eq!(
+            self_path_with_concrete_args(&holder(serde_json::json!([
+                { "lifetime": "'a" }, { "type": prim("i64") }
+            ]))),
+            Some("tm::Holder<i64>".to_string())
+        );
+        for (label, args) in [
+            (
+                "unrenderable",
+                serde_json::json!([{ "type": fn_pointer_node() }, { "type": prim("i64") }]),
+            ),
+            (
+                "unnameable",
+                serde_json::json!([
+                    { "type": { "resolved_path": { "name": "Private", "id": 9999, "args": null } } },
+                    { "type": prim("i64") }
+                ]),
+            ),
+            (
+                "const",
+                serde_json::json!([{ "const": { "expr": "4", "value": "4" } }, { "type": prim("i64") }]),
+            ),
+        ] {
+            let got = self_path_with_concrete_args(&holder(args));
+            assert_eq!(
+                got, None,
+                "an {label} arg must drop the path, not shorten it"
+            );
+        }
+        REACHABLE_PATHS.with(|c| c.borrow_mut().clear());
     }
 
     #[test]
