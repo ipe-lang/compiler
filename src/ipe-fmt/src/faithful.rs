@@ -121,7 +121,8 @@ struct Sides<'a> {
     output: Placement<'a>,
 }
 
-/// An end-of-line comment's identity: its owner token's text and its text.
+/// An end-of-line comment's identity: its owner's name ([`crate::comments::OwnerTok::name`])
+/// and its text.
 type TrailKey<'a> = (&'a str, CommentKey<'a>);
 
 /// C4: every end-of-line comment of the output trails a token of the text its
@@ -149,7 +150,7 @@ fn attachment_kept<'a>(
     let (input, output) = (printed.input, printed.output);
     let trail_key = |c: &'a Comment, src: &'a str| {
         c.owner()
-            .and_then(|o| src.get(o.lo..o.hi))
+            .and_then(|o| o.name(src))
             .map(|owner| (owner, c.key()))
     };
     let mut eligible: BTreeMap<TrailKey<'a>, Vec<&'a Comment>> = BTreeMap::new();

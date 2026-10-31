@@ -39,6 +39,21 @@ pub struct OwnerTok {
     pub lo: usize,
     /// The offset just past the token.
     pub hi: usize,
+    /// The span of the token that names the comment's place: the owner, or
+    /// for a closing parenthesis the last token before its run of `)`.
+    ///
+    /// A layout may drop grouping parentheses (`(a + b) -- c` prints as
+    /// `a + b -- c`), so the comment's identity across the input and the
+    /// output is the code the parentheses closed over, never the `)`.
+    pub name: (usize, usize),
+}
+
+impl OwnerTok {
+    /// The text of the token that names the comment's place, in `src`.
+    #[must_use]
+    pub fn name<'s>(&self, src: &'s str) -> Option<&'s str> {
+        src.get(self.name.0..self.name.1)
+    }
 }
 
 /// Whether a token of `kind` can be the last token of a printed node.

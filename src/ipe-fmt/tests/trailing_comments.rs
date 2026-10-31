@@ -180,3 +180,100 @@ fn a_comment_after_an_open_token_leads_the_next_code() {
         formats_to(&format!("{HEAD}{src}"), &format!("{HEAD}{expected}"));
     }
 }
+
+/// Assert each declaration body `src` formats to `expected` under `HEAD`.
+fn bodies_format_to(cases: &[(&str, &str)]) {
+    for (src, expected) in cases {
+        formats_to(&format!("{HEAD}{src}"), &format!("{HEAD}{expected}"));
+    }
+}
+
+/// A comment before a group's `)` trails the code the group holds where the
+/// layout keeps the group's parentheses: it prints once, in place.
+#[test]
+fn a_comment_inside_a_kept_group_stays_once() {
+    bodies_format_to(&[
+        (
+            "f =\n    g (h x -- c\n    ) x\n",
+            "f =\n    g\n        (h x -- c\n        )\n        x\n",
+        ),
+        (
+            "f =\n    g (h (k x -- c\n    )\n    )\n",
+            "f =\n    g\n        (h\n            (k x -- c\n            )\n        )\n",
+        ),
+        (
+            "f =\n    g (a + b -- c\n    ) y\n",
+            "f =\n    g\n        (a\n            + b -- c\n        )\n        y\n",
+        ),
+    ]);
+}
+
+/// A comment after a `)` the layout drops trails the code the group held,
+/// at the same line end.
+#[test]
+fn a_comment_after_a_dropped_paren_stays_at_its_line_end() {
+    bodies_format_to(&[
+        (
+            "f =\n    (a + b) -- c\n\n\ng =\n    1\n",
+            "f =\n    a + b -- c\n\n\ng =\n    1\n",
+        ),
+        (
+            "f x =\n    case x of\n        A ->\n            (h y) -- c\n\n        B ->\n            2\n",
+            "f x =\n    case x of\n        A ->\n            h y -- c\n\n        B ->\n            2\n",
+        ),
+        (
+            "f =\n    [ (x) -- c\n    , y\n    ]\n",
+            "f =\n    [ x -- c\n    , y\n    ]\n",
+        ),
+        (
+            "f =\n    let\n        v =\n            (a + b) -- c\n    in\n    v\n",
+            "f =\n    let\n        v =\n            a + b -- c\n    in\n    v\n",
+        ),
+        ("f =\n    g ([ 1, 2 ]) -- c\n", "f =\n    g [ 1, 2 ] -- c\n"),
+    ]);
+}
+
+/// A comment above the `)` of a group around a list or a record update leads
+/// the group: it prints once, above it, never again inside the brackets.
+#[test]
+fn a_comment_above_a_group_close_prints_once() {
+    bodies_format_to(&[
+        (
+            "f =\n    g ([ 1, 2 ]\n    -- c\n    ) y\n",
+            "f =\n    g\n        -- c\n        [ 1, 2 ]\n        y\n",
+        ),
+        (
+            "f =\n    g ({ r | a = 1 }\n    -- c\n    ) y\n",
+            "f =\n    g\n        -- c\n        { r | a = 1 }\n        y\n",
+        ),
+        (
+            "f =\n    ([ 1, 2 ]\n    -- c\n    )\n",
+            "f =\n    -- c\n    [ 1, 2 ]\n",
+        ),
+        (
+            "f =\n    g ([ 1, 2 ] -- c\n    ) y\n",
+            "f =\n    g\n        -- c\n        [ 1, 2 ]\n        y\n",
+        ),
+    ]);
+}
+
+/// A comment where the layout keeps the next code on the same line (after a
+/// foreign declaration's type, a `<|` operand or a lambda parameter) prints
+/// on its own line above that code.
+#[test]
+fn same_line_positions_demote_their_comment() {
+    formats_to(
+        "module M exposing (now)\n\n\nforeign now : Int -- c\n    = \"now\"\n",
+        "module M exposing (now)\n\n\nforeign now : Int =\n    -- c\n    \"now\"\n",
+    );
+    bodies_format_to(&[
+        (
+            "f x =\n    g <| x -- c\n        <| y\n",
+            "f x =\n    g <|\n        x <|\n        -- c\n        y\n",
+        ),
+        (
+            "f =\n    \\x -- c\n        y -> x\n",
+            "f =\n    -- c\n    \\x y ->\n        x\n",
+        ),
+    ]);
+}

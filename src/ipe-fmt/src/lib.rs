@@ -263,7 +263,17 @@ fn trailing_owner(src: &str, code: &[CodeToken], lo: usize, hi: usize) -> Option
         let next_lo = code.get(next).map_or(src.len(), |n| n.lo);
         next_lo >= src.len() || src.get(hi..next_lo)?.contains('\n')
     };
-    ends_line.then_some(OwnerTok { lo: t.lo, hi: t.hi })
+    let named = code
+        .get(..next)?
+        .iter()
+        .rev()
+        .find(|k| !matches!(k.kind, TokenKind::RParen))
+        .unwrap_or(t);
+    ends_line.then_some(OwnerTok {
+        lo: t.lo,
+        hi: t.hi,
+        name: (named.lo, named.hi),
+    })
 }
 
 /// Push the byte range of every comment in the trivia gap `src[from..to]`.
@@ -1110,7 +1120,7 @@ impl<'a> Printer<'a> {
         let printed = scan_trivia(text);
         let mut held: BTreeMap<(&str, CommentKey<'_>), usize> = BTreeMap::new();
         for c in printed.iter().flat_map(|t| t.comments.iter()) {
-            if let Some(owner) = c.owner().and_then(|o| text.get(o.lo..o.hi)) {
+            if let Some(owner) = c.owner().and_then(|o| o.name(text)) {
                 let count = held.entry((owner, c.key())).or_default();
                 *count = count.saturating_add(1);
             }
@@ -1119,7 +1129,7 @@ impl<'a> Printer<'a> {
         for (c, placed) in self.trails.iter().zip(&self.placed) {
             let key = c
                 .owner()
-                .and_then(|o| self.src?.get(o.lo..o.hi))
+                .and_then(|o| o.name(self.src?))
                 .map(|owner| (owner, c.key()));
             let found = key
                 .filter(|_| placed.get())
@@ -1227,6 +1237,30 @@ impl<'a> Printer<'a> {
     fn token_before(&self, pos: usize) -> Option<CodeToken> {
         let i = self.code.partition_point(|t| t.lo < pos);
         i.checked_sub(1).and_then(|j| self.code.get(j)).copied()
+    }
+
+    /// The span of the node at `span` without the grouping parentheses the
+    /// parser widened it to: `([ 1, 2 ])` is the list `[ 1, 2 ]`.
+    ///
+    /// The group's `(` and `)` belong to the claim that owns the group
+    /// ([`Self::claim`]), so a node prints neither the comments anchored at
+    /// that `)` nor those trailing the token before it. Not for a tuple or a
+    /// unit, whose own brackets are parentheses.
+    fn own_span(&self, span: ipe_diagnostics::Span) -> ipe_diagnostics::Span {
+        let (mut lo, mut hi) = (span.lo as usize, span.hi as usize);
+        while let Some(g) = self.paren_group(lo, hi) {
+            let after_open = self.code.partition_point(|t| t.lo <= lo);
+            let Some(next) = self.code.get(after_open) else {
+                break;
+            };
+            lo = next.lo;
+            hi = self.end_before(g.close);
+        }
+        let narrow = |at: usize, wide: u32| u32::try_from(at).unwrap_or(wide);
+        ipe_diagnostics::Span {
+            lo: narrow(lo, span.lo),
+            hi: narrow(hi, span.hi),
+        }
     }
 
     /// The comments anchored at the closing bracket that ends `span`.
@@ -2583,7 +2617,8 @@ impl<'a> Printer<'a> {
         let arg_col = col.tab();
         let arg_one_strs: Vec<String> = args.iter().map(|a| self.expr_atom(a, arg_col)).collect();
         let one = format!("{head_s} {}", arg_one_strs.join(" "));
-        let (lo, hi) = (span.lo as usize, span.hi as usize);
+        let own = self.own_span(span);
+        let (lo, hi) = (own.lo as usize, own.hi as usize);
         if !has_layout_newline(&one) && !self.was_multiline(span) && !self.forces_break(lo, hi) {
             return one;
         }
@@ -3064,11 +3099,11 @@ impl<'a> Printer<'a> {
 
     fn list(&self, elems: &[Expr], col: Col, span: ipe_diagnostics::Span) -> String {
         if elems.is_empty() {
-            return self.with_comments(&self.closing_comments(span), "[]", col);
+            return self.with_comments(&self.closing_comments(self.own_span(span)), "[]", col);
         }
         let items = self.elements(elems, col.past(2));
         let ends: Vec<usize> = elems.iter().map(|e| e.span.hi as usize).collect();
-        self.collection(("[", "]"), items, &ends, span, col)
+        self.collection(("[", "]"), items, &ends, self.own_span(span), col)
     }
 
     fn record(
@@ -3078,11 +3113,11 @@ impl<'a> Printer<'a> {
         span: ipe_diagnostics::Span,
     ) -> String {
         if fields.is_empty() {
-            return self.with_comments(&self.closing_comments(span), "{}", col);
+            return self.with_comments(&self.closing_comments(self.own_span(span)), "{}", col);
         }
         let items = self.fields(fields, col.past(2));
         let ends: Vec<usize> = fields.iter().map(|(_, v)| v.span.hi as usize).collect();
-        self.collection(("{", "}"), items, &ends, span, col)
+        self.collection(("{", "}"), items, &ends, self.own_span(span), col)
     }
 
     /// Each element of a list or tuple, rendered at `col`, with the comments
@@ -3159,6 +3194,7 @@ impl<'a> Printer<'a> {
         // field two columns past that.
         let bar_col = col.tab();
         let items = self.fields(fields, bar_col.past(2));
+        let span = self.own_span(span);
         let closing = self.closing_comments(span);
         let (lo, hi) = (span.lo as usize, span.hi as usize);
         let commented = !closing.is_empty()
