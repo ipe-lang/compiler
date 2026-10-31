@@ -4722,6 +4722,55 @@ fn reexported_builtin_type_home(
     }
 }
 
+/// The export of the builtin `row`, spelled `resolved`, from the module at
+/// `home`: the home the module's own import binds it at, else the home the
+/// re-export records.
+fn builtin_export(
+    env: &Env,
+    type_name: Symbol,
+    resolved: &str,
+    row: BuiltinType,
+    home: &[Symbol],
+    interner: &Interner,
+) -> crate::ExportedType {
+    let builtin_home = imported_builtin_home(env, type_name, row)
+        .unwrap_or_else(|| reexported_builtin_type_home(resolved, row, home, interner));
+    crate::ExportedType::Builtin {
+        home: builtin_home,
+        row,
+    }
+}
+
+/// Export every reserved builtin the module at `home` declares as its own.
+///
+/// [`BuiltinRow::declared_in`](ipe_kernels::BuiltinRow::declared_in) names the
+/// module, so `Q.Set` under `import Ipe.Set as Q` and `exposing (Set)` resolve
+/// to the row whether or not the module's `exposing` clause lists it. A row
+/// whose name the interner has not seen is not exported, so a use of it fails
+/// closed at IPE-N0005; the declaring module's own signatures spell the name.
+fn export_declared_builtins(
+    types: &mut BTreeMap<Symbol, crate::ExportedType>,
+    home: &[Symbol],
+    env: &Env,
+    interner: &Interner,
+) {
+    let Some(segments) = home
+        .iter()
+        .map(|segment| interner.resolve(*segment))
+        .collect::<Option<Vec<&str>>>()
+    else {
+        return;
+    };
+    for row in BuiltinType::declared_by_module(&segments) {
+        let resolved = row.row().name();
+        if let Some(type_name) = interner.lookup(resolved) {
+            types
+                .entry(type_name)
+                .or_insert_with(|| builtin_export(env, type_name, resolved, row, home, interner));
+        }
+    }
+}
+
 /// Build a [`crate::ModuleExports`] from the module's own declarations filtered
 /// by its `exposing (…)` clause.
 ///
@@ -4811,16 +4860,9 @@ fn build_module_exports(
                             // (Attribute)`. Record it so an importer's `exposing
                             // (T)` resolves instead of failing `NameNotExposed`; no
                             // constructors (a builtin carrier has none at source).
-                            let builtin_home = imported_builtin_home(env, *type_name, row)
-                                .unwrap_or_else(|| {
-                                    reexported_builtin_type_home(resolved, row, home, interner)
-                                });
                             exports.types.insert(
                                 *type_name,
-                                crate::ExportedType::Builtin {
-                                    home: builtin_home,
-                                    row,
-                                },
+                                builtin_export(env, *type_name, resolved, row, home, interner),
                             );
                         } else if let Some(resolved) = own_aliases.get(type_name) {
                             exports.aliases.insert(*type_name, resolved.clone());
@@ -4836,6 +4878,7 @@ fn build_module_exports(
             }
         }
     }
+    export_declared_builtins(&mut exports.types, home, env, interner);
 
     // Record every EXPORTED kernel alias so importers register `Alias.f` as the
     // kernel rather than a `TopLevel` reference. A kernel alias is an ordinary
@@ -6652,10 +6695,11 @@ fn kernel_type_export<'a>(
 
 /// What a source-module-qualified type reference `qualifier.name` resolves to.
 ///
-/// A builtin the qualifier's dependency re-exports is its row at the export's
-/// home. Otherwise an exported alias expands through its synthetic key. A
-/// reserved builtin name the dependency does not export is IPE-N0005: it would
-/// otherwise mint the row's name at a home no module declares it under; under
+/// A builtin the qualifier's dependency re-exports or declares as its own
+/// ([`export_declared_builtins`]) is its row at the export's home. Otherwise an
+/// exported alias expands through its synthetic key. A reserved builtin name
+/// the dependency does not export is IPE-N0005: it would otherwise mint the
+/// row's name at a home no module declares it under; under
 /// a qualifier whose exports are unknown (an Html fold) it is the row at the
 /// qualifier's home. Any other name is a union of the module.
 ///

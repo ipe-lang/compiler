@@ -1242,6 +1242,75 @@ fn builtin_witness_legal_arity_compiles_under_every_spelling() {
     }
 }
 
+/// A source module that declares no builtin row and exports only its own
+/// union, so a reserved name under its qualifier is neither declared nor
+/// re-exported there.
+const UNRELATED_MODULE: &str = "Ipe.Length";
+
+/// `Int` once per type argument a legal use of `row` takes; an effect carrier
+/// takes its error and its value.
+fn legal_int_args(row: &ipe_kernels::BuiltinRow) -> String {
+    let count = match row.params() {
+        ipe_kernels::TypeParams::Exact(n) => usize::from(n),
+        ipe_kernels::TypeParams::OptionalMessage => 1,
+        ipe_kernels::TypeParams::InferredCarrier => 2,
+    };
+    vec!["Int"; count].join(" ")
+}
+
+/// Every reserved row with a declaring module resolves to the row under that
+/// module's qualifier (`Set.Set`, `Char.Char`), whether or not the module's
+/// `exposing` clause lists it.
+#[test]
+fn a_reserved_row_resolves_under_its_declaring_module() {
+    let mut seen = 0_usize;
+    for row in ipe_kernels::BUILTIN_TYPES {
+        let Some(module) = row.declared_in() else {
+            continue;
+        };
+        seen += 1;
+        let name = row.name();
+        let src = builtin_witness_program(
+            &format!("import {module} as Q"),
+            &format!("Q.{name}"),
+            &legal_int_args(row),
+        );
+        assert_compiles(&format!("declared_home_{name}"), &src);
+    }
+    assert!(seen > 0, "no row names a declaring module");
+}
+
+/// The refusal: the same name under a module that neither declares nor
+/// re-exports it is IPE-N0005, never the row minted at that module's home.
+#[test]
+fn a_reserved_row_under_an_unrelated_module_is_no_such_member() {
+    for row in ipe_kernels::BUILTIN_TYPES {
+        if row.declared_in().is_none() {
+            continue;
+        }
+        assert_ne!(row.declared_in(), Some(UNRELATED_MODULE));
+        let name = row.name();
+        let src = builtin_witness_program(
+            &format!("import {UNRELATED_MODULE} as Q"),
+            &format!("Q.{name}"),
+            &legal_int_args(row),
+        );
+        assert_rejected(&format!("unrelated_home_{name}"), &src, "IPE-N0005");
+    }
+}
+
+/// A Float set element is refused at lowering, not at name resolution, when
+/// the head is spelled through its declaring module.
+#[test]
+fn a_float_set_spelled_through_its_module_reaches_lowering() {
+    let src = format!(
+        "{HEAD}\nimport Ipe.Io as Io\nimport Ipe.Set as Set\n\n\
+         s : Set.Set Float\ns =\n    Set.fromList [ 1.5 ]\n\n\
+         main = Io.println \"ok\"\n"
+    );
+    assert_rejected("declared_home_float_set", &src, "IPE-L0117");
+}
+
 /// `Cells` names no type: the Tui view type is `Screen`.
 #[test]
 fn builtin_witness_cells_is_not_a_type() {
