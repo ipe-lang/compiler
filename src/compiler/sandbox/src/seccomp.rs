@@ -4,7 +4,9 @@
 //! The run jail closes one axis a namespace alone cannot: syscalls. A fresh
 //! network namespace stops egress, a mount scope stops file access — but a
 //! shared PID namespace still lets a process `fork`, and no namespace stops
-//! `ptrace`, `io_uring`, or `process_vm_readv`. This filter denies those.
+//! `ptrace`, `io_uring`, or `process_vm_readv`. This filter denies those, and
+//! refuses every syscall that creates or joins a namespace (`unshare`, `setns`,
+//! `clone3`, and `clone` with any `CLONE_NEW*` flag) in every subprocess mode.
 //!
 //! ## Why hand-assembled classic BPF, not a crate
 //!
@@ -109,6 +111,9 @@ const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 /// `EPERM` — the errno a denied syscall returns (so a caller sees a permission
 /// error, the same as any other blocked operation, rather than a crash).
 const EPERM: u32 = 1;
+/// `ENOSYS` (asm-generic, the same on `x86_64` and `aarch64`) — the errno a
+/// refused `clone3` returns, so glibc falls back to the inspectable `clone`.
+const ENOSYS: u32 = 38;
 
 // ── per-ABI syscall numbers ─────────────────────────────────────────────────
 //
@@ -118,8 +123,8 @@ const EPERM: u32 = 1;
 // for these calls). aarch64 notably has NO `open`, `fork`, or `vfork` syscall —
 // user space uses `openat` and creates tasks exclusively through `clone`/
 // `clone3` — so the fork/vfork deny list is empty there and the whole
-// subprocess-deny axis rests on the `clone` flag split plus the `clone3`
-// all-or-nothing allow.
+// subprocess-deny axis rests on the `clone` flag split (`clone3` is refused
+// with `ENOSYS` in every mode).
 //
 // Each field of [`AbiSyscalls`] names one syscall the filter reasons about;
 // [`X86_64_SYSCALLS`] and [`AARCH64_SYSCALLS`] hold the two tables, and
@@ -140,11 +145,14 @@ struct AbiSyscalls {
     /// `None` on ABIs with no such secondary convention (aarch64).
     deny_nr_ge: Option<u32>,
     nr_clone: u32,
+    /// `clone3`, refused with `ENOSYS` in every mode: its flags live behind a
+    /// pointer classic BPF cannot read, so no namespace check is expressible.
+    nr_clone3: u32,
     /// `fork`/`vfork` on `x86_64`; empty on `aarch64` (no such syscalls there).
     create_denied_non_clone: &'static [u32],
     /// The unconditional escape/exfiltration denials for this ABI.
     baseline_denied: &'static [u32],
-    /// `execve`/`execveat`/`clone3` — never denied; carried only so the
+    /// `execve`/`execveat` — never denied; carried only so the
     /// removal/allow-guard tests can assert they are absent from the filter. The
     /// builder never reads it, so a non-test build sees it unused.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -201,6 +209,7 @@ mod x86_64_abi {
         audit_arch: AUDIT_ARCH_X86_64,
         deny_nr_ge: Some(super::X32_SYSCALL_BIT),
         nr_clone: NR_CLONE,
+        nr_clone3: NR_CLONE3,
         create_denied_non_clone: &[NR_FORK, NR_VFORK],
         baseline_denied: &[
             NR_PTRACE,
@@ -227,7 +236,7 @@ mod x86_64_abi {
             NR_FSMOUNT,
             NR_MOUNT_SETATTR,
         ],
-        never_denied: &[NR_EXECVE, NR_EXECVEAT, NR_CLONE3],
+        never_denied: &[NR_EXECVE, NR_EXECVEAT],
     };
 }
 
@@ -273,6 +282,7 @@ mod aarch64_abi {
         audit_arch: AUDIT_ARCH_AARCH64,
         deny_nr_ge: None,
         nr_clone: NR_CLONE,
+        nr_clone3: NR_CLONE3,
         create_denied_non_clone: &[],
         baseline_denied: &[
             NR_PTRACE,
@@ -299,7 +309,7 @@ mod aarch64_abi {
             NR_FSMOUNT,
             NR_MOUNT_SETATTR,
         ],
-        never_denied: &[NR_EXECVE, NR_EXECVEAT, NR_CLONE3],
+        never_denied: &[NR_EXECVE, NR_EXECVEAT],
     };
 }
 
@@ -348,6 +358,30 @@ const fn active_abi() -> Option<AbiSyscalls> {
 const CLONE_VM: u32 = 0x0000_0100;
 const CLONE_THREAD: u32 = 0x0001_0000;
 
+// The `CLONE_NEW*` namespace-creation flags (from <linux/sched.h>) a legacy
+// `clone` can carry. `CLONE_NEWTIME` (0x80) is absent: in legacy `clone` that
+// bit is part of `CSIGNAL`, and it creates a namespace only through `clone3` or
+// `unshare`, both refused whole.
+const CLONE_NEWNS: u32 = 0x0002_0000;
+const CLONE_NEWCGROUP: u32 = 0x0200_0000;
+const CLONE_NEWUTS: u32 = 0x0400_0000;
+const CLONE_NEWIPC: u32 = 0x0800_0000;
+const CLONE_NEWUSER: u32 = 0x1000_0000;
+const CLONE_NEWPID: u32 = 0x2000_0000;
+const CLONE_NEWNET: u32 = 0x4000_0000;
+
+/// Every namespace-creating legacy-`clone` flag: a `clone` carrying any of them
+/// is refused in every mode.
+const CLONE_NEW_MASK: u32 = CLONE_NEWNS
+    | CLONE_NEWCGROUP
+    | CLONE_NEWUTS
+    | CLONE_NEWIPC
+    | CLONE_NEWUSER
+    | CLONE_NEWPID
+    | CLONE_NEWNET;
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the namespace mask drifts from the seven `CLONE_NEW*` bits [ledger #boundary]
+const _: () = assert!(CLONE_NEW_MASK == 0x7E02_0000);
+
 // ── the deny axes (rationale shared by both ABIs) ───────────────────────────
 //
 // **Baseline denials** ([`AbiSyscalls::baseline_denied`]) are unconditional,
@@ -376,25 +410,18 @@ const CLONE_THREAD: u32 = 0x0001_0000;
 // has neither — its list is empty). Legacy `clone` is handled separately below
 // (allowed only for a thread — `CLONE_VM|CLONE_THREAD` — via the flag split).
 //
-// **`clone3` is deliberately never denied — allowed unconditionally.** On
-// glibc >= 2.34 (verified: `pthread_create` on glibc 2.35 issues exactly one
-// `clone3({flags=CLONE_VM|…|CLONE_THREAD})`), thread creation routes through
-// `clone3`, and the emitted runtime spawns an OS thread + a multi-threaded
-// tokio runtime on *every* entry. seccomp cannot inspect `clone3`'s argument
-// (the flags live in a `struct clone_args` behind a pointer classic BPF cannot
-// dereference), so a thread/process split is not expressible for it — it is
-// all-or-nothing, and denying it is a universal false-deny (nothing runs). A
-// subprocess-absent program *can* raw-`clone3` a new process, but that child is
-// born inside the *same* jail — same PID/net/mount/IPC namespaces, same scrubbed
-// env and fresh `/proc`, and the same inherited seccomp filter (`no_new_privs`
-// makes it unremovable across `execve`) — so it is confined **identically to the
-// parent and cannot exceed its capability set**. The `subprocess` axis controls
-// the common, portable spawn paths (`fork`/`vfork`/legacy-process-`clone` — what
-// `posix_spawn`, `Command::new`, `system`, `fork()+exec()` use); a determined
-// wrapper using raw `clone3` makes an equally-confined sibling. That residual (a
-// process *count*, not a capability axis) is the coarse first cut. On aarch64,
-// where there is no `fork`/`vfork` at all, the whole subprocess axis rests on
-// the `clone` flag split (process-clone → EPERM) plus this `clone3` allow.
+// **Namespace denials** apply in BOTH modes: no jailed payload may create a
+// namespace (a fresh user namespace unlocks kernel surface — netfilter through
+// `CAP_NET_ADMIN` in a new netns — no jail needs). `unshare`/`setns` are in the
+// baseline above. `clone3` is refused with `ENOSYS`: its flags live in a
+// `struct clone_args` behind a pointer classic BPF cannot dereference, so a
+// namespace check is not expressible for it, and `ENOSYS` makes glibc (>= 2.34,
+// `__clone_internal`) fall back to legacy `clone` for threads and `posix_spawn`.
+// Legacy `clone` is refused with `EPERM` when its flags carry any bit of
+// [`CLONE_NEW_MASK`]; the kernel reads only the low 32 bits of legacy `clone`'s
+// flags, so `arg0_lo` is the complete mask. Every task creation therefore goes
+// through the inspectable `clone`, which also closes any raw-`clone3` process
+// creation when `subprocess` is absent.
 //
 // **`execve`/`execveat` are deliberately never denied** (replace-not-spawn
 // model): `execve` *replaces* the current process image, it does not create a
@@ -405,14 +432,14 @@ const CLONE_THREAD: u32 = 0x0001_0000;
 // `execve`s the confined payload (`prlimit`, then the app), so an `execve` deny
 // is a universal false-deny. A lone `execve` grants no new authority: the filter
 // survives it (kernel design), and `no_new_privs` + the read-only root leave the
-// exec'd image equally confined — this holds for a raw-`clone3` child that then
-// execs, too.
+// exec'd image equally confined.
 
 /// Build the seccomp program for the run jail on the active build ABI.
 ///
 /// `allow_subprocess` = whether the resolved capability set grants
 /// `subprocess`; when `false`, the task-creation family is denied (threads
-/// excepted, via the `clone` flag check).
+/// excepted, via the `clone` flag check). Namespace creation is refused in
+/// both modes.
 ///
 /// Returns `None` on any ABI other than `x86_64` or `aarch64` — the syscall
 /// numbers are ABI-specific, so emitting them for an unvetted ABI would be a
@@ -460,7 +487,24 @@ fn build_program_for(abi: AbiSyscalls, allow_subprocess: bool) -> Vec<SockFilter
         prog.push(ret(SECCOMP_RET_ERRNO | EPERM));
     }
 
-    // 4. Task-creation denials when subprocess is absent.
+    // 4. Namespace denials (both modes). `clone3` → ENOSYS; a `clone` carrying
+    //    any `CLONE_NEW*` bit → EPERM. Seven instructions, n0..n6:
+    //   n0 JEQ clone3      jf=1 → not-clone3 skips to n2
+    //   n1 ret ENOSYS
+    //   n2 JEQ clone       jf=3 → not-clone skips to n6
+    //   n3 LD arg0_lo
+    //   n4 JSET NEW_MASK   jf=1 → no namespace bit → n6
+    //   n5 ret EPERM
+    //   n6 LD nr           (restore A for the blocks that follow)
+    prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, abi.nr_clone3, 0, 1));
+    prog.push(ret(SECCOMP_RET_ERRNO | ENOSYS));
+    prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, abi.nr_clone, 0, 3));
+    prog.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARG0_LO));
+    prog.push(jump(BPF_JMP | BPF_JSET | BPF_K, CLONE_NEW_MASK, 0, 1));
+    prog.push(ret(SECCOMP_RET_ERRNO | EPERM));
+    prog.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFF_NR));
+
+    // 5. Task-creation denials when subprocess is absent.
     if !allow_subprocess {
         for &nr in abi.create_denied_non_clone {
             prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr, 0, 1));
@@ -490,7 +534,7 @@ fn build_program_for(abi: AbiSyscalls, allow_subprocess: bool) -> Vec<SockFilter
         prog.push(ret(SECCOMP_RET_ERRNO | EPERM));
     }
 
-    // 5. Default: allow everything not denied above.
+    // 6. Default: allow everything not denied above.
     prog.push(ret(SECCOMP_RET_ALLOW));
     prog
 }
@@ -547,6 +591,151 @@ mod tests {
     fn has_jeq(prog: &[SockFilter], nr: u32) -> bool {
         prog.iter()
             .any(|i| i.code == (BPF_JMP | BPF_JEQ | BPF_K) && i.k == nr)
+    }
+
+    /// Run `prog` on one syscall as the kernel's classic-BPF interpreter would,
+    /// over exactly the instruction shapes the builder emits (`LD W ABS` of the
+    /// nr, arch, or `arg0_lo`; `JEQ`/`JGE`/`JSET` `K`; `RET K`). Returns the
+    /// seccomp action, or `None` on any other opcode, any other load offset, or
+    /// a jump past the end — each a builder defect the caller's assert reports.
+    fn decide(prog: &[SockFilter], arch: u32, nr: u32, arg0_lo: u32) -> Option<u32> {
+        let mut acc: u32 = 0;
+        let mut pc: usize = 0;
+        loop {
+            let insn = prog.get(pc)?;
+            let next = pc.checked_add(1)?;
+            match insn.code {
+                c if c == BPF_LD | BPF_W | BPF_ABS => {
+                    acc = match insn.k {
+                        OFF_NR => nr,
+                        OFF_ARCH => arch,
+                        OFF_ARG0_LO => arg0_lo,
+                        _ => return None,
+                    };
+                    pc = next;
+                }
+                c if c == BPF_RET | BPF_K => return Some(insn.k),
+                c if c == BPF_JMP | BPF_JEQ | BPF_K
+                    || c == BPF_JMP | BPF_JGE | BPF_K
+                    || c == BPF_JMP | BPF_JSET | BPF_K =>
+                {
+                    let taken = if c == BPF_JMP | BPF_JEQ | BPF_K {
+                        acc == insn.k
+                    } else if c == BPF_JMP | BPF_JGE | BPF_K {
+                        acc >= insn.k
+                    } else {
+                        acc & insn.k != 0
+                    };
+                    let off = if taken { insn.jt } else { insn.jf };
+                    pc = next.checked_add(usize::from(off))?;
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// `SIGCHLD` — the exit signal a `fork`-style process `clone` carries.
+    const SIGCHLD: u32 = 17;
+    /// `CLONE_SIGHAND` — part of the flag set `pthread_create` passes.
+    const CLONE_SIGHAND: u32 = 0x0000_0800;
+    /// The seven namespace flags, each tested alone.
+    const NAMESPACE_FLAGS: [u32; 7] = [
+        CLONE_NEWNS,
+        CLONE_NEWCGROUP,
+        CLONE_NEWUTS,
+        CLONE_NEWIPC,
+        CLONE_NEWUSER,
+        CLONE_NEWPID,
+        CLONE_NEWNET,
+    ];
+
+    #[test]
+    fn clone3_is_not_implemented_in_both_modes_on_each_abi() {
+        for &abi in ABIS {
+            for allow in [true, false] {
+                let prog = build_program_for(abi, allow);
+                for arg0 in [0, CLONE_NEWUSER, CLONE_VM | CLONE_THREAD] {
+                    assert_eq!(
+                        decide(&prog, abi.audit_arch, abi.nr_clone3, arg0),
+                        Some(SECCOMP_RET_ERRNO | ENOSYS),
+                        "clone3 must be ENOSYS (arch={:#x}, allow={allow})",
+                        abi.audit_arch
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_clone_with_any_namespace_flag_is_refused_in_both_modes() {
+        let thread = CLONE_VM | CLONE_THREAD | CLONE_SIGHAND;
+        for &abi in ABIS {
+            for allow in [true, false] {
+                let prog = build_program_for(abi, allow);
+                for flag in NAMESPACE_FLAGS {
+                    for base in [SIGCHLD, thread] {
+                        assert_eq!(
+                            decide(&prog, abi.audit_arch, abi.nr_clone, flag | base),
+                            Some(SECCOMP_RET_ERRNO | EPERM),
+                            "clone flags {:#x} must be EPERM (arch={:#x}, allow={allow})",
+                            flag | base,
+                            abi.audit_arch
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_thread_clone_stays_allowed_and_a_process_clone_follows_the_subprocess_axis() {
+        let thread = CLONE_VM | CLONE_THREAD | CLONE_SIGHAND;
+        for &abi in ABIS {
+            for allow in [true, false] {
+                let prog = build_program_for(abi, allow);
+                assert_eq!(
+                    decide(&prog, abi.audit_arch, abi.nr_clone, thread),
+                    Some(SECCOMP_RET_ALLOW),
+                    "a thread clone must stay allowed (arch={:#x}, allow={allow})",
+                    abi.audit_arch
+                );
+                let process = if allow {
+                    SECCOMP_RET_ALLOW
+                } else {
+                    SECCOMP_RET_ERRNO | EPERM
+                };
+                assert_eq!(
+                    decide(&prog, abi.audit_arch, abi.nr_clone, SIGCHLD),
+                    Some(process),
+                    "a process clone follows the subprocess axis (arch={:#x}, allow={allow})",
+                    abi.audit_arch
+                );
+                for &nr in abi.never_denied {
+                    assert_eq!(
+                        decide(&prog, abi.audit_arch, nr, 0),
+                        Some(SECCOMP_RET_ALLOW),
+                        "never-denied nr {nr} must be allowed after the namespace block"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_namespace_mask_is_every_clone_new_flag() {
+        let folded = NAMESPACE_FLAGS.iter().fold(0, |acc, f| acc | f);
+        assert_eq!(folded, CLONE_NEW_MASK);
+        assert_eq!(CLONE_NEW_MASK, 0x7E02_0000);
+        assert_eq!(
+            NAMESPACE_FLAGS.iter().copied().map(u32::count_ones).sum::<u32>(),
+            CLONE_NEW_MASK.count_ones(),
+            "each namespace flag is one distinct bit"
+        );
+        assert_eq!(
+            CLONE_NEW_MASK & (CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | SIGCHLD),
+            0,
+            "the mask must not catch a thread or a plain process clone"
+        );
     }
 
     #[test]
@@ -663,11 +852,10 @@ mod tests {
 
     #[test]
     fn never_denied_syscalls_stay_allowed_in_either_mode() {
-        // execve/execveat/clone3 must stay ALLOWED even when subprocess is
-        // absent: bubblewrap execs the confined payload (execve replaces, never
-        // spawns), and pthread_create routes through clone3 (denying it kills
-        // every thread). This pins the removals so a future edit cannot silently
-        // re-add them and reintroduce a universal false-deny.
+        // execve/execveat must stay ALLOWED even when subprocess is absent:
+        // bubblewrap execs the confined payload (execve replaces, never spawns).
+        // This pins the removals so a future edit cannot silently re-add them
+        // and reintroduce a universal false-deny.
         for &abi in ABIS {
             for allow in [true, false] {
                 let prog = build_program_for(abi, allow);
@@ -683,14 +871,21 @@ mod tests {
     }
 
     #[test]
-    fn a_granted_subprocess_program_has_no_clone_flag_check() {
-        // With subprocess granted, clone/fork/exec are simply allowed — no flag
-        // discriminator, no create denials — on every ABI.
+    fn a_granted_subprocess_program_has_only_the_namespace_check() {
+        // With subprocess granted, the only clone-flag test is the namespace
+        // mask — no thread/process discriminator, no create denials — on every
+        // ABI.
         for &abi in ABIS {
             let prog = build_program_for(abi, true);
-            assert!(
-                !prog.iter().any(|i| i.code == (BPF_JMP | BPF_JSET | BPF_K)),
-                "no clone-flag JSET when subprocess is granted"
+            let jsets: Vec<u32> = prog
+                .iter()
+                .filter(|i| i.code == (BPF_JMP | BPF_JSET | BPF_K))
+                .map(|i| i.k)
+                .collect();
+            assert_eq!(
+                jsets,
+                vec![CLONE_NEW_MASK],
+                "only the namespace JSET when subprocess is granted"
             );
         }
     }
@@ -748,7 +943,8 @@ mod tests {
         // to the ABI module).
         let a = AARCH64_SYSCALLS;
         assert_eq!(a.nr_clone, 220);
-        assert_eq!(a.never_denied, &[221, 281, 435], "execve/execveat/clone3");
+        assert_eq!(a.nr_clone3, 435);
+        assert_eq!(a.never_denied, &[221, 281], "execve/execveat");
         // Baseline: ptrace(117), pvm_readv/writev(270/271), io_uring(425/426/427),
         // pidfd_getfd(438), bpf(280), userfaultfd(282), keyctl(219),
         // kexec_load(104)/kexec_file_load(294),
@@ -772,7 +968,8 @@ mod tests {
         // to the ABI module).
         let a = X86_64_SYSCALLS;
         assert_eq!(a.nr_clone, 56);
-        assert_eq!(a.never_denied, &[59, 322, 435], "execve/execveat/clone3");
+        assert_eq!(a.nr_clone3, 435);
+        assert_eq!(a.never_denied, &[59, 322], "execve/execveat");
         // Baseline: ptrace(101), pvm_readv/writev(310/311), io_uring(425/426/427),
         // pidfd_getfd(438), bpf(321), userfaultfd(323), keyctl(250),
         // kexec_load(246)/kexec_file_load(320),
@@ -813,13 +1010,14 @@ mod tests {
     fn clone_block_jump_offsets_land_on_the_right_returns() {
         // The clone thread/process split is the most fragile part — an
         // off-by-one in a jump offset silently allows a process create or kills a
-        // thread. Locate the block by its `JEQ clone` head and verify each branch
-        // resolves to the intended return, on every ABI.
+        // thread. Locate the block by its `JEQ clone` head (the last one — the
+        // first heads the namespace block) and verify each branch resolves to
+        // the intended return, on every ABI.
         for &abi in ABIS {
             let prog = build_program_for(abi, false);
             let c0 = prog
                 .iter()
-                .position(|i| i.code == (BPF_JMP | BPF_JEQ | BPF_K) && i.k == abi.nr_clone)
+                .rposition(|i| i.code == (BPF_JMP | BPF_JEQ | BPF_K) && i.k == abi.nr_clone)
                 .expect("clone JEQ present");
             // c0 jf → default ALLOW (the last instruction).
             let not_clone_target = c0 + 1 + prog[c0].jf as usize;

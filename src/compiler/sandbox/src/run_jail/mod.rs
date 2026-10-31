@@ -286,9 +286,8 @@ impl RunJailTools {
 /// so the `--chdir` and `TMPDIR` the payload receives are exactly the paths
 /// bound.
 /// `seccomp_fd` is the sealed, inheritable descriptor carrying the compiled
-/// seccomp program (passed to `bwrap --seccomp <fd>`); `None` means
-/// no filter is attached (the caller must have refused already if a filter was
-/// required).
+/// seccomp program (passed to `bwrap --seccomp <fd>`). It is not optional: a
+/// payload jail argv without its filter is unrepresentable.
 ///
 /// The env is scrubbed with `--clearenv`; only the fixed minimal allowlist
 /// (`PATH`, `TMPDIR`, `LANG`) plus the profile's `env_allowlist` re-enter. There
@@ -305,7 +304,7 @@ pub fn run_jail_argv<'fd>(
     scope: &NprocScope,
     profile: &SandboxProfile,
     mounts: &JailMounts,
-    seccomp_fd: Option<SealedFdNumber<'fd>>,
+    seccomp_fd: SealedFdNumber<'fd>,
     host_env: &dyn Fn(&str) -> Option<OsString>,
     payload: &[OsString],
 ) -> Result<JailArgv<'fd>, JailPathError> {
@@ -313,7 +312,7 @@ pub fn run_jail_argv<'fd>(
         scope.tools(),
         profile,
         mounts,
-        seccomp_fd,
+        Some(seccomp_fd),
         None,
         host_env,
         payload,
@@ -357,7 +356,7 @@ pub fn run_jail_argv_with_delivery<'fd>(
     scope: &NprocScope,
     profile: &SandboxProfile,
     mounts: &JailMounts,
-    seccomp_fd: Option<SealedFdNumber<'fd>>,
+    seccomp_fd: SealedFdNumber<'fd>,
     app_fd: SealedFdNumber<'fd>,
     host_env: &dyn Fn(&str) -> Option<OsString>,
     app_args: &[OsString],
@@ -369,7 +368,7 @@ pub fn run_jail_argv_with_delivery<'fd>(
         scope.tools(),
         profile,
         mounts,
-        seccomp_fd,
+        Some(seccomp_fd),
         Some(app_fd),
         host_env,
         &payload,
@@ -381,7 +380,8 @@ pub fn run_jail_argv_with_delivery<'fd>(
 ///
 /// It takes bare tools rather than an [`NprocScope`] because the canary that
 /// mints the proof runs through it; every other caller goes through the two
-/// builders above.
+/// builders above. The seccomp fd is optional only here, for that canary —
+/// ipe's own fixed script, never a payload.
 fn jail_argv_unproven<'fd>(
     tools: &BwrapTools,
     profile: &SandboxProfile,
@@ -1302,21 +1302,39 @@ mod tests {
         )
     }
 
+    /// The run-jail argv with no seccomp fd, for tests asserting the mount,
+    /// namespace and env surface on any host. Only the proof canary's builder
+    /// takes an absent fd; a payload argv always carries one.
+    fn fd_free_argv<'fd>(
+        scope: &NprocScope,
+        profile: &SandboxProfile,
+        mounts: &JailMounts,
+        host_env: &dyn Fn(&str) -> Option<OsString>,
+        payload: &[OsString],
+    ) -> Result<JailArgv<'fd>, JailPathError> {
+        jail_argv_unproven(
+            scope.tools(),
+            profile,
+            mounts,
+            None,
+            None,
+            host_env,
+            payload,
+        )
+    }
+
     fn rendered(profile: &SandboxProfile, seccomp_fd: Option<SealedFdNumber<'_>>) -> Vec<String> {
         let no_env = |_: &str| None;
-        run_jail_argv(
-            &scope(),
-            profile,
-            &work_mounts(),
-            seccomp_fd,
-            &no_env,
-            &[OsString::from("/work/tree/target/debug/ipe-app")],
-        )
-        .expect("the argv builds")
-        .args()
-        .iter()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect()
+        let payload = [OsString::from("/work/tree/target/debug/ipe-app")];
+        let argv = match seccomp_fd {
+            Some(fd) => run_jail_argv(&scope(), profile, &work_mounts(), fd, &no_env, &payload),
+            None => fd_free_argv(&scope(), profile, &work_mounts(), &no_env, &payload),
+        };
+        argv.expect("the argv builds")
+            .args()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
     }
 
     #[test]
@@ -1342,11 +1360,10 @@ mod tests {
             vec![home_bind],
             HomeMasks::resolve(Ok(&crate::home::test_home(&user_home)), None).expect("homes"),
         );
-        let argv: Vec<String> = run_jail_argv(
+        let argv: Vec<String> = fd_free_argv(
             &scope(),
             &profile,
             &mounts,
-            None,
             &no_env,
             &[OsString::from("app")],
         )
@@ -1408,11 +1425,10 @@ mod tests {
                 Vec::new(),
                 HomeMasks::unmasked(),
             );
-            let argv: Vec<String> = run_jail_argv(
+            let argv: Vec<String> = fd_free_argv(
                 &scope(),
                 &profile,
                 &mounts,
-                None,
                 &no_env,
                 &[OsString::from("app")],
             )
@@ -1554,7 +1570,7 @@ mod tests {
             &scope(),
             &SandboxProfile::maximally_isolated(),
             &mounts,
-            Some(SealedFdNumber::for_test(filter.as_fd())),
+            SealedFdNumber::for_test(filter.as_fd()),
             SealedFdNumber::for_test(app.as_fd()),
             &no_env,
             &[OsString::from("--port"), OsString::from("8080")],
@@ -1660,20 +1676,13 @@ mod tests {
             HomeMasks::unmasked(),
         );
         let no_env = |_: &str| None;
-        let joined = run_jail_argv(
-            &scope(),
-            &p,
-            &mounts,
-            None,
-            &no_env,
-            &[OsString::from("app")],
-        )
-        .expect("the argv builds")
-        .args()
-        .iter()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join(" ");
+        let joined = fd_free_argv(&scope(), &p, &mounts, &no_env, &[OsString::from("app")])
+            .expect("the argv builds")
+            .args()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
         let at = tree.as_path().display();
         assert!(
             joined.contains(&format!("--bind {at} {at}")),
@@ -1716,11 +1725,10 @@ mod tests {
                 matches!(bind, crate::mounts::TreeBind::ReadWrite(_)),
                 profile.filesystem == FilesystemScope::WorkingTreeReadWrite
             );
-            let argv: Vec<OsString> = run_jail_argv(
+            let argv: Vec<OsString> = fd_free_argv(
                 &scope(),
                 &profile,
                 &mounts,
-                None,
                 &no_env,
                 &[OsString::from("app")],
             )
@@ -1765,11 +1773,10 @@ mod tests {
                 None
             }
         };
-        let argv = run_jail_argv(
+        let argv = fd_free_argv(
             &scope(),
             &p,
             &work_mounts(),
-            None,
             &host,
             &[OsString::from("app")],
         )
@@ -2253,11 +2260,10 @@ mod tests {
                 ..SandboxProfile::maximally_isolated()
             };
             let no_env = |_: &str| None;
-            run_jail_argv(
+            fd_free_argv(
                 &scope(),
                 &profile,
                 &mounts,
-                None,
                 &no_env,
                 &[OsString::from("app")],
             )
@@ -2326,11 +2332,10 @@ mod tests {
             ..SandboxProfile::maximally_isolated()
         };
         let no_env = |_: &str| None;
-        run_jail_argv(
+        fd_free_argv(
             &scope(),
             &profile,
             mounts,
-            None,
             &no_env,
             &[OsString::from("app")],
         )

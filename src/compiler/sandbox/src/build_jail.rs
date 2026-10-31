@@ -393,14 +393,7 @@ pub fn build_in_jail(
     };
 
     let host_env = crate::host_env::granted;
-    let argv = match run_jail_argv(
-        &scope,
-        profile,
-        mounts,
-        Some(seccomp_fd),
-        &host_env,
-        payload,
-    ) {
+    let argv = match run_jail_argv(&scope, profile, mounts, seccomp_fd, &host_env, payload) {
         Ok(argv) => argv,
         Err(e) => {
             return JailOutcome::Unavailable {

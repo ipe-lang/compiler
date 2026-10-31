@@ -334,7 +334,7 @@ pub struct JailSpec {
 ///
 /// # Errors
 /// Any error of [`mounts::push_mounts`].
-pub fn bwrap_argv(
+fn bwrap_argv(
     scope: &run_jail::NprocScope,
     timeout: &ToolPath,
     spec: &JailSpec,
@@ -452,13 +452,18 @@ pub struct JailedOutput {
 
 /// Run `payload` inside the bubblewrap jail described by `spec`.
 ///
+/// The payload runs under the seccomp program with `subprocess` granted (an
+/// inspection runs cargo, rustc and the linker): every escape primitive and
+/// every namespace-creating syscall is refused, process creation is not.
+///
 /// Stdout is read with a hard byte cap — a 76k-symbol crate must not OOM
 /// the host; exceeding the cap is a defect, not a truncation.
 ///
 /// # Errors
 ///
 /// [`SandboxDefect::NoIsolationMechanism`] or [`SandboxDefect::CapsUnavailable`]
-/// when a jail tool is absent; [`SandboxDefect::ProcCapUnproven`] when the
+/// when a jail tool is absent, or when no seccomp filter can be built for this
+/// architecture (fail-closed); [`SandboxDefect::ProcCapUnproven`] when the
 /// process cap cannot be proven to count only the jail;
 /// [`SandboxDefect::Spawn`] when the jail cannot start;
 /// [`SandboxDefect::OutputCapExceeded`] when the payload out-talks the cap.
@@ -467,8 +472,7 @@ pub fn run_in_bwrap_jail(
     spec: &JailSpec,
     payload: &[OsString],
 ) -> Result<JailedOutput, SandboxDefect> {
-    let (scope, timeout) = proven_scope(caps)?;
-    run_bwrap(&scope, timeout, spec, payload, None)
+    run_in_filtered_bwrap_jail(caps, spec, payload, true)
 }
 
 /// The jail tools `caps` names, proven to jail with a process cap that counts
@@ -501,22 +505,20 @@ fn proven_scope(caps: &Capabilities) -> Result<(run_jail::NprocScope, &ToolPath)
 
 /// Run `payload` in the bubblewrap jail under a subprocess-deny seccomp filter.
 ///
-/// The filter denies the legacy subprocess syscalls (`fork`/`vfork`/process-
-/// `clone`, with thread-`clone` still allowed) — the same
+/// The filter denies the subprocess syscalls (`fork`/`vfork`/process-`clone`,
+/// with thread-`clone` still allowed; `clone3` is refused with `ENOSYS` so every
+/// task creation goes through the inspectable `clone`) — the same
 /// [`seccomp::subprocess_deny_program`] the run jail installs, so the two paths
 /// cannot drift.
 ///
 /// This is the run posture for untrusted *program execution* (as opposed to a
-/// build, which legitimately spawns rustc + a linker). It is a best-effort
-/// narrowing of the common spawn paths, NOT absolute subprocess denial: `clone3`
-/// (which modern `posix_spawn` uses) is allowed unconditionally because thread
-/// creation routes through it and seccomp cannot inspect its pointer-borne flags.
-/// The security boundary a spawned child cannot cross is the bubblewrap namespace
-/// itself — the caller relies on `--unshare-net`, the read-only root, and the
-/// `prlimit` caps to confine any child to the parent's capability set. A fork
-/// bomb is bounded by the `--nproc` cap, which [`run_jail::NprocScope`] proves
-/// counts only the jail's own user namespace, by the pid namespace that keeps
-/// every task the jail starts inside the jail, and by the wall clock.
+/// build, which legitimately spawns rustc + a linker). The security boundary a
+/// child cannot cross is still the bubblewrap namespace itself — the caller
+/// relies on `--unshare-net`, the read-only root, and the `prlimit` caps to
+/// confine every task to the parent's capability set. A fork bomb is bounded by
+/// the `--nproc` cap, which [`run_jail::NprocScope`] proves counts only the
+/// jail's own user namespace, by the pid namespace that keeps every task the
+/// jail starts inside the jail, and by the wall clock.
 ///
 /// Fail-closed: on any architecture with no compilable filter (neither `x86_64`
 /// nor `aarch64`) this REFUSES rather than running the payload unfiltered.
@@ -534,11 +536,33 @@ pub fn run_in_bwrap_jail_deny_subprocess(
     spec: &JailSpec,
     payload: &[OsString],
 ) -> Result<JailedOutput, SandboxDefect> {
+    // `allow_subprocess = false` ⇒ the fork/process-clone family is denied.
+    run_in_filtered_bwrap_jail(caps, spec, payload, false)
+}
+
+/// Prove the jail scope, then run `payload` under the seccomp program for
+/// `allow_subprocess`.
+///
+/// The one body both public bubblewrap entry points share, so no payload jail
+/// can run without its filter.
+///
+/// # Errors
+///
+/// As [`run_in_bwrap_jail`].
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn run_in_filtered_bwrap_jail(
+    caps: &Capabilities,
+    spec: &JailSpec,
+    payload: &[OsString],
+    allow_subprocess: bool,
+) -> Result<JailedOutput, SandboxDefect> {
     // The proof's canary jails run before the seccomp fd below turns
     // inheritable, so none of them can inherit it.
     let (scope, timeout) = proven_scope(caps)?;
-    // `allow_subprocess = false` ⇒ the fork/process-clone family is denied.
-    let Some(program) = seccomp::subprocess_deny_program(false) else {
+    let Some(program) = seccomp::subprocess_deny_program(allow_subprocess) else {
         // No filter can be compiled here — refuse rather than run unfiltered.
         return Err(SandboxDefect::NoIsolationMechanism);
     };
@@ -564,22 +588,54 @@ pub fn run_in_bwrap_jail_deny_subprocess(
         program: "seccomp".to_owned(),
         detail: format!("clearing close-on-exec on the seccomp memfd failed: {e}"),
     })?;
-    let out = run_bwrap(&scope, timeout, spec, payload, Some(seccomp_fd));
+    let out = run_bwrap(&scope, timeout, spec, payload, seccomp_fd);
     drop(owned);
     out
 }
 
-/// The shared spawn+drain core for both the plain and the subprocess-denied jail.
+/// Refuse every bubblewrap payload jail on a target with no seccomp filter.
 ///
-/// When `seccomp_fd` is `Some`, `--seccomp <fd>` is inserted into the bwrap argv;
-/// the caller owns that sealed fd and has already made it inheritable, so bwrap
-/// reads the filter from it across the exec.
+/// The scope is still proven first, so a host missing a jail tool reports
+/// that tool; with every tool present the refusal is
+/// [`SandboxDefect::NoIsolationMechanism`] — a payload never runs unfiltered.
+///
+/// # Errors
+///
+/// As [`run_in_bwrap_jail`]; never `Ok`.
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+fn run_in_filtered_bwrap_jail(
+    caps: &Capabilities,
+    _spec: &JailSpec,
+    _payload: &[OsString],
+    _allow_subprocess: bool,
+) -> Result<JailedOutput, SandboxDefect> {
+    proven_scope(caps)?;
+    Err(SandboxDefect::NoIsolationMechanism)
+}
+
+/// The shared spawn+drain core for every bubblewrap payload jail.
+///
+/// `--seccomp <fd>` is inserted into the bwrap argv; the caller owns that
+/// sealed fd and has already made it inheritable, so bwrap reads the filter
+/// from it across the exec.
+// Reached only through the seccomp-carrying jail, which exists only where a
+// filter can be compiled; elsewhere the fd type is uninhabited.
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )),
+    allow(dead_code)
+)]
 fn run_bwrap(
     scope: &run_jail::NprocScope,
     timeout: &ToolPath,
     spec: &JailSpec,
     payload: &[OsString],
-    seccomp_fd: Option<run_jail::SealedFdNumber<'_>>,
+    seccomp_fd: run_jail::SealedFdNumber<'_>,
 ) -> Result<JailedOutput, SandboxDefect> {
     let argv = bwrap_argv_with_seccomp(scope, timeout, spec, payload, seccomp_fd)?;
     let (program, rest) = argv
@@ -727,27 +783,24 @@ fn drain_and_reap(
     }
 }
 
-/// [`bwrap_argv`] with an optional `--seccomp <fd>` flag injected immediately
-/// after the `bwrap` program token (bwrap reads the filter from the inherited
-/// fd). When `seccomp_fd` is `None` this is exactly [`bwrap_argv`].
+/// [`bwrap_argv`] with the `--seccomp <fd>` flag injected immediately after
+/// the `bwrap` program token (bwrap reads the filter from the inherited fd).
 ///
-/// When a filter is requested but the `bwrap` token cannot be located in the
-/// rendered argv, the seccomp flag cannot be attached to bwrap — dropping it
-/// would run the payload without its syscall filter (fail-open). The refusal
-/// here keeps the seccomp guarantee: no filter, no run.
+/// The fd is not optional: a payload jail argv without its filter is
+/// unrepresentable. When the `bwrap` token cannot be located in the rendered
+/// argv, the seccomp flag cannot be attached to bwrap — dropping it would run
+/// the payload without its syscall filter (fail-open). The refusal here keeps
+/// the seccomp guarantee: no filter, no run.
 fn bwrap_argv_with_seccomp<'fd>(
     scope: &run_jail::NprocScope,
     timeout: &ToolPath,
     spec: &JailSpec,
     payload: &[OsString],
-    seccomp_fd: Option<run_jail::SealedFdNumber<'fd>>,
+    fd: run_jail::SealedFdNumber<'fd>,
 ) -> Result<run_jail::JailArgv<'fd>, SandboxDefect> {
     let mut argv = run_jail::JailArgv::fd_free(
         bwrap_argv(scope, timeout, spec, payload).map_err(SandboxDefect::Path)?,
     );
-    let Some(fd) = seccomp_fd else {
-        return Ok(argv);
-    };
     // The argv is `timeout … <wall> bwrap …`; insert `--seccomp <fd>` right after
     // the `bwrap` token so it is a bwrap option, not a timeout one.
     let bwrap = scope.tools().bwrap.as_path().into_os_string();
@@ -1342,7 +1395,7 @@ mod tests {
             &timeout(),
             &spec(),
             &[OsString::from("ipe-ffi-inspector")],
-            Some(run_jail::SealedFdNumber::for_test(filter.as_fd())),
+            run_jail::SealedFdNumber::for_test(filter.as_fd()),
         )
         .expect("bwrap token present, so the seccomp flag attaches");
         let rendered: Vec<String> = argv
@@ -1380,7 +1433,7 @@ mod tests {
             &timeout(),
             &spec(),
             &[OsString::from("ipe-ffi-inspector")],
-            Some(run_jail::SealedFdNumber::for_test(filter.as_fd())),
+            run_jail::SealedFdNumber::for_test(filter.as_fd()),
         )
         .expect("a requested seccomp filter must attach, never drop");
         let rendered: Vec<String> = argv
@@ -1404,16 +1457,26 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn no_seccomp_request_is_unchanged() {
+    fn every_payload_jail_argv_carries_seccomp() {
+        use std::os::fd::AsFd as _;
+        // The inspection jail's argv holds exactly one `--seccomp`: the fd is a
+        // required parameter, so an argv without the filter has no call site.
+        let filter = stand_in_fd();
         let argv = bwrap_argv_with_seccomp(
-            &scope_of("/nonexistent"),
+            &scope_of("/usr/bin"),
             &timeout(),
             &spec(),
             &[OsString::from("ipe-ffi-inspector")],
-            None,
+            run_jail::SealedFdNumber::for_test(filter.as_fd()),
         )
-        .expect("no filter requested, so the argv renders unchanged");
-        assert!(!argv.args().iter().any(|a| a.as_os_str() == "--seccomp"));
+        .expect("the inspection argv renders with its filter");
+        let seccomp_flags = argv
+            .args()
+            .iter()
+            .filter(|a| a.as_os_str() == "--seccomp")
+            .count();
+        assert_eq!(seccomp_flags, 1, "the payload argv must carry the filter");
     }
 }
