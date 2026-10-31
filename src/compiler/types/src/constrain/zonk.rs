@@ -1472,6 +1472,7 @@ impl KernelSchemeTable {
     }
 
     /// Every row, in `StdlibKernel::ALL` order.
+    #[must_use]
     pub fn rows(&self) -> impl ExactSizeIterator<Item = (StdlibKernel, &KernelScheme)> {
         self.rows.iter().map(|(kernel, scheme)| (*kernel, scheme))
     }
