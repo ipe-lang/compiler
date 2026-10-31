@@ -22,7 +22,7 @@ Two ideas.
 ## A worked example: a card lift
 
 The example under
-[`examples/shapes/script/transform-props`](../../examples/shapes/script/transform-props/src/Main.ipe)
+[`examples/shapes/script/transform-props`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/transform-props/src/Main.ipe)
 builds a small "lift" transform — nudge up, shrink slightly, tilt — and renders it.
 
 ```ipe
@@ -56,7 +56,7 @@ The rendered string is scanned by the CSS sanitiser at the render sink when a
 transform is applied to an interface element, so even a hand-built value cannot
 smuggle an unexpected declaration through.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

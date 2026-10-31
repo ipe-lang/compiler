@@ -35,7 +35,7 @@ Four knots.
 ## A worked example: parsing upload paths
 
 The example under
-[`examples/shapes/script/path-safe-join`](../../examples/shapes/script/path-safe-join/src/Main.ipe)
+[`examples/shapes/script/path-safe-join`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/path-safe-join/src/Main.ipe)
 runs a mix of candidate strings — some clean, one a traversal attack — through the
 single gate, then reads components off the parsed paths.
 
@@ -82,7 +82,7 @@ Rejecting the escape at construction rather than at open time is
 *enters*, close to the handler that received it, not deep in a syscall that is
 harder to trace back to its source.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

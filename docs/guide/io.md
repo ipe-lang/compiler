@@ -27,7 +27,7 @@ Three knots.
 ## A worked example: the write side of a CLI
 
 The greeting CLI under
-[`examples/shapes/script/system-greet-cli`](../../examples/shapes/script/system-greet-cli/src/Main.ipe)
+[`examples/shapes/script/system-greet-cli`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/system-greet-cli/src/Main.ipe)
 (walked through in full in the [System guide](system.md)) shows the stream split.
 It writes its diagnostic — the argument count — to stderr, and its actual result —
 the greeting — to stdout:
@@ -67,7 +67,7 @@ that would log or serialize a password simply doesn't type-check. The safe outco
 is the only reachable one — parse, don't validate, applied to a secret at the
 moment it is read.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

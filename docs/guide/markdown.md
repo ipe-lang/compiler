@@ -28,7 +28,7 @@ Three knots.
 ## A worked example: walking the block tree
 
 The example under
-[`examples/shapes/script/markdown-parse`](../../examples/shapes/script/markdown-parse/src/Main.ipe)
+[`examples/shapes/script/markdown-parse`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/markdown-parse/src/Main.ipe)
 parses a small release note and summarises each block by its variant — matching on
 the typed tree, not the text.
 
@@ -76,7 +76,7 @@ content: because the parser has no raw-HTML path and sanitises URLs at the sink,
 untrusted markdown cannot inject a script or a dangerous URL — the safe outcome is
 the only one the renderer can produce, with no sanitiser for a caller to forget.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

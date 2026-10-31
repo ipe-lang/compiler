@@ -21,7 +21,7 @@ report text =
 ```
 
 As a pipeline it reads as a recipe, top to bottom — from
-[`examples/shapes/script/word-frequency`](../../examples/shapes/script/word-frequency):
+[`examples/shapes/script/word-frequency`](https://github.com/ipe-lang/compiler/tree/main/examples/shapes/script/word-frequency):
 
 ```ipe
 report : String -> String
@@ -47,6 +47,6 @@ that, a named intermediate (`let step = … in`) reads better than forcing the p
 ## References
 
 - `ipe doc |>` — the operator reference.
-- [`Ipe.List`](../reference/stdlib/List.md) — the pipeline stages in the example.
+- [`Ipe.List`](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/List.md) — the pipeline stages in the example.
 - [Pure functions](../guide/pure-functions.md) — why each stage is a pure
   transformation of the last.

@@ -30,7 +30,7 @@ Three knots.
 ## A worked example: a greeting CLI
 
 The example under
-[`examples/shapes/script/system-greet-cli`](../../examples/shapes/script/system-greet-cli/src/Main.ipe)
+[`examples/shapes/script/system-greet-cli`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/system-greet-cli/src/Main.ipe)
 reads its name from the first user argument, its greeting word from an environment
 variable, and writes the result to stdout with a diagnostic on stderr.
 
@@ -91,7 +91,7 @@ returning a `Maybe` rather than panicking on a short argument list is
 [soundness][principles]: a missing argument is a value the compiler makes you
 handle, never an index that falls off the end.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

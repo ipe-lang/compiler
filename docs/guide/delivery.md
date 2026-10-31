@@ -30,7 +30,7 @@ Only the `Web` shape has these axes. A `tui`, `cli`, `worker`, or `script` app
 builds one way, so it has no runtime or host to choose.
 
 The full rationale — why webview is a host and not a shape, why `served` is never
-spelled out — is [ADR 0005](../adr/0005-delivery-shapes-runtimes-hosts-targets.md).
+spelled out — is [ADR 0005](https://github.com/ipe-lang/compiler/blob/main/docs/adr/0005-delivery-shapes-runtimes-hosts-targets.md).
 
 ## The `delivery` record
 
@@ -250,7 +250,7 @@ path selects a project other than the current directory.
 
 ## Where to go next
 
-- [ADR 0005](../adr/0005-delivery-shapes-runtimes-hosts-targets.md) — the two-axis delivery
+- [ADR 0005](https://github.com/ipe-lang/compiler/blob/main/docs/adr/0005-delivery-shapes-runtimes-hosts-targets.md) — the two-axis delivery
   model in full: the four TEA shapes plus the direct bucket, the two web runtimes,
   and why each is where it is.
 - `ipe doc Ipe.Package` — every `delivery`, `wasm`, and `capabilities` field.

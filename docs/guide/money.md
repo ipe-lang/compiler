@@ -28,7 +28,7 @@ Three knots.
 ## A worked example: splitting a restaurant bill
 
 The example under
-[`examples/shapes/script/money-split-bill`](../../examples/shapes/script/money-split-bill/src/Main.ipe)
+[`examples/shapes/script/money-split-bill`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/money-split-bill/src/Main.ipe)
 adds an 18% tip to a bill, splits it three ways, verifies the parts re-sum to the
 total, and shows a cross-currency add being rejected.
 
@@ -98,7 +98,7 @@ an invariant of the function, not something each caller must re-check. And the
 binary floats would drift — the reason financial code never uses `Float` for an
 amount.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

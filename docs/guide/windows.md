@@ -31,7 +31,7 @@ Open a new terminal and check `gcc --version`. Skip this step with MSVC.
 
 ## 3. `ipe`
 
-[`install.bat`](../../install.bat) downloads the **latest** release, verifies its
+[`install.bat`](https://github.com/ipe-lang/compiler/blob/main/install.bat) downloads the **latest** release, verifies its
 SHA-256, installs `ipe.exe` to `%USERPROFILE%\.ipe\bin` (override with
 `IPE_INSTALL_DIR`) and offers to add that folder to your user `PATH`. Pin a
 release with `IPE_VERSION`. It also checks for Rust and a C linker and, when

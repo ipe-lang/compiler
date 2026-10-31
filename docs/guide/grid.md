@@ -25,7 +25,7 @@ Three ideas.
 ## A worked example: a responsive column list
 
 The example under
-[`examples/shapes/script/grid-tracks`](../../examples/shapes/script/grid-tracks/src/Main.ipe)
+[`examples/shapes/script/grid-tracks`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/grid-tracks/src/Main.ipe)
 builds a column list — a fixed sidebar, a flexible main column with a minimum, and
 three equal cards — and renders it.
 
@@ -62,7 +62,7 @@ The same track lists attach to an element as `grid-template` attributes through
 `Grid.columns` / `Grid.rows` / `Grid.tracks`, which produce an `Attribute msg` for
 an interface element.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

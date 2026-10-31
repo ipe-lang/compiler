@@ -54,7 +54,7 @@ see the sibling guide [Composing row-security policies](db-store-rls-composition
 ## A worked example: store-secured-owner
 
 A per-owner secured store, end to end. The example under
-[`examples/shapes/script/store-secured-owner`](../../examples/shapes/script/store-secured-owner/src/Main.ipe)
+[`examples/shapes/script/store-secured-owner`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/store-secured-owner/src/Main.ipe)
 builds a `Note` table from a codec, secures it with an owner policy, and both writes
 and reads it as the authenticated caller through `insertAs` and `allAs`.
 
@@ -169,7 +169,7 @@ code, keeps the trust boundary in one place: the `…As` operations cannot be ca
 without an authenticated caller, so authentication is a structural precondition of
 every secured read and write, not a convention.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

@@ -24,7 +24,7 @@ Three ideas.
 ## A worked example: a login form
 
 The example under
-[`examples/shapes/script/attributes-form`](../../examples/shapes/script/attributes-form/src/Main.ipe)
+[`examples/shapes/script/attributes-form`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/attributes-form/src/Main.ipe)
 builds a two-field form. Each field is a text input; `autofocus` is chosen
 conditionally, falling back to `noAttr` when off.
 
@@ -68,7 +68,7 @@ type carries the on/off meaning, not a string a reader might get backwards. And
 Values are escaped at the render sink, so a user-supplied attribute value cannot
 break out of its quotes — the same XSS barrier [HTML](html.md) describes for text.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

@@ -60,7 +60,7 @@ update msg model =
 unchanged, as [immutability](pure-functions.md) requires.
 
 Since `update` is pure, applying a sequence of events is a
-[fold](../reference/stdlib/List.md) over them:
+[fold](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/List.md) over them:
 
 ```ipe
 -- Apply a sequence of messages, oldest first, to a starting model.
@@ -99,7 +99,7 @@ argument is context the runtime hands *in* at startup, and it is fixed by shape:
   way, so the runtime passes it in.
 - **WebView, Terminal** — `init : () -> ( Model, Cmd Msg )`. There is no
   per-session context to hand in; anything ambient (window size, args, the
-  environment) is read directly through [`Ipe.System`](../reference/stdlib/System.md).
+  environment) is read directly through [`Ipe.System`](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/System.md).
 
 Unlike Elm, Ipê has no startup `flags` — a native program reaches its
 environment directly rather than receiving it at boot. **Which way the data

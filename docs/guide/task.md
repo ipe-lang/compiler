@@ -29,7 +29,7 @@ Three knots.
 ## A worked example: a deploy runner with rollback
 
 The example under
-[`examples/shapes/script/task-deploy-steps`](../../examples/shapes/script/task-deploy-steps/src/Main.ipe)
+[`examples/shapes/script/task-deploy-steps`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/task-deploy-steps/src/Main.ipe)
 runs a deploy as a chain of dependent steps, then catches a failure and rolls
 back.
 
@@ -265,7 +265,7 @@ automatic short-circuit is [ease of use][principles] — the happy path is writt
 once, failures propagate for free, and the code reads as a straight sequence
 rather than a pyramid of nested error checks.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 
@@ -280,5 +280,5 @@ rather than a pyramid of nested error checks.
 - **Concepts:** [The do-notation idiom](../idioms/do-notation.md) — how `<-` and
   the bare-statement form desugar to `andThen`. [The Elm Architecture](the-elm-architecture.md)
   — where tasks fit in a full `init`/`update`/`view` app. The
-  [`release-preflight`](../../examples/shapes/script/release-preflight/src/Main.ipe)
+  [`release-preflight`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/release-preflight/src/Main.ipe)
   example shows `Task.parallel` for independent, concurrent steps.

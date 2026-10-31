@@ -132,7 +132,7 @@ cross-link where topics meet.
 ## Reference and lookup
 
 - [Glossary](glossary.md) — every term of art, defined once.
-- [**Module reference**](../reference/stdlib.md) — one page per `Ipe.*` module, each export
+- [**Module reference**](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib.md) — one page per `Ipe.*` module, each export
   with its signature, description, and a verified example; browsable with `ipe doc serve`.
 
 ## Looking something up from the terminal

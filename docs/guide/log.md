@@ -27,7 +27,7 @@ Three knots.
 ## A worked example: four severities
 
 The example under
-[`examples/shapes/script/log-severities`](../../examples/shapes/script/log-severities/src/Main.ipe)
+[`examples/shapes/script/log-severities`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/log-severities/src/Main.ipe)
 emits one record at each of three severities plus one with structured context,
 sequenced as tasks.
 
@@ -94,7 +94,7 @@ in the effect flow, rather than a `print` buried in a "pure" function. Dropping
 sub-threshold records before formatting means leaving diagnostics in the source
 costs nothing in production — [correctness][principles] without a runtime tax.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## Configuration
 
@@ -105,7 +105,7 @@ Two env vars control runtime log output. Use `ipe doc <VAR>` for the full entry.
 | `IPE_LOG_LEVEL` | unset (info) | Minimum severity emitted: `debug`, `info`, `warn`, or `error`; any other value refuses startup. |
 | `IPE_LOG_FORMAT` | unset (human) | Set to `json` for structured log lines suited to aggregation pipelines. |
 
-See the [**Observability** subsystem](../reference/env.md#observability) in the
+See the [**Observability** subsystem](https://github.com/ipe-lang/compiler/blob/main/docs/reference/env.md#observability) in the
 environment variable reference.
 
 ## References

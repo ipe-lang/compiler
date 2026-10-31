@@ -25,7 +25,7 @@ Three knots.
 ## A worked example: guarding config ports
 
 The example under
-[`examples/shapes/script/net-port-guard`](../../examples/shapes/script/net-port-guard/src/Main.ipe)
+[`examples/shapes/script/net-port-guard`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/net-port-guard/src/Main.ipe)
 runs a mix of candidate port numbers through the single gate, then builds a config
 port with a safe default.
 
@@ -83,7 +83,7 @@ And exposing `min`/`max` as total values is [ease of use][principles] — a safe
 default is a plain `Port`, so falling back does not drag a `Result` through code
 that just wants a sensible port.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 
@@ -95,4 +95,4 @@ that just wants a sensible port.
   (see `ipe doc Ipe.Db.Dsn`) is a connection surface that takes a `Port`.
 - **Concepts:** [The parse-don't-validate idiom](../idioms/parse-dont-validate.md)
   — the discipline the opaque `Port` embodies. The
-  [live/HTTP security invariants ADR](../adr/0003-security-render-and-data-access-invariants.md).
+  [live/HTTP security invariants ADR](https://github.com/ipe-lang/compiler/blob/main/docs/adr/0003-security-render-and-data-access-invariants.md).

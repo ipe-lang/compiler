@@ -28,7 +28,7 @@ Three knots.
 ## A worked example: decoding an app config
 
 The example under
-[`examples/shapes/script/config-decode`](../../examples/shapes/script/config-decode/src/Main.ipe)
+[`examples/shapes/script/config-decode`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/config-decode/src/Main.ipe)
 decodes a TOML document into a typed `AppConfig`, and shows a malformed document
 being rejected.
 
@@ -92,7 +92,7 @@ valid host but an unparsed port. And because a decode failure is an `Err` value,
 not a panic, malformed config cannot make the program fall over — the
 [soundness][principles] guarantee, at the config boundary.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## The YAML subset
 
@@ -132,7 +132,7 @@ Use `ipe doc <VAR>` for the full entry.
 | `IPE_CONFIG_MAX_BYTES` | 16777216 (16 MiB) | Maximum size of any config file loaded via `Config.load*`. |
 | `IPE_YAML_MAX_BYTES` | 4194304 (4 MiB) | Separate ceiling for YAML sources (`Config.decodeYaml`, and a `.yaml`/`.yml` file read by `Config.loadFromFile`). |
 
-See the [**Config** subsystem](../reference/env.md#config) in the
+See the [**Config** subsystem](https://github.com/ipe-lang/compiler/blob/main/docs/reference/env.md#config) in the
 environment variable reference.
 
 ## References

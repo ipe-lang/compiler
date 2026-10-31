@@ -28,7 +28,7 @@ Three knots.
 ## A worked example: a permission set
 
 The example under
-[`examples/shapes/script/bitwise-flags`](../../examples/shapes/script/bitwise-flags/src/Main.ipe)
+[`examples/shapes/script/bitwise-flags`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/bitwise-flags/src/Main.ipe)
 packs three capabilities — read, write, execute — into the low bits of one `Int`,
 then grants, tests, and revokes them.
 
@@ -82,7 +82,7 @@ the compiler checks them. Reach for `Bitwise` when the packing itself matters: a
 wire format, a hardware register, a hash mix, or interop with a bit-encoded
 protocol.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

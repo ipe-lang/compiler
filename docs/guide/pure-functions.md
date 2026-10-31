@@ -22,7 +22,7 @@ could have mutated between calls. This is what the [Correctness][principles]
 principle means in practice: the same well-typed program with the same input
 yields the same output.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ### Then how does anything happen?
 
@@ -32,7 +32,7 @@ world, so they cannot be plain values. In Ipê they are
 performing it. `Io.println "hi"` does not print; it produces a `Task` that, when
 the runtime runs it, prints. Your program builds up a description of what should
 happen, and the runtime is the single place that makes it happen. The
-[`Ipe.Task`](../reference/stdlib/Task.md) module and the
+[`Ipe.Task`](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/Task.md) module and the
 [TEA concept page](the-elm-architecture.md) develop how effects are sequenced.
 
 ## A value never changes
@@ -53,7 +53,7 @@ doubled =
 ```
 
 After this runs, `doubled` is `[ 2, 4, 6 ]` and `original` is **still**
-`[ 1, 2, 3 ]`. [`List.map`](../reference/stdlib/List.md) did not alter `original`; it
+`[ 1, 2, 3 ]`. [`List.map`](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/List.md) did not alter `original`; it
 produced a new list. Printing both confirms it:
 
 ```
@@ -84,7 +84,7 @@ replaced. `model` itself is unchanged.
 - **The soundness guarantee.** A well-typed Ipê program cannot fall over at
   runtime — no null dereference, no out-of-bounds access. Functions that might
   not have an answer say so in their type, returning a
-  [`Maybe`](../reference/stdlib/Maybe.md) rather than a value-or-crash. The
+  [`Maybe`](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/Maybe.md) rather than a value-or-crash. The
   [types concept page](types.md) develops this.
 
 ## Where to go next

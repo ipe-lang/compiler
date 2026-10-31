@@ -46,7 +46,7 @@ Four knots.
 ## A worked example: parse, redact, reject
 
 The example under
-[`examples/shapes/script/dsn-parse-redact`](../../examples/shapes/script/dsn-parse-redact/src/Main.ipe)
+[`examples/shapes/script/dsn-parse-redact`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/dsn-parse-redact/src/Main.ipe)
 parses a valid Postgres DSN, prints its redacted form and typed parts, then shows
 a cleartext-transport DSN and an unknown-driver DSN both rejected.
 
@@ -103,7 +103,7 @@ the source of a password in a log line. And splitting the pure parse from the
 costs nothing and reaches nothing, while dialing a host is a separately-reviewed
 step whose read-only result is enforced by the type, not a runtime check.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

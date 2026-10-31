@@ -35,10 +35,10 @@ Three ideas.
 The policy surface is pure — `explain` renders a policy as text and `secured`
 classifies a store, neither needing a live database or a `Principal` — so the whole
 demonstration runs deterministically. The multi-module package under
-[`examples/shapes/script/rls-composition-builders`](../../examples/shapes/script/rls-composition-builders/src/Main.ipe)
+[`examples/shapes/script/rls-composition-builders`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/rls-composition-builders/src/Main.ipe)
 puts each pattern in its own `Rls.*` sub-module of composition helpers, and its
 `Main` exercises all four. The sealed, self-contained twin is
-[`tests/golden/db_store_rls_composition_builders_seal`](../../tests/golden/db_store_rls_composition_builders_seal/src/Main.ipe).
+[`tests/golden/db_store_rls_composition_builders_seal`](https://github.com/ipe-lang/compiler/blob/main/tests/golden/db_store_rls_composition_builders_seal/src/Main.ipe).
 
 **Owner** — the simplest pattern: every row is private to the user who created it,
 and no one else can see or change it (think a personal notes or drafts table). A row
@@ -125,7 +125,7 @@ write. The shares store's own read policy folded into the `existsIn` subquery is
 correlation alone. And because a `Pred` is data, `explain` can state a policy's full
 meaning, so a wrong composition is legible before it ships an insecure idiom.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 
@@ -136,10 +136,10 @@ meaning, so a wrong composition is legible before it ships an insecure idiom.
   and the secured operations `allAs` / `getAs` / `insertAs` / `updateAs` /
   `deleteAs`, each with its signature.
 - **Worked example:**
-  [`examples/shapes/script/rls-composition-builders`](../../examples/shapes/script/rls-composition-builders/src/Main.ipe)
+  [`examples/shapes/script/rls-composition-builders`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/rls-composition-builders/src/Main.ipe)
   — the four patterns as `Rls.*` composition helpers.
 - **The SEAL:**
-  [`tests/golden/db_store_rls_composition_builders_seal`](../../tests/golden/db_store_rls_composition_builders_seal/src/Main.ipe)
+  [`tests/golden/db_store_rls_composition_builders_seal`](https://github.com/ipe-lang/compiler/blob/main/tests/golden/db_store_rls_composition_builders_seal/src/Main.ipe)
   — ipe-accepts ⇒ cargo-builds ⇒ runs ⇒ output matches `expected.txt`.
 - **Sibling guides:** [Store](db-store.md) — the typed table the policy secures.
   [Codec](codec.md) — the single source of truth a store and its columns derive

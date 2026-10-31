@@ -83,7 +83,7 @@ away there, never carried as a doomed send. And every credential being a sealed
 reach a log line, an error message, or a serialised value, and cannot be baked
 into source.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## Configuration
 
@@ -94,7 +94,7 @@ Use `ipe doc IPE_EMAIL_DRY_RUN` for the full entry.
 |----------|---------|--------|
 | `IPE_EMAIL_DRY_RUN` | unset (false) | Skip SMTP delivery and return a synthetic message ID. |
 
-See the [**Email** subsystem](../reference/env.md#email) in the
+See the [**Email** subsystem](https://github.com/ipe-lang/compiler/blob/main/docs/reference/env.md#email) in the
 environment variable reference.
 
 ## References

@@ -120,11 +120,11 @@ mobile is `web client <os>`).
 
 | runtime | host | command | rendered view |
 |---------|------|---------|---------------|
-| served | browser | `ipe dev run` | ![web · served · browser](../assets/shapes/web-served-browser.png) |
-| client | browser | `ipe dev run` (wasm client) | ![web · client · browser](../assets/shapes/web-client-browser.png) |
-| served | desktop | `ipe release build web desktop` | same served view, in a WebKitGTK window ![web · served · desktop](../assets/shapes/web-served-browser.png) |
-| client | ios | `ipe release build web client ios` | same client view, in a `WKWebView` ![web · client · iOS](../assets/shapes/web-client-browser.png) |
-| client | android | `ipe release build web client android` | same client view, in an Android `WebView` ![web · client · Android](../assets/shapes/web-client-browser.png) |
+| served | browser | `ipe dev run` | ![web · served · browser](https://raw.githubusercontent.com/ipe-lang/compiler/main/docs/assets/shapes/web-served-browser.png) |
+| client | browser | `ipe dev run` (wasm client) | ![web · client · browser](https://raw.githubusercontent.com/ipe-lang/compiler/main/docs/assets/shapes/web-client-browser.png) |
+| served | desktop | `ipe release build web desktop` | same served view, in a WebKitGTK window ![web · served · desktop](https://raw.githubusercontent.com/ipe-lang/compiler/main/docs/assets/shapes/web-served-browser.png) |
+| client | ios | `ipe release build web client ios` | same client view, in a `WKWebView` ![web · client · iOS](https://raw.githubusercontent.com/ipe-lang/compiler/main/docs/assets/shapes/web-client-browser.png) |
+| client | android | `ipe release build web client android` | same client view, in an Android `WebView` ![web · client · Android](https://raw.githubusercontent.com/ipe-lang/compiler/main/docs/assets/shapes/web-client-browser.png) |
 
 The last three rows reuse the browser capture on purpose: **every host renders
 the identical DOM** — desktop/iOS/Android only wrap it in a native shell — so the

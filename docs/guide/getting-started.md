@@ -62,11 +62,11 @@ Reading it top to bottom:
 
 - **`module Main exposing (main)`** declares this file as the module `Main` and
   makes `main` visible to the runtime. Every program has a `main`.
-- **`import Ipe.Io as Io`** brings the [`Ipe.Io`](../reference/stdlib/Io.md) module
+- **`import Ipe.Io as Io`** brings the [`Ipe.Io`](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/Io.md) module
   into scope under the short name `Io`; likewise `List` and `String`. You call a
   module's function through its qualifier: `Io.println`, `String.join`.
 - **`main = Io.println (greeting names)`** is the entry point.
-  [`Io.println`](../reference/stdlib/Io.md) takes a `String` and produces a
+  [`Io.println`](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/Io.md) takes a `String` and produces a
   [`Task`](glossary.md#task) — a description of an effect to run. The runtime
   runs `main`'s task; running this one prints the line.
 - **`names : List String`** is a *type annotation* — it states that `names` is a
@@ -74,7 +74,7 @@ Reading it top to bottom:
   annotations are optional, but writing them on top-level definitions documents
   the code and pins down mistakes early.
 - **`greeting`** is an ordinary function. `people` is its parameter; the body
-  joins the names with `" and "` between them ([`String.join`](../reference/stdlib/String.md))
+  joins the names with `" and "` between them ([`String.join`](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/String.md))
   and wraps the result in `"Hello, "` and `"!"`. `++` concatenates strings.
 
 ## Run it
@@ -108,7 +108,7 @@ Hello, Ada!
 
 `String.join` puts its separator only *between* elements, so a single name has
 no `" and "`. That behaviour, and every other `Ipe.String` and `Ipe.List`
-function, is in the [module reference](../reference/stdlib.md), each with a
+function, is in the [module reference](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib.md), each with a
 verified example.
 
 ## Where to go next
@@ -125,6 +125,6 @@ verified example.
   developers can `ipe add`: the registry, `ipe login`, the audit gate, and
   `ipe package publish`.
 - [Glossary](glossary.md) — every term of art, defined once.
-- [Module reference](../reference/stdlib.md) — every `Ipe.*` module, generated
+- [Module reference](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib.md) — every `Ipe.*` module, generated
   from its source doc-strings.
 ```

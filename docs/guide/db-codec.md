@@ -34,7 +34,7 @@ Three knots.
 ## A worked example: a row round-trip and two fail-closed drifts
 
 The example under
-[`examples/shapes/script/db-codec-row`](../../examples/shapes/script/db-codec-row/src/Main.ipe)
+[`examples/shapes/script/db-codec-row`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/db-codec-row/src/Main.ipe)
 derives a codec from a record witness, reads a well-formed row back into a
 typed value, and rejects three drifted rows.
 
@@ -97,7 +97,7 @@ encoder rather than any SQL text is [security][principles]: `Ipe.Db.Codec`
 constructs no query string, so it adds no injection surface over the
 already-parameterised binds it feeds.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

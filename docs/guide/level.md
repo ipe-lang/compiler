@@ -32,7 +32,7 @@ configuration. Splitting the tag into its own tiny module lets both `Ipe.Log` an
 any future severity-aware surface depend on the same four values without
 depending on each other.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

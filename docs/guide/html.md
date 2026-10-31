@@ -27,7 +27,7 @@ Three knots.
 ## A worked example: an XSS-safe comment card
 
 The example under
-[`examples/shapes/script/html-escaping`](../../examples/shapes/script/html-escaping/src/Main.ipe)
+[`examples/shapes/script/html-escaping`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/html-escaping/src/Main.ipe)
 renders a comment card whose author name is a script-injection attempt, and shows
 the render sink neutralising it.
 
@@ -69,7 +69,7 @@ and content through one render sink is [defend in depth][principles] — the esc
 and the URL check sit at a single boundary every value must cross, so no page
 built with these builders can skip them.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 
@@ -83,5 +83,5 @@ built with these builders can skip them.
   content. [Strings](string.md) — the text the builders wrap. [Tasks](task.md) —
   `renderStatic` renders a view to a file as a `Task`.
 - **Concepts:** [Types and inference](types.md) — how an `Html msg` tree is typed.
-  [Make invalid states unrepresentable](../../PRINCIPLES.md) — the principle the
+  [Make invalid states unrepresentable](https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md) — the principle the
   tree structure embodies.

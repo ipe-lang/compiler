@@ -23,7 +23,7 @@ Two knots.
 ## A worked example: shades and a spacing scale
 
 The example under
-[`examples/shapes/script/palette-shades`](../../examples/shapes/script/palette-shades/src/Main.ipe)
+[`examples/shapes/script/palette-shades`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/palette-shades/src/Main.ipe)
 renders each `Shade` to its hex string and unwraps a three-step `Spacing` scale to
 pixels.
 
@@ -73,7 +73,7 @@ spacing step, in pixels) is carried in its type, so it cannot be added to a font
 size or a z-index by accident. `spacingPx` is the one narrow un-wrap, at the edge
 where the raw number is actually laid out.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

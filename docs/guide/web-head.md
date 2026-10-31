@@ -31,7 +31,7 @@ Three knots.
 ## A worked example: per-page SEO tags
 
 The example under
-[`examples/shapes/web/head-seo`](../../examples/shapes/web/head-seo/src/Main.ipe)
+[`examples/shapes/web/head-seo`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/web/head-seo/src/Main.ipe)
 is a minimal `Web.tea` that supplies a `head` callback with title, description,
 Open Graph, theme-colour, and a canonical link.
 
@@ -84,7 +84,7 @@ guide describes, carried into the head. And head content being a pure function o
 the model is [the Elm Architecture](the-elm-architecture.md): what the page
 declares in its head is derived from state, not mutated in place.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 [html]: html.md
 
 ## References

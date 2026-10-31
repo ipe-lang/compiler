@@ -28,7 +28,7 @@ Three knots.
 ## A worked example: a retry policy by error kind
 
 The example under
-[`examples/shapes/script/error-retry-policy`](../../examples/shapes/script/error-retry-policy/src/Main.ipe)
+[`examples/shapes/script/error-retry-policy`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/error-retry-policy/src/Main.ipe)
 takes a list of representative failures and decides, for each, whether to retry —
 using the kind, not the message text.
 
@@ -113,7 +113,7 @@ message-independent. And keeping structured details out of `toString` is a small
 message, not whatever context a detail payload might hold, so a log line doesn't
 become an accidental leak.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

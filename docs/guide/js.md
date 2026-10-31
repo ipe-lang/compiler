@@ -55,7 +55,7 @@ The same SEAL governs four transport shapes, chosen by the interaction:
 ## A worked example: an outbound effect and a guarded inbound stream
 
 The example under
-[`examples/shapes/web/js-ports`](../../examples/shapes/web/js-ports/src/Main.ipe)
+[`examples/shapes/web/js-ports`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/web/js-ports/src/Main.ipe)
 is a `Web.tea` that sends a closed `JsCmd` outbound and subscribes to a guarded
 `Int` inbound stream.
 
@@ -102,7 +102,7 @@ sender can exhaust). And publishing a narrow inbound ADT rather than the interna
 `Msg` is defence in depth: even past the decoder, the browser can only name the
 transitions you deliberately exposed.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 
@@ -112,7 +112,7 @@ transitions you deliberately exposed.
   (a correlated bounded stream). A module whose reachable code uses a port
   discloses the `js-port` capability.
 - **Generic session example:**
-  [`examples/wasm/session-stream`](../../examples/wasm/session-stream/src/Main.ipe)
+  [`examples/wasm/session-stream`](https://github.com/ipe-lang/compiler/blob/main/examples/wasm/session-stream/src/Main.ipe)
   — a demo ticker session over a developer echo handler.
 - **Sibling guides:** [The Elm Architecture](the-elm-architecture.md) — the
   `Cmd`/`Sub` machinery ports reuse. [Codec](codec.md) — the typed decode

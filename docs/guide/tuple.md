@@ -26,7 +26,7 @@ Three knots.
 ## A worked example: coldest and warmest in one pass
 
 The example under
-[`examples/shapes/script/tuple-minmax`](../../examples/shapes/script/tuple-minmax/src/Main.ipe)
+[`examples/shapes/script/tuple-minmax`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/tuple-minmax/src/Main.ipe)
 finds the minimum and maximum of a list of readings in a single fold, carrying
 both in a pair.
 
@@ -83,7 +83,7 @@ names stop a reader from mixing up "first" and "second". `Tuple.pair` as a first
 -class function is [composition][principles]: it lets the pair constructor flow
 into `map2`-style combinators just like any other builder.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 
