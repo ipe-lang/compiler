@@ -9,7 +9,7 @@ package =
     , version = "0.1.0"
     , delivery =
         { desktop = { title = "server-mount-routed", width = 1024, height = 768 }
-        , mobile = { bundleId = "com.example.servermountrouted", orientation = Portrait }
+        , mobile = { bundleId = "io.acme.servermountrouted", orientation = Portrait }
         , browser = { basePath = "/" }
         }
     }

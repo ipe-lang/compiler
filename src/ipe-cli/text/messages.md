@@ -1556,6 +1556,54 @@ package.ipe: program entry {entry} names no module. An entry names a module file
 
 `delivery.browser.basePath` {base} holds the byte {byte}. A segment holds only `A-Z a-z 0-9 - . _ ~`, and segments are joined by `/`, e.g. `/my-app`.
 
+## manifest-bundle-id-refused
+
+`delivery.mobile.bundleId` is refused: {reason}; {grammar}
+
+## manifest-bundle-id-grammar
+
+a bundle id is two or more `.`-separated labels, each an ASCII letter then ASCII letters or digits, at most {max} bytes, like `{example}`
+
+## manifest-bundle-id-empty
+
+it is empty
+
+## manifest-bundle-id-too-long
+
+it is {len} bytes, over the {max}-byte ceiling
+
+## manifest-bundle-id-byte
+
+it holds byte {byte}, outside A-Z a-z 0-9 and `.`
+
+## manifest-bundle-id-empty-label
+
+it has an empty label (a leading or trailing `.`, or `..`)
+
+## manifest-bundle-id-label-starts-with-digit
+
+a label starts with a digit
+
+## manifest-bundle-id-one-label
+
+it has a single label
+
+## manifest-bundle-id-reserved-word
+
+the label `{word}` is a Java reserved word, which Android refuses as a package segment
+
+## manifest-bundle-id-java-platform
+
+the first label `{label}` names the Java platform's own packages, where Android refuses an app's classes
+
+## manifest-bundle-id-reserved-app-store
+
+it starts with `{prefix}`, which Apple reserves for its own apps (compared without regard to case); use a reverse-DNS id under a domain you own, like `{example}`
+
+## manifest-bundle-id-reserved-google-play
+
+it starts with `{prefix}`, which Google Play refuses for published apps (compared without regard to case); use a reverse-DNS id under a domain you own, like `{example}`
+
 ## manifest-installable-without-icon
 
 `delivery.browser.installable` is `True`, but the package has no `icon`. An installable app needs a square PNG icon of at least 192 by 192 px and at most 2 MiB: add one, e.g. `icon = "assets/icon-512.png"`, or set `installable = False`.
@@ -2488,7 +2536,7 @@ released (bundle) → {path} (run `./ipe-wrapper -- <args>`; WARNING: ipe-app ca
 ## android-build-steps
 
 1. `gradle wrapper` once with Gradle {gradle} or newer — the project ships no wrapper.
-2. `./gradlew assembleDebug` (Android SDK, API 34) builds an APK signed with the SDK's debug key, for local install only.
+2. `./gradlew assembleDebug` (Android SDK, API {api}) builds an APK signed with the SDK's debug key, for local install only.
 3. `./gradlew installDebug` installs it onto a running emulator or device.
 4. Store build: add a `signingConfig` for your keystore to `app/build.gradle`, then run `./gradlew assembleRelease`.
 

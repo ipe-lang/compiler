@@ -1207,7 +1207,7 @@ messages! {
     /// The Android build steps: wrapper bootstrap, debug build, install, store build.
     ///
     /// The one rendering every producer (CLI note, README, guide) carries verbatim.
-    android_build_steps(gradle) = "android-build-steps";
+    android_build_steps(gradle, api) = "android-build-steps";
     /// The note under a written Android shell project: unsigned, and how to sign it.
     mobile_android_note = "mobile-android-note";
     /// The note under a written iOS shell project.
@@ -1323,6 +1323,31 @@ messages! {
     manifest_base_path_dot_segment(base) = "manifest-base-path-dot-segment";
     /// `delivery.browser.basePath` holds a byte outside the unreserved set.
     manifest_base_path_reserved_byte(base, byte) = "manifest-base-path-reserved-byte";
+    /// A refused `delivery.mobile.bundleId`: the reason, then the grammar.
+    manifest_bundle_id_refused(reason, grammar) = "manifest-bundle-id-refused";
+    /// The bundle-id grammar every bundle-id refusal ends with.
+    manifest_bundle_id_grammar(example, max) = "manifest-bundle-id-grammar";
+    /// `delivery.mobile.bundleId` is empty.
+    manifest_bundle_id_empty = "manifest-bundle-id-empty";
+    /// `delivery.mobile.bundleId` is past the length ceiling.
+    manifest_bundle_id_too_long(len, max) = "manifest-bundle-id-too-long";
+    /// `delivery.mobile.bundleId` holds a byte outside the grammar.
+    manifest_bundle_id_byte(byte) = "manifest-bundle-id-byte";
+    /// `delivery.mobile.bundleId` has an empty label.
+    manifest_bundle_id_empty_label = "manifest-bundle-id-empty-label";
+    /// A `delivery.mobile.bundleId` label starts with a digit.
+    manifest_bundle_id_label_starts_with_digit = "manifest-bundle-id-label-starts-with-digit";
+    /// `delivery.mobile.bundleId` has a single label.
+    manifest_bundle_id_one_label = "manifest-bundle-id-one-label";
+    /// A `delivery.mobile.bundleId` label is a Java reserved word.
+    manifest_bundle_id_reserved_word(word) = "manifest-bundle-id-reserved-word";
+    /// `delivery.mobile.bundleId` starts with the Java platform's label.
+    manifest_bundle_id_java_platform(label) = "manifest-bundle-id-java-platform";
+    /// `delivery.mobile.bundleId` is under a prefix Apple reserves.
+    manifest_bundle_id_reserved_app_store(prefix, example) = "manifest-bundle-id-reserved-app-store";
+    /// `delivery.mobile.bundleId` is under a prefix Google Play refuses.
+    manifest_bundle_id_reserved_google_play(prefix, example) =
+        "manifest-bundle-id-reserved-google-play";
     /// `delivery.browser.installable = True` with no top-level `icon`.
     manifest_installable_without_icon = "manifest-installable-without-icon";
     /// The installable app's `icon` cannot be read beneath the project root.

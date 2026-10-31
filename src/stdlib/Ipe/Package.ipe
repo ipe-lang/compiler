@@ -193,10 +193,12 @@ type alias DesktopConfig =
 -- | Configuration for the `web client ios` / `web client android` mobile hosts.
 --
 -- `bundleId` is the reverse-DNS application identifier both platforms install
--- the app under (`com.example.myapp`): two or more `.`-separated labels, each an
+-- the app under (`io.acme.myapp`): two or more `.`-separated labels, each an
 -- ASCII letter then ASCII letters or digits, at most 128 bytes in all, no
--- label a Java reserved word, and a first label other than `java` (the Java
--- platform's own packages); the manifest refuses any other value. Android
+-- label a Java reserved word, a first label other than `java` (the Java
+-- platform's own packages), and not under a store-reserved prefix (`com.apple`,
+-- `com.android`, `android`, `com.example`, in any case); the manifest refuses
+-- any other value. Android
 -- (package and application id) and iOS (`CFBundleIdentifier`) use it verbatim.
 -- An absent `bundleId` is `com.ipe.` followed by the lowercased letters and
 -- digits of the package name.

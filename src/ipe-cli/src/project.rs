@@ -406,10 +406,84 @@ const JAVA_RESERVED_WORDS: &[&str] = &[
     "null",
 ];
 
-/// The first label no bundle id may start with: `java` names the Java
-/// platform's own packages, in which the Android dexer and class loaders refuse
-/// an app's classes (the `R` class of the `namespace` among them).
-const JAVA_PLATFORM_LABEL: &str = "java";
+/// The first label no bundle id may start with.
+///
+/// `java` names the Java platform's own packages, in which the Android dexer
+/// and class loaders refuse an app's classes (the `R` class of the `namespace`
+/// among them).
+pub const JAVA_PLATFORM_LABEL: &str = "java";
+
+/// The example id every bundle-id refusal advises; a test proves it parses.
+pub const BUNDLE_ID_EXAMPLE: &str = "io.acme.myapp";
+
+/// A bundle-id prefix a store or platform reserves for its own apps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReservedPrefix {
+    /// `com.apple`: Apple refuses registering an App ID under it.
+    ComApple,
+    /// `com.android`: the Android platform's own package namespace.
+    ComAndroid,
+    /// `android`: the Android framework's namespace, where the `R` class collides.
+    Android,
+    /// `com.example`: Google Play refuses a package under it.
+    ComExample,
+}
+
+impl ReservedPrefix {
+    /// Every reserved prefix, in judging order.
+    pub const ALL: [Self; 4] = [
+        Self::ComApple,
+        Self::ComAndroid,
+        Self::Android,
+        Self::ComExample,
+    ];
+
+    /// The prefix as `.`-separated lowercase labels: its one spelling.
+    #[must_use]
+    pub const fn spelled(self) -> &'static str {
+        match self {
+            Self::ComApple => "com.apple",
+            Self::ComAndroid => "com.android",
+            Self::Android => "android",
+            Self::ComExample => "com.example",
+        }
+    }
+
+    /// The store that refuses an id under this prefix.
+    #[must_use]
+    pub const fn owner(self) -> ReservedBy {
+        match self {
+            Self::ComApple => ReservedBy::AppStore,
+            Self::ComAndroid | Self::Android | Self::ComExample => ReservedBy::GooglePlay,
+        }
+    }
+}
+
+/// The store whose rule reserves a [`ReservedPrefix`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReservedBy {
+    /// Apple's App Store and developer portal.
+    AppStore,
+    /// Google Play and the Android platform.
+    GooglePlay,
+}
+
+/// The [`ReservedPrefix`] whose labels lead `text`, compared label by label
+/// without regard to ASCII case.
+///
+/// The caller has proven every byte of `text` is in `[A-Za-z0-9.]`, so ASCII
+/// case folding is the whole fold: no other spelling of a reserved label can
+/// reach this comparison. The labels are read as written, never rewritten.
+fn reserved_prefix(text: &str) -> Option<ReservedPrefix> {
+    ReservedPrefix::ALL.into_iter().find(|row| {
+        let mut labels = text.split('.');
+        row.spelled().split('.').all(|want| {
+            labels
+                .next()
+                .is_some_and(|got| got.eq_ignore_ascii_case(want))
+        })
+    })
+}
 
 /// The [`JAVA_RESERVED_WORDS`] entry `label` equals, if any.
 fn java_reserved_word(label: &str) -> Option<&'static str> {
@@ -424,9 +498,9 @@ fn java_reserved_word(label: &str) -> Option<&'static str> {
 /// The grammar is the intersection of the Android `applicationId` and the Apple
 /// `CFBundleIdentifier` grammars: two or more `.`-separated labels, each an
 /// ASCII letter followed by ASCII letters or digits, at most
-/// [`MAX_BUNDLE_ID_LEN`] bytes, and no label a Java reserved word. The field is
-/// private, so every value went through [`BundleId::parse`] or
-/// [`BundleId::derived`].
+/// [`MAX_BUNDLE_ID_LEN`] bytes, and no label a Java reserved word; it is never
+/// under a [`ReservedPrefix`], so the stores admit it. The field is private, so
+/// every value went through [`BundleId::parse`] or [`BundleId::derived`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BundleId(String);
 
@@ -436,8 +510,9 @@ impl BundleId {
     /// # Errors
     ///
     /// In judging order: `Empty`, `TooLong`, the first refused `Byte`,
-    /// `EmptyLabel`, `LabelStartsWithDigit`, `OneLabel`, `ReservedWord`, then
-    /// `JavaPlatformPackage`.
+    /// `EmptyLabel`, `LabelStartsWithDigit`, `OneLabel`, `ReservedWord`,
+    /// `JavaPlatformPackage`, then `StoreReserved`. The byte proof precedes the
+    /// store check, so its ASCII case fold is complete.
     pub fn parse(text: &str) -> Result<Self, BundleIdRefusal> {
         if text.is_empty() {
             return Err(BundleIdRefusal::Empty);
@@ -466,6 +541,9 @@ impl BundleId {
         }
         if labels().next() == Some(JAVA_PLATFORM_LABEL) {
             return Err(BundleIdRefusal::JavaPlatformPackage);
+        }
+        if let Some(prefix) = reserved_prefix(text) {
+            return Err(BundleIdRefusal::StoreReserved { prefix });
         }
         Ok(Self(text.to_owned()))
     }
@@ -533,44 +611,11 @@ pub enum BundleIdRefusal {
     },
     /// A first label `java`: the Java platform's own package namespace.
     JavaPlatformPackage,
-}
-
-/// The grammar sentence every [`BundleIdRefusal`] text ends with.
-const BUNDLE_ID_GRAMMAR: &str = "a bundle id is two or more `.`-separated labels, each an ASCII \
-                                 letter then ASCII letters or digits, like `com.example.myapp`";
-
-impl std::fmt::Display for BundleIdRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Empty => write!(f, "it is empty; {BUNDLE_ID_GRAMMAR}"),
-            Self::TooLong { len } => write!(
-                f,
-                "it is {len} bytes, over the {MAX_BUNDLE_ID_LEN}-byte ceiling; {BUNDLE_ID_GRAMMAR}"
-            ),
-            Self::Byte { byte } => write!(
-                f,
-                "it holds byte 0x{byte:02X}, outside A-Z a-z 0-9 and `.`; {BUNDLE_ID_GRAMMAR}"
-            ),
-            Self::EmptyLabel => write!(
-                f,
-                "it has an empty label (a leading or trailing `.`, or `..`); {BUNDLE_ID_GRAMMAR}"
-            ),
-            Self::LabelStartsWithDigit => {
-                write!(f, "a label starts with a digit; {BUNDLE_ID_GRAMMAR}")
-            }
-            Self::OneLabel => write!(f, "it has a single label; {BUNDLE_ID_GRAMMAR}"),
-            Self::ReservedWord { word } => write!(
-                f,
-                "the label `{word}` is a Java reserved word, which Android refuses as a \
-                 package segment; {BUNDLE_ID_GRAMMAR}"
-            ),
-            Self::JavaPlatformPackage => write!(
-                f,
-                "the first label `{JAVA_PLATFORM_LABEL}` names the Java platform's own \
-                 packages, where Android refuses an app's classes; {BUNDLE_ID_GRAMMAR}"
-            ),
-        }
-    }
+    /// Leading labels a store reserves, in any ASCII case.
+    StoreReserved {
+        /// The reserved prefix, from the static table.
+        prefix: ReservedPrefix,
+    },
 }
 
 /// A mobile pack of a program that accepts push, with no
@@ -2112,7 +2157,8 @@ mod tests {
     #[test]
     fn bundle_id_refusal_text_never_echoes_the_input() {
         for (text, byte, label) in HOSTILE_BYTE_IDS {
-            let shown = BundleIdRefusal::Byte { byte: *byte }.to_string();
+            let shown =
+                crate::package_manifest::bundle_id_refusal(&BundleIdRefusal::Byte { byte: *byte });
             assert!(
                 !shown.contains(text) && !shown.contains(label),
                 "the refusal for {text:?} echoes it: {shown}"
@@ -2148,7 +2194,7 @@ mod tests {
             "Java.example",
             "com.java.app",
             "javax.example",
-            "com.example.java",
+            "io.acme.java",
         ] {
             assert_eq!(
                 BundleId::parse(text).map(|id| id.as_str().to_owned()),
@@ -2191,16 +2237,130 @@ mod tests {
 
     #[test]
     fn bundle_id_accepts_uppercase_interior_digits_and_cased_reserved_words() {
-        for text in [
-            "Com.Example.MyApp2",
-            "com.example.Class",
-            "com.example.myapp",
-        ] {
+        for text in ["Io.Acme.MyApp2", "io.acme.Class", BUNDLE_ID_EXAMPLE] {
             assert_eq!(
                 BundleId::parse(text).map(|id| id.as_str().to_owned()),
                 Ok(text.to_owned()),
                 "{text:?}"
             );
+        }
+    }
+
+    #[test]
+    fn bundle_id_refuses_store_reserved_prefixes() {
+        for (text, prefix) in [
+            ("com.apple.x", ReservedPrefix::ComApple),
+            ("com.apple", ReservedPrefix::ComApple),
+            ("com.android.foo", ReservedPrefix::ComAndroid),
+            ("android.foo", ReservedPrefix::Android),
+            ("com.example.app", ReservedPrefix::ComExample),
+        ] {
+            assert_eq!(
+                BundleId::parse(text),
+                Err(BundleIdRefusal::StoreReserved { prefix }),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_id_refuses_store_reserved_prefixes_in_any_case() {
+        for (text, prefix) in [
+            ("COM.APPLE.x", ReservedPrefix::ComApple),
+            ("Com.Apple.App", ReservedPrefix::ComApple),
+            ("com.ApPle.x", ReservedPrefix::ComApple),
+            ("Android.foo", ReservedPrefix::Android),
+            ("Com.Example.app", ReservedPrefix::ComExample),
+        ] {
+            assert_eq!(
+                BundleId::parse(text),
+                Err(BundleIdRefusal::StoreReserved { prefix }),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_id_store_prefix_matches_whole_labels_only() {
+        for text in [
+            "com.applesauce.x",
+            "com.examples.app",
+            "androidx.foo",
+            "org.android.x",
+            "io.apple.x",
+            "com.acme.android",
+        ] {
+            assert_eq!(
+                BundleId::parse(text).map(|id| id.as_str().to_owned()),
+                Ok(text.to_owned()),
+                "a reserved label elsewhere or as a longer label is not the prefix: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_id_earlier_refusals_precede_the_store_prefix() {
+        assert_eq!(
+            BundleId::parse("com.\u{e4}pple.x"),
+            Err(BundleIdRefusal::Byte { byte: 0xC3 })
+        );
+        assert_eq!(
+            BundleId::parse("com.app\u{17f}e.x"),
+            Err(BundleIdRefusal::Byte { byte: 0xC5 })
+        );
+        assert_eq!(
+            BundleId::parse("com.apple.class"),
+            Err(BundleIdRefusal::ReservedWord { word: "class" })
+        );
+        assert_eq!(
+            BundleId::parse("java.apple"),
+            Err(BundleIdRefusal::JavaPlatformPackage)
+        );
+    }
+
+    #[test]
+    fn bundle_id_refuses_every_reserved_prefix_row() {
+        for row in ReservedPrefix::ALL {
+            let witness = match row {
+                ReservedPrefix::ComApple
+                | ReservedPrefix::ComAndroid
+                | ReservedPrefix::Android
+                | ReservedPrefix::ComExample => row.spelled(),
+            };
+            let shouted = format!("{}.x", witness.to_ascii_uppercase());
+            for text in [witness, shouted.as_str()] {
+                let expected = if text.contains('.') {
+                    Err(BundleIdRefusal::StoreReserved { prefix: row })
+                } else {
+                    Err(BundleIdRefusal::OneLabel)
+                };
+                assert_eq!(BundleId::parse(text), expected, "{text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn bundle_id_example_parses() {
+        assert_eq!(
+            BundleId::parse(BUNDLE_ID_EXAMPLE).map(|id| id.as_str().to_owned()),
+            Ok(BUNDLE_ID_EXAMPLE.to_owned())
+        );
+    }
+
+    #[test]
+    fn derived_bundle_ids_sit_under_no_reserved_prefix() {
+        assert_eq!(reserved_prefix(DERIVED_PREFIX), None);
+        for name in [
+            "",
+            "My Cool App!",
+            "9lives",
+            "class",
+            "apple",
+            "android",
+            "example",
+        ] {
+            let derived = BundleId::derived(name);
+            assert_eq!(reserved_prefix(derived.as_str()), None, "{name:?}");
         }
     }
 
