@@ -1377,9 +1377,10 @@ pub struct InstalledCrate {
 /// exact-carrier cross-check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectedFnFact {
-    /// Parameter Rust types, verbatim from the inspection.
+    /// Parameter Rust types as the signature declares them
+    /// ([`crate::pkginfo::Param::signature_rust_type`]), never the Ipê view.
     pub params: Vec<String>,
-    /// The result Rust type, or `None` for a unit return.
+    /// The result Rust type, same derivation, or `None` for a unit return.
     pub result: Option<String>,
     /// The inspector's effect classification.
     pub effect: crate::pkginfo::Effect,
@@ -1828,8 +1829,15 @@ pub fn installed_crate_from_pkg(
             inspected_free_fns.insert(
                 f.name().to_owned(),
                 InspectedFnFact {
-                    params: f.params().iter().map(|p| p.foreign_ty.clone()).collect(),
-                    result: f.results().first().map(|r| r.foreign_ty.clone()),
+                    params: f
+                        .params()
+                        .iter()
+                        .map(|p| p.signature_rust_type().to_owned())
+                        .collect(),
+                    result: f
+                        .results()
+                        .first()
+                        .map(|r| r.signature_rust_type().to_owned()),
                     effect: f.effect(),
                 },
             );

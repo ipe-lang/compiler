@@ -1808,6 +1808,114 @@ mod tests {
         assert!(check("Version").is_ok());
     }
 
+    /// An installed crate whose inspection has the inspector's own shape:
+    /// `type` holds the Ipê view, `rustType` the declared Rust type.
+    fn inspector_shaped_crate(slug: &str, functions: &serde_json::Value) -> InstalledCrate {
+        let doc = serde_json::json!({
+            "pkg": slug, "name": slug, "version": "0.1.0",
+            "functions": functions,
+            "errors": [],
+            "transitiveDeps": [{"ident": slug, "name": slug, "version": "0.1.0"}]
+        })
+        .to_string();
+        let pkg = PkgInfo::decode_json(&doc).expect("decodes");
+        crate::driver::installed_crate_from_pkg(
+            slug.to_owned(),
+            &pkg,
+            &crate::driver::FfiCache::at_project_root(std::path::Path::new(".")),
+        )
+        .expect("installs")
+    }
+
+    fn ta_fn(name: &str, param: (&str, &str), result: (&str, &str)) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "params": [{"name": "x", "type": param.0, "ipeType": param.0, "rustType": param.1}],
+            "results": [{"name": "", "type": result.0, "rustType": result.1}],
+            "effect": "pure"
+        })
+    }
+
+    fn validated_ta(sig_names: &[&str], path: &str) -> Result<AssertedSpec, Diagnostic> {
+        let ta = inspector_shaped_crate(
+            "ta",
+            &serde_json::json!([
+                ta_fn("open_client", ("Int", "i64"), ("Client", "ta::Client")),
+                ta_fn("narrow", ("Int", "u32"), ("Int", "i64")),
+                ta_fn(
+                    "borrow_client",
+                    ("Client", "&ta::Client"),
+                    ("Client", "ta::Client")
+                ),
+                ta_fn("own_client", ("Client", "ta::Client"), ("Int", "i64")),
+            ]),
+        );
+        validated_in(
+            sig_names,
+            path,
+            &[ta],
+            &UnifyReport::default(),
+            &LocalTypeNames::default(),
+        )
+    }
+
+    #[test]
+    fn the_inspected_fact_is_the_declared_rust_type_not_the_ipe_view() {
+        let spec = validated_ta(&["Int", "Result Error Client"], "ta::open_client")
+            .expect("`Int -> Client` over `fn(i64) -> ta::Client` validates");
+        assert_eq!(spec.param_rust, vec!["i64".to_owned()]);
+        assert!(validated_ta(&["Client", "Result Error Int"], "ta::own_client").is_ok());
+    }
+
+    #[test]
+    fn an_ipe_view_match_over_a_different_rust_type_is_refused() {
+        for (sig, path) in [
+            (["Int", "Result Error Int"], "ta::narrow"),
+            (["Client", "Result Error Client"], "ta::borrow_client"),
+        ] {
+            let defect = refused_with(validated_ta(&sig, path));
+            assert!(
+                matches!(defect, Some(AssertedDefect::InspectedMismatch { .. })),
+                "{path}: {defect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_same_named_opaque_of_another_crate_is_refused() {
+        let mut ta = stub_crate(
+            "Rust.Ta",
+            "ta",
+            &[("Client", "::ta::Client", Some("ta::Client"))],
+            ("ta", "0.1.0"),
+        );
+        ta.inspected_free_fns.insert(
+            "open_client".to_owned(),
+            crate::driver::InspectedFnFact {
+                params: vec!["i64".to_owned()],
+                result: Some("tb::Client".to_owned()),
+                effect: Effect::Pure,
+            },
+        );
+        let tb = stub_crate(
+            "Rust.Tb",
+            "tb",
+            &[("Client", "::tb::Client", Some("tb::Client"))],
+            ("tb", "0.1.0"),
+        );
+        let defect = refused_with(validated_in(
+            &["Int", "Result Error Client"],
+            "ta::open_client",
+            &[ta, tb],
+            &UnifyReport::default(),
+            &LocalTypeNames::default(),
+        ));
+        assert!(
+            matches!(defect, Some(AssertedDefect::InspectedMismatch { .. })),
+            "{defect:?}"
+        );
+    }
+
     #[test]
     fn dedupe_distinguishes_homes() {
         let a = validated(&["Version", "Result Error Int"], "semver::not_inspected")
