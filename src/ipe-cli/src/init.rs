@@ -3,7 +3,8 @@
 //! `ipe init [directory] [shape] [runtime]` (spec § 8). The positionals mirror
 //! the build grammar's prefix and are wizard shortcuts: `directory` is where to
 //! scaffold (`.` or omitted → the current directory, as `cargo init`); `shape`
-//! picks the template; `runtime` (for `web` only) seeds the default delivery.
+//! picks the template; `runtime` (for `web` only) seeds the declared delivery
+//! set (`ships`) and the delivery the next steps build.
 //! Host and target are not `init` args — they are delivery choices with defaults
 //! written into `package.ipe`'s `delivery` and selected later at build/release.
 //!
@@ -30,9 +31,10 @@ use std::fmt::Write as _;
 use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 
-use crate::delivery::Runtime;
+use crate::delivery::{Delivery, Runtime};
 use crate::delivery_set::ShipEntry;
 use crate::project::BundleId;
+use crate::verb::Verb;
 use crate::{CliError, health, style, text};
 
 // ── per-shape Main.ipe templates ─────────────────────────────────────────────
@@ -194,8 +196,9 @@ impl InitShape {
             Self::Web => match runtime {
                 Runtime::Served => "Then open http://localhost:8000 and click the counter buttons.",
                 Runtime::Client => {
-                    "This is a `client` app: `ipe dev run` serves the wasm bundle at \
-                     http://localhost:8000; open it and click the counter buttons."
+                    "This is a `client` app: the build writes its wasm bundle and prints \
+                     the command that serves it; open the address it serves and click \
+                     the counter buttons."
                 }
             },
             Self::Tui => "Then press the Up/Down arrow keys to change the count; press q to quit.",
@@ -212,13 +215,20 @@ impl InitShape {
     ///
     /// The single source of truth for that sentence, exhaustively matched like
     /// [`InitShape::open_hint`], so a new shape can't ship a README describing
-    /// another shape's app.
-    const fn readme_description(self) -> &'static str {
+    /// another shape's app; `web` describes the runtime it was scaffolded for.
+    const fn readme_description(self, runtime: Runtime) -> &'static str {
         match self {
-            Self::Web => {
-                "a small `Ipe.Web` counter — a Model holding a count, `Increment` and \
-                 `Decrement` messages, and a two-button view — that serves its UI over HTTP."
-            }
+            Self::Web => match runtime {
+                Runtime::Served => {
+                    "a small `Ipe.Web` counter — a Model holding a count, `Increment` and \
+                     `Decrement` messages, and a two-button view — that serves its UI over HTTP."
+                }
+                Runtime::Client => {
+                    "a small `Ipe.Web` counter — a Model holding a count, `Increment` and \
+                     `Decrement` messages, and a two-button view — that runs in the browser \
+                     as a self-contained wasm client."
+                }
+            },
             Self::Tui => {
                 "a small `Ipe.Tea.Tui` counter — a Model holding a count, updated by the \
                  Up/Down arrow keys and rendered to the terminal screen."
@@ -235,6 +245,29 @@ impl InitShape {
             }
             Self::Script => "a one-shot `Ipe.Task` script — it prints a greeting and exits.",
         }
+    }
+
+    /// The command the next steps advise, building the delivery the scaffold declares.
+    ///
+    /// A `web client` scaffold declares the browser client, which `ipe dev run`
+    /// has no executable form for, so it advises `ipe dev build` spelled with
+    /// that delivery's own words; every other scaffold declares its shape's
+    /// default delivery, which a bare `ipe dev run` builds and runs.
+    fn next_step_command(self, runtime: Runtime) -> String {
+        let client = match self {
+            Self::Web => match runtime {
+                Runtime::Served => None,
+                Runtime::Client => Some(Delivery::web_client()),
+            },
+            Self::Tui | Self::Cli | Self::Worker | Self::Server | Self::Script => None,
+        };
+        client.map_or_else(
+            || format!("ipe {}", Verb::DEV_RUN.name()),
+            |delivery| {
+                let words: Vec<&str> = delivery.words().collect();
+                format!("ipe {} {}", Verb::DEV_BUILD.name(), words.join(" "))
+            },
+        )
     }
 }
 
@@ -275,7 +308,7 @@ struct InitArgs {
     /// wizard shape prompt.
     shape: Option<InitShape>,
     /// The runtime positional, when supplied for a `web` shape — skips the wizard
-    /// runtime prompt and seeds the default delivery.
+    /// runtime prompt and seeds the declared delivery set.
     runtime: Option<Runtime>,
 }
 
@@ -796,7 +829,8 @@ fn managed_files(project_name: &str, shape: InitShape, runtime: Runtime) -> Vec<
             rel: PathBuf::from("README.md"),
             content: README_MD
                 .replace("{name}", project_name)
-                .replace("{description}", shape.readme_description())
+                .replace("{description}", shape.readme_description(runtime))
+                .replace("{run_command}", &shape.next_step_command(runtime))
                 .replace("{run_hint}", shape.open_hint(runtime)),
         },
         ManagedFile {
@@ -1066,10 +1100,11 @@ fn print_next_steps(
     shape: InitShape,
     runtime: Runtime,
 ) {
+    let command = shape.next_step_command(runtime);
     let run_cmd = if target_arg == "." {
-        "    ipe dev run".to_owned()
+        format!("    {command}")
     } else {
-        format!("    cd {target_arg} && ipe dev run")
+        format!("    cd {target_arg} && {command}")
     };
     let health_tip = if interactive {
         String::new()
@@ -1229,6 +1264,144 @@ mod tests {
                 }
             }
             assert!(admitted_hosts > 0, "{label}: some host carries the runtime");
+        }
+    }
+
+    /// The runtimes `init` scaffolds `shape` for: both for `web`, served otherwise.
+    fn scaffolded_runtimes(shape: InitShape) -> Vec<Runtime> {
+        if shape.has_runtime_choice() {
+            Runtime::ALL.to_vec()
+        } else {
+            vec![Runtime::Served]
+        }
+    }
+
+    /// The delivery shape the build pins for the `src/Main.ipe` an init `shape`
+    /// scaffolds, read by the same strict classifier the build keys on.
+    fn pinned_shape(shape: InitShape, runtime: Runtime) -> crate::delivery::Shape {
+        let files = managed_files("swept-app", shape, runtime);
+        let main = files
+            .iter()
+            .find(|f| f.rel == Path::new("src").join("Main.ipe"))
+            .expect("init writes a src/Main.ipe");
+        let mut interner = ipe_intern::Interner::new();
+        let module =
+            ipe_parse::parse_module(&main.content, &mut interner).expect("scaffold parses");
+        crate::delivery::Shape::from_main(ipe_canon::shape_source::classify_main_shape(
+            &module, &interner,
+        ))
+    }
+
+    /// The scaffold's `package.ipe`, read back by the real manifest reader.
+    fn scaffolded_manifest(
+        tag: &str,
+        shape: InitShape,
+        runtime: Runtime,
+    ) -> Result<crate::project::ProjectManifest, CliError> {
+        let files = managed_files("swept-app", shape, runtime);
+        let manifest = files
+            .iter()
+            .find(|f| f.rel == Path::new("package.ipe"))
+            .expect("init writes a package.ipe");
+        let root = ipe_test_temp::temp_root().join(format!(
+            "ipe_init_{tag}_{}_{}",
+            shape.label(),
+            runtime_label(runtime)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        write_stub_src(&root);
+        let path = root.join("package.ipe");
+        std::fs::write(&path, &manifest.content).expect("write scaffolded package.ipe");
+        let parsed = crate::project::parse_manifest(&path);
+        let _ = std::fs::remove_dir_all(&root);
+        parsed
+    }
+
+    /// Every shape `init` scaffolds, under every runtime it offers, writes a
+    /// manifest the real reader accepts and whose `ships` set the build's
+    /// delivery-set resolver admits, so no scaffold names a builder the build
+    /// refuses.
+    #[test]
+    fn every_init_shape_scaffolds_a_delivery_set_the_build_admits() {
+        use crate::delivery_set::DeliverySet;
+        for shape in InitShape::ALL {
+            for runtime in scaffolded_runtimes(shape) {
+                let label = format!("{} {}", shape.label(), runtime_label(runtime));
+                let parsed = scaffolded_manifest("admits", shape, runtime);
+                assert!(parsed.is_ok(), "{label}: manifest re-parses: {parsed:?}");
+                let Ok(parsed) = parsed else { continue };
+                let set =
+                    DeliverySet::resolve(pinned_shape(shape, runtime), &parsed.delivery.ships);
+                assert!(
+                    set.is_ok(),
+                    "{label}: the build admits the ships set: {set:?}"
+                );
+            }
+        }
+    }
+
+    /// The command a scaffold's next steps and README advise builds exactly the
+    /// delivery its manifest declares: parsed by the advised verb's own argument
+    /// parser and resolved by the build's delivery resolver, it names the one
+    /// declared delivery, and it is `dev run` only when that delivery derives a
+    /// target `dev run` executes (a `web client` derives the browser bundle, so
+    /// its command is `dev build web client`).
+    #[test]
+    fn the_advised_next_step_builds_the_declared_delivery() {
+        use crate::delivery::TargetTriple;
+        use crate::delivery_set::{DeliverySet, PlannedDelivery};
+        use crate::driver::{TargetVerb, derive_target, resolve_delivery};
+        for shape in InitShape::ALL {
+            for runtime in scaffolded_runtimes(shape) {
+                let label = format!("{} {}", shape.label(), runtime_label(runtime));
+                let pinned = pinned_shape(shape, runtime);
+                let parsed =
+                    scaffolded_manifest("advice", shape, runtime).expect("manifest re-parses");
+                let set = DeliverySet::resolve(pinned, &parsed.delivery.ships)
+                    .expect("the build admits the ships set");
+                let planned = set.planned();
+                assert_eq!(planned.len(), 1, "{label}: one declared delivery");
+                let Some(declared) = planned.first().copied().map(PlannedDelivery::delivery) else {
+                    continue;
+                };
+
+                let command = shape.next_step_command(runtime);
+                let rest = command.strip_prefix("ipe ").unwrap_or_default();
+                let (verb, tail) = [Verb::DEV_RUN, Verb::DEV_BUILD]
+                    .into_iter()
+                    .find_map(|verb| rest.strip_prefix(verb.name()).map(|tail| (verb, tail)))
+                    .expect("the advised command is `ipe dev run` or `ipe dev build`");
+                let args: Vec<String> = tail.split_whitespace().map(str::to_owned).collect();
+                let positionals = if verb == Verb::DEV_RUN {
+                    crate::cli_args::parse_run(&args).map(|a| a.delivery)
+                } else {
+                    crate::cli_args::parse_build(&args).map(|a| a.delivery)
+                }
+                .expect("the advised verb's parser reads the command");
+                let advised = resolve_delivery(pinned, &positionals, false, verb.name())
+                    .expect("the advised delivery resolves");
+                assert_eq!(
+                    advised, declared,
+                    "{label}: `{command}` builds the declared delivery"
+                );
+
+                let derived = derive_target(TargetVerb::Dev, advised, None, None, false)
+                    .expect("the advised delivery derives a dev target");
+                assert_eq!(
+                    verb == Verb::DEV_RUN,
+                    !derived.is_some_and(TargetTriple::is_wasm),
+                    "{label}: `{command}` runs only a delivery `dev run` can execute"
+                );
+
+                let readme = managed_files("swept-app", shape, runtime)
+                    .into_iter()
+                    .find(|f| f.rel == Path::new("README.md"))
+                    .expect("init writes a README.md");
+                assert!(
+                    readme.content.contains(&format!("\n{command}\n")),
+                    "{label}: the README advises `{command}`"
+                );
+            }
         }
     }
 
