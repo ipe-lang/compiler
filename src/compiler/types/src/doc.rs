@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use ipe_canon::ast as canon;
-use ipe_diagnostics::{DResult, Diagnostic, TyDoc};
+use ipe_diagnostics::{DResult, Diagnostic, TyDoc, TypeClass};
 use ipe_intern::{Interner, Symbol};
 
 use crate::ty::Ty;
@@ -18,13 +18,17 @@ use crate::ty::Ty;
 ///
 /// A solved [`Ty::Var`] carries an opaque arena id, not a source name; rendering
 /// it verbatim would leak an unstable integer. Instead each distinct id is
-/// assigned a stable letter (`a`, `b`, …, `z`, `a1`, `b1`, …) in **first-seen
-/// order**, shared across the expected/found pair of a single diagnostic so the
-/// same variable reads identically on both sides.
+/// assigned a stable name in **first-seen order**, shared across the
+/// expected/found pair of a single diagnostic so the same variable reads
+/// identically on both sides. A variable owing a [`TypeClass`] is named by the
+/// class stem (`number`, `number1`, `comparable`, …); every other variable gets
+/// a letter (`a`, `b`, …, `z`, `a1`, `b1`, …).
 #[derive(Default)]
 pub struct VarNamer {
     map: BTreeMap<u32, Box<str>>,
     next: u32,
+    classes: BTreeMap<u32, TypeClass>,
+    stem_next: BTreeMap<TypeClass, u32>,
 }
 
 impl VarNamer {
@@ -34,18 +38,52 @@ impl VarNamer {
         Self {
             map: BTreeMap::new(),
             next: 0,
+            classes: BTreeMap::new(),
+            stem_next: BTreeMap::new(),
         }
     }
 
-    /// The stable letter name for arena id `id`, minting one on first sight.
+    /// A fresh namer that names each id in `classes` by its class stem.
+    #[must_use]
+    pub const fn with_classes(classes: BTreeMap<u32, TypeClass>) -> Self {
+        Self {
+            map: BTreeMap::new(),
+            next: 0,
+            classes,
+            stem_next: BTreeMap::new(),
+        }
+    }
+
+    /// The stable name for arena id `id`, minting one on first sight.
     fn name(&mut self, id: u32) -> Box<str> {
         if let Some(existing) = self.map.get(&id) {
             return existing.clone();
         }
-        let name = letters(self.next);
-        self.next = self.next.saturating_add(1);
+        let name = self.classes.get(&id).map_or_else(
+            || {
+                let name = letters(self.next);
+                self.next = self.next.saturating_add(1);
+                name
+            },
+            |class| {
+                let n = self.stem_next.entry(*class).or_insert(0);
+                let name = stem_name(*class, *n);
+                *n = n.saturating_add(1);
+                name
+            },
+        );
         self.map.insert(id, name.clone());
         name
+    }
+}
+
+/// `(Number, 0) → number`, `(Number, 1) → number1`, … — the `k`-th distinct
+/// variable owing `class`.
+fn stem_name(class: TypeClass, k: u32) -> Box<str> {
+    if k == 0 {
+        class.stem().into()
+    } else {
+        format!("{}{k}", class.stem()).into_boxed_str()
     }
 }
 
@@ -220,6 +258,22 @@ mod tests {
         assert_eq!(&*first, "a");
         assert_eq!(&*second, "b");
         assert_eq!(first, again, "same id must reuse its name");
+    }
+
+    #[test]
+    fn namer_names_a_class_owing_id_by_its_stem() {
+        let classes = BTreeMap::from([
+            (1, TypeClass::Number),
+            (2, TypeClass::Number),
+            (3, TypeClass::Comparable),
+        ]);
+        let mut n = VarNamer::with_classes(classes);
+        assert_eq!(&*n.name(9), "a");
+        assert_eq!(&*n.name(1), "number");
+        assert_eq!(&*n.name(2), "number1");
+        assert_eq!(&*n.name(3), "comparable");
+        assert_eq!(&*n.name(1), "number", "same id must reuse its stem name");
+        assert_eq!(&*n.name(8), "b", "a stem name must not consume a letter");
     }
 
     #[test]

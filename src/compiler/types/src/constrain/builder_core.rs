@@ -1,10 +1,10 @@
 use strum::EnumCount as _;
 
 use super::{
-    BTreeMap, BTreeSet, BinopClass, Builder, Builtins, Constraint, Content, CtorScheme, DResult,
-    Diagnostic, FlatType, Generated, InferError, Interner, ModuleHome, Rc, RefCell, RowTail,
-    SchemeSlot, Span, StdlibKernel, SuperVar, Symbol, Ty, TyBounds, UnionFind, UntypedDef, VarId,
-    canon, classify_binop, from_canon, pin_any_in_ty,
+    BTreeMap, BTreeSet, BinopClass, Builder, Builtins, CallSite, Constraint, ConstraintOrigin,
+    Content, CtorScheme, DResult, Diagnostic, FlatType, Generated, InferError, Interner,
+    ModuleHome, Rc, RefCell, RowTail, SchemeSlot, Span, StdlibKernel, SuperVar, Symbol, Ty,
+    TyBounds, UnionFind, UntypedDef, VarId, canon, classify_binop, from_canon, pin_any_in_ty,
 };
 
 impl<'a> Builder<'a> {
@@ -56,6 +56,7 @@ impl<'a> Builder<'a> {
             expected: BTreeMap::new(),
             current_home: None,
             constraints: Vec::new(),
+            call_results: BTreeMap::new(),
             top_level: seed_top_level, // (home, name) → Ty
             untyped: BTreeMap::new(),  // (home, name) → UntypedDef
             field_accesses: Vec::new(),
@@ -543,13 +544,48 @@ impl<'a> Builder<'a> {
     }
 
     /// Constrain `lhs` to equal `rhs`, blaming `span` in the module `home`.
+    ///
+    /// A `lhs` that is a call's result carries that call as the origin, so a
+    /// failure can read as the call's arity fault.
     pub fn eq_at(&mut self, home: ModuleHome, span: Span, lhs: VarId, rhs: VarId) {
+        let origin = self
+            .call_results
+            .get(&lhs)
+            .map_or(ConstraintOrigin::Plain, |site| {
+                ConstraintOrigin::CallResult(*site)
+            });
         self.constraints.push(Constraint {
             span,
             lhs,
             rhs,
             home,
+            origin,
         });
+    }
+
+    /// Constrain a call's callee type `callee` to equal the arrow `shape` its
+    /// arguments build, blaming `span`; the result variable `ret` is recorded
+    /// as the call's, for every later constraint that consumes it.
+    ///
+    /// # Errors
+    /// [`Diagnostic::CompilerBug`] when no def is being constrained.
+    pub fn eq_call_shape(
+        &mut self,
+        span: Span,
+        site: CallSite,
+        shape: VarId,
+        ret: VarId,
+    ) -> DResult<()> {
+        let home = self.home()?;
+        self.constraints.push(Constraint {
+            span,
+            lhs: site.callee,
+            rhs: shape,
+            home,
+            origin: ConstraintOrigin::CallShape(site),
+        });
+        self.call_results.insert(ret, site);
+        Ok(())
     }
 
     /// The module owning the def being constrained.

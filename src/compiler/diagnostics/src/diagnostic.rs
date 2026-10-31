@@ -1109,6 +1109,90 @@ pub const INTERPOLABLE_TYPES: [&str; 5] = ["String", "Int", "Float", "Bool", "Ch
 /// names the accepted types and the conversion that fixes the call.
 pub const INTERPOLABLE_CLASS: &str = "interpolable scalar";
 
+/// The Ipê types that satisfy the `number` class (`+`, `-`, `*`).
+///
+/// The single table the type gate (`ipe_types::super_bounds::NUMBER`) and the
+/// help line for [`TypeClass::Number`] read.
+pub const NUMBER_TYPES: [&str; 2] = ["Int", "Float"];
+
+/// The Ipê types with a built-in ordering: the `comparable` class (`<`, `>`,
+/// sorting, a `Set` element, a `Dict` key) at a concrete type.
+///
+/// The single table the type gate (`ipe_types::super_bounds::ORD_BORROW` and
+/// `COMPARABLE_KEY`) and the help line for [`TypeClass::Comparable`] read.
+pub const COMPARABLE_TYPES: [&str; 5] = ["Int", "Float", "Char", "String", "Bool"];
+
+/// A class a constrained type variable owes, as a diagnostic names it.
+///
+/// A solved variable owing one renders by the class stem (`number`,
+/// `comparable`, …), never a bare letter. A [`TypeError::TypeMismatch`] whose
+/// concrete side lacks the class carries it, so the help line says what the
+/// class admits.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum TypeClass {
+    /// `+ - *`: exactly [`NUMBER_TYPES`].
+    Number,
+    /// `< > <= >=`, sorting, and `Set` elements / `Dict` keys.
+    Comparable,
+    /// `++`: `String` and `List`.
+    Appendable,
+    /// `== /=`: every type that holds no function.
+    Equatable,
+}
+
+impl TypeClass {
+    /// The stem a variable owing this class renders as.
+    #[must_use]
+    pub const fn stem(self) -> &'static str {
+        match self {
+            Self::Number => "number",
+            Self::Comparable => "comparable",
+            Self::Appendable => "appendable",
+            Self::Equatable => "equatable",
+        }
+    }
+}
+
+/// The argument count of a call against the count its function takes.
+///
+/// Built only through [`Self::new`], which refuses an equal pair: a call that
+/// gives a function exactly the arguments it takes has no arity fault.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ArgCount {
+    takes: usize,
+    given: usize,
+}
+
+impl ArgCount {
+    /// The count pair, or `None` when the call gives what the function takes.
+    #[must_use]
+    pub const fn new(takes: usize, given: usize) -> Option<Self> {
+        if takes == given {
+            None
+        } else {
+            Some(Self { takes, given })
+        }
+    }
+
+    /// How many arguments the function takes.
+    #[must_use]
+    pub const fn takes(self) -> usize {
+        self.takes
+    }
+
+    /// How many arguments the call gives it.
+    #[must_use]
+    pub const fn given(self) -> usize {
+        self.given
+    }
+
+    /// Whether the call gives more arguments than the function takes.
+    #[must_use]
+    pub const fn is_surplus(self) -> bool {
+        self.given > self.takes
+    }
+}
+
 /// Errors raised during type inference / checking.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum TypeError {
@@ -1127,6 +1211,17 @@ pub enum TypeError {
         definition: Option<Span>,
         /// The diverging field/row path, e.g. `["user", "age"]`, if applicable.
         path: Box<[Box<str>]>,
+        /// The class a constrained type variable on one side owes and the
+        /// other side's type lacks, when that is why the two diverge.
+        unmet_class: Option<TypeClass>,
+    },
+    /// A call gives a function more arguments than it takes, or fewer where
+    /// its result is used as a finished value. `callee` names the function
+    /// when the call names it; `signature` is the function's type. [IPE-T0001]
+    CallArity {
+        callee: Option<Box<str>>,
+        count: ArgCount,
+        signature: Box<TyDoc>,
     },
     /// Occurs-check failure: `var` would have to equal a type containing it. [IPE-T0002]
     InfiniteType { var: Box<str>, ty: Box<TyDoc> },
@@ -2629,6 +2724,7 @@ impl Diagnostic {
                 | TypeError::Mismatch
                 | TypeError::BudgetExceeded
                 | TypeError::TypeMismatch { .. }
+                | TypeError::CallArity { .. }
                 | TypeError::InfiniteType { .. }
                 | TypeError::StepBudgetExceeded { .. }
                 | TypeError::TooManyParameters { .. }
@@ -2883,7 +2979,9 @@ const fn name_code(msg: &NameError) -> Code {
 
 const fn type_code(msg: &TypeError) -> Code {
     in_type(match msg {
-        TypeError::Mismatch | TypeError::TypeMismatch { .. } => IPE_T0001,
+        TypeError::Mismatch | TypeError::TypeMismatch { .. } | TypeError::CallArity { .. } => {
+            IPE_T0001
+        }
         TypeError::InfiniteType { .. } => IPE_T0002,
         TypeError::BudgetExceeded | TypeError::StepBudgetExceeded { .. } => IPE_T0003,
         TypeError::TooManyParameters { .. } => IPE_T0004,
@@ -3128,12 +3226,22 @@ fn name_help(msg: &NameError) -> Vec<HelpLine> {
 
 fn type_help(msg: &TypeError) -> Vec<HelpLine> {
     match msg {
-        TypeError::TypeMismatch { definition, .. } => definition.map_or_else(Vec::new, |span| {
-            vec![HelpLine::SecondarySpan {
-                span,
-                role: SpanRole::Definition,
-            }]
-        }),
+        TypeError::TypeMismatch {
+            definition,
+            unmet_class,
+            ..
+        } => {
+            let mut lines: Vec<HelpLine> = definition
+                .iter()
+                .map(|span| HelpLine::SecondarySpan {
+                    span: *span,
+                    role: SpanRole::Definition,
+                })
+                .collect();
+            lines.extend(unmet_class.map(|class| HelpLine::Note(class_note(class).into())));
+            lines
+        }
+        TypeError::CallArity { count, .. } => vec![HelpLine::Note(arity_note(*count).into())],
         TypeError::BudgetExceeded | TypeError::StepBudgetExceeded { .. } => {
             vec![HelpLine::Hint(Hint::RaiseSolverBudget)]
         }
@@ -3222,6 +3330,56 @@ fn type_help(msg: &TypeError) -> Vec<HelpLine> {
         | TypeError::CtorPatternArity { .. }
         | TypeError::SuperTypeUnsatisfied { .. }
         | TypeError::TaskArity { .. } => Vec::new(),
+    }
+}
+
+/// What a class admits, for a mismatch whose concrete side lacks it.
+fn class_note(class: TypeClass) -> String {
+    match class {
+        TypeClass::Number => format!(
+            "only {} are numbers: `+`, `-`, `*` and every function built on them \
+             take no other type",
+            listed(&NUMBER_TYPES)
+        ),
+        TypeClass::Comparable => format!(
+            "only {} have a built-in ordering, so only they can be compared with `<` or \
+             `>`, sorted with `List.sort`, or used as a `Set` element or `Dict` key. Use a \
+             value of one of those types derived from yours instead: `List.sortBy` sorts \
+             by such a key, `List.sortWith` by your own ordering",
+            listed(&COMPARABLE_TYPES)
+        ),
+        TypeClass::Appendable => {
+            "only `String` and `List` values can be joined with `++`".to_owned()
+        }
+        TypeClass::Equatable => "a function has no equality, so a value holding one can't be \
+             compared with `==` or `/=`. Compare the values the function produces instead"
+            .to_owned(),
+    }
+}
+
+/// `["Int", "Float", "Char"]` as `` `Int`, `Float` and `Char` ``.
+fn listed(types: &[&str]) -> String {
+    let quoted: Vec<String> = types.iter().map(|t| format!("`{t}`")).collect();
+    match quoted.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => quoted.concat(),
+    }
+}
+
+/// The remedy for a call that gives a function the wrong number of arguments.
+fn arity_note(count: ArgCount) -> String {
+    if count.takes() == 0 {
+        "only a function can be applied to arguments: remove the arguments, or call \
+         a function that takes them"
+            .to_owned()
+    } else if count.is_surplus() {
+        "pass exactly the arguments the function takes. An argument that is itself a \
+         call goes in parentheses: `f (g x)` gives `f` one argument, `f g x` gives it two"
+            .to_owned()
+    } else {
+        "pass the missing arguments. A call given fewer arguments than its function \
+         takes is a function still waiting for the rest, not a finished value"
+            .to_owned()
     }
 }
 

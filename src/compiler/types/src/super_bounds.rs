@@ -25,8 +25,9 @@ pub enum BoundSite {
     ConcretePin,
 }
 
-/// Prim names that satisfy the `number` super-type (`+`, `-`, `*`).
-pub const NUMBER: &[&str] = &["Int", "Float"];
+/// Prim names that satisfy the `number` super-type (`+`, `-`, `*`) — exactly
+/// [`ipe_diagnostics::NUMBER_TYPES`], the table the help line names.
+pub const NUMBER: &[&str] = &ipe_diagnostics::NUMBER_TYPES;
 
 /// Prim names that satisfy `ord` at an **emitted-generic** site.
 ///
@@ -38,8 +39,9 @@ pub const ORD_COPY: &[&str] = &["Int", "Float", "Char", "Bool"];
 /// Prim names that satisfy `ord` at a **concrete-pin** site.
 ///
 /// `String` is included: direct comparison borrows operands and needs no
-/// `Copy`. Differs from [`ORD_COPY`] only in the `String` slot.
-pub const ORD_BORROW: &[&str] = &["Int", "Float", "Char", "String", "Bool"];
+/// `Copy`. Differs from [`ORD_COPY`] only in the `String` slot. Exactly
+/// [`ipe_diagnostics::COMPARABLE_TYPES`], the table the help line names.
+pub const ORD_BORROW: &[&str] = &ipe_diagnostics::COMPARABLE_TYPES;
 
 /// Prim names that satisfy the `comparable` key constraint (`Set` element /
 /// `Dict` key at the Ipê type level).
@@ -47,7 +49,8 @@ pub const ORD_BORROW: &[&str] = &["Int", "Float", "Char", "String", "Bool"];
 /// `Float` is admitted here because Ipê's type system accepts it as
 /// `comparable`; the Rust-backend reality that `f64` is neither `Hash` nor
 /// `Eq` is enforced at lowering (see `ipe_lower`'s `float_key_rejected`).
-pub const COMPARABLE_KEY: &[&str] = &["Int", "Float", "Char", "String", "Bool"];
+/// Exactly [`ipe_diagnostics::COMPARABLE_TYPES`], the table the help line names.
+pub const COMPARABLE_KEY: &[&str] = &ipe_diagnostics::COMPARABLE_TYPES;
 
 /// Prim names that satisfy the SQL-bind-parameter constraint.
 pub const SQL_PARAM: &[&str] = &["Int", "Float", "String", "Bool", "SqlValue"];

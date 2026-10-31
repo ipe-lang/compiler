@@ -93,6 +93,7 @@ impl Builder<'_> {
                                         found: Box::new(found),
                                         definition: None,
                                         path: Box::new([]),
+                                        unmet_class: None,
                                     },
                                 });
                             }

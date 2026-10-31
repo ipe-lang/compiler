@@ -7,7 +7,8 @@
 //! at `ipe` — never left to emit Rust `cargo` rejects:
 //!
 //! * **Non-orderable key, direct call** (a record, a custom type, a function, a
-//!   tuple): `IPE-T0001`, the eager-pin mismatch of the ordered key variable.
+//!   tuple): `IPE-T0001`, the eager-pin mismatch of the ordered key variable,
+//!   which reads by its class stem (`comparable`).
 //! * **Through a generic forwarder** (`byKey : (a -> b) -> List a -> List a`):
 //!   `IPE-T0014`, the forwarder's key variable inherits the obligation and its
 //!   instantiation does not meet it. An ordering generic is emitted with a
@@ -99,7 +100,7 @@ fn sort_by_record_key_is_ipe_t0001() {
         "sort_by_record_key_gate",
         "m4e_sort_by_record_key_gate_emit",
         ipe_diagnostics::IPE_T0001,
-        "expected { name : String }, found a",
+        "expected { name : String }, found comparable",
     );
 }
 
@@ -110,7 +111,7 @@ fn sort_by_custom_type_key_is_ipe_t0001() {
         "sort_by_adt_key_gate",
         "m4e_sort_by_adt_key_gate_emit",
         ipe_diagnostics::IPE_T0001,
-        "expected Main.Shade, found a",
+        "expected Main.Shade, found comparable",
     );
 }
 
@@ -123,7 +124,7 @@ fn sort_by_function_key_is_ipe_t0001() {
         "sort_by_fn_key_gate",
         "m4e_sort_by_fn_key_gate_emit",
         ipe_diagnostics::IPE_T0001,
-        "expected a, found b -> b",
+        "expected comparable, found number -> number",
     );
 }
 
@@ -135,7 +136,7 @@ fn sort_by_tuple_key_is_ipe_t0001() {
         "sort_by_tuple_key_gate",
         "m4e_sort_by_tuple_key_gate_emit",
         ipe_diagnostics::IPE_T0001,
-        "expected a, found (b, c)",
+        "expected comparable, found (a, b)",
     );
 }
 
