@@ -566,13 +566,12 @@ fn run_in_filtered_bwrap_jail(
         // No filter can be compiled here — refuse rather than run unfiltered.
         return Err(SandboxDefect::NoIsolationMechanism);
     };
-    let bytes = seccomp::program_bytes(&program);
     // The memfd is owned in the PARENT so it is closed on return — this launcher
     // `spawn`s (not `exec`s) and the server is long-lived, so a leaked fd per
     // request would exhaust the process's file-descriptor limit. The child gets
     // its own inherited copy across `spawn`, so closing the parent's copy after
     // the run does not disturb the jailed process.
-    let owned = run_jail::write_seccomp_memfd(&bytes).map_err(|d| SandboxDefect::Spawn {
+    let owned = run_jail::write_seccomp_memfd(&program).map_err(|d| SandboxDefect::Spawn {
         program: "seccomp".to_owned(),
         detail: d.to_string(),
     })?;
@@ -635,7 +634,7 @@ fn run_bwrap(
     timeout: &ToolPath,
     spec: &JailSpec,
     payload: &[OsString],
-    seccomp_fd: run_jail::SealedFdNumber<'_>,
+    seccomp_fd: run_jail::SeccompFdNumber<'_>,
 ) -> Result<JailedOutput, SandboxDefect> {
     let argv = bwrap_argv_with_seccomp(scope, timeout, spec, payload, seccomp_fd)?;
     let (program, rest) = argv
@@ -796,7 +795,7 @@ fn bwrap_argv_with_seccomp<'fd>(
     timeout: &ToolPath,
     spec: &JailSpec,
     payload: &[OsString],
-    fd: run_jail::SealedFdNumber<'fd>,
+    fd: run_jail::SeccompFdNumber<'fd>,
 ) -> Result<run_jail::JailArgv<'fd>, SandboxDefect> {
     let mut argv = run_jail::JailArgv::fd_free(
         bwrap_argv(scope, timeout, spec, payload).map_err(SandboxDefect::Path)?,
@@ -804,7 +803,7 @@ fn bwrap_argv_with_seccomp<'fd>(
     // The argv is `timeout … <wall> bwrap …`; insert `--seccomp <fd>` right after
     // the `bwrap` token so it is a bwrap option, not a timeout one.
     let bwrap = scope.tools().bwrap.as_path().into_os_string();
-    if !argv.attach_fd_after(&bwrap, "--seccomp", &fd) {
+    if !argv.attach_seccomp_after(&bwrap, &fd) {
         return Err(SandboxDefect::SeccompNotAttached);
     }
     Ok(argv)
@@ -1395,7 +1394,7 @@ mod tests {
             &timeout(),
             &spec(),
             &[OsString::from("ipe-ffi-inspector")],
-            run_jail::SealedFdNumber::for_test(filter.as_fd()),
+            run_jail::SeccompFdNumber::for_test(filter.as_fd()),
         )
         .expect("bwrap token present, so the seccomp flag attaches");
         let rendered: Vec<String> = argv
@@ -1433,7 +1432,7 @@ mod tests {
             &timeout(),
             &spec(),
             &[OsString::from("ipe-ffi-inspector")],
-            run_jail::SealedFdNumber::for_test(filter.as_fd()),
+            run_jail::SeccompFdNumber::for_test(filter.as_fd()),
         )
         .expect("a requested seccomp filter must attach, never drop");
         let rendered: Vec<String> = argv
@@ -1469,7 +1468,7 @@ mod tests {
             &timeout(),
             &spec(),
             &[OsString::from("ipe-ffi-inspector")],
-            run_jail::SealedFdNumber::for_test(filter.as_fd()),
+            run_jail::SeccompFdNumber::for_test(filter.as_fd()),
         )
         .expect("the inspection argv renders with its filter");
         let seccomp_flags = argv

@@ -446,9 +446,27 @@ const _: () = assert!(CLONE_NEW_MASK == 0x7E02_0000);
 /// mismatched, fail-open filter. The caller treats `None` as "no filter can be
 /// built here" and refuses (fail-closed).
 #[must_use]
-pub fn subprocess_deny_program(allow_subprocess: bool) -> Option<Vec<SockFilter>> {
+pub fn subprocess_deny_program(allow_subprocess: bool) -> Option<JailProgram> {
     let abi = active_abi()?;
-    Some(build_program_for(abi, allow_subprocess))
+    Some(JailProgram(build_program_for(abi, allow_subprocess)))
+}
+
+/// A seccomp program this module built for the jail: the only value a sealed
+/// seccomp descriptor is written from.
+///
+/// The field is private and [`subprocess_deny_program`] is its only producer,
+/// so an arbitrary instruction list or byte string (an allow-all program, a
+/// program for another ABI) has no representation as a jail filter.
+#[derive(Debug, PartialEq, Eq)]
+pub struct JailProgram(Vec<SockFilter>);
+
+#[cfg(test)]
+impl JailProgram {
+    /// A real jail program on a fixed ABI, independent of the host arch, for
+    /// tests that need a sealed seccomp descriptor but not its decisions.
+    pub(crate) fn for_test() -> Self {
+        Self(build_program_for(X86_64_SYSCALLS, false))
+    }
 }
 
 /// The pure program builder for an explicit ABI, independent of the host arch so
@@ -567,7 +585,13 @@ const fn ret(k: u32) -> SockFilter {
 /// The whole program as the flat little-endian byte stream bubblewrap loads
 /// from the seccomp fd.
 #[must_use]
-pub fn program_bytes(prog: &[SockFilter]) -> Vec<u8> {
+pub fn program_bytes(program: &JailProgram) -> Vec<u8> {
+    instruction_bytes(&program.0)
+}
+
+/// The flat byte stream of any instruction list; reached by production only
+/// through [`program_bytes`].
+fn instruction_bytes(prog: &[SockFilter]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(prog.len() * 8);
     for insn in prog {
         bytes.extend_from_slice(&insn.to_bytes());
@@ -1005,8 +1029,9 @@ mod tests {
     fn program_bytes_is_dense_eight_per_instruction() {
         for &abi in ABIS {
             let prog = build_program_for(abi, false);
-            let bytes = program_bytes(&prog);
+            let bytes = instruction_bytes(&prog);
             assert_eq!(bytes.len(), prog.len() * 8);
+            assert_eq!(program_bytes(&JailProgram(prog)), bytes);
         }
     }
 

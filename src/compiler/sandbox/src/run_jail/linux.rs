@@ -12,8 +12,8 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 
 use super::{
-    BwrapTools, JailArgv, RunJailDefect, RunJailTools, SandboxProfile, SealedFdNumber, prove,
-    run_jail_argv, run_jail_argv_with_delivery,
+    BwrapTools, JailArgv, RunJailDefect, RunJailTools, SandboxProfile, SealedFdNumber,
+    SeccompFdNumber, prove, run_jail_argv, run_jail_argv_with_delivery,
 };
 use crate::seccomp;
 use crate::{CanonicalPath, HostTool, JailMounts};
@@ -145,8 +145,7 @@ pub fn exec_in_run_jail(
             reason: "no seccomp filter can be compiled for this architecture",
         });
     };
-    let bytes = seccomp::program_bytes(&program);
-    let seccomp = write_seccomp_memfd(&bytes)?;
+    let seccomp = write_seccomp_memfd(&program)?;
     // The seccomp fd MUST survive exec so bwrap can read the program from it.
     // `exec` replaces THIS process (no fork), so clearing close-on-exec here is
     // the same fd-table state a pre-exec hook would see. A failure refuses
@@ -207,8 +206,7 @@ pub fn exec_embedded_in_run_jail(
             reason: "no seccomp filter can be compiled for this architecture",
         });
     };
-    let bytes = seccomp::program_bytes(&program);
-    let seccomp = write_seccomp_memfd(&bytes)?;
+    let seccomp = write_seccomp_memfd(&program)?;
     // Both the seccomp filter fd and the sealed app fd MUST survive the exec so
     // bwrap can read them. `exec` replaces THIS process (no fork), so clearing
     // close-on-exec here is the same fd-table state a pre-exec hook would see. A
@@ -331,16 +329,18 @@ fn write_frozen_memfd(
 /// A sealed anonymous file holding a compiled seccomp program, owning its
 /// descriptor (closed on drop).
 ///
-/// Built only by [`write_seccomp_memfd`], which seals the fd after the write,
-/// so the filter bwrap loads is exactly the program compiled here: no process
-/// holding the fd, the jailed payload included, can rewrite or resize it.
+/// Built only by [`write_seccomp_memfd`] from a [`seccomp::JailProgram`], and
+/// sealed after the write, so the filter bwrap loads is exactly the program
+/// this crate compiled: no process holding the fd, the jailed payload included,
+/// can rewrite or resize it.
 ///
-/// The [`SealedFdNumber`] it mints cannot outlive it:
+/// The [`SeccompFdNumber`] it mints cannot outlive it:
 ///
 /// ```compile_fail,E0597
 /// # fn stale() -> Option<String> {
 /// let number = {
-///     let sealed = ipe_sandbox::run_jail::write_seccomp_memfd(b"filter").ok()?;
+///     let program = ipe_sandbox::seccomp::subprocess_deny_program(false)?;
+///     let sealed = ipe_sandbox::run_jail::write_seccomp_memfd(&program).ok()?;
 ///     sealed.make_inheritable().ok()?
 /// };
 /// Some(format!("{number:?}"))
@@ -367,7 +367,7 @@ fn write_frozen_memfd(
 /// # let root = CanonicalPath::resolve(Path::new("/")).ok()?;
 /// # let mounts = JailMounts::of_invoker(root.clone(), root, Vec::new()).ok()?;
 /// # let no_env = |_: &str| None;
-/// let sealed = write_seccomp_memfd(b"filter").ok()?;
+/// let sealed = write_seccomp_memfd(&ipe_sandbox::seccomp::subprocess_deny_program(false)?).ok()?;
 /// let argv = run_jail_argv(
 ///     &scope,
 ///     &SandboxProfile::maximally_isolated(),
@@ -411,6 +411,92 @@ fn write_frozen_memfd(
 /// Some(argv.args().len())
 /// # }
 /// ```
+///
+/// The filter and the delivered app are distinct roles: the builder takes the
+/// filter's number first and the app's second,
+///
+/// ```no_run
+/// # use std::ffi::OsString;
+/// # use std::path::Path;
+/// # use ipe_sandbox::run_jail::{
+/// #     BwrapTools, RunJailTools, SandboxProfile, prove, run_jail_argv_with_delivery,
+/// #     write_sealed_app_memfd, write_seccomp_memfd,
+/// # };
+/// # use ipe_sandbox::seccomp::subprocess_deny_program;
+/// # use ipe_sandbox::{CanonicalPath, HostTool, JailMounts, host_tool};
+/// # fn ordered() -> Option<usize> {
+/// # let tools = RunJailTools::Bwrap(BwrapTools {
+/// #     bwrap: host_tool::resolve(HostTool::Bwrap).ok()?,
+/// #     prlimit: host_tool::resolve(HostTool::Prlimit).ok()?,
+/// #     timeout: None,
+/// # });
+/// # let scope = prove(&tools).ok()?;
+/// # let root = CanonicalPath::resolve(Path::new("/")).ok()?;
+/// # let mounts = JailMounts::of_invoker(root.clone(), root, Vec::new()).ok()?;
+/// # let no_env = |_: &str| None;
+/// let seccomp = write_seccomp_memfd(&subprocess_deny_program(false)?).ok()?;
+/// let app = write_sealed_app_memfd(b"app").ok()?;
+/// let argv = run_jail_argv_with_delivery(
+///     &scope,
+///     &SandboxProfile::maximally_isolated(),
+///     &mounts,
+///     seccomp.make_inheritable().ok()?,
+///     app.make_inheritable().ok()?,
+///     &no_env,
+///     &[],
+/// )
+/// .ok()?;
+/// Some(argv.args().len())
+/// # }
+/// ```
+///
+/// and a swap of the two does not compile:
+///
+/// ```compile_fail,E0308
+/// # use std::ffi::OsString;
+/// # use std::path::Path;
+/// # use ipe_sandbox::run_jail::{
+/// #     BwrapTools, RunJailTools, SandboxProfile, prove, run_jail_argv_with_delivery,
+/// #     write_sealed_app_memfd, write_seccomp_memfd,
+/// # };
+/// # use ipe_sandbox::seccomp::subprocess_deny_program;
+/// # use ipe_sandbox::{CanonicalPath, HostTool, JailMounts, host_tool};
+/// # fn swapped() -> Option<usize> {
+/// # let tools = RunJailTools::Bwrap(BwrapTools {
+/// #     bwrap: host_tool::resolve(HostTool::Bwrap).ok()?,
+/// #     prlimit: host_tool::resolve(HostTool::Prlimit).ok()?,
+/// #     timeout: None,
+/// # });
+/// # let scope = prove(&tools).ok()?;
+/// # let root = CanonicalPath::resolve(Path::new("/")).ok()?;
+/// # let mounts = JailMounts::of_invoker(root.clone(), root, Vec::new()).ok()?;
+/// # let no_env = |_: &str| None;
+/// let seccomp = write_seccomp_memfd(&subprocess_deny_program(false)?).ok()?;
+/// let app = write_sealed_app_memfd(b"app").ok()?;
+/// let argv = run_jail_argv_with_delivery(
+///     &scope,
+///     &SandboxProfile::maximally_isolated(),
+///     &mounts,
+///     app.make_inheritable().ok()?,
+///     seccomp.make_inheritable().ok()?,
+///     &no_env,
+///     &[],
+/// )
+/// .ok()?;
+/// Some(argv.args().len())
+/// # }
+/// ```
+///
+/// Nor can a descriptor be sealed as the jail's filter from bytes this crate's
+/// program builder did not produce:
+///
+/// ```compile_fail,E0308
+/// # fn forged() -> Option<()> {
+/// let sealed = ipe_sandbox::run_jail::write_seccomp_memfd(b"allow-all").ok()?;
+/// # drop(sealed);
+/// # Some(())
+/// # }
+/// ```
 pub struct SealedSeccompFd {
     fd: OwnedFd,
 }
@@ -428,9 +514,9 @@ impl SealedSeccompFd {
     /// # Errors
     ///
     /// [`std::io::Error`] when either `fcntl` fails.
-    pub fn make_inheritable(&self) -> std::io::Result<SealedFdNumber<'_>> {
+    pub fn make_inheritable(&self) -> std::io::Result<SeccompFdNumber<'_>> {
         clear_cloexec(self.fd.as_fd())?;
-        Ok(SealedFdNumber(self.fd.as_fd()))
+        Ok(SeccompFdNumber(SealedFdNumber(self.fd.as_fd())))
     }
 }
 
@@ -447,8 +533,11 @@ impl SealedSeccompFd {
 /// [`RunJailDefect::Spawn`] on any `memfd_create`, write, seal, or seek failure
 /// — a truncated, unwritten, or unsealed filter would let the payload run
 /// under a program other than the one compiled, so the jail refuses.
-pub fn write_seccomp_memfd(bytes: &[u8]) -> Result<SealedSeccompFd, RunJailDefect> {
-    let fd = write_frozen_memfd(c"ipe-seccomp", "seccomp program", bytes)?;
+pub fn write_seccomp_memfd(
+    program: &seccomp::JailProgram,
+) -> Result<SealedSeccompFd, RunJailDefect> {
+    let bytes = seccomp::program_bytes(program);
+    let fd = write_frozen_memfd(c"ipe-seccomp", "seccomp program", &bytes)?;
     Ok(SealedSeccompFd { fd })
 }
 
@@ -545,6 +634,7 @@ pub fn write_sealed_app_memfd(bytes: &[u8]) -> Result<SealedApp, RunJailDefect> 
 mod tests {
     use super::{app_ro_binds, write_sealed_app_memfd, write_seccomp_memfd};
     use crate::CanonicalPath;
+    use crate::seccomp::JailProgram;
     use std::os::fd::AsFd as _;
 
     /// Whether `fd` carries close-on-exec.
@@ -554,7 +644,7 @@ mod tests {
 
     #[test]
     fn a_write_to_the_sealed_seccomp_fd_is_refused() {
-        let sealed = write_seccomp_memfd(b"filter").expect("sealed seccomp memfd");
+        let sealed = write_seccomp_memfd(&JailProgram::for_test()).expect("sealed seccomp memfd");
         let refused = rustix::io::write(sealed.as_fd(), b"x");
         assert_eq!(refused, Err(rustix::io::Errno::PERM));
         assert_eq!(
@@ -565,7 +655,7 @@ mod tests {
 
     #[test]
     fn a_resize_of_the_sealed_seccomp_fd_is_refused() {
-        let sealed = write_seccomp_memfd(b"filter").expect("sealed seccomp memfd");
+        let sealed = write_seccomp_memfd(&JailProgram::for_test()).expect("sealed seccomp memfd");
         assert_eq!(
             rustix::fs::ftruncate(sealed.as_fd(), 0),
             Err(rustix::io::Errno::PERM)
@@ -578,7 +668,7 @@ mod tests {
 
     #[test]
     fn the_seccomp_fd_is_close_on_exec_until_made_inheritable() {
-        let sealed = write_seccomp_memfd(b"filter").expect("sealed seccomp memfd");
+        let sealed = write_seccomp_memfd(&JailProgram::for_test()).expect("sealed seccomp memfd");
         assert!(is_cloexec(sealed.as_fd()), "born inheritable");
         sealed.make_inheritable().expect("clear close-on-exec");
         assert!(!is_cloexec(sealed.as_fd()), "still close-on-exec");

@@ -364,7 +364,6 @@ pub fn build_in_jail(
             },
         };
     };
-    let bytes = seccomp::program_bytes(&program);
     // The memfd is owned so it is closed when this function returns. bwrap reads the
     // seccomp filter by fd number during jail setup — before the child runs — so
     // closing it after the child is waited on is safe. Unlike the run jail
@@ -373,7 +372,7 @@ pub fn build_in_jail(
     // per call in the long-lived audit/CI process. It is sealed and born
     // close-on-exec; clearing the flag only now, right before the spawn, lets
     // bwrap inherit it. A failure refuses rather than run the build unfiltered.
-    let seccomp_owned = match crate::run_jail::write_seccomp_memfd(&bytes) {
+    let seccomp_owned = match crate::run_jail::write_seccomp_memfd(&program) {
         Ok(fd) => fd,
         Err(defect) => return JailOutcome::Unavailable { defect },
     };

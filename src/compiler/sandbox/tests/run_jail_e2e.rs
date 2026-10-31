@@ -200,10 +200,9 @@ fn run_jailed_inner(
 
     let program = ipe_sandbox::seccomp::subprocess_deny_program(profile.subprocess)
         .expect("x86_64 seccomp program");
-    let bytes = ipe_sandbox::seccomp::program_bytes(&program);
 
     // memfd for the seccomp program, through the launcher's own safe writer.
-    let seccomp = ipe_sandbox::run_jail::write_seccomp_memfd(&bytes).expect("seccomp memfd");
+    let seccomp = ipe_sandbox::run_jail::write_seccomp_memfd(&program).expect("seccomp memfd");
     let fd = seccomp.make_inheritable().expect("seccomp fd inheritable");
 
     let scoped = ipe_test_temp::temp_root().join(format!("ipe-e2e-{}", std::process::id()));
