@@ -1,17 +1,22 @@
 //! Every comment position the grammar admits survives `ipe_fmt::format_source`.
 //!
 //! Each seed below is re-written once per position a comment can take — an
-//! own-line `-- CMT` above every line, a trailing `-- CMT` after every line, a
-//! `{- CMT -}` before every token that follows a space, and one at the end of
-//! the file. That covers the comment before `module`, inside the exposing
+//! own-line `-- CMT` above every line, a trailing `-- CMT` and `{- CMT -}`
+//! after every line, a `{- CMT -}` before every token that follows a space,
+//! and one at the end of the file. That covers the comment before `module`, inside the exposing
 //! list, between imports, between and inside declarations, inside
 //! constructor arguments, `let`, `case`, records, lists, tuples, lambdas and
 //! pipelines. Every variant the parser accepts must format, keep its one
 //! comment, and be a fixed point of a second pass: a comment position with no
 //! owner in the renderer turns this test red, rather than the `IPE-I0001`
 //! guard refusing the user's file.
+//!
+//! The seeds are canonical, so every seed line end is an output line end: a
+//! comment ending a line whose last token ends a node must stay exactly
+//! there, and a composer with no slot for it fails by name.
 
 use ipe_intern::Interner;
+use ipe_parse::TokenClass;
 
 /// A module header, imports, a union, a record alias, and a `case`.
 const HEADER_SEED: &str = r"module Seed exposing
@@ -98,12 +103,40 @@ pick n =
         -- two
         _ ->
             n
+
+
+step :
+    Int
+    -> Int
+    -> Int
+step a b =
+    a
+        + b
+        + 1
+
+
+main =
+    do
+        x <- Task.succeed 1
+        Io.println "run"
+        Task.succeed x
+
+
+bump r =
+    { r
+        | a = 1
+        , b = 2
+    }
 "#;
 
 /// The fewest parser-accepted variants the seeds must yield.
 ///
 /// Below it, the enumeration exercised too few positions to prove anything.
 const MIN_ACCEPTED_VARIANTS: usize = 200;
+
+/// The fewest end-of-line variants after a node's last token the seeds must
+/// yield, each asserted kept in place byte-exact.
+const MIN_KEPT_EOL_VARIANTS: usize = 94;
 
 /// The source with `line` at index `at` replaced by `with` (or inserted
 /// before it when `insert` holds).
@@ -115,22 +148,65 @@ fn splice(lines: &[&str], at: usize, with: &str, insert: bool) -> String {
     out.join("\n")
 }
 
+/// One comment variant of a seed.
+struct Variant {
+    /// The comment's position.
+    name: String,
+    /// The seed with the comment.
+    src: String,
+    /// The comment ends a seed line whose last code token ends a node, so it
+    /// must stay exactly there.
+    kept: bool,
+}
+
+/// For each line of `src`, whether its last code token ends a node.
+#[allow(clippy::expect_used)] // a seed that does not lex is a broken test
+fn ends_node_by_line(src: &str) -> Vec<bool> {
+    let tokens = ipe_parse::try_source_tokens(src).expect("seed lexes");
+    let mut ends = Vec::new();
+    let mut lo = 0usize;
+    for line in src.split('\n') {
+        let hi = lo + line.len();
+        let last = tokens
+            .iter()
+            .filter(|t| (t.span.lo as usize) >= lo && (t.span.hi as usize) <= hi)
+            .filter_map(|t| match t.class {
+                TokenClass::Code(kind) => Some(kind),
+                TokenClass::DocComment => None,
+            })
+            .last();
+        ends.push(last.is_some_and(ipe_fmt::ends_node));
+        lo = hi + 1;
+    }
+    ends
+}
+
 /// Every single-comment variant of `src`, each named by its position.
-fn variants(src: &str) -> Vec<(String, String)> {
+fn variants(src: &str) -> Vec<Variant> {
     let lines: Vec<&str> = src.split('\n').collect();
+    let ends = ends_node_by_line(src);
     let mut out = Vec::new();
+    let mut push = |name: String, src: String, kept: bool| out.push(Variant { name, src, kept });
     for (i, line) in lines.iter().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
         let indent = line.len() - line.trim_start_matches(' ').len();
         let own = format!("{}-- CMT", " ".repeat(indent));
-        out.push((
+        push(
             format!("own-line above L{}", i + 1),
             splice(&lines, i, &own, true),
-        ));
-        let eol = format!("{line} -- CMT");
-        out.push((format!("end of L{}", i + 1), splice(&lines, i, &eol, false)));
+            false,
+        );
+        let at_end = ends.get(i).copied().unwrap_or(false);
+        for (what, cmt) in [("end", "-- CMT"), ("block end", "{- CMT -}")] {
+            let eol = format!("{line} {cmt}");
+            push(
+                format!("{what} of L{}", i + 1),
+                splice(&lines, i, &eol, false),
+                at_end,
+            );
+        }
         for (j, pair) in line.as_bytes().windows(2).enumerate() {
             let col = j + 1;
             if col <= indent || !matches!(pair, [b' ', next] if *next != b' ') {
@@ -138,16 +214,18 @@ fn variants(src: &str) -> Vec<(String, String)> {
             }
             let (head, tail) = line.split_at(col);
             let mid = format!("{head}{{- CMT -}} {tail}");
-            out.push((
+            push(
                 format!("inline at L{}c{}", i + 1, col + 1),
                 splice(&lines, i, &mid, false),
-            ));
+                false,
+            );
         }
     }
-    out.push((
+    push(
         "end of file".to_owned(),
         format!("{}\n-- CMT\n", src.trim_end_matches('\n')),
-    ));
+        false,
+    );
     out
 }
 
@@ -166,18 +244,31 @@ fn format(src: &str, what: &str) -> String {
 #[test]
 fn every_admitted_comment_position_is_kept_and_stable() {
     let mut accepted = 0usize;
+    let mut kept = 0usize;
+    let mut moved: Vec<String> = Vec::new();
     for seed in [HEADER_SEED, EXPRESSION_SEED] {
         assert_eq!(
             format(seed, "seed formats"),
             seed,
             "a seed must be canonical"
         );
-        for (name, src) in variants(seed) {
+        for Variant {
+            name,
+            src,
+            kept: stays,
+        } in variants(seed)
+        {
             if !parses(&src) {
                 continue;
             }
             accepted += 1;
             let once = format(&src, &format!("{name}: refused\n{src}"));
+            if stays {
+                kept += 1;
+                if once != src {
+                    moved.push(format!("{name}:\n{once}"));
+                }
+            }
             assert_eq!(
                 once.matches("CMT").count(),
                 1,
@@ -188,8 +279,18 @@ fn every_admitted_comment_position_is_kept_and_stable() {
         }
     }
     assert!(
+        moved.is_empty(),
+        "{} end-of-line comments moved off their line end:\n{}",
+        moved.len(),
+        moved.join("\n")
+    );
+    assert!(
         accepted >= MIN_ACCEPTED_VARIANTS,
         "only {accepted} variants parsed, below the floor of {MIN_ACCEPTED_VARIANTS}"
+    );
+    assert!(
+        kept >= MIN_KEPT_EOL_VARIANTS,
+        "only {kept} end-of-line variants kept, below the floor of {MIN_KEPT_EOL_VARIANTS}"
     );
 }
 

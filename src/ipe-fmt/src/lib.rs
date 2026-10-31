@@ -8,6 +8,13 @@
 //! formatting takes [`format_with_segments`], splices the declarations it
 //! wants, and proves the result with [`verify_rewrite`], the same guards.
 //!
+//! A comment takes one of two placements. An end-of-line comment after a
+//! token that can end a node ([`ends_node`]) is kept at the end of that
+//! token's output line; every other comment leads the code below it. When a
+//! layout keeps the next code on the kept comment's line (after a pattern, a
+//! parameter, a type argument, or a module or import name), the comment is
+//! demoted: it prints where that layout puts leading comments.
+//!
 //! The engine is path-agnostic: it works on a bare source string and reports a
 //! typed [`FmtError`]. A caller that knows the file (the CLI) attaches the path
 //! at its own boundary.
@@ -1748,6 +1755,16 @@ impl<'a> Printer<'a> {
         // subsequent constructor is a leading-`|` continuation line — even when
         // there is a single constructor. There is no single-line union form.
         let mut s = format!("type {}{}", self.sym(uv.name.value), vars);
+        // The head's last token is the one before the first constructor's
+        // `=`; the head line always ends there.
+        let head_end = uv
+            .ctors
+            .first()
+            .and_then(|first| self.token_before(first.span.lo as usize))
+            .filter(|eq| eq.kind == TokenKind::Equals)
+            .map(|eq| self.trail_inside(self.end_before(eq.lo), u.span.hi as usize))
+            .unwrap_or_default();
+        s.push_str(&head_end);
         // A section comment written between two constructors annotates the
         // constructor it precedes: re-emit it on its own four-space-indented
         // line just before that constructor's `| Ctor` line, keeping the
@@ -3158,7 +3175,7 @@ impl<'a> Printer<'a> {
         // closing `}` back at the brace column.
         let close_pad = self.pad(col);
         let inner = self.pad(bar_col);
-        let mut out = format!("{{ {base_s}");
+        let mut out = format!("{{ {base_s}{}", self.trail_after(base.span.hi as usize));
         for (i, ((comments, p), (_, value))) in items.iter().zip(fields).enumerate() {
             let lead = if i == 0 { "|" } else { "," };
             open_line(&mut out, comments, inner);
@@ -5113,6 +5130,25 @@ mod tests {
             ]
         );
         let edited = splice_all(src, &formatted);
+        assert!(
+            verify_rewrite(src, &edited).is_ok(),
+            "the spliced segments verify"
+        );
+    }
+
+    /// A declaration's interior and end-of-declaration end-of-line comments
+    /// splice back once each: input and output segments both end at the
+    /// declaration's last token, so the comment after it stays outside both.
+    #[test]
+    fn splicing_keeps_each_end_of_line_comment_once() {
+        let src = "module M exposing (a, b)\n\n\na =\n    [ 1 -- one\n    , 2 ]\n\n\nb =\n      2 -- end\n";
+        let formatted = format_with_segments(src).expect("formats");
+        let whole = format_source(src).expect("formats");
+        assert_eq!(formatted.text, whole);
+        assert!(whole.contains("    [ 1 -- one\n"), "{whole}");
+        assert!(whole.ends_with("    2 -- end\n"), "{whole}");
+        let edited = splice_all(src, &formatted);
+        assert_eq!(edited, whole, "splicing every segment is the format");
         assert!(
             verify_rewrite(src, &edited).is_ok(),
             "the spliced segments verify"
