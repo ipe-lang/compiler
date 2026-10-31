@@ -314,7 +314,7 @@ fn ffi_prose(msg: &FfiError) -> String {
         FfiError::ArtifactIo { path, detail } => {
             format!("The FFI cache artifact `{path}` could not be accessed: {detail}.")
         }
-        FfiError::AssertedRefused { path, detail } => {
+        FfiError::AssertedRefused { path, detail, .. } => {
             format!("The asserted foreign call `{path}` was refused: {detail}.")
         }
         FfiError::SystemLibraryNotFound {
@@ -1547,13 +1547,29 @@ fn primary_label(d: &Diagnostic) -> Option<String> {
         Diagnostic::Name { msg, .. } => name_label(msg),
         Diagnostic::Type { msg, .. } => type_label(msg),
         Diagnostic::Lower { msg, .. } => Some(lower_label(msg)),
+        Diagnostic::Ffi { msg } => ffi_label(msg),
         Diagnostic::CompilerBug { .. }
-        | Diagnostic::Ffi { .. }
         | Diagnostic::Sandbox { .. }
         | Diagnostic::Consent { .. }
         | Diagnostic::RegistryUnreachable { .. }
         | Diagnostic::TargetDirUnlinkable { .. }
         | Diagnostic::HostLinkerCannotOpenInput { .. } => None,
+    }
+}
+
+/// The label under an FFI refusal's span; only an asserted call's refusal has one.
+fn ffi_label(msg: &FfiError) -> Option<String> {
+    match msg {
+        FfiError::AssertedRefused { path, detail, .. } => {
+            Some(format!("the asserted call `{path}` is refused: {detail}"))
+        }
+        FfiError::CallUnrenderable { .. }
+        | FfiError::GenericNotBindable { .. }
+        | FfiError::WireMalformed { .. }
+        | FfiError::ShapeContradiction { .. }
+        | FfiError::SourceRejected { .. }
+        | FfiError::ArtifactIo { .. }
+        | FfiError::SystemLibraryNotFound { .. } => None,
     }
 }
 

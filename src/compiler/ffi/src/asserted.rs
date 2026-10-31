@@ -23,7 +23,8 @@
 //! that result is the error channel the boundary needs.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
+use std::path::{Path, PathBuf};
 
 use ipe_canon::asserted::{AssertedPath, LocalTypeKind, LocalTypeNames};
 use ipe_intern::{Interner, Symbol};
@@ -31,7 +32,7 @@ use ipe_kernels::{BuiltinTag, BuiltinType};
 use ipe_syntax::TypeAnnotation;
 
 use crate::carrier::ScalarCarrier;
-use crate::diag::{AssertedCompilerBug, AssertedDefect, Diagnostic, InspectedShapeReason};
+use crate::diag::{AssertedCompilerBug, AssertedDefect, AssertedRefusal, InspectedShapeReason};
 use crate::driver::{InspectedSig, InstalledCrate};
 use crate::pkginfo::Effect;
 use crate::unify::UnifyReport;
@@ -186,6 +187,53 @@ fn absolute_path(recorded: &str) -> String {
     format!("::{}", recorded.trim_start_matches(':'))
 }
 
+/// Where an asserted definition is written: the user file, the span of its
+/// call, and the 1-based line that span starts on.
+///
+/// The line is read from the file's text once, here, so a refusal naming a
+/// second definition in another file needs no access to that file's text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssertedSite {
+    file: PathBuf,
+    span: ipe_diagnostics::Span,
+    line: u32,
+}
+
+impl AssertedSite {
+    /// The site of `span` in `file`, whose text is `source`.
+    #[must_use]
+    pub fn new(file: PathBuf, span: ipe_diagnostics::Span, source: &str) -> Self {
+        let before = usize::try_from(span.lo).unwrap_or(usize::MAX);
+        let breaks = source.bytes().take(before).filter(|&b| b == b'\n').count();
+        let line = u32::try_from(breaks).unwrap_or(u32::MAX).saturating_add(1);
+        Self { file, span, line }
+    }
+
+    /// The user file that holds the definition.
+    #[must_use]
+    pub fn file(&self) -> &Path {
+        &self.file
+    }
+
+    /// The span of the definition's asserted call in [`Self::file`].
+    #[must_use]
+    pub const fn span(&self) -> ipe_diagnostics::Span {
+        self.span
+    }
+
+    /// The 1-based line [`Self::span`] starts on.
+    #[must_use]
+    pub const fn line(&self) -> u32 {
+        self.line
+    }
+}
+
+impl fmt::Display for AssertedSite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.file.display(), self.line)
+    }
+}
+
 /// One validated asserted call: the parsed path, the parsed signature, the
 /// derived names, and every Rust type the emitters render — all resolved
 /// here, so emission is a total function over this value.
@@ -193,6 +241,8 @@ fn absolute_path(recorded: &str) -> String {
 pub struct AssertedSpec {
     /// The validated target path.
     pub path: AssertedPath,
+    /// The definition that asserts it.
+    pub site: AssertedSite,
     /// The parsed asserted signature.
     pub sig: AssertedSig,
     /// The Ipê definition name in the generated `Rust.Ffi` module.
@@ -603,17 +653,19 @@ fn render_ty(node: &TypeAnnotation, interner: &Interner) -> String {
 /// every name and Rust type the emitters need.
 ///
 /// # Errors
-/// [`Diagnostic::AssertedRefused`] (IPE-F4414) carrying the closed
+/// [`AssertedRefusal`] (IPE-F4414) at `site`, carrying the closed
 /// [`AssertedDefect`].
 pub fn validate(
+    site: AssertedSite,
     path: AssertedPath,
     annotation: &TypeAnnotation,
     interner: &Interner,
     scope: &CarrierScope<'_>,
-) -> Result<AssertedSpec, Diagnostic> {
-    let refused = |defect: AssertedDefect| Diagnostic::AssertedRefused {
+) -> Result<AssertedSpec, AssertedRefusal> {
+    let refused = |defect: AssertedDefect| AssertedRefusal {
         path: path.as_str().to_owned(),
         defect,
+        site: site.clone(),
     };
     let Some(target) = scope.target(&path) else {
         return Err(refused(AssertedDefect::TargetCrateNotInstalled {
@@ -652,6 +704,7 @@ pub fn validate(
         def_name: path.def_name(),
         wrapper_ident: path.wrapper_ident(),
         path,
+        site,
         sig,
         param_rust,
         result_rust,
@@ -731,9 +784,9 @@ fn exact_carrier_match(carrier: &AssertedCarrier, foreign_ty: &str) -> bool {
 /// from different homes are different signatures.
 ///
 /// # Errors
-/// [`Diagnostic::AssertedRefused`] with
-/// [`AssertedDefect::ConflictingAssertions`].
-pub fn dedupe(specs: Vec<AssertedSpec>) -> Result<Vec<AssertedSpec>, Diagnostic> {
+/// [`AssertedRefusal`] with [`AssertedDefect::ConflictingAssertions`], at the
+/// later definition's site and naming the earlier one's.
+pub fn dedupe(specs: Vec<AssertedSpec>) -> Result<Vec<AssertedSpec>, AssertedRefusal> {
     let mut by_def: BTreeMap<String, AssertedSpec> = BTreeMap::new();
     for spec in specs {
         match by_def.get(&spec.def_name) {
@@ -745,12 +798,14 @@ pub fn dedupe(specs: Vec<AssertedSpec>) -> Result<Vec<AssertedSpec>, Diagnostic>
             // unlikely) hash collision — refused loudly, never merged.
             Some(existing) if existing.sig == spec.sig && existing.path == spec.path => {}
             Some(existing) => {
-                return Err(Diagnostic::AssertedRefused {
+                return Err(AssertedRefusal {
                     path: spec.path.as_str().to_owned(),
                     defect: AssertedDefect::ConflictingAssertions {
                         first: format!("{} : {}", existing.path.as_str(), existing.sig.ipe_sig()),
                         second: format!("{} : {}", spec.path.as_str(), spec.sig.ipe_sig()),
+                        first_site: existing.site.clone(),
                     },
+                    site: spec.site,
                 });
             }
         }
@@ -892,6 +947,8 @@ pub fn emit_asserted_shims(specs: &[AssertedSpec]) -> String {
 pub struct ConstSpec {
     /// The validated target path.
     pub path: AssertedPath,
+    /// The definition that reads it.
+    pub site: AssertedSite,
     /// The asserted scalar carrier (never opaque, never a `Result`/arrow).
     pub scalar: crate::carrier::ScalarCarrier,
     /// The Ipê definition name in the generated `Rust.Ffi` module.
@@ -953,16 +1010,18 @@ fn parse_const_scalar(
 /// type the inspection recorded but the emit still mis-renders.
 ///
 /// # Errors
-/// [`Diagnostic::AssertedRefused`] carrying the closed [`AssertedDefect`].
+/// [`AssertedRefusal`] at `site`, carrying the closed [`AssertedDefect`].
 pub fn validate_const(
+    site: AssertedSite,
     path: AssertedPath,
     annotation: &TypeAnnotation,
     interner: &Interner,
     scope: &CarrierScope<'_>,
-) -> Result<ConstSpec, Diagnostic> {
-    let refused = |defect: AssertedDefect| Diagnostic::AssertedRefused {
+) -> Result<ConstSpec, AssertedRefusal> {
+    let refused = |defect: AssertedDefect| AssertedRefusal {
         path: path.as_str().to_owned(),
         defect,
+        site: site.clone(),
     };
     let Some(target) = scope.target(&path) else {
         return Err(refused(AssertedDefect::TargetCrateNotInstalled {
@@ -992,6 +1051,7 @@ pub fn validate_const(
         def_name: path.const_def_name(),
         wrapper_ident: path.const_wrapper_ident(),
         path,
+        site,
         scalar,
     })
 }
@@ -1093,9 +1153,9 @@ pub fn emit_const_shims(specs: &[ConstSpec]) -> String {
 /// refusing conflicting ones (two different scalar types for one path).
 ///
 /// # Errors
-/// [`Diagnostic::AssertedRefused`] with
-/// [`AssertedDefect::ConflictingAssertions`].
-pub fn dedupe_consts(specs: Vec<ConstSpec>) -> Result<Vec<ConstSpec>, Diagnostic> {
+/// [`AssertedRefusal`] with [`AssertedDefect::ConflictingAssertions`], at the
+/// later definition's site and naming the earlier one's.
+pub fn dedupe_consts(specs: Vec<ConstSpec>) -> Result<Vec<ConstSpec>, AssertedRefusal> {
     let mut by_def: BTreeMap<String, ConstSpec> = BTreeMap::new();
     for spec in specs {
         match by_def.get(&spec.def_name) {
@@ -1104,12 +1164,14 @@ pub fn dedupe_consts(specs: Vec<ConstSpec>) -> Result<Vec<ConstSpec>, Diagnostic
             }
             Some(existing) if existing.scalar == spec.scalar && existing.path == spec.path => {}
             Some(existing) => {
-                return Err(Diagnostic::AssertedRefused {
+                return Err(AssertedRefusal {
                     path: spec.path.as_str().to_owned(),
                     defect: AssertedDefect::ConflictingAssertions {
                         first: format!("{} : {}", existing.path.as_str(), existing.ipe_type()),
                         second: format!("{} : {}", spec.path.as_str(), spec.ipe_type()),
+                        first_site: existing.site.clone(),
                     },
+                    site: spec.site,
                 });
             }
         }
@@ -1121,6 +1183,7 @@ pub fn dedupe_consts(specs: Vec<ConstSpec>) -> Result<Vec<ConstSpec>, Diagnostic
 mod tests {
     use super::*;
     use crate::pkginfo::PkgInfo;
+    use ipe_diagnostics::FfiError;
 
     fn intern(interner: &mut Interner, s: &str) -> Symbol {
         interner.intern(s).expect("interner has capacity")
@@ -1198,7 +1261,23 @@ mod tests {
         .expect("installs")
     }
 
-    fn validated_const(ty: &str, path: &str) -> Result<ConstSpec, Diagnostic> {
+    /// A site on line 3 of a fixture module.
+    fn test_site() -> AssertedSite {
+        site_at("src/Main.ipe", 3)
+    }
+
+    /// A site at the start of 1-based `line` in `file`.
+    fn site_at(file: &str, line: usize) -> AssertedSite {
+        let source = "x\n".repeat(line);
+        let lo = u32::try_from(source.len().saturating_sub(2)).expect("small");
+        AssertedSite::new(
+            std::path::PathBuf::from(file),
+            ipe_diagnostics::Span::new(lo, lo.saturating_add(1)),
+            &source,
+        )
+    }
+
+    fn validated_const(ty: &str, path: &str) -> Result<ConstSpec, AssertedRefusal> {
         let mut interner = Interner::new();
         let ann = ann_leaf(&mut interner, ty);
         let path = AssertedPath::parse(path).expect("path parses");
@@ -1206,6 +1285,7 @@ mod tests {
         let unify = UnifyReport::default();
         let locals = LocalTypeNames::default();
         validate_const(
+            test_site(),
             path,
             &ann,
             &interner,
@@ -1219,11 +1299,12 @@ mod tests {
         catalog: &[InstalledCrate],
         unify: &UnifyReport,
         locals: &LocalTypeNames,
-    ) -> Result<AssertedSpec, Diagnostic> {
+    ) -> Result<AssertedSpec, AssertedRefusal> {
         let mut interner = Interner::new();
         let ann = arrow(&mut interner, sig_names);
         let path = AssertedPath::parse(path).expect("path parses");
         validate(
+            test_site(),
             path,
             &ann,
             &interner,
@@ -1231,7 +1312,7 @@ mod tests {
         )
     }
 
-    fn validated(sig_names: &[&str], path: &str) -> Result<AssertedSpec, Diagnostic> {
+    fn validated(sig_names: &[&str], path: &str) -> Result<AssertedSpec, AssertedRefusal> {
         validated_in(
             sig_names,
             path,
@@ -1256,12 +1337,39 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_carries_the_site_it_refuses() {
+        let err = validated(&["Int", "Result Error Int"], "nope::f").expect_err("refused");
+        assert_eq!(err.site, test_site());
+        assert_eq!(err.site.line(), 3);
+        let shared = FfiError::from(err.clone());
+        assert!(
+            matches!(&shared, FfiError::AssertedRefused { span, .. } if *span == err.site.span()),
+            "the shared diagnostic keeps the site's span: {shared:?}"
+        );
+        let refused =
+            validated_const("Result Error Int", "semver::MAX_MINOR").expect_err("not a scalar");
+        assert_eq!(refused.site, test_site());
+    }
+
+    #[test]
+    fn a_site_line_counts_from_one() {
+        let path = std::path::PathBuf::from("src/A.ipe");
+        let first = AssertedSite::new(path.clone(), ipe_diagnostics::Span::new(0, 1), "ab\ncd\n");
+        assert_eq!(first.line(), 1);
+        let second = AssertedSite::new(path.clone(), ipe_diagnostics::Span::new(3, 4), "ab\ncd\n");
+        assert_eq!(second.line(), 2);
+        assert_eq!(second.to_string(), "src/A.ipe:2");
+        let past = AssertedSite::new(path, ipe_diagnostics::Span::new(99, 99), "ab\ncd\n");
+        assert_eq!(past.line(), 3, "an offset past the text clamps to its end");
+    }
+
+    #[test]
     fn an_uninstalled_crate_is_refused() {
         let err = validated(&["Int", "Result Error Int"], "nope::f").expect_err("refused");
         assert!(
             matches!(
                 &err,
-                Diagnostic::AssertedRefused {
+                AssertedRefusal {
                     defect: AssertedDefect::TargetCrateNotInstalled { crate_ident }, ..
                 } if crate_ident == "nope"
             ),
@@ -1277,7 +1385,7 @@ mod tests {
         assert!(
             matches!(
                 &err,
-                Diagnostic::AssertedRefused {
+                AssertedRefusal {
                     defect: AssertedDefect::InspectedMismatch { expected }, ..
                 } if expected.contains("u32")
             ),
@@ -1292,7 +1400,7 @@ mod tests {
         assert!(
             matches!(
                 &err,
-                Diagnostic::AssertedRefused {
+                AssertedRefusal {
                     defect: AssertedDefect::InspectedShapeUnsupported { .. },
                     ..
                 }
@@ -1317,7 +1425,7 @@ mod tests {
         assert!(
             matches!(
                 &err,
-                Diagnostic::AssertedRefused {
+                AssertedRefusal {
                     defect: AssertedDefect::ResultShape { .. },
                     ..
                 }
@@ -1333,7 +1441,7 @@ mod tests {
         assert!(
             matches!(
                 &err,
-                Diagnostic::AssertedRefused {
+                AssertedRefusal {
                     defect: AssertedDefect::OpaqueNotDeclared { name }, ..
                 } if name == "Widget"
             ),
@@ -1364,22 +1472,26 @@ mod tests {
         let a = validated(&["Int", "Result Error Int"], "semver::frobnicate").expect("validates");
         let b =
             validated(&["Bool", "Result Error Int"], "semver::not_inspected").expect("validates");
-        // Same path, different sig: rebuild `b` on `a`'s path.
+        // Same path, different sig, another file: rebuild `b` on `a`'s path.
         let conflicting = AssertedSpec {
             def_name: a.def_name.clone(),
+            site: site_at("src/Other.ipe", 7),
             ..b
         };
         let err = dedupe(vec![a, conflicting]).expect_err("refused");
         assert!(
             matches!(
                 &err,
-                Diagnostic::AssertedRefused {
-                    defect: AssertedDefect::ConflictingAssertions { .. },
+                AssertedRefusal {
+                    defect: AssertedDefect::ConflictingAssertions { first_site, .. },
+                    site,
                     ..
-                }
+                } if *first_site == test_site() && *site == site_at("src/Other.ipe", 7)
             ),
-            "{err}"
+            "the conflict sits at the second definition and names the first: {err:?}"
         );
+        let detail = err.defect.to_string();
+        assert!(detail.contains("at src/Main.ipe:3 "), "{detail}");
         // Identical assertions deduplicate to one spec.
         let a2 = validated(&["Int", "Result Error Int"], "semver::frobnicate").expect("validates");
         let a3 = validated(&["Int", "Result Error Int"], "semver::frobnicate").expect("validates");
@@ -1487,7 +1599,7 @@ mod tests {
         assert!(
             matches!(
                 &err,
-                Diagnostic::AssertedRefused {
+                AssertedRefusal {
                     defect: AssertedDefect::ConstNotScalar { .. },
                     ..
                 }
@@ -1504,7 +1616,7 @@ mod tests {
         assert!(
             matches!(
                 &err,
-                Diagnostic::AssertedRefused {
+                AssertedRefusal {
                     defect: AssertedDefect::ConstNotScalar { .. },
                     ..
                 }
@@ -1521,7 +1633,7 @@ mod tests {
         assert!(
             matches!(
                 &err,
-                Diagnostic::AssertedRefused {
+                AssertedRefusal {
                     defect: AssertedDefect::ConstNotIntrospectable { .. },
                     ..
                 }
@@ -1537,7 +1649,7 @@ mod tests {
         assert!(
             matches!(
                 &err,
-                Diagnostic::AssertedRefused {
+                AssertedRefusal {
                     defect: AssertedDefect::ConstTypeMismatch { expected }, ..
                 } if expected == "i64"
             ),
@@ -1549,22 +1661,27 @@ mod tests {
     fn conflicting_const_types_for_one_path_are_refused() {
         let a = validated_const("Float", "semver::consts::PI").expect("validates");
         let b = validated_const("String", "semver::NAME").expect("validates");
-        // Same derived name, different scalar: rebuild `b` on `a`'s def name.
+        // Same derived name, different scalar, another file: rebuild `b` on
+        // `a`'s def name.
         let conflicting = ConstSpec {
             def_name: a.def_name.clone(),
+            site: site_at("src/Other.ipe", 7),
             ..b
         };
         let err = dedupe_consts(vec![a, conflicting]).expect_err("refused");
         assert!(
             matches!(
                 &err,
-                Diagnostic::AssertedRefused {
-                    defect: AssertedDefect::ConflictingAssertions { .. },
+                AssertedRefusal {
+                    defect: AssertedDefect::ConflictingAssertions { first_site, .. },
+                    site,
                     ..
-                }
+                } if *first_site == test_site() && *site == site_at("src/Other.ipe", 7)
             ),
-            "{err}"
+            "the conflict sits at the second definition and names the first: {err:?}"
         );
+        let detail = err.defect.to_string();
+        assert!(detail.contains("at src/Main.ipe:3 "), "{detail}");
         // Identical const reads deduplicate to one spec.
         let a2 = validated_const("Float", "semver::consts::PI").expect("validates");
         let a3 = validated_const("Float", "semver::consts::PI").expect("validates");
@@ -1603,9 +1720,9 @@ mod tests {
         }
     }
 
-    fn refused_with(outcome: Result<AssertedSpec, Diagnostic>) -> Option<AssertedDefect> {
+    fn refused_with(outcome: Result<AssertedSpec, AssertedRefusal>) -> Option<AssertedDefect> {
         match outcome {
-            Err(Diagnostic::AssertedRefused { defect, .. }) => Some(defect),
+            Err(AssertedRefusal { defect, .. }) => Some(defect),
             _ => None,
         }
     }
@@ -1863,7 +1980,7 @@ mod tests {
         })
     }
 
-    fn validated_ta(sig_names: &[&str], path: &str) -> Result<AssertedSpec, Diagnostic> {
+    fn validated_ta(sig_names: &[&str], path: &str) -> Result<AssertedSpec, AssertedRefusal> {
         let ta = inspector_shaped_crate(
             "ta",
             &serde_json::json!([
@@ -2029,7 +2146,7 @@ mod tests {
         assert!(
             matches!(
                 &err,
-                Diagnostic::AssertedRefused {
+                AssertedRefusal {
                     defect: AssertedDefect::ConflictingAssertions { .. },
                     ..
                 }
@@ -2075,6 +2192,7 @@ mod tests {
         let catalog = [semver_crate()];
         let unify = UnifyReport::default();
         let err = validate_const(
+            test_site(),
             AssertedPath::parse("semver::MAX_MINOR").expect("path parses"),
             &ann,
             &interner,
@@ -2084,7 +2202,7 @@ mod tests {
         assert!(
             matches!(
                 &err,
-                Diagnostic::AssertedRefused {
+                AssertedRefusal {
                     defect: AssertedDefect::LocalTypeNotACarrier { alias: true, .. },
                     ..
                 }
@@ -2151,6 +2269,7 @@ mod tests {
         ] {
             let ann = TypeAnnotation::TLambda(Box::new(param), Box::new(result.clone()));
             let err = validate(
+                test_site(),
                 AssertedPath::parse("semver::not_inspected").expect("path parses"),
                 &ann,
                 &interner,
@@ -2160,7 +2279,7 @@ mod tests {
             assert!(
                 matches!(
                     &err,
-                    Diagnostic::AssertedRefused {
+                    AssertedRefusal {
                         defect: AssertedDefect::CompilerBug(got),
                         ..
                     } if *got == bug

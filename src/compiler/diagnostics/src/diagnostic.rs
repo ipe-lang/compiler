@@ -2200,6 +2200,8 @@ pub enum FfiError {
     /// `IPE-F4414` — an author-asserted foreign call (`Rust.Ffi.call`) was
     /// refused at validation.
     AssertedRefused {
+        /// The refused definition's asserted call, in the user file.
+        span: Span,
         /// The asserted Rust path, verbatim.
         path: TerminalSafe,
         /// A short description of which rule refused it.
@@ -2650,8 +2652,9 @@ impl Diagnostic {
         }
     }
 
-    /// The primary source span. Span-free variants (`CompilerBug`, `Ffi`,
-    /// `Sandbox`, `Consent`) return [`Span::DUMMY`].
+    /// The primary source span. Span-free variants (`CompilerBug`, `Sandbox`,
+    /// `Consent`, and every `Ffi` refusal but an asserted call's) return
+    /// [`Span::DUMMY`].
     #[must_use]
     pub const fn primary_span(&self) -> Span {
         match self {
@@ -2659,8 +2662,8 @@ impl Diagnostic {
             | Self::Name { span, .. }
             | Self::Type { span, .. }
             | Self::Lower { span, .. } => *span,
+            Self::Ffi { msg } => ffi_span(msg),
             Self::CompilerBug { .. }
-            | Self::Ffi { .. }
             | Self::Sandbox { .. }
             | Self::Consent { .. }
             | Self::RegistryUnreachable { .. }
@@ -3854,8 +3857,24 @@ const fn sandbox_code(msg: &SandboxError) -> Code {
     })
 }
 
+/// The user-source span an FFI refusal names: an asserted call's definition,
+/// or none for a refusal about the installed catalog or the host.
+const fn ffi_span(msg: &FfiError) -> Span {
+    match msg {
+        FfiError::AssertedRefused { span, .. } => *span,
+        FfiError::CallUnrenderable { .. }
+        | FfiError::GenericNotBindable { .. }
+        | FfiError::WireMalformed { .. }
+        | FfiError::ShapeContradiction { .. }
+        | FfiError::SourceRejected { .. }
+        | FfiError::ArtifactIo { .. }
+        | FfiError::SystemLibraryNotFound { .. } => Span::DUMMY,
+    }
+}
+
 fn ffi_help(msg: &FfiError) -> Vec<HelpLine> {
     match msg {
+        FfiError::AssertedRefused { .. } => vec![HelpLine::SeeExplain("IPE-F4414")],
         FfiError::SystemLibraryNotFound {
             system_lib,
             crate_name,
@@ -3880,8 +3899,7 @@ fn ffi_help(msg: &FfiError) -> Vec<HelpLine> {
         | FfiError::WireMalformed { .. }
         | FfiError::ShapeContradiction { .. }
         | FfiError::SourceRejected { .. }
-        | FfiError::ArtifactIo { .. }
-        | FfiError::AssertedRefused { .. } => Vec::new(),
+        | FfiError::ArtifactIo { .. } => Vec::new(),
     }
 }
 

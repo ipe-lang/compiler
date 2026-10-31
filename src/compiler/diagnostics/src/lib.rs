@@ -70,6 +70,7 @@ mod tests {
                 detail: hostile(),
             },
             FfiError::AssertedRefused {
+                span: Span::new(0, 1),
                 path: hostile(),
                 detail: hostile(),
             },
@@ -149,6 +150,7 @@ mod tests {
             },
             IPE_F4414 => Diagnostic::Ffi {
                 msg: FfiError::AssertedRefused {
+                    span: Span::new(0, 3),
                     path: "my_crate::foo".into(),
                     detail: "crate not installed".into(),
                 },

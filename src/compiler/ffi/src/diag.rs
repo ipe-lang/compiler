@@ -1,18 +1,21 @@
 //! Typed diagnostics for the FFI generator — the `IPE-F####` block.
 //!
 //! Every fallible public function in this crate returns
-//! `Result<T, Diagnostic>`; there is no `Result<_, String>` on any public
-//! surface. Each variant maps to exactly one taxonomy [`Code`] and carries a
-//! closed defect enum, so a caller can match on the failure class without
-//! string inspection.
+//! `Result<T, Diagnostic>`, or [`AssertedRefusal`] for an asserted call (a
+//! refusal that carries the site it refuses); there is no `Result<_, String>`
+//! on any public surface. Each variant maps to exactly one taxonomy [`Code`]
+//! and carries a closed defect enum, so a caller can match on the failure
+//! class without string inspection.
 
 use std::fmt;
 
 use ipe_diagnostics::terminal::TerminalSafe;
 use ipe_diagnostics::{
     Code, Diagnostic as SharedDiag, FfiError, IPE_F4400, IPE_F4401, IPE_F4402, IPE_F4411,
-    IPE_F4412, IPE_F4414, IPE_F4415,
+    IPE_F4412, IPE_F4415,
 };
+
+use crate::asserted::AssertedSite;
 
 /// One FFI-generator diagnostic: the failure class plus enough context to
 /// name the offending binding.
@@ -71,14 +74,6 @@ pub enum Diagnostic {
         /// The rendered OS error.
         detail: String,
     },
-    /// `IPE-F4414` — an author-asserted foreign call (`Rust.Ffi.call`) was
-    /// refused at validation, before any shim was generated.
-    AssertedRefused {
-        /// The asserted Rust path, verbatim.
-        path: String,
-        /// Which rule refused it.
-        defect: AssertedDefect,
-    },
     /// `IPE-F4415` — the inspector's build failed because a required system
     /// library is not installed on the host. Parsed from the inspector's
     /// captured stderr at the `pkg-config`-not-found signature boundary, so the
@@ -103,7 +98,6 @@ impl Diagnostic {
             Self::ShapeContradiction { .. } => IPE_F4402,
             Self::SourceRejected { .. } => IPE_F4411,
             Self::ArtifactIo { .. } => IPE_F4412,
-            Self::AssertedRefused { .. } => IPE_F4414,
             Self::SystemLibraryNotFound { .. } => IPE_F4415,
         }
     }
@@ -144,10 +138,6 @@ impl From<Diagnostic> for FfiError {
                 path: path.into(),
                 detail: detail.into(),
             },
-            Diagnostic::AssertedRefused { path, defect } => Self::AssertedRefused {
-                path: path.into(),
-                detail: defect.to_string().into(),
-            },
             Diagnostic::SystemLibraryNotFound {
                 system_lib,
                 crate_name,
@@ -169,6 +159,52 @@ impl fmt::Display for Diagnostic {
 }
 
 impl std::error::Error for Diagnostic {}
+
+/// `IPE-F4414` — an author-asserted foreign call (`Rust.fn`, `Rust.Ffi.call`,
+/// `Rust.const`) refused at validation or deduplication.
+///
+/// The site is a field, not an option: no asserted refusal exists without the
+/// user file and span of the definition it refuses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssertedRefusal {
+    /// The asserted Rust path, verbatim.
+    pub path: String,
+    /// Which rule refused it.
+    pub defect: AssertedDefect,
+    /// The refused definition.
+    pub site: AssertedSite,
+}
+
+impl From<AssertedRefusal> for FfiError {
+    fn from(r: AssertedRefusal) -> Self {
+        Self::AssertedRefused {
+            span: r.site.span(),
+            path: r.path.into(),
+            detail: r.defect.to_string().into(),
+        }
+    }
+}
+
+impl From<AssertedRefusal> for SharedDiag {
+    fn from(r: AssertedRefusal) -> Self {
+        Self::Ffi {
+            msg: FfiError::from(r),
+        }
+    }
+}
+
+impl fmt::Display for AssertedRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let shared: SharedDiag = self.clone().into();
+        f.write_str(&ipe_diagnostics::render(
+            &shared,
+            &self.site.file().to_string_lossy(),
+            "",
+        ))
+    }
+}
+
+impl std::error::Error for AssertedRefusal {}
 
 /// The closed set of asserted-call validation refusals (`IPE-F4414`). Every
 /// rule runs at build preparation, before any shim or interface entry is
@@ -216,11 +252,14 @@ pub enum AssertedDefect {
         /// The exact Rust signature the inspection records.
         expected: String,
     },
-    /// Two definitions assert different signatures for one path.
+    /// Two definitions assert different signatures for one path. The refusal
+    /// sits at the second; the first is named by its site.
     ConflictingAssertions {
         /// The two rendered signatures.
         first: String,
         second: String,
+        /// The definition that asserted `first`.
+        first_site: AssertedSite,
     },
     /// A `Rust.const` annotation is not a bare scalar type — a native constant
     /// reads a single infallible value (Int, Float, Bool, Char, String, or
@@ -346,11 +385,15 @@ impl fmt::Display for AssertedDefect {
                  under the exact-carrier rule (no clamp, no widening) — fix the \
                  assertion or use the inspected import"
             ),
-            Self::ConflictingAssertions { first, second } => write!(
+            Self::ConflictingAssertions {
+                first,
+                second,
+                first_site,
+            } => write!(
                 f,
                 "two definitions assert different signatures for this path \
-                 (`{first}` vs `{second}`) — make them identical or share one \
-                 asserted definition"
+                 (`{first}` at {first_site} vs `{second}` here) — make them \
+                 identical or share one asserted definition"
             ),
             Self::ConstNotScalar { ty } => write!(
                 f,
