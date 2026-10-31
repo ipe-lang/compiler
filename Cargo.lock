@@ -1721,7 +1721,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "e2e-support"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ipe-test-temp",
  "ipe_env",
@@ -3057,7 +3057,7 @@ checksum = "06432fb54d3be7964ecd3649233cddf80db2832f47fec34c01f65b3d9d774983"
 
 [[package]]
 name = "ipe"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "base64 0.22.1",
  "cap-primitives",
@@ -3129,7 +3129,7 @@ dependencies = [
 
 [[package]]
 name = "ipe-runtime-rust"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -3203,11 +3203,11 @@ dependencies = [
 
 [[package]]
 name = "ipe-test-temp"
-version = "0.7.2"
+version = "0.7.3"
 
 [[package]]
 name = "ipe-wasm"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ipe_backend",
  "ipe_backend_rust",
@@ -3225,7 +3225,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_annotate"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ipe_canon",
  "ipe_diagnostics",
@@ -3239,7 +3239,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_backend"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ipe_diagnostics",
  "ipe_ir",
@@ -3249,7 +3249,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_backend_rust"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "e2e-support",
  "ipe-runtime-rust",
@@ -3270,11 +3270,11 @@ dependencies = [
 
 [[package]]
 name = "ipe_bindgen"
-version = "0.7.2"
+version = "0.7.3"
 
 [[package]]
 name = "ipe_canon"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ipe_diagnostics",
  "ipe_intern",
@@ -3285,7 +3285,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_db"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ipe_backend",
  "ipe_backend_rust",
@@ -3304,7 +3304,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_diagnostics"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "e2e-support",
  "ipe_env",
@@ -3316,7 +3316,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_docs"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ipe-runtime-rust",
  "ipe_annotate",
@@ -3331,14 +3331,14 @@ dependencies = [
 
 [[package]]
 name = "ipe_env"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ipe-test-temp",
 ]
 
 [[package]]
 name = "ipe_ffi"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "e2e-support",
  "ipe-test-temp",
@@ -3359,7 +3359,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_fmt"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ipe_diagnostics",
  "ipe_intern",
@@ -3369,7 +3369,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_fs_open"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "cap-primitives",
  "e2e-support",
@@ -3382,7 +3382,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_intern"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ipe_diagnostics",
  "serde",
@@ -3391,7 +3391,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_ir"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ipe_diagnostics",
  "ipe_intern",
@@ -3402,7 +3402,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_kernels"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "e2e-support",
  "ipe_intern",
@@ -3414,7 +3414,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_lint"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ipe-test-temp",
  "ipe_canon",
@@ -3427,7 +3427,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_lower"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ipe_canon",
  "ipe_diagnostics",
@@ -3440,7 +3440,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_lsp_features"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "e2e-support",
  "ipe_annotate",
@@ -3460,7 +3460,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_lsp_server"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "crossbeam-channel",
  "e2e-support",
@@ -3480,7 +3480,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_parse"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ipe_diagnostics",
  "ipe_intern",
@@ -3489,11 +3489,11 @@ dependencies = [
 
 [[package]]
 name = "ipe_path_core"
-version = "0.7.2"
+version = "0.7.3"
 
 [[package]]
 name = "ipe_sandbox"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "dunce",
  "e2e-support",
@@ -3513,7 +3513,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_stdlib"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ipe_canon",
  "ipe_diagnostics",
@@ -3525,7 +3525,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_syntax"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ipe_diagnostics",
  "ipe_intern",
@@ -3533,7 +3533,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_types"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ipe_canon",
  "ipe_diagnostics",
@@ -3547,7 +3547,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_watch"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ipe-test-temp",
  "notify",
@@ -3556,7 +3556,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_wrapper"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ipe_env",
  "ipe_fs_open",
@@ -4983,7 +4983,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "playground-jail-runner"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "e2e-support",
  "ipe-test-temp",
@@ -5590,7 +5590,7 @@ dependencies = [
 
 [[package]]
 name = "regen-cli-transcripts"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ipe",
  "ipe_docs",
@@ -5599,7 +5599,7 @@ dependencies = [
 
 [[package]]
 name = "regen-goldens"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "e2e-support",
  "ipe",
