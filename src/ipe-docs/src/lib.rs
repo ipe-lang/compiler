@@ -18,6 +18,9 @@
 //!   dependency; command data is passed in via [`CommandInfo`].
 //! - **Environment variables** — the recognised `IPE_*` variables and their
 //!   documentation.
+//! - **Operators** — one `Symbol` entry per [`BinOp`], keyed by its source
+//!   text (`//`), its meaning from [`operator_meaning`] and its precedence
+//!   from [`BinOp::fixity`].
 //!
 //! Entry point: [`Index::build`].
 
@@ -35,7 +38,7 @@ use std::path::{Path, PathBuf};
 use ipe_intern::Interner;
 use ipe_parse::parse_module;
 use ipe_stdlib::{COMPILED_STD_MODULES, MODULES as STDLIB_MODULES};
-use ipe_syntax::{TypeAlias, Union, Value};
+use ipe_syntax::{Assoc, BinOp, TypeAlias, Union, Value};
 // `Located` wrapper is accessed via `.value` on the `loc` field of each node;
 // the type itself is not named in this module.
 
@@ -130,6 +133,9 @@ pub struct Index {
 impl Index {
     /// Build the index by aggregating every source, one `add_*` step per kind.
     ///
+    /// Operators are left out: this index feeds the per-key page writer, whose
+    /// keys are path segments, and an operator's text (`//`) is not one.
+    ///
     /// - `explain_dir`: path to `src/compiler/diagnostics/explain/`
     /// - `content_dir`: path to `docs/constructs/`
     /// - `commands`: command metadata from `help.rs`'s `COMMANDS` table
@@ -174,6 +180,7 @@ impl Index {
         builder.add_compiled_stdlib()?;
         builder.add_diagnostics_embedded();
         builder.add_env_vars();
+        builder.add_operators()?;
         Ok(builder.finish())
     }
 
@@ -187,6 +194,7 @@ impl Index {
     /// - `case`, `do` — a construct or glossary term.
     /// - `version`, `build` — a CLI command.
     /// - `IPE_WEB_PORT`, `IPE_LOG_LEVEL` — a runtime environment variable.
+    /// - `//`, `|>` — a binary operator, by its source text.
     #[must_use]
     pub fn resolve(&self, key: &str) -> Option<&Entry> {
         self.entries.get(key)
@@ -491,6 +499,103 @@ impl IndexBuilder {
             self.entries.insert(var.name.to_owned(), entry);
         }
     }
+
+    /// Index every [`BinOp`] as an [`EntryKind::Symbol`] keyed by its source text.
+    ///
+    /// The text is the operator's meaning ([`operator_meaning`]) and its
+    /// precedence and associativity ([`BinOp::fixity`]). Call it after every
+    /// other source, so a key one of them already holds is refused rather than
+    /// silently replaced.
+    ///
+    /// # Errors
+    ///
+    /// Names the operator whose source text another entry already holds.
+    pub fn add_operators(&mut self) -> Result<(), String> {
+        for op in BinOp::ALL {
+            let key = op.text();
+            if let Some(held) = self.entries.get(key) {
+                return Err(format!(
+                    "operator `{key}` collides with the {} entry `{}`",
+                    held.kind.route_subdir(),
+                    held.source_key
+                ));
+            }
+            let fixity = op.fixity();
+            let assoc = match fixity.assoc() {
+                Assoc::Left => "left-associative",
+                Assoc::Right => "right-associative",
+                Assoc::None => "non-associative",
+            };
+            let text = format!(
+                "{}\n\nPrecedence {} (higher binds tighter), {assoc}.\n",
+                operator_meaning(op),
+                fixity.prec()
+            );
+            self.entries.insert(
+                key.to_owned(),
+                Entry {
+                    kind: EntryKind::Symbol,
+                    source_key: key.to_owned(),
+                    text,
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
+/// What `op` computes on in-range operands.
+///
+/// Exhaustive over the closed [`BinOp`] set, so a new operator without a
+/// meaning does not build.
+#[must_use]
+pub const fn operator_meaning(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Mul => "Multiplies two numbers, both `Int` or both `Float`: `6 * 7 == 42`.",
+        BinOp::FloatDiv => "Divides one `Float` by another: `7.0 / 2.0 == 3.5`.",
+        BinOp::IntDiv => {
+            "Divides one `Int` by another, truncating the quotient toward zero: \
+             `7 // 2 == 3`, `-7 // 2 == -3`."
+        }
+        BinOp::Add => "Adds two numbers, both `Int` or both `Float`: `1 + 2 == 3`.",
+        BinOp::Sub => {
+            "Subtracts the right number from the left, both `Int` or both `Float`: \
+             `5 - 3 == 2`."
+        }
+        BinOp::ParserIgnorer => {
+            "Runs the left parser, then the right one, and keeps the left result \
+             (`Parser.keep`). In scope after `import Ipe.Parser`."
+        }
+        BinOp::Append => {
+            "Appends two `String`s or two `List`s: `\"ab\" ++ \"cd\" == \"abcd\"`, \
+             `[1] ++ [2] == [1, 2]`."
+        }
+        BinOp::Cons => "Puts an element in front of a `List`: `1 :: [2, 3] == [1, 2, 3]`.",
+        BinOp::ParserKeeper => {
+            "Runs the left parser, then the right one, and keeps the right result \
+             (`Parser.ignore`). In scope after `import Ipe.Parser`."
+        }
+        BinOp::Eq => "`True` when the two values are structurally equal: `[1, 2] == [1, 2]`.",
+        BinOp::Neq => "`True` when the two values are not structurally equal: `1 /= 2`.",
+        BinOp::Lt => "`True` when the left value is less than the right: `1 < 2`.",
+        BinOp::Gt => "`True` when the left value is greater than the right: `2 > 1`.",
+        BinOp::Le => "`True` when the left value is less than or equal to the right: `2 <= 2`.",
+        BinOp::Ge => "`True` when the left value is greater than or equal to the right: `2 >= 2`.",
+        BinOp::And => "`True` when both `Bool` operands are `True`: `(True && False) == False`.",
+        BinOp::Or => "`True` when either `Bool` operand is `True`: `(True || False) == True`.",
+        BinOp::PipeRight => {
+            "Applies the function on the right to the value on the left: `x |> f` is `f x`."
+        }
+        BinOp::PipeLeft => {
+            "Applies the function on the left to the value on the right: `f <| x` is `f x`."
+        }
+        BinOp::ComposeLeft => {
+            "Composes two functions, the right one first: `(f << g) x == f (g x)`."
+        }
+        BinOp::ComposeRight => {
+            "Composes two functions, the left one first: `(f >> g) x == g (f x)`."
+        }
+    }
 }
 
 impl Default for IndexBuilder {
@@ -628,7 +733,8 @@ pub fn stdlib_module_matches(query: &str, dotted: &str) -> bool {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{CommandInfo, EntryKind, Index};
+    use super::{CommandInfo, Entry, EntryKind, Index, IndexBuilder, operator_meaning};
+    use ipe_syntax::BinOp;
 
     /// Resolve a workspace-root-relative path.
     ///
@@ -922,6 +1028,52 @@ mod tests {
         assert!(
             html.contains(&heading_html),
             "symbol heading must appear verbatim; got: {html}"
+        );
+    }
+
+    /// Every operator of the closed set opens its own `Symbol` entry, by its
+    /// source text, in the embedded index.
+    #[test]
+    fn every_binop_has_doc_entry() {
+        let idx = Index::build_embedded().expect("embedded index build must succeed");
+        for op in BinOp::ALL {
+            let key = op.text();
+            let entry = idx.resolve(key).expect("every operator resolves");
+            assert_eq!(entry.kind, EntryKind::Symbol, "{key}");
+            assert_eq!(entry.source_key, key, "{key}");
+            assert!(
+                entry.text.starts_with(operator_meaning(op)),
+                "{key} carries its meaning: {}",
+                entry.text
+            );
+            let precedence = format!("Precedence {} ", op.fixity().prec());
+            assert!(entry.text.contains(&precedence), "{key}: {}", entry.text);
+        }
+    }
+
+    /// An operator whose text another source already holds is refused, never
+    /// written over the other entry.
+    #[test]
+    fn operator_key_collision_is_refused() {
+        let mut builder = IndexBuilder::new();
+        builder.insert(
+            "//".to_owned(),
+            Entry {
+                kind: EntryKind::Construct,
+                source_key: "//".to_owned(),
+                text: "held".to_owned(),
+            },
+        );
+        let refused = builder.add_operators();
+        assert!(
+            refused.as_ref().is_err_and(|e| e.contains("`//`")),
+            "{refused:?}"
+        );
+        let idx = builder.finish();
+        assert_eq!(
+            idx.resolve("//").map(|e| e.kind.clone()),
+            Some(EntryKind::Construct),
+            "the held entry survives"
         );
     }
 }
