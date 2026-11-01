@@ -118,6 +118,13 @@ pub fn completions(
     };
     let source = file.text(db);
 
+    // Completion is code-only: a trigger byte inside a comment or string
+    // literal (BUG-CLASSES 8ck) must never offer anything, so this gate runs
+    // before any candidate is even considered.
+    if ipe_parse::position_context(source, byte) != ipe_parse::PositionContext::Code {
+        return Vec::new();
+    }
+
     // Demand all salsa queries before locking the interner — each query
     // internally acquires + releases the interner lock, and the Mutex is not
     // reentrant. All results are cloned out of their `Arc` wrappers here so
@@ -245,6 +252,14 @@ pub fn qualified_completions(
     let files = root.files(db);
     let &file = files.get(module)?;
     let source = file.text(db);
+
+    // Same code-only gate as `completions` — checked before
+    // `scan_qualifier_prefix` runs, since that scanner has no comment/string
+    // awareness of its own (BUG-CLASSES 8ck).
+    if ipe_parse::position_context(source, byte) != ipe_parse::PositionContext::Code {
+        return None;
+    }
+
     let trigger = ipe_parse::scan_qualifier_prefix(source, byte)?;
 
     let spellings = ipe_db::scan_import_spellings(source);

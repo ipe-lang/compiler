@@ -364,6 +364,256 @@ impl<'src> Lexer<'src> {
     }
 }
 
+/// The lexical context a byte offset sits in: ordinary code, one of the
+/// comment kinds, or inside a string/char literal.
+///
+/// [`position_context`] is the only producer; completion (`ipe_lsp_features`)
+/// is the only consumer that needs the distinction, so a feature gate can
+/// refuse everywhere but [`PositionContext::Code`] without caring which
+/// non-code kind it is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PositionContext {
+    /// Ordinary code: an identifier, keyword, literal head, or operator.
+    Code,
+    /// Inside a `-- …` line comment.
+    LineComment,
+    /// Inside a `{- … -}` block comment (nestable).
+    BlockComment,
+    /// Inside a `{-| … -}` doc comment (not nestable, same as [`lex_doc_comment`]).
+    DocComment,
+    /// Inside a `"…"` or `"""…"""` string literal.
+    String,
+    /// Inside a `'…'` character literal.
+    Char,
+}
+
+/// Classify the byte `offset` in `src` as [`PositionContext::Code`], a
+/// comment kind, or inside a string/char literal.
+///
+/// Reuses [`Lexer`]'s own character window (`peek`/`peek2`/`peek3`/`advance`)
+/// and mirrors, arm for arm, the dispatch [`Lexer::skip_trivia`] and the main
+/// [`lex`] loop use to open a line comment (`--`), a block comment (`{-`,
+/// nestable), a doc comment (`{-|`, not nestable — see [`lex_doc_comment`]),
+/// a string/triple-string (`lex_string`/`lex_triple_string`), or a char
+/// literal ([`lex_char`]) — never a second, independently maintained grammar
+/// (BUG-CLASSES 8ck).
+///
+/// Unlike those functions, this NEVER fails: it tolerates a lex error
+/// anywhere in `src`, because completion must still answer over a buffer
+/// mid-edit. An unterminated comment, string, or char literal that reaches
+/// `offset` (including end of input) classifies as that context rather than
+/// propagating an error. A raw newline that ends an unterminated single-line
+/// string or char literal before `offset` is reached ends the literal there
+/// (the real lexer's own refusal point) and resumes classifying as code from
+/// the next character, the same recovery a line-oriented editor expects.
+///
+/// Runs in O(offset) with no recursion: every loop advances the cursor by at
+/// least one character per iteration and returns as soon as the cursor
+/// reaches `offset`, never scanning past it. Nested block-comment depth is a
+/// `u32` counter with a saturating increment — sufound because depth is only
+/// ever compared against zero, so a wrapped value cannot read as closed.
+#[must_use]
+pub fn position_context(src: &str, offset: u32) -> PositionContext {
+    // Bytes past `src.len()` cannot be a real cursor position; clamping here
+    // (rather than scanning the whole file first to validate `offset`) is
+    // what keeps the scan itself at O(offset) instead of O(src.len()).
+    let end = offset.min(u32::try_from(src.len()).unwrap_or(u32::MAX));
+    let mut lx = Lexer::new(src);
+
+    loop {
+        if lx.offset() >= end {
+            return PositionContext::Code;
+        }
+        // Each `classify_*` helper is entered right after `lx` has consumed
+        // that region's opening marker. `Some(ctx)` means `end` fell inside
+        // the region (the region never closes before `end`, including an
+        // unterminated one at EOF); `None` means the region closed before
+        // `end`, so the main dispatch resumes classifying as ordinary code.
+        let opened = match lx.peek() {
+            None => return PositionContext::Code,
+            // Line comment `-- … \n` — mirrors `Lexer::skip_trivia`.
+            Some('-') if lx.peek2() == Some('-') => {
+                lx.advance();
+                lx.advance();
+                classify_line_comment(&mut lx, end)
+            }
+            // Doc comment `{-| … -}`, no nesting — mirrors `lex_doc_comment`.
+            // Checked before the plain block-comment arm below: `{-|` is a
+            // subset of `{-`.
+            Some('{') if lx.peek2() == Some('-') && lx.peek3() == Some('|') => {
+                lx.advance();
+                lx.advance();
+                lx.advance();
+                classify_doc_comment(&mut lx, end)
+            }
+            // Block comment `{- … -}`, nestable — mirrors `Lexer::skip_trivia`.
+            Some('{') if lx.peek2() == Some('-') => {
+                lx.advance();
+                lx.advance();
+                classify_block_comment(&mut lx, end)
+            }
+            // String / triple string — mirrors `lex_string`/`lex_triple_string`.
+            Some('"') => {
+                lx.advance(); // opening `"`
+                classify_string(&mut lx, end)
+            }
+            // Char literal — mirrors `lex_char`.
+            Some('\'') => {
+                lx.advance(); // opening `'`
+                classify_char(&mut lx, end)
+            }
+            // Anything else — including plain whitespace — is one character
+            // of ordinary code: no other token shape can embed a bare `"`,
+            // `'`, `--`, or `{-`, so a plain single-char advance is always
+            // correct here (see this function's doc comment).
+            Some(_) => {
+                lx.advance();
+                None
+            }
+        };
+        if let Some(ctx) = opened {
+            return ctx;
+        }
+    }
+}
+
+/// Scan a `-- …` line comment from right after its opener to `-}`'s
+/// counterpart for a line comment: end of line. Mirrors `Lexer::skip_trivia`.
+fn classify_line_comment(lx: &mut Lexer<'_>, end: u32) -> Option<PositionContext> {
+    loop {
+        if lx.offset() >= end {
+            return Some(PositionContext::LineComment);
+        }
+        match lx.peek() {
+            None | Some('\n') => return None,
+            Some(_) => lx.advance(),
+        }
+    }
+}
+
+/// Scan a `{-| … -}` doc comment body from right after the `{-|` opener.
+/// Mirrors `lex_doc_comment`: no nesting.
+fn classify_doc_comment(lx: &mut Lexer<'_>, end: u32) -> Option<PositionContext> {
+    loop {
+        if lx.offset() >= end {
+            return Some(PositionContext::DocComment);
+        }
+        match lx.peek() {
+            None => return Some(PositionContext::DocComment),
+            Some('-') if lx.peek2() == Some('}') => {
+                lx.advance();
+                lx.advance();
+                return None;
+            }
+            Some(_) => lx.advance(),
+        }
+    }
+}
+
+/// Scan a `{- … -}` block comment body from right after the outermost `{-`
+/// opener. Mirrors `Lexer::skip_trivia`'s nestable depth counter: a
+/// saturating increment is enough because depth is only ever compared
+/// against zero.
+fn classify_block_comment(lx: &mut Lexer<'_>, end: u32) -> Option<PositionContext> {
+    let mut depth: u32 = 1;
+    loop {
+        if lx.offset() >= end {
+            return Some(PositionContext::BlockComment);
+        }
+        match lx.peek() {
+            None => return Some(PositionContext::BlockComment),
+            Some('{') if lx.peek2() == Some('-') => {
+                lx.advance();
+                lx.advance();
+                depth = depth.saturating_add(1);
+            }
+            Some('-') if lx.peek2() == Some('}') => {
+                lx.advance();
+                lx.advance();
+                depth -= 1;
+                if depth == 0 {
+                    return None;
+                }
+            }
+            Some(_) => lx.advance(),
+        }
+    }
+}
+
+/// Scan a string literal body from right after its opening `"`, dispatching
+/// to the triple-quote form when the next two characters are also `"`.
+/// Mirrors `lex_string`/`lex_triple_string`.
+fn classify_string(lx: &mut Lexer<'_>, end: u32) -> Option<PositionContext> {
+    if lx.peek() == Some('"') && lx.peek2() == Some('"') {
+        lx.advance();
+        lx.advance();
+        return classify_triple_string(lx, end);
+    }
+    loop {
+        if lx.offset() >= end {
+            return Some(PositionContext::String);
+        }
+        match lx.peek() {
+            // A raw newline/EOF is `lex_string`'s own `UnterminatedString`
+            // refusal point: the literal ends there, same as the real lexer.
+            None | Some('\n' | '\r') => return None,
+            Some('"') => {
+                lx.advance();
+                return None;
+            }
+            Some('\\') => {
+                lx.advance();
+                lx.advance();
+            }
+            Some(_) => lx.advance(),
+        }
+    }
+}
+
+/// Scan a `"""…"""` triple-string body from right after its opening `"""`.
+/// Mirrors `lex_triple_string`: closes only on three consecutive `"`, a raw
+/// newline is ordinary content.
+fn classify_triple_string(lx: &mut Lexer<'_>, end: u32) -> Option<PositionContext> {
+    loop {
+        if lx.offset() >= end {
+            return Some(PositionContext::String);
+        }
+        match lx.peek() {
+            None => return Some(PositionContext::String),
+            Some('"') if lx.peek2() == Some('"') && lx.peek3() == Some('"') => {
+                lx.advance();
+                lx.advance();
+                lx.advance();
+                return None;
+            }
+            Some(_) => lx.advance(),
+        }
+    }
+}
+
+/// Scan a char literal body from right after its opening `'`. Mirrors
+/// `lex_char`'s tolerant superset: the real lexer's strict one-char rule only
+/// matters for the error it produces, not for where the literal's bytes end.
+fn classify_char(lx: &mut Lexer<'_>, end: u32) -> Option<PositionContext> {
+    loop {
+        if lx.offset() >= end {
+            return Some(PositionContext::Char);
+        }
+        match lx.peek() {
+            None | Some('\n') => return None,
+            Some('\'') => {
+                lx.advance();
+                return None;
+            }
+            Some('\\') => {
+                lx.advance();
+                lx.advance();
+            }
+            Some(_) => lx.advance(),
+        }
+    }
+}
+
 /// The UTF-8 byte width of `c` as a `u32`, clamped to `1` on the impossible
 /// overflow so a span can always be formed without a panic.
 fn char_width(c: char) -> u32 {
