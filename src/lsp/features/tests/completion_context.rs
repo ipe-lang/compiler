@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
-//! `ipe_parse::position_context` proves BUG-CLASSES 8ck closed for
-//! completion: the cursor's lexical context — code, a comment, or a string —
-//! is read from the lexer itself, never a second scanner, so completion can
-//! gate on it and never fire inside a comment or a string literal.
+//! `ipe_parse::position_context` closes BUG-CLASSES 8ck for completion: the
+//! cursor's lexical context (code, a comment, or a literal) comes from
+//! `ipe_parse::lexical_regions`, which drives the lexer's own trivia step and
+//! token dispatch, so completion never fires inside a comment or a literal.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -308,8 +308,122 @@ fn qualified_completion_still_fires_in_code_after_a_comment() {
 }
 
 // ---------------------------------------------------------------------------
-// Differential test: `position_context` against the real lexer's own token
-// and trivia boundaries, over the stdlib and examples corpus.
+// Edge refusals: shapes a scanner beside the lexer reads differently.
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::expect_used)] // test helper: a fixture missing its needle is the failure
+fn context_after(src: &str, needle: &str) -> PositionContext {
+    let at = src.rfind(needle).expect("fixture holds the needle") + needle.len();
+    ipe_parse::position_context(src, u32::try_from(at).expect("offset fits u32"))
+}
+
+/// `<--x` is the token `<-` then `-`: the lexer never opens a comment there,
+/// so a classifier that steps code one character at a time (and so reads the
+/// second and third characters as `--`) refuses completion in real code.
+#[test]
+fn a_left_arrow_before_a_minus_is_code_not_a_line_comment() {
+    const SRC: &str = "main =\n    do\n        p <--Font.\n";
+    assert!(
+        ipe_parse::lexical_regions(SRC).all(|r| r.context == PositionContext::Code),
+        "the lexer reads no comment in `<--`"
+    );
+    assert_eq!(context_after(SRC, "Font."), PositionContext::Code);
+}
+
+/// A malformed char literal mid-edit holds the rest of its line, so a
+/// qualifier typed after the quote is never offered members.
+#[test]
+fn an_unclosed_char_literal_holds_the_rest_of_its_line() {
+    const SRC: &str = "main = 'Font.\nnext = Font.";
+    assert_eq!(context_after(SRC, "'Font."), PositionContext::Char);
+    assert_eq!(context_after(SRC, "next = Font."), PositionContext::Code);
+}
+
+/// `{{expr}}` inside `"""` is the canonicaliser's grammar, not the lexer's:
+/// it reads as string, so completion stays off rather than guessing.
+#[test]
+fn a_triple_string_interpolation_body_reads_as_string() {
+    const SRC: &str = "main = \"\"\"a {{ Font. }} b\"\"\"\n";
+    assert_eq!(context_after(SRC, "Font."), PositionContext::String);
+}
+
+/// The cursor between the two characters of a closer is still inside the
+/// comment; right after the closer it is code.
+#[test]
+fn a_cursor_inside_a_closer_is_inside_its_comment() {
+    const SRC: &str = "{- Font. -}x";
+    let closer = u32::try_from(SRC.find("-}").expect("closer")).expect("fits");
+    assert_eq!(
+        ipe_parse::position_context(SRC, closer + 1),
+        PositionContext::BlockComment
+    );
+    assert_eq!(
+        ipe_parse::position_context(SRC, closer + 2),
+        PositionContext::Code
+    );
+}
+
+/// A `\r\n` ends a line comment at the `\n`; the next line is code.
+#[test]
+fn a_crlf_line_comment_ends_at_its_line_feed() {
+    const SRC: &str = "-- Font.\r\nmain = Font.";
+    assert_eq!(context_after(SRC, "-- Font."), PositionContext::LineComment);
+    assert_eq!(
+        context_after(SRC, "-- Font.\r"),
+        PositionContext::LineComment
+    );
+    assert_eq!(context_after(SRC, "main = Font."), PositionContext::Code);
+}
+
+/// An offset inside a multi-byte character, or past the end, never panics and
+/// reads the region around it.
+#[test]
+fn an_offset_off_a_char_boundary_or_past_the_end_reads_its_region() {
+    const SRC: &str = "x = \"é Font.";
+    let mid = u32::try_from(SRC.find('é').expect("é") + 1).expect("fits");
+    assert_eq!(
+        ipe_parse::position_context(SRC, mid),
+        PositionContext::String
+    );
+    assert_eq!(
+        ipe_parse::position_context(SRC, u32::MAX),
+        PositionContext::String
+    );
+    assert_eq!(ipe_parse::position_context("", 7), PositionContext::Code);
+}
+
+/// Regions tile the source: each starts where the last ended, none is empty,
+/// and the last ends at the end of input, on unlexable text too.
+#[test]
+fn lexical_regions_tile_any_source() {
+    for src in [
+        "",
+        "\"",
+        "'",
+        "{-",
+        "{-|",
+        "\"\"\"",
+        "& . 1x \u{0007} \r",
+        "x = \"a\nb = 'c' {- {- -} -} --",
+    ] {
+        let mut at = 0u32;
+        for region in ipe_parse::lexical_regions(src) {
+            assert_eq!(region.span.lo, at, "{src:?}: regions must be contiguous");
+            assert!(region.span.hi > region.span.lo, "{src:?}: empty region");
+            at = region.span.hi;
+        }
+        assert_eq!(
+            at as usize,
+            src.len(),
+            "{src:?}: regions must reach the end"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Differential test: every non-code region `lexical_regions` reads, against
+// the real lexer's token spans and the trivia between them, over the stdlib
+// and examples corpus. Equal region lists mean every byte offset agrees.
 // ---------------------------------------------------------------------------
 
 fn stdlib_root() -> PathBuf {
@@ -336,211 +450,135 @@ fn ipe_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// How many times each `PositionContext` kind has already been checked
-/// against `position_context` in the current file — capped so the
-/// differential test stays O(corpus size) rather than re-scanning from
-/// offset 0 once per token (an O(n^2) blow-up a large file would otherwise
-/// pay for free).
-#[derive(Default)]
-struct ProbeBudget {
-    code: u32,
-    line_comment: u32,
-    block_comment: u32,
-    doc_comment: u32,
-    string: u32,
-    char: u32,
-}
+/// A non-code region: its span, kind, and whether its end is open.
+type Expected = (u32, u32, PositionContext, bool);
 
-const PER_FILE_CAP: u32 = 3;
-
-impl ProbeBudget {
-    const fn allow(counter: &mut u32) -> bool {
-        if *counter >= PER_FILE_CAP {
-            return false;
+/// The comments in the trivia gap `[lo, hi)` between two tokens of a source
+/// the lexer accepted, so the gap holds only whitespace and comments.
+#[allow(clippy::panic, clippy::expect_used)] // the oracle refuses a gap the lexer could not have accepted
+fn gap_comments(src: &str, lo: u32, hi: u32, out: &mut Vec<Expected>, label: &str) {
+    let gap = src
+        .get(lo as usize..hi as usize)
+        .expect("gap on char boundaries");
+    let bytes = gap.as_bytes();
+    let mut i = 0usize;
+    let at = |i: usize| lo + u32::try_from(i).expect("fits u32");
+    while i < bytes.len() {
+        match (bytes.get(i), bytes.get(i + 1)) {
+            (Some(b' ' | b'\t' | b'\r' | b'\n'), _) => i += 1,
+            (Some(b'-'), Some(b'-')) => {
+                let start = i;
+                while bytes.get(i).is_some_and(|&b| b != b'\n') {
+                    i += 1;
+                }
+                out.push((at(start), at(i), PositionContext::LineComment, true));
+            }
+            (Some(b'{'), Some(b'-')) => {
+                let start = i;
+                i += 2;
+                let mut depth = 1u32;
+                while depth > 0 {
+                    match (bytes.get(i), bytes.get(i + 1)) {
+                        (Some(b'{'), Some(b'-')) => {
+                            depth += 1;
+                            i += 2;
+                        }
+                        (Some(b'-'), Some(b'}')) => {
+                            depth -= 1;
+                            i += 2;
+                        }
+                        (Some(_), _) => i += 1,
+                        (None, _) => panic!("{label}: unclosed block comment in a lexed gap"),
+                    }
+                }
+                out.push((at(start), at(i), PositionContext::BlockComment, false));
+            }
+            _ => panic!("{label}: non-trivia byte {i} in the gap at {lo}"),
         }
-        *counter += 1;
-        true
     }
 }
 
-/// Probe the first comment marker in the gap `[gap_lo, gap_hi)` — the real
-/// lexer's trivia between two tokens (or before the first / after the last)
-/// — and assert `position_context` agrees it is a line or block comment. A
-/// whitespace-only gap asserts nothing further: ordinary code bytes are
-/// already covered by the tokens on either side of it.
-fn probe_gap(
-    src: &str,
-    gap_lo: u32,
-    gap_hi: u32,
-    budget: &mut ProbeBudget,
-    observed: &mut BTreeSet<&'static str>,
-    label: &str,
-) {
-    if gap_hi <= gap_lo {
-        return;
-    }
-    let gap = &src[gap_lo as usize..gap_hi as usize];
-    let Some((rel, _)) = gap.char_indices().find(|(_, c)| !c.is_whitespace()) else {
-        return;
-    };
-    // `rel` is a byte offset inside `gap`, a slice of `src`; `src` is already
-    // bounded to `u32` range by every span-producing lexer call, so this never
-    // saturates in practice — the fallback just keeps the helper `expect`-free.
-    let marker_start = gap_lo + u32::try_from(rel).unwrap_or(u32::MAX);
-    let rest = &gap[rel..];
-    if rest.starts_with("--") {
-        if !ProbeBudget::allow(&mut budget.line_comment) {
-            return;
-        }
-        let probe = marker_start + 2;
-        assert_eq!(
-            ipe_parse::position_context(src, probe),
-            PositionContext::LineComment,
-            "{label}: byte {probe} inside a `--` comment must classify LineComment"
-        );
-        observed.insert("LineComment");
-    } else if rest.starts_with("{-") {
-        if !ProbeBudget::allow(&mut budget.block_comment) {
-            return;
-        }
-        let probe = marker_start + 2;
-        assert_eq!(
-            ipe_parse::position_context(src, probe),
-            PositionContext::BlockComment,
-            "{label}: byte {probe} inside a block comment must classify BlockComment"
-        );
-        observed.insert("BlockComment");
-    }
-}
-
-/// Run every probe [`position_context_agrees_with_the_lexer_over_the_corpus`]
-/// drives against one source text, identified in failure messages by `label`.
-/// Returns whether `src` lexed at all — an unlexable source (a deliberately
-/// malformed fixture elsewhere in the corpus) contributes no ground truth and
-/// is skipped by the caller, same as `try_source_tokens`'s own contract.
-fn probe_source(src: &str, label: &str, observed: &mut BTreeSet<&'static str>) -> bool {
-    let Some(tokens) = ipe_parse::try_source_tokens(src) else {
-        return false;
-    };
-    let mut budget = ProbeBudget::default();
-
-    let mut prev_hi = 0u32;
+/// The non-code regions of a lexed `src` per the lexer's tokens and the trivia
+/// between them, or `None` when the lexer refuses `src`.
+#[allow(clippy::expect_used)] // test oracle: a token span past u32 is the failure
+fn expected_regions(src: &str, label: &str) -> Option<Vec<Expected>> {
+    let tokens = ipe_parse::try_source_tokens(src)?;
+    let mut out = Vec::new();
+    let mut prev = 0u32;
     for tok in &tokens {
-        probe_gap(src, prev_hi, tok.span.lo, &mut budget, observed, label);
-
-        match tok.class {
-            TokenClass::DocComment => {
-                if ProbeBudget::allow(&mut budget.doc_comment) {
-                    let probe = tok.span.lo + 3; // past the `{-|` opener
-                    assert_eq!(
-                        ipe_parse::position_context(src, probe),
-                        PositionContext::DocComment,
-                        "{label}: byte {probe} inside a doc-comment token must classify DocComment"
-                    );
-                    observed.insert("DocComment");
-                }
-            }
-            TokenClass::Code(TokenKind::Str) => {
-                let probe = tok.span.lo + 1; // past the opening `"`
-                if probe < tok.span.hi && ProbeBudget::allow(&mut budget.string) {
-                    assert_eq!(
-                        ipe_parse::position_context(src, probe),
-                        PositionContext::String,
-                        "{label}: byte {probe} inside a string token must classify String"
-                    );
-                    observed.insert("String");
-                }
-            }
-            TokenClass::Code(TokenKind::Char) => {
-                let probe = tok.span.lo + 1; // past the opening `'`
-                if probe < tok.span.hi && ProbeBudget::allow(&mut budget.char) {
-                    assert_eq!(
-                        ipe_parse::position_context(src, probe),
-                        PositionContext::Char,
-                        "{label}: byte {probe} inside a char token must classify Char"
-                    );
-                    observed.insert("Char");
-                }
-            }
-            TokenClass::Code(_) => {
-                if ProbeBudget::allow(&mut budget.code) {
-                    let probe = tok.span.lo + (tok.span.hi - tok.span.lo) / 2;
-                    assert_eq!(
-                        ipe_parse::position_context(src, probe),
-                        PositionContext::Code,
-                        "{label}: byte {probe} inside an ordinary token must classify Code"
-                    );
-                    observed.insert("Code");
-                }
-            }
+        gap_comments(src, prev, tok.span.lo, &mut out, label);
+        let context = match tok.class {
+            TokenClass::DocComment => Some(PositionContext::DocComment),
+            TokenClass::Code(TokenKind::Str) => Some(PositionContext::String),
+            TokenClass::Code(TokenKind::Char) => Some(PositionContext::Char),
+            TokenClass::Code(_) => None,
+        };
+        if let Some(context) = context {
+            out.push((tok.span.lo, tok.span.hi, context, false));
         }
-        prev_hi = tok.span.hi;
+        prev = tok.span.hi;
     }
-    probe_gap(
-        src,
-        prev_hi,
-        u32::try_from(src.len()).unwrap_or(u32::MAX),
-        &mut budget,
-        observed,
-        label,
-    );
-    true
+    let end = u32::try_from(src.len()).expect("fits u32");
+    gap_comments(src, prev, end, &mut out, label);
+    Some(out)
 }
 
-/// The stdlib and examples corpus happens to contain zero plain `{- -}`
-/// block comments — every block-shaped comment it has is a `{-|` doc
-/// comment. This fragment exercises that one remaining kind through the
-/// exact same lexer-derived probe every corpus file goes through
-/// ([`probe_source`]), so the vacuity guard (BUG-CLASSES 8aw) stays honest
-/// — proven on real lexer output, never loosened to pass on an absence.
-const SYNTHETIC_BLOCK_COMMENT_FIXTURE: &str =
-    "module Main exposing (main)\n\n{- a plain, non-doc block comment -}\nmain : Int\nmain = 1\n";
+/// The non-code regions `lexical_regions` reads in `src`.
+fn read_regions(src: &str) -> Vec<Expected> {
+    ipe_parse::lexical_regions(src)
+        .filter(|r| r.context != PositionContext::Code)
+        .map(|r| (r.span.lo, r.span.hi, r.context, r.open_end))
+        .collect()
+}
 
-/// `position_context` agrees with the real lexer's own token and trivia
-/// boundaries over every `.ipe` file in the stdlib and examples corpus — the
-/// differential proof BUG-CLASSES 8ck asks for (mirror the real lexer,
-/// proven against it, not merely asserted). The vacuity guard (BUG-CLASSES
-/// 8aw) pins a non-empty corpus, at least one file that actually lexed, and
-/// every `PositionContext` variant observed at least once, so this cannot
-/// pass by probing nothing.
+/// Kinds the corpus lacks, each driven through the same comparison.
+const SYNTHETIC_FIXTURES: &[&str] = &[
+    "module Main exposing (main)\n\n{- a {- nested -} block comment -}\nmain : Int\nmain = 1\n",
+    "main = 'a' -- c\r\nx = \"\"\"a -- b {- c\"\"\" ++ \"{-\" <--y\n",
+];
+
 #[test]
 fn position_context_agrees_with_the_lexer_over_the_corpus() {
     let mut files = Vec::new();
     ipe_files(&stdlib_root(), &mut files);
     ipe_files(&examples_root(), &mut files);
-    assert!(
-        !files.is_empty(),
-        "corpus must be non-empty or this test proves nothing"
+    assert!(files.len() > 100, "corpus too small: {}", files.len());
+
+    let mut observed: BTreeSet<String> = BTreeSet::new();
+    let mut lexed_files = 0usize;
+    let mut sources: Vec<(String, String)> = files
+        .iter()
+        .filter_map(|path| {
+            std::fs::read_to_string(path)
+                .ok()
+                .map(|src| (path.display().to_string(), src))
+        })
+        .collect();
+    sources.extend(
+        SYNTHETIC_FIXTURES
+            .iter()
+            .enumerate()
+            .map(|(i, src)| (format!("<synthetic {i}>"), (*src).to_owned())),
     );
 
-    let mut observed: BTreeSet<&'static str> = BTreeSet::new();
-    let mut lexed_files = 0usize;
-
-    for path in &files {
-        let Ok(src) = std::fs::read_to_string(path) else {
+    for (label, src) in &sources {
+        let Some(expected) = expected_regions(src, label) else {
+            assert!(!label.starts_with("<synthetic"), "{label} must lex");
             continue;
         };
-        let label = path.display().to_string();
-        if probe_source(&src, &label, &mut observed) {
-            lexed_files += 1;
+        lexed_files += 1;
+        let read = read_regions(src);
+        assert_eq!(read, expected, "{label}: regions disagree with the lexer");
+        for (_, _, context, _) in &read {
+            observed.insert(format!("{context:?}"));
         }
     }
 
     assert!(
-        probe_source(
-            SYNTHETIC_BLOCK_COMMENT_FIXTURE,
-            "<synthetic block-comment fixture>",
-            &mut observed
-        ),
-        "the synthetic block-comment fixture must itself lex"
-    );
-
-    assert!(
-        lexed_files > 0,
-        "every corpus file failed to lex — the differential test proves nothing"
+        lexed_files > 100,
+        "too few corpus files lexed: {lexed_files}"
     );
     for kind in [
-        "Code",
         "LineComment",
         "BlockComment",
         "DocComment",
@@ -549,7 +587,27 @@ fn position_context_agrees_with_the_lexer_over_the_corpus() {
     ] {
         assert!(
             observed.contains(kind),
-            "the corpus never exercised PositionContext::{kind} — vacuity guard failed"
+            "no {kind} region was compared, so the test proves nothing for it"
+        );
+    }
+}
+
+/// On one source holding every kind, `position_context` at every byte offset
+/// equals the region that holds it, so the corpus comparison of regions covers
+/// the per-offset answer too.
+#[test]
+fn position_context_at_every_offset_is_the_holding_region() {
+    let src = SYNTHETIC_FIXTURES.concat();
+    let regions: Vec<_> = ipe_parse::lexical_regions(&src).collect();
+    for offset in 0..=u32::try_from(src.len()).expect("fits u32") {
+        let expected = regions
+            .iter()
+            .find(|r| r.holds(offset))
+            .map_or(PositionContext::Code, |r| r.context);
+        assert_eq!(
+            ipe_parse::position_context(&src, offset),
+            expected,
+            "offset {offset}"
         );
     }
 }
