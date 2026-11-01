@@ -1026,14 +1026,8 @@ impl fmt::Display for UnsanitizedWireDefect<'_> {
                      borrows, tuples, arrays only — no statement tokens)"
                 )
             }
-            WireDefect::TypeTooLong { len, max } => write!(
-                f,
-                "a type string of {len} bytes is past the {max}-byte ceiling on foreign types"
-            ),
-            WireDefect::TypeTooDeep { max } => write!(
-                f,
-                "a type string nests past the depth ceiling of {max} on foreign types"
-            ),
+            WireDefect::TypeTooLong { len, max } => wire_text::type_too_long(f, *len, *max),
+            WireDefect::TypeTooDeep { max } => wire_text::type_too_deep(f, *max),
             WireDefect::InvalidPattern { got } => {
                 write!(
                     f,
@@ -1176,6 +1170,20 @@ mod wire_text {
              renderable `path` dependency (it must be UTF-8, free of control \
              characters, and on a local drive); move the project or the wrapper \
              crate to such a directory"
+        )
+    }
+
+    pub(super) fn type_too_long(f: &mut fmt::Formatter<'_>, len: usize, max: usize) -> fmt::Result {
+        write!(
+            f,
+            "a type string of {len} bytes is past the {max}-byte ceiling on foreign types"
+        )
+    }
+
+    pub(super) fn type_too_deep(f: &mut fmt::Formatter<'_>, max: usize) -> fmt::Result {
+        write!(
+            f,
+            "a type string nests past the depth ceiling of {max} on foreign types"
         )
     }
 
