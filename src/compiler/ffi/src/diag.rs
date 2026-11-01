@@ -830,6 +830,18 @@ pub enum WireDefect {
         /// The offending type string.
         got: String,
     },
+    /// A foreign type string longer than [`crate::naming::MAX_TYPE_LEN`] bytes.
+    TypeTooLong {
+        /// The string's length in bytes.
+        len: usize,
+        /// The ceiling it passed.
+        max: usize,
+    },
+    /// A foreign type string nested deeper than [`crate::naming::MAX_TYPE_DEPTH`].
+    TypeTooDeep {
+        /// The ceiling it passed.
+        max: usize,
+    },
     /// An enum-arm pattern that is not a `RustIdent` head with an optional
     /// `(..)` / `{..}` suffix.
     InvalidPattern {
@@ -1014,6 +1026,8 @@ impl fmt::Display for UnsanitizedWireDefect<'_> {
                      borrows, tuples, arrays only — no statement tokens)"
                 )
             }
+            WireDefect::TypeTooLong { len, max } => wire_text::type_too_long(f, *len, *max),
+            WireDefect::TypeTooDeep { max } => wire_text::type_too_deep(f, *max),
             WireDefect::InvalidPattern { got } => {
                 write!(
                     f,
@@ -1156,6 +1170,20 @@ mod wire_text {
              renderable `path` dependency (it must be UTF-8, free of control \
              characters, and on a local drive); move the project or the wrapper \
              crate to such a directory"
+        )
+    }
+
+    pub(super) fn type_too_long(f: &mut fmt::Formatter<'_>, len: usize, max: usize) -> fmt::Result {
+        write!(
+            f,
+            "a type string of {len} bytes is past the {max}-byte ceiling on foreign types"
+        )
+    }
+
+    pub(super) fn type_too_deep(f: &mut fmt::Formatter<'_>, max: usize) -> fmt::Result {
+        write!(
+            f,
+            "a type string nests past the depth ceiling of {max} on foreign types"
         )
     }
 
