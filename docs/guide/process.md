@@ -31,7 +31,7 @@ Three knots.
 ## A worked example: capturing a child's output
 
 The example under
-[`examples/shapes/script/process-run`](../../examples/shapes/script/process-run/src/Main.ipe)
+[`examples/shapes/script/process-run`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/process-run/src/Main.ipe)
 runs two children: the simple `run` for a successful command, then `runWith` to
 show an argument passed literally and the exit code captured.
 
@@ -81,7 +81,7 @@ get, and a sandbox can see exactly which programs reach for a child process.
 7" is a normal outcome with a value, distinct from "the command could not be
 started", which is the failure.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

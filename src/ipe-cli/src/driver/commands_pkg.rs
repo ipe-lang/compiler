@@ -4,9 +4,8 @@ use super::{
     attribute_post_link_error, build_root_into, build_test_into,
     capabilities_including_served_widgets, create_source_root, emit_machine_error,
     emitted_bin_filename, entry_modules, frame_infer_error, home_to_source_map,
-    lowering_check_query, program_constructs_a_widget, resolve_runtime,
-    resolve_vendored_runtime_dir, run_build, runtime_context_for_message, typecheck_target,
-    working_dir,
+    lowering_check_query, program_constructs_a_widget, resolve_vendored_runtime_dir, run_build,
+    runtime_context_for_message, typecheck_target, working_dir,
 };
 use crate::cargo_step::{CargoOutput, CargoTarget, Verbosity};
 use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths};
@@ -415,15 +414,16 @@ impl<'a> BundleAssembler<'a> {
         out: OutTarget<'_>,
         webview: delivery::WebViewProof,
     ) -> Result<EmittedCrate, CliError> {
-        let runtime_dir = resolve_vendored_runtime_dir(None, false)?;
+        let options = BuildOptions {
+            intent: self.profile.build_intent(),
+            ..BuildOptions::from_env()
+        };
+        let runtime_dir = resolve_vendored_runtime_dir(None, options.runtime_emit())?;
         build_root_into(
             self.held,
             out,
             &runtime_dir,
-            &BuildOptions {
-                intent: self.profile.build_intent(),
-                ..BuildOptions::from_env()
-            },
+            &options,
             delivery::HostIntent::WebView(webview),
         )
     }
@@ -1427,8 +1427,6 @@ pub fn run_project_tests_with(
     // rather than an opaque OS spawn error.
     let cargo_bin = toolchain::require_cargo(toolchain::ToolIntent::Test)?;
 
-    let runtime_dir = resolve_runtime()?;
-
     // Emit into an exclusively-created, unpredictably-named temp directory so
     // concurrent verify runs cannot collide and an attacker cannot pre-seed the
     // path.
@@ -1444,7 +1442,6 @@ pub fn run_project_tests_with(
             host: crate::delivery::HostIntent::Served,
         },
         &out_scratch,
-        &runtime_dir,
         &cargo_bin,
         stdio,
     );
@@ -1493,7 +1490,6 @@ pub struct TestProgram<'a> {
 pub fn build_and_run_test_entry(
     program: &TestProgram<'_>,
     out_scratch: &scratch::ScratchDir,
-    runtime_dir: &Path,
     cargo_bin: &crate::toolchain::CargoBin,
     stdio: TestStdio,
 ) -> Result<TestOutcome, CliError> {
@@ -1502,7 +1498,6 @@ pub fn build_and_run_test_entry(
         program.view,
         program.host,
         OutTarget::Scratch(out_scratch),
-        runtime_dir,
     )?;
 
     let target = crate::target_dir::LinkableTargetDir::for_scratch(cargo_bin.path(), out_scratch)?;
@@ -1723,11 +1718,25 @@ pub fn run_test(rest: &[String]) -> Result<(), CliError> {
             Ok(())
         }
         Err(err) => {
-            // A failing case (or any build error) settles the stage red before
-            // the error propagates to the exit-code contract.
-            stage.failure("tests failed");
+            // The stage settles red before the error propagates to the
+            // exit-code contract, naming what happened: a failing case, or a
+            // run that never reached the tests.
+            stage.failure(test_stage_failure(&err));
             Err(err)
         }
+    }
+}
+
+/// The settled line of a test stage that ended in `err`.
+///
+/// Only [`CliError::TestFailed`] (the runner ran and a case failed) reads as
+/// failed tests; every other error stopped the run before any test ran.
+#[must_use]
+pub const fn test_stage_failure(err: &CliError) -> &'static str {
+    if matches!(err, CliError::TestFailed { .. }) {
+        "tests failed"
+    } else {
+        "tests did not run"
     }
 }
 

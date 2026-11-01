@@ -29,7 +29,7 @@ Three knots.
 ## A worked example: the length of a path
 
 The example under
-[`examples/shapes/script/math-path-length`](../../examples/shapes/script/math-path-length/src/Main.ipe)
+[`examples/shapes/script/math-path-length`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/math-path-length/src/Main.ipe)
 measures the total length of a 2-D path and reports it four ways, then shows NaN
 detection.
 
@@ -96,14 +96,14 @@ The four separate rounding functions are [ease of use][principles] and
 mode argument you might set wrong, each direction is its own named function, so
 the code *says* which rounding it means and a reader cannot misread it.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 
 - **Per-symbol reference:** `ipe doc Ipe.Math` — every function and constant with
   a verified example. `ipe doc Ipe.Math.atan2` covers the quadrant-aware
   arctangent (two arguments, unlike unary `atan`).
-- **Sibling guides:** [Lists](../reference/stdlib/List.md) — `sum`, `map2`, and the
+- **Sibling guides:** [Lists](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/List.md) — `sum`, `map2`, and the
   folds this example builds on. The everyday arithmetic operators live in
   `Ipe.Basics` (see `ipe doc Ipe.Basics`).
 - **Concepts:** [Types and inference](types.md) — how `Int` and `Float` are kept

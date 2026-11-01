@@ -32,8 +32,8 @@ mutable field to reason about, and every change is one `case` arm in `update`.
 
 A script or one-shot tool with **no state loop** does not need TEA — write a plain
 `main` driven by tasks instead (the `Program` shape; see the
-[`Ipe.Task` guide](../reference/stdlib/Task.md) and
-[`examples/shapes/script/release-preflight`](../../examples/shapes/script/release-preflight)).
+[`Ipe.Task` guide](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/Task.md) and
+[`examples/shapes/script/release-preflight`](https://github.com/ipe-lang/compiler/tree/main/examples/shapes/script/release-preflight)).
 Reach for TEA when the program must react to input *over time*.
 
 ## References

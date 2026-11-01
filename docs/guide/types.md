@@ -42,7 +42,7 @@ result:
 - `List String -> String` — takes a list of strings, returns a string.
 - `(a -> b) -> List a -> List b` — takes a function and a list, returns a list.
   A **lowercase** name like `a` is a *type variable*: it stands for any type,
-  the same one everywhere it appears. This is [`List.map`](../reference/stdlib/List.md):
+  the same one everywhere it appears. This is [`List.map`](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/List.md):
   give it a function from `a` to `b` and a list of `a`, get back a list of `b`.
 
 An **uppercase** name is a concrete type (`Int`, `String`, `Bool`) or a named
@@ -52,7 +52,7 @@ type you or the standard library declared (`Maybe`, `Result`, `Task`).
 
 Many languages let any value secretly be null, so any dereference can crash. Ipê
 has no null. A function that might not have an answer says so in its type by
-returning a [`Maybe a`](../reference/stdlib/Maybe.md) — either `Just a` (a value) or
+returning a [`Maybe a`](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/Maybe.md) — either `Just a` (a value) or
 `Nothing` (no value):
 
 ```ipe
@@ -67,7 +67,7 @@ parsePort text =
             Nothing
 ```
 
-[`String.toInt`](../reference/stdlib/String.md) returns `Maybe Int` because not every
+[`String.toInt`](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/String.md) returns `Maybe Int` because not every
 string is a number. To *use* the result you must handle both cases — the
 compiler will not let you treat a `Maybe Int` as an `Int`:
 
@@ -98,11 +98,11 @@ discovered in production.
 ## Failure with a reason: `Result`
 
 `Maybe` says "there is no value". When you also need to say *why* it failed, use
-[`Result e a`](../reference/stdlib/Result.md) — either `Ok a` (success) or `Err e`
+[`Result e a`](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/Result.md) — either `Ok a` (success) or `Err e`
 (failure carrying an error `e`). Parsing and validation typically return a
 `Result` whose `Err` describes what was wrong. At the boundary where effects run
 — a file read, a database query — the error type is
-[`Ipe.Error`](../reference/stdlib/Error.md), a typed, matchable value rather than a
+[`Ipe.Error`](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/Error.md), a typed, matchable value rather than a
 string.
 
 ## Making invalid states unrepresentable
@@ -134,14 +134,14 @@ proven free of an entire category of crashes. That is the payoff for handling
 every `Maybe`, covering every `case`, and shaping your types to exclude the
 impossible.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## Where to go next
 
 - [The Elm Architecture](the-elm-architecture.md) — types in the large: how a
   whole interactive program is one `Model` type and one `Msg` type.
-- [`Ipe.Maybe`](../reference/stdlib/Maybe.md) and
-  [`Ipe.Result`](../reference/stdlib/Result.md) — the full combinator reference.
+- [`Ipe.Maybe`](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/Maybe.md) and
+  [`Ipe.Result`](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/Result.md) — the full combinator reference.
 - [Glossary](glossary.md) — `type variable`, `constructor`, `exhaustive`, and
   more.
 ```

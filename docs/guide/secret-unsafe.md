@@ -55,7 +55,7 @@ type is one boundary, and the fact that escaping it is both explicitly named
 the hatch stays reserved for the residual it was built for, and every use of it is
 an auditable decision.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

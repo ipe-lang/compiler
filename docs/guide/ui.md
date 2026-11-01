@@ -27,7 +27,7 @@ Three knots.
 ## A worked example: a counter view
 
 The example under
-[`examples/shapes/web/ui-layout`](../../examples/shapes/web/ui-layout/src/Main.ipe)
+[`examples/shapes/web/ui-layout`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/web/ui-layout/src/Main.ipe)
 is a minimal `Ipe.Tea.Web` counter. The whole page is one `view` function.
 
 `column` stacks a heading and a counter row with `spacing`; the inner `row`
@@ -173,7 +173,7 @@ and [correctness][principles]: the runtime renders values, so raw style or scrip
 cannot leak into the page, and an event can only produce a `Msg` your `update`
 already handles.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

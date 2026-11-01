@@ -1,0 +1,62 @@
+-- | Commands: effects a program's `update` asks the runtime to run.
+--
+-- Every app shape exposes the same command set under its own module
+-- (`Ipe.Tea.Web.Cmd`, `Ipe.Tea.Tui.Cmd`, `Ipe.Tea.Cli.Cmd`,
+-- `Ipe.Tea.Worker.Cmd`). A `Cmd msg` is a description, not an action: the
+-- runtime runs it after `update` returns, and each result comes back to
+-- `update` as a `msg`.
+module Cmd exposing
+    ( none
+    , batch
+    , perform
+    , map
+    , publish
+    , publishNoEcho
+    )
+
+
+import Ipe.Ffi.Kernel as Kernel
+
+
+-- | The command that does nothing; return it when `update` has no effect to run.
+none =
+    Kernel.kernel "Cmd_none"
+
+
+-- | Run every command in the list.
+--
+-- `Cmd.batch [ a, b ]` starts both `a` and `b`; neither waits for the other,
+-- so their messages may arrive in either order.
+batch =
+    Kernel.kernel "Cmd_batch"
+
+
+-- | Run a `Task` and deliver its outcome as a message.
+--
+-- `Cmd.perform task toMsg` runs `task` and calls `toMsg` with `Ok value` or
+-- `Err error`; `update` receives the message `toMsg` returns.
+perform =
+    Kernel.kernel "Cmd_perform"
+
+
+-- | Turn the messages a command produces into another message type.
+--
+-- `Cmd.map Child cmd` wraps each message of `cmd` in `Child`, so a parent
+-- `update` can run a child component's commands.
+map =
+    Kernel.kernel "Cmd_map"
+
+
+-- | Send `payload` to every live subscriber of `topic`, this program's own
+-- `Sub.subscribeTopic` included.
+--
+-- Make the topic with `PubSub.topic "name"`; the topic's type fixes the
+-- payload type, so a subscriber always receives the type that was sent.
+publish =
+    Kernel.kernel "Cmd_publish"
+
+
+-- | Like `publish`, except the sender's own subscription to `topic` does not
+-- receive the payload.
+publishNoEcho =
+    Kernel.kernel "Cmd_publishNoEcho"

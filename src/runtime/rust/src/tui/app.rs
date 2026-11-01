@@ -24,7 +24,7 @@ use super::focus::{
     Focusable, InputRegistry, clamp_focus, edit_input, ensure_focus_visible, extract_click_msg,
     extract_input_msg, extract_msg_named, hit_test, parse_mouse,
 };
-use super::key::{TuiKey, decode_key};
+use super::key::{decode_key, wire_key};
 use super::layout::render_with_focus;
 use std::io::{Read, Write};
 
@@ -214,8 +214,8 @@ fn term_size() -> (usize, usize) {
     }
 }
 
-/// Longest key sequence `decode_key` recognises (`ESC [ 1 ; <mod> <final>` = 6
-/// bytes); padded to 8 so any tail at least this long is decoded, never carried.
+/// Longest named-key sequence a terminal sends (`ESC [ 2 4 ; 1 6 ~`, a fully
+/// modified F12 = 8 bytes): any tail at least this long is decoded, never carried.
 const MAX_KEY_SEQ: usize = 8;
 
 /// Bytes a UTF-8 lead byte announces (1 for ASCII / continuation / invalid lead).
@@ -247,16 +247,12 @@ fn tail_maybe_truncated(tail: &[u8]) -> bool {
 /// sequences that straddle the fixed 64-byte read boundary by carrying the
 /// unconsumed tail into the next read — a fixed-buffer decode would otherwise
 /// mis-decode or corrupt a split sequence (e.g. a multibyte char inside a paste
-/// larger than 64 bytes). `map_kind` turns the decoded `TuiKey` into the wire
-/// `(kind, value)` pair (`tui_app_ui` folds the ctrl modifier into the kind for
-/// the input editor's word-jumps; `tui_app` passes it through). Runs on its own
+/// larger than 64 bytes). Every decoded key reaches the loop as the one
+/// [`wire_key`] pair, whichever driver runs. Runs on its own
 /// blocking thread so the key handlers stay off it. Each key is queued only with
 /// an [`InputBudget`] permit, so at most [`MAX_QUEUED_INPUT`] keys wait for the
 /// loop; past that the reader blocks until the loop catches up.
-fn read_keys_loop<Msg, FMap>(tx: &tokio::sync::mpsc::UnboundedSender<CliEvent<Msg>>, map_kind: FMap)
-where
-    FMap: Fn(TuiKey) -> (String, String),
-{
+fn read_keys_loop<Msg>(tx: &tokio::sync::mpsc::UnboundedSender<CliEvent<Msg>>) {
     let budget = InputBudget::new(MAX_QUEUED_INPUT);
     let mut stdin = std::io::stdin();
     let mut buf = [0u8; 64];
@@ -283,7 +279,7 @@ where
                 break;
             }
             i += consumed;
-            let (kind, value) = map_kind(k);
+            let (kind, value) = wire_key(k);
             let Some(permit) = budget.acquire(|| tx.is_closed()) else {
                 return;
             };
@@ -301,7 +297,7 @@ where
             break;
         }
         i += consumed;
-        let (kind, value) = map_kind(k);
+        let (kind, value) = wire_key(k);
         let Some(permit) = budget.acquire(|| tx.is_closed()) else {
             return;
         };
@@ -453,20 +449,7 @@ where
         // guard restores the terminal.
         let key_tx = tx.clone();
         let started = crate::threads::spawn_named(KEY_READER_THREAD, move || {
-            read_keys_loop(&key_tx, |k| {
-                // Under the debugger, fold a Ctrl modifier on Left/Right into the
-                // kind (`ctrlleft`/`ctrlright`) so the history step keys are
-                // distinguishable on the flat (kind, value) channel.
-                #[cfg(all(feature = "debugger", not(target_arch = "wasm32")))]
-                let kind = if k.ctrl && (k.kind == "left" || k.kind == "right") {
-                    format!("ctrl{}", k.kind)
-                } else {
-                    k.kind
-                };
-                #[cfg(not(all(feature = "debugger", not(target_arch = "wasm32"))))]
-                let kind = k.kind;
-                (kind, k.value)
-            });
+            read_keys_loop(&key_tx);
         });
         if let Err(e) = started {
             return IpeResult::Err(
@@ -1068,17 +1051,7 @@ where
         // A refused key reader ends the app as in `tui_app`.
         let key_tx = tx.clone();
         let started = crate::threads::spawn_named(KEY_READER_THREAD, move || {
-            read_keys_loop(&key_tx, |k| {
-                // The (kind, value) channel is flat, so fold the ctrl modifier on
-                // Left/Right into the kind (`ctrlleft`/`ctrlright`) for the input
-                // editor's word-jumps.
-                let kind = if k.ctrl && (k.kind == "left" || k.kind == "right") {
-                    format!("ctrl{}", k.kind)
-                } else {
-                    k.kind
-                };
-                (kind, k.value)
-            });
+            read_keys_loop(&key_tx);
         });
         if let Err(e) = started {
             return IpeResult::Err(

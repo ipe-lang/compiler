@@ -119,19 +119,79 @@ fn vendored_runtime_dir_is_required_only_when_vendoring() {
     // demanding a runtime dir. Requiring the vendored tree here is what made
     // `ipe dev watch` fail to locate the runtime in an installed checkout.
     assert_eq!(
-        resolve_vendored_runtime_dir(None, false).ok(),
+        resolve_vendored_runtime_dir(None, RuntimeEmit::Linked).ok(),
         Some(PathBuf::new()),
     );
     // An explicit `--runtime` is honoured verbatim, vendoring or not — so the
     // vendoring path (e.g. `ipe release eject`) resolves a runtime dir even when the
     // ambient vendored tree is absent.
     assert_eq!(
-        resolve_vendored_runtime_dir(Some("/opt/ipe-runtime".to_owned()), false).ok(),
+        resolve_vendored_runtime_dir(Some("/opt/ipe-runtime".to_owned()), RuntimeEmit::Linked).ok(),
         Some(PathBuf::from("/opt/ipe-runtime")),
     );
     assert_eq!(
-        resolve_vendored_runtime_dir(Some("/opt/ipe-runtime".to_owned()), true).ok(),
+        resolve_vendored_runtime_dir(Some("/opt/ipe-runtime".to_owned()), RuntimeEmit::Vendored)
+            .ok(),
         Some(PathBuf::from("/opt/ipe-runtime")),
+    );
+}
+
+/// The test build resolves its runtime by the same emit model as `ipe dev build`.
+///
+/// Both read the ambient environment, so a dependency-model `dev build` that
+/// links the runtime as a crate never pairs with a test build that demands the
+/// vendored source tree (the split that made `ipe test` refuse to locate a
+/// runtime `ipe dev build` and `ipe health` found).
+#[test]
+fn test_build_resolves_the_runtime_like_dev_build() {
+    let dev_build = BuildOptions {
+        intent: Verb::DEV_BUILD.intent(),
+        ..BuildOptions::from_env()
+    };
+    assert_eq!(
+        test_build_options().runtime_emit(),
+        dev_build.runtime_emit()
+    );
+    assert_eq!(
+        test_build_options().runtime_dep,
+        runtime_dep_from_env(),
+        "the test build takes its runtime model from the environment, as dev build does",
+    );
+}
+
+/// The emit model follows the options' runtime link, never a caller's flag.
+#[test]
+fn runtime_emit_follows_the_runtime_link() {
+    let linked = BuildOptions {
+        runtime_dep: true,
+        ..BuildOptions::default()
+    };
+    assert_eq!(linked.runtime_emit(), RuntimeEmit::Linked);
+    let vendored = BuildOptions {
+        runtime_dep: false,
+        ..BuildOptions::default()
+    };
+    assert_eq!(vendored.runtime_emit(), RuntimeEmit::Vendored);
+    assert_eq!(
+        resolve_vendored_runtime_dir(None, linked.runtime_emit()).ok(),
+        Some(PathBuf::new()),
+        "a linked emit never demands the vendored source tree",
+    );
+}
+
+/// The test stage names a test failure only when a test ran and failed.
+///
+/// A build or runtime refusal before any test ran reads as "tests did not run",
+/// so a missing runtime is never reported as a red test.
+#[test]
+fn test_stage_failure_names_only_a_real_test_failure() {
+    assert_eq!(
+        test_stage_failure(&CliError::TestFailed { code: 1 }),
+        "tests failed",
+    );
+    assert_eq!(
+        test_stage_failure(&CliError::RuntimeNotFound),
+        "tests did not run",
     );
 }
 
@@ -1750,7 +1810,6 @@ fn build_root_test_entry(
     label: &str,
 ) -> Result<String, CliError> {
     use crate::source_snapshot::{Limits, SourceSnapshot};
-    let runtime = resolve_runtime()?;
     let snapshot = SourceSnapshot::read(root, Limits::DEFAULT)?;
     let main = ["Main".to_owned()];
     let Some(entry) = snapshot.test_entry(&main) else {
@@ -1768,7 +1827,6 @@ fn build_root_test_entry(
         &view,
         crate::delivery::HostIntent::Served,
         OutTarget::Scratch(&scratch),
-        &runtime,
     )?;
     let cargo_toml = built.path().join("Cargo.toml");
     fs::read_to_string(&cargo_toml).map_err(|e| io_err(&cargo_toml, e))

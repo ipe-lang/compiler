@@ -25,7 +25,7 @@ Two knots, and they are the whole module.
 ## A worked example: a round-trip
 
 The example under
-[`examples/shapes/script/encoding-round-trip`](../../examples/shapes/script/encoding-round-trip/src/Main.ipe)
+[`examples/shapes/script/encoding-round-trip`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/encoding-round-trip/src/Main.ipe)
 sends one payload through each encoding and back, checking it survives, then shows
 what a decoder does with malformed input.
 
@@ -94,7 +94,7 @@ That the decoder cannot *crash* on bad input is the [soundness][principles]
 guarantee: no byte sequence a remote party sends can make the program fall over —
 the worst outcome is an `Err` you already handle.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 
