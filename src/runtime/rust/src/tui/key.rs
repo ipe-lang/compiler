@@ -8,7 +8,8 @@
 /// A decoded key. `kind` values: `enter` / `tab` / `space` / `backspace` /
 /// `escape` / `up` / `down` / `left` / `right` / `home` / `end` / `delete` /
 /// `pageup` / `pagedown` / `fn` (value = the F-key number, `1`-`12`) / `mouse` / `paste-start` /
-/// `paste-end` / `ctrl` (value = letter) / `char` (value = the printable
+/// `paste-end` / `ctrl` (value = letter; Ctrl-C is the terminal interrupt, see
+/// [`TuiKey::is_interrupt`]) / `char` (value = the printable
 /// character) / `other` (value = raw bytes lossily). The `shift` / `alt` /
 /// `ctrl` flags are set only on a CSI-modified named key; `wire_key` decides
 /// which of them reach a program.
@@ -22,6 +23,15 @@ pub struct TuiKey {
 }
 
 impl TuiKey {
+    /// Whether this key is the terminal interrupt (Ctrl-C).
+    ///
+    /// Raw mode delivers Ctrl-C as a byte instead of a signal, so the key
+    /// reader ends the app on it; it never reaches an `onKey` handler.
+    #[must_use]
+    pub fn is_interrupt(&self) -> bool {
+        self.kind == "ctrl" && self.value == "c"
+    }
+
     fn of(kind: &str) -> Self {
         TuiKey {
             kind: kind.to_string(),
@@ -64,7 +74,31 @@ pub fn decode_key(buf: &[u8]) -> (TuiKey, usize) {
     }
 }
 
+/// Decode one escape sequence, ending it before any C0 control byte inside it.
+///
+/// A control byte is never part of an escape sequence (ECMA-48 executes it in
+/// place), so a sequence a control interrupts ends before it as an `other` key
+/// and the control decodes as its own key next. Without that, a Ctrl-C typed
+/// right after an unfinished sequence would be swallowed into it and never end
+/// the app.
 fn decode_escape(buf: &[u8]) -> (TuiKey, usize) {
+    let (key, consumed) = decode_escape_sequence(buf);
+    let control = buf
+        .get(1..consumed)
+        .and_then(|body| body.iter().position(|b| *b < 0x20));
+    match control {
+        Some(at) => {
+            let end = at + 1;
+            (
+                TuiKey::val("other", lossy(buf.get(..end).unwrap_or(buf))),
+                end,
+            )
+        }
+        None => (key, consumed),
+    }
+}
+
+fn decode_escape_sequence(buf: &[u8]) -> (TuiKey, usize) {
     if buf.len() == 1 {
         return (TuiKey::of("escape"), 1);
     }

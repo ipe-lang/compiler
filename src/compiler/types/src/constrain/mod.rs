@@ -15,7 +15,7 @@
 
 pub use crate::doc::{VarNamer, canon_type_to_doc, ty_to_doc};
 pub use crate::homed::{InferError, ModuleHome};
-pub use crate::solve::{Budget, Constraint};
+pub use crate::solve::{Budget, CallSite, CalleeName, Constraint, ConstraintOrigin};
 pub use crate::ty::{Content, FlatType, RowTail, Ty, TyBounds, from_canon, tag_solver_var};
 pub use crate::unify::unify_at;
 pub use crate::unionfind::{UnionFind, VarId};
@@ -158,6 +158,9 @@ pub struct Builder<'a> {
     pub current_home: Option<ModuleHome>,
     /// Equality constraints to be discharged by the solver.
     pub constraints: Vec<Constraint>,
+    /// The call each call-result variable is the result of, so a constraint
+    /// whose found side is that variable carries the call as its origin.
+    pub call_results: BTreeMap<VarId, CallSite>,
     /// Annotation-derived types of every top-level binding, for cross-binding
     /// references (`main` mentions `update`).
     ///

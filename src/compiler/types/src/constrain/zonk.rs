@@ -1399,6 +1399,7 @@ impl<'a> Builder<'a> {
             expected: BTreeMap::new(),
             current_home: None,
             constraints: Vec::new(),
+            call_results: BTreeMap::new(),
             top_level: BTreeMap::new(),
             untyped: BTreeMap::new(),
             field_accesses: Vec::new(),

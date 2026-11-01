@@ -227,6 +227,10 @@ fn a_clamp_requiring_assertion_is_refused() {
         "the refusal must name the real carrier and the rule: {msg}"
     );
     assert!(
+        msg.contains("IPE-F4414") && msg.contains("Main.ipe:7:"),
+        "the refusal must point at the refused definition's call: {msg}"
+    );
+    assert!(
         !msg.contains("Rust.Ffi.ipe"),
         "the refusal must not be attributed to the generated module: {msg}"
     );
@@ -475,6 +479,10 @@ fn a_result_typed_const_is_refused() {
     assert!(
         msg.contains("bare scalar"),
         "the refusal must name the bare-scalar rule; got: {msg}"
+    );
+    assert!(
+        msg.contains("IPE-F4414") && msg.contains("Main.ipe:7:"),
+        "the refusal must point at the refused definition's read: {msg}"
     );
     assert!(
         !msg.contains("Rust.Ffi.ipe"),
@@ -773,6 +781,51 @@ fn a_local_alias_carrier_is_refused() {
     assert!(
         msg.contains("`Str` is a type alias this module declares"),
         "the refusal must name the alias as the cause: {msg}"
+    );
+    assert!(
+        msg.contains("IPE-F4414") && msg.contains("Main.ipe:9:"),
+        "the refusal must point at the refused definition's call: {msg}"
+    );
+    assert!(
+        !msg.contains("Rust.Ffi.ipe"),
+        "the refusal must not be attributed to the generated module: {msg}"
+    );
+}
+
+/// Two definitions in two modules asserting different signatures for one
+/// path are refused at the second definition, naming the first one's file.
+#[test]
+fn a_conflict_across_modules_names_both_definitions() {
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let main = "module Main exposing (main)\n\
+        import Ipe.Io as Io\n\
+        import Rust.Ffi\n\
+        import Other\n\n\
+        doubled : Int -> Result Error Int\n\
+        doubled =\n\
+        \x20   Rust.Ffi.call \"tm::hidden_double\"\n\n\
+        main =\n\
+        \x20   case Other.twice 1 2 of\n\
+        \x20       Ok _ -> Io.println \"ok\"\n\
+        \x20       Err _ -> Io.println \"err\"\n";
+    let other = "module Other exposing (twice)\n\
+        import Rust.Ffi\n\n\
+        twice : Int -> Int -> Result Error Int\n\
+        twice =\n\
+        \x20   Rust.Ffi.call \"tm::hidden_double\"\n";
+    let fixture = ffi_fixture_of(SourceTree::main(main).module("Other", other));
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_asserted_conflict_out");
+    let _ = fs::remove_dir_all(&out);
+    let built = ipe::build_fixture(&fixture, &out, &runtime);
+    assert!(built.is_err(), "conflicting assertions must be refused");
+    let msg = built.err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(
+        msg.contains("IPE-F4414") && msg.contains("Other.ipe:6:"),
+        "the refusal must point at the second definition's call: {msg}"
+    );
+    assert!(
+        msg.contains("Main.ipe:8 "),
+        "the refusal must name the first definition's file and line: {msg}"
     );
     assert!(
         !msg.contains("Rust.Ffi.ipe"),
