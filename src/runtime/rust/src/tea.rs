@@ -528,8 +528,8 @@ impl EveryInterval {
     /// unsaturated long period would fire continuously.
     #[cfg(any(test, target_arch = "wasm32"))]
     pub(crate) fn browser_delay_ms(self) -> u32 {
-        const MAX_BROWSER_DELAY_MS: u32 = 2_147_483_647;
-        u32::try_from(self.millis()).map_or(MAX_BROWSER_DELAY_MS, |ms| ms.min(MAX_BROWSER_DELAY_MS))
+        use crate::narrow::BROWSER_TIMER_MAX_MS;
+        u32::try_from(self.millis()).map_or(BROWSER_TIMER_MAX_MS, |ms| ms.min(BROWSER_TIMER_MAX_MS))
     }
 }
 
