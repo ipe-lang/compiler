@@ -4,7 +4,7 @@
 //! compiled [`Regex`], so no operation can re-encounter an unvalidated pattern
 //! string (parse, don't validate).
 
-use super::{IpeMaybe, IpeResult};
+use super::{FromIpeError, IpeError, IpeMaybe, IpeResult};
 use crate::system::{EnvCeiling, EnvCeilingRefusal, ZeroCeiling};
 use std::sync::{Arc, OnceLock};
 
@@ -79,27 +79,42 @@ crate::stringify::show_row!(
 /// or a malformed `IPE_REGEX_MAX_INPUT_BYTES` surfaces here as a typed `Err`,
 /// never anywhere downstream as a silent no-match or a default ceiling.
 #[must_use]
-pub fn regex_compile<E: From<String>>(pattern: String) -> IpeResult<E, Regex> {
+pub fn regex_compile<E: FromIpeError>(pattern: String) -> IpeResult<E, Regex> {
     compile_within(&pattern, regex_input_ceiling())
 }
 
 /// Compiles `pattern` under an already parsed subject `ceiling`.
 ///
 /// A refused ceiling is the `Err`, before the pattern is compiled.
-fn compile_within<E: From<String>>(
+fn compile_within<E: FromIpeError>(
     pattern: &str,
     ceiling: Result<usize, EnvCeilingRefusal>,
 ) -> IpeResult<E, Regex> {
     let max_input = match ceiling {
         Ok(max_input) => max_input,
-        Err(refusal) => return IpeResult::Err(E::from(String::from(refusal))),
+        Err(refusal) => return IpeResult::Err(E::from_ipe_error(IpeError::from(refusal))),
     };
     match regex::Regex::new(pattern) {
         Ok(re) => IpeResult::Ok(Regex {
             re: Arc::new(re),
             max_input,
         }),
-        Err(e) => IpeResult::Err(format!("Ipe.Regex: invalid pattern: {e}").into()),
+        Err(e) => IpeResult::Err(E::from_ipe_error(pattern_refusal(&e))),
+    }
+}
+
+/// The error for a pattern the `regex` crate refused.
+///
+/// The message names the refusal's shape only: the crate's syntax message
+/// quotes the pattern, which may carry text the program received.
+fn pattern_refusal(error: &regex::Error) -> IpeError {
+    match error {
+        regex::Error::CompiledTooBig(limit) => IpeError::limit_exceeded(format!(
+            "Ipe.Regex: the compiled pattern exceeds the {limit} byte size limit"
+        )),
+        // `regex::Error` is non-exhaustive: a syntax error, and any variant a
+        // later release adds, is a pattern outside the accepted language.
+        _ => IpeError::invalid_input("Ipe.Regex: invalid pattern".to_owned()),
     }
 }
 
@@ -260,6 +275,34 @@ mod tests {
         }
     }
 
+    /// A refused pattern is `InvalidInput` and its message never quotes the pattern.
+    #[test]
+    fn invalid_pattern_is_invalid_input_without_the_pattern() {
+        let refused = regex_compile::<IpeError>("SENTINEL[".to_owned());
+        assert!(
+            matches!(
+                &refused,
+                IpeResult::Err(IpeError::Error(crate::error::IpeErrorKind::InvalidInput, info))
+                    if info.message == "Ipe.Regex: invalid pattern"
+            ),
+            "an invalid pattern must be InvalidInput without the pattern text"
+        );
+    }
+
+    /// A pattern past the compiled-size limit is `LimitExceeded`.
+    #[test]
+    fn oversized_pattern_is_limit_exceeded() {
+        let refused = regex_compile::<IpeError>(r"(?:\w{1000}){1000}".to_owned());
+        assert!(
+            matches!(
+                &refused,
+                IpeResult::Err(IpeError::Error(crate::error::IpeErrorKind::LimitExceeded, info))
+                    if info.message.starts_with("Ipe.Regex: the compiled pattern exceeds")
+            ),
+            "a pattern past the size limit must be LimitExceeded"
+        );
+    }
+
     #[test]
     fn test_match() {
         assert!(regex_match(ok(r"^\d+$"), "12345".to_string()));
@@ -312,10 +355,15 @@ mod tests {
         use std::env::VarError;
         let refused = |raw: Result<String, VarError>| {
             let shown = format!("{raw:?}");
-            let outcome = compile_within::<String>("a", REGEX_INPUT_CEILING.parse_as::<usize>(raw));
+            let outcome =
+                compile_within::<IpeError>("a", REGEX_INPUT_CEILING.parse_as::<usize>(raw));
             assert!(
-                matches!(&outcome, IpeResult::Err(e) if e.starts_with("IPE_REGEX_MAX_INPUT_BYTES")),
-                "{shown} must be refused naming the variable"
+                matches!(
+                    &outcome,
+                    IpeResult::Err(IpeError::Error(crate::error::IpeErrorKind::InvalidInput, info))
+                        if info.message.starts_with("IPE_REGEX_MAX_INPUT_BYTES")
+                ),
+                "{shown} must be refused as InvalidInput naming the variable"
             );
         };
         for raw in ["", "abc", "0", "-5", " 42", "16MiB", "18446744073709551616"] {

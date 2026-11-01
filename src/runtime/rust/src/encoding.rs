@@ -1,7 +1,7 @@
 //! Encoding kernels for Ipe.Encoding — base64 / url-percent / hex.
 //! Each fn backs an Ipê-side signature declared in `src/stdlib/Ipe/Encoding.ipe`.
 
-use super::IpeResult;
+use super::{FromIpeError, IpeError, IpeResult};
 
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
@@ -1816,15 +1816,39 @@ pub fn base64_encode(s: String) -> String {
 /// `base64Decode (base64Encode s) == Ok s` for every `String s`. Non-UTF-8
 /// payloads surface as `Err` (raw-byte round-tripping lives on `Ipe.Bytes`).
 #[must_use]
-pub fn base64_decode<E: From<String>>(s: String) -> IpeResult<E, String> {
+pub fn base64_decode<E: FromIpeError>(s: String) -> IpeResult<E, String> {
     match B64.decode(s.as_bytes()) {
         Ok(bytes) => match String::from_utf8(bytes) {
             Ok(text) => IpeResult::Ok(text),
-            Err(e) => {
-                IpeResult::Err(format!("base64: decoded bytes are not valid UTF-8: {e}").into())
-            }
+            Err(e) => IpeResult::Err(decode_refused(format!(
+                "base64: decoded bytes are not valid UTF-8: {}",
+                e.utf8_error()
+            ))),
         },
-        Err(e) => IpeResult::Err(format!("base64: {e}").into()),
+        Err(e) => IpeResult::Err(decode_refused(base64_refusal(&e))),
+    }
+}
+
+/// The `Decode` error for a refused decode, carrying `message`.
+fn decode_refused<E: FromIpeError>(message: String) -> E {
+    E::from_ipe_error(IpeError::decode(message))
+}
+
+/// The message for a refused base64 input, naming the failure and its offset.
+///
+/// The crate's own message quotes the offending symbol; this names its offset only.
+fn base64_refusal(error: &base64::DecodeError) -> String {
+    match error {
+        base64::DecodeError::InvalidByte(at, _) => {
+            format!("base64: invalid symbol at offset {at}")
+        }
+        base64::DecodeError::InvalidLength(symbols) => {
+            format!("base64: invalid length of {symbols} symbols")
+        }
+        base64::DecodeError::InvalidLastSymbol(at, _) => {
+            format!("base64: invalid last symbol at offset {at}")
+        }
+        base64::DecodeError::InvalidPadding => "base64: invalid padding".to_owned(),
     }
 }
 
@@ -1848,7 +1872,7 @@ pub fn url_encode(s: String) -> String {
 /// closed with `Err` on a malformed percent-escape, on decoded bytes that are
 /// not valid UTF-8, and on an over-cap component.
 #[must_use]
-pub fn url_decode<E: From<String>>(s: String) -> IpeResult<E, String> {
+pub fn url_decode<E: FromIpeError>(s: String) -> IpeResult<E, String> {
     decode_kernel("urlDecode", &s, UrlGrammar::Form)
 }
 
@@ -1859,19 +1883,29 @@ pub fn url_decode<E: From<String>>(s: String) -> IpeResult<E, String> {
 /// Decodes `%XX` under the path grammar (`+` stays a literal `+`) through
 /// `decode_component`, refusing exactly what `url_decode` refuses.
 #[must_use]
-pub fn path_decode<E: From<String>>(s: String) -> IpeResult<E, String> {
+pub fn path_decode<E: FromIpeError>(s: String) -> IpeResult<E, String> {
     decode_kernel("percentDecode", &s, UrlGrammar::Path)
 }
 
 /// Run `decode_component` for the kernel `name`, rendering a refusal as its error.
-fn decode_kernel<E: From<String>>(
+///
+/// A malformed component is `Decode`; one past the length cap is `LimitExceeded`.
+fn decode_kernel<E: FromIpeError>(
     name: &str,
     s: &str,
     grammar: UrlGrammar,
 ) -> IpeResult<E, String> {
     match decode_component(s, grammar) {
         Ok(text) => IpeResult::Ok(text),
-        Err(refusal) => IpeResult::Err(format!("{name}: {refusal}").into()),
+        Err(refusal) => {
+            let message = format!("{name}: {refusal}");
+            IpeResult::Err(E::from_ipe_error(match refusal {
+                DecodeRefusal::MalformedEscape { .. } | DecodeRefusal::InvalidUtf8 { .. } => {
+                    IpeError::decode(message)
+                }
+                DecodeRefusal::TooLong { .. } => IpeError::limit_exceeded(message),
+            }))
+        }
     }
 }
 
@@ -1890,15 +1924,29 @@ pub fn encoding_hex_encode(s: String) -> String {
 /// round-trip arbitrary bytes. (jwt.rs owns its own `hex::decode` on raw
 /// `&[u8]` and never routes through this kernel.)
 #[must_use]
-pub fn encoding_hex_decode<E: From<String>>(s: String) -> IpeResult<E, String> {
+pub fn encoding_hex_decode<E: FromIpeError>(s: String) -> IpeResult<E, String> {
     match hex::decode(&s) {
         Ok(bytes) => match String::from_utf8(bytes) {
             Ok(text) => IpeResult::Ok(text),
-            Err(e) => {
-                IpeResult::Err(format!("hexDecode: decoded bytes are not valid UTF-8: {e}").into())
-            }
+            Err(e) => IpeResult::Err(decode_refused(format!(
+                "hexDecode: decoded bytes are not valid UTF-8: {}",
+                e.utf8_error()
+            ))),
         },
-        Err(e) => IpeResult::Err(format!("hexDecode: {e}").into()),
+        Err(e) => IpeResult::Err(decode_refused(hex_refusal(e))),
+    }
+}
+
+/// The message for a refused hex input, naming the failure and its index.
+///
+/// The crate's own message quotes the offending character; this names its index only.
+fn hex_refusal(error: hex::FromHexError) -> String {
+    match error {
+        hex::FromHexError::InvalidHexCharacter { index, .. } => {
+            format!("hexDecode: invalid hex character at index {index}")
+        }
+        hex::FromHexError::OddLength => "hexDecode: odd number of hex digits".to_owned(),
+        hex::FromHexError::InvalidStringLength => "hexDecode: invalid string length".to_owned(),
     }
 }
 
@@ -1906,13 +1954,13 @@ pub fn encoding_hex_decode<E: From<String>>(s: String) -> IpeResult<E, String> {
 //
 // The generic `base64_decode<E>`, `url_decode<E>`, `path_decode<E>`,
 // `encoding_hex_decode<E>` above
-// use a flexible `E: From<String>` bound so the error type can be inferred from
+// use a flexible `E: FromIpeError` bound so the error type can be inferred from
 // surrounding context. Generated Ipê code sets `IpeError = ipe_runtime::error::
 // IpeError`, but Rust's type inference cannot pin `E` when
 // the error arm discards the value (e.g. `Err _ ->` in a case expression).
 // These concrete aliases pin `E = IpeError` up-front, eliminating the
-// ambiguity without changing the runtime semantics — construction still
-// routes through `IpeError: From<String>` (classified `Unexpected`).
+// ambiguity without changing the runtime semantics — each failure keeps the
+// kind its kernel names.
 
 /// Generated-code alias for `base64_decode` with `E = IpeError`.
 #[must_use]
@@ -2331,10 +2379,14 @@ mod tests {
             "%G0",
             "bad-utf8-%C0",
         ] {
-            let got: IpeResult<String, String> = path_decode(bad.to_string());
+            let got: IpeResult<IpeError, String> = path_decode(bad.to_string());
             assert!(
-                matches!(got, IpeResult::Err(ref e) if e.starts_with("percentDecode: ")),
-                "malformed input {bad:?} must be rejected by percentDecode"
+                matches!(
+                    &got,
+                    IpeResult::Err(IpeError::Error(crate::IpeErrorKind::Decode, info))
+                        if info.message.starts_with("percentDecode: ")
+                ),
+                "malformed input {bad:?} must be a Decode refusal from percentDecode"
             );
         }
     }
@@ -2345,6 +2397,61 @@ mod tests {
         assert_eq!(encoded, "486921");
         let decoded: IpeResult<String, String> = encoding_hex_decode(encoded);
         assert!(matches!(decoded, IpeResult::Ok(ref s) if s == "Hi!"));
+    }
+
+    /// The `(kind, message)` of a refused decode, or `None` when it decoded.
+    fn refused(decoded: IpeResult<IpeError, String>) -> Option<(crate::IpeErrorKind, String)> {
+        match decoded {
+            IpeResult::Ok(_) => None,
+            IpeResult::Err(IpeError::Error(kind, info)) => Some((kind, info.message)),
+        }
+    }
+
+    /// A refused base64 or hex input is `Decode` naming the position, never the symbol.
+    #[test]
+    fn invalid_symbol_is_decode_without_the_symbol() {
+        let base64 = refused(base64_decode("QUJD$A==".to_owned()));
+        assert!(
+            matches!(&base64, Some((crate::IpeErrorKind::Decode, message))
+                if message.starts_with("base64: invalid symbol at offset ")
+                    && !message.contains('$')),
+            "an invalid base64 symbol must be Decode without the symbol: {base64:?}"
+        );
+        let hex = refused(encoding_hex_decode("41q2".to_owned()));
+        assert_eq!(
+            hex,
+            Some((
+                crate::IpeErrorKind::Decode,
+                "hexDecode: invalid hex character at index 2".to_owned()
+            ))
+        );
+        let odd = refused(encoding_hex_decode("414".to_owned()));
+        assert_eq!(
+            odd,
+            Some((
+                crate::IpeErrorKind::Decode,
+                "hexDecode: odd number of hex digits".to_owned()
+            ))
+        );
+        let not_text = refused(encoding_hex_decode("c0".to_owned()));
+        assert!(
+            matches!(&not_text, Some((crate::IpeErrorKind::Decode, message))
+                if message.starts_with("hexDecode: decoded bytes are not valid UTF-8")),
+            "non-UTF-8 hex must be a Decode refusal: {not_text:?}"
+        );
+    }
+
+    /// A URL component past the length cap is `LimitExceeded`.
+    #[test]
+    fn over_cap_component_is_limit_exceeded() {
+        let over = MAX_URL_COMPONENT_LEN.get().saturating_add(1);
+        let decoded = refused(url_decode("a".repeat(over)));
+        assert!(
+            matches!(&decoded, Some((crate::IpeErrorKind::LimitExceeded, message))
+                if message.starts_with("urlDecode: component longer than")),
+            "an over-cap component must be LimitExceeded: {:?}",
+            decoded.map(|(kind, _)| kind)
+        );
     }
 
     #[test]

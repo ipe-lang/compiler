@@ -94,9 +94,49 @@ pub fn config_decode_toml<E: DecodeErrorSink + 'static, T>(
     decoder: Decoder<E, T>,
 ) -> IpeResult<E, T> {
     run_decoder(
-        toml::from_str(&s).map_err(|e| format!("toml parse: {}", e)),
+        toml::from_str(&s).map_err(|e| toml_failure(&s, &e)),
         decoder,
     )
+}
+
+/// The byte cap on the parser's description in a TOML parse error.
+const TOML_MESSAGE_MAX_BYTES: usize = 256;
+
+/// The parse error for a TOML source, naming the failure and its position.
+///
+/// `toml`'s `Display` quotes the offending source line, which may hold a
+/// secret, so the message keeps only the parser's description, scrubbed and
+/// capped, and the line and column where the failure starts.
+fn toml_failure(source: &str, error: &toml::de::Error) -> String {
+    let what = error
+        .message()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let what = crate::system::scrub_log_controls_capped(&what, TOML_MESSAGE_MAX_BYTES);
+    error
+        .span()
+        .and_then(|span| line_column(source, span.start))
+        .map_or_else(
+            || format!("toml parse: {what}"),
+            |(line, column)| format!("toml parse: {what} at line {line} column {column}"),
+        )
+}
+
+/// The one-based line and character column of byte `offset` in `source`.
+///
+/// `None` when `offset` is past the end or not on a character boundary.
+fn line_column(source: &str, offset: usize) -> Option<(usize, usize)> {
+    let before = source.get(..offset)?;
+    let line = before.matches('\n').count().saturating_add(1);
+    let column = before
+        .rsplit('\n')
+        .next()
+        .map_or(0, |tail| tail.chars().count())
+        .saturating_add(1);
+    Some((line, column))
 }
 
 /// Default cap on a YAML source string parsed directly via `Config.decodeYaml`
@@ -752,6 +792,55 @@ mod load_from_file_spawn_blocking_tests {
              the blocking file read is starving the single-threaded executor \
              (spawn_blocking missing or not taking effect)"
         );
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod toml_tests {
+    use super::*;
+    use crate::json::decode_value_identity;
+
+    /// A TOML parse error is `Decode` and names its position, never the source line.
+    #[test]
+    fn toml_parse_error_does_not_echo_source_line() {
+        let decoded = config_decode_toml(
+            "ok = 1\nsecret = \"SENTINEL\n".to_owned(),
+            decode_value_identity::<crate::IpeError>(),
+        );
+        assert!(
+            matches!(
+                &decoded,
+                IpeResult::Err(crate::IpeError::Error(crate::IpeErrorKind::Decode, _))
+            ),
+            "an unterminated TOML string must be a Decode refusal"
+        );
+        let IpeResult::Err(crate::IpeError::Error(_, info)) = decoded else {
+            return;
+        };
+        assert!(
+            !info.message.contains("SENTINEL") && !info.message.contains("secret ="),
+            "the parse error must not quote the source: {:?}",
+            info.message.replace("SENTINEL", "<sentinel>")
+        );
+        assert!(
+            info.message.starts_with("toml parse: ")
+                && info.message.contains(" at line ")
+                && info.message.contains(" column "),
+            "the parse error must name its line and column: {:?}",
+            info.message
+        );
+    }
+
+    /// Positions are one-based lines and character columns; an offset off a boundary has none.
+    #[test]
+    fn line_column_counts_lines_and_characters() {
+        assert_eq!(line_column("", 0), Some((1, 1)));
+        assert_eq!(line_column("ab\ncd", 4), Some((2, 2)));
+        assert_eq!(line_column("é\nx", 3), Some((2, 1)));
+        assert_eq!(line_column("xé", 3), Some((1, 3)));
+        assert_eq!(line_column("é", 1), None);
+        assert_eq!(line_column("ab", 3), None);
     }
 }
 
