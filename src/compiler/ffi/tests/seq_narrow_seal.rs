@@ -16,9 +16,9 @@ use ipe_ffi::bindings::emit_bindings;
 use ipe_ffi::interface::crate_interface;
 use ipe_ffi::pkginfo::PkgInfo;
 
-/// One echo fn per admitted sequence shape: `(name, Ipê param, raw param,
-/// Ipê result, raw result)`.
-const ECHOES: [(&str, &str, &str, &str, &str); 7] = [
+/// One echo fn per admitted sequence or borrowed-scalar shape: `(name, Ipê
+/// param, raw param, Ipê result, raw result)`.
+const ECHOES: [(&str, &str, &str, &str, &str); 11] = [
     ("echo_i32", "List Int", "Vec<i32>", "List Int", "Vec<i64>"),
     ("echo_u16", "List Int", "&[u16]", "List Int", "Vec<i64>"),
     ("echo_i8_arr", "List Int", "[i8; 3]", "List Int", "Vec<i64>"),
@@ -38,6 +38,10 @@ const ECHOES: [(&str, &str, &str, &str, &str); 7] = [
         "List Float",
         "Vec<f64>",
     ),
+    ("echo_ref_u16", "Int", "&u16", "Int", "i64"),
+    ("echo_ref_i8", "Int", "&i8", "Int", "i64"),
+    ("echo_ref_i64", "Int", "&i64", "Int", "i64"),
+    ("echo_ref_bool", "Bool", "&bool", "Bool", "bool"),
 ];
 
 fn echo_fn(name: &str, ipe: &str, raw: &str, ipe_ret: &str, raw_ret: &str) -> serde_json::Value {
@@ -111,6 +115,10 @@ fn narrowed_sequences_admit_and_an_optional_array_over_drops() {
         "::nums::echo_u32_opt(ipe_maybe_to_option(arg0).map(|v| v.iter().map(|&x| (x).clamp(0, u32::MAX as i64) as u32).collect::<Vec<u32>>()))",
         "::nums::echo_i64(arg0.as_slice())",
         "::nums::echo_f64(arg0)",
+        "::nums::echo_ref_u16(&((arg0).clamp(0, u16::MAX as i64) as u16))",
+        "::nums::echo_ref_i8(&((arg0).clamp(i8::MIN as i64, i8::MAX as i64) as i8))",
+        "::nums::echo_ref_i64(&arg0)",
+        "::nums::echo_ref_bool(&arg0)",
         "(arg0: IpeMaybe<Vec<i64>>)",
     ] {
         assert!(out.contains(needle), "missing `{needle}` in:\n{out}");
@@ -132,6 +140,10 @@ pub fn echo_u32_opt(v: Option<Vec<u32>>) -> Vec<i64> {
 }
 pub fn echo_i64(v: &[i64]) -> Vec<i64> { v.to_vec() }
 pub fn echo_f64(v: Vec<f64>) -> Vec<f64> { v }
+pub fn echo_ref_u16(x: &u16) -> i64 { i64::from(*x) }
+pub fn echo_ref_i8(x: &i8) -> i64 { i64::from(*x) }
+pub fn echo_ref_i64(x: &i64) -> i64 { *x }
+pub fn echo_ref_bool(x: &bool) -> bool { !*x }
 ";
 
 /// The app crate. The emitted bindings' preamble is `use crate::*;`, so the
@@ -206,6 +218,14 @@ fn main() {
     let want_f = vec![0.0_f64, 1.5, f64::INFINITY, f64::NEG_INFINITY];
     if narrowed != want_f { eprintln!("f32: got {narrowed:?}"); std::process::exit(1) }
     if ok(ffi::nums_echo_f64(floats.clone()), "f64") != floats { eprintln!("f64 identity"); std::process::exit(1) }
+    for (x, w) in [(70000, 65535), (-5, 0), (7, 7)] {
+        if ok(ffi::nums_echo_ref_u16(x), "ref u16") != w { eprintln!("ref u16 {x}"); std::process::exit(1) }
+    }
+    for (x, w) in [(-300, -128), (300, 127), (-7, -7)] {
+        if ok(ffi::nums_echo_ref_i8(x), "ref i8") != w { eprintln!("ref i8 {x}"); std::process::exit(1) }
+    }
+    if ok(ffi::nums_echo_ref_i64(i64::MIN), "ref i64") != i64::MIN { eprintln!("ref i64"); std::process::exit(1) }
+    if ok(ffi::nums_echo_ref_bool(true), "ref bool") { eprintln!("ref bool"); std::process::exit(1) }
     println!("ok");
 }
 "#;

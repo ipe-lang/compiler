@@ -394,6 +394,8 @@ pub enum Uncoercible {
     NestedNumeric,
     /// A slice or array in an owned position (a field value or ctor argument).
     BorrowedOrArrayOwned,
+    /// `&mut` over a scalar: the foreign write would land on a temporary.
+    MutableScalarBorrow,
 }
 
 impl Uncoercible {
@@ -410,6 +412,9 @@ impl Uncoercible {
             }
             Self::BorrowedOrArrayOwned => {
                 "slice or array in an owned position has no total element coercion"
+            }
+            Self::MutableScalarBorrow => {
+                "mutable borrow of a scalar parameter has no Ipê lowering (the write is lost)"
             }
         }
     }
@@ -495,10 +500,10 @@ fn optional_owned_elems(base: &str, elem: &ForeignElem) -> String {
     }
 }
 
-/// The one renderer of every sequence-typed call argument `base` (slot `j`)
-/// into the raw foreign type `raw`.
+/// The one renderer of every sequence-typed or borrowed-scalar call argument
+/// `base` (slot `j`) into the raw foreign type `raw`.
 ///
-/// `Ok(None)` when `raw` is not a sequence-carrying shape (the scalar paths
+/// `Ok(None)` when `raw` is neither (the by-value scalar paths
 /// own it); `Err` for a shape no coercion renders. A `Num(w)` element of a
 /// non-carrier width never reaches the call as the raw carrier: every element
 /// goes through [`narrowed_vec`], i.e. [`num_saturate`]. The interface
@@ -508,6 +513,9 @@ fn seq_param_coercion(j: usize, base: &str, raw: &str) -> Result<Option<SeqArg>,
     let raw = raw.trim();
     if NumWidth::parse(raw).is_some() {
         return Ok(None);
+    }
+    if let Some(arg) = scalar_ref_coercion(base, raw)? {
+        return Ok(Some(arg));
     }
     if let Some(seq) = foreign_seq(raw) {
         let owned = owned_elems(base, &seq.elem);
@@ -545,6 +553,33 @@ fn seq_param_coercion(j: usize, base: &str, raw: &str) -> Result<Option<SeqArg>,
         return Err(Uncoercible::NestedNumeric);
     }
     Ok(None)
+}
+
+/// A borrowed scalar parameter (`&u16`, `&i64`, `&bool`): the wrapper takes the
+/// carrier by value, so the call site narrows it through [`num_saturate`] and
+/// lends the narrowed value. A `&mut` scalar is refused: the foreign write
+/// would land on a temporary Ipê never sees.
+///
+/// `Ok(None)` when `raw` is not a borrowed scalar.
+fn scalar_ref_coercion(base: &str, raw: &str) -> Result<Option<SeqArg>, Uncoercible> {
+    let Some(pointee) = raw.strip_prefix('&').map(str::trim_start) else {
+        return Ok(None);
+    };
+    let (mutable, pointee) = pointee
+        .strip_prefix("mut ")
+        .map_or((false, pointee), |p| (true, p));
+    let pointee = pointee.trim();
+    let width = NumWidth::parse(pointee);
+    if width.is_none() && !matches!(pointee, "bool" | "char") {
+        return Ok(None);
+    }
+    if mutable {
+        return Err(Uncoercible::MutableScalarBorrow);
+    }
+    Ok(Some(SeqArg::inline(match width {
+        Some(w) if !w.is_carrier() => format!("&({})", num_saturate(w, base)),
+        Some(_) | None => format!("&{base}"),
+    })))
 }
 
 /// True when a non-carrier numeric width sits as an element of a std
@@ -2732,6 +2767,38 @@ mod tests {
             assert!(seq_param_coercion(0, "arg0", raw).is_ok(), "{raw}");
             assert!(foreign_param_is_coercible(raw), "{raw}");
         }
+    }
+
+    #[test]
+    fn a_borrowed_scalar_param_lends_the_narrowed_value_and_a_mutable_one_is_refused() {
+        let call = |raw: &str| {
+            seq_param_coercion(0, "arg0", raw)
+                .expect("renders")
+                .expect("is a borrowed scalar")
+                .call
+        };
+        for w in NumWidth::ALL {
+            let raw = format!("&{}", w.rust());
+            let want = if w.is_carrier() {
+                "&arg0".to_owned()
+            } else {
+                format!("&({})", num_saturate(w, "arg0"))
+            };
+            assert_eq!(call(&raw), want, "{raw}");
+            assert!(foreign_param_is_coercible(&raw), "{raw}");
+        }
+        assert_eq!(call("&bool"), "&arg0");
+        assert_eq!(call("&char"), "&arg0");
+        for raw in ["&mut i64", "&mut u32", "&mut bool"] {
+            assert_eq!(
+                seq_param_coercion(0, "arg0", raw),
+                Err(Uncoercible::MutableScalarBorrow),
+                "{raw}"
+            );
+            assert!(!foreign_param_is_coercible(raw), "{raw}");
+        }
+        assert_eq!(seq_param_coercion(0, "arg0", "&str"), Ok(None));
+        assert_eq!(seq_param_coercion(0, "arg0", "&Point"), Ok(None));
     }
 
     #[test]
