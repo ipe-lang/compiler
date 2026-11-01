@@ -231,10 +231,10 @@ fn unparen(st: &str) -> &str {
     for c in inner.chars() {
         match c {
             '(' => depth = depth.saturating_add(1),
-            // The opening paren closes before the end: `(A) -> (B)`.
-            ')' if depth == 0 => return t,
+            // The opening paren closes before the end (`(A) -> (B)`), or a
+            // top-level comma makes it a tuple.
+            ')' | ',' if depth == 0 => return t,
             ')' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => return t,
             _ => {}
         }
     }
@@ -424,7 +424,7 @@ struct SeqArg {
 }
 
 impl SeqArg {
-    fn inline(call: String) -> Self {
+    const fn inline(call: String) -> Self {
         Self {
             prelude: None,
             call,
