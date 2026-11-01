@@ -720,26 +720,38 @@ enum RootRef {
     Reexported { provider: String },
     /// `<seg>` is an item the emitted `mod.rs` itself defines, unconditionally.
     RootItem,
+    /// Two or more root globs each define `<seg>`: rustc refuses the reference
+    /// as ambiguous (E0659) whichever modules are declared.
+    Ambiguous,
     /// No root name is `<seg>`: the emitted crate cannot resolve the reference.
     Unresolved,
 }
 
 impl RootRef {
     /// The module the emitted `mod.rs` must declare for the reference to build,
-    /// `None` only for a root item. An unresolved `seg` stays its own dep — no
-    /// runtime module bears that name, so no declared set contains it and the
-    /// closure check fires.
+    /// `None` only for a root item. An ambiguous or unresolved `seg` stays its
+    /// own dep — [`RootScope::resolve`] returns [`RootRef::Module`] for every
+    /// declared name, so no declared set contains it and the closure check fires.
     fn dep(self, seg: &str) -> Option<String> {
         match self {
             Self::Module(m) | Self::Reexported { provider: m } => Some(m),
             Self::RootItem => None,
-            Self::Unresolved => Some(seg.to_owned()),
+            Self::Ambiguous | Self::Unresolved => Some(seg.to_owned()),
         }
     }
 }
 
 /// Each module path's top-level definitions, memoised across masks.
 type DefCache = HashMap<Vec<String>, BTreeSet<String>>;
+
+/// One `pub use <path>::<item>;` (or `<item> as <alias>`) root re-export.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NamedReexport {
+    /// The module path, segment by segment; `path[0]` is the providing module.
+    path: Vec<String>,
+    /// The item's name in `<path>` (before any `as`).
+    item: String,
+}
 
 /// The root names one emitted `ipe_runtime/mod.rs` supplies: its declared
 /// modules, its unconditional re-exports, and the items it defines itself.
@@ -749,8 +761,8 @@ struct RootScope<'a> {
     /// `pub use <path>::*;` — each glob's module path, segment by segment.
     globs: Vec<Vec<String>>,
     /// `pub use <path>::{a, b as c};` / `pub use <path>::a;` — each exported
-    /// name and the top-level module of its `<path>`.
-    named: HashMap<String, String>,
+    /// name and the item it re-exports.
+    named: HashMap<String, NamedReexport>,
     root_items: BTreeSet<String>,
 }
 
@@ -783,24 +795,39 @@ impl<'a> RootScope<'a> {
         if self.root_items.contains(seg) {
             return RootRef::RootItem;
         }
-        if let Some(provider) = self.named.get(seg) {
-            return RootRef::Reexported {
-                provider: provider.clone(),
+        if let Some(named) = self.named.get(seg) {
+            // A named re-export shadows every glob, so it alone decides `seg`:
+            // an item `<path>` does not define makes the `pub use` itself E0432.
+            let items = defs
+                .entry(named.path.clone())
+                .or_insert_with(|| module_definitions(self.runtime_root, &named.path));
+            return match named.path.first() {
+                Some(top) if items.contains(&named.item) => RootRef::Reexported {
+                    provider: top.clone(),
+                },
+                _ => RootRef::Unresolved,
             };
         }
+        let mut providers = BTreeSet::new();
         for path in &self.globs {
             let items = defs
                 .entry(path.clone())
                 .or_insert_with(|| module_definitions(self.runtime_root, path));
-            if items.contains(seg)
-                && let Some(top) = path.first()
-            {
-                return RootRef::Reexported {
-                    provider: top.clone(),
-                };
+            if items.contains(seg) {
+                providers.insert(path.clone());
             }
         }
-        RootRef::Unresolved
+        let mut providers = providers.into_iter();
+        match (providers.next(), providers.next()) {
+            (Some(path), None) => {
+                path.first()
+                    .map_or(RootRef::Unresolved, |top| RootRef::Reexported {
+                        provider: top.clone(),
+                    })
+            }
+            (Some(_), Some(_)) => RootRef::Ambiguous,
+            (None, _) => RootRef::Unresolved,
+        }
     }
 
     /// The module each raw `crate::<seg>` reference needs declared, paired
@@ -818,16 +845,20 @@ impl<'a> RootScope<'a> {
 
 /// Every depth-0 `pub use …;` statement of a `mod.rs`, joined onto one line,
 /// that no `#[cfg(..)]` attribute gates. A gated re-export does not hold in
-/// every build, so it supplies no name unconditionally (`#[cfg(not(..))]`
-/// holds in the base build, as in [`cfg_gated_child_modules`]).
+/// every build, so it supplies no name unconditionally — `#[cfg(not(..))]`
+/// included: it drops the re-export whenever its predicate's feature or target
+/// is on (a wasm32 build, a feature-on mask). A multi-line attribute is
+/// consumed whole, and a trailing `//` comment is not part of the statement.
 fn unconditional_root_uses(mod_rs: &str) -> Vec<String> {
     let src = blank_literals(mod_rs);
     let mut out = Vec::new();
     let mut depth: i32 = 0;
     let mut cfg_pending = false;
+    // Bracket balance of a multi-line attribute still open.
+    let mut attr_open: i32 = 0;
     let mut open: Option<(String, bool)> = None;
     for line in src.lines() {
-        let t = line.trim();
+        let t = line.split_once("//").map_or(line, |(code, _)| code).trim();
         if let Some((mut stmt, gated)) = open.take() {
             stmt.push(' ');
             stmt.push_str(t);
@@ -839,11 +870,18 @@ fn unconditional_root_uses(mod_rs: &str) -> Vec<String> {
             continue;
         }
         if depth == 0 {
-            if t.starts_with("#[cfg(") && !t.starts_with("#[cfg(not(") {
-                cfg_pending = true;
+            if attr_open > 0 {
+                attr_open = (attr_open + bracket_delta(t)).max(0);
                 continue;
             }
-            if t.starts_with("#[") || t.starts_with("//") || t.is_empty() {
+            if t.starts_with("#[") {
+                if t.starts_with("#[cfg(") {
+                    cfg_pending = true;
+                }
+                attr_open = bracket_delta(t).max(0);
+                continue;
+            }
+            if t.is_empty() {
                 continue;
             }
             let gated = std::mem::take(&mut cfg_pending);
@@ -861,10 +899,23 @@ fn unconditional_root_uses(mod_rs: &str) -> Vec<String> {
     out
 }
 
+/// The net `[` minus `]` count of one [`blank_literals`] line.
+fn bracket_delta(s: &str) -> i32 {
+    s.chars().fold(0, |n, c| match c {
+        '[' => n + 1,
+        ']' => n - 1,
+        _ => n,
+    })
+}
+
 /// Record one `pub use <path>::…;` statement as a glob or as named exports.
 /// A path of one segment (`pub use foo;`) names no runtime module and is
 /// skipped.
-fn parse_root_use(stmt: &str, globs: &mut Vec<Vec<String>>, named: &mut HashMap<String, String>) {
+fn parse_root_use(
+    stmt: &str,
+    globs: &mut Vec<Vec<String>>,
+    named: &mut HashMap<String, NamedReexport>,
+) {
     let Some(body) = stmt
         .strip_prefix("pub use ")
         .and_then(|s| s.trim().strip_suffix(';'))
@@ -890,23 +941,49 @@ fn parse_root_use(stmt: &str, globs: &mut Vec<Vec<String>>, named: &mut HashMap<
             None => return,
         },
     };
-    let Some(top) = segs_of(path).into_iter().next() else {
+    let path = segs_of(path);
+    if path.is_empty() {
         return;
-    };
+    }
     for entry in entries {
         let words: Vec<&str> = entry.split_whitespace().collect();
-        let exported = match words.as_slice() {
-            [_, "as", alias] => *alias,
-            [item] => item.rsplit("::").next().unwrap_or(item),
+        let (item, exported) = match words.as_slice() {
+            [item, "as", alias] => (*item, *alias),
+            [item] => (*item, *item),
             _ => continue,
         };
-        named.insert(exported.to_owned(), top.clone());
+        // `a::B` inside a brace list nests a path: its item lives one module
+        // further down.
+        let mut item_path = path.clone();
+        let mut item_segs = segs_of(item);
+        let Some(item) = item_segs.pop() else {
+            continue;
+        };
+        item_path.extend(item_segs);
+        let exported = exported.rsplit("::").next().unwrap_or(exported);
+        named.insert(
+            exported.to_owned(),
+            NamedReexport {
+                path: item_path,
+                item,
+            },
+        );
     }
 }
 
 /// The top-level definitions of the runtime module at `path` (segments under
-/// the runtime root), read from `<path>.rs` and `<path>/mod.rs`.
+/// the runtime root), read from `<path>.rs` and `<path>/mod.rs`. A nested
+/// module whose `mod` declaration in its parent is cfg-gated supplies none.
 fn module_definitions(runtime_root: &Path, path: &[String]) -> BTreeSet<String> {
+    let mut parent = runtime_root.to_path_buf();
+    for seg in path {
+        if parent != runtime_root
+            && dir_child_declarations(&parent, &parent.with_extension("rs")).contains(seg)
+        {
+            return BTreeSet::new();
+        }
+        parent.push(seg);
+    }
     let rel: std::path::PathBuf = path.iter().collect();
     let flat = runtime_root.join(&rel).with_extension("rs");
     let dir_mod = runtime_root.join(&rel).join("mod.rs");
@@ -918,8 +995,9 @@ fn module_definitions(runtime_root: &Path, path: &[String]) -> BTreeSet<String> 
 }
 
 /// The names of the `pub`/`pub(crate)` items defined at brace depth 0 of a
-/// [`blank_literals`] source that no `#[cfg(..)]` attribute gates
-/// (`#[cfg(not(..))]` holds in the base build): `struct`, `enum`, `union`,
+/// [`blank_literals`] source that no `#[cfg(..)]` attribute gates —
+/// `#[cfg(not(..))]` included, as it drops the item under a wasm32 build or a
+/// feature-on mask: `struct`, `enum`, `union`,
 /// `fn` (`const`/`async`/`extern` too), `type`, `trait`, `const`, `static`,
 /// `mod`. A nested `pub use` or a `macro_rules!` supplies no name here, so a
 /// reference only they could satisfy stays unresolved — the check fails
@@ -941,22 +1019,15 @@ fn top_level_definitions(src: &str) -> BTreeSet<String> {
         if !at_root || t.starts_with("//") || t.is_empty() {
             continue;
         }
-        let brackets = |s: &str| -> i32 {
-            s.chars().fold(0, |n, c| match c {
-                '[' => n + 1,
-                ']' => n - 1,
-                _ => n,
-            })
-        };
         if attr_open > 0 {
-            attr_open = (attr_open + brackets(t)).max(0);
+            attr_open = (attr_open + bracket_delta(t)).max(0);
             continue;
         }
         if t.starts_with("#[") {
-            if t.starts_with("#[cfg(") && !t.starts_with("#[cfg(not(") {
+            if t.starts_with("#[cfg(") {
                 cfg_pending = true;
             }
-            attr_open = brackets(t).max(0);
+            attr_open = bracket_delta(t).max(0);
             continue;
         }
         let gated = std::mem::take(&mut cfg_pending);
@@ -1715,14 +1786,22 @@ fn root_scope_fixture(tag: &str) -> std::path::PathBuf {
         "ipe_modset_closure_root_scope_{tag}_{}",
         std::process::id()
     ));
-    std::fs::create_dir_all(&root).expect("create fixture root");
+    std::fs::create_dir_all(root.join("outer")).expect("create fixture root");
     let files = [
         (
             "error.rs",
             "/// A host failure.\n#[derive(Debug)]\npub struct IoFailure {\n    kind: u8,\n}\n\
              #[cfg(feature = \"x\")]\npub struct Gated;\n\
+             #[cfg(not(target_arch = \"wasm32\"))]\npub struct NativeOnly;\n\
              mod inner {\n    pub struct Nested;\n}\n",
         ),
+        ("io.rs", "pub struct IoFailure;\n"),
+        (
+            "outer/mod.rs",
+            "#[cfg(feature = \"x\")]\npub mod inner;\npub mod open;\n",
+        ),
+        ("outer/inner.rs", "pub struct Deep;\n"),
+        ("outer/open.rs", "pub struct Shallow;\n"),
         ("csv.rs", "pub fn read() {}\n"),
         (
             "retained.rs",
@@ -1733,6 +1812,98 @@ fn root_scope_fixture(tag: &str) -> std::path::PathBuf {
         std::fs::write(root.join(name), src).expect("write fixture file");
     }
     root
+}
+
+/// Every root name rustc would refuse stays unresolved, never a passing dep:
+/// an item only a `#[cfg(not(..))]` defines (absent from a wasm32 build), a
+/// name two globs both define (E0659), a re-export behind a multi-line cfg
+/// attribute, a named re-export of an item its module lacks (E0432), and a
+/// glob over a nested module its parent declares under a cfg.
+#[test]
+fn root_scope_refuses_names_rustc_cannot_resolve() {
+    let root = root_scope_fixture("unsound");
+    let mut defs = DefCache::new();
+    let cfg_not = RootScope::new(&root, "pub mod error;\npub use error::*;\n")
+        .resolve("NativeOnly", &mut defs);
+    let ambiguous = RootScope::new(
+        &root,
+        "pub mod error;\npub mod io;\npub use error::*;\npub use io::*;\n",
+    )
+    .resolve("IoFailure", &mut defs);
+    let multi_line_cfg = RootScope::new(
+        &root,
+        "pub mod error;\n#[cfg(any(\n    feature = \"x\",\n    feature = \"y\",\n))]\n\
+         pub use error::*;\n",
+    )
+    .resolve("IoFailure", &mut defs);
+    let missing_item = RootScope::new(
+        &root,
+        "pub mod retained;\npub use retained::{Bytes, Gone as Held};\n",
+    )
+    .resolve("Held", &mut defs);
+    let gated_nested = RootScope::new(&root, "pub mod outer;\npub use outer::inner::*;\n")
+        .resolve("Deep", &mut defs);
+    let open_nested = RootScope::new(&root, "pub mod outer;\npub use outer::open::*;\n")
+        .resolve("Shallow", &mut defs);
+    let commented = RootScope::new(
+        &root,
+        "pub mod error;\npub use error::*; // the error kinds\n",
+    )
+    .resolve("IoFailure", &mut defs);
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert_eq!(
+        cfg_not,
+        RootRef::Unresolved,
+        "a `#[cfg(not(..))]` item is absent under its predicate, so it is not unconditional"
+    );
+    assert_eq!(
+        ambiguous,
+        RootRef::Ambiguous,
+        "two globs defining one name make `crate::<name>` E0659"
+    );
+    assert_eq!(
+        multi_line_cfg,
+        RootRef::Unresolved,
+        "a re-export behind a multi-line cfg attribute is gated"
+    );
+    assert_eq!(
+        missing_item,
+        RootRef::Unresolved,
+        "a named re-export of an item its module does not define supplies nothing"
+    );
+    assert_eq!(
+        gated_nested,
+        RootRef::Unresolved,
+        "a glob over a cfg-declared nested module supplies nothing unconditionally"
+    );
+    let outer = RootRef::Reexported {
+        provider: "outer".to_owned(),
+    };
+    assert_eq!(
+        open_nested, outer,
+        "an ungated nested module still supplies"
+    );
+    assert_eq!(
+        commented,
+        RootRef::Reexported {
+            provider: "error".to_owned()
+        },
+        "a trailing comment does not hide the re-export"
+    );
+    for refused in [
+        cfg_not,
+        ambiguous,
+        multi_line_cfg,
+        missing_item,
+        gated_nested,
+    ] {
+        assert_eq!(
+            refused.dep("Probe").as_deref(),
+            Some("Probe"),
+            "a refused name stays its own (never declared) dep"
+        );
+    }
 }
 
 /// A `crate::<Type>::…` path resolves to the module whose root re-export
