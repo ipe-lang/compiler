@@ -124,6 +124,32 @@ pub fn decode_err_str<E: crate::DecodeErrorSink, T>(s: String) -> IpeResult<E, T
     IpeResult::Err(E::from_decode_failure(s))
 }
 
+/// The single source for a json decode failure: a typed kind plus a
+/// position, never the input text.
+///
+/// `Category::Syntax` and `Category::Eof` carry no input bytes in their
+/// `Display` — a fixed grammar phrase plus a line and column — so it is kept
+/// verbatim. `Category::Data`'s `Display` quotes the offending value (a type
+/// mismatch names the mistyped field's value), so only the position
+/// survives. `Category::Io` wraps a host `std::io::Error` raised by the
+/// reader a caller supplied; it is classified through the io table rather
+/// than forced to `Decode`.
+pub(crate) fn json_failure(error: &serde_json::Error) -> IpeError {
+    use serde_json::error::Category;
+    match error.classify() {
+        Category::Syntax | Category::Eof => IpeError::decode(format!("json parse: {error}")),
+        Category::Data => IpeError::decode(format!(
+            "json parse: invalid value at line {} column {}",
+            error.line(),
+            error.column()
+        )),
+        Category::Io => {
+            let kind = error.io_error_kind().unwrap_or(std::io::ErrorKind::Other);
+            IoFailure::without_path("json parse", &std::io::Error::from(kind)).into()
+        }
+    }
+}
+
 // --- Encode ---
 /// `Json.Encode.encode`: `indent` 0 (or below) is compact JSON, `N` is
 /// `N`-space pretty JSON with the width saturating at
@@ -854,7 +880,10 @@ pub fn decode_from_json_string<E: crate::DecodeErrorSink + 'static, T>(
 ) -> IpeResult<E, T> {
     match serde_json::from_str(&json) {
         Ok(val) => (decoder.run)(&val),
-        Err(e) => decode_err_str(format!("json parse: {}", e)),
+        Err(e) => {
+            let IpeError::Error(_, info) = json_failure(&e);
+            decode_err_str(info.message)
+        }
     }
 }
 
@@ -1617,6 +1646,52 @@ mod enc_tests {
             "output unexpectedly large ({} bytes)",
             out.len()
         );
+    }
+
+    /// `Category::Data` is a type mismatch whose `Display` quotes the
+    /// offending value — `json_failure` must keep only the position, never
+    /// that value, so a decode failure can never echo input content (e.g. a
+    /// secret) back into a log or diagnostic.
+    #[test]
+    fn json_data_error_does_not_echo_value() {
+        let err = serde_json::from_str::<i64>("\"SENTINEL\"")
+            .expect_err("a JSON string is not a valid i64");
+        assert!(
+            matches!(err.classify(), serde_json::error::Category::Data),
+            "{err:?}"
+        );
+        let IpeError::Error(kind, info) = json_failure(&err);
+        assert!(matches!(kind, crate::IpeErrorKind::Decode), "{kind:?}");
+        assert!(
+            !info.message.contains("SENTINEL"),
+            "decode message echoed the input value: {}",
+            info.message
+        );
+    }
+
+    /// A `Category::Io` failure wraps a host `std::io::Error` raised by the
+    /// reader a caller supplied; `json_failure` must classify it through the
+    /// shared io table rather than forcing `Decode`.
+    struct FailingReader;
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "simulated io failure",
+            ))
+        }
+    }
+
+    #[test]
+    fn json_io_category_uses_io_table() {
+        let err = serde_json::from_reader::<_, serde_json::Value>(FailingReader)
+            .expect_err("the reader always fails");
+        assert!(
+            matches!(err.classify(), serde_json::error::Category::Io),
+            "{err:?}"
+        );
+        let IpeError::Error(kind, _) = json_failure(&err);
+        assert_eq!(kind, io_error_kind(std::io::ErrorKind::TimedOut));
     }
 }
 
