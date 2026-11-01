@@ -63,7 +63,7 @@ pub fn debug_log<T: IpeStringify>(label: String, value: T) -> T {
 /// runtime.  `note` is the developer-supplied string argument.
 pub fn debug_todo<A>(location: String, note: String) -> A {
     crate::system::write_stderr_line(&format!("TODO at {location}: {note}"));
-    crate::system::system_exit(1)
+    crate::system::exit_process(crate::system::ProcessStatus::FAILURE)
 }
 
 #[cfg(test)]

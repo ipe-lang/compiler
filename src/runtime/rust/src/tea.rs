@@ -839,17 +839,12 @@ pub(crate) enum CliEvent<M> {
     Key(String, String, InputPermit),
     /// The terminal interrupt (Ctrl-C) read as a key in raw mode, where the OS
     /// no longer turns it into a signal; it ends the program with
-    /// [`INTERRUPT_EXIT_CODE`]. Constructed only by the `tui` raw-key reader.
+    /// [`ProcessStatus::INTERRUPTED`](crate::system::ProcessStatus::INTERRUPTED). Constructed only by the `tui` raw-key reader.
     Interrupt,
     Msg(M),
     PerformDone(M),
     Eof,
 }
-
-/// The exit status of a program the terminal interrupt ends: 128 + `SIGINT`,
-/// what a shell reports for a program stopped by Ctrl-C.
-#[cfg(all(not(target_arch = "wasm32"), feature = "tui"))]
-pub(crate) const INTERRUPT_EXIT_CODE: i32 = 130;
 
 /// The most terminal input events the loop may hold queued but not yet taken.
 ///
@@ -1331,7 +1326,7 @@ where
                 CliEvent::Key(..) => continue, // Cli has no keys
                 CliEvent::Interrupt => {
                     submgr.stop_all();
-                    crate::system::exit_process(INTERRUPT_EXIT_CODE)
+                    crate::system::exit_process(crate::system::ProcessStatus::INTERRUPTED)
                 }
                 CliEvent::Msg(m) => vec![m],
                 CliEvent::PerformDone(m) => {

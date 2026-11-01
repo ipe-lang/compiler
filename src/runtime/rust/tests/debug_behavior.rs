@@ -3,7 +3,7 @@
 //! - `Debug.explain : Attribute msg` — a depth-aware debug overlay emitted on
 //!   the parent element and propagated to every descendant via the renderer.
 //! - `Debug.todo : String -> a` — writes `TODO at <file>:<line>: <note>` to
-//!   stderr and exits non-zero via `system_exit`, never via `panic!`.
+//!   stderr and exits non-zero via `exit_process`, never via `panic!`.
 
 // ── Test 4: Debug.explain outline on parent AND nested child ─────────────────
 
@@ -56,9 +56,9 @@ fn explain_outline_emitted_on_parent_and_nested_child() {
 const SUBPROCESS_SENTINEL: &str = "IPE_DEBUG_TODO_SUBPROCESS";
 
 /// Called only in the child process (when `SUBPROCESS_SENTINEL` is set).
-/// `debug_todo` diverges via `system_exit`; the child process never returns.
+/// `debug_todo` diverges via `exit_process`; the child process never returns.
 /// The return type is `()` because `debug_todo<A>` is generic over `A` and
-/// the divergence is supplied by `system_exit(1)` inside the runtime.
+/// the divergence is supplied by `exit_process(ProcessStatus::FAILURE)` inside the runtime.
 fn run_todo_subprocess() {
     ipe_runtime_rust::debug_todo::<()>("testfile.ipe:42".to_owned(), "subprocess note".to_owned())
 }
@@ -72,7 +72,7 @@ fn run_todo_subprocess() {
 /// inside the child, then the parent inspects the child's stderr and exit code.
 #[test]
 fn todo_writes_located_message_to_stderr_and_exits_nonzero() {
-    // Guard: if we are the subprocess, run the todo — `system_exit` terminates
+    // Guard: if we are the subprocess, run the todo — `exit_process` terminates
     // the child process.  The test runner never reaches this in the parent.
     #[expect(
         clippy::disallowed_methods,
