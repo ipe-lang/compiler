@@ -1709,6 +1709,7 @@ fn scanner_ignores_bare_crate_item_without_module_path() {
 /// A runtime-root fixture for the [`RootScope`] resolver tests: `error.rs`
 /// defines `IoFailure` unconditionally and `Gated` only under a cfg, and
 /// `csv.rs` and `retained.rs` exist. Returns the root; the caller removes it.
+#[allow(clippy::expect_used)] // test scaffolding: a temp fixture write cannot be skipped
 fn root_scope_fixture(tag: &str) -> std::path::PathBuf {
     let root = ipe_test_temp::temp_root().join(format!(
         "ipe_modset_closure_root_scope_{tag}_{}",
@@ -1758,8 +1759,8 @@ fn root_scope_resolves_a_crate_item_path_to_its_providing_module() {
     crate_refs_in_line("crate::Held::new(); crate::Bytes::new();", 1, &mut raw);
     crate_refs_in_line("crate::root_helper::x(); crate::Gated::x();", 1, &mut raw);
     crate_refs_in_line("crate::Nested::x();", 1, &mut raw);
-    let deps = scope.deps_of(&raw, &mut defs);
-    let resolved: HashMap<&str, &str> = deps
+    let pairs = scope.deps_of(&raw, &mut defs);
+    let resolved: HashMap<&str, &str> = pairs
         .iter()
         .map(|(seg, dep)| (seg.as_str(), dep.as_str()))
         .collect();
