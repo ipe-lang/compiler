@@ -37,7 +37,7 @@ use std::sync::{Mutex, PoisonError};
 /// FRESH id — entropy is not memoizable. Fails with kind `Unavailable` when
 /// the OS random source is unavailable.
 #[must_use]
-pub fn uuid_v4<E: From<String> + FromUnavailable + Send + 'static>(_: ()) -> IpeTask<E, String> {
+pub fn uuid_v4<E: FromUnavailable + Send + 'static>(_: ()) -> IpeTask<E, String> {
     Box::pin(async move { v4_with(fill_entropy) })
 }
 
@@ -69,7 +69,7 @@ fn v4_with<E: FromUnavailable>(
 /// Fails with kind `Unavailable` when the OS random source or the clock is
 /// unavailable, or the clock reads outside the UUIDv7 range.
 #[must_use]
-pub fn uuid_v7<E: From<String> + FromUnavailable + Send + 'static>(_: ()) -> IpeTask<E, String> {
+pub fn uuid_v7<E: FromUnavailable + Send + 'static>(_: ()) -> IpeTask<E, String> {
     Box::pin(async move { v7_with(&V7_CLOCK, now_millis, fill_entropy) })
 }
 

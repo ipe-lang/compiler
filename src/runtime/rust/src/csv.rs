@@ -44,17 +44,14 @@ crate::stringify::show_row!("CsvDoc", Value, [] CsvDoc, |d| format!(
 /// silently mishandled by the old `first_byte` helper — the multi-byte case
 /// takes only the first (possibly continuation) byte, producing a nonsense
 /// delimiter; the empty case silently falls back to `,`, which is wrong for
-/// callers that passed an explicit delimiter. Return `Err` for both cases.
-fn validated_delimiter<E: From<String>>(delim: &str) -> IpeResult<E, u8> {
+/// callers that passed an explicit delimiter. Return `InvalidInput` for both
+/// cases, naming the rule and never the argument.
+fn validated_delimiter<E: FromIpeError>(delim: &str) -> IpeResult<E, u8> {
     match delim.as_bytes() {
         [b] if b.is_ascii() => IpeResult::Ok(*b),
-        _ => IpeResult::Err(
-            format!(
-                "Csv: delimiter must be a single ASCII byte, got {:?}",
-                delim
-            )
-            .into(),
-        ),
+        _ => IpeResult::Err(E::from_ipe_error(IpeError::invalid_input(
+            "Csv: delimiter must be a single ASCII byte".to_owned(),
+        ))),
     }
 }
 
@@ -119,10 +116,7 @@ fn row_cap_refusal(max_rows: usize) -> LimitRefusal {
     ))
 }
 
-fn parse_delim<E: From<String> + FromLimitExceeded + FromIpeError>(
-    text: &str,
-    delim: u8,
-) -> IpeResult<E, CsvDoc> {
+fn parse_delim<E: FromLimitExceeded + FromIpeError>(text: &str, delim: u8) -> IpeResult<E, CsvDoc> {
     let mut rdr = ::csv::ReaderBuilder::new()
         .delimiter(delim)
         .has_headers(true)
@@ -150,7 +144,7 @@ fn parse_delim<E: From<String> + FromLimitExceeded + FromIpeError>(
             }
             h.iter().map(|s| s.to_string()).collect()
         }
-        Err(e) => return IpeResult::Err(format!("Csv.parse: {}", e).into()),
+        Err(e) => return IpeResult::Err(record_refusal(&e)),
     };
     let mut rows = Vec::new();
     for rec in rdr.records() {
@@ -166,10 +160,17 @@ fn parse_delim<E: From<String> + FromLimitExceeded + FromIpeError>(
                 }
                 rows.push(r.iter().map(|s| s.to_string()).collect());
             }
-            Err(e) => return IpeResult::Err(format!("Csv.parse: {}", e).into()),
+            Err(e) => return IpeResult::Err(record_refusal(&e)),
         }
     }
     IpeResult::Ok(CsvDoc { header, rows })
+}
+
+/// The `Decode` error for a record the in-memory parse refused.
+///
+/// The csv crate's message names the failure and its position, never a field.
+fn record_refusal<E: FromIpeError>(error: &::csv::Error) -> E {
+    E::from_ipe_error(IpeError::decode(format!("Csv.parse: {error}")))
 }
 
 /// Spreadsheet formula-injection guard (CWE-1236 / OWASP). A cell beginning with
@@ -221,14 +222,12 @@ fn encode_delim(doc: &CsvDoc, delim: u8) -> String {
 }
 
 /// Csv.parse : String -> Result Error Csv
-pub fn csv_parse<E: From<String> + FromLimitExceeded + FromIpeError>(
-    text: String,
-) -> IpeResult<E, CsvDoc> {
+pub fn csv_parse<E: FromLimitExceeded + FromIpeError>(text: String) -> IpeResult<E, CsvDoc> {
     parse_delim(&text, b',')
 }
 
 /// Csv.parseWithDelimiter : String -> String -> Result Error Csv
-pub fn csv_parse_with_delimiter<E: From<String> + FromLimitExceeded + FromIpeError>(
+pub fn csv_parse_with_delimiter<E: FromLimitExceeded + FromIpeError>(
     delim: String,
     text: String,
 ) -> IpeResult<E, CsvDoc> {
@@ -332,6 +331,20 @@ mod tests {
     fn env_ceilings_honour_the_shared_contract() {
         crate::system::assert_env_ceiling_contract(CSV_ROWS_CEILING);
         crate::system::assert_env_ceiling_contract(CSV_BYTES_CEILING);
+    }
+
+    /// A delimiter that is not one ASCII byte is `InvalidInput` naming the rule, never the argument.
+    #[test]
+    fn invalid_delimiter_is_invalid_input_without_the_argument() {
+        for delim in ["", "SENTINEL", "é"] {
+            let refused: IpeResult<IpeError, CsvDoc> =
+                csv_parse_with_delimiter(delim.to_owned(), "a\n1\n".to_owned());
+            assert!(
+                matches!(&refused, IpeResult::Err(IpeError::Error(IpeErrorKind::InvalidInput, info))
+                    if info.message == "Csv: delimiter must be a single ASCII byte"),
+                "delimiter {delim:?} must be InvalidInput without the argument"
+            );
+        }
     }
 
     /// A malformed `IPE_CSV_MAX_ROWS` or `IPE_CSV_MAX_BYTES` is the operator's

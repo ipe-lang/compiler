@@ -27,7 +27,7 @@
 //! separate runtime authority over which validated URLs an outbound request may
 //! actually reach; `Url` is the syntactic parse boundary that feeds it.
 
-use super::IpeResult;
+use super::{FromIpeError, IpeError, IpeResult};
 use crate::core::IpeMaybe;
 use url::{Url as UrlCrate, form_urlencoded};
 
@@ -139,12 +139,14 @@ impl Url {
 /// or otherwise unparseable input all surface as a typed `Err`, never a silent
 /// accept. Succeeds with the parsed, normalised URL otherwise.
 #[must_use]
-pub fn url_from_string<E: From<String>>(s: String) -> IpeResult<E, Url> {
+pub fn url_from_string<E: FromIpeError>(s: String) -> IpeResult<E, Url> {
     match UrlCrate::parse(&s) {
         Ok(u) => IpeResult::Ok(Url(u)),
         // The input is not echoed: an unparseable URL may hold credentials the
         // parser never separated from the rest of the text.
-        Err(e) => IpeResult::Err(format!("Ipe.Url: not a valid absolute URL ({e})").into()),
+        Err(e) => IpeResult::Err(E::from_ipe_error(IpeError::invalid_input(format!(
+            "Ipe.Url: not a valid absolute URL ({e})"
+        )))),
     }
 }
 
@@ -384,10 +386,12 @@ fn scheme_colon_before_slash(s: &str) -> bool {
 /// that survives a single mistake. On success the parsed `path`/`query`/
 /// `fragment` are extracted and stored.
 #[must_use]
-pub fn url_relative<E: From<String>>(raw: String) -> IpeResult<E, UrlRelative> {
+pub fn url_relative<E: FromIpeError>(raw: String) -> IpeResult<E, UrlRelative> {
     let reject = |why: &str| -> IpeResult<E, UrlRelative> {
         // The input is not echoed: a refused reference may carry userinfo.
-        IpeResult::Err(format!("Ipe.Url: unsafe relative reference ({why})").into())
+        IpeResult::Err(E::from_ipe_error(IpeError::invalid_input(format!(
+            "Ipe.Url: unsafe relative reference ({why})"
+        ))))
     };
     // ── String-level guards (fail-closed on presence, never strip). ──
     if raw.is_empty() {
@@ -608,6 +612,23 @@ mod tests {
         ] {
             assert_eq!(url_scheme_shown(parse(raw)), shown, "{raw:?}");
         }
+    }
+
+    /// A refused URL or relative reference is `InvalidInput`.
+    #[test]
+    fn refusals_are_invalid_input() {
+        let absolute = url_from_string::<IpeError>("/not/absolute".to_owned());
+        assert!(
+            matches!(&absolute, IpeResult::Err(IpeError::Error(crate::IpeErrorKind::InvalidInput, info))
+                if info.message.starts_with("Ipe.Url: not a valid absolute URL")),
+            "a relative string must be refused as InvalidInput"
+        );
+        let relative = url_relative::<IpeError>("//evil.example/".to_owned());
+        assert!(
+            matches!(&relative, IpeResult::Err(IpeError::Error(crate::IpeErrorKind::InvalidInput, info))
+                if info.message.starts_with("Ipe.Url: unsafe relative reference")),
+            "a protocol-relative reference must be refused as InvalidInput"
+        );
     }
 
     /// A refused string is never echoed: it may hold credentials the parser

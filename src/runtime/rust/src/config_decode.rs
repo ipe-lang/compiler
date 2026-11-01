@@ -94,9 +94,127 @@ pub fn config_decode_toml<E: DecodeErrorSink + 'static, T>(
     decoder: Decoder<E, T>,
 ) -> IpeResult<E, T> {
     run_decoder(
-        toml::from_str(&s).map_err(|e| format!("toml parse: {}", e)),
+        toml::from_str(&s).map_err(|e| toml_failure(&s, &e)),
         decoder,
     )
+}
+
+/// Every static grammar label the TOML parser names in an `invalid <label>`
+/// refusal: the `StrContext::Label` strings of `toml_edit` 0.20.2 (this
+/// workspace's `toml` 0.8.2) and 0.22.27 (the newest `toml` 0.8 an emitted
+/// project resolves), which carry the same set. Sorted, so a lookup is a
+/// binary search.
+const TOML_GRAMMAR_LABELS: &[&str] = &[
+    "array",
+    "basic string",
+    "binary integer",
+    "date-time",
+    "escape sequence",
+    "floating-point number",
+    "hexadecimal integer",
+    "inline table",
+    "integer",
+    "key",
+    "literal string",
+    "multiline basic string",
+    "multiline literal string",
+    "octal integer",
+    "string",
+    "table header",
+    "time",
+    "time offset",
+    "unicode 4-digit hex code",
+    "unicode 8-digit hex code",
+];
+
+/// Whether `a` sorts strictly before `b` byte-wise.
+const fn str_before(a: &str, b: &str) -> bool {
+    let (mut a, mut b) = (a.as_bytes(), b.as_bytes());
+    loop {
+        match (a, b) {
+            ([x, a_rest @ ..], [y, b_rest @ ..]) => {
+                if *x != *y {
+                    return *x < *y;
+                }
+                a = a_rest;
+                b = b_rest;
+            }
+            ([], [_, ..]) => return true,
+            (_, []) => return false,
+        }
+    }
+}
+
+/// Whether `labels` is strictly ascending, so a binary search over it is exact.
+const fn strictly_ascending(mut labels: &[&str]) -> bool {
+    while let [first, rest @ ..] = labels {
+        if let [second, ..] = rest
+            && !str_before(first, second)
+        {
+            return false;
+        }
+        labels = rest;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if `TOML_GRAMMAR_LABELS` is not strictly sorted, which the `toml_category` binary search requires [ledger #boundary]
+const _: () = assert!(strictly_ascending(TOML_GRAMMAR_LABELS));
+
+/// The parse error for a TOML source, naming the failure and its position.
+///
+/// `toml`'s `Display` quotes the offending source line, and its description
+/// names the keys of a duplicate or dotted-key refusal, either of which may
+/// hold a secret. The message keeps only [`toml_category`] and the line and
+/// column where the failure starts.
+fn toml_failure(source: &str, error: &toml::de::Error) -> String {
+    let what = toml_category(error.message());
+    error
+        .span()
+        .and_then(|span| line_column(source, span.start))
+        .map_or_else(
+            || format!("toml parse: {what}"),
+            |(line, column)| format!("toml parse: {what} at line {line} column {column}"),
+        )
+}
+
+/// The category of a TOML parser description, carrying no input text.
+///
+/// A key-naming refusal keeps its category without the keys; a grammar
+/// refusal (`invalid <label>`) keeps its label only when the label is one of
+/// [`TOML_GRAMMAR_LABELS`]. Any other description is `invalid document`.
+fn toml_category(message: &str) -> String {
+    let first = message.lines().next().map_or("", str::trim);
+    if first.starts_with("duplicate key") {
+        return "duplicate key".to_owned();
+    }
+    if first.starts_with("dotted key") {
+        return "dotted key extends a value that is not a table".to_owned();
+    }
+    if first == "value is out of range" || first == "recursion limit exceeded" {
+        return first.to_owned();
+    }
+    first
+        .strip_prefix("invalid ")
+        .filter(|label| TOML_GRAMMAR_LABELS.binary_search(label).is_ok())
+        .map_or_else(
+            || "invalid document".to_owned(),
+            |label| format!("invalid {label}"),
+        )
+}
+
+/// The one-based line and character column of byte `offset` in `source`.
+///
+/// `None` when `offset` is past the end or not on a character boundary.
+fn line_column(source: &str, offset: usize) -> Option<(usize, usize)> {
+    let before = source.get(..offset)?;
+    let line = before.matches('\n').count().saturating_add(1);
+    let column = before
+        .rsplit('\n')
+        .next()
+        .map_or(0, |tail| tail.chars().count())
+        .saturating_add(1);
+    Some((line, column))
 }
 
 /// Default cap on a YAML source string parsed directly via `Config.decodeYaml`
@@ -752,6 +870,123 @@ mod load_from_file_spawn_blocking_tests {
              the blocking file read is starving the single-threaded executor \
              (spawn_blocking missing or not taking effect)"
         );
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod toml_tests {
+    use super::*;
+    use crate::json::decode_value_identity;
+
+    /// A TOML parse error is `Decode` and names its position, never the source line.
+    #[test]
+    fn toml_parse_error_does_not_echo_source_line() {
+        let decoded = config_decode_toml(
+            "ok = 1\nsecret = \"SENTINEL\n".to_owned(),
+            decode_value_identity::<crate::IpeError>(),
+        );
+        assert!(
+            matches!(
+                &decoded,
+                IpeResult::Err(crate::IpeError::Error(crate::IpeErrorKind::Decode, _))
+            ),
+            "an unterminated TOML string must be a Decode refusal"
+        );
+        let IpeResult::Err(crate::IpeError::Error(_, info)) = decoded else {
+            return;
+        };
+        assert!(
+            !info.message.contains("SENTINEL") && !info.message.contains("secret ="),
+            "the parse error must not quote the source: {:?}",
+            info.message.replace("SENTINEL", "<sentinel>")
+        );
+        assert!(
+            info.message.starts_with("toml parse: ")
+                && info.message.contains(" at line ")
+                && info.message.contains(" column "),
+            "the parse error must name its line and column: {:?}",
+            info.message
+        );
+    }
+
+    /// A key-naming TOML refusal keeps its category and never names the key.
+    #[test]
+    fn toml_key_error_does_not_echo_the_key() {
+        for source in [
+            "SENTINEL = 1\nSENTINEL = 2\n",
+            "[t]\n\"SENTINEL\" = 1\n\"SENTINEL\" = 2\n",
+            "a = { SENTINEL = 1, SENTINEL = 2 }\n",
+            "SENTINEL = 1\nSENTINEL.b = 2\n",
+        ] {
+            let decoded = config_decode_toml(
+                source.to_owned(),
+                decode_value_identity::<crate::IpeError>(),
+            );
+            let shown = match &decoded {
+                IpeResult::Err(crate::IpeError::Error(crate::IpeErrorKind::Decode, info)) => {
+                    info.message.clone()
+                }
+                IpeResult::Err(crate::IpeError::Error(..)) | IpeResult::Ok(_) => String::new(),
+            };
+            assert!(
+                shown.starts_with("toml parse: ")
+                    && shown.contains(" at line ")
+                    && !shown.contains("SENTINEL"),
+                "a key refusal must be Decode without the key: {:?}",
+                shown.replace("SENTINEL", "<sentinel>")
+            );
+        }
+    }
+
+    /// A description keeps only a fixed category or a static grammar label.
+    #[test]
+    fn toml_category_keeps_no_input_text() {
+        assert_eq!(
+            toml_category("invalid basic string\nexpected `\"`"),
+            "invalid basic string"
+        );
+        assert_eq!(
+            toml_category("invalid unicode 4-digit hex code"),
+            "invalid unicode 4-digit hex code"
+        );
+        assert_eq!(
+            toml_category("duplicate key `SENTINEL` in table `t`"),
+            "duplicate key"
+        );
+        assert_eq!(
+            toml_category("dotted key `SENTINEL.b` attempted to extend non-table type (integer)"),
+            "dotted key extends a value that is not a table"
+        );
+        assert_eq!(
+            toml_category("value is out of range"),
+            "value is out of range"
+        );
+        for label in TOML_GRAMMAR_LABELS {
+            let message = format!("invalid {label}");
+            assert_eq!(toml_category(&message), message);
+        }
+        for echoing in [
+            "invalid type: string \"SENTINEL\", expected i64",
+            "invalid SENTINEL",
+            "invalid sentinel",
+            "invalid basic string sentinel",
+            "unexpected keys in table: SENTINEL",
+            "",
+        ] {
+            assert_eq!(toml_category(echoing), "invalid document", "{echoing:?}");
+        }
+    }
+
+    /// Positions are one-based lines and character columns; an offset off a boundary has none.
+    #[test]
+    fn line_column_counts_lines_and_characters() {
+        assert_eq!(line_column("", 0), Some((1, 1)));
+        assert_eq!(line_column("ab\ncd", 4), Some((2, 2)));
+        assert_eq!(line_column("é\nx", 3), Some((2, 1)));
+        assert_eq!(line_column("xé", 3), Some((1, 3)));
+        assert_eq!(line_column("é", 1), None);
+        assert_eq!(line_column("ab", 3), None);
     }
 }
 
