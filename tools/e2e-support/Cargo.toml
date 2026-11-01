@@ -3,6 +3,7 @@ name = "e2e-support"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+publish = false
 
 [lib]
 name = "e2e_support"

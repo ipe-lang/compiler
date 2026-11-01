@@ -24,6 +24,7 @@ pub use ipe_runtime_rust::encoding::MountBase;
 /// The parsed `delivery.servers` origins a browser bundle may reach.
 pub use ipe_runtime_rust::encoding::{ServerOrigin, ServerOrigins};
 pub mod crate_specs;
+pub mod golden_form;
 #[macro_use]
 mod doc;
 mod emit_console;

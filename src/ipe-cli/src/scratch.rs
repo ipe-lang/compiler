@@ -266,32 +266,134 @@ mod tests {
         roots
     }
 
-    /// Whether `manifest` names `ipe-test-temp` anywhere but a dev-dependency
-    /// table, by key or by `package` rename.
-    fn test_temp_outside_dev_deps(manifest: &toml::Table) -> bool {
-        let names_test_temp = |deps: Option<&toml::Value>| {
-            deps.and_then(toml::Value::as_table).is_some_and(|deps| {
-                deps.iter().any(|(key, spec)| {
-                    key == "ipe-test-temp"
-                        || spec.get("package").and_then(toml::Value::as_str)
-                            == Some("ipe-test-temp")
-                })
-            })
+    /// The package the test-only temp-root reader ships as.
+    const TEST_TEMP_PACKAGE: &str = "ipe-test-temp";
+
+    /// What the test-temp reach audit reads from one workspace member.
+    struct CrateFacts {
+        /// Its `[package] name`; empty when the manifest names none.
+        name: String,
+        /// Every package it links through a normal or build dependency table,
+        /// top-level or target-specific, by `package` rename when present.
+        linked: Vec<String>,
+        /// Whether it declares `publish = false`.
+        unpublished: bool,
+        /// Whether it builds an artifact beyond a Rust library: a `[[bin]]`, a
+        /// `src/main.rs` or `src/bin/` cargo discovers as one, or a `[lib]`
+        /// crate type other than `lib`/`rlib`.
+        ships_artifact: bool,
+    }
+
+    /// Read a member's [`CrateFacts`] from its parsed manifest. `auto_bin`
+    /// says whether the member holds a `src/main.rs` or a `src/bin/`, and
+    /// `workspace_deps` is the root `[workspace.dependencies]` an inherited
+    /// dependency resolves its package through.
+    fn crate_facts(
+        manifest: &toml::Table,
+        auto_bin: bool,
+        workspace_deps: Option<&toml::Table>,
+    ) -> CrateFacts {
+        let package = manifest.get("package").and_then(toml::Value::as_table);
+        let name = package
+            .and_then(|p| p.get("name"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let unpublished = package
+            .and_then(|p| p.get("publish"))
+            .and_then(toml::Value::as_bool)
+            == Some(false);
+        let package_of = |key: &str, spec: &toml::Value| {
+            let inherited = spec.get("workspace").and_then(toml::Value::as_bool) == Some(true);
+            let spec = if inherited {
+                workspace_deps
+                    .and_then(|deps| deps.get(key))
+                    .unwrap_or(spec)
+            } else {
+                spec
+            };
+            spec.get("package")
+                .and_then(toml::Value::as_str)
+                .unwrap_or(key)
+                .to_owned()
         };
-        let in_table = |table: &toml::Table| {
-            names_test_temp(table.get("dependencies"))
-                || names_test_temp(table.get("build-dependencies"))
+        let mut linked = Vec::new();
+        let mut read_tables = |table: &toml::Table| {
+            for kind in ["dependencies", "build-dependencies", "build_dependencies"] {
+                if let Some(deps) = table.get(kind).and_then(toml::Value::as_table) {
+                    linked.extend(deps.iter().map(|(key, spec)| package_of(key, spec)));
+                }
+            }
         };
-        in_table(manifest)
-            || manifest
-                .get("target")
-                .and_then(toml::Value::as_table)
-                .is_some_and(|targets| {
-                    targets
-                        .values()
-                        .filter_map(toml::Value::as_table)
-                        .any(in_table)
-                })
+        read_tables(manifest);
+        if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
+            targets
+                .values()
+                .filter_map(toml::Value::as_table)
+                .for_each(&mut read_tables);
+        }
+        let declared_bin = manifest
+            .get("bin")
+            .and_then(toml::Value::as_array)
+            .is_some_and(|bins| !bins.is_empty());
+        let foreign_crate_type = manifest
+            .get("lib")
+            .and_then(|lib| lib.get("crate-type").or_else(|| lib.get("crate_type")))
+            .and_then(toml::Value::as_array)
+            .is_some_and(|types| {
+                types
+                    .iter()
+                    .any(|t| !matches!(t.as_str(), Some("lib" | "rlib")))
+            });
+        CrateFacts {
+            name,
+            linked,
+            unpublished,
+            ships_artifact: auto_bin || declared_bin || foreign_crate_type,
+        }
+    }
+
+    /// Why the test-only temp-root reader could reach a shipped artifact.
+    ///
+    /// The reader's reach is every crate that links it through a normal or
+    /// build edge, closed over the same edges. A dev-dependency edge never
+    /// extends it, since a dev-dependency builds only into its dependent's
+    /// tests. Each crate in the reach must be a Rust library that declares
+    /// `publish = false`: a crate building a binary or a foreign library ships
+    /// what it links, and a publishable crate can leave the workspace. A
+    /// shipped crate linking a reached library is itself reached, so it is
+    /// refused too.
+    fn test_temp_reach_refusals(crates: &[CrateFacts]) -> Vec<String> {
+        let mut reach = std::collections::BTreeSet::from([TEST_TEMP_PACKAGE.to_owned()]);
+        loop {
+            let before = reach.len();
+            for krate in crates {
+                if krate.linked.iter().any(|dep| reach.contains(dep)) {
+                    reach.insert(krate.name.clone());
+                }
+            }
+            if reach.len() == before {
+                break;
+            }
+        }
+        let mut refusals = Vec::new();
+        for krate in crates.iter().filter(|k| reach.contains(&k.name)) {
+            if krate.ships_artifact {
+                refusals.push(format!(
+                    "`{}` builds a binary or foreign library and links `{TEST_TEMP_PACKAGE}` \
+                     outside [dev-dependencies]",
+                    krate.name
+                ));
+            }
+            if !krate.unpublished {
+                refusals.push(format!(
+                    "`{}` links `{TEST_TEMP_PACKAGE}` outside [dev-dependencies] but does not \
+                     declare `publish = false`",
+                    krate.name
+                ));
+            }
+        }
+        refusals
     }
 
     /// No production code derives a temp path from `temp_dir()`, a shared temp
@@ -510,14 +612,25 @@ mod tests {
         );
     }
 
-    /// The test-only temp-root reader never reaches production: no workspace
-    /// member depends on `ipe-test-temp` outside a dev-dependency table.
+    /// The test-only temp-root reader never reaches production: every crate
+    /// that links it outside a dev-dependency table is an unpublished Rust
+    /// library, and no crate building an artifact links one.
     #[test]
-    fn the_test_temp_reader_is_a_dev_dependency_only() {
+    fn the_test_temp_reader_reaches_no_shipped_artifact() {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let Some(workspace) = manifest.ancestors().nth(2) else {
             return;
         };
+        let root = std::fs::read_to_string(workspace.join("Cargo.toml"))
+            .map_err(|e| e.to_string())
+            .and_then(|text| text.parse::<toml::Table>().map_err(|e| e.to_string()));
+        assert!(root.is_ok(), "cannot read the workspace manifest: {root:?}");
+        let Ok(root) = root else { return };
+        let workspace_deps = root
+            .get("workspace")
+            .and_then(|w| w.get("dependencies"))
+            .and_then(toml::Value::as_table);
+        let mut crates = Vec::new();
         for member in workspace_members(workspace) {
             let path = member.join("Cargo.toml");
             let parsed = std::fs::read_to_string(&path)
@@ -525,16 +638,41 @@ mod tests {
                 .and_then(|text| text.parse::<toml::Table>().map_err(|e| e.to_string()));
             assert!(parsed.is_ok(), "cannot read {}: {parsed:?}", path.display());
             let Ok(parsed) = parsed else { return };
+            let auto_bin = member.join("src/main.rs").exists() || member.join("src/bin").exists();
+            let facts = crate_facts(&parsed, auto_bin, workspace_deps);
             assert!(
-                !test_temp_outside_dev_deps(&parsed),
-                "{} depends on `ipe-test-temp` outside [dev-dependencies]",
+                !facts.name.is_empty(),
+                "{} names no package",
                 path.display()
             );
+            crates.push(facts);
         }
+        assert!(
+            crates.iter().any(|k| k.name == TEST_TEMP_PACKAGE),
+            "`{TEST_TEMP_PACKAGE}` is no longer a workspace member; the audit has nothing to bound"
+        );
+        let refusals = test_temp_reach_refusals(&crates);
+        assert!(refusals.is_empty(), "{}", refusals.join("\n"));
     }
 
-    /// A production, build, or target-specific dependency on the test reader
-    /// is refused, by key or by rename; a dev-dependency is not.
+    /// The facts of one fixture manifest, its source tree holding a
+    /// `src/main.rs` when `auto_bin`.
+    fn fixture(manifest: &str, auto_bin: bool) -> CrateFacts {
+        let parsed = manifest.parse::<toml::Table>();
+        assert!(parsed.is_ok(), "fixture must parse: {parsed:?}");
+        crate_facts(&parsed.unwrap_or_default(), auto_bin, None)
+    }
+
+    /// The reader itself, as its manifest declares it.
+    fn reader_fixture() -> CrateFacts {
+        fixture(
+            "[package]\nname = \"ipe-test-temp\"\npublish = false\n",
+            false,
+        )
+    }
+
+    /// A shipped crate's production, build, or target-specific dependency on
+    /// the test reader is refused, by key or by rename; a dev-dependency is not.
     #[test]
     fn a_production_dependency_on_the_test_temp_reader_is_refused() {
         for refused in [
@@ -543,9 +681,9 @@ mod tests {
             "[dependencies]\ntt = { package = \"ipe-test-temp\", path = \"x\" }\n",
             "[target.'cfg(unix)'.dependencies]\nipe-test-temp = { path = \"x\" }\n",
         ] {
-            let parsed = refused.parse::<toml::Table>();
+            let app = fixture(&format!("[package]\nname = \"app\"\n{refused}"), true);
             assert!(
-                parsed.as_ref().is_ok_and(test_temp_outside_dev_deps),
+                !test_temp_reach_refusals(&[reader_fixture(), app]).is_empty(),
                 "must refuse: {refused}"
             );
         }
@@ -553,12 +691,88 @@ mod tests {
             "[dev-dependencies]\nipe-test-temp = { path = \"../test-temp\" }\n",
             "[target.'cfg(unix)'.dev-dependencies]\nipe-test-temp = { path = \"x\" }\n",
         ] {
-            let parsed = accepted.parse::<toml::Table>();
-            assert!(
-                parsed
-                    .as_ref()
-                    .is_ok_and(|m| !test_temp_outside_dev_deps(m)),
+            let app = fixture(&format!("[package]\nname = \"app\"\n{accepted}"), true);
+            assert_eq!(
+                test_temp_reach_refusals(&[reader_fixture(), app]),
+                Vec::<String>::new(),
                 "must accept: {accepted}"
+            );
+        }
+    }
+
+    /// A test-support library may link the reader only while no crate that
+    /// builds an artifact links that library outside its dev-dependencies, at
+    /// any depth; and the library itself must be an unpublished Rust library.
+    #[test]
+    fn a_shipped_crate_reaching_the_test_temp_reader_is_refused() {
+        let support = |extra: &str| {
+            fixture(
+                &format!(
+                    "[package]\nname = \"support\"\npublish = false\n{extra}\n\
+                     [dependencies]\nipe-test-temp = {{ path = \"x\" }}\n"
+                ),
+                false,
+            )
+        };
+        let app = |deps: &str| fixture(&format!("[package]\nname = \"app\"\n{deps}"), true);
+        let app_refused = |crates: &[CrateFacts]| {
+            test_temp_reach_refusals(crates)
+                .iter()
+                .any(|r| r.starts_with("`app`"))
+        };
+
+        assert_eq!(
+            test_temp_reach_refusals(&[
+                reader_fixture(),
+                support(""),
+                app("[dev-dependencies]\nsupport = { path = \"s\" }\n"),
+            ]),
+            Vec::<String>::new(),
+            "a library reached only through a dev-dependency stays in tests"
+        );
+        for deps in [
+            "[dependencies]\nsupport = { path = \"s\" }\n",
+            "[build-dependencies]\nsupport = { path = \"s\" }\n",
+            "[dependencies]\ns = { package = \"support\", path = \"s\" }\n",
+            "[target.'cfg(unix)'.dependencies]\nsupport = { path = \"s\" }\n",
+        ] {
+            assert!(
+                app_refused(&[reader_fixture(), support(""), app(deps)]),
+                "a shipped crate linking the library must be refused: {deps}"
+            );
+        }
+        let middle = fixture(
+            "[package]\nname = \"middle\"\npublish = false\n\
+             [dependencies]\nsupport = { path = \"s\" }\n",
+            false,
+        );
+        assert!(
+            app_refused(&[
+                reader_fixture(),
+                support(""),
+                middle,
+                app("[dependencies]\nmiddle = { path = \"m\" }\n"),
+            ]),
+            "a shipped crate two links away must be refused"
+        );
+
+        let published = fixture(
+            "[package]\nname = \"support\"\n[dependencies]\nipe-test-temp = { path = \"x\" }\n",
+            false,
+        );
+        assert!(
+            test_temp_reach_refusals(&[reader_fixture(), published])
+                .iter()
+                .any(|r| r.contains("publish = false")),
+            "a publishable library linking the reader must be refused"
+        );
+        for artifact in [
+            "[[bin]]\nname = \"tool\"\npath = \"src/tool.rs\"\n",
+            "[lib]\ncrate-type = [\"cdylib\"]\n",
+        ] {
+            assert!(
+                !test_temp_reach_refusals(&[reader_fixture(), support(artifact)]).is_empty(),
+                "a library that also builds an artifact must be refused: {artifact}"
             );
         }
     }

@@ -21,6 +21,7 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -721,6 +722,49 @@ class DiskOrderLintTest(unittest.TestCase):
             with self.subTest(i):
                 self.assertTrue(_order_refused(lambda s, i=i: s[i].update({"if": "always()"}), "no `if:`"))
                 self.assertTrue(_order_refused(lambda s, i=i: s[i].update({"continue-on-error": True}), "no `if:`"))
+
+    def test_unpack_creates_its_destination_before_the_extract(self) -> None:
+        # A stub `cargo` refuses as nextest does: `--extract-to` names a
+        # directory that must already exist.
+        stub = (
+            "#!/bin/sh\n"
+            'while [ "$#" -gt 0 ]; do\n'
+            '  if [ "$1" = --extract-to ]; then\n'
+            '    [ -d "$2" ] || { echo "error canonicalizing destination directory $2" >&2; exit 101; }\n'
+            '    echo "$2" > extracted-to\n'
+            "  fi\n"
+            "  shift\n"
+            "done\n"
+        )
+        with tempfile.TemporaryDirectory() as work:
+            bindir = os.path.join(work, "bin")
+            runner_temp = os.path.join(work, "runner-temp")
+            os.makedirs(bindir)
+            os.makedirs(runner_temp)
+            cargo = os.path.join(bindir, "cargo")
+            with open(cargo, "w", encoding="utf-8") as f:
+                f.write(stub)
+            os.chmod(cargo, 0o755)
+            archive = os.path.join(work, es.ARCHIVE_FILE)
+            with open(archive, "wb"):
+                pass
+            env = {**os.environ, "PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}", "RUNNER_TEMP": runner_temp}
+            done = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", es.EXTRACT_RUN],
+                cwd=work,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(done.returncode, 0, done.stderr)
+            with open(os.path.join(work, "extracted-to"), encoding="utf-8") as f:
+                self.assertEqual(f.read().strip(), os.path.join(runner_temp, "nextest-x"))
+            self.assertFalse(os.path.exists(archive), "the archive is deleted after the unpack")
+
+    def test_lint_refuses_an_unpack_without_its_destination(self) -> None:
+        bare = f"{es.EXTRACT_COMMAND}\nrm -- {es.ARCHIVE_FILE}"
+        self.assertTrue(_order_refused(lambda s: s[3].update(run=bare), "unpack-then-delete"))
 
     def test_lint_refuses_archive_kept_during_run(self) -> None:
         kept = es.EXTRACT_COMMAND

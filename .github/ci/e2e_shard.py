@@ -364,7 +364,10 @@ EXTRACT_COMMAND = " ".join(
         "--extract-overwrite -E 'none()'",
     )
 )
-EXTRACT_RUN = f"{EXTRACT_COMMAND}\nrm -- {ARCHIVE_FILE}"
+# nextest canonicalizes `--extract-to` before it unpacks, so a destination
+# that does not exist yet refuses the whole step; the run creates it first.
+EXTRACT_MKDIR = f'mkdir -p "{EXTRACT_DIR}"'
+EXTRACT_RUN = f"{EXTRACT_MKDIR}\n{EXTRACT_COMMAND}\nrm -- {ARCHIVE_FILE}"
 ARCHIVE_ARGS = (
     "--binaries-metadata",
     f'"{EXTRACT_DIR}/target/nextest/binaries-metadata.json"',

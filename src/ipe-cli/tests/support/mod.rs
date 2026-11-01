@@ -166,26 +166,6 @@ pub fn normalize_rustfmt_whitespace(s: &str) -> String {
     out
 }
 
-/// The placeholder a blessed golden `Cargo.toml` stores in place of the
-/// dependency-model runtime `path`. Aliased to the single `e2e_support`
-/// definition so the CLI golden harness and the emit-corpus harness pin the
-/// same token from one source of truth.
-#[allow(dead_code)] // referenced by intra-doc links; the golden token, sourced from the SSOT
-pub const RUNTIME_PATH_PLACEHOLDER: &str = e2e_support::RUNTIME_PATH_PLACEHOLDER;
-
-/// Normalize an emitted `Cargo.toml`'s machine-specific bytes to their stable
-/// golden placeholders — the runtime dependency `path` (→
-/// [`RUNTIME_PATH_PLACEHOLDER`]) AND the per-project crate-identity hash suffix.
-/// Delegates to the single `e2e_support` implementation so the compare and
-/// bless paths here can never drift from it (the drift this consolidation
-/// closes: a normalization change landing in one copy and not the others,
-/// leaving a machine-specific value in a byte-compared golden).
-#[must_use]
-#[allow(dead_code)] // used by the Cargo.toml arm of the directory-diff helper
-pub fn normalize_runtime_dep_path(manifest: &str) -> String {
-    e2e_support::normalize_runtime_dep_path(manifest)
-}
-
 /// Collect the `.rs` filenames present in a directory, returning an empty set
 /// when the directory does not exist or cannot be read.
 fn rs_filenames_in(dir: &Path) -> std::collections::BTreeSet<String> {
@@ -219,7 +199,7 @@ fn bless_golden_dir(
             continue; // emitted file absent — nothing to bless
         };
         let blessed = if rel == "Cargo.toml" {
-            normalize_runtime_dep_path(&text)
+            ipe_backend_rust::golden_form::golden_cargo_toml(&text)
         } else {
             text
         };
@@ -285,7 +265,7 @@ fn bless_golden_dir(
 /// **Bless mode:** if `IPE_BLESS=1` is set in the environment, instead of
 /// asserting, the function writes every emitted file into `golden_dir` (creating
 /// parent directories as needed), normalizing `Cargo.toml`'s machine-specific
-/// runtime path to [`RUNTIME_PATH_PLACEHOLDER`] before writing so the golden
+/// runtime path to [`ipe_backend_rust::golden_form::RUNTIME_PATH_PLACEHOLDER`] before writing so the golden
 /// stays portable across machines; stale `ipe_mods/*.rs` files that the emitted
 /// set no longer contains are deleted; then returns without asserting. Use to
 /// regenerate golden files after an intentional emit change.
@@ -336,7 +316,7 @@ pub fn assert_emitted_project_matches_golden_dir(emitted_out: &Path, golden_dir:
 
     let normalize = |rel: &str, text: String| -> String {
         if rel == "Cargo.toml" {
-            normalize_runtime_dep_path(&text)
+            ipe_backend_rust::golden_form::golden_cargo_toml(&text)
         } else {
             text
         }

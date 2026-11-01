@@ -1463,6 +1463,7 @@ jobs:
       # binaries only, never both copies (`e2e_shard.py` `EXTRACT_RUN`).
       - name: Unpack the test archive and delete it
         run: |
+          mkdir -p "$RUNNER_TEMP/nextest-x"
           cargo nextest list --archive-file nextest.tar.zst --workspace-remap . --extract-to "$RUNNER_TEMP/nextest-x" --extract-overwrite -E 'none()'
           rm -- nextest.tar.zst
       # Cache the shared emitted-crate target across runs so the runtime dep tree

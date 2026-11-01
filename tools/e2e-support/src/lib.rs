@@ -83,115 +83,6 @@ fn emitted_build_idle() -> Duration {
     duration_env_or("IPE_E2E_BUILD_IDLE_SECS", DEFAULT_EMITTED_BUILD_IDLE_SECS)
 }
 
-/// Stable token stored in a portable golden `Cargo.toml` instead of the
-/// machine-specific `ipe-runtime-rust` crate path.
-///
-/// The real emit writes a live, resolvable absolute path so `cargo build`
-/// works in any environment; only the golden fixture stores this placeholder
-/// so the byte-compare is machine-independent. The comparison and bless paths
-/// both normalise the emitted path to this value before touching the golden.
-pub const RUNTIME_PATH_PLACEHOLDER: &str = "__IPE_RUNTIME_PATH__";
-
-/// Replace the `ipe-runtime-rust` dependency's `path = "<abs>"` value in a
-/// `Cargo.toml` text with [`RUNTIME_PATH_PLACEHOLDER`], leaving every other
-/// byte untouched.
-///
-/// Only the one `ipe_runtime = { … package = "ipe-runtime-rust" … path = "…"
-/// … }` dependency line carries a machine-specific value; the rewrite is
-/// scoped to `path = "…"` on that line, so a manifest with no such line (e.g.
-/// the vendored / wasm shape) passes through unchanged, and any real manifest
-/// drift still surfaces as a diff.
-#[must_use]
-pub fn normalize_runtime_dep_path(manifest: &str) -> String {
-    let path_normalized = manifest
-        .lines()
-        .map(|line| {
-            if line.contains("package = \"ipe-runtime-rust\"")
-                && let Some(start) = line.find("path = \"")
-            {
-                let val_start = start + "path = \"".len();
-                if let Some(rel_end) = line[val_start..].find('"') {
-                    let end = val_start + rel_end;
-                    return format!(
-                        "{}{}{}",
-                        &line[..val_start],
-                        RUNTIME_PATH_PLACEHOLDER,
-                        &line[end..]
-                    );
-                }
-            }
-            line.to_owned()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + if manifest.ends_with('\n') { "\n" } else { "" };
-    normalize_crate_identity_hash(&path_normalized)
-}
-
-/// Stable token stored in a portable golden `Cargo.toml` in place of the
-/// machine-specific per-project crate-identity hash.
-///
-/// The emitted `[package] name` is `"<friendly>_<hash>"`, where `<hash>` is a
-/// fixed-width digest of the CANONICAL project directory — a value that differs
-/// per machine (the golden is emitted from a host-local temp/checkout path). The
-/// friendly base is host-independent and stays in the golden verbatim (so the
-/// golden still pins it); only the volatile hash is replaced with this placeholder
-/// on both the comparison and bless paths, so the committed golden is portable and
-/// a regen is idempotent across machines.
-pub const CRATE_IDENTITY_HASH_PLACEHOLDER: &str = "__IPE_CRATE_HASH__";
-
-/// Replace the `[package] name` crate-identity hash suffix (`_<8 lowercase-hex>`)
-/// with [`CRATE_IDENTITY_HASH_PLACEHOLDER`], leaving the friendly base and every
-/// other byte untouched.
-///
-/// Scoped to the `[package]` table's first `name = "…"` line. A name with no
-/// hash suffix (the single-file `ipe-app` default) and any non-`[package]` `name`
-/// (a dependency) pass through unchanged. The suffix shape — a trailing `_`
-/// followed by EXACTLY the fixed-width lowercase-hex digest — is matched
-/// precisely so a friendly base that itself ends in `_<hex-looking>` is not
-/// mangled beyond that exact trailing token.
-#[must_use]
-fn normalize_crate_identity_hash(manifest: &str) -> String {
-    // Mirrors `ipe_backend_rust::crate_identity`'s fixed suffix width; a shell/
-    // tool cannot import that const, so the expected width is asserted by the
-    // determinism/host-independence tests that drive both sides.
-    const HEX_LEN: usize = 8;
-    let mut in_package = false;
-    let mut done = false;
-    manifest
-        .lines()
-        .map(|line| {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with('[') {
-                in_package = trimmed.starts_with("[package]");
-                return line.to_owned();
-            }
-            if in_package
-                && !done
-                && trimmed.starts_with("name")
-                && let Some((lhs, rhs)) = line.split_once('=')
-                && lhs.trim() == "name"
-            {
-                let raw = rhs.trim();
-                if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
-                    && let Some((base, hash)) = inner.rsplit_once('_')
-                    && hash.len() == HEX_LEN
-                    && hash
-                        .bytes()
-                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-                {
-                    done = true;
-                    return format!("{lhs}= \"{base}_{CRATE_IDENTITY_HASH_PLACEHOLDER}\"");
-                }
-                done = true;
-            }
-            line.to_owned()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + if manifest.ends_with('\n') { "\n" } else { "" }
-}
-
 /// Captured stdout + exit code from running a built program.
 #[derive(Clone, Debug)]
 pub struct RunResult {
@@ -852,9 +743,8 @@ fn ran_exactly_one_passing_test(stdout: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedRun, BoundedRunError, CRATE_IDENTITY_HASH_PLACEHOLDER,
-        DEFAULT_EMITTED_BUILD_IDLE_SECS, DEFAULT_EMITTED_BUILD_TIMEOUT_SECS, OutStream,
-        emitted_build_idle, emitted_build_timeout, normalize_crate_identity_hash,
+        BoundedRun, BoundedRunError, DEFAULT_EMITTED_BUILD_IDLE_SECS,
+        DEFAULT_EMITTED_BUILD_TIMEOUT_SECS, OutStream, emitted_build_idle, emitted_build_timeout,
         ran_exactly_one_passing_test, replace_package_name, rerun_this_test_exact, run_bounded,
         run_bounded_build, wait_for,
     };
@@ -1046,57 +936,6 @@ mod tests {
     #[test]
     fn no_package_name_yields_none() {
         assert!(replace_package_name("[dependencies]\nfoo = \"1\"\n", "uniq").is_none());
-    }
-
-    // Host-independence of goldens: the per-machine crate-identity hash suffix is
-    // replaced with a stable placeholder, so a golden regenerated on any machine
-    // is byte-identical (the friendly base is preserved verbatim).
-    #[test]
-    fn crate_identity_hash_suffix_is_normalized_to_placeholder() {
-        let manifest = "[package]\nname = \"mm-diamond_1a2b3c4d\"\nedition = \"2024\"\n";
-        let out = normalize_crate_identity_hash(manifest);
-        assert!(
-            out.contains(&format!(
-                "name = \"mm-diamond_{CRATE_IDENTITY_HASH_PLACEHOLDER}\""
-            )),
-            "hash suffix must normalize to the placeholder, got:\n{out}"
-        );
-        assert!(!out.contains("1a2b3c4d"), "no per-machine hash may survive");
-    }
-
-    // Two different real project paths yield different hashes; after
-    // normalization BOTH collapse to the identical placeholder text — the
-    // property that makes the committed golden host-independent.
-    #[test]
-    fn distinct_hashes_normalize_to_the_same_text() {
-        let a = normalize_crate_identity_hash("[package]\nname = \"app_00112233\"\n");
-        let b = normalize_crate_identity_hash("[package]\nname = \"app_deadbeef\"\n");
-        assert_eq!(a, b);
-    }
-
-    // The single-file default carries no hash suffix and must pass through
-    // untouched, and a `name` under a later table is never mistaken for the
-    // package name.
-    #[test]
-    fn unhashed_and_non_package_names_pass_through() {
-        let single = "[package]\nname = \"ipe-app\"\nedition = \"2024\"\n";
-        assert_eq!(normalize_crate_identity_hash(single), single);
-
-        // A dependency `name` whose value merely looks hash-shaped is untouched.
-        let dep = "[package]\nname = \"app_00112233\"\n\n[[bin]]\nname = \"other_00112233\"\n";
-        let out = normalize_crate_identity_hash(dep);
-        assert!(out.contains(&format!("name = \"app_{CRATE_IDENTITY_HASH_PLACEHOLDER}\"")));
-        assert!(
-            out.contains("name = \"other_00112233\""),
-            "a non-[package] name must be left alone, got:\n{out}"
-        );
-    }
-
-    // A friendly base that is NOT hash-shaped (wrong width) is not mangled.
-    #[test]
-    fn wrong_width_suffix_is_not_treated_as_a_hash() {
-        let manifest = "[package]\nname = \"my_app\"\nedition = \"2024\"\n";
-        assert_eq!(normalize_crate_identity_hash(manifest), manifest);
     }
 
     /// The load-bearing soundness guarantee of the warm-deps/cold-app dep cache:

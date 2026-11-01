@@ -5602,8 +5602,8 @@ dependencies = [
 name = "regen-goldens"
 version = "0.7.2"
 dependencies = [
- "e2e-support",
  "ipe",
+ "ipe_backend_rust",
  "ipe_docs",
 ]
 
