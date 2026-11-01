@@ -19,8 +19,7 @@ use super::super::core::{IpeResult, IpeTask, ok_res};
 use super::super::debugger::tui::TuiDebugger;
 use super::super::stringify::IpeStringify;
 use super::super::tea::{
-    CliEvent, INTERRUPT_EXIT_CODE, InputBudget, IpeCmd, IpeSub, MAX_QUEUED_INPUT, SubManager,
-    cli_run_cmd,
+    CliEvent, InputBudget, IpeCmd, IpeSub, MAX_QUEUED_INPUT, SubManager, cli_run_cmd,
 };
 use super::CellsView;
 use super::focus::{
@@ -582,7 +581,7 @@ where
                 }
                 CliEvent::Interrupt => {
                     submgr.stop_all();
-                    crate::system::exit_process(INTERRUPT_EXIT_CODE)
+                    crate::system::exit_process(crate::system::ProcessStatus::INTERRUPTED)
                 }
                 CliEvent::Msg(m) | CliEvent::PerformDone(m) => vec![m],
                 CliEvent::Line(..) => continue,
@@ -1258,7 +1257,7 @@ where
                 CliEvent::Line(..) => continue,
                 CliEvent::Interrupt => {
                     submgr.stop_all();
-                    crate::system::exit_process(INTERRUPT_EXIT_CODE)
+                    crate::system::exit_process(crate::system::ProcessStatus::INTERRUPTED)
                 }
                 // The permit returns to the reader's budget as the key is taken.
                 CliEvent::Key(kind, value, _permit) => {

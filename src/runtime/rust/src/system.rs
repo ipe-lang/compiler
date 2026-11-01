@@ -3661,10 +3661,11 @@ impl ProcessStatus {
     pub const FAILURE: Self = Self(1);
     /// The largest request every target (Unix, Windows, WASI) reports unchanged.
     pub const PORTABLE_MAX: u8 = 125;
-    /// `128 + SIGINT`: the runtime's own forced-shutdown status on an interrupt.
+    /// `128 + SIGINT`: the status of a program an interrupt ends — a native
+    /// server's forced shutdown, or a terminal app's Ctrl-C in raw mode.
     ///
-    /// Native-server only; never built from a program's `Int`.
-    #[cfg(feature = "server")]
+    /// Never built from a program's `Int`.
+    #[cfg(any(feature = "server", all(not(target_arch = "wasm32"), feature = "tui")))]
     pub(crate) const INTERRUPTED: Self = Self(130);
     /// `128 + SIGTERM`: the runtime's own forced-shutdown status on a terminate.
     ///
