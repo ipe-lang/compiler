@@ -121,7 +121,9 @@ pub fn unix_secs() -> i64 {
     unix_millis().div_euclid(1000)
 }
 
-#[cfg(test)]
+// The wasm-floor cell scan admits no test module outside `src/wasm/` into the
+// wasm32 library test binary.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::{
         I64_CEIL, I64_FLOOR, byte_saturating, count_from_int, count_to_int, count_to_int_u64,
@@ -232,7 +234,6 @@ mod tests {
         assert_eq!(f64_trunc_to_i64(-0.0), Some(0));
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn unix_clock_reads_agree() {
         let secs = super::unix_secs();

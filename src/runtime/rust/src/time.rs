@@ -97,7 +97,10 @@ pub fn time_sleep<E: 'static>(ms: i64) -> IpeTask<E, ()> {
 /// `setTimeout` reads its delay as a signed 32-bit `long`, and `gloo-timers`
 /// passes its `u32` through as `i32`, so a delay past `i32::MAX` wraps to a
 /// negative one and fires at once.
-#[cfg(any(test, all(target_arch = "wasm32", feature = "wasm-client")))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    all(target_arch = "wasm32", feature = "wasm-client")
+))]
 const SLEEP_CHUNK_MS: u32 = i32::MAX.unsigned_abs();
 
 /// Splits a `Time.sleep` of `ms` milliseconds into browser-timer-sized waits.
@@ -106,7 +109,10 @@ const SLEEP_CHUNK_MS: u32 = i32::MAX.unsigned_abs();
 /// is always at least one (a zero wait still yields to the event loop, as the
 /// native arm's zero sleep does). A negative `ms` waits zero, matching the
 /// native arm's deadlock guard.
-#[cfg(any(test, all(target_arch = "wasm32", feature = "wasm-client")))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    all(target_arch = "wasm32", feature = "wasm-client")
+))]
 fn sleep_chunks(ms: i64) -> impl Iterator<Item = u32> {
     let mut rest = Some(ms.max(0).unsigned_abs());
     std::iter::from_fn(move || {
@@ -943,9 +949,9 @@ mod time_advanced_tests {
     }
 }
 
-// The calendar and sleep narrowings, in an always-compiled module so the
-// wasm-floor node leg runs them on a 32-bit `usize` target too.
-#[cfg(test)]
+// The calendar and sleep narrowings, outside the `time` feature so the
+// featureless runtime runs them too.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod narrowing_tests {
     use super::{SLEEP_CHUNK_MS, sleep_chunks, time_days_in_month};
 
