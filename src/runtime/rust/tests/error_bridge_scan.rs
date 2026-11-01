@@ -70,7 +70,7 @@ const TRANSITIONAL_FROM_STRING: &[(&str, usize)] = &[
     ("file.rs", 3),
     ("http_client.rs", 18),
     ("http_stream.rs", 9),
-    ("jwt.rs", 4),
+    ("jwt.rs", 2),
     ("money.rs", 3),
     ("random.rs", 1),
     ("revocation.rs", 4),
