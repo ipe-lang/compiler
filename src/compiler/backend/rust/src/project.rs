@@ -1746,8 +1746,8 @@ fn open_main_with(fixed: &str, statement: &str) -> DResult<String> {
         return Err(Diagnostic::CompilerBug {
             where_: "ipe_backend_rust::project::open_main_with",
             detail: format!(
-                "test-runner key: anchor `{}` must occur exactly once in the native epilogue",
-                NATIVE_MAIN_ANCHOR.escape_default()
+                "test-runner key: the line `{}` must occur exactly once in the native epilogue",
+                NATIVE_MAIN_ANCHOR.trim_end()
             ),
         });
     };
