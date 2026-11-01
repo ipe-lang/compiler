@@ -2212,12 +2212,14 @@ mod tests {
                 "shape '{}': `Quit` must end the program through `System.exit`",
                 shape.label()
             );
-            assert_eq!(
-                advertises_q,
-                shape.readme_description().contains("`q` quits"),
-                "shape '{}': the README must advertise the same quit key as the hint",
-                shape.label()
-            );
+            for runtime in Runtime::ALL {
+                assert_eq!(
+                    advertises_q,
+                    shape.readme_description(runtime).contains("`q` quits"),
+                    "shape '{}' ({runtime:?}): the README must advertise the same quit key as the hint",
+                    shape.label()
+                );
+            }
         }
     }
 
