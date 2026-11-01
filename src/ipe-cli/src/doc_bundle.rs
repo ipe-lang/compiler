@@ -65,12 +65,28 @@ pub const OVERLAY_ENTRY_CAP: EntryCap =
 pub const OVERLAY_TOTAL_READ_CAP: u64 = 16 * 1024 * 1024;
 
 /// The overlay kind directories under `docs/`, each with the kind its pages become.
-const OVERLAY_KINDS: [(&str, DocKind); 4] = [
+pub(crate) const OVERLAY_KINDS: [(&str, DocKind); 4] = [
     ("constructs", DocKind::Construct),
     ("idioms", DocKind::Idiom),
     ("topics", DocKind::Topic),
     ("guide", DocKind::Guide),
 ];
+
+/// The `docs/<dir>` directories `ipe doc` serves, one per [`OVERLAY_KINDS`] row.
+///
+/// Derived from the same table that drives the embedded overlay, so a kind
+/// added to the bundle is scanned by every consumer — the `explain_examples`
+/// checker included — the moment it is served, with no second list to keep in
+/// sync by hand.
+pub const SERVED_PAGE_DIRS: [&str; OVERLAY_KINDS.len()] = {
+    let mut dirs = [""; OVERLAY_KINDS.len()];
+    let mut i = 0;
+    while i < OVERLAY_KINDS.len() {
+        dirs[i] = OVERLAY_KINDS[i].0;
+        i += 1;
+    }
+    dirs
+};
 
 /// The one Markdown file name a docs directory holds that is not a page.
 const HOUSEKEEPING_PAGE: &str = "README.md";
