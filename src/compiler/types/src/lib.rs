@@ -2217,6 +2217,7 @@ fn check_wildcard_pins(
                             found: Box::new(found),
                             definition: None,
                             path: Box::new([]),
+                            unmet_class: None,
                         },
                     },
                     &app.use_home,
@@ -2714,6 +2715,17 @@ pub(crate) fn super_unsatisfied(
     ty: &Ty,
     span: Span,
 ) -> Diagnostic {
+    super_unsatisfied_named(interner, bounds, ty, span, &mut VarNamer::new())
+}
+
+/// [`super_unsatisfied`], rendering `ty`'s variables through `namer`.
+pub(crate) fn super_unsatisfied_named(
+    interner: &Interner,
+    bounds: TyBounds,
+    ty: &Ty,
+    span: Span,
+    namer: &mut VarNamer,
+) -> Diagnostic {
     // Name every super-type the variable owes, in a fixed order, joined with
     // `+` (`Number + Equatable` when a variable is both added and compared for
     // equality). A bound set always carries at least one obligation at a call
@@ -2759,8 +2771,7 @@ pub(crate) fn super_unsatisfied(
     } else {
         classes.join(" + ")
     };
-    let mut namer = VarNamer::new();
-    let found = match ty_to_doc(ty, interner, &mut namer) {
+    let found = match ty_to_doc(ty, interner, namer) {
         Ok(d) => d,
         Err(bug) => return bug,
     };
@@ -5084,15 +5095,90 @@ mod tests {
     }
 
     #[test]
-    fn calling_a_non_function_keeps_function_shape_on_expected_side() {
-        // Calling a non-function value: the *expected* side stays the
-        // function shape the call site demands, the *found* side the callee's
-        // actual (non-function) type. Locks the companion orientation so the
-        // per-arg fix above cannot silently flip this arm.
+    fn calling_a_non_function_reads_as_a_call_arity_fault() {
+        // Calling a non-function value is a call given more arguments than
+        // its callee takes (none): the refusal names the callee, the count,
+        // and the callee's actual type, never a bare `a -> b` shape.
         // (`String`, not an integer literal — a bare `5` is a polymorphic
-        // Number var and would render as a type variable, not a Con.)
+        // Number var, not a Con.)
         let src = "module Main exposing (main)\n\
                    main =\n    let x = \"s\" in x 1\n";
+        let (m, mut i) = canon_src(src).expect("fixture must parse and canonicalise");
+        let r = infer(&m, &mut i);
+        assert!(
+            matches!(
+                r,
+                Err(Diagnostic::Type {
+                    msg: TypeError::CallArity { .. },
+                    ..
+                })
+            ),
+            "calling a String must be a CallArity, got {r:?}"
+        );
+        let Err(Diagnostic::Type {
+            msg:
+                TypeError::CallArity {
+                    callee,
+                    count,
+                    signature,
+                },
+            ..
+        }) = r
+        else {
+            return;
+        };
+        assert_eq!(callee.as_deref(), Some("x"));
+        assert_eq!((count.takes(), count.given()), (0, 1));
+        assert_eq!(*signature, con_doc("String"));
+    }
+
+    /// The arity refusal `src` yields, as `(callee, takes, given)`, or `None`
+    /// when inference yields anything else.
+    fn call_arity_of(src: &str) -> Option<(Option<Box<str>>, usize, usize)> {
+        let (m, mut i) = canon_src(src)?;
+        match infer(&m, &mut i) {
+            Err(Diagnostic::Type {
+                msg: TypeError::CallArity { callee, count, .. },
+                ..
+            }) => Some((callee, count.takes(), count.given())),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_call_given_too_many_arguments_names_the_callee_and_its_arity() {
+        let src = "module Main exposing (main)\n\
+                   greet : String -> Int -> String\n\
+                   greet name n =\n    name\n\
+                   main =\n    greet \"x\" 3 4\n";
+        assert_eq!(
+            call_arity_of(src),
+            Some((Some("greet".into()), 2, 3)),
+            "one argument past the callee's arity is a CallArity refusal"
+        );
+    }
+
+    #[test]
+    fn a_partial_call_used_as_a_value_names_the_missing_arguments() {
+        let src = "module Main exposing (main)\n\
+                   greet : String -> Int -> String\n\
+                   greet name n =\n    name\n\
+                   size : String -> Int\n\
+                   size s =\n    0\n\
+                   main =\n    size (greet \"x\")\n";
+        assert_eq!(
+            call_arity_of(src),
+            Some((Some("greet".into()), 2, 1)),
+            "a call one argument short, used where its result is expected, is a CallArity refusal"
+        );
+    }
+
+    #[test]
+    fn a_call_at_its_arity_with_a_wrong_argument_stays_a_mismatch() {
+        let src = "module Main exposing (main)\n\
+                   greet : String -> Int -> String\n\
+                   greet name n =\n    name\n\
+                   main =\n    greet \"x\" \"y\"\n";
         let (m, mut i) = canon_src(src).expect("fixture must parse and canonicalise");
         let r = infer(&m, &mut i);
         assert!(
@@ -5103,25 +5189,96 @@ mod tests {
                     ..
                 })
             ),
-            "calling a String must be a TypeMismatch, got {r:?}"
+            "a wrong argument at the right arity is no arity fault, got {r:?}"
         );
-        let Err(Diagnostic::Type {
-            msg: TypeError::TypeMismatch {
-                expected, found, ..
-            },
-            ..
-        }) = r
-        else {
-            return;
-        };
-        assert!(
-            matches!(*expected, ipe_diagnostics::TyDoc::Fun(..)),
-            "the call-shape (a function type) must be the expected side, got {expected:?}"
-        );
+    }
+
+    /// The `(expected, found, unmet_class)` of the mismatch `src` yields, or
+    /// `None` when inference yields anything else.
+    fn class_mismatch_of(
+        src: &str,
+    ) -> Option<(
+        ipe_diagnostics::TyDoc,
+        ipe_diagnostics::TyDoc,
+        Option<ipe_diagnostics::TypeClass>,
+    )> {
+        let (m, mut i) = canon_src(src)?;
+        match infer(&m, &mut i) {
+            Err(Diagnostic::Type {
+                msg:
+                    TypeError::TypeMismatch {
+                        expected,
+                        found,
+                        unmet_class,
+                        ..
+                    },
+                ..
+            }) => Some((*expected, *found, unmet_class)),
+            _ => None,
+        }
+    }
+
+    fn var_doc(name: &str) -> ipe_diagnostics::TyDoc {
+        ipe_diagnostics::TyDoc::Var(name.into())
+    }
+
+    #[test]
+    fn a_number_where_a_bool_is_expected_reads_by_its_class() {
+        let src = "module Main exposing (main)\n\
+                   main =\n    if 1 then 2 else 3\n";
         assert_eq!(
-            *found,
-            con_doc("String"),
-            "the non-function callee's type must be the found side"
+            class_mismatch_of(src),
+            Some((
+                con_doc("Bool"),
+                var_doc("number"),
+                Some(ipe_diagnostics::TypeClass::Number)
+            )),
+            "an unpinned numeric literal must read as `number` and name the class"
+        );
+    }
+
+    #[test]
+    fn adding_a_string_names_the_number_class() {
+        let src = "module Main exposing (main)\n\
+                   main =\n    \"a\" + 1\n";
+        let unmet = class_mismatch_of(src).and_then(|(_, _, unmet)| unmet);
+        assert_eq!(unmet, Some(ipe_diagnostics::TypeClass::Number));
+    }
+
+    #[test]
+    fn ordering_functions_names_the_comparable_class() {
+        let src = "module Main exposing (main)\n\
+                   main =\n    (\\x -> x) < (\\x -> x)\n";
+        let unmet = class_mismatch_of(src).and_then(|(_, _, unmet)| unmet);
+        assert_eq!(unmet, Some(ipe_diagnostics::TypeClass::Comparable));
+    }
+
+    #[test]
+    fn ordering_a_custom_type_names_the_comparable_class() {
+        let src = "module Main exposing (main)\n\
+                   type Color = Red | Green\n\
+                   main =\n    Green < Red\n";
+        let unmet = class_mismatch_of(src).and_then(|(_, _, unmet)| unmet);
+        assert_eq!(unmet, Some(ipe_diagnostics::TypeClass::Comparable));
+    }
+
+    #[test]
+    fn comparing_functions_names_the_equatable_class() {
+        let src = "module Main exposing (main)\n\
+                   main =\n    (\\x -> x) == (\\x -> x)\n";
+        let unmet = class_mismatch_of(src).and_then(|(_, _, unmet)| unmet);
+        assert_eq!(unmet, Some(ipe_diagnostics::TypeClass::Equatable));
+    }
+
+    #[test]
+    fn a_plain_mismatch_names_no_class() {
+        let src = "module Main exposing (main)\n\
+                   main =\n    if \"s\" then 2 else 3\n";
+        let unmet = class_mismatch_of(src).map(|(_, _, unmet)| unmet);
+        assert_eq!(
+            unmet,
+            Some(None),
+            "two concrete types disagreeing owe no class"
         );
     }
 
