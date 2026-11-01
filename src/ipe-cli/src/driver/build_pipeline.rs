@@ -580,6 +580,7 @@ pub fn build_with_options_into(
     compile_modules(
         sources,
         discovered,
+        project::CompiledDeps::none(),
         &entry_path,
         &target,
         runtime_dir,
@@ -644,6 +645,7 @@ pub fn build_loose_file_into(
     compile_modules(
         collected.sources,
         collected.discovered,
+        project::CompiledDeps::none(),
         &collected.entry_module_path,
         &target,
         runtime_dir,
@@ -964,7 +966,8 @@ pub enum CacheOutcome {
 /// injection seam is identical on the single-file and project paths.
 ///
 /// `blame_path` is the file a cross-file diagnostic with no single owner (an
-/// import cycle) is rendered against.
+/// import cycle) is rendered against; `deps` proves the dependencies of the
+/// manifest the sources were read under were honored or refused.
 ///
 /// # Errors
 /// [`CliError::Pipeline`] carrying the first compiler diagnostic; [`CliError::Io`]
@@ -973,6 +976,7 @@ pub enum CacheOutcome {
 pub fn compile_modules(
     sources: BTreeMap<Vec<String>, (PathBuf, String)>,
     discovered: Vec<project::DiscoveredModule>,
+    deps: project::CompiledDeps,
     entry_path: &[String],
     target: &EmitTarget,
     runtime_dir: &Path,
@@ -984,6 +988,7 @@ pub fn compile_modules(
     compile_modules_observed(
         sources,
         discovered,
+        deps,
         entry_path,
         target,
         runtime_dir,
@@ -1020,6 +1025,7 @@ pub fn compile_modules(
 pub fn compile_modules_observed(
     sources: BTreeMap<Vec<String>, (PathBuf, String)>,
     discovered: Vec<project::DiscoveredModule>,
+    deps: project::CompiledDeps,
     entry_path: &[String],
     target: &EmitTarget,
     runtime_dir: &Path,
@@ -1032,7 +1038,8 @@ pub fn compile_modules_observed(
         return (Err(refusal), CacheOutcome::Miss);
     }
     // The same stdlib-closure and FFI injection capability inference sees.
-    let source_set = match super::PackageSourceSet::assemble(sources, discovered, blame_path) {
+    let source_set = match super::PackageSourceSet::assemble(sources, discovered, blame_path, deps)
+    {
         Ok(set) => set,
         Err(e) => return (Err(e), CacheOutcome::Miss),
     };
@@ -3013,10 +3020,10 @@ pub fn build_parsed_project_into(
     options: &BuildOptions,
     host: crate::delivery::HostIntent,
 ) -> Result<EmittedCrate, CliError> {
-    let (sources, discovered) = super::read_package_modules(manifest)?;
+    let (sources, discovered, deps) = super::read_package_modules(manifest)?;
     refuse_debugger_without_runtime_dep(options)?;
     refuse_webview_off_web(host, manifest, &sources)?;
-    let source_set = super::PackageSourceSet::assemble(sources, discovered, manifest_path)?;
+    let source_set = super::PackageSourceSet::assemble(sources, discovered, manifest_path, deps)?;
     build_from_sources_for(
         manifest,
         manifest_path,
@@ -3156,7 +3163,9 @@ fn build_from_sources_for(
         && !manifest.exposed_modules.is_empty()
         && !source_set.has_module(&entry_path)
     {
-        return Err(CliError::Usage(text::msg::library_package_no_entry()));
+        return Err(CliError::ProjectRefused(
+            text::msg::library_package_no_entry(),
+        ));
     }
     // The emit epilogue's fixed `fn main` calls `ipe_main`, which the backend
     // names only for a `main` in module `Main`. A `programs`-declared entry in a
@@ -3165,7 +3174,7 @@ fn build_from_sources_for(
     // so emitting a non-`Main` program entry would miscompile. Refuse cleanly and
     // point at the working analysis path rather than emit a broken crate.
     if entry_path != ["Main".to_owned()] {
-        return Err(CliError::Usage(text::msg::build_entry_not_main(
+        return Err(CliError::ProjectRefused(text::msg::build_entry_not_main(
             &entry_path.join("."),
         )));
     }

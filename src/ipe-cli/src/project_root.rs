@@ -281,7 +281,7 @@ impl ProjectRoot {
     /// [`CliError::EntryMissing`], [`CliError::EntryEscapes`],
     /// [`CliError::ExposedModuleMissing`] or [`CliError::NoDefaultEntry`] when
     /// what the project builds is not all present under `src/`;
-    /// [`CliError::Usage`] when `package.ipe` names a `sourceRoot` other than
+    /// [`CliError::ProjectRefused`] when `package.ipe` names a `sourceRoot` other than
     /// `src`, or for the manifest's own refusals; [`CliError::Io`] on another
     /// failure.
     pub fn resolve(arg: RootArg) -> Result<Self, CliError> {
@@ -315,7 +315,7 @@ impl ProjectRoot {
         };
         let (manifest, spelled) = parse_package_manifest_source(&source, &path.join(PACKAGE_IPE))?;
         if spelled != SRC_DIR {
-            return Err(CliError::Usage(
+            return Err(CliError::ProjectRefused(
                 text::msg::package_manifest_source_root_removed(),
             ));
         }
@@ -960,8 +960,9 @@ mod tests {
         let err = resolve_err(s.path());
         assert_eq!(
             err.to_string(),
-            CliError::Usage(text::msg::package_manifest_source_root_removed()).to_string()
+            CliError::ProjectRefused(text::msg::package_manifest_source_root_removed()).to_string()
         );
+        assert!(matches!(err, CliError::ProjectRefused(_)), "{err:?}");
         assert!(err.to_string().contains("must live in `src/`"));
     }
 

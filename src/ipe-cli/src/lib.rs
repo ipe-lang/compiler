@@ -33,6 +33,7 @@ pub mod control_model_consent;
 pub mod coverage;
 pub mod delivery;
 pub mod delivery_set;
+pub mod dep_path;
 pub mod diff;
 pub mod doc;
 pub mod doc_bundle;

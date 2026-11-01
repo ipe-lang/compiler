@@ -282,7 +282,7 @@ impl From<LockRefusal> for CliError {
 const LOCAL_REV: &str = "local";
 
 /// The longest recorded local path, in bytes.
-const MAX_LOCAL_SOURCE_LEN: usize = 4096;
+pub(crate) const MAX_LOCAL_SOURCE_LEN: usize = 4096;
 
 /// The recorded location of a `{path=}` dependency, as the author wrote it.
 ///

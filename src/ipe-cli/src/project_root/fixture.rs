@@ -161,7 +161,7 @@ mod tests {
         assert!(matches!(err, CliError::NoDefaultEntry { .. }), "{err}");
         let err = RootFixture::from_tree(&SourceTree::main(MODULE).field("sourceRoot = \"app\""))
             .expect_err("moved source root");
-        assert!(matches!(err, CliError::Usage(_)), "{err}");
+        assert!(matches!(err, CliError::ProjectRefused(_)), "{err}");
     }
 
     /// A scratch directory holding `manifest` as an emitted `Cargo.toml`.

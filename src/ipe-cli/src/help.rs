@@ -345,10 +345,9 @@ const COMMANDS: &[Command] = &[
         page: include_str!("../help/clean.md"),
         hidden: false,
     },
-    // Editing a package.ipe `Package.dependencies` list is not yet
-    // automated, so `add`/`remove` today only report the manual step. Kept
-    // dispatchable (and documented) but withheld from the top-level screen
-    // until the manifest-source rewrite lands.
+    // `add`/`remove` edit the package.ipe `dependencies` list, but no
+    // compiling command builds a declared dependency, so they stay
+    // dispatchable (and documented) but withheld from the top-level screen.
     Command {
         name: "add",
         run: crate::pkg::run_add,

@@ -54,9 +54,16 @@ dependencies =
     ]
 ```
 
-`ipe add <pkg>[@<req>]` writes a `dep` line and pins it in `ipe.lock` for you;
-`depGit`/`depPath` escapes are author-written and never rewritten. Rust crates
-for FFI:
+Each name appears once. A `depPath` is `../` steps (at most eight) and then
+`/`-separated directory names, the same on every host; an absolute path, a
+drive, a `\`, or a `.` component is refused.
+
+No dependency is compiled yet: a package that declares one is refused by
+`ipe type-check`, `ipe dev build`, `ipe test` and `ipe lint`, with an error that
+names the dependency and its kind. To use a library today, copy its modules into
+this package's `src/`. `ipe fmt` keeps working, and `ipe add <pkg>[@<req>]` still
+writes a `dep` line and pins it in `ipe.lock`; `depGit`/`depPath` lines are
+author-written and never rewritten. Rust crates for FFI:
 
 ```ipe
 rustDependencies =
