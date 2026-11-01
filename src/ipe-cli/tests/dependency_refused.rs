@@ -36,6 +36,25 @@ fn run(args: &[&str]) -> Run {
     }
 }
 
+/// Run `ipe <args>` with `NO_COLOR=1` from the directory `cwd`.
+fn run_in(cwd: &Path, args: &[&str]) -> Run {
+    match Command::new(support::ipe_bin())
+        .args(args)
+        .current_dir(cwd)
+        .env("NO_COLOR", "1")
+        .output()
+    {
+        Ok(output) => Run {
+            ok: output.status.success(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        },
+        Err(e) => Run {
+            ok: false,
+            stderr: format!("failed to spawn ipe {args:?} in {}: {e}", cwd.display()),
+        },
+    }
+}
+
 /// A fresh directory unique to this process and call.
 fn fresh_dir(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -240,6 +259,35 @@ fn a_library_build_refusal_prints_no_help() {
         r.stderr
     );
     assert!(!shows_help(&r.stderr), "printed help:\n{}", r.stderr);
+}
+
+/// A directory with no `package.ipe` is a project-state refusal for the
+/// commands that need one: each names the missing manifest and never prints
+/// the command's help page.
+#[test]
+#[allow(clippy::expect_used)] // a failed fixture write is the test failure
+fn a_missing_manifest_prints_no_help() {
+    let base = fresh_dir("no-manifest");
+    std::fs::create_dir_all(&base).expect("create the empty directory");
+    let path = base.to_string_lossy().into_owned();
+    let runs = [
+        ("add", run_in(&base, &["add", "somepkg"])),
+        ("remove", run_in(&base, &["remove", "somepkg"])),
+        ("package audit", run(&["package", "audit", &path])),
+    ];
+    let _ = std::fs::remove_dir_all(&base);
+    for (command, r) in runs {
+        assert!(
+            !r.ok,
+            "{command}: a directory with no manifest must be refused"
+        );
+        assert!(r.stderr.contains("package.ipe"), "{command}: {}", r.stderr);
+        assert!(
+            !shows_help(&r.stderr),
+            "{command}: printed help:\n{}",
+            r.stderr
+        );
+    }
 }
 
 /// Real argument misuse still prints the command's help page, so the

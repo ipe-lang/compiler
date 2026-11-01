@@ -307,9 +307,9 @@ fn locate_manifest(path: &Path) -> Result<PathBuf, CliError> {
             return Ok(manifest);
         }
         if crate::project::has_only_legacy_toml(path) {
-            return Err(CliError::Usage(text::msg::legacy_toml_hint()));
+            return Err(CliError::ProjectRefused(text::msg::legacy_toml_hint()));
         }
-        return Err(CliError::Usage(text::msg::publish_no_manifest(
+        return Err(CliError::ProjectRefused(text::msg::publish_no_manifest(
             &path.display(),
         )));
     }
@@ -318,7 +318,7 @@ fn locate_manifest(path: &Path) -> Result<PathBuf, CliError> {
     {
         return Ok(path.to_path_buf());
     }
-    Err(CliError::Usage(text::msg::publish_not_a_package(
+    Err(CliError::ProjectRefused(text::msg::publish_not_a_package(
         &path.display(),
     )))
 }
@@ -547,13 +547,13 @@ pub fn render_entry(
 /// The manifest's version as the index will record it.
 ///
 /// # Errors
-/// [`CliError::Usage`] when the manifest declares no version;
+/// [`CliError::ProjectRefused`] when the manifest declares no version;
 /// [`CliError::VersionRefused`] when it carries build metadata.
 fn manifest_published_version(manifest: &ProjectManifest) -> Result<PublishedVersion, CliError> {
     let version = manifest
         .version
         .clone()
-        .ok_or_else(|| CliError::Usage(text::msg::publish_no_version(&manifest.name)))?;
+        .ok_or_else(|| CliError::ProjectRefused(text::msg::publish_no_version(&manifest.name)))?;
     PublishedVersion::from_semver(version).map_err(|refusal| refusal.for_package(&manifest.name))
 }
 

@@ -1512,18 +1512,17 @@ pub fn has_only_legacy_toml(dir: &Path) -> bool {
 /// [`CliError::ProjectRefused`] for a malformed or invalid manifest (an unsupported
 /// driver, a bad version or dependency, an unknown capability, a denylisted
 /// `publicEnv` name, a missing source root); [`CliError::Pipeline`] when the
-/// source does not parse; and [`CliError::Usage`] when the path is not a
-/// `package.ipe`.
+/// source does not parse; and [`CliError::ProjectRefused`] when the path is
+/// not a `package.ipe`.
 pub fn parse_manifest(manifest_path: &Path) -> Result<ProjectManifest, CliError> {
     if manifest_path.file_name().and_then(|n| n.to_str())
         == Some(crate::package_manifest::PACKAGE_IPE)
     {
         return crate::package_manifest::parse_package_manifest(manifest_path);
     }
-    Err(CliError::Usage(text::msg::manifest_not_package_ipe(
-        &manifest_path.display(),
-        &text::legacy_toml_hint(),
-    )))
+    Err(CliError::ProjectRefused(
+        text::msg::manifest_not_package_ipe(&manifest_path.display(), &text::legacy_toml_hint()),
+    ))
 }
 
 // ---------------------------------------------------------------------------
