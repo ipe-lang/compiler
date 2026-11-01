@@ -254,10 +254,18 @@ fn utf8_seq_len(lead: u8) -> usize {
 /// multibyte UTF-8 char needs all its continuation bytes. Carrying a tail that is
 /// in fact already complete is harmless — it is decoded on the next read with the
 /// following bytes prepended (one-read latency, never a drop or mis-decode).
+///
+/// A tail holding a byte that cannot continue its sequence — a C0 control after
+/// an ESC, a non-continuation byte after a UTF-8 lead — is already cut there, so
+/// it is never carried: a Ctrl-C at the end of a filled read is decoded now
+/// instead of waiting for a next read that may never come.
 fn tail_maybe_truncated(tail: &[u8]) -> bool {
+    let body = tail.get(1..).unwrap_or(&[]);
     match tail.first() {
-        Some(&0x1b) => tail.len() < MAX_KEY_SEQ,
-        Some(&b) if b >= 0x80 => tail.len() < utf8_seq_len(b),
+        Some(&0x1b) => tail.len() < MAX_KEY_SEQ && !body.iter().any(|b| *b < 0x20),
+        Some(&b) if b >= 0x80 => {
+            tail.len() < utf8_seq_len(b) && body.iter().all(|b| (0x80..=0xbf).contains(b))
+        }
         _ => false,
     }
 }
@@ -2322,6 +2330,64 @@ mod key_reader_tests {
         let active = AtomicBool::new(true);
         paint_to(&mut out, &active, "frame");
         assert!(out.ends_with(b"frame"), "{out:?}");
+    }
+
+    /// A reader that hands out `chunks` one read each; a read past them records
+    /// whether the interrupt was already queued, then reports end of input.
+    struct ChunkedThenCheck {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        rx: tokio::sync::mpsc::UnboundedReceiver<CliEvent<()>>,
+        interrupt_queued: bool,
+        read_past_chunks: bool,
+    }
+
+    impl ChunkedThenCheck {
+        fn drain(&mut self) {
+            while let Ok(ev) = self.rx.try_recv() {
+                self.interrupt_queued |= matches!(ev, CliEvent::Interrupt);
+            }
+        }
+    }
+
+    impl std::io::Read for ChunkedThenCheck {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let Some(chunk) = self.chunks.pop_front() else {
+                self.read_past_chunks = true;
+                self.drain();
+                return Ok(0);
+            };
+            Ok(buf
+                .iter_mut()
+                .zip(chunk.iter())
+                .map(|(dst, src)| *dst = *src)
+                .count())
+        }
+    }
+
+    // A Ctrl-C at the end of a completely filled read, right after an
+    // unfinished escape or UTF-8 sequence, is queued from that read: it never
+    // waits in the carried tail for a next read the user may never send.
+    #[test]
+    fn ctrl_c_ending_a_filled_read_is_queued_without_a_next_read() {
+        for tail in [&b"\x1b[\x03"[..], b"\x1b\x03", b"\xe2\x03"] {
+            let mut chunk = vec![b'a'; 64];
+            chunk.truncate(64_usize.saturating_sub(tail.len()));
+            chunk.extend_from_slice(tail);
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<CliEvent<()>>();
+            let mut input = ChunkedThenCheck {
+                chunks: std::iter::once(chunk).collect(),
+                rx,
+                interrupt_queued: false,
+                read_past_chunks: false,
+            };
+            read_keys_from(&mut input, &tx);
+            assert!(
+                !input.read_past_chunks || input.interrupt_queued,
+                "{tail:?}: interrupt held past the filled read"
+            );
+            input.drain();
+            assert!(input.interrupt_queued, "{tail:?}: no interrupt");
+        }
     }
 
     #[test]
