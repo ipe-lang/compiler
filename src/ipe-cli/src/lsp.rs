@@ -149,7 +149,6 @@ const fn ffi_prep_load_error(refusal: &FfiPrepError, detail: String) -> LoadErro
     match refusal {
         FfiPrepError::ModuleClaimed { .. }
         | FfiPrepError::ReservedModuleExists
-        | FfiPrepError::AssertedRefused(_)
         | FfiPrepError::AssertedShimSeal(_) => LoadError::Pipeline(detail),
         FfiPrepError::DefineOpaqueCollision { .. }
         | FfiPrepError::DependencyMerge(_)
@@ -362,12 +361,11 @@ mod tests {
     ///
     /// The exhaustive match over a witness value makes a new variant a build
     /// error here until it joins the list.
-    fn every_ffi_prep_error() -> [FfiPrepError; 9] {
+    fn every_ffi_prep_error() -> [FfiPrepError; 8] {
         let witness = FfiPrepError::ReservedModuleExists;
         match witness {
             FfiPrepError::ModuleClaimed { .. }
             | FfiPrepError::ReservedModuleExists
-            | FfiPrepError::AssertedRefused(_)
             | FfiPrepError::AssertedShimSeal(_)
             | FfiPrepError::DefineOpaqueCollision { .. }
             | FfiPrepError::DependencyMerge(_)
@@ -386,10 +384,6 @@ mod tests {
                 slug: "a".to_owned(),
             },
             FfiPrepError::ReservedModuleExists,
-            FfiPrepError::AssertedRefused(Box::new(ipe_ffi::diag::Diagnostic::ArtifactIo {
-                path: "/p/x.consumer.json".to_owned(),
-                detail: "refused".to_owned(),
-            })),
             FfiPrepError::AssertedShimSeal(dropped()),
             FfiPrepError::DefineOpaqueCollision {
                 slug: "a".to_owned(),
@@ -416,7 +410,6 @@ mod tests {
             refusal,
             FfiPrepError::ModuleClaimed { .. }
                 | FfiPrepError::ReservedModuleExists
-                | FfiPrepError::AssertedRefused(_)
                 | FfiPrepError::AssertedShimSeal(_)
         )
     }

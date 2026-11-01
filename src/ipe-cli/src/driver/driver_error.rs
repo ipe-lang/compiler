@@ -1679,7 +1679,6 @@ const fn ffi_prep_fault(refusal: &crate::ffi::FfiPrepError) -> crate::screen::Fa
         FfiPrepError::AssertedWithoutCatalog => crate::screen::Fault::Internal,
         FfiPrepError::ModuleClaimed { .. }
         | FfiPrepError::ReservedModuleExists
-        | FfiPrepError::AssertedRefused(_)
         | FfiPrepError::AssertedShimSeal(_)
         | FfiPrepError::DefineOpaqueCollision { .. }
         | FfiPrepError::DependencyMerge(_)
