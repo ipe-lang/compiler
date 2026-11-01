@@ -557,9 +557,17 @@ fn decoder_idiomatic_pipe_form_checks_clean() -> TestResult {
 fn check_help_page_names_the_command() -> TestResult {
     let (ok, stdout, _) = run_ipe(&["type-check", "--help"])?;
     assert!(ok, "--help exits 0");
+    let summary = include_str!("../help/type-check.md")
+        .lines()
+        .next()
+        .unwrap_or_default();
     assert!(
-        stdout.contains("type-check") && stdout.contains("Type-check"),
-        "help page names the command, got:\n{stdout}"
+        !summary.is_empty() && stdout.contains(summary),
+        "help page renders the command's summary {summary:?}, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("ipe type-check [<path>]"),
+        "help page names the command in its usage line, got:\n{stdout}"
     );
     Ok(())
 }
@@ -814,6 +822,55 @@ fn type_check_library_runs_lowering() -> TestResult {
     Ok(())
 }
 
+/// A well-typed entry whose `main` is an `Int`: a value, not a runnable entry.
+const NON_RUNNABLE_MAIN: &str = "module Main exposing (main)\n\n\nmain : Int\nmain =\n    1\n";
+
+/// `ipe type-check` refuses a `src/` entry whose `main` is not runnable with
+/// IPE-L0136, the entry rule `ipe dev build` refuses it under.
+#[test]
+fn type_check_refuses_a_non_runnable_entry_main() -> TestResult {
+    let project = SourceTree::main(NON_RUNNABLE_MAIN).resolve()?;
+    let (ok, stdout, stderr) = type_check_in(&project_dir(&project)?)?;
+    assert!(
+        !ok,
+        "an entry whose `main` is an `Int` must fail type-check, got:\n{stdout}"
+    );
+    assert_eq!(
+        first_code(&stderr),
+        Some("IPE-L0136"),
+        "the refusal must carry the entry rule's code, got:\n{stderr}"
+    );
+    Ok(())
+}
+
+/// `ipe type-check tests/Main.ipe` refuses a test entry whose `main` is not
+/// runnable with IPE-L0136: `ipe test` builds `tests/Main.ipe` as the test
+/// program's entry, under the same entry rule.
+#[test]
+fn type_check_refuses_a_non_runnable_test_entry_main() -> TestResult {
+    let project = SourceTree::main(
+        "module Main exposing (main)\n\nimport Ipe.Io as Io\n\n\nmain =\n    Io.println \"app\"\n",
+    )
+    .test_module("Main", NON_RUNNABLE_MAIN)
+    .resolve()?;
+    let out = Command::new(support::ipe_bin())
+        .args(["type-check", "tests/Main.ipe"])
+        .current_dir(project_dir(&project)?)
+        .output()?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a test entry whose `main` is an `Int` must fail type-check, got:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        first_code(&stderr),
+        Some("IPE-L0136"),
+        "the refusal must carry the entry rule's code, got:\n{stderr}"
+    );
+    Ok(())
+}
+
 /// `ipe type-check` and the build front end give one verdict.
 ///
 /// For each program, the first code `ipe type-check` reports equals the one
@@ -823,6 +880,7 @@ fn type_check_library_runs_lowering() -> TestResult {
 fn type_check_and_build_agree() -> TestResult {
     let programs = [
         ("lowering refusal", LOWERING_REFUSAL.to_owned()),
+        ("non-runnable entry main", NON_RUNNABLE_MAIN.to_owned()),
         (
             "hand-nested decoder",
             std::fs::read_to_string(fixture("decoder_nested_direct.ipe"))?,
