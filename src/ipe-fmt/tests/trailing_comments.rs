@@ -284,19 +284,23 @@ fn same_line_positions_demote_their_comment() {
 /// `issue_3939_repro` below, never a string captured from any prior run.
 #[allow(clippy::expect_used)] // a missing anchor line is this helper's own bug to surface
 fn attach_at_owner_line(formatted: &str, placements: &[(&str, &str)]) -> String {
-    let mut lines: Vec<String> = formatted.lines().map(str::to_owned).collect();
-    let mut used = vec![false; lines.len()];
+    let mut lines: Vec<(bool, String)> = formatted
+        .lines()
+        .map(|line| (false, line.to_owned()))
+        .collect();
     for (anchor, comment) in placements {
-        let idx = lines
-            .iter()
-            .enumerate()
-            .find(|(i, line)| !used[*i] && line.contains(anchor))
-            .map(|(i, _)| i)
+        let (used, line) = lines
+            .iter_mut()
+            .find(|(used, line)| !*used && line.contains(anchor))
             .expect("anchor line exists in the formatted baseline");
-        used[idx] = true;
-        lines[idx] = format!("{} {comment}", lines[idx].trim_end());
+        *used = true;
+        *line = format!("{} {comment}", line.trim_end());
     }
-    let mut out = lines.join("\n");
+    let mut out = lines
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect::<Vec<_>>()
+        .join("\n");
     if formatted.ends_with('\n') {
         out.push('\n');
     }
