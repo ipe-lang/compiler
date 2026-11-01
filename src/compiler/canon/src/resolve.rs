@@ -8833,9 +8833,17 @@ fn desugar_multiline(
     let stripped = src::strip_anchor_margin(raw, anchor);
     let chunks = split_interpolation(&stripped);
     // Build one canonical expression per chunk.
+    // An interpolated name has no span of its own: every chunk carries the
+    // whole string's span, so a record there would answer the name at every
+    // offset of the string. Its occurrences resolve into a sink that is dropped.
+    let mut unlocated = NameSink::new();
+    let mut chunk_cx = ResolveCx {
+        interner: &mut *cx.interner,
+        names: &mut unlocated,
+    };
     let mut parts: Vec<canon::Expr> = Vec::with_capacity(chunks.len());
     for chunk in chunks {
-        parts.push(chunk_to_expr(chunk, span, env, cx)?);
+        parts.push(chunk_to_expr(chunk, span, env, &mut chunk_cx)?);
     }
     match parts.len() {
         0 => Ok(canon::Expr_::Str(String::new())),

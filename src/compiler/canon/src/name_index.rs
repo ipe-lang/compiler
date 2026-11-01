@@ -180,7 +180,8 @@ impl NameIndex {
     /// The innermost recorded occurrence containing byte `offset`.
     ///
     /// An occurrence contains the offsets from its start up to, not
-    /// including, its end. When the innermost one is ambiguous the answer is
+    /// including, its end. When the innermost one is ambiguous, or two partly
+    /// overlapping occurrences of one width tie for innermost, the answer is
     /// `None`: an enclosing occurrence never stands in for it.
     #[must_use]
     pub fn at(&self, offset: u32) -> Option<(Span, &Target)> {
@@ -188,14 +189,26 @@ impl NameIndex {
             lo: offset,
             hi: u32::MAX,
         };
-        let innermost = self
+        let mut innermost: Option<(Span, &Slot)> = None;
+        let mut tied = false;
+        for (span, slot) in self
             .by_span
             .range(..=upper)
             .filter(|(span, _)| offset < span.hi)
-            .min_by_key(|(span, _)| span.hi.saturating_sub(span.lo))?;
-        match innermost {
-            (span, Slot::One(target)) => Some((*span, target)),
-            (_, Slot::Ambiguous) => None,
+        {
+            let width = span.hi.saturating_sub(span.lo);
+            match innermost.map(|(held, _)| held.hi.saturating_sub(held.lo)) {
+                Some(held) if width > held => {}
+                Some(held) if width == held => tied = true,
+                Some(_) | None => {
+                    innermost = Some((*span, slot));
+                    tied = false;
+                }
+            }
+        }
+        match innermost? {
+            (span, Slot::One(target)) if !tied => Some((span, target)),
+            (_, Slot::One(_) | Slot::Ambiguous) => None,
         }
     }
 
@@ -303,6 +316,19 @@ mod tests {
         sink.record(inner, top(4));
         let index = sink.finish();
         assert_eq!(index.at(6), None);
+    }
+
+    #[test]
+    fn two_partly_overlapping_occurrences_of_one_width_answer_nothing_where_they_meet() {
+        let left = Span { lo: 0, hi: 5 };
+        let right = Span { lo: 3, hi: 8 };
+        let mut sink = NameSink::new();
+        sink.record(left, top(2));
+        sink.record(right, top(3));
+        let index = sink.finish();
+        assert_eq!(index.at(4), None);
+        assert_eq!(index.at(1), Some((left, &top(2))));
+        assert_eq!(index.at(6), Some((right, &top(3))));
     }
 }
 
@@ -480,6 +506,23 @@ mod resolver_tests {
         );
         let bound = local_at(DO_MAIN, "step", 0)?;
         assert_eq!(index.get(span_of(DO_MAIN, "step", 1)?), Some(&bound));
+        Ok(())
+    }
+
+    const INTERPOLATED: &str = "module Main exposing (greet)\n\n\
+                                greet : String -> String\n\
+                                greet who =\n    \"\"\"hi {{who}} there\"\"\"\n";
+
+    #[test]
+    fn an_interpolated_name_is_never_answered_across_its_whole_string() -> Outcome {
+        let (index, _) = index_of(&[], INTERPOLATED)?;
+        let string = span_of(INTERPOLATED, "\"\"\"hi {{who}} there\"\"\"", 0)?;
+        assert_eq!(index.get(string), None);
+        let literal = span_of(INTERPOLATED, "hi ", 0)?;
+        assert_eq!(index.at(literal.lo), None);
+        // The binder itself is still recorded at its own span.
+        let binder = local_at(INTERPOLATED, "who", 0)?;
+        assert_eq!(index.get(span_of(INTERPOLATED, "who", 0)?), Some(&binder));
         Ok(())
     }
 
