@@ -3262,8 +3262,9 @@ fn version_flags_alias_the_version_command() {
     assert!(run_cli(&["--version".to_owned(), "--json".to_owned()]).is_ok());
 }
 
-/// A clean `Main` entry.
-const CLEAN_MAIN: &str = "module Main exposing (main)\n\n\nmain : Int\nmain =\n    1\n";
+/// A clean `Main` entry: well-typed, and its `main` a runnable entry the build accepts.
+const CLEAN_MAIN: &str =
+    "module Main exposing (main)\n\nimport Ipe.Io as Io\n\n\nmain =\n    Io.println \"clean\"\n";
 
 /// A module `module` whose one value `x` is ill-typed.
 fn ill_typed(module: &str) -> String {
@@ -3447,10 +3448,13 @@ fn type_check_of_a_directory_checks_that_project() {
 fn a_tests_module_importing_a_src_module_type_checks_green() {
     let project = analysis_project(
         &SourceTree::main(CLEAN_MAIN)
-            .module("Support", "module Support exposing (value)\nvalue = 42\n")
+            .module(
+                "Support",
+                "module Support exposing (greeting)\ngreeting = \"hi\"\n",
+            )
             .test_module(
                 "Main",
-                "module Main exposing (main)\nimport Support\nmain = Support.value\n",
+                "module Main exposing (main)\nimport Ipe.Io as Io\nimport Support\nmain = Io.println Support.greeting\n",
             ),
     );
     let checked = typecheck_in(project.root().path(), Some("tests/Main.ipe"));
@@ -3547,7 +3551,7 @@ fn nested_entry_project(main_body: &str) -> ScratchRoot {
             .field("programs = [ { name = \"app\", entry = \"App/Main.ipe\" } ]")
             .module(
                 "Shared.Util",
-                "module Shared.Util exposing (one)\none = 1\n",
+                "module Shared.Util exposing (one, greeting)\none = 1\ngreeting = \"hi\"\n",
             )
             .module("App.Main", main_body),
     )
@@ -3557,7 +3561,7 @@ fn nested_entry_project(main_body: &str) -> ScratchRoot {
 #[test]
 fn type_check_of_a_nested_entry_resolves_src_rooted_imports() {
     let project = nested_entry_project(
-        "module App.Main exposing (main)\nimport Shared.Util as Util\nmain = Util.one\n",
+        "module App.Main exposing (main)\nimport Ipe.Io as Io\nimport Shared.Util as Util\nmain = Io.println Util.greeting\n",
     );
     let checked = typecheck_in(project.root().path(), None);
     assert!(checked.is_ok(), "{checked:?}");

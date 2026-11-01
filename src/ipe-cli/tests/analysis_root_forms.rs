@@ -31,7 +31,7 @@ fn nested_entry_project(name: &str, main_body: &str) -> std::io::Result<PathBuf>
     )?;
     fs::write(
         src.join("Shared").join("Util.ipe"),
-        "module Shared.Util exposing (one)\none = 1\n",
+        "module Shared.Util exposing (one, greeting)\none = 1\ngreeting = \"hi\"\n",
     )?;
     fs::write(
         root.join("Extra.ipe"),
@@ -80,7 +80,7 @@ fn every_form(root: &Path) -> std::io::Result<[(Option<i32>, String); 3]> {
 fn a_nested_entry_type_checks_through_every_form() -> std::io::Result<()> {
     let root = nested_entry_project(
         "analysis_root_forms_nested_entry_green",
-        "module App.Main exposing (main)\nimport Shared.Util as Util\nmain = Util.one\n",
+        "module App.Main exposing (main)\nimport Ipe.Io as Io\nimport Shared.Util as Util\nmain = Io.println Util.greeting\n",
     )?;
     let outcomes = every_form(&root)?;
     fs::remove_dir_all(&root)?;

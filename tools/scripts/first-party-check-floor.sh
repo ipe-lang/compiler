@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Ipê FIRST-PARTY `ipe type-check` FLOOR — the cheap, gating compile floor.
 #
-# Runs `ipe type-check` (type-check ONLY — no `ipe dev build`, no cargo) over every
-# shipped first-party example (first_party_check_set in tools/scripts/lib/examples.sh:
-# examples/shapes/** + examples/wasm/**, minus the FFI-gated ones). A shipped
-# example that fails to type-check FAILS this floor LOUD, naming each broken
+# Runs `ipe type-check` (type inference + IR lowering, no Rust emission, no cargo)
+# over every shipped first-party example (first_party_check_set in
+# tools/scripts/lib/examples.sh: examples/shapes/** + examples/wasm/**, minus the
+# FFI-gated ones). A shipped example that type-check refuses FAILS this floor LOUD,
+# naming each broken
 # entry — so a compiler change that reddens a canonical example breaks the gate
 # instead of rotting silently in the tree.
 #
