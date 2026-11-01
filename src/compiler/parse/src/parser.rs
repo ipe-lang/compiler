@@ -3100,7 +3100,7 @@ impl<'a> Parser<'a> {
                         let bare = text.rsplit('.').next().unwrap_or(text);
                         return Err(Self::qualified_ctor_in_pattern(
                             &tok,
-                            text.into(),
+                            text.as_str().into(),
                             bare.into(),
                         ));
                     }

@@ -3269,23 +3269,27 @@ fn name_help(msg: &NameError) -> Vec<HelpLine> {
     }
 }
 
+/// A type mismatch points at the definition that fixed the type, then names
+/// the class the other side lacks.
+fn mismatch_help(definition: Option<Span>, unmet_class: Option<TypeClass>) -> Vec<HelpLine> {
+    let mut lines: Vec<HelpLine> = definition
+        .into_iter()
+        .map(|span| HelpLine::SecondarySpan {
+            span,
+            role: SpanRole::Definition,
+        })
+        .collect();
+    lines.extend(unmet_class.map(|class| HelpLine::Note(class_note(class).into())));
+    lines
+}
+
 fn type_help(msg: &TypeError) -> Vec<HelpLine> {
     match msg {
         TypeError::TypeMismatch {
             definition,
             unmet_class,
             ..
-        } => {
-            let mut lines: Vec<HelpLine> = definition
-                .iter()
-                .map(|span| HelpLine::SecondarySpan {
-                    span: *span,
-                    role: SpanRole::Definition,
-                })
-                .collect();
-            lines.extend(unmet_class.map(|class| HelpLine::Note(class_note(class).into())));
-            lines
-        }
+        } => mismatch_help(*definition, *unmet_class),
         TypeError::CallArity { count, .. } => vec![HelpLine::Note(arity_note(*count).into())],
         TypeError::BudgetExceeded | TypeError::StepBudgetExceeded { .. } => {
             vec![HelpLine::Hint(Hint::RaiseSolverBudget)]
