@@ -644,12 +644,13 @@ fn unquoted_brace_delta(line: &str) -> i32 {
 /// Scan one source line for ALL occurrences of crate-root module references —
 /// `use crate::<seg>::`, inline path expressions `crate::<seg>::fn()`, and macro
 /// invocations `crate::<seg>::mac!(…)`, plus the equivalent `super::`-chain forms
-/// — and insert every resolved first segment into `deps`.
+/// — and insert every first segment into `deps`.
 ///
-/// A module DEPENDENCY reaches INTO a module (`crate::tea::{…}`,
-/// `crate::app_config::resolve()`, `crate::ct_eq::impl_ct_eq!(...)`); a bare
-/// `crate::Foo` with no trailing `::` imports an item re-exported at the crate
-/// root via the `mod.rs` glob and needs no separate `pub mod` declaration.
+/// A recorded segment is followed by `::`: a module (`crate::tea::{…}`,
+/// `crate::ct_eq::impl_ct_eq!(...)`) or a root item reached through
+/// (`crate::IoFailure::on_path(..)`); [`RootScope::resolve`] maps each to the
+/// module that supplies it. A bare `crate::Foo` with no trailing `::` is not
+/// recorded.
 ///
 /// The `super::`-chain form is recognised only for an EXACT chain of
 /// `supers_to_root` hops, which resolves to the crate root from this file's
@@ -708,6 +709,281 @@ fn extract_seg_with_trailing_colons(s: &str) -> Option<String> {
     }
 }
 
+/// What the first segment of a `crate::<seg>::…` reference names at the crate
+/// root of one emitted `ipe_runtime/mod.rs`.
+#[derive(Debug, PartialEq, Eq)]
+enum RootRef {
+    /// `<seg>` is a runtime module: the reference reaches into it.
+    Module(String),
+    /// `<seg>` is an item a root `pub use <provider>::…` re-exports
+    /// (`crate::IoFailure::on_path` through `pub use error::*;`).
+    Reexported { provider: String },
+    /// `<seg>` is an item the emitted `mod.rs` itself defines, unconditionally.
+    RootItem,
+    /// No root name is `<seg>`: the emitted crate cannot resolve the reference.
+    Unresolved,
+}
+
+impl RootRef {
+    /// The module the emitted `mod.rs` must declare for the reference to build,
+    /// `None` only for a root item. An unresolved `seg` stays its own dep — no
+    /// runtime module bears that name, so no declared set contains it and the
+    /// closure check fires.
+    fn dep(self, seg: &str) -> Option<String> {
+        match self {
+            Self::Module(m) | Self::Reexported { provider: m } => Some(m),
+            Self::RootItem => None,
+            Self::Unresolved => Some(seg.to_owned()),
+        }
+    }
+}
+
+/// Each module path's top-level definitions, memoised across masks.
+type DefCache = HashMap<Vec<String>, BTreeSet<String>>;
+
+/// The root names one emitted `ipe_runtime/mod.rs` supplies: its declared
+/// modules, its unconditional re-exports, and the items it defines itself.
+struct RootScope<'a> {
+    runtime_root: &'a Path,
+    declared: BTreeSet<String>,
+    /// `pub use <path>::*;` — each glob's module path, segment by segment.
+    globs: Vec<Vec<String>>,
+    /// `pub use <path>::{a, b as c};` / `pub use <path>::a;` — each exported
+    /// name and the top-level module of its `<path>`.
+    named: HashMap<String, String>,
+    root_items: BTreeSet<String>,
+}
+
+impl<'a> RootScope<'a> {
+    fn new(runtime_root: &'a Path, mod_rs: &str) -> Self {
+        let mut globs = Vec::new();
+        let mut named = HashMap::new();
+        for stmt in unconditional_root_uses(mod_rs) {
+            parse_root_use(&stmt, &mut globs, &mut named);
+        }
+        Self {
+            runtime_root,
+            declared: declared_modules(mod_rs),
+            globs,
+            named,
+            root_items: top_level_definitions(&blank_literals(mod_rs)),
+        }
+    }
+
+    /// Resolve the first segment of a `crate::<seg>::…` path: a runtime module
+    /// (a `<seg>.rs` or `<seg>/` under the runtime root, or a module the
+    /// `mod.rs` declares) first, then a root item, then a named re-export, then
+    /// a glob re-export of a module defining `<seg>`.
+    fn resolve(&self, seg: &str, defs: &mut DefCache) -> RootRef {
+        let on_disk = self.runtime_root.join(format!("{seg}.rs")).is_file()
+            || self.runtime_root.join(seg).is_dir();
+        if on_disk || self.declared.contains(seg) {
+            return RootRef::Module(seg.to_owned());
+        }
+        if self.root_items.contains(seg) {
+            return RootRef::RootItem;
+        }
+        if let Some(provider) = self.named.get(seg) {
+            return RootRef::Reexported {
+                provider: provider.clone(),
+            };
+        }
+        for path in &self.globs {
+            let items = defs
+                .entry(path.clone())
+                .or_insert_with(|| module_definitions(self.runtime_root, path));
+            if items.contains(seg)
+                && let Some(top) = path.first()
+            {
+                return RootRef::Reexported {
+                    provider: top.clone(),
+                };
+            }
+        }
+        RootRef::Unresolved
+    }
+
+    /// The module each raw `crate::<seg>` reference needs declared, paired
+    /// with the segment that needs it.
+    fn deps_of(&self, raw: &BTreeSet<String>, defs: &mut DefCache) -> Vec<(String, String)> {
+        raw.iter()
+            .filter_map(|seg| {
+                self.resolve(seg, defs)
+                    .dep(seg)
+                    .map(|dep| (seg.clone(), dep))
+            })
+            .collect()
+    }
+}
+
+/// Every depth-0 `pub use …;` statement of a `mod.rs`, joined onto one line,
+/// that no `#[cfg(..)]` attribute gates. A gated re-export does not hold in
+/// every build, so it supplies no name unconditionally (`#[cfg(not(..))]`
+/// holds in the base build, as in [`cfg_gated_child_modules`]).
+fn unconditional_root_uses(mod_rs: &str) -> Vec<String> {
+    let src = blank_literals(mod_rs);
+    let mut out = Vec::new();
+    let mut depth: i32 = 0;
+    let mut cfg_pending = false;
+    let mut open: Option<(String, bool)> = None;
+    for line in src.lines() {
+        let t = line.trim();
+        if let Some((mut stmt, gated)) = open.take() {
+            stmt.push(' ');
+            stmt.push_str(t);
+            if !t.ends_with(';') {
+                open = Some((stmt, gated));
+            } else if !gated {
+                out.push(stmt);
+            }
+            continue;
+        }
+        if depth == 0 {
+            if t.starts_with("#[cfg(") && !t.starts_with("#[cfg(not(") {
+                cfg_pending = true;
+                continue;
+            }
+            if t.starts_with("#[") || t.starts_with("//") || t.is_empty() {
+                continue;
+            }
+            let gated = std::mem::take(&mut cfg_pending);
+            if t.starts_with("pub use ") {
+                if !t.ends_with(';') {
+                    open = Some((t.to_owned(), gated));
+                } else if !gated {
+                    out.push(t.to_owned());
+                }
+                continue;
+            }
+        }
+        depth = (depth + unquoted_brace_delta(t)).max(0);
+    }
+    out
+}
+
+/// Record one `pub use <path>::…;` statement as a glob or as named exports.
+/// A path of one segment (`pub use foo;`) names no runtime module and is
+/// skipped.
+fn parse_root_use(stmt: &str, globs: &mut Vec<Vec<String>>, named: &mut HashMap<String, String>) {
+    let Some(body) = stmt
+        .strip_prefix("pub use ")
+        .and_then(|s| s.trim().strip_suffix(';'))
+    else {
+        return;
+    };
+    let body = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let segs_of = |path: &str| -> Vec<String> {
+        path.split("::")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    if let Some(path) = body.strip_suffix("::*") {
+        globs.push(segs_of(path));
+        return;
+    }
+    let (path, entries): (&str, Vec<&str>) = match body.split_once("::{") {
+        Some((path, list)) => (path, list.trim_end_matches('}').split(',').collect()),
+        None => match body.rsplit_once("::") {
+            Some((path, name)) => (path, vec![name]),
+            None => return,
+        },
+    };
+    let Some(top) = segs_of(path).into_iter().next() else {
+        return;
+    };
+    for entry in entries {
+        let words: Vec<&str> = entry.split_whitespace().collect();
+        let exported = match words.as_slice() {
+            [_, "as", alias] => *alias,
+            [item] => item.rsplit("::").next().unwrap_or(item),
+            _ => continue,
+        };
+        named.insert(exported.to_owned(), top.clone());
+    }
+}
+
+/// The top-level definitions of the runtime module at `path` (segments under
+/// the runtime root), read from `<path>.rs` and `<path>/mod.rs`.
+fn module_definitions(runtime_root: &Path, path: &[String]) -> BTreeSet<String> {
+    let rel: std::path::PathBuf = path.iter().collect();
+    let flat = runtime_root.join(&rel).with_extension("rs");
+    let dir_mod = runtime_root.join(&rel).join("mod.rs");
+    [flat, dir_mod]
+        .iter()
+        .filter_map(|file| std::fs::read_to_string(file).ok())
+        .flat_map(|src| top_level_definitions(&blank_literals(&src)))
+        .collect()
+}
+
+/// The names of the `pub`/`pub(crate)` items defined at brace depth 0 of a
+/// [`blank_literals`] source that no `#[cfg(..)]` attribute gates
+/// (`#[cfg(not(..))]` holds in the base build): `struct`, `enum`, `union`,
+/// `fn` (`const`/`async`/`extern` too), `type`, `trait`, `const`, `static`,
+/// `mod`. A nested `pub use` or a `macro_rules!` supplies no name here, so a
+/// reference only they could satisfy stays unresolved — the check fails
+/// closed on what it cannot prove.
+fn top_level_definitions(src: &str) -> BTreeSet<String> {
+    const KINDS: &[&str] = &[
+        "struct", "enum", "union", "fn", "type", "trait", "const", "static", "mod",
+    ];
+    const QUALIFIERS: &[&str] = &["pub", "crate", "async", "unsafe", "extern"];
+    let mut out = BTreeSet::new();
+    let mut depth: i32 = 0;
+    let mut cfg_pending = false;
+    // Bracket balance of a multi-line attribute still open.
+    let mut attr_open: i32 = 0;
+    for line in src.lines() {
+        let t = line.trim();
+        let at_root = depth == 0;
+        depth = (depth + unquoted_brace_delta(t)).max(0);
+        if !at_root || t.starts_with("//") || t.is_empty() {
+            continue;
+        }
+        let brackets = |s: &str| -> i32 {
+            s.chars().fold(0, |n, c| match c {
+                '[' => n + 1,
+                ']' => n - 1,
+                _ => n,
+            })
+        };
+        if attr_open > 0 {
+            attr_open = (attr_open + brackets(t)).max(0);
+            continue;
+        }
+        if t.starts_with("#[") {
+            if t.starts_with("#[cfg(") && !t.starts_with("#[cfg(not(") {
+                cfg_pending = true;
+            }
+            attr_open = brackets(t).max(0);
+            continue;
+        }
+        let gated = std::mem::take(&mut cfg_pending);
+        if gated || !(t.starts_with("pub ") || t.starts_with("pub(crate)")) {
+            continue;
+        }
+        let mut words = t
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|w| !w.is_empty())
+            .skip_while(|w| QUALIFIERS.contains(w));
+        let Some(mut kind) = words.next() else {
+            continue;
+        };
+        let mut name = words.next();
+        if kind == "const" && matches!(name, Some("fn" | "async" | "unsafe" | "extern")) {
+            kind = "fn";
+            name = words.find(|w| !matches!(*w, "fn" | "async" | "unsafe" | "extern"));
+        }
+        if KINDS.contains(&kind)
+            && let Some(name) = name
+        {
+            out.insert(name.to_owned());
+        }
+    }
+    out
+}
+
 /// The set of top-level modules the emitted `ipe_runtime/mod.rs` DECLARES for
 /// one flag mask.
 #[allow(clippy::expect_used)] // test scaffolding: a body-free emit cannot fail
@@ -749,29 +1025,41 @@ fn mod_rs_for_mask(interner: &Interner, main: ipe_intern::Symbol, mask: u32) -> 
 /// The per-mask closure obligation: the declared module set is CLOSED under
 /// every declared module's unconditional `use crate::<dep>` references. Shared
 /// by the per-flag, composed, and sampled proofs so they run an identical check.
-/// `dep_cache` memoises the source-only, mask-independent per-module dep scan.
+/// Each `crate::<seg>` reference resolves through [`RootScope`] of the mask's
+/// emitted `mod.rs` to the module that supplies `<seg>`.
 fn assert_mask_closed(
     runtime_root: &Path,
     interner: &Interner,
     main: ipe_intern::Symbol,
     mask: u32,
-    dep_cache: &mut HashMap<String, BTreeSet<String>>,
+    cache: &mut ScanCache,
 ) {
-    let declared = declared_for_mask(interner, main, mask);
-    for m in &declared {
-        let deps = dep_cache
+    let mod_rs = mod_rs_for_mask(interner, main, mask);
+    let scope = RootScope::new(runtime_root, &mod_rs);
+    let declared = &scope.declared;
+    for m in declared {
+        let raw = cache
+            .raw
             .entry(m.clone())
             .or_insert_with(|| unconditional_crate_deps(runtime_root, m));
-        for dep in deps.iter() {
+        for (seg, dep) in scope.deps_of(raw, &mut cache.defs) {
             assert!(
-                declared.contains(dep),
+                declared.contains(&dep),
                 "module-set SEAL breach: emitted `mod.rs` declares `{m}` \
-                 (which does `use crate::{dep}`) but does NOT declare `{dep}` \
-                 — flag mask {mask:#019b}. The emitted crate would fail `cargo build`. \
-                 Declared modules: {declared:?}"
+                 (which reaches `crate::{seg}`, supplied by module `{dep}`) but does \
+                 NOT declare `{dep}` — flag mask {mask:#019b}. The emitted crate would \
+                 fail `cargo build`. Declared modules: {declared:?}"
             );
         }
     }
+}
+
+/// Memoised source scans: each module's raw `crate::<seg>` segments and each
+/// module path's top-level definitions. Both are mask-independent.
+#[derive(Default)]
+struct ScanCache {
+    raw: HashMap<String, BTreeSet<String>>,
+    defs: DefCache,
 }
 
 // ── (1) per-flag closure — O(FLAG_COUNT) ────────────────────────────────────
@@ -784,7 +1072,7 @@ fn each_flag_declares_a_closed_modset() {
     let runtime_root = e2e_support::require_runtime().into_path_buf();
     let mut interner = Interner::new();
     let main = interner.intern("Main").expect("intern Main");
-    let mut dep_cache: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let mut dep_cache = ScanCache::default();
     assert_mask_closed(&runtime_root, &interner, main, 0, &mut dep_cache);
     for bit in 0..FLAG_COUNT {
         assert_mask_closed(&runtime_root, &interner, main, 1u32 << bit, &mut dep_cache);
@@ -847,7 +1135,7 @@ fn composed_full_modset_is_closed() {
          compose"
     );
 
-    let mut dep_cache: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let mut dep_cache = ScanCache::default();
     assert_mask_closed(&runtime_root, &interner, main, all, &mut dep_cache);
 }
 
@@ -911,7 +1199,7 @@ fn sampled_full_masks_are_closed() {
     let mut interner = Interner::new();
     let main = interner.intern("Main").expect("intern Main");
     let all: u32 = (1u32 << FLAG_COUNT) - 1;
-    let mut dep_cache: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let mut dep_cache = ScanCache::default();
 
     let mut masks: BTreeSet<u32> = sampled_masks(SAMPLE_MASKS).into_iter().collect();
     masks.insert(0);
@@ -1004,14 +1292,17 @@ fn base_modules_do_not_reach_gated_modules() {
         .files
         .get("src/ipe_runtime/mod.rs")
         .expect("emitted project must contain ipe_runtime/mod.rs");
-    let base = declared_modules(base_mod_rs);
+    let scope = RootScope::new(&runtime_root, base_mod_rs);
+    let base = &scope.declared;
+    let mut defs = DefCache::new();
 
-    for m in &base {
-        for dep in unconditional_crate_deps(&runtime_root, m) {
+    for m in base {
+        let raw = unconditional_crate_deps(&runtime_root, m);
+        for (seg, dep) in scope.deps_of(&raw, &mut defs) {
             assert!(
                 base.contains(&dep),
-                "always-on-core rule violation: base module `{m}` does \
-                 `use crate::{dep}` unconditionally, but `{dep}` is NOT in the \
+                "always-on-core rule violation: base module `{m}` reaches \
+                 `crate::{seg}` (supplied by `{dep}`) unconditionally, but `{dep}` is NOT in the \
                  always-compiled base floor — it is a gated feature module. A \
                  base module must reach only other base modules (outside \
                  `#[cfg(...)]` / `#[cfg(test)]`); move the reach behind a cfg, or \
@@ -1259,16 +1550,16 @@ fn wasm_vendored_modset_is_closed() {
     let declared = declared_modules(mod_rs);
     let inline_children = parse_inline_modules(mod_rs);
 
-    let mut dep_cache: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let scope = RootScope::new(&runtime_root, mod_rs);
+    let mut defs = DefCache::new();
     for m in &declared {
-        let deps = dep_cache
-            .entry(m.clone())
-            .or_insert_with(|| wasm_unconditional_crate_deps(&runtime_root, m, &inline_children));
-        for dep in deps.iter() {
+        let raw = wasm_unconditional_crate_deps(&runtime_root, m, &inline_children);
+        for (seg, dep) in scope.deps_of(&raw, &mut defs) {
             assert!(
-                declared.contains(dep),
+                declared.contains(&dep),
                 "wasm vendored module-set SEAL breach: `WASM_RUNTIME_MOD_RS` declares \
-                 `{m}` (which does `use crate::{dep}` unconditionally) but does NOT \
+                 `{m}` (which reaches `crate::{seg}`, supplied by `{dep}`, \
+                 unconditionally) but does NOT \
                  declare `{dep}`. The emitted wasm crate fails `cargo check \
                  --target wasm32-unknown-unknown` (E0433) though `ipe` exits 0. \
                  Add `pub mod {dep};` to `WASM_RUNTIME_MOD_RS` in \
@@ -1412,6 +1703,135 @@ fn scanner_ignores_bare_crate_item_without_module_path() {
     assert!(
         deps.is_empty(),
         "bare `crate::Item` (no trailing `::`) must NOT register as a module dep; got {deps:?}"
+    );
+}
+
+/// A runtime-root fixture for the [`RootScope`] resolver tests: `error.rs`
+/// defines `IoFailure` unconditionally and `Gated` only under a cfg, and
+/// `csv.rs` and `retained.rs` exist. Returns the root; the caller removes it.
+fn root_scope_fixture(tag: &str) -> std::path::PathBuf {
+    let root = ipe_test_temp::temp_root().join(format!(
+        "ipe_modset_closure_root_scope_{tag}_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).expect("create fixture root");
+    let files = [
+        (
+            "error.rs",
+            "/// A host failure.\n#[derive(Debug)]\npub struct IoFailure {\n    kind: u8,\n}\n\
+             #[cfg(feature = \"x\")]\npub struct Gated;\n\
+             mod inner {\n    pub struct Nested;\n}\n",
+        ),
+        ("csv.rs", "pub fn read() {}\n"),
+        (
+            "retained.rs",
+            "pub struct Bytes;\npub struct RetainedBytes;\n",
+        ),
+    ];
+    for (name, src) in files {
+        std::fs::write(root.join(name), src).expect("write fixture file");
+    }
+    root
+}
+
+/// A `crate::<Type>::…` path resolves to the module whose root re-export
+/// supplies the type, a `crate::<module>::…` path to the module itself, and a
+/// segment no root name supplies stays an unresolved dep the closure check
+/// fires on.
+#[test]
+fn root_scope_resolves_a_crate_item_path_to_its_providing_module() {
+    let root = root_scope_fixture("resolve");
+    let mod_rs = "pub mod error;\npub mod csv;\npub mod retained;\npub use error::*;\n\
+                  pub use csv::*;\npub use retained::{Bytes, RetainedBytes as Held};\n\
+                  pub fn root_helper() {}\n";
+    let scope = RootScope::new(&root, mod_rs);
+    let mut defs = DefCache::new();
+
+    let mut raw = BTreeSet::new();
+    crate_refs_in_line(
+        "Io(io) => crate::IoFailure::on_path(\"read CSV file\", path, io).into(),",
+        1,
+        &mut raw,
+    );
+    crate_refs_in_line("crate::csv::read();", 1, &mut raw);
+    crate_refs_in_line("crate::NoSuchItem::x();", 1, &mut raw);
+    crate_refs_in_line("crate::Held::new(); crate::Bytes::new();", 1, &mut raw);
+    crate_refs_in_line("crate::root_helper::x(); crate::Gated::x();", 1, &mut raw);
+    crate_refs_in_line("crate::Nested::x();", 1, &mut raw);
+    let deps = scope.deps_of(&raw, &mut defs);
+    let resolved: HashMap<&str, &str> = deps
+        .iter()
+        .map(|(seg, dep)| (seg.as_str(), dep.as_str()))
+        .collect();
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert_eq!(
+        resolved.get("IoFailure"),
+        Some(&"error"),
+        "a glob-re-exported type resolves to its defining module"
+    );
+    assert_eq!(
+        resolved.get("csv"),
+        Some(&"csv"),
+        "a module path stays the module"
+    );
+    assert_eq!(
+        resolved.get("Held"),
+        Some(&"retained"),
+        "an aliased named re-export"
+    );
+    assert_eq!(
+        resolved.get("Bytes"),
+        Some(&"retained"),
+        "a named re-export"
+    );
+    assert!(
+        !resolved.contains_key("root_helper"),
+        "an unconditional item the `mod.rs` defines itself needs no module"
+    );
+    for unresolved in ["NoSuchItem", "Gated", "Nested"] {
+        assert_eq!(
+            resolved.get(unresolved),
+            Some(&unresolved),
+            "`crate::{unresolved}` has no unconditional root name, so it stays its own dep"
+        );
+        assert!(
+            !scope.declared.contains(unresolved),
+            "an unresolved dep is never a declared module, so the closure check fires"
+        );
+    }
+}
+
+/// A re-export the `mod.rs` emits without declaring its module, or emits only
+/// under a cfg, does not satisfy the reference: the first yields a dep the
+/// declared set lacks, the second leaves the segment unresolved.
+#[test]
+fn root_scope_refuses_an_undeclared_or_gated_provider() {
+    let root = root_scope_fixture("refuse");
+    let undeclared = RootScope::new(&root, "pub mod csv;\npub use error::*;\n");
+    let gated = RootScope::new(
+        &root,
+        "pub mod error;\npub mod csv;\n#[cfg(feature = \"x\")]\npub use error::*;\n",
+    );
+    let mut defs = DefCache::new();
+    let undeclared_ref = undeclared.resolve("IoFailure", &mut defs);
+    let gated_ref = gated.resolve("IoFailure", &mut defs);
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert_eq!(
+        undeclared_ref,
+        RootRef::Reexported {
+            provider: "error".to_owned()
+        }
+    );
+    assert!(
+        !undeclared.declared.contains("error"),
+        "the provider `error` is not declared, so the closure check fires on `csv`"
+    );
+    assert_eq!(
+        gated_ref,
+        RootRef::Unresolved,
+        "a cfg-gated re-export supplies no name unconditionally"
     );
 }
 
