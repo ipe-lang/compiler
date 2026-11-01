@@ -198,11 +198,18 @@ fn a_project_state_refusal_prints_no_help() {
             ", sourceRoot = \"app\"",
             "`sourceRoot` is not a package field",
         ),
+        (
+            "source-root-absent",
+            ", sourceRoot = \"app\"",
+            "`sourceRoot` is not a package field",
+        ),
     ] {
         let base = fresh_dir(tag);
         let dir = project(&base, field, PLAIN_MAIN);
-        // The moved root exists, so the refusal is the removed field, not a missing directory.
-        std::fs::create_dir_all(dir.join("app")).expect("create the moved root");
+        // The removed field is refused whether or not the moved root exists.
+        if tag == "source-root" {
+            std::fs::create_dir_all(dir.join("app")).expect("create the moved root");
+        }
         let r = run(&["type-check", &dir.to_string_lossy()]);
         let _ = std::fs::remove_dir_all(&base);
         assert!(!r.ok, "{tag}: the manifest must be refused");
