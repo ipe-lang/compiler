@@ -6457,7 +6457,16 @@ mod tests {
                 .collect()
         };
         let db = names("Ipe.Db");
-        for hidden in ["unsafeExecRaw", "insertFieldsChecked", "updateWhereChecked"] {
+        for hidden in [
+            "unsafeExecRaw",
+            "unsafeQuery",
+            "unsafeGetString",
+            "unsafeGetInt",
+            "unsafeGetBool",
+            "unsafeGetField",
+            "insertFieldsChecked",
+            "updateWhereChecked",
+        ] {
             assert!(
                 !db.contains(hidden),
                 "Ipe.Db must not list `{hidden}`: {db:?}"
