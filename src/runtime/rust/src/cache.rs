@@ -113,20 +113,16 @@ struct Slot {
 /// calls `cache_destroy`.
 const MAX_LIVE_CACHES: i64 = 4096;
 
-/// The longest expiry an entry gets when its TTL overruns the clock: 30 years.
-const TTL_SATURATION: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 30);
-
 /// The expiry a TTL of `ttl_ms` gives an entry written at `now`; `None` never expires.
 ///
-/// A TTL `<= 0` is no expiry. A positive TTL past the clock's range saturates
-/// to [`TTL_SATURATION`] past `now`, and past even that to no expiry, so a
-/// longer TTL never expires sooner than a shorter one.
+/// A TTL `<= 0` is no expiry (`Duration.zero`). A positive TTL whose deadline
+/// lies past the clock's last instant is no expiry too: no instant the clock
+/// can reach is past it, and a longer TTL never expires sooner than a shorter one.
 fn expiry_deadline(now: Instant, ttl_ms: i64) -> Option<Instant> {
     if ttl_ms <= 0 {
         return None;
     }
     now.checked_add(Duration::from_millis(ttl_ms.unsigned_abs()))
-        .or_else(|| now.checked_add(TTL_SATURATION))
 }
 
 /// The global cache registry: a monotonic handle counter plus the live caches
@@ -589,6 +585,39 @@ mod tests {
         assert!(
             far.is_none_or(|deadline| deadline.saturating_duration_since(now) > year),
             "ttl i64::MAX gave {far:?}"
+        );
+    }
+
+    /// Near the clock's last instant a longer TTL never expires sooner than a
+    /// shorter one: a deadline the clock cannot hold is no expiry, never a
+    /// fallback span shorter than the TTL asked for.
+    #[test]
+    fn expiry_deadline_keeps_ttl_order_at_the_clock_edge() {
+        let now = Instant::now();
+        // The last whole second the clock can hold past `now`.
+        let (mut lo, mut hi) = (0_u64, u64::MAX);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if now.checked_add(Duration::from_secs(mid)).is_some() {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let forty_years_secs: u64 = 60 * 60 * 24 * 365 * 40;
+        let Some(base) = lo
+            .checked_sub(forty_years_secs)
+            .and_then(|d| now.checked_add(Duration::from_secs(d)))
+        else {
+            return; // a clock spanning under 40 years has no such edge
+        };
+        let shorter_ms = i64::try_from(forty_years_secs * 1000).unwrap_or(i64::MAX);
+        let shorter = expiry_deadline(base, shorter_ms);
+        let longer = expiry_deadline(base, i64::MAX);
+        assert!(shorter.is_some(), "a 40-year TTL fits under the edge");
+        assert!(
+            longer.is_none_or(|l| shorter.is_some_and(|s| l >= s)),
+            "TTL i64::MAX expires at {longer:?}, before the 40-year TTL's {shorter:?}"
         );
     }
 

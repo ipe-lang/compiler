@@ -772,7 +772,9 @@ fn percentile(vals: &[f64], p: f64) -> f64 {
         return 0.0;
     }
     let mut sorted = vals.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // A total order: `partial_cmp` with a NaN read as `Equal` is no order, and
+    // `sort_by` may panic on one.
+    sorted.sort_by(f64::total_cmp);
     // The 1-based nearest rank `ceil(p * n)`, clamped into `0..=n` in the float
     // domain; a NaN rank names no observation, the empty input's `0.0`.
     let n = sorted.len() as f64;
@@ -797,12 +799,13 @@ fn classify_status(error_rate: f64) -> &'static str {
 }
 
 /// Parse an attr value string ("3.14"/"42") to f64; `None` (skip the
-/// observation) on empty/unparseable.
+/// observation) on empty/unparseable, and on `NaN`/`inf`, which name no
+/// measurement.
 fn parse_float_attr(raw: &str) -> Option<f64> {
     if raw.is_empty() {
         None
     } else {
-        raw.trim().parse::<f64>().ok()
+        raw.trim().parse::<f64>().ok().filter(|v| v.is_finite())
     }
 }
 
@@ -1365,6 +1368,27 @@ mod tests {
         assert_eq!(percentile(&v, 1e300), 100.0);
         assert_eq!(percentile(&v, f64::INFINITY), 100.0);
         assert_eq!(percentile(&v, f64::NAN), 0.0);
+    }
+
+    /// A `NaN`/`inf` attr is no measurement: it is skipped, never fed to the
+    /// percentile sort, whose order it would break.
+    #[test]
+    fn parse_float_attr_refuses_non_finite() {
+        for raw in ["NaN", "nan", "inf", "-inf", "infinity", " NaN "] {
+            assert_eq!(parse_float_attr(raw), None, "{raw:?}");
+        }
+        assert_eq!(parse_float_attr(" 3.5 "), Some(3.5));
+    }
+
+    /// The percentile sort is total, so a NaN observation reached by another
+    /// path still yields one deterministic rank and never panics.
+    #[test]
+    fn percentile_sort_is_total_over_nan() {
+        let mut v: Vec<f64> = (1..=40).map(f64::from).collect();
+        for i in (0..40).step_by(3) {
+            v.insert(i, f64::NAN);
+        }
+        assert_eq!(percentile(&v, 0.5), 27.0);
     }
 
     #[test]
