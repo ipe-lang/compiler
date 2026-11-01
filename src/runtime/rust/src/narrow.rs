@@ -65,7 +65,7 @@ pub fn u128_saturating_u64(n: u128) -> u64 {
 /// a caller that needs `floor`/`ceil`/`round` applies it first.
 #[must_use]
 pub fn f64_trunc_to_i64(f: f64) -> Option<i64> {
-    if f >= I64_FLOOR && f < I64_CEIL {
+    if (I64_FLOOR..I64_CEIL).contains(&f) {
         // The guard is false for NaN and both infinities and bounds `f`
         // strictly inside `i64`, so truncation toward zero is exact.
         #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
