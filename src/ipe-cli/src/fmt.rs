@@ -53,6 +53,7 @@
 //! removal (the AST does not retain user parens), documentation-comment
 //! (`{-| … -}`) re-flowing, and per-import `exposing`-list column wrapping.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
@@ -93,67 +94,248 @@ pub fn run_fmt(rest: &[String]) -> Result<(), CliError> {
         crate::cli_args::FmtMode::Stdin => run_fmt_stdin(false),
         crate::cli_args::FmtMode::StdinCheck => run_fmt_stdin(true),
         crate::cli_args::FmtMode::InPlace {
-            path,
+            paths,
             check,
             format,
-        } => run_fmt_inplace(path.as_deref(), check, format),
+        } => {
+            let roots: Vec<PathBuf> =
+                paths.map_or_else(|| vec![PathBuf::from(".")], |p| p.iter().cloned().collect());
+            run_fmt_inplace(&roots, check, format)
+        }
     }
 }
 
-/// Format every `.ipe` under `root` in place.
+/// The most source and formatted text one in-place run holds before writing.
 ///
-/// `None` means the current directory `.`. Under `--check`, `format` selects how
-/// the unformatted set is reported: the human list (default), or a machine
-/// `--json` / `--plain` file list.
-fn run_fmt_inplace(
-    path: Option<&str>,
-    check: bool,
-    format: crate::cli_args::OutputFormat,
-) -> Result<(), CliError> {
-    let root = PathBuf::from(path.unwrap_or("."));
-    // A file reached by walking a directory must stay inside it; only an
-    // explicitly named file may be a symlink to elsewhere.
-    let (walked, files) = match collect_ipe_files(&root)? {
-        FmtTargets::Named(file) => (false, vec![file]),
-        FmtTargets::Walked(files) => (true, files),
-    };
-    if files.is_empty() {
-        return Err(CliError::Usage(crate::text::msg::fmt_no_files(
-            &root.display(),
-        )));
-    }
+/// Every rewrite is held until every file has formatted, so the held text is
+/// bounded like a build's summed source read.
+const HELD_REWRITE_BYTES: u64 = crate::source_snapshot::SOURCE_TREE_READ_CAP;
 
-    let mut unformatted: Vec<PathBuf> = Vec::new();
-    for file in &files {
-        let src = if walked {
-            crate::io_bounded::read_walked_source(file)?
-        } else {
-            crate::io_bounded::read_user_named(file, crate::io_bounded::SOURCE_CAP)?
-        };
-        let formatted = format_source(&src).map_err(|e| fmt_err_to_cli(file, e))?;
-        if check {
-            if formatted != src {
-                unformatted.push(file.clone());
+/// Where an in-place run reports its refusals: the human screen, or the
+/// machine stream a `--check --json` / `--check --plain` scan writes.
+#[derive(Debug, Clone, Copy)]
+enum RefusalSink {
+    /// The human error screen on stderr.
+    Human,
+    /// The machine error envelope of this format on stderr.
+    Machine(crate::cli_args::OutputFormat),
+}
+
+impl RefusalSink {
+    /// The sink of a run reporting in `format`.
+    const fn of(format: crate::cli_args::OutputFormat) -> Self {
+        match format {
+            crate::cli_args::OutputFormat::Human => Self::Human,
+            crate::cli_args::OutputFormat::Json | crate::cli_args::OutputFormat::Plain => {
+                Self::Machine(format)
             }
-        } else if formatted != src {
-            if walked {
-                crate::rewrite_walked_file(&root, file, &formatted, crate::RewriteKind::Lossless)?;
-            } else {
-                crate::rewrite_user_file(file, &formatted, crate::RewriteKind::Lossless)?;
-            }
-            crate::screen::chatter(
-                crate::screen::Stream::Stderr,
-                crate::screen::Tone::Text,
-                &format!("formatted {}", file.display()),
-            );
         }
     }
 
-    if check {
-        return report_check(&unformatted, format);
+    /// Report a refusal the run met before its last one.
+    fn report(self, err: &CliError) {
+        match self {
+            Self::Human => crate::screen::report_error(err),
+            Self::Machine(format) => {
+                // The returned sentinel is the run's to return, not this one's.
+                let _ = crate::driver::emit_machine_error(format, "fmt", err);
+            }
+        }
     }
 
+    /// The run's final error: as is for a human run, or written as a machine
+    /// envelope and replaced by the already-emitted sentinel.
+    fn finish(self, err: CliError) -> CliError {
+        match self {
+            Self::Human => err,
+            Self::Machine(format) => crate::driver::emit_machine_error(format, "fmt", &err),
+        }
+    }
+
+    /// Keep `err` as the run's refusal, reporting the one it replaces.
+    fn keep(self, refusal: &mut Option<CliError>, err: CliError) {
+        if let Some(earlier) = refusal.replace(err) {
+            self.report(&earlier);
+        }
+    }
+}
+
+/// Format every `.ipe` file `roots` name, in place, all or nothing.
+///
+/// Every root is resolved and every file formatted before any file is
+/// written: a missing root, an unparsable file or any other refusal leaves
+/// every file as it was. Under `--check`, `format` selects how the unformatted
+/// set and every refusal are reported: the human screen (default), or a
+/// machine `--json` / `--plain` stream.
+fn run_fmt_inplace(
+    roots: &[PathBuf],
+    check: bool,
+    format: crate::cli_args::OutputFormat,
+) -> Result<(), CliError> {
+    let sink = RefusalSink::of(format);
+    let files = collect_fmt_files(roots, WalkLimits::DEFAULT).map_err(|e| sink.finish(e))?;
+    if files.is_empty() {
+        let named = roots
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Err(sink.finish(CliError::Usage(crate::text::msg::fmt_no_files(&named))));
+    }
+    if check {
+        let mut unformatted: Vec<PathBuf> = Vec::new();
+        format_each(&files, sink, |file, _, _| {
+            unformatted.push(file.path.clone());
+            Ok(())
+        })
+        .map_err(|e| sink.finish(e))?;
+        return report_check(&unformatted, format);
+    }
+    let mut plan: Vec<Rewrite<'_>> = Vec::new();
+    let mut held: u64 = 0;
+    format_each(&files, sink, |file, source, formatted| {
+        hold_rewrite(
+            &mut held,
+            HELD_REWRITE_BYTES,
+            &file.path,
+            &source,
+            &formatted,
+        )?;
+        plan.push(Rewrite {
+            file,
+            source,
+            formatted,
+        });
+        Ok(())
+    })?;
+    write_rewrites(plan, sink)
+}
+
+/// One file whose formatted text differs from the source it was read as.
+struct Rewrite<'f> {
+    /// The file, as collected.
+    file: &'f FmtFile,
+    /// The source exactly as read.
+    source: String,
+    /// The formatter's output for `source`.
+    formatted: String,
+}
+
+/// Read and format every file, handing each one that changes to `changed`.
+///
+/// Every refusal is reported to `sink` and the last one returned, so a caller
+/// that writes only on `Ok` writes nothing when any file is refused. An error
+/// from `changed` stops the run at once.
+fn format_each<'f>(
+    files: &'f [FmtFile],
+    sink: RefusalSink,
+    mut changed: impl FnMut(&'f FmtFile, String, String) -> Result<(), CliError>,
+) -> Result<(), CliError> {
+    let mut refusal: Option<CliError> = None;
+    for file in files {
+        let outcome = read_fmt_file(file).and_then(|source| {
+            format_source(&source)
+                .map(|formatted| (source, formatted))
+                .map_err(|e| fmt_err_to_cli(&file.path, e))
+        });
+        match outcome {
+            Err(err) => sink.keep(&mut refusal, err),
+            // After a refusal nothing is written; the rest are formatted only
+            // to report their own refusals.
+            Ok((source, formatted)) if source != formatted && refusal.is_none() => {
+                changed(file, source, formatted)?;
+            }
+            Ok(_) => {}
+        }
+    }
+    refusal.map_or(Ok(()), Err)
+}
+
+/// Charge one held rewrite of `path` to `held`, refusing past `cap` bytes.
+fn hold_rewrite(
+    held: &mut u64,
+    cap: u64,
+    path: &Path,
+    source: &str,
+    formatted: &str,
+) -> Result<(), CliError> {
+    let size = u64::try_from(source.len().saturating_add(formatted.len())).unwrap_or(u64::MAX);
+    *held = held.saturating_add(size);
+    if *held > cap {
+        return Err(CliError::Usage(crate::text::msg::fmt_held_bytes_limit(
+            &cap,
+            &path.display(),
+        )));
+    }
     Ok(())
+}
+
+/// Write every planned rewrite while its file still holds the source it was formatted from.
+///
+/// Each file is written on its own: one that fails, or was edited since it
+/// was read, is left as it is and reported, and every other file is still
+/// written. Every written file is named as it is written.
+fn write_rewrites(plan: Vec<Rewrite<'_>>, sink: RefusalSink) -> Result<(), CliError> {
+    let mut refusal: Option<CliError> = None;
+    let mut changed: Vec<PathBuf> = Vec::new();
+    for rewrite in plan {
+        match write_rewrite(&rewrite) {
+            Ok(true) => crate::screen::chatter(
+                crate::screen::Stream::Stderr,
+                crate::screen::Tone::Text,
+                crate::text::msg::fmt_formatted(&rewrite.file.path.display()).as_str(),
+            ),
+            Ok(false) => changed.push(rewrite.file.path.clone()),
+            Err(err) => sink.keep(&mut refusal, err),
+        }
+    }
+    if !changed.is_empty() {
+        let list =
+            crate::text::TerminalBlock::lines(changed.iter().map(|p| format!("  {}", p.display())));
+        sink.keep(
+            &mut refusal,
+            CliError::Usage(crate::text::msg::fmt_changed_while_formatting(&list)),
+        );
+    }
+    refusal.map_or(Ok(()), Err)
+}
+
+/// Write one planned rewrite; `false` when its file no longer holds the source it was formatted from.
+fn write_rewrite(rewrite: &Rewrite<'_>) -> Result<bool, CliError> {
+    let file = rewrite.file;
+    match &file.origin {
+        FmtOrigin::Named => Ok(matches!(
+            crate::driver::rewrite_user_file_if_unchanged(
+                &file.path,
+                &rewrite.source,
+                &rewrite.formatted,
+                crate::RewriteKind::Lossless,
+            )?,
+            crate::driver::IfUnchanged::Written(_)
+        )),
+        FmtOrigin::Walked(root) => {
+            if crate::io_bounded::read_walked_source(&file.path)? != rewrite.source {
+                return Ok(false);
+            }
+            crate::rewrite_walked_file(
+                root,
+                &file.path,
+                &rewrite.formatted,
+                crate::RewriteKind::Lossless,
+            )?;
+            Ok(true)
+        }
+    }
+}
+
+/// Read `file` the way its [`FmtOrigin`] allows.
+fn read_fmt_file(file: &FmtFile) -> Result<String, CliError> {
+    match file.origin {
+        FmtOrigin::Named => {
+            crate::io_bounded::read_user_named(&file.path, crate::io_bounded::SOURCE_CAP)
+        }
+        FmtOrigin::Walked(_) => crate::io_bounded::read_walked_source(&file.path),
+    }
 }
 
 /// Report a `--check` scan's result in the requested [`OutputFormat`].
@@ -321,57 +503,166 @@ fn fmt_err_to_cli(file: &Path, e: FmtError) -> CliError {
     }
 }
 
-/// The files one `ipe fmt` run formats, typed by who named them.
-enum FmtTargets {
-    /// The one file the user named.
-    Named(PathBuf),
-    /// Every `.ipe` a walk of the named directory found, sorted.
-    Walked(Vec<PathBuf>),
+/// How one file reached an `ipe fmt` run, which decides how it is read and rewritten.
+enum FmtOrigin {
+    /// Named on the command line: a final symlink is followed.
+    Named,
+    /// Found by walking this named directory: it must resolve inside it.
+    Walked(PathBuf),
 }
 
-/// Collect every `.ipe` file governed by `root`: a single file if `root` is one,
-/// otherwise every `.ipe` under the directory tree (deterministically sorted).
-fn collect_ipe_files(root: &Path) -> Result<FmtTargets, CliError> {
-    if root.is_file() {
-        return Ok(FmtTargets::Named(root.to_path_buf()));
+/// One file an `ipe fmt` run formats.
+struct FmtFile {
+    /// The path as the user named it or the walk reached it.
+    path: PathBuf,
+    /// How it reached the run.
+    origin: FmtOrigin,
+}
+
+/// The ceilings one `ipe fmt` run's file collection is held to, summed over every root.
+///
+/// The module-discovery ceilings a build's walk is held to: a directory past
+/// `depth` below its root, a named path or listed entry past `entries`, or a
+/// file past `files` refuses the run before any file is read.
+#[derive(Debug, Clone, Copy)]
+struct WalkLimits {
+    depth: usize,
+    entries: usize,
+    files: usize,
+}
+
+impl WalkLimits {
+    /// The ceilings every `ipe fmt` run is held to.
+    const DEFAULT: Self = Self {
+        depth: crate::project::MAX_DISCOVERY_DEPTH,
+        entries: crate::project::MAX_DISCOVERY_ENTRIES,
+        files: crate::project::MAX_DISCOVERED_MODULES,
+    };
+}
+
+/// One collection's running counts against its [`WalkLimits`].
+struct FmtWalk {
+    limits: WalkLimits,
+    examined: usize,
+    found: usize,
+}
+
+impl FmtWalk {
+    /// Count one more named path or listed entry, refusing past the entry ceiling.
+    fn examine(&mut self, at: &Path) -> Result<(), CliError> {
+        self.examined = self.examined.saturating_add(1);
+        if self.examined > self.limits.entries {
+            return Err(walk_limit(crate::text::msg::fmt_walk_too_many_entries(
+                &self.limits.entries,
+                &at.display(),
+            )));
+        }
+        Ok(())
     }
-    if !root.is_dir() {
-        return Err(CliError::Usage(crate::text::msg::fmt_no_such_path(
-            &root.display(),
-        )));
+
+    /// Count one more file to format, refusing past the file ceiling.
+    fn find(&mut self, at: &Path) -> Result<(), CliError> {
+        self.found = self.found.saturating_add(1);
+        if self.found > self.limits.files {
+            return Err(walk_limit(crate::text::msg::fmt_walk_too_many_files(
+                &self.limits.files,
+                &at.display(),
+            )));
+        }
+        Ok(())
     }
-    let mut out: Vec<PathBuf> = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let entries = fs::read_dir(&dir).map_err(|e| CliError::Io {
-            path: dir.clone(),
-            source: e,
-        })?;
-        for entry in entries {
-            let entry = entry.map_err(|e| CliError::Io {
+
+    /// Every file `root` names: itself when it is a file, else every `.ipe`
+    /// under it, never through a symlink and never in a generated build tree.
+    fn root(&mut self, root: &Path) -> Result<Vec<FmtFile>, CliError> {
+        self.examine(root)?;
+        if root.is_file() {
+            self.find(root)?;
+            return Ok(vec![FmtFile {
+                path: root.to_path_buf(),
+                origin: FmtOrigin::Named,
+            }]);
+        }
+        if !root.is_dir() {
+            return Err(CliError::Usage(crate::text::msg::fmt_no_such_path(
+                &root.display(),
+            )));
+        }
+        let mut out: Vec<FmtFile> = Vec::new();
+        let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+        while let Some((dir, depth)) = stack.pop() {
+            if depth > self.limits.depth {
+                return Err(walk_limit(crate::text::msg::fmt_walk_too_deep(
+                    &self.limits.depth,
+                    &dir.display(),
+                )));
+            }
+            let entries = fs::read_dir(&dir).map_err(|e| CliError::Io {
                 path: dir.clone(),
                 source: e,
             })?;
-            let path = entry.path();
-            let file_type = entry.file_type().map_err(|e| CliError::Io {
-                path: path.clone(),
-                source: e,
-            })?;
-            if file_type.is_dir() {
-                // Skip a generated build tree — never a source directory.
-                if entry.file_name() == "out" || entry.file_name() == "target" {
-                    continue;
+            for entry in entries {
+                let entry = entry.map_err(|e| CliError::Io {
+                    path: dir.clone(),
+                    source: e,
+                })?;
+                self.examine(&dir)?;
+                let path = entry.path();
+                let file_type = entry.file_type().map_err(|e| CliError::Io {
+                    path: path.clone(),
+                    source: e,
+                })?;
+                if file_type.is_dir() {
+                    // Skip a generated build tree — never a source directory.
+                    if entry.file_name() == "out" || entry.file_name() == "target" {
+                        continue;
+                    }
+                    stack.push((path, depth.saturating_add(1)));
+                } else if file_type.is_file()
+                    && path.extension().and_then(|e| e.to_str()) == Some("ipe")
+                {
+                    self.find(&dir)?;
+                    out.push(FmtFile {
+                        path,
+                        origin: FmtOrigin::Walked(root.to_path_buf()),
+                    });
                 }
-                stack.push(path);
-            } else if file_type.is_file()
-                && path.extension().and_then(|e| e.to_str()) == Some("ipe")
-            {
-                out.push(path);
             }
         }
+        Ok(out)
     }
-    out.sort();
-    Ok(FmtTargets::Walked(out))
+}
+
+/// A collection ceiling's refusal.
+fn walk_limit(detail: crate::text::Message) -> CliError {
+    CliError::DiscoveryLimitReached {
+        detail: detail.into(),
+    }
+}
+
+/// Every file `roots` name, once each, in the order of the file each path reaches.
+///
+/// Each root is resolved before any file is read, so a missing root refuses
+/// the run. Two paths reaching the same file (a repeated argument, a file
+/// also inside a named directory, a link) keep the first in argument order.
+/// The collection is held to `limits`, summed over every root.
+fn collect_fmt_files(roots: &[PathBuf], limits: WalkLimits) -> Result<Vec<FmtFile>, CliError> {
+    let mut walk = FmtWalk {
+        limits,
+        examined: 0,
+        found: 0,
+    };
+    let mut by_file: BTreeMap<PathBuf, FmtFile> = BTreeMap::new();
+    for root in roots {
+        for file in walk.root(root)? {
+            let real = fs::canonicalize(&file.path).map_err(|e| CliError::Io {
+                path: file.path.clone(),
+                source: e,
+            })?;
+            by_file.entry(real).or_insert(file);
+        }
+    }
+    Ok(by_file.into_values().collect())
 }
 
 #[cfg(test)]
@@ -385,7 +676,7 @@ mod tests {
     const USAGE_FIRST_LINE: &str = "Format Ipê source files.";
 
     /// The synopsis line of the `ipe fmt` help page.
-    const USAGE_SYNOPSIS: &str = "ipe fmt [<path>]";
+    const USAGE_SYNOPSIS: &str = "ipe fmt [<path>...]";
 
     /// The human error screen of `err`, header omitted.
     fn screen_of(err: &CliError) -> String {
@@ -439,6 +730,136 @@ mod tests {
         let screen = screen_of(&err);
         assert!(screen.contains("src/A.ipe"), "{screen}");
         assert!(screen.contains("src/B.ipe"), "{screen}");
+    }
+
+    /// Held rewrite text is accepted up to the ceiling and refused one byte past it.
+    #[test]
+    fn held_rewrite_text_is_refused_one_byte_past_the_ceiling() {
+        let path = Path::new("A.ipe");
+        let mut held = 0;
+        assert!(hold_rewrite(&mut held, 10, path, "abcd", "efghij").is_ok());
+        assert_eq!(held, 10);
+        let past = hold_rewrite(&mut held, 10, path, "", "x");
+        assert!(
+            matches!(&past, Err(CliError::Usage(m)) if m.contains("A.ipe")),
+            "{past:?}"
+        );
+
+        let mut held = 0;
+        let over = hold_rewrite(&mut held, 10, path, "abcde", "fghijk");
+        assert!(matches!(over, Err(CliError::Usage(_))), "{over:?}");
+    }
+
+    /// A fresh scratch directory for one test.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = ipe_test_temp::temp_root().join(format!("ipe-fmt-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(fs::create_dir_all(&dir).is_ok(), "{}", dir.display());
+        dir
+    }
+
+    /// Ceilings far above any tree a test builds, then `change`d.
+    fn limits(change: impl FnOnce(&mut WalkLimits)) -> WalkLimits {
+        let mut limits = WalkLimits {
+            depth: 64,
+            entries: 1_000,
+            files: 1_000,
+        };
+        change(&mut limits);
+        limits
+    }
+
+    /// Whether collecting `roots` under `limits` is the walk-ceiling refusal.
+    fn walk_refused(roots: &[PathBuf], limits: WalkLimits) -> bool {
+        matches!(
+            collect_fmt_files(roots, limits).err(),
+            Some(CliError::DiscoveryLimitReached { .. })
+        )
+    }
+
+    /// Each collection ceiling admits a tree at it and refuses one past it.
+    #[test]
+    fn the_file_collection_is_refused_one_past_each_ceiling() {
+        let dir = scratch("walk-limits");
+        let deep = dir.join("a").join("b");
+        assert!(fs::create_dir_all(&deep).is_ok());
+        assert!(fs::write(dir.join("A.ipe"), UNFORMATTED).is_ok());
+        assert!(fs::write(dir.join("a").join("B.ipe"), UNFORMATTED).is_ok());
+        let roots = [dir.clone()];
+
+        // `b` sits two levels below the root.
+        assert!(collect_fmt_files(&roots, limits(|l| l.depth = 2)).is_ok());
+        assert!(walk_refused(&roots, limits(|l| l.depth = 1)));
+        // The root, `A.ipe`, `a`, `B.ipe` and `b` are five entries.
+        assert!(collect_fmt_files(&roots, limits(|l| l.entries = 5)).is_ok());
+        assert!(walk_refused(&roots, limits(|l| l.entries = 4)));
+        // Two files, counted again when a second root reaches one of them.
+        assert!(collect_fmt_files(&roots, limits(|l| l.files = 2)).is_ok());
+        assert!(walk_refused(&roots, limits(|l| l.files = 1)));
+        let twice = [dir.clone(), dir.join("A.ipe")];
+        assert!(collect_fmt_files(&twice, limits(|l| l.files = 3)).is_ok());
+        assert!(walk_refused(&twice, limits(|l| l.files = 2)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A write that fails leaves the files after it written, and is reported.
+    #[test]
+    fn a_failed_write_does_not_stop_the_rest() {
+        let dir = scratch("write-continues");
+        let gone = FmtFile {
+            path: dir.join("Gone.ipe"),
+            origin: FmtOrigin::Named,
+        };
+        let kept = FmtFile {
+            path: dir.join("Kept.ipe"),
+            origin: FmtOrigin::Named,
+        };
+        assert!(fs::write(&kept.path, UNFORMATTED).is_ok());
+        let plan = vec![
+            Rewrite {
+                file: &gone,
+                source: UNFORMATTED.to_owned(),
+                formatted: String::from("formatted\n"),
+            },
+            Rewrite {
+                file: &kept,
+                source: UNFORMATTED.to_owned(),
+                formatted: String::from("formatted\n"),
+            },
+        ];
+        let res = write_rewrites(plan, RefusalSink::Human);
+        assert!(matches!(res, Err(CliError::Io { .. })), "{res:?}");
+        assert_eq!(
+            fs::read_to_string(&kept.path).unwrap_or_default(),
+            "formatted\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A file edited since it was read is left as it is and named.
+    #[test]
+    fn a_file_changed_since_it_was_read_is_left_and_named() {
+        let dir = scratch("write-changed");
+        let edited = FmtFile {
+            path: dir.join("Edited.ipe"),
+            origin: FmtOrigin::Walked(dir.clone()),
+        };
+        assert!(fs::write(&edited.path, "edited\n").is_ok());
+        let plan = vec![Rewrite {
+            file: &edited,
+            source: UNFORMATTED.to_owned(),
+            formatted: String::from("formatted\n"),
+        }];
+        let res = write_rewrites(plan, RefusalSink::Human);
+        assert!(
+            matches!(&res, Err(CliError::Usage(m)) if m.contains("Edited.ipe")),
+            "{res:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&edited.path).unwrap_or_default(),
+            "edited\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A malformed command line still renders the usage page.

@@ -214,6 +214,7 @@ fn fmt_valid_combinations_parse() {
     assert!(parse_fmt(&v(&["src"])).is_ok());
     assert!(parse_fmt(&v(&["--check"])).is_ok());
     assert!(parse_fmt(&v(&["src", "--check"])).is_ok());
+    assert!(parse_fmt(&v(&["a.ipe", "b.ipe", "src"])).is_ok());
 
     // --stdin
     let m = parse_fmt(&v(&["--stdin"])).expect("stdin");
@@ -224,10 +225,10 @@ fn fmt_valid_combinations_parse() {
 
 #[test]
 fn fmt_invalid_combinations_rejected() {
-    assert!(parse_fmt(&v(&["a", "b"])).is_err());
     assert!(parse_fmt(&v(&["--bogus"])).is_err());
-    // --stdin + path is mutually exclusive
+    // --stdin + any path is mutually exclusive
     assert!(parse_fmt(&v(&["--stdin", "src"])).is_err());
+    assert!(parse_fmt(&v(&["a.ipe", "b.ipe", "--stdin"])).is_err());
 }
 
 // ===========================================================================
