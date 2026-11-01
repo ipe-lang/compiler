@@ -293,6 +293,8 @@ pub mod list;
 pub mod log;
 pub mod math;
 pub mod money;
+// The narrowing helpers every kernel module may call.
+pub mod narrow;
 pub mod home_core;
 pub mod scratch_core;
 pub mod scratch_host;

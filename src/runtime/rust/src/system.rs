@@ -3644,21 +3644,79 @@ pub(crate) fn run_pre_exit_stages() {
     }
 }
 
-/// Ends the process with `code` after every pre-exit stage has run.
+/// A process exit status every target reports unchanged.
+///
+/// The field is private: a status is built only by [`ProcessStatus::requested`]
+/// (a program's `System.exit` request) or a named constant, so no integer
+/// reaches the OS exit without passing through one of them, and only a request
+/// of `0` yields success.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessStatus(u8);
+
+#[deny(clippy::as_conversions)]
+impl ProcessStatus {
+    /// The status every consumer reads as success.
+    pub const SUCCESS: Self = Self(0);
+    /// The generic failure status, and the one an out-of-range request becomes.
+    pub const FAILURE: Self = Self(1);
+    /// The largest request every target (Unix, Windows, WASI) reports unchanged.
+    pub const PORTABLE_MAX: u8 = 125;
+    /// `128 + SIGINT`: the status of a program an interrupt ends — a native
+    /// server's forced shutdown, or a terminal app's Ctrl-C in raw mode.
+    ///
+    /// Never built from a program's `Int`.
+    #[cfg(any(feature = "server", all(not(target_arch = "wasm32"), feature = "tui")))]
+    pub(crate) const INTERRUPTED: Self = Self(130);
+    /// `128 + SIGTERM`: the runtime's own forced-shutdown status on a terminate.
+    ///
+    /// Native-server only; never built from a program's `Int`.
+    #[cfg(feature = "server")]
+    pub(crate) const TERMINATED: Self = Self(143);
+
+    /// Parse a program's `System.exit` request; total, and only `0` maps to success.
+    ///
+    /// `0..=125` pass unchanged; every other value (negative, `126` and above)
+    /// becomes [`ProcessStatus::FAILURE`].
+    #[must_use]
+    pub fn requested(code: i64) -> Self {
+        u8::try_from(code)
+            .ok()
+            .filter(|byte| *byte <= Self::PORTABLE_MAX)
+            .map_or(Self::FAILURE, Self)
+    }
+
+    /// The status as `std::process::exit` takes it (a lossless widening).
+    #[must_use]
+    pub fn code(self) -> i32 {
+        i32::from(self.0)
+    }
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the out-of-range status could read as success or leave the portable range [ledger #boundary]
+const _: () = assert!(
+    ProcessStatus::FAILURE.0 != 0 && ProcessStatus::FAILURE.0 <= ProcessStatus::PORTABLE_MAX
+);
+
+/// Ends the process with `status` after every pre-exit stage has run.
 ///
 /// The one process exit in the runtime; the runtime `clippy.toml` denies
 /// `std::process::exit` everywhere else. `process::exit` skips Drop, so the
 /// stages Drop would have run happen here first (`run_pre_exit_stages`).
-pub fn exit_process(code: i32) -> ! {
+#[deny(clippy::as_conversions)]
+pub fn exit_process(status: ProcessStatus) -> ! {
     run_pre_exit_stages();
     #[expect(clippy::disallowed_methods)] // the one process exit; proves the ban fires
     // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — the runtime's one process-exit funnel: every exit request (`System.exit`, server shutdown, a CLI db op) ends here after the pre-exit stages [ledger #boundary]
-    std::process::exit(code);
+    std::process::exit(status.code());
 }
 
 /// The `System.exit` kernel: ends the process through `exit_process`.
+///
+/// The request is parsed by [`ProcessStatus::requested`], so a code outside
+/// `0..=125` ends the process with status `1`, never with a wrapped `0`.
+#[deny(clippy::as_conversions)]
 pub fn system_exit(code: i64) -> ! {
-    exit_process(code as i32)
+    exit_process(ProcessStatus::requested(code))
 }
 
 /// `Ipe.System.getenv key : String -> Task Error String` — the env var as a
@@ -4861,7 +4919,7 @@ mod exit_hook_tests {
     }
 
     /// The code the panicking-stage child asks to exit with.
-    const PANICKING_STAGE_EXIT_CODE: i32 = 7;
+    const PANICKING_STAGE_EXIT_CODE: i64 = 7;
 
     /// How long the parent waits for the panicking-stage child before it fails the test.
     const CHILD_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -4914,7 +4972,9 @@ mod exit_hook_tests {
         let stdout = String::from_utf8(out.stdout).unwrap_or_default();
         let stderr = String::from_utf8(out.stderr).unwrap_or_default();
         assert!(
-            status.is_some_and(|s| s.code() == Some(PANICKING_STAGE_EXIT_CODE)),
+            status.is_some_and(|s| {
+                s.code() == Some(super::ProcessStatus::requested(PANICKING_STAGE_EXIT_CODE).code())
+            }),
             "a panicking pre-exit stage cancelled the exit ({status:?}):\n{stdout}\n{stderr}"
         );
     }
@@ -4926,7 +4986,7 @@ mod exit_hook_tests {
     #[test]
     fn panicking_stage_child() {
         register_exit_hook(panicking_exit_hook);
-        super::exit_process(PANICKING_STAGE_EXIT_CODE);
+        super::exit_process(super::ProcessStatus::requested(PANICKING_STAGE_EXIT_CODE));
     }
 
     #[test]
@@ -7065,5 +7125,177 @@ mod argv_tests {
             decode_arg_at(bad().into_iter(), 0),
             Ok(IpeMaybe::Just(p)) if p == "prog"
         ));
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod process_status_tests {
+    use super::ProcessStatus;
+
+    /// Requests past the portable range, each of which a cast would wrap or forward.
+    const OUT_OF_RANGE: [i64; 8] = [256, 4_294_967_296, -256, -1, 126, 255, i64::MAX, i64::MIN];
+
+    #[test]
+    fn out_of_range_requests_end_as_failure() {
+        for n in OUT_OF_RANGE {
+            assert_eq!(ProcessStatus::requested(n), ProcessStatus::FAILURE, "{n}");
+        }
+    }
+
+    #[test]
+    fn zero_is_the_only_success() {
+        let edges = [i64::MAX, i64::MIN, 1 << 32, -(1 << 32), 1 << 31, -(1 << 31)];
+        for n in (-1024..=1024).chain(edges) {
+            assert_eq!(ProcessStatus::requested(n).code() == 0, n == 0, "{n}");
+        }
+    }
+
+    #[test]
+    fn portable_range_is_unchanged() {
+        for n in 0..=i32::from(ProcessStatus::PORTABLE_MAX) {
+            assert_eq!(ProcessStatus::requested(i64::from(n)).code(), n);
+        }
+    }
+
+    #[test]
+    fn the_named_statuses_are_the_documented_values() {
+        assert_eq!(ProcessStatus::SUCCESS.code(), 0);
+        assert_eq!(ProcessStatus::FAILURE.code(), 1);
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn the_forced_shutdown_statuses_are_128_plus_the_signal() {
+        assert_eq!(ProcessStatus::INTERRUPTED.code(), 130);
+        assert_eq!(ProcessStatus::TERMINATED.code(), 143);
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod system_exit_status_tests {
+    use super::system_exit;
+
+    /// The line each child prints before it exits, proving it ran.
+    const MARKER: &str = "system-exit-status-child-ran";
+
+    /// How long the parent waits for one child before it fails the test.
+    const CHILD_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Each child's name and the status the OS must report for it.
+    const CASES: [(&str, i32); 8] = [
+        ("exit_256", 1),
+        ("exit_two_pow_32", 1),
+        ("exit_minus_256", 1),
+        ("exit_i64_max", 1),
+        ("exit_i64_min", 1),
+        ("exit_0", 0),
+        ("exit_1", 1),
+        ("exit_125", 125),
+    ];
+
+    /// Runs one child of this test binary and returns its status and stdout.
+    #[allow(clippy::expect_used)] // test harness: a test binary that cannot re-run itself is an environment issue
+    fn run_child(name: &str) -> (Option<i32>, String) {
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let filter = format!("{module}::{name}");
+        let exe = std::env::current_exe().expect("the test binary");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                filter.as_str(),
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start the exit-status child");
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll the exit-status child") {
+                break status.code();
+            }
+            if started.elapsed() > CHILD_LIMIT {
+                let _ = child.kill();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let out = child
+            .wait_with_output()
+            .expect("collect the child's output");
+        (status, String::from_utf8(out.stdout).unwrap_or_default())
+    }
+
+    /// The status a program asks `System.exit` for reaches the OS fail-closed.
+    ///
+    /// A request outside `0..=125` ends with status `1`, never a wrapped `0`;
+    /// the marker proves each child ran, so the `0` row cannot pass vacuously.
+    #[test]
+    fn system_exit_status_reaches_the_os() {
+        for (name, expected) in CASES {
+            let (status, stdout) = run_child(name);
+            assert!(stdout.contains(MARKER), "{name} never ran:\n{stdout}");
+            assert_eq!(status, Some(expected), "{name}:\n{stdout}");
+        }
+    }
+
+    /// Prints the marker, then exits with `code`.
+    fn mark_and_exit(code: i64) -> ! {
+        println!("{MARKER}");
+        system_exit(code)
+    }
+
+    #[ignore = "run as a child process by system_exit_status_reaches_the_os"]
+    #[test]
+    fn exit_256() {
+        mark_and_exit(256);
+    }
+
+    #[ignore = "run as a child process by system_exit_status_reaches_the_os"]
+    #[test]
+    fn exit_two_pow_32() {
+        mark_and_exit(1 << 32);
+    }
+
+    #[ignore = "run as a child process by system_exit_status_reaches_the_os"]
+    #[test]
+    fn exit_minus_256() {
+        mark_and_exit(-256);
+    }
+
+    #[ignore = "run as a child process by system_exit_status_reaches_the_os"]
+    #[test]
+    fn exit_i64_max() {
+        mark_and_exit(i64::MAX);
+    }
+
+    #[ignore = "run as a child process by system_exit_status_reaches_the_os"]
+    #[test]
+    fn exit_i64_min() {
+        mark_and_exit(i64::MIN);
+    }
+
+    #[ignore = "run as a child process by system_exit_status_reaches_the_os"]
+    #[test]
+    fn exit_0() {
+        mark_and_exit(0);
+    }
+
+    #[ignore = "run as a child process by system_exit_status_reaches_the_os"]
+    #[test]
+    fn exit_1() {
+        mark_and_exit(1);
+    }
+
+    #[ignore = "run as a child process by system_exit_status_reaches_the_os"]
+    #[test]
+    fn exit_125() {
+        mark_and_exit(125);
     }
 }

@@ -225,6 +225,11 @@ pub mod threads;
 // module is available in every config, mirroring the always-on `pub mod task;`
 // in the emitted crate's runtime template.
 pub mod task;
+// The one home of every integer and float narrowing (`count_from_int`,
+// `f64_trunc_to_i64`, the clock reads). Ungated, and needing no crate beyond
+// the browser clock `wasm-client` already links, so each kernel module reaches it in any feature set; `pub` so a
+// feature set that calls none of its helpers still compiles it warning-free.
+pub mod narrow;
 // `time` is behind the `time-core` feature (base `chrono`). The whole module —
 // the reactor-free clock reads (`Time.now`/`unixMillis`), the `Time.sleep`
 // timer, the calendar math, and the `chrono-tz`-gated IANA zone helpers — lives

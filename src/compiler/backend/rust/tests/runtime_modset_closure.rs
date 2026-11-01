@@ -1723,6 +1723,46 @@ fn wasm_vendored_modset_declares_seal_codec() {
     );
 }
 
+/// Every emitted module set declares `narrow`, the narrowing helpers any kernel
+/// module may call under any `cfg`.
+///
+/// The closure scanners skip a `#[cfg(...)]`-gated item, and the callers of
+/// `narrow` that sit inside one (`time::time_now`'s two target arms,
+/// `tea::EveryInterval::browser_delay_ms`) would pass them with a set missing
+/// it and then fail the emitted `cargo build` (E0433). The featureless native
+/// base set is the floor every flag mask extends
+/// (`declared_modset_is_monotone`), so the base and the wasm set together
+/// cover every emitted set.
+#[test]
+fn every_emitted_modset_declares_narrow() {
+    let mut interner = Interner::new();
+    let main = interner.intern("Main").expect("intern Main");
+    let base = declared_for_mask(&interner, main, 0);
+    assert!(
+        base.contains("narrow"),
+        "the native base module set (`templates/ipe_runtime/mod.rs`) must declare \
+         `narrow`; declared: {base:?}"
+    );
+    let prog = Program {
+        imports_unsafe_submodule: false,
+        imported_web_capabilities: std::collections::BTreeSet::new(),
+        modules: vec![module_for_mask(main, 0)],
+    };
+    let emitted = RustBackend::new(&interner)
+        .with_target(Target::WasmClient)
+        .emit(&prog)
+        .expect("wasm vendored emit must succeed");
+    let mod_rs = emitted
+        .files
+        .get("src/ipe_runtime/mod.rs")
+        .expect("wasm vendored emit must include src/ipe_runtime/mod.rs");
+    let wasm = declared_modules(mod_rs);
+    assert!(
+        wasm.contains("narrow"),
+        "`WASM_RUNTIME_MOD_RS` must declare `narrow`; declared: {wasm:?}"
+    );
+}
+
 // ── scanner unit tests: inline-path and cfg(test) regression ─────────────────
 
 /// The `crate_refs_in_line` scanner must detect `crate::<seg>::` occurrences
