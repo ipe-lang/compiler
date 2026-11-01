@@ -390,8 +390,8 @@ app code.
 | Module | Path | Key functions |
 |---|---|---|
 | `Task` | `Ipe.Task` | succeed, fail, map, andThen, perform, sequence, parallel, lazy, run, fromResult, andThenResult, mapError, onError; **loop** + `Step s a` ADT (Continue \| Done): `loop ceiling init step` repeats a step at constant stack depth, at most `ceiling` times; **retryWith** + `RetryPolicy e` + `BackoffStrategy` ADT (Linear \| LinearWithJitter \| Exponential \| ExponentialWithJitter). Build via linearBackoff/exponentialBackoff/defaultRetryPolicy; decorate via withJitter/withMaxAttempts/withBaseMs (`Ipe.Duration`)/withRetryOn. |
-| `Cmd` | `Ipe.Tea.<Shape>.Cmd` | Shape-scoped (`Ipe.Tea.Web.Cmd` / `Ipe.Tea.WebView.Cmd` / `Ipe.Tea.Tui.Cmd` / `Ipe.Tea.Cli.Cmd`; `Ipe.Tea.Terminal.Cmd` serves both terminal shapes); importing another shape's `Cmd` in an app is rejected (IPE-N0035). none, batch, perform, map, publish (echo-by-default pub/sub from update return), publishNoEcho (opt-out echo) |
-| `Sub` | `Ipe.Tea.<Shape>.Sub` | Shape-scoped (`Ipe.Tea.Web.Sub` / `Ipe.Tea.WebView.Sub` / `Ipe.Tea.Tui.Sub` / `Ipe.Tea.Cli.Sub`; `Ipe.Tea.Terminal.Sub` serves both terminal shapes but has no input subscription); wrong-shape import rejected (IPE-N0035). none, every, batch, map, subscribeTopic (pub/sub receive); `Tui.Sub` adds onKey (key input), `Cli.Sub` adds onLine (stdin lines) |
+| `Cmd` | `Ipe.Tea.<Shape>.Cmd` | Shape-scoped (`Ipe.Tea.Web.Cmd` / `Ipe.Tea.Tui.Cmd` / `Ipe.Tea.Cli.Cmd` / `Ipe.Tea.Worker.Cmd`; an `Ipe.Tea.WebView` app uses `Ipe.Tea.Web.Cmd`); importing another shape's `Cmd` in an app is rejected (IPE-N0035). none, batch, perform, map, publish (echo-by-default pub/sub from update return), publishNoEcho (opt-out echo) |
+| `Sub` | `Ipe.Tea.<Shape>.Sub` | Shape-scoped (`Ipe.Tea.Web.Sub` / `Ipe.Tea.Tui.Sub` / `Ipe.Tea.Cli.Sub` / `Ipe.Tea.Worker.Sub`; an `Ipe.Tea.WebView` app uses `Ipe.Tea.Web.Sub`); wrong-shape import rejected (IPE-N0035). none, every, batch, map, subscribeTopic (pub/sub receive); `Tui.Sub` adds onKey (key input), `Cli.Sub` adds onLine (stdin lines) |
 | `PubSub` | `Ipe.PubSub` | publish (Task-shaped, callable wherever a broadcast bus runs — a Web-app process, or `Err` in a plain CLI; complements `Ipe.Tea.Web.PubSub.publish`), publishNoEcho (Task-shaped no-echo) |
 | `Tea.Web.PubSub` | `Ipe.Tea.Web.PubSub` | publish, publishNoEcho (Cmd-shaped, returned from a Web `update`), subscribeTopic (Sub-shaped, declared in `subscriptions`) — the TEA-loop broadcast surface (importing it marks the module a TEA app) |
 | `Time` | `Ipe.Time` | now, sleep (`Ipe.Duration`), every (`Ipe.Duration`), unixMillis, format/formatISO8601/formatRFC3339/formatHTTP, addMillis, diffMillis, timeString |
@@ -1027,6 +1027,14 @@ main =
         , subscriptions = subscriptions
         }
 ```
+
+`KeyEvent.kind` is one of: `enter`, `tab`, `space`, `backspace`, `escape`,
+`up`, `down`, `left`, `right`, `home`, `end`, `delete`, `pageup`, `pagedown`,
+`fn` (`value` is the function-key number, e.g. `"1"` for F1), `mouse`,
+`paste-start`, `paste-end`, `ctrl` (`value` is the letter, e.g. `"a"` for
+Ctrl-A), `char` (`value` is the one character typed), or `other` (`value` is
+the raw bytes, decoded lossily). `value` is `""` for every `kind` not listed
+above as carrying one.
 
 A `Cli.tea` app subscribes to stdin lines the same way, through its own `Sub`:
 `import Ipe.Tea.Cli.Sub as Sub`, then `Sub.onLine onLine`
