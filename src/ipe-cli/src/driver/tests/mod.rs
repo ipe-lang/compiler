@@ -2003,7 +2003,10 @@ fn a_test_calling_an_uninstalled_crate_refuses_the_run_not_the_build() {
     let tree = SourceTree::main(RUNNABLE_MAIN).test_module("Main", asserted);
     let fixture = crate::RootFixture::from_tree(&tree).expect("fixture");
     let run = test_run_in(fixture.path(), None);
-    assert!(matches!(run, Err(CliError::FfiPrep(_))), "{run:?}");
+    assert!(
+        crate::ffi::is_asserted_refusal_at(&run, "tests/Main.ipe", "tm::shift"),
+        "{run:?}"
+    );
 
     let runtime = resolve_runtime().expect("the in-repo runtime resolves");
     let out = session_scratch("test_run_ffi_build_out").join("out");

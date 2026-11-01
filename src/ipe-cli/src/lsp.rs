@@ -468,7 +468,7 @@ mod tests {
             .into_iter()
             .filter(is_source_side)
             .collect();
-        assert_eq!(source_side.len(), 4, "{source_side:?}");
+        assert_eq!(source_side.len(), 3, "{source_side:?}");
         for refusal in source_side {
             let err = CliError::FfiPrep(Box::new(refusal));
             assert_eq!(
@@ -602,6 +602,29 @@ mod tests {
             fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod");
         }
         dir
+    }
+
+    /// An asserted call into an uninstalled crate is a source refusal: the
+    /// load degrades with the IPE-F4414 refusal of that call, never refuses
+    /// the workspace, since an edit to the call lifts it.
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed fixture write IS the failure
+    fn an_asserted_call_refusal_degrades_the_load() {
+        let asserted = "module Main exposing (shifted)\nimport Rust.Ffi\n\n\n\
+                        shifted : Int -> Result Error Int\nshifted =\n    Rust.Ffi.call \"tm::shift\"\n";
+        let fixture = RootFixture::main(asserted).expect("fixture");
+        let main = fixture.path().join("src/Main.ipe");
+        let loaded = DriverLoader.load(&[fixture.path().to_path_buf()], &main, Some(asserted));
+        let err = loaded.err();
+        assert!(
+            matches!(&err, Some(LoadError::Pipeline(detail))
+                if detail.contains("IPE-F4414") && detail.contains("tm::shift")),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.as_ref().map(LoadError::disposition),
+            Some(ipe_lsp_server::LoadDisposition::Degrade)
+        );
     }
 
     /// A tampered FFI catalog under the project root refuses the load rather than degrading it.

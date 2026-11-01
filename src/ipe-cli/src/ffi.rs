@@ -1280,6 +1280,40 @@ fn asserted_refused(
     }
 }
 
+/// Whether `result` is the IPE-F4414 refusal of the asserted call to `path`,
+/// blamed on the file ending in `rel` and spanned at its `Rust.Ffi.call`.
+///
+/// A refusal of another kind (an unresolved `Rust.Ffi`, a type error in the
+/// same file) does not match, so a test pinning it goes red when the asserted
+/// refusal itself disappears.
+#[cfg(test)]
+pub(crate) fn is_asserted_refusal_at<T>(
+    result: &Result<T, CliError>,
+    rel: &str,
+    path: &str,
+) -> bool {
+    let Err(CliError::Pipeline { file, src, diag }) = result else {
+        return false;
+    };
+    let ipe_diagnostics::Diagnostic::Ffi {
+        msg:
+            ipe_diagnostics::FfiError::AssertedRefused {
+                path: refused,
+                span,
+                ..
+            },
+    } = diag.as_ref()
+    else {
+        return false;
+    };
+    let at = usize::try_from(span.lo).unwrap_or(usize::MAX);
+    file.ends_with(rel)
+        && refused.as_str() == path
+        && src
+            .get(at..)
+            .is_some_and(|rest| rest.starts_with("Rust.Ffi.call"))
+}
+
 /// Locate the `ipe-ffi-inspector` binary: beside the running `ipe`
 /// executable first, then `$PATH`.
 fn inspector_binary() -> Result<PathBuf, CliError> {
@@ -6317,24 +6351,9 @@ version = \"1\"
         );
         let got = scan_asserted(&sources, &[], &ipe_ffi::unify::UnifyReport::default());
         assert!(
-            matches!(&got, Err(CliError::Pipeline { .. })),
-            "an asserted call into an uninstalled crate is a pipeline refusal: {:?}",
+            is_asserted_refusal_at(&got, "src/Main.ipe", "tm::shift"),
+            "the refusal is IPE-F4414 at the asserted call in Main: {:?}",
             got.as_ref().err()
-        );
-        let Err(CliError::Pipeline { file, src, diag }) = &got else {
-            return;
-        };
-        assert_eq!(file, &PathBuf::from("src/Main.ipe"));
-        let span = diag.primary_span();
-        let at = usize::try_from(span.lo).expect("small offset");
-        assert!(
-            matches!(diag.as_ref(), ipe_diagnostics::Diagnostic::Ffi {
-                msg: ipe_diagnostics::FfiError::AssertedRefused { path, .. }
-            } if path.as_str() == "tm::shift")
-                && src
-                    .get(at..)
-                    .is_some_and(|rest| rest.starts_with("Rust.Ffi.call")),
-            "the refusal is IPE-F4414 at the asserted call in Main: {diag:?}"
         );
     }
 
