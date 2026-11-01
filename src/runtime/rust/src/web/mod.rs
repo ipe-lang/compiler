@@ -772,6 +772,10 @@ pub struct SessionEntry<Model, Msg> {
     /// The session's in-flight Cmd budget, shared with its driver: a Cmd holds
     /// one of its units from its start until its Msg is queued.
     pub(crate) cmds: Arc<budget::SessionCmds>,
+    /// The `Ipe.Ffi.Js` port life this session's publication opened, written
+    /// under this entry's lock. An attach binds its sink only into this life;
+    /// `None` (not yet opened, or no life could open) refuses the attach.
+    pub(crate) port_life: Option<crate::js_port::PortLife>,
 }
 
 #[cfg(feature = "web")]
@@ -5453,6 +5457,7 @@ mod handlers {
             liveness: SessionLiveness::new(scope.clone()),
             charge,
             cmds: Arc::clone(&cmds),
+            port_life: None,
         };
         // The first model is charged before the store, the driver or the
         // cookie learn of the session: a refused one runs no Cmd.
@@ -5503,9 +5508,16 @@ mod handlers {
                 }
             }
             // The life's port endpoints open now the store holds this session,
-            // before the driver or the seed Cmd can reach them.
-            let port_lease = crate::js_port::SessionId::parse(sid)
-                .and_then(|s| crate::js_port::session_open(&s));
+            // before the driver or the seed Cmd can reach them. The life is
+            // recorded on the entry under its lock, the lock an attach binds
+            // under, so an attach binds into this life or none.
+            let port_lease = {
+                let mut e = entry.lock().unwrap_or_else(|e| e.into_inner());
+                let lease = crate::js_port::SessionId::parse(sid)
+                    .and_then(|s| crate::js_port::session_open(&s));
+                e.port_life = lease.as_ref().map(crate::js_port::PortLease::life);
+                lease
+            };
             tokio::spawn(drive_session(
                 Arc::downgrade(&entry),
                 msg_rx,
@@ -5645,27 +5657,33 @@ mod handlers {
             // connection: every `js_send` whose origin is this sid is forwarded to
             // the browser as an `event: port` frame over the same stream that
             // carries DOM patches (mirroring how the custom-element served-widget
-            // transport delivers per-session). The sink is keyed by sid in the port
+            // transport delivers per-session). The sink is keyed by (sid, life) in the port
             // registry, so a frame can only ever reach the session that produced it
             // — never another session's stream. `try_send` is non-blocking (this
             // sink runs on the synchronous Cmd-dispatch path): a full SSE buffer
             // drops the one frame rather than blocking the dispatch loop, the same
-            // fire-and-forget contract the port carries client-side. A sid whose
-            // life no longer holds port endpoints is a lost session, refused
-            // before the stream is attached. The sink binds only while the store
-            // holds this session, under the lock an eviction takes.
-            #[cfg(all(feature = "json", feature = "tokio"))]
-            if let Some(port_sid) = crate::js_port::SessionId::parse(&sid) {
-                let port_tx = tx.clone();
-                let bound = crate::js_port::register_out_sink_for(
-                    &port_sid,
-                    std::sync::Arc::new(move |encoded: &str| {
-                        let _ = port_tx.try_send(SsePatch(sse::frame("port", encoded)));
-                    }),
-                );
-                if bound.is_err() {
-                    return SessionLost.into_response();
-                }
+            // fire-and-forget contract the port carries client-side. The sink
+            // binds into the port life this entry's publication opened, never
+            // the sid's current one: a session another life of the sid has
+            // replaced binds nothing. An entry with no life yet, or whose life
+            // no longer holds port endpoints, is a lost session, refused before
+            // the stream is attached. The sink binds only while the store holds
+            // this session, under the lock an eviction takes.
+            let (Some(port_life), Some(port_sid)) =
+                (e.port_life, crate::js_port::SessionId::parse(&sid))
+            else {
+                return SessionLost.into_response();
+            };
+            let port_tx = tx.clone();
+            let bound = crate::js_port::register_out_sink_for(
+                &port_sid,
+                port_life,
+                std::sync::Arc::new(move |encoded: &str| {
+                    let _ = port_tx.try_send(SsePatch(sse::frame("port", encoded)));
+                }),
+            );
+            if bound.is_err() {
+                return SessionLost.into_response();
             }
             e.sse_tx = Some(tx.clone());
             e.liveness.closer.subscribe()
@@ -8026,6 +8044,7 @@ mod reload_push_tests {
             liveness: crate::web::SessionLiveness::default(),
             charge: crate::web::budget::Charge::detached(),
             cmds: Arc::new(crate::web::budget::SessionCmds::new()),
+            port_life: None,
         }))
     }
 
@@ -8147,6 +8166,7 @@ mod hot_appearance_push_tests {
             liveness: crate::web::SessionLiveness::default(),
             charge: crate::web::budget::Charge::detached(),
             cmds: Arc::new(crate::web::budget::SessionCmds::new()),
+            port_life: None,
         }))
     }
 
@@ -10364,6 +10384,7 @@ mod sse_reconnect_reconcile_tests {
             liveness: crate::web::SessionLiveness::default(),
             charge: crate::web::budget::Charge::detached(),
             cmds: Arc::new(crate::web::budget::SessionCmds::new()),
+            port_life: None,
         }));
         Fixture {
             entry,
@@ -11170,6 +11191,7 @@ mod watch_status_handler_tests {
             liveness: crate::web::SessionLiveness::default(),
             charge: crate::web::budget::Charge::detached(),
             cmds: Arc::new(crate::web::budget::SessionCmds::new()),
+            port_life: None,
         }))
     }
 
@@ -14954,6 +14976,56 @@ mod emitted_router_behavior_tests {
         });
     }
 
+    /// An SSE for a held session whose entry records no port life is lost
+    /// before it attaches, even while a lease holds the sid's port: the
+    /// attach binds only into the life its entry's publication opened.
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a fixed request always builds
+    fn an_sse_for_an_entry_without_a_port_life_is_lost_before_it_attaches() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, _body) = get(make_router(store.clone()), "/", None).await;
+            assert!(!sid.is_empty(), "the page mints a session");
+            assert!(
+                crate::js_port::lock_sessions().contains_key(&sid),
+                "the publication opened the life's port"
+            );
+            let held = session_of(&store, &sid).await;
+            let recorded = held
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .port_life
+                .take();
+            assert!(recorded.is_some(), "the publication recorded its life");
+            let resp = make_router(store.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/_ipe/sse?path=%2F")
+                        .header(header::ACCEPT, "text/event-stream")
+                        .header(
+                            header::COOKIE,
+                            format!(
+                                "{}={sid}",
+                                cookie_name_for(&crate::encoding::MountBase::root())
+                            ),
+                        )
+                        .body(Body::empty())
+                        .expect("build SSE GET"),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            assert!(
+                held.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .sse_tx
+                    .is_none(),
+                "a lost SSE leaves no stream sender on the session"
+            );
+        });
+    }
+
     /// A commit that passes the session's byte ceiling closes the session: its
     /// stream yields the one `closed` frame tagged `over_ceiling`, then ends,
     /// and the session is gone.
@@ -17989,6 +18061,7 @@ mod route_entry_cmd_tests {
             liveness: crate::web::SessionLiveness::default(),
             charge: crate::web::budget::Charge::detached(),
             cmds: Arc::new(crate::web::budget::SessionCmds::new()),
+            port_life: None,
         }));
         assert!(matches!(
             store.set(&sid, entry).await,
@@ -21188,6 +21261,7 @@ mod session_history_charge_tests {
             liveness: SessionLiveness::default(),
             charge: budget::Charge::detached(),
             cmds: Arc::new(budget::SessionCmds::new()),
+            port_life: None,
         }
     }
 
@@ -21333,6 +21407,7 @@ mod shutdown_work_tests {
             liveness: SessionLiveness::new(scope.clone()),
             charge: budget::Charge::detached(),
             cmds: Arc::clone(&cmds),
+            port_life: None,
         }));
         let update = Arc::new(move |msg: i64, model: i64| {
             applied.fetch_add(1, Ordering::SeqCst);
@@ -21348,6 +21423,8 @@ mod shutdown_work_tests {
         let store: Arc<dyn SessionStore<i64, i64>> = store;
         let port_lease = crate::js_port::SessionId::parse(scope.sid())
             .and_then(|s| crate::js_port::session_open(&s));
+        entry.lock().unwrap_or_else(|e| e.into_inner()).port_life =
+            port_lease.as_ref().map(crate::js_port::PortLease::life);
         let driver = tokio::spawn(drive_session(
             Arc::downgrade(&entry),
             msg_rx,
