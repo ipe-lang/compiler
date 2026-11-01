@@ -2754,7 +2754,7 @@ fn read_ffi_vocabulary(manifest_path: &Path) -> Result<String, CliError> {
 /// in `src/Ffi/<Crate>.ipe` instead.
 fn reject_legacy_define_tables(text: &str) -> Result<(), CliError> {
     if text.contains("[[rust.define.") {
-        return Err(CliError::Usage(
+        return Err(CliError::ProjectRefused(
             crate::text::msg::ffi_legacy_define_removed(),
         ));
     }
@@ -3423,9 +3423,9 @@ fn reject_ambiguous_define<'a>(
     mut unqualified: impl Iterator<Item = &'a str>,
 ) -> Result<(), CliError> {
     if !sole_dep && let Some(name) = unqualified.next() {
-        return Err(CliError::Usage(text::msg::ffi_define_crate_ambiguous(
-            &kind, &name,
-        )));
+        return Err(CliError::ProjectRefused(
+            text::msg::ffi_define_crate_ambiguous(&kind, &name),
+        ));
     }
     Ok(())
 }
@@ -3627,24 +3627,21 @@ fn merge_declared_opaques(
             t.get("name").and_then(serde_json::Value::as_str) == Some(o.rust_type.as_str())
         });
         let Some(reported) = reported else {
-            return Err(CliError::Usage(text::msg::ffi_opaque_unknown_type(
-                &o.ipe_name,
-                &o.rust_type,
-                &crate_name,
-            )));
+            return Err(CliError::ProjectRefused(
+                text::msg::ffi_opaque_unknown_type(&o.ipe_name, &o.rust_type, &crate_name),
+            ));
         };
         if transparent.contains(o.rust_type.as_str()) {
-            return Err(CliError::Usage(text::msg::ffi_opaque_is_transparent(
-                &o.ipe_name,
-                &o.rust_type,
-            )));
+            return Err(CliError::ProjectRefused(
+                text::msg::ffi_opaque_is_transparent(&o.ipe_name, &o.rust_type),
+            ));
         }
         let rust_path = reported
             .get("rustPath")
             .and_then(serde_json::Value::as_str)
             .filter(|p| !p.is_empty())
             .ok_or_else(|| {
-                CliError::Usage(text::msg::ffi_opaque_without_path(
+                CliError::ProjectRefused(text::msg::ffi_opaque_without_path(
                     &o.ipe_name,
                     &o.rust_type,
                 ))
@@ -3657,9 +3654,9 @@ fn merge_declared_opaques(
         if let Some(prev) = declared.get(o.ipe_name.as_str())
             && prev.as_str() != Some(absolute.as_str())
         {
-            return Err(CliError::Usage(text::msg::ffi_opaque_declared_twice(
-                &o.ipe_name,
-            )));
+            return Err(CliError::ProjectRefused(
+                text::msg::ffi_opaque_declared_twice(&o.ipe_name),
+            ));
         }
         declared.insert(o.ipe_name.clone(), serde_json::Value::String(absolute));
     }
@@ -3752,8 +3749,8 @@ type ForeignDefines = (
 /// A parse error in any source module is silently skipped here — the compile
 /// pipeline will surface it with full context moments later. A malformed
 /// `foreign` declaration (invalid carrier, unknown kind, …) is a typed refusal
-/// returned as an `Err` with a `CliError::Usage` carrying the source path
-/// and reason; the caller decides whether to propagate it immediately or defer.
+/// returned as an `Err` with a `CliError::ProjectRefused` carrying the source
+/// path and reason: the project's source is wrong, not the command line.
 ///
 /// The returned vectors are the exact same `ManifestDefine*` shapes the TOML
 /// readers produce, so they feed unchanged into `merge_provides`.
@@ -3812,10 +3809,10 @@ impl ForeignReader<'_> {
         self.interner.resolve(sym).unwrap_or("")
     }
 
-    /// Emit a typed refusal with a source location prefix.
+    /// Emit a project-state refusal with a source location prefix.
     fn reject(&self, span: ipe_diagnostics::Span, reason: &str) -> CliError {
         let (line, col) = line_col_from_span(self.src, span.lo);
-        CliError::Usage(text::msg::located_refusal(
+        CliError::ProjectRefused(text::msg::located_refusal(
             &self.file.display(),
             &line,
             &col,
@@ -6062,7 +6059,7 @@ version = \"1\"
         )
         .expect_err("must_refuse: an un-inspected type cannot mint a handle");
         assert!(
-            matches!(&err, CliError::Usage(m) if m.contains("not an inspected type")),
+            matches!(&err, CliError::ProjectRefused(m) if m.contains("not an inspected type")),
             "{err:?}"
         );
     }
@@ -6091,7 +6088,7 @@ version = \"1\"
         let err = merge_provides(&doc, "geo", &[], &[], &[], &opaques, true)
             .expect_err("must_refuse: a transparent value type is not a handle");
         assert!(
-            matches!(&err, CliError::Usage(m) if m.contains("TRANSPARENTLY")),
+            matches!(&err, CliError::ProjectRefused(m) if m.contains("TRANSPARENTLY")),
             "{err:?}"
         );
     }
@@ -6104,17 +6101,18 @@ version = \"1\"
             rust_type: "Client".to_owned(),
         }];
         // sole_dep = false ⇒ an unattributed declaration cannot be placed.
+        let unplaced = merge_provides(
+            &doc_reporting_opaque_client(),
+            "postgres",
+            &[],
+            &[],
+            &[],
+            &opaques,
+            false,
+        );
         assert!(
-            merge_provides(
-                &doc_reporting_opaque_client(),
-                "postgres",
-                &[],
-                &[],
-                &[],
-                &opaques,
-                false
-            )
-            .is_err()
+            matches!(unplaced, Err(CliError::ProjectRefused(_))),
+            "an unattributed declaration is project state: {unplaced:?}"
         );
         // sole_dep = true ⇒ it attaches to the one crate.
         assert!(
@@ -6799,6 +6797,37 @@ version = \"1\"
         );
     }
 
+    /// A malformed `foreign` declaration in the project's source is a
+    /// project-state refusal.
+    ///
+    /// It never routes as argument misuse, so no help page prints under it.
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed write IS the failure
+    fn a_malformed_foreign_declaration_is_a_project_refusal() {
+        let dir = ipe_test_temp::temp_root().join(format!(
+            "ipe-foreign-project-refused-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(
+            dir.join("Main.ipe"),
+            "module Main exposing (..)\n\nforeign Foo =\n    { crate = \"x\"\n    , kind = Phantom\n    }\n",
+        )
+        .expect("write source");
+        let got = scan_foreign_defines(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(got, Err(CliError::ProjectRefused(_))),
+            "a malformed `foreign` is project state, never argument misuse: {got:?}"
+        );
+        let Err(CliError::ProjectRefused(msg)) = got else {
+            return;
+        };
+        assert!(msg.contains("Main.ipe"), "names the source file: {msg}");
+        assert!(msg.contains("kind"), "names the refused field: {msg}");
+    }
+
     /// A `_bindings.rs` that is a symlink is refused, never followed: the
     /// read of the FFI cache is the scan's whole input, so a link that could
     /// point it elsewhere fails the read with the link refusal itself.
@@ -6922,6 +6951,10 @@ fields = { value = "i64" }
 "#;
         let err = reject_legacy_define_tables(toml_with_define)
             .expect_err("must reject legacy [[rust.define.*]]");
+        assert!(
+            matches!(err, CliError::ProjectRefused(_)),
+            "a legacy table is project state: {err:?}"
+        );
         let msg = err.to_string();
         assert!(
             msg.contains("[[rust.define.*]] is no longer supported"),

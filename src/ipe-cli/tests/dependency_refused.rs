@@ -36,6 +36,25 @@ fn run(args: &[&str]) -> Run {
     }
 }
 
+/// Run `ipe <args>` with `NO_COLOR=1` from the directory `cwd`.
+fn run_in(cwd: &Path, args: &[&str]) -> Run {
+    match Command::new(support::ipe_bin())
+        .args(args)
+        .current_dir(cwd)
+        .env("NO_COLOR", "1")
+        .output()
+    {
+        Ok(output) => Run {
+            ok: output.status.success(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        },
+        Err(e) => Run {
+            ok: false,
+            stderr: format!("failed to spawn ipe {args:?} in {}: {e}", cwd.display()),
+        },
+    }
+}
+
 /// A fresh directory unique to this process and call.
 fn fresh_dir(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -198,11 +217,18 @@ fn a_project_state_refusal_prints_no_help() {
             ", sourceRoot = \"app\"",
             "`sourceRoot` is not a package field",
         ),
+        (
+            "source-root-absent",
+            ", sourceRoot = \"app\"",
+            "`sourceRoot` is not a package field",
+        ),
     ] {
         let base = fresh_dir(tag);
         let dir = project(&base, field, PLAIN_MAIN);
-        // The moved root exists, so the refusal is the removed field, not a missing directory.
-        std::fs::create_dir_all(dir.join("app")).expect("create the moved root");
+        // The removed field is refused whether or not the moved root exists.
+        if tag == "source-root" {
+            std::fs::create_dir_all(dir.join("app")).expect("create the moved root");
+        }
         let r = run(&["type-check", &dir.to_string_lossy()]);
         let _ = std::fs::remove_dir_all(&base);
         assert!(!r.ok, "{tag}: the manifest must be refused");
@@ -235,8 +261,55 @@ fn a_library_build_refusal_prints_no_help() {
     assert!(!shows_help(&r.stderr), "printed help:\n{}", r.stderr);
 }
 
+/// A directory with no `package.ipe` is a project-state refusal for the
+/// commands that need one: each names the missing manifest and never prints
+/// the command's help page.
+#[test]
+#[allow(clippy::expect_used)] // a failed fixture write is the test failure
+fn a_missing_manifest_prints_no_help() {
+    let base = fresh_dir("no-manifest");
+    std::fs::create_dir_all(&base).expect("create the empty directory");
+    let path = base.to_string_lossy().into_owned();
+    let runs = [
+        ("add", run_in(&base, &["add", "somepkg"])),
+        ("remove", run_in(&base, &["remove", "somepkg"])),
+        ("package audit", run(&["package", "audit", &path])),
+    ];
+    let _ = std::fs::remove_dir_all(&base);
+    for (command, r) in runs {
+        assert!(
+            !r.ok,
+            "{command}: a directory with no manifest must be refused"
+        );
+        assert!(r.stderr.contains("package.ipe"), "{command}: {}", r.stderr);
+        assert!(
+            !shows_help(&r.stderr),
+            "{command}: printed help:\n{}",
+            r.stderr
+        );
+    }
+}
+
 /// Real argument misuse still prints the command's help page, so the
 /// no-help assertions above are not vacuous.
+/// A path argument naming neither a directory nor a `package.ipe` is argument
+/// misuse: `package audit` and `package publish` refuse it with the help page.
+#[test]
+fn a_path_argument_that_is_not_a_package_prints_help() {
+    let base = fresh_dir("not_a_package");
+    let missing = base.join("absent");
+    let missing_arg = missing.to_string_lossy().into_owned();
+    for sub in ["audit", "publish"] {
+        let r = run(&["package", sub, &missing_arg]);
+        assert!(!r.ok, "`package {sub}` must refuse a missing path");
+        assert!(
+            shows_help(&r.stderr),
+            "`package {sub}` on a path that is no package must print help:\n{}",
+            r.stderr
+        );
+    }
+}
+
 #[test]
 fn argument_misuse_still_prints_help() {
     let r = run(&["type-check", "--no-such-flag"]);

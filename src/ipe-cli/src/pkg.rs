@@ -20,7 +20,7 @@ use crate::text;
 ///
 /// # Errors
 /// [`CliError::Usage`] when no package is named or the requirement is
-/// malformed; [`CliError::Usage`] when there is no `package.ipe` here;
+/// malformed; [`CliError::ProjectRefused`] when there is no `package.ipe` here;
 /// [`CliError::Resolve`] / [`CliError::HashMismatch`] on a resolution or
 /// integrity failure; [`CliError::Io`] on a filesystem failure.
 pub fn run_add(rest: &[String]) -> Result<(), CliError> {
@@ -33,8 +33,8 @@ pub fn run_add(rest: &[String]) -> Result<(), CliError> {
 /// `package.ipe` and `ipe.lock`.
 ///
 /// # Errors
-/// [`CliError::Usage`] when no package is named; [`CliError::Usage`] when
-/// there is no `package.ipe` here; [`CliError::Io`] on a filesystem failure.
+/// [`CliError::Usage`] when no package is named; [`CliError::ProjectRefused`]
+/// when there is no `package.ipe` here; [`CliError::Io`] on a filesystem failure.
 pub fn run_remove(rest: &[String]) -> Result<(), CliError> {
     let package = package_arg(rest, "remove")?;
     let project_root = project_root()?;
@@ -46,8 +46,8 @@ pub fn run_remove(rest: &[String]) -> Result<(), CliError> {
 /// The manifest reader/writer both key off this root.
 ///
 /// # Errors
-/// [`CliError::Io`] if the current directory cannot be read; [`CliError::Usage`]
-/// when there is no `package.ipe` here (with the legacy-toml hint when only a
+/// [`CliError::Io`] if the current directory cannot be read;
+/// [`CliError::ProjectRefused`] when there is no `package.ipe` here (with the legacy-toml hint when only a
 /// legacy `ipe.toml` is present).
 fn project_root() -> Result<PathBuf, CliError> {
     let cwd = std::env::current_dir().map_err(|e| CliError::Io {
@@ -58,9 +58,9 @@ fn project_root() -> Result<PathBuf, CliError> {
         return Ok(cwd);
     }
     if crate::project::has_only_legacy_toml(&cwd) {
-        return Err(CliError::Usage(text::msg::legacy_toml_hint()));
+        return Err(CliError::ProjectRefused(text::msg::legacy_toml_hint()));
     }
-    Err(CliError::Usage(text::msg::pkg_no_manifest()))
+    Err(CliError::ProjectRefused(text::msg::pkg_no_manifest()))
 }
 
 /// Parse `ipe add`'s single argument into a package name and a version

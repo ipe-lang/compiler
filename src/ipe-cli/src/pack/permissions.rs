@@ -1053,7 +1053,7 @@ fn android_entry_name(entry: AndroidEntry) -> String {
 /// derives, never *introduce* one.
 ///
 /// # Errors
-/// [`CliError::Usage`] carrying the `IPE-P0001` refusal when any override
+/// [`CliError::ProjectRefused`] carrying the `IPE-P0001` refusal when any override
 /// permission has no backing accepted axis.
 pub fn reconcile_override(
     accepts: &BTreeSet<Capability>,
@@ -1074,7 +1074,7 @@ pub fn reconcile_override(
 /// The typed, fail-closed refusal naming each override permission with no backing
 /// accepted axis, and the remedy.
 fn unbacked_permission_refusal(platform: Platform, unbacked: &[&String]) -> CliError {
-    CliError::Usage(crate::text::Message::lines(
+    CliError::ProjectRefused(crate::text::Message::lines(
         std::iter::once(crate::text::msg::permission_consent_header(
             &platform.as_str(),
         ))
@@ -1360,6 +1360,10 @@ mod tests {
         let over = one_override("NSCameraUsageDescription");
         let err = reconcile_override(&a, Platform::Ios, &over)
             .expect_err("an unbacked camera permission must be refused");
+        assert!(
+            matches!(err, CliError::ProjectRefused(_)),
+            "an override is project state: {err:?}"
+        );
         let msg = err.to_string();
         assert!(msg.contains("IPE-P0001"), "carries the code: {msg}");
         assert!(

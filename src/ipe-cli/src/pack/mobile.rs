@@ -1490,7 +1490,7 @@ impl<'a> AndroidPlan<'a> {
         let identity = &shell.identity;
         let reach = pin
             .reach(BundleHost::AndroidAssets)
-            .map_err(|refusal| CliError::Usage(text::Message::relay(&refusal)))?;
+            .map_err(|refusal| CliError::ProjectRefused(text::Message::relay(&refusal)))?;
         let accepts = pin.accepts();
         let permissions = permissions::derive_permissions(accepts, Platform::Android)?;
         let groups = permissions.android_runtime_request_groups();
@@ -1508,7 +1508,7 @@ impl<'a> AndroidPlan<'a> {
             .collect();
         let push = if caps.contains(&native_bridge::BridgeCap::Push) {
             Some(pin.push().ok_or_else(|| {
-                CliError::Usage(text::Message::relay(&MobileRefusal::PushUnconfigured))
+                CliError::ProjectRefused(text::Message::relay(&MobileRefusal::PushUnconfigured))
             })?)
         } else {
             None
@@ -4031,7 +4031,7 @@ fn ios_layout(
     let base = pin.base();
     let reach = pin
         .reach(BundleHost::IosScheme)
-        .map_err(|refusal| CliError::Usage(text::Message::relay(&refusal)))?;
+        .map_err(|refusal| CliError::ProjectRefused(text::Message::relay(&refusal)))?;
     let slug = app_slug(&identity.name);
     let root_name = format!("{slug}-ios");
     let mut files = Vec::new();
@@ -6796,7 +6796,10 @@ mod tests {
             &bundle(),
             None,
         );
-        assert!(matches!(refused, Err(CliError::Usage(_))), "{refused:?}");
+        assert!(
+            matches!(refused, Err(CliError::ProjectRefused(_))),
+            "{refused:?}"
+        );
     }
 
     #[test]
@@ -7237,7 +7240,10 @@ mod tests {
         for listed in [csp::ANDROID_ASSET_ORIGIN, with_port.as_str()] {
             let refused = pin("/", &["https://api.example", listed]);
             let result = lay(MobileOs::Android, &refused);
-            assert!(matches!(result, Err(CliError::Usage(_))), "{listed}");
+            assert!(
+                matches!(result, Err(CliError::ProjectRefused(_))),
+                "{listed}"
+            );
             assert!(
                 lay(MobileOs::Ios, &refused).is_ok(),
                 "only the Android shell answers that host locally"
