@@ -268,7 +268,7 @@ pub enum AssertedDefect {
         first: String,
         second: String,
         /// The definition that asserted `first`.
-        first_site: AssertedSite,
+        first_site: Box<AssertedSite>,
     },
     /// A `Rust.const` annotation is not a bare scalar type — a native constant
     /// reads a single infallible value (Int, Float, Bool, Char, String, or

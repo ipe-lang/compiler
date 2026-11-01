@@ -803,7 +803,7 @@ pub fn dedupe(specs: Vec<AssertedSpec>) -> Result<Vec<AssertedSpec>, AssertedRef
                     defect: AssertedDefect::ConflictingAssertions {
                         first: format!("{} : {}", existing.path.as_str(), existing.sig.ipe_sig()),
                         second: format!("{} : {}", spec.path.as_str(), spec.sig.ipe_sig()),
-                        first_site: existing.site.clone(),
+                        first_site: Box::new(existing.site.clone()),
                     },
                     site: spec.site,
                 });
@@ -1169,7 +1169,7 @@ pub fn dedupe_consts(specs: Vec<ConstSpec>) -> Result<Vec<ConstSpec>, AssertedRe
                     defect: AssertedDefect::ConflictingAssertions {
                         first: format!("{} : {}", existing.path.as_str(), existing.ipe_type()),
                         second: format!("{} : {}", spec.path.as_str(), spec.ipe_type()),
-                        first_site: existing.site.clone(),
+                        first_site: Box::new(existing.site.clone()),
                     },
                     site: spec.site,
                 });
@@ -1497,7 +1497,7 @@ mod tests {
                     defect: AssertedDefect::ConflictingAssertions { first_site, .. },
                     site,
                     ..
-                } if *first_site == test_site() && *site == site_at("src/Other.ipe", 7)
+                } if **first_site == test_site() && *site == site_at("src/Other.ipe", 7)
             ),
             "the conflict sits at the second definition and names the first: {err:?}"
         );
@@ -1687,7 +1687,7 @@ mod tests {
                     defect: AssertedDefect::ConflictingAssertions { first_site, .. },
                     site,
                     ..
-                } if *first_site == test_site() && *site == site_at("src/Other.ipe", 7)
+                } if **first_site == test_site() && *site == site_at("src/Other.ipe", 7)
             ),
             "the conflict sits at the second definition and names the first: {err:?}"
         );

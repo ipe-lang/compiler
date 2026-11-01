@@ -396,7 +396,11 @@ impl<'a> Parser<'a> {
     }
 
     /// `Module.Ctor` where a pattern expects a bare constructor — IPE-P0074.
-    fn qualified_ctor_in_pattern(tok: &Token, qualified: Box<str>, bare: Box<str>) -> Diagnostic {
+    const fn qualified_ctor_in_pattern(
+        tok: &Token,
+        qualified: Box<str>,
+        bare: Box<str>,
+    ) -> Diagnostic {
         Diagnostic::Parse {
             span: tok.span,
             msg: ParseError::QualifiedCtorInPattern { qualified, bare },
