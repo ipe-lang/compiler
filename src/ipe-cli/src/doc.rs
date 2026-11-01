@@ -487,7 +487,7 @@ fn route_term(raw: &str, generate_flags: bool) -> Result<Sub, CliError> {
 ///
 /// The operator set is the parser's closed [`ipe_syntax::BinOp`], so a term
 /// routes as an operator exactly when the parser reads it as one.
-fn is_operator_term(term: &str) -> bool {
+const fn is_operator_term(term: &str) -> bool {
     ipe_syntax::BinOp::from_text(term).is_some()
 }
 
