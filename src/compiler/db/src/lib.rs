@@ -1719,6 +1719,9 @@ pub type LowerResult = Result<Arc<ipe_ir::Program>, PipelineError>;
 
 /// Lower the linked whole-program module.
 ///
+/// Admission runs in build order: link, type-check, the IPE-N0040
+/// decoder-direction gate, then lowering; the first refusal is the result.
+///
 /// Keyed on `(root, entry)` over [`linked_program`] and [`typecheck`], so it
 /// re-executes exactly when either input changes, and a repeat demand or a
 /// no-op re-save executes nothing.
@@ -1737,6 +1740,11 @@ pub fn lower_program(db: &dyn Db, root: SourceRoot, entry: SourceFile) -> LowerR
     let types = typecheck(db, root, entry)
         .clone()
         .map_err(PipelineError::from)?;
+    // The IPE-N0040 decoder-direction gate is part of lowering's admission, so
+    // every consumer of the lowered program (build, type-check, LSP) refuses a
+    // hand-nested decoder pipeline through this one query.
+    ipe_canon::decoder_pipeline_gate::check_decoder_pipelines(&linked.module)
+        .map_err(|d| PipelineError::Lower(d, Vec::new()))?;
     let mut interner = db.interner().lock();
     // Provide the entry file's display path and source text so the lowerer
     // can inject `<file>:<line>` into `Debug.todo` call sites.

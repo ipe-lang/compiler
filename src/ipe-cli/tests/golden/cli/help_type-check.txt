@@ -3,7 +3,7 @@ exit: 0
 
   Ipê language - v<VERSION> - https://github.com/ipe-lang/compiler
 
-  Type-check a program without building or running it.
+  Check a program through type inference and lowering, without building or running it.
 
   ipe type-check [<path>]
 

@@ -226,7 +226,7 @@ impl AspectCheck<StdlibSymbol> for DocExampleColumn {
                     ));
                 }
             };
-            if let Err(err) = crate::driver::typecheck_target(
+            if let Err(err) = crate::driver::typecheck_stage_target(
                 &crate::project_root::AnalysisTarget::Project(scratch.root()),
             ) {
                 return Cell::Hole(format!(
