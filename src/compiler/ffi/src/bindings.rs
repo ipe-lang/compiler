@@ -29,7 +29,7 @@ use ipe_intern::rust_str_lit;
 use crate::carrier::{Carrier, ClosureRet, ClosureSig, EnumDef, StructDef};
 use crate::emit::{foreign_to_ipe, param_ipe_type};
 use crate::naming::{RustIdent, arg_name, rust_kernel_name, rust_safe_ident, wrapper_fn_ident};
-use crate::num_coerce::{is_numeric_rust, num_saturate, num_widen_scalar};
+use crate::num_coerce::{NumWidth, num_saturate, num_widen_scalar};
 use crate::pkginfo::{Effect, EnumArm, EnumVariantKind, FnInfo, FnShape, Param, PkgInfo};
 
 /// A rendered coercion lifting an expression of the raw foreign type into the
@@ -154,6 +154,7 @@ fn line_declares_abort(line: &str) -> bool {
 /// back to `String`; callers that know the raw Rust type prefer it via
 /// [`resolve_rust_type`].
 fn ipe_type_to_rust(st: &str) -> String {
+    let st = unparen(st);
     if let Some(inner) = st.strip_prefix("List ") {
         return format!("Vec<{}>", ipe_type_to_rust(inner));
     }
@@ -206,11 +207,55 @@ fn is_known_ipe(st: &str) -> bool {
         .any(|p| st.starts_with(p))
 }
 
+/// True when `st` is built only from `List`, `Maybe`, grouping parentheses and
+/// Ipê scalars, so [`ipe_type_to_rust`] maps every position to its carrier.
+fn is_carrier_ipe(st: &str) -> bool {
+    let t = unparen(st);
+    if let Some(inner) = t.strip_prefix("List ").or_else(|| t.strip_prefix("Maybe ")) {
+        return is_carrier_ipe(inner);
+    }
+    matches!(
+        t,
+        "String" | "Int" | "Float" | "Bool" | "Char" | "Bytes" | "()"
+    )
+}
+
+/// `st` trimmed, without one pair of grouping parentheses that encloses all
+/// of it (`(List Int)` → `List Int`); a tuple `(A, B)` or `()` is kept.
+fn unparen(st: &str) -> &str {
+    let t = st.trim();
+    let Some(inner) = t.strip_prefix('(').and_then(|r| r.strip_suffix(')')) else {
+        return t;
+    };
+    let mut depth = 0_u32;
+    for c in inner.chars() {
+        match c {
+            '(' => depth = depth.saturating_add(1),
+            // The opening paren closes before the end: `(A) -> (B)`.
+            ')' if depth == 0 => return t,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => return t,
+            _ => {}
+        }
+    }
+    if inner.trim().is_empty() {
+        t
+    } else {
+        inner.trim()
+    }
+}
+
 /// Resolve an Ipê surface type to the Rust type used in a wrapper PARAMETER
 /// (and static-method receiver) position. Known Ipê types use their direct
 /// mapping (owned values — `String`, not `&str`; the call site borrows).
 /// Genuinely-opaque types use the inspector's raw Rust type, absolutized.
 fn resolve_rust_type(krate: &str, st: &str, rt_override: &str) -> String {
+    // A container of carriers (`Maybe (List Int)`) declares the carrier
+    // element, whatever width the raw override spells: the call site narrows
+    // into that width, so the declaration must never take it over.
+    if is_carrier_ipe(st) {
+        return ipe_type_to_rust(st);
+    }
     let owned_inner = |raw: &str| -> String { absolutize_crate(krate, strip_ref(raw)) };
     // `Maybe <opaque>` / `List <opaque>`: the Ipê mapping would collapse the
     // opaque inner to `String` — take the inner from the raw override instead
@@ -239,24 +284,8 @@ fn resolve_rust_type(krate: &str, st: &str, rt_override: &str) -> String {
 /// True when the Rust type is a `Copy` primitive, so a field getter reads it
 /// as `recv.field` (a `.clone()` on a Copy type is a clippy deny).
 fn is_copy_rust(t: &str) -> bool {
-    matches!(
-        t.trim(),
-        "i8" | "i16"
-            | "i32"
-            | "i64"
-            | "i128"
-            | "u8"
-            | "u16"
-            | "u32"
-            | "u64"
-            | "u128"
-            | "isize"
-            | "usize"
-            | "f32"
-            | "f64"
-            | "bool"
-            | "char"
-    )
+    let t = t.trim();
+    NumWidth::parse(t).is_some() || matches!(t, "bool" | "char")
 }
 
 // ── sequence (slice/array/Vec) classification ───────────────────────────────
@@ -270,18 +299,20 @@ enum SeqShape {
     RefArr(usize),
 }
 
-/// Element kind: the byte fast path, or a general coercible element carrying
-/// its (Rust type, Ipê type).
+/// A sequence element: a numeric width the call site must narrow, or any other
+/// coercible element passed as its carrier unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum SeqElem {
-    U8,
-    General { rust: String, ipe: String },
+enum ForeignElem {
+    Num(NumWidth),
+    /// `bool`, `char`, `String`, or a clone-verified opaque name, spelled raw.
+    Other(String),
 }
 
+/// A foreign sequence type, parsed once: its shape and its element.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SeqKind {
+struct ForeignSeq {
     shape: SeqShape,
-    elem: SeqElem,
+    elem: ForeignElem,
 }
 
 /// Sane array-size ceiling: a pathological `[u8; 999999999999]` from
@@ -297,100 +328,35 @@ fn parse_array_len(digits: &str) -> Option<usize> {
     t.parse::<usize>().ok().filter(|&n| n <= MAX_ARRAY_LEN)
 }
 
-/// The `N]`-terminated length of a `[u8; N]` remainder.
-fn digits_before_close(rest: &str) -> Option<usize> {
-    let (digits, tail) = rest.split_once(']')?;
-    if !tail.is_empty() {
+/// A coercible sequence element: a numeric width, `bool`/`char`/`String`, or a
+/// bare opaque name (Clone-ness already verified inspector-side).
+/// `str`/`OsString`/`PathBuf` are denied explicitly.
+fn foreign_elem(e: &str) -> Option<ForeignElem> {
+    let t = e.trim();
+    if let Some(w) = NumWidth::parse(t) {
+        return Some(ForeignElem::Num(w));
+    }
+    if t.is_empty() || t.contains(['&', ' ', '<', '[', ',']) {
         return None;
     }
-    parse_array_len(digits)
-}
-
-/// A coercible List element: the closed numeric set, `bool`/`char`/`String`,
-/// or a bare opaque name (Clone-ness already verified inspector-side).
-/// `str`/`OsString`/`PathBuf` are denied explicitly.
-fn is_coercible_elem(e: &str) -> bool {
-    const ADMIT_PRIM: [&str; 15] = [
-        "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize",
-        "f32", "f64", "bool",
-    ];
-    let t = e.trim();
-    if t.is_empty() || t.contains(['&', ' ', '<', '[', ',']) {
-        return false;
-    }
-    ADMIT_PRIM.contains(&t)
-        || t == "char"
+    let admitted = t == "char"
         || t == "String"
         || (t
             .chars()
             .next()
             .is_some_and(|c| c.is_alphabetic() || c == '_')
-            && !matches!(t, "str" | "OsString" | "PathBuf"))
+            && !matches!(t, "str" | "OsString" | "PathBuf"));
+    admitted.then(|| ForeignElem::Other(t.to_owned()))
 }
 
-fn ipe_of_elem(e: &str) -> String {
-    match e {
-        "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16" | "i32" | "i64" | "i128"
-        | "isize" => "Int".to_owned(),
-        "f32" | "f64" => "Float".to_owned(),
-        "bool" => "Bool".to_owned(),
-        "char" => "Char".to_owned(),
-        _ => e.to_owned(),
-    }
-}
-
-/// Classify a raw Rust type as an Ipê-coercible sequence (mirrors the
+/// Parse a raw Rust type as an Ipê-coercible sequence (mirrors the
 /// inspector's gate). `None` for `&mut [T]` and non-coercible elements.
-fn seq_kind(raw: &str) -> Option<SeqKind> {
+fn foreign_seq(raw: &str) -> Option<ForeignSeq> {
     let s = raw.trim();
     if s.starts_with("&mut ") {
         return None;
     }
-    match s {
-        "&[u8]" => {
-            return Some(SeqKind {
-                shape: SeqShape::Slice,
-                elem: SeqElem::U8,
-            });
-        }
-        "Vec<u8>" => {
-            return Some(SeqKind {
-                shape: SeqShape::Owned,
-                elem: SeqElem::U8,
-            });
-        }
-        _ => {}
-    }
-    if let Some(rest) = s.strip_prefix("&[u8; ")
-        && let Some(n) = digits_before_close(rest)
-    {
-        return Some(SeqKind {
-            shape: SeqShape::RefArr(n),
-            elem: SeqElem::U8,
-        });
-    }
-    if let Some(rest) = s.strip_prefix("[u8; ")
-        && let Some(n) = digits_before_close(rest)
-    {
-        return Some(SeqKind {
-            shape: SeqShape::Arr(n),
-            elem: SeqElem::U8,
-        });
-    }
-    seq_kind_general(s)
-}
-
-fn seq_kind_general(s: &str) -> Option<SeqKind> {
-    let admit = |shape: SeqShape, e: &str| -> Option<SeqKind> {
-        let t = e.trim();
-        is_coercible_elem(t).then(|| SeqKind {
-            shape,
-            elem: SeqElem::General {
-                rust: t.to_owned(),
-                ipe: ipe_of_elem(t),
-            },
-        })
-    };
+    let admit = |shape: SeqShape, e: &str| foreign_elem(e).map(|elem| ForeignSeq { shape, elem });
     if let Some(rest) = s.strip_prefix("Vec<") {
         return rest
             .strip_suffix('>')
@@ -413,6 +379,292 @@ fn seq_kind_general(s: &str) -> Option<SeqKind> {
     None
 }
 
+// ── sequence element coercion (argument direction) ──────────────────────────
+
+/// A foreign parameter shape no wrapper coercion can render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Uncoercible {
+    /// `Option<[T; N]>` / `Option<&[T; N]>`: the length check is fallible
+    /// inside an `Option`.
+    OptionalArray,
+    /// A `Result<T, E>` parameter: Ipê has no `Result` parameter lowering.
+    ResultParam,
+    /// A numeric element of non-carrier width inside a container the
+    /// sequence coercion does not render (`Vec<Vec<i32>>`, `HashMap<K, u32>`).
+    NestedNumeric,
+    /// A slice or array in an owned position (a field value or ctor argument).
+    BorrowedOrArrayOwned,
+}
+
+impl Uncoercible {
+    /// The over-drop reason recorded for the skipped binding.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::OptionalArray => {
+                "optional fixed-size array parameter has no total element coercion"
+            }
+            Self::ResultParam => "Result parameter has no Ipê lowering",
+            Self::NestedNumeric => {
+                "numeric element nested in a container the sequence coercion does not narrow"
+            }
+            Self::BorrowedOrArrayOwned => {
+                "slice or array in an owned position has no total element coercion"
+            }
+        }
+    }
+}
+
+/// A rendered sequence argument: an optional prelude binding plus the call
+/// expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SeqArg {
+    prelude: Option<String>,
+    call: String,
+}
+
+impl SeqArg {
+    fn inline(call: String) -> Self {
+        Self {
+            prelude: None,
+            call,
+        }
+    }
+}
+
+/// An owned `Vec<w>` narrowed element-wise from the carrier sequence `src`,
+/// or `None` when `w` is its carrier and `src` passes unchanged.
+fn narrowed_vec(w: NumWidth, src: &str) -> Option<String> {
+    match w {
+        NumWidth::I64 | NumWidth::F64 => None,
+        // The byte path is `num_saturate(U8)` per element (pinned by
+        // `ffi_byte_narrow_parity`), reached through the runtime helper.
+        NumWidth::U8 => Some(format!("to_u8_vec(&{src})")),
+        NumWidth::I8
+        | NumWidth::I16
+        | NumWidth::I32
+        | NumWidth::I128
+        | NumWidth::Isize
+        | NumWidth::U16
+        | NumWidth::U32
+        | NumWidth::U64
+        | NumWidth::U128
+        | NumWidth::Usize
+        | NumWidth::F32 => Some(format!(
+            "{src}.iter().map(|&x| {}).collect::<Vec<{}>>()",
+            num_saturate(w, "x"),
+            w.rust()
+        )),
+    }
+}
+
+/// The `bJ` prelude converting a carrier sequence into a fixed `[T; N]`; a
+/// length mismatch early-returns `Err` (no panic).
+fn arr_binding(j: usize, base: &str, elem: &ForeignElem, n: usize) -> String {
+    let tail = "{ IpeResult::Ok(a) => a, IpeResult::Err(e) => return IpeResult::Err(e), };";
+    match elem {
+        ForeignElem::Num(NumWidth::U8) => {
+            format!("let b{j}: [u8; {n}] = match to_u8_array::<IpeError, {n}>(&{base}) {tail}")
+        }
+        ForeignElem::Num(w) => {
+            let t = w.rust();
+            let src = narrowed_vec(*w, base).unwrap_or_else(|| base.to_owned());
+            format!("let b{j}: [{t}; {n}] = match to_array::<IpeError, {t}, {n}>(&{src}) {tail}")
+        }
+        ForeignElem::Other(t) => {
+            format!("let b{j}: [{t}; {n}] = match to_array::<IpeError, {t}, {n}>(&{base}) {tail}")
+        }
+    }
+}
+
+/// The owned `Vec<T>` a carrier sequence `src` coerces to, element-wise.
+fn owned_elems(src: &str, elem: &ForeignElem) -> String {
+    match elem {
+        ForeignElem::Num(w) => narrowed_vec(*w, src).unwrap_or_else(|| src.to_owned()),
+        ForeignElem::Other(_) => src.to_owned(),
+    }
+}
+
+/// The owned `Option<Vec<T>>` an Ipê `Maybe (List _)` value `base` coerces to.
+fn optional_owned_elems(base: &str, elem: &ForeignElem) -> String {
+    let opt = format!("ipe_maybe_to_option({base})");
+    match elem {
+        ForeignElem::Num(w) => narrowed_vec(*w, "v")
+            .map_or_else(|| opt.clone(), |elems| format!("{opt}.map(|v| {elems})")),
+        ForeignElem::Other(_) => opt,
+    }
+}
+
+/// The one renderer of every sequence-typed call argument `base` (slot `j`)
+/// into the raw foreign type `raw`.
+///
+/// `Ok(None)` when `raw` is not a sequence-carrying shape (the scalar paths
+/// own it); `Err` for a shape no coercion renders. A `Num(w)` element of a
+/// non-carrier width never reaches the call as the raw carrier: every element
+/// goes through [`narrowed_vec`], i.e. [`num_saturate`]. The interface
+/// admission gate is a dry run of this same function
+/// ([`foreign_param_is_coercible`]), so admission and emission cannot drift.
+fn seq_param_coercion(j: usize, base: &str, raw: &str) -> Result<Option<SeqArg>, Uncoercible> {
+    let raw = raw.trim();
+    if NumWidth::parse(raw).is_some() {
+        return Ok(None);
+    }
+    if let Some(seq) = foreign_seq(raw) {
+        let owned = owned_elems(base, &seq.elem);
+        return Ok(Some(match seq.shape {
+            SeqShape::Owned => SeqArg::inline(owned),
+            SeqShape::Slice if owned == base => SeqArg::inline(format!("{base}.as_slice()")),
+            SeqShape::Slice => SeqArg::inline(format!("&{owned}")),
+            SeqShape::Arr(n) => SeqArg {
+                prelude: Some(arr_binding(j, base, &seq.elem, n)),
+                call: format!("b{j}"),
+            },
+            SeqShape::RefArr(n) => SeqArg {
+                prelude: Some(arr_binding(j, base, &seq.elem, n)),
+                call: format!("&b{j}"),
+            },
+        }));
+    }
+    if let Some(inner) = strip_generic1("Option", raw) {
+        if NumWidth::parse(inner).is_some() {
+            return Ok(None);
+        }
+        if let Some(seq) = foreign_seq(inner) {
+            let mapped = optional_owned_elems(base, &seq.elem);
+            return match seq.shape {
+                SeqShape::Owned => Ok(Some(SeqArg::inline(mapped))),
+                SeqShape::Slice => Ok(Some(SeqArg::inline(format!("{mapped}.as_deref()")))),
+                SeqShape::Arr(_) | SeqShape::RefArr(_) => Err(Uncoercible::OptionalArray),
+            };
+        }
+    }
+    if strip_generic1("Result", raw).is_some() {
+        return Err(Uncoercible::ResultParam);
+    }
+    if names_unnarrowed_numeric(raw) {
+        return Err(Uncoercible::NestedNumeric);
+    }
+    Ok(None)
+}
+
+/// True when a non-carrier numeric width sits as an element of a std
+/// container (`Vec`, `Option`, `Box`, `Result`, a map, a slice, an array, a
+/// tuple, or behind a borrow) that no coercion renders.
+///
+/// An opaque generic (`Matrix<f32>`) is the crate's own type, declared raw on
+/// both sides, so its arguments are not elements.
+fn names_unnarrowed_numeric(raw: &str) -> bool {
+    let t = strip_ref(raw);
+    if let Some(w) = NumWidth::parse(t) {
+        return !w.is_carrier();
+    }
+    for ctor in [
+        "Vec", "Option", "Box", "Result", "HashMap", "BTreeMap", "HashSet", "BTreeSet", "VecDeque",
+    ] {
+        if let Some(args) = strip_generic1(ctor, t) {
+            return split_top_level(args)
+                .iter()
+                .any(|a| names_unnarrowed_numeric(a));
+        }
+    }
+    if let Some(inner) = t.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+        let elem = inner.split_once(';').map_or(inner, |(e, _)| e);
+        return names_unnarrowed_numeric(elem);
+    }
+    if let Some(inner) = t.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+        return split_top_level(inner)
+            .iter()
+            .any(|a| names_unnarrowed_numeric(a));
+    }
+    false
+}
+
+/// Split a type-argument list at its top-level commas.
+fn split_top_level(inner: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0_u32;
+    let mut start = 0_usize;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth = depth.saturating_add(1),
+            '>' | ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(inner.get(start..i).unwrap_or("").trim());
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let tail = inner.get(start..).unwrap_or("").trim();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
+}
+
+/// Whether the wrapper can coerce an Ipê value into the raw foreign parameter
+/// type — the interface admission predicate.
+///
+/// A dry run of the emitter's own [`seq_param_coercion`]: admitted exactly
+/// when that renderer succeeds.
+///
+/// # Errors
+///
+/// The [`Uncoercible`] shape the renderer refuses.
+pub fn foreign_param_coercion(raw: &str) -> Result<(), Uncoercible> {
+    seq_param_coercion(0, "arg0", raw).map(|_| ())
+}
+
+/// The text [`seq_param_coercion`] renders for parameter `arg0` of raw type
+/// `raw`: the prelude (if any) and the call argument, space-separated.
+///
+/// `Ok(None)` when `raw` is not a sequence-carrying shape.
+///
+/// # Errors
+///
+/// The [`Uncoercible`] shape the renderer refuses.
+pub fn foreign_seq_arg(raw: &str) -> Result<Option<String>, Uncoercible> {
+    Ok(
+        seq_param_coercion(0, "arg0", raw)?.map(|a| match a.prelude {
+            Some(p) => format!("{p} {}", a.call),
+            None => a.call,
+        }),
+    )
+}
+
+/// Boolean form of [`foreign_param_coercion`].
+#[must_use]
+pub fn foreign_param_is_coercible(raw: &str) -> bool {
+    foreign_param_coercion(raw).is_ok()
+}
+
+/// Owned inbound coercion of a sequence `base` into the raw foreign type,
+/// for a field value or ctor argument (owned, never borrowed).
+///
+/// `Ok(None)` when `raw` is not a sequence-carrying shape.
+fn owned_seq_coercion(base: &str, raw: &str) -> Result<Option<String>, Uncoercible> {
+    let raw = raw.trim();
+    if let Some(seq) = foreign_seq(raw) {
+        return match seq.shape {
+            SeqShape::Owned => Ok(Some(owned_elems(base, &seq.elem))),
+            SeqShape::Slice | SeqShape::Arr(_) | SeqShape::RefArr(_) => {
+                Err(Uncoercible::BorrowedOrArrayOwned)
+            }
+        };
+    }
+    if let Some(inner) = strip_generic1("Option", raw)
+        && let Some(seq) = foreign_seq(inner)
+    {
+        return match seq.shape {
+            SeqShape::Owned => Ok(Some(optional_owned_elems(base, &seq.elem))),
+            SeqShape::Slice | SeqShape::Arr(_) | SeqShape::RefArr(_) => {
+                Err(Uncoercible::BorrowedOrArrayOwned)
+            }
+        };
+    }
+    Ok(None)
+}
+
 // ── return-type translation ─────────────────────────────────────────────────
 
 /// Translate a raw Rust (Ok-)type into the wrapper's declared inner return
@@ -429,8 +681,8 @@ pub fn translate_rust_ret(raw0: &str) -> (String, RetCoercion) {
     if let Some(comps) = tuple_components(&raw) {
         return translate_tuple_ret(&comps);
     }
-    if let Some(sk) = seq_kind(&raw) {
-        return translate_seq_ret(&sk);
+    if let Some(seq) = foreign_seq(&raw) {
+        return translate_seq_ret(&seq);
     }
     if let Some(inner) = strip_generic1("Option", &raw) {
         let (dt, co) = translate_rust_ret(inner);
@@ -458,11 +710,10 @@ pub fn translate_rust_ret(raw0: &str) -> (String, RetCoercion) {
             }),
         );
     }
-    if let Some(probe) = num_widen_scalar(&raw, "x") {
-        let carrier = probe.carrier.to_owned();
+    if let Some(w) = NumWidth::parse(&raw) {
         return (
-            carrier,
-            Box::new(move |e| num_widen_scalar(&raw, e).map_or_else(|| e.to_owned(), |w| w.expr)),
+            w.carrier().rust().to_owned(),
+            Box::new(move |e| num_widen_scalar(w, e).expr),
         );
     }
     if raw == "bool" || raw == "String" {
@@ -491,55 +742,66 @@ pub fn translate_rust_ret(raw0: &str) -> (String, RetCoercion) {
     (raw, identity_coercion())
 }
 
-fn translate_seq_ret(sk: &SeqKind) -> (String, RetCoercion) {
-    match &sk.elem {
-        SeqElem::U8 => {
-            // Owned/plain-array values are borrowed into the helper;
-            // slice/ref-array values already are references.
-            let borrow = matches!(sk.shape, SeqShape::Owned | SeqShape::Arr(_));
-            (
+fn translate_seq_ret(seq: &ForeignSeq) -> (String, RetCoercion) {
+    // Owned/plain-array values are moved (or borrowed into the byte helper);
+    // slice/ref-array values already are references.
+    let by_value = matches!(seq.shape, SeqShape::Owned | SeqShape::Arr(_));
+    let (elem_decl, mapped) = match &seq.elem {
+        ForeignElem::Num(NumWidth::U8) => {
+            return (
                 "Vec<i64>".to_owned(),
                 Box::new(move |e| {
-                    if borrow {
+                    if by_value {
                         format!("from_u8_slice(&{e})")
                     } else {
                         format!("from_u8_slice({e})")
                     }
                 }),
-            )
+            );
         }
-        SeqElem::General { rust, .. } => {
-            let (elem_decl, elem_co) = translate_rust_ret(rust);
-            let decl = format!("Vec<{elem_decl}>");
-            if elem_decl == *rust {
-                // Element maps to itself: owned is identity, borrowed clones.
-                let owned = matches!(sk.shape, SeqShape::Owned);
-                return (
-                    decl,
-                    Box::new(move |e| {
-                        if owned {
-                            e.to_owned()
-                        } else {
-                            format!("{e}.to_vec()")
-                        }
-                    }),
-                );
+        ForeignElem::Num(w) if w.is_carrier() => (w.rust().to_owned(), None),
+        ForeignElem::Num(w) => (
+            w.carrier().rust().to_owned(),
+            Some(num_widen_scalar(*w, "x").expr),
+        ),
+        ForeignElem::Other(t) => {
+            let (decl, co) = translate_rust_ret(t);
+            let mapped = co("x");
+            if decl == *t {
+                (decl, None)
+            } else {
+                (decl, Some(mapped))
             }
-            // Per-element scalar coercion; slice/ref-array elements arrive as
-            // `&T` — `|&x|` copies them out (all such elements are Copy).
-            let by_value = matches!(sk.shape, SeqShape::Owned | SeqShape::Arr(_));
-            let mapped = elem_co("x");
+        }
+    };
+    let decl = format!("Vec<{elem_decl}>");
+    match mapped {
+        // Element maps to itself: owned is identity, borrowed clones.
+        None => {
+            let owned = matches!(seq.shape, SeqShape::Owned);
             (
                 decl,
                 Box::new(move |e| {
-                    if by_value {
-                        format!("{e}.into_iter().map(|x| {mapped}).collect::<Vec<_>>()")
+                    if owned {
+                        e.to_owned()
                     } else {
-                        format!("{e}.iter().map(|&x| {mapped}).collect::<Vec<_>>()")
+                        format!("{e}.to_vec()")
                     }
                 }),
             )
         }
+        // Per-element scalar coercion; slice/ref-array elements arrive as
+        // `&T` — `|&x|` copies them out (all such elements are Copy).
+        Some(mapped) => (
+            decl,
+            Box::new(move |e| {
+                if by_value {
+                    format!("{e}.into_iter().map(|x| {mapped}).collect::<Vec<_>>()")
+                } else {
+                    format!("{e}.iter().map(|&x| {mapped}).collect::<Vec<_>>()")
+                }
+            }),
+        ),
     }
 }
 
@@ -653,9 +915,7 @@ fn tuple_component_carrier(c: &str) -> Option<&'static str> {
     match t {
         "String" => Some("String"),
         "bool" => Some("Bool"),
-        "f32" | "f64" => Some("Float"),
-        _ if is_numeric_rust(t) => Some("Int"),
-        _ => None,
+        _ => NumWidth::parse(t).map(|w| w.carrier().ipe()),
     }
 }
 
@@ -867,26 +1127,23 @@ impl<'a> WrapperCx<'a> {
         }
         let raw_ty = self.raw_param(j);
         let decl_ty = self.decl_param(j);
-        if let Some(sk) = seq_kind(raw_ty) {
-            return match (sk.shape, &sk.elem) {
-                (SeqShape::Slice, SeqElem::U8) => format!("&to_u8_vec(&{base})"),
-                (SeqShape::Owned, SeqElem::U8) => format!("to_u8_vec(&{base})"),
-                (SeqShape::Arr(_), _) => format!("b{j}"),
-                (SeqShape::RefArr(_), _) => format!("&b{j}"),
-                (SeqShape::Slice, SeqElem::General { .. }) => format!("{base}.as_slice()"),
-                (SeqShape::Owned, SeqElem::General { .. }) => base,
-            };
+        match seq_param_coercion(j, &base, raw_ty) {
+            Ok(Some(arg)) => return arg.call,
+            Ok(None) => {}
+            // Unreachable: `emit_fn_wrapper` over-drops a wrapper with any
+            // uncoercible param before rendering a call.
+            Err(_) => return base,
         }
         if let Some(inner) = strip_generic1("Option", raw_ty) {
             // The wrapper takes IpeMaybe<declInner>; adapt the inner value to
             // the foreign Option<rawInner>.
             let opt = format!("ipe_maybe_to_option({base})");
+            if let Some(w) = NumWidth::parse(inner) {
+                return format!("{opt}.map(|x| {})", num_saturate(w, "x"));
+            }
             return match inner {
                 "&str" => format!("{opt}.as_deref()"),
                 "&String" => format!("{opt}.as_ref()"),
-                _ if is_numeric_rust(inner) => {
-                    format!("{opt}.map(|x| {})", num_saturate(inner, "x"))
-                }
                 _ if inner.starts_with('&') => format!("{opt}.as_ref()"),
                 _ => opt,
             };
@@ -914,8 +1171,10 @@ impl<'a> WrapperCx<'a> {
         if raw_ty.is_empty() || raw_ty == decl_ty {
             return base;
         }
-        if is_numeric_rust(raw_ty) && (decl_ty == "i64" || decl_ty == "f64") {
-            return num_saturate(raw_ty, &base);
+        if let Some(w) = NumWidth::parse(raw_ty)
+            && (decl_ty == "i64" || decl_ty == "f64")
+        {
+            return num_saturate(w, &base);
         }
         base
     }
@@ -1019,23 +1278,23 @@ impl<'a> WrapperCx<'a> {
     fn arr_prelude(&self) -> Vec<String> {
         (0..self.n_params())
             .filter_map(|j| {
-                let sk = seq_kind(self.raw_param(j))?;
-                let n = match sk.shape {
-                    SeqShape::Arr(n) | SeqShape::RefArr(n) => n,
-                    SeqShape::Slice | SeqShape::Owned => return None,
-                };
-                Some(match sk.elem {
-                    SeqElem::U8 => format!(
-                        "let b{j}: [u8; {n}] = match to_u8_array::<IpeError, {n}>(&arg{j}) \
-                         {{ IpeResult::Ok(a) => a, IpeResult::Err(e) => return IpeResult::Err(e), }};"
-                    ),
-                    SeqElem::General { rust, .. } => format!(
-                        "let b{j}: [{rust}; {n}] = match to_array::<IpeError, {rust}, {n}>(&arg{j}) \
-                         {{ IpeResult::Ok(a) => a, IpeResult::Err(e) => return IpeResult::Err(e), }};"
-                    ),
-                })
+                seq_param_coercion(j, &arg_name(j), self.raw_param(j))
+                    .ok()
+                    .flatten()
+                    .and_then(|a| a.prelude)
             })
             .collect()
+    }
+
+    /// The first parameter no coercion renders, if any — the wrapper is then
+    /// over-dropped rather than emitted with a raw carrier argument.
+    fn uncoercible_param(&self) -> Option<Uncoercible> {
+        (0..self.n_params()).find_map(|j| {
+            if self.own_ref_idx.contains(&j) {
+                return None;
+            }
+            seq_param_coercion(j, &arg_name(j), self.raw_param(j)).err()
+        })
     }
 
     /// Serde-bound params (`serde_json::Value` foreign type behind a `String`
@@ -1834,6 +2093,11 @@ fn plain_lines(cx: &WrapperCx<'_>) -> Vec<String> {
     if is_degenerate_method || unresolved_generic_recv || is_trait_fn {
         return Vec::new();
     }
+    // Defense in depth behind the interface admission gate: a param the
+    // renderer refuses never reaches a call as its raw carrier.
+    if cx.uncoercible_param().is_some() {
+        return Vec::new();
+    }
     let (ret_inner, ret_coerce) = cx.ret_inner_and_coerce();
     // A by-borrow reader threads its receiver (`arg0`) back beside the result:
     // the inner return type gains a trailing receiver component and the body
@@ -2044,7 +2308,9 @@ fn field_set_lines(cx: &WrapperCx<'_>) -> Vec<String> {
     if f.effect() == Effect::Fallible {
         return checked_field_set_lines(cx, &recv_rust, field, &set_val_rust);
     }
-    let expr = owned_value_coercion(cx.raw_param(0), &set_val_rust, "arg0");
+    let Ok(expr) = owned_value_coercion(cx.raw_param(0), &set_val_rust, "arg0") else {
+        return Vec::new();
+    };
     vec![
         format!("// [field-set] {}", cx.label),
         format!(
@@ -2125,43 +2391,35 @@ fn checked_field_set_lines(
 
 /// Owned inbound coercion: lift an Ipê-resolved wrapper value into the exact
 /// raw foreign type, OWNED (never borrows — field assignments and enum ctors
-/// move owned values in). Int narrowing saturates; a Float-source list keeps
-/// the already-saturating bare `as`.
-fn owned_value_coercion(raw_ty: &str, decl_ty: &str, base: &str) -> String {
-    if let Some(sk) = seq_kind(raw_ty) {
-        return match (sk.shape, &sk.elem) {
-            (SeqShape::Owned, SeqElem::U8) => format!("to_u8_vec(&{base})"),
-            (SeqShape::Owned, SeqElem::General { rust, ipe }) => {
-                if rust == "i64" || rust == "f64" || !is_numeric_rust(rust) {
-                    base.to_owned()
-                } else if ipe == "Float" {
-                    format!("{base}.into_iter().map(|x| x as {rust}).collect()")
-                } else {
-                    format!(
-                        "{base}.into_iter().map(|x| {}).collect()",
-                        num_saturate(rust, "x")
-                    )
-                }
-            }
-            // Slice/array field shapes are outside the closed eligible set.
-            _ => base.to_owned(),
-        };
+/// move owned values in).
+///
+/// Every numeric narrowing saturates through [`num_saturate`], element-wise
+/// for a sequence.
+///
+/// # Errors
+///
+/// The [`Uncoercible`] shape no owned coercion renders; the caller drops the
+/// binding.
+fn owned_value_coercion(raw_ty: &str, decl_ty: &str, base: &str) -> Result<String, Uncoercible> {
+    if let Some(expr) = owned_seq_coercion(base, raw_ty)? {
+        return Ok(expr);
     }
     if let Some(inner) = strip_generic1("Option", raw_ty) {
         let opt = format!("ipe_maybe_to_option({base})");
-        return if is_numeric_rust(inner) {
-            format!("{opt}.map(|x| {})", num_saturate(inner, "x"))
-        } else {
-            opt
-        };
+        return Ok(NumWidth::parse(inner).map_or_else(
+            || opt.clone(),
+            |w| format!("{opt}.map(|x| {})", num_saturate(w, "x")),
+        ));
     }
     if raw_ty.is_empty() || raw_ty == decl_ty {
-        return base.to_owned();
+        return Ok(base.to_owned());
     }
-    if is_numeric_rust(raw_ty) && (decl_ty == "i64" || decl_ty == "f64") {
-        return num_saturate(raw_ty, base);
+    if let Some(w) = NumWidth::parse(raw_ty)
+        && (decl_ty == "i64" || decl_ty == "f64")
+    {
+        return Ok(num_saturate(w, base));
     }
-    base.to_owned()
+    Ok(base.to_owned())
 }
 
 /// Enum-variant constructor: `E::Variant(args)` — infallible (the inspector
@@ -2177,9 +2435,12 @@ fn enum_ctor_lines(
         return Vec::new();
     }
     let path = format!("{recv_rust}::{}", rust_safe_ident(variant));
-    let ctor_args: Vec<String> = (0..cx.n_params())
+    let Ok(ctor_args) = (0..cx.n_params())
         .map(|j| owned_value_coercion(cx.raw_param(j), cx.decl_param(j), &arg_name(j)))
-        .collect();
+        .collect::<Result<Vec<String>, Uncoercible>>()
+    else {
+        return Vec::new();
+    };
     let expr = match kind {
         EnumVariantKind::Unit => path,
         EnumVariantKind::Struct => {
@@ -2361,27 +2622,156 @@ mod tests {
     }
 
     #[test]
-    fn seq_kind_classifies_shapes_and_rejects_mut_and_huge_arrays() {
-        let u8_slice = seq_kind("&[u8]").expect("slice");
+    fn foreign_seq_classifies_shapes_and_rejects_mut_and_huge_arrays() {
+        let u8_slice = foreign_seq("&[u8]").expect("slice");
         assert_eq!(u8_slice.shape, SeqShape::Slice);
-        assert_eq!(u8_slice.elem, SeqElem::U8);
-        assert_eq!(seq_kind("[u8; 16]").expect("arr").shape, SeqShape::Arr(16));
+        assert_eq!(u8_slice.elem, ForeignElem::Num(NumWidth::U8));
         assert_eq!(
-            seq_kind("&[u8; 4]").expect("ref arr").shape,
+            foreign_seq("[u8; 16]").expect("arr").shape,
+            SeqShape::Arr(16)
+        );
+        assert_eq!(
+            foreign_seq("&[u8; 4]").expect("ref arr").shape,
             SeqShape::RefArr(4)
         );
-        let general_vec = seq_kind("Vec<f32>").expect("general vec");
+        let f32_vec = foreign_seq("Vec<f32>").expect("f32 vec");
+        assert_eq!(f32_vec.elem, ForeignElem::Num(NumWidth::F32));
         assert_eq!(
-            general_vec.elem,
-            SeqElem::General {
-                rust: "f32".into(),
-                ipe: "Float".into()
-            }
+            foreign_seq("Vec<String>").expect("string vec").elem,
+            ForeignElem::Other("String".to_owned())
         );
-        assert_eq!(seq_kind("&mut [u8]"), None);
-        assert_eq!(seq_kind("[u8; 999999999999]"), None);
-        assert_eq!(seq_kind("Vec<str>"), None);
-        assert_eq!(seq_kind("Vec<PathBuf>"), None);
+        assert_eq!(foreign_seq("&mut [u8]"), None);
+        assert_eq!(foreign_seq("[u8; 999999999999]"), None);
+        assert_eq!(foreign_seq("Vec<str>"), None);
+        assert_eq!(foreign_seq("Vec<PathBuf>"), None);
+    }
+
+    /// Every sequence shape that can carry a numeric element, as a raw type
+    /// over element `t`.
+    fn seq_shapes(t: &str) -> [String; 6] {
+        [
+            format!("Vec<{t}>"),
+            format!("&[{t}]"),
+            format!("[{t}; 3]"),
+            format!("&[{t}; 3]"),
+            format!("Option<Vec<{t}>>"),
+            format!("Option<&[{t}]>"),
+        ]
+    }
+
+    /// The rendered call plus prelude for `arg0` of raw type `raw`.
+    fn rendered(raw: &str) -> String {
+        let arg = seq_param_coercion(0, "arg0", raw)
+            .expect("renders")
+            .expect("is a sequence");
+        format!("{} | {}", arg.prelude.unwrap_or_default(), arg.call)
+    }
+
+    #[test]
+    fn every_numeric_width_in_every_seq_shape_routes_each_element_through_num_saturate() {
+        for w in NumWidth::ALL {
+            for raw in seq_shapes(w.rust()) {
+                let r = rendered(&raw);
+                match w {
+                    NumWidth::I64 | NumWidth::F64 => {
+                        assert!(!r.contains(".map(|&x|"), "{raw}: carrier mapped: {r}");
+                    }
+                    NumWidth::U8 => {
+                        assert!(
+                            r.contains("to_u8_vec(") || r.contains("to_u8_array::<"),
+                            "{raw}: byte path missing: {r}"
+                        );
+                    }
+                    NumWidth::I8
+                    | NumWidth::I16
+                    | NumWidth::I32
+                    | NumWidth::I128
+                    | NumWidth::Isize
+                    | NumWidth::U16
+                    | NumWidth::U32
+                    | NumWidth::U64
+                    | NumWidth::U128
+                    | NumWidth::Usize
+                    | NumWidth::F32 => {
+                        let elem = format!(".map(|&x| {})", num_saturate(w, "x"));
+                        assert!(r.contains(&elem), "{raw}: element not narrowed: {r}");
+                        assert!(!r.ends_with("| arg0"), "{raw}: raw carrier passed: {r}");
+                        assert!(!r.contains("arg0.as_slice()"), "{raw}: raw slice: {r}");
+                        assert!(
+                            !r.contains(&format!("to_array::<IpeError, {}, 3>(&arg0)", w.rust())),
+                            "{raw}: raw carrier into array: {r}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shapes_the_renderer_cannot_coerce_are_refused_and_admission_agrees() {
+        for (raw, why) in [
+            ("Result<Vec<i32>, E>", Uncoercible::ResultParam),
+            ("Vec<Vec<i32>>", Uncoercible::NestedNumeric),
+            ("HashMap<String, u32>", Uncoercible::NestedNumeric),
+            ("Option<&[i32; 3]>", Uncoercible::OptionalArray),
+            ("Option<[u8; 4]>", Uncoercible::OptionalArray),
+        ] {
+            assert_eq!(seq_param_coercion(0, "arg0", raw), Err(why), "{raw}");
+            assert_eq!(foreign_param_coercion(raw), Err(why), "{raw}");
+            assert!(!foreign_param_is_coercible(raw), "{raw}");
+        }
+        for raw in [
+            "i32",
+            "Option<u16>",
+            "String",
+            "Vec<String>",
+            "Vec<i64>",
+            "Matrix<f32>",
+            "&str",
+        ] {
+            assert!(seq_param_coercion(0, "arg0", raw).is_ok(), "{raw}");
+            assert!(foreign_param_is_coercible(raw), "{raw}");
+        }
+    }
+
+    #[test]
+    fn owned_value_coercion_narrows_each_element_as_the_call_path_does() {
+        for w in [NumWidth::U32, NumWidth::F32, NumWidth::I16] {
+            let raw = format!("Vec<{}>", w.rust());
+            let decl = format!("Vec<{}>", w.carrier().rust());
+            let owned = owned_value_coercion(&raw, &decl, "arg0").expect("owned seq");
+            let call = seq_param_coercion(0, "arg0", &raw)
+                .expect("renders")
+                .expect("is a sequence")
+                .call;
+            assert_eq!(owned, call, "{raw}");
+            assert!(owned.contains(&num_saturate(w, "x")), "{raw}: {owned}");
+        }
+        assert_eq!(
+            owned_value_coercion("&[u32]", "Vec<i64>", "arg0"),
+            Err(Uncoercible::BorrowedOrArrayOwned)
+        );
+    }
+
+    #[test]
+    fn a_grouped_carrier_container_declares_its_carrier_not_the_raw_width() {
+        assert_eq!(
+            resolve_rust_type("geom", "Maybe (List Int)", "Option<Vec<u32>>"),
+            "IpeMaybe<Vec<i64>>"
+        );
+        assert_eq!(
+            resolve_rust_type("geom", "List (Maybe Float)", "Vec<Option<f32>>"),
+            "Vec<IpeMaybe<f64>>"
+        );
+        // An opaque element still takes the raw override.
+        assert_eq!(
+            resolve_rust_type("geom", "Maybe (List Shape)", "Option<Vec<geom::Shape>>"),
+            "IpeMaybe<Vec<::geom::Shape>>"
+        );
+        assert_eq!(unparen("(Int, Int)"), "(Int, Int)");
+        assert_eq!(unparen("()"), "()");
+        assert_eq!(unparen(" (List Int) "), "List Int");
+        assert_eq!(unparen("(A) -> (B)"), "(A) -> (B)");
     }
 
     #[test]

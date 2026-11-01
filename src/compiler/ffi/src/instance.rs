@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 use crate::call::{ByKind, Call};
 use crate::diag::{ClosedSetViolation, Diagnostic, GenericBindDefect};
 use crate::naming::{RustTypeExpr, mangle_tvar, wrapper_fn_ident};
-use crate::num_coerce::num_widen_scalar;
+use crate::num_coerce::{NumWidth, num_widen_scalar};
 use crate::pkginfo::{FnInfo, GenericFn};
 use crate::typeref::{ArgTypeRef, ClosureKind, InnerTypeRef};
 
@@ -557,10 +557,9 @@ fn ok_ref_lift(ok: &InnerTypeRef, params: &[String], val: &str) -> (String, Stri
         );
     }
     if let InnerTypeRef::Prim(w) = ok
-        && w.as_str() != "i64"
-        && w.as_str() != "f64"
-        && let Some(widen) = num_widen_scalar(w.as_str(), val)
+        && let Some(nw) = NumWidth::parse(w.as_str()).filter(|n| !n.is_carrier())
     {
+        let widen = num_widen_scalar(nw, val);
         return (widen.carrier.to_owned(), widen.expr);
     }
     if let Some(inner) = option_inner(ok) {
