@@ -9,8 +9,10 @@ pub mod diff; // accessed qualified (tui::diff::diff) — `diff` collides with l
 pub mod focus; // input registry + focusable model + key editing
 pub mod key;
 pub mod layout; // structured Element → ANSI cells
+pub mod line_surface; // `Lines` view → the one Cli frame serializer
 pub use app::{tui_app, tui_app_ui};
 pub use cell::*;
+pub use line_surface::{FrameEnd, InputEnd, LineState, LineStyle, LineSurface, write_frame};
 
 use crate::color::{AnsiColor, Color};
 use crate::ui::element::{Attribute, Element, HAlign};
@@ -398,79 +400,140 @@ pub enum CliAttr<M> {
 
 crate::stringify::show_row!("CliAttribute", Internals, [M] CliAttr<M>, |_| "<Ipe.Ui.Cli.Attribute>".to_owned());
 
-impl<M> CliAttr<M> {
-    /// Lower a line-native attribute to the honorable `ui::Attribute` the cell
-    /// layout engine reads. A `Lines` view is rendered by the same styled-run
-    /// engine as `Screen`, restricted to one column of lines.
-    fn translate(self) -> Option<Attribute<M>> {
-        match self {
-            CliAttr::Bold => Some(Attribute::AttrFontWeight(700)),
-            CliAttr::Underline => Some(Attribute::AttrFontUnderline),
-            CliAttr::Dim => Some(Attribute::AttrFontDecoration("dim".to_owned())),
-            CliAttr::Reverse => Some(Attribute::AttrFontDecoration("reverse".to_owned())),
-            CliAttr::FgColor(c) => Some(term_fg_attr(c)),
-            CliAttr::BgColor(c) => Some(term_bg_attr(c)),
-            CliAttr::_Msg(_) => None,
+/// One colour channel of a line's style, in the two shapes the SGR builder
+/// writes: a portable palette code, or a truecolour degraded to the profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineColor {
+    /// A palette SGR code (`30..=37`, `90..=97`, `39` foreground; the `4x`,
+    /// `10x`, `49` background family).
+    Palette(u8),
+    /// A 24-bit colour, down-sampled to the terminal profile when written.
+    Rgb(u8, u8, u8),
+}
+
+impl LineColor {
+    /// The channel a terminal colour selects; `fg` picks the code family.
+    ///
+    /// A palette entry with no named code (`default`, or an `Indexed` entry the
+    /// `Ipe.Color.Ansi` surface cannot build) is the terminal default (`39` /
+    /// `49`).
+    fn of_ansi(c: AnsiColor, fg: bool) -> Self {
+        match c {
+            AnsiColor::Rgb(r, g, b) => Self::Rgb(byte_channel(r), byte_channel(g), byte_channel(b)),
+            palette => {
+                let default = if fg { 39 } else { 49 };
+                Self::Palette(
+                    palette
+                        .named_sgr_code(fg)
+                        .and_then(|code| u8::try_from(code).ok())
+                        .unwrap_or(default),
+                )
+            }
         }
     }
 }
 
-fn translate_cli_attrs<M>(attrs: Vec<CliAttr<M>>) -> Vec<Attribute<M>> {
-    attrs.into_iter().filter_map(CliAttr::translate).collect()
+/// An `Int` colour channel as a byte, clamped into `0..=255`.
+fn byte_channel(v: i64) -> u8 {
+    u8::try_from(v.clamp(0, 255)).unwrap_or(u8::MAX)
 }
 
-/// Newtype wrapper: the Cli-only line-oriented view type `Lines msg`.
+/// The style of one `Lines` line; the last attribute of a kind wins.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LineAttrs {
+    bold: bool,
+    underline: bool,
+    dim: bool,
+    reverse: bool,
+    fg: Option<LineColor>,
+    bg: Option<LineColor>,
+}
+
+impl LineAttrs {
+    /// Fold a line's attribute list into its style.
+    fn of_cli<M>(attrs: Vec<CliAttr<M>>) -> Self {
+        attrs.into_iter().fold(Self::default(), |mut style, attr| {
+            match attr {
+                CliAttr::Bold => style.bold = true,
+                CliAttr::Underline => style.underline = true,
+                CliAttr::Dim => style.dim = true,
+                CliAttr::Reverse => style.reverse = true,
+                CliAttr::FgColor(c) => style.fg = Some(LineColor::of_ansi(c, true)),
+                CliAttr::BgColor(c) => style.bg = Some(LineColor::of_ansi(c, false)),
+                CliAttr::_Msg(_) => {}
+            }
+            style
+        })
+    }
+}
+
+/// One line of a `Lines` view: its style and its display-sanitised text.
 ///
-/// A `Lines` view is a vertical stack of styled lines. It reuses the cell
-/// layout engine (as a single column) so styling renders identically to a
-/// `Screen`, but its builder surface admits only line-scoped attributes.
+/// The text is sanitised once, at construction, through [`sanitize_rune`], so
+/// a line holding a control character (ESC, CR, LF, …) has no representation
+/// and the serializer writes the stored text with no second check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Line {
+    attrs: LineAttrs,
+    text: String,
+}
+
+impl Line {
+    /// A line whose text is `raw` with every control character made a space.
+    fn new(attrs: LineAttrs, raw: &str) -> Self {
+        Self {
+            attrs,
+            text: raw.chars().map(sanitize_rune).collect(),
+        }
+    }
+}
+
+/// The Cli-only line-oriented view type `Lines msg`: a flat list of lines.
+///
+/// Each line is written exactly as the program spelled it (after display
+/// sanitisation): no layout, no padding to the widest line, no clipping to a
+/// terminal width. `Ui.Cli.line` takes a `String`, so styles never nest and
+/// the flat form loses nothing.
 #[derive(Clone, Debug, PartialEq)]
-pub struct LinesView<M>(pub Element<M>);
+pub struct LinesView<M>(Vec<Line>, core::marker::PhantomData<M>);
 
 crate::stringify::show_row!("CliLines", Internals, [M] LinesView<M>, |_| "<Ipe.Ui.Cli.Lines>".to_owned());
 
 impl<M> LinesView<M> {
-    /// Wrap an existing `Element` as a `Lines` view.
-    pub fn new(inner: Element<M>) -> Self {
-        Self(inner)
+    /// A view of exactly these lines, in order.
+    const fn of_lines(lines: Vec<Line>) -> Self {
+        Self(lines, core::marker::PhantomData)
     }
 
-    /// Consume the wrapper and return the inner `Element`.
-    pub fn into_element(self) -> Element<M> {
-        self.0
+    /// The view's lines, in order.
+    #[must_use]
+    pub fn lines(&self) -> &[Line] {
+        &self.0
     }
 }
 
 /// `Ipe.Ui.Cli.none : Lines msg`
 #[must_use]
-pub fn cli_none_<M>() -> LinesView<M> {
-    LinesView::new(Element::Empty)
+pub const fn cli_none_<M>() -> LinesView<M> {
+    LinesView::of_lines(Vec::new())
 }
 
 /// `Ipe.Ui.Cli.text : String -> Lines msg` — one unstyled line.
 #[must_use]
 pub fn cli_text_<M>(s: String) -> LinesView<M> {
-    LinesView::new(Element::Text(s))
+    LinesView::of_lines(vec![Line::new(LineAttrs::default(), &s)])
 }
 
 /// `Ipe.Ui.Cli.line : List (Attribute msg) -> String -> Lines msg`
 #[must_use]
 pub fn cli_line_<M: Clone>(attrs: Vec<CliAttr<M>>, s: String) -> LinesView<M> {
-    use crate::ui::element::Description;
-    LinesView::new(Element::Node(
-        Description::NoDescription,
-        translate_cli_attrs(attrs),
-        vec![Element::Text(s)],
-    ))
+    LinesView::of_lines(vec![Line::new(LineAttrs::of_cli(attrs), &s)])
 }
 
 /// `Ipe.Ui.Cli.lines : List (Lines msg) -> Lines msg` — stack vertically.
 #[must_use]
 pub fn cli_lines_<M: Clone>(children: Vec<LinesView<M>>) -> LinesView<M> {
-    use crate::ui::element::Description;
-    let attrs = vec![Attribute::AttrStyle("__col".to_owned(), "true".to_owned())];
-    let elems: Vec<Element<M>> = children.into_iter().map(LinesView::into_element).collect();
-    LinesView::new(Element::Node(Description::NoDescription, attrs, elems))
+    LinesView::of_lines(children.into_iter().flat_map(|child| child.0).collect())
 }
 
 /// `Ipe.Ui.Cli.bold : Attribute msg`
@@ -504,30 +567,19 @@ pub fn cli_bg_<M>(c: AnsiColor) -> CliAttr<M> {
     CliAttr::BgColor(c)
 }
 
-/// The layout width of a plain frame.
+/// Whether this process's stdout is a terminal.
 ///
-/// Fixed, so piped output never depends on whether a controlling terminal
-/// exists or how wide it is; a plain line is never clipped to it.
-const PLAIN_LAYOUT_COLS: usize = 80;
-
-/// How a line-oriented `Cli.tea` program writes its frames to stdout.
-///
-/// Chosen once per run by [`LineOutput::of_stdout`]; every frame and the closing
-/// bytes go through the one value, so a run never mixes terminal and plain
-/// output.
+/// Read once per run by [`LineSurface::from_stdout_only`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LineOutput {
-    /// Stdout is a terminal: styled frames (SGR, `\r\n` between lines) sized to
-    /// the window, written back to back with no forced newline, so a view ending
-    /// in a prompt keeps the cursor on the prompt line; one newline at exit.
+    /// Stdout is a terminal.
     Terminal,
-    /// Stdout is a pipe or a file: plain lines (no escape sequence, `\n`, no
-    /// trailing blanks), each non-empty frame terminated by its own newline.
+    /// Stdout is a pipe or a file.
     Plain,
 }
 
 impl LineOutput {
-    /// The output mode for this process's stdout.
+    /// The output kind of this process's stdout.
     #[must_use]
     pub fn of_stdout() -> Self {
         use std::io::IsTerminal;
@@ -537,122 +589,11 @@ impl LineOutput {
             Self::Plain
         }
     }
-
-    /// The bytes written once after the event loop ends.
-    #[must_use]
-    pub const fn closing(self) -> &'static str {
-        match self {
-            Self::Terminal => "\n",
-            Self::Plain => "",
-        }
-    }
-}
-
-/// Render a `Lines` view to the frame a line-oriented `Cli.tea` writes to stdout.
-///
-/// A line-oriented surface occupies exactly the height of its own stacked lines,
-/// so the frame is sized to the view's content height rather than the full
-/// terminal window. Under [`LineOutput::Terminal`] the width comes from the
-/// terminal so styled runs reflow to the visible columns, and the frame carries
-/// no trailing newline (the view's prompt formatting decides). Under
-/// [`LineOutput::Plain`] each line is plain text and a frame with any line ends
-/// in `\n`; a view with no line renders nothing.
-#[must_use]
-pub fn render_lines_view<M: Clone>(view: LinesView<M>, output: LineOutput) -> String {
-    let element = view.into_element();
-    let (cols, encoding) = match output {
-        LineOutput::Terminal => {
-            let cols = match crossterm::terminal::size() {
-                Ok((w, _)) if w > 0 => w as usize,
-                _ => 80,
-            };
-            let profile = crate::color::resolve_term_profile();
-            (cols, layout::FrameEncoding::Ansi(profile))
-        }
-        LineOutput::Plain => (PLAIN_LAYOUT_COLS, layout::FrameEncoding::Plain),
-    };
-    // Probe pass measures the content height; the paint pass sizes the frame to
-    // exactly that height so no blank padding rows follow the last line.
-    let content_h = layout::element_to_cells_height(&element, cols);
-    let frame = layout::element_to_frame(&element, cols, content_h, encoding);
-    let frame = frame.trim_end_matches(['\r', '\n']);
-    match output {
-        LineOutput::Terminal => frame.to_owned(),
-        LineOutput::Plain if content_h == 0 => String::new(),
-        LineOutput::Plain => format!("{frame}\n"),
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn render_lines_view_terminal(view: LinesView<()>) -> String {
-        render_lines_view(view, LineOutput::Terminal)
-    }
-
-    fn plain(view: LinesView<()>) -> String {
-        render_lines_view(view, LineOutput::Plain)
-    }
-
-    // A piped run writes no escape sequence, whatever the view styles.
-    #[test]
-    fn plain_frame_carries_no_escape_sequence() {
-        let out = plain(cli_lines_(vec![
-            cli_line_(vec![CliAttr::Bold], "b".to_owned()),
-            cli_line_(vec![CliAttr::Dim, CliAttr::Reverse], "d".to_owned()),
-            cli_line_(vec![CliAttr::FgColor(term_color_red_())], "c".to_owned()),
-            cli_line_(
-                vec![CliAttr::BgColor(term_color_rgb_(1, 2, 3))],
-                "g".to_owned(),
-            ),
-        ]));
-        assert_eq!(out, "b\nd\nc\ng\n");
-    }
-
-    // Lines are `\n`-separated, carry no layout padding, and the frame ends in
-    // its own newline so the next frame starts on a fresh line.
-    #[test]
-    fn plain_frame_is_newline_terminated_unpadded_lines() {
-        let out = plain(cli_lines_(vec![
-            cli_text_("-- a longer header line".to_owned()),
-            cli_text_("[ ] 1. a".to_owned()),
-        ]));
-        assert_eq!(out, "-- a longer header line\n[ ] 1. a\n");
-        assert!(!out.contains('\r'), "no CR in plain output: {out:?}");
-    }
-
-    // A single text line renders to its bytes plus the frame's newline; a
-    // trailing prompt blank is layout-indistinguishable padding and is dropped.
-    #[test]
-    fn plain_text_frame_is_the_text_and_a_newline() {
-        assert_eq!(plain(cli_text_("lines: 0".to_owned())), "lines: 0\n");
-        assert_eq!(
-            plain(cli_text_("echoed 0 [] > ".to_owned())),
-            "echoed 0 [] >\n"
-        );
-    }
-
-    // A plain line is never clipped to a terminal width.
-    #[test]
-    fn plain_line_is_never_clipped() {
-        let long = "x".repeat(PLAIN_LAYOUT_COLS * 3);
-        assert_eq!(plain(cli_text_(long.clone())), format!("{long}\n"));
-    }
-
-    // A view with no line writes nothing, not a blank line.
-    #[test]
-    fn plain_empty_view_writes_nothing() {
-        assert_eq!(plain(cli_none_()), "");
-    }
-
-    // Each mode owns its closing bytes: the terminal's one newline at exit, and
-    // nothing after plain frames that already end their lines.
-    #[test]
-    fn closing_bytes_follow_the_mode() {
-        assert_eq!(LineOutput::Terminal.closing(), "\n");
-        assert_eq!(LineOutput::Plain.closing(), "");
-    }
 
     #[test]
     fn dim_and_reverse_translate_to_decoration_attributes() {
@@ -722,75 +663,60 @@ mod tests {
         );
     }
 
+    // A line's attributes fold into its style once: a palette colour becomes
+    // its portable SGR code, a truecolour its clamped bytes, and the last
+    // colour of a kind wins.
     #[test]
-    fn cli_attr_line_styles_translate() {
-        assert!(matches!(
-            CliAttr::<()>::Bold.translate(),
-            Some(Attribute::AttrFontWeight(700))
-        ));
-        assert!(matches!(
-            CliAttr::<()>::FgColor(term_color_green_()).translate(),
-            Some(Attribute::AttrFontDecoration(s)) if s == "fg:32"
-        ));
+    fn cli_attrs_fold_into_line_style() {
+        let attrs = LineAttrs::of_cli::<()>(vec![
+            CliAttr::Bold,
+            CliAttr::FgColor(term_color_red_()),
+            CliAttr::FgColor(term_color_green_()),
+            CliAttr::BgColor(term_color_rgb_(-5, 300, 128)),
+        ]);
+        assert!(attrs.bold && !attrs.dim && !attrs.underline && !attrs.reverse);
+        assert_eq!(attrs.fg, Some(LineColor::Palette(32)));
+        assert_eq!(attrs.bg, Some(LineColor::Rgb(0, 255, 128)));
+    }
+
+    // `default` has no named code and falls to the terminal default code of
+    // its channel.
+    #[test]
+    fn default_colour_is_the_reset_code_of_its_channel() {
+        assert_eq!(
+            LineColor::of_ansi(term_color_default_(), true),
+            LineColor::Palette(39)
+        );
+        assert_eq!(
+            LineColor::of_ansi(term_color_default_(), false),
+            LineColor::Palette(49)
+        );
+    }
+
+    // Line text is sanitised at construction: no control character reaches a
+    // stored line, while ordinary spaces (leading and trailing) are kept.
+    #[test]
+    fn line_text_is_sanitised_at_construction() {
+        let view = cli_text_::<()>(" a\u{1b}[31m\r\nb\u{7f}\u{9b} ".to_owned());
+        assert_eq!(view.lines().len(), 1);
+        assert!(matches!(view.lines(), [line] if line.text == " a [31m  b   "));
+    }
+
+    // `lines` flattens nested views in order; `none` contributes no line.
+    #[test]
+    fn lines_flattens_children_in_order() {
+        let view = cli_lines_::<()>(vec![
+            cli_text_("a".to_owned()),
+            cli_none_(),
+            cli_lines_(vec![cli_text_("b".to_owned()), cli_text_("c".to_owned())]),
+        ]);
+        let texts: Vec<&str> = view.lines().iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, ["a", "b", "c"]);
+        assert!(cli_none_::<()>().lines().is_empty());
     }
 
     #[test]
     fn rgb_channels_clamp_into_byte_range() {
         assert_eq!(term_color_rgb_(-5, 300, 128), AnsiColor::Rgb(0, 255, 128));
-    }
-
-    #[test]
-    fn render_lines_view_emits_plain_text() {
-        let out = render_lines_view_terminal(cli_text_::<()>("hello".to_owned()));
-        assert!(out.contains("hello"));
-    }
-
-    // A single unstyled `text` line renders to exactly its own bytes — no
-    // width-padding, no trailing newline, no SGR. This is the byte-for-byte
-    // parity that lets a `Cli.tea` view migrate from `model -> String` to
-    // `model -> Lines msg` (via `Cli.Ui.text`) with identical stdout.
-    #[test]
-    fn render_lines_view_text_is_byte_exact() {
-        assert_eq!(
-            render_lines_view_terminal(cli_text_::<()>("lines: 0".to_owned())),
-            "lines: 0"
-        );
-    }
-
-    #[test]
-    fn render_lines_view_has_no_trailing_newline() {
-        let out = render_lines_view_terminal(cli_text_::<()>("prompt > ".to_owned()));
-        assert!(!out.ends_with('\n'));
-    }
-
-    #[test]
-    fn render_lines_view_stacks_lines_top_to_bottom() {
-        let out = render_lines_view_terminal(cli_lines_::<()>(vec![
-            cli_text_("first".to_owned()),
-            cli_text_("second".to_owned()),
-        ]));
-        let first = out.find("first").expect("first line present");
-        let second = out.find("second").expect("second line present");
-        assert!(first < second, "lines stack top-to-bottom");
-    }
-
-    #[test]
-    fn render_lines_view_carries_line_styling() {
-        let bold = render_lines_view_terminal(cli_line_::<()>(vec![CliAttr::Bold], "b".to_owned()));
-        assert!(bold.contains("\u{1b}[") && bold.contains('1'));
-        let dim = render_lines_view_terminal(cli_line_::<()>(vec![CliAttr::Dim], "d".to_owned()));
-        assert!(dim.contains('2'));
-        let reverse =
-            render_lines_view_terminal(cli_line_::<()>(vec![CliAttr::Reverse], "r".to_owned()));
-        assert!(reverse.contains('7'));
-    }
-
-    #[test]
-    fn render_lines_view_carries_palette_color() {
-        let out = render_lines_view_terminal(cli_line_::<()>(
-            vec![CliAttr::FgColor(term_color_red_())],
-            "c".to_owned(),
-        ));
-        assert!(out.contains("31"));
     }
 }

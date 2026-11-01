@@ -832,8 +832,9 @@ impl<M: Clone + Send + 'static, S: SubSink<M>> SubRuntime<M, S> {
 /// the shared TEA event plumbing rather than carrying it as dead code.
 #[cfg(all(not(target_arch = "wasm32"), feature = "tui"))]
 pub(crate) enum CliEvent<M> {
-    /// A stdin line, holding its share of the reader's [`InputBudget`].
-    Line(String, InputPermit),
+    /// A stdin line and how it ended, holding its share of the reader's
+    /// [`InputBudget`].
+    Line(String, crate::tui::InputEnd, InputPermit),
     // Constructed only by the `tui` raw-key reader; console_app matches it
     // defensively (keys are ignored under Cli).
     Key(String, String, InputPermit),
@@ -933,8 +934,9 @@ impl Drop for InputPermit {
 #[cfg(all(not(target_arch = "wasm32"), feature = "tui"))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum BoundedLine {
-    /// A complete line within the ceiling, its `\n` / `\r\n` terminator removed.
-    Line(String),
+    /// A complete line within the ceiling, its `\n` / `\r\n` terminator
+    /// removed, and how it ended.
+    Line(String, crate::tui::InputEnd),
     /// A line past the ceiling, consumed through its terminator and dropped.
     TooLong,
     /// A line within the ceiling that is not UTF-8.
@@ -955,6 +957,7 @@ pub(crate) fn read_bounded_line<R: std::io::BufRead>(
     let mut line: Vec<u8> = Vec::new();
     let mut too_long = false;
     let mut read_any = false;
+    let mut terminated = false;
     loop {
         let available = reader.fill_buf()?;
         if available.is_empty() {
@@ -981,6 +984,7 @@ pub(crate) fn read_bounded_line<R: std::io::BufRead>(
         let consumed = chunk.len().saturating_add(usize::from(newline.is_some()));
         reader.consume(consumed);
         if newline.is_some() {
+            terminated = true;
             break;
         }
     }
@@ -990,8 +994,13 @@ pub(crate) fn read_bounded_line<R: std::io::BufRead>(
     if too_long || line.len() > max_bytes {
         return Ok(Some(BoundedLine::TooLong));
     }
+    let end = if terminated {
+        crate::tui::InputEnd::Newline
+    } else {
+        crate::tui::InputEnd::Eof
+    };
     Ok(Some(
-        String::from_utf8(line).map_or(BoundedLine::NotUtf8, BoundedLine::Line),
+        String::from_utf8(line).map_or(BoundedLine::NotUtf8, |text| BoundedLine::Line(text, end)),
     ))
 }
 
@@ -1180,9 +1189,9 @@ const STDIN_READER_THREAD: &str = "ipe-stdin-reader";
 /// subscribes to is unobserved (no update, no render). Stdin is read on a blocking task; tickers + perform
 /// results merge into the same single-threaded update sequence via one channel.
 ///
-/// Gated on `feature = "tui"`: the `Lines msg` view rasterizes through
-/// `crate::tui::render_lines_view`, which shares the terminal runtime module
-/// with `tui_app`. A `Cli.tea` program selects the `tui` feature, so a plain
+/// Gated on `feature = "tui"`: the `Lines msg` view serializes through
+/// `crate::tui::write_frame`, which shares the terminal runtime module with
+/// `tui_app`. A `Cli.tea` program selects the `tui` feature, so a plain
 /// `tokio` program (web/server, no terminal shape) never compiles this entry.
 ///
 /// A `--debugger` build takes the program's session `codec` too: the recorder
@@ -1255,8 +1264,8 @@ where
             let stdin = std::io::stdin();
             let mut reader = stdin.lock();
             loop {
-                let line = match read_bounded_line(&mut reader, MAX_LINE_BYTES) {
-                    Ok(Some(BoundedLine::Line(l))) => l,
+                let (line, end) = match read_bounded_line(&mut reader, MAX_LINE_BYTES) {
+                    Ok(Some(BoundedLine::Line(l, end))) => (l, end),
                     Ok(Some(BoundedLine::TooLong)) => continue,
                     // End of input, a non-UTF-8 line, or a read error ends input.
                     Ok(None | Some(BoundedLine::NotUtf8)) | Err(_) => break,
@@ -1264,7 +1273,7 @@ where
                 let Some(permit) = budget.acquire(|| line_tx.is_closed()) else {
                     return;
                 };
-                if line_tx.send(CliEvent::Line(line, permit)).is_err() {
+                if line_tx.send(CliEvent::Line(line, end, permit)).is_err() {
                     return;
                 }
             }
@@ -1296,14 +1305,14 @@ where
         // Inline render (a closure borrowing `view` would make the future non-Send).
         // Fallible writes (NOT print!/println!, which panic on a broken pipe).
         //
-        // Every frame and the closing bytes are encoded by the ONE `output`
-        // chosen here from whether stdout is a terminal. On a terminal a frame
-        // is styled and written with NO forced trailing "\n": the prompt
-        // formatting is the view's own to decide, so a view whose last line ends
-        // `"> "` keeps the cursor on the prompt line, and exactly one newline is
-        // written after the loop exits. Into a pipe or a file a frame is plain
-        // lines, each frame terminated by its own newline, so the output is
-        // line-oriented text a script can read.
+        // Every frame byte and the closing byte are serialized over the ONE
+        // `surface` chosen here, by `write_frame` and `LineState::close`. On a
+        // terminal a frame is styled and its last line stays open, so a view
+        // whose last line ends `"> "` keeps the cursor on the prompt line; the
+        // next frame (unless an echoed input line moved the cursor) and the
+        // close end it. Into a pipe or a file a frame is plain lines, each
+        // ending in its own newline, so the output is line-oriented text a
+        // script can read.
         //
         // The initial render is skipped when `init` issued an outstanding
         // effect: that effect's Msg folds through `update` and renders the
@@ -1311,10 +1320,11 @@ where
         // pre-effect model and duplicate the frame. An effect-free `init`
         // (`Cmd.none`) has nothing to settle, so its initial model renders now
         // (the `lines: 0` frame the separator fixture pins).
-        let output = crate::tui::LineOutput::of_stdout();
+        let surface = crate::tui::LineSurface::from_stdout_only();
+        let mut line_state = crate::tui::LineState::new();
         if outstanding.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-            let rendered = crate::tui::render_lines_view(view(model.clone()), output);
-            let _ = std::io::stdout().write_all(rendered.as_bytes());
+            let frame = crate::tui::write_frame(&view(model.clone()), &surface, &mut line_state);
+            let _ = std::io::stdout().write_all(&frame);
             let _ = std::io::stdout().flush();
         }
 
@@ -1322,7 +1332,12 @@ where
             let msgs: Vec<Msg> = match ev {
                 // Every active line handler sees the line; none → unobserved.
                 // The permit returns to the reader's budget as the line is taken.
-                CliEvent::Line(l, _permit) => submgr.line_msgs(&l),
+                // A newline-ended line's echo ended the open prompt line,
+                // observed or not.
+                CliEvent::Line(l, end, _permit) => {
+                    line_state.input_line(end);
+                    submgr.line_msgs(&l)
+                }
                 CliEvent::Key(..) => continue, // Cli has no keys
                 CliEvent::Interrupt => {
                     submgr.stop_all();
@@ -1363,8 +1378,8 @@ where
                 cli_run_cmd_tracked(cmd, &tx, Some(&outstanding));
                 submgr.update(subscriptions(model.clone()));
             }
-            let rendered = crate::tui::render_lines_view(view(model.clone()), output);
-            let _ = std::io::stdout().write_all(rendered.as_bytes());
+            let frame = crate::tui::write_frame(&view(model.clone()), &surface, &mut line_state);
+            let _ = std::io::stdout().write_all(&frame);
             let _ = std::io::stdout().flush();
             // After folding an effect's result, if EOF was already seen and no
             // effects remain outstanding, terminate as EOF would have.
@@ -1373,7 +1388,7 @@ where
             }
         }
         submgr.stop_all();
-        let _ = std::io::stdout().write_all(output.closing().as_bytes());
+        let _ = std::io::stdout().write_all(line_state.close());
         let _ = std::io::stdout().flush();
         // Dump the recorded session (plain trace + typed log) to the
         // `IPE_DEBUGGER_RECORD` destination, a no-op when that env var is unset.
@@ -2230,6 +2245,7 @@ mod input_dispatch_tests {
 #[cfg(all(test, not(target_arch = "wasm32"), feature = "tui"))]
 mod bounded_input_tests {
     use super::*;
+    use crate::tui::InputEnd;
 
     fn lines(input: &[u8], max: usize) -> Vec<BoundedLine> {
         let mut reader = std::io::BufReader::with_capacity(4, input);
@@ -2245,19 +2261,22 @@ mod bounded_input_tests {
         assert_eq!(
             lines(b"ab\r\ncd\nef", 8),
             vec![
-                BoundedLine::Line("ab".into()),
-                BoundedLine::Line("cd".into()),
-                BoundedLine::Line("ef".into()),
+                BoundedLine::Line("ab".into(), InputEnd::Newline),
+                BoundedLine::Line("cd".into(), InputEnd::Newline),
+                BoundedLine::Line("ef".into(), InputEnd::Eof),
             ]
         );
     }
 
     #[test]
     fn a_line_at_exactly_the_cap_is_delivered() {
-        assert_eq!(lines(b"abcd\n", 4), vec![BoundedLine::Line("abcd".into())]);
+        assert_eq!(
+            lines(b"abcd\n", 4),
+            vec![BoundedLine::Line("abcd".into(), InputEnd::Newline)]
+        );
         assert_eq!(
             lines(b"abcd\r\n", 4),
-            vec![BoundedLine::Line("abcd".into())]
+            vec![BoundedLine::Line("abcd".into(), InputEnd::Newline)]
         );
     }
 
@@ -2267,7 +2286,10 @@ mod bounded_input_tests {
         // is read intact, never a truncated prefix of the dropped one.
         assert_eq!(
             lines(b"abcde\nok\n", 4),
-            vec![BoundedLine::TooLong, BoundedLine::Line("ok".into())]
+            vec![
+                BoundedLine::TooLong,
+                BoundedLine::Line("ok".into(), InputEnd::Newline)
+            ]
         );
         assert_eq!(lines(b"abcde", 4), vec![BoundedLine::TooLong]);
     }
