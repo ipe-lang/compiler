@@ -5515,7 +5515,7 @@ fn resolve_pattern_ctor<'e>(
     unqualified: bool,
     span: Span,
     env: &'e Env,
-    cx: &mut ResolveCx<'_>,
+    interner: &Interner,
 ) -> DResult<&'e CtorHome> {
     match env.module_scope.expr.resolve(name) {
         Resolved::Found(
@@ -5526,15 +5526,15 @@ fn resolve_pattern_ctor<'e>(
             _,
         ) => Ok(ctor),
         Resolved::Ambiguous { importers } => {
-            let modules = importer_names(&importers, cx.interner);
-            Err(ambiguous_import(name, span, modules, cx.interner)?)
+            let modules = importer_names(&importers, interner);
+            Err(ambiguous_import(name, span, modules, interner)?)
         }
         Resolved::Found(..) | Resolved::Missing => Err(ctor_pattern_not_found(
             name,
             unqualified,
             span,
             env,
-            cx.interner,
+            interner,
         )?),
     }
 }
@@ -5552,7 +5552,7 @@ fn canonicalise_pattern(
         src::Pattern_::PUnit => canon::Pattern_::PUnit,
         src::Pattern_::PVar(name) => canon::Pattern_::PVar(*name),
         src::Pattern_::PCtor(name, segments, args) => {
-            let ctor = resolve_pattern_ctor(*name, segments.is_empty(), span, env, cx)?;
+            let ctor = resolve_pattern_ctor(*name, segments.is_empty(), span, env, cx.interner)?;
             cx.names.record(span, ctor_target(ctor));
             let home = ctor.home.clone();
             let type_name = ctor.type_name;
@@ -6381,46 +6381,42 @@ fn resolve_qual_var(
     let Some(members) = env.qual_members(qualifier) else {
         return Err(absent_qualifier(qualifier, span, token, env, cx.interner)?);
     };
-    match members.get(&name) {
-        // A reachable-but-unbacked member lowers with no registry id: IPE-L0108
-        // at type-check.
-        Some(home) => {
-            let declared_in = qualifier_declaring_module(qualifier, env);
-            record_value(cx.names, span, name, home, declared_in);
-            Ok(var_home_to_expr(name, home))
-        }
-        // The qualifier resolves via qual_vars but the member is not a value.
-        // Check qual_ctors — needed for compiled-source ADT constructors accessed
-        // as `Alias.CtorName` (e.g. `Money.USD`, `Money.EUR`).
-        None => {
-            if let Some(ctor_map) = env.qual_ctors.get(&qualifier)
-                && let Some(ch) = ctor_map.get(&name)
-            {
-                cx.names.record(span, ctor_target(ch));
-                return Ok(ctor_expr(ch));
-            }
-            let member = name_str(cx.interner, name)?;
-            Err(Diagnostic::Name {
-                span,
-                msg: NameError::NoSuchMember {
-                    module: name_str(cx.interner, qualifier)?,
-                    suggestions: Candidates::at(
-                        token.and_then(|t| EditTarget::suffix(t, &member)),
-                        suggestions(
-                            name,
-                            Shape::Flat,
-                            members
-                                .keys()
-                                .chain(env.qual_ctors.get(&qualifier).iter().flat_map(|m| m.keys()))
-                                .copied(),
-                            cx.interner,
-                        ),
-                    ),
-                    member,
-                },
-            })
-        }
+    // A reachable-but-unbacked member lowers with no registry id: IPE-L0108
+    // at type-check.
+    if let Some(home) = members.get(&name) {
+        let declared_in = qualifier_declaring_module(qualifier, env);
+        record_value(cx.names, span, name, home, declared_in);
+        return Ok(var_home_to_expr(name, home));
     }
+    // The qualifier resolves via qual_vars but the member is not a value.
+    // Check qual_ctors — needed for compiled-source ADT constructors accessed
+    // as `Alias.CtorName` (e.g. `Money.USD`, `Money.EUR`).
+    if let Some(ctor_map) = env.qual_ctors.get(&qualifier)
+        && let Some(ch) = ctor_map.get(&name)
+    {
+        cx.names.record(span, ctor_target(ch));
+        return Ok(ctor_expr(ch));
+    }
+    let member = name_str(cx.interner, name)?;
+    Err(Diagnostic::Name {
+        span,
+        msg: NameError::NoSuchMember {
+            module: name_str(cx.interner, qualifier)?,
+            suggestions: Candidates::at(
+                token.and_then(|t| EditTarget::suffix(t, &member)),
+                suggestions(
+                    name,
+                    Shape::Flat,
+                    members
+                        .keys()
+                        .chain(env.qual_ctors.get(&qualifier).iter().flat_map(|m| m.keys()))
+                        .copied(),
+                    cx.interner,
+                ),
+            ),
+            member,
+        },
+    })
 }
 
 /// Canonicalise a binary-operator chain into a precedence-correct tree.
