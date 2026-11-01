@@ -99,8 +99,67 @@ pub fn config_decode_toml<E: DecodeErrorSink + 'static, T>(
     )
 }
 
-/// The byte cap on a grammar label kept from a TOML parse error.
-const TOML_LABEL_MAX_BYTES: usize = 48;
+/// Every static grammar label the TOML parser names in an `invalid <label>`
+/// refusal: the `StrContext::Label` strings of `toml_edit` 0.20.2 (this
+/// workspace's `toml` 0.8.2) and 0.22.27 (the newest `toml` 0.8 an emitted
+/// project resolves), which carry the same set. Sorted, so a lookup is a
+/// binary search.
+const TOML_GRAMMAR_LABELS: &[&str] = &[
+    "array",
+    "basic string",
+    "binary integer",
+    "date-time",
+    "escape sequence",
+    "floating-point number",
+    "hexadecimal integer",
+    "inline table",
+    "integer",
+    "key",
+    "literal string",
+    "multiline basic string",
+    "multiline literal string",
+    "octal integer",
+    "string",
+    "table header",
+    "time",
+    "time offset",
+    "unicode 4-digit hex code",
+    "unicode 8-digit hex code",
+];
+
+/// Whether `a` sorts strictly before `b` byte-wise.
+const fn str_before(a: &str, b: &str) -> bool {
+    let (mut a, mut b) = (a.as_bytes(), b.as_bytes());
+    loop {
+        match (a, b) {
+            ([x, a_rest @ ..], [y, b_rest @ ..]) => {
+                if *x != *y {
+                    return *x < *y;
+                }
+                a = a_rest;
+                b = b_rest;
+            }
+            ([], [_, ..]) => return true,
+            (_, []) => return false,
+        }
+    }
+}
+
+/// Whether `labels` is strictly ascending, so a binary search over it is exact.
+const fn strictly_ascending(mut labels: &[&str]) -> bool {
+    while let [first, rest @ ..] = labels {
+        if let [second, ..] = rest
+            && !str_before(first, second)
+        {
+            return false;
+        }
+        labels = rest;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if `TOML_GRAMMAR_LABELS` is not strictly sorted, which the `toml_category` binary search requires [ledger #boundary]
+const _: () = assert!(strictly_ascending(TOML_GRAMMAR_LABELS));
 
 /// The parse error for a TOML source, naming the failure and its position.
 ///
@@ -122,9 +181,8 @@ fn toml_failure(source: &str, error: &toml::de::Error) -> String {
 /// The category of a TOML parser description, carrying no input text.
 ///
 /// A key-naming refusal keeps its category without the keys; a grammar
-/// refusal (`invalid <label>`) keeps its label when the label is a short run
-/// of lowercase letters, digits, spaces and hyphens, the only shape the
-/// parser's static labels take. Any other description is `invalid document`.
+/// refusal (`invalid <label>`) keeps its label only when the label is one of
+/// [`TOML_GRAMMAR_LABELS`]. Any other description is `invalid document`.
 fn toml_category(message: &str) -> String {
     let first = message.lines().next().map_or("", str::trim);
     if first.starts_with("duplicate key") {
@@ -136,18 +194,13 @@ fn toml_category(message: &str) -> String {
     if first == "value is out of range" || first == "recursion limit exceeded" {
         return first.to_owned();
     }
-    match first.strip_prefix("invalid ") {
-        Some(label)
-            if !label.is_empty()
-                && label.len() <= TOML_LABEL_MAX_BYTES
-                && label.bytes().all(|b| {
-                    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b' ' || b == b'-'
-                }) =>
-        {
-            format!("invalid {label}")
-        }
-        _ => "invalid document".to_owned(),
-    }
+    first
+        .strip_prefix("invalid ")
+        .filter(|label| TOML_GRAMMAR_LABELS.binary_search(label).is_ok())
+        .map_or_else(
+            || "invalid document".to_owned(),
+            |label| format!("invalid {label}"),
+        )
 }
 
 /// The one-based line and character column of byte `offset` in `source`.
@@ -909,9 +962,15 @@ mod toml_tests {
             toml_category("value is out of range"),
             "value is out of range"
         );
+        for label in TOML_GRAMMAR_LABELS {
+            let message = format!("invalid {label}");
+            assert_eq!(toml_category(&message), message);
+        }
         for echoing in [
             "invalid type: string \"SENTINEL\", expected i64",
             "invalid SENTINEL",
+            "invalid sentinel",
+            "invalid basic string sentinel",
             "unexpected keys in table: SENTINEL",
             "",
         ] {

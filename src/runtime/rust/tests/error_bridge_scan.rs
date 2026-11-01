@@ -17,27 +17,32 @@
 //!   and the reason the site is `Unexpected`; an unlisted site and a stale entry
 //!   both go red. `Self::` resolves to the enclosing `impl`'s self type, and
 //!   stays `Self` (still matched) where no `impl` encloses it. A path inside a
-//!   pattern builds nothing and is not a site. A `use` rename or `type` alias
-//!   of one of the three types anywhere in the file (any scope, any order)
-//!   makes the alias resolve to that type, so `Kf::Unexpected` after
-//!   `use KernelFailure as Kf` is a site. A `use` that imports
-//!   `Unexpected`/`unexpected` by name or glob from one of the three types is
-//!   itself a site: the bare name would build `Unexpected` unseen.
+//!   pattern builds nothing and is not a site. A qualified-self head
+//!   `<T>::` (position 0) counts as the owner `T`.
 //!
-//! Inside a macro body the same token shapes count, and `fn name { … }` names
-//! the function. Attributes (doc comments) are not code. A `#[cfg(…)]` proven
+//! Aliases are followed crate-wide: every `type` alias and `use` rename of
+//! every scanned file is one edge in a single map, resolved to a fixpoint, so
+//! an alias chain (`type B = A; type A = KernelFailure;`) or an alias
+//! re-exported from another file still names its type. A `use` importing
+//! `Unexpected`/`unexpected` by name, rename or glob from one of the three
+//! types makes the bare name (or a module path ending in it) a site where it
+//! is built.
+//!
+//! Inside a macro body the same token shapes count, `<T>::` included, and
+//! `fn name { … }` names the function. A metavariable owner (`$t::Unexpected`)
+//! may stand for any of the three types, so it is a site of its own needle. Attributes (doc comments) are not code. A `#[cfg(…)]` proven
 //! test-only removes exactly the node it is attached to.
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
 use syn::ext::IdentExt;
 use syn::visit::{self, Visit};
 use syn::{
-    Arm, Attribute, Expr, Field, FieldValue, GenericArgument, ImplItem, ImplItemFn, ImplItemType,
-    Item, ItemFn, ItemImpl, ItemType, ItemUse, Macro, Pat, Path, PathArguments, Stmt, TraitItem,
-    TraitItemFn, Type, UseTree, Variant,
+    Arm, Attribute, Expr, ExprPath, ExprStruct, Field, FieldValue, GenericArgument, ImplItem,
+    ImplItemFn, ImplItemType, Item, ItemFn, ItemImpl, ItemType, ItemUse, Macro, Pat, Path,
+    PathArguments, QSelf, Stmt, TraitItem, TraitItemFn, Type, TypePath, UseTree, Variant,
 };
 
 #[path = "support/cfg_scan.rs"]
@@ -210,6 +215,13 @@ fn bridge_segments(path: &Path) -> usize {
         .count()
 }
 
+/// The needle a `$t::Unexpected` in a macro body is recorded under: the
+/// metavariable can stand for any of the three error types.
+const METAVAR_UNEXPECTED: &str = "$meta::Unexpected";
+
+/// The needle a `$t::unexpected` in a macro body is recorded under.
+const METAVAR_UNEXPECTED_FN: &str = "$meta::unexpected";
+
 /// The needle `names` ends in, if any.
 fn site_needle(names: &[String]) -> Option<&'static str> {
     let last = names.last()?;
@@ -223,14 +235,25 @@ fn site_needle(names: &[String]) -> Option<&'static str> {
         ("IpeErrorKind", "Unexpected") => Some("IpeErrorKind::Unexpected"),
         ("Self", "unexpected") => Some("Self::unexpected"),
         ("Self", "Unexpected") => Some("Self::Unexpected"),
+        (meta, "unexpected") if meta.starts_with('$') => Some(METAVAR_UNEXPECTED_FN),
+        (meta, "Unexpected") if meta.starts_with('$') => Some(METAVAR_UNEXPECTED),
         _ => None,
     }
 }
 
-/// The needle an alias of the type `name` stands for, if `name` is one of the
-/// three error types.
-fn alias_needle(name: &str) -> Option<&'static str> {
+/// The canonical name of `name` if it is one of the three error types.
+fn error_type(name: &str) -> Option<&'static str> {
     match name {
+        "IpeError" => Some("IpeError"),
+        "KernelFailure" => Some("KernelFailure"),
+        "IpeErrorKind" => Some("IpeErrorKind"),
+        _ => None,
+    }
+}
+
+/// The needle the error type `ty` builds.
+fn type_needle(ty: &str) -> Option<&'static str> {
+    match ty {
         "IpeError" => Some("IpeError::unexpected"),
         "KernelFailure" => Some("KernelFailure::Unexpected"),
         "IpeErrorKind" => Some("IpeErrorKind::Unexpected"),
@@ -238,77 +261,235 @@ fn alias_needle(name: &str) -> Option<&'static str> {
     }
 }
 
-/// The needles a `use` tree imports under a name the needles do not match:
-/// `Unexpected`/`unexpected` by name or glob from one of the three types.
-fn use_needles(tree: &UseTree, owner: Option<&str>, out: &mut Vec<&'static str>) {
-    let owned = owner.and_then(alias_needle);
-    match tree {
-        UseTree::Path(path) => use_needles(&path.tree, Some(&path.ident.unraw().to_string()), out),
-        UseTree::Group(group) => {
-            for item in &group.items {
-                use_needles(item, owner, out);
-            }
-        }
-        UseTree::Glob(_) => out.extend(owned),
-        UseTree::Name(name) => {
-            let name = name.ident.unraw().to_string();
-            if name == "Unexpected" || name == "unexpected" {
-                out.extend(owned);
-            }
-        }
-        UseTree::Rename(rename) => {
-            let name = rename.ident.unraw().to_string();
-            if name == "Unexpected" || name == "unexpected" {
-                out.extend(owned);
-            }
-        }
+/// The bare name a glob import of the error type `ty` brings into scope.
+fn glob_name(ty: &str) -> &'static str {
+    if ty == "IpeError" {
+        "unexpected"
+    } else {
+        "Unexpected"
     }
 }
 
-/// The alias `name` of one of the three error types, from a `type` item's
-/// right-hand side.
-fn type_alias(name: &syn::Ident, ty: &Type) -> Option<(String, String)> {
-    let Type::Path(path) = ty else { return None };
-    let last = path.path.segments.last()?;
-    let target = last.ident.unraw().to_string();
-    (path.qself.is_none() && last.arguments.is_none() && alias_needle(&target).is_some())
-        .then(|| (name.unraw().to_string(), target))
+fn is_unexpected(name: &str) -> bool {
+    name == "Unexpected" || name == "unexpected"
 }
 
-/// Every name a file binds to one of the three error types, by `type` alias
-/// or `use` rename, in any scope.
-#[derive(Default)]
-struct Aliases(BTreeMap<String, String>);
+/// The last identifier of a plain type path, through groups and parens.
+fn type_name(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Path(path) if path.qself.is_none() => path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.unraw().to_string()),
+        Type::Group(group) => type_name(&group.elem),
+        Type::Paren(paren) => type_name(&paren.elem),
+        _ => None,
+    }
+}
 
-impl Aliases {
-    fn add_use(&mut self, tree: &UseTree) {
+/// The owner a qualified-self path `<T>::x` puts before its segments.
+///
+/// It is the last identifier of `T` when the `qself` stands at position 0;
+/// `<T as Trait>::x` names the trait's item, not `T`'s.
+fn qself_owner(qself: &QSelf) -> Option<String> {
+    if qself.position == 0 {
+        type_name(&qself.ty)
+    } else {
+        None
+    }
+}
+
+/// A `use` that imports `Unexpected`/`unexpected` from `owner`.
+struct Import {
+    /// The type (or alias) the name is imported from.
+    owner: String,
+    /// The name it is bound to, or `None` for a glob.
+    bound: Option<String>,
+}
+
+/// The raw alias edges of every scanned source.
+///
+/// Each `type` alias and `use` rename adds an edge whatever it names, and each
+/// import of the `Unexpected` name is kept. Edges are keyed by name alone,
+/// across files and scopes, so an alias re-exported from one file and used in
+/// another resolves; a name bound twice stands for every target it is bound
+/// to.
+#[derive(Default)]
+struct AliasEdges {
+    /// Each alias name to the names it stands for.
+    edges: BTreeMap<String, BTreeSet<String>>,
+    imports: Vec<Import>,
+    /// The self type of each enclosing `impl`, innermost last.
+    impl_self: Vec<Option<String>>,
+}
+
+impl AliasEdges {
+    fn edge(&mut self, alias: String, target: String) {
+        if alias != target {
+            self.edges.entry(alias).or_default().insert(target);
+        }
+    }
+
+    fn import(&mut self, owner: Option<&str>, bound: Option<String>) {
+        if let Some(owner) = owner {
+            self.imports.push(Import {
+                owner: owner.to_owned(),
+                bound,
+            });
+        }
+    }
+
+    fn add_use(&mut self, tree: &UseTree, owner: Option<&str>) {
         match tree {
-            UseTree::Path(path) => self.add_use(&path.tree),
-            UseTree::Group(group) => group.items.iter().for_each(|item| self.add_use(item)),
-            UseTree::Rename(rename) => {
-                let target = rename.ident.unraw().to_string();
-                if alias_needle(&target).is_some() {
-                    self.0.insert(rename.rename.unraw().to_string(), target);
+            UseTree::Path(path) => {
+                let next = path.ident.unraw().to_string();
+                self.add_use(&path.tree, Some(&next));
+            }
+            UseTree::Group(group) => {
+                for item in &group.items {
+                    self.add_use(item, owner);
                 }
             }
-            UseTree::Name(_) | UseTree::Glob(_) => {}
+            UseTree::Glob(_) => self.import(owner, None),
+            UseTree::Name(name) => {
+                let name = name.ident.unraw().to_string();
+                if is_unexpected(&name) {
+                    self.import(owner, Some(name));
+                }
+            }
+            UseTree::Rename(rename) => {
+                let ident = rename.ident.unraw().to_string();
+                let alias = rename.rename.unraw().to_string();
+                if is_unexpected(&ident) {
+                    return self.import(owner, Some(alias));
+                }
+                let target = if ident == "self" {
+                    owner.map(ToOwned::to_owned)
+                } else {
+                    Some(ident)
+                };
+                if let Some(target) = target {
+                    self.edge(alias, target);
+                }
+            }
+        }
+    }
+
+    fn add_type(&mut self, name: &syn::Ident, ty: &Type) {
+        match ty {
+            Type::Path(path) if path.qself.is_none() => {
+                let Some(last) = path.path.segments.last() else {
+                    return;
+                };
+                if !last.arguments.is_none() {
+                    return;
+                }
+                let mut target = last.ident.unraw().to_string();
+                if target == "Self"
+                    && let Some(Some(self_ty)) = self.impl_self.last()
+                {
+                    target.clone_from(self_ty);
+                }
+                self.edge(name.unraw().to_string(), target);
+            }
+            Type::Group(group) => self.add_type(name, &group.elem),
+            Type::Paren(paren) => self.add_type(name, &paren.elem),
+            _ => {}
         }
     }
 }
 
-impl<'ast> Visit<'ast> for Aliases {
+impl<'ast> Visit<'ast> for AliasEdges {
+    fn visit_item_impl(&mut self, item: &'ast ItemImpl) {
+        self.impl_self.push(type_name(&item.self_ty));
+        visit::visit_item_impl(self, item);
+        self.impl_self.pop();
+    }
+
     fn visit_item_type(&mut self, item: &'ast ItemType) {
-        self.0.extend(type_alias(&item.ident, &item.ty));
+        self.add_type(&item.ident, &item.ty);
         visit::visit_item_type(self, item);
     }
 
     fn visit_impl_item_type(&mut self, item: &'ast ImplItemType) {
-        self.0.extend(type_alias(&item.ident, &item.ty));
+        self.add_type(&item.ident, &item.ty);
         visit::visit_impl_item_type(self, item);
     }
 
     fn visit_item_use(&mut self, item: &'ast ItemUse) {
-        self.add_use(&item.tree);
+        self.add_use(&item.tree, None);
+    }
+}
+
+/// Every name reachable from `start` over `edges`, `start` included.
+fn reach<'e>(edges: &'e BTreeMap<String, BTreeSet<String>>, start: &'e str) -> BTreeSet<&'e str> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut todo: Vec<&str> = vec![start];
+    while let Some(name) = todo.pop() {
+        if seen.insert(name) {
+            todo.extend(edges.get(name).into_iter().flatten().map(String::as_str));
+        }
+    }
+    seen
+}
+
+/// The alias edges resolved to a fixpoint.
+///
+/// It records which error types each alias stands for, and which needle each
+/// bare imported name builds.
+#[derive(Default)]
+struct Resolved {
+    /// Each alias to the error types it reaches.
+    types: BTreeMap<String, BTreeSet<&'static str>>,
+    /// Each bare name (an imported `Unexpected`, or an alias reaching one) to
+    /// the needles it builds.
+    bare: BTreeMap<String, BTreeSet<&'static str>>,
+}
+
+impl Resolved {
+    fn of(raw: &AliasEdges) -> Self {
+        let mut resolved = Self::default();
+        for alias in raw.edges.keys() {
+            let reached: BTreeSet<&'static str> = reach(&raw.edges, alias)
+                .into_iter()
+                .filter_map(error_type)
+                .collect();
+            if !reached.is_empty() {
+                resolved.types.insert(alias.clone(), reached);
+            }
+        }
+        let mut direct: BTreeMap<String, BTreeSet<&'static str>> = BTreeMap::new();
+        for import in &raw.imports {
+            for ty in resolved.owner_types(&import.owner) {
+                let bound = import
+                    .bound
+                    .clone()
+                    .unwrap_or_else(|| glob_name(ty).to_owned());
+                direct.entry(bound).or_default().extend(type_needle(ty));
+            }
+        }
+        let names: BTreeSet<&String> = raw.edges.keys().chain(direct.keys()).collect();
+        for name in names {
+            let needles: BTreeSet<&'static str> = reach(&raw.edges, name)
+                .into_iter()
+                .filter_map(|reached| direct.get(reached))
+                .flatten()
+                .copied()
+                .collect();
+            if !needles.is_empty() {
+                resolved.bare.insert(name.clone(), needles);
+            }
+        }
+        resolved
+    }
+
+    /// The error types `owner` names: itself if it is one, and every type an
+    /// alias of that name reaches.
+    fn owner_types(&self, owner: &str) -> BTreeSet<&'static str> {
+        let mut out: BTreeSet<&'static str> = error_type(owner).into_iter().collect();
+        out.extend(self.types.get(owner).into_iter().flatten().copied());
+        out
     }
 }
 
@@ -358,33 +539,82 @@ fn bridge_tokens_at(trees: &[TokenTree], at: usize) -> bool {
     }
 }
 
-/// The `a::b::c` identifier path that ends at `trees[at]`.
-fn token_path_ending_at(trees: &[TokenTree], at: usize) -> Vec<String> {
-    let mut names = Vec::new();
-    let Some(last) = ident(trees.get(at)) else {
-        return names;
-    };
-    names.push(last);
-    let mut end = at;
-    loop {
-        let colons = end.checked_sub(2).and_then(|first| trees.get(first..end));
-        let owner = end.checked_sub(3).and_then(|i| ident(trees.get(i)));
-        match (colons, owner) {
-            (Some([TokenTree::Punct(a), TokenTree::Punct(b)]), Some(owner))
-                if a.as_char() == ':' && b.as_char() == ':' =>
-            {
-                names.insert(0, owner);
-                end = end.saturating_sub(3);
+/// Whether `trees[at - 2]` and `trees[at - 1]` are the two colons of a `::`.
+fn colons_before(trees: &[TokenTree], at: usize) -> bool {
+    at.checked_sub(2)
+        .is_some_and(|first| punct(trees.get(first), ':'))
+        && at
+            .checked_sub(1)
+            .is_some_and(|second| punct(trees.get(second), ':'))
+}
+
+/// The name of the identifier at `trees[at]`, spelled `$name` when a `$`
+/// precedes it (a macro metavariable; `$crate` stays `crate`), and the index
+/// the name starts at.
+fn token_name_at(trees: &[TokenTree], at: usize) -> Option<(String, usize)> {
+    let name = ident(trees.get(at))?;
+    let dollar = at
+        .checked_sub(1)
+        .filter(|before| punct(trees.get(*before), '$'));
+    Some(match dollar {
+        Some(start) if name != "crate" => (format!("${name}"), start),
+        Some(start) => (name, start),
+        None => (name, at),
+    })
+}
+
+/// The owner of a qualified-self `<a::T>` whose closing `>` is `trees[gt]`:
+/// the last identifier of the path inside the angle brackets.
+fn token_qself_ending_at(trees: &[TokenTree], gt: usize) -> Option<String> {
+    if !punct(trees.get(gt), '>') {
+        return None;
+    }
+    let (owner, mut start) = token_name_at(trees, gt.checked_sub(1)?)?;
+    while colons_before(trees, start) {
+        let colons = start.checked_sub(2)?;
+        match colons
+            .checked_sub(1)
+            .and_then(|at| token_name_at(trees, at))
+        {
+            Some((_, segment)) => start = segment,
+            None => {
+                start = colons;
+                break;
             }
-            _ => break,
         }
+    }
+    let lt = start.checked_sub(1)?;
+    punct(trees.get(lt), '<').then_some(owner)
+}
+
+/// The `a::b::c` identifier path that ends at `trees[at]`.
+///
+/// A `<T>::` head contributes `T`, and a metavariable segment is spelled
+/// `$name`.
+fn token_path_ending_at(trees: &[TokenTree], at: usize) -> Vec<String> {
+    let Some((last, mut start)) = token_name_at(trees, at) else {
+        return Vec::new();
+    };
+    let mut names = vec![last];
+    while colons_before(trees, start) {
+        let Some(before) = start.checked_sub(3) else {
+            break;
+        };
+        if let Some((owner, owner_start)) = token_name_at(trees, before) {
+            names.insert(0, owner);
+            start = owner_start;
+            continue;
+        }
+        if let Some(owner) = token_qself_ending_at(trees, before) {
+            names.insert(0, owner);
+        }
+        break;
     }
     names
 }
 
 /// The census count and the `(fn, needle)` sites of one file's production syntax.
-#[derive(Default)]
-struct Scan {
+struct Scan<'r> {
     /// The functions enclosing the node being visited, innermost last.
     functions: Vec<String>,
     /// The self type of each enclosing `impl`, innermost last; `None` when it
@@ -392,36 +622,86 @@ struct Scan {
     impl_self: Vec<Option<String>>,
     /// How many patterns enclose the node being visited.
     in_pattern: usize,
-    /// The file's aliases of the three error types, alias to type.
-    aliases: BTreeMap<String, String>,
+    /// The crate-wide aliases resolved to a fixpoint.
+    aliases: &'r Resolved,
     bridges: usize,
     sites: Vec<(String, &'static str)>,
 }
 
-impl Scan {
+impl<'r> Scan<'r> {
+    const fn new(aliases: &'r Resolved) -> Self {
+        Self {
+            functions: Vec::new(),
+            impl_self: Vec::new(),
+            in_pattern: 0,
+            aliases,
+            bridges: 0,
+            sites: Vec::new(),
+        }
+    }
+
     fn function(&self) -> String {
         self.functions
             .last()
             .map_or_else(|| OUTSIDE_FN.to_owned(), Clone::clone)
     }
 
-    fn record_site(&mut self, names: &[String]) {
-        if self.in_pattern > 0 {
-            return;
-        }
+    /// The needle the path `names` builds, after `Self` and alias resolution.
+    fn needle_of(&self, names: &[String]) -> Option<&'static str> {
         let mut resolved = names.to_vec();
         if let (Some(first), Some(Some(self_ty))) = (resolved.first_mut(), self.impl_self.last())
             && first == "Self"
         {
             first.clone_from(self_ty);
         }
-        let owner_at = resolved.len().checked_sub(2);
-        if let Some(owner) = owner_at.and_then(|at| resolved.get_mut(at))
-            && let Some(target) = self.aliases.get(owner.as_str())
-        {
-            owner.clone_from(target);
+        if let Some(needle) = site_needle(&resolved) {
+            return Some(needle);
         }
-        self.record_needle(site_needle(&resolved));
+        let owner_at = resolved.len().checked_sub(2);
+        if let Some(at) = owner_at
+            && let Some(owner) = resolved.get(at).cloned()
+        {
+            for ty in self.aliases.owner_types(&owner) {
+                if let Some(slot) = resolved.get_mut(at) {
+                    ty.clone_into(slot);
+                }
+                if let Some(needle) = site_needle(&resolved) {
+                    return Some(needle);
+                }
+            }
+        }
+        let (last, head) = resolved.split_last()?;
+        let through_module = head
+            .last()
+            .is_none_or(|owner| owner.starts_with(|c: char| c.is_ascii_lowercase()));
+        if !through_module {
+            return None;
+        }
+        self.aliases.bare.get(last)?.first().copied()
+    }
+
+    fn record_site(&mut self, names: &[String]) {
+        if self.in_pattern > 0 {
+            return;
+        }
+        let needle = self.needle_of(names);
+        self.record_needle(needle);
+    }
+
+    /// Counts the bridges of `path` and records it as a site, with `owner`
+    /// (a qualified-self head) before its segments.
+    fn scan_path(&mut self, path: &Path, owner: Option<String>) {
+        self.bridges = self.bridges.saturating_add(bridge_segments(path));
+        let names: Vec<String> = owner
+            .into_iter()
+            .chain(
+                path.segments
+                    .iter()
+                    .map(|segment| segment.ident.unraw().to_string()),
+            )
+            .collect();
+        self.record_site(&names);
+        visit::visit_path(self, path);
     }
 
     fn record_needle(&mut self, needle: Option<&'static str>) {
@@ -483,7 +763,7 @@ impl Scan {
     }
 }
 
-impl<'ast> Visit<'ast> for Scan {
+impl<'ast> Visit<'ast> for Scan<'_> {
     fn visit_attribute(&mut self, _attr: &'ast Attribute) {}
 
     fn visit_item(&mut self, item: &'ast Item) {
@@ -517,26 +797,12 @@ impl<'ast> Visit<'ast> for Scan {
     }
 
     fn visit_item_impl(&mut self, item: &'ast ItemImpl) {
-        let self_ty = match &*item.self_ty {
-            Type::Path(path) if path.qself.is_none() => path
-                .path
-                .segments
-                .last()
-                .map(|segment| segment.ident.unraw().to_string()),
-            _ => None,
-        };
-        self.impl_self.push(self_ty);
+        self.impl_self.push(type_name(&item.self_ty));
         visit::visit_item_impl(self, item);
         self.impl_self.pop();
     }
 
-    fn visit_item_use(&mut self, item: &'ast ItemUse) {
-        let mut needles = Vec::new();
-        use_needles(&item.tree, None, &mut needles);
-        for needle in needles {
-            self.record_needle(Some(needle));
-        }
-    }
+    fn visit_item_use(&mut self, _item: &'ast ItemUse) {}
 
     fn visit_pat(&mut self, pat: &'ast Pat) {
         self.in_pattern = self.in_pattern.saturating_add(1);
@@ -608,14 +874,43 @@ impl<'ast> Visit<'ast> for Scan {
     }
 
     fn visit_path(&mut self, path: &'ast Path) {
-        self.bridges = self.bridges.saturating_add(bridge_segments(path));
-        let names: Vec<String> = path
-            .segments
-            .iter()
-            .map(|segment| segment.ident.unraw().to_string())
-            .collect();
-        self.record_site(&names);
-        visit::visit_path(self, path);
+        self.scan_path(path, None);
+    }
+
+    fn visit_expr_path(&mut self, node: &'ast ExprPath) {
+        match qualified(node.qself.as_ref()) {
+            Some((qself, owner)) => {
+                self.visit_qself(qself);
+                self.scan_path(&node.path, Some(owner));
+            }
+            None => visit::visit_expr_path(self, node),
+        }
+    }
+
+    fn visit_expr_struct(&mut self, node: &'ast ExprStruct) {
+        match qualified(node.qself.as_ref()) {
+            Some((qself, owner)) => {
+                self.visit_qself(qself);
+                self.scan_path(&node.path, Some(owner));
+                for field in &node.fields {
+                    self.visit_field_value(field);
+                }
+                if let Some(rest) = &node.rest {
+                    self.visit_expr(rest);
+                }
+            }
+            None => visit::visit_expr_struct(self, node),
+        }
+    }
+
+    fn visit_type_path(&mut self, node: &'ast TypePath) {
+        match qualified(node.qself.as_ref()) {
+            Some((qself, owner)) => {
+                self.visit_qself(qself);
+                self.scan_path(&node.path, Some(owner));
+            }
+            None => visit::visit_type_path(self, node),
+        }
     }
 
     fn visit_macro(&mut self, mac: &'ast Macro) {
@@ -624,44 +919,80 @@ impl<'ast> Visit<'ast> for Scan {
     }
 }
 
-/// The scan of `src`; a source that does not parse fails.
-fn scan(name: &str, src: &str) -> Scan {
-    let parsed = syn::parse_file(src);
-    assert!(
-        parsed.is_ok(),
-        "{name}: does not parse as Rust, so its error bridges cannot be counted: {:?}",
-        parsed.as_ref().err().map(ToString::to_string)
-    );
-    let mut found = Scan::default();
-    if let Ok(file) = &parsed {
-        let mut aliases = Aliases::default();
-        aliases.visit_file(file);
-        found.aliases = aliases.0;
-        found.visit_file(file);
+/// A qualified-self head at position 0 and the owner it names.
+fn qualified(qself: Option<&QSelf>) -> Option<(&QSelf, String)> {
+    let qself = qself?;
+    qself_owner(qself).map(|owner| (qself, owner))
+}
+
+/// One file's census count and `(fn, needle)` sites.
+#[derive(Default)]
+struct Found {
+    bridges: usize,
+    sites: Vec<(String, &'static str)>,
+}
+
+/// The scan of every source against one crate-wide alias map; a source that
+/// does not parse fails.
+fn scan_all(sources: &[(String, String)]) -> Vec<(String, Found)> {
+    let mut files = Vec::new();
+    for (name, src) in sources {
+        let parsed = syn::parse_file(src);
+        assert!(
+            parsed.is_ok(),
+            "{name}: does not parse as Rust, so its error bridges cannot be counted: {:?}",
+            parsed.as_ref().err().map(ToString::to_string)
+        );
+        if let Ok(file) = parsed {
+            files.push((name.clone(), file));
+        }
     }
-    found
+    let mut edges = AliasEdges::default();
+    for (_, file) in &files {
+        edges.visit_file(file);
+    }
+    let aliases = Resolved::of(&edges);
+    files
+        .iter()
+        .map(|(name, file)| {
+            let mut scan = Scan::new(&aliases);
+            scan.visit_file(file);
+            let found = Found {
+                bridges: scan.bridges,
+                sites: scan.sites,
+            };
+            (name.clone(), found)
+        })
+        .collect()
+}
+
+/// The scan of the single source `src`.
+fn scan(name: &str, src: &str) -> Found {
+    scan_all(&[(name.to_owned(), src.to_owned())])
+        .pop()
+        .map(|(_, found)| found)
+        .unwrap_or_default()
 }
 
 /// Every file of `sources` whose bridge count differs from `table`.
 fn census_violations(sources: &[(String, String)], table: &[(&str, usize)]) -> Vec<String> {
     let expected: BTreeMap<&str, usize> = table.iter().copied().collect();
     let mut out = Vec::new();
-    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
-    for (name, src) in sources {
-        let found = scan(name, src).bridges;
-        if found > 0 {
-            seen.insert(name.as_str(), found);
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    for (name, found) in scan_all(sources) {
+        if found.bridges > 0 {
+            seen.insert(name, found.bridges);
         }
     }
     for (file, found) in &seen {
-        match expected.get(file) {
+        match expected.get(file.as_str()) {
             Some(count) if count == found => {}
             Some(count) => out.push(format!("{file}: expects {count} bridge(s), found {found}")),
             None => out.push(format!("{file}: {found} unlisted bridge(s)")),
         }
     }
     for (file, count) in &expected {
-        if !seen.contains_key(file) {
+        if !seen.contains_key(*file) {
             out.push(format!("{file}: expects {count} bridge(s), found 0"));
         }
     }
@@ -671,8 +1002,8 @@ fn census_violations(sources: &[(String, String)], table: &[(&str, usize)]) -> V
 /// Every unlisted site of `sources`, and every `ledger` entry whose count differs.
 fn site_violations(sources: &[(String, String)], ledger: &[Unclassified]) -> Vec<String> {
     let mut found: BTreeMap<(String, String, &'static str), usize> = BTreeMap::new();
-    for (name, src) in sources {
-        for (function, needle) in scan(name, src).sites {
+    for (name, scanned) in scan_all(sources) {
+        for (function, needle) in scanned.sites {
             let seen = found.entry((name.clone(), function, needle)).or_insert(0);
             *seen = seen.saturating_add(1);
         }
@@ -794,6 +1125,8 @@ fn m() -> Ek { Ek::Unexpected }
 impl Kf { fn n() -> Self { Self::Unexpected(String::new()) } }
 fn o() { type Late = crate::error::IpeError; }
 fn p() -> Late { Late::unexpected(String::new()) }
+fn q(m: String) -> KernelFailure { Unexpected(m) }
+fn r() -> IpeErrorKind { Odd }
 "#;
     let found = scan("fixture", src).sites;
     let expected: Vec<(String, &str)> = vec![
@@ -801,12 +1134,143 @@ fn p() -> Late { Late::unexpected(String::new()) }
         ("g".to_owned(), "IpeError::unexpected"),
         ("i".to_owned(), "Self::Unexpected"),
         ("j".to_owned(), "IpeErrorKind::Unexpected"),
-        (OUTSIDE_FN.to_owned(), "KernelFailure::Unexpected"),
-        (OUTSIDE_FN.to_owned(), "IpeErrorKind::Unexpected"),
         ("l".to_owned(), "KernelFailure::Unexpected"),
         ("m".to_owned(), "IpeErrorKind::Unexpected"),
         ("n".to_owned(), "KernelFailure::Unexpected"),
         ("p".to_owned(), "IpeError::unexpected"),
+        ("q".to_owned(), "KernelFailure::Unexpected"),
+        ("r".to_owned(), "IpeErrorKind::Unexpected"),
+    ];
+    assert_eq!(found, expected);
+}
+
+#[test]
+fn a_qualified_self_owner_is_a_site() {
+    let src = r#"
+impl KernelFailure { fn a(m: String) -> Self { <Self>::Unexpected(m) } }
+fn b(m: String) -> KernelFailure { <KernelFailure>::Unexpected(m) }
+fn c(m: String) -> IpeError { <crate::error::IpeError>::unexpected(m) }
+fn d(m: String) -> KernelFailure { <KernelFailure>::Unexpected { 0: m } }
+fn e(m: String) -> IpeError { <IpeError as Tr>::unexpected(m) }
+m! { fn f() -> IpeErrorKind { <crate::IpeErrorKind>::Unexpected } }
+m! { fn g(m: String) -> KernelFailure { <Self>::Unexpected(m) } }
+fn h(k: KernelFailure) -> bool { if let <KernelFailure>::Unexpected(_) = k { true } else { false } }
+"#;
+    let found = scan("fixture", src).sites;
+    let expected: Vec<(String, &str)> = vec![
+        ("a".to_owned(), "KernelFailure::Unexpected"),
+        ("b".to_owned(), "KernelFailure::Unexpected"),
+        ("c".to_owned(), "IpeError::unexpected"),
+        ("d".to_owned(), "KernelFailure::Unexpected"),
+        ("f".to_owned(), "IpeErrorKind::Unexpected"),
+        ("g".to_owned(), "Self::Unexpected"),
+    ];
+    assert_eq!(found, expected);
+}
+
+#[test]
+fn an_alias_chain_resolves_to_a_fixpoint() {
+    let src = r#"
+type A = KernelFailure;
+type B = A;
+use self::B as C;
+use crate::error::IpeErrorKind as D;
+use self::D as E;
+use crate::error::{self as err, IpeError::{self as Ie}};
+type F = Ie;
+type Loop1 = Loop2;
+type Loop2 = Loop1;
+impl KernelFailure { type Me = Self; }
+fn a() -> B { B::Unexpected(String::new()) }
+fn b() -> C { C::Unexpected(String::new()) }
+fn c() -> E { E::Unexpected }
+fn d(m: String) -> F { F::unexpected(m) }
+fn e() -> Loop1 { Loop1::Unexpected }
+fn f(m: String) -> KernelFailure { Me::Unexpected(m) }
+"#;
+    let found = scan("fixture", src).sites;
+    let expected: Vec<(String, &str)> = vec![
+        ("a".to_owned(), "KernelFailure::Unexpected"),
+        ("b".to_owned(), "KernelFailure::Unexpected"),
+        ("c".to_owned(), "IpeErrorKind::Unexpected"),
+        ("d".to_owned(), "IpeError::unexpected"),
+        ("f".to_owned(), "KernelFailure::Unexpected"),
+    ];
+    assert_eq!(found, expected);
+}
+
+#[test]
+fn an_alias_from_another_file_is_resolved() {
+    let files = sources(&[
+        ("a.rs", "pub type Kf = crate::error::KernelFailure;"),
+        (
+            "b.rs",
+            "use crate::a::Kf; fn f(m: String) -> Kf { Kf::Unexpected(m) }",
+        ),
+        ("c.rs", "pub use crate::a::Kf as Kf2;"),
+        ("d.rs", "fn g(m: String) -> Kf2 { Kf2::Unexpected(m) }"),
+        (
+            "e.rs",
+            "pub use crate::error::IpeErrorKind::Unexpected as Boom;",
+        ),
+        ("f.rs", "fn h() -> IpeErrorKind { crate::e::Boom }"),
+    ]);
+    let found: Vec<(String, Vec<(String, &str)>)> = scan_all(&files)
+        .into_iter()
+        .filter(|(_, found)| !found.sites.is_empty())
+        .map(|(name, found)| (name, found.sites))
+        .collect();
+    let site = |name: &str, function: &str, needle: &'static str| {
+        (name.to_owned(), vec![(function.to_owned(), needle)])
+    };
+    assert_eq!(
+        found,
+        vec![
+            site("b.rs", "f", "KernelFailure::Unexpected"),
+            site("d.rs", "g", "KernelFailure::Unexpected"),
+            site("f.rs", "h", "IpeErrorKind::Unexpected"),
+        ]
+    );
+}
+
+#[test]
+fn a_metavariable_owner_in_a_macro_is_a_site() {
+    let src = r#"
+macro_rules! boom { ($t:ty, $m:expr) => { $t::Unexpected($m) }; }
+macro_rules! fail { ($t:path) => { fn inner() -> IpeError { $t::unexpected(String::new()) } }; }
+macro_rules! wrapped { ($t:ty) => { <$t>::Unexpected }; }
+macro_rules! krate { () => { $crate::Unexpected }; }
+"#;
+    let found = scan("fixture", src).sites;
+    let expected: Vec<(String, &str)> = vec![
+        (OUTSIDE_FN.to_owned(), METAVAR_UNEXPECTED),
+        ("inner".to_owned(), METAVAR_UNEXPECTED_FN),
+        (OUTSIDE_FN.to_owned(), METAVAR_UNEXPECTED),
+    ];
+    assert_eq!(found, expected);
+}
+
+#[test]
+fn a_bare_imported_unexpected_is_a_site_where_it_is_built() {
+    let src = r#"
+mod a { pub use crate::error::KernelFailure::*; }
+use crate::error::IpeErrorKind::{Unexpected as Odd};
+use self::Odd as Odder;
+fn f(m: String) -> KernelFailure { Unexpected(m) }
+fn g() -> IpeErrorKind { Odd }
+fn h() -> IpeErrorKind { Odder }
+fn i(m: String) -> KernelFailure { a::Unexpected(m) }
+fn j(k: KernelFailure) -> bool { if let Unexpected(_) = k { true } else { false } }
+fn k() -> Other { Other::Unexpected }
+m! { fn l(m: String) -> KernelFailure { Unexpected(m) } }
+"#;
+    let found = scan("fixture", src).sites;
+    let expected: Vec<(String, &str)> = vec![
+        ("f".to_owned(), "KernelFailure::Unexpected"),
+        ("g".to_owned(), "IpeErrorKind::Unexpected"),
+        ("h".to_owned(), "IpeErrorKind::Unexpected"),
+        ("i".to_owned(), "KernelFailure::Unexpected"),
+        ("l".to_owned(), "KernelFailure::Unexpected"),
     ];
     assert_eq!(found, expected);
 }
