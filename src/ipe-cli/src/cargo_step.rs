@@ -147,6 +147,43 @@ pub struct EmbeddedApp<'a> {
     pub profile: &'a Path,
 }
 
+/// The key one `ipe test` run builds its runner under.
+///
+/// Sixteen bytes from the operating system's random source, minted fresh per
+/// run by [`TestRunKey::fresh`] and never derived from anything a previous run
+/// or the project holds. The build hands [`TestRunKey::marker`] to the runner
+/// through [`ipe_backend_rust::TEST_RUN_KEY_ENV`]; the runner embeds it, so a
+/// binary that does not carry this run's marker was not built by this run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct TestRunKey([u8; 16]);
+
+impl TestRunKey {
+    /// The prefix of every rendered marker.
+    const MARKER_PREFIX: &'static str = "ipe-test-run-key:";
+
+    /// Mint a key no earlier run used.
+    ///
+    /// # Errors
+    /// The random source's failure, as an I/O error.
+    pub fn fresh() -> std::io::Result<Self> {
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).map_err(std::io::Error::from)?;
+        Ok(Self(bytes))
+    }
+
+    /// The marker the runner embeds: the prefix and 32 lowercase hex digits.
+    #[must_use]
+    pub fn marker(&self) -> String {
+        format!("{}{}", Self::MARKER_PREFIX, hex::encode(self.0))
+    }
+}
+
+impl std::fmt::Debug for TestRunKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestRunKey(..)")
+    }
+}
+
 /// The crate a blocking cargo build compiles.
 #[derive(Debug, Clone, Copy)]
 pub enum CargoCrate<'a> {
@@ -154,6 +191,14 @@ pub enum CargoCrate<'a> {
     /// before cargo starts and again after it succeeds: cargo reaches it by
     /// path, so a swap while it runs is detected, never trusted.
     Emitted(&'a OwnedDir),
+    /// The emitted `ipe test` runner, held exactly as [`Self::Emitted`] and
+    /// built with `key`'s marker in [`ipe_backend_rust::TEST_RUN_KEY_ENV`].
+    TestRunner {
+        /// The claimed directory holding the runner crate.
+        dir: &'a OwnedDir,
+        /// The key of the run this build serves.
+        key: &'a TestRunKey,
+    },
     /// The `ipe_wrapper` package of the verified compiler workspace `source`,
     /// a tree ipe does not own, so no output claim is proven.
     ReleaseWrapper {
@@ -176,10 +221,18 @@ enum LockPolicy<'a> {
 }
 
 impl<'a> CargoCrate<'a> {
+    /// The claimed directory ipe emitted this crate into, when it did.
+    const fn owned(&self) -> Option<&'a OwnedDir> {
+        match *self {
+            Self::Emitted(dir) | Self::TestRunner { dir, .. } => Some(dir),
+            Self::ReleaseWrapper { .. } => None,
+        }
+    }
+
     /// The lock this crate's build replays.
     const fn lock_policy(&self) -> LockPolicy<'a> {
         match *self {
-            Self::Emitted(dir) => LockPolicy::ReplayOrResolve(dir),
+            Self::Emitted(dir) | Self::TestRunner { dir, .. } => LockPolicy::ReplayOrResolve(dir),
             Self::ReleaseWrapper { .. } => LockPolicy::Committed,
         }
     }
@@ -246,7 +299,7 @@ impl CargoBuild<'_> {
     /// The directory cargo runs in.
     fn dir(&self) -> &Path {
         match self.krate {
-            CargoCrate::Emitted(dir) => dir.path(),
+            CargoCrate::Emitted(dir) | CargoCrate::TestRunner { dir, .. } => dir.path(),
             CargoCrate::ReleaseWrapper { source, .. } => source.root(),
         }
     }
@@ -261,13 +314,19 @@ impl CargoBuild<'_> {
             self.target,
             self.output,
         );
-        if let CargoCrate::ReleaseWrapper { embed, .. } = self.krate {
-            cmd.args(["--package", "ipe_wrapper"]);
-            if let Some(app) = embed {
-                // The wrapper's `build.rs` copies these into `OUT_DIR` and
-                // enables its `embed_mode` cfg.
-                cmd.env("IPE_EMBED_APP", app.binary)
-                    .env("IPE_EMBED_PROFILE", app.profile);
+        match self.krate {
+            CargoCrate::Emitted(_) => {}
+            CargoCrate::TestRunner { key, .. } => {
+                cmd.env(ipe_backend_rust::TEST_RUN_KEY_ENV, key.marker());
+            }
+            CargoCrate::ReleaseWrapper { embed, .. } => {
+                cmd.args(["--package", "ipe_wrapper"]);
+                if let Some(app) = embed {
+                    // The wrapper's `build.rs` copies these into `OUT_DIR` and
+                    // enables its `embed_mode` cfg.
+                    cmd.env("IPE_EMBED_APP", app.binary)
+                        .env("IPE_EMBED_PROFILE", app.profile);
+                }
             }
         }
         cmd
@@ -295,7 +354,7 @@ impl CargoBuild<'_> {
     ///   [`CARGO_BUILD_WALL`]; every process it started is killed.
     /// - [`CliError::LocalLimitExceeded`] if the lock probe or the resolve
     ///   crosses a ceiling.
-    /// - [`CliError::OutputRefused`] if an [`CargoCrate::Emitted`] directory
+    /// - [`CliError::OutputRefused`] if an emitted crate's directory
     ///   was replaced before or while cargo ran, or its `Cargo.lock` is a
     ///   symlink or reparse point.
     pub fn run(&self) -> Result<String, CliError> {
@@ -304,7 +363,7 @@ impl CargoBuild<'_> {
 
     /// [`Self::run`] with the build held to `wall`.
     fn run_within(&self, wall: LocalWall) -> Result<String, CliError> {
-        if let CargoCrate::Emitted(dir) = self.krate {
+        if let Some(dir) = self.krate.owned() {
             dir.verify()?;
         }
         let dir = self.dir();
@@ -322,52 +381,10 @@ impl CargoBuild<'_> {
         cmd.arg("--locked");
         let drained = run_to_exit(cmd, ARTIFACT_STREAM_CAP, wall).map_err(io_err)?;
         let stdout = self.verdict(drained)?;
-        if let CargoCrate::Emitted(dir) = self.krate {
+        if let Some(dir) = self.krate.owned() {
             dir.verify()?;
         }
         Ok(stdout)
-    }
-
-    /// Remove every compiled unit of `package` from the build directory, ahead of the build.
-    ///
-    /// The crate's lock is established first, exactly as [`Self::run`]
-    /// establishes it, so the clean replays that lock offline and never
-    /// resolves on its own. `cargo clean --package <package> --locked
-    /// --offline` then runs with the build's program, directory and
-    /// environment (its `CARGO_TARGET_DIR` included), held to
-    /// [`LOCK_RESOLVE_LIMITS`].
-    ///
-    /// # Errors
-    /// The lock errors of [`Self::run`]; [`CliError::EmittedBuildFailed`] if
-    /// the clean exits non-zero; [`CliError::LocalLimitExceeded`],
-    /// [`CliError::Io`] or [`CliError::ChildPipeHeld`] from its runner.
-    pub fn clean_package(&self, package: &str) -> Result<(), CliError> {
-        if let CargoCrate::Emitted(dir) = self.krate {
-            dir.verify()?;
-        }
-        let build = self.command();
-        match self.krate.lock_policy() {
-            LockPolicy::ReplayOrResolve(owned) => {
-                let _locked: Locked = establish_lock(&build, owned, self.output.verbosity())?;
-            }
-            LockPolicy::Committed => {}
-        }
-        let dir = self.dir();
-        let mut clean = Command::new(build.get_program());
-        clean
-            .args(["clean", "--package", package, "--locked", "--offline"])
-            .current_dir(dir);
-        forward_build_env(&build, &mut clean);
-        match run_local(clean, LOCK_RESOLVE_LIMITS, LocalSource::CargoClean) {
-            Ok(captured) if captured.status.success() => Ok(()),
-            Ok(captured) => Err(CliError::EmittedBuildFailed {
-                what: "the clean of the previous test runner's build output",
-                code: captured.status.code().unwrap_or(1),
-                stderr: captured.stderr.to_terminal(),
-                runtime: None,
-            }),
-            Err(e) => Err(local_run_error(dir, e)),
-        }
     }
 
     /// The build's captured stdout, or why the drained build failed.

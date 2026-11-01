@@ -975,6 +975,10 @@ messages! {
     cli_target_dir_scratch_cache = "cli-target-dir-scratch-cache";
     /// Another `ipe test` held the shared test build directory past the wall.
     cli_test_target_busy(path: &crate::style::TerminalSafe, wall) = "cli-test-target-busy";
+    /// The test runner found does not carry this `ipe test` run's key.
+    cli_test_runner_stale(binary: &crate::style::TerminalSafe) = "cli-test-runner-stale";
+    /// The system random source could not mint an `ipe test` run's key.
+    cli_test_run_key_unavailable(kind) = "cli-test-run-key-unavailable";
     /// The embedded runtime manifest could not be prepared for bundling.
     cli_bundled_manifest(detail) = "cli-bundled-manifest";
     /// An unlinkable toolchain sysroot.

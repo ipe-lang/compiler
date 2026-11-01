@@ -140,13 +140,6 @@ const SITES: &[SiteRow] = &[
     ("cargo_step.rs", "build_command", "cargo", Runner::Cargo, 1),
     (
         "cargo_step.rs",
-        "CargoBuild::clean_package",
-        "build.get_program()",
-        Runner::Local("LOCK_RESOLVE_LIMITS"),
-        1,
-    ),
-    (
-        "cargo_step.rs",
         "probe_lock_within",
         "build.get_program()",
         Runner::Local("LOCK_RESOLVE_LIMITS"),
@@ -3573,4 +3566,100 @@ fn a_name_standing_for_a_runner_or_sink_fn_is_refused() {
         refused_for(&found, "a binding named as a runner or sink fn"),
         "{found:?}"
     );
+}
+
+/// The subcommand no child the `ipe` crate starts may pass.
+///
+/// A stale `ipe test` runner is told apart by the run key it embeds, never by
+/// removing build output another run may be reading.
+const REMOVED_SUBCOMMAND: &str = "clean";
+
+/// The local-runner source the removed subcommand ran under.
+const REMOVED_SOURCE: &str = "CargoClean";
+
+/// Every `.arg`/`.args` call passing [`REMOVED_SUBCOMMAND`], and every
+/// [`REMOVED_SOURCE`] identifier, in one parsed file.
+#[derive(Default)]
+struct RemovedChildScan {
+    found: Vec<String>,
+}
+
+impl RemovedChildScan {
+    /// Whether `expr` is, or is an array holding, the removed subcommand literal.
+    fn passes_removed(expr: &Expr) -> bool {
+        match expr {
+            Expr::Lit(lit) => {
+                matches!(&lit.lit, Lit::Str(text) if text.value() == REMOVED_SUBCOMMAND)
+            }
+            Expr::Array(array) => array.elems.iter().any(Self::passes_removed),
+            Expr::Reference(reference) => Self::passes_removed(&reference.expr),
+            _ => false,
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for RemovedChildScan {
+    fn visit_expr_method_call(&mut self, call: &'ast ExprMethodCall) {
+        let method = call.method.to_string();
+        if (method == "arg" || method == "args") && call.args.iter().any(Self::passes_removed) {
+            self.found
+                .push(format!("`.{method}(..)` passing `{REMOVED_SUBCOMMAND}`"));
+        }
+        visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_ident(&mut self, ident: &'ast Ident) {
+        if ident == REMOVED_SOURCE {
+            self.found.push(format!("`{REMOVED_SOURCE}`"));
+        }
+    }
+}
+
+/// The removed-subcommand sites of `source`, one line each.
+fn removed_child_sites(source: &str) -> syn::Result<Vec<String>> {
+    let file = syn::parse_file(source)?;
+    let mut scan = RemovedChildScan::default();
+    scan.visit_file(&file);
+    Ok(scan.found)
+}
+
+#[test]
+fn no_child_removes_build_output() {
+    let root = src_root();
+    let mut paths = Vec::new();
+    rust_files(&root, 0, &mut paths).expect("source tree listable");
+    assert!(
+        paths.iter().any(|path| path.ends_with("cargo_step.rs")),
+        "the listing must reach src/cargo_step.rs, or it is listing the wrong tree"
+    );
+    let mut found = Vec::new();
+    for path in &paths {
+        let source = std::fs::read_to_string(path).expect("source readable");
+        let sites = removed_child_sites(&source).expect("source parses");
+        let file = relative(&root, path).expect("listed under the root");
+        found.extend(sites.into_iter().map(|site| format!("{file}: {site}")));
+    }
+    assert!(
+        found.is_empty(),
+        "no child the `ipe` crate starts removes build output:\n{}",
+        found.join("\n")
+    );
+}
+
+#[test]
+fn a_child_removing_build_output_is_refused() {
+    let refused = [
+        "fn c(cmd: &mut Command) { cmd.args([\"clean\", \"--package\", p]); }",
+        "fn c(cmd: &mut Command) { cmd.arg(\"clean\"); }",
+        "fn c(cmd: &mut Command) { cmd.args(&[\"clean\"]); }",
+        "fn c() { let _ = LocalSource::CargoClean; }",
+    ];
+    for sample in refused {
+        let sites = removed_child_sites(sample).expect("sample parses");
+        assert!(!sites.is_empty(), "the scan must refuse: {sample}");
+    }
+    let admitted = "fn c(cmd: &mut Command) { cmd.args([\"build\", \"--locked\"]); \
+                    let _ = usage_unexpected_argument(\"clean\", arg); }";
+    let sites = removed_child_sites(admitted).expect("sample parses");
+    assert!(sites.is_empty(), "{admitted}: {sites:?}");
 }

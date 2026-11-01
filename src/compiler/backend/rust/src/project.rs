@@ -1716,11 +1716,48 @@ fn prelude_section(ctx: &EmitCtx) -> DResult<String> {
     Ok(section.render())
 }
 
+/// The opening of the native epilogue's `fn main` body.
+const NATIVE_MAIN_ANCHOR: &str = "fn main() {\n";
+
+/// The first statement of the `ipe test` runner's `fn main`.
+///
+/// It embeds the value of [`crate::TEST_RUN_KEY_ENV`] in the binary; the
+/// `black_box` keeps the string reachable, so no build profile strips it.
+fn test_run_key_statement() -> String {
+    format!(
+        "    std::hint::black_box(env!({}));\n",
+        ipe_intern::rust_str_lit(crate::TEST_RUN_KEY_ENV)
+    )
+}
+
 /// The fixed epilogue for the program's target: the native `fn main`, or the
 /// wasm-bindgen entry.
+///
+/// The `ipe test` runner's `fn main` opens with [`test_run_key_statement`];
+/// every other crate's epilogue is the fixed one.
 fn epilogue_for_target(ctx: &EmitCtx) -> DResult<String> {
+    let is_test = matches!(ctx.crate_name, crate::CrateName::Test);
     match ctx.target {
+        ipe_ir::Target::Native | ipe_ir::Target::WasmWasi if is_test => {
+            let fixed = epilogue()?;
+            let opened = format!("{NATIVE_MAIN_ANCHOR}{}", test_run_key_statement());
+            let keyed = fixed.replacen(NATIVE_MAIN_ANCHOR, &opened, 1);
+            if keyed == fixed {
+                return Err(Diagnostic::CompilerBug {
+                    where_: "ipe_backend_rust::project::epilogue_for_target",
+                    detail: format!(
+                        "test-runner key: anchor {NATIVE_MAIN_ANCHOR:?} not found in the \
+                         native epilogue"
+                    ),
+                });
+            }
+            Ok(keyed)
+        }
         ipe_ir::Target::Native | ipe_ir::Target::WasmWasi => epilogue(),
+        ipe_ir::Target::WasmClient if is_test => Err(Diagnostic::CompilerBug {
+            where_: "ipe_backend_rust::project::epilogue_for_target",
+            detail: "the `ipe test` runner has no wasm-client entry".to_owned(),
+        }),
         ipe_ir::Target::WasmClient => epilogue_wasm(ctx),
     }
 }
