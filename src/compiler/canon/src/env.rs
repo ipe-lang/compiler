@@ -15,6 +15,7 @@ use ipe_kernels::{
     KernelHome, KernelTypeAlias, RowTailShape, StdlibKernel, TyShape,
 };
 
+use crate::name_index::BinderSite;
 use crate::resolve::{ModuleOrigin, QualifierForm, import_qualifier_forms};
 use crate::scope::{ExprTarget, Identity, ModuleScope, Origin, Tier, ValueIdentity};
 
@@ -1084,13 +1085,13 @@ pub struct Env {
     /// The module being canonicalised.
     pub home: Vec<Symbol>,
     /// The lexical binders in scope (function parameters, `let` and `case`
-    /// bindings), each [`VarHome::Local`].
+    /// bindings), each with the site that introduced it.
     ///
     /// The one genuinely scope-local table: it stays owned so a per-scope
     /// `env.clone()` copies only the current binders. Every other table below
     /// is set up once and sits behind an `Rc`, so the per-scope clone is a
     /// refcount bump. A lexical binder shadows every module-level name.
-    pub vars: BTreeMap<Symbol, VarHome>,
+    pub locals: BTreeMap<Symbol, BinderSite>,
     /// Every bare module-level name, in its two namespaces, each bound and read
     /// through the one ladder in [`crate::scope`].
     ///
@@ -2359,15 +2360,15 @@ impl Env {
         Ok(())
     }
 
-    /// Bind a name as a local (function parameter / `case` binding).
-    pub fn add_local(&mut self, name: Symbol) {
-        self.vars.insert(name, VarHome::Local);
+    /// Bind a name as a local introduced at `site`.
+    pub fn add_local(&mut self, name: Symbol, site: BinderSite) {
+        self.locals.insert(name, site);
     }
 
-    /// Look up an unqualified variable.
+    /// The site of the lexical binder `name` names, when one is in scope.
     #[must_use]
-    pub fn lookup_var(&self, name: Symbol) -> Option<&VarHome> {
-        self.vars.get(&name)
+    pub fn lookup_local(&self, name: Symbol) -> Option<BinderSite> {
+        self.locals.get(&name).copied()
     }
 
     /// Look up a qualified variable (`Qualifier.name`).

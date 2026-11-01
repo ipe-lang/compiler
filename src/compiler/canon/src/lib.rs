@@ -16,6 +16,7 @@ pub mod decoder_pipeline_gate;
 mod env;
 pub mod link;
 pub mod module_classify;
+pub mod name_index;
 pub mod reach;
 pub mod ref_index;
 pub mod rename;
@@ -221,6 +222,25 @@ pub fn canonicalise_module_in_project(
     interner: &mut Interner,
 ) -> DResult<(ast::Module, ModuleExports)> {
     resolve::canonicalise_module_in_project(m, expected_path, deps, catalog, origin, interner)
+}
+
+/// Canonicalise a module like [`canonicalise_module_in_project`], also returning its name index.
+///
+/// The [`name_index::NameIndex`] maps every name occurrence the resolver
+/// resolved to its target, recorded by the same pass that builds the module,
+/// so the module is byte-identical to the one the unindexed entry returns.
+///
+/// # Errors
+/// Same set as [`canonicalise_module_in_project`].
+pub fn canonicalise_module_indexed(
+    m: &ipe_syntax::Module,
+    expected_path: &[Symbol],
+    deps: &BTreeMap<Vec<Symbol>, &ModuleExports>,
+    catalog: &ModuleCatalog,
+    origin: ModuleOrigin,
+    interner: &mut Interner,
+) -> DResult<(ast::Module, ModuleExports, name_index::NameIndex)> {
+    resolve::canonicalise_module_indexed(m, expected_path, deps, catalog, origin, interner)
 }
 
 #[cfg(test)]

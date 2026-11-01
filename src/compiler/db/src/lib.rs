@@ -413,14 +413,18 @@ pub fn resolve_imports(db: &dyn Db, root: SourceRoot, file: SourceFile) -> Impor
     Ok(Arc::new(resolutions))
 }
 
-/// The output of canonicalising one module: the name-resolved AST plus its
-/// export surface.
+/// The output of canonicalising one module: the AST, exports and name index.
+///
+/// The name index is module-local: it is not part of the export surface, so
+/// [`module_interface`] never carries it to an importer.
 #[derive(Clone, PartialEq, Debug)]
 pub struct CanonicalModule {
     /// The name-resolved module.
     pub module: ipe_canon::ast::Module,
     /// The module's cross-module-observable export surface.
     pub exports: ModuleExports,
+    /// Every name occurrence the resolver resolved, by source span.
+    pub names: ipe_canon::name_index::NameIndex,
 }
 
 /// The memoized result of canonicalising one module.
@@ -519,7 +523,7 @@ pub fn canonicalize(db: &dyn Db, root: SourceRoot, file: SourceFile) -> CanonRes
             .collect::<Result<_, _>>()?;
         deps.insert(key, interface.as_ref());
     }
-    let (module, exports) = ipe_canon::canonicalise_module_in_project(
+    let (module, exports, names) = ipe_canon::canonicalise_module_indexed(
         &parsed,
         &expected_path,
         &deps,
@@ -527,7 +531,11 @@ pub fn canonicalize(db: &dyn Db, root: SourceRoot, file: SourceFile) -> CanonRes
         *origin,
         &mut interner,
     )?;
-    Ok(Arc::new(CanonicalModule { module, exports }))
+    Ok(Arc::new(CanonicalModule {
+        module,
+        exports,
+        names,
+    }))
 }
 
 /// The cross-module interface of one module — its export surface, projected

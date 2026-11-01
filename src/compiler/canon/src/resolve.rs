@@ -26,6 +26,7 @@ use crate::env::{
     AbsentQualifier, ClaimForm, CmdOrSub, CtorHome, CtorIdentity, Env, ImportAliases, KernelModule,
     KernelTypeExport, ModuleIdentity, QualifierClaim, TeaShape, VarHome,
 };
+use crate::name_index::{BinderSite, DeclHome, NameIndex, NameSink, Target};
 use crate::scope::{
     AliasBody, BoundBuiltin, Clash, ExprTarget, Identity, ModuleScope, Origin, QualifiedType,
     Resolved, Tier, TypeTarget as ScopeType, ValueIdentity,
@@ -33,6 +34,17 @@ use crate::scope::{
 use ctor_clause::{
     CtorFilter, CtorOffer, JudgedCtors, Withheld, exposed_ctor_filter, judge_ctor_clause,
 };
+
+/// What expression resolution writes to: the interner and the name sink.
+///
+/// Every resolution point records the occurrence it resolved into `names` as
+/// it resolves it, so the index and the canonical module come from one pass.
+struct ResolveCx<'a> {
+    /// The build's symbol table.
+    interner: &'a mut Interner,
+    /// The recorder of every resolved name occurrence.
+    names: &'a mut NameSink,
+}
 
 /// The most `did you mean` names attached to an unresolved name, so a wall of
 /// near-misses never drowns the actual error.
@@ -465,6 +477,7 @@ pub fn canonicalise(m: &src::Module, interner: &mut Interner) -> DResult<canon::
         &QualifiedAliases::new(),
         ModuleOrigin::User,
         interner,
+        &mut NameSink::new(),
     )
     .map(|(canon_mod, _kernel_aliases, _own_aliases)| canon_mod)
 }
@@ -559,7 +572,6 @@ fn origin_owns_reserved_prefix(origin: ModuleOrigin, prefix: &str) -> bool {
     }
 }
 
-#[allow(clippy::too_many_lines)] // one linear resolution pass over a module's declarations
 pub fn canonicalise_module_in_project(
     m: &src::Module,
     expected_path: &[Symbol],
@@ -568,6 +580,26 @@ pub fn canonicalise_module_in_project(
     origin: ModuleOrigin,
     interner: &mut Interner,
 ) -> DResult<(canon::Module, crate::ModuleExports)> {
+    canonicalise_module_indexed(m, expected_path, deps, catalog, origin, interner)
+        .map(|(canon_mod, exports, _names)| (canon_mod, exports))
+}
+
+/// Canonicalise a module in a project, with the index of every name it resolved.
+///
+/// Identical to [`canonicalise_module_in_project`]; the [`NameIndex`] is
+/// recorded by the same resolution pass that builds the module.
+///
+/// # Errors
+/// Same set as [`canonicalise_module_in_project`].
+#[allow(clippy::too_many_lines)] // one linear resolution pass over a module's declarations
+pub fn canonicalise_module_indexed(
+    m: &src::Module,
+    expected_path: &[Symbol],
+    deps: &BTreeMap<Vec<Symbol>, &crate::ModuleExports>,
+    catalog: &crate::ModuleCatalog,
+    origin: ModuleOrigin,
+    interner: &mut Interner,
+) -> DResult<(canon::Module, crate::ModuleExports, NameIndex)> {
     let home = m.name.value.clone();
 
     // IPE-N0023: declared module name must match the path the build driver
@@ -774,8 +806,15 @@ pub fn canonicalise_module_in_project(
         }
     }
 
-    let (mut canon_mod, kernel_aliases, own_aliases) =
-        canonicalise_with_env(m, &mut env, &qualified_aliases, origin, interner)?;
+    let mut names = NameSink::new();
+    let (mut canon_mod, kernel_aliases, own_aliases) = canonicalise_with_env(
+        m,
+        &mut env,
+        &qualified_aliases,
+        origin,
+        interner,
+        &mut names,
+    )?;
     // The record-alias auto-constructors that were actually synthesized:
     // exactly the defs whose name is an alias name. A function-field alias is
     // gated out of synthesis, so it is absent here and must NOT be exported as a
@@ -845,7 +884,7 @@ pub fn canonicalise_module_in_project(
         thread_config_binding(&mut canon_mod, interner)?;
     }
 
-    Ok((canon_mod, exports))
+    Ok((canon_mod, exports, names.finish()))
 }
 
 /// The reserved name of the app's cross-cutting settings binding — a top-level
@@ -2782,6 +2821,7 @@ fn canonicalise_with_env(
     qualified_aliases: &QualifiedAliases,
     origin: ModuleOrigin,
     interner: &mut Interner,
+    names: &mut NameSink,
 ) -> DResult<CanonicalisedModule> {
     let home = env.home.clone();
 
@@ -2948,6 +2988,7 @@ fn canonicalise_with_env(
     // it lowers as its kernel at every call site — so it is skipped here, exactly
     // as a kernel-qualifier member is never a compiled def.
     let mut defs = Vec::with_capacity(m.values.len() + synth_ctor_defs.len());
+    let mut cx = ResolveCx { interner, names };
     for v in &m.values {
         if kernel_aliases.contains_key(&v.value.name.value) {
             continue;
@@ -2956,7 +2997,7 @@ fn canonicalise_with_env(
             &v.value,
             env,
             qualified_aliases,
-            interner,
+            &mut cx,
         )?);
     }
     // The synthesized constructor defs are already fully canonical.
@@ -5185,29 +5226,30 @@ fn canonicalise_value(
     val: &src::Value,
     env: &Env,
     qualified_aliases: &QualifiedAliases,
-    interner: &mut Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<canon::Def> {
     // The reserved `CustomElement.fromFile "<js-path>"` constructor is recognised BEFORE
     // the body is canonicalised: its qualified head is otherwise an unknown member,
     // and only this position (the whole body of a `CustomElement`-annotated
     // binding) is legal. A malformed use fails closed here (IPE-N0044); any other
     // appearance of the qualified name is rejected downstream by `resolve_qual_var`.
-    if let Some(def) = detect_custom_element_constructor(val, env, qualified_aliases, interner)? {
+    if let Some(def) = detect_custom_element_constructor(val, env, qualified_aliases, cx.interner)?
+    {
         return Ok(def);
     }
 
     // Add parameter-bound names to a body-local environment.
     let mut body_env = env.clone();
     for p in &val.patterns {
-        bind_pattern_names(&p.value, &mut body_env);
+        bind_pattern_names(p, &mut body_env, cx.names);
     }
 
     let mut patterns = Vec::with_capacity(val.patterns.len());
     for p in &val.patterns {
-        reject_duplicate_pattern_binders(p, interner)?;
-        patterns.push(canonicalise_pattern(p, env, interner)?);
+        reject_duplicate_pattern_binders(p, cx.interner)?;
+        patterns.push(canonicalise_pattern(p, env, cx)?);
     }
-    let body = canonicalise_expr(&val.body, &body_env, interner)?;
+    let body = canonicalise_expr(&val.body, &body_env, cx)?;
 
     match &val.type_annotation {
         None => Ok(canon::Def::Untyped {
@@ -5222,7 +5264,7 @@ fn canonicalise_value(
             let ctx = TypeCtx {
                 env,
                 qualified_aliases,
-                interner,
+                interner: cx.interner,
                 ann_span: ann.span,
             };
             let no_params = ParamSlots::empty();
@@ -5242,7 +5284,7 @@ fn canonicalise_value(
             // must yield the same `free_vars` regardless of how the interner
             // happened to number the names.
             let mut free_vars: Vec<Symbol> = free_vars.into_iter().collect();
-            free_vars.sort_by(|a, b| interner.resolve(*a).cmp(&interner.resolve(*b)));
+            free_vars.sort_by(|a, b| cx.interner.resolve(*a).cmp(&cx.interner.resolve(*b)));
             Ok(canon::Def::Typed {
                 home: env.home.clone(),
                 name: val.name,
@@ -5255,9 +5297,30 @@ fn canonicalise_value(
     }
 }
 
-/// Bind every variable a pattern introduces as a local in the environment.
-fn bind_pattern_names(p: &src::Pattern_, env: &mut Env) {
-    match p {
+/// Bind every variable a pattern introduces as a local, recording each binder.
+///
+/// Each binder is recorded at its own span as the site that introduced it. An
+/// or-pattern binds its first alternative's names; the same name in every
+/// other alternative is recorded as an occurrence of that first binder.
+fn bind_pattern_names(p: &src::Pattern, env: &mut Env, names: &mut NameSink) {
+    visit_binders(p, true, &mut |name, span, binds| {
+        if binds {
+            let site = BinderSite::of(span);
+            env.add_local(name, site);
+            names.record(span, Target::Local(site));
+        } else if let Some(site) = env.lookup_local(name) {
+            names.record(span, Target::Local(site));
+        }
+    });
+}
+
+/// Visit every binder of a pattern with its name, its span, and whether it binds.
+///
+/// A binder binds when `binds` holds and it lies outside every non-first
+/// or-pattern alternative; the binders of a later alternative are visited
+/// after the first alternative's, with `binds` false.
+fn visit_binders<F: FnMut(Symbol, Span, bool)>(p: &src::Pattern, binds: bool, visit: &mut F) {
+    match &p.value {
         // The wildcard, the dev-only `Debug._` catch-all, the unit pattern, and
         // the literal leaves all bind nothing.
         src::Pattern_::PAnything
@@ -5267,39 +5330,43 @@ fn bind_pattern_names(p: &src::Pattern_, env: &mut Env) {
         | src::Pattern_::PBool(_)
         | src::Pattern_::PChar(_)
         | src::Pattern_::PStr(_) => {}
-        src::Pattern_::PVar(name) => env.add_local(*name),
+        src::Pattern_::PVar(name) => visit(*name, p.span, binds),
         src::Pattern_::PCtor(_, _, args) => {
             for a in args {
-                bind_pattern_names(&a.value, env);
+                visit_binders(a, binds, visit);
             }
         }
         // A tuple and a list pattern both bind every element's names.
         src::Pattern_::PTuple(elems) | src::Pattern_::PList(elems) => {
             for e in elems {
-                bind_pattern_names(&e.value, env);
+                visit_binders(e, binds, visit);
             }
         }
         src::Pattern_::PRecord(fields) => {
             // Field-pun: each field name binds a local of the same name.
             for f in fields {
-                env.add_local(f.value);
+                visit(f.value, f.span, binds);
             }
         }
         src::Pattern_::PAlias(inner, name) => {
             // The alias binds its name AND every name its inner pattern binds.
-            bind_pattern_names(&inner.value, env);
-            env.add_local(name.value);
+            visit_binders(inner, binds, visit);
+            visit(name.value, name.span, binds);
         }
         src::Pattern_::PCons(head, tail) => {
-            bind_pattern_names(&head.value, env);
-            bind_pattern_names(&tail.value, env);
+            visit_binders(head, binds, visit);
+            visit_binders(tail, binds, visit);
         }
         src::Pattern_::POr(alts) => {
             // Every alternative binds the identical name set (proved in
-            // `canonicalise_pattern`), so binding the FIRST alternative's names
-            // introduces the whole or-pattern's common binder set exactly once.
-            if let Some(first) = alts.first() {
-                bind_pattern_names(&first.value, env);
+            // `canonicalise_pattern`), so the FIRST alternative introduces the
+            // whole or-pattern's common binder set exactly once.
+            let mut rest = alts.iter();
+            if let Some(first) = rest.next() {
+                visit_binders(first, binds, visit);
+            }
+            for alt in rest {
+                visit_binders(alt, false, visit);
             }
         }
     }
@@ -5448,7 +5515,7 @@ fn resolve_pattern_ctor<'e>(
     unqualified: bool,
     span: Span,
     env: &'e Env,
-    interner: &Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<&'e CtorHome> {
     match env.module_scope.expr.resolve(name) {
         Resolved::Found(
@@ -5459,15 +5526,15 @@ fn resolve_pattern_ctor<'e>(
             _,
         ) => Ok(ctor),
         Resolved::Ambiguous { importers } => {
-            let modules = importer_names(&importers, interner);
-            Err(ambiguous_import(name, span, modules, interner)?)
+            let modules = importer_names(&importers, cx.interner);
+            Err(ambiguous_import(name, span, modules, cx.interner)?)
         }
         Resolved::Found(..) | Resolved::Missing => Err(ctor_pattern_not_found(
             name,
             unqualified,
             span,
             env,
-            interner,
+            cx.interner,
         )?),
     }
 }
@@ -5476,7 +5543,7 @@ fn resolve_pattern_ctor<'e>(
 fn canonicalise_pattern(
     p: &src::Pattern,
     env: &Env,
-    interner: &Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<canon::Pattern> {
     let span = p.span;
     let node = match &p.value {
@@ -5485,13 +5552,14 @@ fn canonicalise_pattern(
         src::Pattern_::PUnit => canon::Pattern_::PUnit,
         src::Pattern_::PVar(name) => canon::Pattern_::PVar(*name),
         src::Pattern_::PCtor(name, segments, args) => {
-            let ctor = resolve_pattern_ctor(*name, segments.is_empty(), span, env, interner)?;
+            let ctor = resolve_pattern_ctor(*name, segments.is_empty(), span, env, cx)?;
+            cx.names.record(span, ctor_target(ctor));
             let home = ctor.home.clone();
             let type_name = ctor.type_name;
             let index = ctor.index;
             let mut can_args = Vec::with_capacity(args.len());
             for a in args {
-                can_args.push(canonicalise_pattern(a, env, interner)?);
+                can_args.push(canonicalise_pattern(a, env, cx)?);
             }
             canon::Pattern_::PCtor {
                 home,
@@ -5504,7 +5572,7 @@ fn canonicalise_pattern(
         src::Pattern_::PTuple(elems) => {
             let mut can_elems = Vec::with_capacity(elems.len());
             for e in elems {
-                can_elems.push(canonicalise_pattern(e, env, interner)?);
+                can_elems.push(canonicalise_pattern(e, env, cx)?);
             }
             canon::Pattern_::PTuple(can_elems)
         }
@@ -5518,19 +5586,19 @@ fn canonicalise_pattern(
         src::Pattern_::PChar(c) => canon::Pattern_::PChar(c.clone()),
         src::Pattern_::PStr(s) => canon::Pattern_::PStr(s.clone()),
         src::Pattern_::PAlias(inner, name) => {
-            let can_inner = canonicalise_pattern(inner, env, interner)?;
+            let can_inner = canonicalise_pattern(inner, env, cx)?;
             canon::Pattern_::PAlias(Box::new(can_inner), *name)
         }
         src::Pattern_::PList(elems) => {
             let mut can_elems = Vec::with_capacity(elems.len());
             for e in elems {
-                can_elems.push(canonicalise_pattern(e, env, interner)?);
+                can_elems.push(canonicalise_pattern(e, env, cx)?);
             }
             canon::Pattern_::PList(can_elems)
         }
         src::Pattern_::PCons(head, tail) => {
-            let can_head = canonicalise_pattern(head, env, interner)?;
-            let can_tail = canonicalise_pattern(tail, env, interner)?;
+            let can_head = canonicalise_pattern(head, env, cx)?;
+            let can_tail = canonicalise_pattern(tail, env, cx)?;
             canon::Pattern_::PCons(Box::new(can_head), Box::new(can_tail))
         }
         src::Pattern_::POr(alts) => {
@@ -5557,7 +5625,7 @@ fn canonicalise_pattern(
                         reference
                             .symmetric_difference(&this)
                             .copied()
-                            .map(|sym| name_str(interner, sym)),
+                            .map(|sym| name_str(cx.interner, sym)),
                     )?;
                     return Err(Diagnostic::Type {
                         span: alt.span,
@@ -5567,7 +5635,7 @@ fn canonicalise_pattern(
             }
             let mut can_alts = Vec::with_capacity(alts.len());
             for alt in alts {
-                can_alts.push(canonicalise_pattern(alt, env, interner)?);
+                can_alts.push(canonicalise_pattern(alt, env, cx)?);
             }
             canon::Pattern_::POr(can_alts)
         }
@@ -5577,7 +5645,7 @@ fn canonicalise_pattern(
 
 /// Canonicalise an expression, resolving every name.
 #[allow(clippy::too_many_lines)] // one arm per source expression form
-fn canonicalise_expr(e: &src::Expr, env: &Env, interner: &mut Interner) -> DResult<canon::Expr> {
+fn canonicalise_expr(e: &src::Expr, env: &Env, cx: &mut ResolveCx<'_>) -> DResult<canon::Expr> {
     let span = e.span;
     let node = match &e.value {
         src::Expr_::Int(n) => canon::Expr_::Int(*n),
@@ -5586,40 +5654,38 @@ fn canonicalise_expr(e: &src::Expr, env: &Env, interner: &mut Interner) -> DResu
         // Triple-quoted strings: desugar `{{expr}}` interpolation into a `++`
         // chain at canonicalise time. Mirrors `Ipe.Canonicalise.Expression.hs`
         // line 42 (`Src.MultilineStr s -> desugarMultiline env s`).
-        src::Expr_::MultilineStr { raw, anchor } => {
-            desugar_multiline(raw, *anchor, span, env, interner)?
-        }
+        src::Expr_::MultilineStr { raw, anchor } => desugar_multiline(raw, *anchor, span, env, cx)?,
         src::Expr_::Char(c) => canon::Expr_::Char(c.clone()),
         src::Expr_::Unit => canon::Expr_::Unit,
-        src::Expr_::VarLocal(name) => resolve_var(*name, span, env, interner)?,
-        src::Expr_::VarQual(qual, name) => resolve_qual_var(*qual, *name, span, env, interner)?,
-        src::Expr_::TaskAndThen => resolve_task_and_then(span, env, interner)?,
+        src::Expr_::VarLocal(name) => resolve_var(*name, span, env, cx)?,
+        src::Expr_::VarQual(qual, name) => resolve_qual_var(*qual, *name, span, env, cx)?,
+        src::Expr_::TaskAndThen => resolve_task_and_then(span, env, cx.interner)?,
         src::Expr_::Call(f, args) => {
-            if let Some(node) = canonicalise_foreign_call(f, args, span, env, interner)? {
+            if let Some(node) = canonicalise_foreign_call(f, args, span, env, cx)? {
                 node
-            } else if let Some(node) = canonicalise_asserted_call(f, args, span, env, interner)? {
+            } else if let Some(node) = canonicalise_asserted_call(f, args, span, env, cx)? {
                 node
-            } else if let Some(node) = canonicalise_codec_auto(f, args, span, env, interner)? {
+            } else if let Some(node) = canonicalise_codec_auto(f, args, span, env, cx.interner)? {
                 node
             } else {
-                let callee = canonicalise_expr(f, env, interner)?;
+                let callee = canonicalise_expr(f, env, cx)?;
                 let mut can_args = Vec::with_capacity(args.len());
                 for a in args {
-                    can_args.push(canonicalise_expr(a, env, interner)?);
+                    can_args.push(canonicalise_expr(a, env, cx)?);
                 }
                 canon::Expr_::Call(Box::new(callee), can_args)
             }
         }
         src::Expr_::Case(scrut, arms) => {
-            let can_scrut = canonicalise_expr(scrut, env, interner)?;
+            let can_scrut = canonicalise_expr(scrut, env, cx)?;
             let mut branches = Vec::with_capacity(arms.len());
             for (pat, body) in arms {
                 // Pattern-bound names are local in the arm body.
                 let mut arm_env = env.clone();
-                bind_pattern_names(&pat.value, &mut arm_env);
-                reject_duplicate_pattern_binders(pat, interner)?;
-                let can_pat = canonicalise_pattern(pat, env, interner)?;
-                let can_body = canonicalise_expr(body, &arm_env, interner)?;
+                bind_pattern_names(pat, &mut arm_env, cx.names);
+                reject_duplicate_pattern_binders(pat, cx.interner)?;
+                let can_pat = canonicalise_pattern(pat, env, cx)?;
+                let can_body = canonicalise_expr(body, &arm_env, cx)?;
                 branches.push(canon::CaseBranch {
                     pat: can_pat,
                     body: can_body,
@@ -5637,14 +5703,14 @@ fn canonicalise_expr(e: &src::Expr, env: &Env, interner: &mut Interner) -> DResu
             let mut body_env = env.clone();
             let mut can_params = Vec::with_capacity(params.len());
             for p in params {
-                reject_duplicate_pattern_binders(p, interner)?;
-                bind_pattern_names(&p.value, &mut body_env);
-                can_params.push(canonicalise_pattern(p, env, interner)?);
+                reject_duplicate_pattern_binders(p, cx.interner)?;
+                bind_pattern_names(p, &mut body_env, cx.names);
+                can_params.push(canonicalise_pattern(p, env, cx)?);
             }
-            let can_body = canonicalise_expr(body, &body_env, interner)?;
+            let can_body = canonicalise_expr(body, &body_env, cx)?;
             canon::Expr_::Lambda(can_params, Box::new(can_body))
         }
-        src::Expr_::Binops(pairs, final_) => canonicalise_binops(pairs, final_, env, interner)?,
+        src::Expr_::Binops(pairs, final_) => canonicalise_binops(pairs, final_, env, cx)?,
         src::Expr_::Let(bindings, body) => {
             // Sequential (`let*`) scoping: each binding's value is resolved
             // against the enclosing scope plus the bindings before it, then its
@@ -5655,22 +5721,22 @@ fn canonicalise_expr(e: &src::Expr, env: &Env, interner: &mut Interner) -> DResu
             let mut let_env = env.clone();
             let mut can_bindings = Vec::with_capacity(bindings.len());
             for b in bindings {
-                let can_body = canonicalise_expr(&b.body, &let_env, interner)?;
+                let can_body = canonicalise_expr(&b.body, &let_env, cx)?;
                 // The binder's value is resolved against the scope so far; then
                 // every variable it introduces (a plain name, or each leaf of a
                 // tuple / record destructure) becomes a local for the bindings
                 // that follow and the `in` body. The binder pattern itself is
                 // canonicalised against the enclosing env (consistent with how
                 // `case` arms and lambda parameters resolve their patterns).
-                reject_duplicate_pattern_binders(&b.pat, interner)?;
-                let can_pat = canonicalise_pattern(&b.pat, &let_env, interner)?;
-                bind_pattern_names(&b.pat.value, &mut let_env);
+                reject_duplicate_pattern_binders(&b.pat, cx.interner)?;
+                let can_pat = canonicalise_pattern(&b.pat, &let_env, cx)?;
+                bind_pattern_names(&b.pat, &mut let_env, cx.names);
                 can_bindings.push(canon::LetBinding {
                     pat: can_pat,
                     body: can_body,
                 });
             }
-            let can_in = canonicalise_expr(body, &let_env, interner)?;
+            let can_in = canonicalise_expr(body, &let_env, cx)?;
             canon::Expr_::Let(can_bindings, Box::new(can_in))
         }
         src::Expr_::If(branches, else_expr) => {
@@ -5678,11 +5744,11 @@ fn canonicalise_expr(e: &src::Expr, env: &Env, interner: &mut Interner) -> DResu
             // against the same enclosing scope.
             let mut can_branches = Vec::with_capacity(branches.len());
             for (cond, body) in branches {
-                let can_cond = canonicalise_expr(cond, env, interner)?;
-                let can_body = canonicalise_expr(body, env, interner)?;
+                let can_cond = canonicalise_expr(cond, env, cx)?;
+                let can_body = canonicalise_expr(body, env, cx)?;
                 can_branches.push((can_cond, can_body));
             }
-            let can_else = canonicalise_expr(else_expr, env, interner)?;
+            let can_else = canonicalise_expr(else_expr, env, cx)?;
             canon::Expr_::If(can_branches, Box::new(can_else))
         }
         src::Expr_::Tuple(elems) => {
@@ -5690,7 +5756,7 @@ fn canonicalise_expr(e: &src::Expr, env: &Env, interner: &mut Interner) -> DResu
             // same enclosing scope.
             let mut can_elems = Vec::with_capacity(elems.len());
             for elem in elems {
-                can_elems.push(canonicalise_expr(elem, env, interner)?);
+                can_elems.push(canonicalise_expr(elem, env, cx)?);
             }
             canon::Expr_::Tuple(can_elems)
         }
@@ -5699,7 +5765,7 @@ fn canonicalise_expr(e: &src::Expr, env: &Env, interner: &mut Interner) -> DResu
             // against the same enclosing scope.
             let mut can_elems = Vec::with_capacity(elems.len());
             for elem in elems {
-                can_elems.push(canonicalise_expr(elem, env, interner)?);
+                can_elems.push(canonicalise_expr(elem, env, cx)?);
             }
             canon::Expr_::List(can_elems)
         }
@@ -5707,12 +5773,12 @@ fn canonicalise_expr(e: &src::Expr, env: &Env, interner: &mut Interner) -> DResu
             // A record introduces no bindings: every field value resolves against
             // the same enclosing scope. The field names are labels, carried
             // unresolved; a duplicate is rejected (see `canonicalise_fields`).
-            canon::Expr_::Record(canonicalise_fields(fields, env, interner)?)
+            canon::Expr_::Record(canonicalise_fields(fields, env, cx)?)
         }
         src::Expr_::Access(record, field) => {
             // `record.field`: the record sub-expression resolves against the
             // enclosing scope; the field is a label carried through unresolved.
-            let can_record = canonicalise_expr(record, env, interner)?;
+            let can_record = canonicalise_expr(record, env, cx)?;
             canon::Expr_::Access(Box::new(can_record), field.value)
         }
         src::Expr_::Update(base, fields) => {
@@ -5721,9 +5787,9 @@ fn canonicalise_expr(e: &src::Expr, env: &Env, interner: &mut Interner) -> DResu
             // would be (an unknown name is the usual `ValueNotFound`). The updated
             // fields resolve the same way as a literal's, with the same
             // duplicate-field rejection.
-            let base_node = resolve_var(base.value, base.span, env, interner)?;
+            let base_node = resolve_var(base.value, base.span, env, cx)?;
             let can_base = Located::new(base.span, base_node);
-            let can_fields = canonicalise_fields(fields, env, interner)?;
+            let can_fields = canonicalise_fields(fields, env, cx)?;
             canon::Expr_::Update(Box::new(can_base), can_fields)
         }
     };
@@ -5740,7 +5806,7 @@ fn canonicalise_expr(e: &src::Expr, env: &Env, interner: &mut Interner) -> DResu
 fn canonicalise_fields(
     fields: &[(Located<Symbol>, src::Expr)],
     env: &Env,
-    interner: &mut Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<Vec<(Symbol, canon::Expr)>> {
     let mut seen: BTreeMap<Symbol, Span> = BTreeMap::new();
     let mut can_fields = Vec::with_capacity(fields.len());
@@ -5749,13 +5815,13 @@ fn canonicalise_fields(
             return Err(Diagnostic::Name {
                 span: name.span,
                 msg: NameError::DuplicateValue {
-                    name: name_str(interner, name.value)?,
+                    name: name_str(cx.interner, name.value)?,
                     first: *first,
                 },
             });
         }
         seen.insert(name.value, name.span);
-        let can_value = canonicalise_expr(value, env, interner)?;
+        let can_value = canonicalise_expr(value, env, cx)?;
         can_fields.push((name.value, can_value));
     }
     Ok(can_fields)
@@ -5768,21 +5834,118 @@ fn canonicalise_fields(
 /// # Errors
 /// [`NameError::AmbiguousImport`] for two open-import definitions no higher
 /// tier shadows; [`NameError::ValueNotFound`] when no tier binds the name.
-fn resolve_var(name: Symbol, span: Span, env: &Env, interner: &Interner) -> DResult<canon::Expr_> {
-    if let Some(home) = env.lookup_var(name) {
+fn resolve_var(
+    name: Symbol,
+    span: Span,
+    env: &Env,
+    cx: &mut ResolveCx<'_>,
+) -> DResult<canon::Expr_> {
+    if let Some(site) = env.lookup_local(name) {
         // A lexical binder shadows every module-level binding of its spelling.
-        return Ok(var_home_to_expr(name, home));
+        cx.names.record(span, Target::Local(site));
+        return Ok(canon::Expr_::VarLocal(name));
     }
     match env.module_scope.expr.resolve(name) {
-        Resolved::Found(origin, _) => Ok(match &origin.target {
-            ExprTarget::Ctor(ctor) => ctor_expr(ctor),
-            ExprTarget::Value(home) => var_home_to_expr(name, home),
+        Resolved::Found(origin, tier) => Ok(match &origin.target {
+            ExprTarget::Ctor(ctor) => {
+                cx.names.record(span, ctor_target(ctor));
+                ctor_expr(ctor)
+            }
+            ExprTarget::Value(home) => {
+                let declared_in = bare_declaring_module(origin, tier, env);
+                record_value(cx.names, span, name, home, declared_in);
+                var_home_to_expr(name, home)
+            }
         }),
         Resolved::Ambiguous { importers } => {
-            let modules = importer_names(&importers, interner);
-            Err(ambiguous_import(name, span, modules, interner)?)
+            let modules = importer_names(&importers, cx.interner);
+            Err(ambiguous_import(name, span, modules, cx.interner)?)
         }
-        Resolved::Missing => Err(value_not_found(name, span, env, interner)?),
+        Resolved::Missing => Err(value_not_found(name, span, env, cx.interner)?),
+    }
+}
+
+/// The module declaring the bare value `origin` binds, when it is an Ipê module.
+///
+/// A value of this module is declared here. An imported one is declared in the
+/// one source module it was imported from; a value two modules bring in, or one
+/// from a kernel module or the ambient prelude, has no single Ipê declaration.
+fn bare_declaring_module<'o>(
+    origin: &'o Origin<ExprTarget>,
+    tier: Tier,
+    env: &'o Env,
+) -> Option<&'o [Symbol]> {
+    match tier {
+        Tier::Local => Some(&env.home),
+        Tier::Explicit | Tier::Open => {
+            let mut importers = origin.importers.iter();
+            match (importers.next(), importers.next()) {
+                (Some(only), None)
+                    if env
+                        .import_scope
+                        .imported_modules
+                        .contains(&ModuleIdentity::Source(only.clone())) =>
+                {
+                    Some(only)
+                }
+                _ => None,
+            }
+        }
+        Tier::Ambient => None,
+    }
+}
+
+/// The source module a qualifier spelling resolves into, when it is an Ipê module.
+fn qualifier_declaring_module(qualifier: Symbol, env: &Env) -> Option<&[Symbol]> {
+    env.import_scope
+        .qualifier_owner
+        .get(&qualifier)
+        .and_then(|claim| match &claim.owner {
+            ModuleIdentity::Source(path) => Some(path.as_slice()),
+            ModuleIdentity::Kernel(_) => None,
+        })
+}
+
+/// Record the value occurrence at `span` resolving `name` to `home`.
+///
+/// `declared_in` is the Ipê module the occurrence reached the value through; a
+/// kernel takes it as the declaration of its alias. A module-level table never
+/// holds a lexical binder, so a [`VarHome::Local`] there carries no site and is
+/// not recorded.
+fn record_value(
+    names: &mut NameSink,
+    span: Span,
+    name: Symbol,
+    home: &VarHome,
+    declared_in: Option<&[Symbol]>,
+) {
+    let target = match home {
+        VarHome::Local => return,
+        VarHome::TopLevel(module) => Target::TopLevel {
+            home: module.clone(),
+            name,
+        },
+        VarHome::Kernel(id, _, _) => Target::Kernel {
+            id: Some(*id),
+            declared: declared_in.map(|module| DeclHome {
+                module: module.to_vec(),
+                name,
+            }),
+        },
+        VarHome::ReservedKernel { .. } => Target::Kernel {
+            id: None,
+            declared: None,
+        },
+    };
+    names.record(span, target);
+}
+
+/// The index target of a resolved constructor.
+fn ctor_target(ctor: &CtorHome) -> Target {
+    Target::Ctor {
+        home: ctor.home.clone(),
+        type_name: ctor.type_name,
+        name: ctor.name,
     }
 }
 
@@ -5841,7 +6004,7 @@ fn value_not_found(
                 suggestions(
                     name,
                     Shape::Flat,
-                    env.vars
+                    env.locals
                         .keys()
                         .copied()
                         .chain(env.module_scope.expr.names()),
@@ -6145,20 +6308,20 @@ fn resolve_qual_var(
     name: Symbol,
     span: Span,
     env: &Env,
-    interner: &Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<canon::Expr_> {
     // A bare reference to a reserved literal-only constructor (`Rust.Ffi.call`,
     // `CustomElement.fromFile`) has no value to denote — each is legal only fully
     // applied in a sanctioned position, so refuse it with a teachable diagnostic
     // rather than a no-such-member miss.
-    if let Some(diag) = reject_bare_reserved_constructor(qualifier, name, span, env, interner) {
+    if let Some(diag) = reject_bare_reserved_constructor(qualifier, name, span, env, cx.interner) {
         return Err(diag);
     }
     // Resolve the qualifier and member text once and reuse across the
     // removed-surface and negate gates below — the interner lookup is a Vec
     // index plus a content compare, and both symbols are consulted twice.
-    let qualifier_text = interner.resolve(qualifier);
-    let name_text = interner.resolve(name);
+    let qualifier_text = cx.interner.resolve(qualifier);
+    let name_text = cx.interner.resolve(name);
     // Removed-surface gate (IPE-N0036): bindings intentionally dropped from
     // the Ipê surface are intercepted here before any catalog lookup, so the
     // user gets a clear migration diagnostic rather than "no such member".
@@ -6198,6 +6361,13 @@ fn resolve_qual_var(
     // (Tier A) and is not otherwise a resolvable qualifier, so this is the sole
     // `Basics.member` spelling — no member table to consult.
     if qualifier_text == Some("Basics") && name_text == Some("negate") {
+        cx.names.record(
+            span,
+            Target::Kernel {
+                id: Some(StdlibKernel::BasicsNegate),
+                declared: None,
+            },
+        );
         return Ok(canon::Expr_::VarKernel {
             id: Some(StdlibKernel::BasicsNegate),
             module: qualifier,
@@ -6209,25 +6379,16 @@ fn resolve_qual_var(
     // classified once (IPE-N0027 / IPE-N0034 / IPE-N0004).
     let token = qualified_token(span, qualifier_text, name_text);
     let Some(members) = env.qual_members(qualifier) else {
-        return Err(absent_qualifier(qualifier, span, token, env, interner)?);
+        return Err(absent_qualifier(qualifier, span, token, env, cx.interner)?);
     };
     match members.get(&name) {
-        Some(VarHome::Kernel(id, m, f)) => Ok(canon::Expr_::VarKernel {
-            id: Some(*id),
-            module: *m,
-            name: *f,
-        }),
-        // Reachable-but-unbacked member: no registry id, IPE-L0108 at type-check.
-        Some(VarHome::ReservedKernel { module, name }) => Ok(canon::Expr_::VarKernel {
-            id: None,
-            module: *module,
-            name: *name,
-        }),
-        Some(VarHome::TopLevel(module)) => Ok(canon::Expr_::VarTopLevel {
-            module: module.clone(),
-            name,
-        }),
-        Some(VarHome::Local) => Ok(canon::Expr_::VarLocal(name)),
+        // A reachable-but-unbacked member lowers with no registry id: IPE-L0108
+        // at type-check.
+        Some(home) => {
+            let declared_in = qualifier_declaring_module(qualifier, env);
+            record_value(cx.names, span, name, home, declared_in);
+            Ok(var_home_to_expr(name, home))
+        }
         // The qualifier resolves via qual_vars but the member is not a value.
         // Check qual_ctors — needed for compiled-source ADT constructors accessed
         // as `Alias.CtorName` (e.g. `Money.USD`, `Money.EUR`).
@@ -6235,18 +6396,14 @@ fn resolve_qual_var(
             if let Some(ctor_map) = env.qual_ctors.get(&qualifier)
                 && let Some(ch) = ctor_map.get(&name)
             {
-                return Ok(canon::Expr_::VarCtor {
-                    home: ch.home.clone(),
-                    type_name: ch.type_name,
-                    name: ch.name,
-                    index: ch.index,
-                });
+                cx.names.record(span, ctor_target(ch));
+                return Ok(ctor_expr(ch));
             }
-            let member = name_str(interner, name)?;
+            let member = name_str(cx.interner, name)?;
             Err(Diagnostic::Name {
                 span,
                 msg: NameError::NoSuchMember {
-                    module: name_str(interner, qualifier)?,
+                    module: name_str(cx.interner, qualifier)?,
                     suggestions: Candidates::at(
                         token.and_then(|t| EditTarget::suffix(t, &member)),
                         suggestions(
@@ -6256,7 +6413,7 @@ fn resolve_qual_var(
                                 .keys()
                                 .chain(env.qual_ctors.get(&qualifier).iter().flat_map(|m| m.keys()))
                                 .copied(),
-                            interner,
+                            cx.interner,
                         ),
                     ),
                     member,
@@ -6288,29 +6445,29 @@ fn canonicalise_binops(
     pairs: &[(src::Expr, Located<Symbol>)],
     final_: &src::Expr,
     env: &Env,
-    interner: &mut Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<canon::Expr_> {
     // No operators: just the final operand.
     if pairs.is_empty() {
-        return Ok(canonicalise_expr(final_, env, interner)?.value);
+        return Ok(canonicalise_expr(final_, env, cx)?.value);
     }
 
-    let basics = interner.intern("Basics")?;
+    let basics = cx.interner.intern("Basics")?;
 
     // Canonicalise every operand once, left to right, into a front-poppable
     // queue; parse each operator into the closed set.
     let mut operands: VecDeque<canon::Expr> = VecDeque::with_capacity(pairs.len() + 1);
     let mut ops: VecDeque<Located<BinOp>> = VecDeque::with_capacity(pairs.len());
     for (operand, op) in pairs {
-        operands.push_back(canonicalise_expr(operand, env, interner)?);
-        let text = resolve_or_bug(interner, op.value, "ipe_canon::canonicalise_binops")?;
+        operands.push_back(canonicalise_expr(operand, env, cx)?);
+        let text = resolve_or_bug(cx.interner, op.value, "ipe_canon::canonicalise_binops")?;
         let bin_op = BinOp::from_text(text).ok_or_else(|| Diagnostic::CompilerBug {
             where_: "ipe_canon::canonicalise_binops",
             detail: format!("operator `{text}` is outside the closed operator set"),
         })?;
         ops.push_back(Located::new(op.span, bin_op));
     }
-    operands.push_back(canonicalise_expr(final_, env, interner)?);
+    operands.push_back(canonicalise_expr(final_, env, cx)?);
 
     let left = operands
         .pop_front()
@@ -6318,7 +6475,7 @@ fn canonicalise_binops(
             where_: "ipe_canon::canonicalise_binops",
             detail: "binop chain with operators but no operands".to_owned(),
         })?;
-    let tree = climb_binops(left, &mut operands, &mut ops, basics, env, interner)?;
+    let tree = climb_binops(left, &mut operands, &mut ops, basics, env, cx.interner)?;
     Ok(tree.value)
 }
 
@@ -6416,7 +6573,7 @@ impl SiteBinder {
 fn mint_site_binder(site: SiteBinder, env: &Env, interner: &mut Interner) -> DResult<Symbol> {
     let taken = |interner: &Interner, name: &str| {
         interner.lookup(name).is_some_and(|sym| {
-            env.vars.contains_key(&sym)
+            env.locals.contains_key(&sym)
                 || !matches!(env.module_scope.expr.resolve(sym), Resolved::Missing)
         })
     };
@@ -6425,7 +6582,7 @@ fn mint_site_binder(site: SiteBinder, env: &Env, interner: &mut Interner) -> DRe
         return interner.intern(&base);
     }
     let ceiling = env
-        .vars
+        .locals
         .len()
         .checked_add(env.module_scope.expr.names().count())
         .and_then(|n| n.checked_add(1))
@@ -7749,7 +7906,7 @@ fn canonicalise_foreign_call(
     args: &[src::Expr],
     span: Span,
     env: &Env,
-    interner: &mut Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<Option<canon::Expr_>> {
     if env.origin != ModuleOrigin::FfiInterface {
         return Ok(None);
@@ -7757,15 +7914,15 @@ fn canonicalise_foreign_call(
     let src::Expr_::VarQual(qualifier, member) = &callee.value else {
         return Ok(None);
     };
-    let ffi_sym = interner.intern("Ffi")?;
+    let ffi_sym = cx.interner.intern("Ffi")?;
     // The `asserted` spelling is matched by RESOLVE, not intern: interning a
     // symbol the module never spells would shift the deterministic interning
     // sequence (and with it, golden byte identity) for every pre-existing
     // FFI program. A module that does spell `Ffi.asserted` interned the word
     // at parse, so resolve finds it.
-    let binding_sym = interner.intern("binding")?;
+    let binding_sym = cx.interner.intern("binding")?;
     let member_is_binding = *member == binding_sym;
-    let asserted = interner.resolve(*member) == Some("asserted");
+    let asserted = cx.interner.resolve(*member) == Some("asserted");
     if *qualifier != ffi_sym || (!member_is_binding && !asserted) {
         return Ok(None);
     }
@@ -7793,10 +7950,10 @@ fn canonicalise_foreign_call(
     }
     let mut can_args = Vec::with_capacity(value_args.len());
     for a in value_args {
-        can_args.push(canonicalise_expr(a, env, interner)?);
+        can_args.push(canonicalise_expr(a, env, cx)?);
     }
     Ok(Some(canon::Expr_::ForeignCall {
-        ident: interner.intern(ident)?,
+        ident: cx.interner.intern(ident)?,
         args: can_args,
         asserted,
     }))
@@ -7825,7 +7982,7 @@ fn canonicalise_asserted_call(
     args: &[src::Expr],
     span: Span,
     env: &Env,
-    interner: &mut Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<Option<canon::Expr_>> {
     if env.origin != ModuleOrigin::User {
         return Ok(None);
@@ -7835,7 +7992,7 @@ fn canonicalise_asserted_call(
     // would shift the deterministic interning sequence (golden byte identity).
     // A module that does spell `Rust.Ffi.call` / `Rust.fn` interned the
     // symbols at parse.
-    let Some(which) = crate::asserted::classify_asserted_callee(callee, interner) else {
+    let Some(which) = crate::asserted::classify_asserted_callee(callee, cx.interner) else {
         return Ok(None);
     };
     let malformed = |detail: String| Diagnostic::Name {
@@ -7875,18 +8032,18 @@ fn canonicalise_asserted_call(
         crate::asserted::AssertedCallee::RustConst => path.const_def_name(),
         _ => path.def_name(),
     };
-    let def_sym = interner.intern(&def_name)?;
+    let def_sym = cx.interner.intern(&def_name)?;
     // The generated module is imported as `import Rust.Ffi` (unaliased), which
     // registers it under its LAST path segment like every dep import — so the
     // rewritten reference resolves through the `Ffi` qualifier even though the
     // surface spelling is the full `Rust.Ffi.call`.
-    let ffi_qualifier = interner.intern("Ffi")?;
+    let ffi_qualifier = cx.interner.intern("Ffi")?;
     let raw_path = path.as_str().to_owned();
     // `Ffi` must denote the generated module itself: a spelling another import
     // owns (`import App.Shim as Ffi`) would otherwise answer the forwarder's
     // name with an ordinary definition of that module. Read by `lookup`, never
     // `intern`, for the interning-sequence reason above.
-    let rust = interner.lookup("Rust");
+    let rust = cx.interner.lookup("Rust");
     let foreign_ffi = env
         .import_scope
         .qualifier_owner
@@ -7904,7 +8061,7 @@ fn canonicalise_asserted_call(
              module, which no other import may spell `Ffi`"
         )));
     }
-    let target = resolve_qual_var(ffi_qualifier, def_sym, span, env, interner).map_err(|_| {
+    let target = resolve_qual_var(ffi_qualifier, def_sym, span, env, cx).map_err(|_| {
         malformed(format!(
             "no asserted binding exists for `{raw_path}` — a native binding needs \
              `import Rust.Ffi` (unaliased), the target crate installed via `ipe rust \
@@ -7925,7 +8082,7 @@ fn canonicalise_asserted_call(
     }
     let mut can_args = Vec::with_capacity(value_args.len());
     for a in value_args {
-        can_args.push(canonicalise_expr(a, env, interner)?);
+        can_args.push(canonicalise_expr(a, env, cx)?);
     }
     Ok(Some(canon::Expr_::Call(
         Box::new(ipe_diagnostics::Located::new(callee.span, target)),
@@ -8383,7 +8540,7 @@ const fn name_zero() -> Symbol {
 // Faithful Rust port of `Ipe.Canonicalise.Expression.desugarMultiline` /
 // `splitInterpolation` / `chunkToExpr` / `resolveInterpolationRef`.
 //
-// Entry point: `desugar_multiline(raw, span, env, interner)` — called from
+// Entry point: `desugar_multiline(raw, span, env, cx)` — called from
 // `canonicalise_expr` when it sees `src::Expr_::MultilineStr`.
 //
 // The raw string is split into alternating `Lit` / `Interp` chunks, each
@@ -8475,7 +8632,7 @@ fn chunk_to_expr(
     chunk: Chunk,
     span: Span,
     env: &Env,
-    interner: &mut Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<canon::Expr> {
     match chunk {
         Chunk::Lit(s) => Ok(Located::new(span, canon::Expr_::Str(s))),
@@ -8483,9 +8640,9 @@ fn chunk_to_expr(
             // Trim leading/trailing whitespace, matching the reference compiler
             // `dropWhile (== ' ') (reverse (dropWhile …))`.
             let trimmed = body.trim();
-            let resolved = resolve_interp_ref(trimmed, span, env, interner)?;
-            let mod_sym = interner.intern("_internal_")?;
-            let fn_sym = interner.intern("interpolate")?;
+            let resolved = resolve_interp_ref(trimmed, span, env, cx)?;
+            let mod_sym = cx.interner.intern("_internal_")?;
+            let fn_sym = cx.interner.intern("interpolate")?;
             let stringify = Located::new(
                 span,
                 canon::Expr_::VarKernel {
@@ -8517,22 +8674,22 @@ fn resolve_interp_ref(
     s: &str,
     span: Span,
     env: &Env,
-    interner: &mut Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<canon::Expr> {
     // Check for `func arg` (a single space separates them).
     if let Some(space_pos) = s.find(' ') {
         let func_str = &s[..space_pos];
         let arg_str = s[space_pos + 1..].trim();
         if !func_str.is_empty() && !arg_str.is_empty() {
-            let func_expr = resolve_interp_ref(func_str, span, env, interner)?;
-            let arg_expr = resolve_interp_ref(arg_str, span, env, interner)?;
+            let func_expr = resolve_interp_ref(func_str, span, env, cx)?;
+            let arg_expr = resolve_interp_ref(arg_str, span, env, cx)?;
             return Ok(Located::new(
                 span,
                 canon::Expr_::Call(Box::new(func_expr), vec![arg_expr]),
             ));
         }
     }
-    resolve_simple_interp_ref(s, span, env, interner)
+    resolve_simple_interp_ref(s, span, env, cx)
 }
 
 /// Resolve a qualified interpolation reference `Q.member` (`Q` may be dotted).
@@ -8551,7 +8708,7 @@ fn resolve_interp_qualified(
     s: &str,
     span: Span,
     env: &Env,
-    interner: &mut Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<canon::Expr> {
     let segments: Vec<&str> = s.split('.').collect();
     let qualifier_len = segments
@@ -8574,11 +8731,11 @@ fn resolve_interp_qualified(
             canon::Expr_::Str(format!("{{{{{s}}}}}")),
         ));
     }
-    let qualifier = interner.intern(&qualifier_segments.join("."))?;
-    let name = interner.intern(member)?;
+    let qualifier = cx.interner.intern(&qualifier_segments.join("."))?;
+    let name = cx.interner.intern(member)?;
     Ok(Located::new(
         span,
-        resolve_qual_var(qualifier, name, span, env, interner)?,
+        resolve_qual_var(qualifier, name, span, env, cx)?,
     ))
 }
 
@@ -8588,7 +8745,7 @@ fn resolve_simple_interp_ref(
     s: &str,
     span: Span,
     env: &Env,
-    interner: &mut Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<canon::Expr> {
     // Numeric literal. A body that begins with an ASCII digit can never be an
     // identifier (Ipê identifiers never start with a digit), so it is an
@@ -8635,15 +8792,15 @@ fn resolve_simple_interp_ref(
             ));
         }
         if first.starts_with(char::is_uppercase) {
-            return resolve_interp_qualified(s, span, env, interner);
+            return resolve_interp_qualified(s, span, env, cx);
         }
         // Lowercase `record.field` → `Access(record, field)`, the record read
         // through `resolve_var` exactly as a bare name is: a local stays
         // `VarLocal`, a top-level value is `VarTopLevel`, an unknown name is
         // IPE-N0001.
-        let rec_sym = interner.intern(first)?;
-        let field_sym = interner.intern(rest)?;
-        let record = resolve_var(rec_sym, span, env, interner)?;
+        let rec_sym = cx.interner.intern(first)?;
+        let field_sym = cx.interner.intern(rest)?;
+        let record = resolve_var(rec_sym, span, env, cx)?;
         return Ok(Located::new(
             span,
             canon::Expr_::Access(Box::new(Located::new(span, record)), field_sym),
@@ -8657,8 +8814,8 @@ fn resolve_simple_interp_ref(
     // interpolation. Emitting `VarLocal` for an unbound/unknown name would
     // leak it past canonicalisation and fire the `constrain` unbound-local
     // ICE, so every name this path emits as `VarLocal` is provably bound.
-    let sym = interner.intern(s)?;
-    Ok(Located::new(span, resolve_var(sym, span, env, interner)?))
+    let sym = cx.interner.intern(s)?;
+    Ok(Located::new(span, resolve_var(sym, span, env, cx)?))
 }
 
 /// Desugar a triple-quoted string into a balanced `++` tree of its chunks.
@@ -8669,7 +8826,7 @@ fn desugar_multiline(
     anchor: u32,
     span: Span,
     env: &Env,
-    interner: &mut Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<canon::Expr_> {
     // Strip the source indentation margin before splitting, so the runtime
     // value drops the leading whitespace the author used to lay the block out.
@@ -8682,15 +8839,15 @@ fn desugar_multiline(
     // Build one canonical expression per chunk.
     let mut parts: Vec<canon::Expr> = Vec::with_capacity(chunks.len());
     for chunk in chunks {
-        parts.push(chunk_to_expr(chunk, span, env, interner)?);
+        parts.push(chunk_to_expr(chunk, span, env, cx)?);
     }
     match parts.len() {
         0 => Ok(canon::Expr_::Str(String::new())),
         1 => Ok(parts.remove(0).value),
         _ => {
-            let op_sym = interner.intern("++")?;
-            let home_sym = interner.intern("Basics")?;
-            let func_sym = interner.intern("append")?;
+            let op_sym = cx.interner.intern("++")?;
+            let home_sym = cx.interner.intern("Basics")?;
+            let func_sym = cx.interner.intern("append")?;
             Ok(balanced_append(parts, op_sym, home_sym, func_sym)
                 .map_or_else(|| canon::Expr_::Str(String::new()), |joined| joined.value))
         }
