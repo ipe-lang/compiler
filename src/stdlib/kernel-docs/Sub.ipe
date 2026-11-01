@@ -1,0 +1,63 @@
+-- | Subscriptions: event sources a program listens to.
+--
+-- Every app shape exposes the same subscription set under its own module
+-- (`Ipe.Tea.Web.Sub`, `Ipe.Tea.Tui.Sub`, `Ipe.Tea.Cli.Sub`,
+-- `Ipe.Tea.Worker.Sub`); `Ipe.Tea.Tui.Sub` adds `onKey` and
+-- `Ipe.Tea.Cli.Sub` adds `onLine`. The runtime re-reads `subscriptions model`
+-- after every `update`, so a subscription is live exactly while the current
+-- model asks for it.
+module Sub exposing
+    ( none
+    , batch
+    , every
+    , map
+    , subscribeTopic
+    , subscribeWebSocket
+    )
+
+
+import Ipe.Ffi.Kernel as Kernel
+
+
+-- | The subscription that delivers nothing.
+none =
+    Kernel.kernel "Sub_none"
+
+
+-- | Listen to every subscription in the list at once.
+--
+-- `Sub.batch [ Sub.every 1000 Tick, onKey KeyPressed ]` delivers both the
+-- ticks and the keys.
+batch =
+    Kernel.kernel "Sub_batch"
+
+
+-- | Deliver `msg` every `ms` milliseconds.
+--
+-- `Sub.every 1000 Tick` sends `Tick` once a second. `Time.every` is the same
+-- subscription with a `Duration` interval.
+every =
+    Kernel.kernel "Sub_every"
+
+
+-- | Turn the messages a subscription delivers into another message type.
+--
+-- `Sub.map Child sub` wraps each message of `sub` in `Child`.
+map =
+    Kernel.kernel "Sub_map"
+
+
+-- | Receive every payload published to `topic`, turned into a message.
+--
+-- `Sub.subscribeTopic topic toMsg` calls `toMsg` on each payload a
+-- `Cmd.publish` or `Cmd.publishNoEcho` sends to `topic`.
+subscribeTopic =
+    Kernel.kernel "Sub_subscribeTopic"
+
+
+-- | The raw WebSocket event source that `Ipe.WebSocket` wraps.
+--
+-- Use `WebSocket.onOpen`, `onMessage`, `onClose`, and `onError` instead: they
+-- take a typed `WebSocket` and pick the event kind for you.
+subscribeWebSocket =
+    Kernel.kernel "Sub_subscribeWebSocket"

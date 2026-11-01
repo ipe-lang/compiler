@@ -94,9 +94,10 @@
 //!   (so they may declare the reserved `Ipe.*` namespace a user module may not); their
 //!   doc-comments are scanned from the embedded source.
 //! * **Kernel-qualifier** (`ipe_canon::STDLIB_MODULE_QUALIFIERS`): modules backed by the
-//!   kernel registry (e.g. `Ipe.List`, `Ipe.String`). Type signatures come from
-//!   [`ipe_types::KernelSchemeTable`]; doc-comments are absent (signatures
-//!   are the contract).
+//!   kernel registry (e.g. `Ipe.Http`, `Ipe.Tea.Tui.Sub`). A page lists the members
+//!   the resolver installs for an import of the module; type signatures come from
+//!   [`ipe_types::KernelSchemeTable`], comments from `ipe_stdlib::KERNEL_DOC_SOURCES`
+//!   and the kernel veneers in `ipe_stdlib::MODULES`.
 //!
 //! `ipe doc check` exempts stdlib modules from the coverage gate — signatures are
 //! sufficient; prose is optional for compiler-internal stdlib.
@@ -1677,11 +1678,7 @@ fn stdlib_module_names() -> Vec<String> {
         names.insert(segments.join("."));
     }
 
-    // `Ipe.Tea.Terminal` is superseded by `Ipe.Color`; suppress its module
-    // pages from the doc site so the reference tree does not expose a retired
-    // namespace.  The qualifier entries still exist in the compiler (they must, for
-    // backwards import compatibility), but they carry no user-visible doc page.
-    names.retain(|n| !n.starts_with("Ipe.Tea.Terminal"));
+    names.retain(|n| !is_retired_stdlib_module(n));
 
     names.into_iter().collect()
 }
@@ -1690,9 +1687,8 @@ fn stdlib_module_names() -> Vec<String> {
 ///
 /// Compiled-source modules are type-checked using the same pipeline as project
 /// modules (injecting each individually as a minimal package). Kernel-qualifier
-/// modules use [`ipe_types::KernelSchemeTable`] for type signatures;
-/// doc-comments are empty
-/// (signatures are the contract for kernel-backed stdlib).
+/// modules list the resolver's members with their
+/// [`ipe_types::KernelSchemeTable`] signatures ([`build_kernel_module_docs`]).
 ///
 /// # Errors
 /// [`CliError`] when a shipped compiled-source module cannot be documented or
@@ -1705,11 +1701,9 @@ fn build_stdlib_docs() -> Result<Vec<ModuleDoc>, CliError> {
     // declare the reserved `Ipe.*` namespace); signatures and unions come from the
     // type checker, doc-comments from the embedded source. A module that cannot
     // be documented refuses the whole build rather than shipping an empty page.
-    //
-    // `Ipe.Tea.Terminal` is superseded by `Ipe.Color`; its compiled-source
-    // modules are skipped so the doc site does not expose retired namespace pages.
+    // A retired module has no page.
     for csm in ipe_stdlib::COMPILED_STD_MODULES {
-        if csm.dotted.starts_with("Ipe.Tea.Terminal") {
+        if is_retired_stdlib_module(csm.dotted) {
             continue;
         }
         let segments: Vec<String> = csm.dotted.split('.').map(str::to_owned).collect();
@@ -1734,8 +1728,8 @@ fn build_stdlib_docs() -> Result<Vec<ModuleDoc>, CliError> {
     }
 
     // ── Kernel-qualifier stdlib modules ───────────────────────────────────────
-    // Signatures come from the kernel type-scheme table; doc-comments are absent for these
-    // compiler-internal modules (signatures are the contract).
+    // Members come from the resolver's export table, signatures from the kernel
+    // type-scheme table.
     for (name, doc) in build_kernel_module_docs()? {
         modules.entry(name).or_insert(doc);
     }
@@ -1981,6 +1975,14 @@ fn build_source_only_module_doc(segments: &[String], source: &str) -> ModuleDoc 
     }
 }
 
+/// Whether a stdlib module path is retired from the doc site.
+///
+/// `Ipe.Tea.Terminal` is superseded by `Ipe.Color`; the compiler still resolves
+/// its imports, but no doc page or module listing exposes the retired namespace.
+fn is_retired_stdlib_module(dotted: &str) -> bool {
+    dotted.starts_with("Ipe.Tea.Terminal")
+}
+
 /// The builtin row a kernel type scheme names `Error` by, found at compile time.
 const fn builtin_error_row(
     rows: &'static [ipe_kernels::BuiltinRow],
@@ -2098,13 +2100,18 @@ fn restore_task_error_channel(ty: TyDoc) -> TyDoc {
 /// `Ty::Con` naming a [`ipe_intern::Symbol`] `interner` never interned): the
 /// failure propagates rather than silently dropping the member, so a render
 /// failure never shrinks the page by one row.
-fn kernel_value_doc(name: &str, ty: &Ty, interner: &Interner) -> Result<ValueDoc, CliError> {
+fn kernel_value_doc(
+    name: &str,
+    ty: &Ty,
+    interner: &Interner,
+    comment: String,
+) -> Result<ValueDoc, CliError> {
     let mut namer = VarNamer::new();
     let ty_doc = ty_to_doc(ty, interner, &mut namer).map_err(|d| kernel_doc_error(&d))?;
     Ok(ValueDoc {
         name: name.to_owned(),
         signature: ValueSignature::Resolved(restore_task_error_channel(ty_doc)),
-        comment: String::new(),
+        comment,
     })
 }
 
@@ -2123,20 +2130,88 @@ fn kernel_pool_bug(module: &str, detail: &str) -> CliError {
     })
 }
 
-/// Build [`ModuleDoc`]s for every listed kernel-qualifier stdlib module.
+/// The prose `ipe doc` shows on kernel module pages, keyed by kernel qualifier.
+///
+/// Read from [`ipe_stdlib::KERNEL_DOC_SOURCES`] and the kernel veneers in
+/// [`ipe_stdlib::MODULES`]. Prose only annotates a member the import pool
+/// already lists; it never adds one.
+struct KernelProse {
+    by_qualifier: BTreeMap<&'static str, DocComments>,
+}
+
+impl KernelProse {
+    /// Scan every kernel prose source once.
+    fn load() -> Self {
+        let mut by_qualifier: BTreeMap<&'static str, DocComments> = BTreeMap::new();
+        for source in ipe_stdlib::KERNEL_DOC_SOURCES {
+            by_qualifier.insert(source.qualifier, scan_doc_comments(source.source));
+        }
+        for veneer in ipe_stdlib::MODULES {
+            let segments: Vec<&str> = veneer.name.split('.').collect();
+            if let Some(qualifier) = ipe_canon::stdlib_canonical_qualifier(&segments) {
+                by_qualifier
+                    .entry(qualifier)
+                    .or_insert_with(|| scan_doc_comments(veneer.source));
+            }
+        }
+        Self { by_qualifier }
+    }
+
+    /// The comment `qualifier`'s source gives `name`, if any.
+    fn binding(&self, qualifier: &str, name: &str) -> Option<&String> {
+        self.by_qualifier
+            .get(qualifier)
+            .and_then(|doc| doc.bindings.get(name))
+    }
+
+    /// The comment for the member `name` of the page whose canonical is `page`.
+    ///
+    /// The page's own source wins; otherwise the source of the kernel backing
+    /// the member, so a member a shape module re-exports carries its family's
+    /// comment.
+    fn member(&self, page: &str, name: &str, kernel: ipe_kernels::StdlibDecl) -> String {
+        self.binding(page, name)
+            .or_else(|| self.binding(kernel.qualifier, kernel.name))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The module comment for the page whose canonical is `page`.
+    ///
+    /// A shape-scoped `Cmd` / `Sub` page without its own header takes its
+    /// family's.
+    fn module(&self, page: &str) -> String {
+        let own = self
+            .by_qualifier
+            .get(page)
+            .map(|doc| doc.module.as_str())
+            .filter(|text| !text.is_empty());
+        let family = || {
+            ipe_canon::cmd_sub_module(page)
+                .and_then(|(_, family)| self.by_qualifier.get(family.qualifier()))
+                .map(|doc| doc.module.as_str())
+        };
+        own.or_else(family).unwrap_or_default().to_owned()
+    }
+}
+
+/// Build [`ModuleDoc`]s for every kernel-qualifier stdlib module.
 ///
 /// A page lists exactly the members `import <Module>` installs: the canonical
 /// resolver's kernel member pool ([`ipe_canon::Env::kernel_module`] /
 /// [`ipe_canon::Env::kernel_module_members`]) for each
-/// [`ipe_canon::STDLIB_MODULE_QUALIFIERS`] path [`stdlib_module_names`] lists.
-/// Aliases, cross-qualifier members and every shape's `Cmd`/`Sub` copies come
-/// from the same pool imports read, and a member relocated to an `Unsafe`
-/// module or kept private is absent from it, so no hand list decides a page.
+/// [`ipe_canon::STDLIB_MODULE_QUALIFIERS`] path [`is_retired_stdlib_module`]
+/// does not retire. Aliases, cross-qualifier members and every shape's
+/// `Cmd`/`Sub` copies come from the same pool imports read, and a member
+/// relocated to an `Unsafe` module or kept private is absent from it, so no
+/// hand list decides a page. A listed path keeps its page even when no member
+/// is callable, so every `ipe doc --list` line resolves.
 ///
 /// Each member's type is its kernel's row of the [`ipe_types::KernelSchemeTable`]
-/// (the table inference reads). A member with no callable scheme
-/// ([`ipe_types::KernelScheme::Unschemed`] or [`ipe_canon::VarHome::ReservedKernel`])
-/// is refused at every use with `IPE-L0108`, so it is not documented.
+/// (the table inference reads); its comment comes from [`KernelProse`]. A
+/// member with no callable scheme ([`ipe_types::KernelScheme::Unschemed`] or
+/// [`ipe_canon::VarHome::ReservedKernel`]) is refused at every use with
+/// `IPE-L0108`, so it is not documented.
 ///
 /// # Errors
 /// [`CliError::Usage`] when the resolver environment or kernel type table
@@ -2148,12 +2223,12 @@ fn build_kernel_module_docs() -> Result<BTreeMap<String, ModuleDoc>, CliError> {
     let env =
         ipe_canon::Env::initial(Vec::new(), &mut interner).map_err(|d| kernel_doc_error(&d))?;
     let table = ipe_types::kernel_type_table(&mut interner).map_err(|d| kernel_doc_error(&d))?;
-    let listed: BTreeSet<String> = stdlib_module_names().into_iter().collect();
+    let prose = KernelProse::load();
 
     let mut docs: BTreeMap<String, ModuleDoc> = BTreeMap::new();
-    for (segments, _canonical) in ipe_canon::STDLIB_MODULE_QUALIFIERS {
+    for (segments, canonical) in ipe_canon::STDLIB_MODULE_QUALIFIERS {
         let dotted = segments.join(".");
-        if !listed.contains(&dotted) {
+        if is_retired_stdlib_module(&dotted) {
             continue;
         }
         let path = segments
@@ -2176,7 +2251,8 @@ fn build_kernel_module_docs() -> Result<BTreeMap<String, ModuleDoc>, CliError> {
             match home {
                 ipe_canon::VarHome::Kernel(kernel, _, _) => match table.scheme(*kernel) {
                     Some(ipe_types::KernelScheme::Schemed(ty)) => {
-                        values.push(kernel_value_doc(name, ty, &interner)?);
+                        let comment = prose.member(canonical, name, kernel.decl());
+                        values.push(kernel_value_doc(name, ty, &interner, comment)?);
                     }
                     // Refused at every use (IPE-L0108): nothing callable to document.
                     Some(ipe_types::KernelScheme::Unschemed) => {}
@@ -2203,7 +2279,7 @@ fn build_kernel_module_docs() -> Result<BTreeMap<String, ModuleDoc>, CliError> {
             ModuleDoc {
                 name: dotted,
                 kind: ModuleKind::Stdlib,
-                comment: String::new(),
+                comment: prose.module(canonical),
                 unions: Vec::new(),
                 values,
             },
@@ -6128,12 +6204,12 @@ mod tests {
         // interner is asked to resolve has no backing string.
         let empty_interner = Interner::new();
 
-        let control = kernel_value_doc("member", &Ty::Unit, &empty_interner);
+        let control = kernel_value_doc("member", &Ty::Unit, &empty_interner, String::new());
         assert!(
             control.is_ok(),
             "control: a renderable type must page: {control:?}",
         );
-        let result = kernel_value_doc("member", &bad_ty, &empty_interner);
+        let result = kernel_value_doc("member", &bad_ty, &empty_interner, String::new());
         assert!(
             matches!(result, Err(CliError::Usage(_))),
             "a type that fails to render must surface as a typed CliError, not a silently \
@@ -6141,7 +6217,7 @@ mod tests {
         );
     }
 
-    // ── #3937: Task's error channel + one consistent `TyDoc::Con` naming ──────
+    // ── Task's error channel + one consistent `TyDoc::Con` naming ──────
 
     /// A one-arg builtin `Task a` (the checker's internal reduction of
     /// `Task Error a`) must come back out as the full two-arg `Task Error a` —
@@ -6443,7 +6519,14 @@ mod tests {
                 );
             }
         }
-        assert!(names("Ipe.Tea.Tui.Sub").contains("onKey"));
+        let tui_sub = names("Ipe.Tea.Tui.Sub");
+        for member in ["onKey", "every", "map"] {
+            assert!(
+                tui_sub.contains(member),
+                "Tui.Sub must list `{member}`: {tui_sub:?}"
+            );
+        }
+        assert!(names("Ipe.Tea.Cli.Sub").contains("onLine"));
         assert!(!names("Ipe.Tea.Web.Sub").contains("onKey"));
         assert!(
             docs.keys()
@@ -6467,6 +6550,131 @@ mod tests {
                 "Ipe.Tea.Web.PubSub must list `{member}`: {pubsub_names:?}"
             );
         }
+    }
+
+    /// The members the resolver installs for an import of `path`, keeping the
+    /// kernels a well-typed program can call.
+    fn resolver_callable_members(path: &[&str]) -> BTreeSet<String> {
+        let mut interner = Interner::new();
+        let table = ipe_types::kernel_type_table(&mut interner).expect("the kernel table builds");
+        let env =
+            ipe_canon::Env::initial(Vec::new(), &mut interner).expect("the initial env builds");
+        let segments: Vec<ipe_intern::Symbol> = path
+            .iter()
+            .map(|s| {
+                interner
+                    .intern(s)
+                    .expect("interning a fresh string must not fail")
+            })
+            .collect();
+        let Some(module) = env
+            .kernel_module(&segments, &mut interner)
+            .expect("kernel module lookup must not fail")
+        else {
+            return BTreeSet::new();
+        };
+        let (members, _ctors) = env.kernel_module_members(module);
+        members
+            .iter()
+            .filter(|(_, home)| match home {
+                ipe_canon::VarHome::Kernel(kernel, _, _) => matches!(
+                    table.scheme(*kernel),
+                    Some(ipe_types::KernelScheme::Schemed(_))
+                ),
+                ipe_canon::VarHome::ReservedKernel { .. }
+                | ipe_canon::VarHome::Local
+                | ipe_canon::VarHome::TopLevel(_) => false,
+            })
+            .filter_map(|(name, _)| interner.resolve(*name).map(str::to_owned))
+            .collect()
+    }
+
+    /// Parity: every kernel page lists exactly the callable members the
+    /// resolver exports for that module path.
+    #[test]
+    fn kernel_pages_list_exactly_the_resolver_exports() {
+        let docs = build_kernel_module_docs().expect("the live kernel docs must build");
+        for (path, _) in ipe_canon::STDLIB_MODULE_QUALIFIERS {
+            let dotted = path.join(".");
+            if is_retired_stdlib_module(&dotted) {
+                assert!(
+                    !docs.contains_key(&dotted),
+                    "retired {dotted} must not page"
+                );
+                continue;
+            }
+            let expected = resolver_callable_members(path);
+            let listed: BTreeSet<String> = docs
+                .get(&dotted)
+                .map(|page| page.values.iter().map(|v| v.name.clone()).collect())
+                .unwrap_or_default();
+            assert_eq!(listed, expected, "page {dotted} drifts from the resolver");
+        }
+    }
+
+    /// Every member and module of the shape-scoped `Cmd` / `Sub` pages carries prose.
+    #[test]
+    #[allow(clippy::panic)] // a missing page, named, IS the failure
+    fn shape_scoped_cmd_and_sub_pages_carry_prose() {
+        let docs = build_kernel_module_docs().expect("the live kernel docs must build");
+        for page in [
+            "Ipe.Tea.Tui.Cmd",
+            "Ipe.Tea.Tui.Sub",
+            "Ipe.Tea.Cli.Cmd",
+            "Ipe.Tea.Cli.Sub",
+            "Ipe.Tea.Web.Cmd",
+            "Ipe.Tea.Web.Sub",
+        ] {
+            let doc = docs
+                .get(page)
+                .unwrap_or_else(|| panic!("{page} must have a kernel-doc page"));
+            assert!(!doc.comment.is_empty(), "{page} has no module comment");
+            for value in &doc.values {
+                assert!(
+                    !value.comment.is_empty(),
+                    "{page}.{} has no comment",
+                    value.name
+                );
+            }
+        }
+    }
+
+    /// The bindings of a kernel prose source naming no registry kernel.
+    fn orphan_kernel_prose(qualifier: &str, source: &str) -> Vec<String> {
+        scan_doc_comments(source)
+            .bindings
+            .keys()
+            .filter(|name| {
+                !ipe_kernels::StdlibKernel::ALL.iter().any(|k| {
+                    let decl = k.decl();
+                    decl.qualifier == qualifier && decl.name == name.as_str()
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Kernel prose only annotates real kernels: a binding naming no registry
+    /// kernel would be prose for a member no page can list.
+    #[test]
+    fn kernel_prose_names_only_registry_kernels() {
+        for source in ipe_stdlib::KERNEL_DOC_SOURCES {
+            let orphans = orphan_kernel_prose(source.qualifier, source.source);
+            assert!(
+                orphans.is_empty(),
+                "{} prose names no kernel: {orphans:?}",
+                source.qualifier
+            );
+        }
+    }
+
+    /// Refusal: prose for a name the registry lacks is flagged.
+    #[test]
+    fn orphan_kernel_prose_flags_a_bogus_binding() {
+        let source = "module Sub exposing (bogus)\n\n\n-- | Nothing.\nbogus =\n    0\n";
+        assert_eq!(orphan_kernel_prose("Sub", source), vec!["bogus".to_owned()]);
+        let real = "module Sub exposing (none)\n\n\n-- | Nothing.\nnone =\n    0\n";
+        assert!(orphan_kernel_prose("Sub", real).is_empty());
     }
 
     #[test]
