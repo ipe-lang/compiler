@@ -27,7 +27,7 @@ Three knots.
 ## A worked example: filtering an export
 
 The example under
-[`examples/shapes/script/csv-report`](../../examples/shapes/script/csv-report/src/Main.ipe)
+[`examples/shapes/script/csv-report`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/csv-report/src/Main.ipe)
 parses an orders export, keeps only the shipped rows, and re-encodes them.
 
 Filtering is an ordinary `List.filter` over the typed `rows`, rebuilt into the
@@ -92,7 +92,7 @@ value with an embedded comma or quote is a classic injection/corruption vector f
 a hand-rolled CSV writer; the library's RFC-4180 quoting closes it by
 construction, and guarantees the output parses back to the same rows.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## Configuration
 
@@ -103,7 +103,7 @@ Two env vars tune CSV limits at runtime. Use `ipe doc <VAR>` for the full entry.
 | `IPE_CSV_MAX_ROWS` | 10000000 (10 M) | Maximum rows parsed from a single CSV input. |
 | `IPE_CSV_SANITIZE_FORMULAS` | unset (false) | Prefix formula-injection characters in output to block spreadsheet injection. |
 
-See the [**CSV** subsystem](../reference/env.md#csv) in the
+See the [**CSV** subsystem](https://github.com/ipe-lang/compiler/blob/main/docs/reference/env.md#csv) in the
 environment variable reference.
 
 ## References
@@ -112,7 +112,7 @@ environment variable reference.
   `ipe doc Ipe.Csv.parseStreamFromFile` reads a large file row-by-row through a
   validated `Path` without materialising it whole.
 - **Sibling guides:** [Files](file.md) — `parseStreamFromFile` builds on the typed
-  `Path` boundary. [Lists](../reference/stdlib/List.md) — the `filter`/`map` you
+  `Path` boundary. [Lists](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/List.md) — the `filter`/`map` you
   transform rows with. [Result](result.md), which `parse` returns.
 - **Concepts:** [The parse-don't-validate idiom](../idioms/parse-dont-validate.md).
   [Pure functions and immutability](pure-functions.md) — why transforming rows

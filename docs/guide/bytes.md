@@ -24,7 +24,7 @@ Two knots.
 ## A worked example: inspecting a buffer
 
 The example under
-[`examples/shapes/script/bytes-buffer`](../../examples/shapes/script/bytes-buffer/src/Main.ipe)
+[`examples/shapes/script/bytes-buffer`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/bytes-buffer/src/Main.ipe)
 encodes a short message to bytes, shows it in hex and base64, slices a window, and
 decodes back — including the case where a decode legitimately fails.
 
@@ -97,7 +97,7 @@ Returning `Maybe` from `toString` (and `fromHex`/`fromBase64`) is the same
 that might not have an answer says so in its type, so no malformed buffer can make
 the program fall over — the worst case is a `Nothing` you handle.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

@@ -32,7 +32,7 @@ Three knots.
 ## A worked example: gating the console
 
 The example under
-[`examples/shapes/web/console-auth`](../../examples/shapes/web/console-auth/src/Main.ipe)
+[`examples/shapes/web/console-auth`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/web/console-auth/src/Main.ipe)
 is a `Web.tea` that supplies a `consoleAuth` callback building an identity with
 the `Ipe.Web.Console` builders.
 
@@ -77,7 +77,7 @@ break existing call sites. And returning `Maybe Identity` inside a `Task` keeps
 authentication an ordinary effect the app composes, reusing the same session
 check the rest of the app already runs — one identity surface, not two.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## Configuration
 
@@ -104,7 +104,7 @@ is set, on every bind.
 | `IPE_DEV_BANNER` | auto (on in dev) | Set to `off` to suppress the dev-mode banner. |
 | `IPE_METRICS_TOKEN` | unset | Metrics token: authorizes the `/_ipe/metrics` scrape only, never the console. The admin token is accepted on `/_ipe/metrics` too. |
 
-See the [**Console** subsystem](../reference/env.md#console) in the
+See the [**Console** subsystem](https://github.com/ipe-lang/compiler/blob/main/docs/reference/env.md#console) in the
 environment variable reference.
 
 ## References

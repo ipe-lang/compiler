@@ -37,7 +37,7 @@ main =
 ```
 
 The same logic as a `do` block reads straight down —
-from [`examples/shapes/script/release-preflight`](../../examples/shapes/script/release-preflight):
+from [`examples/shapes/script/release-preflight`](https://github.com/ipe-lang/compiler/tree/main/examples/shapes/script/release-preflight):
 
 ```ipe
 main =
@@ -84,7 +84,7 @@ the compiler will direct you to `let … in`.
 
 ## References
 
-- [`Ipe.Task`](../reference/stdlib/Task.md) — the combinators `do` sequences.
+- [`Ipe.Task`](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/Task.md) — the combinators `do` sequences.
 - `ipe doc do` — the construct reference.
 - [The Elm Architecture](../guide/the-elm-architecture.md) — where a task's result
   returns as a `Msg` in an interactive program.

@@ -31,7 +31,7 @@ Three knots.
 ## A worked example: a Task-shaped broadcast in a web app
 
 The example under
-[`examples/shapes/web/task-publish`](../../examples/shapes/web/task-publish/src/Main.ipe)
+[`examples/shapes/web/task-publish`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/web/task-publish/src/Main.ipe)
 is a `Web.tea` that broadcasts on a shared topic and shows the subscriber count.
 
 The topic is one shared handle — its `String` payload type is what any publish
@@ -77,7 +77,7 @@ in-process and fire-and-forget, with durability left to an explicit write, keeps
 the guarantee honest: `publish` promises exactly the in-process broker's
 invariant and nothing it cannot deliver.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

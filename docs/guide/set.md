@@ -28,7 +28,7 @@ Three knots trip up a first-time reader; each is one idea.
 ## A worked example: role-based access control
 
 The example under
-[`examples/shapes/script/set-access-control`](../../examples/shapes/script/set-access-control/src/Main.ipe)
+[`examples/shapes/script/set-access-control`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/set-access-control/src/Main.ipe)
 decides whether a user may perform an action, using nothing but set algebra. Each
 role grants a set of permissions; a user's *effective* permissions are the union
 of their roles; an action *requires* a set; access is a subset test.
@@ -131,7 +131,7 @@ every required permission?" loop is easy to get wrong at the boundaries — the
 empty case, the duplicate, the off-by-one. `Set.diff` and `Set.isEmpty` state the
 intent directly and carry no boundaries to fumble.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 
@@ -139,7 +139,7 @@ intent directly and carry no boundaries to fumble.
   and a verified example. `ipe doc Ipe.Set.diff` drills into one.
 - **Sibling guides:** [Dictionaries](dict.md) — a `Set` is a `Dict` with no
   values; when you need a value *per* key, reach for `Dict`.
-  [Lists](../reference/stdlib/List.md) when order or duplicates matter.
+  [Lists](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/List.md) when order or duplicates matter.
 - **Concepts:** [Pure functions and immutability](pure-functions.md) — why every
   `Set` operation returns a new set. [Types and inference](types.md) — how the
   element type `a` is tracked.

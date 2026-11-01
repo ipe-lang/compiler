@@ -25,7 +25,7 @@ Three knots.
 ## A worked example: resource caps
 
 The example under
-[`examples/shapes/script/bytesize-caps`](../../examples/shapes/script/bytesize-caps/src/Main.ipe)
+[`examples/shapes/script/bytesize-caps`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/bytesize-caps/src/Main.ipe)
 builds per-resource size caps from unit-explicit quantities, including a negative
 one that clamps to zero.
 
@@ -77,7 +77,7 @@ raw integer only through `toBytes` at the boundary is [parse, don't
 validate][principles] in reverse — the typed quantity travels through your code,
 and the untyped byte count exists only at the runtime edge.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

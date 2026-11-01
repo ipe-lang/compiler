@@ -81,7 +81,7 @@ The vocabulary: `Network`, `Filesystem`, `Database`, `Env`, `Subprocess`,
 `Clock`, `Random`, `NativeFfi`, `FfiRaw`, `Unsafe`, `CustomElement`, and
 `JsPort <axis>` for a browser port (`Geolocation`, `Clipboard`, `Camera`,
 `Microphone`, `Storage`, `Notification`, `WebAuthn`, …). See
-[capabilities](../reference/capabilities.md).
+[capabilities](https://github.com/ipe-lang/compiler/blob/main/docs/reference/capabilities.md).
 
 ## Web delivery: `wasm` and `delivery`
 
