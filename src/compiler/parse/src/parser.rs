@@ -395,6 +395,14 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `Module.Ctor` where a pattern expects a bare constructor — IPE-P0074.
+    fn qualified_ctor_in_pattern(tok: &Token, qualified: Box<str>, bare: Box<str>) -> Diagnostic {
+        Diagnostic::Parse {
+            span: tok.span,
+            msg: ParseError::QualifiedCtorInPattern { qualified, bare },
+        }
+    }
+
     const fn malformed_header(span: Span, defect: HeaderDefect) -> Diagnostic {
         Diagnostic::Parse {
             span,
@@ -3089,7 +3097,12 @@ impl<'a> Parser<'a> {
                     // pattern position. Reject a dotted upper-case name rather than
                     // drop the qualifier into a non-reference AST.
                     if text.contains('.') {
-                        return Err(Self::unexpected_token(&tok, &[Expected::Constructor]));
+                        let bare = text.rsplit('.').next().unwrap_or(text);
+                        return Err(Self::qualified_ctor_in_pattern(
+                            &tok,
+                            text.into(),
+                            bare.into(),
+                        ));
                     }
                     let name = self.interner.intern(text)?;
                     Ok(Located::new(
