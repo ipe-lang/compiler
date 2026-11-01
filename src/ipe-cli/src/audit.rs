@@ -456,8 +456,7 @@ pub fn run_audit_as(
 /// Capture the package `path` names (a directory or its `package.ipe`) in one walk.
 ///
 /// # Errors
-/// [`CliError::ProjectRefused`] when `path` names no `package.ipe`; the
-/// [`PackageSnapshot::capture`] refusals otherwise.
+/// As [`locate_manifest`]; the [`PackageSnapshot::capture`] refusals otherwise.
 pub fn capture_package(path: &Path) -> Result<PackageSnapshot, CliError> {
     capture_manifest_root(&locate_manifest(path)?)
 }
@@ -1145,8 +1144,9 @@ fn ffi_cache_path_or_reject(project_root: &Path) -> Result<PathBuf, CliError> {
 /// Resolve `path` (a directory or a `package.ipe`) to its manifest file.
 ///
 /// # Errors
-/// [`CliError::ProjectRefused`] when the directory holds no `package.ipe`, or
-/// `path` is neither a directory nor a `package.ipe`.
+/// [`CliError::ProjectRefused`] when the directory holds no `package.ipe`;
+/// [`CliError::Usage`] when the path argument names neither a directory nor a
+/// `package.ipe`.
 fn locate_manifest(path: &Path) -> Result<PathBuf, CliError> {
     if path.is_dir() {
         if let Some(manifest) = crate::project::manifest_in_dir(path) {
@@ -1164,7 +1164,7 @@ fn locate_manifest(path: &Path) -> Result<PathBuf, CliError> {
     {
         return Ok(path.to_path_buf());
     }
-    Err(CliError::ProjectRefused(text::msg::audit_not_a_package(
+    Err(CliError::Usage(text::msg::audit_not_a_package(
         &path.display(),
     )))
 }

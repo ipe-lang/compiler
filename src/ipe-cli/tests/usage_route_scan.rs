@@ -21,6 +21,11 @@
 //! struct spelling `CliError::Usage { 0: … }`, the variant as a function value
 //! (`.map_err(CliError::Usage)`), and every macro body: a body that parses as
 //! expressions is visited as such, any other body is scanned token by token.
+//! A `use CliError::{self as E}` renames the type; a glob of a module that
+//! holds an imported variant binds it bare; an associated `type E = CliError`
+//! is an alias; `<X as T>::E::Usage` names the variant through `E`; in a macro
+//! body, a metavariable owner (`$t::Usage`) or a metavariable variant
+//! (`CliError::$v`) is a site.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -49,6 +54,12 @@ const ADMITTED: &[(&str, &str, usize, &str)] = &[
         "parse_audit_args",
         11,
         "a flag of `ipe package audit` that is unknown, repeated, valueless, or exclusive of another",
+    ),
+    (
+        "audit.rs",
+        "locate_manifest",
+        1,
+        "a path argument that names neither a directory nor a `package.ipe`",
     ),
     (
         "audit.rs",
@@ -151,6 +162,12 @@ const ADMITTED: &[(&str, &str, usize, &str)] = &[
         "parse_add_arg",
         2,
         "a missing or unparsable package-requirement argument",
+    ),
+    (
+        "publish.rs",
+        "locate_manifest",
+        1,
+        "a path argument that names neither a directory nor a `package.ipe`",
     ),
     (
         "publish.rs",
@@ -971,6 +988,15 @@ enum UseLeaf {
     Glob { prefix: Vec<String> },
 }
 
+/// The path and name one `use` leaf imports: `prefix::{self}` imports the
+/// prefix's last segment itself.
+fn named(prefix: &[String], ident: &syn::Ident) -> (Vec<String>, String) {
+    match prefix.split_last() {
+        Some((last, rest)) if ident == "self" => (rest.to_vec(), last.clone()),
+        Some(_) | None => (prefix.to_vec(), ident.to_string()),
+    }
+}
+
 /// Flatten `tree` under `prefix` into its leaves.
 fn use_leaves(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut Vec<UseLeaf>) {
     match tree {
@@ -979,16 +1005,22 @@ fn use_leaves(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut Vec<UseLe
             use_leaves(&path.tree, prefix, out);
             prefix.pop();
         }
-        syn::UseTree::Name(name) => out.push(UseLeaf::Name {
-            prefix: prefix.clone(),
-            name: name.ident.to_string(),
-            alias: name.ident.to_string(),
-        }),
-        syn::UseTree::Rename(rename) => out.push(UseLeaf::Name {
-            prefix: prefix.clone(),
-            name: rename.ident.to_string(),
-            alias: rename.rename.to_string(),
-        }),
+        syn::UseTree::Name(name) => {
+            let (prefix, name) = named(prefix, &name.ident);
+            out.push(UseLeaf::Name {
+                prefix,
+                alias: name.clone(),
+                name,
+            });
+        }
+        syn::UseTree::Rename(rename) => {
+            let (prefix, name) = named(prefix, &rename.ident);
+            out.push(UseLeaf::Name {
+                prefix,
+                name,
+                alias: rename.rename.to_string(),
+            });
+        }
         syn::UseTree::Glob(_) => out.push(UseLeaf::Glob {
             prefix: prefix.clone(),
         }),
@@ -1014,13 +1046,32 @@ impl<'ast> Visit<'ast> for Imports {
     }
 
     fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
-        if let syn::Type::Path(path) = &*item.ty
+        self.alias(&item.ident, &item.ty);
+        visit::visit_item_type(self, item);
+    }
+
+    fn visit_impl_item_type(&mut self, item: &'ast syn::ImplItemType) {
+        self.alias(&item.ident, &item.ty);
+        visit::visit_impl_item_type(self, item);
+    }
+
+    fn visit_trait_item_type(&mut self, item: &'ast syn::TraitItemType) {
+        if let Some((_, ty)) = &item.default {
+            self.alias(&item.ident, ty);
+        }
+        visit::visit_trait_item_type(self, item);
+    }
+}
+
+impl Imports {
+    /// Record `name = ty` when `ty` is a path.
+    fn alias(&mut self, name: &syn::Ident, ty: &syn::Type) {
+        if let syn::Type::Path(path) = ty
             && let Some(last) = path.path.segments.last()
         {
             self.aliases
-                .push((item.ident.to_string(), last.ident.to_string()));
+                .push((name.to_string(), last.ident.to_string()));
         }
-        visit::visit_item_type(self, item);
     }
 }
 
@@ -1067,10 +1118,18 @@ fn names(imports: &BTreeMap<String, Imports>) -> Names {
                     }
                     UseLeaf::Glob { prefix } => {
                         if prefix.last().is_some_and(|last| types.contains(last)) {
+                            exported.insert(VARIANT.to_owned());
                             variants
                                 .entry(rel.clone())
                                 .or_default()
                                 .insert(VARIANT.to_owned());
+                        } else {
+                            // A module glob may carry a name another file bound
+                            // to the variant; it binds every such name here.
+                            variants
+                                .entry(rel.clone())
+                                .or_default()
+                                .extend(exported.iter().cloned());
                         }
                     }
                 }
@@ -1079,6 +1138,8 @@ fn names(imports: &BTreeMap<String, Imports>) -> Names {
         if (types.len(), exported.len()) == before {
             return Names { types, variants };
         }
+        // `variants` grows only from `types` and `exported`, both bounded by the
+        // crate's finite names, so the loop reaches its fixpoint.
     }
 }
 
@@ -1123,6 +1184,14 @@ impl Count<'_> {
     fn names_variant(&self, qself: Option<&syn::QSelf>, path: &syn::Path) -> bool {
         let segments: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
         if let Some(qself) = qself {
+            if segments.last().is_none_or(|l| l != VARIANT) {
+                return false;
+            }
+            // `<X as T>::E::Usage` names the variant through `E`, the segment
+            // before it; `<CliError>::Usage` through the qualified type itself.
+            if let Some([.., owner, _]) = segments.get(qself.position..) {
+                return self.owner_is_type(owner);
+            }
             let syn::Type::Path(ty) = &*qself.ty else {
                 return false;
             };
@@ -1132,7 +1201,7 @@ impl Count<'_> {
                 .last()
                 .map(|s| s.ident.to_string())
                 .unwrap_or_default();
-            return self.owner_is_type(&owner) && segments.last().is_some_and(|l| l == VARIANT);
+            return self.owner_is_type(&owner);
         }
         match segments.as_slice() {
             [single] => self.bare.contains(single),
@@ -1153,9 +1222,25 @@ impl Count<'_> {
                         previous.as_slice(),
                         [.., owner, a, b] if a == ":" && b == ":" && name == VARIANT && self.owner_is_type(owner)
                     );
+                    // `$t::Usage`: the owner is a metavariable the scan cannot
+                    // resolve, so the variant's name alone makes it a site.
+                    let metavariable_owner = matches!(
+                        previous.as_slice(),
+                        [.., dollar, _, a, b] if dollar == "$" && a == ":" && b == ":" && name == VARIANT
+                    );
+                    // `CliError::$v`: the variant is a metavariable, so any
+                    // variant the type is built with here is a site.
+                    let metavariable_variant = matches!(
+                        previous.as_slice(),
+                        [.., owner, a, b, dollar] if a == ":" && b == ":" && dollar == "$" && self.owner_is_type(owner)
+                    );
                     let after_colons =
                         matches!(previous.as_slice(), [.., a, b] if a == ":" && b == ":");
-                    if qualified || (!after_colons && self.bare.contains(&name)) {
+                    if qualified
+                        || metavariable_owner
+                        || metavariable_variant
+                        || (!after_colons && self.bare.contains(&name))
+                    {
                         self.hit();
                     }
                     previous.push(name);
@@ -1464,6 +1549,51 @@ fn a_reexported_variant_is_a_site() {
         ),
     ]);
     assert_eq!(site(&sites, "a.rs", "f"), 1);
+}
+
+#[test]
+fn a_self_rename_of_the_type_is_a_site() {
+    let sites = in_module("use crate::CliError::{self as E};\nfn f() -> E { E::Usage(m()) }");
+    assert_eq!(site(&sites, "a.rs", "f"), 1);
+}
+
+#[test]
+fn a_module_glob_carrying_the_variant_is_a_site() {
+    let sites = planted(&[
+        ("lib.rs", "mod a;\nmod b;\n"),
+        ("a.rs", "pub use crate::CliError::Usage;\n"),
+        ("b.rs", "use crate::a::*;\nfn f() -> E { Usage(m()) }"),
+    ]);
+    assert_eq!(site(&sites, "b.rs", "f"), 1);
+}
+
+#[test]
+fn a_name_reexported_from_a_type_glob_is_a_site() {
+    let sites = planted(&[
+        ("lib.rs", "mod a;\nmod b;\n"),
+        ("a.rs", "pub use crate::CliError::*;\n"),
+        ("b.rs", "use crate::a::Usage;\nfn f() -> E { Usage(m()) }"),
+    ]);
+    assert_eq!(site(&sites, "b.rs", "f"), 1);
+}
+
+#[test]
+fn an_associated_type_alias_is_a_site() {
+    let sites =
+        in_module("impl T for X { type E = CliError; }\nfn f() -> R { <X as T>::E::Usage(m()) }");
+    assert_eq!(site(&sites, "a.rs", "f"), 1);
+}
+
+#[test]
+fn a_metavariable_owner_in_a_macro_is_a_site() {
+    let sites = in_module("macro_rules! refuse { ($t:ident) => { $t::Usage(m()) }; }");
+    assert_eq!(site(&sites, "a.rs", "<item>"), 1);
+}
+
+#[test]
+fn a_metavariable_variant_in_a_macro_is_a_site() {
+    let sites = in_module("macro_rules! refuse { ($v:ident) => { CliError::$v(m()) }; }");
+    assert_eq!(site(&sites, "a.rs", "<item>"), 1);
 }
 
 #[test]

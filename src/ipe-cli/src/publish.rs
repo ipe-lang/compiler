@@ -301,6 +301,11 @@ fn take_value<'a>(
 }
 
 /// Resolve `path` (a directory or a `package.ipe`) to its manifest file.
+///
+/// # Errors
+/// [`CliError::ProjectRefused`] when the directory holds no `package.ipe`;
+/// [`CliError::Usage`] when the path argument names neither a directory nor a
+/// `package.ipe`.
 fn locate_manifest(path: &Path) -> Result<PathBuf, CliError> {
     if path.is_dir() {
         if let Some(manifest) = crate::project::manifest_in_dir(path) {
@@ -318,7 +323,7 @@ fn locate_manifest(path: &Path) -> Result<PathBuf, CliError> {
     {
         return Ok(path.to_path_buf());
     }
-    Err(CliError::ProjectRefused(text::msg::publish_not_a_package(
+    Err(CliError::Usage(text::msg::publish_not_a_package(
         &path.display(),
     )))
 }

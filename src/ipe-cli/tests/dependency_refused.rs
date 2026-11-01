@@ -292,6 +292,24 @@ fn a_missing_manifest_prints_no_help() {
 
 /// Real argument misuse still prints the command's help page, so the
 /// no-help assertions above are not vacuous.
+/// A path argument naming neither a directory nor a `package.ipe` is argument
+/// misuse: `package audit` and `package publish` refuse it with the help page.
+#[test]
+fn a_path_argument_that_is_not_a_package_prints_help() {
+    let base = fresh_dir("not_a_package");
+    let missing = base.join("absent");
+    let missing_arg = missing.to_string_lossy().into_owned();
+    for sub in ["audit", "publish"] {
+        let r = run(&["package", sub, &missing_arg]);
+        assert!(!r.ok, "`package {sub}` must refuse a missing path");
+        assert!(
+            shows_help(&r.stderr),
+            "`package {sub}` on a path that is no package must print help:\n{}",
+            r.stderr
+        );
+    }
+}
+
 #[test]
 fn argument_misuse_still_prints_help() {
     let r = run(&["type-check", "--no-such-flag"]);
