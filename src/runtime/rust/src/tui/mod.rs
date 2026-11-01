@@ -12,7 +12,7 @@ pub mod layout; // structured Element → ANSI cells
 pub mod line_surface; // `Lines` view → the one Cli frame serializer
 pub use app::{tui_app, tui_app_ui};
 pub use cell::*;
-pub use line_surface::{FrameEnd, LineState, LineStyle, LineSurface, write_frame};
+pub use line_surface::{FrameEnd, InputEnd, LineState, LineStyle, LineSurface, write_frame};
 
 use crate::color::{AnsiColor, Color};
 use crate::ui::element::{Attribute, Element, HAlign};

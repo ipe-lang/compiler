@@ -56,10 +56,19 @@ impl LineSurface {
     }
 }
 
+/// How an input line read from stdin ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputEnd {
+    /// Its `\n` (or `\r\n`) terminator.
+    Newline,
+    /// End of input with no terminator: the final line of the input.
+    Eof,
+}
+
 /// Whether the last line written is still open (no `\n` after it yet).
 ///
-/// Only a [`FrameEnd::PromptOpen`] frame opens it; the next frame, an echoed
-/// input line, or [`LineState::close`] ends it.
+/// Only a [`FrameEnd::PromptOpen`] frame opens it; the next frame, a
+/// newline-ended input line, or [`LineState::close`] ends it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LineState {
     line_open: bool,
@@ -72,10 +81,15 @@ impl LineState {
         Self { line_open: false }
     }
 
-    /// An input line was read: the terminal's echo of its Enter already moved
-    /// the cursor to a fresh line, so no frame needs to end the open one.
-    pub const fn echoed_line(&mut self) {
-        self.line_open = false;
+    /// An input line was read. A line ended by its newline was typed with
+    /// Enter, whose echo already moved the cursor to a fresh line, so no frame
+    /// needs to end the open one. A final line ended by end of input (`Ctrl-D`
+    /// after text) echoes no newline, so the open line stays open.
+    pub const fn input_line(&mut self, end: InputEnd) {
+        match end {
+            InputEnd::Newline => self.line_open = false,
+            InputEnd::Eof => {}
+        }
     }
 
     /// The bytes that end the run's output: `\n` when a line is open, else
@@ -322,9 +336,27 @@ mod tests {
         let mut state = LineState::new();
         assert_eq!(write_frame(&view, &prompt, &mut state), b"> ");
         assert_eq!(write_frame(&view, &prompt, &mut state), b"\n> ");
-        state.echoed_line();
+        state.input_line(InputEnd::Newline);
         assert_eq!(write_frame(&view, &prompt, &mut state), b"> ");
-        state.echoed_line();
+        state.input_line(InputEnd::Newline);
         assert_eq!(state.close(), b"");
+    }
+
+    // A final input line ended by end of input (text then `Ctrl-D`) echoed no
+    // newline: the prompt line it was typed on is still open, so the next
+    // frame and the close still end it.
+    #[test]
+    fn eof_ended_input_line_keeps_the_prompt_open() {
+        let view = cli_text_::<()>("> ".to_owned());
+        let prompt = LineSurface {
+            style: LineStyle::Plain,
+            end: FrameEnd::PromptOpen,
+        };
+        let mut state = LineState::new();
+        assert_eq!(write_frame(&view, &prompt, &mut state), b"> ");
+        state.input_line(InputEnd::Eof);
+        assert_eq!(write_frame(&view, &prompt, &mut state), b"\n> ");
+        state.input_line(InputEnd::Eof);
+        assert_eq!(state.close(), b"\n");
     }
 }

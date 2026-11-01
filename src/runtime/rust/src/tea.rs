@@ -832,8 +832,9 @@ impl<M: Clone + Send + 'static, S: SubSink<M>> SubRuntime<M, S> {
 /// the shared TEA event plumbing rather than carrying it as dead code.
 #[cfg(all(not(target_arch = "wasm32"), feature = "tui"))]
 pub(crate) enum CliEvent<M> {
-    /// A stdin line, holding its share of the reader's [`InputBudget`].
-    Line(String, InputPermit),
+    /// A stdin line and how it ended, holding its share of the reader's
+    /// [`InputBudget`].
+    Line(String, crate::tui::InputEnd, InputPermit),
     // Constructed only by the `tui` raw-key reader; console_app matches it
     // defensively (keys are ignored under Cli).
     Key(String, String, InputPermit),
@@ -933,8 +934,9 @@ impl Drop for InputPermit {
 #[cfg(all(not(target_arch = "wasm32"), feature = "tui"))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum BoundedLine {
-    /// A complete line within the ceiling, its `\n` / `\r\n` terminator removed.
-    Line(String),
+    /// A complete line within the ceiling, its `\n` / `\r\n` terminator
+    /// removed, and how it ended.
+    Line(String, crate::tui::InputEnd),
     /// A line past the ceiling, consumed through its terminator and dropped.
     TooLong,
     /// A line within the ceiling that is not UTF-8.
@@ -955,6 +957,7 @@ pub(crate) fn read_bounded_line<R: std::io::BufRead>(
     let mut line: Vec<u8> = Vec::new();
     let mut too_long = false;
     let mut read_any = false;
+    let mut terminated = false;
     loop {
         let available = reader.fill_buf()?;
         if available.is_empty() {
@@ -981,6 +984,7 @@ pub(crate) fn read_bounded_line<R: std::io::BufRead>(
         let consumed = chunk.len().saturating_add(usize::from(newline.is_some()));
         reader.consume(consumed);
         if newline.is_some() {
+            terminated = true;
             break;
         }
     }
@@ -990,8 +994,13 @@ pub(crate) fn read_bounded_line<R: std::io::BufRead>(
     if too_long || line.len() > max_bytes {
         return Ok(Some(BoundedLine::TooLong));
     }
+    let end = if terminated {
+        crate::tui::InputEnd::Newline
+    } else {
+        crate::tui::InputEnd::Eof
+    };
     Ok(Some(
-        String::from_utf8(line).map_or(BoundedLine::NotUtf8, BoundedLine::Line),
+        String::from_utf8(line).map_or(BoundedLine::NotUtf8, |text| BoundedLine::Line(text, end)),
     ))
 }
 
@@ -1255,8 +1264,8 @@ where
             let stdin = std::io::stdin();
             let mut reader = stdin.lock();
             loop {
-                let line = match read_bounded_line(&mut reader, MAX_LINE_BYTES) {
-                    Ok(Some(BoundedLine::Line(l))) => l,
+                let (line, end) = match read_bounded_line(&mut reader, MAX_LINE_BYTES) {
+                    Ok(Some(BoundedLine::Line(l, end))) => (l, end),
                     Ok(Some(BoundedLine::TooLong)) => continue,
                     // End of input, a non-UTF-8 line, or a read error ends input.
                     Ok(None | Some(BoundedLine::NotUtf8)) | Err(_) => break,
@@ -1264,7 +1273,7 @@ where
                 let Some(permit) = budget.acquire(|| line_tx.is_closed()) else {
                     return;
                 };
-                if line_tx.send(CliEvent::Line(line, permit)).is_err() {
+                if line_tx.send(CliEvent::Line(line, end, permit)).is_err() {
                     return;
                 }
             }
@@ -1323,9 +1332,10 @@ where
             let msgs: Vec<Msg> = match ev {
                 // Every active line handler sees the line; none → unobserved.
                 // The permit returns to the reader's budget as the line is taken.
-                // Its echo ended the open prompt line, observed or not.
-                CliEvent::Line(l, _permit) => {
-                    line_state.echoed_line();
+                // A newline-ended line's echo ended the open prompt line,
+                // observed or not.
+                CliEvent::Line(l, end, _permit) => {
+                    line_state.input_line(end);
                     submgr.line_msgs(&l)
                 }
                 CliEvent::Key(..) => continue, // Cli has no keys
@@ -2235,6 +2245,7 @@ mod input_dispatch_tests {
 #[cfg(all(test, not(target_arch = "wasm32"), feature = "tui"))]
 mod bounded_input_tests {
     use super::*;
+    use crate::tui::InputEnd;
 
     fn lines(input: &[u8], max: usize) -> Vec<BoundedLine> {
         let mut reader = std::io::BufReader::with_capacity(4, input);
@@ -2250,19 +2261,22 @@ mod bounded_input_tests {
         assert_eq!(
             lines(b"ab\r\ncd\nef", 8),
             vec![
-                BoundedLine::Line("ab".into()),
-                BoundedLine::Line("cd".into()),
-                BoundedLine::Line("ef".into()),
+                BoundedLine::Line("ab".into(), InputEnd::Newline),
+                BoundedLine::Line("cd".into(), InputEnd::Newline),
+                BoundedLine::Line("ef".into(), InputEnd::Eof),
             ]
         );
     }
 
     #[test]
     fn a_line_at_exactly_the_cap_is_delivered() {
-        assert_eq!(lines(b"abcd\n", 4), vec![BoundedLine::Line("abcd".into())]);
+        assert_eq!(
+            lines(b"abcd\n", 4),
+            vec![BoundedLine::Line("abcd".into(), InputEnd::Newline)]
+        );
         assert_eq!(
             lines(b"abcd\r\n", 4),
-            vec![BoundedLine::Line("abcd".into())]
+            vec![BoundedLine::Line("abcd".into(), InputEnd::Newline)]
         );
     }
 
@@ -2272,7 +2286,10 @@ mod bounded_input_tests {
         // is read intact, never a truncated prefix of the dropped one.
         assert_eq!(
             lines(b"abcde\nok\n", 4),
-            vec![BoundedLine::TooLong, BoundedLine::Line("ok".into())]
+            vec![
+                BoundedLine::TooLong,
+                BoundedLine::Line("ok".into(), InputEnd::Newline)
+            ]
         );
         assert_eq!(lines(b"abcde", 4), vec![BoundedLine::TooLong]);
     }
