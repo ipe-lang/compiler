@@ -187,16 +187,21 @@ pub fn json_decode_string<E: crate::DecodeErrorSink + 'static>() -> Decoder<E, S
 /// The `i64` an integral float denotes, or `None` when it is fractional or out of range.
 ///
 /// Both bounds are *strict* because f64 cannot distinguish a boundary from its
-/// out-of-range neighbour: `i64::MAX as f64` rounds up to `2^63` and
-/// `i64::MIN-1` rounds down to `i64::MIN as f64`, so `<=`/`>=` would admit an
-/// out-of-range integer and let `f as i64` saturate to the limit — a silent
-/// wrong value. An exact `i64::MIN`/`i64::MAX` arrives as an integer through
-/// `Number::as_i64`; this only admits the open interval. `NaN` and the
-/// infinities fail every comparison and the `fract` test, so they are `None`.
-/// The JSON `Int` decoder and the Db row's float-cell text share it, so a row
-/// cell reads the same through either path.
+/// out-of-range neighbour: `i64::MAX` rounds up to the float `2^63` and
+/// `i64::MIN - 1` rounds to the float `-2^63`, so a closed interval would admit
+/// an out-of-range integer as the limit — a silent wrong value. An exact
+/// `i64::MIN`/`i64::MAX` arrives as an integer through `Number::as_i64`; this
+/// only admits the open interval `(-2^63, 2^63)`. `NaN` and the infinities have
+/// a `NaN` fraction, so they are `None`. The JSON `Int` decoder and the Db
+/// row's float-cell text share it, so a row cell reads the same through either
+/// path.
 pub(crate) fn integral_i64(f: f64) -> Option<i64> {
-    (f.fract() == 0.0 && f > (i64::MIN as f64) && f < (i64::MAX as f64)).then_some(f as i64)
+    if f.fract() != 0.0 {
+        return None;
+    }
+    // `f64_trunc_to_i64` admits `[-2^63, 2^63)`; of an integral float only
+    // `-2^63` itself reads as `i64::MIN`, the ambiguous lower edge.
+    crate::narrow::f64_trunc_to_i64(f).filter(|&i| i != i64::MIN)
 }
 
 pub fn json_decode_int<E: crate::DecodeErrorSink + 'static>() -> Decoder<E, i64> {
@@ -266,6 +271,15 @@ pub fn decode_field<E: crate::DecodeErrorSink + 'static, T: 'static + Send>(
     )
 }
 
+/// The array position an Ipê `Int` index names in an array of `len` elements.
+///
+/// `None` for a negative index and for one at or past `len`. The index is
+/// narrowed by `usize::try_from`, so on a 32-bit target `2^32` is out of
+/// range rather than wrapped to `0`.
+pub(crate) fn index_of(n: i64, len: usize) -> Option<usize> {
+    usize::try_from(n).ok().filter(|&idx| idx < len)
+}
+
 /// `JsonDec.index : Int -> Decoder a -> Decoder a` — decode the n-th element
 /// of a JSON array. Out-of-bounds or non-array input is `Err`. The path prefix
 /// `"[N]"` is inlined in the error message.
@@ -277,15 +291,10 @@ pub fn decode_index<E: crate::DecodeErrorSink + 'static, T: 'static + Send>(
     Decoder::new(
         Box::new(move |v| match v.as_array() {
             None => decode_err_str(format!("[{}]: expected array", n)),
-            Some(arr) => {
-                let idx = n as usize;
-                match arr.get(idx) {
-                    None => {
-                        decode_err_str(format!("[{}]: index out of range (len={})", n, arr.len()))
-                    }
-                    Some(elem) => (decoder.run)(elem),
-                }
-            }
+            Some(arr) => match index_of(n, arr.len()).and_then(|idx| arr.get(idx)) {
+                None => decode_err_str(format!("[{}]: index out of range (len={})", n, arr.len())),
+                Some(elem) => (decoder.run)(elem),
+            },
         }),
         inner_fields,
     )
@@ -2269,5 +2278,69 @@ mod writer_parity {
             parsed.map(|v| json_enc_encode(0, v)).ok().as_deref(),
             Some(r#"{"b":1,"a":2}"#)
         );
+    }
+}
+
+// The wasm32 leg of the `index_of` refusals lives in `src/wasm/`, the only
+// test code the wasm32 library test binary admits.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod index_tests {
+    use super::*;
+    use crate::json_val::json_val;
+
+    /// `2^32`: the first index a 32-bit `usize` narrowing wraps back to `0`.
+    const WRAP: i64 = 1 << 32;
+
+    #[test]
+    fn index_of_refuses_negative_and_out_of_range() {
+        assert_eq!(index_of(WRAP, 1), None);
+        assert_eq!(index_of(-WRAP, 1), None);
+        assert_eq!(index_of(WRAP + 1, 2), None);
+        assert_eq!(index_of(-1, 1), None);
+        assert_eq!(index_of(i64::MIN, 1), None);
+        assert_eq!(index_of(1, 1), None);
+        assert_eq!(index_of(0, 0), None);
+        assert_eq!(index_of(0, 1), Some(0));
+        assert_eq!(index_of(2, 3), Some(2));
+    }
+
+    #[test]
+    fn decode_index_past_the_32_bit_width_is_out_of_range() {
+        let arr = json_val!([10, 20]);
+        for n in [WRAP, -WRAP, WRAP + 1, -1, 2] {
+            let got = (decode_index(n, json_decode_int::<String>()).run)(&arr);
+            assert!(
+                matches!(&got, IpeResult::Err(e) if e.contains("index out of range")),
+                "index {n}: {got:?}"
+            );
+        }
+        let got = (decode_index(1, json_decode_int::<String>()).run)(&arr);
+        assert!(matches!(got, IpeResult::Ok(20)), "{got:?}");
+    }
+
+    #[test]
+    fn integral_i64_admits_only_the_open_interval() {
+        let two_63 = 9_223_372_036_854_775_808.0_f64;
+        for f in [
+            -two_63,
+            two_63,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1.5,
+        ] {
+            assert_eq!(integral_i64(f), None, "{f}");
+        }
+        // The next float above `-2^63` and the greatest below `2^63`.
+        assert_eq!(
+            integral_i64(-9_223_372_036_854_774_784.0),
+            Some(-9_223_372_036_854_774_784)
+        );
+        assert_eq!(
+            integral_i64(9_223_372_036_854_774_784.0),
+            Some(9_223_372_036_854_774_784)
+        );
+        assert_eq!(integral_i64(-0.0), Some(0));
+        assert_eq!(integral_i64(-3.0), Some(-3));
     }
 }

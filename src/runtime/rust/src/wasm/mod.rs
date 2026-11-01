@@ -2392,4 +2392,15 @@ mod tests {
         assert_eq!(attr_write("iframe", "src", None, false), AttrWrite::Remove);
         assert_eq!(attr_write("div", "src", Some("/"), false), set("/"));
     }
+
+    /// A `Decode.index` past the 32-bit `usize` is out of range here, never
+    /// wrapped to element `0`; this is the target where a cast would wrap.
+    #[wasm_bindgen_test]
+    fn a_decode_index_past_the_usize_width_is_out_of_range() {
+        use crate::json::index_of;
+        assert_eq!(index_of(1 << 32, 1), None);
+        assert_eq!(index_of(-(1 << 32), 1), None);
+        assert_eq!(index_of(-1, 1), None);
+        assert_eq!(index_of(0, 1), Some(0));
+    }
 }
