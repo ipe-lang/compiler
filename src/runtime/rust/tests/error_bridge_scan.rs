@@ -15,8 +15,14 @@
 //!   `ipe_error_unexpected`, keyed by the function it is written in.
 //!   [`UNCLASSIFIED_SITES`] lists each `(file, fn, needle)` with its exact count
 //!   and the reason the site is `Unexpected`; an unlisted site and a stale entry
-//!   both go red. `Self::unexpected` and a glob-imported `Unexpected` are not
-//!   matched.
+//!   both go red. `Self::` resolves to the enclosing `impl`'s self type, and
+//!   stays `Self` (still matched) where no `impl` encloses it. A path inside a
+//!   pattern builds nothing and is not a site. A `use` rename or `type` alias
+//!   of one of the three types anywhere in the file (any scope, any order)
+//!   makes the alias resolve to that type, so `Kf::Unexpected` after
+//!   `use KernelFailure as Kf` is a site. A `use` that imports
+//!   `Unexpected`/`unexpected` by name or glob from one of the three types is
+//!   itself a site: the bare name would build `Unexpected` unseen.
 //!
 //! Inside a macro body the same token shapes count, and `fn name { … }` names
 //! the function. Attributes (doc comments) are not code. A `#[cfg(…)]` proven
@@ -29,8 +35,9 @@ use proc_macro2::{Delimiter, TokenStream, TokenTree};
 use syn::ext::IdentExt;
 use syn::visit::{self, Visit};
 use syn::{
-    Arm, Attribute, Expr, Field, FieldValue, GenericArgument, ImplItem, ImplItemFn, Item, ItemFn,
-    Macro, Path, PathArguments, Stmt, TraitItem, TraitItemFn, Type, Variant,
+    Arm, Attribute, Expr, Field, FieldValue, GenericArgument, ImplItem, ImplItemFn, ImplItemType,
+    Item, ItemFn, ItemImpl, ItemType, ItemUse, Macro, Pat, Path, PathArguments, Stmt, TraitItem,
+    TraitItemFn, Type, UseTree, Variant,
 };
 
 #[path = "support/cfg_scan.rs"]
@@ -94,6 +101,34 @@ struct Unclassified {
 const UNCLASSIFIED_SITES: &[Unclassified] = &[
     Unclassified {
         file: "error.rs",
+        function: OUTSIDE_FN,
+        needle: "IpeErrorKind::Unexpected",
+        count: 1,
+        reason: "the `IpeErrorKind::ALL` listing of every kind: names the variant, builds no error",
+    },
+    Unclassified {
+        file: "error.rs",
+        function: "context",
+        needle: "KernelFailure::Unexpected",
+        count: 1,
+        reason: "`KernelFailure::context` re-prefixes an `Unexpected` and keeps its kind",
+    },
+    Unclassified {
+        file: "error.rs",
+        function: "from",
+        needle: "IpeError::unexpected",
+        count: 2,
+        reason: "transitional: the `From<String>`/`From<&str>` bridges, deleted in E-final",
+    },
+    Unclassified {
+        file: "error.rs",
+        function: "from",
+        needle: "KernelFailure::Unexpected",
+        count: 1,
+        reason: "transitional: the `From<String>` bridge, deleted in E-final",
+    },
+    Unclassified {
+        file: "error.rs",
         function: "ipe_error_unexpected",
         needle: "IpeError::unexpected",
         count: 1,
@@ -120,6 +155,14 @@ const UNCLASSIFIED_SITES: &[Unclassified] = &[
         needle: "IpeErrorKind::Unexpected",
         count: 1,
         reason: "the `IpeError::unexpected` constructor itself",
+    },
+    Unclassified {
+        file: "system.rs",
+        function: "from",
+        needle: "KernelFailure::Unexpected",
+        count: 7,
+        reason: "transitional: `From<ProcessRefusal>` maps every refusal to `Unexpected`; \
+                 E3 classifies each variant and removes this entry",
     },
     Unclassified {
         file: "js_port.rs",
@@ -178,7 +221,94 @@ fn site_needle(names: &[String]) -> Option<&'static str> {
         ("IpeError", "unexpected") => Some("IpeError::unexpected"),
         ("KernelFailure", "Unexpected") => Some("KernelFailure::Unexpected"),
         ("IpeErrorKind", "Unexpected") => Some("IpeErrorKind::Unexpected"),
+        ("Self", "unexpected") => Some("Self::unexpected"),
+        ("Self", "Unexpected") => Some("Self::Unexpected"),
         _ => None,
+    }
+}
+
+/// The needle an alias of the type `name` stands for, if `name` is one of the
+/// three error types.
+fn alias_needle(name: &str) -> Option<&'static str> {
+    match name {
+        "IpeError" => Some("IpeError::unexpected"),
+        "KernelFailure" => Some("KernelFailure::Unexpected"),
+        "IpeErrorKind" => Some("IpeErrorKind::Unexpected"),
+        _ => None,
+    }
+}
+
+/// The needles a `use` tree imports under a name the needles do not match:
+/// `Unexpected`/`unexpected` by name or glob from one of the three types.
+fn use_needles(tree: &UseTree, owner: Option<&str>, out: &mut Vec<&'static str>) {
+    let owned = owner.and_then(alias_needle);
+    match tree {
+        UseTree::Path(path) => use_needles(&path.tree, Some(&path.ident.unraw().to_string()), out),
+        UseTree::Group(group) => {
+            for item in &group.items {
+                use_needles(item, owner, out);
+            }
+        }
+        UseTree::Glob(_) => out.extend(owned),
+        UseTree::Name(name) => {
+            let name = name.ident.unraw().to_string();
+            if name == "Unexpected" || name == "unexpected" {
+                out.extend(owned);
+            }
+        }
+        UseTree::Rename(rename) => {
+            let name = rename.ident.unraw().to_string();
+            if name == "Unexpected" || name == "unexpected" {
+                out.extend(owned);
+            }
+        }
+    }
+}
+
+/// The alias `name` of one of the three error types, from a `type` item's
+/// right-hand side.
+fn type_alias(name: &syn::Ident, ty: &Type) -> Option<(String, String)> {
+    let Type::Path(path) = ty else { return None };
+    let last = path.path.segments.last()?;
+    let target = last.ident.unraw().to_string();
+    (path.qself.is_none() && last.arguments.is_none() && alias_needle(&target).is_some())
+        .then(|| (name.unraw().to_string(), target))
+}
+
+/// Every name a file binds to one of the three error types, by `type` alias
+/// or `use` rename, in any scope.
+#[derive(Default)]
+struct Aliases(BTreeMap<String, String>);
+
+impl Aliases {
+    fn add_use(&mut self, tree: &UseTree) {
+        match tree {
+            UseTree::Path(path) => self.add_use(&path.tree),
+            UseTree::Group(group) => group.items.iter().for_each(|item| self.add_use(item)),
+            UseTree::Rename(rename) => {
+                let target = rename.ident.unraw().to_string();
+                if alias_needle(&target).is_some() {
+                    self.0.insert(rename.rename.unraw().to_string(), target);
+                }
+            }
+            UseTree::Name(_) | UseTree::Glob(_) => {}
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for Aliases {
+    fn visit_item_type(&mut self, item: &'ast ItemType) {
+        self.0.extend(type_alias(&item.ident, &item.ty));
+        visit::visit_item_type(self, item);
+    }
+
+    fn visit_impl_item_type(&mut self, item: &'ast ImplItemType) {
+        self.0.extend(type_alias(&item.ident, &item.ty));
+        visit::visit_impl_item_type(self, item);
+    }
+
+    fn visit_item_use(&mut self, item: &'ast ItemUse) {
+        self.add_use(&item.tree);
     }
 }
 
@@ -257,6 +387,13 @@ fn token_path_ending_at(trees: &[TokenTree], at: usize) -> Vec<String> {
 struct Scan {
     /// The functions enclosing the node being visited, innermost last.
     functions: Vec<String>,
+    /// The self type of each enclosing `impl`, innermost last; `None` when it
+    /// is not a plain path.
+    impl_self: Vec<Option<String>>,
+    /// How many patterns enclose the node being visited.
+    in_pattern: usize,
+    /// The file's aliases of the three error types, alias to type.
+    aliases: BTreeMap<String, String>,
     bridges: usize,
     sites: Vec<(String, &'static str)>,
 }
@@ -269,7 +406,26 @@ impl Scan {
     }
 
     fn record_site(&mut self, names: &[String]) {
-        if let Some(needle) = site_needle(names) {
+        if self.in_pattern > 0 {
+            return;
+        }
+        let mut resolved = names.to_vec();
+        if let (Some(first), Some(Some(self_ty))) = (resolved.first_mut(), self.impl_self.last())
+            && first == "Self"
+        {
+            first.clone_from(self_ty);
+        }
+        let owner_at = resolved.len().checked_sub(2);
+        if let Some(owner) = owner_at.and_then(|at| resolved.get_mut(at))
+            && let Some(target) = self.aliases.get(owner.as_str())
+        {
+            owner.clone_from(target);
+        }
+        self.record_needle(site_needle(&resolved));
+    }
+
+    fn record_needle(&mut self, needle: Option<&'static str>) {
+        if let Some(needle) = needle {
             let function = self.function();
             self.sites.push((function, needle));
         }
@@ -358,6 +514,34 @@ impl<'ast> Visit<'ast> for Scan {
             self.scan_tokens(tokens.clone());
         }
         visit::visit_trait_item(self, item);
+    }
+
+    fn visit_item_impl(&mut self, item: &'ast ItemImpl) {
+        let self_ty = match &*item.self_ty {
+            Type::Path(path) if path.qself.is_none() => path
+                .path
+                .segments
+                .last()
+                .map(|segment| segment.ident.unraw().to_string()),
+            _ => None,
+        };
+        self.impl_self.push(self_ty);
+        visit::visit_item_impl(self, item);
+        self.impl_self.pop();
+    }
+
+    fn visit_item_use(&mut self, item: &'ast ItemUse) {
+        let mut needles = Vec::new();
+        use_needles(&item.tree, None, &mut needles);
+        for needle in needles {
+            self.record_needle(Some(needle));
+        }
+    }
+
+    fn visit_pat(&mut self, pat: &'ast Pat) {
+        self.in_pattern = self.in_pattern.saturating_add(1);
+        visit::visit_pat(self, pat);
+        self.in_pattern = self.in_pattern.saturating_sub(1);
     }
 
     fn visit_item_fn(&mut self, item: &'ast ItemFn) {
@@ -450,6 +634,9 @@ fn scan(name: &str, src: &str) -> Scan {
     );
     let mut found = Scan::default();
     if let Ok(file) = &parsed {
+        let mut aliases = Aliases::default();
+        aliases.visit_file(file);
+        found.aliases = aliases.0;
         found.visit_file(file);
     }
     found
@@ -579,6 +766,47 @@ impl IpeError { fn f(m: String) -> Self { Self::unexpected(m) } }
         ("d".to_owned(), "ipe_error_unexpected"),
         (OUTSIDE_FN.to_owned(), "IpeErrorKind::Unexpected"),
         ("e".to_owned(), "IpeError::unexpected"),
+        ("f".to_owned(), "IpeError::unexpected"),
+    ];
+    assert_eq!(found, expected);
+}
+
+#[test]
+fn self_alias_and_import_shapes_are_sites_and_patterns_are_not() {
+    let src = r#"
+impl From<ProcessRefusal> for KernelFailure {
+    fn from(r: ProcessRefusal) -> Self { match r { _ => Self::Unexpected(String::new()) } }
+}
+impl KernelFailure {
+    fn message(&self) -> &str { match self { Self::Unexpected(m) | KernelFailure::Decode(m) => m } }
+}
+impl crate::error::IpeError { fn g(m: String) -> Self { Self::unexpected(m) } }
+impl Other { fn h() -> Self { Self::Unexpected } }
+m! { fn i() -> KernelFailure { Self::Unexpected(String::new()) } }
+fn j(k: IpeErrorKind) -> bool { matches!(k, IpeErrorKind::Unexpected) }
+fn k(k: IpeErrorKind) -> bool { if let IpeErrorKind::Unexpected = k { true } else { false } }
+use crate::error::KernelFailure::*;
+use crate::error::{IpeErrorKind::{Io, Unexpected as Odd}, KernelFailure as Kf};
+use crate::error::IpeError as IpeError;
+type Ek = crate::IpeErrorKind;
+fn l() -> Kf { Kf::Unexpected(String::new()) }
+fn m() -> Ek { Ek::Unexpected }
+impl Kf { fn n() -> Self { Self::Unexpected(String::new()) } }
+fn o() { type Late = crate::error::IpeError; }
+fn p() -> Late { Late::unexpected(String::new()) }
+"#;
+    let found = scan("fixture", src).sites;
+    let expected: Vec<(String, &str)> = vec![
+        ("from".to_owned(), "KernelFailure::Unexpected"),
+        ("g".to_owned(), "IpeError::unexpected"),
+        ("i".to_owned(), "Self::Unexpected"),
+        ("j".to_owned(), "IpeErrorKind::Unexpected"),
+        (OUTSIDE_FN.to_owned(), "KernelFailure::Unexpected"),
+        (OUTSIDE_FN.to_owned(), "IpeErrorKind::Unexpected"),
+        ("l".to_owned(), "KernelFailure::Unexpected"),
+        ("m".to_owned(), "IpeErrorKind::Unexpected"),
+        ("n".to_owned(), "KernelFailure::Unexpected"),
+        ("p".to_owned(), "IpeError::unexpected"),
     ];
     assert_eq!(found, expected);
 }

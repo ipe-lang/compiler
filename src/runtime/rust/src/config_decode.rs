@@ -99,23 +99,17 @@ pub fn config_decode_toml<E: DecodeErrorSink + 'static, T>(
     )
 }
 
-/// The byte cap on the parser's description in a TOML parse error.
-const TOML_MESSAGE_MAX_BYTES: usize = 256;
+/// The byte cap on a grammar label kept from a TOML parse error.
+const TOML_LABEL_MAX_BYTES: usize = 48;
 
 /// The parse error for a TOML source, naming the failure and its position.
 ///
-/// `toml`'s `Display` quotes the offending source line, which may hold a
-/// secret, so the message keeps only the parser's description, scrubbed and
-/// capped, and the line and column where the failure starts.
+/// `toml`'s `Display` quotes the offending source line, and its description
+/// names the keys of a duplicate or dotted-key refusal, either of which may
+/// hold a secret. The message keeps only [`toml_category`] and the line and
+/// column where the failure starts.
 fn toml_failure(source: &str, error: &toml::de::Error) -> String {
-    let what = error
-        .message()
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("; ");
-    let what = crate::system::scrub_log_controls_capped(&what, TOML_MESSAGE_MAX_BYTES);
+    let what = toml_category(error.message());
     error
         .span()
         .and_then(|span| line_column(source, span.start))
@@ -123,6 +117,37 @@ fn toml_failure(source: &str, error: &toml::de::Error) -> String {
             || format!("toml parse: {what}"),
             |(line, column)| format!("toml parse: {what} at line {line} column {column}"),
         )
+}
+
+/// The category of a TOML parser description, carrying no input text.
+///
+/// A key-naming refusal keeps its category without the keys; a grammar
+/// refusal (`invalid <label>`) keeps its label when the label is a short run
+/// of lowercase letters, digits, spaces and hyphens, the only shape the
+/// parser's static labels take. Any other description is `invalid document`.
+fn toml_category(message: &str) -> String {
+    let first = message.lines().next().map_or("", str::trim);
+    if first.starts_with("duplicate key") {
+        return "duplicate key".to_owned();
+    }
+    if first.starts_with("dotted key") {
+        return "dotted key extends a value that is not a table".to_owned();
+    }
+    if first == "value is out of range" || first == "recursion limit exceeded" {
+        return first.to_owned();
+    }
+    match first.strip_prefix("invalid ") {
+        Some(label)
+            if !label.is_empty()
+                && label.len() <= TOML_LABEL_MAX_BYTES
+                && label.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b' ' || b == b'-'
+                }) =>
+        {
+            format!("invalid {label}")
+        }
+        _ => "invalid document".to_owned(),
+    }
 }
 
 /// The one-based line and character column of byte `offset` in `source`.
@@ -830,6 +855,68 @@ mod toml_tests {
             "the parse error must name its line and column: {:?}",
             info.message
         );
+    }
+
+    /// A key-naming TOML refusal keeps its category and never names the key.
+    #[test]
+    fn toml_key_error_does_not_echo_the_key() {
+        for source in [
+            "SENTINEL = 1\nSENTINEL = 2\n",
+            "[t]\n\"SENTINEL\" = 1\n\"SENTINEL\" = 2\n",
+            "a = { SENTINEL = 1, SENTINEL = 2 }\n",
+            "SENTINEL = 1\nSENTINEL.b = 2\n",
+        ] {
+            let decoded = config_decode_toml(
+                source.to_owned(),
+                decode_value_identity::<crate::IpeError>(),
+            );
+            let shown = match &decoded {
+                IpeResult::Err(crate::IpeError::Error(crate::IpeErrorKind::Decode, info)) => {
+                    info.message.clone()
+                }
+                IpeResult::Err(crate::IpeError::Error(..)) | IpeResult::Ok(_) => String::new(),
+            };
+            assert!(
+                shown.starts_with("toml parse: ")
+                    && shown.contains(" at line ")
+                    && !shown.contains("SENTINEL"),
+                "a key refusal must be Decode without the key: {:?}",
+                shown.replace("SENTINEL", "<sentinel>")
+            );
+        }
+    }
+
+    /// A description keeps only a fixed category or a static grammar label.
+    #[test]
+    fn toml_category_keeps_no_input_text() {
+        assert_eq!(
+            toml_category("invalid basic string\nexpected `\"`"),
+            "invalid basic string"
+        );
+        assert_eq!(
+            toml_category("invalid unicode 4-digit hex code"),
+            "invalid unicode 4-digit hex code"
+        );
+        assert_eq!(
+            toml_category("duplicate key `SENTINEL` in table `t`"),
+            "duplicate key"
+        );
+        assert_eq!(
+            toml_category("dotted key `SENTINEL.b` attempted to extend non-table type (integer)"),
+            "dotted key extends a value that is not a table"
+        );
+        assert_eq!(
+            toml_category("value is out of range"),
+            "value is out of range"
+        );
+        for echoing in [
+            "invalid type: string \"SENTINEL\", expected i64",
+            "invalid SENTINEL",
+            "unexpected keys in table: SENTINEL",
+            "",
+        ] {
+            assert_eq!(toml_category(echoing), "invalid document", "{echoing:?}");
+        }
     }
 
     /// Positions are one-based lines and character columns; an offset off a boundary has none.
