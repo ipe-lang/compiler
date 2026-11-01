@@ -24,7 +24,7 @@ Two ideas.
 ## A worked example: safe next to unsafe
 
 The example under
-[`examples/shapes/script/html-unsafe-boundary`](../../examples/shapes/script/html-unsafe-boundary/src/Main.ipe)
+[`examples/shapes/script/html-unsafe-boundary`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/html-unsafe-boundary/src/Main.ipe)
 renders the *same* trusted string twice — once through `Html.text`, once through
 `Unsafe.unsafeRaw` — so the difference is visible in one output.
 
@@ -73,7 +73,7 @@ structural tree — is unchanged.
 Reach for this only for trusted, author-controlled markup the safe builders cannot
 express.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

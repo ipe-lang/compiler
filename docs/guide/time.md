@@ -31,7 +31,7 @@ Three knots.
 ## A worked example: a launch window
 
 The example under
-[`examples/shapes/script/time-calendar`](../../examples/shapes/script/time-calendar/src/Main.ipe)
+[`examples/shapes/script/time-calendar`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/time-calendar/src/Main.ipe)
 pins a fixed instant, formats it in UTC, shifts it by a duration, measures the
 span back, and reads two pure calendar helpers.
 
@@ -79,7 +79,7 @@ instant minus an instant is a span" are the only sensible operations, and they a
 the only ones that type-check. A single numeric "time" type would let you add two
 timestamps — a meaningless value the compiler here refuses to produce.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

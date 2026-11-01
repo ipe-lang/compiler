@@ -70,7 +70,7 @@ should still retry the next branch.
 ## Divergences from Elm
 
 `Ipe.Parser` keeps Elm's names and semantics, with a few deliberate differences
-recorded in [`docs/divergences-from-elm.md`](../divergences-from-elm.md): record
+recorded in [`docs/divergences-from-elm.md`](https://github.com/ipe-lang/compiler/blob/main/docs/divergences-from-elm.md): record
 building uses `map2` … `map5` (and `keep` / `ignore` for punctuation) rather than
 Elm's `|=` / `|.` pipeline, and `Parser a` is a transparent `State -> PStep a`
 alias instead of an opaque wrapper. The infix aliases `|.` (`keep`) and `|=`

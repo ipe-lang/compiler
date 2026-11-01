@@ -25,7 +25,7 @@ Three knots.
 ## A worked example: a Caesar cipher
 
 The example under
-[`examples/shapes/script/char-caesar`](../../examples/shapes/script/char-caesar/src/Main.ipe)
+[`examples/shapes/script/char-caesar`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/char-caesar/src/Main.ipe)
 rotates each letter of a message by N places — the small program that shows all
 three knots at once.
 
@@ -89,7 +89,7 @@ against the Unicode-honest signature. And the classification predicates are [eas
 of use][principles] — the branch on "what is this character" reads as plain
 `if isUpper`, not a hand-rolled range check on rune values.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

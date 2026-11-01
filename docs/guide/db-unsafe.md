@@ -66,7 +66,7 @@ second. The safe surface covers the common case without ever issuing verbatim SQ
 or reading a column without proof, so each hatch stays reserved for the residual
 it was built for, and every use of one is an auditable decision.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

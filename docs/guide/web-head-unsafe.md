@@ -24,7 +24,7 @@ Two ideas.
 ## A worked example: product structured data
 
 The example under
-[`examples/shapes/script/jsonld-structured-data`](../../examples/shapes/script/jsonld-structured-data/src/Main.ipe)
+[`examples/shapes/script/jsonld-structured-data`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/jsonld-structured-data/src/Main.ipe)
 emits a JSON-LD block for a product page from a trusted constant.
 
 ```ipe
@@ -54,7 +54,7 @@ JSON, never spliced request input. Producing that JSON from a typed encoder is
 [parse-don't-validate][parse] run in reverse: a typed value serialised to a string
 you can trust, rather than a raw string you hope is well-formed.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 [parse]: ../idioms/parse-dont-validate.md
 
 ## References

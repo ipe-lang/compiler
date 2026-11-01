@@ -1608,6 +1608,100 @@ fn json_unknown_key(key: &str) -> String {
     format!("unknown key {shown:?}")
 }
 
+/// The refusal detail for a JSON mirror object that lists one key twice.
+fn json_duplicate_key(key: &str) -> String {
+    let shown: String = key
+        .chars()
+        .take(crate::line_grammar::MAX_KEY_ECHO)
+        .collect();
+    format!("key {shown:?} is listed twice")
+}
+
+/// A JSON value decoded with every object key unique at every nesting level —
+/// the JSON mirror's single decode point.
+///
+/// `serde_json::Value`'s own decoder keeps only the LAST value of a repeated
+/// object key, so the repeat is gone before any reader of the decoded `Value`
+/// can see it. [`StrictJson`] decodes through [`StrictJsonVisitor`] instead,
+/// which refuses a key its object already holds, so the repeat is caught by the
+/// ONE tokenizer (`serde_json`'s) while it still exists — no second scan of the
+/// raw text, no second notion of what a key is or how its escapes decode.
+/// Depth stays bounded by `serde_json`'s recursion limit, which guards every
+/// nested map and sequence whatever visitor drives it.
+struct StrictJson(serde_json::Value);
+
+impl<'de> serde::Deserialize<'de> for StrictJson {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer
+            .deserialize_any(StrictJsonVisitor)
+            .map(StrictJson)
+    }
+}
+
+/// The [`serde::de::Visitor`] behind [`StrictJson`]: builds a
+/// `serde_json::Value`, refusing a repeated object key.
+struct StrictJsonVisitor;
+
+impl<'de> serde::de::Visitor<'de> for StrictJsonVisitor {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value whose objects list each key once")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Bool(value))
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::from(value))
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::from(value))
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+        serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| E::custom("a number that is not finite"))
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::String(value.to_owned()))
+    }
+
+    fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::String(value))
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(StrictJson(item)) = seq.next_element()? {
+            items.push(item);
+        }
+        Ok(serde_json::Value::Array(items))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut object = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if object.contains_key(key.as_str()) {
+                return Err(<A::Error as serde::de::Error>::custom(json_duplicate_key(
+                    key.as_str(),
+                )));
+            }
+            let StrictJson(value) = map.next_value()?;
+            object.insert(key, value);
+        }
+        Ok(serde_json::Value::Object(object))
+    }
+}
+
 /// Parse the registry's per-package JSON mirror (`/packages/<name>.json`) into
 /// the SAME typed [`IndexEntry`] the TOML reader produces.
 ///
@@ -1630,10 +1724,11 @@ fn json_unknown_key(key: &str) -> String {
 /// ```
 ///
 /// # Errors
-/// [`CliError::Resolve`] when the JSON is malformed, is missing `publisher` or
-/// `versions`, lists zero versions or one version twice, or any per-version
-/// field fails its typed constructor (an unknown or repeated capability, a
-/// non-immutable `rev`, an injection-shaped `source`).
+/// [`CliError::Resolve`] when the JSON is malformed, repeats a key within one
+/// JSON object at any nesting level, is missing `publisher` or `versions`,
+/// lists zero versions or one version twice, or any per-version field fails
+/// its typed constructor (an unknown or repeated capability, a non-immutable
+/// `rev`, an injection-shaped `source`).
 pub fn parse_entry_json(name: &str, text: &str) -> Result<IndexEntry, CliError> {
     let name = &PackageName::parse(name)?;
     let malformed = |detail: &str| {
@@ -1643,7 +1738,7 @@ pub fn parse_entry_json(name: &str, text: &str) -> Result<IndexEntry, CliError> 
         ))
     };
 
-    let value: serde_json::Value =
+    let StrictJson(value) =
         serde_json::from_str(text).map_err(|e| malformed(&format!("not valid JSON: {e}")))?;
     let object = value
         .as_object()
@@ -2855,6 +2950,78 @@ mod tests {
                             "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "signature": null } ] }"#;
         let entry = super::parse_entry_json("x", json).expect("parses");
         assert!(entry.versions.first().expect("v").signature.is_none());
+    }
+
+    /// A repeated object key is refused, never last-wins, at the top-level
+    /// header object, inside a nested `versions` element, inside the nested
+    /// `signature` bundle, and when the two spellings differ only by a `\u`
+    /// escape — mirroring the TOML reader's [`EntryFault::DuplicateKey`]. One
+    /// key in sibling objects is no repeat.
+    #[test]
+    fn json_mirror_refuses_a_duplicate_key() {
+        use crate::CliError;
+        let sha = "0".repeat(64);
+        let entry = |header: &str, version: &str| {
+            format!(
+                r#"{{ {header} "publisher": "p",
+                    "versions": [ {{ "version": "1.0.0",
+                        "source": "https://example.invalid/x",
+                        "rev": "{FIXTURE_REV}",
+                        {version}
+                        "sha256": "{sha}" }} ] }}"#
+            )
+        };
+        for (what, text, key) in [
+            (
+                "top-level",
+                entry(r#""name": "http-extras", "name": "http-extras","#, ""),
+                "name",
+            ),
+            (
+                "escaped spelling",
+                entry(r#""name": "http-extras", "name" : "http-extras","#, ""),
+                "name",
+            ),
+            (
+                "`versions` element",
+                entry("", &format!(r#""rev": "{FIXTURE_REV}","#)),
+                "rev",
+            ),
+            (
+                "`signature` bundle",
+                entry(
+                    "",
+                    r#""signature": { "dsseEnvelope": {}, "dsseEnvelope": {} },"#,
+                ),
+                "dsseEnvelope",
+            ),
+        ] {
+            let refused = super::parse_entry_json("http-extras", &text);
+            assert!(
+                matches!(refused, Err(CliError::Resolve(_))),
+                "a duplicate {what} key must be refused"
+            );
+            let Err(CliError::Resolve(msg)) = refused else {
+                return;
+            };
+            assert!(
+                msg.contains(&format!("key \"{key}\" is listed twice")),
+                "{what}: {msg}"
+            );
+        }
+
+        let siblings = format!(
+            r#"{{ "name": "http-extras", "publisher": "p",
+                "versions": [
+                    {{ "version": "1.0.0", "source": "https://example.invalid/x",
+                       "rev": "{FIXTURE_REV}", "sha256": "{sha}" }},
+                    {{ "version": "1.1.0", "source": "https://example.invalid/y",
+                       "rev": "{FIXTURE_REV}", "sha256": "{sha}" }} ] }}"#
+        );
+        assert!(
+            super::parse_entry_json("http-extras", &siblings).is_ok(),
+            "one key in sibling objects is no repeat"
+        );
     }
 
     /// A `publisher` that is not login-shaped is refused by both entry readers,

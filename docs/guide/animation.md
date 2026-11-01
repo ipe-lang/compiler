@@ -24,7 +24,7 @@ Two ideas.
 ## A worked example: an infinite pulse
 
 The example under
-[`examples/shapes/script/animation-spec`](../../examples/shapes/script/animation-spec/src/Main.ipe)
+[`examples/shapes/script/animation-spec`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/animation-spec/src/Main.ipe)
 builds a pulse — 600ms, ease-in-out, running forever, holding its final frame — and
 renders the shorthand.
 
@@ -58,7 +58,7 @@ function and each closed-set value is its own constructor. `defaultSpec` also
 defaults `respectReducedMotion` on, so an animation is accessibility-safe unless you
 explicitly opt out — the safe choice is the one you get without asking.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

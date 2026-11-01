@@ -424,10 +424,6 @@ pub(crate) enum KernelHome {
 
 /// The three qualifier-resolution tables [`kernel_module_path`] joins
 /// against, built once from the canon and compiled-source registries.
-///
-/// Shared by `coverage::surface` and `doc`'s kernel-module renderer so the two
-/// consumers resolve a kernel qualifier's module the same way — a qualifier
-/// homed here cannot be homed differently there.
 pub(crate) fn qualifier_lookup_tables()
 -> (QualifierModuleMap, QualifierModuleMap, QualifierModuleMap) {
     let qualifier_to_path: QualifierModuleMap = ipe_canon::STDLIB_MODULE_QUALIFIERS

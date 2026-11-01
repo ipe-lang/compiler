@@ -28,7 +28,7 @@ Three knots.
 ## A worked example: a round-trip and a fail-closed enum
 
 The example under
-[`examples/shapes/script/codec-round-trip`](../../examples/shapes/script/codec-round-trip/src/Main.ipe)
+[`examples/shapes/script/codec-round-trip`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/codec-round-trip/src/Main.ipe)
 round-trips a `List Int` through JSON and decodes a `Priority` enum, including an
 unknown tag.
 
@@ -91,7 +91,7 @@ is an `Err` value the caller handles, and `fromJsonSafe`'s size guard plus the
 decoder's own depth bound keep an adversarial payload from exhausting memory or the
 stack.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 
