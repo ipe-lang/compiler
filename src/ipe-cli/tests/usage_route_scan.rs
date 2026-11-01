@@ -208,7 +208,7 @@ const UNROUTED: &[(&str, &str, usize, &str)] = &[
     (
         "doc.rs",
         "build_index",
-        2,
+        3,
         "a stdlib index, bundle, kernel table, or picker failure: neither an argument nor the project",
     ),
     (
