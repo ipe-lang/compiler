@@ -64,7 +64,8 @@ pub const BROWSER_TIMER_MAX_MS: u32 = i32::MAX.unsigned_abs();
 ///
 /// This is the rule the FFI scalar coercion (`ipe_ffi::num_coerce::num_saturate`)
 /// renders for a `u8` parameter, so a byte in a foreign slice and a scalar `u8`
-/// argument narrow alike.
+/// argument narrow alike. The `ipe` crate's `ffi_byte_narrow_parity` test links
+/// both and pins their agreement.
 #[must_use]
 pub fn byte_saturating(n: i64) -> u8 {
     u8::try_from(n.clamp(0, i64::from(u8::MAX))).unwrap_or(u8::MAX)

@@ -446,8 +446,9 @@ pub fn ipe_maybe_and_then<T, U>(m: IpeMaybe<T>, f: impl FnOnce(T) -> IpeMaybe<U>
 /// `IpeMaybe<T>` -> `Option<T>` for FFI parameter coercion: a Ipê `Maybe X`
 /// argument reaches the wrapper as `IpeMaybe<X>` but the underlying crate fn
 /// takes `Option<…>`. The generated wrapper calls this then adapts the inner
-/// value (`.as_deref()` for `Option<&str>`, `.map(|x| x as u16)` for narrowed
-/// numerics, identity otherwise). Total: `Just -> Some`, `Nothing -> None`.
+/// value (`.as_deref()` for `Option<&str>`, the saturating `num_saturate` form
+/// `.map(|x| (x).clamp(0, u16::MAX as i64) as u16)` for narrowed numerics,
+/// identity otherwise). Total: `Just -> Some`, `Nothing -> None`.
 pub fn ipe_maybe_to_option<T>(m: IpeMaybe<T>) -> Option<T> {
     match m {
         IpeMaybe::Just(v) => Some(v),
