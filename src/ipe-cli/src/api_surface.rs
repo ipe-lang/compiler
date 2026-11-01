@@ -194,6 +194,11 @@ pub struct WalkedTree {
 /// modules through the identical discovery rule — one `src/`-aware walk, one
 /// single-file fallback — rather than a divergent second copy.
 ///
+/// The walk reads the package's own `src/` without reading `package.ipe`, so
+/// no declared dependency joins the tree. The extraction over it type-checks
+/// exactly these sources: a module that imports one a declared dependency
+/// provides fails as an unresolved module, never a silently narrower API.
+///
 /// # Errors
 /// [`DiffError::Io`] on a read failure, [`DiffError::Source`] when discovery or
 /// a source read is refused for any other typed reason, and
