@@ -53,7 +53,7 @@ const IMPORTING_MAIN: &str =
     "module Main exposing (main)\n\nimport SLib\n\n\nmain =\n    SLib.value\n";
 
 /// A clean entry that imports nothing.
-const PLAIN_MAIN: &str = "module Main exposing (main)\n\n\nmain =\n    0\n";
+const PLAIN_MAIN: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\n\n\nmain : Task Error ()\nmain =\n    Io.println \"ok\"\n";
 
 /// A project under `base` named `project`, whose `package.ipe` record carries
 /// `fields` after its name and whose `src/Main.ipe` and `tests/Main.ipe` are `main`.
@@ -88,7 +88,14 @@ const DECLARED: [(&str, &str); 3] = [
 ];
 
 /// Every compiling command, as the arguments before the project directory.
-const COMPILING: [&[&str]; 4] = [&["type-check"], &["dev", "build"], &["test"], &["lint"]];
+const COMPILING: [&[&str]; 6] = [
+    &["type-check"],
+    &["dev", "build"],
+    &["dev", "run"],
+    &["release", "build"],
+    &["test"],
+    &["lint"],
+];
 
 /// Whether `stderr` holds a command's help page (its `Arguments:` section).
 fn shows_help(stderr: &str) -> bool {
@@ -178,6 +185,7 @@ fn a_package_without_dependencies_type_checks() {
 /// A located manifest refusal and a moved source root are project-state
 /// refusals: they name the problem and never print the command's help page.
 #[test]
+#[allow(clippy::expect_used)] // a failed fixture write is the test failure
 fn a_project_state_refusal_prints_no_help() {
     for (tag, field, needle) in [
         (
@@ -185,16 +193,46 @@ fn a_project_state_refusal_prints_no_help() {
             ", delivery = { browser = { themeColor = \"#000\" } }",
             "`themeColor` is not a browser field",
         ),
-        ("source-root", ", sourceRoot = \"app\"", "sourceRoot"),
+        (
+            "source-root",
+            ", sourceRoot = \"app\"",
+            "`sourceRoot` is not a package field",
+        ),
     ] {
         let base = fresh_dir(tag);
         let dir = project(&base, field, PLAIN_MAIN);
+        // The moved root exists, so the refusal is the removed field, not a missing directory.
+        std::fs::create_dir_all(dir.join("app")).expect("create the moved root");
         let r = run(&["type-check", &dir.to_string_lossy()]);
         let _ = std::fs::remove_dir_all(&base);
         assert!(!r.ok, "{tag}: the manifest must be refused");
         assert!(r.stderr.contains(needle), "{tag}: {}", r.stderr);
         assert!(!shows_help(&r.stderr), "{tag}: printed help:\n{}", r.stderr);
     }
+}
+
+/// Building a library package, which has no entry, is a project-state refusal:
+/// it names the library and never prints the command's help page.
+#[test]
+#[allow(clippy::expect_used)] // a failed fixture write is the test failure
+fn a_library_build_refusal_prints_no_help() {
+    let base = fresh_dir("library");
+    let dir = project(&base, ", exposedModules = [ \"SLib\" ]", PLAIN_MAIN);
+    std::fs::remove_file(dir.join("src").join("Main.ipe")).expect("drop the entry");
+    std::fs::write(
+        dir.join("src").join("SLib.ipe"),
+        "module SLib exposing (value)\n\n\nvalue =\n    1\n",
+    )
+    .expect("write the library module");
+    let r = run(&["dev", "build", &dir.to_string_lossy()]);
+    let _ = std::fs::remove_dir_all(&base);
+    assert!(!r.ok, "a library has no entry to build");
+    assert!(
+        r.stderr.contains("this is a library package"),
+        "{}",
+        r.stderr
+    );
+    assert!(!shows_help(&r.stderr), "printed help:\n{}", r.stderr);
 }
 
 /// Real argument misuse still prints the command's help page, so the

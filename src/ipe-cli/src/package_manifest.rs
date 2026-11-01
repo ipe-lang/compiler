@@ -4551,4 +4551,50 @@ mod tests {
         let m = reparsed.expect("re-parses");
         assert_eq!(m.declared().len(), 1);
     }
+
+    /// A dependency name declared twice is refused at the entry, never resolved
+    /// to one of the two.
+    #[test]
+    fn a_dependency_declared_twice_is_refused() {
+        let source = format!(
+            "{HEADER}package =\n\
+             \x20   {{ name = \"app\"\n\
+             \x20   , dependencies =\n\
+             \x20       [ depPath \"s-lib\" \"../a\"\n\
+             \x20       , dep \"s-lib\" \"^1\"\n\
+             \x20       ]\n\
+             \x20   }}\n"
+        );
+        let result = read("dup_dependency", &source).map(|m| m.declared().len());
+        assert!(
+            matches!(&result, Err(CliError::ProjectRefused(msg))
+                if msg.to_string().contains("`s-lib` is declared twice")),
+            "a repeated dependency name must be refused: {result:?}"
+        );
+    }
+
+    /// A dependency name `PackageName` refuses is refused at the manifest, in
+    /// every builder, before any path or version is read.
+    #[test]
+    fn a_dependency_name_that_is_not_a_package_name_is_refused() {
+        let builders = ["depPath {} \"../a\"", "dep {} \"^1\"", "depGit {} \"u\""];
+        for (index, name) in ["s_lib", "-a", "A", "../x"].into_iter().enumerate() {
+            for builder in builders {
+                let call = builder.replacen("{}", &format!("{name:?}"), 1);
+                let source = format!(
+                    "{HEADER}package =\n\
+                     \x20   {{ name = \"app\"\n\
+                     \x20   , dependencies = [ {call} ]\n\
+                     \x20   }}\n"
+                );
+                let result =
+                    read(&format!("bad_dep_name_{index}"), &source).map(|m| m.declared().len());
+                assert!(
+                    matches!(&result, Err(CliError::ProjectRefused(msg))
+                        if msg.to_string().contains("package name")),
+                    "dependency name {name:?} in `{call}` must be refused: {result:?}"
+                );
+            }
+        }
+    }
 }

@@ -457,7 +457,7 @@ mod tests {
             "{library}"
         );
         let moved = refused(&tree().field("sourceRoot = \"app\""));
-        assert!(matches!(moved, CliError::Usage(_)));
+        assert!(matches!(moved, CliError::ProjectRefused(_)));
     }
 
     #[test]

@@ -918,6 +918,9 @@ fn set_format(slot: &mut Option<OutputFormat>, requested: OutputFormat) -> Resul
 fn prepare(snapshot: PackageSnapshot) -> Result<Prepared, CliError> {
     let manifest = snapshot.manifest();
     let manifest_path = crate::driver::snapshot_manifest_path(&snapshot);
+    // A declared dependency is refused before any step touches the package
+    // tree or runs its foreign code; the source set below re-mints the proof.
+    let _compiled = manifest.compiled_dependencies()?;
 
     // Reject wrapper-only packages: the gate cannot regenerate wrapper bindings
     // from an independent pinned source, so a committed `_bindings.rs` must
@@ -2779,6 +2782,42 @@ mod tests {
             "a committed FFI cache must be removed before the build: {:?}",
             result.as_ref().err()
         );
+    }
+
+    /// A package that declares a dependency is refused before the FFI cache is
+    /// purged or any binding regenerated, so the refusal leaves its tree as found.
+    #[test]
+    fn prepare_refuses_a_declared_dependency_before_touching_the_tree() {
+        let dir = make_test_dir("dep-refused-first");
+        let src = dir.join("src");
+        std::fs::create_dir(&src).expect("create src/");
+        std::fs::write(src.join("Main.ipe"), "module Main exposing (..)\n")
+            .expect("write Main.ipe");
+        std::fs::write(
+            dir.join("package.ipe"),
+            "module Package exposing (package)\n\n\npackage =\n\
+             \x20   { name = \"dep-pkg\", version = \"0.1.0\"\n\
+             \x20   , dependencies = [ depPath \"s-lib\" \"../s-lib\" ]\n\
+             \x20   }\n",
+        )
+        .expect("write package.ipe");
+        let cache = dir.join(ipe_ffi::driver::FFI_CACHE_REL);
+        std::fs::create_dir_all(&cache).expect("create committed cache");
+        std::fs::write(cache.join("kept_bindings.rs"), "pub fn kept() {}\n")
+            .expect("plant committed bindings");
+
+        let result = capture_package(&dir).and_then(prepare);
+        let survived = cache.join("kept_bindings.rs").exists();
+        if let Ok(prepared) = &result {
+            let _ = std::fs::remove_dir_all(&prepared.emitted_dir);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(&result, Err(CliError::DependencyNotCompiled { .. })),
+            "a declared dependency must be refused: {:?}",
+            result.as_ref().err()
+        );
+        assert!(survived, "the refusal must leave the package tree as found");
     }
 
     /// A manifest with no FFI sections (pure Ipê) is not affected by the wrapper

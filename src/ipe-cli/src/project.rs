@@ -1448,7 +1448,7 @@ pub struct CompiledDeps {
 impl CompiledDeps {
     /// The proof for a build with no manifest (a loose file, a scratch build),
     /// which declares no dependency.
-    pub const fn none() -> Self {
+    pub(crate) const fn none() -> Self {
         Self { _sealed: () }
     }
 }
