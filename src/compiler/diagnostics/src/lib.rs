@@ -22,8 +22,8 @@ pub mod terminal;
 pub use code::*;
 pub use diagnostic::{
     AliasExpansionKind, AliasRowFault, AppShape, Applicability, Candidates, CaseDefect,
-    CmdSubShapeMismatch, CodecAutoRejection, ConsentError, Construct, DResult, Diagnostic,
-    EditTarget, EmitSite, Expected, ExpectedSet, ExposingDefect, Feature, FfiError,
+    CmdSubShapeMismatch, CodecAutoRejection, ConsentError, Construct, CtorWithheld, DResult,
+    Diagnostic, EditTarget, EmitSite, Expected, ExpectedSet, ExposingDefect, Feature, FfiError,
     GenericAppEntryReach, HOF_KERNEL_RESULT_CLASS, HazardRefusal, HeaderDefect, HelpLine, Hint,
     INTERPOLABLE_CLASS, INTERPOLABLE_TYPES, IfDefect, ImportedAs, InterceptContext, LetDefect,
     LowerError, MainRetName, ModelLeaf, ModulePlacementReason, ModulePlacementRejection,
