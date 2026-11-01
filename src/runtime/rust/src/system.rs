@@ -7128,6 +7128,7 @@ mod argv_tests {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod process_status_tests {
     use super::ProcessStatus;
 
