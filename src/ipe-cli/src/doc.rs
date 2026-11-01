@@ -121,7 +121,6 @@ use crate::api_surface::{
     DiffError, ModuleApi, ModulePath, PublicApi, UnionApi, extract_walked, read_tree,
 };
 use crate::cli_args::OutputFormat;
-use crate::coverage::surface::KernelHome;
 use crate::doc_bundle::{
     BundleError, BundleSource, DocBundle, DocEntry, DocKind, DocsOverlay, is_qualified,
 };
@@ -1110,7 +1109,10 @@ fn render_member(module: &ModuleDoc, member: &str, format: OutputFormat) {
     let value = module.values.iter().find(|v| v.name == member);
     let union = module.unions.iter().find(|u| u.name == member);
     let (declaration, comment) = match (value, union) {
-        (Some(v), _) => (format!("{} : {}", v.name, v.signature), v.comment.as_str()),
+        (Some(v), _) => (
+            format!("{} : {}", v.name, v.signature.text()),
+            v.comment.as_str(),
+        ),
         (None, Some(u)) => (
             format!("type {}{}", u.name, union_params(u.params)),
             u.comment.as_str(),
@@ -1151,7 +1153,7 @@ fn render_member(module: &ModuleDoc, member: &str, format: OutputFormat) {
 
 /// `ipe doc --type "<type expr>"` — search the stdlib API by type signature.
 ///
-/// Builds the full stdlib docs, normalizes each symbol's `signature_ty`, and
+/// Builds the full stdlib docs, normalizes each symbol's checked type, and
 /// scores it against the parsed + normalized query. Results are printed ranked
 /// (lower score = better), up to 20 hits.
 ///
@@ -1457,15 +1459,54 @@ pub struct ModuleDoc {
 pub struct ValueDoc {
     /// The value name.
     pub name: String,
-    /// Its checker-inferred, α-canonicalised type signature.
-    pub signature: String,
-    /// The same signature in its resolved [`TyDoc`] form, whose type-constructor
-    /// nodes carry the canonicaliser's resolved module + name. Cross-references
-    /// are computed from this — never from the flat string — so a link is a real
-    /// resolved identity, not a text match.
-    pub signature_ty: TyDoc,
+    /// Its type signature.
+    pub signature: ValueSignature,
     /// Its doc-comment, empty when it has none.
     pub comment: String,
+}
+
+/// Where a documented value's signature comes from.
+///
+/// A value either has a checked type, from which every rendering (text and
+/// cross-reference links alike) is derived, or only the annotation its source
+/// spells. The two never share one field, so a value with no checked type can
+/// never render a placeholder type in place of its annotation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValueSignature {
+    /// The checker-inferred, α-canonicalised type, whose type-constructor nodes
+    /// carry the canonicaliser's resolved module + name. Links are computed from
+    /// this, never from text, so a link is a real resolved identity.
+    Resolved(TyDoc),
+    /// The annotation as written in source, whitespace-folded: an unschemed
+    /// kernel alias or a documentation-only veneer member, neither of which has
+    /// a checked type. It renders verbatim and carries no links.
+    Written(String),
+}
+
+impl ValueSignature {
+    /// The signature's flat, link-free text.
+    pub(crate) fn text(&self) -> String {
+        match self {
+            Self::Resolved(ty) => plain_signature(ty),
+            Self::Written(annotation) => annotation.clone(),
+        }
+    }
+
+    /// The signature as a piece sequence, linking every resolved in-package type.
+    fn pieces(&self, index: &AnchorIndex) -> Vec<SigPiece> {
+        match self {
+            Self::Resolved(ty) => signature_pieces(ty, index),
+            Self::Written(annotation) => vec![SigPiece::Text(annotation.clone())],
+        }
+    }
+
+    /// The checked type, when there is one.
+    pub(crate) const fn resolved(&self) -> Option<&TyDoc> {
+        match self {
+            Self::Resolved(ty) => Some(ty),
+            Self::Written(_) => None,
+        }
+    }
 }
 
 /// One exposed union type's documentation.
@@ -1866,8 +1907,7 @@ fn build_compiled_std_module_doc(
         };
         doc.values.push(ValueDoc {
             name: name.clone(),
-            signature,
-            signature_ty: TyDoc::Unit,
+            signature: ValueSignature::Written(signature),
             comment: comments.get(name).unwrap_or_default(),
         });
     }
@@ -1923,12 +1963,13 @@ fn build_source_only_module_doc(segments: &[String], source: &str) -> ModuleDoc 
     let values = extracted
         .exports
         .into_iter()
-        .filter(|e| e.signature.is_some())
-        .map(|e| ValueDoc {
-            name: e.name,
-            signature: e.signature.unwrap_or_default(),
-            signature_ty: TyDoc::Unit,
-            comment: e.doc.unwrap_or_default(),
+        .filter_map(|e| {
+            let signature = e.signature?;
+            Some(ValueDoc {
+                name: e.name,
+                signature: ValueSignature::Written(signature),
+                comment: e.doc.unwrap_or_default(),
+            })
         })
         .collect();
     ModuleDoc {
@@ -1940,46 +1981,92 @@ fn build_source_only_module_doc(segments: &[String], source: &str) -> ModuleDoc 
     }
 }
 
-/// Restore the canonical two-argument `Task Error a` form a user writes in an
-/// annotation, undoing the type checker's internal one-argument `Task a`
-/// reduction wherever `Task` appears, including nested inside another type.
+/// The builtin row a kernel type scheme names `Error` by, found at compile time.
+const fn builtin_error_row(
+    rows: &'static [ipe_kernels::BuiltinRow],
+) -> Option<&'static ipe_kernels::BuiltinRow> {
+    match rows.split_first() {
+        Some((row, rest)) => {
+            if matches!(row.tag(), Some(ipe_kernels::BuiltinTag::Error)) {
+                Some(row)
+            } else {
+                builtin_error_row(rest)
+            }
+        }
+        None => None,
+    }
+}
+
+/// The `Error` row of [`ipe_kernels::BUILTIN_TYPES`]; the assertion below makes
+/// its absence a build error, so [`restore_task_error_channel`] never meets `None`.
+const BUILTIN_ERROR_ROW: Option<&ipe_kernels::BuiltinRow> =
+    builtin_error_row(ipe_kernels::BUILTIN_TYPES);
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if `BUILTIN_TYPES` loses its `Error` row [ledger #boundary]
+const _: () = assert!(
+    BUILTIN_ERROR_ROW.is_some(),
+    "BUILTIN_TYPES must carry the row tagged BuiltinTag::Error"
+);
+
+/// The `(module, name)` a [`TyDoc::Con`] carries for builtin `row`.
+fn builtin_head(row: &ipe_kernels::BuiltinRow) -> (Box<str>, Box<str>) {
+    let module = match row.home() {
+        ipe_kernels::KernelHome::Builtin => "",
+        ipe_kernels::KernelHome::Module(path) => path,
+    };
+    (module.into(), row.name().into())
+}
+
+/// Whether the head `(module, name)` is the builtin `Task` row.
 ///
-/// `Builder::normalize_annotation_ty` (`src/compiler/types`) validates a
-/// user's `Task Error a` then reduces it to the internal unary `Task a` — the
-/// error channel is always the builtin `Error` type and so implicit in the
-/// IR. By the time a `Ty` reaches [`ty_to_doc`] that information is already
-/// gone, so a `ValueDoc` built straight from it would print the
-/// uncompilable `Task a` (dropping the error type) instead of the form the
-/// annotation actually requires. This is a presentation-layer restoration,
-/// not a parse of the lost information: a one-arg builtin `Task` always meant
-/// `Task Error a` internally, so re-inserting the fixed `Error` head is exact,
-/// never a guess.
+/// Keyed on the row's [`ipe_kernels::BuiltinTag`], never on the spelling: a user
+/// type named `Task` in its own module is a different row (or none) and is left
+/// alone.
+fn is_builtin_task(module: &str, name: &str) -> bool {
+    let segments: Vec<&str> = if module.is_empty() {
+        Vec::new()
+    } else {
+        module.split('.').collect()
+    };
+    ipe_kernels::BuiltinType::of_head(&segments, name).and_then(|builtin| builtin.row().tag())
+        == Some(ipe_kernels::BuiltinTag::Task)
+}
+
+/// Restore the two-argument `Task Error a` form a user writes in an annotation,
+/// wherever the builtin `Task` appears, including nested inside another type.
+///
+/// The checker holds `Task` as unary: `Builder::normalize_annotation_ty`
+/// (`src/compiler/types`) validates a written `Task Error a` and reduces it to
+/// `Task a`, and every kernel scheme names `Task` with one argument. The error
+/// channel is always the builtin `Error`, so it is implicit in every `Ty` that
+/// reaches [`ty_to_doc`] and no un-reduced type exists to read instead. A
+/// one-argument builtin `Task` therefore always means `Task Error a`, and
+/// re-inserting the `Error` head is exact, never a guess. Both heads are read
+/// from their [`ipe_kernels::BUILTIN_TYPES`] rows by tag.
 fn restore_task_error_channel(ty: TyDoc) -> TyDoc {
     match ty {
         TyDoc::Con { module, name, args } => {
-            let args: Vec<TyDoc> = Vec::from(args)
+            let mut args: Vec<TyDoc> = Vec::from(args)
                 .into_iter()
                 .map(restore_task_error_channel)
                 .collect();
-            if module.is_empty() && &*name == "Task" && args.len() == 1 {
-                let error = TyDoc::Con {
-                    module: "".into(),
-                    name: "Error".into(),
-                    args: Box::from([]),
-                };
-                let mut restored = vec![error];
-                restored.extend(args);
-                TyDoc::Con {
-                    module,
-                    name,
-                    args: restored.into_boxed_slice(),
-                }
-            } else {
-                TyDoc::Con {
-                    module,
-                    name,
-                    args: args.into_boxed_slice(),
-                }
+            if args.len() == 1
+                && is_builtin_task(&module, &name)
+                && let Some(error_row) = BUILTIN_ERROR_ROW
+            {
+                let (error_module, error_name) = builtin_head(error_row);
+                args.insert(
+                    0,
+                    TyDoc::Con {
+                        module: error_module,
+                        name: error_name,
+                        args: Box::from([]),
+                    },
+                );
+            }
+            TyDoc::Con {
+                module,
+                name,
+                args: args.into_boxed_slice(),
             }
         }
         TyDoc::Fun(a, b) => TyDoc::Fun(
@@ -2004,177 +2091,117 @@ fn restore_task_error_channel(ty: TyDoc) -> TyDoc {
     }
 }
 
-/// Every real module path whose final segment is the shape-scoped qualifier
-/// `qualifier` (`"Cmd"` or `"Sub"`) — the fan-out targets for a generic shape
-/// kernel with no single canonical home ([`KernelHome::ShapeScoped`]).
-///
-/// Every TEA shape (`Tui`, `Cli`, `Web`, `Worker`) re-exports the same generic
-/// `Cmd`/`Sub` kernel (`none`, `batch`, `perform`/`every`, `map`) under its own
-/// `Ipe.Tea.<Shape>.{Cmd,Sub}` path, so the kernel has no one page and must
-/// render onto every shape's. The retired `Ipe.Tea.Terminal` namespace is
-/// excluded (superseded by `Tui`/`Cli` — see
-/// `tea_terminal_namespace_absent_from_site`).
-fn shape_scoped_module_paths(
-    qualifier: &str,
-    qualifier_to_path: &crate::coverage::surface::QualifierModuleMap,
-) -> Vec<String> {
-    let mut paths: Vec<String> = qualifier_to_path
-        .values()
-        .filter(|segs| {
-            segs.last().map(String::as_str) == Some(qualifier)
-                && !segs.iter().any(|seg| seg == "Terminal")
-        })
-        .map(|segs| segs.join("."))
-        .collect();
-    paths.sort();
-    paths.dedup();
-    paths
-}
-
-/// Resolve one schemed kernel's module path(s) and render its [`ValueDoc`].
-///
-/// Usually one page. Two exceptions fan out or reroute:
-/// - A generic shape-scoped `Cmd`/`Sub` kernel ([`KernelHome::ShapeScoped`])
-///   has no single canonical home, so it renders onto every real shape page
-///   via [`shape_scoped_module_paths`] — except the three Web-PubSub kernels
-///   (`publish`, `publishNoEcho`, `subscribeTopic`), identified by
-///   [`ipe_kernels::StdlibKernel::required_runtime_module`] returning
-///   [`ipe_kernels::RuntimeModule::Web`], which route only to their real
-///   single home `Ipe.Tea.Web.PubSub`.
-/// - A `Db`-family kernel named `unsafe*` reroutes from the generic `Ipe.Db`
-///   fallback to the real `Ipe.Db.Unsafe` compiled-source module when one
-///   exists, so `Ipe.Db`'s page (which has no compiled-source gatekeeper of
-///   its own to tell a safe member from an unsafe one) never lists a member
-///   that actually lives in — and is only callable through — `Ipe.Db.Unsafe`.
-///
-/// `Ok(None)` only for an internal qualifier ([`KernelHome::Internal`]), or a
-/// `ShapeScoped` qualifier with no real page at all — never an invented
-/// `Ipe.<qualifier>` page.
+/// Render one pooled kernel member's [`ValueDoc`] from its kernel's scheme.
 ///
 /// # Errors
-/// [`CliError::Usage`] when the kernel's qualifier does not resolve to a known
-/// module, or when `ty` fails to render through [`ty_to_doc`] (e.g. a
-/// `Ty::Con` naming a [`ipe_intern::Symbol`] `interner` never interned) — both
-/// propagate here rather than silently skipping the kernel, so a render
+/// [`CliError::Usage`] when `ty` fails to render through [`ty_to_doc`] (e.g. a
+/// `Ty::Con` naming a [`ipe_intern::Symbol`] `interner` never interned): the
+/// failure propagates rather than silently dropping the member, so a render
 /// failure never shrinks the page by one row.
-fn kernel_value_doc(
-    kernel: ipe_kernels::StdlibKernel,
-    decl: ipe_kernels::StdlibDecl,
-    ty: &Ty,
-    interner: &Interner,
-    qualifier_to_path: &crate::coverage::surface::QualifierModuleMap,
-    compiled_by_dotted: &crate::coverage::surface::QualifierModuleMap,
-    compiled_by_last_segment: &crate::coverage::surface::QualifierModuleMap,
-) -> Result<Option<(Vec<String>, ValueDoc)>, CliError> {
-    let home = crate::coverage::surface::kernel_module_path(
-        decl.qualifier,
-        qualifier_to_path,
-        compiled_by_dotted,
-        compiled_by_last_segment,
-    )
-    .map_err(|e| CliError::Usage(text::msg::doc_kernel_table_error(&e)))?;
-    let module_paths = match home {
-        KernelHome::Module(path) => {
-            let joined = path.join(".");
-            let unsafe_home = format!("{joined}.Unsafe");
-            if decl.name.starts_with("unsafe") && compiled_by_dotted.contains_key(&unsafe_home) {
-                vec![unsafe_home]
-            } else {
-                vec![joined]
-            }
-        }
-        KernelHome::ShapeScoped => {
-            if kernel.required_runtime_module() == Some(ipe_kernels::RuntimeModule::Web) {
-                match qualifier_to_path.get("TeaWebPubSub") {
-                    Some(path) => vec![path.join(".")],
-                    None => return Ok(None),
-                }
-            } else {
-                shape_scoped_module_paths(decl.qualifier, qualifier_to_path)
-            }
-        }
-        KernelHome::Internal => return Ok(None),
-    };
-    if module_paths.is_empty() {
-        return Ok(None);
-    }
+fn kernel_value_doc(name: &str, ty: &Ty, interner: &Interner) -> Result<ValueDoc, CliError> {
     let mut namer = VarNamer::new();
-    let ty_doc = restore_task_error_channel(ty_to_doc(ty, interner, &mut namer).map_err(|d| {
-        CliError::Usage(text::msg::doc_kernel_table_error(
-            &ipe_diagnostics::plain_message(&d, ""),
-        ))
-    })?);
-    let signature = plain_signature(&ty_doc);
-    Ok(Some((
-        module_paths,
-        ValueDoc {
-            name: decl.name.to_owned(),
-            signature,
-            signature_ty: ty_doc,
-            comment: String::new(),
-        },
-    )))
+    let ty_doc = ty_to_doc(ty, interner, &mut namer).map_err(|d| kernel_doc_error(&d))?;
+    Ok(ValueDoc {
+        name: name.to_owned(),
+        signature: ValueSignature::Resolved(restore_task_error_channel(ty_doc)),
+        comment: String::new(),
+    })
 }
 
-/// Build [`ModuleDoc`]s for every kernel-qualifier stdlib module.
+/// The refusal a kernel page that cannot be built raises.
+fn kernel_doc_error(diag: &ipe_diagnostics::Diagnostic) -> CliError {
+    CliError::Usage(text::msg::doc_kernel_table_error(
+        &ipe_diagnostics::plain_message(diag, ""),
+    ))
+}
+
+/// The refusal for a kernel pool entry no import could install.
+fn kernel_pool_bug(module: &str, detail: &str) -> CliError {
+    kernel_doc_error(&ipe_diagnostics::Diagnostic::CompilerBug {
+        where_: "doc.kernel_module_pool",
+        detail: format!("`{module}`: {detail}"),
+    })
+}
+
+/// Build [`ModuleDoc`]s for every listed kernel-qualifier stdlib module.
 ///
-/// Each [`ipe_kernels::StdlibKernel`] reads its HM type scheme from its
-/// [`ipe_types::KernelSchemeTable`] row — the table
-/// [`crate::coverage::surface`] also reads, so this page and the coverage
-/// matrix cannot disagree about which kernel is schemed. A kernel whose row is
-/// [`ipe_types::KernelScheme::Unschemed`] is not callable from well-typed Ipê
-/// (`IPE-L0108` refuses it at its call sites), so it is skipped here rather
-/// than rendered. The module each kernel's qualifier resolves to is read
-/// through [`crate::coverage::surface::kernel_module_path`], the same
-/// qualifier resolution the coverage surface uses.
+/// A page lists exactly the members `import <Module>` installs: the canonical
+/// resolver's kernel member pool ([`ipe_canon::Env::kernel_module`] /
+/// [`ipe_canon::Env::kernel_module_members`]) for each
+/// [`ipe_canon::STDLIB_MODULE_QUALIFIERS`] path [`stdlib_module_names`] lists.
+/// Aliases, cross-qualifier members and every shape's `Cmd`/`Sub` copies come
+/// from the same pool imports read, and a member relocated to an `Unsafe`
+/// module or kept private is absent from it, so no hand list decides a page.
+///
+/// Each member's type is its kernel's row of the [`ipe_types::KernelSchemeTable`]
+/// (the table inference reads). A member with no callable scheme
+/// ([`ipe_types::KernelScheme::Unschemed`] or [`ipe_canon::VarHome::ReservedKernel`])
+/// is refused at every use with `IPE-L0108`, so it is not documented.
+///
+/// # Errors
+/// [`CliError::Usage`] when the resolver environment or kernel type table
+/// cannot be built, a member fails to render, or the pool holds an entry an
+/// import cannot install (a non-kernel home, a kernel outside the table, an
+/// uninterned name).
 fn build_kernel_module_docs() -> Result<BTreeMap<String, ModuleDoc>, CliError> {
-    let (qualifier_to_path, compiled_by_dotted, compiled_by_last_segment) =
-        crate::coverage::surface::qualifier_lookup_tables();
-
     let mut interner = Interner::new();
-    let table = ipe_types::kernel_type_table(&mut interner).map_err(|d| {
-        CliError::Usage(text::msg::doc_kernel_table_error(
-            &ipe_diagnostics::plain_message(&d, ""),
-        ))
-    })?;
+    let env =
+        ipe_canon::Env::initial(Vec::new(), &mut interner).map_err(|d| kernel_doc_error(&d))?;
+    let table = ipe_types::kernel_type_table(&mut interner).map_err(|d| kernel_doc_error(&d))?;
+    let listed: BTreeSet<String> = stdlib_module_names().into_iter().collect();
 
-    // Group by module path and build ValueDoc for each schemed kernel.
-    let mut by_module: BTreeMap<String, Vec<ValueDoc>> = BTreeMap::new();
-    for (kernel, scheme) in table.rows() {
-        let ty = match scheme {
-            ipe_types::KernelScheme::Schemed(ty) => ty,
-            // Not callable from well-typed Ipê (IPE-L0108 refuses it); no
-            // page to render it on.
-            ipe_types::KernelScheme::Unschemed => continue,
-        };
-        let Some((module_paths, value_doc)) = kernel_value_doc(
-            kernel,
-            kernel.decl(),
-            ty,
-            &interner,
-            &qualifier_to_path,
-            &compiled_by_dotted,
-            &compiled_by_last_segment,
-        )?
+    let mut docs: BTreeMap<String, ModuleDoc> = BTreeMap::new();
+    for (segments, _canonical) in ipe_canon::STDLIB_MODULE_QUALIFIERS {
+        let dotted = segments.join(".");
+        if !listed.contains(&dotted) {
+            continue;
+        }
+        let path = segments
+            .iter()
+            .map(|segment| interner.intern(segment))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|d| kernel_doc_error(&d))?;
+        let Some(module) = env
+            .kernel_module(&path, &mut interner)
+            .map_err(|d| kernel_doc_error(&d))?
         else {
             continue;
         };
-        for module_path in module_paths {
-            by_module
-                .entry(module_path)
-                .or_default()
-                .push(value_doc.clone());
+        let (members, _ctors) = env.kernel_module_members(module);
+        let mut values = Vec::with_capacity(members.len());
+        for (member, home) in &members {
+            let Some(name) = interner.resolve(*member) else {
+                return Err(kernel_pool_bug(&dotted, "a member name is not interned"));
+            };
+            match home {
+                ipe_canon::VarHome::Kernel(kernel, _, _) => match table.scheme(*kernel) {
+                    Some(ipe_types::KernelScheme::Schemed(ty)) => {
+                        values.push(kernel_value_doc(name, ty, &interner)?);
+                    }
+                    // Refused at every use (IPE-L0108): nothing callable to document.
+                    Some(ipe_types::KernelScheme::Unschemed) => {}
+                    None => {
+                        return Err(kernel_pool_bug(
+                            &dotted,
+                            &format!("member `{name}` names a kernel outside the scheme table"),
+                        ));
+                    }
+                },
+                // Reachable but unbacked: refused at every use (IPE-L0108).
+                ipe_canon::VarHome::ReservedKernel { .. } => {}
+                ipe_canon::VarHome::Local | ipe_canon::VarHome::TopLevel(_) => {
+                    return Err(kernel_pool_bug(
+                        &dotted,
+                        &format!("member `{name}` has a non-kernel home"),
+                    ));
+                }
+            }
         }
-    }
-
-    // Assemble ModuleDoc for each module, values in name order.
-    let mut docs: BTreeMap<String, ModuleDoc> = BTreeMap::new();
-    for (module_path, mut values) in by_module {
         values.sort_by(|a, b| a.name.cmp(&b.name));
         docs.insert(
-            module_path.clone(),
+            dotted.clone(),
             ModuleDoc {
-                name: module_path,
+                name: dotted,
                 kind: ModuleKind::Stdlib,
                 comment: String::new(),
                 unions: Vec::new(),
@@ -2331,7 +2358,7 @@ fn render_module_human(module: &ModuleDoc, index: &AnchorIndex) {
     }
     for value in &module.values {
         let sig = {
-            let pieces = signature_pieces(&value.signature_ty, index);
+            let pieces = value.signature.pieces(index);
             let mut s = String::new();
             for p in &pieces {
                 match p {
@@ -2417,7 +2444,7 @@ fn render_query_module(module: &ModuleDoc, format: OutputFormat) {
                 let _ = writeln!(out, "type {}{}", union.name, union_params(union.params));
             }
             for value in &module.values {
-                let _ = writeln!(out, "{} : {}", value.name, value.signature);
+                let _ = writeln!(out, "{} : {}", value.name, value.signature.text());
             }
             crate::screen::emit_machine(crate::screen::Stream::Stdout, &out);
         }
@@ -2446,26 +2473,18 @@ fn module_doc(
         .iter()
         .map(|(name, union)| union_doc(name, union, comments))
         .collect();
+    // Read the resolved types, never `api.values`' pre-rendered strings: the
+    // checker's `Ty` has already lost `Task`'s error channel by the time it
+    // reaches `TyDoc` (see `restore_task_error_channel`), so a string rendered
+    // upstream of that restoration is stale. Every rendering derives from the
+    // one restored type.
     let values = api
-        .values
-        .keys()
-        .map(|name| {
-            // Recompute `signature` from the restored `signature_ty` rather
-            // than trusting `api.values`' pre-rendered string: the checker's
-            // `Ty` has already lost `Task`'s error channel by the time it
-            // reaches `TyDoc` (see `restore_task_error_channel`), so any
-            // string rendered upstream of that restoration is stale. Keeping
-            // one value derived from the other is the single source of truth
-            // for what a reader sees across Plain/JSON/Markdown/HTML.
-            let ty_doc = restore_task_error_channel(
-                api.value_types.get(name).cloned().unwrap_or(TyDoc::Unit),
-            );
-            ValueDoc {
-                name: name.clone(),
-                signature: plain_signature(&ty_doc),
-                signature_ty: ty_doc,
-                comment: comments.get(name).unwrap_or_default(),
-            }
+        .value_types
+        .iter()
+        .map(|(name, ty)| ValueDoc {
+            name: name.clone(),
+            signature: ValueSignature::Resolved(restore_task_error_channel(ty.clone())),
+            comment: comments.get(name).unwrap_or_default(),
         })
         .collect();
     ModuleDoc {
@@ -2651,8 +2670,71 @@ enum SigPiece {
 /// type constructor that resolves to an in-package definition.
 fn signature_pieces(ty: &TyDoc, index: &AnchorIndex) -> Vec<SigPiece> {
     let mut pieces = Vec::new();
-    push_ty(ty, Some(index), Prec::Top, &mut pieces);
+    let heads = HeadStyle::of(ty);
+    push_ty(ty, Some(index), &heads, Prec::Top, &mut pieces);
     pieces
+}
+
+/// How one signature spells its type-constructor heads.
+///
+/// A head renders bare (`Path`, `Timestamp`), the form a user writes in an
+/// annotation, unless two distinct `(module, name)` heads in the same signature
+/// share that bare name: then every module-homed head of that name renders
+/// qualified (`Ipe.Http.Options`), so `A.Thing -> B.Thing` never reads as one
+/// type.
+struct HeadStyle {
+    /// Bare names more than one distinct head in the signature carries.
+    ambiguous: BTreeSet<Box<str>>,
+}
+
+impl HeadStyle {
+    fn of(ty: &TyDoc) -> Self {
+        let mut homes: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        collect_heads(ty, &mut homes);
+        Self {
+            ambiguous: homes
+                .into_iter()
+                .filter(|(_, modules)| modules.len() > 1)
+                .map(|(name, _)| name.into())
+                .collect(),
+        }
+    }
+
+    /// The displayed text for the head `(module, name)`.
+    fn head(&self, module: &str, name: &str) -> String {
+        if module.is_empty() || !self.ambiguous.contains(name) {
+            name.to_owned()
+        } else {
+            format!("{module}.{name}")
+        }
+    }
+}
+
+/// Every type-constructor head in `ty`, grouped by bare name → its modules.
+fn collect_heads<'a>(ty: &'a TyDoc, homes: &mut BTreeMap<&'a str, BTreeSet<&'a str>>) {
+    match ty {
+        TyDoc::Unit | TyDoc::Var(_) => {}
+        TyDoc::Con { module, name, args } => {
+            homes.entry(name).or_default().insert(module);
+            for arg in args {
+                collect_heads(arg, homes);
+            }
+        }
+        TyDoc::Fun(a, b) => {
+            collect_heads(a, homes);
+            collect_heads(b, homes);
+        }
+        TyDoc::Tuple(elems) => {
+            for elem in elems {
+                collect_heads(elem, homes);
+            }
+        }
+        TyDoc::Record(fields) => {
+            for (_, field_ty) in fields {
+                collect_heads(field_ty, homes);
+            }
+        }
+    }
 }
 
 /// Render a signature [`TyDoc`] into flat text with no cross-reference links —
@@ -2666,7 +2748,8 @@ fn signature_pieces(ty: &TyDoc, index: &AnchorIndex) -> Vec<SigPiece> {
 /// apart the way two independently-written renderers could.
 fn plain_signature(ty: &TyDoc) -> String {
     let mut pieces = Vec::new();
-    push_ty(ty, None, Prec::Top, &mut pieces);
+    let heads = HeadStyle::of(ty);
+    push_ty(ty, None, &heads, Prec::Top, &mut pieces);
     let mut out = String::new();
     for piece in &pieces {
         match piece {
@@ -2706,15 +2789,19 @@ fn push_text(pieces: &mut Vec<SigPiece>, text: &str) {
 /// sites differ only in whether a resolved reference becomes a [`SigPiece::Link`]
 /// or stays [`SigPiece::Text`], never in the text itself.
 ///
-/// A constructor's head always renders as its bare `name`, never
-/// `module.name`: a `Ty::Con`'s `module` field is empty for some built-ins
-/// (`Path`) and genuinely non-empty for others (`Timestamp`, `ByteSize`) that a
-/// user still writes unqualified in an annotation, so qualifying by that field
-/// would print one inconsistent style per type rather than the one style a
-/// user actually writes. Link resolution is unaffected: [`AnchorIndex::type_ref`]
-/// still keys off the real `(module, name)` pair, only the displayed text is
-/// bare.
-fn push_ty(ty: &TyDoc, index: Option<&AnchorIndex>, prec: Prec, pieces: &mut Vec<SigPiece>) {
+/// A constructor's head renders as `heads` spells it ([`HeadStyle::head`]):
+/// bare, the one style a user writes in an annotation whether the `Ty::Con`'s
+/// `module` field is empty (`Path`) or not (`Timestamp`, `ByteSize`), and
+/// qualified only where the signature holds two distinct heads of one name.
+/// Link resolution is unaffected: [`AnchorIndex::type_ref`] keys off the real
+/// `(module, name)` pair, never the displayed text.
+fn push_ty(
+    ty: &TyDoc,
+    index: Option<&AnchorIndex>,
+    heads: &HeadStyle,
+    prec: Prec,
+    pieces: &mut Vec<SigPiece>,
+) {
     match ty {
         TyDoc::Unit => push_text(pieces, "()"),
         TyDoc::Var(v) => push_text(pieces, v),
@@ -2723,14 +2810,14 @@ fn push_ty(ty: &TyDoc, index: Option<&AnchorIndex>, prec: Prec, pieces: &mut Vec
             if parens {
                 push_text(pieces, "(");
             }
-            let head = name.to_string();
+            let head = heads.head(module, name);
             match index.and_then(|idx| idx.type_ref(module, name)) {
                 Some(target) => pieces.push(SigPiece::Link { text: head, target }),
                 None => push_text(pieces, &head),
             }
             for arg in args {
                 push_text(pieces, " ");
-                push_ty(arg, index, Prec::Arg, pieces);
+                push_ty(arg, index, heads, Prec::Arg, pieces);
             }
             if parens {
                 push_text(pieces, ")");
@@ -2741,9 +2828,9 @@ fn push_ty(ty: &TyDoc, index: Option<&AnchorIndex>, prec: Prec, pieces: &mut Vec
             if parens {
                 push_text(pieces, "(");
             }
-            push_ty(a, index, Prec::FunLhs, pieces);
+            push_ty(a, index, heads, Prec::FunLhs, pieces);
             push_text(pieces, " -> ");
-            push_ty(b, index, Prec::Top, pieces);
+            push_ty(b, index, heads, Prec::Top, pieces);
             if parens {
                 push_text(pieces, ")");
             }
@@ -2754,7 +2841,7 @@ fn push_ty(ty: &TyDoc, index: Option<&AnchorIndex>, prec: Prec, pieces: &mut Vec
                 if i > 0 {
                     push_text(pieces, ", ");
                 }
-                push_ty(e, index, Prec::Top, pieces);
+                push_ty(e, index, heads, Prec::Top, pieces);
             }
             push_text(pieces, ")");
         }
@@ -2769,7 +2856,7 @@ fn push_ty(ty: &TyDoc, index: Option<&AnchorIndex>, prec: Prec, pieces: &mut Vec
                     push_text(pieces, ", ");
                 }
                 push_text(pieces, &format!("{fname} : "));
-                push_ty(fty, index, Prec::Top, pieces);
+                push_ty(fty, index, heads, Prec::Top, pieces);
             }
             push_text(pieces, " }");
         }
@@ -3886,7 +3973,7 @@ fn render_module_json(out: &mut String, module: &ModuleDoc, index: &AnchorIndex)
         let _ = writeln!(
             out,
             "          \"signature\": {},",
-            json_string(&value.signature)
+            json_string(&value.signature.text())
         );
         let _ = writeln!(
             out,
@@ -3896,7 +3983,11 @@ fn render_module_json(out: &mut String, module: &ModuleDoc, index: &AnchorIndex)
         // The in-package cross-references this signature resolves to — the
         // structured form a `docs.json` consumer resolves, with the anchor
         // shared by the Markdown and HTML renderings.
-        let refs = signature_references(&value.signature_ty, index);
+        let refs = value
+            .signature
+            .resolved()
+            .map(|ty| signature_references(ty, index))
+            .unwrap_or_default();
         out.push_str("          \"references\": [");
         for (k, r) in refs.iter().enumerate() {
             out.push_str(if k == 0 { "\n" } else { ",\n" });
@@ -3995,7 +4086,7 @@ fn render_markdown(module: &ModuleDoc, index: &AnchorIndex) -> String {
     if !module.values.is_empty() {
         out.push_str("## Values\n\n");
         for value in &module.values {
-            let sig = markdown_signature(&signature_pieces(&value.signature_ty, index));
+            let sig = markdown_signature(&value.signature.pieces(index));
             let _ = writeln!(out, "### `{}`\n", value.name);
             let _ = writeln!(out, "`{} :` {}\n", value.name, sig);
             if !value.comment.is_empty() {
@@ -5534,7 +5625,7 @@ fn render_html_module(module: &ModuleDoc, index: &AnchorIndex, search_script: &s
             html::escape(crate::text::site_values())
         );
         for value in &module.values {
-            let sig = html_signature(&signature_pieces(&value.signature_ty, index));
+            let sig = html_signature(&value.signature.pieces(index));
             let _ = writeln!(
                 body,
                 "<section class=\"entry\" id=\"{}\">\n<h3><code>{}</code></h3>\n\
@@ -6036,40 +6127,13 @@ mod tests {
         // Never interned `foreign_module`/`foreign_name` — any symbol id this
         // interner is asked to resolve has no backing string.
         let empty_interner = Interner::new();
-        let empty = BTreeMap::new();
-        let kernel = *ipe_kernels::StdlibKernel::ALL
-            .first()
-            .expect("the kernel registry is non-empty");
-        let decl = kernel.decl();
-        // Home the qualifier so the qualifier step passes and the render step
-        // alone decides the outcome.
-        let homed: crate::coverage::surface::QualifierModuleMap = BTreeMap::from([(
-            decl.qualifier.to_owned(),
-            vec!["Ipe".to_owned(), "X".to_owned()],
-        )]);
 
-        let control = kernel_value_doc(
-            kernel,
-            decl,
-            &Ty::Unit,
-            &empty_interner,
-            &homed,
-            &empty,
-            &empty,
-        );
+        let control = kernel_value_doc("member", &Ty::Unit, &empty_interner);
         assert!(
-            matches!(control, Ok(Some(_))),
-            "control: a renderable type through the same maps must page: {control:?}",
+            control.is_ok(),
+            "control: a renderable type must page: {control:?}",
         );
-        let result = kernel_value_doc(
-            kernel,
-            decl,
-            &bad_ty,
-            &empty_interner,
-            &homed,
-            &empty,
-            &empty,
-        );
+        let result = kernel_value_doc("member", &bad_ty, &empty_interner);
         assert!(
             matches!(result, Err(CliError::Usage(_))),
             "a type that fails to render must surface as a typed CliError, not a silently \
@@ -6219,7 +6283,9 @@ mod tests {
         let mut seen_any_task = false;
         for module in docs.values() {
             for value in &module.values {
-                task_arities(&value.signature_ty, &mut arities);
+                if let Some(ty) = value.signature.resolved() {
+                    task_arities(ty, &mut arities);
+                }
             }
         }
         for arity in &arities {
@@ -6235,120 +6301,161 @@ mod tests {
         );
     }
 
-    // ── #3945: shape-scoped Cmd/Sub fan out to every real shape page ──────────
-
-    /// [`shape_scoped_module_paths`] must list every real TEA shape's page for
-    /// the generic `Cmd`/`Sub` qualifier, and must never invent a page: this
-    /// test builds a synthetic map standing in for the live
-    /// `qualifier_to_path`, independent of the live registry's exact entries.
+    /// A type named `Task` that is not the builtin row (a user's `Foo.Task`)
+    /// keeps its own arity: the restoration keys on the builtin row, never on
+    /// the spelling.
     #[test]
-    fn shape_scoped_module_paths_fans_out_to_every_real_shape() {
-        let map: crate::coverage::surface::QualifierModuleMap = BTreeMap::from([
-            (
-                "TeaWebCmd".to_owned(),
-                vec![
-                    "Ipe".to_owned(),
-                    "Tea".to_owned(),
-                    "Web".to_owned(),
-                    "Cmd".to_owned(),
-                ],
-            ),
-            (
-                "TeaTuiCmd".to_owned(),
-                vec![
-                    "Ipe".to_owned(),
-                    "Tea".to_owned(),
-                    "Tui".to_owned(),
-                    "Cmd".to_owned(),
-                ],
-            ),
-            (
-                "TeaCliCmd".to_owned(),
-                vec![
-                    "Ipe".to_owned(),
-                    "Tea".to_owned(),
-                    "Cli".to_owned(),
-                    "Cmd".to_owned(),
-                ],
-            ),
-            (
-                "TeaWorkerCmd".to_owned(),
-                vec![
-                    "Ipe".to_owned(),
-                    "Tea".to_owned(),
-                    "Worker".to_owned(),
-                    "Cmd".to_owned(),
-                ],
-            ),
-            (
-                "TeaTerminalCmd".to_owned(),
-                vec![
-                    "Ipe".to_owned(),
-                    "Tea".to_owned(),
-                    "Terminal".to_owned(),
-                    "Cmd".to_owned(),
-                ],
-            ),
-            (
-                "TeaWebSub".to_owned(),
-                vec![
-                    "Ipe".to_owned(),
-                    "Tea".to_owned(),
-                    "Web".to_owned(),
-                    "Sub".to_owned(),
-                ],
-            ),
-        ]);
-        let cmd_pages = shape_scoped_module_paths("Cmd", &map);
-        assert_eq!(
-            cmd_pages,
-            vec![
-                "Ipe.Tea.Cli.Cmd".to_owned(),
-                "Ipe.Tea.Tui.Cmd".to_owned(),
-                "Ipe.Tea.Web.Cmd".to_owned(),
-                "Ipe.Tea.Worker.Cmd".to_owned(),
-            ],
-            "every real shape's Cmd page, sorted, excluding the backward-compat \
-             Terminal alias: {cmd_pages:?}"
-        );
-        let sub_pages = shape_scoped_module_paths("Sub", &map);
-        assert_eq!(sub_pages, vec!["Ipe.Tea.Web.Sub".to_owned()]);
+    fn restore_task_error_channel_leaves_a_user_task_alone() {
+        let user_task = TyDoc::Con {
+            module: "Foo".into(),
+            name: "Task".into(),
+            args: Box::from([TyDoc::Var("a".into())]),
+        };
+        assert_eq!(restore_task_error_channel(user_task.clone()), user_task);
     }
 
-    /// Every real TEA shape's `Cmd`/`Sub` page must list the generic shared
-    /// members (`none`, `batch`, `map`, and `Cmd.perform`) in the live
-    /// registry — the exact complaint of #3945 (`ipe doc Ipe.Tea.Tui.Cmd`
-    /// printing no members, `ipe doc Cmd.perform` finding no entry).
+    /// Two distinct heads sharing a bare name in one signature render qualified,
+    /// so the text never claims they are one type; a lone head stays bare.
     #[test]
-    fn live_tea_shape_cmd_pages_list_their_generic_members() {
+    fn same_named_distinct_heads_render_qualified() {
+        let con = |module: &str, name: &str| TyDoc::Con {
+            module: module.into(),
+            name: name.into(),
+            args: Box::from([]),
+        };
+        let clash = TyDoc::Fun(
+            Box::new(con("Ipe.Http", "Options")),
+            Box::new(TyDoc::Fun(
+                Box::new(con("Ipe.Db", "Options")),
+                Box::new(con("Ipe.Time.Timestamp", "Timestamp")),
+            )),
+        );
+        assert_eq!(
+            plain_signature(&clash),
+            "Ipe.Http.Options -> Ipe.Db.Options -> Timestamp"
+        );
+        let builtin_and_user =
+            TyDoc::Fun(Box::new(con("", "Error")), Box::new(con("App", "Error")));
+        assert_eq!(plain_signature(&builtin_and_user), "Error -> App.Error");
+    }
+
+    /// A value documented by its written annotation renders that annotation in
+    /// every format, never a placeholder type.
+    #[test]
+    fn a_written_signature_renders_its_annotation_not_a_placeholder() {
+        let module = ModuleDoc {
+            name: "Ipe.X".to_owned(),
+            kind: ModuleKind::Stdlib,
+            comment: String::new(),
+            unions: Vec::new(),
+            values: vec![ValueDoc {
+                name: "veneer".to_owned(),
+                signature: ValueSignature::Written("String -> Bool".to_owned()),
+                comment: String::new(),
+            }],
+        };
+        let docs = one_module_docs(module.clone());
+        let index = AnchorIndex::build(&docs);
+        let md = render_markdown(&module, &index);
+        assert!(md.contains("`veneer :` `String -> Bool`"), "{md}");
+        assert!(!md.contains("`veneer :` `()`"), "{md}");
+        let json = render_json(&docs);
+        assert!(json.contains("\"signature\": \"String -> Bool\""), "{json}");
+        let value = module.values.first().expect("one value");
+        assert_eq!(value.signature.text(), "String -> Bool");
+        assert!(value.signature.resolved().is_none());
+    }
+
+    /// The kernel pages read the import pool: a member relocated to an `Unsafe`
+    /// module or kept private never appears, whatever its name.
+    #[test]
+    #[allow(clippy::panic)] // a missing page, named, IS the failure
+    fn kernel_pages_omit_members_no_import_installs() {
         let docs = build_kernel_module_docs().expect("the live kernel docs must build");
-        for shape_cmd in [
-            "Ipe.Tea.Web.Cmd",
-            "Ipe.Tea.Tui.Cmd",
-            "Ipe.Tea.Cli.Cmd",
-            "Ipe.Tea.Worker.Cmd",
-        ] {
+        let names = |path: &str| -> BTreeSet<String> {
+            docs.get(path)
+                .unwrap_or_else(|| panic!("{path} must have a kernel-doc page"))
+                .values
+                .iter()
+                .map(|v| v.name.clone())
+                .collect()
+        };
+        let db = names("Ipe.Db");
+        for hidden in ["unsafeExecRaw", "insertFieldsChecked", "updateWhereChecked"] {
             assert!(
-                docs.contains_key(shape_cmd),
-                "{shape_cmd} must have a kernel-doc page"
+                !db.contains(hidden),
+                "Ipe.Db must not list `{hidden}`: {db:?}"
             );
-            let page = docs.get(shape_cmd).expect("just asserted present");
-            let names: BTreeSet<&str> = page.values.iter().map(|v| v.name.as_str()).collect();
+        }
+        assert!(db.contains("updateWhere"), "control: {db:?}");
+        let secret = names("Ipe.Secret");
+        assert!(
+            !secret.contains("reveal"),
+            "Ipe.Secret must not list `reveal`: {secret:?}"
+        );
+        let sql = names("Ipe.Db.Sql");
+        assert!(
+            !sql.contains("unsafeFragment"),
+            "Ipe.Db.Sql must not list `unsafeFragment`: {sql:?}"
+        );
+        assert!(sql.contains("column"), "control: {sql:?}");
+    }
+
+    /// A page lists the spellings an import installs, aliases included.
+    #[test]
+    fn kernel_pages_list_installed_aliases() {
+        let docs = build_kernel_module_docs().expect("the live kernel docs must build");
+        let crypto = docs.get("Ipe.Crypto").expect("Ipe.Crypto must have a page");
+        assert!(
+            crypto.values.iter().any(|v| v.name == "hmacSha256"),
+            "Ipe.Crypto must list its `hmacSha256` alias"
+        );
+    }
+
+    /// Every real TEA shape's `Cmd`/`Sub` page lists the generic shared
+    /// members, a shape-owned `Sub` member stays on its shape, and the retired
+    /// `Ipe.Tea.Terminal` namespace gets no page.
+    #[test]
+    #[allow(clippy::panic)] // a missing page, named, IS the failure
+    fn live_tea_shape_pages_list_their_members() {
+        let docs = build_kernel_module_docs().expect("the live kernel docs must build");
+        let names = |path: &str| -> BTreeSet<String> {
+            docs.get(path)
+                .unwrap_or_else(|| panic!("{path} must have a kernel-doc page"))
+                .values
+                .iter()
+                .map(|v| v.name.clone())
+                .collect()
+        };
+        for shape in ["Web", "Tui", "Cli", "Worker"] {
+            let cmd = names(&format!("Ipe.Tea.{shape}.Cmd"));
             for member in ["none", "batch", "perform", "map"] {
                 assert!(
-                    names.contains(member),
-                    "{shape_cmd} must list `{member}`, found {names:?}"
+                    cmd.contains(member),
+                    "{shape}.Cmd must list `{member}`: {cmd:?}"
+                );
+            }
+            let sub = names(&format!("Ipe.Tea.{shape}.Sub"));
+            for member in ["none", "batch"] {
+                assert!(
+                    sub.contains(member),
+                    "{shape}.Sub must list `{member}`: {sub:?}"
                 );
             }
         }
+        assert!(names("Ipe.Tea.Tui.Sub").contains("onKey"));
+        assert!(!names("Ipe.Tea.Web.Sub").contains("onKey"));
+        assert!(
+            docs.keys()
+                .all(|path| !path.starts_with("Ipe.Tea.Terminal")),
+            "no retired Terminal page: {:?}",
+            docs.keys().collect::<Vec<_>>()
+        );
     }
 
-    /// The three Web-PubSub kernels (`publish`, `publishNoEcho`,
-    /// `subscribeTopic`) must route only to their real single home
-    /// `Ipe.Tea.Web.PubSub`, never fanning out onto the generic
-    /// `Ipe.Tea.<Shape>.Cmd`/`.Sub` pages the way the shape-generic kernels do.
+    /// `Ipe.Tea.Web.PubSub`'s cross-qualifier members list on its own page.
     #[test]
-    fn web_pubsub_kernels_are_not_fanned_out_onto_every_shape() {
+    fn web_pubsub_page_lists_its_cross_qualifier_members() {
         let docs = build_kernel_module_docs().expect("the live kernel docs must build");
         let pubsub = docs
             .get("Ipe.Tea.Web.PubSub")
@@ -6359,38 +6466,6 @@ mod tests {
                 pubsub_names.contains(member),
                 "Ipe.Tea.Web.PubSub must list `{member}`: {pubsub_names:?}"
             );
-        }
-        for other_shape_cmd in ["Ipe.Tea.Tui.Cmd", "Ipe.Tea.Cli.Cmd", "Ipe.Tea.Worker.Cmd"] {
-            if let Some(page) = docs.get(other_shape_cmd) {
-                let names: BTreeSet<&str> = page.values.iter().map(|v| v.name.as_str()).collect();
-                assert!(
-                    !names.contains("publish")
-                        && !names.contains("publishNoEcho")
-                        && !names.contains("subscribeTopic"),
-                    "{other_shape_cmd} must not carry the Web-only PubSub members: {names:?}"
-                );
-            }
-        }
-    }
-
-    // ── #3947: Db.Unsafe members never leak onto Ipe.Db's own page ────────────
-
-    /// `unsafeExecRaw` / `unsafeQuery` / `unsafeGet*` live on `Ipe.Db.Unsafe`,
-    /// not `Ipe.Db`: calling one unqualified on `Db` is a compile error
-    /// (IPE-N0005), so `Ipe.Db`'s kernel-doc page must never list them as its
-    /// own members.
-    #[test]
-    fn ipe_db_kernel_page_never_lists_its_unsafe_siblings() {
-        let docs = build_kernel_module_docs().expect("the live kernel docs must build");
-        if let Some(db) = docs.get("Ipe.Db") {
-            for value in &db.values {
-                assert!(
-                    !value.name.starts_with("unsafe"),
-                    "Ipe.Db must not list the unsafe-prefixed `{}` — it lives on \
-                     Ipe.Db.Unsafe",
-                    value.name
-                );
-            }
         }
     }
 
@@ -7235,7 +7310,7 @@ mod tests {
                     gaps.push(format!("{}.{}: missing", module.dotted, export.name));
                     continue;
                 };
-                if value.signature.is_empty() {
+                if value.signature.text().is_empty() {
                     gaps.push(format!("{}.{}: no signature", module.dotted, export.name));
                 }
                 if value.comment != export.doc.as_deref().unwrap_or_default() {
@@ -7303,7 +7378,9 @@ mod tests {
             .expect("authed is documented");
         assert_eq!(
             authed.signature,
-            "RemoteAuth -> (Principal -> req -> Task Error resp) -> Remote req resp"
+            ValueSignature::Written(
+                "RemoteAuth -> (Principal -> req -> Task Error resp) -> Remote req resp".to_owned()
+            )
         );
         assert!(
             authed.comment.starts_with("`authed key handler`"),
@@ -7420,12 +7497,11 @@ mod tests {
             }],
             values: vec![ValueDoc {
                 name: "paint".to_owned(),
-                signature: "M.Color -> Int".to_owned(),
                 // `M.Color` is in-package (links); `Int` is a built-in (plain).
-                signature_ty: TyDoc::Fun(
+                signature: ValueSignature::Resolved(TyDoc::Fun(
                     Box::new(con("M", "Color", vec![])),
                     Box::new(con("", "Int", vec![])),
-                ),
+                )),
                 comment: "The paint.".to_owned(),
             }],
         }
@@ -7459,7 +7535,7 @@ mod tests {
         let docs = one_module_docs(color_module());
         let index = AnchorIndex::build(&docs);
         let value = module.values.first().expect("one value");
-        let pieces = signature_pieces(&value.signature_ty, &index);
+        let pieces = value.signature.pieces(&index);
 
         // `M.Color` resolves in-package → a link to its anchor.
         let linked: Vec<&TypeRef> = pieces

@@ -519,7 +519,11 @@ pub fn type_search<'a>(
 
     for module in modules {
         for value in &module.values {
-            let candidate_sig = normalize_value_doc(value);
+            // A value documented only by its written annotation has no checked
+            // type to match against.
+            let Some(candidate_sig) = normalize_value_doc(value) else {
+                continue;
+            };
             if let Some(score) = match_score(&query_sig, &candidate_sig) {
                 hits.push(TypeMatch {
                     value,
@@ -547,11 +551,13 @@ pub fn type_search<'a>(
     Ok(hits)
 }
 
-/// Normalize the `signature_ty` of a `ValueDoc` into a `NormalizedSignature`.
-fn normalize_value_doc(value: &ValueDoc) -> NormalizedSignature {
+/// Normalize a `ValueDoc`'s checked type into a `NormalizedSignature`; `None`
+/// when the value carries only its written annotation.
+fn normalize_value_doc(value: &ValueDoc) -> Option<NormalizedSignature> {
+    let ty = value.signature.resolved()?;
     let mut ctx = TyDocAlphaCtx::new();
-    let norm = normalize_tydoc(&value.signature_ty, &mut ctx);
-    normalize_signature(&norm)
+    let norm = normalize_tydoc(ty, &mut ctx);
+    Some(normalize_signature(&norm))
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
@@ -566,7 +572,7 @@ pub fn render_type_matches_human(hits: &[TypeMatch<'_>]) -> String {
         let fq_key = format!("{}.{}", hit.module, hit.value.name);
         let _ = std::fmt::Write::write_fmt(
             &mut out,
-            format_args!("  symbol:{fq_key} — {}\n", hit.value.signature),
+            format_args!("  symbol:{fq_key} — {}\n", hit.value.signature.text()),
         );
     }
     out
@@ -585,7 +591,7 @@ pub fn render_type_matches_json(hits: &[TypeMatch<'_>]) -> String {
             format!(
                 "{{\"kind\":\"symbol\",\"key\":{},\"signature\":{}}}",
                 json::string(&key),
-                json::string(&hit.value.signature),
+                json::string(&hit.value.signature.text()),
             )
         })
         .collect();
@@ -736,8 +742,9 @@ mod tests {
     fn render_json_is_valid_array() {
         let value = ValueDoc {
             name: "map".to_owned(),
-            signature: "List a -> (a -> b) -> List b".to_owned(),
-            signature_ty: ipe_diagnostics::TyDoc::Unit, // dummy for test
+            signature: crate::doc::ValueSignature::Written(
+                "List a -> (a -> b) -> List b".to_owned(),
+            ),
             comment: String::new(),
         };
         let module_doc = crate::doc::ModuleDoc {
@@ -767,8 +774,7 @@ mod tests {
         let signature = "List a -> \u{1}\u{202e} b";
         let value = ValueDoc {
             name: "map".to_owned(),
-            signature: signature.to_owned(),
-            signature_ty: ipe_diagnostics::TyDoc::Unit,
+            signature: crate::doc::ValueSignature::Written(signature.to_owned()),
             comment: String::new(),
         };
         let module_doc = crate::doc::ModuleDoc {
