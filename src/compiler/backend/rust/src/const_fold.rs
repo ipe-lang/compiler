@@ -47,7 +47,9 @@ use std::collections::BTreeMap;
 
 use ipe_intern::{Interner, Symbol};
 use ipe_ir::{BinOp, Callee, Expr, Func, FuncId, KernelFn, ModPath, Pat, Program};
-use ipe_runtime_rust::math::{ipe_int_add, ipe_int_mul, ipe_int_sub};
+use ipe_runtime_rust::math::{
+    ipe_int_exact_add, ipe_int_exact_div, ipe_int_exact_mul, ipe_int_exact_sub,
+};
 
 use crate::emit_ui_plan::{LitKind, appearance_literal_args};
 
@@ -1051,15 +1053,14 @@ fn eval_binop(op: BinOp, l: &ConstValue, r: &ConstValue) -> Option<ConstValue> {
     match (op, l, r) {
         (BinOp::Append, Str(a), Str(b)) => Some(Str(format!("{a}{b}"))),
 
-        // The runtime's one Int `+`/`-`/`*` definitions, so a fold cannot drift.
-        (BinOp::IntAdd | BinOp::Add, Int(a), Int(b)) => Some(Int(ipe_int_add(*a, *b))),
-        (BinOp::IntSub | BinOp::Sub, Int(a), Int(b)) => Some(Int(ipe_int_sub(*a, *b))),
-        (BinOp::IntMul | BinOp::Mul, Int(a), Int(b)) => Some(Int(ipe_int_mul(*a, *b))),
-        // Integer division is total in the runtime only through the checked
-        // helper (`b == 0` and `MIN / -1` are guarded there); rather than
-        // reproduce that guard's exact result, division by zero simply does not
-        // fold. A non-zero divisor folds to the same wrapping quotient.
-        (BinOp::IntDiv, Int(a), Int(b)) if *b != 0 => Some(Int(a.wrapping_div(*b))),
+        // Int arithmetic folds only through the runtime's exact half: an
+        // in-range result is the runtime operator's result, and an out-of-range
+        // edge (overflow, a zero divisor, `MIN // -1`) does not fold, so the
+        // emitted runtime call alone decides it.
+        (BinOp::IntAdd | BinOp::Add, Int(a), Int(b)) => ipe_int_exact_add(*a, *b).map(Int),
+        (BinOp::IntSub | BinOp::Sub, Int(a), Int(b)) => ipe_int_exact_sub(*a, *b).map(Int),
+        (BinOp::IntMul | BinOp::Mul, Int(a), Int(b)) => ipe_int_exact_mul(*a, *b).map(Int),
+        (BinOp::IntDiv, Int(a), Int(b)) => ipe_int_exact_div(*a, *b).map(Int),
 
         (BinOp::FloatAdd | BinOp::Add, Float(a), Float(b)) => Some(Float(a + b)),
         (BinOp::FloatSub | BinOp::Sub, Float(a), Float(b)) => Some(Float(a - b)),
@@ -1903,5 +1904,48 @@ mod tests {
         expected = rt_string::string_append(expected, ")".to_string());
 
         assert_eq!(fold_const(&pipeline, &env), Some(ConstValue::Str(expected)));
+    }
+
+    /// An Int edge the runtime decides (overflow, zero divisor, `MIN // -1`)
+    /// never folds to a baked constant; an in-range fold equals the emitted
+    /// runtime operator byte for byte.
+    #[test]
+    fn int_fold_declines_every_out_of_range_edge() {
+        use ConstValue::Int;
+        let edges = [
+            (BinOp::IntAdd, i64::MAX, 1),
+            (BinOp::Add, i64::MAX, 1),
+            (BinOp::IntSub, i64::MIN, 1),
+            (BinOp::Sub, i64::MIN, 1),
+            (BinOp::IntMul, i64::MIN, -1),
+            (BinOp::Mul, i64::MAX, 2),
+            (BinOp::IntDiv, i64::MIN, -1),
+            (BinOp::IntDiv, 10, 0),
+        ];
+        for (op, a, b) in edges {
+            assert_eq!(eval_binop(op, &Int(a), &Int(b)), None, "{op:?} {a} {b}");
+        }
+        let values = [i64::MIN + 1, -7, -1, 0, 1, 7, i64::MAX - 1];
+        for a in values {
+            for b in values {
+                let pairs = [
+                    (BinOp::IntAdd, ipe_runtime_rust::math::ipe_int_add(a, b)),
+                    (BinOp::IntSub, ipe_runtime_rust::math::ipe_int_sub(a, b)),
+                    (BinOp::IntMul, ipe_runtime_rust::math::ipe_int_mul(a, b)),
+                ];
+                for (op, runtime) in pairs {
+                    if let Some(folded) = eval_binop(op, &Int(a), &Int(b)) {
+                        assert_eq!(folded, Int(runtime), "{op:?} {a} {b}");
+                    }
+                }
+                if b != 0 {
+                    assert_eq!(
+                        eval_binop(BinOp::IntDiv, &Int(a), &Int(b)),
+                        Some(Int(ipe_runtime_rust::math::ipe_int_div(a, b))),
+                        "{a} // {b}"
+                    );
+                }
+            }
+        }
     }
 }

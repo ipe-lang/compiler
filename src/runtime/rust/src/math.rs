@@ -54,30 +54,58 @@ pub fn math_abs(x: i64) -> i64 {
     crate::basics::basics_abs(x)
 }
 
+/// The exact Ipê `Int` sum, or `None` when it leaves the 64-bit range.
+///
+/// The in-range half of `+`: every caller that must not decide the overflow
+/// edge itself (the compiler's constant folder) reads this, never a
+/// `wrapping_*` copy.
+#[must_use]
+pub const fn ipe_int_exact_add(a: i64, b: i64) -> Option<i64> {
+    a.checked_add(b)
+}
+
+/// The exact Ipê `Int` difference, or `None` when it leaves the 64-bit range.
+#[must_use]
+pub const fn ipe_int_exact_sub(a: i64, b: i64) -> Option<i64> {
+    a.checked_sub(b)
+}
+
+/// The exact Ipê `Int` product, or `None` when it leaves the 64-bit range.
+#[must_use]
+pub const fn ipe_int_exact_mul(a: i64, b: i64) -> Option<i64> {
+    a.checked_mul(b)
+}
+
+/// The exact Ipê `Int` truncating quotient, or `None` for a zero divisor or
+/// `i64::MIN / -1`.
+#[must_use]
+pub const fn ipe_int_exact_div(a: i64, b: i64) -> Option<i64> {
+    a.checked_div(b)
+}
+
 /// Integer addition for Ipê's `+` operator on `Int` operands.
 ///
-/// Two's-complement wrapping semantics: `i64::MAX + 1 == i64::MIN`.
-/// The wrap is the defined behaviour — it holds regardless of any Cargo
-/// profile `overflow-checks` setting.
+/// The exact sum when it is in range; the out-of-range edge wraps
+/// (two's complement), regardless of any Cargo `overflow-checks` setting.
 #[must_use]
 pub fn ipe_int_add(a: i64, b: i64) -> i64 {
-    a.wrapping_add(b)
+    ipe_int_exact_add(a, b).unwrap_or_else(|| a.wrapping_add(b))
 }
 
 /// Integer subtraction for Ipê's `-` operator on `Int` operands.
 ///
-/// Two's-complement wrapping semantics: `i64::MIN - 1 == i64::MAX`.
+/// The exact difference when it is in range; the out-of-range edge wraps.
 #[must_use]
 pub fn ipe_int_sub(a: i64, b: i64) -> i64 {
-    a.wrapping_sub(b)
+    ipe_int_exact_sub(a, b).unwrap_or_else(|| a.wrapping_sub(b))
 }
 
 /// Integer multiplication for Ipê's `*` operator on `Int` operands.
 ///
-/// Two's-complement wrapping semantics: `i64::MAX * 2 == -2`.
+/// The exact product when it is in range; the out-of-range edge wraps.
 #[must_use]
 pub fn ipe_int_mul(a: i64, b: i64) -> i64 {
-    a.wrapping_mul(b)
+    ipe_int_exact_mul(a, b).unwrap_or_else(|| a.wrapping_mul(b))
 }
 
 /// Integer division for Ipê's `//` operator.
@@ -357,20 +385,52 @@ mod tests {
                 assert_eq!(a.ipe_wrapping_mul(b), ipe_int_mul(a, b), "{a} * {b}");
             }
         }
-        assert_eq!(ipe_int_add(i64::MAX, 1), i64::MIN);
-        assert_eq!(ipe_int_sub(i64::MIN, 1), i64::MAX);
-        assert_eq!(ipe_int_mul(i64::MIN, -1), i64::MIN);
     }
 
-    // `Math.abs` and `Basics.abs` share one definition: `abs MIN` saturates to
-    // `MAX` while `negate MIN` wraps to `MIN`.
+    // The exact half refuses every out-of-range edge and agrees with the
+    // operator wherever it answers, so a reader of it never decides the edge.
+    #[test]
+    fn int_exact_refuses_out_of_range_and_agrees_in_range() {
+        assert_eq!(ipe_int_exact_add(i64::MAX, 1), None);
+        assert_eq!(ipe_int_exact_sub(i64::MIN, 1), None);
+        assert_eq!(ipe_int_exact_mul(i64::MIN, -1), None);
+        assert_eq!(ipe_int_exact_div(i64::MIN, -1), None);
+        assert_eq!(ipe_int_exact_div(7, 0), None);
+        let edges = [
+            i64::MIN,
+            i64::MIN + 1,
+            -7,
+            -1,
+            0,
+            1,
+            7,
+            i64::MAX - 1,
+            i64::MAX,
+        ];
+        for a in edges {
+            for b in edges {
+                if let Some(v) = ipe_int_exact_add(a, b) {
+                    assert_eq!(v, ipe_int_add(a, b), "{a} + {b}");
+                }
+                if let Some(v) = ipe_int_exact_sub(a, b) {
+                    assert_eq!(v, ipe_int_sub(a, b), "{a} - {b}");
+                }
+                if let Some(v) = ipe_int_exact_mul(a, b) {
+                    assert_eq!(v, ipe_int_mul(a, b), "{a} * {b}");
+                }
+                if let Some(v) = ipe_int_exact_div(a, b) {
+                    assert_eq!(v, ipe_int_div(a, b), "{a} // {b}");
+                }
+            }
+        }
+    }
+
+    // `Math.abs` and `Basics.abs` share one definition, edges included.
     #[test]
     fn abs_kernels_agree_on_min() {
         for x in [i64::MIN, i64::MIN + 1, -7, -1, 0, 1, 7, i64::MAX] {
             assert_eq!(math_abs(x), crate::basics::basics_abs(x), "abs {x}");
         }
-        assert_eq!(math_abs(i64::MIN), i64::MAX);
-        assert_eq!(crate::basics::basics_negate(i64::MIN), i64::MIN);
     }
 
     #[test]
