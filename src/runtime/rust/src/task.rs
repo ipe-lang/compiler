@@ -36,7 +36,7 @@ use std::sync::OnceLock;
 static GLOBAL_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
-fn global_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
+fn global_runtime() -> Result<&'static tokio::runtime::Runtime, std::io::Error> {
     if let Some(rt) = GLOBAL_RUNTIME.get() {
         return Ok(rt);
     }
@@ -51,8 +51,7 @@ fn global_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
         .on_thread_start(|| {
             crate::core::record_stack_floor(crate::core::RUNTIME_THREAD_STACK_SIZE);
         })
-        .build()
-        .map_err(|e| format!("tokio runtime init failed: {e}"))?;
+        .build()?;
     // A racing initializer's spare runtime is dropped unused (no tasks on it).
     Ok(GLOBAL_RUNTIME.get_or_init(|| rt))
 }
@@ -229,12 +228,12 @@ where
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 pub fn block_on<E, A>(future: IpeTask<E, A>) -> IpeResult<E, A>
 where
-    E: From<String> + crate::FromUnavailable + Send + 'static,
+    E: crate::FromUnavailable + crate::FromIpeError + Send + 'static,
     A: Send + 'static,
 {
     let rt = match global_runtime() {
         Ok(r) => r,
-        Err(e) => return IpeResult::Err(e.into()),
+        Err(e) => return IpeResult::Err(runtime_init_refused(&e)),
     };
     let future = on_behalf_of_caller(future);
     // The spawned OS thread keeps the entry poll outside any runtime context
@@ -266,8 +265,19 @@ where
     };
     match handle.join() {
         Ok(r) => r,
-        Err(payload) => IpeResult::Err(ipe_error_from_panic("async task panicked", payload)),
+        Err(payload) => IpeResult::Err(E::from_ipe_error(crate::IpeError::unexpected(
+            crate::core::redacted_panic_message("async task panicked", payload),
+        ))),
     }
+}
+
+/// The caller's error for a tokio runtime the OS would not build.
+///
+/// A runtime that cannot start (no threads, no event-loop descriptor) is a
+/// host resource refusal, so it is kinded `Unavailable`.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+fn runtime_init_refused<E: crate::FromUnavailable>(e: &std::io::Error) -> E {
+    E::from_unavailable(format!("tokio runtime init failed: {e}"))
 }
 
 // Std-only entry for a program that reaches NO reactor-requiring kernel: its
@@ -309,7 +319,7 @@ where
 ))]
 pub fn block_on<E, A>(future: IpeTask<E, A>) -> IpeResult<E, A>
 where
-    E: From<String> + Send + 'static,
+    E: Send + 'static,
     A: Send + 'static,
 {
     use std::sync::Arc;
@@ -388,7 +398,7 @@ where
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 pub fn block_on_current_thread<E, A>(future: IpeTask<E, A>) -> IpeResult<E, A>
 where
-    E: From<String> + Send + 'static,
+    E: crate::FromUnavailable + Send + 'static,
     A: Send + 'static,
 {
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -396,7 +406,7 @@ where
         .build()
     {
         Ok(r) => r,
-        Err(e) => return IpeResult::Err(format!("tokio runtime init failed: {}", e).into()),
+        Err(e) => return IpeResult::Err(runtime_init_refused(&e)),
     };
     rt.block_on(future)
 }
@@ -795,7 +805,10 @@ where
 // its entry differently (`spawn_local`), so it is excluded there but present on
 // `wasm32-wasip1`, where a `Direct` program's `main` calls it.
 #[cfg(not(all(target_arch = "wasm32", feature = "wasm-client")))]
-pub fn task_run<E: From<String> + crate::FromUnavailable + Send + 'static, A: Send + 'static>(
+pub fn task_run<
+    E: crate::FromUnavailable + crate::FromIpeError + Send + 'static,
+    A: Send + 'static,
+>(
     task: IpeTask<E, A>,
 ) -> IpeResult<E, A> {
     block_on(task)
@@ -837,16 +850,16 @@ pub fn task_run<E: From<String> + crate::FromUnavailable + Send + 'static, A: Se
 //
 // TOTALITY: no unwrap/expect/panic/indexing. A `JoinError` from `h.await` is a
 // panic inside the spawned task (we never `.await` a handle after issuing its
-// abort, so the cancelled-handle case is unreachable on this path); its payload
-// routes through the redacting foreign-panic funnel — detail server-side under
-// a correlation id, a generic typed `Err` to Ipê. The cancelled arm stays
-// total via the foreign-error funnel rather than an unreachable assumption.
+// abort, so the cancelled-handle case is reachable only on runtime shutdown);
+// `parallel_child_failure` logs its detail server-side under a correlation id
+// and hands Ipê a generic `Unexpected` naming the panic or the cancel. The
+// cancelled arm stays total rather than resting on an unreachable assumption.
 /// One spawned `Task.parallel` child and the guard that aborts it on drop.
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 type ParallelChild<E, A> = (tokio::task::JoinHandle<IpeResult<E, A>>, AbortOnDrop);
 
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
-pub fn task_parallel<E: From<String> + Send + 'static, A: Send + 'static>(
+pub fn task_parallel<E: crate::FromIpeError + Send + 'static, A: Send + 'static>(
     tasks: Vec<IpeTask<E, A>>,
 ) -> IpeTask<E, Vec<A>> {
     Box::pin(async move {
@@ -870,12 +883,7 @@ pub fn task_parallel<E: From<String> + Send + 'static, A: Send + 'static>(
             guard.defuse();
             let result = match joined {
                 Ok(r) => r,
-                Err(join_err) => match join_err.try_into_panic() {
-                    Ok(payload) => {
-                        IpeResult::Err(ipe_error_from_panic("parallel task panicked", payload))
-                    }
-                    Err(join_err) => IpeResult::Err(ipe_error_from_foreign(join_err)),
-                },
+                Err(join_err) => IpeResult::Err(parallel_child_failure(join_err)),
             };
             match result {
                 IpeResult::Ok(a) => out.push(a),
@@ -894,6 +902,23 @@ pub fn task_parallel<E: From<String> + Send + 'static, A: Send + 'static>(
         }
         ok_res(out)
     })
+}
+
+/// The caller's error for a `Task.parallel` child that did not finish.
+///
+/// A panic or a cancel of a child is a defect in compiled or runtime code, not
+/// a foreign failure, so it is kinded `Unexpected` and named for what it is;
+/// the payload or `JoinError` detail is logged under the correlation id only.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+fn parallel_child_failure<E: crate::FromIpeError>(join_err: tokio::task::JoinError) -> E {
+    let message = match join_err.try_into_panic() {
+        Ok(payload) => crate::core::redacted_panic_message("parallel task panicked", payload),
+        Err(join_err) => format!(
+            "parallel task cancelled (ref {})",
+            crate::core::note_foreign_error(join_err)
+        ),
+    };
+    E::from_ipe_error(crate::IpeError::unexpected(message))
 }
 
 // Std-only `Task.parallel` for the `tokio`-less emitted crate. `Task.parallel`
@@ -921,7 +946,7 @@ pub fn task_parallel<E: From<String> + Send + 'static, A: Send + 'static>(
     not(all(target_arch = "wasm32", feature = "wasm-client")),
     any(not(feature = "tokio"), target_arch = "wasm32")
 ))]
-pub fn task_parallel<E: From<String> + Send + 'static, A: Send + 'static>(
+pub fn task_parallel<E: Send + 'static, A: Send + 'static>(
     tasks: Vec<IpeTask<E, A>>,
 ) -> IpeTask<E, Vec<A>> {
     Box::pin(async move {
@@ -1398,6 +1423,23 @@ mod block_on_refusal_tests {
             IpeResult::Ok(v) => panic!("a refused entry thread must not run the task, got Ok({v})"),
         }
     }
+
+    // A runtime the OS would not build is a retryable host refusal, never the
+    // unclassified `Unexpected` a bare-`String` bridge would give it.
+    #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+    #[test]
+    fn runtime_init_failure_is_unavailable() {
+        let refused = std::io::Error::other("no threads");
+        let err: crate::IpeError = runtime_init_refused(&refused);
+        assert_eq!(
+            crate::ipe_error_kind(err.clone()),
+            crate::IpeErrorKind::Unavailable
+        );
+        assert_eq!(
+            crate::ipe_error_message(err),
+            "tokio runtime init failed: no threads"
+        );
+    }
 }
 
 // Exercises the concurrent spawn-based `task_parallel` (`tokio::spawn` + abort),
@@ -1512,10 +1554,37 @@ mod parallel_abort_tests {
         ];
         match task_parallel(tasks).await {
             IpeResult::Err(e) => assert!(
-                e.starts_with("parallel task panicked (ref "),
-                "parallel panic must fold to the funnel message: {e}"
+                e.starts_with("Unexpected: parallel task panicked (ref "),
+                "a runtime-side panic folds to the funnel message, kinded Unexpected: {e}"
             ),
             IpeResult::Ok(v) => panic!("expected a typed Err, got Ok({v:?})"),
+        }
+    }
+
+    // A cancelled child is named as a cancel, never as an external failure:
+    // nothing foreign ran, so the text must not point the reader at FFI.
+    #[tokio::test]
+    async fn cancelled_parallel_child_is_named_a_cancel() {
+        let handle = tokio::spawn(std::future::pending::<()>());
+        handle.abort();
+        let joined = handle.await;
+        assert!(
+            joined
+                .as_ref()
+                .is_err_and(tokio::task::JoinError::is_cancelled),
+            "an aborted spawn joins as a cancel: {joined:?}"
+        );
+        if let Err(join_err) = joined {
+            let err: crate::IpeError = parallel_child_failure(join_err);
+            assert_eq!(
+                crate::ipe_error_kind(err.clone()),
+                crate::IpeErrorKind::Unexpected
+            );
+            let message = crate::ipe_error_message(err);
+            assert!(
+                message.starts_with("parallel task cancelled (ref "),
+                "got: {message:?}"
+            );
         }
     }
 

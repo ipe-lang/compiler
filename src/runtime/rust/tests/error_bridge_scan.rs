@@ -58,7 +58,7 @@ use source_tree::rust_sources;
 const TRANSITIONAL_FROM_STRING: &[(&str, usize)] = &[
     ("auth.rs", 9),
     ("cache.rs", 8),
-    ("core.rs", 9),
+    ("core.rs", 5),
     ("crypto.rs", 10),
     ("crypto_core.rs", 8),
     ("db.rs", 41),
@@ -77,9 +77,7 @@ const TRANSITIONAL_FROM_STRING: &[(&str, usize)] = &[
     ("server.rs", 17),
     ("server_stream.rs", 3),
     ("system.rs", 1),
-    ("task.rs", 6),
     ("tea.rs", 2),
-    ("threads.rs", 2),
     ("time.rs", 23),
     ("tui/app.rs", 3),
     ("web/hub.rs", 14),
@@ -168,6 +166,29 @@ const UNCLASSIFIED_SITES: &[Unclassified] = &[
         count: 7,
         reason: "transitional: `From<ProcessRefusal>` maps every refusal to `Unexpected`; \
                  E3 classifies each variant and removes this entry",
+    },
+    Unclassified {
+        file: "task.rs",
+        function: "block_on",
+        needle: "IpeError::unexpected",
+        count: 1,
+        reason: "a panic in the entry future outside any guarded foreign call: \
+                 a defect in compiled or runtime code, not a foreign failure",
+    },
+    Unclassified {
+        file: "task.rs",
+        function: "parallel_child_failure",
+        needle: "IpeError::unexpected",
+        count: 1,
+        reason: "a `Task.parallel` child that panicked or was cancelled outside any \
+                 guarded foreign call: a defect in compiled or runtime code",
+    },
+    Unclassified {
+        file: "threads.rs",
+        function: "into_error",
+        needle: "IpeError::unexpected",
+        count: 1,
+        reason: "panic or cancel in runtime blocking work: a runtime defect",
     },
     Unclassified {
         file: "js_port.rs",
