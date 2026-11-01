@@ -19,17 +19,54 @@ fn to_u8_vec_from_u8_slice_roundtrip_in_range() {
     assert_eq!(back, bytes);
 }
 
+/// The `u8` rule a scalar FFI argument follows (`ipe_ffi::num_coerce::num_saturate`):
+/// clamp into `0..=255`, never wrap.
+fn scalar_ffi_u8(n: i64) -> u8 {
+    u8::try_from(n.clamp(0, i64::from(u8::MAX))).unwrap_or(u8::MAX)
+}
+
+/// Edge elements, each out-of-range one on the far side of a wrap: `256` and
+/// `2^32` wrap to `0`, `-1` to `255`, `257` to `1`, `300` to `44`.
+const BYTE_EDGES: [i64; 13] = [
+    i64::MIN,
+    -256,
+    -1,
+    0,
+    1,
+    127,
+    128,
+    255,
+    256,
+    257,
+    300,
+    1 << 32,
+    i64::MAX,
+];
+
 #[test]
-fn to_u8_vec_truncates_out_of_range_without_panic() {
-    // `x as u8` is defined (wrapping) for any i64 — never a panic.
-    assert_eq!(ipe_runtime_rust::core::to_u8_vec(&[256]), vec![0u8]);
-    assert_eq!(ipe_runtime_rust::core::to_u8_vec(&[257]), vec![1u8]);
-    assert_eq!(ipe_runtime_rust::core::to_u8_vec(&[-1]), vec![255u8]);
+fn to_u8_vec_saturates_like_scalar_ffi() {
+    assert_eq!(
+        ipe_runtime_rust::core::to_u8_vec(&[256, -1, 257, 300]),
+        vec![255u8, 0, 255, 255]
+    );
     assert_eq!(
         ipe_runtime_rust::core::to_u8_vec(&[i64::MAX, i64::MIN]),
         vec![255u8, 0u8]
     );
     assert_eq!(ipe_runtime_rust::core::to_u8_vec(&[]), Vec::<u8>::new());
+    let scalar: Vec<u8> = BYTE_EDGES.iter().copied().map(scalar_ffi_u8).collect();
+    assert_eq!(ipe_runtime_rust::core::to_u8_vec(&BYTE_EDGES), scalar);
+}
+
+#[test]
+fn to_u8_array_saturates_like_scalar_ffi() {
+    let r = ipe_runtime_rust::core::to_u8_array::<IpeError, 4>(&[256, -1, 257, 300]);
+    assert!(r.is_ok(), "an in-length array must be Ok");
+    assert_eq!(r.with_default([7, 7, 7, 7]), [255u8, 0, 255, 255]);
+    let scalar = BYTE_EDGES.map(scalar_ffi_u8);
+    let r = ipe_runtime_rust::core::to_u8_array::<IpeError, 13>(&BYTE_EDGES);
+    assert!(r.is_ok(), "an in-length array must be Ok");
+    assert_eq!(r.with_default([7; 13]), scalar);
 }
 
 // ── fixed-size array coercion: length mismatch MUST be Err, never panic ─────

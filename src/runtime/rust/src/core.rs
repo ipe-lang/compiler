@@ -208,12 +208,18 @@ pub fn disconnected_fn3<
 // Byte-sequence FFI coercion (Ipê List Int <-> Rust bytes)
 // ===========================================
 
-/// Ipê `List Int` (Vec<i64>) -> owned bytes. Each element is narrowed `as u8`,
-/// mirroring the numeric param narrowing the FFI codegen already emits.
-/// Used for `&[u8]` and `Vec<u8>` parameters.
+/// Ipê `List Int` (Vec<i64>) -> owned bytes, for `&[u8]` and `Vec<u8>` parameters.
+///
+/// Each element clamps into `0..=255` through [`super::narrow::byte_saturating`],
+/// the rule a scalar `u8` FFI argument follows, so `256` is `255` and `-1` is
+/// `0` on every target.
 #[must_use]
+#[deny(clippy::as_conversions)]
 pub fn to_u8_vec(xs: &[i64]) -> Vec<u8> {
-    xs.iter().map(|&x| x as u8).collect()
+    xs.iter()
+        .copied()
+        .map(super::narrow::byte_saturating)
+        .collect()
 }
 
 /// Owned/borrowed bytes -> Ipê `List Int` (Vec<i64>). Used for byte results.
@@ -222,11 +228,13 @@ pub fn from_u8_slice(bs: &[u8]) -> Vec<i64> {
     bs.iter().map(|&b| i64::from(b)).collect()
 }
 
-/// Ipê `List Int` -> `[u8; N]`. A length mismatch returns `Err` and never
-/// panics (honours "no runtime panic from well-typed Ipê code"). Used for
-/// `[u8; N]` / `&[u8; N]` parameters; the generated wrapper instantiates
+/// Ipê `List Int` -> `[u8; N]`, for `[u8; N]` / `&[u8; N]` parameters.
+///
+/// A length mismatch returns `Err` and never panics; each element clamps into
+/// `0..=255` as [`to_u8_vec`] does. The generated wrapper instantiates
 /// `E = IpeError` and the concrete `N`.
 #[must_use]
+#[deny(clippy::as_conversions)]
 pub fn to_u8_array<E: From<String>, const N: usize>(xs: &[i64]) -> IpeResult<E, [u8; N]> {
     if xs.len() != N {
         return IpeResult::Err(format!("expected {} bytes, got {}", N, xs.len()).into());
@@ -234,7 +242,7 @@ pub fn to_u8_array<E: From<String>, const N: usize>(xs: &[i64]) -> IpeResult<E, 
     let mut a = [0u8; N];
     // len == N checked above; zip is total (no indexing).
     for (slot, &x) in a.iter_mut().zip(xs.iter()) {
-        *slot = x as u8;
+        *slot = super::narrow::byte_saturating(x);
     }
     ok_res(a)
 }
@@ -438,8 +446,9 @@ pub fn ipe_maybe_and_then<T, U>(m: IpeMaybe<T>, f: impl FnOnce(T) -> IpeMaybe<U>
 /// `IpeMaybe<T>` -> `Option<T>` for FFI parameter coercion: a Ipê `Maybe X`
 /// argument reaches the wrapper as `IpeMaybe<X>` but the underlying crate fn
 /// takes `Option<…>`. The generated wrapper calls this then adapts the inner
-/// value (`.as_deref()` for `Option<&str>`, `.map(|x| x as u16)` for narrowed
-/// numerics, identity otherwise). Total: `Just -> Some`, `Nothing -> None`.
+/// value (`.as_deref()` for `Option<&str>`, the saturating `num_saturate` form
+/// `.map(|x| (x).clamp(0, u16::MAX as i64) as u16)` for narrowed numerics,
+/// identity otherwise). Total: `Just -> Some`, `Nothing -> None`.
 pub fn ipe_maybe_to_option<T>(m: IpeMaybe<T>) -> Option<T> {
     match m {
         IpeMaybe::Just(v) => Some(v),
