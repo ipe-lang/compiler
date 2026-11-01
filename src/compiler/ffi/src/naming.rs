@@ -128,8 +128,10 @@ pub const MAX_TYPE_LEN: usize = 4096;
 /// Depth is counted by [`check_type_ceilings`]: every open `<`/`(`/`[` and
 /// every type word on the path from the root to a point adds one level, so
 /// `Vec<Vec<T>>` (Rust) and `List List Int` (Ipê) are both bounded by it. Each
-/// recursive type walk in the crate consumes at least one level per frame, so
-/// its stack is bounded by this ceiling.
+/// recursive type walk in the crate peels at least one word or open bracket
+/// per frame, with no closer between it and the part it descends into, so its
+/// stack is bounded by this ceiling. A scanner that skips a closer kind the
+/// ceiling counts (the closure return parser ignores `]`) must not recurse.
 pub const MAX_TYPE_DEPTH: usize = 64;
 
 /// Refuse a foreign type string past [`MAX_TYPE_LEN`] or [`MAX_TYPE_DEPTH`].
