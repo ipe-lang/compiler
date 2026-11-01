@@ -188,7 +188,7 @@ Ipe.Analytics — typed, consent-gated product analytics.
 
 [Full reference](stdlib/Basics.md)
 
-Ipe.Basics — the implicit prelude (Tier-A auto-import, compiled source).
+Ipe.Basics — the implicit prelude, imported into every module.
 
 | Export | Summary |
 |--------|----------|

@@ -959,9 +959,8 @@ static HAND_TABLE: &[EnvVar] = &[
     EnvVar {
         name: "IPE_RUNTIME_DIR",
         default: Cow::Borrowed("unset (embedded / in-repo)"),
-        purpose: "Explicit path to the runtime. A vendored build \
-                  (`IPE_RUNTIME_VENDORED=1`) copies the module tree at exactly this \
-                  path. A linked build only checks that the runtime crate root at or \
+        purpose: "Explicit path to the runtime. A vendored build copies the module \
+                  tree at exactly this path. A linked build only checks that the runtime crate root at or \
                   above it declares the compiler's version; the emitted project bundles \
                   the compiler's own runtime.",
         subsystem: Subsystem::Runtime,

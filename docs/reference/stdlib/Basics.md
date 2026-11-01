@@ -4,14 +4,13 @@
 
 [Back to stdlib index](../stdlib.md)
 
-Ipe.Basics — the implicit prelude (Tier-A auto-import, compiled source).
+Ipe.Basics — the implicit prelude, imported into every module.
 
-Each binding routes to its runtime kernel via `Kernel.kernel`. Polymorphic
-members with ordering or numeric obligations (`clamp`, `min`, `max`,
-`negate`, `abs`, `compare`) carry the bound implicitly — the type-checker's
-`Comparable`/`Number` obligation rejects a function, record, list, or tuple
-argument before it monomorphises. `sqrt` is monomorphically `Float -> Float`.
-The builtin `Order` is exposed so `Basics.Order` names it.
+Polymorphic members with ordering or numeric obligations (`clamp`, `min`,
+`max`, `negate`, `abs`, `compare`) carry the bound implicitly — the
+type-checker's `Comparable`/`Number` obligation rejects a function, record,
+list, or tuple argument. `sqrt` is monomorphically `Float -> Float`. The
+builtin `Order` is exposed so `Basics.Order` names it.
 
 ## `identity`
 

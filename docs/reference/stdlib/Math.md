@@ -14,6 +14,12 @@ The module complements `Ipe.Basics` (`abs`, `min`, `max`, `sqrt`,
 namespace clear. Floating-point results follow IEEE 754 — `nan` and
 `inf` are valid `Float` values, and `isNaN` is the correct test for NaN.
 
+`Int` and `Float` never convert implicitly. `floor`, `ceil`, `round`, and
+`trunc` take a `Float` to an `Int`. To take an `Int` to a `Float`, go
+through `Ipe.Decimal`, which holds every `Int` exactly:
+`Decimal.toFloat (Decimal.fromInt n)` yields the nearest `Float`, exact
+whenever `abs n <= 2^53`.
+
 ## `abs`
 
 ```ipe
