@@ -97,7 +97,7 @@ impl<T: Clone + 'static> Broker<T> {
                 None => return 0,
             }
         };
-        let n = listeners.len() as i64;
+        let n = crate::narrow::count_to_int(listeners.len());
         for (owner_origin, call) in listeners {
             if skip_origin && owner_origin == origin {
                 continue;

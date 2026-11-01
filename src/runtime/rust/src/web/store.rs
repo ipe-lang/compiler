@@ -4034,7 +4034,8 @@ mod tests {
         // are never parsed: the length gate fires first.
         let mut framed = Vec::new();
         framed.extend_from_slice(&TEST_TAG);
-        framed.resize(32 + MAX_CHECKPOINT_BYTES as usize + 1, b'0');
+        let ceiling = usize::try_from(MAX_CHECKPOINT_BYTES).expect("the 64 MiB ceiling fits usize");
+        framed.resize(32 + ceiling + 1, b'0');
         let blob = B64.encode(&framed);
         let init = || (serde_json::Value::Null, ());
         let decoded = decode_or_reconstruct_checkpoint(&TEST_TAG, &blob, &init);

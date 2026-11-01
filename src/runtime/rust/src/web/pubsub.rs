@@ -78,7 +78,7 @@ impl<T: Clone + Send + 'static> Broker<T> {
         let mut g = self.lock();
         match g.get(topic) {
             Some(tx) => {
-                let n = tx.receiver_count() as i64;
+                let n = crate::narrow::count_to_int(tx.receiver_count());
                 if n == 0 {
                     g.remove(topic); // lazy prune
                     return 0;

@@ -84,7 +84,7 @@ pub fn dict_from_list<K: Hash + Eq, V>(pairs: Vec<(K, V)>) -> HashMap<K, V> {
 /// `Dict.size : Dict k v -> Int`. Returns the number of key/value pairs.
 #[must_use]
 pub fn dict_size<K, V>(d: HashMap<K, V>) -> i64 {
-    d.len() as i64
+    super::narrow::count_to_int(d.len())
 }
 
 /// `Dict.isEmpty : Dict k v -> Bool`.

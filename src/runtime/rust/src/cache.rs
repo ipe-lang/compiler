@@ -113,6 +113,22 @@ struct Slot {
 /// calls `cache_destroy`.
 const MAX_LIVE_CACHES: i64 = 4096;
 
+/// The longest expiry an entry gets when its TTL overruns the clock: 30 years.
+const TTL_SATURATION: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 30);
+
+/// The expiry a TTL of `ttl_ms` gives an entry written at `now`; `None` never expires.
+///
+/// A TTL `<= 0` is no expiry. A positive TTL past the clock's range saturates
+/// to [`TTL_SATURATION`] past `now`, and past even that to no expiry, so a
+/// longer TTL never expires sooner than a shorter one.
+fn expiry_deadline(now: Instant, ttl_ms: i64) -> Option<Instant> {
+    if ttl_ms <= 0 {
+        return None;
+    }
+    now.checked_add(Duration::from_millis(ttl_ms.unsigned_abs()))
+        .or_else(|| now.checked_add(TTL_SATURATION))
+}
+
 /// The global cache registry: a monotonic handle counter plus the live caches
 /// keyed by handle. Keying by the exact `i64` handle makes every op O(1) and
 /// never observes `HashMap` iteration order, so output stays deterministic.
@@ -187,7 +203,7 @@ pub fn cache_new_raw<E: Send + From<String> + FromLimitExceeded + 'static>(
             // registry is full rather than growing without bound or silently
             // evicting a cache another task still holds a handle to. Reclamation
             // is caller-driven (`cache_destroy`); this is the hard backstop.
-            if g.live.len() as i64 >= MAX_LIVE_CACHES {
+            if super::narrow::count_to_int(g.live.len()) >= MAX_LIVE_CACHES {
                 return IpeResult::Err(E::from_limit_exceeded(format!(
                     "Cache.new: live cache limit reached ({MAX_LIVE_CACHES}); destroy unused caches before creating more"
                 )));
@@ -227,21 +243,7 @@ where
             slot.seq = slot.seq.saturating_add(1);
             let seq = slot.seq;
             let max = slot.cfg.maxEntries;
-            let ttl = slot.cfg.ttlMs;
-            let expires_at = if ttl > 0 {
-                // Saturate instead of panicking: a Ipê caller passing a near-i64::MAX ttl
-                // (e.g. `withTTL Int.maxInt`) must not cause "overflow when adding duration
-                // to instant". ttl > 0 is already guarded above, so the cast is lossless.
-                Some(
-                    Instant::now()
-                        .checked_add(Duration::from_millis(ttl as u64))
-                        .unwrap_or_else(|| {
-                            Instant::now() + Duration::from_secs(60 * 60 * 24 * 365 * 30)
-                        }),
-                )
-            } else {
-                None // ttl <= 0 → no expiry
-            };
+            let expires_at = expiry_deadline(Instant::now(), slot.cfg.ttlMs);
             let (added, evicted) = {
                 let store = slot
                     .store
@@ -264,7 +266,7 @@ where
                             });
                         }
                         let mut evicted = 0i64;
-                        if max > 0 && vec.len() as i64 > max {
+                        if max > 0 && super::narrow::count_to_int(vec.len()) > max {
                             // evict the least-recently-used (smallest last_seq)
                             if let Some((idx, _)) =
                                 vec.iter().enumerate().min_by_key(|(_, e)| e.last_seq)
@@ -371,7 +373,7 @@ where
                 .and_then(|s| s.downcast_mut::<Vec<CacheEntry<K>>>())
             {
                 vec.retain(|e| e.key != key);
-                let removed = (before - vec.len()) as i64;
+                let removed = super::narrow::count_to_int(before.saturating_sub(vec.len()));
                 slot.entries = slot.entries.saturating_sub(removed);
             }
         });
@@ -570,6 +572,26 @@ mod tests {
         }
     }
 
+    /// A TTL `<= 0` never expires, and a positive TTL keeps its order: the
+    /// largest TTL reads as a far deadline, never as a short or past one.
+    #[test]
+    fn expiry_deadline_ttl_edges() {
+        let now = Instant::now();
+        for ttl in [0, -1, i64::MIN] {
+            assert_eq!(expiry_deadline(now, ttl), None, "ttl {ttl}");
+        }
+        assert_eq!(
+            expiry_deadline(now, 1),
+            now.checked_add(Duration::from_millis(1))
+        );
+        let year = Duration::from_secs(60 * 60 * 24 * 365);
+        let far = expiry_deadline(now, i64::MAX);
+        assert!(
+            far.is_none_or(|deadline| deadline.saturating_duration_since(now) > year),
+            "ttl i64::MAX gave {far:?}"
+        );
+    }
+
     /// Registry bounded by construction (PRINCIPLES §1/§3): after `MAX_LIVE_CACHES`
     /// live caches, the next `cache_new_raw` fails closed rather than growing the
     /// registry without bound. Pins the exhaustion backstop. Destroys the caches
@@ -583,7 +605,7 @@ mod tests {
         loop {
             let live = {
                 let g = registry().lock().unwrap_or_else(|e| e.into_inner());
-                g.live.len() as i64
+                super::super::narrow::count_to_int(g.live.len())
             };
             if live >= MAX_LIVE_CACHES {
                 break;

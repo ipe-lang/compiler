@@ -43,9 +43,15 @@ pub const WORK_CANCEL_DEADLINE: Duration = Duration::from_millis(500);
 /// after another. The bound the shutdown tests hold the exit to;
 /// `server_shutdown_e2e` mirrors it.
 #[cfg(all(feature = "db", test))]
-pub const POOLS_CLOSE_BOUND: Duration = DB_CLOSE_DEADLINE
-    .saturating_mul(crate::db::CLOSE_STAGES as u32)
-    .saturating_add(WORK_CANCEL_DEADLINE);
+pub const POOLS_CLOSE_BOUND: Duration = {
+    // `CLOSE_STAGES` is a stage count of 2, far inside `u32`; `u32::try_from`
+    // is not callable in a `const`.
+    #[allow(clippy::cast_possible_truncation)]
+    let stages = crate::db::CLOSE_STAGES as u32;
+    DB_CLOSE_DEADLINE
+        .saturating_mul(stages)
+        .saturating_add(WORK_CANCEL_DEADLINE)
+};
 
 /// How long a draining WebSocket's close frame may take to send.
 pub const WS_CLOSE_DEADLINE: Duration = Duration::from_secs(1);

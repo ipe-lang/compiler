@@ -755,6 +755,14 @@ where
 
 const STATS_WINDOW_SECS: i64 = 60;
 const STATS_BUCKET_COUNT: usize = 30;
+/// One stats bucket's width: the window split into `STATS_BUCKET_COUNT` parts.
+const STATS_BUCKET_MS: i64 = {
+    // A count of 30 fits `i64` on every target; `i64::try_from` is not
+    // callable in a `const`.
+    #[allow(clippy::cast_possible_wrap)]
+    let count = STATS_BUCKET_COUNT as i64;
+    (STATS_WINDOW_SECS * 1000) / count
+};
 const STATS_ROW_CAP: i64 = 10_000;
 
 /// Nearest-rank p-th percentile; 0 for empty input (= "no observations", not
@@ -765,11 +773,15 @@ fn percentile(vals: &[f64], p: f64) -> f64 {
     }
     let mut sorted = vals.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mut idx = (p * sorted.len() as f64).ceil() as isize - 1;
-    if idx < 0 {
-        idx = 0;
-    }
-    let idx = (idx as usize).min(sorted.len() - 1);
+    // The 1-based nearest rank `ceil(p * n)`, clamped into `0..=n` in the float
+    // domain; a NaN rank names no observation, the empty input's `0.0`.
+    let n = sorted.len() as f64;
+    let Some(rank) = crate::narrow::f64_trunc_to_i64((p * n).ceil().clamp(0.0, n)) else {
+        return 0.0;
+    };
+    let idx = crate::narrow::count_from_int(rank)
+        .saturating_sub(1)
+        .min(sorted.len().saturating_sub(1));
     sorted.get(idx).copied().unwrap_or(0.0)
 }
 
@@ -795,15 +807,18 @@ fn parse_float_attr(raw: &str) -> Option<f64> {
 }
 
 /// Bucket index for `ts` within `[since, since + count*bucket]`; `None` outside.
+///
+/// An offset `ts - since` that overflows `i64` lies outside every window, and
+/// an index past `usize` names no bucket, so both are `None`.
 fn bucket_index(ts_ms: i64, since_ms: i64, bucket_ms: i64) -> Option<usize> {
     if bucket_ms <= 0 {
         return None;
     }
-    let off = ts_ms - since_ms;
+    let off = ts_ms.checked_sub(since_ms)?;
     if off < 0 {
         return None;
     }
-    Some((off / bucket_ms) as usize)
+    usize::try_from(off / bucket_ms).ok()
 }
 
 fn parse_ms(rfc: &str) -> Option<i64> {
@@ -819,7 +834,7 @@ async fn aggregate_service_stat(pool: &SqlitePool, svc: &str) -> Value {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let since_ms = now_ms - STATS_WINDOW_SECS * 1000;
     let window_sec = STATS_WINDOW_SECS as f64;
-    let bucket_ms = (STATS_WINDOW_SECS * 1000) / STATS_BUCKET_COUNT as i64;
+    let bucket_ms = STATS_BUCKET_MS;
 
     // Recent logs for the service.
     let log_rows = sqlx::query(
@@ -1338,6 +1353,20 @@ mod tests {
         assert_eq!(percentile(&v, 0.95), 95.0);
     }
 
+    /// A rank outside `1..=n`, infinite ones included, clamps to the nearest
+    /// end; a NaN rank names no observation, the empty input's `0.0`.
+    #[test]
+    fn percentile_rank_clamps_and_refuses_nan() {
+        let v: Vec<f64> = (1..=100).map(f64::from).collect();
+        assert_eq!(percentile(&v, 0.0), 1.0);
+        assert_eq!(percentile(&v, -1.0), 1.0);
+        assert_eq!(percentile(&v, f64::NEG_INFINITY), 1.0);
+        assert_eq!(percentile(&v, 2.0), 100.0);
+        assert_eq!(percentile(&v, 1e300), 100.0);
+        assert_eq!(percentile(&v, f64::INFINITY), 100.0);
+        assert_eq!(percentile(&v, f64::NAN), 0.0);
+    }
+
     #[test]
     fn classify_status_thresholds() {
         assert_eq!(classify_status(0.0), "ok");
@@ -1353,6 +1382,17 @@ mod tests {
         assert_eq!(bucket_index(-5, 0, 1000), None); // before window
         assert_eq!(bucket_index(0, 0, 2000), Some(0));
         assert_eq!(bucket_index(2500, 0, 2000), Some(1));
+        assert_eq!(STATS_BUCKET_MS, 2000);
+    }
+
+    /// `ts - since` past `i64` is outside the window: a raw subtraction would
+    /// wrap `i64::MIN - 1` to `i64::MAX` and file a stray row into a bucket.
+    #[test]
+    fn bucket_index_refuses_an_overflowing_offset() {
+        assert_eq!(bucket_index(i64::MIN, 1, 2000), None);
+        assert_eq!(bucket_index(i64::MIN, i64::MAX, 2000), None);
+        assert_eq!(bucket_index(i64::MAX, -1, 2000), None);
+        assert_eq!(bucket_index(i64::MAX, 0, 1), usize::try_from(i64::MAX).ok());
     }
 
     #[tokio::test]
