@@ -48,6 +48,13 @@ const ALLOWED: &[(&str, &str, Breach, usize)] = &[
         Breach::LoneQuote,
         2,
     ),
+    ("golden_form.rs", "golden_cargo_toml", Breach::HandQuote, 1),
+    (
+        "golden_form.rs",
+        "normalize_crate_identity_hash",
+        Breach::HandQuote,
+        1,
+    ),
     ("project.rs", "apply_cargo_name", Breach::HandQuote, 1),
     (
         "project.rs",
