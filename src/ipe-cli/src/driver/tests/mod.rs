@@ -1910,9 +1910,44 @@ fn a_manifest_project_without_src_is_refused_before_any_test_build() {
     fs::remove_dir_all(fixture.path().join("src")).expect("remove src/");
     let refused = project::parse_manifest(&fixture.manifest_path());
     assert!(
-        matches!(&refused, Err(CliError::Usage(m)) if m.to_string().contains("source root")),
+        matches!(&refused, Err(CliError::ProjectRefused(m)) if m.to_string().contains("source root")),
         "a manifest without `src/` must be refused at the read: {refused:?}"
     );
+}
+
+/// A project whose manifest declares one `depPath` dependency on `s-lib`.
+#[allow(clippy::expect_used)] // a failed fixture setup is the test failure
+fn path_dependent_project() -> crate::RootFixture {
+    let tree = SourceTree::main("module Main exposing (main)\n\nmain = 1\n")
+        .field("dependencies = [ depPath \"s-lib\" \"../s-lib\" ]");
+    crate::RootFixture::from_tree(&tree).expect("fixture")
+}
+
+/// Whether `result` is the not-compiled refusal for the `depPath` on `s-lib`.
+fn is_s_lib_path_refusal<T>(result: &Result<T, CliError>) -> bool {
+    matches!(
+        result,
+        Err(CliError::DependencyNotCompiled { name, kind: project::DepKind::Path })
+            if name.as_str() == "s-lib"
+    )
+}
+
+/// The package source set is not assembled for a manifest that declares a
+/// dependency: no compiled dependency stands behind it.
+#[test]
+fn a_package_source_set_is_refused_for_a_declared_dependency() {
+    let fixture = path_dependent_project();
+    let read = PackageSourceSet::read(&fixture.manifest_path());
+    assert!(is_s_lib_path_refusal(&read), "{read:?}");
+}
+
+/// Capability inference refuses a package that declares a dependency rather
+/// than judge a surface without it.
+#[test]
+fn capability_inference_is_refused_for_a_declared_dependency() {
+    let fixture = path_dependent_project();
+    let inferred = infer_package_capabilities(&fixture.manifest_path());
+    assert!(is_s_lib_path_refusal(&inferred), "{inferred:?}");
 }
 
 /// The test runner over the project `arg` names from `cwd`, its binary's summary kept quiet.
@@ -2283,6 +2318,7 @@ fn on_disk_cache_hit_serves_a_tampered_entry_verbatim() {
     let (result_a, outcome_a) = compile_modules_observed(
         sources.clone(),
         discovered.clone(),
+        crate::project::CompiledDeps::none(),
         &entry_path,
         &emit_target(&out_a),
         &runtime,
@@ -2317,6 +2353,7 @@ fn on_disk_cache_hit_serves_a_tampered_entry_verbatim() {
     let (result_b, outcome_b) = compile_modules_observed(
         sources,
         discovered,
+        crate::project::CompiledDeps::none(),
         &entry_path,
         &emit_target(&out_b),
         &runtime,
@@ -2383,6 +2420,7 @@ fn cold_build_with_the_cache_inside_a_fresh_output_dir_claims_it() {
         compile_modules_observed(
             sources.clone(),
             discovered.clone(),
+            crate::project::CompiledDeps::none(),
             &entry_path,
             &emit_target(&out),
             &runtime,
@@ -2481,6 +2519,7 @@ fn build_through_planted_cache_link(tag: &str, planted: PlantedCacheLink) {
         compile_modules_observed(
             sources.clone(),
             discovered.clone(),
+            crate::project::CompiledDeps::none(),
             &entry_path,
             &emit_target(&out),
             &runtime,
@@ -2646,6 +2685,7 @@ fn ir_cache_hit_reuses_lowered_program_across_a_db_driver_only_edit() {
     let (result_a, outcome_a) = compile_modules_observed(
         sources.clone(),
         discovered.clone(),
+        crate::project::CompiledDeps::none(),
         &entry_path,
         &emit_target(&out_a),
         &runtime,
@@ -2676,6 +2716,7 @@ fn ir_cache_hit_reuses_lowered_program_across_a_db_driver_only_edit() {
     let (result_b, outcome_b) = compile_modules_observed(
         sources,
         discovered,
+        crate::project::CompiledDeps::none(),
         &entry_path,
         &emit_target(&out_b),
         &runtime,
@@ -2729,6 +2770,7 @@ fn on_disk_ir_cache_hit_serves_a_tampered_entry_verbatim() {
     let (result_a, outcome_a) = compile_modules_observed(
         sources.clone(),
         discovered.clone(),
+        crate::project::CompiledDeps::none(),
         &entry_path,
         &emit_target(&out_a),
         &runtime,
@@ -2765,6 +2807,7 @@ fn on_disk_ir_cache_hit_serves_a_tampered_entry_verbatim() {
     let (result_b, outcome_b) = compile_modules_observed(
         sources,
         discovered,
+        crate::project::CompiledDeps::none(),
         &entry_path,
         &emit_target(&out_b),
         &runtime,
@@ -2846,6 +2889,7 @@ fn production_ir_cache_hit_blames_the_in_memory_entry_source() {
     let (dev, dev_outcome) = compile_modules_observed(
         sources.clone(),
         discovered.clone(),
+        crate::project::CompiledDeps::none(),
         &entry_path,
         &emit_target(&tmp.join("out-dev")),
         &runtime,
@@ -2860,6 +2904,7 @@ fn production_ir_cache_hit_blames_the_in_memory_entry_source() {
     let (release, release_outcome) = compile_modules_observed(
         sources,
         discovered,
+        crate::project::CompiledDeps::none(),
         &entry_path,
         &emit_target(&tmp.join("out-release")),
         &runtime,
@@ -2925,6 +2970,7 @@ fn cache_dir_none_disables_caching_entirely() {
     let (result, outcome) = compile_modules_observed(
         sources,
         discovered,
+        crate::project::CompiledDeps::none(),
         &entry_path,
         &emit_target(&out_dir),
         &runtime,
@@ -3625,7 +3671,7 @@ fn build_refuses_a_pure_library_with_a_clean_message() {
         &BuildOptions::from_env(),
     );
     assert!(
-        matches!(&result, Err(CliError::Usage(msg)) if msg.contains("library package")),
+        matches!(&result, Err(CliError::ProjectRefused(msg)) if msg.contains("library package")),
         "a pure library must be refused with a clean library message: {result:?}"
     );
     assert!(!out.exists(), "the refusal fires before any emit");
@@ -5790,6 +5836,7 @@ fn compile_debug_log_as(verb: Verb, label: &str) -> Result<crate::driver::Emitte
     let (result, _) = compile_modules_observed(
         sources,
         discovered,
+        crate::project::CompiledDeps::none(),
         &entry_path,
         &emit_target(&tmp.join("out")),
         &runtime,
@@ -6443,6 +6490,7 @@ fn vendored_debugger_build_is_refused_before_compiling() {
         let (result, outcome) = compile_modules_observed(
             sources.clone(),
             discovered.clone(),
+            crate::project::CompiledDeps::none(),
             &entry_path,
             &emit_target(&out),
             Path::new("<no-runtime>"),
