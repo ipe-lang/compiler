@@ -1325,6 +1325,102 @@ fn a_sqlite_session_store_closes_on_sigterm() -> Result<(), BoxError> {
     Ok(())
 }
 
+/// Each startup fact a `Web.tea` app prints has exactly one writer: the
+/// bind-address line on stderr only (no stdout duplicate), and the session
+/// store's own choice on stderr only (no false `memory` line when a durable
+/// store was actually chosen).
+#[test]
+fn startup_facts_once() -> Result<(), BoxError> {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return Ok(());
+    }
+    let test_name = "web_session_db";
+    let exe = compile(test_name, WEB_SESSION_DB)?;
+
+    // Default store (memory): the memory line is the one actual choice.
+    {
+        let port = pick_ephemeral_port()?;
+        let port_env = port.to_string();
+        let env = [
+            ("IPE_WEB_PORT", port_env.as_str()),
+            ("IPE_CSRF", "off"),
+            ("IPE_CONSOLE_EMBED", "off"),
+        ];
+        let mut served = Served::ready(&exe, port, &env)?;
+        assert_eq!(
+            served.containing(Pipe::Out, "listening on"),
+            0,
+            "{test_name}: no stdout duplicate of the bind line; seen {:?}",
+            served.seen
+        );
+        assert_eq!(
+            served.containing(Pipe::Err, "listening on"),
+            1,
+            "{test_name}: one bind line on stderr; seen {:?}",
+            served.seen
+        );
+        assert_eq!(
+            served.containing(Pipe::Err, "session store:"),
+            1,
+            "{test_name}: one session-store line; seen {:?}",
+            served.seen
+        );
+        assert_eq!(
+            served.containing(Pipe::Err, "session store: memory"),
+            1,
+            "{test_name}: the memory store it actually chose; seen {:?}",
+            served.seen
+        );
+        served.signal("-TERM")?;
+        served.wait_exit(EXIT_BUDGET)?;
+    }
+
+    // A durable store (sqlite): no false "memory" line from the inline
+    // console mount re-logging a store choice it never made.
+    {
+        let db = fresh_db(test_name);
+        let db_env = db.to_string_lossy().into_owned();
+        let port = pick_ephemeral_port()?;
+        let port_env = port.to_string();
+        let env = [
+            ("IPE_WEB_PORT", port_env.as_str()),
+            ("IPE_CSRF", "off"),
+            ("IPE_CONSOLE_EMBED", "off"),
+            ("IPE_WEB_STORE", "sqlite"),
+            ("IPE_WEB_STORE_PATH", db_env.as_str()),
+        ];
+        let mut served = Served::ready(&exe, port, &env)?;
+        assert_eq!(
+            served.containing(Pipe::Out, "listening on"),
+            0,
+            "{test_name}: no stdout duplicate of the bind line; seen {:?}",
+            served.seen
+        );
+        assert_eq!(
+            served.containing(Pipe::Err, "listening on"),
+            1,
+            "{test_name}: one bind line on stderr; seen {:?}",
+            served.seen
+        );
+        assert_eq!(
+            served.containing(Pipe::Err, "session store:"),
+            1,
+            "{test_name}: one session-store line; seen {:?}",
+            served.seen
+        );
+        assert_eq!(
+            served.containing(Pipe::Err, "session store: memory"),
+            0,
+            "{test_name}: no false memory line under a durable store; seen {:?}",
+            served.seen
+        );
+        served.signal("-TERM")?;
+        served.wait_exit(EXIT_BUDGET)?;
+        assert_no_sidecars(test_name, &db);
+    }
+    Ok(())
+}
+
 /// E11: a web Cmd still running on an owned pool past the grace is cancelled
 /// before the pools close: it never reports a closed pool, the one cancel line
 /// counts it, and the database keeps no `-wal` or `-shm`.
