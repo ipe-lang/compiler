@@ -837,10 +837,19 @@ pub(crate) enum CliEvent<M> {
     // Constructed only by the `tui` raw-key reader; console_app matches it
     // defensively (keys are ignored under Cli).
     Key(String, String, InputPermit),
+    /// The terminal interrupt (Ctrl-C) read as a key in raw mode, where the OS
+    /// no longer turns it into a signal; it ends the program with
+    /// [`INTERRUPT_EXIT_CODE`]. Constructed only by the `tui` raw-key reader.
+    Interrupt,
     Msg(M),
     PerformDone(M),
     Eof,
 }
+
+/// The exit status of a program the terminal interrupt ends: 128 + `SIGINT`,
+/// what a shell reports for a program stopped by Ctrl-C.
+#[cfg(all(not(target_arch = "wasm32"), feature = "tui"))]
+pub(crate) const INTERRUPT_EXIT_CODE: i32 = 130;
 
 /// The most terminal input events the loop may hold queued but not yet taken.
 ///
@@ -1292,13 +1301,14 @@ where
         // Inline render (a closure borrowing `view` would make the future non-Send).
         // Fallible writes (NOT print!/println!, which panic on a broken pipe).
         //
-        // A render rasterizes the model's `Lines` view to a styled terminal
-        // string via `render_lines_view` and writes it to stdout with NO forced
-        // trailing "\n": the prompt formatting is the view's own to decide, so a
-        // view whose last line ends `"> "` keeps the cursor on the prompt line
-        // for the user's input. Exactly one terminating newline is written after
-        // the event loop exits. A view that wants each render on its own line
-        // supplies its own trailing empty line.
+        // Every frame and the closing bytes are encoded by the ONE `output`
+        // chosen here from whether stdout is a terminal. On a terminal a frame
+        // is styled and written with NO forced trailing "\n": the prompt
+        // formatting is the view's own to decide, so a view whose last line ends
+        // `"> "` keeps the cursor on the prompt line, and exactly one newline is
+        // written after the loop exits. Into a pipe or a file a frame is plain
+        // lines, each frame terminated by its own newline, so the output is
+        // line-oriented text a script can read.
         //
         // The initial render is skipped when `init` issued an outstanding
         // effect: that effect's Msg folds through `update` and renders the
@@ -1306,8 +1316,9 @@ where
         // pre-effect model and duplicate the frame. An effect-free `init`
         // (`Cmd.none`) has nothing to settle, so its initial model renders now
         // (the `lines: 0` frame the separator fixture pins).
+        let output = crate::tui::LineOutput::of_stdout();
         if outstanding.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-            let rendered = crate::tui::render_lines_view(view(model.clone()));
+            let rendered = crate::tui::render_lines_view(view(model.clone()), output);
             let _ = std::io::stdout().write_all(rendered.as_bytes());
             let _ = std::io::stdout().flush();
         }
@@ -1318,6 +1329,10 @@ where
                 // The permit returns to the reader's budget as the line is taken.
                 CliEvent::Line(l, _permit) => submgr.line_msgs(&l),
                 CliEvent::Key(..) => continue, // Cli has no keys
+                CliEvent::Interrupt => {
+                    submgr.stop_all();
+                    crate::system::exit_process(INTERRUPT_EXIT_CODE)
+                }
                 CliEvent::Msg(m) => vec![m],
                 CliEvent::PerformDone(m) => {
                     // A one-shot effect delivered its result: this effect is no
@@ -1353,7 +1368,7 @@ where
                 cli_run_cmd_tracked(cmd, &tx, Some(&outstanding));
                 submgr.update(subscriptions(model.clone()));
             }
-            let rendered = crate::tui::render_lines_view(view(model.clone()));
+            let rendered = crate::tui::render_lines_view(view(model.clone()), output);
             let _ = std::io::stdout().write_all(rendered.as_bytes());
             let _ = std::io::stdout().flush();
             // After folding an effect's result, if EOF was already seen and no
@@ -1363,7 +1378,8 @@ where
             }
         }
         submgr.stop_all();
-        let _ = std::io::stdout().write_all(b"\n");
+        let _ = std::io::stdout().write_all(output.closing().as_bytes());
+        let _ = std::io::stdout().flush();
         // Dump the recorded session (plain trace + typed log) to the
         // `IPE_DEBUGGER_RECORD` destination, a no-op when that env var is unset.
         // The recorder ring already bounds the log.

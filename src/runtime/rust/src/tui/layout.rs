@@ -2661,51 +2661,82 @@ fn sgr_with_profile(style: Style, profile: crate::color::TermProfile) -> String 
     }
 }
 
+/// How [`emit_block`] encodes a frame's lines.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FrameEncoding {
+    /// A terminal frame: SGR styling under the colour profile, `\r\n` between
+    /// lines, each line clipped to the frame width.
+    Ansi(crate::color::TermProfile),
+    /// Plain text: no escape sequence, `\n` between lines, no width clip, and
+    /// no trailing blank on any line.
+    Plain,
+}
+
 fn emit_block(
     block: &Block,
     cols: usize,
     scroll_y: usize,
     rows: usize,
-    profile: crate::color::TermProfile,
+    encoding: FrameEncoding,
 ) -> String {
+    let separator = match encoding {
+        FrameEncoding::Ansi(_) => "\r\n",
+        FrameEncoding::Plain => "\n",
+    };
     let mut out = String::new();
-    // Lines are CRLF-separated, but the SEPARATOR goes BEFORE each line after the
-    // first — NOT a trailing CRLF after the last visible row. A trailing CRLF on a
-    // full-height frame (visible lines == terminal rows) advances the cursor past
-    // the bottom row and scrolls the whole screen up by one, dropping the top row
-    // (the root padding). `paint()` issues ESC[2J + home first, so a
-    // leading-separator model lands every row correctly.
+    // The SEPARATOR goes BEFORE each line after the first — NOT after the last
+    // visible row. A trailing CRLF on a full-height frame (visible lines ==
+    // terminal rows) advances the cursor past the bottom row and scrolls the
+    // whole screen up by one, dropping the top row (the root padding).
+    // `paint()` issues ESC[2J + home first, so a leading-separator model lands
+    // every row correctly.
     for (i, line) in block.lines.iter().skip(scroll_y).take(rows).enumerate() {
         if i > 0 {
-            out.push_str("\r\n");
+            out.push_str(separator);
         }
-        let mut col = 0usize;
-        for run in line {
-            if col >= cols {
-                break;
-            }
-            let mut text = String::new();
-            let mut w = 0usize;
-            for ch in run.text.chars() {
-                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-                if col + w + cw > cols {
-                    break;
-                }
-                text.push(ch);
-                w += cw;
-            }
-            let esc = sgr_with_profile(run.style, profile);
-            if esc.is_empty() {
-                out.push_str(&text);
-            } else {
-                out.push_str(&esc);
-                out.push_str(&text);
-                out.push_str(SGR_RESET);
-            }
-            col += w;
+        match encoding {
+            FrameEncoding::Ansi(profile) => emit_ansi_line(&mut out, line, cols, profile),
+            FrameEncoding::Plain => emit_plain_line(&mut out, line),
         }
     }
     out
+}
+
+/// One styled line, clipped to `cols` display columns.
+fn emit_ansi_line(out: &mut String, line: &[Run], cols: usize, profile: crate::color::TermProfile) {
+    let mut col = 0usize;
+    for run in line {
+        if col >= cols {
+            break;
+        }
+        let mut text = String::new();
+        let mut w = 0usize;
+        for ch in run.text.chars() {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if col + w + cw > cols {
+                break;
+            }
+            text.push(ch);
+            w += cw;
+        }
+        let esc = sgr_with_profile(run.style, profile);
+        if esc.is_empty() {
+            out.push_str(&text);
+        } else {
+            out.push_str(&esc);
+            out.push_str(&text);
+            out.push_str(SGR_RESET);
+        }
+        col += w;
+    }
+}
+
+/// One unstyled line: every run's text in order, without the trailing blanks
+/// the layout pads it with.
+fn emit_plain_line(out: &mut String, line: &[Run]) {
+    let mut text: String = line.iter().map(|run| run.text.as_str()).collect();
+    text.truncate(text.trim_end_matches(' ').len());
+    out.push_str(&text);
 }
 
 /// Render the view, returning the ANSI frame (scrolled to `scroll_y`), the
@@ -2722,28 +2753,28 @@ pub fn render_with_focus<M: Clone>(
 ) -> (String, Vec<Focusable<M>>, usize) {
     // Production: auto-detect the terminal colour capability at the single
     // `resolve_term_profile` point.
-    render_with_focus_profiled(
+    render_with_focus_encoded(
         view,
         cols,
         rows,
         focus_idx,
         inputs,
         scroll_y,
-        crate::color::resolve_term_profile(),
+        FrameEncoding::Ansi(crate::color::resolve_term_profile()),
     )
 }
 
-/// `render_with_focus` with an explicit [`crate::color::TermProfile`], so a caller
-/// (e.g. a test) can pin the colour capability for a deterministic frame.
+/// `render_with_focus` with an explicit [`FrameEncoding`], so a caller can pin
+/// the colour capability (a deterministic test frame) or ask for plain text.
 #[allow(clippy::too_many_arguments)]
-fn render_with_focus_profiled<M: Clone>(
+fn render_with_focus_encoded<M: Clone>(
     view: &Element<M>,
     cols: usize,
     rows: usize,
     focus_idx: usize,
     inputs: &mut InputRegistry,
     scroll_y: usize,
-    profile: crate::color::TermProfile,
+    encoding: FrameEncoding,
 ) -> (String, Vec<Focusable<M>>, usize) {
     let canvas = Canvas::new(cols, rows);
     let mut ctx = Ctx {
@@ -2780,7 +2811,7 @@ fn render_with_focus_profiled<M: Clone>(
             f.height = h;
         }
     }
-    let frame = emit_block(&rendered.block, cols, scroll_y, rows, profile);
+    let frame = emit_block(&rendered.block, cols, scroll_y, rows, encoding);
     (frame, ctx.focusables, content_h)
 }
 
@@ -2789,6 +2820,17 @@ fn render_with_focus_profiled<M: Clone>(
 pub fn element_to_cells<M: Clone>(view: &Element<M>, cols: usize, rows: usize) -> String {
     let mut inputs = InputRegistry::new();
     render_with_focus(view, cols, rows, usize::MAX, &mut inputs, 0).0
+}
+
+/// `Ipe.Ui` Element → frame in the given [`FrameEncoding`], no focus.
+pub fn element_to_frame<M: Clone>(
+    view: &Element<M>,
+    cols: usize,
+    rows: usize,
+    encoding: FrameEncoding,
+) -> String {
+    let mut inputs = InputRegistry::new();
+    render_with_focus_encoded(view, cols, rows, usize::MAX, &mut inputs, 0, encoding).0
 }
 
 /// The content height an Element lays out to at the given width — the number of
@@ -2810,8 +2852,7 @@ fn element_to_cells_profiled<M: Clone>(
     rows: usize,
     profile: crate::color::TermProfile,
 ) -> String {
-    let mut inputs = InputRegistry::new();
-    render_with_focus_profiled(view, cols, rows, usize::MAX, &mut inputs, 0, profile).0
+    element_to_frame(view, cols, rows, FrameEncoding::Ansi(profile))
 }
 
 #[cfg(test)]
