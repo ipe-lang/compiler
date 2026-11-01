@@ -27,6 +27,13 @@ fn fixture_root() -> PathBuf {
     e2e_support::manifest_dir!().join("tests/fixtures/sp2_manifest")
 }
 
+/// The fixture's `depPath "local" "../local"` entry.
+#[allow(clippy::expect_used)] // a fixed, grammatical test path
+fn local_path_dep() -> IpeDep {
+    let name = ipe::package_name::PackageName::parse("local").expect("a valid name");
+    IpeDep::Path(ipe::dep_path::DepPath::parse(&name, "../local").expect("a valid dep path"))
+}
+
 // ── surface enumeration ───────────────────────────────────────────────────────
 
 #[test]
@@ -102,7 +109,7 @@ fn pinned_and_hashed_is_not_applicable_for_path_dep() {
     let path_item = PackageItem {
         name: "local".to_owned(),
         kind: DepKindLabel::Ipe,
-        ipe_dep: Some(IpeDep::Path(PathBuf::from("../local"))),
+        ipe_dep: Some(local_path_dep()),
         rust_dep: None,
     };
     assert!(
@@ -156,7 +163,7 @@ fn semver_satisfied_is_not_applicable_for_path_dep() {
     let path_item = PackageItem {
         name: "local".to_owned(),
         kind: DepKindLabel::Ipe,
-        ipe_dep: Some(IpeDep::Path(PathBuf::from("../local"))),
+        ipe_dep: Some(local_path_dep()),
         rust_dep: None,
     };
     assert!(
@@ -248,7 +255,7 @@ fn provenance_scanned_is_not_applicable_for_path_dep() {
     let path_item = PackageItem {
         name: "local".to_owned(),
         kind: DepKindLabel::Ipe,
-        ipe_dep: Some(IpeDep::Path(PathBuf::from("../local"))),
+        ipe_dep: Some(local_path_dep()),
         rust_dep: None,
     };
     assert!(

@@ -1307,6 +1307,38 @@ messages! {
     ship_retired_builder(got, now) = "ship-retired-builder";
     /// `ipe add` found the package already declared as an escape dependency.
     pkg_add_escape_dependency(name) = "pkg-add-escape-dependency";
+    /// A declared dependency the compiling commands do not compile.
+    dependency_not_compiled(kind, name) = "dependency-not-compiled";
+    /// A dependency declared twice in `package.ipe`.
+    duplicate_dependency(name) = "duplicate-dependency";
+    /// A `depPath` with an empty path.
+    dep_path_empty(name) = "dep-path-empty";
+    /// A `depPath` past the recorded-path length ceiling.
+    dep_path_too_long(name, max) = "dep-path-too-long";
+    /// A `depPath` holding a character a lockfile cannot record.
+    dep_path_unrecordable(name, path: &crate::style::TerminalSafe) = "dep-path-unrecordable";
+    /// A `depPath` naming a network share or a device.
+    dep_path_remote(name, path: &crate::style::TerminalSafe) = "dep-path-remote";
+    /// A `depPath` holding a backslash.
+    dep_path_backslash(name, path: &crate::style::TerminalSafe) = "dep-path-backslash";
+    /// An absolute `depPath`.
+    dep_path_absolute(name, path: &crate::style::TerminalSafe) = "dep-path-absolute";
+    /// A `depPath` starting with a drive.
+    dep_path_drive_prefix(name, path: &crate::style::TerminalSafe) = "dep-path-drive-prefix";
+    /// A `depPath` with an empty component.
+    dep_path_empty_component(name, path: &crate::style::TerminalSafe) = "dep-path-empty-component";
+    /// A `depPath` with a `.` component.
+    dep_path_dot_component(name, path: &crate::style::TerminalSafe) = "dep-path-dot-component";
+    /// A `depPath` with a `..` after a name.
+    dep_path_ascent_after_name(name, path: &crate::style::TerminalSafe) = "dep-path-ascent-after-name";
+    /// A `depPath` climbing past the ascent ceiling.
+    dep_path_too_many_ascents(name, path: &crate::style::TerminalSafe, max) = "dep-path-too-many-ascents";
+    /// A `depPath` with a Windows device component.
+    dep_path_device(name, path: &crate::style::TerminalSafe) = "dep-path-device";
+    /// A `depPath` with a component that is not a plain name.
+    dep_path_not_a_name(name, path: &crate::style::TerminalSafe) = "dep-path-not-a-name";
+    /// A `depPath` that names no directory.
+    dep_path_no_name(name, path: &crate::style::TerminalSafe) = "dep-path-no-name";
     /// A `package.ipe` program entry has an empty path segment.
     manifest_entry_empty_segment(entry) = "manifest-entry-empty-segment";
     /// A `package.ipe` program entry has a `.` or `..` path segment.
@@ -1877,9 +1909,6 @@ messages! {
     index_rev_remedy_sha1 = "index-rev-remedy-sha1";
     /// A requested rev that is hex-shaped but mixed-case.
     index_rev_mixed_case_hex(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-rev-mixed-case-hex";
-    /// A full-SHA requested rev that disagrees with the commit git served.
-    index_rev_served_mismatch(pkg: &crate::package_name::PackageName, requested, served) =
-        "index-rev-served-mismatch";
     /// An index `sha256` that is not a content hash.
     index_sha256_invalid(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-sha256-invalid";
     /// An index entry that exists but cannot be read.
@@ -1978,10 +2007,6 @@ messages! {
     signature_untrusted(pkg, detail: &crate::style::TerminalSafe) = "signature-untrusted";
     /// A malformed registry trust config.
     trust_config_malformed(detail: &crate::style::TerminalSafe) = "trust-config-malformed";
-    /// A path dependency whose directory does not exist.
-    resolve_path_dep_missing(name, path) = "resolve-path-dep-missing";
-    /// An index dependency given to the escape resolver.
-    resolve_index_dep_escape(name) = "resolve-index-dep-escape";
     /// Dependency resolution could not run `git`.
     resolve_git_unavailable(name, detail) = "resolve-git-unavailable";
     /// A `git` step of dependency resolution failed.

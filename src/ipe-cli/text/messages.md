@@ -1525,6 +1525,70 @@ package.ipe declares `{delivery}`, but `main` is a `{shape}` app. The web hosts 
 
 package.ipe: `{name}` is already a git/path escape dependency — `ipe add` records only an index requirement and never rewrites an author-written `depGit`/`depGitRev`/`depPath` entry. Edit the escape by hand, or remove it first.
 
+## dependency-not-compiled
+
+package.ipe declares the {kind} dependency `{name}`, but ipe does not compile dependencies yet, so this package cannot build. Copy the library's modules into this package's `src/` and remove `{name}` from `dependencies`.
+
+## duplicate-dependency
+
+dependency `{name}` is declared twice. A package depends on each library once; remove one of the entries.
+
+## dep-path-empty
+
+dependency `{name}` has an empty path. Write the library's directory relative to this package, such as `../{name}`.
+
+## dep-path-too-long
+
+dependency `{name}` has a path longer than {max} bytes. Write a shorter path to the library's directory.
+
+## dep-path-unrecordable
+
+dependency `{name}`: path `{path}` holds a `"` or a character that displays out of order. Rename the directory, or write its path without that character.
+
+## dep-path-remote
+
+dependency `{name}`: path `{path}` names a network share or a device. A dependency path is a directory on this machine, relative to this package.
+
+## dep-path-backslash
+
+dependency `{name}`: path `{path}` contains a backslash. Separate path components with `/` on every platform, such as `../libs/{name}`.
+
+## dep-path-absolute
+
+dependency `{name}`: path `{path}` is absolute. Write it relative to this package, such as `../{name}`.
+
+## dep-path-drive-prefix
+
+dependency `{name}`: path `{path}` starts with a drive. Write it relative to this package, such as `../{name}`.
+
+## dep-path-empty-component
+
+dependency `{name}`: path `{path}` has an empty component (a doubled or trailing `/`). Join components with a single `/`.
+
+## dep-path-dot-component
+
+dependency `{name}`: path `{path}` has a `.` component. Remove it; a path is already relative to this package.
+
+## dep-path-ascent-after-name
+
+dependency `{name}`: path `{path}` has a `..` after a directory name. Write every `..` first, then the directory names, such as `../libs/{name}`.
+
+## dep-path-too-many-ascents
+
+dependency `{name}`: path `{path}` climbs more than {max} directories with `..`. Keep the library closer to this package.
+
+## dep-path-device
+
+dependency `{name}`: path `{path}` has a component Windows reads as a device (`con`, `nul`, `com1`, …). Rename that directory.
+
+## dep-path-not-a-name
+
+dependency `{name}`: path `{path}` has a component that is not a plain directory name (it holds a `:`, is only dots and spaces, or ends in a dot or a space). Rename that directory.
+
+## dep-path-no-name
+
+dependency `{name}`: path `{path}` names no directory after its `..` components. End the path with the library's directory, such as `../{name}`.
+
 ## manifest-entry-empty-segment
 
 package.ipe: program entry {entry} has an empty path segment (a leading, trailing, or doubled `/`). Write the entry relative to `src/`, with segments joined by a single `/`, e.g. `Cli/Main.ipe`.
@@ -2657,10 +2721,6 @@ ipe pins only 40-character SHA-1 commits, so the source repository must use SHA-
 
 package `{pkg}`: `rev` is hex-shaped but mixed-case, got: {raw} — a commit SHA is always lowercase; use the lowercase spelling or a distinct ref name
 
-## index-rev-served-mismatch
-
-package `{pkg}`: requested rev `{requested}` does not match the commit git served, `{served}` — a ref of the same name shadowed the full SHA; rename the ref or re-check the requested commit
-
 ## index-sha256-invalid
 
 package `{pkg}`: `sha256` is not a 64-char lowercase-hex content hash, got: {raw}
@@ -2831,14 +2891,6 @@ package `{pkg}`: a publisher signature is present but was not trusted — {detai
 ## trust-config-malformed
 
 registry trust config is malformed ({detail})
-
-## resolve-path-dep-missing
-
-package `{name}`: path dependency `{path}` does not exist
-
-## resolve-index-dep-escape
-
-package `{name}`: an index dependency is resolved through `resolve_and_add`, not `resolve_escape`
 
 ## resolve-git-unavailable
 

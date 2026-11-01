@@ -145,7 +145,7 @@ fn add_resolves_verifies_and_locks() {
     let reparsed = ipe::project::parse_manifest(&proj.join("package.ipe"))
         .expect("the rewritten package.ipe must re-parse through the reader");
     assert!(
-        reparsed.dependencies.contains_key("http-extras"),
+        reparsed.declared().contains("http-extras"),
         "the reader must see the added dependency after the rewrite"
     );
 
@@ -316,7 +316,7 @@ fn add_appends_updates_and_never_overwrites_an_escape() {
         "new dep added: {after}"
     );
     let m = ipe::project::parse_manifest(&proj.join("package.ipe")).expect("re-parses");
-    assert_eq!(m.dependencies.len(), 3, "sibling + escape + new = 3");
+    assert_eq!(m.declared().len(), 3, "sibling + escape + new = 3");
 
     // Re-add the same package with a new requirement: update in place, no dup.
     let req2 = "^1.2".parse().expect("req2");
@@ -329,7 +329,7 @@ fn add_appends_updates_and_never_overwrites_an_escape() {
     );
     let m2 = ipe::project::parse_manifest(&proj.join("package.ipe")).expect("re-parses");
     assert_eq!(
-        m2.dependencies.len(),
+        m2.declared().len(),
         3,
         "still 3 deps after idempotent re-add"
     );
@@ -341,8 +341,8 @@ fn add_appends_updates_and_never_overwrites_an_escape() {
     let err = resolve::resolve_and_add(&proj, "locallib", &req3, &esc_index)
         .expect_err("adding an index dep over an escape name must be refused");
     assert!(
-        matches!(err, ipe::CliError::Usage(_)),
-        "the escape-collision refusal is a usage error: {err:?}"
+        matches!(err, ipe::CliError::ProjectRefused(_)),
+        "the escape-collision refusal is a project-state refusal: {err:?}"
     );
     // The escape is untouched and the file still parses.
     let after3 = read_manifest(&proj);

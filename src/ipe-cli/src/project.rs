@@ -25,7 +25,7 @@
 //! ordering of all discovered modules. A Gray → Gray back-edge is an import
 //! cycle ([`CycleError`]).
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque, btree_map};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -75,10 +75,10 @@ pub struct ProjectManifest {
     /// The `wasm` field (`mode`/`entry`/`mount`/`publicEnv`/`optLevel`) —
     /// [`WasmConfig::Off`] when the field is absent.
     pub wasm: WasmConfig,
-    /// The `[dependencies]` section: Ipê packages by name. Empty when the
-    /// section is absent (back-compat). Resolution (fetch / download / lockfile)
-    /// is SP3; this is the parsed schema only.
-    pub dependencies: BTreeMap<String, IpeDep>,
+    /// The `dependencies` list: Ipê packages by name. Private, so a compiling
+    /// reader reaches it only through [`Self::compiled_dependencies`]; a
+    /// non-compiling reader (formatting, coverage) reads [`Self::declared`].
+    pub(crate) dependencies: DeclaredDeps,
     /// The `[rust.dependencies]` section: crates.io crates bound as
     /// foreign-function dependencies. Empty when the section is absent.
     pub rust_dependencies: BTreeMap<String, RustDep>,
@@ -669,6 +669,30 @@ pub enum Install {
 }
 
 impl ProjectManifest {
+    /// The declared dependencies, for a reader that compiles nothing.
+    #[must_use]
+    pub const fn declared(&self) -> &DeclaredDeps {
+        &self.dependencies
+    }
+
+    /// The dependencies a compiling command builds against.
+    ///
+    /// No dependency kind is compiled yet, so a manifest that declares any is
+    /// refused here, before a source is read, rather than built as if the
+    /// dependency were absent.
+    ///
+    /// # Errors
+    /// [`CliError::DependencyNotCompiled`] naming the first declared dependency.
+    pub fn compiled_dependencies(&self) -> Result<CompiledDeps, CliError> {
+        match self.dependencies.iter().next() {
+            None => Ok(CompiledDeps { _sealed: () }),
+            Some((name, dep)) => Err(CliError::DependencyNotCompiled {
+                name: name.clone(),
+                kind: dep.kind(),
+            }),
+        }
+    }
+
     /// The entry module path the build should compile, derived from `programs`.
     ///
     /// A manifest with no `programs` (or one whose sole/default program does not
@@ -1308,8 +1332,125 @@ pub enum IpeDep {
         /// A pinned revision (commit / tag / branch), when given.
         rev: Option<String>,
     },
-    /// A local path escape (`{ path = "../local" }`), relative to the manifest.
-    Path(PathBuf),
+    /// A local library directory, relative to the manifest.
+    Path(crate::dep_path::DepPath),
+}
+
+impl IpeDep {
+    /// Which kind of dependency this is.
+    #[must_use]
+    pub const fn kind(&self) -> DepKind {
+        match self {
+            Self::Index(_) => DepKind::Index,
+            Self::Git { .. } => DepKind::Git,
+            Self::Path(_) => DepKind::Path,
+        }
+    }
+}
+
+/// The kind of a declared dependency, as a refusal names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DepKind {
+    /// A package-index requirement (`dep`).
+    Index,
+    /// A git repository (`depGit`, `depGitRev`).
+    Git,
+    /// A local directory (`depPath`).
+    Path,
+}
+
+impl std::fmt::Display for DepKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Index => "index",
+            Self::Git => "git",
+            Self::Path => "path",
+        })
+    }
+}
+
+/// The dependencies a `package.ipe` declares, each name declared once.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeclaredDeps(BTreeMap<crate::package_name::PackageName, IpeDep>);
+
+impl DeclaredDeps {
+    /// Declare `dep` as `name`, refusing a name already declared.
+    ///
+    /// # Errors
+    /// The repeated name, with the set left as it was.
+    pub fn declare(
+        &mut self,
+        name: crate::package_name::PackageName,
+        dep: IpeDep,
+    ) -> Result<(), crate::package_name::PackageName> {
+        match self.0.entry(name) {
+            btree_map::Entry::Occupied(taken) => Err(taken.key().clone()),
+            btree_map::Entry::Vacant(free) => {
+                free.insert(dep);
+                Ok(())
+            }
+        }
+    }
+
+    /// The dependency declared as `name`.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&IpeDep> {
+        self.0
+            .iter()
+            .find_map(|(declared, dep)| (declared.as_str() == name).then_some(dep))
+    }
+
+    /// Whether `name` is declared.
+    #[must_use]
+    pub fn contains(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
+    /// How many dependencies are declared.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether none is declared.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Every declared dependency, by name.
+    pub fn iter(&self) -> btree_map::Iter<'_, crate::package_name::PackageName, IpeDep> {
+        self.0.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a DeclaredDeps {
+    type Item = (&'a crate::package_name::PackageName, &'a IpeDep);
+    type IntoIter = btree_map::Iter<'a, crate::package_name::PackageName, IpeDep>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+/// Proof that a source set's dependencies were honored or refused.
+///
+/// Every constructor of a compiled source set takes one, and the only ways to
+/// mint it are [`ProjectManifest::compiled_dependencies`] and
+/// [`CompiledDeps::none`], so a reader that skips the dependency check does not
+/// compile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use]
+pub struct CompiledDeps {
+    _sealed: (),
+}
+
+impl CompiledDeps {
+    /// The proof for a build with no manifest (a loose file, a scratch build),
+    /// which declares no dependency.
+    pub const fn none() -> Self {
+        Self { _sealed: () }
+    }
 }
 
 /// One `package.ipe` Rust-dependency entry: a crates.io crate bound as a
@@ -1367,8 +1508,8 @@ pub fn has_only_legacy_toml(dir: &Path) -> bool {
 /// reader. A path to a legacy `ipe.toml` is rejected with [`text::legacy_toml_hint`].
 ///
 /// # Errors
-/// [`CliError::Io`] if the file cannot be read; [`CliError::Usage`] /
-/// [`CliError::Usage`] for a malformed or invalid manifest (an unsupported
+/// [`CliError::Io`] if the file cannot be read;
+/// [`CliError::ProjectRefused`] for a malformed or invalid manifest (an unsupported
 /// driver, a bad version or dependency, an unknown capability, a denylisted
 /// `publicEnv` name, a missing source root); [`CliError::Pipeline`] when the
 /// source does not parse; and [`CliError::Usage`] when the path is not a

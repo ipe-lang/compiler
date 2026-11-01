@@ -88,9 +88,9 @@ const SCHEMA_MODULE: &str = "Ipe.Package";
 ///
 /// # Errors
 /// [`CliError::Io`] if the file cannot be read; [`CliError::Pipeline`] if the
-/// source does not parse (rendered with a caret snippet); [`CliError::Usage`]
+/// source does not parse (rendered with a caret snippet); [`CliError::ProjectRefused`]
 /// naming the offending `package.ipe:LINE:COL` for any non-literal, non-blessed
-/// shape or a failed field validation; [`CliError::Usage`] if the source root
+/// shape or a failed field validation; [`CliError::ProjectRefused`] if the source root
 /// directory does not exist.
 pub fn parse_package_manifest(manifest_path: &Path) -> Result<ProjectManifest, CliError> {
     let text =
@@ -284,12 +284,12 @@ struct IconField {
     span: Span,
 }
 
-/// A `package.ipe:LINE:COL: <reason>` [`CliError::Usage`] for `span` in `src`.
+/// A `package.ipe:LINE:COL: <reason>` [`CliError::ProjectRefused`] for `span` in `src`.
 ///
 /// Line and column are 1-based; an out-of-range offset degrades to `1:1`.
 fn located_refusal(src: &str, manifest_path: &Path, span: Span, reason: &str) -> CliError {
     let (line, col) = line_col(src, span.lo);
-    CliError::Usage(text::msg::located_refusal(
+    CliError::ProjectRefused(text::msg::located_refusal(
         &manifest_path.display(),
         &line,
         &col,
@@ -335,7 +335,7 @@ struct ManifestFields {
     target: Option<String>,
     allocator: Option<crate::build_plan::AllocatorChoice>,
     c_free: Option<bool>,
-    dependencies: BTreeMap<String, IpeDep>,
+    dependencies: crate::project::DeclaredDeps,
     rust_dependencies: BTreeMap<String, RustDep>,
     capabilities: BTreeSet<Capability>,
     capabilities_accept: BTreeSet<Capability>,
@@ -360,9 +360,9 @@ impl ManifestFields {
         src: &str,
         manifest_path: &Path,
     ) -> Result<ProjectManifest, CliError> {
-        let name = self
-            .name
-            .ok_or(CliError::Usage(text::msg::package_manifest_name_required()))?;
+        let name = self.name.ok_or(CliError::ProjectRefused(
+            text::msg::package_manifest_name_required(),
+        ))?;
         let src_rel_raw = self.src_rel.as_deref().unwrap_or(DEFAULT_SOURCE_ROOT);
         let src_root_contained = crate::contained_path::ContainedRelPath::parse(root, src_rel_raw)
             .map_err(|reason| CliError::PathEscape {
@@ -371,7 +371,7 @@ impl ManifestFields {
             })?;
         let src_root = src_root_contained.resolved().to_path_buf();
         if !src_root.is_dir() {
-            return Err(CliError::Usage(
+            return Err(CliError::ProjectRefused(
                 text::msg::package_manifest_src_root_missing(),
             ));
         }
@@ -450,7 +450,7 @@ impl Reader<'_> {
         self.interner.resolve(sym).unwrap_or("")
     }
 
-    /// Render a `package.ipe:LINE:COL: <reason>` [`CliError::Usage`] for the
+    /// Render a `package.ipe:LINE:COL: <reason>` [`CliError::ProjectRefused`] for the
     /// offending `span`. Line/column are 1-based, computed from the byte offset
     /// against the source; an out-of-range offset degrades to `1:1` rather than
     /// panicking (totality).
@@ -511,7 +511,7 @@ impl Reader<'_> {
             }
         }
 
-        let package = package_value.ok_or(CliError::Usage(
+        let package = package_value.ok_or(CliError::ProjectRefused(
             text::msg::package_manifest_no_package_binding(),
         ))?;
         if !package.value.patterns.is_empty() {
@@ -861,40 +861,62 @@ impl Reader<'_> {
     /// Read the `dependencies = [ … ]` list into the typed [`IpeDep`] map. Each
     /// element is a `dep` / `depGit` / `depGitRev` / `depPath` builder call — the
     /// four-builder shape mirrors the `IpeDep` sum, so a dependency is exactly one
-    /// of index / git / path, never a bag of optional keys.
-    fn read_dependencies(&self, expr: &Expr) -> Result<BTreeMap<String, IpeDep>, CliError> {
-        let mut deps = BTreeMap::new();
+    /// of index / git / path, never a bag of optional keys. A name declared twice
+    /// is refused, never silently resolved to one of the entries.
+    fn read_dependencies(&self, expr: &Expr) -> Result<crate::project::DeclaredDeps, CliError> {
+        let mut deps = crate::project::DeclaredDeps::default();
         for item in self.expect_list(expr)? {
             let (name, dep) = self.read_one_dep(item)?;
-            deps.insert(name, dep);
+            deps.declare(name, dep).map_err(|name| {
+                self.reject(item.span, &text::msg::duplicate_dependency(&name.as_str()))
+            })?;
         }
         Ok(deps)
     }
 
+    /// Read a dependency builder's name argument into a [`PackageName`].
+    ///
+    /// [`PackageName`]: crate::package_name::PackageName
+    fn read_dep_name(
+        &self,
+        expr: &Expr,
+        builder: &str,
+        args: &[Expr],
+    ) -> Result<crate::package_name::PackageName, CliError> {
+        let arg = self.nth_arg(expr.span, builder, args, 0)?;
+        let raw = self.expect_string(arg)?;
+        crate::package_name::PackageName::parse(&raw)
+            .map_err(|refusal| self.reject(arg.span, &format!("{refusal}")))
+    }
+
     /// Read one dependency builder call into its `(name, IpeDep)`.
-    fn read_one_dep(&self, expr: &Expr) -> Result<(String, IpeDep), CliError> {
+    fn read_one_dep(
+        &self,
+        expr: &Expr,
+    ) -> Result<(crate::package_name::PackageName, IpeDep), CliError> {
         let (builder, args) = self.expect_ctor_app(expr, "a dependency builder")?;
         match builder {
             "dep" => {
-                let name = self.expect_string(self.nth_arg(expr.span, builder, args, 0)?)?;
+                let name = self.read_dep_name(expr, builder, args)?;
                 let raw = self.expect_string(self.nth_arg(expr.span, builder, args, 1)?)?;
                 let req = raw.parse::<semver::VersionReq>().map_err(|e| {
                     self.reject(
                         expr.span,
                         &format!(
-                            "dependency `{name}` version requirement {raw:?} is not valid: {e}"
+                            "dependency `{}` version requirement {raw:?} is not valid: {e}",
+                            name.as_str()
                         ),
                     )
                 })?;
                 Ok((name, IpeDep::Index(req)))
             }
             "depGit" => {
-                let name = self.expect_string(self.nth_arg(expr.span, builder, args, 0)?)?;
+                let name = self.read_dep_name(expr, builder, args)?;
                 let url = self.expect_string(self.nth_arg(expr.span, builder, args, 1)?)?;
                 Ok((name, IpeDep::Git { url, rev: None }))
             }
             "depGitRev" => {
-                let name = self.expect_string(self.nth_arg(expr.span, builder, args, 0)?)?;
+                let name = self.read_dep_name(expr, builder, args)?;
                 let url = self.expect_string(self.nth_arg(expr.span, builder, args, 1)?)?;
                 let rev = self.expect_string(self.nth_arg(expr.span, builder, args, 2)?)?;
                 Ok((
@@ -906,9 +928,12 @@ impl Reader<'_> {
                 ))
             }
             "depPath" => {
-                let name = self.expect_string(self.nth_arg(expr.span, builder, args, 0)?)?;
-                let path = self.expect_string(self.nth_arg(expr.span, builder, args, 1)?)?;
-                Ok((name, IpeDep::Path(PathBuf::from(path))))
+                let name = self.read_dep_name(expr, builder, args)?;
+                let arg = self.nth_arg(expr.span, builder, args, 1)?;
+                let raw = self.expect_string(arg)?;
+                let path = crate::dep_path::DepPath::parse(&name, &raw)
+                    .map_err(|refusal| self.reject(arg.span, &refusal.message(&name, &raw)))?;
+                Ok((name, IpeDep::Path(path)))
             }
             other => Err(self.reject(
                 expr.span,
@@ -1784,8 +1809,8 @@ pub fn render_manifest_record(manifest: &ProjectManifest) -> String {
     {
         fields.push(format!("sourceRoot = {}", quote(&src_rel)));
     }
-    if !manifest.dependencies.is_empty() {
-        fields.push(render_dependencies(&manifest.dependencies));
+    if !manifest.declared().is_empty() {
+        fields.push(render_dependencies(manifest.declared()));
     }
     if !manifest.rust_dependencies.is_empty() {
         fields.push(render_rust_dependencies(&manifest.rust_dependencies));
@@ -1865,9 +1890,10 @@ fn quote(s: &str) -> String {
 }
 
 /// Render the `dependencies = [ … ]` field from the typed map.
-fn render_dependencies(deps: &BTreeMap<String, IpeDep>) -> String {
+fn render_dependencies(deps: &crate::project::DeclaredDeps) -> String {
     let items: Vec<String> = deps
         .iter()
+        .map(|(name, dep)| (name.as_str(), dep))
         .map(|(name, dep)| match dep {
             IpeDep::Index(req) => format!("dep {} {}", quote(name), quote(&req.to_string())),
             IpeDep::Git { url, rev: None } => format!("depGit {} {}", quote(name), quote(url)),
@@ -1877,9 +1903,7 @@ fn render_dependencies(deps: &BTreeMap<String, IpeDep>) -> String {
             } => {
                 format!("depGitRev {} {} {}", quote(name), quote(url), quote(rev))
             }
-            IpeDep::Path(path) => {
-                format!("depPath {} {}", quote(name), quote(&path.to_string_lossy()))
-            }
+            IpeDep::Path(path) => format!("depPath {} {}", quote(name), quote(path.as_str())),
         })
         .collect();
     format!("dependencies =\n        [ {} ]", items.join("\n        , "))
@@ -2184,7 +2208,7 @@ const fn allocator_ctor_name(alloc: crate::build_plan::AllocatorChoice) -> &'sta
 ///
 /// # Errors
 /// [`CliError::Io`] if the manifest cannot be read or written;
-/// [`CliError::Pipeline`] if the manifest does not parse; [`CliError::Usage`]
+/// [`CliError::Pipeline`] if the manifest does not parse; [`CliError::ProjectRefused`]
 /// if the manifest shape is unexpected (no `package` record, a non-list
 /// `dependencies`) or the name collides with an author-written escape entry.
 pub fn upsert_index_dependency(
@@ -2279,7 +2303,7 @@ fn edit_dependencies_list(
     };
 
     let Expr_::List(items) = &deps_expr.value else {
-        return Err(usage(text::msg::package_manifest_deps_not_list()));
+        return Err(refused(text::msg::package_manifest_deps_not_list()));
     };
 
     let existing = locate_dep_entry(items, &interner, name);
@@ -2288,7 +2312,7 @@ fn edit_dependencies_list(
         // `dep "…" "…"`; an escape is author-owned and never overwritten.
         (Some(entry), Some(found)) => {
             if found.is_escape() {
-                return Err(usage(text::msg::pkg_add_escape_dependency(&name)));
+                return Err(refused(text::msg::pkg_add_escape_dependency(&name)));
             }
             Ok(splice(text, found.entry, entry))
         }
@@ -2313,10 +2337,10 @@ fn locate_package_record<'m>(
         .values
         .iter()
         .find(|v| interner.resolve(v.value.name.value) == Some("package"))
-        .ok_or_else(|| usage(text::msg::package_manifest_no_package_binding_edit()))?;
+        .ok_or_else(|| refused(text::msg::package_manifest_no_package_binding_edit()))?;
     match &package.value.body.value {
         Expr_::Record(fields) => Ok(fields.as_slice()),
-        _ => Err(usage(text::msg::package_manifest_package_not_record())),
+        _ => Err(refused(text::msg::package_manifest_package_not_record())),
     }
 }
 
@@ -2474,11 +2498,13 @@ fn insert_new_dependencies_field(
         .map_or(0, |(_, v)| v.span.hi as usize)
         .min(text.len());
     let Some(rel_close) = text.get(after_last..).and_then(|s| s.find('}')) else {
-        return Err(usage(text::msg::package_manifest_deps_brace_not_found()));
+        return Err(refused(text::msg::package_manifest_deps_brace_not_found()));
     };
     let close_idx = after_last + rel_close;
     let (Some(before), Some(after)) = (text.get(..close_idx), text.get(close_idx..)) else {
-        return Err(usage(text::msg::package_manifest_deps_brace_out_of_range()));
+        return Err(refused(
+            text::msg::package_manifest_deps_brace_out_of_range(),
+        ));
     };
     // Align the new field to the last field's indentation. Elm-style manifests
     // indent record fields and the closing brace to a common column; reuse the
@@ -2489,9 +2515,9 @@ fn insert_new_dependencies_field(
     Ok(format!("{opener}, {field}\n{indent}{after}"))
 }
 
-/// A manifest-write usage refusal.
-const fn usage(message: text::Message) -> CliError {
-    CliError::Usage(message)
+/// A manifest-write project-state refusal.
+const fn refused(message: text::Message) -> CliError {
+    CliError::ProjectRefused(message)
 }
 
 #[cfg(test)]
@@ -2593,7 +2619,7 @@ mod tests {
         assert_eq!(m.name, "my-app");
         assert_eq!(m.version, None);
         assert_eq!(m.driver, ipe_backend_rust::DbDriver::Sqlite);
-        assert!(m.dependencies.is_empty());
+        assert!(m.declared().is_empty());
         assert!(m.rust_dependencies.is_empty());
         assert!(m.capabilities.is_empty());
         assert!(m.capabilities_accept.is_empty());
@@ -2651,21 +2677,21 @@ mod tests {
         );
         assert_eq!(m.driver, ipe_backend_rust::DbDriver::Postgres);
 
-        assert_eq!(m.dependencies.len(), 4);
+        assert_eq!(m.declared().len(), 4);
         assert!(matches!(
-            m.dependencies.get("ipe-http"),
+            m.declared().get("ipe-http"),
             Some(IpeDep::Index(_))
         ));
         assert!(matches!(
-            m.dependencies.get("ipe-widgets"),
+            m.declared().get("ipe-widgets"),
             Some(IpeDep::Git { rev: Some(r), .. }) if r == "a1b2c3"
         ));
         assert!(matches!(
-            m.dependencies.get("ipe-plain"),
+            m.declared().get("ipe-plain"),
             Some(IpeDep::Git { rev: None, .. })
         ));
         assert!(matches!(
-            m.dependencies.get("ipe-local"),
+            m.declared().get("ipe-local"),
             Some(IpeDep::Path(_))
         ));
 
@@ -2716,11 +2742,14 @@ mod tests {
 
     // ── Rejections: totality (a clean diagnostic, never a panic) ──────────────
 
-    /// Every rejection asserts a `Usage` (the reader's named-error channel)
-    /// or a `Usage`/`Pipeline` — never a panic and never an `Ok`.
+    /// Every rejection asserts a `ProjectRefused` (the reader's named-error channel)
+    /// or a `ProjectRefused`/`Pipeline` — never a panic and never an `Ok`.
     fn assert_rejected(result: &Result<ProjectManifest, CliError>) {
         assert!(
-            matches!(result, Err(CliError::Usage(_) | CliError::Pipeline { .. })),
+            matches!(
+                result,
+                Err(CliError::ProjectRefused(_) | CliError::Pipeline { .. })
+            ),
             "expected a clean rejection, got {result:?}"
         );
     }
@@ -2782,7 +2811,7 @@ mod tests {
             ),
         );
         assert_rejected(&r);
-        if let Err(CliError::Usage(msg)) = &r {
+        if let Err(CliError::ProjectRefused(msg)) = &r {
             assert!(
                 msg.contains("DATABASE_URL"),
                 "error names the secret: {msg}"
@@ -2828,7 +2857,7 @@ mod tests {
         let expected = text::msg::manifest_installable_without_icon().to_string();
         let at = located_at(&source, "installable");
         assert!(
-            matches!(&result, Err(CliError::Usage(msg))
+            matches!(&result, Err(CliError::ProjectRefused(msg))
                 if msg.contains(&expected) && msg.contains(&at)),
             "`installable = True` with no `icon` is refused at `installable` ({at}): {:?}",
             result.map(|m| m.name)
@@ -2844,7 +2873,7 @@ mod tests {
             &pwa_icon::test_png(512, 512),
         );
         assert!(
-            matches!(&result, Err(CliError::Usage(msg))
+            matches!(&result, Err(CliError::ProjectRefused(msg))
                 if msg.contains("expected `True` or `False`")),
             "`installable = \"yes\"` is the bool type refusal: {:?}",
             result.map(|m| m.name)
@@ -2907,7 +2936,7 @@ mod tests {
         for (tag, icon, expected) in cases {
             let result = read_with_icon(&format!("installable_unfit_{tag}"), &source, &icon);
             assert!(
-                matches!(&result, Err(CliError::Usage(msg))
+                matches!(&result, Err(CliError::ProjectRefused(msg))
                     if msg.contains(&expected) && msg.contains(&at)),
                 "{tag}: refused at the icon ({at}) with {expected:?}: {:?}",
                 result.map(|m| m.name)
@@ -2935,7 +2964,7 @@ mod tests {
         let source = install_manifest(None, "{ themeColor = \"#000\" }");
         let result = read("unknown_browser_field", &source);
         assert!(
-            matches!(&result, Err(CliError::Usage(msg))
+            matches!(&result, Err(CliError::ProjectRefused(msg))
                 if msg.contains("`themeColor` is not a browser field")
                     && msg.contains("`basePath`")
                     && msg.contains("`installable`")),
@@ -2979,7 +3008,7 @@ mod tests {
     /// accepted or refused through another channel.
     fn base_path_refusal_text(test_name: &str, raw: &str) -> Option<String> {
         match read_base_path(test_name, raw) {
-            Err(CliError::Usage(msg)) => Some(msg.to_string()),
+            Err(CliError::ProjectRefused(msg)) => Some(msg.to_string()),
             _ => None,
         }
     }
@@ -3165,7 +3194,7 @@ mod tests {
     /// accepted or refused through another channel.
     fn public_env_refusal(test_name: &str, entries: &[&str]) -> Option<String> {
         match read_public_env_list(test_name, entries) {
-            Err(CliError::Usage(msg)) => Some(msg.to_string()),
+            Err(CliError::ProjectRefused(msg)) => Some(msg.to_string()),
             _ => None,
         }
     }
@@ -3280,7 +3309,7 @@ mod tests {
     /// The refusal text a read returned, or `None` when it was accepted.
     fn refusal_text(test_name: &str, source: &str) -> Option<String> {
         match read(test_name, source) {
-            Err(CliError::Usage(msg)) => Some(msg.to_string()),
+            Err(CliError::ProjectRefused(msg)) => Some(msg.to_string()),
             _ => None,
         }
     }
@@ -3836,7 +3865,7 @@ mod tests {
         assert!(
             matches!(
                 &r,
-                Err(CliError::Usage(message))
+                Err(CliError::ProjectRefused(message))
                     if message.contains("must set `mode = Render` or `mode = Hydrate`")
             ),
             "a bundle without a mode keeps its refusal: {r:?}"
@@ -3852,7 +3881,7 @@ mod tests {
         assert!(
             matches!(
                 &r,
-                Err(CliError::Usage(message))
+                Err(CliError::ProjectRefused(message))
                     if message.contains("`Solo` was renamed `Render`")
                         && message.contains("`mode = Render`")
             ),
@@ -3872,7 +3901,7 @@ mod tests {
             assert!(
                 matches!(
                     &r,
-                    Err(CliError::Usage(message))
+                    Err(CliError::ProjectRefused(message))
                         if message.contains(&format!(
                             "`{mode}` is not a wasm mode — use `Render` or `Hydrate`"
                         ))
@@ -4174,7 +4203,7 @@ mod tests {
                 "{HEADER}package =\n    {{ name = \"x\", delivery = {{ ships = [ {entry} ] }} }}\n"
             ),
         ) {
-            Err(CliError::Usage(message)) => Some(message.to_string()),
+            Err(CliError::ProjectRefused(message)) => Some(message.to_string()),
             _ => None,
         }
     }
@@ -4393,7 +4422,7 @@ mod tests {
             "a dependencies block with the entry is created: {text}"
         );
         let m = reparsed.expect("the created block re-parses");
-        assert!(m.dependencies.contains_key("http-extras"));
+        assert!(m.declared().contains("http-extras"));
         assert_eq!(m.name, "app", "the existing name field is preserved");
     }
 
@@ -4413,7 +4442,7 @@ mod tests {
         assert!(text.contains("dep \"beta\" \"^2\""), "beta kept: {text}");
         assert!(text.contains("dep \"gamma\""), "gamma appended: {text}");
         let m = reparsed.expect("re-parses");
-        assert_eq!(m.dependencies.len(), 3);
+        assert_eq!(m.declared().len(), 3);
     }
 
     #[test]
@@ -4433,14 +4462,14 @@ mod tests {
             "no duplicate entry after re-add: {text}"
         );
         let m = reparsed.expect("re-parses");
-        assert_eq!(m.dependencies.len(), 1, "still a single dependency");
+        assert_eq!(m.declared().len(), 1, "still a single dependency");
         assert!(
             matches!(
-                m.dependencies.get("http-extras"),
+                m.declared().get("http-extras"),
                 Some(IpeDep::Index(got)) if *got == req("^1.5")
             ),
             "http-extras must remain an index dependency with the updated requirement: {:?}",
-            m.dependencies.get("http-extras")
+            m.declared().get("http-extras")
         );
     }
 
@@ -4462,8 +4491,8 @@ mod tests {
         let after = std::fs::read_to_string(&path).expect("read back");
         let _ = std::fs::remove_dir_all(&root);
         assert!(
-            matches!(err, CliError::Usage(_)),
-            "the refusal is a usage error: {err:?}"
+            matches!(err, CliError::ProjectRefused(_)),
+            "the refusal is a project-state refusal: {err:?}"
         );
         assert_eq!(
             after, source,
@@ -4486,8 +4515,8 @@ mod tests {
         assert!(text.contains("dep \"keep\" \"^1\""), "sibling kept: {text}");
         assert!(!text.contains("\"drop\""), "the entry is gone: {text}");
         let m = reparsed.expect("re-parses after remove");
-        assert_eq!(m.dependencies.len(), 1);
-        assert!(m.dependencies.contains_key("keep"));
+        assert_eq!(m.declared().len(), 1);
+        assert!(m.declared().contains("keep"));
     }
 
     #[test]
@@ -4503,7 +4532,7 @@ mod tests {
         });
         assert_eq!(text, source, "removing an absent dep changes nothing");
         let m = reparsed.expect("re-parses");
-        assert_eq!(m.dependencies.len(), 1);
+        assert_eq!(m.declared().len(), 1);
     }
 
     #[test]
@@ -4520,6 +4549,6 @@ mod tests {
             "entry added into empty list: {text}"
         );
         let m = reparsed.expect("re-parses");
-        assert_eq!(m.dependencies.len(), 1);
+        assert_eq!(m.declared().len(), 1);
     }
 }

@@ -1573,9 +1573,9 @@ pub(crate) fn disclose_package(path: &Path) -> Result<Disclosure, CliError> {
     // are read once and both derivations judge that one read.
     let manifest_path = locate_manifest(path)?;
     let manifest = crate::project::parse_manifest(&manifest_path)?;
-    let (sources, entries) = crate::driver::read_package_modules(&manifest)?;
+    let (sources, entries, deps) = crate::driver::read_package_modules(&manifest)?;
     let source_set =
-        crate::driver::PackageSourceSet::assemble(sources.clone(), entries, &manifest_path)?;
+        crate::driver::PackageSourceSet::assemble(sources.clone(), entries, &manifest_path, deps)?;
     let inferred = crate::driver::infer_package_capabilities_of(&source_set)?;
     derive_disclosure(&manifest, &sources, inferred)
 }
@@ -3693,7 +3693,7 @@ mod tests {
             driver: ipe_backend_rust::DbDriver::default(),
             static_request: crate::build_plan::StaticRequestLayer::default(),
             wasm: crate::project::WasmConfig::default(),
-            dependencies: BTreeMap::new(),
+            dependencies: crate::project::DeclaredDeps::default(),
             rust_dependencies: BTreeMap::new(),
             capabilities: BTreeSet::new(),
             capabilities_accept: BTreeSet::new(),

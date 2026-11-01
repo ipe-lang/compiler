@@ -65,7 +65,8 @@ fn load_error(err: &CliError) -> LoadError {
         | CliError::EntryEscapes { .. }
         | CliError::ExposedModuleMissing { .. }
         | CliError::FileOutsideRoot { .. }
-        | CliError::DirectoryExpected { .. } => LoadError::RootRefused(detail),
+        | CliError::DirectoryExpected { .. }
+        | CliError::DependencyNotCompiled { .. } => LoadError::RootRefused(detail),
         CliError::FileTooLarge { .. }
         | CliError::FmtOutputTooLarge { .. }
         | CliError::DiscoveryLimitReached { .. }
@@ -80,6 +81,7 @@ fn load_error(err: &CliError) -> LoadError {
         },
         CliError::FfiPrep(refusal) => ffi_prep_load_error(refusal, detail),
         CliError::Usage(_)
+        | CliError::ProjectRefused(_)
         | CliError::UnknownCommand { .. }
         | CliError::Pipeline { .. }
         | CliError::RuntimeNotFound
@@ -557,6 +559,28 @@ mod tests {
         let expected = CliError::NoManifest { dir: folder }.to_string();
         let err = loaded.err();
         assert_eq!(err, Some(LoadError::RootRefused(expected)));
+        assert_eq!(
+            err.as_ref().map(LoadError::disposition),
+            Some(ipe_lsp_server::LoadDisposition::Refuse)
+        );
+    }
+
+    /// A package that declares a dependency refuses the load with the
+    /// compiler's own not-compiled refusal, and the server keeps serving: the
+    /// refusal is a disposition, never a crash.
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed fixture IS the failure
+    fn a_declared_dependency_refuses_the_load() {
+        let tree = crate::project_root::SourceTree::main(MAIN)
+            .field("dependencies = [ depPath \"s-lib\" \"../s-lib\" ]");
+        let fixture = RootFixture::from_tree(&tree).expect("fixture");
+        let main = fixture.path().join("src").join("Main.ipe");
+        let loaded = DriverLoader.load(&[fixture.path().to_path_buf()], &main, Some(MAIN));
+        let err = loaded.err();
+        assert!(
+            matches!(&err, Some(LoadError::RootRefused(detail)) if detail.contains("`s-lib`")),
+            "{err:?}"
+        );
         assert_eq!(
             err.as_ref().map(LoadError::disposition),
             Some(ipe_lsp_server::LoadDisposition::Refuse)

@@ -2653,7 +2653,8 @@ pub fn verify_capabilities(
 /// # Errors
 /// [`CliError::Pipeline`] / [`CliError::Io`] when the package cannot be read or
 /// any entry fails to lower; the diagnostic is framed against the module that
-/// owns it.
+/// owns it; [`CliError::DependencyNotCompiled`] when the manifest declares a
+/// dependency.
 pub fn infer_package_capabilities(
     manifest_path: &Path,
 ) -> Result<std::collections::BTreeSet<ipe_ir::Capability>, CliError> {
@@ -2689,6 +2690,7 @@ pub struct PackageSourceSet {
     injected: std::collections::BTreeSet<Vec<String>>,
     ffi_injected: std::collections::BTreeSet<Vec<String>>,
     ffi_emit: Option<ipe_backend_rust::FfiEmit>,
+    deps: project::CompiledDeps,
 }
 
 /// The parts of a [`PackageSourceSet`] the compile core consumes.
@@ -2703,10 +2705,11 @@ pub struct SourceSetParts {
     pub ffi_emit: Option<ipe_backend_rust::FfiEmit>,
 }
 
-/// A module-source map with the modules discovered for it.
+/// A module-source map with the modules discovered for it, and the proof its manifest's dependencies were honored or refused.
 pub type ReadModules = (
     BTreeMap<Vec<String>, (PathBuf, String)>,
     Vec<project::DiscoveredModule>,
+    project::CompiledDeps,
 );
 
 impl PackageSourceSet {
@@ -2716,22 +2719,28 @@ impl PackageSourceSet {
     /// [`project::PackageSnapshot`] through [`PackageSourceSet::from_snapshot`].
     ///
     /// # Errors
-    /// [`CliError::Io`] / manifest errors when the package cannot be read.
+    /// [`CliError::Io`] / manifest errors when the package cannot be read;
+    /// [`CliError::DependencyNotCompiled`] when the manifest declares a
+    /// dependency.
     pub fn read(manifest_path: &Path) -> Result<Self, CliError> {
         let manifest = project::parse_manifest(manifest_path)?;
-        let (sources, entries) = read_package_modules(&manifest)?;
-        Self::assemble(sources, entries, manifest_path)
+        let (sources, entries, deps) = read_package_modules(&manifest)?;
+        Self::assemble(sources, entries, manifest_path, deps)
     }
 
     /// The source set of a captured package: its modules as the snapshot holds them, never re-read.
     ///
     /// # Errors
-    /// The FFI catalog errors of [`ffi::prepare_ffi`].
+    /// The FFI catalog errors of [`ffi::prepare_ffi`];
+    /// [`CliError::DependencyNotCompiled`] when the captured manifest declares
+    /// a dependency.
     pub fn from_snapshot(snapshot: &project::PackageSnapshot) -> Result<Self, CliError> {
+        let deps = snapshot.manifest().compiled_dependencies()?;
         Self::assemble(
             snapshot.sources().clone(),
             snapshot.modules().to_vec(),
             &snapshot_manifest_path(snapshot),
+            deps,
         )
     }
 
@@ -2766,6 +2775,7 @@ impl PackageSourceSet {
             injected,
             ffi_injected: view.ffi().injected.clone(),
             ffi_emit: view.ffi().emit.clone(),
+            deps: view.compiled_deps().clone(),
         }
     }
 
@@ -2809,13 +2819,15 @@ impl PackageSourceSet {
             injected,
             ffi_injected: snapshot.ffi().injected.clone(),
             ffi_emit: snapshot.ffi().emit.clone(),
+            deps: snapshot.compiled_deps().clone(),
         }
     }
 
     /// Inject the compiled-source stdlib closure and the FFI interface modules into `sources`.
     ///
     /// `blame_path` is the project manifest or entry file the FFI catalog
-    /// search walks up from.
+    /// search walks up from; `deps` proves the dependencies were honored or
+    /// refused.
     ///
     /// # Errors
     /// The FFI catalog errors of [`ffi::prepare_ffi`].
@@ -2823,6 +2835,7 @@ impl PackageSourceSet {
         mut sources: BTreeMap<Vec<String>, (PathBuf, String)>,
         mut entries: Vec<project::DiscoveredModule>,
         blame_path: &Path,
+        deps: project::CompiledDeps,
     ) -> Result<Self, CliError> {
         // `injected` is the driver's unforgeable record of which module paths
         // are trusted stdlib source, the only inputs that earn
@@ -2837,6 +2850,7 @@ impl PackageSourceSet {
             injected,
             ffi_injected: ffi.injected,
             ffi_emit: ffi.emit,
+            deps,
         })
     }
 
@@ -2894,6 +2908,7 @@ impl PackageSourceSet {
             injected: self.injected.clone(),
             ffi_injected: self.ffi_injected.clone(),
             ffi_emit: self.ffi_emit.clone(),
+            deps: self.deps.clone(),
         }
     }
 }
@@ -2910,15 +2925,18 @@ pub fn snapshot_manifest_path(snapshot: &project::PackageSnapshot) -> PathBuf {
 /// Read every module under `manifest`'s source root, one bounded read each.
 ///
 /// # Errors
-/// [`CliError::Io`] when the source root cannot be walked or a module read.
+/// [`CliError::DependencyNotCompiled`], before any read, when the manifest
+/// declares a dependency; [`CliError::Io`] when the source root cannot be
+/// walked or a module read.
 pub fn read_package_modules(manifest: &project::ProjectManifest) -> Result<ReadModules, CliError> {
+    let deps = manifest.compiled_dependencies()?;
     let entries = project::discover_modules(&manifest.src_root)?;
     let mut sources: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
     for m in &entries {
         let src = crate::io_bounded::read_walked_source(m.path())?;
         sources.insert(m.module_path().to_vec(), (m.path().to_path_buf(), src));
     }
-    Ok((sources, entries))
+    Ok((sources, entries, deps))
 }
 
 /// [`infer_package_capabilities`] over one caller-supplied database.

@@ -114,9 +114,9 @@ impl Surface for PackageSurface {
 
         let mut items: Vec<PackageItem> = Vec::new();
 
-        for (name, dep) in &manifest.dependencies {
+        for (name, dep) in manifest.declared() {
             items.push(PackageItem {
-                name: name.clone(),
+                name: name.as_str().to_owned(),
                 kind: DepKindLabel::Ipe,
                 ipe_dep: Some(dep.clone()),
                 rust_dep: None,

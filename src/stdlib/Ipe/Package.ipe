@@ -312,6 +312,11 @@ type alias Program =
 -- | One Ipê dependency: its name and its source. Constructed with the `dep` /
 -- `depGit` / `depGitRev` / `depPath` builders so a dependency's source is
 -- exactly one of index / git / path, never a bag of optional keys.
+--
+-- No dependency is compiled yet. A package that declares one is refused by
+-- every compiling command (`ipe type-check`, `ipe dev build`, `ipe test`,
+-- `ipe lint`), with an error naming the dependency and its kind; `ipe fmt` and
+-- `ipe add` keep working. Each name appears once in `dependencies`.
 type alias Dependency =
     { name : String
     , source : DependencySource
@@ -478,7 +483,9 @@ depGitRev name url rev =
     { name = name, source = FromGit url (Just rev) }
 
 
--- | A local-path dependency, relative to the manifest.
+-- | A local-path dependency, relative to the manifest: `../` steps (at most
+-- eight) and then `/`-separated directory names, the same on every host. An
+-- absolute path, a drive, a `\`, a `.` component, or a device name is refused.
 depPath : String -> String -> Dependency
 depPath name path =
     { name = name, source = FromPath path }
