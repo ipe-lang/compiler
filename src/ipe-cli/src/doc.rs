@@ -9900,3 +9900,240 @@ withBaseMs = something
         ));
     }
 }
+
+/// Every member name the `ipe init` `AGENTS.md` module table spans resolves in its row's import pool.
+///
+/// A table row is checked when the first code span of its second column is a
+/// [`ipe_canon::STDLIB_MODULE_QUALIFIERS`] path. In every later column, a code
+/// span that is a member name (`open`), optionally qualified (`Db.open`,
+/// `Ipe.Http.Stream.forEachChunk`) or followed by a signature
+/// (`nullable : …`), claims that member. A bare name claims the row's module;
+/// a qualified one claims the module its qualifier names, when that qualifier
+/// is a kernel path or the first column of a checked row. Each claim must be a
+/// value [`build_kernel_module_docs`] lists for that module, the import pool
+/// `ipe doc` reads.
+#[cfg(test)]
+mod agents_template_members {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::build_kernel_module_docs;
+
+    const TEMPLATE: &str = include_str!("../templates/AGENTS.md.in");
+
+    /// Each kernel module's import pool, keyed by its dotted path.
+    type Pools = BTreeMap<String, BTreeSet<String>>;
+
+    /// One checked row: its line, its cells, and the kernel module it documents.
+    type Row<'a> = (usize, Vec<&'a str>, &'a str);
+
+    /// One member a checked row claims, and the module whose pool must hold it.
+    #[derive(Debug)]
+    struct Claim {
+        line: usize,
+        module: String,
+        member: String,
+    }
+
+    fn live_pools() -> Pools {
+        #[allow(clippy::expect_used)] // a test fixture: the live registry must build
+        let docs = build_kernel_module_docs().expect("the live kernel docs must build");
+        docs.into_iter()
+            .map(|(path, doc)| (path, doc.values.into_iter().map(|v| v.name).collect()))
+            .collect()
+    }
+
+    /// The cells of a table row, split on unescaped pipes outside code spans.
+    fn cells(line: &str) -> Option<Vec<&str>> {
+        let row = line.trim().strip_prefix('|')?;
+        let mut out = Vec::new();
+        let (mut start, mut in_code, mut escaped) = (0, false, false);
+        for (at, ch) in row.char_indices() {
+            match ch {
+                '\\' if !escaped => {
+                    escaped = true;
+                    continue;
+                }
+                '`' if !escaped => in_code = !in_code,
+                '|' if !escaped && !in_code => {
+                    out.push(row.get(start..at)?.trim());
+                    start = at + 1;
+                }
+                _ => {}
+            }
+            escaped = false;
+        }
+        Some(out)
+    }
+
+    /// The code spans of one cell, in order.
+    fn spans(cell: &str) -> impl Iterator<Item = &str> {
+        cell.split('`').skip(1).step_by(2)
+    }
+
+    fn is_kernel_path(text: &str) -> bool {
+        let segments: Vec<&str> = text.split('.').collect();
+        ipe_canon::stdlib_canonical_qualifier(&segments).is_some()
+    }
+
+    fn is_ident(text: &str, upper: bool) -> bool {
+        let mut chars = text.chars();
+        chars.next().is_some_and(|c| {
+            if upper {
+                c.is_ascii_uppercase()
+            } else {
+                c.is_ascii_lowercase()
+            }
+        }) && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
+    /// The `(qualifier, member)` a span claims, or `None` when it names no member.
+    fn member_claim(span: &str) -> Option<(Option<&str>, &str)> {
+        let head = span.split_once(" : ").map_or(span, |(head, _)| head).trim();
+        if head.contains(char::is_whitespace) {
+            return None;
+        }
+        let (qualifier, member) = head
+            .rsplit_once('.')
+            .map_or((None, head), |(q, m)| (Some(q), m));
+        let qualifier_ok = qualifier.is_none_or(|q| q.split('.').all(|s| is_ident(s, true)));
+        (qualifier_ok && is_ident(member, false)).then_some((qualifier, member))
+    }
+
+    /// Every member claim the checked rows of `table` make.
+    fn claims(table: &str) -> Vec<Claim> {
+        let rows: Vec<Row<'_>> = table
+            .lines()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                let cells = cells(line)?;
+                let module = spans(cells.get(1)?).next().filter(|p| is_kernel_path(p))?;
+                (cells.len() >= 3).then_some((index + 1, cells, module))
+            })
+            .collect();
+        let aliases: BTreeMap<&str, &str> = rows
+            .iter()
+            .filter_map(|(_, cells, module)| Some((spans(cells.first()?).next()?, *module)))
+            .collect();
+        let mut out = Vec::new();
+        for (line, cells, module) in &rows {
+            for span in cells.iter().skip(2).flat_map(|cell| spans(cell)) {
+                let Some((qualifier, member)) = member_claim(span) else {
+                    continue;
+                };
+                let owner = match qualifier {
+                    None => Some(*module),
+                    Some(q) if is_kernel_path(q) => Some(q),
+                    Some(q) => aliases.get(q).copied(),
+                };
+                if let Some(owner) = owner {
+                    out.push(Claim {
+                        line: *line,
+                        module: owner.to_owned(),
+                        member: member.to_owned(),
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// The claims of `table` no import pool holds, rendered for a failure message.
+    fn offences(table: &str, pools: &Pools) -> Vec<String> {
+        claims(table)
+            .into_iter()
+            .filter(|c| {
+                !pools
+                    .get(&c.module)
+                    .is_some_and(|pool| pool.contains(&c.member))
+            })
+            .map(|c| {
+                format!(
+                    "line {}: `{}` is not a member of `{}`",
+                    c.line, c.member, c.module
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_spanned_member_of_the_template_table_is_in_its_import_pool() {
+        let pools = live_pools();
+        let found = offences(TEMPLATE, &pools);
+        assert!(
+            found.is_empty(),
+            "AGENTS.md.in names members its module does not export:\n{}",
+            found.join("\n"),
+        );
+    }
+
+    #[test]
+    fn the_template_check_reads_the_kernel_rows() {
+        let claimed: BTreeSet<String> = claims(TEMPLATE).into_iter().map(|c| c.module).collect();
+        for module in [
+            "Ipe.Db",
+            "Ipe.Http",
+            "Ipe.Auth",
+            "Ipe.Server.Http",
+            "Ipe.Tea.Web.Cmd",
+        ] {
+            assert!(
+                claimed.contains(module),
+                "the `{module}` row must be checked, checked rows: {claimed:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn an_unsafe_member_on_the_safe_db_row_is_refused() {
+        let pools = live_pools();
+        let found = offences("| X | `Ipe.Db` | `open`, `unsafeExecRaw` |\n", &pools);
+        assert_eq!(
+            found,
+            ["line 1: `unsafeExecRaw` is not a member of `Ipe.Db`"]
+        );
+    }
+
+    #[test]
+    fn a_member_of_another_kernel_module_on_a_row_is_refused() {
+        let pools = live_pools();
+        let found = offences(
+            "| X | `Ipe.Http` | `get`, `safeValue` (`CssSafety`) |\n",
+            &pools,
+        );
+        assert_eq!(found, ["line 1: `safeValue` is not a member of `Ipe.Http`"]);
+    }
+
+    #[test]
+    fn a_qualified_claim_is_checked_against_the_module_it_names() {
+        let pools = live_pools();
+        let table = "| `Db` | `Ipe.Db` | `open` |\n\
+                     | X | `Ipe.Http` | `Db.unsafeQuery`, `Ipe.Http.Stream.nope`, `Db.open` |\n";
+        assert_eq!(
+            offences(table, &pools),
+            [
+                "line 2: `unsafeQuery` is not a member of `Ipe.Db`",
+                "line 2: `nope` is not a member of `Ipe.Http.Stream`",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_signature_span_claims_its_name() {
+        let pools = live_pools();
+        let table = "| X | `Ipe.Db` | `nullable : Decoder a -> Decoder (Maybe a)` |\n";
+        let found = offences(table, &pools);
+        assert_eq!(found, ["line 1: `nullable` is not a member of `Ipe.Db`"]);
+    }
+
+    #[test]
+    fn prose_spans_and_unchecked_rows_claim_nothing() {
+        let table = "| X | `Ipe.Db` | `Database Db.Busy`, `SqlValue`, `Ipe.Db.Decode`, `INSERT … (?)` |\n\
+                     | Y | `Ipe.List` | `notAListMember` |\n\
+                     | Z | prose | `notAMember` |\n";
+        let found: Vec<String> = claims(table).into_iter().map(|c| c.member).collect();
+        assert!(
+            found.is_empty(),
+            "prose spans must claim nothing: {found:?}"
+        );
+    }
+}
