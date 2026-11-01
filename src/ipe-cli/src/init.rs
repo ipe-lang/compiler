@@ -498,7 +498,7 @@ fn guard_rerun_conflict(
         return Ok(());
     };
     if stated != existing {
-        return Err(CliError::Usage(text::msg::init_shape_fixed(
+        return Err(CliError::ProjectRefused(text::msg::init_shape_fixed(
             &existing.label(),
             &stated.label(),
         )));
@@ -1940,6 +1940,10 @@ mod tests {
         .expect("write tui Main.ipe");
         let err = guard_rerun_conflict(&root, InitShape::Web, Some(InitShape::Web), None)
             .expect_err("web re-init on a tui project is refused");
+        assert!(
+            matches!(err, CliError::ProjectRefused(_)),
+            "the pinned shape is project state: {err:?}"
+        );
         let msg = format!("{err:?}");
         assert!(msg.contains("already holds"), "names the conflict: {msg}");
         // A matching (or absent) stated shape reconciles silently.

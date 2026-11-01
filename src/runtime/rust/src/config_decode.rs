@@ -83,7 +83,10 @@ pub fn config_decode_json<E: DecodeErrorSink + 'static, T>(
     decoder: Decoder<E, T>,
 ) -> IpeResult<E, T> {
     run_decoder(
-        serde_json::from_str(&s).map_err(|e| format!("json parse: {}", e)),
+        serde_json::from_str(&s).map_err(|e| {
+            let IpeError::Error(_, info) = super::json::json_failure(&e);
+            info.message
+        }),
         decoder,
     )
 }

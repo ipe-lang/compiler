@@ -349,7 +349,8 @@ struct ManifestFields {
 
 impl ManifestFields {
     /// Assemble the accumulated fields into a [`ProjectManifest`], applying the
-    /// remaining whole-manifest validations: `name` is required, the
+    /// remaining whole-manifest validations: `name` is required, a `sourceRoot`
+    /// other than `src` is refused before any path is looked at, the
     /// source-root directory must exist, and an install request carries an
     /// icon proven fit for install.
     ///
@@ -363,6 +364,15 @@ impl ManifestFields {
         let name = self.name.ok_or(CliError::ProjectRefused(
             text::msg::package_manifest_name_required(),
         ))?;
+        if self
+            .src_rel
+            .as_deref()
+            .is_some_and(|spelled| spelled != DEFAULT_SOURCE_ROOT)
+        {
+            return Err(CliError::ProjectRefused(
+                text::msg::package_manifest_source_root_removed(),
+            ));
+        }
         let src_rel_raw = self.src_rel.as_deref().unwrap_or(DEFAULT_SOURCE_ROOT);
         let src_root_contained = crate::contained_path::ContainedRelPath::parse(root, src_rel_raw)
             .map_err(|reason| CliError::PathEscape {
@@ -4344,6 +4354,54 @@ mod tests {
             ),
         );
         assert_rejected(&r);
+    }
+
+    /// A `sourceRoot` other than `src` is the removed-field refusal, whether or
+    /// not the named directory exists: the reader refuses the field before it
+    /// looks at any path.
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: an unwritable temp dir IS the failure
+    fn a_moved_source_root_is_the_removed_field_refusal() {
+        let removed =
+            CliError::ProjectRefused(text::msg::package_manifest_source_root_removed()).to_string();
+        for (tag, spelled, make_dir) in [
+            ("source_root_absent", "app", false),
+            ("source_root_present", "app", true),
+            ("source_root_hidden", ".src", true),
+            ("source_root_escape", "../..", false),
+            ("source_root_dotted", "./src", false),
+        ] {
+            let root = fresh_project(tag);
+            if make_dir {
+                std::fs::create_dir_all(root.join(spelled)).expect("create the moved root");
+            }
+            let path = root.join(PACKAGE_IPE);
+            std::fs::write(
+                &path,
+                format!("{HEADER}package =\n    {{ name = \"x\", sourceRoot = \"{spelled}\" }}\n"),
+            )
+            .expect("write package.ipe");
+            let result = parse_package_manifest(&path);
+            let _ = std::fs::remove_dir_all(&root);
+            assert!(
+                matches!(&result, Err(CliError::ProjectRefused(_))),
+                "{tag}: a moved source root is project state: {result:?}"
+            );
+            let Err(err) = result else {
+                return;
+            };
+            assert_eq!(err.to_string(), removed, "{tag}");
+        }
+    }
+
+    /// The control: `sourceRoot = "src"` names the one source root and reads.
+    #[test]
+    fn a_source_root_spelled_src_reads() {
+        let r = read(
+            "source_root_src",
+            &format!("{HEADER}package =\n    {{ name = \"x\", sourceRoot = \"src\" }}\n"),
+        );
+        assert!(r.is_ok(), "{r:?}");
     }
 
     #[test]

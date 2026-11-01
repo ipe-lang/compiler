@@ -301,15 +301,20 @@ fn take_value<'a>(
 }
 
 /// Resolve `path` (a directory or a `package.ipe`) to its manifest file.
+///
+/// # Errors
+/// [`CliError::ProjectRefused`] when the directory holds no `package.ipe`;
+/// [`CliError::Usage`] when the path argument names neither a directory nor a
+/// `package.ipe`.
 fn locate_manifest(path: &Path) -> Result<PathBuf, CliError> {
     if path.is_dir() {
         if let Some(manifest) = crate::project::manifest_in_dir(path) {
             return Ok(manifest);
         }
         if crate::project::has_only_legacy_toml(path) {
-            return Err(CliError::Usage(text::msg::legacy_toml_hint()));
+            return Err(CliError::ProjectRefused(text::msg::legacy_toml_hint()));
         }
-        return Err(CliError::Usage(text::msg::publish_no_manifest(
+        return Err(CliError::ProjectRefused(text::msg::publish_no_manifest(
             &path.display(),
         )));
     }
@@ -547,13 +552,13 @@ pub fn render_entry(
 /// The manifest's version as the index will record it.
 ///
 /// # Errors
-/// [`CliError::Usage`] when the manifest declares no version;
+/// [`CliError::ProjectRefused`] when the manifest declares no version;
 /// [`CliError::VersionRefused`] when it carries build metadata.
 fn manifest_published_version(manifest: &ProjectManifest) -> Result<PublishedVersion, CliError> {
     let version = manifest
         .version
         .clone()
-        .ok_or_else(|| CliError::Usage(text::msg::publish_no_version(&manifest.name)))?;
+        .ok_or_else(|| CliError::ProjectRefused(text::msg::publish_no_version(&manifest.name)))?;
     PublishedVersion::from_semver(version).map_err(|refusal| refusal.for_package(&manifest.name))
 }
 

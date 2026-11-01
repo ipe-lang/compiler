@@ -59,10 +59,16 @@ fn header_json(alg: &str) -> String {
 /// Re-encode a claims JSON string as deterministic sorted-key canonical JSON so
 /// the signed payload bytes (sorted object keys at every depth, HTML-escape shape)
 /// are byte-stable, independent of the ambient object-order encoder setting.
-/// Returns the bad-claims error message on a parse failure.
+///
+/// A parse failure routes through [`super::json::json_failure`] — the single
+/// source for json decode failures — so the message carries a typed kind and
+/// a position, never the caller-supplied claims text (which may hold secrets
+/// the token encodes).
 fn payload_json(claims_json: &str) -> Result<String, String> {
-    let value: JsonVal =
-        serde_json::from_str(claims_json).map_err(|e| format!("bad claims json: {}", e))?;
+    let value: JsonVal = serde_json::from_str(claims_json).map_err(|e| {
+        let crate::error::IpeError::Error(_, info) = super::json::json_failure(&e);
+        info.message
+    })?;
     Ok(super::json_enc_canonical(&value))
 }
 
@@ -205,7 +211,7 @@ pub(crate) fn hs256_short_secret_msg(op: &str, actual_len: usize) -> String {
 }
 
 /// Ipê `Jwt_encodeHs256 : String -> String -> Result Error String`
-pub fn jwt_encode_hs256<E: From<String>>(
+pub fn jwt_encode_hs256<E: crate::DecodeErrorSink>(
     secret: String,
     claims_json: String,
 ) -> IpeResult<E, String> {
@@ -220,7 +226,7 @@ pub fn jwt_encode_hs256<E: From<String>>(
     }
     let payload = match payload_json(&claims_json) {
         Ok(p) => p,
-        Err(e) => return IpeResult::Err(format!("jwt-encode: {}", e).into()),
+        Err(e) => return IpeResult::Err(E::from_decode_failure(format!("jwt-encode: {}", e))),
     };
     let signing_input = format!(
         "{}.{}",
@@ -324,13 +330,13 @@ pub fn jwt_decode_hs256<E: From<String>>(secret: String, token: String) -> IpeRe
 }
 
 /// Ipê `Jwt_encodeRs256 : String -> String -> Result Error String`
-pub fn jwt_encode_rs256<E: From<String>>(
+pub fn jwt_encode_rs256<E: crate::DecodeErrorSink>(
     key_pem: String,
     claims_json: String,
 ) -> IpeResult<E, String> {
     let payload = match payload_json(&claims_json) {
         Ok(p) => p,
-        Err(e) => return IpeResult::Err(format!("jwt-encode-rs: {}", e).into()),
+        Err(e) => return IpeResult::Err(E::from_decode_failure(format!("jwt-encode-rs: {}", e))),
     };
     let signing_input = format!(
         "{}.{}",
@@ -413,14 +419,14 @@ pub fn jwt_decode_rs256<E: From<String>>(key_pem: String, token: String) -> IpeR
 
 // ── Concrete aliases for generated Rust code ─────────────────────────────────
 //
-// The generic `jwt_encode_hs256<E: From<String>>` and friends cannot be
-// called directly from generated code where the `Err` arm may be discarded —
-// Rust cannot infer `E` in that context. These monomorphic aliases pin
-// `E = IpeError` and are what `naming::kernel_name()` maps the Jwt kernels to,
-// mirroring the `ipe_aes_gcm_encrypt` pattern in `crypto.rs`.
+// The generic `jwt_encode_hs256<E: crate::DecodeErrorSink>` and friends cannot
+// be called directly from generated code where the `Err` arm may be
+// discarded — Rust cannot infer `E` in that context. These monomorphic
+// aliases pin `E = IpeError` and are what `naming::kernel_name()` maps the Jwt
+// kernels to, mirroring the `ipe_aes_gcm_encrypt` pattern in `crypto.rs`.
 //
-// SECURITY: only the error message crosses the `From<String>` boundary; no
-// key material is included in error text (see the suppressed RSA key detail
+// SECURITY: only the error message crosses the sink boundary; no key
+// material is included in error text (see the suppressed RSA key detail
 // above). These wrappers add no new logging surface.
 
 /// Generated-code alias for `jwt_encode_hs256` with `E = String`.
@@ -766,6 +772,38 @@ mod tests {
         let bad: IpeResult<String, String> =
             jwt_decode_hs256("wrong-secret-0123456789abcdef0123".to_string(), token);
         assert!(matches!(bad, IpeResult::Err(_)));
+    }
+
+    /// Malformed claims JSON is a decode failure (RFC 7519 §7.1's producer-side
+    /// JSON object), never the catch-all `Unexpected` the `From<String>` bridge
+    /// would otherwise assign — and the message must not echo the caller's
+    /// (potentially secret-bearing) claims text.
+    #[test]
+    fn jwt_bad_claims_json_is_decode() {
+        let secret = "bad-claims-secret-0123456789abcdef".to_string();
+        let hs: IpeResult<crate::error::IpeError, String> =
+            jwt_encode_hs256(secret, "{oops SENTINEL".to_string());
+        let crate::error::IpeError::Error(hs_kind, hs_info) = match hs {
+            IpeResult::Err(e) => e,
+            IpeResult::Ok(t) => panic!("expected a decode error, got a token: {t}"),
+        };
+        assert!(
+            matches!(hs_kind, crate::IpeErrorKind::Decode),
+            "{hs_kind:?}"
+        );
+        assert!(!hs_info.message.contains("SENTINEL"), "{}", hs_info.message);
+
+        let rs: IpeResult<crate::error::IpeError, String> =
+            jwt_encode_rs256(RS256_PRIV_PEM.to_string(), "{oops SENTINEL".to_string());
+        let crate::error::IpeError::Error(rs_kind, rs_info) = match rs {
+            IpeResult::Err(e) => e,
+            IpeResult::Ok(t) => panic!("expected a decode error, got a token: {t}"),
+        };
+        assert!(
+            matches!(rs_kind, crate::IpeErrorKind::Decode),
+            "{rs_kind:?}"
+        );
+        assert!(!rs_info.message.contains("SENTINEL"), "{}", rs_info.message);
     }
 
     /// Seconds since the Unix epoch, for building boundary-exercising claims.

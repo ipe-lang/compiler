@@ -523,7 +523,7 @@ fn read_manifest(root: &ipe_fs_open::HeldDir, dir: &Path) -> Result<String, CliE
                 .flatten();
             match legacy {
                 Some(FileKind::Regular | FileKind::Symlink) => {
-                    Err(CliError::Usage(text::msg::legacy_toml_hint()))
+                    Err(CliError::ProjectRefused(text::msg::legacy_toml_hint()))
                 }
                 Some(
                     FileKind::Dir
@@ -818,7 +818,7 @@ mod tests {
         let err = resolve_err(s.path());
         assert_eq!(
             err.to_string(),
-            CliError::Usage(text::msg::legacy_toml_hint()).to_string()
+            CliError::ProjectRefused(text::msg::legacy_toml_hint()).to_string()
         );
     }
 

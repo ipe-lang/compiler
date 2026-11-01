@@ -1512,18 +1512,17 @@ pub fn has_only_legacy_toml(dir: &Path) -> bool {
 /// [`CliError::ProjectRefused`] for a malformed or invalid manifest (an unsupported
 /// driver, a bad version or dependency, an unknown capability, a denylisted
 /// `publicEnv` name, a missing source root); [`CliError::Pipeline`] when the
-/// source does not parse; and [`CliError::Usage`] when the path is not a
-/// `package.ipe`.
+/// source does not parse; and [`CliError::ProjectRefused`] when the path is
+/// not a `package.ipe`.
 pub fn parse_manifest(manifest_path: &Path) -> Result<ProjectManifest, CliError> {
     if manifest_path.file_name().and_then(|n| n.to_str())
         == Some(crate::package_manifest::PACKAGE_IPE)
     {
         return crate::package_manifest::parse_package_manifest(manifest_path);
     }
-    Err(CliError::Usage(text::msg::manifest_not_package_ipe(
-        &manifest_path.display(),
-        &text::legacy_toml_hint(),
-    )))
+    Err(CliError::ProjectRefused(
+        text::msg::manifest_not_package_ipe(&manifest_path.display(), &text::legacy_toml_hint()),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -3826,16 +3825,11 @@ import String
         assert_eq!(snapshot.tree().to_hex(), rebuilt_hash);
     }
 
-    /// The source root the manifest names decides which `.ipe` files are modules.
+    /// Only the `.ipe` files under `src/` are modules; one elsewhere in the
+    /// package is not.
     #[test]
-    fn a_snapshot_reads_modules_under_the_manifest_source_root() {
+    fn a_snapshot_reads_modules_only_under_src() {
         let root = snapshot_dir("src_prefix");
-        fs::write(
-            root.join("package.ipe"),
-            "module Package exposing (package)\n\npackage =\n    \
-             { name = \"snap\", sourceRoot = \"app\" }\n",
-        )
-        .expect("write manifest");
         fs::create_dir_all(root.join("app")).expect("create app");
         fs::write(
             root.join("app").join("Entry.ipe"),
@@ -3852,28 +3846,25 @@ import String
             .collect();
         assert_eq!(
             paths,
-            vec![module(&["Entry"]).as_slice()],
-            "`src/Main.ipe` lies outside the source root"
+            vec![module(&["Main"]).as_slice()],
+            "`app/Entry.ipe` lies outside the source root"
         );
     }
 
-    /// A source root in a hidden directory is refused: the digest would not cover it.
+    /// A source root spelled in a hidden directory is refused: the digest would
+    /// not cover it.
     #[test]
     fn a_source_root_in_a_hidden_directory_is_refused() {
         let root = snapshot_dir("hidden_src");
-        fs::write(
-            root.join("package.ipe"),
-            "module Package exposing (package)\n\npackage =\n    \
-             { name = \"snap\", sourceRoot = \".src\" }\n",
-        )
-        .expect("write manifest");
         fs::create_dir_all(root.join(".src")).expect("create .src");
-        fs::write(
-            root.join(".src").join("Main.ipe"),
-            "module Main exposing (main)\nmain = 0\n",
+        let capture = crate::cache::capture_tree_within(
+            &root,
+            crate::remote_ingest::PACKAGE_SOURCE.tree(),
+            snapshot_keep_cap,
         )
-        .expect("write Main");
-        let result = PackageSnapshot::capture(&root);
+        .expect("capture");
+        let live = fs::canonicalize(root.join(".src")).expect("canonical .src");
+        let result = src_root_prefix(&root, ".src", &live, &capture);
         let _ = fs::remove_dir_all(&root);
         assert!(invalid_because(&result, "hidden directory"));
     }
@@ -3894,24 +3885,41 @@ import String
     #[test]
     fn a_source_root_spelled_through_a_hidden_link_is_refused() {
         let root = snapshot_dir("hidden_link_src");
-        fs::write(
-            root.join("package.ipe"),
-            "module Package exposing (package)\n\npackage =\n    \
-             { name = \"snap\", sourceRoot = \".h/link\" }\n",
-        )
-        .expect("write manifest");
         fs::create_dir_all(root.join("app")).expect("create app");
-        fs::write(
-            root.join("app").join("Entry.ipe"),
-            "module Entry exposing (e)\n\ne = 0\n",
-        )
-        .expect("write Entry");
         fs::create_dir_all(root.join(".h")).expect("create .h");
         std::os::unix::fs::symlink("../app", root.join(".h").join("link"))
             .expect("plant .h/link -> app");
-        let result = PackageSnapshot::capture(&root);
+        let capture = crate::cache::capture_tree_within(
+            &root,
+            crate::remote_ingest::PACKAGE_SOURCE.tree(),
+            snapshot_keep_cap,
+        )
+        .expect("capture");
+        let live_app = fs::canonicalize(root.join("app")).expect("canonical app");
+        let result = src_root_prefix(&root, ".h/link", &live_app, &capture);
         let _ = fs::remove_dir_all(&root);
         assert!(invalid_because(&result, "hidden directory"));
+    }
+
+    /// A manifest naming a source root other than `src` is refused before the
+    /// snapshot reads a module.
+    #[test]
+    fn a_snapshot_of_a_moved_source_root_is_refused() {
+        let root = snapshot_dir("moved_src");
+        fs::write(
+            root.join("package.ipe"),
+            "module Package exposing (package)\n\npackage =\n    \
+             { name = \"snap\", sourceRoot = \"app\" }\n",
+        )
+        .expect("write manifest");
+        fs::create_dir_all(root.join("app")).expect("create app");
+        let result = PackageSnapshot::capture(&root);
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            matches!(result, Err(CliError::ProjectRefused(_))),
+            "a moved source root is project state: {:?}",
+            result.err()
+        );
     }
 
     /// The source root is located in the captured walk by the manifest's

@@ -19,7 +19,9 @@ use wire::{WireConstant, WireFunction, WireParam, WirePkgInfo, WireTransitiveDep
 use crate::call::Call;
 use crate::carrier::{Carrier, ClosureSig, EnumDef, StructDef};
 use crate::diag::{Diagnostic, WireDefect};
-use crate::naming::{FieldSelector, RustIdent, RustPattern, RustTypeExpr, wrapper_ref_name};
+use crate::naming::{
+    FieldSelector, RustIdent, RustPattern, RustTypeExpr, check_type_ceilings, wrapper_ref_name,
+};
 
 // ── domain layer ────────────────────────────────────────────────────────────
 
@@ -163,10 +165,12 @@ pub struct Param {
     pub name: String,
     /// The foreign Rust type string, verbatim from the inspector. Ipê-facing
     /// data: it drives `foreign_to_ipe` and the opaque-path map, never renders
-    /// as Rust code.
+    /// as Rust code. Decode admits it only within the
+    /// [`check_type_ceilings`] length and depth ceilings.
     pub foreign_ty: String,
     /// The inspector's Ipê-side type override (empty ⇒ derive from
-    /// `foreign_ty`). Ipê-facing data, never rendered as Rust code.
+    /// `foreign_ty`). Ipê-facing data, never rendered as Rust code. Decode
+    /// admits it only within the [`check_type_ceilings`] ceilings.
     pub ipe_type: String,
     /// The inspector's Rust-side type override for wrapper emission — a
     /// validated type expression when present, so it renders verbatim without
@@ -1275,18 +1279,21 @@ const fn shape_fallibility(shape: &FnShape, effect: Effect) -> Fallibility {
 }
 
 fn param_from_wire(function: &str, w: WireParam) -> Result<Param, Diagnostic> {
+    let context = |defect: WireDefect| Diagnostic::WireMalformed {
+        context: format!("function `{function}`"),
+        defect,
+    };
+    // Every type walk downstream recurses once per nesting level, so the free
+    // type strings are admitted only within the length and depth ceilings.
+    check_type_ceilings(&w.ty).map_err(context)?;
+    check_type_ceilings(&w.ipe_type).map_err(context)?;
     // `rustType` renders verbatim into the wrapper; validate it at decode so an
     // injection-bearing override is unrepresentable past this point. Empty ⇒
     // no override.
     let rust_type = if w.rust_type.is_empty() {
         None
     } else {
-        Some(
-            RustTypeExpr::parse(&w.rust_type).map_err(|defect| Diagnostic::WireMalformed {
-                context: format!("function `{function}`"),
-                defect,
-            })?,
-        )
+        Some(RustTypeExpr::parse(&w.rust_type).map_err(context)?)
     };
     Ok(Param {
         name: w.name,
@@ -1305,6 +1312,7 @@ impl TryFrom<WireFunction> for FnInfo {
             defect,
         };
         let name = RustIdent::parse(&w.name).map_err(&context)?;
+        check_type_ceilings(&w.recv_type).map_err(&context)?;
         if !w.method_name.is_empty() {
             RustIdent::parse(&w.method_name).map_err(&context)?;
         }
@@ -1654,12 +1662,18 @@ fn decode_source(wrapper_path: &str, crate_name: &str) -> Result<PkgSource, Diag
 
 /// Inspected constants: keep only a well-shaped crate-relative path
 /// (`seg::…::SEG`, every segment a legal Rust ident) with a non-empty
-/// recorded type. A malformed entry is dropped — absence only disables a
-/// `.const` cross-check (fail-closed), never admits an unverified read.
+/// recorded type within the [`check_type_ceilings`] ceilings. A malformed
+/// entry is dropped — absence only disables a `.const` cross-check
+/// (fail-closed), never admits an unverified read.
 fn decode_consts(constants: Vec<WireConstant>) -> Vec<ConstInfo> {
     constants
         .into_iter()
-        .filter(|c| !c.path.is_empty() && !c.ty.is_empty() && is_rust_path_shaped(&c.path))
+        .filter(|c| {
+            !c.path.is_empty()
+                && !c.ty.is_empty()
+                && check_type_ceilings(&c.ty).is_ok()
+                && is_rust_path_shaped(&c.path)
+        })
         .map(|c| ConstInfo {
             path: c.path,
             ty: c.ty,
@@ -1925,6 +1939,91 @@ mod tests {
         // Construction is infallible; per-call failure is handled in-band.
         assert_eq!(f.fallibility(), Fallibility::Infallible);
         assert!(pkg.dropped().is_empty());
+    }
+
+    /// A one-function package whose single result carries `field` = `ty`.
+    fn pkg_with_result_type(field: &str, ty: &str) -> serde_json::Value {
+        let mut result = serde_json::Map::new();
+        result.insert("type".to_owned(), json!("i64"));
+        result.insert(field.to_owned(), json!(ty));
+        base_pkg(&json!([{
+            "name": "deep",
+            "effect": "pure",
+            "results": [result]
+        }]))
+    }
+
+    /// The defect a package's single over-dropped binding carries.
+    fn only_dropped_defect(pkg: &PkgInfo) -> Option<&WireDefect> {
+        assert!(pkg.fns().is_empty(), "the deep binding must over-drop");
+        match pkg.dropped() {
+            [Diagnostic::WireMalformed { defect, .. }] => Some(defect),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn ten_thousand_nested_vecs_decode_to_a_typed_ceiling_error() {
+        use crate::naming::MAX_TYPE_LEN;
+        let deep = format!("{}i64{}", "Vec<".repeat(10_000), ">".repeat(10_000));
+        for field in ["type", "ipeType", "rustType"] {
+            let pkg = decode(&pkg_with_result_type(field, &deep)).expect("package survives");
+            assert_eq!(
+                only_dropped_defect(&pkg),
+                Some(&WireDefect::TypeTooLong {
+                    len: deep.len(),
+                    max: MAX_TYPE_LEN
+                }),
+                "{field} must refuse at the length ceiling"
+            );
+        }
+    }
+
+    #[test]
+    fn deep_type_strings_under_the_length_ceiling_refuse_at_the_depth_ceiling() {
+        use crate::naming::MAX_TYPE_DEPTH;
+        // `Vec<`×n around `i64` nests 2n + 1 deep.
+        let nested = |n: usize| format!("{}i64{}", "Vec<".repeat(n), ">".repeat(n));
+        let at = nested((MAX_TYPE_DEPTH - 1) / 2);
+        let past = nested((MAX_TYPE_DEPTH - 1) / 2 + 1);
+        let ipe_past = format!("{}Int", "List ".repeat(MAX_TYPE_DEPTH));
+        for (field, ty) in [
+            ("type", past.as_str()),
+            ("rustType", past.as_str()),
+            ("ipeType", ipe_past.as_str()),
+        ] {
+            let pkg = decode(&pkg_with_result_type(field, ty)).expect("package survives");
+            assert_eq!(
+                only_dropped_defect(&pkg),
+                Some(&WireDefect::TypeTooDeep {
+                    max: MAX_TYPE_DEPTH
+                }),
+                "{field} must refuse one past the depth ceiling"
+            );
+        }
+        for field in ["type", "rustType"] {
+            let pkg = decode(&pkg_with_result_type(field, &at)).expect("package survives");
+            assert!(pkg.dropped().is_empty(), "{field} at the ceiling decodes");
+            assert_eq!(pkg.fns().len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_deep_receiver_type_over_drops_the_method() {
+        use crate::naming::MAX_TYPE_DEPTH;
+        let recv = format!("{}Int", "List ".repeat(MAX_TYPE_DEPTH));
+        let pkg = decode(&base_pkg(&json!([{
+            "name": "deep_method",
+            "effect": "pure",
+            "recvType": recv
+        }])))
+        .expect("package survives");
+        assert_eq!(
+            only_dropped_defect(&pkg),
+            Some(&WireDefect::TypeTooDeep {
+                max: MAX_TYPE_DEPTH
+            })
+        );
     }
 
     #[test]

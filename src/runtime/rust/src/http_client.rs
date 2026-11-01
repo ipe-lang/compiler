@@ -548,7 +548,7 @@ pub(crate) fn send_failure<E: From<String> + FromLimitExceeded>(
 /// password or a query-string token. Ipê sees only the correlation id.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn redacted_transport_error<E: From<String>>(e: reqwest::Error) -> E {
-    ipe_error_from_foreign(e.without_url())
+    crate::core::redacted_foreign_message(e.without_url()).into()
 }
 
 // ---------------------------------------------------------------------------
