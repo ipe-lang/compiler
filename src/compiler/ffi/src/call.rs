@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 use crate::diag::{CallDefect, Diagnostic, WireDefect};
 use crate::naming::{RustIdent, RustPathSegment, RustTypeExpr, arg_name};
-use crate::num_coerce::{num_carrier, num_saturate};
+use crate::num_coerce::{NumWidth, num_saturate};
 use crate::typeref::{ArgTypeRef, ClosureKind, InnerTypeRef, WireTypeRef};
 
 /// Whether the call has a receiver (a self input) or is a free/static call.
@@ -500,6 +500,13 @@ impl Call {
     /// saturating narrow for a concrete numeric width, the `.into_iter()` /
     /// `.as_ref()` adapters, else the bare identifier.
     fn render_value_arg(&self, j: usize) -> String {
+        // A concrete numeric param travels as the Ipê carrier; narrow to the
+        // foreign width at the call site (identity for i64/f64).
+        if let Some(ArgTypeRef::Inner(InnerTypeRef::Prim(w))) = self.arg_types.get(j)
+            && let Some(nw) = NumWidth::parse(w.as_str())
+        {
+            return num_saturate(nw, &arg_name(j));
+        }
         match self.arg_types.get(j) {
             // The host wants `Fn(&A)`; the Ipê closure only takes OWNED
             // values, so each borrowed slot is cloned to owned inside a
@@ -514,11 +521,6 @@ impl Call {
             Some(ArgTypeRef::Inner(InnerTypeRef::SerdeValue)) => format!("sv_{j}"),
             // A `&T` serde input borrows the same owned local.
             Some(ArgTypeRef::Inner(InnerTypeRef::SerdeValueRef)) => format!("&sv_{j}"),
-            // A concrete numeric param travels as the Ipê carrier; narrow to
-            // the foreign width at the call site (identity for i64/f64).
-            Some(ArgTypeRef::Inner(InnerTypeRef::Prim(w))) if num_carrier(w.as_str()).is_some() => {
-                num_saturate(w.as_str(), &arg_name(j))
-            }
             _ => {
                 if self.iter_adapters.contains(&j) {
                     format!("{}.into_iter()", arg_name(j))
@@ -547,10 +549,11 @@ impl Call {
     pub fn render_arg_type_at(&self, params: &[String], j: usize) -> String {
         match self.arg_types.get(j) {
             Some(ArgTypeRef::Closure { .. }) => format!("F{j}"),
-            Some(ArgTypeRef::Inner(InnerTypeRef::Prim(w))) => num_carrier(w.as_str()).map_or_else(
-                || InnerTypeRef::Prim(w.clone()).render(params),
-                str::to_owned,
-            ),
+            Some(ArgTypeRef::Inner(InnerTypeRef::Prim(w))) => NumWidth::parse(w.as_str())
+                .map_or_else(
+                    || InnerTypeRef::Prim(w.clone()).render(params),
+                    |nw| nw.carrier().rust().to_owned(),
+                ),
             Some(ArgTypeRef::Inner(t)) => t.render(params),
             None => "()".to_owned(),
         }

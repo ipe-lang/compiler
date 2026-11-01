@@ -46,7 +46,7 @@ const EDGES: [i64; 13] = [
 #[test]
 fn scalar_u8_rendering_is_the_evaluated_form() {
     assert_eq!(
-        ipe_ffi::num_coerce::num_saturate("u8", "x"),
+        ipe_ffi::num_coerce::num_saturate(ipe_ffi::num_coerce::NumWidth::U8, "x"),
         SCALAR_U8_FORM,
         "the scalar u8 FFI rule changed: update `scalar_u8` and the runtime \
          `narrow::byte_saturating` together"

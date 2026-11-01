@@ -725,6 +725,20 @@ pub fn crate_interface(pkg: &PkgInfo) -> CrateInterface {
             );
             continue;
         }
+        // A flat-tier parameter the wrapper's own argument renderer refuses
+        // (an optional fixed-size array, a `Result`, a non-carrier numeric
+        // nested in an unrendered container) over-drops with its own reason: a dry run of
+        // the emitter's renderer (which drops the same region), so admission and
+        // emission cannot drift.
+        if f.generic().is_none()
+            && let Some(refusal) = f
+                .params()
+                .iter()
+                .find_map(|p| crate::bindings::foreign_param_coercion(p.rust_type_str()).err())
+        {
+            skip(refusal.reason(), &mut skipped);
+            continue;
+        }
         if !survivors.contains(&ref_name) {
             skip("no wrapper region in _bindings.rs", &mut skipped);
             continue;
