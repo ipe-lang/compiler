@@ -55,8 +55,8 @@ docs/topics/main.md:61
 docs/topics/main.md:69
 docs/topics/main.md:82
 docs/topics/shapes.md:141
-docs/topics/shapes.md:175
-docs/topics/shapes.md:205
+docs/topics/shapes.md:178
+docs/topics/shapes.md:212
 docs/topics/state.md:117
 docs/topics/state.md:26
 docs/topics/state.md:79
