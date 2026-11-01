@@ -277,3 +277,114 @@ fn same_line_positions_demote_their_comment() {
         ),
     ]);
 }
+
+/// Append `comment` to the end of the first not-yet-used line in `formatted`
+/// that contains `anchor`, in source order. The owner's rendered text, not
+/// its source span, names the line: this is the computed oracle for
+/// `issue_3939_repro` below, never a string captured from any prior run.
+#[allow(clippy::expect_used)] // a missing anchor line is this helper's own bug to surface
+fn attach_at_owner_line(formatted: &str, placements: &[(&str, &str)]) -> String {
+    let mut lines: Vec<String> = formatted.lines().map(str::to_owned).collect();
+    let mut used = vec![false; lines.len()];
+    for (anchor, comment) in placements {
+        let idx = lines
+            .iter()
+            .enumerate()
+            .find(|(i, line)| !used[*i] && line.contains(anchor))
+            .map(|(i, _)| i)
+            .expect("anchor line exists in the formatted baseline");
+        used[idx] = true;
+        lines[idx] = format!("{} {comment}", lines[idx].trim_end());
+    }
+    let mut out = lines.join("\n");
+    if formatted.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// The issue's four reported shapes glued into one module: an import's
+/// trailing comment that must travel with it through the sort, a `case`
+/// arm's trailing comment that must not leak into the next arm, a list's
+/// closing-bracket comment that must not go free-floating, and a pipeline
+/// stage's comment that must not jump to the next stage. The oracle is
+/// computed from the comment-free formatting, never hand-written: this is
+/// what distinguishes a real fix from one tuned to the test's own string.
+#[test]
+fn issue_3939_repro() {
+    let without_comments = concat!(
+        "module Main exposing (Shape(..), area, main, xs)\n",
+        "\n",
+        "import Ipe.Task as Task\n",
+        "import Ipe.Io as Io\n",
+        "import Ipe.List as List\n\n",
+        "type Shape\n",
+        "    = Circle Float\n",
+        "    | Rect Float Float\n\n",
+        "area : Shape -> Float\n",
+        "area s =\n",
+        "    case s of\n",
+        "        Circle r -> 3.14 * r * r\n",
+        "        Rect w h -> w * h\n\n",
+        "xs : List Float\n",
+        "xs =\n",
+        "    [ 1, 2, 3 ]\n\n",
+        "main =\n",
+        "    xs\n",
+        "        |> List.map (\\x -> x + 1)\n",
+        "        |> List.sum\n",
+    );
+    let with_comments = concat!(
+        "module Main exposing (Shape(..), area, main, xs)\n",
+        "\n",
+        "import Ipe.Task as Task\n",
+        "import Ipe.Io as Io -- trailing import comment\n",
+        "import Ipe.List as List\n\n",
+        "type Shape\n",
+        "    = Circle Float\n",
+        "    | Rect Float Float\n\n",
+        "area : Shape -> Float\n",
+        "area s =\n",
+        "    case s of\n",
+        "        Circle r -> 3.14 * r * r   -- circle\n",
+        "        Rect w h -> w * h\n\n",
+        "xs : List Float\n",
+        "xs =\n",
+        "    [ 1, 2, 3 ]  -- list trailing\n\n",
+        "main =\n",
+        "    xs\n",
+        "        |> List.map (\\x -> x + 1) -- lambda\n",
+        "        |> List.sum\n",
+    );
+
+    let baseline = format(without_comments, "comment-free baseline formats");
+    let expected = attach_at_owner_line(
+        &baseline,
+        &[
+            ("as Io", "-- trailing import comment"),
+            ("r * r", "-- circle"),
+            ("1, 2, 3 ]", "-- list trailing"),
+            ("x + 1)", "-- lambda"),
+        ],
+    );
+    let actual = format(with_comments, "commented repro formats");
+    assert_eq!(actual, expected, "a comment left the construct it follows");
+    assert_eq!(format(&actual, "second pass"), actual, "not a fixed point");
+}
+
+/// One token before the body's last token — the position `issue_3939_repro`
+/// exercises — sits past the arrow, which is not node-final: a comment there
+/// is not Trailing. It must still land on the right construct, the arm it
+/// follows, demoted above its body, never swallowed into the next arm as the
+/// issue reported for a comment one line further down.
+#[test]
+fn a_comment_after_the_arrow_demotes_onto_its_own_arm() {
+    formats_to(
+        &format!(
+            "{HEAD}f x =\n    case x of\n        Circle r -> -- c\n            3.14 * r * r\n\n        _ ->\n            0\n"
+        ),
+        &format!(
+            "{HEAD}f x =\n    case x of\n        Circle r ->\n            -- c\n            3.14 * r * r\n\n        _ ->\n            0\n"
+        ),
+    );
+}

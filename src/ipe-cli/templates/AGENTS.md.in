@@ -1279,4 +1279,7 @@ cd my-app && ipe dev build        # → out/rust/, out/bin/my-app
 `ipe type-check` runs the same pipeline as `ipe dev build` up through type-checking,
 then stops — it emits no Rust and runs no `cargo`, so it is the fastest way to
 ask "does this program type-check?". Run `ipe fmt` after editing
-`.ipe`/`.ipei` files (formatter idempotent).
+`.ipe`/`.ipei` files (formatter idempotent). An end-of-line comment stays at
+the end of its line; after a pattern, a parameter, a type argument, or a
+module or import name — where the layout keeps the next code on the same
+line — it moves to its own line above that code.
