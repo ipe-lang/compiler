@@ -31,7 +31,7 @@ mod emit_console;
 mod emit_doc;
 mod emit_settings;
 pub use emit_settings::{
-    CrateName, EmitHost, EmitSettings, SINGLE_FILE_CRATE_NAME, TEST_CRATE_NAME,
+    CrateName, EmitHost, EmitSettings, SINGLE_FILE_CRATE_NAME, TEST_CRATE_NAME, TEST_RUN_KEY_ENV,
 };
 mod emit_expr;
 mod emit_model_gate;

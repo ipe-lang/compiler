@@ -759,6 +759,14 @@ the shared test build directory in the per-user cache
 
 another `ipe test` held the test build lock {path} for longer than {wall}; wait for it to finish, remove {path} if no `ipe test` is running, or set `CARGO_TARGET_DIR` to build elsewhere
 
+## cli-test-runner-stale
+
+the test runner at {binary} is not the one this run built, so it was not run; run `ipe test` again
+
+## cli-test-run-key-unavailable
+
+could not draw this `ipe test` run's key from the system random source: {kind}
+
 ## cli-bundled-manifest
 
 could not prepare the bundled runtime manifest: {detail}

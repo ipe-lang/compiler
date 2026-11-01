@@ -1364,8 +1364,9 @@ pub static EXCLUDED_NAMES: &[&str] = &[
     "IPE_TEST_INT_UNSET",
     "IPE_TEST_PG_URL",
     "IPE_TEST_REDIS_URL",
+    "IPE_TEST_RUN_KEY", // `ipe test`: the run key handed to the test runner crate at compile time
     "IPE_TIME_STRING_TZ_CHILD", // runtime time test: marks the non-UTC `TZ` re-exec
-    "IPE_TMP", // temp-root refusal tests: a neighbouring key that must not be refused
+    "IPE_TMP",          // temp-root refusal tests: a neighbouring key that must not be refused
     "IPE_WASI_SEAL_CHILD", // WASI seal e2e: marks the cargo-env re-exec
     "IPE_WINDOWS_E2E_ENV_CHILD", // Windows jail e2e: marks the env-seeded re-exec
     // Dev-loop-internal listener relocation port — set by `ipe dev watch` and the

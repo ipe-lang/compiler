@@ -97,6 +97,8 @@ fn load_error(err: &CliError) -> LoadError {
         | CliError::TargetDirUnlinkable { .. }
         | CliError::BundledManifest { .. }
         | CliError::TestTargetBusy { .. }
+        | CliError::TestRunnerStale { .. }
+        | CliError::TestRunKeyUnavailable { .. }
         | CliError::UnknownCode { .. }
         | CliError::DocNotFound { .. }
         | CliError::StaticRefusal(_)

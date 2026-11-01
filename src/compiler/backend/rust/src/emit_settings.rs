@@ -49,6 +49,14 @@ pub const SINGLE_FILE_CRATE_NAME: &str = "ipe-app";
 /// The crate name of the `ipe test` runner.
 pub const TEST_CRATE_NAME: &str = "ipe-test";
 
+/// The build-environment variable whose value the `ipe test` runner embeds.
+///
+/// The runner's `fn main` reads it through `env!`, so cargo records it as an
+/// environment dependency of the crate: a build under a different value always
+/// recompiles the runner, and the value lands in the binary for the driver to
+/// find before it runs it.
+pub const TEST_RUN_KEY_ENV: &str = "IPE_TEST_RUN_KEY";
+
 /// How the emitted program is hosted.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum EmitHost {

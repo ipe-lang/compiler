@@ -7,7 +7,7 @@ use super::{
     lowering_check_query, lowering_check_target, program_constructs_a_widget,
     resolve_vendored_runtime_dir, run_build, runtime_context_for_message, working_dir,
 };
-use crate::cargo_step::{CargoOutput, CargoTarget, Verbosity};
+use crate::cargo_step::{CargoOutput, CargoTarget, TestRunKey, Verbosity};
 use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths};
 use crate::project_root::{AnalysisTarget, FileArg, ProjectRoot, SourceDir};
 use crate::publisher::{AttestedActor, BlessedPublisher};
@@ -1477,16 +1477,21 @@ pub struct TestProgram<'a> {
 /// The build directory is held locked from before the build until the built
 /// binary is copied out ([`crate::target_dir::LinkableTargetDir::for_scratch`]),
 /// pinned or shared alike. Under that lock the crate's `Cargo.lock` is seeded
-/// from the directory's lock slot, every unit of the previous test runner is
-/// cleaned (so the verdict never comes from a stale test unit), the crate is
-/// built, its lock is stored back to the slot, and the binary is copied into a
-/// private directory. The copy runs after the lock is released, so no later
-/// build can replace the binary this run judges.
+/// from the directory's lock slot, the crate is built under a [`TestRunKey`]
+/// minted for this run, its lock is stored back to the slot, and the binary is
+/// copied into a private directory. The runner embeds the key and cargo tracks
+/// it as the crate's environment dependency, so this run's build always
+/// recompiles the runner; the copy is run only once it is found to carry this
+/// run's key, so the verdict never comes from another build's runner. The run
+/// starts after the lock is released, and no later build can replace the copy
+/// this run judges.
 ///
 /// # Errors
 /// The compile/build error on a compile or cargo failure; the refusals of
 /// [`crate::target_dir::LinkableTargetDir::for_scratch`];
+/// [`CliError::TestRunKeyUnavailable`] when the run's key cannot be minted;
 /// [`CliError::Io`] when the lock slot, the binary copy, or the spawn fails;
+/// the refusals of [`verify_test_runner_key`];
 /// [`CliError::TestFailed`] when the binary exits non-zero (a failing case, or
 /// a crash/signal with no exit code).
 pub fn build_and_run_test_entry(
@@ -1502,6 +1507,7 @@ pub fn build_and_run_test_entry(
         OutTarget::Scratch(out_scratch),
     )?;
 
+    let key = TestRunKey::fresh().map_err(|source| CliError::TestRunKeyUnavailable { source })?;
     let target = crate::target_dir::LinkableTargetDir::for_scratch(cargo_bin.path(), out_scratch)?;
     seed_test_lock(target.dir().path(), crate_dir.dir())?;
     let build = FlooredBuild {
@@ -1514,8 +1520,7 @@ pub fn build_and_run_test_entry(
         what: "the emitted test runner",
         runtime: runtime_context_for_message(),
     };
-    build.clean_package(ipe_backend_rust::TEST_CRATE_NAME)?;
-    build.run()?;
+    build.run_test_runner(&key)?;
     store_test_lock(target.dir().path(), crate_dir.dir())?;
 
     // Read the compiled binary back from the build directory the build was
@@ -1528,6 +1533,7 @@ pub fn build_and_run_test_entry(
         .map_err(|source| CliError::ScratchUnavailable { source })?;
     let bin = run_dir.path().join(&test_bin_name);
     fs::copy(&compiled, &bin).map_err(|e| io_err(&compiled, e))?;
+    verify_test_runner_key(&bin, &key, TEST_BINARY_SCAN_CEILING)?;
     drop(target.release());
 
     // Run the test binary. `Ipe.Test.runMain` exits 0 on all-pass, 1 on any
@@ -1544,6 +1550,81 @@ pub fn build_and_run_test_entry(
         // failure; classify the absent code as a failure, never a pass.
         let code = run_status.code().unwrap_or(1);
         Err(CliError::TestFailed { code })
+    }
+}
+
+/// The most bytes [`verify_test_runner_key`] reads of a test runner binary.
+pub const TEST_BINARY_SCAN_CEILING: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The bytes one read of a test runner scan fills.
+const TEST_BINARY_SCAN_CHUNK: usize = 64 * 1024;
+
+/// Refuse the test runner at `binary` unless it carries `key`'s marker.
+///
+/// The file is read once, in fixed chunks, up to its length when opened and
+/// never past `ceiling`; a marker spanning two chunks is found.
+///
+/// # Errors
+/// [`CliError::FileTooLarge`] when the file is longer than `ceiling`;
+/// [`CliError::Io`] when it cannot be opened or read;
+/// [`CliError::TestRunnerStale`] when it does not carry the marker.
+pub fn verify_test_runner_key(
+    binary: &Path,
+    key: &TestRunKey,
+    ceiling: u64,
+) -> Result<(), CliError> {
+    let file = fs::File::open(binary).map_err(|e| io_err(binary, e))?;
+    let len = file.metadata().map_err(|e| io_err(binary, e))?.len();
+    if len > ceiling {
+        return Err(CliError::FileTooLarge {
+            path: binary.to_path_buf(),
+            max: ceiling,
+        });
+    }
+    let marker = key.marker();
+    let found = std::io::Read::take(file, len);
+    if contains_marker(found, marker.as_bytes()).map_err(|e| io_err(binary, e))? {
+        Ok(())
+    } else {
+        Err(CliError::TestRunnerStale {
+            binary: style::TerminalSafe::sanitize(&binary.to_string_lossy()),
+        })
+    }
+}
+
+/// Whether `reader` yields `marker` anywhere in its bytes.
+///
+/// The read buffer holds one chunk after the last `marker.len() - 1` bytes of
+/// the previous one, so a marker split across two reads is still seen whole.
+fn contains_marker(mut reader: impl std::io::Read, marker: &[u8]) -> std::io::Result<bool> {
+    let Some(carried) = marker.len().checked_sub(1) else {
+        return Ok(true);
+    };
+    let mut window = vec![0u8; carried.saturating_add(TEST_BINARY_SCAN_CHUNK)];
+    let mut held = 0usize;
+    loop {
+        let Some(free) = window.get_mut(held..) else {
+            return Err(std::io::Error::other("scan window overrun"));
+        };
+        let read = match reader.read(free) {
+            Ok(0) => return Ok(false),
+            Ok(read) => read,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        let filled = held.saturating_add(read);
+        let Some(seen) = window.get(..filled) else {
+            return Err(std::io::Error::other("scan window overrun"));
+        };
+        if seen
+            .windows(marker.len())
+            .any(|candidate| candidate == marker)
+        {
+            return Ok(true);
+        }
+        let keep_from = filled.saturating_sub(carried);
+        window.copy_within(keep_from..filled, 0);
+        held = filled.saturating_sub(keep_from);
     }
 }
 
@@ -5051,6 +5132,118 @@ main =
         assert!(
             !program.contains("ipe_runtime::tea::WebApp("),
             "the served web app was emitted"
+        );
+    }
+}
+
+#[cfg(test)]
+mod test_runner_key_tests {
+    use super::*;
+
+    /// A private file holding `bytes`, removed with the returned directory.
+    #[allow(clippy::expect_used)] // test fixture: the scratch directory and write must succeed
+    fn runner_file(label: &str, bytes: &[u8]) -> (scratch::ScratchDir, PathBuf) {
+        let dir = scratch::ScratchDir::new(label).expect("scratch dir");
+        let path = dir.path().join("ipe-test");
+        fs::write(&path, bytes).expect("write runner");
+        (dir, path)
+    }
+
+    #[allow(clippy::expect_used)] // test fixture: the OS random source is available
+    fn key() -> TestRunKey {
+        TestRunKey::fresh().expect("random source")
+    }
+
+    /// A binary carrying this run's marker passes.
+    #[test]
+    fn a_runner_carrying_the_key_passes() {
+        let key = key();
+        let mut bytes = vec![0u8; 1000];
+        bytes.extend_from_slice(key.marker().as_bytes());
+        bytes.extend_from_slice(&[7u8; 1000]);
+        let (_dir, path) = runner_file("ipe-test-key-present", &bytes);
+        let verdict = verify_test_runner_key(&path, &key, TEST_BINARY_SCAN_CEILING);
+        assert!(verdict.is_ok(), "the marker is present: {verdict:?}");
+    }
+
+    /// A binary without this run's marker is refused, whatever other key it carries.
+    #[test]
+    fn a_runner_without_the_key_is_stale() {
+        let key = key();
+        let other = self::key();
+        assert!(other != key, "two minted keys differ");
+        let mut bytes = vec![0u8; 3 * TEST_BINARY_SCAN_CHUNK];
+        bytes.extend_from_slice(other.marker().as_bytes());
+        let (_dir, path) = runner_file("ipe-test-key-absent", &bytes);
+        let verdict = verify_test_runner_key(&path, &key, TEST_BINARY_SCAN_CEILING);
+        assert!(
+            matches!(verdict, Err(CliError::TestRunnerStale { .. })),
+            "a runner of another build must be refused: {verdict:?}"
+        );
+        let Err(stale) = verdict else { return };
+        assert!(
+            !stale.to_string().contains(&key.marker()),
+            "the refusal never echoes the key"
+        );
+    }
+
+    /// A marker split across two reads is found, at every split point.
+    #[test]
+    fn a_marker_straddling_a_chunk_boundary_is_found() {
+        let key = key();
+        let marker = key.marker();
+        for split in 1..marker.len() {
+            let mut bytes = vec![0u8; TEST_BINARY_SCAN_CHUNK - split];
+            bytes.extend_from_slice(marker.as_bytes());
+            bytes.extend_from_slice(&[0u8; 64]);
+            let (_dir, path) = runner_file("ipe-test-key-straddle", &bytes);
+            let verdict = verify_test_runner_key(&path, &key, TEST_BINARY_SCAN_CEILING);
+            assert!(verdict.is_ok(), "split at {split}: {verdict:?}");
+        }
+    }
+
+    /// A marker past the third chunk boundary, after carried windows, is found.
+    #[test]
+    fn a_marker_after_several_chunks_is_found() {
+        let key = key();
+        let mut bytes = vec![0u8; 3 * TEST_BINARY_SCAN_CHUNK - 5];
+        bytes.extend_from_slice(key.marker().as_bytes());
+        let (_dir, path) = runner_file("ipe-test-key-late", &bytes);
+        let verdict = verify_test_runner_key(&path, &key, TEST_BINARY_SCAN_CEILING);
+        assert!(verdict.is_ok(), "the marker is present: {verdict:?}");
+    }
+
+    /// A runner longer than the ceiling is refused with the typed limit, never read.
+    #[test]
+    fn a_runner_past_the_ceiling_is_refused() {
+        let key = key();
+        let mut bytes = key.marker().into_bytes();
+        bytes.extend_from_slice(&[0u8; 16]);
+        let (_dir, path) = runner_file("ipe-test-key-ceiling", &bytes);
+        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let over = verify_test_runner_key(&path, &key, len - 1);
+        assert!(
+            matches!(over, Err(CliError::FileTooLarge { max, .. }) if max == len - 1),
+            "one byte past the ceiling must be refused: {over:?}"
+        );
+        let at = verify_test_runner_key(&path, &key, len);
+        assert!(
+            at.is_ok(),
+            "a runner exactly at the ceiling is scanned: {at:?}"
+        );
+    }
+
+    /// The marker is the fixed prefix and 32 lowercase hex digits.
+    #[test]
+    fn the_marker_is_prefix_and_lowercase_hex() {
+        let marker = key().marker();
+        let hex = marker.strip_prefix("ipe-test-run-key:");
+        assert!(
+            hex.is_some_and(|hex| hex.len() == 32
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))),
+            "malformed marker: {marker}"
         );
     }
 }

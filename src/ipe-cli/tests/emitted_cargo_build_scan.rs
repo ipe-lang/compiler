@@ -9,9 +9,10 @@
 //!   `CargoBuild::command` and `WatchBuild::command` (every other cargo child
 //!   is held by `cargo_step_scan`);
 //! - constructing each value those two commands build from: a
-//!   `CargoCrate::Emitted` (only in `FlooredBuild::run`, which embeds the floor
-//!   its posture decides, `FlooredBuild::clean_package`, which builds no
-//!   binary, and the wasm bundlers, whose crates no native reader runs), a `WatchBuild` (only in the watch loop's `spawn_cargo_build`, from a
+//!   `CargoCrate::Emitted` (only in `FlooredBuild::run_for`, which embeds the
+//!   floor its posture decides, and the wasm bundlers, whose crates no native
+//!   reader runs), a `CargoCrate::TestRunner` (only in `FlooredBuild::run_for`),
+//!   a `WatchBuild` (only in the watch loop's `spawn_cargo_build`, from a
 //!   `DevMarkedCrate`), an `EmittedCrate` (only in `write_emitted_project`, which
 //!   wrote the floor it records) and a `DevMarkedCrate` (only in
 //!   `EmittedCrate::dev_marked`, which checks that floor).
@@ -23,7 +24,8 @@
 //! scan red. A site is any expression path, struct path or method name whose
 //! last segment is a held name, whatever its prefix (`CargoCrate::`, `Self::`,
 //! a glob import), a `Self { .. }` inside an `impl` of a held type, and any held
-//! token inside a macro body. A `use` naming `Emitted` or `build_command`, a
+//! token inside a macro body. A `use` naming `Emitted`, `TestRunner` or
+//! `build_command`, a
 //! renaming `use` and a type alias of any held name, a `#[path]` module and an
 //! `include!` (which would pull in source the walk never sees) are refused
 //! outright. Each site is keyed by its file, its enclosing item path and the
@@ -54,6 +56,7 @@ enum UsePolicy {
 /// [`UsePolicy::RenameRefused`] is a type, so a type alias of it is refused too.
 const HELD: &[(&str, UsePolicy)] = &[
     ("Emitted", UsePolicy::Refused),
+    ("TestRunner", UsePolicy::Refused),
     ("build_command", UsePolicy::Refused),
     ("WatchBuild", UsePolicy::RenameRefused),
     ("EmittedCrate", UsePolicy::RenameRefused),
@@ -80,11 +83,11 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
         "EmittedCrate",
         1,
     ),
-    ("driver/commands.rs", "FlooredBuild::run", "Emitted", 1),
+    ("driver/commands.rs", "FlooredBuild::run_for", "Emitted", 1),
     (
         "driver/commands.rs",
-        "FlooredBuild::clean_package",
-        "Emitted",
+        "FlooredBuild::run_for",
+        "TestRunner",
         1,
     ),
     ("driver/commands.rs", "bundle_wasm", "Emitted", 1),
@@ -546,8 +549,8 @@ fn scan_source(rel: &str, source: &str) -> syn::Result<(Vec<String>, Vec<String>
 fn admitted_with(rel: &str, extra: &str) -> String {
     let admitted = match rel {
         "driver/commands.rs" => {
-            "impl<'a> FlooredBuild<'a> { fn run(self) { let _ = CargoCrate::Emitted(self.crate_dir); } }\n\
-             impl FlooredBuild<'_> { fn clean_package(&self) { let _ = CargoCrate::Emitted(self.crate_dir); } }\n\
+            "impl<'a> FlooredBuild<'a> { fn run_for(self) { let _ = CargoCrate::Emitted(self.crate_dir); \
+             let _ = CargoCrate::TestRunner { dir: self.crate_dir, key }; } }\n\
              pub fn bundle_wasm(d: &OwnedDir) { let _ = CargoCrate::Emitted(d); }\n\
              pub fn bundle_wasi(d: &OwnedDir) { let _ = CargoCrate::Emitted(d); }\n"
         }
@@ -654,6 +657,22 @@ fn a_held_act_elsewhere_is_refused() {
         (
             "driver/commands.rs",
             "impl<'a> FlooredBuild<'a> { fn other(self) { let _ = CargoCrate::Emitted(d); } }",
+        ),
+        (
+            "driver/commands.rs",
+            "impl FlooredBuild<'_> { fn clean_package(&self) { let _ = CargoCrate::Emitted(d); } }",
+        ),
+        (
+            "driver/commands.rs",
+            "impl<'a> FlooredBuild<'a> { fn run(self) { let _ = CargoCrate::TestRunner { dir, key }; } }",
+        ),
+        (
+            "driver/commands_pkg.rs",
+            "fn build_and_run_test_entry() { let _ = CargoCrate::TestRunner { dir, key }; }",
+        ),
+        (
+            "driver/commands.rs",
+            "use crate::cargo_step::CargoCrate::TestRunner;",
         ),
         (
             "driver/commands.rs",

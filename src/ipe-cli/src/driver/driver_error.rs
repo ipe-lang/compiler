@@ -211,6 +211,19 @@ pub enum CliError {
         /// Why the manifest could not be prepared.
         fault: crate::runtime_embed::ManifestFault,
     },
+    /// The test runner `ipe test` was about to run does not carry the key of
+    /// this run's build.
+    ///
+    /// The binary was not executed: its verdict would belong to another build.
+    TestRunnerStale {
+        /// The binary found, as display text.
+        binary: TerminalSafe,
+    },
+    /// The system random source could not mint this `ipe test` run's key.
+    TestRunKeyUnavailable {
+        /// The random source's failure.
+        source: std::io::Error,
+    },
     /// Another `ipe test` held the shared test build directory past the wall.
     TestTargetBusy {
         /// The held lock file, as display text.
@@ -814,6 +827,8 @@ impl CliError {
             Self::TargetDirUnlinkable { .. } => "target-dir-unlinkable",
             Self::BundledManifest { .. } => "bundled-manifest",
             Self::TestTargetBusy { .. } => "test-target-busy",
+            Self::TestRunnerStale { .. } => "test-runner-stale",
+            Self::TestRunKeyUnavailable { .. } => "test-run-key-unavailable",
             Self::UnknownCode { .. } => "unknown-code",
             Self::DocNotFound { .. } => "doc-not-found",
             Self::StaticRefusal(_) => "static-refusal",
@@ -900,7 +915,9 @@ impl CliError {
                     }
                 }
             }
-            Self::RuntimeVersionMismatch { .. } | Self::BundledManifest { .. } => Internal,
+            Self::RuntimeVersionMismatch { .. }
+            | Self::BundledManifest { .. }
+            | Self::TestRunnerStale { .. } => Internal,
             Self::FfiPrep(refusal) => ffi_prep_fault(refusal),
             Self::Usage(_)
             | Self::ProjectRefused(_)
@@ -952,6 +969,7 @@ impl CliError {
             | Self::CargoBuildTimedOut { .. }
             | Self::TargetDirUnlinkable { .. }
             | Self::TestTargetBusy { .. }
+            | Self::TestRunKeyUnavailable { .. }
             | Self::ChildPipeHeld(_)
             | Self::ThreadRefused { .. }
             | Self::ChildPipeUnread(..)
@@ -1048,6 +1066,10 @@ impl std::fmt::Display for CliError {
             Self::Io { path, source } => fmt_io_error(path, source, f),
             Self::ScratchUnavailable { source } => {
                 f.write_str(&text::cli_scratch_unavailable(&source.kind()))
+            }
+            Self::TestRunnerStale { binary } => f.write_str(&text::cli_test_runner_stale(binary)),
+            Self::TestRunKeyUnavailable { source } => {
+                f.write_str(&text::cli_test_run_key_unavailable(&source.kind()))
             }
             Self::Pipeline { file, src, diag } => {
                 f.write_str(&render(diag, &file.to_string_lossy(), src))

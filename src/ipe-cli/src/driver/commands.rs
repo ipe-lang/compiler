@@ -12,7 +12,8 @@ use ipe_diagnostics::suggest;
 
 use crate::api_surface::ModulePath;
 use crate::cargo_step::{
-    CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, EmbeddedApp, Verbosity,
+    CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, EmbeddedApp, TestRunKey,
+    Verbosity,
 };
 use crate::delivery::HostIntent;
 use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths};
@@ -1275,6 +1276,23 @@ impl FlooredBuild<'_> {
     /// [`run_sandbox::write_build_artifacts`],
     /// [`run_sandbox::write_dev_floor_marker`] and [`CargoBuild::run`].
     pub(crate) fn run(self) -> Result<String, CliError> {
+        self.run_for(None)
+    }
+
+    /// [`Self::run`] for the `ipe test` runner, built under `key`.
+    ///
+    /// The build hands `key`'s marker to the runner, which embeds it; cargo
+    /// records the variable as the crate's environment dependency, so a run
+    /// under a fresh key always recompiles the runner.
+    ///
+    /// # Errors
+    /// The errors of [`Self::run`].
+    pub(crate) fn run_test_runner(self, key: &TestRunKey) -> Result<String, CliError> {
+        self.run_for(Some(key))
+    }
+
+    /// [`Self::run`], building the runner under `key` when one is given.
+    fn run_for(self, key: Option<&TestRunKey>) -> Result<String, CliError> {
         let crate_dir = self.crate_dir.dir();
         let profile = match (self.crate_dir.floor(), self.finish) {
             (run_sandbox::EmitFloor::DevelopmentMarker, NativeFinish::Dev) => {
@@ -1304,9 +1322,15 @@ impl FlooredBuild<'_> {
                 ));
             }
         };
+        let krate = key.map_or(CargoCrate::Emitted(crate_dir), |key| {
+            CargoCrate::TestRunner {
+                dir: crate_dir,
+                key,
+            }
+        });
         CargoBuild {
             cargo: self.cargo,
-            krate: CargoCrate::Emitted(crate_dir),
+            krate,
             profile,
             target: self.target,
             target_dir: self.target_dir,
@@ -1315,31 +1339,6 @@ impl FlooredBuild<'_> {
             runtime: self.runtime,
         }
         .run()
-    }
-
-    /// Remove every compiled unit of `package` from the build directory, ahead of [`Self::run`].
-    ///
-    /// The clean builds no binary, so it writes no floor; it runs in the
-    /// profile the finish picks, against the same crate and directory.
-    ///
-    /// # Errors
-    /// The errors of [`CargoBuild::clean_package`].
-    pub(crate) fn clean_package(&self, package: &str) -> Result<(), CliError> {
-        let profile = match self.finish {
-            NativeFinish::Dev => CargoProfile::Dev,
-            NativeFinish::Release { .. } => CargoProfile::Release,
-        };
-        CargoBuild {
-            cargo: self.cargo,
-            krate: CargoCrate::Emitted(self.crate_dir.dir()),
-            profile,
-            target: self.target,
-            target_dir: self.target_dir,
-            output: self.output,
-            what: self.what,
-            runtime: None,
-        }
-        .clean_package(package)
     }
 }
 
