@@ -136,6 +136,7 @@ checks:
           env:
             IPE_E2E: "1"
             IPE_RUNTIME_DIR: "{repo_root}/src/runtime/rust/src"
+            IPE_ORACLE_SHARED_TARGET: "{oracle_target}"
     aggregates: [test-prep, test-run, wasi-run, windows-test]
   - context: artifact-guard
     disposition: gate
@@ -349,6 +350,7 @@ checks:
           env:
             IPE_E2E: "1"
             IPE_RUNTIME_DIR: "{repo_root}/src/runtime/rust/src"
+            IPE_ORACLE_SHARED_TARGET: "{oracle_target}"
     aggregates: [registry-admission-run]
   - context: release-targets
     disposition: gate
@@ -563,6 +565,7 @@ checks:
           env:
             IPE_E2E: "1"
             IPE_RUNTIME_DIR: "{repo_root}/src/runtime/rust/src"
+            IPE_ORACLE_SHARED_TARGET: "{oracle_target}"
           differs: CI runs the same suite from one archive split into cost-balanced shard groups
     guards: >-
       SEAL, and Security — the vendored-emit SEAL, the real Linux x64 build

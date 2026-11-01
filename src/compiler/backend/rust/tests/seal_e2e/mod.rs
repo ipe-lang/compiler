@@ -8,9 +8,7 @@
 //! library module and excludes it from the test-binary discovery pass.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use e2e_support::child_shared_target_from_env;
 use ipe_backend::EmittedProject;
 use ipe_diagnostics::{DResult, Diagnostic};
 
@@ -34,18 +32,15 @@ pub fn copy_dir(src: &Path, dst: &Path) -> DResult<()> {
     Ok(())
 }
 
-/// Write `emitted` into a fresh temp directory named `slot`, vendor the runtime
-/// beside it, run `cargo <subcmd>`, and return the process exit status.
-#[allow(dead_code)]
+/// Write `emitted` into a fresh temp directory named `slot` and vendor the
+/// runtime source tree beside it. Returns the project root.
 ///
-/// Callers pass `"build"` or `"run"` as `subcmd` and `runtime` from
-/// `e2e_support::require_runtime`.
-pub fn vendor_and_run(
-    emitted: &EmittedProject,
-    runtime: &Path,
-    slot: &str,
-    subcmd: &str,
-) -> DResult<std::io::Result<std::process::ExitStatus>> {
+/// Exposed for the rare caller that must drive `e2e_support::target`'s
+/// low-level `cargo_command`/`isolated` directly rather than
+/// [`build_emitted`]/[`build_and_run_emitted`] — e.g. a test whose own
+/// assertion depends on the package keeping its EXACT emitted name, which
+/// `e2e_support`'s per-golden rename would otherwise mask.
+pub fn vendor_into(emitted: &EmittedProject, runtime: &Path, slot: &str) -> DResult<PathBuf> {
     let out = ipe_test_temp::temp_root().join(slot);
     let _ = std::fs::remove_dir_all(&out);
     let src = out.join("src");
@@ -62,67 +57,55 @@ pub fn vendor_and_run(
         }
         std::fs::write(&path, contents).map_err(|e| io_bug(&path, &e))?;
     }
-
-    // Forward the warm shared target when CI exports `IPE_ORACLE_SHARED_TARGET`,
-    // else fall back to an isolated per-slot target so a bare local run stays
-    // hermetic. The shared target lets heavy dep crates (tokio, axum, runtime)
-    // reuse already-compiled artifacts rather than cold-building per test.
-    let shared = child_shared_target_from_env();
-    let target_dir = shared
-        .as_deref()
-        .map_or_else(|| out.join("target"), PathBuf::from);
-    let status = Command::new("cargo")
-        .arg(subcmd)
-        .current_dir(&out)
-        .env("CARGO_TARGET_DIR", &target_dir)
-        .status();
-    // Only prune an isolated per-slot target; the shared warm target is owned
-    // by the harness and must not be removed here.
-    if shared.is_none() {
-        let _ = std::fs::remove_dir_all(&target_dir);
-    }
-    Ok(status)
+    Ok(out)
 }
 
-/// Resolve the `CARGO_TARGET_DIR` for a hand-rolled emitted-crate build.
+/// Vendor `emitted` into a fresh temp directory named `slot` and build it
+/// through the one typed build decision point (`e2e_support::target`), never a
+/// hand-rolled `Command::new("cargo")`. The base emit template
+/// (`backend/rust/templates/Cargo.toml`) declares no explicit `[[bin]]` and no
+/// `autobins = false`, so cargo's implicit convention ties the binary name to
+/// `[package] name` — and `e2e_support` renames the package per golden, so a
+/// shared target's binary artifact can never collide with a sibling's.
 ///
-/// When CI exports `IPE_ORACLE_SHARED_TARGET` (an absolute path), returns that
-/// path so the emitted crate's deps link against the warm shared tree rather than
-/// cold-building. Falls back to an ambient `CARGO_TARGET_DIR` a local lane set,
-/// then to `out_dir.join("target")` for a bare local run (hermetic, isolated).
-///
-/// Callers that prune the target after the build must check whether the returned
-/// path equals `out_dir.join("target")` before removing it — the shared warm
-/// target must never be pruned here.
-///
-/// This is the BUILD-ONLY target: use it only for a SEAL test that builds an
-/// emitted crate and never executes the resulting binary. A test that RUNS
-/// `debug/ipe-app` and asserts its output must instead use
-/// [`emitted_run_target_dir`] — the shared target holds a single, fixed-name
-/// `debug/ipe-app`, so under parallel nextest one run-output test would execute
-/// a binary a concurrent sibling just overwrote.
-#[must_use]
-#[allow(dead_code)]
-pub fn emitted_target_dir(out_dir: &Path) -> PathBuf {
-    child_shared_target_from_env().map_or_else(|| out_dir.join("target"), PathBuf::from)
+/// Build-only: use this for a SEAL test that proves the emitted crate
+/// `cargo build`s without executing the resulting binary. Use
+/// [`build_and_run_emitted`] for a test that also runs it.
+#[allow(dead_code)] // only some SEAL test binaries that `mod seal_e2e;` build-only
+pub fn build_emitted(
+    emitted: &EmittedProject,
+    runtime: &Path,
+    slot: &str,
+) -> DResult<Result<e2e_support::SharedBuild, String>> {
+    let out = vendor_into(emitted, runtime, slot)?;
+    Ok(e2e_support::build_rust_binary(slot, &out))
 }
 
-/// Resolve the `CARGO_TARGET_DIR` for a SEAL test that RUNS the emitted binary
-/// and asserts its stdout/exit.
-///
-/// ALWAYS an isolated per-slot `out_dir/target`, never the shared warm target:
-/// every emitted crate builds a fixed-name `ipe-app`, so the shared target's
-/// `debug/ipe-app` is a single file that concurrent tests clobber. A run-output
-/// test must execute ITS OWN binary — a path no sibling can write — or it can
-/// read a clobbered binary's output (a false red, or the worse false green where
-/// the wrong binary happens to print the expected value, masking an emit bug).
-/// The shared warm target's dep-cache speedup is reserved for build-only tests
-/// (see [`emitted_target_dir`]); a run-output test cold-builds its deps, which is
-/// the price of an un-clobberable binary path.
-#[must_use]
-#[allow(dead_code)]
-pub fn emitted_run_target_dir(out_dir: &Path) -> PathBuf {
-    out_dir.join("target")
+/// Vendor `emitted` into a fresh temp directory named `slot`, build it, and run
+/// the resulting binary — through `e2e_support::build_and_run_rust`, the one
+/// typed build-and-run decision point. See [`build_emitted`] for why the
+/// per-golden package rename makes this safe under a shared target.
+#[allow(dead_code)] // only some SEAL test binaries that `mod seal_e2e;` build-and-run
+pub fn build_and_run_emitted(
+    emitted: &EmittedProject,
+    runtime: &Path,
+    slot: &str,
+) -> DResult<Result<e2e_support::RunResult, String>> {
+    let out = vendor_into(emitted, runtime, slot)?;
+    Ok(e2e_support::build_and_run_rust(slot, &out))
+}
+
+/// [`build_and_run_emitted`], with `envs` additionally set on the `cargo
+/// build` invocation (e.g. `RUSTFLAGS` for an overflow-checks SEAL).
+#[allow(dead_code)] // only the one SEAL test binary that needs a build-time env var
+pub fn build_and_run_emitted_with_env(
+    emitted: &EmittedProject,
+    runtime: &Path,
+    slot: &str,
+    envs: &[(&str, &str)],
+) -> DResult<Result<e2e_support::RunResult, String>> {
+    let out = vendor_into(emitted, runtime, slot)?;
+    Ok(e2e_support::build_and_run_rust_with_env(slot, &out, envs))
 }
 
 /// Wrap a filesystem error as a `CompilerBug` diagnostic.
@@ -130,5 +113,16 @@ pub fn io_bug(path: &Path, e: &std::io::Error) -> Diagnostic {
     Diagnostic::CompilerBug {
         where_: "seal e2e io",
         detail: format!("{}: {e}", path.display()),
+    }
+}
+
+/// Wrap an `e2e_support` build/run failure (its `String` error) as a
+/// `CompilerBug` diagnostic, so a caller can propagate it with `?` instead of
+/// `.unwrap()`/`.expect()`/`panic!`.
+#[allow(dead_code)] // only the SEAL test binaries that convert a build/run Err use this
+pub const fn build_bug(e: String) -> Diagnostic {
+    Diagnostic::CompilerBug {
+        where_: "seal e2e build",
+        detail: e,
     }
 }

@@ -5,7 +5,6 @@
 //! are unconditionally active.
 
 use std::fs;
-use std::path::PathBuf;
 
 use ipe::project_root::SourceTree;
 use ipe::{RootFixture, build_fixture};
@@ -97,15 +96,19 @@ fn run_subcommand_builds_and_executes_hello_program() {
             panic!("ipe dev build step must succeed: {built:?}")
         };
 
-        // Forward the warm shared target (IPE_ORACLE_SHARED_TARGET in CI, else an
-        // ambient CARGO_TARGET_DIR a local lane set); fall back to an isolated
-        // dir inside out_dir so a bare local run stays hermetic.
-        let target_dir = e2e_support::child_shared_target_from_env()
-            .map_or_else(|| out_dir.join("target"), PathBuf::from);
-        let cargo_status = std::process::Command::new("cargo")
+        // `ipe dev build`/`ipe dev run` emit the fixed package `ipe-app`: an
+        // exclusive tree avoids colliding with a concurrent same-shaped test
+        // over the same package name in the shared target. Removed on drop,
+        // after the run below reads the binary out of it.
+        let isolated =
+            e2e_support::target::isolated(e2e_support::target::IsolationReason::FixedPackageName);
+        let Ok(isolated) = isolated else {
+            panic!("isolated build target: {isolated:?}")
+        };
+        let target = e2e_support::target::BuildTarget::Isolated(isolated);
+        let cargo_status = e2e_support::target::cargo_command(&target)
             .arg("build")
             .current_dir(&out_dir)
-            .env("CARGO_TARGET_DIR", &target_dir)
             .status();
         assert!(
             matches!(&cargo_status, Ok(s) if s.success()),
@@ -113,7 +116,7 @@ fn run_subcommand_builds_and_executes_hello_program() {
         );
 
         // --- Step 3: run the binary, capture stdout ---
-        let bin = built.binary_in(&target_dir.join("debug"));
+        let bin = built.binary_in(&target.path().join("debug"));
         let Ok(bin) = bin else {
             panic!("the emitted binary name must read: {bin:?}")
         };
@@ -127,12 +130,6 @@ fn run_subcommand_builds_and_executes_hello_program() {
             "hello from run\n",
             "ipec run e2e: stdout mismatch"
         );
-
-        // Prune only an isolated per-test target; a shared warm target is owned by
-        // the harness and must not be removed here.
-        if e2e_support::child_shared_target_from_env().is_none() {
-            let _ = fs::remove_dir_all(&target_dir);
-        }
     }
 }
 
@@ -274,10 +271,20 @@ fn run_without_cargo_reports_the_missing_toolchain() {
     assert!(created.is_ok(), "write empty home: {created:?}");
 
     let ipe_bin = e2e_support::cargo_bin!("ipe");
+    // `ipe dev run` emits the fixed package `ipe-app`; an exclusive tree keeps
+    // this test from colliding with a concurrent same-shaped test over the
+    // same package name — even though this run never reaches a build, since
+    // the missing toolchain is caught first.
+    let isolated =
+        e2e_support::target::isolated(e2e_support::target::IsolationReason::FixedPackageName);
+    let Ok(isolated) = isolated else {
+        panic!("isolated build target: {isolated:?}")
+    };
+    let target = e2e_support::target::BuildTarget::Isolated(isolated);
     // A minimal PATH with no cargo. `/nonexistent-ipe-cargo-probe` cannot hold
     // any executable, so cargo is unresolvable on the PATH.
     let cargoless_path = "/nonexistent-ipe-cargo-probe";
-    let out = std::process::Command::new(ipe_bin)
+    let out = e2e_support::target::ipe_command(ipe_bin.path(), &target)
         .args(["dev", "run", &fixture.path().to_string_lossy(), "--out"])
         .arg(dir.join("out"))
         .env("PATH", cargoless_path)

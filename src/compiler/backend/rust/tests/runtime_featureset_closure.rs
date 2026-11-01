@@ -1181,11 +1181,12 @@ fn email_parse_address_only_cargo_builds() -> DResult<()> {
     };
 
     let emitted = RustBackend::new(&interner).emit(&prog)?;
-    let status = seal_e2e::vendor_and_run(&emitted, &runtime, "ipe_email_parse_only_e2e", "build")?;
+    let built = seal_e2e::build_emitted(&emitted, &runtime, "ipe_email_parse_only_e2e")?;
     assert!(
-        matches!(&status, Ok(s) if s.success()),
+        built.is_ok(),
         "an Email.parseAddress-only (no Email.send) program must cargo build; \
-         email feature must be enabled by uses_email=true: {status:?}"
+         email feature must be enabled by uses_email=true: {:?}",
+        built.err()
     );
     Ok(())
 }

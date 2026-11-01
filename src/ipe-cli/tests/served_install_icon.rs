@@ -173,7 +173,7 @@ fn an_installable_build_serves_its_manifest_and_icon() {
         .and_then(|l| l.local_addr())
         .expect("an ephemeral port")
         .port();
-    let _app = App(Command::new(exe)
+    let _app = App(Command::new(&exe)
         .env("IPE_WEB_PORT", port.to_string())
         .env("IPE_CSRF", "off")
         .env("IPE_CONSOLE_EMBED", "off")

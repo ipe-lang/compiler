@@ -66,7 +66,7 @@ pub fn e2e_tier() -> Tier {
 
 /// Fail the calling test with `msg`.
 #[allow(clippy::panic)] // a failed artifact resolution IS a failed test: the designed outcome
-fn fail(msg: fmt::Arguments<'_>) -> ! {
+pub(crate) fn fail(msg: fmt::Arguments<'_>) -> ! {
     // IPE-RUST-AUDIT:ACCEPTED — test-support failure path; a panic fails the calling test
     panic!("{msg}")
 }

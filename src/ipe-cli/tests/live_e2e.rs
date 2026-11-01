@@ -350,7 +350,10 @@ fn dev_loop_options() -> ipe::BuildOptions {
 /// # Errors
 ///
 /// Returns an error on any pipeline or Cargo build failure.
-fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<PathBuf, BoxError> {
+fn compile_and_build(
+    test_name: &str,
+    ipe_source: &str,
+) -> Result<e2e_support::SharedBuild, BoxError> {
     let fixture = ipe::RootFixture::main(ipe_source).map_err(|e| -> BoxError {
         format!("{test_name}: cannot write the fixture: {e}").into()
     })?;
@@ -367,7 +370,7 @@ fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<PathBuf, BoxEr
     let exe = e2e_support::build_rust_binary(test_name, &out_dir)
         .map_err(|e| -> BoxError { format!("{test_name}: cargo build failed: {e}").into() })?;
 
-    Ok(PathBuf::from(exe))
+    Ok(exe)
 }
 
 /// Reserve an ephemeral loopback port by binding then immediately dropping a
@@ -2634,7 +2637,7 @@ fn geo_clipboard_manifest() -> PathBuf {
 /// Uses `ipe::build_project_with_options` (not `ipe::build_with_options`) so
 /// the capabilities consent gate is applied: without the `accepts = [JsPort Geolocation, JsPort
 /// Clipboard, JsPort Raw]` grant the build must fail closed (IPE-S0002).
-fn compile_and_build_geo_clipboard() -> Result<PathBuf, BoxError> {
+fn compile_and_build_geo_clipboard() -> Result<e2e_support::SharedBuild, BoxError> {
     let manifest = geo_clipboard_manifest();
     let manifest = manifest.canonicalize().map_err(|e| -> BoxError {
         format!(
@@ -2658,7 +2661,7 @@ fn compile_and_build_geo_clipboard() -> Result<PathBuf, BoxError> {
     let exe = e2e_support::build_rust_binary("geo_clipboard", &out_dir)
         .map_err(|e| -> BoxError { format!("geo-clipboard: cargo build failed: {e}").into() })?;
 
-    Ok(PathBuf::from(exe))
+    Ok(exe)
 }
 
 /// BUILD-ONLY: the geo-clipboard example compiles end-to-end through
@@ -2780,7 +2783,7 @@ fn gamepad_watch_manifest() -> PathBuf {
 /// Uses `ipe::build_project` so the capabilities consent gate is applied:
 /// without the `accepts = [JsPort Gamepad, JsPort Raw]` grant the build must
 /// fail closed (IPE-S0002).
-fn compile_and_build_gamepad_watch() -> Result<PathBuf, BoxError> {
+fn compile_and_build_gamepad_watch() -> Result<e2e_support::SharedBuild, BoxError> {
     let manifest = gamepad_watch_manifest();
     let manifest = manifest.canonicalize().map_err(|e| -> BoxError {
         format!(
@@ -2804,7 +2807,7 @@ fn compile_and_build_gamepad_watch() -> Result<PathBuf, BoxError> {
     let exe = e2e_support::build_rust_binary("gamepad_watch", &out_dir)
         .map_err(|e| -> BoxError { format!("gamepad-watch: cargo build failed: {e}").into() })?;
 
-    Ok(PathBuf::from(exe))
+    Ok(exe)
 }
 
 /// BUILD-ONLY: the gamepad-watch example compiles end-to-end through
@@ -2858,7 +2861,7 @@ fn recorder_stream_manifest() -> PathBuf {
 /// Uses `ipe::build_project` so the capabilities consent gate is applied:
 /// without the `accepts = [JsPort Recorder, JsPort Raw]` grant the build must
 /// fail closed (IPE-S0002).
-fn compile_and_build_recorder_stream() -> Result<PathBuf, BoxError> {
+fn compile_and_build_recorder_stream() -> Result<e2e_support::SharedBuild, BoxError> {
     let manifest = recorder_stream_manifest();
     let manifest = manifest.canonicalize().map_err(|e| -> BoxError {
         format!(
@@ -2882,7 +2885,7 @@ fn compile_and_build_recorder_stream() -> Result<PathBuf, BoxError> {
     let exe = e2e_support::build_rust_binary("recorder_stream", &out_dir)
         .map_err(|e| -> BoxError { format!("recorder-stream: cargo build failed: {e}").into() })?;
 
-    Ok(PathBuf::from(exe))
+    Ok(exe)
 }
 
 /// BUILD-ONLY: the recorder-stream example compiles end-to-end through
@@ -2938,7 +2941,7 @@ fn web_authn_manifest() -> PathBuf {
 /// Uses `ipe::build_project` so the capabilities consent gate is applied:
 /// without the `accepts = [JsPort WebAuthn, JsPort Raw]` grant the build must
 /// fail closed (IPE-S0002).
-fn compile_and_build_web_authn() -> Result<PathBuf, BoxError> {
+fn compile_and_build_web_authn() -> Result<e2e_support::SharedBuild, BoxError> {
     let manifest = web_authn_manifest();
     let manifest = manifest.canonicalize().map_err(|e| -> BoxError {
         format!(
@@ -2961,7 +2964,7 @@ fn compile_and_build_web_authn() -> Result<PathBuf, BoxError> {
     let exe = e2e_support::build_rust_binary("web_authn", &out_dir)
         .map_err(|e| -> BoxError { format!("web-authn: cargo build failed: {e}").into() })?;
 
-    Ok(PathBuf::from(exe))
+    Ok(exe)
 }
 
 /// BUILD-ONLY: the web-authn example compiles end-to-end through

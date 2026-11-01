@@ -27,7 +27,7 @@ fn repo_root() -> PathBuf {
 
 /// Run `exe` with one session env var set and `stdin` piped, returning
 /// `(exit code, stdout)`.
-fn run_with(exe: &str, var: &str, value: &Path, stdin: &[u8]) -> Option<(Option<i32>, String)> {
+fn run_with(exe: &Path, var: &str, value: &Path, stdin: &[u8]) -> Option<(Option<i32>, String)> {
     use std::io::Write as _;
     let mut child = Command::new(exe)
         .env(var, value)
@@ -138,7 +138,7 @@ fn record_then_replay_is_deterministic_and_refuses_bad_logs() {
 }
 
 /// A log from a changed program or a truncated log is refused, printing nothing.
-fn assert_bad_logs_are_refused(exe: &str, logs: &Path, typed: &Path) {
+fn assert_bad_logs_are_refused(exe: &Path, logs: &Path, typed: &Path) {
     // A changed program: the log's Msg tag no longer matches.
     let text = std::fs::read_to_string(typed).unwrap_or_default();
     assert!(

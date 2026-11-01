@@ -224,13 +224,13 @@ fn sync_file(src: &Path, dst: &Path) -> Result<usize, String> {
 
 /// Like [`sync_file`] but normalises the emitted `Cargo.toml` text before
 /// comparing and writing: the `ipe-runtime-rust` dependency `path = "<abs>"`
-/// is replaced with [`e2e_support::RUNTIME_PATH_PLACEHOLDER`] so the blessed
+/// is replaced with [`ipe_backend_rust::golden_form::RUNTIME_PATH_PLACEHOLDER`] so the blessed
 /// golden is portable across machines and a regen is idempotent (`git diff`
 /// stays empty on an unchanged compiler).
 fn sync_cargo_toml(src: &Path, dst: &Path) -> Result<usize, String> {
     let raw = std::fs::read_to_string(src)
         .map_err(|e| format!("cannot read emitted {}: {e}", src.display()))?;
-    let want = e2e_support::normalize_runtime_dep_path(&raw);
+    let want = ipe_backend_rust::golden_form::golden_cargo_toml(&raw);
     if let Ok(existing) = std::fs::read_to_string(dst)
         && existing == want
     {

@@ -273,7 +273,7 @@ fn param_route_solo_cargo_builds_and_delivers_param() {
         "#108 hole 3: the param-route project must cargo-build\n{}",
         built.as_ref().err().cloned().unwrap_or_default(),
     );
-    let exe = built.unwrap_or_default();
+    let exe = built.expect("asserted Ok above");
 
     // Ephemeral port: bind-then-drop.
     let port = {
