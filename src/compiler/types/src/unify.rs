@@ -27,14 +27,14 @@
 
 use std::collections::BTreeMap;
 
-use ipe_diagnostics::{DResult, Diagnostic, Span, TypeError};
+use ipe_diagnostics::{ArgCount, DResult, Diagnostic, Span, TypeClass, TypeError};
 use ipe_intern::Interner;
 
 use crate::constrain::zonk_reported;
 use crate::doc::{VarNamer, ty_to_doc};
 use crate::homed::{InferError, ModuleHome};
-use crate::solve::Budget;
-use crate::ty::{Content, FlatType, Ty, TyBounds};
+use crate::solve::{Budget, CalleeName, Constraint, ConstraintOrigin};
+use crate::ty::{Content, FlatType, SolverVar, Ty, TyBounds};
 use crate::unionfind::{UnionFind, VarId};
 
 /// Whether a concrete structure `flat` satisfies a variable's super-type
@@ -196,6 +196,209 @@ pub fn unify_at(
     unify(uf, budget, interner, span, a, b).map_err(|diag| InferError::sited(diag, home))
 }
 
+/// Solve one constraint, siting any failure in the constraint's module.
+///
+/// A failed call constraint whose types show an arity fault — a callee given
+/// more arguments than its type takes, or a call's still-a-function result
+/// used where a value is expected — reads as [`TypeError::CallArity`] instead
+/// of the bare shape mismatch.
+///
+/// # Errors
+/// As [`unify_at`].
+pub fn unify_constraint(
+    uf: &mut UnionFind<Content>,
+    budget: &mut Budget,
+    interner: &Interner,
+    c: &Constraint,
+) -> Result<(), InferError> {
+    match unify(uf, budget, interner, c.span, c.lhs, c.rhs) {
+        Ok(()) => Ok(()),
+        Err(diag) => {
+            let diag = if matches!(
+                diag,
+                Diagnostic::Type {
+                    msg: TypeError::TypeMismatch { .. },
+                    ..
+                }
+            ) {
+                call_arity(uf, budget, interner, c).unwrap_or(diag)
+            } else {
+                diag
+            };
+            Err(InferError::sited(diag, &c.home))
+        }
+    }
+}
+
+/// The [`TypeError::CallArity`] a failed call constraint `c` amounts to, or
+/// `None` when its types show no arity fault.
+///
+/// A read-back failure surfaces as that bug.
+fn call_arity(
+    uf: &mut UnionFind<Content>,
+    budget: &mut Budget,
+    interner: &Interner,
+    c: &Constraint,
+) -> Option<Diagnostic> {
+    let (site, takes) = match c.origin {
+        ConstraintOrigin::Plain => return None,
+        ConstraintOrigin::CallShape(site) => {
+            let callee = match zonk_reported(uf, budget, c.lhs, c.span) {
+                Ok(t) => t,
+                Err(bug) => return Some(bug),
+            };
+            let takes = arrow_count(&callee);
+            if takes >= site.given {
+                return None;
+            }
+            (site, takes)
+        }
+        ConstraintOrigin::CallResult(site) => {
+            let found = match zonk_reported(uf, budget, c.lhs, c.span) {
+                Ok(t) => t,
+                Err(bug) => return Some(bug),
+            };
+            let expected = match zonk_reported(uf, budget, c.rhs, c.span) {
+                Ok(t) => t,
+                Err(bug) => return Some(bug),
+            };
+            let missing = missing_args(&found, &expected)?;
+            (site, site.given.checked_add(missing)?)
+        }
+    };
+    let count = ArgCount::new(takes, site.given)?;
+    let callee_ty = match zonk_reported(uf, budget, site.callee, c.span) {
+        Ok(t) => t,
+        Err(bug) => return Some(bug),
+    };
+    let mut namer = VarNamer::with_classes(owed_classes(uf, &[&callee_ty]));
+    let signature = match ty_to_doc(&callee_ty, interner, &mut namer) {
+        Ok(d) => d,
+        Err(bug) => return Some(bug),
+    };
+    Some(Diagnostic::Type {
+        span: c.span,
+        msg: TypeError::CallArity {
+            callee: site.name.and_then(|name| callee_label(interner, name)),
+            count,
+            signature: Box::new(signature),
+        },
+    })
+}
+
+/// How many arrows `ty`'s spine carries: the arguments it takes.
+fn arrow_count(ty: &Ty) -> usize {
+    let mut takes = 0_usize;
+    let mut rest = ty;
+    while let Ty::Fun(_, result) = rest {
+        takes = takes.saturating_add(1);
+        rest = result;
+    }
+    takes
+}
+
+/// How many more arguments `found` needs before its result is exactly
+/// `expected`, or `None` when no prefix of its arrows reaches `expected`.
+fn missing_args(found: &Ty, expected: &Ty) -> Option<usize> {
+    let mut missing = 0_usize;
+    let mut rest = found;
+    while let Ty::Fun(_, result) = rest {
+        missing = missing.checked_add(1)?;
+        if **result == *expected {
+            return Some(missing);
+        }
+        rest = result;
+    }
+    None
+}
+
+/// A named callee as the user reads it: `greet`, or `List.sum` qualified by
+/// the last segment of its module.
+fn callee_label(interner: &Interner, callee: CalleeName) -> Option<Box<str>> {
+    let name = interner.resolve(callee.name)?;
+    let Some(qualifier) = callee.qualifier else {
+        return Some(name.into());
+    };
+    let module = interner.resolve(qualifier)?;
+    let last = module.rsplit('.').next().unwrap_or(module);
+    Some(format!("{last}.{name}").into_boxed_str())
+}
+
+/// The class a variable owing `bounds` is named after: the first of number,
+/// comparable, appendable, equatable it owes.
+const fn owed_class(bounds: TyBounds) -> Option<TypeClass> {
+    if bounds.has_number() {
+        Some(TypeClass::Number)
+    } else if bounds.has_ord() || bounds.has_comparable_key() {
+        Some(TypeClass::Comparable)
+    } else if bounds.has_append() {
+        Some(TypeClass::Appendable)
+    } else if bounds.has_eq() {
+        Some(TypeClass::Equatable)
+    } else {
+        None
+    }
+}
+
+/// The first class a variable owing `bounds` needs that the structure `flat`
+/// lacks at its head, or `None` when the head meets every named class.
+fn unmet_class(interner: &Interner, bounds: TyBounds, flat: &FlatType) -> Option<TypeClass> {
+    let head = SuperHead::of(interner, flat);
+    [
+        (bounds.has_number(), TypeClass::Number, TyBounds::add()),
+        (bounds.has_ord(), TypeClass::Comparable, TyBounds::ord()),
+        (
+            bounds.has_set_elem(),
+            TypeClass::Comparable,
+            TyBounds::set_elem(),
+        ),
+        (
+            bounds.has_dict_key(),
+            TypeClass::Comparable,
+            TyBounds::dict_key(),
+        ),
+        (
+            bounds.has_append(),
+            TypeClass::Appendable,
+            TyBounds::appendable(),
+        ),
+        (bounds.has_eq(), TypeClass::Equatable, TyBounds::eq()),
+    ]
+    .into_iter()
+    .find(|(owed, _, single)| *owed && !super_head_ok(*single, head))
+    .map(|(_, class, _)| class)
+}
+
+/// Every solver variable in `tys` still owing a named class, keyed by the raw
+/// its [`Ty::Var`] carries, so a rendering names it by the class stem.
+fn owed_classes(uf: &UnionFind<Content>, tys: &[&Ty]) -> BTreeMap<u32, TypeClass> {
+    let mut classes = BTreeMap::new();
+    let mut stack: Vec<&Ty> = tys.to_vec();
+    while let Some(ty) = stack.pop() {
+        match ty {
+            Ty::Var(raw) => {
+                let owed = SolverVar::from_raw(*raw)
+                    .and_then(|var| uf.root_content(var.var()).ok())
+                    .and_then(|content| match content {
+                        Content::Super { bounds, .. } => owed_class(*bounds),
+                        _ => None,
+                    });
+                if let Some(class) = owed {
+                    classes.insert(*raw, class);
+                }
+            }
+            Ty::Fun(arg, result) => {
+                stack.push(arg);
+                stack.push(result);
+            }
+            Ty::Con { args, .. } | Ty::Tuple(args) => stack.extend(args.iter()),
+            Ty::Record(fields, _) => stack.extend(fields.values()),
+            Ty::Unit | Ty::Wildcard => {}
+        }
+    }
+    classes
+}
+
 /// Process a single `(found, expected)` obligation: agree the two heads and
 /// push any child obligations onto `stack`. Never recurses on children — that
 /// is what keeps the whole unification bounded by the [`Budget`] rather than the
@@ -270,9 +473,18 @@ fn unify_step(
                 // (IPE-T0014), not a bare shape mismatch against no written type.
                 let structure_var = if a_is_structure { ra } else { rb };
                 let ty = zonk_reported(uf, budget, structure_var, span)?;
-                Err(crate::super_unsatisfied(interner, bounds, &ty, span))
+                let mut namer = VarNamer::with_classes(owed_classes(uf, &[&ty]));
+                Err(crate::super_unsatisfied_named(
+                    interner, bounds, &ty, span, &mut namer,
+                ))
             } else {
-                Err(mismatch(uf, budget, interner, span, ra, rb))
+                // A flex whose class the structure lacks names that class, so
+                // the mismatch says what the class admits.
+                let unmet = match &structure {
+                    Content::Structure(flat) if !rigid => unmet_class(interner, bounds, flat),
+                    _ => None,
+                };
+                Err(mismatch_owing(uf, budget, interner, span, ra, rb, unmet))
             }
         }
         // A rigid against a concrete structure is a mismatch — the annotation
@@ -917,10 +1129,8 @@ fn occurs(
 }
 
 /// Build an owned [`TypeError::TypeMismatch`] from the two diverging variables.
-/// `found` is the actual type, `expected` the wanted one; both are zonked +
-/// rendered through a shared [`VarNamer`] so a shared variable reads identically
-/// on both sides. If the read-back itself hits an internal invariant, that bug
-/// is surfaced instead of the mismatch.
+///
+/// [`mismatch_owing`] with no unmet class.
 fn mismatch(
     uf: &mut UnionFind<Content>,
     budget: &mut Budget,
@@ -929,7 +1139,25 @@ fn mismatch(
     found: VarId,
     expected: VarId,
 ) -> Diagnostic {
-    let mut namer = VarNamer::new();
+    mismatch_owing(uf, budget, interner, span, found, expected, None)
+}
+
+/// Build an owned [`TypeError::TypeMismatch`] carrying `unmet_class`.
+///
+/// `found` is the actual type, `expected` the wanted one; both are zonked and
+/// rendered through one [`VarNamer`], so a shared variable reads identically on
+/// both sides and a variable owing a class reads by its stem. If the read-back
+/// itself hits an internal invariant, that bug is surfaced instead of the
+/// mismatch.
+fn mismatch_owing(
+    uf: &mut UnionFind<Content>,
+    budget: &mut Budget,
+    interner: &Interner,
+    span: Span,
+    found: VarId,
+    expected: VarId,
+    unmet_class: Option<TypeClass>,
+) -> Diagnostic {
     let expected_ty = match zonk_reported(uf, budget, expected, span) {
         Ok(t) => t,
         Err(bug) => return bug,
@@ -938,6 +1166,7 @@ fn mismatch(
         Ok(t) => t,
         Err(bug) => return bug,
     };
+    let mut namer = VarNamer::with_classes(owed_classes(uf, &[&expected_ty, &found_ty]));
     // A managed-loop `view` returns `Html` where the shape requires `Element`
     // (or the symmetric case): render the tailored IPE-T0020, which tells the
     // user to return an `Element` or wrap raw `Html` with `Ui.html`, instead of
@@ -965,6 +1194,7 @@ fn mismatch(
             found: Box::new(found_doc),
             definition: None,
             path: Box::new([]),
+            unmet_class,
         },
     }
 }

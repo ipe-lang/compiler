@@ -13,11 +13,11 @@
 use std::num::NonZeroU64;
 
 use ipe_diagnostics::{DResult, Diagnostic, Span, TypeError};
-use ipe_intern::Interner;
+use ipe_intern::{Interner, Symbol};
 
 use crate::homed::{InferError, ModuleHome};
 use crate::ty::Content;
-use crate::unify::unify_at;
+use crate::unify::unify_constraint;
 use crate::unionfind::{UnionFind, VarId};
 
 /// Default cap on solver steps before bailing.
@@ -41,6 +41,43 @@ pub struct Constraint {
     pub rhs: VarId,
     /// The module that owns the constrained expression.
     pub home: ModuleHome,
+    /// What the equality checks, so a failure can name its cause.
+    pub origin: ConstraintOrigin,
+}
+
+/// What a [`Constraint`] checks beyond the bare equality of its two sides.
+///
+/// The solver reads it only when the constraint fails: a call's arity fault
+/// shows as a shape mismatch, and the origin is what lets the one solve point
+/// report it as the arity fault it is.
+#[derive(Clone, Copy, Debug)]
+pub enum ConstraintOrigin {
+    /// An equality with no further meaning.
+    Plain,
+    /// A callee's type against the arrow its call's arguments shape.
+    CallShape(CallSite),
+    /// A call's result against the type its context expects of it.
+    CallResult(CallSite),
+}
+
+/// One call, as an arity diagnostic names it.
+#[derive(Clone, Copy, Debug)]
+pub struct CallSite {
+    /// The callee's type variable.
+    pub callee: VarId,
+    /// The callee's name, when the call names it directly.
+    pub name: Option<CalleeName>,
+    /// How many arguments the call gives.
+    pub given: usize,
+}
+
+/// A directly named callee: `greet`, or `List.sum` with its module qualifier.
+#[derive(Clone, Copy, Debug)]
+pub struct CalleeName {
+    /// The module a kernel callee is read through.
+    pub qualifier: Option<Symbol>,
+    /// The callee's own name.
+    pub name: Symbol,
 }
 
 /// A solver step ceiling: a positive number of steps, never "no limit".
@@ -213,7 +250,7 @@ pub fn solve_attributed(
     constraints: &[Constraint],
 ) -> Result<(), InferError> {
     for c in constraints {
-        unify_at(uf, budget, interner, &c.home, c.span, c.lhs, c.rhs)?;
+        unify_constraint(uf, budget, interner, c)?;
     }
     Ok(())
 }
