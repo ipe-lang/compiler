@@ -989,6 +989,14 @@ mod tests {
             assert!(is_stamp_for(version, token), "{version}");
             assert!(semver::Version::parse(version).is_ok(), "{version}");
             assert_eq!(version, stamped_version(role, bundle.digest()));
+            // The bundle a build links declares the version `resolve` admits and
+            // `ipe health` reports, so a build and its health check never name
+            // two runtimes.
+            assert_eq!(
+                version.split_once('+').map(|(core, _)| core),
+                Some(COMPILER_VERSION),
+                "{version}",
+            );
             assert!(!holds_dev_dependencies(&parsed));
         }
         assert!(!is_stamp_for("0.1.0+ipe.out.ABCDEF", "out"));
@@ -1122,6 +1130,21 @@ mod tests {
         assert!(
             matches!(past, Err(CliError::RuntimeDirInvalid { .. })),
             "a crate root past the ceiling is refused"
+        );
+    }
+
+    /// An explicit override naming a directory that does not exist is refused,
+    /// never walked past to the embedded copy.
+    #[test]
+    fn a_missing_override_dir_is_refused() {
+        let root = crate::scratch::ScratchDir::new("ipe-runtime-missing-override")
+            .expect("scratch dir")
+            .into_path();
+        let resolved = resolve_override(&root.join("no-such-runtime"));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            matches!(resolved, Err(CliError::RuntimeDirInvalid { .. })),
+            "a missing IPE_RUNTIME_DIR is refused",
         );
     }
 
