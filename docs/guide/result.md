@@ -30,7 +30,7 @@ Three knots.
 ## A worked example: a signup-form parser
 
 The example under
-[`examples/shapes/script/result-signup-form`](../../examples/shapes/script/result-signup-form/src/Main.ipe)
+[`examples/shapes/script/result-signup-form`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/result-signup-form/src/Main.ipe)
 parses a raw three-field form into a typed `Account`. The `Account` type is the
 target — and its existence is proof the input was valid, because it can only be
 built from already-parsed fields:
@@ -104,7 +104,7 @@ produces either a complete `Account` or an `Err` — never a partial one. And th
 [soundness][principles] guarantee follows from the type: because failure is an
 `Err` value rather than a panic, no bad input can make the program fall over.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 
@@ -112,7 +112,7 @@ produces either a complete `Account` or an `Err` — never a partial one. And th
   verified example. `ipe doc Ipe.Result.andThen` and `ipe doc Ipe.Result.map3`
   cover the two idioms above.
 - **Sibling guides:** [Maybe](maybe.md) — absence *without* an error; `Result`
-  is `Maybe` that also says *why*. [Tasks](../reference/stdlib/Task.md) for effects
+  is `Maybe` that also says *why*. [Tasks](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/Task.md) for effects
   that may fail asynchronously (a `Task` settles to a `Result`).
 - **Concepts:** [Types and inference](types.md) — how `Ok`/`Err` and the error
   type `e` are tracked. [The parse-don't-validate idiom](../idioms/parse-dont-validate.md).

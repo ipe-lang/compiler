@@ -1,0 +1,2 @@
+fn build() {
+    let x = 1;

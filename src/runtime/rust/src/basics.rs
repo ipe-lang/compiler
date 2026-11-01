@@ -1,24 +1,25 @@
 //! Ipe.Basics kernels: modBy + errorToString.
 //!
 
-/// Ipê `modBy : Int -> Int -> Int`. Divisor-first convention (Elm/pipeline order).
-///   - divisor == 0  → 0
-///   - r = n % divisor; if r < 0 { r += divisor }
+/// Ipê `modBy : Int -> Int -> Int` — floored modulo, result takes the divisor's sign.
 ///
-/// Adjust fires ONLY when r < 0 (irrespective of divisor sign).
-///
-/// Overflow guard: `i64::MIN % -1` is undefined behaviour in Rust debug/release
-/// (the mathematical result is 0).  `checked_rem` returns `None` for that case;
-/// we map it to r = 0, which is the correct mathematical remainder and leaves
-/// the adjust condition (`0 < 0`) false, so the final result is 0.
+/// Divisor-first (Elm/pipeline order). `divisor == 0` yields `0`. Otherwise the
+/// result lies in `[0, divisor)` for a positive divisor and `(divisor, 0]` for a
+/// negative one. `i64::MIN % -1` overflows in Rust; `checked_rem` maps it to the
+/// mathematical remainder `0`. When the truncated remainder and the divisor have
+/// opposite signs, `|r + divisor| < |divisor|`, so the adjusting add never
+/// overflows.
 #[must_use]
 pub fn basics_mod_by(divisor: i64, n: i64) -> i64 {
     if divisor == 0 {
         return 0;
     }
-    // checked_rem returns None only for i64::MIN % -1 (overflow); treat as 0.
     let r = n.checked_rem(divisor).unwrap_or(0);
-    if r < 0 { r.wrapping_add(divisor) } else { r }
+    if r != 0 && (r < 0) != (divisor < 0) {
+        r.wrapping_add(divisor)
+    } else {
+        r
+    }
 }
 
 /// The result of Ipê's `Basics.compare` — a typed three-way comparison.
@@ -139,8 +140,8 @@ impl IpeWrappingNeg for f64 {
 
 /// Wrapping addition for polymorphic `Number a` functions.
 ///
-/// `i64` wraps on overflow (two's-complement); `f64` uses plain IEEE 754
-/// addition (total — overflow yields ±∞, never panics). Generic `Number a`
+/// `i64` delegates to `math::ipe_int_add`, the one Int `+` definition; `f64`
+/// uses plain IEEE 754 addition (total — overflow yields ±∞, never panics). Generic `Number a`
 /// functions that emit `BinOp::Add` use this trait so the generic body is
 /// safe under `overflow-checks=on` regardless of how the call site
 /// monomorphises.
@@ -156,7 +157,7 @@ impl IpeWrappingAdd for i64 {
     type Output = i64;
     const IPE_ADD_IDENTITY: i64 = 0;
     fn ipe_wrapping_add(self, rhs: i64) -> i64 {
-        self.wrapping_add(rhs)
+        crate::math::ipe_int_add(self, rhs)
     }
 }
 impl IpeWrappingAdd for f64 {
@@ -169,7 +170,7 @@ impl IpeWrappingAdd for f64 {
 
 /// Wrapping subtraction for polymorphic `Number a` functions.
 ///
-/// `i64` wraps on underflow; `f64` is total.
+/// `i64` delegates to `math::ipe_int_sub`; `f64` is total.
 pub trait IpeWrappingSub<Rhs = Self>: Sized {
     type Output;
     #[must_use]
@@ -178,7 +179,7 @@ pub trait IpeWrappingSub<Rhs = Self>: Sized {
 impl IpeWrappingSub for i64 {
     type Output = i64;
     fn ipe_wrapping_sub(self, rhs: i64) -> i64 {
-        self.wrapping_sub(rhs)
+        crate::math::ipe_int_sub(self, rhs)
     }
 }
 impl IpeWrappingSub for f64 {
@@ -190,7 +191,7 @@ impl IpeWrappingSub for f64 {
 
 /// Wrapping multiplication for polymorphic `Number a` functions.
 ///
-/// `i64` wraps on overflow; `f64` is total.
+/// `i64` delegates to `math::ipe_int_mul`; `f64` is total.
 pub trait IpeWrappingMul<Rhs = Self>: Sized {
     type Output;
     /// The multiplicative identity — the seed a wrapping multiplicative fold
@@ -203,7 +204,7 @@ impl IpeWrappingMul for i64 {
     type Output = i64;
     const IPE_MUL_IDENTITY: i64 = 1;
     fn ipe_wrapping_mul(self, rhs: i64) -> i64 {
-        self.wrapping_mul(rhs)
+        crate::math::ipe_int_mul(self, rhs)
     }
 }
 impl IpeWrappingMul for f64 {
@@ -312,16 +313,24 @@ mod tests {
     fn test_mod_by_pos_div_pos_n() {
         assert_eq!(basics_mod_by(3, 7), 1);
     }
-    // negative divisor, positive dividend — r > 0, no adjust.
+    // Floored modulo: every nonzero result carries the divisor's sign.
     #[test]
-    fn test_mod_by_neg_divisor_pos_n() {
-        assert_eq!(basics_mod_by(-3, 7), 1);
-    }
-    // negative divisor, negative dividend — r < 0 → adjust.
-    // -7 % -3 = -1; -1 < 0 → -1 + (-3) = -4 (r += divisor).
-    #[test]
-    fn test_mod_by_neg_divisor_neg_n() {
-        assert_eq!(basics_mod_by(-3, -7), -4);
+    fn mod_by_floors_to_divisor_sign() {
+        let table: [(i64, i64, i64); 10] = [
+            (-3, -1, -1),
+            (-3, 10, -2),
+            (3, -10, 2),
+            (-3, -3, 0),
+            (-1, i64::MIN, 0),
+            (i64::MIN, -1, -1),
+            (i64::MIN, 1, i64::MIN + 1),
+            (-3, 7, -2),
+            (-3, -7, -1),
+            (0, 42, 0),
+        ];
+        for (divisor, n, expected) in table {
+            assert_eq!(basics_mod_by(divisor, n), expected, "modBy {divisor} {n}");
+        }
     }
     // Overflow guard: i64::MIN % -1 must not panic, result = 0.
     #[test]

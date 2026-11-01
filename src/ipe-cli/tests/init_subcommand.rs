@@ -214,6 +214,7 @@ fn init_lib_scaffold_is_lint_clean() {
 /// project of a single shape (or the `--lib` library), asserting THE SEAL —
 /// `ipe`-accepts must imply `cargo`-builds. `init_args` are the `ipe init` args
 /// after the target; `entry_rel` is the module entry the emitter starts from.
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn assert_scaffold_builds(
     runtime_dir: &std::path::Path,
     tag: &str,
@@ -241,10 +242,17 @@ fn assert_scaffold_builds(
         "[{tag}] ipe dev build on the scaffold must succeed: {built:?}"
     );
 
-    let cargo_status = std::process::Command::new("cargo")
+    // THE SEAL: emitted Rust must compile with cargo. A private isolated
+    // tree: the test asserts this cold build, not the shared target's reuse.
+    let isolated =
+        e2e_support::target::isolated(e2e_support::target::IsolationReason::ColdBuildUnderTest);
+    let Ok(isolated) = isolated else {
+        panic!("[{tag}] isolated build target: {isolated:?}")
+    };
+    let build_target = e2e_support::target::BuildTarget::Isolated(isolated);
+    let cargo_status = e2e_support::target::cargo_command(&build_target)
         .arg("build")
         .current_dir(&out_dir)
-        .env("CARGO_TARGET_DIR", out_dir.join("target"))
         .status();
     assert!(
         matches!(&cargo_status, Ok(s) if s.success()),
@@ -252,7 +260,6 @@ fn assert_scaffold_builds(
          ipe-accepts must imply cargo-builds): {cargo_status:?}"
     );
 
-    let _ = fs::remove_dir_all(out_dir.join("target"));
     let _ = fs::remove_dir_all(&dir);
 }
 

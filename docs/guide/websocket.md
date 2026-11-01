@@ -29,7 +29,7 @@ Three knots.
 ## A worked example: sealing URLs and building a config
 
 The example under
-[`examples/shapes/script/websocket-url-seal`](../../examples/shapes/script/websocket-url-seal/src/Main.ipe)
+[`examples/shapes/script/websocket-url-seal`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/websocket-url-seal/src/Main.ipe)
 seals candidate URLs and builds a connect config — without opening a socket.
 
 Sealing composes the two boundaries with `Result.andThen`:
@@ -96,7 +96,7 @@ unrepresentable][principles] at the unit boundary. Building from `defaultCfg`
 with `with*` helpers is [correctness][principles] over time — the record can grow
 without breaking existing call sites.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## Configuration
 
@@ -109,7 +109,7 @@ full entry on any of them.
 | `IPE_WS_MAX_MESSAGE_BYTES` | 1048576 (1 MiB) | Maximum message size for both client and server connections. |
 | `IPE_WS_SEND_BUFFER` | 256 | Per-connection outbound frame buffer depth. |
 
-See the [**WebSocket** subsystem](../reference/env.md#websocket) in the
+See the [**WebSocket** subsystem](https://github.com/ipe-lang/compiler/blob/main/docs/reference/env.md#websocket) in the
 environment variable reference.
 
 ## References

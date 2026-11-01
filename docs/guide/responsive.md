@@ -23,7 +23,7 @@ Two ideas.
 ## A worked example: classifying a range of widths
 
 The example under
-[`examples/shapes/script/responsive-breakpoints`](../../examples/shapes/script/responsive-breakpoints/src/Main.ipe)
+[`examples/shapes/script/responsive-breakpoints`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/responsive-breakpoints/src/Main.ipe)
 classifies four representative viewport widths.
 
 ```ipe
@@ -64,7 +64,7 @@ new device class can't be silently forgotten in one layout while handled in anot
 In a live web app the width comes from a window-size subscription stashed in the
 model; the view calls `classifyDevice` once and dispatches on the result.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

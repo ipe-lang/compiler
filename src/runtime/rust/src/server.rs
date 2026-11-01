@@ -6056,7 +6056,11 @@ mod tests {
             "{not_local}"
         );
         let (other_kind, other) = refusal(BuildPosture::Release, ErrorKind::ConnectionReset);
-        assert_eq!(other_kind, crate::IpeErrorKind::Io, "{other}");
+        assert_eq!(
+            other_kind,
+            crate::io_error_kind(ErrorKind::ConnectionReset),
+            "{other}"
+        );
         assert!(
             other.starts_with("Server.listen: bind 10.255.255.1:80: "),
             "{other}"

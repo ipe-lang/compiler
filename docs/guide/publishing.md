@@ -266,5 +266,5 @@ ipe dev build
 - [Delivering an app](delivery.md) — for an application (not a library), how a
   shape becomes a desktop or mobile distributable.
 - [Testing](test.md) — the in-process test framework the audit expects to pass.
-- [The `ipe` command reference](../reference/cli.md) — every command and flag,
+- [The `ipe` command reference](https://github.com/ipe-lang/compiler/blob/main/docs/reference/cli.md) — every command and flag,
   including `init`, `add`, `login`, and `package`.

@@ -168,8 +168,9 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 
 /// Write the real foreign crate `tm` under `tmp`, repoint the emitted crate at
 /// `out` to it (the fixture crate cannot live on crates.io, so this changes
-/// WHERE `tm` comes from, never what the emitted code says), and `cargo run` it.
-fn cargo_run_against_local_tm(tmp: &Path, out: &Path) -> std::process::Output {
+/// WHERE `tm` comes from, never what the emitted code says), then build it as
+/// package `name` in the shared target and run it.
+fn run_against_local_tm(name: &str, tmp: &Path, out: &Path) -> e2e_support::RunResult {
     // The real foreign crate the emitted wrappers bind.
     let tm_dir = tmp.join("tm");
     fs::create_dir_all(tm_dir.join("src")).expect("mkdir tm");
@@ -206,13 +207,13 @@ pub fn brightness(s: Shade) -> i64 {
     );
     fs::write(&manifest_path, patched).expect("patched Cargo.toml");
 
-    let cargo = ipe_env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
-    std::process::Command::new(cargo)
-        .arg("run")
-        .arg("--quiet")
-        .current_dir(out)
-        .output()
-        .expect("cargo run spawns")
+    let ran = e2e_support::build_and_run_rust(name, out);
+    assert!(
+        ran.is_ok(),
+        "{}",
+        ran.as_ref().err().map_or("", String::as_str)
+    );
+    ran.expect("asserted Ok above")
 }
 
 /// Default gate: `ipe dev build` exits 0 and the emitted crate carries the whole
@@ -283,13 +284,13 @@ fn transparent_import_emitted_crate_builds_and_runs() {
     }
 
     let tmp = scratch("ipec_ffi_transparent_import_e2e");
-    let run = cargo_run_against_local_tm(&tmp, &out);
-    let stdout = String::from_utf8_lossy(&run.stdout);
-    let stderr = String::from_utf8_lossy(&run.stderr);
-    assert!(
-        run.status.success(),
+    let run = run_against_local_tm("ffi_transparent_import", &tmp, &out);
+    let stdout = &run.stdout;
+    assert_eq!(
+        run.exit_code,
+        Some(0),
         "emitted transparent-import crate must build and run exit 0.\n\
-         stdout: {stdout}\nstderr: {stderr}"
+         stdout: {stdout}"
     );
     // shift {x=1,y=2.5} → x=2 → classify → Mix(2, "mix") → describe "mix 2";
     // brightness (Level 3) → 3.
@@ -344,13 +345,13 @@ fn showing_a_transparent_union_renders_it() {
     }
     let (_fixture, out) = build_show_transparent();
     let tmp = scratch("ipec_show_transparent_foreign");
-    let run = cargo_run_against_local_tm(&tmp, &out);
-    let stdout = String::from_utf8_lossy(&run.stdout);
-    let stderr = String::from_utf8_lossy(&run.stderr);
-    assert!(
-        run.status.success(),
+    let run = run_against_local_tm("ffi_show_transparent", &tmp, &out);
+    let stdout = &run.stdout;
+    assert_eq!(
+        run.exit_code,
+        Some(0),
         "the emitted crate showing a transparent union must build and run exit 0.\n\
-         stdout: {stdout}\nstderr: {stderr}"
+         stdout: {stdout}"
     );
     assert!(
         stdout.lines().any(|l| l == "shade: Level 3"),

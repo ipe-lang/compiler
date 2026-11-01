@@ -612,6 +612,7 @@ fn watch_proxies_a_hardcoded_port_server_on_an_internal_port() -> Result<(), Box
 /// port the supervisor chose through the relocation var, which outranks both.
 #[cfg(target_os = "linux")]
 #[test]
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn operator_port_vars_never_relocate_a_watched_child() -> Result<(), BoxError> {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         eprintln!("skipping (set IPE_E2E=1 to run)");
@@ -622,7 +623,17 @@ fn operator_port_vars_never_relocate_a_watched_child() -> Result<(), BoxError> {
     let port: u16 = 19165;
     let operator: u16 = 19166;
     let runtime_dir = e2e_support::require_runtime().into_path_buf();
-    let mut cmd = std::process::Command::new(e2e_support::cargo_bin!("ipe").into_path_buf());
+    // `ipe dev watch` emits the fixed package `ipe-app`: an exclusive tree
+    // avoids colliding with a concurrent same-shaped test over the same
+    // package name in the shared target. Held for the watch's whole lifetime.
+    let isolated =
+        e2e_support::target::isolated(e2e_support::target::IsolationReason::FixedPackageName);
+    let Ok(isolated) = isolated else {
+        panic!("isolated build target: {isolated:?}")
+    };
+    let build_target = e2e_support::target::BuildTarget::Isolated(isolated);
+    let ipe_bin = e2e_support::cargo_bin!("ipe").into_path_buf();
+    let mut cmd = e2e_support::target::ipe_command(&ipe_bin, &build_target);
     cmd.arg("dev")
         .arg("watch")
         .arg(&ipe_dir)
@@ -639,9 +650,6 @@ fn operator_port_vars_never_relocate_a_watched_child() -> Result<(), BoxError> {
         .env_remove("IPE_WATCH_BLUEGREEN")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    if let Some(target) = e2e_support::child_shared_target_from_env() {
-        cmd.env("CARGO_TARGET_DIR", target);
-    }
     let mut watch = cmd
         .spawn()
         .map_err(|e| -> BoxError { format!("ipe dev watch must spawn: {e}").into() })?;

@@ -89,9 +89,11 @@ const HOST_NAMES: &[&str] = &[
     "HOME",
     "SystemRoot",
     "DATABASE_URL",
+    "CARGO",
 ];
 
-/// The prefix of the Cargo build variables, all host variables.
+/// The prefix of the Cargo build variables, all host variables; `CARGO`
+/// itself, the running cargo binary, is in [`HOST_NAMES`].
 const HOST_PREFIX: &str = "CARGO_";
 
 /// The ratchet of sites not yet moved into the registry.
@@ -713,6 +715,26 @@ fn a_literal_in_a_production_fn_is_refused() {
         kinds("src/runtime/rust/src/system.rs", src),
         [Kind::Literal],
         "the program surface is exempt from the accessor rule only"
+    );
+}
+
+/// `CARGO`, the binary cargo exports to the processes it runs, is a host
+/// variable; a name that only starts with it is not.
+#[test]
+fn the_cargo_binary_variable_is_a_host_read_and_only_by_its_exact_name() {
+    assert_eq!(
+        kinds(
+            FIXTURE_PATH,
+            "pub fn f() -> Option<std::ffi::OsString> { ipe_env::var_os(\"CARGO\") }"
+        ),
+        Vec::<Kind>::new()
+    );
+    assert_eq!(
+        kinds(
+            FIXTURE_PATH,
+            "pub fn f() -> Option<std::ffi::OsString> { ipe_env::var_os(\"CARGOX\") }"
+        ),
+        [Kind::Accessor]
     );
 }
 

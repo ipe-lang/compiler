@@ -27,7 +27,7 @@ The word "unsafe" here is narrow, and worth stating precisely.
 ## A worked example: a dynamic table
 
 The example under
-[`examples/shapes/script/store-raw-columns`](../../examples/shapes/script/store-raw-columns/src/Main.ipe)
+[`examples/shapes/script/store-raw-columns`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/store-raw-columns/src/Main.ipe)
 builds a raw-column table (no record type), names its primary key by string, and
 shows that an invalid identifier still fails closed.
 
@@ -74,7 +74,7 @@ checking became query-time checking — and nothing more.
 Reach for this only for a dynamic or non-codec table the safe accessor surface
 cannot express.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

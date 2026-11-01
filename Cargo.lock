@@ -1726,6 +1726,7 @@ dependencies = [
  "ipe-test-temp",
  "ipe_env",
  "proc-macro2",
+ "quote",
  "serde_json",
  "syn 3.0.9",
 ]
@@ -3099,6 +3100,7 @@ dependencies = [
  "rustls-pki-types",
  "salsa",
  "semver",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "signal-hook",
@@ -5601,8 +5603,8 @@ dependencies = [
 name = "regen-goldens"
 version = "0.7.2"
 dependencies = [
- "e2e-support",
  "ipe",
+ "ipe_backend_rust",
  "ipe_docs",
 ]
 

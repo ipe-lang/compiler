@@ -23,7 +23,7 @@ Two ideas.
 ## A worked example: a summary row
 
 The example under
-[`examples/shapes/script/tostring-render`](../../examples/shapes/script/tostring-render/src/Main.ipe)
+[`examples/shapes/script/tostring-render`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/tostring-render/src/Main.ipe)
 renders one row of mixed-type fields by interpolating each straight into a
 triple-quoted string:
 

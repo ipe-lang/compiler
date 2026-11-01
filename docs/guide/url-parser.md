@@ -27,7 +27,7 @@ Three knots.
 ## A worked example: a request router
 
 The example under
-[`examples/shapes/script/url-router`](../../examples/shapes/script/url-router/src/Main.ipe)
+[`examples/shapes/script/url-router`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/url-router/src/Main.ipe)
 matches request paths into a typed `Page` union — home, a blog post by id, a user
 profile by name, and a search with an optional query.
 
@@ -99,7 +99,7 @@ data, with constructors applied in a `case` chain, is [soundness][principles]: t
 divergence from Elm's function-carrying parser exists precisely so the router
 lowers without storing a function value where the backend cannot yet box one.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

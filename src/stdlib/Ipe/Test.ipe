@@ -1,12 +1,11 @@
 -- | Ipe.Test — lightweight in-process test framework.
 --
--- `filterMap` is replaced by `concatMap` (semantically equivalent for
--- this use-case). `summarise` returns a `Task` so its report print stays
--- inside the Task discipline; `runMain` sequences it before exiting.
---
--- All top-level bindings are fully annotated (compiled-source
--- discipline — annotation-driven generalisation; no whole-program
--- let-gen).
+-- Build a `Test` with `test name thunk`, group tests with `suite`, and
+-- decide each one with an assertion (`equal`, `ok`, `expectErr`, `isTrue`, …)
+-- that yields a `TestResult`. `run` evaluates a list of tests into
+-- `( name, result )` pairs; `summarise` prints the report and yields whether
+-- every test passed; `runMain` does both and exits non-zero on a failure, so
+-- it can be a test program's `main`.
 
 
 module Ipe.Test exposing

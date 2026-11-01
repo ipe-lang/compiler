@@ -1,0 +1,2 @@
+#[path = "path_module_target.rs.txt"]
+mod path_module_target;

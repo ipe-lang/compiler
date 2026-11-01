@@ -27,7 +27,7 @@ use super::focus::{
     Focusable, InputRegistry, clamp_focus, edit_input, ensure_focus_visible, extract_click_msg,
     extract_input_msg, extract_msg_named, hit_test, parse_mouse,
 };
-use super::key::{TuiKey, decode_key};
+use super::key::{TuiKey, decode_key, wire_key};
 use super::layout::render_with_focus;
 use std::io::{Read, Write};
 
@@ -234,8 +234,8 @@ fn term_size() -> (usize, usize) {
     }
 }
 
-/// Longest key sequence `decode_key` recognises (`ESC [ 1 ; <mod> <final>` = 6
-/// bytes); padded to 8 so any tail at least this long is decoded, never carried.
+/// Longest named-key sequence a terminal sends (`ESC [ 2 4 ; 1 6 ~`, a fully
+/// modified F12 = 8 bytes): any tail at least this long is decoded, never carried.
 const MAX_KEY_SEQ: usize = 8;
 
 /// Bytes a UTF-8 lead byte announces (1 for ASCII / continuation / invalid lead).
@@ -263,11 +263,8 @@ fn tail_maybe_truncated(tail: &[u8]) -> bool {
 }
 
 /// Blocking raw-key reader over the process's stdin; see [`read_keys_from`].
-fn read_keys_loop<Msg, FMap>(tx: &tokio::sync::mpsc::UnboundedSender<CliEvent<Msg>>, map_kind: FMap)
-where
-    FMap: Fn(TuiKey) -> (String, String),
-{
-    read_keys_from(std::io::stdin(), tx, map_kind);
+fn read_keys_loop<Msg>(tx: &tokio::sync::mpsc::UnboundedSender<CliEvent<Msg>>) {
+    read_keys_from(std::io::stdin(), tx);
 }
 
 /// Whether the key reader keeps reading after one decoded key.
@@ -281,20 +278,16 @@ enum KeyFlow {
 ///
 /// The interrupt is the reader's last event: it is never mapped or handed to
 /// `onKey`, and no key read after it is queued.
-fn deliver_key<Msg, FMap>(
+fn deliver_key<Msg>(
     k: TuiKey,
     budget: &InputBudget,
     tx: &tokio::sync::mpsc::UnboundedSender<CliEvent<Msg>>,
-    map_kind: &FMap,
-) -> KeyFlow
-where
-    FMap: Fn(TuiKey) -> (String, String),
-{
+) -> KeyFlow {
     if k.is_interrupt() {
         let _ = tx.send(CliEvent::Interrupt);
         return KeyFlow::Stop;
     }
-    let (kind, value) = map_kind(k);
+    let (kind, value) = wire_key(k);
     let Some(permit) = budget.acquire(|| tx.is_closed()) else {
         return KeyFlow::Stop;
     };
@@ -309,20 +302,15 @@ where
 /// sequences that straddle the fixed 64-byte read boundary by carrying the
 /// unconsumed tail into the next read — a fixed-buffer decode would otherwise
 /// mis-decode or corrupt a split sequence (e.g. a multibyte char inside a paste
-/// larger than 64 bytes). `map_kind` turns the decoded `TuiKey` into the wire
-/// `(kind, value)` pair (`tui_app_ui` folds the ctrl modifier into the kind for
-/// the input editor's word-jumps; `tui_app` passes it through). Runs on its own
+/// larger than 64 bytes). Every decoded key reaches the loop as the one
+/// [`wire_key`] pair, whichever driver runs. Runs on its own
 /// blocking thread so the key handlers stay off it. Each key is queued only with
 /// an [`InputBudget`] permit, so at most [`MAX_QUEUED_INPUT`] keys wait for the
 /// loop; past that the reader blocks until the loop catches up. The terminal
 /// interrupt (Ctrl-C) ends the reader with `CliEvent::Interrupt` instead.
-fn read_keys_from<R, Msg, FMap>(
-    mut input: R,
-    tx: &tokio::sync::mpsc::UnboundedSender<CliEvent<Msg>>,
-    map_kind: FMap,
-) where
+fn read_keys_from<R, Msg>(mut input: R, tx: &tokio::sync::mpsc::UnboundedSender<CliEvent<Msg>>)
+where
     R: Read,
-    FMap: Fn(TuiKey) -> (String, String),
 {
     let budget = InputBudget::new(MAX_QUEUED_INPUT);
     let mut buf = [0u8; 64];
@@ -349,7 +337,7 @@ fn read_keys_from<R, Msg, FMap>(
                 break;
             }
             i += consumed;
-            if deliver_key(k, &budget, tx, &map_kind) == KeyFlow::Stop {
+            if deliver_key(k, &budget, tx) == KeyFlow::Stop {
                 return;
             }
         }
@@ -363,7 +351,7 @@ fn read_keys_from<R, Msg, FMap>(
             break;
         }
         i += consumed;
-        if deliver_key(k, &budget, tx, &map_kind) == KeyFlow::Stop {
+        if deliver_key(k, &budget, tx) == KeyFlow::Stop {
             return;
         }
     }
@@ -511,20 +499,7 @@ where
         // guard restores the terminal.
         let key_tx = tx.clone();
         let started = crate::threads::spawn_named(KEY_READER_THREAD, move || {
-            read_keys_loop(&key_tx, |k| {
-                // Under the debugger, fold a Ctrl modifier on Left/Right into the
-                // kind (`ctrlleft`/`ctrlright`) so the history step keys are
-                // distinguishable on the flat (kind, value) channel.
-                #[cfg(all(feature = "debugger", not(target_arch = "wasm32")))]
-                let kind = if k.ctrl && (k.kind == "left" || k.kind == "right") {
-                    format!("ctrl{}", k.kind)
-                } else {
-                    k.kind
-                };
-                #[cfg(not(all(feature = "debugger", not(target_arch = "wasm32"))))]
-                let kind = k.kind;
-                (kind, k.value)
-            });
+            read_keys_loop(&key_tx);
         });
         if let Err(e) = started {
             return IpeResult::Err(
@@ -1130,17 +1105,7 @@ where
         // A refused key reader ends the app as in `tui_app`.
         let key_tx = tx.clone();
         let started = crate::threads::spawn_named(KEY_READER_THREAD, move || {
-            read_keys_loop(&key_tx, |k| {
-                // The (kind, value) channel is flat, so fold the ctrl modifier on
-                // Left/Right into the kind (`ctrlleft`/`ctrlright`) for the input
-                // editor's word-jumps.
-                let kind = if k.ctrl && (k.kind == "left" || k.kind == "right") {
-                    format!("ctrl{}", k.kind)
-                } else {
-                    k.kind
-                };
-                (kind, k.value)
-            });
+            read_keys_loop(&key_tx);
         });
         if let Err(e) = started {
             return IpeResult::Err(
@@ -2256,13 +2221,13 @@ mod tui_enter_error_tests {
 
 #[cfg(test)]
 mod key_reader_tests {
-    use super::{AtomicBool, CliEvent, TuiKey, decode_key, paint_to, read_keys_from};
+    use super::{AtomicBool, CliEvent, decode_key, paint_to, read_keys_from};
 
     /// The `(kind, value)` events one byte stream yields, in order, with
     /// `"interrupt"` / `"eof"` standing for the two terminal events.
     fn read_events(input: &[u8]) -> Vec<(String, String)> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CliEvent<()>>();
-        read_keys_from(input, &tx, |k: TuiKey| (k.kind, k.value));
+        read_keys_from(input, &tx);
         drop(tx);
         let mut events = Vec::new();
         while let Ok(ev) = rx.try_recv() {
@@ -2305,6 +2270,16 @@ mod key_reader_tests {
         assert_eq!(
             read_events(b"\x04q"),
             vec![ev("ctrl", "d"), ev("char", "q"), ev("eof", "")]
+        );
+    }
+
+    // Every key reaches the loop as the one `wire_key` pair: Ctrl on Left /
+    // Right folds into the kind, any other modifier is dropped.
+    #[test]
+    fn keys_reach_the_loop_as_the_wire_key_pair() {
+        assert_eq!(
+            read_events(b"\x1b[1;5D\x1b[1;2A"),
+            vec![ev("ctrlleft", ""), ev("up", ""), ev("eof", "")]
         );
     }
 

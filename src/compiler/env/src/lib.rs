@@ -17,6 +17,7 @@
 //! value out under its own name.
 
 pub mod artifact;
+pub mod oracle_target;
 
 use std::env::VarError;
 use std::ffi::{OsStr, OsString};

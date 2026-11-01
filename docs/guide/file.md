@@ -29,7 +29,7 @@ Three knots.
 ## A worked example: a temp-dir scratchpad
 
 The example under
-[`examples/shapes/script/file-scratchpad`](../../examples/shapes/script/file-scratchpad/src/Main.ipe)
+[`examples/shapes/script/file-scratchpad`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/file-scratchpad/src/Main.ipe)
 creates a fresh temp directory, writes two notes, reads one back, and lists the
 directory — a whole session as one `do` block:
 
@@ -92,7 +92,7 @@ would depend on the disk — its result would change run to run, breaking the
 yields the same output. A `Task` *describes* the read; the runtime is the single
 place that performs it, so purity holds everywhere else.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## Writing the working tree under the jail
 
@@ -142,7 +142,7 @@ tools over it.
 `IPE_FILE_READ_MAX` sets the per-call byte ceiling of `File.readFile`,
 `IPE_PROCESS_OUTPUT_MAX` the ceiling on a subprocess's buffered output, and
 `IPE_PROCESS_TIMEOUT` the wall-clock ceiling after which a subprocess is killed.
-Their defaults and exact rules live in the [**File** subsystem](../reference/env.md#file)
+Their defaults and exact rules live in the [**File** subsystem](https://github.com/ipe-lang/compiler/blob/main/docs/reference/env.md#file)
 of the environment variable reference; `ipe doc <VAR>` prints the same entry.
 For a per-call cap of your own, `File.readFileLimit` takes a `ByteSize`:
 `ByteSize.zero` admits only an empty file.
@@ -152,7 +152,7 @@ For a per-call cap of your own, `File.readFileLimit` takes a `ByteSize`:
 - **Per-symbol reference:** `ipe doc Ipe.File` and `ipe doc Ipe.Path` — every
   function with its signature. `ipe doc Ipe.File.walk` covers recursive directory
   traversal.
-- **Sibling guides:** [Tasks](../reference/stdlib/Task.md) — sequencing, concurrency,
+- **Sibling guides:** [Tasks](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/Task.md) — sequencing, concurrency,
   and error handling for the effects `File` returns. [Result](result.md), which
   `Path.fromString` returns and `Task.fromResult` bridges.
 - **Concepts:** [Pure functions and immutability](pure-functions.md) — why disk

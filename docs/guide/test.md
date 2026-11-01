@@ -27,7 +27,7 @@ Three knots.
 ## A worked example: an arithmetic suite
 
 The example under
-[`examples/shapes/script/test-suite`](../../examples/shapes/script/test-suite/src/Main.ipe)
+[`examples/shapes/script/test-suite`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/test-suite/src/Main.ipe)
 tests a couple of pure helpers, exercising the equality, `Result`, and boolean
 assertions, and wires the tree to `runMain`.
 
@@ -77,7 +77,7 @@ how to check, not by scraping printed text. And because the assertions are total
 functions over the values under test, the framework itself has no I/O and no
 hidden state — a suite is as pure and reproducible as the code it exercises.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 
