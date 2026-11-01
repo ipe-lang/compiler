@@ -997,7 +997,6 @@ fn use_leaves(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut Vec<UseLe
                 use_leaves(item, prefix, out);
             }
         }
-        _ => {}
     }
 }
 
