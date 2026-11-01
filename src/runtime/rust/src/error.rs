@@ -420,6 +420,14 @@ impl IpeError {
     pub fn io(message: String) -> Self {
         Self::with(IpeErrorKind::Io, message)
     }
+    /// An error for a host I/O failure category, kinded by [`io_error_kind`].
+    ///
+    /// The caller owns `message`, which must already be fixed or scrubbed
+    /// text; [`IoFailure`] builds one that names a path.
+    #[must_use]
+    pub fn from_io_kind(kind: std::io::ErrorKind, message: String) -> Self {
+        Self::with(io_error_kind(kind), message)
+    }
     #[must_use]
     pub fn network(message: String) -> Self {
         Self::with(IpeErrorKind::Network, message)
@@ -702,6 +710,37 @@ impl FromIpeError for String {
     }
 }
 
+/// A generic error sink that can classify a failed decode as `Decode`.
+///
+/// Every JSON, YAML and row decoder reports malformed or mistyped input
+/// through this bound, never through the blanket `From<String>` bridge, so a
+/// client's bad payload reaches the program as `Decode` and never as
+/// `Unexpected`. A bare `String` sink, which has no kind, keeps the message.
+pub trait FromDecodeFailure {
+    fn from_decode_failure(message: String) -> Self;
+}
+
+impl FromDecodeFailure for IpeError {
+    fn from_decode_failure(message: String) -> Self {
+        Self::decode(message)
+    }
+}
+
+impl FromDecodeFailure for String {
+    fn from_decode_failure(message: String) -> Self {
+        message
+    }
+}
+
+/// An error sink every decoder can land a failure in.
+///
+/// The one bound every generic decoder names: `From<String>` for the
+/// composed decoders that only forward an inner error, and
+/// [`FromDecodeFailure`] for the failure a decoder builds itself.
+pub trait DecodeErrorSink: From<String> + FromDecodeFailure {}
+
+impl<E> DecodeErrorSink for E where E: From<String> + FromDecodeFailure {}
+
 /// A generic `E: From<String>` error sink that can classify a refusal as
 /// `LimitExceeded`.
 ///
@@ -808,6 +847,149 @@ impl From<TimeoutRefusal> for IpeError {
     }
 }
 
+/// The Ipê kind of a host I/O failure category.
+///
+/// The one classification of `std::io::ErrorKind`: every runtime boundary
+/// that turns an `std::io::Error` into an Ipê `Error` reads its kind here. A
+/// category with no Ipê counterpart, `Other`, and any category a later
+/// toolchain adds stay `Unexpected`.
+#[must_use]
+pub const fn io_error_kind(kind: std::io::ErrorKind) -> IpeErrorKind {
+    use std::io::ErrorKind as K;
+    match kind {
+        K::NotFound => IpeErrorKind::NotFound,
+        K::PermissionDenied | K::ReadOnlyFilesystem => IpeErrorKind::PermissionDenied,
+        K::ConnectionRefused
+        | K::ConnectionReset
+        | K::ConnectionAborted
+        | K::NotConnected
+        | K::HostUnreachable
+        | K::NetworkUnreachable
+        | K::NetworkDown => IpeErrorKind::Network,
+        K::AlreadyExists | K::DirectoryNotEmpty | K::AddrInUse => IpeErrorKind::Conflict,
+        K::WouldBlock | K::ResourceBusy | K::ExecutableFileBusy => IpeErrorKind::Unavailable,
+        K::TimedOut => IpeErrorKind::Timeout,
+        K::InvalidInput
+        | K::InvalidFilename
+        | K::NotADirectory
+        | K::IsADirectory
+        | K::AddrNotAvailable => IpeErrorKind::InvalidInput,
+        K::InvalidData => IpeErrorKind::Decode,
+        K::FileTooLarge | K::QuotaExceeded | K::ArgumentListTooLong => IpeErrorKind::LimitExceeded,
+        K::BrokenPipe
+        | K::StaleNetworkFileHandle
+        | K::Interrupted
+        | K::WriteZero
+        | K::UnexpectedEof
+        | K::StorageFull
+        | K::NotSeekable
+        | K::Deadlock
+        | K::CrossesDevices
+        | K::TooManyLinks
+        | K::Unsupported
+        | K::OutOfMemory => IpeErrorKind::Io,
+        _ => IpeErrorKind::Unexpected,
+    }
+}
+
+/// The byte ceiling on a path shown in an [`IoFailure`] message.
+const IO_FAILURE_PATH_MAX_BYTES: usize = 4096;
+
+/// The byte ceiling on the host's reason shown in an [`IoFailure`] message.
+const IO_FAILURE_REASON_MAX_BYTES: usize = 1024;
+
+/// A host I/O failure, kinded by [`io_error_kind`] where it is built.
+///
+/// The message names the operation, the path it touched and the host's
+/// reason, each passed through the runtime's log-hazard scrub so a control or
+/// bidi character in a path shows as a visible escape. The value has no
+/// conversion into `String`, so it cannot fall into the `From<String>` bridge
+/// that yields `Unexpected`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IoFailure {
+    kind: IpeErrorKind,
+    message: String,
+}
+
+impl IoFailure {
+    /// The failure of `operation` on `path`.
+    #[must_use]
+    pub fn on_path(operation: &str, path: &str, error: &std::io::Error) -> Self {
+        Self {
+            kind: io_error_kind(error.kind()),
+            message: format!("{operation} {}: {}", shown_path(path), shown_reason(error)),
+        }
+    }
+
+    /// The failure of `operation` from `from` to `to` (a copy or a rename).
+    #[must_use]
+    pub fn on_paths(operation: &str, from: &str, to: &str, error: &std::io::Error) -> Self {
+        Self {
+            kind: io_error_kind(error.kind()),
+            message: format!(
+                "{operation} {} to {}: {}",
+                shown_path(from),
+                shown_path(to),
+                shown_reason(error)
+            ),
+        }
+    }
+
+    /// The failure of `operation`, which names no path (a standard stream).
+    #[must_use]
+    pub fn without_path(operation: &str, error: &std::io::Error) -> Self {
+        Self {
+            kind: io_error_kind(error.kind()),
+            message: format!("{operation}: {}", shown_reason(error)),
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> IpeErrorKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Prefixes the message with the failing operation, keeping the kind.
+    #[must_use]
+    pub fn context(self, operation: &str) -> Self {
+        Self {
+            kind: self.kind,
+            message: format!("{operation}: {}", self.message),
+        }
+    }
+
+    /// The failure in a generic error sink, under its classified kind.
+    #[must_use]
+    pub fn into_error<E: FromIpeError>(self) -> E {
+        E::from_ipe_error(IpeError::from(self))
+    }
+}
+
+impl From<IoFailure> for IpeError {
+    fn from(failure: IoFailure) -> Self {
+        Self::with(failure.kind, failure.message)
+    }
+}
+
+/// A path as an [`IoFailure`] message shows it: scrubbed, capped and quoted.
+///
+/// The scrub never writes `\"`, so escaping the quote keeps the quoted span
+/// unambiguous: a path cannot close its own quotes and spell a forged reason.
+pub(crate) fn shown_path(path: &str) -> String {
+    let scrubbed = crate::system::scrub_log_controls_capped(path, IO_FAILURE_PATH_MAX_BYTES);
+    format!("\"{}\"", scrubbed.replace('"', "\\\""))
+}
+
+/// The host's reason as an [`IoFailure`] message shows it: scrubbed and capped.
+fn shown_reason(error: &std::io::Error) -> String {
+    crate::system::scrub_log_controls_capped(&error.to_string(), IO_FAILURE_REASON_MAX_BYTES)
+}
+
 /// An error sink that can carry every [`KernelFailure`] kind.
 ///
 /// The one bound every generic kernel that lands a `KernelFailure` names, so a
@@ -824,13 +1006,13 @@ impl<E> KernelErrorSink for E where
 
 /// A kernel failure whose kind is decided where it is built.
 ///
-/// A bare `String` converts into `Unexpected`, so a `?` on an OS or library
-/// error keeps that classification; a ceiling refusal is built as
+/// A bare `String` converts into `Unexpected`; a host I/O failure is built as
+/// [`IoFailure`] under its classified kind; a ceiling refusal is built as
 /// `LimitExceeded`, a wall-clock expiry as `Timeout`, and each keeps its kind
 /// through `into_error`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KernelFailure {
-    /// An unclassified failure (an OS or library error).
+    /// An unclassified failure (a library error with no host category).
     Unexpected(String),
     /// A declared ceiling turned the input back.
     LimitExceeded(LimitRefusal),
@@ -838,15 +1020,25 @@ pub enum KernelFailure {
     TimedOut(TimeoutRefusal),
     /// The blocking pool could not start a thread for the operation.
     Unavailable(String),
+    /// A host I/O failure, kinded by its category.
+    Io(IoFailure),
+    /// Malformed input a parser refused.
+    Decode(String),
+    /// An operator-tunable ceiling setting the environment could not parse.
+    InvalidInput(String),
 }
 
 impl KernelFailure {
     #[must_use]
     pub fn message(&self) -> &str {
         match self {
-            Self::Unexpected(message) | Self::Unavailable(message) => message,
+            Self::Unexpected(message)
+            | Self::Unavailable(message)
+            | Self::Decode(message)
+            | Self::InvalidInput(message) => message,
             Self::LimitExceeded(refusal) => refusal.message(),
             Self::TimedOut(refusal) => refusal.message(),
+            Self::Io(failure) => failure.message(),
         }
     }
 
@@ -858,6 +1050,9 @@ impl KernelFailure {
             Self::LimitExceeded(refusal) => Self::LimitExceeded(refusal.context(operation)),
             Self::TimedOut(refusal) => Self::TimedOut(refusal.context(operation)),
             Self::Unavailable(message) => Self::Unavailable(format!("{operation}: {message}")),
+            Self::Io(failure) => Self::Io(failure.context(operation)),
+            Self::Decode(message) => Self::Decode(format!("{operation}: {message}")),
+            Self::InvalidInput(message) => Self::InvalidInput(format!("{operation}: {message}")),
         }
     }
 
@@ -869,6 +1064,9 @@ impl KernelFailure {
             Self::LimitExceeded(refusal) => refusal.into_error(),
             Self::TimedOut(refusal) => refusal.into_error(),
             Self::Unavailable(message) => E::from_unavailable(message),
+            Self::Io(failure) => failure.into_error(),
+            Self::Decode(message) => E::from_ipe_error(IpeError::decode(message)),
+            Self::InvalidInput(message) => E::from_ipe_error(IpeError::invalid_input(message)),
         }
     }
 }
@@ -882,6 +1080,12 @@ impl From<TimeoutRefusal> for KernelFailure {
 impl From<String> for KernelFailure {
     fn from(message: String) -> Self {
         Self::Unexpected(message)
+    }
+}
+
+impl From<IoFailure> for KernelFailure {
+    fn from(failure: IoFailure) -> Self {
+        Self::Io(failure)
     }
 }
 
@@ -901,6 +1105,126 @@ impl FromUnavailable for KernelFailure {
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
+
+    /// Every classified host I/O category lands on its `ErrorKind`.
+    #[test]
+    fn io_categories_map_to_their_kind() {
+        use IpeErrorKind as I;
+        use std::io::ErrorKind as K;
+        let table = [
+            (K::NotFound, I::NotFound),
+            (K::PermissionDenied, I::PermissionDenied),
+            (K::ReadOnlyFilesystem, I::PermissionDenied),
+            (K::ConnectionRefused, I::Network),
+            (K::ConnectionReset, I::Network),
+            (K::ConnectionAborted, I::Network),
+            (K::NotConnected, I::Network),
+            (K::HostUnreachable, I::Network),
+            (K::NetworkUnreachable, I::Network),
+            (K::NetworkDown, I::Network),
+            (K::AlreadyExists, I::Conflict),
+            (K::DirectoryNotEmpty, I::Conflict),
+            (K::AddrInUse, I::Conflict),
+            (K::WouldBlock, I::Unavailable),
+            (K::ResourceBusy, I::Unavailable),
+            (K::ExecutableFileBusy, I::Unavailable),
+            (K::TimedOut, I::Timeout),
+            (K::InvalidInput, I::InvalidInput),
+            (K::InvalidFilename, I::InvalidInput),
+            (K::NotADirectory, I::InvalidInput),
+            (K::IsADirectory, I::InvalidInput),
+            (K::AddrNotAvailable, I::InvalidInput),
+            (K::InvalidData, I::Decode),
+            (K::FileTooLarge, I::LimitExceeded),
+            (K::QuotaExceeded, I::LimitExceeded),
+            (K::ArgumentListTooLong, I::LimitExceeded),
+            (K::BrokenPipe, I::Io),
+            (K::StaleNetworkFileHandle, I::Io),
+            (K::Interrupted, I::Io),
+            (K::WriteZero, I::Io),
+            (K::UnexpectedEof, I::Io),
+            (K::StorageFull, I::Io),
+            (K::NotSeekable, I::Io),
+            (K::Deadlock, I::Io),
+            (K::CrossesDevices, I::Io),
+            (K::TooManyLinks, I::Io),
+            (K::Unsupported, I::Io),
+            (K::OutOfMemory, I::Io),
+        ];
+        for (host, kind) in table {
+            assert_eq!(io_error_kind(host), kind, "{host:?}");
+            let failure = IoFailure::without_path("op", &std::io::Error::from(host));
+            assert_eq!(failure.kind(), kind, "{host:?}");
+        }
+    }
+
+    /// A host category with no Ipê meaning stays `Unexpected`.
+    #[test]
+    fn unclassified_io_category_stays_unexpected() {
+        assert_eq!(
+            io_error_kind(std::io::ErrorKind::Other),
+            IpeErrorKind::Unexpected
+        );
+        let failure = IoFailure::without_path("op", &std::io::Error::other("custom"));
+        assert_eq!(failure.kind(), IpeErrorKind::Unexpected);
+    }
+
+    /// A missing file is `NotFound` and its message names the path.
+    #[test]
+    fn missing_path_is_not_found_and_named() {
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let err = IpeError::from(IoFailure::on_path("read file", "/no/such.txt", &missing));
+        let IpeError::Error(kind, info) = &err;
+        assert_eq!(*kind, IpeErrorKind::NotFound);
+        assert!(
+            info.message.starts_with("read file \"/no/such.txt\": "),
+            "{}",
+            info.message
+        );
+    }
+
+    /// A path's control characters and quotes show escaped, never raw.
+    #[test]
+    fn path_hazards_are_escaped() {
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let failure = IoFailure::on_path("read file", "a\u{1b}[2J\n\"b", &missing);
+        let message = failure.message();
+        assert!(!message.contains('\u{1b}'), "{message}");
+        assert!(!message.contains('\n'), "{message}");
+        assert!(message.contains("\"a\\u{1b}[2J\\n\\\"b\""), "{message}");
+        let two = IoFailure::on_paths("copy", "x\ry", "z", &missing);
+        assert!(!two.message().contains('\r'), "{}", two.message());
+    }
+
+    /// A path past the display cap is cut and marked, never echoed whole.
+    #[test]
+    fn long_path_is_capped() {
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let long = "p".repeat(IO_FAILURE_PATH_MAX_BYTES + 1);
+        let failure = IoFailure::on_path("read file", &long, &missing);
+        assert!(!failure.message().contains(&long));
+        assert!(failure.message().contains(crate::system::SCRUB_TRUNCATED));
+    }
+
+    /// A decode failure lands as `Decode` in `IpeError` and verbatim in `String`.
+    #[test]
+    fn decode_failure_is_decode_kind() {
+        let err = IpeError::from_decode_failure("bad".to_owned());
+        assert_eq!(err.to_ipe_string(), "Decode: bad");
+        assert_eq!(String::from_decode_failure("bad".to_owned()), "bad");
+    }
+
+    /// The `Io` and `Decode` kernel failures keep their kinds in the sink.
+    #[test]
+    fn kernel_failure_io_and_decode_keep_kind() {
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let io: IpeError =
+            KernelFailure::from(IoFailure::on_path("read", "f", &missing)).into_error();
+        let IpeError::Error(kind, _) = &io;
+        assert_eq!(*kind, IpeErrorKind::NotFound);
+        let decode: IpeError = KernelFailure::Decode("bad row".to_owned()).into_error();
+        assert_eq!(decode.to_ipe_string(), "Decode: bad row");
+    }
 
     #[test]
     fn constructors_carry_kind_and_message() {

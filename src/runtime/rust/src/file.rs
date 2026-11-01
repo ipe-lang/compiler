@@ -9,7 +9,7 @@
 // the proof.
 use super::path::{OsOrigin, Path, from_os, join_entry, name_from_os};
 use super::{
-    IpeError, IpeResult, IpeTask, KernelFailure, LimitRefusal, from_u8_slice, ok_res, str_err,
+    IoFailure, IpeError, IpeResult, IpeTask, KernelFailure, LimitRefusal, from_u8_slice, ok_res,
 };
 
 // ── shared blocking-pool helper ───────────────────────────────────────
@@ -69,23 +69,24 @@ const FILE_READ_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::
 /// The ceiling bounds an attacker-controlled path pointing at an unbounded
 /// source (`/dev/zero`, a named pipe, a multi-GiB file) so it cannot exhaust
 /// memory. A malformed setting fails the read closed rather than falling back.
-fn file_read_ceiling() -> Result<u64, String> {
-    FILE_READ_CEILING.read().map_err(String::from)
+fn file_read_ceiling() -> Result<u64, crate::system::EnvCeilingRefusal> {
+    FILE_READ_CEILING.read()
 }
 
 fn file_read_file_sync(path: &str, cap: u64) -> Result<String, KernelFailure> {
     use std::io::Read;
-    let f = std::fs::File::open(path).map_err(|e| format!("{e}"))?;
+    let f = std::fs::File::open(path).map_err(|e| IoFailure::on_path("read file", path, &e))?;
     // take(cap + 1): if the source yields more than `cap` bytes we still
     // stop at a bounded read and report an error rather than OOM.
     let mut buf = String::new();
     let read = f
         .take(cap.saturating_add(1))
         .read_to_string(&mut buf)
-        .map_err(|e| format!("{e}"))?;
+        .map_err(|e| IoFailure::on_path("read file", path, &e))?;
     if read as u64 > cap {
         return Err(LimitRefusal::new(format!(
-            "file exceeds read ceiling of {cap} bytes (raise IPE_FILE_READ_MAX or use File.readFileLimit): {path}"
+            "file exceeds read ceiling of {cap} bytes (raise IPE_FILE_READ_MAX or use File.readFileLimit): {}",
+            crate::error::shown_path(path)
         ))
         .into());
     }
@@ -100,7 +101,7 @@ pub fn file_read_file<E: Send + crate::KernelErrorSink + 'static>(
     Box::pin(async move {
         let cap = match file_read_ceiling() {
             Ok(cap) => cap,
-            Err(e) => return IpeResult::Err(str_err(&e)),
+            Err(e) => return IpeResult::Err(E::from_ipe_error(IpeError::from(e))),
         };
         match run_blocking::<_, KernelFailure, KernelFailure, _>(move || {
             file_read_file_sync(&path, cap)
@@ -113,20 +114,24 @@ pub fn file_read_file<E: Send + crate::KernelErrorSink + 'static>(
     })
 }
 
-fn file_write_file_sync(path: &str, content: &str) -> Result<(), String> {
-    std::fs::write(path, content).map_err(|e| format!("{e}"))
+fn file_write_file_sync(path: &str, content: &str) -> Result<(), KernelFailure> {
+    std::fs::write(path, content).map_err(|e| IoFailure::on_path("write file", path, &e).into())
 }
 
 #[must_use]
-pub fn file_write_file<E: Send + From<String> + crate::FromUnavailable + 'static>(
+pub fn file_write_file<E: Send + crate::KernelErrorSink + 'static>(
     path: Path,
     content: String,
 ) -> IpeTask<E, ()> {
     let path = path.into_string();
     Box::pin(async move {
-        match run_blocking(move || file_write_file_sync(&path, &content)).await {
+        match run_blocking::<_, KernelFailure, KernelFailure, _>(move || {
+            file_write_file_sync(&path, &content)
+        })
+        .await
+        {
             Ok(()) => ok_res(()),
-            Err(e) => IpeResult::Err(e),
+            Err(e) => IpeResult::Err(e.into_error()),
         }
     })
 }
@@ -149,28 +154,27 @@ pub fn file_exists<E: Send + From<String> + crate::FromUnavailable + 'static>(
 /// Alias of `file_remove` (the `remove` contract). Kept as a public name for
 /// ABI stability; delegates so the two never drift.
 #[must_use]
-pub fn file_delete<E: Send + From<String> + crate::FromUnavailable + 'static>(
-    path: Path,
-) -> IpeTask<E, ()> {
+pub fn file_delete<E: Send + crate::KernelErrorSink + 'static>(path: Path) -> IpeTask<E, ()> {
     file_remove(path)
 }
 
-fn file_mkdir_all_sync(path: &str) -> Result<(), String> {
-    std::fs::create_dir_all(path).map_err(|e| format!("{e}"))
+fn file_mkdir_all_sync(path: &str) -> Result<(), KernelFailure> {
+    std::fs::create_dir_all(path)
+        .map_err(|e| IoFailure::on_path("create directory", path, &e).into())
 }
 
 /// `Ipe.File.mkdirAll : String -> Task Error ()` — create the directory
 /// and every missing parent (mkdir -p). Already-exists is `Ok` (matching
 /// `std::fs::create_dir_all`); a real I/O failure is `Err`.
 #[must_use]
-pub fn file_mkdir_all<E: Send + From<String> + crate::FromUnavailable + 'static>(
-    path: Path,
-) -> IpeTask<E, ()> {
+pub fn file_mkdir_all<E: Send + crate::KernelErrorSink + 'static>(path: Path) -> IpeTask<E, ()> {
     let path = path.into_string();
     Box::pin(async move {
-        match run_blocking(move || file_mkdir_all_sync(&path)).await {
+        match run_blocking::<_, KernelFailure, KernelFailure, _>(move || file_mkdir_all_sync(&path))
+            .await
+        {
             Ok(()) => ok_res(()),
-            Err(e) => IpeResult::Err(e),
+            Err(e) => IpeResult::Err(e.into_error()),
         }
     })
 }
@@ -183,14 +187,20 @@ pub fn file_mkdir_all<E: Send + From<String> + crate::FromUnavailable + 'static>
 /// `fstat` on the opened handle instead of stalling the reader, and a terminal
 /// never becomes the controlling one.
 #[cfg(unix)]
-fn open_regular_following(path: &str) -> Result<std::fs::File, String> {
+fn open_regular_following(path: &str) -> Result<std::fs::File, IoFailure> {
     use rustix::fs::{CWD, FileType, Mode, OFlags};
-    let shown = |errno: rustix::io::Errno| format!("{}", std::io::Error::from(errno));
+    let shown = |errno: rustix::io::Errno| {
+        IoFailure::on_path("read file", path, &std::io::Error::from(errno))
+    };
     let flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
     let fd = rustix::fs::openat(CWD, path, flags, Mode::empty()).map_err(shown)?;
     let stat = rustix::fs::fstat(&fd).map_err(shown)?;
     if !matches!(FileType::from_raw_mode(stat.st_mode), FileType::RegularFile) {
-        return Err(format!("not a regular file: {path}"));
+        return Err(IoFailure::on_path(
+            "read file",
+            path,
+            &std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"),
+        ));
     }
     let status = rustix::fs::fcntl_getfl(&fd).map_err(shown)?;
     rustix::fs::fcntl_setfl(&fd, status.difference(OFlags::NONBLOCK)).map_err(shown)?;
@@ -199,8 +209,8 @@ fn open_regular_following(path: &str) -> Result<std::fs::File, String> {
 
 /// Opens `path` to read, following links.
 #[cfg(not(unix))]
-fn open_regular_following(path: &str) -> Result<std::fs::File, String> {
-    std::fs::File::open(path).map_err(|e| format!("{e}"))
+fn open_regular_following(path: &str) -> Result<std::fs::File, IoFailure> {
+    std::fs::File::open(path).map_err(|e| IoFailure::on_path("read file", path, &e))
 }
 
 fn file_read_file_limit_sync(path: &str, cap: u64) -> Result<String, KernelFailure> {
@@ -210,10 +220,11 @@ fn file_read_file_limit_sync(path: &str, cap: u64) -> Result<String, KernelFailu
     let read = f
         .take(cap.saturating_add(1))
         .read_to_string(&mut buf)
-        .map_err(|e| format!("{e}"))?;
+        .map_err(|e| IoFailure::on_path("read file", path, &e))?;
     if read as u64 > cap {
         return Err(LimitRefusal::new(format!(
-            "file exceeds {cap}-byte limit (stopped reading at the limit — actual size not reported to bound memory use): {path}"
+            "file exceeds {cap}-byte limit (stopped reading at the limit — actual size not reported to bound memory use): {}",
+            crate::error::shown_path(path)
         ))
         .into());
     }
@@ -255,7 +266,7 @@ pub fn file_read_file_limit<E: Send + crate::KernelErrorSink + 'static>(
     Box::pin(async move {
         let cap = match cap {
             Ok(cap) => cap,
-            Err(e) => return IpeResult::Err(str_err(&e)),
+            Err(e) => return IpeResult::Err(E::from_ipe_error(IpeError::invalid_input(e))),
         };
         match run_blocking::<_, KernelFailure, KernelFailure, _>(move || {
             file_read_file_limit_sync(&path, cap)
@@ -295,7 +306,7 @@ pub fn file_read_file_beneath(root: Path, rel: Path, limit: i64) -> IpeTask<IpeE
         let effective = requested.and_then(|cap| {
             file_read_ceiling()
                 .map(|ceiling| cap.min(ceiling))
-                .map_err(IpeError::invalid_input)
+                .map_err(IpeError::from)
         });
         let cap = match effective {
             Ok(cap) => cap,
@@ -433,7 +444,7 @@ mod beneath {
                 Self::TooLarge { .. } => IpeError::limit_exceeded(message),
                 Self::Absent => IpeError::not_found().with_message(message),
                 Self::Denied => IpeError::permission_denied().with_message(message),
-                Self::Io(_) => IpeError::io(message),
+                Self::Io(kind) => IpeError::from_io_kind(kind, message),
             }
         }
     }
@@ -654,7 +665,7 @@ mod unsupported_beneath {
 
 fn file_read_file_bytes_sync(path: &str) -> Result<Vec<i64>, KernelFailure> {
     use std::io::Read as _;
-    let f = std::fs::File::open(path).map_err(|e| format!("{e}"))?;
+    let f = std::fs::File::open(path).map_err(|e| IoFailure::on_path("read file", path, &e))?;
     let mut buf = Vec::new();
     // Read `READ_FILE_BYTES_CEILING + 1` bytes in one pass and check the bytes
     // actually read (same idiom as `file_read_file_sync`): a file over the cap
@@ -662,10 +673,11 @@ fn file_read_file_bytes_sync(path: &str) -> Result<Vec<i64>, KernelFailure> {
     let read = f
         .take(READ_FILE_BYTES_CEILING.saturating_add(1))
         .read_to_end(&mut buf)
-        .map_err(|e| format!("{e}"))?;
+        .map_err(|e| IoFailure::on_path("read file", path, &e))?;
     if read as u64 > READ_FILE_BYTES_CEILING {
         return Err(LimitRefusal::new(format!(
-            "file exceeds {READ_FILE_BYTES_CEILING}-byte limit (stopped reading at the limit — actual size not reported to bound memory use): {path}"
+            "file exceeds {READ_FILE_BYTES_CEILING}-byte limit (stopped reading at the limit — actual size not reported to bound memory use): {}",
+            crate::error::shown_path(path)
         ))
         .into());
     }
@@ -696,51 +708,57 @@ pub fn file_read_file_bytes<E: Send + crate::KernelErrorSink + 'static>(
 
 // ─── Write variants ────────────────────────────────────────────────────────
 
-fn file_append_sync(path: &str, content: &str) -> Result<(), String> {
+fn file_append_sync(path: &str, content: &str) -> Result<(), KernelFailure> {
     use std::io::Write as _;
+    let failed =
+        |e: std::io::Error| KernelFailure::from(IoFailure::on_path("append to file", path, &e));
     let mut f = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
         .open(path)
-        .map_err(|e| format!("{e}"))?;
-    f.write_all(content.as_bytes()).map_err(|e| format!("{e}"))
+        .map_err(failed)?;
+    f.write_all(content.as_bytes()).map_err(failed)
 }
 
 /// `Ipe.File.append : String -> String -> Task Error ()`
 /// Append `content` to the end of the file at `path`, creating it if absent.
 /// Implements `os.OpenFile(…, O_APPEND|O_CREATE|O_WRONLY, 0644)`.
 #[must_use]
-pub fn file_append<E: Send + From<String> + crate::FromUnavailable + 'static>(
+pub fn file_append<E: Send + crate::KernelErrorSink + 'static>(
     path: Path,
     content: String,
 ) -> IpeTask<E, ()> {
     let path = path.into_string();
     Box::pin(async move {
-        match run_blocking(move || file_append_sync(&path, &content)).await {
+        match run_blocking::<_, KernelFailure, KernelFailure, _>(move || {
+            file_append_sync(&path, &content)
+        })
+        .await
+        {
             Ok(()) => ok_res(()),
-            Err(e) => IpeResult::Err(e),
+            Err(e) => IpeResult::Err(e.into_error()),
         }
     })
 }
 
 // ─── Removal ───────────────────────────────────────────────────────────────
 
-fn file_remove_sync(path: &str) -> Result<(), String> {
-    std::fs::remove_file(path).map_err(|e| format!("{e}"))
+fn file_remove_sync(path: &str) -> Result<(), KernelFailure> {
+    std::fs::remove_file(path).map_err(|e| IoFailure::on_path("remove file", path, &e).into())
 }
 
 /// `Ipe.File.remove : String -> Task Error ()`
 /// Remove the file at `path`. Returns `Err` on any I/O failure (including
 /// "not found"). Implements `os.Remove`.
 #[must_use]
-pub fn file_remove<E: Send + From<String> + crate::FromUnavailable + 'static>(
-    path: Path,
-) -> IpeTask<E, ()> {
+pub fn file_remove<E: Send + crate::KernelErrorSink + 'static>(path: Path) -> IpeTask<E, ()> {
     let path = path.into_string();
     Box::pin(async move {
-        match run_blocking(move || file_remove_sync(&path)).await {
+        match run_blocking::<_, KernelFailure, KernelFailure, _>(move || file_remove_sync(&path))
+            .await
+        {
             Ok(()) => ok_res(()),
-            Err(e) => IpeResult::Err(e),
+            Err(e) => IpeResult::Err(e.into_error()),
         }
     })
 }
@@ -753,10 +771,11 @@ fn file_read_dir_sync(path: &str) -> Result<Vec<String>, IpeError> {
     // a transient stat/readdir failure touched —  `os.ReadDir` surfaces
     // such an error rather than returning a truncated list).
     // A name that is not valid UTF-8 is refused, never rewritten lossily.
-    let rd = std::fs::read_dir(path).map_err(|e| IpeError::from(format!("{e}")))?;
+    let failed = |e: std::io::Error| IpeError::from(IoFailure::on_path("read directory", path, &e));
+    let rd = std::fs::read_dir(path).map_err(failed)?;
     let mut names: Vec<String> = Vec::new();
     for entry in rd {
-        let entry = entry.map_err(|e| IpeError::from(format!("{e}")))?;
+        let entry = entry.map_err(failed)?;
         names.push(name_from_os(&entry.file_name(), OsOrigin::ReadDir)?);
     }
     Ok(names)
@@ -849,7 +868,7 @@ pub fn file_temp_dir<E: Send + From<IpeError> + crate::FromUnavailable + 'static
 /// never rewritten lossily.
 fn temp_file_sync(prefix: &str) -> Result<String, IpeError> {
     let (path, _file) = super::scratch_core::private_temp_file(prefix)
-        .map_err(|e| IpeError::from(e.to_string()))?;
+        .map_err(|e| IpeError::from(IoFailure::without_path("create temp file", &e)))?;
     sealed_temp(&path, OsOrigin::TempFile)
 }
 
@@ -857,8 +876,8 @@ fn temp_file_sync(prefix: &str) -> Result<String, IpeError> {
 ///
 /// Sealed under the host regime exactly as [`temp_file_sync`].
 fn temp_dir_sync(prefix: &str) -> Result<String, IpeError> {
-    let dir =
-        super::scratch_core::ScratchDir::new(prefix).map_err(|e| IpeError::from(e.to_string()))?;
+    let dir = super::scratch_core::ScratchDir::new(prefix)
+        .map_err(|e| IpeError::from(IoFailure::without_path("create temp directory", &e)))?;
     sealed_temp(&dir.into_path(), OsOrigin::TempDir)
 }
 
@@ -879,46 +898,52 @@ fn sealed_temp(path: &std::path::Path, origin: OsOrigin) -> Result<String, IpeEr
 
 // ─── Copy / rename ─────────────────────────────────────────────────────────
 
-fn file_copy_sync(src: &str, dst: &str) -> Result<(), String> {
+fn file_copy_sync(src: &str, dst: &str) -> Result<(), KernelFailure> {
     std::fs::copy(src, dst)
         .map(|_| ())
-        .map_err(|e| format!("{e}"))
+        .map_err(|e| IoFailure::on_paths("copy", src, dst, &e).into())
 }
 
 /// `Ipe.File.copy : String -> String -> Task Error ()`
 /// Copy the file at `src` to `dst`, creating or overwriting `dst`.
 /// Implements `io.Copy(out, in)` pattern.
 #[must_use]
-pub fn file_copy<E: Send + From<String> + crate::FromUnavailable + 'static>(
+pub fn file_copy<E: Send + crate::KernelErrorSink + 'static>(
     src: Path,
     dst: Path,
 ) -> IpeTask<E, ()> {
     let (src, dst) = (src.into_string(), dst.into_string());
     Box::pin(async move {
-        match run_blocking(move || file_copy_sync(&src, &dst)).await {
+        match run_blocking::<_, KernelFailure, KernelFailure, _>(move || file_copy_sync(&src, &dst))
+            .await
+        {
             Ok(()) => ok_res(()),
-            Err(e) => IpeResult::Err(e),
+            Err(e) => IpeResult::Err(e.into_error()),
         }
     })
 }
 
-fn file_rename_sync(src: &str, dst: &str) -> Result<(), String> {
-    std::fs::rename(src, dst).map_err(|e| format!("{e}"))
+fn file_rename_sync(src: &str, dst: &str) -> Result<(), KernelFailure> {
+    std::fs::rename(src, dst).map_err(|e| IoFailure::on_paths("rename", src, dst, &e).into())
 }
 
 /// `Ipe.File.rename : String -> String -> Task Error ()`
 /// Rename (move) the file or directory at `src` to `dst`.
 /// Implements `os.Rename`.
 #[must_use]
-pub fn file_rename<E: Send + From<String> + crate::FromUnavailable + 'static>(
+pub fn file_rename<E: Send + crate::KernelErrorSink + 'static>(
     src: Path,
     dst: Path,
 ) -> IpeTask<E, ()> {
     let (src, dst) = (src.into_string(), dst.into_string());
     Box::pin(async move {
-        match run_blocking(move || file_rename_sync(&src, &dst)).await {
+        match run_blocking::<_, KernelFailure, KernelFailure, _>(move || {
+            file_rename_sync(&src, &dst)
+        })
+        .await
+        {
             Ok(()) => ok_res(()),
-            Err(e) => IpeResult::Err(e),
+            Err(e) => IpeResult::Err(e.into_error()),
         }
     })
 }
@@ -958,13 +983,12 @@ fn walk_dir(
         return Ok(());
     }
 
-    let rd = match std::fs::read_dir(dir.as_str()) {
-        Ok(rd) => rd,
-        Err(e) => return Err(IpeError::from(format!("{e}"))),
-    };
+    let failed =
+        |e: std::io::Error| IpeError::from(IoFailure::on_path("read directory", dir.as_str(), &e));
+    let rd = std::fs::read_dir(dir.as_str()).map_err(failed)?;
 
     for entry in rd {
-        let entry = entry.map_err(|e| IpeError::from(format!("{e}")))?;
+        let entry = entry.map_err(failed)?;
         // Every yielded `Path` is the sealed join of the sealed root and the
         // entry name: a name that is not UTF-8, or that the join refuses, fails
         // the walk rather than being rewritten or skipped.
@@ -991,13 +1015,23 @@ fn walk_dir(
     Ok(())
 }
 
-fn file_walk_sync(root: &Path) -> Result<Vec<Path>, IpeError> {
-    if !std::path::Path::new(root.as_str()).is_dir() {
-        return Err(IpeError::from(format!(
-            "not a directory: {}",
-            root.as_str()
-        )));
+/// Admits `root` as a walk root, or refuses it under the host's own kind.
+///
+/// A root the host cannot stat (absent, denied) keeps that category; a root
+/// that stats as anything but a directory is `NotADirectory`.
+fn walk_root(root: &Path) -> Result<(), IpeError> {
+    let refused = |e: &std::io::Error| IpeError::from(IoFailure::on_path("walk", root.as_str(), e));
+    match std::fs::metadata(root.as_str()) {
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(refused(&std::io::Error::from(
+            std::io::ErrorKind::NotADirectory,
+        ))),
+        Err(e) => Err(refused(&e)),
     }
+}
+
+fn file_walk_sync(root: &Path) -> Result<Vec<Path>, IpeError> {
+    walk_root(root)?;
     let mut visited = std::collections::HashSet::new();
     let mut out = Vec::new();
     walk_dir(root, &mut visited, None, &mut out)?;
@@ -1009,12 +1043,7 @@ fn file_walk_matching_sync(
     root: &Path,
     pred: &dyn Fn(&Path) -> bool,
 ) -> Result<Vec<Path>, IpeError> {
-    if !std::path::Path::new(root.as_str()).is_dir() {
-        return Err(IpeError::from(format!(
-            "not a directory: {}",
-            root.as_str()
-        )));
-    }
+    walk_root(root)?;
     let mut visited = std::collections::HashSet::new();
     let mut out = Vec::new();
     walk_dir(root, &mut visited, Some(pred), &mut out)?;
@@ -1113,6 +1142,21 @@ mod read_ceiling_tests {
                 "file exceeds read ceiling of 1024 bytes (raise IPE_FILE_READ_MAX or use File.readFileLimit): "
             )),
             "8 KiB read under a 1 KiB ceiling must be a LimitExceeded refusal: {res:?}"
+        );
+    }
+
+    /// Reading a missing file is `NotFound` and names the quoted path.
+    #[test]
+    fn read_missing_file_is_not_found() {
+        let p = crate::scratch_core::test_temp_root()
+            .join(format!("ipe_rc_missing_{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let shown = format!("read file \"{}\": ", p.display());
+        let res: IpeResult<IpeError, String> = block(file_read_file(tp(&p)));
+        assert!(
+            matches!(&res, IpeResult::Err(IpeError::Error(crate::IpeErrorKind::NotFound, info))
+                if info.message.starts_with(&shown)),
+            "a missing file must be a NotFound naming its path: {res:?}"
         );
     }
 
@@ -1298,6 +1342,38 @@ mod read_file_limit_tests {
                 if info.message.starts_with("file exceeds 16-byte limit (stopped reading at the limit")),
             "17 bytes under a 16-byte limit must be a LimitExceeded refusal: {res:?}"
         );
+    }
+
+    /// An over-limit refusal shows a hazardous path escaped, never raw.
+    #[cfg(unix)]
+    #[test]
+    fn over_limit_refusal_escapes_the_path() {
+        let p = crate::scratch_core::test_temp_root().join(format!(
+            "ipe_rfl_esc_{}_\u{1b}[2J\"x.txt",
+            std::process::id()
+        ));
+        std::fs::write(&p, vec![b'a'; 17]).unwrap();
+        let shown = p.to_string_lossy();
+        let refusals = [
+            (
+                "file exceeds 16-byte limit",
+                file_read_file_limit_sync(&shown, 16),
+            ),
+            (
+                "file exceeds read ceiling of 16 bytes",
+                file_read_file_sync(&shown, 16),
+            ),
+        ];
+        let _ = std::fs::remove_file(&p);
+        for (prefix, res) in refusals {
+            let message = match res {
+                Err(KernelFailure::LimitExceeded(refusal)) => refusal.message().to_owned(),
+                other => format!("not a LimitExceeded refusal: {other:?}"),
+            };
+            assert!(message.starts_with(prefix), "{message:?}");
+            assert!(!message.contains('\u{1b}'), "{message:?}");
+            assert!(message.contains("\\u{1b}[2J\\\"x.txt\""), "{message:?}");
+        }
     }
 
     fn limit_read(name: &str, content: &[u8], limit: i64) -> IpeResult<String, String> {
@@ -1631,6 +1707,28 @@ mod walk_tests {
 
     #[test]
     fn walk_on_nonexistent_root_errs() {
+        let absent = crate::scratch_core::test_temp_root().join("ipe_walk_nonexistent_kind_38291");
+        let res: IpeResult<IpeError, Vec<Path>> = block(file_walk(tp(&absent)));
+        assert!(
+            matches!(
+                &res,
+                IpeResult::Err(IpeError::Error(crate::IpeErrorKind::NotFound, _))
+            ),
+            "a missing walk root must be NotFound, not a non-directory: {res:?}"
+        );
+        let file = crate::scratch_core::test_temp_root()
+            .join(format!("ipe_walk_file_root_{}.txt", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        let res: IpeResult<IpeError, Vec<Path>> = block(file_walk(tp(&file)));
+        let _ = std::fs::remove_file(&file);
+        assert!(
+            matches!(
+                &res,
+                IpeResult::Err(IpeError::Error(crate::IpeErrorKind::InvalidInput, _))
+            ),
+            "a file walk root must be InvalidInput (NotADirectory): {res:?}"
+        );
+
         let root = crate::scratch_core::test_temp_root().join("ipe_walk_nonexistent_38291");
         let res: IpeResult<IpeError, Vec<Path>> = block(file_walk(tp(&root)));
         assert!(
