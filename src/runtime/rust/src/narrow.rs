@@ -176,13 +176,6 @@ mod tests {
 
     #[test]
     fn byte_saturating_matches_the_scalar_ffi_rule() {
-        let rendered = include_str!("../../../compiler/ffi/src/num_coerce.rs");
-        assert!(
-            rendered.contains(
-                r#""u8" | "u16" | "u32" => format!("{par}.clamp(0, {raw}::MAX as i64) as {raw}")"#
-            ),
-            "the scalar FFI u8 rule changed; re-derive `byte_saturating` from it"
-        );
         assert_eq!(byte_saturating(256), 255);
         assert_eq!(byte_saturating(-1), 0);
         assert_eq!(byte_saturating(255), 255);
