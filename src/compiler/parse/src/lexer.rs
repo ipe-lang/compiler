@@ -219,7 +219,6 @@ pub struct Token {
     pub span: Span,
 }
 
-#[derive(Clone)]
 struct Lexer<'src> {
     /// The full source. A lexeme spans a contiguous byte range `[lo, hi)`, so a
     /// keyword/number/body reads directly from `src[lo..hi]` — no per-char heap
@@ -455,8 +454,9 @@ impl LexicalRegion {
 /// mid-edit. A literal or comment the lexer refuses is one region running to
 /// the end of the line it was refused on (to end of input for a `"""` string
 /// or a comment, where the refusal stands); a code token the lexer refuses is
-/// one character of code, and reading resumes after it. Each region consumes
-/// at least one character, so the walk is linear in `src.len()`.
+/// one region of code over the bytes its recogniser read (at least one
+/// character), and reading resumes where it stopped. No byte is read twice,
+/// so the walk is linear in `src.len()`.
 #[must_use]
 pub fn lexical_regions(src: &str) -> LexicalRegions<'_> {
     LexicalRegions {
@@ -469,15 +469,15 @@ pub fn lexical_regions(src: &str) -> LexicalRegions<'_> {
 fn token_region(lx: &mut Lexer<'_>, c: char, lo: u32) -> (PositionContext, bool) {
     let opener = Opener::of(lx, c);
     let context = opener.context();
-    let restart = (context == PositionContext::Code).then(|| lx.clone());
-    match (lex_opened(lx, opener, c, lo), restart) {
-        (Ok(_), _) => (context, false),
-        (Err(_), Some(restart)) => {
-            *lx = restart;
-            lx.advance();
-            (context, false)
-        }
-        (Err(_), None) => {
+    match lex_opened(lx, opener, c, lo) {
+        Ok(_) => (context, false),
+        // A refused code token keeps the bytes its recogniser read — digits,
+        // a fraction, an exponent, or one operator character, never a comment
+        // or literal opener — so reading resumes where it stopped and no byte
+        // is read twice. A refusal that read nothing (an unknown character)
+        // is advanced past by the progress guard in `next`.
+        Err(_) if context == PositionContext::Code => (context, false),
+        Err(_) => {
             lx.skip_to_line_end();
             (context, true)
         }
@@ -510,8 +510,8 @@ impl Iterator for LexicalRegions<'_> {
         let (context, open_end) = lx
             .trivia_step()
             .map_or_else(|| token_region(lx, c, lo), Trivia::region);
-        // Every recogniser above consumes its first character; this keeps the
-        // walk finite even if one ever stops consuming.
+        // A refusal of an unknown character reads nothing; one character of
+        // progress per region keeps the walk finite.
         if lx.offset() <= lo {
             lx.advance();
         }

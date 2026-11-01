@@ -420,6 +420,39 @@ fn lexical_regions_tile_any_source() {
     }
 }
 
+/// A refused code token is one region over every byte the lexer read for it,
+/// so the walk stays linear: rewinding to one character past its start would
+/// re-read the rest of the run once per character (quadratic on a long
+/// out-of-range or name-joined number).
+#[test]
+fn a_refused_code_token_is_one_region_over_the_bytes_the_lexer_read() {
+    let run = "9".repeat(4096);
+    for (src, read, refused) in [
+        (run.clone(), run.len(), "out-of-range integer"),
+        (format!("{run}x"), run.len(), "number joined to a name"),
+        (
+            format!("{run}.5e1x"),
+            run.len() + 4,
+            "float joined to a name",
+        ),
+        ("& x".to_owned(), 1, "lone ampersand"),
+    ] {
+        let first = ipe_parse::lexical_regions(&src)
+            .next()
+            .map(|r| (r.span.lo, r.span.hi, r.context, r.open_end));
+        assert_eq!(
+            first,
+            Some((
+                0,
+                u32::try_from(read).unwrap_or(u32::MAX),
+                PositionContext::Code,
+                false
+            )),
+            "{refused}: the refused token's region ends where the lexer stopped"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Differential test: every non-code region `lexical_regions` reads, against
 // the real lexer's token spans and the trivia between them, over the stdlib
