@@ -50,6 +50,7 @@ use ipe_diagnostics::Span;
 use ipe_intern::Symbol;
 
 use crate::ast::{CaseBranch, Def, Expr, Expr_, LetBinding, Module, Pattern, Pattern_};
+use crate::name_index::{NameIndex, Target};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -101,6 +102,28 @@ impl ReferenceIndex {
         let mut map: BTreeMap<SymbolKey, Vec<Reference>> = BTreeMap::new();
         for (module, containing_path) in modules {
             collect_module(&mut map, module, containing_path);
+        }
+        Self { map }
+    }
+
+    /// Build the index by inverting each module's resolved-name index.
+    ///
+    /// `modules` pairs each module's [`NameIndex`] with the path its
+    /// references are stored under. Every top-level and constructor
+    /// occurrence the resolver recorded becomes a use site of its target;
+    /// locals and kernels carry no module-level symbol to key.
+    #[must_use]
+    pub fn from_name_indexes(modules: &[(&NameIndex, &[Symbol])]) -> Self {
+        let mut map: BTreeMap<SymbolKey, Vec<Reference>> = BTreeMap::new();
+        for (index, containing_path) in modules {
+            for (span, target) in index.entries() {
+                match target {
+                    Target::TopLevel { home, name } | Target::Ctor { home, name, .. } => {
+                        push_ref(&mut map, home, *name, span, containing_path);
+                    }
+                    Target::Local(_) | Target::Kernel { .. } => {}
+                }
+            }
         }
         Self { map }
     }
