@@ -625,9 +625,9 @@ fn stage_origin(
 /// step of `transfer` whose output is capped at `refs.bytes()`; a longer or
 /// malformed advertisement refuses the fetch before any object arrives. When
 /// an advertised ref's tip (the peeled commit of an annotated tag) is
-/// `wanted`, never when only its name is, that ref alone is fetched, at depth
-/// 1. Only a `wanted` reachable solely through history fetches every tag and
-/// branch, still under `transfer`'s disk, entry and wall ceilings.
+/// `wanted`, never when only its name is, that ref alone is fetched at depth
+/// one. Only a `wanted` reachable solely through history fetches every tag
+/// and branch, still under `transfer`'s disk, entry and wall ceilings.
 fn fetch_advertised(
     name: &PackageName,
     wanted: &Wanted,
@@ -1190,7 +1190,7 @@ mod tests {
             version: PublishedVersion::new(0, 0, 0),
             origin: LockedOrigin::Git {
                 source: SourceUrl::parse(name, "https://example.invalid/lib").expect("valid url"),
-                rev: rev.clone(),
+                rev,
             },
             sha256: Sha256Hex::of_tree(&cache).expect("hash"),
         });
