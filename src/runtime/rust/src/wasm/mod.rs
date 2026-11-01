@@ -2397,10 +2397,22 @@ mod tests {
     /// wrapped to element `0`; this is the target where a cast would wrap.
     #[wasm_bindgen_test]
     fn a_decode_index_past_the_usize_width_is_out_of_range() {
-        use crate::json::index_of;
+        use crate::json::{decode_index, index_of, json_decode_int};
+        use crate::json_val::JsonVal;
         assert_eq!(index_of(1 << 32, 1), None);
         assert_eq!(index_of(-(1 << 32), 1), None);
         assert_eq!(index_of(-1, 1), None);
         assert_eq!(index_of(0, 1), Some(0));
+        // The decoder itself, so a cast reintroduced at the call site is red.
+        let arr = JsonVal::from_serde(serde_json::json!([10, 20]));
+        for n in [1_i64 << 32, -(1_i64 << 32), (1_i64 << 32) + 1, -1, 2] {
+            let got = (decode_index(n, json_decode_int::<String>()).run)(&arr);
+            assert!(
+                matches!(&got, IpeResult::Err(e) if e.contains("index out of range")),
+                "index {n}: {got:?}"
+            );
+        }
+        let got = (decode_index(1, json_decode_int::<String>()).run)(&arr);
+        assert!(matches!(got, IpeResult::Ok(20)), "{got:?}");
     }
 }

@@ -1465,8 +1465,9 @@ mod tests {
             "nbf": -1e300,
             "iat": 9.3e18,
             "edge": -9_223_372_036_854_775_808.0,
+            "wide": u64::MAX,
         });
-        for claim in ["exp", "nbf", "iat"] {
+        for claim in ["exp", "nbf", "iat", "wide"] {
             assert_eq!(
                 read_numeric_date(&claims, claim),
                 Err(ClaimsRefusal::NonNumericDate { claim })
@@ -1477,6 +1478,27 @@ mod tests {
             admit_time_claims(&serde_json::json!({"exp": 1e300}), 0),
             Err(ClaimsRefusal::NonNumericDate { claim: "exp" })
         );
+        // An integer `exp` past `i64` (one jsonwebtoken reads as a `u64`) is
+        // refused too, never admitted as the saturated `i64::MAX`.
+        assert_eq!(
+            admit_time_claims(&serde_json::json!({"exp": u64::MAX}), 0),
+            Err(ClaimsRefusal::NonNumericDate { claim: "exp" })
+        );
+        // The `-2^63` edge is only compared, never subtracted: as `exp` it is
+        // long past, as `nbf` long reached.
+        let edge = -9_223_372_036_854_775_808.0_f64;
+        assert_eq!(
+            admit_time_claims(&serde_json::json!({"exp": edge}), i64::MIN),
+            Err(ClaimsRefusal::Expired)
+        );
+        assert_eq!(
+            admit_time_claims(&serde_json::json!({"nbf": edge}), i64::MIN),
+            Ok(())
+        );
+        assert!(matches!(
+            flat_hs256(hs256_token(&format!(r#"{{"sub":"x","exp":{}}}"#, u64::MAX))),
+            IpeResult::Err(_)
+        ));
         let msg = refusal(builder_hs256(
             500,
             hs256_token(r#"{"sub":"x","exp":1e300}"#),
