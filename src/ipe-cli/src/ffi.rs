@@ -3752,8 +3752,8 @@ type ForeignDefines = (
 /// A parse error in any source module is silently skipped here — the compile
 /// pipeline will surface it with full context moments later. A malformed
 /// `foreign` declaration (invalid carrier, unknown kind, …) is a typed refusal
-/// returned as an `Err` with a `CliError::Usage` carrying the source path
-/// and reason; the caller decides whether to propagate it immediately or defer.
+/// returned as an `Err` with a `CliError::ProjectRefused` carrying the source
+/// path and reason: the project's source is wrong, not the command line.
 ///
 /// The returned vectors are the exact same `ManifestDefine*` shapes the TOML
 /// readers produce, so they feed unchanged into `merge_provides`.
@@ -3812,10 +3812,10 @@ impl ForeignReader<'_> {
         self.interner.resolve(sym).unwrap_or("")
     }
 
-    /// Emit a typed refusal with a source location prefix.
+    /// Emit a project-state refusal with a source location prefix.
     fn reject(&self, span: ipe_diagnostics::Span, reason: &str) -> CliError {
         let (line, col) = line_col_from_span(self.src, span.lo);
-        CliError::Usage(text::msg::located_refusal(
+        CliError::ProjectRefused(text::msg::located_refusal(
             &self.file.display(),
             &line,
             &col,
@@ -6797,6 +6797,37 @@ version = \"1\"
         assert!(
             closures.is_empty() && structs.is_empty() && enums.is_empty() && opaques.is_empty()
         );
+    }
+
+    /// A malformed `foreign` declaration in the project's source is a
+    /// project-state refusal.
+    ///
+    /// It never routes as argument misuse, so no help page prints under it.
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed write IS the failure
+    fn a_malformed_foreign_declaration_is_a_project_refusal() {
+        let dir = ipe_test_temp::temp_root().join(format!(
+            "ipe-foreign-project-refused-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(
+            dir.join("Main.ipe"),
+            "module Main exposing (..)\n\nforeign Foo =\n    { crate = \"x\"\n    , kind = Phantom\n    }\n",
+        )
+        .expect("write source");
+        let got = scan_foreign_defines(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(got, Err(CliError::ProjectRefused(_))),
+            "a malformed `foreign` is project state, never argument misuse: {got:?}"
+        );
+        let Err(CliError::ProjectRefused(msg)) = got else {
+            return;
+        };
+        assert!(msg.contains("Main.ipe"), "names the source file: {msg}");
+        assert!(msg.contains("kind"), "names the refused field: {msg}");
     }
 
     /// A `_bindings.rs` that is a symlink is refused, never followed: the

@@ -228,8 +228,8 @@ impl DeliverySet {
     /// delivery, today's `release` behaviour.
     ///
     /// # Errors
-    /// [`CliError::Usage`] naming a duplicate entry; [`CliError::Usage`]
-    /// for a web-only entry on a non-web shape (the shape lesson); the underlying
+    /// [`CliError::ProjectRefused`] naming a duplicate entry;
+    /// [`CliError::ProjectRefused`] for a web-only entry on a non-web shape (the shape lesson); the underlying
     /// [`DeliveryError`] for any other invalid combination or a `--static`
     /// request the delivery cannot honour.
     pub fn resolve(pinned: Shape, entries: &[ShipEntry]) -> Result<Self, CliError> {
@@ -395,13 +395,13 @@ impl ReleaseOutcome {
 /// The duplicate-entry rejection, naming the repeated delivery and the fix.
 fn duplicate_entry(entry: ShipEntry) -> CliError {
     let words = describe_entry(entry);
-    CliError::Usage(crate::text::msg::ships_repeated(&words))
+    CliError::ProjectRefused(crate::text::msg::ships_repeated(&words))
 }
 
 /// The web-entry-on-non-web-shape rejection, in the pedagogical two-axis voice.
 fn web_entry_on_non_web(pinned: Shape, entry: ShipEntry) -> CliError {
     let words = describe_entry(entry);
-    CliError::Usage(crate::text::msg::ships_shape_mismatch(
+    CliError::ProjectRefused(crate::text::msg::ships_shape_mismatch(
         &words,
         &pinned.word(),
     ))
@@ -514,8 +514,12 @@ mod tests {
     fn web_entry_on_non_web_shape_is_pedagogical() {
         for shape in [Shape::Script, Shape::Tui, Shape::Cli, Shape::Worker] {
             let err = DeliverySet::resolve(shape, &[ShipEntry::ClientIos]).unwrap_err();
-            let CliError::Usage(msg) = err else {
-                panic!("expected a named rejection, got {err:?}");
+            assert!(
+                matches!(err, CliError::ProjectRefused(_)),
+                "a `ships` refusal is project state, never argument misuse: {err:?}"
+            );
+            let CliError::ProjectRefused(msg) = err else {
+                return;
             };
             assert!(msg.contains(shape.word()), "names the shape: {msg}");
             assert!(msg.contains("Web.tea"), "offers the fix: {msg}");
@@ -539,8 +543,12 @@ mod tests {
     fn duplicate_entry_is_rejected() {
         let err =
             DeliverySet::resolve(Shape::Web, &[ShipEntry::Client, ShipEntry::Client]).unwrap_err();
-        let CliError::Usage(msg) = err else {
-            panic!("expected a named rejection, got {err:?}");
+        assert!(
+            matches!(err, CliError::ProjectRefused(_)),
+            "a `ships` refusal is project state, never argument misuse: {err:?}"
+        );
+        let CliError::ProjectRefused(msg) = err else {
+            return;
         };
         assert!(msg.contains("twice"), "names the duplicate: {msg}");
     }
