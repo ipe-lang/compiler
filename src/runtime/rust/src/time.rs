@@ -40,9 +40,9 @@ pub fn time_now<E: Send + 'static>(_: ()) -> IpeTask<E, i64> {
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 pub fn time_sleep<E: Send + 'static>(ms: i64) -> IpeTask<E, ()> {
     Box::pin(async move {
-        // Clamp negative ms to 0: `ms as u64` on a negative wraps to a near-
+        // Clamp negative ms to 0: a negative reinterpreted as `u64` is a near-
         // infinite Duration (permanent deadlock from a well-typed Time.sleep).
-        tokio::time::sleep(std::time::Duration::from_millis(ms.max(0) as u64)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(ms.max(0).unsigned_abs())).await;
         ok_res(())
     })
 }
@@ -58,7 +58,7 @@ pub fn time_sleep<E: Send + 'static>(ms: i64) -> IpeTask<E, ()> {
 ))]
 pub fn time_sleep<E: Send + 'static>(ms: i64) -> IpeTask<E, ()> {
     Box::pin(async move {
-        std::thread::sleep(std::time::Duration::from_millis(ms.max(0) as u64));
+        std::thread::sleep(std::time::Duration::from_millis(ms.max(0).unsigned_abs()));
         ok_res(())
     })
 }
@@ -85,9 +85,36 @@ pub fn time_now<E: 'static>(_: ()) -> IpeTask<E, i64> {
 #[cfg(all(target_arch = "wasm32", feature = "wasm-client"))]
 pub fn time_sleep<E: 'static>(ms: i64) -> IpeTask<E, ()> {
     Box::pin(async move {
-        // Clamp negative ms to 0, matching the native arm's deadlock guard.
-        gloo_timers::future::TimeoutFuture::new(ms.max(0) as u32).await;
+        for chunk in sleep_chunks(ms) {
+            gloo_timers::future::TimeoutFuture::new(chunk).await;
+        }
         ok_res(())
+    })
+}
+
+/// The longest single browser timer wait, in milliseconds.
+///
+/// `setTimeout` reads its delay as a signed 32-bit `long`, and `gloo-timers`
+/// passes its `u32` through as `i32`, so a delay past `i32::MAX` wraps to a
+/// negative one and fires at once.
+#[cfg(any(test, all(target_arch = "wasm32", feature = "wasm-client")))]
+const SLEEP_CHUNK_MS: u32 = i32::MAX.unsigned_abs();
+
+/// Splits a `Time.sleep` of `ms` milliseconds into browser-timer-sized waits.
+///
+/// The waits sum to `ms.max(0)`, each is at most [`SLEEP_CHUNK_MS`], and there
+/// is always at least one (a zero wait still yields to the event loop, as the
+/// native arm's zero sleep does). A negative `ms` waits zero, matching the
+/// native arm's deadlock guard.
+#[cfg(any(test, all(target_arch = "wasm32", feature = "wasm-client")))]
+fn sleep_chunks(ms: i64) -> impl Iterator<Item = u32> {
+    let mut rest = Some(ms.max(0).unsigned_abs());
+    std::iter::from_fn(move || {
+        let left = rest?;
+        let chunk = u32::try_from(left.min(u64::from(SLEEP_CHUNK_MS))).unwrap_or(SLEEP_CHUNK_MS);
+        let after = left.saturating_sub(u64::from(chunk));
+        rest = (after > 0).then_some(after);
+        Some(chunk)
     })
 }
 
@@ -262,8 +289,8 @@ pub fn time_add_months(months: i64, ms: i64) -> i64 {
     let y = i64::from(utc.year());
     // `months` is caller-controlled (Ipê `Ipe.Time.addMonths`): saturating_add
     // avoids the i64 overflow (debug panic / release silent-wrap) on an extreme
-    // value. A saturated `m` makes `new_y as i32` truncate → from_ymd_opt below
-    // returns None → the function returns `ms` unchanged (total, no panic).
+    // value. A saturated `m` puts the target year outside `i32`, so the parse
+    // below refuses it and the function returns `ms` unchanged (total, no panic).
     let m = (i64::from(utc.month()) - 1).saturating_add(months);
     // Parse the target year into chrono's i32 domain (don't truncate): a lossy
     // `as i32` on a large-but-non-saturating result would wrap a far-future/past
@@ -272,7 +299,9 @@ pub fn time_add_months(months: i64, ms: i64) -> i64 {
     let Ok(new_y) = i32::try_from(y.saturating_add(m.div_euclid(12))) else {
         return ms;
     };
-    let new_m = (m.rem_euclid(12) + 1) as u32;
+    let Ok(new_m) = u32::try_from(m.rem_euclid(12) + 1) else {
+        return ms;
+    };
     // Clamp day to month end
     let first = NaiveDate::from_ymd_opt(new_y, new_m, 1);
     let max_day = match first {
@@ -283,7 +312,10 @@ pub fn time_add_months(months: i64, ms: i64) -> i64 {
                 (new_y, new_m + 1)
             };
             let first_next = NaiveDate::from_ymd_opt(ny, nm, 1).unwrap_or(d);
-            first_next.signed_duration_since(d).num_days() as u32
+            let Ok(days) = u32::try_from(first_next.signed_duration_since(d).num_days()) else {
+                return ms;
+            };
+            days
         }
         None => return ms,
     };
@@ -385,7 +417,11 @@ pub fn time_days_in_month(year: i64, month: i64) -> i64 {
     let Ok(y) = i32::try_from(year) else {
         return 0;
     };
-    let m = month as u32;
+    // A month past `u32` is refused rather than narrowed: a narrowed `2^32 + 1`
+    // would read as January.
+    let Ok(m) = u32::try_from(month) else {
+        return 0;
+    };
     if !(1..=12).contains(&m) {
         return 0;
     }
@@ -464,7 +500,11 @@ pub fn time_end_of_month<E: From<String>>(zone: String, ms: i64) -> IpeResult<E,
         IpeResult::Ok(d) => d,
         IpeResult::Err(e) => return IpeResult::Err(e),
     };
-    let dim = time_days_in_month(i64::from(dt.year()), i64::from(dt.month())) as u32;
+    let dim = u32::try_from(time_days_in_month(
+        i64::from(dt.year()),
+        i64::from(dt.month()),
+    ))
+    .unwrap_or(0);
     let target = NaiveDate::from_ymd_opt(dt.year(), dt.month(), dim);
     let target_date = target.unwrap_or(dt.date_naive());
     local_midnight_in_zone::<E>(zone, ms, 23, 59, 59, 999, move |_| target_date)
@@ -538,6 +578,27 @@ pub fn time_diff_days(later_ms: i64, earlier_ms: i64) -> i64 {
     later_ms.saturating_sub(earlier_ms) / 86_400_000
 }
 
+/// Parses the `Time.fromParts` date parts into a naive local date-time.
+///
+/// Every part is parsed into chrono's domain rather than narrowed: a narrowing
+/// cast keeps the low bits, so a year past `i32` would land in a valid band and
+/// a month of `2^32 + 3` would read as March, each passing the "invalid date
+/// parts" refusal. Any part out of range yields `None`.
+#[cfg(feature = "time")]
+fn naive_from_parts(
+    y: i64,
+    m: i64,
+    d: i64,
+    h: i64,
+    mins: i64,
+    s: i64,
+) -> Option<chrono::NaiveDateTime> {
+    let y = i32::try_from(y).ok()?;
+    let [m, d, h, mins, s] = [m, d, h, mins, s].map(|part| u32::try_from(part).ok());
+    let (m, d, h, mins, s) = (m?, d?, h?, mins?, s?);
+    NaiveDate::from_ymd_opt(y, m, d)?.and_hms_opt(h, mins, s)
+}
+
 /// Ipê source: `fromParts zone y m d h mins s -> Result Error Int`.
 /// Computes the UTC epoch-ms for the given local date/time in the given IANA
 /// zone. Invalid parts return Err. Unknown timezone returns Err.
@@ -558,14 +619,7 @@ pub fn time_from_parts<E: From<String>>(
             return IpeResult::Err(format!("Time.fromParts: unknown timezone {zone:?}").into());
         }
     };
-    // AUD-09: parse `y` into chrono's i32 domain rather than truncating — a
-    // lossy `as i32` cast on a large caller Int wraps to a valid band,
-    // silently accepting an out-of-range year as if it were a different,
-    // in-range one instead of failing closed with "invalid date parts".
-    let Some(naive) = i32::try_from(y).ok().and_then(|y32| {
-        NaiveDate::from_ymd_opt(y32, m as u32, d as u32)
-            .and_then(|day| day.and_hms_opt(h as u32, mins as u32, s as u32))
-    }) else {
+    let Some(naive) = naive_from_parts(y, m, d, h, mins, s) else {
         return IpeResult::Err(
             format!("Time.fromParts: invalid date parts {y}-{m:02}-{d:02} {h:02}:{mins:02}:{s:02}")
                 .into(),
@@ -772,6 +826,54 @@ mod time_advanced_tests {
         assert!(matches!(r3, IpeResult::Err(_))); // unknown timezone
     }
 
+    /// `2^32`: the first value a `u32` narrowing wraps back to zero.
+    const WRAP: i64 = 1 << 32;
+
+    /// Each part, one step past its last legal value and at `2^32 + valid`
+    /// (which a narrowing cast reads as the valid part), is refused.
+    #[test]
+    fn from_parts_refuses_each_out_of_range_part() {
+        let legal = [2024, 3, 1, 0, 0, 0];
+        let past_last = [(1, 13), (2, 32), (3, 24), (4, 60), (5, 60)];
+        let wrapped = [
+            (1, WRAP + 3),
+            (2, WRAP + 1),
+            (3, WRAP + 1),
+            (4, WRAP + 1),
+            (5, WRAP + 1),
+        ];
+        let negative = [(1, -1), (2, -1), (3, -1), (4, -1), (5, -1)];
+        for (slot, value) in past_last.into_iter().chain(wrapped).chain(negative) {
+            let mut p = legal;
+            if let Some(part) = p.get_mut(slot) {
+                *part = value;
+            }
+            let [y, m, d, h, mins, s] = p;
+            let r: IpeResult<String, i64> = time_from_parts("UTC".into(), y, m, d, h, mins, s);
+            assert!(
+                matches!(r, IpeResult::Err(ref e) if e.contains("invalid date parts")),
+                "part {slot} = {value} was accepted: {r:?}"
+            );
+        }
+        let ok: IpeResult<String, i64> = time_from_parts("UTC".into(), 2024, 12, 31, 23, 59, 59);
+        assert!(
+            matches!(ok, IpeResult::Ok(_)),
+            "last legal parts refused: {ok:?}"
+        );
+    }
+
+    /// A year one past `i32` and `2^32 + 2024` are refused, not wrapped.
+    #[test]
+    fn from_parts_refuses_a_year_past_i32() {
+        for y in [i64::from(i32::MAX) + 1, WRAP + 2024] {
+            let r: IpeResult<String, i64> = time_from_parts("UTC".into(), y, 1, 1, 0, 0, 0);
+            assert!(
+                matches!(r, IpeResult::Err(_)),
+                "year {y} was accepted: {r:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_zone_offset_utc() {
         let r: IpeResult<String, i64> = time_zone_offset("UTC".into(), 0);
@@ -838,5 +940,36 @@ mod time_advanced_tests {
         let s = time_format_http(i64::MAX);
         // Either empty or some valid string — just must not panic.
         let _ = s;
+    }
+}
+
+// The calendar and sleep narrowings, in an always-compiled module so the
+// wasm-floor node leg runs them on a 32-bit `usize` target too.
+#[cfg(test)]
+mod narrowing_tests {
+    use super::{SLEEP_CHUNK_MS, sleep_chunks, time_days_in_month};
+
+    /// `2^32`: the first value a `u32` narrowing wraps back to zero.
+    const WRAP: i64 = 1 << 32;
+
+    #[test]
+    fn days_in_month_refuses_a_month_past_u32() {
+        assert_eq!(time_days_in_month(2024, 12), 31);
+        assert_eq!(time_days_in_month(2024, 2), 29);
+        for month in [0, 13, -1, WRAP + 1, WRAP + 2, i64::MAX, i64::MIN] {
+            assert_eq!(time_days_in_month(2024, month), 0, "month {month}");
+        }
+    }
+
+    #[test]
+    fn sleep_chunks_sum_to_the_request_and_fit_a_browser_timer() {
+        let chunks = |ms: i64| sleep_chunks(ms).collect::<Vec<u32>>();
+        assert_eq!(SLEEP_CHUNK_MS, i32::MAX.unsigned_abs());
+        assert_eq!(chunks(0), [0]);
+        assert_eq!(chunks(-5), [0]);
+        assert_eq!(chunks(5), [5]);
+        assert_eq!(chunks(i64::from(i32::MAX)), [SLEEP_CHUNK_MS]);
+        assert_eq!(chunks(i64::from(i32::MAX) + 1), [SLEEP_CHUNK_MS, 1]);
+        assert_eq!(chunks(WRAP + 5), [SLEEP_CHUNK_MS, SLEEP_CHUNK_MS, 7]);
     }
 }
