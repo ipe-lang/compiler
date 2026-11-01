@@ -31,7 +31,7 @@ use core::fmt::Write as _;
 
 use crate::code::{Severity, issue_tracker_url, title};
 use crate::diagnostic::{
-    AppShape, Applicability, CaseDefect, CodecAutoRejection, ConsentError, CtorWithheld,
+    AppShape, Applicability, ArgCount, CaseDefect, CodecAutoRejection, ConsentError, CtorWithheld,
     Diagnostic, Expected, ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach,
     HazardRefusal, HeaderDefect, HelpLine, Hint, IfDefect, ImportedAs, LetDefect, LowerError,
     MountPrefixFault, NameError, ParseError, RoutePatternDefect, SandboxError, SealRejection,
@@ -314,7 +314,7 @@ fn ffi_prose(msg: &FfiError) -> String {
         FfiError::ArtifactIo { path, detail } => {
             format!("The FFI cache artifact `{path}` could not be accessed: {detail}.")
         }
-        FfiError::AssertedRefused { path, detail } => {
+        FfiError::AssertedRefused { path, detail, .. } => {
             format!("The asserted foreign call `{path}` was refused: {detail}.")
         }
         FfiError::SystemLibraryNotFound {
@@ -435,6 +435,10 @@ fn parse_prose(msg: &ParseError) -> String {
         | ParseError::SourceDisplayHazard { .. }
         | ParseError::SourceTerminalControl { .. } => lexical_prose(msg),
         ParseError::Unexpected => "I couldn't make sense of this part of the file.".to_string(),
+        ParseError::QualifiedCtorInPattern { qualified, bare } => format!(
+            "`{qualified}` is a constructor, but a pattern can't name it with its \
+             module qualifier — only the bare name `{bare}` is matched here."
+        ),
     }
 }
 
@@ -551,7 +555,8 @@ fn lexical_prose(msg: &ParseError) -> String {
         | ParseError::DocOnUnexported { .. }
         | ParseError::MissingDocString { .. }
         | ParseError::AnnotationWithoutBinding { .. }
-        | ParseError::DuplicateAnnotation { .. } => {
+        | ParseError::DuplicateAnnotation { .. }
+        | ParseError::QualifiedCtorInPattern { .. } => {
             "I couldn't make sense of this part of the file.".to_string()
         }
     }
@@ -776,6 +781,35 @@ fn name_prose(msg: &NameError) -> String {
     }
 }
 
+/// `n argument` or `n arguments`.
+fn arguments(n: usize) -> String {
+    if n == 1 {
+        "1 argument".to_owned()
+    } else {
+        format!("{n} arguments")
+    }
+}
+
+/// The prose band for a call that gives a function the wrong number of
+/// arguments.
+fn call_arity_prose(callee: Option<&str>, count: ArgCount) -> String {
+    let subject = callee.map_or_else(|| "This".to_owned(), |name| format!("`{name}`"));
+    let given = arguments(count.given());
+    if count.takes() == 0 {
+        format!("{subject} is not a function, but it is given {given}.")
+    } else if count.is_surplus() {
+        format!(
+            "{subject} takes {}, but it is given {given}.",
+            arguments(count.takes())
+        )
+    } else {
+        format!(
+            "{subject} takes {}, but it is given {given}, so the result is still a function.",
+            arguments(count.takes())
+        )
+    }
+}
+
 /// The prose band for a type-family diagnostic.
 fn type_prose(msg: &TypeError) -> String {
     match msg {
@@ -786,6 +820,7 @@ fn type_prose(msg: &TypeError) -> String {
             an_article(&ty_to_string(expected)),
             an_article(&ty_to_string(found))
         ),
+        TypeError::CallArity { callee, count, .. } => call_arity_prose(callee.as_deref(), *count),
         TypeError::Mismatch => {
             "The type I inferred here isn't the type I was expecting.".to_string()
         }
@@ -1566,13 +1601,29 @@ fn primary_label(d: &Diagnostic) -> Option<String> {
         Diagnostic::Name { msg, .. } => name_label(msg),
         Diagnostic::Type { msg, .. } => type_label(msg),
         Diagnostic::Lower { msg, .. } => Some(lower_label(msg)),
+        Diagnostic::Ffi { msg } => ffi_label(msg),
         Diagnostic::CompilerBug { .. }
-        | Diagnostic::Ffi { .. }
         | Diagnostic::Sandbox { .. }
         | Diagnostic::Consent { .. }
         | Diagnostic::RegistryUnreachable { .. }
         | Diagnostic::TargetDirUnlinkable { .. }
         | Diagnostic::HostLinkerCannotOpenInput { .. } => None,
+    }
+}
+
+/// The label under an FFI refusal's span; only an asserted call's refusal has one.
+fn ffi_label(msg: &FfiError) -> Option<String> {
+    match msg {
+        FfiError::AssertedRefused { path, detail, .. } => {
+            Some(format!("the asserted call `{path}` is refused: {detail}"))
+        }
+        FfiError::CallUnrenderable { .. }
+        | FfiError::GenericNotBindable { .. }
+        | FfiError::WireMalformed { .. }
+        | FfiError::ShapeContradiction { .. }
+        | FfiError::SourceRejected { .. }
+        | FfiError::ArtifactIo { .. }
+        | FfiError::SystemLibraryNotFound { .. } => None,
     }
 }
 
@@ -1657,6 +1708,9 @@ fn parse_label(msg: &ParseError) -> Option<String> {
         ParseError::DuplicateAnnotation { .. } => {
             Some("this name is already annotated above".to_string())
         }
+        ParseError::QualifiedCtorInPattern { bare, .. } => Some(format!(
+            "patterns match the bare name `{bare}`, not the qualified one"
+        )),
         ParseError::Unexpected
         | ParseError::TooDeep
         | ParseError::SteplessDo
@@ -2009,6 +2063,14 @@ fn type_label(msg: &TypeError) -> Option<String> {
                 let _ = write!(label, " (at {})", joined.join("."));
             }
             Some(label)
+        }
+        TypeError::CallArity {
+            callee, signature, ..
+        } => {
+            let subject = callee
+                .as_deref()
+                .map_or_else(|| "this".to_owned(), |name| format!("`{name}`"));
+            Some(format!("{subject} has type {}", ty_to_string(signature)))
         }
         TypeError::InfiniteType { var, ty } => {
             Some(format!("`{var}` would have to equal {}", ty_to_string(ty)))
@@ -2635,6 +2697,9 @@ fn hint_text(hint: Hint) -> String {
              bind the whole value and use `case`"
                 .to_string()
         }
+        Hint::QualifiedCtorInPattern => "bring the type's constructors into scope with \
+             `import Module exposing (Type(..))`, then match the bare name"
+            .to_string(),
     }
 }
 
@@ -3316,6 +3381,7 @@ mod tests {
                 }),
                 definition: None,
                 path: Box::new([]),
+                unmet_class: None,
             },
         };
         let out = render(&d, "test.ipe", src);
@@ -3418,6 +3484,58 @@ mod tests {
     }
 
     #[test]
+    fn call_arity_prose_names_the_callee_and_both_counts() {
+        let Some(surplus) = ArgCount::new(2, 3) else {
+            return;
+        };
+        assert_eq!(
+            call_arity_prose(Some("greet"), surplus),
+            "`greet` takes 2 arguments, but it is given 3 arguments."
+        );
+        let Some(short) = ArgCount::new(2, 1) else {
+            return;
+        };
+        assert_eq!(
+            call_arity_prose(Some("greet"), short),
+            "`greet` takes 2 arguments, but it is given 1 argument, so the result is still a function."
+        );
+        let Some(none) = ArgCount::new(0, 1) else {
+            return;
+        };
+        assert_eq!(
+            call_arity_prose(None, none),
+            "This is not a function, but it is given 1 argument."
+        );
+        assert!(
+            ArgCount::new(2, 2).is_none(),
+            "a call at its arity has no arity fault to report"
+        );
+    }
+
+    #[test]
+    fn call_arity_renders_as_t0001_with_the_signature() {
+        let src = "module Main exposing (main)\n\nmain =\n    foo\n";
+        let Some(count) = ArgCount::new(1, 2) else {
+            return;
+        };
+        let d = Diagnostic::Type {
+            span: Span::new(40, 43),
+            msg: TypeError::CallArity {
+                callee: Some("foo".into()),
+                count,
+                signature: Box::new(TyDoc::Fun(Box::new(con("Int")), Box::new(con("Int")))),
+            },
+        };
+        let out = render(&d, "test.ipe", src);
+        assert!(out.contains("IPE-T0001"), "code missing:\n{out}");
+        assert!(
+            out.contains("`foo` takes 1 argument"),
+            "prose missing:\n{out}"
+        );
+        assert!(out.contains("Int -> Int"), "signature missing:\n{out}");
+    }
+
+    #[test]
     fn dummy_span_compiler_bug_renders_header_help_footer_only() {
         let d = Diagnostic::CompilerBug {
             where_: "lower",
@@ -3455,6 +3573,7 @@ mod tests {
                 found: Box::new(con("Int")),
                 definition: None,
                 path: Box::new([]),
+                unmet_class: None,
             },
         };
         let out = render(&d, "f.ipe", src);
@@ -3614,6 +3733,7 @@ mod tests {
                 found: Box::new(con("String")),
                 definition: None,
                 path: Box::new([]),
+                unmet_class: None,
             },
         };
         let out = render(&d, "test.ipe", src);
@@ -3661,6 +3781,7 @@ mod tests {
                 found: Box::new(con("String")),
                 definition: None,
                 path: Box::new([]),
+                unmet_class: None,
             },
         };
         let out = render(&d, "test.ipe", src);
@@ -3881,6 +4002,7 @@ mod tests {
                 found: Box::new(TyDoc::Var("a".into())),
                 definition: None,
                 path: Box::new([]),
+                unmet_class: None,
             },
         };
         let source = "module Main exposing (main)\nmain = 42\n";
@@ -3992,6 +4114,7 @@ mod tests {
                 found: Box::new(TyDoc::Var("a".into())),
                 definition: Some(Span::new(5, 8)),
                 path: Box::new([]),
+                unmet_class: None,
             },
         };
         let json_defn = render_json(&diag_defn, "Main.ipe", source);

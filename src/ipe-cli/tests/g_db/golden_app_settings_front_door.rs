@@ -678,6 +678,7 @@ fn judge_rejection_refuses_a_missing_fragment() {
             found: Box::new(con("String")),
             definition: None,
             path: Box::new([]),
+            unmet_class: None,
         },
     });
     assert!(matches!(

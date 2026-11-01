@@ -295,6 +295,7 @@ fn golden_type_mismatch() -> Result<(), Box<dyn std::error::Error>> {
             found: Box::new(ty_con("String")),
             definition: Some(Span::new(36, 39)), // the `Int` annotation.
             path: Box::new([]),
+            unmet_class: None,
         },
     };
     check_golden("type_mismatch", &d, "test.ipe", source)
@@ -357,6 +358,7 @@ fn golden_type_mismatch_multiline_span() -> Result<(), Box<dyn std::error::Error
             found: Box::new(ty_con("String")),
             definition: None,
             path: Box::new([]),
+            unmet_class: None,
         },
     };
     check_golden("type_mismatch_multiline_span", &d, "test.ipe", source)

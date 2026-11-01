@@ -1348,10 +1348,12 @@ mod tests {
         // The control: the same module under `src/` is scanned, and its call
         // into a crate no catalog installs is refused.
         let in_src = resolve(&SourceTree::main(MAIN).module("Shift", &asserted_module("Shift")));
-        assert!(matches!(
-            read(&in_src, Limits::DEFAULT),
-            Err(CliError::FfiPrep(_))
-        ));
+        let refused = read(&in_src, Limits::DEFAULT);
+        assert!(
+            crate::ffi::is_asserted_refusal_at(&refused, "src/Shift.ipe", "tm::shift"),
+            "{:?}",
+            refused.err()
+        );
     }
 
     /// The summed byte ceiling: module text summing to it is read, one byte less refuses.
@@ -1494,10 +1496,12 @@ mod tests {
         let snapshot = read(&scratch, Limits::DEFAULT).expect("the build reads");
         assert!(snapshot.modules().contains_key(&path("Main")));
         assert!(snapshot.ffi().injected.is_empty());
-        assert!(matches!(
-            test_view(&snapshot, "Shift"),
-            Err(CliError::FfiPrep(_))
-        ));
+        let refused = test_view(&snapshot, "Shift");
+        assert!(
+            crate::ffi::is_asserted_refusal_at(&refused, "tests/Shift.ipe", "tm::shift"),
+            "{:?}",
+            refused.err()
+        );
         // The control: a test entry with no asserted call prepares cleanly.
         let clean =
             resolve(&SourceTree::main(MAIN).test_module("Plain", &module_source("Plain", &[])));
