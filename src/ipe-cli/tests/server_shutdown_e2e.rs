@@ -1329,6 +1329,12 @@ fn a_sqlite_session_store_closes_on_sigterm() -> Result<(), BoxError> {
 /// bind-address line on stderr only (no stdout duplicate), and the session
 /// store's own choice on stderr only (no false `memory` line when a durable
 /// store was actually chosen).
+///
+/// The inline console is mounted (no `IPE_CONSOLE_EMBED=off`, and
+/// `IPE_CONSOLE_BIN` names no file so no console child replaces it), since
+/// its mount is where a second store line was once written; the mount's own
+/// line is counted so the test cannot pass with the mount skipped. Every count
+/// is taken after the process exits, over all it wrote.
 #[test]
 fn startup_facts_once() -> Result<(), BoxError> {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
@@ -1336,88 +1342,53 @@ fn startup_facts_once() -> Result<(), BoxError> {
     }
     let test_name = "web_session_db";
     let exe = compile(test_name, WEB_SESSION_DB)?;
+    let db = fresh_db("startup_facts_once");
+    let db_env = db.to_string_lossy().into_owned();
+    let console_bin = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("server_shutdown_e2e_startup_facts_no_console_bin");
+    let _ = std::fs::remove_file(&console_bin);
+    let console_bin_env = console_bin.to_string_lossy().into_owned();
 
-    // Default store (memory): the memory line is the one actual choice.
-    {
+    // The default store (memory), then a durable one (sqlite): the store line
+    // names exactly the store chosen, once.
+    for (store, chosen) in [
+        (None, "session store: memory"),
+        (Some("sqlite"), "session store: sqlite"),
+    ] {
         let port = pick_ephemeral_port()?;
         let port_env = port.to_string();
-        let env = [
+        let mut env = vec![
             ("IPE_WEB_PORT", port_env.as_str()),
             ("IPE_CSRF", "off"),
-            ("IPE_CONSOLE_EMBED", "off"),
+            ("IPE_CONSOLE_BIN", console_bin_env.as_str()),
         ];
+        if let Some(kind) = store {
+            env.extend([
+                ("IPE_WEB_STORE", kind),
+                ("IPE_WEB_STORE_PATH", db_env.as_str()),
+            ]);
+        }
         let mut served = Served::ready(&exe, port, &env)?;
-        assert_eq!(
-            served.containing(Pipe::Out, "listening on"),
-            0,
-            "{test_name}: no stdout duplicate of the bind line; seen {:?}",
-            served.seen
-        );
-        assert_eq!(
-            served.containing(Pipe::Err, "listening on"),
-            1,
-            "{test_name}: one bind line on stderr; seen {:?}",
-            served.seen
-        );
-        assert_eq!(
-            served.containing(Pipe::Err, "session store:"),
-            1,
-            "{test_name}: one session-store line; seen {:?}",
-            served.seen
-        );
-        assert_eq!(
-            served.containing(Pipe::Err, "session store: memory"),
-            1,
-            "{test_name}: the memory store it actually chose; seen {:?}",
-            served.seen
-        );
         served.signal("-TERM")?;
         served.wait_exit(EXIT_BUDGET)?;
-    }
-
-    // A durable store (sqlite): no false "memory" line from the inline
-    // console mount re-logging a store choice it never made.
-    {
-        let db = fresh_db(test_name);
-        let db_env = db.to_string_lossy().into_owned();
-        let port = pick_ephemeral_port()?;
-        let port_env = port.to_string();
-        let env = [
-            ("IPE_WEB_PORT", port_env.as_str()),
-            ("IPE_CSRF", "off"),
-            ("IPE_CONSOLE_EMBED", "off"),
-            ("IPE_WEB_STORE", "sqlite"),
-            ("IPE_WEB_STORE_PATH", db_env.as_str()),
+        let counts = [
+            (Pipe::Err, "inline console mounted", 1),
+            (Pipe::Out, "listening on", 0),
+            (Pipe::Err, "listening on", 1),
+            (Pipe::Out, "session store:", 0),
+            (Pipe::Err, "session store:", 1),
+            (Pipe::Err, chosen, 1),
         ];
-        let mut served = Served::ready(&exe, port, &env)?;
-        assert_eq!(
-            served.containing(Pipe::Out, "listening on"),
-            0,
-            "{test_name}: no stdout duplicate of the bind line; seen {:?}",
-            served.seen
-        );
-        assert_eq!(
-            served.containing(Pipe::Err, "listening on"),
-            1,
-            "{test_name}: one bind line on stderr; seen {:?}",
-            served.seen
-        );
-        assert_eq!(
-            served.containing(Pipe::Err, "session store:"),
-            1,
-            "{test_name}: one session-store line; seen {:?}",
-            served.seen
-        );
-        assert_eq!(
-            served.containing(Pipe::Err, "session store: memory"),
-            0,
-            "{test_name}: no false memory line under a durable store; seen {:?}",
-            served.seen
-        );
-        served.signal("-TERM")?;
-        served.wait_exit(EXIT_BUDGET)?;
-        assert_no_sidecars(test_name, &db);
+        for (pipe, text, expected) in counts {
+            assert_eq!(
+                served.containing(pipe, text),
+                expected,
+                "{test_name} (store {store:?}): lines with {text:?} on {pipe:?}; seen {:?}",
+                served.seen
+            );
+        }
     }
+    assert_no_sidecars(test_name, &db);
     Ok(())
 }
 
