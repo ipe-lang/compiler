@@ -5170,7 +5170,7 @@ mod test_runner_key_tests {
     #[test]
     fn a_runner_without_the_key_is_stale() {
         let key = key();
-        let other = TestRunKey::fresh().map_or_else(|_| key, |other| other);
+        let other = self::key();
         assert!(other != key, "two minted keys differ");
         let mut bytes = vec![0u8; 3 * TEST_BINARY_SCAN_CHUNK];
         bytes.extend_from_slice(other.marker().as_bytes());
