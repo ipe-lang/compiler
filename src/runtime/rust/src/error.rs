@@ -735,11 +735,12 @@ impl FromDecodeFailure for String {
 /// An error sink every decoder can land a failure in.
 ///
 /// The one bound every generic decoder names: `From<String>` for the
-/// composed decoders that only forward an inner error, and
-/// [`FromDecodeFailure`] for the failure a decoder builds itself.
-pub trait DecodeErrorSink: From<String> + FromDecodeFailure {}
+/// composed decoders that only forward an inner error,
+/// [`FromDecodeFailure`] for the failure a decoder builds itself, and
+/// [`FromIpeError`] for a failure that carries any other kind.
+pub trait DecodeErrorSink: From<String> + FromDecodeFailure + FromIpeError {}
 
-impl<E> DecodeErrorSink for E where E: From<String> + FromDecodeFailure {}
+impl<E> DecodeErrorSink for E where E: From<String> + FromDecodeFailure + FromIpeError {}
 
 /// A generic `E: From<String>` error sink that can classify a refusal as
 /// `LimitExceeded`.

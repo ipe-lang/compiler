@@ -133,13 +133,15 @@ pub enum BlockingFailure {
 }
 
 impl BlockingFailure {
-    /// The failure as the caller's error: a refusal kinded `Unavailable`, a
-    /// panic as the `panicked` message.
+    /// The failure as the caller's error, each cause under its own kind.
+    ///
+    /// A refusal is kinded `Unavailable`; a panic or cancel is the `panicked`
+    /// message kinded `Unexpected`, since it is a defect in runtime work.
     #[must_use]
-    pub fn into_error<E: From<String> + crate::FromUnavailable>(self, panicked: &str) -> E {
+    pub fn into_error<E: crate::FromUnavailable + crate::FromIpeError>(self, panicked: &str) -> E {
         match self {
             Self::Refused(refused) => refused.into_error(),
-            Self::Panicked => E::from(panicked.to_owned()),
+            Self::Panicked => E::from_ipe_error(crate::IpeError::unexpected(panicked.to_owned())),
         }
     }
 }
@@ -227,21 +229,21 @@ where
 
 /// Runs the fallible blocking `f` off the async worker, as the caller's error.
 ///
-/// A refused thread is kinded `Unavailable`; a panic in `f` becomes the
-/// `panicked` message.
+/// `f`'s own failure keeps its kind; a refused thread is kinded
+/// `Unavailable`; a panic in `f` becomes the `panicked` message.
 ///
 /// # Errors
 ///
 /// `f` failed, no thread could be started for it, or it panicked.
 pub async fn run_blocking<T, E, F>(role: &'static str, panicked: &'static str, f: F) -> Result<T, E>
 where
-    F: FnOnce() -> Result<T, String> + Send + 'static,
+    F: FnOnce() -> Result<T, crate::KernelFailure> + Send + 'static,
     T: Send + 'static,
-    E: From<String> + crate::FromUnavailable,
+    E: crate::KernelErrorSink,
 {
     match join_blocking(role, f).await {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(message)) => Err(E::from(message)),
+        Ok(Err(failure)) => Err(failure.into_error()),
         Err(failure) => Err(failure.into_error(panicked)),
     }
 }

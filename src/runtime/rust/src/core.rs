@@ -59,12 +59,18 @@ pub fn str_err<E: From<String>>(s: &str) -> E {
 /// message carrying that id is returned to Ipê (`Error.toString` shows
 /// `external operation failed (ref <id>)`, never the secret-bearing detail).
 ///
-/// Same generic `E: From<String>` contract as `str_err` — the project provides
-/// `impl From<String> for IpeCoreErrorError` so both arms of the fallible match
-/// resolve to the same `IpeResult<E, A>`. Total — no unwrap/index/panic.
-pub fn ipe_error_from_foreign<ForeignE: std::fmt::Debug, E: From<String>>(e: ForeignE) -> E {
+/// The error is kinded `Ffi`, so a program can branch on a foreign failure;
+/// a bare `String` sink keeps its `Error.toString` text. Total — no
+/// unwrap/index/panic.
+pub fn ipe_error_from_foreign<ForeignE: std::fmt::Debug, E: crate::FromIpeError>(e: ForeignE) -> E {
+    E::from_ipe_error(crate::IpeError::ffi(redacted_foreign_message(e)))
+}
+
+/// The Ipê-visible text of a foreign error: the fixed message plus the
+/// correlation id its raw `Debug` is logged under, never the detail itself.
+pub(crate) fn redacted_foreign_message<ForeignE: std::fmt::Debug>(e: ForeignE) -> String {
     let err_id = note_foreign_error(e);
-    format!("external operation failed (ref {err_id})").into()
+    format!("external operation failed (ref {err_id})")
 }
 
 /// Funnel-log a foreign error's raw `Debug` under a fresh correlation id and
@@ -86,13 +92,24 @@ pub fn note_foreign_error<ForeignE: std::fmt::Debug>(e: ForeignE) -> String {
 /// a foreign error's `Debug`), so it is logged SERVER-SIDE only; the Ipê-visible
 /// value is `context` — an emitter-owned constant such as
 /// `"foreign call panicked"` — plus the correlation id, never the payload.
-/// Total — no unwrap/index/panic.
-pub fn ipe_error_from_panic<E: From<String>>(
+/// The error is kinded `Ffi`. Total — no unwrap/index/panic.
+pub fn ipe_error_from_panic<E: crate::FromIpeError>(
     context: &str,
     payload: Box<dyn std::any::Any + Send>,
 ) -> E {
+    E::from_ipe_error(crate::IpeError::ffi(redacted_panic_message(
+        context, payload,
+    )))
+}
+
+/// The Ipê-visible text of a caught panic: `context` plus the correlation id
+/// its payload is logged under, never the payload itself.
+pub(crate) fn redacted_panic_message(
+    context: &str,
+    payload: Box<dyn std::any::Any + Send>,
+) -> String {
     let err_id = note_foreign_panic(context, payload);
-    format!("{context} (ref {err_id})").into()
+    format!("{context} (ref {err_id})")
 }
 
 /// Funnel-log a caught foreign panic payload under a fresh correlation id and
@@ -230,14 +247,18 @@ pub fn from_u8_slice(bs: &[u8]) -> Vec<i64> {
 
 /// Ipê `List Int` -> `[u8; N]`, for `[u8; N]` / `&[u8; N]` parameters.
 ///
-/// A length mismatch returns `Err` and never panics; each element clamps into
-/// `0..=255` as [`to_u8_vec`] does. The generated wrapper instantiates
-/// `E = IpeError` and the concrete `N`.
+/// A length mismatch returns an `InvalidInput` `Err` and never panics; each
+/// element clamps into `0..=255` as [`to_u8_vec`] does. The generated wrapper
+/// instantiates `E = IpeError` and the concrete `N`.
 #[must_use]
 #[deny(clippy::as_conversions)]
-pub fn to_u8_array<E: From<String>, const N: usize>(xs: &[i64]) -> IpeResult<E, [u8; N]> {
+pub fn to_u8_array<E: crate::FromIpeError, const N: usize>(xs: &[i64]) -> IpeResult<E, [u8; N]> {
     if xs.len() != N {
-        return IpeResult::Err(format!("expected {} bytes, got {}", N, xs.len()).into());
+        return IpeResult::Err(E::from_ipe_error(crate::IpeError::invalid_input(format!(
+            "expected {} bytes, got {}",
+            N,
+            xs.len()
+        ))));
     }
     let mut a = [0u8; N];
     // len == N checked above; zip is total (no indexing).
@@ -248,17 +269,20 @@ pub fn to_u8_array<E: From<String>, const N: usize>(xs: &[i64]) -> IpeResult<E, 
 }
 
 /// Ipê `List T` (Rust `&[T]`) -> fixed-size `[T; N]` with length check.
-/// Mirrors `to_u8_array`'s never-panic discipline: returns `IpeResult::Err`
-/// with a clear message on length mismatch. T: Clone is sufficient — the
-/// elements are cloned out into the array.
-pub fn to_array<E: From<String>, T: Clone, const N: usize>(xs: &[T]) -> IpeResult<E, [T; N]> {
-    if xs.len() != N {
-        return IpeResult::Err(format!("expected array of length {}, got {}", N, xs.len()).into());
-    }
-    let v: Vec<T> = xs.to_vec();
-    match v.try_into() {
-        Ok(a) => ok_res(a),
-        Err(_) => IpeResult::Err("array length conversion failed".to_string().into()),
+///
+/// Mirrors `to_u8_array`'s never-panic discipline: a length mismatch returns
+/// an `InvalidInput` `Err`. `T: Clone` is sufficient — the elements are cloned
+/// out into the array only when the length matches.
+pub fn to_array<E: crate::FromIpeError, T: Clone, const N: usize>(
+    xs: &[T],
+) -> IpeResult<E, [T; N]> {
+    match <&[T; N]>::try_from(xs) {
+        Ok(a) => ok_res(a.clone()),
+        Err(_) => IpeResult::Err(E::from_ipe_error(crate::IpeError::invalid_input(format!(
+            "expected array of length {}, got {}",
+            N,
+            xs.len()
+        )))),
     }
 }
 
@@ -1664,7 +1688,9 @@ mod tests {
         let e = SecretBearingError {
             bearer: "Bearer sk_live_SUPERSECRET_KEY",
         };
-        let msg: String = ipe_error_from_foreign(e);
+        let crate::IpeError::Error(kind, info) = ipe_error_from_foreign(e);
+        assert_eq!(kind, crate::IpeErrorKind::Ffi);
+        let msg = info.message;
         assert!(
             !msg.contains("SUPERSECRET") && !msg.contains("Bearer") && !msg.contains("bearer"),
             "the foreign Debug detail (with the bearer token) must NOT reach the Ipe-visible \
@@ -1692,7 +1718,10 @@ mod tests {
         // funnel-redacted exactly like a foreign error's Debug.
         let payload: Box<dyn std::any::Any + Send> =
             Box::new("token=sk_live_SUPERSECRET_KEY".to_string());
-        let msg: String = ipe_error_from_panic("foreign call panicked", payload);
+        let crate::IpeError::Error(kind, info) =
+            ipe_error_from_panic("foreign call panicked", payload);
+        assert_eq!(kind, crate::IpeErrorKind::Ffi);
+        let msg = info.message;
         assert!(
             !msg.contains("SUPERSECRET") && !msg.contains("token"),
             "the panic payload must NOT reach the Ipe-visible message — got: {msg:?}"
@@ -1708,6 +1737,59 @@ mod tests {
         assert!(
             id.chars().all(|c| c.is_ascii_hexdigit()),
             "id must be hex — got: {id:?}"
+        );
+    }
+
+    // A foreign failure reaches the program under `ErrorKind.Ffi`, never the
+    // unclassified `Unexpected` a bare-`String` bridge would give it.
+    #[test]
+    fn foreign_error_is_ffi_kind() {
+        let err: crate::IpeError = ipe_error_from_foreign("connection reset");
+        assert_eq!(crate::ipe_error_kind(err), crate::IpeErrorKind::Ffi);
+        let shown: String = ipe_error_from_foreign("connection reset");
+        assert!(
+            shown.starts_with("Ffi: external operation failed (ref "),
+            "a bare String sink keeps the kinded Error.toString text — got: {shown:?}"
+        );
+    }
+
+    #[test]
+    fn foreign_panic_is_ffi_kind() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+        let err: crate::IpeError = ipe_error_from_panic("foreign call panicked", payload);
+        assert_eq!(crate::ipe_error_kind(err), crate::IpeErrorKind::Ffi);
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+        let shown: String = ipe_error_from_panic("foreign call panicked", payload);
+        assert!(
+            shown.starts_with("Ffi: foreign call panicked (ref "),
+            "a bare String sink keeps the kinded Error.toString text — got: {shown:?}"
+        );
+    }
+
+    // A wrong-length list handed to a fixed-size foreign parameter is the
+    // caller's input, so it is `InvalidInput`, never `Unexpected`.
+    #[test]
+    fn array_length_mismatch_is_invalid_input_kind() {
+        let bytes: IpeResult<crate::IpeError, [u8; 2]> = to_u8_array(&[1, 2, 3]);
+        assert!(
+            matches!(
+                &bytes,
+                IpeResult::Err(crate::IpeError::Error(crate::IpeErrorKind::InvalidInput, _))
+            ),
+            "got: {bytes:?}"
+        );
+        let items: IpeResult<crate::IpeError, [i64; 2]> = to_array(&[1_i64]);
+        assert!(
+            matches!(
+                &items,
+                IpeResult::Err(crate::IpeError::Error(crate::IpeErrorKind::InvalidInput, _))
+            ),
+            "got: {items:?}"
+        );
+        let exact: IpeResult<crate::IpeError, [i64; 2]> = to_array(&[1_i64, 2]);
+        assert!(
+            matches!(exact, IpeResult::Ok([1, 2])),
+            "an exact length converts"
         );
     }
 
@@ -1733,7 +1815,9 @@ mod tests {
     #[test]
     fn non_string_panic_payload_falls_back_to_fixed_message() {
         let payload: Box<dyn std::any::Any + Send> = Box::new(42_u32);
-        let msg: String = ipe_error_from_panic("foreign closure panicked", payload);
+        let crate::IpeError::Error(_, info) =
+            ipe_error_from_panic("foreign closure panicked", payload);
+        let msg = info.message;
         assert!(
             msg.starts_with("foreign closure panicked (ref "),
             "a non-string payload still yields the generic context message — got: {msg:?}"
