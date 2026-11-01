@@ -1400,7 +1400,7 @@ fn judged(sites: BTreeMap<(String, String), usize>) -> BTreeMap<(String, String)
 /// [`UNROUTED`] site, at its exact count, and every listed site still exists.
 #[test]
 fn usage_is_built_only_for_argument_misuse() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let root = e2e_support::manifest_dir!().join("src");
     let mut files = Vec::new();
     let walked = walk(&root, &root, &mut files);
     assert!(walked.is_ok(), "{walked:?}");
