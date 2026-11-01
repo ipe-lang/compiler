@@ -1293,7 +1293,7 @@ pub fn install_panic_classifier() {
         for refusal in &refusals {
             eprint_task_error(&refusal.to_string());
         }
-        crate::system::system_exit(1);
+        crate::system::exit_process(crate::system::ProcessStatus::FAILURE);
     }
     std::panic::set_hook(Box::new(|info| {
         // Log (classified, with errId) — diagnostic fires regardless of whether

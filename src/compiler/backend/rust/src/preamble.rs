@@ -288,8 +288,13 @@ mod tests {
             !tail.contains("process::exit"),
             "the epilogue ends the process outside the runtime funnel: {tail}"
         );
-        assert!(tail.contains("IpeResult::Ok(_) => ipe_runtime::system::exit_process(0)"));
-        assert!(tail.contains("ipe_runtime::system::exit_process(1)"));
+        assert!(tail.contains(
+            "IpeResult::Ok(_) => {\n            \
+             ipe_runtime::system::exit_process(ipe_runtime::system::ProcessStatus::SUCCESS)"
+        ));
+        assert!(tail.contains(
+            "ipe_runtime::system::exit_process(ipe_runtime::system::ProcessStatus::FAILURE)"
+        ));
         Ok(())
     }
 

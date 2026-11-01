@@ -3659,7 +3659,7 @@ pub fn db_migrate_apply<E: Send + From<String> + crate::FromIpeError + 'static>(
                     crate::system::write_stderr_line(&format!("db: {} failed", $ctx));
                     let _ = std::io::Write::flush(&mut std::io::stderr());
                     // `ipe db migrate` CLI-op boundary: a migration infra failure exits the process (library path returns a Task Err instead)
-                    crate::system::exit_process(1);
+                    crate::system::exit_process(crate::system::ProcessStatus::FAILURE);
                 }
                 return IpeResult::Err($err);
             }};
@@ -3762,10 +3762,10 @@ pub fn db_migrate_apply<E: Send + From<String> + crate::FromIpeError + 'static>(
                      Restore its original text, or ship a new compensating migration.",
                 );
                 // `ipe db migrate` status-op boundary: drift detected, exit non-zero
-                crate::system::exit_process(1);
+                crate::system::exit_process(crate::system::ProcessStatus::FAILURE);
             }
             // `ipe db migrate` status-op boundary: clean status, exit zero
-            crate::system::exit_process(0);
+            crate::system::exit_process(crate::system::ProcessStatus::SUCCESS);
         }
 
         // 3. Apply pending migrations in declaration order.
@@ -3780,7 +3780,7 @@ pub fn db_migrate_apply<E: Send + From<String> + crate::FromIpeError + 'static>(
                         crate::system::write_stderr_line(&migration_drift_line(&name));
                         let _ = std::io::Write::flush(&mut std::io::stderr());
                         // `ipe db migrate` CLI-op boundary: applied migration changed (checksum mismatch), exit non-zero
-                        crate::system::exit_process(1);
+                        crate::system::exit_process(crate::system::ProcessStatus::FAILURE);
                     }
                     return IpeResult::Err(
                         format!(
@@ -3844,7 +3844,7 @@ pub fn db_migrate_apply<E: Send + From<String> + crate::FromIpeError + 'static>(
             }
             let _ = std::io::Write::flush(&mut std::io::stdout());
             // `ipe db migrate` CLI-op boundary: migrations applied, exit zero
-            crate::system::exit_process(0);
+            crate::system::exit_process(crate::system::ProcessStatus::SUCCESS);
         }
         IpeResult::Ok(out)
     })
