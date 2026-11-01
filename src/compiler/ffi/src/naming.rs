@@ -120,6 +120,80 @@ impl std::fmt::Display for RustPathSegment {
     }
 }
 
+/// The longest foreign type string, in bytes, a package inspection may carry.
+pub const MAX_TYPE_LEN: usize = 4096;
+
+/// The deepest nesting a foreign type string may reach.
+///
+/// Depth is counted by [`check_type_ceilings`]: every open `<`/`(`/`[` and
+/// every type word on the path from the root to a point adds one level, so
+/// `Vec<Vec<T>>` (Rust) and `List List Int` (Ipê) are both bounded by it. Each
+/// recursive type walk in the crate consumes at least one level per frame, so
+/// its stack is bounded by this ceiling.
+pub const MAX_TYPE_DEPTH: usize = 64;
+
+/// Refuse a foreign type string past [`MAX_TYPE_LEN`] or [`MAX_TYPE_DEPTH`].
+///
+/// The decode-time ceiling every foreign type string (Rust or Ipê spelling)
+/// passes before it is admitted, so no downstream recursion over it can
+/// exhaust the stack. A word is a maximal run of characters other than
+/// whitespace, `<>()[]` and `,`; a `,` ends the current argument, so siblings
+/// never add up.
+///
+/// # Errors
+///
+/// [`WireDefect::TypeTooLong`] past the length ceiling, checked first;
+/// [`WireDefect::TypeTooDeep`] the moment the nesting passes the depth ceiling.
+pub fn check_type_ceilings(s: &str) -> Result<(), WireDefect> {
+    if s.len() > MAX_TYPE_LEN {
+        return Err(WireDefect::TypeTooLong {
+            len: s.len(),
+            max: MAX_TYPE_LEN,
+        });
+    }
+    // Words seen in the current argument of each open level, innermost last;
+    // `depth` is their sum plus one per open bracket. Refusing the moment
+    // `depth` passes the ceiling also caps `levels` at the ceiling.
+    let mut levels: Vec<usize> = vec![0];
+    let mut depth: usize = 0;
+    let mut in_word = false;
+    for c in s.chars() {
+        let delimiter = c.is_whitespace() || matches!(c, '<' | '>' | '(' | ')' | '[' | ']' | ',');
+        if delimiter {
+            in_word = false;
+            match c {
+                '<' | '(' | '[' => {
+                    levels.push(0);
+                    depth = depth.saturating_add(1);
+                }
+                '>' | ')' | ']' if levels.len() > 1 => {
+                    let words = levels.pop().unwrap_or(0);
+                    depth = depth.saturating_sub(words.saturating_add(1));
+                }
+                ',' => {
+                    if let Some(words) = levels.last_mut() {
+                        depth = depth.saturating_sub(*words);
+                        *words = 0;
+                    }
+                }
+                _ => {}
+            }
+        } else if !in_word {
+            in_word = true;
+            if let Some(words) = levels.last_mut() {
+                *words = words.saturating_add(1);
+            }
+            depth = depth.saturating_add(1);
+        }
+        if depth > MAX_TYPE_DEPTH {
+            return Err(WireDefect::TypeTooDeep {
+                max: MAX_TYPE_DEPTH,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// A validated Rust TYPE expression restricted to the closed grammar the FFI
 /// emitter renders verbatim.
 ///
@@ -144,8 +218,10 @@ impl RustTypeExpr {
     ///
     /// [`WireDefect::InvalidType`] when the string carries a byte outside the
     /// closed grammar, an unbalanced `<`/`(`/`[`, a `;` outside an array, or
-    /// is empty.
+    /// is empty; [`WireDefect::TypeTooLong`]/[`WireDefect::TypeTooDeep`] past
+    /// a [`check_type_ceilings`] ceiling.
     pub fn parse(s: &str) -> Result<Self, WireDefect> {
+        check_type_ceilings(s)?;
         let invalid = || WireDefect::InvalidType { got: s.to_owned() };
         if s.trim().is_empty() {
             return Err(invalid());
@@ -700,6 +776,90 @@ mod tests {
         // A `;` at statement depth is rejected; a `;` inside an array is not.
         assert!(RustTypeExpr::parse("[u8; 4]").is_ok());
         assert!(RustTypeExpr::parse("u8; 4").is_err());
+    }
+
+    /// `n` nested applications of `head` around `i64`, Rust-spelled.
+    fn nested_rust(head: &str, n: usize) -> String {
+        let open = format!("{head}<").repeat(n);
+        format!("{open}i64{}", ">".repeat(n))
+    }
+
+    #[test]
+    fn type_depth_ceiling_admits_the_ceiling_and_refuses_one_past() {
+        // `Vec<`×n around `i64` reaches depth 2n + 1 (n words, n brackets, the
+        // leaf word); the ceiling is even, so pick the widest n still inside.
+        let at = (MAX_TYPE_DEPTH - 1) / 2;
+        assert_eq!(2 * at + 1, MAX_TYPE_DEPTH - 1);
+        assert!(RustTypeExpr::parse(&nested_rust("Vec", at)).is_ok());
+        // Exactly at the ceiling: one more open bracket around the deepest leaf.
+        let exactly = format!("{}(i64){}", "Vec<".repeat(at), ">".repeat(at));
+        assert_eq!(check_type_ceilings(&exactly), Ok(()));
+        // One past it.
+        let past = format!("{}(T i64){}", "Vec<".repeat(at), ">".repeat(at));
+        assert_eq!(
+            check_type_ceilings(&past),
+            Err(WireDefect::TypeTooDeep {
+                max: MAX_TYPE_DEPTH
+            })
+        );
+        assert_eq!(
+            RustTypeExpr::parse(&nested_rust("Vec", at + 1)),
+            Err(WireDefect::TypeTooDeep {
+                max: MAX_TYPE_DEPTH
+            })
+        );
+    }
+
+    #[test]
+    fn type_depth_ceiling_bounds_ipe_word_chains() {
+        // `List List … Int` nests by words alone, no brackets.
+        let chain = |n: usize| format!("{}Int", "List ".repeat(n));
+        assert_eq!(check_type_ceilings(&chain(MAX_TYPE_DEPTH - 1)), Ok(()));
+        assert_eq!(
+            check_type_ceilings(&chain(MAX_TYPE_DEPTH)),
+            Err(WireDefect::TypeTooDeep {
+                max: MAX_TYPE_DEPTH
+            })
+        );
+    }
+
+    #[test]
+    fn type_depth_ceiling_does_not_sum_siblings() {
+        // A wide tuple is shallow: a `,` ends each argument's words.
+        let wide = format!("({})", ["i64"; MAX_TYPE_DEPTH * 2].join(", "));
+        assert!(wide.len() <= MAX_TYPE_LEN);
+        assert!(RustTypeExpr::parse(&wide).is_ok());
+    }
+
+    #[test]
+    fn type_length_ceiling_admits_the_ceiling_and_refuses_one_past() {
+        let at = "a".repeat(MAX_TYPE_LEN);
+        assert!(RustTypeExpr::parse(&at).is_ok());
+        let past = "a".repeat(MAX_TYPE_LEN + 1);
+        assert_eq!(
+            RustTypeExpr::parse(&past),
+            Err(WireDefect::TypeTooLong {
+                len: MAX_TYPE_LEN + 1,
+                max: MAX_TYPE_LEN
+            })
+        );
+    }
+
+    #[test]
+    fn ten_thousand_nested_vecs_refuse_without_recursing() {
+        let deep = nested_rust("Vec", 10_000);
+        assert!(matches!(
+            RustTypeExpr::parse(&deep),
+            Err(WireDefect::TypeTooLong { .. })
+        ));
+        // Under the length ceiling, the depth ceiling turns it back.
+        let deep_short = format!("{}i64", "<".repeat(MAX_TYPE_LEN - 3));
+        assert_eq!(
+            check_type_ceilings(&deep_short),
+            Err(WireDefect::TypeTooDeep {
+                max: MAX_TYPE_DEPTH
+            })
+        );
     }
 
     #[test]

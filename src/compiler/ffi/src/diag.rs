@@ -830,6 +830,18 @@ pub enum WireDefect {
         /// The offending type string.
         got: String,
     },
+    /// A foreign type string longer than [`crate::naming::MAX_TYPE_LEN`] bytes.
+    TypeTooLong {
+        /// The string's length in bytes.
+        len: usize,
+        /// The ceiling it passed.
+        max: usize,
+    },
+    /// A foreign type string nested deeper than [`crate::naming::MAX_TYPE_DEPTH`].
+    TypeTooDeep {
+        /// The ceiling it passed.
+        max: usize,
+    },
     /// An enum-arm pattern that is not a `RustIdent` head with an optional
     /// `(..)` / `{..}` suffix.
     InvalidPattern {
@@ -1014,6 +1026,14 @@ impl fmt::Display for UnsanitizedWireDefect<'_> {
                      borrows, tuples, arrays only — no statement tokens)"
                 )
             }
+            WireDefect::TypeTooLong { len, max } => write!(
+                f,
+                "a type string of {len} bytes is past the {max}-byte ceiling on foreign types"
+            ),
+            WireDefect::TypeTooDeep { max } => write!(
+                f,
+                "a type string nests past the depth ceiling of {max} on foreign types"
+            ),
             WireDefect::InvalidPattern { got } => {
                 write!(
                     f,
