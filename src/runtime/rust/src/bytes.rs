@@ -27,7 +27,7 @@ pub fn bytes_empty() -> Vec<u8> {
 /// `Bytes.length : Bytes -> Int` — the number of bytes in the buffer.
 #[must_use]
 pub fn bytes_length(b: Vec<u8>) -> i64 {
-    b.len() as i64
+    super::narrow::count_to_int(b.len())
 }
 
 /// `Bytes.isEmpty : Bytes -> Bool`.
@@ -117,7 +117,7 @@ pub fn bytes_append(a: Vec<u8>, b: Vec<u8>) -> Vec<u8> {
 /// No `panic` / raw indexing — all bounds are validated before slicing.
 #[must_use]
 pub fn bytes_slice(start: i64, end: i64, b: Vec<u8>) -> Vec<u8> {
-    let len = b.len() as i64;
+    let len = super::narrow::count_to_int(b.len());
 
     // Normalise negative indices to their from-end equivalents.
     let norm = |i: i64| -> i64 {
@@ -129,8 +129,8 @@ pub fn bytes_slice(start: i64, end: i64, b: Vec<u8>) -> Vec<u8> {
         }
     };
 
-    let s = norm(start) as usize;
-    let e = norm(end) as usize;
+    let s = super::narrow::count_from_int(norm(start));
+    let e = super::narrow::count_from_int(norm(end));
 
     if s >= e {
         return Vec::new();

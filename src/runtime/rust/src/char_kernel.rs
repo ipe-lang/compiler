@@ -48,10 +48,10 @@ pub fn char_to_code(c: char) -> i64 {
 /// `fromCode 65 -> 'A'`. Out-of-range / surrogate -> U+FFFD.
 #[must_use]
 pub fn char_from_code(n: i64) -> char {
-    if !(0..=0x0010_FFFF).contains(&n) {
-        return '\u{FFFD}';
-    }
-    char::from_u32(n as u32).unwrap_or('\u{FFFD}')
+    u32::try_from(n)
+        .ok()
+        .and_then(char::from_u32)
+        .unwrap_or('\u{FFFD}')
 }
 
 #[cfg(test)]
@@ -77,6 +77,15 @@ mod tests {
         assert_eq!(char_from_code(-1), '\u{FFFD}');
         assert_eq!(char_from_code(0x0011_0000), '\u{FFFD}');
         assert_eq!(char_from_code(0xD800), '\u{FFFD}'); // lone surrogate
+    }
+
+    /// A code past `u32` is refused whole, never wrapped to its low 32 bits:
+    /// `2^32 + 65` is not `'A'`.
+    #[test]
+    fn from_code_past_u32_is_replacement_not_wrapped() {
+        assert_eq!(char_from_code((1_i64 << 32) + 65), '\u{FFFD}');
+        assert_eq!(char_from_code(i64::MAX), '\u{FFFD}');
+        assert_eq!(char_from_code(i64::MIN + 65), '\u{FFFD}');
     }
 
     #[test]

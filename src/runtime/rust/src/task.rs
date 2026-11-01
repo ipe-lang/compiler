@@ -1019,7 +1019,8 @@ where
                     }
                     let delay = retry_compute_delay(strategy, base, attempt);
                     if delay > 0 {
-                        tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(delay.unsigned_abs()))
+                            .await;
                     }
                     attempt += 1;
                 }
@@ -1075,8 +1076,9 @@ fn retry_compute_delay(strategy: BackoffStrategy, base_ms: i64, attempt: i64) ->
         super::random::lcg_init();
         let unit = (super::random::lcg_next() >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0);
         let scaled = (d as f64) * (0.5 + unit);
-        // round-to-nearest, then re-clamp.
-        d = scaled.round() as i64;
+        // Round to nearest, then re-clamp. `scaled` is finite and below
+        // `1.5 * RETRY_DELAY_CAP_MS`, so the cap fallback is unreachable.
+        d = super::narrow::f64_trunc_to_i64(scaled.round()).unwrap_or(RETRY_DELAY_CAP_MS);
         if d > RETRY_DELAY_CAP_MS {
             d = RETRY_DELAY_CAP_MS;
         }

@@ -55,7 +55,7 @@ pub fn set_to_list<A>(s: BTreeSet<A>) -> Vec<A> {
 /// `Set.size : Set a -> Int`.
 #[must_use]
 pub fn set_size<A>(s: BTreeSet<A>) -> i64 {
-    s.len() as i64
+    super::narrow::count_to_int(s.len())
 }
 
 /// `Set.union : Set a -> Set a -> Set a`. Every element of either set.
