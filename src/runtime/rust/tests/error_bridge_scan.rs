@@ -177,9 +177,9 @@ const UNCLASSIFIED_SITES: &[Unclassified] = &[
     },
     Unclassified {
         file: "task.rs",
-        function: "task_parallel",
+        function: "parallel_child_failure",
         needle: "IpeError::unexpected",
-        count: 2,
+        count: 1,
         reason: "a `Task.parallel` child that panicked or was cancelled outside any \
                  guarded foreign call: a defect in compiled or runtime code",
     },

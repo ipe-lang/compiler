@@ -850,10 +850,10 @@ pub fn task_run<
 //
 // TOTALITY: no unwrap/expect/panic/indexing. A `JoinError` from `h.await` is a
 // panic inside the spawned task (we never `.await` a handle after issuing its
-// abort, so the cancelled-handle case is unreachable on this path); its payload
-// routes through the redacting foreign-panic funnel — detail server-side under
-// a correlation id, a generic typed `Err` to Ipê. The cancelled arm stays
-// total via the foreign-error funnel rather than an unreachable assumption.
+// abort, so the cancelled-handle case is reachable only on runtime shutdown);
+// `parallel_child_failure` logs its detail server-side under a correlation id
+// and hands Ipê a generic `Unexpected` naming the panic or the cancel. The
+// cancelled arm stays total rather than resting on an unreachable assumption.
 /// One spawned `Task.parallel` child and the guard that aborts it on drop.
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 type ParallelChild<E, A> = (tokio::task::JoinHandle<IpeResult<E, A>>, AbortOnDrop);
@@ -883,16 +883,7 @@ pub fn task_parallel<E: crate::FromIpeError + Send + 'static, A: Send + 'static>
             guard.defuse();
             let result = match joined {
                 Ok(r) => r,
-                Err(join_err) => match join_err.try_into_panic() {
-                    Ok(payload) => IpeResult::Err(E::from_ipe_error(crate::IpeError::unexpected(
-                        crate::core::redacted_panic_message("parallel task panicked", payload),
-                    ))),
-                    Err(join_err) => {
-                        IpeResult::Err(E::from_ipe_error(crate::IpeError::unexpected(
-                            crate::core::redacted_foreign_message(join_err),
-                        )))
-                    }
-                },
+                Err(join_err) => IpeResult::Err(parallel_child_failure(join_err)),
             };
             match result {
                 IpeResult::Ok(a) => out.push(a),
@@ -911,6 +902,23 @@ pub fn task_parallel<E: crate::FromIpeError + Send + 'static, A: Send + 'static>
         }
         ok_res(out)
     })
+}
+
+/// The caller's error for a `Task.parallel` child that did not finish.
+///
+/// A panic or a cancel of a child is a defect in compiled or runtime code, not
+/// a foreign failure, so it is kinded `Unexpected` and named for what it is;
+/// the payload or `JoinError` detail is logged under the correlation id only.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+fn parallel_child_failure<E: crate::FromIpeError>(join_err: tokio::task::JoinError) -> E {
+    let message = match join_err.try_into_panic() {
+        Ok(payload) => crate::core::redacted_panic_message("parallel task panicked", payload),
+        Err(join_err) => format!(
+            "parallel task cancelled (ref {})",
+            crate::core::note_foreign_error(join_err)
+        ),
+    };
+    E::from_ipe_error(crate::IpeError::unexpected(message))
 }
 
 // Std-only `Task.parallel` for the `tokio`-less emitted crate. `Task.parallel`
@@ -1550,6 +1558,33 @@ mod parallel_abort_tests {
                 "a runtime-side panic folds to the funnel message, kinded Unexpected: {e}"
             ),
             IpeResult::Ok(v) => panic!("expected a typed Err, got Ok({v:?})"),
+        }
+    }
+
+    // A cancelled child is named as a cancel, never as an external failure:
+    // nothing foreign ran, so the text must not point the reader at FFI.
+    #[tokio::test]
+    async fn cancelled_parallel_child_is_named_a_cancel() {
+        let handle = tokio::spawn(std::future::pending::<()>());
+        handle.abort();
+        let joined = handle.await;
+        assert!(
+            joined
+                .as_ref()
+                .is_err_and(tokio::task::JoinError::is_cancelled),
+            "an aborted spawn joins as a cancel: {joined:?}"
+        );
+        if let Err(join_err) = joined {
+            let err: crate::IpeError = parallel_child_failure(join_err);
+            assert_eq!(
+                crate::ipe_error_kind(err.clone()),
+                crate::IpeErrorKind::Unexpected
+            );
+            let message = crate::ipe_error_message(err);
+            assert!(
+                message.starts_with("parallel task cancelled (ref "),
+                "got: {message:?}"
+            );
         }
     }
 
