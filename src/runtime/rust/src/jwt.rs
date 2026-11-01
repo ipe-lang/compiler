@@ -100,8 +100,11 @@ impl std::fmt::Display for ClaimsRefusal {
 impl std::error::Error for ClaimsRefusal {}
 
 /// A JSON number as whole Unix seconds, flooring toward −∞ so a token is never
-/// accepted longer than its fractional `exp` states. `None` when the number has
-/// no `f64` reading.
+/// accepted longer than its fractional `exp` states.
+///
+/// `None` when the number has no `f64` reading or its floor lies outside
+/// `i64` (`1e300`), so the claim is refused rather than read as a saturated
+/// timestamp.
 ///
 /// Flooring is the conservative direction for both claims:
 ///   - `exp 0.4` → `0`  (already expired at epoch; rejected)
@@ -109,7 +112,10 @@ impl std::error::Error for ClaimsRefusal {}
 ///     matching integer-second oracle behaviour)
 ///   - `exp -0.1` → `-1` (negative, unconditionally in the past; rejected)
 fn number_seconds(n: &serde_json::Number) -> Option<i64> {
-    n.as_i64().or_else(|| n.as_f64().map(|f| f.floor() as i64))
+    n.as_i64().or_else(|| {
+        n.as_f64()
+            .and_then(|f| crate::narrow::f64_trunc_to_i64(f.floor()))
+    })
 }
 
 /// Read the NumericDate claim `claim` (RFC 7519 §2: any JSON number, may be
@@ -122,7 +128,8 @@ fn number_seconds(n: &serde_json::Number) -> Option<i64> {
 ///
 /// [`ClaimsRefusal::NotAnObject`] when `claims` is not a JSON object;
 /// [`ClaimsRefusal::NonNumericDate`] when the claim is present but not a
-/// readable number (a string, `null`, a boolean, an array, an object).
+/// readable number (a string, `null`, a boolean, an array, an object, or a
+/// number whose seconds lie outside `i64`).
 pub(crate) fn read_numeric_date(
     claims: &JsonValue,
     claim: &'static str,
@@ -175,10 +182,7 @@ pub(crate) fn decode_payload(token: &str) -> Option<JsonValue> {
 /// Current wall-clock time as Unix seconds (i64). Used by the flat decoders to
 /// pre-reject expired/not-yet-valid tokens before handing off to jsonwebtoken.
 pub(crate) fn now_unix_seconds() -> i64 {
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => d.as_secs() as i64,
-        Err(_) => 0,
-    }
+    crate::narrow::unix_secs()
 }
 
 /// The HMAC-key floor for HS256, in bytes (256 bits — RFC 7518 §3.2).
@@ -766,10 +770,7 @@ mod tests {
 
     /// Seconds since the Unix epoch, for building boundary-exercising claims.
     fn now_unix() -> i64 {
-        match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            Ok(d) => d.as_secs() as i64,
-            Err(_) => 0,
-        }
+        crate::narrow::unix_secs()
     }
 
     #[test]
@@ -1453,5 +1454,62 @@ mod tests {
             admit_time_claims(&serde_json::json!("exp"), 0),
             Err(ClaimsRefusal::NotAnObject)
         );
+    }
+
+    /// A date claim whose seconds lie outside `i64` is refused, never read as
+    /// a saturated timestamp that would keep the token alive forever.
+    #[test]
+    fn date_claims_past_i64_refused() {
+        let claims = serde_json::json!({
+            "exp": 1e300,
+            "nbf": -1e300,
+            "iat": 9.3e18,
+            "edge": -9_223_372_036_854_775_808.0,
+            "wide": u64::MAX,
+        });
+        for claim in ["exp", "nbf", "iat", "wide"] {
+            assert_eq!(
+                read_numeric_date(&claims, claim),
+                Err(ClaimsRefusal::NonNumericDate { claim })
+            );
+        }
+        assert_eq!(read_numeric_date(&claims, "edge"), Ok(Some(i64::MIN)));
+        assert_eq!(
+            admit_time_claims(&serde_json::json!({"exp": 1e300}), 0),
+            Err(ClaimsRefusal::NonNumericDate { claim: "exp" })
+        );
+        // An integer `exp` past `i64` (one jsonwebtoken reads as a `u64`) is
+        // refused too, never admitted as the saturated `i64::MAX`.
+        assert_eq!(
+            admit_time_claims(&serde_json::json!({"exp": u64::MAX}), 0),
+            Err(ClaimsRefusal::NonNumericDate { claim: "exp" })
+        );
+        // The `-2^63` edge is only compared, never subtracted: as `exp` it is
+        // long past, as `nbf` long reached.
+        let edge = -9_223_372_036_854_775_808.0_f64;
+        assert_eq!(
+            admit_time_claims(&serde_json::json!({"exp": edge}), i64::MIN),
+            Err(ClaimsRefusal::Expired)
+        );
+        assert_eq!(
+            admit_time_claims(&serde_json::json!({"nbf": edge}), i64::MIN),
+            Ok(())
+        );
+        assert!(matches!(
+            flat_hs256(hs256_token(&format!(r#"{{"sub":"x","exp":{}}}"#, u64::MAX))),
+            IpeResult::Err(_)
+        ));
+        let msg = refusal(builder_hs256(
+            500,
+            hs256_token(r#"{"sub":"x","exp":1e300}"#),
+        ));
+        assert!(
+            msg.ends_with("Jwt.decode: token `exp` is not a NumericDate"),
+            "unexpected refusal {msg}"
+        );
+        assert!(matches!(
+            flat_hs256(hs256_token(r#"{"sub":"x","exp":1e300}"#)),
+            IpeResult::Err(_)
+        ));
     }
 }
