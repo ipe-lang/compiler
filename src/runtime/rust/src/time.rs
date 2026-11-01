@@ -21,13 +21,7 @@ use super::{IpeTask, ok_res};
 // `wasm32-unknown-unknown` but runs on `wasm32-wasip1` (WASI has a clock).
 #[cfg(not(all(target_arch = "wasm32", feature = "wasm-client")))]
 pub fn time_now<E: Send + 'static>(_: ()) -> IpeTask<E, i64> {
-    Box::pin(async move {
-        let ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-        ok_res(ms)
-    })
+    Box::pin(async move { ok_res(super::narrow::unix_millis()) })
 }
 
 // `Time.sleep` waits — the one reactor-driven `Time` kernel. On the tokio build
@@ -79,7 +73,7 @@ pub fn time_unix_millis<E: Send + 'static>(_: ()) -> IpeTask<E, i64> {
 // site is unchanged across targets (Q2: `emit_expr.rs` stays target-agnostic).
 #[cfg(all(target_arch = "wasm32", feature = "wasm-client"))]
 pub fn time_now<E: 'static>(_: ()) -> IpeTask<E, i64> {
-    Box::pin(async move { ok_res(js_sys::Date::now() as i64) })
+    Box::pin(async move { ok_res(super::narrow::unix_millis()) })
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "wasm-client"))]
@@ -93,15 +87,11 @@ pub fn time_sleep<E: 'static>(ms: i64) -> IpeTask<E, ()> {
 }
 
 /// The longest single browser timer wait, in milliseconds.
-///
-/// `setTimeout` reads its delay as a signed 32-bit `long`, and `gloo-timers`
-/// passes its `u32` through as `i32`, so a delay past `i32::MAX` wraps to a
-/// negative one and fires at once.
 #[cfg(any(
     all(test, not(target_arch = "wasm32")),
     all(target_arch = "wasm32", feature = "wasm-client")
 ))]
-const SLEEP_CHUNK_MS: u32 = i32::MAX.unsigned_abs();
+const SLEEP_CHUNK_MS: u32 = super::narrow::BROWSER_TIMER_MAX_MS;
 
 /// Splits a `Time.sleep` of `ms` milliseconds into browser-timer-sized waits.
 ///

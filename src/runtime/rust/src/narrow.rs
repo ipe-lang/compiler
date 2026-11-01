@@ -37,8 +37,28 @@ pub fn count_to_int_u64(n: u64) -> i64 {
 /// order of two counts survives the conversion on every target width.
 #[must_use]
 pub fn count_from_int(n: i64) -> usize {
-    usize::try_from(n.max(0)).unwrap_or(usize::MAX)
+    saturating_count(n, usize::MAX)
 }
+
+/// Converts an Ipê `Int` count into any unsigned width whose largest value is
+/// `max`: `<= 0` is `0`, past the width is `max`.
+///
+/// [`count_from_int`] is its `usize` instance; being width-generic, it is
+/// proven at 32 bits by a `u32` instance on every host, not only on wasm32.
+fn saturating_count<T: TryFrom<i64> + Default>(n: i64, max: T) -> T {
+    if n <= 0 {
+        return T::default();
+    }
+    T::try_from(n).unwrap_or(max)
+}
+
+/// The longest delay, in milliseconds, one browser timer honours.
+///
+/// `setTimeout` and `setInterval` read their delay as a signed 32-bit `long`,
+/// and `gloo-timers` narrows its `u32` delay `as i32`, so a delay past
+/// `i32::MAX` wraps negative and fires at once. Every browser timer the
+/// runtime arms is bounded by this one value.
+pub const BROWSER_TIMER_MAX_MS: u32 = i32::MAX.unsigned_abs();
 
 /// Converts an Ipê `Int` to a foreign byte, clamping into `0..=255`.
 ///
@@ -127,7 +147,7 @@ pub fn unix_secs() -> i64 {
 mod tests {
     use super::{
         I64_CEIL, I64_FLOOR, byte_saturating, count_from_int, count_to_int, count_to_int_u64,
-        f64_trunc_to_i64, u128_saturating_u64,
+        f64_trunc_to_i64, saturating_count, u128_saturating_u64,
     };
 
     /// `2^32`: the first value a 32-bit narrowing wraps back to zero.
@@ -146,6 +166,21 @@ mod tests {
         assert_eq!(count_to_int_u64(i64::MAX.unsigned_abs()), i64::MAX);
         assert_eq!(count_to_int_u64(i64::MAX.unsigned_abs() + 1), i64::MAX);
         assert_eq!(count_to_int_u64(41), 41);
+    }
+
+    /// The 32-bit proof, run on every host: `2^32 + 5` saturates, never wraps
+    /// to `5`, and the last value the width holds stays exact.
+    #[test]
+    fn saturating_count_saturates_at_32_bits() {
+        let at32 = |n: i64| saturating_count(n, u32::MAX);
+        assert_eq!(at32(i64::MIN), 0);
+        assert_eq!(at32(-1), 0);
+        assert_eq!(at32(0), 0);
+        assert_eq!(at32(7), 7);
+        assert_eq!(at32(WRAP - 1), u32::MAX);
+        assert_eq!(at32(WRAP), u32::MAX);
+        assert_eq!(at32(WRAP + 5), u32::MAX);
+        assert_eq!(at32(i64::MAX), u32::MAX);
     }
 
     /// Exact where `usize` holds the count, `usize::MAX` where it does not:
