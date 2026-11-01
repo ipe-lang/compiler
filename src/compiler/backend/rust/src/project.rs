@@ -3116,7 +3116,7 @@ fn assemble_project_text(
     // or `Cli.tea` (line-oriented) — add "tui" to the default features and
     // inject the crossterm + unicode-width deps required by the terminal
     // runtime. Both drive axes share the one `tui` Cargo feature: a `Cli.tea`
-    // view returns `Lines msg`, rendered by `ipe_runtime::tui::render_lines_view`
+    // view returns `Lines msg`, serialized by `ipe_runtime::tui::write_frame`
     // (behind `feature = "tui"`). The base manifest declares `tui = []` as a
     // non-default feature; we promote it and add the deps so the compiled binary
     // includes the terminal module.

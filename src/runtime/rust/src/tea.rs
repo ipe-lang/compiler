@@ -1180,9 +1180,9 @@ const STDIN_READER_THREAD: &str = "ipe-stdin-reader";
 /// subscribes to is unobserved (no update, no render). Stdin is read on a blocking task; tickers + perform
 /// results merge into the same single-threaded update sequence via one channel.
 ///
-/// Gated on `feature = "tui"`: the `Lines msg` view rasterizes through
-/// `crate::tui::render_lines_view`, which shares the terminal runtime module
-/// with `tui_app`. A `Cli.tea` program selects the `tui` feature, so a plain
+/// Gated on `feature = "tui"`: the `Lines msg` view serializes through
+/// `crate::tui::write_frame`, which shares the terminal runtime module with
+/// `tui_app`. A `Cli.tea` program selects the `tui` feature, so a plain
 /// `tokio` program (web/server, no terminal shape) never compiles this entry.
 ///
 /// A `--debugger` build takes the program's session `codec` too: the recorder
@@ -1296,14 +1296,14 @@ where
         // Inline render (a closure borrowing `view` would make the future non-Send).
         // Fallible writes (NOT print!/println!, which panic on a broken pipe).
         //
-        // Every frame and the closing bytes are encoded by the ONE `output`
-        // chosen here from whether stdout is a terminal. On a terminal a frame
-        // is styled and written with NO forced trailing "\n": the prompt
-        // formatting is the view's own to decide, so a view whose last line ends
-        // `"> "` keeps the cursor on the prompt line, and exactly one newline is
-        // written after the loop exits. Into a pipe or a file a frame is plain
-        // lines, each frame terminated by its own newline, so the output is
-        // line-oriented text a script can read.
+        // Every frame byte and the closing byte are serialized over the ONE
+        // `surface` chosen here, by `write_frame` and `LineState::close`. On a
+        // terminal a frame is styled and its last line stays open, so a view
+        // whose last line ends `"> "` keeps the cursor on the prompt line; the
+        // next frame (unless an echoed input line moved the cursor) and the
+        // close end it. Into a pipe or a file a frame is plain lines, each
+        // ending in its own newline, so the output is line-oriented text a
+        // script can read.
         //
         // The initial render is skipped when `init` issued an outstanding
         // effect: that effect's Msg folds through `update` and renders the
@@ -1311,10 +1311,11 @@ where
         // pre-effect model and duplicate the frame. An effect-free `init`
         // (`Cmd.none`) has nothing to settle, so its initial model renders now
         // (the `lines: 0` frame the separator fixture pins).
-        let output = crate::tui::LineOutput::of_stdout();
+        let surface = crate::tui::LineSurface::from_stdout_only();
+        let mut line_state = crate::tui::LineState::new();
         if outstanding.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-            let rendered = crate::tui::render_lines_view(view(model.clone()), output);
-            let _ = std::io::stdout().write_all(rendered.as_bytes());
+            let frame = crate::tui::write_frame(&view(model.clone()), &surface, &mut line_state);
+            let _ = std::io::stdout().write_all(&frame);
             let _ = std::io::stdout().flush();
         }
 
@@ -1322,7 +1323,11 @@ where
             let msgs: Vec<Msg> = match ev {
                 // Every active line handler sees the line; none → unobserved.
                 // The permit returns to the reader's budget as the line is taken.
-                CliEvent::Line(l, _permit) => submgr.line_msgs(&l),
+                // Its echo ended the open prompt line, observed or not.
+                CliEvent::Line(l, _permit) => {
+                    line_state.echoed_line();
+                    submgr.line_msgs(&l)
+                }
                 CliEvent::Key(..) => continue, // Cli has no keys
                 CliEvent::Interrupt => {
                     submgr.stop_all();
@@ -1363,8 +1368,8 @@ where
                 cli_run_cmd_tracked(cmd, &tx, Some(&outstanding));
                 submgr.update(subscriptions(model.clone()));
             }
-            let rendered = crate::tui::render_lines_view(view(model.clone()), output);
-            let _ = std::io::stdout().write_all(rendered.as_bytes());
+            let frame = crate::tui::write_frame(&view(model.clone()), &surface, &mut line_state);
+            let _ = std::io::stdout().write_all(&frame);
             let _ = std::io::stdout().flush();
             // After folding an effect's result, if EOF was already seen and no
             // effects remain outstanding, terminate as EOF would have.
@@ -1373,7 +1378,7 @@ where
             }
         }
         submgr.stop_all();
-        let _ = std::io::stdout().write_all(output.closing().as_bytes());
+        let _ = std::io::stdout().write_all(line_state.close());
         let _ = std::io::stdout().flush();
         // Dump the recorded session (plain trace + typed log) to the
         // `IPE_DEBUGGER_RECORD` destination, a no-op when that env var is unset.
