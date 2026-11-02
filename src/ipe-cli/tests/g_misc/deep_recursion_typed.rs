@@ -3,9 +3,14 @@
 //!
 //! The tokio shape runs the recursion inside the entry task, so the entry
 //! boundary converts the trip into `LimitExceeded` and the program exits 1
-//! through the error funnel. The std-only shape builds its whole task before
-//! the entry executor runs, so the trip unwinds out of task construction: the
-//! classifier still names it by its type and no foreign-panic record is written.
+//! through the error funnel. The std-only program computes its value while
+//! `fn main` builds the entry task, outside the entry catch, so this test pins
+//! only what holds there: the classifier names the trip by its type, no
+//! foreign-panic record is written, and the exit is a code, not a signal. Its
+//! exit code is deliberately left unpinned: the defect is that the emitted
+//! entry builds the task before the catch (any shape, the tokio one included,
+//! when the work is not deferred behind `Task.andThen`); the required outcome
+//! is the tokio shape's `LimitExceeded` and exit 1.
 //!
 //! Gated on `IPE_E2E=1`; without it the test returns early.
 

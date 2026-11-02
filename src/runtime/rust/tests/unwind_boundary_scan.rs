@@ -17,6 +17,9 @@
 //! A `#[cfg(...)]` proven test-only removes exactly the node it is attached to;
 //! a `use` names nothing; comments and string literals are never code. A macro
 //! body is scanned token by token, so a shape written inside one still counts.
+//! A path call `JoinHandle::join(h)` counts as a thread join. A `use` that
+//! renames a catch name or a join-handle type is refused outright: the scan
+//! matches names, so the alias would hide every call made through it.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,7 +29,7 @@ use syn::ext::IdentExt;
 use syn::visit::{self, Visit};
 use syn::{
     Arm, Attribute, Expr, ExprMethodCall, Field, FieldValue, ImplItem, ImplItemFn, Item, ItemFn,
-    ItemUse, Macro, Path, Stmt, TraitItem, TraitItemFn, Variant,
+    ItemUse, Macro, Path, Stmt, TraitItem, TraitItemFn, UseTree, Variant,
 };
 
 #[path = "support/cfg_scan.rs"]
@@ -50,6 +53,9 @@ const CATCH_NAMES: &[&str] = &[
 
 /// The shape a no-argument `.join()` call is recorded under.
 const THREAD_JOIN: &str = "join()";
+
+/// The thread-handle types whose `join` is a [`THREAD_JOIN`] when called by path.
+const JOIN_HANDLES: &[&str] = &["JoinHandle", "ScopedJoinHandle"];
 
 /// How a ledgered catch site treats a runtime trip.
 #[derive(Debug, Clone, Copy)]
@@ -169,6 +175,13 @@ const CATCH_SITES: &[CatchSite] = &[
     },
     CatchSite {
         file: "threads.rs",
+        function: "join_blocking",
+        shape: "try_into_panic",
+        count: 1,
+        route: Route::Typed("resume_runtime_trip"),
+    },
+    CatchSite {
+        file: "threads.rs",
         function: "offload_blocking",
         shape: "catch_unwind",
         count: 1,
@@ -197,6 +210,8 @@ struct Found {
     sites: Vec<(String, &'static str)>,
     /// Every path's last segment and method name, per function.
     calls: BTreeMap<String, BTreeSet<String>>,
+    /// `(original, alias)` per `use` that renames a catch name or join handle.
+    renames: Vec<(String, String)>,
 }
 
 /// The `syn` walk of one file's production syntax.
@@ -295,7 +310,28 @@ impl<'ast> Visit<'ast> for Scan {
         visit::visit_trait_item(self, item);
     }
 
-    fn visit_item_use(&mut self, _item: &'ast ItemUse) {}
+    fn visit_item_use(&mut self, item: &'ast ItemUse) {
+        if cfg_test_only(&item.attrs) {
+            return;
+        }
+        let mut pending = vec![&item.tree];
+        while let Some(tree) = pending.pop() {
+            match tree {
+                UseTree::Path(path) => pending.push(&path.tree),
+                UseTree::Group(group) => pending.extend(group.items.iter()),
+                UseTree::Rename(rename) => {
+                    let original = rename.ident.unraw().to_string();
+                    let hidden = Self::catch_shape(&original).is_some()
+                        || JOIN_HANDLES.contains(&original.as_str());
+                    if hidden {
+                        let alias = rename.rename.unraw().to_string();
+                        self.found.renames.push((original, alias));
+                    }
+                }
+                UseTree::Name(_) | UseTree::Glob(_) => {}
+            }
+        }
+    }
 
     fn visit_item_fn(&mut self, item: &'ast ItemFn) {
         self.functions.push(item.sig.ident.unraw().to_string());
@@ -370,11 +406,20 @@ impl<'ast> Visit<'ast> for Scan {
     }
 
     fn visit_path(&mut self, path: &'ast Path) {
+        let mut previous: Option<String> = None;
         for segment in &path.segments {
             let name = segment.ident.unraw().to_string();
             if let Some(shape) = Self::catch_shape(&name) {
                 self.record(shape);
             }
+            let handle_join = name == "join"
+                && previous
+                    .as_deref()
+                    .is_some_and(|handle| JOIN_HANDLES.contains(&handle));
+            if handle_join {
+                self.record(THREAD_JOIN);
+            }
+            previous = Some(name);
         }
         if let Some(last) = path.segments.last() {
             self.call(last.ident.unraw().to_string());
@@ -407,8 +452,15 @@ fn scan(name: &str, src: &str) -> Found {
 fn violations(sources: &[(String, String)], ledger: &[CatchSite]) -> Vec<String> {
     let mut counts: BTreeMap<(String, String, &'static str), usize> = BTreeMap::new();
     let mut calls: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    let mut out = Vec::new();
     for (file, src) in sources {
         let found = scan(file, src);
+        for (original, alias) in found.renames {
+            out.push(format!(
+                "{file}: `use .. {original} as {alias}` hides `{original}` from the scan: \
+                 call it by its own name"
+            ));
+        }
         for (function, shape) in found.sites {
             let count = counts.entry((file.clone(), function, shape)).or_insert(0);
             *count = count.saturating_add(1);
@@ -417,7 +469,6 @@ fn violations(sources: &[(String, String)], ledger: &[CatchSite]) -> Vec<String>
             calls.insert((file.clone(), function), names);
         }
     }
-    let mut out = Vec::new();
     for ((file, function, shape), count) in &counts {
         let listed = ledger.iter().find(|s| {
             s.file == file.as_str() && s.function == function.as_str() && s.shape == *shape
@@ -526,6 +577,31 @@ fn rogue_macro() { m!(x.join(); std::panic::catch_unwind(f)); }
             "`{function}` `{shape}` must be refused: {found:#?}"
         );
     }
+}
+
+#[test]
+fn a_path_join_and_a_renamed_catch_are_refused() {
+    let src = r"
+use std::panic::catch_unwind as contain;
+use std::thread::{JoinHandle as Handle, spawn};
+use tokio::task::JoinError;
+fn via_alias() { let _ = contain(|| ()); }
+fn via_path(h: std::thread::JoinHandle<()>) { let _ = std::thread::JoinHandle::join(h); }
+fn via_map(hs: Vec<JoinHandle<()>>) { let _ = hs.into_iter().map(JoinHandle::join); }
+";
+    let found = violations(&sources(&[("rogue.rs", src)]), &[]);
+    for needle in [
+        "`use .. catch_unwind as contain`",
+        "`use .. JoinHandle as Handle`",
+        "`via_path` catches an unwind through `join()`",
+        "`via_map` catches an unwind through `join()`",
+    ] {
+        assert!(
+            found.iter().any(|v| v.contains(needle)),
+            "{needle} must be refused: {found:#?}"
+        );
+    }
+    assert_eq!(found.len(), 4, "{found:#?}");
 }
 
 #[test]

@@ -348,13 +348,30 @@ where
     E: crate::FromIpeError + Send + 'static,
     A: Send + 'static,
 {
+    block_on_std(future)
+}
+
+/// The std-only entry: poll `future` on this thread inside the entry catch.
+///
+/// The body of the std-only [`block_on`]. It is also compiled in every native
+/// test build, so its tests run whichever config links `block_on` (the CI test
+/// runs all link the tokio one).
+#[cfg(all(
+    not(all(target_arch = "wasm32", feature = "wasm-client")),
+    any(not(feature = "tokio"), target_arch = "wasm32", test)
+))]
+fn block_on_std<E, A>(future: IpeTask<E, A>) -> IpeResult<E, A>
+where
+    E: crate::FromIpeError + Send + 'static,
+    A: Send + 'static,
+{
     drive_entry_caught(move || poll_on_current_thread(future))
 }
 
 /// Poll `future` to completion on the current thread with a park/unpark waker.
 #[cfg(all(
     not(all(target_arch = "wasm32", feature = "wasm-client")),
-    any(not(feature = "tokio"), target_arch = "wasm32")
+    any(not(feature = "tokio"), target_arch = "wasm32", test)
 ))]
 fn poll_on_current_thread<E, A>(future: IpeTask<E, A>) -> IpeResult<E, A> {
     use std::sync::Arc;
@@ -1662,12 +1679,51 @@ mod parallel_abort_tests {
 // Proves the std-only `block_on` (the `tokio`-less entry) drives a future to
 // completion correctly: a ready future returns immediately, and a future that
 // yields `Pending` once — then is woken from another thread — is re-polled and
-// completes without busy-spinning (the park/unpark handshake). Runs only in the
-// `tokio`-less config, which is the one that links that `block_on`.
-#[cfg(all(not(feature = "tokio"), not(target_arch = "wasm32")))]
+// completes without busy-spinning (the park/unpark handshake), and that a trip
+// or a foreign panic escaping the future ends as a typed error. It drives
+// `block_on_std`, the std-only `block_on`'s body, so it runs in every native
+// config, the tokio ones CI tests included.
+#[cfg(not(target_arch = "wasm32"))]
 #[cfg(test)]
 mod std_block_on_tests {
     use super::*;
+    use block_on_std as block_on;
+
+    // The std-only entry types an unwind escaping its future, exactly as the
+    // tokio entry's join does: a trip keeps `LimitExceeded`, any other payload
+    // is a redacted `Unexpected`.
+    #[test]
+    fn std_entry_types_a_trip_and_redacts_a_foreign_panic() {
+        use crate::core::{RuntimeTrip, trip};
+        let tripped: IpeTask<IpeError, i64> = Box::pin(async { trip(RuntimeTrip::RecursionLimit) });
+        let got = block_on(tripped);
+        assert!(matches!(got, IpeResult::Err(_)), "a trip must end as Err");
+        if let IpeResult::Err(err) = got {
+            assert_eq!(
+                crate::ipe_error_kind(err.clone()),
+                crate::IpeErrorKind::LimitExceeded
+            );
+            assert_eq!(
+                crate::ipe_error_message(err),
+                RuntimeTrip::RECURSION_LIMIT_MESSAGE
+            );
+        }
+        let foreign: IpeTask<IpeError, i64> =
+            Box::pin(async { std::panic::resume_unwind(Box::new("sk_live_SECRET".to_owned())) });
+        let got = block_on(foreign);
+        assert!(matches!(got, IpeResult::Err(_)), "a panic must end as Err");
+        if let IpeResult::Err(err) = got {
+            assert_eq!(
+                crate::ipe_error_kind(err.clone()),
+                crate::IpeErrorKind::Unexpected
+            );
+            let message = crate::ipe_error_message(err);
+            assert!(
+                message.starts_with("async task panicked (ref ") && !message.contains("SECRET"),
+                "got: {message:?}"
+            );
+        }
+    }
 
     #[test]
     fn ready_future_completes_immediately() {
