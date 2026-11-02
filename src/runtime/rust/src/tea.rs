@@ -835,6 +835,9 @@ pub(crate) enum CliEvent<M> {
     /// A stdin line and how it ended, holding its share of the reader's
     /// [`InputBudget`].
     Line(String, crate::tui::InputEnd, InputPermit),
+    /// A stdin line the reader dropped (past [`MAX_LINE_BYTES`]) and how it
+    /// ended: never delivered, but its echo moved the cursor like any line's.
+    LineClosed(crate::tui::InputEnd, InputPermit),
     // Constructed only by the `tui` raw-key reader; console_app matches it
     // defensively (keys are ignored under Cli).
     Key(String, String, InputPermit),
@@ -937,8 +940,9 @@ pub(crate) enum BoundedLine {
     /// A complete line within the ceiling, its `\n` / `\r\n` terminator
     /// removed, and how it ended.
     Line(String, crate::tui::InputEnd),
-    /// A line past the ceiling, consumed through its terminator and dropped.
-    TooLong,
+    /// A line past the ceiling, consumed through its terminator and dropped,
+    /// and how it ended.
+    TooLong(crate::tui::InputEnd),
     /// A line within the ceiling that is not UTF-8.
     NotUtf8,
 }
@@ -991,14 +995,14 @@ pub(crate) fn read_bounded_line<R: std::io::BufRead>(
     if line.last() == Some(&b'\r') {
         line.pop();
     }
-    if too_long || line.len() > max_bytes {
-        return Ok(Some(BoundedLine::TooLong));
-    }
     let end = if terminated {
         crate::tui::InputEnd::Newline
     } else {
         crate::tui::InputEnd::Eof
     };
+    if too_long || line.len() > max_bytes {
+        return Ok(Some(BoundedLine::TooLong(end)));
+    }
     Ok(Some(
         String::from_utf8(line).map_or(BoundedLine::NotUtf8, |text| BoundedLine::Line(text, end)),
     ))
@@ -1264,11 +1268,24 @@ where
             let stdin = std::io::stdin();
             let mut reader = stdin.lock();
             loop {
-                let (line, end) = match read_bounded_line(&mut reader, MAX_LINE_BYTES) {
-                    Ok(Some(BoundedLine::Line(l, end))) => (l, end),
-                    Ok(Some(BoundedLine::TooLong)) => continue,
+                let read = match read_bounded_line(&mut reader, MAX_LINE_BYTES) {
+                    Ok(Some(BoundedLine::Line(l, end))) => Some((l, end)),
+                    // A dropped line is still reported, so the loop knows its
+                    // echo ended the open prompt line.
+                    Ok(Some(BoundedLine::TooLong(end))) => {
+                        let Some(permit) = budget.acquire(|| line_tx.is_closed()) else {
+                            return;
+                        };
+                        if line_tx.send(CliEvent::LineClosed(end, permit)).is_err() {
+                            return;
+                        }
+                        None
+                    }
                     // End of input, a non-UTF-8 line, or a read error ends input.
                     Ok(None | Some(BoundedLine::NotUtf8)) | Err(_) => break,
+                };
+                let Some((line, end)) = read else {
+                    continue;
                 };
                 let Some(permit) = budget.acquire(|| line_tx.is_closed()) else {
                     return;
@@ -1306,13 +1323,16 @@ where
         // Fallible writes (NOT print!/println!, which panic on a broken pipe).
         //
         // Every frame byte and the closing byte are serialized over the ONE
-        // `surface` chosen here, by `write_frame` and `LineState::close`. On a
-        // terminal a frame is styled and its last line stays open, so a view
-        // whose last line ends `"> "` keeps the cursor on the prompt line; the
-        // next frame (unless an echoed input line moved the cursor) and the
-        // close end it. Into a pipe or a file a frame is plain lines, each
-        // ending in its own newline, so the output is line-oriented text a
-        // script can read.
+        // `surface` decided here from both stdin's and stdout's facts, by
+        // `write_frame` and `LineState::close` (or, on `System.exit`, the
+        // registered `close_open_line_on_exit`). On one echoing terminal a
+        // frame's last line stays open, so a view whose last line ends `"> "`
+        // keeps the cursor on the prompt line; the next frame (unless an
+        // echoed input line moved the cursor) and the close end it. Anywhere
+        // else (a pipe or file on either side, a non-echoing stdin, another
+        // terminal) every frame line ends in its own newline, so the output is
+        // line-oriented text a script can read; a non-terminal stdout or
+        // `TERM=dumb` also writes no styling.
         //
         // The initial render is skipped when `init` issued an outstanding
         // effect: that effect's Msg folds through `update` and renders the
@@ -1320,8 +1340,15 @@ where
         // pre-effect model and duplicate the frame. An effect-free `init`
         // (`Cmd.none`) has nothing to settle, so its initial model renders now
         // (the `lines: 0` frame the separator fixture pins).
-        let surface = crate::tui::LineSurface::from_stdout_only();
-        let mut line_state = crate::tui::LineState::new();
+        // A slot another driver holds leaves no exit path to end an open
+        // line, so the decision then ends every frame in `\n`.
+        let exit_close = crate::system::register_exit_hook(crate::tui::close_open_line_on_exit)
+            .map_or(crate::terminal_access::ExitClose::Unavailable, |()| {
+                crate::terminal_access::ExitClose::Registered
+            });
+        let surface =
+            crate::terminal_access::decide_line(&crate::terminal_access::probe_line(exit_close));
+        let mut line_state = crate::tui::LineState::for_exit_hook();
         if outstanding.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             let frame = crate::tui::write_frame(&view(model.clone()), &surface, &mut line_state);
             let _ = std::io::stdout().write_all(&frame);
@@ -1337,6 +1364,12 @@ where
                 CliEvent::Line(l, end, _permit) => {
                     line_state.input_line(end);
                     submgr.line_msgs(&l)
+                }
+                // A dropped over-long line is never delivered, but its echo
+                // ended the open prompt line all the same.
+                CliEvent::LineClosed(end, _permit) => {
+                    line_state.input_line(end);
+                    continue;
                 }
                 CliEvent::Key(..) => continue, // Cli has no keys
                 CliEvent::Interrupt => {
@@ -2287,11 +2320,14 @@ mod bounded_input_tests {
         assert_eq!(
             lines(b"abcde\nok\n", 4),
             vec![
-                BoundedLine::TooLong,
+                BoundedLine::TooLong(InputEnd::Newline),
                 BoundedLine::Line("ok".into(), InputEnd::Newline)
             ]
         );
-        assert_eq!(lines(b"abcde", 4), vec![BoundedLine::TooLong]);
+        assert_eq!(
+            lines(b"abcde", 4),
+            vec![BoundedLine::TooLong(InputEnd::Eof)]
+        );
     }
 
     #[test]

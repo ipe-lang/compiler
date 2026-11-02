@@ -2,12 +2,14 @@
 //!
 //! A line app's output surface is one typed value, [`LineSurface`], decided
 //! once per run. Every frame byte goes through [`write_frame`] over that
-//! value, and the closing byte through [`LineState::close`]. The serializer
+//! value, and the closing byte through [`LineState::close`] or, on
+//! `System.exit`, [`close_open_line_on_exit`]. The serializer
 //! sees only sanitised [`Line`]s, never a layout, a terminal width, or `\r`:
 //! a line is written whole, as the program spelled it, with no padding.
 
 use super::{Line, LinesView};
 use crate::color::TermProfile;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// How a line's style is written.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -38,21 +40,25 @@ pub struct LineSurface {
 }
 
 impl LineSurface {
-    /// The surface the stdout-only rule picks: a terminal stdout styles under
-    /// the resolved colour profile and keeps the prompt line open; any other
-    /// stdout writes plain, newline-ended lines.
+    /// The surface of a decided style and frame end.
+    ///
+    /// Called only by `terminal_access::decide_line`, the one decision over
+    /// the run's terminal facts.
     #[must_use]
-    pub fn from_stdout_only() -> Self {
-        match super::LineOutput::of_stdout() {
-            super::LineOutput::Terminal => Self {
-                style: LineStyle::Sgr(crate::color::resolve_term_profile()),
-                end: FrameEnd::PromptOpen,
-            },
-            super::LineOutput::Plain => Self {
-                style: LineStyle::Plain,
-                end: FrameEnd::Newline,
-            },
-        }
+    pub(crate) const fn decided(style: LineStyle, end: FrameEnd) -> Self {
+        Self { style, end }
+    }
+
+    /// How this surface writes a line's style.
+    #[must_use]
+    pub const fn style(&self) -> LineStyle {
+        self.style
+    }
+
+    /// Where this surface ends a frame's last line.
+    #[must_use]
+    pub const fn end(&self) -> FrameEnd {
+        self.end
     }
 }
 
@@ -65,29 +71,70 @@ pub enum InputEnd {
     Eof,
 }
 
+/// Whether the run's last line written is still open, read by the exit hook.
+///
+/// Set and cleared only by a [`LineState`] made by [`LineState::for_exit_hook`].
+static LINE_OPEN: AtomicBool = AtomicBool::new(false);
+
 /// Whether the last line written is still open (no `\n` after it yet).
 ///
 /// Only a [`FrameEnd::PromptOpen`] frame opens it; the next frame, a
-/// newline-ended input line, or [`LineState::close`] ends it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// newline-ended input line, or [`LineState::close`] ends it. A state made by
+/// [`LineState::for_exit_hook`] mirrors the bit into the static that
+/// [`close_open_line_on_exit`] reads, so `System.exit` ends an open line too.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct LineState {
     line_open: bool,
+    exit_mirror: Option<&'static AtomicBool>,
 }
 
 impl LineState {
-    /// A run's state before its first frame: no line open.
+    /// A state before its first frame, seen by no exit hook: no line open.
     #[must_use]
     pub const fn new() -> Self {
-        Self { line_open: false }
+        Self {
+            line_open: false,
+            exit_mirror: None,
+        }
     }
 
-    /// An input line was read. A line ended by its newline was typed with
-    /// Enter, whose echo already moved the cursor to a fresh line, so no frame
-    /// needs to end the open one. A final line ended by end of input (`Ctrl-D`
-    /// after text) echoes no newline, so the open line stays open.
-    pub const fn input_line(&mut self, end: InputEnd) {
+    /// The process run's state, mirrored for [`close_open_line_on_exit`].
+    #[must_use]
+    pub fn for_exit_hook() -> Self {
+        Self::mirrored(&LINE_OPEN)
+    }
+
+    /// A state before its first frame whose open bit `mirror` follows.
+    fn mirrored(mirror: &'static AtomicBool) -> Self {
+        mirror.store(false, Ordering::SeqCst);
+        Self {
+            line_open: false,
+            exit_mirror: Some(mirror),
+        }
+    }
+
+    /// Whether a line is open now.
+    #[must_use]
+    pub const fn is_open(&self) -> bool {
+        self.line_open
+    }
+
+    fn set_open(&mut self, open: bool) {
+        self.line_open = open;
+        if let Some(mirror) = self.exit_mirror {
+            mirror.store(open, Ordering::SeqCst);
+        }
+    }
+
+    /// An input line was read, delivered or dropped.
+    ///
+    /// A line ended by its newline was typed with Enter, whose echo already
+    /// moved the cursor to a fresh line, so no frame needs to end the open
+    /// one. A final line ended by end of input (`Ctrl-D` after text) echoes no
+    /// newline, so the open line stays open.
+    pub fn input_line(&mut self, end: InputEnd) {
         match end {
-            InputEnd::Newline => self.line_open = false,
+            InputEnd::Newline => self.set_open(false),
             InputEnd::Eof => {}
         }
     }
@@ -95,13 +142,33 @@ impl LineState {
     /// The bytes that end the run's output: `\n` when a line is open, else
     /// nothing.
     #[must_use]
-    pub const fn close(&mut self) -> &'static [u8] {
-        if self.line_open {
-            self.line_open = false;
-            b"\n"
-        } else {
-            b""
-        }
+    pub fn close(&mut self) -> &'static [u8] {
+        let open = self.line_open;
+        self.set_open(false);
+        if open { b"\n" } else { b"" }
+    }
+}
+
+/// The `System.exit` stage of a `Cli.tea` run: end the open line, if any.
+///
+/// Registered as the process exit hook, because `process::exit` skips the
+/// loop's own [`LineState::close`]; the shared bit makes the two writes one.
+pub fn close_open_line_on_exit() {
+    use std::io::Write;
+    let bytes = take_open_line(&LINE_OPEN);
+    if !bytes.is_empty() {
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(bytes);
+        let _ = out.flush();
+    }
+}
+
+/// The exit's closing bytes for the open bit `flag`, clearing it.
+fn take_open_line(flag: &AtomicBool) -> &'static [u8] {
+    if flag.swap(false, Ordering::SeqCst) {
+        b"\n"
+    } else {
+        b""
     }
 }
 
@@ -122,7 +189,7 @@ pub fn write_frame<M>(
     if lines.is_empty() {
         return out;
     }
-    if state.line_open {
+    if state.is_open() {
         out.push(b'\n');
     }
     for (i, line) in lines.iter().enumerate() {
@@ -134,9 +201,9 @@ pub fn write_frame<M>(
     match surface.end {
         FrameEnd::Newline => {
             out.push(b'\n');
-            state.line_open = false;
+            state.set_open(false);
         }
-        FrameEnd::PromptOpen => state.line_open = true,
+        FrameEnd::PromptOpen => state.set_open(true),
     }
     out
 }
@@ -358,5 +425,78 @@ mod tests {
         assert_eq!(write_frame(&view, &prompt, &mut state), b"\n> ");
         state.input_line(InputEnd::Eof);
         assert_eq!(state.close(), b"\n");
+    }
+
+    const PLAIN_PROMPT: LineSurface = LineSurface {
+        style: LineStyle::Plain,
+        end: FrameEnd::PromptOpen,
+    };
+
+    // A re-render with no input line between (a ticker, a `Cmd` result)
+    // starts on a new line instead of gluing onto the open prompt.
+    #[test]
+    fn prompt_open_render_after_render_starts_a_new_line() {
+        let view = cli_lines_::<()>(vec![
+            cli_text_("tick 1".to_owned()),
+            cli_text_("> ".to_owned()),
+        ]);
+        let mut state = LineState::new();
+        let mut out = write_frame(&view, &PLAIN_PROMPT, &mut state);
+        out.extend(write_frame(&view, &PLAIN_PROMPT, &mut state));
+        assert_eq!(out, b"tick 1\n> \ntick 1\n> ");
+    }
+
+    // An echoed (newline-ended) input line already ended the open prompt, so
+    // the next frame starts where the cursor is.
+    #[test]
+    fn echoed_line_clears_open_state() {
+        let view = cli_text_::<()>("> ".to_owned());
+        let mut state = LineState::new();
+        let _ = write_frame(&view, &PLAIN_PROMPT, &mut state);
+        assert!(state.is_open());
+        state.input_line(InputEnd::Newline);
+        assert!(!state.is_open());
+        assert_eq!(write_frame(&view, &PLAIN_PROMPT, &mut state), b"> ");
+        // One step past: an input line with no frame open leaves it closed.
+        let mut fresh = LineState::new();
+        fresh.input_line(InputEnd::Newline);
+        assert!(!fresh.is_open());
+    }
+
+    #[test]
+    fn close_writes_newline_only_when_open() {
+        let mut state = LineState::new();
+        assert_eq!(state.close(), b"");
+        let _ = write_frame(&cli_text_::<()>("> ".to_owned()), &PLAIN_PROMPT, &mut state);
+        assert_eq!(state.close(), b"\n");
+        assert_eq!(state.close(), b"");
+        let _ = write_frame(&cli_text_::<()>("x".to_owned()), &PLAIN_NEWLINE, &mut state);
+        assert_eq!(state.close(), b"");
+    }
+
+    // The exit stage ends an open line exactly once, and never one the loop's
+    // own close already ended: both read the one mirrored bit.
+    #[test]
+    fn exit_close_follows_the_mirrored_open_line() {
+        static OPEN: AtomicBool = AtomicBool::new(true);
+        let mut state = LineState::mirrored(&OPEN);
+        assert_eq!(take_open_line(&OPEN), b"", "a fresh run has no open line");
+        let _ = write_frame(&cli_text_::<()>("> ".to_owned()), &PLAIN_PROMPT, &mut state);
+        assert_eq!(take_open_line(&OPEN), b"\n");
+        assert_eq!(take_open_line(&OPEN), b"");
+
+        let _ = write_frame(&cli_text_::<()>("> ".to_owned()), &PLAIN_PROMPT, &mut state);
+        assert_eq!(state.close(), b"\n");
+        assert_eq!(
+            take_open_line(&OPEN),
+            b"",
+            "the loop's close already ended it"
+        );
+
+        let _ = write_frame(&cli_text_::<()>("> ".to_owned()), &PLAIN_PROMPT, &mut state);
+        state.input_line(InputEnd::Newline);
+        assert_eq!(take_open_line(&OPEN), b"", "the echoed Enter ended it");
+        let _ = write_frame(&cli_text_::<()>("x".to_owned()), &PLAIN_NEWLINE, &mut state);
+        assert_eq!(take_open_line(&OPEN), b"");
     }
 }

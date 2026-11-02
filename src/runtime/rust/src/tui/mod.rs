@@ -12,7 +12,9 @@ pub mod layout; // structured Element → ANSI cells
 pub mod line_surface; // `Lines` view → the one Cli frame serializer
 pub use app::{tui_app, tui_app_ui};
 pub use cell::*;
-pub use line_surface::{FrameEnd, InputEnd, LineState, LineStyle, LineSurface, write_frame};
+pub use line_surface::{
+    FrameEnd, InputEnd, LineState, LineStyle, LineSurface, close_open_line_on_exit, write_frame,
+};
 
 use crate::color::{AnsiColor, Color};
 use crate::ui::element::{Attribute, Element, HAlign};
@@ -565,30 +567,6 @@ pub fn cli_color_<M>(c: AnsiColor) -> CliAttr<M> {
 #[must_use]
 pub fn cli_bg_<M>(c: AnsiColor) -> CliAttr<M> {
     CliAttr::BgColor(c)
-}
-
-/// Whether this process's stdout is a terminal.
-///
-/// Read once per run by [`LineSurface::from_stdout_only`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LineOutput {
-    /// Stdout is a terminal.
-    Terminal,
-    /// Stdout is a pipe or a file.
-    Plain,
-}
-
-impl LineOutput {
-    /// The output kind of this process's stdout.
-    #[must_use]
-    pub fn of_stdout() -> Self {
-        use std::io::IsTerminal;
-        if std::io::stdout().is_terminal() {
-            Self::Terminal
-        } else {
-            Self::Plain
-        }
-    }
 }
 
 #[cfg(test)]
