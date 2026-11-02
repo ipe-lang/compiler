@@ -238,17 +238,26 @@ fn release_members_of(base: &Path) -> Result<Vec<PathBuf>, CliError> {
 /// A pinned build directory is the user's, so `clean` never names it, even
 /// when it sits where a relocation would.
 ///
+/// Each crate is keyed by its path spelled from the canonical root through the
+/// names `clean` read, never by where a link planted at a crate path points:
+/// such a link names its own path's build directory, never another crate's.
+///
 /// # Errors
-/// As [`relocatable_crate_dirs`].
+/// [`CliError::Io`] when `root` cannot be canonicalised; as
+/// [`relocatable_crate_dirs`].
 fn relocated_targets_within(
     root: &Path,
     cache_base: &Path,
     pins: &[PathBuf],
 ) -> Result<Vec<PathBuf>, CliError> {
-    Ok(relocatable_crate_dirs(root)?
+    let root = std::fs::canonicalize(root).map_err(|source| CliError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    Ok(relocatable_crate_dirs(&root)?
         .into_iter()
         .map(|crate_dir| {
-            let target = crate::target_dir::user_cache_target(cache_base, &crate_dir);
+            let target = crate::target_dir::user_cache_target_as_spelled(cache_base, &crate_dir);
             (crate_dir, target)
         })
         .filter(|(crate_dir, target)| {
@@ -819,6 +828,42 @@ mod tests {
         assert!(!named.contains(&past), "{named:?}");
         assert_eq!(named.len(), 6, "{named:?}");
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A link planted at a member's crate path names that path's own build
+    /// directory, never the build directory of the crate the link points at.
+    #[cfg(unix)]
+    #[test]
+    fn clean_keys_a_planted_crate_link_by_its_own_path() -> Result<(), std::io::Error> {
+        let (scratch, root, base) = relocation_fixture("ipe_clean_reloc_link");
+        let victim = scratch.join("other").join("out").join("rust");
+        std::fs::create_dir_all(&victim)?;
+        let member = root.join("out").join("release").join("web");
+        std::fs::create_dir_all(&member)?;
+        std::os::unix::fs::symlink(&victim, member.join("rust"))?;
+        let named = relocated_targets_within(&root, &base, &[]).map_err(std::io::Error::other)?;
+        let victims = crate::target_dir::user_cache_target(&base, &victim);
+        assert!(!named.contains(&victims), "{named:?}");
+        let own = crate::target_dir::user_cache_target_as_spelled(&base, &member.join("rust"));
+        assert!(named.contains(&own), "{named:?}");
+        let _ = std::fs::remove_dir_all(&scratch);
+        Ok(())
+    }
+
+    /// The root is canonicalised before any crate is keyed, so a root reached
+    /// through a link names the build directories a build there keys.
+    #[cfg(unix)]
+    #[test]
+    fn clean_keys_crates_from_the_canonical_root() -> Result<(), std::io::Error> {
+        let (scratch, root, base) = relocation_fixture("ipe_clean_reloc_root_link");
+        std::fs::create_dir_all(root.join("out").join("rust"))?;
+        let via = scratch.join("via");
+        std::os::unix::fs::symlink(&root, &via)?;
+        let named = relocated_targets_within(&via, &base, &[]).map_err(std::io::Error::other)?;
+        let built = crate::target_dir::user_cache_target(&base, &via.join("out").join("rust"));
+        assert!(named.contains(&built), "{named:?}");
+        let _ = std::fs::remove_dir_all(&scratch);
+        Ok(())
     }
 
     /// A release dir holding one entry past [`MAX_RELEASE_MEMBERS`] is refused

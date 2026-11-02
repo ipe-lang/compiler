@@ -278,8 +278,9 @@ impl ReleaseSlug {
 
 /// The one spelling of a remedy command a refusal prints.
 ///
-/// The project dir rides after the verb as the user typed it, quoted as one
-/// shell word, so the printed line is the one that clears the refusal.
+/// The project dir rides after the verb as the user typed it, written as one
+/// shell word that reads back as that dir, so the printed line is the one that
+/// clears the refusal.
 #[derive(Debug, Clone, Copy)]
 pub struct Remedy;
 
@@ -293,17 +294,67 @@ impl Remedy {
         )
     }
 
-    /// `text` as one word of the user's shell: bare when every character is
-    /// one no shell reads specially, else single-quoted.
-    fn shell_word(text: &str) -> std::borrow::Cow<'_, str> {
-        let plain = |c: char| c.is_ascii_alphanumeric() || "._/-+=:,@%".contains(c);
-        if !text.is_empty() && text.chars().all(plain) {
-            return std::borrow::Cow::Borrowed(text);
+    /// `dir` as one word of the user's shell — POSIX `sh` and its kin (`bash`,
+    /// `dash`, `zsh`, `fish`) off Windows, PowerShell on it — that the command
+    /// line reads back as the project dir, never as a flag or a delivery word.
+    ///
+    /// A dir opening with `-`, or spelled as a delivery word, is led by `./`.
+    /// The word is bare only when it opens with `[A-Za-z0-9._/]` and goes on in
+    /// `[A-Za-z0-9._/+=:@%-]`, which no target shell reads specially in
+    /// argument position; any other word is single-quoted.
+    fn shell_word(dir: &str) -> String {
+        let dir = if dir.starts_with('-') || crate::cli_args::is_delivery_word(dir) {
+            format!("./{dir}")
+        } else {
+            dir.to_owned()
+        };
+        let lead = |c: char| c.is_ascii_alphanumeric() || "._/".contains(c);
+        let plain = |c: char| c.is_ascii_alphanumeric() || "._/+=:@%-".contains(c);
+        let mut chars = dir.chars();
+        if chars.next().is_some_and(lead) && chars.all(plain) {
+            return dir;
         }
-        // POSIX shells close the quote, emit an escaped quote, and reopen it;
-        // PowerShell doubles the quote inside a single-quoted string.
-        let quote = if cfg!(windows) { "''" } else { r"'\''" };
-        std::borrow::Cow::Owned(format!("'{}'", text.replace('\'', quote)))
+        let mut word = String::with_capacity(dir.len().saturating_add(2));
+        word.push('\'');
+        for c in dir.chars() {
+            match Self::quoted_spelling(c) {
+                Some(spelled) => word.push_str(spelled),
+                None => word.push(c),
+            }
+        }
+        word.push('\'');
+        word
+    }
+
+    /// How `c` is spelled inside a single-quoted word, when not as itself.
+    ///
+    /// PowerShell ends a single-quoted string at any of `'‘’‚‛` and reads each
+    /// one doubled as itself.
+    #[cfg(windows)]
+    const fn quoted_spelling(c: char) -> Option<&'static str> {
+        match c {
+            '\'' => Some("''"),
+            '\u{2018}' => Some("\u{2018}\u{2018}"),
+            '\u{2019}' => Some("\u{2019}\u{2019}"),
+            '\u{201A}' => Some("\u{201A}\u{201A}"),
+            '\u{201B}' => Some("\u{201B}\u{201B}"),
+            _ => None,
+        }
+    }
+
+    /// How `c` is spelled inside a single-quoted word, when not as itself.
+    ///
+    /// A POSIX shell ends a single-quoted string only at `'`; `fish` also reads
+    /// `\\` and `\'` inside one as escapes. Both are written outside the quotes
+    /// — close, the backslash-escaped character, reopen — which every target
+    /// shell reads as that one character.
+    #[cfg(not(windows))]
+    const fn quoted_spelling(c: char) -> Option<&'static str> {
+        match c {
+            '\'' => Some(r"'\''"),
+            '\\' => Some(r"'\\'"),
+            _ => None,
+        }
     }
 }
 
@@ -1083,35 +1134,106 @@ mod tests {
         assert!(!seen.is_empty());
     }
 
-    /// A remedy line's project dir reads back, through a POSIX shell, as the
-    /// one word the user typed — a space, a quote or a metacharacter included.
+    /// The dir word of a remedy line, its frame stripped.
+    fn remedy_word(dir: &str) -> Result<String, String> {
+        let line = Remedy::command("release build", Some(dir), "web client");
+        line.strip_prefix("ipe release build ")
+            .and_then(|rest| rest.strip_suffix(" web client"))
+            .map(str::to_owned)
+            .ok_or(line)
+    }
+
+    /// A remedy line's project dir reads back, through every POSIX shell on
+    /// the host, as the one word the user typed — a space, a quote, a
+    /// backslash, a metacharacter or a `zsh` `=` expansion included — and a dir
+    /// that would read as a flag or a delivery word reads back led by `./`.
     #[cfg(unix)]
     #[test]
-    fn remedy_dir_reads_back_as_one_shell_word() {
-        for dir in [
-            "plain/dir",
-            "my app",
-            "it's",
-            "a;touch pwned",
-            "$HOME",
-            "`id`",
-            "",
+    fn remedy_dir_reads_back_as_one_shell_word() -> Result<(), String> {
+        let shells: Vec<&str> = ["sh", "dash", "bash", "zsh", "fish"]
+            .into_iter()
+            .filter(|shell| {
+                std::process::Command::new(shell)
+                    .args(["-c", "true"])
+                    .output()
+                    .is_ok_and(|out| out.status.success())
+            })
+            .collect();
+        assert!(shells.contains(&"sh"), "{shells:?}");
+        for (dir, reads) in [
+            ("plain/dir", "plain/dir"),
+            ("my app", "my app"),
+            ("it's", "it's"),
+            (r"back\slash", r"back\slash"),
+            (r"tail\", r"tail\"),
+            (r"x\'; touch pwned; '", r"x\'; touch pwned; '"),
+            ("a;touch pwned", "a;touch pwned"),
+            ("$HOME", "$HOME"),
+            ("`id`", "`id`"),
+            ("=ls", "=ls"),
+            ("a,b", "a,b"),
+            ("@splat", "@splat"),
+            ("", ""),
+            ("-flag", "./-flag"),
+            ("--out", "./--out"),
+            ("-x y", "./-x y"),
+            ("web", "./web"),
         ] {
-            let line = Remedy::command("release build", Some(dir), "web client");
-            let word = line
-                .strip_prefix("ipe release build ")
-                .and_then(|rest| rest.strip_suffix(" web client"))
-                .expect("the remedy keeps its frame");
-            let echoed = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("printf '%s' {word}"))
-                .output()
-                .expect("sh runs");
-            assert_eq!(
-                String::from_utf8_lossy(&echoed.stdout),
-                dir,
-                "`{line}` reads back as the dir"
-            );
+            let word = remedy_word(dir)?;
+            for shell in &shells {
+                let echoed = std::process::Command::new(shell)
+                    .arg("-c")
+                    .arg(format!("printf '%s' {word}"))
+                    .output()
+                    .map_err(|e| format!("{shell}: {e}"))?;
+                assert_eq!(
+                    String::from_utf8_lossy(&echoed.stdout),
+                    reads,
+                    "{shell}: `{word}` reads back as `{dir}`"
+                );
+            }
         }
+        Ok(())
+    }
+
+    /// A word a shell reads specially in argument position is quoted, and
+    /// only a lead and body from the plain alphabet stay bare.
+    #[test]
+    fn remedy_dir_is_bare_only_in_the_plain_alphabet() -> Result<(), String> {
+        for bare in ["app", "./app", "../my-app", "a+b=c:d@e%f", "_x", ".hidden"] {
+            assert_eq!(remedy_word(bare)?, bare);
+        }
+        for quoted in ["=ls", "@splat", "%1", "+x", ":x", "a,b", "~", "a b", "é"] {
+            assert_eq!(remedy_word(quoted)?, format!("'{quoted}'"));
+        }
+        assert_eq!(remedy_word("-x")?, "./-x");
+        assert_eq!(remedy_word("tui")?, "./tui");
+        Ok(())
+    }
+
+    /// Off Windows a backslash and a quote are written outside the quotes, so
+    /// fish, which reads `\\` and `\'` as escapes inside single quotes, reads
+    /// the same word every POSIX shell does.
+    #[cfg(not(windows))]
+    #[test]
+    fn remedy_dir_spells_backslash_and_quote_outside_the_quotes() -> Result<(), String> {
+        assert_eq!(remedy_word(r"x\y")?, r"'x'\\'y'");
+        assert_eq!(remedy_word(r"x\'y")?, r"'x'\\''\''y'");
+        Ok(())
+    }
+
+    /// PowerShell, the Windows target, reads each of its single quotes doubled
+    /// as itself inside a quoted word, so none of them closes the word early.
+    #[cfg(windows)]
+    #[test]
+    fn remedy_dir_doubles_every_powershell_quote() -> Result<(), String> {
+        assert_eq!(remedy_word("it's")?, "'it''s'");
+        assert_eq!(remedy_word("a\u{2019}; x")?, "'a\u{2019}\u{2019}; x'");
+        assert_eq!(
+            remedy_word("\u{2018}\u{201A}\u{201B}")?,
+            "'\u{2018}\u{2018}\u{201A}\u{201A}\u{201B}\u{201B}'"
+        );
+        assert_eq!(remedy_word(r"C:\my app")?, r"'C:\my app'");
+        Ok(())
     }
 }
