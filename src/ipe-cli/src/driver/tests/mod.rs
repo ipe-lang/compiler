@@ -5921,14 +5921,22 @@ const DEBUG_DESKTOP_MAIN: &str = "module Main exposing (main)\n\nimport Ipe.Tea.
 
 /// Bundle the Debug-using desktop app: a release bundle behind `consented`,
 /// written under its own release member root, else a dev bundle.
+///
+/// Also answers whether the bundle left a `release/` directory under the
+/// default output root.
 fn bundle_debug_desktop(
     consented: Option<&ConsentedCapabilities>,
     label: &str,
-) -> Result<(), CliError> {
+) -> (Result<(), CliError>, bool) {
     let (tmp, _) = debug_project(label, DEBUG_DESKTOP_PACKAGE, DEBUG_DESKTOP_MAIN);
     let result = held_build(&tmp, false).and_then(|held| {
         let finish = match consented {
-            None => BundleFinish::Dev,
+            None => BundleFinish::Dev {
+                output: crate::output_dir::OutputRoot::resolve(
+                    None,
+                    &crate::output_dir::ProjectPaths::from_manifest(held.root().manifest()),
+                )?,
+            },
             Some(consented) => {
                 let desktop = crate::delivery::Delivery::resolve(
                     crate::delivery::Shape::Web,
@@ -5945,7 +5953,7 @@ fn bundle_debug_desktop(
                     None,
                     &crate::output_dir::ProjectPaths::from_manifest(held.root().manifest()),
                 )?
-                .release_member(&slug)?;
+                .release_member(&slug);
                 BundleFinish::Release {
                     consented,
                     driver: ipe_backend_rust::DbDriver::Sqlite,
@@ -5955,24 +5963,30 @@ fn bundle_debug_desktop(
         };
         bundle_delivery(BundleHost::Desktop, finish, &held)
     });
+    let left_release = tmp.join("out").join("release").exists();
     let _ = fs::remove_dir_all(&tmp);
-    result
+    (result, left_release)
 }
 
-/// A release desktop bundle refuses `Debug.*`.
+/// A release desktop bundle refuses `Debug.*`, and leaves no member behind.
 ///
 /// The bundle compiles under the release posture, so IPE-L0140 fires before
-/// any cargo build.
+/// any cargo build — and before the member root is claimed, so a refused
+/// release creates no `release/<slug>/`.
 #[test]
 fn release_desktop_bundle_gates_debug() {
     let consented = ConsentedCapabilities::admitted(crate::run_sandbox::ResolvedCapabilities {
         inferred: std::collections::BTreeSet::new(),
         declared: std::collections::BTreeSet::new(),
     });
-    let result = bundle_debug_desktop(Some(&consented), "release-desktop-debug");
+    let (result, left_release) = bundle_debug_desktop(Some(&consented), "release-desktop-debug");
     assert!(
         is_debug_gate(&result),
         "a release desktop bundle refuses Debug.log with IPE-L0140: {result:?}"
+    );
+    assert!(
+        !left_release,
+        "a release refused at emit leaves no release member directory"
     );
 }
 
@@ -5987,7 +6001,7 @@ fn dev_desktop_bundle_admits_debug() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let result = bundle_debug_desktop(None, "dev-desktop-debug");
+    let (result, _) = bundle_debug_desktop(None, "dev-desktop-debug");
     assert!(
         !matches!(&result, Err(CliError::Pipeline { .. } | CliError::Usage(_))),
         "a dev desktop bundle compiles a Debug.log app past every gate: {result:?}"

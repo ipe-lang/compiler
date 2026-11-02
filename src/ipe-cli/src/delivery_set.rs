@@ -278,8 +278,8 @@ impl ReleaseSlug {
 
 /// The one spelling of a remedy command a refusal prints.
 ///
-/// The project dir rides after the verb exactly as the user typed it, so the
-/// printed line is the one that clears the refusal.
+/// The project dir rides after the verb as the user typed it, quoted as one
+/// shell word, so the printed line is the one that clears the refusal.
 #[derive(Debug, Clone, Copy)]
 pub struct Remedy;
 
@@ -289,8 +289,21 @@ impl Remedy {
     pub fn command(verb: &str, dir: Option<&str>, words: &str) -> String {
         dir.map_or_else(
             || format!("ipe {verb} {words}"),
-            |dir| format!("ipe {verb} {dir} {words}"),
+            |dir| format!("ipe {verb} {} {words}", Self::shell_word(dir)),
         )
+    }
+
+    /// `text` as one word of the user's shell: bare when every character is
+    /// one no shell reads specially, else single-quoted.
+    fn shell_word(text: &str) -> std::borrow::Cow<'_, str> {
+        let plain = |c: char| c.is_ascii_alphanumeric() || "._/-+=:,@%".contains(c);
+        if !text.is_empty() && text.chars().all(plain) {
+            return std::borrow::Cow::Borrowed(text);
+        }
+        // POSIX shells close the quote, emit an escaped quote, and reopen it;
+        // PowerShell doubles the quote inside a single-quoted string.
+        let quote = if cfg!(windows) { "''" } else { r"'\''" };
+        std::borrow::Cow::Owned(format!("'{}'", text.replace('\'', quote)))
     }
 }
 
@@ -1068,5 +1081,37 @@ mod tests {
             }
         }
         assert!(!seen.is_empty());
+    }
+
+    /// A remedy line's project dir reads back, through a POSIX shell, as the
+    /// one word the user typed — a space, a quote or a metacharacter included.
+    #[cfg(unix)]
+    #[test]
+    fn remedy_dir_reads_back_as_one_shell_word() {
+        for dir in [
+            "plain/dir",
+            "my app",
+            "it's",
+            "a;touch pwned",
+            "$HOME",
+            "`id`",
+            "",
+        ] {
+            let line = Remedy::command("release build", Some(dir), "web client");
+            let word = line
+                .strip_prefix("ipe release build ")
+                .and_then(|rest| rest.strip_suffix(" web client"))
+                .expect("the remedy keeps its frame");
+            let echoed = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf '%s' {word}"))
+                .output()
+                .expect("sh runs");
+            assert_eq!(
+                String::from_utf8_lossy(&echoed.stdout),
+                dir,
+                "`{line}` reads back as the dir"
+            );
+        }
     }
 }

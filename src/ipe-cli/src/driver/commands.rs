@@ -1195,7 +1195,9 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
 
     let compile_target = match route {
         DevRoute::Bundle(host) => {
-            bundle_delivery(host, BundleFinish::Dev, &held)?;
+            // The bundle writes under the root `--out` names, as every dev build does.
+            let output = resolve_output_root(out.as_deref(), manifest)?;
+            bundle_delivery(host, BundleFinish::Dev { output }, &held)?;
             return Ok(BuildSuccess {
                 entry,
                 out_dir: PathBuf::new(),
@@ -1935,7 +1937,7 @@ pub fn release_pipeline(
                     env,
                 )?;
                 let member = resolve_output_root(args.out.as_deref(), manifest)?
-                    .release_member(&plan.slug()?)?;
+                    .release_member(&plan.slug()?);
                 bundle_delivery(
                     host,
                     BundleFinish::Release {
@@ -1979,9 +1981,13 @@ pub fn release_pipeline(
                     });
                 }
                 // Browser/wasm production path.
-                let member = resolve_output_root(args.out.as_deref(), manifest)?
-                    .release_member(&plan.slug()?)?;
-                let rust = member.child(OutputArea::Rust.dir_name())?;
+                // The member is claimed when the crate is written, past every
+                // emit gate, so a refused release leaves no member behind.
+                let rust = EmitTarget::Member(
+                    resolve_output_root(args.out.as_deref(), manifest)?
+                        .release_member(&plan.slug()?)
+                        .area(OutputArea::Rust),
+                );
                 let runtime_dep = runtime_dep_from_env();
                 // Emit the Rust wasm project as a release build so the Debug gate fires.
                 let options = BuildOptions {
@@ -2015,12 +2021,8 @@ pub fn release_pipeline(
                     );
                 }
 
-                let crate_dir = held.emit(
-                    &EmitTarget::Claimed(rust.clone()),
-                    &runtime_dir,
-                    &options,
-                    member_delivery.host_intent(),
-                )?;
+                let crate_dir =
+                    held.emit(&rust, &runtime_dir, &options, member_delivery.host_intent())?;
                 bundle_wasm(crate_dir.dir())?;
                 if show_progress {
                     crate::screen::chatter(
@@ -2029,7 +2031,7 @@ pub fn release_pipeline(
                         &format!(
                             "{} released → {}/www/",
                             style::outcome_glyph(style::Outcome::Success),
-                            rust.path().display()
+                            crate_dir.path().display()
                         ),
                     );
                 }
@@ -2083,9 +2085,10 @@ pub fn release_pipeline(
 
             if !run_sandbox::is_native_bearing(&resolved.union()) {
                 // Pure-native path: emit and build a plain release binary.
+                // The member is claimed when the crate is written, past every
+                // emit gate, so a refused release leaves no member behind.
                 let member = resolve_output_root(args.out.as_deref(), manifest)?
-                    .release_member(&plan.slug()?)?;
-                let rust = member.child(OutputArea::Rust.dir_name())?;
+                    .release_member(&plan.slug()?);
 
                 if show_progress {
                     crate::screen::chatter(
@@ -2103,7 +2106,7 @@ pub fn release_pipeline(
                 // A desktop host returned through the bundler above, so this static
                 // artifact is the served program.
                 let crate_dir = held.emit(
-                    &EmitTarget::Claimed(rust.clone()),
+                    &EmitTarget::Member(member.area(OutputArea::Rust)),
                     &runtime_dir,
                     &options,
                     HostIntent::Served,
@@ -2129,7 +2132,7 @@ pub fn release_pipeline(
                 // identity; it is delivered under the plain FRIENDLY name so the hash the
                 // crate carries only to own a unique shared-target slot never leaks into a
                 // distributed filename.
-                let bin_name = emitted_bin_filename(rust.path())?;
+                let bin_name = emitted_bin_filename(crate_dir.path())?;
                 let bin_path = app_target_dir
                     .path()
                     .join(triple.as_str())
@@ -2142,7 +2145,9 @@ pub fn release_pipeline(
                 }
                 // Copy the binary from the cargo target dir into the member root so the
                 // artifact lands at a predictable path regardless of CARGO_TARGET_DIR.
-                let dest = member.path_to(friendly_artifact_filename(Some(manifest)))?;
+                let dest = member
+                    .claim()?
+                    .path_to(friendly_artifact_filename(Some(manifest)))?;
                 dest.copy_from(&bin_path)?;
                 let dest = dest.path();
                 #[cfg(unix)]
@@ -2170,8 +2175,10 @@ pub fn release_pipeline(
             // tree the current directory leads to; verified before anything is built.
             let wrapper_source = crate::wrapper_source::WrapperSource::resolve()
                 .map_err(|r| CliError::WrapperSourceRefused(Box::new(r)))?;
-            let member = resolve_output_root(args.out.as_deref(), manifest)?
-                .release_member(&plan.slug()?)?;
+            // The member is claimed when the app crate is written, past every
+            // emit gate, so a refused release leaves no member behind.
+            let member =
+                resolve_output_root(args.out.as_deref(), manifest)?.release_member(&plan.slug()?);
 
             if show_progress {
                 crate::screen::chatter(
@@ -2187,12 +2194,10 @@ pub fn release_pipeline(
             let cargo_bin = toolchain::require_cargo(toolchain::ToolIntent::Build)?;
 
             // Step 1: emit + build the app binary (static, musl, production).
-            let app_area = member.child(OutputArea::App.dir_name())?;
-            let app_out = app_area.path().to_path_buf();
             // A desktop host returned through the bundler above, so this static
             // artifact is the served program.
             let app_dir = held.emit(
-                &EmitTarget::Claimed(app_area),
+                &EmitTarget::Member(member.area(OutputArea::App)),
                 &runtime_dir,
                 &options,
                 HostIntent::Served,
@@ -2220,7 +2225,7 @@ pub fn release_pipeline(
             }
             .run()?;
 
-            let release_bin_name = emitted_bin_filename(&app_out)?;
+            let release_bin_name = emitted_bin_filename(app_dir.path())?;
             let app_binary = app_target_dir
                 .path()
                 .join(triple.as_str())
@@ -2231,7 +2236,7 @@ pub fn release_pipeline(
                     &app_binary.display(),
                 )));
             }
-            let profile_src = app_out.join(RELEASE_PROFILE);
+            let profile_src = app_dir.path().join(RELEASE_PROFILE);
 
             // Step 2: build the wrapper binary (static, musl).
             let wrapper_triple = triple;
@@ -2267,7 +2272,7 @@ pub fn release_pipeline(
             .run()?;
 
             // Step 3: lay out the bundle.
-            let bundle_dir = member.child(OutputArea::Bundle.dir_name())?;
+            let bundle_dir = member.area(OutputArea::Bundle).claim()?;
 
             // The wrapper binary is read back from the build directory its build was handed.
             let wrapper_src = wrapper_target_dir
@@ -6229,8 +6234,8 @@ mod declared_delivery_tests {
         assert_eq!(
             choices(&got),
             [
-                "ipe dev run ../my app web",
-                "ipe dev run ../my app web client"
+                "ipe dev run '../my app' web",
+                "ipe dev run '../my app' web client"
             ],
             "{got:?}"
         );

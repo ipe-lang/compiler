@@ -8,7 +8,9 @@ use super::{
     resolve_vendored_runtime_dir, run_build, runtime_context_for_message, working_dir,
 };
 use crate::cargo_step::{CargoOutput, CargoTarget, TestRunKey, Verbosity};
-use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths};
+use crate::output_dir::{
+    EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths, ReleaseMember,
+};
 use crate::project_root::{AnalysisTarget, FileArg, ProjectRoot, SourceDir};
 use crate::publisher::{AttestedActor, BlessedPublisher};
 use crate::remote_ingest::{InheritedError, InheritedInput, InheritedRole, run_inherited};
@@ -61,13 +63,17 @@ pub use crate::delivery_set::BundleHost;
 
 /// The posture a bundle is finished in, and where it is written.
 ///
-/// A dev bundle writes `rust/` and `dist/` under the project's default output
-/// root. A release bundle writes them under its own release member root
-/// (`release/<slug>/`), carried with the consent witness, so a release bundle
-/// without a member place has no representation.
+/// A dev bundle writes `rust/` and `dist/` under the output root the build
+/// resolved (`--out`, else the default). A release bundle writes them under
+/// its own release member root (`release/<slug>/`), carried with the consent
+/// witness, so a release bundle without a member place has no representation.
+/// Neither place is created until a product is written.
 pub enum BundleFinish<'a> {
-    /// `ipe dev build`: a debug bundle under the default output root.
-    Dev,
+    /// `ipe dev build`: a debug bundle under `output`.
+    Dev {
+        /// The output root the build resolved.
+        output: OutputRoot,
+    },
     /// `ipe release build`: an optimised bundle under `member`.
     Release {
         /// The capabilities the release consent gates admitted.
@@ -75,7 +81,7 @@ pub enum BundleFinish<'a> {
         /// The database driver the profile's socket allowances follow.
         driver: ipe_backend_rust::DbDriver,
         /// The release member root this bundle writes under.
-        member: OwnedDir,
+        member: ReleaseMember,
     },
 }
 
@@ -83,7 +89,7 @@ impl<'a> BundleFinish<'a> {
     /// The native build posture this bundle's binary is finished in.
     const fn native(&self) -> NativeFinish<'a> {
         match self {
-            Self::Dev => NativeFinish::Dev,
+            Self::Dev { .. } => NativeFinish::Dev,
             Self::Release {
                 consented, driver, ..
             } => NativeFinish::Release {
@@ -96,36 +102,44 @@ impl<'a> BundleFinish<'a> {
     /// The bundle profile this posture packages.
     const fn profile(&self) -> BundleProfile {
         match self {
-            Self::Dev => BundleProfile::Dev,
+            Self::Dev { .. } => BundleProfile::Dev,
             Self::Release { .. } => BundleProfile::Release,
         }
     }
 
-    /// The emitted crate's place: `rust/` under the default root or the member.
-    fn crate_target(&self, output: &OutputRoot) -> Result<EmitTarget, CliError> {
+    /// The emitted crate's place, `rust/` under the root or the member,
+    /// claimed when the crate is written.
+    fn crate_target(&self) -> EmitTarget {
         match self {
-            Self::Dev => Ok(EmitTarget::Area(output.area(&[OutputArea::Rust]))),
-            Self::Release { member, .. } => Ok(EmitTarget::Claimed(
-                member.child(OutputArea::Rust.dir_name())?,
-            )),
+            Self::Dev { output } => EmitTarget::Area(output.area(&[OutputArea::Rust])),
+            Self::Release { member, .. } => EmitTarget::Member(member.area(OutputArea::Rust)),
         }
     }
 
     /// Claim the directory the packaged bundles go in: `dist/` under the
-    /// default root or the member.
-    fn dist_dir(&self, output: &OutputRoot) -> Result<OwnedDir, CliError> {
+    /// root or the member.
+    fn dist_dir(&self) -> Result<OwnedDir, CliError> {
         match self {
-            Self::Dev => output.claim_area(&[OutputArea::Dist]),
-            Self::Release { member, .. } => member.child(OutputArea::Dist.dir_name()),
+            Self::Dev { output } => output.claim_area(&[OutputArea::Dist]),
+            Self::Release { member, .. } => member.area(OutputArea::Dist).claim(),
         }
     }
 
-    /// The output root the mobile shell's `web client` bundle build writes
-    /// under: the default root, or the member root.
-    fn wasm_root<'o>(&'o self, output: &'o OutputRoot) -> &'o Path {
+    /// The output root the mobile shell's `web client` bundle build is handed:
+    /// the root, or the member root.
+    ///
+    /// The levels above a member root are claimed first, so the build, which
+    /// claims its own root only when it writes, never creates them unowned.
+    ///
+    /// # Errors
+    /// As [`ReleaseMember::claim_parent`] and [`ReleaseMember::path`].
+    fn wasm_root(&self) -> Result<PathBuf, CliError> {
         match self {
-            Self::Dev => output.path(),
-            Self::Release { member, .. } => member.path(),
+            Self::Dev { output } => Ok(output.path().to_path_buf()),
+            Self::Release { member, .. } => {
+                member.claim_parent()?;
+                member.path()
+            }
         }
     }
 
@@ -134,9 +148,9 @@ impl<'a> BundleFinish<'a> {
     ///
     /// A dev build writes it in `rust/www/`; a release build in its own member
     /// `release/<web client slug>/rust/www/` under the root it was handed.
-    fn wasm_www(&self, output: &OutputRoot, project: &ProjectPaths) -> Result<PathBuf, CliError> {
+    fn wasm_www(&self, project: &ProjectPaths) -> Result<PathBuf, CliError> {
         let crate_dir = match self {
-            Self::Dev => output.claim_area(&[OutputArea::Rust])?,
+            Self::Dev { output } => output.claim_area(&[OutputArea::Rust])?,
             Self::Release { member, .. } => {
                 let slug =
                     crate::delivery_set::PlannedDelivery::release(MOBILE_BUNDLE_DELIVERY, None)
@@ -151,9 +165,10 @@ impl<'a> BundleFinish<'a> {
                             }),
                         })?
                         .slug()?;
-                OutputRoot::at(member.path(), project)?
-                    .release_member(&slug)?
-                    .child(OutputArea::Rust.dir_name())?
+                OutputRoot::at(member.claim()?.path(), project)?
+                    .release_member(&slug)
+                    .area(OutputArea::Rust)
+                    .claim()?
             }
         };
         Ok(crate_dir.path_to("www")?.path())
@@ -497,8 +512,7 @@ impl<'a> BundleAssembler<'a> {
         // Emit + compile the project to a binary. A webview app carries the
         // system webview as a dynamic dependency, so this is a plain
         // (non-static) native build.
-        let output = OutputRoot::resolve(None, &ProjectPaths::from_manifest(manifest))?;
-        let rust_target = self.finish.crate_target(&output)?;
+        let rust_target = self.finish.crate_target();
         let crate_dir = self.emit_desktop(OutTarget::Proven(&rust_target), webview)?;
 
         let cargo_bin = toolchain::require_cargo(toolchain::ToolIntent::Build)?;
@@ -535,7 +549,7 @@ impl<'a> BundleAssembler<'a> {
             )));
         }
 
-        let dist = self.finish.dist_dir(&output)?.child(os.as_str())?;
+        let dist = self.finish.dist_dir()?.child(os.as_str())?;
         let bundle_root = pack::desktop::materialise(&layout, &binary, icon, &dist)?;
 
         let mut body = format!(
@@ -586,20 +600,20 @@ impl<'a> BundleAssembler<'a> {
         // hostable bundle; invoking it through this binary keeps that pipeline
         // authoritative rather than re-implemented here.
         let project = ProjectPaths::from_manifest(manifest);
-        let output = OutputRoot::resolve(None, &project)?;
+        let wasm_root = self.finish.wasm_root()?;
         let manifest_path = self.held.manifest_path();
         build_under_pinned_manifest(manifest_path, &pin, || {
-            build_wasm_for_mobile(manifest_path, self.finish.wasm_root(&output), self.profile)
+            build_wasm_for_mobile(manifest_path, &wasm_root, self.profile)
         })?;
         // The SPA is read from the owned crate; a symlinked `www/` is refused so
         // the shell can never pick up files from outside the build output.
-        let www_dir = self.finish.wasm_www(&output, &project)?;
+        let www_dir = self.finish.wasm_www(&project)?;
         let bundle = pack::mobile::SpaBundle::from_www_dir(&www_dir)
             .map_err(|e| CliError::Usage(crate::text::Message::relay(&e)))?;
 
         let layout = pack::mobile::layout(os, self.profile, &shell, &pin, &bundle, icon)?;
 
-        let dist = self.finish.dist_dir(&output)?.child(os.as_str())?;
+        let dist = self.finish.dist_dir()?.child(os.as_str())?;
         let shell_root = pack::mobile::materialise(&layout, icon, &dist)?;
 
         let note = mobile_release_note(os);
@@ -5144,7 +5158,10 @@ main =
         let root = ProjectRoot::resolve(crate::project_root::RootArg::at(fixture.path()))
             .expect("the fixture resolves");
         let held = HeldBuild::read(root).expect("the fixture is read");
-        let gated = BundleAssembler::gate_desktop(&held, BundleFinish::Dev)
+        let output =
+            OutputRoot::resolve(None, &ProjectPaths::from_manifest(held.root().manifest()))
+                .expect("the default output root resolves");
+        let gated = BundleAssembler::gate_desktop(&held, BundleFinish::Dev { output })
             .expect("a web app passes the desktop gate");
         let out = ipe_test_temp::temp_root()
             .join(format!("ipe-desktop-packager-emit-{}", std::process::id()));

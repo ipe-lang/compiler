@@ -1750,19 +1750,17 @@ impl OutputRoot {
         })
     }
 
-    /// Claim the release member root `release/<slug>/` for writing now.
+    /// The release member root `release/<slug>/`, claimed only when a product is written.
     ///
-    /// Every place a release member writes lies below the directory this
-    /// returns, so two members with distinct slugs never share a place.
-    ///
-    /// # Errors
-    /// As [`OutputRoot::claim_area`] and [`OwnedDir::child`].
-    pub fn release_member(
-        &self,
-        slug: &crate::delivery_set::ReleaseSlug,
-    ) -> Result<OwnedDir, CliError> {
-        self.claim_area(&[OutputArea::Release])?
-            .child(slug.as_str())
+    /// Every place a release member writes lies below this root, so two members
+    /// with distinct slugs never share a place. Nothing is created here: a
+    /// release refused at emit leaves no member directory behind.
+    #[must_use]
+    pub fn release_member(&self, slug: &crate::delivery_set::ReleaseSlug) -> ReleaseMember {
+        ReleaseMember {
+            root: self.clone(),
+            slug: slug.clone(),
+        }
     }
 
     /// Claim the root itself for writing now.
@@ -1814,6 +1812,83 @@ impl AreaClaim {
     }
 }
 
+/// A release member root `release/<slug>/` of an [`OutputRoot`], claimed only
+/// when its first product is written.
+#[derive(Debug, Clone)]
+pub struct ReleaseMember {
+    /// The proven root the member sits under.
+    root: OutputRoot,
+    /// The member's place below `release/`.
+    slug: crate::delivery_set::ReleaseSlug,
+}
+
+impl ReleaseMember {
+    /// The member root's path, the `release/` level checked as
+    /// [`OutputRoot::area_path`] checks it; nothing is created.
+    ///
+    /// # Errors
+    /// As [`OutputRoot::area_path`].
+    pub fn path(&self) -> Result<PathBuf, CliError> {
+        Ok(self
+            .root
+            .area_path(&[OutputArea::Release])?
+            .join(self.slug.as_str()))
+    }
+
+    /// Claim the `release/` area alone, so a process handed the member's path
+    /// as its own output root finds every level above it already owned.
+    ///
+    /// # Errors
+    /// As [`OutputRoot::claim_area`].
+    pub fn claim_parent(&self) -> Result<OwnedDir, CliError> {
+        self.root.claim_area(&[OutputArea::Release])
+    }
+
+    /// Claim the member root for writing now.
+    ///
+    /// # Errors
+    /// As [`OutputRoot::claim_area`] and [`OwnedDir::child`].
+    pub fn claim(&self) -> Result<OwnedDir, CliError> {
+        self.claim_parent()?.child(self.slug.as_str())
+    }
+
+    /// The product area `area` below the member, claimed when its product is written.
+    #[must_use]
+    pub fn area(&self, area: OutputArea) -> MemberArea {
+        MemberArea {
+            member: self.clone(),
+            area,
+        }
+    }
+}
+
+/// A product area below a [`ReleaseMember`], claimed only when its product is written.
+#[derive(Debug, Clone)]
+pub struct MemberArea {
+    /// The member the area sits under.
+    member: ReleaseMember,
+    /// The area below the member root.
+    area: OutputArea,
+}
+
+impl MemberArea {
+    /// The area's path; nothing is created.
+    ///
+    /// # Errors
+    /// As [`ReleaseMember::path`].
+    pub fn path(&self) -> Result<PathBuf, CliError> {
+        Ok(self.member.path()?.join(self.area.dir_name()))
+    }
+
+    /// Claim the member and the area for writing now.
+    ///
+    /// # Errors
+    /// As [`ReleaseMember::claim`] and [`OwnedDir::child`].
+    pub fn claim(&self) -> Result<OwnedDir, CliError> {
+        self.member.claim()?.child(self.area.dir_name())
+    }
+}
+
 /// The root of a private scratch directory, as an [`EmitTarget`].
 ///
 /// Built only by [`EmitTarget::in_scratch`] from a borrowed
@@ -1832,6 +1907,8 @@ pub enum EmitTarget {
     Area(AreaClaim),
     /// A directory claimed earlier, proven still the same when written.
     Claimed(OwnedDir),
+    /// A product area below a release member, claimed with its member when written.
+    Member(MemberArea),
     /// The root of a private scratch directory.
     Scratch(ScratchArea),
 }
@@ -1869,7 +1946,9 @@ impl EmitTarget {
     #[must_use]
     pub const fn bundle_role(&self) -> crate::runtime_embed::BundleRole {
         match self {
-            Self::Area(_) | Self::Claimed(_) => crate::runtime_embed::BundleRole::Out,
+            Self::Area(_) | Self::Claimed(_) | Self::Member(_) => {
+                crate::runtime_embed::BundleRole::Out
+            }
             Self::Scratch(_) => crate::runtime_embed::BundleRole::Scratch,
         }
     }
@@ -1882,6 +1961,7 @@ impl EmitTarget {
         match self {
             Self::Area(area) | Self::Scratch(ScratchArea(area)) => area.path(),
             Self::Claimed(dir) => Ok(dir.path().to_path_buf()),
+            Self::Member(area) => area.path(),
         }
     }
 
@@ -1896,6 +1976,7 @@ impl EmitTarget {
                 dir.verify()?;
                 Ok(dir.clone())
             }
+            Self::Member(area) => area.claim(),
         }
     }
 
@@ -2469,6 +2550,7 @@ mod tests {
             .map(|plan| {
                 let slug = plan.slug().expect("every release has a slug");
                 out.release_member(&slug)
+                    .claim()
                     .expect("member claimed")
                     .path()
                     .to_path_buf()
@@ -2517,6 +2599,79 @@ mod tests {
         let proj = project(&base);
         let members = release_members(&proj, &[ShipEntry::Binary(BinaryTarget::Host)]);
         assert_eq!(members, [proj.root.join("out").join("release").join("web")]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The one planned delivery `entry` declares, as its release slug.
+    fn sole_slug(entry: crate::delivery_set::ShipEntry) -> crate::delivery_set::ReleaseSlug {
+        crate::delivery_set::DeliverySet::resolve(crate::delivery::Shape::Web, &[entry])
+            .expect("web set resolves")
+            .planned()
+            .next()
+            .expect("one planned delivery")
+            .slug()
+            .expect("a slug")
+    }
+
+    /// A release member and its areas are created only when a product is
+    /// claimed, so a release refused before its first write leaves nothing;
+    /// the claim then marks every level from the root down.
+    #[test]
+    fn release_member_writes_nothing_until_a_product_is_claimed() {
+        let base = scratch("release_member_lazy");
+        let proj = project(&base);
+        let out = OutputRoot::resolve(None, &proj).expect("default out must resolve");
+        let member = out.release_member(&sole_slug(crate::delivery_set::ShipEntry::Client));
+        let rust = EmitTarget::Member(member.area(OutputArea::Rust));
+        let member_path = out.path().join("release").join("web-client");
+        assert_eq!(member.path().expect("member path"), member_path);
+        assert_eq!(rust.path().expect("area path"), member_path.join("rust"));
+        assert!(!out.path().exists(), "naming a member creates nothing");
+
+        let claimed = rust.claim().expect("the area claims");
+        assert_eq!(claimed.path(), member_path.join("rust"));
+        for level in [
+            out.path().to_path_buf(),
+            out.path().join("release"),
+            member_path.clone(),
+            member_path.join("rust"),
+        ] {
+            assert!(
+                owned_at(&level).expect("level marker"),
+                "{}",
+                level.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Claiming a member's parent owns every level above the member root, so
+    /// a build handed the member root as its own output root, which claims
+    /// that root only when it writes, leaves no unowned level above it.
+    #[test]
+    fn a_member_root_handed_on_sits_under_owned_levels() {
+        let base = scratch("release_member_handed");
+        let proj = project(&base);
+        let out = OutputRoot::resolve(None, &proj).expect("default out must resolve");
+        let member = out.release_member(&sole_slug(crate::delivery_set::ShipEntry::ClientIos));
+        member.claim_parent().expect("the release area claims");
+        let handed = OutputRoot::at(&member.path().expect("member path"), &proj)
+            .expect("the member root resolves");
+        handed
+            .claim_area(&[OutputArea::Rust])
+            .expect("the handed root claims");
+        for level in [out.path().to_path_buf(), out.path().join("release")] {
+            assert!(
+                owned_at(&level).expect("level marker"),
+                "{}",
+                level.display()
+            );
+        }
+        let again = member.claim();
+        assert!(
+            again.is_ok(),
+            "the handed-on member is still ours: {again:?}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

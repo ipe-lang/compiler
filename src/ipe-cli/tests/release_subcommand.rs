@@ -417,6 +417,42 @@ fn dev_build_web_client_desktop_is_refused() {
     assert!(!wrote, "a refused build writes no output");
 }
 
+/// A dev bundle writes under the root `--out` names, as every dev build does:
+/// an `--out` holding the user's files is refused before anything is built,
+/// and the default root is never written in its place.
+#[test]
+fn dev_build_web_desktop_honours_out() {
+    let root = web_project("dev_desktop_honours_out", "desktop");
+    let mine = root.join("mine");
+    support::expect_scratch_step("dev_desktop_honours_out", std::fs::create_dir_all(&mine));
+    support::expect_scratch_step(
+        "dev_desktop_honours_out",
+        std::fs::write(mine.join("keep.txt"), "user file"),
+    );
+    let (ok, stderr, wrote_default) = run_ipe(
+        &root,
+        &root.join("out"),
+        &[
+            "dev".as_ref(),
+            "build".as_ref(),
+            root.as_os_str(),
+            "web".as_ref(),
+            "desktop".as_ref(),
+            "--out".as_ref(),
+            mine.as_os_str(),
+        ],
+    );
+    assert!(!ok, "an `--out` holding user files must refuse: {stderr}");
+    assert!(
+        stderr.contains("ipe did not create"),
+        "the refusal names the user's `--out`: {stderr}"
+    );
+    assert!(
+        !wrote_default,
+        "the default root is never written in place of `--out`"
+    );
+}
+
 /// A remedy line names the project dir the user typed, so running the printed
 /// command acts on the same project.
 #[test]

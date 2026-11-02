@@ -150,6 +150,14 @@ const RELOCATABLE_CRATES: &[crate::output_dir::OutputArea] = &[
 /// is refused rather than walked without a ceiling.
 pub const MAX_RELEASE_MEMBERS: u32 = 256;
 
+/// How many `release/` levels `clean` reads below `out/`.
+///
+/// A release member root is itself the output root of any build the release
+/// hands it to — a mobile shell's `web client` bundle writes
+/// `release/<shell>/release/web-client/` — and such a build is never a bundle,
+/// so no member nests deeper.
+pub const MAX_RELEASE_NESTING: u32 = 2;
+
 /// The per-user build directories `root`'s emitted crates would be relocated to.
 ///
 /// Empty when no per-user cache base resolves, or when the `$IPE_HOME` pin
@@ -173,29 +181,22 @@ fn relocated_targets(root: &Path) -> Result<Vec<PathBuf>, CliError> {
 
 /// The crate directories under `out/` a build may relocate the build directory
 /// of: `out/rust`, `out/app`, and the same two under every release member
-/// `out/release/<slug>/`.
+/// `out/release/<slug>/`, and under every member nested in a member root
+/// (`out/release/<slug>/release/<slug>/`), down to [`MAX_RELEASE_NESTING`].
 ///
 /// # Errors
-/// [`CliError::DiscoveryLimitReached`] when `out/release/` holds more than
-/// [`MAX_RELEASE_MEMBERS`] entries; [`CliError::OutputRefused`] or
-/// [`CliError::Io`] when it cannot be held or listed.
+/// As [`release_members_of`].
 fn relocatable_crate_dirs(root: &Path) -> Result<Vec<PathBuf>, CliError> {
-    use crate::output_dir::OutputArea;
     let out = root.join(crate::output_dir::DEFAULT_OUTPUT_DIR);
     let mut bases = vec![out.clone()];
-    let release = out.join(OutputArea::Release.dir_name());
-    if let Some(held) = crate::output_dir::held::HeldDir::open(&release)? {
-        let cap = ipe_fs_open::EntryCap::from_nonzero(
-            std::num::NonZeroU32::MIN.saturating_add(MAX_RELEASE_MEMBERS.saturating_sub(1)),
-        );
-        for (name, kind) in held.list_names(cap)? {
-            if !matches!(kind, ipe_fs_open::FileKind::Dir) {
-                continue;
-            }
-            if let Some(slug) = crate::delivery_set::ReleaseSlug::listed(&name) {
-                bases.push(release.join(slug.as_str()));
-            }
+    let mut level = vec![out];
+    for _ in 0..MAX_RELEASE_NESTING {
+        let mut nested = Vec::new();
+        for base in &level {
+            nested.extend(release_members_of(base)?);
         }
+        bases.extend_from_slice(&nested);
+        level = nested;
     }
     Ok(bases
         .iter()
@@ -204,6 +205,30 @@ fn relocatable_crate_dirs(root: &Path) -> Result<Vec<PathBuf>, CliError> {
                 .iter()
                 .map(|area| base.join(area.dir_name()))
         })
+        .collect())
+}
+
+/// The release member roots `base/release/<slug>/`: each directory entry
+/// whose name is a release slug; a link, a file, or any other name is none.
+///
+/// # Errors
+/// [`CliError::DiscoveryLimitReached`] when `base/release/` holds more than
+/// [`MAX_RELEASE_MEMBERS`] entries; [`CliError::OutputRefused`] or
+/// [`CliError::Io`] when it cannot be held or listed.
+fn release_members_of(base: &Path) -> Result<Vec<PathBuf>, CliError> {
+    let release = base.join(crate::output_dir::OutputArea::Release.dir_name());
+    let Some(held) = crate::output_dir::held::HeldDir::open(&release)? else {
+        return Ok(Vec::new());
+    };
+    let cap = ipe_fs_open::EntryCap::from_nonzero(
+        std::num::NonZeroU32::MIN.saturating_add(MAX_RELEASE_MEMBERS.saturating_sub(1)),
+    );
+    Ok(held
+        .list_names(cap)?
+        .into_iter()
+        .filter(|(_, kind)| matches!(kind, ipe_fs_open::FileKind::Dir))
+        .filter_map(|(name, _)| crate::delivery_set::ReleaseSlug::listed(&name))
+        .map(|slug| release.join(slug.as_str()))
         .collect())
 }
 
@@ -767,6 +792,31 @@ mod tests {
         for stray in ["Not-A-Slug", "notes.txt"] {
             assert!(!named.contains(&of(stray, "rust")), "{stray}: {named:?}");
         }
+        assert_eq!(named.len(), 6, "{named:?}");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A member nested in a member root — a mobile shell's `web client`
+    /// bundle under `release/<shell>/release/web-client/` — has its emitted
+    /// crates named too; a level past [`MAX_RELEASE_NESTING`] is not read.
+    #[test]
+    fn clean_names_relocated_targets_of_nested_release_members() {
+        let (scratch, root, base) = relocation_fixture("ipe_clean_reloc_nested");
+        let shell = root.join("out").join("release").join("web-client-ios");
+        let nested = shell.join("release").join("web-client");
+        let too_deep = nested.join("release").join("web");
+        std::fs::create_dir_all(&too_deep).expect("make nested members");
+        let named = relocated_targets_within(&root, &base, &[]).expect("names the members");
+        for crate_dir in [shell.join("rust"), nested.join("rust"), nested.join("app")] {
+            let target = crate::target_dir::user_cache_target(&base, &crate_dir);
+            assert!(
+                named.contains(&target),
+                "{}: {named:?}",
+                crate_dir.display()
+            );
+        }
+        let past = crate::target_dir::user_cache_target(&base, &too_deep.join("rust"));
+        assert!(!named.contains(&past), "{named:?}");
         assert_eq!(named.len(), 6, "{named:?}");
         let _ = std::fs::remove_dir_all(&scratch);
     }
