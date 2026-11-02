@@ -800,6 +800,15 @@ pub enum DeliveryError {
         /// The app-bundle delivery.
         delivery: Delivery,
     },
+    /// `ipe dev watch` was handed a `client` delivery.
+    ///
+    /// The watch loop rebuilds and restarts a served program; a browser bundle
+    /// has no server to restart, so the delivery is refused rather than watched
+    /// as the served shape.
+    WatchServesOnly {
+        /// The `client` delivery.
+        delivery: Delivery,
+    },
     /// A runtime (`client`) or host (`desktop`/`ios`/`android`) token was given
     /// more than once. Each axis accepts exactly one value; a second token on
     /// the same axis is a conflict, not a last-wins override.
@@ -985,6 +994,9 @@ impl fmt::Display for DeliveryError {
                     delivery,
                     &delivery.host().word().unwrap_or_default(),
                 ))
+            }
+            Self::WatchServesOnly { delivery } => {
+                f.write_str(&text::delivery_watch_serves_only(delivery))
             }
             Self::DuplicateToken { kind, got } => {
                 f.write_str(&text::delivery_duplicate_token(kind, got))
@@ -1338,6 +1350,9 @@ mod tests {
             DeliveryError::ClientHostHasNoDevRun {
                 delivery: Delivery::resolve(Shape::Web, Some(Runtime::Client), Host::Android)
                     .unwrap(),
+            },
+            DeliveryError::WatchServesOnly {
+                delivery: Delivery::web_client(),
             },
         ];
         for c in &cases {

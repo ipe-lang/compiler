@@ -4473,11 +4473,16 @@ mod pack_gate_tests {
             BundleProfile::Dev => cli_args::parse_build(&rest)?.delivery,
             BundleProfile::Release => cli_args::parse_release_build(&rest)?.delivery,
         };
+        #[allow(clippy::expect_used)]
+        let declared = crate::project::DeliveryConfig::default()
+            .declared(delivery::Shape::Web)
+            .expect("the implicit delivery set of a web package resolves");
         super::super::commands::resolve_delivery(
-            delivery::Shape::Web,
+            &declared,
             &positionals,
             false,
             verb.name(),
+            super::super::commands::ADMIT_ANY,
         )
     }
 
