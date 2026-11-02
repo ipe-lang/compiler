@@ -102,8 +102,9 @@ static EXIT_LINE: ExitLine = ExitLine::new();
 /// newline-ended input line, or [`LineState::close`] ends it. A state made by
 /// [`LineState::for_exit_hook`] publishes the bit to the exit stage once the
 /// bytes that set it are written ([`LineState::emit`]), so `System.exit` ends
-/// an open line too.
-#[derive(Clone, Copy, Default)]
+/// an open line too. It is neither `Clone` nor `Copy`: a copy would publish a
+/// second, diverging bit to the same exit stage.
+#[derive(Default)]
 pub struct LineState {
     line_open: bool,
     exit_line: Option<&'static ExitLine>,
@@ -643,5 +644,27 @@ mod tests {
         let mut free = Vec::new();
         emit_frame(&prompt(), &PLAIN_PROMPT, &mut unseen, &mut free);
         assert_eq!(free, b"> ");
+    }
+
+    /// Whether `T` is `Clone`: the inherent constant applies only to a
+    /// `Clone` type, the trait's default answers for every other.
+    struct CloneProbe<T>(std::marker::PhantomData<T>);
+    trait NotClone {
+        const IS_CLONE: bool = false;
+    }
+    impl<T> NotClone for CloneProbe<T> {}
+    impl<T: Clone> CloneProbe<T> {
+        const IS_CLONE: bool = true;
+    }
+
+    // One run has one state publishing to the exit stage: a copy would publish
+    // its own open bit, so the stage could end a line the run already ended
+    // or miss one it left open. Checked at build time: a `Clone` `LineState`
+    // fails to compile this test.
+    #[test]
+    fn a_line_state_cannot_be_duplicated() {
+        const { assert!(!CloneProbe::<LineState>::IS_CLONE) };
+        // One step past: the probe tells a duplicable type apart.
+        const { assert!(CloneProbe::<LineSurface>::IS_CLONE) };
     }
 }

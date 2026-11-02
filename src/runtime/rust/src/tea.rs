@@ -943,8 +943,55 @@ pub(crate) enum BoundedLine {
     /// A line past the ceiling, consumed through its terminator and dropped,
     /// and how it ended.
     TooLong(crate::tui::InputEnd),
-    /// A line within the ceiling that is not UTF-8.
-    NotUtf8,
+    /// A line within the ceiling that is not UTF-8, and how it ended.
+    NotUtf8(crate::tui::InputEnd),
+}
+
+/// A line [`pump_stdin_lines`] read, before it takes its budget permit.
+#[cfg(all(not(target_arch = "wasm32"), feature = "tui"))]
+enum ReadLine {
+    /// A line the loop delivers to the line handlers.
+    Deliver(String, crate::tui::InputEnd),
+    /// A line the reader dropped: never delivered, but echoed like any line.
+    Dropped(crate::tui::InputEnd),
+}
+
+/// Read `reader`'s lines into `line_tx` until input ends, then send `Eof`.
+///
+/// Every line read is reported, so the loop knows when an echoed Enter ended
+/// the open prompt line: a line within the ceiling as [`CliEvent::Line`], and a
+/// dropped one (over-long, or the non-UTF-8 line that ends input) as
+/// [`CliEvent::LineClosed`]. End of input or a read error ends input with no
+/// line. Once the loop is gone nothing more is sent.
+#[cfg(all(not(target_arch = "wasm32"), feature = "tui"))]
+pub(crate) fn pump_stdin_lines<R: std::io::BufRead, M>(
+    reader: &mut R,
+    max_bytes: usize,
+    budget: &InputBudget,
+    line_tx: &tokio::sync::mpsc::UnboundedSender<CliEvent<M>>,
+) {
+    loop {
+        let (read, ends_input) = match read_bounded_line(reader, max_bytes) {
+            Ok(Some(BoundedLine::Line(line, end))) => (ReadLine::Deliver(line, end), false),
+            Ok(Some(BoundedLine::TooLong(end))) => (ReadLine::Dropped(end), false),
+            Ok(Some(BoundedLine::NotUtf8(end))) => (ReadLine::Dropped(end), true),
+            Ok(None) | Err(_) => break,
+        };
+        let Some(permit) = budget.acquire(|| line_tx.is_closed()) else {
+            return;
+        };
+        let event = match read {
+            ReadLine::Deliver(line, end) => CliEvent::Line(line, end, permit),
+            ReadLine::Dropped(end) => CliEvent::LineClosed(end, permit),
+        };
+        if line_tx.send(event).is_err() {
+            return;
+        }
+        if ends_input {
+            break;
+        }
+    }
+    let _ = line_tx.send(CliEvent::Eof);
 }
 
 /// Read the next line from `reader`, buffering at most `max_bytes` of it.
@@ -1004,7 +1051,9 @@ pub(crate) fn read_bounded_line<R: std::io::BufRead>(
         return Ok(Some(BoundedLine::TooLong(end)));
     }
     Ok(Some(
-        String::from_utf8(line).map_or(BoundedLine::NotUtf8, |text| BoundedLine::Line(text, end)),
+        String::from_utf8(line).map_or(BoundedLine::NotUtf8(end), |text| {
+            BoundedLine::Line(text, end)
+        }),
     ))
 }
 
@@ -1266,34 +1315,7 @@ where
             let budget = InputBudget::new(MAX_QUEUED_INPUT);
             let stdin = std::io::stdin();
             let mut reader = stdin.lock();
-            loop {
-                let read = match read_bounded_line(&mut reader, MAX_LINE_BYTES) {
-                    Ok(Some(BoundedLine::Line(l, end))) => Some((l, end)),
-                    // A dropped line is still reported, so the loop knows its
-                    // echo ended the open prompt line.
-                    Ok(Some(BoundedLine::TooLong(end))) => {
-                        let Some(permit) = budget.acquire(|| line_tx.is_closed()) else {
-                            return;
-                        };
-                        if line_tx.send(CliEvent::LineClosed(end, permit)).is_err() {
-                            return;
-                        }
-                        None
-                    }
-                    // End of input, a non-UTF-8 line, or a read error ends input.
-                    Ok(None | Some(BoundedLine::NotUtf8)) | Err(_) => break,
-                };
-                let Some((line, end)) = read else {
-                    continue;
-                };
-                let Some(permit) = budget.acquire(|| line_tx.is_closed()) else {
-                    return;
-                };
-                if line_tx.send(CliEvent::Line(line, end, permit)).is_err() {
-                    return;
-                }
-            }
-            let _ = line_tx.send(CliEvent::Eof);
+            pump_stdin_lines(&mut reader, MAX_LINE_BYTES, &budget, &line_tx);
         });
         if let Err(e) = started {
             return IpeResult::Err(
@@ -2336,7 +2358,55 @@ mod bounded_input_tests {
 
     #[test]
     fn a_non_utf8_line_is_reported() {
-        assert_eq!(lines(&[0xff, b'\n'], 4), vec![BoundedLine::NotUtf8]);
+        assert_eq!(
+            lines(&[0xff, b'\n'], 4),
+            vec![BoundedLine::NotUtf8(InputEnd::Newline)]
+        );
+        assert_eq!(lines(&[0xff], 4), vec![BoundedLine::NotUtf8(InputEnd::Eof)]);
+    }
+
+    /// The events `pump_stdin_lines` sends for `input`, as `(kind, end)`.
+    fn pumped(input: &[u8], max: usize) -> Vec<(&'static str, Option<InputEnd>)> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CliEvent<()>>();
+        let budget = InputBudget::new(16);
+        let mut reader = std::io::BufReader::with_capacity(4, input);
+        pump_stdin_lines(&mut reader, max, &budget, &tx);
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            out.push(match event {
+                CliEvent::Line(_, end, _permit) => ("line", Some(end)),
+                CliEvent::LineClosed(end, _permit) => ("closed", Some(end)),
+                CliEvent::Eof => ("eof", None),
+                CliEvent::Key(..)
+                | CliEvent::Interrupt
+                | CliEvent::Msg(())
+                | CliEvent::PerformDone(()) => ("other", None),
+            });
+        }
+        out
+    }
+
+    // Every line read reaches the loop, the dropped ones as `LineClosed`, so
+    // an echoed Enter always ends the open prompt line. The non-UTF-8 line
+    // that ends input is reported before `Eof`, and nothing after it is read.
+    #[test]
+    fn every_line_read_is_reported_before_input_ends() {
+        assert_eq!(
+            pumped(b"ok\nabcde\n\xff\nlater\n", 4),
+            vec![
+                ("line", Some(InputEnd::Newline)),
+                ("closed", Some(InputEnd::Newline)),
+                ("closed", Some(InputEnd::Newline)),
+                ("eof", None),
+            ]
+        );
+        // One step past: a non-UTF-8 last line ended by end of input echoed no
+        // newline, and is reported so.
+        assert_eq!(
+            pumped(b"\xff", 4),
+            vec![("closed", Some(InputEnd::Eof)), ("eof", None)]
+        );
+        assert_eq!(pumped(b"", 4), vec![("eof", None)]);
     }
 
     #[test]
