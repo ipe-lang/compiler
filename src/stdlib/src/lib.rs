@@ -2620,21 +2620,11 @@ mod tests {
             source: "",
             tier: StdTier::Public,
         }];
-        assert!(
-            !tiers_agree_with_names(BAD_PUBLIC_INTERNALS),
-            "a `.Internals` row typed `Public` must be refused"
-        );
-
         const BAD_ORPHAN_PORT_LAYER: &[CompiledStdModule] = &[CompiledStdModule {
             dotted: "Ipe.Example.Internals",
             source: "",
             tier: StdTier::PortLayer { of: "Ipe.Example" },
         }];
-        assert!(
-            !tiers_agree_with_names(BAD_ORPHAN_PORT_LAYER),
-            "a `PortLayer` naming no `Public` row must be refused"
-        );
-
         const GOOD: &[CompiledStdModule] = &[
             CompiledStdModule {
                 dotted: "Ipe.Example",
@@ -2647,6 +2637,15 @@ mod tests {
                 tier: StdTier::PortLayer { of: "Ipe.Example" },
             },
         ];
+
+        assert!(
+            !tiers_agree_with_names(BAD_PUBLIC_INTERNALS),
+            "a `.Internals` row typed `Public` must be refused"
+        );
+        assert!(
+            !tiers_agree_with_names(BAD_ORPHAN_PORT_LAYER),
+            "a `PortLayer` naming no `Public` row must be refused"
+        );
         assert!(
             tiers_agree_with_names(GOOD),
             "a `PortLayer` naming its own `Public` row must be accepted"
