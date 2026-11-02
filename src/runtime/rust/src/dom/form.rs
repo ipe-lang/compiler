@@ -7,7 +7,7 @@
 use crate::html::FormData;
 
 /// Why a browser `FormData` payload did not decode into the target record.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum FormDecodeError {
     /// The name/value pairs could not be re-encoded as `x-www-form-urlencoded`.
     Encode(serde_urlencoded::ser::Error),
@@ -24,6 +24,16 @@ impl core::fmt::Display for FormDecodeError {
         match self {
             Self::Encode(_) => f.write_str("form pairs could not be encoded"),
             Self::Decode(_) => f.write_str("form does not fit the record"),
+        }
+    }
+}
+
+/// The variant only, for the same reason as `Display`.
+impl core::fmt::Debug for FormDecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Encode(_) => f.write_str("Encode(..)"),
+            Self::Decode(_) => f.write_str("Decode(..)"),
         }
     }
 }
@@ -302,6 +312,10 @@ mod tests {
         let r: Result<Subscription, FormDecodeError> = decode_form(fd);
         assert!(
             matches!(&r, Err(e @ FormDecodeError::Decode(_)) if e.to_string() == "form does not fit the record"),
+            "{r:?}"
+        );
+        assert!(
+            matches!(&r, Err(e) if format!("{e:?}") == "Decode(..)"),
             "{r:?}"
         );
         let mut bad = FormData::new();
