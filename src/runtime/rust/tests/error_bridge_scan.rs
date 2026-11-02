@@ -103,6 +103,14 @@ struct Unclassified {
 /// Every production `Unexpected` the runtime builds, with its reason.
 const UNCLASSIFIED_SITES: &[Unclassified] = &[
     Unclassified {
+        file: "core.rs",
+        function: "ipe_error_from_unwind",
+        needle: "IpeError::unexpected",
+        count: 1,
+        reason: "a non-trip panic caught at an Ipê task boundary, outside any guarded \
+                 foreign call: a defect in compiled or runtime code, not a foreign failure",
+    },
+    Unclassified {
         file: "error.rs",
         function: OUTSIDE_FN,
         needle: "IpeErrorKind::Unexpected",
@@ -169,19 +177,11 @@ const UNCLASSIFIED_SITES: &[Unclassified] = &[
     },
     Unclassified {
         file: "task.rs",
-        function: "block_on",
-        needle: "IpeError::unexpected",
-        count: 1,
-        reason: "a panic in the entry future outside any guarded foreign call: \
-                 a defect in compiled or runtime code, not a foreign failure",
-    },
-    Unclassified {
-        file: "task.rs",
         function: "parallel_child_failure",
         needle: "IpeError::unexpected",
         count: 1,
-        reason: "a `Task.parallel` child that panicked or was cancelled outside any \
-                 guarded foreign call: a defect in compiled or runtime code",
+        reason: "a `Task.parallel` child cancelled outside any guarded foreign call \
+                 (a panicked child routes through `ipe_error_from_unwind`)",
     },
     Unclassified {
         file: "threads.rs",

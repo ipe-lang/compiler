@@ -92,22 +92,75 @@ pub fn note_foreign_error<ForeignE: std::fmt::Debug>(e: ForeignE) -> String {
 /// a foreign error's `Debug`), so it is logged SERVER-SIDE only; the Ipê-visible
 /// value is `context` — an emitter-owned constant such as
 /// `"foreign call panicked"` — plus the correlation id, never the payload.
-/// The error is kinded `Ffi`. Total — no unwrap/index/panic.
+/// The error is kinded `Ffi`, unless the payload is the runtime's own
+/// [`RuntimeTrip`], which keeps its typed kind (see [`ipe_error_from_unwind`]).
+/// Total — no unwrap/index/panic.
 pub fn ipe_error_from_panic<E: crate::FromIpeError>(
     context: &str,
     payload: Box<dyn std::any::Any + Send>,
 ) -> E {
-    E::from_ipe_error(crate::IpeError::ffi(redacted_panic_message(
-        context, payload,
-    )))
+    ipe_error_from_unwind(UnwindBoundary::Foreign(context), payload)
+}
+
+/// The boundary a caught unwind is converted at.
+///
+/// The boundary fixes the kind of a payload that is NOT a [`RuntimeTrip`]; a
+/// trip keeps its own kind at every boundary. Each variant carries the fixed,
+/// runtime- or emitter-owned context text Ipê sees in place of the payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnwindBoundary<'a> {
+    /// A foreign call or foreign task: any other payload is a foreign panic,
+    /// kinded `Ffi`.
+    Foreign(&'a str),
+    /// An Ipê task boundary (the entry `block_on`, a `Task.parallel` child):
+    /// any other payload is a defect in compiled or runtime code, kinded
+    /// `Unexpected`.
+    Task(&'a str),
+}
+
+/// Convert a caught unwind payload into the caller's typed error.
+///
+/// The single funnel every catch boundary in the runtime routes through. A
+/// [`RuntimeTrip`] payload becomes its typed error ([`RuntimeTrip::to_ipe_error`])
+/// with no foreign-panic record: the classifying hook already logged it once.
+/// Any other payload is foreign-controlled text, so it is logged server-side
+/// under a correlation id and the Ipê-visible value is the boundary's context
+/// plus that id, kinded by the boundary. Total — no unwrap/index/panic.
+pub fn ipe_error_from_unwind<E: crate::FromIpeError>(
+    boundary: UnwindBoundary<'_>,
+    payload: Box<dyn std::any::Any + Send>,
+) -> E {
+    let error = runtime_trip(payload.as_ref()).map_or_else(
+        || match boundary {
+            UnwindBoundary::Foreign(context) => {
+                crate::IpeError::ffi(redacted_panic_message(context, payload))
+            }
+            UnwindBoundary::Task(context) => {
+                crate::IpeError::unexpected(redacted_panic_message(context, payload))
+            }
+        },
+        RuntimeTrip::to_ipe_error,
+    );
+    E::from_ipe_error(error)
+}
+
+/// Resume an unwind that carries a [`RuntimeTrip`]; hand any other payload back.
+///
+/// A catch site that contains a panic it owns (a sort's comparator-contract
+/// violation) calls this first, so the runtime's own typed trip is never
+/// absorbed there and still reaches the entry boundary that types it.
+pub fn resume_runtime_trip(
+    payload: Box<dyn std::any::Any + Send>,
+) -> Box<dyn std::any::Any + Send> {
+    if runtime_trip(payload.as_ref()).is_some() {
+        std::panic::resume_unwind(payload);
+    }
+    payload
 }
 
 /// The Ipê-visible text of a caught panic: `context` plus the correlation id
 /// its payload is logged under, never the payload itself.
-pub(crate) fn redacted_panic_message(
-    context: &str,
-    payload: Box<dyn std::any::Any + Send>,
-) -> String {
+fn redacted_panic_message(context: &str, payload: Box<dyn std::any::Any + Send>) -> String {
     let err_id = note_foreign_panic(context, payload);
     format!("{context} (ref {err_id})")
 }
@@ -1073,30 +1126,79 @@ pub(crate) fn recursion_depth_for_test() -> usize {
     RECURSION_DEPTH.with(std::cell::Cell::get)
 }
 
-/// The typed payload of the recursion-guard trip panic. Zero-size: the fact that
-/// the depth budget (or the stack red-zone probe) was exceeded IS the type — it
-/// carries no data. Panicking with this value (`panic_any`) instead of a message
-/// string lets the catch-layer classifier `downcast_ref` it rather than match a
-/// substring of a free-form message, so the `RecursionLimit` classification is
-/// driven by the type, not by the wording of a string.
+/// A typed fault the runtime raises inside pure code.
 ///
-/// [`RecursionLimit::MESSAGE`] is the single source of the human-facing text; the
-/// classifier renders it back to `"maximum recursion depth exceeded"` so the
-/// server log / 500-side line / CLI stderr are byte-identical to a string trip.
+/// The one payload [`trip`] unwinds with. A guard deep inside a pure
+/// computation has no error channel to return through, so it unwinds with a
+/// value of this type, and every catch boundary reads it back with
+/// [`runtime_trip`] — by type, never by a substring of a message — and turns it
+/// into the variant's typed error ([`Self::to_ipe_error`]). Each variant owns
+/// its log label, its message and its error kind in one exhaustive `match`, so
+/// a new variant cannot reach a boundary without all three. A variant carries
+/// only `Copy` data (static names, counts), so the payload stays trivially
+/// droppable on the unwind path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RecursionLimit;
-
-impl RecursionLimit {
-    /// The fixed human-facing message for a recursion trip. Byte-stable (golden-
-    /// and E2E-asserted) and deliberately omits the word "overflow" so no message
-    /// path can misclassify it as an arithmetic overflow.
-    pub const MESSAGE: &'static str = "maximum recursion depth exceeded";
+pub enum RuntimeTrip {
+    /// The per-thread recursion depth budget, or the stack red zone, was
+    /// exceeded.
+    RecursionLimit,
 }
 
-impl std::fmt::Display for RecursionLimit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(Self::MESSAGE)
+impl RuntimeTrip {
+    /// The fixed message of a recursion trip.
+    ///
+    /// Byte-stable (golden- and E2E-asserted) and deliberately omits the word
+    /// "overflow" so no message path can misclassify it as an arithmetic
+    /// overflow.
+    pub const RECURSION_LIMIT_MESSAGE: &'static str = "maximum recursion depth exceeded";
+
+    /// The classification label the panic hook logs the trip under.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::RecursionLimit => "RecursionLimit",
+        }
     }
+
+    /// The human-facing message the trip's error and log line carry.
+    #[must_use]
+    pub fn message(self) -> String {
+        match self {
+            Self::RecursionLimit => Self::RECURSION_LIMIT_MESSAGE.to_string(),
+        }
+    }
+
+    /// The typed error a catch boundary hands the program for this trip.
+    #[must_use]
+    pub fn to_ipe_error(self) -> crate::IpeError {
+        match self {
+            Self::RecursionLimit => crate::IpeError::limit_exceeded(self.message()),
+        }
+    }
+}
+
+impl std::fmt::Display for RuntimeTrip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
+/// Raise `fault` as a typed unwind that a catch boundary converts to its error.
+///
+/// The runtime's sole deliberate `panic_any` site: every guard that trips
+/// unwinds through here with a [`RuntimeTrip`] payload.
+#[cold]
+pub fn trip(fault: RuntimeTrip) -> ! {
+    // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — the deliberate, sole trip path: it converts a fault pure code cannot return (an uncatchable stack-overflow abort, among others) into a containable unwind carrying the typed `RuntimeTrip` payload, which every catch boundary converts by type through `ipe_error_from_unwind` [ledger #boundary]
+    #[allow(clippy::panic, clippy::disallowed_methods)]
+    // panic_any is the trip: a typed payload the catch boundary downcasts, not a stringly-typed message
+    std::panic::panic_any(fault)
+}
+
+/// The [`RuntimeTrip`] an unwind payload carries, if it is one.
+#[must_use]
+pub fn runtime_trip(payload: &(dyn std::any::Any + Send)) -> Option<RuntimeTrip> {
+    payload.downcast_ref::<RuntimeTrip>().copied()
 }
 
 /// The RAII recursion guard. Its construction (`recursion_guard`) enters one
@@ -1113,14 +1215,14 @@ pub struct RecursionGuard {
 
 /// Enter one level of guarded recursion, returning a [`RecursionGuard`] whose
 /// drop leaves it. Called at the top of every emitted user function body. Trips
-/// by panicking with the typed [`RecursionLimit`] payload when the per-thread
+/// with [`RuntimeTrip::RecursionLimit`] (through [`trip`]) when the per-thread
 /// depth budget is exceeded or — on native targets with a recorded floor — when
-/// the remaining stack falls into the red zone. The classifier downcasts that
-/// type (never a message substring), so the trip can never misclassify as
+/// the remaining stack falls into the red zone. Every boundary reads that type
+/// back (never a message substring), so the trip can never misclassify as
 /// `ArithmeticOverflow`.
 ///
 /// Total apart from the deliberate trip: the increment is a `Cell` bump, the
-/// probe an address compare, and the trip a `panic_any` with a zero-size marker
+/// probe an address compare, and the trip a `panic_any` with a fieldless variant
 /// — no allocation on the trip path beyond the panic itself, no unwrap, no
 /// index. It runs on the panic path (a trip deeper in the same chain unwinds
 /// through outer guards' drops), so it must stay total, and it is.
@@ -1135,7 +1237,7 @@ pub fn recursion_guard() -> RecursionGuard {
     // frame's increment — the trip path must undo it itself before unwinding.
     // (Outer frames each own a guard whose drop restores their own increment as
     // the panic unwinds, so the counter returns exactly to zero once caught.)
-    let trip = depth > recursion_limit() || {
+    let exceeded = depth > recursion_limit() || {
         #[cfg(not(target_arch = "wasm32"))]
         {
             STACK_FLOOR
@@ -1147,12 +1249,9 @@ pub fn recursion_guard() -> RecursionGuard {
             false
         }
     };
-    if trip {
+    if exceeded {
         RECURSION_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
-        // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — the deliberate, sole trip path: it converts an uncatchable stack-overflow abort into a classifiable, containable panic carrying the typed `RecursionLimit` payload (the classifier downcasts it, never a message substring) [ledger #boundary]
-        #[allow(clippy::panic, clippy::disallowed_methods)]
-        // panic_any is the trip: a typed payload the catch-layer downcasts, not a stringly-typed message
-        std::panic::panic_any(RecursionLimit);
+        trip(RuntimeTrip::RecursionLimit);
     }
     RecursionGuard { _private: () }
 }
@@ -1184,7 +1283,7 @@ fn classify_panic(msg: &str) -> &'static str {
     } else if m.contains("index out of bounds") || m.contains("out of range") {
         "IndexOutOfRange"
     } else if m.contains("recursion depth") {
-        // The live recursion trip is classified by its typed `RecursionLimit`
+        // The live recursion trip is classified by its typed `RuntimeTrip`
         // payload in `classify_and_log_panic`, before this message path is
         // reached. This arm remains the fallback for a panic that carries the
         // recursion wording only as a message string. Ordered before the
@@ -1198,15 +1297,12 @@ fn classify_panic(msg: &str) -> &'static str {
     }
 }
 
-/// A panic payload's human-readable message: the typed [`RecursionLimit`] trip
-/// renders to its fixed message, then the standard `&str` / `String` payload
-/// downcasts, with a fixed fallback for any other payload type. Recognising the
-/// typed trip here keeps the server log / 500-side line / CLI stderr byte-
-/// identical to the message a string trip once carried. Total — no
-/// unwrap/index/panic.
+/// A panic payload's human-readable message: a typed [`RuntimeTrip`] renders to
+/// its own message, then the standard `&str` / `String` payload downcasts, with
+/// a fixed fallback for any other payload type. Total — no unwrap/index/panic.
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if payload.downcast_ref::<RecursionLimit>().is_some() {
-        RecursionLimit::MESSAGE.to_string()
+    if let Some(fault) = runtime_trip(payload) {
+        fault.message()
     } else if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -1242,16 +1338,12 @@ fn short_err_id() -> String {
 ///    happens to contain a secret / PII / internal path is never sent to a client).
 pub fn classify_and_log_panic(payload: &(dyn std::any::Any + Send)) -> String {
     let msg = panic_payload_message(payload);
-    // The recursion trip carries a typed [`RecursionLimit`] payload: classify it
-    // by DOWNCASTING the type, never by matching the message wording. Every other
-    // panic (a caught foreign `&str`/`String`, an arithmetic overflow, an index
-    // out of bounds) has no typed payload here, so it falls through to the
-    // message-based `classify_panic` unchanged.
-    let kind = if payload.downcast_ref::<RecursionLimit>().is_some() {
-        "RecursionLimit"
-    } else {
-        classify_panic(&msg)
-    };
+    // A runtime trip carries a typed [`RuntimeTrip`] payload: classify it by its
+    // type, never by matching the message wording. Every other panic (a caught
+    // foreign `&str`/`String`, an arithmetic overflow, an index out of bounds)
+    // has no typed payload here, so it falls through to the message-based
+    // `classify_panic` unchanged.
+    let kind = runtime_trip(payload).map_or_else(|| classify_panic(&msg), RuntimeTrip::label);
     let err_id = short_err_id();
     let json =
         crate::system::read_env_var("IPE_LOG_FORMAT").is_ok_and(|v| v.eq_ignore_ascii_case("json"));
@@ -1649,25 +1741,29 @@ mod tests {
         );
     }
 
-    // The typed `RecursionLimit` payload renders to the fixed human message and is
+    // The typed `RuntimeTrip` payload renders to the fixed human message and is
     // recognised regardless of any wording — the classification is type-driven,
     // not string-driven. A genuine overflow, carried only as a message string,
     // still classifies as `ArithmeticOverflow`, unaffected by the typed path.
     #[test]
     fn typed_recursion_payload_renders_fixed_message() {
-        let payload: Box<dyn std::any::Any + Send> = Box::new(RecursionLimit);
+        let payload: Box<dyn std::any::Any + Send> = Box::new(RuntimeTrip::RecursionLimit);
         assert_eq!(
             panic_payload_message(payload.as_ref()),
             "maximum recursion depth exceeded"
         );
-        assert_eq!(RecursionLimit::MESSAGE, "maximum recursion depth exceeded");
         assert_eq!(
-            RecursionLimit.to_string(),
+            RuntimeTrip::RECURSION_LIMIT_MESSAGE,
             "maximum recursion depth exceeded"
         );
+        assert_eq!(
+            RuntimeTrip::RecursionLimit.to_string(),
+            "maximum recursion depth exceeded"
+        );
+        assert_eq!(RuntimeTrip::RecursionLimit.label(), "RecursionLimit");
 
         let overflow: Box<dyn std::any::Any + Send> = Box::new("attempt to multiply with overflow");
-        assert!(overflow.downcast_ref::<RecursionLimit>().is_none());
+        assert!(runtime_trip(overflow.as_ref()).is_none());
         assert_eq!(
             classify_panic(&panic_payload_message(overflow.as_ref())),
             "ArithmeticOverflow"
@@ -1763,6 +1859,80 @@ mod tests {
         assert!(
             shown.starts_with("Ffi: foreign call panicked (ref "),
             "a bare String sink keeps the kinded Error.toString text — got: {shown:?}"
+        );
+    }
+
+    // A runtime trip keeps its typed kind and its fixed message at every
+    // boundary, the foreign-call funnel included: it is never relabelled `Ffi`
+    // or `Unexpected` and never redacted behind a correlation id.
+    #[test]
+    fn runtime_trip_keeps_its_kind_at_every_boundary() {
+        for boundary in [
+            UnwindBoundary::Foreign("foreign call panicked"),
+            UnwindBoundary::Task("async task panicked"),
+        ] {
+            let payload: Box<dyn std::any::Any + Send> = Box::new(RuntimeTrip::RecursionLimit);
+            let crate::IpeError::Error(kind, info) = ipe_error_from_unwind(boundary, payload);
+            assert_eq!(kind, crate::IpeErrorKind::LimitExceeded, "at {boundary:?}");
+            assert_eq!(info.message, "maximum recursion depth exceeded");
+        }
+        let payload: Box<dyn std::any::Any + Send> = Box::new(RuntimeTrip::RecursionLimit);
+        let err: crate::IpeError = ipe_error_from_panic("foreign call panicked", payload);
+        assert_eq!(err, RuntimeTrip::RecursionLimit.to_ipe_error());
+        let payload: Box<dyn std::any::Any + Send> = Box::new(RuntimeTrip::RecursionLimit);
+        let shown: String = ipe_error_from_unwind(UnwindBoundary::Task("t"), payload);
+        assert!(
+            shown.contains("maximum recursion depth exceeded") && !shown.contains("(ref "),
+            "a bare String sink keeps the trip's own text — got: {shown:?}"
+        );
+    }
+
+    // A foreign payload is never mistaken for a trip: one that merely carries
+    // the trip's wording stays redacted under the boundary's own kind, so a
+    // foreign panic can neither forge `LimitExceeded` nor leak its text.
+    #[test]
+    fn foreign_payload_still_redacted() {
+        for (boundary, expected) in [
+            (
+                UnwindBoundary::Foreign("foreign call panicked"),
+                crate::IpeErrorKind::Ffi,
+            ),
+            (
+                UnwindBoundary::Task("async task panicked"),
+                crate::IpeErrorKind::Unexpected,
+            ),
+        ] {
+            let payload: Box<dyn std::any::Any + Send> =
+                Box::new("maximum recursion depth exceeded sk_live_SECRET".to_string());
+            let crate::IpeError::Error(kind, info) = ipe_error_from_unwind(boundary, payload);
+            assert_eq!(kind, expected, "at {boundary:?}");
+            assert!(
+                !info.message.contains("SECRET") && !info.message.contains("recursion"),
+                "the payload text must not reach Ipê — got: {:?}",
+                info.message
+            );
+            assert!(
+                info.message.contains("panicked (ref "),
+                "the context plus correlation id stands in for the payload — got: {:?}",
+                info.message
+            );
+        }
+    }
+
+    // A catch site that owns its panic hands a foreign payload back and resumes
+    // a trip, so the trip reaches the entry boundary still typed.
+    #[test]
+    fn resume_runtime_trip_resumes_only_trips() {
+        let foreign: Box<dyn std::any::Any + Send> = Box::new("comparator");
+        let back = resume_runtime_trip(foreign);
+        assert_eq!(back.downcast_ref::<&str>(), Some(&"comparator"));
+        let resumed =
+            std::panic::catch_unwind(|| resume_runtime_trip(Box::new(RuntimeTrip::RecursionLimit)));
+        assert!(resumed.is_err(), "a trip payload must resume unwinding");
+        let Err(payload) = resumed else { return };
+        assert_eq!(
+            runtime_trip(payload.as_ref()),
+            Some(RuntimeTrip::RecursionLimit)
         );
     }
 
@@ -2006,10 +2176,10 @@ mod recursion_guard_tests {
             .spawn(|| {
                 let r = std::panic::catch_unwind(recurse);
                 let payload = r.expect_err("unbounded recursion must trip the guard");
-                // The trip carries the TYPED `RecursionLimit` payload, not a string.
+                // The trip carries the TYPED `RuntimeTrip` payload, not a string.
                 assert!(
-                    payload.downcast_ref::<RecursionLimit>().is_some(),
-                    "the trip must panic with the typed RecursionLimit payload"
+                    runtime_trip(payload.as_ref()) == Some(RuntimeTrip::RecursionLimit),
+                    "the trip must panic with the typed RuntimeTrip payload"
                 );
                 // The human message the classifier renders stays byte-identical.
                 assert_eq!(
@@ -2076,8 +2246,8 @@ mod recursion_guard_tests {
                 let r = std::panic::catch_unwind(recurse);
                 let payload = r.expect_err("small stack must trip the guard, not overflow");
                 assert!(
-                    payload.downcast_ref::<RecursionLimit>().is_some(),
-                    "the red-zone trip must panic with the typed RecursionLimit payload"
+                    runtime_trip(payload.as_ref()) == Some(RuntimeTrip::RecursionLimit),
+                    "the red-zone trip must panic with the typed RuntimeTrip payload"
                 );
                 assert_eq!(
                     panic_payload_message(payload.as_ref()),
