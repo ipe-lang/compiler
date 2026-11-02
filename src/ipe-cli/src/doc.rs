@@ -2487,7 +2487,7 @@ fn render_module_human(module: &ModuleDoc, index: &AnchorIndex) {
         let _ = writeln!(
             body,
             "{GUTTER}{}\n",
-            crate::text::site_port_layer_banner(of)
+            crate::text::site_port_layer_banner(&of)
         );
     }
     if !md.is_empty() {
