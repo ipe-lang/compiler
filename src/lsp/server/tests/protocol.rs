@@ -801,3 +801,213 @@ fn unknown_request_gets_method_not_found_not_a_hang() {
         .expect("server thread joins")
         .expect("server exits clean");
 }
+
+// ---------------------------------------------------------------------------
+// Definitions into the stdlib jump to its verified on-disk copy
+// ---------------------------------------------------------------------------
+
+const TUPLE_USER: &str = "module Main exposing (main)\n\nimport Ipe.Tuple as Tuple\n\nmain : Int\nmain =\n    Tuple.first ( 1, 2 )\n";
+
+/// The embedded `Ipe.Tuple` source.
+fn tuple_source() -> &'static str {
+    ipe_stdlib::COMPILED_STD_MODULES
+        .iter()
+        .find(|module| module.dotted == "Ipe.Tuple")
+        .map_or("", |module| module.source)
+}
+
+/// A virtual project serving `Ipe.Tuple` from `tuple_copy`, as the driver does.
+///
+/// Every other stdlib module keeps its synthetic relative path.
+struct StdlibCopyLoader {
+    tuple_copy: Option<PathBuf>,
+}
+
+impl ProjectLoader for StdlibCopyLoader {
+    fn load(
+        &self,
+        workspace_roots: &[PathBuf],
+        open_file: &Path,
+        open_text: Option<&str>,
+    ) -> Result<LoadedProject, LoadError> {
+        let mut project = FixtureLoader.load(workspace_roots, open_file, open_text)?;
+        if let (Some(copy), Some(tuple)) = (
+            &self.tuple_copy,
+            project
+                .files
+                .get_mut(&vec!["Ipe".to_owned(), "Tuple".to_owned()]),
+        ) {
+            tuple.path.clone_from(copy);
+        }
+        Ok(project)
+    }
+}
+
+/// The server thread a stdlib-definition test drives.
+type ServerThread = std::thread::JoinHandle<Result<(), ipe_lsp_server::ServerError>>;
+
+/// A server over `loader` with `TUPLE_USER` open and analysed.
+#[allow(clippy::expect_used)] // test helper: a failed handshake IS the failure
+fn open_tuple_user(loader: StdlibCopyLoader) -> (Connection, ServerThread) {
+    let (server_side, client) = Connection::memory();
+    let server = std::thread::Builder::new()
+        .spawn(move || ipe_lsp_server::run_with_connection(&server_side, &loader))
+        .expect("spawn test thread");
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(1),
+            "initialize".to_owned(),
+            serde_json::json!({ "capabilities": {} }),
+        )))
+        .expect("send initialize");
+    let _ = recv_response(&client, 1);
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "initialized".to_owned(),
+            serde_json::json!({}),
+        )))
+        .expect("send initialized");
+    let uri = format!("file://{VIRTUAL_PATH}");
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            serde_json::json!({
+                "textDocument": {
+                    "uri": uri, "languageId": "ipe", "version": 1, "text": TUPLE_USER
+                }
+            }),
+        )))
+        .expect("send didOpen");
+    let _ = await_diagnostics(&client, &uri, |_| true);
+    (client, server)
+}
+
+/// The `textDocument/definition` answer for `Tuple.first` in `TUPLE_USER`.
+#[allow(clippy::expect_used)] // test helper: a failed send IS the failure
+fn definition_of_first(client: &Connection, id: i32) -> serde_json::Value {
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(id),
+            "textDocument/definition".to_owned(),
+            serde_json::json!({
+                "textDocument": { "uri": format!("file://{VIRTUAL_PATH}") },
+                "position": { "line": 6, "character": 10 }
+            }),
+        )))
+        .expect("send definition");
+    recv_response(client, id)
+}
+
+/// Shut the server down and join it.
+#[allow(clippy::expect_used)] // test helper: an unclean exit IS the failure
+fn shut_down(client: &Connection, server: ServerThread) {
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(2),
+            "shutdown".to_owned(),
+            serde_json::Value::Null,
+        )))
+        .expect("send shutdown");
+    let _ = recv_response(client, 2);
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "exit".to_owned(),
+            serde_json::Value::Null,
+        )))
+        .expect("send exit");
+    server
+        .join()
+        .expect("server thread joins")
+        .expect("server exits clean");
+}
+
+/// Write `bytes` at `path` with the given read-only-ness, replacing what is there.
+#[cfg(unix)]
+#[allow(clippy::expect_used)] // test fixture: a failed write IS the failure
+fn place_copy(path: &Path, bytes: &[u8], read_only: bool) {
+    use std::os::unix::fs::PermissionsExt as _;
+    if std::fs::symlink_metadata(path).is_ok() {
+        std::fs::remove_file(path).expect("remove previous copy");
+    }
+    std::fs::write(path, bytes).expect("write copy");
+    let mode = if read_only { 0o444 } else { 0o644 };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod copy");
+}
+
+/// A stdlib definition answers its copy's URI only while that copy verifies.
+///
+/// A tampered, truncated, writable, or linked copy answers `null`; the
+/// restored copy answers the first location again.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::expect_used)] // test fixture: a failed fixture IS the failure
+fn a_stdlib_definition_jumps_to_its_copy_only_while_the_copy_verifies() {
+    let dir = ipe_test_temp::temp_root()
+        .canonicalize()
+        .expect("canonical temp dir")
+        .join(format!("ipe-lsp-stdlib-copy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("copy dir");
+    let copy = dir.join("Ipe.Tuple.ipe");
+    place_copy(&copy, tuple_source().as_bytes(), true);
+    let (client, server) = open_tuple_user(StdlibCopyLoader {
+        tuple_copy: Some(copy.clone()),
+    });
+
+    let served = definition_of_first(&client, 10);
+    let expected_uri = lsp_types::Url::from_file_path(&copy).expect("a file URI");
+    assert_eq!(
+        served.get("uri").and_then(serde_json::Value::as_str),
+        Some(expected_uri.as_str()),
+        "{served}"
+    );
+    let line = served
+        .pointer("/range/start/line")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|line| usize::try_from(line).ok())
+        .expect("a range");
+    assert!(
+        tuple_source()
+            .lines()
+            .nth(line)
+            .is_some_and(|text| text.starts_with("first")),
+        "the range lands on the declaration of `first`: line {line}"
+    );
+
+    let tampered = format!("-- planted\n{}", tuple_source());
+    place_copy(&copy, tampered.as_bytes(), true);
+    assert_eq!(definition_of_first(&client, 11), serde_json::Value::Null);
+
+    let truncated = tuple_source().as_bytes().get(..20).unwrap_or_default();
+    place_copy(&copy, truncated, true);
+    assert_eq!(definition_of_first(&client, 12), serde_json::Value::Null);
+
+    place_copy(&copy, tuple_source().as_bytes(), false);
+    assert_eq!(definition_of_first(&client, 13), serde_json::Value::Null);
+
+    let real = dir.join("real.ipe");
+    place_copy(&real, tuple_source().as_bytes(), true);
+    std::fs::remove_file(&copy).expect("remove copy");
+    std::os::unix::fs::symlink(&real, &copy).expect("plant link");
+    assert_eq!(definition_of_first(&client, 14), serde_json::Value::Null);
+
+    place_copy(&copy, tuple_source().as_bytes(), true);
+    assert_eq!(definition_of_first(&client, 15), served);
+
+    shut_down(&client, server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stdlib module with no materialised copy (a synthetic relative path) answers `null`.
+#[test]
+fn a_stdlib_definition_without_a_copy_is_null() {
+    let (client, server) = open_tuple_user(StdlibCopyLoader { tuple_copy: None });
+    assert_eq!(definition_of_first(&client, 10), serde_json::Value::Null);
+    shut_down(&client, server);
+}

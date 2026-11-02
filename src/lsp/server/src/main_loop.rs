@@ -80,6 +80,12 @@ struct Layout {
     /// and per-edit overlay lookup are `O(log n)`, not a linear scan or a
     /// re-canonicalize.
     path_of_module: BTreeMap<Vec<String>, PathBuf>,
+    /// The absolute path of each stdlib module's materialised read-only copy.
+    ///
+    /// A definition target only: no stdlib copy is ever a document the
+    /// server edits, renames, or maps back to a module, so it never enters
+    /// `module_of_path`.
+    stdlib_path_of_module: BTreeMap<Vec<String>, PathBuf>,
     /// Where `lint.ipe` is read from, if the load resolved it.
     lint_source: LintSource,
 }
@@ -131,11 +137,19 @@ impl Layout {
             .iter()
             .map(|(module, path)| (path.clone(), module.clone()))
             .collect();
+        let stdlib_path_of_module = files
+            .iter()
+            .filter(|(_, file)| {
+                file.origin == ModuleOrigin::EmbeddedStdlib && file.path.is_absolute()
+            })
+            .map(|(module, file)| (module.clone(), file.path.clone()))
+            .collect();
         Self {
             entry_module,
             disk: files,
             module_of_path,
             path_of_module,
+            stdlib_path_of_module,
             lint_source,
         }
     }
@@ -245,6 +259,24 @@ impl State {
     fn uri_for_module(&self, module: &[String]) -> Option<Url> {
         let path = self.served.layout()?.path_of_module.get(module)?;
         Url::from_file_path(path).ok()
+    }
+
+    /// The URI a definition in `module`, whose analysed source is `text`, jumps to.
+    ///
+    /// A user module answers with its document; a stdlib module answers
+    /// with its materialised copy only once that copy re-proves to hold
+    /// exactly `text`, so a tampered, partial, or swapped copy is never
+    /// served and no range is ever placed over bytes other than the ones it
+    /// was computed on.
+    fn definition_uri_for_module(&self, module: &[String], text: &str) -> Option<Url> {
+        self.uri_for_module(module).or_else(|| {
+            let path = self.served.layout()?.stdlib_path_of_module.get(module)?;
+            if stdlib_copy_holds(path, text) {
+                Url::from_file_path(path).ok()
+            } else {
+                None
+            }
+        })
     }
 
     /// Resolve a document URI to its module path and input handle. The handle's
@@ -674,9 +706,6 @@ fn definition_result(state: &State, params: &serde_json::Value) -> FeatureOutcom
     ) else {
         return FeatureOutcome::NoResult;
     };
-    let Some(def_uri) = state.uri_for_module(&def.module) else {
-        return FeatureOutcome::NoResult;
-    };
     // Borrow the target text to convert the byte span to a range.
     let empty = String::new();
     let def_text = ctx
@@ -684,6 +713,9 @@ fn definition_result(state: &State, params: &serde_json::Value) -> FeatureOutcom
         .files(state.db.db())
         .get(&def.module)
         .map_or(&empty, |f| f.text(state.db.db()));
+    let Some(def_uri) = state.definition_uri_for_module(&def.module, def_text) else {
+        return FeatureOutcome::NoResult;
+    };
     let range = ipe_lsp_features::offset::span_to_range(def_text, def.span, state.encoding);
     let location = lsp_types::Location {
         uri: def_uri,
@@ -716,15 +748,15 @@ fn type_definition_result(state: &State, params: &serde_json::Value) -> FeatureO
     ) else {
         return FeatureOutcome::NoResult;
     };
-    let Some(def_uri) = state.uri_for_module(&def.module) else {
-        return FeatureOutcome::NoResult;
-    };
     let empty = String::new();
     let def_text = ctx
         .root
         .files(state.db.db())
         .get(&def.module)
         .map_or(&empty, |f| f.text(state.db.db()));
+    let Some(def_uri) = state.definition_uri_for_module(&def.module, def_text) else {
+        return FeatureOutcome::NoResult;
+    };
     let range = ipe_lsp_features::offset::span_to_range(def_text, def.span, state.encoding);
     FeatureOutcome::payload(lsp_types::Location {
         uri: def_uri,
@@ -868,6 +900,52 @@ fn rename_result(state: &State, params: &serde_json::Value) -> FeatureOutcome {
 
 /// Normalize a path for map keys: canonical when the file exists, verbatim
 /// otherwise (fixture loaders use paths that exist nowhere).
+/// Whether the stdlib copy at `path` is a read-only regular file holding exactly `text`.
+///
+/// The entry is inspected without following a link, the opened handle is
+/// re-inspected and must be that same file, and the read stops one byte past
+/// `text`'s length, so a link, a swapped entry, an appended tail, or a huge
+/// planted file each answers `false` without being read whole.
+fn stdlib_copy_holds(path: &Path, text: &str) -> bool {
+    use std::io::Read as _;
+    let Ok(entry) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !entry.file_type().is_file() || !entry.permissions().readonly() {
+        return false;
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(held) = file.metadata() else {
+        return false;
+    };
+    if !held.file_type().is_file() || !same_file(&entry, &held) {
+        return false;
+    }
+    let Some(cap) = u64::try_from(text.len())
+        .ok()
+        .and_then(|len| len.checked_add(1))
+    else {
+        return false;
+    };
+    let mut bytes = Vec::with_capacity(text.len());
+    file.take(cap).read_to_end(&mut bytes).is_ok() && bytes == text.as_bytes()
+}
+
+/// Whether two metadata records describe the same file.
+#[cfg(unix)]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+/// Whether two metadata records describe the same file, by length where no inode is exposed.
+#[cfg(not(unix))]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    a.len() == b.len()
+}
+
 fn normalize(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
