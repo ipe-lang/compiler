@@ -53,11 +53,13 @@
 //!   an auto-selected free one).
 //! * `ipe doc check [PATH]` — a coverage gate that writes nothing and exits
 //!   non-zero when an exposed binding lacks a doc-comment. Stdlib modules are exempt.
-//! * `ipe doc --check-examples` — extract every fenced ` ```ipe ` block from every
-//!   `{-| … -}` doc-string in the standard library and type-check each one. A block
-//!   that carries `-->` result annotations is also compiled and run (when `IPE_E2E=1`
-//!   is set) and the printed output is asserted against the annotation. Exits non-zero
-//!   when any block fails its expectation.
+//! * `ipe doc --check-examples` — judge every code block the standard library's
+//!   doc pages serve, from `{-| … -}` and `-- |` doc comments alike: an ` ```ipe `
+//!   fence or an indented block must type-check, an ` ```ipe ipe:error <CODE> `
+//!   fence must be refused with `CODE`. A block that carries `-->` result
+//!   annotations is also compiled and run (when `IPE_E2E=1` is set) and the
+//!   printed output is asserted against the annotation. Exits non-zero when the
+//!   run disagrees with the `doc_examples_rot.txt` ledger.
 //!
 //! The machine-readable [`docs.json`](DocsJson) is the source of truth — one
 //! record per exposed module, with the module's doc-comment and its exposed
@@ -3529,93 +3531,111 @@ fn check(path: &Path) -> Result<(), CliError> {
     )))
 }
 
-/// One extracted doc-string example awaiting verification.
-struct Example {
-    /// Human-readable label, e.g. `Ipe.Maybe::withDefault example 1`.
-    label: String,
-    /// The fenced ` ```ipe ` block body, already stripped of the fence lines.
-    body: String,
-    /// Expected result lines from `-->` annotations in the body, in order.
-    /// Each element is the trimmed right-hand side of a `-->` arrow.
-    expected_results: Vec<String>,
+/// The stdlib doc-comment blocks known to miss their verdict, one
+/// `Module:line` key per line; the ledger only shrinks.
+const DOC_EXAMPLES_ROT: &str = include_str!("doc_examples_rot.txt");
+
+/// What a compiled doc-comment block asks of the type-checker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExampleExpect {
+    /// The block must type-check.
+    Accepted,
+    /// The block must be refused with this code.
+    Refused(ipe_diagnostics::Code),
 }
 
-/// Extract all `{-| … -}` doc-string blocks from an Ipê source text and return
-/// every ` ```ipe ` fenced example within them.
+/// How the gate judges one served doc-comment block.
+#[derive(Debug, PartialEq, Eq)]
+enum ExampleVerdict {
+    /// Compile the block as an example of its module.
+    Compile {
+        /// What the compile must yield.
+        expect: ExampleExpect,
+        /// The block body, fence markers and indent marker stripped.
+        body: String,
+        /// The trimmed right-hand side of each `-->` line, in order.
+        expected_results: Vec<String>,
+    },
+    /// The block can meet no verdict as written; the text says why.
+    Mismatch(String),
+}
+
+/// One code block a stdlib doc page serves, awaiting its verdict.
+#[derive(Debug, PartialEq, Eq)]
+struct DocExample {
+    /// `Module:line`, the block's first source line: the ledger key.
+    key: String,
+    /// How the block is judged.
+    verdict: ExampleVerdict,
+}
+
+/// Every code block `ipe doc` serves from `src`'s doc comments, each with its
+/// verdict.
 ///
-/// Each returned [`Example`] carries a label (for error reporting), the raw
-/// block body, and the `-->` expected-result lines parsed out of the body
-/// (for the result-assertion tier).
-fn extract_doc_examples(module_name: &str, src: &str) -> Vec<Example> {
-    const OPEN: &str = "{-|";
-    const CLOSE: &str = "-}";
-    const FENCE_OPEN: &str = "```ipe";
-    const FENCE_CLOSE: &str = "```";
+/// The comments come from the one extractor `ipe doc` renders from
+/// ([`ipe_docs::stdlib_docs::served_doc_texts`]), both the `{-| … -}` and the
+/// `-- |` form, and their blocks from [`crate::doc_fence::scan`], whose
+/// indented blocks are exactly the ones [`crate::doc_fence::fence_indented_code`]
+/// renders as code. An `ipe` fence or an indented block is compiled; an
+/// `ipe ipe:skip <reason>` fence is not; a malformed fence, a bare fence, and
+/// an excerpt (the installed stdlib cannot reach a repository file) are
+/// mismatches.
+fn doc_examples(module_name: &str, src: &str) -> Vec<DocExample> {
+    use crate::doc_fence::{Block, Kind, Page, scan};
 
+    let compile = |expect: ExampleExpect, body: String| {
+        let expected_results = body
+            .lines()
+            .filter_map(|line| line.split_once("-->"))
+            .map(|(_, result)| result.trim())
+            .filter(|result| !result.is_empty())
+            .map(str::to_owned)
+            .collect();
+        Some(ExampleVerdict::Compile {
+            expect,
+            body,
+            expected_results,
+        })
+    };
     let mut examples = Vec::new();
-    let mut search_from = 0usize;
-    let mut example_idx = 0usize;
-
-    while let Some(open_rel) = src[search_from..].find(OPEN) {
-        let block_start = search_from + open_rel + OPEN.len();
-        let Some(close_rel) = src[block_start..].find(CLOSE) else {
-            break;
-        };
-        let block_end = block_start + close_rel;
-        let block_body = &src[block_start..block_end];
-
-        // Find ` ```ipe ` fences within this doc-string body.
-        let mut fence_search = 0usize;
-        while let Some(fence_open_rel) = block_body[fence_search..].find(FENCE_OPEN) {
-            let after_open = fence_search + fence_open_rel + FENCE_OPEN.len();
-            // Skip the rest of the opening fence line.
-            let content_start = block_body[after_open..]
-                .find('\n')
-                .map_or(block_body.len(), |nl| after_open + nl + 1);
-            // The rest of the opening fence line is the info string. A `skip`
-            // there (e.g. ` ```ipe ipe:skip `) marks a documentation-only example
-            // — shown to the reader but exempt from the type-check, for snippets
-            // that need context this gate cannot supply (e.g. a cross-module
-            // import the synthetic example module does not inject).
-            let fence_info = block_body[after_open..content_start].trim();
-            // Find the closing fence.
-            let Some(close_fence_rel) = block_body[content_start..].find(FENCE_CLOSE) else {
-                fence_search = after_open;
-                continue;
+    for (_, doc) in ipe_docs::stdlib_docs::served_doc_texts(src) {
+        for item in scan(&doc.body, Page::Doc) {
+            let (line, verdict) = match item {
+                Err(refusal) => (
+                    refusal.line,
+                    Some(ExampleVerdict::Mismatch(format!(
+                        "fence refused: {:?}",
+                        refusal.error
+                    ))),
+                ),
+                Ok(Block { line, kind, body }) => (
+                    line,
+                    match kind {
+                        Kind::Check | Kind::Indented => compile(ExampleExpect::Accepted, body),
+                        Kind::Error(code) => compile(ExampleExpect::Refused(code), body),
+                        Kind::Skip(_) => None,
+                        Kind::Unlabelled => Some(ExampleVerdict::Mismatch(
+                            "a bare fence with no info string is never checked; tag it `ipe` \
+                             or `ipe ipe:skip <reason>`"
+                                .to_owned(),
+                        )),
+                        Kind::Excerpt(_) => Some(ExampleVerdict::Mismatch(
+                            "an `ipe:excerpt` names a repository file the installed stdlib \
+                             cannot reach; write the example as an `ipe` fence"
+                                .to_owned(),
+                        )),
+                    },
+                ),
             };
-            let content_end = content_start + close_fence_rel;
-            if fence_info.contains("skip") {
-                fence_search = content_end + FENCE_CLOSE.len();
-                continue;
+            if let Some(verdict) = verdict {
+                let source_line = doc.line.saturating_add(line.saturating_sub(1));
+                examples.push(DocExample {
+                    key: format!("{module_name}:{source_line}"),
+                    verdict,
+                });
             }
-            let raw_body = block_body[content_start..content_end].trim_end_matches('\n');
-
-            example_idx += 1;
-            let label = format!("{module_name} example {example_idx}");
-
-            // Parse `-->` result annotations out of the body lines.
-            let mut expected_results: Vec<String> = Vec::new();
-            for line in raw_body.lines() {
-                if let Some(arrow_pos) = line.find("-->") {
-                    let result = line[arrow_pos + 3..].trim();
-                    if !result.is_empty() {
-                        expected_results.push(result.to_owned());
-                    }
-                }
-            }
-
-            examples.push(Example {
-                label,
-                body: raw_body.to_owned(),
-                expected_results,
-            });
-
-            fence_search = content_end + FENCE_CLOSE.len();
         }
-
-        search_from = block_end + CLOSE.len();
     }
-
     examples
 }
 
@@ -3875,17 +3895,17 @@ fn run_example_and_check(
     Ok(())
 }
 
-/// Doc-test gate: extract every fenced ` ```ipe ` example from every
-/// `{-| … -}` doc-string across the standard library and type-check each one.
-///
-/// When `IPE_E2E=1` is set in the environment, examples with `-->` result
-/// annotations are also compiled, run, and their printed output asserted.
-///
-/// # Errors
-/// [`CliError::DocExamplesFailed`] when any block fails its expectation.
-fn check_examples() -> Result<(), CliError> {
-    // Collect all stdlib sources: the kernel-typed modules and the compiled-source ones.
-    let all_sources: Vec<(&str, &str)> = crate::stdlib::MODULES
+/// The outcome of judging every stdlib doc-comment block.
+struct ExampleRun {
+    /// Blocks judged.
+    total: usize,
+    /// `(key, why)` for each block that missed its verdict.
+    failures: Vec<(String, String)>,
+}
+
+/// Every stdlib module's dotted name and source, each module once.
+fn stdlib_example_sources() -> BTreeMap<&'static str, &'static str> {
+    crate::stdlib::MODULES
         .iter()
         .map(|m| (m.name, m.source))
         .chain(
@@ -3893,95 +3913,170 @@ fn check_examples() -> Result<(), CliError> {
                 .iter()
                 .map(|m| (m.dotted, m.source)),
         )
-        .collect();
+        .collect()
+}
 
-    let mut total = 0usize;
-    let mut passed = 0usize;
-    let mut failed: Vec<String> = Vec::new();
-
-    for (module_name, src) in &all_sources {
-        let examples = extract_doc_examples(module_name, src);
-        let module_imports = extract_module_imports(src);
-        for ex in &examples {
-            total += 1;
-            let module_src = synthesize_module(&ex.body, module_name, &module_imports);
-
-            // The example is the `Main` module of its own scratch project, so
-            // no file outside it is a module of the check; removed on drop.
-            let scratch = crate::project_root::ProjectRoot::scratch(&module_src)?;
-
-            // Tier 1: type-check the example (always).
-            match crate::driver::typecheck_stage_target(
-                &crate::project_root::AnalysisTarget::Project(scratch.root()),
-            ) {
-                Ok(()) => {
-                    crate::screen::chatter(
-                        crate::screen::Stream::Stderr,
-                        crate::screen::Tone::Success,
-                        &format!("ok   {}", ex.label),
-                    );
-                    passed += 1;
-                }
-                Err(err) => {
-                    crate::screen::chatter(
-                        crate::screen::Stream::Stderr,
-                        crate::screen::Tone::UserError,
-                        &format!("FAIL {}: does not type-check\n     {err}", ex.label),
-                    );
-                    failed.push(format!("{}: does not type-check", ex.label));
-                    // Skip result-checking for examples that don't even type-check.
-                    continue;
-                }
-            }
-
-            // Tier 2: if the example has `-->` annotations AND IPE_E2E=1 is set,
-            // run the example and assert its printed output.
-            if !ex.expected_results.is_empty()
-                && ipe_env::var_os("IPE_E2E").is_some_and(|v| v == "1")
+/// The mismatch text for one compiled block, or `None` when it meets `expect`.
+fn judge_example_compile(
+    module_name: &str,
+    src: &str,
+    key: &str,
+    expect: ExampleExpect,
+    body: &str,
+    expected_results: &[String],
+) -> Result<Option<String>, CliError> {
+    let module_src = synthesize_module(body, module_name, &extract_module_imports(src));
+    // The example is the `Main` module of its own scratch project, so no file
+    // outside it is a module of the check; removed on drop.
+    let scratch = crate::project_root::ProjectRoot::scratch(&module_src)?;
+    let outcome = crate::driver::typecheck_stage_target(
+        &crate::project_root::AnalysisTarget::Project(scratch.root()),
+    );
+    Ok(match (expect, outcome) {
+        (ExampleExpect::Accepted, Ok(())) => {
+            // Tier 2: with `IPE_E2E=1`, run an annotated example and assert
+            // its printed output.
+            if !expected_results.is_empty() && ipe_env::var_os("IPE_E2E").is_some_and(|v| v == "1")
             {
-                match run_example_and_check(scratch.root(), &ex.label, &ex.expected_results) {
-                    Ok(()) => {}
-                    Err(msg) => {
-                        crate::screen::chatter(
-                            crate::screen::Stream::Stderr,
-                            crate::screen::Tone::UserError,
-                            &format!("FAIL {msg}"),
-                        );
-                        failed.push(msg);
-                    }
-                }
+                run_example_and_check(scratch.root(), key, expected_results).err()
+            } else {
+                None
+            }
+        }
+        (ExampleExpect::Accepted, Err(err)) => Some(format!("does not type-check\n     {err}")),
+        (ExampleExpect::Refused(want), Ok(())) => Some(format!(
+            "expected a refusal with {}; the example type-checks",
+            want.as_str()
+        )),
+        (ExampleExpect::Refused(want), Err(CliError::Pipeline { diag, .. }))
+            if diag.code() == want =>
+        {
+            None
+        }
+        (ExampleExpect::Refused(want), Err(err)) => Some(format!(
+            "expected a refusal with {}; got\n     {err}",
+            want.as_str()
+        )),
+    })
+}
+
+/// Judge every code block every stdlib doc page serves.
+fn run_stdlib_examples() -> Result<ExampleRun, CliError> {
+    let mut run = ExampleRun {
+        total: 0,
+        failures: Vec::new(),
+    };
+    for (module_name, src) in stdlib_example_sources() {
+        for example in doc_examples(module_name, src) {
+            run.total += 1;
+            let miss = match &example.verdict {
+                ExampleVerdict::Mismatch(why) => Some(why.clone()),
+                ExampleVerdict::Compile {
+                    expect,
+                    body,
+                    expected_results,
+                } => judge_example_compile(
+                    module_name,
+                    src,
+                    &example.key,
+                    *expect,
+                    body,
+                    expected_results,
+                )?,
+            };
+            match miss {
+                Some(why) => run.failures.push((example.key, why)),
+                None => crate::screen::chatter(
+                    crate::screen::Stream::Stderr,
+                    crate::screen::Tone::Success,
+                    &format!("ok   {}", example.key),
+                ),
             }
         }
     }
+    Ok(run)
+}
+
+/// The ledger's `Module:line` keys, comments and blank lines dropped.
+fn rot_ledger(text: &str) -> BTreeSet<&str> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect()
+}
+
+/// Every reason `failures` is red against `ledger`: a failure the ledger does
+/// not list, and a listed key that no longer fails.
+fn reconcile_rot(failures: &[(String, String)], ledger: &BTreeSet<&str>) -> Vec<String> {
+    let failing: BTreeSet<&str> = failures.iter().map(|(key, _)| key.as_str()).collect();
+    failures
+        .iter()
+        .filter(|(key, _)| !ledger.contains(key.as_str()))
+        .map(|(key, why)| format!("{key}: {why}"))
+        .chain(
+            ledger
+                .iter()
+                .filter(|key| !failing.contains(*key))
+                .map(|key| format!("{key}: no longer fails; remove it from doc_examples_rot.txt")),
+        )
+        .collect()
+}
+
+/// Doc-test gate: judge every code block every stdlib doc page serves.
+///
+/// Each block comes from [`doc_examples`]: an `ipe` fence or an indented
+/// block in a `{-| … -}` or `-- |` doc comment must type-check, an
+/// `ipe ipe:error <CODE>` fence must be refused with `CODE`. A failure the
+/// [`DOC_EXAMPLES_ROT`] ledger lists is known; an unlisted failure, or a
+/// listed block that now passes, fails the gate. With `IPE_E2E=1`, a block
+/// with `-->` annotations is also run and its printed output asserted.
+///
+/// # Errors
+/// [`CliError::DocExamplesFailed`] when the run disagrees with the ledger.
+fn check_examples() -> Result<(), CliError> {
+    let run = run_stdlib_examples()?;
+    let ledger = rot_ledger(DOC_EXAMPLES_ROT);
+    let problems = reconcile_rot(&run.failures, &ledger);
+    let known = run
+        .failures
+        .iter()
+        .filter(|(key, _)| ledger.contains(key.as_str()))
+        .count();
 
     crate::screen::Screen::new(crate::screen::Stream::Stderr)
         .blank()
         .line(
             crate::screen::Tone::Text,
-            &format!("doc-example gate: {passed}/{total} passed"),
+            &format!(
+                "doc-example gate: {} of {} block(s) meet their verdict, {known} known to fail",
+                run.total.saturating_sub(run.failures.len()),
+                run.total
+            ),
         )
         .emit_chatter();
 
-    if failed.is_empty() {
+    if problems.is_empty() {
         crate::screen::Screen::new(crate::screen::Stream::Stdout)
             .line(
                 crate::screen::Tone::Text,
-                &format!("all {total} doc-string example(s) type-check"),
+                &format!(
+                    "all {} doc-comment block(s) agree with the ledger",
+                    run.total
+                ),
             )
             .emit();
         Ok(())
     } else {
         let mut report = format!(
-            "{} of {} doc-string example(s) failed:\n",
-            failed.len(),
-            total
+            "{} doc-comment block(s) disagree with the ledger:\n",
+            problems.len()
         );
-        for msg in &failed {
+        for msg in &problems {
             let _ = writeln!(report, "  FAIL: {msg}");
         }
         let _ = write!(
             report,
-            "fix each failing example or mark it with ` ```ipe ipe:skip ` to exempt it"
+            "fix each failing example or mark it with ` ```ipe ipe:skip <reason> ` to exempt it"
         );
         Err(CliError::DocExamplesFailed(
             crate::style::TerminalSafe::sanitize(&report),
@@ -4992,7 +5087,7 @@ fn render_comment_html(comment: &str) -> String {
 
     // Section headings inside a page body start at h3 so they nest under the
     // page's own h1/h2 chrome (the walker clamps at h6).
-    let normalised = fence_indented_code(comment);
+    let normalised = crate::doc_fence::fence_indented_code(comment);
     let highlight = |body: &str| highlight_ipe_snippet(body);
     let opts = walker::WalkOptions {
         heading_offset: 2,
@@ -5000,105 +5095,6 @@ fn render_comment_html(comment: &str) -> String {
         para_class: Some("comment"),
     };
     walker::blocks_to_html(&parse_blocks(&normalised), &opts)
-}
-
-/// Normalise a doc-comment body into `Ipe.Markdown` source before parsing.
-///
-/// A doc-comment may present an example as a four-space-indented block (the
-/// stdlib convention). `Ipe.Markdown` — the parse SSOT — recognises only fenced
-/// code, so this boundary transform rewrites each maximal run of four-space
-/// indented lines into a ```` ``` ````-fenced block (the four-space marker
-/// stripped), leaving the SSOT parser as the single Markdown authority. Lines
-/// already inside a fence, and list/table/blockquote continuations, are left
-/// untouched so the transform never fabricates a code block from list content.
-fn fence_indented_code(body: &str) -> String {
-    let mut out = String::new();
-    let mut in_fence = false;
-    let mut in_indented = false;
-    // Whether the previous non-blank line was a block that legitimately carries
-    // indented continuations (a list / table / blockquote), where a four-space
-    // line is continuation, not a standalone code block.
-    let mut prev_was_container = false;
-
-    let close_indent = |out: &mut String, in_indented: &mut bool| {
-        if *in_indented {
-            out.push_str("```\n");
-            *in_indented = false;
-        }
-    };
-
-    for line in body.lines() {
-        let is_fence_delim = line.trim_start().starts_with("```");
-        if in_fence {
-            // Inside an author fence: copy verbatim, toggle out on the closer.
-            out.push_str(line);
-            out.push('\n');
-            if is_fence_delim {
-                in_fence = false;
-            }
-            continue;
-        }
-        if is_fence_delim {
-            close_indent(&mut out, &mut in_indented);
-            in_fence = true;
-            prev_was_container = false;
-            out.push_str(line);
-            out.push('\n');
-            continue;
-        }
-
-        let line_indented = line.starts_with("    ");
-        let is_blank = line.trim().is_empty();
-
-        if in_indented {
-            if line_indented {
-                // Continue the code block, stripping the four-space marker.
-                out.push_str(line.get(4..).unwrap_or(""));
-            } else if is_blank {
-                // A blank line may separate two indented paragraphs of the same
-                // block; keep it inside the fence (emitted below).
-            } else {
-                // A non-indented, non-blank line ends the code block.
-                close_indent(&mut out, &mut in_indented);
-                prev_was_container = is_container_line(line);
-                out.push_str(line);
-            }
-            out.push('\n');
-            continue;
-        }
-
-        // Not currently in an indented run. A four-space line opens one only
-        // when it is not a continuation of a list/table/blockquote.
-        if line_indented && !prev_was_container {
-            out.push_str("```\n");
-            in_indented = true;
-            out.push_str(line.get(4..).unwrap_or(""));
-            out.push('\n');
-            continue;
-        }
-
-        if !is_blank {
-            prev_was_container = is_container_line(line);
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    close_indent(&mut out, &mut in_indented);
-    out
-}
-
-/// Whether a line opens or continues a list / table / blockquote — a context
-/// where an indented follow-on line is a continuation, not a code block.
-fn is_container_line(line: &str) -> bool {
-    let t = line.trim_start();
-    t.starts_with("- ")
-        || t.starts_with("* ")
-        || t.starts_with("+ ")
-        || t.starts_with('|')
-        || t.starts_with("> ")
-        || t == ">"
-        || t.split_once(". ")
-            .is_some_and(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Syntax-highlight an Ipê snippet into `<code>…</code>` inner HTML.
@@ -8239,7 +8235,8 @@ mod tests {
     fn fence_indented_code_does_not_fire_inside_a_list() {
         // A four-space continuation under a bullet is list content, not a code
         // block: the normaliser must leave it for the SSOT list parser.
-        let out = super::fence_indented_code("- item one\n    still the item\n- item two");
+        let out =
+            crate::doc_fence::fence_indented_code("- item one\n    still the item\n- item two");
         assert!(
             !out.contains("```"),
             "list continuation must not become a fence: {out:?}"
@@ -8252,9 +8249,222 @@ mod tests {
         // even when a line happens to be four-space indented.
         let src = "```\n    indented in fence\n```";
         assert_eq!(
-            super::fence_indented_code(src),
+            crate::doc_fence::fence_indented_code(src),
             "```\n    indented in fence\n```\n"
         );
+    }
+
+    /// The single block [`doc_examples`] finds in `src`, documented as `Ipe.Demo`.
+    fn only_example(src: &str) -> Result<DocExample, &'static str> {
+        let mut examples = doc_examples("Ipe.Demo", src);
+        if examples.len() != 1 {
+            return Err("expected exactly one doc example");
+        }
+        examples.pop().ok_or("expected exactly one doc example")
+    }
+
+    /// A `-- |` doc comment is served like a `{-| … -}` one, so its examples
+    /// are judged too, keyed by their source line.
+    #[test]
+    fn a_dash_pipe_comment_example_is_judged() -> Result<(), &'static str> {
+        let src = "\
+module Ipe.Demo exposing (foo)
+
+-- | Adds one.
+--
+-- ```ipe
+-- foo 1 --> 2
+-- ```
+foo : Int -> Int
+foo n = n + 1
+";
+        assert_eq!(
+            only_example(src)?,
+            DocExample {
+                key: "Ipe.Demo:5".to_owned(),
+                verdict: ExampleVerdict::Compile {
+                    expect: ExampleExpect::Accepted,
+                    body: "foo 1 --> 2".to_owned(),
+                    expected_results: vec!["2".to_owned()],
+                },
+            }
+        );
+        Ok(())
+    }
+
+    /// A four-space block the page renders as code is judged as code.
+    #[test]
+    fn an_indented_doc_comment_block_is_judged() -> Result<(), &'static str> {
+        let src = "\
+module Ipe.Demo exposing (foo)
+
+{-| Adds one.
+
+    foo 1
+-}
+foo : Int -> Int
+foo n = n + 1
+";
+        assert_eq!(
+            only_example(src)?,
+            DocExample {
+                key: "Ipe.Demo:5".to_owned(),
+                verdict: ExampleVerdict::Compile {
+                    expect: ExampleExpect::Accepted,
+                    body: "foo 1".to_owned(),
+                    expected_results: Vec::new(),
+                },
+            }
+        );
+        Ok(())
+    }
+
+    /// A `{-|` inside a string literal opens no doc comment; only the comment
+    /// the page serves contributes an example.
+    #[test]
+    fn a_brace_inside_a_string_is_not_a_doc_comment() -> Result<(), &'static str> {
+        let src = "\
+module Ipe.Demo exposing (foo)
+
+banner : String
+banner =
+    \"\"\"
+{-|
+```ipe
+notCode
+```
+-}
+\"\"\"
+
+{-| Adds one.
+
+```ipe
+foo 1
+```
+-}
+foo : Int -> Int
+foo n = n + 1
+";
+        let example = only_example(src)?;
+        assert_eq!(example.key, "Ipe.Demo:15");
+        assert!(
+            matches!(&example.verdict, ExampleVerdict::Compile { body, .. } if body == "foo 1"),
+            "{example:?}"
+        );
+        Ok(())
+    }
+
+    /// A list item's wrapped line keeps its continuation open, so a deeper
+    /// line under it is list text: neither fenced nor judged.
+    #[test]
+    fn a_list_items_wrapped_lines_keep_its_continuation_open() -> Result<(), &'static str> {
+        let list = "- item one\n  wrapped\n    deeper\n";
+        let fenced = crate::doc_fence::fence_indented_code(list);
+        if fenced.contains("```") {
+            return Err("a list continuation became a code fence");
+        }
+        let src = "\
+module Ipe.Demo exposing (foo)
+
+{-| Adds one.
+
+- item one
+  wrapped
+    deeper
+-}
+foo : Int -> Int
+foo n = n + 1
+";
+        assert_eq!(doc_examples("Ipe.Demo", src), Vec::new());
+        Ok(())
+    }
+
+    /// Every code block a doc page renders is a block the checker judges:
+    /// the renderer's `<pre>` count equals the scan's block count.
+    #[test]
+    fn every_rendered_doc_code_block_is_judged() {
+        let comment = "\
+Intro.
+
+```ipe
+foo 1
+```
+
+    bar 2
+
+- item
+    continued
+
+```ipe ipe:skip needs a server
+serve app
+```
+";
+        let rendered = render_comment_html(comment)
+            .matches("<pre class=\"doc-code\">")
+            .count();
+        let scanned = crate::doc_fence::scan(comment, crate::doc_fence::Page::Doc).len();
+        assert_eq!((rendered, scanned), (3, 3));
+    }
+
+    /// An unlisted failure and a listed key that now passes are both red; a
+    /// listed failure is not.
+    #[test]
+    fn the_rot_ledger_reconciles_both_ways() {
+        let failures = vec![
+            ("Ipe.A:3".to_owned(), "does not type-check".to_owned()),
+            ("Ipe.A:9".to_owned(), "does not type-check".to_owned()),
+        ];
+        let ledger = rot_ledger("# header\n\nIpe.A:3\nIpe.B:4\n");
+        assert_eq!(
+            reconcile_rot(&failures, &ledger),
+            vec![
+                "Ipe.A:9: does not type-check".to_owned(),
+                "Ipe.B:4: no longer fails; remove it from doc_examples_rot.txt".to_owned(),
+            ]
+        );
+    }
+
+    /// Every ledger key names a stdlib module and a source line, once.
+    #[test]
+    fn the_rot_ledger_keys_name_stdlib_lines() -> Result<(), &'static str> {
+        let sources = stdlib_example_sources();
+        let keys: Vec<&str> = DOC_EXAMPLES_ROT
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        for key in &keys {
+            let (module, line) = key.rsplit_once(':').ok_or("a key lacks `:`")?;
+            let src = sources.get(module).ok_or("a key names no stdlib module")?;
+            let line: usize = line.parse().map_err(|_| "a key's line is not a number")?;
+            if line == 0 || line > src.lines().count() {
+                return Err("a key's line is outside its module");
+            }
+        }
+        if rot_ledger(DOC_EXAMPLES_ROT).len() != keys.len() {
+            return Err("a ledger key is listed twice");
+        }
+        Ok(())
+    }
+
+    /// Regenerates `doc_examples_rot.txt` from the current stdlib: its comment
+    /// header, then every failing block's key, sorted.
+    #[test]
+    #[ignore = "writes doc_examples_rot.txt; run by hand after a stdlib doc edit"]
+    fn dump_doc_examples_rot() -> Result<(), &'static str> {
+        let run = run_stdlib_examples().map_err(|_| "a doc example could not be judged")?;
+        let header = DOC_EXAMPLES_ROT.lines().take_while(|l| l.starts_with('#'));
+        let keys: BTreeSet<&str> = run.failures.iter().map(|(key, _)| key.as_str()).collect();
+        let mut out = String::new();
+        for line in header.chain(keys) {
+            out.push_str(line);
+            out.push('\n');
+        }
+        std::fs::write(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/doc_examples_rot.txt"),
+            out,
+        )
+        .map_err(|_| "could not write doc_examples_rot.txt")
     }
 
     /// The HTML command page renders the same command metadata as
