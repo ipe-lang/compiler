@@ -1,10 +1,11 @@
 //! `Cli.tea`'s frame separator when stdout is not a terminal.
 //!
-//! A `view` that supplies no trailing newline of its own is glued to the next
-//! render ON A TERMINAL, so a prompt line keeps the cursor (see
-//! `ipe_runtime::tui::LineOutput::Terminal`). Into a pipe the same program
-//! writes plain lines, each frame terminated by its own newline, and nothing
-//! after the last one: piped output is line-oriented text a script can read.
+//! A `view` that supplies no trailing newline of its own keeps the cursor on
+//! its last line only on one echoing terminal (see
+//! `ipe_runtime::terminal_access::decide_line`). Into a pipe the same program
+//! writes plain lines, each frame terminated by its own newline, with no
+//! styling (its bold line included) and nothing after the last one: piped
+//! output is line-oriented text a script can read.
 //!
 //! Gated on `IPE_E2E=1`. Run:
 //!
@@ -50,9 +51,9 @@ fn piped_console_app_writes_one_line_per_render() {
     );
 
     assert_eq!(outcome.exit_code, Some(0));
-    // Piped stdout: each render is its own newline-terminated plain line, and
-    // no extra newline follows the last one.
-    let expected = "lines: 0\nlines: 1\nlines: 2\n";
+    // Piped stdout: each render's lines end in their own newline, the bold
+    // line is written unstyled, and no extra newline follows the last one.
+    let expected = "count\nlines: 0\ncount\nlines: 1\ncount\nlines: 2\n";
     assert_eq!(
         outcome.stdout, expected,
         "a piped Cli.tea must write one plain line per render, got: {:?}",
@@ -60,7 +61,7 @@ fn piped_console_app_writes_one_line_per_render() {
     );
     assert!(
         !outcome.stdout.contains('\u{1b}') && !outcome.stdout.contains('\r'),
-        "piped output carries no escape sequence and no CR: {:?}",
+        "piped output carries no escape sequence (no bold SGR) and no CR: {:?}",
         outcome.stdout
     );
 }

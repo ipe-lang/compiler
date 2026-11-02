@@ -115,6 +115,8 @@ mod golden_i3320_task_loop;
 mod golden_i3332_stored_fn_kernel_args;
 #[path = "g_issues/golden_i3344_fn_carrier_unification.rs"]
 mod golden_i3344_fn_carrier_unification;
+#[path = "g_issues/golden_i3943_cli_exit_path.rs"]
+mod golden_i3943_cli_exit_path;
 #[path = "g_issues/golden_i663_codec_combinators.rs"]
 mod golden_i663_codec_combinators;
 #[path = "g_issues/golden_i665_retry_policy_value_callee.rs"]
