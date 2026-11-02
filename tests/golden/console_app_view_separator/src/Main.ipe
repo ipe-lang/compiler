@@ -1,8 +1,8 @@
 module Main exposing (main)
 
--- View-separator fixture: `view` supplies no trailing newline of its own. On
--- a terminal consecutive renders glue together (a prompt keeps the cursor);
--- into a pipe each render is its own plain line ("lines: 0\nlines: 1\n...").
+-- View-separator fixture: `view` supplies no trailing newline of its own, and
+-- its first line is bold. Into a pipe each render is plain lines, each ending
+-- in its own newline and carrying no styling ("count\nlines: 0\n...").
 
 import Ipe.Tea.Cli as Cli
 import Ipe.Ui.Cli as Ui
@@ -29,7 +29,10 @@ update msg model =
 
 view : Model -> Lines Msg
 view model =
-    Ui.text ("lines: " ++ String.fromInt model.count)
+    Ui.lines
+        [ Ui.line [ Ui.bold ] "count"
+        , Ui.text ("lines: " ++ String.fromInt model.count)
+        ]
 
 subscriptions : Model -> Sub Msg
 subscriptions _ =
