@@ -635,7 +635,7 @@ pub fn resolve_delivery(
     args: &cli_args::DeliveryArgs,
     wants_static: bool,
     command: &str,
-    admit: fn(delivery::Delivery) -> Result<(), delivery::DeliveryError>,
+    admit: Admit,
 ) -> Result<delivery::Delivery, CliError> {
     let usage =
         |e: &delivery::DeliveryError| CliError::Usage(text::msg::command_refusal(&command, e));
@@ -668,13 +668,11 @@ pub fn resolve_delivery(
     }
 }
 
+/// A command's own admission check on the delivery it resolved.
+pub type Admit = fn(delivery::Delivery) -> Result<(), delivery::DeliveryError>;
+
 /// The admission check of a command that builds every delivery it resolves.
-///
-/// # Errors
-/// Never.
-pub const fn admit_any(_: delivery::Delivery) -> Result<(), delivery::DeliveryError> {
-    Ok(())
-}
+pub const ADMIT_ANY: Admit = |_| Ok(());
 
 /// The admission check of `ipe dev watch`: the loop restarts a served program.
 ///
@@ -1017,7 +1015,7 @@ fn admit_dev_build(
         positionals,
         wants_static,
         Verb::DEV_BUILD.name(),
-        admit_any,
+        ADMIT_ANY,
     )?;
     let env = build_plan::env_target()?;
     if let Some(host) = BundleHost::from_delivery_host(delivery.host())? {
@@ -1855,7 +1853,7 @@ pub enum ReleaseOutput {
     Bundle(PathBuf),
     /// Every delivery `package.ipe` declares, released by an `ipe release
     /// build` given no delivery words, in declared order.
-    Declared(Vec<crate::delivery_set::Released<ReleaseOutput>>),
+    Declared(Vec<crate::delivery_set::Released<Self>>),
 }
 
 /// Produce the release artifact `args` selects, and return where it landed.
@@ -2311,7 +2309,10 @@ pub fn release_pipeline(
         // each for the triple its ship names unless argv names one.
         (cli_args::DeliveryArgs::Unstated, ReleasePurpose::Build) => {
             match declared.into_set().release_each(|plan| {
-                release_one(plan.delivery(), args.target.or(plan.release_triple()))
+                release_one(
+                    plan.delivery(),
+                    args.target.or_else(|| plan.release_triple()),
+                )
             }) {
                 crate::delivery_set::ReleaseOutcome::AllReleased(built) => {
                     Ok(ReleaseOutput::Declared(built))
@@ -2330,10 +2331,13 @@ pub fn release_pipeline(
         // `release run` runs one artifact: the one the package declares.
         (cli_args::DeliveryArgs::Unstated, ReleasePurpose::Run) => {
             let plan = declared.sole_release_member(verb.name())?;
-            release_one(plan.delivery(), args.target.or(plan.release_triple()))
+            release_one(
+                plan.delivery(),
+                args.target.or_else(|| plan.release_triple()),
+            )
         }
         (cli_args::DeliveryArgs::Stated { .. }, _) => release_one(
-            resolve_delivery(&declared, &args.delivery, false, verb.name(), admit_any)?,
+            resolve_delivery(&declared, &args.delivery, false, verb.name(), ADMIT_ANY)?,
             args.target,
         ),
     }
@@ -5833,7 +5837,7 @@ mod parsed_manifest_tests {
 #[cfg(test)]
 mod declared_delivery_tests {
     use super::{
-        CompileTarget, TargetVerb, admit_any, admit_dev_run, admit_watch, derive_target,
+        ADMIT_ANY, CompileTarget, TargetVerb, admit_dev_run, admit_watch, derive_target,
         dev_compile_target, resolve_delivery, with_help_on_misuse,
     };
     use crate::CliError;
@@ -5873,7 +5877,7 @@ mod declared_delivery_tests {
             &DeliveryArgs::Unstated,
             false,
             Verb::DEV_BUILD.name(),
-            admit_any,
+            ADMIT_ANY,
         );
         assert_eq!(got.as_ref().ok(), Some(&Delivery::web_client()));
         let Ok(delivery) = got else { return };
@@ -5912,7 +5916,7 @@ mod declared_delivery_tests {
             &DeliveryArgs::Unstated,
             false,
             Verb::DEV_BUILD.name(),
-            admit_any,
+            ADMIT_ANY,
         );
         assert_eq!(got.ok(), Some(served()));
     }
@@ -5928,7 +5932,7 @@ mod declared_delivery_tests {
                 &DeliveryArgs::Unstated,
                 false,
                 Verb::DEV_BUILD.name(),
-                admit_any,
+                ADMIT_ANY,
             );
             let Err(CliError::ProjectRefused(message)) = &got else {
                 assert!(
@@ -5994,7 +5998,7 @@ mod declared_delivery_tests {
             &stated(&["web", "client"]),
             false,
             Verb::DEV_BUILD.name(),
-            admit_any,
+            ADMIT_ANY,
         );
         assert_eq!(got.ok(), Some(Delivery::web_client()));
     }
@@ -6105,7 +6109,7 @@ mod declared_delivery_tests {
             &stated(&words),
             false,
             Verb::DEV_BUILD.name(),
-            admit_any,
+            ADMIT_ANY,
         );
         let Ok(advised) = advised else {
             assert!(advised.is_ok(), "the remedy resolves: {advised:?}");

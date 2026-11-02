@@ -1448,7 +1448,7 @@ mod tests {
     #[test]
     fn the_advised_next_step_builds_the_declared_delivery() {
         use crate::delivery::TargetTriple;
-        use crate::driver::{TargetVerb, admit_any, derive_target, resolve_delivery};
+        use crate::driver::{ADMIT_ANY, TargetVerb, derive_target, resolve_delivery};
         for shape in InitShape::ALL {
             for runtime in scaffolded_runtimes(shape) {
                 let label = format!("{} {}", shape.label(), runtime_label(runtime));
@@ -1480,7 +1480,7 @@ mod tests {
                 }
                 .expect("the advised verb's parser reads the command");
                 let advised =
-                    resolve_delivery(&declared_set, &positionals, false, verb.name(), admit_any)
+                    resolve_delivery(&declared_set, &positionals, false, verb.name(), ADMIT_ANY)
                         .expect("the advised delivery resolves");
                 assert_eq!(
                     advised, declared,

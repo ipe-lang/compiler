@@ -4482,7 +4482,7 @@ mod pack_gate_tests {
             &positionals,
             false,
             verb.name(),
-            super::super::commands::admit_any,
+            super::super::commands::ADMIT_ANY,
         )
     }
 
