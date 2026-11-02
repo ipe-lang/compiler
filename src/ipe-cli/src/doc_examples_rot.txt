@@ -1,0 +1,6 @@
+# Stdlib doc-comment code blocks that do not yet meet their verdict, one
+# `Module:line` key per line (the block's first source line). This list may
+# only shrink: an unlisted failing block is red, and so is a listed block that
+# now meets its verdict. Fix the example, then delete its line here. The list
+# is generated, never hand-edited:
+#   cargo nextest run -p ipe --lib doc::tests::dump_doc_examples_rot --run-ignored only
