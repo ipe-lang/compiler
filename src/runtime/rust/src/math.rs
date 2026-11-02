@@ -549,7 +549,8 @@ mod tests {
     // convert exactly.
     #[test]
     fn float_to_int_trips_typed() {
-        let convs: [(fn(f64) -> i64, FloatToIntOp); 4] = [
+        type Conv = fn(f64) -> i64;
+        let convs: [(Conv, FloatToIntOp); 4] = [
             (math_floor, FloatToIntOp::Floor),
             (math_ceil, FloatToIntOp::Ceiling),
             (math_round, FloatToIntOp::Round),
