@@ -33,7 +33,7 @@
 //! the conservative branch — rejection — is the only reachable one.
 
 #[cfg(feature = "json")]
-use crate::json::{Decoder, JsonVal};
+use crate::json::{Decoder, JsonSource, JsonVal, json_failure_text};
 #[cfg(feature = "json")]
 use crate::json_val::{SERDE_CONTAINER_FLOOR, json_depth};
 #[cfg(feature = "json")]
@@ -58,11 +58,14 @@ pub enum SealDecodeError {
     /// An unterminated run of opening brackets is nesting too, so it reports
     /// here rather than as `Malformed`.
     TooDeep { max: u8 },
-    /// The JSON was syntactically invalid.
+    /// The JSON was syntactically invalid. The detail is a fixed grammar phrase
+    /// plus a position, never the input.
     Malformed { detail: String },
     /// The JSON parsed, but the declared-type decoder rejected it: a wrong shape,
     /// a wrong ADT tag, a wrong tuple arity, a missing required field, or an
-    /// out-of-range integer. The inner message is the decoder's own diagnostic.
+    /// out-of-range integer. The detail is the combinator decoder's own
+    /// diagnostic, or for a serde-derived type a fixed phrase: serde's message
+    /// quotes the rejected value, so it never reaches the detail.
     TypeMismatch { detail: String },
 }
 
@@ -230,7 +233,7 @@ pub fn seal_decode_serde<T: serde::de::DeserializeOwned>(
         max: limits.max_nesting_depth,
     })?;
     serde_json::from_value::<T>(value).map_err(|e| SealDecodeError::TypeMismatch {
-        detail: e.to_string(),
+        detail: json_failure_text(&e, JsonSource::Value),
     })
 }
 
@@ -270,7 +273,7 @@ fn parse_depth_bounded(input: &str, max_depth: u8) -> Result<JsonVal, SealDecode
         return Err(SealDecodeError::TooDeep { max: max_depth });
     }
     let value: JsonVal = serde_json::from_str(input).map_err(|e| SealDecodeError::Malformed {
-        detail: format!("json parse: {e}"),
+        detail: json_failure_text(&e, JsonSource::Text),
     })?;
     if json_depth(&value) > usize::from(max_depth) {
         return Err(SealDecodeError::TooDeep { max: max_depth });

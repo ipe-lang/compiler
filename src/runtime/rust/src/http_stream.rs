@@ -2210,10 +2210,8 @@ mod tests {
         let decoded = crate::dom::form::decode_form::<StreamForm>(form("5"));
         assert!(matches!(
             &decoded,
-            Err(crate::dom::form::FormDecodeError::Decode(_))
+            Err(crate::dom::form::FormDecodeError::Decode)
         ));
-        let Err(e) = decoded else { return };
-        assert!(e.to_string().ends_with(INVALID_ID), "{e}");
         // Happy twin: the exact wire form decodes to the same handle.
         let wire = "000000000000000000000000000000ff";
         let decoded = crate::dom::form::decode_form::<StreamForm>(form(wire));
