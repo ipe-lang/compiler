@@ -416,7 +416,7 @@ fn take_leading_entry(
 /// both parse. A target triple is deliberately excluded: a leading bare triple with
 /// no preceding shape word is meaningless, so it stays a directory candidate
 /// and the delivery parse rejects it in tail position if it slips through.
-fn is_delivery_word(token: &str) -> bool {
+pub(crate) fn is_delivery_word(token: &str) -> bool {
     Shape::from_word(token).is_some()
         || !matches!(crate::delivery::parse_runtime_word(token), Ok(None))
         || crate::delivery::Host::from_word(token).is_some()

@@ -1268,7 +1268,8 @@ ipe version
 
 **Build output lives in the project's `out/`** — `build`, `run` and `watch`
 emit the Rust crate to `out/rust/` and the binary to `out/bin/`; `release` writes
-under `out/release/`. `--out <dir>` picks another root. ipe writes only into
+under `out/release/<delivery>/`, one directory per delivery (`out/release/web/`,
+`out/release/web-client/`). `--out <dir>` picks another root. ipe writes only into
 directories it created (marked by an `.ipe-output` file) and refuses an `--out`
 that is the project, encloses it, sits inside `src/`, or already holds your files:
 

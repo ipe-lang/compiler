@@ -5919,35 +5919,74 @@ const DEBUG_DESKTOP_PACKAGE: &str = "module Package exposing (package)\n\nimport
 /// The `main` of [`DEBUG_DESKTOP_PACKAGE`].
 const DEBUG_DESKTOP_MAIN: &str = "module Main exposing (main)\n\nimport Ipe.Tea.Web as Web\nimport Ipe.Tea.Web.Cmd as Cmd\nimport Ipe.Tea.Web.Sub as Sub\nimport Ipe.Debug as Debug\nimport Ipe.String as String\nimport Ipe.Ui as Ui\n\n\ntype alias Model =\n    { count : Int }\n\n\ntype Msg\n    = Increment\n    | NoOp\n\n\ninit : WebReq -> ( Model, Cmd.Cmd Msg )\ninit _req =\n    ( { count = 0 }, Cmd.none )\n\n\nupdate : Msg -> Model -> ( Model, Cmd.Cmd Msg )\nupdate msg model =\n    case msg of\n        Increment ->\n            ( { model | count = Debug.log \"count\" (model.count + 1) }, Cmd.none )\n\n        NoOp ->\n            ( model, Cmd.none )\n\n\nsubscriptions : Model -> Sub.Sub Msg\nsubscriptions _model =\n    Sub.none\n\n\nview : Model -> Element Msg\nview model =\n    Ui.column []\n        [ Ui.button [] { onPress = Just Increment, label = Ui.text \"+\" }\n        , Ui.text (String.fromInt model.count)\n        ]\n\n\nmain =\n    Web.tea\n        { init = init\n        , update = update\n        , view = view\n        , subscriptions = subscriptions\n        , routes = []\n        , notFound = NoOp\n        }\n";
 
-/// Bundle the Debug-using desktop app finished in `finish`.
-fn bundle_debug_desktop(finish: NativeFinish<'_>, label: &str) -> Result<(), CliError> {
+/// Bundle the Debug-using desktop app: a release bundle behind `consented`,
+/// written under its own release member root, else a dev bundle.
+///
+/// Also answers whether the bundle left a `release/` directory under the
+/// default output root.
+fn bundle_debug_desktop(
+    consented: Option<&ConsentedCapabilities>,
+    label: &str,
+) -> (Result<(), CliError>, bool) {
     let (tmp, _) = debug_project(label, DEBUG_DESKTOP_PACKAGE, DEBUG_DESKTOP_MAIN);
-    let result = held_build(&tmp, false)
-        .and_then(|held| bundle_delivery(BundleHost::Desktop, finish, &held));
+    let result = held_build(&tmp, false).and_then(|held| {
+        let finish = match consented {
+            None => BundleFinish::Dev {
+                output: crate::output_dir::OutputRoot::resolve(
+                    None,
+                    &crate::output_dir::ProjectPaths::from_manifest(held.root().manifest()),
+                )?,
+            },
+            Some(consented) => {
+                let desktop = crate::delivery::Delivery::resolve(
+                    crate::delivery::Shape::Web,
+                    None,
+                    crate::delivery::Host::Desktop,
+                )
+                .map_err(|e| CliError::Usage(crate::text::msg::command_refusal(&"release", &e)))?;
+                let slug = crate::delivery_set::PlannedDelivery::release(desktop, None)
+                    .map_err(|e| {
+                        CliError::Usage(crate::text::msg::command_refusal(&"release", &e))
+                    })?
+                    .slug()?;
+                let member = crate::output_dir::OutputRoot::resolve(
+                    None,
+                    &crate::output_dir::ProjectPaths::from_manifest(held.root().manifest()),
+                )?
+                .release_member(&slug);
+                BundleFinish::Release {
+                    consented,
+                    driver: ipe_backend_rust::DbDriver::Sqlite,
+                    member,
+                }
+            }
+        };
+        bundle_delivery(BundleHost::Desktop, finish, &held)
+    });
+    let left_release = tmp.join("out").join("release").exists();
     let _ = fs::remove_dir_all(&tmp);
-    result
+    (result, left_release)
 }
 
-/// A release desktop bundle refuses `Debug.*`.
+/// A release desktop bundle refuses `Debug.*`, and leaves no member behind.
 ///
 /// The bundle compiles under the release posture, so IPE-L0140 fires before
-/// any cargo build.
+/// any cargo build — and before the member root is claimed, so a refused
+/// release creates no `release/<slug>/`.
 #[test]
 fn release_desktop_bundle_gates_debug() {
     let consented = ConsentedCapabilities::admitted(crate::run_sandbox::ResolvedCapabilities {
         inferred: std::collections::BTreeSet::new(),
         declared: std::collections::BTreeSet::new(),
     });
-    let result = bundle_debug_desktop(
-        NativeFinish::Release {
-            consented: &consented,
-            driver: ipe_backend_rust::DbDriver::Sqlite,
-        },
-        "release-desktop-debug",
-    );
+    let (result, left_release) = bundle_debug_desktop(Some(&consented), "release-desktop-debug");
     assert!(
         is_debug_gate(&result),
         "a release desktop bundle refuses Debug.log with IPE-L0140: {result:?}"
+    );
+    assert!(
+        !left_release,
+        "a release refused at emit leaves no release member directory"
     );
 }
 
@@ -5962,20 +6001,21 @@ fn dev_desktop_bundle_admits_debug() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let result = bundle_debug_desktop(NativeFinish::Dev, "dev-desktop-debug");
+    let (result, _) = bundle_debug_desktop(None, "dev-desktop-debug");
     assert!(
         !matches!(&result, Err(CliError::Pipeline { .. } | CliError::Usage(_))),
         "a dev desktop bundle compiles a Debug.log app past every gate: {result:?}"
     );
 }
 
-/// Every `release build` row of the derivation yields an artifact or a typed refusal.
+/// Every `release build` row of the derivation yields a static triple, none,
+/// or a typed refusal.
 ///
 /// A release takes no wasm target from either source, builds no WASI module,
-/// derives the browser bundle from `web client` alone, and refuses a `wasm`
-/// block on a delivery with no client form.
+/// derives the browser bundle (no static triple) from `web client` alone, and
+/// refuses a `wasm` block on a delivery with no client form.
 #[test]
-fn release_artifact_table() {
+fn release_static_triple_table() {
     use crate::delivery::{DeliveryError, Runtime, TargetSource, TargetTriple};
     use cli_args::StaticTriple;
     let client = web_delivery(Some(Runtime::Client));
@@ -6021,8 +6061,8 @@ fn release_artifact_table() {
                 DeliveryError::WasmTargetRequiresClient,
             )),
         ),
-        (client, None, None, false, Ok(ReleaseArtifact::Browser)),
-        (client, None, None, true, Ok(ReleaseArtifact::Browser)),
+        (client, None, None, false, Ok(None)),
+        (client, None, None, true, Ok(None)),
         (
             served,
             None,
@@ -6037,41 +6077,28 @@ fn release_artifact_table() {
             false,
             Err(TargetRefusal::NoWasi),
         ),
-        (
-            served,
-            None,
-            None,
-            false,
-            Ok(ReleaseArtifact::Native(StaticTriple::default())),
-        ),
-        (
-            served,
-            Some(arm),
-            None,
-            false,
-            Ok(ReleaseArtifact::Native(arm)),
-        ),
+        (served, None, None, false, Ok(None)),
+        (served, Some(arm), None, false, Ok(Some(arm))),
         (
             script,
             None,
             Some(TargetTriple::Native(arm)),
             false,
-            Ok(ReleaseArtifact::Native(arm)),
+            Ok(Some(arm)),
         ),
     ];
     for (delivery, flag, env, wasm_block, expected) in rows {
         assert_eq!(
-            release_artifact(delivery, flag, env, wasm_block),
+            release_static_triple(delivery, flag, env, wasm_block),
             expected,
-            "release artifact for {delivery:?} flag={flag:?} env={env:?} wasm_block={wasm_block}"
+            "release static triple for {delivery:?} flag={flag:?} env={env:?} wasm_block={wasm_block}"
         );
     }
 }
 
-/// A release refuses a browser target named by the flag, and each artifact
-/// compiles for its own engine.
+/// A release refuses a browser target named by the flag.
 #[test]
-fn release_flag_wasm_refused_and_artifact_engines() {
+fn release_flag_wasm_refused() {
     use crate::delivery::{DeliveryError, Runtime, TargetSource, TargetTriple};
     for delivery in [web_delivery(None), web_delivery(Some(Runtime::Client))] {
         assert_eq!(
@@ -6088,14 +6115,6 @@ fn release_flag_wasm_refused_and_artifact_engines() {
             "a release of {delivery:?} refuses `--target wasm` naming the flag"
         );
     }
-    assert_eq!(
-        ReleaseArtifact::Browser.compile_target(),
-        CompileTarget::WasmClient
-    );
-    assert_eq!(
-        ReleaseArtifact::Native(cli_args::StaticTriple::Aarch64LinuxMusl).compile_target(),
-        CompileTarget::Native
-    );
 }
 
 /// A target handed to an app-bundle delivery is refused before any bundle.

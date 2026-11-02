@@ -228,8 +228,9 @@ pub enum Host {
     #[default]
     Default,
     /// `desktop`. Under `served` it is **webview-native** (the diff/patch
-    /// pipeline over a local IPC bridge); under `client` it is **webview-wasm**
-    /// (the self-contained client wrapped in a `wry` shell).
+    /// pipeline over a local IPC bridge). Under `client` the delivery resolves,
+    /// but no packer builds it, so every build of it is refused
+    /// ([`DeliveryError::ClientDesktopHasNoPacker`]).
     Desktop,
     /// `ios` — a wasm client in `WKWebView` plus a native shell. `client` only.
     Ios,
@@ -809,6 +810,12 @@ pub enum DeliveryError {
         /// The `client` delivery.
         delivery: Delivery,
     },
+    /// A `web client desktop` delivery was asked to build.
+    ///
+    /// No packer wraps the self-contained client in a desktop shell, so the
+    /// delivery is refused rather than built as another one with its `client`
+    /// word dropped.
+    ClientDesktopHasNoPacker,
     /// A runtime (`client`) or host (`desktop`/`ios`/`android`) token was given
     /// more than once. Each axis accepts exactly one value; a second token on
     /// the same axis is a conflict, not a last-wins override.
@@ -997,6 +1004,9 @@ impl fmt::Display for DeliveryError {
             }
             Self::WatchServesOnly { delivery } => {
                 f.write_str(&text::delivery_watch_serves_only(delivery))
+            }
+            Self::ClientDesktopHasNoPacker => {
+                f.write_str(text::delivery_client_desktop_has_no_packer())
             }
             Self::DuplicateToken { kind, got } => {
                 f.write_str(&text::delivery_duplicate_token(kind, got))
@@ -1354,6 +1364,7 @@ mod tests {
             DeliveryError::WatchServesOnly {
                 delivery: Delivery::web_client(),
             },
+            DeliveryError::ClientDesktopHasNoPacker,
         ];
         for c in &cases {
             assert!(c.to_string().len() > 40, "a refusal is a lesson: {c}");
