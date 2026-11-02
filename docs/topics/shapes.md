@@ -193,9 +193,9 @@ main =
 A line with no active `onLine` subscription is ignored. Passing `onLine` as a
 `Cli.tea` config field is **IPE-N0052**.
 
-On a terminal each render is styled and a prompt keeps the cursor on its line.
-When stdout is a pipe or a file, each render is written as plain lines (no
-escape sequences) ending in a newline, so scripts can read the output.
+How a render reaches the terminal (prompt vs. plain-line output, styling,
+and the documented divergences) is the `Ipe.Ui.Cli` module doc's contract —
+see [`ipe doc Ipe.Ui.Cli`](../reference/stdlib/Ui.Cli.md).
 
 The scaffolded echo REPL (type text, `q` quits):
 

@@ -15,6 +15,48 @@
 -- `text` is the plain-string escape hatch: `Cli.text s` renders `s` as one
 -- line. `Cli.tea`'s `view` field returns `Lines msg`, so `text` is the bridge
 -- for a view that only wants to emit a plain string.
+--
+-- ## How a `Lines msg` view reaches the terminal
+--
+-- `Cli.tea` decides its output surface once, at startup, from the gathered
+-- terminal facts (whether stdout is a TTY, whether stdin is a TTY and
+-- echoing, whether they are the same terminal) — never per frame, and never
+-- by re-reading those facts mid run.
+--
+-- On an interactive, echoing terminal, each render writes its lines
+-- separated by a newline and leaves the LAST line open (no trailing
+-- newline), so the user types after the prompt. Before the next frame, an
+-- already-open line is closed with a newline first; a newline-terminated
+-- stdin line closes it too. On `System.exit` or Ctrl-C, an open line is
+-- closed with a trailing newline before the process ends.
+--
+-- Anywhere else (a pipe, a file, a non-echoing or different-terminal
+-- stdin), every line is followed by a newline, full stop: no escape
+-- sequences, no open prompt line, no padding, no clipping. A view of zero
+-- lines writes nothing. Output is then a deterministic function of the
+-- update/view sequence, so a script reading the piped output always sees
+-- the same bytes for the same run.
+--
+-- A styled line's text is wrapped in its SGR open code and a single reset
+-- (`bg` paints only the line's own text, never the rest of the row);
+-- `TERM=dumb` and a piped/file surface both write no styling at all.
+-- `NO_COLOR` drops `color`/`bg` only — bold, underline, dim, and reverse all
+-- survive, since the NO_COLOR convention governs colour, not text
+-- attributes.
+--
+-- Divergences from a naive line-by-line reading, stated here rather than
+-- left silent:
+--
+--   * A write the program makes outside its view (`Io.print`, stderr) is
+--     not tracked by the open-line bookkeeping; on the interactive surface
+--     it may land after an already-open prompt line. A piped/file surface
+--     is unaffected, since every frame there is newline-closed immediately.
+--   * A stdin line over the runtime's length limit is dropped, never
+--     delivered to `Sub.onLine`.
+--   * A terminal narrower than a line soft-wraps it; the runtime never
+--     clips program output to fit a width.
+--   * A styled background colour paints only the text's own cells, never
+--     the rest of the terminal row.
 module Ipe.Ui.Cli exposing
     ( Lines
     , none, text, line, lines
