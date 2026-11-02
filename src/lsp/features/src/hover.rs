@@ -43,9 +43,7 @@ pub fn hover(
     byte: u32,
     docs: Option<&ipe_docs::Index>,
 ) -> Option<HoverInfo> {
-    let types = ipe_db::typecheck_module(db, root, entry, module_file)
-        .as_ref()
-        .ok()?;
+    let types = crate::db_access::module_types(db, root, entry, module_file)?;
     // Innermost wins: narrowest containing span, latest start as tiebreaker.
     let mut best: Option<(u32, u32)> = None; // (width, lo)
     for span in types.regions.keys() {

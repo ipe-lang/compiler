@@ -245,17 +245,13 @@ fn add_type_annotation_action(
     let name = found_name?;
     let insert_line = annotation_line?;
 
-    // Retrieve inferred type from the solved type environment.
-    let solved = ipe_db::typecheck(db, root, entry).clone().ok()?;
+    // Retrieve inferred type from the module's solved types.
+    let types = crate::db_access::module_types(db, root, entry, file)?;
     let mut interner = db.interner().lock();
-    let home: Vec<ipe_intern::Symbol> = module
-        .iter()
-        .map(|s| interner.intern(s).ok())
-        .collect::<Option<Vec<_>>>()?;
     let name_sym = interner.intern(&name).ok()?;
     drop(interner);
 
-    let ty = solved.env.get(&(home, name_sym))?;
+    let ty = types.env.get(&name_sym)?;
     let interner = db.interner().lock();
     let mut namer = ipe_types::VarNamer::new();
     let doc = ipe_types::ty_to_doc(ty, &interner, &mut namer).ok()?;

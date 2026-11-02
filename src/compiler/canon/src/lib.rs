@@ -38,9 +38,9 @@ pub use env::{
     kernel_import_binds_last_segment, stdlib_canonical_qualifier,
 };
 pub use resolve::{
-    DO_BIND_MODULE, ModuleOrigin, QualifierForm, import_qualifier_forms, import_qualifiers,
-    is_reserved_builtin_type_name, is_stdlib_shared_carrier_type,
-    is_user_type_declaration_forbidden, to_snake_case,
+    DO_BIND_MODULE, DeclFailure, DeclaredSignature, ModuleOrigin, PartialModule, QualifierForm,
+    decl_extent, import_qualifier_forms, import_qualifiers, is_reserved_builtin_type_name,
+    is_stdlib_shared_carrier_type, is_user_type_declaration_forbidden, to_snake_case,
 };
 
 /// A type alias exported by a module, resolved in the defining module's scope.
@@ -241,6 +241,27 @@ pub fn canonicalise_module_indexed(
     interner: &mut Interner,
 ) -> DResult<(ast::Module, ModuleExports, name_index::NameIndex)> {
     resolve::canonicalise_module_indexed(m, expected_path, deps, catalog, origin, interner)
+}
+
+/// Canonicalise a module like [`canonicalise_module_indexed`], declaration by declaration.
+///
+/// A value declaration that fails is left out of the module and reported in
+/// [`PartialModule::failures`]; the rest of the module still canonicalises.
+/// [`canonicalise_module_indexed`] is this result refused with its first
+/// error, so the two never disagree on a module with no failure.
+///
+/// # Errors
+/// Every refusal of [`canonicalise_module_indexed`] that is not one value
+/// declaration's or one whole-module check's.
+pub fn canonicalise_module_partial(
+    m: &ipe_syntax::Module,
+    expected_path: &[Symbol],
+    deps: &BTreeMap<Vec<Symbol>, &ModuleExports>,
+    catalog: &ModuleCatalog,
+    origin: ModuleOrigin,
+    interner: &mut Interner,
+) -> DResult<PartialModule> {
+    resolve::canonicalise_module_partial(m, expected_path, deps, catalog, origin, interner)
 }
 
 #[cfg(test)]

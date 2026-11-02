@@ -471,15 +471,20 @@ pub fn canonicalise(m: &src::Module, interner: &mut Interner) -> DResult<canon::
     // can only be raised via `canonicalise_module_with_origin`.
     // The single-module entry does not build a `ModuleExports`, so the kernel-
     // alias map is discarded — registration + def-skip already happened in `env`.
-    canonicalise_with_env(
+    let mut failures = Vec::new();
+    let (canon_mod, _kernel_aliases, _own_aliases) = canonicalise_with_env(
         m,
         &mut env,
         &QualifiedAliases::new(),
         ModuleOrigin::User,
         interner,
         &mut NameSink::new(),
-    )
-    .map(|(canon_mod, _kernel_aliases, _own_aliases)| canon_mod)
+        &mut failures,
+    )?;
+    failures
+        .into_iter()
+        .next()
+        .map_or(Ok(canon_mod), |failure| Err(failure.error))
 }
 
 /// Canonicalise a module in a multi-module project context.
@@ -587,11 +592,12 @@ pub fn canonicalise_module_in_project(
 /// Canonicalise a module in a project, with the index of every name it resolved.
 ///
 /// Identical to [`canonicalise_module_in_project`]; the [`NameIndex`] is
-/// recorded by the same resolution pass that builds the module.
+/// recorded by the same resolution pass that builds the module. The module is
+/// [`canonicalise_module_partial`]'s, refused with its first error when any
+/// declaration or module check failed.
 ///
 /// # Errors
 /// Same set as [`canonicalise_module_in_project`].
-#[allow(clippy::too_many_lines)] // one linear resolution pass over a module's declarations
 pub fn canonicalise_module_indexed(
     m: &src::Module,
     expected_path: &[Symbol],
@@ -600,6 +606,100 @@ pub fn canonicalise_module_indexed(
     origin: ModuleOrigin,
     interner: &mut Interner,
 ) -> DResult<(canon::Module, crate::ModuleExports, NameIndex)> {
+    let partial = canonicalise_module_partial(m, expected_path, deps, catalog, origin, interner)?;
+    let PartialModule {
+        module,
+        exports,
+        names,
+        failures,
+        module_errors,
+    } = partial;
+    failures
+        .into_iter()
+        .map(|failure| failure.error)
+        .chain(module_errors)
+        .next()
+        .map_or(Ok((module, exports, names)), Err)
+}
+
+/// A value declaration whose annotation resolved although its body failed.
+#[derive(Clone, PartialEq, Debug)]
+pub struct DeclaredSignature {
+    /// The declared name, at its declaration.
+    pub name: Located<Symbol>,
+    /// The annotation's quantified type variables, ordered by resolved name.
+    pub free_vars: Vec<Symbol>,
+    /// The canonical annotation.
+    pub ty: canon::Type,
+    /// Whether the declaration binds parameters.
+    pub has_params: bool,
+}
+
+/// One value declaration that failed to canonicalise.
+#[derive(Clone, PartialEq, Debug)]
+pub struct DeclFailure {
+    /// The declared name.
+    pub name: Symbol,
+    /// The source extent of the declaration, annotation included.
+    pub extent: Span,
+    /// Why it failed.
+    pub error: Diagnostic,
+    /// Its annotation, when that resolved on its own.
+    pub signature: Option<DeclaredSignature>,
+}
+
+/// A module canonicalised declaration by declaration.
+///
+/// Every value declaration that failed is left out of [`Self::module`] and
+/// listed in [`Self::failures`] in source order; its name stays bound, so an
+/// occurrence of it resolves to this module, never to an import.
+#[derive(Clone, PartialEq, Debug)]
+pub struct PartialModule {
+    /// The module without its failed declarations.
+    pub module: canon::Module,
+    /// The module's export surface.
+    pub exports: crate::ModuleExports,
+    /// Every name occurrence that resolved.
+    pub names: NameIndex,
+    /// The failed value declarations, in source order.
+    pub failures: Vec<DeclFailure>,
+    /// The whole-module checks that refused the module, in check order.
+    pub module_errors: Vec<Diagnostic>,
+}
+
+/// The source extent of a value declaration, its annotation included.
+#[must_use]
+pub fn decl_extent(value: &Located<src::Value>) -> Span {
+    value
+        .value
+        .type_annotation
+        .as_ref()
+        .map_or(value.span, |ann| Span {
+            lo: value.span.lo.min(ann.span.lo),
+            hi: value.span.hi.max(ann.span.hi),
+        })
+}
+
+/// Canonicalise a module in a project, collecting each declaration's failure.
+///
+/// A failure in the module header, an import, a type or alias declaration, or
+/// the binding of a value name refuses the whole module. A value whose body or
+/// annotation fails is recorded in [`PartialModule::failures`] and the next
+/// declaration is canonicalised; a whole-module check that fails afterwards is
+/// recorded in [`PartialModule::module_errors`].
+///
+/// # Errors
+/// Every refusal of [`canonicalise_module_in_project`] that is not one value
+/// declaration's or one module check's.
+#[allow(clippy::too_many_lines)] // one linear resolution pass over a module's declarations
+pub fn canonicalise_module_partial(
+    m: &src::Module,
+    expected_path: &[Symbol],
+    deps: &BTreeMap<Vec<Symbol>, &crate::ModuleExports>,
+    catalog: &crate::ModuleCatalog,
+    origin: ModuleOrigin,
+    interner: &mut Interner,
+) -> DResult<PartialModule> {
     let home = m.name.value.clone();
 
     // IPE-N0023: declared module name must match the path the build driver
@@ -807,6 +907,7 @@ pub fn canonicalise_module_indexed(
     }
 
     let mut names = NameSink::new();
+    let mut failures = Vec::new();
     let (mut canon_mod, kernel_aliases, own_aliases) = canonicalise_with_env(
         m,
         &mut env,
@@ -814,6 +915,7 @@ pub fn canonicalise_module_indexed(
         origin,
         interner,
         &mut names,
+        &mut failures,
     )?;
     // The record-alias auto-constructors that were actually synthesized:
     // exactly the defs whose name is an alias name. A function-field alias is
@@ -837,24 +939,9 @@ pub fn canonicalise_module_indexed(
     // deep-stdlib unification failure (or exit-0-then-cargo-fail) into an explicit
     // build-time invariant. It can never fire for user code (User origin skips
     // this block); synthesised record-alias ctors are `Def::Typed`, so they pass.
-    if matches!(
-        origin,
-        ModuleOrigin::EmbeddedStdlib | ModuleOrigin::FfiInterface
-    ) {
-        for d in &canon_mod.defs {
-            if let canon::Def::Untyped { name, .. } = d {
-                let binding = name_str(interner, name.value)?;
-                let module = path_to_dot_string(interner, &home);
-                return Err(Diagnostic::CompilerBug {
-                    where_: "canon.stdlib_unannotated",
-                    detail: format!(
-                        "compiled-source stdlib module `{module}` binding `{binding}` \
-                         must carry a type annotation (annotation-driven generalisation \
-                         is required for stdlib modules)"
-                    ),
-                });
-            }
-        }
+    let mut module_errors = Vec::new();
+    if let Err(error) = check_stdlib_annotated(&canon_mod, origin, &home, interner) {
+        module_errors.push(error);
     }
 
     // Build the export surface from the module's own `exposing (…)` clause.
@@ -873,18 +960,63 @@ pub fn canonicalise_module_indexed(
     // `Ipe.Web.Console` helpers are static and never import a shape, and only
     // USER modules are subject to the Program/TEA distinction.
     if origin == ModuleOrigin::User {
-        check_main_not_runtime_branched(&canon_mod, interner)?;
-        check_program_tea_import_gate(m, &canon_mod, interner)?;
-        check_cross_shape_cmd_sub_gate(m, &canon_mod, interner)?;
-        check_input_fields_are_subscriptions(&canon_mod, interner)?;
-        check_library_ssot_import_gate(m, interner)?;
+        let checks = [
+            check_main_not_runtime_branched(&canon_mod, interner),
+            check_program_tea_import_gate(m, &canon_mod, interner),
+            check_cross_shape_cmd_sub_gate(m, &canon_mod, interner),
+            check_input_fields_are_subscriptions(&canon_mod, interner),
+            check_library_ssot_import_gate(m, interner),
+        ];
+        module_errors.extend(checks.into_iter().filter_map(Result::err));
         // Thread a sibling top-level `config` binding into the app entry
         // (`main = Web.tea { … }` becomes `Web.appWith config { … }`), or reject
         // a `config` binding that no app entry consumes (IPE-N0043).
-        thread_config_binding(&mut canon_mod, interner)?;
+        if module_errors.is_empty()
+            && let Err(error) = thread_config_binding(&mut canon_mod, interner)
+        {
+            module_errors.push(error);
+        }
     }
 
-    Ok((canon_mod, exports, names.finish()))
+    Ok(PartialModule {
+        module: canon_mod,
+        exports,
+        names: names.finish(),
+        failures,
+        module_errors,
+    })
+}
+
+/// Refuse an un-annotated top-level binding in a compiled-source stdlib or FFI module.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] naming the first un-annotated binding.
+fn check_stdlib_annotated(
+    canon_mod: &canon::Module,
+    origin: ModuleOrigin,
+    home: &[Symbol],
+    interner: &Interner,
+) -> DResult<()> {
+    if matches!(
+        origin,
+        ModuleOrigin::EmbeddedStdlib | ModuleOrigin::FfiInterface
+    ) {
+        for d in &canon_mod.defs {
+            if let canon::Def::Untyped { name, .. } = d {
+                let binding = name_str(interner, name.value)?;
+                let module = path_to_dot_string(interner, home);
+                return Err(Diagnostic::CompilerBug {
+                    where_: "canon.stdlib_unannotated",
+                    detail: format!(
+                        "compiled-source stdlib module `{module}` binding `{binding}` \
+                         must carry a type annotation (annotation-driven generalisation \
+                         is required for stdlib modules)"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The reserved name of the app's cross-cutting settings binding — a top-level
@@ -2822,6 +2954,7 @@ fn canonicalise_with_env(
     origin: ModuleOrigin,
     interner: &mut Interner,
     names: &mut NameSink,
+    failures: &mut Vec<DeclFailure>,
 ) -> DResult<CanonicalisedModule> {
     let home = env.home.clone();
 
@@ -2993,12 +3126,27 @@ fn canonicalise_with_env(
         if kernel_aliases.contains_key(&v.value.name.value) {
             continue;
         }
-        defs.push(canonicalise_value(
-            &v.value,
-            env,
-            qualified_aliases,
-            &mut cx,
-        )?);
+        match canonicalise_value(&v.value, env, qualified_aliases, &mut cx) {
+            Ok(def) => defs.push(def),
+            Err(error) => {
+                let signature = v.value.type_annotation.as_ref().and_then(|ann| {
+                    canonicalise_annotation(ann, env, qualified_aliases, cx.interner)
+                        .ok()
+                        .map(|(free_vars, ty)| DeclaredSignature {
+                            name: v.value.name,
+                            free_vars,
+                            ty,
+                            has_params: !v.value.patterns.is_empty(),
+                        })
+                });
+                failures.push(DeclFailure {
+                    name: v.value.name.value,
+                    extent: decl_extent(v),
+                    error,
+                    signature,
+                });
+            }
+        }
     }
     // The synthesized constructor defs are already fully canonical.
     defs.extend(synth_ctor_defs);
@@ -5259,32 +5407,8 @@ fn canonicalise_value(
             body,
         }),
         Some(ann) => {
-            let mut free_vars = BTreeSet::new();
-            let mut visited = Vec::new();
-            let ctx = TypeCtx {
-                env,
-                qualified_aliases,
-                interner: cx.interner,
-                ann_span: ann.span,
-            };
-            let no_params = ParamSlots::empty();
-            let mut budget = TYPE_EXPANSION_NODE_LIMIT;
-            let ty = canonicalise_type(
-                &ann.value,
-                &ctx,
-                &no_params,
-                &mut free_vars,
-                &mut visited,
-                &mut budget,
-                0,
-            )?;
-            // Order the quantified type variables by their resolved NAME, not by
-            // `Symbol` id (intern order is allocation-dependent, hence not a
-            // stable wire order). Determinism gate: a multi-tyvar annotation
-            // must yield the same `free_vars` regardless of how the interner
-            // happened to number the names.
-            let mut free_vars: Vec<Symbol> = free_vars.into_iter().collect();
-            free_vars.sort_by(|a, b| cx.interner.resolve(*a).cmp(&cx.interner.resolve(*b)));
+            let (free_vars, ty) =
+                canonicalise_annotation(ann, env, qualified_aliases, cx.interner)?;
             Ok(canon::Def::Typed {
                 home: env.home.clone(),
                 name: val.name,
@@ -5295,6 +5419,45 @@ fn canonicalise_value(
             })
         }
     }
+}
+
+/// Canonicalise a value's annotation, with its quantified variables ordered by name.
+///
+/// # Errors
+/// Any refusal the annotation's canonicalisation raises.
+fn canonicalise_annotation(
+    ann: &Located<src::TypeAnnotation>,
+    env: &Env,
+    qualified_aliases: &QualifiedAliases,
+    interner: &Interner,
+) -> DResult<(Vec<Symbol>, canon::Type)> {
+    let mut free_vars = BTreeSet::new();
+    let mut visited = Vec::new();
+    let ctx = TypeCtx {
+        env,
+        qualified_aliases,
+        interner,
+        ann_span: ann.span,
+    };
+    let no_params = ParamSlots::empty();
+    let mut budget = TYPE_EXPANSION_NODE_LIMIT;
+    let ty = canonicalise_type(
+        &ann.value,
+        &ctx,
+        &no_params,
+        &mut free_vars,
+        &mut visited,
+        &mut budget,
+        0,
+    )?;
+    // Order the quantified type variables by their resolved NAME, not by
+    // `Symbol` id (intern order is allocation-dependent, hence not a
+    // stable wire order). Determinism gate: a multi-tyvar annotation
+    // must yield the same `free_vars` regardless of how the interner
+    // happened to number the names.
+    let mut free_vars: Vec<Symbol> = free_vars.into_iter().collect();
+    free_vars.sort_by(|a, b| interner.resolve(*a).cmp(&interner.resolve(*b)));
+    Ok((free_vars, ty))
 }
 
 /// Bind every variable a pattern introduces as a local, recording each binder.

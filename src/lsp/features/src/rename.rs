@@ -209,6 +209,11 @@ pub fn rename(
         return None;
     }
     let files = root.files(db);
+    // A rename edits every occurrence, so a module whose index misses the
+    // occurrences of a failed declaration refuses it.
+    if !crate::db_access::analysis(db, root, entry, *files.get(&def.module)?)?.complete {
+        return None;
+    }
     let old_name = def.target.name();
     if span_text(files.get(&def.module)?.text(db), def.span)? != old_name {
         return None;
@@ -299,7 +304,11 @@ fn declared_sites(
         let Some(&module_file) = files.get(module_path) else {
             continue;
         };
-        let canonical = crate::db_access::canonicalize_checked(db, root, entry, module_file)?;
+        let analysis = crate::db_access::analysis(db, root, entry, module_file)?;
+        if !analysis.complete {
+            return None;
+        }
+        let canonical = analysis.canonical;
         let mut interner = db.interner().lock();
         let path = intern_path(&mut interner, module_path);
         drop(interner);
@@ -437,8 +446,12 @@ fn refuse_capture(
     for module in touched {
         let &file = files.get(module)?;
         let text = file.text(db);
-        let canonical = crate::db_access::canonicalize_checked(db, root, entry, file)?;
-        if canonical
+        let analysis = crate::db_access::analysis(db, root, entry, file)?;
+        if !analysis.complete {
+            return None;
+        }
+        if analysis
+            .canonical
             .names
             .entries()
             .any(|(span, _)| name_token(text, span, new_name).is_some())

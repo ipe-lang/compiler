@@ -195,7 +195,7 @@ fn no_raw_canonicalize_on_interactive_path() -> Result<(), Box<dyn std::error::E
         let count = content.matches(raw_call).count();
         assert!(
             count == 0,
-            "{name} contains {count} raw `{raw_call}` call(s); use `db_access::canonicalize_checked` instead"
+            "{name} contains {count} raw `{raw_call}` call(s); use `db_access::analysis` instead"
         );
     }
     Ok(())
