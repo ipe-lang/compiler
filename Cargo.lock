@@ -3470,6 +3470,7 @@ dependencies = [
  "ipe_db",
  "ipe_diagnostics",
  "ipe_docs",
+ "ipe_fs_open",
  "ipe_lint",
  "ipe_lsp_features",
  "ipe_stdlib",
