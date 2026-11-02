@@ -317,3 +317,123 @@ fn release_env_wasm_is_refused_end_to_end() {
     );
     assert!(!wrote, "a refused release writes no output");
 }
+
+/// A served web project at `root` declaring `ships`, its manifest and `Main`
+/// written through the scratch steps of test `name`.
+fn web_project(name: &str, ships: &str) -> std::path::PathBuf {
+    let root = support::scratch_root().join(name);
+    let _ = std::fs::remove_dir_all(&root);
+    support::expect_scratch_step(name, std::fs::create_dir_all(root.join("src")));
+    let manifest = if ships.is_empty() {
+        support::package_ipe(name)
+    } else {
+        format!(
+            "module Package exposing (package)\n\n\npackage =\n    {{ name = {name:?}, delivery = {{ ships = [ {ships} ] }} }}\n"
+        )
+    };
+    support::expect_scratch_step(name, std::fs::write(root.join("package.ipe"), manifest));
+    support::expect_scratch_step(
+        name,
+        std::fs::write(root.join("src").join("Main.ipe"), SERVED_APP),
+    );
+    root
+}
+
+/// Run `ipe` with `args`, then remove `root`: the exit success, stderr, and
+/// whether `out` existed before the cleanup.
+#[allow(clippy::panic)] // test assertion: an `ipe` binary that cannot spawn IS the failure
+fn run_ipe(
+    root: &std::path::Path,
+    out: &std::path::Path,
+    args: &[&std::ffi::OsStr],
+) -> (bool, String, bool) {
+    let output = std::process::Command::new(support::ipe_bin())
+        .args(args)
+        .env("NO_COLOR", "1")
+        .output();
+    let wrote = out.exists();
+    let _ = std::fs::remove_dir_all(root);
+    let output = match output {
+        Ok(output) => output,
+        Err(e) => panic!("spawn `ipe`: {e}"),
+    };
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        wrote,
+    )
+}
+
+/// `release build web client desktop`, which no packer builds, is refused
+/// before anything is emitted.
+#[test]
+fn release_build_web_client_desktop_is_refused_before_any_build() {
+    let root = web_project("release_client_desktop_refused", "");
+    let out = root.join("out");
+    let (ok, stderr, wrote) = run_ipe(
+        &root,
+        &out,
+        &[
+            "release".as_ref(),
+            "build".as_ref(),
+            root.as_os_str(),
+            "web".as_ref(),
+            "client".as_ref(),
+            "desktop".as_ref(),
+            "--out".as_ref(),
+            out.as_os_str(),
+        ],
+    );
+    assert!(!ok, "`web client desktop` must refuse: {stderr}");
+    assert!(
+        stderr.contains("web client desktop"),
+        "names the delivery: {stderr}"
+    );
+    assert!(!wrote, "a refused release writes no output");
+}
+
+/// `dev build web client desktop` is refused with the same reason.
+#[test]
+fn dev_build_web_client_desktop_is_refused() {
+    let root = web_project("dev_client_desktop_refused", "");
+    let out = root.join("out");
+    let (ok, stderr, wrote) = run_ipe(
+        &root,
+        &out,
+        &[
+            "dev".as_ref(),
+            "build".as_ref(),
+            root.as_os_str(),
+            "web".as_ref(),
+            "client".as_ref(),
+            "desktop".as_ref(),
+        ],
+    );
+    assert!(!ok, "`web client desktop` must refuse: {stderr}");
+    assert!(
+        stderr.contains("web client desktop"),
+        "names the delivery: {stderr}"
+    );
+    assert!(!wrote, "a refused build writes no output");
+}
+
+/// A remedy line names the project dir the user typed, so running the printed
+/// command acts on the same project.
+#[test]
+fn remedy_lines_keep_the_project_dir_the_user_typed() {
+    let root = web_project("remedy_keeps_typed_dir", "binary, client");
+    let out = root.join("out");
+    let (ok, stderr, _) = run_ipe(
+        &root,
+        &out,
+        &["dev".as_ref(), "run".as_ref(), root.as_os_str()],
+    );
+    let typed = root.display();
+    assert!(!ok, "two declared deliveries must ask which: {stderr}");
+    for remedy in [
+        format!("ipe dev run {typed} web"),
+        format!("ipe dev run {typed} web client"),
+    ] {
+        assert!(stderr.contains(&remedy), "offers `{remedy}`: {stderr}");
+    }
+}

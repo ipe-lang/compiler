@@ -499,6 +499,10 @@ a co-located `wasm32-wasip1` build cannot carry a `client` delivery. `client` is
 
 `ipe dev watch` rebuilds and restarts a served program, and `{delivery}` is a browser bundle with no server to restart. Build the bundle with `ipe dev build {delivery}`.
 
+## delivery-client-desktop-has-no-packer
+
+`web client desktop` names a desktop shell around the self-contained client, and no packer builds that shell yet, so nothing is built. Build the browser client with `web client`, or the desktop app with `web desktop`.
+
 ## delivery-wasi-requires-direct-shape
 
 a co-located `wasm32-wasip1` build carries only a `Direct` script (a plain `Task Error ()` `main`), but this is a `{shape}` app. A `tui`/`cli`/`web` TEA loop needs the reactor spine, which does not build on WASI. Build the `{shape}` app natively, or ship a `Direct` script to `wasm32-wasip1`.
@@ -1533,10 +1537,6 @@ package.ipe declares `{delivery}` twice in `ships`. A delivery is shipped once; 
 
 package.ipe declares several deliveries in `ships`, and `ipe {command}` builds one at a time. Name the delivery to build:
 {choices}
-
-## ships-release-slot-shared
-
-package.ipe declares `{first}` and `{second}` in `ships`, and both release into the same place under `release/`, so the second would overwrite the first. Keep one of them in `ships`, and release the other on its own with `ipe release build {second}`.
 
 ## ships-shape-mismatch
 

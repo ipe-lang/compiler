@@ -23,9 +23,11 @@
 use std::path::PathBuf;
 
 use ipe_backend_rust::static_build::StaticTriple;
+use ipe_fs_open::EntryName;
 
 use crate::CliError;
 use crate::delivery::{Delivery, DeliveryError, Host, RetiredRuntimeWord, Runtime, Shape};
+use crate::pack::mobile::MobileOs;
 
 /// The third delivery axis a co-located binary carries.
 ///
@@ -164,6 +166,134 @@ pub fn ship_constructor(builder: &str) -> String {
     })
 }
 
+/// The packer a bundle delivery goes through.
+///
+/// `desktop` routes to the webview-native desktop packager, `ios`/`android`
+/// to the mobile system-webview packager. Only [`release_route`] builds one
+/// from a delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleHost {
+    /// `web desktop` — a self-contained per-OS desktop bundle for the host OS.
+    Desktop,
+    /// `web client ios` / `web client android` — a native mobile system-webview shell.
+    Mobile(MobileOs),
+}
+
+/// How a delivery is built: the native binary, the browser bundle, or an app bundle.
+///
+/// [`release_route`] is its one producer; the release writer and the release
+/// dedupe key both read it, so they cannot disagree on a delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseRoute {
+    /// The native binary, served or shape-led.
+    Native,
+    /// The browser client bundle.
+    Browser,
+    /// An app bundle through the packer for one host.
+    Bundle(BundleHost),
+}
+
+/// The route a resolved delivery is built through.
+///
+/// Exhaustive over `(host, runtime)` with no wildcard, so a new host or
+/// runtime forces a decision here.
+///
+/// # Errors
+/// [`DeliveryError::ClientDesktopHasNoPacker`] for `web client desktop`, which
+/// no packer builds; [`DeliveryError::ServedHostNotMobile`] for a served mobile
+/// host, which [`Delivery::resolve`] never admits.
+pub const fn release_route(delivery: Delivery) -> Result<ReleaseRoute, DeliveryError> {
+    match (delivery.host(), delivery.runtime()) {
+        (Host::Default, Some(Runtime::Served) | None) => Ok(ReleaseRoute::Native),
+        (Host::Default, Some(Runtime::Client)) => Ok(ReleaseRoute::Browser),
+        (Host::Desktop, Some(Runtime::Served) | None) => {
+            Ok(ReleaseRoute::Bundle(BundleHost::Desktop))
+        }
+        (Host::Desktop, Some(Runtime::Client)) => Err(DeliveryError::ClientDesktopHasNoPacker),
+        (Host::Ios, Some(Runtime::Client)) => {
+            Ok(ReleaseRoute::Bundle(BundleHost::Mobile(MobileOs::Ios)))
+        }
+        (Host::Android, Some(Runtime::Client)) => {
+            Ok(ReleaseRoute::Bundle(BundleHost::Mobile(MobileOs::Android)))
+        }
+        (host @ (Host::Ios | Host::Android), Some(Runtime::Served) | None) => {
+            Err(DeliveryError::ServedHostNotMobile { host })
+        }
+    }
+}
+
+/// The directory name one release member writes under `release/`.
+///
+/// One path segment over `[a-z0-9._-]`: non-empty, no leading `.`, at most
+/// [`MAX_SLUG_BYTES`] bytes, and one [`EntryName`]. Built only by
+/// [`PlannedDelivery::slug`] (and read back by [`ReleaseSlug::listed`]), so
+/// every member place is a function of its release identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseSlug {
+    text: String,
+    name: EntryName,
+}
+
+/// The longest slug, in bytes: one path component on every supported filesystem.
+pub const MAX_SLUG_BYTES: usize = 255;
+
+impl ReleaseSlug {
+    /// Parse `text` against the slug grammar.
+    fn parse(text: String) -> Option<Self> {
+        let grammar = !text.is_empty()
+            && text.len() <= MAX_SLUG_BYTES
+            && !text.starts_with('.')
+            && text.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'_' | b'-')
+            });
+        if !grammar {
+            return None;
+        }
+        let name = EntryName::new(std::ffi::OsStr::new(&text))?;
+        Some(Self { text, name })
+    }
+
+    /// The slug a listed `release/` entry spells, or `None` for any other name.
+    #[must_use]
+    pub fn listed(name: &EntryName) -> Option<Self> {
+        name.as_os_str()
+            .to_str()
+            .and_then(|text| Self::parse(text.to_owned()))
+    }
+
+    /// The slug text, one path component.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    /// The slug as the one entry name a held directory opens.
+    #[must_use]
+    pub const fn entry_name(&self) -> &EntryName {
+        &self.name
+    }
+}
+
+/// The one spelling of a remedy command a refusal prints.
+///
+/// The project dir rides after the verb exactly as the user typed it, so the
+/// printed line is the one that clears the refusal.
+#[derive(Debug, Clone, Copy)]
+pub struct Remedy;
+
+impl Remedy {
+    /// `ipe <verb> [<dir>] <words>`.
+    #[must_use]
+    pub fn command(verb: &str, dir: Option<&str>, words: &str) -> String {
+        dir.map_or_else(
+            || format!("ipe {verb} {words}"),
+            |dir| format!("ipe {verb} {dir} {words}"),
+        )
+    }
+}
+
 /// A resolved delivery paired with its target axis — one member of a set.
 ///
 /// Every field is already validated: the [`Delivery`] passed through
@@ -190,29 +320,56 @@ impl PlannedDelivery {
     /// The cross triple a release builds this member for, or `None` for the
     /// default static triple (a release links statically on either host axis).
     #[must_use]
-    pub const fn release_triple(self) -> Option<StaticTriple> {
+    pub fn release_triple(self) -> Option<StaticTriple> {
         match self.target {
-            BinaryTarget::Cross(triple) => Some(triple),
+            BinaryTarget::Cross(triple) => Some(triple).filter(|t| *t != StaticTriple::default()),
             BinaryTarget::Host | BinaryTarget::Static => None,
         }
     }
 
-    /// The output directory slug for this delivery under the `release/` root —
-    /// the delivery's CLI words joined by `-`, with a target suffix when the
-    /// target is not the host. Injective over a duplicate-free set, so the
-    /// per-slug directories never collide.
-    #[must_use]
-    pub fn slug(self) -> String {
-        let mut slug = self.delivery.to_string().replace(' ', "-");
-        match self.target {
-            BinaryTarget::Host => {}
-            BinaryTarget::Static => slug.push_str("-static"),
-            BinaryTarget::Cross(triple) => {
-                slug.push('-');
-                slug.push_str(triple.as_str());
-            }
+    /// The release of `delivery` built for `triple`, its target normalised.
+    ///
+    /// A release links statically, so the host, the static and the default
+    /// cross target are one release; only a native route carries a triple.
+    ///
+    /// # Errors
+    /// Every [`release_route`] refusal.
+    pub fn release(
+        delivery: Delivery,
+        triple: Option<StaticTriple>,
+    ) -> Result<Self, DeliveryError> {
+        let target = match release_route(delivery)? {
+            ReleaseRoute::Native => triple
+                .filter(|t| *t != StaticTriple::default())
+                .map_or(BinaryTarget::Host, BinaryTarget::Cross),
+            ReleaseRoute::Browser | ReleaseRoute::Bundle(_) => BinaryTarget::Host,
+        };
+        Ok(Self { delivery, target })
+    }
+
+    /// The directory this member releases into under `release/`.
+    ///
+    /// The delivery's words joined by `-`, then `-<triple>` for a cross
+    /// triple. It is a function of the release identity (the delivery and its
+    /// effective triple) alone, and injective over it.
+    ///
+    /// # Errors
+    /// [`CliError::Pipeline`] carrying a compiler bug if the words ever spell
+    /// a name outside the slug grammar.
+    pub fn slug(&self) -> Result<ReleaseSlug, CliError> {
+        let mut text = self.delivery.to_string().replace(' ', "-");
+        if let Some(triple) = self.release_triple() {
+            text.push('-');
+            text.push_str(triple.as_str());
         }
-        slug
+        ReleaseSlug::parse(text.clone()).ok_or_else(|| CliError::Pipeline {
+            file: PathBuf::new(),
+            src: String::new(),
+            diag: Box::new(ipe_diagnostics::Diagnostic::CompilerBug {
+                where_: "release slug",
+                detail: format!("`{text}` is not one release directory name"),
+            }),
+        })
     }
 }
 
@@ -361,31 +518,6 @@ impl DeliverySet {
     }
 }
 
-/// Where `ipe release build` writes a member's artifact under `release/`.
-///
-/// Mirrors the release routing: a non-default host goes through the bundle
-/// packager for that host, a `client` on the default host is the browser
-/// bundle, and everything else is the one native binary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReleaseSlot {
-    /// The native binary (`release/<name>` or `release/bundle/`).
-    Native,
-    /// The browser bundle (`release/rust/www/`).
-    Browser,
-    /// The app bundle for one host (`release/dist/`).
-    Bundle(Host),
-}
-
-impl ReleaseSlot {
-    const fn of(delivery: Delivery) -> Self {
-        match (delivery.host(), delivery.runtime()) {
-            (Host::Default, Some(Runtime::Client)) => Self::Browser,
-            (Host::Default, Some(Runtime::Served) | None) => Self::Native,
-            (host @ (Host::Desktop | Host::Ios | Host::Android), _) => Self::Bundle(host),
-        }
-    }
-}
-
 /// The deliveries a package declares in `ships`, resolved once against the
 /// shape `main` pins.
 ///
@@ -430,14 +562,17 @@ impl DeclaredDeliveries {
     /// A dev build ignores a ship's target axis, so members that differ only by
     /// target are one delivery. `accepts` is the command's own admission: a
     /// member it refuses is listed with the `build` verb that does produce it,
-    /// so every listed command clears the refusal.
+    /// so every listed command clears the refusal. `dir` is the project dir as
+    /// the user typed it.
     ///
     /// # Errors
     /// [`CliError::ProjectRefused`] listing each declared delivery and its
-    /// command when the package declares more than one.
+    /// command when the package declares more than one, or naming a declared
+    /// delivery no route builds.
     pub fn sole_dev_delivery(
         &self,
         command: &str,
+        dir: Option<&str>,
         accepts: impl Fn(Delivery) -> bool,
         build: &str,
     ) -> Result<Delivery, CliError> {
@@ -447,7 +582,7 @@ impl DeclaredDeliveries {
             } else {
                 build
             };
-            format!("ipe {verb} {}", plan.delivery)
+            Remedy::command(verb, dir, &plan.delivery.to_string())
         })
         .map(PlannedDelivery::delivery)
     }
@@ -461,71 +596,65 @@ impl DeclaredDeliveries {
     ///
     /// # Errors
     /// [`CliError::ProjectRefused`] listing each declared delivery and its
-    /// command when the package declares more than one.
+    /// command when the package declares more than one, or naming a declared
+    /// delivery no route builds.
     pub fn sole_release_member(
         &self,
         command: &str,
+        dir: Option<&str>,
         build: &str,
     ) -> Result<PlannedDelivery, CliError> {
         self.sole_by(
             |plan| (plan.delivery, plan.release_triple()),
             command,
             |plan| {
-                let verb = if ReleaseSlot::of(plan.delivery) == ReleaseSlot::Native {
+                let verb = if matches!(release_route(plan.delivery), Ok(ReleaseRoute::Native)) {
                     command
                 } else {
                     build
                 };
-                plan.release_triple().map_or_else(
-                    || format!("ipe {verb} {}", plan.delivery),
-                    |triple| format!("ipe {verb} {} --target {}", plan.delivery, triple.as_str()),
-                )
+                let words = plan.release_triple().map_or_else(
+                    || plan.delivery.to_string(),
+                    |triple| format!("{} --target {}", plan.delivery, triple.as_str()),
+                );
+                Remedy::command(verb, dir, &words)
             },
         )
     }
 
     /// The set `ipe release build` given no delivery words builds: each
-    /// distinct release artifact once, `target` (argv's `--target`) overriding
-    /// every native member's declared triple.
+    /// distinct release once.
     ///
-    /// Members that release the same artifact (a host and a static binary) are
-    /// built once.
+    /// Each member's effective triple is `flag` (argv's `--target`), else its
+    /// declared triple, else `env` (a native `IPE_TARGET`). Members are keyed
+    /// by their [`ReleaseSlug`]: an equal slug is the same release and is
+    /// built once, and distinct slugs write distinct places.
     ///
     /// # Errors
-    /// [`CliError::ProjectRefused`] when two members would release different
-    /// artifacts into the same place under `release/`, so the later one would
-    /// overwrite the earlier while both were reported built.
-    pub fn for_release(self, target: Option<StaticTriple>) -> Result<DeliverySet, CliError> {
-        let artifact = |plan: PlannedDelivery| {
-            let slot = ReleaseSlot::of(plan.delivery);
-            let triple = match slot {
-                ReleaseSlot::Native => target.or_else(|| plan.release_triple()),
-                ReleaseSlot::Browser | ReleaseSlot::Bundle(_) => None,
-            };
-            (slot, plan.delivery, triple)
-        };
-        let words = |plan: PlannedDelivery| {
-            let (_, delivery, triple) = artifact(plan);
-            triple.map_or_else(
-                || delivery.to_string(),
-                |triple| format!("{delivery} --target {}", triple.as_str()),
+    /// [`CliError::ProjectRefused`] naming a declared delivery no route builds,
+    /// before anything is built; a [`PlannedDelivery::slug`] compiler bug.
+    pub fn for_release(
+        self,
+        command: &str,
+        flag: Option<StaticTriple>,
+        env: Option<StaticTriple>,
+    ) -> Result<DeliverySet, CliError> {
+        let release = |plan: PlannedDelivery| {
+            PlannedDelivery::release(
+                plan.delivery,
+                flag.or_else(|| plan.release_triple()).or(env),
             )
+            .map_err(|e| CliError::ProjectRefused(crate::text::msg::command_refusal(&command, &e)))
         };
-        let head = self.set.head;
+        let head = release(self.set.head)?;
+        let mut slugs = vec![head.slug()?];
         let mut rest: Vec<PlannedDelivery> = Vec::with_capacity(self.set.rest.len());
         for plan in self.set.rest {
-            let (slot, ..) = artifact(plan);
-            let shared = std::iter::once(head)
-                .chain(rest.iter().copied())
-                .find(|kept| artifact(*kept).0 == slot);
-            match shared {
-                None => rest.push(plan),
-                Some(kept) if artifact(kept) == artifact(plan) => {}
-                Some(kept) => {
-                    return Err(CliError::ProjectRefused(
-                        crate::text::msg::ships_release_slot_shared(&words(kept), &words(plan)),
-                    ));
-                }
+            let member = release(plan)?;
+            let slug = member.slug()?;
+            if !slugs.contains(&slug) {
+                slugs.push(slug);
+                rest.push(member);
             }
         }
         Ok(DeliverySet { head, rest })
@@ -533,6 +662,9 @@ impl DeclaredDeliveries {
 
     /// The single member distinct under `key`, or the several-deliveries refusal
     /// naming each distinct member's `choice` command.
+    ///
+    /// A declared member no route builds is refused first, so no listed
+    /// choice is a command that is refused in turn.
     fn sole_by<K: PartialEq>(
         &self,
         key: impl Fn(PlannedDelivery) -> K,
@@ -541,6 +673,9 @@ impl DeclaredDeliveries {
     ) -> Result<PlannedDelivery, CliError> {
         let mut distinct: Vec<PlannedDelivery> = Vec::new();
         for plan in self.set.planned() {
+            release_route(plan.delivery).map_err(|e| {
+                CliError::ProjectRefused(crate::text::msg::command_refusal(&command, &e))
+            })?;
             if !distinct.iter().any(|seen| key(*seen) == key(plan)) {
                 distinct.push(plan);
             }
@@ -725,7 +860,11 @@ mod tests {
             ShipEntry::ClientIos,
         ];
         let set = DeliverySet::resolve(Shape::Web, &entries).expect("web set resolves");
-        let slugs: Vec<String> = set.planned().map(PlannedDelivery::slug).collect();
+        let slugs: Vec<String> = set
+            .planned()
+            .filter_map(|plan| plan.slug().ok())
+            .map(|slug| slug.as_str().to_owned())
+            .collect();
         assert_eq!(
             slugs,
             ["web", "web-desktop", "web-client", "web-client-ios"]
@@ -779,14 +918,16 @@ mod tests {
     fn cross_binary_slug_carries_the_triple() {
         let set = DeliverySet::resolve(Shape::Cli, &[cross("aarch64-unknown-linux-musl")])
             .expect("cli cross binary resolves");
-        assert_eq!(set.head().slug(), "cli-aarch64-unknown-linux-musl");
+        let slug = set.head().slug().expect("slug");
+        assert_eq!(slug.as_str(), "cli-aarch64-unknown-linux-musl");
     }
 
     #[test]
-    fn static_binary_slug_is_suffixed() {
+    fn static_binary_releases_under_the_host_slug() {
         let set = DeliverySet::resolve(Shape::Cli, &[ShipEntry::Binary(BinaryTarget::Static)])
             .expect("cli static binary resolves");
-        assert_eq!(set.head().slug(), "cli-static");
+        let slug = set.head().slug().expect("slug");
+        assert_eq!(slug.as_str(), "cli");
     }
 
     #[test]
@@ -796,7 +937,7 @@ mod tests {
             &[ShipEntry::Binary(BinaryTarget::Host), ShipEntry::Client],
         )
         .expect("web set resolves");
-        let outcome = set.release_each(|plan| Ok(PathBuf::from(plan.slug())));
+        let outcome = set.release_each(|plan| Ok(PathBuf::from(plan.delivery().to_string())));
         assert!(outcome.all_released());
         match outcome {
             ReleaseOutcome::AllReleased(built) => assert_eq!(built.len(), 2),
@@ -818,14 +959,14 @@ mod tests {
         // Fail exactly the second delivery (client).
         let outcome = set.release_each(|plan| {
             if matches!(plan.delivery().runtime(), Some(Runtime::Client))
-                && plan.slug() == "web-client"
+                && plan.delivery() == Delivery::web_client()
             {
                 Err(CliError::Usage(crate::text::msg::command_refusal(
                     &"release",
                     &"client bundle failed",
                 )))
             } else {
-                Ok(PathBuf::from(plan.slug()))
+                Ok(PathBuf::from(plan.delivery().to_string()))
             }
         });
         assert!(!outcome.all_released());
@@ -837,5 +978,95 @@ mod tests {
             }
             other => panic!("expected Incomplete, got {other:?}"),
         }
+    }
+
+    /// Every delivery [`Delivery::resolve`] admits has exactly one release
+    /// route, except `web client desktop`, which no packer builds.
+    #[test]
+    fn release_route_is_total_over_every_resolved_delivery() {
+        let shapes = [
+            Shape::Script,
+            Shape::Tui,
+            Shape::Cli,
+            Shape::Worker,
+            Shape::Web,
+        ];
+        let runtimes = [None, Some(Runtime::Served), Some(Runtime::Client)];
+        let hosts = [Host::Default, Host::Desktop, Host::Ios, Host::Android];
+        let mut resolved = 0_usize;
+        for shape in shapes {
+            for runtime in runtimes {
+                for host in hosts {
+                    let Ok(delivery) = Delivery::resolve(shape, runtime, host) else {
+                        continue;
+                    };
+                    resolved += 1;
+                    let route = release_route(delivery);
+                    if (delivery.host(), delivery.runtime())
+                        == (Host::Desktop, Some(Runtime::Client))
+                    {
+                        assert!(
+                            matches!(route, Err(DeliveryError::ClientDesktopHasNoPacker)),
+                            "{delivery}: {route:?}"
+                        );
+                    } else {
+                        assert!(route.is_ok(), "{delivery}: {route:?}");
+                    }
+                }
+            }
+        }
+        assert!(
+            resolved > shapes.len(),
+            "the table admits web forms: {resolved}"
+        );
+    }
+
+    /// Two release identities (a delivery and its effective triple) never
+    /// share a slug, and one identity always spells the same slug.
+    #[test]
+    fn release_slugs_are_injective_over_every_release_identity() {
+        let shapes = [
+            Shape::Script,
+            Shape::Tui,
+            Shape::Cli,
+            Shape::Worker,
+            Shape::Web,
+        ];
+        let runtimes = [None, Some(Runtime::Served), Some(Runtime::Client)];
+        let hosts = [Host::Default, Host::Desktop, Host::Ios, Host::Android];
+        let triples: Vec<Option<StaticTriple>> = std::iter::once(None)
+            .chain(
+                StaticTriple::SUPPORTED
+                    .iter()
+                    .map(|t| Some(StaticTriple::parse(t).expect("supported triple"))),
+            )
+            .collect();
+        let mut seen: Vec<((Delivery, Option<StaticTriple>), String)> = Vec::new();
+        for shape in shapes {
+            for runtime in runtimes {
+                for host in hosts {
+                    let Ok(delivery) = Delivery::resolve(shape, runtime, host) else {
+                        continue;
+                    };
+                    for &triple in &triples {
+                        let Ok(plan) = PlannedDelivery::release(delivery, triple) else {
+                            continue;
+                        };
+                        let slug = plan.slug().expect("every release has a slug");
+                        let identity = (plan.delivery(), plan.release_triple());
+                        for (other, other_slug) in &seen {
+                            assert_eq!(
+                                *other == identity,
+                                *other_slug == slug.as_str(),
+                                "{other:?} / {identity:?}: {other_slug} vs {}",
+                                slug.as_str()
+                            );
+                        }
+                        seen.push((identity, slug.as_str().to_owned()));
+                    }
+                }
+            }
+        }
+        assert!(!seen.is_empty());
     }
 }

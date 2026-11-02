@@ -292,7 +292,7 @@ const UNROUTED: &[(&str, &str, usize, &str)] = &[
     (
         "driver/commands.rs",
         "admit_dev_build",
-        1,
+        2,
         "built in a file another lane owns; its route is decided there",
     ),
     (
@@ -363,8 +363,14 @@ const UNROUTED: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "driver/commands.rs",
+        "planned_release",
+        1,
+        "the delivery words argv named have no release route",
+    ),
+    (
+        "driver/commands.rs",
         "release_pipeline",
-        3,
+        4,
         "built in a file another lane owns; its route is decided there",
     ),
     (
@@ -430,12 +436,6 @@ const UNROUTED: &[(&str, &str, usize, &str)] = &[
     (
         "driver/commands_pkg.rs",
         "BundleAssembler::gate_desktop",
-        1,
-        "built in a file another lane owns; its route is decided there",
-    ),
-    (
-        "driver/commands_pkg.rs",
-        "BundleHost::from_delivery_host",
         1,
         "built in a file another lane owns; its route is decided there",
     ),

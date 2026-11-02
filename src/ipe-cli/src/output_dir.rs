@@ -1750,6 +1750,21 @@ impl OutputRoot {
         })
     }
 
+    /// Claim the release member root `release/<slug>/` for writing now.
+    ///
+    /// Every place a release member writes lies below the directory this
+    /// returns, so two members with distinct slugs never share a place.
+    ///
+    /// # Errors
+    /// As [`OutputRoot::claim_area`] and [`OwnedDir::child`].
+    pub fn release_member(
+        &self,
+        slug: &crate::delivery_set::ReleaseSlug,
+    ) -> Result<OwnedDir, CliError> {
+        self.claim_area(&[OutputArea::Release])?
+            .child(slug.as_str())
+    }
+
     /// Claim the root itself for writing now.
     ///
     /// # Errors
@@ -2440,6 +2455,69 @@ mod tests {
             Err(CliError::OutputRefused(refusal)) => Some(refusal),
             _ => None,
         }
+    }
+
+    /// The release member roots one project's `release build` claims for `ships`.
+    fn release_members(
+        proj: &ProjectPaths,
+        ships: &[crate::delivery_set::ShipEntry],
+    ) -> Vec<PathBuf> {
+        let set = crate::delivery_set::DeliverySet::resolve(crate::delivery::Shape::Web, ships)
+            .expect("web set resolves");
+        let out = OutputRoot::resolve(None, proj).expect("default out must resolve");
+        set.planned()
+            .map(|plan| {
+                let slug = plan.slug().expect("every release has a slug");
+                out.release_member(&slug)
+                    .expect("member claimed")
+                    .path()
+                    .to_path_buf()
+            })
+            .collect()
+    }
+
+    /// Each declared delivery writes its own member root `out/release/<slug>/`,
+    /// owned and distinct from every other member's.
+    #[test]
+    fn release_build_writes_each_declared_delivery_under_its_own_slug() {
+        use crate::delivery_set::{BinaryTarget, ShipEntry};
+        let base = scratch("release_members");
+        let proj = project(&base);
+        let members = release_members(
+            &proj,
+            &[
+                ShipEntry::Binary(BinaryTarget::Host),
+                ShipEntry::Client,
+                ShipEntry::Desktop,
+                ShipEntry::ClientIos,
+            ],
+        );
+        let release = proj.root.join("out").join("release");
+        let expected: Vec<PathBuf> = ["web", "web-client", "web-desktop", "web-client-ios"]
+            .iter()
+            .map(|slug| release.join(slug))
+            .collect();
+        assert_eq!(members, expected);
+        for member in &members {
+            assert!(
+                owned_at(member).expect("member marker"),
+                "{}",
+                member.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A one-delivery release still writes under its slug, never into the
+    /// shared `out/release/` itself.
+    #[test]
+    fn release_build_of_one_delivery_writes_under_its_slug() {
+        use crate::delivery_set::{BinaryTarget, ShipEntry};
+        let base = scratch("release_one_member");
+        let proj = project(&base);
+        let members = release_members(&proj, &[ShipEntry::Binary(BinaryTarget::Host)]);
+        assert_eq!(members, [proj.root.join("out").join("release").join("web")]);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -1479,9 +1479,15 @@ mod tests {
                     crate::cli_args::parse_build(&args).map(|a| a.delivery)
                 }
                 .expect("the advised verb's parser reads the command");
-                let advised =
-                    resolve_delivery(&declared_set, &positionals, false, verb.name(), ADMIT_ANY)
-                        .expect("the advised delivery resolves");
+                let advised = resolve_delivery(
+                    &declared_set,
+                    &positionals,
+                    None,
+                    false,
+                    verb.name(),
+                    ADMIT_ANY,
+                )
+                .expect("the advised delivery resolves");
                 assert_eq!(
                     advised, declared,
                     "{label}: `{command}` builds the declared delivery"
