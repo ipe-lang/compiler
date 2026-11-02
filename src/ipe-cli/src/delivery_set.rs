@@ -187,6 +187,16 @@ impl PlannedDelivery {
         self.target
     }
 
+    /// The cross triple a release builds this member for, or `None` for the
+    /// default static triple (a release links statically on either host axis).
+    #[must_use]
+    pub const fn release_triple(self) -> Option<StaticTriple> {
+        match self.target {
+            BinaryTarget::Cross(triple) => Some(triple),
+            BinaryTarget::Host | BinaryTarget::Static => None,
+        }
+    }
+
     /// The output directory slug for this delivery under the `release/` root —
     /// the delivery's CLI words joined by `-`, with a target suffix when the
     /// target is not the host. Injective over a duplicate-free set, so the
@@ -209,11 +219,15 @@ impl PlannedDelivery {
 /// The non-empty, duplicate-free set of deliveries `ipe release` produces, every
 /// element individually admitted by [`Delivery::resolve`].
 ///
-/// Constructible only through [`DeliverySet::resolve`]; the inner vector is
+/// Constructible only through [`DeliverySet::resolve`]; the fields are
 /// private. No code path can hold a set containing an invalid, duplicate, or
-/// shape-incompatible member, and none can construct an empty one.
+/// shape-incompatible member, and none can construct an empty one: the head
+/// exists by type.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeliverySet(Vec<PlannedDelivery>);
+pub struct DeliverySet {
+    head: PlannedDelivery,
+    rest: Vec<PlannedDelivery>,
+}
 
 impl DeliverySet {
     /// Resolve the declared ship entries against the shape `main` pins into a
@@ -234,23 +248,27 @@ impl DeliverySet {
     /// request the delivery cannot honour.
     pub fn resolve(pinned: Shape, entries: &[ShipEntry]) -> Result<Self, CliError> {
         // An absent `ships` field is the implicit `[ binary ]` singleton.
-        if entries.is_empty() {
+        let Some((&first, others)) = entries.split_first() else {
             let delivery = Delivery::resolve(pinned, None, Host::Default)?;
-            return Ok(Self(vec![PlannedDelivery {
-                delivery,
-                target: BinaryTarget::Host,
-            }]));
-        }
+            return Ok(Self {
+                head: PlannedDelivery {
+                    delivery,
+                    target: BinaryTarget::Host,
+                },
+                rest: Vec::new(),
+            });
+        };
 
-        let mut planned: Vec<PlannedDelivery> = Vec::with_capacity(entries.len());
-        for &entry in entries {
+        let head = Self::resolve_one(pinned, first)?;
+        let mut rest: Vec<PlannedDelivery> = Vec::with_capacity(others.len());
+        for &entry in others {
             let plan = Self::resolve_one(pinned, entry)?;
-            if planned.contains(&plan) {
+            if plan == head || rest.contains(&plan) {
                 return Err(duplicate_entry(entry));
             }
-            planned.push(plan);
+            rest.push(plan);
         }
-        Ok(Self(planned))
+        Ok(Self { head, rest })
     }
 
     /// Resolve one ship entry against the pinned shape into a [`PlannedDelivery`].
@@ -288,24 +306,28 @@ impl DeliverySet {
         })
     }
 
-    /// The resolved deliveries, in declared order.
+    /// The first declared delivery, present by type.
     #[must_use]
-    pub fn planned(&self) -> &[PlannedDelivery] {
-        &self.0
+    pub const fn head(&self) -> PlannedDelivery {
+        self.head
+    }
+
+    /// The resolved deliveries, in declared order: the head, then the rest.
+    pub fn planned(&self) -> impl Iterator<Item = PlannedDelivery> + '_ {
+        std::iter::once(self.head).chain(self.rest.iter().copied())
     }
 
     /// The number of declared deliveries. Always at least one.
     #[must_use]
     pub const fn len(&self) -> usize {
-        self.0.len()
+        self.rest.len().saturating_add(1)
     }
 
-    /// A delivery set is never empty (guaranteed by [`Self::resolve`]); this is
-    /// present only to satisfy the `len`-without-`is_empty` lint. It always
-    /// returns `false`.
+    /// A delivery set is never empty (the head exists by type); this is present
+    /// only to satisfy the `len`-without-`is_empty` lint.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        false
     }
 
     /// Consume the set, invoking `release_one` per delivery in declared order.
@@ -316,14 +338,14 @@ impl DeliverySet {
     /// each delivery attempted, each failure recorded — so a partial release
     /// names every failure rather than stopping at the first.
     #[must_use]
-    pub fn release_each(
+    pub fn release_each<A>(
         self,
-        mut release_one: impl FnMut(&PlannedDelivery) -> Result<PathBuf, CliError>,
-    ) -> ReleaseOutcome {
-        let mut built: Vec<Released> = Vec::with_capacity(self.0.len());
+        mut release_one: impl FnMut(&PlannedDelivery) -> Result<A, CliError>,
+    ) -> ReleaseOutcome<A> {
+        let mut built: Vec<Released<A>> = Vec::with_capacity(self.len());
         let mut failed: Vec<(Delivery, CliError)> = Vec::new();
-        for plan in &self.0 {
-            match release_one(plan) {
+        for plan in self.planned() {
+            match release_one(&plan) {
                 Ok(artifact) => built.push(Released {
                     delivery: plan.delivery,
                     artifact,
@@ -339,25 +361,225 @@ impl DeliverySet {
     }
 }
 
+/// Where `ipe release build` writes a member's artifact under `release/`.
+///
+/// Mirrors the release routing: a non-default host goes through the bundle
+/// packager for that host, a `client` on the default host is the browser
+/// bundle, and everything else is the one native binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseSlot {
+    /// The native binary (`release/<name>` or `release/bundle/`).
+    Native,
+    /// The browser bundle (`release/rust/www/`).
+    Browser,
+    /// The app bundle for one host (`release/dist/`).
+    Bundle(Host),
+}
+
+impl ReleaseSlot {
+    const fn of(delivery: Delivery) -> Self {
+        match (delivery.host(), delivery.runtime()) {
+            (Host::Default, Some(Runtime::Client)) => Self::Browser,
+            (Host::Default, Some(Runtime::Served) | None) => Self::Native,
+            (host @ (Host::Desktop | Host::Ios | Host::Android), _) => Self::Bundle(host),
+        }
+    }
+}
+
+/// The deliveries a package declares in `ships`, resolved once against the
+/// shape `main` pins.
+///
+/// The one token a compiling command selects its delivery from when argv names
+/// none. Built by [`crate::project::DeliveryConfig::declared`], the only
+/// reader of the private `ships` list a compiling command reaches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredDeliveries {
+    pinned: Shape,
+    set: DeliverySet,
+}
+
+impl DeclaredDeliveries {
+    /// Resolve the declared `ships` entries against the pinned shape.
+    ///
+    /// # Errors
+    /// Every [`DeliverySet::resolve`] refusal.
+    pub fn from_ships(pinned: Shape, entries: &[ShipEntry]) -> Result<Self, CliError> {
+        DeliverySet::resolve(pinned, entries).map(|set| Self { pinned, set })
+    }
+
+    /// The shape `main` pins, the one stated delivery words resolve against.
+    #[must_use]
+    pub const fn pinned(&self) -> Shape {
+        self.pinned
+    }
+
+    /// The declared set, in declared order.
+    #[must_use]
+    pub const fn set(&self) -> &DeliverySet {
+        &self.set
+    }
+
+    /// The declared set, consumed by the release loop.
+    #[must_use]
+    pub fn into_set(self) -> DeliverySet {
+        self.set
+    }
+
+    /// The one delivery a dev command builds when argv names none.
+    ///
+    /// A dev build ignores a ship's target axis, so members that differ only by
+    /// target are one delivery. `accepts` is the command's own admission: a
+    /// member it refuses is listed with the `build` verb that does produce it,
+    /// so every listed command clears the refusal.
+    ///
+    /// # Errors
+    /// [`CliError::ProjectRefused`] listing each declared delivery and its
+    /// command when the package declares more than one.
+    pub fn sole_dev_delivery(
+        &self,
+        command: &str,
+        accepts: impl Fn(Delivery) -> bool,
+        build: &str,
+    ) -> Result<Delivery, CliError> {
+        self.sole_by(PlannedDelivery::delivery, command, |plan| {
+            let verb = if accepts(plan.delivery) {
+                command
+            } else {
+                build
+            };
+            format!("ipe {verb} {}", plan.delivery)
+        })
+        .map(PlannedDelivery::delivery)
+    }
+
+    /// The one delivery `ipe release run` builds when argv names none.
+    ///
+    /// A release always links statically, so a host and a static member are one
+    /// artifact; a cross member is its own. A member with no run form (any
+    /// member that is not the native binary) is listed with the `build` verb
+    /// that produces it.
+    ///
+    /// # Errors
+    /// [`CliError::ProjectRefused`] listing each declared delivery and its
+    /// command when the package declares more than one.
+    pub fn sole_release_member(
+        &self,
+        command: &str,
+        build: &str,
+    ) -> Result<PlannedDelivery, CliError> {
+        self.sole_by(
+            |plan| (plan.delivery, plan.release_triple()),
+            command,
+            |plan| {
+                let verb = if ReleaseSlot::of(plan.delivery) == ReleaseSlot::Native {
+                    command
+                } else {
+                    build
+                };
+                plan.release_triple().map_or_else(
+                    || format!("ipe {verb} {}", plan.delivery),
+                    |triple| format!("ipe {verb} {} --target {}", plan.delivery, triple.as_str()),
+                )
+            },
+        )
+    }
+
+    /// The set `ipe release build` given no delivery words builds: each
+    /// distinct release artifact once, `target` (argv's `--target`) overriding
+    /// every native member's declared triple.
+    ///
+    /// Members that release the same artifact (a host and a static binary) are
+    /// built once.
+    ///
+    /// # Errors
+    /// [`CliError::ProjectRefused`] when two members would release different
+    /// artifacts into the same place under `release/`, so the later one would
+    /// overwrite the earlier while both were reported built.
+    pub fn for_release(self, target: Option<StaticTriple>) -> Result<DeliverySet, CliError> {
+        let artifact = |plan: PlannedDelivery| {
+            let slot = ReleaseSlot::of(plan.delivery);
+            let triple = match slot {
+                ReleaseSlot::Native => target.or_else(|| plan.release_triple()),
+                ReleaseSlot::Browser | ReleaseSlot::Bundle(_) => None,
+            };
+            (slot, plan.delivery, triple)
+        };
+        let words = |plan: PlannedDelivery| {
+            let (_, delivery, triple) = artifact(plan);
+            triple.map_or_else(
+                || delivery.to_string(),
+                |triple| format!("{delivery} --target {}", triple.as_str()),
+            )
+        };
+        let head = self.set.head;
+        let mut rest: Vec<PlannedDelivery> = Vec::with_capacity(self.set.rest.len());
+        for plan in self.set.rest {
+            let (slot, ..) = artifact(plan);
+            let shared = std::iter::once(head)
+                .chain(rest.iter().copied())
+                .find(|kept| artifact(*kept).0 == slot);
+            match shared {
+                None => rest.push(plan),
+                Some(kept) if artifact(kept) == artifact(plan) => {}
+                Some(kept) => {
+                    return Err(CliError::ProjectRefused(
+                        crate::text::msg::ships_release_slot_shared(&words(kept), &words(plan)),
+                    ));
+                }
+            }
+        }
+        Ok(DeliverySet { head, rest })
+    }
+
+    /// The single member distinct under `key`, or the several-deliveries refusal
+    /// naming each distinct member's `choice` command.
+    fn sole_by<K: PartialEq>(
+        &self,
+        key: impl Fn(PlannedDelivery) -> K,
+        command: &str,
+        choice: impl Fn(PlannedDelivery) -> String,
+    ) -> Result<PlannedDelivery, CliError> {
+        let mut distinct: Vec<PlannedDelivery> = Vec::new();
+        for plan in self.set.planned() {
+            if !distinct.iter().any(|seen| key(*seen) == key(plan)) {
+                distinct.push(plan);
+            }
+        }
+        match distinct.as_slice() {
+            [only] => Ok(*only),
+            several => {
+                let choices = several
+                    .iter()
+                    .map(|plan| format!("  {}", choice(*plan)))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Err(CliError::ProjectRefused(crate::text::msg::ships_several(
+                    &command, &choices,
+                )))
+            }
+        }
+    }
+}
+
 /// Proof one delivery was built and packaged. Private constructor: the only
 /// producer is [`DeliverySet::release_each`], fed by a packager that ran to
 /// completion.
 #[derive(Debug)]
-pub struct Released {
+pub struct Released<A = PathBuf> {
     delivery: Delivery,
-    artifact: PathBuf,
+    artifact: A,
 }
 
-impl Released {
+impl<A> Released<A> {
     /// The delivery this artifact realises.
     #[must_use]
     pub const fn delivery(&self) -> Delivery {
         self.delivery
     }
 
-    /// The path written, for the release summary line.
+    /// What the packager produced, for the release summary line.
     #[must_use]
-    pub fn artifact(&self) -> &std::path::Path {
+    pub const fn artifact(&self) -> &A {
         &self.artifact
     }
 }
@@ -369,21 +591,21 @@ impl Released {
 /// site can treat it as success by accident. Matching is exhaustive, and
 /// `Incomplete` carries what failed.
 #[derive(Debug)]
-pub enum ReleaseOutcome {
+pub enum ReleaseOutcome<A = PathBuf> {
     /// Every declared delivery built. One [`Released`] per declared delivery, in
     /// declared order.
-    AllReleased(Vec<Released>),
+    AllReleased(Vec<Released<A>>),
     /// At least one delivery failed. `built` and `failed` together account for
     /// every declared delivery; `failed` is non-empty by construction.
     Incomplete {
         /// The deliveries that did build, in declared order.
-        built: Vec<Released>,
+        built: Vec<Released<A>>,
         /// Each failed delivery paired with its diagnostic — non-empty.
         failed: Vec<(Delivery, CliError)>,
     },
 }
 
-impl ReleaseOutcome {
+impl<A> ReleaseOutcome<A> {
     /// Whether every declared delivery built. The command exits non-zero unless
     /// this holds.
     #[must_use]
@@ -488,7 +710,7 @@ mod tests {
         ] {
             let set = DeliverySet::resolve(shape, &[]).expect("empty resolves to singleton");
             assert_eq!(set.len(), 1);
-            let only = set.planned()[0];
+            let only = set.head();
             assert_eq!(only.delivery().shape(), shape);
             assert_eq!(only.target(), BinaryTarget::Host);
         }
@@ -503,7 +725,7 @@ mod tests {
             ShipEntry::ClientIos,
         ];
         let set = DeliverySet::resolve(Shape::Web, &entries).expect("web set resolves");
-        let slugs: Vec<String> = set.planned().iter().map(|p| p.slug()).collect();
+        let slugs: Vec<String> = set.planned().map(PlannedDelivery::slug).collect();
         assert_eq!(
             slugs,
             ["web", "web-desktop", "web-client", "web-client-ios"]
@@ -536,7 +758,7 @@ mod tests {
         // holds for the web-desktop delivery directly instead.
         let set = DeliverySet::resolve(Shape::Web, &[ShipEntry::Binary(BinaryTarget::Static)])
             .expect("served web is static-capable");
-        assert_eq!(set.planned()[0].target(), BinaryTarget::Static);
+        assert_eq!(set.head().target(), BinaryTarget::Static);
     }
 
     #[test]
@@ -557,14 +779,14 @@ mod tests {
     fn cross_binary_slug_carries_the_triple() {
         let set = DeliverySet::resolve(Shape::Cli, &[cross("aarch64-unknown-linux-musl")])
             .expect("cli cross binary resolves");
-        assert_eq!(set.planned()[0].slug(), "cli-aarch64-unknown-linux-musl");
+        assert_eq!(set.head().slug(), "cli-aarch64-unknown-linux-musl");
     }
 
     #[test]
     fn static_binary_slug_is_suffixed() {
         let set = DeliverySet::resolve(Shape::Cli, &[ShipEntry::Binary(BinaryTarget::Static)])
             .expect("cli static binary resolves");
-        assert_eq!(set.planned()[0].slug(), "cli-static");
+        assert_eq!(set.head().slug(), "cli-static");
     }
 
     #[test]

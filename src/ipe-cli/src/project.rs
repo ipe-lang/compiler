@@ -132,12 +132,14 @@ pub struct ProjectManifest {
 /// resolved target. There is no `active` selector — that is the CLI.
 #[derive(Clone, Debug)]
 pub struct DeliveryConfig {
-    /// The declared delivery set — which deliveries `ipe release` produces.
+    /// The declared delivery set — which deliveries the compiling commands build.
+    ///
     /// Empty when the manifest omits the `ships` field, meaning the implicit
-    /// `[ binary ]` singleton (resolved by
-    /// [`crate::delivery_set::DeliverySet::resolve`]). The `ships` list declares
+    /// `[ binary ]` singleton. Private: a compiling command reads it only
+    /// through [`Self::declared`], the one resolved token, so no command can
+    /// pick a delivery the manifest never consulted. The `ships` list declares
     /// *what* ships; the sections below configure *how* each looks.
-    pub ships: Vec<crate::delivery_set::ShipEntry>,
+    ships: Vec<crate::delivery_set::ShipEntry>,
     /// Window title, width, and height for the `web desktop`
     /// (webview-native) host.
     pub desktop: DesktopDelivery,
@@ -148,6 +150,34 @@ pub struct DeliveryConfig {
     /// The `https` origins the browser bundle may reach besides its own;
     /// empty for an offline bundle.
     pub servers: ipe_runtime_rust::encoding::ServerOrigins,
+}
+
+impl DeliveryConfig {
+    /// The declared deliveries resolved against the shape `main` pins.
+    ///
+    /// The only path from `ships` to a buildable delivery: every compiling
+    /// command selects through the returned token.
+    ///
+    /// # Errors
+    /// [`CliError::ProjectRefused`] for a duplicate or shape-incompatible entry,
+    /// or the [`crate::delivery::DeliveryError`] of an invalid combination.
+    pub fn declared(
+        &self,
+        pinned: crate::delivery::Shape,
+    ) -> Result<crate::delivery_set::DeclaredDeliveries, CliError> {
+        crate::delivery_set::DeclaredDeliveries::from_ships(pinned, &self.ships)
+    }
+
+    /// The declared entries as written, for the manifest renderer only.
+    #[must_use]
+    pub fn ships_for_render(&self) -> &[crate::delivery_set::ShipEntry] {
+        &self.ships
+    }
+
+    /// Record the `ships` list the manifest reader parsed.
+    pub fn set_ships(&mut self, ships: Vec<crate::delivery_set::ShipEntry>) {
+        self.ships = ships;
+    }
 }
 
 impl Default for DeliveryConfig {

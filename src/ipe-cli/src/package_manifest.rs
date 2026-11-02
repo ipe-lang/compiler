@@ -1070,7 +1070,7 @@ impl Reader<'_> {
         let mut install_request = None;
         for (fname, value) in self.expect_record(expr)? {
             match self.text(fname.value) {
-                "ships" => config.ships = self.read_ships(value)?,
+                "ships" => config.set_ships(self.read_ships(value)?),
                 "desktop" => config.desktop = self.read_desktop(value)?,
                 "mobile" => config.mobile = self.read_mobile(value)?,
                 "browser" => (config.browser, install_request) = self.read_browser(value)?,
@@ -2095,11 +2095,11 @@ fn render_wasm(wasm: &WasmConfig) -> Option<String> {
 /// minimal and round-trips unchanged. Only the `ships` declaration is emitted;
 /// the host config sections keep their absent-section defaults.
 fn render_delivery(delivery: &DeliveryConfig) -> Option<String> {
-    if delivery.ships.is_empty() {
+    let ships = delivery.ships_for_render();
+    if ships.is_empty() {
         return None;
     }
-    let items = delivery
-        .ships
+    let items = ships
         .iter()
         .map(|s| ship_builder_expr(*s))
         .collect::<Vec<_>>()
@@ -4191,7 +4191,7 @@ mod tests {
         )
         .expect("every ship builder must parse");
         assert_eq!(
-            m.delivery.ships,
+            m.delivery.ships_for_render(),
             vec![
                 ShipEntry::Binary(BinaryTarget::Host),
                 ShipEntry::Binary(BinaryTarget::Static),
@@ -4273,7 +4273,7 @@ mod tests {
             ),
         )
         .expect("every builder the writer spells must parse");
-        assert_eq!(m.delivery.ships, entries);
+        assert_eq!(m.delivery.ships_for_render(), entries);
     }
 
     /// The `Ipe.Package` schema's exposed ship builders and `Ship` constructors
@@ -4331,7 +4331,7 @@ mod tests {
             &format!("{HEADER}package =\n    {{ name = \"x\" }}\n"),
         )
         .expect("absent ships parses");
-        assert!(m.delivery.ships.is_empty());
+        assert!(m.delivery.ships_for_render().is_empty());
     }
 
     #[test]
@@ -4436,7 +4436,10 @@ mod tests {
             "the render emits the declared ships: {rendered}"
         );
         let reparsed = read("ships_render_out", &rendered).expect("rendered manifest re-parses");
-        assert_eq!(reparsed.delivery.ships, m.delivery.ships);
+        assert_eq!(
+            reparsed.delivery.ships_for_render(),
+            m.delivery.ships_for_render()
+        );
     }
 
     // ── manifest writer: `ipe add` records a dependency in package.ipe ────────

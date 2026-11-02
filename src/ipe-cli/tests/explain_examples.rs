@@ -1,34 +1,41 @@
 #![forbid(unsafe_code)]
-//! Every fenced `ipe` block on every explain page and doc page meets its verdict.
+//! Every fenced or indented block on every page `ipe doc` serves meets its verdict.
 //!
 //! The explain pages are the registry's own: every code in `ALL_CODES` whose
-//! `explain_page` exists is scanned, so a new code's page is checked the moment
-//! it exists. The doc pages are every `docs/constructs` and `docs/topics` page.
-//! Each block is the one module of a scratch project, judged in-process through
-//! the build front end (`ipe::front_check`: type-check, decoder gate, lowering,
-//! emit; no cargo):
+//! `explain_page` exists is scanned, so a new code's page is checked the
+//! moment it exists. The doc pages are every page under each directory in
+//! [`ipe::doc_bundle::SERVED_PAGE_DIRS`] — the exact table that drives what
+//! `ipe doc` serves, so a kind added to the bundle is scanned here the moment
+//! it is served ([`every_served_kind_is_scanned`] proves the two sets stay
+//! equal). Each block is judged through [`ipe::doc_fence::scan`]:
 //!
 //! - a check block (` ```ipe `) must be accepted;
-//! - an error block must be refused with its expected code: the page's own code
-//!   on an explain page, the code its info string names on a doc page; refused
-//!   with any other code, or accepted, is a mismatch;
-//! - a skip block (` ```ipe ipe:skip <reason> `) is not compiled.
+//! - an error block must be refused with its expected code: the page's own
+//!   code on an explain page, the code its info string names on a doc page;
+//!   refused with any other code, or accepted, is a mismatch;
+//! - a skip block (` ```ipe ipe:skip <reason> `) is not compiled;
+//! - an excerpt block (` ```ipe ipe:excerpt <examples/…path> `) is not
+//!   compiled — its body must occur verbatim in the named example file;
+//! - a bare fence with no info string, or a four-space indented block outside
+//!   a list/table/blockquote, is always a mismatch: a served page cannot hide
+//!   uncompiled Ipê in either shape.
 //!
-//! No import is ever injected; a block with no module header is only wrapped in
-//! `module Main exposing (..)`. A block with a header lies at the file its
-//! header names: `Main` is the project's entry, any other module its one
-//! exposed module. Every mismatch is reported at once.
+//! A check or error block is the one module of a scratch project, judged
+//! in-process through the build front end (`ipe::front_check`: type-check,
+//! decoder gate, lowering, emit; no cargo). No import is ever injected; a
+//! block with no module header is only wrapped in `module Main exposing
+//! (..)`. A block with a header lies at the file its header names: `Main` is
+//! the project's entry, any other module its one exposed module. Every
+//! mismatch is reported at once.
 //!
-//! `explain_examples/known_rot.txt` lists the `page:line` blocks still failing:
-//! a listed block must still mismatch, so the ledger can only shrink.
-
-#[path = "explain_examples/fence.rs"]
-mod fence;
+//! `explain_examples/known_rot.txt` lists the `page:line` blocks still
+//! failing: a listed block must still mismatch, so the ledger can only shrink.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use fence::{Block, Kind, Page};
+use ipe::contained_path::ContainedRelPath;
+use ipe::doc_fence::{self, Block, ExampleRel, ExcerptMiss, Kind, Page};
 use ipe::project_root::SourceTree;
 use ipe_diagnostics::{ALL_CODES, Code, explain_page};
 
@@ -113,28 +120,75 @@ fn front_check(dir: &Path, source: &str) -> Outcome {
     }
 }
 
-/// The mismatch text for `outcome` against `kind`, or `None` when it meets it.
-fn verdict(kind: &Kind, outcome: &Outcome) -> Option<String> {
-    match (kind, outcome) {
-        (Kind::Skip(_), _) | (Kind::Check, Outcome::Accepted) => None,
-        (Kind::Error(want), Outcome::Refused(got)) if want == got => None,
-        (Kind::Check, Outcome::Refused(got)) => Some(format!(
+/// What a compiled block asks of the front end.
+#[derive(Clone, Copy, Debug)]
+enum Expect {
+    /// The program must be accepted.
+    Accepted,
+    /// The program must be refused with this code.
+    Refused(Code),
+}
+
+/// The mismatch text for `outcome` against `expect`, or `None` when it meets it.
+fn verdict(expect: Expect, outcome: &Outcome) -> Option<String> {
+    match (expect, outcome) {
+        (Expect::Accepted, Outcome::Accepted) => None,
+        (Expect::Refused(want), Outcome::Refused(got)) if want == *got => None,
+        (Expect::Accepted, Outcome::Refused(got)) => Some(format!(
             "expected the program to be accepted; refused with {}",
             got.as_str()
         )),
-        (Kind::Error(want), Outcome::Refused(got)) => Some(format!(
+        (Expect::Refused(want), Outcome::Refused(got)) => Some(format!(
             "expected a refusal with {}; refused with {}",
             want.as_str(),
             got.as_str()
         )),
-        (Kind::Error(want), Outcome::Accepted) => Some(format!(
+        (Expect::Refused(want), Outcome::Accepted) => Some(format!(
             "expected a refusal with {}; the program was accepted",
             want.as_str()
         )),
-        (Kind::Check | Kind::Error(_), Outcome::Failed(why)) => {
+        (Expect::Accepted | Expect::Refused(_), Outcome::Failed(why)) => {
             Some(format!("the check could not run: {why}"))
         }
     }
+}
+
+/// The repository's `examples/` directory, the one root an excerpt may quote.
+fn examples_root() -> PathBuf {
+    let joined = e2e_support::manifest_dir!().join("../../examples");
+    std::fs::canonicalize(&joined).unwrap_or(joined)
+}
+
+/// Judge an excerpt block: its declared path must resolve to a file inside
+/// `examples` (a symlink out of it refused) and its body must occur there as
+/// a run of whole lines.
+fn judge_excerpt(examples: &Path, rel: &ExampleRel, body: &str) -> Option<String> {
+    let shown = rel.as_path().display();
+    let contained = match ContainedRelPath::parse(examples, rel.within_examples()) {
+        Ok(contained) => contained,
+        Err(e) => return Some(format!("excerpt path {shown} escapes examples/: {e}")),
+    };
+    let path = contained.resolved();
+    if !path.is_file() {
+        return Some(format!("excerpt names a file that does not exist: {shown}"));
+    }
+    match std::fs::read_to_string(path) {
+        Ok(contents) => match doc_fence::excerpt_occurs(body, &contents) {
+            Ok(()) => None,
+            Err(ExcerptMiss::Empty) => Some(format!(
+                "excerpt of {shown} has an empty body, which any file would hold"
+            )),
+            Err(ExcerptMiss::Absent) => Some(format!(
+                "excerpt body is not a run of whole lines of {shown}"
+            )),
+        },
+        Err(e) => Some(format!("could not read excerpt file {shown}: {e}")),
+    }
+}
+
+/// Judge one compiled block body as a scratch project under `dir`.
+fn judge_compiled(dir: &Path, expect: Expect, body: &str) -> Option<String> {
+    verdict(expect, &front_check(dir, &program_source(body)))
 }
 
 /// Every mismatch on one page: refused fences and blocks missing their verdict.
@@ -143,7 +197,7 @@ fn judge_page(name: &str, text: &str, page: Page, scratch: &Path) -> Vec<Mismatc
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    fence::scan(text, page)
+    doc_fence::scan(text, page)
         .into_iter()
         .filter_map(|item| match item {
             Err(refusal) => Some(Mismatch {
@@ -154,14 +208,60 @@ fn judge_page(name: &str, text: &str, page: Page, scratch: &Path) -> Vec<Mismatc
                 kind: Kind::Skip(_),
                 ..
             }) => None,
-            Ok(Block { line, kind, body }) => {
-                let dir = scratch.join(format!("{dir_stem}_{line}"));
-                let outcome = front_check(&dir, &program_source(&body));
-                verdict(&kind, &outcome).map(|detail| Mismatch {
-                    key: format!("{name}:{line}"),
-                    detail,
-                })
-            }
+            Ok(Block {
+                line,
+                kind: Kind::Unlabelled,
+                ..
+            }) => Some(Mismatch {
+                key: format!("{name}:{line}"),
+                detail: "a bare fence with no info string is never checked; tag it `ipe`, \
+                    `ipe ipe:skip <reason>`, or `ipe ipe:excerpt <path>`"
+                    .to_owned(),
+            }),
+            Ok(Block {
+                line,
+                kind: Kind::Indented,
+                ..
+            }) => Some(Mismatch {
+                key: format!("{name}:{line}"),
+                detail: "a four-space indented block outside a list, table, or blockquote \
+                    reads as code but is never checked; fence it instead"
+                    .to_owned(),
+            }),
+            Ok(Block {
+                line,
+                kind: Kind::Excerpt(rel),
+                body,
+            }) => judge_excerpt(&examples_root(), &rel, &body).map(|detail| Mismatch {
+                key: format!("{name}:{line}"),
+                detail,
+            }),
+            Ok(Block {
+                line,
+                kind: Kind::Check,
+                body,
+            }) => judge_compiled(
+                &scratch.join(format!("{dir_stem}_{line}")),
+                Expect::Accepted,
+                &body,
+            )
+            .map(|detail| Mismatch {
+                key: format!("{name}:{line}"),
+                detail,
+            }),
+            Ok(Block {
+                line,
+                kind: Kind::Error(code),
+                body,
+            }) => judge_compiled(
+                &scratch.join(format!("{dir_stem}_{line}")),
+                Expect::Refused(code),
+                &body,
+            )
+            .map(|detail| Mismatch {
+                key: format!("{name}:{line}"),
+                detail,
+            }),
         })
         .collect()
 }
@@ -270,22 +370,32 @@ fn explain_pages() {
     );
 }
 
-#[test]
-fn construct_pages() {
-    let mismatches = judge_doc_dir("constructs", &scratch("constructs"));
-    assert_clean(
-        "construct-page",
-        &reconcile("docs/constructs/", &mismatches, &ledger(KNOWN_ROT)),
-    );
+/// One `#[test]` per `docs/<dir>` corpus, and [`SCANNED_DOC_DIRS`] built from
+/// the same rows, so the set [`every_served_kind_is_scanned`] compares is
+/// exactly the set of corpora a test runs.
+macro_rules! doc_corpora {
+    ($($test:ident => $dir:literal),+ $(,)?) => {
+        /// The `docs/<dir>` corpora a `#[test]` here scans, one per row of
+        /// [`doc_corpora`].
+        const SCANNED_DOC_DIRS: &[&str] = &[$($dir),+];
+        $(
+            #[test]
+            fn $test() {
+                let mismatches = judge_doc_dir($dir, &scratch($dir));
+                assert_clean(
+                    concat!("docs/", $dir),
+                    &reconcile(concat!("docs/", $dir, "/"), &mismatches, &ledger(KNOWN_ROT)),
+                );
+            }
+        )+
+    };
 }
 
-#[test]
-fn topic_pages() {
-    let mismatches = judge_doc_dir("topics", &scratch("topics"));
-    assert_clean(
-        "topic-page",
-        &reconcile("docs/topics/", &mismatches, &ledger(KNOWN_ROT)),
-    );
+doc_corpora! {
+    construct_pages => "constructs",
+    idiom_pages => "idioms",
+    topic_pages => "topics",
+    guide_pages => "guide",
 }
 
 #[test]
@@ -314,15 +424,26 @@ fn every_registered_code_page_was_visited() {
     );
 }
 
+/// This file's `docs/<dir>` corpora must match exactly what `ipe doc` serves —
+/// the checker SSOT: a kind [`ipe::doc_bundle::OVERLAY_KINDS`] gains is scanned
+/// here the moment it is served, never discovered later as a silent gap.
+#[test]
+fn every_served_kind_is_scanned() {
+    let served: BTreeSet<&str> = ipe::doc_bundle::SERVED_PAGE_DIRS.iter().copied().collect();
+    let scanned: BTreeSet<&str> = SCANNED_DOC_DIRS.iter().copied().collect();
+    assert_eq!(
+        scanned, served,
+        "this file's docs/<dir> corpora must match every directory ipe doc serves"
+    );
+}
+
 #[test]
 fn every_ledger_entry_names_a_scanned_corpus() {
+    let mut prefixes = vec!["explain/".to_owned()];
+    prefixes.extend(SCANNED_DOC_DIRS.iter().map(|d| format!("docs/{d}/")));
     let stray: Vec<&str> = ledger(KNOWN_ROT)
         .into_iter()
-        .filter(|k| {
-            !["explain/", "docs/constructs/", "docs/topics/"]
-                .iter()
-                .any(|p| k.starts_with(p))
-        })
+        .filter(|k| !prefixes.iter().any(|p| k.starts_with(p.as_str())))
         .collect();
     assert!(
         stray.is_empty(),
@@ -414,6 +535,121 @@ fn lowering_code_error_block_is_judged_past_typecheck() {
 fn skip_block_is_not_compiled() {
     let text = "```ipe ipe:skip needs a second module\nx = = 1\n```\n";
     assert!(judge_synthetic("skip_block_is_not_compiled", text, Page::Doc).is_empty());
+}
+
+#[test]
+fn an_untagged_fence_in_a_served_page_is_a_mismatch() {
+    let text = "```\nx = 1\n```\n";
+    let found = judge_synthetic(
+        "an_untagged_fence_in_a_served_page_is_a_mismatch",
+        text,
+        Page::Doc,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+#[test]
+fn an_indented_code_block_outside_a_container_is_a_mismatch() {
+    let text = "Prose.\n\n    x = 1\n\nMore prose.\n";
+    let found = judge_synthetic(
+        "an_indented_code_block_outside_a_container_is_a_mismatch",
+        text,
+        Page::Doc,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+#[test]
+fn an_excerpt_absent_from_its_example_is_a_mismatch() {
+    let text = "```ipe ipe:excerpt examples/wasm/counter/src/Main.ipe\nZZZ_NOT_IN_FILE_ZZZ\n```\n";
+    let found = judge_synthetic(
+        "an_excerpt_absent_from_its_example_is_a_mismatch",
+        text,
+        Page::Doc,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+#[test]
+fn an_empty_excerpt_is_a_mismatch() {
+    let text = "```ipe ipe:excerpt examples/wasm/counter/src/Main.ipe\n\n```\n";
+    let found = judge_synthetic("an_empty_excerpt_is_a_mismatch", text, Page::Doc);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found.iter().all(|m| m.detail.contains("empty body")),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn an_excerpt_of_a_line_fragment_is_a_mismatch() {
+    let text = "```ipe ipe:excerpt examples/wasm/counter/src/Main.ipe\nmodule Ma\n```\n";
+    let found = judge_synthetic(
+        "an_excerpt_of_a_line_fragment_is_a_mismatch",
+        text,
+        Page::Doc,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+#[test]
+fn an_excerpt_naming_a_path_outside_examples_is_refused() {
+    for raw in [
+        "examples/../src/ipe-cli/src/lib.rs",
+        "src/ipe-cli/src/lib.rs",
+        "/etc/passwd",
+        "examples\\..\\Cargo.toml",
+        "examplesX/x.ipe",
+    ] {
+        let text = format!("```ipe ipe:excerpt {raw}\nmodule Main exposing (main)\n```\n");
+        let found = judge_synthetic(
+            "an_excerpt_naming_a_path_outside_examples_is_refused",
+            &text,
+            Page::Doc,
+        );
+        assert_eq!(found.len(), 1, "{raw}: {found:?}");
+        assert!(
+            found
+                .iter()
+                .all(|m| m.detail.starts_with("fence refused: ExcerptPath(")),
+            "{raw}: {found:?}"
+        );
+    }
+}
+
+/// The containment proof runs against `examples/` itself, so a file the
+/// repository root contains but `examples/` does not is refused even when a
+/// symlink inside `examples/` names it.
+#[test]
+#[cfg(unix)]
+fn an_excerpt_through_a_symlink_out_of_examples_is_refused() {
+    let base = scratch("an_excerpt_through_a_symlink_out_of_examples_is_refused");
+    let examples = base.join("examples");
+    std::fs::create_dir_all(&examples).expect("make examples");
+    std::fs::write(base.join("secret.ipe"), "module Main exposing (main)\n").expect("write");
+    std::os::unix::fs::symlink(base.join("secret.ipe"), examples.join("leak.ipe"))
+        .expect("symlink");
+    let rel = ExampleRel::parse("examples/leak.ipe").expect("a well-formed path");
+    let detail = judge_excerpt(&examples, &rel, "module Main exposing (main)");
+    assert!(
+        detail
+            .as_deref()
+            .is_some_and(|d| d.contains("escapes examples/")),
+        "{detail:?}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn an_excerpt_matching_its_example_meets_its_verdict() {
+    let text =
+        "```ipe ipe:excerpt examples/wasm/counter/src/Main.ipe\nmodule Main exposing (main)\n```\n";
+    let found = judge_synthetic(
+        "an_excerpt_matching_its_example_meets_its_verdict",
+        text,
+        Page::Doc,
+    );
+    assert!(found.is_empty(), "{found:?}");
 }
 
 fn mismatch(key: &str) -> Mismatch {
