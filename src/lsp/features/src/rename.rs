@@ -243,23 +243,20 @@ pub fn rename(
 
     let mut edits_by_uri = edits_by_uri(&sites, new_name, resolver, req.encoding)?;
     if matches!(def.target, NameTarget::Declared { .. }) {
-        let (def_module_syms, old_name_sym) = {
-            let mut interner = db.interner().lock();
-            let module_syms = intern_path(&mut interner, &def.module);
-            let name_sym = interner.intern(old_name).ok();
-            drop(interner);
-            (module_syms?, name_sym?)
-        };
+        let mut interner = db.interner().lock();
+        let old_name_sym = interner.intern(old_name).ok();
+        drop(interner);
+        let old_name_sym = old_name_sym?;
         patch_exposing_headers(
             db,
             root,
-            &def_module_syms,
+            &def.module,
             old_name_sym,
             new_name,
             resolver,
             req.encoding,
             &mut edits_by_uri,
-        );
+        )?;
     }
     Some(workspace_edit(
         edits_by_uri,
@@ -494,7 +491,56 @@ fn record_pattern_labels(tokens: &[SourceToken]) -> Vec<Span> {
                     labels.push(token.span);
                 }
             }
-            _ => {}
+            TokenKind::Module
+            | TokenKind::Import
+            | TokenKind::Exposing
+            | TokenKind::As
+            | TokenKind::Type
+            | TokenKind::Foreign
+            | TokenKind::Case
+            | TokenKind::Of
+            | TokenKind::Let
+            | TokenKind::In
+            | TokenKind::If
+            | TokenKind::Then
+            | TokenKind::Else
+            | TokenKind::Do
+            | TokenKind::ColonColon
+            | TokenKind::Equals
+            | TokenKind::Pipe
+            | TokenKind::Colon
+            | TokenKind::Arrow
+            | TokenKind::LeftArrow
+            | TokenKind::Backslash
+            | TokenKind::DotDot
+            | TokenKind::Dot
+            | TokenKind::Comma
+            | TokenKind::Underscore
+            | TokenKind::Plus
+            | TokenKind::PlusPlus
+            | TokenKind::Minus
+            | TokenKind::Star
+            | TokenKind::Slash
+            | TokenKind::SlashEq
+            | TokenKind::SlashSlash
+            | TokenKind::EqEq
+            | TokenKind::Lt
+            | TokenKind::Gt
+            | TokenKind::Le
+            | TokenKind::Ge
+            | TokenKind::AmpAmp
+            | TokenKind::PipePipe
+            | TokenKind::PipeGt
+            | TokenKind::LtPipe
+            | TokenKind::PipeEq
+            | TokenKind::PipeDot
+            | TokenKind::GtGt
+            | TokenKind::LtLt
+            | TokenKind::Int
+            | TokenKind::Float
+            | TokenKind::Str
+            | TokenKind::Char
+            | TokenKind::Eof => {}
         }
     }
     labels
@@ -575,135 +621,78 @@ fn edits_by_uri(
 ///
 /// The canon rename engine operates on body-expression and binding-name spans;
 /// it never visits module headers or import clauses. This pass adds those edits
-/// to the already-built `WorkspaceEdit` so the rename stays syntactically valid.
+/// so the rename stays syntactically valid.
 ///
-/// Conservative: silently skips any module that does not parse, has no URI, or
-/// exposes via `(..)` — those need no edit and an error here must not corrupt
-/// the existing edits.
+/// A module that does not parse holds no exposing list to patch (every module
+/// the rename resolved parsed; one outside the import graph that spells the
+/// name already refused it). Refuses (`None`) when a list naming `old_name`
+/// sits in a module with no URI or text: dropping that edit would leave a
+/// partial rename.
 #[allow(clippy::too_many_arguments)] // internal helper; extracting a struct adds ceremony without benefit
 fn patch_exposing_headers(
     db: &IpeDatabase,
     root: SourceRoot,
-    def_module: &[Symbol],
+    def_module: &[String],
     old_name: Symbol,
     new_name: &str,
     resolver: &ModuleResolver<'_>,
     encoding: PositionEncoding,
     edits_by_uri: &mut BTreeMap<Url, Vec<TextEdit>>,
-) {
-    let files = root.files(db);
-
-    // ── 1. Defining module: patch `module M exposing (old_name, …)` ──────────
-    {
-        let def_string_path: Option<Vec<String>> = {
-            let interner = db.interner().lock();
-            def_module
-                .iter()
-                .map(|&s| interner.resolve(s).map(str::to_owned))
-                .collect::<Option<Vec<_>>>()
-        };
-        if let Some(def_string_path) = def_string_path
-            && let (Some(uri), Some(text), Some(&file)) = (
-                (resolver.uri_of_module)(&def_string_path),
-                (resolver.text_of_module)(&def_string_path),
-                files.get(&def_string_path),
-            )
-            && let Ok(parsed) = ipe_db::parse(db, file)
-            && let Some(edit) = exposed_name_edit(
-                &parsed.exposing.value,
-                old_name,
-                new_name,
-                &text,
-                encoding,
-                db,
-            )
-        {
-            add_edit(edits_by_uri, uri, edit);
-        }
-    }
-
-    // ── 2. Consumer modules: patch `import DefModule exposing (old_name, …)` ──
-    //
-    // Walk every file in the source root. For each file that has an import of
-    // the defining module with an explicit `exposing (…)` list, add an edit for
-    // the old-name token in that list.
-    let def_string_path: Option<Vec<String>> = {
-        let interner = db.interner().lock();
-        def_module
-            .iter()
-            .map(|&s| interner.resolve(s).map(str::to_owned))
-            .collect::<Option<Vec<_>>>()
-    };
-    let Some(def_string_path) = def_string_path else {
-        return;
-    };
-
-    for (module_path, &file) in files {
-        // Skip the defining module itself — already handled above.
-        if module_path == &def_string_path {
-            continue;
-        }
-        let (Some(uri), Some(text)) = (
-            (resolver.uri_of_module)(module_path),
-            (resolver.text_of_module)(module_path),
-        ) else {
-            continue;
-        };
+) -> Option<()> {
+    for (module_path, &file) in root.files(db) {
         let Ok(parsed) = ipe_db::parse(db, file) else {
             continue;
         };
-
-        // Find an import of the defining module with an explicit exposing list.
-        for imp in &parsed.imports {
-            let imp_path: Option<Vec<String>> = {
-                let interner = db.interner().lock();
-                imp.name
+        let mut lists: Vec<&Exposing> = Vec::new();
+        if module_path.as_slice() == def_module {
+            lists.push(&parsed.exposing.value);
+        }
+        for import in &parsed.imports {
+            let interner = db.interner().lock();
+            let imports_def = import.name.value.len() == def_module.len()
+                && import
+                    .name
                     .value
                     .iter()
-                    .map(|&s| interner.resolve(s).map(str::to_owned))
-                    .collect::<Option<Vec<_>>>()
-            };
-            if imp_path.as_deref() != Some(def_string_path.as_slice()) {
-                continue;
-            }
-            if let Some(edit) =
-                exposed_name_edit(&imp.exposing.value, old_name, new_name, &text, encoding, db)
-            {
-                add_edit(edits_by_uri, uri.clone(), edit);
+                    .zip(def_module)
+                    .all(|(&sym, segment)| interner.resolve(sym) == Some(segment.as_str()));
+            drop(interner);
+            if imports_def {
+                lists.push(&import.exposing.value);
             }
         }
+        for exposing in lists {
+            let Some(span) = exposed_name_span(exposing, old_name) else {
+                continue;
+            };
+            let uri = (resolver.uri_of_module)(module_path)?;
+            let text = (resolver.text_of_module)(module_path)?;
+            add_edit(
+                edits_by_uri,
+                uri,
+                TextEdit {
+                    range: span_to_range(&text, span, encoding),
+                    new_text: new_name.to_owned(),
+                },
+            );
+        }
     }
+    Some(())
 }
 
-/// Build a [`TextEdit`] that renames `old_name` inside an `Exposing::List`, or
-/// `None` when the exposing clause is `(..)` or does not mention `old_name`.
-fn exposed_name_edit(
-    exposing: &Exposing,
-    old_name: Symbol,
-    new_name: &str,
-    text: &str,
-    encoding: PositionEncoding,
-    _db: &IpeDatabase,
-) -> Option<TextEdit> {
+/// The span of `old_name` inside an `Exposing::List`, or `None` when the
+/// exposing clause is `(..)` or does not mention `old_name`.
+///
+/// A `Type(Name, Privacy::Public)` exposes `Name(..)`; its span covers only
+/// the type name token, so replacing just that span is correct.
+fn exposed_name_span(exposing: &Exposing, old_name: Symbol) -> Option<Span> {
     let Exposing::List(items) = exposing else {
-        return None; // `(..)` exposes everything — no token to rename
+        return None;
     };
-    for item in items {
-        let sym = match &item.value {
-            Exposed::Value(s) | Exposed::Type(s, _) => *s,
-        };
-        if sym == old_name {
-            let range = span_to_range(text, item.span, encoding);
-            // A `Type(Name, Privacy::Public)` exposes `Name(..)`. The span
-            // covers only the type name token (the `(..)` is separate), so
-            // replacing just the name span is correct.
-            return Some(TextEdit {
-                range,
-                new_text: new_name.to_owned(),
-            });
-        }
-    }
-    None
+    items.iter().find_map(|item| {
+        let (Exposed::Value(sym) | Exposed::Type(sym, _)) = &item.value;
+        (*sym == old_name).then_some(item.span)
+    })
 }
 
 /// Insert `edit` for `uri` into `edits_by_uri`, appending to any existing
@@ -1138,6 +1127,24 @@ mod tests {
         nth: usize,
         new_name: &str,
     ) -> Option<std::collections::BTreeMap<String, String>> {
+        rename_texts_without_uri(sources, at, needle, nth, new_name, &[])
+    }
+
+    /// [`rename_texts`] with a server that has no URI for the `no_uri` modules.
+    fn rename_texts_without_uri(
+        sources: &[Source<'_>],
+        at: &str,
+        needle: &str,
+        nth: usize,
+        new_name: &str,
+        no_uri: &[&str],
+    ) -> Option<std::collections::BTreeMap<String, String>> {
+        let uri_of = |module: &[String]| {
+            let served = module
+                .first()
+                .is_none_or(|name| !no_uri.contains(&name.as_str()));
+            served.then(|| make_uri(module)).flatten()
+        };
         let db = IpeDatabase::new();
         let files: Vec<(Vec<String>, SourceFile)> = sources
             .iter()
@@ -1172,7 +1179,7 @@ mod tests {
                 document_changes_supported: false,
             },
             &super::ModuleResolver {
-                uri_of_module: &make_uri,
+                uri_of_module: &uri_of,
                 text_of_module: &text_of,
                 version_of: &no_version,
             },
@@ -1282,5 +1289,80 @@ mod tests {
             ("Main", main, ModuleOrigin::User),
         ];
         assert!(rename_texts(&sources, "Main", "helper", 0, "aid").is_none());
+    }
+
+    #[test]
+    fn an_exposing_list_in_a_module_with_no_uri_refuses_the_rename() {
+        let lib = "module Lib exposing (helper)\n\nhelper : Int\nhelper = 2\n";
+        let other =
+            "module Other exposing (one)\n\nimport Lib exposing (helper)\n\none : Int\none = 1\n";
+        let main = "module Main exposing (main)\n\nimport Lib\nimport Other\n\nmain : Int\nmain = Lib.helper + Other.one\n";
+        let user = ModuleOrigin::User;
+        let sources = [
+            ("Lib", lib, user),
+            ("Other", other, user),
+            ("Main", main, user),
+        ];
+        let served = rename_texts(&sources, "Main", "helper", 0, "aid")
+            .expect("with every URI served the rename is applied");
+        assert_eq!(
+            served.get("Other").map(String::as_str),
+            Some(
+                "module Other exposing (one)\n\nimport Lib exposing (aid)\n\none : Int\none = 1\n"
+            )
+        );
+        assert!(
+            rename_texts_without_uri(&sources, "Main", "helper", 0, "aid", &["Other"]).is_none()
+        );
+    }
+
+    #[test]
+    fn a_project_module_outside_the_import_graph_is_renamed_too() {
+        let lib = "module Lib exposing (helper)\n\nhelper : Int\nhelper = 2\n";
+        let main = "module Main exposing (main)\n\nimport Lib\n\nmain : Int\nmain = Lib.helper\n";
+        let orphan =
+            "module Orphan exposing (twice)\n\nimport Lib\n\ntwice : Int\ntwice = Lib.helper * 2\n";
+        let user = ModuleOrigin::User;
+        let sources = [
+            ("Lib", lib, user),
+            ("Main", main, user),
+            ("Orphan", orphan, user),
+        ];
+        let renamed = rename_texts(&sources, "Main", "helper", 0, "aid")
+            .expect("a use in an unimported project module is renamed, not refused");
+        assert_eq!(
+            renamed.get("Orphan").map(String::as_str),
+            Some(
+                "module Orphan exposing (twice)\n\nimport Lib\n\ntwice : Int\ntwice = Lib.aid * 2\n"
+            )
+        );
+    }
+
+    #[test]
+    fn a_lambda_binder_spelling_the_new_name_refuses_a_local_rename() {
+        let src = "module Main exposing (main)\n\nbump : Int -> Int\nbump n =\n    (\\x -> n + 1) 0\n\nmain : Int\nmain = bump 1\n";
+        let user = ModuleOrigin::User;
+        assert!(rename_texts(&[("Main", src, user)], "Main", "n + 1", 0, "y").is_some());
+        assert!(rename_texts(&[("Main", src, user)], "Main", "n + 1", 0, "x").is_none());
+    }
+
+    #[test]
+    fn a_recorded_site_whose_token_cannot_be_isolated_refuses_every_edit() {
+        let db = IpeDatabase::new();
+        let text = "module Main exposing (main)\n\nmain : Int\nmain = helper 1\n";
+        let main = file(&db, &["Main"], text);
+        let root = root_of(&db, &[(&["Main"], main)]);
+        let site = |needle: &str| {
+            let lo = u32::try_from(text.find(needle)?).ok()?;
+            let hi = lo.checked_add(u32::try_from(needle.len()).ok()?)?;
+            Some(crate::navigation::NameRef {
+                module: vec!["Main".to_owned()],
+                span: ipe_diagnostics::Span::new(lo, hi),
+            })
+        };
+        let token = site("helper").expect("fixture spells the name");
+        let wide = site("helper 1").expect("fixture spells the call");
+        assert!(super::narrowed_sites(&db, root, vec![token.clone()], "helper").is_some());
+        assert!(super::narrowed_sites(&db, root, vec![token, wide], "helper").is_none());
     }
 }

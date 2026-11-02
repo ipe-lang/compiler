@@ -171,7 +171,25 @@ const fn callee_name(f: &Located<Expr_>) -> Option<Symbol> {
         | Expr_::VarLocal(name)
         | Expr_::VarCtor { name, .. }
         | Expr_::VarKernel { name, .. } => Some(*name),
-        _ => None,
+        Expr_::Int(_)
+        | Expr_::Float(_)
+        | Expr_::Str(_)
+        | Expr_::Char(_)
+        | Expr_::CustomElementCtor(_)
+        | Expr_::Unit
+        | Expr_::Call(..)
+        | Expr_::ForeignCall { .. }
+        | Expr_::Case(..)
+        | Expr_::Lambda(..)
+        | Expr_::Binop { .. }
+        | Expr_::Let(..)
+        | Expr_::If(..)
+        | Expr_::Tuple(_)
+        | Expr_::List(_)
+        | Expr_::Cons(..)
+        | Expr_::Record(_)
+        | Expr_::Access(..)
+        | Expr_::Update(..) => None,
     }
 }
 

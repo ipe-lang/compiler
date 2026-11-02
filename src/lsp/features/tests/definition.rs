@@ -5,7 +5,7 @@
 
 use ipe_db::{IpeDatabase, ModuleOrigin, SourceFile, SourceRoot};
 use ipe_lsp_features::navigation::{
-    NameTarget, find_references, goto_definition, resolve_name_at, span_text,
+    NameTarget, find_references, goto_definition, name_token, resolve_name_at, span_text,
 };
 
 /// A fixture module: path, text, origin.
@@ -216,5 +216,43 @@ fn an_unrecorded_occurrence_resolves_to_nothing() {
         let byte = at(LOCALS, needle, nth, 0);
         let resolved = byte.and_then(|byte| resolve_name_at(&db, root, entry, &main_path(), byte));
         assert!(resolved.is_none(), "{needle}: {resolved:?}");
+    }
+}
+
+/// `name_token` over a whole text: the narrowed token's text, or `None`.
+fn narrowed<'a>(text: &'a str, spelling: &str) -> Option<&'a str> {
+    let span = ipe_diagnostics::Span::new(0, u32::try_from(text.len()).ok()?);
+    span_text(text, name_token(text, span, spelling)?)
+}
+
+#[test]
+fn name_token_isolates_the_name_by_the_language_lexer() {
+    for (recorded, spelling) in [
+        ("total", "total"),
+        ("Lib.total", "total"),
+        ("A.B.total", "total"),
+        ("Circle r", "Circle"),
+        ("(Circle r)", "Circle"),
+        ("( {- c -} Circle r)", "Circle"),
+        ("(\n  -- c\n  Lib.Circle r)", "Circle"),
+    ] {
+        assert_eq!(narrowed(recorded, spelling), Some(spelling), "{recorded}");
+    }
+}
+
+#[test]
+fn name_token_refuses_what_it_cannot_isolate() {
+    for (recorded, spelling) in [
+        ("r.total", "total"),
+        ("totals", "total"),
+        ("total x", "total"),
+        ("(total)", "total"),
+        ("Circler r", "Circle"),
+        ("\"Circle\"", "Circle"),
+        ("{-| d -} Circle r", "Circle"),
+        ("(Just Circle)", "Circle"),
+        ("\"unterminated", "total"),
+    ] {
+        assert_eq!(narrowed(recorded, spelling), None, "{recorded}");
     }
 }

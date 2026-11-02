@@ -26,8 +26,9 @@
 
 use ipe_canon::name_index::Target;
 use ipe_db::{Db as _, IpeDatabase, SourceRoot};
-use ipe_diagnostics::Span;
+use ipe_diagnostics::{Span, TokenKind};
 use ipe_intern::Symbol;
+use ipe_parse::TokenClass;
 
 // ---------------------------------------------------------------------------
 // Public API types
@@ -123,27 +124,36 @@ pub fn span_text(text: &str, span: Span) -> Option<&str> {
 
 /// The span of the name token `spelling` inside a recorded occurrence `span`.
 ///
-/// A recorded span is the name itself, a qualified value (`Lib.total`, whose
-/// name token is the member suffix), or a constructor pattern with arguments
-/// (`Circle r`, `(Circle r)`, whose name token is the pattern head). Any other
-/// shape yields `None`: the caller must refuse rather than edit or report
-/// text that is not the name.
+/// The occurrence's text is split by the language lexer. A recorded span is
+/// the name's own identifier token, a qualified value (`Lib.total`, one
+/// dotted identifier token whose name is the member suffix), or a constructor
+/// pattern with arguments (`Circle r`, `(Circle r)`, whose name token is the
+/// first token after the opening parentheses). Any other shape — text that
+/// does not lex, a head that is not an identifier, an identifier that is not
+/// `spelling` behind module qualifiers — yields `None`: the caller must
+/// refuse rather than edit or report text that is not the name.
 #[must_use]
 pub fn name_token(text: &str, span: Span, spelling: &str) -> Option<Span> {
     let slice = span_text(text, span)?;
-    if let Some(offset) = member_offset(slice, spelling) {
-        return offset_span(span, offset, spelling);
-    }
-    // Only a constructor occurrence is recorded at a whole pattern.
-    if !spelling.starts_with(|c: char| c.is_ascii_uppercase()) {
+    let tokens = ipe_parse::try_source_tokens(slice)?;
+    let mut code = tokens
+        .iter()
+        .filter(|token| token.class != TokenClass::Code(TokenKind::Eof));
+    let head = if spelling.starts_with(|c: char| c.is_ascii_uppercase()) {
+        // Only a constructor occurrence is recorded at a whole pattern.
+        code.find(|token| token.class != TokenClass::Code(TokenKind::LParen))?
+    } else {
+        let only = code.next()?;
+        if code.next().is_some() {
+            return None;
+        }
+        only
+    };
+    if head.class != TokenClass::Code(TokenKind::Ident) {
         return None;
     }
-    let head_lo = slice.find(|c: char| c != '(' && !c.is_whitespace())?;
-    let rest = slice.get(head_lo..)?;
-    let head_len = rest
-        .find(|c: char| !(ipe_parse::is_ident_continue(c) || c == '.'))
-        .unwrap_or(rest.len());
-    let offset = member_offset(rest.get(..head_len)?, spelling)?;
+    let offset = member_offset(span_text(slice, head.span)?, spelling)?;
+    let head_lo = usize::try_from(head.span.lo).ok()?;
     offset_span(span, head_lo.checked_add(offset)?, spelling)
 }
 
@@ -533,9 +543,6 @@ pub fn occurrences(
     entry: ipe_db::SourceFile,
     target: &NameTarget,
 ) -> Vec<NameRef> {
-    let Some(wanted) = Wanted::of(db, target) else {
-        return Vec::new();
-    };
     // Dependency-first module order for consistent output. A cycle means no
     // safe canonicalize demand is possible — return empty rather than
     // iterating files and hitting salsa's dependency-cycle panic.
@@ -543,29 +550,35 @@ pub fn occurrences(
         return Vec::new();
     };
     let files = root.files(db);
-    let mut found: Vec<NameRef> = Vec::new();
-    for module_path in order.iter() {
-        if matches!(target, NameTarget::Local { module, .. } if module != module_path) {
-            continue;
-        }
-        let Some(&file) = files.get(module_path) else {
-            continue;
-        };
-        let Ok(canonical) = ipe_db::canonicalize(db, root, file) else {
-            continue;
-        };
-        found.extend(
+    let canonical: Vec<_> = order
+        .iter()
+        .filter(|module_path| {
+            !matches!(target, NameTarget::Local { module, .. } if module != *module_path)
+        })
+        .filter_map(|module_path| {
+            let &file = files.get(module_path)?;
+            let canonical = ipe_db::canonicalize(db, root, file).as_ref().ok()?;
+            Some((module_path, std::sync::Arc::clone(canonical)))
+        })
+        .collect();
+    // Only after canonicalising: the target's strings are interned by the
+    // queries that record its occurrences, so a lookup before them can miss.
+    let Some(wanted) = Wanted::of(db, target) else {
+        return Vec::new();
+    };
+    canonical
+        .iter()
+        .flat_map(|(module_path, canonical)| {
             canonical
                 .names
                 .entries()
                 .filter(|&(span, recorded)| wanted.matches(span, recorded))
                 .map(|(span, _)| NameRef {
-                    module: module_path.clone(),
+                    module: (*module_path).clone(),
                     span,
-                }),
-        );
-    }
-    found
+                })
+        })
+        .collect()
 }
 
 /// Every use site of `target`, each narrowed to its name token.
