@@ -8382,7 +8382,7 @@ foo n = n + 1
     /// Every code block a doc page renders is a block the checker judges:
     /// the renderer's `<pre>` count equals the scan's block count.
     #[test]
-    fn every_rendered_doc_code_block_is_judged() -> Result<(), &'static str> {
+    fn every_rendered_doc_code_block_is_judged() {
         let comment = "\
 Intro.
 
@@ -8404,7 +8404,6 @@ serve app
             .count();
         let scanned = crate::doc_fence::scan(comment, crate::doc_fence::Page::Doc).len();
         assert_eq!((rendered, scanned), (3, 3));
-        Ok(())
     }
 
     /// An unlisted failure and a listed key that now passes are both red; a
