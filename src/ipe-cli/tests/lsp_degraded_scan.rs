@@ -6,21 +6,36 @@
 //! the right answer for an editor request and a wrong one for anything that
 //! builds, checks, or reports, which must refuse with the module's first
 //! error. The facade's module is therefore named only by the interactive
-//! language-server features (`src/lsp/features/src/`) and by the database
-//! crate that defines it (`src/compiler/db/`). A Rust file anywhere else that
-//! names it goes red.
+//! language-server features (`src/lsp/features/src/`), by its own file and
+//! tests in the database crate, and by the one `pub mod` line declaring it,
+//! so no other module of the database crate (where the strict pipeline
+//! lives) reads it or re-exports it under another name. The features crate
+//! re-exposes the degraded results through its own accessors, so only the
+//! language server depends on it, and the server re-exports none of it.
 //!
-//! The scan covers every `.rs` file git would commit under `src/`, `tools/`,
-//! `examples/` and `editors/`. This file spells the module name through
-//! `concat!`, so it holds none.
+//! The scan covers every `.rs` and `Cargo.toml` file git would commit under
+//! `src/`, `tools/`, `examples/` and `editors/`. This file spells each
+//! guarded name through `concat!`, so it holds none.
 
 use std::path::PathBuf;
 
 /// The degraded facade's module name.
 const FACADE: &str = concat!("lsp", "_degraded");
 
-/// The workspace-relative prefixes allowed to name [`FACADE`].
-const ALLOWED: [&str; 2] = ["src/lsp/features/src/", "src/compiler/db/"];
+/// The workspace-relative prefixes allowed to name [`FACADE`] anywhere.
+const ALLOWED: [&str; 2] = ["src/lsp/features/src/", "src/compiler/db/tests/"];
+
+/// The database crate's root, which may name [`FACADE`] only to declare it.
+const DB_ROOT: &str = "src/compiler/db/src/lib.rs";
+
+/// The features crate, which re-exposes the degraded results.
+const FEATURES: &str = concat!("ipe_lsp", "_features");
+
+/// The manifests allowed to name [`FEATURES`]: its own and the language server's.
+const FEATURES_MANIFESTS: [&str; 2] = ["src/lsp/features/Cargo.toml", "src/lsp/server/Cargo.toml"];
+
+/// The language server's sources, which must not re-export [`FEATURES`].
+const SERVER: &str = "src/lsp/server/";
 
 /// The workspace root.
 fn workspace() -> PathBuf {
@@ -59,10 +74,10 @@ fn scanned_files() -> Vec<(String, String)> {
     let mut files = Vec::new();
     let mut unreadable = Vec::new();
     for rel in listed.split('\0') {
-        let is_rust = std::path::Path::new(rel)
-            .extension()
-            .is_some_and(|ext| ext == "rs");
-        if rel.is_empty() || !is_rust {
+        let path = std::path::Path::new(rel);
+        let is_rust = path.extension().is_some_and(|ext| ext == "rs");
+        let is_manifest = path.file_name().is_some_and(|name| name == "Cargo.toml");
+        if rel.is_empty() || !(is_rust || is_manifest) {
             continue;
         }
         let path = root.join(rel);
@@ -82,13 +97,37 @@ fn scanned_files() -> Vec<(String, String)> {
     files
 }
 
-/// Every file outside [`ALLOWED`] that names [`FACADE`].
+/// Whether `rel` may name [`FACADE`] as `text` does.
+fn may_name_facade(rel: &str, text: &str) -> bool {
+    let own_file = format!("src/compiler/db/src/{FACADE}.rs");
+    let declaration = format!("pub mod {FACADE};");
+    ALLOWED.iter().any(|prefix| rel.starts_with(prefix))
+        || rel == own_file
+        || (rel == DB_ROOT
+            && text
+                .lines()
+                .filter(|line| line.contains(FACADE))
+                .all(|line| line.trim() == declaration))
+}
+
+/// Whether `rel`, holding `text`, reaches the degraded analysis outside the language server.
+fn reaches(rel: &str, text: &str) -> bool {
+    if std::path::Path::new(rel)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+    {
+        (text.contains(FACADE) && !may_name_facade(rel, text))
+            || (rel.starts_with(SERVER) && text.contains(&format!("pub use {FEATURES}")))
+    } else {
+        text.contains(FEATURES) && !FEATURES_MANIFESTS.contains(&rel)
+    }
+}
+
+/// Every file that reaches the degraded analysis outside the language server.
 fn outside_reach(files: &[(String, String)]) -> Vec<String> {
     files
         .iter()
-        .filter(|(rel, text)| {
-            text.contains(FACADE) && !ALLOWED.iter().any(|prefix| rel.starts_with(prefix))
-        })
+        .filter(|(rel, text)| reaches(rel, text))
         .map(|(rel, _)| rel.clone())
         .collect()
 }
@@ -135,12 +174,74 @@ fn a_planted_reach_from_the_cli_is_refused() {
             "src/lsp/features/tests/hover.rs".to_owned(),
             format!("use ipe_db::{FACADE};\n"),
         ),
+        (
+            format!("src/compiler/db/src/{FACADE}.rs"),
+            format!("//! {FACADE}\n"),
+        ),
+        (
+            "src/compiler/db/tests/differential.rs".to_owned(),
+            format!("use ipe_db::{FACADE};\n"),
+        ),
     ];
     assert_eq!(
         outside_reach(&planted),
         vec![
             "src/ipe-cli/src/check.rs".to_owned(),
             "src/lsp/features/tests/hover.rs".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn a_planted_reach_inside_the_database_crate_is_refused() {
+    let planted = vec![
+        (
+            DB_ROOT.to_owned(),
+            format!("pub mod {FACADE};\npub use {FACADE}::typecheck_module as lenient;\n"),
+        ),
+        (
+            "src/compiler/db/src/build.rs".to_owned(),
+            format!("let types = crate::{FACADE}::typecheck_module(db, root, entry, file);\n"),
+        ),
+    ];
+    assert_eq!(
+        outside_reach(&planted),
+        vec![
+            DB_ROOT.to_owned(),
+            "src/compiler/db/src/build.rs".to_owned()
+        ]
+    );
+}
+
+#[test]
+fn a_planted_dependency_on_the_features_crate_is_refused() {
+    let planted = vec![
+        (
+            "src/lsp/server/Cargo.toml".to_owned(),
+            format!("{FEATURES} = {{ path = \"../features\" }}\n"),
+        ),
+        (
+            "src/lsp/features/Cargo.toml".to_owned(),
+            format!("name = \"{FEATURES}\"\n"),
+        ),
+        (
+            "src/ipe-cli/Cargo.toml".to_owned(),
+            format!("{FEATURES} = {{ path = \"../lsp/features\" }}\n"),
+        ),
+        (
+            "src/lsp/server/src/lib.rs".to_owned(),
+            format!("pub use {FEATURES}::db_access;\n"),
+        ),
+        (
+            "src/lsp/server/src/hover.rs".to_owned(),
+            format!("use {FEATURES}::hover::hover;\n"),
+        ),
+    ];
+    assert_eq!(
+        outside_reach(&planted),
+        vec![
+            "src/ipe-cli/Cargo.toml".to_owned(),
+            "src/lsp/server/src/lib.rs".to_owned(),
         ]
     );
 }

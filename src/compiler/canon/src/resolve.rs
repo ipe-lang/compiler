@@ -471,20 +471,16 @@ pub fn canonicalise(m: &src::Module, interner: &mut Interner) -> DResult<canon::
     // can only be raised via `canonicalise_module_with_origin`.
     // The single-module entry does not build a `ModuleExports`, so the kernel-
     // alias map is discarded — registration + def-skip already happened in `env`.
-    let mut failures = Vec::new();
-    let (canon_mod, _kernel_aliases, _own_aliases) = canonicalise_with_env(
+    canonicalise_with_env(
         m,
         &mut env,
         &QualifiedAliases::new(),
         ModuleOrigin::User,
         interner,
         &mut NameSink::new(),
-        &mut failures,
-    )?;
-    failures
-        .into_iter()
-        .next()
-        .map_or(Ok(canon_mod), |failure| Err(failure.error))
+        DeclRefusals::FailFirst,
+    )
+    .map(|(canon_mod, _kernel_aliases, _own_aliases)| canon_mod)
 }
 
 /// Canonicalise a module in a multi-module project context.
@@ -592,9 +588,8 @@ pub fn canonicalise_module_in_project(
 /// Canonicalise a module in a project, with the index of every name it resolved.
 ///
 /// Identical to [`canonicalise_module_in_project`]; the [`NameIndex`] is
-/// recorded by the same resolution pass that builds the module. The module is
-/// [`canonicalise_module_partial`]'s, refused with its first error when any
-/// declaration or module check failed.
+/// recorded by the same resolution pass that builds the module. It stops at
+/// the first refusal: no declaration or module check after it runs.
 ///
 /// # Errors
 /// Same set as [`canonicalise_module_in_project`].
@@ -606,20 +601,53 @@ pub fn canonicalise_module_indexed(
     origin: ModuleOrigin,
     interner: &mut Interner,
 ) -> DResult<(canon::Module, crate::ModuleExports, NameIndex)> {
-    let partial = canonicalise_module_partial(m, expected_path, deps, catalog, origin, interner)?;
     let PartialModule {
         module,
         exports,
         names,
-        failures,
-        module_errors,
-    } = partial;
-    failures
-        .into_iter()
-        .map(|failure| failure.error)
-        .chain(module_errors)
-        .next()
-        .map_or(Ok((module, exports, names)), Err)
+        failures: _,
+        module_errors: _,
+    } = canonicalise_module_refusing(
+        m,
+        expected_path,
+        deps,
+        catalog,
+        origin,
+        interner,
+        Refusals::FailFirst,
+    )?;
+    Ok((module, exports, names))
+}
+
+/// How a module pass treats a refusal it meets.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Refusals {
+    /// Return the first refusal; nothing after it runs.
+    FailFirst,
+    /// Record each value declaration's and each module check's refusal and continue.
+    Collect,
+}
+
+impl Refusals {
+    /// Record one module check's outcome, or return its refusal when failing first.
+    fn check(self, errors: &mut Vec<Diagnostic>, outcome: DResult<()>) -> DResult<()> {
+        match (self, outcome) {
+            (_, Ok(())) => Ok(()),
+            (Self::FailFirst, Err(error)) => Err(error),
+            (Self::Collect, Err(error)) => {
+                errors.push(error);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// How the value-declaration loop treats a declaration that fails.
+enum DeclRefusals<'a> {
+    /// Return the first failure; no later declaration is canonicalised.
+    FailFirst,
+    /// Record each failure here and canonicalise the next declaration.
+    Collect(&'a mut Vec<DeclFailure>),
 }
 
 /// A value declaration whose annotation resolved although its body failed.
@@ -640,7 +668,7 @@ pub struct DeclaredSignature {
 pub struct DeclFailure {
     /// The declared name.
     pub name: Symbol,
-    /// The source extent of the declaration, annotation included.
+    /// The source extent of the declaration, annotation and body included.
     pub extent: Span,
     /// Why it failed.
     pub error: Diagnostic,
@@ -667,16 +695,15 @@ pub struct PartialModule {
     pub module_errors: Vec<Diagnostic>,
 }
 
-/// The source extent of a value declaration, its annotation included.
+/// The source extent of a value declaration: its annotation, name, parameters, and body.
 #[must_use]
 pub fn decl_extent(value: &Located<src::Value>) -> Span {
-    value
-        .value
-        .type_annotation
-        .as_ref()
-        .map_or(value.span, |ann| Span {
-            lo: value.span.lo.min(ann.span.lo),
-            hi: value.span.hi.max(ann.span.hi),
+    [value.value.name.span, value.value.body.span]
+        .into_iter()
+        .chain(value.value.type_annotation.as_ref().map(|ann| ann.span))
+        .fold(value.span, |extent, part| Span {
+            lo: extent.lo.min(part.lo),
+            hi: extent.hi.max(part.hi),
         })
 }
 
@@ -691,7 +718,6 @@ pub fn decl_extent(value: &Located<src::Value>) -> Span {
 /// # Errors
 /// Every refusal of [`canonicalise_module_in_project`] that is not one value
 /// declaration's or one module check's.
-#[allow(clippy::too_many_lines)] // one linear resolution pass over a module's declarations
 pub fn canonicalise_module_partial(
     m: &src::Module,
     expected_path: &[Symbol],
@@ -699,6 +725,35 @@ pub fn canonicalise_module_partial(
     catalog: &crate::ModuleCatalog,
     origin: ModuleOrigin,
     interner: &mut Interner,
+) -> DResult<PartialModule> {
+    canonicalise_module_refusing(
+        m,
+        expected_path,
+        deps,
+        catalog,
+        origin,
+        interner,
+        Refusals::Collect,
+    )
+}
+
+/// Canonicalise a module in a project, each refusal treated as `refusals` says.
+///
+/// Under [`Refusals::FailFirst`] the returned failure lists are empty.
+///
+/// # Errors
+/// Every refusal of [`canonicalise_module_in_project`]; under
+/// [`Refusals::Collect`], none that is one value declaration's or one module
+/// check's.
+#[allow(clippy::too_many_lines)] // one linear resolution pass over a module's declarations
+fn canonicalise_module_refusing(
+    m: &src::Module,
+    expected_path: &[Symbol],
+    deps: &BTreeMap<Vec<Symbol>, &crate::ModuleExports>,
+    catalog: &crate::ModuleCatalog,
+    origin: ModuleOrigin,
+    interner: &mut Interner,
+    refusals: Refusals,
 ) -> DResult<PartialModule> {
     let home = m.name.value.clone();
 
@@ -908,6 +963,10 @@ pub fn canonicalise_module_partial(
 
     let mut names = NameSink::new();
     let mut failures = Vec::new();
+    let decl_refusals = match refusals {
+        Refusals::FailFirst => DeclRefusals::FailFirst,
+        Refusals::Collect => DeclRefusals::Collect(&mut failures),
+    };
     let (mut canon_mod, kernel_aliases, own_aliases) = canonicalise_with_env(
         m,
         &mut env,
@@ -915,7 +974,7 @@ pub fn canonicalise_module_partial(
         origin,
         interner,
         &mut names,
-        &mut failures,
+        decl_refusals,
     )?;
     // The record-alias auto-constructors that were actually synthesized:
     // exactly the defs whose name is an alias name. A function-field alias is
@@ -940,9 +999,10 @@ pub fn canonicalise_module_partial(
     // build-time invariant. It can never fire for user code (User origin skips
     // this block); synthesised record-alias ctors are `Def::Typed`, so they pass.
     let mut module_errors = Vec::new();
-    if let Err(error) = check_stdlib_annotated(&canon_mod, origin, &home, interner) {
-        module_errors.push(error);
-    }
+    refusals.check(
+        &mut module_errors,
+        check_stdlib_annotated(&canon_mod, origin, &home, interner),
+    )?;
 
     // Build the export surface from the module's own `exposing (…)` clause.
     let exports = build_module_exports(
@@ -960,21 +1020,36 @@ pub fn canonicalise_module_partial(
     // `Ipe.Web.Console` helpers are static and never import a shape, and only
     // USER modules are subject to the Program/TEA distinction.
     if origin == ModuleOrigin::User {
-        let checks = [
+        // Each check runs only once every earlier one passed, unless collecting.
+        refusals.check(
+            &mut module_errors,
             check_main_not_runtime_branched(&canon_mod, interner),
+        )?;
+        refusals.check(
+            &mut module_errors,
             check_program_tea_import_gate(m, &canon_mod, interner),
+        )?;
+        refusals.check(
+            &mut module_errors,
             check_cross_shape_cmd_sub_gate(m, &canon_mod, interner),
+        )?;
+        refusals.check(
+            &mut module_errors,
             check_input_fields_are_subscriptions(&canon_mod, interner),
+        )?;
+        refusals.check(
+            &mut module_errors,
             check_library_ssot_import_gate(m, interner),
-        ];
-        module_errors.extend(checks.into_iter().filter_map(Result::err));
+        )?;
         // Thread a sibling top-level `config` binding into the app entry
         // (`main = Web.tea { … }` becomes `Web.appWith config { … }`), or reject
-        // a `config` binding that no app entry consumes (IPE-N0043).
-        if module_errors.is_empty()
-            && let Err(error) = thread_config_binding(&mut canon_mod, interner)
-        {
-            module_errors.push(error);
+        // a `config` binding that no app entry consumes (IPE-N0043). A module
+        // a check refused is never threaded.
+        if module_errors.is_empty() {
+            refusals.check(
+                &mut module_errors,
+                thread_config_binding(&mut canon_mod, interner),
+            )?;
         }
     }
 
@@ -2954,7 +3029,7 @@ fn canonicalise_with_env(
     origin: ModuleOrigin,
     interner: &mut Interner,
     names: &mut NameSink,
-    failures: &mut Vec<DeclFailure>,
+    mut refusals: DeclRefusals<'_>,
 ) -> DResult<CanonicalisedModule> {
     let home = env.home.clone();
 
@@ -3126,9 +3201,13 @@ fn canonicalise_with_env(
         if kernel_aliases.contains_key(&v.value.name.value) {
             continue;
         }
-        match canonicalise_value(&v.value, env, qualified_aliases, &mut cx) {
-            Ok(def) => defs.push(def),
-            Err(error) => {
+        match (
+            canonicalise_value(&v.value, env, qualified_aliases, &mut cx),
+            &mut refusals,
+        ) {
+            (Ok(def), _) => defs.push(def),
+            (Err(error), DeclRefusals::FailFirst) => return Err(error),
+            (Err(error), DeclRefusals::Collect(failures)) => {
                 let signature = v.value.type_annotation.as_ref().and_then(|ann| {
                     canonicalise_annotation(ann, env, qualified_aliases, cx.interner)
                         .ok()

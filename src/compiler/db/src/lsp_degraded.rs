@@ -195,6 +195,11 @@ struct DegradedSolve {
     interface: Option<Arc<ipe_types::TypedInterface>>,
     /// The values whose type is an annotation, kept even when polymorphic.
     annotated: BTreeSet<Symbol>,
+    /// The extents, ordered by start, of the kept declarations a left-out body
+    /// may share a solver variable with: their types are withheld whole.
+    shared: Vec<Span>,
+    /// The kept unannotated values among them.
+    shared_names: BTreeSet<Symbol>,
 }
 
 /// The typed interface of `file`: the strict one, else its degraded solve's.
@@ -261,7 +266,11 @@ impl Prune<'_> {
     }
 
     /// Leave out every declaration that reads a value the solve cannot type.
-    fn close(&mut self) {
+    ///
+    /// `false` when such an occurrence lies in no value declaration, or the
+    /// closure does not settle: the module then has no degraded solve.
+    #[must_use]
+    fn close(&mut self) -> bool {
         // Each round that changes anything leaves out one more declaration.
         for _ in 0..=self.extents.len() {
             let mut grew = false;
@@ -269,20 +278,32 @@ impl Prune<'_> {
                 if !self.unresolvable(home, *name) {
                     continue;
                 }
-                if let Some(owner) = self.owner(*span)
-                    && !self.is_declared(owner)
-                    && self.dropped.insert(owner)
-                {
+                let Some(owner) = self.owner(*span) else {
+                    return false;
+                };
+                if !self.is_declared(owner) && self.dropped.insert(owner) {
                     grew = true;
                 }
             }
             if !grew {
-                return;
+                return true;
             }
+        }
+        false
+    }
+
+    /// Know `signature`'s declaration by its annotation, or leave it out when
+    /// the annotation's meaning depends on the body.
+    fn declare(&mut self, signature: DeclaredSignature) {
+        if mentions_wildcard(&signature.ty) {
+            self.dropped.insert(signature.name.value);
+        } else {
+            self.declared.push(signature);
         }
     }
 
-    /// Prune the declaration a solve refusal names, reporting whether the refusal was attributable.
+    /// Prune the declaration a solve refusal names, reporting whether the refusal was attributable
+    /// and the pruned module still closes.
     ///
     /// A declaration with an annotation is then known by that annotation;
     /// one already known so, or with none, is left out.
@@ -319,17 +340,81 @@ impl Prune<'_> {
             }),
             _ => None,
         }) {
-            self.declared.push(signature);
+            self.declare(signature);
         } else {
             self.dropped.insert(owner);
         }
-        self.close();
-        true
+        self.close()
+    }
+
+    /// Whether the solve left out a body the module declares.
+    fn pruned(&self) -> bool {
+        !self.dropped.is_empty() || !self.declared.is_empty()
     }
 
     /// Whether the solve keeps `name`'s body.
     fn keeps(&self, name: Symbol) -> bool {
         !self.dropped.contains(&name) && !self.is_declared(name)
+    }
+
+    /// The kept declarations a left-out body may share a solver variable with.
+    ///
+    /// An unannotated top-level value is one variable across its module, so a
+    /// left-out body that reads it may pin it, and with it every declaration
+    /// that reads it, transitively; a default the solve then applies (an
+    /// unpinned number to `Int`) is not the full program's. A left-out body
+    /// may have failed to canonicalise, so what it reads is taken from its
+    /// source text: every word spelled as a kept unannotated value counts.
+    /// `untyped` maps each kept unannotated value to its spelling.
+    fn shared_with_left_out(
+        &self,
+        untyped: &BTreeMap<Symbol, String>,
+        text: &str,
+    ) -> BTreeSet<Symbol> {
+        let by_spelling: BTreeMap<&str, Symbol> = untyped
+            .iter()
+            .map(|(name, spelling)| (spelling.as_str(), *name))
+            .collect();
+        let mut shared: BTreeSet<Symbol> = BTreeSet::new();
+        for (extent, name) in self.extents {
+            if self.keeps(*name) {
+                continue;
+            }
+            let body = usize::try_from(extent.lo)
+                .ok()
+                .zip(usize::try_from(extent.hi).ok())
+                .and_then(|(lo, hi)| text.get(lo..hi));
+            let Some(body) = body else {
+                // Unreadable: it may read every one of them.
+                return self.extents.iter().map(|(_, name)| *name).collect();
+            };
+            shared.extend(
+                body.split(|c: char| !ipe_parse::is_ident_continue(c))
+                    .filter_map(|word| by_spelling.get(word).copied()),
+            );
+        }
+        let mut adjacent: BTreeMap<Symbol, Vec<Symbol>> = BTreeMap::new();
+        for (span, home, name) in self.refs {
+            if home != self.home || !untyped.contains_key(name) {
+                continue;
+            }
+            let Some(owner) = self.owner(*span) else {
+                continue;
+            };
+            if self.keeps(owner) {
+                adjacent.entry(owner).or_default().push(*name);
+                adjacent.entry(*name).or_default().push(owner);
+            }
+        }
+        let mut pending: Vec<Symbol> = shared.iter().copied().collect();
+        while let Some(name) = pending.pop() {
+            for next in adjacent.get(&name).into_iter().flatten() {
+                if shared.insert(*next) {
+                    pending.push(*next);
+                }
+            }
+        }
+        shared
     }
 }
 
@@ -349,6 +434,7 @@ fn infer_module_degraded(
         return None;
     }
     let parsed = crate::parse(db, module).clone().ok()?;
+    let text = module.text(db);
     let resolutions = crate::resolve_imports(db, root, module).clone().ok()?;
     // Every dep interface is demanded before the interner lock is taken.
     let mut dep_interfaces: Vec<(Vec<String>, Arc<ipe_types::TypedInterface>)> = Vec::new();
@@ -360,6 +446,7 @@ fn infer_module_degraded(
             ));
         }
     }
+    let unimported = imported_by_none(db, root, module)?;
     let limits = crate::solve_limits(db).ok()?;
     let mut extents: Vec<(Span, Symbol)> = parsed
         .values
@@ -382,9 +469,14 @@ fn infer_module_degraded(
         defs: &canonical.module.defs,
         deps: &deps,
         dropped: degraded.dropped.clone(),
-        declared: degraded.declared.clone(),
+        declared: Vec::new(),
     };
-    prune.close();
+    for signature in degraded.declared.iter().cloned() {
+        prune.declare(signature);
+    }
+    if !prune.close() {
+        return None;
+    }
     // Every attributable refusal prunes one more declaration, and a
     // declaration is pruned at most twice.
     let attempts = extents
@@ -406,39 +498,21 @@ fn infer_module_degraded(
             limits.steps,
         ) {
             Ok(inference) => {
-                drop(interner);
-                let annotated: BTreeSet<Symbol> = pruned
+                let untyped: BTreeMap<Symbol, String> = pruned
                     .defs
                     .iter()
-                    .filter(|def| matches!(def, ipe_canon::ast::Def::Typed { .. }))
-                    .map(|def| def.name().value)
-                    .chain(prune.declared.iter().map(|signature| signature.name.value))
-                    .collect();
-                let (solved, interface) = match inference.interface {
-                    ipe_types::InterfaceStatus::Closed(interface) => (
-                        crate::scoped_module_slice(&inference.solved, home, &deps)
-                            .ok()
-                            .and_then(|slice| {
-                                ipe_types::canonicalize(
-                                    slice,
-                                    ipe_types::VarScope::PerHome,
-                                    limits.var_ceiling,
-                                )
-                                .ok()
-                            })
-                            .map(Arc::new),
-                        Some(Arc::new(interface)),
-                    ),
-                    ipe_types::InterfaceStatus::ImporterDependent(interface) => {
-                        (None, Some(Arc::new(interface)))
-                    }
-                    ipe_types::InterfaceStatus::Open => (None, None),
-                };
-                return Some(Arc::new(DegradedSolve {
-                    solved,
-                    interface,
-                    annotated,
-                }));
+                    .filter(|def| !matches!(def, ipe_canon::ast::Def::Typed { .. }))
+                    .map(|def| {
+                        let name = def.name().value;
+                        interner
+                            .resolve(name)
+                            .map(|spelling| (name, spelling.to_owned()))
+                    })
+                    .collect::<Option<_>>()?;
+                drop(interner);
+                return Some(settle(
+                    &prune, &pruned, &untyped, text, inference, unimported, limits,
+                ));
             }
             Err(err) => {
                 if !prune.prune_at(&err) {
@@ -450,22 +524,141 @@ fn infer_module_degraded(
     None
 }
 
+/// The degraded result of a solve of `pruned` that succeeded.
+///
+/// `untyped` maps each kept unannotated value to its spelling; `unimported`
+/// says no module of the root imports this one.
+fn settle(
+    prune: &Prune<'_>,
+    pruned: &ipe_canon::ast::Module,
+    untyped: &BTreeMap<Symbol, String>,
+    text: &str,
+    inference: ipe_types::ModuleInference,
+    unimported: bool,
+    limits: crate::SolveLimits,
+) -> Arc<DegradedSolve> {
+    let shared_names = prune.shared_with_left_out(untyped, text);
+    let shared: Vec<Span> = prune
+        .extents
+        .iter()
+        .filter(|(_, name)| shared_names.contains(name))
+        .map(|(extent, _)| *extent)
+        .collect();
+    let bodied: BTreeSet<Symbol> = pruned
+        .defs
+        .iter()
+        .filter(|def| matches!(def, ipe_canon::ast::Def::Typed { .. }))
+        .map(|def| def.name().value)
+        .collect();
+    let annotated: BTreeSet<Symbol> = bodied
+        .iter()
+        .copied()
+        .chain(prune.declared.iter().map(|signature| signature.name.value))
+        .collect();
+    // The module's own solve is faithful when no importer's use
+    // site can pin it: a closed interface, or no importer at all.
+    let (own_faithful, interface) = match inference.interface {
+        ipe_types::InterfaceStatus::Closed(interface) => (true, Some(interface)),
+        ipe_types::InterfaceStatus::ImporterDependent(interface) => (unimported, Some(interface)),
+        ipe_types::InterfaceStatus::Open => (unimported, None),
+    };
+    let solved = if own_faithful {
+        crate::scoped_module_slice(&inference.solved, prune.home, prune.deps)
+            .ok()
+            .and_then(|slice| {
+                ipe_types::canonicalize(slice, ipe_types::VarScope::PerHome, limits.var_ceiling)
+                    .ok()
+            })
+            .map(Arc::new)
+    } else {
+        None
+    };
+    let interface = interface.map(|mut interface| {
+        if prune.pruned() {
+            // A left-out body may have pinned a variable of an
+            // unannotated value's scheme, and a declaration known
+            // by its annotation has unknown obligations: only a
+            // scheme without a variable, or a solved annotated
+            // body's, still stands for the module.
+            interface
+                .values
+                .retain(|name, scheme| bodied.contains(name) || !scheme.ty.holds_variable());
+        }
+        Arc::new(interface)
+    });
+    Arc::new(DegradedSolve {
+        solved,
+        interface,
+        annotated,
+        shared,
+        shared_names,
+    })
+}
+
+/// Whether no module of `root` imports `module`; `None` when some module's imports do not resolve.
+fn imported_by_none(db: &dyn Db, root: SourceRoot, module: SourceFile) -> Option<bool> {
+    for file in root.files(db).values() {
+        let resolutions = crate::resolve_imports(db, root, *file).as_ref().ok()?;
+        if resolutions
+            .iter()
+            .any(|(_, resolution)| *resolution == ImportResolution::Resolved(module))
+        {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+/// Whether a wildcard `any` occurs in `ty`.
+fn mentions_wildcard(ty: &ipe_canon::ast::Type) -> bool {
+    use ipe_canon::ast::Type;
+    let mut pending = vec![ty];
+    while let Some(ty) = pending.pop() {
+        match ty {
+            Type::Wildcard => return true,
+            Type::Var(_) | Type::Unit => {}
+            Type::Lambda(arg, result) => {
+                pending.push(arg);
+                pending.push(result);
+            }
+            Type::Con { args, .. } | Type::Tuple(args) => pending.extend(args),
+            Type::Record(fields) | Type::RecordOpen(_, fields) => {
+                pending.extend(fields.iter().map(|(_, field)| field));
+            }
+        }
+    }
+    false
+}
+
 /// Withhold every type a pruned solve may have left unpinned.
 ///
 /// A region, an expected type, or an unannotated value's type that holds a
-/// solver variable is withheld, as is a region with no width.
-fn withhold_residuals(types: ModuleTypes, annotated: &BTreeSet<Symbol>) -> ModuleTypes {
+/// solver variable is withheld, as is a region with no width, and every
+/// type inside a declaration a left-out body may share a variable with.
+fn withhold_residuals(types: ModuleTypes, solve: &DegradedSolve) -> ModuleTypes {
     let ModuleTypes {
         env,
         regions,
         expected,
         bounds,
     } = types;
-    let pinned = |(span, ty): &(Span, ipe_types::Ty)| span.lo < span.hi && !ty.holds_variable();
+    let shared = |span: Span| {
+        let after = solve.shared.partition_point(|extent| extent.lo <= span.lo);
+        after
+            .checked_sub(1)
+            .and_then(|at| solve.shared.get(at))
+            .is_some_and(|extent| span.hi <= extent.hi)
+    };
+    let pinned = |(span, ty): &(Span, ipe_types::Ty)| {
+        span.lo < span.hi && !ty.holds_variable() && !shared(*span)
+    };
     ModuleTypes {
         env: env
             .into_iter()
-            .filter(|(name, ty)| annotated.contains(name) || !ty.holds_variable())
+            .filter(|(name, ty)| {
+                solve.annotated.contains(name)
+                    || (!ty.holds_variable() && !solve.shared_names.contains(name))
+            })
             .collect(),
         regions: regions.into_iter().filter(pinned).collect(),
         expected: expected.into_iter().filter(pinned).collect(),
@@ -492,7 +685,7 @@ fn typecheck_module_degraded(
     };
     Some(Arc::new(withhold_residuals(
         project_module_types(solved.as_solved(), &home),
-        &solve.annotated,
+        &solve,
     )))
 }
 

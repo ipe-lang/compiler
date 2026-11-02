@@ -168,23 +168,177 @@ const IDENT: &str = "ident x =\n    x\n\n";
 
 #[test]
 fn a_pruned_solve_withholds_an_unpinned_type() -> Result<(), &'static str> {
-    let strict_text = format!("module Main exposing (main)\n\n{IDENT}main =\n    ident 1\n");
+    // Untyped bindings are monomorphic within their module, so the call in
+    // `pinner` pins `ident`'s parameter.
+    let strict_text = format!(
+        "module Main exposing (main)\n\n{HELPER}{IDENT}pinner =\n    ident 2\n\nmain =\n    helper 1\n"
+    );
     let db = IpeDatabase::new();
     let (root, main) = single(&db, &strict_text);
     let byte = last(&strict_text, "    x", 4)?;
     assert!(hover(&db, root, main, main, &main_path(), byte, None).is_some());
 
+    // The only pinner is left out, so the parameter's type is unknown.
     let degraded_text = format!(
-        "module Main exposing (main)\n\n{IDENT}broken =\n    missing\n\nmain =\n    ident 1\n"
+        "module Main exposing (main)\n\n{HELPER}{IDENT}pinner =\n    ident missing\n\nmain =\n    helper 1\n"
     );
     let db = IpeDatabase::new();
     let (root, main) = single(&db, &degraded_text);
     let byte = last(&degraded_text, "    x", 4)?;
     assert_eq!(hover(&db, root, main, main, &main_path(), byte, None), None);
-    // The pinned use site still answers.
-    let call = last(&degraded_text, "ident 1", "ident ".len())?;
+    // The sibling that never reads it still answers.
+    let call = last(&degraded_text, "helper 1", 0)?;
     let info = hover(&db, root, main, main, &main_path(), call, None);
+    assert!(
+        matches!(&info, Some(info) if info.ty == "Int -> Int"),
+        "{info:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_reader_of_a_failed_declaration_is_withheld_and_its_siblings_answer() -> Result<(), &'static str>
+{
+    let text = format!(
+        "module Main exposing (main)\n\n{HELPER}\
+         broken =\n    missing\n\nuser =\n    helper broken\n\nmain =\n    helper 1\n"
+    );
+    let db = IpeDatabase::new();
+    let (root, main) = single(&db, &text);
+    let sibling = last(&text, "helper 1", 0)?;
+    let info = hover(&db, root, main, main, &main_path(), sibling, None);
+    assert!(
+        matches!(&info, Some(info) if info.ty == "Int -> Int"),
+        "{info:?}"
+    );
+    let reader = last(&text, "helper broken", 0)?;
+    assert_eq!(
+        hover(&db, root, main, main, &main_path(), reader, None),
+        None
+    );
+    Ok(())
+}
+
+#[test]
+fn a_left_out_body_that_pinned_a_number_leaves_no_default() -> Result<(), &'static str> {
+    // `y` reads `x` and `pinner` reads `y`: one variable, which `1.5` pins.
+    let strict_text = "module Main exposing (main)\n\n\
+        x =\n    1\n\ny =\n    x\n\nz =\n    2\n\npinner =\n    y + 1.5\n\nmain =\n    z\n";
+    let db = IpeDatabase::new();
+    let (root, main) = single(&db, strict_text);
+    let byte = last(strict_text, "    1\n", 4)?;
+    let info = hover(&db, root, main, main, &main_path(), byte, None);
+    assert!(
+        matches!(&info, Some(info) if info.ty == "Float"),
+        "{info:?}"
+    );
+
+    let degraded_text = "module Main exposing (main)\n\n\
+        x =\n    1\n\ny =\n    x\n\nz =\n    2\n\npinner =\n    y + missing\n\nmain =\n    z\n";
+    let db = IpeDatabase::new();
+    let (root, main) = single(&db, degraded_text);
+    let byte = last(degraded_text, "    1\n", 4)?;
+    let info = hover(&db, root, main, main, &main_path(), byte, None);
+    assert!(
+        info.as_ref().is_none_or(|info| info.ty == "Float"),
+        "{info:?}"
+    );
+    // A number no left-out body reaches keeps its default.
+    let byte = last(degraded_text, "    2\n", 4)?;
+    let info = hover(&db, root, main, main, &main_path(), byte, None);
     assert!(matches!(&info, Some(info) if info.ty == "Int"), "{info:?}");
+    Ok(())
+}
+
+const LEAKY_LIB: &str = "module Lib exposing (ident, pinner)\n\n\
+    ident x =\n    x\n\npinner =\n    ident missing\n";
+
+const LEAKY_MAIN: &str = "module Main exposing (main)\n\nimport Lib\n\n\
+    main =\n    Lib.ident \"s\"\n";
+
+#[test]
+fn a_pruned_module_exports_no_scheme_a_left_out_body_could_pin() -> Result<(), &'static str> {
+    let db = IpeDatabase::new();
+    let lib = file(&db, &["Lib"], LEAKY_LIB);
+    let main = file(&db, &["Main"], LEAKY_MAIN);
+    let root = root_of(&db, &[(&["Lib"], lib), (&["Main"], main)]);
+    let byte = last(LEAKY_MAIN, "Lib.ident", "Lib.".len())?;
+    assert_eq!(hover(&db, root, main, main, &main_path(), byte, None), None);
+    Ok(())
+}
+
+const DECLARED_LIB: &str = "module Lib exposing (pick)\n\n\
+    pick : a -> a\npick x =\n    missing\n";
+
+const DECLARED_MAIN: &str = "module Main exposing (main)\n\nimport Lib\n\n\
+    main =\n    Lib.pick 1\n";
+
+#[test]
+fn a_polymorphic_annotation_with_no_body_stays_in_its_module() -> Result<(), &'static str> {
+    let db = IpeDatabase::new();
+    let lib = file(&db, &["Lib"], DECLARED_LIB);
+    let main = file(&db, &["Main"], DECLARED_MAIN);
+    let root = root_of(&db, &[(&["Lib"], lib), (&["Main"], main)]);
+    let byte = last(DECLARED_MAIN, "Lib.pick", "Lib.".len())?;
+    assert_eq!(hover(&db, root, main, main, &main_path(), byte, None), None);
+    Ok(())
+}
+
+#[test]
+fn an_annotation_holding_a_wildcard_does_not_stand_for_its_body() -> Result<(), &'static str> {
+    // The body decides what `any` is, and the caller's number follows it.
+    let strict_text = "module Main exposing (main)\n\n\
+        view : Int -> any\nview n =\n    1.5\n\nmain =\n    view 1 + 2\n";
+    let db = IpeDatabase::new();
+    let (root, main) = single(&db, strict_text);
+    let byte = last(strict_text, "+ 2", 2)?;
+    let info = hover(&db, root, main, main, &main_path(), byte, None);
+    assert!(
+        matches!(&info, Some(info) if info.ty == "Float"),
+        "{info:?}"
+    );
+
+    // Left out with its readers, so a sibling that reads neither answers.
+    let degraded_text = format!(
+        "module Main exposing (main)\n\n{HELPER}\
+         view : Int -> any\nview n =\n    missing\n\nuser =\n    view 1 + 2\n\n\
+         main =\n    helper 1\n"
+    );
+    let db = IpeDatabase::new();
+    let (root, main) = single(&db, &degraded_text);
+    let byte = last(&degraded_text, "+ 2", 2)?;
+    let info = hover(&db, root, main, main, &main_path(), byte, None);
+    assert!(
+        info.as_ref().is_none_or(|info| info.ty == "Float"),
+        "{info:?}"
+    );
+    let sibling = last(&degraded_text, "helper 1", 0)?;
+    let info = hover(&db, root, main, main, &main_path(), sibling, None);
+    assert!(
+        matches!(&info, Some(info) if info.ty == "Int -> Int"),
+        "{info:?}"
+    );
+    Ok(())
+}
+
+const NUMBER_LIB: &str = "module Lib exposing (one)\n\n\
+    one =\n    1\n\nbroken =\n    missing\n";
+
+const NUMBER_MAIN: &str = "module Main exposing (main)\n\nimport Lib\n\n\
+    main =\n    Lib.one + 1.5\n";
+
+#[test]
+fn an_open_module_with_an_importer_withholds_its_own_types() -> Result<(), &'static str> {
+    let db = IpeDatabase::new();
+    let lib = file(&db, &["Lib"], NUMBER_LIB);
+    let main = file(&db, &["Main"], NUMBER_MAIN);
+    let root = root_of(&db, &[(&["Lib"], lib), (&["Main"], main)]);
+    let byte = last(NUMBER_LIB, "    1\n", 4)?;
+    let info = hover(&db, root, main, lib, &["Lib".to_owned()], byte, None);
+    assert!(
+        info.as_ref().is_none_or(|info| info.ty == "Float"),
+        "{info:?}"
+    );
     Ok(())
 }
 
