@@ -32,7 +32,7 @@ use ipe_ir::{
 const TYPED_ERROR_EXIT: i32 = 1;
 
 /// `callee(args)` with no pin, outside a form.
-fn call(callee: Callee, args: Vec<Expr>) -> Expr {
+const fn call(callee: Callee, args: Vec<Expr>) -> Expr {
     Expr::Call {
         callee,
         args,
