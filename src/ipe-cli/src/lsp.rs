@@ -390,10 +390,12 @@ mod stdlib_cache {
                 CompiledStdModule {
                     dotted: "Ipe.A",
                     source: "",
+                    tier: ipe_stdlib::StdTier::Public,
                 },
                 CompiledStdModule {
                     dotted: "Ipe.B",
                     source: "x",
+                    tier: ipe_stdlib::StdTier::Public,
                 },
             ];
             assert_eq!(table_footprint(&table), Some(2));
