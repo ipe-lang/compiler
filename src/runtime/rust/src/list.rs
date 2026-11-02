@@ -2,7 +2,7 @@
 
 use super::IpeMaybe;
 use super::basics::{IpeOrder, IpeWrappingAdd, IpeWrappingMul};
-use crate::core::{IntOp, RuntimeTrip, trip};
+use crate::core::{CeilingKernel, IntOp, RuntimeTrip, trip};
 
 /// `Ipe.List.singleton : a -> List a` — the one-element list `[x]`. Total.
 pub fn list_singleton<T>(x: T) -> Vec<T> {
@@ -10,12 +10,18 @@ pub fn list_singleton<T>(x: T) -> Vec<T> {
 }
 
 /// `Ipe.List.repeat : Int -> a -> List a` — `n` copies of `x`. Elm semantics:
-/// `n <= 0` yields `[]`. `T: Clone` because each copy is a fresh clone.
+/// `n <= 0` yields `[]`. `T: Clone` because each copy is a fresh clone. A
+/// count past its ceiling ([`CeilingKernel::ceiling`]) trips `OutputCeiling`
+/// before any allocation.
 pub fn list_repeat<T: Clone>(n: i64, x: T) -> Vec<T> {
     if n <= 0 {
-        Vec::new()
-    } else {
-        vec![x; crate::narrow::count_from_int(n)]
+        return Vec::new();
+    }
+    match usize::try_from(n) {
+        Ok(count) if count <= CeilingKernel::ListRepeat.ceiling() => vec![x; count],
+        Ok(_) | Err(_) => trip(RuntimeTrip::OutputCeiling {
+            kernel: CeilingKernel::ListRepeat,
+        }),
     }
 }
 
@@ -328,31 +334,22 @@ pub fn list_foldr<T0, T1>(f: impl Fn(T0, T1) -> T1, init: T1, list: Vec<T0>) -> 
     }
     acc
 }
-// Ipê `List.range` is INCLUSIVE: range 1 3 = [1, 2, 3].
+/// `Ipe.List.range : Int -> Int -> List Int` — `lo` to `hi` INCLUSIVE:
+/// `range 1 3 = [1, 2, 3]`; `hi < lo` yields `[]`. A span past its ceiling
+/// ([`CeilingKernel::ceiling`]) trips `OutputCeiling` before any allocation —
+/// never a truncated prefix.
 #[must_use]
 pub fn list_range(lo: i64, hi: i64) -> Vec<i64> {
-    // Bound the allocation: lo/hi are caller-controlled; an absurd span (e.g.
-    // 0..i64::MAX) would OOM. Cap at 10M elements (any real list is far smaller).
-    // Over the cap, emit the first 10M (a correct PREFIX) plus a structured warn,
-    // never a silently-wrong empty list — `[]` for `List.range 1 20000000` is a
-    // wrong result for input Ipê's types accept, far more surprising than a
-    // truncated-with-warning span.
-    const CAP: usize = 10_000_000;
     if hi < lo {
         return Vec::new();
     }
-    let n = i128::from(hi) - i128::from(lo) + 1;
-    if !usize::try_from(n).is_ok_and(|n| n <= CAP) {
-        crate::system::emit_runtime_log(
-            "list",
-            &format!(
-                "List.range: span of {n} elements exceeds the {CAP}-element allocation cap; \
-                 returning the first {CAP} only"
-            ),
-        );
-        return (lo..=hi).take(CAP).collect();
+    let span = i128::from(hi) - i128::from(lo) + 1;
+    match usize::try_from(span) {
+        Ok(count) if count <= CeilingKernel::ListRange.ceiling() => (lo..=hi).collect(),
+        Ok(_) | Err(_) => trip(RuntimeTrip::OutputCeiling {
+            kernel: CeilingKernel::ListRange,
+        }),
     }
-    (lo..=hi).collect()
 }
 pub fn list_indexed_map<T0, T1>(f: impl Fn(i64, T0) -> T1, list: Vec<T0>) -> Vec<T1> {
     list.into_iter()
@@ -800,6 +797,48 @@ mod tests {
         assert_eq!(outcome(|| list_product(vec![i64::MIN, -1])), product);
         assert_eq!(list_sum(vec![i64::MAX, -1, 1]), i64::MAX);
         assert_eq!(list_product(vec![i64::MIN, 1]), i64::MIN);
+    }
+
+    /// A `List.repeat` count or `List.range` span one past its declared
+    /// ceiling trips `OutputCeiling` before allocating — never a truncated
+    /// prefix, never an allocation failure; the ceiling itself is built whole.
+    #[test]
+    fn list_builders_trip_past_their_output_ceiling() {
+        fn outcome(
+            f: impl FnOnce() -> usize + std::panic::UnwindSafe,
+        ) -> Result<usize, Option<RuntimeTrip>> {
+            std::panic::catch_unwind(f).map_err(|p| crate::core::runtime_trip(p.as_ref()))
+        }
+        let at = |kernel: CeilingKernel| i64::try_from(kernel.ceiling()).unwrap_or(i64::MAX);
+        let tripped = |kernel| Err(Some(RuntimeTrip::OutputCeiling { kernel }));
+        let repeat = at(CeilingKernel::ListRepeat);
+        let range = at(CeilingKernel::ListRange);
+        assert_eq!(
+            outcome(|| list_repeat(repeat, ()).len()),
+            Ok(CeilingKernel::ListRepeat.ceiling())
+        );
+        assert_eq!(
+            outcome(|| list_repeat(repeat + 1, ()).len()),
+            tripped(CeilingKernel::ListRepeat)
+        );
+        assert_eq!(
+            outcome(|| list_repeat(i64::MAX, ()).len()),
+            tripped(CeilingKernel::ListRepeat)
+        );
+        assert_eq!(
+            outcome(|| list_range(1, range).len()),
+            Ok(CeilingKernel::ListRange.ceiling())
+        );
+        assert_eq!(
+            outcome(|| list_range(0, range).len()),
+            tripped(CeilingKernel::ListRange)
+        );
+        assert_eq!(
+            outcome(|| list_range(i64::MIN, i64::MAX).len()),
+            tripped(CeilingKernel::ListRange)
+        );
+        assert_eq!(outcome(|| list_range(i64::MAX, i64::MAX).len()), Ok(1));
+        assert_eq!(outcome(|| list_range(1, 0).len()), Ok(0));
     }
 
     #[test]

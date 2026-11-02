@@ -185,10 +185,20 @@ pub fn math_ceil(x: f64) -> i64 {
     float_to_int(x.ceil(), FloatToIntOp::Ceiling)
 }
 
-/// Ipê `round : Float -> Int`, half away from zero.
+/// Ipê `round : Float -> Int`, ties toward positive infinity (Elm):
+/// `round 2.5 == 3`, `round (-2.5) == -2`.
+///
+/// The tie test reads `x - floor x`, exact for `|x| >= 1` (Sterbenz) and for
+/// `0 <= x < 1`; for `-1 < x < 0` it is `x + 1`, whose rounding cannot cross
+/// one half because no `x` lies within half an ulp of `-0.5`. So a value below
+/// one half never rounds up, as `floor (x + 0.5)` does for
+/// `0.49999999999999994`. NaN and the infinities reach `float_to_int`
+/// unchanged and trip there.
 #[must_use]
 pub fn math_round(x: f64) -> i64 {
-    float_to_int(x.round(), FloatToIntOp::Round)
+    let below = x.floor();
+    let nearest = if x - below >= 0.5 { below + 1.0 } else { below };
+    float_to_int(nearest, FloatToIntOp::Round)
 }
 
 /// Ipê `trunc : Float -> Int`, toward zero.
@@ -538,10 +548,32 @@ mod tests {
         assert_eq!(math_floor(-3.2), -4);
         assert_eq!(math_ceil(3.2), 4);
         assert_eq!(math_ceil(-3.7), -3);
-        assert_eq!(math_round(3.5), 4);
-        assert_eq!(math_round(-3.5), -4); // half-away-from-zero
         assert_eq!(math_round(2.4), 2);
         assert_eq!(math_trunc(-3.7), -3);
+    }
+
+    // `round` breaks a tie toward positive infinity, as Elm and the Math
+    // module docs say, never away from zero; a value one ulp below one half
+    // is not a tie.
+    #[test]
+    fn round_ties_toward_positive_infinity() {
+        for (x, rounded) in [
+            (3.5, 4),
+            (2.5, 3),
+            (0.5, 1),
+            (-0.5, 0),
+            (-2.5, -2),
+            (-3.5, -3),
+            (-3.6, -4),
+            (-3.4, -3),
+            (0.499_999_999_999_999_94, 0),
+            (-0.500_000_000_000_000_1, -1),
+            (-1.0e-20, 0),
+            (4_503_599_627_370_495.5, 4_503_599_627_370_496),
+            (-4_503_599_627_370_495.5, -4_503_599_627_370_495),
+        ] {
+            assert_eq!(math_round(x), rounded, "round {x}");
+        }
     }
 
     // A non-finite value trips `NonFiniteToInt`; a finite value past either

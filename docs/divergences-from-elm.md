@@ -49,3 +49,11 @@ and is exercised by the first-party examples sweep.
   value.** Elm returns a non-integer number for NaN or an infinity. In Ipê, NaN,
   an infinity, or a value outside the 64-bit `Int` range ends in a typed
   `InvalidInput` error, never a saturated `Int`.
+
+## `List.range` and `List.repeat` ceilings (vs `elm/core` `List`)
+
+- **A list builder refuses more than 10000000 elements.** Elm builds whatever
+  length it is asked for, until memory runs out. In Ipê, `List.range lo hi`
+  with a span past 10000000, or `List.repeat n x` with `n` past 10000000,
+  ends in a typed `LimitExceeded` error before anything is allocated — never a
+  truncated list.

@@ -1152,6 +1152,51 @@ pub enum RuntimeTrip {
         /// The conversion that met the non-finite value.
         op: FloatToIntOp,
     },
+    /// A kernel was asked for more output than its declared ceiling
+    /// ([`CeilingKernel::ceiling`]).
+    OutputCeiling {
+        /// The kernel whose requested output passed its ceiling.
+        kernel: CeilingKernel,
+    },
+}
+
+/// The kernels whose output size an `Int` argument chooses.
+///
+/// The program computes the count or span from its input, so it picks the
+/// allocation size: each kernel refuses a request past its
+/// [`ceiling`](Self::ceiling) with [`RuntimeTrip::OutputCeiling`], never
+/// truncating and never allocating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CeilingKernel {
+    /// `List.repeat`.
+    ListRepeat,
+    /// `List.range`.
+    ListRange,
+}
+
+impl CeilingKernel {
+    /// The most elements one call of the kernel builds — the one ceiling
+    /// table. [`RuntimeTrip::message`] spells each number; a test pins the
+    /// two equal.
+    #[must_use]
+    pub const fn ceiling(self) -> usize {
+        match self {
+            Self::ListRepeat | Self::ListRange => 10_000_000,
+        }
+    }
+}
+
+/// The message of kernel `$kernel` asked past its `$ceiling`-element ceiling.
+macro_rules! output_ceiling_message {
+    ($kernel:literal, $ceiling:literal) => {
+        concat!(
+            "`",
+            $kernel,
+            "` output exceeds the ",
+            $ceiling,
+            "-element ceiling"
+        )
+    };
 }
 
 /// The `Int` operations whose exact result can leave the 64-bit range.
@@ -1223,6 +1268,7 @@ impl RuntimeTrip {
             Self::RecursionLimit => "RecursionLimit",
             Self::IntOverflow { .. } => "IntOverflow",
             Self::NonFiniteToInt { .. } => "NonFiniteToInt",
+            Self::OutputCeiling { .. } => "OutputCeiling",
         }
     }
 
@@ -1251,17 +1297,25 @@ impl RuntimeTrip {
                 FloatToIntOp::Round => non_finite_message!("round"),
                 FloatToIntOp::Truncate => non_finite_message!("trunc"),
             },
+            Self::OutputCeiling { kernel } => match kernel {
+                CeilingKernel::ListRepeat => output_ceiling_message!("List.repeat", "10000000"),
+                CeilingKernel::ListRange => output_ceiling_message!("List.range", "10000000"),
+            },
         }
     }
 
     /// The typed error a catch boundary hands the program for this trip.
     ///
     /// An arithmetic trip is `InvalidInput`: the operands admit no `Int`
-    /// result at any bound, so no larger limit would accept them.
+    /// result at any bound, so no larger limit would accept them. A recursion
+    /// or output-ceiling trip is `LimitExceeded`: a larger declared bound would
+    /// accept the same input.
     #[must_use]
     pub fn to_ipe_error(self) -> crate::IpeError {
         match self {
-            Self::RecursionLimit => crate::IpeError::limit_exceeded(self.message().to_owned()),
+            Self::RecursionLimit | Self::OutputCeiling { .. } => {
+                crate::IpeError::limit_exceeded(self.message().to_owned())
+            }
             Self::IntOverflow { .. } | Self::NonFiniteToInt { .. } => {
                 crate::IpeError::invalid_input(self.message().to_owned())
             }
@@ -1904,6 +1958,37 @@ mod tests {
                 if err != fault.to_ipe_error() {
                     return Err("an arithmetic trip keeps its kind at every boundary");
                 }
+            }
+        }
+        Ok(())
+    }
+
+    // An output-ceiling trip names its kernel, spells the kernel's ceiling
+    // from the one table and converts to `LimitExceeded` at a boundary.
+    #[test]
+    fn output_ceiling_trips_are_typed_limit_exceeded() -> Result<(), &'static str> {
+        for (kernel, name) in [
+            (CeilingKernel::ListRepeat, "`List.repeat`"),
+            (CeilingKernel::ListRange, "`List.range`"),
+        ] {
+            let fault = RuntimeTrip::OutputCeiling { kernel };
+            let ceiling = format!(" {}-element ", kernel.ceiling());
+            let message = fault.message();
+            if fault.label() != "OutputCeiling"
+                || !message.starts_with(name)
+                || !message.contains(ceiling.as_str())
+            {
+                return Err("an output-ceiling trip names its kernel and its table ceiling");
+            }
+            let crate::IpeError::Error(kind, _) = fault.to_ipe_error();
+            if kind != crate::IpeErrorKind::LimitExceeded {
+                return Err("an output-ceiling trip converts to LimitExceeded");
+            }
+            let payload: Box<dyn std::any::Any + Send> = Box::new(fault);
+            let err: crate::IpeError =
+                ipe_error_from_unwind(UnwindBoundary::Task("async task panicked"), payload);
+            if err != fault.to_ipe_error() {
+                return Err("an output-ceiling trip keeps its kind at a boundary");
             }
         }
         Ok(())

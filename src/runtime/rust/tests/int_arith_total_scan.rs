@@ -29,7 +29,17 @@ mod cfg_scan;
 use cfg_scan::{cfg_test_only, expr_attrs, impl_item_attrs, item_attrs, trait_item_attrs};
 
 /// The runtime files that hold the `Int` arithmetic kernels.
-const ARITH_FILES: &[&str] = &["math.rs", "basics.rs", "list.rs"];
+///
+/// `time.rs` holds the instant arithmetic (`Time.addMillis`, `diffDays`, ...)
+/// and `web/transition.rs` the `Int` arms of the browser interpreter: each
+/// yields an Ipê `Int` exactly as `math.rs` does.
+const ARITH_FILES: &[&str] = &[
+    "math.rs",
+    "basics.rs",
+    "list.rs",
+    "time.rs",
+    "web/transition.rs",
+];
 
 /// The name a site written outside any function is keyed under.
 const OUTSIDE_FN: &str = "<outside any fn>";
@@ -66,6 +76,37 @@ const ADMITTED: &[Admitted] = &[
         shape: "saturating_sub",
         count: 1,
         why: "a `usize` capacity hint for the output `Vec`, never an Ipê value",
+    },
+    Admitted {
+        file: "time.rs",
+        function: "sleep_chunks",
+        shape: "saturating_sub",
+        count: 1,
+        why: "the `u64` wait still owed after one timer chunk, never an Ipê value",
+    },
+    Admitted {
+        file: "time.rs",
+        function: "time_add_months",
+        shape: "saturating_add",
+        count: 2,
+        why: "a month index and target year that a refused `i32` year parse turns \
+              back; a saturated one never reaches the result",
+    },
+    Admitted {
+        file: "time.rs",
+        function: "time_add_years",
+        shape: "saturating_mul",
+        count: 1,
+        why: "a month count `time_add_months` turns back through its `i32` year \
+              parse; a saturated one never reaches the result",
+    },
+    Admitted {
+        file: "time.rs",
+        function: "time_days_in_month",
+        shape: "saturating_add",
+        count: 1,
+        why: "the next `i32` calendar year; a saturated one has no date, so the \
+              count is the refused `0`, never a saturated value",
     },
 ];
 

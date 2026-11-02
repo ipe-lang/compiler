@@ -101,13 +101,16 @@ fn math_out_of_domain_is_total() {
         }))
     );
     assert_eq!(ipe_runtime_rust::math::math_round(2.5), 3);
+    assert_eq!(ipe_runtime_rust::math::math_round(-2.5), -2);
     assert_eq!(ipe_runtime_rust::math::math_pow(2.0, 10.0), 1024.0);
 }
 
 proptest! {
     #[test]
     fn prop_math_round_is_exact_or_typed_trip(x in any::<f64>()) {
-        let rounded = x.round();
+        // Elm's `round`: half away from zero, except a negative tie (a
+        // fraction of exactly -0.5) goes up toward positive infinity.
+        let rounded = if x - x.trunc() == -0.5 { x.round() + 1.0 } else { x.round() };
         let expected = if !rounded.is_finite() {
             Err(Some(RuntimeTrip::NonFiniteToInt { op: FloatToIntOp::Round }))
         } else if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&rounded) {

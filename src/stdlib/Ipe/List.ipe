@@ -194,6 +194,9 @@ range 1 5 --> [ 1, 2, 3, 4, 5 ]
 range 3 3 --> [ 3 ]
 range 5 1 --> []
 ```
+
+A span of more than 10000000 integers is refused, never truncated: the
+program ends in a typed `LimitExceeded` error.
 -}
 range : Int -> Int -> List Int
 range = Kernel.kernel "List_range"
@@ -451,6 +454,9 @@ repeat 3 "x" --> [ "x", "x", "x" ]
 repeat 0 "x" --> []
 repeat 4 0 --> [ 0, 0, 0, 0 ]
 ```
+
+A count of more than 10000000 is refused before anything is built: the
+program ends in a typed `LimitExceeded` error.
 -}
 repeat : Int -> a -> List a
 repeat = Kernel.kernel "List_repeat"
