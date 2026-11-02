@@ -508,12 +508,7 @@ pub fn run_watch(rest: &[String]) -> Result<(), CliError> {
         &args.delivery,
         false,
         Verb::DEV_WATCH.name(),
-        |delivery| match delivery.runtime() {
-            Some(delivery::Runtime::Client) => {
-                Err(delivery::DeliveryError::WatchServesOnly { delivery })
-            }
-            Some(delivery::Runtime::Served) | None => Ok(()),
-        },
+        admit_watch,
     )?;
 
     // A Tui app with no interactive terminal is refused right here — before
@@ -679,6 +674,19 @@ pub fn resolve_delivery(
 /// Never.
 pub const fn admit_any(_: delivery::Delivery) -> Result<(), delivery::DeliveryError> {
     Ok(())
+}
+
+/// The admission check of `ipe dev watch`: the loop restarts a served program.
+///
+/// # Errors
+/// [`delivery::DeliveryError::WatchServesOnly`] for any `client` delivery.
+pub const fn admit_watch(delivery: delivery::Delivery) -> Result<(), delivery::DeliveryError> {
+    match delivery.runtime() {
+        Some(delivery::Runtime::Client) => {
+            Err(delivery::DeliveryError::WatchServesOnly { delivery })
+        }
+        Some(delivery::Runtime::Served) | None => Ok(()),
+    }
 }
 
 /// The admission check of `ipe dev run`: a `client` app bundle has no dev run.
@@ -5819,5 +5827,363 @@ mod parsed_manifest_tests {
             crate::ffi::FfiPresence::Absent,
             "a read after the move sees no crate, so a by-path judge would admit the eject"
         );
+    }
+}
+
+#[cfg(test)]
+mod declared_delivery_tests {
+    use super::{
+        CompileTarget, TargetVerb, admit_any, admit_dev_run, admit_watch, derive_target,
+        dev_compile_target, resolve_delivery, with_help_on_misuse,
+    };
+    use crate::CliError;
+    use crate::cli_args::{self, DeliveryArgs};
+    use crate::delivery::{Delivery, Host, Shape, TargetTriple};
+    use crate::delivery_set::{BinaryTarget, DeclaredDeliveries, PlannedDelivery, ShipEntry};
+    use crate::verb::Verb;
+    use ipe_backend_rust::static_build::StaticTriple;
+
+    /// The deliveries a `web` package declaring `ships` resolves to.
+    #[allow(clippy::expect_used)]
+    fn declared(ships: &[ShipEntry]) -> DeclaredDeliveries {
+        DeclaredDeliveries::from_ships(Shape::Web, ships).expect("the declared ships resolve")
+    }
+
+    /// The delivery args `ipe dev build <words>` parses.
+    #[allow(clippy::expect_used)]
+    fn stated(words: &[&str]) -> DeliveryArgs {
+        let rest: Vec<String> = std::iter::once("app")
+            .chain(words.iter().copied())
+            .map(str::to_owned)
+            .collect();
+        cli_args::parse_build(&rest)
+            .expect("the delivery words parse")
+            .delivery
+    }
+
+    #[allow(clippy::expect_used)]
+    fn served() -> Delivery {
+        Delivery::resolve(Shape::Web, None, Host::Default).expect("the served web delivery")
+    }
+
+    #[test]
+    fn unstated_build_of_client_only_package_derives_browser_wasm() {
+        let got = resolve_delivery(
+            &declared(&[ShipEntry::Client]),
+            &DeliveryArgs::Unstated,
+            false,
+            Verb::DEV_BUILD.name(),
+            admit_any,
+        );
+        assert_eq!(got.as_ref().ok(), Some(&Delivery::web_client()));
+        let Ok(delivery) = got else { return };
+        assert_eq!(
+            derive_target(TargetVerb::Dev, delivery, None, None, false).ok(),
+            Some(Some(TargetTriple::BrowserWasm))
+        );
+    }
+
+    #[test]
+    fn unstated_run_of_client_only_package_routes_to_bundle() {
+        let got = resolve_delivery(
+            &declared(&[ShipEntry::Client]),
+            &DeliveryArgs::Unstated,
+            false,
+            Verb::DEV_RUN.name(),
+            admit_dev_run,
+        );
+        let Ok(delivery) = got else {
+            assert!(
+                got.is_ok(),
+                "a declared browser client is a dev-run delivery: {got:?}"
+            );
+            return;
+        };
+        assert!(matches!(
+            dev_compile_target(delivery, None, None, false),
+            Ok(CompileTarget::WasmClient)
+        ));
+    }
+
+    #[test]
+    fn absent_ships_keeps_served_default() {
+        let got = resolve_delivery(
+            &declared(&[]),
+            &DeliveryArgs::Unstated,
+            false,
+            Verb::DEV_BUILD.name(),
+            admit_any,
+        );
+        assert_eq!(got.ok(), Some(served()));
+    }
+
+    #[test]
+    fn several_declared_refuses_listing_commands() {
+        for ships in [
+            [ShipEntry::Binary(BinaryTarget::Host), ShipEntry::Client],
+            [ShipEntry::Client, ShipEntry::Binary(BinaryTarget::Host)],
+        ] {
+            let got = resolve_delivery(
+                &declared(&ships),
+                &DeliveryArgs::Unstated,
+                false,
+                Verb::DEV_BUILD.name(),
+                admit_any,
+            );
+            let Err(CliError::ProjectRefused(message)) = &got else {
+                assert!(
+                    matches!(got, Err(CliError::ProjectRefused(_))),
+                    "{ships:?}: several declared deliveries are a project refusal: {got:?}"
+                );
+                return;
+            };
+            let text = message.to_string();
+            assert!(
+                text.lines().any(|line| line.trim() == "ipe dev build web"),
+                "{text}"
+            );
+            assert!(text.contains("ipe dev build web client"), "{text}");
+        }
+    }
+
+    #[test]
+    fn several_declared_refuses_release_run_listing_targets() {
+        let several = declared(&[
+            ShipEntry::Binary(BinaryTarget::Host),
+            ShipEntry::Binary(BinaryTarget::Cross(StaticTriple::Aarch64LinuxMusl)),
+        ]);
+        let got = several.sole_release_member(Verb::RELEASE_RUN.name());
+        let Err(CliError::ProjectRefused(message)) = &got else {
+            assert!(matches!(got, Err(CliError::ProjectRefused(_))), "{got:?}");
+            return;
+        };
+        let text = message.to_string();
+        assert!(
+            text.lines()
+                .any(|line| line.trim() == "ipe release run web"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ipe release run web --target aarch64-unknown-linux-musl"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn single_declared_with_static_axis_is_one_delivery() {
+        let one = declared(&[
+            ShipEntry::Binary(BinaryTarget::Host),
+            ShipEntry::Binary(BinaryTarget::Static),
+        ]);
+        assert_eq!(
+            one.sole_dev_delivery(Verb::DEV_BUILD.name()).ok(),
+            Some(served())
+        );
+        assert_eq!(
+            one.sole_release_member(Verb::RELEASE_RUN.name())
+                .ok()
+                .map(PlannedDelivery::delivery),
+            Some(served())
+        );
+    }
+
+    #[test]
+    fn stated_delivery_outside_ships_is_honoured() {
+        let got = resolve_delivery(
+            &declared(&[]),
+            &stated(&["web", "client"]),
+            false,
+            Verb::DEV_BUILD.name(),
+            admit_any,
+        );
+        assert_eq!(got.ok(), Some(Delivery::web_client()));
+    }
+
+    #[test]
+    fn release_build_unstated_plans_every_declared() {
+        let mut seen = Vec::new();
+        let outcome = declared(&[ShipEntry::Binary(BinaryTarget::Host), ShipEntry::Client])
+            .into_set()
+            .release_each(|plan| {
+                seen.push(plan.delivery());
+                Ok(())
+            });
+        assert!(outcome.all_released());
+        assert_eq!(seen, [served(), Delivery::web_client()]);
+    }
+
+    #[test]
+    fn release_honours_binary_static_axis() {
+        let cross = declared(&[ShipEntry::Binary(BinaryTarget::Cross(
+            StaticTriple::Aarch64LinuxMusl,
+        ))]);
+        let member = cross.sole_release_member(Verb::RELEASE_BUILD.name());
+        assert_eq!(
+            member.ok().and_then(PlannedDelivery::release_triple),
+            Some(StaticTriple::Aarch64LinuxMusl)
+        );
+    }
+
+    #[test]
+    fn dev_ignores_target_axis() {
+        let cross = declared(&[ShipEntry::Binary(BinaryTarget::Cross(
+            StaticTriple::Aarch64LinuxMusl,
+        ))]);
+        let Ok(delivery) = cross.sole_dev_delivery(Verb::DEV_BUILD.name()) else {
+            assert!(cross.sole_dev_delivery(Verb::DEV_BUILD.name()).is_ok());
+            return;
+        };
+        assert_eq!(delivery, served());
+        assert!(matches!(
+            dev_compile_target(delivery, None, None, false),
+            Ok(CompileTarget::Native)
+        ));
+    }
+
+    #[test]
+    fn watch_refuses_declared_client_as_project() {
+        let got = resolve_delivery(
+            &declared(&[ShipEntry::Client]),
+            &DeliveryArgs::Unstated,
+            false,
+            Verb::DEV_WATCH.name(),
+            admit_watch,
+        );
+        assert!(matches!(got, Err(CliError::ProjectRefused(_))), "{got:?}");
+        let routed = with_help_on_misuse(Verb::DEV_WATCH, got.map(|_| ()));
+        assert!(
+            matches!(routed, Err(CliError::ProjectRefused(_))),
+            "a project refusal never gains the usage page: {routed:?}"
+        );
+        let Err(err) = routed else { return };
+        let screen = crate::screen::error_screen(&err, false)
+            .map(|screen| screen.render(crate::screen::Header::Omitted));
+        assert!(
+            screen
+                .as_deref()
+                .is_some_and(|text| !text.contains("Usage:")),
+            "{screen:?}"
+        );
+    }
+
+    #[test]
+    fn watch_refuses_stated_client_as_usage() {
+        let got = resolve_delivery(
+            &declared(&[]),
+            &stated(&["web", "client"]),
+            false,
+            Verb::DEV_WATCH.name(),
+            admit_watch,
+        );
+        assert!(matches!(got, Err(CliError::Usage(_))), "{got:?}");
+    }
+
+    #[test]
+    fn watch_refusal_remedy_clears() {
+        let client = declared(&[ShipEntry::Client]);
+        let got = resolve_delivery(
+            &client,
+            &DeliveryArgs::Unstated,
+            false,
+            Verb::DEV_WATCH.name(),
+            admit_watch,
+        );
+        let Err(err) = got else {
+            assert!(got.is_err(), "a declared client is refused by watch");
+            return;
+        };
+        let text = err.to_string();
+        let remedy = "ipe dev build web client";
+        assert!(text.contains(remedy), "{text}");
+        let words: Vec<&str> = remedy
+            .strip_prefix("ipe dev build ")
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect();
+        let advised = resolve_delivery(
+            &client,
+            &stated(&words),
+            false,
+            Verb::DEV_BUILD.name(),
+            admit_any,
+        );
+        let Ok(advised) = advised else {
+            assert!(advised.is_ok(), "the remedy resolves: {advised:?}");
+            return;
+        };
+        assert_eq!(
+            derive_target(TargetVerb::Dev, advised, None, None, false).ok(),
+            Some(Some(TargetTriple::BrowserWasm))
+        );
+    }
+
+    /// The source files under `src/`, relative to the crate's `src/`.
+    fn sources(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                sources(&path, root, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let rel = path
+                    .strip_prefix(root)
+                    .map_or_else(|_| path.display().to_string(), |p| p.display().to_string());
+                out.push((rel, std::fs::read_to_string(&path).unwrap_or_default()));
+            }
+        }
+    }
+
+    /// The field access the scan counts, spelled so this file holds none.
+    const FIELD: &str = concat!('.', "ships");
+
+    /// The `ships` field reads in `source`, comments aside.
+    fn ships_reads(source: &str) -> usize {
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .map(|line| {
+                line.match_indices(FIELD)
+                    .filter(|(at, _)| {
+                        line.get(at.saturating_add(FIELD.len())..)
+                            .and_then(|rest| rest.chars().next())
+                            .is_none_or(|next| !(next.is_alphanumeric() || next == '_'))
+                    })
+                    .count()
+            })
+            .sum()
+    }
+
+    /// Every read of the private `ships` list, by file: the accessors in
+    /// `project.rs` are the only ones, so a compiling command reaches the list
+    /// only through `DeliveryConfig::declared`.
+    #[test]
+    fn ships_has_no_compiling_reader() {
+        const ADMITTED: &[(&str, usize)] = &[("project.rs", 3)];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        sources(&root, &root, &mut files);
+        assert!(files.len() > 10, "the scan reads the crate's sources");
+        let found: Vec<(String, usize)> = files
+            .iter()
+            .map(|(rel, source)| (rel.clone(), ships_reads(source)))
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        let admitted: Vec<(String, usize)> = ADMITTED
+            .iter()
+            .map(|(rel, n)| ((*rel).to_owned(), *n))
+            .collect();
+        assert_eq!(
+            found, admitted,
+            "`ships` is read only through its accessors"
+        );
+    }
+
+    #[test]
+    fn ships_scan_sees_a_read() {
+        assert_eq!(ships_reads(&format!("let s = cfg{FIELD};\n")), 1);
+        assert_eq!(ships_reads(&format!("// cfg{FIELD}\n")), 0);
+        assert_eq!(ships_reads(&format!("cfg{FIELD}_for_render()\n")), 0);
     }
 }
