@@ -2520,9 +2520,12 @@ fn memory_store_message(ttl: Duration) -> String {
 }
 
 /// Emit the `[ipe.live] YYYY/MM/DD HH:MM:SS session store: memory (ttl=…)`
-/// startup line. Shared so the in-process console sub-app mount emits the same
-/// line format.
-pub(crate) fn emit_memory_store_log(ttl: Duration) {
+/// startup line.
+///
+/// The only caller is [`choose_store`], the one place a memory store is
+/// actually chosen; kept module-private so no other site can log a store
+/// choice it did not make.
+fn emit_memory_store_log(ttl: Duration) {
     crate::system::emit_runtime_log_stamped(
         &go_log_timestamp(),
         "live",

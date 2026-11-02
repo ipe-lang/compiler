@@ -5031,8 +5031,8 @@ mod gutter_line_tests {
             (
                 None,
                 "web",
-                "listening on :8000",
-                "[ipe.web] listening on :8000",
+                "listening on http://127.0.0.1:8000",
+                "[ipe.web] listening on http://127.0.0.1:8000",
             ),
         ] {
             let line = format_runtime_log(stamp, tag, msg);

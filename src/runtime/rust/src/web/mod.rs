@@ -7461,8 +7461,6 @@ where
             ));
         }
     };
-    // User-facing status line on stdout.
-    crate::system::emit_runtime_log_stdout("web", &format!("listening on :{port}"));
     match crate::server::serve_app(listener, app, armed).await {
         Ok(crate::server::shutdown::Stopped { .. }) => {
             // A console child spawned after the plan's teardown is stopped too.
@@ -7530,7 +7528,7 @@ where
     let body_limit: usize = WEB_MAX_BODY_CEILING
         .read()
         .map_err(StartupRefusal::Ceiling)?;
-    let session_ttl = web_ttl().map_err(StartupRefusal::Ceiling)?;
+    web_ttl().map_err(StartupRefusal::Ceiling)?;
     #[cfg(feature = "jwt")]
     crate::app_config::auth_ceilings().map_err(StartupRefusal::Ceiling)?;
     // A requested revocation gate arms every session; a build without the
@@ -7810,8 +7808,8 @@ where
     // When `http_client` is active and the pre-built console binary is
     // present, the proxy replaces the in-process console: a child process is
     // spawned and all `/_ipe/console/*` traffic is forwarded to it via
-    // reqwest. The child logs its own `session store: …` + `reverse-proxy
-    // ready` lines, so the parent does not duplicate the inline-mount log.
+    // reqwest. The child is its own process: its `session store: …` and
+    // `reverse-proxy ready` lines report the store and listener it chose.
     #[cfg(all(feature = "web", feature = "http_client"))]
     if use_console_proxy {
         router = console_proxy::proxy_routes(router);
@@ -7834,7 +7832,6 @@ where
         }
     };
     if !proxy_active && console::gate_allows(&mount) {
-        store::emit_memory_store_log(session_ttl);
         crate::system::emit_runtime_log(
             "console",
             &format!(
