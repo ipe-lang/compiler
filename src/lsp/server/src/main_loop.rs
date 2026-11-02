@@ -741,7 +741,7 @@ fn references_result(state: &State, params: &serde_json::Value) -> FeatureOutcom
     let Ok(ctx) = position_ctx(state, &position.text_document.uri, position.position) else {
         return FeatureOutcome::NoResult;
     };
-    // Resolve via goto_definition to get the canonical (home, name) pair.
+    // Resolve via goto_definition to the target: a declaration or a local binder.
     let Some(def) = ipe_lsp_features::navigation::goto_definition(
         state.db.db(),
         ctx.root,
@@ -758,17 +758,11 @@ fn references_result(state: &State, params: &serde_json::Value) -> FeatureOutcom
     let Some(def_text) = text_of(&def.module) else {
         return FeatureOutcome::NoResult;
     };
-    let lo = def.span.lo as usize;
-    let hi = def.span.hi as usize;
-    let Some(def_name) = def_text.get(lo..hi) else {
-        return FeatureOutcome::NoResult;
-    };
     let refs = ipe_lsp_features::navigation::find_references(
         state.db.db(),
         ctx.root,
         ctx.entry_file,
-        &def.module,
-        def_name,
+        &def.target,
     );
     let mut locations: Vec<lsp_types::Location> = Vec::new();
     // Include definition if requested.
@@ -1640,7 +1634,7 @@ fn document_highlight_result(state: &State, params: &serde_json::Value) -> Featu
     let Ok(ctx) = position_ctx(state, &position.text_document.uri, position.position) else {
         return FeatureOutcome::NoResult;
     };
-    // Resolve to the canonical (home, name) pair via goto_definition.
+    // Resolve via goto_definition to the target: a declaration or a local binder.
     let Some(def) = ipe_lsp_features::navigation::goto_definition(
         state.db.db(),
         ctx.root,
@@ -1655,18 +1649,12 @@ fn document_highlight_result(state: &State, params: &serde_json::Value) -> Featu
     let Some(def_text) = text_of(&def.module) else {
         return FeatureOutcome::NoResult;
     };
-    let lo = def.span.lo as usize;
-    let hi = def.span.hi as usize;
-    let Some(def_name) = def_text.get(lo..hi) else {
-        return FeatureOutcome::NoResult;
-    };
     // Collect references across all modules, then filter to the requested document.
     let refs = ipe_lsp_features::navigation::find_references(
         state.db.db(),
         ctx.root,
         ctx.entry_file,
-        &def.module,
-        def_name,
+        &def.target,
     );
     let mut highlights: Vec<lsp_types::DocumentHighlight> = Vec::new();
     // Include the definition site when it is in the same document.
