@@ -1913,6 +1913,7 @@ mod tests {
     #[test]
     fn int_fold_declines_every_out_of_range_edge() {
         use ConstValue::Int;
+        type IntOpFn = fn(i64, i64) -> i64;
         let edges = [
             (BinOp::IntAdd, i64::MAX, 1),
             (BinOp::Add, i64::MAX, 1),
@@ -1929,7 +1930,7 @@ mod tests {
         let values = [i64::MIN + 1, -7, -1, 0, 1, 7, i64::MAX - 1];
         for a in values {
             for b in values {
-                let pairs: [(BinOp, fn(i64, i64) -> i64); 3] = [
+                let pairs: [(BinOp, IntOpFn); 3] = [
                     (BinOp::IntAdd, ipe_runtime_rust::math::ipe_int_add),
                     (BinOp::IntSub, ipe_runtime_rust::math::ipe_int_sub),
                     (BinOp::IntMul, ipe_runtime_rust::math::ipe_int_mul),
