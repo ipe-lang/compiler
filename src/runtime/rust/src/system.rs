@@ -1245,10 +1245,11 @@ pub(crate) fn listen_port_from_env(
 /// `read_env_var` (same overlay-first semantics). `None` when unset (or masked by
 /// an overlay tombstone) or — unlike `read_env_var` — when the real value is not
 /// valid Unicode. Gated to the feature whose module actually reads `var_os`
-/// (`tui` — the `NO_COLOR` probe); widen the gate when another feature gains a
-/// `var_os` reader, so it never sits as dead code under `-D warnings`. A
-/// temp-root key reads as unset, as in `read_env_var`.
-#[cfg(any(feature = "tui", feature = "debugger"))]
+/// (`debugger` — the replay-root probe; `tui`'s colour decision reads the typed
+/// `TermProfile` through `read_env_var` instead, never `var_os`); widen the gate
+/// when another feature gains a `var_os` reader, so it never sits as dead code
+/// under `-D warnings`. A temp-root key reads as unset, as in `read_env_var`.
+#[cfg(feature = "debugger")]
 pub(crate) fn read_env_var_os(key: &str) -> Option<std::ffi::OsString> {
     if super::scratch_core::is_temp_root_key(key) {
         return None;
@@ -4717,7 +4718,7 @@ mod temp_root_env_tests {
 
     /// The `OsString` reader refuses every temp-root spelling alike, even when
     /// Ipê set it.
-    #[cfg(any(feature = "tui", feature = "debugger"))]
+    #[cfg(feature = "debugger")]
     #[test]
     fn a_temp_root_key_is_never_answered_as_os_string() {
         for key in ["TMPDIR", "tmpdir", "TmpDir", "TMP", "tmp", "TEMP", "Temp"] {
