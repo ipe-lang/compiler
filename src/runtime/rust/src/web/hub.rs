@@ -24,6 +24,7 @@
 //! mismatch cannot arise.
 
 use super::super::core::{IpeResult, IpeTask, ok_res, str_err};
+use crate::json::{JsonSource, json_failure_text};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -382,13 +383,15 @@ where
     match serde_json::from_value::<A>(arr) {
         Ok(a) => ok_res(a),
         Err(e) => {
-            crate::system::emit_runtime_log("hub", &format!("decode_rows: {e}"));
+            // A data error quotes the row value it refused; render the fixed phrase.
+            let why = json_failure_text(&e, JsonSource::Value);
+            crate::system::emit_runtime_log("hub", &format!("decode_rows: {why}"));
             // Fall back to decoding an empty array (List records) — if A is not
             // a list this also fails, in which case surface a structured Err
             // (the value system models it; never a panic).
             match serde_json::from_value::<A>(Value::Array(vec![])) {
                 Ok(a) => ok_res(a),
-                Err(_) => IpeResult::Err(str_err(&format!("hub.decode: {e}"))),
+                Err(_) => IpeResult::Err(str_err(&format!("hub.decode: {why}"))),
             }
         }
     }
@@ -969,8 +972,9 @@ where
     match serde_json::from_value::<A>(obj) {
         Ok(a) => ok_res(a),
         Err(e) => {
-            crate::system::emit_runtime_log("hub", &format!("decode_one: {e}"));
-            IpeResult::Err(str_err(&format!("hub.decode: {e}")))
+            let why = json_failure_text(&e, JsonSource::Value);
+            crate::system::emit_runtime_log("hub", &format!("decode_one: {why}"));
+            IpeResult::Err(str_err(&format!("hub.decode: {why}")))
         }
     }
 }
@@ -1062,6 +1066,28 @@ pub fn hub_list_services<E: Send + From<String> + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Deserialize)]
+    struct Counted {
+        #[serde(rename = "count")]
+        _count: u8,
+    }
+
+    const SENTINEL: &str = "SENTINEL-row-value";
+
+    #[test]
+    fn a_refused_row_value_is_not_echoed() {
+        let one: IpeResult<String, Counted> = decode_one(json!({ "count": SENTINEL }));
+        assert!(
+            matches!(&one, IpeResult::Err(why) if why == "hub.decode: json decode: invalid value"),
+            "decode_one: {one:?}"
+        );
+        let rows: IpeResult<String, Counted> = decode_rows(json!({ "count": SENTINEL }));
+        assert!(
+            matches!(&rows, IpeResult::Err(why) if why == "hub.decode: json decode: invalid value"),
+            "decode_rows: {rows:?}"
+        );
+    }
 
     async fn seed(path: &str) -> SqlitePool {
         let pool = SqlitePool::connect(&format!("sqlite:{path}?mode=rwc"))

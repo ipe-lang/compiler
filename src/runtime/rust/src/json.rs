@@ -124,25 +124,55 @@ pub fn decode_err_str<E: crate::DecodeErrorSink, T>(s: String) -> IpeResult<E, T
     IpeResult::Err(E::from_decode_failure(s))
 }
 
-/// The single source for a json decode failure: a typed kind plus a
-/// position, never the input text.
+/// Where a `serde_json::Error` was raised, which decides whether its position
+/// names anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JsonSource {
+    /// Parsed from text (`from_str`, `from_slice`): the line and column point
+    /// into that text.
+    Text,
+    /// Converted from an in-memory value (`from_value`): there is no text, so
+    /// there is no position.
+    Value,
+}
+
+/// The single renderer of a `serde_json::Error` as text: a fixed phrase per
+/// category, plus a position for a text parse, never the input.
 ///
 /// `Category::Syntax` and `Category::Eof` carry no input bytes in their
-/// `Display` — a fixed grammar phrase plus a line and column — so it is kept
-/// verbatim. `Category::Data`'s `Display` quotes the offending value (a type
-/// mismatch names the mistyped field's value), so only the position
-/// survives. `Category::Io` wraps a host `std::io::Error` raised by the
-/// reader a caller supplied; it is classified through the io table rather
-/// than forced to `Decode`.
-pub(crate) fn json_failure(error: &serde_json::Error) -> IpeError {
+/// `Display` — a fixed grammar phrase plus a line and column — so a text parse
+/// keeps it verbatim. `Category::Data`'s `Display` quotes the offending value
+/// (a type mismatch names the mistyped field's value, an unknown variant names
+/// the tag), so only the position survives, and a value conversion keeps not
+/// even that. `Category::Io` names no input and gets a fixed phrase.
+pub(crate) fn json_failure_text(error: &serde_json::Error, source: JsonSource) -> String {
     use serde_json::error::Category;
-    match error.classify() {
-        Category::Syntax | Category::Eof => IpeError::decode(format!("json parse: {error}")),
-        Category::Data => IpeError::decode(format!(
+    match (error.classify(), source) {
+        (Category::Syntax | Category::Eof, JsonSource::Text) => format!("json parse: {error}"),
+        (Category::Data, JsonSource::Text) => format!(
             "json parse: invalid value at line {} column {}",
             error.line(),
             error.column()
-        )),
+        ),
+        (Category::Syntax | Category::Eof | Category::Data, JsonSource::Value) => {
+            "json decode: invalid value".to_owned()
+        }
+        (Category::Io, _) => "json read: io failure".to_owned(),
+    }
+}
+
+/// The single source for a json decode failure as an [`IpeError`]: a typed
+/// kind plus [`json_failure_text`]'s text, never the input.
+///
+/// `Category::Io` wraps a host `std::io::Error` raised by the reader a caller
+/// supplied; it is classified through the io table rather than forced to
+/// `Decode`.
+pub(crate) fn json_failure(error: &serde_json::Error) -> IpeError {
+    use serde_json::error::Category;
+    match error.classify() {
+        Category::Syntax | Category::Eof | Category::Data => {
+            IpeError::decode(json_failure_text(error, JsonSource::Text))
+        }
         Category::Io => {
             let kind = error.io_error_kind().unwrap_or(std::io::ErrorKind::Other);
             IoFailure::without_path("json parse", &std::io::Error::from(kind)).into()
@@ -1666,6 +1696,23 @@ mod enc_tests {
             !info.message.contains("SENTINEL"),
             "decode message echoed the input value: {}",
             info.message
+        );
+    }
+
+    /// A value conversion has no text to point into, so its failure text is a
+    /// fixed phrase: neither the rejected value nor a meaningless position.
+    #[test]
+    fn json_value_failure_text_is_fixed() {
+        let value = serde_json::Value::String("SENTINEL".to_owned());
+        let err =
+            serde_json::from_value::<i64>(value).expect_err("a JSON string is not a valid i64");
+        assert!(
+            matches!(err.classify(), serde_json::error::Category::Data),
+            "{err:?}"
+        );
+        assert_eq!(
+            json_failure_text(&err, JsonSource::Value),
+            "json decode: invalid value"
         );
     }
 
