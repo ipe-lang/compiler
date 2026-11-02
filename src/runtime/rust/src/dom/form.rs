@@ -16,11 +16,14 @@ pub enum FormDecodeError {
     Decode(serde_urlencoded::de::Error),
 }
 
+/// A fixed phrase per variant: the `serde_urlencoded` error text quotes the
+/// submitted value (``unknown variant `<value>` ``), and a form value can be a
+/// password, so it never reaches a log line or a message.
 impl core::fmt::Display for FormDecodeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Encode(e) => write!(f, "form pairs could not be encoded: {e}"),
-            Self::Decode(e) => write!(f, "form does not fit the record: {e}"),
+            Self::Encode(_) => f.write_str("form pairs could not be encoded"),
+            Self::Decode(_) => f.write_str("form does not fit the record"),
         }
     }
 }
@@ -64,8 +67,6 @@ pub fn decode_form_or_warn<T: serde::de::DeserializeOwned>(fd: FormData) -> Opti
     match decode_form::<T>(fd) {
         Ok(t) => Some(t),
         Err(e) => {
-            // `e` embeds the attacker-supplied form value (e.g. "unknown
-            // variant `<value>`"); the emitter neutralises its control bytes.
             crate::system::emit_runtime_log(
                 "live",
                 &format!("form decode failed, dispatching no Msg: {e}"),
@@ -290,6 +291,27 @@ mod tests {
     struct Subscription {
         email: String,
         tier: Tier,
+    }
+
+    #[test]
+    fn a_refused_form_value_is_not_echoed() {
+        const SENTINEL: &str = "SENTINEL-form-value";
+        let mut fd = FormData::new();
+        fd.insert("email".to_string(), "a@b.c".to_string());
+        fd.insert("tier".to_string(), SENTINEL.to_string());
+        let r: Result<Subscription, FormDecodeError> = decode_form(fd);
+        assert!(
+            matches!(&r, Err(e @ FormDecodeError::Decode(_)) if e.to_string() == "form does not fit the record"),
+            "{r:?}"
+        );
+        let mut bad = FormData::new();
+        bad.insert("code".to_string(), "ok".to_string());
+        bad.insert("count".to_string(), SENTINEL.to_string());
+        let r2: Result<RunPayload, FormDecodeError> = decode_form(bad);
+        assert!(
+            matches!(&r2, Err(e) if !e.to_string().contains(SENTINEL)),
+            "{r2:?}"
+        );
     }
 
     #[test]

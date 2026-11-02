@@ -27,10 +27,15 @@
 //!   the scan keys on: a crate rename, a glob, or a fallible function, stream
 //!   type, error type or error module imported by name.
 //!
-//! An outcome is the value of a fallible `serde_json` function, or of a call
+//! An outcome is the value of a fallible `serde_json` function, of a call
 //! or method that takes a `serde_json` stream (`Deserializer`, `Serializer`),
-//! carried through `let` bindings and adaptors that keep the error (`map`,
-//! `and_then`). [`ADMITTED_SITES`] lists each `(file, fn, kind)` with its exact
+//! of any `deserialize` call or `deserialize_*` method outside a serde trait
+//! impl (a `serde_json::Value` is itself a deserializer, so the scan cannot
+//! tell its error apart; inside the impl the error is the caller's), or of a
+//! `parse::<P>()` whose `P` is a `serde_json` type, carried through `let`
+//! bindings and adaptors that keep the error (`map`, `and_then`). A name a
+//! `use` brings in from `serde_json` (`Value`, `Value as JsonValue`) keys the
+//! scan as the full path does: `Value::from_str` is `serde_json::Value::from_str`. [`ADMITTED_SITES`] lists each `(file, fn, kind)` with its exact
 //! count and reason; an unlisted site and a stale entry both go red.
 //! Attributes (doc comments) are not code. A `#[cfg(…)]` proven test-only
 //! removes exactly the node it is attached to.
@@ -45,8 +50,8 @@ use syn::visit::{self, Visit};
 use syn::{
     Arm, Attribute, Block, Expr, ExprCall, ExprClosure, ExprForLoop, ExprIf, ExprLet, ExprLit,
     ExprMatch, ExprMethodCall, ExprPath, ExprReturn, ExprTry, ExprWhile, Field, FieldValue, FnArg,
-    ImplItem, ImplItemFn, Item, ItemExternCrate, ItemFn, ItemUse, Lit, LitStr, Local, Macro, Pat,
-    Path, Signature, Stmt, Token, TraitItem, TraitItemFn, Type, UseTree, Variant,
+    ImplItem, ImplItemFn, Item, ItemExternCrate, ItemFn, ItemImpl, ItemUse, Lit, LitStr, Local,
+    Macro, Pat, Path, Signature, Stmt, Token, TraitItem, TraitItemFn, Type, UseTree, Variant,
 };
 
 #[path = "support/cfg_scan.rs"]
@@ -166,24 +171,6 @@ const ADMITTED_SITES: &[Admitted] = &[
                  data error to quote",
     },
     Admitted {
-        file: "web/hub.rs",
-        function: "decode_one",
-        kind: SiteKind::Rendered,
-        count: 2,
-        reason: "transitional: a hub row decode echoes the serde error into the runtime log \
-                 and the returned error; routing it through `json_failure_text` removes \
-                 this entry",
-    },
-    Admitted {
-        file: "web/hub.rs",
-        function: "decode_rows",
-        kind: SiteKind::Rendered,
-        count: 2,
-        reason: "transitional: a hub rows decode echoes the serde error into the runtime log \
-                 and the returned error; routing it through `json_failure_text` removes \
-                 this entry",
-    },
-    Admitted {
         file: "web/store.rs",
         function: OUTSIDE_FN,
         kind: SiteKind::Carrier,
@@ -226,6 +213,27 @@ const FALLIBLE: &[&str] = &[
     "to_writer",
     "to_writer_pretty",
 ];
+
+/// The serde entry whose error is the deserializer's own: a call path or a
+/// method named this (or a method starting `deserialize_`) is an outcome.
+const DESERIALIZE: &str = "deserialize";
+
+/// The serde traits whose methods take a generic deserializer or serializer.
+const SERDE_TRAITS: &[&str] = &[
+    "Deserialize",
+    "DeserializeSeed",
+    "Visitor",
+    "Serialize",
+    "Deserializer",
+    "Serializer",
+    "MapAccess",
+    "SeqAccess",
+    "EnumAccess",
+    "VariantAccess",
+];
+
+/// The method whose error type its turbofish names: `parse::<serde_json::Value>`.
+const PARSE: &str = "parse";
 
 /// The `serde_json` stream types; a call or method taking one is an outcome.
 const STREAMS: &[&str] = &["Deserializer", "Serializer", "StreamDeserializer"];
@@ -298,6 +306,79 @@ fn idents(path: &Path) -> Vec<String> {
 fn serde_names(path: &Path) -> Option<Vec<String>> {
     let names = idents(path);
     (names.first().map(String::as_str) == Some(SERDE_JSON)).then_some(names)
+}
+
+/// The segments of `path` when it starts at `serde_json`, or at a name a `use`
+/// brought in from it (`aliases`): `JsonValue::from_str` reads as
+/// `serde_json::JsonValue::from_str`.
+fn serde_names_via(path: &Path, aliases: &BTreeSet<String>) -> Option<Vec<String>> {
+    let names = idents(path);
+    match names.first() {
+        Some(first) if first == SERDE_JSON => Some(names),
+        Some(first) if aliases.contains(first) => Some(
+            std::iter::once(SERDE_JSON.to_owned())
+                .chain(names)
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Whether `ty` names a `serde_json` type, directly or through an alias.
+fn is_serde_type(ty: &Type, aliases: &BTreeSet<String>) -> bool {
+    match ty {
+        Type::Reference(reference) => is_serde_type(&reference.elem, aliases),
+        Type::Paren(paren) => is_serde_type(&paren.elem, aliases),
+        Type::Group(group) => is_serde_type(&group.elem, aliases),
+        Type::Path(path) => path.qself.is_none() && serde_names_via(&path.path, aliases).is_some(),
+        _ => false,
+    }
+}
+
+/// Every local name a production `use` binds to a `serde_json` item.
+#[derive(Default)]
+struct Aliases {
+    names: BTreeSet<String>,
+}
+
+impl Aliases {
+    fn add_use(&mut self, tree: &UseTree, under_serde: bool, root: bool) {
+        match tree {
+            UseTree::Path(path) => {
+                let name = path.ident.unraw().to_string();
+                let under = under_serde || (root && name == SERDE_JSON);
+                self.add_use(&path.tree, under, false);
+            }
+            UseTree::Group(group) => {
+                for item in &group.items {
+                    self.add_use(item, under_serde, root);
+                }
+            }
+            UseTree::Name(name) => {
+                if under_serde && name.ident != "self" {
+                    self.names.insert(name.ident.unraw().to_string());
+                }
+            }
+            UseTree::Rename(rename) => {
+                if under_serde || (root && rename.ident == SERDE_JSON) {
+                    self.names.insert(rename.rename.unraw().to_string());
+                }
+            }
+            UseTree::Glob(_) => {}
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for Aliases {
+    fn visit_item(&mut self, item: &'ast Item) {
+        if !cfg_test_only(item_attrs(item)) {
+            visit::visit_item(self, item);
+        }
+    }
+
+    fn visit_item_use(&mut self, item: &'ast ItemUse) {
+        self.add_use(&item.tree, false, true);
+    }
 }
 
 fn last_name(path: &Path) -> Option<String> {
@@ -396,6 +477,12 @@ impl<'ast> Visit<'ast> for Handlers {
 
 struct Scan<'h> {
     handlers: &'h BTreeSet<String>,
+    /// The local names this file imports from `serde_json`.
+    aliases: BTreeSet<String>,
+    /// How many serde trait impls enclose the current item: there a
+    /// `deserialize` call's error is the impl's generic one, forwarded to the
+    /// caller whose own call is scanned.
+    serde_impls: usize,
     /// The enclosing function names, innermost last.
     functions: Vec<String>,
     /// The bindings in scope, innermost last.
@@ -404,9 +491,11 @@ struct Scan<'h> {
 }
 
 impl<'h> Scan<'h> {
-    fn new(handlers: &'h BTreeSet<String>) -> Self {
+    fn new(handlers: &'h BTreeSet<String>, aliases: BTreeSet<String>) -> Self {
         Self {
             handlers,
+            aliases,
+            serde_impls: 0,
             functions: Vec::new(),
             scopes: vec![BTreeMap::new()],
             sites: Vec::new(),
@@ -460,6 +549,30 @@ impl<'h> Scan<'h> {
             }
             Expr::Paren(paren) => self.binding_of(&paren.expr),
             Expr::Group(group) => self.binding_of(&group.expr),
+            Expr::Block(block) => self.tail_binding(&block.block),
+            Expr::If(branch) => {
+                let then = self.tail_binding(&branch.then_branch);
+                let otherwise = branch
+                    .else_branch
+                    .as_ref()
+                    .map_or(Binding::Clean, |(_, otherwise)| self.binding_of(otherwise));
+                if then == Binding::Outcome || otherwise == Binding::Outcome {
+                    Binding::Outcome
+                } else {
+                    Binding::Clean
+                }
+            }
+            Expr::Match(matched) => {
+                if matched
+                    .arms
+                    .iter()
+                    .any(|arm| self.binding_of(&arm.body) == Binding::Outcome)
+                {
+                    Binding::Outcome
+                } else {
+                    Binding::Clean
+                }
+            }
             Expr::Reference(reference) => self.binding_of(&reference.expr),
             Expr::Await(awaited) => self.binding_of(&awaited.base),
             Expr::Tuple(tuple) => {
@@ -479,7 +592,21 @@ impl<'h> Scan<'h> {
 
     fn call_binding(&self, call: &ExprCall) -> Binding {
         let serde = match &*call.func {
-            Expr::Path(func) => serde_names(&func.path),
+            Expr::Path(func) => {
+                if self.serde_impls == 0
+                    && last_name(&func.path).is_some_and(|name| name == DESERIALIZE)
+                {
+                    return Binding::Outcome;
+                }
+                match &func.qself {
+                    Some(qself) if is_serde_type(&qself.ty, &self.aliases) => Some(
+                        std::iter::once(SERDE_JSON.to_owned())
+                            .chain(idents(&func.path))
+                            .collect(),
+                    ),
+                    _ => serde_names_via(&func.path, &self.aliases),
+                }
+            }
             _ => None,
         };
         if let Some(names) = serde {
@@ -513,6 +640,25 @@ impl<'h> Scan<'h> {
             return Binding::Outcome;
         }
         let method = call.method.unraw().to_string();
+        if self.serde_impls == 0 && (method == DESERIALIZE || method.starts_with("deserialize_")) {
+            return Binding::Outcome;
+        }
+        let serde_turbofish = call.turbofish.as_ref().is_some_and(|turbofish| {
+            turbofish.args.iter().any(|arg| match arg {
+                syn::GenericArgument::Type(ty) => is_serde_type(ty, &self.aliases),
+                _ => false,
+            })
+        });
+        if method == PARSE && serde_turbofish {
+            return Binding::Outcome;
+        }
+        let returns_outcome = call.args.iter().any(|arg| match arg {
+            Expr::Closure(closure) => self.binding_of(&closure.body) == Binding::Outcome,
+            _ => false,
+        });
+        if returns_outcome {
+            return Binding::Outcome;
+        }
         let drops = listed(DISCARDING, &method)
             || listed(ERROR_HANDLERS, &method)
             || listed(UNOPENED, &method);
@@ -541,9 +687,11 @@ impl<'h> Scan<'h> {
                 }
             }
             Pat::TupleStruct(tuple) => {
-                let err = outcome && last_name(&tuple.path).is_some_and(|name| name == "Err");
+                let name = last_name(&tuple.path);
+                let err = outcome && name.as_deref() == Some("Err");
+                let wrapped = outcome && name.as_deref() == Some("Some");
                 for elem in &tuple.elems {
-                    self.bind_pat(elem, false, in_err || err);
+                    self.bind_pat(elem, wrapped, in_err || err);
                 }
             }
             Pat::Struct(fields) => {
@@ -595,14 +743,20 @@ impl<'h> Scan<'h> {
         }
         self.visit_return_type(&sig.output);
         if let Some(block) = block {
-            self.visit_block(block);
+            self.push();
+            visit::visit_block(self, block);
+            if self.tail_binding(block) == Binding::Outcome {
+                self.record(SiteKind::Forwarded);
+            }
+            self.pop();
         }
         self.functions.pop();
         self.scopes = outer;
     }
 
-    /// Scan a closure; `failure` says its parameters are handed the error.
-    fn closure(&mut self, closure: &ExprClosure, failure: bool) {
+    /// Scan a closure; `failure` says its parameters are handed the error,
+    /// `kept` that a method call's binding carries its returned outcome.
+    fn closure(&mut self, closure: &ExprClosure, failure: bool, kept: bool) {
         self.push();
         for input in &closure.inputs {
             self.bind_pat(input, false, failure);
@@ -610,13 +764,24 @@ impl<'h> Scan<'h> {
         }
         self.visit_return_type(&closure.output);
         self.visit_expr(&closure.body);
+        if !kept && self.binding_of(&closure.body) == Binding::Outcome {
+            self.record(SiteKind::Forwarded);
+        }
         self.pop();
+    }
+
+    /// The binding of a block's tail expression.
+    fn tail_binding(&self, block: &Block) -> Binding {
+        match block.stmts.last() {
+            Some(Stmt::Expr(tail, None)) => self.binding_of(tail),
+            _ => Binding::Clean,
+        }
     }
 
     /// The first argument of an error handler over an outcome.
     fn error_handler(&mut self, arg: &Expr) {
         match arg {
-            Expr::Closure(closure) => self.closure(closure, true),
+            Expr::Closure(closure) => self.closure(closure, true, true),
             Expr::Path(path) if self.renders(&path.path) => visit::visit_expr_path(self, path),
             _ => {
                 self.record(SiteKind::Forwarded);
@@ -633,7 +798,8 @@ impl<'h> Scan<'h> {
     }
 
     /// Record a `Rendered` site for each `{name}` placeholder of `text` that
-    /// names a failure binding.
+    /// names a failure or an outcome binding (an outcome's `Debug` prints its
+    /// error).
     fn placeholders(&mut self, text: &str) {
         let mut rest = text;
         while let Some(open) = rest.find('{') {
@@ -644,7 +810,7 @@ impl<'h> Scan<'h> {
             }
             let end = after.find(['}', ':']).unwrap_or(after.len());
             let name = after.get(..end).unwrap_or_default().trim();
-            if self.lookup(name) == Binding::Failure {
+            if matches!(self.lookup(name), Binding::Failure | Binding::Outcome) {
                 self.record(SiteKind::Rendered);
             }
             rest = after;
@@ -656,11 +822,11 @@ impl<'h> Scan<'h> {
         for tree in tokens {
             match tree {
                 TokenTree::Group(group) => self.scan_tokens(group.stream()),
-                TokenTree::Ident(ident) => {
-                    if self.lookup(&ident.unraw().to_string()) == Binding::Failure {
-                        self.record(SiteKind::Rendered);
-                    }
-                }
+                TokenTree::Ident(ident) => match self.lookup(&ident.unraw().to_string()) {
+                    Binding::Failure => self.record(SiteKind::Rendered),
+                    Binding::Outcome => self.record(SiteKind::Forwarded),
+                    Binding::Clean | Binding::Stream => {}
+                },
                 TokenTree::Literal(literal) => {
                     let text = syn::parse2::<LitStr>(TokenTree::Literal(literal).into());
                     if let Ok(text) = text {
@@ -757,6 +923,15 @@ impl<'ast> Visit<'ast> for Scan<'_> {
         self.add_use(&item.tree, false, None);
     }
 
+    fn visit_item_impl(&mut self, item: &'ast ItemImpl) {
+        let serde_trait = item.trait_.as_ref().is_some_and(|(path, _)| {
+            last_name(path).is_some_and(|name| listed(SERDE_TRAITS, &name))
+        });
+        self.serde_impls = self.serde_impls.saturating_add(usize::from(serde_trait));
+        visit::visit_item_impl(self, item);
+        self.serde_impls = self.serde_impls.saturating_sub(usize::from(serde_trait));
+    }
+
     fn visit_item_extern_crate(&mut self, item: &'ast ItemExternCrate) {
         if item.ident == SERDE_JSON && item.rename.is_some() {
             self.record(SiteKind::Import);
@@ -815,7 +990,11 @@ impl<'ast> Visit<'ast> for Scan<'_> {
     fn visit_block(&mut self, block: &'ast Block) {
         self.push();
         visit::visit_block(self, block);
+        let inner = self.tail_binding(block);
         self.pop();
+        if inner == Binding::Outcome && self.tail_binding(block) != Binding::Outcome {
+            self.record(SiteKind::Forwarded);
+        }
     }
 
     fn visit_local(&mut self, local: &'ast Local) {
@@ -837,7 +1016,7 @@ impl<'ast> Visit<'ast> for Scan<'_> {
     }
 
     fn visit_expr_closure(&mut self, node: &'ast ExprClosure) {
-        self.closure(node, false);
+        self.closure(node, false, false);
     }
 
     fn visit_expr_match(&mut self, node: &'ast ExprMatch) {
@@ -895,7 +1074,7 @@ impl<'ast> Visit<'ast> for Scan<'_> {
                 .path
                 .get_ident()
                 .is_some_and(|ident| self.lookup(&ident.unraw().to_string()) == Binding::Failure);
-            let fallible = serde_names(&node.path)
+            let fallible = serde_names_via(&node.path, &self.aliases)
                 .is_some_and(|names| names.last().is_some_and(|last| listed(FALLIBLE, last)));
             if failure {
                 self.record(SiteKind::Rendered);
@@ -965,6 +1144,8 @@ impl<'ast> Visit<'ast> for Scan<'_> {
         for (at, arg) in node.args.iter().enumerate() {
             if outcome && at == 0 && listed(ERROR_HANDLERS, &method) {
                 self.error_handler(arg);
+            } else if let Expr::Closure(closure) = arg {
+                self.closure(closure, false, true);
             } else {
                 self.visit_arg(arg);
             }
@@ -1016,7 +1197,9 @@ fn scan_all(sources: &[(String, String)]) -> Vec<(String, Vec<(String, SiteKind)
     files
         .iter()
         .map(|(name, file)| {
-            let mut scan = Scan::new(&handlers.names);
+            let mut aliases = Aliases::default();
+            aliases.visit_file(file);
+            let mut scan = Scan::new(&handlers.names, aliases.names);
             scan.visit_file(file);
             (name.clone(), scan.sites)
         })
@@ -1127,6 +1310,85 @@ fn i(s: &str) { let _ = serde_json::from_str::<V>(s).expect("valid"); }
         SiteKind::Forwarded,
         &["a", "b", "c", "d", "e", "f", "g", "h", "i"],
     );
+}
+
+// A `serde_json` failure reached without the `serde_json::` prefix: an
+// imported or renamed type's `from_str`, a qualified-self `from_str`, a
+// `parse` turbofish, and a `Value` used as a deserializer.
+#[test]
+fn an_unprefixed_serde_failure_is_a_site() {
+    let src = r#"
+use serde_json::{Value as JsonValue, Number};
+fn a(s: &str) -> String { match JsonValue::from_str(s) { Ok(_) => String::new(), Err(e) => format!("{e}") } }
+fn b(s: &str) -> String { match Number::from_str(s) { Ok(_) => String::new(), Err(e) => e.to_string() } }
+fn c(s: &str) -> String { match <serde_json::Value as FromStr>::from_str(s) { Ok(_) => String::new(), Err(e) => format!("{e}") } }
+fn d(s: &str) -> String { match s.parse::<serde_json::Value>() { Ok(_) => String::new(), Err(e) => format!("{e}") } }
+fn e(s: &str) -> String { match s.parse::<JsonValue>() { Ok(_) => String::new(), Err(e) => format!("{e}") } }
+fn f(v: JsonValue) -> String { match T::deserialize(v) { Ok(_) => String::new(), Err(e) => format!("{e}") } }
+fn g(v: &JsonValue) -> String { match <T as serde::Deserialize>::deserialize(v) { Ok(_) => String::new(), Err(e) => e.to_string() } }
+fn h(v: JsonValue) -> String { v.deserialize_any(V).map_err(|e| e.to_string()).err().unwrap_or_default() }
+fn i(s: &str) -> String { match s.parse::<u8>() { Ok(_) => String::new(), Err(e) => format!("{e}") } }
+"#;
+    expect_sites(
+        src,
+        SiteKind::Rendered,
+        &["a", "b", "c", "d", "e", "f", "g", "h"],
+    );
+}
+
+// A `serde_json` outcome that leaves its binding by a function or closure
+// tail, through a block, `if` or `match`, inside `Some(..)`, or formatted
+// whole with `{name:?}`: each is a site, never a silent pass.
+#[test]
+fn an_outcome_leaving_by_tail_block_or_format_is_a_site() {
+    let src = r#"
+fn a<T: DeserializeOwned>(s: &str) -> Result<T, impl std::error::Error> { serde_json::from_str(s) }
+fn b(s: &str) -> Result<u8, Box<dyn std::error::Error>> { serde_json::from_str(s).map_err(Into::into) }
+fn c(s: &str) -> Result<u8, String> { let r = serde_json::from_str(s); r.map_err(|e| e.to_string()) }
+fn d(s: &str) -> String { if let Err(e) = serde_json::from_str::<u8>(s) { let f = || e.to_string(); return f(); } String::new() }
+fn e(s: &str) -> String { let r = serde_json::from_str::<u8>(s); let t = r; match t { Err(e) => e.to_string(), _ => String::new() } }
+fn f(s: &str) -> String { let r = serde_json::from_str::<u8>(s); let v = vec![r]; format!("{v:?}") }
+fn g(s: &str) -> String { serde_json::from_str::<u8>(s).map(|_| String::new()).unwrap_or_else(|e| e.to_string()) }
+fn h(s: &str) -> String { match serde_json::from_str::<u8>(s) { Ok(_) => String::new(), other => format!("{other:?}") } }
+fn i(s: &str) -> String { let r = serde_json::from_str::<u8>(s); if r.is_err() { return format!("{r:?}"); } String::new() }
+fn j(s: &str) -> String { let r = { let x = serde_json::from_str::<u8>(s); x }; match r { Err(e) => e.to_string(), _ => String::new() } }
+fn k(s: &str) -> String { let r = if s.is_empty() { serde_json::from_str::<u8>(s) } else { Ok(1) }; match r { Err(e) => e.to_string(), _ => String::new() } }
+fn l(s: Option<&str>) -> String { match s.map(|x| serde_json::from_str::<u8>(x)) { Some(Err(e)) => e.to_string(), _ => String::new() } }
+fn m(s: &str) -> String { let f = || serde_json::from_str::<u8>(s); String::new() }
+fn n(s: Option<&str>) -> String { s.map(|x| { let r = serde_json::from_str::<u8>(x); r }); String::new() }
+fn o(s: &str) -> Result<u8, String> { serde_json::from_str::<u8>(s).or_else(|_| serde_json::from_str::<u8>("1")).map_err(|e| e.to_string()) }
+fn p(v: JsonValue) -> Result<X, Box<dyn std::error::Error>> { Ok(X(u8::deserialize(v)?)) }
+"#;
+    let rendered = ["c", "d", "e", "g", "h", "i", "k", "l", "o"];
+    let forwarded = ["a", "b", "f", "j", "m", "n", "p"];
+    let expected: BTreeMap<(String, SiteKind), usize> = rendered
+        .iter()
+        .map(|name| ((String::from(*name), SiteKind::Rendered), 1))
+        .chain(
+            forwarded
+                .iter()
+                .map(|name| ((String::from(*name), SiteKind::Forwarded), 1)),
+        )
+        .collect();
+    assert_eq!(scan(src), expected);
+}
+
+// Inside a serde trait impl a `deserialize` call's error is the impl's generic
+// one, handed back to the caller whose own call the scan sees.
+#[test]
+fn a_serde_trait_impl_forwarding_its_deserializer_error_is_not_a_site() {
+    let src = r#"
+impl<'de> Deserialize<'de> for X {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> { u8::deserialize(d).map(X) }
+}
+impl<'de> serde::de::Visitor<'de> for XVisitor {
+    type Value = X;
+    fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<X, D::Error> { d.deserialize_u8(self) }
+}
+fn a(s: &str) -> Option<u8> { serde_json::from_str(s).ok() }
+fn b(s: &str) -> Result<u8, u8> { serde_json::from_str(s).map_err(|_| 0) }
+"#;
+    assert_eq!(scan(src), BTreeMap::new());
 }
 
 #[test]
