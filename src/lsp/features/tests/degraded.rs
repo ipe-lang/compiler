@@ -190,14 +190,15 @@ fn a_pruned_solve_withholds_an_unpinned_type() -> Result<(), &'static str> {
 
 /// A module with `count` annotated declarations, each with a type error.
 fn failing_chain(count: usize) -> String {
-    let decls: String = (0..count)
+    let decls = (0..count)
         .map(|n| format!("bad{n} : Int\nbad{n} =\n    \"x\"\n\n"))
-        .collect();
+        .collect::<Vec<_>>()
+        .concat();
     format!("module Main exposing (main)\n\n{decls}main =\n    1\n")
 }
 
 #[test]
-fn a_degraded_solve_stops_at_its_cap() -> Result<(), &'static str> {
+fn a_degraded_solve_stops_at_its_cap() {
     let db = IpeDatabase::new();
     let (root, main) = single(&db, &failing_chain(3));
     assert!(module_types(&db, root, main, main).is_some());
@@ -205,7 +206,6 @@ fn a_degraded_solve_stops_at_its_cap() -> Result<(), &'static str> {
     let db = IpeDatabase::new();
     let (root, main) = single(&db, &failing_chain(40));
     assert_eq!(module_types(&db, root, main, main), None);
-    Ok(())
 }
 
 const TWO_FAILURES: &str = "module Main exposing (main)\n\n\

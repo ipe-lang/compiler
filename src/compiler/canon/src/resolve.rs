@@ -623,7 +623,7 @@ pub fn canonicalise_module_indexed(
 }
 
 /// A value declaration whose annotation resolved although its body failed.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DeclaredSignature {
     /// The declared name, at its declaration.
     pub name: Located<Symbol>,
@@ -636,7 +636,7 @@ pub struct DeclaredSignature {
 }
 
 /// One value declaration that failed to canonicalise.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DeclFailure {
     /// The declared name.
     pub name: Symbol,

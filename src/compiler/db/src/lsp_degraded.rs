@@ -387,12 +387,12 @@ fn infer_module_degraded(
     prune.close();
     // Every attributable refusal prunes one more declaration, and a
     // declaration is pruned at most twice.
-    let solves = extents
+    let attempts = extents
         .len()
         .saturating_mul(2)
         .saturating_add(1)
         .min(PRUNE_CAP);
-    for _ in 0..solves {
+    for _ in 0..attempts {
         let mut pruned = canonical.module.clone();
         pruned.defs.retain(|def| prune.keeps(def.name().value));
         let mut exports = canonical.exports.clone();
