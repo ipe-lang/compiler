@@ -326,7 +326,7 @@ Compile a program to a native or WebAssembly development artifact, with Debug.* 
 ipe dev build [<dir>] [<shape>] [<runtime>] [<host>] [<target>]
 ```
 
-**Arguments:** dir: a project directory (default: the current directory). shape is derived from `main` and, if written, only cross-checked. runtime/host apply to `web` only: `web` = served (served is the unnamed default, never written), `web client` = self-contained browser client (it derives the wasm target), and a host is desktop/ios/android. A `desktop`/`ios`/`android` host lays out the app bundle for that host (a fast dev bundle; `release build` with the same delivery words produces the production distributable). With no delivery args, `dev build` builds the default delivery — the fast one-artifact inner loop; `release build` builds every declared delivery. Delivery args select a subset or override for this invocation only and never edit package.ipe.
+**Arguments:** dir: a project directory (default: the current directory). shape is derived from `main` and, if written, only cross-checked. runtime/host apply to `web` only: `web` = served (served is the unnamed default, never written), `web client` = self-contained browser client (it derives the wasm target), and a host is desktop/ios/android. A `desktop`/`ios`/`android` host lays out the app bundle for that host (a fast dev bundle; `release build` with the same delivery words produces the production distributable). With no delivery args, `dev build` builds the one delivery declared in `ships` in package.ipe (the served default when `ships` is absent) and ignores its static or cross target; when `ships` declares several, it refuses and lists the command for each. `release build` builds every declared delivery. Delivery args select a subset or override for this invocation only and never edit package.ipe.
 
 **Output:** a native build lands the runnable binary at `out/bin/<project-name>` under the project (copied there within the build), so it is findable even when a shared `CARGO_TARGET_DIR` places cargo's own output outside the project.
 
@@ -352,7 +352,7 @@ Compile a program as a development build and run the resulting binary.
 ipe dev run [<dir>]
 ```
 
-**Arguments:** A project directory (default: the current directory).
+**Arguments:** A project directory (default: the current directory). With no delivery args, `dev run` runs the one delivery declared in `ships` in package.ipe (the served default when `ships` is absent); when `ships` declares several, it refuses and lists the command for each.
 
 **Flags:**
 
@@ -377,7 +377,7 @@ Rebuild and re-run a development build on every source change.
 ipe dev watch [<dir>]
 ```
 
-**Arguments:** A project directory (default: the current directory).
+**Arguments:** A project directory (default: the current directory). `dev watch` serves the delivery declared in package.ipe and refuses a `web client` delivery, stated or declared, which has no server to restart: build it with `ipe dev build web client`.
 
 **Flags:**
 
@@ -398,7 +398,7 @@ Build the production artifact, optimised and with Debug.* gated. Native-bearing 
 ipe release build [<dir>] [<shape>] [<runtime>] [<host>]
 ```
 
-**Arguments:** A project directory (default: the current directory). shape/runtime/host are the delivery grammar shared with `dev build`: a `desktop`/`ios`/`android` host lays out the production app bundle for that host (a self-contained desktop bundle, or a native mobile system-webview shell). An `android` host produces an unsigned Gradle project: a store build needs your own keystore configured in Gradle. With no delivery args, `release build` builds every delivery declared in package.ipe (`dev build` builds only the default one).
+**Arguments:** A project directory (default: the current directory). shape/runtime/host are the delivery grammar shared with `dev build`: a `desktop`/`ios`/`android` host lays out the production app bundle for that host (a self-contained desktop bundle, or a native mobile system-webview shell). An `android` host produces an unsigned Gradle project: a store build needs your own keystore configured in Gradle. With no delivery args, `release build` builds every delivery declared in `ships` in package.ipe, each for the target its ship names (the served default when `ships` is absent).
 
 **Flags:**
 
@@ -419,7 +419,7 @@ Build the production artifact (cached), then run exactly that artifact, jailed t
 ipe release run [<dir>|<artifact-dir>]
 ```
 
-**Arguments:** A project directory (default: the current directory), or a built artifact directory holding `ipe-wrapper`. Every run is confined: the default single binary jails itself, a bundle is verified against the floor embedded in its app and then jailed, and a pure-native binary runs jailed to its consented capabilities. An artifact directory runs as built, so it takes no build options. A `web client` build (with or without `desktop`/`ios`/`android`) or a served `web desktop` bundle has no run form and is refused: build it with `ipe release build`.
+**Arguments:** A project directory (default: the current directory), or a built artifact directory holding `ipe-wrapper`. Every run is confined: the default single binary jails itself, a bundle is verified against the floor embedded in its app and then jailed, and a pure-native binary runs jailed to its consented capabilities. An artifact directory runs as built, so it takes no build options. With no delivery args, `release run` builds and runs the one delivery declared in `ships` in package.ipe (the served default when `ships` is absent); when `ships` declares several, it refuses and lists the command for each. A `web client` build (with or without `desktop`/`ios`/`android`) or a served `web desktop` bundle has no run form and is refused: build it with `ipe release build`.
 
 **Flags:**
 
