@@ -96,10 +96,9 @@ fn outside_reach(files: &[(String, String)]) -> Vec<String> {
 #[test]
 fn only_the_language_server_features_reach_the_degraded_analysis() {
     let files = scanned_files();
+    let this_file = format!("src/ipe-cli/tests/{FACADE}_scan.rs");
     assert!(
-        files
-            .iter()
-            .any(|(rel, _)| rel == "src/ipe-cli/tests/lsp_degraded_scan.rs"),
+        files.iter().any(|(rel, _)| *rel == this_file),
         "the scan must list this file (the listing is not vacuous)"
     );
     assert!(
