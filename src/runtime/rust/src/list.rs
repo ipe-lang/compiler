@@ -128,20 +128,15 @@ pub fn list_unzip<A, B>(xs: Vec<(A, B)>) -> (Vec<A>, Vec<B>) {
 /// instead of panicking (std sort panics on such a comparator since Rust 1.81).
 pub fn list_sort_with_order<A: Clone>(cmp: impl Fn(A, A) -> IpeOrder, list: Vec<A>) -> Vec<A> {
     let mut result = list;
-    let order = &mut result;
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        order.sort_by(|a, b| match cmp(a.clone(), b.clone()) {
+    sort_by_total(
+        &mut result,
+        |a, b| match cmp(a.clone(), b.clone()) {
             IpeOrder::LT => std::cmp::Ordering::Less,
             IpeOrder::EQ => std::cmp::Ordering::Equal,
             IpeOrder::GT => std::cmp::Ordering::Greater,
-        });
-    }));
-    if outcome.is_err() {
-        crate::system::emit_runtime_log(
-            "list",
-            "List.sortWith: comparator is not a consistent total order; returning input in unspecified order",
-        );
-    }
+        },
+        SORT_WITH_INCONSISTENT,
+    );
     result
 }
 
@@ -413,22 +408,38 @@ pub fn list_find<T0: Clone>(f: impl Fn(T0) -> bool, list: Vec<T0>) -> IpeMaybe<T
 /// and NaN≈2.0 yet 1.0<2.0), and since Rust 1.81 `slice::sort_by` PANICS on a
 /// comparator that violates a strict weak ordering. NaN IS reachable at runtime
 /// (`0.0 / 0.0`, `sqrt(-1)`, an FFI float) even though no Ipê literal spells it —
-/// so the callers below wrap the sort in `catch_unwind` to stay total.
+/// so the callers below sort through `sort_by_total` to stay total.
 fn cmp_total<T: PartialOrd>(a: &T, b: &T) -> std::cmp::Ordering {
     a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
 }
 
-/// Run `sort_by` but never panic: a non-strict-weak-ordering comparator (e.g.
-/// `cmp_total` over a multi-NaN float list) panics std's sort since Rust 1.81;
-/// catch it and leave the slice in its safe, element-complete (unspecified-order)
-/// state. Shared by `list_sort`/`list_sort_by` (and mirrors `list_sort_with`).
-fn sort_by_total<T, F: Fn(&T, &T) -> std::cmp::Ordering>(result: &mut [T], cmp: F) {
-    let order = std::panic::AssertUnwindSafe(|| result.sort_by(&cmp));
-    if std::panic::catch_unwind(order).is_err() {
-        crate::system::emit_runtime_log(
-            "list",
-            "sort: comparator is not a consistent total order (NaN?); unspecified order",
-        );
+/// The log line of a `sortWith` comparator that is not a consistent total order.
+const SORT_WITH_INCONSISTENT: &str = "List.sortWith: comparator is not a consistent total order; returning input in unspecified order";
+
+/// The log line of a natural-order sort over keys that are not totally ordered.
+const SORT_NAN_INCONSISTENT: &str =
+    "sort: comparator is not a consistent total order (NaN?); unspecified order";
+
+/// Sort `result` by `cmp`, containing std's inconsistent-order panic and resuming a runtime trip.
+///
+/// Since Rust 1.81 `slice::sort_by` panics on a comparator that is not a strict
+/// weak ordering (a user `sortWith` comparator, or `cmp_total` over a multi-NaN
+/// list); that panic is caught, `message` is logged, and the slice is left in
+/// its element-complete, unspecified-order state. A [`crate::core::RuntimeTrip`]
+/// raised inside the comparator (a recursion trip in user comparator code) is
+/// resumed instead, so it reaches the task boundary as its typed error rather
+/// than being absorbed as a mere ordering fault. Every list sort goes through
+/// here.
+fn sort_by_total<T>(
+    result: &mut [T],
+    cmp: impl FnMut(&T, &T) -> std::cmp::Ordering,
+    message: &str,
+) {
+    let outcome =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || result.sort_by(cmp)));
+    if let Err(payload) = outcome {
+        drop(crate::core::resume_runtime_trip(payload));
+        crate::system::emit_runtime_log("list", message);
     }
 }
 
@@ -436,7 +447,7 @@ fn sort_by_total<T, F: Fn(&T, &T) -> std::cmp::Ordering>(result: &mut [T], cmp: 
 /// sort by the element's natural order. Total (no panic on NaN).
 pub fn list_sort<T: PartialOrd>(list: Vec<T>) -> Vec<T> {
     let mut result = list;
-    sort_by_total(&mut result, cmp_total);
+    sort_by_total(&mut result, cmp_total, SORT_NAN_INCONSISTENT);
     result
 }
 
@@ -452,7 +463,11 @@ pub fn list_sort_by<A: Clone, B: PartialOrd>(key_fn: impl Fn(A) -> B, list: Vec<
     let mut decorated: Vec<(B, A)> = list.into_iter().map(|x| (key_fn(x.clone()), x)).collect();
     // Stable sort on the key only (so equal keys preserve input order). Via the
     // panic-safe wrapper: a multi-NaN key set makes cmp_total non-transitive.
-    sort_by_total(&mut decorated, |a, b| cmp_total(&a.0, &b.0));
+    sort_by_total(
+        &mut decorated,
+        |a, b| cmp_total(&a.0, &b.0),
+        SORT_NAN_INCONSISTENT,
+    );
     // Undecorate.
     decorated.into_iter().map(|(_, x)| x).collect()
 }
@@ -465,23 +480,15 @@ pub fn list_sort_by<A: Clone, B: PartialOrd>(key_fn: impl Fn(A) -> B, list: Vec<
 /// exactly one of Less / Equal / Greater.
 pub fn list_sort_with<A: Clone>(cmp: impl Fn(A, A) -> i64, list: Vec<A>) -> Vec<A> {
     let mut result = list;
-    // Soundness (no-panic thesis): the comparator is arbitrary user Ipê code.
-    // Since Rust 1.81 the standard sort PANICS when a comparator violates a
-    // strict weak ordering (e.g. `cmp a b` and `cmp b a` both return a positive
-    // Int). A well-typed Ipê `List.sortWith` could supply exactly that, so the
-    // bare `sort_by` is a Ipê-reachable panic. Catch the unwind and return the
-    // list in its (safe, unspecified-order) post-sort state — std guarantees the
-    // elements are all still present and no UB on a panicking comparator.
-    let order = &mut result;
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        order.sort_by(|a, b| cmp(a.clone(), b.clone()).cmp(&0));
-    }));
-    if outcome.is_err() {
-        crate::system::emit_runtime_log(
-            "list",
-            "List.sortWith: comparator is not a consistent total order; returning input in unspecified order",
-        );
-    }
+    // The comparator is arbitrary user Ipê code: one that is not a strict weak
+    // ordering (`cmp a b` and `cmp b a` both positive) would panic std's sort,
+    // so the sort runs contained and returns the list in its element-complete,
+    // unspecified-order state.
+    sort_by_total(
+        &mut result,
+        |a, b| cmp(a.clone(), b.clone()).cmp(&0),
+        SORT_WITH_INCONSISTENT,
+    );
     result
 }
 
@@ -868,6 +875,29 @@ mod tests {
         // Always-LT comparator violates antisymmetry — must not panic.
         let out = list_sort_with_order(|_a, _b| IpeOrder::LT, xs);
         assert_eq!(out.len(), 64);
+    }
+
+    /// The trip a sort whose comparator trips unwinds with, if any.
+    fn sort_unwind(sort: impl FnOnce() -> Vec<i64>) -> Option<crate::core::RuntimeTrip> {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(sort));
+        assert!(outcome.is_err(), "a comparator trip must leave the sort");
+        let Err(payload) = outcome else { return None };
+        crate::core::runtime_trip(payload.as_ref())
+    }
+
+    // A trip raised inside a user comparator is the runtime's typed fault, not
+    // an ordering-contract violation: the sort must resume it, never absorb it.
+    #[test]
+    fn sort_with_propagates_runtime_trip() {
+        use crate::core::{RuntimeTrip, trip};
+        let xs: Vec<i64> = (0..8).collect();
+        let by_int =
+            sort_unwind(|| list_sort_with(|_a, _b| trip(RuntimeTrip::RecursionLimit), xs.clone()));
+        assert_eq!(by_int, Some(RuntimeTrip::RecursionLimit));
+        let by_order = sort_unwind(|| {
+            list_sort_with_order(|_a, _b| trip(RuntimeTrip::RecursionLimit), xs.clone())
+        });
+        assert_eq!(by_order, Some(RuntimeTrip::RecursionLimit));
     }
 
     #[test]
