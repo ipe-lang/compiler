@@ -401,8 +401,9 @@ fn parse_doc_with(rest: &[String], notice: &mut dyn FnMut(&str)) -> Result<DocMo
                 return Err(query_refused(QueryRefusal::Empty));
             }
             // Any other positional is a term, routed on its trimmed text; a
-            // project path is left unconsumed for `parse_doc_flags`.
-            Some(first) if !first.starts_with('-') => {
+            // project path is left unconsumed for `parse_doc_flags`. The `-`
+            // operator is a term too, never a flag.
+            Some(first) if !first.starts_with('-') || is_operator_term(first.trim()) => {
                 let generate_flags = rest.iter().any(|a| a == "--out" || a == "--write-format");
                 let sub = route_term(first, generate_flags)?;
                 if !matches!(sub, Sub::Generate) {
@@ -448,6 +449,12 @@ fn parse_doc_with(rest: &[String], notice: &mut dyn FnMut(&str)) -> Result<DocMo
 /// [`CliError::Usage`] naming the [`QueryRefusal`] of a lookup or module term.
 fn route_term(raw: &str, generate_flags: bool) -> Result<Sub, CliError> {
     let term = raw.trim();
+    // A binary operator's text (`//`, `|>`) names its documentation, checked
+    // before any host-path test so its `/` or `|` never reads as a path; a
+    // path spelled like an operator is written `./`-prefixed.
+    if is_operator_term(term) {
+        return parsed_term(raw).map(Sub::Lookup);
+    }
     let uppercase = term.chars().next().is_some_and(|c| c.is_ascii_uppercase());
     // A `kind:key` term whose prefix is a known kind is a bundle lookup,
     // whatever its key holds (an operator symbol may carry `/`).
@@ -474,6 +481,14 @@ fn route_term(raw: &str, generate_flags: bool) -> Result<Sub, CliError> {
         return Ok(Sub::Generate);
     }
     parsed_term(raw).map(Sub::Lookup)
+}
+
+/// Whether `term` is the source text of a binary operator.
+///
+/// The operator set is the parser's closed [`ipe_syntax::BinOp`], so a term
+/// routes as an operator exactly when the parser reads it as one.
+const fn is_operator_term(term: &str) -> bool {
+    ipe_syntax::BinOp::from_text(term).is_some()
 }
 
 /// A lookup term parsed into its [`LookupTerm`], the key part of a `kind:key`
@@ -738,6 +753,12 @@ fn build_index() -> Result<Index, CliError> {
 
     // Environment variables: sourced from the ENV_VARS registry (single SSOT).
     builder.add_env_vars();
+
+    // Operators: one entry per parser `BinOp`, added last so a key another
+    // source holds is refused rather than replaced.
+    builder
+        .add_operators()
+        .map_err(|e| CliError::Usage(text::msg::doc_stdlib_index_failed(&e)))?;
 
     Ok(builder.finish())
 }
@@ -7378,6 +7399,63 @@ mod tests {
                 write_format: WriteFormat::All,
             }
         );
+    }
+
+    /// Every binary operator's text is a lookup term, never a host path or a
+    /// flag, and opens the operator's own entry.
+    #[test]
+    fn every_operator_routes_to_its_entry() {
+        let index = build_index().expect("the doc index builds");
+        for op in ipe_syntax::BinOp::ALL {
+            let text = op.text();
+            assert_eq!(
+                parse_doc(&s(&[text])).ok(),
+                Some(bare(text, OutputFormat::Human)),
+                "`ipe doc {text}` must be a lookup"
+            );
+            let entry = index.resolve(text);
+            assert!(
+                entry.is_some_and(|e| {
+                    matches!(e.kind, ipe_docs::EntryKind::Symbol) && e.source_key == text
+                }),
+                "`{text}` must open its operator entry: {entry:?}"
+            );
+        }
+    }
+
+    /// A path spelled like an operator stays a path once `./`-prefixed.
+    #[test]
+    fn a_dot_prefixed_operator_spelling_is_a_path() {
+        assert_eq!(
+            parse_doc(&s(&["./"])).ok(),
+            Some(DocMode::Generate {
+                path: PathBuf::from("./"),
+                out: PathBuf::from("doc"),
+                write_format: WriteFormat::All,
+            })
+        );
+        assert_eq!(
+            parse_doc(&s(&["./-"])).ok(),
+            Some(DocMode::Generate {
+                path: PathBuf::from("./-"),
+                out: PathBuf::from("doc"),
+                write_format: WriteFormat::All,
+            })
+        );
+    }
+
+    /// An operator is a lookup even beside a generate-only flag, so the flag
+    /// is refused rather than the operator read as a project path.
+    #[test]
+    fn an_operator_with_a_generate_flag_is_refused() {
+        let refused = text::msg::doc_generate_only_flag(&"<key>", &"--out");
+        for op in ["//", "-"] {
+            let got = parse_doc(&s(&[op, "--out", "site"]));
+            assert!(
+                matches!(&got, Err(CliError::Usage(msg)) if *msg == refused),
+                "`ipe doc {op} --out site` must refuse `--out`: {got:?}"
+            );
+        }
     }
 
     #[test]
