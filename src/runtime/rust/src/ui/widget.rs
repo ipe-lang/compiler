@@ -33,7 +33,7 @@
 #[cfg(feature = "json")]
 use crate::html::{Attribute as HtmlAttribute, Event};
 #[cfg(feature = "json")]
-use crate::seal_codec::{SealLimits, seal_decode_serde};
+use crate::seal_codec::{SealDecodeError, SealLimits, seal_decode_serde};
 #[cfg(feature = "json")]
 use crate::ui::element::Attribute;
 use crate::ui::element::{Description, Element};
@@ -122,8 +122,7 @@ where
             match seal_decode_serde::<Up>(&payload, SealLimits::default()) {
                 Ok(up) => Some(on_up(up)),
                 Err(e) => {
-                    // Observable, but never a foothold: no part of the value survives.
-                    crate::system::emit_runtime_log("widget", &format!("up-event dropped: {e}"));
+                    crate::system::emit_runtime_log("widget", &up_event_dropped_line(&e));
                     None
                 }
             }
@@ -136,6 +135,16 @@ where
         vec![state_attr, up_attr],
         Vec::new(),
     )
+}
+
+/// The runtime-log line for an up-event the seal refused.
+///
+/// It names the refusal reason only: a [`SealDecodeError`] carries a length, a
+/// ceiling, or a fixed phrase with at most a position, so no byte of the
+/// browser-posted payload reaches the log.
+#[cfg(feature = "json")]
+fn up_event_dropped_line(refusal: &SealDecodeError) -> String {
+    format!("up-event dropped: {refusal}")
 }
 
 /// Non-`json` builds have no seal-codec substrate, so the widget seam has no
@@ -222,5 +231,93 @@ mod tests {
             )
         });
         assert!(has_up, "the widget must wire an OnWidget up-event handler");
+    }
+
+    /// A serde-derived `up` type with a non-string field.
+    #[derive(serde::Deserialize)]
+    struct Counted {
+        count: i64,
+    }
+
+    /// A unit-variant `up` type, whose unknown-variant error names the tag.
+    #[derive(serde::Deserialize)]
+    enum Saved {
+        Saved,
+    }
+
+    /// The refusal a browser-posted `payload` meets when decoded into `Up`.
+    fn refusal_of<Up: serde::de::DeserializeOwned>(payload: &str) -> Option<SealDecodeError> {
+        seal_decode_serde::<Up>(payload, SealLimits::default()).err()
+    }
+
+    /// The text a refusal can surface: its detail and the logged line.
+    fn surfaced(refusal: &SealDecodeError) -> [String; 2] {
+        [format!("{refusal:?}"), up_event_dropped_line(refusal)]
+    }
+
+    // A payload value the seal refuses never reaches the refusal or the log:
+    // serde's own `Display` quotes it (`invalid type: string "SENTINEL"`,
+    // `unknown variant `SENTINEL``), so the seal renders a fixed phrase instead.
+    #[test]
+    fn a_refused_up_payload_value_is_not_echoed() {
+        let mismatched = refusal_of::<Counted>(r#"{"count":"SENTINEL"}"#);
+        let unknown_tag = refusal_of::<Saved>(r#""SENTINEL""#);
+        for refusal in [mismatched, unknown_tag] {
+            assert!(
+                matches!(refusal, Some(SealDecodeError::TypeMismatch { .. })),
+                "the payload must be refused as a type mismatch: {refusal:?}"
+            );
+            let Some(refusal) = refusal else { return };
+            for text in surfaced(&refusal) {
+                assert!(
+                    !text.contains("SENTINEL"),
+                    "the refused payload value reached the surfaced text: {text}"
+                );
+            }
+        }
+    }
+
+    // A syntax error names a grammar phrase and a position, never the bad token.
+    #[test]
+    fn a_malformed_up_payload_is_not_echoed() {
+        let refusal = refusal_of::<Counted>(r#"{"count": SENTINEL}"#);
+        assert!(
+            matches!(refusal, Some(SealDecodeError::Malformed { .. })),
+            "a syntax error must be refused as malformed: {refusal:?}"
+        );
+        let Some(refusal) = refusal else { return };
+        for text in surfaced(&refusal) {
+            assert!(
+                !text.contains("SENTINEL"),
+                "the malformed payload reached the surfaced text: {text}"
+            );
+        }
+    }
+
+    // The wired handler drops a refused payload: no msg is dispatched.
+    #[test]
+    fn the_up_handler_drops_a_refused_payload() {
+        let ce = custom_element_("ipe-ce-cafef00d".to_string());
+        let down = DownState {
+            text: String::new(),
+        };
+        let el: Element<i64> = ui_widget_(ce, down, |up: Counted| up.count);
+        assert!(
+            matches!(el, Element::TaggedNode(..)),
+            "CustomElement.node must render a TaggedNode"
+        );
+        let Element::TaggedNode(_, _, attrs, _) = &el else {
+            return;
+        };
+        let handler = attrs.iter().find_map(|a| match a {
+            Attribute::AttrEvent(crate::html::Attribute::EventAttr(
+                crate::html::Event::OnWidget(_, handler),
+            )) => Some(handler.clone()),
+            _ => None,
+        });
+        assert!(handler.is_some(), "the widget must wire an up handler");
+        let Some(handler) = handler else { return };
+        assert_eq!(handler(r#"{"count":"SENTINEL"}"#.to_string()), None);
+        assert_eq!(handler(r#"{"count":7}"#.to_string()), Some(7));
     }
 }
