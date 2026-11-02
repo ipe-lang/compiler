@@ -12,6 +12,8 @@
 //! - A kernel maps to its registry entry and, when an Ipê module declares the
 //!   alias, that module and name; a kernel-only function has no declaration.
 //!
+//! - A top-level value whose declaration failed maps to [`Target::Poisoned`].
+//!
 //! Two different targets recorded at one span leave that span ambiguous, and
 //! an ambiguous span answers nothing rather than either target.
 
@@ -102,6 +104,11 @@ pub enum Target {
         /// it through one; `None` for a kernel-only function.
         declared: Option<DeclHome>,
     },
+    /// A top-level value whose declaration failed to resolve.
+    ///
+    /// The occurrence names no declaration a reader may show: it answers
+    /// nothing, and never the target an import of the same name would give.
+    Poisoned,
 }
 
 /// One span's recorded answer.
@@ -218,6 +225,20 @@ impl NameIndex {
             Slot::One(target) => Some((*span, target)),
             Slot::Ambiguous => None,
         })
+    }
+
+    /// Mark every top-level occurrence of a failed declaration as poisoned.
+    ///
+    /// `failed` answers whether the value `name` of module `home` failed; each
+    /// [`Target::TopLevel`] it holds for becomes [`Target::Poisoned`].
+    pub fn poison(&mut self, failed: impl Fn(&[Symbol], Symbol) -> bool) {
+        for slot in self.by_span.values_mut() {
+            if let Slot::One(Target::TopLevel { home, name }) = slot
+                && failed(home, *name)
+            {
+                *slot = Slot::One(Target::Poisoned);
+            }
+        }
     }
 
     /// The number of recorded spans, ambiguous ones included.

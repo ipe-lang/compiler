@@ -214,7 +214,7 @@ fn name_target(
             declared: Some(decl),
             ..
         } => declared(db, &decl.module, decl.name),
-        Target::Kernel { declared: None, .. } => None,
+        Target::Kernel { declared: None, .. } | Target::Poisoned => None,
         Target::Local(site) => {
             let binder = site.location()?;
             let name = span_text(text, binder)?;
@@ -248,7 +248,7 @@ pub fn resolve_name_at(
 ) -> Option<ResolvedName> {
     let files = root.files(db);
     let &file = files.get(module)?;
-    let canonical = crate::db_access::canonicalize_checked(db, root, entry, file)?;
+    let canonical = crate::db_access::analysis(db, root, entry, file)?.canonical;
     if let Some((span, recorded)) = canonical.names.at(byte) {
         let text = file.text(db);
         let target = name_target(db, module, text, recorded)?;
@@ -352,9 +352,7 @@ pub fn type_definition(
 ) -> Option<Definition> {
     let files = root.files(db);
     let &file = files.get(module)?;
-    let types = ipe_db::typecheck_module(db, root, entry, file)
-        .as_ref()
-        .ok()?;
+    let types = crate::db_access::module_types(db, root, entry, file)?;
 
     // Innermost solved region at the cursor — same resolution as hover.
     let mut best: Option<(u32, u32)> = None; // (width, lo)
@@ -522,10 +520,16 @@ impl Wanted {
             (Self::Local { binder }, Target::Local(site)) => {
                 span != *binder && site.location() == Some(*binder)
             }
-            (Self::Declared { .. }, Target::Local(_) | Target::Kernel { declared: None, .. })
+            (
+                Self::Declared { .. },
+                Target::Local(_) | Target::Kernel { declared: None, .. } | Target::Poisoned,
+            )
             | (
                 Self::Local { .. },
-                Target::TopLevel { .. } | Target::Ctor { .. } | Target::Kernel { .. },
+                Target::TopLevel { .. }
+                | Target::Ctor { .. }
+                | Target::Kernel { .. }
+                | Target::Poisoned,
             ) => false,
         }
     }
@@ -557,8 +561,8 @@ pub fn occurrences(
         })
         .filter_map(|module_path| {
             let &file = files.get(module_path)?;
-            let canonical = ipe_db::canonicalize(db, root, file).as_ref().ok()?;
-            Some((module_path, std::sync::Arc::clone(canonical)))
+            let analysis = crate::db_access::analysis(db, root, entry, file)?;
+            Some((module_path, analysis.canonical))
         })
         .collect();
     // Only after canonicalising: the target's strings are interned by the

@@ -91,6 +91,27 @@ pub enum Ty {
     Record(BTreeMap<Symbol, Self>, RowTail),
 }
 
+impl Ty {
+    /// Whether any type variable or open record row occurs in the type.
+    #[must_use]
+    pub fn holds_variable(&self) -> bool {
+        let mut pending: Vec<&Self> = vec![self];
+        while let Some(ty) = pending.pop() {
+            match ty {
+                Self::Var(_) | Self::Record(_, RowTail::Open(_)) => return true,
+                Self::Wildcard | Self::Unit => {}
+                Self::Fun(arg, result) => {
+                    pending.push(arg);
+                    pending.push(result);
+                }
+                Self::Con { args, .. } | Self::Tuple(args) => pending.extend(args),
+                Self::Record(fields, RowTail::Closed) => pending.extend(fields.values()),
+            }
+        }
+        false
+    }
+}
+
 /// Reserved high bit marking a [`Ty::Var`] raw as solver-representative space
 /// (a tagged [`VarId`]) rather than annotation-symbol space (a
 /// [`ipe_intern::Symbol`] raw). See [`Ty::Var`]'s doc comment (AUD-13) for the

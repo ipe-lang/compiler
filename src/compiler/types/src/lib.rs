@@ -606,6 +606,8 @@ struct ScopedContext<'a> {
     exports: &'a ModuleExports,
     /// Resolved dep module path → its CLOSED typed interface.
     deps: &'a BTreeMap<Vec<Symbol>, Arc<TypedInterface>>,
+    /// The annotations of the module's own values whose bodies failed.
+    declared: &'a [ipe_canon::DeclaredSignature],
 }
 
 /// Infer the types of ONE module of a multi-module program, scoped.
@@ -647,8 +649,32 @@ pub fn infer_module_with_budget(
     interner: &mut Interner,
     steps: SolverSteps,
 ) -> Result<ModuleInference, InferError> {
+    infer_module_declared(m, exports, deps, &[], interner, steps)
+}
+
+/// Like [`infer_module_with_budget`], with values known only by their annotation.
+///
+/// Each of `declared` is a value of `m` whose body failed to canonicalise and
+/// is absent from `m`; a reference to it instantiates its annotation, and
+/// an exported one enters the interface with that annotation as its scheme.
+/// This is analysis of a module that does not build, never a build input.
+///
+/// # Errors
+/// Same conditions as [`infer_module`].
+pub fn infer_module_declared(
+    m: &canon::Module,
+    exports: &ModuleExports,
+    deps: &BTreeMap<Vec<Symbol>, Arc<TypedInterface>>,
+    declared: &[ipe_canon::DeclaredSignature],
+    interner: &mut Interner,
+    steps: SolverSteps,
+) -> Result<ModuleInference, InferError> {
     let mut budget = Budget::new(steps);
-    let scoped = ScopedContext { exports, deps };
+    let scoped = ScopedContext {
+        exports,
+        deps,
+        declared,
+    };
     let (solved, interface) = infer_core(m, interner, &mut budget, Some(&scoped))?;
     Ok(ModuleInference {
         solved,
@@ -751,7 +777,7 @@ fn infer_core(
                     seed.insert((path.clone(), *name), Rc::new(scheme.ty.clone()));
                 }
             }
-            Builder::run_seeded(&mut uf, interner, m, &dep_unions, seed)?
+            Builder::run_seeded(&mut uf, interner, m, &dep_unions, seed, ctx.declared)?
         }
     };
 

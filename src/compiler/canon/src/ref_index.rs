@@ -121,7 +121,7 @@ impl ReferenceIndex {
                     Target::TopLevel { home, name } | Target::Ctor { home, name, .. } => {
                         push_ref(&mut map, home, *name, span, containing_path);
                     }
-                    Target::Local(_) | Target::Kernel { .. } => {}
+                    Target::Local(_) | Target::Kernel { .. } | Target::Poisoned => {}
                 }
             }
         }
