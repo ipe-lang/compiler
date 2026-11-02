@@ -857,8 +857,10 @@ pub fn resolve_term_profile() -> TermProfile {
 /// variant. A Tui session is a process-wide singleton (`TuiGuard::enter*`
 /// refuses a second one while one is active), so a process-wide pin is exact —
 /// never a stale value left over from a different session.
+#[cfg(feature = "tui")]
 static TUI_SESSION_PROFILE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+#[cfg(feature = "tui")]
 impl TermProfile {
     const fn encode(self) -> u8 {
         match self {
@@ -884,6 +886,7 @@ impl TermProfile {
 /// every frame that session paints reads the SAME value for its whole life
 /// instead of re-deriving it per frame — the one env read happens here, through
 /// [`resolve_term_profile`]. Called from `TuiGuard::enter`/`enter_mouse`.
+#[cfg(feature = "tui")]
 pub(crate) fn begin_tui_session_profile() {
     TUI_SESSION_PROFILE.store(
         resolve_term_profile().encode(),
@@ -894,12 +897,14 @@ pub(crate) fn begin_tui_session_profile() {
 /// Un-pin the session profile on teardown, so the next render — a fresh
 /// session, or a one-shot render with no session (e.g. `element_to_cells`) —
 /// resolves fresh again. Called from `tui_teardown`.
+#[cfg(feature = "tui")]
 pub(crate) fn end_tui_session_profile() {
     TUI_SESSION_PROFILE.store(0, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// The profile a Tui frame renders with: the active session's pinned profile,
 /// or a fresh [`resolve_term_profile`] when no session has pinned one.
+#[cfg(feature = "tui")]
 #[must_use]
 pub(crate) fn active_term_profile() -> TermProfile {
     TermProfile::decode(TUI_SESSION_PROFILE.load(std::sync::atomic::Ordering::SeqCst))
