@@ -37,6 +37,7 @@ pub mod dep_path;
 pub mod diff;
 pub mod doc;
 pub mod doc_bundle;
+pub mod doc_fence;
 pub mod doc_pick;
 pub mod doc_search;
 pub mod doc_type_search;

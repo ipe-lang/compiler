@@ -64,13 +64,39 @@ pub const OVERLAY_ENTRY_CAP: EntryCap =
 /// sum those per-page reads hold at once.
 pub const OVERLAY_TOTAL_READ_CAP: u64 = 16 * 1024 * 1024;
 
-/// The overlay kind directories under `docs/`, each with the kind its pages become.
-const OVERLAY_KINDS: [(&str, DocKind); 4] = [
+/// The page kind directories under `docs/`, each with the kind its pages
+/// become: the one table both the embedded corpus ([`EMBEDDED_PAGES`], row for
+/// row) and the on-disk overlay are ingested from.
+pub(crate) const OVERLAY_KINDS: [(&str, DocKind); 4] = [
     ("constructs", DocKind::Construct),
     ("idioms", DocKind::Idiom),
     ("topics", DocKind::Topic),
     ("guide", DocKind::Guide),
 ];
+
+/// Each [`OVERLAY_KINDS`] row's compile-time embedded corpus, row for row.
+///
+/// `include_dir!` takes only a literal path, so the directory name is written
+/// twice; `each_embedded_corpus_is_its_rows_docs_dir` pins each row's embedded
+/// files to its own `docs/<dir>`, and the array length is the table's.
+static EMBEDDED_PAGES: [&Dir<'static>; OVERLAY_KINDS.len()] = [
+    &EMBEDDED_CONSTRUCTS,
+    &EMBEDDED_IDIOMS,
+    &EMBEDDED_TOPICS,
+    &EMBEDDED_GUIDES,
+];
+
+/// The `docs/<dir>` directories `ipe doc` serves, one per [`OVERLAY_KINDS`] row.
+///
+/// Derived from the table that drives both the embedded corpus and the
+/// overlay, so a kind added to the bundle is scanned by every consumer — the
+/// `explain_examples` checker included — the moment it is served. The
+/// destructuring names every row: a row added to [`OVERLAY_KINDS`] breaks the
+/// build here until it is named.
+pub const SERVED_PAGE_DIRS: [&str; OVERLAY_KINDS.len()] = {
+    let [(constructs, _), (idioms, _), (topics, _), (guide, _)] = OVERLAY_KINDS;
+    [constructs, idioms, topics, guide]
+};
 
 /// The one Markdown file name a docs directory holds that is not a page.
 const HOUSEKEEPING_PAGE: &str = "README.md";
@@ -318,10 +344,9 @@ impl DocBundle {
 
         // Always ingest from the compile-time embedded corpus first.  This
         // guarantees non-empty curated sections no matter the working directory.
-        ingest_embedded_dir(&EMBEDDED_CONSTRUCTS, DocKind::Construct, &mut maps)?;
-        ingest_embedded_dir(&EMBEDDED_IDIOMS, DocKind::Idiom, &mut maps)?;
-        ingest_embedded_dir(&EMBEDDED_TOPICS, DocKind::Topic, &mut maps)?;
-        ingest_embedded_dir(&EMBEDDED_GUIDES, DocKind::Guide, &mut maps)?;
+        for ((_, kind), dir) in OVERLAY_KINDS.iter().zip(EMBEDDED_PAGES) {
+            ingest_embedded_dir(dir, *kind, &mut maps)?;
+        }
 
         if let DocsOverlay::Project(root) = overlay {
             ingest_overlay(
@@ -1742,17 +1767,38 @@ mod tests {
         let bundle = DocBundle::build(&DocsOverlay::Embedded, &[], &[], &[], &[])
             .expect("bundle builds from embedded corpus");
 
-        for (kind, dir) in [
-            (DocKind::Construct, &EMBEDDED_CONSTRUCTS),
-            (DocKind::Idiom, &EMBEDDED_IDIOMS),
-            (DocKind::Topic, &EMBEDDED_TOPICS),
-            (DocKind::Guide, &EMBEDDED_GUIDES),
-        ] {
+        for ((_, kind), dir) in OVERLAY_KINDS.iter().zip(EMBEDDED_PAGES) {
             let expected = slug_count(dir);
-            let actual = bundle.entries_for_kind(kind).count();
+            let actual = bundle.entries_for_kind(*kind).count();
             assert_eq!(
                 actual, expected,
                 "{kind}: bundle has {actual} entries but embedded dir has {expected} slug files"
+            );
+        }
+    }
+
+    /// Each [`EMBEDDED_PAGES`] row embeds exactly its [`OVERLAY_KINDS`] row's
+    /// `docs/<dir>`: a swapped or misnamed row serves one directory's pages
+    /// under another's kind and name, which this pins.
+    #[test]
+    fn each_embedded_corpus_is_its_rows_docs_dir() {
+        let docs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
+        for ((name, kind), dir) in OVERLAY_KINDS.iter().zip(EMBEDDED_PAGES) {
+            let embedded: std::collections::BTreeSet<String> = dir
+                .files()
+                .filter_map(|f| f.path().file_name()?.to_str().map(str::to_owned))
+                .collect();
+            let on_disk: std::collections::BTreeSet<String> = docs
+                .join(name)
+                .read_dir()
+                .expect("read the served docs directory")
+                .filter_map(Result::ok)
+                .filter(|e| e.path().is_file())
+                .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+                .collect();
+            assert_eq!(
+                embedded, on_disk,
+                "{kind}: the embedded corpus is not docs/{name}"
             );
         }
     }
