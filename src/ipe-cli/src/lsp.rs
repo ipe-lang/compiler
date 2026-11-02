@@ -1278,11 +1278,11 @@ mod tests {
         let base = fixture.path().join("cache-base");
         fs::create_dir(&base).expect("cache base");
         fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).expect("private base");
-        let loader = DriverLoader {
+        let caching = DriverLoader {
             stdlib_cache_base: Some(base.clone()),
         };
         let main = fixture.path().join("src").join("Main.ipe");
-        let loaded = loader
+        let loaded = caching
             .load(&[fixture.path().to_path_buf()], &main, Some(source))
             .expect("the project loads");
         let tuple = loaded
