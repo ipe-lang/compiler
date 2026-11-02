@@ -216,8 +216,6 @@ docs/guide/process.md:48
 docs/guide/process.md:62
 docs/guide/publishing.md:100
 docs/guide/publishing.md:232
-docs/guide/publishing.md:57
-docs/guide/publishing.md:60
 docs/guide/pubsub.md:40
 docs/guide/pubsub.md:49
 docs/guide/pure-functions.md:13
@@ -716,5 +714,4 @@ explain/IPE-T0021.md:23
 explain/IPE-T0021.md:31
 explain/IPE-T0021.md:39
 explain/IPE-T0021.md:49
-explain/IPE-T0023.md:54
-explain/IPE-T0023.md:56
+explain/IPE-T0023.md:50

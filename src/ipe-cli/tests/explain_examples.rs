@@ -35,19 +35,12 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use ipe::contained_path::ContainedRelPath;
-use ipe::doc_fence::{self, Block, ExampleRel, Kind, Page};
+use ipe::doc_fence::{self, Block, ExampleRel, ExcerptMiss, Kind, Page};
 use ipe::project_root::SourceTree;
 use ipe_diagnostics::{ALL_CODES, Code, explain_page};
 
 /// The blocks known to fail, one `page:line` per line.
 const KNOWN_ROT: &str = include_str!("explain_examples/known_rot.txt");
-
-/// The `docs/<dir>` corpora a `#[test]` below actually scans.
-///
-/// [`every_served_kind_is_scanned`] proves this set equals
-/// [`ipe::doc_bundle::SERVED_PAGE_DIRS`], so this file cannot drift from what
-/// `ipe doc` serves without going red.
-const SCANNED_DOC_DIRS: &[&str] = &["constructs", "idioms", "topics", "guide"];
 
 /// What the front end made of one block.
 #[derive(Debug)]
@@ -127,57 +120,75 @@ fn front_check(dir: &Path, source: &str) -> Outcome {
     }
 }
 
-/// The mismatch text for `outcome` against `kind`, or `None` when it meets it.
-fn verdict(kind: &Kind, outcome: &Outcome) -> Option<String> {
-    match (kind, outcome) {
-        (Kind::Skip(_), _) | (Kind::Check, Outcome::Accepted) => None,
-        (Kind::Error(want), Outcome::Refused(got)) if want == got => None,
-        (Kind::Check, Outcome::Refused(got)) => Some(format!(
+/// What a compiled block asks of the front end.
+#[derive(Clone, Copy, Debug)]
+enum Expect {
+    /// The program must be accepted.
+    Accepted,
+    /// The program must be refused with this code.
+    Refused(Code),
+}
+
+/// The mismatch text for `outcome` against `expect`, or `None` when it meets it.
+fn verdict(expect: Expect, outcome: &Outcome) -> Option<String> {
+    match (expect, outcome) {
+        (Expect::Accepted, Outcome::Accepted) => None,
+        (Expect::Refused(want), Outcome::Refused(got)) if want == *got => None,
+        (Expect::Accepted, Outcome::Refused(got)) => Some(format!(
             "expected the program to be accepted; refused with {}",
             got.as_str()
         )),
-        (Kind::Error(want), Outcome::Refused(got)) => Some(format!(
+        (Expect::Refused(want), Outcome::Refused(got)) => Some(format!(
             "expected a refusal with {}; refused with {}",
             want.as_str(),
             got.as_str()
         )),
-        (Kind::Error(want), Outcome::Accepted) => Some(format!(
+        (Expect::Refused(want), Outcome::Accepted) => Some(format!(
             "expected a refusal with {}; the program was accepted",
             want.as_str()
         )),
-        (Kind::Check | Kind::Error(_), Outcome::Failed(why)) => {
+        (Expect::Accepted | Expect::Refused(_), Outcome::Failed(why)) => {
             Some(format!("the check could not run: {why}"))
-        }
-        (Kind::Unlabelled | Kind::Indented | Kind::Excerpt(_), _) => {
-            unreachable!("judge_page judges these kinds without calling front_check")
         }
     }
 }
 
-/// The repository root, for resolving an excerpt's declared path.
-fn repo_root() -> PathBuf {
-    let joined = e2e_support::manifest_dir!().join("..").join("..");
+/// The repository's `examples/` directory, the one root an excerpt may quote.
+fn examples_root() -> PathBuf {
+    let joined = e2e_support::manifest_dir!().join("../../examples");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-/// Judge an excerpt block: its declared path must resolve under `root` and
-/// its body must occur verbatim in the named file.
-fn judge_excerpt(root: &Path, rel: &ExampleRel, body: &str) -> Option<String> {
-    let raw = rel.as_path().to_string_lossy().into_owned();
-    match ContainedRelPath::parse(root, &raw) {
-        Ok(contained) => {
-            let path = contained.resolved();
-            if !path.is_file() {
-                return Some(format!("excerpt names a file that does not exist: {raw}"));
-            }
-            match std::fs::read_to_string(path) {
-                Ok(contents) if contents.contains(body) => None,
-                Ok(_) => Some(format!("excerpt body is not found verbatim in {raw}")),
-                Err(e) => Some(format!("could not read excerpt file {raw}: {e}")),
-            }
-        }
-        Err(e) => Some(format!("excerpt path escapes the repository: {e}")),
+/// Judge an excerpt block: its declared path must resolve to a file inside
+/// `examples` (a symlink out of it refused) and its body must occur there as
+/// a run of whole lines.
+fn judge_excerpt(examples: &Path, rel: &ExampleRel, body: &str) -> Option<String> {
+    let shown = rel.as_path().display();
+    let contained = match ContainedRelPath::parse(examples, rel.within_examples()) {
+        Ok(contained) => contained,
+        Err(e) => return Some(format!("excerpt path {shown} escapes examples/: {e}")),
+    };
+    let path = contained.resolved();
+    if !path.is_file() {
+        return Some(format!("excerpt names a file that does not exist: {shown}"));
     }
+    match std::fs::read_to_string(path) {
+        Ok(contents) => match doc_fence::excerpt_occurs(body, &contents) {
+            Ok(()) => None,
+            Err(ExcerptMiss::Empty) => Some(format!(
+                "excerpt of {shown} has an empty body, which any file would hold"
+            )),
+            Err(ExcerptMiss::Absent) => Some(format!(
+                "excerpt body is not a run of whole lines of {shown}"
+            )),
+        },
+        Err(e) => Some(format!("could not read excerpt file {shown}: {e}")),
+    }
+}
+
+/// Judge one compiled block body as a scratch project under `dir`.
+fn judge_compiled(dir: &Path, expect: Expect, body: &str) -> Option<String> {
+    verdict(expect, &front_check(dir, &program_source(body)))
 }
 
 /// Every mismatch on one page: refused fences and blocks missing their verdict.
@@ -221,18 +232,36 @@ fn judge_page(name: &str, text: &str, page: Page, scratch: &Path) -> Vec<Mismatc
                 line,
                 kind: Kind::Excerpt(rel),
                 body,
-            }) => judge_excerpt(&repo_root(), &rel, &body).map(|detail| Mismatch {
+            }) => judge_excerpt(&examples_root(), &rel, &body).map(|detail| Mismatch {
                 key: format!("{name}:{line}"),
                 detail,
             }),
-            Ok(Block { line, kind, body }) => {
-                let dir = scratch.join(format!("{dir_stem}_{line}"));
-                let outcome = front_check(&dir, &program_source(&body));
-                verdict(&kind, &outcome).map(|detail| Mismatch {
-                    key: format!("{name}:{line}"),
-                    detail,
-                })
-            }
+            Ok(Block {
+                line,
+                kind: Kind::Check,
+                body,
+            }) => judge_compiled(
+                &scratch.join(format!("{dir_stem}_{line}")),
+                Expect::Accepted,
+                &body,
+            )
+            .map(|detail| Mismatch {
+                key: format!("{name}:{line}"),
+                detail,
+            }),
+            Ok(Block {
+                line,
+                kind: Kind::Error(code),
+                body,
+            }) => judge_compiled(
+                &scratch.join(format!("{dir_stem}_{line}")),
+                Expect::Refused(code),
+                &body,
+            )
+            .map(|detail| Mismatch {
+                key: format!("{name}:{line}"),
+                detail,
+            }),
         })
         .collect()
 }
@@ -341,40 +370,32 @@ fn explain_pages() {
     );
 }
 
-#[test]
-fn construct_pages() {
-    let mismatches = judge_doc_dir("constructs", &scratch("constructs"));
-    assert_clean(
-        "construct-page",
-        &reconcile("docs/constructs/", &mismatches, &ledger(KNOWN_ROT)),
-    );
+/// One `#[test]` per `docs/<dir>` corpus, and [`SCANNED_DOC_DIRS`] built from
+/// the same rows, so the set [`every_served_kind_is_scanned`] compares is
+/// exactly the set of corpora a test runs.
+macro_rules! doc_corpora {
+    ($($test:ident => $dir:literal),+ $(,)?) => {
+        /// The `docs/<dir>` corpora a `#[test]` here scans, one per row of
+        /// [`doc_corpora`].
+        const SCANNED_DOC_DIRS: &[&str] = &[$($dir),+];
+        $(
+            #[test]
+            fn $test() {
+                let mismatches = judge_doc_dir($dir, &scratch($dir));
+                assert_clean(
+                    concat!("docs/", $dir),
+                    &reconcile(concat!("docs/", $dir, "/"), &mismatches, &ledger(KNOWN_ROT)),
+                );
+            }
+        )+
+    };
 }
 
-#[test]
-fn idiom_pages() {
-    let mismatches = judge_doc_dir("idioms", &scratch("idioms"));
-    assert_clean(
-        "idiom-page",
-        &reconcile("docs/idioms/", &mismatches, &ledger(KNOWN_ROT)),
-    );
-}
-
-#[test]
-fn topic_pages() {
-    let mismatches = judge_doc_dir("topics", &scratch("topics"));
-    assert_clean(
-        "topic-page",
-        &reconcile("docs/topics/", &mismatches, &ledger(KNOWN_ROT)),
-    );
-}
-
-#[test]
-fn guide_pages() {
-    let mismatches = judge_doc_dir("guide", &scratch("guide"));
-    assert_clean(
-        "guide-page",
-        &reconcile("docs/guide/", &mismatches, &ledger(KNOWN_ROT)),
-    );
+doc_corpora! {
+    construct_pages => "constructs",
+    idiom_pages => "idioms",
+    topic_pages => "topics",
+    guide_pages => "guide",
 }
 
 #[test]
@@ -547,6 +568,76 @@ fn an_excerpt_absent_from_its_example_is_a_mismatch() {
         Page::Doc,
     );
     assert_eq!(found.len(), 1, "{found:?}");
+}
+
+#[test]
+fn an_empty_excerpt_is_a_mismatch() {
+    let text = "```ipe ipe:excerpt examples/wasm/counter/src/Main.ipe\n\n```\n";
+    let found = judge_synthetic("an_empty_excerpt_is_a_mismatch", text, Page::Doc);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found.iter().all(|m| m.detail.contains("empty body")),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn an_excerpt_of_a_line_fragment_is_a_mismatch() {
+    let text = "```ipe ipe:excerpt examples/wasm/counter/src/Main.ipe\nmodule Ma\n```\n";
+    let found = judge_synthetic(
+        "an_excerpt_of_a_line_fragment_is_a_mismatch",
+        text,
+        Page::Doc,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+#[test]
+fn an_excerpt_naming_a_path_outside_examples_is_refused() {
+    for raw in [
+        "examples/../src/ipe-cli/src/lib.rs",
+        "src/ipe-cli/src/lib.rs",
+        "/etc/passwd",
+        "examples\\..\\Cargo.toml",
+        "examplesX/x.ipe",
+    ] {
+        let text = format!("```ipe ipe:excerpt {raw}\nmodule Main exposing (main)\n```\n");
+        let found = judge_synthetic(
+            "an_excerpt_naming_a_path_outside_examples_is_refused",
+            &text,
+            Page::Doc,
+        );
+        assert_eq!(found.len(), 1, "{raw}: {found:?}");
+        assert!(
+            found
+                .iter()
+                .all(|m| m.detail.starts_with("fence refused: ExcerptPath(")),
+            "{raw}: {found:?}"
+        );
+    }
+}
+
+/// The containment proof runs against `examples/` itself, so a file the
+/// repository root contains but `examples/` does not is refused even when a
+/// symlink inside `examples/` names it.
+#[test]
+#[cfg(unix)]
+fn an_excerpt_through_a_symlink_out_of_examples_is_refused() {
+    let base = scratch("an_excerpt_through_a_symlink_out_of_examples_is_refused");
+    let examples = base.join("examples");
+    std::fs::create_dir_all(&examples).expect("make examples");
+    std::fs::write(base.join("secret.ipe"), "module Main exposing (main)\n").expect("write");
+    std::os::unix::fs::symlink(base.join("secret.ipe"), examples.join("leak.ipe"))
+        .expect("symlink");
+    let rel = ExampleRel::parse("examples/leak.ipe").expect("a well-formed path");
+    let detail = judge_excerpt(&examples, &rel, "module Main exposing (main)");
+    assert!(
+        detail
+            .as_deref()
+            .is_some_and(|d| d.contains("escapes examples/")),
+        "{detail:?}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[test]
