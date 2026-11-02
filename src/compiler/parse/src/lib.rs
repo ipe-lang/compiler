@@ -111,7 +111,10 @@ pub fn try_source_tokens(src: &str) -> Option<Vec<SourceToken>> {
     )
 }
 
-pub use lexer::{KEYWORDS, is_ident_continue, is_ident_start};
+pub use lexer::{
+    KEYWORDS, LexicalRegion, LexicalRegions, PositionContext, is_ident_continue, is_ident_start,
+    lexical_regions, position_context,
+};
 pub use surface::{field_accessor, let_function, negation};
 
 /// Return `true` when `s` is a reserved keyword.
