@@ -149,7 +149,7 @@ pub fn prepare_rename(
 fn is_user_module(db: &IpeDatabase, root: SourceRoot, module: &[String]) -> bool {
     root.files(db)
         .get(module)
-        .is_some_and(|file| file.origin(db) == ModuleOrigin::User)
+        .is_some_and(|file| *file.origin(db) == ModuleOrigin::User)
 }
 
 /// Supplies URI and text for a module path, forwarded from the server layer
@@ -231,7 +231,7 @@ pub fn rename(
             sites.extend(signature_sites(db, root, &def.module, old_name)?);
             let user_modules = files
                 .iter()
-                .filter(|(_, file)| file.origin(db) == ModuleOrigin::User)
+                .filter(|(_, file)| *file.origin(db) == ModuleOrigin::User)
                 .map(|(path, _)| path.clone())
                 .collect();
             (sites, user_modules)

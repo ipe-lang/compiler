@@ -47,7 +47,7 @@ const DO_MAIN: &str = "module Main exposing (main)\n\n\
                        second <- Task.succeed (Lib.total first)\n        \
                        Lib.total second\n";
 
-fn do_fixture() -> [Fixture<'static>; 3] {
+const fn do_fixture() -> [Fixture<'static>; 3] {
     [
         (&["Ipe", "Task"], TASK_STUB, ModuleOrigin::EmbeddedStdlib),
         (&["Lib"], LIB, ModuleOrigin::User),
