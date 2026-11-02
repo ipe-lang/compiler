@@ -3601,27 +3601,54 @@ fn clamp_u16(n: i64) -> u16 {
 
 /// Process-exit cleanup hook. `std::process::exit` (what `System.exit` lowers to)
 /// bypasses Drop, so an RAII guard's destructor never runs on that path. A backend
-/// driver that puts the terminal/process into a state needing restoration (the
-/// Ipe.Tui driver: raw mode + alternate screen + hidden cursor + mouse reporting)
-/// registers its idempotent teardown here; `exit_process` runs it BEFORE
-/// `process::exit`. The hook runs teardown before process termination, so RAII-
-/// bypassed cleanup (terminal restore, cursor reset) completes before the OS reclaims
-/// the process. A plain `fn()` keeps the boundary clean — `system` (always compiled) never
-/// references the feature-gated `tui`/crossterm; the TUI provides the function.
-static EXIT_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+/// driver whose output or terminal needs a closing act (the Ipe.Tui driver's
+/// raw mode, alternate screen, hidden cursor and mouse reporting; the
+/// `Cli.tea` driver's open prompt line) registers its idempotent teardown
+/// here; `exit_process` runs it BEFORE `process::exit`. A plain `fn()` keeps the
+/// boundary clean: `system` (always compiled) never references the
+/// feature-gated `tui`/crossterm; the driver provides the function.
+static EXIT_HOOK: ExitHookSlot = ExitHookSlot::new();
 
-/// Register the process-exit cleanup (idempotent target; set once per process —
-/// there is a single backend driver). Subsequent registrations are ignored.
-pub fn register_exit_hook(f: fn()) {
-    let _ = EXIT_HOOK.set(f);
+/// A second driver asked for the exit hook one driver already holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExitHookTaken;
+
+/// One exit-hook slot: the first registrant holds it, any later one is refused.
+struct ExitHookSlot(std::sync::OnceLock<fn()>);
+
+impl ExitHookSlot {
+    const fn new() -> Self {
+        Self(std::sync::OnceLock::new())
+    }
+
+    fn register(&self, f: fn()) -> Result<(), ExitHookTaken> {
+        self.0.set(f).map_err(|_| ExitHookTaken)
+    }
+
+    fn run(&self) {
+        if let Some(f) = self.0.get() {
+            f();
+        }
+    }
+}
+
+/// Register the process-exit cleanup.
+///
+/// One driver runs per process, so the slot is set once; a second
+/// registration is refused with [`ExitHookTaken`] and the first hook stays, so
+/// the caller must choose an outcome that needs no exit hook.
+///
+/// # Errors
+///
+/// [`ExitHookTaken`] when a hook is already registered.
+pub fn register_exit_hook(f: fn()) -> Result<(), ExitHookTaken> {
+    EXIT_HOOK.register(f)
 }
 
 /// Run the registered exit hook, if any. Called by `exit_process`; also safe to
 /// call from a backend driver's own normal-exit path (the hook is idempotent).
 pub fn run_exit_hook() {
-    if let Some(f) = EXIT_HOOK.get() {
-        f();
-    }
+    EXIT_HOOK.run();
 }
 
 /// The teardown `process::exit` would otherwise skip, in order: the registered
@@ -4910,7 +4937,7 @@ mod getenv_kind_tests {
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod exit_hook_tests {
-    use super::{register_exit_hook, run_exit_hook};
+    use super::{ExitHookSlot, ExitHookTaken, register_exit_hook};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -4985,23 +5012,44 @@ mod exit_hook_tests {
     #[ignore = "run as a child process by a_panicking_pre_exit_stage_still_ends_the_process"]
     #[test]
     fn panicking_stage_child() {
-        register_exit_hook(panicking_exit_hook);
+        assert_eq!(register_exit_hook(panicking_exit_hook), Ok(()));
         super::exit_process(super::ProcessStatus::requested(PANICKING_STAGE_EXIT_CODE));
     }
 
     #[test]
     fn exit_hook_runs_and_is_safe_without_registration() {
-        // No hook registered yet → run_exit_hook must be a safe no-op (the common
-        // CLI / server / non-TUI case — System.exit must not require a hook).
-        run_exit_hook();
-        // Register one and confirm it runs (the Ipe.Tui driver registers its
-        // terminal-restore here so a System.exit quit doesn't bypass cleanup).
-        register_exit_hook(bump);
-        run_exit_hook();
-        assert!(
-            CALLS.load(Ordering::SeqCst) >= 1,
-            "registered exit hook must run"
-        );
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        fn count() {
+            RUNS.fetch_add(1, Ordering::SeqCst);
+        }
+        // No hook registered yet: running the slot is a safe no-op (the common
+        // CLI / server case; System.exit must not require a hook).
+        let slot = ExitHookSlot::new();
+        slot.run();
+        assert_eq!(RUNS.load(Ordering::SeqCst), 0);
+        // A registered hook runs on every call (each driver's hook is idempotent).
+        assert_eq!(slot.register(count), Ok(()));
+        slot.run();
+        assert_eq!(RUNS.load(Ordering::SeqCst), 1);
+    }
+
+    // The slot never silently drops a registrant: a second driver is told the
+    // hook is taken, and the first hook is still the one that runs.
+    #[test]
+    fn second_exit_hook_registration_is_refused() {
+        static SECOND: AtomicUsize = AtomicUsize::new(0);
+        fn second() {
+            SECOND.fetch_add(1, Ordering::SeqCst);
+        }
+        let slot = ExitHookSlot::new();
+        assert_eq!(slot.register(bump), Ok(()));
+        assert_eq!(slot.register(second), Err(ExitHookTaken));
+        // One step past: re-registering the holder itself is refused too.
+        assert_eq!(slot.register(bump), Err(ExitHookTaken));
+        let before = CALLS.load(Ordering::SeqCst);
+        slot.run();
+        assert_eq!(CALLS.load(Ordering::SeqCst), before.saturating_add(1));
+        assert_eq!(SECOND.load(Ordering::SeqCst), 0);
     }
 }
 

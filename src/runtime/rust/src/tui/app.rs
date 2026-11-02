@@ -91,6 +91,9 @@ enum TuiEnterError {
     /// A residual `enable_raw_mode` failure the probe did not predict; kept
     /// with its raw OS context.
     RawMode(std::io::Error),
+    /// Another terminal driver holds the process exit hook, so a
+    /// `System.exit` could not restore the terminal.
+    ExitHookTaken,
 }
 
 impl TuiEnterError {
@@ -98,6 +101,9 @@ impl TuiEnterError {
         match self {
             Self::NoTerminal(reason) => E::from_unavailable(reason.text().to_owned()),
             Self::RawMode(e) => format!("Tui: enable raw mode: {e}").into(),
+            Self::ExitHookTaken => "Tui: another terminal driver already runs in this process"
+                .to_owned()
+                .into(),
         }
     }
 }
@@ -136,14 +142,19 @@ impl TuiGuard {
         {
             return Err(TuiEnterError::NoTerminal(reason));
         }
+        // Register the teardown before raw mode is entered, so a `System.exit`
+        // quit restores the terminal even though process::exit skips Drop
+        // (idempotent with the Drop path below). A slot another driver holds
+        // refuses the session: raw mode with no exit restore would strand the
+        // terminal.
+        if crate::system::register_exit_hook(tui_teardown).is_err() {
+            return Err(TuiEnterError::ExitHookTaken);
+        }
         if let Err(e) = crossterm::terminal::enable_raw_mode() {
             return Err(classify_raw_mode_error(e));
         }
         TUI_MOUSE.store(mouse, Ordering::SeqCst);
         TUI_RESTORE_ACTIVE.store(true, Ordering::SeqCst);
-        // Register the teardown so a `System.exit` quit restores the terminal even
-        // though process::exit skips Drop. Idempotent with the Drop path below.
-        crate::system::register_exit_hook(tui_teardown);
         let mut out = std::io::stdout();
         let _ = out.write_all(ALT_SCREEN_ON.as_bytes());
         let _ = out.write_all(HIDE_CURSOR.as_bytes());
@@ -584,7 +595,7 @@ where
                     crate::system::exit_process(crate::system::ProcessStatus::INTERRUPTED)
                 }
                 CliEvent::Msg(m) | CliEvent::PerformDone(m) => vec![m],
-                CliEvent::Line(..) => continue,
+                CliEvent::Line(..) | CliEvent::LineClosed(..) => continue,
                 CliEvent::Eof => break,
             };
             if msgs.is_empty() {
@@ -1254,7 +1265,7 @@ where
             match ev {
                 CliEvent::Msg(m) | CliEvent::PerformDone(m) => produced = Some(m),
                 CliEvent::Eof => break,
-                CliEvent::Line(..) => continue,
+                CliEvent::Line(..) | CliEvent::LineClosed(..) => continue,
                 CliEvent::Interrupt => {
                     submgr.stop_all();
                     crate::system::exit_process(crate::system::ProcessStatus::INTERRUPTED)
@@ -2242,9 +2253,10 @@ mod key_reader_tests {
                 CliEvent::Key(kind, value, _permit) => (kind, value),
                 CliEvent::Interrupt => ("interrupt".to_owned(), String::new()),
                 CliEvent::Eof => ("eof".to_owned(), String::new()),
-                CliEvent::Line(..) | CliEvent::Msg(()) | CliEvent::PerformDone(()) => {
-                    ("other".to_owned(), String::new())
-                }
+                CliEvent::Line(..)
+                | CliEvent::LineClosed(..)
+                | CliEvent::Msg(())
+                | CliEvent::PerformDone(()) => ("other".to_owned(), String::new()),
             });
         }
         events
