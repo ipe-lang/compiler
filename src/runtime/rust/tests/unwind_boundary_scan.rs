@@ -17,9 +17,15 @@
 //! A `#[cfg(...)]` proven test-only removes exactly the node it is attached to;
 //! a `use` names nothing; comments and string literals are never code. A macro
 //! body is scanned token by token, so a shape written inside one still counts.
-//! A path call `JoinHandle::join(h)` counts as a thread join. A `use` that
-//! renames a catch name or a join-handle type is refused outright: the scan
-//! matches names, so the alias would hide every call made through it.
+//! A path-form `join` qualified by a type (`JoinHandle::join(h)`, a type
+//! alias's `Handle::join`, `<JoinHandle<()>>::join`) counts as a thread join,
+//! whatever the type's name: an alias cannot hide it. A path call
+//! `thread::scope` counts as a catch, since the scope joins its threads
+//! implicitly and replaces a panicking one's payload with its own message. A
+//! `use` that renames a catch name, a join-handle type or the `thread` module,
+//! or that imports `scope` from `thread` (by name, rename or glob), is refused
+//! outright: the scan matches names, so the import would hide every call made
+//! through it.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,8 +34,8 @@ use proc_macro2::{Delimiter, TokenStream, TokenTree};
 use syn::ext::IdentExt;
 use syn::visit::{self, Visit};
 use syn::{
-    Arm, Attribute, Expr, ExprMethodCall, Field, FieldValue, ImplItem, ImplItemFn, Item, ItemFn,
-    ItemUse, Macro, Path, Stmt, TraitItem, TraitItemFn, UseTree, Variant,
+    Arm, Attribute, Expr, ExprMethodCall, ExprPath, Field, FieldValue, ImplItem, ImplItemFn, Item,
+    ItemFn, ItemUse, Macro, Path, Stmt, TraitItem, TraitItemFn, UseTree, Variant,
 };
 
 #[path = "support/cfg_scan.rs"]
@@ -46,6 +52,7 @@ const OUTSIDE_FN: &str = "<outside any fn>";
 /// The path segments and method names that catch an unwind.
 const CATCH_NAMES: &[&str] = &[
     "catch_unwind",
+    "CatchPanic",
     "CatchPanicLayer",
     "try_into_panic",
     "into_panic",
@@ -54,8 +61,19 @@ const CATCH_NAMES: &[&str] = &[
 /// The shape a no-argument `.join()` call is recorded under.
 const THREAD_JOIN: &str = "join()";
 
-/// The thread-handle types whose `join` is a [`THREAD_JOIN`] when called by path.
+/// The thread-handle types a `use` must not rename.
 const JOIN_HANDLES: &[&str] = &["JoinHandle", "ScopedJoinHandle"];
+
+/// The shape a `thread::scope` call is recorded under: the scope joins every
+/// thread it spawned and, when one panicked, unwinds with its own message in
+/// place of that thread's payload, so a trip there would lose its type.
+const THREAD_SCOPE: &str = "thread::scope";
+
+/// Whether a path segment names a type (or `Self`): its `join` is a thread
+/// join whatever the type is called, so a type alias cannot hide one.
+fn names_a_type(segment: &str) -> bool {
+    segment.chars().next().is_some_and(char::is_uppercase)
+}
 
 /// How a ledgered catch site treats a runtime trip.
 #[derive(Debug, Clone, Copy)]
@@ -74,7 +92,8 @@ struct CatchSite {
     file: &'static str,
     /// The enclosing function, or [`OUTSIDE_FN`].
     function: &'static str,
-    /// The catch shape: one of [`CATCH_NAMES`] or [`THREAD_JOIN`].
+    /// The catch shape: one of [`CATCH_NAMES`], [`THREAD_JOIN`] or
+    /// [`THREAD_SCOPE`].
     shape: &'static str,
     /// How many times `shape` occurs in `function`.
     count: usize,
@@ -314,21 +333,47 @@ impl<'ast> Visit<'ast> for Scan {
         if cfg_test_only(&item.attrs) {
             return;
         }
-        let mut pending = vec![&item.tree];
-        while let Some(tree) = pending.pop() {
+        let mut pending: Vec<(&UseTree, Option<String>)> = vec![(&item.tree, None)];
+        while let Some((tree, parent)) = pending.pop() {
+            let from_thread = parent.as_deref() == Some("thread");
             match tree {
-                UseTree::Path(path) => pending.push(&path.tree),
-                UseTree::Group(group) => pending.extend(group.items.iter()),
+                UseTree::Path(path) => {
+                    pending.push((&path.tree, Some(path.ident.unraw().to_string())));
+                }
+                UseTree::Group(group) => {
+                    pending.extend(group.items.iter().map(|t| (t, parent.clone())));
+                }
                 UseTree::Rename(rename) => {
-                    let original = rename.ident.unraw().to_string();
+                    let named = rename.ident.unraw().to_string();
+                    // `use std::thread::{self as t}` renames the module itself.
+                    let original = if named == "self" {
+                        parent.clone().unwrap_or(named)
+                    } else {
+                        named
+                    };
                     let hidden = Self::catch_shape(&original).is_some()
-                        || JOIN_HANDLES.contains(&original.as_str());
+                        || JOIN_HANDLES.contains(&original.as_str())
+                        || original == "thread"
+                        || (from_thread && original == "scope");
                     if hidden {
                         let alias = rename.rename.unraw().to_string();
                         self.found.renames.push((original, alias));
                     }
                 }
-                UseTree::Name(_) | UseTree::Glob(_) => {}
+                UseTree::Name(name) => {
+                    if from_thread && name.ident.unraw() == "scope" {
+                        self.found
+                            .renames
+                            .push(("thread::scope".to_owned(), "scope".to_owned()));
+                    }
+                }
+                UseTree::Glob(_) => {
+                    if from_thread {
+                        self.found
+                            .renames
+                            .push(("thread::*".to_owned(), "*".to_owned()));
+                    }
+                }
             }
         }
     }
@@ -412,12 +457,12 @@ impl<'ast> Visit<'ast> for Scan {
             if let Some(shape) = Self::catch_shape(&name) {
                 self.record(shape);
             }
-            let handle_join = name == "join"
-                && previous
-                    .as_deref()
-                    .is_some_and(|handle| JOIN_HANDLES.contains(&handle));
+            let handle_join = name == "join" && previous.as_deref().is_some_and(names_a_type);
             if handle_join {
                 self.record(THREAD_JOIN);
+            }
+            if name == "scope" && previous.as_deref() == Some("thread") {
+                self.record(THREAD_SCOPE);
             }
             previous = Some(name);
         }
@@ -425,6 +470,22 @@ impl<'ast> Visit<'ast> for Scan {
             self.call(last.ident.unraw().to_string());
         }
         visit::visit_path(self, path);
+    }
+
+    fn visit_expr_path(&mut self, expr: &'ast ExprPath) {
+        // `<JoinHandle<()>>::join`: the qualifying type sits in the `qself`,
+        // so the path itself is the bare `join`.
+        let qualified_join = expr.qself.is_some()
+            && expr.path.segments.len() == 1
+            && expr
+                .path
+                .segments
+                .first()
+                .is_some_and(|segment| segment.ident.unraw() == "join");
+        if qualified_join {
+            self.record(THREAD_JOIN);
+        }
+        visit::visit_expr_path(self, expr);
     }
 
     fn visit_macro(&mut self, mac: &'ast Macro) {
@@ -602,6 +663,38 @@ fn via_map(hs: Vec<JoinHandle<()>>) { let _ = hs.into_iter().map(JoinHandle::joi
         );
     }
     assert_eq!(found.len(), 4, "{found:#?}");
+}
+
+#[test]
+fn an_aliased_or_qualified_join_a_scope_and_a_catch_service_are_refused() {
+    let src = r"
+use std::thread::scope as region;
+use std::thread::{self as t};
+use std::thread::scope;
+use std::thread::*;
+type Handle = std::thread::JoinHandle<()>;
+fn via_type_alias(h: Handle) { let _ = Handle::join(h); }
+fn via_qself(h: std::thread::JoinHandle<()>) { let _ = <std::thread::JoinHandle<()>>::join(h); }
+fn via_scope() { std::thread::scope(|s| { s.spawn(|| ()); }); }
+fn via_service<S>(inner: S) { let _ = tower_http::catch_panic::CatchPanic::new(inner); }
+";
+    let found = violations(&sources(&[("rogue.rs", src)]), &[]);
+    for needle in [
+        "`use .. scope as region`",
+        "`use .. thread as t`",
+        "`use .. thread::scope as scope`",
+        "`use .. thread::* as *`",
+        "`via_type_alias` catches an unwind through `join()`",
+        "`via_qself` catches an unwind through `join()`",
+        "`via_scope` catches an unwind through `thread::scope`",
+        "`via_service` catches an unwind through `CatchPanic`",
+    ] {
+        assert!(
+            found.iter().any(|v| v.contains(needle)),
+            "{needle} must be refused: {found:#?}"
+        );
+    }
+    assert_eq!(found.len(), 8, "{found:#?}");
 }
 
 #[test]
