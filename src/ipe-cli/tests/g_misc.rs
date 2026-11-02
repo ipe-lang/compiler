@@ -4,6 +4,8 @@
 
 mod support;
 
+#[path = "g_misc/deep_recursion_typed.rs"]
+mod deep_recursion_typed;
 #[path = "g_misc/golden_alias.rs"]
 mod golden_alias;
 #[path = "g_misc/golden_alias_move_seal.rs"]

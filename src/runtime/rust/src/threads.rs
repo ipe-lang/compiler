@@ -193,6 +193,10 @@ mod blocking {
 
     /// Runs `f` on tokio's blocking pool and returns its value.
     ///
+    /// A [`crate::core::RuntimeTrip`] raised in `f` is resumed on the awaiting
+    /// task, so it reaches that task's boundary as its typed error rather than
+    /// ending here as an untyped [`BlockingFailure::Panicked`].
+    ///
     /// # Errors
     ///
     /// No thread could be started for `f`, or `f` panicked.
@@ -204,7 +208,12 @@ mod blocking {
         offload_blocking(role, f)
             .map_err(BlockingFailure::Refused)?
             .await
-            .map_err(|_| BlockingFailure::Panicked)
+            .map_err(|failed| {
+                if let Ok(payload) = failed.try_into_panic() {
+                    drop(crate::core::resume_runtime_trip(payload));
+                }
+                BlockingFailure::Panicked
+            })
     }
 }
 
@@ -336,6 +345,47 @@ mod tests {
             offload_blocking("ipe-test-no-runtime", || ()),
             Err(refused) if refused.cause() == RefusalCause::NoRuntime
         ));
+    }
+
+    // A trip raised in blocking work is the runtime's typed fault, not a
+    // defect of the offloaded work: it resumes on the awaiting task, so that
+    // task's boundary types it instead of `join_blocking` absorbing it.
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn a_trip_in_blocking_work_resumes_on_the_awaiting_task() {
+        use crate::core::{RuntimeTrip, runtime_trip, trip};
+        let awaiting = tokio::spawn(async {
+            join_blocking("ipe-test-trip", || -> i64 {
+                trip(RuntimeTrip::RecursionLimit)
+            })
+            .await
+        });
+        let joined = awaiting.await;
+        assert!(
+            joined.is_err(),
+            "the trip must leave `join_blocking`: {joined:?}"
+        );
+        let Err(failed) = joined else { return };
+        let payload = failed.try_into_panic();
+        assert!(
+            payload.is_ok(),
+            "the awaiting task must unwind, not be cancelled"
+        );
+        let Ok(payload) = payload else { return };
+        assert_eq!(
+            runtime_trip(payload.as_ref()),
+            Some(RuntimeTrip::RecursionLimit)
+        );
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn a_non_trip_panic_in_blocking_work_is_panicked() {
+        let joined = join_blocking("ipe-test-panic", || -> i64 {
+            std::panic::resume_unwind(Box::new("blocking work failed"))
+        })
+        .await;
+        assert!(matches!(joined, Err(BlockingFailure::Panicked)));
     }
 
     #[cfg(feature = "tokio")]
