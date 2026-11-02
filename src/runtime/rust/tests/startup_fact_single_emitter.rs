@@ -232,7 +232,7 @@ fn violations(sources: &[(String, String)]) -> Vec<String> {
 
 #[test]
 fn startup_fact_single_emitter() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let root = e2e_support::manifest_dir!().join("src");
     let sources = rust_sources(&root);
     for owner in FACT_OWNERS.iter().map(|(_, owner)| *owner) {
         assert!(
