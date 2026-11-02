@@ -354,6 +354,28 @@ mod tests {
         }
     }
 
+    /// No bidi control or line separator a program spells reaches a line, under every style.
+    ///
+    /// CI job `runtime-full-features-run`.
+    #[test]
+    fn bidi_override_never_reaches_a_line() -> Result<(), String> {
+        use super::super::cell::BIDI_AND_SEPARATOR_HAZARDS;
+        for c in BIDI_AND_SEPARATOR_HAZARDS.iter().flat_map(Clone::clone) {
+            let view = cli_text_::<()>(format!("a{c}b"));
+            for surface in all_surfaces() {
+                let out = write_frame(&view, &surface, &mut LineState::new());
+                let text = String::from_utf8(out).map_err(|e| e.to_string())?;
+                if text.contains(c) || !text.contains("a b") {
+                    return Err(format!(
+                        "U+{:04X} under {surface:?}: {text:?}",
+                        u32::from(c)
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     // No surface writes a carriage return, whatever the style or the end.
     #[test]
     fn no_surface_writes_cr() {

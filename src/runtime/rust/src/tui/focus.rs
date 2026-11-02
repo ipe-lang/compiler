@@ -14,6 +14,7 @@
 //! arithmetic; nothing indexes or unwraps.
 
 use super::super::html::{Attribute as HtmlAttribute, Event};
+use super::cell::sanitize_rune;
 use std::collections::HashMap;
 
 /// Per-input editor state, keyed by focus (tab-order) index in the registry.
@@ -192,7 +193,12 @@ pub fn edit_input(st: &mut InputState, kind: &str, value: &str) -> bool {
     st.cursor = st.cursor.min(n);
     match kind {
         "char" => {
-            let ins: Vec<char> = value.chars().collect();
+            // The buffer is drawn as typed, so a pasted display hazard is
+            // blanked here; a textarea's Enter arrives as `\n`, its line break.
+            let ins: Vec<char> = value
+                .chars()
+                .map(|c| if c == '\n' { c } else { sanitize_rune(c) })
+                .collect();
             let mut next: Vec<char> = Vec::with_capacity(n + ins.len());
             next.extend_from_slice(runes.get(..st.cursor).unwrap_or(&[]));
             next.extend_from_slice(&ins);
@@ -366,6 +372,26 @@ mod tests {
         assert!(edit_input(&mut s, "char", "b"));
         assert_eq!(s.buffer, "abc");
         assert_eq!(s.cursor, 2);
+    }
+
+    /// A typed or pasted bidi control or separator is blanked before the buffer
+    /// draws it; a textarea's `\n` stays its line break.
+    ///
+    /// CI job `runtime-full-features-run`.
+    #[test]
+    fn typed_display_hazard_never_reaches_the_buffer() -> Result<(), String> {
+        use super::super::cell::BIDI_AND_SEPARATOR_HAZARDS;
+        for c in BIDI_AND_SEPARATOR_HAZARDS.iter().flat_map(Clone::clone) {
+            let mut s = st("ab", 1);
+            if !edit_input(&mut s, "char", &c.to_string()) || s.buffer != "a b" {
+                return Err(format!("U+{:04X} reached the buffer", u32::from(c)));
+            }
+        }
+        let mut s = st("ab", 1);
+        if !edit_input(&mut s, "char", "\n") || s.buffer != "a\nb" {
+            return Err("a textarea line break was blanked".to_owned());
+        }
+        Ok(())
     }
 
     #[test]

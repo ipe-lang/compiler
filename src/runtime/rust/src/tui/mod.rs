@@ -472,8 +472,9 @@ impl LineAttrs {
 /// One line of a `Lines` view: its style and its display-sanitised text.
 ///
 /// The text is sanitised once, at construction, through [`sanitize_rune`], so
-/// a line holding a control character (ESC, CR, LF, …) has no representation
-/// and the serializer writes the stored text with no second check.
+/// a line holding a control character (ESC, CR, LF, …), a bidi control or a
+/// line separator has no representation and the serializer writes the stored
+/// text with no second check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Line {
     attrs: LineAttrs,
@@ -481,7 +482,7 @@ pub struct Line {
 }
 
 impl Line {
-    /// A line whose text is `raw` with every control character made a space.
+    /// A line whose text is `raw` with every display hazard made a space.
     fn new(attrs: LineAttrs, raw: &str) -> Self {
         Self {
             attrs,
