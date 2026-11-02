@@ -1311,6 +1311,8 @@ messages! {
     ships_shape_mismatch(delivery, shape) = "ships-shape-mismatch";
     /// A command given no delivery words found several declared deliveries.
     ships_several(command, choices) = "ships-several";
+    /// Two declared deliveries would release into the same place.
+    ships_release_slot_shared(first, second) = "ships-release-slot-shared";
     /// A retired ship builder is written in `ships`.
     ship_retired_builder(got, now) = "ship-retired-builder";
     /// `ipe add` found the package already declared as an escape dependency.

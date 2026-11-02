@@ -641,7 +641,11 @@ pub fn resolve_delivery(
         |e: &delivery::DeliveryError| CliError::Usage(text::msg::command_refusal(&command, e));
     match args {
         cli_args::DeliveryArgs::Unstated => {
-            let delivery = declared.sole_dev_delivery(command)?;
+            let delivery = declared.sole_dev_delivery(
+                command,
+                |delivery| admit(delivery).is_ok(),
+                Verb::DEV_BUILD.name(),
+            )?;
             if wants_static && !delivery.allows_static() {
                 return Err(usage(&delivery::DeliveryError::StaticNotAllowed {
                     delivery,
@@ -2308,7 +2312,7 @@ pub fn release_pipeline(
         // No delivery words: `release build` builds every declared delivery,
         // each for the triple its ship names unless argv names one.
         (cli_args::DeliveryArgs::Unstated, ReleasePurpose::Build) => {
-            match declared.into_set().release_each(|plan| {
+            match declared.for_release(args.target)?.release_each(|plan| {
                 release_one(
                     plan.delivery(),
                     args.target.or_else(|| plan.release_triple()),
@@ -2330,7 +2334,7 @@ pub fn release_pipeline(
         }
         // `release run` runs one artifact: the one the package declares.
         (cli_args::DeliveryArgs::Unstated, ReleasePurpose::Run) => {
-            let plan = declared.sole_release_member(verb.name())?;
+            let plan = declared.sole_release_member(verb.name(), Verb::RELEASE_BUILD.name())?;
             release_one(
                 plan.delivery(),
                 args.target.or_else(|| plan.release_triple()),
@@ -5956,7 +5960,7 @@ mod declared_delivery_tests {
             ShipEntry::Binary(BinaryTarget::Host),
             ShipEntry::Binary(BinaryTarget::Cross(StaticTriple::Aarch64LinuxMusl)),
         ]);
-        let got = several.sole_release_member(Verb::RELEASE_RUN.name());
+        let got = several.sole_release_member(Verb::RELEASE_RUN.name(), Verb::RELEASE_BUILD.name());
         let Err(CliError::ProjectRefused(message)) = &got else {
             assert!(matches!(got, Err(CliError::ProjectRefused(_))), "{got:?}");
             return;
@@ -5973,6 +5977,138 @@ mod declared_delivery_tests {
         );
     }
 
+    /// The choice lines a several-deliveries refusal lists.
+    fn choices<T: std::fmt::Debug>(got: &Result<T, CliError>) -> Vec<String> {
+        let Err(CliError::ProjectRefused(message)) = got else {
+            return Vec::new();
+        };
+        message
+            .to_string()
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("ipe "))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Every command a several-deliveries refusal lists is one its own verb
+    /// admits: a member the refused command cannot run is listed with the build
+    /// verb that produces it, never with a command that is refused in turn.
+    #[test]
+    fn several_declared_lists_only_commands_that_clear() {
+        for (verb, admit, ships, expected) in [
+            (
+                Verb::DEV_WATCH,
+                admit_watch as super::Admit,
+                [ShipEntry::Binary(BinaryTarget::Host), ShipEntry::Client],
+                ["ipe dev watch web", "ipe dev build web client"],
+            ),
+            (
+                Verb::DEV_RUN,
+                admit_dev_run,
+                [
+                    ShipEntry::Binary(BinaryTarget::Host),
+                    ShipEntry::ClientDesktop,
+                ],
+                ["ipe dev run web", "ipe dev build web client desktop"],
+            ),
+            (
+                Verb::DEV_BUILD,
+                ADMIT_ANY,
+                [ShipEntry::Client, ShipEntry::ClientIos],
+                ["ipe dev build web client", "ipe dev build web client ios"],
+            ),
+        ] {
+            let got = resolve_delivery(
+                &declared(&ships),
+                &DeliveryArgs::Unstated,
+                false,
+                verb.name(),
+                admit,
+            );
+            assert_eq!(choices(&got), expected, "{ships:?}: {got:?}");
+            let own = format!("ipe {} ", verb.name());
+            for line in choices(&got) {
+                let words: Vec<&str> = line.split_whitespace().skip(3).collect();
+                let admit = if line.starts_with(&own) {
+                    admit
+                } else {
+                    ADMIT_ANY
+                };
+                let advised = resolve_delivery(
+                    &declared(&ships),
+                    &stated(&words),
+                    false,
+                    verb.name(),
+                    admit,
+                );
+                assert!(advised.is_ok(), "`{line}` clears: {advised:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn several_declared_release_run_lists_build_for_no_run_form() {
+        let got = declared(&[ShipEntry::Binary(BinaryTarget::Host), ShipEntry::Client])
+            .sole_release_member(Verb::RELEASE_RUN.name(), Verb::RELEASE_BUILD.name());
+        assert_eq!(
+            choices(&got),
+            ["ipe release run web", "ipe release build web client"],
+            "{got:?}"
+        );
+    }
+
+    /// Two declared members that release different artifacts into one place
+    /// are refused before anything is built, so no artifact is overwritten
+    /// while both are reported released; members releasing the same artifact
+    /// are built once.
+    #[test]
+    fn release_build_refuses_two_artifacts_in_one_place() {
+        let cross = ShipEntry::Binary(BinaryTarget::Cross(StaticTriple::Aarch64LinuxMusl));
+        for ships in [
+            vec![ShipEntry::Binary(BinaryTarget::Host), cross],
+            vec![ShipEntry::Desktop, ShipEntry::ClientDesktop],
+        ] {
+            let got = declared(&ships).for_release(None);
+            assert!(
+                matches!(got, Err(CliError::ProjectRefused(_))),
+                "{ships:?}: {got:?}"
+            );
+        }
+        for (ships, target, members) in [
+            (
+                vec![
+                    ShipEntry::Binary(BinaryTarget::Host),
+                    ShipEntry::Binary(BinaryTarget::Static),
+                ],
+                None,
+                1,
+            ),
+            (
+                vec![ShipEntry::Binary(BinaryTarget::Host), cross],
+                Some(StaticTriple::Aarch64LinuxMusl),
+                1,
+            ),
+            (
+                vec![
+                    ShipEntry::Binary(BinaryTarget::Host),
+                    ShipEntry::Client,
+                    ShipEntry::ClientIos,
+                    ShipEntry::ClientDesktop,
+                ],
+                None,
+                4,
+            ),
+        ] {
+            let got = declared(&ships).for_release(target);
+            assert_eq!(
+                got.as_ref().map(crate::delivery_set::DeliverySet::len).ok(),
+                Some(members),
+                "{ships:?}: {got:?}"
+            );
+        }
+    }
+
     #[test]
     fn single_declared_with_static_axis_is_one_delivery() {
         let one = declared(&[
@@ -5980,11 +6116,12 @@ mod declared_delivery_tests {
             ShipEntry::Binary(BinaryTarget::Static),
         ]);
         assert_eq!(
-            one.sole_dev_delivery(Verb::DEV_BUILD.name()).ok(),
+            one.sole_dev_delivery(Verb::DEV_BUILD.name(), |_| true, Verb::DEV_BUILD.name())
+                .ok(),
             Some(served())
         );
         assert_eq!(
-            one.sole_release_member(Verb::RELEASE_RUN.name())
+            one.sole_release_member(Verb::RELEASE_RUN.name(), Verb::RELEASE_BUILD.name())
                 .ok()
                 .map(PlannedDelivery::delivery),
             Some(served())
@@ -6021,7 +6158,8 @@ mod declared_delivery_tests {
         let cross = declared(&[ShipEntry::Binary(BinaryTarget::Cross(
             StaticTriple::Aarch64LinuxMusl,
         ))]);
-        let member = cross.sole_release_member(Verb::RELEASE_BUILD.name());
+        let member =
+            cross.sole_release_member(Verb::RELEASE_BUILD.name(), Verb::RELEASE_BUILD.name());
         assert_eq!(
             member.ok().and_then(PlannedDelivery::release_triple),
             Some(StaticTriple::Aarch64LinuxMusl)
@@ -6033,8 +6171,14 @@ mod declared_delivery_tests {
         let cross = declared(&[ShipEntry::Binary(BinaryTarget::Cross(
             StaticTriple::Aarch64LinuxMusl,
         ))]);
-        let Ok(delivery) = cross.sole_dev_delivery(Verb::DEV_BUILD.name()) else {
-            assert!(cross.sole_dev_delivery(Verb::DEV_BUILD.name()).is_ok());
+        let Ok(delivery) =
+            cross.sole_dev_delivery(Verb::DEV_BUILD.name(), |_| true, Verb::DEV_BUILD.name())
+        else {
+            assert!(
+                cross
+                    .sole_dev_delivery(Verb::DEV_BUILD.name(), |_| true, Verb::DEV_BUILD.name())
+                    .is_ok()
+            );
             return;
         };
         assert_eq!(delivery, served());

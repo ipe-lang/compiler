@@ -1534,6 +1534,10 @@ package.ipe declares `{delivery}` twice in `ships`. A delivery is shipped once; 
 package.ipe declares several deliveries in `ships`, and `ipe {command}` builds one at a time. Name the delivery to build:
 {choices}
 
+## ships-release-slot-shared
+
+package.ipe declares `{first}` and `{second}` in `ships`, and both release into the same place under `release/`, so the second would overwrite the first. Keep one of them in `ships`, and release the other on its own with `ipe release build {second}`.
+
 ## ships-shape-mismatch
 
 package.ipe declares `{delivery}`, but `main` is a `{shape}` app. The web hosts (desktop, client, client ios, …) carry a self-contained web client; a `{shape}` app ships as a binary. Remove the entry, or change `main` to a `Web.tea` entry.

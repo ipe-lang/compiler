@@ -361,6 +361,31 @@ impl DeliverySet {
     }
 }
 
+/// Where `ipe release build` writes a member's artifact under `release/`.
+///
+/// Mirrors the release routing: a non-default host goes through the bundle
+/// packager for that host, a `client` on the default host is the browser
+/// bundle, and everything else is the one native binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseSlot {
+    /// The native binary (`release/<name>` or `release/bundle/`).
+    Native,
+    /// The browser bundle (`release/rust/www/`).
+    Browser,
+    /// The app bundle for one host (`release/dist/`).
+    Bundle(Host),
+}
+
+impl ReleaseSlot {
+    const fn of(delivery: Delivery) -> Self {
+        match (delivery.host(), delivery.runtime()) {
+            (Host::Default, Some(Runtime::Client)) => Self::Browser,
+            (Host::Default, Some(Runtime::Served) | None) => Self::Native,
+            (host @ (Host::Desktop | Host::Ios | Host::Android), _) => Self::Bundle(host),
+        }
+    }
+}
+
 /// The deliveries a package declares in `ships`, resolved once against the
 /// shape `main` pins.
 ///
@@ -403,14 +428,26 @@ impl DeclaredDeliveries {
     /// The one delivery a dev command builds when argv names none.
     ///
     /// A dev build ignores a ship's target axis, so members that differ only by
-    /// target are one delivery.
+    /// target are one delivery. `accepts` is the command's own admission: a
+    /// member it refuses is listed with the `build` verb that does produce it,
+    /// so every listed command clears the refusal.
     ///
     /// # Errors
     /// [`CliError::ProjectRefused`] listing each declared delivery and its
     /// command when the package declares more than one.
-    pub fn sole_dev_delivery(&self, command: &str) -> Result<Delivery, CliError> {
+    pub fn sole_dev_delivery(
+        &self,
+        command: &str,
+        accepts: impl Fn(Delivery) -> bool,
+        build: &str,
+    ) -> Result<Delivery, CliError> {
         self.sole_by(PlannedDelivery::delivery, command, |plan| {
-            format!("ipe {command} {}", plan.delivery)
+            let verb = if accepts(plan.delivery) {
+                command
+            } else {
+                build
+            };
+            format!("ipe {verb} {}", plan.delivery)
         })
         .map(PlannedDelivery::delivery)
     }
@@ -418,28 +455,80 @@ impl DeclaredDeliveries {
     /// The one delivery `ipe release run` builds when argv names none.
     ///
     /// A release always links statically, so a host and a static member are one
-    /// artifact; a cross member is its own.
+    /// artifact; a cross member is its own. A member with no run form (any
+    /// member that is not the native binary) is listed with the `build` verb
+    /// that produces it.
     ///
     /// # Errors
     /// [`CliError::ProjectRefused`] listing each declared delivery and its
     /// command when the package declares more than one.
-    pub fn sole_release_member(&self, command: &str) -> Result<PlannedDelivery, CliError> {
+    pub fn sole_release_member(
+        &self,
+        command: &str,
+        build: &str,
+    ) -> Result<PlannedDelivery, CliError> {
         self.sole_by(
             |plan| (plan.delivery, plan.release_triple()),
             command,
             |plan| {
+                let verb = if ReleaseSlot::of(plan.delivery) == ReleaseSlot::Native {
+                    command
+                } else {
+                    build
+                };
                 plan.release_triple().map_or_else(
-                    || format!("ipe {command} {}", plan.delivery),
-                    |triple| {
-                        format!(
-                            "ipe {command} {} --target {}",
-                            plan.delivery,
-                            triple.as_str()
-                        )
-                    },
+                    || format!("ipe {verb} {}", plan.delivery),
+                    |triple| format!("ipe {verb} {} --target {}", plan.delivery, triple.as_str()),
                 )
             },
         )
+    }
+
+    /// The set `ipe release build` given no delivery words builds: each
+    /// distinct release artifact once, `target` (argv's `--target`) overriding
+    /// every native member's declared triple.
+    ///
+    /// Members that release the same artifact (a host and a static binary) are
+    /// built once.
+    ///
+    /// # Errors
+    /// [`CliError::ProjectRefused`] when two members would release different
+    /// artifacts into the same place under `release/`, so the later one would
+    /// overwrite the earlier while both were reported built.
+    pub fn for_release(self, target: Option<StaticTriple>) -> Result<DeliverySet, CliError> {
+        let artifact = |plan: PlannedDelivery| {
+            let slot = ReleaseSlot::of(plan.delivery);
+            let triple = match slot {
+                ReleaseSlot::Native => target.or_else(|| plan.release_triple()),
+                ReleaseSlot::Browser | ReleaseSlot::Bundle(_) => None,
+            };
+            (slot, plan.delivery, triple)
+        };
+        let words = |plan: PlannedDelivery| {
+            let (_, delivery, triple) = artifact(plan);
+            triple.map_or_else(
+                || delivery.to_string(),
+                |triple| format!("{delivery} --target {}", triple.as_str()),
+            )
+        };
+        let head = self.set.head;
+        let mut rest: Vec<PlannedDelivery> = Vec::with_capacity(self.set.rest.len());
+        for plan in self.set.rest {
+            let (slot, ..) = artifact(plan);
+            let shared = std::iter::once(head)
+                .chain(rest.iter().copied())
+                .find(|kept| artifact(*kept).0 == slot);
+            match shared {
+                None => rest.push(plan),
+                Some(kept) if artifact(kept) == artifact(plan) => {}
+                Some(kept) => {
+                    return Err(CliError::ProjectRefused(
+                        crate::text::msg::ships_release_slot_shared(&words(kept), &words(plan)),
+                    ));
+                }
+            }
+        }
+        Ok(DeliverySet { head, rest })
     }
 
     /// The single member distinct under `key`, or the several-deliveries refusal
