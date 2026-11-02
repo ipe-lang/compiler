@@ -80,11 +80,12 @@ struct Layout {
     /// and per-edit overlay lookup are `O(log n)`, not a linear scan or a
     /// re-canonicalize.
     path_of_module: BTreeMap<Vec<String>, PathBuf>,
-    /// The absolute path of each stdlib module's materialised read-only copy.
+    /// The normalized path of each stdlib module's materialised read-only copy.
     ///
     /// A definition target only: no stdlib copy is ever a document the
     /// server edits, renames, or maps back to a module, so it never enters
-    /// `module_of_path`.
+    /// `module_of_path`, and opening one never re-runs the load
+    /// ([`State::is_stdlib_copy`]).
     stdlib_path_of_module: BTreeMap<Vec<String>, PathBuf>,
     /// Where `lint.ipe` is read from, if the load resolved it.
     lint_source: LintSource,
@@ -142,7 +143,7 @@ impl Layout {
             .filter(|(_, file)| {
                 file.origin == ModuleOrigin::EmbeddedStdlib && file.path.is_absolute()
             })
-            .map(|(module, file)| (module.clone(), file.path.clone()))
+            .map(|(module, file)| (module.clone(), normalize(&file.path)))
             .collect();
         Self {
             entry_module,
@@ -259,6 +260,16 @@ impl State {
     fn uri_for_module(&self, module: &[String]) -> Option<Url> {
         let path = self.served.layout()?.path_of_module.get(module)?;
         Url::from_file_path(path).ok()
+    }
+
+    /// Whether the normalized `path` is a stdlib copy of the served layout.
+    fn is_stdlib_copy(&self, path: &Path) -> bool {
+        self.served.layout().is_some_and(|layout| {
+            layout
+                .stdlib_path_of_module
+                .values()
+                .any(|copy| copy == path)
+        })
     }
 
     /// The URI a definition in `module`, whose analysed source is `text`, jumps to.
@@ -898,54 +909,57 @@ fn rename_result(state: &State, params: &serde_json::Value) -> FeatureOutcome {
     FeatureOutcome::payload(ws_edit)
 }
 
-/// Normalize a path for map keys: canonical when the file exists, verbatim
-/// otherwise (fixture loaders use paths that exist nowhere).
 /// Whether the stdlib copy at `path` is a read-only regular file holding exactly `text`.
 ///
-/// The entry is inspected without following a link, the opened handle is
-/// re-inspected and must be that same file, and the read stops one byte past
-/// `text`'s length, so a link, a swapped entry, an appended tail, or a huge
-/// planted file each answers `false` without being read whole.
+/// The entry must be a read-only regular file when inspected without
+/// following a link. It is then opened through its held parent directory,
+/// never through a link and never blocking, so a FIFO, device or socket
+/// swapped in after the inspection is refused rather than waited on; the
+/// opened handle must still be the object the name holds, and the read
+/// stops one byte past `text`'s length, so a link, a swapped entry, an
+/// appended tail, or a huge planted file each answers `false` without
+/// being read whole. Content equality is the proof a range is placed on;
+/// read-only is the copy's write-once stamp.
+#[cfg(unix)]
 fn stdlib_copy_holds(path: &Path, text: &str) -> bool {
-    use std::io::Read as _;
     let Ok(entry) = std::fs::symlink_metadata(path) else {
         return false;
     };
     if !entry.file_type().is_file() || !entry.permissions().readonly() {
         return false;
     }
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let Ok(held) = file.metadata() else {
-        return false;
-    };
-    if !held.file_type().is_file() || !same_file(&entry, &held) {
-        return false;
-    }
     let Some(cap) = u64::try_from(text.len())
         .ok()
-        .and_then(|len| len.checked_add(1))
+        .and_then(ipe_fs_open::ByteCap::new)
     else {
         return false;
     };
-    let mut bytes = Vec::with_capacity(text.len());
-    file.take(cap).read_to_end(&mut bytes).is_ok() && bytes == text.as_bytes()
+    open_stdlib_copy(path)
+        .and_then(|file| file.read_bytes(cap).ok())
+        .is_some_and(|bytes| bytes == text.as_bytes())
 }
 
-/// Whether two metadata records describe the same file.
-#[cfg(unix)]
-fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    a.dev() == b.dev() && a.ino() == b.ino()
-}
-
-/// Whether two metadata records describe the same file, by length where no inode is exposed.
+/// No stdlib copy is trusted on a host without Unix ownership: the cache that writes one refuses there.
 #[cfg(not(unix))]
-fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
-    a.len() == b.len()
+const fn stdlib_copy_holds(_path: &Path, _text: &str) -> bool {
+    false
 }
 
+/// Open the regular file at `path` through its parent, never through a link and never blocking.
+///
+/// `None` unless the opened object is a regular file and is still the
+/// object the name holds.
+#[cfg(unix)]
+fn open_stdlib_copy(path: &Path) -> Option<ipe_fs_open::RegularFile> {
+    let name = ipe_fs_open::EntryName::new(path.file_name()?)?;
+    let dir = ipe_fs_open::HeldDir::open_root(path.parent()?).ok()?;
+    let file = dir.open_regular(&name).ok()?;
+    let opened = file.id().ok()?;
+    (dir.entry_id(&name).ok()? == Some(opened)).then_some(file)
+}
+
+/// Normalize a path for map keys: canonical when the file exists, verbatim
+/// otherwise (fixture loaders use paths that exist nowhere).
 fn normalize(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -1054,8 +1068,15 @@ fn ensure_project(state: &mut State, loader: &dyn ProjectLoader, path: &Path) {
     ensure_project_fresh(state, loader, path);
 }
 
-/// Unconditionally re-resolve the project layout anchored at `path`.
+/// Re-resolve the project layout anchored at `path`, unless `path` is a stdlib copy.
+///
+/// A stdlib copy is a read-only view a definition opened, never a project
+/// anchor: a load from it would serve the copy as a user module, or refuse
+/// its root and withdraw the project being edited.
 fn ensure_project_fresh(state: &mut State, loader: &dyn ProjectLoader, path: &Path) {
+    if state.is_stdlib_copy(path) {
+        return;
+    }
     let open_text = state.overlays.get(path).map(|o| o.text.as_str());
     let verdict = loader.load(&state.workspace_roots, path, open_text);
     let previous = std::mem::replace(&mut state.served, Served::Unloaded);
@@ -3668,5 +3689,69 @@ mod tests {
         if let Some(worker) = state.worker.take() {
             let _ = worker.join();
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod stdlib_copy_tests {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use super::{open_stdlib_copy, stdlib_copy_holds};
+
+    /// A fresh scratch directory for one stdlib-copy test.
+    #[allow(clippy::expect_used)] // test fixture: a failed mkdir IS the failure
+    fn scratch(name: &str) -> PathBuf {
+        let dir = ipe_test_temp::temp_root()
+            .canonicalize()
+            .expect("canonical temp dir")
+            .join(format!("ipe-lsp-stdlib-copy-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// A FIFO at the copy's name is refused at once, never waited on for a writer.
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed mkfifo IS the failure
+    fn a_fifo_at_the_copy_is_refused_without_blocking() {
+        let dir = scratch("fifo");
+        let fifo = dir.join("Ipe.Tuple.ipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo failed");
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let probe = fifo.clone();
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = tx.send(open_stdlib_copy(&probe).is_none());
+            })
+            .expect("spawn the probe thread");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)),
+            Ok(true),
+            "the open of a FIFO must refuse, not block"
+        );
+        assert!(!stdlib_copy_holds(&fifo, "module Ipe.Tuple"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A link at the copy's name is never followed, even to a byte-equal read-only file.
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed plant IS the failure
+    fn a_link_at_the_copy_is_never_opened() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch("link");
+        let real = dir.join("real.ipe");
+        std::fs::write(&real, "module Ipe.Tuple").expect("write real");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o444)).expect("chmod");
+        let copy = dir.join("Ipe.Tuple.ipe");
+        std::os::unix::fs::symlink(&real, &copy).expect("plant link");
+        assert!(open_stdlib_copy(&copy).is_none());
+        assert!(!stdlib_copy_holds(&copy, "module Ipe.Tuple"));
+        assert!(stdlib_copy_holds(&real, "module Ipe.Tuple"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

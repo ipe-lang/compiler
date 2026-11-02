@@ -846,7 +846,11 @@ impl ProjectLoader for StdlibCopyLoader {
 /// The server thread a stdlib-definition test drives.
 type ServerThread = std::thread::JoinHandle<Result<(), ipe_lsp_server::ServerError>>;
 
-/// A server over `loader` with `TUPLE_USER` open and analysed.
+/// A server over `loader` with `TUPLE_USER` open.
+///
+/// Notifications are handled in receipt order on the server's one thread,
+/// so a request sent after the open sees its load. A clean module publishes
+/// no diagnostics, so none is awaited.
 #[allow(clippy::expect_used)] // test helper: a failed handshake IS the failure
 fn open_tuple_user(loader: StdlibCopyLoader) -> (Connection, ServerThread) {
     let (server_side, client) = Connection::memory();
@@ -881,7 +885,6 @@ fn open_tuple_user(loader: StdlibCopyLoader) -> (Connection, ServerThread) {
             }),
         )))
         .expect("send didOpen");
-    let _ = await_diagnostics(&client, &uri, |_| true);
     (client, server)
 }
 
@@ -1012,4 +1015,56 @@ fn a_stdlib_definition_without_a_copy_is_null() {
     let (client, server) = open_tuple_user(StdlibCopyLoader { tuple_copy: None });
     assert_eq!(definition_of_first(&client, 10), serde_json::Value::Null);
     shut_down(&client, server);
+}
+
+/// Opening the stdlib copy a definition jumped to leaves the served project in place.
+///
+/// The copy is a read-only view, never a project anchor: were its open to
+/// re-run the load, the copy would be analysed as the user's own module (an
+/// edit and rename target), or, with no workspace folder to fall back on,
+/// its refused root would withdraw the project the user was editing.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::expect_used)] // test fixture: a failed fixture IS the failure
+fn opening_a_stdlib_copy_keeps_the_served_project() {
+    let dir = ipe_test_temp::temp_root()
+        .canonicalize()
+        .expect("canonical temp dir")
+        .join(format!("ipe-lsp-stdlib-open-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("copy dir");
+    let copy = dir.join("Ipe.Tuple.ipe");
+    place_copy(&copy, tuple_source().as_bytes(), true);
+    let (client, server) = open_tuple_user(StdlibCopyLoader {
+        tuple_copy: Some(copy.clone()),
+    });
+    let first_location = definition_of_first(&client, 10);
+    assert_ne!(first_location, serde_json::Value::Null);
+
+    let copy_uri = lsp_types::Url::from_file_path(&copy).expect("a file URI");
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            serde_json::json!({
+                "textDocument": {
+                    "uri": copy_uri.as_str(), "languageId": "ipe", "version": 1,
+                    "text": tuple_source()
+                }
+            }),
+        )))
+        .expect("send didOpen of the copy");
+    assert_eq!(definition_of_first(&client, 11), first_location);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didClose".to_owned(),
+            serde_json::json!({ "textDocument": { "uri": copy_uri.as_str() } }),
+        )))
+        .expect("send didClose of the copy");
+    assert_eq!(definition_of_first(&client, 12), first_location);
+
+    shut_down(&client, server);
+    let _ = std::fs::remove_dir_all(&dir);
 }
