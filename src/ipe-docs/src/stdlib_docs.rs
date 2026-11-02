@@ -20,7 +20,7 @@
 //! The extractor never authors prose: it only relays comment text and the
 //! `name : Type` signature line exactly as they appear in the source.
 
-use ipe_stdlib::{COMPILED_STD_MODULES, DOC_ONLY_MODULES, MODULES as STDLIB_MODULES};
+use ipe_stdlib::{COMPILED_STD_MODULES, DOC_ONLY_MODULES, MODULES as STDLIB_MODULES, StdTier};
 
 /// A single documented export of a stdlib module.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,6 +49,12 @@ pub struct ModuleDoc {
     pub module_doc: Option<String>,
     /// Every top-level declaration the module defines, in source order.
     pub exports: Vec<ExportDoc>,
+    /// This module's presentation tier (public API, or a low-level port
+    /// layer). Carried straight from the `COMPILED_STD_MODULES` row that
+    /// named it — [`extract_module_doc`] alone has no row to read, so it
+    /// defaults to [`StdTier::Public`]; [`all_module_docs`] overwrites that
+    /// default with the row's own tier for every compiled-source module.
+    pub tier: StdTier,
 }
 
 /// Extract documentation for every embedded stdlib module (both the
@@ -62,7 +68,11 @@ pub fn all_module_docs() -> Vec<ModuleDoc> {
         out.push(extract_module_doc(m.name, m.source));
     }
     for m in COMPILED_STD_MODULES {
-        out.push(extract_module_doc(m.dotted, m.source));
+        let mut doc = extract_module_doc(m.dotted, m.source);
+        // The tier is this row's own typed field, never re-derived from
+        // `dotted`'s spelling.
+        doc.tier = m.tier;
+        out.push(doc);
     }
     for m in DOC_ONLY_MODULES {
         out.push(extract_module_doc(m.dotted, m.source));
@@ -76,7 +86,24 @@ pub fn all_module_docs() -> Vec<ModuleDoc> {
     out
 }
 
+/// Partition reference-index modules into the public API and the low-level
+/// port layers, by each module's `tier` field alone — never by matching
+/// `.Internals` against its name.
+///
+/// Returns `(public, port_layers)`.
+#[must_use]
+pub fn group_by_tier(modules: &[ModuleDoc]) -> (Vec<&ModuleDoc>, Vec<&ModuleDoc>) {
+    modules
+        .iter()
+        .partition(|m| matches!(m.tier, StdTier::Public))
+}
+
 /// Extract documentation for one module from its dotted name and raw source.
+///
+/// The returned [`ModuleDoc::tier`] defaults to [`StdTier::Public`] — this
+/// function has no `COMPILED_STD_MODULES` row to read a real tier from.
+/// [`all_module_docs`] overwrites the default with the row's own tier for
+/// every compiled-source module.
 #[must_use]
 pub fn extract_module_doc(dotted: &str, source: &str) -> ModuleDoc {
     let short = dotted.strip_prefix("Ipe.").unwrap_or(dotted).to_owned();
@@ -87,6 +114,7 @@ pub fn extract_module_doc(dotted: &str, source: &str) -> ModuleDoc {
         short,
         module_doc,
         exports,
+        tier: StdTier::Public,
     }
 }
 
@@ -808,6 +836,42 @@ make = { size = 1 }
         assert!(
             result.exports.iter().any(|e| e.name == "withDefault"),
             "Result must list `withDefault` (header-prose `module`/`exposing` must not mislead the parser)"
+        );
+    }
+
+    /// The reference index partitions every compiled-source module into the
+    /// public group and the port-layer group by its typed `tier` alone: a
+    /// `.Internals` module always lands in the port-layer group, and nothing
+    /// outside `COMPILED_STD_MODULES`'s port-layer rows ever does.
+    #[test]
+    fn reference_index_groups_by_tier() {
+        let modules = all_module_docs();
+        let (public, port_layers) = group_by_tier(&modules);
+
+        assert!(!port_layers.is_empty(), "no port-layer module found");
+        for m in &port_layers {
+            assert!(
+                matches!(m.tier, StdTier::PortLayer { .. }),
+                "{} grouped as a port layer but is not tiered PortLayer",
+                m.dotted
+            );
+            assert!(
+                m.dotted.ends_with(".Internals"),
+                "{} grouped as a port layer but is not spelled `.Internals`",
+                m.dotted
+            );
+        }
+        for m in &public {
+            assert!(
+                matches!(m.tier, StdTier::Public),
+                "{} grouped as public but is not tiered Public",
+                m.dotted
+            );
+        }
+        assert_eq!(
+            public.len() + port_layers.len(),
+            modules.len(),
+            "every module must land in exactly one group"
         );
     }
 

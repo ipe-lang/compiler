@@ -1704,6 +1704,24 @@ fn stdlib_module_names() -> Vec<String> {
     names.into_iter().collect()
 }
 
+/// A compiled-source stdlib module's presentation tier, by dotted name.
+///
+/// `Some(of)` when `dotted` is a port-layer module (`StdTier::PortLayer`),
+/// naming the public module it backs. `None` for a public compiled-source
+/// module, a kernel-qualifier module, or a doc-only reserved module — the tier
+/// is read from the row's typed field, never from the name's spelling.
+fn stdlib_port_layer_of(dotted: &str) -> Option<&'static str> {
+    ipe_stdlib::COMPILED_STD_MODULES.iter().find_map(|m| {
+        if m.dotted != dotted {
+            return None;
+        }
+        match m.tier {
+            ipe_stdlib::StdTier::Public => None,
+            ipe_stdlib::StdTier::PortLayer { of } => Some(of),
+        }
+    })
+}
+
 /// Build [`ModuleDoc`]s for every stdlib module.
 ///
 /// Compiled-source modules are type-checked using the same pipeline as project
@@ -2386,18 +2404,44 @@ fn list_modules(path: &Path, format: OutputFormat) {
                 }
                 body.push('\n');
             }
+            // Port-layer modules (`*.Internals`) are public but low-level;
+            // list them apart from the public API so a reader is not misled
+            // into importing one by default. The split reads the row's typed
+            // `StdTier`, never the name's spelling.
+            let (port_layer_names, public_stdlib_names): (Vec<&String>, Vec<&String>) =
+                stdlib_names
+                    .iter()
+                    .partition(|n: &&String| stdlib_port_layer_of(n.as_str()).is_some());
+
             let _ = writeln!(
                 body,
                 "{GUTTER}{} ({}):\n",
                 crate::text::site_standard_library(),
-                stdlib_names.len()
+                public_stdlib_names.len()
             );
-            let stdlib_refs: Vec<&str> = stdlib_names.iter().map(String::as_str).collect();
+            let stdlib_refs: Vec<&str> = public_stdlib_names.iter().map(|n| n.as_str()).collect();
             let tree = build_namespace_tree(&stdlib_refs);
             let mut tree_out = String::new();
             render_plain_tree(&tree, 0, &mut tree_out);
             for line in tree_out.lines() {
                 let _ = writeln!(body, "{GUTTER}  {line}");
+            }
+
+            if !port_layer_names.is_empty() {
+                body.push('\n');
+                let _ = writeln!(
+                    body,
+                    "{GUTTER}{} ({}):\n",
+                    crate::text::site_port_layers(),
+                    port_layer_names.len()
+                );
+                let port_refs: Vec<&str> = port_layer_names.iter().map(|n| n.as_str()).collect();
+                let tree = build_namespace_tree(&port_refs);
+                let mut tree_out = String::new();
+                render_plain_tree(&tree, 0, &mut tree_out);
+                for line in tree_out.lines() {
+                    let _ = writeln!(body, "{GUTTER}  {line}");
+                }
             }
             // Module names come from project source: sanitise before framing.
             Screen::new(Stream::Stdout)
@@ -2439,6 +2483,13 @@ fn render_module_human(module: &ModuleDoc, index: &AnchorIndex) {
 
     let md = module.comment.as_str();
     let mut body = format!("{GUTTER}{}\n\n", module.name);
+    if let Some(of) = stdlib_port_layer_of(&module.name) {
+        let _ = writeln!(
+            body,
+            "{GUTTER}{}\n",
+            crate::text::site_port_layer_banner(&of)
+        );
+    }
     if !md.is_empty() {
         let _ = writeln!(body, "{GUTTER}{md}\n");
     }

@@ -403,6 +403,7 @@ mod tests {
         let modules = [ipe_stdlib::CompiledStdModule {
             dotted: "Ipe.CoverageTestBroken",
             source: "module Ipe.CoverageTestBroken exposing (broken)\n\nbroken : Int\nbroken = \"not an Int\"\n",
+            tier: ipe_stdlib::StdTier::Public,
         }];
         let result = LayerAgreementColumn::build_from(&modules);
         assert!(

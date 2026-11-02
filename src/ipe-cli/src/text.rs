@@ -1184,6 +1184,10 @@ messages! {
     site_project_modules = "site-project-modules";
     /// The standard library group.
     site_standard_library = "site-standard-library";
+    /// The port-layer modules group, listed apart from the public API.
+    site_port_layers = "site-port-layers";
+    /// A port-layer module page's banner, naming the public module it backs.
+    site_port_layer_banner(of) = "site-port-layer-banner";
     /// A module page's types heading.
     site_types = "site-types";
     /// A module page's values heading.
