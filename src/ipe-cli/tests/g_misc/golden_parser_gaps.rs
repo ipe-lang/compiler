@@ -15,10 +15,6 @@
 //! * `intdiv` — `//` integer division. `20 // 2` → `10` and `(-7) // 2` →
 //!   `-3` (truncation toward zero, Elm parity; a floor-division backend
 //!   would give `-4`). Output: `"10 -3"`.
-//! * `intdiv_minint` — F6 regression: `i64::MIN // -1`. Raw Rust `/`
-//!   panics here unconditionally (signed-overflow hardware trap); Ipê
-//!   returns `i64::MIN` (two's-complement wrap). `ipe_int_div` reproduces this
-//!   via `wrapping_div`. Output: `"-9223372036854775808"`, exit 0.
 //! * `let_fn` — a let-bound *function* (`inc n = n + 1`) applied inside the
 //!   `in` body. Output: `"30"`.
 //! * `blockcomment` — a `{- … -}` block comment containing an em-dash plus a
@@ -40,6 +36,10 @@
 //!   as `DivisionByZero` and aborts with exit code 101 (a Rust panic), rather
 //!   than emitting a wrong answer. Asserted by building + running the emitted
 //!   binary and checking the exit code (gated on `IPE_E2E`).
+//! * `intdiv_minint` — `minInt // -1` inside a task step. The quotient `2^63`
+//!   is outside the 64-bit `Int` range, so `ipe_int_div` trips `IntOverflow`
+//!   and the program ends in a typed error: exit 1, nothing printed — never a
+//!   wrapped `minInt` and never a Rust panic (exit 101).
 //! * `blockcomment_unterminated` — a `{-` that is never closed → `IPE-P0017`
 //!   (unterminated block comment). This is a sanctioned stricter behaviour: the
 //!   golden oracle leniently swallows the unterminated comment to EOF and builds an
@@ -168,16 +168,35 @@ fn intdiv_by_zero_aborts_exit_101() {
     );
 }
 
-/// F6 regression — `i64::MIN // -1` must NOT panic.
+/// `minInt // -1` ends in a typed `IntOverflow` error, never a panic or a wrap.
 ///
-/// Raw Rust `/` on `i64` panics here unconditionally (signed-overflow hardware
-/// trap, present even with `overflow-checks = false`). Ipê uses two's-complement
-/// arithmetic and returns `i64::MIN`. The fix routes `BinOp::IntDiv` through
-/// `ipe_runtime::math::ipe_int_div(a, b)` which calls `a.wrapping_div(b)` for
-/// non-zero divisors.
+/// The quotient `2^63` has no `Int` value. `ipe_int_div` trips `IntOverflow`;
+/// the task step's boundary turns the trip into the program's typed error, so
+/// the binary prints nothing and exits 1 — not 101 (a foreign panic), and not
+/// 0 with a wrapped `minInt`.
 #[test]
 fn intdiv_minint_by_neg1_does_not_panic() {
-    assert_single_oracle("intdiv_minint");
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let name = "intdiv_minint";
+    let dir = golden_dir(name);
+    let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
+    let _ = std::fs::remove_dir_all(&out);
+
+    let built = crate::support::build_golden(&dir, &out, &runtime());
+    assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
+
+    let outcome = crate::support::build_and_run_emitted(name, &out);
+    assert_eq!(
+        outcome.exit_code,
+        Some(1),
+        "`minInt // -1` must end in the typed IntOverflow error (exit 1), not a panic or a wrapped value"
+    );
+    assert_eq!(
+        outcome.stdout, "",
+        "no quotient is printed once IntOverflow fires"
+    );
 }
 
 // ---------------------------------------------------------------------------
