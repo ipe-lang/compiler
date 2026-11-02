@@ -6,7 +6,7 @@ ipe dev run [<dir>]
 
 ## Arguments
 
-A project directory (default: the current directory).
+A project directory (default: the current directory). With no delivery args, `dev run` runs the one delivery declared in `ships` in package.ipe (the served default when `ships` is absent); when `ships` declares several, it refuses and lists the command for each.
 
 ## Options
 

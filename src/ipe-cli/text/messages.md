@@ -495,6 +495,10 @@ a co-located `wasm32-wasip1` build cannot carry a `client` delivery. `client` is
 
 `{delivery}` is an app bundle for `{host}`, and `ipe dev run` has no way to run it. Lay the bundle out with `ipe dev build {delivery}`, or drop `{host}` to run the browser client with `ipe dev run web client`.
 
+## delivery-watch-serves-only
+
+`ipe dev watch` rebuilds and restarts a served program, and `{delivery}` is a browser bundle with no server to restart. Build the bundle with `ipe dev build {delivery}`.
+
 ## delivery-wasi-requires-direct-shape
 
 a co-located `wasm32-wasip1` build carries only a `Direct` script (a plain `Task Error ()` `main`), but this is a `{shape}` app. A `tui`/`cli`/`web` TEA loop needs the reactor spine, which does not build on WASI. Build the `{shape}` app natively, or ship a `Direct` script to `wasm32-wasip1`.
@@ -1524,6 +1528,11 @@ watch: cannot bind the blue-green proxy on port {port}: {detail}
 ## ships-repeated
 
 package.ipe declares `{delivery}` twice in `ships`. A delivery is shipped once; a repeated entry is a confused manifest, not a request for two copies. Remove the duplicate.
+
+## ships-several
+
+package.ipe declares several deliveries in `ships`, and `ipe {command}` builds one at a time. Name the delivery to build:
+{choices}
 
 ## ships-shape-mismatch
 

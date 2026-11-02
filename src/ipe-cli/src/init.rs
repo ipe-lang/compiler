@@ -1306,8 +1306,8 @@ mod tests {
         let parsed =
             crate::project::parse_manifest(&path).expect("scaffolded client manifest re-parses");
         assert_eq!(
-            parsed.delivery.ships,
-            vec![ShipEntry::Client],
+            parsed.delivery.ships_for_render(),
+            [ShipEntry::Client],
             "a wizard `web client` choice writes an explicit `ships = [ client ]`"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -1424,15 +1424,13 @@ mod tests {
     /// refuses.
     #[test]
     fn every_init_shape_scaffolds_a_delivery_set_the_build_admits() {
-        use crate::delivery_set::DeliverySet;
         for shape in InitShape::ALL {
             for runtime in scaffolded_runtimes(shape) {
                 let label = format!("{} {}", shape.label(), runtime_label(runtime));
                 let parsed = scaffolded_manifest("admits", shape, runtime);
                 assert!(parsed.is_ok(), "{label}: manifest re-parses: {parsed:?}");
                 let Ok(parsed) = parsed else { continue };
-                let set =
-                    DeliverySet::resolve(pinned_shape(shape, runtime), &parsed.delivery.ships);
+                let set = parsed.delivery.declared(pinned_shape(shape, runtime));
                 assert!(
                     set.is_ok(),
                     "{label}: the build admits the ships set: {set:?}"
@@ -1450,21 +1448,23 @@ mod tests {
     #[test]
     fn the_advised_next_step_builds_the_declared_delivery() {
         use crate::delivery::TargetTriple;
-        use crate::delivery_set::{DeliverySet, PlannedDelivery};
-        use crate::driver::{TargetVerb, derive_target, resolve_delivery};
+        use crate::driver::{TargetVerb, admit_any, derive_target, resolve_delivery};
         for shape in InitShape::ALL {
             for runtime in scaffolded_runtimes(shape) {
                 let label = format!("{} {}", shape.label(), runtime_label(runtime));
                 let pinned = pinned_shape(shape, runtime);
                 let parsed =
                     scaffolded_manifest("advice", shape, runtime).expect("manifest re-parses");
-                let set = DeliverySet::resolve(pinned, &parsed.delivery.ships)
+                let declared_set = parsed
+                    .delivery
+                    .declared(pinned)
                     .expect("the build admits the ships set");
-                let planned = set.planned();
-                assert_eq!(planned.len(), 1, "{label}: one declared delivery");
-                let Some(declared) = planned.first().copied().map(PlannedDelivery::delivery) else {
-                    continue;
-                };
+                assert_eq!(
+                    declared_set.set().len(),
+                    1,
+                    "{label}: one declared delivery"
+                );
+                let declared = declared_set.set().head().delivery();
 
                 let command = shape.next_step_command(runtime);
                 let rest = command.strip_prefix("ipe ").unwrap_or_default();
@@ -1479,8 +1479,9 @@ mod tests {
                     crate::cli_args::parse_build(&args).map(|a| a.delivery)
                 }
                 .expect("the advised verb's parser reads the command");
-                let advised = resolve_delivery(pinned, &positionals, false, verb.name())
-                    .expect("the advised delivery resolves");
+                let advised =
+                    resolve_delivery(&declared_set, &positionals, false, verb.name(), admit_any)
+                        .expect("the advised delivery resolves");
                 assert_eq!(
                     advised, declared,
                     "{label}: `{command}` builds the declared delivery"
@@ -1528,7 +1529,7 @@ mod tests {
         let parsed =
             crate::project::parse_manifest(&path).expect("scaffolded served manifest re-parses");
         assert!(
-            parsed.delivery.ships.is_empty(),
+            parsed.delivery.ships_for_render().is_empty(),
             "an absent ships field is the implicit default"
         );
         let _ = std::fs::remove_dir_all(&root);

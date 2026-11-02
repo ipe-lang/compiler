@@ -849,6 +849,8 @@ messages! {
     delivery_bundle_host_has_no_target(delivery, host, source) = "delivery-bundle-host-has-no-target";
     /// `ipe dev run` was handed a client app-bundle delivery.
     delivery_client_host_has_no_dev_run(delivery, host) = "delivery-client-host-has-no-dev-run";
+    /// `ipe dev watch` was handed a `client` delivery, which has no server to restart.
+    delivery_watch_serves_only(delivery) = "delivery-watch-serves-only";
     /// A co-located WASI build was asked for a non-`Direct` shape.
     delivery_wasi_requires_direct_shape(shape) = "delivery-wasi-requires-direct-shape";
     /// A co-located WASI engine was asked for a non-WASI triple.
@@ -1307,6 +1309,8 @@ messages! {
     ships_repeated(delivery) = "ships-repeated";
     /// A `ships` delivery does not fit the shape of `main`.
     ships_shape_mismatch(delivery, shape) = "ships-shape-mismatch";
+    /// A command given no delivery words found several declared deliveries.
+    ships_several(command, choices) = "ships-several";
     /// A retired ship builder is written in `ships`.
     ship_retired_builder(got, now) = "ship-retired-builder";
     /// `ipe add` found the package already declared as an escape dependency.
