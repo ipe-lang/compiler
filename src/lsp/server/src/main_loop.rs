@@ -2,7 +2,7 @@
 //! thread, diagnostics on cancellable worker threads, latest-generation-wins
 //! publishing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -240,6 +240,13 @@ struct State {
     docs: Option<ipe_docs::Index>,
     /// Whether the client accepts versioned `documentChanges` in a workspace edit.
     document_changes: bool,
+    /// The stdlib copies of the last adopted layout that named any, normalized.
+    ///
+    /// Held apart from [`State::served`] because the editor keeps a copy's
+    /// tab open across a refusal that withdraws the layout: the copy must
+    /// stay no project anchor ([`State::is_stdlib_copy`]) whatever is served.
+    /// Replaced, never grown, so it holds at most one layout's stdlib.
+    stdlib_copies: BTreeSet<PathBuf>,
 }
 
 impl State {
@@ -262,14 +269,9 @@ impl State {
         Url::from_file_path(path).ok()
     }
 
-    /// Whether the normalized `path` is a stdlib copy of the served layout.
+    /// Whether the normalized `path` is a stdlib copy a layout of this session named.
     fn is_stdlib_copy(&self, path: &Path) -> bool {
-        self.served.layout().is_some_and(|layout| {
-            layout
-                .stdlib_path_of_module
-                .values()
-                .any(|copy| copy == path)
-        })
+        self.stdlib_copies.contains(path)
     }
 
     /// The URI a definition in `module`, whose analysed source is `text`, jumps to.
@@ -328,6 +330,7 @@ impl State {
             // leaves enrichment off rather than blocking the server.
             docs: ipe_docs::Index::build_embedded().ok(),
             document_changes: false,
+            stdlib_copies: BTreeSet::new(),
         }
     }
 
@@ -1081,7 +1084,13 @@ fn ensure_project_fresh(state: &mut State, loader: &dyn ProjectLoader, path: &Pa
     let verdict = loader.load(&state.workspace_roots, path, open_text);
     let previous = std::mem::replace(&mut state.served, Served::Unloaded);
     state.served = match verdict {
-        Ok(project) => Served::Trusted(Layout::of(project)),
+        Ok(project) => {
+            let layout = Layout::of(project);
+            if !layout.stdlib_path_of_module.is_empty() {
+                state.stdlib_copies = layout.stdlib_path_of_module.values().cloned().collect();
+            }
+            Served::Trusted(layout)
+        }
         Err(err) => match (err.disposition(), previous) {
             // A refusal withdraws every layout, a trusted one included: the
             // compiler refuses the project, so no analysis of it stays shown.
@@ -2587,6 +2596,101 @@ mod tests {
         did_change_watched_files(&mut state, &loader, &diag_tx);
         assert_eq!(loader.loads(), 0, "no anchor, no load");
         assert!(matches!(state.served, Served::Unloaded));
+    }
+
+    /// A loader serving `Main` plus `Ipe.Tuple` at a materialised stdlib copy, counting its loads.
+    struct StdlibCopyLoader {
+        copy: PathBuf,
+        loads: AtomicUsize,
+    }
+
+    impl ProjectLoader for StdlibCopyLoader {
+        fn load(
+            &self,
+            _workspace_roots: &[PathBuf],
+            open_file: &Path,
+            open_text: Option<&str>,
+        ) -> Result<LoadedProject, LoadError> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            let mut files = BTreeMap::new();
+            files.insert(
+                vec!["Main".to_owned()],
+                LoadedFile {
+                    path: open_file.to_path_buf(),
+                    text: open_text.unwrap_or(MAIN_TEXT).to_owned(),
+                    origin: ModuleOrigin::User,
+                },
+            );
+            files.insert(
+                vec!["Ipe".to_owned(), "Tuple".to_owned()],
+                LoadedFile {
+                    path: self.copy.clone(),
+                    text: String::new(),
+                    origin: ModuleOrigin::EmbeddedStdlib,
+                },
+            );
+            Ok(LoadedProject {
+                files,
+                entry_module: vec!["Main".to_owned()],
+                lint_config_dir: ipe_lint::lint_config_dir(open_file),
+            })
+        }
+    }
+
+    /// A stdlib copy stays no anchor after a refusal withdrew the layout that named it.
+    ///
+    /// The editor keeps the copy's tab open across the refusal; its open or
+    /// close must neither re-run the load from the copy nor move the
+    /// refusal, and the diagnostic published on its anchor, onto the copy.
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: an unbuildable URI IS the failure
+    fn a_stdlib_copy_is_no_anchor_after_a_refusal_withdrew_the_layout() {
+        let main_path = normalize(Path::new("/lsp-stdlib-copy-refused-test/src/Main.ipe"));
+        let copy = normalize(Path::new("/lsp-stdlib-copy-refused-cache/Ipe.Tuple.ipe"));
+        let loader = StdlibCopyLoader {
+            copy: copy.clone(),
+            loads: AtomicUsize::new(0),
+        };
+        let (diag_tx, _diag_rx) = crossbeam_channel::unbounded::<DiagnosticsBatch>();
+        let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
+        ensure_project_fresh(&mut state, &loader, &main_path);
+        assert!(matches!(state.served, Served::Trusted(_)), "first load");
+        assert_eq!(loader.loads.load(Ordering::SeqCst), 1);
+
+        ensure_project_fresh(
+            &mut state,
+            &FailingLoader(LoadError::RootRefused("no manifest".to_owned())),
+            &main_path,
+        );
+        assert!(matches!(&state.served, Served::Refused { anchor, .. } if *anchor == main_path));
+
+        let copy_uri = Url::from_file_path(&copy).expect("copy uri");
+        let open = lsp_types::DidOpenTextDocumentParams {
+            text_document: lsp_types::TextDocumentItem {
+                uri: copy_uri.clone(),
+                language_id: "ipe".to_owned(),
+                version: 1,
+                text: String::new(),
+            },
+        };
+        let close = lsp_types::DidCloseTextDocumentParams {
+            text_document: lsp_types::TextDocumentIdentifier { uri: copy_uri },
+        };
+        for note in [
+            Notification::new(DidOpenTextDocument::METHOD.to_owned(), open),
+            Notification::new(DidCloseTextDocument::METHOD.to_owned(), close),
+        ] {
+            handle_notification(&mut state, &loader, &note, &diag_tx);
+        }
+        assert_eq!(
+            loader.loads.load(Ordering::SeqCst),
+            1,
+            "no load is anchored at the stdlib copy"
+        );
+        assert!(
+            matches!(&state.served, Served::Refused { anchor, .. } if *anchor == main_path),
+            "the refusal stays anchored at the project file"
+        );
     }
 
     /// The last `publishDiagnostics` payload per URI `client` received.
