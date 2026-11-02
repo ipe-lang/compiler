@@ -7,33 +7,33 @@
 use crate::html::FormData;
 
 /// Why a browser `FormData` payload did not decode into the target record.
-#[derive(Clone, PartialEq)]
+///
+/// No variant holds the `serde_urlencoded` error: its text quotes the
+/// submitted value (``unknown variant `<value>` ``), and a form value can be a
+/// password, so the error is dropped where it is raised and no match arm can
+/// render it into a log line or a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FormDecodeError {
     /// The name/value pairs could not be re-encoded as `x-www-form-urlencoded`.
-    Encode(serde_urlencoded::ser::Error),
+    Encode,
     /// The pairs do not fit the target record (a missing required field, an
     /// unknown variant, a value the field's type does not parse).
-    Decode(serde_urlencoded::de::Error),
+    Decode,
 }
 
-/// A fixed phrase per variant: the `serde_urlencoded` error text quotes the
-/// submitted value (``unknown variant `<value>` ``), and a form value can be a
-/// password, so it never reaches a log line or a message.
+/// A `serde_urlencoded` error is not `Copy`, so this stops the build if a
+/// variant wraps one again.
+const _: () = {
+    const fn holds_no_foreign_error<T: Copy>() {}
+    holds_no_foreign_error::<FormDecodeError>();
+};
+
+/// A fixed phrase per variant.
 impl core::fmt::Display for FormDecodeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Encode(_) => f.write_str("form pairs could not be encoded"),
-            Self::Decode(_) => f.write_str("form does not fit the record"),
-        }
-    }
-}
-
-/// The variant only, for the same reason as `Display`.
-impl core::fmt::Debug for FormDecodeError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Encode(_) => f.write_str("Encode(..)"),
-            Self::Decode(_) => f.write_str("Decode(..)"),
+            Self::Encode => f.write_str("form pairs could not be encoded"),
+            Self::Decode => f.write_str("form does not fit the record"),
         }
     }
 }
@@ -55,7 +55,7 @@ impl std::error::Error for FormDecodeError {}
 /// field makes the `OnForm` closure dispatch no Msg).
 pub fn decode_form<T: serde::de::DeserializeOwned>(fd: FormData) -> Result<T, FormDecodeError> {
     let pairs: Vec<(String, String)> = fd.into_iter().collect();
-    let encoded = serde_urlencoded::to_string(&pairs).map_err(FormDecodeError::Encode)?;
+    let encoded = serde_urlencoded::to_string(&pairs).map_err(|_| FormDecodeError::Encode)?;
     // `encoded` is this function's own output: every escape is well-formed and
     // the bytes are UTF-8, so the lenient reader reproduces `pairs` exactly and
     // no URL component from the wire is decoded here.
@@ -64,7 +64,7 @@ pub fn decode_form<T: serde::de::DeserializeOwned>(fd: FormData) -> Result<T, Fo
         reason = "re-reads this function's own encoder output, never a URL component from the wire"
     )]
     let decoded = serde_urlencoded::from_str::<T>(&encoded);
-    decoded.map_err(FormDecodeError::Decode)
+    decoded.map_err(|_| FormDecodeError::Decode)
 }
 
 /// `decode_form` + a warn on failure. The `OnForm` closure is synchronous and
@@ -311,11 +311,11 @@ mod tests {
         fd.insert("tier".to_string(), SENTINEL.to_string());
         let r: Result<Subscription, FormDecodeError> = decode_form(fd);
         assert!(
-            matches!(&r, Err(e @ FormDecodeError::Decode(_)) if e.to_string() == "form does not fit the record"),
+            matches!(&r, Err(e @ FormDecodeError::Decode) if e.to_string() == "form does not fit the record"),
             "{r:?}"
         );
         assert!(
-            matches!(&r, Err(e) if format!("{e:?}") == "Decode(..)"),
+            matches!(&r, Err(e) if format!("{e:?}") == "Decode"),
             "{r:?}"
         );
         let mut bad = FormData::new();

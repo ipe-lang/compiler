@@ -3,9 +3,9 @@
 //! A `serde_json` data error quotes the input value it refused, so its
 //! `Display` or `Debug` text can carry a secret into a log line or a returned
 //! error. The one renderer is `json::json_failure_text` (and `json_failure`,
-//! built on it). Every `.rs` file under `src/` except `json.rs` is parsed with
-//! `syn`, and four kinds of site are counted in its production syntax, keyed by
-//! the function they are written in:
+//! built on it). Every `.rs` file under `src/`, `json.rs` included, is parsed
+//! with `syn`, and four kinds of site are counted in its production syntax,
+//! keyed by the function they are written in:
 //!
 //! - **`Rendered`.** A failure binding is read for anything other than its
 //!   kind. A failure binding is the binder of an `Err(..)` pattern over a
@@ -13,10 +13,11 @@
 //!   parameter of a closure handed the error (`map_err`, `unwrap_or_else`,
 //!   `or_else`, `inspect_err`, `is_err_and`, `map_or_else`), or a parameter
 //!   typed `serde_json::Error`. Reading it through an inspector (`classify`,
-//!   `is_eof`, `line`, …), or passing it to the renderer or to a function whose
-//!   own parameter is a `serde_json::Error` (scanned in its turn), is not a
-//!   site; any other use is, a `{name}` placeholder in a macro's format string
-//!   included.
+//!   `is_eof`, `line`, …), or passing it to a function whose own parameter is
+//!   a `serde_json::Error` (scanned in its turn), is not a site; any other use
+//!   is, a `{name}` placeholder in a macro's format string included. A call
+//!   is matched by its last path segment, so a name some other function also
+//!   carries, or a local binding shadows, proves nothing and is a site.
 //! - **`Forwarded`.** An unopened outcome leaves the scan's sight: `?`, a call
 //!   or macro argument, a `return`, a struct field, a non-closure error
 //!   handler, `.err()`/`.unwrap()`/`.expect()`, or a fallible `serde_json`
@@ -48,10 +49,11 @@ use syn::ext::IdentExt;
 use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
 use syn::{
-    Arm, Attribute, Block, Expr, ExprCall, ExprClosure, ExprForLoop, ExprIf, ExprLet, ExprLit,
-    ExprMatch, ExprMethodCall, ExprPath, ExprReturn, ExprTry, ExprWhile, Field, FieldValue, FnArg,
-    ImplItem, ImplItemFn, Item, ItemExternCrate, ItemFn, ItemImpl, ItemUse, Lit, LitStr, Local,
-    Macro, Pat, Path, Signature, Stmt, Token, TraitItem, TraitItemFn, Type, UseTree, Variant,
+    Arm, Attribute, Block, Expr, ExprAssign, ExprBreak, ExprCall, ExprClosure, ExprForLoop, ExprIf,
+    ExprLet, ExprLit, ExprMatch, ExprMethodCall, ExprPath, ExprReturn, ExprTry, ExprWhile, Field,
+    FieldValue, FnArg, ImplItem, ImplItemFn, Item, ItemExternCrate, ItemFn, ItemImpl, ItemUse, Lit,
+    LitStr, Local, Macro, Pat, Path, Signature, Stmt, Token, TraitItem, TraitItemFn, Type, UseTree,
+    Variant,
 };
 
 #[path = "support/cfg_scan.rs"]
@@ -88,8 +90,16 @@ struct Admitted {
     reason: &'static str,
 }
 
-/// Every production site outside `json.rs`, with its reason.
+/// Every production site, with its reason.
 const ADMITTED_SITES: &[Admitted] = &[
+    Admitted {
+        file: "json.rs",
+        function: "json_failure_text",
+        kind: SiteKind::Rendered,
+        count: 1,
+        reason: "the renderer: only a `Syntax`/`Eof` text-parse error is printed, whose \
+                 `Display` is a fixed grammar phrase and a position, never input bytes",
+    },
     Admitted {
         file: "debugger/mod.rs",
         function: "export_msgs",
@@ -432,10 +442,13 @@ enum Binding {
     Failure,
 }
 
-/// The names of every function with a `serde_json::Error` parameter.
+/// The function names whose every definition takes a `serde_json::Error`
+/// parameter. A call is matched by name alone, so a name another function
+/// also carries (one taking `impl Display`, say) proves nothing.
 #[derive(Default)]
 struct Handlers {
     names: BTreeSet<String>,
+    others: BTreeSet<String>,
 }
 
 impl Handlers {
@@ -444,9 +457,16 @@ impl Handlers {
             FnArg::Typed(typed) => is_failure_type(&typed.ty),
             FnArg::Receiver(_) => false,
         });
+        let name = sig.ident.unraw().to_string();
         if takes_failure {
-            self.names.insert(sig.ident.unraw().to_string());
+            self.names.insert(name);
+        } else {
+            self.others.insert(name);
         }
+    }
+
+    fn proven(&self) -> BTreeSet<String> {
+        self.names.difference(&self.others).cloned().collect()
     }
 }
 
@@ -524,6 +544,25 @@ impl<'h> Scan<'h> {
         }
     }
 
+    /// An assignment taints the binding it writes, in the scope that owns it;
+    /// it never clears one, since the assigned branch may not run.
+    fn assign(&mut self, name: &str, binding: Binding) {
+        if binding == Binding::Clean {
+            return;
+        }
+        let owner = self
+            .scopes
+            .iter_mut()
+            .rev()
+            .find(|scope| scope.contains_key(name));
+        match owner {
+            Some(scope) => {
+                scope.insert(name.to_owned(), binding);
+            }
+            None => self.bind(name.to_owned(), binding),
+        }
+    }
+
     fn push(&mut self) {
         self.scopes.push(BTreeMap::new());
     }
@@ -532,10 +571,17 @@ impl<'h> Scan<'h> {
         self.scopes.pop();
     }
 
-    /// A function the renderer owns, or one whose parameter is the error.
+    /// A function whose every same-named definition takes the error, called
+    /// by a name no local binding (a closure named like it) shadows.
     fn renders(&self, path: &Path) -> bool {
-        last_name(path)
-            .is_some_and(|name| listed(RENDERER_FNS, &name) || self.handlers.contains(&name))
+        let shadowed = path
+            .get_ident()
+            .is_some_and(|ident| self.bound(&ident.unraw().to_string()));
+        !shadowed && last_name(path).is_some_and(|name| self.handlers.contains(&name))
+    }
+
+    fn bound(&self, name: &str) -> bool {
+        self.scopes.iter().any(|scope| scope.contains_key(name))
     }
 
     fn binding_of(&self, expr: &Expr) -> Binding {
@@ -575,18 +621,27 @@ impl<'h> Scan<'h> {
             }
             Expr::Reference(reference) => self.binding_of(&reference.expr),
             Expr::Await(awaited) => self.binding_of(&awaited.base),
-            Expr::Tuple(tuple) => {
-                if tuple
-                    .elems
-                    .iter()
-                    .any(|elem| self.binding_of(elem) == Binding::Outcome)
-                {
-                    Binding::Outcome
-                } else {
-                    Binding::Clean
-                }
+            Expr::Tuple(tuple) => self.any_outcome(&tuple.elems),
+            Expr::Array(array) => self.any_outcome(&array.elems),
+            Expr::Field(field) => self.binding_of(&field.base),
+            Expr::Index(index) => self.binding_of(&index.expr),
+            Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Deref(_)) => {
+                self.binding_of(&unary.expr)
             }
+            Expr::Async(block) => self.tail_binding(&block.block),
             _ => Binding::Clean,
+        }
+    }
+
+    /// An outcome when any element holds one: a tuple or array carries it.
+    fn any_outcome(&self, elems: &Punctuated<Expr, Token![,]>) -> Binding {
+        if elems
+            .iter()
+            .any(|elem| self.binding_of(elem) == Binding::Outcome)
+        {
+            Binding::Outcome
+        } else {
+            Binding::Clean
         }
     }
 
@@ -1099,6 +1154,34 @@ impl<'ast> Visit<'ast> for Scan<'_> {
         visit::visit_expr_try(self, node);
     }
 
+    fn visit_expr_assign(&mut self, node: &'ast ExprAssign) {
+        self.visit_expr(&node.right);
+        let binding = self.binding_of(&node.right);
+        match &*node.left {
+            Expr::Path(left) if left.qself.is_none() => match left.path.get_ident() {
+                Some(ident) => self.assign(&ident.unraw().to_string(), binding),
+                None => self.visit_expr(&node.left),
+            },
+            left => {
+                if binding == Binding::Outcome {
+                    self.record(SiteKind::Forwarded);
+                }
+                self.visit_expr(left);
+            }
+        }
+    }
+
+    fn visit_expr_break(&mut self, node: &'ast ExprBreak) {
+        if node
+            .expr
+            .as_ref()
+            .is_some_and(|expr| self.binding_of(expr) == Binding::Outcome)
+        {
+            self.record(SiteKind::Forwarded);
+        }
+        visit::visit_expr_break(self, node);
+    }
+
     fn visit_expr_return(&mut self, node: &'ast ExprReturn) {
         if node
             .expr
@@ -1194,12 +1277,13 @@ fn scan_all(sources: &[(String, String)]) -> Vec<(String, Vec<(String, SiteKind)
     for (_, file) in &files {
         handlers.visit_file(file);
     }
+    let proven = handlers.proven();
     files
         .iter()
         .map(|(name, file)| {
             let mut aliases = Aliases::default();
             aliases.visit_file(file);
-            let mut scan = Scan::new(&handlers.names, aliases.names);
+            let mut scan = Scan::new(&proven, aliases.names);
             scan.visit_file(file);
             (name.clone(), scan.sites)
         })
@@ -1418,6 +1502,8 @@ fn a() -> serde_json::Result<V> { load() }
 #[test]
 fn admitted_shapes_are_not_sites() {
     let src = r#"
+fn json_failure(_: &serde_json::Error) -> IpeError { IpeError::opaque() }
+fn json_failure_text(_: &serde_json::Error, _: JsonSource) -> String { String::new() }
 fn a(s: &str) -> IpeError {
     match serde_json::from_str::<V>(s) { Ok(_) => ok(), Err(e) => json_failure(&e) }
 }
@@ -1462,6 +1548,67 @@ mod tests {
 }
 "#;
     assert_eq!(scan(src), BTreeMap::new());
+}
+
+// An outcome is carried through every value that holds it whole: an array, a
+// tuple field, an index, a deref, an async block, an assignment, or a `break`
+// out of a loop.
+#[test]
+fn an_outcome_carried_by_a_container_or_assignment_is_a_site() {
+    let src = r#"
+fn a(s: &str) -> String { let v = [serde_json::from_str::<u8>(s)]; match v.into_iter().next() { Some(Err(e)) => e.to_string(), _ => String::new() } }
+fn b(s: &str) -> String { let mut r = Ok(0); if s.is_empty() { r = serde_json::from_str::<u8>(s); } match r { Err(e) => e.to_string(), _ => String::new() } }
+fn c(s: &str) -> String { let p = (serde_json::from_str::<u8>(s), 0); match p.0 { Err(e) => e.to_string(), _ => String::new() } }
+fn d(s: &str) -> String { match async { serde_json::from_str::<u8>(s) }.now() { Err(e) => e.to_string(), _ => String::new() } }
+fn e(s: &str) -> String { let v = [serde_json::from_str::<u8>(s)]; match &v[0] { Err(e) => e.to_string(), _ => String::new() } }
+fn f(s: &str) -> String { let r = &serde_json::from_str::<u8>(s); match *r { Err(e) => e.to_string(), _ => String::new() } }
+fn g(s: &str) -> u8 { let r = loop { break serde_json::from_str::<u8>(s); }; r.unwrap_or(0) }
+fn h(s: &str, out: &mut Holder) { out.r = serde_json::from_str::<u8>(s); }
+"#;
+    let expected: BTreeMap<(String, SiteKind), usize> = [
+        (("a".to_owned(), SiteKind::Rendered), 1),
+        (("b".to_owned(), SiteKind::Rendered), 1),
+        (("c".to_owned(), SiteKind::Rendered), 1),
+        (("d".to_owned(), SiteKind::Rendered), 1),
+        (("e".to_owned(), SiteKind::Rendered), 1),
+        (("f".to_owned(), SiteKind::Rendered), 1),
+        (("g".to_owned(), SiteKind::Forwarded), 1),
+        (("h".to_owned(), SiteKind::Forwarded), 1),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(scan(src), expected);
+}
+
+// A call is matched by name, so a name only proves a renderer when every
+// function carrying it takes the error and no local binding shadows it.
+#[test]
+fn a_renderer_name_that_proves_nothing_is_a_site() {
+    let renderer = "fn json_failure_text(_: &serde_json::Error, _: u8) -> String { String::new() }";
+    let shared = format!(
+        r#"{renderer}
+mod other {{ pub fn json_failure_text(e: &dyn std::fmt::Display, _: u8) -> String {{ format!("{{e}}") }} }}
+fn a(s: &str) -> String {{
+    match serde_json::from_str::<u8>(s) {{ Err(e) => other::json_failure_text(&e, 0), _ => String::new() }}
+}}"#
+    );
+    let shadowed = format!(
+        r#"{renderer}
+fn b(s: &str) -> String {{
+    let json_failure_text = |e: &dyn std::fmt::Display, _: u8| e.to_string();
+    match serde_json::from_str::<u8>(s) {{ Err(e) => json_failure_text(&e, 0), _ => String::new() }}
+}}
+fn c(s: &str) -> String {{
+    match serde_json::from_str::<u8>(s) {{ Err(e) => json_failure_text(&e, 0), _ => String::new() }}
+}}"#
+    );
+    let site = |function: &str| -> BTreeMap<(String, SiteKind), usize> {
+        [((function.to_owned(), SiteKind::Rendered), 1)]
+            .into_iter()
+            .collect()
+    };
+    assert_eq!(scan(&shared), site("a"));
+    assert_eq!(scan(&shadowed), site("b"));
 }
 
 #[test]
@@ -1509,11 +1656,11 @@ fn a_source_that_does_not_parse_fails_the_scan() {
 // The scan over the whole runtime source tree.
 // ---------------------------------------------------------------------------
 
-/// The runtime sources except the renderer, after checking the walk read the
-/// files the ledger names and the renderer still defines its functions.
+/// The runtime sources, the renderer included, after checking the walk read
+/// the files the ledger names and the renderer still defines its functions.
 fn runtime_sources() -> Vec<(String, String)> {
     let root = e2e_support::manifest_dir!().join("src");
-    let mut found = rust_sources(&root);
+    let found = rust_sources(&root);
     for required in [
         RENDERER,
         "js_port.rs",
@@ -1535,7 +1682,6 @@ fn runtime_sources() -> Vec<(String, String)> {
             "{RENDERER} no longer defines `{function}`"
         );
     }
-    found.retain(|(name, _)| name != RENDERER);
     found
 }
 
@@ -1555,6 +1701,26 @@ fn a_planted_echo_in_the_runtime_tree_is_refused() {
     assert!(!baseline.contains(&refusal));
     assert!(planted.contains(&refusal));
     assert_eq!(planted.len(), baseline.len().saturating_add(1));
+}
+
+#[test]
+fn a_planted_echo_in_the_renderer_file_is_refused() {
+    let mut tree = runtime_sources();
+    let baseline = site_violations(&tree, ADMITTED_SITES);
+    let planted = tree.iter_mut().find(|(name, _)| name == RENDERER);
+    assert!(planted.is_some(), "the source walk did not read {RENDERER}");
+    if let Some((_, src)) = planted {
+        src.push_str(
+            r#"
+pub fn leak(s: &str) -> String {
+    match serde_json::from_str::<u8>(s) { Ok(_) => String::new(), Err(e) => format!("{e}") }
+}"#,
+        );
+    }
+    let refused = site_violations(&tree, ADMITTED_SITES);
+    let refusal = format!("{RENDERER}: leak: Rendered unlisted (1)");
+    assert!(!baseline.contains(&refusal));
+    assert!(refused.contains(&refusal), "{refused:#?}");
 }
 
 #[test]
