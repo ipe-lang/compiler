@@ -1,30 +1,38 @@
 //! Rename: `textDocument/rename` and `textDocument/prepareRename`.
 //!
-//! Reference collection and capture-avoidance are delegated to
-//! [`ipe_canon::rename`], which operates on the `ReferenceIndex` built from
-//! the fully resolved module graph.  This module owns the LSP boundary:
-//! converting positions to byte offsets, building the `WorkspaceEdit`, and
-//! injecting the URI/text callbacks from the server layer.
+//! The renamed name is whatever the resolver recorded at the cursor: a
+//! top-level declaration or constructor (renamed across every project module
+//! through [`ipe_canon::rename`]) or a local binder (renamed within its scope
+//! only, by binder identity). This module owns the LSP boundary: positions,
+//! the `WorkspaceEdit`, and the URI/text callbacks from the server layer.
 //!
-//! Scope: top-level bindings only.  Rename returns `None` (refuse) when the
-//! position is not on a top-level reference or definition, when the new name
-//! is invalid, or when the canon layer detects a capture conflict.
+//! Every edit replaces exactly one token spelling the old name. The rename is
+//! refused (`None`) — never applied partially — when an occurrence's token
+//! cannot be isolated, when a touched module does not canonicalise or lex,
+//! when the new name could capture or be captured, when a site is a record
+//! pattern's field label, or when a string interpolation may mention either
+//! spelling (the resolver records no occurrence inside one).
 //!
 //! The `new_name` string from the LSP client is untrusted: [`ValidatedIdentifier`]
 //! is the parse-don't-validate boundary; only the validated form reaches the
 //! edit builder.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use ipe_canon::name_index::NameIndex;
 use ipe_canon::ref_index::ReferenceIndex;
-use ipe_canon::rename::{EditSet, RenameError, rename as canon_rename};
-use ipe_db::{Db as _, IpeDatabase, SourceRoot};
-use ipe_diagnostics::Span;
-use ipe_intern::Symbol;
+use ipe_canon::rename::rename as canon_rename;
+use ipe_db::{CanonicalModule, Db as _, IpeDatabase, ModuleOrigin, SourceRoot};
+use ipe_diagnostics::{Span, TokenKind};
+use ipe_intern::{Interner, Symbol};
+use ipe_parse::{SourceToken, TokenClass};
 use ipe_syntax::{Exposed, Exposing};
 use lsp_types::{TextEdit, Url, WorkspaceEdit};
 
-use crate::navigation::goto_definition;
+use crate::navigation::{
+    NameRef, NameTarget, goto_definition, name_token, occurrences, resolve_name_at, span_text,
+};
 use crate::offset::{PositionEncoding, span_to_range};
 use crate::workspace_edit::workspace_edit;
 
@@ -111,8 +119,9 @@ pub struct PrepareRename {
 
 /// Validate that the position is renameable and return the current name.
 ///
-/// Returns `None` when the position is not on a top-level reference or
-/// definition — the client should show no rename UI in that case.
+/// Returns `None` when the position resolves to nothing, when the token under
+/// the cursor is not exactly the name, or when the name is declared outside
+/// the user's project — the client should show no rename UI in that case.
 #[must_use]
 pub fn prepare_rename(
     db: &IpeDatabase,
@@ -123,13 +132,24 @@ pub fn prepare_rename(
 ) -> Option<PrepareRename> {
     // The same "resolve the name under this position" query used by
     // goto-definition and find-references, so all three agree about whether a
-    // position — use site or declaration name token — is resolvable. The token
-    // span it returns is exactly the range the client pre-fills.
-    let resolved = crate::navigation::resolve_name_at(db, root, entry, module, byte)?;
-    Some(PrepareRename {
-        name: resolved.name,
+    // position — use site, binder or declaration name token — is resolvable.
+    let resolved = resolve_name_at(db, root, entry, module, byte)?;
+    let files = root.files(db);
+    let text = files.get(module)?.text(db);
+    let name = resolved.target.name();
+    let renameable = span_text(text, resolved.span)? == name
+        && is_user_module(db, root, resolved.target.module());
+    renameable.then(|| PrepareRename {
+        name: name.to_owned(),
         span: resolved.span,
     })
+}
+
+/// Whether `module` is a project module the user wrote.
+fn is_user_module(db: &IpeDatabase, root: SourceRoot, module: &[String]) -> bool {
+    root.files(db)
+        .get(module)
+        .is_some_and(|file| file.origin(db) == ModuleOrigin::User)
 }
 
 /// Supplies URI and text for a module path, forwarded from the server layer
@@ -164,13 +184,13 @@ pub struct RenameRequest<'a> {
     pub document_changes_supported: bool,
 }
 
-/// Apply a rename across all references to the top-level identifier at
-/// `req.byte` in `module`. Returns the `WorkspaceEdit` the client should
-/// apply, or `None` when the position is not renameable.
+/// Apply a rename to the name at `req.byte` in `module`.
 ///
-/// Reference collection and capture-avoidance are handled by
-/// [`ipe_canon::rename::rename`] operating on a [`ReferenceIndex`] built
-/// from the fully resolved module graph.
+/// Returns the `WorkspaceEdit` the client should apply, or `None` when the
+/// position is not renameable or the rename cannot be proven safe. Every edit
+/// replaces exactly one token spelling the old name; an occurrence whose
+/// token cannot be isolated refuses the whole rename rather than rewrite more
+/// text than the name.
 ///
 /// `resolver` supplies URI and text callbacks; they are injected by the server
 /// because URI construction requires filesystem paths the features crate never
@@ -184,110 +204,63 @@ pub fn rename(
     req: &RenameRequest<'_>,
     resolver: &ModuleResolver<'_>,
 ) -> Option<WorkspaceEdit> {
-    // Resolve the definition of whatever is at `req.byte`.
     let def = goto_definition(db, root, entry, module, req.byte)?;
-    let def_module = &def.module;
-
-    // Recover the current name from the definition span.
-    let def_text = (resolver.text_of_module)(def_module)?;
-    let lo = def_span_lo_usize(def.span)?;
-    let hi = def_span_hi_usize(def.span)?;
-    let current_name = def_text.get(lo..hi)?;
-
-    // Pre-validate at the LSP boundary (typed parse-don't-validate gate).
-    let kind = symbol_kind_of(current_name);
-    ValidatedIdentifier::parse(req.new_name, kind)?;
-
-    // Build the ReferenceIndex from the full resolved module graph.
-    // `topo_order` proves the import graph is acyclic; `canonicalize_checked`
-    // repeats the guard per file so the raw `ipe_db::canonicalize` path is
-    // never taken on the interactive handler path.
-    let Ok(order) = ipe_db::topo_order(db, root, entry) else {
+    if !is_user_module(db, root, &def.module) {
         return None;
-    };
-    let files = root.files(db);
-
-    // Collect canonical modules for every file in topo order.
-    // We keep them alive in a Vec so the &Module references remain valid.
-    let mut canon_modules: Vec<(ipe_canon::ast::Module, Vec<Symbol>)> = Vec::new();
-    for module_path in order.iter() {
-        let Some(&module_file) = files.get(module_path) else {
-            continue;
-        };
-        let Some(canonical) = crate::db_access::canonicalize_checked(db, root, entry, module_file)
-        else {
-            continue;
-        };
-        // Convert the String module path to a Symbol path.
-        let sym_path: Option<Vec<Symbol>> = {
-            let mut interner = db.interner().lock();
-            module_path
-                .iter()
-                .map(|s| interner.intern(s).ok())
-                .collect::<Option<Vec<_>>>()
-        };
-        if let Some(sym_path) = sym_path {
-            canon_modules.push((canonical.module.clone(), sym_path));
-        }
     }
+    let files = root.files(db);
+    let old_name = def.target.name();
+    if span_text(files.get(&def.module)?.text(db), def.span)? != old_name {
+        return None;
+    }
+    // Parse-don't-validate gate on the untrusted client string.
+    let new_name = ValidatedIdentifier::parse(req.new_name, symbol_kind_of(old_name))?;
+    let new_name = new_name.as_str();
 
-    // Resolve the defining module path and old_name to symbols.
-    let (def_module_syms, old_name_sym) = {
-        let mut interner = db.interner().lock();
-        let def_syms: Option<Vec<Symbol>> = def_module
-            .iter()
-            .map(|s| interner.intern(s).ok())
-            .collect::<Option<Vec<_>>>();
-        let name_sym = interner.intern(current_name).ok();
-        drop(interner);
-        match (def_syms, name_sym) {
-            (Some(d), Some(n)) => (d, n),
-            _ => return None,
+    let (recorded, scanned): (Vec<NameRef>, Vec<Vec<String>>) = match &def.target {
+        NameTarget::Local { .. } => {
+            let mut sites = vec![NameRef {
+                module: def.module.clone(),
+                span: def.span,
+            }];
+            sites.extend(occurrences(db, root, entry, &def.target));
+            (sites, vec![def.module.clone()])
+        }
+        NameTarget::Declared { .. } => {
+            let mut sites = declared_sites(db, root, entry, &def.module, old_name, new_name)?;
+            sites.extend(signature_sites(db, root, &def.module, old_name)?);
+            let user_modules = files
+                .iter()
+                .filter(|(_, file)| file.origin(db) == ModuleOrigin::User)
+                .map(|(path, _)| path.clone())
+                .collect();
+            (sites, user_modules)
         }
     };
+    let sites = narrowed_sites(db, root, recorded, old_name)?;
+    refuse_capture(db, root, entry, &sites, new_name)?;
+    refuse_interpolation(db, root, &scanned, old_name, new_name)?;
 
-    // Build the reference index.
-    let module_slice: Vec<(&ipe_canon::ast::Module, &[Symbol])> = canon_modules
-        .iter()
-        .map(|(m, p)| (m, p.as_slice()))
-        .collect();
-    let index = ReferenceIndex::build(&module_slice);
-
-    // Delegate to the canon rename engine.
-    let interner = db.interner().lock();
-    let edit_set: EditSet = match canon_rename(
-        &interner,
-        &index,
-        &module_slice,
-        &def_module_syms,
-        old_name_sym,
-        req.new_name,
-    ) {
-        Ok(es) => es,
-        Err(
-            RenameError::InvalidIdentifier { .. }
-            | RenameError::SymbolNotFound { .. }
-            | RenameError::CaptureConflict { .. },
-        ) => {
-            return None;
-        }
-    };
-    drop(interner);
-
-    // Build the WorkspaceEdit from the canon edits, then patch in any
-    // `exposing (Name)` header and `import M exposing (Name)` sites that the
-    // canon engine does not reach (it only visits body-expression spans).
-    let mut edits_by_uri = edit_set_to_edits_by_uri(db, &edit_set, resolver, req.encoding)?;
-    patch_exposing_headers(
-        db,
-        root,
-        &def_module_syms,
-        old_name_sym,
-        req.new_name,
-        resolver,
-        req.encoding,
-        &mut edits_by_uri,
-    );
+    let mut edits_by_uri = edits_by_uri(&sites, new_name, resolver, req.encoding)?;
+    if matches!(def.target, NameTarget::Declared { .. }) {
+        let (def_module_syms, old_name_sym) = {
+            let mut interner = db.interner().lock();
+            let module_syms = intern_path(&mut interner, &def.module);
+            let name_sym = interner.intern(old_name).ok();
+            drop(interner);
+            (module_syms?, name_sym?)
+        };
+        patch_exposing_headers(
+            db,
+            root,
+            &def_module_syms,
+            old_name_sym,
+            new_name,
+            resolver,
+            req.encoding,
+            &mut edits_by_uri,
+        );
+    }
     Some(workspace_edit(
         edits_by_uri,
         req.document_changes_supported,
@@ -295,51 +268,307 @@ pub fn rename(
     ))
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Edit sites ────────────────────────────────────────────────────────────────
 
-/// Group a canon [`EditSet`] into edits keyed by document URI.
+/// A module path in symbol form, or `None` when a segment cannot be interned.
+fn intern_path(interner: &mut Interner, path: &[String]) -> Option<Vec<Symbol>> {
+    path.iter()
+        .map(|segment| interner.intern(segment).ok())
+        .collect()
+}
+
+/// The canonical module and symbol path of one project module.
+type CanonEntry = (Arc<CanonicalModule>, Vec<Symbol>);
+
+/// The definition and every recorded use of the declaration `(home, old_name)`,
+/// from the canon rename engine over every project module's name index.
 ///
-/// Each edit's symbol module path is resolved back to a string path for the
-/// resolver's URI and text callbacks; an edit whose path, URI, or text cannot be
-/// resolved is skipped. Returns `None` when no edit survives resolution.
-fn edit_set_to_edits_by_uri(
+/// Refuses (`None`) when any project module does not canonicalise — its uses
+/// would be missed — or when the engine reports a capture conflict.
+fn declared_sites(
     db: &IpeDatabase,
-    edit_set: &EditSet,
+    root: SourceRoot,
+    entry: ipe_db::SourceFile,
+    home: &[String],
+    old_name: &str,
+    new_name: &str,
+) -> Option<Vec<NameRef>> {
+    let Ok(order) = ipe_db::topo_order(db, root, entry) else {
+        return None;
+    };
+    let files = root.files(db);
+    let mut canon: Vec<CanonEntry> = Vec::new();
+    for module_path in order.iter() {
+        let Some(&module_file) = files.get(module_path) else {
+            continue;
+        };
+        let canonical = crate::db_access::canonicalize_checked(db, root, entry, module_file)?;
+        let mut interner = db.interner().lock();
+        let path = intern_path(&mut interner, module_path);
+        drop(interner);
+        canon.push((canonical, path?));
+    }
+    let (home_syms, old_sym) = {
+        let mut interner = db.interner().lock();
+        let home_syms = intern_path(&mut interner, home);
+        let old_sym = interner.intern(old_name).ok();
+        drop(interner);
+        (home_syms?, old_sym?)
+    };
+    let modules: Vec<(&ipe_canon::ast::Module, &[Symbol])> = canon
+        .iter()
+        .map(|(canonical, path)| (&canonical.module, path.as_slice()))
+        .collect();
+    let indexes: Vec<(&NameIndex, &[Symbol])> = canon
+        .iter()
+        .map(|(canonical, path)| (&canonical.names, path.as_slice()))
+        .collect();
+    let index = ReferenceIndex::from_name_indexes(&indexes);
+    let interner = db.interner().lock();
+    let edits = canon_rename(&interner, &index, &modules, &home_syms, old_sym, new_name)
+        .ok()
+        .and_then(|edit_set| {
+            edit_set
+                .edits
+                .iter()
+                .map(|edit| {
+                    let module = edit
+                        .file
+                        .iter()
+                        .map(|&sym| interner.resolve(sym).map(str::to_owned))
+                        .collect::<Option<Vec<_>>>()?;
+                    Some(NameRef {
+                        module,
+                        span: edit.span,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()
+        });
+    drop(interner);
+    edits
+}
+
+/// The name token of the `old_name : T` signature of a top-level value in
+/// `module`, when it has one.
+///
+/// Refuses (`None`) when the value is annotated but the signature's name token
+/// cannot be located: renaming the definition alone would orphan the signature.
+fn signature_sites(
+    db: &IpeDatabase,
+    root: SourceRoot,
+    module: &[String],
+    old_name: &str,
+) -> Option<Vec<NameRef>> {
+    let files = root.files(db);
+    let &file = files.get(module)?;
+    let Ok(parsed) = ipe_db::parse(db, file) else {
+        return None;
+    };
+    let interner = db.interner().lock();
+    let annotation_lo = parsed
+        .values
+        .iter()
+        .find(|value| interner.resolve(value.value.name.value) == Some(old_name))
+        .and_then(|value| value.value.type_annotation.as_ref())
+        .map(|annotation| annotation.span.lo);
+    drop(interner);
+    let Some(annotation_lo) = annotation_lo else {
+        return Some(Vec::new());
+    };
+    let text = file.text(db);
+    let tokens = ipe_parse::try_source_tokens(text)?;
+    let colon_at = tokens.iter().rposition(|token| {
+        token.span.hi <= annotation_lo && token.class == TokenClass::Code(TokenKind::Colon)
+    })?;
+    let after_colon = tokens.get(colon_at.checked_add(1)?)?;
+    let name = tokens.get(colon_at.checked_sub(1)?)?;
+    let located = after_colon.span.lo == annotation_lo
+        && name.class == TokenClass::Code(TokenKind::Ident)
+        && span_text(text, name.span)? == old_name;
+    located.then(|| {
+        vec![NameRef {
+            module: module.to_vec(),
+            span: name.span,
+        }]
+    })
+}
+
+/// Every site narrowed to its `old_name` token, deduplicated.
+///
+/// Refuses (`None`) when any site's token cannot be isolated — a rewrite there
+/// would replace more text than the name.
+fn narrowed_sites(
+    db: &IpeDatabase,
+    root: SourceRoot,
+    recorded: Vec<NameRef>,
+    old_name: &str,
+) -> Option<Vec<NameRef>> {
+    let files = root.files(db);
+    let mut sites = recorded
+        .into_iter()
+        .map(|site| {
+            let text = files.get(&site.module)?.text(db);
+            let span = name_token(text, site.span, old_name)?;
+            Some(NameRef {
+                module: site.module,
+                span,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    sites.sort_by(|a, b| (&a.module, a.span.lo, a.span.hi).cmp(&(&b.module, b.span.lo, b.span.hi)));
+    sites.dedup();
+    Some(sites)
+}
+
+/// Refuse (`None`) when the new name could change what an occurrence in a
+/// touched module resolves to, or a site is a record-pattern field label.
+///
+/// Any recorded occurrence in a touched module already spelled `new_name` (a
+/// local binder, an import, a top-level value) could capture or be captured
+/// by the renamed sites. A record-pattern field (`{ size }`) names both the
+/// binder and the field, so renaming it would change the field it matches.
+fn refuse_capture(
+    db: &IpeDatabase,
+    root: SourceRoot,
+    entry: ipe_db::SourceFile,
+    sites: &[NameRef],
+    new_name: &str,
+) -> Option<()> {
+    let files = root.files(db);
+    let mut touched: Vec<&[String]> = sites.iter().map(|site| site.module.as_slice()).collect();
+    touched.dedup();
+    for module in touched {
+        let &file = files.get(module)?;
+        let text = file.text(db);
+        let canonical = crate::db_access::canonicalize_checked(db, root, entry, file)?;
+        if canonical
+            .names
+            .entries()
+            .any(|(span, _)| name_token(text, span, new_name).is_some())
+        {
+            return None;
+        }
+        let labels = record_pattern_labels(&ipe_parse::try_source_tokens(text)?);
+        let on_label = sites.iter().any(|site| {
+            site.module.as_slice() == module
+                && labels
+                    .iter()
+                    .any(|label| label.lo <= site.span.lo && site.span.hi <= label.hi)
+        });
+        if on_label {
+            return None;
+        }
+    }
+    Some(())
+}
+
+/// The spans of identifier tokens standing as a record-pattern field label:
+/// directly inside `{ }`, between `{`/`,` and `,`/`}`.
+fn record_pattern_labels(tokens: &[SourceToken]) -> Vec<Span> {
+    let code = |at: Option<usize>| match at.and_then(|i| tokens.get(i)).map(|t| t.class) {
+        Some(TokenClass::Code(kind)) => Some(kind),
+        Some(TokenClass::DocComment) | None => None,
+    };
+    let mut open: Vec<TokenKind> = Vec::new();
+    let mut labels = Vec::new();
+    for (at, token) in tokens.iter().enumerate() {
+        let TokenClass::Code(kind) = token.class else {
+            continue;
+        };
+        match kind {
+            TokenKind::LParen | TokenKind::LBrace | TokenKind::LBracket => open.push(kind),
+            TokenKind::RParen | TokenKind::RBrace | TokenKind::RBracket => {
+                open.pop();
+            }
+            TokenKind::Ident => {
+                let in_braces = open.last() == Some(&TokenKind::LBrace);
+                let after = matches!(
+                    code(at.checked_sub(1)),
+                    Some(TokenKind::LBrace | TokenKind::Comma)
+                );
+                let before = matches!(
+                    code(at.checked_add(1)),
+                    Some(TokenKind::RBrace | TokenKind::Comma)
+                );
+                if in_braces && after && before {
+                    labels.push(token.span);
+                }
+            }
+            _ => {}
+        }
+    }
+    labels
+}
+
+/// Refuse (`None`) when a string literal in `modules` may interpolate the old
+/// or the new name.
+///
+/// The resolver records no occurrence inside an interpolation, so a rename
+/// cannot rewrite one; a `{{ … }}` string mentioning either spelling as a word
+/// would silently keep the old name or start naming the renamed value.
+fn refuse_interpolation(
+    db: &IpeDatabase,
+    root: SourceRoot,
+    modules: &[Vec<String>],
+    old_name: &str,
+    new_name: &str,
+) -> Option<()> {
+    let files = root.files(db);
+    for module in modules {
+        let text = files.get(module)?.text(db);
+        let tokens = ipe_parse::try_source_tokens(text)?;
+        let interpolates = tokens
+            .iter()
+            .filter(|token| token.class == TokenClass::Code(TokenKind::Str))
+            .filter_map(|token| span_text(text, token.span))
+            .any(|literal| {
+                literal.contains("{{")
+                    && (has_word(literal, old_name) || has_word(literal, new_name))
+            });
+        if interpolates {
+            return None;
+        }
+    }
+    Some(())
+}
+
+/// Whether `word` occurs in `hay` with no identifier character on either side.
+fn has_word(hay: &str, word: &str) -> bool {
+    hay.match_indices(word).any(|(at, _)| {
+        let before = hay.get(..at).and_then(|s| s.chars().next_back());
+        let after = at
+            .checked_add(word.len())
+            .and_then(|end| hay.get(end..))
+            .and_then(|s| s.chars().next());
+        !before.is_some_and(ipe_parse::is_ident_continue)
+            && !after.is_some_and(ipe_parse::is_ident_continue)
+    })
+}
+
+/// Group the sites into `new_name` edits keyed by document URI.
+///
+/// Refuses (`None`) when a touched module has no URI or text: dropping its
+/// edits would leave a partial rename.
+fn edits_by_uri(
+    sites: &[NameRef],
+    new_name: &str,
     resolver: &ModuleResolver<'_>,
     encoding: PositionEncoding,
 ) -> Option<BTreeMap<Url, Vec<TextEdit>>> {
     let mut edits_by_uri: BTreeMap<Url, Vec<TextEdit>> = BTreeMap::new();
-
-    for edit in &edit_set.edits {
-        let string_path: Option<Vec<String>> = {
-            let interner = db.interner().lock();
-            edit.file
-                .iter()
-                .map(|&s| interner.resolve(s).map(str::to_owned))
-                .collect::<Option<Vec<_>>>()
-        };
-        let Some(string_path) = string_path else {
-            continue;
-        };
-        let Some(uri) = (resolver.uri_of_module)(&string_path) else {
-            continue;
-        };
-        let Some(text) = (resolver.text_of_module)(&string_path) else {
-            continue;
-        };
-        let range = span_to_range(&text, edit.span, encoding);
+    for site in sites {
+        let uri = (resolver.uri_of_module)(&site.module)?;
+        let text = (resolver.text_of_module)(&site.module)?;
+        let range = span_to_range(&text, site.span, encoding);
         edits_by_uri.entry(uri).or_default().push(TextEdit {
             range,
-            new_text: edit.replacement.clone(),
+            new_text: new_name.to_owned(),
         });
     }
-
-    if edits_by_uri.is_empty() {
-        return None;
-    }
-
-    Some(edits_by_uri)
+    (!edits_by_uri.is_empty()).then_some(edits_by_uri)
 }
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Patch `exposing (Name)` in the defining module's header and every
 /// `import DefModule exposing (Name)` in consumer modules.
@@ -481,14 +710,6 @@ fn exposed_name_edit(
 /// edits for that URI. Creates the entry when absent.
 fn add_edit(edits_by_uri: &mut BTreeMap<Url, Vec<TextEdit>>, uri: Url, edit: TextEdit) {
     edits_by_uri.entry(uri).or_default().push(edit);
-}
-
-fn def_span_lo_usize(span: Span) -> Option<usize> {
-    usize::try_from(span.lo).ok()
-}
-
-fn def_span_hi_usize(span: Span) -> Option<usize> {
-    usize::try_from(span.hi).ok()
 }
 
 #[cfg(test)]
@@ -877,5 +1098,189 @@ mod tests {
             matches!(&ws_edit.changes, Some(m) if !m.is_empty()),
             "{ws_edit:?}"
         );
+    }
+
+    // ── Token-exact edits and fail-closed refusals ───────────────────────────
+
+    /// One module of a rename scenario: its single-segment name, text, origin.
+    type Source<'a> = (&'a str, &'a str, ModuleOrigin);
+
+    /// The texts after applying `edits` to `text` (ranges in UTF-8 units).
+    fn apply(text: &str, edits: &[lsp_types::TextEdit]) -> String {
+        let mut spans: Vec<(usize, usize, &str)> = edits
+            .iter()
+            .map(|edit| {
+                (
+                    crate::offset::position_to_offset(
+                        text,
+                        edit.range.start,
+                        PositionEncoding::Utf8,
+                    ),
+                    crate::offset::position_to_offset(text, edit.range.end, PositionEncoding::Utf8),
+                    edit.new_text.as_str(),
+                )
+            })
+            .collect();
+        spans.sort_by_key(|&(lo, _, _)| std::cmp::Reverse(lo));
+        let mut out = text.to_owned();
+        for (lo, hi, new_text) in spans {
+            out.replace_range(lo..hi, new_text);
+        }
+        out
+    }
+
+    /// Rename the `nth` occurrence of `needle` in module `at` to `new_name`,
+    /// returning every module's text after the edit, or `None` when refused.
+    fn rename_texts(
+        sources: &[Source<'_>],
+        at: &str,
+        needle: &str,
+        nth: usize,
+        new_name: &str,
+    ) -> Option<std::collections::BTreeMap<String, String>> {
+        let db = IpeDatabase::new();
+        let files: Vec<(Vec<String>, SourceFile)> = sources
+            .iter()
+            .map(|&(name, text, origin)| {
+                let path = vec![name.to_owned()];
+                let source = SourceFile::new(&db, path.clone(), text.to_owned(), origin);
+                (path, source)
+            })
+            .collect();
+        let root = SourceRoot::new(&db, files.iter().cloned().collect());
+        let entry = files
+            .iter()
+            .find(|(path, _)| path.first().map(String::as_str) == Some(at))?
+            .1;
+        let at_text = sources.iter().find(|s| s.0 == at)?.1;
+        let byte = at_text.match_indices(needle).nth(nth)?.0;
+        let text_of = |module: &[String]| {
+            sources
+                .iter()
+                .find(|s| module.first().map(String::as_str) == Some(s.0))
+                .map(|s| s.1.to_owned())
+        };
+        let edit = rename(
+            &db,
+            root,
+            entry,
+            &[at.to_owned()],
+            &super::RenameRequest {
+                byte: u32::try_from(byte).ok()?,
+                new_name,
+                encoding: PositionEncoding::Utf8,
+                document_changes_supported: false,
+            },
+            &super::ModuleResolver {
+                uri_of_module: &make_uri,
+                text_of_module: &text_of,
+                version_of: &no_version,
+            },
+        )?;
+        let changes = edit.changes?;
+        Some(
+            sources
+                .iter()
+                .map(|&(name, text, _)| {
+                    let uri = make_uri(&[name.to_owned()]);
+                    let edits = uri
+                        .and_then(|u| changes.get(&u).cloned())
+                        .unwrap_or_default();
+                    (name.to_owned(), apply(text, &edits))
+                })
+                .collect(),
+        )
+    }
+
+    const LOCALS: &str = "module Main exposing (main)\n\nbump : Int -> Int\nbump n =\n    n + 1\n\ntwice : Int -> Int\ntwice n =\n    n * 2\n\nmain : Int\nmain = twice (bump 1)\n";
+
+    #[test]
+    fn a_local_rename_edits_only_its_own_scope() {
+        let user = ModuleOrigin::User;
+        let texts = rename_texts(&[("Main", LOCALS, user)], "Main", "n + 1", 0, "count")
+            .expect("a local rename is applied");
+        assert_eq!(
+            texts.get("Main").map(String::as_str),
+            Some(
+                "module Main exposing (main)\n\nbump : Int -> Int\nbump count =\n    count + 1\n\ntwice : Int -> Int\ntwice n =\n    n * 2\n\nmain : Int\nmain = twice (bump 1)\n"
+            )
+        );
+    }
+
+    #[test]
+    fn a_local_rename_onto_a_name_in_scope_is_refused() {
+        let src = "module Main exposing (main)\n\nadd : Int -> Int -> Int\nadd a b =\n    a + b\n\nmain : Int\nmain = add 1 2\n";
+        let user = ModuleOrigin::User;
+        assert!(rename_texts(&[("Main", src, user)], "Main", "a + b", 0, "b").is_none());
+    }
+
+    #[test]
+    fn a_qualified_use_edits_only_the_member_and_the_signature_follows() {
+        let lib = "module Lib exposing (helper)\n\nhelper : Int\nhelper = 2\n";
+        let main = "module Main exposing (main)\n\nimport Lib\n\nmain : Int\nmain = Lib.helper\n";
+        let user = ModuleOrigin::User;
+        let texts = rename_texts(
+            &[("Lib", lib, user), ("Main", main, user)],
+            "Main",
+            "helper",
+            0,
+            "aid",
+        )
+        .expect("a qualified-use rename is applied");
+        assert_eq!(
+            texts.get("Lib").map(String::as_str),
+            Some("module Lib exposing (aid)\n\naid : Int\naid = 2\n")
+        );
+        assert_eq!(
+            texts.get("Main").map(String::as_str),
+            Some("module Main exposing (main)\n\nimport Lib\n\nmain : Int\nmain = Lib.aid\n")
+        );
+    }
+
+    #[test]
+    fn a_constructor_pattern_edits_only_the_constructor_token() {
+        let src = "module Main exposing (main)\n\ntype Shape = Circle Int | Dot\n\narea : Shape -> Int\narea s =\n    case s of\n        Circle r -> r\n        Dot -> 0\n\nmain : Int\nmain = area (Circle 2)\n";
+        let user = ModuleOrigin::User;
+        let texts = rename_texts(&[("Main", src, user)], "Main", "Circle", 0, "Disc")
+            .expect("a constructor rename is applied");
+        assert_eq!(
+            texts.get("Main").map(String::as_str),
+            Some(
+                "module Main exposing (main)\n\ntype Shape = Disc Int | Dot\n\narea : Shape -> Int\narea s =\n    case s of\n        Disc r -> r\n        Dot -> 0\n\nmain : Int\nmain = area (Disc 2)\n"
+            )
+        );
+    }
+
+    #[test]
+    fn a_name_an_interpolation_mentions_is_refused() {
+        let src = "module Main exposing (main)\n\ngreet : String -> String\ngreet name =\n    \"\"\"hi {{name}}\"\"\"\n\nmain : String\nmain = greet \"x\"\n";
+        let user = ModuleOrigin::User;
+        assert!(rename_texts(&[("Main", src, user)], "Main", "name", 0, "who").is_none());
+    }
+
+    #[test]
+    fn a_record_pattern_field_binder_is_refused() {
+        let src = "module Main exposing (main)\n\nwidth : { w : Int } -> Int\nwidth r =\n    case r of\n        { w } -> w\n\nmain : Int\nmain = width { w = 1 }\n";
+        let user = ModuleOrigin::User;
+        assert!(rename_texts(&[("Main", src, user)], "Main", "w\n\nmain", 0, "x").is_none());
+        assert!(rename_texts(&[("Main", src, user)], "Main", "w }", 0, "x").is_none());
+    }
+
+    #[test]
+    fn a_rename_onto_a_top_level_name_is_refused() {
+        let src = "module Main exposing (main)\n\none : Int\none = 1\n\ntwo : Int\ntwo = 2\n\nmain : Int\nmain = one + two\n";
+        let user = ModuleOrigin::User;
+        assert!(rename_texts(&[("Main", src, user)], "Main", "one + two", 0, "two").is_none());
+    }
+
+    #[test]
+    fn a_name_declared_outside_the_project_is_not_renameable() {
+        let lib = "module Lib exposing (helper)\n\nhelper : Int\nhelper = 2\n";
+        let main = "module Main exposing (main)\n\nimport Lib\n\nmain : Int\nmain = Lib.helper\n";
+        let sources = [
+            ("Lib", lib, ModuleOrigin::EmbeddedStdlib),
+            ("Main", main, ModuleOrigin::User),
+        ];
+        assert!(rename_texts(&sources, "Main", "helper", 0, "aid").is_none());
     }
 }
