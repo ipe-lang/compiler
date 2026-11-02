@@ -1763,7 +1763,7 @@ mod entry_unwind_tests {
         Box::pin(async { foreign_panicked() })
     }
 
-    fn assert_recursion_limit(got: IpeResult<IpeError, i64>) {
+    fn assert_recursion_limit<A>(got: IpeResult<IpeError, A>) {
         assert!(matches!(got, IpeResult::Err(_)), "a trip must end as Err");
         let IpeResult::Err(err) = got else { return };
         assert_eq!(
