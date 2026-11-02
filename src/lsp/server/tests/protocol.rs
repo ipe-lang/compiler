@@ -960,14 +960,16 @@ fn a_stdlib_definition_jumps_to_its_copy_only_while_the_copy_verifies() {
         tuple_copy: Some(copy.clone()),
     });
 
-    let served = definition_of_first(&client, 10);
+    let first_location = definition_of_first(&client, 10);
     let expected_uri = lsp_types::Url::from_file_path(&copy).expect("a file URI");
     assert_eq!(
-        served.get("uri").and_then(serde_json::Value::as_str),
+        first_location
+            .get("uri")
+            .and_then(serde_json::Value::as_str),
         Some(expected_uri.as_str()),
-        "{served}"
+        "{first_location}"
     );
-    let line = served
+    let line = first_location
         .pointer("/range/start/line")
         .and_then(serde_json::Value::as_u64)
         .and_then(|line| usize::try_from(line).ok())
@@ -998,7 +1000,7 @@ fn a_stdlib_definition_jumps_to_its_copy_only_while_the_copy_verifies() {
     assert_eq!(definition_of_first(&client, 14), serde_json::Value::Null);
 
     place_copy(&copy, tuple_source().as_bytes(), true);
-    assert_eq!(definition_of_first(&client, 15), served);
+    assert_eq!(definition_of_first(&client, 15), first_location);
 
     shut_down(&client, server);
     let _ = std::fs::remove_dir_all(&dir);
