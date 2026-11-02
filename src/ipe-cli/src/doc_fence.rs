@@ -438,33 +438,42 @@ impl Open {
         })
     }
 
-    /// The closed fence's block or refusal, or `None` for a fence no verdict
-    /// covers (a non-`ipe` info string).
-    fn finish(self) -> Option<Result<Block, Refusal>> {
+    /// The fence closed on 1-based line `last`: its block or refusal, or
+    /// `None` for a fence no verdict covers (a non-`ipe` info string).
+    fn finish(self, last: usize) -> Option<Spanned> {
         let line = self.line;
         Some(match self.kind? {
-            Ok(kind) => Ok(Block {
-                line,
-                kind,
-                body: self.body.join("\n"),
-            }),
+            Ok(kind) => Ok((
+                Block {
+                    line,
+                    kind,
+                    body: self.body.join("\n"),
+                },
+                last,
+            )),
             Err(error) => Err(Refusal { line, error }),
         })
     }
 }
 
+/// A classified block with the 1-based line it ends on, or its refusal.
+type Spanned = Result<(Block, usize), Refusal>;
+
 /// The indented block starting at `start` with `rows` as its body, the blank
-/// rows that separated it from the next line dropped.
-fn indented_block(start: usize, rows: &[String]) -> Block {
+/// rows that separated it from the next line dropped, with its last line.
+fn indented_block(start: usize, rows: &[String]) -> (Block, usize) {
     let end = rows
         .iter()
         .rposition(|row| !row.is_empty())
         .map_or(0, |last| last.saturating_add(1));
-    Block {
-        line: start,
-        kind: Kind::Indented,
-        body: rows.get(..end).unwrap_or(rows).join("\n"),
-    }
+    (
+        Block {
+            line: start,
+            kind: Kind::Indented,
+            body: rows.get(..end).unwrap_or(rows).join("\n"),
+        },
+        start.saturating_add(end.saturating_sub(1)),
+    )
 }
 
 /// Every fenced `ipe` block, bare fence, or free-standing indented block on
@@ -478,6 +487,58 @@ fn indented_block(start: usize, rows: &[String]) -> Block {
 /// block is always the block `ipe doc` serves.
 #[must_use]
 pub fn scan(text: &str, page: Page) -> Vec<Result<Block, Refusal>> {
+    scan_spans(text, page)
+        .into_iter()
+        .map(|item| item.map(|(block, _)| block))
+        .collect()
+}
+
+/// Rewrite every block [`scan`] reads as [`Kind::Indented`] into a
+/// ```` ``` ````-fenced block, its indent marker stripped.
+///
+/// The served-page renderer (`ipe_docs::markdown::parse`) recognises only
+/// fenced code, so this is how a doc comment's four-space example reaches it
+/// as code. The blocks rewritten are exactly the ones [`scan`] classifies, so
+/// the code a doc page shows and the blocks a checker judges come from one
+/// container rule and one fence reading. Every other line is copied verbatim.
+#[must_use]
+pub fn fence_indented_code(text: &str) -> String {
+    let indented: std::collections::BTreeMap<usize, (usize, String)> = scan_spans(text, Page::Doc)
+        .into_iter()
+        .filter_map(|item| match item {
+            Ok((
+                Block {
+                    line,
+                    kind: Kind::Indented,
+                    body,
+                },
+                last,
+            )) => Some((line, (last, body))),
+            _ => None,
+        })
+        .collect();
+    let mut out = String::new();
+    let mut inside_through = 0usize;
+    for (index, line) in text.lines().enumerate() {
+        let number = index + 1;
+        if number <= inside_through {
+            continue;
+        }
+        if let Some((last, body)) = indented.get(&number) {
+            out.push_str("```\n");
+            out.push_str(body);
+            out.push_str("\n```\n");
+            inside_through = *last;
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// [`scan`]'s blocks, each with the 1-based line it ends on.
+fn scan_spans(text: &str, page: Page) -> Vec<Spanned> {
     let mut items = Vec::new();
     let mut open: Option<Open> = None;
     let mut indented: Option<(usize, Vec<String>)> = None;
@@ -496,7 +557,7 @@ pub fn scan(text: &str, page: Page) -> Vec<Result<Block, Refusal>> {
                 fence.body.push(dedent(line, fence.indent));
                 continue;
             }
-            items.extend(open.take().and_then(Open::finish));
+            items.extend(open.take().and_then(|fence| fence.finish(index + 1)));
             continue;
         }
 
@@ -528,7 +589,8 @@ pub fn scan(text: &str, page: Page) -> Vec<Result<Block, Refusal>> {
             continue;
         }
 
-        if line_indented && !in_container {
+        // A whitespace-only line is blank to the renderer: it opens nothing.
+        if line_indented && !is_blank && !in_container {
             indented = Some((index + 1, vec![strip_indent_marker(line)]));
             continue;
         }
@@ -554,6 +616,34 @@ pub fn scan(text: &str, page: Page) -> Vec<Result<Block, Refusal>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A line of spaces is blank to the renderer, so it opens no code block
+    /// for the checker to judge or the renderer to fence.
+    #[test]
+    fn a_whitespace_only_line_opens_no_indented_block() {
+        let text = "Intro.\n    \nMore.\n";
+        assert_eq!(scan(text, Page::Doc), Vec::new());
+        assert_eq!(fence_indented_code(text), text);
+    }
+
+    /// The renderer fences exactly the indented runs [`scan`] reports, and
+    /// copies every other line verbatim.
+    #[test]
+    fn fence_indented_code_fences_exactly_the_scanned_runs() {
+        let text = "Intro.\n\n    foo 1\n\n    bar 2\n\n- item\n    continued\n";
+        assert_eq!(
+            scan(text, Page::Doc),
+            vec![Ok(Block {
+                line: 3,
+                kind: Kind::Indented,
+                body: "foo 1\n\nbar 2".to_owned(),
+            })]
+        );
+        assert_eq!(
+            fence_indented_code(text),
+            "Intro.\n\n```\nfoo 1\n\nbar 2\n```\n\n- item\n    continued\n"
+        );
+    }
 
     #[test]
     fn unknown_info_string_is_refused() {
