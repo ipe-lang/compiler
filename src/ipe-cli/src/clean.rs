@@ -118,11 +118,12 @@ pub fn run_clean(rest: &[String]) -> Result<(), CliError> {
 /// `root`, a relocated build directory in full.
 ///
 /// # Errors
-/// As [`remove_generated_dir`] and [`remove_cache_target`].
+/// As [`relocated_targets_within`], [`remove_generated_dir`] and
+/// [`remove_cache_target`].
 pub(crate) fn clean_root(root: &Path) -> Result<Vec<String>, CliError> {
     // The relocated directories are keyed by the crate paths, so they are named
     // before `out/` goes.
-    let relocated = relocated_targets(root);
+    let relocated = relocated_targets(root)?;
     let mut removed: Vec<String> = Vec::new();
     for generated in GENERATED_DIRS {
         removed.extend(remove_generated_dir(root, generated)?);
@@ -143,16 +144,33 @@ const RELOCATABLE_CRATES: &[crate::output_dir::OutputArea] = &[
     crate::output_dir::OutputArea::App,
 ];
 
+/// The most release members `clean` reads under `out/release/`.
+///
+/// A release writes one member per declared delivery, so a listing past this
+/// is refused rather than walked without a ceiling.
+pub const MAX_RELEASE_MEMBERS: u32 = 256;
+
+/// How many `release/` levels `clean` reads below `out/`.
+///
+/// A release member root is itself the output root of any build the release
+/// hands it to — a mobile shell's `web client` bundle writes
+/// `release/<shell>/release/web-client/` — and such a build is never a bundle,
+/// so no member nests deeper.
+pub const MAX_RELEASE_NESTING: u32 = 2;
+
 /// The per-user build directories `root`'s emitted crates would be relocated to.
 ///
 /// Empty when no per-user cache base resolves, or when the `$IPE_HOME` pin
 /// cannot be read: without knowing every pin, nothing is named for removal.
-fn relocated_targets(root: &Path) -> Vec<PathBuf> {
+///
+/// # Errors
+/// As [`relocated_targets_within`].
+fn relocated_targets(root: &Path) -> Result<Vec<PathBuf>, CliError> {
     let Ok(cache_base) = crate::resolve::default_cache_base() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let Ok(ipe_home_pin) = crate::health::shared_target_pin() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let env_pin = ipe_env::var_os("CARGO_TARGET_DIR")
         .filter(|value| !value.is_empty())
@@ -161,19 +179,85 @@ fn relocated_targets(root: &Path) -> Vec<PathBuf> {
     relocated_targets_within(root, &cache_base, &pins)
 }
 
+/// The crate directories under `out/` a build may relocate the build directory
+/// of: `out/rust`, `out/app`, and the same two under every release member
+/// `out/release/<slug>/`, and under every member nested in a member root
+/// (`out/release/<slug>/release/<slug>/`), down to [`MAX_RELEASE_NESTING`].
+///
+/// # Errors
+/// As [`release_members_of`].
+fn relocatable_crate_dirs(root: &Path) -> Result<Vec<PathBuf>, CliError> {
+    let out = root.join(crate::output_dir::DEFAULT_OUTPUT_DIR);
+    let mut bases = vec![out.clone()];
+    let mut level = vec![out];
+    for _ in 0..MAX_RELEASE_NESTING {
+        let mut nested = Vec::new();
+        for base in &level {
+            nested.extend(release_members_of(base)?);
+        }
+        bases.extend_from_slice(&nested);
+        level = nested;
+    }
+    Ok(bases
+        .iter()
+        .flat_map(|base| {
+            RELOCATABLE_CRATES
+                .iter()
+                .map(|area| base.join(area.dir_name()))
+        })
+        .collect())
+}
+
+/// The release member roots `base/release/<slug>/`: each directory entry
+/// whose name is a release slug; a link, a file, or any other name is none.
+///
+/// # Errors
+/// [`CliError::DiscoveryLimitReached`] when `base/release/` holds more than
+/// [`MAX_RELEASE_MEMBERS`] entries; [`CliError::OutputRefused`] or
+/// [`CliError::Io`] when it cannot be held or listed.
+fn release_members_of(base: &Path) -> Result<Vec<PathBuf>, CliError> {
+    let release = base.join(crate::output_dir::OutputArea::Release.dir_name());
+    let Some(held) = crate::output_dir::held::HeldDir::open(&release)? else {
+        return Ok(Vec::new());
+    };
+    let cap = ipe_fs_open::EntryCap::from_nonzero(
+        std::num::NonZeroU32::MIN.saturating_add(MAX_RELEASE_MEMBERS.saturating_sub(1)),
+    );
+    Ok(held
+        .list_names(cap)?
+        .into_iter()
+        .filter(|(_, kind)| matches!(kind, ipe_fs_open::FileKind::Dir))
+        .filter_map(|(name, _)| crate::delivery_set::ReleaseSlug::listed(&name))
+        .map(|slug| release.join(slug.as_str()))
+        .collect())
+}
+
 /// The per-user build directories under `cache_base` keyed by `root`'s emitted
 /// crates, leaving out any one a pin in `pins` names.
 ///
 /// A pinned build directory is the user's, so `clean` never names it, even
 /// when it sits where a relocation would.
-fn relocated_targets_within(root: &Path, cache_base: &Path, pins: &[PathBuf]) -> Vec<PathBuf> {
-    RELOCATABLE_CRATES
-        .iter()
-        .map(|area| {
-            let crate_dir = root
-                .join(crate::output_dir::DEFAULT_OUTPUT_DIR)
-                .join(area.dir_name());
-            let target = crate::target_dir::user_cache_target(cache_base, &crate_dir);
+///
+/// Each crate is keyed by its path spelled from the canonical root through the
+/// names `clean` read, never by where a link planted at a crate path points:
+/// such a link names its own path's build directory, never another crate's.
+///
+/// # Errors
+/// [`CliError::Io`] when `root` cannot be canonicalised; as
+/// [`relocatable_crate_dirs`].
+fn relocated_targets_within(
+    root: &Path,
+    cache_base: &Path,
+    pins: &[PathBuf],
+) -> Result<Vec<PathBuf>, CliError> {
+    let root = std::fs::canonicalize(root).map_err(|source| CliError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    Ok(relocatable_crate_dirs(&root)?
+        .into_iter()
+        .map(|crate_dir| {
+            let target = crate::target_dir::user_cache_target_as_spelled(cache_base, &crate_dir);
             (crate_dir, target)
         })
         .filter(|(crate_dir, target)| {
@@ -182,7 +266,7 @@ fn relocated_targets_within(root: &Path, cache_base: &Path, pins: &[PathBuf]) ->
                 .any(|pin| names_same_dir(&crate_dir.join(pin), target))
         })
         .map(|(_, target)| target)
-        .collect()
+        .collect())
 }
 
 /// Whether `pin` and `target` name one directory: spelled alike, or resolving
@@ -617,7 +701,8 @@ mod tests {
         let target = relocated(&root, &base);
         std::fs::create_dir_all(target.join("debug")).expect("make target");
         std::fs::write(target.join(CACHEDIR_TAG), CARGO_CACHEDIR_TAG).expect("tag");
-        let named = relocated_targets_within(&root, &base, &[]);
+        let named =
+            relocated_targets_within(&root, &base, &[]).expect("names the relocated targets");
         assert!(
             named.contains(&target),
             "{named:?} names {}",
@@ -686,6 +771,121 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
+    /// Every release member's emitted crates are named for their relocated
+    /// build directories; an entry that is no member (a file, a name outside
+    /// the slug grammar) is not.
+    #[test]
+    fn clean_names_relocated_targets_of_release_members() {
+        let (scratch, root, base) = relocation_fixture("ipe_clean_reloc_members");
+        let release = root.join("out").join("release");
+        for member in ["web", "web-client", "Not-A-Slug"] {
+            std::fs::create_dir_all(release.join(member)).expect("make member");
+        }
+        std::fs::write(release.join("notes.txt"), b"not a member").expect("file");
+        let named = relocated_targets_within(&root, &base, &[]).expect("names the members");
+        let of = |member: &str, area: &str| {
+            crate::target_dir::user_cache_target(&base, &release.join(member).join(area))
+        };
+        for (member, area) in [
+            ("web", "rust"),
+            ("web", "app"),
+            ("web-client", "rust"),
+            ("web-client", "app"),
+        ] {
+            assert!(
+                named.contains(&of(member, area)),
+                "{member}/{area}: {named:?}"
+            );
+        }
+        assert!(named.contains(&relocated(&root, &base)), "{named:?}");
+        for stray in ["Not-A-Slug", "notes.txt"] {
+            assert!(!named.contains(&of(stray, "rust")), "{stray}: {named:?}");
+        }
+        assert_eq!(named.len(), 6, "{named:?}");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A member nested in a member root — a mobile shell's `web client`
+    /// bundle under `release/<shell>/release/web-client/` — has its emitted
+    /// crates named too; a level past [`MAX_RELEASE_NESTING`] is not read.
+    #[test]
+    fn clean_names_relocated_targets_of_nested_release_members() {
+        let (scratch, root, base) = relocation_fixture("ipe_clean_reloc_nested");
+        let shell = root.join("out").join("release").join("web-client-ios");
+        let nested = shell.join("release").join("web-client");
+        let too_deep = nested.join("release").join("web");
+        std::fs::create_dir_all(&too_deep).expect("make nested members");
+        let named = relocated_targets_within(&root, &base, &[]).expect("names the members");
+        for crate_dir in [shell.join("rust"), nested.join("rust"), nested.join("app")] {
+            let target = crate::target_dir::user_cache_target(&base, &crate_dir);
+            assert!(
+                named.contains(&target),
+                "{}: {named:?}",
+                crate_dir.display()
+            );
+        }
+        let past = crate::target_dir::user_cache_target(&base, &too_deep.join("rust"));
+        assert!(!named.contains(&past), "{named:?}");
+        assert_eq!(named.len(), 6, "{named:?}");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A link planted at a member's crate path names that path's own build
+    /// directory, never the build directory of the crate the link points at.
+    #[cfg(unix)]
+    #[test]
+    fn clean_keys_a_planted_crate_link_by_its_own_path() -> Result<(), std::io::Error> {
+        let (scratch, root, base) = relocation_fixture("ipe_clean_reloc_link");
+        let victim = scratch.join("other").join("out").join("rust");
+        std::fs::create_dir_all(&victim)?;
+        let member = root.join("out").join("release").join("web");
+        std::fs::create_dir_all(&member)?;
+        std::os::unix::fs::symlink(&victim, member.join("rust"))?;
+        let named = relocated_targets_within(&root, &base, &[]).map_err(std::io::Error::other)?;
+        let victims = crate::target_dir::user_cache_target(&base, &victim);
+        assert!(!named.contains(&victims), "{named:?}");
+        let own = crate::target_dir::user_cache_target_as_spelled(&base, &member.join("rust"));
+        assert!(named.contains(&own), "{named:?}");
+        let _ = std::fs::remove_dir_all(&scratch);
+        Ok(())
+    }
+
+    /// The root is canonicalised before any crate is keyed, so a root reached
+    /// through a link names the build directories a build there keys.
+    #[cfg(unix)]
+    #[test]
+    fn clean_keys_crates_from_the_canonical_root() -> Result<(), std::io::Error> {
+        let (scratch, root, base) = relocation_fixture("ipe_clean_reloc_root_link");
+        std::fs::create_dir_all(root.join("out").join("rust"))?;
+        let via = scratch.join("via");
+        std::os::unix::fs::symlink(&root, &via)?;
+        let named = relocated_targets_within(&via, &base, &[]).map_err(std::io::Error::other)?;
+        let built = crate::target_dir::user_cache_target(&base, &via.join("out").join("rust"));
+        assert!(named.contains(&built), "{named:?}");
+        let _ = std::fs::remove_dir_all(&scratch);
+        Ok(())
+    }
+
+    /// A release dir holding one entry past [`MAX_RELEASE_MEMBERS`] is refused
+    /// with a typed limit error; one at the ceiling is read.
+    #[test]
+    fn clean_refuses_a_release_dir_past_its_member_ceiling() {
+        let (scratch, root, base) = relocation_fixture("ipe_clean_reloc_ceiling");
+        let release = root.join("out").join("release");
+        for index in 0..MAX_RELEASE_MEMBERS {
+            std::fs::create_dir_all(release.join(format!("m{index}"))).expect("make member");
+        }
+        let at_ceiling = relocated_targets_within(&root, &base, &[]);
+        assert!(at_ceiling.is_ok(), "{at_ceiling:?}");
+        std::fs::create_dir_all(release.join("one-past")).expect("make member");
+        let past = relocated_targets_within(&root, &base, &[]);
+        assert!(
+            matches!(past, Err(CliError::DiscoveryLimitReached { .. })),
+            "{past:?}"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
     /// A pin naming the relocated path makes it the user's: never named for removal.
     #[test]
     fn a_pinned_target_is_never_removed() {
@@ -693,7 +893,8 @@ mod tests {
         let target = relocated(&root, &base);
         std::fs::create_dir_all(&target).expect("make target");
         std::fs::write(target.join(CACHEDIR_TAG), CARGO_CACHEDIR_TAG).expect("tag");
-        let named = relocated_targets_within(&root, &base, std::slice::from_ref(&target));
+        let named = relocated_targets_within(&root, &base, std::slice::from_ref(&target))
+            .expect("names the relocated targets");
         assert!(
             !named.contains(&target),
             "a pinned target is not named: {named:?}"
@@ -714,7 +915,8 @@ mod tests {
         std::fs::write(target.join(CACHEDIR_TAG), CARGO_CACHEDIR_TAG).expect("tag");
         let key = target.file_name().expect("relocation key");
         let pin = base.join("ipe").join("..").join("ipe").join("t").join(key);
-        let named = relocated_targets_within(&root, &base, std::slice::from_ref(&pin));
+        let named = relocated_targets_within(&root, &base, std::slice::from_ref(&pin))
+            .expect("names the relocated targets");
         assert!(
             !named.contains(&target),
             "a pin through `..` is not named: {named:?}"

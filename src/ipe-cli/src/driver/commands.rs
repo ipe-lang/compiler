@@ -1,10 +1,10 @@
 use super::{
-    BuildOptions, BundleHost, CliError, EmittedCrate, OutTarget, RuntimeContext, RuntimeEmit,
-    SettingsSource, apply_fixes_cmd, attribute_canon_errors, attribute_post_link_error,
-    bluegreen_enabled, build_root_into, bundle_delivery, compile_prepared, create_source_root,
-    emit_machine_error, emit_permissions, emit_settings, find_manifest_for_ipe_file,
-    frame_infer_error, gate_decoder_pipelines, home_to_source_map, io_err,
-    resolve_vendored_runtime_dir, run_version, runtime_dep_from_env,
+    BuildOptions, BundleFinish, BundleHost, CliError, EmittedCrate, OutTarget, RuntimeContext,
+    RuntimeEmit, SettingsSource, apply_fixes_cmd, attribute_canon_errors,
+    attribute_post_link_error, bluegreen_enabled, build_root_into, bundle_delivery,
+    compile_prepared, create_source_root, emit_machine_error, emit_permissions, emit_settings,
+    find_manifest_for_ipe_file, frame_infer_error, gate_decoder_pipelines, home_to_source_map,
+    io_err, resolve_vendored_runtime_dir, run_version, runtime_dep_from_env,
 };
 use std::num::NonZeroU8;
 
@@ -16,6 +16,7 @@ use crate::cargo_step::{
     Verbosity,
 };
 use crate::delivery::HostIntent;
+use crate::delivery_set::{ReleaseRoute, release_route};
 use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths};
 use crate::project_root::{
     AnalysisTarget, EntrySet, FileArg, ProjectRoot, ResolvedEntry, RootArg, SourceDir,
@@ -506,6 +507,7 @@ pub fn run_watch(rest: &[String]) -> Result<(), CliError> {
     let delivery = resolve_delivery(
         &held.declared()?,
         &args.delivery,
+        args.entry.as_deref(),
         false,
         Verb::DEV_WATCH.name(),
         admit_watch,
@@ -633,6 +635,7 @@ impl EntryMain {
 pub fn resolve_delivery(
     declared: &crate::delivery_set::DeclaredDeliveries,
     args: &cli_args::DeliveryArgs,
+    dir: Option<&str>,
     wants_static: bool,
     command: &str,
     admit: Admit,
@@ -643,6 +646,7 @@ pub fn resolve_delivery(
         cli_args::DeliveryArgs::Unstated => {
             let delivery = declared.sole_dev_delivery(
                 command,
+                dir,
                 |delivery| admit(delivery).is_ok(),
                 Verb::DEV_BUILD.name(),
             )?;
@@ -1006,28 +1010,35 @@ struct DevAdmission {
 ///
 /// # Errors
 /// [`CliError::Usage`] carrying the refusal of [`resolve_delivery`],
-/// [`BundleHost::from_delivery_host`], [`derive_target`] or the triple matrix;
+/// [`release_route`], [`derive_target`] or the triple matrix;
 /// [`CliError::StaticRefusal`] for an unparseable `IPE_TARGET`.
 fn admit_dev_build(
     held: &HeldBuild,
     positionals: &cli_args::DeliveryArgs,
+    dir: Option<&str>,
     wants_static: bool,
     flag: Option<delivery::TargetTriple>,
 ) -> Result<DevAdmission, CliError> {
     let delivery = resolve_delivery(
         &held.declared()?,
         positionals,
+        dir,
         wants_static,
         Verb::DEV_BUILD.name(),
         ADMIT_ANY,
     )?;
     let env = build_plan::env_target()?;
-    if let Some(host) = BundleHost::from_delivery_host(delivery.host())? {
-        refuse_bundle_target(Verb::DEV_BUILD, delivery, flag, env)?;
-        return Ok(DevAdmission {
-            delivery,
-            route: DevRoute::Bundle(host),
-        });
+    match release_route(delivery)
+        .map_err(|e| CliError::Usage(text::msg::command_refusal(&Verb::DEV_BUILD, &e)))?
+    {
+        ReleaseRoute::Bundle(host) => {
+            refuse_bundle_target(Verb::DEV_BUILD, delivery, flag, env)?;
+            return Ok(DevAdmission {
+                delivery,
+                route: DevRoute::Bundle(host),
+            });
+        }
+        ReleaseRoute::Native | ReleaseRoute::Browser => {}
     }
     let compile_target = dev_compile_target(
         delivery,
@@ -1137,10 +1148,22 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
     // untouched; the rewritten project is then read and judged once more, and
     // that read is the one built.
     let unfixed = HeldBuild::read(root)?;
-    let admitted = admit_dev_build(&unfixed, &args.delivery, wants_static, target_flag)?;
+    let admitted = admit_dev_build(
+        &unfixed,
+        &args.delivery,
+        args.entry.as_deref(),
+        wants_static,
+        target_flag,
+    )?;
     let (held, admitted) = if args.fix {
         let held = unfixed.fixed()?;
-        let admitted = admit_dev_build(&held, &args.delivery, wants_static, target_flag)?;
+        let admitted = admit_dev_build(
+            &held,
+            &args.delivery,
+            args.entry.as_deref(),
+            wants_static,
+            target_flag,
+        )?;
         (held, admitted)
     } else {
         (unfixed, admitted)
@@ -1172,7 +1195,9 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
 
     let compile_target = match route {
         DevRoute::Bundle(host) => {
-            bundle_delivery(host, NativeFinish::Dev, &held)?;
+            // The bundle writes under the root `--out` names, as every dev build does.
+            let output = resolve_output_root(out.as_deref(), manifest)?;
+            bundle_delivery(host, BundleFinish::Dev { output }, &held)?;
             return Ok(BuildSuccess {
                 entry,
                 out_dir: PathBuf::new(),
@@ -1754,51 +1779,27 @@ pub fn run_release(rest: &[String]) -> Result<(), CliError> {
     })
 }
 
-/// The artifact a `release build` produces.
-///
-/// Built only by [`release_artifact`], whose exhaustive match leaves no target
-/// that produces nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReleaseArtifact {
-    /// The production browser bundle (`wasm32-unknown-unknown`).
-    Browser,
-    /// A statically linked native binary for the triple.
-    Native(ipe_backend_rust::static_build::StaticTriple),
-}
-
-impl ReleaseArtifact {
-    /// The compile target this artifact emits for.
-    #[must_use]
-    pub const fn compile_target(self) -> CompileTarget {
-        match self {
-            Self::Browser => CompileTarget::WasmClient,
-            Self::Native(_) => CompileTarget::Native,
-        }
-    }
-}
-
-/// The artifact a release produces, derived from the delivery.
+/// The static triple a native release links for, judged from every target source.
 ///
 /// Every target source is judged by [`derive_target`]; nothing is ignored.
 /// `flag` is the parsed native `--target`, `env` the parsed `IPE_TARGET`, and
-/// `wasm_block` whether the manifest sets `wasm = On {…}`.
+/// `wasm_block` whether the manifest sets `wasm = On {…}`. `None` is the
+/// default static triple, or a browser bundle, which links no static triple.
 ///
 /// # Errors
 ///
-/// [`TargetRefusal`] from [`derive_target`] under [`TargetVerb::Release`].
-pub fn release_artifact(
+/// [`TargetRefusal`] from [`derive_target`] under [`TargetVerb::Release`], and
+/// [`TargetRefusal::NoWasi`] for a WASI module, which no release produces.
+pub fn release_static_triple(
     delivery: delivery::Delivery,
     flag: Option<ipe_backend_rust::static_build::StaticTriple>,
     env: Option<delivery::TargetTriple>,
     wasm_block: bool,
-) -> Result<ReleaseArtifact, TargetRefusal> {
+) -> Result<Option<ipe_backend_rust::static_build::StaticTriple>, TargetRefusal> {
     let flag = flag.map(delivery::TargetTriple::Native);
     match derive_target(TargetVerb::Release, delivery, flag, env, wasm_block)? {
-        Some(delivery::TargetTriple::BrowserWasm) => Ok(ReleaseArtifact::Browser),
-        Some(delivery::TargetTriple::Native(triple)) => Ok(ReleaseArtifact::Native(triple)),
-        None => Ok(ReleaseArtifact::Native(
-            ipe_backend_rust::static_build::StaticTriple::default(),
-        )),
+        Some(delivery::TargetTriple::Native(triple)) => Ok(Some(triple)),
+        Some(delivery::TargetTriple::BrowserWasm) | None => Ok(None),
         Some(delivery::TargetTriple::Wasm32Wasip1) => Err(TargetRefusal::NoWasi),
     }
 }
@@ -1889,83 +1890,104 @@ pub fn release_pipeline(
     // only way through (a CI release must not block on a TTY prompt).
     let consented = consent_to_capabilities(&held)?;
 
-    // A `desktop`/`ios`/`android` host is a production distributable bundle:
-    // route it through the delivery-grammar bundler (the `release` production
-    // profile). The served/default host falls through to the ordinary release
-    // artifact below. The delivery grammar is the one vocabulary for every bundle
-    // target.
+    // Every release member writes under its own `release/<slug>/` root, the
+    // slug a function of the member's release identity, so two members never
+    // share a place. A `desktop`/`ios`/`android` host is a production
+    // distributable bundle routed through the delivery-grammar bundler; the
+    // browser bundle and the static native binary are built here.
     let declared = held.declared()?;
-    // One delivery's release, from its resolution to its artifact; `target` is
-    // the static triple argv or the declared ship names.
-    let release_one = |bundle_delivery_resolved: delivery::Delivery,
-                       target: Option<ipe_backend_rust::static_build::StaticTriple>|
-     -> Result<ReleaseOutput, CliError> {
-        if let (ReleasePurpose::Run, Some(target)) = (
-            purpose,
-            cli_args::NoRunTarget::from_host(bundle_delivery_resolved.host()),
-        ) {
-            return Err(CliError::NoRunForm { target });
+    let env = build_plan::env_target()?;
+    let env_native = match env {
+        Some(delivery::TargetTriple::Native(triple)) => Some(triple),
+        Some(delivery::TargetTriple::BrowserWasm | delivery::TargetTriple::Wasm32Wasip1) | None => {
+            None
         }
-        // The database driver a release profile's socket allowances follow: the
-        // one the emit links, read from the same build shape.
-        let driver =
-            SettingsSource::discovered(Some((manifest, held.manifest_path())), HostIntent::Served)
-                .db_driver();
-        let env = build_plan::env_target()?;
-        if let Some(host) = BundleHost::from_delivery_host(bundle_delivery_resolved.host())? {
-            refuse_bundle_target(
-                verb,
-                bundle_delivery_resolved,
-                target.map(delivery::TargetTriple::Native),
-                env,
-            )?;
-            bundle_delivery(
-                host,
-                NativeFinish::Release {
-                    consented: &consented,
-                    driver,
-                },
-                &held,
-            )?;
-            return Ok(ReleaseOutput::Distributable);
-        }
-
-        // Route on the typed artifact the delivery derives: the browser bundle for
-        // `web client`, otherwise a static native binary.
-        let artifact = release_artifact(
-            bundle_delivery_resolved,
-            target,
-            env,
-            manifest.wasm.implies_wasm_target(),
-        )
-        .map_err(|refusal| refusal.into_cli(verb))?;
-        let compile_target = artifact.compile_target();
-
-        // Fail closed unless the delivery runtime and the compile target agree — the
-        // `(engine, triple)` validity matrix is the single live gate — so a sandboxed
-        // client is never released as a native binary with the wasm-keyed native-deny
-        // backstops skipped.
-        let (engine, triple) = compile_target.engine_triple();
-        bundle_delivery_resolved
-            .admit_triple(engine, triple)
-            .map_err(|e| CliError::Usage(text::msg::command_refusal(&verb, &e)))?;
-
-        // Native path: the triple the parse validated; the browser bundle
-        // returns from its own arm.
-        let triple = match artifact {
-            ReleaseArtifact::Native(triple) => triple,
-            ReleaseArtifact::Browser if purpose == ReleasePurpose::Run => {
-                // The parse refuses `web client` under `release run`; this arm
-                // keeps the refusal at the artifact as well, before any emit.
-                return Err(CliError::NoRunForm {
-                    target: cli_args::NoRunTarget::Client,
-                });
+    };
+    // One member's release, from its planned delivery to its artifact.
+    let release_one =
+        |plan: crate::delivery_set::PlannedDelivery| -> Result<ReleaseOutput, CliError> {
+            let member_delivery = plan.delivery();
+            if let (ReleasePurpose::Run, Some(target)) = (
+                purpose,
+                cli_args::NoRunTarget::from_host(member_delivery.host()),
+            ) {
+                return Err(CliError::NoRunForm { target });
             }
-            ReleaseArtifact::Browser => {
+            // The flag the member is judged under: argv's `--target`, else the
+            // triple the member was planned for.
+            let flag = args.target.or_else(|| plan.release_triple());
+            // The database driver a release profile's socket allowances follow: the
+            // one the emit links, read from the same build shape.
+            let driver = SettingsSource::discovered(
+                Some((manifest, held.manifest_path())),
+                HostIntent::Served,
+            )
+            .db_driver();
+            let route = release_route(member_delivery)
+                .map_err(|e| CliError::Usage(text::msg::command_refusal(&verb, &e)))?;
+            let host = match route {
+                ReleaseRoute::Bundle(host) => Some(host),
+                ReleaseRoute::Native | ReleaseRoute::Browser => None,
+            };
+            if let Some(host) = host {
+                refuse_bundle_target(
+                    verb,
+                    member_delivery,
+                    flag.map(delivery::TargetTriple::Native),
+                    env,
+                )?;
+                let member = resolve_output_root(args.out.as_deref(), manifest)?
+                    .release_member(&plan.slug()?);
+                bundle_delivery(
+                    host,
+                    BundleFinish::Release {
+                        consented: &consented,
+                        driver,
+                        member,
+                    },
+                    &held,
+                )?;
+                return Ok(ReleaseOutput::Distributable);
+            }
+
+            // Every target source is judged before the member is claimed.
+            let judged = release_static_triple(
+                member_delivery,
+                flag,
+                env,
+                manifest.wasm.implies_wasm_target(),
+            )
+            .map_err(|refusal| refusal.into_cli(verb))?;
+            let compile_target = match route {
+                ReleaseRoute::Browser => CompileTarget::WasmClient,
+                ReleaseRoute::Native | ReleaseRoute::Bundle(_) => CompileTarget::Native,
+            };
+
+            // Fail closed unless the delivery runtime and the compile target agree — the
+            // `(engine, triple)` validity matrix is the single live gate — so a sandboxed
+            // client is never released as a native binary with the wasm-keyed native-deny
+            // backstops skipped.
+            let (engine, engine_triple) = compile_target.engine_triple();
+            member_delivery
+                .admit_triple(engine, engine_triple)
+                .map_err(|e| CliError::Usage(text::msg::command_refusal(&verb, &e)))?;
+
+            if route == ReleaseRoute::Browser {
+                if purpose == ReleasePurpose::Run {
+                    // The parse refuses `web client` under `release run`; this arm
+                    // keeps the refusal at the route as well, before any emit.
+                    return Err(CliError::NoRunForm {
+                        target: cli_args::NoRunTarget::Client,
+                    });
+                }
                 // Browser/wasm production path.
-                let output = resolve_output_root(args.out.as_deref(), manifest)?;
-                let rust_area = output.area(&[OutputArea::Release, OutputArea::Rust]);
-                let out_dir = rust_area.path()?;
+                // The member is claimed when the crate is written, past every
+                // emit gate, so a refused release leaves no member behind.
+                let rust = EmitTarget::Member(
+                    resolve_output_root(args.out.as_deref(), manifest)?
+                        .release_member(&plan.slug()?)
+                        .area(OutputArea::Rust),
+                );
                 let runtime_dep = runtime_dep_from_env();
                 // Emit the Rust wasm project as a release build so the Debug gate fires.
                 let options = BuildOptions {
@@ -1999,12 +2021,8 @@ pub fn release_pipeline(
                     );
                 }
 
-                let crate_dir = held.emit(
-                    &EmitTarget::Area(rust_area),
-                    &runtime_dir,
-                    &options,
-                    bundle_delivery_resolved.host_intent(),
-                )?;
+                let crate_dir =
+                    held.emit(&rust, &runtime_dir, &options, member_delivery.host_intent())?;
                 bundle_wasm(crate_dir.dir())?;
                 if show_progress {
                     crate::screen::chatter(
@@ -2013,46 +2031,154 @@ pub fn release_pipeline(
                         &format!(
                             "{} released → {}/www/",
                             style::outcome_glyph(style::Outcome::Success),
-                            out_dir.display()
+                            crate_dir.path().display()
                         ),
                     );
                 }
                 return Ok(ReleaseOutput::Distributable);
             }
-        };
 
-        // The consented capabilities discriminate between native-bearing (needs jail
-        // wrapper) and pure-native (plain optimised binary).
-        let resolved = consented.resolved();
+            // Native path: the triple the judgment derived, which is the triple the
+            // member was planned (and named) for.
+            let triple = judged.unwrap_or_default();
+            if plan.release_triple().unwrap_or_default() != triple {
+                return Err(CliError::Pipeline {
+                    file: PathBuf::new(),
+                    src: String::new(),
+                    diag: Box::new(ipe_diagnostics::Diagnostic::CompilerBug {
+                        where_: "release member triple",
+                        detail: format!(
+                            "`{member_delivery}` was planned for `{}` and judged for `{}`",
+                            plan.release_triple().unwrap_or_default().as_str(),
+                            triple.as_str()
+                        ),
+                    }),
+                });
+            }
 
-        // The pure-native and the jailed path emit the same statically linked app,
-        // so one options value drives both emits and the runtime resolution.
-        let options = BuildOptions {
-            static_plan: Some(ipe_backend_rust::static_build::StaticPlan {
-                triple,
-                c_profile: ipe_backend_rust::static_build::CProfile::WithLibc {
-                    allocator: ipe_backend_rust::static_build::StaticAllocator::Dlmalloc,
-                },
-            }),
-            target: ipe_ir::Target::Native,
-            intent: verb.intent(),
-            runtime_dep: runtime_dep_from_env(),
-            tree_shake_vendored: false,
-            ..BuildOptions::default()
-        };
-        let runtime_dir =
-            resolve_vendored_runtime_dir(args.runtime.clone(), options.runtime_emit())?;
+            // The consented capabilities discriminate between native-bearing (needs jail
+            // wrapper) and pure-native (plain optimised binary).
+            let resolved = consented.resolved();
 
-        let show_progress = {
-            use std::io::IsTerminal as _;
-            std::io::stderr().is_terminal()
-        };
+            // The pure-native and the jailed path emit the same statically linked app,
+            // so one options value drives both emits and the runtime resolution.
+            let options = BuildOptions {
+                static_plan: Some(ipe_backend_rust::static_build::StaticPlan {
+                    triple,
+                    c_profile: ipe_backend_rust::static_build::CProfile::WithLibc {
+                        allocator: ipe_backend_rust::static_build::StaticAllocator::Dlmalloc,
+                    },
+                }),
+                target: ipe_ir::Target::Native,
+                intent: verb.intent(),
+                runtime_dep: runtime_dep_from_env(),
+                tree_shake_vendored: false,
+                ..BuildOptions::default()
+            };
+            let runtime_dir =
+                resolve_vendored_runtime_dir(args.runtime.clone(), options.runtime_emit())?;
 
-        if !run_sandbox::is_native_bearing(&resolved.union()) {
-            // Pure-native path: emit and build a plain release binary.
-            let output = resolve_output_root(args.out.as_deref(), manifest)?;
-            let rust_area = output.area(&[OutputArea::Release, OutputArea::Rust]);
-            let out_dir = rust_area.path()?;
+            let show_progress = {
+                use std::io::IsTerminal as _;
+                std::io::stderr().is_terminal()
+            };
+
+            if !run_sandbox::is_native_bearing(&resolved.union()) {
+                // Pure-native path: emit and build a plain release binary.
+                // The member is claimed when the crate is written, past every
+                // emit gate, so a refused release leaves no member behind.
+                let member = resolve_output_root(args.out.as_deref(), manifest)?
+                    .release_member(&plan.slug()?);
+
+                if show_progress {
+                    crate::screen::chatter(
+                        crate::screen::Stream::Stderr,
+                        crate::screen::Tone::Text,
+                        &format!(
+                            "{} releasing {entry}",
+                            style::outcome_glyph(style::Outcome::Step)
+                        ),
+                    );
+                }
+
+                let cargo_bin = toolchain::require_cargo(toolchain::ToolIntent::Build)?;
+
+                // A desktop host returned through the bundler above, so this static
+                // artifact is the served program.
+                let crate_dir = held.emit(
+                    &EmitTarget::Member(member.area(OutputArea::Rust)),
+                    &runtime_dir,
+                    &options,
+                    HostIntent::Served,
+                )?;
+
+                let app_target_dir = crate::target_dir::LinkableTargetDir::for_crate(
+                    cargo_bin.path(),
+                    crate_dir.path(),
+                    None,
+                )?;
+                build_pure_native_release(
+                    &cargo_bin,
+                    &crate_dir,
+                    &consented,
+                    driver,
+                    triple,
+                    &app_target_dir,
+                    Verbosity::Progress,
+                )?;
+
+                // Cargo names the built binary after the emitted crate IDENTITY (the
+                // path-uniquified `<friendly>_<hash>`), so the artifact is LOCATED by that
+                // identity; it is delivered under the plain FRIENDLY name so the hash the
+                // crate carries only to own a unique shared-target slot never leaks into a
+                // distributed filename.
+                let bin_name = emitted_bin_filename(crate_dir.path())?;
+                let bin_path = app_target_dir
+                    .path()
+                    .join(triple.as_str())
+                    .join("release")
+                    .join(&bin_name);
+                if !bin_path.is_file() {
+                    return Err(CliError::Usage(text::msg::release_binary_missing(
+                        &bin_path.display(),
+                    )));
+                }
+                // Copy the binary from the cargo target dir into the member root so the
+                // artifact lands at a predictable path regardless of CARGO_TARGET_DIR.
+                let dest = member
+                    .claim()?
+                    .path_to(friendly_artifact_filename(Some(manifest)))?;
+                dest.copy_from(&bin_path)?;
+                let dest = dest.path();
+                #[cfg(unix)]
+                set_executable(&dest)?;
+                if show_progress {
+                    crate::screen::chatter(
+                        crate::screen::Stream::Stderr,
+                        crate::screen::Tone::Success,
+                        &format!(
+                            "{} released → {}",
+                            style::outcome_glyph(style::Outcome::Success),
+                            dest.display()
+                        ),
+                    );
+                }
+                let profile = run_sandbox::build_profile(resolved, driver)?;
+                return Ok(ReleaseOutput::PureNative {
+                    binary: dest,
+                    profile,
+                });
+            }
+
+            // Native-bearing path: jailed bundle. The wrapper builds only from the
+            // verified compiler workspace this binary was compiled from, never from a
+            // tree the current directory leads to; verified before anything is built.
+            let wrapper_source = crate::wrapper_source::WrapperSource::resolve()
+                .map_err(|r| CliError::WrapperSourceRefused(Box::new(r)))?;
+            // The member is claimed when the app crate is written, past every
+            // emit gate, so a refused release leaves no member behind.
+            let member =
+                resolve_output_root(args.out.as_deref(), manifest)?.release_member(&plan.slug()?);
 
             if show_progress {
                 crate::screen::chatter(
@@ -2067,257 +2193,166 @@ pub fn release_pipeline(
 
             let cargo_bin = toolchain::require_cargo(toolchain::ToolIntent::Build)?;
 
+            // Step 1: emit + build the app binary (static, musl, production).
             // A desktop host returned through the bundler above, so this static
             // artifact is the served program.
-            let crate_dir = held.emit(
-                &EmitTarget::Area(rust_area),
+            let app_dir = held.emit(
+                &EmitTarget::Member(member.area(OutputArea::App)),
                 &runtime_dir,
                 &options,
                 HostIntent::Served,
             )?;
 
+            // The build directory is resolved once, before cargo runs, and the app
+            // binary is read back from that same value.
             let app_target_dir = crate::target_dir::LinkableTargetDir::for_crate(
                 cargo_bin.path(),
-                crate_dir.path(),
+                app_dir.path(),
                 None,
             )?;
-            build_pure_native_release(
-                &cargo_bin,
-                &crate_dir,
-                &consented,
-                driver,
-                triple,
-                &app_target_dir,
-                Verbosity::Progress,
-            )?;
+            FlooredBuild {
+                cargo: &cargo_bin,
+                crate_dir: &app_dir,
+                finish: NativeFinish::Release {
+                    consented: &consented,
+                    driver,
+                },
+                target: CargoTarget::Static(triple),
+                target_dir: &app_target_dir,
+                output: CargoOutput::Human(Verbosity::Progress),
+                what: "the release app",
+                runtime: None,
+            }
+            .run()?;
 
-            // Cargo names the built binary after the emitted crate IDENTITY (the
-            // path-uniquified `<friendly>_<hash>`), so the artifact is LOCATED by that
-            // identity; it is delivered under the plain FRIENDLY name so the hash the
-            // crate carries only to own a unique shared-target slot never leaks into a
-            // distributed filename.
-            let bin_name = emitted_bin_filename(&out_dir)?;
-            let bin_path = app_target_dir
+            let release_bin_name = emitted_bin_filename(app_dir.path())?;
+            let app_binary = app_target_dir
                 .path()
                 .join(triple.as_str())
                 .join("release")
-                .join(&bin_name);
-            if !bin_path.is_file() {
-                return Err(CliError::Usage(text::msg::release_binary_missing(
-                    &bin_path.display(),
+                .join(&release_bin_name);
+            if !app_binary.is_file() {
+                return Err(CliError::Usage(text::msg::release_app_binary_missing(
+                    &app_binary.display(),
                 )));
             }
-            // Copy the binary from the cargo target dir into the release area so the
-            // artifact lands at a predictable path regardless of CARGO_TARGET_DIR.
-            let dest = output
-                .claim_area(&[OutputArea::Release])?
-                .path_to(friendly_artifact_filename(Some(manifest)))?;
-            dest.copy_from(&bin_path)?;
-            let dest = dest.path();
-            #[cfg(unix)]
-            set_executable(&dest)?;
-            if show_progress {
-                crate::screen::chatter(
-                    crate::screen::Stream::Stderr,
-                    crate::screen::Tone::Success,
-                    &format!(
-                        "{} released → {}",
-                        style::outcome_glyph(style::Outcome::Success),
-                        dest.display()
-                    ),
-                );
-            }
-            let profile = run_sandbox::build_profile(resolved, driver)?;
-            return Ok(ReleaseOutput::PureNative {
-                binary: dest,
-                profile,
+            let profile_src = app_dir.path().join(RELEASE_PROFILE);
+
+            // Step 2: build the wrapper binary (static, musl).
+            let wrapper_triple = triple;
+            let wrapper_static_plan = ipe_backend_rust::static_build::StaticPlan {
+                triple: wrapper_triple,
+                c_profile: ipe_backend_rust::static_build::CProfile::WithLibc {
+                    allocator: ipe_backend_rust::static_build::StaticAllocator::Dlmalloc,
+                },
+            };
+
+            let embed = matches!(args.mode, cli_args::ReleaseMode::Embed).then_some(EmbeddedApp {
+                binary: &app_binary,
+                profile: &profile_src,
             });
-        }
-
-        // Native-bearing path: jailed bundle. The wrapper builds only from the
-        // verified compiler workspace this binary was compiled from, never from a
-        // tree the current directory leads to; verified before anything is built.
-        let wrapper_source = crate::wrapper_source::WrapperSource::resolve()
-            .map_err(|r| CliError::WrapperSourceRefused(Box::new(r)))?;
-        let output = resolve_output_root(args.out.as_deref(), manifest)?;
-
-        if show_progress {
-            crate::screen::chatter(
-                crate::screen::Stream::Stderr,
-                crate::screen::Tone::Text,
-                &format!(
-                    "{} releasing {entry}",
-                    style::outcome_glyph(style::Outcome::Step)
-                ),
-            );
-        }
-
-        let cargo_bin = toolchain::require_cargo(toolchain::ToolIntent::Build)?;
-
-        // Step 1: emit + build the app binary (static, musl, production).
-        let app_area = output.area(&[OutputArea::Release, OutputArea::App]);
-        let app_out = app_area.path()?;
-        // A desktop host returned through the bundler above, so this static
-        // artifact is the served program.
-        let app_dir = held.emit(
-            &EmitTarget::Area(app_area),
-            &runtime_dir,
-            &options,
-            HostIntent::Served,
-        )?;
-
-        // The build directory is resolved once, before cargo runs, and the app
-        // binary is read back from that same value.
-        let app_target_dir = crate::target_dir::LinkableTargetDir::for_crate(
-            cargo_bin.path(),
-            app_dir.path(),
-            None,
-        )?;
-        FlooredBuild {
-            cargo: &cargo_bin,
-            crate_dir: &app_dir,
-            finish: NativeFinish::Release {
-                consented: &consented,
-                driver,
-            },
-            target: CargoTarget::Static(triple),
-            target_dir: &app_target_dir,
-            output: CargoOutput::Human(Verbosity::Progress),
-            what: "the release app",
-            runtime: None,
-        }
-        .run()?;
-
-        let release_bin_name = emitted_bin_filename(&app_out)?;
-        let app_binary = app_target_dir
-            .path()
-            .join(triple.as_str())
-            .join("release")
-            .join(&release_bin_name);
-        if !app_binary.is_file() {
-            return Err(CliError::Usage(text::msg::release_app_binary_missing(
-                &app_binary.display(),
-            )));
-        }
-        let profile_src = app_out.join(RELEASE_PROFILE);
-
-        // Step 2: build the wrapper binary (static, musl).
-        let wrapper_triple = triple;
-        let wrapper_static_plan = ipe_backend_rust::static_build::StaticPlan {
-            triple: wrapper_triple,
-            c_profile: ipe_backend_rust::static_build::CProfile::WithLibc {
-                allocator: ipe_backend_rust::static_build::StaticAllocator::Dlmalloc,
-            },
-        };
-
-        let embed = matches!(args.mode, cli_args::ReleaseMode::Embed).then_some(EmbeddedApp {
-            binary: &app_binary,
-            profile: &profile_src,
-        });
-        let wrapper_target_dir = crate::target_dir::LinkableTargetDir::for_crate(
-            cargo_bin.path(),
-            wrapper_source.root(),
-            None,
-        )?;
-        CargoBuild {
-            cargo: &cargo_bin,
-            krate: CargoCrate::ReleaseWrapper {
-                source: &wrapper_source,
-                embed,
-            },
-            profile: CargoProfile::Release,
-            target: CargoTarget::Static(wrapper_static_plan.triple),
-            target_dir: &wrapper_target_dir,
-            output: CargoOutput::Human(Verbosity::Progress),
-            what: "the release wrapper",
-            runtime: None,
-        }
-        .run()?;
-
-        // Step 3: lay out the bundle.
-        let bundle_dir = output.claim_area(&[OutputArea::Release, OutputArea::Bundle])?;
-
-        // The wrapper binary is read back from the build directory its build was handed.
-        let wrapper_src = wrapper_target_dir
-            .path()
-            .join(wrapper_static_plan.triple.as_str())
-            .join("release")
-            .join(RELEASE_WRAPPER);
-
-        let artifact = match args.mode {
-            cli_args::ReleaseMode::Embed => {
-                // Single-file embed: copy only the wrapper (app + profile baked in).
-                let dest = bundle_dir.path_to(RELEASE_WRAPPER)?;
-                dest.copy_from(&wrapper_src)?;
-                let dest = dest.path();
-                #[cfg(unix)]
-                set_executable(&dest)?;
-                dest
+            let wrapper_target_dir = crate::target_dir::LinkableTargetDir::for_crate(
+                cargo_bin.path(),
+                wrapper_source.root(),
+                None,
+            )?;
+            CargoBuild {
+                cargo: &cargo_bin,
+                krate: CargoCrate::ReleaseWrapper {
+                    source: &wrapper_source,
+                    embed,
+                },
+                profile: CargoProfile::Release,
+                target: CargoTarget::Static(wrapper_static_plan.triple),
+                target_dir: &wrapper_target_dir,
+                output: CargoOutput::Human(Verbosity::Progress),
+                what: "the release wrapper",
+                runtime: None,
             }
-            cli_args::ReleaseMode::Bundle => {
-                // Bundle: wrapper + app + profile as siblings.
-                let wrapper_dest = bundle_dir.path_to(RELEASE_WRAPPER)?;
-                let app_dest = bundle_dir.path_to(RELEASE_APP)?;
-                bundle_dir
-                    .path_to(RELEASE_PROFILE)?
-                    .copy_from(&profile_src)?;
-                wrapper_dest.copy_from(&wrapper_src)?;
-                app_dest.copy_from(&app_binary)?;
-                #[cfg(unix)]
-                {
-                    set_executable(&wrapper_dest.path())?;
-                    set_executable(&app_dest.path())?;
+            .run()?;
+
+            // Step 3: lay out the bundle.
+            let bundle_dir = member.area(OutputArea::Bundle).claim()?;
+
+            // The wrapper binary is read back from the build directory its build was handed.
+            let wrapper_src = wrapper_target_dir
+                .path()
+                .join(wrapper_static_plan.triple.as_str())
+                .join("release")
+                .join(RELEASE_WRAPPER);
+
+            let artifact = match args.mode {
+                cli_args::ReleaseMode::Embed => {
+                    // Single-file embed: copy only the wrapper (app + profile baked in).
+                    let dest = bundle_dir.path_to(RELEASE_WRAPPER)?;
+                    dest.copy_from(&wrapper_src)?;
+                    let dest = dest.path();
+                    #[cfg(unix)]
+                    set_executable(&dest)?;
+                    dest
                 }
-                bundle_dir.path().to_path_buf()
-            }
-        };
+                cli_args::ReleaseMode::Bundle => {
+                    // Bundle: wrapper + app + profile as siblings.
+                    let wrapper_dest = bundle_dir.path_to(RELEASE_WRAPPER)?;
+                    let app_dest = bundle_dir.path_to(RELEASE_APP)?;
+                    bundle_dir
+                        .path_to(RELEASE_PROFILE)?
+                        .copy_from(&profile_src)?;
+                    wrapper_dest.copy_from(&wrapper_src)?;
+                    app_dest.copy_from(&app_binary)?;
+                    #[cfg(unix)]
+                    {
+                        set_executable(&wrapper_dest.path())?;
+                        set_executable(&app_dest.path())?;
+                    }
+                    bundle_dir.path().to_path_buf()
+                }
+            };
 
-        if show_progress {
-            // Post-build report: how the binary is linked, where it landed, and the
-            // capability model it will enforce.
-            let cap_names: Vec<&'static str> =
-                resolved.union().iter().map(|c| c.as_str()).collect();
-            screen::chatter_styled(
-                screen::Stream::Stderr,
-                &release_bundle_report(&artifact, &cap_names, args.mode),
-            );
-            match args.mode {
-                cli_args::ReleaseMode::Embed => crate::screen::chatter(
-                    crate::screen::Stream::Stderr,
-                    crate::screen::Tone::Success,
-                    &format!(
-                        "{} {}",
-                        style::outcome_glyph(style::Outcome::Success),
-                        text::release_embedded(&artifact.display())
+            if show_progress {
+                // Post-build report: how the binary is linked, where it landed, and the
+                // capability model it will enforce.
+                let cap_names: Vec<&'static str> =
+                    resolved.union().iter().map(|c| c.as_str()).collect();
+                screen::chatter_styled(
+                    screen::Stream::Stderr,
+                    &release_bundle_report(&artifact, &cap_names, args.mode),
+                );
+                match args.mode {
+                    cli_args::ReleaseMode::Embed => crate::screen::chatter(
+                        crate::screen::Stream::Stderr,
+                        crate::screen::Tone::Success,
+                        &format!(
+                            "{} {}",
+                            style::outcome_glyph(style::Outcome::Success),
+                            text::release_embedded(&artifact.display())
+                        ),
                     ),
-                ),
-                cli_args::ReleaseMode::Bundle => crate::screen::chatter(
-                    crate::screen::Stream::Stderr,
-                    crate::screen::Tone::Success,
-                    &format!(
-                        "{} {}",
-                        style::outcome_glyph(style::Outcome::Success),
-                        text::release_bundled(&artifact.display())
+                    cli_args::ReleaseMode::Bundle => crate::screen::chatter(
+                        crate::screen::Stream::Stderr,
+                        crate::screen::Tone::Success,
+                        &format!(
+                            "{} {}",
+                            style::outcome_glyph(style::Outcome::Success),
+                            text::release_bundled(&artifact.display())
+                        ),
                     ),
-                ),
+                }
             }
-        }
-        Ok(match args.mode {
-            cli_args::ReleaseMode::Embed => ReleaseOutput::Embedded(artifact),
-            cli_args::ReleaseMode::Bundle => ReleaseOutput::Bundle(artifact),
-        })
-    };
+            Ok(match args.mode {
+                cli_args::ReleaseMode::Embed => ReleaseOutput::Embedded(artifact),
+                cli_args::ReleaseMode::Bundle => ReleaseOutput::Bundle(artifact),
+            })
+        };
 
     match (&args.delivery, purpose) {
-        // No delivery words: `release build` builds every declared delivery,
-        // each for the triple its ship names unless argv names one.
+        // No delivery words: `release build` builds every distinct declared
+        // release once, each for the triple its ship names unless argv names one.
         (cli_args::DeliveryArgs::Unstated, ReleasePurpose::Build) => {
-            match declared.for_release(args.target)?.release_each(|plan| {
-                release_one(
-                    plan.delivery(),
-                    args.target.or_else(|| plan.release_triple()),
-                )
-            }) {
+            match declared
+                .for_release(verb.name(), args.target, env_native)?
+                .release_each(|plan| release_one(*plan))
+            {
                 crate::delivery_set::ReleaseOutcome::AllReleased(built) => {
                     Ok(ReleaseOutput::Declared(built))
                 }
@@ -2334,17 +2369,41 @@ pub fn release_pipeline(
         }
         // `release run` runs one artifact: the one the package declares.
         (cli_args::DeliveryArgs::Unstated, ReleasePurpose::Run) => {
-            let plan = declared.sole_release_member(verb.name(), Verb::RELEASE_BUILD.name())?;
-            release_one(
-                plan.delivery(),
-                args.target.or_else(|| plan.release_triple()),
-            )
+            let sole = declared.sole_release_member(
+                verb.name(),
+                args.entry.as_deref(),
+                Verb::RELEASE_BUILD.name(),
+            )?;
+            release_one(planned_release(
+                verb,
+                sole.delivery(),
+                args.target.or_else(|| sole.release_triple()).or(env_native),
+            )?)
         }
-        (cli_args::DeliveryArgs::Stated { .. }, _) => release_one(
-            resolve_delivery(&declared, &args.delivery, false, verb.name(), ADMIT_ANY)?,
-            args.target,
-        ),
+        (cli_args::DeliveryArgs::Stated { .. }, _) => release_one(planned_release(
+            verb,
+            resolve_delivery(
+                &declared,
+                &args.delivery,
+                args.entry.as_deref(),
+                false,
+                verb.name(),
+                ADMIT_ANY,
+            )?,
+            args.target.or(env_native),
+        )?),
     }
+}
+
+/// The release member of `delivery` for `triple`, or the usage refusal of a
+/// delivery no route builds.
+fn planned_release(
+    verb: Verb,
+    delivery: delivery::Delivery,
+    triple: Option<ipe_backend_rust::static_build::StaticTriple>,
+) -> Result<crate::delivery_set::PlannedDelivery, CliError> {
+    crate::delivery_set::PlannedDelivery::release(delivery, triple)
+        .map_err(|e| CliError::Usage(text::msg::command_refusal(&verb, &e)))
 }
 
 /// The human-readable post-build report for a native-bearing release bundle:
@@ -3238,6 +3297,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     let delivery = resolve_delivery(
         &held.declared()?,
         &args.delivery,
+        args.entry.as_deref(),
         wants_static,
         Verb::DEV_RUN.name(),
         admit_dev_run,
@@ -3520,7 +3580,7 @@ pub fn run_release_run(rest: &[String]) -> Result<(), CliError> {
     };
     let app_args: Vec<std::ffi::OsString> =
         args.app_args.iter().map(std::ffi::OsString::from).collect();
-    run_release_output(output, &app_args)
+    run_release_output(output, args.build.entry.as_deref(), &app_args)
 }
 
 /// The built artifact directory `entry` names: a directory holding the
@@ -3569,9 +3629,11 @@ fn prebuilt_artifact(dir: &Path) -> Result<ReleaseOutput, CliError> {
 /// embedded floor and jails itself, failing closed. A bundle's app is read
 /// once, verified against its profile, and those verified bytes run jailed; a
 /// pure-native binary is jailed under the profile its consented capabilities
-/// lower to.
+/// lower to. `dir` is the project dir as the user typed it, carried into any
+/// remedy line.
 fn run_release_output(
     output: ReleaseOutput,
+    dir: Option<&str>,
     app_args: &[std::ffi::OsString],
 ) -> Result<(), CliError> {
     let working_tree = || {
@@ -3593,7 +3655,16 @@ fn run_release_output(
             // a declared set has no single program to run.
             let choices = released
                 .iter()
-                .map(|one| format!("  ipe {} {}", Verb::RELEASE_RUN.name(), one.delivery()))
+                .map(|one| {
+                    format!(
+                        "  {}",
+                        crate::delivery_set::Remedy::command(
+                            Verb::RELEASE_RUN.name(),
+                            dir,
+                            &one.delivery().to_string(),
+                        )
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             Err(CliError::ProjectRefused(text::msg::ships_several(
@@ -5879,6 +5950,7 @@ mod declared_delivery_tests {
         let got = resolve_delivery(
             &declared(&[ShipEntry::Client]),
             &DeliveryArgs::Unstated,
+            None,
             false,
             Verb::DEV_BUILD.name(),
             ADMIT_ANY,
@@ -5896,6 +5968,7 @@ mod declared_delivery_tests {
         let got = resolve_delivery(
             &declared(&[ShipEntry::Client]),
             &DeliveryArgs::Unstated,
+            None,
             false,
             Verb::DEV_RUN.name(),
             admit_dev_run,
@@ -5918,6 +5991,7 @@ mod declared_delivery_tests {
         let got = resolve_delivery(
             &declared(&[]),
             &DeliveryArgs::Unstated,
+            None,
             false,
             Verb::DEV_BUILD.name(),
             ADMIT_ANY,
@@ -5934,6 +6008,7 @@ mod declared_delivery_tests {
             let got = resolve_delivery(
                 &declared(&ships),
                 &DeliveryArgs::Unstated,
+                None,
                 false,
                 Verb::DEV_BUILD.name(),
                 ADMIT_ANY,
@@ -5960,7 +6035,8 @@ mod declared_delivery_tests {
             ShipEntry::Binary(BinaryTarget::Host),
             ShipEntry::Binary(BinaryTarget::Cross(StaticTriple::Aarch64LinuxMusl)),
         ]);
-        let got = several.sole_release_member(Verb::RELEASE_RUN.name(), Verb::RELEASE_BUILD.name());
+        let got =
+            several.sole_release_member(Verb::RELEASE_RUN.name(), None, Verb::RELEASE_BUILD.name());
         let Err(CliError::ProjectRefused(message)) = &got else {
             assert!(matches!(got, Err(CliError::ProjectRefused(_))), "{got:?}");
             return;
@@ -6006,11 +6082,8 @@ mod declared_delivery_tests {
             (
                 Verb::DEV_RUN,
                 admit_dev_run,
-                [
-                    ShipEntry::Binary(BinaryTarget::Host),
-                    ShipEntry::ClientDesktop,
-                ],
-                ["ipe dev run web", "ipe dev build web client desktop"],
+                [ShipEntry::Binary(BinaryTarget::Host), ShipEntry::ClientIos],
+                ["ipe dev run web", "ipe dev build web client ios"],
             ),
             (
                 Verb::DEV_BUILD,
@@ -6022,6 +6095,7 @@ mod declared_delivery_tests {
             let got = resolve_delivery(
                 &declared(&ships),
                 &DeliveryArgs::Unstated,
+                None,
                 false,
                 verb.name(),
                 admit,
@@ -6038,6 +6112,7 @@ mod declared_delivery_tests {
                 let advised = resolve_delivery(
                     &declared(&ships),
                     &stated(&words),
+                    None,
                     false,
                     verb.name(),
                     admit,
@@ -6050,7 +6125,7 @@ mod declared_delivery_tests {
     #[test]
     fn several_declared_release_run_lists_build_for_no_run_form() {
         let got = declared(&[ShipEntry::Binary(BinaryTarget::Host), ShipEntry::Client])
-            .sole_release_member(Verb::RELEASE_RUN.name(), Verb::RELEASE_BUILD.name());
+            .sole_release_member(Verb::RELEASE_RUN.name(), None, Verb::RELEASE_BUILD.name());
         assert_eq!(
             choices(&got),
             ["ipe release run web", "ipe release build web client"],
@@ -6058,55 +6133,112 @@ mod declared_delivery_tests {
         );
     }
 
-    /// Two declared members that release different artifacts into one place
-    /// are refused before anything is built, so no artifact is overwritten
-    /// while both are reported released; members releasing the same artifact
-    /// are built once.
+    /// The member slugs `ipe release build` given no delivery words plans.
+    fn release_slugs(ships: &[ShipEntry], target: Option<StaticTriple>) -> Vec<String> {
+        declared(ships)
+            .for_release(Verb::RELEASE_BUILD.name(), target, None)
+            .map(|set| {
+                set.planned()
+                    .filter_map(|plan| plan.slug().ok())
+                    .map(|slug| slug.as_str().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A host and a cross native member are two releases in one run, each
+    /// under its own slug, so neither overwrites the other.
     #[test]
-    fn release_build_refuses_two_artifacts_in_one_place() {
+    fn release_build_releases_web_and_web_cross_target_in_one_run() {
         let cross = ShipEntry::Binary(BinaryTarget::Cross(StaticTriple::Aarch64LinuxMusl));
-        for ships in [
-            vec![ShipEntry::Binary(BinaryTarget::Host), cross],
-            vec![ShipEntry::Desktop, ShipEntry::ClientDesktop],
-        ] {
-            let got = declared(&ships).for_release(None);
-            assert!(
-                matches!(got, Err(CliError::ProjectRefused(_))),
-                "{ships:?}: {got:?}"
-            );
-        }
-        for (ships, target, members) in [
+        assert_eq!(
+            release_slugs(&[ShipEntry::Binary(BinaryTarget::Host), cross], None),
+            ["web", "web-aarch64-unknown-linux-musl"]
+        );
+        let every = release_slugs(
+            &[
+                ShipEntry::Binary(BinaryTarget::Host),
+                ShipEntry::Client,
+                ShipEntry::ClientIos,
+                ShipEntry::Desktop,
+            ],
+            None,
+        );
+        assert_eq!(
+            every,
+            ["web", "web-client", "web-client-ios", "web-desktop"]
+        );
+    }
+
+    /// Members that are one release (host, static, default cross, or a cross
+    /// member argv's `--target` folds onto the host's triple) are built once.
+    #[test]
+    fn release_build_dedupes_a_delivery_declared_twice() {
+        let default_cross = ShipEntry::Binary(BinaryTarget::Cross(StaticTriple::default()));
+        let cross = ShipEntry::Binary(BinaryTarget::Cross(StaticTriple::Aarch64LinuxMusl));
+        for (ships, target, slugs) in [
             (
                 vec![
                     ShipEntry::Binary(BinaryTarget::Host),
                     ShipEntry::Binary(BinaryTarget::Static),
+                    default_cross,
                 ],
                 None,
-                1,
+                vec!["web"],
             ),
             (
                 vec![ShipEntry::Binary(BinaryTarget::Host), cross],
                 Some(StaticTriple::Aarch64LinuxMusl),
-                1,
-            ),
-            (
-                vec![
-                    ShipEntry::Binary(BinaryTarget::Host),
-                    ShipEntry::Client,
-                    ShipEntry::ClientIos,
-                    ShipEntry::ClientDesktop,
-                ],
-                None,
-                4,
+                vec!["web-aarch64-unknown-linux-musl"],
             ),
         ] {
-            let got = declared(&ships).for_release(target);
-            assert_eq!(
-                got.as_ref().map(crate::delivery_set::DeliverySet::len).ok(),
-                Some(members),
-                "{ships:?}: {got:?}"
-            );
+            assert_eq!(release_slugs(&ships, target), slugs, "{ships:?}");
         }
+    }
+
+    /// A declared `web client desktop`, which no packer builds, is refused
+    /// before anything is built, by every command that would select it.
+    #[test]
+    fn declared_client_desktop_is_refused_before_any_build() {
+        let ships = [ShipEntry::Desktop, ShipEntry::ClientDesktop];
+        let got = declared(&ships).for_release(Verb::RELEASE_BUILD.name(), None, None);
+        assert!(matches!(got, Err(CliError::ProjectRefused(_))), "{got:?}");
+        let run = declared(&ships).sole_release_member(
+            Verb::RELEASE_RUN.name(),
+            None,
+            Verb::RELEASE_BUILD.name(),
+        );
+        assert!(matches!(run, Err(CliError::ProjectRefused(_))), "{run:?}");
+        let dev = resolve_delivery(
+            &declared(&ships),
+            &DeliveryArgs::Unstated,
+            None,
+            false,
+            Verb::DEV_BUILD.name(),
+            ADMIT_ANY,
+        );
+        assert!(matches!(dev, Err(CliError::ProjectRefused(_))), "{dev:?}");
+    }
+
+    /// A remedy line carries the project dir after its verb, so the printed
+    /// command builds the same project it was printed for.
+    #[test]
+    fn remedy_lines_carry_the_typed_dir() {
+        let got = declared(&[ShipEntry::Binary(BinaryTarget::Host), ShipEntry::Client])
+            .sole_dev_delivery(
+                Verb::DEV_RUN.name(),
+                Some("../my app"),
+                |_| true,
+                Verb::DEV_BUILD.name(),
+            );
+        assert_eq!(
+            choices(&got),
+            [
+                "ipe dev run '../my app' web",
+                "ipe dev run '../my app' web client"
+            ],
+            "{got:?}"
+        );
     }
 
     #[test]
@@ -6116,12 +6248,17 @@ mod declared_delivery_tests {
             ShipEntry::Binary(BinaryTarget::Static),
         ]);
         assert_eq!(
-            one.sole_dev_delivery(Verb::DEV_BUILD.name(), |_| true, Verb::DEV_BUILD.name())
-                .ok(),
+            one.sole_dev_delivery(
+                Verb::DEV_BUILD.name(),
+                None,
+                |_| true,
+                Verb::DEV_BUILD.name()
+            )
+            .ok(),
             Some(served())
         );
         assert_eq!(
-            one.sole_release_member(Verb::RELEASE_RUN.name(), Verb::RELEASE_BUILD.name())
+            one.sole_release_member(Verb::RELEASE_RUN.name(), None, Verb::RELEASE_BUILD.name())
                 .ok()
                 .map(PlannedDelivery::delivery),
             Some(served())
@@ -6133,6 +6270,7 @@ mod declared_delivery_tests {
         let got = resolve_delivery(
             &declared(&[]),
             &stated(&["web", "client"]),
+            None,
             false,
             Verb::DEV_BUILD.name(),
             ADMIT_ANY,
@@ -6159,7 +6297,7 @@ mod declared_delivery_tests {
             StaticTriple::Aarch64LinuxMusl,
         ))]);
         let member =
-            cross.sole_release_member(Verb::RELEASE_BUILD.name(), Verb::RELEASE_BUILD.name());
+            cross.sole_release_member(Verb::RELEASE_BUILD.name(), None, Verb::RELEASE_BUILD.name());
         assert_eq!(
             member.ok().and_then(PlannedDelivery::release_triple),
             Some(StaticTriple::Aarch64LinuxMusl)
@@ -6171,12 +6309,20 @@ mod declared_delivery_tests {
         let cross = declared(&[ShipEntry::Binary(BinaryTarget::Cross(
             StaticTriple::Aarch64LinuxMusl,
         ))]);
-        let Ok(delivery) =
-            cross.sole_dev_delivery(Verb::DEV_BUILD.name(), |_| true, Verb::DEV_BUILD.name())
-        else {
+        let Ok(delivery) = cross.sole_dev_delivery(
+            Verb::DEV_BUILD.name(),
+            None,
+            |_| true,
+            Verb::DEV_BUILD.name(),
+        ) else {
             assert!(
                 cross
-                    .sole_dev_delivery(Verb::DEV_BUILD.name(), |_| true, Verb::DEV_BUILD.name())
+                    .sole_dev_delivery(
+                        Verb::DEV_BUILD.name(),
+                        None,
+                        |_| true,
+                        Verb::DEV_BUILD.name()
+                    )
                     .is_ok()
             );
             return;
@@ -6193,6 +6339,7 @@ mod declared_delivery_tests {
         let got = resolve_delivery(
             &declared(&[ShipEntry::Client]),
             &DeliveryArgs::Unstated,
+            None,
             false,
             Verb::DEV_WATCH.name(),
             admit_watch,
@@ -6219,6 +6366,7 @@ mod declared_delivery_tests {
         let got = resolve_delivery(
             &declared(&[]),
             &stated(&["web", "client"]),
+            None,
             false,
             Verb::DEV_WATCH.name(),
             admit_watch,
@@ -6232,6 +6380,7 @@ mod declared_delivery_tests {
         let got = resolve_delivery(
             &client,
             &DeliveryArgs::Unstated,
+            None,
             false,
             Verb::DEV_WATCH.name(),
             admit_watch,
@@ -6251,6 +6400,7 @@ mod declared_delivery_tests {
         let advised = resolve_delivery(
             &client,
             &stated(&words),
+            None,
             false,
             Verb::DEV_BUILD.name(),
             ADMIT_ANY,

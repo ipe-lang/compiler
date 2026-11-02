@@ -398,11 +398,11 @@ Build the production artifact, optimised and with Debug.* gated. Native-bearing 
 ipe release build [<dir>] [<shape>] [<runtime>] [<host>]
 ```
 
-**Arguments:** A project directory (default: the current directory). shape/runtime/host are the delivery grammar shared with `dev build`: a `desktop`/`ios`/`android` host lays out the production app bundle for that host (a self-contained desktop bundle, or a native mobile system-webview shell). An `android` host produces an unsigned Gradle project: a store build needs your own keystore configured in Gradle. With no delivery args, `release build` builds every delivery declared in `ships` in package.ipe, each for the target its ship names (the served default when `ships` is absent).
+**Arguments:** A project directory (default: the current directory). shape/runtime/host are the delivery grammar shared with `dev build`: a `desktop`/`ios`/`android` host lays out the production app bundle for that host (a self-contained desktop bundle, or a native mobile system-webview shell). An `android` host produces an unsigned Gradle project: a store build needs your own keystore configured in Gradle. With no delivery args, `release build` builds every delivery declared in `ships` in package.ipe, each for the target its ship names (the served default when `ships` is absent). Each delivery lands in its own `out/release/<delivery>/` (its words joined by `-`, e.g. `out/release/web-client/`, then `-<triple>` for a cross target), one delivery included.
 
 **Flags:**
 
-- `[--out <dir>]` — put the artifact under <dir>/release/ (default: out/ in the project)
+- `[--out <dir>]` — put the artifact under <dir>/release/<delivery>/ (default: out/ in the project)
 - `[--target <triple>]` — a musl-static native <triple> (default: x86_64-unknown-linux-musl). The browser bundle is `web client`, never a target; a `web client` or app-bundle delivery takes no target.
 - `[--static]` — produce a statically linked binary
 - `[--emit-permissions <ios|macos|android>]` — read-only: print the OS-permission declarations the app's accepted web capabilities derive on the platform, and build nothing
@@ -423,7 +423,7 @@ ipe release run [<dir>|<artifact-dir>]
 
 **Flags:**
 
-- `[--out <dir>]` — put the artifact under <dir>/release/ (default: out/ in the project)
+- `[--out <dir>]` — put the artifact under <dir>/release/<delivery>/ (default: out/ in the project)
 - `[--target <triple>]` — a musl-static native <triple> (default: x86_64-unknown-linux-musl). The browser bundle is `web client`, never a target; a `web client` or app-bundle delivery takes no target.
 - `[--runtime <dir>]` — vendor the Ipê runtime source from <dir>
 - `[-- <args>...]` — forward <args> to the artifact

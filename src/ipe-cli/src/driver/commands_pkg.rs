@@ -8,7 +8,9 @@ use super::{
     resolve_vendored_runtime_dir, run_build, runtime_context_for_message, working_dir,
 };
 use crate::cargo_step::{CargoOutput, CargoTarget, TestRunKey, Verbosity};
-use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths};
+use crate::output_dir::{
+    EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths, ReleaseMember,
+};
 use crate::project_root::{AnalysisTarget, FileArg, ProjectRoot, SourceDir};
 use crate::publisher::{AttestedActor, BlessedPublisher};
 use crate::remote_ingest::{InheritedError, InheritedInput, InheritedRole, run_inherited};
@@ -36,15 +38,6 @@ pub enum BundleProfile {
 }
 
 impl BundleProfile {
-    /// The bundle profile a native build finished in `finish` packages: a
-    /// release bundle only behind the release consent witness.
-    pub(crate) const fn of(finish: &NativeFinish<'_>) -> Self {
-        match finish {
-            NativeFinish::Dev => Self::Dev,
-            NativeFinish::Release { .. } => Self::Release,
-        }
-    }
-
     /// The build intent the bundle's crate is emitted with.
     ///
     /// The `release` bundle is a shipped artifact, so it is a release build;
@@ -54,28 +47,6 @@ impl BundleProfile {
             Self::Dev => ipe_backend_rust::BuildIntent::Development,
             Self::Release => ipe_backend_rust::BuildIntent::Release,
         }
-    }
-
-    /// The emitted crate's area under the output root.
-    ///
-    /// `rust/` for [`Self::Dev`], `release/rust/` for [`Self::Release`] — where
-    /// `build` and `release` respectively put it.
-    const fn crate_areas(self) -> &'static [OutputArea] {
-        match self {
-            Self::Dev => &[OutputArea::Rust],
-            Self::Release => &[OutputArea::Release, OutputArea::Rust],
-        }
-    }
-
-    /// Claim the directory this profile's packaged bundles go in.
-    ///
-    /// `dist/` for [`Self::Dev`], `release/dist/` for [`Self::Release`].
-    fn dist_dir(self, output: &OutputRoot) -> Result<OwnedDir, CliError> {
-        let areas: &[OutputArea] = match self {
-            Self::Dev => &[OutputArea::Dist],
-            Self::Release => &[OutputArea::Release, OutputArea::Dist],
-        };
-        output.claim_area(areas)
     }
 
     /// The compiled binary's `target/` profile subdirectory (`debug` / `release`),
@@ -88,41 +59,119 @@ impl BundleProfile {
     }
 }
 
-/// The delivery host a bundling verb (`build`/`release`) targets.
+pub use crate::delivery_set::BundleHost;
+
+/// The posture a bundle is finished in, and where it is written.
 ///
-/// Resolved from the delivery grammar's [`delivery::Host`]: `desktop` routes to
-/// the webview-native desktop packager, `ios`/`android` to the mobile
-/// system-webview packager. The served/default host produces no bundle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BundleHost {
-    /// `web desktop` — a self-contained per-OS desktop bundle for the host OS.
-    Desktop,
-    /// `web client ios` / `web client android` — a native mobile system-webview shell.
-    Mobile(pack::mobile::MobileOs),
+/// A dev bundle writes `rust/` and `dist/` under the output root the build
+/// resolved (`--out`, else the default). A release bundle writes them under
+/// its own release member root (`release/<slug>/`), carried with the consent
+/// witness, so a release bundle without a member place has no representation.
+/// Neither place is created until a product is written.
+pub enum BundleFinish<'a> {
+    /// `ipe dev build`: a debug bundle under `output`.
+    Dev {
+        /// The output root the build resolved.
+        output: OutputRoot,
+    },
+    /// `ipe release build`: an optimised bundle under `member`.
+    Release {
+        /// The capabilities the release consent gates admitted.
+        consented: &'a super::ConsentedCapabilities,
+        /// The database driver the profile's socket allowances follow.
+        driver: ipe_backend_rust::DbDriver,
+        /// The release member root this bundle writes under.
+        member: ReleaseMember,
+    },
 }
 
-impl BundleHost {
-    /// Map a resolved delivery [`delivery::Host`] onto the bundle host it
-    /// packages, or `None` for the served/default host (which produces a plain
-    /// artifact, not a bundle). The mobile host word is the delivery grammar's own
-    /// `ios`/`android`, so the closed-set resolution below cannot fail in practice
-    /// — a refusal is surfaced, never panicked.
+impl<'a> BundleFinish<'a> {
+    /// The native build posture this bundle's binary is finished in.
+    const fn native(&self) -> NativeFinish<'a> {
+        match self {
+            Self::Dev { .. } => NativeFinish::Dev,
+            Self::Release {
+                consented, driver, ..
+            } => NativeFinish::Release {
+                consented,
+                driver: *driver,
+            },
+        }
+    }
+
+    /// The bundle profile this posture packages.
+    const fn profile(&self) -> BundleProfile {
+        match self {
+            Self::Dev { .. } => BundleProfile::Dev,
+            Self::Release { .. } => BundleProfile::Release,
+        }
+    }
+
+    /// The emitted crate's place, `rust/` under the root or the member,
+    /// claimed when the crate is written.
+    fn crate_target(&self) -> EmitTarget {
+        match self {
+            Self::Dev { output } => EmitTarget::Area(output.area(&[OutputArea::Rust])),
+            Self::Release { member, .. } => EmitTarget::Member(member.area(OutputArea::Rust)),
+        }
+    }
+
+    /// Claim the directory the packaged bundles go in: `dist/` under the
+    /// root or the member.
+    fn dist_dir(&self) -> Result<OwnedDir, CliError> {
+        match self {
+            Self::Dev { output } => output.claim_area(&[OutputArea::Dist]),
+            Self::Release { member, .. } => member.area(OutputArea::Dist).claim(),
+        }
+    }
+
+    /// The output root the mobile shell's `web client` bundle build is handed:
+    /// the root, or the member root.
+    ///
+    /// The levels above a member root are claimed first, so the build, which
+    /// claims its own root only when it writes, never creates them unowned.
     ///
     /// # Errors
-    /// [`CliError::Usage`] if the mobile OS resolution refuses (unreachable
-    /// through the typed [`delivery::Host`]).
-    pub fn from_delivery_host(host: delivery::Host) -> Result<Option<Self>, CliError> {
-        let mobile = |word| {
-            pack::mobile::resolve_os(Some(word))
-                .map(Self::Mobile)
-                .map_err(|r| CliError::Usage(crate::text::Message::relay(&r)))
+    /// As [`ReleaseMember::claim_parent`] and [`ReleaseMember::path`].
+    fn wasm_root(&self) -> Result<PathBuf, CliError> {
+        match self {
+            Self::Dev { output } => Ok(output.path().to_path_buf()),
+            Self::Release { member, .. } => {
+                member.claim_parent()?;
+                member.path()
+            }
+        }
+    }
+
+    /// The `www/` tree the mobile shell's `web client` bundle build produced
+    /// under [`Self::wasm_root`].
+    ///
+    /// A dev build writes it in `rust/www/`; a release build in its own member
+    /// `release/<web client slug>/rust/www/` under the root it was handed.
+    fn wasm_www(&self, project: &ProjectPaths) -> Result<PathBuf, CliError> {
+        let crate_dir = match self {
+            Self::Dev { output } => output.claim_area(&[OutputArea::Rust])?,
+            Self::Release { member, .. } => {
+                let slug =
+                    crate::delivery_set::PlannedDelivery::release(MOBILE_BUNDLE_DELIVERY, None)
+                        .map_err(|e| CliError::Pipeline {
+                            file: PathBuf::new(),
+                            src: String::new(),
+                            diag: Box::new(ipe_diagnostics::Diagnostic::CompilerBug {
+                                where_: "mobile bundle delivery",
+                                detail: format!(
+                                    "`{MOBILE_BUNDLE_DELIVERY}` has no release route: {e}"
+                                ),
+                            }),
+                        })?
+                        .slug()?;
+                OutputRoot::at(member.claim()?.path(), project)?
+                    .release_member(&slug)
+                    .area(OutputArea::Rust)
+                    .claim()?
+            }
         };
-        Ok(match host {
-            delivery::Host::Default => None,
-            delivery::Host::Desktop => Some(Self::Desktop),
-            delivery::Host::Ios => Some(mobile("ios")?),
-            delivery::Host::Android => Some(mobile("android")?),
-        })
+        Ok(crate_dir.path_to("www")?.path())
     }
 }
 
@@ -142,12 +191,12 @@ impl BundleHost {
 /// the underlying build's errors; [`CliError::Io`] on any filesystem failure.
 pub fn bundle_delivery(
     host: BundleHost,
-    finish: NativeFinish<'_>,
+    finish: BundleFinish<'_>,
     held: &HeldBuild,
 ) -> Result<(), CliError> {
     match host {
         BundleHost::Desktop => pack_desktop(finish, held),
-        BundleHost::Mobile(os) => pack_mobile(os, BundleProfile::of(&finish), held),
+        BundleHost::Mobile(os) => pack_mobile(os, finish, held),
     }
 }
 
@@ -283,6 +332,7 @@ pub fn validate_mobile_pack(
 struct BundleAssembler<'a> {
     held: &'a HeldBuild,
     profile: BundleProfile,
+    finish: BundleFinish<'a>,
 }
 
 /// A desktop-shape gate witness: proof that [`validate_desktop_shape`] passed
@@ -293,7 +343,6 @@ struct BundleAssembler<'a> {
 /// emitted for the webview host.
 pub struct GatedDesktop<'a> {
     assembler: BundleAssembler<'a>,
-    finish: NativeFinish<'a>,
     webview: delivery::WebViewProof,
 }
 
@@ -311,8 +360,7 @@ impl GatedDesktop<'_> {
     /// Build/emit errors from the underlying compile; [`CliError::Io`] on any
     /// filesystem failure while materialising the bundle.
     pub fn assemble(self, os: pack::desktop::DesktopOs) -> Result<(), CliError> {
-        self.assembler
-            .assemble_desktop(os, self.finish, self.webview)
+        self.assembler.assemble_desktop(os, self.webview)
     }
 
     /// Emit the packaged app's crate into `out` without running cargo.
@@ -338,10 +386,14 @@ impl GatedMobile<'_> {
 }
 
 impl<'a> BundleAssembler<'a> {
-    /// Construct an assembler for the held build `held` at the given profile.
+    /// Construct an assembler for the held build `held` finished in `finish`.
     /// Private: a runnable assembler is reachable only through a gate witness.
-    const fn new(held: &'a HeldBuild, profile: BundleProfile) -> Self {
-        Self { held, profile }
+    const fn new(held: &'a HeldBuild, finish: BundleFinish<'a>) -> Self {
+        Self {
+            held,
+            profile: finish.profile(),
+            finish,
+        }
     }
 
     /// The manifest of the held build.
@@ -359,7 +411,7 @@ impl<'a> BundleAssembler<'a> {
     /// the shape is not webview-capable.
     pub fn gate_desktop(
         held: &'a HeldBuild,
-        finish: NativeFinish<'a>,
+        finish: BundleFinish<'a>,
     ) -> Result<GatedDesktop<'a>, CliError> {
         let declared = held
             .root()
@@ -381,8 +433,7 @@ impl<'a> BundleAssembler<'a> {
             )));
         };
         Ok(GatedDesktop {
-            assembler: Self::new(held, BundleProfile::of(&finish)),
-            finish,
+            assembler: Self::new(held, finish),
             webview,
         })
     }
@@ -398,10 +449,10 @@ impl<'a> BundleAssembler<'a> {
     /// push but names no `delivery.mobile.push`.
     pub fn gate_mobile(
         held: &'a HeldBuild,
-        profile: BundleProfile,
+        finish: BundleFinish<'a>,
     ) -> Result<GatedMobile<'a>, CliError> {
         validate_mobile_pack(held.root().manifest(), held.shape())?;
-        Ok(GatedMobile(Self::new(held, profile)))
+        Ok(GatedMobile(Self::new(held, finish)))
     }
 
     /// Emit the desktop app's crate into `out` for the webview host `webview`
@@ -439,7 +490,6 @@ impl<'a> BundleAssembler<'a> {
     fn assemble_desktop(
         &self,
         os: pack::desktop::DesktopOs,
-        finish: NativeFinish<'_>,
         webview: delivery::WebViewProof,
     ) -> Result<(), CliError> {
         use std::fmt::Write as _;
@@ -462,8 +512,7 @@ impl<'a> BundleAssembler<'a> {
         // Emit + compile the project to a binary. A webview app carries the
         // system webview as a dynamic dependency, so this is a plain
         // (non-static) native build.
-        let output = OutputRoot::resolve(None, &ProjectPaths::from_manifest(manifest))?;
-        let rust_target = EmitTarget::Area(output.area(&[OutputArea::Rust]));
+        let rust_target = self.finish.crate_target();
         let crate_dir = self.emit_desktop(OutTarget::Proven(&rust_target), webview)?;
 
         let cargo_bin = toolchain::require_cargo(toolchain::ToolIntent::Build)?;
@@ -478,7 +527,7 @@ impl<'a> BundleAssembler<'a> {
         FlooredBuild {
             cargo: &cargo_bin,
             crate_dir: &crate_dir,
-            finish,
+            finish: self.finish.native(),
             target: CargoTarget::Host,
             target_dir: &target_dir,
             output: CargoOutput::Human(Verbosity::Progress),
@@ -500,7 +549,7 @@ impl<'a> BundleAssembler<'a> {
             )));
         }
 
-        let dist = self.profile.dist_dir(&output)?.child(os.as_str())?;
+        let dist = self.finish.dist_dir()?.child(os.as_str())?;
         let bundle_root = pack::desktop::materialise(&layout, &binary, icon, &dist)?;
 
         let mut body = format!(
@@ -550,23 +599,21 @@ impl<'a> BundleAssembler<'a> {
         // pipeline (emit + cargo + wasm-bindgen) is the single source of the
         // hostable bundle; invoking it through this binary keeps that pipeline
         // authoritative rather than re-implemented here.
-        let output = OutputRoot::resolve(None, &ProjectPaths::from_manifest(manifest))?;
+        let project = ProjectPaths::from_manifest(manifest);
+        let wasm_root = self.finish.wasm_root()?;
         let manifest_path = self.held.manifest_path();
         build_under_pinned_manifest(manifest_path, &pin, || {
-            build_wasm_for_mobile(manifest_path, output.path(), self.profile)
+            build_wasm_for_mobile(manifest_path, &wasm_root, self.profile)
         })?;
         // The SPA is read from the owned crate; a symlinked `www/` is refused so
         // the shell can never pick up files from outside the build output.
-        let www_dir = output
-            .claim_area(self.profile.crate_areas())?
-            .path_to("www")?
-            .path();
+        let www_dir = self.finish.wasm_www(&project)?;
         let bundle = pack::mobile::SpaBundle::from_www_dir(&www_dir)
             .map_err(|e| CliError::Usage(crate::text::Message::relay(&e)))?;
 
         let layout = pack::mobile::layout(os, self.profile, &shell, &pin, &bundle, icon)?;
 
-        let dist = self.profile.dist_dir(&output)?.child(os.as_str())?;
+        let dist = self.finish.dist_dir()?.child(os.as_str())?;
         let shell_root = pack::mobile::materialise(&layout, icon, &dist)?;
 
         let note = mobile_release_note(os);
@@ -621,7 +668,7 @@ fn mobile_release_note(os: pack::mobile::MobileOs) -> String {
 /// [`CliError::Usage`] wrapping a [`pack::desktop::DesktopRefusal`];
 /// build/emit errors from the underlying compile; [`CliError::Io`] on any
 /// filesystem failure while materialising the bundle.
-pub fn pack_desktop(finish: NativeFinish<'_>, held: &HeldBuild) -> Result<(), CliError> {
+pub fn pack_desktop(finish: BundleFinish<'_>, held: &HeldBuild) -> Result<(), CliError> {
     // The desktop bundle is the host OS's webview-native app; the delivery
     // grammar carries no per-OS override (a cross-OS artifact is finished on that
     // OS's own runner), so the packager always targets this host's OS.
@@ -661,7 +708,7 @@ pub fn pack_desktop(finish: NativeFinish<'_>, held: &HeldBuild) -> Result<(), Cl
 /// collecting the bundle or materialising the shell.
 pub fn pack_mobile(
     os: pack::mobile::MobileOs,
-    profile: BundleProfile,
+    finish: BundleFinish<'_>,
     held: &HeldBuild,
 ) -> Result<(), CliError> {
     // Gate the app's web-delivery capability BEFORE any build: it must be a
@@ -674,7 +721,7 @@ pub fn pack_mobile(
     // name rather than silently packaging a terminal or script app as an SPA.
     // The witness constructor runs the gate and is the only way to obtain a
     // runnable assembler — assembling an ungated shape has no representation.
-    BundleAssembler::gate_mobile(held, profile)?.assemble(os)
+    BundleAssembler::gate_mobile(held, finish)?.assemble(os)
 }
 
 /// The delivery the mobile bundle build is re-invoked with: the browser
@@ -684,7 +731,8 @@ pub const MOBILE_BUNDLE_DELIVERY: delivery::Delivery = delivery::Delivery::web_c
 /// Build the hostable SPA bundle under `output_root` through this binary.
 ///
 /// `ipe dev build web client` for a dev bundle (`<root>/rust/www/`), `ipe
-/// release build web client` for a production one (`<root>/release/rust/www/`).
+/// release build web client` for a production one
+/// (`<root>/release/web-client/rust/www/`).
 ///
 /// Invoking the same binary keeps the wasm bundle pipeline (emit + cargo +
 /// wasm-bindgen) authoritative — the mobile shell hosts exactly the bundle a
@@ -4480,6 +4528,7 @@ mod pack_gate_tests {
         super::super::commands::resolve_delivery(
             &declared,
             &positionals,
+            None,
             false,
             verb.name(),
             super::super::commands::ADMIT_ANY,
@@ -5109,7 +5158,10 @@ main =
         let root = ProjectRoot::resolve(crate::project_root::RootArg::at(fixture.path()))
             .expect("the fixture resolves");
         let held = HeldBuild::read(root).expect("the fixture is read");
-        let gated = BundleAssembler::gate_desktop(&held, NativeFinish::Dev)
+        let output =
+            OutputRoot::resolve(None, &ProjectPaths::from_manifest(held.root().manifest()))
+                .expect("the default output root resolves");
+        let gated = BundleAssembler::gate_desktop(&held, BundleFinish::Dev { output })
             .expect("a web app passes the desktop gate");
         let out = ipe_test_temp::temp_root()
             .join(format!("ipe-desktop-packager-emit-{}", std::process::id()));

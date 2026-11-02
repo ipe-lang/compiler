@@ -91,17 +91,19 @@ Package it:
 ipe release build web desktop
 ```
 
-This compiles the app and lays out a bundle for the host OS:
+This compiles the app and lays out a bundle for the host OS. Every release writes
+under its own `out/release/<delivery>/` — the delivery words joined by `-`, here
+`web-desktop` — so the deliveries of one `release build` never overwrite each other:
 
 ```
-packaged `ui-layout` for linux → out/release/dist/linux/ui-layout
+packaged `ui-layout` for linux → out/release/web-desktop/dist/linux/ui-layout
   This app requires WebKitGTK at runtime (Debian/Ubuntu: libwebkit2gtk-4.1-0).
 ```
 
 The Linux bundle is a self-contained tree:
 
 ```
-out/release/dist/linux/ui-layout/
+out/release/web-desktop/dist/linux/ui-layout/
   bin/                 the compiled binary
   ui-layout.desktop    the desktop-entry launcher
   RUNTIME.txt          the runtime dependency note
@@ -140,9 +142,9 @@ ipe release build web client android
 This builds the wasm bundle and materialises a native shell:
 
 ```
-  wasm bundle ready at out/release/rust/www/
-  bundle size: 196 KB (out/release/rust/www/pkg/ipe_app_bg.wasm)
-packaged `ui-layout` for android → out/release/dist/android/ui-layout-android
+  wasm bundle ready at out/release/web-client-android/release/web-client/rust/www/
+  bundle size: 196 KB (out/release/web-client-android/release/web-client/rust/www/pkg/ipe_app_bg.wasm)
+packaged `ui-layout` for android → out/release/web-client-android/dist/android/ui-layout-android
   note: an unsigned Android Gradle project is written here. To build it:
     ...
 ```
@@ -170,7 +172,7 @@ run the packaged build instead, launch the emitted binary directly:
 
 ```
 ipe release build web desktop
-./out/release/dist/linux/<name>/bin/<name>
+./out/release/web-desktop/dist/linux/<name>/bin/<name>
 ```
 
 Linux needs WebKitGTK (`libwebkit2gtk-4.1-0`); macOS uses the system WebKit;
@@ -178,20 +180,20 @@ Windows needs the Edge WebView2 runtime. On a **headless** box (CI, a server),
 run it under a virtual display:
 
 ```
-xvfb-run -a ./out/release/dist/linux/<name>/bin/<name>
+xvfb-run -a ./out/release/web-desktop/dist/linux/<name>/bin/<name>
 ```
 
 ### Android (emulator)
 
 `release web client android` writes a Gradle project to
-`out/release/dist/android/<name>-android/`. To **simulate**, boot an emulator
+`out/release/web-client-android/dist/android/<name>-android/`. To **simulate**, boot an emulator
 first (or start one from Android Studio's Device Manager):
 
 ```
 emulator -avd <your-avd> &
 ```
 
-With the Android SDK on `PATH`, `cd` into `out/release/dist/android/<name>-android/`
+With the Android SDK on `PATH`, `cd` into `out/release/web-client-android/dist/android/<name>-android/`
 and:
 
 <!-- android-build-steps -->
@@ -206,12 +208,12 @@ Android SDK.
 
 ### iOS (simulator)
 
-`release web client ios` writes an Xcode project to `out/release/dist/ios/<name>-ios/` (a
+`release web client ios` writes an Xcode project to `out/release/web-client-ios/dist/ios/<name>-ios/` (a
 `WKWebView` plus a scheme handler serving the wasm client). Simulating needs
 **macOS + Xcode**:
 
 ```
-open out/release/dist/ios/<name>-ios/          # open the Xcode project, pick an iOS Simulator, press ⌘R
+open out/release/web-client-ios/dist/ios/<name>-ios/          # open the Xcode project, pick an iOS Simulator, press ⌘R
 # headless macOS:
 xcrun simctl boot "iPhone 15"
 xcodebuild -scheme App -destination 'platform=iOS Simulator,name=iPhone 15'

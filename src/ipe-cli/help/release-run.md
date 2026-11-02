@@ -10,7 +10,7 @@ A project directory (default: the current directory), or a built artifact direct
 
 ## Options
 
-- `[--out <dir>]` — put the artifact under <dir>/release/ (default: out/ in the project)
+- `[--out <dir>]` — put the artifact under <dir>/release/<delivery>/ (default: out/ in the project)
 - `[--target <triple>]` — a musl-static native <triple> (default: x86_64-unknown-linux-musl). The browser bundle is `web client`, never a target; a `web client` or app-bundle delivery takes no target.
 - `[--runtime <dir>]` — vendor the Ipê runtime source from <dir>
 - `[-- <args>...]` — forward <args> to the artifact
