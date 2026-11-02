@@ -19,6 +19,11 @@ crossbeam-channel = "0.5"
 # `Cancelled::catch` around worker-thread query demands.
 salsa = "=0.28.5"
 
+# A stdlib copy is opened through its held parent, never through a link and
+# never blocking; only a host with Unix ownership serves one.
+[target.'cfg(unix)'.dependencies]
+ipe_fs_open = { path = "../../compiler/fs_open" }
+
 [dev-dependencies]
 e2e-support = { path = "../../../tools/e2e-support" }
 ipe-test-temp = { path = "../../../tools/test-temp" }

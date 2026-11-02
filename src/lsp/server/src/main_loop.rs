@@ -2,7 +2,7 @@
 //! thread, diagnostics on cancellable worker threads, latest-generation-wins
 //! publishing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -80,6 +80,13 @@ struct Layout {
     /// and per-edit overlay lookup are `O(log n)`, not a linear scan or a
     /// re-canonicalize.
     path_of_module: BTreeMap<Vec<String>, PathBuf>,
+    /// The normalized path of each stdlib module's materialised read-only copy.
+    ///
+    /// A definition target only: no stdlib copy is ever a document the
+    /// server edits, renames, or maps back to a module, so it never enters
+    /// `module_of_path`, and opening one never re-runs the load
+    /// ([`State::is_stdlib_copy`]).
+    stdlib_path_of_module: BTreeMap<Vec<String>, PathBuf>,
     /// Where `lint.ipe` is read from, if the load resolved it.
     lint_source: LintSource,
 }
@@ -131,11 +138,19 @@ impl Layout {
             .iter()
             .map(|(module, path)| (path.clone(), module.clone()))
             .collect();
+        let stdlib_path_of_module = files
+            .iter()
+            .filter(|(_, file)| {
+                file.origin == ModuleOrigin::EmbeddedStdlib && file.path.is_absolute()
+            })
+            .map(|(module, file)| (module.clone(), normalize(&file.path)))
+            .collect();
         Self {
             entry_module,
             disk: files,
             module_of_path,
             path_of_module,
+            stdlib_path_of_module,
             lint_source,
         }
     }
@@ -225,6 +240,13 @@ struct State {
     docs: Option<ipe_docs::Index>,
     /// Whether the client accepts versioned `documentChanges` in a workspace edit.
     document_changes: bool,
+    /// The stdlib copies of the last adopted layout that named any, normalized.
+    ///
+    /// Held apart from [`State::served`] because the editor keeps a copy's
+    /// tab open across a refusal that withdraws the layout: the copy must
+    /// stay no project anchor ([`State::is_stdlib_copy`]) whatever is served.
+    /// Replaced, never grown, so it holds at most one layout's stdlib.
+    stdlib_copies: BTreeSet<PathBuf>,
 }
 
 impl State {
@@ -245,6 +267,29 @@ impl State {
     fn uri_for_module(&self, module: &[String]) -> Option<Url> {
         let path = self.served.layout()?.path_of_module.get(module)?;
         Url::from_file_path(path).ok()
+    }
+
+    /// Whether the normalized `path` is a stdlib copy a layout of this session named.
+    fn is_stdlib_copy(&self, path: &Path) -> bool {
+        self.stdlib_copies.contains(path)
+    }
+
+    /// The URI a definition in `module`, whose analysed source is `text`, jumps to.
+    ///
+    /// A user module answers with its document; a stdlib module answers
+    /// with its materialised copy only once that copy re-proves to hold
+    /// exactly `text`, so a tampered, partial, or swapped copy is never
+    /// served and no range is ever placed over bytes other than the ones it
+    /// was computed on.
+    fn definition_uri_for_module(&self, module: &[String], text: &str) -> Option<Url> {
+        self.uri_for_module(module).or_else(|| {
+            let path = self.served.layout()?.stdlib_path_of_module.get(module)?;
+            if stdlib_copy_holds(path, text) {
+                Url::from_file_path(path).ok()
+            } else {
+                None
+            }
+        })
     }
 
     /// Resolve a document URI to its module path and input handle. The handle's
@@ -285,6 +330,7 @@ impl State {
             // leaves enrichment off rather than blocking the server.
             docs: ipe_docs::Index::build_embedded().ok(),
             document_changes: false,
+            stdlib_copies: BTreeSet::new(),
         }
     }
 
@@ -674,9 +720,6 @@ fn definition_result(state: &State, params: &serde_json::Value) -> FeatureOutcom
     ) else {
         return FeatureOutcome::NoResult;
     };
-    let Some(def_uri) = state.uri_for_module(&def.module) else {
-        return FeatureOutcome::NoResult;
-    };
     // Borrow the target text to convert the byte span to a range.
     let empty = String::new();
     let def_text = ctx
@@ -684,6 +727,9 @@ fn definition_result(state: &State, params: &serde_json::Value) -> FeatureOutcom
         .files(state.db.db())
         .get(&def.module)
         .map_or(&empty, |f| f.text(state.db.db()));
+    let Some(def_uri) = state.definition_uri_for_module(&def.module, def_text) else {
+        return FeatureOutcome::NoResult;
+    };
     let range = ipe_lsp_features::offset::span_to_range(def_text, def.span, state.encoding);
     let location = lsp_types::Location {
         uri: def_uri,
@@ -716,15 +762,15 @@ fn type_definition_result(state: &State, params: &serde_json::Value) -> FeatureO
     ) else {
         return FeatureOutcome::NoResult;
     };
-    let Some(def_uri) = state.uri_for_module(&def.module) else {
-        return FeatureOutcome::NoResult;
-    };
     let empty = String::new();
     let def_text = ctx
         .root
         .files(state.db.db())
         .get(&def.module)
         .map_or(&empty, |f| f.text(state.db.db()));
+    let Some(def_uri) = state.definition_uri_for_module(&def.module, def_text) else {
+        return FeatureOutcome::NoResult;
+    };
     let range = ipe_lsp_features::offset::span_to_range(def_text, def.span, state.encoding);
     FeatureOutcome::payload(lsp_types::Location {
         uri: def_uri,
@@ -741,7 +787,7 @@ fn references_result(state: &State, params: &serde_json::Value) -> FeatureOutcom
     let Ok(ctx) = position_ctx(state, &position.text_document.uri, position.position) else {
         return FeatureOutcome::NoResult;
     };
-    // Resolve via goto_definition to get the canonical (home, name) pair.
+    // Resolve via goto_definition to the target: a declaration or a local binder.
     let Some(def) = ipe_lsp_features::navigation::goto_definition(
         state.db.db(),
         ctx.root,
@@ -758,17 +804,11 @@ fn references_result(state: &State, params: &serde_json::Value) -> FeatureOutcom
     let Some(def_text) = text_of(&def.module) else {
         return FeatureOutcome::NoResult;
     };
-    let lo = def.span.lo as usize;
-    let hi = def.span.hi as usize;
-    let Some(def_name) = def_text.get(lo..hi) else {
-        return FeatureOutcome::NoResult;
-    };
     let refs = ipe_lsp_features::navigation::find_references(
         state.db.db(),
         ctx.root,
         ctx.entry_file,
-        &def.module,
-        def_name,
+        &def.target,
     );
     let mut locations: Vec<lsp_types::Location> = Vec::new();
     // Include definition if requested.
@@ -864,6 +904,55 @@ fn rename_result(state: &State, params: &serde_json::Value) -> FeatureOutcome {
         return FeatureOutcome::NoResult;
     };
     FeatureOutcome::payload(ws_edit)
+}
+
+/// Whether the stdlib copy at `path` is a read-only regular file holding exactly `text`.
+///
+/// The entry must be a read-only regular file when inspected without
+/// following a link. It is then opened through its held parent directory,
+/// never through a link and never blocking, so a FIFO, device or socket
+/// swapped in after the inspection is refused rather than waited on; the
+/// opened handle must still be the object the name holds, and the read
+/// stops one byte past `text`'s length, so a link, a swapped entry, an
+/// appended tail, or a huge planted file each answers `false` without
+/// being read whole. Content equality is the proof a range is placed on;
+/// read-only is the copy's write-once stamp.
+#[cfg(unix)]
+fn stdlib_copy_holds(path: &Path, text: &str) -> bool {
+    let Ok(entry) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !entry.file_type().is_file() || !entry.permissions().readonly() {
+        return false;
+    }
+    let Some(cap) = u64::try_from(text.len())
+        .ok()
+        .and_then(ipe_fs_open::ByteCap::new)
+    else {
+        return false;
+    };
+    open_stdlib_copy(path)
+        .and_then(|file| file.read_bytes(cap).ok())
+        .is_some_and(|bytes| bytes == text.as_bytes())
+}
+
+/// No stdlib copy is trusted on a host without Unix ownership: the cache that writes one refuses there.
+#[cfg(not(unix))]
+const fn stdlib_copy_holds(_path: &Path, _text: &str) -> bool {
+    false
+}
+
+/// Open the regular file at `path` through its parent, never through a link and never blocking.
+///
+/// `None` unless the opened object is a regular file and is still the
+/// object the name holds.
+#[cfg(unix)]
+fn open_stdlib_copy(path: &Path) -> Option<ipe_fs_open::RegularFile> {
+    let name = ipe_fs_open::EntryName::new(path.file_name()?)?;
+    let dir = ipe_fs_open::HeldDir::open_root(path.parent()?).ok()?;
+    let file = dir.open_regular(&name).ok()?;
+    let opened = file.id().ok()?;
+    (dir.entry_id(&name).ok()? == Some(opened)).then_some(file)
 }
 
 /// Normalize a path for map keys: canonical when the file exists, verbatim
@@ -976,13 +1065,26 @@ fn ensure_project(state: &mut State, loader: &dyn ProjectLoader, path: &Path) {
     ensure_project_fresh(state, loader, path);
 }
 
-/// Unconditionally re-resolve the project layout anchored at `path`.
+/// Re-resolve the project layout anchored at `path`, unless `path` is a stdlib copy.
+///
+/// A stdlib copy is a read-only view a definition opened, never a project
+/// anchor: a load from it would serve the copy as a user module, or refuse
+/// its root and withdraw the project being edited.
 fn ensure_project_fresh(state: &mut State, loader: &dyn ProjectLoader, path: &Path) {
+    if state.is_stdlib_copy(path) {
+        return;
+    }
     let open_text = state.overlays.get(path).map(|o| o.text.as_str());
     let verdict = loader.load(&state.workspace_roots, path, open_text);
     let previous = std::mem::replace(&mut state.served, Served::Unloaded);
     state.served = match verdict {
-        Ok(project) => Served::Trusted(Layout::of(project)),
+        Ok(project) => {
+            let layout = Layout::of(project);
+            if !layout.stdlib_path_of_module.is_empty() {
+                state.stdlib_copies = layout.stdlib_path_of_module.values().cloned().collect();
+            }
+            Served::Trusted(layout)
+        }
         Err(err) => match (err.disposition(), previous) {
             // A refusal withdraws every layout, a trusted one included: the
             // compiler refuses the project, so no analysis of it stays shown.
@@ -1640,7 +1742,7 @@ fn document_highlight_result(state: &State, params: &serde_json::Value) -> Featu
     let Ok(ctx) = position_ctx(state, &position.text_document.uri, position.position) else {
         return FeatureOutcome::NoResult;
     };
-    // Resolve to the canonical (home, name) pair via goto_definition.
+    // Resolve via goto_definition to the target: a declaration or a local binder.
     let Some(def) = ipe_lsp_features::navigation::goto_definition(
         state.db.db(),
         ctx.root,
@@ -1655,18 +1757,12 @@ fn document_highlight_result(state: &State, params: &serde_json::Value) -> Featu
     let Some(def_text) = text_of(&def.module) else {
         return FeatureOutcome::NoResult;
     };
-    let lo = def.span.lo as usize;
-    let hi = def.span.hi as usize;
-    let Some(def_name) = def_text.get(lo..hi) else {
-        return FeatureOutcome::NoResult;
-    };
     // Collect references across all modules, then filter to the requested document.
     let refs = ipe_lsp_features::navigation::find_references(
         state.db.db(),
         ctx.root,
         ctx.entry_file,
-        &def.module,
-        def_name,
+        &def.target,
     );
     let mut highlights: Vec<lsp_types::DocumentHighlight> = Vec::new();
     // Include the definition site when it is in the same document.
@@ -2488,6 +2584,101 @@ mod tests {
         did_change_watched_files(&mut state, &loader, &diag_tx);
         assert_eq!(loader.loads(), 0, "no anchor, no load");
         assert!(matches!(state.served, Served::Unloaded));
+    }
+
+    /// A loader serving `Main` plus `Ipe.Tuple` at a materialised stdlib copy, counting its loads.
+    struct StdlibCopyLoader {
+        copy: PathBuf,
+        loads: AtomicUsize,
+    }
+
+    impl ProjectLoader for StdlibCopyLoader {
+        fn load(
+            &self,
+            _workspace_roots: &[PathBuf],
+            open_file: &Path,
+            open_text: Option<&str>,
+        ) -> Result<LoadedProject, LoadError> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            let mut files = BTreeMap::new();
+            files.insert(
+                vec!["Main".to_owned()],
+                LoadedFile {
+                    path: open_file.to_path_buf(),
+                    text: open_text.unwrap_or(MAIN_TEXT).to_owned(),
+                    origin: ModuleOrigin::User,
+                },
+            );
+            files.insert(
+                vec!["Ipe".to_owned(), "Tuple".to_owned()],
+                LoadedFile {
+                    path: self.copy.clone(),
+                    text: String::new(),
+                    origin: ModuleOrigin::EmbeddedStdlib,
+                },
+            );
+            Ok(LoadedProject {
+                files,
+                entry_module: vec!["Main".to_owned()],
+                lint_config_dir: ipe_lint::lint_config_dir(open_file),
+            })
+        }
+    }
+
+    /// A stdlib copy stays no anchor after a refusal withdrew the layout that named it.
+    ///
+    /// The editor keeps the copy's tab open across the refusal; its open or
+    /// close must neither re-run the load from the copy nor move the
+    /// refusal, and the diagnostic published on its anchor, onto the copy.
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: an unbuildable URI IS the failure
+    fn a_stdlib_copy_is_no_anchor_after_a_refusal_withdrew_the_layout() {
+        let main_path = normalize(Path::new("/lsp-stdlib-copy-refused-test/src/Main.ipe"));
+        let copy = normalize(Path::new("/lsp-stdlib-copy-refused-cache/Ipe.Tuple.ipe"));
+        let loader = StdlibCopyLoader {
+            copy: copy.clone(),
+            loads: AtomicUsize::new(0),
+        };
+        let (diag_tx, _diag_rx) = crossbeam_channel::unbounded::<DiagnosticsBatch>();
+        let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
+        ensure_project_fresh(&mut state, &loader, &main_path);
+        assert!(matches!(state.served, Served::Trusted(_)), "first load");
+        assert_eq!(loader.loads.load(Ordering::SeqCst), 1);
+
+        ensure_project_fresh(
+            &mut state,
+            &FailingLoader(LoadError::RootRefused("no manifest".to_owned())),
+            &main_path,
+        );
+        assert!(matches!(&state.served, Served::Refused { anchor, .. } if *anchor == main_path));
+
+        let copy_uri = Url::from_file_path(&copy).expect("copy uri");
+        let open = lsp_types::DidOpenTextDocumentParams {
+            text_document: lsp_types::TextDocumentItem {
+                uri: copy_uri.clone(),
+                language_id: "ipe".to_owned(),
+                version: 1,
+                text: String::new(),
+            },
+        };
+        let close = lsp_types::DidCloseTextDocumentParams {
+            text_document: lsp_types::TextDocumentIdentifier { uri: copy_uri },
+        };
+        for note in [
+            Notification::new(DidOpenTextDocument::METHOD.to_owned(), open),
+            Notification::new(DidCloseTextDocument::METHOD.to_owned(), close),
+        ] {
+            handle_notification(&mut state, &loader, &note, &diag_tx);
+        }
+        assert_eq!(
+            loader.loads.load(Ordering::SeqCst),
+            1,
+            "no load is anchored at the stdlib copy"
+        );
+        assert!(
+            matches!(&state.served, Served::Refused { anchor, .. } if *anchor == main_path),
+            "the refusal stays anchored at the project file"
+        );
     }
 
     /// The last `publishDiagnostics` payload per URI `client` received.
@@ -3590,5 +3781,69 @@ mod tests {
         if let Some(worker) = state.worker.take() {
             let _ = worker.join();
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod stdlib_copy_tests {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use super::{open_stdlib_copy, stdlib_copy_holds};
+
+    /// A fresh scratch directory for one stdlib-copy test.
+    #[allow(clippy::expect_used)] // test fixture: a failed mkdir IS the failure
+    fn scratch(name: &str) -> PathBuf {
+        let dir = ipe_test_temp::temp_root()
+            .canonicalize()
+            .expect("canonical temp dir")
+            .join(format!("ipe-lsp-stdlib-copy-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// A FIFO at the copy's name is refused at once, never waited on for a writer.
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed mkfifo IS the failure
+    fn a_fifo_at_the_copy_is_refused_without_blocking() {
+        let dir = scratch("fifo");
+        let fifo = dir.join("Ipe.Tuple.ipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo failed");
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let probe = fifo.clone();
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = tx.send(open_stdlib_copy(&probe).is_none());
+            })
+            .expect("spawn the probe thread");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)),
+            Ok(true),
+            "the open of a FIFO must refuse, not block"
+        );
+        assert!(!stdlib_copy_holds(&fifo, "module Ipe.Tuple"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A link at the copy's name is never followed, even to a byte-equal read-only file.
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed plant IS the failure
+    fn a_link_at_the_copy_is_never_opened() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch("link");
+        let real = dir.join("real.ipe");
+        std::fs::write(&real, "module Ipe.Tuple").expect("write real");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o444)).expect("chmod");
+        let copy = dir.join("Ipe.Tuple.ipe");
+        std::os::unix::fs::symlink(&real, &copy).expect("plant link");
+        assert!(open_stdlib_copy(&copy).is_none());
+        assert!(!stdlib_copy_holds(&copy, "module Ipe.Tuple"));
+        assert!(stdlib_copy_holds(&real, "module Ipe.Tuple"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

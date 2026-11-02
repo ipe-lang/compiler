@@ -71,8 +71,15 @@ fn goto_definition_returns_none_on_cyclic_graph() {
 #[test]
 fn find_references_returns_empty_on_cyclic_graph() {
     let (db, root, entry_a, _b) = cyclic_project();
-    let refs =
-        ipe_lsp_features::navigation::find_references(&db, root, entry_a, &["A".to_owned()], "a");
+    let refs = ipe_lsp_features::navigation::find_references(
+        &db,
+        root,
+        entry_a,
+        &ipe_lsp_features::navigation::NameTarget::Declared {
+            module: vec!["A".to_owned()],
+            name: "a".to_owned(),
+        },
+    );
     // Already topo-gated; must not panic and must return an empty-or-valid vec.
     let _ = refs; // just proving no panic
 }
