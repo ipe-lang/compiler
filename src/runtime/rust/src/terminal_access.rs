@@ -255,23 +255,28 @@ fn probe_echo_and_device(
     (echo, same)
 }
 
+/// The echo and same-terminal facts of a target that reads neither.
+///
+/// No fact is assumed: an unread echo flag is no echo, and an unread device
+/// is an unknown one, so such a target ends every frame in `\n`.
+#[cfg(all(
+    feature = "tui",
+    any(test, all(not(unix), not(target_arch = "wasm32")))
+))]
+const UNPROBED_ECHO_AND_DEVICE: (bool, SameTerminal) = (false, SameTerminal::Unknown);
+
 /// Stdin's echo flag, and whether stdin and stdout are one terminal.
 ///
-/// No device number is read off unix: two console handles are taken as the
-/// one console, and a console in its default cooked mode echoes input, so
-/// both consoles read as one echoing terminal; anything else is unknown.
+/// Off unix neither the console's echo mode nor a device number is read, so
+/// both facts are [`UNPROBED_ECHO_AND_DEVICE`].
 #[cfg(all(feature = "tui", not(unix), not(target_arch = "wasm32")))]
 const fn probe_echo_and_device(
     _stdin: &std::io::Stdin,
     _stdout: &std::io::Stdout,
-    stdin_tty: bool,
-    stdout_tty: bool,
+    _stdin_tty: bool,
+    _stdout_tty: bool,
 ) -> (bool, SameTerminal) {
-    if stdin_tty && stdout_tty {
-        (true, SameTerminal::Yes)
-    } else {
-        (false, SameTerminal::Unknown)
-    }
+    UNPROBED_ECHO_AND_DEVICE
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -344,7 +349,7 @@ mod tests {
 
 #[cfg(all(test, feature = "tui", not(target_arch = "wasm32")))]
 mod line_tests {
-    use super::{ExitClose, LineFacts, SameTerminal, decide_line};
+    use super::{ExitClose, LineFacts, SameTerminal, UNPROBED_ECHO_AND_DEVICE, decide_line};
     use crate::color::TermProfile;
     use crate::tui::{FrameEnd, LineStyle};
 
@@ -439,6 +444,19 @@ mod line_tests {
     fn an_unheld_exit_hook_ends_every_frame() {
         let facts = LineFacts {
             exit_close: ExitClose::Unavailable,
+            ..interactive()
+        };
+        assert_eq!(decide_line(&facts).end(), FrameEnd::Newline);
+    }
+
+    // A target that reads no echo or device fact (off unix) keeps no line
+    // open, even with both fds terminals and the exit hook held.
+    #[test]
+    fn unprobed_echo_and_device_end_every_frame() {
+        let (stdin_echo, same_terminal) = UNPROBED_ECHO_AND_DEVICE;
+        let facts = LineFacts {
+            stdin_echo,
+            same_terminal,
             ..interactive()
         };
         assert_eq!(decide_line(&facts).end(), FrameEnd::Newline);

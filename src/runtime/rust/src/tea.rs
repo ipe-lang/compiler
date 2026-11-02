@@ -1229,7 +1229,6 @@ where
     FSubs: Fn(Model) -> IpeSub<Msg> + Send + 'static,
 {
     Box::pin(async move {
-        use std::io::Write;
         // A replay run folds the recorded log and never starts the live loop:
         // no stdin is read, no `Cmd` (not even `init`'s) and no `Sub` runs.
         #[cfg(feature = "debugger")]
@@ -1351,8 +1350,7 @@ where
         let mut line_state = crate::tui::LineState::for_exit_hook();
         if outstanding.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             let frame = crate::tui::write_frame(&view(model.clone()), &surface, &mut line_state);
-            let _ = std::io::stdout().write_all(&frame);
-            let _ = std::io::stdout().flush();
+            line_state.emit(&mut std::io::stdout().lock(), &frame);
         }
 
         while let Some(ev) = rx.recv().await {
@@ -1401,6 +1399,10 @@ where
             }
             // Fold each message in order; the subscriptions are re-evaluated
             // after each, so the next message meets the model it produced.
+            // The folded messages' commands start only once their frame is on
+            // stdout, so an effect (a `System.exit` inside a task) can never
+            // race the frame of the update that issued it.
+            let mut cmds = Vec::with_capacity(msgs.len());
             for msg in msgs {
                 #[cfg(feature = "debugger")]
                 let msg_for_recorder = msg.clone();
@@ -1408,12 +1410,14 @@ where
                 model = next;
                 #[cfg(feature = "debugger")]
                 recorder.record(msg_for_recorder, model.clone(), &update);
-                cli_run_cmd_tracked(cmd, &tx, Some(&outstanding));
+                cmds.push(cmd);
                 submgr.update(subscriptions(model.clone()));
             }
             let frame = crate::tui::write_frame(&view(model.clone()), &surface, &mut line_state);
-            let _ = std::io::stdout().write_all(&frame);
-            let _ = std::io::stdout().flush();
+            line_state.emit(&mut std::io::stdout().lock(), &frame);
+            for cmd in cmds {
+                cli_run_cmd_tracked(cmd, &tx, Some(&outstanding));
+            }
             // After folding an effect's result, if EOF was already seen and no
             // effects remain outstanding, terminate as EOF would have.
             if eof_seen && outstanding.load(std::sync::atomic::Ordering::SeqCst) == 0 {
@@ -1421,8 +1425,8 @@ where
             }
         }
         submgr.stop_all();
-        let _ = std::io::stdout().write_all(line_state.close());
-        let _ = std::io::stdout().flush();
+        let close = line_state.close();
+        line_state.emit(&mut std::io::stdout().lock(), close);
         // Dump the recorded session (plain trace + typed log) to the
         // `IPE_DEBUGGER_RECORD` destination, a no-op when that env var is unset.
         // The recorder ring already bounds the log.

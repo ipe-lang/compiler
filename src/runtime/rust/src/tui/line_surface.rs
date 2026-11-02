@@ -71,21 +71,51 @@ pub enum InputEnd {
     Eof,
 }
 
-/// Whether the run's last line written is still open, read by the exit hook.
+/// What the `System.exit` stage of a `Cli.tea` run reads and seals.
 ///
-/// Set and cleared only by a [`LineState`] made by [`LineState::for_exit_hook`].
-static LINE_OPEN: AtomicBool = AtomicBool::new(false);
+/// Both bits change only while stdout's lock is held, by [`LineState::emit`]
+/// and [`end_output`], so the stage sees the open bit of the bytes that
+/// reached stdout, never of a frame still being written, and no frame lands
+/// after the stage ended the output.
+struct ExitLine {
+    /// The last line written to stdout is still open.
+    open: AtomicBool,
+    /// The exit stage ended the output; nothing more is written.
+    ended: AtomicBool,
+}
+
+impl ExitLine {
+    const fn new() -> Self {
+        Self {
+            open: AtomicBool::new(false),
+            ended: AtomicBool::new(false),
+        }
+    }
+}
+
+/// The process run's [`ExitLine`], read by [`close_open_line_on_exit`].
+static EXIT_LINE: ExitLine = ExitLine::new();
 
 /// Whether the last line written is still open (no `\n` after it yet).
 ///
 /// Only a [`FrameEnd::PromptOpen`] frame opens it; the next frame, a
 /// newline-ended input line, or [`LineState::close`] ends it. A state made by
-/// [`LineState::for_exit_hook`] mirrors the bit into the static that
-/// [`close_open_line_on_exit`] reads, so `System.exit` ends an open line too.
-#[derive(Clone, Copy, Debug, Default)]
+/// [`LineState::for_exit_hook`] publishes the bit to the exit stage once the
+/// bytes that set it are written ([`LineState::emit`]), so `System.exit` ends
+/// an open line too.
+#[derive(Clone, Copy, Default)]
 pub struct LineState {
     line_open: bool,
-    exit_mirror: Option<&'static AtomicBool>,
+    exit_line: Option<&'static ExitLine>,
+}
+
+impl std::fmt::Debug for LineState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LineState")
+            .field("line_open", &self.line_open)
+            .field("seen_on_exit", &self.exit_line.is_some())
+            .finish()
+    }
 }
 
 impl LineState {
@@ -94,22 +124,22 @@ impl LineState {
     pub const fn new() -> Self {
         Self {
             line_open: false,
-            exit_mirror: None,
+            exit_line: None,
         }
     }
 
-    /// The process run's state, mirrored for [`close_open_line_on_exit`].
+    /// The process run's state, published to [`close_open_line_on_exit`].
     #[must_use]
     pub fn for_exit_hook() -> Self {
-        Self::mirrored(&LINE_OPEN)
+        Self::published_to(&EXIT_LINE)
     }
 
-    /// A state before its first frame whose open bit `mirror` follows.
-    fn mirrored(mirror: &'static AtomicBool) -> Self {
-        mirror.store(false, Ordering::SeqCst);
+    /// A state before its first frame whose open bit `exit_line` follows.
+    fn published_to(exit_line: &'static ExitLine) -> Self {
+        exit_line.open.store(false, Ordering::SeqCst);
         Self {
             line_open: false,
-            exit_mirror: Some(mirror),
+            exit_line: Some(exit_line),
         }
     }
 
@@ -119,11 +149,8 @@ impl LineState {
         self.line_open
     }
 
-    fn set_open(&mut self, open: bool) {
+    const fn set_open(&mut self, open: bool) {
         self.line_open = open;
-        if let Some(mirror) = self.exit_mirror {
-            mirror.store(open, Ordering::SeqCst);
-        }
     }
 
     /// An input line was read, delivered or dropped.
@@ -131,10 +158,16 @@ impl LineState {
     /// A line ended by its newline was typed with Enter, whose echo already
     /// moved the cursor to a fresh line, so no frame needs to end the open
     /// one. A final line ended by end of input (`Ctrl-D` after text) echoes no
-    /// newline, so the open line stays open.
+    /// newline, so the open line stays open. The echo is already on the
+    /// terminal, so the exit stage learns of it at once.
     pub fn input_line(&mut self, end: InputEnd) {
         match end {
-            InputEnd::Newline => self.set_open(false),
+            InputEnd::Newline => {
+                self.set_open(false);
+                if let Some(exit_line) = self.exit_line {
+                    exit_line.open.store(false, Ordering::SeqCst);
+                }
+            }
             InputEnd::Eof => {}
         }
     }
@@ -142,33 +175,52 @@ impl LineState {
     /// The bytes that end the run's output: `\n` when a line is open, else
     /// nothing.
     #[must_use]
-    pub fn close(&mut self) -> &'static [u8] {
+    pub const fn close(&mut self) -> &'static [u8] {
         let open = self.line_open;
         self.set_open(false);
         if open { b"\n" } else { b"" }
+    }
+
+    /// Write `bytes` this state produced (a frame or the close) to `out`, then
+    /// publish the open bit they leave.
+    ///
+    /// `out` is the locked stdout, the lock the exit stage takes, so the
+    /// stage never reads a bit whose bytes are not yet written. Once the
+    /// stage has ended the output nothing is written: the process is exiting
+    /// and the stage already wrote the last byte.
+    pub fn emit<W: std::io::Write>(&self, out: &mut W, bytes: &[u8]) {
+        if let Some(exit_line) = self.exit_line
+            && exit_line.ended.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        if !bytes.is_empty() {
+            let _ = out.write_all(bytes);
+        }
+        let _ = out.flush();
+        if let Some(exit_line) = self.exit_line {
+            exit_line.open.store(self.line_open, Ordering::SeqCst);
+        }
     }
 }
 
 /// The `System.exit` stage of a `Cli.tea` run: end the open line, if any.
 ///
 /// Registered as the process exit hook, because `process::exit` skips the
-/// loop's own [`LineState::close`]; the shared bit makes the two writes one.
+/// loop's own [`LineState::close`]. It holds stdout's lock while it reads and
+/// seals the shared bits, so the loop's close and this stage write the closing
+/// `\n` at most once between them, and no frame follows it.
 pub fn close_open_line_on_exit() {
-    use std::io::Write;
-    let bytes = take_open_line(&LINE_OPEN);
-    if !bytes.is_empty() {
-        let mut out = std::io::stdout().lock();
-        let _ = out.write_all(bytes);
-        let _ = out.flush();
-    }
+    let mut out = std::io::stdout().lock();
+    end_output(&EXIT_LINE, &mut out);
 }
 
-/// The exit's closing bytes for the open bit `flag`, clearing it.
-fn take_open_line(flag: &AtomicBool) -> &'static [u8] {
-    if flag.swap(false, Ordering::SeqCst) {
-        b"\n"
-    } else {
-        b""
+/// Seal `exit_line`, then write the `\n` an open line needs to `out`.
+fn end_output<W: std::io::Write>(exit_line: &ExitLine, out: &mut W) {
+    exit_line.ended.store(true, Ordering::SeqCst);
+    if exit_line.open.swap(false, Ordering::SeqCst) {
+        let _ = out.write_all(b"\n");
+        let _ = out.flush();
     }
 }
 
@@ -474,29 +526,122 @@ mod tests {
         assert_eq!(state.close(), b"");
     }
 
-    // The exit stage ends an open line exactly once, and never one the loop's
-    // own close already ended: both read the one mirrored bit.
+    /// Serialize one frame of `view` and emit it into `out`, as the loop does.
+    fn emit_frame(
+        view: &LinesView<()>,
+        surface: &LineSurface,
+        state: &mut LineState,
+        out: &mut Vec<u8>,
+    ) {
+        let frame = write_frame(view, surface, state);
+        state.emit(out, &frame);
+    }
+
+    fn prompt() -> LinesView<()> {
+        cli_text_::<()>("> ".to_owned())
+    }
+
+    // The exit stage ends an open line exactly once: a fresh run has none, an
+    // emitted prompt frame opens one, and a second stage run adds nothing.
     #[test]
-    fn exit_close_follows_the_mirrored_open_line() {
-        static OPEN: AtomicBool = AtomicBool::new(true);
-        let mut state = LineState::mirrored(&OPEN);
-        assert_eq!(take_open_line(&OPEN), b"", "a fresh run has no open line");
-        let _ = write_frame(&cli_text_::<()>("> ".to_owned()), &PLAIN_PROMPT, &mut state);
-        assert_eq!(take_open_line(&OPEN), b"\n");
-        assert_eq!(take_open_line(&OPEN), b"");
-
-        let _ = write_frame(&cli_text_::<()>("> ".to_owned()), &PLAIN_PROMPT, &mut state);
-        assert_eq!(state.close(), b"\n");
-        assert_eq!(
-            take_open_line(&OPEN),
-            b"",
-            "the loop's close already ended it"
+    fn exit_close_ends_an_emitted_open_line_once() {
+        static EXIT: ExitLine = ExitLine::new();
+        EXIT.open.store(true, Ordering::SeqCst);
+        let mut state = LineState::published_to(&EXIT);
+        assert!(
+            !EXIT.open.load(Ordering::SeqCst),
+            "a fresh run has no open line"
         );
+        let mut out = Vec::new();
+        emit_frame(&prompt(), &PLAIN_PROMPT, &mut state, &mut out);
+        assert_eq!(out, b"> ");
+        let mut tail = Vec::new();
+        end_output(&EXIT, &mut tail);
+        end_output(&EXIT, &mut tail);
+        assert_eq!(tail, b"\n");
+    }
 
-        let _ = write_frame(&cli_text_::<()>("> ".to_owned()), &PLAIN_PROMPT, &mut state);
+    // The loop's own close and the exit stage write the closing `\n` once
+    // between them.
+    #[test]
+    fn loop_close_and_exit_close_write_one_newline() {
+        static EXIT: ExitLine = ExitLine::new();
+        let mut state = LineState::published_to(&EXIT);
+        let mut out = Vec::new();
+        emit_frame(&prompt(), &PLAIN_PROMPT, &mut state, &mut out);
+        let close = state.close();
+        state.emit(&mut out, close);
+        assert_eq!(out, b"> \n");
+        let mut tail = Vec::new();
+        end_output(&EXIT, &mut tail);
+        assert_eq!(tail, b"", "the loop's close already ended it");
+    }
+
+    // An echoed Enter is already on the terminal, so the exit stage learns at
+    // once that it ended the open line.
+    #[test]
+    fn an_echoed_enter_reaches_the_exit_stage_at_once() {
+        static EXIT: ExitLine = ExitLine::new();
+        let mut state = LineState::published_to(&EXIT);
+        let mut out = Vec::new();
+        emit_frame(&prompt(), &PLAIN_PROMPT, &mut state, &mut out);
         state.input_line(InputEnd::Newline);
-        assert_eq!(take_open_line(&OPEN), b"", "the echoed Enter ended it");
-        let _ = write_frame(&cli_text_::<()>("x".to_owned()), &PLAIN_NEWLINE, &mut state);
-        assert_eq!(take_open_line(&OPEN), b"");
+        let mut tail = Vec::new();
+        end_output(&EXIT, &mut tail);
+        assert_eq!(tail, b"", "the echoed Enter ended it");
+    }
+
+    // The exit stage reads the bit of the bytes on stdout, never of a frame
+    // still being written: a frame computed but not emitted changes nothing
+    // the stage sees, in either direction.
+    #[test]
+    fn a_frame_reaches_the_exit_stage_only_once_emitted() {
+        static EXIT: ExitLine = ExitLine::new();
+        let mut state = LineState::published_to(&EXIT);
+        let opening = write_frame(&prompt(), &PLAIN_PROMPT, &mut state);
+        assert!(
+            !EXIT.open.load(Ordering::SeqCst),
+            "the prompt is not written yet"
+        );
+        let mut out = Vec::new();
+        state.emit(&mut out, &opening);
+        assert!(EXIT.open.load(Ordering::SeqCst));
+        // One step past: a closing frame computed but not yet written leaves the
+        // written prompt open, so an exit now still ends it.
+        let closing = write_frame(&cli_text_::<()>("x".to_owned()), &PLAIN_NEWLINE, &mut state);
+        assert!(
+            EXIT.open.load(Ordering::SeqCst),
+            "the prompt is still open on stdout"
+        );
+        state.emit(&mut out, &closing);
+        assert!(!EXIT.open.load(Ordering::SeqCst));
+        assert_eq!(out, b"> \nx\n");
+    }
+
+    // Once the exit stage ended the output, no frame and no close follows its
+    // last byte.
+    #[test]
+    fn nothing_is_written_after_the_exit_ended_the_output() {
+        static EXIT: ExitLine = ExitLine::new();
+        let mut state = LineState::published_to(&EXIT);
+        let mut out = Vec::new();
+        emit_frame(&prompt(), &PLAIN_PROMPT, &mut state, &mut out);
+        end_output(&EXIT, &mut out);
+        assert_eq!(out, b"> \n");
+        emit_frame(&prompt(), &PLAIN_PROMPT, &mut state, &mut out);
+        emit_frame(
+            &cli_text_::<()>("x".to_owned()),
+            &PLAIN_NEWLINE,
+            &mut state,
+            &mut out,
+        );
+        let close = state.close();
+        state.emit(&mut out, close);
+        assert_eq!(out, b"> \n", "the stage's newline is the last byte");
+        // One step past: a state no exit stage sees always writes.
+        let mut unseen = LineState::new();
+        let mut free = Vec::new();
+        emit_frame(&prompt(), &PLAIN_PROMPT, &mut unseen, &mut free);
+        assert_eq!(free, b"> ");
     }
 }
