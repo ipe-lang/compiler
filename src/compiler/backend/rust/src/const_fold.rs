@@ -1044,10 +1044,10 @@ fn eval_with_local(
 
 /// Evaluate a binary operation over two already-constant operands. Only the
 /// total, deterministic operations the pure builders use are folded: string
-/// append (`++`), integer/float arithmetic (wrapping / IEEE-754, matching the
-/// runtime's total semantics), and the boolean / comparison operators. Integer
-/// division by zero and any operand-kind mismatch yield `None` (unfolded), so a
-/// fold never diverges from the runtime.
+/// append (`++`), integer/float arithmetic (exact / IEEE-754, matching the
+/// runtime), and the boolean / comparison operators. An integer result outside
+/// the `Int` range, integer division by zero, and any operand-kind mismatch
+/// yield `None` (unfolded), so the runtime trips and a fold never diverges.
 fn eval_binop(op: BinOp, l: &ConstValue, r: &ConstValue) -> Option<ConstValue> {
     use ConstValue::{Bool, Float, Int, Str};
     match (op, l, r) {
@@ -1908,7 +1908,8 @@ mod tests {
 
     /// An Int edge the runtime decides (overflow, zero divisor, `MIN // -1`)
     /// never folds to a baked constant; an in-range fold equals the emitted
-    /// runtime operator byte for byte.
+    /// runtime operator byte for byte. The runtime operator is called only on
+    /// a pair the folder answers, since an out-of-range pair trips it.
     #[test]
     fn int_fold_declines_every_out_of_range_edge() {
         use ConstValue::Int;
@@ -1928,14 +1929,14 @@ mod tests {
         let values = [i64::MIN + 1, -7, -1, 0, 1, 7, i64::MAX - 1];
         for a in values {
             for b in values {
-                let pairs = [
-                    (BinOp::IntAdd, ipe_runtime_rust::math::ipe_int_add(a, b)),
-                    (BinOp::IntSub, ipe_runtime_rust::math::ipe_int_sub(a, b)),
-                    (BinOp::IntMul, ipe_runtime_rust::math::ipe_int_mul(a, b)),
+                let pairs: [(BinOp, fn(i64, i64) -> i64); 3] = [
+                    (BinOp::IntAdd, ipe_runtime_rust::math::ipe_int_add),
+                    (BinOp::IntSub, ipe_runtime_rust::math::ipe_int_sub),
+                    (BinOp::IntMul, ipe_runtime_rust::math::ipe_int_mul),
                 ];
                 for (op, runtime) in pairs {
                     if let Some(folded) = eval_binop(op, &Int(a), &Int(b)) {
-                        assert_eq!(folded, Int(runtime), "{op:?} {a} {b}");
+                        assert_eq!(folded, Int(runtime(a, b)), "{op:?} {a} {b}");
                     }
                 }
                 if b != 0 {

@@ -465,6 +465,9 @@ sum [ 1, 2, 3 ] --> 6
 sum [] --> 0
 sum [ 1.5, 2.5 ] --> 4.0
 ```
+
+An `Int` partial result outside the 64-bit range ends in a typed
+`InvalidInput` error, like the `Int` operator it folds.
 -}
 sum : List a -> a
 sum = Kernel.kernel "List_sum"
@@ -478,6 +481,9 @@ product [ 1, 2, 3, 4 ] --> 24
 product [] --> 1
 product [ 2.0, 0.5 ] --> 1.0
 ```
+
+An `Int` partial result outside the 64-bit range ends in a typed
+`InvalidInput` error, like the `Int` operator it folds.
 -}
 product : List a -> a
 product = Kernel.kernel "List_product"

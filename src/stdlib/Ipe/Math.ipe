@@ -9,7 +9,8 @@
 -- `inf` are valid `Float` values, and `isNaN` is the correct test for NaN.
 --
 -- `Int` and `Float` never convert implicitly. `floor`, `ceil`, `round`, and
--- `trunc` take a `Float` to an `Int`. To take an `Int` to a `Float`, go
+-- `trunc` take a `Float` to an `Int`; a non-finite or out-of-range `Float` has
+-- no `Int` result and ends in a typed error. To take an `Int` to a `Float`, go
 -- through `Ipe.Decimal`, which holds every `Int` exactly:
 -- `Decimal.toFloat (Decimal.fromInt n)` yields the nearest `Float`, exact
 -- whenever `abs n <= 2^53`.
@@ -415,6 +416,10 @@ floor 3.7 --> 3
 floor (-3.7) --> -4
 floor 3.0 --> 3
 ```
+
+NaN, an infinity, or a value outside the 64-bit `Int` range has no `Int`
+result: the program ends in a typed `InvalidInput` error, never a wrapped
+or saturated number.
 -}
 floor : Float -> Int
 floor = Kernel.kernel "Math_floor"
@@ -427,6 +432,10 @@ ceil 3.2 --> 4
 ceil (-3.2) --> -3
 ceil 3.0 --> 3
 ```
+
+NaN, an infinity, or a value outside the 64-bit `Int` range has no `Int`
+result: the program ends in a typed `InvalidInput` error, never a wrapped
+or saturated number.
 -}
 ceil : Float -> Int
 ceil = Kernel.kernel "Math_ceil"
@@ -441,6 +450,10 @@ round 3.4 --> 3
 round 3.5 --> 4
 round (-3.5) --> -3
 ```
+
+NaN, an infinity, or a value outside the 64-bit `Int` range has no `Int`
+result: the program ends in a typed `InvalidInput` error, never a wrapped
+or saturated number.
 -}
 round : Float -> Int
 round = Kernel.kernel "Math_round"
@@ -455,6 +468,10 @@ trunc 3.7 --> 3
 trunc (-3.7) --> -3
 trunc 3.0 --> 3
 ```
+
+NaN, an infinity, or a value outside the 64-bit `Int` range has no `Int`
+result: the program ends in a typed `InvalidInput` error, never a wrapped
+or saturated number.
 -}
 trunc : Float -> Int
 trunc = Kernel.kernel "Math_trunc"

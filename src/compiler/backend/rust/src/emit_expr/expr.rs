@@ -103,14 +103,14 @@ pub fn emit_expr_at(
                 // `//` (integer division). Raw Rust `/` on `i64` panics on
                 // `b == 0` AND on `i64::MIN / -1`; `//` is itself a Rust line
                 // comment, so raw infix emit is doubly unsound. Route through
-                // the total helper for integer division semantics:
-                // b==0 → panic("attempt to divide by zero") (abort, exit 101);
-                // i64::MIN / -1 → i64::MIN (wrapping, no abort).
+                // the runtime helper: b==0 → panic("attempt to divide by
+                // zero") (abort, exit 101); i64::MIN / -1 → a typed
+                // `IntOverflow` trip.
                 BinOp::IntDiv => Ok(format!("ipe_runtime::math::ipe_int_div({l}, {r})")),
-                // Integer `+`/`-`/`*` on `i64`: raw Rust infix panics on
-                // overflow when `overflow-checks = true`. Route through total
-                // wrapping helpers so the two's-complement wrap contract holds
-                // regardless of any Cargo profile flag.
+                // Integer `+`/`-`/`*` on `i64`: raw Rust infix panics or wraps
+                // on overflow depending on `overflow-checks`. Route through the
+                // exact helpers, which trip a typed `IntOverflow` regardless of
+                // any Cargo profile flag.
                 BinOp::IntAdd => Ok(format!("ipe_runtime::math::ipe_int_add({l}, {r})")),
                 BinOp::IntSub => Ok(format!("ipe_runtime::math::ipe_int_sub({l}, {r})")),
                 BinOp::IntMul => Ok(format!("ipe_runtime::math::ipe_int_mul({l}, {r})")),
@@ -140,11 +140,10 @@ pub fn emit_expr_at(
                 }
                 // Generic (polymorphic `Number a`) `+`/`-`/`*`: route through
                 // `IpeWrappingAdd/Sub/Mul` method calls. The bound in
-                // `render_bounds` is already set to the wrapping trait, so the
-                // call type-checks. This prevents a panic under
-                // `overflow-checks=on` when the call site monomorphises to i64.
-                // Concrete Int routes through `ipe_int_add/sub/mul` (above);
-                // Float's `IpeWrappingAdd` impl is the plain IEEE op.
+                // `render_bounds` is already set to that trait, so the call
+                // type-checks. Its `Int` impl is `ipe_int_add/sub/mul`, so a
+                // generic body monomorphised to i64 trips `IntOverflow` exactly
+                // like the concrete arm above; Float's impl is the plain IEEE op.
                 BinOp::Add => Ok(format!("{l}.ipe_wrapping_add({r})")),
                 BinOp::Sub => Ok(format!("{l}.ipe_wrapping_sub({r})")),
                 BinOp::Mul => Ok(format!("{l}.ipe_wrapping_mul({r})")),

@@ -1,14 +1,19 @@
 module Main exposing (main)
 import Ipe.Io as Io
 import Ipe.String
+import Ipe.Task as Task
 
--- Integer division at the i64::MIN // -1 corner: the quotient wraps to
--- i64::MIN instead of trapping. minInt is built by wrapping subtraction,
--- (-9223372036854775807) - 1, so the program also pins that path.
+-- Integer division at the minInt // -1 corner: the quotient 2^63 is outside
+-- the 64-bit Int range, so the program ends in a typed IntOverflow error
+-- (exit 1, nothing printed) instead of a wrapped value or a panic. minInt is
+-- built by subtraction, (-9223372036854775807) - 1, which stays in range.
+-- The division runs inside a task step, where a runtime trip becomes the
+-- program's typed error.
 
 minInt : Int
 minInt =
     (-9223372036854775807) - 1
 
 main =
-    Io.println (String.fromInt (minInt // (-1)))
+    Task.succeed ()
+        |> Task.andThen (\_ -> Io.println (String.fromInt (minInt // (-1))))

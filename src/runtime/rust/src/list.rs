@@ -2,6 +2,7 @@
 
 use super::IpeMaybe;
 use super::basics::{IpeOrder, IpeWrappingAdd, IpeWrappingMul};
+use crate::core::{IntOp, RuntimeTrip, trip};
 
 /// `Ipe.List.singleton : a -> List a` — the one-element list `[x]`. Total.
 pub fn list_singleton<T>(x: T) -> Vec<T> {
@@ -14,30 +15,32 @@ pub fn list_repeat<T: Clone>(n: i64, x: T) -> Vec<T> {
     if n <= 0 {
         Vec::new()
     } else {
-        // `n > 0` here, so `n as usize` is total on 64-bit targets.
-        vec![x; n as usize]
+        vec![x; crate::narrow::count_from_int(n)]
     }
 }
 
-/// `Ipe.List.sum : number a => List a -> a` — the additive fold. Empty list
-/// sums to the type's additive identity (`0` / `0.0`). Folds through the same
-/// wrapping add Ipê's `(+)` lowers to, so the reduction wraps identically to
-/// repeated inline `(+)` and never overflow-aborts under `overflow-checks=on`.
+/// `Ipe.List.sum : number a => List a -> a` — the additive fold.
+///
+/// An empty list sums to the type's additive identity (`0` / `0.0`). Each step
+/// is the exact `+` Ipê's `(+)` lowers to: an `Int` partial sum outside the
+/// 64-bit range trips `IntOverflow`.
 #[must_use]
 pub fn list_sum<T: IpeWrappingAdd<T, Output = T>>(xs: Vec<T>) -> T {
     xs.into_iter()
-        .fold(T::IPE_ADD_IDENTITY, |acc, x| acc.ipe_wrapping_add(x))
+        .try_fold(T::IPE_ADD_IDENTITY, IpeWrappingAdd::ipe_exact_add)
+        .unwrap_or_else(|| trip(RuntimeTrip::IntOverflow { op: IntOp::Sum }))
 }
 
 /// `Ipe.List.product : number a => List a -> a` — the multiplicative fold.
-/// Empty list yields the multiplicative identity (`1` / `1.0`). Folds through
-/// the same wrapping mul Ipê's `(*)` lowers to, so the reduction wraps
-/// identically to repeated inline `(*)` and never overflow-aborts under
-/// `overflow-checks=on`.
+///
+/// An empty list yields the multiplicative identity (`1` / `1.0`). Each step is
+/// the exact `*` Ipê's `(*)` lowers to: an `Int` partial product outside the
+/// 64-bit range trips `IntOverflow`.
 #[must_use]
 pub fn list_product<T: IpeWrappingMul<T, Output = T>>(xs: Vec<T>) -> T {
     xs.into_iter()
-        .fold(T::IPE_MUL_IDENTITY, |acc, x| acc.ipe_wrapping_mul(x))
+        .try_fold(T::IPE_MUL_IDENTITY, IpeWrappingMul::ipe_exact_mul)
+        .unwrap_or_else(|| trip(RuntimeTrip::IntOverflow { op: IntOp::Product }))
 }
 
 /// `Ipe.List.maximum : comparable a => List a -> Maybe a` — the largest
@@ -194,7 +197,7 @@ pub fn list_map5<A, B, C, D, E, R>(
 /// `ipe_core_list_length` is the recursive stdlib form).
 #[must_use]
 pub fn list_length<T>(xs: Vec<T>) -> i64 {
-    xs.len() as i64
+    crate::narrow::count_to_int(xs.len())
 }
 
 /// `Ipe.List.head : List a -> Maybe a` — the first element, or `Nothing`
@@ -236,7 +239,9 @@ pub fn list_drop<T>(n: i64, xs: Vec<T>) -> Vec<T> {
     if n <= 0 {
         xs
     } else {
-        xs.into_iter().skip(n as usize).collect()
+        xs.into_iter()
+            .skip(crate::narrow::count_from_int(n))
+            .collect()
     }
 }
 
@@ -259,13 +264,12 @@ pub fn list_concat<T>(xss: Vec<Vec<T>>) -> Vec<T> {
 
 /// `Ipe.List.take : Int -> List a -> List a` — the first `n` elements.
 /// Elm semantics: `n <= 0` yields `[]`; `n >= len` yields the whole list.
-/// `n.max(0)` is non-negative, so the `as usize` cast is total on 64-bit
-/// targets (an `i64` in `0..=i64::MAX` fits `usize`); `truncate(k)` with
-/// `k >= len` is a no-op. No indexing, no overflow, no panic.
+/// The count narrows through `count_from_int` (`<= 0` is `0`, past `usize`
+/// saturates), and `truncate(k)` with `k >= len` is a no-op.
 #[must_use]
 pub fn list_take<T>(n: i64, xs: Vec<T>) -> Vec<T> {
     let mut xs = xs;
-    xs.truncate(n.max(0) as usize);
+    xs.truncate(crate::narrow::count_from_int(n));
     xs
 }
 
@@ -338,7 +342,7 @@ pub fn list_range(lo: i64, hi: i64) -> Vec<i64> {
         return Vec::new();
     }
     let n = i128::from(hi) - i128::from(lo) + 1;
-    if n > CAP as i128 {
+    if !usize::try_from(n).is_ok_and(|n| n <= CAP) {
         crate::system::emit_runtime_log(
             "list",
             &format!(
@@ -353,7 +357,7 @@ pub fn list_range(lo: i64, hi: i64) -> Vec<i64> {
 pub fn list_indexed_map<T0, T1>(f: impl Fn(i64, T0) -> T1, list: Vec<T0>) -> Vec<T1> {
     list.into_iter()
         .enumerate()
-        .map(|(i, x)| f(i as i64, x))
+        .map(|(i, x)| f(crate::narrow::count_to_int(i), x))
         .collect()
 }
 pub fn list_concat_map<T0, T1>(f: impl Fn(T0) -> Vec<T1>, list: Vec<T0>) -> Vec<T1> {
@@ -780,22 +784,22 @@ mod tests {
         assert_eq!(list_sum(vec![1.5f64, 2.5]), 4.0);
     }
 
-    /// The additive/multiplicative fold wraps two's-complement, exactly like a
-    /// repeated inline `(+)`/`(*)`, and never overflow-aborts — the fold routes
-    /// through `ipe_wrapping_add`/`ipe_wrapping_mul`, so this holds under any
-    /// Cargo profile's `overflow-checks` setting (the assertion could not even
-    /// reach a value past `i64::MAX` if the fold panicked instead).
+    /// A partial sum or product past the `Int` range trips `IntOverflow`
+    /// under its own op, never a wrapped value and never a foreign panic; a
+    /// fold whose every partial result stays in range returns it exactly.
     #[test]
-    fn sum_product_wrap_past_int_max_no_panic() {
-        // sum [i64::MAX, 1] == i64::MAX.wrapping_add(1) == i64::MIN.
-        assert_eq!(list_sum(vec![i64::MAX, 1]), i64::MIN);
-        // Matches repeated inline `(+)`: MAX + 1 wraps to MIN.
-        assert_eq!(list_sum(vec![i64::MAX, 1]), i64::MAX.wrapping_add(1));
-        // sum [i64::MIN, -1] wraps forward to i64::MAX.
-        assert_eq!(list_sum(vec![i64::MIN, -1]), i64::MAX);
-        // product [i64::MAX, 2] == i64::MAX.wrapping_mul(2) == -2.
-        assert_eq!(list_product(vec![i64::MAX, 2]), i64::MAX.wrapping_mul(2));
-        assert_eq!(list_product(vec![i64::MAX, 2]), -2);
+    fn sum_product_trip_past_int_range() {
+        let outcome = |f: fn() -> i64| {
+            std::panic::catch_unwind(f).map_err(|p| crate::core::runtime_trip(p.as_ref()))
+        };
+        let sum = Err(Some(RuntimeTrip::IntOverflow { op: IntOp::Sum }));
+        let product = Err(Some(RuntimeTrip::IntOverflow { op: IntOp::Product }));
+        assert_eq!(outcome(|| list_sum(vec![i64::MAX, 1])), sum);
+        assert_eq!(outcome(|| list_sum(vec![i64::MIN, -1])), sum);
+        assert_eq!(outcome(|| list_product(vec![i64::MAX, 2])), product);
+        assert_eq!(outcome(|| list_product(vec![i64::MIN, -1])), product);
+        assert_eq!(list_sum(vec![i64::MAX, -1, 1]), i64::MAX);
+        assert_eq!(list_product(vec![i64::MIN, 1]), i64::MIN);
     }
 
     #[test]

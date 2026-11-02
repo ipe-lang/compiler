@@ -1142,6 +1142,70 @@ pub enum RuntimeTrip {
     /// The per-thread recursion depth budget, or the stack red zone, was
     /// exceeded.
     RecursionLimit,
+    /// An `Int` operation's exact result lies outside the 64-bit `Int` range.
+    IntOverflow {
+        /// The operation whose result left the range.
+        op: IntOp,
+    },
+    /// A `Float` to `Int` conversion met NaN or an infinity.
+    NonFiniteToInt {
+        /// The conversion that met the non-finite value.
+        op: FloatToIntOp,
+    },
+}
+
+/// The `Int` operations whose exact result can leave the 64-bit range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntOp {
+    /// `+`.
+    Add,
+    /// `-`.
+    Sub,
+    /// `*`.
+    Mul,
+    /// `//`.
+    Div,
+    /// `negate`.
+    Negate,
+    /// `abs`.
+    Abs,
+    /// `List.sum`.
+    Sum,
+    /// `List.product`.
+    Product,
+    /// A `Float` to `Int` conversion of a finite value beyond the `Int` range.
+    FromFloat(FloatToIntOp),
+}
+
+/// The `Float` to `Int` conversions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatToIntOp {
+    /// `floor`.
+    Floor,
+    /// `ceil`.
+    Ceiling,
+    /// `round`.
+    Round,
+    /// `trunc`.
+    Truncate,
+}
+
+/// The message of an `Int` overflow in operation `$op`.
+macro_rules! int_overflow_message {
+    ($op:literal) => {
+        concat!(
+            "Int overflow: the result of `",
+            $op,
+            "` is outside the 64-bit Int range"
+        )
+    };
+}
+
+/// The message of a non-finite `Float` met by conversion `$op`.
+macro_rules! non_finite_message {
+    ($op:literal) => {
+        concat!("`", $op, "` of NaN or an infinity has no Int value")
+    };
 }
 
 impl RuntimeTrip {
@@ -1157,29 +1221,57 @@ impl RuntimeTrip {
     pub const fn label(self) -> &'static str {
         match self {
             Self::RecursionLimit => "RecursionLimit",
+            Self::IntOverflow { .. } => "IntOverflow",
+            Self::NonFiniteToInt { .. } => "NonFiniteToInt",
         }
     }
 
     /// The human-facing message the trip's error and log line carry.
     #[must_use]
-    pub fn message(self) -> String {
+    pub const fn message(self) -> &'static str {
         match self {
-            Self::RecursionLimit => Self::RECURSION_LIMIT_MESSAGE.to_string(),
+            Self::RecursionLimit => Self::RECURSION_LIMIT_MESSAGE,
+            Self::IntOverflow { op } => match op {
+                IntOp::Add => int_overflow_message!("+"),
+                IntOp::Sub => int_overflow_message!("-"),
+                IntOp::Mul => int_overflow_message!("*"),
+                IntOp::Div => int_overflow_message!("//"),
+                IntOp::Negate => int_overflow_message!("negate"),
+                IntOp::Abs => int_overflow_message!("abs"),
+                IntOp::Sum => int_overflow_message!("List.sum"),
+                IntOp::Product => int_overflow_message!("List.product"),
+                IntOp::FromFloat(FloatToIntOp::Floor) => int_overflow_message!("floor"),
+                IntOp::FromFloat(FloatToIntOp::Ceiling) => int_overflow_message!("ceil"),
+                IntOp::FromFloat(FloatToIntOp::Round) => int_overflow_message!("round"),
+                IntOp::FromFloat(FloatToIntOp::Truncate) => int_overflow_message!("trunc"),
+            },
+            Self::NonFiniteToInt { op } => match op {
+                FloatToIntOp::Floor => non_finite_message!("floor"),
+                FloatToIntOp::Ceiling => non_finite_message!("ceil"),
+                FloatToIntOp::Round => non_finite_message!("round"),
+                FloatToIntOp::Truncate => non_finite_message!("trunc"),
+            },
         }
     }
 
     /// The typed error a catch boundary hands the program for this trip.
+    ///
+    /// An arithmetic trip is `InvalidInput`: the operands admit no `Int`
+    /// result at any bound, so no larger limit would accept them.
     #[must_use]
     pub fn to_ipe_error(self) -> crate::IpeError {
         match self {
-            Self::RecursionLimit => crate::IpeError::limit_exceeded(self.message()),
+            Self::RecursionLimit => crate::IpeError::limit_exceeded(self.message().to_owned()),
+            Self::IntOverflow { .. } | Self::NonFiniteToInt { .. } => {
+                crate::IpeError::invalid_input(self.message().to_owned())
+            }
         }
     }
 }
 
 impl std::fmt::Display for RuntimeTrip {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message())
+        f.write_str(self.message())
     }
 }
 
@@ -1302,7 +1394,7 @@ fn classify_panic(msg: &str) -> &'static str {
 /// a fixed fallback for any other payload type. Total — no unwrap/index/panic.
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(fault) = runtime_trip(payload) {
-        fault.message()
+        fault.message().to_owned()
     } else if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -1768,6 +1860,53 @@ mod tests {
             classify_panic(&panic_payload_message(overflow.as_ref())),
             "ArithmeticOverflow"
         );
+    }
+
+    // An arithmetic trip carries its own label and message and converts to an
+    // `InvalidInput` error, read back by type at every unwind boundary.
+    #[test]
+    fn arithmetic_trips_are_typed_invalid_input() -> Result<(), &'static str> {
+        let trips = [
+            (
+                RuntimeTrip::IntOverflow { op: IntOp::Add },
+                "IntOverflow",
+                "Int overflow: the result of `+` is outside the 64-bit Int range",
+            ),
+            (
+                RuntimeTrip::IntOverflow {
+                    op: IntOp::FromFloat(FloatToIntOp::Round),
+                },
+                "IntOverflow",
+                "Int overflow: the result of `round` is outside the 64-bit Int range",
+            ),
+            (
+                RuntimeTrip::NonFiniteToInt {
+                    op: FloatToIntOp::Floor,
+                },
+                "NonFiniteToInt",
+                "`floor` of NaN or an infinity has no Int value",
+            ),
+        ];
+        for (fault, label, message) in trips {
+            if fault.label() != label || fault.message() != message {
+                return Err("an arithmetic trip renders its own label and message");
+            }
+            let crate::IpeError::Error(kind, _) = fault.to_ipe_error();
+            if kind != crate::IpeErrorKind::InvalidInput {
+                return Err("an arithmetic trip converts to InvalidInput");
+            }
+            for boundary in [
+                UnwindBoundary::Foreign("foreign call panicked"),
+                UnwindBoundary::Task("async task panicked"),
+            ] {
+                let payload: Box<dyn std::any::Any + Send> = Box::new(fault);
+                let err: crate::IpeError = ipe_error_from_unwind(boundary, payload);
+                if err != fault.to_ipe_error() {
+                    return Err("an arithmetic trip keeps its kind at every boundary");
+                }
+            }
+        }
+        Ok(())
     }
 
     // [B8] The Ipê-visible message NEVER contains the foreign error's Debug detail
