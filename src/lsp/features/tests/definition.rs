@@ -56,12 +56,11 @@ const fn do_fixture() -> [Fixture<'static>; 3] {
 }
 
 #[test]
-fn a_qualified_name_inside_do_goes_to_its_declaration_at_every_statement() {
+fn a_qualified_name_inside_do_goes_to_its_declaration_at_every_statement()
+-> Result<(), &'static str> {
     let db = IpeDatabase::new();
     let (root, files) = project(&db, &do_fixture());
-    let Some(&entry) = files.get(2) else {
-        return;
-    };
+    let &entry = files.get(2).ok_or("the fixture has `Main`")?;
     let decl = at(LIB, "total", 2, 0);
     assert!(decl.is_some());
     for occurrence in 0..3 {
@@ -72,15 +71,14 @@ fn a_qualified_name_inside_do_goes_to_its_declaration_at_every_statement() {
             "statement {occurrence}: {def:?}"
         );
     }
+    Ok(())
 }
 
 #[test]
-fn a_do_bind_use_goes_to_its_binder() {
+fn a_do_bind_use_goes_to_its_binder() -> Result<(), &'static str> {
     let db = IpeDatabase::new();
     let (root, files) = project(&db, &do_fixture());
-    let Some(&entry) = files.get(2) else {
-        return;
-    };
+    let &entry = files.get(2).ok_or("the fixture has `Main`")?;
     let binder = at(DO_MAIN, "second", 0, 0);
     let byte = at(DO_MAIN, "second", 1, 0);
     let def = byte.and_then(|byte| goto_definition(&db, root, entry, &main_path(), byte));
@@ -89,6 +87,7 @@ fn a_do_bind_use_goes_to_its_binder() {
             && matches!(&d.target, NameTarget::Local { name, .. } if name == "second")),
         "{def:?}"
     );
+    Ok(())
 }
 
 const LOCALS: &str = "module Main exposing (main)\n\n\
@@ -132,12 +131,10 @@ fn word_at(text: &str, name: &str, nth: usize) -> Option<u32> {
 }
 
 #[test]
-fn param_let_case_and_shadowing_uses_go_to_their_binders() {
+fn param_let_case_and_shadowing_uses_go_to_their_binders() -> Result<(), &'static str> {
     let db = IpeDatabase::new();
     let (root, files) = project(&db, &[(&["Main"], LOCALS, ModuleOrigin::User)]);
-    let Some(&entry) = files.first() else {
-        return;
-    };
+    let &entry = files.first().ok_or("the fixture has `Main`")?;
     for (name, binder, used) in LOCAL_USES {
         let binder = word_at(LOCALS, name, binder);
         let byte = word_at(LOCALS, name, used);
@@ -149,21 +146,17 @@ fn param_let_case_and_shadowing_uses_go_to_their_binders() {
             "{name} use #{used}: {def:?}"
         );
     }
+    Ok(())
 }
 
 #[test]
-fn a_local_s_references_stay_inside_its_scope() {
+fn a_local_s_references_stay_inside_its_scope() -> Result<(), &'static str> {
     let db = IpeDatabase::new();
     let (root, files) = project(&db, &[(&["Main"], LOCALS, ModuleOrigin::User)]);
-    let Some(&entry) = files.first() else {
-        return;
-    };
+    let &entry = files.first().ok_or("the fixture has `Main`")?;
     let byte = word_at(LOCALS, "n", 1);
     let def = byte.and_then(|byte| goto_definition(&db, root, entry, &main_path(), byte));
-    let Some(def) = def else {
-        assert!(def.is_some(), "the `n` of `scale` resolves");
-        return;
-    };
+    let def = def.ok_or("the `n` of `scale` resolves")?;
     let mut found: Vec<u32> = find_references(&db, root, entry, &def.target)
         .iter()
         .map(|reference| reference.span.lo)
@@ -174,10 +167,11 @@ fn a_local_s_references_stay_inside_its_scope() {
         .filter_map(|&n| word_at(LOCALS, "n", n))
         .collect();
     assert_eq!(found, expected);
+    Ok(())
 }
 
 #[test]
-fn every_recorded_occurrence_answers_one_target_through_every_query() {
+fn every_recorded_occurrence_answers_one_target_through_every_query() -> Result<(), &'static str> {
     let db = IpeDatabase::new();
     let fixture = do_fixture();
     let (root, files) = project(&db, &fixture);
@@ -188,10 +182,9 @@ fn every_recorded_occurrence_answers_one_target_through_every_query() {
         }
         let module: Vec<String> = path.iter().map(|s| (*s).to_owned()).collect();
         let canonical = ipe_db::canonicalize(&db, root, file);
-        assert!(canonical.is_ok(), "{module:?} canonicalises");
-        let Ok(canonical) = canonical else {
-            return;
-        };
+        let canonical = canonical
+            .as_ref()
+            .map_err(|_| "a user module canonicalises")?;
         for (span, _) in canonical.names.entries() {
             let resolved = resolve_name_at(&db, root, file, &module, span.lo);
             let def = goto_definition(&db, root, file, &module, span.lo);
@@ -202,21 +195,21 @@ fn every_recorded_occurrence_answers_one_target_through_every_query() {
         }
     }
     assert!(checked > 0, "the fixture records occurrences");
+    Ok(())
 }
 
 #[test]
-fn an_unrecorded_occurrence_resolves_to_nothing() {
+fn an_unrecorded_occurrence_resolves_to_nothing() -> Result<(), &'static str> {
     let db = IpeDatabase::new();
     let (root, files) = project(&db, &[(&["Main"], LOCALS, ModuleOrigin::User)]);
-    let Some(&entry) = files.first() else {
-        return;
-    };
+    let &entry = files.first().ok_or("the fixture has `Main`")?;
     // An operator and a type reference record no occurrence.
     for (needle, nth) in [("+", 0), ("Int", 0)] {
         let byte = at(LOCALS, needle, nth, 0);
         let resolved = byte.and_then(|byte| resolve_name_at(&db, root, entry, &main_path(), byte));
         assert!(resolved.is_none(), "{needle}: {resolved:?}");
     }
+    Ok(())
 }
 
 /// `name_token` over a whole text: the narrowed token's text, or `None`.
