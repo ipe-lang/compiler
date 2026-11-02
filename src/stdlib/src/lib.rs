@@ -376,13 +376,34 @@ pub fn source(module_name: &str) -> Option<&'static str> {
 // enforces that invariant; a name in both would be pre-installed as a kernel
 // qualifier AND injected as a source dep, giving ambiguous resolution.
 
-/// One compiled-from-source standard-library module: its dotted name and its
-/// embedded Ipê source.
+/// A stdlib module's presentation tier: how `ipe doc` and the stdlib
+/// reference group and label it.
+///
+/// This is a typed fact on the registry row, never read off the dotted
+/// name's spelling: a consumer renders from `tier`, and the `.Internals`
+/// suffix carries no meaning of its own (see the `tiers_agree_with_names`
+/// build-time proof below, which ties the two together exactly once).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StdTier {
+    /// Part of the public, documented API surface.
+    Public,
+    /// A low-level port layer backing the public module named `of`; importable
+    /// (canon places no restriction on it) but presented as internal.
+    PortLayer {
+        /// The dotted name of the public module this port layer backs.
+        of: &'static str,
+    },
+}
+
+/// One compiled-from-source standard-library module: its dotted name, its
+/// embedded Ipê source, and its presentation tier.
 pub struct CompiledStdModule {
     /// The dotted module name as written in an `import`, e.g. `Ipe.Palette`.
     pub dotted: &'static str,
     /// The module's Ipê source, embedded at compile time.
     pub source: &'static str,
+    /// How `ipe doc` and the stdlib reference present this module.
+    pub tier: StdTier,
 }
 
 /// `Ipe.Palette` — a Std-namespace spike module that defines `Shade` / `Spacing`
@@ -1337,14 +1358,17 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Palette",
         source: PALETTE,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Net",
         source: STD_NET,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Duration",
         source: STD_DURATION,
+        tier: StdTier::Public,
     },
     // Ipe.Time.Timestamp — opaque instant newtype; pure Ipê over a raw `Int`
     // epoch-millis carrier. Composes with `Ipe.Duration` for typed arithmetic.
@@ -1352,10 +1376,12 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Time.Timestamp",
         source: STD_TIME_TIMESTAMP,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.ByteSize",
         source: STD_BYTESIZE,
+        tier: StdTier::Public,
     },
     // Ipe.Length -- pure-Ipe SSOT for the shared CSS length-unit spelling
     // (`Px`/`Vh`/`Vw`); `Ipe.Css` folds its shared arms through it. No kernel
@@ -1363,16 +1389,19 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Length",
         source: STD_LENGTH,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Tuple",
         source: TUPLE,
+        tier: StdTier::Public,
     },
     // Ipe.Parser — pure-Ipê parser combinators (elm/parser parity); no kernel
     // calls. Defines and pattern-matches its own `Parser`/`Problem`/`Step` data.
     CompiledStdModule {
         dotted: "Ipe.Parser",
         source: PARSER,
+        tier: StdTier::Public,
     },
     // Ipe.Bitwise — Layer-3 source; every member is a point-free
     // `Kernel.kernel "Bitwise_*"` alias resolved by `detect_kernel_alias` to the
@@ -1381,6 +1410,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Bitwise",
         source: BITWISE,
+        tier: StdTier::Public,
     },
     // Ipe.Color — Layer-3 source; every member is a point-free
     // `Kernel.kernel "Color_*"` alias resolved by `detect_kernel_alias` to the
@@ -1390,6 +1420,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Color",
         source: COLOR,
+        tier: StdTier::Public,
     },
     // Ipe.Color.Ansi — the terminal colour palette (`black`…`brightWhite`,
     // `default`, `rgb`), each a point-free `Kernel.kernel "TermColor_*"` alias
@@ -1397,6 +1428,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Color.Ansi",
         source: STD_COLOR_ANSI,
+        tier: StdTier::Public,
     },
     // Ipe.String — Layer-3 source; every member is a point-free
     // `Kernel.kernel "String_*"` alias resolved by `detect_kernel_alias` to the
@@ -1406,6 +1438,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.String",
         source: STRING,
+        tier: StdTier::Public,
     },
     // Ipe.Encoding — Layer-3 source; every member is a point-free
     // `Kernel.kernel "Encoding_*"` alias resolved by `detect_kernel_alias` to the
@@ -1414,6 +1447,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Encoding",
         source: ENCODING,
+        tier: StdTier::Public,
     },
     // Ipe.Debug — Layer-3 source; every member is a point-free
     // `Kernel.kernel "Debug_*"` alias resolved by `detect_kernel_alias` to the
@@ -1422,6 +1456,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Debug",
         source: DEBUG,
+        tier: StdTier::Public,
     },
     // Ipe.Uuid — Layer-3 source; `v4`/`v7`/`parse` are point-free
     // `Kernel.kernel "Uuid_*"` aliases resolved by `detect_kernel_alias` to the
@@ -1431,6 +1466,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Uuid",
         source: UUID,
+        tier: StdTier::Public,
     },
     // Ipe.Time — Layer-3 source; every member is a point-free
     // `Kernel.kernel "Time_*"` alias resolved by `detect_kernel_alias` to the
@@ -1439,6 +1475,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Time",
         source: TIME,
+        tier: StdTier::Public,
     },
     // Ipe.Set — Layer-3 source; every member is a point-free
     // `Kernel.kernel "Set_*"` alias resolved by `detect_kernel_alias` to the
@@ -1447,6 +1484,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Set",
         source: SET,
+        tier: StdTier::Public,
     },
     // Ipe.Bytes — Layer-3 source; every member is a point-free
     // `Kernel.kernel "Bytes_*"` alias resolved by `detect_kernel_alias` to the
@@ -1455,6 +1493,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Bytes",
         source: BYTES,
+        tier: StdTier::Public,
     },
     // Ipe.Char — Layer-3 source; every member is a point-free
     // `Kernel.kernel "Char_*"` alias resolved by `detect_kernel_alias` to the
@@ -1463,6 +1502,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Char",
         source: CHAR,
+        tier: StdTier::Public,
     },
     // Ipe.Io — Layer-3 source; every member is a point-free
     // `Kernel.kernel "Io_*"` alias resolved by `detect_kernel_alias` to the
@@ -1471,6 +1511,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Io",
         source: IO,
+        tier: StdTier::Public,
     },
     // Ipe.Dict — Layer-3 source; every member is a point-free
     // `Kernel.kernel "Dict_*"` alias resolved by `detect_kernel_alias` to the
@@ -1479,6 +1520,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Dict",
         source: DICT,
+        tier: StdTier::Public,
     },
     // Ipe.List — Layer-3 source; pure members compile from Ipê; the eleven
     // kernel-backed members (`sort`/`singleton`/`repeat`/`product`/
@@ -1489,6 +1531,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.List",
         source: LIST,
+        tier: StdTier::Public,
     },
     // Ipe.Task — Layer-3 source; members are either point-free
     // `Kernel.kernel "Task_*"` aliases resolved by `detect_kernel_alias` to the
@@ -1498,6 +1541,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Task",
         source: TASK,
+        tier: StdTier::Public,
     },
     // Ipe.Decimal — Layer-3 source; every member is a point-free
     // `Kernel.kernel "Decimal_*"` alias resolved by `detect_kernel_alias` to the
@@ -1506,26 +1550,32 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Decimal",
         source: DECIMAL,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Random",
         source: RANDOM,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Random.Generator",
         source: RANDOM_GENERATOR,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Css",
         source: CSS,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Test",
         source: IPE_TEST,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Web.Head",
         source: STD_LIVE_HEAD,
+        tier: StdTier::Public,
     },
     // Ipe.Web.Head.Unsafe — Layer-3 source; the single `unsafeJsonLd` verbatim
     // JSON-LD `<script>` hatch. Its body is pure Ipê over the `Html` kernel
@@ -1534,46 +1584,57 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Web.Head.Unsafe",
         source: STD_LIVE_HEAD_UNSAFE,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Ui.Responsive",
         source: STD_UI_RESPONSIVE,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Ui.Chart",
         source: STD_UI_CHART,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Ui.Grid",
         source: STD_UI_GRID,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Ui.Transition",
         source: STD_UI_TRANSITION,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Ui.Transform",
         source: STD_UI_TRANSFORM,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Ui.Animation",
         source: STD_UI_ANIMATION,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Ui.Cells",
         source: STD_UI_CELLS,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Ui.Tui",
         source: STD_UI_TUI,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Ui.Cli",
         source: STD_UI_CLI,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Codec",
         source: STD_CODEC,
+        tier: StdTier::Public,
     },
     // Ipe.Analytics — consent-gated typed analytics. `Pii` is opaque with no
     // reveal path; `PPii` always serialises as `"[redacted]"`. Consent is
@@ -1582,6 +1643,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Analytics",
         source: STD_ANALYTICS,
+        tier: StdTier::Public,
     },
     // Ipe.Db.Store — Layer-3 source; codec-driven typed persistence over the
     // audited `Ipe.Db` / `Ipe.Db.Sql` kernels. Pure Ipê, no new kernel.
@@ -1590,6 +1652,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Db.Store",
         source: STD_DB_STORE,
+        tier: StdTier::Public,
     },
     // Ipe.Db.Store.Unsafe — Layer-3 source; the raw string-named query leaves for
     // a `fromColumns` raw store. Imports `Ipe.Db.Store` for the `Cond`
@@ -1598,6 +1661,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Db.Store.Unsafe",
         source: STD_DB_STORE_UNSAFE,
+        tier: StdTier::Public,
     },
     // Ipe.Db.Codec — the codec↔SQL row seam (`codecToBinds` / `codecFromRow`).
     // Pure Ipê over `Ipe.Codec` + the reserved `SqlValue`; reuses the codec's
@@ -1607,274 +1671,394 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Db.Codec",
         source: STD_DB_CODEC,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Money",
         source: STD_MONEY,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.WebSocket",
         source: IPE_CORE_WEBSOCKET,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Ffi.Js",
         source: IPE_CORE_JS,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Ffi.Js.CustomElement",
         source: IPE_CORE_JS_CUSTOM_ELEMENT,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Clipboard",
         source: IPE_BROWSER_CLIPBOARD,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Clipboard.Internals",
         source: IPE_BROWSER_CLIPBOARD_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.Clipboard",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Geolocation",
         source: IPE_BROWSER_GEOLOCATION,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Geolocation.Internals",
         source: IPE_BROWSER_GEOLOCATION_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.Geolocation",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Notification",
         source: IPE_BROWSER_NOTIFICATION,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Notification.Internals",
         source: IPE_BROWSER_NOTIFICATION_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.Notification",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Push",
         source: IPE_BROWSER_PUSH,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Push.Internals",
         source: IPE_BROWSER_PUSH_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.Push",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Storage",
         source: IPE_BROWSER_STORAGE,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Storage.Internals",
         source: IPE_BROWSER_STORAGE_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.Storage",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Vibration",
         source: IPE_BROWSER_VIBRATION,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Vibration.Internals",
         source: IPE_BROWSER_VIBRATION_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.Vibration",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Share",
         source: IPE_BROWSER_SHARE,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Share.Internals",
         source: IPE_BROWSER_SHARE_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.Share",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Battery",
         source: IPE_BROWSER_BATTERY,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Battery.Internals",
         source: IPE_BROWSER_BATTERY_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.Battery",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.NetworkInfo",
         source: IPE_BROWSER_NETWORK_INFO,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.NetworkInfo.Internals",
         source: IPE_BROWSER_NETWORK_INFO_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.NetworkInfo",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.FilePicker",
         source: IPE_BROWSER_FILE_PICKER,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.FilePicker.Internals",
         source: IPE_BROWSER_FILE_PICKER_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.FilePicker",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Camera",
         source: IPE_BROWSER_CAMERA,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Camera.Internals",
         source: IPE_BROWSER_CAMERA_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.Camera",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Microphone",
         source: IPE_BROWSER_MICROPHONE,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Microphone.Internals",
         source: IPE_BROWSER_MICROPHONE_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.Microphone",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Speech",
         source: IPE_BROWSER_SPEECH,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Speech.Internals",
         source: IPE_BROWSER_SPEECH_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.Speech",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Permission",
         source: IPE_BROWSER_PERMISSION,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Permission.Internals",
         source: IPE_BROWSER_PERMISSION_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.Permission",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Gamepad",
         source: IPE_BROWSER_GAMEPAD,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Gamepad.Internals",
         source: IPE_BROWSER_GAMEPAD_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.Gamepad",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Recorder",
         source: IPE_BROWSER_RECORDER,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Recorder.Internals",
         source: IPE_BROWSER_RECORDER_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.Recorder",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.WebAuthn",
         source: IPE_BROWSER_WEB_AUTHN,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.WebAuthn.Internals",
         source: IPE_BROWSER_WEB_AUTHN_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.WebAuthn",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Visibility",
         source: IPE_BROWSER_VISIBILITY,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Visibility.Internals",
         source: IPE_BROWSER_VISIBILITY_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.Visibility",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.MediaQuery",
         source: IPE_BROWSER_MEDIA_QUERY,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.MediaQuery.Internals",
         source: IPE_BROWSER_MEDIA_QUERY_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.MediaQuery",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Connectivity",
         source: IPE_BROWSER_CONNECTIVITY,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Connectivity.Internals",
         source: IPE_BROWSER_CONNECTIVITY_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.Connectivity",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Orientation",
         source: IPE_BROWSER_ORIENTATION,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Orientation.Internals",
         source: IPE_BROWSER_ORIENTATION_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.Orientation",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Motion",
         source: IPE_BROWSER_MOTION,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Motion.Internals",
         source: IPE_BROWSER_MOTION_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.Motion",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Channel",
         source: IPE_BROWSER_CHANNEL,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Channel.Internals",
         source: IPE_BROWSER_CHANNEL_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.Channel",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Fullscreen",
         source: IPE_BROWSER_FULLSCREEN,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Fullscreen.Internals",
         source: IPE_BROWSER_FULLSCREEN_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.Fullscreen",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.ScreenOrientation",
         source: IPE_BROWSER_SCREEN_ORIENTATION,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.ScreenOrientation.Internals",
         source: IPE_BROWSER_SCREEN_ORIENTATION_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.ScreenOrientation",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.WakeLock",
         source: IPE_BROWSER_WAKE_LOCK,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.WakeLock.Internals",
         source: IPE_BROWSER_WAKE_LOCK_INTERNALS,
+        tier: StdTier::PortLayer {
+            of: "Ipe.Browser.WakeLock",
+        },
     },
     CompiledStdModule {
         dotted: "Ipe.Env",
         source: IPE_CORE_ENV,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Cache",
         source: STD_CACHE,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Compression",
         source: STD_COMPRESSION,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Config",
         source: STD_CONFIG,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Csv",
         source: STD_CSV,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Email",
         source: STD_EMAIL,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Web.Console",
         source: STD_LIVE_CONSOLE,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.PubSub",
         source: STD_PUBSUB,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Remote",
         source: STD_REMOTE,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Trace",
         source: STD_TRACE,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Ui.Events",
         source: STD_UI_EVENTS,
+        tier: StdTier::Public,
     },
     // Ipe.Http.StatusCode — typed HTTP status code over Int (opaque ctor,
     // `fromInt` / `code` / `isSuccess` / `isRedirect` / `isClientError` /
@@ -1882,30 +2066,35 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Http.StatusCode",
         source: STD_HTTP_STATUS_CODE,
+        tier: StdTier::Public,
     },
     // Ipe.Regex — Layer-3 source, `Kernel.kernel "Regex_*"` aliases route
     // to the registered pure `Regex*` kernels (`ipe_runtime::regex_kernel::*`).
     CompiledStdModule {
         dotted: "Ipe.Regex",
         source: REGEX,
+        tier: StdTier::Public,
     },
     // Ipe.Path — Layer-3 source, `Kernel.kernel "Path_*"` aliases route
     // to the registered pure `Path*` kernels (`ipe_runtime::path::*`).
     CompiledStdModule {
         dotted: "Ipe.Path",
         source: PATH,
+        tier: StdTier::Public,
     },
     // Ipe.File — Layer-3 source over the `File_*` effect kernels
     // (`ipe_runtime::file::*`); `readFileLimit` unwraps its `ByteSize` ceiling.
     CompiledStdModule {
         dotted: "Ipe.File",
         source: FILE,
+        tier: StdTier::Public,
     },
     // Ipe.Html.Attributes — Layer-3 source; fixed-key builders are pure Ipê over
     // the retained `Kernel.kernel "Attr_*"` primitives (`ipe_runtime::html::*`).
     CompiledStdModule {
         dotted: "Ipe.Html.Attributes",
         source: HTML_ATTRIBUTES,
+        tier: StdTier::Public,
     },
     // Ipe.Html.Unsafe — Layer-3 source; the single `unsafeRaw` escape hatch is a
     // `Kernel.kernel "Html_unsafeRaw"` alias to the unchanged `HtmlRawNode` kernel.
@@ -1913,6 +2102,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Html.Unsafe",
         source: HTML_UNSAFE,
+        tier: StdTier::Public,
     },
     // Ipe.Db.Unsafe — Layer-3 source; the raw-SQL / untyped-read escape hatches
     // are `Kernel.kernel "Db_*"` / `"Sql_unsafeFragment"` aliases to unchanged (and
@@ -1920,6 +2110,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Db.Unsafe",
         source: DB_UNSAFE,
+        tier: StdTier::Public,
     },
     // Ipe.Db.Dsn — Layer-3 source; the typed, opaque connection descriptor
     // (parse-don't-validate). Defines the `Driver` / `TlsMode` ADTs and wraps the
@@ -1929,6 +2120,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Db.Dsn",
         source: DB_DSN,
+        tier: StdTier::Public,
     },
     // Ipe.Db.Location — Layer-3 source; the typed location `Db.open` opens.
     // Defines the `Mode` ADT and wraps the `Db.Location_*` constructor kernels.
@@ -1936,6 +2128,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Db.Location",
         source: DB_LOCATION,
+        tier: StdTier::Public,
     },
     // Ipe.Secret.Unsafe — Layer-3 source; the single `unsafeReveal` escape hatch
     // is a `Kernel.kernel "Secret_reveal"` alias to the unchanged `SecretReveal`
@@ -1944,6 +2137,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Secret.Unsafe",
         source: SECRET_UNSAFE,
+        tier: StdTier::Public,
     },
     // Ipe.Html — Layer-3 source; element builders are pure Ipê over the retained
     // `Kernel.kernel "Html_node"` / `"Html_voidNode"` primitives, with the native
@@ -1951,6 +2145,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Html",
         source: HTML,
+        tier: StdTier::Public,
     },
     // Ipe.Ui — Layer-3 source; the layout builders are pure Ipê over the retained
     // `Kernel.kernel "Ui_node"` / `"Ui_taggedNode"` primitives, with every other
@@ -1958,23 +2153,27 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Ui",
         source: UI,
+        tier: StdTier::Public,
     },
     // Ipe.Markdown — pure Ipê markdown→Ui renderer; no kernel calls.
     CompiledStdModule {
         dotted: "Ipe.Markdown",
         source: STD_MARKDOWN,
+        tier: StdTier::Public,
     },
     // Ipe.Url — Layer-3 source, `Kernel.kernel "Url_*"` aliases route to the
     // registered pure `Url*` kernels (`ipe_runtime::url::*`).
     CompiledStdModule {
         dotted: "Ipe.Url",
         source: URL,
+        tier: StdTier::Public,
     },
     // Ipe.Url.Parser — pure-Ipê routing combinators over the shipped `Ipe.Url`
     // accessors; no kernel calls.
     CompiledStdModule {
         dotted: "Ipe.Url.Parser",
         source: URL_PARSER,
+        tier: StdTier::Public,
     },
     // Ipe.Locale — opaque BCP-47 locale handle + locale-aware case mapping.
     // `Locale.fromTag`/`Locale.toTag` resolve via `Kernel.kernel "Locale_*"`;
@@ -1985,6 +2184,7 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Locale",
         source: LOCALE,
+        tier: StdTier::Public,
     },
     // Ipe.Math — Layer-3 source; every member is a point-free
     // `Kernel.kernel "Math_*"` alias resolved by `detect_kernel_alias` to the
@@ -1994,32 +2194,124 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Math",
         source: MATH,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Basics",
         source: BASICS,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Maybe",
         source: MAYBE,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Result",
         source: RESULT,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Log",
         source: LOG,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Level",
         source: LEVEL,
+        tier: StdTier::Public,
     },
     CompiledStdModule {
         dotted: "Ipe.Error",
         source: ERROR,
+        tier: StdTier::Public,
     },
 ];
+
+/// Byte-wise equality; `split_first` keeps the walk free of slice indexing in
+/// a `const fn`.
+const fn bytes_eq(mut a: &[u8], mut b: &[u8]) -> bool {
+    loop {
+        match (a.split_first(), b.split_first()) {
+            (None, None) => return true,
+            (Some((&ha, ta)), Some((&hb, tb))) if ha == hb => (a, b) = (ta, tb),
+            _ => return false,
+        }
+    }
+}
+
+/// Whether `dotted` ends in the literal suffix `.Internals`.
+const fn ends_with_dot_internals(dotted: &str) -> bool {
+    const SUFFIX: &[u8] = b".Internals";
+    let bytes = dotted.as_bytes();
+    if bytes.len() < SUFFIX.len() {
+        return false;
+    }
+    let (_, tail) = bytes.split_at(bytes.len() - SUFFIX.len());
+    bytes_eq(tail, SUFFIX)
+}
+
+/// Whether `dotted` is exactly `of` followed by the literal suffix
+/// `.Internals`, byte for byte, with no allocation.
+const fn names_internals_of(dotted: &str, of: &str) -> bool {
+    const SUFFIX: &[u8] = b".Internals";
+    let dotted_bytes = dotted.as_bytes();
+    let of_bytes = of.as_bytes();
+    if dotted_bytes.len() != of_bytes.len() + SUFFIX.len() {
+        return false;
+    }
+    let (head, tail) = dotted_bytes.split_at(of_bytes.len());
+    bytes_eq(head, of_bytes) && bytes_eq(tail, SUFFIX)
+}
+
+/// Whether `rows` holds a `StdTier::Public` row named `dotted`.
+///
+/// Searches `rows` itself, not the global `COMPILED_STD_MODULES` — so the
+/// proof below is self-contained and exercisable on a fixture slice, not only
+/// on the real table.
+const fn has_public_row_named(rows: &[CompiledStdModule], dotted: &str) -> bool {
+    let mut remaining = rows;
+    while let Some((row, tail)) = remaining.split_first() {
+        if matches!(row.tier, StdTier::Public) && bytes_eq(row.dotted.as_bytes(), dotted.as_bytes())
+        {
+            return true;
+        }
+        remaining = tail;
+    }
+    false
+}
+
+/// Whether every row's `tier` agrees with its `dotted` name: a `.Internals`
+/// row must be a `PortLayer` naming a `Public` row at its own prefix
+/// (`dotted == of ++ ".Internals"`, checked both ways), and no `Public` row
+/// may be spelled `.Internals`. Consumers then render the tier field alone —
+/// never the spelling.
+const fn tiers_agree_with_names(rows: &[CompiledStdModule]) -> bool {
+    let mut remaining = rows;
+    while let Some((row, tail)) = remaining.split_first() {
+        match row.tier {
+            StdTier::Public => {
+                if ends_with_dot_internals(row.dotted) {
+                    return false;
+                }
+            }
+            StdTier::PortLayer { of } => {
+                if !names_internals_of(row.dotted, of) || !has_public_row_named(rows, of) {
+                    return false;
+                }
+            }
+        }
+        remaining = tail;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a `.Internals` row is typed `Public`, or a `PortLayer`'s `of` names no `Public` row, or the `.Internals` suffix and `of` disagree [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    tiers_agree_with_names(COMPILED_STD_MODULES),
+    "every `.Internals` row must be a StdTier::PortLayer naming a Public row at its own prefix, and no Public row may be spelled `.Internals`",
+);
 
 // ===========================================================================
 // Documentation-only modules — reserved compiler-internal qualifiers.
@@ -2286,6 +2578,79 @@ mod tests {
                 dotted.split('.').map(str::to_owned).collect()
             })
             .collect()
+    }
+
+    /// `COMPILED_STD_MODULES` groups into the `Public` rows and the
+    /// `PortLayer` rows by `tier` alone, never by matching `.Internals`
+    /// against the name — the typed field is what a renderer (`ipe doc`'s
+    /// `--list`) must read to group its listing by tier.
+    #[test]
+    fn list_groups_port_layers_by_tier() {
+        let (port_layers, public): (Vec<_>, Vec<_>) = COMPILED_STD_MODULES
+            .iter()
+            .partition(|m| matches!(m.tier, StdTier::PortLayer { .. }));
+
+        assert!(!port_layers.is_empty(), "no PortLayer row found");
+        assert!(!public.is_empty(), "no Public row found");
+        for m in &port_layers {
+            assert!(
+                ends_with_dot_internals(m.dotted),
+                "{} is tiered PortLayer but is not spelled `.Internals`",
+                m.dotted
+            );
+        }
+        for m in &public {
+            assert!(
+                !ends_with_dot_internals(m.dotted),
+                "{} is tiered Public but is spelled `.Internals`",
+                m.dotted
+            );
+        }
+    }
+
+    /// The build-time proof (`tiers_agree_with_names`, asserted over
+    /// `COMPILED_STD_MODULES` below) refuses a `.Internals` row typed
+    /// `Public` and a `PortLayer` whose `of` names no `Public` row —
+    /// exercised here at runtime on fixture slices so the refusal is pinned
+    /// without needing a build failure to observe it.
+    #[test]
+    fn a_public_row_named_internals_is_refused() {
+        const BAD_PUBLIC_INTERNALS: &[CompiledStdModule] = &[CompiledStdModule {
+            dotted: "Ipe.Example.Internals",
+            source: "",
+            tier: StdTier::Public,
+        }];
+        assert!(
+            !tiers_agree_with_names(BAD_PUBLIC_INTERNALS),
+            "a `.Internals` row typed `Public` must be refused"
+        );
+
+        const BAD_ORPHAN_PORT_LAYER: &[CompiledStdModule] = &[CompiledStdModule {
+            dotted: "Ipe.Example.Internals",
+            source: "",
+            tier: StdTier::PortLayer { of: "Ipe.Example" },
+        }];
+        assert!(
+            !tiers_agree_with_names(BAD_ORPHAN_PORT_LAYER),
+            "a `PortLayer` naming no `Public` row must be refused"
+        );
+
+        const GOOD: &[CompiledStdModule] = &[
+            CompiledStdModule {
+                dotted: "Ipe.Example",
+                source: "",
+                tier: StdTier::Public,
+            },
+            CompiledStdModule {
+                dotted: "Ipe.Example.Internals",
+                source: "",
+                tier: StdTier::PortLayer { of: "Ipe.Example" },
+            },
+        ];
+        assert!(
+            tiers_agree_with_names(GOOD),
+            "a `PortLayer` naming its own `Public` row must be accepted"
+        );
     }
 
     /// The module `|=` / `|.` desugar into is an embedded module under exactly
