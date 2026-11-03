@@ -1,9 +1,11 @@
-//! `NO_COLOR` reader scan: the environment variable that forces
-//! [`crate::color::TermProfile::NoColor`] has exactly one typed reader in
-//! production code, [`crate::color::resolve_term_profile`] — the single place
-//! `Tui`/`Cli` decide the colour profile. A second independent reader can
-//! disagree with the first (e.g. on "present" vs "present and non-empty"),
-//! which is the two-readers-of-one-input class the scan guards against.
+//! `NO_COLOR` reader scan: the environment variable that suppresses colour has
+//! exactly one typed reader in production code,
+//! [`crate::color::no_color_requested`] — every colour decision, `Tui`/`Cli`
+//! rendering (through [`crate::color::resolve_term_profile`]) and the emitted
+//! app's task-error printer alike, calls it instead of reading the raw env var
+//! itself. A second independent reader can disagree with the first (e.g. on
+//! "present at all" vs "present and non-empty"), which is the
+//! two-readers-of-one-input class the scan guards against.
 //!
 //! The scan counts, per file, every production-syntax string literal equal to
 //! `"NO_COLOR"` and asserts the per-file counts equal [`ADMITTED`] exactly — an
@@ -36,18 +38,12 @@ const NO_COLOR_VAR: &str = "NO_COLOR";
 
 /// Every admitted literal naming [`NO_COLOR_VAR`]: file, count.
 ///
-/// `color.rs` is the one intended reader: [`crate::color::resolve_term_profile`],
-/// which every `Tui`/`Cli` colour decision reads through its typed
-/// [`crate::color::TermProfile`] result.
-///
-/// `core.rs`'s `eprint_task_error` is a SECOND, pre-existing reader with its own
-/// (slightly different: "present at all" vs "present and non-empty") reading of
-/// the same var, for the emitted app's top-level task-error printer — a
-/// genuinely separate surface from the `Tui`/`Cli` rendering pipeline this scan
-/// otherwise closes. It is admitted here, not closed, because `core.rs` is out
-/// of this change's file boundary; closing it (routing that printer through
-/// `resolve_term_profile` too) is tracked as a follow-up, not silently hidden.
-const ADMITTED: &[(&str, usize)] = &[("color.rs", 1), ("core.rs", 1)];
+/// `color.rs` is the ONLY reader: [`crate::color::no_color_requested`], the one
+/// predicate every colour decision calls — both `Tui`/`Cli` rendering (through
+/// [`crate::color::resolve_term_profile`]) and the emitted app's task-error
+/// printer (`core.rs`'s `eprint_task_error`) call it instead of reading the raw
+/// env var themselves.
+const ADMITTED: &[(&str, usize)] = &[("color.rs", 1)];
 
 /// The counted literal naming [`NO_COLOR_VAR`] in one file's production syntax.
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -242,10 +238,10 @@ fn a_source_that_does_not_parse_fails_the_scan() {
 // The scan over the whole runtime source tree.
 // ---------------------------------------------------------------------------
 
-/// `NO_COLOR` is read only where [`ADMITTED`] says: the one intended reader in
-/// `color.rs`, plus the pre-existing, out-of-boundary `core.rs` reader this
-/// change does not close. No other file — in particular not `tui/layout.rs`,
-/// which used to cache its own independent reader — reads it at all.
+/// `NO_COLOR` is read only where [`ADMITTED`] says: the one reader in
+/// `color.rs`. No other file — in particular neither `tui/layout.rs` nor
+/// `core.rs` — reads it directly; every colour decision instead calls
+/// [`crate::color::no_color_requested`].
 #[test]
 fn no_color_has_one_reader() {
     let root = e2e_support::manifest_dir!().join("src");
