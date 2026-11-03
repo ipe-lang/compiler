@@ -62,7 +62,7 @@ fn plain_render(diag: &ipe_diagnostics::Diagnostic, entry: &std::path::Path) -> 
 fn assert_gate(fixture: &str, out_suffix: &str, expected: ipe_diagnostics::Code, needle: &str) {
     let entry = fixture_project(fixture);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&entry, &out, &runtime);
@@ -203,7 +203,7 @@ fn sort_by_scalar_keys_build_and_order() {
     }
     let name = "sort_by_scalar_keys";
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&fixture_project(name), &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());

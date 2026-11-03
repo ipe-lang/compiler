@@ -62,7 +62,7 @@ fn http_stream_open_full_emit_succeeds() {
     let root = repo_root();
     let golden_project = root.join("tests").join("golden").join("http_stream_id");
     let out = crate::support::scratch_root().join("ipec_i148_http_stream_id_full_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

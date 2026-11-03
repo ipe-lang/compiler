@@ -22,7 +22,7 @@ fn compile(test_name: &str, source: &str) -> Result<Result<(), ipe::CliError>, B
 
     let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("ui_cells_gate_{test_name}_out"));
-    let _ = std::fs::remove_dir_all(&out_dir);
+    e2e_support::scratch::fresh(&out_dir);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     Ok(ipe::build_fixture(&fixture, &out_dir, &runtime).map(drop))

@@ -41,7 +41,7 @@ fn rejection_diagnostic(golden: &str) -> Diagnostic {
     let root = repo_root();
     let entry = fixture_project(&root, golden);
     let out = crate::support::scratch_root().join(format!("ipec_{golden}"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let diag = match crate::support::build_golden(&entry, &out, &runtime) {

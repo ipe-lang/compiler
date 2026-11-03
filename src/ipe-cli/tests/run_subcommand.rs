@@ -80,7 +80,7 @@ fn run_subcommand_builds_and_executes_hello_program() {
         };
         let dir =
             std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_run_subcommand_e2e");
-        let _ = fs::remove_dir_all(&dir);
+        e2e_support::scratch::fresh(&dir);
 
         // Use a dedicated out dir so CARGO_TARGET_DIR contention is isolated.
         let out_dir = dir.join("out");
@@ -152,7 +152,7 @@ fn emitted_cargo_toml_name_matches_binary_ipe_run_will_exec() {
         // --- Case 1: single-file build (no manifest) → name must be "ipe-app" ---
         let dir =
             std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipe_run_bin_name_e2e");
-        let _ = fs::remove_dir_all(&dir);
+        e2e_support::scratch::fresh(&dir);
         let entry = dir.join("Main.ipe");
         let created = fs::create_dir_all(&dir).and_then(|()| fs::write(&entry, SRC));
         assert!(created.is_ok(), "write source: {created:?}");
@@ -265,7 +265,7 @@ fn run_without_cargo_reports_the_missing_toolchain() {
         panic!("write project: {fixture:?}")
     };
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipe_run_no_cargo_e2e");
-    let _ = fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     let empty_home = dir.join("empty-home");
     let created = fs::create_dir_all(&empty_home);
     assert!(created.is_ok(), "write empty home: {created:?}");

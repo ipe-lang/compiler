@@ -47,7 +47,7 @@ fn assert_byte_identical(name: &str) {
     let root = repo_root();
     let dir = golden_dir(&root, name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_emit"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -73,7 +73,7 @@ fn assert_runs_and_matches_oracle(name: &str) {
     let root = repo_root();
     let dir = golden_dir(&root, name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&dir, &out, &runtime);
@@ -90,7 +90,7 @@ fn assert_gate(fixture: &str, expected: ipe_diagnostics::Code) {
     let root = repo_root();
     let dir = golden_dir(&root, fixture);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{fixture}_gate_emit"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&dir, &out, &runtime);

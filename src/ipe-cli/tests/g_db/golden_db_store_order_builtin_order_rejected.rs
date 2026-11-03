@@ -22,7 +22,7 @@ fn store_order_compared_with_builtin_order_is_rejected() {
     let root = repo_root();
     let entry = fixture_project(&root, GOLDEN);
     let out = crate::support::scratch_root().join("ipec_db_store_order_builtin_order_rejected");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&entry, &out, &runtime);

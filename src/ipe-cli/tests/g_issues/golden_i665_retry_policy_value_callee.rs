@@ -106,7 +106,7 @@ fn retry_policy_shape_nearmiss_rejects() {
     let root = repo_root();
     let golden_dir = fixture_dir_named(&root, "retry_policy_shape_nearmiss");
     let out = crate::support::scratch_root().join("ipec_retry_policy_shape_nearmiss");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     let got = match &built {

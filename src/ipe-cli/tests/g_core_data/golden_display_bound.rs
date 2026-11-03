@@ -45,7 +45,7 @@ fn i186_ipec_accepts_and_bounds_fn_display() {
     let root = repo_root();
     let entry = project_path(&root);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i186_display_bound_ipec_out");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -94,7 +94,7 @@ fn i186_cargo_builds_and_runs() {
     let root = repo_root();
     let entry = project_path(&root);
     let out = crate::support::scratch_root().join("ipec_i186_display_bound_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

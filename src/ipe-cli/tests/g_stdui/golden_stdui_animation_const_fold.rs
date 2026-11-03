@@ -95,7 +95,7 @@ static HOT_ENV_LOCK: Mutex<()> = Mutex::new(());
 fn build_project(slot: &str, hot: bool) -> (PathBuf, Result<(), ipe::CliError>) {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("stdui_animation_const_fold_{slot}"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     std::fs::create_dir_all(&out).expect("create the scratch output dir");
     let fixture = ipe::RootFixture::main(MAIN_IPE).expect("the inline Main project resolves");
     let emit = out.join("emit");

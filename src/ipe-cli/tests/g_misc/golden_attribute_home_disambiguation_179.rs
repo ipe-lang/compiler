@@ -51,7 +51,7 @@ fn build_run_attribute_home_179() -> crate::support::RunOutcome {
         .join("golden")
         .join("attribute_home_disambiguation_179");
     let out = crate::support::scratch_root().join("ipec_attribute_home_179_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&dir, &out, &runtime);

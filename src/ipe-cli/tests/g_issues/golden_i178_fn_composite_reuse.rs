@@ -41,7 +41,7 @@ fn assert_byte_identical(name: &str) {
     let golden_dir = fixture_dir(&root, name);
     let golden_project = root.join("tests").join("golden").join(name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_emit"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);
@@ -57,7 +57,7 @@ fn assert_e2e_prints(name: &str, want_stdout: &str) {
     let root = repo_root();
     let golden_dir = fixture_dir(&root, name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);
@@ -78,7 +78,7 @@ fn assert_fail_closed(name: &str, expected: ipe_diagnostics::Code) {
     let root = repo_root();
     let golden_dir = fixture_dir(&root, name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_gate"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);
@@ -111,7 +111,7 @@ fn escaping_record_of_functions_builds() {
     let root = repo_root();
     let golden_dir = fixture_dir(&root, "fn_record_reuse_escapes");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fn_record_reuse_escapes_build");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(

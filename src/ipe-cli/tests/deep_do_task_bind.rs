@@ -46,7 +46,7 @@ fn deep_do_task_bind_emit_is_linear() {
     let src = make_do_src(N);
 
     let out_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("deep_do_task_bind");
-    let _ = std::fs::remove_dir_all(&out_dir);
+    e2e_support::scratch::fresh(&out_dir);
     let fixture = ipe::RootFixture::main(&src).expect("write the project fixture");
 
     let emit_dir = out_dir.join("emit");
@@ -96,7 +96,7 @@ fn deep_do_task_bind_e2e_seal() {
         let src = make_do_src(N);
 
         let out_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("deep_do_task_bind_e2e");
-        let _ = std::fs::remove_dir_all(&out_dir);
+        e2e_support::scratch::fresh(&out_dir);
         let fixture = ipe::RootFixture::main(&src).expect("write the project fixture");
 
         let emit_dir = out_dir.join("emit");

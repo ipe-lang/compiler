@@ -32,7 +32,7 @@ fn assert_rejected_as_user_kernel_alias(out_dir: &str, main: &str) {
 
     let fixture = ipe::RootFixture::main(main).expect("the fixture project resolves");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_dir);
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let built = ipe::build_fixture(&fixture, &out, &runtime);
     let is_user_kernel_alias = matches!(

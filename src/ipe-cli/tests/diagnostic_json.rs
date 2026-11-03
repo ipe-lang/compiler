@@ -300,7 +300,7 @@ fn build_json_on_type_error_exits_nonzero_with_schema_conforming_json() {
     let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("diag_json_build")
         .join("type_error");
-    let _ = std::fs::remove_dir_all(&tmp);
+    e2e_support::scratch::fresh(&tmp);
     std::fs::create_dir_all(&tmp).expect("create tmp dir");
 
     // A minimal project whose entry has a deliberate type error.
@@ -432,7 +432,7 @@ fn run_json_on_type_error_exits_nonzero_with_schema_conforming_json() {
     let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("diag_json_run")
         .join("type_error");
-    let _ = std::fs::remove_dir_all(&tmp);
+    e2e_support::scratch::fresh(&tmp);
     std::fs::create_dir_all(&tmp).expect("create tmp dir");
 
     std::fs::create_dir_all(tmp.join("src")).expect("create src dir");

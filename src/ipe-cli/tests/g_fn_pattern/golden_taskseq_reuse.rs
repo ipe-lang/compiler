@@ -35,7 +35,7 @@ fn i193_taskseq_ipec_accepts() {
     let root = repo_root();
     let golden = golden_dir(&root);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i193_taskseq_reuse_ipec_out");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -74,7 +74,7 @@ fn i193_taskseq_cargo_builds_and_runs() {
     let root = repo_root();
     let golden = golden_dir(&root);
     let out = crate::support::scratch_root().join("ipec_i193_taskseq_reuse_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

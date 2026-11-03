@@ -52,7 +52,7 @@ main =
 fn build_project(slot: &str, source: &str) -> (PathBuf, Result<(), ipe::CliError>) {
     let out =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("stdui_cubic_bezier_seal_{slot}"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     std::fs::create_dir_all(&out).expect("create the scratch output dir");
     let fixture = ipe::RootFixture::main(source).expect("the inline Main project resolves");
     let emit = out.join("emit");

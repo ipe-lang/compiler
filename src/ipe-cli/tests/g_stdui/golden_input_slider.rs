@@ -26,7 +26,7 @@ fn input_slider_typechecks_and_lowers() {
     let root = repo_root();
     let golden_project = root.join("tests").join("golden").join("input_slider");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i148_input_slider_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let result = crate::support::build_golden(&golden_project, &out, &runtime);

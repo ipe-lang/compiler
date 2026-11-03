@@ -47,7 +47,7 @@ fn build_run_layoutwith() -> (PathBuf, crate::support::RunOutcome) {
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("stdui_layoutwith");
     let out = crate::support::scratch_root().join("ipec_m7_stdui_layoutwith_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&dir, &out, &runtime);

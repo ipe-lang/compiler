@@ -55,7 +55,7 @@ fn record_then_replay_is_deterministic_and_refuses_bad_logs() {
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("console_app_seal");
     let out = crate::support::scratch_root().join("ipec_session_replay_seal_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -87,7 +87,7 @@ fn record_then_replay_is_deterministic_and_refuses_bad_logs() {
 
     let logs =
         crate::support::scratch_root().join(format!("ipe_session_replay_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&logs);
+    e2e_support::scratch::fresh(&logs);
     assert!(std::fs::create_dir_all(&logs).is_ok(), "make log dir");
     let trace = logs.join("session.ipelog");
     let typed = logs.join("session.ipemsgs");

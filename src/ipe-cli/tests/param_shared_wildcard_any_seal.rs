@@ -29,7 +29,7 @@ fn fixture_of(main_ipe: &str) -> ipe::RootFixture {
 fn emit(fixture: &ipe::RootFixture, test_name: &str) -> (Result<(), ipe::CliError>, PathBuf) {
     let out =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("param_any_seal_{test_name}"));
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let result = ipe::build_fixture(fixture, &out, &runtime()).map(drop);
     (result, out)
 }

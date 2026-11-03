@@ -75,7 +75,7 @@ fn diag_code(err: &ipe::CliError) -> Option<ipe_diagnostics::Code> {
 fn subset_access_ipec_accepts_and_resolves_superset_struct() {
     let golden_project = golden_dir("row_poly_subset_access");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("row_poly_subset_access_ipec_out");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -114,7 +114,7 @@ fn subset_access_cargo_builds_and_prints_ada() {
 
     let golden_project = golden_dir("row_poly_subset_access");
     let out = crate::support::scratch_root().join("ipec_row_poly_subset_access_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -153,7 +153,7 @@ fn subset_access_cargo_builds_and_prints_ada() {
 fn subset_pattern_ipec_accepts_and_completes_superset_pattern() {
     let golden_project = golden_dir("row_poly_subset_pattern");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("row_poly_subset_pattern_ipec_out");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -193,7 +193,7 @@ fn subset_pattern_cargo_builds_and_prints_iri_ada_bo() {
 
     let golden_project = golden_dir("row_poly_subset_pattern");
     let out = crate::support::scratch_root().join("ipec_row_poly_subset_pattern_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -232,7 +232,7 @@ fn closed_superset_is_ipe_t0001() {
     let name = "row_poly_closed_superset_neg";
     let golden_project = golden_dir(name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_out"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let res = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -278,7 +278,7 @@ fn two_different_supersets_is_ipe_t0001() {
     let name = "row_poly_two_supersets_neg";
     let golden_project = golden_dir(name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_out"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let res = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -315,7 +315,7 @@ fn row_var_annotation_lowers_to_witness_generic() {
     let name = "row_poly_annotation_gap";
     let golden_project = golden_dir(name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_out"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -364,7 +364,7 @@ fn row_var_annotation_lowers_to_witness_generic() {
 fn accessor_ipec_accepts_and_resolves_concrete_getter() {
     let golden_project = golden_dir("row_poly_accessor");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("row_poly_accessor_ipec_out");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -402,7 +402,7 @@ fn accessor_cargo_builds_and_prints_names() {
 
     let golden_project = golden_dir("row_poly_accessor");
     let out = crate::support::scratch_root().join("ipec_row_poly_accessor_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -443,7 +443,7 @@ fn accessor_cargo_builds_and_prints_names() {
 fn row_poly_greet_lowers_and_monomorphises_two_shapes() {
     let golden_project = golden_dir("row_poly_greet");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("row_poly_greet_ipec_out");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -494,7 +494,7 @@ fn row_poly_greet_cargo_builds_and_prints_both() {
 
     let golden_project = golden_dir("row_poly_greet");
     let out = crate::support::scratch_root().join("ipec_row_poly_greet_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -529,7 +529,7 @@ fn row_poly_task_seq_row_read_routes_effect_through_getter() {
     let golden_project = golden_dir("row_poly_task_seq_row_read");
     let out =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("row_poly_task_seq_row_read_ipec_out");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -584,7 +584,7 @@ fn row_poly_task_seq_row_read_cargo_builds_and_runs() {
 
     let golden_project = golden_dir("row_poly_task_seq_row_read");
     let out = crate::support::scratch_root().join("ipec_row_poly_task_seq_row_read_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -625,7 +625,7 @@ fn let_rebind_of_row_is_ipe_l0131() {
     let name = "row_poly_let_rebind_neg";
     let golden_project = golden_dir(name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_out"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let res = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -655,7 +655,7 @@ fn subset_pattern_param_of_row_is_ipe_l0131() {
     let name = "row_poly_subset_pattern_param_neg";
     let golden_project = golden_dir(name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_out"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let res = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -687,7 +687,7 @@ fn non_first_arg_row_is_ipe_l0131_not_ice() {
     let name = "row_poly_non_first_arg_neg";
     let golden_project = golden_dir(name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_out"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let res = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -716,7 +716,7 @@ fn captured_clone_field_read_is_ipe_l0131() {
     let name = "row_poly_captured_clone_neg";
     let golden_project = golden_dir(name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_out"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let res = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -758,7 +758,7 @@ fn accessor_two_shapes_cargo_builds_and_prints_both() {
 
     let golden_project = golden_dir("row_poly_accessor_two_shapes");
     let out = crate::support::scratch_root().join("ipec_row_poly_accessor_two_shapes_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -797,7 +797,7 @@ fn accessor_two_shapes_cargo_builds_and_prints_both() {
 fn row_poly_multi_lowers_with_one_witness_bound_per_field() {
     let golden_project = golden_dir("row_poly_multi");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("row_poly_multi_ipec_out");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -849,7 +849,7 @@ fn row_poly_multi_cargo_builds_and_prints_both() {
 
     let golden_project = golden_dir("row_poly_multi");
     let out = crate::support::scratch_root().join("ipec_row_poly_multi_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -889,7 +889,7 @@ fn row_poly_passthrough_lowers_to_r1_to_r1() {
     let name = "row_poly_passthrough";
     let golden_project = golden_dir(name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_ipec_out"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -924,7 +924,7 @@ fn row_poly_passthrough_cargo_builds_and_runs() {
     let name = "row_poly_passthrough";
     let golden_project = golden_dir(name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -963,7 +963,7 @@ fn row_poly_update_lowers_to_setter_witness() {
     let name = "row_poly_update";
     let golden_project = golden_dir(name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_ipec_out"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -1012,7 +1012,7 @@ fn row_poly_update_cargo_builds_and_runs() {
     let name = "row_poly_update";
     let golden_project = golden_dir(name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -1054,7 +1054,7 @@ fn row_poly_map_update_funcvalue_lowers_and_builds() {
     let name = "row_poly_map_update";
     let golden_project = golden_dir(name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_ipec_out"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -1077,7 +1077,7 @@ fn row_poly_map_update_cargo_builds_and_runs() {
     let name = "row_poly_map_update";
     let golden_project = golden_dir(name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -1111,7 +1111,7 @@ fn row_poly_map_update_cargo_builds_and_runs() {
 fn unannotated_relay_of_row_poly_fn_is_ipe_l0131() {
     let name = "row_poly_unannotated_relay_neg";
     let out = crate::support::scratch_root().join(format!("{name}_out"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let tree = ipe::project_root::SourceTree::new()
         .module(
             "Lib",
@@ -1152,7 +1152,7 @@ fn free_unused_row_is_accepted() {
     let name = "row_poly_free_row_unused";
     let golden_project = golden_dir(name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_out"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -1176,7 +1176,7 @@ fn helper_borrowing_a_signature_row_is_ipe_l0102() {
     let name = "row_poly_helper_borrows_row_neg";
     let golden_project = golden_dir(name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_out"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);

@@ -50,7 +50,7 @@ non-ascii:FF";
 fn store_ident_parity_resolves_and_builds() {
     let root = repo_root();
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("store_ident_parity_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -73,7 +73,7 @@ fn store_ident_parity_end_to_end() {
 
     let root = repo_root();
     let out = crate::support::scratch_root().join("ipec_store_ident_parity_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

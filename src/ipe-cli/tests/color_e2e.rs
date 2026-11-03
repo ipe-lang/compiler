@@ -40,7 +40,7 @@ fn color_manifest() -> PathBuf {
 #[test]
 fn color_project_builds_with_no_ui_import() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("color_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let res = ipe::build_project(&color_manifest(), &out, &runtime());
     assert!(
@@ -65,7 +65,7 @@ fn color_e2e_runs_and_prints_hex_and_css() {
         return;
     }
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("color_e2e_run");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let res = ipe::build_project(&color_manifest(), &out, &runtime());
     assert!(res.is_ok(), "color-e2e build must succeed: {:?}", res.err());

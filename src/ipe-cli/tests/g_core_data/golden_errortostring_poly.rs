@@ -33,7 +33,7 @@ fn golden_project_dir(root: &Path, name: &str) -> PathBuf {
 fn try_build(entry: &Path) -> Result<PathBuf, ipe::CliError> {
     let out =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(entry.file_name().unwrap_or_default());
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     crate::support::build_golden(entry, &out, &runtime)?;
     Ok(out)
@@ -50,7 +50,7 @@ fn errortostring_polymorphic_compiles() {
     let entry = golden_project_dir(&root, "m_ipe_test_stringify");
     let runtime = e2e_support::require_runtime().into_path_buf();
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m_ipe_test_stringify");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -68,7 +68,7 @@ fn errortostring_polymorphic_e2e() {
     let root = repo_root();
     let entry = golden_project_dir(&root, "m_ipe_test_stringify");
     let out = crate::support::scratch_root().join("ipec_m_ipe_test_stringify_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(built.is_ok(), "must compile: {:?}", built.err());
@@ -84,7 +84,7 @@ fn eqshow_eq_plus_stringify_compiles() {
     let entry = golden_project_dir(&root, "m_errortostring_eqshow");
     let runtime = e2e_support::require_runtime().into_path_buf();
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m_errortostring_eqshow");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -102,7 +102,7 @@ fn eqshow_e2e() {
     let root = repo_root();
     let entry = golden_project_dir(&root, "m_errortostring_eqshow");
     let out = crate::support::scratch_root().join("ipec_m_errortostring_eqshow_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(built.is_ok(), "must compile: {:?}", built.err());

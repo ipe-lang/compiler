@@ -61,7 +61,7 @@ fn compile_solo_into(out: &Path) -> Result<(), CliError> {
 fn compile_src(test_name: &str, source: &str) -> Result<(), CliError> {
     let project = ipe::RootFixture::main(source).expect("the fixture project resolves");
     let out = crate::support::scratch_root().join(format!("param_routes_{test_name}_out"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     ipe::build_fixture(&project, &out, &runtime).map(drop)
 }

@@ -40,7 +40,7 @@ fn assert_ipec_exit0(label: &str, entry_rel: &str) {
         return;
     }
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{label}_ipec_out"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     // The project is the directory above `src/`: its manifest roots every

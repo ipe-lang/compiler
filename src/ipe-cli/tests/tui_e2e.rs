@@ -125,7 +125,7 @@ fn compile_and_build(
 
     let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("tui_e2e_{test_name}_emitted"));
-    let _ = std::fs::remove_dir_all(&out_dir);
+    e2e_support::scratch::fresh(&out_dir);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -178,7 +178,7 @@ fn tui_onkey_record_typechecks() {
 
         let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
             .join(format!("tui_onkey_{label}_emitted"));
-        let _ = std::fs::remove_dir_all(&out_dir);
+        e2e_support::scratch::fresh(&out_dir);
 
         let runtime = e2e_support::require_runtime().into_path_buf();
 

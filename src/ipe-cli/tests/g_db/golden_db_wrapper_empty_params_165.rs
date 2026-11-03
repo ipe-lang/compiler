@@ -90,7 +90,7 @@ fn db_wrapper_empty_params_165_ipec_accepts_and_emits_sql_param_bound() {
         .join("db_wrapper_empty_params_165");
     let out =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("db_wrapper_empty_params_165_ipec_out");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -151,7 +151,7 @@ fn db_wrapper_empty_params_165_cargo_builds_and_runs() {
         .join("golden")
         .join("db_wrapper_empty_params_165");
     let out = crate::support::scratch_root().join("ipec_db_wrapper_empty_params_165_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

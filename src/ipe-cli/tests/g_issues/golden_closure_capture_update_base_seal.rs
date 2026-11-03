@@ -53,7 +53,7 @@ fn update_base_capture_pre_clones_only_a_reused_local() {
     let root = crate::support::repo_root();
     let golden = golden_dir(&root);
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_emit"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden, &out, &runtime);
@@ -89,7 +89,7 @@ fn update_base_capture_seal_runs() {
     let root = crate::support::repo_root();
     let golden = golden_dir(&root);
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_e2e"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden, &out, &runtime);
@@ -147,7 +147,7 @@ fn nonclone_update_base_capture_reuse_fails_closed() {
     let name = "nonclone_update_base_capture_reuse";
     let fixture = crate::root_fixture::main(NONCLONE_UPDATE_BASE_CAPTURE_REUSE);
     let out = crate::support::scratch_root().join(format!("ipec_{name}"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     match crate::root_fixture::build(&fixture, &out, &runtime) {

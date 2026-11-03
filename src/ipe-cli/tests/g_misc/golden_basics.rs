@@ -16,7 +16,7 @@ fn emits_byte_identical_main_rs_as_runtime_dependency() {
     let dir = root.join("tests").join("golden").join("basics");
     let golden_project = root.join("tests").join("golden").join("basics");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m0_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -61,7 +61,7 @@ fn end_to_end_builds_and_prints_one() {
     // own target/ dir is (correctly) rejected by cargo as a non-member package,
     // and the golden Cargo.toml carries no detaching `[workspace]` stanza.
     let out = crate::support::scratch_root().join("ipec_m0_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&dir, &out, &runtime);

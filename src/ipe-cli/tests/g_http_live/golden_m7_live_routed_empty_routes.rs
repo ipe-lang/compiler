@@ -181,7 +181,7 @@ main =
 fn compile_src(test_name: &str, source: &str) -> Result<(), ipe::CliError> {
     let project = ipe::RootFixture::main(source).expect("the fixture project resolves");
     let out = crate::support::scratch_root().join(format!("live_routed_empty_{test_name}_out"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     ipe::build_fixture(&project, &out, &runtime).map(drop)
 }
@@ -197,7 +197,7 @@ fn run_ipec(fixture: &str, out_suffix: &str) -> Result<(), CliError> {
     let root = repo_root();
     let golden_project = root.join("tests").join("golden").join(fixture);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     crate::support::build_golden(&golden_project, &out, &runtime)
@@ -358,7 +358,7 @@ fn routed_empty_routes_is_refused() {
         .join("live_routed_empty_routes_refused");
     let out =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m7_live_routed_empty_routes_refused");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let result = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(

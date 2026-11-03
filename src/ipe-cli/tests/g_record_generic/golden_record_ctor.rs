@@ -38,7 +38,7 @@ fn record_ctor_end_to_end_field_order() {
     let root = repo_root();
     let golden_project = root.join("tests").join("golden").join("record_ctor");
     let out = crate::support::scratch_root().join("ipec_m82_record_ctor_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -63,7 +63,7 @@ fn record_ctor_and_literal_share_one_struct() {
     let root = repo_root();
     let golden_project = root.join("tests").join("golden").join("record_ctor_twin");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m82_record_ctor_twin_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -117,7 +117,7 @@ fn seal_fn_field_alias_emits_no_struct() {
         .join("golden")
         .join("record_ctor_fn_field");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m82_record_ctor_fn_field_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     // ipe MUST succeed — a function-embedding alias that is merely NAMED
@@ -160,7 +160,7 @@ fn seal_fn_field_alias_builds_and_runs() {
         .join("golden")
         .join("record_ctor_fn_field");
     let out = crate::support::scratch_root().join("ipec_m82_record_ctor_fn_field_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -191,7 +191,7 @@ fn seal_opaque_field_alias_emits_no_struct() {
         .join("golden")
         .join("record_ctor_opaque_field");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m82_record_ctor_opaque_field_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     // ipe MUST succeed — an opaque-wrapper-field alias that is merely NAMED
@@ -235,7 +235,7 @@ fn seal_opaque_field_alias_builds_and_runs() {
         .join("golden")
         .join("record_ctor_opaque_field");
     let out = crate::support::scratch_root().join("ipec_m82_record_ctor_opaque_field_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -263,7 +263,7 @@ fn seal_opaque_field_used_as_ctor_fails_closed() {
         .join("golden")
         .join("record_ctor_opaque_ctor");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m82_record_ctor_opaque_ctor_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -287,7 +287,7 @@ fn record_ctor_cross_module_end_to_end() {
     let root = repo_root();
     let manifest = root.join("tests").join("golden").join("record_ctor_xmod");
     let out = crate::support::scratch_root().join("ipec_m82_record_ctor_xmod_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&manifest, &out, &runtime);

@@ -19,7 +19,7 @@ fn runtime() -> PathBuf {
 fn write_project(test_name: &str, main_ipe: &str) -> PathBuf {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("ipe_db_unsafe_marker_{test_name}"));
-    let _ = fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     let src = dir.join("src");
     fs::create_dir_all(&src).expect("create src/");
     fs::write(src.join("Main.ipe"), main_ipe).expect("write Main.ipe");
@@ -33,7 +33,7 @@ fn write_project(test_name: &str, main_ipe: &str) -> PathBuf {
 
 fn build(dir: &Path, test_name: &str) -> Result<(), ipe::CliError> {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("db_marker_{test_name}"));
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     ipe::build_project(&dir.join("package.ipe"), &out, &runtime())
 }
 

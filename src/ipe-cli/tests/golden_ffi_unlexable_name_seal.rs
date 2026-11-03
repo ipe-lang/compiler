@@ -88,7 +88,7 @@ fn ffi_fixture(main_ipe: &str) -> RootFixture {
 /// A fresh scratch directory `name` for files that sit outside the project.
 fn scratch(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     dir
 }
 
@@ -127,7 +127,7 @@ fn unlexable_foreign_names_are_skipped_and_the_import_builds() {
 
     let fixture = ffi_fixture(MAIN_IPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_unlexable_name_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!("a crate with unlexable foreign names must still import, got: {err}")
     }
@@ -152,7 +152,7 @@ fn unlexable_foreign_names_emitted_crate_builds_and_runs() {
 
     let fixture = ffi_fixture(MAIN_IPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_unlexable_name_e2e_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!("a crate with unlexable foreign names must still import, got: {err}")
     }
