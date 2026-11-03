@@ -5,3 +5,6 @@ least=true
 greatest=true
 arith=true
 shadow=true
+eta=true
+pipe=true
+compose=true

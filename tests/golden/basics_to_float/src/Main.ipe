@@ -16,6 +16,9 @@ checks =
     , "greatest=" ++ String.fromBool (toFloat 9223372036854775807 == 9223372036854775808.0)
     , "arith=" ++ String.fromBool (toFloat 3 + 0.5 == 3.5)
     , "shadow=" ++ String.fromBool (Conv.twice 21 == 42)
+    , "eta=" ++ String.fromBool (List.map toFloat [ 1, 2 ] == [ 1.0, 2.0 ])
+    , "pipe=" ++ String.fromBool ((4 |> toFloat) == 4.0)
+    , "compose=" ++ String.fromBool ((toFloat >> sqrt) 16 == 4.0)
     ]
 
 
