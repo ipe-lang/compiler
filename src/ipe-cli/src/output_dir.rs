@@ -639,6 +639,15 @@ impl OwnedDir {
         &self.path
     }
 
+    /// The identity of the directory that was claimed.
+    ///
+    /// A reader that opens the owned tree through its own handle compares the
+    /// directory it opened against this before reading below it.
+    #[must_use]
+    pub const fn id(&self) -> held::DirId {
+        self.id
+    }
+
     /// Claim the owned subdirectory `name`, a single plain path component.
     ///
     /// # Errors

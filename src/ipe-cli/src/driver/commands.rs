@@ -2808,7 +2808,7 @@ fn bundle_wasm_pkg(
     let bundle_size = format_artifact_size(artifact_size_bytes(&bg_wasm)?);
     // The published copy is the artifact: claimed only now, past every
     // fallible step above, so a refused bundle leaves no area behind.
-    let published = crate::bundle_www::publish_www(&crate_dir.path().join("www"), &into()?)?;
+    let published = crate::bundle_www::publish_www(crate_dir, &into()?)?;
     crate::screen::chatter(
         crate::screen::Stream::Stderr,
         crate::screen::Tone::Text,

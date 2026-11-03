@@ -40,30 +40,31 @@ impl BundleHome {
     }
 }
 
-/// Publish the bundle collected from `crate_www` as `www/` under `into`.
+/// Publish the bundle collected from the `www/` of the owned emitted crate `crate_dir` as `www/` under `into`.
 ///
 /// The bundle is exactly the files the held walk admitted, each read through
-/// the held `crate_www` and written into one staged directory that replaces
-/// any previous `www/` whole in one rename. A refusal at any file leaves the
+/// the held `www/` and written into one staged directory that replaces any
+/// previous `www/` whole in one rename. A refusal at any file leaves the
 /// previous bundle exactly as it was, and no staging entry.
 ///
 /// # Errors
 /// [`CliError::ProjectRefused`] carrying the [`BundleError`] for a crate
-/// `www/` the walk refuses, a read past a cap, or a `www/` replaced during the
-/// copy; [`CliError::OutputRefused`] for a link or a swapped directory under
-/// `into`; [`CliError::Io`] on a filesystem failure.
-pub fn publish_www(crate_www: &Path, into: &OwnedDir) -> Result<PathBuf, CliError> {
-    publish_www_with(crate_www, into, AssetLimits::PRODUCTION)
+/// replaced since its claim, a crate `www/` the walk refuses, a read past a
+/// cap, or a `www/` replaced during the copy; [`CliError::OutputRefused`] for
+/// a link or a swapped directory under `into`; [`CliError::Io`] on a
+/// filesystem failure.
+pub fn publish_www(crate_dir: &OwnedDir, into: &OwnedDir) -> Result<PathBuf, CliError> {
+    publish_www_with(crate_dir, into, AssetLimits::PRODUCTION)
 }
 
 /// [`publish_www`] under the ceilings `limits`.
 fn publish_www_with(
-    crate_www: &Path,
+    crate_dir: &OwnedDir,
     into: &OwnedDir,
     limits: AssetLimits,
 ) -> Result<PathBuf, CliError> {
     let refused = |e: BundleError| CliError::ProjectRefused(Message::relay(&e));
-    let bundle = SpaBundle::from_www_dir_with(crate_www, limits).map_err(refused)?;
+    let bundle = SpaBundle::from_crate_with(crate_dir, limits).map_err(refused)?;
     let mut www = bundle.spa.hold().map_err(refused)?;
     let staged = into.stage_dir(OutputArea::Www.dir_name())?;
     for asset in &bundle.assets {
@@ -365,10 +366,34 @@ pub struct SpaBundle {
 }
 
 impl SpaBundle {
-    /// Collect the SPA asset set from an emitted `www/` directory.
+    /// Collect the SPA asset set from the emitted `www/` directory at `www_dir`,
+    /// opened by path: the walk of [`SpaBundle::from_crate`] with no claimed
+    /// crate to prove the levels above `www/` against.
     ///
-    /// The walk holds `www_dir` and every directory below it as an open handle
-    /// and names each asset by the entry names it descended through. Every
+    /// # Errors
+    /// As [`SpaBundle::from_crate`], [`BundleError::Replaced`] aside.
+    #[cfg(test)]
+    pub fn from_www_dir(www_dir: &Path) -> Result<Self, BundleError> {
+        Self::from_www_dir_with(www_dir, AssetLimits::PRODUCTION)
+    }
+
+    /// [`SpaBundle::from_www_dir`] under the ceilings `limits`.
+    #[cfg(test)]
+    fn from_www_dir_with(www_dir: &Path, limits: AssetLimits) -> Result<Self, BundleError> {
+        let root = open_www(www_dir)
+            .map_err(|refusal| bundle_refusal(www_dir.to_path_buf(), refusal, limits.entries))?;
+        Self::collect(www_dir, &root, limits)
+    }
+
+    /// Collect the SPA asset set from the `www/` of the owned emitted crate `crate_dir`.
+    ///
+    /// The crate directory is opened and proven to be the directory that was
+    /// claimed before its `www/` is opened through that handle, so a crate
+    /// path swapped since its claim is refused, never walked.
+    ///
+    /// The walk holds the crate's `www/` and every directory below it as an
+    /// open handle and names each asset by the entry names it descended
+    /// through. Every
     /// regular file becomes one [`AssetFile`]; a link, FIFO, socket, device or
     /// other special file, or a name the shell cannot place, is refused rather
     /// than skipped. The set is sorted for determinism. An `index.html` is
@@ -376,29 +401,50 @@ impl SpaBundle {
     /// a fail-closed error rather than an empty shell.
     ///
     /// # Errors
-    /// [`BundleError::NoIndexHtml`] when `www_dir` has no `index.html`;
+    /// [`BundleError::Replaced`] when the crate path names another directory
+    /// than the one claimed;
+    /// [`BundleError::NoIndexHtml`] when `www/` has no `index.html`;
     /// [`BundleError::UnplaceableAsset`] for an entry the shell cannot place;
     /// [`BundleError::TooDeep`] past [`MAX_ASSET_DEPTH`];
     /// [`BundleError::TooManyAssets`] past [`MAX_ASSETS`];
     /// [`BundleError::Io`] naming the exact path on any other walk failure.
-    pub fn from_www_dir(www_dir: &Path) -> Result<Self, BundleError> {
-        Self::from_www_dir_with(www_dir, AssetLimits::PRODUCTION)
+    pub fn from_crate(crate_dir: &OwnedDir) -> Result<Self, BundleError> {
+        Self::from_crate_with(crate_dir, AssetLimits::PRODUCTION)
     }
 
-    /// [`SpaBundle::from_www_dir`] under the ceilings `limits`.
-    fn from_www_dir_with(www_dir: &Path, limits: AssetLimits) -> Result<Self, BundleError> {
+    /// [`SpaBundle::from_crate`] under the ceilings `limits`.
+    fn from_crate_with(crate_dir: &OwnedDir, limits: AssetLimits) -> Result<Self, BundleError> {
+        let crate_path = crate_dir.path();
+        let www_dir = crate_path.join(CRATE_WWW);
+        let at_crate = |refusal: OpenRefusal| {
+            bundle_refusal(crate_path.to_path_buf(), refusal, limits.entries)
+        };
+        let held = HeldDir::open_root(crate_path).map_err(at_crate)?;
+        if held.id().map_err(at_crate)? != crate_dir.id() {
+            return Err(BundleError::Replaced {
+                path: crate_path.to_path_buf(),
+            });
+        }
+        let name = EntryName::new(std::ffi::OsStr::new(CRATE_WWW))
+            .ok_or_else(|| at_crate(OpenRefusal::BadName))?;
+        let root = held
+            .child_dir(&name)
+            .map_err(|refusal| bundle_refusal(www_dir.clone(), refusal, limits.entries))?;
+        Self::collect(&www_dir, &root, limits)
+    }
+
+    /// Walk the held `root`, the `www/` directory at `www_dir`, under `limits`.
+    fn collect(www_dir: &Path, root: &HeldDir, limits: AssetLimits) -> Result<Self, BundleError> {
         let mut walk = AssetWalk {
             root: www_dir,
             limits,
             visited: 0,
             assets: Vec::new(),
         };
-        let root =
-            open_www(www_dir).map_err(|refusal| walk.refused(www_dir.to_path_buf(), refusal))?;
         let id = root
             .id()
             .map_err(|refusal| walk.refused(www_dir.to_path_buf(), refusal))?;
-        walk.descend(&root, &mut Vec::new(), 0)?;
+        walk.descend(root, &mut Vec::new(), 0)?;
         let mut assets = walk.assets;
         assets.sort_by(|a, b| a.path.cmp(&b.path));
         if !assets.iter().any(|a| a.path.is_index_html()) {
@@ -428,6 +474,9 @@ impl SpaBundle {
         &self.spa
     }
 }
+
+/// The entry name of the client bundle's tree in the emitted crate.
+const CRATE_WWW: &str = "www";
 
 /// Open the emitted `www/` directory, its own entry held without following a link.
 ///
@@ -749,10 +798,11 @@ mod tests {
         dir
     }
 
-    /// A `www/` tree holding `index.html` and the given extra files, under a fresh scratch dir.
+    /// A `www/` tree holding `index.html` and the given extra files, in the
+    /// claimed crate `rust/` under a fresh scratch dir.
     fn www_with(tag: &str, files: &[&str]) -> (PathBuf, PathBuf) {
         let base = scratch(tag);
-        let www = base.join("www");
+        let www = crate_of(&base).path().join("www");
         std::fs::create_dir_all(&www).expect("mk www");
         std::fs::write(www.join("index.html"), b"<html>").expect("write index");
         for rel in files {
@@ -778,6 +828,11 @@ mod tests {
         }
     }
 
+    /// The claimed emitted crate `rust/` under `base`.
+    fn crate_of(base: &Path) -> OwnedDir {
+        OwnedDir::claim(&base.join("rust")).expect("claim the crate")
+    }
+
     /// A claimed output root `out/` under `base`.
     fn out_root(base: &Path) -> OwnedDir {
         OwnedDir::claim(&base.join("out")).expect("claim out")
@@ -796,12 +851,12 @@ mod tests {
     fn publish_www_refuses_a_symlink_in_the_crate_www() {
         let (base, www) = www_with("publish-link", &["boot.js"]);
         let out = out_root(&base);
-        publish_www(&www, &out).expect("a plain bundle publishes");
+        publish_www(&crate_of(&base), &out).expect("a plain bundle publishes");
         let before = tree_snapshot(&base.join("out").join("www"));
         std::fs::remove_file(www.join("boot.js")).expect("drop boot.js");
         std::os::unix::fs::symlink("/etc/passwd", www.join("boot.js")).expect("plant link");
 
-        let published = publish_www(&www, &out);
+        let published = publish_www(&crate_of(&base), &out);
         assert!(
             matches!(published, Err(CliError::ProjectRefused(_))),
             "{published:?}"
@@ -815,7 +870,7 @@ mod tests {
 
         let fresh = scratch("publish-link-fresh");
         let out = out_root(&fresh);
-        assert!(publish_www(&www, &out).is_err());
+        assert!(publish_www(&crate_of(&base), &out).is_err());
         assert!(
             !fresh.join("out").join("www").exists(),
             "nothing is promoted from a linked asset"
@@ -825,10 +880,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn publish_www_refuses_a_linked_crate_www() {
-        let (base, real) = www_with("publish-linked-www", &["boot.js"]);
-        let link = base.join("www-link");
-        std::os::unix::fs::symlink(&real, &link).expect("plant www link");
-        let published = publish_www(&link, &out_root(&base));
+        let (base, www) = www_with("publish-linked-www", &["boot.js"]);
+        let real = base.join("elsewhere");
+        std::fs::rename(&www, &real).expect("move www away");
+        std::os::unix::fs::symlink(&real, &www).expect("plant www link");
+        let published = publish_www(&crate_of(&base), &out_root(&base));
         assert!(
             matches!(published, Err(CliError::ProjectRefused(_))),
             "{published:?}"
@@ -836,22 +892,43 @@ mod tests {
         assert!(!base.join("out").join("www").exists());
     }
 
+    /// A crate path swapped for another directory after its claim is refused,
+    /// never walked: the bundle published is the claimed crate's or none.
+    #[test]
+    fn publish_www_refuses_a_crate_swapped_since_its_claim() {
+        let (base, _) = www_with("publish-crate-swap", &["boot.js"]);
+        let krate = crate_of(&base);
+        std::fs::rename(krate.path(), base.join("rust-claimed")).expect("move the crate away");
+        let foreign = krate.path().join("www");
+        std::fs::create_dir_all(&foreign).expect("mk the foreign www");
+        std::fs::write(foreign.join("index.html"), b"<foreign>").expect("write foreign index");
+
+        let published = publish_www(&krate, &out_root(&base));
+        let error = BundleError::Replaced {
+            path: krate.path().to_path_buf(),
+        };
+        assert!(refused_with(&published, &error), "{published:?}");
+        assert!(!base.join("out").join("www").exists());
+        assert!(staging_leftovers(&base.join("out")).is_empty());
+    }
+
     #[test]
     fn publish_www_refuses_a_bundle_past_the_total_ceiling() {
         // `index.html` is six bytes and `boot.js` one: seven in all.
-        let (base, www) = www_with("publish-total", &["boot.js"]);
+        let (base, _) = www_with("publish-total", &["boot.js"]);
         let out = out_root(&base);
-        publish_www_with(&www, &out, total_of(7)).expect("exactly the total is published");
+        publish_www_with(&crate_of(&base), &out, total_of(7))
+            .expect("exactly the total is published");
 
         let limit = NonZeroU64::new(6).expect("a non-zero total");
-        let past = publish_www_with(&www, &out, total_of(6));
+        let past = publish_www_with(&crate_of(&base), &out, total_of(6));
         assert!(
             refused_with(&past, &BundleError::TooLarge { limit }),
             "{past:?}"
         );
 
         let fresh = scratch("publish-total-fresh");
-        let past = publish_www_with(&www, &out_root(&fresh), total_of(6));
+        let past = publish_www_with(&crate_of(&base), &out_root(&fresh), total_of(6));
         assert!(past.is_err(), "{past:?}");
         assert!(!fresh.join("out").join("www").exists());
         assert!(staging_leftovers(&fresh.join("out")).is_empty());
@@ -859,13 +936,13 @@ mod tests {
 
     #[test]
     fn publish_www_refuses_a_bundle_past_the_entry_ceiling() {
-        let (base, www) = www_with("publish-count", &["boot.js", "pkg/app.wasm"]);
+        let (base, _) = www_with("publish-count", &["boot.js", "pkg/app.wasm"]);
         let limits = AssetLimits {
             entries: NonZeroU32::new(3).expect("a non-zero ceiling"),
             ..AssetLimits::PRODUCTION
         };
         let limit = limits.entries;
-        let past = publish_www_with(&www, &out_root(&base), limits);
+        let past = publish_www_with(&crate_of(&base), &out_root(&base), limits);
         assert!(
             refused_with(&past, &BundleError::TooManyAssets { limit }),
             "{past:?}"
@@ -875,12 +952,12 @@ mod tests {
 
     #[test]
     fn publish_www_refuses_a_bundle_past_the_depth_ceiling() {
-        let (base, www) = www_with("publish-depth", &["d/e/leaf.js"]);
+        let (base, _) = www_with("publish-depth", &["d/e/leaf.js"]);
         let limits = AssetLimits {
             depth: NonZeroUsize::MIN,
             ..AssetLimits::PRODUCTION
         };
-        let past = publish_www_with(&www, &out_root(&base), limits);
+        let past = publish_www_with(&crate_of(&base), &out_root(&base), limits);
         assert!(
             matches!(&past, Err(CliError::ProjectRefused(_))),
             "{past:?}"
@@ -892,13 +969,13 @@ mod tests {
     fn publish_www_replaces_a_stale_bundle_atomically() {
         let (base, www) = www_with("publish-stale", &["stale.js", "pkg/app.wasm"]);
         let out = out_root(&base);
-        let published = publish_www(&www, &out).expect("first publish");
+        let published = publish_www(&crate_of(&base), &out).expect("first publish");
         assert_eq!(published, base.join("out").join("www"));
         assert!(published.join("stale.js").is_file());
 
         std::fs::remove_file(www.join("stale.js")).expect("drop stale.js");
         std::fs::write(www.join("boot.js"), b"fresh").expect("write boot.js");
-        let published = publish_www(&www, &out).expect("second publish");
+        let published = publish_www(&crate_of(&base), &out).expect("second publish");
         assert!(
             !published.join("stale.js").exists(),
             "a file only the old bundle held is gone"
@@ -911,7 +988,7 @@ mod tests {
 
         // `boot.js` is copied first and fits; `index.html` is past what is left.
         std::fs::write(www.join("boot.js"), b"newer").expect("rewrite boot.js");
-        let mid_copy = publish_www_with(&www, &out, total_of(5));
+        let mid_copy = publish_www_with(&crate_of(&base), &out, total_of(5));
         assert!(
             matches!(mid_copy, Err(CliError::ProjectRefused(_))),
             "{mid_copy:?}"
