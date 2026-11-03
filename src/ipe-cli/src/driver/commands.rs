@@ -1256,11 +1256,11 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
         delivery.host_intent(),
     )?;
 
-    let native_artifact = match compile_target {
-        CompileTarget::WasmClient => {
-            bundle_wasm(crate_dir.dir())?;
-            None
-        }
+    let artifact = match compile_target {
+        CompileTarget::WasmClient => Some(bundle_wasm(
+            crate_dir.dir(),
+            &crate::bundle_www::BundleHome::Dev(output.clone()),
+        )?),
         CompileTarget::WasmWasi => {
             bundle_wasi(crate_dir.dir())?;
             None
@@ -1280,8 +1280,9 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
 
     if show_progress {
         // A native build reports the runnable binary's project-local path (the
-        // `out/bin` copy); a wasm bundle reports the emitted output directory.
-        let destination = native_artifact.as_ref().map_or_else(
+        // `out/bin` copy) and a `web client` build its published `out/www/`; a
+        // WASI module reports the emitted output directory.
+        let destination = artifact.as_ref().map_or_else(
             || out_dir.display().to_string(),
             |p| p.display().to_string(),
         );
@@ -1983,11 +1984,9 @@ pub fn release_pipeline(
                 // Browser/wasm production path.
                 // The member is claimed when the crate is written, past every
                 // emit gate, so a refused release leaves no member behind.
-                let rust = EmitTarget::Member(
-                    resolve_output_root(args.out.as_deref(), manifest)?
-                        .release_member(&plan.slug()?)
-                        .area(OutputArea::Rust),
-                );
+                let member = resolve_output_root(args.out.as_deref(), manifest)?
+                    .release_member(&plan.slug()?);
+                let rust = EmitTarget::Member(member.area(OutputArea::Rust));
                 let runtime_dep = runtime_dep_from_env();
                 // Emit the Rust wasm project as a release build so the Debug gate fires.
                 let options = BuildOptions {
@@ -2023,15 +2022,18 @@ pub fn release_pipeline(
 
                 let crate_dir =
                     held.emit(&rust, &runtime_dir, &options, member_delivery.host_intent())?;
-                bundle_wasm(crate_dir.dir())?;
+                let www = bundle_wasm(
+                    crate_dir.dir(),
+                    &crate::bundle_www::BundleHome::Release(member),
+                )?;
                 if show_progress {
                     crate::screen::chatter(
                         crate::screen::Stream::Stderr,
                         crate::screen::Tone::Success,
                         &format!(
-                            "{} released → {}/www/",
+                            "{} released → {}/",
                             style::outcome_glyph(style::Outcome::Success),
-                            crate_dir.path().display()
+                            www.display()
                         ),
                     );
                 }
@@ -2603,16 +2605,21 @@ const WASM_BINDGEN_VERSION: &str = "0.2.126";
 /// 3. `wasm-opt -Oz` — optional; silently skipped when not on PATH
 ///
 /// Both tools run under [`crate::remote_ingest::WASM_TOOL_LIMITS`].
-/// Writes the final `www/pkg/` tree into `<crate_dir>/www/pkg/`. On success
-/// the directory at `<crate_dir>/www/` is a self-contained static SPA ready to
-/// serve.
+/// The tools write `www/pkg/` into the crate's `www/`, an intermediate; the
+/// last step publishes that `www/` as the artifact at `home`'s `www/`
+/// (`out/www/`, or `release/<slug>/www/`) through
+/// [`crate::bundle_www::publish_www`], and returns its path.
 ///
 /// # Errors
 /// [`CliError::EmittedBuildFailed`] when the wasm `cargo build` fails;
 /// [`CliError::Usage`] when `wasm-bindgen` fails;
 /// [`CliError::LocalLimitExceeded`] when `wasm-bindgen` crosses its ceiling;
-/// [`CliError::OutputRefused`] when `crate_dir` was replaced since its claim.
-pub fn bundle_wasm(crate_dir: &OwnedDir) -> Result<(), CliError> {
+/// [`CliError::OutputRefused`] when `crate_dir` was replaced since its claim;
+/// [`CliError::ProjectRefused`] when the crate's `www/` cannot be published.
+pub fn bundle_wasm(
+    crate_dir: &OwnedDir,
+    home: &crate::bundle_www::BundleHome,
+) -> Result<PathBuf, CliError> {
     let out_dir = crate_dir.path();
     // Fail closed before the cross-compile: a missing toolchain becomes a clear
     // root-cause message rather than an opaque OS spawn error.
@@ -2650,6 +2657,7 @@ pub fn bundle_wasm(crate_dir: &OwnedDir) -> Result<(), CliError> {
             opt: Path::new("wasm-opt"),
         },
         crate::remote_ingest::WASM_TOOL_LIMITS,
+        || home.claim(),
     )
 }
 
@@ -2699,15 +2707,16 @@ enum WasmOptSkip {
 /// [`CliError::Usage`] when `wasm-bindgen` fails; [`CliError::LocalLimitExceeded`]
 /// when `wasm-bindgen` crosses `ceiling`; [`CliError::OutputRefused`] when
 /// `crate_dir` was replaced before or while either tool ran; [`CliError::Io`]
-/// on a filesystem or spawn failure.
+/// on a filesystem or spawn failure; as [`crate::bundle_www::publish_www`]
+/// when the finished `www/` is published into the directory `into` claims.
 fn bundle_wasm_pkg(
     crate_dir: &OwnedDir,
     wasm_path: &Path,
     tools: &WasmTools<'_>,
     ceiling: crate::remote_ingest::LocalCeiling,
-) -> Result<(), CliError> {
+    into: impl FnOnce() -> Result<OwnedDir, CliError>,
+) -> Result<PathBuf, CliError> {
     use crate::remote_ingest::{LocalSource, RunError, run_local};
-    let out_dir = crate_dir.path();
     // `wasm-bindgen` and `wasm-opt` write into `www/pkg/` by path, so it is
     // rebuilt empty under the owned crate: a symlink at any level is refused and
     // nothing planted inside it can redirect their writes. Each tool's writes
@@ -2797,19 +2806,24 @@ fn bundle_wasm_pkg(
 
     prove_pkg()?;
     let bundle_size = format_artifact_size(artifact_size_bytes(&bg_wasm)?);
-    let www = out_dir.join("www");
+    // The published copy is the artifact: claimed only now, past every
+    // fallible step above, so a refused bundle leaves no area behind.
+    let published = crate::bundle_www::publish_www(&crate_dir.path().join("www"), &into()?)?;
     crate::screen::chatter(
         crate::screen::Stream::Stderr,
         crate::screen::Tone::Text,
-        &format!(
-            "wasm bundle ready at {www}/\n\
-             bundle size: {bundle_size} ({bg})\n\
-             serve with: python3 -m http.server -d {www} 8080",
-            www = www.display(),
-            bg = bg_wasm.display(),
-        ),
+        bundle_ready_message(&published, &bundle_size).as_str(),
     );
-    Ok(())
+    Ok(published)
+}
+
+/// The note naming the published bundle at `www` and its wasm's size.
+fn bundle_ready_message(www: &Path, size: &str) -> text::Message {
+    text::msg::wasm_bundle_ready(
+        &www.display(),
+        &size,
+        &www.join("pkg").join(WASM_BUNDLE_FILE).display(),
+    )
 }
 
 /// Cross-compile the emitted co-located WASI crate for `wasm32-wasip1`.
@@ -3439,7 +3453,13 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     //     EXECUTE it under embedded wasmtime with the dev ambient context.
     //   * Native — fall through to the cargo build + exec below.
     match compile_target {
-        CompileTarget::WasmClient => return bundle_wasm(crate_dir.dir()),
+        CompileTarget::WasmClient => {
+            return bundle_wasm(
+                crate_dir.dir(),
+                &crate::bundle_www::BundleHome::Dev(output.clone()),
+            )
+            .map(drop);
+        }
         CompileTarget::WasmWasi => {
             // The `wasi_run` feature gate already fired before emit (above), so
             // reaching here means the embedded engine is linked. Build the module
@@ -4852,25 +4872,31 @@ mod held_crate_tests {
         crate_dir: &OwnedDir,
         bindgen: &str,
         opt: &str,
-    ) -> Result<(), CliError> {
+    ) -> Result<PathBuf, CliError> {
         let bindgen = stub(base, "wasm-bindgen", bindgen);
         let opt = stub(base, "wasm-opt", opt);
         bundle_within(crate_dir, base, &bindgen, &opt, WASM_TOOL_LIMITS)
     }
 
     /// Run [`bundle_wasm_pkg`] over `crate_dir` with the tools at `bindgen` and `opt` under `ceiling`.
+    ///
+    /// The crate's `www/` holds an `index.html`; the bundle is published under `<base>/out/`.
     fn bundle_within(
         crate_dir: &OwnedDir,
         base: &Path,
         bindgen: &Path,
         opt: &Path,
         ceiling: LocalCeiling,
-    ) -> Result<(), CliError> {
+    ) -> Result<PathBuf, CliError> {
+        let www = crate_dir.path().join("www");
+        std::fs::create_dir_all(&www).expect("crate www");
+        std::fs::write(www.join("index.html"), b"<html>").expect("crate index.html");
         bundle_wasm_pkg(
             crate_dir,
             &base.join("ipe_app.wasm"),
             &WasmTools { bindgen, opt },
             ceiling,
+            || OwnedDir::claim(&base.join("out")),
         )
     }
 
@@ -5076,6 +5102,79 @@ mod held_crate_tests {
             .join("ipe_app_bg.wasm");
         assert!(bundle.is_file(), "the bundle lands in the owned crate");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A dev `web client` bundle is published at `out/www/`, beside the
+    /// emitted crate at `out/rust/`, never inside it, and the message names it.
+    #[test]
+    fn dev_build_web_client_writes_out_www_not_out_rust_www() {
+        use crate::bundle_www::BundleHome;
+        use crate::output_dir::{OutputArea, OutputRoot, ProjectPaths};
+
+        let (base, _) = scratch("dev-www");
+        let project = base.join("project");
+        std::fs::create_dir_all(&project).expect("project dir");
+        let paths = ProjectPaths::of_file(&project.join("Main.ipe"));
+        let output = OutputRoot::at(&base.join("out"), &paths).expect("output root");
+        let crate_dir = output
+            .claim_area(&[OutputArea::Rust])
+            .expect("claim out/rust");
+        let www = crate_dir.path().join("www");
+        std::fs::create_dir_all(&www).expect("crate www");
+        std::fs::write(www.join("index.html"), b"<html>").expect("crate index.html");
+        let bindgen = stub(&base, "wasm-bindgen", WRITE_ORIGINAL);
+        let opt = stub(&base, "wasm-opt", "exit 0");
+        let home = BundleHome::Dev(output);
+        let published = bundle_wasm_pkg(
+            &crate_dir,
+            &base.join("ipe_app.wasm"),
+            &WasmTools {
+                bindgen: &bindgen,
+                opt: &opt,
+            },
+            WASM_TOOL_LIMITS,
+            || home.claim(),
+        );
+        let out_www = base.join("out").join("www");
+        assert!(
+            published.as_ref().is_ok_and(|path| *path == out_www),
+            "the bundle is published at out/www, got {published:?}"
+        );
+        assert_eq!(
+            std::fs::read(out_www.join("pkg").join(super::WASM_BUNDLE_FILE))
+                .expect("the published wasm"),
+            ORIGINAL
+        );
+        assert!(out_www.join("index.html").is_file());
+        assert!(
+            !base.join("out").join("www").join("www").exists() && staging_free(&base.join("out")),
+            "the bundle is published once, with no staging left"
+        );
+        let message = super::bundle_ready_message(&out_www, "8 B");
+        assert!(
+            message
+                .as_str()
+                .contains(&format!("wasm bundle ready at {}/", out_www.display())),
+            "{}",
+            message.as_str()
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The bundle note points at the published directory, never at an external server.
+    #[test]
+    fn bundle_message_names_no_external_serve_tool() {
+        let message = super::bundle_ready_message(Path::new("/p/out/www"), "8 B");
+        let text = message.as_str();
+        assert!(text.contains("/p/out/www/"), "{text}");
+        for tool in ["python3", "http.server", "serve with"] {
+            assert!(!text.contains(tool), "{tool} in {text}");
+        }
+    }
+
+    /// Whether `dir` holds no staging entry.
+    fn staging_free(dir: &Path) -> bool {
+        crate::output_dir::test_links::staging_leftovers(dir).is_empty()
     }
 
     /// A claimed crate holding a bare `src/main.rs`, staged as emitted with

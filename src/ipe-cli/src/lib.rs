@@ -21,6 +21,7 @@ pub mod audit;
 pub mod audit_native;
 mod browser;
 pub mod build_plan;
+pub mod bundle_www;
 mod cache;
 mod cargo_step;
 pub mod clean;

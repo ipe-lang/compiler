@@ -1776,6 +1776,10 @@ the emitted wasm bundle nests directories deeper than {limit} levels at {path}
 
 the emitted wasm bundle holds more than {limit} entries
 
+## mobile-bundle-too-large
+
+the emitted wasm bundle holds more than {limit} bytes in all
+
 ## mobile-bundle-replaced
 
 the emitted wasm bundle at {path} was replaced after it was collected — build and package again
@@ -2513,6 +2517,11 @@ ipe release run: {dir} holds a wrapper with no app and profile beside it, so the
 ## wasm-bindgen-failed
 
 wasm-bindgen failed (exit {code}); ensure wasm-bindgen-cli {version} is installed: cargo install wasm-bindgen-cli --version {version}
+
+## wasm-bundle-ready
+
+wasm bundle ready at {www}/
+bundle size: {size} ({wasm})
 
 ## wasi-artifact-missing
 

@@ -142,8 +142,8 @@ ipe release build web client android
 This builds the wasm bundle and materialises a native shell:
 
 ```
-  wasm bundle ready at out/release/web-client-android/release/web-client/rust/www/
-  bundle size: 196 KB (out/release/web-client-android/release/web-client/rust/www/pkg/ipe_app_bg.wasm)
+  wasm bundle ready at out/release/web-client-android/release/web-client/www/
+  bundle size: 196 KB (out/release/web-client-android/release/web-client/www/pkg/ipe_app_bg.wasm)
 packaged `ui-layout` for android → out/release/web-client-android/dist/android/ui-layout-android
   note: an unsigned Android Gradle project is written here. To build it:
     ...

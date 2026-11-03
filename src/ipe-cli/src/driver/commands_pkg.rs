@@ -608,7 +608,7 @@ impl<'a> BundleAssembler<'a> {
         // The SPA is read from the owned crate; a symlinked `www/` is refused so
         // the shell can never pick up files from outside the build output.
         let www_dir = self.finish.wasm_www(&project)?;
-        let bundle = pack::mobile::SpaBundle::from_www_dir(&www_dir)
+        let bundle = crate::bundle_www::SpaBundle::from_www_dir(&www_dir)
             .map_err(|e| CliError::Usage(crate::text::Message::relay(&e)))?;
 
         let layout = pack::mobile::layout(os, self.profile, &shell, &pin, &bundle, icon)?;
@@ -4355,7 +4355,7 @@ mod mobile_base_tests {
         std::fs::create_dir_all(&www).expect("create www/");
         std::fs::write(www.join("index.html"), b"<html>").expect("write index.html");
         let parsed = project::parse_manifest(&manifest).expect("the manifest reads");
-        let bundle = pack::mobile::SpaBundle::from_www_dir(&www).expect("collect the bundle");
+        let bundle = crate::bundle_www::SpaBundle::from_www_dir(&www).expect("collect the bundle");
         let pin = pack::mobile::ManifestPin::of(&parsed);
         let shell = pack::mobile::ShellIdentity::of(&parsed);
         let lay = |os| {

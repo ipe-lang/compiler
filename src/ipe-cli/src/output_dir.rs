@@ -1527,6 +1527,8 @@ pub enum OutputArea {
     App,
     /// The jailed release's launcher bundle (`bundle/`).
     Bundle,
+    /// The published `web client` bundle (`www/`).
+    Www,
 }
 
 impl OutputArea {
@@ -1540,6 +1542,7 @@ impl OutputArea {
             Self::Dist => "dist",
             Self::App => "app",
             Self::Bundle => "bundle",
+            Self::Www => "www",
         }
     }
 }

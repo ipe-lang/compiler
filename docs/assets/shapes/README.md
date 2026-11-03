@@ -3,7 +3,7 @@
 Web runtime×host captures referenced by [`../topics/shapes.md`](../topics/shapes.md).
 
 - `web-served-browser.png` — real capture: `ipe dev run` (served SSR+SSE) at `http://localhost:8000`.
-- `web-client-browser.png` — real capture: the wasm client (`ipe dev build web client`, served from `out/rust/www/`).
+- `web-client-browser.png` — real capture: the wasm client (`ipe dev build web client`, served from `out/www/`).
 
 Desktop, iOS, and Android render the **identical DOM** (only the native shell
 differs), so shapes.md reuses the browser captures for those rows. A native-frame

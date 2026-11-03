@@ -24,10 +24,8 @@
 //! module never fakes a mobile toolchain invocation.
 
 use std::collections::BTreeSet;
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
-use ipe_fs_open::{ByteCap, EntryCap, EntryName, FileId, FileKind, HeldDir, OpenRefusal};
 use ipe_ir::{Capability, WebCapability};
 use ipe_runtime_rust::csp::{
     self, BundleHost, BundleReach, BundleWorker, ContentSecurityPolicy, ReachRefusal,
@@ -36,6 +34,7 @@ use ipe_runtime_rust::encoding::{MountBase, ServerOrigin};
 use ipe_runtime_rust::js_port_glue::native_bridge;
 
 use crate::CliError;
+use crate::bundle_www::{AssetPath, BundleError, HeldSpa, SpaBundle, SpaRoot};
 use crate::driver::BundleProfile;
 use crate::output_dir::OwnedDir;
 use crate::project::{BundleId, MobileDelivery, ProjectManifest, PushDelivery, ScreenOrientation};
@@ -518,520 +517,6 @@ impl std::fmt::Display for MovedFields {
     }
 }
 
-/// How deep below `www/` the asset walk descends, in directory levels.
-///
-/// A wasm SPA holds `index.html`, a boot script and `pkg/*`, so a few levels
-/// suffice; a deeper tree is refused rather than walked.
-pub const MAX_ASSET_DEPTH: NonZeroUsize = NonZeroUsize::MIN.saturating_add(31);
-
-/// How many entries, files and directories alike, the asset walk visits in all.
-///
-/// Each listing is charged to this budget in full the moment it is read, so
-/// the listings held along the open path never hold more names than it.
-pub const MAX_ASSETS: NonZeroU32 = NonZeroU32::MIN.saturating_add(65_535);
-
-/// The ceilings one asset walk runs under.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct AssetLimits {
-    /// The deepest directory level below `www/` the walk enters.
-    depth: NonZeroUsize,
-    /// The most entries the walk visits, and the most one directory may list.
-    entries: NonZeroU32,
-}
-
-impl AssetLimits {
-    /// The ceilings every packaged bundle is collected under.
-    const PRODUCTION: Self = Self {
-        depth: MAX_ASSET_DEPTH,
-        entries: MAX_ASSETS,
-    };
-}
-
-/// An asset's identity: its entry names below `www/`, one per directory level.
-///
-/// Built name by name during the walk, never stripped or joined from an
-/// absolute path, and only from names that are UTF-8, so its `/`-joined shell
-/// form spells exactly the entries it names.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AssetPath {
-    /// The entry names, outermost directory first; never empty.
-    segments: Vec<EntryName>,
-    /// The names joined by `/`.
-    shell_rel: String,
-}
-
-impl AssetPath {
-    /// The asset path `segments` spells, or `None` when it is empty or a name is not UTF-8.
-    fn new(segments: Vec<EntryName>) -> Option<Self> {
-        if segments.is_empty() {
-            return None;
-        }
-        let mut shell_rel = String::new();
-        for (index, name) in segments.iter().enumerate() {
-            if index > 0 {
-                shell_rel.push('/');
-            }
-            shell_rel.push_str(name.as_os_str().to_str()?);
-        }
-        Some(Self {
-            segments,
-            shell_rel,
-        })
-    }
-
-    /// The entry names, outermost directory first.
-    #[must_use]
-    pub fn segments(&self) -> &[EntryName] {
-        &self.segments
-    }
-
-    /// The `/`-joined form the shell layout places the asset under.
-    #[must_use]
-    pub fn to_shell_rel(&self) -> &str {
-        &self.shell_rel
-    }
-
-    /// Whether this is the top-level `index.html`.
-    fn is_index_html(&self) -> bool {
-        matches!(self.segments.as_slice(), [only] if only.as_os_str() == "index.html")
-    }
-}
-
-impl Ord for AssetPath {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.segments
-            .iter()
-            .map(EntryName::as_os_str)
-            .cmp(other.segments.iter().map(EntryName::as_os_str))
-    }
-}
-
-impl PartialOrd for AssetPath {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-/// One file a bundled SPA asset carries, named by its path below `www/`.
-///
-/// A typed value rather than a loose string so the asset set is inspectable and
-/// a test can assert the full copied file set without materialising bytes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AssetFile {
-    /// The asset's entry names below `www/`, which are also its path below the
-    /// native project's web-asset root.
-    pub path: AssetPath,
-}
-
-/// The emitted `www/` directory an SPA bundle was collected from, with its identity then.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SpaRoot {
-    /// The `www/` path the walk opened.
-    path: PathBuf,
-    /// The identity of the directory the walk held.
-    id: FileId,
-}
-
-impl SpaRoot {
-    /// Prove the path still names the directory the bundle was collected from.
-    ///
-    /// # Errors
-    /// [`BundleError::Replaced`] when `www/` is gone or now names another
-    /// object; [`BundleError::Io`] when it cannot be opened or identified.
-    pub fn verify_unreplaced(&self) -> Result<(), BundleError> {
-        self.hold().map(drop)
-    }
-
-    /// Hold `www/`, proven to be the directory the bundle was collected from.
-    ///
-    /// Every asset is read through the returned handle, so an entry swapped
-    /// for a link after the walk is refused rather than followed.
-    ///
-    /// # Errors
-    /// As [`SpaRoot::verify_unreplaced`].
-    fn hold(&self) -> Result<HeldDir, BundleError> {
-        match open_www(&self.path).and_then(|dir| dir.id().map(|id| (dir, id))) {
-            Ok((dir, id)) if id == self.id => Ok(dir),
-            Ok(_) | Err(OpenRefusal::Absent | OpenRefusal::Link | OpenRefusal::NotRegular(_)) => {
-                Err(BundleError::Replaced {
-                    path: self.path.clone(),
-                })
-            }
-            Err(refusal) => Err(BundleError::Io {
-                path: self.path.clone(),
-                source: refusal.into_io(),
-            }),
-        }
-    }
-
-    /// The path of `asset` below this root, joined from its entry names; for
-    /// messages only, never reopened.
-    fn shown(&self, asset: &AssetPath) -> PathBuf {
-        joined(&self.path, asset.segments())
-    }
-
-    /// The bytes of `asset`, read through `www`, the handle [`SpaRoot::hold`]
-    /// proved, without following a link at any level.
-    ///
-    /// # Errors
-    /// The refusal met opening or reading it; [`OpenRefusal::TooLarge`] past `cap`.
-    fn read(www: &HeldDir, asset: &AssetPath, cap: ByteCap) -> Result<Vec<u8>, OpenRefusal> {
-        www.open_rel(asset.segments())
-            .and_then(|file| file.read_bytes(cap))
-    }
-}
-
-/// The offline SPA bundle a mobile shell hosts: the ordered set of asset files
-/// copied out of a `web client` build's `www/` tree.
-///
-/// Pure data derived from the emitted `www/` directory, so a test can assert the
-/// full asset set without running a device toolchain. The webview serves these
-/// and only these — local assets, no remote URL.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SpaBundle {
-    /// The `www/` directory the assets were collected from.
-    spa: SpaRoot,
-    /// The asset files, sorted by [`AssetPath`].
-    assets: Vec<AssetFile>,
-}
-
-impl SpaBundle {
-    /// Collect the SPA asset set from an emitted `www/` directory.
-    ///
-    /// The walk holds `www_dir` and every directory below it as an open handle
-    /// and names each asset by the entry names it descended through. Every
-    /// regular file becomes one [`AssetFile`]; a link, FIFO, socket, device or
-    /// other special file, or a name the shell cannot place, is refused rather
-    /// than skipped. The set is sorted for determinism. An `index.html` is
-    /// required — its absence means the input was not a `web client` bundle,
-    /// a fail-closed error rather than an empty shell.
-    ///
-    /// # Errors
-    /// [`BundleError::NoIndexHtml`] when `www_dir` has no `index.html`;
-    /// [`BundleError::UnplaceableAsset`] for an entry the shell cannot place;
-    /// [`BundleError::TooDeep`] past [`MAX_ASSET_DEPTH`];
-    /// [`BundleError::TooManyAssets`] past [`MAX_ASSETS`];
-    /// [`BundleError::Io`] naming the exact path on any other walk failure.
-    pub fn from_www_dir(www_dir: &Path) -> Result<Self, BundleError> {
-        Self::from_www_dir_with(www_dir, AssetLimits::PRODUCTION)
-    }
-
-    /// [`SpaBundle::from_www_dir`] under the ceilings `limits`.
-    fn from_www_dir_with(www_dir: &Path, limits: AssetLimits) -> Result<Self, BundleError> {
-        let mut walk = AssetWalk {
-            root: www_dir,
-            limits,
-            visited: 0,
-            assets: Vec::new(),
-        };
-        let root =
-            open_www(www_dir).map_err(|refusal| walk.refused(www_dir.to_path_buf(), refusal))?;
-        let id = root
-            .id()
-            .map_err(|refusal| walk.refused(www_dir.to_path_buf(), refusal))?;
-        walk.descend(&root, &mut Vec::new(), 0)?;
-        let mut assets = walk.assets;
-        assets.sort_by(|a, b| a.path.cmp(&b.path));
-        if !assets.iter().any(|a| a.path.is_index_html()) {
-            return Err(BundleError::NoIndexHtml {
-                dir: www_dir.to_path_buf(),
-            });
-        }
-        Ok(Self {
-            spa: SpaRoot {
-                path: www_dir.to_path_buf(),
-                id,
-            },
-            assets,
-        })
-    }
-
-    /// The asset files, sorted by [`AssetPath`].
-    #[must_use]
-    pub fn assets(&self) -> &[AssetFile] {
-        &self.assets
-    }
-}
-
-/// Open the emitted `www/` directory, its own entry held without following a link.
-///
-/// Only the levels above `www/` are followed, so a link standing at `www/`
-/// itself is refused rather than walked or copied through.
-///
-/// # Errors
-/// [`OpenRefusal::BadName`] when `www_dir` ends in no plain entry name;
-/// [`OpenRefusal::Link`] when `www/` is a link; the refusal of any other
-/// level that cannot be opened.
-fn open_www(www_dir: &Path) -> Result<HeldDir, OpenRefusal> {
-    let (Some(parent), Some(name)) = (www_dir.parent(), www_dir.file_name()) else {
-        return Err(OpenRefusal::BadName);
-    };
-    let name = EntryName::new(name).ok_or(OpenRefusal::BadName)?;
-    HeldDir::open_root(parent)?.child_dir(&name)
-}
-
-/// `root` with `names` appended, one component per name.
-fn joined(root: &Path, names: &[EntryName]) -> PathBuf {
-    names
-        .iter()
-        .fold(root.to_path_buf(), |path, name| path.join(name.as_os_str()))
-}
-
-/// One bounded walk of an emitted `www/` tree through held directory handles.
-struct AssetWalk<'root> {
-    /// The `www/` path, for messages only; never reopened.
-    root: &'root Path,
-    /// The ceilings this walk runs under.
-    limits: AssetLimits,
-    /// How many entries the walk has visited so far.
-    visited: u32,
-    /// The regular files found so far.
-    assets: Vec<AssetFile>,
-}
-
-impl AssetWalk<'_> {
-    /// Visit every entry of `dir`, the directory `prefix` names `depth` levels below `www/`.
-    fn descend(
-        &mut self,
-        dir: &HeldDir,
-        prefix: &mut Vec<EntryName>,
-        depth: usize,
-    ) -> Result<(), BundleError> {
-        let listing = dir
-            .entries(self.listing_cap())
-            .map_err(|refusal| self.refused(joined(self.root, prefix), refusal))?;
-        self.charge(listing.len())?;
-        for (name, kind) in listing {
-            let shown = joined(self.root, prefix).join(name.as_os_str());
-            if name.as_os_str().to_str().is_none() {
-                return Err(BundleError::UnplaceableAsset {
-                    path: shown,
-                    reason: AssetRefusal::NotUtf8,
-                });
-            }
-            match kind {
-                FileKind::Regular => {
-                    let mut segments = prefix.clone();
-                    segments.push(name);
-                    let path = AssetPath::new(segments).ok_or(BundleError::UnplaceableAsset {
-                        path: shown,
-                        reason: AssetRefusal::NotUtf8,
-                    })?;
-                    self.assets.push(AssetFile { path });
-                }
-                FileKind::Dir => {
-                    let Some(next) = depth
-                        .checked_add(1)
-                        .filter(|next| *next <= self.limits.depth.get())
-                    else {
-                        return Err(BundleError::TooDeep {
-                            path: shown,
-                            limit: self.limits.depth,
-                        });
-                    };
-                    let child = dir
-                        .child_dir(&name)
-                        .map_err(|refusal| self.refused(shown, refusal))?;
-                    prefix.push(name);
-                    let walked = self.descend(&child, prefix, next);
-                    prefix.pop();
-                    walked?;
-                }
-                FileKind::Symlink
-                | FileKind::Fifo
-                | FileKind::Socket
-                | FileKind::Device
-                | FileKind::Other => {
-                    return Err(BundleError::UnplaceableAsset {
-                        path: shown,
-                        reason: AssetRefusal::Kind(kind),
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Charge a listing of `listed` names to the entry budget before any of it
-    /// is visited, refusing once the budget is exceeded.
-    ///
-    /// Every listing on the open path is held while the walk descends; charging
-    /// each in full on read keeps their names together within the budget.
-    fn charge(&mut self, listed: usize) -> Result<(), BundleError> {
-        let listed = u32::try_from(listed).unwrap_or(u32::MAX);
-        self.visited = self.visited.saturating_add(listed);
-        if self.visited > self.limits.entries.get() {
-            return Err(BundleError::TooManyAssets {
-                limit: self.limits.entries,
-            });
-        }
-        Ok(())
-    }
-
-    /// The most names the next directory listing may hold: what is left of the
-    /// walk's entry budget. A spent budget still lists one name, which the
-    /// charge then refuses.
-    fn listing_cap(&self) -> EntryCap {
-        let left = self.limits.entries.get().saturating_sub(self.visited);
-        EntryCap::new(left).unwrap_or(EntryCap::from_nonzero(NonZeroU32::MIN))
-    }
-
-    /// The bundle error for `refusal` met at `path`.
-    ///
-    /// An entry that turned into a link or another kind between its listing
-    /// and its open is refused as that kind, never followed or skipped.
-    fn refused(&self, path: PathBuf, refusal: OpenRefusal) -> BundleError {
-        bundle_refusal(path, refusal, self.limits.entries)
-    }
-}
-
-/// The bundle error for `refusal` met at `path`, under an entry budget of `entries`.
-///
-/// An entry that turned into a link or another kind between its listing and
-/// its open is refused as that kind, never followed or skipped.
-fn bundle_refusal(path: PathBuf, refusal: OpenRefusal, entries: NonZeroU32) -> BundleError {
-    match refusal {
-        OpenRefusal::Link => BundleError::UnplaceableAsset {
-            path,
-            reason: AssetRefusal::Kind(FileKind::Symlink),
-        },
-        OpenRefusal::NotRegular(kind) => BundleError::UnplaceableAsset {
-            path,
-            reason: AssetRefusal::Kind(kind),
-        },
-        OpenRefusal::BadName => BundleError::UnplaceableAsset {
-            path,
-            reason: AssetRefusal::BadName,
-        },
-        OpenRefusal::TooManyEntries(_) => BundleError::TooManyAssets { limit: entries },
-        OpenRefusal::Absent
-        | OpenRefusal::Denied
-        | OpenRefusal::InUse
-        | OpenRefusal::TooLarge(_)
-        | OpenRefusal::NotUtf8
-        | OpenRefusal::Io(_) => BundleError::Io {
-            path,
-            source: refusal.into_io(),
-        },
-    }
-}
-
-/// Why the shell cannot place one entry of the emitted `www/` tree.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AssetRefusal {
-    /// The entry's name is not valid UTF-8, which a shell asset path cannot carry.
-    NotUtf8,
-    /// The entry's name is not one plain entry name a held handle can open.
-    BadName,
-    /// The entry is not a regular file or a directory: this is what it is.
-    Kind(FileKind),
-}
-
-impl std::fmt::Display for AssetRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotUtf8 => f.write_str(text::mobile_asset_not_utf8()),
-            Self::BadName => f.write_str(text::mobile_asset_bad_name()),
-            Self::Kind(kind) => f.write_str(&text::mobile_asset_kind(kind)),
-        }
-    }
-}
-
-/// A path shown in a bundle message: escaped, so a control character, a
-/// direction override or a byte that is not UTF-8 is spelled out, never shown raw
-/// or replaced.
-struct EscapedPath<'path>(&'path Path);
-
-impl std::fmt::Display for EscapedPath<'_> {
-    // The escaped `Debug` form is the point: `display()` shows control and
-    // direction characters raw and replaces a byte that is not UTF-8.
-    #[allow(clippy::unnecessary_debug_formatting)]
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.0)
-    }
-}
-
-/// A failure while collecting the SPA bundle from an emitted `www/` tree.
-#[derive(Debug)]
-pub enum BundleError {
-    /// The emitted `www/` directory has no `index.html` — the input was not a
-    /// `web client` bundle. Carries the directory inspected.
-    NoIndexHtml {
-        /// The `www/` directory that lacked an `index.html`.
-        dir: PathBuf,
-    },
-    /// An entry of the `www/` tree the shell cannot place.
-    UnplaceableAsset {
-        /// The entry's full path, for the message only; never reopened.
-        path: PathBuf,
-        /// Why it cannot be placed.
-        reason: AssetRefusal,
-    },
-    /// The `www/` tree nests directories deeper than the walk descends.
-    TooDeep {
-        /// The first directory past the ceiling, for the message only.
-        path: PathBuf,
-        /// The deepest level the walk enters.
-        limit: NonZeroUsize,
-    },
-    /// The `www/` tree holds more entries than the walk visits.
-    TooManyAssets {
-        /// The most entries the walk visits.
-        limit: NonZeroU32,
-    },
-    /// The `www/` path names another object than the directory collected.
-    Replaced {
-        /// The `www/` path.
-        path: PathBuf,
-    },
-    /// The bundle's `index.html` does not carry exactly one policy meta the
-    /// wasm build renders for the pinned servers and capabilities.
-    PolicyMismatch {
-        /// The `index.html` path, for the message only.
-        path: PathBuf,
-    },
-    /// The bundle's `index.html` is larger than the pack reads.
-    IndexTooLarge {
-        /// The `index.html` path, for the message only.
-        path: PathBuf,
-        /// The most bytes the pack reads.
-        cap: u64,
-    },
-    /// A filesystem error while walking the `www/` tree.
-    Io {
-        /// The path the walk failed on.
-        path: PathBuf,
-        /// The underlying OS error.
-        source: std::io::Error,
-    },
-}
-
-impl std::fmt::Display for BundleError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let message = match self {
-            Self::NoIndexHtml { dir } => text::mobile_bundle_no_index(&EscapedPath(dir)),
-            Self::UnplaceableAsset { path, reason } => {
-                text::mobile_bundle_unplaceable(&EscapedPath(path), reason)
-            }
-            Self::TooDeep { path, limit } => {
-                text::mobile_bundle_too_deep(limit, &EscapedPath(path))
-            }
-            Self::TooManyAssets { limit } => text::mobile_bundle_too_many(limit),
-            Self::Replaced { path } => text::mobile_bundle_replaced(&EscapedPath(path)),
-            Self::PolicyMismatch { path } => {
-                text::mobile_bundle_policy_mismatch(&EscapedPath(path))
-            }
-            Self::IndexTooLarge { path, cap } => {
-                text::mobile_bundle_index_too_large(&EscapedPath(path), cap)
-            }
-            Self::Io { path, source } => text::mobile_bundle_io(&EscapedPath(path), source),
-        };
-        f.write_str(&message)
-    }
-}
-
-impl std::error::Error for BundleError {}
-
 /// The origin of a generated shell file's bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShellContent {
@@ -1065,25 +550,6 @@ pub struct PolicySwap {
     hosted: String,
 }
 
-/// The most bytes of a bundle's `index.html` the pack reads.
-///
-/// The emitted page is under 2 KiB, so a larger file is refused unread.
-pub const MAX_INDEX_HTML_BYTES: u64 = 64 * 1024;
-
-/// [`MAX_INDEX_HTML_BYTES`] as the cap a held read takes.
-const INDEX_HTML_CAP: ByteCap =
-    ByteCap::from_nonzero(NonZeroU64::MIN.saturating_add(MAX_INDEX_HTML_BYTES.saturating_sub(1)));
-
-/// The most bytes of any one bundled asset the pack reads.
-///
-/// An emitted bundle's largest asset, its wasm module, stays far below this;
-/// a larger file is refused before it is read.
-pub const MAX_ASSET_BYTES: u64 = 256 * 1024 * 1024;
-
-/// [`MAX_ASSET_BYTES`] as the cap a held read takes.
-const ASSET_CAP: ByteCap =
-    ByteCap::from_nonzero(NonZeroU64::MIN.saturating_add(MAX_ASSET_BYTES.saturating_sub(1)));
-
 /// How a bundled asset at `asset` is laid out for a shell whose bundle has
 /// `reach`.
 ///
@@ -1110,28 +576,19 @@ fn bundle_content(asset: &AssetPath, pin: &ManifestPin, reach: &BundleReach<'_>)
 /// meta swapped.
 ///
 /// # Errors
-/// [`BundleError::IndexTooLarge`] past [`MAX_INDEX_HTML_BYTES`];
+/// [`BundleError::IndexTooLarge`] past
+/// [`MAX_INDEX_HTML_BYTES`](crate::bundle_www::MAX_INDEX_HTML_BYTES);
+/// [`BundleError::TooLarge`] past what is left of the bundle's total;
 /// [`BundleError::PolicyMismatch`] when the page is not UTF-8, or does not
 /// hold exactly one meta of exactly one of `swaps`; the refusal of a link,
 /// another kind of entry, or a read failure met on the way.
 fn policed_index(
-    spa: &SpaRoot,
-    www: &HeldDir,
+    www: &mut HeldSpa<'_>,
     asset: &AssetPath,
     swaps: &[PolicySwap],
 ) -> Result<String, BundleError> {
-    let shown = spa.shown(asset);
-    let bytes = match SpaRoot::read(www, asset, INDEX_HTML_CAP) {
-        Ok(bytes) => bytes,
-        Err(OpenRefusal::TooLarge(_)) => {
-            return Err(BundleError::IndexTooLarge {
-                path: shown,
-                cap: MAX_INDEX_HTML_BYTES,
-            });
-        }
-        Err(refusal) => return Err(bundle_refusal(shown, refusal, MAX_ASSETS)),
-    };
-    swapped_policy(&shown, bytes, swaps)
+    let bytes = www.read_index(asset)?;
+    swapped_policy(&www.shown(asset), bytes, swaps)
 }
 
 /// `bytes`, the page at `shown`, with its one policy meta swapped.
@@ -1620,7 +1077,7 @@ fn android_layout(
         os: MobileOs::Android,
         root_name,
         files,
-        spa: bundle.spa.clone(),
+        spa: bundle.root().clone(),
     })
 }
 
@@ -4072,7 +3529,7 @@ fn ios_layout(
         os: MobileOs::Ios,
         root_name,
         files,
-        spa: bundle.spa.clone(),
+        spa: bundle.root().clone(),
     })
 }
 
@@ -4505,7 +3962,10 @@ impl std::fmt::Display for SwiftStringLiteral {
 /// policed, before any shell file is written;
 /// [`CliError::Usage`] carrying [`BundleError::UnplaceableAsset`] for an asset
 /// that is no longer a regular file below the held `www/` (a link, a FIFO),
-/// or [`BundleError::Io`] for one past [`MAX_ASSET_BYTES`], never read;
+/// or [`BundleError::Io`] for one past
+/// [`MAX_ASSET_BYTES`](crate::bundle_www::MAX_ASSET_BYTES), never read;
+/// [`CliError::Usage`] carrying [`BundleError::TooLarge`] for a bundle past
+/// its total;
 /// [`CliError::Io`] naming the exact path on any filesystem failure.
 pub fn materialise(
     layout: &ShellLayout,
@@ -4515,7 +3975,7 @@ pub fn materialise(
     let refused = |e: BundleError| CliError::Usage(crate::text::Message::relay(&e));
     // Every asset is read through this one held `www/`, proven to be the
     // directory collected, never reopened by path.
-    let www = layout.spa.hold().map_err(refused)?;
+    let mut www = layout.spa.hold().map_err(refused)?;
     // Every policed page is read and proven before the shell directory is
     // touched, so a refusal lays nothing down.
     let laid = layout
@@ -4526,7 +3986,7 @@ pub fn materialise(
                 ShellContent::Generated(text) => Laid::Text(text),
                 ShellContent::Asset(asset) => Laid::Copy(asset),
                 ShellContent::PolicedIndex { asset, swaps } => {
-                    Laid::Policed(policed_index(&layout.spa, &www, asset, swaps)?)
+                    Laid::Policed(policed_index(&mut www, asset, swaps)?)
                 }
                 ShellContent::Icon => Laid::Icon,
             };
@@ -4542,9 +4002,7 @@ pub fn materialise(
             Laid::Text(text) => out_file.write(text.as_bytes())?,
             Laid::Policed(page) => out_file.write(page.as_bytes())?,
             Laid::Copy(asset) => {
-                let copied = SpaRoot::read(&www, asset, ASSET_CAP).map_err(|refusal| {
-                    refused(bundle_refusal(layout.spa.shown(asset), refusal, MAX_ASSETS))
-                })?;
+                let copied = www.read_asset(asset).map_err(refused)?;
                 out_file.write(&copied)?;
             }
             Laid::Icon => {
@@ -4577,7 +4035,9 @@ fn rel_to_native(rel: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bundle_www::{MAX_ASSET_BYTES, MAX_INDEX_HTML_BYTES};
     use crate::output_dir::test_links::{staging_leftovers, tree_snapshot};
+    use ipe_fs_open::FileKind;
     use ipe_runtime_rust::encoding::ServerOrigins;
 
     fn accepts(items: &[Capability]) -> BTreeSet<Capability> {
@@ -4703,169 +4163,6 @@ mod tests {
     // ── SPA bundle collection ─────────────────────────────────────────────────
 
     #[test]
-    fn a_www_dir_without_index_html_is_refused() {
-        let dir =
-            ipe_test_temp::temp_root().join(format!("ipe-mobile-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("mk tmp");
-        std::fs::write(dir.join("boot.js"), b"x").expect("write");
-        let err = SpaBundle::from_www_dir(&dir).expect_err("no index.html is refused");
-        assert!(matches!(err, BundleError::NoIndexHtml { .. }));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_www_dir_collects_its_files_sorted() {
-        let (_base, www) = www_with("ok", &["boot.js", "pkg/app_bg.wasm"]);
-        let spa = SpaBundle::from_www_dir(&www).expect("collect");
-        assert_eq!(rels(&spa), vec!["boot.js", "index.html", "pkg/app_bg.wasm"]);
-        spa.spa
-            .verify_unreplaced()
-            .expect("an untouched www/ is the directory collected");
-    }
-
-    #[cfg(all(unix, not(target_vendor = "apple")))]
-    #[test]
-    fn non_utf8_dir_name_is_refused_not_collapsed() {
-        use std::os::unix::ffi::OsStrExt;
-        let (_base, www) = www_with("non-utf8-dir", &[]);
-        let odd = www.join(std::ffi::OsStr::from_bytes(b"\xff"));
-        std::fs::create_dir_all(&odd).expect("mk non-UTF-8 dir");
-        std::fs::write(odd.join("index.html"), b"decoy").expect("write decoy");
-        let err = SpaBundle::from_www_dir(&www).expect_err("a non-UTF-8 directory is refused");
-        assert!(
-            matches!(
-                &err,
-                BundleError::UnplaceableAsset {
-                    reason: AssetRefusal::NotUtf8,
-                    ..
-                }
-            ),
-            "{err}"
-        );
-    }
-
-    #[cfg(all(unix, not(target_vendor = "apple")))]
-    #[test]
-    fn non_utf8_top_level_file_is_refused() {
-        use std::os::unix::ffi::OsStrExt;
-        let (_base, www) = www_with("non-utf8-file", &[]);
-        std::fs::write(www.join(std::ffi::OsStr::from_bytes(b"\xff")), b"x")
-            .expect("write non-UTF-8 file");
-        let err = SpaBundle::from_www_dir(&www).expect_err("a non-UTF-8 file is refused");
-        assert!(
-            matches!(
-                &err,
-                BundleError::UnplaceableAsset {
-                    reason: AssetRefusal::NotUtf8,
-                    ..
-                }
-            ),
-            "{err}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn symlink_in_www_is_refused() {
-        let (base, www) = www_with("symlink", &[]);
-        let outside = base.join("outside.js");
-        std::fs::write(&outside, b"outside").expect("write outside file");
-        std::os::unix::fs::symlink(&outside, www.join("boot.js")).expect("plant link");
-        let err = SpaBundle::from_www_dir(&www).expect_err("a link in www/ is refused");
-        assert!(
-            matches!(
-                &err,
-                BundleError::UnplaceableAsset {
-                    reason: AssetRefusal::Kind(FileKind::Symlink),
-                    ..
-                }
-            ),
-            "{err}"
-        );
-    }
-
-    #[cfg(all(unix, not(target_vendor = "apple")))]
-    #[test]
-    fn fifo_in_www_is_refused() {
-        let (_base, www) = www_with("fifo", &[]);
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            www.join("pipe"),
-            rustix::fs::FileType::Fifo,
-            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-            0,
-        )
-        .expect("make FIFO");
-        let err = SpaBundle::from_www_dir(&www).expect_err("a FIFO in www/ is refused");
-        assert!(
-            matches!(
-                &err,
-                BundleError::UnplaceableAsset {
-                    reason: AssetRefusal::Kind(FileKind::Fifo),
-                    ..
-                }
-            ),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn walk_past_max_depth_is_too_deep() {
-        let nested = |levels: usize| {
-            let mut rel = "d/".repeat(levels);
-            rel.push_str("leaf.js");
-            rel
-        };
-        let at_ceiling = nested(MAX_ASSET_DEPTH.get());
-        let (_base, www) = www_with("depth-ok", &[&at_ceiling]);
-        let spa = SpaBundle::from_www_dir(&www).expect("exactly the ceiling is walked");
-        assert!(rels(&spa).contains(&at_ceiling.as_str()));
-
-        let past = nested(MAX_ASSET_DEPTH.get().saturating_add(1));
-        let (_base, www) = www_with("depth-past", &[&past]);
-        let err = SpaBundle::from_www_dir(&www).expect_err("one level past is refused");
-        assert!(
-            matches!(&err, BundleError::TooDeep { limit, .. } if *limit == MAX_ASSET_DEPTH),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn more_than_max_assets_is_refused() {
-        let limits = |entries: u32| AssetLimits {
-            depth: MAX_ASSET_DEPTH,
-            entries: NonZeroU32::new(entries).expect("a non-zero ceiling"),
-        };
-        // `index.html`, `boot.js`, `pkg/` and `pkg/app.wasm`: four entries.
-        let (_base, www) = www_with("ceiling", &["boot.js", "pkg/app.wasm"]);
-        SpaBundle::from_www_dir_with(&www, limits(4)).expect("exactly the ceiling is walked");
-        let err = SpaBundle::from_www_dir_with(&www, limits(3))
-            .expect_err("one entry past the ceiling is refused");
-        assert!(
-            matches!(&err, BundleError::TooManyAssets { limit } if limit.get() == 3),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn a_listing_is_charged_in_full_before_any_of_it_is_entered() {
-        // `www/` lists three names, so with four entries in all the first
-        // directory entered may list only one: its two names are refused
-        // before its `g/` is ever reached.
-        let (_base, www) = www_with("charged", &["a/f", "a/g/x", "b/f", "b/g/x"]);
-        let limits = AssetLimits {
-            depth: NonZeroUsize::MIN,
-            entries: NonZeroU32::new(4).expect("a non-zero ceiling"),
-        };
-        let err = SpaBundle::from_www_dir_with(&www, limits).expect_err("over budget");
-        assert!(
-            matches!(&err, BundleError::TooManyAssets { limit } if limit.get() == 4),
-            "{err}"
-        );
-    }
-
-    #[test]
     fn www_replaced_between_collect_and_materialise_is_refused() {
         let (base, www) = www_with("replaced", &["boot.js"]);
         let spa = SpaBundle::from_www_dir(&www).expect("collect");
@@ -4892,103 +4189,6 @@ mod tests {
         assert!(
             !base.join("dist").join(&shell.root_name).exists(),
             "nothing is laid down from a replaced www/"
-        );
-    }
-
-    #[test]
-    fn each_listing_is_capped_at_the_entry_budget_left() {
-        let walk = |visited: u32| AssetWalk {
-            root: Path::new("www"),
-            limits: AssetLimits {
-                depth: MAX_ASSET_DEPTH,
-                entries: NonZeroU32::new(4).expect("a non-zero ceiling"),
-            },
-            visited,
-            assets: Vec::new(),
-        };
-        assert_eq!(walk(0).listing_cap().get(), 4);
-        assert_eq!(
-            walk(3).listing_cap().get(),
-            1,
-            "a nested listing holds only what the walk may still visit"
-        );
-        assert_eq!(
-            walk(4).listing_cap().get(),
-            1,
-            "a spent budget lists one name, which the visit refuses"
-        );
-    }
-
-    #[test]
-    fn bundle_messages_come_from_the_catalog_with_escaped_paths() {
-        let limit = NonZeroU32::new(3).expect("a non-zero ceiling");
-        assert_eq!(
-            BundleError::TooManyAssets { limit }.to_string(),
-            text::mobile_bundle_too_many(&limit).as_str()
-        );
-        let hostile = PathBuf::from("www/a\u{1b}[31m\u{202e}b\nc.js");
-        let shown = BundleError::UnplaceableAsset {
-            path: hostile,
-            reason: AssetRefusal::Kind(FileKind::Fifo),
-        }
-        .to_string();
-        assert!(
-            shown.contains(r"\u{1b}[31m\u{202e}b\nc.js"),
-            "every control and direction character is spelled out: {shown}"
-        );
-        assert!(
-            shown.contains(text::mobile_asset_kind(&FileKind::Fifo).as_str()),
-            "{shown}"
-        );
-        assert!(
-            !shown.contains(['\u{1b}', '\u{202e}', '\n']),
-            "nothing reaches the terminal raw: {shown}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_non_utf8_path_is_shown_escaped_not_replaced() {
-        use std::os::unix::ffi::OsStrExt;
-        let path = Path::new(std::ffi::OsStr::from_bytes(b"www/\xff.js")).to_path_buf();
-        let shown = BundleError::Replaced { path }.to_string();
-        assert!(shown.contains(r"\xFF.js"), "{shown}");
-        assert!(!shown.contains('\u{fffd}'), "{shown}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_linked_www_is_refused_not_followed() {
-        let (base, real) = www_with("linked-www", &["boot.js"]);
-        let link = base.join("www-link");
-        std::os::unix::fs::symlink(&real, &link).expect("plant www link");
-        let err = SpaBundle::from_www_dir(&link).expect_err("a linked www/ is refused");
-        assert!(
-            matches!(
-                &err,
-                BundleError::UnplaceableAsset {
-                    reason: AssetRefusal::Kind(FileKind::Symlink),
-                    ..
-                }
-            ),
-            "{err}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn www_swapped_for_a_link_to_itself_is_replaced() {
-        let (base, www) = www_with("www-self-link", &["boot.js"]);
-        let spa = SpaBundle::from_www_dir(&www).expect("collect");
-        let moved = base.join("www-collected");
-        std::fs::rename(&www, &moved).expect("move www away");
-        std::os::unix::fs::symlink(&moved, &www).expect("link www to the collected dir");
-        assert!(
-            matches!(
-                spa.spa.verify_unreplaced(),
-                Err(BundleError::Replaced { .. })
-            ),
-            "a link at www/ is not the directory collected, even when it reaches it"
         );
     }
 
@@ -7427,9 +6627,9 @@ mod tests {
         let ShellContent::PolicedIndex { swaps, .. } = content else {
             return;
         };
-        let www = spa.spa.hold().expect("hold www");
-        let source = spa.spa.shown(&index.path);
-        let refused = policed_index(&spa.spa, &www, &index.path, &swaps);
+        let mut www = spa.root().hold().expect("hold www");
+        let source = spa.root().shown(&index.path);
+        let refused = policed_index(&mut www, &index.path, &swaps);
         assert!(matches!(
             refused,
             Err(BundleError::IndexTooLarge {
@@ -7440,7 +6640,7 @@ mod tests {
         page.truncate(cap);
         std::fs::write(&source, &page).expect("write the page at the cap");
         assert!(
-            policed_index(&spa.spa, &www, &index.path, &swaps).is_ok(),
+            policed_index(&mut www, &index.path, &swaps).is_ok(),
             "the cap itself is read"
         );
         let mut bytes = page.into_bytes();
@@ -7448,7 +6648,7 @@ mod tests {
         bytes.insert(0, 0xff);
         std::fs::write(&source, bytes).expect("write a non-UTF-8 page at the cap");
         assert!(matches!(
-            policed_index(&spa.spa, &www, &index.path, &swaps),
+            policed_index(&mut www, &index.path, &swaps),
             Err(BundleError::PolicyMismatch { .. })
         ));
     }
