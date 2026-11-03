@@ -56,7 +56,7 @@ main =
 fn run_program(name: &str, source: &str) -> crate::support::RunOutcomeWithStderr {
     let fixture = ipe::RootFixture::main(source).expect("the project fixture must be written");
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build_fixture(&fixture, &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());

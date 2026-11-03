@@ -59,7 +59,7 @@ fn build_run(name: &str) -> (PathBuf, crate::support::RunOutcome) {
     let root = repo_root();
     let dir = golden_dir(&root, name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&dir, &out, &runtime);
@@ -155,7 +155,7 @@ fn http_default_request_emits_without_signature_consumer() {
     let root = repo_root();
     let golden_project = golden_dir(&root, "http_response_fields");
     let out = crate::support::scratch_root().join("ipec_m5b_http_default_request_no_sig_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

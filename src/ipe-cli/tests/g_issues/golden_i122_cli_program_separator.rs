@@ -32,7 +32,7 @@ fn piped_console_app_writes_one_line_per_render() {
         .join("golden")
         .join("console_app_view_separator");
     let out = crate::support::scratch_root().join("ipec_i122_console_app_view_separator_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

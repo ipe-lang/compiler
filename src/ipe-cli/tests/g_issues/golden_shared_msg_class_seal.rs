@@ -28,7 +28,7 @@ fn fixture_dir(root: &Path, golden: &str) -> PathBuf {
 fn emitted_lib(golden: &str) -> Result<String, String> {
     let golden_dir = fixture_dir(&repo_root(), golden);
     let out = crate::support::scratch_root().join(format!("ipec_{golden}_emit"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     crate::support::build_golden(&golden_dir, &out, &runtime)
         .map_err(|e| format!("{golden} must be accepted, got: {e:?}"))?;
@@ -51,7 +51,7 @@ fn assert_generic(golden: &str, emitted: &str, helpers: &[&str]) {
 fn assert_seal(golden: &str) {
     let golden_dir = fixture_dir(&repo_root(), golden);
     let out = crate::support::scratch_root().join(format!("ipec_{golden}_e2e"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(built.is_ok(), "{golden} must be accepted, got: {built:?}");
@@ -93,7 +93,7 @@ fn wrapped_threaded_msg_is_refused() {
     let golden = "wrapped_threaded_msg_seal";
     let golden_dir = fixture_dir(&repo_root(), golden);
     let out = crate::support::scratch_root().join(format!("ipec_{golden}_emit"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     let got = match &built {

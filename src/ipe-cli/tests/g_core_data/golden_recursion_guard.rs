@@ -46,7 +46,7 @@ fn compile_golden_into(name: &str, scratch: &str) -> PathBuf {
     let root = repo_root();
     let golden_project = golden_dir(&root, name);
     let out = crate::support::scratch_root().join(scratch);
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);

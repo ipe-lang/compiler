@@ -40,7 +40,7 @@ use ipe::{BuildOptions, CliError};
 fn scratch(name: &str) -> PathBuf {
     let dir =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     dir
 }
 

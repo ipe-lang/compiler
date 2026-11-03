@@ -55,7 +55,7 @@ fn runtime() -> PathBuf {
 fn css_length_color_ssot_emits_byte_identical() {
     let dir = golden_dir();
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("css_length_color_ssot_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let rt = runtime();
     let built = crate::support::build_golden(&dir, &out, &rt);
@@ -81,7 +81,7 @@ fn css_length_color_ssot_e2e_output_matches_native_table() {
 
     let dir = golden_dir();
     let out = crate::support::scratch_root().join("ipec_css_length_color_ssot_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let rt = runtime();
     let built = crate::support::build_golden(&dir, &out, &rt);

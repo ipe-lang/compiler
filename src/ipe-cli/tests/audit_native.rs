@@ -52,7 +52,7 @@ fn temp_pkg(tag: &str) -> PathBuf {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos())
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     std::fs::create_dir_all(dir.join("src")).expect("create temp src dir");
     dir
 }
@@ -63,7 +63,7 @@ fn empty_index(tag: &str) -> PathBuf {
         std::process::id(),
         tag
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     std::fs::create_dir_all(dir.join("packages")).expect("create index packages dir");
     dir
 }

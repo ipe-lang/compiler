@@ -23,7 +23,7 @@ fn golden_dir(root: &Path, name: &str) -> PathBuf {
 /// Assert `ipe` refuses `golden` with the foreign-variable refusal at `chip`'s name in `file`.
 fn assert_chip_refused(name: &str, golden: &Path, file: &str) {
     let out = crate::support::scratch_root().join(format!("ipec_{name}"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(golden, &out, &runtime);

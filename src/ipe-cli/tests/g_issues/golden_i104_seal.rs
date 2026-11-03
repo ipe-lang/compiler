@@ -45,7 +45,7 @@ fn f1_multiuse_let_clone() {
     let root = repo_root();
     let golden_dir = root.join("tests").join("golden").join("multiuse_let_clone");
     let out = crate::support::scratch_root().join("ipec_i104_multiuse_let_clone_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -86,7 +86,7 @@ fn f2_closure_capture_reuse() {
         .join("golden")
         .join("closure_capture_reuse");
     let out = crate::support::scratch_root().join("ipec_i112_closure_capture_reuse_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

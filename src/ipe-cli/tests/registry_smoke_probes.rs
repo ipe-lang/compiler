@@ -58,7 +58,7 @@ fn template_path() -> PathBuf {
 fn scratch(tag: &str) -> Result<PathBuf, Box<dyn Error>> {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("registry_smoke_{tag}_{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }

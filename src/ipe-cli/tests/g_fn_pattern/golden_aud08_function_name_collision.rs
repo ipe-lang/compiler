@@ -25,7 +25,6 @@
 //! cargo test -p ipe --test golden_aud08_function_name_collision
 //! ```
 
-use std::fs;
 use std::path::PathBuf;
 
 #[test]
@@ -56,7 +55,7 @@ fn distinct_functions_folding_to_the_same_rust_name_both_emit() {
         ),
     ]);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("aud08_function_name_collision_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     // `ZuiBorder.rounded` and `Zui.borderRounded` both fold to
     // `zui_border_rounded`. The injective fold disambiguates the loser to a
@@ -98,7 +97,7 @@ import Ipe.String
     ]);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("aud08_function_name_collision_control_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let built = crate::root_fixture::build(&fixture, &out, &runtime);
     assert!(

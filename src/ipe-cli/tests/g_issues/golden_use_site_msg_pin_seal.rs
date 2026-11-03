@@ -38,7 +38,7 @@ fn use_site_msg_pin_emitted() {
     let root = crate::support::repo_root();
     let golden = golden_dir(&root);
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_emit"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden, &out, &runtime);
@@ -69,7 +69,7 @@ fn use_site_open_non_msg_var_refused() {
     let root = crate::support::repo_root();
     let golden = root.join("tests").join("golden").join(name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden, &out, &runtime);
@@ -93,7 +93,7 @@ fn use_site_msg_pin_seal_runs() {
     let root = crate::support::repo_root();
     let golden = golden_dir(&root);
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_e2e"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden, &out, &runtime);

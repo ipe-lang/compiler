@@ -44,7 +44,7 @@ fn generic_optional_sync_emits_byte_identical() {
     let golden_dir = fixture_dir(&root);
     let golden_project = root.join("tests").join("golden").join(GOLDEN);
     let out = crate::support::scratch_root().join("ipec_i802_generic_optional_sync_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);
@@ -66,7 +66,7 @@ fn generic_optional_sync_builds_and_runs() {
     let root = repo_root();
     let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_i802_generic_optional_sync_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);

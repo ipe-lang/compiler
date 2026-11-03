@@ -13,6 +13,7 @@
 
 pub mod bin;
 pub mod live_page;
+pub mod scratch;
 pub mod target;
 
 pub use bin::{

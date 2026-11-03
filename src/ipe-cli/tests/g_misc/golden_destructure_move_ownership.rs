@@ -36,7 +36,7 @@ fn i224_destructure_ipec_accepts_and_clones_reused_component() {
     let root = repo_root();
     let entry = project_path(&root);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i224_destructure_ipec_out");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -70,7 +70,7 @@ fn i224_destructure_cargo_builds_and_runs() {
     let root = repo_root();
     let entry = project_path(&root);
     let out = crate::support::scratch_root().join("ipec_i224_destructure_move_ownership_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

@@ -41,7 +41,7 @@ fn poly_fn_attr_list_ipec_and_cargo_zero() {
     let root = repo_root();
     let golden_project = root.join("tests").join("golden").join("poly_fn_attr_list");
     let out = crate::support::scratch_root().join("ipec_i139_poly_fn_attr_list_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

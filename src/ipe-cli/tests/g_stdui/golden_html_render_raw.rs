@@ -37,7 +37,7 @@ fn html_render_escapes_text_and_emits_raw_and_script() {
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("html_render_raw");
     let out = crate::support::scratch_root().join("ipec_html_render_raw_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&dir, &out, &runtime);

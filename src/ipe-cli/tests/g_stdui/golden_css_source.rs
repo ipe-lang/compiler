@@ -36,7 +36,7 @@ fn css_project() -> PathBuf {
 #[test]
 fn css_source_builds_and_injects_leaf_kernels() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("css_source_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let res = crate::support::build_golden(&css_project(), &out, &runtime());
     assert!(
@@ -79,7 +79,7 @@ fn css_e2e_neutralises_injection() {
         return;
     }
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("css_source_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let res = crate::support::build_golden(&css_project(), &out, &runtime());
     assert!(res.is_ok(), "Ipe.Css build must succeed: {:?}", res.err());

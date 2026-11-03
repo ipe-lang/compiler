@@ -65,7 +65,7 @@ fn unexpected_flag_is_misuse_and_shows_help() -> TestResult {
 #[test]
 fn a_project_with_no_test_entry_reports_nothing_to_run_and_exits_zero() -> TestResult {
     let dir = crate::support::scratch_root().join(format!("ipe_test_none_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     write_project(&dir)?;
 
     let (ok, stdout, stderr) = run_ipe(&["test", &dir.to_string_lossy()])?;
@@ -89,7 +89,7 @@ fn a_project_with_no_test_entry_reports_nothing_to_run_and_exits_zero() -> TestR
 fn a_directory_without_a_manifest_is_refused() -> TestResult {
     let dir =
         crate::support::scratch_root().join(format!("ipe_test_no_manifest_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     write_project(&dir)?;
     std::fs::create_dir_all(dir.join("loose").join("tests"))?;
     std::fs::copy(fixture("clean.ipe"), dir.join("loose").join("Main.ipe"))?;
@@ -118,7 +118,7 @@ fn a_project_with_passing_tests_exits_zero_with_a_summary() -> TestResult {
         return Ok(());
     }
     let dir = crate::support::scratch_root().join(format!("ipe_test_pass_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     write_project(&dir)?;
     std::fs::create_dir_all(dir.join("tests"))?;
     std::fs::copy(
@@ -149,7 +149,7 @@ fn a_project_with_a_failing_test_names_it_and_exits_non_zero() -> TestResult {
         return Ok(());
     }
     let dir = crate::support::scratch_root().join(format!("ipe_test_fail_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     write_project(&dir)?;
     std::fs::create_dir_all(dir.join("tests"))?;
     std::fs::copy(
@@ -218,7 +218,7 @@ main =
 /// Lay out a project whose `tests/Main.ipe` is `test_entry`, returning its root.
 fn write_db_test_project(name: &str, test_entry: &str) -> Result<PathBuf, Box<dyn Error>> {
     let dir = crate::support::scratch_root().join(format!("{name}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     write_project(&dir)?;
     std::fs::create_dir_all(dir.join("tests"))?;
     std::fs::write(dir.join("tests").join("Main.ipe"), test_entry)?;
@@ -292,7 +292,7 @@ fn a_test_entry_importing_the_database_stdlib_passes() -> TestResult {
 /// A fresh per-user cache base for one test, under this binary's scratch root.
 fn fresh_cache(name: &str) -> Result<PathBuf, Box<dyn Error>> {
     let cache = crate::support::scratch_root().join(format!("{name}_cache_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&cache);
+    e2e_support::scratch::fresh(&cache);
     std::fs::create_dir_all(&cache)?;
     Ok(cache)
 }
@@ -300,7 +300,7 @@ fn fresh_cache(name: &str) -> Result<PathBuf, Box<dyn Error>> {
 /// Lay out a project whose `tests/Main.ipe` is the fixture `tests_fixture`, returning its root.
 fn fixture_project(name: &str, tests_fixture: &str) -> Result<PathBuf, Box<dyn Error>> {
     let dir = crate::support::scratch_root().join(format!("{name}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     write_project(&dir)?;
     std::fs::create_dir_all(dir.join("tests"))?;
     std::fs::copy(fixture(tests_fixture), dir.join("tests").join("Main.ipe"))?;
@@ -469,7 +469,7 @@ fn build_metadata_alone_keeps_two_path_dependency_units_apart() -> TestResult {
     }
     let base =
         crate::support::scratch_root().join(format!("ipe_test_identity_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    e2e_support::scratch::fresh(&base);
     let target = base.join("target");
     for tag in ["a", "b"] {
         let root = base.join(format!("root_{tag}"));
@@ -609,7 +609,7 @@ fn a_new_run_key_alone_recompiles_the_runner() -> TestResult {
     }
     let base =
         crate::support::scratch_root().join(format!("ipe_test_run_key_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    e2e_support::scratch::fresh(&base);
     let root = base.join("runner");
     let target = base.join("target");
     std::fs::create_dir_all(root.join("src"))?;
@@ -835,7 +835,7 @@ fn a_postgres_project_test_cannot_open_an_sqlite_location() -> TestResult {
     }
     let dir = crate::support::scratch_root()
         .join(format!("ipe_test_postgres_driver_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     std::fs::create_dir_all(dir.join("src"))?;
     std::fs::create_dir_all(dir.join("tests"))?;
     std::fs::write(

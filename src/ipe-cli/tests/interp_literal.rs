@@ -39,7 +39,7 @@ fn golden_dir(name: &str) -> PathBuf {
 fn interp_int_literal_compiles() {
     let golden = golden_dir("m_interp_int_literal");
     let out = crate::support::scratch_root().join("ipec_m_interp_int_literal");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
@@ -57,7 +57,7 @@ fn interp_int_literal_runs() {
     }
     let golden = golden_dir("m_interp_int_literal");
     let out = crate::support::scratch_root().join("ipec_m_interp_int_literal_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     crate::support::build_golden(&golden, &out, &runtime).expect("build must succeed");
     let outcome = support::build_and_run_emitted("m_interp_int_literal", &out);

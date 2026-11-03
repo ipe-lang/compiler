@@ -32,7 +32,7 @@ fn authed_store_query_emits_byte_identical() {
     let dir = fixture_dir(&root);
     let golden_project = root.join("tests").join("golden").join(GOLDEN);
     let out = crate::support::scratch_root().join("ipec_authed_store_query_seal_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&dir, &out, &runtime);
@@ -53,7 +53,7 @@ fn authed_store_query_seal_builds() {
     let root = repo_root();
     let dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_authed_store_query_seal_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&dir, &out, &runtime);

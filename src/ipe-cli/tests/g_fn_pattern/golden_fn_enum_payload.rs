@@ -40,7 +40,7 @@ fn enum_payload_emits_arc_carrier_and_clone() {
     let root = repo_root();
     let golden = golden_dir(&root);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fn_enum_payload_dispatch_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden, &out, &runtime);
@@ -77,7 +77,7 @@ fn enum_payload_end_to_end_prints_two_hundred_seven() {
     let root = repo_root();
     let golden = golden_dir(&root);
     let out = crate::support::scratch_root().join("ipec_fn_enum_payload_dispatch_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden, &out, &runtime);
@@ -95,7 +95,7 @@ fn enum_payload_end_to_end_prints_two_hundred_seven() {
 fn build_source(name: &str, source: &str) -> Result<(), CliError> {
     let fixture = crate::root_fixture::main(source);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     crate::root_fixture::build(&fixture, &out, &runtime)
 }

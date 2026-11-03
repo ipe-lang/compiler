@@ -48,7 +48,7 @@ main =
 fn write_project(test_name: &str, database_stage: &str) -> PathBuf {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("ipec_pg_reachability_{test_name}"));
-    let _ = fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     let src = dir.join("src");
     fs::create_dir_all(&src).expect("create src/");
     fs::write(src.join("Main.ipe"), MAIN_IPE).expect("write Main.ipe");
@@ -69,7 +69,7 @@ fn write_project(test_name: &str, database_stage: &str) -> PathBuf {
 fn postgres_driver_selects_postgres_config_template() {
     let dir = write_project("postgres_select", ", build = { database = Postgres }");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("pg_reachability_postgres_select");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let built = ipe::build_project(&dir.join("package.ipe"), &out, &runtime());
     assert!(
@@ -126,7 +126,7 @@ fn postgres_driver_project_cargo_builds() {
     let dir = write_project("postgres_cargo_build", ", build = { database = Postgres }");
     let out =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("pg_reachability_postgres_cargo_build");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let built = ipe::build_project(&dir.join("package.ipe"), &out, &runtime());
     assert!(
@@ -177,7 +177,7 @@ fn postgres_driver_project_cargo_builds() {
 fn no_database_section_still_selects_sqlite_config_template() {
     let dir = write_project("sqlite_default", "");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("pg_reachability_sqlite_default");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let built = ipe::build_project(&dir.join("package.ipe"), &out, &runtime());
     assert!(

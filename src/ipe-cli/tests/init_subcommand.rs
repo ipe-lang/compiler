@@ -11,7 +11,7 @@ use std::path::PathBuf;
 fn fresh_dir(tag: &str) -> PathBuf {
     let dir =
         std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("ipe_init_test_{tag}"));
-    let _ = fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     dir
 }
 

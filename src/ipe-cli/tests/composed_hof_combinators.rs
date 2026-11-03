@@ -40,7 +40,7 @@ fn manifest() -> PathBuf {
 #[test]
 fn composed_combinators_lower() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("composed_hof_combinators");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let res = ipe::build_project(&manifest(), &out, &runtime());
     assert!(
@@ -68,7 +68,7 @@ fn composed_combinators_run_deterministically() {
         return;
     }
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("composed_hof_combinators_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let res = ipe::build_project(&manifest(), &out, &runtime());
     assert!(res.is_ok(), "build must succeed: {:?}", res.err());

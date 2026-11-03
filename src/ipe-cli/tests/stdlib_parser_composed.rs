@@ -41,7 +41,7 @@ fn manifest() -> PathBuf {
 #[test]
 fn stdlib_parser_composed_combinators_lower() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("stdlib_parser_composed");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let res = ipe::build_project(&manifest(), &out, &runtime());
     assert!(
@@ -60,7 +60,7 @@ fn stdlib_parser_composed_combinators_run() {
         return;
     }
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("stdlib_parser_composed_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let res = ipe::build_project(&manifest(), &out, &runtime());
     assert!(res.is_ok(), "build must succeed: {:?}", res.err());

@@ -40,7 +40,7 @@ fn i1353_generic_view_helper_body_msg_tvar_emits_generic_return() {
     let golden_dir = fixture_dir(&root);
     let out =
         crate::support::scratch_root().join("ipec_i1353_generic_view_helper_body_msg_tvar_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);
@@ -75,7 +75,7 @@ fn i1353_generic_view_helper_body_msg_tvar_seal_builds() {
     let golden_dir = fixture_dir(&root);
     let out =
         crate::support::scratch_root().join("ipec_i1353_generic_view_helper_body_msg_tvar_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);

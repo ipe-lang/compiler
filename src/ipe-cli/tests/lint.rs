@@ -23,7 +23,7 @@ fn scratch(tag: &str) -> Result<PathBuf, Box<dyn Error>> {
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     let dir =
         crate::support::scratch_root().join(format!("ipe_lint_{tag}_{}_{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }

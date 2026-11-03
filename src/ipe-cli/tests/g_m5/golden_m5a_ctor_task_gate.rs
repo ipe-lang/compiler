@@ -29,7 +29,7 @@ fn build_fixture(fixture: &str, out_suffix: &str) -> Result<(), CliError> {
     let root = repo_root();
     let golden_project = root.join("tests").join("golden").join(fixture);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     crate::support::build_golden(&golden_project, &out, &runtime)

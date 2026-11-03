@@ -28,7 +28,7 @@ fn piped_console_app_ends_every_frame_before_system_exit() {
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("cli_exit_path");
     let out = crate::support::scratch_root().join("ipec_i3943_cli_exit_path_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

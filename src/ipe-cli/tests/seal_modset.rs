@@ -38,7 +38,7 @@ fn emit_and_build(name: &str, ipe_source: &str) -> Result<(), BoxError> {
 
     let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("seal_modset_{name}_emitted"));
-    let _ = std::fs::remove_dir_all(&out_dir);
+    e2e_support::scratch::fresh(&out_dir);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -67,7 +67,7 @@ fn emit_and_build_vendored(name: &str, ipe_source: &str) -> Result<(), BoxError>
 
     let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("seal_modset_{name}_emitted"));
-    let _ = std::fs::remove_dir_all(&out_dir);
+    e2e_support::scratch::fresh(&out_dir);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -559,7 +559,7 @@ fn json_object_order_vendored_builds_and_keeps_insertion_order() {
     let fixture = ipe::RootFixture::main(JSON_OBJECT_ORDER).expect("write the fixture");
     let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("seal_modset_{name}_emitted"));
-    let _ = std::fs::remove_dir_all(&out_dir);
+    e2e_support::scratch::fresh(&out_dir);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let options = ipe::BuildOptions {
         runtime_dep: false,

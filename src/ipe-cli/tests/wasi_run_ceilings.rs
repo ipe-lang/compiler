@@ -66,7 +66,7 @@ const MEMORY_CEILING_BYTES: u64 = 64 * 65_536;
 fn module_file(name: &str, bytes: &[u8]) -> (PathBuf, PathBuf) {
     let dir =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     std::fs::create_dir_all(&dir).expect("mkdir scratch");
     let file = dir.join("module.wasm");
     std::fs::write(&file, bytes).expect("write module");

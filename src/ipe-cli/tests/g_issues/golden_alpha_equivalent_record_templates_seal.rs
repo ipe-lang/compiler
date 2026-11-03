@@ -73,7 +73,7 @@ main =
 fn build(name: &str, source: &str, suffix: &str) -> PathBuf {
     let fixture = crate::root_fixture::main(source);
     let out = crate::support::scratch_root().join(format!("ipec_{name}_{suffix}"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::root_fixture::build(&fixture, &out, &runtime);
     assert!(

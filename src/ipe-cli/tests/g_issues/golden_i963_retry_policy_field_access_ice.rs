@@ -50,7 +50,7 @@ fn retry_policy_nearmiss_still_rejects() {
     let root = repo_root();
     let golden_dir = fixture_named(&root, "retry_policy_shape_nearmiss");
     let out = crate::support::scratch_root().join("ipec_i963_nearmiss_guard");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     let got = match &built {
@@ -137,7 +137,7 @@ main =
 fn built_kernel_only_policy(name: &str) -> (Result<(), CliError>, PathBuf) {
     let fixture = crate::root_fixture::main(KERNEL_ONLY_POLICY);
     let out = crate::support::scratch_root().join(name);
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     (crate::root_fixture::build(&fixture, &out, &runtime), out)
 }

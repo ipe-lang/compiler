@@ -106,7 +106,7 @@ fn build_run(name: &str) -> (PathBuf, crate::support::RunOutcome) {
     let root = repo_root();
     let dir = golden_dir(&root, name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&dir, &out, &runtime);
@@ -608,7 +608,7 @@ fn db_sql_decimal_accepts_decimal() {
     let root = repo_root();
     let dir = golden_dir(&root, "db_sql_decimal_money");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("db_sql_decimal_accepts");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -629,7 +629,7 @@ fn db_sql_decimal_rejects_raw_string() {
     let root = repo_root();
     let dir = golden_dir(&root, "db_sql_decimal_rejects_string");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("db_sql_decimal_rejects");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -666,7 +666,7 @@ fn db_poly_params_compiles() {
     let root = repo_root();
     let dir = golden_dir(&root, "db_poly_params");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("db_poly_params");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

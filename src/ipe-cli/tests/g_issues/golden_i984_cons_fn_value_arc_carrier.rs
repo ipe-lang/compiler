@@ -33,7 +33,7 @@ fn assert_byte_identical(name: &str) {
     let golden_dir = fixture_dir(&root, name);
     let golden_project = root.join("tests").join("golden").join(name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_emit"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -86,7 +86,7 @@ fn assert_e2e_prints(name: &str, want_stdout: &str) {
     let root = repo_root();
     let golden_dir = fixture_dir(&root, name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);

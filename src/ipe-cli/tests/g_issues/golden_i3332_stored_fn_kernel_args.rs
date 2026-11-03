@@ -54,7 +54,7 @@ fn fixture_entry(name: &str) -> PathBuf {
 fn accept_and_run(name: &str, expected_stdout: &str) {
     let dir = fixture_dir(name);
     let out = crate::support::scratch_root().join(format!("ipec_i3332_{name}"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
