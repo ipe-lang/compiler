@@ -1470,16 +1470,20 @@ impl Drop for RecursionGuard {
 // Synchronous-panic gate
 // ===========================================
 // The generated `fn main()` installs this FIRST so any panic that escapes the
-// synchronous Ipê path — a div-by-zero (`a / 0`), an index-out-of-range, an
-// arithmetic overflow, etc. — is CLASSIFIED into a Ipê error kind, logged
-// structurally with a short correlation id, and the process exits 1 — instead of
-// dumping a raw Rust backtrace. Implements `defer rt.LogPanicAndExit()` on
+// synchronous Ipê path — a typed `RuntimeTrip` from Ipê code, or a raw panic
+// from foreign or runtime Rust code — is CLASSIFIED into a Ipê error kind,
+// logged structurally with a short correlation id, and the process exits 1 —
+// instead of dumping a raw Rust backtrace. Implements `defer rt.LogPanicAndExit()` on
 // every emitted `func main()` (AGENTS.md "Synchronous-panic gate"). The hook is
 // total (no unwrap/index/panic of its own) and honours `IPE_LOG_FORMAT=json`.
 
-/// Map a Rust panic message to a Ipê error classification ( panic-class
-/// taxonomy, restricted to the kinds reachable from well-typed Ipê on the typed
-/// Rust backend — TypeMismatch/CoerceFailure are compiler-only).
+/// Map a raw Rust panic message to a Ipê error classification.
+///
+/// Well-typed Ipê code never reaches this path: its integer arithmetic is total
+/// or trips a typed [`RuntimeTrip`], which [`classify_and_log_panic`] labels
+/// first. A message reaches here only from foreign (FFI) or runtime Rust code,
+/// so each arm names the panic that code can raise — `/` on a zero divisor
+/// included, though Ipê's own `x // 0` is `0`.
 fn classify_panic(msg: &str) -> &'static str {
     let m = msg.to_ascii_lowercase();
     if m.contains("divide by zero") || m.contains("divisor of zero") {
