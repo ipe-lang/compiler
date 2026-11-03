@@ -249,7 +249,7 @@ fn build_fixture(name: &str, source: &str) -> (Result<(), CliError>, PathBuf) {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("embed-fn-param-capture")
         .join(format!("{name}-out"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     (crate::root_fixture::build(&fixture, &out, &runtime), out)
 }

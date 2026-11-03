@@ -23,7 +23,7 @@ fn temp_dir(tag: &str) -> PathBuf {
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     std::fs::create_dir_all(&dir).expect("create temp dir");
     dir
 }

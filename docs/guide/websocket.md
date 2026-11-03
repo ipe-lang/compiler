@@ -34,7 +34,7 @@ seals candidate URLs and builds a connect config — without opening a socket.
 
 Sealing composes the two boundaries with `Result.andThen`:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/websocket-url-seal/src/Main.ipe
 seal : String -> Result Error WebSocket.WsUrl
 seal raw =
     Url.fromString raw
@@ -44,11 +44,10 @@ seal raw =
 A wrong scheme (`https://`) or a malformed string is rejected; only a `ws`/`wss`
 URL seals:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/websocket-url-seal/src/Main.ipe
 describe : String -> String
 describe raw =
     case seal raw of
-
         Ok wsUrl ->
             raw
                 ++ "  ->  sealed host="
@@ -60,7 +59,7 @@ describe raw =
 
 The config is a value built from typed durations — nothing connects:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/websocket-url-seal/src/Main.ipe
 configFor : WebSocket.WsUrl -> WebSocket.WebSocketCfg
 configFor wsUrl =
     WebSocket.defaultCfg wsUrl

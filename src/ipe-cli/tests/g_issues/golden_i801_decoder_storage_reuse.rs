@@ -44,7 +44,7 @@ fn decoder_storage_reuse_emits_byte_identical() {
     let golden_dir = fixture_dir(&root);
     let golden_project = root.join("tests").join("golden").join(GOLDEN);
     let out = crate::support::scratch_root().join("ipec_i801_decoder_storage_reuse_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);
@@ -66,7 +66,7 @@ fn decoder_storage_reuse_builds_and_runs() {
     let root = repo_root();
     let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_i801_decoder_storage_reuse_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);

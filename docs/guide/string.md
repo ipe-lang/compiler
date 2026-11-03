@@ -35,7 +35,7 @@ Parsing one line finds the `<`/`>` delimiters with `String.indexes` (each a
 step returns a new string; a line without both delimiters falls out as `Nothing`
 rather than crashing:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/string-contacts/src/Main.ipe
 parseLine line =
     Maybe.map2 Tuple.pair
         (List.head (String.indexes "<" line))
@@ -47,7 +47,7 @@ The field extraction is a chain of pure transforms — `slice` the window, `trim
 the whitespace, `toLower` the address — and the parse *rejects* rather than
 returns on a bad address, because `isEmail` is the typed boundary check:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/string-contacts/src/Main.ipe
 toContact line open close =
     let
         name =
@@ -68,7 +68,7 @@ toContact line open close =
 The whole roster is `lines` → `filterMap parseLine`: split the block, parse each
 line, and keep only the successes in one pass:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/string-contacts/src/Main.ipe
 roster block =
     String.lines block
         |> List.filterMap parseLine
@@ -77,7 +77,7 @@ roster block =
 Running it (`ipe dev run`) drops the two malformed lines, lowercases `Ada@Example.COM`,
 and prints the clean roster:
 
-```
+```text
 parsed 2 contacts:
   Ada Lovelace <ada@example.com>
   Grace Hopper <grace@navy.mil>

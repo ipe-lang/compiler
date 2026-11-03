@@ -129,7 +129,7 @@ fn define_transparency_emits_the_conversion_seam() {
 
     let fixture = ffi_fixture(MAIN_IPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_define_transparency_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!("define-transparency fixture must build, got: {err}")
@@ -177,7 +177,7 @@ fn define_transparency_emitted_crate_builds_and_runs() {
 
     let fixture = ffi_fixture(MAIN_IPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_define_transparency_e2e_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!("define-transparency fixture must build, got: {err}")
     }
@@ -188,7 +188,7 @@ fn define_transparency_emitted_crate_builds_and_runs() {
     // empty local stand-in; the defined types themselves are self-contained
     // in `_bindings.rs` and reference nothing from it.
     let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_define_transparency_e2e");
-    let _ = fs::remove_dir_all(&tmp);
+    e2e_support::scratch::fresh(&tmp);
     let demo_dir = tmp.join("demo");
     fs::create_dir_all(demo_dir.join("src")).expect("mkdir demo");
     fs::write(
@@ -255,7 +255,7 @@ fn value_struct_marshal_refuses_a_mismatched_record_shape() {
 
     let fixture = ffi_fixture(MISMATCHED_RECORD_IPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_value_struct_mismatch_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let result = ipe::build_fixture(&fixture, &out, &runtime);
     assert!(

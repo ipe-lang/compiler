@@ -34,10 +34,10 @@ The accumulator *is* a pair — the transient two-things bundle a tuple is for.
 `Tuple.mapBoth` updates both components at once: shrink the running minimum, grow
 the running maximum, in one step, without taking the pair apart:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/tuple-minmax/src/Main.ipe
+extremes : List Float -> Maybe ( Float, Float )
 extremes xs =
     case xs of
-
         first :: rest ->
             List.foldl widen ( first, first ) rest
                 |> Just
@@ -46,6 +46,7 @@ extremes xs =
             Nothing
 
 
+widen : Float -> ( Float, Float ) -> ( Float, Float )
 widen x range =
     Tuple.mapBoth (min x) (max x) range
 ```
@@ -53,7 +54,8 @@ widen x range =
 Reading the result back is positional — `Tuple.first`/`Tuple.second`, no field
 names, because the pair is a passing value rather than a declared type:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/tuple-minmax/src/Main.ipe
+report : ( Float, Float ) -> String
 report range =
     "coldest "
         ++ String.fromFloat (Tuple.first range)
@@ -64,7 +66,7 @@ report range =
 
 Running it (`ipe dev run`) prints:
 
-```
+```text
 coldest 14.2°C, warmest 27.3°C
 ```
 

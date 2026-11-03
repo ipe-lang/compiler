@@ -51,7 +51,7 @@ fn server_request_accessor_emit_inserts_clone() {
         .join("golden")
         .join("server_request_accessors");
     let out = crate::support::scratch_root().join("ipec_m6_server_request_accessors");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

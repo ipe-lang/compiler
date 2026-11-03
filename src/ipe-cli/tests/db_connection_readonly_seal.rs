@@ -24,7 +24,7 @@ fn runtime() -> PathBuf {
 #[allow(clippy::expect_used)]
 fn write_project(test_name: &str, main_ipe: &str) -> PathBuf {
     let dir = crate::support::scratch_root().join(format!("ipe_conn_ro_seal_{test_name}"));
-    let _ = fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     let src = dir.join("src");
     fs::create_dir_all(&src).expect("create src/");
     fs::write(src.join("Main.ipe"), main_ipe).expect("write Main.ipe");
@@ -40,7 +40,7 @@ fn write_project(test_name: &str, main_ipe: &str) -> PathBuf {
 /// program; the caller decides whether rejection is expected or a failure.
 fn emit(dir: &Path, test_name: &str) -> (Result<(), ipe::CliError>, PathBuf) {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("conn_ro_seal_{test_name}"));
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let result = ipe::build_project(&dir.join("package.ipe"), &out, &runtime());
     (result, out)
 }

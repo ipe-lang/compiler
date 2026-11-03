@@ -53,7 +53,7 @@ fn build_run_input_callback() -> crate::support::RunOutcome {
         .join("golden")
         .join("input_callback_maybe_field");
     let out = crate::support::scratch_root().join("ipec_m7_input_callback_maybe_field_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&dir, &out, &runtime);

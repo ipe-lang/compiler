@@ -28,7 +28,7 @@ The example under
 builds a two-field form. Each field is a text input; `autofocus` is chosen
 conditionally, falling back to `noAttr` when off.
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/attributes-form/src/Main.ipe
 field : String -> String -> Bool -> Html msg
 field fieldName label focus =
     Html.input
@@ -47,7 +47,7 @@ field fieldName label focus =
 
 Running it (`ipe dev run`):
 
-```
+```text
 Rendered form (required is driven by a Bool, autofocus omitted when off):
 <form class="login"><input autofocus="true" id="email" name="email" placeholder="you@example.com" required="true" type="text" /><input id="password" name="password" placeholder="password" required="true" type="text" /></form>
 ```

@@ -36,7 +36,8 @@ back.
 Each step is a task that either succeeds with a log line or *fails with a typed
 error* — the failure is a value, built where the check is:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/task-deploy-steps/src/Main.ipe
+check : String -> Bool -> Task Error String
 check label ok =
     if ok then
         Task.succeed ("ok   — " ++ label)
@@ -49,7 +50,8 @@ The deploy is a `do` block: each `<-` binds the previous step's success, and if 
 step fails the chain short-circuits — the steps below it never run. Read it top to
 bottom, not as a nested `andThen` pyramid:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/task-deploy-steps/src/Main.ipe
+deploy : Bool -> Task Error String
 deploy migrationsOk =
     do
         build <- check "build compiled" True
@@ -65,20 +67,20 @@ Recovery is `Task.onError`: it catches a failure on the typed channel and hands
 back a rollback task, turning a failed deploy into a clean result instead of a
 crash:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/task-deploy-steps/src/Main.ipe
+attempt : String -> Bool -> Task Error ()
 attempt name migrationsOk =
     do
         _ <- Io.println (name ++ ":")
-        outcome <-
-            deploy migrationsOk
-                |> Task.onError rollback
+        outcome <- deploy migrationsOk
+                    |> Task.onError rollback
         Io.println ("  => " ++ outcome)
 ```
 
 And `main` is itself the one task the runtime runs — everything above merely
 *described* work:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/task-deploy-steps/src/Main.ipe
 main =
     do
         _ <- attempt "green deploy" True
@@ -89,7 +91,7 @@ Running it (`ipe dev run`) shows the green deploy running every step, and the ba
 deploy short-circuiting at the failed migration (the traffic-shift step never
 runs) then rolling back:
 
-```
+```text
 green deploy:
   ok   — build compiled
   ok   — migrations applied
@@ -124,7 +126,7 @@ Four shapes come up often enough to walk through.
 collected so far; the loop is done once a page reports no next cursor. The
 ceiling is the most pages the call is willing to fetch:
 
-```ipe
+```ipe ipe:skip a representative loop shape over a hypothetical paged API (fetchPage/Page are illustrative, not a runnable program)
 fetchPage : Maybe String -> Task Error Page
 
 pageStep :
@@ -158,7 +160,7 @@ one call may fetch, not a guess at stack depth.
 the step takes one batch off the front and reports whether the queue is now
 empty:
 
-```ipe
+```ipe ipe:skip a representative loop shape over a hypothetical batch API (processBatch is illustrative, not a runnable program)
 processBatch : List String -> Task Error (List String)
 
 drainStep : ( List String, Int ) -> Task Error (Step ( List String, Int ) Int)
@@ -186,7 +188,7 @@ ends the instant the queue empties.
 state is the attempt count; the step asks the job once and either reports
 `Done` with the result or `Continue` to try again:
 
-```ipe
+```ipe ipe:skip a representative loop shape over a hypothetical job API (checkJobStatus/JobStatus are illustrative, not a runnable program)
 checkJobStatus : Int -> Task Error JobStatus
 
 pollStep : Int -> Task Error (Step Int String)
@@ -215,6 +217,9 @@ Without `Task.loop`, the way to repeat a step is a function calling itself
 through `andThen`:
 
 ```ipe
+import Ipe.Task as Task
+
+
 countRecursive : Int -> Int -> Task Error Int
 countRecursive target n =
     if n >= target then
@@ -230,6 +235,9 @@ and the function has no declared bound, only whatever depth the stack happens to
 allow. The same count written as a loop makes the bound explicit and typed:
 
 ```ipe
+import Ipe.Task as Task exposing (Step(..))
+
+
 countStep : Int -> Int -> Task Error (Step Int Int)
 countStep target n =
     if n >= target then

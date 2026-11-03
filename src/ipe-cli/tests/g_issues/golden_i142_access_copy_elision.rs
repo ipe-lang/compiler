@@ -34,7 +34,7 @@ fn emit_fixture(out_name: &str) -> String {
         .join("golden")
         .join("copy_field_no_clone");
     let out = crate::support::scratch_root().join(out_name);
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

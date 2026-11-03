@@ -455,7 +455,7 @@ fn compile_and_build(test_name: &str) -> Result<e2e_support::SharedBuild, BoxErr
 fn fresh_db_path(test_name: &str) -> Result<PathBuf, BoxError> {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("secured_store_e2e_{test_name}_db"));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     std::fs::create_dir_all(&dir)
         .map_err(|e| -> BoxError { format!("{test_name}: cannot create db dir: {e}").into() })?;
     Ok(dir.join("secured.db"))

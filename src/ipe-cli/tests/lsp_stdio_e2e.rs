@@ -112,7 +112,7 @@ fn await_response(rx: &mpsc::Receiver<serde_json::Value>, id: i64) -> serde_json
 fn stdio_server_serves_live_diagnostics_for_a_real_project() {
     // A real project on disk: sibling discovery, disk starts CLEAN.
     let dir = crate::support::scratch_root().join(format!("ipe_lsp_e2e_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     std::fs::create_dir_all(&dir).expect("create project dir");
     let dir = std::fs::canonicalize(&dir).expect("canonical project dir");
     std::fs::write(dir.join("package.ipe"), support::package_ipe("lsp-e2e"))
@@ -276,7 +276,7 @@ fn first_location(result: &serde_json::Value) -> Option<(String, i64, i64)> {
 fn stdio_definition_answers_inside_do_and_on_local_binders() {
     let dir =
         crate::support::scratch_root().join(format!("ipe_lsp_def_e2e_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     std::fs::create_dir_all(dir.join("src")).expect("create project dir");
     let dir = std::fs::canonicalize(&dir).expect("canonical project dir");
     std::fs::write(dir.join("package.ipe"), support::package_ipe("lsp-def-e2e"))

@@ -66,7 +66,7 @@ fn build_into_shared_target(
 
     let scratch = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("ipe_build_artifact_copy_{tag}"));
-    let _ = fs::remove_dir_all(&scratch);
+    e2e_support::scratch::fresh(&scratch);
     fs::create_dir_all(&scratch)?;
     let out_dir = scratch.join("out");
 

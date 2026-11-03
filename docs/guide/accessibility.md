@@ -66,6 +66,16 @@ button — all named, all with the right ARIA state, no raw strings:
 import Ipe.Ui as Ui
 
 
+type Msg
+    = Toggle
+    | Close
+
+
+closeIcon : Element Msg
+closeIcon =
+    Ui.text "x"
+
+
 statusBar : Bool -> Element Msg
 statusBar open =
     Ui.row [ Ui.describe Ui.descNavigation ]

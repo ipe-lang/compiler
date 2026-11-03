@@ -50,7 +50,7 @@ fn assert_ipec_accepts_without_ipe_row(fixture: &str) {
     let root = repo_root();
     let entry = project_path(&root, fixture);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{fixture}_ipec_out"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -82,7 +82,7 @@ fn assert_cargo_builds_and_runs(fixture: &str, expected_stdout: &str) {
     let root = repo_root();
     let entry = project_path(&root, fixture);
     let out = crate::support::scratch_root().join(format!("ipec_{fixture}_e2e"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

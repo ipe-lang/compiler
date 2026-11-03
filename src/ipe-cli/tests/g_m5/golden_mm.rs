@@ -52,7 +52,7 @@ fn runtime() -> PathBuf {
 fn mm_local_pkg_emits_byte_identical_main_rs() {
     let fixture = golden_dir("mm_local_pkg");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("mm_local_pkg");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let res = crate::support::build_golden(&fixture, &out, &runtime());
     assert!(res.is_ok(), "build_project failed: {:?}", res.err());
@@ -71,7 +71,7 @@ fn mm_local_pkg_emits_byte_identical_main_rs() {
 fn mm_diamond_emits_byte_identical_main_rs() {
     let fixture = golden_dir("mm_diamond");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("mm_diamond");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let res = crate::support::build_golden(&fixture, &out, &runtime());
     assert!(res.is_ok(), "build_project failed: {:?}", res.err());
@@ -106,7 +106,7 @@ fn mm_diamond_emits_byte_identical_main_rs() {
 fn mm_qualtype_local_shadow_compiles() {
     let fixture = golden_dir("mm_qualtype_local_shadow");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("mm_qualtype_local_shadow");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let res = crate::support::build_golden(&fixture, &out, &runtime());
     assert!(res.is_ok(), "build_project failed: {:?}", res.err());
 }
@@ -119,7 +119,7 @@ fn mm_qualtype_local_shadow_compiles() {
 fn expect_error_code(fixture_name: &str, expected: ipe_diagnostics::Code) {
     let fixture = golden_dir(fixture_name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(fixture_name);
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let res = crate::support::build_golden(&fixture, &out, &runtime());
     assert!(
@@ -276,7 +276,7 @@ fn expect_error_at_line(
 ) {
     let fixture = golden_dir(fixture_name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(fixture_name);
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let res = crate::support::build_golden(&fixture, &out, &runtime());
     assert!(
@@ -320,7 +320,7 @@ fn expect_error_at_line(
 fn mm_open_user_unused_compiles() {
     let fixture = golden_dir("mm_open_user_unused");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("mm_open_user_unused");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let res = crate::support::build_golden(&fixture, &out, &runtime());
     assert!(res.is_ok(), "build_project failed: {:?}", res.err());
 }
@@ -345,7 +345,7 @@ fn mm_open_user_used_is_ipe_n0024_at_the_use() {
 fn mm_open_user_explicit_wins_compiles() {
     let fixture = golden_dir("mm_open_user_explicit_wins");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("mm_open_user_explicit_wins");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let res = crate::support::build_golden(&fixture, &out, &runtime());
     assert!(res.is_ok(), "build_project failed: {:?}", res.err());
 }

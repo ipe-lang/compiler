@@ -29,7 +29,7 @@ const DSN_PASSWORD: &str = "hunter2SENTINEL";
 fn build_every_leaf() -> PathBuf {
     let entry = golden_project_dir(&repo_root(), "show_policy_every_leaf");
     let out = crate::support::scratch_root().join("ipec_show_policy_every_leaf");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
@@ -92,7 +92,7 @@ fn showing_a_rust_handle_is_refused_before_cargo() {
         .unwrap_or_else(|e| panic!("read {}: {e}", source.display()));
     let fixture = ffi_fixture(&main);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("show_refused_foreign_out");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) else {
         panic!("showing a `Rust.*` handle must be refused, but ipe accepted it")
     };

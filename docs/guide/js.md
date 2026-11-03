@@ -62,23 +62,28 @@ is a `Web.tea` that sends a closed `JsCmd` outbound and subscribes to a guarded
 The outbound surface is one closed ADT — the whole attack surface as a single
 auditable object; `send` takes a value of it:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/web/js-ports/src/Main.ipe
 type JsCmd
     = Chime Int
+```
 
-
+```ipe ipe:excerpt examples/shapes/web/js-ports/src/Main.ipe
+update : Msg -> Model -> ( Model, Cmd.Cmd Msg )
 update msg model =
     case msg of
         Ring ->
+            -- Outbound: hand a closed `JsCmd` value to the seam.
             ( model, Js.send (Chime 1) )
-        ...
+
+        Ticked k ->
+            ( { model | lastTick = k }, Cmd.none )
 ```
 
 The inbound decoder is the fail-closed gate — a value that does not decode is
 dropped whole; a decoded value is folded in through a *narrow* message, never the
 internal `Msg` directly:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/web/js-ports/src/Main.ipe
 subscriptions : Model -> Sub.Sub Msg
 subscriptions _model =
     Js.subscribe Decode.int Ticked

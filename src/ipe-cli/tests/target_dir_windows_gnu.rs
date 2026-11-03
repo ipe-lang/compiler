@@ -47,7 +47,7 @@ error: could not compile `app` (bin \"app\") due to 1 previous error
         fn new(name: &str, project_dir: &str) -> Self {
             let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
                 .join(format!("ipe_target_dir_gnu_{name}"));
-            let _ = fs::remove_dir_all(&root);
+            e2e_support::scratch::fresh(&root);
             let case = Self {
                 project: root.join(project_dir),
                 bin: root.join("fakebin"),

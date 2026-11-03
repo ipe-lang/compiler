@@ -75,7 +75,7 @@ fn fresh_out_dir(tag: &str) -> Result<PathBuf, BoxError> {
         std::process::id(),
         Instant::now().elapsed().as_nanos()
     ));
-    let _ = std::fs::remove_dir_all(&base);
+    e2e_support::scratch::fresh(&base);
     std::fs::create_dir_all(&base)
         .map_err(|e| -> BoxError { format!("mkdir {}: {e}", base.display()).into() })?;
     Ok(base.join("out"))

@@ -21,7 +21,7 @@ page develops what that gives you.
 A project is a directory with a `package.ipe` manifest and a `src/` directory.
 Scaffold one with `ipe init`:
 
-```
+```sh
 ipe init hello
 cd hello
 ```
@@ -79,14 +79,14 @@ Reading it top to bottom:
 
 ## Run it
 
-```
+```sh
 ipe dev run
 ```
 
 The first run compiles the project and its dependencies, then executes it. The
 output is:
 
-```
+```text
 Hello, Ada and Linus and Grace!
 ```
 
@@ -102,7 +102,7 @@ names =
     [ "Ada" ]
 ```
 
-```
+```text
 Hello, Ada!
 ```
 
@@ -127,4 +127,3 @@ verified example.
 - [Glossary](glossary.md) — every term of art, defined once.
 - [Module reference](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib.md) — every `Ipe.*` module, generated
   from its source doc-strings.
-```

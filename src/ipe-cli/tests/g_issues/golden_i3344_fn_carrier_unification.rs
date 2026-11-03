@@ -177,7 +177,7 @@ fn every_carrier_frontier_builds_and_runs() {
 fn payload_carrier_conflict_is_refused() {
     let dir = "fn_carrier_conflict";
     let out = crate::support::scratch_root().join("ipec_i3344_conflict");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir(dir), &out, &runtime);
     let got = match &built {
@@ -213,7 +213,7 @@ fn stored_read_through_a_user_generic_def_is_refused() {
     let dir = "fn_carrier_unification_generic";
     let golden = golden_dir(dir);
     let out = crate::support::scratch_root().join("ipec_i3344_generic");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden, &out, &runtime);
     let got = match &built {
@@ -320,7 +320,7 @@ fn moved_payload_span() -> Span {
 #[test]
 fn partial_over_a_non_clone_payload_is_refused() {
     let out = crate::support::scratch_root().join("ipec_i3344_partial_moves_payload");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir(PARTIAL_MOVES_PAYLOAD), &out, &runtime);
     let got = match &built {

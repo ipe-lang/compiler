@@ -50,7 +50,7 @@ fn fixture_project() -> PathBuf {
 #[test]
 fn refutable_var_scrutinee_builds() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tuple_refutable_var_scrut_gate");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&fixture_project(), &out, &runtime);
@@ -72,7 +72,7 @@ fn refutable_var_scrutinee_cargo_builds_and_runs() {
     }
 
     let out = crate::support::scratch_root().join("ipec_tuple_refutable_var_scrut_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

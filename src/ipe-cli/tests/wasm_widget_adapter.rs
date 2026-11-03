@@ -99,7 +99,7 @@ fn emit_wasm_under(
 
     let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("wasm_widget_{test_name}_out"));
-    let _ = std::fs::remove_dir_all(&out_dir);
+    e2e_support::scratch::fresh(&out_dir);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let mut opts = BuildOptions::from_env();

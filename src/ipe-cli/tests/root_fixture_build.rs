@@ -14,7 +14,7 @@ const LIB: &str = "module Lib exposing (greeting)\n\ngreeting : String\ngreeting
 
 fn out_dir(tag: &str) -> PathBuf {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("root_fixture_{tag}"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     out
 }
 

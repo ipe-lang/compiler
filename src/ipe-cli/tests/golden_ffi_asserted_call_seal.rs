@@ -113,7 +113,7 @@ fn ffi_fixture_of(tree: SourceTree) -> RootFixture {
 /// A fresh scratch directory `name` for files that sit outside the project.
 fn scratch(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     dir
 }
 
@@ -154,7 +154,7 @@ fn asserted_call_emits_the_exact_carrier_shim() {
 
     let fixture = ffi_fixture(MAIN_IPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_asserted_call_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!("asserted-call fixture must build, got: {err}")
@@ -218,7 +218,7 @@ fn a_clamp_requiring_assertion_is_refused() {
         \x20       Err _ -> Io.println \"err\"\n";
     let fixture = ffi_fixture(main);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_asserted_clamp_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let err = ipe::build_fixture(&fixture, &out, &runtime)
         .expect_err("a clamp-requiring assertion must be refused");
     let msg = err.to_string();
@@ -250,7 +250,7 @@ fn a_misplaced_asserted_call_is_refused() {
         \x20       Err _ -> Io.println \"err\"\n";
     let fixture = ffi_fixture(main);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_asserted_misplaced_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let err = ipe::build_fixture(&fixture, &out, &runtime)
         .expect_err("a misplaced asserted call must be refused");
     let msg = err.to_string();
@@ -341,7 +341,7 @@ fn asserted_call_emitted_crate_builds_and_runs() {
 
     let fixture = ffi_fixture(MAIN_IPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_asserted_call_e2e_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!("asserted-call fixture must build, got: {err}")
     }
@@ -434,7 +434,7 @@ fn const_read_emits_a_bare_infallible_shim() {
 
     let fixture = ffi_fixture(CONST_MAIN_IPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_const_read_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!("const fixture must build, got: {err}")
     }
@@ -472,7 +472,7 @@ fn a_result_typed_const_is_refused() {
         \x20   Io.println \"unreached\"\n";
     let fixture = ffi_fixture(main);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_const_result_refused_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let err = ipe::build_fixture(&fixture, &out, &runtime)
         .expect_err("a Result-typed .const must be refused");
     let msg = err.to_string();
@@ -501,7 +501,7 @@ fn const_read_emitted_crate_builds_and_runs() {
 
     let fixture = ffi_fixture(CONST_MAIN_IPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_const_read_e2e_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!("const fixture must build, got: {err}")
     }
@@ -628,7 +628,7 @@ fn same_named_opaques_from_two_crates_are_accepted() {
     let runtime = e2e_support::require_runtime().into_path_buf();
     let fixture = two_clients_fixture();
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_asserted_two_clients_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let built = ipe::build_fixture(&fixture, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -654,7 +654,7 @@ fn same_named_opaques_emitted_crate_builds_and_runs() {
     let runtime = e2e_support::require_runtime().into_path_buf();
     let fixture = two_clients_fixture();
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_asserted_two_clients_e2e_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let built = ipe::build_fixture(&fixture, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -746,7 +746,7 @@ fn a_define_nominal_asserted_carrier_is_accepted() {
         &[doc],
     );
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_asserted_define_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let built = ipe::build_fixture(&fixture, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -774,7 +774,7 @@ fn a_local_alias_carrier_is_refused() {
         \x20       Err _ -> Io.println \"err\"\n";
     let fixture = ffi_fixture(main);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_asserted_local_alias_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let built = ipe::build_fixture(&fixture, &out, &runtime);
     assert!(built.is_err(), "a local alias carrier must be refused");
     let msg = built.err().map(|e| e.to_string()).unwrap_or_default();
@@ -815,7 +815,7 @@ fn a_conflict_across_modules_names_both_definitions() {
         \x20   Rust.Ffi.call \"tm::hidden_double\"\n";
     let fixture = ffi_fixture_of(SourceTree::main(main).module("Other", other));
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_asserted_conflict_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let built = ipe::build_fixture(&fixture, &out, &runtime);
     assert!(built.is_err(), "conflicting assertions must be refused");
     let msg = built.err().map(|e| e.to_string()).unwrap_or_default();

@@ -11,6 +11,9 @@ arguments alone. It reads no hidden state and writes none: given the same
 arguments, it returns the same result every time.
 
 ```ipe
+import Ipe.String as String
+
+
 greeting : List String -> String
 greeting people =
     "Hello, " ++ String.join " and " people ++ "!"
@@ -42,6 +45,9 @@ function that "changes" a value returns a **new** value; the original is
 untouched.
 
 ```ipe
+import Ipe.List as List
+
+
 original : List Int
 original =
     [ 1, 2, 3 ]
@@ -56,7 +62,7 @@ After this runs, `doubled` is `[ 2, 4, 6 ]` and `original` is **still**
 `[ 1, 2, 3 ]`. [`List.map`](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/List.md) did not alter `original`; it
 produced a new list. Printing both confirms it:
 
-```
+```text
 original: [1, 2, 3]
 doubled:  [2, 4, 6]
 ```
@@ -65,6 +71,10 @@ The same holds for records. A record update writes with the `|` syntax and
 yields a new record:
 
 ```ipe
+type alias Model =
+    { count : Int }
+
+
 withCount : Model -> Int -> Model
 withCount model n =
     { model | count = n }
@@ -94,4 +104,3 @@ replaced. `model` itself is unchanged.
 - [The Elm Architecture](the-elm-architecture.md) — structuring a program that
   reacts to input over time.
 - [Glossary](glossary.md) — `pure function`, `Task`, `immutable`, and the rest.
-```

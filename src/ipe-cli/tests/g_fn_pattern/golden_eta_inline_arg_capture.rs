@@ -30,7 +30,7 @@ fn eta_inline_arg_capture_ipec_clones_capture() {
     let root = repo_root();
     let golden = golden_dir(&root);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("eta_inline_arg_capture_ipec_out");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -59,7 +59,7 @@ fn eta_inline_arg_capture_cargo_builds_and_runs() {
     let root = repo_root();
     let golden = golden_dir(&root);
     let out = crate::support::scratch_root().join("ipec_eta_inline_arg_capture_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

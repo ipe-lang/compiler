@@ -82,7 +82,7 @@ fn assert_single_oracle(name: &str) {
     }
     let dir = golden_dir(name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let built = crate::support::build_golden(&dir, &out, &runtime());
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
@@ -119,7 +119,7 @@ fn qualtype_project_builds_and_prints_42() {
     let name = "mm_qualtype";
     let dir = golden_dir(name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let built = crate::support::build_golden(&dir, &out, &runtime());
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
@@ -154,7 +154,7 @@ fn intdiv_minint_by_neg1_does_not_panic() {
     let name = "intdiv_minint";
     let dir = golden_dir(name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let built = crate::support::build_golden(&dir, &out, &runtime());
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
@@ -187,7 +187,7 @@ fn unterminated_blockcomment_is_ipe_p0017() {
     let name = "blockcomment_unterminated";
     let dir = golden_dir(name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let res = crate::support::build_golden(&dir, &out, &runtime());
     assert!(res.is_err(), "{name} must fail to compile");
@@ -204,7 +204,7 @@ fn unknown_module_in_annotation_is_ipe_n0004() {
     let name = "mm_neg_qualtype_unknownmod";
     let dir = golden_dir(name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let res = crate::support::build_golden(&dir, &out, &runtime());
     assert!(res.is_err(), "{name} must fail to compile");

@@ -35,7 +35,7 @@ fn runtime_dir() -> PathBuf {
 
 fn out_dir(fixture: &str) -> PathBuf {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(fixture);
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     out
 }
 

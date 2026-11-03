@@ -122,7 +122,7 @@ fn assert_module_files_match_golden(out: &Path, golden_dir: &Path) {
 fn emits_split_spine_and_per_module_files() {
     let fixture = fixture_dir();
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("multi_mod_split_pilot");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let res = crate::support::build_golden(&fixture, &out, &runtime());
     assert!(res.is_ok(), "build failed: {:?}", res.err());
@@ -156,7 +156,7 @@ fn end_to_end_builds_and_prints_seeded_count() {
     // Build OUTSIDE the workspace tree (an emitted project under the
     // workspace target/ is rejected by cargo as a non-member package).
     let out = crate::support::scratch_root().join("ipec_multi_mod_split_pilot_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let res = crate::support::build_golden(&fixture, &out, &runtime());
     assert!(res.is_ok(), "build failed: {:?}", res.err());

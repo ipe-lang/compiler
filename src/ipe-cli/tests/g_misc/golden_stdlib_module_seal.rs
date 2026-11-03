@@ -22,7 +22,6 @@
 //! IPE_E2E=1 cargo test -p ipe --test golden_stdlib_module_seal
 //! ```
 
-use std::fs;
 use std::path::PathBuf;
 
 /// A project fixture whose only module `Main` holds `main`.
@@ -51,7 +50,7 @@ fn compile_module_probe(slug: &str, main: &str) -> PathBuf {
     // `cargo build`, whose `rustc` then cannot locate its working directory.
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("stdlib_seal_{slug}_{pid}_{uid}_out"));
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let built = ipe::build_fixture(&fixture, &out, &runtime);
     if let Err(e) = built {
@@ -562,7 +561,7 @@ fn pubsub_topic_type_mismatch_is_rejected() {
     let uid = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let fixture = write_project(PUBSUB_TOPIC_MISMATCH);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("pubsub_mismatch_{uid}_out"));
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let res = ipe::build_fixture(&fixture, &out, &runtime);
     assert!(
         res.is_err(),

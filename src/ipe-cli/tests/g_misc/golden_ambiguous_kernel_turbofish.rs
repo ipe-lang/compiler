@@ -41,7 +41,7 @@ const FIXTURE: &str = "ambiguous_kernel_turbofish";
 fn ambiguous_kernel_turbofish_compiles() {
     let entry = golden_project_dir(FIXTURE);
     let out = crate::support::scratch_root().join("ipec_i181_ambiguous_kernel");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
@@ -62,7 +62,7 @@ fn ambiguous_kernel_turbofish_builds_and_runs() {
     }
     let entry = golden_project_dir(FIXTURE);
     let out = crate::support::scratch_root().join("ipec_i181_ambiguous_kernel_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     crate::support::build_golden(&entry, &out, &runtime).expect("build must succeed");
     let outcome = crate::support::build_and_run_emitted("i181_ambiguous_kernel", &out);

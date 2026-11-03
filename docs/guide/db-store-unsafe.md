@@ -31,7 +31,7 @@ The example under
 builds a raw-column table (no record type), names its primary key by string, and
 shows that an invalid identifier still fails closed.
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/store-raw-columns/src/Main.ipe
 events : Result Error (Store Store.Row)
 events =
     Store.fromColumns "events"
@@ -45,18 +45,21 @@ events =
 
 Its manifest pre-accepts the capability:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/store-raw-columns/package.ipe
 package : Package
 package =
     { name = "store-raw-columns"
     , version = "0.1.0"
-    , capabilities = { accepts = [ Unsafe ] }
+    , capabilities =
+        { declares = []
+        , accepts = [ Unsafe ]
+        }
     }
 ```
 
 Running it (`ipe dev run`):
 
-```
+```text
 columns: id, kind, weight
 bad column name -> rejected (invalid identifier — fail-closed)
 ```

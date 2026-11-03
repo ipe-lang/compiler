@@ -59,3 +59,12 @@ and is exercised by the first-party examples sweep.
   with a span past 10000000, or `List.repeat n x` with `n` past 10000000,
   ends in a typed `LimitExceeded` error before anything is allocated — never a
   truncated list.
+
+## `String.repeat` and padding ceilings (vs `elm/core` `String`)
+
+- **A string builder refuses an output past its ceiling.** Elm builds whatever
+  length it is asked for, until memory runs out. In Ipê, `String.repeat n s`
+  whose result passes 67108864 bytes (64 MiB of UTF-8), or `String.padLeft`,
+  `String.padRight`, or `String.pad` with a width past 16000000 characters,
+  ends in a typed `LimitExceeded` error before anything is allocated — never a
+  truncated or unpadded string.

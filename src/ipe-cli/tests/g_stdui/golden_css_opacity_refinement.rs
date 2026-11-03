@@ -39,7 +39,7 @@ fn runtime() -> PathBuf {
 fn css_opacity_refinement_emits() {
     let dir = fixture_dir();
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("css_opacity_refinement_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let rt = runtime();
     let built = crate::support::build_golden(&dir, &out, &rt);
@@ -60,7 +60,7 @@ fn css_opacity_refinement_e2e_output_matches_expected() {
 
     let dir = fixture_dir();
     let out = crate::support::scratch_root().join("ipec_css_opacity_refinement_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let rt = runtime();
     let built = crate::support::build_golden(&dir, &out, &rt);

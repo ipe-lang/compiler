@@ -6,7 +6,7 @@ cut it most and how to apply them.
 
 ## Start with `ipe health`
 
-```
+```sh
 ipe health
 ```
 
@@ -17,7 +17,7 @@ the same thing again.
 
 To apply every fix non-interactively (for provisioning or CI):
 
-```
+```sh
 ipe health --yes
 ```
 
@@ -40,7 +40,7 @@ array into `~/.cargo/config.toml` under the host target triple.
 
 **mold** is the fastest option. Install it from your package manager:
 
-```
+```sh
 # Debian / Ubuntu
 sudo apt install mold
 
@@ -71,7 +71,7 @@ in the same block.
 On Apple Silicon and Intel Macs, the system linker (`ld-prime` on recent Xcode)
 is already fast. If you want a cross-platform option, install lld via Homebrew:
 
-```
+```sh
 brew install llvm
 ```
 
@@ -113,7 +113,7 @@ matters most for:
 
 **Install:**
 
-```
+```sh
 cargo install sccache
 ```
 
@@ -212,7 +212,7 @@ reach under 5 seconds for a one-line change.
 
 Once the build is fast, `ipe dev watch` keeps it running:
 
-```
+```sh
 ipe dev watch
 ```
 

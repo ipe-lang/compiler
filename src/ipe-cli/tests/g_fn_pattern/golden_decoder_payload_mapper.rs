@@ -54,7 +54,7 @@ fn i198_ipec_accepts_and_renders_send_only_fnonce_param() {
     let golden = golden_dir(&root);
     let out =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i198_decoder_payload_mapper_ipec_out");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -100,7 +100,7 @@ fn i198_cargo_builds_and_runs() {
     let root = repo_root();
     let golden = golden_dir(&root);
     let out = crate::support::scratch_root().join("ipec_i198_decoder_payload_mapper_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

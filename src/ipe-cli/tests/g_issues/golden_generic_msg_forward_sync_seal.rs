@@ -55,7 +55,7 @@ fn generic_msg_forward_sync_bounds_emitted() {
     let root = crate::support::repo_root();
     let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_emit"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);
@@ -84,7 +84,7 @@ fn generic_msg_forward_sync_seal_builds() {
     let root = crate::support::repo_root();
     let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_e2e"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);

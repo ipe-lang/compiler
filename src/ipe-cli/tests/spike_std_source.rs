@@ -36,7 +36,7 @@ fn spike_manifest() -> PathBuf {
 #[test]
 fn spike_project_builds_and_injects_compiled_source() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("spike_std_source");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let res = ipe::build_project(&spike_manifest(), &out, &runtime());
     assert!(
@@ -76,7 +76,7 @@ fn spike_project_builds_and_injects_compiled_source() {
 #[test]
 fn hostile_std_squat_is_ipe_n0025() {
     let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("spike_hostile_squat");
-    let _ = std::fs::remove_dir_all(&root);
+    e2e_support::scratch::fresh(&root);
     let std_dir = root.join("src").join("Ipe");
     std::fs::create_dir_all(&std_dir).expect("mk hostile project dirs");
 
@@ -131,7 +131,7 @@ fn spike_e2e_runs_and_prints_hex() {
         return;
     }
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("spike_std_source_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let res = ipe::build_project(&spike_manifest(), &out, &runtime());
     assert!(res.is_ok(), "spike build must succeed: {:?}", res.err());

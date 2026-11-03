@@ -41,7 +41,7 @@ from attacker-controlled values.
 `fromString` accepts any absolute scheme, so `checkScheme` is the gate that turns
 `ftp:` / `javascript:` away — only a vetted `Url` reaches the accessors:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/url-safe-request/src/Main.ipe
 vet : String -> String
 vet raw =
     case Url.fromString raw of
@@ -75,7 +75,7 @@ allowedSchemes =
 A relative reference lives in its own type; `relative` validates it and rejects
 anything that would escape the origin:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/url-safe-request/src/Main.ipe
 triageRef : String -> String
 triageRef raw =
     case Url.relative raw of
@@ -88,7 +88,7 @@ triageRef raw =
 
 And `buildQuery` is the only assembly of a query from untrusted parts:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/url-safe-request/src/Main.ipe
 searchQuery : String
 searchQuery =
     Url.buildQuery
@@ -99,7 +99,7 @@ searchQuery =
 
 Running it (`ipe dev run`) prints:
 
-```
+```text
 parse + narrow (checkScheme):
   https://api.example.com:8443/v1/users  ->  ok scheme=https host=api.example.com port=8443
   http://example.com/search  ->  ok scheme=http host=example.com port=80

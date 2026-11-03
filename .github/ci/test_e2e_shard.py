@@ -654,7 +654,7 @@ ed = _load("e2e_disk", os.path.join(REPO, "tools", "scripts", "e2e-disk.py"))
 SHARED = "${{ github.workspace }}/.cache/oracle-shared-target"
 DISK_E2E_STEPS = [
     {"uses": "actions/checkout@v7"},
-    {"name": "free", "run": es.FREE_DISK_MARKER + "\ndocker image prune -af"},
+    {"uses": es.FREE_DISK_ACTION},
     {"uses": "actions/download-artifact@v8", "with": {"name": "nextest-archive"}},
     {"name": "unpack", "run": es.EXTRACT_RUN},
     {"name": "floor", "run": es.DISK_FLOOR_INVOCATION},
@@ -707,6 +707,17 @@ def _order_refused(mutate, needle: str) -> bool:
 
 
 class DiskOrderLintTest(unittest.TestCase):
+    def test_repo_free_disk_action_runs_the_marker(self) -> None:
+        self.assertEqual(es.free_disk_action_errors(), [])
+
+    def test_lint_refuses_a_free_disk_action_that_frees_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "action.yml")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("runs:\n  using: composite\n  steps:\n    - shell: bash\n      run: df -h /\n")
+            self.assertTrue(any("must run" in e for e in es.free_disk_action_errors(path)))
+            self.assertTrue(any("unloadable" in e for e in es.free_disk_action_errors(os.path.join(d, "missing.yml"))))
+
     def test_lint_refuses_step_order_drift(self) -> None:
         self.assertTrue(_order_refused(lambda s: s.insert(5, s.pop(4)) or s.insert(1, s.pop(4)), "out of order"))
         self.assertTrue(_order_refused(lambda s: s.insert(1, s.pop(2)), "out of order"))

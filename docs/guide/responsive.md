@@ -26,7 +26,7 @@ The example under
 [`examples/shapes/script/responsive-breakpoints`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/responsive-breakpoints/src/Main.ipe)
 classifies four representative viewport widths.
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/responsive-breakpoints/src/Main.ipe
 describe : Int -> String
 describe width =
     let
@@ -42,7 +42,7 @@ describe width =
 
 Running it (`ipe dev run`):
 
-```
+```text
 viewport width -> device class:
 375px -> phone
 768px -> tablet

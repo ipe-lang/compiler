@@ -25,7 +25,7 @@ fn scan_invisible_cycle_must_not_panic_the_driver() {
 
     let tmp =
         std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_review_scan_gap_cycle");
-    let _ = fs::remove_dir_all(&tmp);
+    e2e_support::scratch::fresh(&tmp);
     fs::create_dir_all(&tmp).expect("create scratch dir");
 
     // A project whose one program starts at `A`.

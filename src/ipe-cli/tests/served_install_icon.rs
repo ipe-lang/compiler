@@ -54,7 +54,7 @@ const ICON: &str = "assets/icon.png";
 /// A fresh output directory for `name`.
 fn scratch(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     dir
 }
 

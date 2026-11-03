@@ -47,7 +47,7 @@ fn list_filter_partial_app_compiles() {
         .join("golden")
         .join("list_filter_partial_app");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i161_list_filter_partial_app_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -63,7 +63,7 @@ fn list_filter_partial_app_compiles() {
         // `crate::support::build_and_run_emitted` wants a dedicated directory it can
         // freely rewrite the manifest of).
         let e2e_out = crate::support::scratch_root().join("ipec_i161_list_filter_partial_app_e2e");
-        let _ = std::fs::remove_dir_all(&e2e_out);
+        e2e_support::scratch::fresh(&e2e_out);
 
         let runtime = e2e_support::require_runtime().into_path_buf();
 

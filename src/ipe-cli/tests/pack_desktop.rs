@@ -114,7 +114,7 @@ fn plist_of(layout: &desktop::BundleLayout) -> String {
 fn materialise_refuses_planted_symlinks() {
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("pack_desktop_symlink_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     let victim = dir.join("victim");
     std::fs::create_dir_all(&victim).expect("victim dir");
     std::fs::write(victim.join("keep.txt"), "keep").expect("victim file");
@@ -181,7 +181,7 @@ fn linux_bundle_is_materialised_end_to_end() {
     }
 
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("pack_desktop_linux_e2e");
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     let src = dir.join("src");
     let fixture = ipe::RootFixture::main(TRIVIAL_MAIN).expect("write the project fixture");
 

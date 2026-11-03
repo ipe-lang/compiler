@@ -28,7 +28,7 @@ fn db_store_select_pipe_builds() {
     let root = repo_root();
     let golden_project = golden_dir(&root);
     let out = crate::support::scratch_root().join("ipec_db_store_select_pipe_build");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -51,7 +51,7 @@ fn db_store_select_pipe_runs() {
     let root = repo_root();
     let dir = golden_dir(&root);
     let out = crate::support::scratch_root().join("ipec_db_store_select_pipe_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&dir, &out, &runtime);

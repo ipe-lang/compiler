@@ -25,7 +25,7 @@ fn adding_two_timestamps_is_ipe_t0001() {
         .join("golden")
         .join("timestamp_add_two_ts_rejected");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("timestamp_add_two_ts_rejected_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);

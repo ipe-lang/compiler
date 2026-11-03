@@ -40,7 +40,7 @@ fn i186_false_positive_ipec_no_spurious_display() {
     let entry = project_path(&root);
     let out =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i186_display_false_positive_ipec_out");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -84,7 +84,7 @@ fn i186_false_positive_cargo_builds_and_runs() {
     let root = repo_root();
     let entry = project_path(&root);
     let out = crate::support::scratch_root().join("ipec_i186_display_false_positive_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

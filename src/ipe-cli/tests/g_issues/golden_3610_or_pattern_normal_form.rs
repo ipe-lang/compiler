@@ -86,7 +86,7 @@ const ABC: &str = "type T
 
 fn out_dir(name: &str) -> PathBuf {
     let out = crate::support::scratch_root().join(format!("ipec_3610_{name}"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     out
 }
 

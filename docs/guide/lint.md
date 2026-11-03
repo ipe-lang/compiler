@@ -70,7 +70,7 @@ every fix has landed.
 Configuration is Ipê-native. A `lint.ipe` next to your `package.ipe` declares a
 single `lint` value, built in the same builder style as the manifest (not TOML):
 
-```ipe
+```ipe ipe:skip a lint.ipe fragment: read syntactically, never evaluated, so this builder chain is not type-checked here
 module Lint exposing (lint)
 
 lint =
@@ -99,6 +99,15 @@ directly above it:
 ```ipe
 -- ipe-lint: allow adjacent-bools
 render : Bool -> Bool -> String
+render loud shout =
+    if loud then
+        "LOUD"
+
+    else if shout then
+        "shout"
+
+    else
+        "quiet"
 ```
 
 Use `-- ipe-lint: allow all` to silence every rule for that site. Suppression is

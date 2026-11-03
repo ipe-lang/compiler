@@ -49,7 +49,7 @@ fn assert_ipec_ok(fixture: &str, out_suffix: &str) {
     let root = repo_root();
     let golden_dir = root.join("tests").join("golden").join(fixture);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);
@@ -82,7 +82,7 @@ fn a1_ctor_map_bare() {
         let root = repo_root();
         let golden_dir = root.join("tests").join("golden").join("ctor_map_bare");
         let out = crate::support::scratch_root().join("ipec_i147_ctor_map_bare_e2e");
-        let _ = std::fs::remove_dir_all(&out);
+        e2e_support::scratch::fresh(&out);
 
         let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -121,7 +121,7 @@ fn a2_ctor_partial_multiarg_with_clone() {
         let root = repo_root();
         let golden_dir = root.join("tests").join("golden").join("ctor_partial");
         let out = crate::support::scratch_root().join("ipec_i147_ctor_partial_e2e");
-        let _ = std::fs::remove_dir_all(&out);
+        e2e_support::scratch::fresh(&out);
 
         let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -160,7 +160,7 @@ fn a3_ctor_stored_in_record_field() {
         let root = repo_root();
         let golden_dir = root.join("tests").join("golden").join("ctor_field");
         let out = crate::support::scratch_root().join("ipec_i147_ctor_field_e2e");
-        let _ = std::fs::remove_dir_all(&out);
+        e2e_support::scratch::fresh(&out);
 
         let runtime = e2e_support::require_runtime().into_path_buf();
 

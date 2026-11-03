@@ -36,7 +36,7 @@ fn golden_dir(fixture: &str) -> PathBuf {
 
 fn out_dir(fixture: &str) -> PathBuf {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(fixture);
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     out
 }
 
@@ -148,7 +148,7 @@ fn admitted_once_positions_build_and_run() {
     }
     let fixture = "eta_once_admitted";
     let out = crate::support::scratch_root().join("ipec_eta_once_admitted_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let built = crate::support::build_golden(
         &golden_dir(fixture),
         &out,
@@ -293,7 +293,7 @@ const SOURCE_ADMITTED_STDOUT: &str = "partial=42\na\nx\nb\ny\nz\nz\nr\n";
 fn build_source(name: &str, source: &str) -> (Result<(), CliError>, PathBuf) {
     let fixture = crate::root_fixture::main(source);
     let out = crate::support::scratch_root().join(name);
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     (crate::root_fixture::build(&fixture, &out, &runtime), out)
 }

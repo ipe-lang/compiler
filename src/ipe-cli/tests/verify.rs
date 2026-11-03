@@ -74,7 +74,7 @@ fn unformatted_project_stops_at_the_format_stage() -> TestResult {
 fn type_error_project_stops_at_the_type_check_stage() -> TestResult {
     let dir = crate::support::scratch_root()
         .join(format!("ipe_verify_type_error_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     std::fs::create_dir_all(dir.join("src"))?;
     std::fs::write(dir.join("package.ipe"), PACKAGE_IPE)?;
     std::fs::copy(fixture("type_error.ipe"), dir.join("src").join("Main.ipe"))?;
@@ -139,7 +139,7 @@ fn clean_project_passes_every_stage() -> TestResult {
     }
     let dir =
         crate::support::scratch_root().join(format!("ipe_verify_clean_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     write_project(&dir)?;
 
     let (ok, stdout, stderr) = run_ipe(&["verify", &dir.to_string_lossy()])?;
@@ -170,7 +170,7 @@ fn project_with_passing_tests_clears_the_test_stage() -> TestResult {
     // A project with src/Main.ipe + tests/Main.ipe (all tests pass).
     let dir = crate::support::scratch_root()
         .join(format!("ipe_verify_tests_pass_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     write_project(&dir)?;
     std::fs::create_dir_all(dir.join("tests"))?;
     std::fs::copy(
@@ -204,7 +204,7 @@ fn test_stage_resolves_src_modules_from_a_sibling_tests_dir() -> TestResult {
     }
     let dir =
         crate::support::scratch_root().join(format!("ipe_verify_src_tests_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     std::fs::create_dir_all(dir.join("src").join("Lib"))?;
     std::fs::create_dir_all(dir.join("tests"))?;
     std::fs::write(dir.join("package.ipe"), PACKAGE_IPE)?;
@@ -253,7 +253,7 @@ fn project_with_failing_tests_fails_the_test_stage() -> TestResult {
     }
     let dir = crate::support::scratch_root()
         .join(format!("ipe_verify_tests_fail_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     write_project(&dir)?;
     std::fs::create_dir_all(dir.join("tests"))?;
     std::fs::copy(

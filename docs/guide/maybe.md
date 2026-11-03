@@ -37,7 +37,7 @@ pipeline. If any link is absent — an unknown user, a settings row that isn't
 there, a row with no theme — the whole chain is `Nothing` and the later hops
 never run:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/maybe-settings-lookup/src/Main.ipe
 lookupTheme : String -> Maybe String
 lookupTheme userId =
     Dict.get userId userSettings
@@ -49,7 +49,7 @@ The report line shows `map` and `withDefault` finishing the job: `map` decorates
 a present theme, and `withDefault` supplies the fallback for every absent case at
 once:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/maybe-settings-lookup/src/Main.ipe
 describe : String -> String
 describe userId =
     let
@@ -64,7 +64,7 @@ describe userId =
 Running it (`ipe dev run`) over four users prints — one resolves, three miss at three
 *different* links, and all three land on the same fallback:
 
-```
+```text
 u1: theme=dark
 u2: no theme set, using system
 u3: no theme set, using system

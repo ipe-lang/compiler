@@ -105,7 +105,7 @@ fn ffi_fixture(main_ipe: &str) -> RootFixture {
 /// A fresh scratch directory `name` for files that sit outside the project.
 fn scratch(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     dir
 }
 
@@ -170,7 +170,7 @@ fn rust_fn_resolves_without_import_rust_ffi() {
 
     let fixture = ffi_fixture(main_no_ffi_import);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_rust_fn_no_ffi_import_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!(
@@ -195,7 +195,7 @@ fn rust_fn_emits_the_shared_exact_carrier_shim() {
 
     let fixture = ffi_fixture(MAIN_IPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_rust_fn_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!("rust-fn fixture must build, got: {err}")
@@ -256,7 +256,7 @@ fn a_clamp_requiring_rust_fn_is_refused() {
         \x20       Err _ -> Io.println \"err\"\n";
     let fixture = ffi_fixture(main);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_rust_fn_clamp_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let err = ipe::build_fixture(&fixture, &out, &runtime)
         .expect_err("a clamp-requiring native binding must be refused");
     let msg = err.to_string();
@@ -284,7 +284,7 @@ fn a_malformed_rust_fn_is_refused() {
         \x20       Err _ -> Io.println \"err\"\n";
     let fixture = ffi_fixture(main);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_rust_fn_malformed_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let err = ipe::build_fixture(&fixture, &out, &runtime)
         .expect_err("a one-literal Rust.fn must be refused");
     let msg = err.to_string();
@@ -312,7 +312,7 @@ fn a_rust_fn_on_an_uninstalled_crate_is_refused() {
         \x20       Err _ -> Io.println \"err\"\n";
     let fixture = ffi_fixture(main);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_rust_fn_uninstalled_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let err = ipe::build_fixture(&fixture, &out, &runtime)
         .expect_err("a Rust.fn on an uninstalled crate must be refused");
     let msg = err.to_string();
@@ -336,7 +336,7 @@ fn rust_fn_emitted_crate_builds_and_runs() {
 
     let fixture = ffi_fixture(MAIN_IPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_rust_fn_e2e_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!("rust-fn fixture must build, got: {err}")
     }
