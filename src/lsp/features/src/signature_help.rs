@@ -46,10 +46,8 @@ pub fn signature_help(
 ) -> Option<SignatureHelp> {
     let files = root.files(db);
     let &file = files.get(module)?;
-    let canonical = crate::db_access::canonicalize_checked(db, root, entry, file)?;
-    let types = ipe_db::typecheck_module(db, root, entry, file)
-        .as_ref()
-        .ok()?;
+    let canonical = crate::db_access::analysis(db, root, entry, file)?.canonical;
+    let types = crate::db_access::module_types(db, root, entry, file)?;
 
     // Find the innermost Call(…, …) containing `byte` — any callee kind.
     let (callee_span, callee_name_sym, active_param) = find_call_at(&canonical.module, byte)?;
@@ -72,7 +70,10 @@ pub fn signature_help(
     // callee resolves nothing — the signature then carries no doc (fail-closed).
     let signature_doc: Option<String> = docs.and_then(|index| {
         let resolved = crate::navigation::resolve_name_at(db, root, entry, module, callee_span.lo)?;
-        crate::docs_lookup::symbol_doc(index, &resolved.module, &resolved.name)
+        let crate::navigation::NameTarget::Declared { module, name } = resolved.target else {
+            return None;
+        };
+        crate::docs_lookup::symbol_doc(index, &module, &name)
     });
 
     // Render signature and parameters.
@@ -133,6 +134,10 @@ fn fn_params(ty: &Ty) -> Vec<Ty> {
     params
 }
 
+/// One candidate call: its span width, callee span, callee name, and active
+/// argument index.
+type CallHit = (u32, Span, Option<Symbol>, usize);
+
 /// Walk the canonical module's defs looking for the innermost `Call(f, args)`
 /// node whose span contains `byte`, for ANY callee kind.
 ///
@@ -144,8 +149,7 @@ fn find_call_at(
     module: &ipe_canon::ast::Module,
     byte: u32,
 ) -> Option<(Span, Option<Symbol>, usize)> {
-    // (span_width, callee_span, name_sym, active_arg)
-    let mut best: Option<(u32, Span, Option<Symbol>, usize)> = None;
+    let mut best: Option<CallHit> = None;
 
     for def in &module.defs {
         let body = match def {
@@ -165,39 +169,55 @@ const fn callee_name(f: &Located<Expr_>) -> Option<Symbol> {
         | Expr_::VarLocal(name)
         | Expr_::VarCtor { name, .. }
         | Expr_::VarKernel { name, .. } => Some(*name),
-        _ => None,
+        Expr_::Int(_)
+        | Expr_::Float(_)
+        | Expr_::Str(_)
+        | Expr_::Char(_)
+        | Expr_::CustomElementCtor(_)
+        | Expr_::Unit
+        | Expr_::Call(..)
+        | Expr_::ForeignCall { .. }
+        | Expr_::Case(..)
+        | Expr_::Lambda(..)
+        | Expr_::Binop { .. }
+        | Expr_::Let(..)
+        | Expr_::If(..)
+        | Expr_::Tuple(_)
+        | Expr_::List(_)
+        | Expr_::Cons(..)
+        | Expr_::Record(_)
+        | Expr_::Access(..)
+        | Expr_::Update(..) => None,
     }
 }
 
-fn walk_call(
-    expr: &Located<Expr_>,
-    byte: u32,
-    best: &mut Option<(u32, Span, Option<Symbol>, usize)>,
-) {
-    if !(expr.span.lo <= byte && byte < expr.span.hi) {
-        return;
-    }
-
-    if let Expr_::Call(f, args) = &expr.value {
-        // Count how many arguments are fully before the cursor.
-        let active = args.iter().take_while(|a| a.span.hi <= byte).count();
-
-        // Record this call regardless of callee kind — the region map covers all.
-        let width = expr.span.hi.saturating_sub(expr.span.lo);
-        if best.as_ref().is_none_or(|&(w, _, _, _)| width < w) {
-            *best = Some((width, f.span, callee_name(f), active));
-        }
-
-        walk_call(f, byte, best);
-        for arg in args {
-            walk_call(arg, byte, best);
-        }
-        return; // sub-expressions handled above
-    }
-
-    // Recurse for all other compound expressions.
+/// Visit every call in `expr`, keeping the innermost one containing `byte`.
+///
+/// The walk never prunes on a node's span: a desugar (a `do` block's chain of
+/// binds) builds nodes whose spans do not nest inside their parent's, so a
+/// pruning walk would skip calls the cursor is on. Every variant is named, so
+/// a new expression form cannot be silently skipped.
+fn walk_call(expr: &Located<Expr_>, byte: u32, best: &mut Option<CallHit>) {
     match &expr.value {
-        Expr_::Lambda(_, body) => walk_call(body, byte, best),
+        Expr_::Call(f, args) => {
+            if expr.span.lo <= byte && byte < expr.span.hi {
+                let active = args.iter().take_while(|a| a.span.hi <= byte).count();
+                let width = expr.span.hi.saturating_sub(expr.span.lo);
+                if best.as_ref().is_none_or(|&(w, _, _, _)| width < w) {
+                    *best = Some((width, f.span, callee_name(f), active));
+                }
+            }
+            walk_call(f, byte, best);
+            for arg in args {
+                walk_call(arg, byte, best);
+            }
+        }
+        Expr_::ForeignCall { args, .. } | Expr_::Tuple(args) | Expr_::List(args) => {
+            for arg in args {
+                walk_call(arg, byte, best);
+            }
+        }
+        Expr_::Lambda(_, body) | Expr_::Access(body, _) => walk_call(body, byte, best),
         Expr_::Let(bindings, body) => {
             for b in bindings {
                 walk_call(&b.body, byte, best);
@@ -210,7 +230,7 @@ fn walk_call(
                 walk_call(&branch.body, byte, best);
             }
         }
-        Expr_::Binop { lhs, rhs, .. } => {
+        Expr_::Binop { lhs, rhs, .. } | Expr_::Cons(lhs, rhs) => {
             walk_call(lhs, byte, best);
             walk_call(rhs, byte, best);
         }
@@ -221,28 +241,27 @@ fn walk_call(
             }
             walk_call(else_expr, byte, best);
         }
-        Expr_::Tuple(elems) | Expr_::List(elems) => {
-            for e in elems {
-                walk_call(e, byte, best);
-            }
-        }
-        Expr_::Cons(h, t) => {
-            walk_call(h, byte, best);
-            walk_call(t, byte, best);
-        }
         Expr_::Record(fields) => {
             for (_, v) in fields {
                 walk_call(v, byte, best);
             }
         }
-        Expr_::Access(rec, _) => walk_call(rec, byte, best),
         Expr_::Update(base, fields) => {
             walk_call(base, byte, best);
             for (_, v) in fields {
                 walk_call(v, byte, best);
             }
         }
-        _ => {}
+        Expr_::VarLocal(_)
+        | Expr_::VarTopLevel { .. }
+        | Expr_::VarKernel { .. }
+        | Expr_::VarCtor { .. }
+        | Expr_::Int(_)
+        | Expr_::Float(_)
+        | Expr_::Str(_)
+        | Expr_::Char(_)
+        | Expr_::CustomElementCtor(_)
+        | Expr_::Unit => {}
     }
 }
 

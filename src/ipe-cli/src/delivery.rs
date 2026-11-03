@@ -228,8 +228,9 @@ pub enum Host {
     #[default]
     Default,
     /// `desktop`. Under `served` it is **webview-native** (the diff/patch
-    /// pipeline over a local IPC bridge); under `client` it is **webview-wasm**
-    /// (the self-contained client wrapped in a `wry` shell).
+    /// pipeline over a local IPC bridge). Under `client` the delivery resolves,
+    /// but no packer builds it, so every build of it is refused
+    /// ([`DeliveryError::ClientDesktopHasNoPacker`]).
     Desktop,
     /// `ios` — a wasm client in `WKWebView` plus a native shell. `client` only.
     Ios,
@@ -800,6 +801,21 @@ pub enum DeliveryError {
         /// The app-bundle delivery.
         delivery: Delivery,
     },
+    /// `ipe dev watch` was handed a `client` delivery.
+    ///
+    /// The watch loop rebuilds and restarts a served program; a browser bundle
+    /// has no server to restart, so the delivery is refused rather than watched
+    /// as the served shape.
+    WatchServesOnly {
+        /// The `client` delivery.
+        delivery: Delivery,
+    },
+    /// A `web client desktop` delivery was asked to build.
+    ///
+    /// No packer wraps the self-contained client in a desktop shell, so the
+    /// delivery is refused rather than built as another one with its `client`
+    /// word dropped.
+    ClientDesktopHasNoPacker,
     /// A runtime (`client`) or host (`desktop`/`ios`/`android`) token was given
     /// more than once. Each axis accepts exactly one value; a second token on
     /// the same axis is a conflict, not a last-wins override.
@@ -985,6 +1001,12 @@ impl fmt::Display for DeliveryError {
                     delivery,
                     &delivery.host().word().unwrap_or_default(),
                 ))
+            }
+            Self::WatchServesOnly { delivery } => {
+                f.write_str(&text::delivery_watch_serves_only(delivery))
+            }
+            Self::ClientDesktopHasNoPacker => {
+                f.write_str(text::delivery_client_desktop_has_no_packer())
             }
             Self::DuplicateToken { kind, got } => {
                 f.write_str(&text::delivery_duplicate_token(kind, got))
@@ -1339,6 +1361,10 @@ mod tests {
                 delivery: Delivery::resolve(Shape::Web, Some(Runtime::Client), Host::Android)
                     .unwrap(),
             },
+            DeliveryError::WatchServesOnly {
+                delivery: Delivery::web_client(),
+            },
+            DeliveryError::ClientDesktopHasNoPacker,
         ];
         for c in &cases {
             assert!(c.to_string().len() > 40, "a refusal is a lesson: {c}");

@@ -523,7 +523,18 @@ impl LinkableTargetDir {
 #[must_use]
 pub fn user_cache_target(cache_base: &Path, crate_dir: &Path) -> PathBuf {
     let canonical = std::fs::canonicalize(crate_dir).unwrap_or_else(|_| crate_dir.to_path_buf());
-    let digest = ipe_backend_rust::identity_hex(&canonical);
+    user_cache_target_as_spelled(cache_base, &canonical)
+}
+
+/// [`user_cache_target`] keyed by `crate_dir` exactly as spelled, no link
+/// followed.
+///
+/// For a caller that spells the crate path from a canonical root through
+/// names it read without following a link: a link planted at the crate path
+/// then names this path's own key, never the key of the crate it points at.
+#[must_use]
+pub fn user_cache_target_as_spelled(cache_base: &Path, crate_dir: &Path) -> PathBuf {
+    let digest = ipe_backend_rust::identity_hex(crate_dir);
     let key = digest.get(..USER_CACHE_KEY_LEN).unwrap_or(&digest);
     user_cache_root(cache_base).join(key)
 }

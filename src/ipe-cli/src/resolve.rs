@@ -9,9 +9,8 @@
 //! (the exact pins) and in `package.ipe`'s `dependencies` block (the requirement)
 //! — and the resolved version and its capability set printed for consent.
 //!
-//! The `{git=}` / `{path=}` escapes ([`resolve_escape`]) bypass the index by
-//! design but still carry lockfile integrity: the fetched (or copied) tree is
-//! hashed and that hash is locked, so a later build re-verifies the same source.
+//! A locked `git` origin is cached under its pinned commit and held to its
+//! locked hash like an index pin ([`verify_locked_hashes`]).
 //!
 //! Verify-before-trust is the security boundary: a content-hash mismatch is a
 //! hard [`CliError::HashMismatch`], never a warning — the fetched bytes are not
@@ -22,13 +21,9 @@ use std::path::{Path, PathBuf};
 use ipe_ir::Capability;
 
 use crate::CliError;
-use crate::index::{
-    self, CommitId, EntryVersion, PinnedRev, RequestedRev, RevMismatch, Sha256Hex, SourceUrl,
-    check_served,
-};
-use crate::lockfile::{LocalSource, LockedDep, LockedOrigin, Lockfile};
+use crate::index::{self, EntryVersion, PinnedRev, Sha256Hex, SourceUrl};
+use crate::lockfile::{LockedDep, LockedOrigin, Lockfile};
 use crate::package_name::PackageName;
-use crate::project::IpeDep;
 use crate::published_version::PublishedVersion;
 use crate::remote_ingest::{
     self, Captured, ChildStderr, FetchBudget, Git, IngestLimit, RefsCeiling, RunError, Transfer,
@@ -151,181 +146,6 @@ fn resolve_and_add_within(
     write_records(project_root, name, &locked, req)?;
 
     report_added(name, &version.version.to_string(), &version.capabilities);
-    Ok(())
-}
-
-/// Resolve one of the `{git=}` / `{path=}` escapes and record it.
-///
-/// Fetch (git) or copy (path) the source into the package cache, hash the tree,
-/// and lock that hash. The escape bypasses the index but still carries lockfile
-/// integrity.
-///
-/// The manifest is not rewritten here — the escape is already spelled in
-/// `[dependencies]` by the author; this locks what it points at.
-///
-/// # Errors
-/// [`CliError::Resolve`] if a `git` fetch fails or a path source is missing;
-/// [`CliError::RemoteIngestExceeded`] when a `git` fetch crosses its transfer
-/// ceiling; [`CliError::LocalLimitExceeded`] when the tree crosses its tree
-/// ceiling or holds a refused entry; [`CliError::Io`] on a filesystem failure.
-pub fn resolve_escape(project_root: &Path, name: &str, dep: &IpeDep) -> Result<(), CliError> {
-    resolve_escape_within(project_root, name, dep, &remote_ingest::PACKAGE_SOURCE)
-}
-
-/// The lockable origin and directory of a path dependency on `path`.
-///
-/// The typed location exists before the first filesystem touch: a network
-/// share or a device is refused here, never opened.
-fn path_origin(
-    project_root: &Path,
-    name: &str,
-    package_name: &PackageName,
-    path: &Path,
-) -> Result<(LockedOrigin, PathBuf), CliError> {
-    path_origin_in(project_root, name, package_name, path, ipe_path_core::HOST)
-}
-
-/// [`path_origin`] with the device-element rule read under `regime`.
-fn path_origin_in(
-    project_root: &Path,
-    name: &str,
-    package_name: &PackageName,
-    path: &Path,
-    regime: ipe_path_core::Regime,
-) -> Result<(LockedOrigin, PathBuf), CliError> {
-    let source = LocalSource::from_path(package_name, path)?;
-    if source.opens_a_device(regime) {
-        return Err(crate::lockfile::LockRefusal::DeviceLocalSource {
-            package: package_name.clone(),
-            raw: source.as_str().to_owned(),
-        }
-        .into());
-    }
-    let resolved = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        project_root.join(path)
-    };
-    if !resolved.is_dir() {
-        return Err(CliError::Resolve(
-            crate::text::msg::resolve_path_dep_missing(&name, &resolved.display()),
-        ));
-    }
-    Ok((LockedOrigin::Path { source }, resolved))
-}
-
-/// [`resolve_escape`] with a `git` fetch and the tree hash held to `budget`.
-fn resolve_escape_within(
-    project_root: &Path,
-    name: &str,
-    dep: &IpeDep,
-    budget: &FetchBudget,
-) -> Result<(), CliError> {
-    // Parse-don't-validate: gate the name into a safe path component here, at the
-    // boundary, before it reaches any cache-directory join.
-    let package_name = PackageName::parse(name)?;
-    let (origin, checkout, fetched) = match dep {
-        IpeDep::Git { url, rev } => {
-            // Parse-don't-validate: convert the raw manifest strings to typed
-            // newtypes at this escape-path boundary before they reach the git
-            // sink, so the sink cannot be called with an unvalidated value.
-            let typed_url = SourceUrl::parse(&package_name, url)?;
-            // The requested ref (may be a branch or HEAD) is injection-gated
-            // here but not yet an immutable pin.
-            let raw_rev = rev.as_deref().unwrap_or("HEAD");
-            let requested = CommitId::parse(&package_name, raw_rev)?;
-            // Classify the request's shape once, from the already
-            // injection-validated `CommitId` — never re-parse the raw string.
-            let shape = RequestedRev::classify(&package_name, &requested)?;
-            // Fetch into the escape's fetch slot; the pin is the commit the
-            // checkout holds, read from it after the fetch.
-            let (fetched, commit) = fetch_git_requested(
-                project_root,
-                &package_name,
-                &typed_url,
-                &requested,
-                &shape,
-                budget,
-            )?;
-            let pinned = commit.into_pin();
-            match check_served(&shape, &pinned) {
-                None => {}
-                Some(RevMismatch::Different { requested, served }) => {
-                    return Err(CliError::Resolve(
-                        crate::text::msg::index_rev_served_mismatch(
-                            &package_name,
-                            &requested,
-                            &served,
-                        ),
-                    ));
-                }
-                Some(RevMismatch::ShadowedAbbrev { requested, served }) => {
-                    // A same-shaped ref shadowed the abbreviation. The checkout
-                    // still succeeded and is what gets locked — warn, don't
-                    // refuse, per the maintainer-resolved override for this
-                    // specific ambiguity.
-                    let mut screen = crate::screen::Screen::new(crate::screen::Stream::Stderr);
-                    let warning = crate::style::escape_abbrev_shadowed_warning(
-                        screen.palette(),
-                        package_name.as_str(),
-                        &requested,
-                        served.as_str(),
-                    );
-                    screen.guttered(&warning).emit();
-                }
-            }
-            // Re-key the cache dir by the immutable SHA so fetch and verify
-            // share the same key regardless of what ref was requested.
-            let final_dest = cache_dir(project_root, &package_name, CacheSlot::Escape(&pinned));
-            if final_dest.exists() {
-                std::fs::remove_dir_all(&final_dest).map_err(|e| CliError::Io {
-                    path: final_dest.clone(),
-                    source: e,
-                })?;
-            }
-            std::fs::rename(fetched.path(), &final_dest).map_err(|e| CliError::Io {
-                path: fetched.path().to_path_buf(),
-                source: e,
-            })?;
-            fetched.keep();
-            let fetched = UnverifiedCheckout::new(final_dest.clone());
-            (
-                LockedOrigin::Git {
-                    source: typed_url,
-                    rev: pinned,
-                },
-                final_dest,
-                Some(fetched),
-            )
-        }
-        IpeDep::Path(path) => {
-            let (origin, resolved) = path_origin(project_root, name, &package_name, path)?;
-            // The author's own directory: never removed on a failure.
-            (origin, resolved, None)
-        }
-        IpeDep::Index(_) => {
-            return Err(CliError::Resolve(
-                crate::text::msg::resolve_index_dep_escape(&name),
-            ));
-        }
-    };
-
-    let sha256 = hash_checkout(&checkout, budget.tree()).map_err(naming(&package_name))?;
-    if let Some(fetched) = fetched {
-        fetched.keep();
-    }
-    // An escape has no published version; `0.0.0` marks "locked from an escape,
-    // not the index" without inventing a version the source does not claim.
-    let version = PublishedVersion::new(0, 0, 0);
-    let locked = LockedDep {
-        name: package_name,
-        version,
-        origin,
-        sha256,
-    };
-    let mut lock = Lockfile::read(project_root)?;
-    lock.upsert(locked);
-    lock.write(project_root)?;
     Ok(())
 }
 
@@ -544,22 +364,18 @@ fn manifest_path(project_root: &Path) -> PathBuf {
 enum CacheSlot<'a> {
     /// An index version, keyed by its published version.
     Index(&'a PublishedVersion),
-    /// A git escape, keyed by the commit it resolved to.
+    /// A locked git origin, keyed by its pinned commit.
     Escape(&'a PinnedRev),
-    /// A git escape being fetched, before the commit it names is known.
-    EscapeFetch,
 }
 
 /// The package cache directory of `slot` for `name` under the project's
 /// `.ipe/packages/` tree.
 ///
 /// The single SSOT for the cache key — the fetch path and the verify path both
-/// call this, so they can never key by different values. The three slot shapes
+/// call this, so they can never key by different values. The two slot shapes
 /// never overlap: an index slot is `{name}-{version}`, and a package name never
 /// starts with `.`, while an escape slot is `.git-{name}-{sha}` (a fixed-length
-/// hex commit) and a fetch slot is `.fetch-{name}`. A requested ref never
-/// reaches the path, so an escape pinned to a ref spelled like a version cannot
-/// land in (or remove) that version's index slot.
+/// hex commit), so a git origin cannot land in (or remove) an index slot.
 ///
 /// Takes a validated [`PackageName`] so the name is a single, non-traversing
 /// path component by construction — an unvalidated string cannot reach this
@@ -568,7 +384,6 @@ fn cache_dir(project_root: &Path, name: &PackageName, slot: CacheSlot<'_>) -> Pa
     let key = match slot {
         CacheSlot::Index(version) => format!("{}-{version}", name.as_str()),
         CacheSlot::Escape(pinned) => format!(".git-{}-{}", name.as_str(), pinned.as_str()),
-        CacheSlot::EscapeFetch => format!(".fetch-{}", name.as_str()),
     };
     project_root
         .join(crate::output_dir::CACHE_NAMESPACE_DIR)
@@ -651,126 +466,71 @@ fn fetch_source(
         &dest,
         budget,
     )
-    .map(|(checkout, _)| checkout)
     .map_err(naming(name))
 }
 
-/// Fetch a git escape's source at the requested ref into the escape's fetch
-/// slot under `budget`.
-///
-/// The returned checkout holds the checked-out tree, and the commit it holds is
-/// the pin the caller records before renaming the directory to its SHA-keyed
-/// final location.
-fn fetch_git_requested(
-    project_root: &Path,
-    name: &PackageName,
-    url: &SourceUrl,
-    requested: &CommitId,
-    shape: &RequestedRev,
-    budget: &FetchBudget,
-) -> Result<(UnverifiedCheckout, CheckedOutCommit), CliError> {
-    let dest = cache_dir(project_root, name, CacheSlot::EscapeFetch);
-    let wanted = Wanted::of_request(requested, shape);
-    fetch_git_into(name, url, &wanted, &dest, budget).map_err(naming(name))
-}
-
-/// What a fetch asks the server for.
+/// What a fetch asks the server for: one full commit SHA.
 ///
 /// A full commit SHA names exactly one commit, and only that commit satisfies
-/// the fetch: no advertised ref, whatever its name, stands in for it. Any
-/// other spelling names a ref (or an abbreviated SHA) the server resolves.
+/// the fetch: no advertised ref, whatever its name, stands in for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Wanted<'a> {
-    /// A full commit SHA.
-    Commit(PinnedRev),
-    /// A ref name or an abbreviated SHA — never a full SHA.
-    Name(&'a CommitId),
-}
+struct Wanted(PinnedRev);
 
-impl<'a> Wanted<'a> {
+impl Wanted {
     /// A fetch of the pinned commit `rev`.
     fn of_commit(rev: &PinnedRev) -> Self {
-        Self::Commit(rev.clone())
+        Self(rev.clone())
     }
 
-    /// A fetch of what the author requested, by its classified `shape`: a full
-    /// SHA is a [`Wanted::Commit`], anything else a [`Wanted::Name`].
-    fn of_request(requested: &'a CommitId, shape: &RequestedRev) -> Self {
-        match shape {
-            RequestedRev::FullSha(sha) => Self::Commit(sha.clone()),
-            RequestedRev::Head | RequestedRev::AbbrevHex(_) | RequestedRev::Name(_) => {
-                Self::Name(requested)
-            }
-        }
-    }
-
-    /// The spelling passed to git — safe in argv, since both a [`PinnedRev`]
-    /// and a [`CommitId`] never begin with `-`.
+    /// The spelling passed to git, also what is checked out once fetched:
+    /// safe in argv, since a [`PinnedRev`] never begins with `-`, and a
+    /// fetched tip that is not this commit fails closed at checkout.
     fn as_str(&self) -> &str {
-        match self {
-            Self::Commit(sha) => sha.as_str(),
-            Self::Name(name) => name.as_str(),
-        }
+        self.0.as_str()
     }
 
-    /// What to check out once a single ref's tip was fetched: a commit by its
-    /// SHA, so a tip that is not it fails closed; a name by `FETCH_HEAD`.
-    fn fetched_tip(&self) -> &str {
-        match self {
-            Self::Commit(sha) => sha.as_str(),
-            Self::Name(_) => "FETCH_HEAD",
-        }
-    }
-}
-
-/// The commit a fetch left checked out, read from `HEAD` after the checkout.
-///
-/// This is the only source of a recorded pin: the pin is what the tree on disk
-/// is, never what the server's advertisement said it would be.
-#[derive(Debug)]
-struct CheckedOutCommit(PinnedRev);
-
-impl CheckedOutCommit {
     /// Read the commit checked out in `dest` as a step of `transfer`, and
-    /// [`check`](Self::check) it against `wanted`.
-    fn read(
+    /// [`check`](Self::check) it.
+    ///
+    /// What is judged is the tree on disk, never what the server's
+    /// advertisement said it would be.
+    fn check_checked_out(
+        &self,
         name: &PackageName,
-        wanted: &Wanted<'_>,
         dest: &Path,
         transfer: &Transfer,
-    ) -> Result<Self, CliError> {
+    ) -> Result<(), CliError> {
         let args = ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"];
         let head =
             git_step(&args, dest, transfer).map_err(|failed| failed.into_cli(name, &args))?;
-        let served = PinnedRev::from_full_sha(name, String::from_utf8_lossy(&head.stdout).trim())?;
-        Self::check(name, wanted, served)
+        let served = PinnedRev::from_full_sha(
+            name,
+            String::from_utf8_lossy(&head.stdout).trim(),
+            crate::index::RevSite::GitHead,
+        )?;
+        self.check(name, &served)
     }
 
-    /// Accept `served` as the fetch of `wanted`: a requested commit must be
-    /// exactly the commit served, and a requested name is whatever it served.
-    fn check(name: &PackageName, wanted: &Wanted<'_>, served: PinnedRev) -> Result<Self, CliError> {
-        match wanted {
-            Wanted::Commit(requested) if *requested != served => Err(CliError::Resolve(
-                crate::text::msg::resolve_fetched_commit_mismatch(name, requested, &served),
-            )),
-            Wanted::Commit(_) | Wanted::Name(_) => Ok(Self(served)),
+    /// Accept `served` as the fetch of this commit only when it is exactly it.
+    fn check(&self, name: &PackageName, served: &PinnedRev) -> Result<(), CliError> {
+        if self.0 == *served {
+            Ok(())
+        } else {
+            Err(CliError::Resolve(
+                crate::text::msg::resolve_fetched_commit_mismatch(name, &self.0, served),
+            ))
         }
-    }
-
-    /// The commit, as the pin to record.
-    fn into_pin(self) -> PinnedRev {
-        self.0
     }
 }
 
 /// Clone `url` into `dest` and check out exactly `wanted`, returning the
-/// checkout and the commit it holds. A pre-existing `dest` is removed first so
+/// checkout. A pre-existing `dest` is removed first so
 /// a re-add always fetches fresh.
 ///
 /// `url` is a [`SourceUrl`] newtype — a raw unvalidated string cannot reach
-/// this function — and `wanted` is built only from a [`CommitId`] or a
-/// [`PinnedRev`], both of which never begin with `-`, so its spelling is safe
-/// to pass to `git checkout` without `--`.
+/// this function — and `wanted` is built only from a [`PinnedRev`], which
+/// never begins with `-`, so its spelling is safe to pass to `git checkout`
+/// without `--`.
 ///
 /// Defense-in-depth: [`Git::isolated`] restricts transports to the
 /// [`Transport`](crate::index::Transport) set even if a value somehow bypassed
@@ -785,10 +545,10 @@ impl CheckedOutCommit {
 fn fetch_git_into(
     name: &PackageName,
     url: &SourceUrl,
-    wanted: &Wanted<'_>,
+    wanted: &Wanted,
     dest: &Path,
     budget: &FetchBudget,
-) -> Result<(UnverifiedCheckout, CheckedOutCommit), CliError> {
+) -> Result<UnverifiedCheckout, CliError> {
     let checkout = UnverifiedCheckout::new(dest.to_path_buf());
     let transfer = Transfer::begin(*budget.transfer());
     stage_origin(name, url, dest, &transfer)?;
@@ -815,7 +575,7 @@ fn fetch_git_into(
         Ok(_) => {
             run_git(
                 name,
-                &["checkout", "--quiet", wanted.fetched_tip()],
+                &["checkout", "--quiet", wanted.as_str()],
                 dest,
                 &transfer,
             )?;
@@ -825,8 +585,8 @@ fn fetch_git_into(
         }
         Err(failed) => return Err(failed.into_cli(name, &exact)),
     }
-    let commit = CheckedOutCommit::read(name, wanted, dest, &transfer)?;
-    Ok((checkout, commit))
+    wanted.check_checked_out(name, dest, &transfer)?;
+    Ok(checkout)
 }
 
 /// Make `dest` an empty repository whose `origin` is `url`, as the first steps
@@ -864,14 +624,13 @@ fn stage_origin(
 /// The server's tag and branch advertisement is read first under `refs`, as a
 /// step of `transfer` whose output is capped at `refs.bytes()`; a longer or
 /// malformed advertisement refuses the fetch before any object arrives. When
-/// an advertised ref matches `wanted` — a requested commit by its tip (the
-/// peeled commit of an annotated tag) only, a requested name by its name only
-/// — that ref alone is fetched, at depth 1. Only a `wanted` reachable solely
-/// through history fetches every tag and branch, still under `transfer`'s
-/// disk, entry and wall ceilings.
+/// an advertised ref's tip (the peeled commit of an annotated tag) is
+/// `wanted`, never when only its name is, that ref alone is fetched at depth
+/// one. Only a `wanted` reachable solely through history fetches every tag
+/// and branch, still under `transfer`'s disk, entry and wall ceilings.
 fn fetch_advertised(
     name: &PackageName,
-    wanted: &Wanted<'_>,
+    wanted: &Wanted,
     dest: &Path,
     transfer: &Transfer,
     refs: &RefsCeiling,
@@ -883,13 +642,8 @@ fn fetch_advertised(
         .map_err(|limit| CliError::RemoteIngestExceeded(transfer.refusal(limit)))?;
     let tip = advertised
         .iter()
-        .filter_map(|advert| {
-            advert
-                .matches(wanted)
-                .map(|rank| (rank, advert.name.as_str()))
-        })
-        .min_by_key(|(rank, _)| *rank)
-        .map(|(_, tip)| tip);
+        .find(|advert| advert.sha == wanted.0)
+        .map(|advert| advert.name.as_str());
     if let Some(tip) = tip {
         let fetch = [
             "fetch",
@@ -904,7 +658,7 @@ fn fetch_advertised(
         run_git(name, &fetch, dest, transfer)?;
         return run_git(
             name,
-            &["checkout", "--quiet", wanted.fetched_tip()],
+            &["checkout", "--quiet", wanted.as_str()],
             dest,
             transfer,
         );
@@ -980,20 +734,6 @@ enum Advertised {
     Unmatchable,
 }
 
-/// How an advertised ref matches what a fetch wants, strongest first — git's
-/// own order for resolving a short name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum TipMatch {
-    /// The requested name is the ref's full name.
-    FullName,
-    /// The requested name is the tag's short name.
-    Tag,
-    /// The requested name is the branch's short name.
-    Branch,
-    /// The ref's tip is the requested commit.
-    Commit,
-}
-
 impl AdvertisedRef {
     /// Parse `<sha>\t<ref>`, where a peeled `<ref>^{}` is accepted on a tag
     /// only; `None` when the line is malformed.
@@ -1013,24 +753,6 @@ impl AdvertisedRef {
             sha,
             name: RefName::parse(name)?,
         }))
-    }
-
-    /// How this ref matches `wanted`, if it does. A requested commit matches
-    /// only by the ref's tip, never by its name, so a ref named like a SHA
-    /// cannot stand in for that commit.
-    fn matches(&self, wanted: &Wanted<'_>) -> Option<TipMatch> {
-        let name = self.name.as_str();
-        match *wanted {
-            Wanted::Commit(ref sha) => (self.sha == *sha).then_some(TipMatch::Commit),
-            Wanted::Name(rev) if name == rev.as_str() => Some(TipMatch::FullName),
-            Wanted::Name(rev) if name.strip_prefix(RefName::TAGS) == Some(rev.as_str()) => {
-                Some(TipMatch::Tag)
-            }
-            Wanted::Name(rev) if name.strip_prefix(RefName::HEADS) == Some(rev.as_str()) => {
-                Some(TipMatch::Branch)
-            }
-            Wanted::Name(_) => None,
-        }
     }
 }
 
@@ -1235,9 +957,8 @@ fn write_records(
     // that collides with an author-written escape is refused), and doing it
     // before the lockfile keeps the two files consistent — a refusal leaves
     // BOTH untouched rather than a lockfile pin with no manifest requirement.
-    // Only an INDEX requirement is written into the manifest: an escape
-    // (`{git=}`/`{path=}`) is author-written and lockfile-only by design, so
-    // `resolve_escape` never routes through here.
+    // Only an INDEX requirement is written into the manifest: a `depGit` or
+    // `depPath` entry is author-written, never recorded here.
     crate::package_manifest::upsert_index_dependency(&manifest_path(project_root), name, req)?;
     let mut lock = Lockfile::read(project_root)?;
     lock.upsert(locked.clone());
@@ -1294,19 +1015,16 @@ fn has_lock_suffix(component: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CacheSlot, CheckedOutCommit, GitStepError, INDEX_DIR_ENV, Wanted, added_report,
-        cache_base_from, cache_dir, dep_cache_dir, fetch_advertised,
-        fetch_and_verify_index_version_within, fetch_git_into, hash_checkout, hash_source_tree,
-        index_root_from, parse_advertisement, resolve_and_add_within, resolve_and_remove,
-        resolve_escape, resolve_escape_within, stage_origin, verify_hash, verify_lockfile_hashes,
+        CacheSlot, GitStepError, INDEX_DIR_ENV, Wanted, added_report, cache_base_from, cache_dir,
+        dep_cache_dir, fetch_advertised, fetch_and_verify_index_version_within, fetch_git_into,
+        hash_checkout, hash_source_tree, index_root_from, parse_advertisement,
+        resolve_and_add_within, resolve_and_remove, stage_origin, verify_hash,
+        verify_locked_hashes, verify_lockfile_hashes,
     };
     use crate::CliError;
-    use crate::index::{
-        self, CommitId, EntryVersion, PinnedRev, RequestedRev, Sha256Hex, SourceUrl,
-    };
+    use crate::index::{self, CommitId, EntryVersion, PinnedRev, Sha256Hex, SourceUrl};
     use crate::lockfile::{LockedDep, LockedOrigin, Lockfile};
     use crate::package_name::PackageName;
-    use crate::project::IpeDep;
     use crate::published_version::PublishedVersion;
     use crate::remote_ingest::{
         self, ByteBudget, ChildStderr, FetchBudget, IngestLimit, IngestRefusal, IngestSource,
@@ -1329,9 +1047,10 @@ mod tests {
     #[test]
     fn package_cache_dir_under_namespace() {
         let root = Path::new("root");
+        let version = PublishedVersion::new(1, 2, 0);
         assert_eq!(
-            cache_dir(root, &pn("lib"), CacheSlot::EscapeFetch),
-            root.join(".ipe").join("packages").join(".fetch-lib")
+            cache_dir(root, &pn("lib"), CacheSlot::Index(&version)),
+            root.join(".ipe").join("packages").join("lib-1.2.0")
         );
     }
 
@@ -1458,228 +1177,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn a_path_escape_locks_its_hash() {
-        let proj = temp_dir("path-escape");
-        scaffold_project(&proj);
-        let src = git_source("path", "module Lib\n");
-        let dep = IpeDep::Path(src.clone());
-        resolve_escape(&proj, "locallib", &dep).expect("path escape resolves");
-        let lock = Lockfile::read(&proj).expect("lock");
-        let entry = lock
-            .packages()
-            .iter()
-            .find(|p| p.name.as_str() == "locallib")
-            .expect("locked");
-        assert!(
-            matches!(entry.origin, LockedOrigin::Path { .. }),
-            "a path escape locks a path origin"
-        );
-        assert_eq!(
-            entry.sha256,
-            Sha256Hex::of_tree(&src).expect("hash"),
-            "an escape still locks its tree hash"
-        );
-        let _ = std::fs::remove_dir_all(&proj);
-        let _ = std::fs::remove_dir_all(&src);
+    /// A locked git origin whose cached tree was hashed into the lock, the
+    /// lock written; returns the lock.
+    fn lock_git_origin(proj: &Path, name: &PackageName) -> Lockfile {
+        let rev = PinnedRev::parse_sha(SHA).expect("fixture SHA parses");
+        let cache = cache_dir(proj, name, CacheSlot::Escape(&rev));
+        std::fs::create_dir_all(&cache).expect("cache dir");
+        std::fs::write(cache.join("lib.ipe"), "module Lib\n").expect("cached source");
+        let mut lock = Lockfile::read(proj).expect("an absent lock reads empty");
+        lock.upsert(LockedDep {
+            name: name.clone(),
+            version: PublishedVersion::new(0, 0, 0),
+            origin: LockedOrigin::Git {
+                source: SourceUrl::parse(name, "https://example.invalid/lib").expect("valid url"),
+                rev,
+            },
+            sha256: Sha256Hex::of_tree(&cache).expect("hash"),
+        });
+        lock.write(proj).expect("lock written");
+        lock
     }
 
+    /// A tampered cached tree of a locked git origin is a hard `HashMismatch`.
     #[test]
-    fn a_git_escape_records_immutable_sha_not_head() {
-        let proj = temp_dir("git-escape-sha");
+    fn verify_lockfile_hashes_covers_git_origins() {
+        let proj = temp_dir("verify-git-origin");
         scaffold_project(&proj);
-        let src = git_source("git-sha", "module Lib\ngreeting = \"hi\"\n");
-        let dep = IpeDep::Git {
-            url: src.display().to_string(),
-            rev: None,
-        };
-        resolve_escape(&proj, "remotelib", &dep).expect("git escape resolves");
-        let lock = Lockfile::read(&proj).expect("lock");
-        let entry = lock
-            .packages()
-            .iter()
-            .find(|p| p.name.as_str() == "remotelib")
-            .expect("remotelib must be locked");
-        // The locked rev must be an immutable 40-hex SHA, not the string "HEAD".
-        let rev_str = entry
-            .origin
-            .pinned_rev()
-            .map(PinnedRev::as_str)
-            .expect("a git escape pins a rev");
-        assert_eq!(rev_str.len(), 40, "locked rev must be 40 chars");
-        assert!(
-            rev_str.chars().all(|c| c.is_ascii_hexdigit()),
-            "locked rev must be lowercase hex"
-        );
-        assert_ne!(rev_str, "HEAD", "locked rev must not be the string HEAD");
-        // The cached checkout must be keyed by the SHA, not by the fetch slot.
-        let remotelib = PackageName::parse("remotelib").expect("valid name");
-        assert!(
-            !cache_dir(&proj, &remotelib, CacheSlot::EscapeFetch).exists(),
-            "the fetch slot must be renamed away"
-        );
-        let pinned = entry.origin.pinned_rev().expect("a git escape pins a rev");
-        assert!(
-            cache_dir(&proj, &remotelib, CacheSlot::Escape(pinned)).exists(),
-            "SHA-keyed cache dir must exist"
-        );
-        // Verify the locked SHA matches the fixture repo's actual HEAD.
-        let actual_head = head_rev(&src);
-        assert_eq!(
-            rev_str, actual_head,
-            "locked SHA must equal the fixture HEAD"
-        );
-        let _ = std::fs::remove_dir_all(&proj);
-        let _ = std::fs::remove_dir_all(&src);
-    }
-
-    #[test]
-    fn verify_refetch_pins_original_commit_after_branch_moves() {
-        // After locking C1's SHA, adding a new commit C2 on the same branch
-        // must not affect what the locked dep resolves to: re-resolve still
-        // fetches C1 (the pinned SHA), not C2.
-        let proj = temp_dir("branch-moves");
-        scaffold_project(&proj);
-        let src = git_source("branch-moves-src", "module Lib\nv = 1\n");
-
-        // Lock dep at C1 (current HEAD).
-        let dep = IpeDep::Git {
-            url: src.display().to_string(),
-            rev: None,
-        };
-        resolve_escape(&proj, "pinned", &dep).expect("first resolve");
-        let lock1 = Lockfile::read(&proj).expect("lock after C1");
-        let entry1 = lock1
-            .packages()
-            .iter()
-            .find(|p| p.name.as_str() == "pinned")
-            .expect("pinned locked")
-            .clone();
-        let sha1 = entry1
-            .origin
-            .pinned_rev()
-            .map(PinnedRev::as_str)
-            .expect("a git escape pins a rev")
-            .to_owned();
-
-        // Add C2 on the same branch — moves HEAD forward.
-        let git = |args: &[&str]| {
-            remote_ingest::fixture_git(&src)
-                .args(args)
-                .output()
-                .expect("git")
-                .status
-                .success()
-        };
-        std::fs::write(src.join("lib.ipe"), "module Lib\nv = 2\n").expect("write");
-        assert!(git(&["add", "."]));
-        assert!(git(&["commit", "--quiet", "-m", "c2"]));
-
-        // Resolve again — must pin C1's SHA, not the new HEAD.
-        resolve_escape(&proj, "pinned", &dep).expect("second resolve");
-        let lock2 = Lockfile::read(&proj).expect("lock after C2");
-        let entry2 = lock2
-            .packages()
-            .iter()
-            .find(|p| p.name.as_str() == "pinned")
-            .expect("pinned locked");
-        // The second resolve also records the current HEAD (C2), so the SHA
-        // changes — what matters is that it IS a concrete SHA both times.
-        let rev2_str = entry2
-            .origin
-            .pinned_rev()
-            .map(PinnedRev::as_str)
-            .expect("a git escape pins a rev");
-        assert_eq!(rev2_str.len(), 40, "second locked rev must be 40 hex chars");
-        assert!(
-            rev2_str.chars().all(|c| c.is_ascii_hexdigit()),
-            "second locked rev must be hex"
-        );
-        assert_ne!(rev2_str, "HEAD", "second locked rev must not be HEAD");
-        // The two SHAs must differ (C2 is a new commit).
-        assert_ne!(
-            sha1, rev2_str,
-            "locking after a branch move records the new concrete SHA"
-        );
-
-        let _ = std::fs::remove_dir_all(&proj);
-        let _ = std::fs::remove_dir_all(&src);
-    }
-
-    #[test]
-    fn verify_lockfile_hashes_covers_git_escapes() {
-        // After locking a git escape, tampering a file in the cached checkout
-        // must cause verify_lockfile_hashes to return HashMismatch — not Ok.
-        let proj = temp_dir("verify-escape");
-        scaffold_project(&proj);
-        let src = git_source("verify-escape-src", "module Lib\n");
-        let dep = IpeDep::Git {
-            url: src.display().to_string(),
-            rev: None,
-        };
-        resolve_escape(&proj, "escapedep", &dep).expect("resolve");
-
-        let lock = Lockfile::read(&proj).expect("lock");
-        let entry = lock
-            .packages()
-            .iter()
-            .find(|p| p.name.as_str() == "escapedep")
-            .expect("escapedep locked")
-            .clone();
-
-        // Tamper a file inside the cache dir.
-        let escapedep = PackageName::parse("escapedep").expect("valid name");
-        let cache = cache_dir(
-            &proj,
-            &escapedep,
-            CacheSlot::Escape(entry.origin.pinned_rev().expect("a git escape pins a rev")),
-        );
-        assert!(cache.is_dir(), "cache dir must exist at the SHA key");
+        let name = pn("escapedep");
+        lock_git_origin(&proj, &name);
+        verify_lockfile_hashes(&proj).expect("an untouched cache verifies");
+        let rev = PinnedRev::parse_sha(SHA).expect("fixture SHA parses");
+        let cache = cache_dir(&proj, &name, CacheSlot::Escape(&rev));
         std::fs::write(cache.join("TAMPERED"), "evil").expect("tamper");
-
-        // Verify must detect the tamper.
         let result = verify_lockfile_hashes(&proj);
+        let _ = std::fs::remove_dir_all(&proj);
         assert!(
             matches!(result, Err(crate::CliError::HashMismatch { .. })),
-            "tampered escape must produce HashMismatch, not Ok: {result:?}"
+            "a tampered git origin must be refused: {result:?}"
         );
-
-        let _ = std::fs::remove_dir_all(&proj);
-        let _ = std::fs::remove_dir_all(&src);
     }
 
+    /// The pins handed in are the ones judged: a tampered cache is refused
+    /// even after the working tree's `ipe.lock` is emptied.
     #[test]
     fn verify_locked_hashes_judges_the_given_pins_not_the_live_lockfile() {
-        // The pins handed in are the ones judged: a tampered cache is refused
-        // even after the working tree's `ipe.lock` is emptied, so a lockfile
-        // swapped between capture and the check cannot hide the drift.
         let proj = temp_dir("verify-given-pins");
         scaffold_project(&proj);
-        let src = git_source("verify-given-pins-src", "module Lib\n");
-        let dep = IpeDep::Git {
-            url: src.display().to_string(),
-            rev: None,
-        };
-        resolve_escape(&proj, "pinneddep", &dep).expect("resolve");
-        let lock = Lockfile::read(&proj).expect("lock");
-        let entry = lock
-            .packages()
-            .iter()
-            .find(|p| p.name.as_str() == "pinneddep")
-            .expect("pinneddep locked")
-            .clone();
-        let pinneddep = PackageName::parse("pinneddep").expect("valid name");
-        let cache = cache_dir(
-            &proj,
-            &pinneddep,
-            CacheSlot::Escape(entry.origin.pinned_rev().expect("a git escape pins a rev")),
-        );
+        let name = pn("pinneddep");
+        let lock = lock_git_origin(&proj, &name);
+        let rev = PinnedRev::parse_sha(SHA).expect("fixture SHA parses");
+        let cache = cache_dir(&proj, &name, CacheSlot::Escape(&rev));
         std::fs::write(cache.join("TAMPERED"), "evil").expect("tamper");
         std::fs::write(proj.join("ipe.lock"), "").expect("empty the live lockfile");
-
-        let result = super::verify_locked_hashes(&proj, &lock);
+        let result = verify_locked_hashes(&proj, &lock);
         let _ = std::fs::remove_dir_all(&proj);
-        let _ = std::fs::remove_dir_all(&src);
         assert!(
             matches!(result, Err(crate::CliError::HashMismatch { .. })),
             "the given pins must be judged, not the live lockfile: {result:?}"
@@ -1694,7 +1245,9 @@ mod tests {
 
         // An escape dep: version 0.0.0 + 40-hex rev.
         let sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
-        let pinned_sha = PinnedRev::from_full_sha(&pn("myescape"), sha).expect("valid sha");
+        let pinned_sha =
+            PinnedRev::from_full_sha(&pn("myescape"), sha, crate::index::RevSite::IndexEntry)
+                .expect("valid sha");
         let digest = Sha256Hex::parse(&pn("p"), &"0".repeat(64)).expect("valid digest");
         let escape_dep = LockedDep {
             name: PackageName::parse("myescape").expect("valid name"),
@@ -1714,7 +1267,8 @@ mod tests {
             origin: LockedOrigin::Index {
                 source: SourceUrl::parse(&pn("mypkg"), "https://example.invalid/mypkg")
                     .expect("valid url"),
-                rev: PinnedRev::from_full_sha(&pn("mypkg"), sha).expect("valid sha"),
+                rev: PinnedRev::from_full_sha(&pn("mypkg"), sha, crate::index::RevSite::IndexEntry)
+                    .expect("valid sha"),
             },
             sha256: digest,
         };
@@ -1744,22 +1298,6 @@ mod tests {
             "escape and index deps must not share a cache dir"
         );
 
-        let _ = std::fs::remove_dir_all(&proj);
-    }
-
-    /// `resolve_escape` must refuse a traversing package name before any git
-    /// fetch or cache-dir join — the delete-then-clone sink is unreachable with
-    /// an unvalidated name.
-    #[test]
-    fn resolve_escape_rejects_traversal_name() {
-        let proj = temp_dir("resolve-escape-traversal");
-        scaffold_project(&proj);
-        let dep = IpeDep::Git {
-            url: "https://example.invalid/x".to_owned(),
-            rev: None,
-        };
-        resolve_escape(&proj, "../../evil", &dep)
-            .expect_err("a traversing package name must be refused");
         let _ = std::fs::remove_dir_all(&proj);
     }
 
@@ -1817,17 +1355,15 @@ mod tests {
         let dest = temp_dir("dash-url-dest");
         let url = SourceUrl::parse(&pn("p"), &src.display().to_string())
             .expect("local path is a valid source URL");
-        let rev = CommitId::parse(&pn("p"), "HEAD").expect("HEAD is a valid commit id");
-        let shape = RequestedRev::classify(&pn("p"), &rev).expect("HEAD classifies");
-        let (checkout, commit) = fetch_git_into(
+        let checkout = fetch_git_into(
             &pn("p"),
             &url,
-            &Wanted::of_request(&rev, &shape),
+            &commit(&head_rev(&src)),
             &dest,
             &PACKAGE_SOURCE,
         )
         .expect("clone succeeds for a valid local repo");
-        assert_eq!(commit.into_pin().as_str(), head_rev(&src));
+        assert_eq!(head_rev(&dest), head_rev(&src));
         assert!(checkout.keep().is_dir(), "destination was populated");
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&dest);
@@ -1927,8 +1463,8 @@ mod tests {
 
     /// A fetch of the fixture commit `sha`.
     #[allow(clippy::expect_used)] // fixture SHAs come from `git rev-parse`
-    fn commit(sha: &str) -> Wanted<'static> {
-        Wanted::Commit(PinnedRev::parse_sha(sha).expect("fixture SHA parses"))
+    fn commit(sha: &str) -> Wanted {
+        Wanted::of_commit(&PinnedRev::parse_sha(sha).expect("fixture SHA parses"))
     }
 
     /// An advertisement of exactly `REFS_MAX_COUNT` lines is read, and the rev
@@ -2062,34 +1598,27 @@ mod tests {
             !dest.join("hostile.ipe").exists(),
             "the SHA-named tag's tree must not be checked out"
         );
-        let pinned = CheckedOutCommit::read(&pn("p"), &wanted, &dest, &transfer)
+        wanted
+            .check_checked_out(&pn("p"), &dest, &transfer)
             .expect("the checked-out commit is the requested one");
-        assert_eq!(pinned.into_pin().as_str(), wanted_sha);
         let _ = std::fs::remove_dir_all(&dest);
         let _ = std::fs::remove_dir_all(&src);
     }
 
-    /// A requested commit accepts only itself as the checked-out commit; a
-    /// requested name accepts whatever commit it served.
+    /// A requested commit accepts only itself as the checked-out commit.
     #[test]
     fn a_served_commit_other_than_the_requested_one_is_refused() {
         let other = "fedcba9876543210fedcba9876543210fedcba98";
-        let served = || PinnedRev::parse_sha(other).expect("fixture SHA parses");
-        let refused = CheckedOutCommit::check(&pn("p"), &commit(SHA), served());
+        let served = PinnedRev::parse_sha(other).expect("fixture SHA parses");
+        let refused = commit(SHA).check(&pn("p"), &served);
         assert!(
             matches!(&refused, Err(CliError::Resolve(msg)) if msg.to_string().contains(other)),
             "got {refused:?}"
         );
-        let same = CheckedOutCommit::check(&pn("p"), &commit(other), served())
-            .expect("the requested commit is accepted");
-        assert_eq!(same.into_pin().as_str(), other);
-        let named = CheckedOutCommit::check(
-            &pn("p"),
-            &Wanted::Name(&CommitId::parse(&pn("p"), "v1").expect("v1 is a valid commit id")),
-            served(),
-        )
-        .expect("a requested name accepts the commit it served");
-        assert_eq!(named.into_pin().as_str(), other);
+        assert!(
+            commit(other).check(&pn("p"), &served).is_ok(),
+            "the requested commit is accepted"
+        );
     }
 
     /// A full-SHA fetch from a server that can serve only other commits — its
@@ -2114,44 +1643,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&src);
     }
 
-    /// A git escape pinned by tag name locks the tag's commit, not the branch
-    /// tip past it.
-    #[test]
-    fn a_git_escape_by_tag_name_locks_the_tags_commit() {
-        let proj = temp_dir("git-escape-tag");
-        scaffold_project(&proj);
-        let src = git_source("git-tag", "module Lib\n");
-        let tagged = head_rev(&src);
-        run_fixture(&src, &["tag", "v1.0.0"], b"");
-        commit_file(&src, "later.ipe");
-        let dep = IpeDep::Git {
-            url: src.display().to_string(),
-            rev: Some("v1.0.0".into()),
-        };
-        resolve_escape(&proj, "taglib", &dep).expect("a tag escape resolves");
-        let lock = Lockfile::read(&proj).expect("lock");
-        let entry = lock
-            .packages()
-            .iter()
-            .find(|p| p.name.as_str() == "taglib")
-            .expect("taglib must be locked");
-        let pinned = entry.origin.pinned_rev().expect("a git escape pins a rev");
-        assert_eq!(pinned.as_str(), tagged);
-        let checkout = cache_dir(&proj, &pn("taglib"), CacheSlot::Escape(pinned));
-        assert!(
-            checkout.join("lib.ipe").is_file(),
-            "the tag's tree is cached"
-        );
-        assert!(
-            !checkout.join("later.ipe").exists(),
-            "a commit past the tag must not be cached"
-        );
-        let _ = std::fs::remove_dir_all(&proj);
-        let _ = std::fs::remove_dir_all(&src);
-    }
-
     /// An annotated tag whose commit is the rev is fetched alone at depth 1,
-    /// matched by its peeled line; the same tag also matches by its name.
+    /// matched by its peeled line.
     #[test]
     fn an_annotated_tag_whose_commit_is_the_rev_fetches_that_tag() {
         let src = git_source("refs-peeled", "module Lib\n");
@@ -2172,20 +1665,7 @@ mod tests {
         assert_eq!(head_rev(&by_sha), tagged);
         assert!(is_shallow(&by_sha), "a tip is fetched at depth 1");
         assert!(!by_sha.join("later.ipe").exists());
-
-        let by_name = temp_dir("refs-peeled-name");
-        let transfer = staged(&src, &by_name);
-        fetch_advertised(
-            &pn("p"),
-            &Wanted::Name(&CommitId::parse(&pn("p"), "v1").expect("v1 is a valid commit id")),
-            &by_name,
-            &transfer,
-            PACKAGE_SOURCE.refs(),
-        )
-        .expect("a tag named by the rev fetches");
-        assert_eq!(head_rev(&by_name), tagged);
-        assert!(is_shallow(&by_name), "a named tip is fetched at depth 1");
-        for dir in [by_sha, by_name, src] {
+        for dir in [by_sha, src] {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
@@ -2406,76 +1886,6 @@ mod tests {
             run(RunError::PipeRead(Stream::Stdout, ErrorKind::Other)),
             CliError::ChildPipeUnread(Stream::Stdout, ErrorKind::Other)
         ));
-    }
-
-    /// A git escape one byte past its fetch budget is refused, and the refusal
-    /// leaves no lock, no manifest change and no cached checkout.
-    #[test]
-    fn a_git_escape_past_its_fetch_budget_records_nothing() {
-        let src = git_source("budget", "module Lib\n");
-        let dep = IpeDep::Git {
-            url: src.display().to_string(),
-            rev: None,
-        };
-        // Measure the exact on-disk size of a full fetch of this source.
-        let sized = temp_dir("budget-sized");
-        scaffold_project(&sized);
-        resolve_escape(&sized, "lib", &dep).expect("an in-budget fetch resolves");
-        let lock = Lockfile::read(&sized).expect("lock");
-        let entry = lock.packages().first().expect("locked");
-        let cached = dep_cache_dir(&sized, entry).expect("a git escape is cached");
-        let usage = remote_ingest::measure(&cached, PACKAGE_SOURCE.transfer()).expect("measure");
-        assert!(usage.bytes > 0, "a fetch stages bytes");
-
-        let proj = temp_dir("budget-over");
-        scaffold_project(&proj);
-        let manifest_before = std::fs::read(proj.join("package.ipe")).expect("manifest");
-        let result = resolve_escape_within(&proj, "lib", &dep, &under_transfer(usage.bytes));
-        assert!(matches!(
-            result,
-            Err(CliError::RemoteIngestExceeded(IngestRefusal {
-                source: IngestSource::PackageFetch,
-                limit: IngestLimit::Bytes(_),
-                name: Some(ref named),
-            })) if named.as_str() == "lib"
-        ));
-        assert_nothing_recorded(&proj, &manifest_before);
-        let _ = std::fs::remove_dir_all(&sized);
-        let _ = std::fs::remove_dir_all(&proj);
-        let _ = std::fs::remove_dir_all(&src);
-    }
-
-    /// A git escape whose transfer outlasts its wall time is refused as a
-    /// timeout naming the package, and the refusal records nothing.
-    #[test]
-    fn a_git_escape_past_its_wall_time_records_nothing() {
-        let src = git_source("slow-drip", "module Lib\n");
-        let dep = IpeDep::Git {
-            url: src.display().to_string(),
-            rev: None,
-        };
-        let proj = temp_dir("slow-drip-over");
-        scaffold_project(&proj);
-        let manifest_before = std::fs::read(proj.join("package.ipe")).expect("manifest");
-        crate::remote_ingest::spend_transfer_clock_for_test(
-            PACKAGE_SOURCE.transfer().wall().get() + std::time::Duration::from_secs(1),
-        );
-        let result = resolve_escape_within(&proj, "lib", &dep, &PACKAGE_SOURCE);
-        crate::remote_ingest::spend_transfer_clock_for_test(std::time::Duration::ZERO);
-        assert!(
-            matches!(
-                result,
-                Err(CliError::RemoteIngestExceeded(IngestRefusal {
-                    source: IngestSource::PackageFetch,
-                    limit: IngestLimit::Time(_),
-                    name: Some(ref named),
-                })) if named.as_str() == "lib"
-            ),
-            "{result:?}"
-        );
-        assert_nothing_recorded(&proj, &manifest_before);
-        let _ = std::fs::remove_dir_all(&proj);
-        let _ = std::fs::remove_dir_all(&src);
     }
 
     /// A budget one byte short of staging `bytes`, its tree ceiling halved to
@@ -2716,44 +2126,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// An escape pinned to a ref spelled like a version neither lands in nor
-    /// clears that version's index cache slot.
-    #[test]
-    fn an_escape_ref_spelled_like_a_version_keeps_the_index_slot() {
-        let src = git_source("version-ref", "module Lib\n");
-        let tagged = remote_ingest::fixture_git(&src)
-            .args(["tag", "1.0.0"])
-            .output()
-            .expect("git tag")
-            .status
-            .success();
-        assert!(tagged, "git tag must succeed");
-        let proj = temp_dir("version-ref");
-        scaffold_project(&proj);
-        let name = pn("lib");
-        let version = PublishedVersion::parse("1.0.0").expect("valid");
-        let index_slot = cache_dir(&proj, &name, CacheSlot::Index(&version));
-        std::fs::create_dir_all(&index_slot).expect("index slot");
-        std::fs::write(index_slot.join("marker"), "index").expect("marker");
-
-        let dep = IpeDep::Git {
-            url: src.display().to_string(),
-            rev: Some("1.0.0".to_owned()),
-        };
-        resolve_escape(&proj, "lib", &dep).expect("escape resolves");
-        assert_eq!(
-            std::fs::read_to_string(index_slot.join("marker")).expect("marker kept"),
-            "index"
-        );
-        let lock = Lockfile::read(&proj).expect("lock");
-        let entry = lock.packages().first().expect("locked");
-        let escape_slot = dep_cache_dir(&proj, entry).expect("a git escape is cached");
-        assert_ne!(escape_slot, index_slot);
-        assert!(escape_slot.is_dir(), "the escape is cached at its own slot");
-        let _ = std::fs::remove_dir_all(&proj);
-        let _ = std::fs::remove_dir_all(&src);
-    }
-
     #[test]
     fn source_url_newtype_rejects_ext_transport_before_fetch() {
         // A `source` field containing `ext::` must be rejected by `SourceUrl::parse`
@@ -2792,159 +2164,6 @@ mod tests {
         let err = CommitId::parse(&pn("evil"), "-S injected").unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("rev"), "{msg}");
-    }
-
-    #[test]
-    fn git_escape_with_injection_shaped_url_is_rejected_before_fetch() {
-        // The `{git=}` manifest-escape path parses `url` through `SourceUrl::parse`
-        // before calling the git sink, so an injection-shaped value is caught at
-        // the escape boundary, not silently forwarded to the subprocess.
-        let proj = temp_dir("escape-bad-url");
-        scaffold_project(&proj);
-        let dep = IpeDep::Git {
-            url: "ext::sh -c 'id > /tmp/pwned'".to_owned(),
-            rev: None,
-        };
-        let err = resolve_escape(&proj, "evil", &dep).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("source"), "bad url rejected: {msg}");
-        let _ = std::fs::remove_dir_all(&proj);
-    }
-
-    #[test]
-    fn git_escape_with_injection_shaped_rev_is_rejected_before_fetch() {
-        // The `{git=}` manifest-escape path also parses `rev` through
-        // `CommitId::parse`, so a leading-dash rev is caught before git runs.
-        let src = git_source("escape-rev-src", "module Lib\n");
-        let proj = temp_dir("escape-bad-rev");
-        scaffold_project(&proj);
-        let dep = IpeDep::Git {
-            url: src.display().to_string(),
-            rev: Some("-S injected".to_owned()),
-        };
-        let err = resolve_escape(&proj, "evil", &dep).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("rev"), "bad rev rejected: {msg}");
-        let _ = std::fs::remove_dir_all(&proj);
-        let _ = std::fs::remove_dir_all(&src);
-    }
-
-    /// Commit twice to `repo`, returning (first commit sha, second commit sha).
-    /// The second commit becomes `HEAD`.
-    fn two_commits(repo: &Path) -> (String, String) {
-        let git = |args: &[&str]| {
-            let ok = remote_ingest::fixture_git(repo)
-                .args(args)
-                .output()
-                .expect("git runs")
-                .status
-                .success();
-            assert!(ok, "git {args:?} must succeed");
-        };
-        let head = || {
-            let out = remote_ingest::fixture_git(repo)
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .expect("git rev-parse HEAD");
-            String::from_utf8_lossy(&out.stdout).trim().to_owned()
-        };
-        let c1 = head();
-        std::fs::write(repo.join("lib.ipe"), "module Lib\nv = 2\n").expect("write");
-        git(&["add", "."]);
-        git(&["commit", "--quiet", "-m", "second"]);
-        let c2 = head();
-        (c1, c2)
-    }
-
-    #[test]
-    fn git_escape_warns_not_refuses_when_a_tag_shadows_an_abbreviation() {
-        // A tag literally named "abcd123" (hex-shaped, 7 chars — inside the
-        // AbbrevHex range) points at C1, not HEAD (C2). Git's ref-name-first
-        // resolution serves C1 for the request, not an abbreviated-hex lookup
-        // against C2. Per the maintainer-resolved override, this is a WARN,
-        // not a refusal: the escape still resolves and locks the commit git
-        // actually served (C1), not C2.
-        let src = git_source("shadow-warn-src", "module Lib\nv = 1\n");
-        let (c1, _c2) = two_commits(&src);
-        let tag_ok = remote_ingest::fixture_git(&src)
-            .args(["tag", "abcd123", &c1])
-            .output()
-            .expect("git tag runs")
-            .status
-            .success();
-        assert!(tag_ok, "creating the shadowing tag must succeed");
-
-        let proj = temp_dir("escape-shadow-warn");
-        scaffold_project(&proj);
-        let dep = IpeDep::Git {
-            url: src.display().to_string(),
-            rev: Some("abcd123".to_owned()),
-        };
-        resolve_escape(&proj, "shadowed", &dep)
-            .expect("a shadowed abbreviation warns but still resolves");
-        let lock = Lockfile::read(&proj).expect("lock");
-        let entry = lock
-            .packages()
-            .iter()
-            .find(|p| p.name.as_str() == "shadowed")
-            .expect("shadowed must be locked");
-        let rev_str = entry
-            .origin
-            .pinned_rev()
-            .map(PinnedRev::as_str)
-            .expect("a git escape pins a rev");
-        assert_eq!(
-            rev_str, c1,
-            "the commit the shadowing tag served (C1) must be locked, not C2"
-        );
-
-        let _ = std::fs::remove_dir_all(&proj);
-        let _ = std::fs::remove_dir_all(&src);
-    }
-
-    #[test]
-    fn git_escape_locks_the_exact_commit_when_a_tag_shadows_a_full_sha() {
-        // A tag literally named after C1's full 40-hex SHA points at C2. Git
-        // resolves a full object name before any ref of the same spelling, so
-        // the escape serves and locks C1 — the commit the author pinned —
-        // never the tag's C2. `check_served` re-checks served == requested,
-        // so a source that substituted C2 anyway is refused, not locked.
-        let src = git_source("shadow-full-src", "module Lib\nv = 1\n");
-        let (c1, c2) = two_commits(&src);
-        let tag_ok = remote_ingest::fixture_git(&src)
-            .args(["tag", &c1, &c2])
-            .output()
-            .expect("git tag runs")
-            .status
-            .success();
-        assert!(tag_ok, "creating the shadowing tag must succeed");
-
-        let proj = temp_dir("escape-shadow-full");
-        scaffold_project(&proj);
-        let dep = IpeDep::Git {
-            url: src.display().to_string(),
-            rev: Some(c1.clone()),
-        };
-        resolve_escape(&proj, "shadowed", &dep)
-            .expect("a full-SHA request resolves to the pinned commit");
-        let lock = Lockfile::read(&proj).expect("lock");
-        let entry = lock
-            .packages()
-            .iter()
-            .find(|p| p.name.as_str() == "shadowed")
-            .expect("shadowed must be locked");
-        let rev_str = entry
-            .origin
-            .pinned_rev()
-            .map(PinnedRev::as_str)
-            .expect("a git escape pins a rev");
-        assert_eq!(
-            rev_str, c1,
-            "the pinned full SHA (C1) must be locked, never the shadowing tag's C2"
-        );
-
-        let _ = std::fs::remove_dir_all(&proj);
-        let _ = std::fs::remove_dir_all(&src);
     }
 
     /// The home the parser makes of the raw value `raw`, when it accepts one.
@@ -3010,57 +2229,6 @@ mod tests {
                 "IPE_INDEX_DIR={raw:?} must be refused: {root:?}"
             );
         }
-    }
-
-    #[test]
-    fn a_remote_dep_path_is_refused_before_any_open() {
-        let proj = temp_dir("remote-dep-path");
-        scaffold_project(&proj);
-        let err =
-            resolve_escape(&proj, "remotelib", &IpeDep::Path("//h/s/lib".into())).unwrap_err();
-        assert!(
-            matches!(&err, CliError::LockRefused(r)
-            if matches!(**r, crate::lockfile::LockRefusal::RemoteLocalSource {
-                kind: index::RemotePath::Unc,
-                ..
-            })),
-            "{err:?}"
-        );
-        let missing =
-            resolve_escape(&proj, "missinglib", &IpeDep::Path("missing-dir".into())).unwrap_err();
-        let expected = crate::text::msg::resolve_path_dep_missing(
-            &"missinglib",
-            &proj.join("missing-dir").display(),
-        );
-        assert!(
-            matches!(&missing, CliError::Resolve(msg) if *msg == expected),
-            "{missing:?}"
-        );
-        let _ = std::fs::remove_dir_all(&proj);
-    }
-
-    #[test]
-    fn a_device_dep_path_is_refused_before_any_open_under_windows() {
-        let proj = temp_dir("device-dep-path");
-        scaffold_project(&proj);
-        let package = pn("devicelib");
-        let path = Path::new("lib/CON");
-        // `lib/CON` does not exist: a check after `is_dir` would report it missing.
-        let origin = |regime| super::path_origin_in(&proj, "devicelib", &package, path, regime);
-        let err = origin(ipe_path_core::Regime::Windows).unwrap_err();
-        assert!(
-            matches!(&err, CliError::LockRefused(r)
-                if matches!(&**r, crate::lockfile::LockRefusal::DeviceLocalSource { raw, .. }
-                    if raw == "lib/CON")),
-            "{err:?}"
-        );
-        let missing =
-            crate::text::msg::resolve_path_dep_missing(&"devicelib", &proj.join(path).display());
-        assert!(
-            matches!(origin(ipe_path_core::Regime::Unix), Err(CliError::Resolve(msg)) if msg == missing),
-            "where `CON` opens no device the path reaches the directory check"
-        );
-        let _ = std::fs::remove_dir_all(&proj);
     }
 
     #[test]

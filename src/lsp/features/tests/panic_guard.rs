@@ -71,8 +71,15 @@ fn goto_definition_returns_none_on_cyclic_graph() {
 #[test]
 fn find_references_returns_empty_on_cyclic_graph() {
     let (db, root, entry_a, _b) = cyclic_project();
-    let refs =
-        ipe_lsp_features::navigation::find_references(&db, root, entry_a, &["A".to_owned()], "a");
+    let refs = ipe_lsp_features::navigation::find_references(
+        &db,
+        root,
+        entry_a,
+        &ipe_lsp_features::navigation::NameTarget::Declared {
+            module: vec!["A".to_owned()],
+            name: "a".to_owned(),
+        },
+    );
     // Already topo-gated; must not panic and must return an empty-or-valid vec.
     let _ = refs; // just proving no panic
 }
@@ -188,7 +195,7 @@ fn no_raw_canonicalize_on_interactive_path() -> Result<(), Box<dyn std::error::E
         let count = content.matches(raw_call).count();
         assert!(
             count == 0,
-            "{name} contains {count} raw `{raw_call}` call(s); use `db_access::canonicalize_checked` instead"
+            "{name} contains {count} raw `{raw_call}` call(s); use `db_access::analysis` instead"
         );
     }
     Ok(())

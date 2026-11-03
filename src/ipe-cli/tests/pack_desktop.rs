@@ -7,7 +7,7 @@
 //! stays fast. The pure-data layout/plist assertions always run.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use ipe::pack::desktop::{
     self, AppShape, BundleContent, BundleIdentity, DesktopOs, DesktopRefusal,
@@ -189,10 +189,8 @@ fn linux_bundle_is_materialised_end_to_end() {
     let runtime = e2e_support::require_runtime().into_path_buf();
     ipe::build_fixture(&fixture, &out_dir, &runtime).expect("ipe dev build of the program");
 
-    let exe = PathBuf::from(
-        e2e_support::build_rust_binary("pack_desktop_linux", &out_dir)
-            .expect("cargo build of the program"),
-    );
+    let exe = e2e_support::build_rust_binary("pack_desktop_linux", &out_dir)
+        .expect("cargo build of the program");
 
     let identity = BundleIdentity::new("counter", Some("1.2.3"), BundleId::derived("counter"));
     let layout =

@@ -14,7 +14,7 @@
 //! from, so no raw manifest string ever reaches generated source.
 
 use crate::diag::WireDefect;
-use crate::naming::RustIdent;
+use crate::naming::{RustIdent, check_type_ceilings};
 
 /// A type an Ipê-defined Rust struct field or closure component may carry.
 ///
@@ -48,6 +48,12 @@ impl Carrier {
     /// spellings (both `i64` and `Int` name the integer carrier), so an author
     /// may write either. Any other capitalised identifier is taken as an opaque
     /// handle name and validated as a `RustIdent`.
+    ///
+    /// This is the wire/manifest parser only. It never classifies an Ipê
+    /// annotation: its wire spellings (`Str`, `i64`) are not Ipê type names,
+    /// and a bare handle name here carries no home module. The asserted-call
+    /// boundary classifies annotations through the builtin-row SSOT and the
+    /// crate's resolved opaque types instead.
     ///
     /// # Errors
     ///
@@ -740,8 +746,11 @@ impl ClosureSig {
     /// `Fn(...)` head, an unbalanced parameter list, a parameter or return
     /// component outside the carrier set, a bound outside `{Send, Sync,
     /// 'static}`, a total (non-`Result`/`Option`) return that is not a scalar,
-    /// or unconsumed trailing text.
+    /// a future of a future, or unconsumed trailing text;
+    /// [`WireDefect::TypeTooLong`]/[`WireDefect::TypeTooDeep`] past a
+    /// [`check_type_ceilings`] ceiling, checked first.
     pub fn parse(s: &str) -> Result<Self, WireDefect> {
+        check_type_ceilings(s)?;
         let raw = s;
         let refuse = |reason: &str| WireDefect::InvalidClosureSig {
             got: raw.to_owned(),
@@ -961,19 +970,40 @@ fn parse_ret(s: &str) -> Result<ClosureRet, String> {
     // `BoxFuture<'static, R>`. The `Output` R is re-parsed as a SYNC return and
     // must land on the fallible shape — an async-total return is unrepresentable
     // (a poll-panic has no error channel; see `ClosureRet`).
-    if let Some(output) = future_output(s) {
-        return match parse_ret(output)? {
-            ClosureRet::Result(c) => Ok(ClosureRet::AsyncResult(c)),
-            ClosureRet::Option(c) => Ok(ClosureRet::AsyncOption(c)),
-            ClosureRet::Total(_) => Err(format!(
-                "an async return `{s}` must be fallible — a `Future<Output = R>` with a total \
-                 (non-`Result`/`Option`) `R` has no error channel to fold a poll-panic into"
-            )),
-            ClosureRet::AsyncResult(_) | ClosureRet::AsyncOption(_) => Err(format!(
-                "a nested async return `{s}` (a future of a future) is not a carrier shape"
-            )),
-        };
+    let Some(output) = future_output(s) else {
+        return parse_sync_ret(s).map(|ret| match ret {
+            SyncRet::Total(c) => ClosureRet::Total(c),
+            SyncRet::Result(c) => ClosureRet::Result(c),
+            SyncRet::Option(c) => ClosureRet::Option(c),
+        });
+    };
+    // A future of a future is refused before its output is read, so the async
+    // layer never recurses.
+    if future_output(output).is_some() {
+        return Err(format!(
+            "a nested async return `{s}` (a future of a future) is not a carrier shape"
+        ));
     }
+    match parse_sync_ret(output)? {
+        SyncRet::Result(c) => Ok(ClosureRet::AsyncResult(c)),
+        SyncRet::Option(c) => Ok(ClosureRet::AsyncOption(c)),
+        SyncRet::Total(_) => Err(format!(
+            "an async return `{s}` must be fallible — a `Future<Output = R>` with a total \
+             (non-`Result`/`Option`) `R` has no error channel to fold a poll-panic into"
+        )),
+    }
+}
+
+/// A non-future closure return, before the async layer is applied.
+enum SyncRet {
+    Total(ScalarCarrier),
+    Result(Carrier),
+    Option(Carrier),
+}
+
+/// Parse a non-future closure return: `Result<B, E>`, `Option<B>`, or a total
+/// scalar carrier.
+fn parse_sync_ret(s: &str) -> Result<SyncRet, String> {
     let inner_of = |head: &str| -> Option<&str> {
         s.strip_prefix(head)
             .and_then(|r| r.strip_suffix('>'))
@@ -987,19 +1017,19 @@ fn parse_ret(s: &str) -> Result<ClosureRet, String> {
         let ok = inner.split(',').next().unwrap_or(inner).trim();
         let c = Carrier::parse(ok)
             .map_err(|_| format!("`Result` Ok type `{ok}` is outside the carrier set"))?;
-        return Ok(ClosureRet::Result(c));
+        return Ok(SyncRet::Result(c));
     }
     if let Some(inner) = inner_of("Option<") {
         let c = Carrier::parse(inner)
             .map_err(|_| format!("`Option` type `{inner}` is outside the carrier set"))?;
-        return Ok(ClosureRet::Option(c));
+        return Ok(SyncRet::Option(c));
     }
     // A total return: MUST be a scalar carrier. An opaque handle has no default
     // to yield on a panic-abort, so it is refused here (representable only
     // inside Result/Option).
     let c =
         Carrier::parse(s).map_err(|_| format!("return type `{s}` is outside the carrier set"))?;
-    c.as_scalar().map(ClosureRet::Total).ok_or_else(|| {
+    c.as_scalar().map(SyncRet::Total).ok_or_else(|| {
         format!(
             "a total return `{s}` must be a scalar carrier — an opaque handle return \
              is representable only inside `Result`/`Option`"
@@ -1549,6 +1579,71 @@ mod tests {
                 &["Clone".to_owned()],
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_closure_signature_past_the_length_ceiling_refuses_before_parsing() {
+        use crate::naming::MAX_TYPE_LEN;
+        // A hundred thousand nested futures: past the length ceiling, so the
+        // return parser never walks it.
+        let ret = format!(
+            "{}Result<Int>{}",
+            "BoxFuture<".repeat(100_000),
+            ">".repeat(100_000)
+        );
+        let sig = format!("Fn(Int) -> {ret} + Send + Sync + 'static");
+        assert_eq!(
+            ClosureSig::parse(&sig),
+            Err(WireDefect::TypeTooLong {
+                len: sig.len(),
+                max: MAX_TYPE_LEN
+            })
+        );
+    }
+
+    #[test]
+    fn a_nested_future_return_is_refused_without_recursing() {
+        // `]` closes a level for the depth ceiling but not for the future
+        // scanner, so this chain passes both ceilings while nesting one
+        // future per twelve bytes. The parse runs on a small stack: a return
+        // parser that recursed once per future would overflow it.
+        let head = "Fn(Int) -> ";
+        let tail = " + Send + Sync + 'static";
+        let link = "Future<], = ";
+        let n = (crate::naming::MAX_TYPE_LEN - head.len() - tail.len() - 16) / (link.len() + 1);
+        let sig = format!("{head}{}Result<Int>{}{tail}", link.repeat(n), ">".repeat(n));
+        assert!(n > 250);
+        assert_eq!(crate::naming::check_type_ceilings(&sig), Ok(()));
+        let parsed = std::thread::Builder::new()
+            .stack_size(32 * 1024)
+            .spawn(move || ClosureSig::parse(&sig))
+            .expect("spawns")
+            .join()
+            .expect("does not overflow the stack");
+        assert!(
+            matches!(
+                &parsed,
+                Err(WireDefect::InvalidClosureSig { reason, .. })
+                    if reason.contains("future of a future")
+            ),
+            "{parsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_future_of_a_future_is_refused() {
+        let sig = ClosureSig::parse(
+            "Fn(Int) -> BoxFuture<'static, BoxFuture<'static, Result<Int, Error>>> + Send + \
+             Sync + 'static",
+        );
+        assert!(
+            matches!(
+                &sig,
+                Err(WireDefect::InvalidClosureSig { reason, .. })
+                    if reason.contains("future of a future")
+            ),
+            "{sig:?}"
         );
     }
 }

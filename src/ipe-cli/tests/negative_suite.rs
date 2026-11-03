@@ -1130,6 +1130,201 @@ fn canon_open_imports_bare_ctor_use_is_ambiguous() {
     assert_rejected("canon_open_bare_ctor_ambiguous", &src, "IPE-N0024");
 }
 
+/// Every spelling of a builtin type head reaches its row: the import that
+/// brings it in, the annotation that uses it, a legal and a mis-arity type
+/// argument list.
+const BUILTIN_WITNESS_SPELLINGS: &[(&str, &str, &str, &str, &str)] = &[
+    (
+        "exposed_ui_element",
+        "import Ipe.Ui exposing (Element)",
+        "Element",
+        "Int",
+        "Int Int",
+    ),
+    (
+        "qualified_ui_element",
+        "import Ipe.Ui as Ui",
+        "Ui.Element",
+        "Int",
+        "Int Int",
+    ),
+    (
+        "qualified_ui_attribute",
+        "import Ipe.Ui as Ui",
+        "Ui.Attribute",
+        "Int",
+        "Int Int",
+    ),
+    (
+        "qualified_html_attribute",
+        "import Ipe.Html.Attributes as Attr",
+        "Attr.Attribute",
+        "Int",
+        "Int Int",
+    ),
+    (
+        "exposed_html_attribute",
+        "import Ipe.Html.Attributes exposing (Attribute)",
+        "Attribute",
+        "Int",
+        "Int Int",
+    ),
+    (
+        "qualified_tui_screen",
+        "import Ipe.Ui.Tui as Tui",
+        "Tui.Screen",
+        "Int",
+        "Int Int",
+    ),
+    (
+        "qualified_cli_lines",
+        "import Ipe.Ui.Cli as Cli",
+        "Cli.Lines",
+        "Int",
+        "Int Int",
+    ),
+    (
+        "qualified_path",
+        "import Ipe.Path as P",
+        "P.Path",
+        "",
+        "Int",
+    ),
+    (
+        "qualified_dict",
+        "import Ipe.Dict as Dict",
+        "Dict.Dict",
+        "Int Int",
+        "Int",
+    ),
+    (
+        "exposed_dict",
+        "import Ipe.Dict exposing (Dict)",
+        "Dict",
+        "Int Int",
+        "Int",
+    ),
+    (
+        "qualified_color",
+        "import Ipe.Color as C",
+        "C.Color",
+        "",
+        "Int",
+    ),
+];
+
+/// The program annotating `f` with `head args`, behind `import`.
+fn builtin_witness_program(import: &str, head: &str, args: &str) -> String {
+    format!(
+        "{HEAD}\nimport Ipe.Io as Io\n{import}\n\n\
+         f : ({head} {args}) -> Int\nf _ =\n    0\n\n\
+         main = Io.println \"ok\"\n"
+    )
+}
+
+/// A builtin head applied to a count its row does not admit is IPE-N0031,
+/// however the head is spelled: re-exported at a module home, or qualified
+/// by a source module.
+#[test]
+fn builtin_witness_mis_arity_is_refused_under_every_spelling() {
+    for (case, import, head, _legal, wrong) in BUILTIN_WITNESS_SPELLINGS {
+        let src = builtin_witness_program(import, head, wrong);
+        assert_rejected(&format!("builtin_witness_wrong_{case}"), &src, "IPE-N0031");
+    }
+}
+
+/// The contrapositive: each spelling at its row's count compiles.
+#[test]
+fn builtin_witness_legal_arity_compiles_under_every_spelling() {
+    for (case, import, head, legal, _wrong) in BUILTIN_WITNESS_SPELLINGS {
+        let src = builtin_witness_program(import, head, legal);
+        assert_compiles(&format!("builtin_witness_legal_{case}"), &src);
+    }
+}
+
+/// A source module that declares no builtin row and exports only its own
+/// union, so a reserved name under its qualifier is neither declared nor
+/// re-exported there.
+const UNRELATED_MODULE: &str = "Ipe.Length";
+
+/// `Int` once per type argument a legal use of `row` takes; an effect carrier
+/// takes its one value argument.
+fn legal_int_args(row: &ipe_kernels::BuiltinRow) -> String {
+    let count = match row.params() {
+        ipe_kernels::TypeParams::Exact(n) => usize::from(n),
+        ipe_kernels::TypeParams::OptionalMessage | ipe_kernels::TypeParams::InferredCarrier => 1,
+    };
+    vec!["Int"; count].join(" ")
+}
+
+/// Every reserved row with a declaring module resolves to the row under that
+/// module's qualifier (`Set.Set`, `Char.Char`), whether or not the module's
+/// `exposing` clause lists it.
+#[test]
+fn a_reserved_row_resolves_under_its_declaring_module() {
+    let mut seen = 0_usize;
+    for row in ipe_kernels::BUILTIN_TYPES {
+        let Some(module) = row.declared_in() else {
+            continue;
+        };
+        seen += 1;
+        let name = row.name();
+        let src = builtin_witness_program(
+            &format!("import {module} as Q"),
+            &format!("Q.{name}"),
+            &legal_int_args(row),
+        );
+        assert_compiles(&format!("declared_home_{name}"), &src);
+    }
+    assert!(seen > 0, "no row names a declaring module");
+}
+
+/// The refusal: the same name under a module that neither declares nor
+/// re-exports it is IPE-N0005, never the row minted at that module's home.
+#[test]
+fn a_reserved_row_under_an_unrelated_module_is_no_such_member() {
+    for row in ipe_kernels::BUILTIN_TYPES {
+        if row.declared_in().is_none() {
+            continue;
+        }
+        assert_ne!(row.declared_in(), Some(UNRELATED_MODULE));
+        let name = row.name();
+        let src = builtin_witness_program(
+            &format!("import {UNRELATED_MODULE} as Q"),
+            &format!("Q.{name}"),
+            &legal_int_args(row),
+        );
+        assert_rejected(&format!("unrelated_home_{name}"), &src, "IPE-N0005");
+    }
+}
+
+/// A Float set element is refused at lowering, not at name resolution, when
+/// the head is spelled through its declaring module.
+#[test]
+fn a_float_set_spelled_through_its_module_reaches_lowering() {
+    let src = format!(
+        "{HEAD}\nimport Ipe.Io as Io\nimport Ipe.Set as Set\n\n\
+         s : Set.Set Float\ns =\n    Set.fromList [ 1.5 ]\n\n\
+         main = Io.println \"ok\"\n"
+    );
+    assert_rejected("declared_home_float_set", &src, "IPE-L0117");
+}
+
+/// `Cells` names no type: the Tui view type is `Screen`.
+#[test]
+fn builtin_witness_cells_is_not_a_type() {
+    let src = builtin_witness_program("", "Cells", "Int");
+    assert_rejected("builtin_witness_cells", &src, "IPE-N0002");
+}
+
+/// A kernel qualifier that does not export a view alias name does not alias
+/// it: `Http.Element` is IPE-N0005.
+#[test]
+fn builtin_witness_view_alias_needs_its_export() {
+    let src = builtin_witness_program("import Ipe.Http as Http", "Http.Element", "Int");
+    assert_rejected("builtin_witness_kernel_view_alias", &src, "IPE-N0005");
+}
+
 /// The open-import sweep: one program opens every compiled-source stdlib module
 /// a plain `main` may import, and compiles, so no stdlib type or constructor
 /// addition can reject an open importer that does not use the name.
@@ -1398,6 +1593,36 @@ fn canon_open_imports_tui_and_cells_share_column_and_compile() {
     assert_compiles("canon_open_tui_cells_column", &src);
 }
 
+/// `Ipe.Ui.Cells` re-exports the `Attribute` it imports from `Ipe.Ui.Tui`, so
+/// a re-export carries the definition's home: open imports of both modules
+/// bind one `Attribute`, and a bare `Attribute Msg` annotation resolves
+/// without IPE-N0024.
+#[test]
+fn canon_open_imports_tui_and_cells_share_attribute_and_compile() {
+    let mut src = HEAD.to_owned();
+    src.push_str(
+        "\nimport Ipe.Tea.Tui as Tui\n\
+         import Ipe.Ui.Tui exposing (..)\n\
+         import Ipe.Ui.Cells exposing (..)\n\
+         import Ipe.Tea.Tui.Cmd\n\
+         import Ipe.Tea.Tui.Sub\n\n\
+         type Msg = NoOp\n\n\
+         type alias Model = { count : Int }\n\n\
+         attrs : List (Attribute Msg)\n\
+         attrs =\n    []\n\n\
+         init : () -> ( Model, Cmd Msg )\n\
+         init _unit =\n    ( { count = 0 }, Cmd.none )\n\n\
+         update : Msg -> Model -> ( Model, Cmd Msg )\n\
+         update _msg model =\n    ( model, Cmd.none )\n\n\
+         view : Model -> Screen Msg\n\
+         view _model =\n    column attrs []\n\n\
+         subscriptions : Model -> Sub Msg\n\
+         subscriptions _model =\n    Sub.none\n\n\
+         main =\n    Tui.tea\n        { init = init, update = update, view = view\n        , subscriptions = subscriptions\n        }\n",
+    );
+    assert_compiles("canon_open_tui_cells_attribute", &src);
+}
+
 /// The shape app-leaf names (`WebApp` / `TuiApp` / `CliApp`) are
 /// deliberately NOT reserved — a user program may soundly declare
 /// `type WebApp = …` and use it, and the lowerer's empty-home guard keeps that
@@ -1455,12 +1680,12 @@ fn canon_custom_element_use_resolves_and_lowers() {
     assert_compiles("canon_custom_element_use", &src);
 }
 
-/// A QUALIFIED spelling of the boundary type (`D.CustomElement …` through an
-/// imported module) is checked by NAME regardless of its non-empty home: the
-/// arity + SEAL gates pass for two primitives, so it too type-RESOLVES at canon
-/// and now lowers — never slipping past a home gate into a build-time ICE.
+/// A QUALIFIED spelling of the boundary type through a module that does not
+/// export it (`D.CustomElement …` with `D` = `Ipe.Dict`) names no type: no
+/// module exports `CustomElement`, so the use is IPE-N0005, never the row
+/// minted at a home that does not declare it.
 #[test]
-fn canon_custom_element_qualified_use_resolves_and_lowers() {
+fn canon_custom_element_qualified_through_a_non_exporter_is_no_such_member() {
     let src = format!(
         "{HEAD}import Ipe.Dict as D\n\
          import Ipe.Io as Io\n\
@@ -1470,7 +1695,7 @@ fn canon_custom_element_qualified_use_resolves_and_lowers() {
          main =\n\
          \x20   Io.println \"ok\"\n"
     );
-    assert_compiles("canon_custom_element_qualified", &src);
+    assert_rejected("canon_custom_element_qualified", &src, "IPE-N0005");
 }
 
 /// The boundary SEAL accepts plain, closed, concrete value types transitively:
@@ -2043,6 +2268,288 @@ fn canon_duplicate_qualifier() {
             "canon_dup_qualifier: expected IPE-N0027, got {got} — WRONG reason"
         ),
         Outcome::Accepted(how) => fail_accepted("canon_dup_qualifier", "IPE-N0027", &how),
+    }
+}
+
+/// A dependency that exports the union `Box` and declares the private union
+/// `Hidden` and the private alias `Tally`.
+const QUALIFIED_DEP: &str = "module Dep exposing (Box, box)\n\n\
+                             type Box = Box Int\n\n\
+                             type Hidden = Hidden Int\n\n\
+                             type alias Tally = Int\n\n\
+                             box : Box\nbox =\n    Box 1\n";
+
+/// A `Main` whose `f` takes a `ty` under `import Dep as D`.
+fn qualified_type_main(ty: &str) -> String {
+    format!(
+        "{HEAD}\nimport Dep as D\nimport Ipe.Io as Io\n\n\
+         f : {ty} -> Int\nf _ =\n    0\n\n\
+         main = Io.println \"ok\"\n"
+    )
+}
+
+/// Compile `QUALIFIED_DEP` plus a `Main` naming `ty`; the outcome.
+fn compile_qualified_type(name: &str, ty: &str) -> Outcome {
+    compile_project(
+        name,
+        &[
+            ("Dep.ipe", QUALIFIED_DEP),
+            ("Main.ipe", &qualified_type_main(ty)),
+        ],
+    )
+}
+
+/// Assert `ty` under `import Dep as D` is refused with `expected`.
+#[track_caller]
+fn assert_qualified_type_rejected(name: &str, ty: &str, expected: &str) {
+    match compile_qualified_type(name, ty) {
+        Outcome::Rejected(got) => assert_eq!(
+            got, expected,
+            "{name}: expected {expected}, got {got} — WRONG reason"
+        ),
+        Outcome::Accepted(how) => fail_accepted(name, expected, &how),
+    }
+}
+
+/// A qualified type the dependency does not declare is IPE-N0005, never a
+/// union minted at the dependency's home.
+#[test]
+fn canon_qualified_undeclared_type_is_no_such_member() {
+    assert_qualified_type_rejected("canon_qualified_undeclared", "D.Nope", "IPE-N0005");
+}
+
+/// A union the dependency declares and does not expose is IPE-N0022.
+#[test]
+fn canon_qualified_private_union_is_not_exposed() {
+    assert_qualified_type_rejected("canon_qualified_private_union", "D.Hidden", "IPE-N0022");
+}
+
+/// An alias the dependency declares and does not expose is IPE-N0022.
+#[test]
+fn canon_qualified_private_alias_is_not_exposed() {
+    assert_qualified_type_rejected("canon_qualified_private_alias", "D.Tally", "IPE-N0022");
+}
+
+/// A builtin row name the dependency neither declares nor exports is
+/// IPE-N0005 whatever the row's role: a non-reserved row (`Value`, `Order`)
+/// is never minted as the dependency's union.
+#[test]
+fn canon_qualified_unexported_row_name_is_no_such_member() {
+    for ty in ["D.Value", "D.Order", "D.Algorithm"] {
+        assert_qualified_type_rejected(
+            &format!("canon_qualified_row_{}", ty.trim_start_matches("D.")),
+            ty,
+            "IPE-N0005",
+        );
+    }
+}
+
+/// The exported union resolves through its qualifier.
+#[test]
+fn canon_qualified_exported_union_compiles() {
+    match compile_qualified_type("canon_qualified_exported_union", "D.Box") {
+        Outcome::Accepted(how) => assert!(
+            how.starts_with("compiled successfully"),
+            "canon_qualified_exported_union: a non-pipeline failure ({how})"
+        ),
+        Outcome::Rejected(got) => assert!(
+            false_marker(),
+            "canon_qualified_exported_union: `D.Box` is exported, but ipe REJECTED it with {got}"
+        ),
+    }
+}
+
+/// `Basics.Order` names the builtin `Ipe.Basics` exposes, and its
+/// constructors match it exhaustively.
+#[test]
+fn canon_qualified_basics_order_compiles() {
+    let src = format!(
+        "{HEAD}\nimport Ipe.Basics as Basics\nimport Ipe.Io as Io\nimport Ipe.String as String\n\n\
+         rank : Basics.Order -> Int\nrank o =\n    case o of\n        \
+         LT ->\n            0\n\n        EQ ->\n            1\n\n        \
+         GT ->\n            2\n\n\
+         main = Io.println (String.fromInt (rank (compare 1 2)))\n"
+    );
+    assert_compiles("canon_qualified_basics_order", &src);
+}
+
+/// The type names an `exposing (…)` list names, constructors aside.
+fn exposed_type_names<'a>(
+    items: impl Iterator<Item = &'a ipe_syntax::Exposed>,
+) -> Vec<ipe_intern::Symbol> {
+    items
+        .filter_map(|item| match item {
+            ipe_syntax::Exposed::Type(name, _) => Some(*name),
+            ipe_syntax::Exposed::Value(_) => None,
+        })
+        .collect()
+}
+
+/// Every `(module, type)` pair where a stdlib module brings the type into its
+/// own scope through an `import … exposing (N)` and does not export it.
+///
+/// Read through the language's own parser over every importable stdlib
+/// module, embedded and compiled-source alike. A module exporting `(..)` and a
+/// type the module itself declares are left out, so each pair names a type in
+/// the module's scope by import alone. The second list names every module the
+/// parser refused, so an unreadable module fails the caller instead of
+/// silently shrinking the enumeration.
+fn stdlib_reimported_unexported_types() -> (Vec<(&'static str, String)>, Vec<&'static str>) {
+    use ipe_syntax::Exposing;
+
+    let modules = ipe_stdlib::MODULES
+        .iter()
+        .map(|module| (module.name, module.source))
+        .chain(
+            ipe_stdlib::COMPILED_STD_MODULES
+                .iter()
+                .map(|module| (module.dotted, module.source)),
+        );
+    let mut pairs = Vec::new();
+    let mut unparsed = Vec::new();
+    for (module_name, source) in modules {
+        let mut interner = ipe_intern::Interner::new();
+        let Ok(parsed) = ipe_parse::parse_module(source, &mut interner) else {
+            unparsed.push(module_name);
+            continue;
+        };
+        let Exposing::List(exports) = &parsed.exposing.value else {
+            continue;
+        };
+        let exported = exposed_type_names(exports.iter().map(|item| &item.value));
+        let declared: Vec<ipe_intern::Symbol> = parsed
+            .unions
+            .iter()
+            .map(|union| union.value.name.value)
+            .chain(parsed.aliases.iter().map(|alias| alias.value.name.value))
+            .collect();
+        for import in &parsed.imports {
+            let Exposing::List(items) = &import.exposing.value else {
+                continue;
+            };
+            for name in exposed_type_names(items.iter().map(|item| &item.value)) {
+                if exported.contains(&name) || declared.contains(&name) {
+                    continue;
+                }
+                if let Some(text) = interner.resolve(name) {
+                    pairs.push((module_name, text.to_owned()));
+                }
+            }
+        }
+    }
+    pairs.sort();
+    pairs.dedup();
+    (pairs, unparsed)
+}
+
+/// `Main` naming `Q.{ty}` in a signature under `import {module} as Q`.
+fn reimport_main(module: &str, ty: Option<&str>) -> String {
+    let signature = ty.map_or_else(String::new, |ty| {
+        format!("f : Q.{ty} -> Int\nf _ =\n    0\n\n")
+    });
+    format!(
+        "{HEAD}\nimport {module} as Q\nimport Ipe.Io as Io\n\n\
+         {signature}main = Io.println \"ok\"\n"
+    )
+}
+
+/// A type a stdlib module imports into its scope but does not re-export is
+/// IPE-N0005 through that module's qualifier, never a resolved type.
+///
+/// A refusal under another code is checked against a bare import of the same
+/// module: a module the user may not import is refused before any type is
+/// named, so it proves nothing here and is skipped; any other code is a failure.
+#[test]
+fn a_type_imported_but_not_reexported_is_no_such_member() {
+    let (pairs, unparsed) = stdlib_reimported_unexported_types();
+    assert!(
+        unparsed.is_empty(),
+        "the enumeration must read every stdlib module, the parser refused: {unparsed:?}"
+    );
+    let mut seen = 0_usize;
+    let mut failures = Vec::new();
+    for (module, ty) in &pairs {
+        let slug = format!("reimport_{}_{ty}", module.replace('.', "_"));
+        match compile(&slug, &reimport_main(module, Some(ty)), Target::Native) {
+            Outcome::Rejected("IPE-N0005") => seen += 1,
+            Outcome::Rejected(got) => {
+                let control = compile(
+                    &format!("{slug}_control"),
+                    &reimport_main(module, None),
+                    Target::Native,
+                );
+                if !matches!(control, Outcome::Rejected(code) if code == got) {
+                    failures.push(format!("{module}.{ty}: refused with {got}"));
+                }
+            }
+            Outcome::Accepted(how) => failures.push(format!("{module}.{ty}: accepted ({how})")),
+        }
+    }
+    assert!(
+        seen > 0,
+        "no stdlib re-imported type was refused with IPE-N0005: the enumeration \
+         found {} pairs",
+        pairs.len()
+    );
+    assert!(
+        failures.is_empty(),
+        "a type in a module's scope by import alone must be IPE-N0005 through its \
+         qualifier:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// A source dependency `A` declaring `T`, `B` importing `T` from it without
+/// exporting it, and a `Main` naming `{ty}` under `import A` and `import B`.
+fn reimport_project(name: &str, ty: &str) -> Outcome {
+    let main = format!(
+        "{HEAD}\nimport A\nimport B\nimport Ipe.Io as Io\n\n\
+         f : {ty} -> Int\nf _ =\n    0\n\n\
+         main = Io.println B.label\n"
+    );
+    compile_project(
+        name,
+        &[
+            ("A.ipe", "module A exposing (T(..))\n\ntype T = T\n"),
+            (
+                "B.ipe",
+                "module B exposing (label)\n\nimport A exposing (T(..))\n\n\
+                 make : T\nmake =\n    T\n\n\
+                 label : String\nlabel =\n    \"ok\"\n",
+            ),
+            ("Main.ipe", &main),
+        ],
+    )
+}
+
+/// `B.T` is IPE-N0005 when `B` imports `T` from `A` without exporting it.
+#[test]
+fn a_source_dependency_reimport_is_no_such_member() {
+    match reimport_project("source_dep_reimport_unexported", "B.T") {
+        Outcome::Rejected(got) => assert_eq!(
+            got, "IPE-N0005",
+            "source_dep_reimport_unexported: expected IPE-N0005, got {got} — WRONG reason"
+        ),
+        Outcome::Accepted(how) => {
+            fail_accepted("source_dep_reimport_unexported", "IPE-N0005", &how);
+        }
+    }
+}
+
+/// The companion acceptance: the same project naming `A.T`, through the module
+/// that exports it, compiles, so the refusal above is `B`'s missing export and
+/// nothing broader.
+#[test]
+fn a_source_dependency_type_resolves_through_its_exporter() {
+    match reimport_project("source_dep_reimport_exporter", "A.T") {
+        Outcome::Accepted(how) => assert!(
+            how.starts_with("compiled successfully"),
+            "source_dep_reimport_exporter: a non-pipeline failure ({how})"
+        ),
+        Outcome::Rejected(got) => assert!(
+            false_marker(),
+            "source_dep_reimport_exporter: `A` exports `T`, but ipe REJECTED `A.T` with {got}"
+        ),
     }
 }
 

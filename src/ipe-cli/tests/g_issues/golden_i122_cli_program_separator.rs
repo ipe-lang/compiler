@@ -1,21 +1,16 @@
-//! oracle parity check for `Cli.tea`'s view printer. A
-//! `view` that doesn't append its own trailing newline gets renders glued
-//! together with NOTHING in between, and exactly ONE trailing newline after
-//! the event loop exits. This matches the runtime's
-//! `cliPrintView` contract byte-for-byte: it "writes the result to stdout
-//! WITHOUT a trailing newline (the user's prompt formatting decides whether
-//! to add one)".
+//! `Cli.tea`'s frame separator when stdout is not a terminal.
 //!
-//! Forcing a newline after every render would break `examples/shapes/terminal/simple-counter`'s
-//! REPL-prompt UX (`view` returns `"count=... > "` with no trailing newline so
-//! the cursor stays on the prompt line) and diverge from the golden reference.
-//! This test asserts the CORRECT (golden-verified) glued-together behavior so
-//! a future "fix" doesn't reintroduce that divergence.
+//! A `view` that supplies no trailing newline of its own keeps the cursor on
+//! its last line only on one echoing terminal (see
+//! `ipe_runtime::terminal_access::decide_line`). Into a pipe the same program
+//! writes plain lines, each frame terminated by its own newline, with no
+//! styling (its bold line included) and nothing after the last one: piped
+//! output is line-oriented text a script can read.
 //!
 //! Gated on `IPE_E2E=1`. Run:
 //!
 //! ```text
-//! IPE_E2E=1 cargo test -p ipe --test golden_i122_console_app_separator
+//! IPE_E2E=1 cargo nextest run -p ipe --test g_issues golden_i122
 //! ```
 
 use std::path::PathBuf;
@@ -26,7 +21,7 @@ fn repo_root() -> PathBuf {
 }
 
 #[test]
-fn console_app_glues_consecutive_renders_matching_go_oracle() {
+fn piped_console_app_writes_one_line_per_render() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
@@ -56,13 +51,17 @@ fn console_app_glues_consecutive_renders_matching_go_oracle() {
     );
 
     assert_eq!(outcome.exit_code, Some(0));
-    // golden-verified: renders glue together (view supplies no separator of its
-    // own), with exactly ONE trailing newline after the loop exits.
-    let expected = "lines: 0lines: 1lines: 2\n";
+    // Piped stdout: each render's lines end in their own newline, the bold
+    // line is written unstyled, and no extra newline follows the last one.
+    let expected = "count\nlines: 0\ncount\nlines: 1\ncount\nlines: 2\n";
     assert_eq!(
         outcome.stdout, expected,
-        "Cli.tea must match the view-printer contract (no per-render \
-         newline, one trailing newline at exit), got: {:?}",
+        "a piped Cli.tea must write one plain line per render, got: {:?}",
+        outcome.stdout
+    );
+    assert!(
+        !outcome.stdout.contains('\u{1b}') && !outcome.stdout.contains('\r'),
+        "piped output carries no escape sequence (no bold SGR) and no CR: {:?}",
         outcome.stdout
     );
 }

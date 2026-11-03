@@ -159,7 +159,7 @@ pub fn register(facts: &'static InstallFacts) {
         }
         Err(refusal) => {
             crate::core::eprint_task_error(&refusal.to_string());
-            crate::system::system_exit(1);
+            crate::system::exit_process(crate::system::ProcessStatus::FAILURE);
         }
     }
 }

@@ -23,7 +23,9 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[];
 
 #[test]
 fn cli_surface_is_non_empty() {
-    let items = CliSurface.all();
+    let items = CliSurface
+        .all()
+        .expect("the live CLI surface must enumerate");
     assert!(
         !items.is_empty(),
         "the CLI surface must enumerate at least one item",
@@ -32,7 +34,9 @@ fn cli_surface_is_non_empty() {
 
 #[test]
 fn cli_surface_contains_known_subcommands() {
-    let items = CliSurface.all();
+    let items = CliSurface
+        .all()
+        .expect("the live CLI surface must enumerate");
     let labels: Vec<String> = items.iter().map(CliSurface::label).collect();
 
     // These are stable subcommands — their absence means the SSOT drifted.
@@ -55,8 +59,18 @@ fn cli_surface_contains_known_subcommands() {
 
 #[test]
 fn cli_surface_is_deterministic() {
-    let first: Vec<String> = CliSurface.all().iter().map(CliSurface::label).collect();
-    let second: Vec<String> = CliSurface.all().iter().map(CliSurface::label).collect();
+    let first: Vec<String> = CliSurface
+        .all()
+        .expect("the live CLI surface must enumerate")
+        .iter()
+        .map(CliSurface::label)
+        .collect();
+    let second: Vec<String> = CliSurface
+        .all()
+        .expect("the live CLI surface must enumerate")
+        .iter()
+        .map(CliSurface::label)
+        .collect();
     assert_eq!(
         first, second,
         "two enumerations of the CLI surface must be identical",
@@ -65,7 +79,9 @@ fn cli_surface_is_deterministic() {
 
 #[test]
 fn subcommand_and_flag_items_are_distinct_kinds() {
-    let items = CliSurface.all();
+    let items = CliSurface
+        .all()
+        .expect("the live CLI surface must enumerate");
     let has_subcommand = items
         .iter()
         .any(|i| matches!(i, CliItem::Subcommand { .. }));
@@ -81,7 +97,7 @@ fn subcommand_and_flag_items_are_distinct_kinds() {
 fn cli_columns_pass_over_the_whole_surface() {
     use std::fmt::Write as _;
 
-    let report = matrix::run_cli_surface();
+    let report = matrix::run_cli_surface().expect("the CLI matrix run must not fail closed");
 
     let mut unexpected = String::new();
     for h in report.holes.iter().filter(|h| {
@@ -107,7 +123,7 @@ fn cli_columns_pass_over_the_whole_surface() {
 
 #[test]
 fn allowlisted_holes_are_still_real() {
-    let report = matrix::run_cli_surface();
+    let report = matrix::run_cli_surface().expect("the CLI matrix run must not fail closed");
     for (aspect, label, reason) in ALLOWLIST {
         let present = report
             .holes
@@ -126,7 +142,7 @@ fn not_advertised_unimplemented_column_passes_today() {
     // Every current command must have a real implementation — no `todo!()`
     // or `unimplemented!()` in any handler. This pins that the anti-advertise
     // gate is green and alerts immediately if a stub slips in.
-    let report = matrix::run_cli_surface();
+    let report = matrix::run_cli_surface().expect("the CLI matrix run must not fail closed");
     let stubs: Vec<&ipe::coverage::matrix::Hole> = report
         .holes
         .iter()

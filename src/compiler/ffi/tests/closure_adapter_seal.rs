@@ -116,8 +116,6 @@ fn closure_adapter_builds_and_runs() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let cargo = ipe_env::var("CARGO").expect("cargo sets CARGO for every test it runs");
-
     let total_region = emit_closure("Fn(Int) -> Int + Send + Sync + 'static");
     let result_region = emit_closure("Fn(Int) -> Result<Int, Error> + Send + Sync + 'static");
     // Keep only the sentinel-bracketed wrapper regions; drop the emitted
@@ -202,18 +200,19 @@ fn main() {{
     );
     std::fs::write(dir.join("src").join("main.rs"), main_rs).expect("main.rs");
 
-    let out = std::process::Command::new(&cargo)
-        .arg("run")
-        .arg("--quiet")
-        .current_dir(&dir)
-        .output()
-        .expect("cargo run spawns");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let ran = e2e_support::build_and_run_rust("ffi_closure_adapter", &dir);
     assert!(
-        out.status.success(),
+        ran.is_ok(),
+        "{}",
+        ran.as_ref().err().map_or("", String::as_str)
+    );
+    let run = ran.expect("asserted Ok above");
+    let stdout = &run.stdout;
+    assert_eq!(
+        run.exit_code,
+        Some(0),
         "emitted closure adapter crate must build and run exit 0.\n\
-         stdout: {stdout}\nstderr: {stderr}"
+         stdout: {stdout}"
     );
     assert!(
         stdout.contains("44 42"),

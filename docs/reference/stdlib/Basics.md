@@ -4,13 +4,13 @@
 
 [Back to stdlib index](../stdlib.md)
 
-Ipe.Basics — the implicit prelude (Tier-A auto-import, compiled source).
+Ipe.Basics — the implicit prelude, imported into every module.
 
-Each binding routes to its runtime kernel via `Kernel.kernel`. Polymorphic
-members with ordering or numeric obligations (`clamp`, `min`, `max`,
-`negate`, `abs`, `compare`) carry the bound implicitly — the type-checker's
-`Comparable`/`Number` obligation rejects a function, record, list, or tuple
-argument before it monomorphises. `sqrt` is monomorphically `Float -> Float`.
+Polymorphic members with ordering or numeric obligations (`clamp`, `min`,
+`max`, `negate`, `abs`, `compare`) carry the bound implicitly — the
+type-checker's `Comparable`/`Number` obligation rejects a function, record,
+list, or tuple argument. `sqrt` is monomorphically `Float -> Float`. The
+builtin `Order` is exposed so `Basics.Order` names it.
 
 ## `identity`
 
@@ -112,11 +112,13 @@ modBy : Int -> Int -> Int
 divisor.
 
 This follows the mathematical modulo convention (not C-style remainder):
-the result is always in the range `[0, abs divisor)` when `divisor > 0`.
+the result is always in the range `[0, divisor)` when `divisor > 0`, and in
+`(divisor, 0]` when `divisor < 0`.
 
 ```ipe
 modBy 3 10 --> 1
 modBy 3 (-1) --> 2
+modBy (-3) 10 --> -2
 modBy 5 0 --> 0
 ```
 

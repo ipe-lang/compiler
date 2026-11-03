@@ -580,6 +580,7 @@ pub fn build_with_options_into(
     compile_modules(
         sources,
         discovered,
+        project::CompiledDeps::none(),
         &entry_path,
         &target,
         runtime_dir,
@@ -644,6 +645,7 @@ pub fn build_loose_file_into(
     compile_modules(
         collected.sources,
         collected.discovered,
+        project::CompiledDeps::none(),
         &collected.entry_module_path,
         &target,
         runtime_dir,
@@ -659,7 +661,8 @@ pub fn build_loose_file_into(
 /// closure and the FFI preparation were all read once, from the handles `root`
 /// holds, so nothing is discovered or read again here. The settings are the
 /// manifest's, the ones the project build uses, its database driver included,
-/// but for the test crate's name.
+/// but for the test crate's name. The runtime is resolved from those options
+/// through [`resolve_vendored_runtime_dir`], as `ipe dev build` resolves it.
 ///
 /// Returns the claimed crate directory.
 ///
@@ -667,22 +670,21 @@ pub fn build_loose_file_into(
 /// [`CliError::Pipeline`] when the compiler rejects the program; [`CliError::Io`]
 /// on any filesystem failure; [`CliError::StaticRefusal`] when the emitted app
 /// shape cannot be static; [`CliError::OutputRefused`] when `out` overlaps the
-/// project's `src/` or `tests/` tree.
+/// project's `src/` or `tests/` tree; the refusals of
+/// [`resolve_vendored_runtime_dir`] and of the compile core's runtime
+/// resolution.
 pub fn build_test_into(
     root: &ProjectRoot,
     view: &TestView,
     host: crate::delivery::HostIntent,
     out: OutTarget<'_>,
-    runtime_dir: &Path,
 ) -> Result<EmittedCrate, CliError> {
     let manifest_path = root.path().join(crate::package_manifest::PACKAGE_IPE);
     let test_sources = root.test_sources_path();
     let target =
         out.prove(&ProjectPaths::from_manifest(root.manifest()).with_sources(&test_sources))?;
-    let options = BuildOptions {
-        intent: ipe_backend_rust::BuildIntent::Development,
-        ..BuildOptions::from_env()
-    };
+    let options = test_build_options();
+    let runtime_dir = resolve_vendored_runtime_dir(None, options.runtime_emit())?;
     let settings = emit_settings(
         &SettingsSource::Manifest {
             manifest: root.manifest(),
@@ -702,13 +704,23 @@ pub fn build_test_into(
         super::PackageSourceSet::from_test_view(view),
         view.entry(),
         &target,
-        runtime_dir,
+        &runtime_dir,
         &blame_path,
         settings,
         cache_site.as_ref(),
         &options,
     )
     .0
+}
+
+/// The options a test program builds with: the environment's emit model at
+/// the development intent.
+#[must_use]
+pub fn test_build_options() -> BuildOptions {
+    BuildOptions {
+        intent: ipe_backend_rust::BuildIntent::Development,
+        ..BuildOptions::from_env()
+    }
 }
 
 /// A loose entry plus the sibling modules its imports reach, ready to feed the shared compile core.
@@ -954,7 +966,8 @@ pub enum CacheOutcome {
 /// injection seam is identical on the single-file and project paths.
 ///
 /// `blame_path` is the file a cross-file diagnostic with no single owner (an
-/// import cycle) is rendered against.
+/// import cycle) is rendered against; `deps` proves the dependencies of the
+/// manifest the sources were read under were honored or refused.
 ///
 /// # Errors
 /// [`CliError::Pipeline`] carrying the first compiler diagnostic; [`CliError::Io`]
@@ -963,6 +976,7 @@ pub enum CacheOutcome {
 pub fn compile_modules(
     sources: BTreeMap<Vec<String>, (PathBuf, String)>,
     discovered: Vec<project::DiscoveredModule>,
+    deps: project::CompiledDeps,
     entry_path: &[String],
     target: &EmitTarget,
     runtime_dir: &Path,
@@ -974,6 +988,7 @@ pub fn compile_modules(
     compile_modules_observed(
         sources,
         discovered,
+        deps,
         entry_path,
         target,
         runtime_dir,
@@ -1010,6 +1025,7 @@ pub fn compile_modules(
 pub fn compile_modules_observed(
     sources: BTreeMap<Vec<String>, (PathBuf, String)>,
     discovered: Vec<project::DiscoveredModule>,
+    deps: project::CompiledDeps,
     entry_path: &[String],
     target: &EmitTarget,
     runtime_dir: &Path,
@@ -1022,7 +1038,8 @@ pub fn compile_modules_observed(
         return (Err(refusal), CacheOutcome::Miss);
     }
     // The same stdlib-closure and FFI injection capability inference sees.
-    let source_set = match super::PackageSourceSet::assemble(sources, discovered, blame_path) {
+    let source_set = match super::PackageSourceSet::assemble(sources, discovered, blame_path, deps)
+    {
         Ok(set) => set,
         Err(e) => return (Err(e), CacheOutcome::Miss),
     };
@@ -3003,10 +3020,10 @@ pub fn build_parsed_project_into(
     options: &BuildOptions,
     host: crate::delivery::HostIntent,
 ) -> Result<EmittedCrate, CliError> {
-    let (sources, discovered) = super::read_package_modules(manifest)?;
+    let (sources, discovered, deps) = super::read_package_modules(manifest)?;
     refuse_debugger_without_runtime_dep(options)?;
     refuse_webview_off_web(host, manifest, &sources)?;
-    let source_set = super::PackageSourceSet::assemble(sources, discovered, manifest_path)?;
+    let source_set = super::PackageSourceSet::assemble(sources, discovered, manifest_path, deps)?;
     build_from_sources_for(
         manifest,
         manifest_path,
@@ -3146,7 +3163,9 @@ fn build_from_sources_for(
         && !manifest.exposed_modules.is_empty()
         && !source_set.has_module(&entry_path)
     {
-        return Err(CliError::Usage(text::msg::library_package_no_entry()));
+        return Err(CliError::ProjectRefused(
+            text::msg::library_package_no_entry(),
+        ));
     }
     // The emit epilogue's fixed `fn main` calls `ipe_main`, which the backend
     // names only for a `main` in module `Main`. A `programs`-declared entry in a
@@ -3155,7 +3174,7 @@ fn build_from_sources_for(
     // so emitting a non-`Main` program entry would miscompile. Refuse cleanly and
     // point at the working analysis path rather than emit a broken crate.
     if entry_path != ["Main".to_owned()] {
-        return Err(CliError::Usage(text::msg::build_entry_not_main(
+        return Err(CliError::ProjectRefused(text::msg::build_entry_not_main(
             &entry_path.join("."),
         )));
     }
@@ -3207,31 +3226,57 @@ pub fn resolve_runtime() -> Result<PathBuf, CliError> {
     .map_err(|_| CliError::RuntimeNotFound)
 }
 
+/// What runtime source an emit carries, read from the options the emit runs with.
+///
+/// The one input [`resolve_vendored_runtime_dir`] decides on, so whether a
+/// build needs the vendored tree is never chosen apart from the emit shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeEmit {
+    /// The emitted project names the runtime crate as a path dependency and
+    /// carries no vendored module tree.
+    Linked,
+    /// The emitted project carries the runtime module tree under `src/ipe_runtime/`.
+    Vendored,
+}
+
+impl BuildOptions {
+    /// The runtime source the emit these options drive carries.
+    #[must_use]
+    pub const fn runtime_emit(&self) -> RuntimeEmit {
+        if self.links_runtime_dependency() {
+            RuntimeEmit::Linked
+        } else {
+            RuntimeEmit::Vendored
+        }
+    }
+}
+
 /// Resolve the vendored runtime MODULE tree the emit copies into the project,
 /// but only when that emit shape actually needs it.
 ///
-/// The dependency-model native emit (the default) carries no vendored
-/// `src/ipe_runtime/` tree — it names the runtime as a path dependency, resolved
-/// separately by [`runtime_embed::resolve`] — so requiring a vendored tree up
-/// front would fail a perfectly valid build run outside a repo checkout. The
-/// vendored tree is needed only when the vendored shape is emitted: the wasm
-/// target (which still vendors) or a build with the dependency model turned off.
+/// Every command that emits a crate resolves its runtime tree here, from the
+/// [`RuntimeEmit`] of the options its emit runs with. A linked emit carries no
+/// vendored `src/ipe_runtime/` tree: it names the runtime as a path
+/// dependency, resolved inside the compile core by [`runtime_embed::resolve_for`]
+/// (`$IPE_RUNTIME_DIR`, the in-repo crate, or the installed embedded copy), so
+/// requiring a vendored tree up front would fail a valid build run outside a
+/// repo checkout. Only a [`RuntimeEmit::Vendored`] emit needs the tree.
 ///
 /// `cli_override` is the explicit `--runtime <dir>` value, honoured verbatim when
 /// present. When the vendored tree is not needed, an empty sentinel path is
-/// returned; the dep-model native emit never reads it.
+/// returned; the linked emit never reads it.
 ///
 /// # Errors
 /// [`CliError::RuntimeNotFound`] / [`CliError::Io`] from [`resolve_runtime`] when
 /// a vendored tree is required but cannot be located.
 pub fn resolve_vendored_runtime_dir(
     cli_override: Option<String>,
-    needs_vendored: bool,
+    emit: RuntimeEmit,
 ) -> Result<PathBuf, CliError> {
-    match cli_override {
-        Some(r) => Ok(PathBuf::from(r)),
-        None if needs_vendored => resolve_runtime(),
-        None => Ok(PathBuf::new()),
+    match (cli_override, emit) {
+        (Some(r), _) => Ok(PathBuf::from(r)),
+        (None, RuntimeEmit::Vendored) => resolve_runtime(),
+        (None, RuntimeEmit::Linked) => Ok(PathBuf::new()),
     }
 }
 

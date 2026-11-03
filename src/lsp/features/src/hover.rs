@@ -43,9 +43,7 @@ pub fn hover(
     byte: u32,
     docs: Option<&ipe_docs::Index>,
 ) -> Option<HoverInfo> {
-    let types = ipe_db::typecheck_module(db, root, entry, module_file)
-        .as_ref()
-        .ok()?;
+    let types = crate::db_access::module_types(db, root, entry, module_file)?;
     // Innermost wins: narrowest containing span, latest start as tiebreaker.
     let mut best: Option<(u32, u32)> = None; // (width, lo)
     for span in types.regions.keys() {
@@ -80,16 +78,19 @@ pub fn hover(
     });
     // When the hovered binding carries no `{-| … -}` doc of its own, fall back
     // to the `ipe_docs` index: resolve the identifier under the cursor to its
-    // home + name and surface the stdlib symbol's or module's real doc. This
+    // declaration and surface the stdlib symbol's or module's real doc. This
     // never overrides a binding's own doc, and an identifier that resolves to
-    // no documented entry (a user binding) yields nothing — fail-closed.
-    // `resolve_name_at` acquires the interner internally, so it is called
-    // before the explicit lock below.
+    // no documented entry (a user binding, a local binder) yields nothing —
+    // fail-closed. `resolve_name_at` acquires the interner internally, so it is
+    // called before the explicit lock below.
     let doc = doc.or_else(|| {
         let index = docs?;
         let resolved = crate::navigation::resolve_name_at(db, root, entry, module, byte)?;
-        crate::docs_lookup::symbol_doc(index, &resolved.module, &resolved.name)
-            .or_else(|| crate::docs_lookup::module_doc(index, &resolved.module))
+        let crate::navigation::NameTarget::Declared { module, name } = resolved.target else {
+            return None;
+        };
+        crate::docs_lookup::symbol_doc(index, &module, &name)
+            .or_else(|| crate::docs_lookup::module_doc(index, &module))
     });
     let interner = db.interner().lock();
     let mut namer = ipe_types::VarNamer::new();

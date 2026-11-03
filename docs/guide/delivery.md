@@ -30,7 +30,7 @@ Only the `Web` shape has these axes. A `tui`, `cli`, `worker`, or `script` app
 builds one way, so it has no runtime or host to choose.
 
 The full rationale — why webview is a host and not a shape, why `served` is never
-spelled out — is [ADR 0005](../adr/0005-delivery-shapes-runtimes-hosts-targets.md).
+spelled out — is [ADR 0005](https://github.com/ipe-lang/compiler/blob/main/docs/adr/0005-delivery-shapes-runtimes-hosts-targets.md).
 
 ## The `delivery` record
 
@@ -45,7 +45,7 @@ package =
     , version = "0.1.0"
     , delivery =
         { desktop = { title = "UI Layout", width = 1024, height = 768 }
-        , mobile = { bundleId = "com.example.uilayout", orientation = Portrait }
+        , mobile = { bundleId = "io.acme.uilayout", orientation = Portrait }
         , browser = { basePath = "/" }
         }
     }
@@ -91,17 +91,19 @@ Package it:
 ipe release build web desktop
 ```
 
-This compiles the app and lays out a bundle for the host OS:
+This compiles the app and lays out a bundle for the host OS. Every release writes
+under its own `out/release/<delivery>/` — the delivery words joined by `-`, here
+`web-desktop` — so the deliveries of one `release build` never overwrite each other:
 
 ```
-packaged `ui-layout` for linux → out/release/dist/linux/ui-layout
+packaged `ui-layout` for linux → out/release/web-desktop/dist/linux/ui-layout
   This app requires WebKitGTK at runtime (Debian/Ubuntu: libwebkit2gtk-4.1-0).
 ```
 
 The Linux bundle is a self-contained tree:
 
 ```
-out/release/dist/linux/ui-layout/
+out/release/web-desktop/dist/linux/ui-layout/
   bin/                 the compiled binary
   ui-layout.desktop    the desktop-entry launcher
   RUNTIME.txt          the runtime dependency note
@@ -140,17 +142,17 @@ ipe release build web client android
 This builds the wasm bundle and materialises a native shell:
 
 ```
-  wasm bundle ready at out/release/rust/www/
-  bundle size: 196 KB (out/release/rust/www/pkg/ipe_app_bg.wasm)
-packaged `ui-layout` for android → out/release/dist/android/ui-layout-android
-  note: an Android shell project is written here; run `./gradlew assembleDebug`
-        inside it with the Android SDK to produce an APK.
+  wasm bundle ready at out/release/web-client-android/release/web-client/rust/www/
+  bundle size: 196 KB (out/release/web-client-android/release/web-client/rust/www/pkg/ipe_app_bg.wasm)
+packaged `ui-layout` for android → out/release/web-client-android/dist/android/ui-layout-android
+  note: an unsigned Android Gradle project is written here. To build it:
+    ...
 ```
 
 The Android shell is a ready-to-build Gradle project; the client rides under
 `app/src/main/assets/www/` and a `WebViewAssetLoader` serves it same-origin, so
-there is no remote host and no `file://` access. Finish the APK with
-`./gradlew assembleDebug` where the Android SDK is present.
+there is no remote host and no `file://` access. See
+[Android (emulator)](#android-emulator) below for the build steps.
 
 `ipe release build web client ios` writes the equivalent Xcode project (`WKWebView` +
 `WKURLSchemeHandler`). Its layout and derived-permission manifest are written for
@@ -170,7 +172,7 @@ run the packaged build instead, launch the emitted binary directly:
 
 ```
 ipe release build web desktop
-./out/release/dist/linux/<name>/bin/<name>
+./out/release/web-desktop/dist/linux/<name>/bin/<name>
 ```
 
 Linux needs WebKitGTK (`libwebkit2gtk-4.1-0`); macOS uses the system WebKit;
@@ -178,38 +180,40 @@ Windows needs the Edge WebView2 runtime. On a **headless** box (CI, a server),
 run it under a virtual display:
 
 ```
-xvfb-run -a ./out/release/dist/linux/<name>/bin/<name>
+xvfb-run -a ./out/release/web-desktop/dist/linux/<name>/bin/<name>
 ```
 
 ### Android (emulator)
 
 `release web client android` writes a Gradle project to
-`out/release/dist/android/<name>-android/`. With the Android SDK on `PATH`:
+`out/release/web-client-android/dist/android/<name>-android/`. To **simulate**, boot an emulator
+first (or start one from Android Studio's Device Manager):
 
 ```
-cd out/release/dist/android/<name>-android
-./gradlew assembleDebug          # → app/build/outputs/apk/debug/app-debug.apk
+emulator -avd <your-avd> &
 ```
 
-To **simulate**, boot an emulator and install the debug build onto it:
+With the Android SDK on `PATH`, `cd` into `out/release/web-client-android/dist/android/<name>-android/`
+and:
 
-```
-emulator -avd <your-avd> &       # or start one from Android Studio's Device Manager
-./gradlew installDebug           # builds + installs onto the running emulator/device
-# or: adb install app/build/outputs/apk/debug/app-debug.apk
-```
+<!-- android-build-steps -->
+1. `gradle wrapper` once with Gradle 8.7 or newer — the project ships no wrapper.
+2. `./gradlew assembleDebug` (Android SDK, API 34) builds an APK signed with the SDK's debug key, for local install only.
+3. `./gradlew installDebug` installs it onto a running emulator or device.
+4. Store build: add a `signingConfig` for your keystore to `app/build.gradle`, then run `./gradlew assembleRelease`.
+<!-- /android-build-steps -->
 
 `adb`, `emulator`, and `avdmanager` (to create an AVD once) all ship with the
 Android SDK.
 
 ### iOS (simulator)
 
-`release web client ios` writes an Xcode project to `out/release/dist/ios/<name>-ios/` (a
+`release web client ios` writes an Xcode project to `out/release/web-client-ios/dist/ios/<name>-ios/` (a
 `WKWebView` plus a scheme handler serving the wasm client). Simulating needs
 **macOS + Xcode**:
 
 ```
-open out/release/dist/ios/<name>-ios/          # open the Xcode project, pick an iOS Simulator, press ⌘R
+open out/release/web-client-ios/dist/ios/<name>-ios/          # open the Xcode project, pick an iOS Simulator, press ⌘R
 # headless macOS:
 xcrun simctl boot "iPhone 15"
 xcodebuild -scheme App -destination 'platform=iOS Simulator,name=iPhone 15'
@@ -248,7 +252,7 @@ path selects a project other than the current directory.
 
 ## Where to go next
 
-- [ADR 0005](../adr/0005-delivery-shapes-runtimes-hosts-targets.md) — the two-axis delivery
+- [ADR 0005](https://github.com/ipe-lang/compiler/blob/main/docs/adr/0005-delivery-shapes-runtimes-hosts-targets.md) — the two-axis delivery
   model in full: the four TEA shapes plus the direct bucket, the two web runtimes,
   and why each is where it is.
 - `ipe doc Ipe.Package` — every `delivery`, `wasm`, and `capabilities` field.

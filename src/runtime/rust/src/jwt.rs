@@ -59,10 +59,16 @@ fn header_json(alg: &str) -> String {
 /// Re-encode a claims JSON string as deterministic sorted-key canonical JSON so
 /// the signed payload bytes (sorted object keys at every depth, HTML-escape shape)
 /// are byte-stable, independent of the ambient object-order encoder setting.
-/// Returns the bad-claims error message on a parse failure.
+///
+/// A parse failure routes through [`super::json::json_failure`] — the single
+/// source for json decode failures — so the message carries a typed kind and
+/// a position, never the caller-supplied claims text (which may hold secrets
+/// the token encodes).
 fn payload_json(claims_json: &str) -> Result<String, String> {
-    let value: JsonVal =
-        serde_json::from_str(claims_json).map_err(|e| format!("bad claims json: {}", e))?;
+    let value: JsonVal = serde_json::from_str(claims_json).map_err(|e| {
+        let crate::error::IpeError::Error(_, info) = super::json::json_failure(&e);
+        info.message
+    })?;
     Ok(super::json_enc_canonical(&value))
 }
 
@@ -100,8 +106,11 @@ impl std::fmt::Display for ClaimsRefusal {
 impl std::error::Error for ClaimsRefusal {}
 
 /// A JSON number as whole Unix seconds, flooring toward −∞ so a token is never
-/// accepted longer than its fractional `exp` states. `None` when the number has
-/// no `f64` reading.
+/// accepted longer than its fractional `exp` states.
+///
+/// `None` when the number has no `f64` reading or its floor lies outside
+/// `i64` (`1e300`), so the claim is refused rather than read as a saturated
+/// timestamp.
 ///
 /// Flooring is the conservative direction for both claims:
 ///   - `exp 0.4` → `0`  (already expired at epoch; rejected)
@@ -109,7 +118,10 @@ impl std::error::Error for ClaimsRefusal {}
 ///     matching integer-second oracle behaviour)
 ///   - `exp -0.1` → `-1` (negative, unconditionally in the past; rejected)
 fn number_seconds(n: &serde_json::Number) -> Option<i64> {
-    n.as_i64().or_else(|| n.as_f64().map(|f| f.floor() as i64))
+    n.as_i64().or_else(|| {
+        n.as_f64()
+            .and_then(|f| crate::narrow::f64_trunc_to_i64(f.floor()))
+    })
 }
 
 /// Read the NumericDate claim `claim` (RFC 7519 §2: any JSON number, may be
@@ -122,7 +134,8 @@ fn number_seconds(n: &serde_json::Number) -> Option<i64> {
 ///
 /// [`ClaimsRefusal::NotAnObject`] when `claims` is not a JSON object;
 /// [`ClaimsRefusal::NonNumericDate`] when the claim is present but not a
-/// readable number (a string, `null`, a boolean, an array, an object).
+/// readable number (a string, `null`, a boolean, an array, an object, or a
+/// number whose seconds lie outside `i64`).
 pub(crate) fn read_numeric_date(
     claims: &JsonValue,
     claim: &'static str,
@@ -175,10 +188,7 @@ pub(crate) fn decode_payload(token: &str) -> Option<JsonValue> {
 /// Current wall-clock time as Unix seconds (i64). Used by the flat decoders to
 /// pre-reject expired/not-yet-valid tokens before handing off to jsonwebtoken.
 pub(crate) fn now_unix_seconds() -> i64 {
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => d.as_secs() as i64,
-        Err(_) => 0,
-    }
+    crate::narrow::unix_secs()
 }
 
 /// The HMAC-key floor for HS256, in bytes (256 bits — RFC 7518 §3.2).
@@ -201,7 +211,7 @@ pub(crate) fn hs256_short_secret_msg(op: &str, actual_len: usize) -> String {
 }
 
 /// Ipê `Jwt_encodeHs256 : String -> String -> Result Error String`
-pub fn jwt_encode_hs256<E: From<String>>(
+pub fn jwt_encode_hs256<E: crate::DecodeErrorSink>(
     secret: String,
     claims_json: String,
 ) -> IpeResult<E, String> {
@@ -216,7 +226,7 @@ pub fn jwt_encode_hs256<E: From<String>>(
     }
     let payload = match payload_json(&claims_json) {
         Ok(p) => p,
-        Err(e) => return IpeResult::Err(format!("jwt-encode: {}", e).into()),
+        Err(e) => return IpeResult::Err(E::from_decode_failure(format!("jwt-encode: {}", e))),
     };
     let signing_input = format!(
         "{}.{}",
@@ -320,13 +330,13 @@ pub fn jwt_decode_hs256<E: From<String>>(secret: String, token: String) -> IpeRe
 }
 
 /// Ipê `Jwt_encodeRs256 : String -> String -> Result Error String`
-pub fn jwt_encode_rs256<E: From<String>>(
+pub fn jwt_encode_rs256<E: crate::DecodeErrorSink>(
     key_pem: String,
     claims_json: String,
 ) -> IpeResult<E, String> {
     let payload = match payload_json(&claims_json) {
         Ok(p) => p,
-        Err(e) => return IpeResult::Err(format!("jwt-encode-rs: {}", e).into()),
+        Err(e) => return IpeResult::Err(E::from_decode_failure(format!("jwt-encode-rs: {}", e))),
     };
     let signing_input = format!(
         "{}.{}",
@@ -409,14 +419,14 @@ pub fn jwt_decode_rs256<E: From<String>>(key_pem: String, token: String) -> IpeR
 
 // ── Concrete aliases for generated Rust code ─────────────────────────────────
 //
-// The generic `jwt_encode_hs256<E: From<String>>` and friends cannot be
-// called directly from generated code where the `Err` arm may be discarded —
-// Rust cannot infer `E` in that context. These monomorphic aliases pin
-// `E = IpeError` and are what `naming::kernel_name()` maps the Jwt kernels to,
-// mirroring the `ipe_aes_gcm_encrypt` pattern in `crypto.rs`.
+// The generic `jwt_encode_hs256<E: crate::DecodeErrorSink>` and friends cannot
+// be called directly from generated code where the `Err` arm may be
+// discarded — Rust cannot infer `E` in that context. These monomorphic
+// aliases pin `E = IpeError` and are what `naming::kernel_name()` maps the Jwt
+// kernels to, mirroring the `ipe_aes_gcm_encrypt` pattern in `crypto.rs`.
 //
-// SECURITY: only the error message crosses the `From<String>` boundary; no
-// key material is included in error text (see the suppressed RSA key detail
+// SECURITY: only the error message crosses the sink boundary; no key
+// material is included in error text (see the suppressed RSA key detail
 // above). These wrappers add no new logging surface.
 
 /// Generated-code alias for `jwt_encode_hs256` with `E = String`.
@@ -764,12 +774,41 @@ mod tests {
         assert!(matches!(bad, IpeResult::Err(_)));
     }
 
+    /// Malformed claims JSON is a decode failure (RFC 7519 §7.1's producer-side
+    /// JSON object), never the catch-all `Unexpected` the `From<String>` bridge
+    /// would otherwise assign — and the message must not echo the caller's
+    /// (potentially secret-bearing) claims text.
+    #[test]
+    fn jwt_bad_claims_json_is_decode() {
+        let secret = "bad-claims-secret-0123456789abcdef".to_string();
+        let hs: IpeResult<crate::error::IpeError, String> =
+            jwt_encode_hs256(secret, "{oops SENTINEL".to_string());
+        let crate::error::IpeError::Error(hs_kind, hs_info) = match hs {
+            IpeResult::Err(e) => e,
+            IpeResult::Ok(t) => panic!("expected a decode error, got a token: {t}"),
+        };
+        assert!(
+            matches!(hs_kind, crate::IpeErrorKind::Decode),
+            "{hs_kind:?}"
+        );
+        assert!(!hs_info.message.contains("SENTINEL"), "{}", hs_info.message);
+
+        let rs: IpeResult<crate::error::IpeError, String> =
+            jwt_encode_rs256(RS256_PRIV_PEM.to_string(), "{oops SENTINEL".to_string());
+        let crate::error::IpeError::Error(rs_kind, rs_info) = match rs {
+            IpeResult::Err(e) => e,
+            IpeResult::Ok(t) => panic!("expected a decode error, got a token: {t}"),
+        };
+        assert!(
+            matches!(rs_kind, crate::IpeErrorKind::Decode),
+            "{rs_kind:?}"
+        );
+        assert!(!rs_info.message.contains("SENTINEL"), "{}", rs_info.message);
+    }
+
     /// Seconds since the Unix epoch, for building boundary-exercising claims.
     fn now_unix() -> i64 {
-        match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            Ok(d) => d.as_secs() as i64,
-            Err(_) => 0,
-        }
+        crate::narrow::unix_secs()
     }
 
     #[test]
@@ -1453,5 +1492,62 @@ mod tests {
             admit_time_claims(&serde_json::json!("exp"), 0),
             Err(ClaimsRefusal::NotAnObject)
         );
+    }
+
+    /// A date claim whose seconds lie outside `i64` is refused, never read as
+    /// a saturated timestamp that would keep the token alive forever.
+    #[test]
+    fn date_claims_past_i64_refused() {
+        let claims = serde_json::json!({
+            "exp": 1e300,
+            "nbf": -1e300,
+            "iat": 9.3e18,
+            "edge": -9_223_372_036_854_775_808.0,
+            "wide": u64::MAX,
+        });
+        for claim in ["exp", "nbf", "iat", "wide"] {
+            assert_eq!(
+                read_numeric_date(&claims, claim),
+                Err(ClaimsRefusal::NonNumericDate { claim })
+            );
+        }
+        assert_eq!(read_numeric_date(&claims, "edge"), Ok(Some(i64::MIN)));
+        assert_eq!(
+            admit_time_claims(&serde_json::json!({"exp": 1e300}), 0),
+            Err(ClaimsRefusal::NonNumericDate { claim: "exp" })
+        );
+        // An integer `exp` past `i64` (one jsonwebtoken reads as a `u64`) is
+        // refused too, never admitted as the saturated `i64::MAX`.
+        assert_eq!(
+            admit_time_claims(&serde_json::json!({"exp": u64::MAX}), 0),
+            Err(ClaimsRefusal::NonNumericDate { claim: "exp" })
+        );
+        // The `-2^63` edge is only compared, never subtracted: as `exp` it is
+        // long past, as `nbf` long reached.
+        let edge = -9_223_372_036_854_775_808.0_f64;
+        assert_eq!(
+            admit_time_claims(&serde_json::json!({"exp": edge}), i64::MIN),
+            Err(ClaimsRefusal::Expired)
+        );
+        assert_eq!(
+            admit_time_claims(&serde_json::json!({"nbf": edge}), i64::MIN),
+            Ok(())
+        );
+        assert!(matches!(
+            flat_hs256(hs256_token(&format!(r#"{{"sub":"x","exp":{}}}"#, u64::MAX))),
+            IpeResult::Err(_)
+        ));
+        let msg = refusal(builder_hs256(
+            500,
+            hs256_token(r#"{"sub":"x","exp":1e300}"#),
+        ));
+        assert!(
+            msg.ends_with("Jwt.decode: token `exp` is not a NumericDate"),
+            "unexpected refusal {msg}"
+        );
+        assert!(matches!(
+            flat_hs256(hs256_token(r#"{"sub":"x","exp":1e300}"#)),
+            IpeResult::Err(_)
+        ));
     }
 }

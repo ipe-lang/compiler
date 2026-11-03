@@ -418,7 +418,7 @@ impl AuditOptions {
 /// capabilities, version, and dependency graph every check reads.
 ///
 /// # Errors
-/// [`CliError::Usage`] / [`CliError::Usage`] on argument misuse or a
+/// [`CliError::Usage`] on argument misuse; [`CliError::ProjectRefused`] for a
 /// package with no manifest; [`CliError::Pipeline`] / [`CliError::Io`] when the
 /// package cannot be built or read; [`CliError::PackageAudit`] when a Tier-1
 /// check rejects the package (the gate's hard reject).
@@ -456,8 +456,7 @@ pub fn run_audit_as(
 /// Capture the package `path` names (a directory or its `package.ipe`) in one walk.
 ///
 /// # Errors
-/// [`CliError::Usage`] when `path` names no `package.ipe`; the
-/// [`PackageSnapshot::capture`] refusals otherwise.
+/// As [`locate_manifest`]; the [`PackageSnapshot::capture`] refusals otherwise.
 pub fn capture_package(path: &Path) -> Result<PackageSnapshot, CliError> {
     capture_manifest_root(&locate_manifest(path)?)
 }
@@ -918,6 +917,9 @@ fn set_format(slot: &mut Option<OutputFormat>, requested: OutputFormat) -> Resul
 fn prepare(snapshot: PackageSnapshot) -> Result<Prepared, CliError> {
     let manifest = snapshot.manifest();
     let manifest_path = crate::driver::snapshot_manifest_path(&snapshot);
+    // A declared dependency is refused before any step touches the package
+    // tree or runs its foreign code; the source set below re-mints the proof.
+    let _compiled = manifest.compiled_dependencies()?;
 
     // Reject wrapper-only packages: the gate cannot regenerate wrapper bindings
     // from an independent pinned source, so a committed `_bindings.rs` must
@@ -1142,17 +1144,18 @@ fn ffi_cache_path_or_reject(project_root: &Path) -> Result<PathBuf, CliError> {
 /// Resolve `path` (a directory or a `package.ipe`) to its manifest file.
 ///
 /// # Errors
-/// [`CliError::Usage`] when the directory holds no `package.ipe`, or `path`
-/// is neither a directory nor a `package.ipe`.
+/// [`CliError::ProjectRefused`] when the directory holds no `package.ipe`;
+/// [`CliError::Usage`] when the path argument names neither a directory nor a
+/// `package.ipe`.
 fn locate_manifest(path: &Path) -> Result<PathBuf, CliError> {
     if path.is_dir() {
         if let Some(manifest) = crate::project::manifest_in_dir(path) {
             return Ok(manifest);
         }
         if crate::project::has_only_legacy_toml(path) {
-            return Err(CliError::Usage(text::msg::legacy_toml_hint()));
+            return Err(CliError::ProjectRefused(text::msg::legacy_toml_hint()));
         }
-        return Err(CliError::Usage(text::msg::audit_no_manifest(
+        return Err(CliError::ProjectRefused(text::msg::audit_no_manifest(
             &path.display(),
         )));
     }
@@ -1573,9 +1576,9 @@ pub(crate) fn disclose_package(path: &Path) -> Result<Disclosure, CliError> {
     // are read once and both derivations judge that one read.
     let manifest_path = locate_manifest(path)?;
     let manifest = crate::project::parse_manifest(&manifest_path)?;
-    let (sources, entries) = crate::driver::read_package_modules(&manifest)?;
+    let (sources, entries, deps) = crate::driver::read_package_modules(&manifest)?;
     let source_set =
-        crate::driver::PackageSourceSet::assemble(sources.clone(), entries, &manifest_path)?;
+        crate::driver::PackageSourceSet::assemble(sources.clone(), entries, &manifest_path, deps)?;
     let inferred = crate::driver::infer_package_capabilities_of(&source_set)?;
     derive_disclosure(&manifest, &sources, inferred)
 }
@@ -2781,6 +2784,42 @@ mod tests {
         );
     }
 
+    /// A package that declares a dependency is refused before the FFI cache is
+    /// purged or any binding regenerated, so the refusal leaves its tree as found.
+    #[test]
+    fn prepare_refuses_a_declared_dependency_before_touching_the_tree() {
+        let dir = make_test_dir("dep-refused-first");
+        let src = dir.join("src");
+        std::fs::create_dir(&src).expect("create src/");
+        std::fs::write(src.join("Main.ipe"), "module Main exposing (..)\n")
+            .expect("write Main.ipe");
+        std::fs::write(
+            dir.join("package.ipe"),
+            "module Package exposing (package)\n\n\npackage =\n\
+             \x20   { name = \"dep-pkg\", version = \"0.1.0\"\n\
+             \x20   , dependencies = [ depPath \"s-lib\" \"../s-lib\" ]\n\
+             \x20   }\n",
+        )
+        .expect("write package.ipe");
+        let cache = dir.join(ipe_ffi::driver::FFI_CACHE_REL);
+        std::fs::create_dir_all(&cache).expect("create committed cache");
+        std::fs::write(cache.join("kept_bindings.rs"), "pub fn kept() {}\n")
+            .expect("plant committed bindings");
+
+        let result = capture_package(&dir).and_then(prepare);
+        let survived = cache.join("kept_bindings.rs").exists();
+        if let Ok(prepared) = &result {
+            let _ = std::fs::remove_dir_all(&prepared.emitted_dir);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(&result, Err(CliError::DependencyNotCompiled { .. })),
+            "a declared dependency must be refused: {:?}",
+            result.as_ref().err()
+        );
+        assert!(survived, "the refusal must leave the package tree as found");
+    }
+
     /// A manifest with no FFI sections (pure Ipê) is not affected by the wrapper
     /// guard and must parse with `has_rust_wrapper = false`.
     #[test]
@@ -3693,7 +3732,7 @@ mod tests {
             driver: ipe_backend_rust::DbDriver::default(),
             static_request: crate::build_plan::StaticRequestLayer::default(),
             wasm: crate::project::WasmConfig::default(),
-            dependencies: BTreeMap::new(),
+            dependencies: crate::project::DeclaredDeps::default(),
             rust_dependencies: BTreeMap::new(),
             capabilities: BTreeSet::new(),
             capabilities_accept: BTreeSet::new(),
@@ -4591,7 +4630,7 @@ mod tests {
         #[test]
         fn the_ambient_scan_sees_a_vendored_runtime_resolution() {
             let mutated = format!(
-                "{AUDIT_SOURCE}\nfn vendored_tree() -> bool {{ crate::resolve_vendored_runtime_dir(None, true).is_ok() }}\n"
+                "{AUDIT_SOURCE}\nfn vendored_tree() -> bool {{ crate::resolve_vendored_runtime_dir(None, RuntimeEmit::Vendored).is_ok() }}\n"
             );
             let hits = ambient_reads(&mutated).unwrap_or_default();
             assert_eq!(

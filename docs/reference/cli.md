@@ -23,7 +23,7 @@ Scaffold a new Ipê project.
 ipe init [<directory>] [<shape>] [<runtime>]
 ```
 
-**Arguments:** directory: where to scaffold (`.` or omitted → the current directory). shape: script | tui | cli | server | web (default web) — picks the template. runtime (web only): `client` for the self-contained client; omit it for served (the default, never written) — seeds the default delivery. Host and target are delivery choices, chosen later at build/release. On a TTY an omitted positional is prompted; a re-run reconciles (creates only missing files) and refuses a shape that conflicts with the existing `main`.
+**Arguments:** directory: where to scaffold (`.` or omitted → the current directory). shape: script | tui | cli | server | web (default web) — picks the template. runtime (web only): `client` for the self-contained client; omit it for served (the default, never written) — seeds the declared delivery set (`ships`) and the delivery the next steps build. Host and target are delivery choices, chosen later at build/release. On a TTY an omitted positional is prompted; a re-run reconciles (creates only missing files) and refuses a shape that conflicts with the existing `main`.
 
 **Flags:**
 
@@ -57,7 +57,7 @@ Verbs:
 
 ### `ipe type-check`
 
-Type-check a program without building or running it.
+Check a program through type inference and lowering, without building or running it.
 
 ```
 ipe type-check [<path>]
@@ -177,7 +177,7 @@ Look up documentation, generate API docs (docs.json + Markdown + HTML), query th
 ipe doc [list | serve | check | <key> | <Module.Name>] [<path>]
 ```
 
-**Arguments:** Without a subcommand: generate docs.json + renderings for the project and stdlib. `<key>`: look up any entity by key — a diagnostic code (IPE-L0107), symbol (List.map), module (List), member (Ipe.Time.unixMillis), language construct (case), or CLI command (version), bare or as `kind:key` (construct:case); a key that names nothing lists up to ten of the closest entries of every kind, numbered, each as the exact term that opens it, and on a terminal asks which number to open (Enter cancels). `list`: list all stdlib + project modules (one per line; `--list` is a deprecated alias). `serve`: build the HTML site and preview it on loopback. `check`: verify doc-comment coverage for project modules (stdlib is exempt). `<Module.Name>`: show one module's types and values with signatures (e.g. `ipe doc Ipe.List`).
+**Arguments:** Without a subcommand: generate docs.json + renderings for the project and stdlib. `<key>`: look up any entity by key — a diagnostic code (IPE-L0107), symbol (List.map), module (List), member (Ipe.Time.unixMillis), language construct (case), CLI command (version), or binary operator (//, its meaning and precedence), bare or as `kind:key` (construct:case); a path spelled like an operator is written ./-prefixed; a key that names nothing lists up to ten of the closest entries of every kind, numbered, each as the exact term that opens it, and on a terminal asks which number to open (Enter cancels). `list`: list all stdlib + project modules (one per line; `--list` is a deprecated alias). `serve`: build the HTML site and preview it on loopback. `check`: verify doc-comment coverage for project modules (stdlib is exempt). `<Module.Name>`: show one module's types and values with signatures (e.g. `ipe doc Ipe.List`).
 
 **Flags:**
 
@@ -192,16 +192,16 @@ ipe doc [list | serve | check | <key> | <Module.Name>] [<path>]
 Format Ipê source files.
 
 ```
-ipe fmt [<path>]
+ipe fmt [<path>...]
 ```
 
-**Arguments:** A file or directory to format (`.` for the current directory).
+**Arguments:** Files and directories to format; a directory formats every `.ipe` under it (`.` when none is given). A file reached twice is formatted once. Every file is formatted before any is written, so one refused file leaves them all unchanged.
 
 **Flags:**
 
-- `[--check]` — report unformatted files without rewriting them
+- `[--check]` — report every unformatted file without rewriting any
 - `[--check --json|--plain]` — with --check, emit the unformatted file list as JSON ({"unformatted":[…]}) or one path per line
-- `[--stdin]` — format stdin to stdout (for editors and pipes); excludes <path>
+- `[--stdin]` — format stdin to stdout (for editors and pipes); excludes every <path>
 
 ### `ipe lsp`
 
@@ -326,7 +326,7 @@ Compile a program to a native or WebAssembly development artifact, with Debug.* 
 ipe dev build [<dir>] [<shape>] [<runtime>] [<host>] [<target>]
 ```
 
-**Arguments:** dir: a project directory (default: the current directory). shape is derived from `main` and, if written, only cross-checked. runtime/host apply to `web` only: `web` = served (served is the unnamed default, never written), `web client` = self-contained browser client (it derives the wasm target), and a host is desktop/ios/android. A `desktop`/`ios`/`android` host lays out the app bundle for that host (a fast dev bundle; `release build` with the same delivery words produces the production distributable). With no delivery args, `dev build` builds the default delivery — the fast one-artifact inner loop; `release build` builds every declared delivery. Delivery args select a subset or override for this invocation only and never edit package.ipe.
+**Arguments:** dir: a project directory (default: the current directory). shape is derived from `main` and, if written, only cross-checked. runtime/host apply to `web` only: `web` = served (served is the unnamed default, never written), `web client` = self-contained browser client (it derives the wasm target), and a host is desktop/ios/android. A `desktop`/`ios`/`android` host lays out the app bundle for that host (a fast dev bundle; `release build` with the same delivery words produces the production distributable). With no delivery args, `dev build` builds the one delivery declared in `ships` in package.ipe (the served default when `ships` is absent) and ignores its static or cross target; when `ships` declares several, it refuses and lists the command for each. `release build` builds every declared delivery. Delivery args select a subset or override for this invocation only and never edit package.ipe.
 
 **Output:** a native build lands the runnable binary at `out/bin/<project-name>` under the project (copied there within the build), so it is findable even when a shared `CARGO_TARGET_DIR` places cargo's own output outside the project.
 
@@ -352,7 +352,7 @@ Compile a program as a development build and run the resulting binary.
 ipe dev run [<dir>]
 ```
 
-**Arguments:** A project directory (default: the current directory).
+**Arguments:** A project directory (default: the current directory). With no delivery args, `dev run` runs the one delivery declared in `ships` in package.ipe (the served default when `ships` is absent); when `ships` declares several, it refuses and lists the command for each.
 
 **Flags:**
 
@@ -377,7 +377,7 @@ Rebuild and re-run a development build on every source change.
 ipe dev watch [<dir>]
 ```
 
-**Arguments:** A project directory (default: the current directory).
+**Arguments:** A project directory (default: the current directory). `dev watch` serves the delivery declared in package.ipe and refuses a `web client` delivery, stated or declared, which has no server to restart: build it with `ipe dev build web client`.
 
 **Flags:**
 
@@ -398,11 +398,11 @@ Build the production artifact, optimised and with Debug.* gated. Native-bearing 
 ipe release build [<dir>] [<shape>] [<runtime>] [<host>]
 ```
 
-**Arguments:** A project directory (default: the current directory). shape/runtime/host are the delivery grammar shared with `dev build`: a `desktop`/`ios`/`android` host lays out the production app bundle for that host (a self-contained desktop bundle, or a native mobile system-webview shell). An `android` host produces an unsigned Gradle project: a store build needs your own keystore configured in Gradle. With no delivery args, `release build` builds every delivery declared in package.ipe (`dev build` builds only the default one).
+**Arguments:** A project directory (default: the current directory). shape/runtime/host are the delivery grammar shared with `dev build`: a `desktop`/`ios`/`android` host lays out the production app bundle for that host (a self-contained desktop bundle, or a native mobile system-webview shell). An `android` host produces an unsigned Gradle project: a store build needs your own keystore configured in Gradle. With no delivery args, `release build` builds every delivery declared in `ships` in package.ipe, each for the target its ship names (the served default when `ships` is absent). Each delivery lands in its own `out/release/<delivery>/` (its words joined by `-`, e.g. `out/release/web-client/`, then `-<triple>` for a cross target), one delivery included.
 
 **Flags:**
 
-- `[--out <dir>]` — put the artifact under <dir>/release/ (default: out/ in the project)
+- `[--out <dir>]` — put the artifact under <dir>/release/<delivery>/ (default: out/ in the project)
 - `[--target <triple>]` — a musl-static native <triple> (default: x86_64-unknown-linux-musl). The browser bundle is `web client`, never a target; a `web client` or app-bundle delivery takes no target.
 - `[--static]` — produce a statically linked binary
 - `[--emit-permissions <ios|macos|android>]` — read-only: print the OS-permission declarations the app's accepted web capabilities derive on the platform, and build nothing
@@ -419,11 +419,11 @@ Build the production artifact (cached), then run exactly that artifact, jailed t
 ipe release run [<dir>|<artifact-dir>]
 ```
 
-**Arguments:** A project directory (default: the current directory), or a built artifact directory holding `ipe-wrapper`. Every run is confined: the default single binary jails itself, a bundle is verified against the floor embedded in its app and then jailed, and a pure-native binary runs jailed to its consented capabilities. An artifact directory runs as built, so it takes no build options. A `web client` build (with or without `desktop`/`ios`/`android`) or a served `web desktop` bundle has no run form and is refused: build it with `ipe release build`.
+**Arguments:** A project directory (default: the current directory), or a built artifact directory holding `ipe-wrapper`. Every run is confined: the default single binary jails itself, a bundle is verified against the floor embedded in its app and then jailed, and a pure-native binary runs jailed to its consented capabilities. An artifact directory runs as built, so it takes no build options. With no delivery args, `release run` builds and runs the one delivery declared in `ships` in package.ipe (the served default when `ships` is absent); when `ships` declares several, it refuses and lists the command for each. A `web client` build (with or without `desktop`/`ios`/`android`) or a served `web desktop` bundle has no run form and is refused: build it with `ipe release build`.
 
 **Flags:**
 
-- `[--out <dir>]` — put the artifact under <dir>/release/ (default: out/ in the project)
+- `[--out <dir>]` — put the artifact under <dir>/release/<delivery>/ (default: out/ in the project)
 - `[--target <triple>]` — a musl-static native <triple> (default: x86_64-unknown-linux-musl). The browser bundle is `web client`, never a target; a `web client` or app-bundle delivery takes no target.
 - `[--runtime <dir>]` — vendor the Ipê runtime source from <dir>
 - `[-- <args>...]` — forward <args> to the artifact

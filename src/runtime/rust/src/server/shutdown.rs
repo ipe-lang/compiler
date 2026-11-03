@@ -21,6 +21,7 @@
 //!
 //! A signal the process inherited as ignored stays ignored (Linux).
 
+use crate::system::ProcessStatus;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -42,9 +43,15 @@ pub const WORK_CANCEL_DEADLINE: Duration = Duration::from_millis(500);
 /// after another. The bound the shutdown tests hold the exit to;
 /// `server_shutdown_e2e` mirrors it.
 #[cfg(all(feature = "db", test))]
-pub const POOLS_CLOSE_BOUND: Duration = DB_CLOSE_DEADLINE
-    .saturating_mul(crate::db::CLOSE_STAGES as u32)
-    .saturating_add(WORK_CANCEL_DEADLINE);
+pub const POOLS_CLOSE_BOUND: Duration = {
+    // `CLOSE_STAGES` is a stage count of 2, far inside `u32`; `u32::try_from`
+    // is not callable in a `const`.
+    #[allow(clippy::cast_possible_truncation)]
+    let stages = crate::db::CLOSE_STAGES as u32;
+    DB_CLOSE_DEADLINE
+        .saturating_mul(stages)
+        .saturating_add(WORK_CANCEL_DEADLINE)
+};
 
 /// How long a draining WebSocket's close frame may take to send.
 pub const WS_CLOSE_DEADLINE: Duration = Duration::from_secs(1);
@@ -108,10 +115,10 @@ pub enum Signal {
 impl Signal {
     /// The exit status of a process this signal forces to end: `128 + signo`.
     #[must_use]
-    pub const fn forced_exit_code(self) -> i32 {
+    pub const fn forced_exit_status(self) -> ProcessStatus {
         match self {
-            Self::Interrupt => 130,
-            Self::Terminate => 143,
+            Self::Interrupt => ProcessStatus::INTERRUPTED,
+            Self::Terminate => ProcessStatus::TERMINATED,
         }
     }
 }
@@ -196,7 +203,7 @@ fn mark_draining() {
 const fn mark_draining() {}
 
 /// How the owner ends the process on a second signal.
-type Exit = Box<dyn Fn(i32) + Send + Sync>;
+type Exit = Box<dyn Fn(ProcessStatus) + Send + Sync>;
 
 /// The pool registry a stop closes.
 #[cfg(feature = "db")]
@@ -356,7 +363,7 @@ async fn run_signals(shutdown: Arc<Shutdown>, mut source: mpsc::Receiver<Signal>
                             shutdown.tag,
                             "forcing exit (second signal)",
                         );
-                        exit(signal.forced_exit_code());
+                        exit(signal.forced_exit_status());
                     }
                     None if !torn_down => teardown.as_mut().await,
                     None => {}
@@ -630,8 +637,8 @@ pub fn arm(plan: ShutdownPlan, grace: Duration) -> std::io::Result<Armed> {
         plan,
         grace,
         os_signals,
-        Box::new(|code| {
-            crate::system::exit_process(code);
+        Box::new(|status| {
+            crate::system::exit_process(status);
         }),
         process_pools(),
     )
@@ -935,7 +942,7 @@ pub mod tests {
             plan,
             grace,
             move || Ok(rx),
-            Box::new(move |code| exited.store(code, Ordering::SeqCst)),
+            Box::new(move |status: ProcessStatus| exited.store(status.code(), Ordering::SeqCst)),
             test_pools(),
         )
         .expect("an injected source arms");

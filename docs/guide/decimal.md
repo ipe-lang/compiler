@@ -28,7 +28,7 @@ Three knots.
 ## A worked example: exactness, safe division, and rounding
 
 The example under
-[`examples/shapes/script/decimal-rounding`](../../examples/shapes/script/decimal-rounding/src/Main.ipe)
+[`examples/shapes/script/decimal-rounding`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/decimal-rounding/src/Main.ipe)
 shows the three knots in a few lines.
 
 The classic float trap, avoided — `0.1 + 0.2` is exactly `0.3`:
@@ -88,7 +88,7 @@ explicit function is [ease of use][principles] in service of correctness: a
 "round" that silently picked one convention would be right for one domain and a
 subtle bug in another, so the choice is surfaced, not hidden.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

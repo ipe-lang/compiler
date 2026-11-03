@@ -120,11 +120,11 @@ mobile is `web client <os>`).
 
 | runtime | host | command | rendered view |
 |---------|------|---------|---------------|
-| served | browser | `ipe dev run` | ![web · served · browser](../assets/shapes/web-served-browser.png) |
-| client | browser | `ipe dev run` (wasm client) | ![web · client · browser](../assets/shapes/web-client-browser.png) |
-| served | desktop | `ipe release build web desktop` | same served view, in a WebKitGTK window ![web · served · desktop](../assets/shapes/web-served-browser.png) |
-| client | ios | `ipe release build web client ios` | same client view, in a `WKWebView` ![web · client · iOS](../assets/shapes/web-client-browser.png) |
-| client | android | `ipe release build web client android` | same client view, in an Android `WebView` ![web · client · Android](../assets/shapes/web-client-browser.png) |
+| served | browser | `ipe dev run` | ![web · served · browser](https://raw.githubusercontent.com/ipe-lang/compiler/main/docs/assets/shapes/web-served-browser.png) |
+| client | browser | `ipe dev build web client` (writes the wasm bundle and prints how to serve it) | ![web · client · browser](https://raw.githubusercontent.com/ipe-lang/compiler/main/docs/assets/shapes/web-client-browser.png) |
+| served | desktop | `ipe release build web desktop` | same served view, in a WebKitGTK window ![web · served · desktop](https://raw.githubusercontent.com/ipe-lang/compiler/main/docs/assets/shapes/web-served-browser.png) |
+| client | ios | `ipe release build web client ios` | same client view, in a `WKWebView` ![web · client · iOS](https://raw.githubusercontent.com/ipe-lang/compiler/main/docs/assets/shapes/web-client-browser.png) |
+| client | android | `ipe release build web client android` | same client view, in an Android `WebView` ![web · client · Android](https://raw.githubusercontent.com/ipe-lang/compiler/main/docs/assets/shapes/web-client-browser.png) |
 
 The last three rows reuse the browser capture on purpose: **every host renders
 the identical DOM** — desktop/iOS/Android only wrap it in a native shell — so the
@@ -158,6 +158,9 @@ Combine keys with other events through `Sub.batch` (e.g.
 `onKey` subscription is ignored. Passing `onKey` as a `Tui.tea` config field is
 **IPE-N0052**.
 
+An app ends itself through `System.exit` from `update`. Ctrl-C always ends it
+too, with the terminal restored and exit status 130; it never reaches `onKey`.
+
 The scaffolded counter (`Up` +, `Down` -, `q` quit) renders as:
 
 ```
@@ -189,6 +192,10 @@ main =
 
 A line with no active `onLine` subscription is ignored. Passing `onLine` as a
 `Cli.tea` config field is **IPE-N0052**.
+
+On a terminal each render is styled and a prompt keeps the cursor on its line.
+When stdout is a pipe or a file, each render is written as plain lines (no
+escape sequences) ending in a newline, so scripts can read the output.
 
 The scaffolded echo REPL (type text, `q` quits):
 

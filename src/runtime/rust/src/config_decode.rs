@@ -17,7 +17,7 @@ use super::*;
 // combinator is JSON-shaped (null => Nothing, else Just, inner error
 // propagated) and lives once, in the always-available `json` module, so
 // JsonDec / Config / Db.Decode share a single implementation.
-pub fn config_nullable<E: From<String> + 'static, T: 'static + Send>(
+pub fn config_nullable<E: DecodeErrorSink + 'static, T: 'static + Send>(
     decoder: Decoder<E, T>,
 ) -> Decoder<E, IpeMaybe<T>> {
     super::json::decode_nullable(decoder)
@@ -26,7 +26,7 @@ pub fn config_nullable<E: From<String> + 'static, T: 'static + Send>(
 // Config.maybe : Decoder a -> Decoder (Maybe a)
 // Unlike `nullable` (which only tolerates null/missing), `maybe` catches ANY
 // decode failure: `Just` on success, `Nothing` on any error. Never fails.
-pub fn config_maybe<E: From<String> + 'static, T: 'static + Send>(
+pub fn config_maybe<E: DecodeErrorSink + 'static, T: 'static + Send>(
     decoder: Decoder<E, T>,
 ) -> Decoder<E, IpeMaybe<T>> {
     let inner_fields = decoder.fields.clone();
@@ -43,7 +43,7 @@ pub fn config_maybe<E: From<String> + 'static, T: 'static + Send>(
 // Decode every object entry into a `Dict String a` (runtime `IpeDict<T>`),
 // applying `decoder` to each value. Non-object input is `Err`; the first entry
 // whose value fails short-circuits with its real error.
-pub fn config_dict<E: From<String> + 'static, T: 'static + Send>(
+pub fn config_dict<E: DecodeErrorSink + 'static, T: 'static + Send>(
     decoder: Decoder<E, T>,
 ) -> Decoder<E, IpeDict<T>> {
     Decoder::new(
@@ -61,42 +61,163 @@ pub fn config_dict<E: From<String> + 'static, T: 'static + Send>(
                 }
                 IpeResult::Ok(out)
             }
-            None => IpeResult::Err(str_err("expected object")),
+            None => IpeResult::Err(E::from_decode_failure("expected object".to_owned())),
         }),
         vec![],
     )
 }
 
-fn run_decoder<E: From<String> + 'static, T>(
+fn run_decoder<E: DecodeErrorSink + 'static, T>(
     parsed: Result<JsonVal, String>,
     decoder: Decoder<E, T>,
 ) -> IpeResult<E, T> {
     match parsed {
         Ok(v) => (decoder.run)(&v),
-        Err(e) => IpeResult::Err(str_err(&e)),
+        Err(e) => IpeResult::Err(E::from_decode_failure(e)),
     }
 }
 
 // Config.decodeJson : String -> Decoder a -> Result Error a
-pub fn config_decode_json<E: From<String> + 'static, T>(
+pub fn config_decode_json<E: DecodeErrorSink + 'static, T>(
     s: String,
     decoder: Decoder<E, T>,
 ) -> IpeResult<E, T> {
     run_decoder(
-        serde_json::from_str(&s).map_err(|e| format!("json parse: {}", e)),
+        serde_json::from_str(&s).map_err(|e| {
+            let IpeError::Error(_, info) = super::json::json_failure(&e);
+            info.message
+        }),
         decoder,
     )
 }
 
 // Config.decodeToml : String -> Decoder a -> Result Error a
-pub fn config_decode_toml<E: From<String> + 'static, T>(
+pub fn config_decode_toml<E: DecodeErrorSink + 'static, T>(
     s: String,
     decoder: Decoder<E, T>,
 ) -> IpeResult<E, T> {
     run_decoder(
-        toml::from_str(&s).map_err(|e| format!("toml parse: {}", e)),
+        toml::from_str(&s).map_err(|e| toml_failure(&s, &e)),
         decoder,
     )
+}
+
+/// Every static grammar label the TOML parser names in an `invalid <label>`
+/// refusal: the `StrContext::Label` strings of `toml_edit` 0.20.2 (this
+/// workspace's `toml` 0.8.2) and 0.22.27 (the newest `toml` 0.8 an emitted
+/// project resolves), which carry the same set. Sorted, so a lookup is a
+/// binary search.
+const TOML_GRAMMAR_LABELS: &[&str] = &[
+    "array",
+    "basic string",
+    "binary integer",
+    "date-time",
+    "escape sequence",
+    "floating-point number",
+    "hexadecimal integer",
+    "inline table",
+    "integer",
+    "key",
+    "literal string",
+    "multiline basic string",
+    "multiline literal string",
+    "octal integer",
+    "string",
+    "table header",
+    "time",
+    "time offset",
+    "unicode 4-digit hex code",
+    "unicode 8-digit hex code",
+];
+
+/// Whether `a` sorts strictly before `b` byte-wise.
+const fn str_before(a: &str, b: &str) -> bool {
+    let (mut a, mut b) = (a.as_bytes(), b.as_bytes());
+    loop {
+        match (a, b) {
+            ([x, a_rest @ ..], [y, b_rest @ ..]) => {
+                if *x != *y {
+                    return *x < *y;
+                }
+                a = a_rest;
+                b = b_rest;
+            }
+            ([], [_, ..]) => return true,
+            (_, []) => return false,
+        }
+    }
+}
+
+/// Whether `labels` is strictly ascending, so a binary search over it is exact.
+const fn strictly_ascending(mut labels: &[&str]) -> bool {
+    while let [first, rest @ ..] = labels {
+        if let [second, ..] = rest
+            && !str_before(first, second)
+        {
+            return false;
+        }
+        labels = rest;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if `TOML_GRAMMAR_LABELS` is not strictly sorted, which the `toml_category` binary search requires [ledger #boundary]
+const _: () = assert!(strictly_ascending(TOML_GRAMMAR_LABELS));
+
+/// The parse error for a TOML source, naming the failure and its position.
+///
+/// `toml`'s `Display` quotes the offending source line, and its description
+/// names the keys of a duplicate or dotted-key refusal, either of which may
+/// hold a secret. The message keeps only [`toml_category`] and the line and
+/// column where the failure starts.
+fn toml_failure(source: &str, error: &toml::de::Error) -> String {
+    let what = toml_category(error.message());
+    error
+        .span()
+        .and_then(|span| line_column(source, span.start))
+        .map_or_else(
+            || format!("toml parse: {what}"),
+            |(line, column)| format!("toml parse: {what} at line {line} column {column}"),
+        )
+}
+
+/// The category of a TOML parser description, carrying no input text.
+///
+/// A key-naming refusal keeps its category without the keys; a grammar
+/// refusal (`invalid <label>`) keeps its label only when the label is one of
+/// [`TOML_GRAMMAR_LABELS`]. Any other description is `invalid document`.
+fn toml_category(message: &str) -> String {
+    let first = message.lines().next().map_or("", str::trim);
+    if first.starts_with("duplicate key") {
+        return "duplicate key".to_owned();
+    }
+    if first.starts_with("dotted key") {
+        return "dotted key extends a value that is not a table".to_owned();
+    }
+    if first == "value is out of range" || first == "recursion limit exceeded" {
+        return first.to_owned();
+    }
+    first
+        .strip_prefix("invalid ")
+        .filter(|label| TOML_GRAMMAR_LABELS.binary_search(label).is_ok())
+        .map_or_else(
+            || "invalid document".to_owned(),
+            |label| format!("invalid {label}"),
+        )
+}
+
+/// The one-based line and character column of byte `offset` in `source`.
+///
+/// `None` when `offset` is past the end or not on a character boundary.
+fn line_column(source: &str, offset: usize) -> Option<(usize, usize)> {
+    let before = source.get(..offset)?;
+    let line = before.matches('\n').count().saturating_add(1);
+    let column = before
+        .rsplit('\n')
+        .next()
+        .map_or(0, |tail| tail.chars().count())
+        .saturating_add(1);
+    Some((line, column))
 }
 
 /// Default cap on a YAML source string parsed directly via `Config.decodeYaml`
@@ -118,7 +239,7 @@ const CONFIG_FILE_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling
 );
 
 // Config.decodeYaml : String -> Decoder a -> Result Error a
-pub fn config_decode_yaml<E: From<String> + FromLimitExceeded + 'static, T>(
+pub fn config_decode_yaml<E: DecodeErrorSink + FromLimitExceeded + FromIpeError + 'static, T>(
     s: String,
     decoder: Decoder<E, T>,
 ) -> IpeResult<E, T> {
@@ -127,7 +248,11 @@ pub fn config_decode_yaml<E: From<String> + FromLimitExceeded + 'static, T>(
     // expand into (aliases, events, nodes, depth, documents).
     let cap: usize = match YAML_SOURCE_CEILING.read() {
         Ok(cap) => cap,
-        Err(refusal) => return IpeResult::Err(str_err(&format!("yaml parse: {refusal}"))),
+        Err(refusal) => {
+            return IpeResult::Err(E::from_ipe_error(IpeError::invalid_input(format!(
+                "yaml parse: {refusal}"
+            ))));
+        }
     };
     if s.len() > cap {
         return IpeResult::Err(
@@ -292,7 +417,7 @@ impl YamlRefusal {
     }
 
     /// A ceiling breach is `LimitExceeded`; every other refusal is a decode error.
-    fn into_error<E: From<String> + FromLimitExceeded>(self) -> E {
+    fn into_error<E: DecodeErrorSink + FromLimitExceeded>(self) -> E {
         match self.kind {
             YamlRefusalKind::Limit(_) => LimitRefusal::new(self.message()).into_error(),
             YamlRefusalKind::Syntax
@@ -301,7 +426,7 @@ impl YamlRefusal {
             | YamlRefusalKind::MergeKey
             | YamlRefusalKind::UnsupportedTag
             | YamlRefusalKind::NonFiniteFloat
-            | YamlRefusalKind::Other => str_err(&self.message()),
+            | YamlRefusalKind::Other => E::from_decode_failure(self.message()),
         }
     }
 }
@@ -443,15 +568,20 @@ fn config_read_capped(path: &str, cap: u64) -> Result<String, KernelFailure> {
     // gate would pass and the subsequent slurp would read unbounded bytes.
     // Reject non-regular files outright, then bound the read at cap+1 bytes.
     use std::io::Read;
-    let file = std::fs::File::open(path).map_err(|e| format!("{}", e))?;
-    let meta = file.metadata().map_err(|e| format!("{}", e))?;
+    let failed =
+        |e: std::io::Error| KernelFailure::from(IoFailure::on_path("read config file", path, &e));
+    let file = std::fs::File::open(path).map_err(failed)?;
+    let meta = file.metadata().map_err(failed)?;
     if !meta.file_type().is_file() {
-        return Err(format!("config file {:?} is not a regular file", path).into());
+        return Err(failed(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        )));
     }
     if meta.len() > cap {
         return Err(LimitRefusal::new(format!(
-            "config file {:?} is {} bytes, over the {} byte cap (IPE_CONFIG_MAX_BYTES)",
-            path,
+            "config file {} is {} bytes, over the {} byte cap (IPE_CONFIG_MAX_BYTES)",
+            crate::error::shown_path(path),
             meta.len(),
             cap
         ))
@@ -462,11 +592,12 @@ fn config_read_capped(path: &str, cap: u64) -> Result<String, KernelFailure> {
     // or reports a misleading size, the read still can't exceed cap+1 bytes.
     file.take(cap.saturating_add(1))
         .read_to_string(&mut contents)
-        .map_err(|e| format!("{}", e))?;
+        .map_err(failed)?;
     if contents.len() as u64 > cap {
         return Err(LimitRefusal::new(format!(
-            "config file {:?} exceeds the {} byte cap (IPE_CONFIG_MAX_BYTES)",
-            path, cap
+            "config file {} exceeds the {} byte cap (IPE_CONFIG_MAX_BYTES)",
+            crate::error::shown_path(path),
+            cap
         ))
         .into());
     }
@@ -481,7 +612,10 @@ fn config_read_capped(path: &str, cap: u64) -> Result<String, KernelFailure> {
 // worker thread. The decode dispatch itself runs back on the calling task
 // after the read completes — decoding an already-in-memory, size-capped
 // (≤16 MiB default) string is fast enough not to warrant its own offload.
-pub fn config_load_from_file<E: crate::KernelErrorSink + Send + 'static, T: Send + 'static>(
+pub fn config_load_from_file<
+    E: crate::KernelErrorSink + crate::FromDecodeFailure + Send + 'static,
+    T: Send + 'static,
+>(
     path: crate::path::Path,
     decoder: Decoder<E, T>,
 ) -> IpeTask<E, T> {
@@ -495,7 +629,11 @@ pub fn config_load_from_file<E: crate::KernelErrorSink + Send + 'static, T: Send
         // (memory DoS). Default 16 MiB; override via IPE_CONFIG_MAX_BYTES.
         let cap: u64 = match CONFIG_FILE_CEILING.read() {
             Ok(cap) => cap,
-            Err(refusal) => return IpeResult::Err(str_err(&refusal.to_string())),
+            Err(refusal) => {
+                return IpeResult::Err(E::from_ipe_error(IpeError::invalid_input(
+                    refusal.to_string(),
+                )));
+            }
         };
         let contents = match crate::threads::join_blocking("Config.loadFromFile", {
             let path = path.clone();
@@ -631,6 +769,41 @@ mod load_from_file_tests {
         );
     }
 
+    /// A malformed `IPE_CONFIG_MAX_BYTES` is the operator's `InvalidInput`
+    /// naming the variable, never an `Unexpected` failure.
+    #[test]
+    fn malformed_config_ceiling_is_invalid_input() {
+        let p = crate::scratch_core::test_temp_root()
+            .join(format!("ipe_cfg_bad_cap_{}.json", std::process::id()));
+        std::fs::write(&p, r#"{"name": "ipe"}"#).unwrap();
+        crate::system::locked_set_var("IPE_CONFIG_MAX_BYTES", "abc");
+        let res: IpeResult<crate::IpeError, String> = block(config_load_from_file(
+            make_path(&p.to_string_lossy()),
+            kinded_name_decoder(),
+        ));
+        crate::system::locked_remove_var("IPE_CONFIG_MAX_BYTES");
+        let _ = std::fs::remove_file(&p);
+        assert!(
+            matches!(&res, IpeResult::Err(crate::IpeError::Error(crate::IpeErrorKind::InvalidInput, info))
+                if info.message.contains("IPE_CONFIG_MAX_BYTES")),
+            "a malformed config ceiling must be InvalidInput: {res:?}"
+        );
+    }
+
+    /// A malformed `IPE_YAML_MAX_BYTES` is `InvalidInput`, never `Unexpected`.
+    #[test]
+    fn malformed_yaml_ceiling_is_invalid_input() {
+        crate::system::locked_set_var("IPE_YAML_MAX_BYTES", "abc");
+        let res: IpeResult<crate::IpeError, String> =
+            config_decode_yaml("name: ipe".to_string(), kinded_name_decoder());
+        crate::system::locked_remove_var("IPE_YAML_MAX_BYTES");
+        assert!(
+            matches!(&res, IpeResult::Err(crate::IpeError::Error(crate::IpeErrorKind::InvalidInput, info))
+                if info.message.starts_with("yaml parse: ") && info.message.contains("IPE_YAML_MAX_BYTES")),
+            "a malformed YAML ceiling must be InvalidInput: {res:?}"
+        );
+    }
+
     #[test]
     fn missing_file_errs() {
         let res: IpeResult<String, String> = block(config_load_from_file(
@@ -700,6 +873,123 @@ mod load_from_file_spawn_blocking_tests {
              the blocking file read is starving the single-threaded executor \
              (spawn_blocking missing or not taking effect)"
         );
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod toml_tests {
+    use super::*;
+    use crate::json::decode_value_identity;
+
+    /// A TOML parse error is `Decode` and names its position, never the source line.
+    #[test]
+    fn toml_parse_error_does_not_echo_source_line() {
+        let decoded = config_decode_toml(
+            "ok = 1\nsecret = \"SENTINEL\n".to_owned(),
+            decode_value_identity::<crate::IpeError>(),
+        );
+        assert!(
+            matches!(
+                &decoded,
+                IpeResult::Err(crate::IpeError::Error(crate::IpeErrorKind::Decode, _))
+            ),
+            "an unterminated TOML string must be a Decode refusal"
+        );
+        let IpeResult::Err(crate::IpeError::Error(_, info)) = decoded else {
+            return;
+        };
+        assert!(
+            !info.message.contains("SENTINEL") && !info.message.contains("secret ="),
+            "the parse error must not quote the source: {:?}",
+            info.message.replace("SENTINEL", "<sentinel>")
+        );
+        assert!(
+            info.message.starts_with("toml parse: ")
+                && info.message.contains(" at line ")
+                && info.message.contains(" column "),
+            "the parse error must name its line and column: {:?}",
+            info.message
+        );
+    }
+
+    /// A key-naming TOML refusal keeps its category and never names the key.
+    #[test]
+    fn toml_key_error_does_not_echo_the_key() {
+        for source in [
+            "SENTINEL = 1\nSENTINEL = 2\n",
+            "[t]\n\"SENTINEL\" = 1\n\"SENTINEL\" = 2\n",
+            "a = { SENTINEL = 1, SENTINEL = 2 }\n",
+            "SENTINEL = 1\nSENTINEL.b = 2\n",
+        ] {
+            let decoded = config_decode_toml(
+                source.to_owned(),
+                decode_value_identity::<crate::IpeError>(),
+            );
+            let shown = match &decoded {
+                IpeResult::Err(crate::IpeError::Error(crate::IpeErrorKind::Decode, info)) => {
+                    info.message.clone()
+                }
+                IpeResult::Err(crate::IpeError::Error(..)) | IpeResult::Ok(_) => String::new(),
+            };
+            assert!(
+                shown.starts_with("toml parse: ")
+                    && shown.contains(" at line ")
+                    && !shown.contains("SENTINEL"),
+                "a key refusal must be Decode without the key: {:?}",
+                shown.replace("SENTINEL", "<sentinel>")
+            );
+        }
+    }
+
+    /// A description keeps only a fixed category or a static grammar label.
+    #[test]
+    fn toml_category_keeps_no_input_text() {
+        assert_eq!(
+            toml_category("invalid basic string\nexpected `\"`"),
+            "invalid basic string"
+        );
+        assert_eq!(
+            toml_category("invalid unicode 4-digit hex code"),
+            "invalid unicode 4-digit hex code"
+        );
+        assert_eq!(
+            toml_category("duplicate key `SENTINEL` in table `t`"),
+            "duplicate key"
+        );
+        assert_eq!(
+            toml_category("dotted key `SENTINEL.b` attempted to extend non-table type (integer)"),
+            "dotted key extends a value that is not a table"
+        );
+        assert_eq!(
+            toml_category("value is out of range"),
+            "value is out of range"
+        );
+        for label in TOML_GRAMMAR_LABELS {
+            let message = format!("invalid {label}");
+            assert_eq!(toml_category(&message), message);
+        }
+        for echoing in [
+            "invalid type: string \"SENTINEL\", expected i64",
+            "invalid SENTINEL",
+            "invalid sentinel",
+            "invalid basic string sentinel",
+            "unexpected keys in table: SENTINEL",
+            "",
+        ] {
+            assert_eq!(toml_category(echoing), "invalid document", "{echoing:?}");
+        }
+    }
+
+    /// Positions are one-based lines and character columns; an offset off a boundary has none.
+    #[test]
+    fn line_column_counts_lines_and_characters() {
+        assert_eq!(line_column("", 0), Some((1, 1)));
+        assert_eq!(line_column("ab\ncd", 4), Some((2, 2)));
+        assert_eq!(line_column("é\nx", 3), Some((2, 1)));
+        assert_eq!(line_column("xé", 3), Some((1, 3)));
+        assert_eq!(line_column("é", 1), None);
+        assert_eq!(line_column("ab", 3), None);
     }
 }
 
@@ -1030,10 +1320,7 @@ mod yaml_tests {
         assert_eq!(syntax.message(), expected);
         assert!(!expected.contains("zq"), "{expected}");
         assert!(!expected.contains("17"), "{expected}");
-        assert_eq!(
-            refusal(src),
-            Some((crate::IpeErrorKind::Unexpected, expected))
-        );
+        assert_eq!(refusal(src), Some((crate::IpeErrorKind::Decode, expected)));
     }
 
     #[test]

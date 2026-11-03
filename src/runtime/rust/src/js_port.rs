@@ -36,14 +36,20 @@
 //!   is only ever obtained from a [`SessionId`]. A caller with no session sid in scope
 //!   gets `None` from [`scope_sid`] and subscribes to an inert per-call channel that
 //!   no route ever feeds, so an unscoped subscription receives nothing rather than
-//!   another session's traffic. Channels are created on session start ([`session_open`])
-//!   and dropped on session end/eviction ([`session_close`]), reusing the session
-//!   store's lifecycle.
+//!   another session's traffic. A sid's endpoints exist exactly while one
+//!   [`PortLease`] from [`session_open`] holds them: the live server opens the lease
+//!   once the store owns the session and drops it when the session's driver exits.
+//!   Every other reach is a lookup that refuses or drops when no lease holds the
+//!   sid, so no reach recreates the endpoints of a closed session.
 //! * **Wasm (`feature = "wasm-client"`).** In-process, no network. Outbound calls
 //!   the browser-registered `window.ipeOnReceive` handler with the seal-encoded
 //!   string; inbound is fed by the browser's `window.ipe.send(...)` pushing a
 //!   string into an in-tab queue the `Source` drains.
 
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-client"))]
+use crate::entropy::EntropyError;
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-client"))]
+use crate::json::JsonVal;
 use crate::seal_codec::{SealLimits, seal_encode};
 use crate::tea::{IpeCmd, IpeSub};
 
@@ -120,19 +126,17 @@ impl std::fmt::Debug for SessionId {
     }
 }
 
-// ─── Native (server) transport ─────────────────────────────────────────────
-
 // ─── Correlation-id wire key ────────────────────────────────────────────────
 
-/// The JSON field name the runtime uses to carry the correlation id on both
-/// the outbound request envelope and the inbound reply envelope.
+/// The JSON field carrying a request's correlation token on the outbound envelope and its reply.
 ///
-/// The double-underscore prefix and `ipe_` namespace make this key impossible
-/// to collide with a user-defined field: the seal gate rejects any value that
-/// contains a field named `__ipe_id` (the sealed type is closed and declared,
-/// so an extra field on an inbound value fails the decoder for any user type).
-/// Runtime-private — never exported, never user-reachable.
-const COR_ID_FIELD: &str = "__ipe_id";
+/// The value is a [`PortToken`] in its wire spelling: 128 bits minted per
+/// request, scoped to the minting sid (native) or tab (wasm), and consumed by
+/// the first reply that carries it. Page JS sees the token and echoes it, so
+/// inside the page realm it addresses a waiter; it does not authenticate one.
+/// [`classify_inbound`] removes the field before a payload reaches a decoder,
+/// and the browser glue renders its spelling from this constant.
+pub(crate) const COR_ID_FIELD: &str = "__ipe_id";
 
 /// Hard ceiling on outstanding (in-flight) `js_request` waiters per session.
 /// A JS handler that never replies must not fill heap indefinitely; once the
@@ -147,19 +151,20 @@ pub const REQUEST_TIMEOUT_MS: u64 = 10_000;
 
 // ─── Session-stream wire keys + bounds ──────────────────────────────────────
 
-/// The JSON field name carrying a session's runtime-minted correlation id on
-/// every open envelope, inbound frame, control cmd, and close/terminal
-/// envelope. Same collision-proof discipline as [`COR_ID_FIELD`]: the sealed
-/// frame/terminal type is closed and declared, so an inbound value that carries
-/// this extra field fails the user decoder — the runtime strips it before the
-/// payload reaches a decoder. Runtime-private, never user-reachable, never
-/// derived from JS input.
+/// The JSON field carrying a session's wire token on every session envelope and frame.
+///
+/// The value is a [`PortToken`] in its wire spelling, minted per
+/// `openSession` and scoped like [`COR_ID_FIELD`]. It is never the Ipê-side
+/// `SessionHandle`: the handle stays in the program, the token goes on the
+/// wire. Page JS sees and echoes it; [`classify_inbound`] removes the field
+/// before a payload reaches a decoder.
 const SESSION_ID_FIELD: &str = "__ipe_session";
 
-/// The JSON field name distinguishing a session's terminal reply (delivered to
-/// the one-shot close waiter) from an ordinary stream frame (broadcast to the
-/// session's `sessionFrames` subscriber). A frame carrying `__ipe_terminal:
-/// true` resolves the close waiter; any other framed value is a stream frame.
+/// The JSON field marking a session frame as the terminal reply.
+///
+/// A frame carrying `__ipe_terminal: true` resolves the close waiter and
+/// `false` marks an ordinary stream frame. Any other value, or the field on a
+/// frame with no session token, is refused by [`classify_inbound`].
 const SESSION_TERMINAL_FIELD: &str = "__ipe_terminal";
 
 /// Hard ceiling on concurrently-open sessions per session sid. A host that
@@ -180,6 +185,211 @@ pub(crate) const SESSION_FRAME_BUDGET: u64 = 100_000;
 /// indefinitely. Generous — a long recording session stays well under it.
 const SESSION_DEADLINE_MS: u64 = 3_600_000;
 
+// ─── Port tokens and the inbound classifier ─────────────────────────────────
+
+/// The three fields that route an inbound frame to a waiter or a session.
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-client"))]
+const RESERVED_ROUTING_KEYS: [&str; 3] = [COR_ID_FIELD, SESSION_ID_FIELD, SESSION_TERMINAL_FIELD];
+
+/// Bytes of entropy in one [`PortToken`].
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-client"))]
+const PORT_TOKEN_BYTES: usize = 16;
+
+/// Length of a [`PortToken`]'s wire spelling: two hex digits per byte.
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-client"))]
+const PORT_TOKEN_WIRE_LEN: usize = PORT_TOKEN_BYTES * 2;
+
+/// A runtime-minted port address: 128 bits from the OS random source.
+///
+/// The only ways in are [`PortToken::mint`] and [`PortToken::parse`]; the only
+/// way out is [`PortToken::wire`]. Registries key on it through a `HashMap`,
+/// never an ordered map, and `Debug` prints no bits of it.
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-client"))]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct PortToken([u8; PORT_TOKEN_BYTES]);
+
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-client"))]
+impl PortToken {
+    /// Draw a fresh token from the OS random source.
+    ///
+    /// # Errors
+    ///
+    /// [`EntropyError`] when the OS random source refuses the draw.
+    pub(crate) fn mint() -> Result<Self, EntropyError> {
+        Self::mint_from(crate::entropy::fill_entropy)
+    }
+
+    /// Draw a token through `fill`, the entropy source.
+    fn mint_from(
+        fill: impl FnOnce(&mut [u8]) -> Result<(), EntropyError>,
+    ) -> Result<Self, EntropyError> {
+        let mut bytes = [0_u8; PORT_TOKEN_BYTES];
+        fill(&mut bytes)?;
+        Ok(Self(bytes))
+    }
+
+    /// The token's one wire spelling: 32 lowercase hex digits.
+    pub(crate) fn wire(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(PORT_TOKEN_WIRE_LEN);
+        for byte in self.0 {
+            // Writing to a `String` cannot fail.
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
+    }
+
+    /// Parse the wire spelling back into a token.
+    ///
+    /// Exactly 32 bytes, each `0-9` or `a-f`; anything else is `None`.
+    pub(crate) fn parse(wire: &str) -> Option<Self> {
+        let digits = wire.as_bytes();
+        if digits.len() != PORT_TOKEN_WIRE_LEN {
+            return None;
+        }
+        let mut bytes = [0_u8; PORT_TOKEN_BYTES];
+        let (pairs, _) = digits.as_chunks::<2>();
+        for (slot, [high, low]) in bytes.iter_mut().zip(pairs) {
+            *slot = (hex_digit_value(*high)? << 4) | hex_digit_value(*low)?;
+        }
+        Some(Self(bytes))
+    }
+}
+
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-client"))]
+impl std::fmt::Debug for PortToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PortToken(<opaque>)")
+    }
+}
+
+/// The value of one lowercase hex digit; any other byte is `None`.
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-client"))]
+const fn hex_digit_value(digit: u8) -> Option<u8> {
+    match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// Bytes drawn for one [`PortHandle`].
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-client"))]
+const PORT_HANDLE_BYTES: usize = 8;
+
+/// The Ipê-side `SessionHandle` of one open port session: a positive value from the OS random source.
+///
+/// The only ways in are [`PortHandle::mint`] and [`PortHandle::parse`]; the
+/// only way out is [`PortHandle::to_ipe`]. A handle never goes on the wire. It
+/// is drawn, not counted, so a handle carried over from another life of the
+/// same sid, another process or another replica names no stream of this one.
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-client"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct PortHandle(std::num::NonZeroI64);
+
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-client"))]
+impl PortHandle {
+    /// Draw a fresh handle from the OS random source.
+    ///
+    /// `None` when the source refuses the draw or the draw is zero.
+    pub(crate) fn mint() -> Option<Self> {
+        Self::mint_from(crate::entropy::fill_entropy)
+    }
+
+    /// Draw a handle through `fill`, the entropy source: the draw's top 63 bits.
+    ///
+    /// `None` when `fill` refuses or the 63 bits are all zero.
+    fn mint_from(fill: impl FnOnce(&mut [u8]) -> Result<(), EntropyError>) -> Option<Self> {
+        let mut bytes = [0_u8; PORT_HANDLE_BYTES];
+        fill(&mut bytes).ok()?;
+        let drawn = i64::try_from(u64::from_le_bytes(bytes) >> 1).ok()?;
+        std::num::NonZeroI64::new(drawn).map(Self)
+    }
+
+    /// The handle as the program holds it.
+    pub(crate) const fn to_ipe(self) -> i64 {
+        self.0.get()
+    }
+
+    /// Parse a program-held handle; zero and negative values are `None`.
+    pub(crate) fn parse(raw: i64) -> Option<Self> {
+        std::num::NonZeroI64::new(raw)
+            .filter(|value| value.get() > 0)
+            .map(Self)
+    }
+}
+
+/// The refusal a port call reports when it cannot mint a fresh token.
+///
+/// A failed draw and a draw that collides with a live token both land here.
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-client"))]
+fn entropy_refusal(call: &str) -> crate::error::IpeError {
+    crate::error::IpeError::unavailable(format!("{call}: {EntropyError}"))
+}
+
+/// Where one inbound port frame goes, decided once from its reserved fields.
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-client"))]
+pub(crate) enum Inbound {
+    /// A reply to the `js_request` waiter holding `token`.
+    Reply { token: PortToken, payload: JsonVal },
+    /// An ordinary frame for the session holding `token`.
+    SessionFrame { token: PortToken, payload: JsonVal },
+    /// The terminal reply for the session holding `token`.
+    SessionTerminal { token: PortToken, payload: JsonVal },
+    /// No reserved field: the original raw string goes to `js_subscribe`.
+    Broadcast,
+    /// A reserved field is present but the frame is no legal routed frame.
+    Refused,
+}
+
+/// Classify one raw inbound frame by its reserved routing fields.
+///
+/// A frame that is not a JSON object, or carries no reserved field, is a
+/// [`Inbound::Broadcast`]. A frame with a reserved field routes only when its
+/// token is a JSON string [`PortToken::parse`] accepts and the fields form one
+/// legal shape; every other combination is [`Inbound::Refused`], so a reserved
+/// field never reaches a `js_subscribe` decoder. The payload is the `payload`
+/// field, else the object left once the routing fields are removed.
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-client"))]
+pub(crate) fn classify_inbound(raw: &str) -> Inbound {
+    let Ok(mut value) = serde_json::from_str::<JsonVal>(raw) else {
+        return Inbound::Broadcast;
+    };
+    let Some(fields) = value.as_object_mut() else {
+        return Inbound::Broadcast;
+    };
+    let [cor_id, session_id, terminal] = RESERVED_ROUTING_KEYS.map(|key| fields.swap_remove(key));
+    let token_of = |id: &JsonVal| id.as_str().and_then(PortToken::parse);
+    let route = match (cor_id, session_id, terminal) {
+        (None, None, None) => return Inbound::Broadcast,
+        (Some(id), None, None) => token_of(&id).map(|token| (token, Route::Reply)),
+        (None, Some(id), None) => token_of(&id).map(|token| (token, Route::Frame)),
+        (None, Some(id), Some(flag)) => match (token_of(&id), flag.as_bool()) {
+            (Some(token), Some(true)) => Some((token, Route::Terminal)),
+            (Some(token), Some(false)) => Some((token, Route::Frame)),
+            (None, _) | (Some(_), None) => None,
+        },
+        (Some(_), Some(_), _) | (Some(_), None, Some(_)) | (None, None, Some(_)) => None,
+    };
+    let Some((token, route)) = route else {
+        return Inbound::Refused;
+    };
+    let payload = fields.swap_remove("payload").unwrap_or(value);
+    match route {
+        Route::Reply => Inbound::Reply { token, payload },
+        Route::Frame => Inbound::SessionFrame { token, payload },
+        Route::Terminal => Inbound::SessionTerminal { token, payload },
+    }
+}
+
+/// The routed shape [`classify_inbound`] settles on before it takes the payload.
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-client"))]
+enum Route {
+    Reply,
+    Frame,
+    Terminal,
+}
+
 // ─── Native (server) transport ─────────────────────────────────────────────
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -190,10 +400,8 @@ mod native {
     use crate::seal_codec::seal_decode;
     use crate::tea::SourceTask;
     use std::collections::HashMap;
-    use std::sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
-    };
+    use std::collections::hash_map::Entry;
+    use std::sync::{Arc, Mutex, OnceLock};
     use tokio::sync::{broadcast, oneshot};
 
     /// Hard ceiling on outbound port frames buffered for a session whose browser
@@ -212,16 +420,6 @@ mod native {
     /// (never panics); the size bounds the queue an inbound burst can hold.
     const PORT_CAP: usize = 256;
 
-    /// Process-global monotonic correlation-id counter. Ids are runtime-private:
-    /// they are minted here and never accepted as input — a JS-injected id cannot
-    /// forge a waiter lookup because the registry key is the id minted by this
-    /// counter, not an id parsed from an untrusted inbound frame.
-    static NEXT_COR_ID: AtomicU64 = AtomicU64::new(1);
-
-    fn next_cor_id() -> u64 {
-        NEXT_COR_ID.fetch_add(1, Ordering::Relaxed)
-    }
-
     /// A registered out-sink for one session: the server installs it so each
     /// outbound `js_send` frame for that session is pushed to that session's
     /// browser over its own SSE connection.
@@ -231,20 +429,23 @@ mod native {
     /// frames (already through the fail-closed decode gate) to that session's
     /// `js_subscribe`; `out_sink` is that session's browser-push installed by the
     /// live server; `pending` holds in-flight `js_request` waiters keyed by their
-    /// runtime-minted correlation id. All belong to exactly one sid.
+    /// [`PortToken`]. All belong to exactly one sid.
     pub(crate) struct SessionPorts {
+        /// The life of the [`PortLease`] that built this entry; only that
+        /// lease's drop removes it.
+        life: PortLife,
         inbound: broadcast::Sender<String>,
         out_sink: Option<OutSink>,
-        /// In-flight correlated one-shot waiters. Key = runtime-minted correlation
-        /// id (never derived from JS input). A reply whose id is not in this map is
-        /// dropped fail-closed (unknown/duplicate/late id). Bounded by
+        /// In-flight correlated one-shot waiters, keyed by the token minted for
+        /// each request. A reply whose token is not in this map is dropped
+        /// fail-closed (unknown, duplicate or late). Bounded by
         /// [`MAX_OUTSTANDING`]: a new waiter is refused when the map is full.
-        pub(crate) pending: HashMap<u64, oneshot::Sender<JsonVal>>,
-        /// Open session streams, keyed by runtime-minted session id (never derived
-        /// from JS input). A frame/terminal whose id is not in this map is dropped
-        /// fail-closed. Bounded by [`MAX_OPEN_SESSIONS`]: a new `openSession` is
-        /// refused when the map is full.
-        pub(crate) streams: HashMap<u64, SessionStream>,
+        pub(crate) pending: HashMap<PortToken, oneshot::Sender<JsonVal>>,
+        /// Open session streams, keyed by the wire token minted for each
+        /// session. A frame or terminal whose token is not in this map is
+        /// dropped fail-closed. Bounded by [`MAX_OPEN_SESSIONS`]: a new
+        /// `openSession` is refused when the map is full.
+        pub(crate) streams: HashMap<PortToken, SessionStream>,
         /// Outbound port frames produced before `out_sink` was bound (the window
         /// between session creation and the SSE connection that installs the
         /// sink). Flushed in FIFO order the instant the sink binds, so a `Cmd`
@@ -272,11 +473,16 @@ mod native {
         /// called. A terminal frame (or a fail-closed overflow/timeout) resolves it
         /// exactly once, then the session is evicted. `None` until close is awaited.
         pub(crate) terminal: Option<oneshot::Sender<JsonVal>>,
+        /// The Ipê-side `SessionHandle` this stream answers to. It never goes on
+        /// the wire; the stream's map key is its wire token.
+        pub(crate) handle: PortHandle,
     }
 
     impl SessionPorts {
-        pub(crate) fn new() -> Self {
+        /// Empty endpoints for `life`; built only by [`session_open`].
+        fn new(life: PortLife) -> Self {
             SessionPorts {
+                life,
                 inbound: broadcast::channel(PORT_CAP).0,
                 out_sink: None,
                 pending: HashMap::new(),
@@ -284,7 +490,77 @@ mod native {
                 out_pending: std::collections::VecDeque::new(),
             }
         }
+
+        /// The open stream `handle` names, with its wire token.
+        ///
+        /// A linear scan: the map holds at most [`MAX_OPEN_SESSIONS`] entries.
+        pub(crate) fn stream_by_handle(
+            &mut self,
+            handle: PortHandle,
+        ) -> Option<(PortToken, &mut SessionStream)> {
+            self.streams
+                .iter_mut()
+                .find(|(_, stream)| stream.handle == handle)
+                .map(|(token, stream)| (*token, stream))
+        }
     }
+
+    /// The generation of one port life, distinguishing overlapping lives of one sid.
+    ///
+    /// Internal: it never goes on the wire or into the program. Only
+    /// [`session_open`] mints one, so a life names exactly one lease.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct PortLife(u64);
+
+    impl PortLife {
+        /// The next unused life, or `None` once lives are exhausted.
+        fn next() -> Option<Self> {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            NEXT.fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |n| n.checked_add(1),
+            )
+            .ok()
+            .map(Self)
+        }
+    }
+
+    /// Ownership of one sid's port endpoints for one session life.
+    ///
+    /// Built only by [`session_open`] and never cloned. Dropping it removes the
+    /// sid's entry only while that entry is still the one this lease built, so
+    /// the close of a superseded life never touches the life that replaced it.
+    pub struct PortLease {
+        sid: SessionId,
+        life: PortLife,
+    }
+
+    impl PortLease {
+        /// The life this lease owns; a sink binds only into this life.
+        pub fn life(&self) -> PortLife {
+            self.life
+        }
+    }
+
+    impl Drop for PortLease {
+        fn drop(&mut self) {
+            let ended = {
+                let mut g = lock_sessions();
+                if g.get(&self.sid.0).is_some_and(|p| p.life == self.life) {
+                    g.remove(&self.sid.0)
+                } else {
+                    None
+                }
+            };
+            // Waiters, streams and the sink drop outside the registry lock.
+            drop(ended);
+        }
+    }
+
+    /// The refusal [`register_out_sink_for`] answers when the sid's port is not the binder's life.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PortClosed;
 
     /// The per-session port registry, keyed by session sid. A channel handle is
     /// ONLY ever obtained by looking up a [`SessionId`] here; there is no
@@ -317,27 +593,51 @@ mod native {
         None
     }
 
-    /// Create a session's port endpoints on session start (idempotent). Called by
-    /// the live server when it creates the session, so the inbound channel exists
-    /// before the browser can POST to it.
-    pub fn session_open(sid: &SessionId) {
-        lock_sessions()
-            .entry(sid.0.clone())
-            .or_insert_with(SessionPorts::new);
+    /// The life whose lease holds `sid`'s port, if any.
+    #[cfg(all(test, feature = "web"))]
+    pub(crate) fn life_of(sid: &SessionId) -> Option<PortLife> {
+        lock_sessions().get(&sid.0).map(|p| p.life)
     }
 
-    /// Drop a session's port endpoints on session end/eviction. Any live
-    /// `js_subscribe` receiver on the dropped inbound channel observes `Closed`
-    /// and ends; no dead-session channel lingers.
-    pub fn session_close(sid: &SessionId) {
-        lock_sessions().remove(&sid.0);
+    /// Open a new port life for `sid` and return the lease that owns it.
+    ///
+    /// The live server calls this once the store has made the session's handle
+    /// the sid's owner, before any program code of that life can reach the
+    /// port. Fresh endpoints REPLACE any entry already there: such an entry
+    /// belongs to a superseded life, whose waiters then end with `Err`, whose
+    /// streams close and whose sink drops. `None` only once lives are
+    /// exhausted; every reach for the sid then refuses, so the port is inert.
+    pub fn session_open(sid: &SessionId) -> Option<PortLease> {
+        let life = PortLife::next()?;
+        let superseded = lock_sessions().insert(sid.0.clone(), SessionPorts::new(life));
+        drop(superseded);
+        Some(PortLease {
+            sid: sid.clone(),
+            life,
+        })
     }
 
-    /// Install `sid`'s browser-push sink. Called when the live server attaches the
-    /// session's client transport; every subsequent `js_send` whose origin is
-    /// `sid` is delivered to `sink`. Creates the session entry if the sink is
-    /// wired before `session_open` (idempotent).
-    pub fn register_out_sink_for(sid: &SessionId, sink: OutSink) {
+    /// Install the browser-push sink of `sid`'s port life `life`. Called when the
+    /// live server attaches the session's client transport; every subsequent
+    /// `js_send` whose origin is that life is delivered to `sink`.
+    ///
+    /// The bind is keyed by the life, not the sid: an attach still holding a
+    /// session that another life of the same sid has replaced can never bind
+    /// into the replacing life's endpoints.
+    ///
+    /// The live server binds while it holds the session entry's lock, and the
+    /// frames buffered before the bind are delivered to `sink` here, still under
+    /// that lock: a sink must never take the session entry's lock.
+    ///
+    /// # Errors
+    ///
+    /// [`PortClosed`] when no lease holds `sid`, or the lease holding it owns a
+    /// life other than `life`; no sink is stored.
+    pub fn register_out_sink_for(
+        sid: &SessionId,
+        life: PortLife,
+        sink: OutSink,
+    ) -> Result<(), PortClosed> {
         // Take the sink and drain the pre-bind buffer under one lock acquisition,
         // then deliver the drained frames after the guard drops — the sink is a
         // synchronous callback and must never run while the registry mutex is
@@ -345,13 +645,17 @@ mod native {
         // preserves that invariant for every sink shape).
         let buffered = {
             let mut g = lock_sessions();
-            let ports = g.entry(sid.0.clone()).or_insert_with(SessionPorts::new);
+            let ports = g
+                .get_mut(&sid.0)
+                .filter(|p| p.life == life)
+                .ok_or(PortClosed)?;
             ports.out_sink = Some(sink.clone());
             std::mem::take(&mut ports.out_pending)
         };
         for encoded in buffered {
             sink(&encoded);
         }
+        Ok(())
     }
 
     /// Deliver one encoded outbound frame to `sid`'s browser out-sink, or buffer
@@ -362,11 +666,14 @@ mod native {
     /// connection installs the sink is queued in the session's bounded
     /// [`SessionPorts::out_pending`] and flushed on [`register_out_sink_for`];
     /// past the [`MAX_OUT_PENDING`] ceiling the OLDEST buffered frame is dropped
-    /// so a pre-bind flood cannot grow heap without limit.
+    /// so a pre-bind flood cannot grow heap without limit. A frame for a sid no
+    /// lease holds is dropped: no entry, no buffer.
     pub(crate) fn deliver_or_buffer(sid: &SessionId, encoded: &str) {
         let sink = {
             let mut g = lock_sessions();
-            let ports = g.entry(sid.0.clone()).or_insert_with(SessionPorts::new);
+            let Some(ports) = g.get_mut(&sid.0) else {
+                return;
+            };
             match &ports.out_sink {
                 Some(sink) => Some(sink.clone()),
                 None => {
@@ -383,130 +690,89 @@ mod native {
         }
     }
 
-    /// Feed one raw inbound string to `sid`'s port. Called by the server's inbound
-    /// port route AFTER its session-cookie + CSRF + bounded-seal checks.
+    /// Feed one raw inbound string to `sid`'s port.
     ///
-    /// Dispatch policy (fail-closed at each step):
+    /// Called by the server's inbound port route after its session-cookie,
+    /// CSRF and bounded-seal checks. [`classify_inbound`] decides the route
+    /// once, and each outcome is handled here:
     ///
-    /// 1. If the raw string is valid JSON and its top-level object contains the
-    ///    runtime-private `__ipe_id` field, this is a correlated reply: extract the
-    ///    id and the rest of the frame, look up the matching one-shot waiter, and
-    ///    resolve it. An unknown/duplicate/late id is silently dropped (no panic, no
-    ///    forwarding to `js_subscribe` subscribers). The `__ipe_id` field is stripped
-    ///    before the reply payload is handed to the waiter's decoder, so it is never
-    ///    user-visible.
-    /// 2. Otherwise forward to the session's `js_subscribe` broadcast channel.
+    /// * a reply resolves the waiter its token names in `sid`'s pending map,
+    ///   consuming it; an unknown, duplicate or late token is dropped;
+    /// * a session frame or terminal goes to the stream its token names in
+    ///   `sid`'s registry;
+    /// * a frame with no reserved field goes to `sid`'s `js_subscribe`
+    ///   broadcast as the original string;
+    /// * a refused frame (a reserved field that does not form a legal routed
+    ///   frame) is dropped whole: no waiter, no stream, no broadcast.
     ///
-    /// Cross-session delivery is unrepresentable: delivery reaches ONLY `sid`.
+    /// The tokens are visible to page JS, which echoes them, so inside the page
+    /// realm they address a waiter rather than authenticate one. They are
+    /// scoped to `sid`: delivery reaches only `sid`'s own registries.
     pub fn deliver_inbound_for(sid: &SessionId, raw: String) {
-        // A session-tagged frame (carrying `__ipe_session`) is routed to that
-        // session's stream/terminal BEFORE the one-shot-reply check, so a session
-        // frame can never be misrouted to a `js_request` waiter or a broadcast
-        // subscriber. An unknown/closed/foreign session id is dropped fail-closed.
-        if let Ok(mut value) = serde_json::from_str::<JsonVal>(&raw)
-            && let Some(sess_val) = value
-                .as_object_mut()
-                .and_then(|o| o.swap_remove(SESSION_ID_FIELD))
-            && let Some(session_id) = sess_val.as_u64()
-        {
-            deliver_session_frame(sid, session_id, value);
-            return;
-        }
-        // Peek at the raw string: if it parses as a JSON object with `__ipe_id`,
-        // this is a correlated reply — route to the pending map, not subscribers.
-        // Wire format: `{"__ipe_id": <u64>, "payload": <sealed_reply>}`.
-        // After stripping `__ipe_id`, the remaining object's `"payload"` field is
-        // the sealed reply value forwarded to the waiting decoder.
-        if let Ok(mut value) = serde_json::from_str::<JsonVal>(&raw)
-            && let Some(id_val) = value
-                .as_object_mut()
-                .and_then(|o| o.swap_remove(COR_ID_FIELD))
-            && let Some(id) = id_val.as_u64()
-        {
-            // Extract the `"payload"` field from the remaining envelope,
-            // falling back to the whole remaining value so an echo that omits
-            // the wrapper is still decoded (fail-closed if neither decodes).
-            let payload = value
-                .as_object_mut()
-                .and_then(|o| o.swap_remove("payload"))
-                .unwrap_or(value);
-            let waiter = lock_sessions()
-                .get_mut(&sid.0)
-                .and_then(|p| p.pending.remove(&id));
-            if let Some(tx) = waiter {
-                // Resolve the one-shot with the extracted payload.
-                let _ = tx.send(payload);
+        match classify_inbound(&raw) {
+            Inbound::Reply { token, payload } => {
+                let waiter = lock_sessions()
+                    .get_mut(&sid.0)
+                    .and_then(|p| p.pending.remove(&token));
+                if let Some(tx) = waiter {
+                    let _ = tx.send(payload);
+                }
             }
-            // Unknown/duplicate/late id: dropped fail-closed, no subscribers.
-            return;
-        }
-        // No correlation id — forward to `js_subscribe` subscribers as before.
-        let sender = lock_sessions().get(&sid.0).map(|p| p.inbound.clone());
-        if let Some(tx) = sender {
-            let _ = tx.send(raw);
+            Inbound::SessionFrame { token, payload } => {
+                deliver_session_frame(sid, token, &payload);
+            }
+            Inbound::SessionTerminal { token, payload } => {
+                deliver_session_terminal(sid, token, payload);
+            }
+            Inbound::Broadcast => {
+                let sender = lock_sessions().get(&sid.0).map(|p| p.inbound.clone());
+                if let Some(tx) = sender {
+                    let _ = tx.send(raw);
+                }
+            }
+            Inbound::Refused => {}
         }
     }
 
-    /// Route one session-tagged inbound value to the session identified by the
-    /// runtime-minted `session_id` within the owning `sid`. Fail-closed at every
-    /// step:
+    /// Route one stream frame to the session `token` names within `sid`.
     ///
-    /// * An unknown/closed/foreign `session_id` (no live stream in `sid`'s
-    ///   registry) is dropped whole — no cross-session/cross-handle leak, no panic.
-    /// * A value tagged `__ipe_terminal: true` resolves the session's `closeSession`
-    ///   one-shot with the stripped payload and evicts the session.
-    /// * Any other value is an ordinary stream frame: it counts against the frame
-    ///   budget and is broadcast to the session's `sessionFrames` subscriber. When
-    ///   the budget is exhausted the session is terminated with an overflow terminal
-    ///   `Err` and evicted (an ordered stream never silently drops a frame).
-    ///
-    /// The `session_id` is the registry key minted by [`next_cor_id`]; a
-    /// JS-injected id cannot forge a live session because the key is never derived
-    /// from an inbound frame.
-    fn deliver_session_frame(sid: &SessionId, session_id: u64, mut value: JsonVal) {
-        let is_terminal = value
-            .as_object_mut()
-            .and_then(|o| o.swap_remove(SESSION_TERMINAL_FIELD))
-            .and_then(|t| t.as_bool())
-            .unwrap_or(false);
-        // Extract the inner `"payload"`, falling back to the whole remaining value.
-        let payload = value
-            .as_object_mut()
-            .and_then(|o| o.swap_remove("payload"))
-            .unwrap_or(value);
-
+    /// A token with no live stream in `sid`'s registry (unknown, closed, or
+    /// another sid's) is dropped whole. A live stream charges the frame against
+    /// its budget first: on exhaustion the session is evicted, which resolves a
+    /// parked close waiter with `Err` and ends the `sessionFrames` subscriber,
+    /// so an ordered stream never silently loses a frame. Otherwise the payload
+    /// is broadcast to the session's `sessionFrames` subscriber, which decodes
+    /// it fail-closed through the seal gate.
+    fn deliver_session_frame(sid: &SessionId, token: PortToken, payload: &JsonVal) {
         let mut g = lock_sessions();
         let Some(ports) = g.get_mut(&sid.0) else {
-            return; // no such session sid — dropped fail-closed
-        };
-        if is_terminal {
-            // Terminal reply: resolve the close waiter (if any) and evict.
-            if let Some(stream) = ports.streams.remove(&session_id)
-                && let Some(tx) = stream.terminal
-            {
-                let _ = tx.send(payload);
-            }
-            // Unknown/closed session id, or a terminal with no close waiter yet:
-            // dropped fail-closed (the close Task resolves via its own deadline).
             return;
-        }
-        // Ordinary stream frame. Charge the budget FIRST; on exhaustion terminate
-        // fail-closed rather than deliver-and-overflow.
-        let Some(stream) = ports.streams.get_mut(&session_id) else {
-            return; // unknown/closed/foreign session id — dropped fail-closed
+        };
+        let Some(stream) = ports.streams.get_mut(&token) else {
+            return;
         };
         stream.frames_seen = stream.frames_seen.saturating_add(1);
         if stream.frames_seen > SESSION_FRAME_BUDGET {
-            // Overflow: terminate the session with a fail-closed terminal Err and
-            // evict. A parked close waiter observes the sender drop and resolves
-            // Err; a live `sessionFrames` subscriber sees the channel close and ends.
-            g.get_mut(&sid.0).map(|p| p.streams.remove(&session_id));
+            ports.streams.remove(&token);
             return;
         }
-        // Deliver the frame to the session's subscriber. The value is re-encoded to
-        // its canonical string; the `sessionFrames` drain decodes it fail-closed
-        // through the seal gate, exactly as `js_subscribe` does.
         let _ = stream.frames.send(payload.to_string());
+    }
+
+    /// Resolve the close waiter of the session `token` names within `sid`.
+    ///
+    /// The session is evicted, so the token is consumed. A token with no live
+    /// stream, or a terminal that arrives before `closeSession` parked its
+    /// waiter, is dropped; the close `Task` then resolves through its own
+    /// deadline.
+    fn deliver_session_terminal(sid: &SessionId, token: PortToken, payload: JsonVal) {
+        let waiter = lock_sessions()
+            .get_mut(&sid.0)
+            .and_then(|p| p.streams.remove(&token))
+            .and_then(|stream| stream.terminal);
+        if let Some(tx) = waiter {
+            let _ = tx.send(payload);
+        }
     }
 
     /// `js_send payload` — seal-encode `payload` and deliver it to the ORIGIN
@@ -564,18 +830,15 @@ mod native {
         T: Send + 'static,
     {
         // Read the owning sid while the materialisation scope is live, then bind
-        // this session's inbound receiver. No valid sid (no live session) gets a
-        // fresh private channel no route publishes to — an inert, fail-closed drain.
-        let rx = match scope_sid() {
-            None => broadcast::channel(PORT_CAP).1,
-            Some(owner_sid) => {
-                let mut g = lock_sessions();
-                g.entry(owner_sid.0)
-                    .or_insert_with(SessionPorts::new)
-                    .inbound
-                    .subscribe()
-            }
-        };
+        // this session's inbound receiver. No valid sid, or a sid no lease holds,
+        // gets a fresh private channel no route publishes to — an inert,
+        // fail-closed drain.
+        let held = scope_sid().and_then(|owner_sid| {
+            lock_sessions()
+                .get(&owner_sid.0)
+                .map(|p| p.inbound.subscribe())
+        });
+        let rx = held.unwrap_or_else(|| broadcast::channel(PORT_CAP).1);
         IpeSub::Source(Box::new(move |emit| {
             let mut rx = rx;
             SourceTask::Tracked(Box::pin(async move {
@@ -604,20 +867,23 @@ mod native {
     ///
     /// Semantics:
     ///
-    /// 1. Mint a fresh runtime-private correlation id (process-global monotonic
-    ///    counter; never derived from JS input, never user-observable).
-    /// 2. Register a one-shot waiter keyed by that id in the OWNING session's
-    ///    pending map. Fails immediately with `Err` when [`MAX_OUTSTANDING`] is
-    ///    already reached (bounded — heap cannot grow unboundedly).
-    /// 3. Send `payload` outbound as `{"__ipe_id": id, "payload": <sealed>}` so
-    ///    the first-party JS sink can echo the id on its reply.
-    /// 4. Await the one-shot with a [`REQUEST_TIMEOUT_MS`] deadline. A reply whose
-    ///    id matches resolves the waiter with the stripped reply frame; the decoder
-    ///    runs fail-closed over that frame. A duplicate/late/unknown id is dropped
-    ///    by `deliver_inbound_for` before the waiter is ever signalled.
+    /// 1. Mint a fresh [`PortToken`] for this request. A failed draw refuses
+    ///    with `Unavailable`; there is no fallback id.
+    /// 2. Under one registry lock, refuse with `Unavailable` when the owning
+    ///    session already holds [`MAX_OUTSTANDING`] waiters (bounded; it frees
+    ///    as replies arrive) or when the token collides with a live waiter.
+    /// 3. Register a one-shot waiter under that token in the OWNING session's
+    ///    pending map, then send `payload` outbound as
+    ///    `{"__ipe_id": "<token>", "payload": <sealed>}`.
+    /// 4. Await the one-shot with a [`REQUEST_TIMEOUT_MS`] deadline. The first
+    ///    reply carrying the token consumes the waiter; the decoder runs
+    ///    fail-closed over its payload. A duplicate, late or unknown token is
+    ///    dropped by `deliver_inbound_for`.
     /// 5. Timeout or decode-miss → typed `Err`; never a panic.
     ///
-    /// No trust change: the same SEAL discipline governs both directions.
+    /// The token is visible to page JS, which echoes it on the reply: inside
+    /// the page realm it addresses the waiter, it does not authenticate the
+    /// reply. It is scoped to the owning sid and unpredictable across sids.
     pub fn js_request<T, R>(
         payload: T,
         decoder: Decoder<IpeError, R>,
@@ -626,22 +892,27 @@ mod native {
         T: serde::Serialize + Send + 'static,
         R: Send + 'static,
     {
-        let cor_id = next_cor_id();
+        request_with_mint(payload, decoder, PortToken::mint)
+    }
+
+    /// [`js_request`] with its token drawn through `mint`.
+    pub(crate) fn request_with_mint<T, R, M>(
+        payload: T,
+        decoder: Decoder<IpeError, R>,
+        mint: M,
+    ) -> crate::core::IpeTask<IpeError, R>
+    where
+        T: serde::Serialize + Send + 'static,
+        R: Send + 'static,
+        M: FnOnce() -> Result<PortToken, EntropyError> + Send + 'static,
+    {
         let owner_sid = scope_sid();
         Box::pin(async move {
-            // Refuse when the ceiling is already reached (fail-closed, no panic).
-            {
-                let mut g = lock_sessions();
-                if let Some(ports) = owner_sid.as_ref().and_then(|s| g.get_mut(&s.0))
-                    && ports.pending.len() >= MAX_OUTSTANDING
-                {
-                    return crate::core::IpeResult::Err(IpeError::unavailable(
-                        "js_request: outstanding waiter ceiling reached".to_owned(),
-                    ));
-                }
-            }
+            let Ok(token) = mint() else {
+                return crate::core::IpeResult::Err(entropy_refusal("js_request"));
+            };
 
-            // Serialize payload and wrap with the correlation id.
+            // Serialize payload and wrap with the correlation token.
             let outbound_json = match serde_json::to_value(&payload) {
                 Ok(v) => v,
                 Err(e) => {
@@ -651,19 +922,35 @@ mod native {
                 }
             };
             let envelope = serde_json::json!({
-                COR_ID_FIELD: cor_id,
+                COR_ID_FIELD: token.wire(),
                 "payload": outbound_json,
             });
             let encoded = seal_encode(&JsonVal::from_serde(envelope));
 
-            // Register the one-shot waiter.
+            // Register the one-shot waiter. The ceiling is checked under the
+            // same lock that inserts, so concurrent requests cannot overshoot
+            // it; a token already live is refused, never overwritten.
             let (tx, rx) = oneshot::channel::<JsonVal>();
             if let Some(sid) = &owner_sid {
                 let mut g = lock_sessions();
-                g.entry(sid.0.clone())
-                    .or_insert_with(SessionPorts::new)
-                    .pending
-                    .insert(cor_id, tx);
+                let Some(ports) = g.get_mut(&sid.0) else {
+                    return crate::core::IpeResult::Err(IpeError::unavailable(
+                        "js_request: session closed".to_owned(),
+                    ));
+                };
+                if ports.pending.len() >= MAX_OUTSTANDING {
+                    return crate::core::IpeResult::Err(IpeError::unavailable(
+                        "js_request: outstanding waiter ceiling reached".to_owned(),
+                    ));
+                }
+                match ports.pending.entry(token) {
+                    Entry::Occupied(_) => {
+                        return crate::core::IpeResult::Err(entropy_refusal("js_request"));
+                    }
+                    Entry::Vacant(slot) => {
+                        slot.insert(tx);
+                    }
+                }
             }
             // Deliver outbound to the origin session's sink, or buffer it
             // fail-closed until the SSE connection binds the sink.
@@ -680,7 +967,7 @@ mod native {
             if let Some(sid) = &owner_sid {
                 lock_sessions()
                     .get_mut(&sid.0)
-                    .map(|p| p.pending.remove(&cor_id));
+                    .map(|p| p.pending.remove(&token));
             }
 
             match result {
@@ -713,28 +1000,49 @@ mod native {
     /// Semantics (generalising `js_request`'s one-shot correlation to a bounded
     /// multi-frame lifecycle):
     ///
-    /// 1. Mint a fresh runtime-private session id (the same counter `js_request`
-    ///    uses; never derived from JS input, never user-observable).
+    /// 1. Mint a fresh [`PortToken`] as the session's wire token. A failed
+    ///    draw, or one that collides with a live stream, refuses with
+    ///    `Unavailable`.
     /// 2. Refuse when [`MAX_OPEN_SESSIONS`] is already open in the owning session
     ///    (fail-closed, bounded — heap cannot grow unboundedly).
-    /// 3. Register the session's bounded frame channel keyed by that id, then send
-    ///    `open_cmd` outbound tagged with the id so the first-party JS glue routes
-    ///    every subsequent frame/terminal back with it.
-    /// 4. Return the minted id as the opaque `SessionHandle` (a runtime `i64`); the
-    ///    handle is the ONLY way to address the session — cross-handle addressing is
-    ///    unrepresentable because the id is never taken from JS.
+    /// 3. Register the session's bounded frame channel under the token, then
+    ///    send `open_cmd` outbound tagged with it so the JS glue routes every
+    ///    later frame and terminal back with it.
+    /// 4. Return a separate Ipê-side handle drawn from the OS random source. A
+    ///    failed or zero draw, or one equal to a live stream's handle, refuses
+    ///    with `Unavailable` and overwrites nothing. The handle never goes on
+    ///    the wire and the token never reaches the program, so a frame carrying
+    ///    the handle routes nowhere.
+    ///
+    /// The token is visible to page JS, which echoes it: inside the page realm
+    /// it addresses the session, it does not authenticate a frame.
     ///
     /// The `decoder` is not consumed here (the frame stream carries it in
     /// `js_session_frames`); it fixes the frame type at the type level.
     pub fn js_open_session<T, F>(
         open_cmd: T,
-        _decoder: Decoder<IpeError, F>,
+        decoder: Decoder<IpeError, F>,
     ) -> crate::core::IpeTask<IpeError, i64>
     where
         T: serde::Serialize + Send + 'static,
         F: Send + 'static,
     {
-        let session_id = next_cor_id();
+        open_session_with_mint(open_cmd, decoder, PortToken::mint, PortHandle::mint)
+    }
+
+    /// [`js_open_session`] with its token drawn through `mint` and its handle through `mint_handle`.
+    pub(crate) fn open_session_with_mint<T, F, M, H>(
+        open_cmd: T,
+        _decoder: Decoder<IpeError, F>,
+        mint: M,
+        mint_handle: H,
+    ) -> crate::core::IpeTask<IpeError, i64>
+    where
+        T: serde::Serialize + Send + 'static,
+        F: Send + 'static,
+        M: FnOnce() -> Result<PortToken, EntropyError> + Send + 'static,
+        H: FnOnce() -> Option<PortHandle> + Send + 'static,
+    {
         let owner_sid = scope_sid();
         Box::pin(async move {
             let Some(sid) = owner_sid else {
@@ -742,53 +1050,71 @@ mod native {
                     "js_open_session: no session in scope".to_string().into(),
                 );
             };
+            let Ok(token) = mint() else {
+                return crate::core::IpeResult::Err(entropy_refusal("js_open_session"));
+            };
+            let Some(handle) = mint_handle() else {
+                return crate::core::IpeResult::Err(entropy_refusal("js_open_session"));
+            };
             // Refuse at the ceiling (fail-closed, no panic).
             {
                 let mut g = lock_sessions();
-                let ports = g.entry(sid.0.clone()).or_insert_with(SessionPorts::new);
+                let Some(ports) = g.get_mut(&sid.0) else {
+                    return crate::core::IpeResult::Err(IpeError::unavailable(
+                        "js_open_session: session closed".to_owned(),
+                    ));
+                };
                 if ports.streams.len() >= MAX_OPEN_SESSIONS {
                     return crate::core::IpeResult::Err(IpeError::unavailable(
                         "js_open_session: open-session ceiling reached".to_owned(),
                     ));
                 }
-                ports.streams.insert(
-                    session_id,
-                    SessionStream {
-                        frames: broadcast::channel(PORT_CAP).0,
-                        frames_seen: 0,
-                        terminal: None,
-                    },
-                );
+                if ports.stream_by_handle(handle).is_some() {
+                    return crate::core::IpeResult::Err(entropy_refusal("js_open_session"));
+                }
+                match ports.streams.entry(token) {
+                    Entry::Occupied(_) => {
+                        return crate::core::IpeResult::Err(entropy_refusal("js_open_session"));
+                    }
+                    Entry::Vacant(slot) => {
+                        slot.insert(SessionStream {
+                            frames: broadcast::channel(PORT_CAP).0,
+                            frames_seen: 0,
+                            terminal: None,
+                            handle,
+                        });
+                    }
+                }
             }
-            // Serialize + tag the open cmd with the session id.
+            // Serialize + tag the open cmd with the session token.
             let outbound_json = match serde_json::to_value(&open_cmd) {
                 Ok(v) => v,
                 Err(e) => {
                     lock_sessions()
                         .get_mut(&sid.0)
-                        .map(|p| p.streams.remove(&session_id));
+                        .map(|p| p.streams.remove(&token));
                     return crate::core::IpeResult::Err(
                         format!("js_open_session: open cmd serialisation failed: {e}").into(),
                     );
                 }
             };
             let envelope = serde_json::json!({
-                SESSION_ID_FIELD: session_id,
+                SESSION_ID_FIELD: token.wire(),
                 "payload": outbound_json,
             });
             let encoded = seal_encode(&JsonVal::from_serde(envelope));
             deliver_or_buffer(&sid, &encoded);
-            crate::core::IpeResult::Ok(session_id as i64)
+            crate::core::IpeResult::Ok(handle.to_ipe())
         })
     }
 
     /// `js_session_frames handle to_msg` — the inbound frame stream for ONE session.
     ///
-    /// Drains only the frame channel keyed by `handle`'s runtime-minted id in the
-    /// owning session, decoding each frame fail-closed through the bounded seal
-    /// decoder (a rejected frame is dropped whole, never a partial value, never a
-    /// panic). A `handle` with no live stream (closed/evicted/foreign) binds an
-    /// inert channel no route feeds — it receives nothing.
+    /// Drains only the frame channel of the stream `handle` names in the owning
+    /// session, decoding each frame fail-closed through the bounded seal
+    /// decoder (a rejected frame is dropped whole, never a partial value, never
+    /// a panic). A zero or negative `handle`, or one with no live stream (closed,
+    /// evicted, another sid's), binds an inert channel no route feeds.
     pub fn js_session_frames<T, M, F>(
         handle: i64,
         decoder: Decoder<IpeError, T>,
@@ -799,19 +1125,21 @@ mod native {
         F: Fn(T) -> M + Send + 'static,
         T: Send + 'static,
     {
-        let session_id = handle as u64;
         // Bind this session's frame receiver while the materialisation scope is
-        // live. A missing session (unknown id / no scope) gets a fresh private
+        // live. A missing session (unheld handle / no scope) gets a fresh private
         // channel no route publishes to — an inert, fail-closed drain.
-        let rx = match scope_sid() {
-            None => broadcast::channel(PORT_CAP).1,
-            Some(owner_sid) => {
-                let g = lock_sessions();
-                match g.get(&owner_sid.0).and_then(|p| p.streams.get(&session_id)) {
-                    Some(stream) => stream.frames.subscribe(),
+        let rx = match (scope_sid(), PortHandle::parse(handle)) {
+            (Some(owner_sid), Some(handle)) => {
+                let mut g = lock_sessions();
+                match g
+                    .get_mut(&owner_sid.0)
+                    .and_then(|p| p.stream_by_handle(handle))
+                {
+                    Some((_, stream)) => stream.frames.subscribe(),
                     None => broadcast::channel(PORT_CAP).1,
                 }
             }
+            (None, _) | (_, None) => broadcast::channel(PORT_CAP).1,
         };
         IpeSub::Source(Box::new(move |emit| {
             let mut rx = rx;
@@ -833,27 +1161,37 @@ mod native {
 
     /// `js_send_to_session handle session_cmd` — send a control cmd to ONE session.
     ///
-    /// Fire-and-forget via [`IpeCmd::Publish`]; the cmd is seal-encoded, tagged with
-    /// the session id, and delivered to the ORIGIN session's out-sink so the JS glue
-    /// routes it to that session's host recorder. A cmd for a session that is not
-    /// open is delivered to the sink but recognised by no live host recorder (the
-    /// tag names a dead id) — a fail-closed no-op, never cross-session.
+    /// Fire-and-forget via [`IpeCmd::Publish`]; the cmd is seal-encoded, tagged
+    /// with the wire token of the stream `handle` names in the ORIGIN session,
+    /// and delivered to that session's out-sink so the JS glue routes it to the
+    /// session's host operation. A negative handle, or one with no open stream
+    /// in the origin session, sends nothing.
     pub fn js_send_to_session<T, M>(handle: i64, session_cmd: T) -> IpeCmd<M>
     where
         T: serde::Serialize + Send + 'static,
     {
-        let session_id = handle as u64;
+        let handle = PortHandle::parse(handle);
         IpeCmd::Publish(Box::new(move |origin| {
+            let Some(sid) = SessionId::parse(origin) else {
+                return 0;
+            };
+            let token = handle.and_then(|handle| {
+                lock_sessions()
+                    .get_mut(&sid.0)
+                    .and_then(|p| p.stream_by_handle(handle))
+                    .map(|(token, _)| token)
+            });
+            let Some(token) = token else {
+                return 0;
+            };
             match serde_json::to_value(&session_cmd) {
                 Ok(value) => {
                     let envelope = serde_json::json!({
-                        SESSION_ID_FIELD: session_id,
+                        SESSION_ID_FIELD: token.wire(),
                         "payload": value,
                     });
                     let encoded = seal_encode(&JsonVal::from_serde(envelope));
-                    if let Some(sid) = SessionId::parse(origin) {
-                        deliver_or_buffer(&sid, &encoded);
-                    }
+                    deliver_or_buffer(&sid, &encoded);
                 }
                 Err(e) => {
                     crate::system::write_stderr_line(&format!(
@@ -869,13 +1207,14 @@ mod native {
     /// `js_close_session handle close_cmd decoder` — close a session and await its
     /// terminal reply.
     ///
-    /// 1. Install a one-shot terminal waiter on the session (if it is still open).
-    /// 2. Send `close_cmd` outbound tagged with the id so the host recorder emits
-    ///    its terminal frame.
+    /// 1. Install a one-shot terminal waiter on the stream `handle` names in the
+    ///    owning session; a negative or unheld handle is an `Err` at once.
+    /// 2. Send `close_cmd` outbound tagged with the stream's wire token so the
+    ///    host operation emits its terminal frame.
     /// 3. Await the terminal with a [`SESSION_DEADLINE_MS`] deadline; on arrival,
     ///    decode it fail-closed through the seal gate. A timeout, a decode-miss, an
     ///    overflow eviction, or an already-closed session → typed `Err`, never a
-    ///    panic. The session id is evicted regardless of outcome.
+    ///    panic. The session is evicted regardless of outcome.
     pub fn js_close_session<T, R>(
         handle: i64,
         close_cmd: T,
@@ -885,7 +1224,7 @@ mod native {
         T: serde::Serialize + Send + 'static,
         R: Send + 'static,
     {
-        let session_id = handle as u64;
+        let handle = PortHandle::parse(handle);
         let owner_sid = scope_sid();
         Box::pin(async move {
             let Some(sid) = owner_sid else {
@@ -896,25 +1235,23 @@ mod native {
             // Install the terminal waiter on the live session; fail closed if the
             // session is not open (already closed / evicted / never opened / foreign).
             let (tx, rx) = oneshot::channel::<JsonVal>();
-            {
+            let token = {
                 let mut g = lock_sessions();
-                match g
-                    .get_mut(&sid.0)
-                    .and_then(|p| p.streams.get_mut(&session_id))
-                {
-                    Some(stream) => stream.terminal = Some(tx),
-                    None => {
-                        return crate::core::IpeResult::Err(
-                            "js_close_session: session not open".to_string().into(),
-                        );
-                    }
-                }
-            }
+                let stream = handle
+                    .and_then(|handle| g.get_mut(&sid.0).and_then(|p| p.stream_by_handle(handle)));
+                let Some((token, stream)) = stream else {
+                    return crate::core::IpeResult::Err(
+                        "js_close_session: session not open".to_string().into(),
+                    );
+                };
+                stream.terminal = Some(tx);
+                token
+            };
             // Serialize + tag the close cmd and deliver it.
             match serde_json::to_value(&close_cmd) {
                 Ok(v) => {
                     let envelope = serde_json::json!({
-                        SESSION_ID_FIELD: session_id,
+                        SESSION_ID_FIELD: token.wire(),
                         "payload": v,
                     });
                     let encoded = seal_encode(&JsonVal::from_serde(envelope));
@@ -928,7 +1265,7 @@ mod native {
                 Err(e) => {
                     lock_sessions()
                         .get_mut(&sid.0)
-                        .map(|p| p.streams.remove(&session_id));
+                        .map(|p| p.streams.remove(&token));
                     return crate::core::IpeResult::Err(
                         format!("js_close_session: close cmd serialisation failed: {e}").into(),
                     );
@@ -941,7 +1278,7 @@ mod native {
             // router already removed it on a clean terminal).
             lock_sessions()
                 .get_mut(&sid.0)
-                .map(|p| p.streams.remove(&session_id));
+                .map(|p| p.streams.remove(&token));
 
             match result {
                 Ok(Ok(terminal_value)) => {
@@ -971,15 +1308,15 @@ mod native {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::{
-    deliver_inbound_for, js_close_session, js_open_session, js_request, js_send,
-    js_send_to_session, js_session_frames, js_subscribe, register_out_sink_for, session_close,
-    session_open,
+    PortClosed, PortLease, PortLife, deliver_inbound_for, js_close_session, js_open_session,
+    js_request, js_send, js_send_to_session, js_session_frames, js_subscribe,
+    register_out_sink_for, session_open,
 };
 
 // Consumed only by the `web`-gated `per_session` test submodule below; gate the
 // re-export to match so a `db`-without-`web` test build has no unused import.
 #[cfg(all(not(target_arch = "wasm32"), test, feature = "web"))]
-pub(crate) use native::{SessionPorts, lock_sessions};
+pub(crate) use native::{life_of, lock_sessions, open_session_with_mint, request_with_mint};
 
 // ─── Wasm (browser) transport ──────────────────────────────────────────────
 //
@@ -995,6 +1332,7 @@ mod wasm {
     use crate::seal_codec::seal_decode;
     use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::collections::hash_map::Entry;
     use std::rc::Rc;
     use wasm_bindgen::{JsCast, JsValue};
 
@@ -1005,36 +1343,45 @@ mod wasm {
     type ReplyWaiter = Box<dyn FnOnce(JsonVal)>;
 
     thread_local! {
-        /// Process-local monotonic correlation-id counter for the wasm target.
-        /// Single-threaded (wasm32 is `!Send`), so `Cell<u64>` is safe.
-        static NEXT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
-    }
-
-    fn next_cor_id() -> u64 {
-        NEXT_ID.with(|c| {
-            let id = c.get();
-            c.set(id.wrapping_add(1));
-            id
-        })
-    }
-
-    thread_local! {
         /// The in-tab inbound queue's drains. The browser's `window.ipe.send(raw)`
         /// pushes a string here (via [`push_inbound`]); each active `js_subscribe`
         /// registers a drain closure that fires on every pushed string.
         static INBOUND: RefCell<Vec<Drain>> = const { RefCell::new(Vec::new()) };
 
-        /// In-flight correlated one-shot waiters. Key = runtime-minted id.
-        /// A reply whose id is not in this map is dropped fail-closed.
-        static PENDING: RefCell<HashMap<u64, ReplyWaiter>> =
+        /// In-flight correlated one-shot waiters, keyed by the token minted for
+        /// each request. A reply whose token is not in this map is dropped
+        /// fail-closed (unknown, duplicate or late).
+        static PENDING: RefCell<HashMap<PortToken, ReplyWaiter>> =
             RefCell::new(HashMap::new());
 
-        /// Open session streams, keyed by runtime-minted session id (never derived
-        /// from JS input). Each holds the live `sessionFrames` drains, the frame
-        /// budget spent, and the one-shot terminal waiter. A frame/terminal whose id
-        /// is not in this map is dropped fail-closed. Bounded by
-        /// [`MAX_OPEN_SESSIONS`].
-        static SESSIONS: RefCell<HashMap<u64, WasmSession>> = RefCell::new(HashMap::new());
+        /// This tab's open session streams.
+        static SESSIONS: RefCell<WasmSessions> = RefCell::new(WasmSessions::new());
+    }
+
+    /// This tab's open sessions.
+    struct WasmSessions {
+        /// Open session streams, keyed by the wire token minted for each
+        /// session. A frame or terminal whose token is not in this map is
+        /// dropped fail-closed. Bounded by [`MAX_OPEN_SESSIONS`].
+        streams: HashMap<PortToken, WasmSession>,
+    }
+
+    impl WasmSessions {
+        fn new() -> Self {
+            Self {
+                streams: HashMap::new(),
+            }
+        }
+
+        /// The wire token of the open stream `handle` names.
+        ///
+        /// A linear scan: the map holds at most [`MAX_OPEN_SESSIONS`] entries.
+        fn token_of(&self, handle: PortHandle) -> Option<PortToken> {
+            self.streams
+                .iter()
+                .find(|(_, session)| session.handle == handle)
+                .map(|(token, _)| *token)
+        }
     }
 
     /// One open session's browser-local state.
@@ -1046,85 +1393,55 @@ mod wasm {
         frames_seen: u64,
         /// The `closeSession` terminal one-shot (resolves the awaiting Task once).
         terminal: Option<ReplyWaiter>,
+        /// The Ipê-side `SessionHandle` this stream answers to. It never goes on
+        /// the wire; the stream's map key is its wire token.
+        handle: PortHandle,
     }
 
     /// The browser-facing entry the JS glue calls to push an inbound port
     /// message: `window.ipe.send(raw)` routes here.
     ///
-    /// Dispatch: if the raw JSON has `__ipe_id`, route to the pending waiter
-    /// (correlated reply); otherwise fan out to all `js_subscribe` drains.
+    /// [`classify_inbound`] decides the route once: a reply resolves the
+    /// waiter its token names, a session frame or terminal goes to the stream
+    /// its token names, a frame with no reserved field fans out to every
+    /// `js_subscribe` drain, and a refused frame is dropped whole. An unknown,
+    /// duplicate or late token is dropped.
     pub fn push_inbound(raw: &str) {
-        // A session-tagged frame is routed to its session BEFORE the one-shot-reply
-        // check, so a session frame can never be misrouted. Unknown id → dropped.
-        if let Ok(mut value) = serde_json::from_str::<JsonVal>(raw)
-            && let Some(sess_val) = value
-                .as_object_mut()
-                .and_then(|o| o.swap_remove(SESSION_ID_FIELD))
-            && let Some(session_id) = sess_val.as_u64()
-        {
-            deliver_session_frame(session_id, value);
-            return;
-        }
-        // Peek for a correlation id (fail-closed: a parse error falls through).
-        // Wire format: `{"__ipe_id": <u64>, "payload": <sealed_reply>}`.
-        if let Ok(mut value) = serde_json::from_str::<JsonVal>(raw)
-            && let Some(id_val) = value
-                .as_object_mut()
-                .and_then(|o| o.swap_remove(COR_ID_FIELD))
-            && let Some(id) = id_val.as_u64()
-        {
-            // Extract `"payload"`, falling back to the whole remaining value.
-            let payload = value
-                .as_object_mut()
-                .and_then(|o| o.swap_remove("payload"))
-                .unwrap_or(value);
-            let waiter = PENDING.with(|p| p.borrow_mut().remove(&id));
-            if let Some(cb) = waiter {
-                cb(payload);
+        match classify_inbound(raw) {
+            Inbound::Reply { token, payload } => {
+                let waiter = PENDING.with(|p| p.borrow_mut().remove(&token));
+                if let Some(cb) = waiter {
+                    cb(payload);
+                }
             }
-            // Unknown/duplicate/late id: dropped fail-closed.
-            return;
-        }
-        let drains: Vec<Drain> = INBOUND.with(|q| q.borrow().iter().map(Rc::clone).collect());
-        for drain in drains {
-            drain(raw);
+            Inbound::SessionFrame { token, payload } => deliver_session_frame(token, &payload),
+            Inbound::SessionTerminal { token, payload } => {
+                deliver_session_terminal(token, payload);
+            }
+            Inbound::Broadcast => {
+                let drains: Vec<Drain> =
+                    INBOUND.with(|q| q.borrow().iter().map(Rc::clone).collect());
+                for drain in drains {
+                    drain(raw);
+                }
+            }
+            Inbound::Refused => {}
         }
     }
 
-    /// Route one session-tagged inbound value to the session `session_id`.
-    /// Fail-closed: an unknown/closed session id is dropped whole; a terminal
-    /// resolves the close waiter and evicts; an ordinary frame is charged against
-    /// the budget and fanned to the session's drains, terminating on overflow.
-    fn deliver_session_frame(session_id: u64, mut value: JsonVal) {
-        let is_terminal = value
-            .as_object_mut()
-            .and_then(|o| o.swap_remove(SESSION_TERMINAL_FIELD))
-            .and_then(|t| t.as_bool())
-            .unwrap_or(false);
-        let payload = value
-            .as_object_mut()
-            .and_then(|o| o.swap_remove("payload"))
-            .unwrap_or(value);
-
-        if is_terminal {
-            let waiter = SESSIONS.with(|s| {
-                s.borrow_mut()
-                    .remove(&session_id)
-                    .and_then(|sess| sess.terminal)
-            });
-            if let Some(cb) = waiter {
-                cb(payload);
-            }
-            return;
-        }
-        // Charge the budget; on overflow evict (drops the terminal waiter → the
-        // close Task resolves Err) rather than deliver past the bound.
+    /// Route one stream frame to the session `token` names.
+    ///
+    /// A token with no live stream is dropped whole. A live stream charges the
+    /// frame against its budget first; on overflow the session is evicted
+    /// (dropping the terminal waiter, so the close `Task` resolves `Err`)
+    /// rather than delivering past the bound.
+    fn deliver_session_frame(token: PortToken, payload: &JsonVal) {
         let drains = SESSIONS.with(|s| {
-            let mut map = s.borrow_mut();
-            let sess = map.get_mut(&session_id)?;
+            let mut sessions = s.borrow_mut();
+            let sess = sessions.streams.get_mut(&token)?;
             sess.frames_seen = sess.frames_seen.saturating_add(1);
             if sess.frames_seen > SESSION_FRAME_BUDGET {
-                map.remove(&session_id);
+                sessions.streams.remove(&token);
                 return None;
             }
             Some(sess.drains.iter().map(Rc::clone).collect::<Vec<_>>())
@@ -1134,6 +1451,22 @@ mod wasm {
             for drain in drains {
                 drain(&raw);
             }
+        }
+    }
+
+    /// Resolve the close waiter of the session `token` names and evict it.
+    ///
+    /// A token with no live stream, or a stream with no parked waiter, is
+    /// dropped.
+    fn deliver_session_terminal(token: PortToken, payload: JsonVal) {
+        let waiter = SESSIONS.with(|s| {
+            s.borrow_mut()
+                .streams
+                .remove(&token)
+                .and_then(|sess| sess.terminal)
+        });
+        if let Some(cb) = waiter {
+            cb(payload);
         }
     }
 
@@ -1247,9 +1580,11 @@ mod wasm {
     /// `js_request payload decoder` — correlated one-shot port request (wasm).
     ///
     /// Mirrors the native semantics using a `js_sys::Promise`-based future (the
-    /// wasm-compatible async primitive). A `resolve`/`reject` pair is stored in
-    /// `PENDING`; `push_inbound` calls `resolve` when the correlated reply arrives.
-    /// A `setTimeout` races the promise: whichever fires first wins.
+    /// wasm-compatible async primitive). A fresh [`PortToken`] is minted per
+    /// request (a failed or colliding draw refuses with `Unavailable`); the
+    /// `resolve` callback is stored in `PENDING` under it, and `push_inbound`
+    /// calls it when the reply carrying the token arrives. A `setTimeout` races
+    /// the promise: whichever fires first wins.
     pub fn js_request<T, R>(
         payload: T,
         decoder: Decoder<IpeError, R>,
@@ -1258,7 +1593,6 @@ mod wasm {
         T: serde::Serialize + 'static,
         R: 'static,
     {
-        let cor_id = next_cor_id();
         Box::pin(async move {
             // Refuse when the ceiling is already reached.
             let at_limit = PENDING.with(|p| p.borrow().len() >= MAX_OUTSTANDING);
@@ -1267,6 +1601,9 @@ mod wasm {
                     "js_request: outstanding waiter ceiling reached".to_owned(),
                 ));
             }
+            let Ok(token) = PortToken::mint() else {
+                return crate::core::IpeResult::Err(entropy_refusal("js_request"));
+            };
 
             // Serialize and wrap with the correlation id.
             let outbound_json = match serde_json::to_value(&payload) {
@@ -1278,7 +1615,7 @@ mod wasm {
                 }
             };
             let envelope = serde_json::json!({
-                COR_ID_FIELD: cor_id,
+                COR_ID_FIELD: token.wire(),
                 "payload": outbound_json,
             });
             let encoded = seal_encode(&JsonVal::from_serde(envelope));
@@ -1293,28 +1630,36 @@ mod wasm {
             // registered, so no reply can arrive before the waiter exists and a
             // frame no host takes rejects the promise at once.
             let mut outcome = DeliverOutcome::Delivered;
+            let mut collided = false;
             let promise = js_sys::Promise::new(&mut |resolve, reject| {
                 // `resolve` receives the reply payload JSON as a JsValue string.
                 // `reject` is called by the timeout closure, or at once when no
-                // host takes the frame.
+                // host takes the frame or the token is already live.
                 let resolve_rc = Rc::new(resolve);
                 let reject_rc = Rc::new(reject);
 
-                // Register resolve as the waiter.
+                // Register resolve as the waiter; a token already live belongs
+                // to another waiter and is never overwritten.
                 let resolve_stored = Rc::clone(&resolve_rc);
-                PENDING.with(|p| {
-                    p.borrow_mut().insert(
-                        cor_id,
-                        Box::new(move |value: JsonVal| {
+                let registered = PENDING.with(|p| match p.borrow_mut().entry(token) {
+                    Entry::Occupied(_) => false,
+                    Entry::Vacant(slot) => {
+                        slot.insert(Box::new(move |value: JsonVal| {
                             let s = value.to_string();
                             let _ = resolve_stored.call1(&JsValue::NULL, &JsValue::from_str(&s));
-                        }),
-                    );
+                        }));
+                        true
+                    }
                 });
+                if !registered {
+                    collided = true;
+                    let _ = reject_rc.call0(&JsValue::NULL);
+                    return;
+                }
 
                 outcome = deliver_outbound(&encoded);
                 if outcome != DeliverOutcome::Delivered {
-                    PENDING.with(|p| p.borrow_mut().remove(&cor_id));
+                    PENDING.with(|p| p.borrow_mut().remove(&token));
                     let _ = reject_rc.call0(&JsValue::NULL);
                     return;
                 }
@@ -1336,10 +1681,15 @@ mod wasm {
             // Await the promise (resolve = reply arrived; reject = no host or
             // timeout).
             let js_fut = wasm_bindgen_futures::JsFuture::from(promise);
-            match js_fut.await {
+            let settled = js_fut.await;
+            if collided {
+                // The live entry under this token is another waiter's; leave it.
+                return crate::core::IpeResult::Err(entropy_refusal("js_request"));
+            }
+            match settled {
                 Ok(reply_js) => {
                     // Clean up (idempotent).
-                    PENDING.with(|p| p.borrow_mut().remove(&cor_id));
+                    PENDING.with(|p| p.borrow_mut().remove(&token));
                     let reply_str = reply_js.as_string().unwrap_or_default();
                     match seal_decode(&reply_str, &decoder, SealLimits::default()) {
                         Ok(v) => crate::core::IpeResult::Ok(v),
@@ -1350,7 +1700,7 @@ mod wasm {
                     }
                 }
                 Err(_) => {
-                    PENDING.with(|p| p.borrow_mut().remove(&cor_id));
+                    PENDING.with(|p| p.borrow_mut().remove(&token));
                     crate::core::IpeResult::Err(
                         outcome
                             .refusal("js_request")
@@ -1361,10 +1711,14 @@ mod wasm {
         })
     }
 
-    /// `js_open_session open_cmd _decoder` (wasm) — mint a session id, register its
-    /// stream (bounded by [`MAX_OPEN_SESSIONS`]), send `open_cmd` outbound tagged
-    /// with the id, and resolve the Task with the id as the opaque handle. The id is
-    /// never derived from JS, so cross-handle addressing is unrepresentable.
+    /// `js_open_session open_cmd _decoder` (wasm) — open a session stream.
+    ///
+    /// Mints a fresh [`PortToken`] and a fresh [`PortHandle`] (a failed draw,
+    /// or one colliding with a live stream's token or handle, refuses with
+    /// `Unavailable`), registers the stream under the token (bounded by
+    /// [`MAX_OPEN_SESSIONS`]), sends `open_cmd` outbound tagged with the token,
+    /// and resolves the Task with the handle. The handle never goes on the
+    /// wire and the token never reaches the program.
     pub fn js_open_session<T, F>(
         open_cmd: T,
         _decoder: Decoder<IpeError, F>,
@@ -1373,49 +1727,66 @@ mod wasm {
         T: serde::Serialize + 'static,
         F: 'static,
     {
-        let session_id = next_cor_id();
         Box::pin(async move {
-            let at_limit = SESSIONS.with(|s| s.borrow().len() >= MAX_OPEN_SESSIONS);
-            if at_limit {
-                return crate::core::IpeResult::Err(IpeError::unavailable(
-                    "js_open_session: open-session ceiling reached".to_owned(),
-                ));
-            }
-            SESSIONS.with(|s| {
-                s.borrow_mut().insert(
-                    session_id,
-                    WasmSession {
-                        drains: Vec::new(),
-                        frames_seen: 0,
-                        terminal: None,
-                    },
-                );
+            let Ok(token) = PortToken::mint() else {
+                return crate::core::IpeResult::Err(entropy_refusal("js_open_session"));
+            };
+            let Some(handle) = PortHandle::mint() else {
+                return crate::core::IpeResult::Err(entropy_refusal("js_open_session"));
+            };
+            let registered = SESSIONS.with(|s| {
+                let mut sessions = s.borrow_mut();
+                if sessions.streams.len() >= MAX_OPEN_SESSIONS {
+                    return Err(IpeError::unavailable(
+                        "js_open_session: open-session ceiling reached".to_owned(),
+                    ));
+                }
+                if sessions.token_of(handle).is_some() {
+                    return Err(entropy_refusal("js_open_session"));
+                }
+                match sessions.streams.entry(token) {
+                    Entry::Occupied(_) => Err(entropy_refusal("js_open_session")),
+                    Entry::Vacant(slot) => {
+                        slot.insert(WasmSession {
+                            drains: Vec::new(),
+                            frames_seen: 0,
+                            terminal: None,
+                            handle,
+                        });
+                        Ok(handle.to_ipe())
+                    }
+                }
             });
+            let handle = match registered {
+                Ok(handle) => handle,
+                Err(refusal) => return crate::core::IpeResult::Err(refusal),
+            };
             let outbound_json = match serde_json::to_value(&open_cmd) {
                 Ok(v) => v,
                 Err(e) => {
-                    SESSIONS.with(|s| s.borrow_mut().remove(&session_id));
+                    SESSIONS.with(|s| s.borrow_mut().streams.remove(&token));
                     return crate::core::IpeResult::Err(
                         format!("js_open_session: open cmd serialisation failed: {e}").into(),
                     );
                 }
             };
             let envelope = serde_json::json!({
-                SESSION_ID_FIELD: session_id,
+                SESSION_ID_FIELD: token.wire(),
                 "payload": outbound_json,
             });
             let outcome = deliver_outbound(&seal_encode(&JsonVal::from_serde(envelope)));
             if let Some(refusal) = outcome.refusal("js_open_session") {
-                SESSIONS.with(|s| s.borrow_mut().remove(&session_id));
+                SESSIONS.with(|s| s.borrow_mut().streams.remove(&token));
                 return crate::core::IpeResult::Err(refusal);
             }
-            crate::core::IpeResult::Ok(session_id as i64)
+            crate::core::IpeResult::Ok(handle)
         })
     }
 
     /// `js_session_frames handle to_msg` (wasm) — register a fail-closed decoder
-    /// drain on the session's stream. A `handle` with no live session registers on
-    /// nothing (inert). The teardown thunk removes the drain on re-render.
+    /// drain on the stream `handle` names. A zero or negative `handle`, or one with no
+    /// live session, registers on nothing (inert). The teardown thunk removes
+    /// the drain on re-render.
     pub fn js_session_frames<T, M, F>(
         handle: i64,
         decoder: Decoder<IpeError, T>,
@@ -1426,7 +1797,7 @@ mod wasm {
         F: Fn(T) -> M + 'static,
         T: 'static,
     {
-        let session_id = handle as u64;
+        let handle = PortHandle::parse(handle);
         IpeSub::Source(Box::new(move |emit: Rc<dyn Fn(M)>| {
             let decoder = decoder.clone();
             let drain: Drain = Rc::new(move |raw: &str| {
@@ -1435,14 +1806,24 @@ mod wasm {
                 }
             });
             let drain_key = Rc::as_ptr(&drain) as *const () as usize;
-            SESSIONS.with(|s| {
-                if let Some(sess) = s.borrow_mut().get_mut(&session_id) {
-                    sess.drains.push(Rc::clone(&drain));
-                }
+            let token = handle.and_then(|handle| {
+                SESSIONS.with(|s| {
+                    let mut sessions = s.borrow_mut();
+                    let token = sessions.token_of(handle)?;
+                    sessions
+                        .streams
+                        .get_mut(&token)?
+                        .drains
+                        .push(Rc::clone(&drain));
+                    Some(token)
+                })
             });
             Box::new(move || {
+                let Some(token) = token else {
+                    return;
+                };
                 SESSIONS.with(|s| {
-                    if let Some(sess) = s.borrow_mut().get_mut(&session_id) {
+                    if let Some(sess) = s.borrow_mut().streams.get_mut(&token) {
                         sess.drains
                             .retain(|d| Rc::as_ptr(d) as *const () as usize != drain_key);
                     }
@@ -1451,17 +1832,22 @@ mod wasm {
         }))
     }
 
-    /// `js_send_to_session handle session_cmd` (wasm) — seal-encode + tag the cmd
-    /// and deliver it outbound. A cmd for a dead id reaches no live host recorder.
+    /// `js_send_to_session handle session_cmd` (wasm) — seal-encode the cmd, tag
+    /// it with the wire token of the stream `handle` names, and deliver it
+    /// outbound. A negative handle, or one with no open stream, sends nothing.
     pub fn js_send_to_session<T, M>(handle: i64, session_cmd: T) -> IpeCmd<M>
     where
         T: serde::Serialize + Send + 'static,
     {
-        let session_id = handle as u64;
+        let handle = PortHandle::parse(handle);
         IpeCmd::Publish(Box::new(move |_origin| {
+            let token = handle.and_then(|handle| SESSIONS.with(|s| s.borrow().token_of(handle)));
+            let Some(token) = token else {
+                return 0;
+            };
             if let Ok(value) = serde_json::to_value(&session_cmd) {
                 let envelope = serde_json::json!({
-                    SESSION_ID_FIELD: session_id,
+                    SESSION_ID_FIELD: token.wire(),
                     "payload": value,
                 });
                 deliver_outbound(&seal_encode(&JsonVal::from_serde(envelope)))
@@ -1472,8 +1858,9 @@ mod wasm {
     }
 
     /// `js_close_session handle close_cmd decoder` (wasm) — install the terminal
-    /// waiter, send `close_cmd` outbound tagged with the id, and await the terminal
-    /// with a deadline. Timeout / decode-miss / already-closed → typed `Err`.
+    /// waiter, send `close_cmd` outbound tagged with the stream's wire token, and
+    /// await the terminal with a deadline. Timeout / decode-miss / a negative,
+    /// unheld or already-closed handle → typed `Err`.
     pub fn js_close_session<T, R>(
         handle: i64,
         close_cmd: T,
@@ -1483,25 +1870,25 @@ mod wasm {
         T: serde::Serialize + 'static,
         R: 'static,
     {
-        let session_id = handle as u64;
+        let handle = PortHandle::parse(handle);
         Box::pin(async move {
-            let is_open = SESSIONS.with(|s| s.borrow().contains_key(&session_id));
-            if !is_open {
+            let token = handle.and_then(|handle| SESSIONS.with(|s| s.borrow().token_of(handle)));
+            let Some(token) = token else {
                 return crate::core::IpeResult::Err(
                     "js_close_session: session not open".to_string().into(),
                 );
-            }
+            };
             let outbound_json = match serde_json::to_value(&close_cmd) {
                 Ok(v) => v,
                 Err(e) => {
-                    SESSIONS.with(|s| s.borrow_mut().remove(&session_id));
+                    SESSIONS.with(|s| s.borrow_mut().streams.remove(&token));
                     return crate::core::IpeResult::Err(
                         format!("js_close_session: close cmd serialisation failed: {e}").into(),
                     );
                 }
             };
             let envelope = serde_json::json!({
-                SESSION_ID_FIELD: session_id,
+                SESSION_ID_FIELD: token.wire(),
                 "payload": outbound_json,
             });
             let encoded = seal_encode(&JsonVal::from_serde(envelope));
@@ -1513,7 +1900,7 @@ mod wasm {
                 let reject_rc = Rc::new(reject);
                 let resolve_stored = Rc::clone(&resolve_rc);
                 SESSIONS.with(|s| {
-                    if let Some(sess) = s.borrow_mut().get_mut(&session_id) {
+                    if let Some(sess) = s.borrow_mut().streams.get_mut(&token) {
                         sess.terminal = Some(Box::new(move |value: JsonVal| {
                             let out = value.to_string();
                             let _ = resolve_stored.call1(&JsValue::NULL, &JsValue::from_str(&out));
@@ -1539,7 +1926,7 @@ mod wasm {
 
             let js_fut = wasm_bindgen_futures::JsFuture::from(promise);
             let outcome = js_fut.await;
-            SESSIONS.with(|s| s.borrow_mut().remove(&session_id));
+            SESSIONS.with(|s| s.borrow_mut().streams.remove(&token));
             match outcome {
                 Ok(reply_js) => {
                     let reply_str = reply_js.as_string().unwrap_or_default();
@@ -1612,6 +1999,778 @@ mod tests {
         assert_eq!(seal_encode(&value), r#"{"a":1,"b":2}"#);
     }
 
+    // ── Port tokens and the inbound classifier ──────────────────────────────────
+
+    /// A well-formed token no registry minted.
+    const UNMINTED_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn minted_tokens_are_distinct_and_round_trip() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let minted = PortToken::mint();
+            assert!(
+                minted.is_ok(),
+                "the OS random source must serve a test mint"
+            );
+            let Ok(token) = minted else {
+                return;
+            };
+            let wire = token.wire();
+            assert_eq!(wire.len(), 32);
+            assert!(
+                wire.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+                "the wire spelling is lowercase hex: {wire}"
+            );
+            assert_eq!(PortToken::parse(&wire), Some(token));
+            assert!(seen.insert(wire), "1000 mints never repeat");
+        }
+        assert_eq!(
+            format!("{:?}", PortToken::parse(UNMINTED_TOKEN)),
+            "Some(PortToken(<opaque>))"
+        );
+    }
+
+    #[test]
+    fn mint_refuses_without_entropy() {
+        assert!(matches!(
+            PortToken::mint_from(|_| Err(EntropyError)),
+            Err(EntropyError)
+        ));
+        assert_eq!(
+            entropy_refusal("js_request"),
+            crate::error::IpeError::unavailable(
+                "js_request: the OS random source is unavailable".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn port_ids_are_never_counters() {
+        // The needles are split so this test does not match itself.
+        let source = include_str!("js_port.rs");
+        for needle in [
+            concat!("Cell<", "u64>"),
+            concat!("next_", "cor_id"),
+            concat!("next_", "handle"),
+            concat!("take_", "handle"),
+        ] {
+            assert!(
+                !source.contains(needle),
+                "a port id must be a minted token, never a counter: found `{needle}`"
+            );
+        }
+        // The one counter is the internal life generation, which never leaves
+        // the registry: its `impl` holds one fn, and every integer counter of
+        // any width sits inside it.
+        let life = life_block(source);
+        assert!(!life.is_empty(), "the life generation is implemented");
+        assert_eq!(
+            source
+                .get(life)
+                .map(|block| block.matches(concat!("fn", " ")).count()),
+            Some(1),
+            "the life generation holds its one counter fn only"
+        );
+        assert_eq!(
+            counters_outside_life(source),
+            Vec::<usize>::new(),
+            "an integer counter outside the life generation: a port id must be minted"
+        );
+        // The scan sees every counter width, not only the one the life uses.
+        for planted in [
+            concat!("static N: Atomic", "Usize"),
+            concat!("static N: Atomic", "U32"),
+            concat!("static N: Atomic", "I64"),
+            concat!("n: Cell<", "usize>"),
+            concat!("n: Cell<", "i64>"),
+            concat!("static N: Mutex<", "u64>"),
+            concat!("static N: Mutex<", "i64>"),
+            concat!("static N: RwLock<", "usize>"),
+            concat!("static N: RwLock<", "i32>"),
+        ] {
+            let probe = format!(
+                "{planted}\n{}\n        fn next() {{}}\n    }}\n",
+                concat!("impl Port", "Life {")
+            );
+            assert!(
+                !counters_outside_life(&probe).is_empty(),
+                "the counter scan misses `{planted}`"
+            );
+        }
+    }
+
+    /// The production part of `source`: everything before this test module.
+    fn production_source(source: &str) -> &str {
+        source
+            .find(concat!(
+                "#[cfg(all(test, not(target_arch = \"wasm32\")))]\nmod ",
+                "tests"
+            ))
+            .and_then(|end| source.get(..end))
+            .unwrap_or(source)
+    }
+
+    /// The byte range of the life generation's `impl` block in `source`; empty when absent.
+    fn life_block(source: &str) -> std::ops::Range<usize> {
+        let source = production_source(source);
+        source
+            .find(concat!("impl Port", "Life {"))
+            .map_or(0..0, |start| {
+                let len = source
+                    .get(start..)
+                    .and_then(|rest| rest.find("\n    }\n"))
+                    .unwrap_or(0);
+                start..start.saturating_add(len)
+            })
+    }
+
+    /// Offsets of every integer counter primitive (an atomic or a `Cell` of
+    /// any integer width) in the production part of `source` that lies
+    /// outside the life generation's `impl` block.
+    fn counters_outside_life(source: &str) -> Vec<usize> {
+        let life = life_block(source);
+        let production = production_source(source);
+        [
+            concat!("Atomic", "U"),
+            concat!("Atomic", "I"),
+            concat!("Cell<", "u"),
+            concat!("Cell<", "i"),
+            concat!("Mutex<", "u"),
+            concat!("Mutex<", "i"),
+            concat!("RwLock<", "u"),
+            concat!("RwLock<", "i"),
+        ]
+        .into_iter()
+        .flat_map(|needle| production.match_indices(needle).map(|(at, _)| at))
+        .filter(|at| !life.contains(at))
+        .collect()
+    }
+
+    /// `source` with every string literal emptied and every line cut at its
+    /// first `//` outside a string.
+    fn code_only(source: &str) -> String {
+        let mut out = String::with_capacity(source.len());
+        for line in source.lines() {
+            let mut in_string = false;
+            let mut escaped = false;
+            let mut chars = line.chars().peekable();
+            while let Some(c) = chars.next() {
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if c == '\\' {
+                        escaped = true;
+                    } else if c == '"' {
+                        in_string = false;
+                        out.push(c);
+                    }
+                    continue;
+                }
+                if c == '/' && chars.peek() == Some(&'/') {
+                    break;
+                }
+                if c == '"' {
+                    in_string = true;
+                }
+                out.push(c);
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The byte range of the block whose header is the first `header` in
+    /// `source`, through the `}` at the header line's indentation; empty when
+    /// the header or its close is absent.
+    fn block_of(source: &str, header: &str) -> std::ops::Range<usize> {
+        let Some(start) = source.find(header) else {
+            return 0..0;
+        };
+        let line_start = source
+            .get(..start)
+            .and_then(|before| before.rfind('\n'))
+            .map_or(0, |i| i.saturating_add(1));
+        let indent: String = source
+            .get(line_start..start)
+            .unwrap_or_default()
+            .chars()
+            .take_while(|c| *c == ' ')
+            .collect();
+        let close = format!("\n{indent}}}\n");
+        source
+            .get(start..)
+            .and_then(|rest| rest.find(&close))
+            .map_or(0..0, |len| {
+                start..start.saturating_add(len).saturating_add(close.len())
+            })
+    }
+
+    /// The names of the `fn`s declared in `block`, sorted.
+    fn fn_names(block: &str) -> Vec<String> {
+        let mut names: Vec<String> = block
+            .match_indices("fn ")
+            .filter(|(at, _)| {
+                block
+                    .get(..*at)
+                    .and_then(|before| before.chars().next_back())
+                    .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+            })
+            .map(|(at, _)| {
+                block
+                    .get(at.saturating_add(3)..)
+                    .unwrap_or_default()
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The `Self` constructor shapes: a tuple call, a brace literal, a fn value.
+    const SELF_BUILDS: [&str; 5] = ["Self(", "Self {", "Self{", "(Self)", "Self)"];
+
+    /// Offsets of `needle` in `code` that build a value: a return type
+    /// (`-> Self {` opening a body) is not a build.
+    fn builds_at(code: &str, needle: &str) -> Vec<usize> {
+        code.match_indices(needle)
+            .map(|(at, _)| at)
+            .filter(|at| {
+                !code
+                    .get(..*at)
+                    .is_some_and(|before| before.ends_with("-> "))
+            })
+            .collect()
+    }
+
+    /// Every way `source`'s `impl SessionPorts` block could build a second
+    /// entry: a `Self` literal or a call to `new`, a `fn` beyond `new` and
+    /// `stream_by_handle`, or a trait `impl` for the type. A missing block is
+    /// a fault, never a pass.
+    fn session_ports_impl_faults(source: &str) -> Vec<String> {
+        let code = code_only(production_source(source));
+        let block = block_of(&code, concat!("impl Session", "Ports {"));
+        let Some(body) = code.get(block).filter(|body| !body.is_empty()) else {
+            return vec!["no `impl SessionPorts` block".to_owned()];
+        };
+        let mut faults = Vec::new();
+        for needle in ["Self {", "Self{", "Self::new(", "Self::new)", "Self::new,"] {
+            if !builds_at(body, needle).is_empty() {
+                faults.push(format!("`{needle}` inside `impl SessionPorts`"));
+            }
+        }
+        let names = fn_names(body);
+        if names != ["new", "stream_by_handle"] {
+            faults.push(format!("`impl SessionPorts` declares {names:?}"));
+        }
+        if code.contains(concat!("for Session", "Ports")) {
+            faults.push("a trait impl for SessionPorts".to_owned());
+        }
+        faults
+    }
+
+    /// Every way `source` builds a [`PortHandle`] or a [`PortToken`] other
+    /// than through its own `mint_from` and `parse`, and every
+    /// `PortHandle::parse` whose argument is not the program's `handle: i64`
+    /// parameter. A missing block or constructor is a fault, never a pass.
+    fn handle_construction_faults(source: &str) -> Vec<String> {
+        let code = code_only(production_source(source));
+        let mut faults = Vec::new();
+        for ty in [concat!("Port", "Handle"), concat!("Port", "Token")] {
+            let block = block_of(&code, &format!("impl {ty} {{"));
+            let Some(body) = code.get(block.clone()).filter(|body| !body.is_empty()) else {
+                faults.push(format!("no `impl {ty}` block"));
+                continue;
+            };
+            let mut allowed = Vec::new();
+            for header in ["fn mint_from(", "fn parse("] {
+                let span = block_of(body, header);
+                if span.is_empty() {
+                    faults.push(format!("`impl {ty}` has no `{header}`"));
+                } else {
+                    allowed.push(
+                        span.start.saturating_add(block.start)
+                            ..span.end.saturating_add(block.start),
+                    );
+                }
+            }
+            // Inside the type's own impl, `Self` is built only by its two
+            // constructors.
+            for needle in SELF_BUILDS {
+                for at in builds_at(body, needle) {
+                    let at = at.saturating_add(block.start);
+                    if !allowed.iter().any(|span| span.contains(&at)) {
+                        faults.push(format!("`{needle}` outside {ty}'s constructors"));
+                    }
+                }
+            }
+            // A trait impl for the type builds no `Self`.
+            let trait_header = format!("for {ty} {{");
+            for (at, _) in code.match_indices(&trait_header) {
+                let line = code
+                    .get(..at)
+                    .and_then(|before| before.rfind('\n'))
+                    .map_or(0, |i| i.saturating_add(1));
+                let rest = code.get(line..).unwrap_or_default();
+                let trait_body = rest.get(block_of(rest, &trait_header)).unwrap_or_default();
+                if trait_body.is_empty()
+                    || SELF_BUILDS
+                        .iter()
+                        .any(|needle| !builds_at(trait_body, needle).is_empty())
+                {
+                    faults.push(format!("a trait impl for {ty} builds a value"));
+                }
+            }
+            // Outside its impl the name is never a constructor call, a brace
+            // literal or a fn value; a declaration or a type position is not
+            // a build.
+            for needle in [
+                format!("{ty}("),
+                format!("{ty} {{"),
+                format!("{ty}{{"),
+                format!("({ty})"),
+                format!(", {ty})"),
+            ] {
+                for (at, _) in code.match_indices(&needle) {
+                    let before = code.get(..at).unwrap_or_default();
+                    let declared = before.ends_with("struct ")
+                        || before.ends_with("impl ")
+                        || before.ends_with("for ");
+                    let typed = before.ends_with(": ") || before.ends_with("-> ");
+                    if !(declared || typed) {
+                        faults.push(format!("`{needle}` builds a {ty}"));
+                    }
+                }
+            }
+            // No derive hands out a value the constructors never checked.
+            let derive = code
+                .find(&format!("struct {ty}("))
+                .and_then(|at| code.get(..at))
+                .and_then(|before| before.rfind("#[derive(").and_then(|d| before.get(d..)))
+                .unwrap_or_default();
+            if derive.is_empty() || derive.contains("Default") {
+                faults.push(format!("{ty} derives `Default` or has no derive"));
+            }
+        }
+        // A program handle enters only through the program's own `handle:
+        // i64` parameter, not rebound before the parse.
+        let parse = concat!("PortHandle::", "parse");
+        let call = format!("{parse}(");
+        if code.matches(parse).count() != code.matches(&call).count() {
+            faults.push(format!("`{parse}` used as a fn value"));
+        }
+        for (at, _) in code.match_indices(&call) {
+            let arg = code
+                .get(at.saturating_add(call.len())..)
+                .and_then(|rest| rest.split(')').next())
+                .unwrap_or_default();
+            if arg != "handle" {
+                faults.push(format!("`{call}{arg})` is not the program's handle"));
+                continue;
+            }
+            let before = code.get(..at).unwrap_or_default();
+            let Some(fn_at) = before.rfind("fn ") else {
+                faults.push(format!("`{call}handle)` outside a fn"));
+                continue;
+            };
+            let seg = before.get(fn_at..).unwrap_or_default();
+            let (sig, body) = seg.split_once("{\n").unwrap_or((seg, ""));
+            let body = body
+                .rfind('\n')
+                .and_then(|end| body.get(..end))
+                .unwrap_or_default();
+            if !sig.contains("handle: i64") {
+                faults.push(format!("`{call}handle)` in a fn without `handle: i64`"));
+            }
+            for rebind in [
+                "let handle",
+                "let mut handle",
+                "handle = ",
+                "|handle",
+                "(handle)",
+                "handle,",
+            ] {
+                if body.contains(rebind) {
+                    faults.push(format!("`handle` rebound by `{rebind}` before `{call}`"));
+                }
+            }
+        }
+        faults
+    }
+
+    #[test]
+    fn port_handles_are_built_only_by_their_constructors() {
+        let source = include_str!("js_port.rs");
+        assert_eq!(
+            handle_construction_faults(source),
+            Vec::<String>::new(),
+            "a port handle or token is built only by its mint_from and parse"
+        );
+        // Each planted shape is refused. The needles are split so this test
+        // does not match itself.
+        let parse_site = concat!("PortHandle::parse", "(handle)");
+        let top = "/// Bytes drawn for one [`PortHandle`].\n";
+        let inside = "    /// The handle as the program holds it.\n";
+        let planted: [(&str, String, &str); 14] = [
+            (
+                parse_site,
+                concat!("PortHandle::parse", "(n)").to_owned(),
+                "not the program's handle",
+            ),
+            (
+                parse_site,
+                concat!("Some(handle).and_then(PortHandle::", "parse)").to_owned(),
+                "fn value",
+            ),
+            (
+                top,
+                format!("fn g(n: i64) -> Option<PortHandle> {{\n    {parse_site}\n}}\n{top}"),
+                "without `handle: i64`",
+            ),
+            (
+                top,
+                format!(
+                    "fn g(handle: i64) -> Option<PortHandle> {{\n    let handle = n;\n    {parse_site}\n}}\n{top}"
+                ),
+                "rebound",
+            ),
+            (
+                inside,
+                format!(
+                    "    fn of(n: std::num::NonZeroI64) -> Self {{\n        {}\n    }}\n{inside}",
+                    concat!("Self", "(n)")
+                ),
+                "outside PortHandle's constructors",
+            ),
+            (
+                inside,
+                format!(
+                    "    fn of(n: std::num::NonZeroI64) -> Option<Self> {{\n        Some(n).map({}\n    }}\n{inside}",
+                    concat!("Self", ")")
+                ),
+                "outside PortHandle's constructors",
+            ),
+            (
+                inside,
+                format!(
+                    "    fn of(n: std::num::NonZeroI64) -> Self {{\n        {} 0: n }}\n    }}\n{inside}",
+                    concat!("Self", " {")
+                ),
+                "outside PortHandle's constructors",
+            ),
+            (
+                top,
+                format!(
+                    "fn z(n: std::num::NonZeroI64) -> Option<PortHandle> {{\n    Some({}n))\n}}\n{top}",
+                    concat!("Port", "Handle(")
+                ),
+                "builds a PortHandle",
+            ),
+            (
+                top,
+                format!(
+                    "fn z(n: std::num::NonZeroI64) -> Option<PortHandle> {{\n    Some(n).map{}\n}}\n{top}",
+                    concat!("(Port", "Handle)")
+                ),
+                "builds a PortHandle",
+            ),
+            (
+                top,
+                format!(
+                    "fn z() -> Option<PortToken> {{\n    Some({}[0; 16]))\n}}\n{top}",
+                    concat!("Port", "Token(")
+                ),
+                "builds a PortToken",
+            ),
+            (
+                top,
+                format!(
+                    "impl From<std::num::NonZeroI64> for {} {{\n    fn from(n: std::num::NonZeroI64) -> Self {{\n        {}\n    }}\n}}\n{top}",
+                    concat!("Port", "Handle"),
+                    concat!("Self", "(n)")
+                ),
+                "trait impl for PortHandle",
+            ),
+            (
+                concat!("Debug)]\npub(crate) struct Port", "Handle("),
+                concat!("Debug, Default)]\npub(crate) struct Port", "Handle(").to_owned(),
+                "derives `Default`",
+            ),
+            (
+                concat!("pub(crate) fn parse(raw: ", "i64)"),
+                concat!("pub(crate) fn parse_raw(raw: ", "i64)").to_owned(),
+                "has no `fn parse(`",
+            ),
+            (
+                concat!("impl Port", "Handle {"),
+                concat!("impl Port", "HandleX {").to_owned(),
+                "no `impl PortHandle` block",
+            ),
+        ];
+        for (anchor, replacement, expected) in planted {
+            let probe = source.replacen(anchor, &replacement, 1);
+            assert_ne!(probe, source, "the plant at `{anchor}` took");
+            let faults = handle_construction_faults(&probe);
+            assert!(
+                faults.iter().any(|fault| fault.contains(expected)),
+                "the construction scan misses `{replacement}`: {faults:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_ports_impl_builds_no_second_entry() {
+        let source = include_str!("js_port.rs");
+        assert_eq!(
+            session_ports_impl_faults(source),
+            Vec::<String>::new(),
+            "`impl SessionPorts` holds `new` and `stream_by_handle` only"
+        );
+        // Each planted shape is refused. The needles are split so this test
+        // does not match itself.
+        let stream_doc = "        /// The open stream `handle` names, with its wire token.\n";
+        let planted: [(&str, String, &str); 5] = [
+            (
+                concat!("-> Self {\n            Session", "Ports {"),
+                concat!("-> Self {\n            Self", " {").to_owned(),
+                "`Self {` inside",
+            ),
+            (
+                "            self.streams\n                .iter_mut()",
+                format!(
+                    "            let _ = {}self.life);\n            self.streams\n                .iter_mut()",
+                    concat!("Self::", "new(")
+                ),
+                "`Self::new(` inside",
+            ),
+            (
+                stream_doc,
+                format!("        fn spare() {{}}\n{stream_doc}"),
+                "declares",
+            ),
+            (
+                "    /// The generation of one port life",
+                format!(
+                    "    impl Clone for {} {{\n    }}\n\n    /// The generation of one port life",
+                    concat!("Session", "Ports")
+                ),
+                "trait impl",
+            ),
+            (
+                concat!("impl Session", "Ports {"),
+                concat!("impl Session", "PortsX {").to_owned(),
+                "no `impl SessionPorts` block",
+            ),
+        ];
+        for (anchor, replacement, expected) in planted {
+            let probe = source.replacen(anchor, &replacement, 1);
+            assert_ne!(probe, source, "the plant at `{anchor}` took");
+            let faults = session_ports_impl_faults(&probe);
+            assert!(
+                faults.iter().any(|fault| fault.contains(expected)),
+                "the SessionPorts scan misses `{replacement}`: {faults:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn port_handle_parse_refuses_out_of_range() {
+        assert_eq!(PortHandle::parse(0), None);
+        assert_eq!(PortHandle::parse(-1), None);
+        assert_eq!(PortHandle::parse(i64::MIN), None);
+        assert_eq!(
+            PortHandle::parse(i64::MAX).map(PortHandle::to_ipe),
+            Some(i64::MAX)
+        );
+        assert_eq!(
+            PortHandle::mint_from(|bytes| {
+                bytes.fill(0);
+                Ok(())
+            }),
+            None
+        );
+        assert_eq!(PortHandle::mint_from(|_| Err(EntropyError)), None);
+        assert!(
+            PortHandle::mint_from(|bytes| {
+                bytes.fill(0xff);
+                Ok(())
+            })
+            .is_some_and(|h| h.to_ipe() == i64::MAX)
+        );
+    }
+
+    #[test]
+    fn session_ports_are_built_only_by_session_open() {
+        // The needles are split so this test does not match itself.
+        let full = include_str!("js_port.rs");
+        let end = full
+            .find(concat!(
+                "#[cfg(all(test, not(target_arch = \"wasm32\")))]\nmod ",
+                "tests"
+            ))
+            .unwrap_or(full.len());
+        let source: String = full
+            .get(..end)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let ctor = concat!("SessionPorts", "::new(");
+        let ctors: Vec<usize> = source.match_indices(ctor).map(|(at, _)| at).collect();
+        let open_at = source.find(concat!("pub fn session", "_open("));
+        assert!(open_at.is_some(), "session_open exists");
+        let Some(open_at) = open_at else {
+            return;
+        };
+        let open_end = source
+            .get(open_at + 1..)
+            .and_then(|rest| {
+                rest.find("\n    pub fn ")
+                    .or_else(|| rest.find("\n    fn "))
+            })
+            .map_or(source.len(), |len| open_at + 1 + len);
+        assert!(
+            ctors.len() == 1 && ctors.iter().all(|at| (open_at..open_end).contains(at)),
+            "SessionPorts is built only inside session_open, found at {ctors:?}"
+        );
+        let literals = source.matches(concat!("SessionPorts", " {")).count()
+            - source.matches(concat!("struct ", "SessionPorts {")).count()
+            - source.matches(concat!("impl ", "SessionPorts {")).count();
+        assert_eq!(literals, 1, "SessionPorts has one literal, in `new`");
+        for needle in [
+            concat!("impl Default for ", "SessionPorts"),
+            concat!(".or_insert", "_with("),
+        ] {
+            assert!(
+                !source.contains(needle),
+                "no reach may create a sid's entry: found `{needle}`"
+            );
+        }
+        // Every `entry` reach names its receiver, and the admitted ones are
+        // the inner tables of an entry already held (a session's waiters and
+        // streams, the wasm realm's): a sessions-map entry under any guard
+        // name is refused.
+        let admitted = [
+            "ports.pending",
+            "ports.streams",
+            "sessions.streams",
+            "p.borrow_mut()",
+        ];
+        let receivers = entry_receivers(&source);
+        assert!(
+            !receivers.is_empty() && receivers.iter().all(|r| admitted.contains(&r.as_str())),
+            "no reach may create a sid's entry: `entry` on {receivers:?}"
+        );
+        for planted in ["g", "sessions", "lock_sessions()", "f(g"] {
+            let probe = format!("let _ = {planted}{}sid);\n", concat!(".", "entry("));
+            assert_eq!(
+                entry_receivers(&probe),
+                vec![planted.to_owned()],
+                "the receiver read sees `{planted}`"
+            );
+        }
+    }
+
+    /// The receiver expression before each `.entry(` call in `source`.
+    fn entry_receivers(source: &str) -> Vec<String> {
+        source
+            .match_indices(concat!(".", "entry("))
+            .map(|(at, _)| {
+                let before = source.get(..at).unwrap_or_default();
+                let start = before
+                    .rfind(|c: char| c.is_whitespace() || c == '{' || c == ';')
+                    .map_or(0, |i| i.saturating_add(1));
+                before.get(start..).unwrap_or_default().to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reserved_key_frames_are_refused() {
+        let unparsable_ids = [
+            "null".to_owned(),
+            "1".to_owned(),
+            "1.5".to_owned(),
+            "-1".to_owned(),
+            "true".to_owned(),
+            "{}".to_owned(),
+            "[]".to_owned(),
+            format!("\"{}\"", &UNMINTED_TOKEN[..31]),
+            format!("\"{UNMINTED_TOKEN}0\""),
+            format!("\"+{}\"", &UNMINTED_TOKEN[1..]),
+            format!("\" {}\"", &UNMINTED_TOKEN[1..]),
+            format!("\"{}\"", UNMINTED_TOKEN.to_uppercase()),
+            "\"\"".to_owned(),
+        ];
+        for key in [COR_ID_FIELD, SESSION_ID_FIELD] {
+            for id in &unparsable_ids {
+                let raw = format!(r#"{{"{key}":{id},"payload":1}}"#);
+                assert!(
+                    matches!(classify_inbound(&raw), Inbound::Refused),
+                    "an id that does not parse is refused, never broadcast: {raw}"
+                );
+            }
+        }
+        let t = UNMINTED_TOKEN;
+        for raw in [
+            format!(r#"{{"__ipe_id":"{t}","__ipe_session":"{t}","payload":1}}"#),
+            format!(r#"{{"__ipe_id":"{t}","__ipe_session":"{t}","__ipe_terminal":true}}"#),
+            r#"{"__ipe_terminal":true,"payload":1}"#.to_owned(),
+            format!(r#"{{"__ipe_id":"{t}","__ipe_terminal":true,"payload":1}}"#),
+            format!(r#"{{"__ipe_session":"{t}","__ipe_terminal":"yes","payload":1}}"#),
+            format!(r#"{{"__ipe_session":"{t}","__ipe_terminal":1,"payload":1}}"#),
+            format!(r#"{{"__ipe_session":"{t}","__ipe_terminal":null,"payload":1}}"#),
+        ] {
+            assert!(
+                matches!(classify_inbound(&raw), Inbound::Refused),
+                "an illegal reserved-field shape is refused: {raw}"
+            );
+        }
+        for raw in [
+            "1",
+            "not json",
+            "[1,2]",
+            r#"{"payload":1}"#,
+            r#"{"ipe_id":1}"#,
+        ] {
+            assert!(
+                matches!(classify_inbound(raw), Inbound::Broadcast),
+                "a frame with no reserved field is a broadcast: {raw}"
+            );
+        }
+        let Some(expected) = PortToken::parse(t) else {
+            return;
+        };
+        assert!(matches!(
+            classify_inbound(&format!(r#"{{"__ipe_id":"{t}","payload":7}}"#)),
+            Inbound::Reply { token, payload } if token == expected && payload.to_string() == "7"
+        ));
+        assert!(matches!(
+            classify_inbound(&format!(r#"{{"__ipe_id":"{t}","a":2}}"#)),
+            Inbound::Reply { token, payload } if token == expected && payload.to_string() == r#"{"a":2}"#
+        ));
+        assert!(matches!(
+            classify_inbound(&format!(r#"{{"__ipe_session":"{t}","payload":8}}"#)),
+            Inbound::SessionFrame { token, payload } if token == expected && payload.to_string() == "8"
+        ));
+        assert!(matches!(
+            classify_inbound(&format!(
+                r#"{{"__ipe_session":"{t}","__ipe_terminal":false,"payload":8}}"#
+            )),
+            Inbound::SessionFrame { token, .. } if token == expected
+        ));
+        assert!(matches!(
+            classify_inbound(&format!(
+                r#"{{"__ipe_session":"{t}","__ipe_terminal":true,"payload":9}}"#
+            )),
+            Inbound::SessionTerminal { token, payload } if token == expected && payload.to_string() == "9"
+        ));
+    }
+
     // ── Per-session transport (needs the `web` session-sid scope) ──────────────
     //
     // The native port transport binds each `js_subscribe`/`js_send` to the OWNING
@@ -1622,6 +2781,7 @@ mod tests {
     mod per_session {
         use super::super::native::MAX_OUT_PENDING;
         use super::super::*;
+        use super::UNMINTED_TOKEN;
         use crate::IpeResult;
         use crate::error::IpeError;
         use crate::json::{Decoder, JsonVal, json_decode_int};
@@ -1645,6 +2805,14 @@ mod tests {
         #[allow(clippy::expect_used)]
         fn test_sid(raw: &str) -> SessionId {
             SessionId::parse(raw).expect("test sid must be valid hex")
+        }
+
+        // Bind the out-sink of `sid`'s current life; the test holds a lease for `sid`.
+        fn bind_sink(sid: &SessionId, sink: Arc<dyn Fn(&str) + Send + Sync>) {
+            let life = life_of(sid);
+            assert!(life.is_some(), "the test holds a lease for the sid");
+            let Some(life) = life else { return };
+            assert_eq!(register_out_sink_for(sid, life, sink), Ok(()));
         }
 
         // Materialise a `js_subscribe` Source the way the Web driver does —
@@ -1671,20 +2839,20 @@ mod tests {
         #[tokio::test]
         async fn inbound_clean_payload_is_emitted() {
             let sid = test_sid("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6");
-            session_open(&sid);
+            let lease = session_open(&sid);
             let (h, got) = collect_for(&sid, int_decoder());
             tokio::time::sleep(std::time::Duration::from_millis(20)).await; // let it subscribe
             deliver_inbound_for(&sid, "7".to_string());
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             assert_eq!(*got.lock().unwrap_or_else(|e| e.into_inner()), vec![7]);
             drop(h);
-            session_close(&sid);
+            drop(lease);
         }
 
         #[tokio::test]
         async fn inbound_undecodable_payload_is_dropped_whole() {
             let sid = test_sid("b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7");
-            session_open(&sid);
+            let lease = session_open(&sid);
             let (h, got) = collect_for(&sid, int_decoder());
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             deliver_inbound_for(&sid, "\"not an int\"".to_string()); // string, not i64
@@ -1692,13 +2860,13 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             assert!(got.lock().unwrap_or_else(|e| e.into_inner()).is_empty()); // both dropped, no panic, no partial
             drop(h);
-            session_close(&sid);
+            drop(lease);
         }
 
         #[tokio::test]
         async fn inbound_failing_decoder_drops_every_payload() {
             let sid = test_sid("c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8");
-            session_open(&sid);
+            let lease = session_open(&sid);
             let (h, got) = collect_for(&sid, never_decoder());
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             deliver_inbound_for(&sid, "1".to_string());
@@ -1706,7 +2874,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             assert!(got.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
             drop(h);
-            session_close(&sid);
+            drop(lease);
         }
 
         #[tokio::test]
@@ -1714,8 +2882,8 @@ mod tests {
             let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
             let seen2 = seen.clone();
             let sid = test_sid("d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9");
-            session_open(&sid);
-            register_out_sink_for(
+            let lease = session_open(&sid);
+            bind_sink(
                 &sid,
                 Arc::new(move |s: &str| {
                     seen2
@@ -1739,7 +2907,7 @@ mod tests {
                     .map(String::as_str),
                 Some("42")
             );
-            session_close(&sid);
+            drop(lease);
         }
 
         // A `Cmd` dispatched BEFORE the SSE connection binds the out-sink — the
@@ -1749,7 +2917,7 @@ mod tests {
         #[tokio::test]
         async fn outbound_before_sink_bind_is_buffered_then_flushed_on_bind() {
             let sid = test_sid("a0b1c2d3e4f5a0b1c2d3e4f5a0b1c2d3");
-            session_open(&sid); // session exists, but NO out-sink bound yet
+            let lease = session_open(&sid); // session exists, but NO out-sink bound yet
 
             // Two outbound frames produced while the sink is unbound.
             for payload in [1_i64, 2_i64] {
@@ -1763,7 +2931,7 @@ mod tests {
             let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
             let seen2 = seen.clone();
             // Binding the sink must flush the buffered frames in FIFO order.
-            register_out_sink_for(
+            bind_sink(
                 &sid,
                 Arc::new(move |s: &str| {
                     seen2
@@ -1791,7 +2959,7 @@ mod tests {
                     .map(String::as_str),
                 Some("3")
             );
-            session_close(&sid);
+            drop(lease);
         }
 
         // A `closeSession` Cmd fired during an SSE reopen window — after the old
@@ -1804,7 +2972,7 @@ mod tests {
         #[tokio::test]
         async fn close_during_reopen_window_is_buffered_then_flushed_on_rebind() {
             let sid = test_sid("c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8");
-            session_open(&sid);
+            let lease = session_open(&sid);
 
             // Open a session INSIDE the sid scope so `js_close_session` finds a
             // live stream to install its terminal waiter on.
@@ -1831,7 +2999,7 @@ mod tests {
             // dropped. Binding the sink now must flush it (FIFO).
             let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
             let seen2 = seen.clone();
-            register_out_sink_for(
+            bind_sink(
                 &sid,
                 Arc::new(move |s: &str| {
                     seen2
@@ -1847,7 +3015,8 @@ mod tests {
             // proof: before routing through `deliver_or_buffer`, a close fired
             // in the reopen window was dropped fire-and-forget.
             let flushed = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            let close_frame = format!("{{\"{SESSION_ID_FIELD}\":{handle},\"payload\":1}}");
+            let token = wire_token_of(&sid, handle);
+            let close_frame = format!("{{\"{SESSION_ID_FIELD}\":\"{token}\",\"payload\":1}}");
             assert!(
                 flushed.contains(&close_frame),
                 "the close frame fired during the reopen window must be buffered \
@@ -1857,7 +3026,7 @@ mod tests {
             // The close future is still awaiting its terminal (never arrives in
             // this unit test) — abort it rather than block on the deadline.
             task.abort();
-            session_close(&sid);
+            drop(lease);
         }
 
         // The pre-bind buffer is bounded by construction: past MAX_OUT_PENDING the
@@ -1867,7 +3036,7 @@ mod tests {
         #[tokio::test]
         async fn pre_bind_buffer_is_bounded_drop_oldest() {
             let sid = test_sid("b1c2d3e4f5a0b1c2d3e4f5a0b1c2d3e4");
-            session_open(&sid);
+            let lease = session_open(&sid);
 
             // Overflow the ceiling by pushing MAX_OUT_PENDING + overflow frames.
             let overflow = 5_usize;
@@ -1881,7 +3050,7 @@ mod tests {
 
             let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
             let seen2 = seen.clone();
-            register_out_sink_for(
+            bind_sink(
                 &sid,
                 Arc::new(move |s: &str| {
                     seen2
@@ -1904,7 +3073,7 @@ mod tests {
                 flushed, expected,
                 "drop-oldest keeps the newest MAX_OUT_PENDING frames in FIFO order"
             );
-            session_close(&sid);
+            drop(lease);
         }
 
         // THE cross-session-isolation proof. Two live sessions, A and B. A's
@@ -1915,8 +3084,8 @@ mod tests {
         async fn sessions_are_isolated_inbound_and_outbound() {
             let sid_a = test_sid("e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0");
             let sid_b = test_sid("f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1");
-            session_open(&sid_a);
-            session_open(&sid_b);
+            let lease_a = session_open(&sid_a);
+            let lease_b = session_open(&sid_b);
 
             // Inbound: one subscriber per session, bound via the session scope.
             let (ha, got_a) = collect_for(&sid_a, int_decoder());
@@ -1927,7 +3096,7 @@ mod tests {
             let out_b: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
             let oa = out_a.clone();
             let ob = out_b.clone();
-            register_out_sink_for(
+            bind_sink(
                 &sid_a,
                 Arc::new(move |s: &str| {
                     oa.lock()
@@ -1935,7 +3104,7 @@ mod tests {
                         .push(s.to_string())
                 }),
             );
-            register_out_sink_for(
+            bind_sink(
                 &sid_b,
                 Arc::new(move |s: &str| {
                     ob.lock()
@@ -1966,8 +3135,8 @@ mod tests {
 
             drop(ha);
             drop(hb);
-            session_close(&sid_a);
-            session_close(&sid_b);
+            drop(lease_a);
+            drop(lease_b);
         }
 
         // A subscription materialised with NO session sid in scope binds an inert
@@ -1976,7 +3145,7 @@ mod tests {
         #[tokio::test]
         async fn unscoped_subscription_receives_nothing() {
             let sid = test_sid("a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2");
-            session_open(&sid);
+            let lease = session_open(&sid);
             // NOTE: materialised OUTSIDE with_session → owner sid is absent.
             let got = Arc::new(Mutex::new(Vec::<i64>::new()));
             let got2 = got.clone();
@@ -1992,7 +3161,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             assert!(got.lock().unwrap_or_else(|e| e.into_inner()).is_empty()); // inert drain — nothing delivered
             drop(h);
-            session_close(&sid);
+            drop(lease);
         }
 
         // ── js_request security / refusal tests ──────────────────────────────
@@ -2006,7 +3175,7 @@ mod tests {
         {
             let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
             let seen2 = seen.clone();
-            register_out_sink_for(
+            bind_sink(
                 sid,
                 Arc::new(move |s: &str| {
                     let s = s.to_string();
@@ -2028,33 +3197,36 @@ mod tests {
         #[tokio::test]
         async fn unknown_id_reply_is_dropped() {
             let sid = test_sid("f0e1d2c3b4a5f0e1d2c3b4a5f0e1d2c3");
-            session_open(&sid);
+            let lease = session_open(&sid);
             let (h, got) = collect_for(&sid, int_decoder());
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            // Deliver a frame that looks like a correlated reply with an id that
-            // has no pending waiter — it must not reach the subscriber.
-            deliver_inbound_for(&sid, r#"{"__ipe_id":999999,"payload":42}"#.to_string());
+            // Deliver a frame that looks like a correlated reply with a token
+            // that has no pending waiter — it must not reach the subscriber.
+            deliver_inbound_for(
+                &sid,
+                format!(r#"{{"__ipe_id":"{UNMINTED_TOKEN}","payload":42}}"#),
+            );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             assert!(
                 got.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
                 "unknown-id reply must not reach subscribers"
             );
             drop(h);
-            session_close(&sid);
+            drop(lease);
         }
 
         // A clean reply resolves the Task with the decoded value.
         #[tokio::test]
         async fn clean_reply_resolves_task() {
             let sid = test_sid("1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d");
-            session_open(&sid);
+            let lease = session_open(&sid);
             let sid_clone = sid.clone();
             let result = drive_request(&sid, move |frame| {
                 // Parse the outbound envelope to learn the minted id.
                 let v: serde_json::Value = serde_json::from_str(&frame).unwrap_or_default();
-                if let Some(id) = v.get("__ipe_id").and_then(|x| x.as_u64()) {
+                if let Some(id) = v.get("__ipe_id").and_then(|x| x.as_str()) {
                     // Reply with envelope: id + "payload" = bare int 7.
-                    let reply = format!(r#"{{"__ipe_id":{id},"payload":7}}"#);
+                    let reply = format!(r#"{{"__ipe_id":"{id}","payload":7}}"#);
                     deliver_inbound_for(&sid_clone, reply);
                 }
             })
@@ -2063,7 +3235,7 @@ mod tests {
                 matches!(result, crate::IpeResult::Ok(7)),
                 "expected Ok(7), got {result:?}"
             );
-            session_close(&sid);
+            drop(lease);
         }
 
         // A duplicate reply (same id echoed twice) does not double-resolve — the
@@ -2071,20 +3243,20 @@ mod tests {
         #[tokio::test]
         async fn duplicate_reply_is_dropped() {
             let sid = test_sid("2b3c4d5e6f7a2b3c4d5e6f7a2b3c4d5e");
-            session_open(&sid);
+            let lease = session_open(&sid);
             let sid_clone = sid.clone();
             let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
             let counter2 = counter.clone();
-            register_out_sink_for(
+            bind_sink(
                 &sid,
                 Arc::new(move |frame: &str| {
                     let v: serde_json::Value = serde_json::from_str(frame).unwrap_or_default();
-                    if let Some(id) = v.get("__ipe_id").and_then(|x| x.as_u64()) {
+                    if let Some(id) = v.get("__ipe_id").and_then(|x| x.as_str()) {
                         let n = counter2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         // Send the reply twice on the FIRST outbound only.
                         if n == 0 {
-                            let r1 = format!(r#"{{"__ipe_id":{id},"payload":1}}"#);
-                            let r2 = format!(r#"{{"__ipe_id":{id},"payload":2}}"#);
+                            let r1 = format!(r#"{{"__ipe_id":"{id}","payload":1}}"#);
+                            let r2 = format!(r#"{{"__ipe_id":"{id}","payload":2}}"#);
                             deliver_inbound_for(&sid_clone, r1);
                             deliver_inbound_for(&sid_clone, r2); // duplicate
                         }
@@ -2100,7 +3272,7 @@ mod tests {
                 matches!(result, crate::IpeResult::Ok(_)),
                 "first reply must resolve the Task, got {result:?}"
             );
-            session_close(&sid);
+            drop(lease);
         }
 
         // Timeout: if no reply arrives within the deadline the Task resolves Err.
@@ -2113,14 +3285,26 @@ mod tests {
         #[tokio::test]
         async fn outstanding_ceiling_refuses_immediately() {
             let sid = test_sid("3c4d5e6f7a8b3c4d5e6f7a8b3c4d5e6f");
-            session_open(&sid);
+            let lease = session_open(&sid);
             // Fill the pending map with synthetic entries (dummy oneshot senders).
             {
                 let mut g = lock_sessions();
-                let ports = g.entry(sid.0.clone()).or_insert_with(SessionPorts::new);
-                for i in 0..MAX_OUTSTANDING as u64 {
+                let ports = g.get_mut(&sid.0);
+                assert!(ports.is_some(), "the lease holds the sid's entry");
+                let Some(ports) = ports else {
+                    return;
+                };
+                for _ in 0..MAX_OUTSTANDING {
+                    let minted = PortToken::mint();
+                    assert!(
+                        minted.is_ok(),
+                        "the OS random source must serve a test mint"
+                    );
+                    let Ok(token) = minted else {
+                        return;
+                    };
                     let (tx, _rx) = tokio::sync::oneshot::channel::<JsonVal>();
-                    ports.pending.insert(i, tx);
+                    ports.pending.insert(token, tx);
                 }
             }
             // The next request must be refused immediately.
@@ -2134,7 +3318,7 @@ mod tests {
                 )),
                 "a ceiling breach is refused at once as Unavailable: it frees as replies arrive"
             );
-            session_close(&sid);
+            drop(lease);
         }
 
         // Two concurrent requests resolve to their OWN replies — no cross-talk.
@@ -2142,33 +3326,33 @@ mod tests {
         async fn two_concurrent_requests_no_cross_talk() {
             let sid_a = test_sid("4d5e6f7a8b9c4d5e6f7a8b9c4d5e6f7a");
             let sid_b = test_sid("5e6f7a8b9c0d5e6f7a8b9c0d5e6f7a8b");
-            session_open(&sid_a);
-            session_open(&sid_b);
+            let lease_a = session_open(&sid_a);
+            let lease_b = session_open(&sid_b);
 
             let sid_a2 = sid_a.clone();
-            register_out_sink_for(
+            bind_sink(
                 &sid_a,
                 Arc::new(move |frame: &str| {
                     let v: serde_json::Value = serde_json::from_str(frame).unwrap_or_default();
-                    if let Some(id) = v.get("__ipe_id").and_then(|x| x.as_u64()) {
+                    if let Some(id) = v.get("__ipe_id").and_then(|x| x.as_str()) {
                         // Reply to A's request with value 11.
                         deliver_inbound_for(
                             &sid_a2,
-                            format!(r#"{{"__ipe_id":{id},"payload":11}}"#),
+                            format!(r#"{{"__ipe_id":"{id}","payload":11}}"#),
                         );
                     }
                 }),
             );
             let sid_b2 = sid_b.clone();
-            register_out_sink_for(
+            bind_sink(
                 &sid_b,
                 Arc::new(move |frame: &str| {
                     let v: serde_json::Value = serde_json::from_str(frame).unwrap_or_default();
-                    if let Some(id) = v.get("__ipe_id").and_then(|x| x.as_u64()) {
+                    if let Some(id) = v.get("__ipe_id").and_then(|x| x.as_str()) {
                         // Reply to B's request with value 22.
                         deliver_inbound_for(
                             &sid_b2,
-                            format!(r#"{{"__ipe_id":{id},"payload":22}}"#),
+                            format!(r#"{{"__ipe_id":"{id}","payload":22}}"#),
                         );
                     }
                 }),
@@ -2192,8 +3376,8 @@ mod tests {
                 "session B must get 22, got {rb:?}"
             );
 
-            session_close(&sid_a);
-            session_close(&sid_b);
+            drop(lease_a);
+            drop(lease_b);
         }
 
         // A malformed (non-JSON) reply frame arriving with a valid id is decoded
@@ -2201,15 +3385,15 @@ mod tests {
         #[tokio::test]
         async fn malformed_reply_decoded_fail_closed() {
             let sid = test_sid("6f7a8b9c0d1e6f7a8b9c0d1e6f7a8b9c");
-            session_open(&sid);
+            let lease = session_open(&sid);
             let sid_clone = sid.clone();
-            register_out_sink_for(
+            bind_sink(
                 &sid,
                 Arc::new(move |frame: &str| {
                     let v: serde_json::Value = serde_json::from_str(frame).unwrap_or_default();
-                    if let Some(id) = v.get("__ipe_id").and_then(|x| x.as_u64()) {
+                    if let Some(id) = v.get("__ipe_id").and_then(|x| x.as_str()) {
                         // Reply with a frame whose payload won't decode as i64.
-                        let bad = format!(r#"{{"__ipe_id":{id},"payload":"not-an-int"}}"#);
+                        let bad = format!(r#"{{"__ipe_id":"{id}","payload":"not-an-int"}}"#);
                         deliver_inbound_for(&sid_clone, bad);
                     }
                 }),
@@ -2224,7 +3408,7 @@ mod tests {
                 )),
                 "a reply of the wrong shape is no ceiling: Unexpected, got {result:?}"
             );
-            session_close(&sid);
+            drop(lease);
         }
 
         // A reply past the seal byte budget resolves the Task with a
@@ -2232,14 +3416,14 @@ mod tests {
         #[tokio::test]
         async fn oversized_reply_is_limit_exceeded() {
             let sid = test_sid("7a8b9c0d1e2f7a8b9c0d1e2f7a8b9c0d");
-            session_open(&sid);
+            let lease = session_open(&sid);
             let sid_clone = sid.clone();
             let past_budget = "a".repeat(crate::seal_codec::DEFAULT_SEAL_MAX_INPUT_BYTES);
             let result = drive_request(&sid, move |frame| {
                 let v: serde_json::Value = serde_json::from_str(&frame).unwrap_or_default();
-                if let Some(id) = v.get("__ipe_id").and_then(|x| x.as_u64()) {
+                if let Some(id) = v.get("__ipe_id").and_then(|x| x.as_str()) {
                     // The quoted string is two bytes past the budget.
-                    let reply = format!(r#"{{"__ipe_id":{id},"payload":"{past_budget}"}}"#);
+                    let reply = format!(r#"{{"__ipe_id":"{id}","payload":"{past_budget}"}}"#);
                     deliver_inbound_for(&sid_clone, reply);
                 }
             })
@@ -2250,19 +3434,19 @@ mod tests {
                 )),
                 "a reply past the byte budget is LimitExceeded, got {result:?}"
             );
-            session_close(&sid);
+            drop(lease);
         }
 
-        // After `session_close`, a delivery to that sid is a fire-and-forget no-op
+        // After the lease drops, a delivery to that sid is a fire-and-forget no-op
         // (the channel is gone) and any live subscriber ends — no dead-session
         // channel lingers.
         #[tokio::test]
         async fn closed_session_delivery_is_a_noop() {
             let sid = test_sid("b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3");
-            session_open(&sid);
+            let lease = session_open(&sid);
             let (h, got) = collect_for(&sid, int_decoder());
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            session_close(&sid);
+            drop(lease);
             deliver_inbound_for(&sid, "1".to_string()); // no channel → dropped
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             assert!(got.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
@@ -2271,12 +3455,24 @@ mod tests {
 
         // ── Session-stream primitive: routing + refusals ─────────────────────
 
-        // Drive `js_open_session`, capture the minted session id from the tagged
-        // outbound open envelope, and return (handle, captured-outbound-frames).
-        async fn open_session_capturing(sid: &SessionId) -> (i64, Arc<Mutex<Vec<String>>>) {
+        // The wire token of the open stream `handle` names in `sid`, or an empty
+        // string when none is open.
+        fn wire_token_of(sid: &SessionId, handle: i64) -> String {
+            let Some(handle) = PortHandle::parse(handle) else {
+                return String::new();
+            };
+            lock_sessions()
+                .get_mut(&sid.0)
+                .and_then(|p| p.stream_by_handle(handle))
+                .map_or_else(String::new, |(token, _)| token.wire())
+        }
+
+        // Drive `js_open_session` and return (handle, the stream's wire token,
+        // captured-outbound-frames).
+        async fn open_session_capturing(sid: &SessionId) -> (i64, String, Arc<Mutex<Vec<String>>>) {
             let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
             let seen2 = seen.clone();
-            register_out_sink_for(
+            bind_sink(
                 sid,
                 Arc::new(move |s: &str| {
                     seen2
@@ -2293,7 +3489,7 @@ mod tests {
                 crate::IpeResult::Ok(h) => h,
                 crate::IpeResult::Err(e) => panic!("open must succeed: {e:?}"),
             };
-            (handle, seen)
+            (handle, wire_token_of(sid, handle), seen)
         }
 
         // Materialise a `js_session_frames` Sub inside the session scope and collect
@@ -2321,15 +3517,18 @@ mod tests {
         #[tokio::test]
         async fn session_frame_routes_to_its_subscriber() {
             let sid = test_sid("aa11bb22cc33dd44ee55ff66aa11bb22");
-            session_open(&sid);
-            let (handle, _out) = open_session_capturing(&sid).await;
+            let lease = session_open(&sid);
+            let (handle, token, _out) = open_session_capturing(&sid).await;
             let (h, got) = collect_frames(&sid, handle);
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            deliver_inbound_for(&sid, format!(r#"{{"__ipe_session":{handle},"payload":7}}"#));
+            deliver_inbound_for(
+                &sid,
+                format!(r#"{{"__ipe_session":"{token}","payload":7}}"#),
+            );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             assert_eq!(*got.lock().unwrap_or_else(|e| e.into_inner()), vec![7]);
             drop(h);
-            session_close(&sid);
+            drop(lease);
         }
 
         // A frame tagged with an UNKNOWN/foreign session id is dropped fail-closed:
@@ -2337,42 +3536,49 @@ mod tests {
         #[tokio::test]
         async fn unknown_session_id_frame_is_dropped() {
             let sid = test_sid("bb22cc33dd44ee55ff66aa11bb22cc33");
-            session_open(&sid);
-            let (handle, _out) = open_session_capturing(&sid).await;
+            let lease = session_open(&sid);
+            let (handle, token, _out) = open_session_capturing(&sid).await;
             let (h, got) = collect_frames(&sid, handle);
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            // A frame for a DIFFERENT (never-minted) id must not reach the drain.
-            deliver_inbound_for(&sid, r#"{"__ipe_session":999999,"payload":42}"#.to_string());
+            // A frame for a DIFFERENT (never-minted) token must not reach the drain.
+            deliver_inbound_for(
+                &sid,
+                format!(r#"{{"__ipe_session":"{UNMINTED_TOKEN}","payload":42}}"#),
+            );
+            assert_ne!(token, UNMINTED_TOKEN);
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             assert!(
                 got.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
                 "foreign session-id frame must not reach the subscriber"
             );
             drop(h);
-            session_close(&sid);
+            drop(lease);
         }
 
         // A frame arriving AFTER the session is closed is dropped fail-closed.
         #[tokio::test]
         async fn closed_session_frame_is_dropped() {
             let sid = test_sid("cc33dd44ee55ff66aa11bb22cc33dd44");
-            session_open(&sid);
-            let (handle, _out) = open_session_capturing(&sid).await;
+            let lease = session_open(&sid);
+            let (handle, token, _out) = open_session_capturing(&sid).await;
             let (h, got) = collect_frames(&sid, handle);
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             // Close (terminal) evicts the session; a later frame finds no stream.
             deliver_inbound_for(
                 &sid,
-                format!(r#"{{"__ipe_session":{handle},"__ipe_terminal":true,"payload":0}}"#),
+                format!(r#"{{"__ipe_session":"{token}","__ipe_terminal":true,"payload":0}}"#),
             );
-            deliver_inbound_for(&sid, format!(r#"{{"__ipe_session":{handle},"payload":5}}"#));
+            deliver_inbound_for(
+                &sid,
+                format!(r#"{{"__ipe_session":"{token}","payload":5}}"#),
+            );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             assert!(
                 got.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
                 "a frame after close must be dropped"
             );
             drop(h);
-            session_close(&sid);
+            drop(lease);
         }
 
         // Overflow past the frame budget terminates the session with a fail-closed
@@ -2380,7 +3586,7 @@ mod tests {
         #[tokio::test]
         async fn frame_budget_overflow_terminates_with_err() {
             let sid = test_sid("dd44ee55ff66aa11bb22cc33dd44ee55");
-            session_open(&sid);
+            let lease = session_open(&sid);
             // Mint a session directly and shrink its remaining budget to 0 so the
             // NEXT frame overflows (driving 100k frames in a unit test is wasteful).
             let handle = match with_session(&SessionScope::new(sid.to_string()), || {
@@ -2393,13 +3599,13 @@ mod tests {
             };
             {
                 let mut g = lock_sessions();
-                if let Some(stream) = g
-                    .get_mut(&sid.0)
-                    .and_then(|p| p.streams.get_mut(&(handle as u64)))
-                {
+                if let Some((_, stream)) = g.get_mut(&sid.0).and_then(|p| {
+                    PortHandle::parse(handle).and_then(|handle| p.stream_by_handle(handle))
+                }) {
                     stream.frames_seen = SESSION_FRAME_BUDGET;
                 }
             }
+            let token = wire_token_of(&sid, handle);
             // Park a close waiter, then push the overflowing frame; the close Task
             // must resolve Err (session terminated, not a silent drop).
             let sid_clone = sid.clone();
@@ -2410,14 +3616,14 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             deliver_inbound_for(
                 &sid_clone,
-                format!(r#"{{"__ipe_session":{handle},"payload":1}}"#),
+                format!(r#"{{"__ipe_session":"{token}","payload":1}}"#),
             );
             let result = close.await.expect("close task joins");
             assert!(
                 matches!(result, crate::IpeResult::Err(_)),
                 "budget overflow must terminate the session with Err, got {result:?}"
             );
-            session_close(&sid);
+            drop(lease);
         }
 
         // The open-session ceiling is enforced: once MAX_OPEN_SESSIONS are open,
@@ -2425,8 +3631,8 @@ mod tests {
         #[tokio::test]
         async fn open_session_ceiling_refuses() {
             let sid = test_sid("ee55ff66aa11bb22cc33dd44ee55ff66");
-            session_open(&sid);
-            register_out_sink_for(&sid, Arc::new(|_s: &str| {}));
+            let lease = session_open(&sid);
+            bind_sink(&sid, Arc::new(|_s: &str| {}));
             for _ in 0..MAX_OPEN_SESSIONS {
                 let r = with_session(&SessionScope::new(sid.to_string()), || {
                     js_open_session::<i64, i64>(0_i64, int_decoder())
@@ -2447,15 +3653,15 @@ mod tests {
                 )),
                 "an open past the ceiling is refused as Unavailable: it frees as sessions close"
             );
-            session_close(&sid);
+            drop(lease);
         }
 
         // A clean terminal resolves the `closeSession` Task with the decoded value.
         #[tokio::test]
         async fn close_session_resolves_on_terminal() {
             let sid = test_sid("ff66aa11bb22cc33dd44ee55ff66aa11");
-            session_open(&sid);
-            let (handle, _out) = open_session_capturing(&sid).await;
+            let lease = session_open(&sid);
+            let (handle, token, _out) = open_session_capturing(&sid).await;
             let sid_clone = sid.clone();
             let close = tokio::spawn(with_session(
                 &SessionScope::new(sid.to_string()),
@@ -2464,14 +3670,14 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             deliver_inbound_for(
                 &sid_clone,
-                format!(r#"{{"__ipe_session":{handle},"__ipe_terminal":true,"payload":9}}"#),
+                format!(r#"{{"__ipe_session":"{token}","__ipe_terminal":true,"payload":9}}"#),
             );
             let result = close.await.expect("close joins");
             assert!(
                 matches!(result, crate::IpeResult::Ok(9)),
                 "clean terminal must resolve Ok(9), got {result:?}"
             );
-            session_close(&sid);
+            drop(lease);
         }
 
         // A malformed terminal (payload that won't decode) resolves the close Task
@@ -2479,8 +3685,8 @@ mod tests {
         #[tokio::test]
         async fn malformed_terminal_resolves_err() {
             let sid = test_sid("a1a2a3a4b1b2b3b4c1c2c3c4d1d2d3d4");
-            session_open(&sid);
-            let (handle, _out) = open_session_capturing(&sid).await;
+            let lease = session_open(&sid);
+            let (handle, token, _out) = open_session_capturing(&sid).await;
             let sid_clone = sid.clone();
             let close = tokio::spawn(with_session(
                 &SessionScope::new(sid.to_string()),
@@ -2490,7 +3696,7 @@ mod tests {
             deliver_inbound_for(
                 &sid_clone,
                 format!(
-                    r#"{{"__ipe_session":{handle},"__ipe_terminal":true,"payload":"not-an-int"}}"#
+                    r#"{{"__ipe_session":"{token}","__ipe_terminal":true,"payload":"not-an-int"}}"#
                 ),
             );
             let result = close.await.expect("close joins");
@@ -2500,7 +3706,7 @@ mod tests {
                 )),
                 "a terminal of the wrong shape is no ceiling: Unexpected, got {result:?}"
             );
-            session_close(&sid);
+            drop(lease);
         }
 
         // A terminal past the seal byte budget resolves the close Task with a
@@ -2508,8 +3714,8 @@ mod tests {
         #[tokio::test]
         async fn oversized_terminal_is_limit_exceeded() {
             let sid = test_sid("c5c6c7c8d5d6d7d8e5e6e7e8f5f6f7f8");
-            session_open(&sid);
-            let (handle, _out) = open_session_capturing(&sid).await;
+            let lease = session_open(&sid);
+            let (handle, token, _out) = open_session_capturing(&sid).await;
             let sid_clone = sid.clone();
             let close = tokio::spawn(with_session(
                 &SessionScope::new(sid.to_string()),
@@ -2520,7 +3726,7 @@ mod tests {
             deliver_inbound_for(
                 &sid_clone,
                 format!(
-                    r#"{{"__ipe_session":{handle},"__ipe_terminal":true,"payload":"{past_budget}"}}"#
+                    r#"{{"__ipe_session":"{token}","__ipe_terminal":true,"payload":"{past_budget}"}}"#
                 ),
             );
             let result = close.await.expect("close joins");
@@ -2530,22 +3736,22 @@ mod tests {
                 )),
                 "a terminal past the byte budget is LimitExceeded, got {result:?}"
             );
-            session_close(&sid);
+            drop(lease);
         }
 
         // Two open sessions are isolated: a frame for A never reaches B's subscriber.
         #[tokio::test]
         async fn two_sessions_isolated() {
             let sid = test_sid("b1b2b3b4c1c2c3c4d1d2d3d4e1e2e3e4");
-            session_open(&sid);
-            let (ha_handle, _oa) = open_session_capturing(&sid).await;
-            let (hb_handle, _ob) = open_session_capturing(&sid).await;
+            let lease = session_open(&sid);
+            let (ha_handle, ha_token, _oa) = open_session_capturing(&sid).await;
+            let (hb_handle, _hb_token, _ob) = open_session_capturing(&sid).await;
             let (ha, got_a) = collect_frames(&sid, ha_handle);
             let (hb, got_b) = collect_frames(&sid, hb_handle);
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             deliver_inbound_for(
                 &sid,
-                format!(r#"{{"__ipe_session":{ha_handle},"payload":11}}"#),
+                format!(r#"{{"__ipe_session":"{ha_token}","payload":11}}"#),
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             assert_eq!(*got_a.lock().unwrap_or_else(|e| e.into_inner()), vec![11]);
@@ -2555,7 +3761,635 @@ mod tests {
             );
             drop(ha);
             drop(hb);
-            session_close(&sid);
+            drop(lease);
+        }
+
+        // ── Correlation tokens: only the minted token routes ─────────────────
+
+        // A decoder that accepts every payload, so any frame a drain receives
+        // is seen.
+        fn any_decoder() -> Decoder<IpeError, i64> {
+            Decoder::new(Box::new(|_v: &JsonVal| IpeResult::Ok(1)), Vec::new())
+        }
+
+        // Whether `sid` still holds a pending waiter under `wire`.
+        fn is_pending(sid: &SessionId, wire: &str) -> bool {
+            PortToken::parse(wire).is_some_and(|token| {
+                lock_sessions()
+                    .get(&sid.0)
+                    .is_some_and(|p| p.pending.contains_key(&token))
+            })
+        }
+
+        // Run a fire-and-forget port `Cmd` with `sid` as its origin.
+        fn publish_from(sid: &SessionId, cmd: IpeCmd<i64>) -> Option<i64> {
+            match cmd {
+                IpeCmd::Publish(thunk) => Some(thunk(sid.as_str())),
+                _ => None,
+            }
+        }
+
+        // A reply spelled one step off the minted token (last nibble flipped,
+        // uppercased, one char longer) leaves the waiter pending; only the
+        // token's own spelling resolves it.
+        #[tokio::test]
+        async fn guessed_token_reply_is_not_delivered() {
+            tokio::time::pause();
+            let sid = test_sid("0a1b2c3d4e5f0a1b2c3d4e5f0a1b2c3d");
+            let lease = session_open(&sid);
+            let sid_clone = sid.clone();
+            let still_pending = Arc::new(Mutex::new(Vec::<bool>::new()));
+            let still_pending2 = still_pending.clone();
+            let result = drive_request(&sid, move |frame| {
+                let v: serde_json::Value = serde_json::from_str(&frame).unwrap_or_default();
+                let Some(wire) = v.get("__ipe_id").and_then(|x| x.as_str()) else {
+                    return;
+                };
+                let flipped_last = if wire.ends_with('0') { '1' } else { '0' };
+                let mut guesses = vec![
+                    format!("{}{flipped_last}", &wire[..wire.len() - 1]),
+                    format!("{wire}0"),
+                ];
+                let upper = wire.to_uppercase();
+                if upper != wire {
+                    guesses.push(upper);
+                }
+                for guess in guesses {
+                    deliver_inbound_for(
+                        &sid_clone,
+                        format!(r#"{{"__ipe_id":"{guess}","payload":666}}"#),
+                    );
+                    still_pending2
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(is_pending(&sid_clone, wire));
+                }
+                deliver_inbound_for(
+                    &sid_clone,
+                    format!(r#"{{"__ipe_id":"{wire}","payload":7}}"#),
+                );
+            })
+            .await;
+            let checks = still_pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            assert!(
+                checks.len() >= 2 && checks.iter().all(|&pending| pending),
+                "a guessed token must leave the waiter pending: {checks:?}"
+            );
+            assert!(
+                matches!(result, crate::IpeResult::Ok(7)),
+                "only the minted token resolves the waiter, got {result:?}"
+            );
+            drop(lease);
+        }
+
+        // Numeric ids are refused whole: they resolve no waiter and never reach
+        // a `js_subscribe` drain.
+        #[tokio::test]
+        async fn numeric_id_is_dropped_not_broadcast() {
+            let sid = test_sid("1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e");
+            let lease = session_open(&sid);
+            let (h, got) = collect_for(&sid, any_decoder());
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let sid_clone = sid.clone();
+            let result = drive_request(&sid, move |frame| {
+                let v: serde_json::Value = serde_json::from_str(&frame).unwrap_or_default();
+                let Some(wire) = v.get("__ipe_id").and_then(|x| x.as_str()) else {
+                    return;
+                };
+                for id in 1..=512_u32 {
+                    deliver_inbound_for(
+                        &sid_clone,
+                        format!(r#"{{"__ipe_id":{id},"payload":666}}"#),
+                    );
+                    deliver_inbound_for(
+                        &sid_clone,
+                        format!(r#"{{"__ipe_id":"{id}","payload":666}}"#),
+                    );
+                }
+                deliver_inbound_for(
+                    &sid_clone,
+                    format!(r#"{{"__ipe_id":"{wire}","payload":7}}"#),
+                );
+            })
+            .await;
+            assert!(
+                matches!(result, crate::IpeResult::Ok(7)),
+                "no numeric id resolves the waiter, got {result:?}"
+            );
+            // A frame with no reserved field still reaches the drain, so the
+            // drain was live while the numeric ids arrived.
+            deliver_inbound_for(&sid, r#"{"plain":1}"#.to_string());
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert_eq!(
+                *got.lock().unwrap_or_else(|e| e.into_inner()),
+                vec![1],
+                "only the plain frame reaches the drain"
+            );
+            drop(h);
+            drop(lease);
+        }
+
+        // Every outbound correlation and session id is a parseable token string.
+        #[tokio::test]
+        async fn envelope_ids_are_tokens() {
+            let sid = test_sid("2c3d4e5f6a7b2c3d4e5f6a7b2c3d4e5f");
+            let lease = session_open(&sid);
+            let sid_clone = sid.clone();
+            let request_ids = Arc::new(Mutex::new(Vec::<String>::new()));
+            let request_ids2 = request_ids.clone();
+            let result = drive_request(&sid, move |frame| {
+                let v: serde_json::Value = serde_json::from_str(&frame).unwrap_or_default();
+                let Some(wire) = v.get("__ipe_id").and_then(|x| x.as_str()) else {
+                    return;
+                };
+                request_ids2
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(wire.to_owned());
+                deliver_inbound_for(
+                    &sid_clone,
+                    format!(r#"{{"__ipe_id":"{wire}","payload":7}}"#),
+                );
+            })
+            .await;
+            assert!(matches!(result, crate::IpeResult::Ok(7)));
+            let request_ids = request_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            assert_eq!(request_ids.len(), 1);
+            assert!(request_ids.iter().all(|id| PortToken::parse(id).is_some()));
+
+            let (handle, token, out) = open_session_capturing(&sid).await;
+            assert!(PortToken::parse(&token).is_some());
+            let frames = out.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let session_ids: Vec<String> = frames
+                .iter()
+                .filter_map(|frame| {
+                    let v: serde_json::Value = serde_json::from_str(frame).ok()?;
+                    v.get("__ipe_session")?.as_str().map(str::to_owned)
+                })
+                .collect();
+            assert_eq!(
+                session_ids,
+                vec![token.clone()],
+                "the open frame carries the token"
+            );
+            assert_ne!(
+                token,
+                handle.to_string(),
+                "the handle is not the wire token"
+            );
+            drop(lease);
+        }
+
+        // A failed mint refuses the request before any frame or waiter exists.
+        #[tokio::test]
+        async fn request_refuses_without_entropy() {
+            let sid = test_sid("3d4e5f6a7b8c3d4e5f6a7b8c3d4e5f6a");
+            let lease = session_open(&sid);
+            let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen2 = seen.clone();
+            bind_sink(
+                &sid,
+                Arc::new(move |s: &str| {
+                    seen2
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(s.to_string());
+                }),
+            );
+            let result = with_session(&SessionScope::new(sid.to_string()), || {
+                request_with_mint::<i64, i64, _>(0_i64, int_decoder(), || Err(EntropyError))
+            })
+            .await;
+            assert!(
+                matches!(&result, crate::IpeResult::Err(e) if *e == IpeError::unavailable(
+                    format!("js_request: {EntropyError}")
+                )),
+                "a failed mint is Unavailable, got {result:?}"
+            );
+            assert!(seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+            assert!(
+                lock_sessions()
+                    .get(&sid.0)
+                    .is_none_or(|p| p.pending.is_empty()),
+                "a failed mint registers no waiter"
+            );
+            drop(lease);
+        }
+
+        // The Ipê-side handle, as a number or a string, addresses no stream;
+        // only the wire token does.
+        #[tokio::test]
+        async fn session_handle_is_not_the_wire_token() {
+            let sid = test_sid("4e5f6a7b8c9d4e5f6a7b8c9d4e5f6a7b");
+            let lease = session_open(&sid);
+            let (handle, token, _out) = open_session_capturing(&sid).await;
+            let (h, got) = collect_frames(&sid, handle);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            deliver_inbound_for(&sid, format!(r#"{{"__ipe_session":{handle},"payload":1}}"#));
+            deliver_inbound_for(
+                &sid,
+                format!(r#"{{"__ipe_session":"{handle}","payload":2}}"#),
+            );
+            deliver_inbound_for(
+                &sid,
+                format!(r#"{{"__ipe_session":"{token}","payload":3}}"#),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert_eq!(*got.lock().unwrap_or_else(|e| e.into_inner()), vec![3]);
+            drop(h);
+            drop(lease);
+        }
+
+        // A send to a handle the origin sid does not hold puts nothing on the
+        // wire; a held handle sends one frame tagged with its token.
+        #[tokio::test]
+        async fn send_to_unheld_handle_sends_nothing() {
+            let sid = test_sid("5f6a7b8c9d0e5f6a7b8c9d0e5f6a7b8c");
+            let other = test_sid("6a7b8c9d0e1f6a7b8c9d0e1f6a7b8c9d");
+            let lease = session_open(&sid);
+            let lease_other = session_open(&other);
+            let (handle, token, out) = open_session_capturing(&sid).await;
+            let other_seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let other_seen2 = other_seen.clone();
+            bind_sink(
+                &other,
+                Arc::new(move |s: &str| {
+                    other_seen2
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(s.to_string());
+                }),
+            );
+            out.lock().unwrap_or_else(|e| e.into_inner()).clear();
+
+            let unheld = handle ^ 1;
+            assert_eq!(
+                publish_from(&sid, js_send_to_session::<i64, i64>(unheld, 5)),
+                Some(0)
+            );
+            assert_eq!(
+                publish_from(&other, js_send_to_session::<i64, i64>(handle, 5)),
+                Some(0)
+            );
+            assert!(out.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+            assert!(
+                other_seen
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty()
+            );
+
+            assert_eq!(
+                publish_from(&sid, js_send_to_session::<i64, i64>(handle, 5)),
+                Some(0)
+            );
+            assert_eq!(
+                *out.lock().unwrap_or_else(|e| e.into_inner()),
+                vec![format!(r#"{{"__ipe_session":"{token}","payload":5}}"#)]
+            );
+            drop(lease);
+            drop(lease_other);
+        }
+
+        // A minted token that is already live refuses the new request and
+        // leaves the live waiter in place: no overwrite, no eviction.
+        #[tokio::test]
+        async fn colliding_request_token_evicts_no_waiter() {
+            tokio::time::pause();
+            let sid = test_sid("8c9d0e1f2a3b8c9d0e1f2a3b8c9d0e1f");
+            let lease = session_open(&sid);
+            let Some(token) = PortToken::parse(super::UNMINTED_TOKEN) else {
+                return;
+            };
+            let (tx, mut rx) = tokio::sync::oneshot::channel::<JsonVal>();
+            let seeded = lock_sessions()
+                .get_mut(&sid.0)
+                .map(|p| p.pending.insert(token, tx));
+            assert!(seeded.is_some(), "the lease holds the sid's entry");
+            let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen2 = seen.clone();
+            bind_sink(
+                &sid,
+                Arc::new(move |s: &str| {
+                    seen2
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(s.to_string());
+                }),
+            );
+            let result = with_session(&SessionScope::new(sid.to_string()), || {
+                request_with_mint::<i64, i64, _>(0_i64, int_decoder(), move || Ok(token))
+            })
+            .await;
+            assert!(
+                matches!(&result, crate::IpeResult::Err(e) if *e == IpeError::unavailable(
+                    format!("js_request: {EntropyError}")
+                )),
+                "a colliding token is Unavailable, got {result:?}"
+            );
+            assert!(
+                seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+                "a colliding request sends nothing"
+            );
+            assert!(
+                matches!(
+                    rx.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ),
+                "the live waiter keeps its sender"
+            );
+            assert!(is_pending(&sid, super::UNMINTED_TOKEN));
+            drop(lease);
+        }
+
+        // A minted session token that is already live refuses the new open
+        // and leaves the live stream, and its handle, in place.
+        #[tokio::test]
+        async fn colliding_session_token_evicts_no_stream() {
+            let sid = test_sid("9d0e1f2a3b4c9d0e1f2a3b4c9d0e1f2a");
+            let lease = session_open(&sid);
+            let (handle, token, out) = open_session_capturing(&sid).await;
+            out.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            let Some(live) = PortToken::parse(&token) else {
+                return;
+            };
+            let result = with_session(&SessionScope::new(sid.to_string()), || {
+                open_session_with_mint::<i64, i64, _, _>(
+                    0_i64,
+                    int_decoder(),
+                    move || Ok(live),
+                    PortHandle::mint,
+                )
+            })
+            .await;
+            assert!(
+                matches!(&result, crate::IpeResult::Err(e) if *e == IpeError::unavailable(
+                    format!("js_open_session: {EntropyError}")
+                )),
+                "a colliding session token is Unavailable, got {result:?}"
+            );
+            assert!(
+                out.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+                "a colliding open sends nothing"
+            );
+            assert_eq!(
+                wire_token_of(&sid, handle),
+                token,
+                "the live stream keeps its handle"
+            );
+            drop(lease);
+        }
+
+        // A negative handle never wraps onto a stream: the drain is inert, the
+        // send puts nothing on the wire, and the close is an `Err`.
+        #[tokio::test]
+        async fn negative_handle_is_inert() {
+            let sid = test_sid("7b8c9d0e1f2a7b8c9d0e1f2a7b8c9d0e");
+            let lease = session_open(&sid);
+            let (_handle, token, out) = open_session_capturing(&sid).await;
+            out.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            for negative in [0_i64, -1, i64::MIN] {
+                let (h, got) = collect_frames(&sid, negative);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                deliver_inbound_for(
+                    &sid,
+                    format!(r#"{{"__ipe_session":"{token}","payload":4}}"#),
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                assert!(got.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+                drop(h);
+
+                assert_eq!(
+                    publish_from(&sid, js_send_to_session::<i64, i64>(negative, 5)),
+                    Some(0)
+                );
+                assert!(out.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+
+                let closed = with_session(&SessionScope::new(sid.to_string()), || {
+                    js_close_session::<i64, i64>(negative, 0_i64, int_decoder())
+                })
+                .await;
+                assert!(
+                    matches!(&closed, crate::IpeResult::Err(e)
+                        if *e == IpeError::from("js_close_session: session not open".to_string())),
+                    "a negative handle closes nothing, got {closed:?}"
+                );
+            }
+            drop(lease);
+        }
+        // Capture every frame `sid`'s sink receives, binding a fresh sink.
+        fn capture_sink(sid: &SessionId) -> Arc<Mutex<Vec<String>>> {
+            let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen2 = seen.clone();
+            bind_sink(
+                sid,
+                Arc::new(move |s: &str| {
+                    seen2
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(s.to_string());
+                }),
+            );
+            seen
+        }
+
+        // Open a stream in `sid` whose handle is `handle`.
+        async fn open_with_handle(sid: &SessionId, handle: i64) -> crate::IpeResult<IpeError, i64> {
+            with_session(&SessionScope::new(sid.to_string()), || {
+                open_session_with_mint::<i64, i64, _, _>(
+                    0_i64,
+                    int_decoder(),
+                    PortToken::mint,
+                    move || PortHandle::parse(handle),
+                )
+            })
+            .await
+        }
+
+        // Once a life's lease drops, no reach for its sid recreates the entry:
+        // each refuses or drops.
+        #[tokio::test]
+        async fn a_reach_after_close_creates_nothing() {
+            let sid = test_sid("e0f1a2b3c4d5e0f1a2b3c4d5e0f1a2b3");
+            let lease = session_open(&sid);
+            assert!(lease.is_some());
+            let Some(lease) = lease else { return };
+            let life = lease.life();
+            drop(lease);
+
+            assert_eq!(publish_from(&sid, js_send::<i64, i64>(5)), Some(0));
+            assert_eq!(
+                register_out_sink_for(&sid, life, Arc::new(|_s: &str| {})),
+                Err(PortClosed)
+            );
+            let requested = with_session(&SessionScope::new(sid.to_string()), || {
+                request_with_mint::<i64, i64, _>(0_i64, int_decoder(), PortToken::mint)
+            })
+            .await;
+            assert!(
+                matches!(&requested, crate::IpeResult::Err(e)
+                    if *e == IpeError::unavailable("js_request: session closed".to_owned())),
+                "a request after close refuses, got {requested:?}"
+            );
+            let opened = open_with_handle(&sid, 3).await;
+            assert!(
+                matches!(&opened, crate::IpeResult::Err(e)
+                    if *e == IpeError::unavailable("js_open_session: session closed".to_owned())),
+                "an open after close refuses, got {opened:?}"
+            );
+            let (h, got) = collect_for(&sid, int_decoder());
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            deliver_inbound_for(&sid, "1".to_string());
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert!(got.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+            drop(h);
+            assert!(
+                !lock_sessions().contains_key(&sid.0),
+                "no reach after close recreates the sid's entry"
+            );
+        }
+
+        // A handle from a closed life names nothing in the life that follows.
+        #[tokio::test]
+        async fn a_stale_handle_after_reopen_is_inert() {
+            let sid = test_sid("f1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4");
+            let lease_a = session_open(&sid);
+            let _seen_a = capture_sink(&sid);
+            let opened_a = open_with_handle(&sid, 1).await;
+            assert!(matches!(opened_a, crate::IpeResult::Ok(1)));
+            drop(lease_a);
+
+            let lease_b = session_open(&sid);
+            let seen_b = capture_sink(&sid);
+            let opened_b = open_with_handle(&sid, 2).await;
+            assert!(matches!(opened_b, crate::IpeResult::Ok(2)));
+            let token_b = wire_token_of(&sid, 2);
+            assert!(!token_b.is_empty());
+            assert!(wire_token_of(&sid, 1).is_empty());
+            seen_b.lock().unwrap_or_else(|e| e.into_inner()).clear();
+
+            assert_eq!(
+                publish_from(&sid, js_send_to_session::<i64, i64>(1, 5)),
+                Some(0)
+            );
+            assert!(
+                seen_b.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+                "a stale handle sends nothing"
+            );
+            let closed = with_session(&SessionScope::new(sid.to_string()), || {
+                js_close_session::<i64, i64>(1, 0_i64, int_decoder())
+            })
+            .await;
+            assert!(
+                matches!(&closed, crate::IpeResult::Err(e)
+                    if *e == IpeError::from("js_close_session: session not open".to_string())),
+                "a stale handle closes nothing, got {closed:?}"
+            );
+            let (h, got) = collect_frames(&sid, 1);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            deliver_inbound_for(
+                &sid,
+                format!(r#"{{"__ipe_session":"{token_b}","payload":4}}"#),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert!(
+                got.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+                "a stale handle drains nothing of the new life"
+            );
+            drop(h);
+            drop(lease_b);
+        }
+
+        // The close of a superseded life leaves the life that replaced it.
+        #[tokio::test]
+        async fn a_superseded_lease_closes_nothing() {
+            let sid = test_sid("a2b3c4d5e6f7a2b3c4d5e6f7a2b3c4d5");
+            let lease_a = session_open(&sid);
+            let seen_a = capture_sink(&sid);
+            let lease_b = session_open(&sid);
+            let seen_b = capture_sink(&sid);
+            drop(lease_a);
+
+            assert!(lock_sessions().contains_key(&sid.0));
+            assert_eq!(publish_from(&sid, js_send::<i64, i64>(5)), Some(0));
+            assert_eq!(seen_b.lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
+            assert!(seen_a.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+            drop(lease_b);
+            assert!(!lock_sessions().contains_key(&sid.0));
+        }
+
+        // A bind carrying a superseded life refuses and leaves the sink of the
+        // life that replaced it in place.
+        #[tokio::test]
+        async fn a_bind_with_a_superseded_life_refuses() {
+            let sid = test_sid("c4d5e6f7a8b9c4d5e6f7a8b9c4d5e6f7");
+            let lease_a = session_open(&sid);
+            assert!(lease_a.is_some());
+            let Some(lease_a) = lease_a else { return };
+            let life_a = lease_a.life();
+            let lease_b = session_open(&sid);
+            let seen_b = capture_sink(&sid);
+            let stale: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let stale2 = stale.clone();
+            assert_eq!(
+                register_out_sink_for(
+                    &sid,
+                    life_a,
+                    Arc::new(move |s: &str| {
+                        stale2
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(s.to_string());
+                    }),
+                ),
+                Err(PortClosed)
+            );
+
+            assert_eq!(publish_from(&sid, js_send::<i64, i64>(5)), Some(0));
+            assert_eq!(seen_b.lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
+            assert!(
+                stale.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+                "a superseded life's sink receives nothing"
+            );
+            drop(lease_a);
+            drop(lease_b);
+        }
+
+        // A drawn handle equal to a live stream's handle refuses the open and
+        // leaves the live stream in place.
+        #[tokio::test]
+        async fn a_handle_collision_with_a_live_stream_is_refused() {
+            let sid = test_sid("b3c4d5e6f7a8b3c4d5e6f7a8b3c4d5e6");
+            let lease = session_open(&sid);
+            let seen = capture_sink(&sid);
+            let first = open_with_handle(&sid, 7).await;
+            assert!(matches!(first, crate::IpeResult::Ok(7)));
+            let token = wire_token_of(&sid, 7);
+            seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
+
+            let second = open_with_handle(&sid, 7).await;
+            assert!(
+                matches!(&second, crate::IpeResult::Err(e) if *e == IpeError::unavailable(
+                    format!("js_open_session: {EntropyError}")
+                )),
+                "a colliding handle is Unavailable, got {second:?}"
+            );
+            assert!(
+                seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+                "a colliding open sends nothing"
+            );
+            assert_eq!(
+                wire_token_of(&sid, 7),
+                token,
+                "the live stream keeps its handle"
+            );
+            drop(lease);
         }
     }
 }

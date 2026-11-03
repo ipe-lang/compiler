@@ -293,6 +293,8 @@ pub mod list;
 pub mod log;
 pub mod math;
 pub mod money;
+// The narrowing helpers every kernel module may call.
+pub mod narrow;
 pub mod home_core;
 pub mod scratch_core;
 pub mod scratch_host;
@@ -1714,11 +1716,60 @@ fn prelude_section(ctx: &EmitCtx) -> DResult<String> {
     Ok(section.render())
 }
 
+/// The opening of the native epilogue's `fn main` body.
+const NATIVE_MAIN_ANCHOR: &str = "fn main() {\n";
+
+/// The first statement of the `ipe test` runner's `fn main`.
+///
+/// It embeds the value of [`crate::TEST_RUN_KEY_ENV`] in the binary; the
+/// `black_box` keeps the string reachable, so no build profile strips it.
+fn test_run_key_statement() -> String {
+    format!(
+        "    std::hint::black_box(env!({}));\n",
+        ipe_intern::rust_str_lit(crate::TEST_RUN_KEY_ENV)
+    )
+}
+
+/// `fixed` with `statement` as the first line of its one `fn main` body.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] unless [`NATIVE_MAIN_ANCHOR`] occurs exactly
+/// once in `fixed`: with none or several, the statement would land nowhere or
+/// in a function other than the entry.
+fn open_main_with(fixed: &str, statement: &str) -> DResult<String> {
+    let mut anchors = fixed.match_indices(NATIVE_MAIN_ANCHOR);
+    let body = match (anchors.next(), anchors.next()) {
+        (Some((start, _)), None) => start.checked_add(NATIVE_MAIN_ANCHOR.len()),
+        _ => None,
+    };
+    let Some((head, tail)) = body.and_then(|at| fixed.split_at_checked(at)) else {
+        return Err(Diagnostic::CompilerBug {
+            where_: "ipe_backend_rust::project::open_main_with",
+            detail: format!(
+                "test-runner key: the line `{}` must occur exactly once in the native epilogue",
+                NATIVE_MAIN_ANCHOR.trim_end()
+            ),
+        });
+    };
+    Ok(format!("{head}{statement}{tail}"))
+}
+
 /// The fixed epilogue for the program's target: the native `fn main`, or the
 /// wasm-bindgen entry.
+///
+/// The `ipe test` runner's `fn main` opens with [`test_run_key_statement`];
+/// every other crate's epilogue is the fixed one.
 fn epilogue_for_target(ctx: &EmitCtx) -> DResult<String> {
+    let is_test = matches!(ctx.crate_name, crate::CrateName::Test);
     match ctx.target {
+        ipe_ir::Target::Native | ipe_ir::Target::WasmWasi if is_test => {
+            open_main_with(&epilogue()?, &test_run_key_statement())
+        }
         ipe_ir::Target::Native | ipe_ir::Target::WasmWasi => epilogue(),
+        ipe_ir::Target::WasmClient if is_test => Err(Diagnostic::CompilerBug {
+            where_: "ipe_backend_rust::project::epilogue_for_target",
+            detail: "the `ipe test` runner has no wasm-client entry".to_owned(),
+        }),
         ipe_ir::Target::WasmClient => epilogue_wasm(ctx),
     }
 }
@@ -3114,7 +3165,7 @@ fn assemble_project_text(
     // or `Cli.tea` (line-oriented) — add "tui" to the default features and
     // inject the crossterm + unicode-width deps required by the terminal
     // runtime. Both drive axes share the one `tui` Cargo feature: a `Cli.tea`
-    // view returns `Lines msg`, rendered by `ipe_runtime::tui::render_lines_view`
+    // view returns `Lines msg`, serialized by `ipe_runtime::tui::write_frame`
     // (behind `feature = "tui"`). The base manifest declares `tui = []` as a
     // non-default feature; we promote it and add the deps so the compiled binary
     // includes the terminal module.
@@ -7475,5 +7526,45 @@ mod non_serde_tests {
         ]);
         assert_eq!(clean.files.len(), 2);
         assert!(super::refuse_lexer_hazards(&clean).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod test_runner_key_tests {
+    use super::{NATIVE_MAIN_ANCHOR, epilogue, open_main_with, test_run_key_statement};
+    use ipe_diagnostics::{DResult, Diagnostic};
+
+    /// The runner's `fn main` opens with the key read and is otherwise the
+    /// fixed epilogue byte for byte.
+    #[test]
+    fn the_test_runner_main_opens_with_the_key_read() -> DResult<()> {
+        let fixed = epilogue()?;
+        let keyed = open_main_with(&fixed, &test_run_key_statement())?;
+        let opened =
+            format!("{NATIVE_MAIN_ANCHOR}    std::hint::black_box(env!(\"IPE_TEST_RUN_KEY\"));\n");
+        assert_eq!(keyed.matches(opened.as_str()).count(), 1, "{keyed}");
+        assert_eq!(
+            keyed.replacen(&test_run_key_statement(), "", 1),
+            fixed,
+            "only the key read is added"
+        );
+        Ok(())
+    }
+
+    /// An epilogue whose `fn main` anchor is absent or repeated is a compiler bug.
+    #[test]
+    fn an_epilogue_without_exactly_one_main_is_refused() {
+        let twice = format!("{NATIVE_MAIN_ANCHOR}}}\n{NATIVE_MAIN_ANCHOR}}}\n");
+        for fixed in ["", "fn main() {}\n", twice.as_str()] {
+            let opened = open_main_with(fixed, "    x();\n");
+            assert!(
+                matches!(opened, Err(Diagnostic::CompilerBug { .. })),
+                "{fixed:?} must be refused: {opened:?}"
+            );
+        }
+        assert_eq!(
+            open_main_with(&format!("a\n{NATIVE_MAIN_ANCHOR}}}\n"), "    x();\n").ok(),
+            Some(format!("a\n{NATIVE_MAIN_ANCHOR}    x();\n}}\n"))
+        );
     }
 }

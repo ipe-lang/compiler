@@ -91,7 +91,8 @@ pub(crate) fn run_lint(rest: &[String]) -> Result<(), CliError> {
 /// [`run_lint`] with `cwd` as the current directory.
 ///
 /// # Errors
-/// [`CliError::Usage`] on misuse or a malformed `lint.ipe`; every refusal of
+/// [`CliError::Usage`] on misuse; [`CliError::ProjectRefused`] for a malformed
+/// `lint.ipe`; every refusal of
 /// [`analysis_root`] and [`ProjectRoot::target`](crate::project_root::ProjectRoot::target) ([`CliError::NoManifest`],
 /// [`CliError::FileOutsideRoot`], …) and of [`SourceSnapshot::read`];
 /// [`CliError::LintGateFailed`] when a surviving finding is at or above the
@@ -207,7 +208,9 @@ fn load_config(dir: &Path) -> Result<LintConfig, CliError> {
             path: path.clone(),
             max,
         },
-        LintConfigLoadError::Invalid(e) => CliError::Usage(crate::text::Message::relay(&e)),
+        LintConfigLoadError::Invalid(e) => {
+            CliError::ProjectRefused(crate::text::Message::relay(&e))
+        }
     })
 }
 

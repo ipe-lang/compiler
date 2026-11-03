@@ -552,8 +552,6 @@ pub enum FfiPrepError {
     ModuleClaimed { module: String, slug: String },
     /// A project module already occupies the reserved asserted module path.
     ReservedModuleExists,
-    /// An asserted call or constant failed validation or deduplication.
-    AssertedRefused(Box<ipe_ffi::diag::Diagnostic>),
     /// The shims appended for asserted calls name a crate the table leaves out.
     AssertedShimSeal(SealRefusal),
     /// A define type and an opaque type share one name in one crate.
@@ -613,7 +611,6 @@ impl FfiPrepError {
             Self::ReservedModuleExists => {
                 text::msg::ffi_reserved_module_exists(&ipe_canon::asserted::ASSERTED_MODULE)
             }
-            Self::AssertedRefused(diag) => text::Message::relay(&**diag),
             Self::AssertedShimSeal(refusal) | Self::CatalogSeal(refusal) => refusal.message(),
             Self::DefineOpaqueCollision { slug, name } => {
                 text::msg::ffi_define_opaque_collision(slug, name)
@@ -1117,7 +1114,7 @@ pub fn prepare(
     let unify = ipe_ffi::unify::unify_foreign_nominals(&mut catalog);
     // Scan for asserted calls BEFORE interface injection, while `sources`
     // holds only project (and stdlib) modules.
-    let ScannedFfi { asserted, consts } = scan_asserted(sources, &catalog)?;
+    let ScannedFfi { asserted, consts } = scan_asserted(sources, &catalog, &unify)?;
     let mut injected = inject_interfaces(sources, &catalog, cache_hint)?;
     let mut assembled = assemble_emit(&catalog)?;
     if !asserted.is_empty() || !consts.is_empty() {
@@ -1194,16 +1191,21 @@ struct ScannedFfi {
 /// (`Rust.Ffi.call "<path>"`) and validate each against the installed-crate
 /// catalog, deduplicating identical assertions.
 ///
+/// Each module's carriers are classified against the catalog, the unify
+/// report's demotion edges (the home of a re-exported opaque), and the type
+/// names that module declares itself.
+///
 /// A module that fails to parse is skipped here: it cannot carry a working
 /// asserted call, and the compile pipeline reports the parse error with full
 /// context moments later.
 ///
 /// # Errors
-/// [`CliError::Pipeline`] (IPE-N0038, span-attributed) for a malformed site;
-/// [`FfiPrepError::AssertedRefused`] (IPE-F4414) for a refused assertion.
+/// [`CliError::Pipeline`], span-attributed in the user file: IPE-N0038 for a
+/// malformed site, IPE-F4414 for a refused assertion.
 fn scan_asserted(
     sources: &BTreeMap<Vec<String>, (PathBuf, String)>,
     catalog: &[InstalledCrate],
+    unify: &ipe_ffi::unify::UnifyReport,
 ) -> Result<ScannedFfi, CliError> {
     let mut specs = Vec::new();
     let mut const_specs = Vec::new();
@@ -1221,36 +1223,95 @@ fn scan_asserted(
         let Ok(module) = ipe_parse::parse_module(text, &mut interner) else {
             continue;
         };
-        let uses = ipe_canon::asserted::scan_module(&module, &interner).map_err(|diag| {
-            CliError::Pipeline {
-                file: file.clone(),
-                src: text.clone(),
-                diag: Box::new(diag),
-            }
-        })?;
+        let ipe_canon::asserted::AssertedScan { uses, local_types } =
+            ipe_canon::asserted::scan_module(&module, &interner).map_err(|diag| {
+                CliError::Pipeline {
+                    file: file.clone(),
+                    src: text.clone(),
+                    diag: Box::new(diag),
+                }
+            })?;
+        let scope = ipe_ffi::asserted::CarrierScope::new(catalog, unify, &local_types);
         for u in uses {
             // A native constant reads a bare scalar; every other surface is a
             // forwarder. The classifier carried on the use routes the two.
+            let site = ipe_ffi::asserted::AssertedSite::new(file.clone(), u.span, text);
             if matches!(u.callee, ipe_canon::asserted::AssertedCallee::RustConst) {
-                let spec =
-                    ipe_ffi::asserted::validate_const(u.path, &u.annotation, &interner, catalog)
-                        .map_err(asserted_refused)?;
+                let spec = ipe_ffi::asserted::validate_const(
+                    site,
+                    u.path,
+                    &u.annotation,
+                    &interner,
+                    &scope,
+                )
+                .map_err(|refusal| asserted_refused(sources, refusal))?;
                 const_specs.push(spec);
             } else {
-                let spec = ipe_ffi::asserted::validate(u.path, &u.annotation, &interner, catalog)
-                    .map_err(asserted_refused)?;
+                let spec =
+                    ipe_ffi::asserted::validate(site, u.path, &u.annotation, &interner, &scope)
+                        .map_err(|refusal| asserted_refused(sources, refusal))?;
                 specs.push(spec);
             }
         }
     }
-    let asserted = ipe_ffi::asserted::dedupe(specs).map_err(asserted_refused)?;
-    let consts = ipe_ffi::asserted::dedupe_consts(const_specs).map_err(asserted_refused)?;
+    let asserted =
+        ipe_ffi::asserted::dedupe(specs).map_err(|refusal| asserted_refused(sources, refusal))?;
+    let consts = ipe_ffi::asserted::dedupe_consts(const_specs)
+        .map_err(|refusal| asserted_refused(sources, refusal))?;
     Ok(ScannedFfi { asserted, consts })
 }
 
-/// Lift a refused asserted call or constant into its typed FFI prep refusal.
-fn asserted_refused(diag: ipe_ffi::diag::Diagnostic) -> CliError {
-    FfiPrepError::AssertedRefused(Box::new(diag)).into()
+/// Lift a refused asserted call or constant into a pipeline diagnostic at the
+/// refused definition, rendered against that definition's file.
+fn asserted_refused(
+    sources: &BTreeMap<Vec<String>, (PathBuf, String)>,
+    refusal: ipe_ffi::diag::AssertedRefusal,
+) -> CliError {
+    let file = refusal.site.file().to_path_buf();
+    let src = sources
+        .values()
+        .find(|(path, _)| *path == file)
+        .map(|(_, text)| text.clone())
+        .unwrap_or_default();
+    CliError::Pipeline {
+        file,
+        src,
+        diag: Box::new(ipe_diagnostics::Diagnostic::from(refusal)),
+    }
+}
+
+/// Whether `result` is the IPE-F4414 refusal of the asserted call to `path`,
+/// blamed on the file ending in `rel` and spanned at its `Rust.Ffi.call`.
+///
+/// A refusal of another kind (an unresolved `Rust.Ffi`, a type error in the
+/// same file) does not match, so a test pinning it goes red when the asserted
+/// refusal itself disappears.
+#[cfg(test)]
+pub(crate) fn is_asserted_refusal_at<T>(
+    result: &Result<T, CliError>,
+    rel: &str,
+    path: &str,
+) -> bool {
+    let Err(CliError::Pipeline { file, src, diag }) = result else {
+        return false;
+    };
+    let ipe_diagnostics::Diagnostic::Ffi {
+        msg:
+            ipe_diagnostics::FfiError::AssertedRefused {
+                path: refused,
+                span,
+                ..
+            },
+    } = diag.as_ref()
+    else {
+        return false;
+    };
+    let at = usize::try_from(span.lo).unwrap_or(usize::MAX);
+    file.ends_with(rel)
+        && refused.as_str() == path
+        && src
+            .get(at..)
+            .is_some_and(|rest| rest.starts_with("Rust.Ffi.call"))
 }
 
 /// Locate the `ipe-ffi-inspector` binary: beside the running `ipe`
@@ -2693,7 +2754,7 @@ fn read_ffi_vocabulary(manifest_path: &Path) -> Result<String, CliError> {
 /// in `src/Ffi/<Crate>.ipe` instead.
 fn reject_legacy_define_tables(text: &str) -> Result<(), CliError> {
     if text.contains("[[rust.define.") {
-        return Err(CliError::Usage(
+        return Err(CliError::ProjectRefused(
             crate::text::msg::ffi_legacy_define_removed(),
         ));
     }
@@ -3362,9 +3423,9 @@ fn reject_ambiguous_define<'a>(
     mut unqualified: impl Iterator<Item = &'a str>,
 ) -> Result<(), CliError> {
     if !sole_dep && let Some(name) = unqualified.next() {
-        return Err(CliError::Usage(text::msg::ffi_define_crate_ambiguous(
-            &kind, &name,
-        )));
+        return Err(CliError::ProjectRefused(
+            text::msg::ffi_define_crate_ambiguous(&kind, &name),
+        ));
     }
     Ok(())
 }
@@ -3566,24 +3627,21 @@ fn merge_declared_opaques(
             t.get("name").and_then(serde_json::Value::as_str) == Some(o.rust_type.as_str())
         });
         let Some(reported) = reported else {
-            return Err(CliError::Usage(text::msg::ffi_opaque_unknown_type(
-                &o.ipe_name,
-                &o.rust_type,
-                &crate_name,
-            )));
+            return Err(CliError::ProjectRefused(
+                text::msg::ffi_opaque_unknown_type(&o.ipe_name, &o.rust_type, &crate_name),
+            ));
         };
         if transparent.contains(o.rust_type.as_str()) {
-            return Err(CliError::Usage(text::msg::ffi_opaque_is_transparent(
-                &o.ipe_name,
-                &o.rust_type,
-            )));
+            return Err(CliError::ProjectRefused(
+                text::msg::ffi_opaque_is_transparent(&o.ipe_name, &o.rust_type),
+            ));
         }
         let rust_path = reported
             .get("rustPath")
             .and_then(serde_json::Value::as_str)
             .filter(|p| !p.is_empty())
             .ok_or_else(|| {
-                CliError::Usage(text::msg::ffi_opaque_without_path(
+                CliError::ProjectRefused(text::msg::ffi_opaque_without_path(
                     &o.ipe_name,
                     &o.rust_type,
                 ))
@@ -3596,9 +3654,9 @@ fn merge_declared_opaques(
         if let Some(prev) = declared.get(o.ipe_name.as_str())
             && prev.as_str() != Some(absolute.as_str())
         {
-            return Err(CliError::Usage(text::msg::ffi_opaque_declared_twice(
-                &o.ipe_name,
-            )));
+            return Err(CliError::ProjectRefused(
+                text::msg::ffi_opaque_declared_twice(&o.ipe_name),
+            ));
         }
         declared.insert(o.ipe_name.clone(), serde_json::Value::String(absolute));
     }
@@ -3691,8 +3749,8 @@ type ForeignDefines = (
 /// A parse error in any source module is silently skipped here — the compile
 /// pipeline will surface it with full context moments later. A malformed
 /// `foreign` declaration (invalid carrier, unknown kind, …) is a typed refusal
-/// returned as an `Err` with a `CliError::Usage` carrying the source path
-/// and reason; the caller decides whether to propagate it immediately or defer.
+/// returned as an `Err` with a `CliError::ProjectRefused` carrying the source
+/// path and reason: the project's source is wrong, not the command line.
 ///
 /// The returned vectors are the exact same `ManifestDefine*` shapes the TOML
 /// readers produce, so they feed unchanged into `merge_provides`.
@@ -3751,10 +3809,10 @@ impl ForeignReader<'_> {
         self.interner.resolve(sym).unwrap_or("")
     }
 
-    /// Emit a typed refusal with a source location prefix.
+    /// Emit a project-state refusal with a source location prefix.
     fn reject(&self, span: ipe_diagnostics::Span, reason: &str) -> CliError {
         let (line, col) = line_col_from_span(self.src, span.lo);
-        CliError::Usage(text::msg::located_refusal(
+        CliError::ProjectRefused(text::msg::located_refusal(
             &self.file.display(),
             &line,
             &col,
@@ -5554,6 +5612,11 @@ version = \"1\"
         };
         let spec = |path: &str| ipe_ffi::asserted::ConstSpec {
             path: ipe_canon::asserted::AssertedPath::parse(path).expect("valid path"),
+            site: ipe_ffi::asserted::AssertedSite::new(
+                PathBuf::from("src/Main.ipe"),
+                ipe_diagnostics::Span::new(0, 1),
+                "",
+            ),
             scalar: ipe_ffi::carrier::ScalarCarrier::Int,
             def_name: "limit".to_owned(),
             wrapper_ident: "ipe_asserted_const_limit".to_owned(),
@@ -5996,7 +6059,7 @@ version = \"1\"
         )
         .expect_err("must_refuse: an un-inspected type cannot mint a handle");
         assert!(
-            matches!(&err, CliError::Usage(m) if m.contains("not an inspected type")),
+            matches!(&err, CliError::ProjectRefused(m) if m.contains("not an inspected type")),
             "{err:?}"
         );
     }
@@ -6025,7 +6088,7 @@ version = \"1\"
         let err = merge_provides(&doc, "geo", &[], &[], &[], &opaques, true)
             .expect_err("must_refuse: a transparent value type is not a handle");
         assert!(
-            matches!(&err, CliError::Usage(m) if m.contains("TRANSPARENTLY")),
+            matches!(&err, CliError::ProjectRefused(m) if m.contains("TRANSPARENTLY")),
             "{err:?}"
         );
     }
@@ -6038,17 +6101,18 @@ version = \"1\"
             rust_type: "Client".to_owned(),
         }];
         // sole_dep = false ⇒ an unattributed declaration cannot be placed.
+        let unplaced = merge_provides(
+            &doc_reporting_opaque_client(),
+            "postgres",
+            &[],
+            &[],
+            &[],
+            &opaques,
+            false,
+        );
         assert!(
-            merge_provides(
-                &doc_reporting_opaque_client(),
-                "postgres",
-                &[],
-                &[],
-                &[],
-                &opaques,
-                false
-            )
-            .is_err()
+            matches!(unplaced, Err(CliError::ProjectRefused(_))),
+            "an unattributed declaration is project state: {unplaced:?}"
         );
         // sole_dep = true ⇒ it attaches to the one crate.
         assert!(
@@ -6279,17 +6343,15 @@ version = \"1\"
     }
 
     #[test]
-    fn scan_asserted_refused_assertion_is_asserted_refused() {
+    fn scan_asserted_refusal_names_the_refused_definition() {
         let sources = main_module(
             "shifted : Int -> Result Error Int\nshifted =\n    Rust.Ffi.call \"tm::shift\"\n",
         );
-        let got = scan_asserted(&sources, &[]);
+        let got = scan_asserted(&sources, &[], &ipe_ffi::unify::UnifyReport::default());
         assert!(
-            matches!(&got, Err(CliError::FfiPrep(refusal))
-                if matches!(refusal.as_ref(), FfiPrepError::AssertedRefused(diag)
-                    if matches!(diag.as_ref(), ipe_ffi::diag::Diagnostic::AssertedRefused { path, .. }
-                        if path == "tm::shift"))),
-            "an asserted call into an uninstalled crate is a typed refusal"
+            is_asserted_refusal_at(&got, "src/Main.ipe", "tm::shift"),
+            "the refusal is IPE-F4414 at the asserted call in Main: {:?}",
+            got.as_ref().err()
         );
     }
 
@@ -6298,7 +6360,7 @@ version = \"1\"
         let sources = main_module(
             "main =\n    case (Rust.Ffi.call \"tm::shift\") 1 of\n        Ok _ -> 1\n        Err _ -> 0\n",
         );
-        let got = scan_asserted(&sources, &[]);
+        let got = scan_asserted(&sources, &[], &ipe_ffi::unify::UnifyReport::default());
         assert!(
             matches!(&got, Err(CliError::Pipeline { .. })),
             "a misplaced asserted call stays a span-attributed pipeline error"
@@ -6312,11 +6374,7 @@ version = \"1\"
             ident: "syn".to_owned(),
             site: "src/ffi.rs".to_owned(),
         };
-        let diag = ipe_ffi::diag::Diagnostic::ArtifactIo {
-            path: "/p/x.consumer.json".to_owned(),
-            detail: "refused".to_owned(),
-        };
-        let cases: [(FfiPrepError, text::Message); 10] = [
+        let cases: [(FfiPrepError, text::Message); 9] = [
             (
                 FfiPrepError::ModuleClaimed {
                     module: "Rust.a".to_owned(),
@@ -6327,10 +6385,6 @@ version = \"1\"
             (
                 FfiPrepError::ReservedModuleExists,
                 text::msg::ffi_reserved_module_exists(&ipe_canon::asserted::ASSERTED_MODULE),
-            ),
-            (
-                FfiPrepError::AssertedRefused(Box::new(diag.clone())),
-                text::Message::relay(&diag),
             ),
             (
                 FfiPrepError::AssertedShimSeal(dropped()),
@@ -6743,6 +6797,37 @@ version = \"1\"
         );
     }
 
+    /// A malformed `foreign` declaration in the project's source is a
+    /// project-state refusal.
+    ///
+    /// It never routes as argument misuse, so no help page prints under it.
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed write IS the failure
+    fn a_malformed_foreign_declaration_is_a_project_refusal() {
+        let dir = ipe_test_temp::temp_root().join(format!(
+            "ipe-foreign-project-refused-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(
+            dir.join("Main.ipe"),
+            "module Main exposing (..)\n\nforeign Foo =\n    { crate = \"x\"\n    , kind = Phantom\n    }\n",
+        )
+        .expect("write source");
+        let got = scan_foreign_defines(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(got, Err(CliError::ProjectRefused(_))),
+            "a malformed `foreign` is project state, never argument misuse: {got:?}"
+        );
+        let Err(CliError::ProjectRefused(msg)) = got else {
+            return;
+        };
+        assert!(msg.contains("Main.ipe"), "names the source file: {msg}");
+        assert!(msg.contains("kind"), "names the refused field: {msg}");
+    }
+
     /// A `_bindings.rs` that is a symlink is refused, never followed: the
     /// read of the FFI cache is the scan's whole input, so a link that could
     /// point it elsewhere fails the read with the link refusal itself.
@@ -6866,6 +6951,10 @@ fields = { value = "i64" }
 "#;
         let err = reject_legacy_define_tables(toml_with_define)
             .expect_err("must reject legacy [[rust.define.*]]");
+        assert!(
+            matches!(err, CliError::ProjectRefused(_)),
+            "a legacy table is project state: {err:?}"
+        );
         let msg = err.to_string();
         assert!(
             msg.contains("[[rust.define.*]] is no longer supported"),

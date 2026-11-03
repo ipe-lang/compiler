@@ -959,16 +959,19 @@ static HAND_TABLE: &[EnvVar] = &[
     EnvVar {
         name: "IPE_RUNTIME_DIR",
         default: Cow::Borrowed("unset (embedded / in-repo)"),
-        purpose: "Explicit path to the runtime crate source directory. Overrides the \
-                  embedded fallback. Used in tests and in-repo development.",
+        purpose: "Explicit path to the runtime. A vendored build copies the module \
+                  tree at exactly this path. A linked build only checks that the runtime crate root at or \
+                  above it declares the compiler's version; the emitted project bundles \
+                  the compiler's own runtime.",
         subsystem: Subsystem::Runtime,
         class: Class::Tunable,
     },
     EnvVar {
         name: "IPE_RUNTIME_VENDORED",
         default: Cow::Borrowed("unset (false)"),
-        purpose: "Set to `1` to declare that the runtime is vendored (already present \
-                  on disk) and skip materialization. Used during packaging.",
+        purpose: "Set to `1` to emit the vendored shape: the runtime module tree is \
+                  copied into the emitted project's `src/ipe_runtime/` instead of linked \
+                  as a path dependency. Any other value keeps the linked shape.",
         subsystem: Subsystem::Runtime,
         class: Class::Tunable,
     },
@@ -1361,8 +1364,9 @@ pub static EXCLUDED_NAMES: &[&str] = &[
     "IPE_TEST_INT_UNSET",
     "IPE_TEST_PG_URL",
     "IPE_TEST_REDIS_URL",
+    "IPE_TEST_RUN_KEY", // `ipe test`: the run key handed to the test runner crate at compile time
     "IPE_TIME_STRING_TZ_CHILD", // runtime time test: marks the non-UTC `TZ` re-exec
-    "IPE_TMP", // temp-root refusal tests: a neighbouring key that must not be refused
+    "IPE_TMP",          // temp-root refusal tests: a neighbouring key that must not be refused
     "IPE_WASI_SEAL_CHILD", // WASI seal e2e: marks the cargo-env re-exec
     "IPE_WINDOWS_E2E_ENV_CHILD", // Windows jail e2e: marks the env-seeded re-exec
     // Dev-loop-internal listener relocation port — set by `ipe dev watch` and the

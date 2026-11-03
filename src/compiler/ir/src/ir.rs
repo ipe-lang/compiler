@@ -1987,7 +1987,7 @@ pub enum UiCtor {
     Html,
     /// `Element msg` — a Ipe.Ui layout element (`ipe_runtime::ui::element::Element<M>`).
     Element,
-    /// `Cells msg` — a Tui-only structured view (`ipe_runtime::tui::CellsView<M>`).
+    /// `Screen msg` — a Tui-only structured view (`ipe_runtime::tui::CellsView<M>`).
     /// Produced exclusively by `Ipe.Ui.Cells.*` builders; the type is distinct from
     /// `Element msg` so Web-only constructs cannot appear inside a Tui view.
     Cells,
@@ -2000,7 +2000,7 @@ pub enum UiCtor {
     TuiAttribute,
     /// `Lines msg` from `Ipe.Ui.Cli` — a line-oriented view
     /// (`ipe_runtime::tui::LinesView<M>`). Distinct from both `Element msg` and
-    /// `Cells msg`: line-scoped, so 2D cell and DOM builders cannot appear in it.
+    /// `Screen msg`: line-scoped, so 2D cell and DOM builders cannot appear in it.
     CliLines,
     /// `Attribute msg` from `Ipe.Ui.Cli` — a line-native attribute
     /// (`ipe_runtime::tui::CliAttr<M>`). Only line-scoped styles inhabit it, so a

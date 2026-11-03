@@ -322,8 +322,59 @@ pub enum TypeTarget {
     Union(Vec<Symbol>),
     /// A type alias.
     Alias(AliasBody),
-    /// A builtin row a kernel module exports, minted at the empty home.
-    Builtin(ipe_kernels::BuiltinType),
+    /// A builtin row, with the home its use mints.
+    Builtin(BoundBuiltin),
+}
+
+/// A builtin row a name is bound to, with the home its use mints.
+///
+/// The row decides the use's arity, view alias and seal; the home only names
+/// the carrier (`["Html"]` for the Html attribute, an engine path for a
+/// terminal attribute, the empty home for a kernel export).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundBuiltin {
+    /// The row the name denotes.
+    pub row: ipe_kernels::BuiltinType,
+    /// The home a use of the name mints.
+    pub home: Vec<Symbol>,
+}
+
+impl BoundBuiltin {
+    /// The row `row` minted at the empty home.
+    #[must_use]
+    pub const fn at_empty_home(row: ipe_kernels::BuiltinType) -> Self {
+        Self {
+            row,
+            home: Vec::new(),
+        }
+    }
+}
+
+/// A type name a source-module dependency declares, as a qualified use reads it.
+///
+/// A name absent from the table is one the dependency neither declares nor
+/// exports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QualifiedType {
+    /// A builtin row the dependency exports, at the export's home.
+    Builtin(BoundBuiltin),
+    /// A union the dependency exports, at the export's home.
+    Union(Vec<Symbol>),
+    /// An alias the dependency exports, under its synthetic `Q.Name` key.
+    Alias,
+    /// A union or alias the dependency declares and does not export.
+    Private,
+}
+
+impl QualifiedType {
+    /// Whether a qualified use may name this type.
+    #[must_use]
+    pub const fn is_exported(&self) -> bool {
+        match self {
+            Self::Builtin(_) | Self::Union(_) | Self::Alias => true,
+            Self::Private => false,
+        }
+    }
 }
 
 /// The two module-level bare-name namespaces of the module being canonicalised.

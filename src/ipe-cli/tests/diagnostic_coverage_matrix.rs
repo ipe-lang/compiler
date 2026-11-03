@@ -223,7 +223,9 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
 
 #[test]
 fn diagnostic_surface_is_non_empty() {
-    let items = DiagnosticSurface.all();
+    let items = DiagnosticSurface
+        .all()
+        .expect("the live diagnostic surface must enumerate");
     assert!(
         !items.is_empty(),
         "the diagnostic surface must enumerate at least one code",
@@ -233,7 +235,9 @@ fn diagnostic_surface_is_non_empty() {
 #[test]
 fn diagnostic_surface_matches_all_codes_length() {
     use ipe_diagnostics::ALL_CODES;
-    let items = DiagnosticSurface.all();
+    let items = DiagnosticSurface
+        .all()
+        .expect("the live diagnostic surface must enumerate");
     assert_eq!(
         items.len(),
         ALL_CODES.len(),
@@ -245,11 +249,13 @@ fn diagnostic_surface_matches_all_codes_length() {
 fn diagnostic_surface_is_deterministic() {
     let first: Vec<String> = DiagnosticSurface
         .all()
+        .expect("the live diagnostic surface must enumerate")
         .iter()
         .map(|c| c.as_str().to_owned())
         .collect();
     let second: Vec<String> = DiagnosticSurface
         .all()
+        .expect("the live diagnostic surface must enumerate")
         .iter()
         .map(|c| c.as_str().to_owned())
         .collect();
@@ -262,7 +268,9 @@ fn diagnostic_surface_is_deterministic() {
 #[test]
 fn a_known_code_appears_on_the_surface() {
     use ipe_diagnostics::IPE_T0001;
-    let items = DiagnosticSurface.all();
+    let items = DiagnosticSurface
+        .all()
+        .expect("the live diagnostic surface must enumerate");
     assert!(
         items.contains(&IPE_T0001),
         "IPE-T0001 must appear on the diagnostic surface",
@@ -273,7 +281,7 @@ fn a_known_code_appears_on_the_surface() {
 fn diagnostic_columns_pass_with_allowlist() {
     use std::fmt::Write as _;
 
-    let report = matrix::run_diagnostic();
+    let report = matrix::run_diagnostic().expect("the diagnostic matrix run must not fail closed");
 
     let mut unexpected = String::new();
     for h in report.holes.iter().filter(|h| {
@@ -299,7 +307,7 @@ fn diagnostic_columns_pass_with_allowlist() {
 
 #[test]
 fn allowlisted_holes_are_still_real() {
-    let report = matrix::run_diagnostic();
+    let report = matrix::run_diagnostic().expect("the diagnostic matrix run must not fail closed");
     for (aspect, symbol, reason) in ALLOWLIST {
         let present = report
             .holes
@@ -317,7 +325,7 @@ fn allowlisted_holes_are_still_real() {
 fn explain_page_column_passes_for_all_codes() {
     // Every code must have a conforming explain page — this column is never
     // allowlisted, so a hole here is always an immediate failure.
-    let report = matrix::run_diagnostic();
+    let report = matrix::run_diagnostic().expect("the diagnostic matrix run must not fail closed");
     let page_holes: Vec<_> = report
         .holes
         .iter()

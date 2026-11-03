@@ -13,11 +13,13 @@
 
 pub mod bin;
 pub mod live_page;
+pub mod target;
 
 pub use bin::{
     ProvenBin, ProvenRuntime, ResolveError, Tier, e2e_tier, require_manifest_dir, require_runtime,
     require_runtime_crate,
 };
+pub use target::{SharedBuild, child_shared_target_from_env};
 
 use std::io::{BufRead, Read};
 use std::path::Path;
@@ -79,115 +81,6 @@ fn emitted_build_timeout() -> Duration {
 /// Resolve the emitted-build inactivity window from the environment.
 fn emitted_build_idle() -> Duration {
     duration_env_or("IPE_E2E_BUILD_IDLE_SECS", DEFAULT_EMITTED_BUILD_IDLE_SECS)
-}
-
-/// Stable token stored in a portable golden `Cargo.toml` instead of the
-/// machine-specific `ipe-runtime-rust` crate path.
-///
-/// The real emit writes a live, resolvable absolute path so `cargo build`
-/// works in any environment; only the golden fixture stores this placeholder
-/// so the byte-compare is machine-independent. The comparison and bless paths
-/// both normalise the emitted path to this value before touching the golden.
-pub const RUNTIME_PATH_PLACEHOLDER: &str = "__IPE_RUNTIME_PATH__";
-
-/// Replace the `ipe-runtime-rust` dependency's `path = "<abs>"` value in a
-/// `Cargo.toml` text with [`RUNTIME_PATH_PLACEHOLDER`], leaving every other
-/// byte untouched.
-///
-/// Only the one `ipe_runtime = { … package = "ipe-runtime-rust" … path = "…"
-/// … }` dependency line carries a machine-specific value; the rewrite is
-/// scoped to `path = "…"` on that line, so a manifest with no such line (e.g.
-/// the vendored / wasm shape) passes through unchanged, and any real manifest
-/// drift still surfaces as a diff.
-#[must_use]
-pub fn normalize_runtime_dep_path(manifest: &str) -> String {
-    let path_normalized = manifest
-        .lines()
-        .map(|line| {
-            if line.contains("package = \"ipe-runtime-rust\"")
-                && let Some(start) = line.find("path = \"")
-            {
-                let val_start = start + "path = \"".len();
-                if let Some(rel_end) = line[val_start..].find('"') {
-                    let end = val_start + rel_end;
-                    return format!(
-                        "{}{}{}",
-                        &line[..val_start],
-                        RUNTIME_PATH_PLACEHOLDER,
-                        &line[end..]
-                    );
-                }
-            }
-            line.to_owned()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + if manifest.ends_with('\n') { "\n" } else { "" };
-    normalize_crate_identity_hash(&path_normalized)
-}
-
-/// Stable token stored in a portable golden `Cargo.toml` in place of the
-/// machine-specific per-project crate-identity hash.
-///
-/// The emitted `[package] name` is `"<friendly>_<hash>"`, where `<hash>` is a
-/// fixed-width digest of the CANONICAL project directory — a value that differs
-/// per machine (the golden is emitted from a host-local temp/checkout path). The
-/// friendly base is host-independent and stays in the golden verbatim (so the
-/// golden still pins it); only the volatile hash is replaced with this placeholder
-/// on both the comparison and bless paths, so the committed golden is portable and
-/// a regen is idempotent across machines.
-pub const CRATE_IDENTITY_HASH_PLACEHOLDER: &str = "__IPE_CRATE_HASH__";
-
-/// Replace the `[package] name` crate-identity hash suffix (`_<8 lowercase-hex>`)
-/// with [`CRATE_IDENTITY_HASH_PLACEHOLDER`], leaving the friendly base and every
-/// other byte untouched.
-///
-/// Scoped to the `[package]` table's first `name = "…"` line. A name with no
-/// hash suffix (the single-file `ipe-app` default) and any non-`[package]` `name`
-/// (a dependency) pass through unchanged. The suffix shape — a trailing `_`
-/// followed by EXACTLY the fixed-width lowercase-hex digest — is matched
-/// precisely so a friendly base that itself ends in `_<hex-looking>` is not
-/// mangled beyond that exact trailing token.
-#[must_use]
-fn normalize_crate_identity_hash(manifest: &str) -> String {
-    // Mirrors `ipe_backend_rust::crate_identity`'s fixed suffix width; a shell/
-    // tool cannot import that const, so the expected width is asserted by the
-    // determinism/host-independence tests that drive both sides.
-    const HEX_LEN: usize = 8;
-    let mut in_package = false;
-    let mut done = false;
-    manifest
-        .lines()
-        .map(|line| {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with('[') {
-                in_package = trimmed.starts_with("[package]");
-                return line.to_owned();
-            }
-            if in_package
-                && !done
-                && trimmed.starts_with("name")
-                && let Some((lhs, rhs)) = line.split_once('=')
-                && lhs.trim() == "name"
-            {
-                let raw = rhs.trim();
-                if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
-                    && let Some((base, hash)) = inner.rsplit_once('_')
-                    && hash.len() == HEX_LEN
-                    && hash
-                        .bytes()
-                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-                {
-                    done = true;
-                    return format!("{lhs}= \"{base}_{CRATE_IDENTITY_HASH_PLACEHOLDER}\"");
-                }
-                done = true;
-            }
-            line.to_owned()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + if manifest.ends_with('\n') { "\n" } else { "" }
 }
 
 /// Captured stdout + exit code from running a built program.
@@ -292,119 +185,55 @@ fn find_executable(json_stdout: &str, unique_pkg: &str) -> Option<String> {
     found
 }
 
-/// Decide the emitted-project cargo target, decoupling it from the ambient
-/// `CARGO_TARGET_DIR` set by the outer build lane.
+/// Build the emitted project at `emitted_dir` for `golden_name` in the shared
+/// target, returning the guard that holds the located binary. The shared core
+/// of [`build_and_run_rust`] and [`build_rust_binary`], so both drive
+/// `cargo build` identically.
 ///
-/// `shared` is the raw `IPE_ORACLE_SHARED_TARGET` value. Returns `Some(path)`
-/// only when it is a non-empty absolute path — anything else (absent, relative,
-/// whitespace) returns `None` (inherit the ambient env = isolate). This
-/// fail-safe prevents a runtime-editing lane that vendors a different
-/// `ipe_runtime` from accidentally reusing a stale shared target and producing
-/// a false green.
-fn resolve_emitted_target(shared: Option<&str>) -> Option<String> {
-    let trimmed = shared?.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if !Path::new(trimmed).is_absolute() {
-        eprintln!(
-            "e2e-support: ignoring IPE_ORACLE_SHARED_TARGET={trimmed:?} \
-             (not an absolute path); isolating emitted build in ambient CARGO_TARGET_DIR"
-        );
-        return None;
-    }
-    Some(trimmed.to_owned())
+/// The target is [`target::shared`]: the warm shared dependency target, so the
+/// runtime's dependency tree is compiled once and reused. Under the end-to-end
+/// tier a missing or relative shared target is refused. Without one in the
+/// unit tier the build gets a private isolated tree. The package is renamed
+/// unique to `golden_name` first, so every golden's binary coexists in the one
+/// shared target and the returned [`SharedBuild`] removes only its own
+/// artifacts.
+fn build_emitted_binary(golden_name: &str, emitted_dir: &Path) -> Result<SharedBuild, String> {
+    build_emitted_binary_with_env(golden_name, emitted_dir, &[])
 }
 
-/// The `CARGO_TARGET_DIR` a child `ipe`/`cargo` process should inherit so its
-/// emitted build links against the warm shared dependency target.
-///
-/// A test spawning the `ipe` subprocess (`ipe dev run|build|watch`) forwards this on
-/// the child's environment. The resolution order:
-///   * `IPE_ORACLE_SHARED_TARGET`, when it is an absolute path — CI's e2e/seal
-///     jobs export ONLY this variable, and production `ipe` never reads it, so
-///     the harness must translate it into the child's `CARGO_TARGET_DIR` or the
-///     child cold-builds the full tokio/axum/runtime tree.
-///   * else the ambient `CARGO_TARGET_DIR`, when a local run set one — the child
-///     inherits it untouched, so agent-lane target isolation is preserved.
-///   * else `None` (nothing to forward; cargo's default per-crate target).
-///
-/// Returning `None` when neither is set keeps a bare local run hermetic and
-/// unchanged; a non-absolute `IPE_ORACLE_SHARED_TARGET` fails safe exactly as
-/// [`resolve_emitted_target`] does (isolate rather than reuse a stale target).
-#[must_use]
-pub fn child_shared_target(
-    shared: Option<&str>,
-    ambient_cargo_target: Option<&str>,
-) -> Option<String> {
-    resolve_emitted_target(shared).or_else(|| {
-        ambient_cargo_target
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-    })
-}
-
-/// Resolve [`child_shared_target`] from the current process environment.
-///
-/// Convenience wrapper reading `IPE_ORACLE_SHARED_TARGET` and `CARGO_TARGET_DIR`
-/// from the ambient environment for the common call site that forwards the warm
-/// target onto a spawned `ipe`/`cargo` child.
-#[must_use]
-pub fn child_shared_target_from_env() -> Option<String> {
-    let shared = ipe_env::var("IPE_ORACLE_SHARED_TARGET").ok();
-    let ambient = ipe_env::var("CARGO_TARGET_DIR").ok();
-    child_shared_target(shared.as_deref(), ambient.as_deref())
-}
-
-/// Build the emitted project at `emitted_dir` for `golden_name`, returning the
-/// located binary path. The shared core of [`build_and_run_rust`] and
-/// [`build_rust_binary`], so both drive `cargo build` identically.
-///
-/// The emitted build's cargo target is chosen by [`resolve_emitted_target`] from
-/// `IPE_ORACLE_SHARED_TARGET`: when the harness opts in with an absolute path the
-/// build is pinned to that shared target (runtime deps compiled once, reused);
-/// otherwise the ambient env is inherited untouched (isolate — the fail-safe
-/// default).
-///
-/// The compiler wrapper (sccache) is disabled for this build. Each emitted crate
-/// lives in a per-golden scratch directory the golden removes on its next run, so
-/// pinning rustc to a cwd-sensitive shared sccache server is unsound under
-/// parallelism: one golden's scratch teardown unlinks the very cwd the shared
-/// sccache server inherited, after which every sibling compile fails
-/// `sccache rustc -vV` with "couldn't determine current working directory".
-/// Running the emitted builds without the wrapper removes that shared, racy
-/// resource; the shared cargo target already caches the heavy runtime dep tree.
-///
-/// An EMPTY `CARGO_BUILD_RUSTC_WRAPPER` (not `env_remove`) is required: the
-/// wrapper is commonly configured in `~/.cargo/config.toml`'s `[build]
-/// rustc-wrapper`, which `env_remove` cannot override — only an empty env var,
-/// which takes precedence over the config value, actually disables it.
-fn build_emitted_binary(golden_name: &str, emitted_dir: &Path) -> Result<String, String> {
+/// [`build_emitted_binary`], with `envs` additionally set on the `cargo build`
+/// invocation (e.g. `RUSTFLAGS` for an overflow-checks SEAL). The lockfile
+/// resolve step never takes `envs` — it never needs to see them, and keeping
+/// them off it means a build-only env var cannot accidentally perturb
+/// resolution.
+fn build_emitted_binary_with_env(
+    golden_name: &str,
+    emitted_dir: &Path,
+    envs: &[(&str, &str)],
+) -> Result<SharedBuild, String> {
     let unique_pkg = rewrite_package_name(emitted_dir, golden_name)?;
-
-    let shared = ipe_env::var("IPE_ORACLE_SHARED_TARGET").ok();
-    let target = resolve_emitted_target(shared.as_deref());
+    let refused = |e: target::TargetError| format!("{golden_name}: {e}");
+    let build_target = match target::shared().map_err(refused)? {
+        Some(shared) => target::BuildTarget::Shared(shared),
+        None => target::BuildTarget::Isolated(
+            target::isolated(target::IsolationReason::ColdBuildUnderTest).map_err(refused)?,
+        ),
+    };
 
     // Hermetic resolve: pin the emitted crate's whole dependency graph into a
     // per-emit `Cargo.lock` ONCE, then build against exactly that lock with
     // `--locked`. Without the lock the build resolves "latest-compatible" live on
-    // every run, so a transitive point-release (e.g. a chrono patch pulling a
-    // wasm-bindgen bump against the runtime's exact pin) can red the SEAL with no
-    // source change. `--locked` makes the build refuse to re-resolve: any
-    // lock↔manifest drift fails closed here, never as a silent divergence.
-    lock_emitted_dependencies(emitted_dir, target.as_deref(), golden_name)?;
+    // every run, so a transitive point-release can red the SEAL with no source
+    // change. `--locked` makes the build refuse to re-resolve: any
+    // lock-manifest drift fails closed here, never as a silent divergence.
+    lock_emitted_dependencies(emitted_dir, &build_target, golden_name)?;
 
-    let mut cmd = Command::new("cargo");
+    let mut cmd = target::cargo_command(&build_target);
     cmd.arg("build")
         .arg("--locked")
         .arg("--message-format=json")
         .current_dir(emitted_dir)
-        .env("CARGO_BUILD_RUSTC_WRAPPER", "")
-        .env("RUSTC_WRAPPER", "");
-    if let Some(p) = &target {
-        cmd.env("CARGO_TARGET_DIR", p);
-    }
+        .envs(envs.iter().copied());
     let build = run_bounded_build(
         cmd,
         golden_name,
@@ -419,30 +248,24 @@ fn build_emitted_binary(golden_name: &str, emitted_dir: &Path) -> Result<String,
     }
 
     let json_stdout = String::from_utf8_lossy(&build.stdout);
-    find_executable(&json_stdout, &unique_pkg).ok_or_else(|| {
+    let exe = find_executable(&json_stdout, &unique_pkg).ok_or_else(|| {
         format!("{golden_name}: no `executable` artifact for package `{unique_pkg}` in cargo JSON")
-    })
+    })?;
+    Ok(SharedBuild::new(exe, build_target, &unique_pkg))
 }
 
 /// Resolve the emitted crate's dependency graph ONCE into a per-emit
 /// `Cargo.lock` under `emitted_dir`, so the subsequent `--locked` build replays
 /// exactly that resolution instead of resolving "latest-compatible" afresh. The
-/// environment mirrors the build below (cleared `RUSTC_WRAPPER`, the shared
-/// `CARGO_TARGET_DIR` when set) so the same toolchain that consumes the lock
-/// produces it.
+/// command is the build's own [`target::cargo_command`], so the same toolchain
+/// and target that consume the lock produce it.
 fn lock_emitted_dependencies(
     emitted_dir: &Path,
-    target: Option<&str>,
+    build_target: &target::BuildTarget,
     golden_name: &str,
 ) -> Result<(), String> {
-    let mut cmd = Command::new("cargo");
-    cmd.arg("generate-lockfile")
-        .current_dir(emitted_dir)
-        .env("CARGO_BUILD_RUSTC_WRAPPER", "")
-        .env("RUSTC_WRAPPER", "");
-    if let Some(p) = target {
-        cmd.env("CARGO_TARGET_DIR", p);
-    }
+    let mut cmd = target::cargo_command(build_target);
+    cmd.arg("generate-lockfile").current_dir(emitted_dir);
     let out = run_bounded_build(
         cmd,
         golden_name,
@@ -771,7 +594,23 @@ fn drain_stream(
 /// (the message carries cargo's stderr), the binary cannot be located in the
 /// JSON output, or the binary cannot be executed.
 pub fn build_and_run_rust(golden_name: &str, emitted_dir: &Path) -> Result<RunResult, String> {
-    let exe = build_emitted_binary(golden_name, emitted_dir)?;
+    build_and_run_rust_with_env(golden_name, emitted_dir, &[])
+}
+
+/// [`build_and_run_rust`], with `envs` also set on the `cargo build` step.
+///
+/// The variables never reach the run of the already-built binary: a
+/// build-time flag like `RUSTFLAGS` has nothing to say to the finished
+/// executable.
+///
+/// # Errors
+/// Same as [`build_and_run_rust`].
+pub fn build_and_run_rust_with_env(
+    golden_name: &str,
+    emitted_dir: &Path,
+    envs: &[(&str, &str)],
+) -> Result<RunResult, String> {
+    let exe = build_emitted_binary_with_env(golden_name, emitted_dir, envs)?;
 
     let run = Command::new(&exe)
         .output()
@@ -782,17 +621,19 @@ pub fn build_and_run_rust(golden_name: &str, emitted_dir: &Path) -> Result<RunRe
     })
 }
 
-/// Build the emitted Rust project at `emitted_dir` and return the path of the
-/// resulting binary WITHOUT running it.
+/// Build the emitted Rust project at `emitted_dir` and return the guard holding
+/// the resulting binary WITHOUT running it.
 ///
 /// Used by E2E tests that need to control binary launch (custom env vars,
-/// pre-started fixture servers, stack-limit wrappers, …).
+/// pre-started fixture servers, stack-limit wrappers, …). The binary and its
+/// package's artifacts are removed when the guard drops; hold it for as long
+/// as the binary runs.
 ///
 /// # Errors
-/// Returns a message if the manifest cannot be retargeted, `cargo build` fails
-/// (carrying cargo's stderr), or the binary cannot be located in the JSON
-/// output.
-pub fn build_rust_binary(golden_name: &str, emitted_dir: &Path) -> Result<String, String> {
+/// Returns a message if no build target can be chosen, the manifest cannot be
+/// retargeted, `cargo build` fails (carrying cargo's stderr), or the binary
+/// cannot be located in the JSON output.
+pub fn build_rust_binary(golden_name: &str, emitted_dir: &Path) -> Result<SharedBuild, String> {
     build_emitted_binary(golden_name, emitted_dir)
 }
 
@@ -902,11 +743,10 @@ fn ran_exactly_one_passing_test(stdout: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedRun, BoundedRunError, CRATE_IDENTITY_HASH_PLACEHOLDER,
-        DEFAULT_EMITTED_BUILD_IDLE_SECS, DEFAULT_EMITTED_BUILD_TIMEOUT_SECS, OutStream,
-        emitted_build_idle, emitted_build_timeout, normalize_crate_identity_hash,
-        ran_exactly_one_passing_test, replace_package_name, rerun_this_test_exact,
-        resolve_emitted_target, run_bounded, run_bounded_build, wait_for,
+        BoundedRun, BoundedRunError, DEFAULT_EMITTED_BUILD_IDLE_SECS,
+        DEFAULT_EMITTED_BUILD_TIMEOUT_SECS, OutStream, emitted_build_idle, emitted_build_timeout,
+        ran_exactly_one_passing_test, replace_package_name, rerun_this_test_exact, run_bounded,
+        run_bounded_build, wait_for,
     };
     use std::process::Command;
     use std::time::{Duration, Instant};
@@ -1098,123 +938,6 @@ mod tests {
         assert!(replace_package_name("[dependencies]\nfoo = \"1\"\n", "uniq").is_none());
     }
 
-    // Host-independence of goldens: the per-machine crate-identity hash suffix is
-    // replaced with a stable placeholder, so a golden regenerated on any machine
-    // is byte-identical (the friendly base is preserved verbatim).
-    #[test]
-    fn crate_identity_hash_suffix_is_normalized_to_placeholder() {
-        let manifest = "[package]\nname = \"mm-diamond_1a2b3c4d\"\nedition = \"2024\"\n";
-        let out = normalize_crate_identity_hash(manifest);
-        assert!(
-            out.contains(&format!(
-                "name = \"mm-diamond_{CRATE_IDENTITY_HASH_PLACEHOLDER}\""
-            )),
-            "hash suffix must normalize to the placeholder, got:\n{out}"
-        );
-        assert!(!out.contains("1a2b3c4d"), "no per-machine hash may survive");
-    }
-
-    // Two different real project paths yield different hashes; after
-    // normalization BOTH collapse to the identical placeholder text — the
-    // property that makes the committed golden host-independent.
-    #[test]
-    fn distinct_hashes_normalize_to_the_same_text() {
-        let a = normalize_crate_identity_hash("[package]\nname = \"app_00112233\"\n");
-        let b = normalize_crate_identity_hash("[package]\nname = \"app_deadbeef\"\n");
-        assert_eq!(a, b);
-    }
-
-    // The single-file default carries no hash suffix and must pass through
-    // untouched, and a `name` under a later table is never mistaken for the
-    // package name.
-    #[test]
-    fn unhashed_and_non_package_names_pass_through() {
-        let single = "[package]\nname = \"ipe-app\"\nedition = \"2024\"\n";
-        assert_eq!(normalize_crate_identity_hash(single), single);
-
-        // A dependency `name` whose value merely looks hash-shaped is untouched.
-        let dep = "[package]\nname = \"app_00112233\"\n\n[[bin]]\nname = \"other_00112233\"\n";
-        let out = normalize_crate_identity_hash(dep);
-        assert!(out.contains(&format!("name = \"app_{CRATE_IDENTITY_HASH_PLACEHOLDER}\"")));
-        assert!(
-            out.contains("name = \"other_00112233\""),
-            "a non-[package] name must be left alone, got:\n{out}"
-        );
-    }
-
-    // A friendly base that is NOT hash-shaped (wrong width) is not mangled.
-    #[test]
-    fn wrong_width_suffix_is_not_treated_as_a_hash() {
-        let manifest = "[package]\nname = \"my_app\"\nedition = \"2024\"\n";
-        assert_eq!(normalize_crate_identity_hash(manifest), manifest);
-    }
-
-    // These lock the fail-safe semantics of `resolve_emitted_target` without
-    // touching the ambient env — the function signature takes an `Option<&str>`
-    // so tests pass the value directly.
-
-    #[test]
-    fn shared_absolute_path_overrides_ambient() {
-        assert_eq!(
-            resolve_emitted_target(Some("/home/x/.cache/ipe-lang-target")),
-            Some("/home/x/.cache/ipe-lang-target".to_owned())
-        );
-    }
-
-    #[test]
-    fn unset_inherits_ambient_isolate() {
-        assert_eq!(resolve_emitted_target(None), None);
-    }
-
-    #[test]
-    fn empty_or_whitespace_fails_safe() {
-        assert_eq!(resolve_emitted_target(Some("")), None);
-        assert_eq!(resolve_emitted_target(Some("   ")), None);
-    }
-
-    #[test]
-    fn relative_path_fails_safe() {
-        assert_eq!(resolve_emitted_target(Some("relative/target")), None);
-        assert_eq!(resolve_emitted_target(Some("./target")), None);
-    }
-
-    // `child_shared_target` layers the ambient-CARGO_TARGET_DIR fallback over the
-    // same fail-safe resolution, so an `ipe`-subprocess site can forward the warm
-    // target whether CI exports IPE_ORACLE_SHARED_TARGET or a local lane exports
-    // CARGO_TARGET_DIR.
-    use super::child_shared_target;
-
-    #[test]
-    fn child_prefers_absolute_shared_over_ambient() {
-        assert_eq!(
-            child_shared_target(Some("/warm/shared"), Some("/lane/target")),
-            Some("/warm/shared".to_owned())
-        );
-    }
-
-    #[test]
-    fn child_falls_back_to_ambient_when_shared_absent() {
-        assert_eq!(
-            child_shared_target(None, Some("/lane/target")),
-            Some("/lane/target".to_owned())
-        );
-    }
-
-    #[test]
-    fn child_falls_back_to_ambient_when_shared_non_absolute() {
-        // A non-absolute shared value fails safe; a valid ambient value still wins.
-        assert_eq!(
-            child_shared_target(Some("relative/target"), Some("/lane/target")),
-            Some("/lane/target".to_owned())
-        );
-    }
-
-    #[test]
-    fn child_is_none_when_neither_set() {
-        assert_eq!(child_shared_target(None, None), None);
-        assert_eq!(child_shared_target(Some("  "), Some("")), None);
-    }
-
     /// The load-bearing soundness guarantee of the warm-deps/cold-app dep cache:
     /// a shared cargo target reuses only DEPENDENCY artifacts, never masking a
     /// broken app crate. Two crates build into ONE shared `CARGO_TARGET_DIR`;
@@ -1224,8 +947,6 @@ mod tests {
     /// proving the SEAL cannot be greened by cache reuse.
     #[test]
     fn shared_target_never_masks_a_broken_crate() {
-        use std::process::Command;
-
         let root = ipe_test_temp::temp_root().join(format!(
             "e2e_support_soundness_{}_{}",
             std::process::id(),
@@ -1253,13 +974,13 @@ mod tests {
             dir
         };
 
+        let shared = ipe_env::oracle_target::parse(&shared_target.to_string_lossy())
+            .expect("the temp root is absolute");
+        let build_target = crate::target::BuildTarget::Shared(shared);
         let build_into_shared = |dir: &std::path::Path| -> std::process::Output {
-            Command::new("cargo")
+            crate::target::cargo_command(&build_target)
                 .arg("build")
                 .current_dir(dir)
-                .env("CARGO_TARGET_DIR", &shared_target)
-                .env("CARGO_BUILD_RUSTC_WRAPPER", "")
-                .env("RUSTC_WRAPPER", "")
                 .output()
                 .expect("cargo must spawn")
         };

@@ -45,9 +45,20 @@ pub struct AdvisoryVulnerablePayload {
 /// of the Ipê program being compiled.
 #[derive(Debug)]
 pub enum CliError {
-    /// Command-line or manifest misuse; carries the catalog message saying what
-    /// was wrong and how to fix it.
+    /// Command-line misuse; carries the catalog message saying what was wrong
+    /// and how to fix it. The dispatcher pairs it with the command's help page.
     Usage(text::Message),
+    /// A refusal about the project's state (its manifest, its source layout,
+    /// its package kind). Not argument misuse, so it never prints a help page.
+    ProjectRefused(text::Message),
+    /// `package.ipe` declares a dependency of a kind no compiling command
+    /// compiles, refused before any source is read.
+    DependencyNotCompiled {
+        /// The declared dependency.
+        name: crate::package_name::PackageName,
+        /// How it was declared.
+        kind: crate::project::DepKind,
+    },
     /// A check ran correctly and its verdict on the user's input is "failed"
     /// (e.g. `ipe fmt --check` found unformatted files). Carries the catalog
     /// message with the findings. A verdict is not command misuse, so it exits
@@ -200,6 +211,19 @@ pub enum CliError {
         /// Why the manifest could not be prepared.
         fault: crate::runtime_embed::ManifestFault,
     },
+    /// The test runner `ipe test` was about to run does not carry the key of
+    /// this run's build.
+    ///
+    /// The binary was not executed: its verdict would belong to another build.
+    TestRunnerStale {
+        /// The binary found, as display text.
+        binary: TerminalSafe,
+    },
+    /// The system random source could not mint this `ipe test` run's key.
+    TestRunKeyUnavailable {
+        /// The random source's failure.
+        source: std::io::Error,
+    },
     /// Another `ipe test` held the shared test build directory past the wall.
     TestTargetBusy {
         /// The held lock file, as display text.
@@ -241,6 +265,11 @@ pub enum CliError {
     /// path dependency that cannot be written into the lockfile. Boxed to keep
     /// `CliError` within its size ceiling.
     LockRefused(Box<crate::lockfile::LockRefusal>),
+    /// A registry index entry outside the closed entry grammar: a line that is
+    /// no field, an unknown or misplaced key, a malformed or repeated value, a
+    /// version listed twice, or a `name` naming another package. Boxed to keep
+    /// `CliError` within its size ceiling.
+    IndexEntryRefused(Box<crate::index::EntryRefusal>),
     /// A fetched package's content hash did not equal the hash the index pinned.
     /// This is the verify-before-trust boundary: a mismatch is always a hard,
     /// typed error — never a warning — because the source that was fetched is not
@@ -778,6 +807,8 @@ impl CliError {
     pub const fn machine_kind(&self) -> &'static str {
         match self {
             Self::Usage(_) | Self::FfiPrep(_) => "usage",
+            Self::ProjectRefused(_) => "project-refused",
+            Self::DependencyNotCompiled { .. } => "dependency-not-compiled",
             Self::CheckFailed(_) => "check-failed",
             Self::UnknownCommand { .. } => "unknown-command",
             Self::Io { .. } => "io",
@@ -796,12 +827,15 @@ impl CliError {
             Self::TargetDirUnlinkable { .. } => "target-dir-unlinkable",
             Self::BundledManifest { .. } => "bundled-manifest",
             Self::TestTargetBusy { .. } => "test-target-busy",
+            Self::TestRunnerStale { .. } => "test-runner-stale",
+            Self::TestRunKeyUnavailable { .. } => "test-run-key-unavailable",
             Self::UnknownCode { .. } => "unknown-code",
             Self::DocNotFound { .. } => "doc-not-found",
             Self::StaticRefusal(_) => "static-refusal",
             Self::CapabilityMismatch { .. } => "capability-mismatch",
             Self::Resolve(_) => "resolve",
             Self::LockRefused(_) => "lock-refused",
+            Self::IndexEntryRefused(_) => "index-entry-refused",
             Self::HashMismatch { .. } => "hash-mismatch",
             Self::Diff(_) => "diff",
             Self::SemverRejected { .. } => "semver-rejected",
@@ -881,9 +915,13 @@ impl CliError {
                     }
                 }
             }
-            Self::RuntimeVersionMismatch { .. } | Self::BundledManifest { .. } => Internal,
+            Self::RuntimeVersionMismatch { .. }
+            | Self::BundledManifest { .. }
+            | Self::TestRunnerStale { .. } => Internal,
             Self::FfiPrep(refusal) => ffi_prep_fault(refusal),
             Self::Usage(_)
+            | Self::ProjectRefused(_)
+            | Self::DependencyNotCompiled { .. }
             | Self::CheckFailed(_)
             | Self::UnknownCommand { .. }
             | Self::Io { .. }
@@ -902,6 +940,7 @@ impl CliError {
             | Self::CapabilityMismatch { .. }
             | Self::Resolve(_)
             | Self::LockRefused(_)
+            | Self::IndexEntryRefused(_)
             | Self::HashMismatch { .. }
             | Self::Diff(_)
             | Self::SemverRejected { .. }
@@ -930,6 +969,7 @@ impl CliError {
             | Self::CargoBuildTimedOut { .. }
             | Self::TargetDirUnlinkable { .. }
             | Self::TestTargetBusy { .. }
+            | Self::TestRunKeyUnavailable { .. }
             | Self::ChildPipeHeld(_)
             | Self::ThreadRefused { .. }
             | Self::ChildPipeUnread(..)
@@ -1016,11 +1056,20 @@ impl std::fmt::Display for CliError {
     #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Usage(hint) | Self::CheckFailed(hint) => f.write_str(hint),
+            Self::Usage(hint) | Self::ProjectRefused(hint) | Self::CheckFailed(hint) => {
+                f.write_str(hint)
+            }
+            Self::DependencyNotCompiled { name, kind } => {
+                f.write_str(&text::msg::dependency_not_compiled(kind, &name.as_str()))
+            }
             Self::UnknownCommand { attempted } => fmt_unknown_command(attempted, f),
             Self::Io { path, source } => fmt_io_error(path, source, f),
             Self::ScratchUnavailable { source } => {
                 f.write_str(&text::cli_scratch_unavailable(&source.kind()))
+            }
+            Self::TestRunnerStale { binary } => f.write_str(&text::cli_test_runner_stale(binary)),
+            Self::TestRunKeyUnavailable { source } => {
+                f.write_str(&text::cli_test_run_key_unavailable(&source.kind()))
             }
             Self::Pipeline { file, src, diag } => {
                 f.write_str(&render(diag, &file.to_string_lossy(), src))
@@ -1057,6 +1106,7 @@ impl std::fmt::Display for CliError {
             }
             Self::Resolve(message) => f.write_str(message),
             Self::LockRefused(refusal) => write!(f, "{refusal}"),
+            Self::IndexEntryRefused(refusal) => write!(f, "{refusal}"),
             Self::HashMismatch {
                 package,
                 expected,
@@ -1671,7 +1721,6 @@ const fn ffi_prep_fault(refusal: &crate::ffi::FfiPrepError) -> crate::screen::Fa
         FfiPrepError::AssertedWithoutCatalog => crate::screen::Fault::Internal,
         FfiPrepError::ModuleClaimed { .. }
         | FfiPrepError::ReservedModuleExists
-        | FfiPrepError::AssertedRefused(_)
         | FfiPrepError::AssertedShimSeal(_)
         | FfiPrepError::DefineOpaqueCollision { .. }
         | FfiPrepError::DependencyMerge(_)

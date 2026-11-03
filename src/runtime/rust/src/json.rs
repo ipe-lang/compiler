@@ -120,8 +120,64 @@ fn union_fields(base: &mut Vec<String>, extra: &[String]) {
 pub fn decode_ok<E, T>(t: T) -> IpeResult<E, T> {
     IpeResult::Ok(t)
 }
-pub fn decode_err_str<E: From<String>, T>(s: String) -> IpeResult<E, T> {
-    IpeResult::Err(str_err(&s))
+pub fn decode_err_str<E: crate::DecodeErrorSink, T>(s: String) -> IpeResult<E, T> {
+    IpeResult::Err(E::from_decode_failure(s))
+}
+
+/// Where a `serde_json::Error` was raised, which decides whether its position
+/// names anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JsonSource {
+    /// Parsed from text (`from_str`, `from_slice`): the line and column point
+    /// into that text.
+    Text,
+    /// Converted from an in-memory value (`from_value`): there is no text, so
+    /// there is no position.
+    Value,
+}
+
+/// The single renderer of a `serde_json::Error` as text: a fixed phrase per
+/// category, plus a position for a text parse, never the input.
+///
+/// `Category::Syntax` and `Category::Eof` carry no input bytes in their
+/// `Display` — a fixed grammar phrase plus a line and column — so a text parse
+/// keeps it verbatim. `Category::Data`'s `Display` quotes the offending value
+/// (a type mismatch names the mistyped field's value, an unknown variant names
+/// the tag), so only the position survives, and a value conversion keeps not
+/// even that. `Category::Io` names no input and gets a fixed phrase.
+pub(crate) fn json_failure_text(error: &serde_json::Error, source: JsonSource) -> String {
+    use serde_json::error::Category;
+    match (error.classify(), source) {
+        (Category::Syntax | Category::Eof, JsonSource::Text) => format!("json parse: {error}"),
+        (Category::Data, JsonSource::Text) => format!(
+            "json parse: invalid value at line {} column {}",
+            error.line(),
+            error.column()
+        ),
+        (Category::Syntax | Category::Eof | Category::Data, JsonSource::Value) => {
+            "json decode: invalid value".to_owned()
+        }
+        (Category::Io, _) => "json read: io failure".to_owned(),
+    }
+}
+
+/// The single source for a json decode failure as an [`IpeError`]: a typed
+/// kind plus [`json_failure_text`]'s text, never the input.
+///
+/// `Category::Io` wraps a host `std::io::Error` raised by the reader a caller
+/// supplied; it is classified through the io table rather than forced to
+/// `Decode`.
+pub(crate) fn json_failure(error: &serde_json::Error) -> IpeError {
+    use serde_json::error::Category;
+    match error.classify() {
+        Category::Syntax | Category::Eof | Category::Data => {
+            IpeError::decode(json_failure_text(error, JsonSource::Text))
+        }
+        Category::Io => {
+            let kind = error.io_error_kind().unwrap_or(std::io::ErrorKind::Other);
+            IoFailure::without_path("json parse", &std::io::Error::from(kind)).into()
+        }
+    }
 }
 
 // --- Encode ---
@@ -175,7 +231,7 @@ pub fn json_enc_canonical(val: &JsonVal) -> String {
 }
 
 // --- Decode primitives ---
-pub fn json_decode_string<E: From<String> + 'static>() -> Decoder<E, String> {
+pub fn json_decode_string<E: crate::DecodeErrorSink + 'static>() -> Decoder<E, String> {
     Decoder::new(
         Box::new(|v| match v {
             JsonVal::String(s) => decode_ok(s.clone()),
@@ -187,19 +243,24 @@ pub fn json_decode_string<E: From<String> + 'static>() -> Decoder<E, String> {
 /// The `i64` an integral float denotes, or `None` when it is fractional or out of range.
 ///
 /// Both bounds are *strict* because f64 cannot distinguish a boundary from its
-/// out-of-range neighbour: `i64::MAX as f64` rounds up to `2^63` and
-/// `i64::MIN-1` rounds down to `i64::MIN as f64`, so `<=`/`>=` would admit an
-/// out-of-range integer and let `f as i64` saturate to the limit — a silent
-/// wrong value. An exact `i64::MIN`/`i64::MAX` arrives as an integer through
-/// `Number::as_i64`; this only admits the open interval. `NaN` and the
-/// infinities fail every comparison and the `fract` test, so they are `None`.
-/// The JSON `Int` decoder and the Db row's float-cell text share it, so a row
-/// cell reads the same through either path.
+/// out-of-range neighbour: `i64::MAX` rounds up to the float `2^63` and
+/// `i64::MIN - 1` rounds to the float `-2^63`, so a closed interval would admit
+/// an out-of-range integer as the limit — a silent wrong value. An exact
+/// `i64::MIN`/`i64::MAX` arrives as an integer through `Number::as_i64`; this
+/// only admits the open interval `(-2^63, 2^63)`. `NaN` and the infinities have
+/// a `NaN` fraction, so they are `None`. The JSON `Int` decoder and the Db
+/// row's float-cell text share it, so a row cell reads the same through either
+/// path.
 pub(crate) fn integral_i64(f: f64) -> Option<i64> {
-    (f.fract() == 0.0 && f > (i64::MIN as f64) && f < (i64::MAX as f64)).then_some(f as i64)
+    if f.fract() != 0.0 {
+        return None;
+    }
+    // `f64_trunc_to_i64` admits `[-2^63, 2^63)`; of an integral float only
+    // `-2^63` itself reads as `i64::MIN`, the ambiguous lower edge.
+    crate::narrow::f64_trunc_to_i64(f).filter(|&i| i != i64::MIN)
 }
 
-pub fn json_decode_int<E: From<String> + 'static>() -> Decoder<E, i64> {
+pub fn json_decode_int<E: crate::DecodeErrorSink + 'static>() -> Decoder<E, i64> {
     Decoder::new(
         // Parse-don't-validate: an integer decoder yields an integer or a typed
         // rejection — never a silently truncated value. A fractional number
@@ -223,7 +284,7 @@ pub fn json_decode_int<E: From<String> + 'static>() -> Decoder<E, i64> {
         vec![],
     )
 }
-pub fn json_decode_float<E: From<String> + 'static>() -> Decoder<E, f64> {
+pub fn json_decode_float<E: crate::DecodeErrorSink + 'static>() -> Decoder<E, f64> {
     Decoder::new(
         Box::new(|v| match v.as_f64() {
             Some(f) => decode_ok(f),
@@ -232,7 +293,7 @@ pub fn json_decode_float<E: From<String> + 'static>() -> Decoder<E, f64> {
         vec![],
     )
 }
-pub fn json_decode_bool<E: From<String> + 'static>() -> Decoder<E, bool> {
+pub fn json_decode_bool<E: crate::DecodeErrorSink + 'static>() -> Decoder<E, bool> {
     Decoder::new(
         Box::new(|v| match v.as_bool() {
             Some(b) => decode_ok(b),
@@ -241,7 +302,7 @@ pub fn json_decode_bool<E: From<String> + 'static>() -> Decoder<E, bool> {
         vec![],
     )
 }
-pub fn json_decode_null<E: From<String> + 'static, A: Default + Send>() -> Decoder<E, A> {
+pub fn json_decode_null<E: crate::DecodeErrorSink + 'static, A: Default + Send>() -> Decoder<E, A> {
     Decoder::new(
         Box::new(|v| match v {
             JsonVal::Null => decode_ok(A::default()),
@@ -252,7 +313,7 @@ pub fn json_decode_null<E: From<String> + 'static, A: Default + Send>() -> Decod
 }
 
 // --- Decode combinators ---
-pub fn decode_field<E: From<String> + 'static, T: 'static + Send>(
+pub fn decode_field<E: crate::DecodeErrorSink + 'static, T: 'static + Send>(
     name: String,
     decoder: Decoder<E, T>,
 ) -> Decoder<E, T> {
@@ -266,10 +327,19 @@ pub fn decode_field<E: From<String> + 'static, T: 'static + Send>(
     )
 }
 
+/// The array position an Ipê `Int` index names in an array of `len` elements.
+///
+/// `None` for a negative index and for one at or past `len`. The index is
+/// narrowed by `usize::try_from`, so on a 32-bit target `2^32` is out of
+/// range rather than wrapped to `0`.
+pub(crate) fn index_of(n: i64, len: usize) -> Option<usize> {
+    usize::try_from(n).ok().filter(|&idx| idx < len)
+}
+
 /// `JsonDec.index : Int -> Decoder a -> Decoder a` — decode the n-th element
 /// of a JSON array. Out-of-bounds or non-array input is `Err`. The path prefix
 /// `"[N]"` is inlined in the error message.
-pub fn decode_index<E: From<String> + 'static, T: 'static + Send>(
+pub fn decode_index<E: crate::DecodeErrorSink + 'static, T: 'static + Send>(
     n: i64,
     decoder: Decoder<E, T>,
 ) -> Decoder<E, T> {
@@ -277,21 +347,16 @@ pub fn decode_index<E: From<String> + 'static, T: 'static + Send>(
     Decoder::new(
         Box::new(move |v| match v.as_array() {
             None => decode_err_str(format!("[{}]: expected array", n)),
-            Some(arr) => {
-                let idx = n as usize;
-                match arr.get(idx) {
-                    None => {
-                        decode_err_str(format!("[{}]: index out of range (len={})", n, arr.len()))
-                    }
-                    Some(elem) => (decoder.run)(elem),
-                }
-            }
+            Some(arr) => match index_of(n, arr.len()).and_then(|idx| arr.get(idx)) {
+                None => decode_err_str(format!("[{}]: index out of range (len={})", n, arr.len())),
+                Some(elem) => (decoder.run)(elem),
+            },
         }),
         inner_fields,
     )
 }
 
-pub fn decode_at<E: From<String> + 'static, T: 'static + Send>(
+pub fn decode_at<E: crate::DecodeErrorSink + 'static, T: 'static + Send>(
     path: Vec<String>,
     decoder: Decoder<E, T>,
 ) -> Decoder<E, T> {
@@ -310,7 +375,7 @@ pub fn decode_at<E: From<String> + 'static, T: 'static + Send>(
         inner_fields,
     )
 }
-pub fn decode_list<E: From<String> + 'static, T: 'static + Send>(
+pub fn decode_list<E: crate::DecodeErrorSink + 'static, T: 'static + Send>(
     decoder: Decoder<E, T>,
 ) -> Decoder<E, Vec<T>> {
     Decoder::new(
@@ -337,7 +402,7 @@ pub fn decode_list<E: From<String> + 'static, T: 'static + Send>(
         vec![],
     )
 }
-pub fn decode_map<E: From<String> + 'static, A: 'static + Send, B: 'static + Send>(
+pub fn decode_map<E: crate::DecodeErrorSink + 'static, A: 'static + Send, B: 'static + Send>(
     f: impl Fn(A) -> B + Send + Sync + 'static,
     decoder: Decoder<E, A>,
 ) -> Decoder<E, B> {
@@ -354,7 +419,7 @@ pub fn decode_map<E: From<String> + 'static, A: 'static + Send, B: 'static + Sen
 // N-ary function. Each runs against `v`; the first Err short-circuits (real
 // error propagated, not collapsed to a generic string). Total, no panic.
 pub fn decode_map2<
-    E: From<String> + 'static,
+    E: crate::DecodeErrorSink + 'static,
     A: 'static + Send,
     B: 'static + Send,
     C: 'static + Send,
@@ -381,7 +446,7 @@ pub fn decode_map2<
     )
 }
 pub fn decode_map3<
-    E: From<String> + 'static,
+    E: crate::DecodeErrorSink + 'static,
     A: 'static + Send,
     B: 'static + Send,
     C: 'static + Send,
@@ -415,7 +480,7 @@ pub fn decode_map3<
     )
 }
 pub fn decode_map4<
-    E: From<String> + 'static,
+    E: crate::DecodeErrorSink + 'static,
     A: 'static + Send,
     B: 'static + Send,
     C: 'static + Send,
@@ -458,7 +523,7 @@ pub fn decode_map4<
 // `map5` — combine 5 decoders over the SAME value with a 5-arg function.
 // Mirrors map2/map3/map4 exactly; first Err short-circuits with the real error.
 pub fn decode_map5<
-    E: From<String> + 'static,
+    E: crate::DecodeErrorSink + 'static,
     A: 'static + Send,
     B: 'static + Send,
     C: 'static + Send,
@@ -511,7 +576,7 @@ pub fn decode_map5<
 // error. Total, no panic.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn decode_map6<
-    E: From<String> + 'static,
+    E: crate::DecodeErrorSink + 'static,
     A: 'static + Send,
     B: 'static + Send,
     C: 'static + Send,
@@ -567,7 +632,7 @@ pub fn decode_map6<
 }
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn decode_map7<
-    E: From<String> + 'static,
+    E: crate::DecodeErrorSink + 'static,
     A: 'static + Send,
     B: 'static + Send,
     C: 'static + Send,
@@ -630,7 +695,7 @@ pub fn decode_map7<
 }
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn decode_map8<
-    E: From<String> + 'static,
+    E: crate::DecodeErrorSink + 'static,
     A: 'static + Send,
     B: 'static + Send,
     C: 'static + Send,
@@ -704,7 +769,7 @@ pub fn decode_map8<
 /// `andMap decB (andMap decA (succeed Ctor))` — the VALUE decoder is the first
 /// arg, the FUNCTION decoder is the second.
 /// Matches Ipê's `Ipe.Db.Decode.ipe` line: `andMap : Decoder a -> Decoder (a -> b) -> Decoder b`.
-pub fn decode_and_map<E: From<String> + 'static, A: 'static + Send, B: 'static + Send>(
+pub fn decode_and_map<E: crate::DecodeErrorSink + 'static, A: 'static + Send, B: 'static + Send>(
     dec_val: Decoder<E, A>,
     dec_fn: Decoder<E, Box<dyn FnOnce(A) -> B + Send>>,
 ) -> Decoder<E, B> {
@@ -726,7 +791,11 @@ pub fn decode_and_map<E: From<String> + 'static, A: 'static + Send, B: 'static +
         fields,
     )
 }
-pub fn decode_and_then<E: From<String> + 'static, A: 'static + Send, B: 'static + Send>(
+pub fn decode_and_then<
+    E: crate::DecodeErrorSink + 'static,
+    A: 'static + Send,
+    B: 'static + Send,
+>(
     decoder: Decoder<E, A>,
     f: impl Fn(A) -> Decoder<E, B> + Send + Sync + 'static,
 ) -> Decoder<E, B> {
@@ -756,16 +825,18 @@ pub fn decode_and_then<E: From<String> + 'static, A: 'static + Send, B: 'static 
 /// Multi-row correctness: each call to `succeed.run` calls `factory()` to get a
 /// fresh `A`; the `FnOnce` chain is consumed exactly once per row by the
 /// enclosing pipeline combinators — correct by construction.
-pub fn decode_succeed<E: From<String> + 'static, A: 'static + Send>(
+pub fn decode_succeed<E: crate::DecodeErrorSink + 'static, A: 'static + Send>(
     factory: Box<dyn Fn() -> A + Send + Sync>,
 ) -> Decoder<E, A> {
     Decoder::new(Box::new(move |_| decode_ok((factory)())), vec![])
 }
-pub fn decode_fail<E: From<String> + 'static, A: 'static + Send>(msg: String) -> Decoder<E, A> {
+pub fn decode_fail<E: crate::DecodeErrorSink + 'static, A: 'static + Send>(
+    msg: String,
+) -> Decoder<E, A> {
     let m = msg;
     Decoder::new(Box::new(move |_| decode_err_str(m.clone())), vec![])
 }
-pub fn decode_one_of<E: From<String> + 'static, T: 'static + Send>(
+pub fn decode_one_of<E: crate::DecodeErrorSink + 'static, T: 'static + Send>(
     decoders: Vec<Decoder<E, T>>,
 ) -> Decoder<E, T> {
     Decoder::new(
@@ -791,7 +862,7 @@ pub fn decode_one_of<E: From<String> + 'static, T: 'static + Send>(
 /// Returns Ipê's `IpeMaybe` so the decoded value matches the `Maybe a` the Ipê
 /// annotation lowers to. Shared by `Json.Decode`, `Config`, and `Db.Decode`
 /// over the unified `Decoder` carrier.
-pub fn decode_nullable<E: From<String> + 'static, T: 'static + Send>(
+pub fn decode_nullable<E: crate::DecodeErrorSink + 'static, T: 'static + Send>(
     decoder: Decoder<E, T>,
 ) -> Decoder<E, IpeMaybe<T>> {
     let inner_fields = decoder.fields.clone();
@@ -812,7 +883,7 @@ pub fn decode_nullable<E: From<String> + 'static, T: 'static + Send>(
 /// is `Err`; the first entry whose value fails to decode short-circuits with
 /// its real error. The one decoder instance is borrowed across entries and
 /// across every document this decoder runs against (like `decode_list`).
-pub fn decode_key_value_pairs<E: From<String> + 'static, T: 'static + Send>(
+pub fn decode_key_value_pairs<E: crate::DecodeErrorSink + 'static, T: 'static + Send>(
     decoder: Decoder<E, T>,
 ) -> Decoder<E, Vec<(String, T)>> {
     Decoder::new(
@@ -833,13 +904,16 @@ pub fn decode_key_value_pairs<E: From<String> + 'static, T: 'static + Send>(
         vec![],
     )
 }
-pub fn decode_from_json_string<E: From<String> + 'static, T>(
+pub fn decode_from_json_string<E: crate::DecodeErrorSink + 'static, T>(
     decoder: Decoder<E, T>,
     json: String,
 ) -> IpeResult<E, T> {
     match serde_json::from_str(&json) {
         Ok(val) => (decoder.run)(&val),
-        Err(e) => decode_err_str(format!("json parse: {}", e)),
+        Err(e) => {
+            let IpeError::Error(_, info) = json_failure(&e);
+            decode_err_str(info.message)
+        }
     }
 }
 
@@ -849,7 +923,7 @@ pub fn decode_from_json_string<E: From<String> + 'static, T>(
 /// re-serialise it (`Json.Encode.encode`) or run a further decoder on it. This
 /// is the same node the encode direction of a codec produces, so no re-parse and
 /// no second decoder are involved.
-pub fn decode_value_identity<E: From<String> + 'static>() -> Decoder<E, JsonVal> {
+pub fn decode_value_identity<E: crate::DecodeErrorSink + 'static>() -> Decoder<E, JsonVal> {
     Decoder::new(Box::new(move |v| decode_ok(v.clone())), vec![])
 }
 
@@ -860,7 +934,7 @@ pub fn decode_value_identity<E: From<String> + 'static>() -> Decoder<E, JsonVal>
 /// the SAME `(decoder.run)(&val)` decode path, given a `Value` already in memory
 /// rather than a string to parse. There is no second decoder and no string
 /// round-trip; a value the decoder rejects is a typed `Err`, never a panic.
-pub fn decode_from_json_value<E: From<String> + 'static, T>(
+pub fn decode_from_json_value<E: crate::DecodeErrorSink + 'static, T>(
     decoder: Decoder<E, T>,
     val: JsonVal,
 ) -> IpeResult<E, T> {
@@ -1420,7 +1494,7 @@ pub fn curry10<
 // decoder is the pipe's left side, threaded as the last arg). Taking
 // next_decoder as a normal parameter — rather than returning a closure over it
 // — matches that shape (35-composite-generics; was a 2-arg curried fn → E0061).
-pub fn decode_pipeline_required<E: From<String> + 'static, T: 'static, F: 'static>(
+pub fn decode_pipeline_required<E: crate::DecodeErrorSink + 'static, T: 'static, F: 'static>(
     name: String,
     decoder: Decoder<E, T>,
     next_decoder: Decoder<E, Box<dyn FnOnce(T) -> F + Send>>,
@@ -1448,7 +1522,7 @@ pub fn decode_pipeline_required<E: From<String> + 'static, T: 'static, F: 'stati
     )
 }
 pub fn decode_pipeline_optional<
-    E: From<String> + 'static,
+    E: crate::DecodeErrorSink + 'static,
     T: Clone + 'static + Send + Sync,
     F: 'static,
 >(
@@ -1490,7 +1564,7 @@ pub fn decode_pipeline_optional<
 /// Like `required` but walks a nested path before decoding. Iterates the
 /// `List String` path by successive `.get(key)` calls, hard-erroring on any
 /// missing segment or non-object node.
-pub fn decode_pipeline_required_at<E: From<String> + 'static, T: 'static, F: 'static>(
+pub fn decode_pipeline_required_at<E: crate::DecodeErrorSink + 'static, T: 'static, F: 'static>(
     path: Vec<String>,
     decoder: Decoder<E, T>,
     next_decoder: Decoder<E, Box<dyn FnOnce(T) -> F + Send>>,
@@ -1533,7 +1607,7 @@ pub fn decode_pipeline_required_at<E: From<String> + 'static, T: 'static, F: 'st
 /// `JsonDec.Pipeline.custom decoder next` — like `required`, but the custom
 /// `decoder` runs on the WHOLE value (not a single field) and supplies the next
 /// pipeline argument. A custom decode failure aborts the pipeline.
-pub fn decode_pipeline_custom<E: From<String> + 'static, T: 'static, F: 'static>(
+pub fn decode_pipeline_custom<E: crate::DecodeErrorSink + 'static, T: 'static, F: 'static>(
     decoder: Decoder<E, T>,
     next_decoder: Decoder<E, Box<dyn FnOnce(T) -> F + Send>>,
 ) -> Decoder<E, F> {
@@ -1561,6 +1635,26 @@ pub fn decode_pipeline_custom<E: From<String> + 'static, T: 'static, F: 'static>
 mod enc_tests {
     use super::*;
 
+    /// Malformed JSON text and a decoder mismatch are both `Decode`.
+    #[test]
+    fn malformed_json_is_decode_kind() {
+        let parsed = decode_from_json_string::<IpeError, _>(json_decode_int(), "{oops".to_owned());
+        assert!(
+            matches!(&parsed, IpeResult::Err(IpeError::Error(crate::IpeErrorKind::Decode, info))
+                if info.message.starts_with("json parse: ")),
+            "{parsed:?}"
+        );
+        let mismatched =
+            decode_from_json_string::<IpeError, _>(json_decode_int(), "\"7\"".to_owned());
+        assert!(
+            matches!(
+                &mismatched,
+                IpeResult::Err(IpeError::Error(crate::IpeErrorKind::Decode, _))
+            ),
+            "{mismatched:?}"
+        );
+    }
+
     #[test]
     fn json_encode_indent_is_clamped() {
         // A pathological attacker-supplied indent must not trigger an unbounded
@@ -1582,6 +1676,69 @@ mod enc_tests {
             "output unexpectedly large ({} bytes)",
             out.len()
         );
+    }
+
+    /// `Category::Data` is a type mismatch whose `Display` quotes the
+    /// offending value — `json_failure` must keep only the position, never
+    /// that value, so a decode failure can never echo input content (e.g. a
+    /// secret) back into a log or diagnostic.
+    #[test]
+    fn json_data_error_does_not_echo_value() {
+        let err = serde_json::from_str::<i64>("\"SENTINEL\"")
+            .expect_err("a JSON string is not a valid i64");
+        assert!(
+            matches!(err.classify(), serde_json::error::Category::Data),
+            "{err:?}"
+        );
+        let IpeError::Error(kind, info) = json_failure(&err);
+        assert!(matches!(kind, crate::IpeErrorKind::Decode), "{kind:?}");
+        assert!(
+            !info.message.contains("SENTINEL"),
+            "decode message echoed the input value: {}",
+            info.message
+        );
+    }
+
+    /// A value conversion has no text to point into, so its failure text is a
+    /// fixed phrase: neither the rejected value nor a meaningless position.
+    #[test]
+    fn json_value_failure_text_is_fixed() {
+        let value = serde_json::Value::String("SENTINEL".to_owned());
+        let err =
+            serde_json::from_value::<i64>(value).expect_err("a JSON string is not a valid i64");
+        assert!(
+            matches!(err.classify(), serde_json::error::Category::Data),
+            "{err:?}"
+        );
+        assert_eq!(
+            json_failure_text(&err, JsonSource::Value),
+            "json decode: invalid value"
+        );
+    }
+
+    /// A `Category::Io` failure wraps a host `std::io::Error` raised by the
+    /// reader a caller supplied; `json_failure` must classify it through the
+    /// shared io table rather than forcing `Decode`.
+    struct FailingReader;
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "simulated io failure",
+            ))
+        }
+    }
+
+    #[test]
+    fn json_io_category_uses_io_table() {
+        let err = serde_json::from_reader::<_, serde_json::Value>(FailingReader)
+            .expect_err("the reader always fails");
+        assert!(
+            matches!(err.classify(), serde_json::error::Category::Io),
+            "{err:?}"
+        );
+        let IpeError::Error(kind, _) = json_failure(&err);
+        assert_eq!(kind, io_error_kind(std::io::ErrorKind::TimedOut));
     }
 }
 
@@ -2243,5 +2400,69 @@ mod writer_parity {
             parsed.map(|v| json_enc_encode(0, v)).ok().as_deref(),
             Some(r#"{"b":1,"a":2}"#)
         );
+    }
+}
+
+// The wasm32 leg of the `index_of` refusals lives in `src/wasm/`, the only
+// test code the wasm32 library test binary admits.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod index_tests {
+    use super::*;
+    use crate::json_val::json_val;
+
+    /// `2^32`: the first index a 32-bit `usize` narrowing wraps back to `0`.
+    const WRAP: i64 = 1 << 32;
+
+    #[test]
+    fn index_of_refuses_negative_and_out_of_range() {
+        assert_eq!(index_of(WRAP, 1), None);
+        assert_eq!(index_of(-WRAP, 1), None);
+        assert_eq!(index_of(WRAP + 1, 2), None);
+        assert_eq!(index_of(-1, 1), None);
+        assert_eq!(index_of(i64::MIN, 1), None);
+        assert_eq!(index_of(1, 1), None);
+        assert_eq!(index_of(0, 0), None);
+        assert_eq!(index_of(0, 1), Some(0));
+        assert_eq!(index_of(2, 3), Some(2));
+    }
+
+    #[test]
+    fn decode_index_past_the_32_bit_width_is_out_of_range() {
+        let arr = json_val!([10, 20]);
+        for n in [WRAP, -WRAP, WRAP + 1, -1, 2] {
+            let got = (decode_index(n, json_decode_int::<String>()).run)(&arr);
+            assert!(
+                matches!(&got, IpeResult::Err(e) if e.contains("index out of range")),
+                "index {n}: {got:?}"
+            );
+        }
+        let got = (decode_index(1, json_decode_int::<String>()).run)(&arr);
+        assert!(matches!(got, IpeResult::Ok(20)), "{got:?}");
+    }
+
+    #[test]
+    fn integral_i64_admits_only_the_open_interval() {
+        let two_63 = 9_223_372_036_854_775_808.0_f64;
+        for f in [
+            -two_63,
+            two_63,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1.5,
+        ] {
+            assert_eq!(integral_i64(f), None, "{f}");
+        }
+        // The next float above `-2^63` and the greatest below `2^63`.
+        assert_eq!(
+            integral_i64(-9_223_372_036_854_774_784.0),
+            Some(-9_223_372_036_854_774_784)
+        );
+        assert_eq!(
+            integral_i64(9_223_372_036_854_774_784.0),
+            Some(9_223_372_036_854_774_784)
+        );
+        assert_eq!(integral_i64(-0.0), Some(0));
+        assert_eq!(integral_i64(-3.0), Some(-3));
     }
 }

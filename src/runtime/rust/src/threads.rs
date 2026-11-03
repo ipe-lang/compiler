@@ -133,13 +133,15 @@ pub enum BlockingFailure {
 }
 
 impl BlockingFailure {
-    /// The failure as the caller's error: a refusal kinded `Unavailable`, a
-    /// panic as the `panicked` message.
+    /// The failure as the caller's error, each cause under its own kind.
+    ///
+    /// A refusal is kinded `Unavailable`; a panic or cancel is the `panicked`
+    /// message kinded `Unexpected`, since it is a defect in runtime work.
     #[must_use]
-    pub fn into_error<E: From<String> + crate::FromUnavailable>(self, panicked: &str) -> E {
+    pub fn into_error<E: crate::FromUnavailable + crate::FromIpeError>(self, panicked: &str) -> E {
         match self {
             Self::Refused(refused) => refused.into_error(),
-            Self::Panicked => E::from(panicked.to_owned()),
+            Self::Panicked => E::from_ipe_error(crate::IpeError::unexpected(panicked.to_owned())),
         }
     }
 }
@@ -191,6 +193,10 @@ mod blocking {
 
     /// Runs `f` on tokio's blocking pool and returns its value.
     ///
+    /// A [`crate::core::RuntimeTrip`] raised in `f` is resumed on the awaiting
+    /// task, so it reaches that task's boundary as its typed error rather than
+    /// ending here as an untyped [`BlockingFailure::Panicked`].
+    ///
     /// # Errors
     ///
     /// No thread could be started for `f`, or `f` panicked.
@@ -202,7 +208,12 @@ mod blocking {
         offload_blocking(role, f)
             .map_err(BlockingFailure::Refused)?
             .await
-            .map_err(|_| BlockingFailure::Panicked)
+            .map_err(|failed| {
+                if let Ok(payload) = failed.try_into_panic() {
+                    drop(crate::core::resume_runtime_trip(payload));
+                }
+                BlockingFailure::Panicked
+            })
     }
 }
 
@@ -227,21 +238,21 @@ where
 
 /// Runs the fallible blocking `f` off the async worker, as the caller's error.
 ///
-/// A refused thread is kinded `Unavailable`; a panic in `f` becomes the
-/// `panicked` message.
+/// `f`'s own failure keeps its kind; a refused thread is kinded
+/// `Unavailable`; a panic in `f` becomes the `panicked` message.
 ///
 /// # Errors
 ///
 /// `f` failed, no thread could be started for it, or it panicked.
 pub async fn run_blocking<T, E, F>(role: &'static str, panicked: &'static str, f: F) -> Result<T, E>
 where
-    F: FnOnce() -> Result<T, String> + Send + 'static,
+    F: FnOnce() -> Result<T, crate::KernelFailure> + Send + 'static,
     T: Send + 'static,
-    E: From<String> + crate::FromUnavailable,
+    E: crate::KernelErrorSink,
 {
     match join_blocking(role, f).await {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(message)) => Err(E::from(message)),
+        Ok(Err(failure)) => Err(failure.into_error()),
         Err(failure) => Err(failure.into_error(panicked)),
     }
 }
@@ -334,6 +345,47 @@ mod tests {
             offload_blocking("ipe-test-no-runtime", || ()),
             Err(refused) if refused.cause() == RefusalCause::NoRuntime
         ));
+    }
+
+    // A trip raised in blocking work is the runtime's typed fault, not a
+    // defect of the offloaded work: it resumes on the awaiting task, so that
+    // task's boundary types it instead of `join_blocking` absorbing it.
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn a_trip_in_blocking_work_resumes_on_the_awaiting_task() {
+        use crate::core::{RuntimeTrip, runtime_trip, trip};
+        let awaiting = tokio::spawn(async {
+            join_blocking("ipe-test-trip", || -> i64 {
+                trip(RuntimeTrip::RecursionLimit)
+            })
+            .await
+        });
+        let joined = awaiting.await;
+        assert!(
+            joined.is_err(),
+            "the trip must leave `join_blocking`: {joined:?}"
+        );
+        let Err(failed) = joined else { return };
+        let payload = failed.try_into_panic();
+        assert!(
+            payload.is_ok(),
+            "the awaiting task must unwind, not be cancelled"
+        );
+        let Ok(payload) = payload else { return };
+        assert_eq!(
+            runtime_trip(payload.as_ref()),
+            Some(RuntimeTrip::RecursionLimit)
+        );
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn a_non_trip_panic_in_blocking_work_is_panicked() {
+        let joined = join_blocking("ipe-test-panic", || -> i64 {
+            std::panic::resume_unwind(Box::new("blocking work failed"))
+        })
+        .await;
+        assert!(matches!(joined, Err(BlockingFailure::Panicked)));
     }
 
     #[cfg(feature = "tokio")]

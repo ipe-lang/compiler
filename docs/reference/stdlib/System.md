@@ -142,7 +142,10 @@ precedence — the process environment wins.  A missing or unreadable
 exit : Int -> a
 ```
 
-Terminate the process with the given exit code.  Polymorphic
-return type so this can be the last expression in any case
-branch (it never returns to the caller).
+End the process with exit status `code`; only `0` reports success.
+`0` through `125` are reported unchanged on every target. Any other
+value (negative, or 126 and above) ends the process with status `1`,
+so a failure code can never be read as success.  Polymorphic return
+type so this can be the last expression in any case branch (it never
+returns to the caller).
 

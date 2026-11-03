@@ -1,18 +1,21 @@
 //! Typed diagnostics for the FFI generator — the `IPE-F####` block.
 //!
 //! Every fallible public function in this crate returns
-//! `Result<T, Diagnostic>`; there is no `Result<_, String>` on any public
-//! surface. Each variant maps to exactly one taxonomy [`Code`] and carries a
-//! closed defect enum, so a caller can match on the failure class without
-//! string inspection.
+//! `Result<T, Diagnostic>`, or [`AssertedRefusal`] for an asserted call (a
+//! refusal that carries the site it refuses); there is no `Result<_, String>`
+//! on any public surface. Each variant maps to exactly one taxonomy [`Code`]
+//! and carries a closed defect enum, so a caller can match on the failure
+//! class without string inspection.
 
 use std::fmt;
 
 use ipe_diagnostics::terminal::TerminalSafe;
 use ipe_diagnostics::{
     Code, Diagnostic as SharedDiag, FfiError, IPE_F4400, IPE_F4401, IPE_F4402, IPE_F4411,
-    IPE_F4412, IPE_F4414, IPE_F4415,
+    IPE_F4412, IPE_F4415,
 };
+
+use crate::asserted::AssertedSite;
 
 /// One FFI-generator diagnostic: the failure class plus enough context to
 /// name the offending binding.
@@ -71,14 +74,6 @@ pub enum Diagnostic {
         /// The rendered OS error.
         detail: String,
     },
-    /// `IPE-F4414` — an author-asserted foreign call (`Rust.Ffi.call`) was
-    /// refused at validation, before any shim was generated.
-    AssertedRefused {
-        /// The asserted Rust path, verbatim.
-        path: String,
-        /// Which rule refused it.
-        defect: AssertedDefect,
-    },
     /// `IPE-F4415` — the inspector's build failed because a required system
     /// library is not installed on the host. Parsed from the inspector's
     /// captured stderr at the `pkg-config`-not-found signature boundary, so the
@@ -103,7 +98,6 @@ impl Diagnostic {
             Self::ShapeContradiction { .. } => IPE_F4402,
             Self::SourceRejected { .. } => IPE_F4411,
             Self::ArtifactIo { .. } => IPE_F4412,
-            Self::AssertedRefused { .. } => IPE_F4414,
             Self::SystemLibraryNotFound { .. } => IPE_F4415,
         }
     }
@@ -144,10 +138,6 @@ impl From<Diagnostic> for FfiError {
                 path: path.into(),
                 detail: detail.into(),
             },
-            Diagnostic::AssertedRefused { path, defect } => Self::AssertedRefused {
-                path: path.into(),
-                detail: defect.to_string().into(),
-            },
             Diagnostic::SystemLibraryNotFound {
                 system_lib,
                 crate_name,
@@ -169,6 +159,61 @@ impl fmt::Display for Diagnostic {
 }
 
 impl std::error::Error for Diagnostic {}
+
+/// `IPE-F4414` — an author-asserted foreign call (`Rust.fn`, `Rust.Ffi.call`,
+/// `Rust.const`) refused at validation or deduplication.
+///
+/// The site is a field, not an option: no asserted refusal exists without the
+/// user file and span of the definition it refuses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssertedRefusal {
+    /// The asserted Rust path, verbatim.
+    pub path: String,
+    /// Which rule refused it.
+    pub defect: AssertedDefect,
+    /// The refused definition.
+    pub site: AssertedSite,
+}
+
+impl From<AssertedRefusal> for FfiError {
+    fn from(r: AssertedRefusal) -> Self {
+        Self::AssertedRefused {
+            span: r.site.span(),
+            path: r.path.into(),
+            detail: r.defect.to_string().into(),
+        }
+    }
+}
+
+impl From<AssertedRefusal> for SharedDiag {
+    fn from(r: AssertedRefusal) -> Self {
+        Self::Ffi {
+            msg: FfiError::from(r),
+        }
+    }
+}
+
+/// Renders without the site's text, which a refusal does not hold: the
+/// location is the site's `file:line`, never a column or snippet computed
+/// from absent text.
+impl fmt::Display for AssertedRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let shared = SharedDiag::Ffi {
+            msg: FfiError::AssertedRefused {
+                span: ipe_diagnostics::Span::DUMMY,
+                path: self.path.as_str().into(),
+                detail: self.defect.to_string().into(),
+            },
+        };
+        f.write_str(&ipe_diagnostics::render(
+            &shared,
+            &self.site.to_string(),
+            "",
+        ))
+    }
+}
+
+impl std::error::Error for AssertedRefusal {}
 
 /// The closed set of asserted-call validation refusals (`IPE-F4414`). Every
 /// rule runs at build preparation, before any shim or interface entry is
@@ -208,7 +253,7 @@ pub enum AssertedDefect {
     /// call (non-pure effect, no return value, or a receiver).
     InspectedShapeUnsupported {
         /// The unsupported aspect.
-        reason: String,
+        reason: InspectedShapeReason,
     },
     /// The target is inspected and the assertion does not match it under the
     /// exact-carrier rule (identity, never a clamp or widening).
@@ -216,11 +261,14 @@ pub enum AssertedDefect {
         /// The exact Rust signature the inspection records.
         expected: String,
     },
-    /// Two definitions assert different signatures for one path.
+    /// Two definitions assert different signatures for one path. The refusal
+    /// sits at the second; the first is named by its site.
     ConflictingAssertions {
         /// The two rendered signatures.
         first: String,
         second: String,
+        /// The definition that asserted `first`.
+        first_site: Box<AssertedSite>,
     },
     /// A `Rust.const` annotation is not a bare scalar type — a native constant
     /// reads a single infallible value (Int, Float, Bool, Char, String, or
@@ -242,6 +290,65 @@ pub enum AssertedDefect {
         /// The exact Rust type the inspection records for the constant.
         expected: String,
     },
+    /// A signature names a type the calling module declares itself.
+    ///
+    /// A local union or alias is never a foreign carrier, even when it shares
+    /// a name with a builtin or with a crate's opaque type.
+    LocalTypeNotACarrier {
+        /// The local type, as written.
+        ty: String,
+        /// Whether the local declaration is a `type alias`.
+        alias: bool,
+    },
+    /// An internal invariant of the asserted-call boundary failed.
+    CompilerBug(AssertedCompilerBug),
+}
+
+/// Why an inspected target cannot carry an asserted call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InspectedShapeReason {
+    /// The effect is not a plain synchronous return.
+    NotPure,
+    /// The target returns no value.
+    NoReturnValue,
+    /// The inspection declares no Rust type for a parameter or the result.
+    UndeclaredRustType,
+}
+
+impl fmt::Display for InspectedShapeReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotPure => f.write_str(
+                "its effect is not a plain synchronous return — the fallible/async \
+                 folding lives on the inspected path",
+            ),
+            Self::NoReturnValue => f.write_str("it returns no value"),
+            Self::UndeclaredRustType => f.write_str(
+                "the inspection declares no Rust type for a parameter or the result, \
+                 so the assertion cannot be checked against it",
+            ),
+        }
+    }
+}
+
+/// The closed set of internal invariants the asserted-call boundary checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssertedCompilerBug {
+    /// An annotation type name is missing from the interner that parsed it.
+    TypeNameNotInterned,
+    /// An annotation type reference has no name segment.
+    EmptyTypeName,
+}
+
+impl fmt::Display for AssertedCompilerBug {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TypeNameNotInterned => {
+                f.write_str("a type name in the annotation is missing from the interner")
+            }
+            Self::EmptyTypeName => f.write_str("a type reference in the annotation has no name"),
+        }
+    }
 }
 
 impl fmt::Display for AssertedDefect {
@@ -287,11 +394,15 @@ impl fmt::Display for AssertedDefect {
                  under the exact-carrier rule (no clamp, no widening) — fix the \
                  assertion or use the inspected import"
             ),
-            Self::ConflictingAssertions { first, second } => write!(
+            Self::ConflictingAssertions {
+                first,
+                second,
+                first_site,
+            } => write!(
                 f,
                 "two definitions assert different signatures for this path \
-                 (`{first}` vs `{second}`) — make them identical or share one \
-                 asserted definition"
+                 (`{first}` at {first_site} vs `{second}` here) — make them \
+                 identical or share one asserted definition"
             ),
             Self::ConstNotScalar { ty } => write!(
                 f,
@@ -310,6 +421,18 @@ impl fmt::Display for AssertedDefect {
                 f,
                 "the asserted type does not match the inspected constant type \
                  `{expected}` under the exact-carrier rule — fix the annotation"
+            ),
+            Self::LocalTypeNotACarrier { ty, alias } => write!(
+                f,
+                "`{ty}` is a {} this module declares, not a foreign carrier — an \
+                 asserted signature names only Int, Float, Bool, Char, String, \
+                 Bytes, or an opaque type the target crate declares",
+                if *alias { "type alias" } else { "type" }
+            ),
+            Self::CompilerBug(bug) => write!(
+                f,
+                "internal compiler error in the asserted-call boundary ({bug}) — \
+                 please report this bug"
             ),
         }
     }
@@ -707,6 +830,18 @@ pub enum WireDefect {
         /// The offending type string.
         got: String,
     },
+    /// A foreign type string longer than [`crate::naming::MAX_TYPE_LEN`] bytes.
+    TypeTooLong {
+        /// The string's length in bytes.
+        len: usize,
+        /// The ceiling it passed.
+        max: usize,
+    },
+    /// A foreign type string nested deeper than [`crate::naming::MAX_TYPE_DEPTH`].
+    TypeTooDeep {
+        /// The ceiling it passed.
+        max: usize,
+    },
     /// An enum-arm pattern that is not a `RustIdent` head with an optional
     /// `(..)` / `{..}` suffix.
     InvalidPattern {
@@ -891,6 +1026,8 @@ impl fmt::Display for UnsanitizedWireDefect<'_> {
                      borrows, tuples, arrays only — no statement tokens)"
                 )
             }
+            WireDefect::TypeTooLong { len, max } => wire_text::type_too_long(f, *len, *max),
+            WireDefect::TypeTooDeep { max } => wire_text::type_too_deep(f, *max),
             WireDefect::InvalidPattern { got } => {
                 write!(
                     f,
@@ -1033,6 +1170,20 @@ mod wire_text {
              renderable `path` dependency (it must be UTF-8, free of control \
              characters, and on a local drive); move the project or the wrapper \
              crate to such a directory"
+        )
+    }
+
+    pub(super) fn type_too_long(f: &mut fmt::Formatter<'_>, len: usize, max: usize) -> fmt::Result {
+        write!(
+            f,
+            "a type string of {len} bytes is past the {max}-byte ceiling on foreign types"
+        )
+    }
+
+    pub(super) fn type_too_deep(f: &mut fmt::Formatter<'_>, max: usize) -> fmt::Result {
+        write!(
+            f,
+            "a type string nests past the depth ceiling of {max} on foreign types"
         )
     }
 

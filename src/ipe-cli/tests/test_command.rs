@@ -310,10 +310,8 @@ fn fixture_project(name: &str, tests_fixture: &str) -> Result<PathBuf, Box<dyn E
 /// An `ipe test` of `project` with no build-directory pin and `cache` as the per-user cache base.
 fn ipe_test_command(project: &Path, cache: &Path) -> Command {
     let mut cmd = Command::new(support::ipe_bin());
-    cmd.arg("test")
-        .arg(project)
-        .env_remove("CARGO_TARGET_DIR")
-        .env("XDG_CACHE_HOME", cache);
+    cmd.arg("test").arg(project).env("XDG_CACHE_HOME", cache);
+    e2e_support::target::clear_target_dir_env(&mut cmd);
     cmd
 }
 
@@ -473,7 +471,6 @@ fn build_metadata_alone_keeps_two_path_dependency_units_apart() -> TestResult {
         crate::support::scratch_root().join(format!("ipe_test_identity_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let target = base.join("target");
-    let cargo = ipe_env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     for tag in ["a", "b"] {
         let root = base.join(format!("root_{tag}"));
         let dep = root.join("dep");
@@ -495,12 +492,10 @@ fn build_metadata_alone_keeps_two_path_dependency_units_apart() -> TestResult {
             root.join("src").join("main.rs"),
             "fn main() { std::process::exit(i32::from(dep::one()) - 1); }\n",
         )?;
-        let out = Command::new(&cargo)
-            .arg("build")
-            .arg("--offline")
-            .current_dir(&root)
-            .env("CARGO_TARGET_DIR", &target)
-            .output()?;
+        let mut cmd = Command::new(e2e_support::target::cargo_program());
+        cmd.arg("build").arg("--offline").current_dir(&root);
+        e2e_support::target::set_target_dir_env(&mut cmd, &target);
+        let out = cmd.output()?;
         assert!(
             out.status.success(),
             "root_{tag} must build, got stderr:\n{}",
@@ -520,8 +515,9 @@ fn build_metadata_alone_keeps_two_path_dependency_units_apart() -> TestResult {
 /// A failing project run after a passing one on the same directory fails.
 ///
 /// The passing run's build records are moved a day ahead first, so every
-/// source the failing run writes reads as older than them; the previous test
-/// runner's units are cleaned under the lock, so its verdict is never reused.
+/// source the failing run writes reads as older than them; each run builds its
+/// runner under its own run key, so the previous runner's verdict is never
+/// reused.
 #[test]
 fn a_failing_run_after_a_passing_one_is_judged_by_its_own_build() -> TestResult {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
@@ -547,6 +543,121 @@ fn a_failing_run_after_a_passing_one_is_judged_by_its_own_build() -> TestResult 
     assert!(
         stdout.contains("failed"),
         "the failing case must be counted, got stdout:\n{stdout}"
+    );
+    Ok(())
+}
+
+/// A project edited to fail after a passing run fails, though no mtime moved forward.
+///
+/// Run 1 passes; its test entry is then rewritten to fail, given back run 1's
+/// modification time, and every build record is moved a day ahead, so nothing
+/// a file system timestamp shows tells run 2 the source changed. Run 2 builds
+/// under a fresh run key, so cargo recompiles the runner and the edit is judged.
+#[test]
+fn an_edit_with_its_mtime_pinned_back_is_judged_by_its_own_build() -> TestResult {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!("skipping: set IPE_E2E=1 to run the pinned-mtime stale-verdict E2E");
+        return Ok(());
+    }
+    let cache = fresh_cache("ipe_test_pinned")?;
+    let project = fixture_project("ipe_test_pinned", "tests_pass.ipe")?;
+    let entry = project.join("tests").join("Main.ipe");
+
+    let (ok, _, stderr) = run_captured(ipe_test_command(&project, &cache))?;
+    assert!(ok, "run 1 must pass, got stderr:\n{stderr}");
+    let pinned = std::fs::metadata(&entry)?.modified()?;
+    std::fs::copy(fixture("tests_fail.ipe"), &entry)?;
+    std::fs::File::options()
+        .write(true)
+        .open(&entry)?
+        .set_modified(pinned)?;
+    age_build_records_forward(&the_scratch_target(&cache)?)?;
+
+    let (ok, stdout, _) = run_captured(ipe_test_command(&project, &cache))?;
+    let _ = std::fs::remove_dir_all(&project);
+    let _ = std::fs::remove_dir_all(&cache);
+    assert!(
+        !ok,
+        "the edited project must exit non-zero, got stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("failed"),
+        "the failing case must be counted, got stdout:\n{stdout}"
+    );
+    Ok(())
+}
+
+/// Whether `haystack` holds `needle` anywhere.
+fn holds(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+/// Cargo recompiles a crate whose `env!` value alone changed.
+///
+/// One crate reading the run-key variable is built twice in one directory under
+/// two values, with every build record moved a day ahead in between, so no
+/// source or timestamp changed. The second binary carries the second value and
+/// not the first: the run key alone forces a fresh test runner.
+#[test]
+fn a_new_run_key_alone_recompiles_the_runner() -> TestResult {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!("skipping: set IPE_E2E=1 to run the run-key env-dep E2E");
+        return Ok(());
+    }
+    let base =
+        crate::support::scratch_root().join(format!("ipe_test_run_key_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let root = base.join("runner");
+    let target = base.join("target");
+    std::fs::create_dir_all(root.join("src"))?;
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"ipe-test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+    )?;
+    std::fs::write(
+        root.join("src").join("main.rs"),
+        format!(
+            "fn main() {{\n    std::hint::black_box(env!({:?}));\n}}\n",
+            ipe_backend_rust::TEST_RUN_KEY_ENV
+        ),
+    )?;
+    let first = "ipe-test-run-key:00000000000000000000000000000001";
+    let second = "ipe-test-run-key:00000000000000000000000000000002";
+    let mut built = Vec::new();
+    for marker in [first, second] {
+        let mut cmd = Command::new(e2e_support::target::cargo_program());
+        cmd.arg("build")
+            .arg("--offline")
+            .current_dir(&root)
+            .env(ipe_backend_rust::TEST_RUN_KEY_ENV, marker);
+        e2e_support::target::set_target_dir_env(&mut cmd, &target);
+        let out = cmd.output()?;
+        assert!(
+            out.status.success(),
+            "the runner must build under {marker}, got stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let binary = target
+            .join("debug")
+            .join(format!("ipe-test{}", std::env::consts::EXE_SUFFIX));
+        built.push(std::fs::read(&binary)?);
+        age_build_records_forward(&target)?;
+    }
+    let _ = std::fs::remove_dir_all(&base);
+    let [run_1, run_2] = built.as_slice() else {
+        return Err("two builds must have run".into());
+    };
+    assert!(holds(run_1, first.as_bytes()), "build 1 must carry its key");
+    assert!(
+        holds(run_2, second.as_bytes()),
+        "build 2 must carry its own key: cargo must recompile on the key alone"
+    );
+    assert!(
+        !holds(run_2, first.as_bytes()),
+        "build 2 must not carry build 1's key"
     );
     Ok(())
 }
@@ -663,12 +774,10 @@ fn a_hand_edited_out_build_never_replaces_the_test_runtime_unit() -> TestResult 
     source.push_str("\n// edited by hand\n");
     std::fs::write(&mod_rs, source)?;
     std::fs::copy(target.join("ipe-test.Cargo.lock"), out.join("Cargo.lock"))?;
-    let cargo = ipe_env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let hand = Command::new(&cargo)
-        .arg("build")
-        .current_dir(&out)
-        .env("CARGO_TARGET_DIR", &target)
-        .output()?;
+    let mut hand_cmd = Command::new(e2e_support::target::cargo_program());
+    hand_cmd.arg("build").current_dir(&out);
+    e2e_support::target::set_target_dir_env(&mut hand_cmd, &target);
+    let hand = hand_cmd.output()?;
     assert!(
         hand.status.success(),
         "the hand-edited out/ must build, got stderr:\n{}",

@@ -64,10 +64,20 @@ fn build_propagates_a_failed_emitted_cargo_build() {
     let fake_cargo = write_failing_cargo(&bin_dir);
     assert!(fake_cargo.is_ok(), "write fake cargo: {fake_cargo:?}");
 
+    // `ipe dev build` emits the fixed package `ipe-app`: an exclusive tree
+    // avoids colliding with a concurrent `ipe dev build`/`ipe dev run` test
+    // over the same package name in the shared target.
+    let isolated =
+        e2e_support::target::isolated(e2e_support::target::IsolationReason::FixedPackageName);
+    let Ok(isolated) = isolated else {
+        panic!("isolated build target: {isolated:?}")
+    };
+    let target = e2e_support::target::BuildTarget::Isolated(isolated);
+
     // PATH holds ONLY the fake-bin dir, so the fake `cargo` is the one resolved
     // and no real cargo can be reached. `sh` is invoked by the fake cargo via
     // its shebang, which the kernel resolves without consulting PATH.
-    let out = std::process::Command::new(ipe_bin)
+    let out = e2e_support::target::ipe_command(ipe_bin.path(), &target)
         .args(["dev", "build", &fixture.path().to_string_lossy(), "--out"])
         .arg(&out_dir)
         .env("PATH", &bin_dir)

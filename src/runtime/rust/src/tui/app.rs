@@ -4,7 +4,9 @@
 //! (so `Sub.every` → Tick works) and `cli_run_cmd` (so `Cmd.perform` works) — but
 //! reads RAW key bytes (raw mode + `decode_key`) instead of stdin lines, and
 //! paints into the alternate screen. A Ipe.Tui app quits by calling `System.exit`
-//! from `update` (the `Quit` Msg) or by stdin EOF.
+//! from `update` (the `Quit` Msg), by stdin EOF, or by the terminal interrupt:
+//! raw mode delivers Ctrl-C as a key, so the key reader ends the app on it with
+//! the terminal restored and exit status 130, before any `onKey` handler sees it.
 //!
 //! No panic vectors: a `TuiGuard` restores the TTY (cooked mode, cursor, main
 //! screen) on Drop — normal exit AND panic unwind — so no path leaves the
@@ -24,7 +26,7 @@ use super::focus::{
     Focusable, InputRegistry, clamp_focus, edit_input, ensure_focus_visible, extract_click_msg,
     extract_input_msg, extract_msg_named, hit_test, parse_mouse,
 };
-use super::key::{TuiKey, decode_key};
+use super::key::{TuiKey, decode_key, wire_key};
 use super::layout::render_with_focus;
 use std::io::{Read, Write};
 
@@ -57,10 +59,13 @@ static TUI_MOUSE: AtomicBool = AtomicBool::new(false);
 /// `Cmd.perform (System.exit n)` quit would leave the TTY in raw mode + the
 /// alternate screen (needing `reset`). Implements `tuiTeardown`. Never panics.
 fn tui_teardown() {
+    // The stdout lock is taken BEFORE the gate flips, so a `paint` on another
+    // thread either finishes its frame first or sees the session ended and
+    // writes nothing: no frame lands on the main screen after the restore.
+    let mut out = std::io::stdout().lock();
     if !TUI_RESTORE_ACTIVE.swap(false, Ordering::SeqCst) {
         return; // already restored, or never entered
     }
-    let mut out = std::io::stdout();
     if TUI_MOUSE.load(Ordering::SeqCst) {
         let _ = out.write_all(MOUSE_OFF.as_bytes());
     }
@@ -86,6 +91,9 @@ enum TuiEnterError {
     /// A residual `enable_raw_mode` failure the probe did not predict; kept
     /// with its raw OS context.
     RawMode(std::io::Error),
+    /// Another terminal driver holds the process exit hook, so a
+    /// `System.exit` could not restore the terminal.
+    ExitHookTaken,
 }
 
 impl TuiEnterError {
@@ -93,6 +101,9 @@ impl TuiEnterError {
         match self {
             Self::NoTerminal(reason) => E::from_unavailable(reason.text().to_owned()),
             Self::RawMode(e) => format!("Tui: enable raw mode: {e}").into(),
+            Self::ExitHookTaken => "Tui: another terminal driver already runs in this process"
+                .to_owned()
+                .into(),
         }
     }
 }
@@ -131,14 +142,19 @@ impl TuiGuard {
         {
             return Err(TuiEnterError::NoTerminal(reason));
         }
+        // Register the teardown before raw mode is entered, so a `System.exit`
+        // quit restores the terminal even though process::exit skips Drop
+        // (idempotent with the Drop path below). A slot another driver holds
+        // refuses the session: raw mode with no exit restore would strand the
+        // terminal.
+        if crate::system::register_exit_hook(tui_teardown).is_err() {
+            return Err(TuiEnterError::ExitHookTaken);
+        }
         if let Err(e) = crossterm::terminal::enable_raw_mode() {
             return Err(classify_raw_mode_error(e));
         }
         TUI_MOUSE.store(mouse, Ordering::SeqCst);
         TUI_RESTORE_ACTIVE.store(true, Ordering::SeqCst);
-        // Register the teardown so a `System.exit` quit restores the terminal even
-        // though process::exit skips Drop. Idempotent with the Drop path below.
-        crate::system::register_exit_hook(tui_teardown);
         let mut out = std::io::stdout();
         let _ = out.write_all(ALT_SCREEN_ON.as_bytes());
         let _ = out.write_all(HIDE_CURSOR.as_bytes());
@@ -157,6 +173,21 @@ impl Drop for TuiGuard {
 }
 
 fn paint(frame: &str) {
+    let mut out = std::io::stdout().lock();
+    paint_to(&mut out, &TUI_RESTORE_ACTIVE, frame);
+}
+
+/// Write one frame to `out`, the stdout lock's holder, only while the session
+/// `active` gate is still set.
+///
+/// A `System.exit` effect runs `tui_teardown` on a worker thread while the loop
+/// may still be painting; the teardown takes the same lock before it clears
+/// the gate, so a frame painted after the restore (clearing the main screen and
+/// drawing on it) has no path.
+fn paint_to<W: Write>(out: &mut W, active: &AtomicBool, frame: &str) {
+    if !active.load(Ordering::SeqCst) {
+        return;
+    }
     // Clear and frame content are concatenated into one buffer so the terminal
     // emulator receives a single write: the prior content disappears and the new
     // frame appears in one step, never leaving a visible blank between them.
@@ -166,7 +197,6 @@ fn paint(frame: &str) {
     let mut buf = String::with_capacity(CLEAR_HOME.len() + frame.len());
     buf.push_str(CLEAR_HOME);
     buf.push_str(frame);
-    let mut out = std::io::stdout();
     let _ = out.write_all(buf.as_bytes());
     let _ = out.flush();
 }
@@ -214,8 +244,8 @@ fn term_size() -> (usize, usize) {
     }
 }
 
-/// Longest key sequence `decode_key` recognises (`ESC [ 1 ; <mod> <final>` = 6
-/// bytes); padded to 8 so any tail at least this long is decoded, never carried.
+/// Longest named-key sequence a terminal sends (`ESC [ 2 4 ; 1 6 ~`, a fully
+/// modified F12 = 8 bytes): any tail at least this long is decoded, never carried.
 const MAX_KEY_SEQ: usize = 8;
 
 /// Bytes a UTF-8 lead byte announces (1 for ASCII / continuation / invalid lead).
@@ -234,35 +264,77 @@ fn utf8_seq_len(lead: u8) -> usize {
 /// multibyte UTF-8 char needs all its continuation bytes. Carrying a tail that is
 /// in fact already complete is harmless — it is decoded on the next read with the
 /// following bytes prepended (one-read latency, never a drop or mis-decode).
+///
+/// A tail holding a byte that cannot continue its sequence — a C0 control after
+/// an ESC, a non-continuation byte after a UTF-8 lead — is already cut there, so
+/// it is never carried: a Ctrl-C at the end of a filled read is decoded now
+/// instead of waiting for a next read that may never come.
 fn tail_maybe_truncated(tail: &[u8]) -> bool {
+    let body = tail.get(1..).unwrap_or(&[]);
     match tail.first() {
-        Some(&0x1b) => tail.len() < MAX_KEY_SEQ,
-        Some(&b) if b >= 0x80 => tail.len() < utf8_seq_len(b),
+        Some(&0x1b) => tail.len() < MAX_KEY_SEQ && !body.iter().any(|b| *b < 0x20),
+        Some(&b) if b >= 0x80 => {
+            tail.len() < utf8_seq_len(b) && body.iter().all(|b| (0x80..=0xbf).contains(b))
+        }
         _ => false,
     }
 }
 
-/// Blocking raw-key reader: decodes stdin bytes into `CliEvent::Key(kind, value)`
+/// Blocking raw-key reader over the process's stdin; see [`read_keys_from`].
+fn read_keys_loop<Msg>(tx: &tokio::sync::mpsc::UnboundedSender<CliEvent<Msg>>) {
+    read_keys_from(std::io::stdin(), tx);
+}
+
+/// Whether the key reader keeps reading after one decoded key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyFlow {
+    Continue,
+    Stop,
+}
+
+/// Queue one decoded key, or end the reader on the terminal interrupt.
+///
+/// The interrupt is the reader's last event: it is never mapped or handed to
+/// `onKey`, and no key read after it is queued.
+fn deliver_key<Msg>(
+    k: TuiKey,
+    budget: &InputBudget,
+    tx: &tokio::sync::mpsc::UnboundedSender<CliEvent<Msg>>,
+) -> KeyFlow {
+    if k.is_interrupt() {
+        let _ = tx.send(CliEvent::Interrupt);
+        return KeyFlow::Stop;
+    }
+    let (kind, value) = wire_key(k);
+    let Some(permit) = budget.acquire(|| tx.is_closed()) else {
+        return KeyFlow::Stop;
+    };
+    if tx.send(CliEvent::Key(kind, value, permit)).is_err() {
+        return KeyFlow::Stop;
+    }
+    KeyFlow::Continue
+}
+
+/// Blocking raw-key reader: decodes `input` bytes into `CliEvent::Key(kind, value)`
 /// events via `decode_key`, then a final `Eof`. Reassembles escape / UTF-8 key
 /// sequences that straddle the fixed 64-byte read boundary by carrying the
 /// unconsumed tail into the next read — a fixed-buffer decode would otherwise
 /// mis-decode or corrupt a split sequence (e.g. a multibyte char inside a paste
-/// larger than 64 bytes). `map_kind` turns the decoded `TuiKey` into the wire
-/// `(kind, value)` pair (`tui_app_ui` folds the ctrl modifier into the kind for
-/// the input editor's word-jumps; `tui_app` passes it through). Runs on its own
+/// larger than 64 bytes). Every decoded key reaches the loop as the one
+/// [`wire_key`] pair, whichever driver runs. Runs on its own
 /// blocking thread so the key handlers stay off it. Each key is queued only with
 /// an [`InputBudget`] permit, so at most [`MAX_QUEUED_INPUT`] keys wait for the
-/// loop; past that the reader blocks until the loop catches up.
-fn read_keys_loop<Msg, FMap>(tx: &tokio::sync::mpsc::UnboundedSender<CliEvent<Msg>>, map_kind: FMap)
+/// loop; past that the reader blocks until the loop catches up. The terminal
+/// interrupt (Ctrl-C) ends the reader with `CliEvent::Interrupt` instead.
+fn read_keys_from<R, Msg>(mut input: R, tx: &tokio::sync::mpsc::UnboundedSender<CliEvent<Msg>>)
 where
-    FMap: Fn(TuiKey) -> (String, String),
+    R: Read,
 {
     let budget = InputBudget::new(MAX_QUEUED_INPUT);
-    let mut stdin = std::io::stdin();
     let mut buf = [0u8; 64];
     let mut carry: Vec<u8> = Vec::new();
     loop {
-        let n = match stdin.read(&mut buf) {
+        let n = match input.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
@@ -283,11 +355,7 @@ where
                 break;
             }
             i += consumed;
-            let (kind, value) = map_kind(k);
-            let Some(permit) = budget.acquire(|| tx.is_closed()) else {
-                return;
-            };
-            if tx.send(CliEvent::Key(kind, value, permit)).is_err() {
+            if deliver_key(k, &budget, tx) == KeyFlow::Stop {
                 return;
             }
         }
@@ -301,11 +369,7 @@ where
             break;
         }
         i += consumed;
-        let (kind, value) = map_kind(k);
-        let Some(permit) = budget.acquire(|| tx.is_closed()) else {
-            return;
-        };
-        if tx.send(CliEvent::Key(kind, value, permit)).is_err() {
+        if deliver_key(k, &budget, tx) == KeyFlow::Stop {
             return;
         }
     }
@@ -453,20 +517,7 @@ where
         // guard restores the terminal.
         let key_tx = tx.clone();
         let started = crate::threads::spawn_named(KEY_READER_THREAD, move || {
-            read_keys_loop(&key_tx, |k| {
-                // Under the debugger, fold a Ctrl modifier on Left/Right into the
-                // kind (`ctrlleft`/`ctrlright`) so the history step keys are
-                // distinguishable on the flat (kind, value) channel.
-                #[cfg(all(feature = "debugger", not(target_arch = "wasm32")))]
-                let kind = if k.ctrl && (k.kind == "left" || k.kind == "right") {
-                    format!("ctrl{}", k.kind)
-                } else {
-                    k.kind
-                };
-                #[cfg(not(all(feature = "debugger", not(target_arch = "wasm32"))))]
-                let kind = k.kind;
-                (kind, k.value)
-            });
+            read_keys_loop(&key_tx);
         });
         if let Err(e) = started {
             return IpeResult::Err(
@@ -539,8 +590,12 @@ where
                     }
                     submgr.key_msgs(&kind, &value)
                 }
+                CliEvent::Interrupt => {
+                    submgr.stop_all();
+                    crate::system::exit_process(crate::system::ProcessStatus::INTERRUPTED)
+                }
                 CliEvent::Msg(m) | CliEvent::PerformDone(m) => vec![m],
-                CliEvent::Line(..) => continue,
+                CliEvent::Line(..) | CliEvent::LineClosed(..) => continue,
                 CliEvent::Eof => break,
             };
             if msgs.is_empty() {
@@ -1031,8 +1086,8 @@ where
     outcome.focusables.unwrap_or(current)
 }
 
-/// `Tui.tea` — terminal TEA driver for a `view : Model -> Cells msg`.
-/// The `Cells msg` value wraps the same structured `Element` tree that `Ipe.Web`
+/// `Tui.tea` — terminal TEA driver for a `view : Model -> Screen msg`.
+/// The `Screen msg` value wraps the same structured `Element` tree that `Ipe.Web`
 /// renders; here it is laid out to ANSI cells by walking the typed attributes
 /// (`tui::layout`), and `Ipe.Ui.Input.*` widgets become focusables. Tab /
 /// Shift-Tab cycle focus; typing edits the focused text input (dispatching its
@@ -1068,17 +1123,7 @@ where
         // A refused key reader ends the app as in `tui_app`.
         let key_tx = tx.clone();
         let started = crate::threads::spawn_named(KEY_READER_THREAD, move || {
-            read_keys_loop(&key_tx, |k| {
-                // The (kind, value) channel is flat, so fold the ctrl modifier on
-                // Left/Right into the kind (`ctrlleft`/`ctrlright`) for the input
-                // editor's word-jumps.
-                let kind = if k.ctrl && (k.kind == "left" || k.kind == "right") {
-                    format!("ctrl{}", k.kind)
-                } else {
-                    k.kind
-                };
-                (kind, k.value)
-            });
+            read_keys_loop(&key_tx);
         });
         if let Err(e) = started {
             return IpeResult::Err(
@@ -1220,7 +1265,11 @@ where
             match ev {
                 CliEvent::Msg(m) | CliEvent::PerformDone(m) => produced = Some(m),
                 CliEvent::Eof => break,
-                CliEvent::Line(..) => continue,
+                CliEvent::Line(..) | CliEvent::LineClosed(..) => continue,
+                CliEvent::Interrupt => {
+                    submgr.stop_all();
+                    crate::system::exit_process(crate::system::ProcessStatus::INTERRUPTED)
+                }
                 // The permit returns to the reader's budget as the key is taken.
                 CliEvent::Key(kind, value, _permit) => {
                     // Debugger key intercept — must come before any app key handling.
@@ -2185,5 +2234,180 @@ mod tui_enter_error_tests {
             classify_raw_mode_error(io_err),
             TuiEnterError::NoTerminal(NoTerminal::NoControllingTerminal)
         ));
+    }
+}
+
+#[cfg(test)]
+mod key_reader_tests {
+    use super::{AtomicBool, CliEvent, decode_key, paint_to, read_keys_from};
+
+    /// The `(kind, value)` events one byte stream yields, in order, with
+    /// `"interrupt"` / `"eof"` standing for the two terminal events.
+    fn read_events(input: &[u8]) -> Vec<(String, String)> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CliEvent<()>>();
+        read_keys_from(input, &tx);
+        drop(tx);
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(match ev {
+                CliEvent::Key(kind, value, _permit) => (kind, value),
+                CliEvent::Interrupt => ("interrupt".to_owned(), String::new()),
+                CliEvent::Eof => ("eof".to_owned(), String::new()),
+                CliEvent::Line(..)
+                | CliEvent::LineClosed(..)
+                | CliEvent::Msg(())
+                | CliEvent::PerformDone(()) => ("other".to_owned(), String::new()),
+            });
+        }
+        events
+    }
+
+    fn ev(kind: &str, value: &str) -> (String, String) {
+        (kind.to_owned(), value.to_owned())
+    }
+
+    // Raw mode delivers Ctrl-C as byte 0x03: it ends the reader with the
+    // interrupt, never reaches `onKey`, and no key typed after it is queued.
+    #[test]
+    fn ctrl_c_ends_the_reader_with_the_interrupt() {
+        assert_eq!(
+            read_events(b"a\x03b"),
+            vec![ev("char", "a"), ev("interrupt", "")]
+        );
+    }
+
+    // The interrupt, not `Eof`, is the last event even when the stream ends
+    // right after it.
+    #[test]
+    fn a_trailing_ctrl_c_is_the_last_event() {
+        assert_eq!(read_events(b"\x03"), vec![ev("interrupt", "")]);
+    }
+
+    // Other control keys stay ordinary keys an app maps itself.
+    #[test]
+    fn other_ctrl_keys_reach_the_app() {
+        assert_eq!(
+            read_events(b"\x04q"),
+            vec![ev("ctrl", "d"), ev("char", "q"), ev("eof", "")]
+        );
+    }
+
+    // Every key reaches the loop as the one `wire_key` pair: Ctrl on Left /
+    // Right folds into the kind, any other modifier is dropped.
+    #[test]
+    fn keys_reach_the_loop_as_the_wire_key_pair() {
+        assert_eq!(
+            read_events(b"\x1b[1;5D\x1b[1;2A"),
+            vec![ev("ctrlleft", ""), ev("up", ""), ev("eof", "")]
+        );
+    }
+
+    // A stream with no interrupt ends in `Eof`.
+    #[test]
+    fn a_stream_without_ctrl_c_ends_in_eof() {
+        assert_eq!(read_events(b"q"), vec![ev("char", "q"), ev("eof", "")]);
+    }
+
+    // A Ctrl-C typed right after an unfinished escape sequence, read in the
+    // same chunk, still ends the reader: the control byte ends the sequence
+    // instead of being swallowed into it.
+    #[test]
+    fn ctrl_c_inside_an_unfinished_escape_sequence_still_interrupts() {
+        for input in [
+            &b"\x1b[\x03"[..],
+            b"\x1b[1;\x03A",
+            b"\x1b[2\x03~",
+            b"\x1b[<0;1\x03",
+            b"\x1bO\x03",
+        ] {
+            let events = read_events(input);
+            assert_eq!(
+                events.last(),
+                Some(&ev("interrupt", "")),
+                "{input:?} -> {events:?}"
+            );
+        }
+    }
+
+    // A frame painted after the session ended writes nothing, so a `System.exit`
+    // teardown on another thread is never followed by a frame on the main screen.
+    #[test]
+    fn a_paint_after_the_session_ends_writes_nothing() {
+        let ended = AtomicBool::new(false);
+        let mut out: Vec<u8> = Vec::new();
+        paint_to(&mut out, &ended, "frame");
+        assert!(out.is_empty(), "{out:?}");
+
+        let active = AtomicBool::new(true);
+        paint_to(&mut out, &active, "frame");
+        assert!(out.ends_with(b"frame"), "{out:?}");
+    }
+
+    /// A reader that hands out `chunks` one read each; a read past them records
+    /// whether the interrupt was already queued, then reports end of input.
+    struct ChunkedThenCheck {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        rx: tokio::sync::mpsc::UnboundedReceiver<CliEvent<()>>,
+        interrupt_queued: bool,
+        read_past_chunks: bool,
+    }
+
+    impl ChunkedThenCheck {
+        fn drain(&mut self) {
+            while let Ok(ev) = self.rx.try_recv() {
+                self.interrupt_queued |= matches!(ev, CliEvent::Interrupt);
+            }
+        }
+    }
+
+    impl std::io::Read for ChunkedThenCheck {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let Some(chunk) = self.chunks.pop_front() else {
+                self.read_past_chunks = true;
+                self.drain();
+                return Ok(0);
+            };
+            Ok(buf
+                .iter_mut()
+                .zip(chunk.iter())
+                .map(|(dst, src)| *dst = *src)
+                .count())
+        }
+    }
+
+    // A Ctrl-C at the end of a completely filled read, right after an
+    // unfinished escape or UTF-8 sequence, is queued from that read: it never
+    // waits in the carried tail for a next read the user may never send.
+    #[test]
+    fn ctrl_c_ending_a_filled_read_is_queued_without_a_next_read() {
+        for tail in [&b"\x1b[\x03"[..], b"\x1b\x03", b"\xe2\x03"] {
+            let mut chunk = vec![b'a'; 64];
+            chunk.truncate(64_usize.saturating_sub(tail.len()));
+            chunk.extend_from_slice(tail);
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<CliEvent<()>>();
+            let mut input = ChunkedThenCheck {
+                chunks: std::iter::once(chunk).collect(),
+                rx,
+                interrupt_queued: false,
+                read_past_chunks: false,
+            };
+            read_keys_from(&mut input, &tx);
+            assert!(
+                !input.read_past_chunks || input.interrupt_queued,
+                "{tail:?}: interrupt held past the filled read"
+            );
+            input.drain();
+            assert!(input.interrupt_queued, "{tail:?}: no interrupt");
+        }
+    }
+
+    #[test]
+    fn only_ctrl_c_is_the_interrupt() {
+        let (ctrl_c, _) = decode_key(b"\x03");
+        let (ctrl_d, _) = decode_key(b"\x04");
+        let (c, _) = decode_key(b"c");
+        assert!(ctrl_c.is_interrupt());
+        assert!(!ctrl_d.is_interrupt());
+        assert!(!c.is_interrupt());
     }
 }

@@ -321,10 +321,6 @@ usage: ipe diff <old-path> <new-path>
 
 ipe health: --yes does not compose with --plain / --json (a data form never mutates)
 
-## fmt-single-path
-
-fmt: expected a single <path> argument
-
 ## fmt-stdin-and-path
 
 fmt: --stdin and a <path> argument are mutually exclusive
@@ -498,6 +494,14 @@ a co-located `wasm32-wasip1` build cannot carry a `client` delivery. `client` is
 ## delivery-client-host-has-no-dev-run
 
 `{delivery}` is an app bundle for `{host}`, and `ipe dev run` has no way to run it. Lay the bundle out with `ipe dev build {delivery}`, or drop `{host}` to run the browser client with `ipe dev run web client`.
+
+## delivery-watch-serves-only
+
+`ipe dev watch` rebuilds and restarts a served program, and `{delivery}` is a browser bundle with no server to restart. Build the bundle with `ipe dev build {delivery}`.
+
+## delivery-client-desktop-has-no-packer
+
+`web client desktop` names a desktop shell around the self-contained client, and no packer builds that shell yet, so nothing is built. Build the browser client with `web client`, or the desktop app with `web desktop`.
 
 ## delivery-wasi-requires-direct-shape
 
@@ -763,6 +767,14 @@ the shared test build directory in the per-user cache
 
 another `ipe test` held the test build lock {path} for longer than {wall}; wait for it to finish, remove {path} if no `ipe test` is running, or set `CARGO_TARGET_DIR` to build elsewhere
 
+## cli-test-runner-stale
+
+the test runner at {binary} is not the one this run built, so it was not run; run `ipe test` again
+
+## cli-test-run-key-unavailable
+
+could not draw this `ipe test` run's key from the system random source: {kind}
+
 ## cli-bundled-manifest
 
 could not prepare the bundled runtime manifest: {detail}
@@ -1024,11 +1036,43 @@ ipe.lock: a `[[package]]` is missing `{field}`
 
 ## lock-unknown-kind
 
-ipe.lock: package `{package}` has an unrecognised `kind` value "{kind}" — re-run `ipe add` to regenerate
+ipe.lock: package `{package}` has an unrecognised `kind` value "{kind}" — {remedy}
 
 ## lock-index-dep-local-rev
 
-ipe.lock: package `{package}` is an index dependency but records a `local` rev — an index dependency is always pinned to a commit; re-run `ipe add`
+ipe.lock: package `{package}` is an index dependency but records a `local` rev — an index dependency is always pinned to a commit; {remedy}
+
+## lock-remedy
+
+restore ipe.lock from version control, or delete it and run `ipe add <package>@<requirement>` for each dependency, with the requirement package.ipe declares for it
+
+## lock-unrecognised-line
+
+ipe.lock line {line}: not a comment, a `[[package]]` header, or a `key = "value"` field — {remedy}
+
+## lock-unknown-key
+
+ipe.lock line {line}: unknown field "{key}" — a `[[package]]` holds only {known}; {remedy}
+
+## lock-key-outside-record
+
+ipe.lock line {line}: field `{key}` comes before any `[[package]]` header — {remedy}
+
+## lock-malformed-value
+
+ipe.lock line {line}: field `{key}` must be one double-quoted value with nothing after it — {remedy}
+
+## lock-duplicate-key
+
+ipe.lock line {line}: field `{key}` appears twice in one `[[package]]` — {remedy}
+
+## lock-duplicate-package
+
+ipe.lock line {line}: package `{package}` is locked twice — {remedy}
+
+## lock-hidden-character
+
+ipe.lock line {line}: character {column} of the comment is U+{code}, a control or invisible character a viewer shows differently from what ipe reads — {remedy}
 
 ## lock-unrecordable-local-source
 
@@ -1152,6 +1196,14 @@ Project modules
 ## site-standard-library
 
 Standard library
+
+## site-port-layers
+
+Low-level port layers
+
+## site-port-layer-banner
+
+Low-level port layer of `{of}`; prefer `{of}`.
 
 ## site-types
 
@@ -1404,7 +1456,32 @@ stdin is not formatted (run `ipe fmt --stdin` to fix)
 
 ## fmt-no-such-path
 
-fmt: no such file or directory: {root}
+fmt: no such file or directory: {root}; nothing was formatted
+
+## fmt-changed-while-formatting
+
+these files changed while `ipe fmt` ran and were left as they are (run `ipe fmt` again):
+{list}
+
+## fmt-held-bytes-limit
+
+fmt: the files to rewrite hold more than {cap} bytes of source and formatted text at `{file}`; nothing was written. Format fewer paths at a time.
+
+## fmt-formatted
+
+formatted {file}
+
+## fmt-walk-too-deep
+
+the paths to format pass the {cap}-level directory depth ceiling at `{dir}`; nothing was formatted
+
+## fmt-walk-too-many-entries
+
+the paths to format hold more than {cap} entries at `{dir}`; nothing was formatted
+
+## fmt-walk-too-many-files
+
+the paths to format hold more than {cap} `.ipe` files at `{dir}`; nothing was formatted
 
 ## fmt-output-too-large
 
@@ -1464,6 +1541,11 @@ watch: cannot bind the blue-green proxy on port {port}: {detail}
 
 package.ipe declares `{delivery}` twice in `ships`. A delivery is shipped once; a repeated entry is a confused manifest, not a request for two copies. Remove the duplicate.
 
+## ships-several
+
+package.ipe declares several deliveries in `ships`, and `ipe {command}` builds one at a time. Name the delivery to build:
+{choices}
+
 ## ships-shape-mismatch
 
 package.ipe declares `{delivery}`, but `main` is a `{shape}` app. The web hosts (desktop, client, client ios, …) carry a self-contained web client; a `{shape}` app ships as a binary. Remove the entry, or change `main` to a `Web.tea` entry.
@@ -1471,6 +1553,70 @@ package.ipe declares `{delivery}`, but `main` is a `{shape}` app. The web hosts 
 ## pkg-add-escape-dependency
 
 package.ipe: `{name}` is already a git/path escape dependency — `ipe add` records only an index requirement and never rewrites an author-written `depGit`/`depGitRev`/`depPath` entry. Edit the escape by hand, or remove it first.
+
+## dependency-not-compiled
+
+package.ipe declares the {kind} dependency `{name}`, but ipe does not compile dependencies yet, so this package cannot build. Copy the library's modules into this package's `src/` and remove `{name}` from `dependencies`.
+
+## duplicate-dependency
+
+dependency `{name}` is declared twice. A package depends on each library once; remove one of the entries.
+
+## dep-path-empty
+
+dependency `{name}` has an empty path. Write the library's directory relative to this package, such as `../{name}`.
+
+## dep-path-too-long
+
+dependency `{name}` has a path longer than {max} bytes. Write a shorter path to the library's directory.
+
+## dep-path-unrecordable
+
+dependency `{name}`: path `{path}` holds a `"` or a character that displays out of order. Rename the directory, or write its path without that character.
+
+## dep-path-remote
+
+dependency `{name}`: path `{path}` names a network share or a device. A dependency path is a directory on this machine, relative to this package.
+
+## dep-path-backslash
+
+dependency `{name}`: path `{path}` contains a backslash. Separate path components with `/` on every platform, such as `../libs/{name}`.
+
+## dep-path-absolute
+
+dependency `{name}`: path `{path}` is absolute. Write it relative to this package, such as `../{name}`.
+
+## dep-path-drive-prefix
+
+dependency `{name}`: path `{path}` starts with a drive. Write it relative to this package, such as `../{name}`.
+
+## dep-path-empty-component
+
+dependency `{name}`: path `{path}` has an empty component (a doubled or trailing `/`). Join components with a single `/`.
+
+## dep-path-dot-component
+
+dependency `{name}`: path `{path}` has a `.` component. Remove it; a path is already relative to this package.
+
+## dep-path-ascent-after-name
+
+dependency `{name}`: path `{path}` has a `..` after a directory name. Write every `..` first, then the directory names, such as `../libs/{name}`.
+
+## dep-path-too-many-ascents
+
+dependency `{name}`: path `{path}` climbs more than {max} directories with `..`. Keep the library closer to this package.
+
+## dep-path-device
+
+dependency `{name}`: path `{path}` has a component Windows reads as a device (`con`, `nul`, `com1`, …). Rename that directory.
+
+## dep-path-not-a-name
+
+dependency `{name}`: path `{path}` has a component that is not a plain directory name (it holds a `:`, is only dots and spaces, or ends in a dot or a space). Rename that directory.
+
+## dep-path-no-name
+
+dependency `{name}`: path `{path}` names no directory after its `..` components. End the path with the library's directory, such as `../{name}`.
 
 ## manifest-entry-empty-segment
 
@@ -1523,6 +1669,54 @@ package.ipe: program entry {entry} names no module. An entry names a module file
 ## manifest-base-path-reserved-byte
 
 `delivery.browser.basePath` {base} holds the byte {byte}. A segment holds only `A-Z a-z 0-9 - . _ ~`, and segments are joined by `/`, e.g. `/my-app`.
+
+## manifest-bundle-id-refused
+
+`delivery.mobile.bundleId` is refused: {reason}; {grammar}
+
+## manifest-bundle-id-grammar
+
+a bundle id is two or more `.`-separated labels, each an ASCII letter then ASCII letters or digits, at most {max} bytes, like `{example}`
+
+## manifest-bundle-id-empty
+
+it is empty
+
+## manifest-bundle-id-too-long
+
+it is {len} bytes, over the {max}-byte ceiling
+
+## manifest-bundle-id-byte
+
+it holds byte {byte}, outside A-Z a-z 0-9 and `.`
+
+## manifest-bundle-id-empty-label
+
+it has an empty label (a leading or trailing `.`, or `..`)
+
+## manifest-bundle-id-label-starts-with-digit
+
+a label starts with a digit
+
+## manifest-bundle-id-one-label
+
+it has a single label
+
+## manifest-bundle-id-reserved-word
+
+the label `{word}` is a Java reserved word, which Android refuses as a package segment
+
+## manifest-bundle-id-java-platform
+
+the first label `{label}` names the Java platform's own packages, where Android refuses an app's classes
+
+## manifest-bundle-id-reserved-app-store
+
+it starts with `{prefix}`, which Apple reserves for its own apps (compared without regard to case); use a reverse-DNS id under a domain you own, like `{example}`
+
+## manifest-bundle-id-reserved-google-play
+
+it starts with `{prefix}`, which Google Play refuses for published apps (compared without regard to case); use a reverse-DNS id under a domain you own, like `{example}`
 
 ## manifest-installable-without-icon
 
@@ -2453,9 +2647,16 @@ released → {path} (single self-jailing binary; run `--capabilities` to audit)
 
 released (bundle) → {path} (run `./ipe-wrapper -- <args>`; WARNING: ipe-app can be run directly, bypassing the sandbox — prefer embed mode for production)
 
+## android-build-steps
+
+1. `gradle wrapper` once with Gradle {gradle} or newer — the project ships no wrapper.
+2. `./gradlew assembleDebug` (Android SDK, API {api}) builds an APK signed with the SDK's debug key, for local install only.
+3. `./gradlew installDebug` installs it onto a running emulator or device.
+4. Store build: add a `signingConfig` for your keystore to `app/build.gradle`, then run `./gradlew assembleRelease`.
+
 ## mobile-android-note
 
-note: an unsigned Android Gradle project is written here. `./gradlew assembleDebug` (with the Android SDK) builds an APK signed with the SDK's debug key, for local install only; a store build needs your own keystore — add a `signingConfig` for it to `app/build.gradle`, then run `./gradlew assembleRelease`.
+note: an unsigned Android Gradle project is written here. To build it:
 
 ## mobile-ios-note
 
@@ -2539,15 +2740,15 @@ package `{pkg}`: `rev` contains an injection-shaped value, got: {raw}
 
 ## index-rev-not-immutable
 
-package `{pkg}`: recorded `rev` is not an immutable commit SHA (expected 40 lowercase hex chars), got: {raw} — re-run `ipe add` to record an immutable pin
+package `{pkg}`: recorded `rev` is not an immutable commit SHA (expected 40 lowercase hex chars), got: {raw} — {remedy}
+
+## index-rev-remedy-sha1
+
+ipe pins only 40-character SHA-1 commits, so the source repository must use SHA-1 object ids
 
 ## index-rev-mixed-case-hex
 
 package `{pkg}`: `rev` is hex-shaped but mixed-case, got: {raw} — a commit SHA is always lowercase; use the lowercase spelling or a distinct ref name
-
-## index-rev-served-mismatch
-
-package `{pkg}`: requested rev `{requested}` does not match the commit git served, `{served}` — a ref of the same name shadowed the full SHA; rename the ref or re-check the requested commit
 
 ## index-sha256-invalid
 
@@ -2597,9 +2798,57 @@ package `{name}`: {detail}
 
 package `{name}`: a `[[version]]` entry is missing `{field}`
 
-## index-capabilities-not-array
+## index-entry-remedy
 
-package `{name}`: `capabilities` must be a `["…", …]` array, got: {raw}
+an index entry holds only what `ipe package publish` writes; report the entry to the registry's maintainers
+
+## index-entry-unrecognised-line
+
+index entry `{entry}` line {line}: not a comment, a `[[version]]` header, or a `key = value` field — {remedy}
+
+## index-entry-unknown-key
+
+index entry `{entry}` line {line}: unknown field "{key}" — an entry holds only {known}; {remedy}
+
+## index-entry-key-needs-header
+
+index entry `{entry}` line {line}: field `{key}` belongs before the first `[[version]]` — {remedy}
+
+## index-entry-key-needs-version
+
+index entry `{entry}` line {line}: field `{key}` belongs inside a `[[version]]` table — {remedy}
+
+## index-entry-malformed-value
+
+index entry `{entry}` line {line}: field `{key}` must be {shape} — {remedy}
+
+## index-entry-shape-quoted
+
+one double-quoted value with no other `"` and nothing after it
+
+## index-entry-shape-list
+
+a `["…", …]` list of distinct double-quoted capability names, or `[]`
+
+## index-entry-shape-signature
+
+one double-quoted bundle free of control and invisible characters
+
+## index-entry-duplicate-key
+
+index entry `{entry}` line {line}: field `{key}` appears twice in one table — {remedy}
+
+## index-entry-duplicate-version
+
+index entry `{entry}` line {line}: version {version} is listed twice — {remedy}
+
+## index-entry-name-mismatch
+
+index entry `{entry}` line {line}: field `name` names another package — {remedy}
+
+## index-entry-hidden-character
+
+index entry `{entry}` line {line}: character {column} of the comment is U+{code}, a control or invisible character a viewer shows differently from what ipe reads — {remedy}
 
 ## publish-rev-unresolved
 
@@ -2671,14 +2920,6 @@ package `{pkg}`: a publisher signature is present but was not trusted — {detai
 ## trust-config-malformed
 
 registry trust config is malformed ({detail})
-
-## resolve-path-dep-missing
-
-package `{name}`: path dependency `{path}` does not exist
-
-## resolve-index-dep-escape
-
-package `{name}`: an index dependency is resolved through `resolve_and_add`, not `resolve_escape`
 
 ## resolve-git-unavailable
 

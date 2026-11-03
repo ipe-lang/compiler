@@ -36,8 +36,9 @@ use crate::io_bounded::{self, SourceRefusal};
 use crate::output_dir::OutputRefusal;
 use crate::output_dir::held::HeldDir;
 use crate::project::{
-    MAX_DISCOVERED_MODULES, MAX_DISCOVERY_DEPTH, MAX_DISCOVERY_ENTRIES, ModulePathShape,
-    ModuleSources, extract_imports_from_source, inject_compiled_std_closure, module_path_shape,
+    CompiledDeps, MAX_DISCOVERED_MODULES, MAX_DISCOVERY_DEPTH, MAX_DISCOVERY_ENTRIES,
+    ModulePathShape, ModuleSources, extract_imports_from_source, inject_compiled_std_closure,
+    module_path_shape,
 };
 use crate::project_root::{EntrySet, ProjectRoot, SourceDir};
 
@@ -192,6 +193,7 @@ pub struct SourceSnapshot {
     tests: BTreeMap<ModulePath, SnapshotModule>,
     ffi: FfiPrep,
     catalog: Catalog,
+    deps: CompiledDeps,
 }
 
 impl SourceSnapshot {
@@ -214,8 +216,11 @@ impl SourceSnapshot {
     /// naming a Windows device; [`CliError::SourceRefused`] for a module file
     /// that is not a regular file or may not be read; [`CliError::Io`] for
     /// text that is not UTF-8 or another failure; every refusal of
-    /// [`ProjectRoot::cache_dir`], [`load_catalog`] and [`prepare`].
+    /// [`ProjectRoot::cache_dir`], [`load_catalog`] and [`prepare`];
+    /// [`CliError::DependencyNotCompiled`], before any walk, when the manifest
+    /// declares a dependency.
     pub fn read(root: &ProjectRoot, limits: Limits) -> Result<Self, CliError> {
+        let deps = root.manifest().compiled_dependencies()?;
         let mut walk = Walk::new(limits);
         walk.tree(root.src(), SourceDir::Src)?;
         if let Some(tests) = root.tests() {
@@ -244,6 +249,7 @@ impl SourceSnapshot {
             tests,
             ffi,
             catalog,
+            deps,
         })
     }
 
@@ -293,6 +299,7 @@ impl SourceSnapshot {
             entry: entry.clone(),
             modules,
             ffi,
+            deps: snapshot.deps.clone(),
         })
     }
 
@@ -354,6 +361,11 @@ impl SourceSnapshot {
     pub const fn catalog(&self) -> &Catalog {
         &self.catalog
     }
+
+    /// The proof the snapshot's manifest dependencies were honored or refused.
+    pub const fn compiled_deps(&self) -> &CompiledDeps {
+        &self.deps
+    }
 }
 
 /// A `tests/` module of one snapshot, named as a test program's entry.
@@ -382,6 +394,7 @@ pub struct TestView {
     entry: ModulePath,
     modules: BTreeMap<ModulePath, SnapshotModule>,
     ffi: FfiPrep,
+    deps: CompiledDeps,
 }
 
 impl TestView {
@@ -407,6 +420,11 @@ impl TestView {
     #[must_use]
     pub const fn ffi(&self) -> &FfiPrep {
         &self.ffi
+    }
+
+    /// The proof the snapshot this view was minted from carries.
+    pub const fn compiled_deps(&self) -> &CompiledDeps {
+        &self.deps
     }
 }
 
@@ -1012,6 +1030,58 @@ mod tests {
         );
     }
 
+    /// Each dependency builder, spelled as a `package.ipe` field, with the kind it declares.
+    const DECLARED_DEPS: [(&str, crate::project::DepKind); 3] = [
+        (
+            "dependencies = [ depPath \"s-lib\" \"../s-lib\" ]",
+            crate::project::DepKind::Path,
+        ),
+        (
+            "dependencies = [ dep \"s-lib\" \"^1.0\" ]",
+            crate::project::DepKind::Index,
+        ),
+        (
+            "dependencies = [ depGit \"s-lib\" \"https://example.invalid/s-lib\" ]",
+            crate::project::DepKind::Git,
+        ),
+    ];
+
+    /// A manifest that declares any dependency refuses the read, naming the
+    /// dependency and its kind, since no dependency is compiled yet.
+    #[test]
+    fn a_declared_dependency_refuses_the_read() {
+        for (field, kind) in DECLARED_DEPS {
+            let scratch = resolve(&SourceTree::main(MAIN).field(field));
+            let result = read(&scratch, Limits::DEFAULT);
+            assert!(
+                matches!(
+                    &result,
+                    Err(CliError::DependencyNotCompiled { name, kind: refused })
+                        if name.as_str() == "s-lib" && *refused == kind
+                ),
+                "{field}: {result:?}"
+            );
+        }
+    }
+
+    /// The dependency refusal comes before the walk: a symbolic link the walk
+    /// would refuse is never reached.
+    #[cfg(unix)]
+    #[test]
+    fn a_declared_dependency_is_refused_before_the_walk() {
+        use crate::output_dir::test_links::plant_link;
+        let [(field, _), ..] = DECLARED_DEPS;
+        let scratch = resolve(&SourceTree::main(MAIN).field(field));
+        let outside = scratch.root().path().join("Outside.ipe");
+        std::fs::write(&outside, module_source("Linked", &[])).expect("write target");
+        plant_link(&outside, &src(&scratch).join("Linked.ipe"));
+        let result = read(&scratch, Limits::DEFAULT);
+        assert!(
+            matches!(&result, Err(CliError::DependencyNotCompiled { .. })),
+            "{result:?}"
+        );
+    }
+
     /// A link that is no module file at all still refuses the read.
     #[cfg(unix)]
     #[test]
@@ -1348,10 +1418,12 @@ mod tests {
         // The control: the same module under `src/` is scanned, and its call
         // into a crate no catalog installs is refused.
         let in_src = resolve(&SourceTree::main(MAIN).module("Shift", &asserted_module("Shift")));
-        assert!(matches!(
-            read(&in_src, Limits::DEFAULT),
-            Err(CliError::FfiPrep(_))
-        ));
+        let refused = read(&in_src, Limits::DEFAULT);
+        assert!(
+            crate::ffi::is_asserted_refusal_at(&refused, "src/Shift.ipe", "tm::shift"),
+            "{:?}",
+            refused.err()
+        );
     }
 
     /// The summed byte ceiling: module text summing to it is read, one byte less refuses.
@@ -1494,10 +1566,12 @@ mod tests {
         let snapshot = read(&scratch, Limits::DEFAULT).expect("the build reads");
         assert!(snapshot.modules().contains_key(&path("Main")));
         assert!(snapshot.ffi().injected.is_empty());
-        assert!(matches!(
-            test_view(&snapshot, "Shift"),
-            Err(CliError::FfiPrep(_))
-        ));
+        let refused = test_view(&snapshot, "Shift");
+        assert!(
+            crate::ffi::is_asserted_refusal_at(&refused, "tests/Shift.ipe", "tm::shift"),
+            "{:?}",
+            refused.err()
+        );
         // The control: a test entry with no asserted call prepares cleanly.
         let clean =
             resolve(&SourceTree::main(MAIN).test_module("Plain", &module_source("Plain", &[])));

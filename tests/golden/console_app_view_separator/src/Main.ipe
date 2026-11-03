@@ -1,9 +1,8 @@
 module Main exposing (main)
 
--- View-separator fixture: `view` deliberately supplies no trailing newline of
--- its own, so consecutive renders glue together on stdout
--- ("lines: 0lines: 1lines: 2") with exactly one trailing newline at exit. An
--- app that wants each render on its own line appends "\n" itself.
+-- View-separator fixture: `view` supplies no trailing newline of its own, and
+-- its first line is bold. Into a pipe each render is plain lines, each ending
+-- in its own newline and carrying no styling ("count\nlines: 0\n...").
 
 import Ipe.Tea.Cli as Cli
 import Ipe.Ui.Cli as Ui
@@ -30,7 +29,10 @@ update msg model =
 
 view : Model -> Lines Msg
 view model =
-    Ui.text ("lines: " ++ String.fromInt model.count)
+    Ui.lines
+        [ Ui.line [ Ui.bold ] "count"
+        , Ui.text ("lines: " ++ String.fromInt model.count)
+        ]
 
 subscriptions : Model -> Sub Msg
 subscriptions _ =

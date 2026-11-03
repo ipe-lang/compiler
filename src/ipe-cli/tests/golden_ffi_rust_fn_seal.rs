@@ -38,14 +38,14 @@ fn seed_ffi_cache(project_root: &Path) -> bool {
         "functions": [
             {
                 "name": "shift",
-                "params": [{"name": "n", "type": "i64"}],
-                "results": [{"name": "", "type": "i64"}],
+                "params": [{"name": "n", "type": "Int", "ipeType": "Int", "rustType": "i64"}],
+                "results": [{"name": "", "type": "Int", "rustType": "i64"}],
                 "effect": "pure"
             },
             {
                 "name": "clamped",
-                "params": [{"name": "n", "type": "u32"}],
-                "results": [{"name": "", "type": "u32"}],
+                "params": [{"name": "n", "type": "Int", "ipeType": "Int", "rustType": "u32"}],
+                "results": [{"name": "", "type": "Int", "rustType": "u32"}],
                 "effect": "pure"
             }
         ],
@@ -374,19 +374,19 @@ pub fn boom(n: i64) -> i64 {
     );
     fs::write(&manifest_path, patched).expect("patched Cargo.toml");
 
-    let cargo = ipe_env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
-    let run = std::process::Command::new(cargo)
-        .arg("run")
-        .arg("--quiet")
-        .current_dir(&out)
-        .output()
-        .expect("cargo run spawns");
-    let stdout = String::from_utf8_lossy(&run.stdout);
-    let stderr = String::from_utf8_lossy(&run.stderr);
+    let ran = e2e_support::build_and_run_rust("ffi_rust_fn", &out);
     assert!(
-        run.status.success(),
+        ran.is_ok(),
+        "{}",
+        ran.as_ref().err().map_or("", String::as_str)
+    );
+    let run = ran.expect("asserted Ok above");
+    let stdout = &run.stdout;
+    assert_eq!(
+        run.exit_code,
+        Some(0),
         "emitted rust-fn crate must build and run exit 0.\n\
-         stdout: {stdout}\nstderr: {stderr}"
+         stdout: {stdout}"
     );
     assert!(
         stdout.contains("panic-err 42"),

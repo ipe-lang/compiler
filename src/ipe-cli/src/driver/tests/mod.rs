@@ -119,19 +119,79 @@ fn vendored_runtime_dir_is_required_only_when_vendoring() {
     // demanding a runtime dir. Requiring the vendored tree here is what made
     // `ipe dev watch` fail to locate the runtime in an installed checkout.
     assert_eq!(
-        resolve_vendored_runtime_dir(None, false).ok(),
+        resolve_vendored_runtime_dir(None, RuntimeEmit::Linked).ok(),
         Some(PathBuf::new()),
     );
     // An explicit `--runtime` is honoured verbatim, vendoring or not — so the
     // vendoring path (e.g. `ipe release eject`) resolves a runtime dir even when the
     // ambient vendored tree is absent.
     assert_eq!(
-        resolve_vendored_runtime_dir(Some("/opt/ipe-runtime".to_owned()), false).ok(),
+        resolve_vendored_runtime_dir(Some("/opt/ipe-runtime".to_owned()), RuntimeEmit::Linked).ok(),
         Some(PathBuf::from("/opt/ipe-runtime")),
     );
     assert_eq!(
-        resolve_vendored_runtime_dir(Some("/opt/ipe-runtime".to_owned()), true).ok(),
+        resolve_vendored_runtime_dir(Some("/opt/ipe-runtime".to_owned()), RuntimeEmit::Vendored)
+            .ok(),
         Some(PathBuf::from("/opt/ipe-runtime")),
+    );
+}
+
+/// The test build resolves its runtime by the same emit model as `ipe dev build`.
+///
+/// Both read the ambient environment, so a dependency-model `dev build` that
+/// links the runtime as a crate never pairs with a test build that demands the
+/// vendored source tree (the split that made `ipe test` refuse to locate a
+/// runtime `ipe dev build` and `ipe health` found).
+#[test]
+fn test_build_resolves_the_runtime_like_dev_build() {
+    let dev_build = BuildOptions {
+        intent: Verb::DEV_BUILD.intent(),
+        ..BuildOptions::from_env()
+    };
+    assert_eq!(
+        test_build_options().runtime_emit(),
+        dev_build.runtime_emit()
+    );
+    assert_eq!(
+        test_build_options().runtime_dep,
+        runtime_dep_from_env(),
+        "the test build takes its runtime model from the environment, as dev build does",
+    );
+}
+
+/// The emit model follows the options' runtime link, never a caller's flag.
+#[test]
+fn runtime_emit_follows_the_runtime_link() {
+    let linked = BuildOptions {
+        runtime_dep: true,
+        ..BuildOptions::default()
+    };
+    assert_eq!(linked.runtime_emit(), RuntimeEmit::Linked);
+    let vendored = BuildOptions {
+        runtime_dep: false,
+        ..BuildOptions::default()
+    };
+    assert_eq!(vendored.runtime_emit(), RuntimeEmit::Vendored);
+    assert_eq!(
+        resolve_vendored_runtime_dir(None, linked.runtime_emit()).ok(),
+        Some(PathBuf::new()),
+        "a linked emit never demands the vendored source tree",
+    );
+}
+
+/// The test stage names a test failure only when a test ran and failed.
+///
+/// A build or runtime refusal before any test ran reads as "tests did not run",
+/// so a missing runtime is never reported as a red test.
+#[test]
+fn test_stage_failure_names_only_a_real_test_failure() {
+    assert_eq!(
+        test_stage_failure(&CliError::TestFailed { code: 1 }),
+        "tests failed",
+    );
+    assert_eq!(
+        test_stage_failure(&CliError::RuntimeNotFound),
+        "tests did not run",
     );
 }
 
@@ -1750,7 +1810,6 @@ fn build_root_test_entry(
     label: &str,
 ) -> Result<String, CliError> {
     use crate::source_snapshot::{Limits, SourceSnapshot};
-    let runtime = resolve_runtime()?;
     let snapshot = SourceSnapshot::read(root, Limits::DEFAULT)?;
     let main = ["Main".to_owned()];
     let Some(entry) = snapshot.test_entry(&main) else {
@@ -1768,7 +1827,6 @@ fn build_root_test_entry(
         &view,
         crate::delivery::HostIntent::Served,
         OutTarget::Scratch(&scratch),
-        &runtime,
     )?;
     let cargo_toml = built.path().join("Cargo.toml");
     fs::read_to_string(&cargo_toml).map_err(|e| io_err(&cargo_toml, e))
@@ -1852,9 +1910,44 @@ fn a_manifest_project_without_src_is_refused_before_any_test_build() {
     fs::remove_dir_all(fixture.path().join("src")).expect("remove src/");
     let refused = project::parse_manifest(&fixture.manifest_path());
     assert!(
-        matches!(&refused, Err(CliError::Usage(m)) if m.to_string().contains("source root")),
+        matches!(&refused, Err(CliError::ProjectRefused(m)) if m.to_string().contains("source root")),
         "a manifest without `src/` must be refused at the read: {refused:?}"
     );
+}
+
+/// A project whose manifest declares one `depPath` dependency on `s-lib`.
+#[allow(clippy::expect_used)] // a failed fixture setup is the test failure
+fn path_dependent_project() -> crate::RootFixture {
+    let tree = SourceTree::main("module Main exposing (main)\n\nmain = 1\n")
+        .field("dependencies = [ depPath \"s-lib\" \"../s-lib\" ]");
+    crate::RootFixture::from_tree(&tree).expect("fixture")
+}
+
+/// Whether `result` is the not-compiled refusal for the `depPath` on `s-lib`.
+fn is_s_lib_path_refusal<T>(result: &Result<T, CliError>) -> bool {
+    matches!(
+        result,
+        Err(CliError::DependencyNotCompiled { name, kind: project::DepKind::Path })
+            if name.as_str() == "s-lib"
+    )
+}
+
+/// The package source set is not assembled for a manifest that declares a
+/// dependency: no compiled dependency stands behind it.
+#[test]
+fn a_package_source_set_is_refused_for_a_declared_dependency() {
+    let fixture = path_dependent_project();
+    let read = PackageSourceSet::read(&fixture.manifest_path());
+    assert!(is_s_lib_path_refusal(&read), "{read:?}");
+}
+
+/// Capability inference refuses a package that declares a dependency rather
+/// than judge a surface without it.
+#[test]
+fn capability_inference_is_refused_for_a_declared_dependency() {
+    let fixture = path_dependent_project();
+    let inferred = infer_package_capabilities(&fixture.manifest_path());
+    assert!(is_s_lib_path_refusal(&inferred), "{inferred:?}");
 }
 
 /// The test runner over the project `arg` names from `cwd`, its binary's summary kept quiet.
@@ -1945,7 +2038,10 @@ fn a_test_calling_an_uninstalled_crate_refuses_the_run_not_the_build() {
     let tree = SourceTree::main(RUNNABLE_MAIN).test_module("Main", asserted);
     let fixture = crate::RootFixture::from_tree(&tree).expect("fixture");
     let run = test_run_in(fixture.path(), None);
-    assert!(matches!(run, Err(CliError::FfiPrep(_))), "{run:?}");
+    assert!(
+        crate::ffi::is_asserted_refusal_at(&run, "tests/Main.ipe", "tm::shift"),
+        "{run:?}"
+    );
 
     let runtime = resolve_runtime().expect("the in-repo runtime resolves");
     let out = session_scratch("test_run_ffi_build_out").join("out");
@@ -2222,6 +2318,7 @@ fn on_disk_cache_hit_serves_a_tampered_entry_verbatim() {
     let (result_a, outcome_a) = compile_modules_observed(
         sources.clone(),
         discovered.clone(),
+        crate::project::CompiledDeps::none(),
         &entry_path,
         &emit_target(&out_a),
         &runtime,
@@ -2256,6 +2353,7 @@ fn on_disk_cache_hit_serves_a_tampered_entry_verbatim() {
     let (result_b, outcome_b) = compile_modules_observed(
         sources,
         discovered,
+        crate::project::CompiledDeps::none(),
         &entry_path,
         &emit_target(&out_b),
         &runtime,
@@ -2322,6 +2420,7 @@ fn cold_build_with_the_cache_inside_a_fresh_output_dir_claims_it() {
         compile_modules_observed(
             sources.clone(),
             discovered.clone(),
+            crate::project::CompiledDeps::none(),
             &entry_path,
             &emit_target(&out),
             &runtime,
@@ -2420,6 +2519,7 @@ fn build_through_planted_cache_link(tag: &str, planted: PlantedCacheLink) {
         compile_modules_observed(
             sources.clone(),
             discovered.clone(),
+            crate::project::CompiledDeps::none(),
             &entry_path,
             &emit_target(&out),
             &runtime,
@@ -2585,6 +2685,7 @@ fn ir_cache_hit_reuses_lowered_program_across_a_db_driver_only_edit() {
     let (result_a, outcome_a) = compile_modules_observed(
         sources.clone(),
         discovered.clone(),
+        crate::project::CompiledDeps::none(),
         &entry_path,
         &emit_target(&out_a),
         &runtime,
@@ -2615,6 +2716,7 @@ fn ir_cache_hit_reuses_lowered_program_across_a_db_driver_only_edit() {
     let (result_b, outcome_b) = compile_modules_observed(
         sources,
         discovered,
+        crate::project::CompiledDeps::none(),
         &entry_path,
         &emit_target(&out_b),
         &runtime,
@@ -2668,6 +2770,7 @@ fn on_disk_ir_cache_hit_serves_a_tampered_entry_verbatim() {
     let (result_a, outcome_a) = compile_modules_observed(
         sources.clone(),
         discovered.clone(),
+        crate::project::CompiledDeps::none(),
         &entry_path,
         &emit_target(&out_a),
         &runtime,
@@ -2704,6 +2807,7 @@ fn on_disk_ir_cache_hit_serves_a_tampered_entry_verbatim() {
     let (result_b, outcome_b) = compile_modules_observed(
         sources,
         discovered,
+        crate::project::CompiledDeps::none(),
         &entry_path,
         &emit_target(&out_b),
         &runtime,
@@ -2785,6 +2889,7 @@ fn production_ir_cache_hit_blames_the_in_memory_entry_source() {
     let (dev, dev_outcome) = compile_modules_observed(
         sources.clone(),
         discovered.clone(),
+        crate::project::CompiledDeps::none(),
         &entry_path,
         &emit_target(&tmp.join("out-dev")),
         &runtime,
@@ -2799,6 +2904,7 @@ fn production_ir_cache_hit_blames_the_in_memory_entry_source() {
     let (release, release_outcome) = compile_modules_observed(
         sources,
         discovered,
+        crate::project::CompiledDeps::none(),
         &entry_path,
         &emit_target(&tmp.join("out-release")),
         &runtime,
@@ -2864,6 +2970,7 @@ fn cache_dir_none_disables_caching_entirely() {
     let (result, outcome) = compile_modules_observed(
         sources,
         discovered,
+        crate::project::CompiledDeps::none(),
         &entry_path,
         &emit_target(&out_dir),
         &runtime,
@@ -3204,8 +3311,9 @@ fn version_flags_alias_the_version_command() {
     assert!(run_cli(&["--version".to_owned(), "--json".to_owned()]).is_ok());
 }
 
-/// A clean `Main` entry.
-const CLEAN_MAIN: &str = "module Main exposing (main)\n\n\nmain : Int\nmain =\n    1\n";
+/// A clean `Main` entry: well-typed, and its `main` a runnable entry the build accepts.
+const CLEAN_MAIN: &str =
+    "module Main exposing (main)\n\nimport Ipe.Io as Io\n\n\nmain =\n    Io.println \"clean\"\n";
 
 /// A module `module` whose one value `x` is ill-typed.
 fn ill_typed(module: &str) -> String {
@@ -3389,10 +3497,13 @@ fn type_check_of_a_directory_checks_that_project() {
 fn a_tests_module_importing_a_src_module_type_checks_green() {
     let project = analysis_project(
         &SourceTree::main(CLEAN_MAIN)
-            .module("Support", "module Support exposing (value)\nvalue = 42\n")
+            .module(
+                "Support",
+                "module Support exposing (greeting)\ngreeting = \"hi\"\n",
+            )
             .test_module(
                 "Main",
-                "module Main exposing (main)\nimport Support\nmain = Support.value\n",
+                "module Main exposing (main)\nimport Ipe.Io as Io\nimport Support\nmain = Io.println Support.greeting\n",
             ),
     );
     let checked = typecheck_in(project.root().path(), Some("tests/Main.ipe"));
@@ -3489,7 +3600,7 @@ fn nested_entry_project(main_body: &str) -> ScratchRoot {
             .field("programs = [ { name = \"app\", entry = \"App/Main.ipe\" } ]")
             .module(
                 "Shared.Util",
-                "module Shared.Util exposing (one)\none = 1\n",
+                "module Shared.Util exposing (one, greeting)\none = 1\ngreeting = \"hi\"\n",
             )
             .module("App.Main", main_body),
     )
@@ -3499,7 +3610,7 @@ fn nested_entry_project(main_body: &str) -> ScratchRoot {
 #[test]
 fn type_check_of_a_nested_entry_resolves_src_rooted_imports() {
     let project = nested_entry_project(
-        "module App.Main exposing (main)\nimport Shared.Util as Util\nmain = Util.one\n",
+        "module App.Main exposing (main)\nimport Ipe.Io as Io\nimport Shared.Util as Util\nmain = Io.println Util.greeting\n",
     );
     let checked = typecheck_in(project.root().path(), None);
     assert!(checked.is_ok(), "{checked:?}");
@@ -3560,7 +3671,7 @@ fn build_refuses_a_pure_library_with_a_clean_message() {
         &BuildOptions::from_env(),
     );
     assert!(
-        matches!(&result, Err(CliError::Usage(msg)) if msg.contains("library package")),
+        matches!(&result, Err(CliError::ProjectRefused(msg)) if msg.contains("library package")),
         "a pure library must be refused with a clean library message: {result:?}"
     );
     assert!(!out.exists(), "the refusal fires before any emit");
@@ -5725,6 +5836,7 @@ fn compile_debug_log_as(verb: Verb, label: &str) -> Result<crate::driver::Emitte
     let (result, _) = compile_modules_observed(
         sources,
         discovered,
+        crate::project::CompiledDeps::none(),
         &entry_path,
         &emit_target(&tmp.join("out")),
         &runtime,
@@ -5807,35 +5919,74 @@ const DEBUG_DESKTOP_PACKAGE: &str = "module Package exposing (package)\n\nimport
 /// The `main` of [`DEBUG_DESKTOP_PACKAGE`].
 const DEBUG_DESKTOP_MAIN: &str = "module Main exposing (main)\n\nimport Ipe.Tea.Web as Web\nimport Ipe.Tea.Web.Cmd as Cmd\nimport Ipe.Tea.Web.Sub as Sub\nimport Ipe.Debug as Debug\nimport Ipe.String as String\nimport Ipe.Ui as Ui\n\n\ntype alias Model =\n    { count : Int }\n\n\ntype Msg\n    = Increment\n    | NoOp\n\n\ninit : WebReq -> ( Model, Cmd.Cmd Msg )\ninit _req =\n    ( { count = 0 }, Cmd.none )\n\n\nupdate : Msg -> Model -> ( Model, Cmd.Cmd Msg )\nupdate msg model =\n    case msg of\n        Increment ->\n            ( { model | count = Debug.log \"count\" (model.count + 1) }, Cmd.none )\n\n        NoOp ->\n            ( model, Cmd.none )\n\n\nsubscriptions : Model -> Sub.Sub Msg\nsubscriptions _model =\n    Sub.none\n\n\nview : Model -> Element Msg\nview model =\n    Ui.column []\n        [ Ui.button [] { onPress = Just Increment, label = Ui.text \"+\" }\n        , Ui.text (String.fromInt model.count)\n        ]\n\n\nmain =\n    Web.tea\n        { init = init\n        , update = update\n        , view = view\n        , subscriptions = subscriptions\n        , routes = []\n        , notFound = NoOp\n        }\n";
 
-/// Bundle the Debug-using desktop app finished in `finish`.
-fn bundle_debug_desktop(finish: NativeFinish<'_>, label: &str) -> Result<(), CliError> {
+/// Bundle the Debug-using desktop app: a release bundle behind `consented`,
+/// written under its own release member root, else a dev bundle.
+///
+/// Also answers whether the bundle left a `release/` directory under the
+/// default output root.
+fn bundle_debug_desktop(
+    consented: Option<&ConsentedCapabilities>,
+    label: &str,
+) -> (Result<(), CliError>, bool) {
     let (tmp, _) = debug_project(label, DEBUG_DESKTOP_PACKAGE, DEBUG_DESKTOP_MAIN);
-    let result = held_build(&tmp, false)
-        .and_then(|held| bundle_delivery(BundleHost::Desktop, finish, &held));
+    let result = held_build(&tmp, false).and_then(|held| {
+        let finish = match consented {
+            None => BundleFinish::Dev {
+                output: crate::output_dir::OutputRoot::resolve(
+                    None,
+                    &crate::output_dir::ProjectPaths::from_manifest(held.root().manifest()),
+                )?,
+            },
+            Some(consented) => {
+                let desktop = crate::delivery::Delivery::resolve(
+                    crate::delivery::Shape::Web,
+                    None,
+                    crate::delivery::Host::Desktop,
+                )
+                .map_err(|e| CliError::Usage(crate::text::msg::command_refusal(&"release", &e)))?;
+                let slug = crate::delivery_set::PlannedDelivery::release(desktop, None)
+                    .map_err(|e| {
+                        CliError::Usage(crate::text::msg::command_refusal(&"release", &e))
+                    })?
+                    .slug()?;
+                let member = crate::output_dir::OutputRoot::resolve(
+                    None,
+                    &crate::output_dir::ProjectPaths::from_manifest(held.root().manifest()),
+                )?
+                .release_member(&slug);
+                BundleFinish::Release {
+                    consented,
+                    driver: ipe_backend_rust::DbDriver::Sqlite,
+                    member,
+                }
+            }
+        };
+        bundle_delivery(BundleHost::Desktop, finish, &held)
+    });
+    let left_release = tmp.join("out").join("release").exists();
     let _ = fs::remove_dir_all(&tmp);
-    result
+    (result, left_release)
 }
 
-/// A release desktop bundle refuses `Debug.*`.
+/// A release desktop bundle refuses `Debug.*`, and leaves no member behind.
 ///
 /// The bundle compiles under the release posture, so IPE-L0140 fires before
-/// any cargo build.
+/// any cargo build — and before the member root is claimed, so a refused
+/// release creates no `release/<slug>/`.
 #[test]
 fn release_desktop_bundle_gates_debug() {
     let consented = ConsentedCapabilities::admitted(crate::run_sandbox::ResolvedCapabilities {
         inferred: std::collections::BTreeSet::new(),
         declared: std::collections::BTreeSet::new(),
     });
-    let result = bundle_debug_desktop(
-        NativeFinish::Release {
-            consented: &consented,
-            driver: ipe_backend_rust::DbDriver::Sqlite,
-        },
-        "release-desktop-debug",
-    );
+    let (result, left_release) = bundle_debug_desktop(Some(&consented), "release-desktop-debug");
     assert!(
         is_debug_gate(&result),
         "a release desktop bundle refuses Debug.log with IPE-L0140: {result:?}"
+    );
+    assert!(
+        !left_release,
+        "a release refused at emit leaves no release member directory"
     );
 }
 
@@ -5850,20 +6001,21 @@ fn dev_desktop_bundle_admits_debug() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let result = bundle_debug_desktop(NativeFinish::Dev, "dev-desktop-debug");
+    let (result, _) = bundle_debug_desktop(None, "dev-desktop-debug");
     assert!(
         !matches!(&result, Err(CliError::Pipeline { .. } | CliError::Usage(_))),
         "a dev desktop bundle compiles a Debug.log app past every gate: {result:?}"
     );
 }
 
-/// Every `release build` row of the derivation yields an artifact or a typed refusal.
+/// Every `release build` row of the derivation yields a static triple, none,
+/// or a typed refusal.
 ///
 /// A release takes no wasm target from either source, builds no WASI module,
-/// derives the browser bundle from `web client` alone, and refuses a `wasm`
-/// block on a delivery with no client form.
+/// derives the browser bundle (no static triple) from `web client` alone, and
+/// refuses a `wasm` block on a delivery with no client form.
 #[test]
-fn release_artifact_table() {
+fn release_static_triple_table() {
     use crate::delivery::{DeliveryError, Runtime, TargetSource, TargetTriple};
     use cli_args::StaticTriple;
     let client = web_delivery(Some(Runtime::Client));
@@ -5909,8 +6061,8 @@ fn release_artifact_table() {
                 DeliveryError::WasmTargetRequiresClient,
             )),
         ),
-        (client, None, None, false, Ok(ReleaseArtifact::Browser)),
-        (client, None, None, true, Ok(ReleaseArtifact::Browser)),
+        (client, None, None, false, Ok(None)),
+        (client, None, None, true, Ok(None)),
         (
             served,
             None,
@@ -5925,41 +6077,28 @@ fn release_artifact_table() {
             false,
             Err(TargetRefusal::NoWasi),
         ),
-        (
-            served,
-            None,
-            None,
-            false,
-            Ok(ReleaseArtifact::Native(StaticTriple::default())),
-        ),
-        (
-            served,
-            Some(arm),
-            None,
-            false,
-            Ok(ReleaseArtifact::Native(arm)),
-        ),
+        (served, None, None, false, Ok(None)),
+        (served, Some(arm), None, false, Ok(Some(arm))),
         (
             script,
             None,
             Some(TargetTriple::Native(arm)),
             false,
-            Ok(ReleaseArtifact::Native(arm)),
+            Ok(Some(arm)),
         ),
     ];
     for (delivery, flag, env, wasm_block, expected) in rows {
         assert_eq!(
-            release_artifact(delivery, flag, env, wasm_block),
+            release_static_triple(delivery, flag, env, wasm_block),
             expected,
-            "release artifact for {delivery:?} flag={flag:?} env={env:?} wasm_block={wasm_block}"
+            "release static triple for {delivery:?} flag={flag:?} env={env:?} wasm_block={wasm_block}"
         );
     }
 }
 
-/// A release refuses a browser target named by the flag, and each artifact
-/// compiles for its own engine.
+/// A release refuses a browser target named by the flag.
 #[test]
-fn release_flag_wasm_refused_and_artifact_engines() {
+fn release_flag_wasm_refused() {
     use crate::delivery::{DeliveryError, Runtime, TargetSource, TargetTriple};
     for delivery in [web_delivery(None), web_delivery(Some(Runtime::Client))] {
         assert_eq!(
@@ -5976,14 +6115,6 @@ fn release_flag_wasm_refused_and_artifact_engines() {
             "a release of {delivery:?} refuses `--target wasm` naming the flag"
         );
     }
-    assert_eq!(
-        ReleaseArtifact::Browser.compile_target(),
-        CompileTarget::WasmClient
-    );
-    assert_eq!(
-        ReleaseArtifact::Native(cli_args::StaticTriple::Aarch64LinuxMusl).compile_target(),
-        CompileTarget::Native
-    );
 }
 
 /// A target handed to an app-bundle delivery is refused before any bundle.
@@ -6378,6 +6509,7 @@ fn vendored_debugger_build_is_refused_before_compiling() {
         let (result, outcome) = compile_modules_observed(
             sources.clone(),
             discovered.clone(),
+            crate::project::CompiledDeps::none(),
             &entry_path,
             &emit_target(&out),
             Path::new("<no-runtime>"),

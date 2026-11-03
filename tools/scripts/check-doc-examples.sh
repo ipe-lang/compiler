@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # Doc-test gate for Ipê doc-string examples (component F).
 #
-# Extracts every fenced ` ```ipe ` block from every `{-| … -}` doc-string in
-# the standard library and type-checks each one via `ipe doc --check-examples`.
+# Judges every code block the standard library's doc pages serve, from
+# `{-| … -}` and `-- |` doc comments alike, via `ipe doc --check-examples`.
 #
 # FENCE MARKERS
 # ─────────────
-# Blocks are extracted by the compiler itself (the `DocString` AST node from the
-# parse component). A block with `-->` annotations on expression lines is also
-# used for result-assertion in the E2E tier (when IPE_E2E=1).
+# Blocks are read by the same fence scan the doc renderer uses. A block with
+# `-->` annotations on expression lines is also used for result-assertion in
+# the E2E tier (when IPE_E2E=1).
 #
 # EXIT
-#   0 — all example blocks type-check
-#   1 — at least one block failed
+#   0 — every block agrees with src/ipe-cli/src/doc_examples_rot.txt
+#   1 — a block disagrees with the ledger
 #   2 — setup error (missing ipe binary)
 #
 set -euo pipefail

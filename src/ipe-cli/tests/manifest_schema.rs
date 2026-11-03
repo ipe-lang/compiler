@@ -8,6 +8,13 @@ use std::path::PathBuf;
 use ipe::project::{IpeDep, parse_manifest};
 use ipe_ir::Capability;
 
+/// The fixture's `depPath "local" "../local"` entry.
+#[allow(clippy::expect_used)] // a fixed, grammatical test path
+fn local_path_dep() -> IpeDep {
+    let name = ipe::package_name::PackageName::parse("local").expect("a valid name");
+    IpeDep::Path(ipe::dep_path::DepPath::parse(&name, "../local").expect("a valid dep path"))
+}
+
 /// The bundled multi-section manifest fixture.
 fn fixture_manifest() -> PathBuf {
     e2e_support::manifest_dir!().join("tests/fixtures/sp2_manifest/package.ipe")
@@ -20,13 +27,13 @@ fn full_manifest_round_trips_every_section() {
     assert_eq!(m.name, "sp2-manifest-fixture");
 
     // [dependencies]: an index dep, a git escape, and a path escape.
-    let http = m.dependencies.get("http");
+    let http = m.declared().get("http");
     assert!(
         matches!(http, Some(IpeDep::Index(req)) if req.matches(&semver::Version::new(1, 4, 0))),
         "http should be an Index dep admitting 1.4, got {http:?}"
     );
     assert_eq!(
-        m.dependencies.get("mylib"),
+        m.declared().get("mylib"),
         Some(&IpeDep::Git {
             url: "https://example.com/mylib.git".to_owned(),
             rev: Some("abc123".to_owned()),
@@ -34,8 +41,8 @@ fn full_manifest_round_trips_every_section() {
         "mylib should be the git escape",
     );
     assert_eq!(
-        m.dependencies.get("local"),
-        Some(&IpeDep::Path(PathBuf::from("../local"))),
+        m.declared().get("local"),
+        Some(&local_path_dep()),
         "local should be the path escape",
     );
 

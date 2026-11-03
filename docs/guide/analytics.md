@@ -28,7 +28,7 @@ Three knots.
 ## A worked example: redaction and the consent gate
 
 The example under
-[`examples/shapes/script/analytics-consent`](../../examples/shapes/script/analytics-consent/src/Main.ipe)
+[`examples/shapes/script/analytics-consent`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/analytics-consent/src/Main.ipe)
 serialises a few prop values and fires one event in each consent state.
 
 The config is a value you build and thread — `defaultConfig` starts fail-closed,
@@ -79,7 +79,7 @@ because no path from the sealed value back to its plaintext exists on the
 surface. And encoding money as an exact decimal string is [correctness][principles]:
 an amount that a `Float` would round is carried losslessly.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

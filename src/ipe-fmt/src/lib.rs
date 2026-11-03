@@ -8,16 +8,25 @@
 //! formatting takes [`format_with_segments`], splices the declarations it
 //! wants, and proves the result with [`verify_rewrite`], the same guards.
 //!
+//! A comment takes one of two placements. An end-of-line comment after a
+//! token that can end a node ([`ends_node`]) is kept at the end of that
+//! token's output line; every other comment leads the code below it. When a
+//! layout keeps the next code on the kept comment's line (after a pattern, a
+//! parameter, a type argument, or a module or import name), the comment is
+//! demoted: it prints where that layout puts leading comments.
+//!
 //! The engine is path-agnostic: it works on a bare source string and reports a
 //! typed [`FmtError`]. A caller that knows the file (the CLI) attaches the path
 //! at its own boundary.
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Write as _;
 use std::ops::Range;
 
-use comments::{Comment, Run, Tail, comment_multiset, unplaced};
+pub use comments::ends_node;
+use comments::{Comment, CommentKey, Demoted, OwnerTok, Run, Tail, comment_multiset, unplaced};
 pub use faithful::{Owner, RunFault};
 use ipe_diagnostics::{Diagnostic, Located, TokenKind, render};
 use ipe_intern::Interner;
@@ -73,6 +82,9 @@ pub enum RoundTripFault {
     DidNotReparse(Box<Diagnostic>),
     /// The output broke a comment run of one owner.
     CommentRun { owner: Owner, fault: RunFault },
+    /// The printer kept an end-of-line comment at no line end, even with
+    /// every comment it could not keep printed above its next code.
+    UnplacedTrailing,
 }
 
 impl fmt::Display for RoundTripFault {
@@ -95,6 +107,9 @@ impl fmt::Display for RoundTripFault {
                     f,
                     "formatted output broke a comment run of {owner}: {fault}"
                 )
+            }
+            Self::UnplacedTrailing => {
+                f.write_str("formatter could not place an end-of-line comment")
             }
         }
     }
@@ -221,8 +236,44 @@ fn scan_trivia(src: &str) -> Option<Trivia> {
         cursor = hi;
     }
     trivia_comments(src, cursor, src.len(), &mut ranges);
-    let comments = comments::scan(src, ranges, |end| anchor_after(&code, end));
+    let comments = comments::scan(
+        src,
+        ranges,
+        |end| anchor_after(&code, end),
+        |lo, hi| trailing_owner(src, &code, lo, hi),
+    );
     Some(Trivia { comments, code })
+}
+
+/// The token the comment at `[lo, hi)` trails, or `None` when it leads the
+/// code after it.
+///
+/// A comment trails the last code token before it when nothing but spaces
+/// separate them on one line, that token ends a node ([`ends_node`]), and the
+/// line ends after the comment: a `--` comment always ends its line, and a
+/// block comment trails only when a newline or the end of the file follows it
+/// before the next code token (`x {- c -} + y` leads `+ y`).
+fn trailing_owner(src: &str, code: &[CodeToken], lo: usize, hi: usize) -> Option<OwnerTok> {
+    let next = code.partition_point(|t| t.hi <= lo);
+    let t = code.get(next.checked_sub(1)?)?;
+    if !ends_node(t.kind) || src.get(t.hi..lo)?.contains('\n') {
+        return None;
+    }
+    let ends_line = src.get(lo..hi)?.starts_with("--") || {
+        let next_lo = code.get(next).map_or(src.len(), |n| n.lo);
+        next_lo >= src.len() || src.get(hi..next_lo)?.contains('\n')
+    };
+    let named = code
+        .get(..next)?
+        .iter()
+        .rev()
+        .find(|k| !matches!(k.kind, TokenKind::RParen))
+        .unwrap_or(t);
+    ends_line.then_some(OwnerTok {
+        lo: t.lo,
+        hi: t.hi,
+        name: (named.lo, named.hi),
+    })
 }
 
 /// Push the byte range of every comment in the trivia gap `src[from..to]`.
@@ -457,6 +508,7 @@ pub fn verify_rewrite(original: &str, edited: &str) -> Result<Verified, FmtError
         &module,
         &interner,
         &input,
+        original,
         edited,
         OutputCap::for_input(original.len()),
     )
@@ -549,21 +601,108 @@ fn lex_input(src: &str) -> Result<Trivia, FmtError> {
 fn format_guarded<R: Rendering>(
     src: &str,
     cap: OutputCap,
-    render: impl FnOnce(&Printer<'_>, &Module) -> R,
+    render: impl Fn(&Printer<'_>, &Module) -> R,
 ) -> Result<R, FmtError> {
     let mut interner = Interner::new();
     let module = parse_input(src, &mut interner)?;
     let input = lex_input(src)?;
-    let printer = Printer::new(&interner, &input, Some(src), cap);
-    let rendered = render(&printer, &module);
+    let source = Source {
+        interner: &interner,
+        module: &module,
+        trivia: &input,
+        text: src,
+        cap,
+    };
+    let rendered = render_placed(&source, &render)?;
+    verify(&module, &interner, &input, src, rendered.text(), cap)?;
+    Ok(rendered)
+}
 
+/// A parsed source and the ceiling its print is held to.
+struct Source<'s> {
+    interner: &'s Interner,
+    module: &'s Module,
+    trivia: &'s Trivia,
+    text: &'s str,
+    cap: OutputCap,
+}
+
+/// Render `source` with `render`, keeping every end-of-line comment the
+/// layout gives a line end and printing every other one above its next code.
+///
+/// The first pass keeps every end-of-line comment; those it found no line
+/// end for are demoted, and a second pass prints them as leading comments of
+/// their anchor. Two passes at most: a comment the second pass still did not
+/// place is a printer fault, refused rather than written.
+///
+/// # Errors
+/// [`FmtError::Limit`] when a pass would pass the cap;
+/// [`RoundTripFault::UnplacedTrailing`] when the second pass leaves a kept
+/// comment unplaced.
+fn render_placed<R: Rendering>(
+    source: &Source<'_>,
+    render: &impl Fn(&Printer<'_>, &Module) -> R,
+) -> Result<R, FmtError> {
+    let (first, unplaced) = render_pass(source, &Demoted::default(), render)?;
+    if unplaced.is_empty() {
+        return Ok(first);
+    }
+    let demote = if demotion_disabled() {
+        Vec::new()
+    } else {
+        unplaced
+    };
+    let mask = Demoted::of(source.trivia.comments.len(), demote);
+    let (second, left) = render_pass(source, &mask, render)?;
+    if left.is_empty() {
+        Ok(second)
+    } else {
+        Err(FmtError::RoundTrip(RoundTripFault::UnplacedTrailing))
+    }
+}
+
+/// One render of `source` under `mask`, with the ordinals of the kept
+/// comments it left unplaced.
+fn render_pass<R: Rendering>(
+    source: &Source<'_>,
+    mask: &Demoted,
+    render: &impl Fn(&Printer<'_>, &Module) -> R,
+) -> Result<(R, Vec<usize>), FmtError> {
+    let printer = Printer::new(
+        source.interner,
+        source.trivia,
+        Some(source.text),
+        source.cap,
+        mask,
+    );
+    let rendered = render(&printer, source.module);
     // A refused pad rendered empty, so the text alone under-counts: the
     // budget's verdict comes before any guard reads the text.
     if printer.pads.exceeded() {
-        return Err(FmtError::Limit(FmtLimit::OutputBytes { cap }));
+        return Err(FmtError::Limit(FmtLimit::OutputBytes { cap: source.cap }));
     }
-    verify(&module, &interner, &input, rendered.text(), cap)?;
-    Ok(rendered)
+    let unplaced = printer.unplaced_trails(rendered.text());
+    Ok((rendered, unplaced))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by a test to make the second render pass demote nothing, driving
+    /// the bounded-pass refusal.
+    static NO_DEMOTION: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the second render pass is barred from demoting, a test knob.
+#[cfg(test)]
+fn demotion_disabled() -> bool {
+    NO_DEMOTION.with(Cell::get)
+}
+
+/// Whether the second render pass is barred from demoting: never outside
+/// tests.
+#[cfg(not(test))]
+const fn demotion_disabled() -> bool {
+    false
 }
 
 /// Refuse `out` as a print of `module` unless it fits `cap`, carries exactly
@@ -575,6 +714,7 @@ fn verify(
     module: &Module,
     interner: &Interner,
     input: &Trivia,
+    input_src: &str,
     out: &str,
     cap: OutputCap,
 ) -> Result<Verified, FmtError> {
@@ -611,9 +751,16 @@ fn verify(
         Err(diag) => return refuse(RoundTripFault::DidNotReparse(Box::new(diag))),
     };
 
-    // Run guard: every comment run keeps its owner, its inner gaps, and the
-    // run directly above each head keeps its gap to the head.
-    let head_runs = match faithful::check(module, input, &reparsed, &output) {
+    // Run guard: every end-of-line comment stays on its owner's line or moves
+    // above its next code, every comment run keeps its owner, its inner gaps,
+    // and the run directly above each head keeps its gap to the head.
+    let printed = faithful::Printed {
+        input,
+        input_src,
+        output: &output,
+        output_src: out,
+    };
+    let head_runs = match faithful::check(module, &reparsed, &printed) {
         Ok(head_runs) => head_runs,
         Err(faithful::Refusal::DeclCount) => return refuse(RoundTripFault::DifferentAst),
         Err(faithful::Refusal::Run { owner, fault }) => {
@@ -636,13 +783,14 @@ pub(crate) fn format_source_unchecked(src: &str) -> Result<String, FmtError> {
     let mut interner = Interner::new();
     let module = parse_input(src, &mut interner)?;
     let input = lex_input(src)?;
-    Ok(Printer::new(
-        &interner,
-        &input,
-        Some(src),
-        OutputCap::for_input(src.len()),
-    )
-    .module(&module))
+    let source = Source {
+        interner: &interner,
+        module: &module,
+        trivia: &input,
+        text: src,
+        cap: OutputCap::for_input(src.len()),
+    };
+    render_placed(&source, &|p: &Printer<'_>, m: &Module| p.module(m))
 }
 
 #[cfg(test)]
@@ -822,7 +970,8 @@ impl ModuleText {
             comments: Vec::new(),
             code: Vec::new(),
         };
-        let printer = Printer::new(i, &none, None, cap);
+        let mask = Demoted::default();
+        let printer = Printer::new(i, &none, None, cap, &mask);
         let text = printer.module(m);
         if printer.pads.exceeded() || !cap.admits(&text) {
             return Err(FmtError::Limit(FmtLimit::OutputBytes { cap }));
@@ -835,10 +984,28 @@ impl ModuleText {
 // The printer
 // ---------------------------------------------------------------------------
 
+/// Where a definition's signature type sits and whether its source broke it.
+#[derive(Clone, Copy)]
+struct SignatureLayout {
+    /// The source wrote the signature across lines.
+    was_multi: bool,
+    /// The type's first byte.
+    lo: usize,
+    /// The offset just past the type.
+    hi: usize,
+}
+
 struct Printer<'a> {
     interner: &'a Interner,
     /// The source's comments, in source order (so sorted by anchor).
     comments: &'a [Comment],
+    /// Which end-of-line comments this render prints as leading comments.
+    mask: &'a Demoted,
+    /// The end-of-line comments this render keeps on their owner's line, in
+    /// source order (so sorted by owner token).
+    trails: Vec<&'a Comment>,
+    /// Whether each of `trails` was printed, by index into `trails`.
+    placed: Vec<Cell<bool>>,
     /// The source's code tokens, in source order.
     code: &'a [CodeToken],
     /// The original source text, used to recover elm-format's MODAL layout
@@ -870,15 +1037,21 @@ struct Printer<'a> {
 }
 
 impl<'a> Printer<'a> {
-    const fn new(
+    fn new(
         interner: &'a Interner,
         trivia: &'a Trivia,
         src: Option<&'a str>,
         cap: OutputCap,
+        mask: &'a Demoted,
     ) -> Self {
+        let trails: Vec<&'a Comment> = trivia.comments.iter().filter(|c| !mask.leads(c)).collect();
+        let placed = trails.iter().map(|_| Cell::new(false)).collect();
         Self {
             interner,
             comments: trivia.comments.as_slice(),
+            mask,
+            trails,
+            placed,
             code: trivia.code.as_slice(),
             src,
             claimed: Cell::new(None),
@@ -918,9 +1091,10 @@ impl<'a> Printer<'a> {
 
     // -- Comment placement ---------------------------------------------------
 
-    /// The comments anchored at a token starting in the byte range `[lo, hi)`.
+    /// The leading comments anchored at a token starting in the byte range
+    /// `[lo, hi)`.
     fn anchored_in(&self, lo: usize, hi: usize) -> Run<'a> {
-        comments::anchored_in(self.comments, lo, hi)
+        comments::anchored_in(self.comments, self.mask, lo, hi)
     }
 
     /// The comments anchored at the token starting at byte `pos`.
@@ -928,15 +1102,165 @@ impl<'a> Printer<'a> {
         self.anchored_in(pos, pos.saturating_add(1))
     }
 
-    /// The comments after the last token of the file.
-    fn trailing(&self) -> Run<'a> {
-        comments::trailing(self.comments)
+    /// The leading comments after the last token of the file.
+    fn end_of_file(&self) -> Run<'a> {
+        comments::end_of_file(self.comments, self.mask)
+    }
+
+    /// The ordinals of the kept end-of-line comments `text`, this printer's
+    /// output, does not hold at the end of their owner's line.
+    ///
+    /// A comment counts as placed only when a render printed it and the
+    /// output re-scans with it trailing a token of its owner's text, so a
+    /// print a composer later discarded never passes for a placement.
+    fn unplaced_trails(&self, text: &str) -> Vec<usize> {
+        if self.trails.is_empty() {
+            return Vec::new();
+        }
+        let printed = scan_trivia(text);
+        let mut held: BTreeMap<(&str, CommentKey<'_>), usize> = BTreeMap::new();
+        for c in printed.iter().flat_map(|t| t.comments.iter()) {
+            if let Some(owner) = c.owner().and_then(|o| o.name(text)) {
+                let count = held.entry((owner, c.key())).or_default();
+                *count = count.saturating_add(1);
+            }
+        }
+        let mut unplaced = Vec::new();
+        for (c, placed) in self.trails.iter().zip(&self.placed) {
+            let key = c
+                .owner()
+                .and_then(|o| o.name(self.src?))
+                .map(|owner| (owner, c.key()));
+            let found = key
+                .filter(|_| placed.get())
+                .and_then(|key| held.get_mut(&key))
+                .filter(|count| **count > 0);
+            match found {
+                Some(count) => *count = count.saturating_sub(1),
+                None => unplaced.push(c.ord()),
+            }
+        }
+        unplaced
+    }
+
+    /// The kept end-of-line comments owned by the token ending at
+    /// `owner_hi`, each after a space, for the end of the line that token
+    /// ends.
+    fn trail_after(&self, owner_hi: usize) -> String {
+        let owner_end = |c: &&Comment| c.owner().map_or(0, |o| o.hi);
+        let first = self.trails.partition_point(|c| owner_end(c) < owner_hi);
+        let mut out = String::new();
+        let held = self.trails.iter().zip(&self.placed).skip(first);
+        for (c, placed) in held.take_while(|(c, _)| owner_end(c) == owner_hi) {
+            comments::emit_trailing(&mut out, c);
+            placed.set(true);
+        }
+        out
+    }
+
+    /// [`Self::trail_after`] for an owner inside a node ending at `node_hi`;
+    /// empty for the node's own last token, whose comment its enclosing
+    /// composer prints at the line end it opens after the node.
+    fn trail_inside(&self, owner_hi: usize, node_hi: usize) -> String {
+        if owner_hi < node_hi {
+            self.trail_after(owner_hi)
+        } else {
+            String::new()
+        }
+    }
+
+    /// Whether a kept end-of-line comment is owned by the token ending at
+    /// `owner_hi`.
+    fn trails_at(&self, owner_hi: usize) -> bool {
+        let first = self
+            .trails
+            .partition_point(|c| c.owner().map_or(0, |o| o.hi) < owner_hi);
+        self.trails
+            .get(first)
+            .and_then(|c| c.owner())
+            .is_some_and(|o| o.hi == owner_hi)
+    }
+
+    /// Whether a kept end-of-line comment is owned by a token inside
+    /// `[lo, hi)` short of its end: the node there needs a line end inside
+    /// it.
+    fn forces_break(&self, lo: usize, hi: usize) -> bool {
+        let first = self
+            .trails
+            .partition_point(|c| c.owner().map_or(0, |o| o.lo) < lo);
+        self.trails
+            .get(first)
+            .and_then(|c| c.owner())
+            .is_some_and(|o| o.hi < hi)
+    }
+
+    /// The end of the code token before each depth-0 `separator` of the
+    /// group of code tokens starting at `lo`, then the end of the token
+    /// before the bracket that closes the group, which ends the scan; or
+    /// before `hi`, when no bracket closes it first.
+    fn item_ends(&self, lo: usize, hi: usize, separator: TokenKind) -> Vec<usize> {
+        let first = self.code.partition_point(|t| t.lo < lo);
+        let mut ends = Vec::new();
+        let mut depth = 0usize;
+        let mut prev: Option<usize> = None;
+        for t in self.code.get(first..).unwrap_or_default() {
+            if t.lo >= hi {
+                break;
+            }
+            match t.kind {
+                TokenKind::LParen | TokenKind::LBrace | TokenKind::LBracket => {
+                    depth = depth.saturating_add(1);
+                }
+                TokenKind::RParen | TokenKind::RBrace | TokenKind::RBracket => {
+                    let Some(inner) = depth.checked_sub(1) else {
+                        ends.extend(prev);
+                        return ends;
+                    };
+                    depth = inner;
+                }
+                kind if kind == separator && depth == 0 => ends.extend(prev),
+                _ => {}
+            }
+            prev = Some(t.hi);
+        }
+        ends.extend(prev);
+        ends
+    }
+
+    /// The end of the last code token that starts before byte `pos`, `0`
+    /// when none does.
+    fn end_before(&self, pos: usize) -> usize {
+        self.token_before(pos).map_or(0, |t| t.hi)
     }
 
     /// The last code token that starts before byte `pos`.
     fn token_before(&self, pos: usize) -> Option<CodeToken> {
         let i = self.code.partition_point(|t| t.lo < pos);
         i.checked_sub(1).and_then(|j| self.code.get(j)).copied()
+    }
+
+    /// The span of the node at `span` without the grouping parentheses the
+    /// parser widened it to: `([ 1, 2 ])` is the list `[ 1, 2 ]`.
+    ///
+    /// The group's `(` and `)` belong to the claim that owns the group
+    /// ([`Self::claim`]), so a node prints neither the comments anchored at
+    /// that `)` nor those trailing the token before it. Not for a tuple or a
+    /// unit, whose own brackets are parentheses.
+    fn own_span(&self, span: ipe_diagnostics::Span) -> ipe_diagnostics::Span {
+        let (mut lo, mut hi) = (span.lo as usize, span.hi as usize);
+        while let Some(g) = self.paren_group(lo, hi) {
+            let after_open = self.code.partition_point(|t| t.lo <= lo);
+            let Some(next) = self.code.get(after_open) else {
+                break;
+            };
+            lo = next.lo;
+            hi = self.end_before(g.close);
+        }
+        let narrow = |at: usize, wide: u32| u32::try_from(at).unwrap_or(wide);
+        ipe_diagnostics::Span {
+            lo: narrow(lo, span.lo),
+            hi: narrow(hi, span.hi),
+        }
     }
 
     /// The comments anchored at the closing bracket that ends `span`.
@@ -1143,6 +1467,7 @@ impl<'a> Printer<'a> {
             let line = self.import(imp);
             comments::emit(out, &unplaced(travels, &line), zero, Tail::Glued);
             out.push_str(&line);
+            out.push_str(&self.trail_after(imp.span.hi as usize));
             out.push('\n');
         }
     }
@@ -1203,6 +1528,7 @@ impl<'a> Printer<'a> {
         comments::emit(&mut out, &hoisted, zero, hoist_tail(&head));
         comments::emit(&mut out, &head, zero, TOP_LEVEL_HEAD);
         out.push_str(&header);
+        out.push_str(&self.trail_after(self.end_before(first_item)));
         out.push('\n');
 
         self.import_block(&mut out, imports, owned_from);
@@ -1237,11 +1563,14 @@ impl<'a> Printer<'a> {
                     output: item_start..end,
                 });
             }
+            // The declaration's segment ends at its last token, as its input
+            // range does, so a splice keeps the comment after it once.
+            out.push_str(&self.trail_after(self.end_before(owner_end(start))));
             out.push('\n');
         }
 
         // Trailing comments after the last token.
-        let trailing = self.trailing();
+        let trailing = self.end_of_file();
         if !trailing.is_empty() {
             out.push('\n');
             comments::emit(&mut out, &trailing, zero, Tail::Glued);
@@ -1313,7 +1642,11 @@ impl<'a> Printer<'a> {
         };
         let above = |it: &Located<Exposed>| self.anchored(it.span.lo as usize);
         let closing = self.closing_comments(e.span);
-        let commented = !closing.is_empty() || items.iter().any(|it| !above(it).is_empty());
+        let list_hi = e.span.hi as usize;
+        let items_lo = items.first().map_or(list_hi, |it| it.span.lo as usize);
+        let commented = !closing.is_empty()
+            || items.iter().any(|it| !above(it).is_empty())
+            || self.forces_break(items_lo, list_hi);
         // The clause is multi-line iff its items do not all begin on the same
         // source line (a lone `(` or `)` line does not make it multi-line), or
         // it carries a comment it places.
@@ -1332,6 +1665,10 @@ impl<'a> Printer<'a> {
         let mut lead = "( ";
         let mut group: Vec<String> = Vec::new();
         let mut cur_line: Option<usize> = None;
+        // An item that owns an end-of-line comment ended its source line, so
+        // it is the last of its group and its comment ends the group's line.
+        let ends = self.item_ends(items_lo, list_hi, TokenKind::Comma);
+        let ends = (ends.len() == items.len()).then_some(ends);
         for (i, it) in items.iter().enumerate() {
             let line = self.line_of(it.span.lo);
             let run = above(it);
@@ -1344,7 +1681,12 @@ impl<'a> Printer<'a> {
                 comments::emit(&mut out, &run, pad, Tail::Glued);
             }
             cur_line = Some(line);
-            group.push(self.exposed(&it.value));
+            let trail = ends
+                .as_ref()
+                .and_then(|ends| ends.get(i))
+                .map(|&end| self.trail_inside(end, list_hi))
+                .unwrap_or_default();
+            group.push(format!("{}{trail}", self.exposed(&it.value)));
         }
         push_exposing_group(&mut out, &mut group, &mut lead, pad);
         comments::emit(&mut out, &closing, pad, Tail::Glued);
@@ -1411,7 +1753,7 @@ impl<'a> Printer<'a> {
         } = f;
         let head = type_annotation.as_ref().map_or_else(
             || self.sym(name.value),
-            |ann| self.signature(name.value, &ann.value, false),
+            |ann| self.signature(name.value, &ann.value, None),
         );
         // A comment inside the head (outside a record field's own) prints at
         // the start of the body, where a second pass reads it as the body's.
@@ -1447,6 +1789,16 @@ impl<'a> Printer<'a> {
         // subsequent constructor is a leading-`|` continuation line — even when
         // there is a single constructor. There is no single-line union form.
         let mut s = format!("type {}{}", self.sym(uv.name.value), vars);
+        // The head's last token is the one before the first constructor's
+        // `=`; the head line always ends there.
+        let head_end = uv
+            .ctors
+            .first()
+            .and_then(|first| self.token_before(first.span.lo as usize))
+            .filter(|eq| eq.kind == TokenKind::Equals)
+            .map(|eq| self.trail_inside(self.end_before(eq.lo), u.span.hi as usize))
+            .unwrap_or_default();
+        s.push_str(&head_end);
         // A section comment written between two constructors annotates the
         // constructor it precedes: re-emit it on its own four-space-indented
         // line just before that constructor's `| Ctor` line, keeping the
@@ -1465,6 +1817,16 @@ impl<'a> Printer<'a> {
             let run = self.type_comments(&c.value.args, c.span.lo as usize, hi);
             open_line(&mut s, &run, pad);
             let _ = write!(s, "{lead} {}", self.ctor(&c.value));
+            // The constructor's last token is the one before the next `|`; the
+            // last constructor's comment is the declaration's.
+            let trail = uv
+                .ctors
+                .get(idx + 1)
+                .and_then(|next| self.token_before(next.span.lo as usize))
+                .filter(|pipe| pipe.kind == TokenKind::Pipe)
+                .map(|pipe| self.trail_inside(self.end_before(pipe.lo), u.span.hi as usize))
+                .unwrap_or_default();
+            s.push_str(&trail);
         }
         s
     }
@@ -1530,7 +1892,13 @@ impl<'a> Printer<'a> {
             let (lo, hi) = (ann.span.lo as usize, ann.span.hi as usize);
             let inside =
                 self.type_comments(std::slice::from_ref(&ann.value), lo.max(start + 1), hi);
-            s.push_str(&self.signature(v.name.value, &ann.value, self.was_multiline(ann.span)));
+            let layout = Some(SignatureLayout {
+                was_multi: self.was_multiline(ann.span),
+                lo,
+                hi,
+            });
+            s.push_str(&self.signature(v.name.value, &ann.value, layout));
+            s.push_str(&self.trail_after(hi));
             s.push('\n');
             // A comment written between the type annotation and the binding
             // name (e.g. `-- c` in `main : Int\n-- c\nmain = 42`) attaches to
@@ -1573,9 +1941,19 @@ impl<'a> Printer<'a> {
     /// out four-space indented beneath — an arrow chain becomes one segment per
     /// line, the first bare and each subsequent one with a leading `->`. The
     /// modal trigger (`was_multi`) mirrors the record / list / tuple trigger.
-    fn signature(&self, name: ipe_intern::Symbol, ann: &TypeAnnotation, was_multi: bool) -> String {
+    ///
+    /// `layout` is `None` for a head that stays single-line (a `foreign`
+    /// declaration's); otherwise a broken arrow chain keeps each segment's
+    /// end-of-line comment, and a chain owning one inside breaks.
+    fn signature(
+        &self,
+        name: ipe_intern::Symbol,
+        ann: &TypeAnnotation,
+        layout: Option<SignatureLayout>,
+    ) -> String {
         let name = self.sym(name);
-        if !was_multi {
+        let multi = layout.is_some_and(|l| l.was_multi || self.forces_break(l.lo, l.hi));
+        if !multi {
             // Force a single line irrespective of width (elm-format keeps a
             // single-line signature single-line however wide it is). An arrow
             // chain is joined with ` -> `; anything else prints as one atom.
@@ -1591,8 +1969,10 @@ impl<'a> Printer<'a> {
             }
             self.pads.rewind(mark, one);
         }
-        // Multi-line: `name :` then the type at the body column.
-        let body = self.type_multiline(ann, Col::BODY);
+        // Multi-line: `name :` then the type at the body column, each arrow
+        // segment's end-of-line comment at its line end.
+        let trails = layout.map_or_else(Vec::new, |l| self.segment_trails(ann, l.lo, l.hi));
+        let body = self.type_multiline(ann, Col::BODY, &trails);
         format!("{name} :\n{body}")
     }
 
@@ -1601,16 +1981,19 @@ impl<'a> Printer<'a> {
     /// overflows the width budget breaks its arguments one per line (elm-format
     /// indents each argument one tab stop past the applied head); anything else
     /// is a single indented line.
-    fn type_multiline(&self, t: &TypeAnnotation, col: Col) -> String {
+    ///
+    /// `trails[i]` ends an arrow chain's segment `i`'s line.
+    fn type_multiline(&self, t: &TypeAnnotation, col: Col, trails: &[String]) -> String {
         let cur_pad = self.pad(col);
         match t {
             TypeAnnotation::TLambda(_, _) => {
                 let parts = self.arrow_chain(t, col);
-                let mut it = parts.into_iter();
-                let first = it.next().unwrap_or_default();
-                let mut out = format!("{cur_pad}{first}");
-                for p in it {
-                    let _ = write!(out, "\n{cur_pad}-> {p}");
+                let mut out = String::new();
+                for (i, p) in parts.iter().enumerate() {
+                    let lead = if i == 0 { "" } else { "-> " };
+                    let trail = trails.get(i).map_or("", String::as_str);
+                    let sep = if i == 0 { "" } else { "\n" };
+                    let _ = write!(out, "{sep}{cur_pad}{lead}{p}{trail}");
                 }
                 out
             }
@@ -1633,6 +2016,29 @@ impl<'a> Printer<'a> {
             }
             _ => format!("{cur_pad}{}", self.type_app(t, col)),
         }
+    }
+
+    /// The end-of-line comments ending each but the last segment of `ann`'s
+    /// arrow chain, whose type spans `[lo, hi)`: a segment ends at the token
+    /// before its depth-0 `->`.
+    ///
+    /// Empty when the chain's segments are not its depth-0 arrows (a
+    /// parenthesised arrow result), so those comments are demoted.
+    fn segment_trails(&self, ann: &TypeAnnotation, lo: usize, hi: usize) -> Vec<String> {
+        let mut segments = 1usize;
+        let mut cur = ann;
+        while let TypeAnnotation::TLambda(_, b) = cur {
+            segments = segments.saturating_add(1);
+            cur = b;
+        }
+        let ends = self.item_ends(lo, hi, TokenKind::Arrow);
+        if ends.len() != segments {
+            return Vec::new();
+        }
+        ends.iter()
+            .take(segments.saturating_sub(1))
+            .map(|&end| self.trail_inside(end, hi))
+            .collect()
     }
 
     fn type_annotation(&self, t: &TypeAnnotation, col: Col) -> String {
@@ -1786,28 +2192,41 @@ impl<'a> Printer<'a> {
             .map(|(name, _)| self.anchored(name.span.lo as usize))
             .collect();
         let has_field_comments = leading.iter().any(|cs| !cs.is_empty());
+        // A field's last token is the one before its depth-0 `,` or the
+        // closing `}`; a field owning an end-of-line comment ends its line.
+        let first_lo = fields.first().map_or(0, |(n, _)| n.span.lo as usize);
+        let ends = self.item_ends(first_lo, usize::MAX, TokenKind::Comma);
+        let trails: Vec<String> = if ends.len() == fields.len() {
+            ends.iter().map(|&end| self.trail_after(end)).collect()
+        } else {
+            Vec::new()
+        };
+        let kept = ends
+            .last()
+            .is_some_and(|&last| self.forces_break(first_lo, last.saturating_add(1)));
         let one = format!("{{ {} }}", parts.join(", "));
         // Modal, like every other collection: a record type written on one line
         // stays single-line however wide; only a source-multiline record (the
         // `force_multi` trigger), one whose own field broke, or one carrying an
         // inter-field comment (which cannot survive on a single line) lays out
         // one field per leading-comma line.
-        if !force_multi && !has_field_comments && !one.contains('\n') {
+        if !force_multi && !has_field_comments && !kept && !one.contains('\n') {
             return one;
         }
         let pad = self.pad(col);
         let inner = pad;
         let mut out = String::from("{");
         for (i, (part, lead)) in parts.iter().zip(&leading).enumerate() {
+            let trail = trails.get(i).map_or("", String::as_str);
             // The comment block precedes the field it annotates, mirroring the
             // source where the comment sits above its field.
             if i == 0 && lead.is_empty() {
-                let _ = write!(out, " {part}");
+                let _ = write!(out, " {part}{trail}");
                 continue;
             }
             open_line(&mut out, lead, inner);
             let sep = if i == 0 { " " } else { "," };
-            let _ = write!(out, "{sep} {part}");
+            let _ = write!(out, "{sep} {part}{trail}");
         }
         let _ = write!(out, "\n{pad}}}");
         out
@@ -2040,12 +2459,13 @@ impl<'a> Printer<'a> {
         for step in &view.steps {
             // A bound or pure statement starts at its binder; a bare run is an
             // expression and carries its own comments.
-            let line = match step {
-                DoStep::Bind(pat, task) => self.do_binding(pat, "<-", task, stmt),
-                DoStep::Let(pat, value) => self.do_binding(pat, "=", value, stmt),
-                DoStep::Run(task) => self.expr(task, stmt),
+            let (line, last) = match step {
+                DoStep::Bind(pat, task) => (self.do_binding(pat, "<-", task, stmt), task),
+                DoStep::Let(pat, value) => (self.do_binding(pat, "=", value, stmt), value),
+                DoStep::Run(task) => (self.expr(task, stmt), task),
             };
-            let _ = write!(out, "\n{stmt_pad}{line}");
+            let trail = self.trail_after(last.span.hi as usize);
+            let _ = write!(out, "\n{stmt_pad}{line}{trail}");
         }
         // With no statement peeled, the result IS the `do`-stamped node: print
         // its own shape, or `expr` would recognise the block again.
@@ -2160,7 +2580,17 @@ impl<'a> Printer<'a> {
         }
         if needs_parens_as_atom(&e.value) {
             let inner = self.expr(e, col.past(1));
-            if inner.contains('\n') {
+            // A written group's last inner token may own an end-of-line
+            // comment: it ends the inner line, the `)` on its own line below.
+            let closing = self
+                .token_before(e.span.hi as usize)
+                .filter(|t| t.kind == TokenKind::RParen && t.hi == e.span.hi as usize);
+            let trail = closing
+                .map(|paren| self.trail_after(self.end_before(paren.lo)))
+                .unwrap_or_default();
+            if !trail.is_empty() {
+                format!("({inner}{trail}\n{})", self.pad(col))
+            } else if inner.contains('\n') {
                 // A multiline compound in parens: the content starts right
                 // after `(`, one column in, and the closing `)` sits on its
                 // own line at the `(` column — elm-format's
@@ -2187,7 +2617,9 @@ impl<'a> Printer<'a> {
         let arg_col = col.tab();
         let arg_one_strs: Vec<String> = args.iter().map(|a| self.expr_atom(a, arg_col)).collect();
         let one = format!("{head_s} {}", arg_one_strs.join(" "));
-        if !has_layout_newline(&one) && !self.was_multiline(span) {
+        let own = self.own_span(span);
+        let (lo, hi) = (own.lo as usize, own.hi as usize);
+        if !has_layout_newline(&one) && !self.was_multiline(span) && !self.forces_break(lo, hi) {
             return one;
         }
 
@@ -2221,21 +2653,29 @@ impl<'a> Printer<'a> {
         let first_is_block =
             |a: &Expr| matches!(&a.value, Expr_::MultilineStr { raw, .. } if raw.contains('\n'));
         let later_block = |tail_strs: &[String]| tail_strs.iter().any(|s| has_layout_newline(s));
-        let (mut out, rest_strs): (String, &[String]) =
+        // A head owning an end-of-line comment ends its line: it stands alone.
+        let head_hi = head.span.hi as usize;
+        let (mut out, rest, rest_strs): (String, &[Expr], &[String]) =
             match (args.split_first(), arg_one_strs.split_first()) {
-                (Some((first, _)), Some((first_str, tail_strs)))
+                (Some((first, rest)), Some((first_str, tail_strs)))
                     if Self::joins_on_head_line(first, first_str)
                         && head_line_fits(&head_s, first, col)
+                        && !self.trails_at(head_hi)
                         && (is_simple_ref(first)
                             || first_is_block(first)
                             || later_block(tail_strs)) =>
                 {
-                    (format!("{head_s} {first_str}"), tail_strs)
+                    let trail = self.trail_inside(first.span.hi as usize, hi);
+                    (format!("{head_s} {first_str}{trail}"), rest, tail_strs)
                 }
-                _ => (head_s, arg_one_strs.as_slice()),
+                _ => {
+                    let trail = self.trail_inside(head_hi, hi);
+                    (format!("{head_s}{trail}"), args, arg_one_strs.as_slice())
+                }
             };
-        for s in rest_strs {
-            let _ = write!(out, "\n{inner}{s}");
+        for (a, s) in rest.iter().zip(rest_strs) {
+            let trail = self.trail_inside(a.span.hi as usize, hi);
+            let _ = write!(out, "\n{inner}{s}{trail}");
         }
         out
     }
@@ -2359,9 +2799,12 @@ impl<'a> Printer<'a> {
         // Children sit after their parent, so the reverse order assembles
         // every child before the group that holds it.
         let mut texts: Vec<String> = vec![String::new(); groups.0.len()];
+        let operand_end = |i: usize| operands.get(i).map_or(0, |o| o.span.hi as usize);
+        let chain_hi = span.hi as usize;
         for (index, g) in groups.0.iter().enumerate().rev() {
             let mut children = g.children.iter();
             let mut segments: Vec<Item<'a>> = Vec::new();
+            let mut trails: Vec<String> = Vec::new();
             let ends = g.splits.iter().copied().chain(std::iter::once(g.hi));
             let mut start = g.lo;
             for end in ends {
@@ -2386,14 +2829,28 @@ impl<'a> Printer<'a> {
                         .unwrap_or_default()
                 };
                 segments.push((comments, text));
+                trails.push(if g.backward {
+                    String::new()
+                } else {
+                    self.trail_inside(operand_end(end), chain_hi)
+                });
                 start = end + 1;
             }
-            let forced = segments
-                .iter()
-                .any(|(cs, text)| !cs.is_empty() || has_layout_newline(text));
+            // A segment's end-of-line comment needs the line end a broken
+            // group opens after it; a `<|` group ends its lines with the
+            // operator, so its comments are demoted.
+            let group_lo = operands.get(g.lo).map_or(0, |o| o.span.lo as usize);
+            let owns_trail = !g.backward && self.forces_break(group_lo, operand_end(g.hi));
+            let forced = owns_trail
+                || segments
+                    .iter()
+                    .any(|(cs, text)| !cs.is_empty() || has_layout_newline(text));
             let broken = forced || (index == 0 && self.was_multiline(span));
             let line = at.get(g.lo).copied().unwrap_or(col).tab();
-            let text = self.op_group(&ops, g, segments, broken, line);
+            if !broken {
+                trails.clear();
+            }
+            let text = self.op_group(&ops, g, segments, &trails, broken, line);
             if let Some(slot) = texts.get_mut(index) {
                 *slot = text;
             }
@@ -2404,19 +2861,22 @@ impl<'a> Printer<'a> {
     /// Join one operator group's `segments`, the first operand or child
     /// group and then the one right of each split, each with its comments.
     ///
-    /// A `broken` group starts each split's line at `line`.
+    /// A `broken` group starts each split's line at `line`, `trails[i]`
+    /// ending segment `i`'s line.
     fn op_group(
         &self,
         ops: &[String],
         g: &OpGroup,
         segments: Vec<Item<'a>>,
+        trails: &[String],
         broken: bool,
         line: Col,
     ) -> String {
         let mut segments = segments.into_iter();
         let mut out = segments.next().map(|(_, text)| text).unwrap_or_default();
         let pad = self.pad(line);
-        for (&split, (comments, text)) in g.splits.iter().zip(segments) {
+        for (i, (&split, (comments, text))) in g.splits.iter().zip(segments).enumerate() {
+            out.push_str(trails.get(i).map_or("", String::as_str));
             let op = ops.get(split).map_or("", String::as_str);
             if !broken {
                 let _ = write!(out, " {op} {text}");
@@ -2527,7 +2987,18 @@ impl<'a> Printer<'a> {
             let run = self.anchored_in(pat.span.lo as usize, body.span.lo as usize);
             let body_s = self.expr(body, body_col);
             open_line(&mut out, &run, arm_pad);
-            let _ = write!(out, "{} ->\n{body_pad}{body_s}", self.pattern(&pat.value));
+            // The last arm's body ends the `case`: its comment is the
+            // enclosing composer's.
+            let trail = if i + 1 < arms.len() {
+                self.trail_after(body.span.hi as usize)
+            } else {
+                String::new()
+            };
+            let _ = write!(
+                out,
+                "{} ->\n{body_pad}{body_s}{trail}",
+                self.pattern(&pat.value)
+            );
         }
         out
     }
@@ -2565,8 +3036,9 @@ impl<'a> Printer<'a> {
             // elm-format ALWAYS drops a `let` binding's value onto its own
             // four-space-indented line, however short — `x =\n    1`.
             let val = self.expr(value, value_col);
+            let trail = self.trail_after(value.span.hi as usize);
             open_line(&mut out, &run, bind_pad);
-            let _ = write!(out, "{binder} =\n{body_val_pad}{val}");
+            let _ = write!(out, "{binder} =\n{body_val_pad}{val}{trail}");
         }
         let in_pad = self.pad(col);
         let _ = write!(out, "\n{in_pad}in\n{in_pad}{}", self.expr(body, col));
@@ -2600,9 +3072,10 @@ impl<'a> Printer<'a> {
             }
             let _ = write!(
                 out,
-                "{lead} {} then\n{inner}{}\n\n{}",
+                "{lead} {} then\n{inner}{}{}\n\n{}",
                 self.expr(cond, col.past(lead.len() + 1)),
                 self.expr(body, body_col),
+                self.trail_after(body.span.hi as usize),
                 self.pad(col)
             );
         }
@@ -2620,15 +3093,17 @@ impl<'a> Printer<'a> {
     // always multi-line.
     fn tuple(&self, elems: &[Expr], col: Col, span: ipe_diagnostics::Span) -> String {
         let items = self.elements(elems, col.past(2));
-        self.collection("(", ")", &items, span, col)
+        let ends: Vec<usize> = elems.iter().map(|e| e.span.hi as usize).collect();
+        self.collection(("(", ")"), items, &ends, span, col)
     }
 
     fn list(&self, elems: &[Expr], col: Col, span: ipe_diagnostics::Span) -> String {
         if elems.is_empty() {
-            return self.with_comments(&self.closing_comments(span), "[]", col);
+            return self.with_comments(&self.closing_comments(self.own_span(span)), "[]", col);
         }
         let items = self.elements(elems, col.past(2));
-        self.collection("[", "]", &items, span, col)
+        let ends: Vec<usize> = elems.iter().map(|e| e.span.hi as usize).collect();
+        self.collection(("[", "]"), items, &ends, self.own_span(span), col)
     }
 
     fn record(
@@ -2638,10 +3113,11 @@ impl<'a> Printer<'a> {
         span: ipe_diagnostics::Span,
     ) -> String {
         if fields.is_empty() {
-            return self.with_comments(&self.closing_comments(span), "{}", col);
+            return self.with_comments(&self.closing_comments(self.own_span(span)), "{}", col);
         }
         let items = self.fields(fields, col.past(2));
-        self.collection("{", "}", &items, span, col)
+        let ends: Vec<usize> = fields.iter().map(|(_, v)| v.span.hi as usize).collect();
+        self.collection(("{", "}"), items, &ends, self.own_span(span), col)
     }
 
     /// Each element of a list or tuple, rendered at `col`, with the comments
@@ -2679,22 +3155,31 @@ impl<'a> Printer<'a> {
     /// A list, tuple or record: single-line when it fits, the source kept it
     /// on one line and no comment is inside; leading-comma multi-line
     /// otherwise.
+    ///
+    /// `ends[i]` is the end of item `i`'s last token; its end-of-line comment
+    /// ends the item's line.
     fn collection(
         &self,
-        open: &str,
-        close: &str,
-        items: &[Item<'a>],
+        (open, close): (&str, &str),
+        mut items: Vec<Item<'a>>,
+        ends: &[usize],
         span: ipe_diagnostics::Span,
         col: Col,
     ) -> String {
+        let (lo, hi) = (span.lo as usize, span.hi as usize);
         let closing = self.closing_comments(span);
-        let commented = !closing.is_empty() || items.iter().any(|(cs, _)| !cs.is_empty());
+        let commented = !closing.is_empty()
+            || items.iter().any(|(cs, _)| !cs.is_empty())
+            || self.forces_break(lo, hi);
         let parts: Vec<&str> = items.iter().map(|(_, s)| s.as_str()).collect();
         let one = format!("{open} {} {close}", parts.join(", "));
         if !commented && !has_layout_newline(&one) && !self.was_multiline(span) {
             return one;
         }
-        comma_multiline(&self.pads, open, close, items, &closing, col)
+        for ((_, part), &end) in items.iter_mut().zip(ends) {
+            part.push_str(&self.trail_inside(end, hi));
+        }
+        comma_multiline(&self.pads, open, close, &items, &closing, col)
     }
 
     fn update(
@@ -2709,8 +3194,12 @@ impl<'a> Printer<'a> {
         // field two columns past that.
         let bar_col = col.tab();
         let items = self.fields(fields, bar_col.past(2));
+        let span = self.own_span(span);
         let closing = self.closing_comments(span);
-        let commented = !closing.is_empty() || items.iter().any(|(cs, _)| !cs.is_empty());
+        let (lo, hi) = (span.lo as usize, span.hi as usize);
+        let commented = !closing.is_empty()
+            || items.iter().any(|(cs, _)| !cs.is_empty())
+            || self.forces_break(lo, hi);
         let parts: Vec<&str> = items.iter().map(|(_, s)| s.as_str()).collect();
         let one = format!("{{ {base_s} | {} }}", parts.join(", "));
         if !commented && !has_layout_newline(&one) && !self.was_multiline(span) {
@@ -2722,11 +3211,12 @@ impl<'a> Printer<'a> {
         // closing `}` back at the brace column.
         let close_pad = self.pad(col);
         let inner = self.pad(bar_col);
-        let mut out = format!("{{ {base_s}");
-        for (i, (comments, p)) in items.iter().enumerate() {
+        let mut out = format!("{{ {base_s}{}", self.trail_after(base.span.hi as usize));
+        for (i, ((comments, p), (_, value))) in items.iter().zip(fields).enumerate() {
             let lead = if i == 0 { "|" } else { "," };
             open_line(&mut out, comments, inner);
-            let _ = write!(out, "{lead} {p}");
+            let trail = self.trail_inside(value.span.hi as usize, hi);
+            let _ = write!(out, "{lead} {p}{trail}");
         }
         if closing.is_empty() {
             out.push('\n');
@@ -4392,7 +4882,7 @@ mod tests {
     }
 
     /// The `RoundTrip` detail of formatting `src` with `render`.
-    fn refusal(src: &str, render: impl FnOnce(&Printer<'_>, &Module) -> String) -> String {
+    fn refusal(src: &str, render: impl Fn(&Printer<'_>, &Module) -> String) -> String {
         match format_guarded(src, OutputCap::for_input(src.len()), render) {
             Err(FmtError::RoundTrip(fault)) => fault.to_string(),
             other => format!("not a refusal: {other:?}"),
@@ -4682,6 +5172,25 @@ mod tests {
         );
     }
 
+    /// A declaration's interior and end-of-declaration end-of-line comments
+    /// splice back once each: input and output segments both end at the
+    /// declaration's last token, so the comment after it stays outside both.
+    #[test]
+    fn splicing_keeps_each_end_of_line_comment_once() {
+        let src = "module M exposing (a, b)\n\n\na =\n    [ 1 -- one\n    , 2 ]\n\n\nb =\n      2 -- end\n";
+        let formatted = format_with_segments(src).expect("formats");
+        let whole = format_source(src).expect("formats");
+        assert_eq!(formatted.text, whole);
+        assert!(whole.contains("    [ 1 -- one\n"), "{whole}");
+        assert!(whole.ends_with("    2 -- end\n"), "{whole}");
+        let edited = splice_all(src, &formatted);
+        assert_eq!(edited, whole, "splicing every segment is the format");
+        assert!(
+            verify_rewrite(src, &edited).is_ok(),
+            "the spliced segments verify"
+        );
+    }
+
     /// `verify_rewrite` accepts a faithful rewrite and refuses one that drops
     /// a comment, changes the program, or does not parse.
     #[test]
@@ -4713,6 +5222,153 @@ mod tests {
             verify_rewrite("not ipe @@@@", src),
             Err(FmtError::Parse { .. })
         ));
+    }
+
+    /// The owner token text of each comment of `src`, `None` for a leading
+    /// comment.
+    fn trail_owners(src: &str) -> Vec<Option<String>> {
+        scan_comments(src)
+            .iter()
+            .map(|c| {
+                c.owner()
+                    .and_then(|o| src.get(o.lo..o.hi))
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    /// A comment trails the token before it only at a line end and only after
+    /// a token that ends a node; a block comment with code after it on its
+    /// line leads that code.
+    #[test]
+    fn trailing_classifier_pins_its_boundary() {
+        let owner = |text: &str| Some(text.to_owned());
+        assert_eq!(trail_owners("x = a {- c -} + y\n"), vec![None]);
+        assert_eq!(trail_owners("x = a {- c -}\ny = 1\n"), vec![owner("a")]);
+        assert_eq!(trail_owners("x = a {- c -}"), vec![owner("a")]);
+        assert_eq!(trail_owners("x = a {-| d -}\ny = 1\n"), vec![owner("a")]);
+        assert_eq!(trail_owners("x = f y -- c\n"), vec![owner("y")]);
+        assert_eq!(trail_owners("x = (f y) -- c\n"), vec![owner(")")]);
+        assert_eq!(trail_owners("x =\n    1 -- c"), vec![owner("1")]);
+        assert_eq!(
+            trail_owners("x = a {- b -} -- c\n"),
+            vec![owner("a"), owner("a")]
+        );
+        assert_eq!(trail_owners("-- own line\nx = 1\n"), vec![None]);
+        assert_eq!(trail_owners("x = 1\n-- own line\n"), vec![None]);
+    }
+
+    /// A comment after a token that leaves its construct open leads the code
+    /// after it, whatever line it ends.
+    #[test]
+    fn comments_after_open_tokens_lead() {
+        for src in [
+            "x = -- c\n    1\n",
+            "x = case y of -- c\n    _ -> 1\n",
+            "x = a + -- c\n    b\n",
+            "x = ( -- c\n    1)\n",
+            "module M exposing -- c\n    (x)\n",
+            "x = if a then -- c\n    1 else 2\n",
+        ] {
+            assert_eq!(trail_owners(src), vec![None], "{src:?}");
+        }
+    }
+
+    /// `ends_node` is true exactly for the tokens a node can end on.
+    #[test]
+    fn ends_node_names_the_node_final_tokens() {
+        for kind in [
+            TokenKind::Ident,
+            TokenKind::Int,
+            TokenKind::Float,
+            TokenKind::Str,
+            TokenKind::Char,
+            TokenKind::Underscore,
+            TokenKind::RParen,
+            TokenKind::RBracket,
+            TokenKind::RBrace,
+        ] {
+            assert!(ends_node(kind), "{kind:?}");
+        }
+        for kind in [
+            TokenKind::Equals,
+            TokenKind::Of,
+            TokenKind::Then,
+            TokenKind::Arrow,
+            TokenKind::Comma,
+            TokenKind::LParen,
+            TokenKind::PipeGt,
+            TokenKind::Exposing,
+            TokenKind::Eof,
+        ] {
+            assert!(!ends_node(kind), "{kind:?}");
+        }
+    }
+
+    /// The fault detail of `verify_rewrite(original, edited)`.
+    fn rewrite_fault(original: &str, edited: &str) -> Option<(Owner, RunFault)> {
+        match verify_rewrite(original, edited) {
+            Err(FmtError::RoundTrip(RoundTripFault::CommentRun { owner, fault })) => {
+                Some((owner, fault))
+            }
+            _ => None,
+        }
+    }
+
+    const TRAILS_ONE: &str = "module M exposing (x)\n\n\nx =\n    [ 1 -- one\n    , 2\n    ]\n";
+
+    /// A rewrite that moves an end-of-line comment to another line's end is
+    /// refused, though it keeps every comment's text and owner.
+    #[test]
+    fn verify_refuses_an_end_of_line_comment_moved_to_another_line() {
+        let moved = "module M exposing (x)\n\n\nx =\n    [ 1\n    , 2 -- one\n    ]\n";
+        assert_eq!(
+            rewrite_fault(TRAILS_ONE, moved),
+            Some((Owner::Decl(0), RunFault::Attachment))
+        );
+    }
+
+    /// An end-of-line comment may move onto its own line inside its
+    /// declaration, never into the run above the declaration's head.
+    #[test]
+    fn verify_accepts_only_a_demotion_inside_its_declaration() {
+        let demoted = "module M exposing (x)\n\n\nx =\n    [ 1\n    -- one\n    , 2\n    ]\n";
+        assert!(verify_rewrite(TRAILS_ONE, demoted).is_ok());
+        let hoisted = "module M exposing (x)\n\n\n-- one\nx =\n    [ 1\n    , 2\n    ]\n";
+        assert_eq!(
+            rewrite_fault(TRAILS_ONE, hoisted),
+            Some((Owner::Decl(0), RunFault::HeadRun))
+        );
+    }
+
+    /// A leading comment never joins the end of a code line.
+    #[test]
+    fn verify_refuses_a_leading_comment_moved_to_a_line_end() {
+        let leading = "module M exposing (x)\n\n\nx =\n    [ 1\n    -- one\n    , 2\n    ]\n";
+        let gained = "module M exposing (x)\n\n\nx =\n    [ 1 -- one\n    , 2\n    ]\n";
+        assert_eq!(
+            rewrite_fault(leading, gained),
+            Some((Owner::Decl(0), RunFault::Attachment))
+        );
+    }
+
+    /// A second render pass that may not demote leaves an end-of-line comment
+    /// at no line end unplaced, and the formatter refuses rather than run a
+    /// third pass.
+    #[test]
+    fn an_unplaced_end_of_line_comment_after_two_passes_is_refused() {
+        let src = "module M exposing (f)\n\n\nf x =\n    case x of\n        Just -- inner\n            y ->\n            y\n\n        _ ->\n            0\n";
+        NO_DEMOTION.with(|knob| knob.set(true));
+        let refused = format_source(src);
+        NO_DEMOTION.with(|knob| knob.set(false));
+        assert!(
+            matches!(
+                refused,
+                Err(FmtError::RoundTrip(RoundTripFault::UnplacedTrailing))
+            ),
+            "{refused:?}"
+        );
+        assert!(format_source(src).is_ok(), "demotion places it");
     }
 
     /// An operator printed as `?`, the text a symbol the printer cannot

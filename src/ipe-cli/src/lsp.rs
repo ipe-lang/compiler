@@ -9,6 +9,9 @@
 //! through it. No directory above a workspace folder is ever searched, so
 //! the module set the editor analyzes can never diverge from the one the
 //! batch build compiles, and no parent directory can supply the scope.
+//! Each embedded stdlib module it reports carries the path of a verified
+//! read-only copy in the per-user cache, so a definition inside the stdlib
+//! has a file the editor can open.
 
 use std::path::{Path, PathBuf};
 
@@ -65,7 +68,8 @@ fn load_error(err: &CliError) -> LoadError {
         | CliError::EntryEscapes { .. }
         | CliError::ExposedModuleMissing { .. }
         | CliError::FileOutsideRoot { .. }
-        | CliError::DirectoryExpected { .. } => LoadError::RootRefused(detail),
+        | CliError::DirectoryExpected { .. }
+        | CliError::DependencyNotCompiled { .. } => LoadError::RootRefused(detail),
         CliError::FileTooLarge { .. }
         | CliError::FmtOutputTooLarge { .. }
         | CliError::DiscoveryLimitReached { .. }
@@ -80,6 +84,7 @@ fn load_error(err: &CliError) -> LoadError {
         },
         CliError::FfiPrep(refusal) => ffi_prep_load_error(refusal, detail),
         CliError::Usage(_)
+        | CliError::ProjectRefused(_)
         | CliError::UnknownCommand { .. }
         | CliError::Pipeline { .. }
         | CliError::RuntimeNotFound
@@ -95,12 +100,15 @@ fn load_error(err: &CliError) -> LoadError {
         | CliError::TargetDirUnlinkable { .. }
         | CliError::BundledManifest { .. }
         | CliError::TestTargetBusy { .. }
+        | CliError::TestRunnerStale { .. }
+        | CliError::TestRunKeyUnavailable { .. }
         | CliError::UnknownCode { .. }
         | CliError::DocNotFound { .. }
         | CliError::StaticRefusal(_)
         | CliError::CapabilityMismatch { .. }
         | CliError::Resolve(_)
         | CliError::LockRefused(_)
+        | CliError::IndexEntryRefused(_)
         | CliError::HashMismatch { .. }
         | CliError::Diff(_)
         | CliError::SemverRejected { .. }
@@ -148,7 +156,6 @@ const fn ffi_prep_load_error(refusal: &FfiPrepError, detail: String) -> LoadErro
     match refusal {
         FfiPrepError::ModuleClaimed { .. }
         | FfiPrepError::ReservedModuleExists
-        | FfiPrepError::AssertedRefused(_)
         | FfiPrepError::AssertedShimSeal(_) => LoadError::Pipeline(detail),
         FfiPrepError::DefineOpaqueCollision { .. }
         | FfiPrepError::DependencyMerge(_)
@@ -158,7 +165,439 @@ const fn ffi_prep_load_error(refusal: &FfiPrepError, detail: String) -> LoadErro
     }
 }
 
-struct DriverLoader;
+/// The read-only per-user copies of the embedded stdlib sources an editor opens.
+///
+/// A definition inside the stdlib needs a file the editor can open, but the
+/// stdlib lives only inside the binary. Each module is written once into
+/// `<cache base>/ipe/stdlib/<key>/`, where the key digests the compiler
+/// version and the whole embedded table, so one compiler's copies never
+/// serve another's sources. The trust boundary is held three ways: the
+/// directory is a [`ProvenDir`] (every ancestor proven, the leaf private), a
+/// file name exists only for a module of the compile-time stdlib table, and
+/// a copy is handed out only after its bytes re-prove equal to the embedded
+/// source — a tampered, partial or swapped copy is re-written through a
+/// fresh temporary file and an atomic rename, never served.
+mod stdlib_cache {
+    use std::fs::File;
+    use std::io::{self, Read as _, Write as _};
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+
+    use ipe_stdlib::{COMPILED_STD_MODULES, CompiledStdModule};
+    use sha2::Digest as _;
+
+    use crate::proven_dir::{EntryName, NewFileMode, ProvenDir};
+
+    /// The most bytes every copy and its temporary file may occupy together.
+    pub const MAX_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+    /// The bytes the whole table occupies on disk at most: every copy plus one temporary file each.
+    const fn table_footprint(mut rest: &[CompiledStdModule]) -> Option<usize> {
+        let mut sum: usize = 0;
+        while let Some((module, tail)) = rest.split_first() {
+            sum = match sum.checked_add(module.source.len()) {
+                Some(next) => next,
+                None => return None,
+            };
+            rest = tail;
+        }
+        sum.checked_mul(2)
+    }
+
+    /// Whether `footprint` is a computed size within [`MAX_CACHE_BYTES`].
+    pub const fn within_cap(footprint: Option<usize>) -> bool {
+        matches!(footprint, Some(bytes) if bytes <= MAX_CACHE_BYTES)
+    }
+
+    // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the embedded stdlib outgrows the cache's size ceiling [ledger #boundary]
+    const _: () = assert!(within_cap(table_footprint(COMPILED_STD_MODULES)));
+
+    /// The directory name under `<cache base>/ipe` the copies live in.
+    const STDLIB_DIR: &str = "stdlib";
+
+    /// The domain tag that opens the key digest.
+    const KEY_TAG: &[u8] = b"ipe-stdlib-sources\0";
+
+    /// The version key: SHA-256 over the compiler version and every table entry, each length-framed.
+    fn cache_key() -> &'static str {
+        static KEY: OnceLock<String> = OnceLock::new();
+        KEY.get_or_init(|| {
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(KEY_TAG);
+            let mut frame = |bytes: &[u8]| {
+                let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                hasher.update(len.to_le_bytes());
+                hasher.update(bytes);
+            };
+            frame(crate::runtime_embed::COMPILER_VERSION.as_bytes());
+            for module in COMPILED_STD_MODULES {
+                frame(module.dotted.as_bytes());
+                frame(module.source.as_bytes());
+            }
+            hex::encode(hasher.finalize())
+        })
+    }
+
+    /// The directory the copies of this compiler's stdlib live in, under `cache_base`.
+    pub fn dir_under(cache_base: &Path) -> PathBuf {
+        cache_base.join("ipe").join(STDLIB_DIR).join(cache_key())
+    }
+
+    /// A stdlib module of the compile-time table, with the two entry names its copy uses.
+    pub struct StdlibEntry {
+        /// The embedded source the copy must hold.
+        source: &'static str,
+        /// The copy's name, `<dotted>.ipe`.
+        copy: EntryName,
+        /// The temporary file the copy is written through, `.<dotted>.ipe.tmp`.
+        temp: EntryName,
+    }
+
+    impl StdlibEntry {
+        /// Parse `module` into its table entry; `None` unless the table holds it.
+        ///
+        /// The names come from the table's own dotted spelling, every segment
+        /// a legal module segment, so no name a caller supplies reaches a path.
+        pub fn of(module: &[String]) -> Option<Self> {
+            let entry = COMPILED_STD_MODULES.iter().find(|entry| {
+                entry
+                    .dotted
+                    .split('.')
+                    .eq(module.iter().map(String::as_str))
+            })?;
+            if !entry
+                .dotted
+                .split('.')
+                .all(crate::project::is_module_segment)
+            {
+                return None;
+            }
+            let copy = format!("{}.ipe", entry.dotted);
+            let temp = format!(".{copy}.tmp");
+            Some(Self {
+                source: entry.source,
+                copy: EntryName::new(copy.as_ref())?,
+                temp: EntryName::new(temp.as_ref())?,
+            })
+        }
+    }
+
+    /// This compiler's stdlib copy directory, held open and proven private.
+    pub struct StdlibCache {
+        /// The held directory every copy is written and read through.
+        dir: ProvenDir,
+    }
+
+    impl StdlibCache {
+        /// Hold this compiler's copy directory under `cache_base`, creating it.
+        ///
+        /// `None` when any component fails its ownership proof, or on a host
+        /// with no file ownership to prove it by.
+        pub fn open(cache_base: &Path) -> Option<Self> {
+            ProvenDir::create(&dir_under(cache_base))
+                .ok()
+                .map(|dir| Self { dir })
+        }
+
+        /// The path of `module`'s verified copy, written first when absent or wrong.
+        ///
+        /// `None` when `module` is not a table module, when `text` is not its
+        /// embedded source, or when no verified copy could be put in place.
+        pub fn materialise(&self, module: &[String], text: &str) -> Option<PathBuf> {
+            let entry = StdlibEntry::of(module)?;
+            if entry.source != text {
+                return None;
+            }
+            if !self.holds(&entry) {
+                self.write(&entry).ok()?;
+                if !self.holds(&entry) {
+                    return None;
+                }
+            }
+            Some(self.dir.path_of(&entry.copy))
+        }
+
+        /// Whether the copy of `entry` is a read-only regular file holding exactly its source.
+        pub fn holds(&self, entry: &StdlibEntry) -> bool {
+            self.dir
+                .open_file(&entry.copy)
+                .is_ok_and(|file| holds_exactly(file, entry.source))
+        }
+
+        /// Write `entry`'s copy through its temporary file and rename it into place.
+        fn write(&self, entry: &StdlibEntry) -> io::Result<()> {
+            let file = match self
+                .dir
+                .create_file(&entry.temp, NewFileMode::WorldReadable)
+            {
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                    self.dir.remove_file(&entry.temp)?;
+                    self.dir
+                        .create_file(&entry.temp, NewFileMode::WorldReadable)?
+                }
+                created => created?,
+            };
+            let placed = fill_read_only(file, entry.source)
+                .and_then(|()| self.dir.rename(&entry.temp, &entry.copy));
+            if placed.is_err() {
+                // The rename failed, so the temporary file is the one this
+                // call created; the error reported is the write's own.
+                let _ = self.dir.remove_file(&entry.temp);
+            }
+            placed
+        }
+    }
+
+    /// Write `source` into `file`, flush it to disk, and drop every write permission.
+    fn fill_read_only(mut file: File, source: &str) -> io::Result<()> {
+        file.write_all(source.as_bytes())?;
+        file.sync_all()?;
+        let mut permissions = file.metadata()?.permissions();
+        permissions.set_readonly(true);
+        file.set_permissions(permissions)
+    }
+
+    /// Whether the open `file` is read-only and holds exactly `source`, read no further than one byte past it.
+    fn holds_exactly(file: File, source: &str) -> bool {
+        let read_only = file
+            .metadata()
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().readonly());
+        let Some(cap) = u64::try_from(source.len())
+            .ok()
+            .and_then(|len| len.checked_add(1))
+        else {
+            return false;
+        };
+        let mut bytes = Vec::with_capacity(source.len());
+        read_only && file.take(cap).read_to_end(&mut bytes).is_ok() && bytes == source.as_bytes()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_embedded_table_fits_the_cache_ceiling() {
+            assert!(within_cap(table_footprint(COMPILED_STD_MODULES)));
+        }
+
+        #[test]
+        fn a_footprint_past_the_ceiling_or_overflowing_is_refused() {
+            assert!(within_cap(Some(MAX_CACHE_BYTES)));
+            assert!(!within_cap(Some(MAX_CACHE_BYTES + 1)));
+            assert!(!within_cap(None));
+            let table = [
+                CompiledStdModule {
+                    dotted: "Ipe.A",
+                    source: "",
+                    tier: ipe_stdlib::StdTier::Public,
+                },
+                CompiledStdModule {
+                    dotted: "Ipe.B",
+                    source: "x",
+                    tier: ipe_stdlib::StdTier::Public,
+                },
+            ];
+            assert_eq!(table_footprint(&table), Some(2));
+        }
+
+        #[test]
+        fn only_a_table_module_names_an_entry() {
+            let tuple = StdlibEntry::of(&["Ipe".to_owned(), "Tuple".to_owned()]);
+            assert!(
+                tuple.is_some_and(|entry| entry.copy.as_os_str() == "Ipe.Tuple.ipe"
+                    && entry.temp.as_os_str() == ".Ipe.Tuple.ipe.tmp")
+            );
+            for refused in [
+                vec!["Ipe".to_owned(), "Nope".to_owned()],
+                vec!["Main".to_owned()],
+                vec!["..".to_owned()],
+                vec!["Ipe".to_owned(), "../../etc/passwd".to_owned()],
+                vec!["Ipe.Tuple".to_owned()],
+                vec![],
+            ] {
+                assert!(StdlibEntry::of(&refused).is_none(), "{refused:?}");
+            }
+        }
+
+        #[test]
+        fn the_key_is_a_full_sha256_digest_under_the_stdlib_dir() {
+            let key = cache_key();
+            assert_eq!(key.len(), 64);
+            assert!(key.bytes().all(|b| b.is_ascii_hexdigit()));
+            assert!(dir_under(Path::new("/c")).starts_with("/c/ipe/stdlib"));
+        }
+
+        #[cfg(unix)]
+        mod disk {
+            use std::fs;
+            use std::os::unix::fs::PermissionsExt as _;
+
+            use super::super::*;
+
+            fn tuple() -> Vec<String> {
+                vec!["Ipe".to_owned(), "Tuple".to_owned()]
+            }
+
+            fn tuple_source() -> &'static str {
+                COMPILED_STD_MODULES
+                    .iter()
+                    .find(|module| module.dotted == "Ipe.Tuple")
+                    .map_or("", |module| module.source)
+            }
+
+            /// A fresh private directory to root a cache base in.
+            #[allow(clippy::expect_used)] // test fixture: a failed mkdir IS the failure
+            fn scratch(name: &str) -> PathBuf {
+                let base = ipe_test_temp::temp_root()
+                    .canonicalize()
+                    .expect("canonical temp dir");
+                let dir = base.join(format!(
+                    "ipe-stdlib-cache-{name}-{}-{:?}",
+                    std::process::id(),
+                    std::thread::current().id()
+                ));
+                let _ = fs::remove_dir_all(&dir);
+                fs::create_dir_all(&dir).expect("create scratch dir");
+                fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+                    .expect("make scratch dir private");
+                dir
+            }
+
+            fn mode(path: &Path) -> u32 {
+                fs::symlink_metadata(path).map_or(0, |meta| meta.permissions().mode() & 0o777)
+            }
+
+            /// Replace the copy at `path` with `bytes`, writable, as a tamperer would.
+            #[allow(clippy::expect_used)] // test fixture: a failed tamper IS the failure
+            fn tamper(path: &Path, bytes: &[u8]) {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o644)).expect("chmod");
+                fs::write(path, bytes).expect("tamper");
+            }
+
+            #[test]
+            #[allow(clippy::expect_used)] // test fixture: a refused cache IS the failure
+            fn a_copy_is_written_read_only_into_a_private_versioned_dir() {
+                let base = scratch("fresh");
+                let cache = StdlibCache::open(&base).expect("the cache opens");
+                let path = cache
+                    .materialise(&tuple(), tuple_source())
+                    .expect("the copy is materialised");
+                assert_eq!(path, dir_under(&base).join("Ipe.Tuple.ipe"));
+                assert_eq!(
+                    fs::read_to_string(&path).ok().as_deref(),
+                    Some(tuple_source())
+                );
+                assert_eq!(mode(&path), 0o444);
+                assert_eq!(mode(&dir_under(&base)), 0o700);
+                assert!(!dir_under(&base).join(".Ipe.Tuple.ipe.tmp").exists());
+                assert_eq!(cache.materialise(&tuple(), tuple_source()), Some(path));
+            }
+
+            #[test]
+            #[allow(clippy::expect_used)] // test fixture: a refused cache IS the failure
+            fn a_tampered_partial_or_writable_copy_is_rewritten_never_served() {
+                let base = scratch("tampered");
+                let cache = StdlibCache::open(&base).expect("the cache opens");
+                let entry = StdlibEntry::of(&tuple()).expect("a table module");
+                let path = cache
+                    .materialise(&tuple(), tuple_source())
+                    .expect("the copy is materialised");
+                let truncated = tuple_source().as_bytes().get(..10).unwrap_or_default();
+                let appended = format!("{}\nevil = 1\n", tuple_source());
+                for bad in [b"module Evil".as_slice(), truncated, appended.as_bytes()] {
+                    tamper(&path, bad);
+                    assert!(!cache.holds(&entry), "a tampered copy never holds");
+                    assert_eq!(
+                        cache.materialise(&tuple(), tuple_source()),
+                        Some(path.clone())
+                    );
+                    assert_eq!(
+                        fs::read_to_string(&path).ok().as_deref(),
+                        Some(tuple_source())
+                    );
+                    assert_eq!(mode(&path), 0o444);
+                }
+                tamper(&path, tuple_source().as_bytes());
+                assert!(!cache.holds(&entry), "a writable copy never holds");
+                assert_eq!(
+                    cache.materialise(&tuple(), tuple_source()),
+                    Some(path.clone())
+                );
+                assert_eq!(mode(&path), 0o444);
+            }
+
+            #[test]
+            #[allow(clippy::expect_used)] // test fixture: a failed plant IS the failure
+            fn a_planted_link_is_replaced_and_its_target_left_untouched() {
+                let base = scratch("link");
+                let cache = StdlibCache::open(&base).expect("the cache opens");
+                let victim = base.join("victim.txt");
+                fs::write(&victim, "victim").expect("write victim");
+                let copy = dir_under(&base).join("Ipe.Tuple.ipe");
+                std::os::unix::fs::symlink(&victim, &copy).expect("plant link");
+                let temp = dir_under(&base).join(".Ipe.Tuple.ipe.tmp");
+                std::os::unix::fs::symlink(&victim, &temp).expect("plant temp link");
+                assert_eq!(
+                    cache.materialise(&tuple(), tuple_source()),
+                    Some(copy.clone())
+                );
+                assert_eq!(fs::read_to_string(&victim).ok().as_deref(), Some("victim"));
+                assert!(fs::symlink_metadata(&copy).is_ok_and(|meta| meta.is_file()));
+                assert_eq!(
+                    fs::read_to_string(&copy).ok().as_deref(),
+                    Some(tuple_source())
+                );
+            }
+
+            #[test]
+            #[allow(clippy::expect_used)] // test fixture: a failed mkdir IS the failure
+            fn a_directory_squatting_the_copy_name_yields_no_copy() {
+                let base = scratch("squat");
+                let cache = StdlibCache::open(&base).expect("the cache opens");
+                fs::create_dir(dir_under(&base).join("Ipe.Tuple.ipe")).expect("squat");
+                assert_eq!(cache.materialise(&tuple(), tuple_source()), None);
+            }
+
+            #[test]
+            #[allow(clippy::expect_used)] // test fixture: a refused cache IS the failure
+            fn a_foreign_module_or_foreign_text_writes_nothing() {
+                let base = scratch("foreign");
+                let cache = StdlibCache::open(&base).expect("the cache opens");
+                assert_eq!(
+                    cache.materialise(&tuple(), "module Ipe.Tuple exposing (x)"),
+                    None
+                );
+                assert_eq!(
+                    cache.materialise(&["Main".to_owned()], tuple_source()),
+                    None
+                );
+                assert_eq!(
+                    cache.materialise(&["Ipe".to_owned(), "..".to_owned()], tuple_source()),
+                    None
+                );
+                let written = fs::read_dir(dir_under(&base)).map_or(usize::MAX, Iterator::count);
+                assert_eq!(written, 0, "no refused module leaves a file behind");
+            }
+
+            #[test]
+            #[allow(clippy::expect_used)] // test fixture: a failed chmod IS the failure
+            fn a_cache_base_other_users_can_write_is_refused() {
+                let base = scratch("shared");
+                fs::set_permissions(&base, fs::Permissions::from_mode(0o777)).expect("chmod");
+                assert!(StdlibCache::open(&base).is_none());
+                fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).expect("chmod");
+            }
+        }
+    }
+}
+
+/// The driver's project loader, holding where stdlib copies are cached.
+struct DriverLoader {
+    /// The per-user cache base stdlib copies go under; `None` keeps the
+    /// embedded stdlib without an openable file.
+    stdlib_cache_base: Option<PathBuf>,
+}
 
 impl ProjectLoader for DriverLoader {
     fn load(
@@ -179,20 +618,33 @@ impl ProjectLoader for DriverLoader {
         // capped, and the FFI catalog read through the held cache directory.
         let resolved = watch::resolve_project_sources(root).map_err(|e| load_error(&e))?;
         let entry_module = resolved.entry_path;
+        let stdlib_cache = self
+            .stdlib_cache_base
+            .as_deref()
+            .and_then(stdlib_cache::StdlibCache::open);
         let files = resolved
             .snapshot
             .modules()
             .iter()
             .map(|(module, held)| {
-                let origin = match held.origin() {
+                let held_path = || held.path().to_path_buf();
+                let (origin, path) = match held.origin() {
                     SourceOrigin::Own(SourceDir::Src | SourceDir::Tests) => {
-                        ipe_canon::ModuleOrigin::User
+                        (ipe_canon::ModuleOrigin::User, held_path())
                     }
-                    SourceOrigin::Stdlib => ipe_canon::ModuleOrigin::EmbeddedStdlib,
-                    SourceOrigin::FfiInterface => ipe_canon::ModuleOrigin::FfiInterface,
+                    SourceOrigin::Stdlib => (
+                        ipe_canon::ModuleOrigin::EmbeddedStdlib,
+                        stdlib_cache
+                            .as_ref()
+                            .and_then(|cache| cache.materialise(module, held.text()))
+                            .unwrap_or_else(held_path),
+                    ),
+                    SourceOrigin::FfiInterface => {
+                        (ipe_canon::ModuleOrigin::FfiInterface, held_path())
+                    }
                 };
                 let file = LoadedFile {
-                    path: held.path().to_path_buf(),
+                    path,
                     text: held.text().to_owned(),
                     origin,
                 };
@@ -217,7 +669,10 @@ pub fn run_lsp(rest: &[String]) -> Result<(), CliError> {
     if !rest.is_empty() {
         return Err(CliError::Usage(text::msg::lsp_takes_no_arguments()));
     }
-    ipe_lsp_server::run_stdio(&DriverLoader).map_err(|e| CliError::Usage(text::msg::lsp_failed(&e)))
+    let loader = DriverLoader {
+        stdlib_cache_base: crate::resolve::default_cache_base().ok(),
+    };
+    ipe_lsp_server::run_stdio(&loader).map_err(|e| CliError::Usage(text::msg::lsp_failed(&e)))
 }
 
 #[cfg(test)]
@@ -233,6 +688,11 @@ mod tests {
     use crate::project_root::SourceTree;
 
     const MAIN: &str = "module Main exposing (main)\n\nmain =\n    0\n";
+
+    /// A loader that leaves the embedded stdlib without a cached copy.
+    const NO_STDLIB_CACHE: DriverLoader = DriverLoader {
+        stdlib_cache_base: None,
+    };
 
     /// Every trust refusal, one per variant.
     fn every_trust_refusal() -> Vec<TrustRefusal> {
@@ -361,12 +821,11 @@ mod tests {
     ///
     /// The exhaustive match over a witness value makes a new variant a build
     /// error here until it joins the list.
-    fn every_ffi_prep_error() -> [FfiPrepError; 9] {
+    fn every_ffi_prep_error() -> [FfiPrepError; 8] {
         let witness = FfiPrepError::ReservedModuleExists;
         match witness {
             FfiPrepError::ModuleClaimed { .. }
             | FfiPrepError::ReservedModuleExists
-            | FfiPrepError::AssertedRefused(_)
             | FfiPrepError::AssertedShimSeal(_)
             | FfiPrepError::DefineOpaqueCollision { .. }
             | FfiPrepError::DependencyMerge(_)
@@ -385,10 +844,6 @@ mod tests {
                 slug: "a".to_owned(),
             },
             FfiPrepError::ReservedModuleExists,
-            FfiPrepError::AssertedRefused(Box::new(ipe_ffi::diag::Diagnostic::ArtifactIo {
-                path: "/p/x.consumer.json".to_owned(),
-                detail: "refused".to_owned(),
-            })),
             FfiPrepError::AssertedShimSeal(dropped()),
             FfiPrepError::DefineOpaqueCollision {
                 slug: "a".to_owned(),
@@ -415,7 +870,6 @@ mod tests {
             refusal,
             FfiPrepError::ModuleClaimed { .. }
                 | FfiPrepError::ReservedModuleExists
-                | FfiPrepError::AssertedRefused(_)
                 | FfiPrepError::AssertedShimSeal(_)
         )
     }
@@ -474,7 +928,7 @@ mod tests {
             .into_iter()
             .filter(is_source_side)
             .collect();
-        assert_eq!(source_side.len(), 4, "{source_side:?}");
+        assert_eq!(source_side.len(), 3, "{source_side:?}");
         for refusal in source_side {
             let err = CliError::FfiPrep(Box::new(refusal));
             assert_eq!(
@@ -559,10 +1013,32 @@ mod tests {
         let fixture = RootFixture::main(MAIN).expect("fixture");
         let folder = fixture.path().join("src");
         let main = folder.join("Main.ipe");
-        let loaded = DriverLoader.load(std::slice::from_ref(&folder), &main, Some(MAIN));
+        let loaded = NO_STDLIB_CACHE.load(std::slice::from_ref(&folder), &main, Some(MAIN));
         let expected = CliError::NoManifest { dir: folder }.to_string();
         let err = loaded.err();
         assert_eq!(err, Some(LoadError::RootRefused(expected)));
+        assert_eq!(
+            err.as_ref().map(LoadError::disposition),
+            Some(ipe_lsp_server::LoadDisposition::Refuse)
+        );
+    }
+
+    /// A package that declares a dependency refuses the load with the
+    /// compiler's own not-compiled refusal, and the server keeps serving: the
+    /// refusal is a disposition, never a crash.
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed fixture IS the failure
+    fn a_declared_dependency_refuses_the_load() {
+        let tree = crate::project_root::SourceTree::main(MAIN)
+            .field("dependencies = [ depPath \"s-lib\" \"../s-lib\" ]");
+        let fixture = RootFixture::from_tree(&tree).expect("fixture");
+        let main = fixture.path().join("src").join("Main.ipe");
+        let loaded = NO_STDLIB_CACHE.load(&[fixture.path().to_path_buf()], &main, Some(MAIN));
+        let err = loaded.err();
+        assert!(
+            matches!(&err, Some(LoadError::RootRefused(detail)) if detail.contains("`s-lib`")),
+            "{err:?}"
+        );
         assert_eq!(
             err.as_ref().map(LoadError::disposition),
             Some(ipe_lsp_server::LoadDisposition::Refuse)
@@ -579,7 +1055,7 @@ mod tests {
         let nested = (0..=crate::project::MAX_DISCOVERY_DEPTH)
             .fold(src, |parent, index| parent.join(format!("D{index}")));
         fs::create_dir_all(&nested).expect("create nested source tree");
-        let loaded = DriverLoader.load(&[fixture.path().to_path_buf()], &main, Some(MAIN));
+        let loaded = NO_STDLIB_CACHE.load(&[fixture.path().to_path_buf()], &main, Some(MAIN));
         let err = loaded.err();
         assert!(
             matches!(
@@ -610,6 +1086,29 @@ mod tests {
         dir
     }
 
+    /// An asserted call into an uninstalled crate is a source refusal: the
+    /// load degrades with the IPE-F4414 refusal of that call, never refuses
+    /// the workspace, since an edit to the call lifts it.
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed fixture write IS the failure
+    fn an_asserted_call_refusal_degrades_the_load() {
+        let asserted = "module Main exposing (shifted)\nimport Rust.Ffi\n\n\n\
+                        shifted : Int -> Result Error Int\nshifted =\n    Rust.Ffi.call \"tm::shift\"\n";
+        let fixture = RootFixture::main(asserted).expect("fixture");
+        let main = fixture.path().join("src/Main.ipe");
+        let loaded = NO_STDLIB_CACHE.load(&[fixture.path().to_path_buf()], &main, Some(asserted));
+        let err = loaded.err();
+        assert!(
+            matches!(&err, Some(LoadError::Pipeline(detail))
+                if detail.contains("IPE-F4414") && detail.contains("tm::shift")),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.as_ref().map(LoadError::disposition),
+            Some(ipe_lsp_server::LoadDisposition::Degrade)
+        );
+    }
+
     /// A tampered FFI catalog under the project root refuses the load rather than degrading it.
     #[test]
     #[allow(clippy::expect_used)] // test fixture: a failed write IS the failure
@@ -618,7 +1117,7 @@ mod tests {
         let main = fixture.path().join("src/Main.ipe");
         let cache = private_chain(fixture.path(), &ipe_ffi::driver::FFI_CACHE_COMPONENTS);
         fs::write(cache.join("x.consumer.json"), "{ not json").expect("write artifact");
-        let loaded = DriverLoader.load(&[fixture.path().to_path_buf()], &main, Some(MAIN));
+        let loaded = NO_STDLIB_CACHE.load(&[fixture.path().to_path_buf()], &main, Some(MAIN));
         assert!(
             matches!(&loaded, Err(LoadError::FfiUntrusted(_))),
             "{:?}",
@@ -638,7 +1137,7 @@ mod tests {
             .status()
             .expect("run mkfifo");
         assert!(made.success(), "mkfifo creates the fixture");
-        let loaded = DriverLoader.load(&[fixture.path().to_path_buf()], &main, Some(MAIN));
+        let loaded = NO_STDLIB_CACHE.load(&[fixture.path().to_path_buf()], &main, Some(MAIN));
         let err = loaded.err();
         assert!(matches!(err, Some(LoadError::Refused(_))), "{err:?}");
         assert_eq!(
@@ -673,7 +1172,7 @@ mod tests {
             "the build refuses the link"
         );
 
-        let loaded = DriverLoader.load(&[fixture.path().to_path_buf()], &main, Some(MAIN));
+        let loaded = NO_STDLIB_CACHE.load(&[fixture.path().to_path_buf()], &main, Some(MAIN));
         let err = loaded.err();
         assert!(matches!(err, Some(LoadError::Refused(_))), "{err:?}");
 
@@ -721,7 +1220,7 @@ mod tests {
             .collect();
 
         let main = fixture.path().join("src/Main.ipe");
-        let loaded = DriverLoader
+        let loaded = NO_STDLIB_CACHE
             .load(&[fixture.path().to_path_buf()], &main, None)
             .expect("the LSP loads the project");
         let lsp_modules: Vec<(Vec<String>, PathBuf)> = loaded
@@ -769,5 +1268,61 @@ mod tests {
         };
         assert_eq!(cache_of(&build_root), Some(cache.clone()));
         assert_eq!(cache_of(&watched.root), Some(cache));
+    }
+
+    /// An imported stdlib module loads at its verified read-only cache copy, a user module at its source.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed fixture or load IS the failure
+    fn a_loaded_stdlib_module_points_at_its_verified_cache_copy() {
+        let source = "module Main exposing (main)\n\nimport Ipe.Tuple as Tuple\n\nmain =\n    Tuple.first ( 1, 2 )\n";
+        let fixture = RootFixture::main(source).expect("fixture");
+        let base = fixture.path().join("cache-base");
+        fs::create_dir(&base).expect("cache base");
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).expect("private base");
+        let caching = DriverLoader {
+            stdlib_cache_base: Some(base.clone()),
+        };
+        let main = fixture.path().join("src").join("Main.ipe");
+        let loaded = caching
+            .load(&[fixture.path().to_path_buf()], &main, Some(source))
+            .expect("the project loads");
+        let tuple = loaded
+            .files
+            .get(&vec!["Ipe".to_owned(), "Tuple".to_owned()])
+            .expect("the stdlib closure holds Ipe.Tuple");
+        assert_eq!(tuple.origin, ipe_canon::ModuleOrigin::EmbeddedStdlib);
+        assert_eq!(
+            tuple.path,
+            stdlib_cache::dir_under(&base).join("Ipe.Tuple.ipe")
+        );
+        assert_eq!(
+            fs::read_to_string(&tuple.path).ok().as_deref(),
+            Some(tuple.text.as_str())
+        );
+        let mode = fs::metadata(&tuple.path).map_or(0, |meta| meta.permissions().mode() & 0o777);
+        assert_eq!(mode, 0o444);
+        let user = loaded
+            .files
+            .get(&vec!["Main".to_owned()])
+            .expect("the entry module loads");
+        assert_eq!(user.path, main);
+    }
+
+    /// With no cache base the stdlib keeps its synthetic path, which names no openable file.
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed fixture or load IS the failure
+    fn without_a_cache_base_the_stdlib_keeps_no_openable_path() {
+        let source = "module Main exposing (main)\n\nimport Ipe.Tuple as Tuple\n\nmain =\n    Tuple.first ( 1, 2 )\n";
+        let fixture = RootFixture::main(source).expect("fixture");
+        let main = fixture.path().join("src").join("Main.ipe");
+        let loaded = NO_STDLIB_CACHE
+            .load(&[fixture.path().to_path_buf()], &main, Some(source))
+            .expect("the project loads");
+        let tuple = loaded
+            .files
+            .get(&vec!["Ipe".to_owned(), "Tuple".to_owned()])
+            .expect("the stdlib closure holds Ipe.Tuple");
+        assert!(tuple.path.is_relative(), "{}", tuple.path.display());
     }
 }

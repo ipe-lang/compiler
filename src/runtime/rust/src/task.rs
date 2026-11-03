@@ -36,7 +36,7 @@ use std::sync::OnceLock;
 static GLOBAL_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
-fn global_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
+fn global_runtime() -> Result<&'static tokio::runtime::Runtime, std::io::Error> {
     if let Some(rt) = GLOBAL_RUNTIME.get() {
         return Ok(rt);
     }
@@ -51,8 +51,7 @@ fn global_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
         .on_thread_start(|| {
             crate::core::record_stack_floor(crate::core::RUNTIME_THREAD_STACK_SIZE);
         })
-        .build()
-        .map_err(|e| format!("tokio runtime init failed: {e}"))?;
+        .build()?;
     // A racing initializer's spare runtime is dropped unused (no tasks on it).
     Ok(GLOBAL_RUNTIME.get_or_init(|| rt))
 }
@@ -136,6 +135,35 @@ where
 /// The name of the entry thread [`block_on`] drives its task on.
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 const BLOCK_ON_THREAD: &str = "ipe-block-on";
+
+/// The context an entry boundary reports a panic that is not a trip under.
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm-client")))]
+const ENTRY_PANIC_CONTEXT: &str = "async task panicked";
+
+/// The caller's error for an unwind that escaped the entry future.
+///
+/// A [`crate::core::RuntimeTrip`] keeps its typed kind; any other payload is
+/// a defect in compiled or runtime code, kinded `Unexpected` and redacted.
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm-client")))]
+fn entry_unwind_error<E: crate::FromIpeError>(payload: Box<dyn std::any::Any + Send>) -> E {
+    crate::core::ipe_error_from_unwind(
+        crate::core::UnwindBoundary::Task(ENTRY_PANIC_CONTEXT),
+        payload,
+    )
+}
+
+/// Drive an entry on the current thread, typing any unwind that escapes it.
+///
+/// The catch every entry that polls on the caller's own thread routes
+/// through (the std-only [`block_on`], `block_on_current_thread`), so a trip
+/// raised inside the entry future ends as its typed error, never a raw panic.
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm-client")))]
+fn drive_entry_caught<E: crate::FromIpeError, A>(
+    drive: impl FnOnce() -> IpeResult<E, A>,
+) -> IpeResult<E, A> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(drive))
+        .unwrap_or_else(|payload| IpeResult::Err(entry_unwind_error(payload)))
+}
 
 /// `task`, carried into every task-local scope its caller runs in, so code
 /// that runs on another task or thread on the caller's behalf sees the scopes
@@ -229,20 +257,20 @@ where
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 pub fn block_on<E, A>(future: IpeTask<E, A>) -> IpeResult<E, A>
 where
-    E: From<String> + crate::FromUnavailable + Send + 'static,
+    E: crate::FromUnavailable + crate::FromIpeError + Send + 'static,
     A: Send + 'static,
 {
     let rt = match global_runtime() {
         Ok(r) => r,
-        Err(e) => return IpeResult::Err(e.into()),
+        Err(e) => return IpeResult::Err(runtime_init_refused(&e)),
     };
     let future = on_behalf_of_caller(future);
     // The spawned OS thread keeps the entry poll outside any runtime context
     // (a nested `block_on` inside a worker thread would panic) and lets a
     // panicking future be `.join()`-mapped to `Err` instead of aborting. The
-    // caught payload routes through the redacting foreign-panic funnel: raw
-    // detail goes to the server log under a correlation id, and the typed
-    // Ipê error carries only the generic message plus that id.
+    // caught payload routes through `entry_unwind_error`: a runtime trip keeps
+    // its typed kind, and any other payload is logged under a correlation id
+    // while the typed Ipê error carries only the generic message plus that id.
     //
     // The entry thread is spawned with the uniform 8 MiB stack and records its
     // floor first thing, so a guarded recursion entered directly from `block_on`
@@ -264,10 +292,18 @@ where
             );
         }
     };
-    match handle.join() {
-        Ok(r) => r,
-        Err(payload) => IpeResult::Err(ipe_error_from_panic("async task panicked", payload)),
-    }
+    handle
+        .join()
+        .unwrap_or_else(|payload| IpeResult::Err(entry_unwind_error(payload)))
+}
+
+/// The caller's error for a tokio runtime the OS would not build.
+///
+/// A runtime that cannot start (no threads, no event-loop descriptor) is a
+/// host resource refusal, so it is kinded `Unavailable`.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+fn runtime_init_refused<E: crate::FromUnavailable>(e: &std::io::Error) -> E {
+    E::from_unavailable(format!("tokio runtime init failed: {e}"))
 }
 
 // Std-only entry for a program that reaches NO reactor-requiring kernel: its
@@ -292,10 +328,10 @@ where
 // pre-park check sees it, clears it, and re-polls instead of parking. This is
 // the canonical race-free park/unpark handshake.
 //
-// TOTALITY: no unwrap/expect/panic/indexing. A panic inside the future
-// propagates to the entry boundary's synchronous-panic classifier (the same
-// place the tokio path's non-spawned webview driver relies on) — there is no
-// spawn here to `.join()`, matching `block_on_current_thread`'s contract.
+// TOTALITY: no unwrap/expect/panic/indexing. A panic inside the future is
+// caught by `drive_entry_caught` on this thread (there is no spawn to
+// `.join()`): a runtime trip ends as its typed error, any other panic as a
+// redacted `Unexpected`, the same outcomes the tokio entry's join gives.
 // The std-only single-thread poll loop — no tokio, no spawn. It is the LIVE
 // `block_on` on two targets: a `tokio`-less host build, AND co-located WASI
 // (`wasm32-wasip1`), whose single-threaded reactor has no tokio *crate* (tokio
@@ -309,9 +345,35 @@ where
 ))]
 pub fn block_on<E, A>(future: IpeTask<E, A>) -> IpeResult<E, A>
 where
-    E: From<String> + Send + 'static,
+    E: crate::FromIpeError + Send + 'static,
     A: Send + 'static,
 {
+    block_on_std(future)
+}
+
+/// The std-only entry: poll `future` on this thread inside the entry catch.
+///
+/// The body of the std-only [`block_on`]. It is also compiled in every native
+/// test build, so its tests run whichever config links `block_on` (the CI test
+/// runs all link the tokio one).
+#[cfg(all(
+    not(all(target_arch = "wasm32", feature = "wasm-client")),
+    any(not(feature = "tokio"), target_arch = "wasm32", test)
+))]
+fn block_on_std<E, A>(future: IpeTask<E, A>) -> IpeResult<E, A>
+where
+    E: crate::FromIpeError + Send + 'static,
+    A: Send + 'static,
+{
+    drive_entry_caught(move || poll_on_current_thread(future))
+}
+
+/// Poll `future` to completion on the current thread with a park/unpark waker.
+#[cfg(all(
+    not(all(target_arch = "wasm32", feature = "wasm-client")),
+    any(not(feature = "tokio"), target_arch = "wasm32", test)
+))]
+fn poll_on_current_thread<E, A>(future: IpeTask<E, A>) -> IpeResult<E, A> {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::{Context, Poll, Wake, Waker};
@@ -379,16 +441,13 @@ where
 // drivers available.
 //
 // TOTALITY: runtime-init failure returns `Err` (no unwrap/expect/panic). There
-// is no spawn here, so there is no `.join()` panic-catch — a panic inside the
-// webview future would propagate (the synchronous-panic gate at the entry
-// boundary classifies it). That is acceptable for the webview shape: the
-// webview path itself is total (window/webview construction failure returns
-// `IpeResult::Err`), so a panic would be a genuine compiler/runtime bug, not a
-// well-typed-Ipê-reachable abort.
+// is no spawn here, so there is no `.join()` panic-catch; the poll runs inside
+// `drive_entry_caught` instead, so a runtime trip in the webview Task chain
+// ends as its typed error and any other panic as a redacted `Unexpected`.
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 pub fn block_on_current_thread<E, A>(future: IpeTask<E, A>) -> IpeResult<E, A>
 where
-    E: From<String> + Send + 'static,
+    E: crate::FromUnavailable + crate::FromIpeError + Send + 'static,
     A: Send + 'static,
 {
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -396,9 +455,9 @@ where
         .build()
     {
         Ok(r) => r,
-        Err(e) => return IpeResult::Err(format!("tokio runtime init failed: {}", e).into()),
+        Err(e) => return IpeResult::Err(runtime_init_refused(&e)),
     };
-    rt.block_on(future)
+    drive_entry_caught(move || rt.block_on(future))
 }
 
 pub fn task_succeed<E: Send + 'static, A: Send + 'static>(a: A) -> IpeTask<E, A> {
@@ -795,7 +854,10 @@ where
 // its entry differently (`spawn_local`), so it is excluded there but present on
 // `wasm32-wasip1`, where a `Direct` program's `main` calls it.
 #[cfg(not(all(target_arch = "wasm32", feature = "wasm-client")))]
-pub fn task_run<E: From<String> + crate::FromUnavailable + Send + 'static, A: Send + 'static>(
+pub fn task_run<
+    E: crate::FromUnavailable + crate::FromIpeError + Send + 'static,
+    A: Send + 'static,
+>(
     task: IpeTask<E, A>,
 ) -> IpeResult<E, A> {
     block_on(task)
@@ -837,16 +899,17 @@ pub fn task_run<E: From<String> + crate::FromUnavailable + Send + 'static, A: Se
 //
 // TOTALITY: no unwrap/expect/panic/indexing. A `JoinError` from `h.await` is a
 // panic inside the spawned task (we never `.await` a handle after issuing its
-// abort, so the cancelled-handle case is unreachable on this path); its payload
-// routes through the redacting foreign-panic funnel — detail server-side under
-// a correlation id, a generic typed `Err` to Ipê. The cancelled arm stays
-// total via the foreign-error funnel rather than an unreachable assumption.
+// abort, so the cancelled-handle case is reachable only on runtime shutdown);
+// `parallel_child_failure` hands a runtime trip back under its typed kind;
+// any other panic, and a cancel, it logs server-side under a correlation id and
+// hands Ipê a generic `Unexpected` naming the panic or the cancel. The
+// cancelled arm stays total rather than resting on an unreachable assumption.
 /// One spawned `Task.parallel` child and the guard that aborts it on drop.
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 type ParallelChild<E, A> = (tokio::task::JoinHandle<IpeResult<E, A>>, AbortOnDrop);
 
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
-pub fn task_parallel<E: From<String> + Send + 'static, A: Send + 'static>(
+pub fn task_parallel<E: crate::FromIpeError + Send + 'static, A: Send + 'static>(
     tasks: Vec<IpeTask<E, A>>,
 ) -> IpeTask<E, Vec<A>> {
     Box::pin(async move {
@@ -870,12 +933,7 @@ pub fn task_parallel<E: From<String> + Send + 'static, A: Send + 'static>(
             guard.defuse();
             let result = match joined {
                 Ok(r) => r,
-                Err(join_err) => match join_err.try_into_panic() {
-                    Ok(payload) => {
-                        IpeResult::Err(ipe_error_from_panic("parallel task panicked", payload))
-                    }
-                    Err(join_err) => IpeResult::Err(ipe_error_from_foreign(join_err)),
-                },
+                Err(join_err) => IpeResult::Err(parallel_child_failure(join_err)),
             };
             match result {
                 IpeResult::Ok(a) => out.push(a),
@@ -894,6 +952,26 @@ pub fn task_parallel<E: From<String> + Send + 'static, A: Send + 'static>(
         }
         ok_res(out)
     })
+}
+
+/// The caller's error for a `Task.parallel` child that did not finish.
+///
+/// A runtime trip in a child keeps its typed kind. Any other panic, or a
+/// cancel, is a defect in compiled or runtime code, not a foreign failure, so
+/// it is kinded `Unexpected` and named for what it is; the payload or
+/// `JoinError` detail is logged under the correlation id only.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+fn parallel_child_failure<E: crate::FromIpeError>(join_err: tokio::task::JoinError) -> E {
+    match join_err.try_into_panic() {
+        Ok(payload) => crate::core::ipe_error_from_unwind(
+            crate::core::UnwindBoundary::Task("parallel task panicked"),
+            payload,
+        ),
+        Err(join_err) => E::from_ipe_error(crate::IpeError::unexpected(format!(
+            "parallel task cancelled (ref {})",
+            crate::core::note_foreign_error(join_err)
+        ))),
+    }
 }
 
 // Std-only `Task.parallel` for the `tokio`-less emitted crate. `Task.parallel`
@@ -921,7 +999,7 @@ pub fn task_parallel<E: From<String> + Send + 'static, A: Send + 'static>(
     not(all(target_arch = "wasm32", feature = "wasm-client")),
     any(not(feature = "tokio"), target_arch = "wasm32")
 ))]
-pub fn task_parallel<E: From<String> + Send + 'static, A: Send + 'static>(
+pub fn task_parallel<E: Send + 'static, A: Send + 'static>(
     tasks: Vec<IpeTask<E, A>>,
 ) -> IpeTask<E, Vec<A>> {
     Box::pin(async move {
@@ -1019,7 +1097,8 @@ where
                     }
                     let delay = retry_compute_delay(strategy, base, attempt);
                     if delay > 0 {
-                        tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(delay.unsigned_abs()))
+                            .await;
                     }
                     attempt += 1;
                 }
@@ -1075,8 +1154,9 @@ fn retry_compute_delay(strategy: BackoffStrategy, base_ms: i64, attempt: i64) ->
         super::random::lcg_init();
         let unit = (super::random::lcg_next() >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0);
         let scaled = (d as f64) * (0.5 + unit);
-        // round-to-nearest, then re-clamp.
-        d = scaled.round() as i64;
+        // Round to nearest, then re-clamp. `scaled` is finite and below
+        // `1.5 * RETRY_DELAY_CAP_MS`, so the cap fallback is unreachable.
+        d = super::narrow::f64_trunc_to_i64(scaled.round()).unwrap_or(RETRY_DELAY_CAP_MS);
         if d > RETRY_DELAY_CAP_MS {
             d = RETRY_DELAY_CAP_MS;
         }
@@ -1396,6 +1476,23 @@ mod block_on_refusal_tests {
             IpeResult::Ok(v) => panic!("a refused entry thread must not run the task, got Ok({v})"),
         }
     }
+
+    // A runtime the OS would not build is a retryable host refusal, never the
+    // unclassified `Unexpected` a bare-`String` bridge would give it.
+    #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+    #[test]
+    fn runtime_init_failure_is_unavailable() {
+        let refused = std::io::Error::other("no threads");
+        let err: crate::IpeError = runtime_init_refused(&refused);
+        assert_eq!(
+            crate::ipe_error_kind(err.clone()),
+            crate::IpeErrorKind::Unavailable
+        );
+        assert_eq!(
+            crate::ipe_error_message(err),
+            "tokio runtime init failed: no threads"
+        );
+    }
 }
 
 // Exercises the concurrent spawn-based `task_parallel` (`tokio::spawn` + abort),
@@ -1510,10 +1607,37 @@ mod parallel_abort_tests {
         ];
         match task_parallel(tasks).await {
             IpeResult::Err(e) => assert!(
-                e.starts_with("parallel task panicked (ref "),
-                "parallel panic must fold to the funnel message: {e}"
+                e.starts_with("Unexpected: parallel task panicked (ref "),
+                "a runtime-side panic folds to the funnel message, kinded Unexpected: {e}"
             ),
             IpeResult::Ok(v) => panic!("expected a typed Err, got Ok({v:?})"),
+        }
+    }
+
+    // A cancelled child is named as a cancel, never as an external failure:
+    // nothing foreign ran, so the text must not point the reader at FFI.
+    #[tokio::test]
+    async fn cancelled_parallel_child_is_named_a_cancel() {
+        let handle = tokio::spawn(std::future::pending::<()>());
+        handle.abort();
+        let joined = handle.await;
+        assert!(
+            joined
+                .as_ref()
+                .is_err_and(tokio::task::JoinError::is_cancelled),
+            "an aborted spawn joins as a cancel: {joined:?}"
+        );
+        if let Err(join_err) = joined {
+            let err: crate::IpeError = parallel_child_failure(join_err);
+            assert_eq!(
+                crate::ipe_error_kind(err.clone()),
+                crate::IpeErrorKind::Unexpected
+            );
+            let message = crate::ipe_error_message(err);
+            assert!(
+                message.starts_with("parallel task cancelled (ref "),
+                "got: {message:?}"
+            );
         }
     }
 
@@ -1555,12 +1679,51 @@ mod parallel_abort_tests {
 // Proves the std-only `block_on` (the `tokio`-less entry) drives a future to
 // completion correctly: a ready future returns immediately, and a future that
 // yields `Pending` once — then is woken from another thread — is re-polled and
-// completes without busy-spinning (the park/unpark handshake). Runs only in the
-// `tokio`-less config, which is the one that links that `block_on`.
-#[cfg(all(not(feature = "tokio"), not(target_arch = "wasm32")))]
+// completes without busy-spinning (the park/unpark handshake), and that a trip
+// or a foreign panic escaping the future ends as a typed error. It drives
+// `block_on_std`, the std-only `block_on`'s body, so it runs in every native
+// config, the tokio ones CI tests included.
+#[cfg(not(target_arch = "wasm32"))]
 #[cfg(test)]
 mod std_block_on_tests {
     use super::*;
+    use block_on_std as block_on;
+
+    // The std-only entry types an unwind escaping its future, exactly as the
+    // tokio entry's join does: a trip keeps `LimitExceeded`, any other payload
+    // is a redacted `Unexpected`.
+    #[test]
+    fn std_entry_types_a_trip_and_redacts_a_foreign_panic() {
+        use crate::core::{RuntimeTrip, trip};
+        let tripped: IpeTask<IpeError, i64> = Box::pin(async { trip(RuntimeTrip::RecursionLimit) });
+        let got = block_on(tripped);
+        assert!(matches!(got, IpeResult::Err(_)), "a trip must end as Err");
+        if let IpeResult::Err(err) = got {
+            assert_eq!(
+                crate::ipe_error_kind(err.clone()),
+                crate::IpeErrorKind::LimitExceeded
+            );
+            assert_eq!(
+                crate::ipe_error_message(err),
+                RuntimeTrip::RECURSION_LIMIT_MESSAGE
+            );
+        }
+        let foreign: IpeTask<IpeError, i64> =
+            Box::pin(async { std::panic::resume_unwind(Box::new("sk_live_SECRET".to_owned())) });
+        let got = block_on(foreign);
+        assert!(matches!(got, IpeResult::Err(_)), "a panic must end as Err");
+        if let IpeResult::Err(err) = got {
+            assert_eq!(
+                crate::ipe_error_kind(err.clone()),
+                crate::IpeErrorKind::Unexpected
+            );
+            let message = crate::ipe_error_message(err);
+            assert!(
+                message.starts_with("async task panicked (ref ") && !message.contains("SECRET"),
+                "got: {message:?}"
+            );
+        }
+    }
 
     #[test]
     fn ready_future_completes_immediately() {
@@ -1625,6 +1788,97 @@ mod std_block_on_tests {
             2,
             "driver must park, not spin"
         );
+    }
+}
+
+// Every entry boundary types the unwind that escapes it: a runtime trip keeps
+// its own kind and message, and any other payload is a redacted `Unexpected`.
+// `block_on` here is whichever entry the config links (the spawning tokio one or
+// the std-only poller); `drive_entry_caught` is the shared current-thread catch.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(test)]
+mod entry_unwind_tests {
+    use super::*;
+    use crate::core::{RuntimeTrip, trip};
+
+    /// An entry body that raises a recursion trip.
+    fn tripped() -> IpeResult<IpeError, i64> {
+        trip(RuntimeTrip::RecursionLimit)
+    }
+
+    /// An entry body that unwinds with a foreign payload carrying a secret.
+    fn foreign_panicked() -> IpeResult<IpeError, i64> {
+        std::panic::resume_unwind(Box::new("sk_live_SECRET".to_string()))
+    }
+
+    fn tripping_task() -> IpeTask<IpeError, i64> {
+        Box::pin(async { tripped() })
+    }
+
+    fn foreign_panicking_task() -> IpeTask<IpeError, i64> {
+        Box::pin(async { foreign_panicked() })
+    }
+
+    fn assert_recursion_limit<A>(got: IpeResult<IpeError, A>) {
+        assert!(matches!(got, IpeResult::Err(_)), "a trip must end as Err");
+        let IpeResult::Err(err) = got else { return };
+        assert_eq!(
+            crate::ipe_error_kind(err.clone()),
+            crate::IpeErrorKind::LimitExceeded
+        );
+        assert_eq!(
+            crate::ipe_error_message(err),
+            RuntimeTrip::RECURSION_LIMIT_MESSAGE
+        );
+    }
+
+    fn assert_redacted_unexpected(got: IpeResult<IpeError, i64>) {
+        assert!(matches!(got, IpeResult::Err(_)), "a panic must end as Err");
+        let IpeResult::Err(err) = got else { return };
+        assert_eq!(
+            crate::ipe_error_kind(err.clone()),
+            crate::IpeErrorKind::Unexpected
+        );
+        let message = crate::ipe_error_message(err);
+        assert!(
+            message.starts_with("async task panicked (ref "),
+            "got: {message:?}"
+        );
+        assert!(!message.contains("SECRET"), "payload leaked: {message:?}");
+    }
+
+    #[test]
+    fn block_on_types_a_trip_as_limit_exceeded() {
+        assert_recursion_limit(block_on(tripping_task()));
+    }
+
+    #[test]
+    fn block_on_redacts_a_foreign_panic_as_unexpected() {
+        assert_redacted_unexpected(block_on(foreign_panicking_task()));
+    }
+
+    #[test]
+    fn drive_entry_caught_types_both_shapes() {
+        assert_recursion_limit(drive_entry_caught(tripped));
+        assert_redacted_unexpected(drive_entry_caught(foreign_panicked));
+        assert!(matches!(
+            drive_entry_caught::<IpeError, i64>(|| IpeResult::Ok(3)),
+            IpeResult::Ok(3)
+        ));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn block_on_current_thread_types_a_trip() {
+        assert_recursion_limit(block_on_current_thread(tripping_task()));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn parallel_child_trip_is_limit_exceeded() {
+        let tasks: Vec<IpeTask<IpeError, i64>> =
+            vec![Box::pin(async { IpeResult::Ok(1) }), tripping_task()];
+        assert_recursion_limit(task_parallel(tasks).await);
     }
 }
 

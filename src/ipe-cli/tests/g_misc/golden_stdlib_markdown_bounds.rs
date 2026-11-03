@@ -12,7 +12,7 @@
 //! inflate, never on its wall time.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ipe_docs::markdown::MAX_BLOCKQUOTE_DEPTH;
@@ -494,17 +494,18 @@ fn emit_bounds_program(slug: &str) -> Option<PathBuf> {
     Some(out)
 }
 
-/// The built bounds binary; the caller has already gated the unit tier.
-fn bounds_binary(slug: &str) -> String {
-    let dir = emit_bounds_program(slug);
-    assert!(dir.is_some(), "the bounds program must emit for `{slug}`");
-    let exe =
-        dir.and_then(|dir| build_emitted_binary_checked(&format!("markdown_bounds_{slug}"), &dir));
-    assert!(exe.is_some(), "the bounds program must build for `{slug}`");
-    exe.unwrap_or_default()
+/// The built bounds binary for `slug`.
+///
+/// A failure names the stage (emit or build) that failed; the caller has
+/// already gated the unit tier.
+#[allow(clippy::expect_used)] // a bounds program that fails to emit or build fails the test
+fn bounds_binary(slug: &str) -> e2e_support::SharedBuild {
+    let dir = emit_bounds_program(slug).expect("the bounds program must emit");
+    build_emitted_binary_checked(&format!("markdown_bounds_{slug}"), &dir)
+        .expect("the bounds program must build")
 }
 
-fn run_case(exe: &str, case: Case, n: usize) -> TimedRunOutcome {
+fn run_case(exe: &Path, case: Case, n: usize) -> TimedRunOutcome {
     let stdin = format!("{} {n}\n", case.name());
     run_with_stdin_deadline(
         &format!("markdown_bounds_{}", case.name()),
@@ -515,7 +516,7 @@ fn run_case(exe: &str, case: Case, n: usize) -> TimedRunOutcome {
 }
 
 /// Run one case, require a clean exit, and return its trimmed digest line.
-fn digest_of(exe: &str, case: Case, n: usize) -> String {
+fn digest_of(exe: &Path, case: Case, n: usize) -> String {
     let out = run_case(exe, case, n);
     assert_eq!(
         out.exit_code,
@@ -645,7 +646,7 @@ fn superlinear_ratio(base: Duration, quadrupled: Duration) -> Option<f64> {
 /// CPU time, never wall time: a wall clock also counts the time the child
 /// waited for a core while sibling tests ran, which reads as growth.
 #[cfg(target_os = "linux")]
-fn parse_work(exe: &str, case: Case, n: usize) -> CpuTime {
+fn parse_work(exe: &Path, case: Case, n: usize) -> CpuTime {
     let runs = (0..3).map(|_| {
         let out = run_case(exe, case, n);
         assert_eq!(out.exit_code, Some(0), "`{} {n}` must exit 0", case.name());
@@ -759,8 +760,7 @@ fn run_shell(name: &str, script: &str) -> TimedRunOutcome {
             "chmod script"
         );
     }
-    let exe = path.to_string_lossy().into_owned();
-    let out = run_with_stdin_deadline(name, &exe, b"", DEADLINE);
+    let out = run_with_stdin_deadline(name, &path, b"", DEADLINE);
     let _ = fs::remove_dir_all(&dir);
     out
 }
@@ -823,11 +823,10 @@ fn a_child_that_never_reads_stdin_is_killed_at_the_deadline() {
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).is_ok(),
         "chmod script"
     );
-    let exe = script.to_string_lossy().into_owned();
     let input = vec![b'x'; 4 << 20];
     let started = std::time::Instant::now();
     let run = std::panic::catch_unwind(|| {
-        run_with_stdin_deadline("never_reads", &exe, &input, Duration::from_millis(300))
+        run_with_stdin_deadline("never_reads", &script, &input, Duration::from_millis(300))
     });
     let took = started.elapsed();
     let _ = fs::remove_dir_all(&dir);

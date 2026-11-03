@@ -28,7 +28,7 @@ Three knots.
 ## A worked example: resolving a theme through nested lookups
 
 The example under
-[`examples/shapes/script/maybe-settings-lookup`](../../examples/shapes/script/maybe-settings-lookup/src/Main.ipe)
+[`examples/shapes/script/maybe-settings-lookup`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/maybe-settings-lookup/src/Main.ipe)
 resolves a user's display theme through three lookups, any of which may come up
 empty: user id -> their settings row -> the `"theme"` key.
 
@@ -89,7 +89,7 @@ says *whether* a value is there, `Result` also says *why* it isn't. Use `Maybe`
 when absence needs no explanation (a key simply isn't in the dictionary); reach
 for `Result` when the caller needs to know the reason it failed.
 
-[principles]: ../../PRINCIPLES.md
+[principles]: https://github.com/ipe-lang/compiler/blob/main/PRINCIPLES.md
 
 ## References
 

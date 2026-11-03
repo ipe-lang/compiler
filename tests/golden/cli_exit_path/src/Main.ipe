@@ -1,0 +1,78 @@
+module Main exposing (main)
+
+-- Exit-path fixture: the `Main.cli.ipe` prompt view, whose update ends the
+-- process through `System.exit 0` on the line `quit`. Piped, every frame is
+-- its own newline-ended plain line, and the exit adds no byte after the last.
+
+import Ipe.String as String
+import Ipe.System as System
+import Ipe.Tea.Cli exposing (tea)
+import Ipe.Tea.Cli.Cmd as Cmd
+import Ipe.Tea.Cli.Sub as Sub
+import Ipe.Ui.Cli as Ui
+import Ipe.Ui.Cli exposing (Lines)
+
+
+type Msg
+    = Echo String
+    | Quit
+    | NoOp
+
+
+type alias Model =
+    { count : Int
+    , last : String
+    }
+
+
+init : () -> ( Model, Cmd Msg )
+init _unit =
+    ( { count = 0, last = "" }, Cmd.none )
+
+
+update : Msg -> Model -> ( Model, Cmd Msg )
+update msg model =
+    case msg of
+        Echo line ->
+            ( { count = model.count + 1, last = line }, Cmd.none )
+
+        Quit ->
+            ( model, Cmd.perform (System.exit 0) (\_ -> NoOp) )
+
+        NoOp ->
+            ( model, Cmd.none )
+
+
+view : Model -> Lines Msg
+view model =
+    Ui.text
+        ("echoed "
+            ++ String.fromInt model.count
+            ++ " ["
+            ++ model.last
+            ++ "] > "
+        )
+
+
+subscriptions : Model -> Sub Msg
+subscriptions _model =
+    Sub.onLine onLine
+
+
+onLine : String -> Msg
+onLine line =
+    case String.trim line of
+        "quit" ->
+            Quit
+
+        trimmed ->
+            Echo trimmed
+
+
+main =
+    tea
+        { init = init
+        , update = update
+        , view = view
+        , subscriptions = subscriptions
+        }

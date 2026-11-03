@@ -93,7 +93,7 @@ fn a_non_png_icon_stops_the_served_build() {
     let result = build_installable("served_install_icon_gif", b"GIF89a\x00\x02\x00\x02");
     let expected = ipe::text::msg::manifest_icon_not_png(&format!("{ICON:?}")).to_string();
     assert!(
-        matches!(&result, Err(CliError::Usage(msg)) if msg.contains(&expected)),
+        matches!(&result, Err(CliError::ProjectRefused(msg)) if msg.contains(&expected)),
         "the build is refused with {expected:?}: {result:?}"
     );
 }
@@ -103,7 +103,7 @@ fn a_non_png_icon_stops_the_served_build() {
 fn a_fit_icon_is_past_the_icon_rule() {
     let result = build_installable("served_install_icon_fit", &png(192));
     assert!(
-        !matches!(&result, Err(CliError::Usage(msg)) if msg.contains("icon")),
+        !matches!(&result, Err(CliError::ProjectRefused(msg)) if msg.contains("icon")),
         "a fit icon is not refused: {result:?}"
     );
 }
@@ -173,7 +173,7 @@ fn an_installable_build_serves_its_manifest_and_icon() {
         .and_then(|l| l.local_addr())
         .expect("an ephemeral port")
         .port();
-    let _app = App(Command::new(exe)
+    let _app = App(Command::new(&exe)
         .env("IPE_WEB_PORT", port.to_string())
         .env("IPE_CSRF", "off")
         .env("IPE_CONSOLE_EMBED", "off")

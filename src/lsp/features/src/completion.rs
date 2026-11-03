@@ -118,18 +118,24 @@ pub fn completions(
     };
     let source = file.text(db);
 
+    // Completion is code-only: a trigger byte inside a comment or string
+    // literal (BUG-CLASSES 8ck) must never offer anything, so this gate runs
+    // before any candidate is even considered.
+    if ipe_parse::position_context(source, byte) != ipe_parse::PositionContext::Code {
+        return Vec::new();
+    }
+
     // Demand all salsa queries before locking the interner — each query
     // internally acquires + releases the interner lock, and the Mutex is not
     // reentrant. All results are cloned out of their `Arc` wrappers here so
     // the interner is free when we acquire it below.
-    let canonical = crate::db_access::canonicalize_checked(db, root, entry, file);
+    let canonical =
+        crate::db_access::analysis(db, root, entry, file).map(|analysis| analysis.canonical);
     let dep_canonicals = collect_dep_canonicals(db, root, entry, file);
     // This module's own binding types, from the per-module `typecheck_module`
     // projection (keyed by bare name — the home is fixed to this module).
-    let module_env: Option<BTreeMap<Symbol, Ty>> = ipe_db::typecheck_module(db, root, entry, file)
-        .as_ref()
-        .ok()
-        .map(|types| types.env.clone());
+    let module_env: Option<BTreeMap<Symbol, Ty>> =
+        crate::db_access::module_types(db, root, entry, file).map(|types| types.env.clone());
     // Dep bindings' types come from the deps' own per-module projections, so a
     // cross-module value candidate still carries its solved type for ranking.
     let dep_envs: Vec<(Vec<Symbol>, BTreeMap<Symbol, Ty>)> =
@@ -245,6 +251,14 @@ pub fn qualified_completions(
     let files = root.files(db);
     let &file = files.get(module)?;
     let source = file.text(db);
+
+    // Same code-only gate as `completions` — checked before
+    // `scan_qualifier_prefix` runs, since that scanner has no comment/string
+    // awareness of its own (BUG-CLASSES 8ck).
+    if ipe_parse::position_context(source, byte) != ipe_parse::PositionContext::Code {
+        return None;
+    }
+
     let trigger = ipe_parse::scan_qualifier_prefix(source, byte)?;
 
     let spellings = ipe_db::scan_import_spellings(source);
@@ -287,12 +301,12 @@ pub fn qualified_completions(
     let Some(&dep_file) = files.get(&dep_path) else {
         return Some(Vec::new());
     };
-    let Some(dep_canon) = crate::db_access::canonicalize_checked(db, root, entry, dep_file) else {
+    let Some(dep_canon) =
+        crate::db_access::analysis(db, root, entry, dep_file).map(|analysis| analysis.canonical)
+    else {
         return Some(Vec::new());
     };
-    let dep_env: BTreeMap<Symbol, Ty> = ipe_db::typecheck_module(db, root, entry, dep_file)
-        .as_ref()
-        .ok()
+    let dep_env: BTreeMap<Symbol, Ty> = crate::db_access::module_types(db, root, entry, dep_file)
         .map(|t| t.env.clone())
         .unwrap_or_default();
 
@@ -350,8 +364,8 @@ fn collect_dep_canonicals(
     let mut out = Vec::new();
     for (dep_path, resolution) in resolutions.iter() {
         if let ipe_db::ImportResolution::Resolved(dep_file) = resolution
-            && let Some(dep_canon) =
-                crate::db_access::canonicalize_checked(db, root, entry, *dep_file)
+            && let Some(dep_canon) = crate::db_access::analysis(db, root, entry, *dep_file)
+                .map(|analysis| analysis.canonical)
         {
             // Keep the salsa `Arc` — the consumers only borrow it, so a
             // refcount bump replaces a full deep-copy of the canonical module.
@@ -377,7 +391,7 @@ fn collect_dep_envs(
     let mut out = Vec::new();
     for (dep_path, resolution) in resolutions.iter() {
         if let ipe_db::ImportResolution::Resolved(dep_file) = resolution
-            && let Ok(dep_types) = ipe_db::typecheck_module(db, root, entry, *dep_file)
+            && let Some(dep_types) = crate::db_access::module_types(db, root, entry, *dep_file)
         {
             let dep_home: Vec<Symbol> = {
                 let mut interner = db.interner().lock();

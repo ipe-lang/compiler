@@ -319,7 +319,7 @@ pub(crate) fn sanitise_identifier(name: &str) -> String {
 /// the offending manifest field.
 ///
 /// # Errors
-/// [`CliError::Usage`] when `root_name` is not one spelled name.
+/// [`CliError::ProjectRefused`] when `root_name` is not one spelled name.
 fn reject_traversing_bundle_root(
     root_name: &str,
     display_name: &str,
@@ -327,7 +327,7 @@ fn reject_traversing_bundle_root(
     if ipe_fs_open::is_one_spelled_name(std::ffi::OsStr::new(root_name)) {
         return Ok(());
     }
-    Err(super::super::CliError::Usage(
+    Err(super::super::CliError::ProjectRefused(
         crate::text::msg::bundle_name_not_a_component(&display_name),
     ))
 }
@@ -833,7 +833,7 @@ mod tests {
             let identity = BundleIdentity::new(hostile, Some("1.0.0"), BundleId::derived(hostile));
             let result = layout(DesktopOs::MacOs, &identity, &accepts(&[]), None);
             assert!(
-                matches!(result, Err(crate::CliError::Usage(_))),
+                matches!(result, Err(crate::CliError::ProjectRefused(_))),
                 "a traversing macOS bundle name {hostile:?} must be refused, not joined, got {result:?}"
             );
         }

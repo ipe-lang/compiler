@@ -19,7 +19,6 @@
 use ipe_canon::ast::{Expr_, Pattern_};
 use ipe_db::{Db as _, IpeDatabase, SourceRoot};
 use ipe_diagnostics::{Located, Span};
-use ipe_intern::Symbol;
 use ipe_types::{Ty, VarNamer, ty_to_doc};
 use lsp_types::{InlayHint, InlayHintKind, InlayHintLabel, Range};
 
@@ -52,25 +51,10 @@ pub fn inlay_hints(
     };
     let text = file.text(db);
 
-    // Only produce hints when the type environment is available.
-    let Ok(solved) = ipe_db::typecheck(db, root, entry) else {
+    // Only produce hints when the module's types are available.
+    let Some(types) = crate::db_access::module_types(db, root, entry, file) else {
         return Vec::new();
     };
-
-    // Build the home symbol path once.
-    let (home_syms, interner_needed): (Vec<Symbol>, bool) = {
-        let mut interner = db.interner().lock();
-        let syms: Option<Vec<Symbol>> = module
-            .iter()
-            .map(|s| interner.intern(s).ok())
-            .collect::<Option<Vec<_>>>();
-        drop(interner);
-        match syms {
-            Some(s) => (s, true),
-            None => return Vec::new(),
-        }
-    };
-    let _ = interner_needed;
 
     let mut hints: Vec<InlayHint> = Vec::new();
 
@@ -93,7 +77,7 @@ pub fn inlay_hints(
         let name_sym = value.value.name.value;
 
         // Look up the type.
-        let Some(ty) = solved.env.get(&(home_syms.clone(), name_sym)) else {
+        let Some(ty) = types.env.get(&name_sym) else {
             continue;
         };
 
@@ -116,9 +100,8 @@ pub fn inlay_hints(
     // Local `let` binder hints, typed from the per-module region map — the same
     // span-keyed solved types a hover reads. A binder is skipped unless its RHS
     // sits in a solved region and renders to a concrete type (fail-closed).
-    if let Some(canonical) = crate::db_access::canonicalize_checked(db, root, entry, file)
-        && let Ok(types) = ipe_db::typecheck_module(db, root, entry, file)
-    {
+    if let Some(analysis) = crate::db_access::analysis(db, root, entry, file) {
+        let canonical = analysis.canonical;
         let interner = db.interner().lock();
         for def in &canonical.module.defs {
             let body = match def {

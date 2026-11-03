@@ -20,7 +20,7 @@
 //! The extractor never authors prose: it only relays comment text and the
 //! `name : Type` signature line exactly as they appear in the source.
 
-use ipe_stdlib::{COMPILED_STD_MODULES, DOC_ONLY_MODULES, MODULES as STDLIB_MODULES};
+use ipe_stdlib::{COMPILED_STD_MODULES, DOC_ONLY_MODULES, MODULES as STDLIB_MODULES, StdTier};
 
 /// A single documented export of a stdlib module.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,6 +49,12 @@ pub struct ModuleDoc {
     pub module_doc: Option<String>,
     /// Every top-level declaration the module defines, in source order.
     pub exports: Vec<ExportDoc>,
+    /// This module's presentation tier (public API, or a low-level port
+    /// layer). Carried straight from the `COMPILED_STD_MODULES` row that
+    /// named it — [`extract_module_doc`] alone has no row to read, so it
+    /// defaults to [`StdTier::Public`]; [`all_module_docs`] overwrites that
+    /// default with the row's own tier for every compiled-source module.
+    pub tier: StdTier,
 }
 
 /// Extract documentation for every embedded stdlib module (both the
@@ -62,7 +68,11 @@ pub fn all_module_docs() -> Vec<ModuleDoc> {
         out.push(extract_module_doc(m.name, m.source));
     }
     for m in COMPILED_STD_MODULES {
-        out.push(extract_module_doc(m.dotted, m.source));
+        let mut doc = extract_module_doc(m.dotted, m.source);
+        // The tier is this row's own typed field, never re-derived from
+        // `dotted`'s spelling.
+        doc.tier = m.tier;
+        out.push(doc);
     }
     for m in DOC_ONLY_MODULES {
         out.push(extract_module_doc(m.dotted, m.source));
@@ -76,18 +86,87 @@ pub fn all_module_docs() -> Vec<ModuleDoc> {
     out
 }
 
+/// Partition reference-index modules into the public API and the low-level
+/// port layers, by each module's `tier` field alone — never by matching
+/// `.Internals` against its name.
+///
+/// Returns `(public, port_layers)`.
+#[must_use]
+pub fn group_by_tier(modules: &[ModuleDoc]) -> (Vec<&ModuleDoc>, Vec<&ModuleDoc>) {
+    modules
+        .iter()
+        .partition(|m| matches!(m.tier, StdTier::Public))
+}
+
 /// Extract documentation for one module from its dotted name and raw source.
+///
+/// The returned [`ModuleDoc::tier`] defaults to [`StdTier::Public`] — this
+/// function has no `COMPILED_STD_MODULES` row to read a real tier from.
+/// [`all_module_docs`] overwrites the default with the row's own tier for
+/// every compiled-source module.
 #[must_use]
 pub fn extract_module_doc(dotted: &str, source: &str) -> ModuleDoc {
     let short = dotted.strip_prefix("Ipe.").unwrap_or(dotted).to_owned();
-    let module_doc = extract_module_header(source);
-    let exports = extract_exports(source);
+    let module_doc = extract_module_header(source).map(|doc| doc.body);
+    let exports = extract_exports(source)
+        .into_iter()
+        .map(|export| ExportDoc {
+            name: export.name,
+            signature: export.signature,
+            doc: export.doc.map(|doc| doc.body),
+        })
+        .collect();
     ModuleDoc {
         dotted: dotted.to_owned(),
         short,
         module_doc,
         exports,
+        tier: StdTier::Public,
     }
+}
+
+/// A documentation body together with the source line its first line sits on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocText {
+    /// The 1-based source line of the body's first line; every later body
+    /// line sits on the next source line, so body line `k` is source line
+    /// `line + k - 1`.
+    pub line: usize,
+    /// The documentation body, exactly as [`extract_module_doc`] serves it.
+    pub body: String,
+}
+
+/// Whose documentation a [`DocText`] is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DocOwner {
+    /// The module header's own comment.
+    Module,
+    /// The comment above the named export.
+    Export(String),
+}
+
+/// Every documentation body [`extract_module_doc`] serves for `source`.
+///
+/// The module header comes first, then each export in `exposing` order, each
+/// with the source line it starts on.
+#[must_use]
+pub fn served_doc_texts(source: &str) -> Vec<(DocOwner, DocText)> {
+    extract_module_header(source)
+        .map(|doc| (DocOwner::Module, doc))
+        .into_iter()
+        .chain(
+            extract_exports(source)
+                .into_iter()
+                .filter_map(|export| export.doc.map(|doc| (DocOwner::Export(export.name), doc))),
+        )
+        .collect()
+}
+
+/// One export's head and its documentation with its source line.
+struct SourcedExport {
+    name: String,
+    signature: Option<String>,
+    doc: Option<DocText>,
 }
 
 /// Parse the names listed in the module's `exposing ( … )` clause, in source
@@ -219,7 +298,7 @@ fn push_exposed_name(names: &mut Vec<String>, token: &str) {
 /// comment line immediately preceding the `module` keyword.
 ///
 /// Both the `-- |`/`--` line form and the `{-| … -}` block form are accepted.
-fn extract_module_header(source: &str) -> Option<String> {
+fn extract_module_header(source: &str) -> Option<DocText> {
     let lines: Vec<&str> = source.lines().collect();
     let module_idx = lines
         .iter()
@@ -244,7 +323,7 @@ fn extract_module_header(source: &str) -> Option<String> {
     if start == module_idx {
         return None;
     }
-    gather_line_doc(lines.get(start..module_idx).unwrap_or(&[]))
+    gather_line_doc(lines.get(start..module_idx).unwrap_or(&[]), start)
 }
 
 /// Extract the module's exported declarations, in `exposing` order.
@@ -258,12 +337,13 @@ fn extract_module_header(source: &str) -> Option<String> {
 /// When the module declares an explicit `exposing ( … )` list, only the listed
 /// names are emitted, in list order. A module with `exposing (..)` (none do at
 /// present) falls back to every declaration in source order.
-fn extract_exports(source: &str) -> Vec<ExportDoc> {
+fn extract_exports(source: &str) -> Vec<SourcedExport> {
     let lines: Vec<&str> = source.lines().collect();
 
     // Collect every top-level declaration head, keyed by name, first
     // occurrence wins (a `name : T` signature precedes its `name = …` body).
-    let mut decls: std::collections::HashMap<String, ExportDoc> = std::collections::HashMap::new();
+    let mut decls: std::collections::HashMap<String, SourcedExport> =
+        std::collections::HashMap::new();
     let mut source_order: Vec<String> = Vec::new();
 
     // Track `{- … -}` block-comment nesting so that a `{-| … -}` doc-block's
@@ -288,7 +368,7 @@ fn extract_exports(source: &str) -> Vec<ExportDoc> {
         source_order.push(name.clone());
         decls.insert(
             name.clone(),
-            ExportDoc {
+            SourcedExport {
                 name,
                 signature,
                 doc,
@@ -301,7 +381,7 @@ fn extract_exports(source: &str) -> Vec<ExportDoc> {
     let order = parse_exposing(source).unwrap_or(source_order);
     order
         .into_iter()
-        .filter_map(|name| decls.get(&name).cloned())
+        .filter_map(|name| decls.remove(&name))
         .collect()
 }
 
@@ -397,7 +477,7 @@ fn declaration_head(line: &str) -> Option<(String, Option<String>)> {
 ///
 /// Looks for a `{-| … -}` block or a `-- |` line block ending on the line
 /// directly above `decl_idx` (no intervening blank line).
-fn declaration_doc(lines: &[&str], decl_idx: usize) -> Option<String> {
+fn declaration_doc(lines: &[&str], decl_idx: usize) -> Option<DocText> {
     if decl_idx == 0 {
         return None;
     }
@@ -432,13 +512,13 @@ fn declaration_doc(lines: &[&str], decl_idx: usize) -> Option<String> {
     {
         return None;
     }
-    gather_line_doc(block)
+    gather_line_doc(block, start)
 }
 
 /// If a `{-| … -}` block closes on the line directly above `idx`, return its
 /// body (delimiters stripped, blank-line-separated intervening lines allowed
 /// inside the block but not between the block and `idx`).
-fn block_doc_ending_before(lines: &[&str], idx: usize) -> Option<String> {
+fn block_doc_ending_before(lines: &[&str], idx: usize) -> Option<DocText> {
     if idx == 0 {
         return None;
     }
@@ -458,23 +538,37 @@ fn block_doc_ending_before(lines: &[&str], idx: usize) -> Option<String> {
         open -= 1;
     }
     let raw = lines.get(open..idx).unwrap_or(&[]).join("\n");
-    let body = raw
+    // Each step keeps the byte offset of its slice's start within `raw`, so
+    // the body's first line is counted from the newlines before it.
+    let (after_open, after_open_at) = raw
         .trim_start()
         .strip_prefix("{-|")
-        .unwrap_or(&raw)
+        .map_or((raw.as_str(), 0), |rest| (rest, raw.len() - rest.len()));
+    let (inner, inner_at) = after_open
         .trim_end()
         .strip_suffix("-}")
-        .unwrap_or(&raw)
-        .trim()
-        .to_owned();
-    if body.is_empty() { None } else { Some(body) }
+        .map_or((raw.as_str(), 0), |rest| (rest, after_open_at));
+    let body = inner.trim();
+    if body.is_empty() {
+        return None;
+    }
+    let body_at = inner_at + (inner.len() - inner.trim_start().len());
+    let newlines_before = raw
+        .get(..body_at)
+        .map_or(0, |head| head.matches('\n').count());
+    Some(DocText {
+        line: open + newlines_before + 1,
+        body: body.to_owned(),
+    })
 }
 
-/// Join a run of `-- |` / `--` comment lines into a documentation body,
-/// stripping the leading comment markers and preserving relative structure.
-fn gather_line_doc(block: &[&str]) -> Option<String> {
-    let mut body_lines: Vec<String> = Vec::new();
-    for line in block {
+/// Join a run of `-- |` / `--` comment lines into a documentation body.
+///
+/// The run's first line sits at 0-based source index `first`; the leading
+/// comment markers are stripped and relative structure is preserved.
+fn gather_line_doc(block: &[&str], first: usize) -> Option<DocText> {
+    let mut body_lines: Vec<(usize, String)> = Vec::new();
+    for (offset, line) in block.iter().enumerate() {
         let t = line.trim_start();
         let stripped = if let Some(rest) = t.strip_prefix("-- |") {
             rest
@@ -485,20 +579,25 @@ fn gather_line_doc(block: &[&str]) -> Option<String> {
         };
         // Drop exactly one leading space (the conventional `-- text` gap).
         let stripped = stripped.strip_prefix(' ').unwrap_or(stripped);
-        body_lines.push(stripped.trim_end().to_owned());
+        body_lines.push((first + offset + 1, stripped.trim_end().to_owned()));
     }
     // Trim leading/trailing blank lines.
-    while body_lines.first().is_some_and(String::is_empty) {
-        body_lines.remove(0);
-    }
-    while body_lines.last().is_some_and(String::is_empty) {
-        body_lines.pop();
-    }
-    let joined = body_lines.join("\n");
+    let kept_from = body_lines.iter().position(|(_, text)| !text.is_empty())?;
+    let kept_to = body_lines
+        .iter()
+        .rposition(|(_, text)| !text.is_empty())
+        .map_or(kept_from, |last| last + 1);
+    let kept = body_lines.get(kept_from..kept_to)?;
+    let line = kept.first()?.0;
+    let joined = kept
+        .iter()
+        .map(|(_, text)| text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     if joined.trim().is_empty() {
         None
     } else {
-        Some(joined)
+        Some(DocText { line, body: joined })
     }
 }
 
@@ -553,6 +652,58 @@ foo n = n + 1
             .expect("foo export");
         assert_eq!(foo.signature.as_deref(), Some("foo : Int -> Int"));
         assert_eq!(foo.doc.as_deref(), Some("Adds one to `n`."));
+    }
+
+    /// Each served body names the source line its first line sits on, for
+    /// both comment forms and the module header.
+    #[test]
+    fn served_doc_texts_give_each_bodys_first_source_line() {
+        let src = "\
+-- | The demo module.
+module Ipe.Demo exposing (foo, bar)
+
+{-|
+  Adds one.
+
+      foo 1
+-}
+foo : Int -> Int
+foo n = n + 1
+
+-- |
+-- Doubles.
+bar : Int -> Int
+bar n = n * 2
+";
+        let got: Vec<(DocOwner, usize, String)> = served_doc_texts(src)
+            .into_iter()
+            .map(|(owner, doc)| (owner, doc.line, doc.body))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (DocOwner::Module, 1, "The demo module.".to_owned()),
+                (
+                    DocOwner::Export("foo".to_owned()),
+                    5,
+                    "Adds one.\n\n      foo 1".to_owned()
+                ),
+                (
+                    DocOwner::Export("bar".to_owned()),
+                    13,
+                    "Doubles.".to_owned()
+                ),
+            ]
+        );
+        let module = extract_module_doc("Ipe.Demo", src);
+        let served: Vec<Option<String>> = module.exports.into_iter().map(|e| e.doc).collect();
+        assert_eq!(
+            served,
+            vec![
+                Some("Adds one.\n\n      foo 1".to_owned()),
+                Some("Doubles.".to_owned())
+            ]
+        );
     }
 
     #[test]
@@ -808,6 +959,42 @@ make = { size = 1 }
         assert!(
             result.exports.iter().any(|e| e.name == "withDefault"),
             "Result must list `withDefault` (header-prose `module`/`exposing` must not mislead the parser)"
+        );
+    }
+
+    /// The reference index partitions every compiled-source module into the
+    /// public group and the port-layer group by its typed `tier` alone: a
+    /// `.Internals` module always lands in the port-layer group, and nothing
+    /// outside `COMPILED_STD_MODULES`'s port-layer rows ever does.
+    #[test]
+    fn reference_index_groups_by_tier() {
+        let modules = all_module_docs();
+        let (public, port_layers) = group_by_tier(&modules);
+
+        assert!(!port_layers.is_empty(), "no port-layer module found");
+        for m in &port_layers {
+            assert!(
+                matches!(m.tier, StdTier::PortLayer { .. }),
+                "{} grouped as a port layer but is not tiered PortLayer",
+                m.dotted
+            );
+            assert!(
+                m.dotted.ends_with(".Internals"),
+                "{} grouped as a port layer but is not spelled `.Internals`",
+                m.dotted
+            );
+        }
+        for m in &public {
+            assert!(
+                matches!(m.tier, StdTier::Public),
+                "{} grouped as public but is not tiered Public",
+                m.dotted
+            );
+        }
+        assert_eq!(
+            public.len() + port_layers.len(),
+            modules.len(),
+            "every module must land in exactly one group"
         );
     }
 

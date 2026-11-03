@@ -16,6 +16,7 @@ pub mod decoder_pipeline_gate;
 mod env;
 pub mod link;
 pub mod module_classify;
+pub mod name_index;
 pub mod reach;
 pub mod ref_index;
 pub mod rename;
@@ -32,13 +33,14 @@ use ipe_diagnostics::DResult;
 use ipe_intern::{Interner, Symbol};
 
 pub use env::{
-    CtorHome, Env, KernelTypeExport, ModuleCatalog, STDLIB_MODULE_QUALIFIERS, UnionParams, VarHome,
-    bare_import_binds, const_str_eq, kernel_import_binds_last_segment, stdlib_canonical_qualifier,
+    CmdOrSub, CtorHome, Env, KernelTypeExport, ModuleCatalog, STDLIB_MODULE_QUALIFIERS,
+    UnionParams, VarHome, bare_import_binds, cmd_sub_module, const_str_eq,
+    kernel_import_binds_last_segment, stdlib_canonical_qualifier,
 };
 pub use resolve::{
-    DO_BIND_MODULE, ModuleOrigin, QualifierForm, builtin_empty_home_arity, import_qualifier_forms,
-    import_qualifiers, is_reserved_builtin_type_name, is_stdlib_shared_carrier_type,
-    is_user_type_declaration_forbidden, to_snake_case,
+    DO_BIND_MODULE, DeclFailure, DeclaredSignature, ModuleOrigin, PartialModule, QualifierForm,
+    decl_extent, import_qualifier_forms, import_qualifiers, is_reserved_builtin_type_name,
+    is_stdlib_shared_carrier_type, is_user_type_declaration_forbidden, to_snake_case,
 };
 
 /// A type alias exported by a module, resolved in the defining module's scope.
@@ -85,6 +87,10 @@ pub struct ModuleExports {
     pub ctors: BTreeMap<Symbol, CtorHome>,
     /// Exported type aliases by name.
     pub aliases: BTreeMap<Symbol, ExportedAlias>,
+    /// Every union and alias the module declares but does not export: disjoint
+    /// from `types` and `aliases` by construction. A qualified use of one is
+    /// refused as not exposed rather than reported missing.
+    pub private_types: BTreeSet<Symbol>,
     /// Exported Stage-4 kernel aliases: value names whose binding is
     /// `f = Kernel.kernel "Module_function"`, mapped to the resolved kernel target
     /// `(StdlibKernel, module, function)`.
@@ -216,6 +222,46 @@ pub fn canonicalise_module_in_project(
     interner: &mut Interner,
 ) -> DResult<(ast::Module, ModuleExports)> {
     resolve::canonicalise_module_in_project(m, expected_path, deps, catalog, origin, interner)
+}
+
+/// Canonicalise a module like [`canonicalise_module_in_project`], also returning its name index.
+///
+/// The [`name_index::NameIndex`] maps every name occurrence the resolver
+/// resolved to its target, recorded by the same pass that builds the module,
+/// so the module is byte-identical to the one the unindexed entry returns.
+///
+/// # Errors
+/// Same set as [`canonicalise_module_in_project`].
+pub fn canonicalise_module_indexed(
+    m: &ipe_syntax::Module,
+    expected_path: &[Symbol],
+    deps: &BTreeMap<Vec<Symbol>, &ModuleExports>,
+    catalog: &ModuleCatalog,
+    origin: ModuleOrigin,
+    interner: &mut Interner,
+) -> DResult<(ast::Module, ModuleExports, name_index::NameIndex)> {
+    resolve::canonicalise_module_indexed(m, expected_path, deps, catalog, origin, interner)
+}
+
+/// Canonicalise a module like [`canonicalise_module_indexed`], declaration by declaration.
+///
+/// A value declaration that fails is left out of the module and reported in
+/// [`PartialModule::failures`]; the rest of the module still canonicalises.
+/// [`canonicalise_module_indexed`] is this result refused with its first
+/// error, so the two never disagree on a module with no failure.
+///
+/// # Errors
+/// Every refusal of [`canonicalise_module_indexed`] that is not one value
+/// declaration's or one whole-module check's.
+pub fn canonicalise_module_partial(
+    m: &ipe_syntax::Module,
+    expected_path: &[Symbol],
+    deps: &BTreeMap<Vec<Symbol>, &ModuleExports>,
+    catalog: &ModuleCatalog,
+    origin: ModuleOrigin,
+    interner: &mut Interner,
+) -> DResult<PartialModule> {
+    resolve::canonicalise_module_partial(m, expected_path, deps, catalog, origin, interner)
 }
 
 #[cfg(test)]
@@ -5574,6 +5620,85 @@ mod tests {
                 }) if **name == *want
             ),
             "`{want}` is unbound, got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// A module whose first value fails, then a value whose body mints a binder.
+    const FAIL_THEN_MINT: &str = "module Main exposing (main)\n\n\
+                                  bad =\n    missing\n\n\
+                                  inc n =\n    n + 1\n\n\
+                                  later =\n    inc >> inc\n\n\
+                                  main =\n    1\n";
+
+    /// Whether `interner` holds a binder minted for a composition in `src`.
+    fn holds_compose_binder(interner: &Interner, src: &str) -> bool {
+        let stem = ipe_intern::SynthStem::Compose.text();
+        (0..=src.len())
+            .any(|lo| (lo..=src.len()).any(|hi| interner.contains(&format!("{stem}{lo}_{hi}"))))
+    }
+
+    /// Canonicalise [`FAIL_THEN_MINT`] in a project; the interner afterwards.
+    fn project_pass(
+        partial: bool,
+    ) -> Result<(Interner, Result<(), Diagnostic>), Box<dyn std::error::Error>> {
+        let mut interner = Interner::new();
+        let parsed =
+            ipe_parse::parse_module(FAIL_THEN_MINT, &mut interner).map_err(|e| format!("{e:?}"))?;
+        let expected = parsed.name.value.clone();
+        let catalog = ModuleCatalog::new(std::iter::empty::<Box<str>>());
+        let deps = BTreeMap::new();
+        let outcome = if partial {
+            canonicalise_module_partial(
+                &parsed,
+                &expected,
+                &deps,
+                &catalog,
+                ModuleOrigin::User,
+                &mut interner,
+            )
+            .map(|_| ())
+        } else {
+            canonicalise_module_indexed(
+                &parsed,
+                &expected,
+                &deps,
+                &catalog,
+                ModuleOrigin::User,
+                &mut interner,
+            )
+            .map(|_| ())
+        };
+        Ok((interner, outcome))
+    }
+
+    #[test]
+    fn the_strict_project_entry_stops_at_the_first_failed_declaration()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The partial pass reaches `later` and mints its binder, so the probe
+        // is not vacuous.
+        let (collected, partial) = project_pass(true)?;
+        assert!(partial.is_ok(), "the partial pass keeps going: {partial:?}");
+        assert!(holds_compose_binder(&collected, FAIL_THEN_MINT));
+        let (strict, outcome) = project_pass(false)?;
+        assert!(outcome.is_err(), "`bad` refuses the module");
+        assert!(
+            !holds_compose_binder(&strict, FAIL_THEN_MINT),
+            "the strict entry canonicalised a declaration after the first failure"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_strict_single_module_entry_stops_at_the_first_failed_declaration()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut interner = Interner::new();
+        let parsed =
+            ipe_parse::parse_module(FAIL_THEN_MINT, &mut interner).map_err(|e| format!("{e:?}"))?;
+        assert!(canonicalise(&parsed, &mut interner).is_err());
+        assert!(
+            !holds_compose_binder(&interner, FAIL_THEN_MINT),
+            "the single-module entry canonicalised a declaration after the first failure"
         );
         Ok(())
     }

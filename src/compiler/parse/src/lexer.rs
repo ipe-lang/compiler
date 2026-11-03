@@ -310,58 +310,233 @@ impl<'src> Lexer<'src> {
     /// matching `-}` before end of input.
     fn skip_trivia(&mut self) -> DResult<()> {
         loop {
-            match self.peek() {
-                Some(c) if c == ' ' || c == '\t' || c == '\r' || c == '\n' => self.advance(),
-                // Line comment: `-- … \n`. Consume everything up to (but not
-                // including) the newline, then loop so the newline itself is
-                // consumed as whitespace on the next iteration.
-                Some('-') if self.peek2() == Some('-') => {
-                    while let Some(c) = self.peek() {
-                        if c == '\n' {
-                            break;
-                        }
-                        self.advance();
-                    }
+            let lo = self.offset();
+            match self.trivia_step() {
+                None => return Ok(()),
+                Some(Trivia::BlockComment { closed: false }) => {
+                    return Err(Diagnostic::Parse {
+                        span: Span::new(lo, self.offset()),
+                        msg: ParseError::UnterminatedBlockComment,
+                    });
                 }
-                // Block comment: `{- … -}`, nestable. A `{-` inside a comment
-                // increments the depth; a `-}` decrements it; depth 0 ends.
-                // A `{-|` opener is a doc-comment token — leave it for the
-                // main lex loop to emit as [`Tok::DocComment`].
-                Some('{') if self.peek2() == Some('-') && self.peek3() != Some('|') => {
-                    let lo = self.offset();
-                    self.advance(); // consume `{`
-                    self.advance(); // consume `-`
-                    let mut depth: u32 = 1;
-                    loop {
-                        match self.peek() {
-                            None => {
-                                return Err(Diagnostic::Parse {
-                                    span: Span::new(lo, self.offset()),
-                                    msg: ParseError::UnterminatedBlockComment,
-                                });
-                            }
-                            Some('{') if self.peek2() == Some('-') => {
-                                self.advance();
-                                self.advance();
-                                depth = depth.saturating_add(1);
-                            }
-                            Some('-') if self.peek2() == Some('}') => {
-                                self.advance();
-                                self.advance();
-                                depth -= 1;
-                                if depth == 0 {
-                                    break;
-                                }
-                            }
-                            Some(_) => self.advance(),
-                        }
-                    }
-                }
-                _ => break,
+                Some(
+                    Trivia::Space | Trivia::LineComment | Trivia::BlockComment { closed: true },
+                ) => {}
             }
         }
-        Ok(())
     }
+
+    /// Consume one trivia item at the cursor and say which, or `None` (consuming
+    /// nothing) when the cursor is at a token or end of input. The one trivia
+    /// grammar: [`Lexer::skip_trivia`] and [`lexical_regions`] both read it.
+    fn trivia_step(&mut self) -> Option<Trivia> {
+        match self.peek() {
+            Some(' ' | '\t' | '\r' | '\n') => {
+                self.advance();
+                Some(Trivia::Space)
+            }
+            // Line comment: `-- … \n`. Consume everything up to (but not
+            // including) the newline, which the next step reads as space.
+            Some('-') if self.peek2() == Some('-') => {
+                self.skip_to_line_end();
+                Some(Trivia::LineComment)
+            }
+            // Block comment: `{- … -}`, nestable. A `{-` inside a comment
+            // increments the depth; a `-}` decrements it; depth 0 ends.
+            // A `{-|` opener is a doc-comment token — leave it for the
+            // token dispatch ([`Opener::DocComment`]).
+            Some('{') if self.peek2() == Some('-') && self.peek3() != Some('|') => {
+                self.advance(); // consume `{`
+                self.advance(); // consume `-`
+                // Depth only compares against 0, and a source holds at most
+                // `u32::MAX / 2` openers, so the saturating add never matters.
+                let mut depth: u32 = 1;
+                loop {
+                    match self.peek() {
+                        None => return Some(Trivia::BlockComment { closed: false }),
+                        Some('{') if self.peek2() == Some('-') => {
+                            self.advance();
+                            self.advance();
+                            depth = depth.saturating_add(1);
+                        }
+                        Some('-') if self.peek2() == Some('}') => {
+                            self.advance();
+                            self.advance();
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                return Some(Trivia::BlockComment { closed: true });
+                            }
+                        }
+                        Some(_) => self.advance(),
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Advance to the next `\n` (not consumed) or end of input.
+    fn skip_to_line_end(&mut self) {
+        while let Some(c) = self.peek() {
+            if c == '\n' {
+                break;
+            }
+            self.advance();
+        }
+    }
+}
+
+/// One trivia item [`Lexer::trivia_step`] consumed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Trivia {
+    /// One whitespace character.
+    Space,
+    /// A `--` comment, up to its line break.
+    LineComment,
+    /// A `{- … -}` comment; `closed` is false when input ended inside it.
+    BlockComment { closed: bool },
+}
+
+/// The lexical context a byte offset sits in: ordinary code, one of the
+/// comment kinds, or inside a string/char literal.
+///
+/// [`lexical_regions`] is the only producer; completion (`ipe_lsp_features`)
+/// gates on [`position_context`], refusing everywhere but
+/// [`PositionContext::Code`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PositionContext {
+    /// Ordinary code: whitespace, an identifier, keyword, number, or operator.
+    Code,
+    /// Inside a `-- …` line comment.
+    LineComment,
+    /// Inside a `{- … -}` block comment (nestable).
+    BlockComment,
+    /// Inside a `{-| … -}` doc comment (not nestable, see [`lex_doc_comment`]).
+    DocComment,
+    /// Inside a `"…"` or `"""…"""` string literal, `{{expr}}` interpolation
+    /// bodies included: their grammar is the canonicaliser's, so they are
+    /// never claimed as code here.
+    String,
+    /// Inside a `'…'` character literal.
+    Char,
+}
+
+/// One region of source as the lexer reads it: a trivia item or a token.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LexicalRegion {
+    /// The bytes the lexer consumed for this region.
+    pub span: Span,
+    /// What the region is.
+    pub context: PositionContext,
+    /// Whether a cursor at `span.hi` is still inside: true for a line comment
+    /// (it runs to the line break the cursor sits before) and for a region the
+    /// lexer refused as unterminated or malformed (the user is still typing it).
+    pub open_end: bool,
+}
+
+impl LexicalRegion {
+    /// Whether a cursor at byte `offset` sits inside this region: past its
+    /// first byte, and before its last (or at its end when `open_end`).
+    #[must_use]
+    pub const fn holds(&self, offset: u32) -> bool {
+        self.span.lo < offset
+            && (offset < self.span.hi || (self.open_end && offset == self.span.hi))
+    }
+}
+
+/// Every region of `src` in order, read by the lexer's own recognisers.
+///
+/// Those are [`Lexer::trivia_step`] (the one [`Lexer::skip_trivia`] loops)
+/// and [`lex_opened`] (the one [`lex`] calls per token), never a second
+/// grammar (BUG-CLASSES 8ck).
+///
+/// Unlike [`lex`] it never fails, because completion answers over a buffer
+/// mid-edit. A literal or comment the lexer refuses is one region running to
+/// the end of the line it was refused on (to end of input for a `"""` string
+/// or a comment, where the refusal stands); a code token the lexer refuses is
+/// one region of code over the bytes its recogniser read (at least one
+/// character), and reading resumes where it stopped. No byte is read twice,
+/// so the walk is linear in `src.len()`.
+#[must_use]
+pub fn lexical_regions(src: &str) -> LexicalRegions<'_> {
+    LexicalRegions {
+        lx: Lexer::new(src),
+    }
+}
+
+/// The region one token read from `c` at `lo` covers: its context, and
+/// whether it is open-ended because the lexer refused it.
+fn token_region(lx: &mut Lexer<'_>, c: char, lo: u32) -> (PositionContext, bool) {
+    let opener = Opener::of(lx, c);
+    let context = opener.context();
+    match lex_opened(lx, opener, c, lo) {
+        Ok(_) => (context, false),
+        // A refused code token keeps the bytes its recogniser read — digits,
+        // a fraction, an exponent, or one operator character, never a comment
+        // or literal opener — so reading resumes where it stopped and no byte
+        // is read twice. A refusal that read nothing (an unknown character)
+        // is advanced past by the progress guard in `next`.
+        Err(_) if context == PositionContext::Code => (context, false),
+        Err(_) => {
+            lx.skip_to_line_end();
+            (context, true)
+        }
+    }
+}
+
+impl Trivia {
+    /// The context and open end of the region this trivia step covered.
+    const fn region(self) -> (PositionContext, bool) {
+        match self {
+            Self::Space => (PositionContext::Code, false),
+            Self::LineComment => (PositionContext::LineComment, true),
+            Self::BlockComment { closed } => (PositionContext::BlockComment, !closed),
+        }
+    }
+}
+
+/// The iterator [`lexical_regions`] returns.
+pub struct LexicalRegions<'src> {
+    lx: Lexer<'src>,
+}
+
+impl Iterator for LexicalRegions<'_> {
+    type Item = LexicalRegion;
+
+    fn next(&mut self) -> Option<LexicalRegion> {
+        let lx = &mut self.lx;
+        let lo = lx.offset();
+        let c = lx.peek()?;
+        let (context, open_end) = lx
+            .trivia_step()
+            .map_or_else(|| token_region(lx, c, lo), Trivia::region);
+        // A refusal of an unknown character reads nothing; one character of
+        // progress per region keeps the walk finite.
+        if lx.offset() <= lo {
+            lx.advance();
+        }
+        Some(LexicalRegion {
+            span: Span::new(lo, lx.offset()),
+            context,
+            open_end,
+        })
+    }
+}
+
+/// The lexical context of a cursor at byte `offset` in `src`: the
+/// [`LexicalRegion`] that [`holds`](LexicalRegion::holds) it, else code.
+///
+/// An offset past the end of `src` reads as the end of `src`. A cursor
+/// between two regions (before an opening quote, after a closing one) is
+/// code. The walk stops at the first region starting at or after `offset`,
+/// so it reads `offset` bytes plus the region holding it.
+#[must_use]
+pub fn position_context(src: &str, offset: u32) -> PositionContext {
+    let offset = offset.min(u32::try_from(src.len()).unwrap_or(u32::MAX));
+    lexical_regions(src)
+        .take_while(|region| region.span.lo < offset)
+        .find(|region| region.holds(offset))
+        .map_or(PositionContext::Code, |region| region.context)
 }
 
 /// The UTF-8 byte width of `c` as a `u32`, clamped to `1` on the impossible
@@ -620,19 +795,8 @@ pub fn lex(src: &str) -> DResult<Vec<Token>> {
         let col = lx.col;
         let lo = lx.offset();
 
-        let kind = if c == '{' && lx.peek2() == Some('-') && lx.peek3() == Some('|') {
-            lex_doc_comment(&mut lx, lo)?
-        } else if c.is_ascii_digit() {
-            lex_number(&mut lx, lo)?
-        } else if is_ident_start(c) {
-            lex_ident(&mut lx, lo)
-        } else if c == '"' {
-            lex_string(&mut lx, lo)?
-        } else if c == '\'' {
-            lex_char(&mut lx, lo)?
-        } else {
-            lex_symbol(&mut lx, c, lo)?
-        };
+        let opener = Opener::of(&lx, c);
+        let kind = lex_opened(&mut lx, opener, c, lo)?;
 
         let hi = lx.offset();
         out.push(Token {
@@ -648,6 +812,59 @@ pub fn lex(src: &str) -> DResult<Vec<Token>> {
         return Err(display_hazard_error(hit));
     }
     Ok(out)
+}
+
+/// Which token recogniser the character at the cursor opens.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Opener {
+    DocComment,
+    Number,
+    Ident,
+    Str,
+    Char,
+    Symbol,
+}
+
+impl Opener {
+    /// The recogniser for the token starting at `c`, the cursor's character.
+    fn of(lx: &Lexer, c: char) -> Self {
+        if c == '{' && lx.peek2() == Some('-') && lx.peek3() == Some('|') {
+            Self::DocComment
+        } else if c.is_ascii_digit() {
+            Self::Number
+        } else if is_ident_start(c) {
+            Self::Ident
+        } else if c == '"' {
+            Self::Str
+        } else if c == '\'' {
+            Self::Char
+        } else {
+            Self::Symbol
+        }
+    }
+
+    /// The context of a cursor inside the token this opener reads.
+    const fn context(self) -> PositionContext {
+        match self {
+            Self::DocComment => PositionContext::DocComment,
+            Self::Str => PositionContext::String,
+            Self::Char => PositionContext::Char,
+            Self::Number | Self::Ident | Self::Symbol => PositionContext::Code,
+        }
+    }
+}
+
+/// Lex the token `opener` names, starting at `c` (the cursor's character, at
+/// byte `lo`). The one token dispatch: [`lex`] and [`lexical_regions`] both call it.
+fn lex_opened(lx: &mut Lexer, opener: Opener, c: char, lo: u32) -> DResult<Tok> {
+    match opener {
+        Opener::DocComment => lex_doc_comment(lx, lo),
+        Opener::Number => lex_number(lx, lo),
+        Opener::Ident => Ok(lex_ident(lx, lo)),
+        Opener::Str => lex_string(lx, lo),
+        Opener::Char => lex_char(lx, lo),
+        Opener::Symbol => lex_symbol(lx, c, lo),
+    }
 }
 
 /// Lex a doc-comment block `{-| … -}`, consuming the delimiters and returning

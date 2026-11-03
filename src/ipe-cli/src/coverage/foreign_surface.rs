@@ -106,14 +106,14 @@ impl Surface for ForeignSurface {
         "foreign"
     }
 
-    fn all(&self) -> Vec<ForeignItem> {
-        Capability::ALL
+    fn all(&self) -> Result<Vec<ForeignItem>, crate::coverage::error::CoverageError> {
+        Ok(Capability::ALL
             .iter()
             .map(|&cap| ForeignItem {
                 capability: cap,
                 boundary_class: ForeignItem::class_of(cap),
             })
-            .collect()
+            .collect())
     }
 
     fn label(item: &ForeignItem) -> String {
@@ -372,15 +372,18 @@ fn scan_grant_gate_present() -> Marker {
 /// absent from the reference is undisclosed to operators and package consumers —
 /// they cannot make an informed grant decision.
 pub struct ForeignDocumentedColumn {
-    reference: Option<String>,
+    reference: Result<String, std::io::ErrorKind>,
 }
 
 impl ForeignDocumentedColumn {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            reference: load_capability_reference(),
-        }
+        Self::with_reference(load_capability_reference())
+    }
+
+    /// The column over one read of the reference, its failure kind kept.
+    const fn with_reference(reference: Result<String, std::io::ErrorKind>) -> Self {
+        Self { reference }
     }
 }
 
@@ -397,14 +400,17 @@ impl AspectCheck<ForeignItem> for ForeignDocumentedColumn {
 
     fn check(&self, item: &ForeignItem) -> Cell {
         let wire = item.capability.as_str();
-        let Some(reference) = &self.reference else {
-            // The reference file is absent: every axis is undocumented.
-            // This is a real gap (not advisory) — an absent reference file means
-            // operators cannot make an informed grant decision for any axis.
-            return Cell::Hole(format!(
-                "docs/reference/capabilities.md does not exist; `{wire}` cannot \
-                 be confirmed documented — generate the reference file"
-            ));
+        let reference = match &self.reference {
+            Ok(reference) => reference,
+            // An unreadable reference documents no axis — a real gap (not
+            // advisory). The cause is named: "absent" and "unreadable" need
+            // different fixes.
+            Err(kind) => {
+                return Cell::Hole(format!(
+                    "docs/reference/capabilities.md cannot be read ({kind}); `{wire}` \
+                     cannot be confirmed documented"
+                ));
+            }
         };
         // Match the wire name inside backticks or as a section anchor so
         // `js-port:clipboard` and `network` both find their entry.
@@ -421,12 +427,13 @@ impl AspectCheck<ForeignItem> for ForeignDocumentedColumn {
     }
 }
 
-fn load_capability_reference() -> Option<String> {
-    static REFERENCE: OnceLock<Option<String>> = OnceLock::new();
+/// Read the committed capability reference once, keeping why a read failed.
+fn load_capability_reference() -> Result<String, std::io::ErrorKind> {
+    static REFERENCE: OnceLock<Result<String, std::io::ErrorKind>> = OnceLock::new();
     REFERENCE
         .get_or_init(|| {
             let path = workspace_path("docs/reference/capabilities.md");
-            std::fs::read_to_string(path).ok()
+            std::fs::read_to_string(path).map_err(|error| error.kind())
         })
         .clone()
 }
@@ -723,6 +730,27 @@ pub const FOREIGN_ALLOWLIST: &[(&str, &str, &str)] = &[];
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reference that cannot be read holes every axis naming the cause —
+    /// never "does not exist" for a file that may exist but be unreadable.
+    #[test]
+    fn an_unreadable_capability_reference_holes_with_its_cause() {
+        let column =
+            ForeignDocumentedColumn::with_reference(Err(std::io::ErrorKind::PermissionDenied));
+        let cap = *Capability::ALL
+            .first()
+            .expect("the capability vocabulary is non-empty");
+        let item = ForeignItem {
+            capability: cap,
+            boundary_class: ForeignItem::class_of(cap),
+        };
+        let cell = column.check(&item);
+        let cause = std::io::ErrorKind::PermissionDenied.to_string();
+        assert!(
+            matches!(&cell, Cell::Hole(msg) if msg.contains(&cause) && !msg.contains("does not exist")),
+            "{cell:?}"
+        );
+    }
 
     /// A tree the scan cannot read whole is a refusal, never an absent marker, and
     /// a refusal survives `either` unless the other scan found the marker.

@@ -230,7 +230,7 @@ impl ConfigError {
     /// [`Secret`] uses it in value position without producing an empty secret.
     pub fn abort_startup(&self) -> ! {
         crate::system::write_stderr_line(&format!("configuration error: {}", self.message()));
-        crate::system::system_exit(1)
+        crate::system::exit_process(crate::system::ProcessStatus::FAILURE)
     }
 }
 

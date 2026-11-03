@@ -13,8 +13,11 @@
 //! `run_fmt` consume the typed value; the scattered ad-hoc checks they used to
 //! carry are folded into these parses.
 
+use std::path::PathBuf;
+
 use crate::build_plan::{AllocatorChoice, StaticRequestLayer};
 use crate::delivery::{DeliveryError, DeliveryTokens, Shape, TargetSource, TargetTriple};
+use crate::project_root::NonEmpty;
 use crate::verb::Verb;
 use crate::{CliError, text};
 pub use ipe_backend_rust::static_build::StaticTriple;
@@ -26,14 +29,42 @@ pub use ipe_backend_rust::static_build::StaticTriple;
 /// Constructed by [`take_delivery_positionals`], which splits a run of
 /// positional tokens into the (optional) leading shape word and the rest,
 /// parsing the rest into typed [`DeliveryTokens`] at this boundary — an
-/// out-of-grammar token is a [`DeliveryError`] here, never a silent drop.
+/// out-of-grammar token is a [`DeliveryError`] here, never a silent drop. No
+/// words at all is its own state, [`Self::Unstated`]: the command then builds
+/// what `package.ipe` declares, never a shape default argv implies.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct DeliveryPositionals {
-    /// The leading `[shape]` cross-check word, when one was written. Validated
-    /// against the compiler-pinned shape at resolution.
-    pub stated_shape: Option<Shape>,
-    /// The parsed `[runtime] [host] [target]` tail.
-    pub tokens: DeliveryTokens,
+pub enum DeliveryArgs {
+    /// No delivery word was written.
+    #[default]
+    Unstated,
+    /// At least one delivery word was written.
+    Stated {
+        /// The leading `[shape]` cross-check word, when one was written.
+        /// Validated against the compiler-pinned shape at resolution.
+        stated_shape: Option<Shape>,
+        /// The parsed `[runtime] [host] [target]` tail.
+        tokens: DeliveryTokens,
+    },
+}
+
+impl DeliveryArgs {
+    /// The leading `[shape]` word, when one was written.
+    #[must_use]
+    pub const fn stated_shape(&self) -> Option<Shape> {
+        match self {
+            Self::Unstated => None,
+            Self::Stated { stated_shape, .. } => *stated_shape,
+        }
+    }
+
+    /// The parsed `[runtime] [host]` tail, when any delivery word was written.
+    #[must_use]
+    pub const fn tokens(&self) -> Option<&DeliveryTokens> {
+        match self {
+            Self::Unstated => None,
+            Self::Stated { tokens, .. } => Some(tokens),
+        }
+    }
 }
 
 /// Split a run of positional tokens into the delivery positionals: an optional
@@ -52,13 +83,16 @@ pub struct DeliveryPositionals {
 fn take_delivery_positionals(
     positionals: &[String],
     command: &str,
-) -> Result<DeliveryPositionals, CliError> {
+) -> Result<DeliveryArgs, CliError> {
+    if positionals.is_empty() {
+        return Ok(DeliveryArgs::Unstated);
+    }
     let (stated_shape, tail) = match positionals.split_first() {
         Some((first, rest)) if Shape::from_word(first).is_some() => (Shape::from_word(first), rest),
         _ => (None, positionals),
     };
     let tokens = DeliveryTokens::parse(tail).map_err(|e| delivery_usage(command, &e))?;
-    Ok(DeliveryPositionals {
+    Ok(DeliveryArgs::Stated {
         stated_shape,
         tokens,
     })
@@ -382,7 +416,7 @@ fn take_leading_entry(
 /// both parse. A target triple is deliberately excluded: a leading bare triple with
 /// no preceding shape word is meaningless, so it stays a directory candidate
 /// and the delivery parse rejects it in tail position if it slips through.
-fn is_delivery_word(token: &str) -> bool {
+pub(crate) fn is_delivery_word(token: &str) -> bool {
     Shape::from_word(token).is_some()
         || !matches!(crate::delivery::parse_runtime_word(token), Ok(None))
         || crate::delivery::Host::from_word(token).is_some()
@@ -612,7 +646,7 @@ pub struct BuildArgs {
     pub entry: Option<String>,
     /// The delivery positionals (`[shape] [runtime] [host]`) that follow the
     /// entry — the shape cross-check and the web runtime/host selection.
-    pub delivery: DeliveryPositionals,
+    pub delivery: DeliveryArgs,
     /// `--runtime <dir>` — vendor the runtime from here.
     pub runtime: Option<String>,
     /// `--fix` — apply machine-applicable fixes before building.
@@ -788,7 +822,7 @@ pub struct RunArgs {
     pub entry: Option<String>,
     /// The delivery positionals (`[shape] [runtime] [host]`) that follow the
     /// entry.
-    pub delivery: DeliveryPositionals,
+    pub delivery: DeliveryArgs,
     /// `--out <dir>`.
     pub out: Option<String>,
     /// `--runtime <dir>`.
@@ -1044,7 +1078,7 @@ pub struct ReleaseArgs {
     /// The delivery positionals (`[shape] [runtime] [host]`) that follow the
     /// entry — the shape cross-check and the web runtime/host selection. A
     /// `desktop`/`ios`/`android` host produces a production distributable bundle.
-    pub delivery: DeliveryPositionals,
+    pub delivery: DeliveryArgs,
     /// `--out <dir>` — where to write the artifact (optional; defaults to
     /// `release/`).
     pub out: Option<String>,
@@ -1269,10 +1303,13 @@ pub fn parse_release_run(rest: &[String]) -> Result<ReleaseRunArgs, CliError> {
 
     let build_flags = !words.is_empty() || out.is_some() || runtime.is_some() || target.is_some();
     let target = release_target_from_flag(target, LABEL)?;
-    if let Some(no_run) = NoRunTarget::from_host(delivery.tokens.host) {
+    if let Some(no_run) = delivery
+        .tokens()
+        .and_then(|t| NoRunTarget::from_host(t.host))
+    {
         return Err(CliError::NoRunForm { target: no_run });
     }
-    if delivery.tokens.runtime == Some(crate::delivery::Runtime::Client) {
+    if delivery.tokens().and_then(|t| t.runtime) == Some(crate::delivery::Runtime::Client) {
         return Err(CliError::NoRunForm {
             target: NoRunTarget::Client,
         });
@@ -1300,7 +1337,7 @@ pub struct WatchArgs {
     pub entry: Option<String>,
     /// The delivery positionals (`[shape] [runtime] [host]`) that follow the
     /// entry.
-    pub delivery: DeliveryPositionals,
+    pub delivery: DeliveryArgs,
     /// `--out <dir>`.
     pub out: Option<String>,
     /// `--runtime <dir>`.
@@ -1505,12 +1542,15 @@ pub fn parse_health(rest: &[String]) -> Result<HealthArgs, CliError> {
 /// Constructed exclusively by [`parse_fmt`], which rejects invalid combinations
 /// at the boundary (parse, don't validate).
 pub enum FmtMode {
-    /// Format (or check) every `.ipe` file under `path` in place.
-    /// `None` means the current directory `.`. `format` selects how a `--check`
-    /// run reports the unformatted set (human list, or a machine `--json`/`--plain`
-    /// file list); it is [`OutputFormat::Human`] for a plain in-place format.
+    /// Format (or check) every `.ipe` file each of `paths` names, in place.
+    ///
+    /// A file path names that file; a directory path names every `.ipe` under
+    /// it. `None` means the current directory `.`. `format` selects how a
+    /// `--check` run reports the unformatted set (human list, or a machine
+    /// `--json`/`--plain` file list); it is [`OutputFormat::Human`] for a plain
+    /// in-place format.
     InPlace {
-        path: Option<String>,
+        paths: Option<NonEmpty<PathBuf>>,
         check: bool,
         format: OutputFormat,
     },
@@ -1522,13 +1562,14 @@ pub enum FmtMode {
 
 /// Parse `ipe fmt`'s argument tail into a [`FmtMode`].
 ///
-/// * No flags, no path → `InPlace { path: None, check: false }`
-/// * One path → `InPlace { path: Some(…), check: false }`
+/// * No flags, no path → `InPlace { paths: None, check: false }`
+/// * One or more paths → `InPlace { paths: Some(…), check: false }`, in the
+///   order given (the run dedupes them by the file each reaches)
 /// * `--check` → `InPlace { …, check: true }`
 /// * `--check --json` / `--check --plain` → machine list of unformatted files
 /// * `--stdin` → `Stdin`
 /// * `--stdin --check` → `StdinCheck`
-/// * `--stdin` + positional path → error (mutually exclusive)
+/// * `--stdin` + any positional path → error (mutually exclusive)
 ///
 /// A machine output format (`--json` / `--plain`) is meaningful only for a
 /// `--check` scan (it reports which files are unformatted), and never with
@@ -1538,7 +1579,7 @@ pub enum FmtMode {
 /// # Errors
 /// [`CliError::Usage`] / [`CliError::Usage`] naming the exact problem.
 pub fn parse_fmt(rest: &[String]) -> Result<FmtMode, CliError> {
-    let mut path: Option<String> = None;
+    let mut paths: Vec<PathBuf> = Vec::new();
     let mut check = false;
     let mut stdin = false;
     let mut format: Option<OutputFormat> = None;
@@ -1552,15 +1593,11 @@ pub fn parse_fmt(rest: &[String]) -> Result<FmtMode, CliError> {
             flag if flag.starts_with('-') => {
                 return Err(usage_unknown_flag("fmt", flag));
             }
-            positional => {
-                if path.is_some() {
-                    return Err(CliError::Usage(text::msg::fmt_single_path()));
-                }
-                path = Some(positional.to_owned());
-            }
+            positional => paths.push(PathBuf::from(positional)),
         }
     }
-    if stdin && path.is_some() {
+    let paths = NonEmpty::from_vec(paths);
+    if stdin && paths.is_some() {
         return Err(CliError::Usage(text::msg::fmt_stdin_and_path()));
     }
     let format = format.unwrap_or_default();
@@ -1578,7 +1615,7 @@ pub fn parse_fmt(rest: &[String]) -> Result<FmtMode, CliError> {
         }
     } else {
         Ok(FmtMode::InPlace {
-            path,
+            paths,
             check,
             format,
         })
@@ -1622,26 +1659,32 @@ mod tests {
         // `ipe dev build web` is a delivery shape cross-check, not an entry file.
         let a = parse_build(&s(&["web"])).expect("web");
         assert!(a.entry.is_none());
-        assert_eq!(a.delivery.stated_shape, Some(Shape::Web));
+        assert_eq!(a.delivery.stated_shape(), Some(Shape::Web));
     }
 
     #[test]
     fn build_entry_path_then_delivery() {
         let a = parse_build(&s(&["src/Main.ipe", "web", "desktop"])).expect("entry+delivery");
         assert_eq!(a.entry.as_deref(), Some("src/Main.ipe"));
-        assert_eq!(a.delivery.stated_shape, Some(Shape::Web));
-        assert_eq!(a.delivery.tokens.host, crate::delivery::Host::Desktop);
+        assert_eq!(a.delivery.stated_shape(), Some(Shape::Web));
+        assert_eq!(
+            a.delivery.tokens().map(|t| t.host),
+            Some(crate::delivery::Host::Desktop)
+        );
     }
 
     #[test]
     fn build_web_client_host_parses() {
         let a = parse_build(&s(&["web", "client", "ios"])).expect("web client ios");
-        assert_eq!(a.delivery.stated_shape, Some(Shape::Web));
+        assert_eq!(a.delivery.stated_shape(), Some(Shape::Web));
         assert_eq!(
-            a.delivery.tokens.runtime,
+            a.delivery.tokens().and_then(|t| t.runtime),
             Some(crate::delivery::Runtime::Client)
         );
-        assert_eq!(a.delivery.tokens.host, crate::delivery::Host::Ios);
+        assert_eq!(
+            a.delivery.tokens().map(|t| t.host),
+            Some(crate::delivery::Host::Ios)
+        );
     }
 
     #[test]
@@ -1656,23 +1699,26 @@ mod tests {
     #[test]
     fn build_no_delivery_positionals_is_empty() {
         let a = parse_build(&[]).expect("empty");
-        assert_eq!(a.delivery, DeliveryPositionals::default());
+        assert_eq!(a.delivery, DeliveryArgs::Unstated);
     }
 
     #[test]
     fn run_and_watch_take_delivery_positionals() {
         let r = parse_run(&s(&["web", "desktop"])).expect("run web desktop");
-        assert_eq!(r.delivery.stated_shape, Some(Shape::Web));
-        assert_eq!(r.delivery.tokens.host, crate::delivery::Host::Desktop);
+        assert_eq!(r.delivery.stated_shape(), Some(Shape::Web));
+        assert_eq!(
+            r.delivery.tokens().map(|t| t.host),
+            Some(crate::delivery::Host::Desktop)
+        );
         let w = parse_watch(&s(&["tui"])).expect("watch tui");
-        assert_eq!(w.delivery.stated_shape, Some(Shape::Tui));
+        assert_eq!(w.delivery.stated_shape(), Some(Shape::Tui));
     }
 
     #[test]
     fn run_delivery_before_dash_dash_only() {
         // Positionals after `--` are the binary's, never delivery words.
         let r = parse_run(&s(&["web", "--", "spa"])).expect("run");
-        assert_eq!(r.delivery.stated_shape, Some(Shape::Web));
+        assert_eq!(r.delivery.stated_shape(), Some(Shape::Web));
         assert_eq!(r.bin_args, s(&["spa"]));
     }
 
@@ -2063,7 +2109,7 @@ mod tests {
         assert!(matches!(
             m,
             FmtMode::InPlace {
-                path: None,
+                paths: None,
                 check: false,
                 ..
             }
@@ -2073,13 +2119,19 @@ mod tests {
     #[test]
     fn fmt_path_sets_in_place() {
         let m = parse_fmt(&s(&["src"])).expect("fmt src");
-        assert!(matches!(m, FmtMode::InPlace { path: Some(p), check: false, .. } if p == "src"));
+        assert!(
+            matches!(m, FmtMode::InPlace { paths: Some(p), check: false, .. }
+            if p.iter().eq([&PathBuf::from("src")]))
+        );
     }
 
     #[test]
     fn fmt_check_and_path() {
         let m = parse_fmt(&s(&["src", "--check"])).expect("fmt");
-        assert!(matches!(m, FmtMode::InPlace { path: Some(p), check: true, .. } if p == "src"));
+        assert!(
+            matches!(m, FmtMode::InPlace { paths: Some(p), check: true, .. }
+            if p.iter().eq([&PathBuf::from("src")]))
+        );
     }
 
     #[test]
@@ -2100,21 +2152,39 @@ mod tests {
         assert!(matches!(
             m,
             FmtMode::InPlace {
-                path: None,
+                paths: None,
                 check: true,
                 ..
             }
         ));
     }
 
+    /// `--stdin` with any path, first or last among several, is refused.
     #[test]
     fn fmt_stdin_with_path_rejected() {
-        assert!(parse_fmt(&s(&["--stdin", "src"])).is_err());
+        let refusal = text::msg::fmt_stdin_and_path();
+        for args in [
+            &["--stdin", "src"][..],
+            &["a.ipe", "b.ipe", "--stdin"][..],
+            &["--check", "a.ipe", "--stdin", "src"][..],
+        ] {
+            let res = parse_fmt(&s(args));
+            assert!(
+                matches!(&res, Err(CliError::Usage(m)) if *m == refusal),
+                "{args:?}: {:?}",
+                res.err()
+            );
+        }
     }
 
+    /// Several paths are kept in the order given, with `--check` anywhere.
     #[test]
-    fn fmt_two_paths_rejected() {
-        assert!(parse_fmt(&s(&["a", "b"])).is_err());
+    fn fmt_several_paths_in_place() {
+        let m = parse_fmt(&s(&["a.ipe", "--check", "src", "a.ipe"])).expect("fmt paths");
+        assert!(
+            matches!(m, FmtMode::InPlace { paths: Some(p), check: true, .. }
+            if p.iter().eq([&PathBuf::from("a.ipe"), &PathBuf::from("src"), &PathBuf::from("a.ipe")]))
+        );
     }
 
     #[test]

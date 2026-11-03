@@ -25,7 +25,7 @@
 //! ordering of all discovered modules. A Gray → Gray back-edge is an import
 //! cycle ([`CycleError`]).
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque, btree_map};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -75,10 +75,10 @@ pub struct ProjectManifest {
     /// The `wasm` field (`mode`/`entry`/`mount`/`publicEnv`/`optLevel`) —
     /// [`WasmConfig::Off`] when the field is absent.
     pub wasm: WasmConfig,
-    /// The `[dependencies]` section: Ipê packages by name. Empty when the
-    /// section is absent (back-compat). Resolution (fetch / download / lockfile)
-    /// is SP3; this is the parsed schema only.
-    pub dependencies: BTreeMap<String, IpeDep>,
+    /// The `dependencies` list: Ipê packages by name. Private, so a compiling
+    /// reader reaches it only through [`Self::compiled_dependencies`]; a
+    /// non-compiling reader (formatting, coverage) reads [`Self::declared`].
+    pub(crate) dependencies: DeclaredDeps,
     /// The `[rust.dependencies]` section: crates.io crates bound as
     /// foreign-function dependencies. Empty when the section is absent.
     pub rust_dependencies: BTreeMap<String, RustDep>,
@@ -132,12 +132,14 @@ pub struct ProjectManifest {
 /// resolved target. There is no `active` selector — that is the CLI.
 #[derive(Clone, Debug)]
 pub struct DeliveryConfig {
-    /// The declared delivery set — which deliveries `ipe release` produces.
+    /// The declared delivery set — which deliveries the compiling commands build.
+    ///
     /// Empty when the manifest omits the `ships` field, meaning the implicit
-    /// `[ binary ]` singleton (resolved by
-    /// [`crate::delivery_set::DeliverySet::resolve`]). The `ships` list declares
+    /// `[ binary ]` singleton. Private: a compiling command reads it only
+    /// through [`Self::declared`], the one resolved token, so no command can
+    /// pick a delivery the manifest never consulted. The `ships` list declares
     /// *what* ships; the sections below configure *how* each looks.
-    pub ships: Vec<crate::delivery_set::ShipEntry>,
+    ships: Vec<crate::delivery_set::ShipEntry>,
     /// Window title, width, and height for the `web desktop`
     /// (webview-native) host.
     pub desktop: DesktopDelivery,
@@ -148,6 +150,34 @@ pub struct DeliveryConfig {
     /// The `https` origins the browser bundle may reach besides its own;
     /// empty for an offline bundle.
     pub servers: ipe_runtime_rust::encoding::ServerOrigins,
+}
+
+impl DeliveryConfig {
+    /// The declared deliveries resolved against the shape `main` pins.
+    ///
+    /// The only path from `ships` to a buildable delivery: every compiling
+    /// command selects through the returned token.
+    ///
+    /// # Errors
+    /// [`CliError::ProjectRefused`] for a duplicate or shape-incompatible entry,
+    /// or the [`crate::delivery::DeliveryError`] of an invalid combination.
+    pub fn declared(
+        &self,
+        pinned: crate::delivery::Shape,
+    ) -> Result<crate::delivery_set::DeclaredDeliveries, CliError> {
+        crate::delivery_set::DeclaredDeliveries::from_ships(pinned, &self.ships)
+    }
+
+    /// The declared entries as written, for the manifest renderer only.
+    #[must_use]
+    pub fn ships_for_render(&self) -> &[crate::delivery_set::ShipEntry] {
+        &self.ships
+    }
+
+    /// Record the `ships` list the manifest reader parsed.
+    pub fn set_ships(&mut self, ships: Vec<crate::delivery_set::ShipEntry>) {
+        self.ships = ships;
+    }
 }
 
 impl Default for DeliveryConfig {
@@ -406,10 +436,84 @@ const JAVA_RESERVED_WORDS: &[&str] = &[
     "null",
 ];
 
-/// The first label no bundle id may start with: `java` names the Java
-/// platform's own packages, in which the Android dexer and class loaders refuse
-/// an app's classes (the `R` class of the `namespace` among them).
-const JAVA_PLATFORM_LABEL: &str = "java";
+/// The first label no bundle id may start with.
+///
+/// `java` names the Java platform's own packages, in which the Android dexer
+/// and class loaders refuse an app's classes (the `R` class of the `namespace`
+/// among them).
+pub const JAVA_PLATFORM_LABEL: &str = "java";
+
+/// The example id every bundle-id refusal advises; a test proves it parses.
+pub const BUNDLE_ID_EXAMPLE: &str = "io.acme.myapp";
+
+/// A bundle-id prefix a store or platform reserves for its own apps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReservedPrefix {
+    /// `com.apple`: Apple refuses registering an App ID under it.
+    ComApple,
+    /// `com.android`: the Android platform's own package namespace.
+    ComAndroid,
+    /// `android`: the Android framework's namespace, where the `R` class collides.
+    Android,
+    /// `com.example`: Google Play refuses a package under it.
+    ComExample,
+}
+
+impl ReservedPrefix {
+    /// Every reserved prefix, in judging order.
+    pub const ALL: [Self; 4] = [
+        Self::ComApple,
+        Self::ComAndroid,
+        Self::Android,
+        Self::ComExample,
+    ];
+
+    /// The prefix as `.`-separated lowercase labels: its one spelling.
+    #[must_use]
+    pub const fn spelled(self) -> &'static str {
+        match self {
+            Self::ComApple => "com.apple",
+            Self::ComAndroid => "com.android",
+            Self::Android => "android",
+            Self::ComExample => "com.example",
+        }
+    }
+
+    /// The store that refuses an id under this prefix.
+    #[must_use]
+    pub const fn owner(self) -> ReservedBy {
+        match self {
+            Self::ComApple => ReservedBy::AppStore,
+            Self::ComAndroid | Self::Android | Self::ComExample => ReservedBy::GooglePlay,
+        }
+    }
+}
+
+/// The store whose rule reserves a [`ReservedPrefix`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReservedBy {
+    /// Apple's App Store and developer portal.
+    AppStore,
+    /// Google Play and the Android platform.
+    GooglePlay,
+}
+
+/// The [`ReservedPrefix`] whose labels lead `text`, compared label by label
+/// without regard to ASCII case.
+///
+/// The caller has proven every byte of `text` is in `[A-Za-z0-9.]`, so ASCII
+/// case folding is the whole fold: no other spelling of a reserved label can
+/// reach this comparison. The labels are read as written, never rewritten.
+fn reserved_prefix(text: &str) -> Option<ReservedPrefix> {
+    ReservedPrefix::ALL.into_iter().find(|row| {
+        let mut labels = text.split('.');
+        row.spelled().split('.').all(|want| {
+            labels
+                .next()
+                .is_some_and(|got| got.eq_ignore_ascii_case(want))
+        })
+    })
+}
 
 /// The [`JAVA_RESERVED_WORDS`] entry `label` equals, if any.
 fn java_reserved_word(label: &str) -> Option<&'static str> {
@@ -424,9 +528,9 @@ fn java_reserved_word(label: &str) -> Option<&'static str> {
 /// The grammar is the intersection of the Android `applicationId` and the Apple
 /// `CFBundleIdentifier` grammars: two or more `.`-separated labels, each an
 /// ASCII letter followed by ASCII letters or digits, at most
-/// [`MAX_BUNDLE_ID_LEN`] bytes, and no label a Java reserved word. The field is
-/// private, so every value went through [`BundleId::parse`] or
-/// [`BundleId::derived`].
+/// [`MAX_BUNDLE_ID_LEN`] bytes, and no label a Java reserved word; it is never
+/// under a [`ReservedPrefix`], so the stores admit it. The field is private, so
+/// every value went through [`BundleId::parse`] or [`BundleId::derived`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BundleId(String);
 
@@ -436,8 +540,9 @@ impl BundleId {
     /// # Errors
     ///
     /// In judging order: `Empty`, `TooLong`, the first refused `Byte`,
-    /// `EmptyLabel`, `LabelStartsWithDigit`, `OneLabel`, `ReservedWord`, then
-    /// `JavaPlatformPackage`.
+    /// `EmptyLabel`, `LabelStartsWithDigit`, `OneLabel`, `ReservedWord`,
+    /// `JavaPlatformPackage`, then `StoreReserved`. The byte proof precedes the
+    /// store check, so its ASCII case fold is complete.
     pub fn parse(text: &str) -> Result<Self, BundleIdRefusal> {
         if text.is_empty() {
             return Err(BundleIdRefusal::Empty);
@@ -466,6 +571,9 @@ impl BundleId {
         }
         if labels().next() == Some(JAVA_PLATFORM_LABEL) {
             return Err(BundleIdRefusal::JavaPlatformPackage);
+        }
+        if let Some(prefix) = reserved_prefix(text) {
+            return Err(BundleIdRefusal::StoreReserved { prefix });
         }
         Ok(Self(text.to_owned()))
     }
@@ -533,44 +641,11 @@ pub enum BundleIdRefusal {
     },
     /// A first label `java`: the Java platform's own package namespace.
     JavaPlatformPackage,
-}
-
-/// The grammar sentence every [`BundleIdRefusal`] text ends with.
-const BUNDLE_ID_GRAMMAR: &str = "a bundle id is two or more `.`-separated labels, each an ASCII \
-                                 letter then ASCII letters or digits, like `com.example.myapp`";
-
-impl std::fmt::Display for BundleIdRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Empty => write!(f, "it is empty; {BUNDLE_ID_GRAMMAR}"),
-            Self::TooLong { len } => write!(
-                f,
-                "it is {len} bytes, over the {MAX_BUNDLE_ID_LEN}-byte ceiling; {BUNDLE_ID_GRAMMAR}"
-            ),
-            Self::Byte { byte } => write!(
-                f,
-                "it holds byte 0x{byte:02X}, outside A-Z a-z 0-9 and `.`; {BUNDLE_ID_GRAMMAR}"
-            ),
-            Self::EmptyLabel => write!(
-                f,
-                "it has an empty label (a leading or trailing `.`, or `..`); {BUNDLE_ID_GRAMMAR}"
-            ),
-            Self::LabelStartsWithDigit => {
-                write!(f, "a label starts with a digit; {BUNDLE_ID_GRAMMAR}")
-            }
-            Self::OneLabel => write!(f, "it has a single label; {BUNDLE_ID_GRAMMAR}"),
-            Self::ReservedWord { word } => write!(
-                f,
-                "the label `{word}` is a Java reserved word, which Android refuses as a \
-                 package segment; {BUNDLE_ID_GRAMMAR}"
-            ),
-            Self::JavaPlatformPackage => write!(
-                f,
-                "the first label `{JAVA_PLATFORM_LABEL}` names the Java platform's own \
-                 packages, where Android refuses an app's classes; {BUNDLE_ID_GRAMMAR}"
-            ),
-        }
-    }
+    /// Leading labels a store reserves, in any ASCII case.
+    StoreReserved {
+        /// The reserved prefix, from the static table.
+        prefix: ReservedPrefix,
+    },
 }
 
 /// A mobile pack of a program that accepts push, with no
@@ -624,6 +699,30 @@ pub enum Install {
 }
 
 impl ProjectManifest {
+    /// The declared dependencies, for a reader that compiles nothing.
+    #[must_use]
+    pub const fn declared(&self) -> &DeclaredDeps {
+        &self.dependencies
+    }
+
+    /// The dependencies a compiling command builds against.
+    ///
+    /// No dependency kind is compiled yet, so a manifest that declares any is
+    /// refused here, before a source is read, rather than built as if the
+    /// dependency were absent.
+    ///
+    /// # Errors
+    /// [`CliError::DependencyNotCompiled`] naming the first declared dependency.
+    pub fn compiled_dependencies(&self) -> Result<CompiledDeps, CliError> {
+        match self.dependencies.iter().next() {
+            None => Ok(CompiledDeps { _sealed: () }),
+            Some((name, dep)) => Err(CliError::DependencyNotCompiled {
+                name: name.clone(),
+                kind: dep.kind(),
+            }),
+        }
+    }
+
     /// The entry module path the build should compile, derived from `programs`.
     ///
     /// A manifest with no `programs` (or one whose sole/default program does not
@@ -1263,8 +1362,125 @@ pub enum IpeDep {
         /// A pinned revision (commit / tag / branch), when given.
         rev: Option<String>,
     },
-    /// A local path escape (`{ path = "../local" }`), relative to the manifest.
-    Path(PathBuf),
+    /// A local library directory, relative to the manifest.
+    Path(crate::dep_path::DepPath),
+}
+
+impl IpeDep {
+    /// Which kind of dependency this is.
+    #[must_use]
+    pub const fn kind(&self) -> DepKind {
+        match self {
+            Self::Index(_) => DepKind::Index,
+            Self::Git { .. } => DepKind::Git,
+            Self::Path(_) => DepKind::Path,
+        }
+    }
+}
+
+/// The kind of a declared dependency, as a refusal names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DepKind {
+    /// A package-index requirement (`dep`).
+    Index,
+    /// A git repository (`depGit`, `depGitRev`).
+    Git,
+    /// A local directory (`depPath`).
+    Path,
+}
+
+impl std::fmt::Display for DepKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Index => "index",
+            Self::Git => "git",
+            Self::Path => "path",
+        })
+    }
+}
+
+/// The dependencies a `package.ipe` declares, each name declared once.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeclaredDeps(BTreeMap<crate::package_name::PackageName, IpeDep>);
+
+impl DeclaredDeps {
+    /// Declare `dep` as `name`, refusing a name already declared.
+    ///
+    /// # Errors
+    /// The repeated name, with the set left as it was.
+    pub fn declare(
+        &mut self,
+        name: crate::package_name::PackageName,
+        dep: IpeDep,
+    ) -> Result<(), crate::package_name::PackageName> {
+        match self.0.entry(name) {
+            btree_map::Entry::Occupied(taken) => Err(taken.key().clone()),
+            btree_map::Entry::Vacant(free) => {
+                free.insert(dep);
+                Ok(())
+            }
+        }
+    }
+
+    /// The dependency declared as `name`.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&IpeDep> {
+        self.0
+            .iter()
+            .find_map(|(declared, dep)| (declared.as_str() == name).then_some(dep))
+    }
+
+    /// Whether `name` is declared.
+    #[must_use]
+    pub fn contains(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
+    /// How many dependencies are declared.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether none is declared.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Every declared dependency, by name.
+    pub fn iter(&self) -> btree_map::Iter<'_, crate::package_name::PackageName, IpeDep> {
+        self.0.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a DeclaredDeps {
+    type Item = (&'a crate::package_name::PackageName, &'a IpeDep);
+    type IntoIter = btree_map::Iter<'a, crate::package_name::PackageName, IpeDep>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+/// Proof that a source set's dependencies were honored or refused.
+///
+/// Every constructor of a compiled source set takes one, and the only ways to
+/// mint it are [`ProjectManifest::compiled_dependencies`] and
+/// [`CompiledDeps::none`], so a reader that skips the dependency check does not
+/// compile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use]
+pub struct CompiledDeps {
+    _sealed: (),
+}
+
+impl CompiledDeps {
+    /// The proof for a build with no manifest (a loose file, a scratch build),
+    /// which declares no dependency.
+    pub(crate) const fn none() -> Self {
+        Self { _sealed: () }
+    }
 }
 
 /// One `package.ipe` Rust-dependency entry: a crates.io crate bound as a
@@ -1322,22 +1538,21 @@ pub fn has_only_legacy_toml(dir: &Path) -> bool {
 /// reader. A path to a legacy `ipe.toml` is rejected with [`text::legacy_toml_hint`].
 ///
 /// # Errors
-/// [`CliError::Io`] if the file cannot be read; [`CliError::Usage`] /
-/// [`CliError::Usage`] for a malformed or invalid manifest (an unsupported
+/// [`CliError::Io`] if the file cannot be read;
+/// [`CliError::ProjectRefused`] for a malformed or invalid manifest (an unsupported
 /// driver, a bad version or dependency, an unknown capability, a denylisted
 /// `publicEnv` name, a missing source root); [`CliError::Pipeline`] when the
-/// source does not parse; and [`CliError::Usage`] when the path is not a
-/// `package.ipe`.
+/// source does not parse; and [`CliError::ProjectRefused`] when the path is
+/// not a `package.ipe`.
 pub fn parse_manifest(manifest_path: &Path) -> Result<ProjectManifest, CliError> {
     if manifest_path.file_name().and_then(|n| n.to_str())
         == Some(crate::package_manifest::PACKAGE_IPE)
     {
         return crate::package_manifest::parse_package_manifest(manifest_path);
     }
-    Err(CliError::Usage(text::msg::manifest_not_package_ipe(
-        &manifest_path.display(),
-        &text::legacy_toml_hint(),
-    )))
+    Err(CliError::ProjectRefused(
+        text::msg::manifest_not_package_ipe(&manifest_path.display(), &text::legacy_toml_hint()),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2112,7 +2327,8 @@ mod tests {
     #[test]
     fn bundle_id_refusal_text_never_echoes_the_input() {
         for (text, byte, label) in HOSTILE_BYTE_IDS {
-            let shown = BundleIdRefusal::Byte { byte: *byte }.to_string();
+            let shown =
+                crate::package_manifest::bundle_id_refusal(&BundleIdRefusal::Byte { byte: *byte });
             assert!(
                 !shown.contains(text) && !shown.contains(label),
                 "the refusal for {text:?} echoes it: {shown}"
@@ -2148,7 +2364,7 @@ mod tests {
             "Java.example",
             "com.java.app",
             "javax.example",
-            "com.example.java",
+            "io.acme.java",
         ] {
             assert_eq!(
                 BundleId::parse(text).map(|id| id.as_str().to_owned()),
@@ -2191,16 +2407,130 @@ mod tests {
 
     #[test]
     fn bundle_id_accepts_uppercase_interior_digits_and_cased_reserved_words() {
-        for text in [
-            "Com.Example.MyApp2",
-            "com.example.Class",
-            "com.example.myapp",
-        ] {
+        for text in ["Io.Acme.MyApp2", "io.acme.Class", BUNDLE_ID_EXAMPLE] {
             assert_eq!(
                 BundleId::parse(text).map(|id| id.as_str().to_owned()),
                 Ok(text.to_owned()),
                 "{text:?}"
             );
+        }
+    }
+
+    #[test]
+    fn bundle_id_refuses_store_reserved_prefixes() {
+        for (text, prefix) in [
+            ("com.apple.x", ReservedPrefix::ComApple),
+            ("com.apple", ReservedPrefix::ComApple),
+            ("com.android.foo", ReservedPrefix::ComAndroid),
+            ("android.foo", ReservedPrefix::Android),
+            ("com.example.app", ReservedPrefix::ComExample),
+        ] {
+            assert_eq!(
+                BundleId::parse(text),
+                Err(BundleIdRefusal::StoreReserved { prefix }),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_id_refuses_store_reserved_prefixes_in_any_case() {
+        for (text, prefix) in [
+            ("COM.APPLE.x", ReservedPrefix::ComApple),
+            ("Com.Apple.App", ReservedPrefix::ComApple),
+            ("com.ApPle.x", ReservedPrefix::ComApple),
+            ("Android.foo", ReservedPrefix::Android),
+            ("Com.Example.app", ReservedPrefix::ComExample),
+        ] {
+            assert_eq!(
+                BundleId::parse(text),
+                Err(BundleIdRefusal::StoreReserved { prefix }),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_id_store_prefix_matches_whole_labels_only() {
+        for text in [
+            "com.applesauce.x",
+            "com.examples.app",
+            "androidx.foo",
+            "org.android.x",
+            "io.apple.x",
+            "com.acme.android",
+        ] {
+            assert_eq!(
+                BundleId::parse(text).map(|id| id.as_str().to_owned()),
+                Ok(text.to_owned()),
+                "a reserved label elsewhere or as a longer label is not the prefix: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_id_earlier_refusals_precede_the_store_prefix() {
+        assert_eq!(
+            BundleId::parse("com.\u{e4}pple.x"),
+            Err(BundleIdRefusal::Byte { byte: 0xC3 })
+        );
+        assert_eq!(
+            BundleId::parse("com.app\u{17f}e.x"),
+            Err(BundleIdRefusal::Byte { byte: 0xC5 })
+        );
+        assert_eq!(
+            BundleId::parse("com.apple.class"),
+            Err(BundleIdRefusal::ReservedWord { word: "class" })
+        );
+        assert_eq!(
+            BundleId::parse("java.apple"),
+            Err(BundleIdRefusal::JavaPlatformPackage)
+        );
+    }
+
+    #[test]
+    fn bundle_id_refuses_every_reserved_prefix_row() {
+        for row in ReservedPrefix::ALL {
+            let witness = match row {
+                ReservedPrefix::ComApple
+                | ReservedPrefix::ComAndroid
+                | ReservedPrefix::Android
+                | ReservedPrefix::ComExample => row.spelled(),
+            };
+            let shouted = format!("{}.x", witness.to_ascii_uppercase());
+            for text in [witness, shouted.as_str()] {
+                let expected = if text.contains('.') {
+                    Err(BundleIdRefusal::StoreReserved { prefix: row })
+                } else {
+                    Err(BundleIdRefusal::OneLabel)
+                };
+                assert_eq!(BundleId::parse(text), expected, "{text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn bundle_id_example_parses() {
+        assert_eq!(
+            BundleId::parse(BUNDLE_ID_EXAMPLE).map(|id| id.as_str().to_owned()),
+            Ok(BUNDLE_ID_EXAMPLE.to_owned())
+        );
+    }
+
+    #[test]
+    fn derived_bundle_ids_sit_under_no_reserved_prefix() {
+        assert_eq!(reserved_prefix(DERIVED_PREFIX), None);
+        for name in [
+            "",
+            "My Cool App!",
+            "9lives",
+            "class",
+            "apple",
+            "android",
+            "example",
+        ] {
+            let derived = BundleId::derived(name);
+            assert_eq!(reserved_prefix(derived.as_str()), None, "{name:?}");
         }
     }
 
@@ -3525,16 +3855,11 @@ import String
         assert_eq!(snapshot.tree().to_hex(), rebuilt_hash);
     }
 
-    /// The source root the manifest names decides which `.ipe` files are modules.
+    /// Only the `.ipe` files under `src/` are modules; one elsewhere in the
+    /// package is not.
     #[test]
-    fn a_snapshot_reads_modules_under_the_manifest_source_root() {
+    fn a_snapshot_reads_modules_only_under_src() {
         let root = snapshot_dir("src_prefix");
-        fs::write(
-            root.join("package.ipe"),
-            "module Package exposing (package)\n\npackage =\n    \
-             { name = \"snap\", sourceRoot = \"app\" }\n",
-        )
-        .expect("write manifest");
         fs::create_dir_all(root.join("app")).expect("create app");
         fs::write(
             root.join("app").join("Entry.ipe"),
@@ -3551,28 +3876,25 @@ import String
             .collect();
         assert_eq!(
             paths,
-            vec![module(&["Entry"]).as_slice()],
-            "`src/Main.ipe` lies outside the source root"
+            vec![module(&["Main"]).as_slice()],
+            "`app/Entry.ipe` lies outside the source root"
         );
     }
 
-    /// A source root in a hidden directory is refused: the digest would not cover it.
+    /// A source root spelled in a hidden directory is refused: the digest would
+    /// not cover it.
     #[test]
     fn a_source_root_in_a_hidden_directory_is_refused() {
         let root = snapshot_dir("hidden_src");
-        fs::write(
-            root.join("package.ipe"),
-            "module Package exposing (package)\n\npackage =\n    \
-             { name = \"snap\", sourceRoot = \".src\" }\n",
-        )
-        .expect("write manifest");
         fs::create_dir_all(root.join(".src")).expect("create .src");
-        fs::write(
-            root.join(".src").join("Main.ipe"),
-            "module Main exposing (main)\nmain = 0\n",
+        let capture = crate::cache::capture_tree_within(
+            &root,
+            crate::remote_ingest::PACKAGE_SOURCE.tree(),
+            snapshot_keep_cap,
         )
-        .expect("write Main");
-        let result = PackageSnapshot::capture(&root);
+        .expect("capture");
+        let live = fs::canonicalize(root.join(".src")).expect("canonical .src");
+        let result = src_root_prefix(&root, ".src", &live, &capture);
         let _ = fs::remove_dir_all(&root);
         assert!(invalid_because(&result, "hidden directory"));
     }
@@ -3593,24 +3915,41 @@ import String
     #[test]
     fn a_source_root_spelled_through_a_hidden_link_is_refused() {
         let root = snapshot_dir("hidden_link_src");
-        fs::write(
-            root.join("package.ipe"),
-            "module Package exposing (package)\n\npackage =\n    \
-             { name = \"snap\", sourceRoot = \".h/link\" }\n",
-        )
-        .expect("write manifest");
         fs::create_dir_all(root.join("app")).expect("create app");
-        fs::write(
-            root.join("app").join("Entry.ipe"),
-            "module Entry exposing (e)\n\ne = 0\n",
-        )
-        .expect("write Entry");
         fs::create_dir_all(root.join(".h")).expect("create .h");
         std::os::unix::fs::symlink("../app", root.join(".h").join("link"))
             .expect("plant .h/link -> app");
-        let result = PackageSnapshot::capture(&root);
+        let capture = crate::cache::capture_tree_within(
+            &root,
+            crate::remote_ingest::PACKAGE_SOURCE.tree(),
+            snapshot_keep_cap,
+        )
+        .expect("capture");
+        let live_app = fs::canonicalize(root.join("app")).expect("canonical app");
+        let result = src_root_prefix(&root, ".h/link", &live_app, &capture);
         let _ = fs::remove_dir_all(&root);
         assert!(invalid_because(&result, "hidden directory"));
+    }
+
+    /// A manifest naming a source root other than `src` is refused before the
+    /// snapshot reads a module.
+    #[test]
+    fn a_snapshot_of_a_moved_source_root_is_refused() {
+        let root = snapshot_dir("moved_src");
+        fs::write(
+            root.join("package.ipe"),
+            "module Package exposing (package)\n\npackage =\n    \
+             { name = \"snap\", sourceRoot = \"app\" }\n",
+        )
+        .expect("write manifest");
+        fs::create_dir_all(root.join("app")).expect("create app");
+        let result = PackageSnapshot::capture(&root);
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            matches!(result, Err(CliError::ProjectRefused(_))),
+            "a moved source root is project state: {:?}",
+            result.err()
+        );
     }
 
     /// The source root is located in the captured walk by the manifest's

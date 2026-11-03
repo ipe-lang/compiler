@@ -188,7 +188,7 @@ Ipe.Analytics — typed, consent-gated product analytics.
 
 [Full reference](stdlib/Basics.md)
 
-Ipe.Basics — the implicit prelude (Tier-A auto-import, compiled source).
+Ipe.Basics — the implicit prelude, imported into every module.
 
 | Export | Summary |
 |--------|----------|
@@ -2783,7 +2783,7 @@ Ipe.System -- process environment + args + termination
 | `cwd` | (no summary) |
 | `getcwd` | Alias for `cwd` -- kept for backward compatibility. |
 | `loadEnv` | Load environment variables from `./.env` (the `.env` file in the |
-| `exit` | Terminate the process with the given exit code.  Polymorphic |
+| `exit` | End the process with exit status `code`; only `0` reports success. |
 
 ## Task
 

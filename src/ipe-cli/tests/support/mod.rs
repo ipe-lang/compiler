@@ -166,26 +166,6 @@ pub fn normalize_rustfmt_whitespace(s: &str) -> String {
     out
 }
 
-/// The placeholder a blessed golden `Cargo.toml` stores in place of the
-/// dependency-model runtime `path`. Aliased to the single `e2e_support`
-/// definition so the CLI golden harness and the emit-corpus harness pin the
-/// same token from one source of truth.
-#[allow(dead_code)] // referenced by intra-doc links; the golden token, sourced from the SSOT
-pub const RUNTIME_PATH_PLACEHOLDER: &str = e2e_support::RUNTIME_PATH_PLACEHOLDER;
-
-/// Normalize an emitted `Cargo.toml`'s machine-specific bytes to their stable
-/// golden placeholders — the runtime dependency `path` (→
-/// [`RUNTIME_PATH_PLACEHOLDER`]) AND the per-project crate-identity hash suffix.
-/// Delegates to the single `e2e_support` implementation so the compare and
-/// bless paths here can never drift from it (the drift this consolidation
-/// closes: a normalization change landing in one copy and not the others,
-/// leaving a machine-specific value in a byte-compared golden).
-#[must_use]
-#[allow(dead_code)] // used by the Cargo.toml arm of the directory-diff helper
-pub fn normalize_runtime_dep_path(manifest: &str) -> String {
-    e2e_support::normalize_runtime_dep_path(manifest)
-}
-
 /// Collect the `.rs` filenames present in a directory, returning an empty set
 /// when the directory does not exist or cannot be read.
 fn rs_filenames_in(dir: &Path) -> std::collections::BTreeSet<String> {
@@ -219,7 +199,7 @@ fn bless_golden_dir(
             continue; // emitted file absent — nothing to bless
         };
         let blessed = if rel == "Cargo.toml" {
-            normalize_runtime_dep_path(&text)
+            ipe_backend_rust::golden_form::golden_cargo_toml(&text)
         } else {
             text
         };
@@ -285,7 +265,7 @@ fn bless_golden_dir(
 /// **Bless mode:** if `IPE_BLESS=1` is set in the environment, instead of
 /// asserting, the function writes every emitted file into `golden_dir` (creating
 /// parent directories as needed), normalizing `Cargo.toml`'s machine-specific
-/// runtime path to [`RUNTIME_PATH_PLACEHOLDER`] before writing so the golden
+/// runtime path to [`ipe_backend_rust::golden_form::RUNTIME_PATH_PLACEHOLDER`] before writing so the golden
 /// stays portable across machines; stale `ipe_mods/*.rs` files that the emitted
 /// set no longer contains are deleted; then returns without asserting. Use to
 /// regenerate golden files after an intentional emit change.
@@ -336,7 +316,7 @@ pub fn assert_emitted_project_matches_golden_dir(emitted_out: &Path, golden_dir:
 
     let normalize = |rel: &str, text: String| -> String {
         if rel == "Cargo.toml" {
-            normalize_runtime_dep_path(&text)
+            ipe_backend_rust::golden_form::golden_cargo_toml(&text)
         } else {
             text
         }
@@ -609,7 +589,8 @@ pub fn build_and_run_emitted_with_stdin(
         .spawn();
     assert!(
         child.is_ok(),
-        "{golden_name}: failed to spawn `{exe}`: {:?}",
+        "{golden_name}: failed to spawn `{}`: {:?}",
+        exe.display(),
         child.as_ref().err()
     );
     let Ok(mut child) = child else {
@@ -777,13 +758,17 @@ fn poll_exit(
         .map(|status| status.map(|status| (status, None)))
 }
 
-/// Build the emitted project at `emitted_dir` and return its binary path.
+/// Build the emitted project at `emitted_dir` and return the guard holding its
+/// binary; the binary's artifacts go when the guard drops.
 ///
 /// # Panics
 /// Fails the calling test if `cargo build` fails, surfacing cargo's stderr.
 #[must_use]
 #[allow(dead_code)] // only deadline-bounded goldens build once and run many times
-pub fn build_emitted_binary_checked(golden_name: &str, emitted_dir: &Path) -> Option<String> {
+pub fn build_emitted_binary_checked(
+    golden_name: &str,
+    emitted_dir: &Path,
+) -> Option<e2e_support::SharedBuild> {
     let exe = e2e_support::build_rust_binary(golden_name, emitted_dir);
     assert!(
         exe.is_ok(),
@@ -806,7 +791,7 @@ pub fn build_emitted_binary_checked(golden_name: &str, emitted_dir: &Path) -> Op
 #[allow(dead_code)] // only deadline-bounded goldens exercise this helper
 pub fn run_with_stdin_deadline(
     golden_name: &str,
-    exe: &str,
+    exe: &Path,
     stdin_bytes: &[u8],
     deadline: std::time::Duration,
 ) -> TimedRunOutcome {
@@ -817,7 +802,8 @@ pub fn run_with_stdin_deadline(
         .spawn();
     assert!(
         child.is_ok(),
-        "{golden_name}: failed to spawn `{exe}`: {:?}",
+        "{golden_name}: failed to spawn `{}`: {:?}",
+        exe.display(),
         child.as_ref().err()
     );
     let Ok(mut child) = child else {
@@ -862,7 +848,8 @@ pub fn run_with_stdin_deadline(
     });
     assert!(
         polled.is_ok(),
-        "{golden_name}: failed to poll `{exe}`: {:?}",
+        "{golden_name}: failed to poll `{}`: {:?}",
+        exe.display(),
         polled.err()
     );
     assert!(
@@ -1045,7 +1032,8 @@ pub fn build_and_run_emitted_capturing_stderr_with_env(
     let output = Command::new(&exe).envs(env.iter().copied()).output();
     assert!(
         output.is_ok(),
-        "{golden_name}: failed to spawn `{exe}`: {:?}",
+        "{golden_name}: failed to spawn `{}`: {:?}",
+        exe.display(),
         output.as_ref().err()
     );
     let Ok(output) = output else {

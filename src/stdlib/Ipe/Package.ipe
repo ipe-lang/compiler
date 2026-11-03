@@ -193,10 +193,12 @@ type alias DesktopConfig =
 -- | Configuration for the `web client ios` / `web client android` mobile hosts.
 --
 -- `bundleId` is the reverse-DNS application identifier both platforms install
--- the app under (`com.example.myapp`): two or more `.`-separated labels, each an
+-- the app under (`io.acme.myapp`): two or more `.`-separated labels, each an
 -- ASCII letter then ASCII letters or digits, at most 128 bytes in all, no
--- label a Java reserved word, and a first label other than `java` (the Java
--- platform's own packages); the manifest refuses any other value. Android
+-- label a Java reserved word, a first label other than `java` (the Java
+-- platform's own packages), and not under a store-reserved prefix (`com.apple`,
+-- `com.android`, `android`, `com.example`, in any case); the manifest refuses
+-- any other value. Android
 -- (package and application id) and iOS (`CFBundleIdentifier`) use it verbatim.
 -- An absent `bundleId` is `com.ipe.` followed by the lowercased letters and
 -- digits of the package name.
@@ -310,6 +312,11 @@ type alias Program =
 -- | One Ipê dependency: its name and its source. Constructed with the `dep` /
 -- `depGit` / `depGitRev` / `depPath` builders so a dependency's source is
 -- exactly one of index / git / path, never a bag of optional keys.
+--
+-- No dependency is compiled yet. A package that declares one is refused by
+-- every compiling command (`ipe type-check`, `ipe dev build`, `ipe test`,
+-- `ipe lint`), with an error naming the dependency and its kind; `ipe fmt` and
+-- `ipe add` keep working. Each name appears once in `dependencies`.
 type alias Dependency =
     { name : String
     , source : DependencySource
@@ -476,7 +483,9 @@ depGitRev name url rev =
     { name = name, source = FromGit url (Just rev) }
 
 
--- | A local-path dependency, relative to the manifest.
+-- | A local-path dependency, relative to the manifest: `../` steps (at most
+-- eight) and then `/`-separated directory names, the same on every host. An
+-- absolute path, a drive, a `\`, a `.` component, or a device name is refused.
 depPath : String -> String -> Dependency
 depPath name path =
     { name = name, source = FromPath path }

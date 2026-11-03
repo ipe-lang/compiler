@@ -7,9 +7,7 @@
 //! `Attribute` exists in BOTH `Ipe.Ui` (→ `ui::element::Attribute`) and
 //! `Ipe.Html.Attributes` (→ `html::Attribute`).  The lowerer disambiguates by
 //! `is_html = home contains "Html"`. If a bare/aliased `Attribute` from a
-//! stdlib module reaches the empty-home sentinel (stdlib imports are
-//! skipped by both the dep-injection loop and the `qualifier_paths`
-//! construction), `is_html` always fails and BOTH the bare-exposed form
+//! stdlib module reaches the empty-home sentinel, `is_html` always fails and BOTH the bare-exposed form
 //! (`Ipe.Web.Head.pairToAttr`) and the qualified form
 //! (`Ipe.Ui.Chart.svgRootAttrs`) mis-lower `Attribute msg` to
 //! `ui::element::Attribute` while their `Attr.attribute` bodies produce

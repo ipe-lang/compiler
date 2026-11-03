@@ -16,6 +16,7 @@ use crate::coverage::cli_surface::CliItem;
 use crate::coverage::compiler_surface::CompilerCrate;
 use crate::coverage::contract::{AspectCheck, Cell, StdlibSymbol, Surface};
 use crate::coverage::env_surface::EnvItem;
+use crate::coverage::error::CoverageError;
 use crate::coverage::foreign_surface::ForeignItem;
 use crate::coverage::package_surface::PackageItem;
 
@@ -23,17 +24,20 @@ use crate::coverage::package_surface::PackageItem;
 ///
 /// These read only registries and typed interfaces — no program build — so they
 /// run in the fast (non-E2E) path.
-#[must_use]
-pub fn static_columns() -> Vec<Box<dyn AspectCheck<StdlibSymbol>>> {
-    vec![
+///
+/// # Errors
+/// A typed [`CoverageError`] if a column's own construction (which reads the
+/// stdlib registries) fails — never a silently truncated column set.
+pub fn static_columns() -> Result<Vec<Box<dyn AspectCheck<StdlibSymbol>>>, CoverageError> {
+    Ok(vec![
         Box::new(crate::coverage::columns_static::HomeColumn),
         Box::new(crate::coverage::columns_static::ResolvesColumn::new()),
         Box::new(crate::coverage::columns_static::ClosedSchemeColumn::new()),
-        Box::new(crate::coverage::columns_static::LayerAgreementColumn::new()),
+        Box::new(crate::coverage::columns_static::LayerAgreementColumn::new()?),
         // LANE B: register your columns here
         Box::new(crate::coverage::columns_doc::DocumentedColumn::new()),
         Box::new(crate::coverage::columns_doc::DocExampleColumn::new()),
-    ]
+    ])
 }
 
 /// The registered dynamic aspect columns of the stdlib surface.
@@ -43,15 +47,17 @@ pub fn static_columns() -> Vec<Box<dyn AspectCheck<StdlibSymbol>>> {
 /// the caller asks for it. The `documented` and `doc-example` columns stay in
 /// [`static_columns`] because a doc-string type-check is cheap enough for the
 /// fast path.
-#[must_use]
-pub fn dynamic_columns() -> Vec<Box<dyn AspectCheck<StdlibSymbol>>> {
-    vec![
-        Box::new(crate::coverage::columns_runtime::LowersColumn::new()),
-        Box::new(crate::coverage::columns_runtime::ComposesColumn::new()),
-        Box::new(crate::coverage::columns_runtime::BuildRunColumn::new()),
+///
+/// # Errors
+/// A typed [`CoverageError`] if a column's scratch directory cannot be created.
+pub fn dynamic_columns() -> Result<Vec<Box<dyn AspectCheck<StdlibSymbol>>>, CoverageError> {
+    Ok(vec![
+        Box::new(crate::coverage::columns_runtime::LowersColumn::new()?),
+        Box::new(crate::coverage::columns_runtime::ComposesColumn::new()?),
+        Box::new(crate::coverage::columns_runtime::BuildRunColumn::new()?),
         Box::new(crate::coverage::columns_runtime::RuntimeFnExistsColumn::new()),
         Box::new(crate::coverage::columns_runtime::WasmColumn),
-    ]
+    ])
 }
 
 /// One hole found in the grid, at a named `(symbol, aspect)` coordinate.
@@ -145,11 +151,19 @@ impl MatrixReport {
 
 /// Run the matrix over one surface and one column set, collecting every hole and
 /// advisory coordinate.
-pub fn run<S>(surface: &S, columns: &[Box<dyn AspectCheck<S::Item>>]) -> MatrixReport
+///
+/// # Errors
+/// The typed [`CoverageError`] the surface's own enumeration refused with — a
+/// surface that cannot enumerate its items never silently reports zero holes
+/// over a grid it never actually judged.
+pub fn run<S>(
+    surface: &S,
+    columns: &[Box<dyn AspectCheck<S::Item>>],
+) -> Result<MatrixReport, CoverageError>
 where
     S: Surface,
 {
-    let items = surface.all();
+    let items = surface.all()?;
     let mut report = MatrixReport {
         symbols: items.len(),
         columns: columns.len(),
@@ -180,20 +194,27 @@ where
             }
         }
     }
-    report
+    Ok(report)
 }
 
 /// Run the stdlib surface against its registered static columns.
-#[must_use]
-pub fn run_static() -> MatrixReport {
-    run(&crate::coverage::surface::StdlibSurface, &static_columns())
+///
+/// # Errors
+/// A typed [`CoverageError`] from column construction or surface enumeration.
+pub fn run_static() -> Result<MatrixReport, CoverageError> {
+    run(&crate::coverage::surface::StdlibSurface, &static_columns()?)
 }
 
 /// Run the stdlib surface against its registered dynamic (emit/build/run)
 /// columns. Heavy — the caller gates this behind the E2E path.
-#[must_use]
-pub fn run_dynamic() -> MatrixReport {
-    run(&crate::coverage::surface::StdlibSurface, &dynamic_columns())
+///
+/// # Errors
+/// A typed [`CoverageError`] from column construction or surface enumeration.
+pub fn run_dynamic() -> Result<MatrixReport, CoverageError> {
+    run(
+        &crate::coverage::surface::StdlibSurface,
+        &dynamic_columns()?,
+    )
 }
 
 /// The registered aspect columns of the env-var surface.
@@ -215,8 +236,10 @@ pub fn env_columns() -> Vec<Box<dyn AspectCheck<EnvItem>>> {
 }
 
 /// Run the env-var surface against its registered columns.
-#[must_use]
-pub fn run_env() -> MatrixReport {
+///
+/// # Errors
+/// The typed [`CoverageError`] the source-tree scan refused with.
+pub fn run_env() -> Result<MatrixReport, CoverageError> {
     run(&crate::coverage::env_surface::EnvVarSurface, &env_columns())
 }
 
@@ -234,8 +257,10 @@ pub fn diagnostic_columns() -> Vec<Box<dyn AspectCheck<Code>>> {
 }
 
 /// Run the diagnostic surface against its registered columns.
-#[must_use]
-pub fn run_diagnostic() -> MatrixReport {
+///
+/// # Errors
+/// The typed [`CoverageError`] the surface's own enumeration refused with.
+pub fn run_diagnostic() -> Result<MatrixReport, CoverageError> {
     run(
         &crate::coverage::diagnostic_surface::DiagnosticSurface,
         &diagnostic_columns(),
@@ -256,8 +281,10 @@ pub fn cli_columns() -> Vec<Box<dyn AspectCheck<CliItem>>> {
 }
 
 /// Run the CLI surface against its registered columns.
-#[must_use]
-pub fn run_cli_surface() -> MatrixReport {
+///
+/// # Errors
+/// The typed [`CoverageError`] the surface's own enumeration refused with.
+pub fn run_cli_surface() -> Result<MatrixReport, CoverageError> {
     run(&crate::coverage::cli_surface::CliSurface, &cli_columns())
 }
 
@@ -275,8 +302,10 @@ pub fn compiler_columns() -> Vec<Box<dyn AspectCheck<CompilerCrate>>> {
 }
 
 /// Run the compiler-crate surface against its registered columns.
-#[must_use]
-pub fn run_compiler() -> MatrixReport {
+///
+/// # Errors
+/// The typed [`CoverageError`] the surface's own enumeration refused with.
+pub fn run_compiler() -> Result<MatrixReport, CoverageError> {
     run(
         &crate::coverage::compiler_surface::CompilerSurface,
         &compiler_columns(),
@@ -294,8 +323,10 @@ pub fn foreign_columns() -> Vec<Box<dyn AspectCheck<ForeignItem>>> {
 }
 
 /// Run the foreign-binding surface against its registered columns.
-#[must_use]
-pub fn run_foreign() -> MatrixReport {
+///
+/// # Errors
+/// The typed [`CoverageError`] the surface's own enumeration refused with.
+pub fn run_foreign() -> Result<MatrixReport, CoverageError> {
     run(
         &crate::coverage::foreign_surface::ForeignSurface,
         &foreign_columns(),
@@ -306,14 +337,22 @@ pub fn run_foreign() -> MatrixReport {
 ///
 /// These read only the project's manifest and lockfile — no program build — so
 /// they run in the fast path alongside the env-var columns.
-#[must_use]
-pub fn package_columns(project_root: PathBuf) -> Vec<Box<dyn AspectCheck<PackageItem>>> {
+///
+/// # Errors
+/// A typed [`CoverageError`] if the lockfile exists but fails to parse.
+pub fn package_columns(
+    project_root: PathBuf,
+) -> Result<Vec<Box<dyn AspectCheck<PackageItem>>>, CoverageError> {
     crate::coverage::package_surface::package_columns(project_root)
 }
 
 /// Run the package surface for `project_root` against its registered columns.
-#[must_use]
-pub fn run_package(project_root: PathBuf) -> MatrixReport {
+///
+/// # Errors
+/// A typed [`CoverageError`] from column construction or surface enumeration
+/// (a malformed manifest or lockfile, named rather than reported as a clean,
+/// empty surface).
+pub fn run_package(project_root: PathBuf) -> Result<MatrixReport, CoverageError> {
     let surface = crate::coverage::package_surface::PackageSurface::new(project_root.clone());
-    run(&surface, &package_columns(project_root))
+    run(&surface, &package_columns(project_root)?)
 }

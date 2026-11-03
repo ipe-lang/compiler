@@ -1,7 +1,8 @@
 #[cfg(test)]
 mod registry_phase_c_tests {
     use super::super::{
-        Builder, Builtins, Content, Diagnostic, Feature, LowerError, Ty, UnionFind, UntypedDef,
+        Builder, Builtins, Content, Diagnostic, Feature, KernelScheme, KernelSchemeTable,
+        LowerError, Ty, UnionFind, UntypedDef, kernel_type_table,
     };
     use ipe_diagnostics::Span;
     use ipe_intern::Interner;
@@ -1660,6 +1661,80 @@ mod registry_phase_c_tests {
         }
     }
 
+    /// The live table carries exactly one row per `StdlibKernel::ALL` member,
+    /// in `ALL` order: a filter that drops a row (the absent-means-unschemed
+    /// encoding) goes red here.
+    #[test]
+    fn kernel_type_table_has_one_row_per_wired_kernel_in_all_order() {
+        let mut interner = Interner::new();
+        let table = kernel_type_table(&mut interner).expect("the kernel table must derive");
+        let kernels: Vec<StdlibKernel> = table.rows().map(|(k, _)| k).collect();
+        assert_eq!(kernels.as_slice(), StdlibKernel::ALL);
+    }
+
+    /// A kernel the resolver does not scheme is an explicit `Unschemed` row,
+    /// never a dropped one (injected resolver: holds whatever the registry
+    /// currently schemes).
+    #[test]
+    fn an_unschemed_kernel_is_an_explicit_row() {
+        let (schemed, unschemed) = (StdlibKernel::LogInfo, StdlibKernel::ListMap);
+        let table = KernelSchemeTable::build(&[schemed, unschemed], |k| {
+            (k == schemed).then_some(Ty::Unit)
+        });
+        let rows: Vec<(StdlibKernel, &KernelScheme)> = table.rows().collect();
+        assert_eq!(
+            rows,
+            [
+                (schemed, &KernelScheme::Schemed(Ty::Unit)),
+                (unschemed, &KernelScheme::Unschemed),
+            ]
+        );
+        assert_eq!(table.scheme(unschemed), Some(&KernelScheme::Unschemed));
+        assert_eq!(table.schemed().count(), 1);
+    }
+
+    /// The registry-vs-table boundary: a table row is `Unschemed` exactly when
+    /// the registry declares no scheme shape, and every KNOWN-UNBACKED kernel
+    /// is an explicit `Unschemed` row.
+    #[test]
+    fn table_unschemed_iff_registry_shape_absent() {
+        let mut interner = Interner::new();
+        let table = kernel_type_table(&mut interner).expect("the kernel table must derive");
+        for &k in StdlibKernel::ALL {
+            let scheme = table.scheme(k);
+            assert!(scheme.is_some(), "{k:?} is in ALL and must carry a row");
+            assert_eq!(
+                matches!(scheme, Some(KernelScheme::Unschemed)),
+                k.scheme_shape().is_none(),
+                "{k:?}: table row {scheme:?} disagrees with the registry's scheme shape",
+            );
+        }
+        assert!(
+            table
+                .rows()
+                .any(|(_, scheme)| matches!(scheme, KernelScheme::Unschemed)),
+            "the live table must carry an Unschemed row (KNOWN_UNBACKED pins one)",
+        );
+        for &k in KNOWN_UNBACKED {
+            assert_eq!(
+                table.scheme(k),
+                Some(&KernelScheme::Unschemed),
+                "{k:?} is KNOWN-UNBACKED and must be an explicit Unschemed row",
+            );
+        }
+    }
+
+    /// An unwired kernel (outside `ALL`) has no row: absence means "not
+    /// wired", never "unschemed". The pair mirrors the kernels crate's
+    /// test-local `UNWIRED_VARIANTS` (`all_covers_every_variant_except_documented_exclusions`).
+    #[test]
+    fn an_unwired_kernel_has_no_row() {
+        let mut interner = Interner::new();
+        let table = kernel_type_table(&mut interner).expect("the kernel table must derive");
+        assert_eq!(table.scheme(StdlibKernel::TaskRun), None);
+        assert_eq!(table.scheme(StdlibKernel::TaskPerform), None);
+    }
+
     /// The number of leading `->` arrows on a scheme's curried spine — its
     /// Ipê-level argument count.
     ///
@@ -1711,7 +1786,7 @@ mod registry_phase_c_tests {
     /// drift catcher).
     ///
     /// For every schemed kernel in [`StdlibKernel::ALL`], resolve its scheme
-    /// THROUGH the [`SchemeKey`] bridge — `def().scheme` -> [`resolve_scheme`] —
+    /// THROUGH the [`SchemeKey`] bridge — `def().scheme` -> [`Builder::resolve_scheme`] —
     /// and assert the scheme's leading-arrow count equals `def().arity`, plus one
     /// for the [`RETURNS_HANDLER`] class whose result value is itself a function.
     /// This is the extension of ADR 0002's

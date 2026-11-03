@@ -30,9 +30,7 @@ pub fn expected_type_at(
     module_file: ipe_db::SourceFile,
     byte: u32,
 ) -> Option<Ty> {
-    let types = ipe_db::typecheck_module(db, root, entry, module_file)
-        .as_ref()
-        .ok()?;
+    let types = crate::db_access::module_types(db, root, entry, module_file)?;
     // Spans are already home-scoped in the projection, so the byte lookup needs
     // no home comparison — the map holds only this module's regions.
     let mut best: Option<(u32, u32)> = None; // (width, lo)

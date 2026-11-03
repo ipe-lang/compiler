@@ -62,10 +62,11 @@ use ipe_runtime_rust::encoding::{
 use crate::CliError;
 use crate::delivery_set::{BinaryTarget, ShipEntry};
 use crate::project::{
-    ApnsEnvironment, BrowserDelivery, BundleId, Capability, DeliveryConfig, DesktopDelivery,
-    EntryShape, FcmApiKey, FcmApplicationId, FcmIdentifierRefusal, FcmIdentifiers, FcmProjectId,
-    FcmSenderId, Install, IpeDep, MobileDelivery, Program, ProjectManifest, PublicEnvAllowlist,
-    PublicEnvName, PushDelivery, RustDep, ScreenOrientation, WasmBundle, WasmConfig, WasmMode,
+    ApnsEnvironment, BUNDLE_ID_EXAMPLE, BrowserDelivery, BundleId, BundleIdRefusal, Capability,
+    DeliveryConfig, DesktopDelivery, EntryShape, FcmApiKey, FcmApplicationId, FcmIdentifierRefusal,
+    FcmIdentifiers, FcmProjectId, FcmSenderId, Install, IpeDep, JAVA_PLATFORM_LABEL,
+    MAX_BUNDLE_ID_LEN, MobileDelivery, Program, ProjectManifest, PublicEnvAllowlist, PublicEnvName,
+    PushDelivery, ReservedBy, RustDep, ScreenOrientation, WasmBundle, WasmConfig, WasmMode,
 };
 use crate::pwa_icon::{self, PwaIconRefusal};
 use crate::text;
@@ -87,9 +88,9 @@ const SCHEMA_MODULE: &str = "Ipe.Package";
 ///
 /// # Errors
 /// [`CliError::Io`] if the file cannot be read; [`CliError::Pipeline`] if the
-/// source does not parse (rendered with a caret snippet); [`CliError::Usage`]
+/// source does not parse (rendered with a caret snippet); [`CliError::ProjectRefused`]
 /// naming the offending `package.ipe:LINE:COL` for any non-literal, non-blessed
-/// shape or a failed field validation; [`CliError::Usage`] if the source root
+/// shape or a failed field validation; [`CliError::ProjectRefused`] if the source root
 /// directory does not exist.
 pub fn parse_package_manifest(manifest_path: &Path) -> Result<ProjectManifest, CliError> {
     let text =
@@ -190,6 +191,45 @@ fn base_path_refusal(raw: &str, refusal: &MountBaseRefusal) -> text::Message {
     }
 }
 
+/// The manifest refusal for a `delivery.mobile.bundleId` that
+/// [`BundleId::parse`] turned away, one catalog message per refusal.
+///
+/// The one composer of every bundle-id refusal: each reason is static data
+/// (a table word, a table prefix, a byte value), never the declared text, and
+/// every text ends with the grammar and its proven example.
+pub(crate) fn bundle_id_refusal(refusal: &BundleIdRefusal) -> text::Message {
+    let reason = match refusal {
+        BundleIdRefusal::Empty => text::msg::manifest_bundle_id_empty(),
+        BundleIdRefusal::TooLong { len } => {
+            text::msg::manifest_bundle_id_too_long(len, &MAX_BUNDLE_ID_LEN)
+        }
+        BundleIdRefusal::Byte { byte } => {
+            text::msg::manifest_bundle_id_byte(&format!("0x{byte:02X}"))
+        }
+        BundleIdRefusal::EmptyLabel => text::msg::manifest_bundle_id_empty_label(),
+        BundleIdRefusal::LabelStartsWithDigit => {
+            text::msg::manifest_bundle_id_label_starts_with_digit()
+        }
+        BundleIdRefusal::OneLabel => text::msg::manifest_bundle_id_one_label(),
+        BundleIdRefusal::ReservedWord { word } => text::msg::manifest_bundle_id_reserved_word(word),
+        BundleIdRefusal::JavaPlatformPackage => {
+            text::msg::manifest_bundle_id_java_platform(&JAVA_PLATFORM_LABEL)
+        }
+        BundleIdRefusal::StoreReserved { prefix } => match prefix.owner() {
+            ReservedBy::AppStore => text::msg::manifest_bundle_id_reserved_app_store(
+                &prefix.spelled(),
+                &BUNDLE_ID_EXAMPLE,
+            ),
+            ReservedBy::GooglePlay => text::msg::manifest_bundle_id_reserved_google_play(
+                &prefix.spelled(),
+                &BUNDLE_ID_EXAMPLE,
+            ),
+        },
+    };
+    let grammar = text::msg::manifest_bundle_id_grammar(&BUNDLE_ID_EXAMPLE, &MAX_BUNDLE_ID_LEN);
+    text::msg::manifest_bundle_id_refused(&reason, &grammar)
+}
+
 /// The manifest refusal for an `icon` that [`pwa_icon::parse`] turned away, one catalog message per refusal.
 ///
 /// The icon path is author text, so it renders through `{:?}` (escaped).
@@ -244,12 +284,12 @@ struct IconField {
     span: Span,
 }
 
-/// A `package.ipe:LINE:COL: <reason>` [`CliError::Usage`] for `span` in `src`.
+/// A `package.ipe:LINE:COL: <reason>` [`CliError::ProjectRefused`] for `span` in `src`.
 ///
 /// Line and column are 1-based; an out-of-range offset degrades to `1:1`.
 fn located_refusal(src: &str, manifest_path: &Path, span: Span, reason: &str) -> CliError {
     let (line, col) = line_col(src, span.lo);
-    CliError::Usage(text::msg::located_refusal(
+    CliError::ProjectRefused(text::msg::located_refusal(
         &manifest_path.display(),
         &line,
         &col,
@@ -295,7 +335,7 @@ struct ManifestFields {
     target: Option<String>,
     allocator: Option<crate::build_plan::AllocatorChoice>,
     c_free: Option<bool>,
-    dependencies: BTreeMap<String, IpeDep>,
+    dependencies: crate::project::DeclaredDeps,
     rust_dependencies: BTreeMap<String, RustDep>,
     capabilities: BTreeSet<Capability>,
     capabilities_accept: BTreeSet<Capability>,
@@ -309,7 +349,8 @@ struct ManifestFields {
 
 impl ManifestFields {
     /// Assemble the accumulated fields into a [`ProjectManifest`], applying the
-    /// remaining whole-manifest validations: `name` is required, the
+    /// remaining whole-manifest validations: `name` is required, a `sourceRoot`
+    /// other than `src` is refused before any path is looked at, the
     /// source-root directory must exist, and an install request carries an
     /// icon proven fit for install.
     ///
@@ -320,9 +361,18 @@ impl ManifestFields {
         src: &str,
         manifest_path: &Path,
     ) -> Result<ProjectManifest, CliError> {
-        let name = self
-            .name
-            .ok_or(CliError::Usage(text::msg::package_manifest_name_required()))?;
+        let name = self.name.ok_or(CliError::ProjectRefused(
+            text::msg::package_manifest_name_required(),
+        ))?;
+        if self
+            .src_rel
+            .as_deref()
+            .is_some_and(|spelled| spelled != DEFAULT_SOURCE_ROOT)
+        {
+            return Err(CliError::ProjectRefused(
+                text::msg::package_manifest_source_root_removed(),
+            ));
+        }
         let src_rel_raw = self.src_rel.as_deref().unwrap_or(DEFAULT_SOURCE_ROOT);
         let src_root_contained = crate::contained_path::ContainedRelPath::parse(root, src_rel_raw)
             .map_err(|reason| CliError::PathEscape {
@@ -331,7 +381,7 @@ impl ManifestFields {
             })?;
         let src_root = src_root_contained.resolved().to_path_buf();
         if !src_root.is_dir() {
-            return Err(CliError::Usage(
+            return Err(CliError::ProjectRefused(
                 text::msg::package_manifest_src_root_missing(),
             ));
         }
@@ -410,7 +460,7 @@ impl Reader<'_> {
         self.interner.resolve(sym).unwrap_or("")
     }
 
-    /// Render a `package.ipe:LINE:COL: <reason>` [`CliError::Usage`] for the
+    /// Render a `package.ipe:LINE:COL: <reason>` [`CliError::ProjectRefused`] for the
     /// offending `span`. Line/column are 1-based, computed from the byte offset
     /// against the source; an out-of-range offset degrades to `1:1` rather than
     /// panicking (totality).
@@ -471,7 +521,7 @@ impl Reader<'_> {
             }
         }
 
-        let package = package_value.ok_or(CliError::Usage(
+        let package = package_value.ok_or(CliError::ProjectRefused(
             text::msg::package_manifest_no_package_binding(),
         ))?;
         if !package.value.patterns.is_empty() {
@@ -821,40 +871,62 @@ impl Reader<'_> {
     /// Read the `dependencies = [ … ]` list into the typed [`IpeDep`] map. Each
     /// element is a `dep` / `depGit` / `depGitRev` / `depPath` builder call — the
     /// four-builder shape mirrors the `IpeDep` sum, so a dependency is exactly one
-    /// of index / git / path, never a bag of optional keys.
-    fn read_dependencies(&self, expr: &Expr) -> Result<BTreeMap<String, IpeDep>, CliError> {
-        let mut deps = BTreeMap::new();
+    /// of index / git / path, never a bag of optional keys. A name declared twice
+    /// is refused, never silently resolved to one of the entries.
+    fn read_dependencies(&self, expr: &Expr) -> Result<crate::project::DeclaredDeps, CliError> {
+        let mut deps = crate::project::DeclaredDeps::default();
         for item in self.expect_list(expr)? {
             let (name, dep) = self.read_one_dep(item)?;
-            deps.insert(name, dep);
+            deps.declare(name, dep).map_err(|name| {
+                self.reject(item.span, &text::msg::duplicate_dependency(&name.as_str()))
+            })?;
         }
         Ok(deps)
     }
 
+    /// Read a dependency builder's name argument into a [`PackageName`].
+    ///
+    /// [`PackageName`]: crate::package_name::PackageName
+    fn read_dep_name(
+        &self,
+        expr: &Expr,
+        builder: &str,
+        args: &[Expr],
+    ) -> Result<crate::package_name::PackageName, CliError> {
+        let arg = self.nth_arg(expr.span, builder, args, 0)?;
+        let raw = self.expect_string(arg)?;
+        crate::package_name::PackageName::parse(&raw)
+            .map_err(|refusal| self.reject(arg.span, &format!("{refusal}")))
+    }
+
     /// Read one dependency builder call into its `(name, IpeDep)`.
-    fn read_one_dep(&self, expr: &Expr) -> Result<(String, IpeDep), CliError> {
+    fn read_one_dep(
+        &self,
+        expr: &Expr,
+    ) -> Result<(crate::package_name::PackageName, IpeDep), CliError> {
         let (builder, args) = self.expect_ctor_app(expr, "a dependency builder")?;
         match builder {
             "dep" => {
-                let name = self.expect_string(self.nth_arg(expr.span, builder, args, 0)?)?;
+                let name = self.read_dep_name(expr, builder, args)?;
                 let raw = self.expect_string(self.nth_arg(expr.span, builder, args, 1)?)?;
                 let req = raw.parse::<semver::VersionReq>().map_err(|e| {
                     self.reject(
                         expr.span,
                         &format!(
-                            "dependency `{name}` version requirement {raw:?} is not valid: {e}"
+                            "dependency `{}` version requirement {raw:?} is not valid: {e}",
+                            name.as_str()
                         ),
                     )
                 })?;
                 Ok((name, IpeDep::Index(req)))
             }
             "depGit" => {
-                let name = self.expect_string(self.nth_arg(expr.span, builder, args, 0)?)?;
+                let name = self.read_dep_name(expr, builder, args)?;
                 let url = self.expect_string(self.nth_arg(expr.span, builder, args, 1)?)?;
                 Ok((name, IpeDep::Git { url, rev: None }))
             }
             "depGitRev" => {
-                let name = self.expect_string(self.nth_arg(expr.span, builder, args, 0)?)?;
+                let name = self.read_dep_name(expr, builder, args)?;
                 let url = self.expect_string(self.nth_arg(expr.span, builder, args, 1)?)?;
                 let rev = self.expect_string(self.nth_arg(expr.span, builder, args, 2)?)?;
                 Ok((
@@ -866,9 +938,12 @@ impl Reader<'_> {
                 ))
             }
             "depPath" => {
-                let name = self.expect_string(self.nth_arg(expr.span, builder, args, 0)?)?;
-                let path = self.expect_string(self.nth_arg(expr.span, builder, args, 1)?)?;
-                Ok((name, IpeDep::Path(PathBuf::from(path))))
+                let name = self.read_dep_name(expr, builder, args)?;
+                let arg = self.nth_arg(expr.span, builder, args, 1)?;
+                let raw = self.expect_string(arg)?;
+                let path = crate::dep_path::DepPath::parse(&name, &raw)
+                    .map_err(|refusal| self.reject(arg.span, &refusal.message(&name, &raw)))?;
+                Ok((name, IpeDep::Path(path)))
             }
             other => Err(self.reject(
                 expr.span,
@@ -995,7 +1070,7 @@ impl Reader<'_> {
         let mut install_request = None;
         for (fname, value) in self.expect_record(expr)? {
             match self.text(fname.value) {
-                "ships" => config.ships = self.read_ships(value)?,
+                "ships" => config.set_ships(self.read_ships(value)?),
                 "desktop" => config.desktop = self.read_desktop(value)?,
                 "mobile" => config.mobile = self.read_mobile(value)?,
                 "browser" => (config.browser, install_request) = self.read_browser(value)?,
@@ -1282,12 +1357,8 @@ impl Reader<'_> {
     /// The refusal names the grammar and never echoes the declared text.
     fn bundle_id_field(&self, value: &Expr) -> Result<BundleId, CliError> {
         let raw = self.expect_string(value)?;
-        BundleId::parse(&raw).map_err(|refusal| {
-            self.reject(
-                value.span,
-                &format!("`delivery.mobile.bundleId` is refused: {refusal}"),
-            )
-        })
+        BundleId::parse(&raw)
+            .map_err(|refusal| self.reject(value.span, &bundle_id_refusal(&refusal)))
     }
 
     /// Read `delivery.mobile.orientation`: `Portrait` / `Landscape` / `Any`.
@@ -1748,8 +1819,8 @@ pub fn render_manifest_record(manifest: &ProjectManifest) -> String {
     {
         fields.push(format!("sourceRoot = {}", quote(&src_rel)));
     }
-    if !manifest.dependencies.is_empty() {
-        fields.push(render_dependencies(&manifest.dependencies));
+    if !manifest.declared().is_empty() {
+        fields.push(render_dependencies(manifest.declared()));
     }
     if !manifest.rust_dependencies.is_empty() {
         fields.push(render_rust_dependencies(&manifest.rust_dependencies));
@@ -1829,9 +1900,10 @@ fn quote(s: &str) -> String {
 }
 
 /// Render the `dependencies = [ … ]` field from the typed map.
-fn render_dependencies(deps: &BTreeMap<String, IpeDep>) -> String {
+fn render_dependencies(deps: &crate::project::DeclaredDeps) -> String {
     let items: Vec<String> = deps
         .iter()
+        .map(|(name, dep)| (name.as_str(), dep))
         .map(|(name, dep)| match dep {
             IpeDep::Index(req) => format!("dep {} {}", quote(name), quote(&req.to_string())),
             IpeDep::Git { url, rev: None } => format!("depGit {} {}", quote(name), quote(url)),
@@ -1841,9 +1913,7 @@ fn render_dependencies(deps: &BTreeMap<String, IpeDep>) -> String {
             } => {
                 format!("depGitRev {} {} {}", quote(name), quote(url), quote(rev))
             }
-            IpeDep::Path(path) => {
-                format!("depPath {} {}", quote(name), quote(&path.to_string_lossy()))
-            }
+            IpeDep::Path(path) => format!("depPath {} {}", quote(name), quote(path.as_str())),
         })
         .collect();
     format!("dependencies =\n        [ {} ]", items.join("\n        , "))
@@ -2025,11 +2095,11 @@ fn render_wasm(wasm: &WasmConfig) -> Option<String> {
 /// minimal and round-trips unchanged. Only the `ships` declaration is emitted;
 /// the host config sections keep their absent-section defaults.
 fn render_delivery(delivery: &DeliveryConfig) -> Option<String> {
-    if delivery.ships.is_empty() {
+    let ships = delivery.ships_for_render();
+    if ships.is_empty() {
         return None;
     }
-    let items = delivery
-        .ships
+    let items = ships
         .iter()
         .map(|s| ship_builder_expr(*s))
         .collect::<Vec<_>>()
@@ -2148,7 +2218,7 @@ const fn allocator_ctor_name(alloc: crate::build_plan::AllocatorChoice) -> &'sta
 ///
 /// # Errors
 /// [`CliError::Io`] if the manifest cannot be read or written;
-/// [`CliError::Pipeline`] if the manifest does not parse; [`CliError::Usage`]
+/// [`CliError::Pipeline`] if the manifest does not parse; [`CliError::ProjectRefused`]
 /// if the manifest shape is unexpected (no `package` record, a non-list
 /// `dependencies`) or the name collides with an author-written escape entry.
 pub fn upsert_index_dependency(
@@ -2243,7 +2313,7 @@ fn edit_dependencies_list(
     };
 
     let Expr_::List(items) = &deps_expr.value else {
-        return Err(usage(text::msg::package_manifest_deps_not_list()));
+        return Err(refused(text::msg::package_manifest_deps_not_list()));
     };
 
     let existing = locate_dep_entry(items, &interner, name);
@@ -2252,7 +2322,7 @@ fn edit_dependencies_list(
         // `dep "…" "…"`; an escape is author-owned and never overwritten.
         (Some(entry), Some(found)) => {
             if found.is_escape() {
-                return Err(usage(text::msg::pkg_add_escape_dependency(&name)));
+                return Err(refused(text::msg::pkg_add_escape_dependency(&name)));
             }
             Ok(splice(text, found.entry, entry))
         }
@@ -2277,10 +2347,10 @@ fn locate_package_record<'m>(
         .values
         .iter()
         .find(|v| interner.resolve(v.value.name.value) == Some("package"))
-        .ok_or_else(|| usage(text::msg::package_manifest_no_package_binding_edit()))?;
+        .ok_or_else(|| refused(text::msg::package_manifest_no_package_binding_edit()))?;
     match &package.value.body.value {
         Expr_::Record(fields) => Ok(fields.as_slice()),
-        _ => Err(usage(text::msg::package_manifest_package_not_record())),
+        _ => Err(refused(text::msg::package_manifest_package_not_record())),
     }
 }
 
@@ -2438,11 +2508,13 @@ fn insert_new_dependencies_field(
         .map_or(0, |(_, v)| v.span.hi as usize)
         .min(text.len());
     let Some(rel_close) = text.get(after_last..).and_then(|s| s.find('}')) else {
-        return Err(usage(text::msg::package_manifest_deps_brace_not_found()));
+        return Err(refused(text::msg::package_manifest_deps_brace_not_found()));
     };
     let close_idx = after_last + rel_close;
     let (Some(before), Some(after)) = (text.get(..close_idx), text.get(close_idx..)) else {
-        return Err(usage(text::msg::package_manifest_deps_brace_out_of_range()));
+        return Err(refused(
+            text::msg::package_manifest_deps_brace_out_of_range(),
+        ));
     };
     // Align the new field to the last field's indentation. Elm-style manifests
     // indent record fields and the closing brace to a common column; reuse the
@@ -2453,14 +2525,15 @@ fn insert_new_dependencies_field(
     Ok(format!("{opener}, {field}\n{indent}{after}"))
 }
 
-/// A manifest-write usage refusal.
-const fn usage(message: text::Message) -> CliError {
-    CliError::Usage(message)
+/// A manifest-write project-state refusal.
+const fn refused(message: text::Message) -> CliError {
+    CliError::ProjectRefused(message)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::ReservedPrefix;
 
     /// Create a fresh temp project directory with a minimal `src/Main.ipe`, so
     /// the reader's source-root existence check passes. Returns the project root.
@@ -2556,7 +2629,7 @@ mod tests {
         assert_eq!(m.name, "my-app");
         assert_eq!(m.version, None);
         assert_eq!(m.driver, ipe_backend_rust::DbDriver::Sqlite);
-        assert!(m.dependencies.is_empty());
+        assert!(m.declared().is_empty());
         assert!(m.rust_dependencies.is_empty());
         assert!(m.capabilities.is_empty());
         assert!(m.capabilities_accept.is_empty());
@@ -2614,21 +2687,21 @@ mod tests {
         );
         assert_eq!(m.driver, ipe_backend_rust::DbDriver::Postgres);
 
-        assert_eq!(m.dependencies.len(), 4);
+        assert_eq!(m.declared().len(), 4);
         assert!(matches!(
-            m.dependencies.get("ipe-http"),
+            m.declared().get("ipe-http"),
             Some(IpeDep::Index(_))
         ));
         assert!(matches!(
-            m.dependencies.get("ipe-widgets"),
+            m.declared().get("ipe-widgets"),
             Some(IpeDep::Git { rev: Some(r), .. }) if r == "a1b2c3"
         ));
         assert!(matches!(
-            m.dependencies.get("ipe-plain"),
+            m.declared().get("ipe-plain"),
             Some(IpeDep::Git { rev: None, .. })
         ));
         assert!(matches!(
-            m.dependencies.get("ipe-local"),
+            m.declared().get("ipe-local"),
             Some(IpeDep::Path(_))
         ));
 
@@ -2679,11 +2752,14 @@ mod tests {
 
     // ── Rejections: totality (a clean diagnostic, never a panic) ──────────────
 
-    /// Every rejection asserts a `Usage` (the reader's named-error channel)
-    /// or a `Usage`/`Pipeline` — never a panic and never an `Ok`.
+    /// Every rejection asserts a `ProjectRefused` (the reader's named-error channel)
+    /// or a `ProjectRefused`/`Pipeline` — never a panic and never an `Ok`.
     fn assert_rejected(result: &Result<ProjectManifest, CliError>) {
         assert!(
-            matches!(result, Err(CliError::Usage(_) | CliError::Pipeline { .. })),
+            matches!(
+                result,
+                Err(CliError::ProjectRefused(_) | CliError::Pipeline { .. })
+            ),
             "expected a clean rejection, got {result:?}"
         );
     }
@@ -2745,7 +2821,7 @@ mod tests {
             ),
         );
         assert_rejected(&r);
-        if let Err(CliError::Usage(msg)) = &r {
+        if let Err(CliError::ProjectRefused(msg)) = &r {
             assert!(
                 msg.contains("DATABASE_URL"),
                 "error names the secret: {msg}"
@@ -2791,7 +2867,7 @@ mod tests {
         let expected = text::msg::manifest_installable_without_icon().to_string();
         let at = located_at(&source, "installable");
         assert!(
-            matches!(&result, Err(CliError::Usage(msg))
+            matches!(&result, Err(CliError::ProjectRefused(msg))
                 if msg.contains(&expected) && msg.contains(&at)),
             "`installable = True` with no `icon` is refused at `installable` ({at}): {:?}",
             result.map(|m| m.name)
@@ -2807,7 +2883,7 @@ mod tests {
             &pwa_icon::test_png(512, 512),
         );
         assert!(
-            matches!(&result, Err(CliError::Usage(msg))
+            matches!(&result, Err(CliError::ProjectRefused(msg))
                 if msg.contains("expected `True` or `False`")),
             "`installable = \"yes\"` is the bool type refusal: {:?}",
             result.map(|m| m.name)
@@ -2870,7 +2946,7 @@ mod tests {
         for (tag, icon, expected) in cases {
             let result = read_with_icon(&format!("installable_unfit_{tag}"), &source, &icon);
             assert!(
-                matches!(&result, Err(CliError::Usage(msg))
+                matches!(&result, Err(CliError::ProjectRefused(msg))
                     if msg.contains(&expected) && msg.contains(&at)),
                 "{tag}: refused at the icon ({at}) with {expected:?}: {:?}",
                 result.map(|m| m.name)
@@ -2898,7 +2974,7 @@ mod tests {
         let source = install_manifest(None, "{ themeColor = \"#000\" }");
         let result = read("unknown_browser_field", &source);
         assert!(
-            matches!(&result, Err(CliError::Usage(msg))
+            matches!(&result, Err(CliError::ProjectRefused(msg))
                 if msg.contains("`themeColor` is not a browser field")
                     && msg.contains("`basePath`")
                     && msg.contains("`installable`")),
@@ -2942,7 +3018,7 @@ mod tests {
     /// accepted or refused through another channel.
     fn base_path_refusal_text(test_name: &str, raw: &str) -> Option<String> {
         match read_base_path(test_name, raw) {
-            Err(CliError::Usage(msg)) => Some(msg.to_string()),
+            Err(CliError::ProjectRefused(msg)) => Some(msg.to_string()),
             _ => None,
         }
     }
@@ -3128,7 +3204,7 @@ mod tests {
     /// accepted or refused through another channel.
     fn public_env_refusal(test_name: &str, entries: &[&str]) -> Option<String> {
         match read_public_env_list(test_name, entries) {
-            Err(CliError::Usage(msg)) => Some(msg.to_string()),
+            Err(CliError::ProjectRefused(msg)) => Some(msg.to_string()),
             _ => None,
         }
     }
@@ -3243,7 +3319,7 @@ mod tests {
     /// The refusal text a read returned, or `None` when it was accepted.
     fn refusal_text(test_name: &str, source: &str) -> Option<String> {
         match read(test_name, source) {
-            Err(CliError::Usage(msg)) => Some(msg.to_string()),
+            Err(CliError::ProjectRefused(msg)) => Some(msg.to_string()),
             _ => None,
         }
     }
@@ -3362,7 +3438,7 @@ mod tests {
     /// the Firebase API key.
     fn push_delivery(api_key: &str) -> String {
         format!(
-            "{{ mobile = {{ bundleId = \"com.example.app\", push = {{ apns = Production, fcm = {{ projectId = \"example-app\", applicationId = \"1:123:android:abc\", apiKey = {api_key:?}, senderId = \"123\" }} }} }} }}"
+            "{{ mobile = {{ bundleId = \"io.acme.app\", push = {{ apns = Production, fcm = {{ projectId = \"example-app\", applicationId = \"1:123:android:abc\", apiKey = {api_key:?}, senderId = \"123\" }} }} }} }}"
         )
     }
 
@@ -3371,7 +3447,7 @@ mod tests {
         let twice_key = refusal_text(
             "push_api_key_twice_refused",
             &delivery_manifest(
-                "{ mobile = { bundleId = \"com.example.app\", push = { apns = Production, fcm = { projectId = \"example-app\", applicationId = \"1:123:android:abc\", apiKey = \"AIza-first\", apiKey = \"AIza-second\", senderId = \"123\" } } } }",
+                "{ mobile = { bundleId = \"io.acme.app\", push = { apns = Production, fcm = { projectId = \"example-app\", applicationId = \"1:123:android:abc\", apiKey = \"AIza-first\", apiKey = \"AIza-second\", senderId = \"123\" } } } }",
                 "JsPort Push",
             ),
         );
@@ -3450,9 +3526,70 @@ mod tests {
         );
         assert!(
             one_label.as_deref().is_some_and(
-                |msg| msg.contains(&crate::project::BundleIdRefusal::OneLabel.to_string())
+                |msg| msg.contains(bundle_id_refusal(&BundleIdRefusal::OneLabel).as_str())
             ),
             "a one-label bundleId is refused with the one-label text: {one_label:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_bundle_id_refusal_text_covers_every_refusal() {
+        for refusal in [
+            BundleIdRefusal::Empty,
+            BundleIdRefusal::TooLong { len: 200 },
+            BundleIdRefusal::Byte { byte: b'-' },
+            BundleIdRefusal::EmptyLabel,
+            BundleIdRefusal::LabelStartsWithDigit,
+            BundleIdRefusal::OneLabel,
+            BundleIdRefusal::ReservedWord { word: "class" },
+            BundleIdRefusal::JavaPlatformPackage,
+            BundleIdRefusal::StoreReserved {
+                prefix: ReservedPrefix::ComApple,
+            },
+            BundleIdRefusal::StoreReserved {
+                prefix: ReservedPrefix::ComExample,
+            },
+        ] {
+            let names = match refusal {
+                BundleIdRefusal::Empty
+                | BundleIdRefusal::EmptyLabel
+                | BundleIdRefusal::LabelStartsWithDigit
+                | BundleIdRefusal::OneLabel => None,
+                BundleIdRefusal::TooLong { .. } => Some("200".to_owned()),
+                BundleIdRefusal::Byte { .. } => Some("0x2D".to_owned()),
+                BundleIdRefusal::ReservedWord { word } => Some(format!("`{word}`")),
+                BundleIdRefusal::JavaPlatformPackage => Some("`java`".to_owned()),
+                BundleIdRefusal::StoreReserved { prefix } => {
+                    Some(format!("`{}`", prefix.spelled()))
+                }
+            };
+            let shown = bundle_id_refusal(&refusal);
+            assert!(
+                shown.contains("`delivery.mobile.bundleId` is refused")
+                    && shown.contains(BUNDLE_ID_EXAMPLE)
+                    && names.as_deref().is_none_or(|name| shown.contains(name)),
+                "{refusal:?}: {shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_bundle_id_under_a_store_prefix_is_refused_without_echo() {
+        let source = delivery_manifest("{ mobile = { bundleId = \"Com.Apple.Shop\" } }", "");
+        let refusal = refusal_text("bundle_id_store_reserved_refused", &source);
+        let at = located_at(&source, "\"Com.Apple.Shop\"");
+        let expected = bundle_id_refusal(&BundleIdRefusal::StoreReserved {
+            prefix: ReservedPrefix::ComApple,
+        });
+        assert!(
+            refusal.as_deref().is_some_and(|msg| {
+                msg.contains(expected.as_str())
+                    && msg.contains(&at)
+                    && msg.contains("`com.apple`")
+                    && !msg.contains("Com.Apple")
+                    && !msg.contains("Shop")
+            }),
+            "a store-reserved bundleId is refused at the field ({at}) by the table spelling, never echoed: {refusal:?}"
         );
     }
 
@@ -3460,7 +3597,10 @@ mod tests {
     fn manifest_bundle_id_refusal_remedy_parses() {
         let manifest = read(
             "bundle_id_remedy_accepted",
-            &delivery_manifest("{ mobile = { bundleId = \"com.example.myapp\" } }", ""),
+            &delivery_manifest(
+                &format!("{{ mobile = {{ bundleId = {BUNDLE_ID_EXAMPLE:?} }} }}"),
+                "",
+            ),
         )
         .expect("the bundleId the refusal text advises parses");
         assert_eq!(
@@ -3470,7 +3610,7 @@ mod tests {
                 .bundle_id
                 .as_ref()
                 .map(BundleId::as_str),
-            Some("com.example.myapp")
+            Some(BUNDLE_ID_EXAMPLE)
         );
         let absent = read(
             "bundle_id_absent",
@@ -3488,10 +3628,7 @@ mod tests {
     fn manifest_push_accept_without_identifiers_is_unconfigured() {
         let manifest = read(
             "push_accept_without_identifiers",
-            &delivery_manifest(
-                "{ mobile = { bundleId = \"com.example.app\" } }",
-                "JsPort Push",
-            ),
+            &delivery_manifest("{ mobile = { bundleId = \"io.acme.app\" } }", "JsPort Push"),
         )
         .expect("the manifest reads; a web-only bundle needs no identifiers");
         assert!(
@@ -3500,7 +3637,7 @@ mod tests {
         );
         let offline = read(
             "push_neither_accept_nor_identifiers",
-            &delivery_manifest("{ mobile = { bundleId = \"com.example.app\" } }", ""),
+            &delivery_manifest("{ mobile = { bundleId = \"io.acme.app\" } }", ""),
         )
         .expect("a manifest without push parses");
         assert!(
@@ -3738,7 +3875,7 @@ mod tests {
         assert!(
             matches!(
                 &r,
-                Err(CliError::Usage(message))
+                Err(CliError::ProjectRefused(message))
                     if message.contains("must set `mode = Render` or `mode = Hydrate`")
             ),
             "a bundle without a mode keeps its refusal: {r:?}"
@@ -3754,7 +3891,7 @@ mod tests {
         assert!(
             matches!(
                 &r,
-                Err(CliError::Usage(message))
+                Err(CliError::ProjectRefused(message))
                     if message.contains("`Solo` was renamed `Render`")
                         && message.contains("`mode = Render`")
             ),
@@ -3774,7 +3911,7 @@ mod tests {
             assert!(
                 matches!(
                     &r,
-                    Err(CliError::Usage(message))
+                    Err(CliError::ProjectRefused(message))
                         if message.contains(&format!(
                             "`{mode}` is not a wasm mode — use `Render` or `Hydrate`"
                         ))
@@ -4054,7 +4191,7 @@ mod tests {
         )
         .expect("every ship builder must parse");
         assert_eq!(
-            m.delivery.ships,
+            m.delivery.ships_for_render(),
             vec![
                 ShipEntry::Binary(BinaryTarget::Host),
                 ShipEntry::Binary(BinaryTarget::Static),
@@ -4076,7 +4213,7 @@ mod tests {
                 "{HEADER}package =\n    {{ name = \"x\", delivery = {{ ships = [ {entry} ] }} }}\n"
             ),
         ) {
-            Err(CliError::Usage(message)) => Some(message.to_string()),
+            Err(CliError::ProjectRefused(message)) => Some(message.to_string()),
             _ => None,
         }
     }
@@ -4136,7 +4273,7 @@ mod tests {
             ),
         )
         .expect("every builder the writer spells must parse");
-        assert_eq!(m.delivery.ships, entries);
+        assert_eq!(m.delivery.ships_for_render(), entries);
     }
 
     /// The `Ipe.Package` schema's exposed ship builders and `Ship` constructors
@@ -4194,7 +4331,7 @@ mod tests {
             &format!("{HEADER}package =\n    {{ name = \"x\" }}\n"),
         )
         .expect("absent ships parses");
-        assert!(m.delivery.ships.is_empty());
+        assert!(m.delivery.ships_for_render().is_empty());
     }
 
     #[test]
@@ -4217,6 +4354,54 @@ mod tests {
             ),
         );
         assert_rejected(&r);
+    }
+
+    /// A `sourceRoot` other than `src` is the removed-field refusal, whether or
+    /// not the named directory exists: the reader refuses the field before it
+    /// looks at any path.
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: an unwritable temp dir IS the failure
+    fn a_moved_source_root_is_the_removed_field_refusal() {
+        let removed =
+            CliError::ProjectRefused(text::msg::package_manifest_source_root_removed()).to_string();
+        for (tag, spelled, make_dir) in [
+            ("source_root_absent", "app", false),
+            ("source_root_present", "app", true),
+            ("source_root_hidden", ".src", true),
+            ("source_root_escape", "../..", false),
+            ("source_root_dotted", "./src", false),
+        ] {
+            let root = fresh_project(tag);
+            if make_dir {
+                std::fs::create_dir_all(root.join(spelled)).expect("create the moved root");
+            }
+            let path = root.join(PACKAGE_IPE);
+            std::fs::write(
+                &path,
+                format!("{HEADER}package =\n    {{ name = \"x\", sourceRoot = \"{spelled}\" }}\n"),
+            )
+            .expect("write package.ipe");
+            let result = parse_package_manifest(&path);
+            let _ = std::fs::remove_dir_all(&root);
+            assert!(
+                matches!(&result, Err(CliError::ProjectRefused(_))),
+                "{tag}: a moved source root is project state: {result:?}"
+            );
+            let Err(err) = result else {
+                return;
+            };
+            assert_eq!(err.to_string(), removed, "{tag}");
+        }
+    }
+
+    /// The control: `sourceRoot = "src"` names the one source root and reads.
+    #[test]
+    fn a_source_root_spelled_src_reads() {
+        let r = read(
+            "source_root_src",
+            &format!("{HEADER}package =\n    {{ name = \"x\", sourceRoot = \"src\" }}\n"),
+        );
+        assert!(r.is_ok(), "{r:?}");
     }
 
     #[test]
@@ -4251,7 +4436,10 @@ mod tests {
             "the render emits the declared ships: {rendered}"
         );
         let reparsed = read("ships_render_out", &rendered).expect("rendered manifest re-parses");
-        assert_eq!(reparsed.delivery.ships, m.delivery.ships);
+        assert_eq!(
+            reparsed.delivery.ships_for_render(),
+            m.delivery.ships_for_render()
+        );
     }
 
     // ── manifest writer: `ipe add` records a dependency in package.ipe ────────
@@ -4295,7 +4483,7 @@ mod tests {
             "a dependencies block with the entry is created: {text}"
         );
         let m = reparsed.expect("the created block re-parses");
-        assert!(m.dependencies.contains_key("http-extras"));
+        assert!(m.declared().contains("http-extras"));
         assert_eq!(m.name, "app", "the existing name field is preserved");
     }
 
@@ -4315,7 +4503,7 @@ mod tests {
         assert!(text.contains("dep \"beta\" \"^2\""), "beta kept: {text}");
         assert!(text.contains("dep \"gamma\""), "gamma appended: {text}");
         let m = reparsed.expect("re-parses");
-        assert_eq!(m.dependencies.len(), 3);
+        assert_eq!(m.declared().len(), 3);
     }
 
     #[test]
@@ -4335,14 +4523,14 @@ mod tests {
             "no duplicate entry after re-add: {text}"
         );
         let m = reparsed.expect("re-parses");
-        assert_eq!(m.dependencies.len(), 1, "still a single dependency");
+        assert_eq!(m.declared().len(), 1, "still a single dependency");
         assert!(
             matches!(
-                m.dependencies.get("http-extras"),
+                m.declared().get("http-extras"),
                 Some(IpeDep::Index(got)) if *got == req("^1.5")
             ),
             "http-extras must remain an index dependency with the updated requirement: {:?}",
-            m.dependencies.get("http-extras")
+            m.declared().get("http-extras")
         );
     }
 
@@ -4364,8 +4552,8 @@ mod tests {
         let after = std::fs::read_to_string(&path).expect("read back");
         let _ = std::fs::remove_dir_all(&root);
         assert!(
-            matches!(err, CliError::Usage(_)),
-            "the refusal is a usage error: {err:?}"
+            matches!(err, CliError::ProjectRefused(_)),
+            "the refusal is a project-state refusal: {err:?}"
         );
         assert_eq!(
             after, source,
@@ -4388,8 +4576,8 @@ mod tests {
         assert!(text.contains("dep \"keep\" \"^1\""), "sibling kept: {text}");
         assert!(!text.contains("\"drop\""), "the entry is gone: {text}");
         let m = reparsed.expect("re-parses after remove");
-        assert_eq!(m.dependencies.len(), 1);
-        assert!(m.dependencies.contains_key("keep"));
+        assert_eq!(m.declared().len(), 1);
+        assert!(m.declared().contains("keep"));
     }
 
     #[test]
@@ -4405,7 +4593,7 @@ mod tests {
         });
         assert_eq!(text, source, "removing an absent dep changes nothing");
         let m = reparsed.expect("re-parses");
-        assert_eq!(m.dependencies.len(), 1);
+        assert_eq!(m.declared().len(), 1);
     }
 
     #[test]
@@ -4422,6 +4610,52 @@ mod tests {
             "entry added into empty list: {text}"
         );
         let m = reparsed.expect("re-parses");
-        assert_eq!(m.dependencies.len(), 1);
+        assert_eq!(m.declared().len(), 1);
+    }
+
+    /// A dependency name declared twice is refused at the entry, never resolved
+    /// to one of the two.
+    #[test]
+    fn a_dependency_declared_twice_is_refused() {
+        let source = format!(
+            "{HEADER}package =\n\
+             \x20   {{ name = \"app\"\n\
+             \x20   , dependencies =\n\
+             \x20       [ depPath \"s-lib\" \"../a\"\n\
+             \x20       , dep \"s-lib\" \"^1\"\n\
+             \x20       ]\n\
+             \x20   }}\n"
+        );
+        let result = read("dup_dependency", &source).map(|m| m.declared().len());
+        assert!(
+            matches!(&result, Err(CliError::ProjectRefused(msg))
+                if msg.to_string().contains("`s-lib` is declared twice")),
+            "a repeated dependency name must be refused: {result:?}"
+        );
+    }
+
+    /// A dependency name `PackageName` refuses is refused at the manifest, in
+    /// every builder, before any path or version is read.
+    #[test]
+    fn a_dependency_name_that_is_not_a_package_name_is_refused() {
+        let builders = ["depPath {} \"../a\"", "dep {} \"^1\"", "depGit {} \"u\""];
+        for (index, name) in ["s_lib", "-a", "A", "../x"].into_iter().enumerate() {
+            for builder in builders {
+                let call = builder.replacen("{}", &format!("{name:?}"), 1);
+                let source = format!(
+                    "{HEADER}package =\n\
+                     \x20   {{ name = \"app\"\n\
+                     \x20   , dependencies = [ {call} ]\n\
+                     \x20   }}\n"
+                );
+                let result =
+                    read(&format!("bad_dep_name_{index}"), &source).map(|m| m.declared().len());
+                assert!(
+                    matches!(&result, Err(CliError::ProjectRefused(msg))
+                        if msg.to_string().contains("package name")),
+                    "dependency name {name:?} in `{call}` must be refused: {result:?}"
+                );
+            }
+        }
     }
 }

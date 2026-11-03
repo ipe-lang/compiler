@@ -863,9 +863,16 @@ fn run_probe(
             drifts.push((i, "does not resolve to a registered kernel".to_owned()));
             continue;
         };
-        let Some((_, inf)) = kernel_table.iter().find(|(k, _)| k == kernel) else {
-            drifts.push((i, format!("kernel `{kernel:?}` carries no type scheme")));
-            continue;
+        let inf = match kernel_table.scheme(*kernel) {
+            Some(ipe_types::KernelScheme::Schemed(inf)) => inf,
+            Some(ipe_types::KernelScheme::Unschemed) => {
+                drifts.push((i, format!("kernel `{kernel:?}` carries no type scheme")));
+                continue;
+            }
+            None => {
+                drifts.push((i, format!("kernel `{kernel:?}` is not wired")));
+                continue;
+            }
         };
         if !alpha_eq(ann, inf, &interner, &mut VarPairs::with_seals(seals)) {
             drifts.push((

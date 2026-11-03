@@ -54,9 +54,16 @@ dependencies =
     ]
 ```
 
-`ipe add <pkg>[@<req>]` writes a `dep` line and pins it in `ipe.lock` for you;
-`depGit`/`depPath` escapes are author-written and never rewritten. Rust crates
-for FFI:
+Each name appears once. A `depPath` is `../` steps (at most eight) and then
+`/`-separated directory names, the same on every host; an absolute path, a
+drive, a `\`, or a `.` component is refused.
+
+No dependency is compiled yet: a package that declares one is refused by
+`ipe type-check`, `ipe dev build`, `ipe test` and `ipe lint`, with an error that
+names the dependency and its kind. To use a library today, copy its modules into
+this package's `src/`. `ipe fmt` keeps working, and `ipe add <pkg>[@<req>]` still
+writes a `dep` line and pins it in `ipe.lock`; `depGit`/`depPath` lines are
+author-written and never rewritten. Rust crates for FFI:
 
 ```ipe
 rustDependencies =
@@ -81,7 +88,7 @@ The vocabulary: `Network`, `Filesystem`, `Database`, `Env`, `Subprocess`,
 `Clock`, `Random`, `NativeFfi`, `FfiRaw`, `Unsafe`, `CustomElement`, and
 `JsPort <axis>` for a browser port (`Geolocation`, `Clipboard`, `Camera`,
 `Microphone`, `Storage`, `Notification`, `WebAuthn`, …). See
-[capabilities](../reference/capabilities.md).
+[capabilities](https://github.com/ipe-lang/compiler/blob/main/docs/reference/capabilities.md).
 
 ## Web delivery: `wasm` and `delivery`
 
@@ -101,7 +108,7 @@ to its default:
 delivery =
     { ships = [ binary, desktop, clientAndroid ]   -- default: [ binary ]
     , desktop = { title = "My App", width = 1024, height = 768 }
-    , mobile = { bundleId = "com.example.myapp", orientation = Any }  -- Any (default) | Portrait | Landscape
+    , mobile = { bundleId = "io.acme.myapp", orientation = Any }  -- Any (default) | Portrait | Landscape
     , browser = { basePath = "/" }
     , servers = [ "https://api.example.com" ]   -- default: [] (offline)
     }
@@ -110,9 +117,10 @@ delivery =
 `bundleId` is the application identifier the Android and iOS shells install
 the app under, verbatim. It is two or more `.`-separated labels, each an ASCII
 letter then ASCII letters or digits, at most 128 bytes in all, with no label a
-Java reserved word and a first label other than `java` (`com.example.myapp`, not
-`com.my-app`, `com.example.class`, or `java.myapp`);
-the manifest refuses any other value. An absent `bundleId` is `com.ipe.`
+Java reserved word, a first label other than `java`, and not under a
+store-reserved prefix (`com.apple`, `com.android`, `android`, `com.example`, in
+any case) (`io.acme.myapp`, not `com.my-app`, `io.acme.class`, `java.myapp`, or
+`com.example.myapp`); the manifest refuses any other value. An absent `bundleId` is `com.ipe.`
 followed by the lowercased letters and digits of the package name.
 `orientation` is the orientation the app runs in, `Any` (free rotation) when
 absent; `Portrait` and `Landscape` lock it.
@@ -166,7 +174,7 @@ A mobile app that accepts `JsPort Push` names its push identifiers under
 
 ```ipe
 mobile =
-    { bundleId = "com.example.myapp"
+    { bundleId = "io.acme.myapp"
     , push =
         { apns = Production                      -- Development | Production
         , fcm =
@@ -224,7 +232,7 @@ package =
     , delivery =
         { ships = [ binary, clientAndroid, clientIos ]
         , desktop = { title = "My App", width = 1200, height = 800 }
-        , mobile = { bundleId = "com.example.myapp", orientation = Any }
+        , mobile = { bundleId = "io.acme.myapp", orientation = Any }
         , browser = { basePath = "/" }
         }
     }

@@ -7,8 +7,8 @@
 
 use std::path::{Path, PathBuf};
 
-use e2e_support::normalize_runtime_dep_path;
 use ipe_backend::Backend;
+use ipe_backend_rust::golden_form::golden_cargo_toml;
 use ipe_backend_rust::{RuntimeDep, RustBackend};
 use ipe_diagnostics::{DResult, Diagnostic};
 use ipe_intern::Interner;
@@ -21,7 +21,7 @@ const GOLDEN_CARGO: &str = include_str!("../../../../../tests/golden/basics/Carg
 
 /// The crate identity a project build gives `tests/golden/basics`: the package
 /// name from its `package.ipe` plus a fixed-width hash suffix, which
-/// `normalize_runtime_dep_path` replaces with the portable placeholder.
+/// `golden_cargo_toml` replaces with the portable placeholder.
 const BASICS_PROJECT_NAME: &str = "basics_00000000";
 
 /// Locate the runtime crate root (`src/runtime/rust`) by walking up from the
@@ -169,7 +169,7 @@ fn m0_emits_byte_identical_cargo_toml() -> DResult<()> {
     let emitted = backend.emit(&program)?;
 
     assert_eq!(
-        normalize_runtime_dep_path(&emitted.cargo_toml),
+        golden_cargo_toml(&emitted.cargo_toml),
         GOLDEN_CARGO,
         "Cargo.toml must match the golden (runtime path normalized to the placeholder)"
     );

@@ -114,15 +114,18 @@ impl AspectCheck<EnvItem> for ReadInCodeColumn {
 /// registry (its own gate). This column lifts that to a per-variable cell: a
 /// variable whose name is absent from the committed reference is a hole.
 pub struct DocumentedColumn {
-    reference: Option<String>,
+    reference: Result<String, std::io::ErrorKind>,
 }
 
 impl DocumentedColumn {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            reference: load_env_reference(),
-        }
+        Self::with_reference(load_env_reference())
+    }
+
+    /// The column over one read of the reference, its failure kind kept.
+    const fn with_reference(reference: Result<String, std::io::ErrorKind>) -> Self {
+        Self { reference }
     }
 }
 
@@ -143,12 +146,15 @@ impl AspectCheck<EnvItem> for DocumentedColumn {
                 "not a registered environment variable — this column judges registered vars only",
             );
         };
-        let Some(reference) = &self.reference else {
-            return Cell::Hole(format!(
-                "docs/reference/env.md is unreadable, so `{}` cannot be shown \
-                 documented",
-                var.name
-            ));
+        let reference = match &self.reference {
+            Ok(reference) => reference,
+            Err(kind) => {
+                return Cell::Hole(format!(
+                    "docs/reference/env.md cannot be read ({kind}), so `{}` cannot be \
+                     shown documented",
+                    var.name
+                ));
+            }
         };
         // The reference renders each name inside backticks (`IPE_WEB_PORT`); match
         // that exact token so a name that is a prefix of another (IPE_WEB_STORE vs
@@ -167,15 +173,15 @@ impl AspectCheck<EnvItem> for DocumentedColumn {
     }
 }
 
-/// Read the committed env reference once.
-fn load_env_reference() -> Option<String> {
-    static REFERENCE: OnceLock<Option<String>> = OnceLock::new();
+/// Read the committed env reference once, keeping why a read failed.
+fn load_env_reference() -> Result<String, std::io::ErrorKind> {
+    static REFERENCE: OnceLock<Result<String, std::io::ErrorKind>> = OnceLock::new();
     REFERENCE
         .get_or_init(|| {
             let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../..")
                 .join("docs/reference/env.md");
-            std::fs::read_to_string(path).ok()
+            std::fs::read_to_string(path).map_err(|error| error.kind())
         })
         .clone()
 }
@@ -307,4 +313,24 @@ fn is_dev_only(var: &EnvVar) -> bool {
         || p.contains("no effect on a release build")
         || p.contains("release build never sets it")
         || p.contains("never mounted in a release build")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ipe_docs::env_vars::ENV_VARS;
+
+    /// A reference that cannot be read holes every registered variable naming
+    /// the cause.
+    #[test]
+    fn an_unreadable_env_reference_holes_with_its_cause() {
+        let column = DocumentedColumn::with_reference(Err(std::io::ErrorKind::PermissionDenied));
+        let var = ENV_VARS.first().expect("the env registry is non-empty");
+        let cell = column.check(&EnvItem::Registered(var));
+        let cause = std::io::ErrorKind::PermissionDenied.to_string();
+        assert!(
+            matches!(&cell, Cell::Hole(msg) if msg.contains(&cause)),
+            "{cell:?}"
+        );
+    }
 }

@@ -2520,9 +2520,12 @@ fn memory_store_message(ttl: Duration) -> String {
 }
 
 /// Emit the `[ipe.live] YYYY/MM/DD HH:MM:SS session store: memory (ttl=…)`
-/// startup line. Shared so the in-process console sub-app mount emits the same
-/// line format.
-pub(crate) fn emit_memory_store_log(ttl: Duration) {
+/// startup line.
+///
+/// The only caller is [`choose_store`], the one place a memory store is
+/// actually chosen; kept module-private so no other site can log a store
+/// choice it did not make.
+fn emit_memory_store_log(ttl: Duration) {
     crate::system::emit_runtime_log_stamped(
         &go_log_timestamp(),
         "live",
@@ -2626,6 +2629,7 @@ mod tests {
             liveness: crate::web::SessionLiveness::default(),
             charge: crate::web::budget::Charge::detached(),
             cmds: Arc::new(crate::web::budget::SessionCmds::new()),
+            port_life: None,
         }))
     }
 
@@ -2836,6 +2840,7 @@ mod tests {
             liveness: crate::web::SessionLiveness::default(),
             charge: crate::web::budget::Charge::detached(),
             cmds: Arc::new(crate::web::budget::SessionCmds::new()),
+            port_life: None,
         }))
     }
 
@@ -4032,7 +4037,8 @@ mod tests {
         // are never parsed: the length gate fires first.
         let mut framed = Vec::new();
         framed.extend_from_slice(&TEST_TAG);
-        framed.resize(32 + MAX_CHECKPOINT_BYTES as usize + 1, b'0');
+        let ceiling = usize::try_from(MAX_CHECKPOINT_BYTES).expect("the 64 MiB ceiling fits usize");
+        framed.resize(32 + ceiling + 1, b'0');
         let blob = B64.encode(&framed);
         let init = || (serde_json::Value::Null, ());
         let decoded = decode_or_reconstruct_checkpoint(&TEST_TAG, &blob, &init);
@@ -4421,6 +4427,7 @@ mod tests {
             liveness: crate::web::SessionLiveness::default(),
             charge: crate::web::budget::Charge::detached(),
             cmds: Arc::new(crate::web::budget::SessionCmds::new()),
+            port_life: None,
             model,
             rendered: crate::web::Rendered::first(crate::web::SessionKeys::distinct(), tree),
             tabs: crate::web::TabSeqs::default(),

@@ -1,6 +1,6 @@
 use super::{
-    BTreeMap, Builder, Content, DResult, Diagnostic, FieldAccess, FlatType, RecordUpdate, STAGE,
-    Span, Symbol, TyBounds, VarId, canon,
+    BTreeMap, Builder, CallSite, CalleeName, Content, DResult, Diagnostic, FieldAccess, FlatType,
+    RecordUpdate, STAGE, Span, Symbol, TyBounds, VarId, canon,
 };
 
 impl Builder<'_> {
@@ -98,8 +98,15 @@ impl Builder<'_> {
                 for (_, _, param_var) in arg_pairs.iter().rev() {
                     fun_shape = self.structure(FlatType::Fun(*param_var, fun_shape))?;
                 }
-                // Order matters: callee-vs-shape first (see above).
-                self.eq(callee.span, callee_var, fun_shape)?;
+                // Order matters: callee-vs-shape first (see above). The call
+                // site rides as the origin of the shape constraint and of every
+                // constraint consuming `ret`, so an arity fault reads as one.
+                let site = CallSite {
+                    callee: callee_var,
+                    name: callee_name(&callee.value),
+                    given: arg_pairs.len(),
+                };
+                self.eq_call_shape(callee.span, site, fun_shape, ret)?;
                 for (arg_span, arg_var, param_var) in arg_pairs {
                     self.eq(arg_span, arg_var, param_var)?;
                 }
@@ -310,5 +317,24 @@ impl Builder<'_> {
             self.eq(br.body.span, body_var, result)?;
         }
         Ok(result)
+    }
+}
+
+/// The name an arity diagnostic gives a call's callee, when the call names it
+/// directly: a local or top-level binding or a constructor by its own name, a
+/// kernel with its module qualifier (`List.sum`).
+const fn callee_name(callee: &canon::Expr_) -> Option<CalleeName> {
+    match callee {
+        canon::Expr_::VarLocal(name)
+        | canon::Expr_::VarTopLevel { name, .. }
+        | canon::Expr_::VarCtor { name, .. } => Some(CalleeName {
+            qualifier: None,
+            name: *name,
+        }),
+        canon::Expr_::VarKernel { module, name, .. } => Some(CalleeName {
+            qualifier: Some(*module),
+            name: *name,
+        }),
+        _ => None,
     }
 }

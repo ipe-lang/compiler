@@ -5,8 +5,10 @@
 //! the runtime's `scratch_core`), which verifies the base and creates entries
 //! exclusively under it. Clippy bans the standard library's and `tempfile`'s
 //! temp-root lookups everywhere else, so a test that needs the root reads it
-//! here. This crate is a dev-dependency only; the scratch text gate refuses a
-//! manifest that lists it under `[dependencies]` or `[build-dependencies]`.
+//! here. This crate never reaches a shipped artifact: the scratch reach gate
+//! admits it outside `[dev-dependencies]` only in an unpublished Rust library
+//! that no crate building a binary or foreign library links outside its own
+//! `[dev-dependencies]`.
 //!
 //! The root is handed out only once it is proven to sit outside every Ipê
 //! project: a project marker at the base or above it would make the compiler's

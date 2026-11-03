@@ -8,13 +8,14 @@ use std::rc::Rc;
 use ipe_diagnostics::suggest::{Cap, Hit, Policy, Query, Shape, Spelling, Threshold, rank};
 use ipe_diagnostics::{
     AliasExpansionKind, AliasRowFault, Candidates, CmdSubShapeMismatch, CodecAutoRejection,
-    DResult, Diagnostic, EditTarget, ImportedAs, Located, ModulePlacementReason,
+    CtorWithheld, DResult, Diagnostic, EditTarget, ImportedAs, Located, ModulePlacementReason,
     ModulePlacementRejection, NameError, ParseError, SealRejection, SortedNames, Span, StdlibReach,
     TypeError,
 };
 use ipe_intern::{Interner, Symbol, SynthStem};
 use ipe_kernels::{
-    AppSurface, BuiltinRow, BuiltinType, SealClass, StdlibKernel, TypeParams, WebCapability,
+    AppSurface, BuiltinRow, BuiltinTag, BuiltinType, SealClass, StdlibKernel, TypeParams,
+    WebCapability,
 };
 use ipe_syntax as src;
 use ipe_syntax::BinOp;
@@ -25,10 +26,25 @@ use crate::env::{
     AbsentQualifier, ClaimForm, CmdOrSub, CtorHome, CtorIdentity, Env, ImportAliases, KernelModule,
     KernelTypeExport, ModuleIdentity, QualifierClaim, TeaShape, VarHome,
 };
+use crate::name_index::{BinderSite, DeclHome, NameIndex, NameSink, Target};
 use crate::scope::{
-    AliasBody, Clash, ExprTarget, Identity, ModuleScope, Origin, Resolved, Tier,
-    TypeTarget as ScopeType, ValueIdentity,
+    AliasBody, BoundBuiltin, Clash, ExprTarget, Identity, ModuleScope, Origin, QualifiedType,
+    Resolved, Tier, TypeTarget as ScopeType, ValueIdentity,
 };
+use ctor_clause::{
+    CtorFilter, CtorOffer, JudgedCtors, Withheld, exposed_ctor_filter, judge_ctor_clause,
+};
+
+/// What expression resolution writes to: the interner and the name sink.
+///
+/// Every resolution point records the occurrence it resolved into `names` as
+/// it resolves it, so the index and the canonical module come from one pass.
+struct ResolveCx<'a> {
+    /// The build's symbol table.
+    interner: &'a mut Interner,
+    /// The recorder of every resolved name occurrence.
+    names: &'a mut NameSink,
+}
 
 /// The most `did you mean` names attached to an unresolved name, so a wall of
 /// near-misses never drowns the actual error.
@@ -139,17 +155,6 @@ pub fn is_reserved_builtin_type_name(name: &str) -> bool {
 #[must_use]
 pub fn is_user_type_declaration_forbidden(name: &str) -> bool {
     bare_builtin(name).is_some_and(|row| row.role().forbids_user_declaration())
-}
-
-/// The exact type-argument count of the empty-home builtin spelled `name`, or
-/// `None` when its row takes an optional message or an inference-counted
-/// argument, or no empty-home row has the name.
-///
-/// The count is the row's [`BuiltinRow::fixed_arity`], the one the IPE-N0031
-/// canon gate enforces on every use resolved to the row.
-#[must_use]
-pub fn builtin_empty_home_arity(name: Option<&str>) -> Option<usize> {
-    bare_builtin(name?)?.fixed_arity().map(usize::from)
 }
 
 /// The boundary-seal legality check over a canonicalised type (§2.1). Returns
@@ -411,16 +416,6 @@ struct TypeCtx<'a> {
     /// The module environment; a bare type name resolves through its
     /// [`ModuleScope`] type namespace.
     env: &'a Env,
-    /// Maps each import qualifier (the short name used in `Q.TypeName` type
-    /// annotations) to the full dep-module path.  Built from the module's
-    /// `import` declarations in [`canonicalise_module_with_origin`].
-    ///
-    /// A `TType(qualifier, segments, args)` node whose qualifier a source
-    /// module owns takes its `home` from this map, so `Counter.Msg` gets
-    /// `home = ["Counter"]` regardless of whether the current module also
-    /// defines a local `type Msg`. A kernel-module qualifier reads
-    /// [`Env::kernel_types`] instead.
-    qualifier_paths: &'a BTreeMap<Symbol, Vec<Symbol>>,
     /// The dependency aliases reachable as `Q.Name`.
     qualified_aliases: &'a QualifiedAliases,
     interner: &'a Interner,
@@ -472,12 +467,6 @@ pub fn canonicalise(m: &src::Module, interner: &mut Interner) -> DResult<canon::
     for import in &m.imports {
         bind_stdlib_kernel_import(import, &mut env, interner)?;
     }
-    // Single-module has no deps, so no user qualifiers to map — but a Html-family
-    // STDLIB import qualifier (`import Ipe.Html.Attributes as Attr`) still needs
-    // its `["Html"]` type home folded so a qualified `Attr.Attribute` lowers to
-    // `html::Attribute`.
-    let mut qualifier_paths: BTreeMap<Symbol, Vec<Symbol>> = BTreeMap::new();
-    fold_html_stdlib_qualifier_homes(&m.imports, &env, &mut qualifier_paths, interner)?;
     // The bare single-module entry is always ordinary USER source: the trust tag
     // can only be raised via `canonicalise_module_with_origin`.
     // The single-module entry does not build a `ModuleExports`, so the kernel-
@@ -485,10 +474,11 @@ pub fn canonicalise(m: &src::Module, interner: &mut Interner) -> DResult<canon::
     canonicalise_with_env(
         m,
         &mut env,
-        &qualifier_paths,
         &QualifiedAliases::new(),
         ModuleOrigin::User,
         interner,
+        &mut NameSink::new(),
+        DeclRefusals::FailFirst,
     )
     .map(|(canon_mod, _kernel_aliases, _own_aliases)| canon_mod)
 }
@@ -583,7 +573,6 @@ fn origin_owns_reserved_prefix(origin: ModuleOrigin, prefix: &str) -> bool {
     }
 }
 
-#[allow(clippy::too_many_lines)] // one linear resolution pass over a module's declarations
 pub fn canonicalise_module_in_project(
     m: &src::Module,
     expected_path: &[Symbol],
@@ -592,6 +581,180 @@ pub fn canonicalise_module_in_project(
     origin: ModuleOrigin,
     interner: &mut Interner,
 ) -> DResult<(canon::Module, crate::ModuleExports)> {
+    canonicalise_module_indexed(m, expected_path, deps, catalog, origin, interner)
+        .map(|(canon_mod, exports, _names)| (canon_mod, exports))
+}
+
+/// Canonicalise a module in a project, with the index of every name it resolved.
+///
+/// Identical to [`canonicalise_module_in_project`]; the [`NameIndex`] is
+/// recorded by the same resolution pass that builds the module. It stops at
+/// the first refusal: no declaration or module check after it runs.
+///
+/// # Errors
+/// Same set as [`canonicalise_module_in_project`].
+pub fn canonicalise_module_indexed(
+    m: &src::Module,
+    expected_path: &[Symbol],
+    deps: &BTreeMap<Vec<Symbol>, &crate::ModuleExports>,
+    catalog: &crate::ModuleCatalog,
+    origin: ModuleOrigin,
+    interner: &mut Interner,
+) -> DResult<(canon::Module, crate::ModuleExports, NameIndex)> {
+    let PartialModule {
+        module,
+        exports,
+        names,
+        failures: _,
+        module_errors: _,
+    } = canonicalise_module_refusing(
+        m,
+        expected_path,
+        deps,
+        catalog,
+        origin,
+        interner,
+        Refusals::FailFirst,
+    )?;
+    Ok((module, exports, names))
+}
+
+/// How a module pass treats a refusal it meets.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Refusals {
+    /// Return the first refusal; nothing after it runs.
+    FailFirst,
+    /// Record each value declaration's and each module check's refusal and continue.
+    Collect,
+}
+
+impl Refusals {
+    /// Record one module check's outcome, or return its refusal when failing first.
+    fn check(self, errors: &mut Vec<Diagnostic>, outcome: DResult<()>) -> DResult<()> {
+        match (self, outcome) {
+            (_, Ok(())) => Ok(()),
+            (Self::FailFirst, Err(error)) => Err(error),
+            (Self::Collect, Err(error)) => {
+                errors.push(error);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// How the value-declaration loop treats a declaration that fails.
+enum DeclRefusals<'a> {
+    /// Return the first failure; no later declaration is canonicalised.
+    FailFirst,
+    /// Record each failure here and canonicalise the next declaration.
+    Collect(&'a mut Vec<DeclFailure>),
+}
+
+/// A value declaration whose annotation resolved although its body failed.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DeclaredSignature {
+    /// The declared name, at its declaration.
+    pub name: Located<Symbol>,
+    /// The annotation's quantified type variables, ordered by resolved name.
+    pub free_vars: Vec<Symbol>,
+    /// The canonical annotation.
+    pub ty: canon::Type,
+    /// Whether the declaration binds parameters.
+    pub has_params: bool,
+}
+
+/// One value declaration that failed to canonicalise.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DeclFailure {
+    /// The declared name.
+    pub name: Symbol,
+    /// The source extent of the declaration, annotation and body included.
+    pub extent: Span,
+    /// Why it failed.
+    pub error: Diagnostic,
+    /// Its annotation, when that resolved on its own.
+    pub signature: Option<DeclaredSignature>,
+}
+
+/// A module canonicalised declaration by declaration.
+///
+/// Every value declaration that failed is left out of [`Self::module`] and
+/// listed in [`Self::failures`] in source order; its name stays bound, so an
+/// occurrence of it resolves to this module, never to an import.
+#[derive(Clone, PartialEq, Debug)]
+pub struct PartialModule {
+    /// The module without its failed declarations.
+    pub module: canon::Module,
+    /// The module's export surface.
+    pub exports: crate::ModuleExports,
+    /// Every name occurrence that resolved.
+    pub names: NameIndex,
+    /// The failed value declarations, in source order.
+    pub failures: Vec<DeclFailure>,
+    /// The whole-module checks that refused the module, in check order.
+    pub module_errors: Vec<Diagnostic>,
+}
+
+/// The source extent of a value declaration: its annotation, name, parameters, and body.
+#[must_use]
+pub fn decl_extent(value: &Located<src::Value>) -> Span {
+    [value.value.name.span, value.value.body.span]
+        .into_iter()
+        .chain(value.value.type_annotation.as_ref().map(|ann| ann.span))
+        .fold(value.span, |extent, part| Span {
+            lo: extent.lo.min(part.lo),
+            hi: extent.hi.max(part.hi),
+        })
+}
+
+/// Canonicalise a module in a project, collecting each declaration's failure.
+///
+/// A failure in the module header, an import, a type or alias declaration, or
+/// the binding of a value name refuses the whole module. A value whose body or
+/// annotation fails is recorded in [`PartialModule::failures`] and the next
+/// declaration is canonicalised; a whole-module check that fails afterwards is
+/// recorded in [`PartialModule::module_errors`].
+///
+/// # Errors
+/// Every refusal of [`canonicalise_module_in_project`] that is not one value
+/// declaration's or one module check's.
+pub fn canonicalise_module_partial(
+    m: &src::Module,
+    expected_path: &[Symbol],
+    deps: &BTreeMap<Vec<Symbol>, &crate::ModuleExports>,
+    catalog: &crate::ModuleCatalog,
+    origin: ModuleOrigin,
+    interner: &mut Interner,
+) -> DResult<PartialModule> {
+    canonicalise_module_refusing(
+        m,
+        expected_path,
+        deps,
+        catalog,
+        origin,
+        interner,
+        Refusals::Collect,
+    )
+}
+
+/// Canonicalise a module in a project, each refusal treated as `refusals` says.
+///
+/// Under [`Refusals::FailFirst`] the returned failure lists are empty.
+///
+/// # Errors
+/// Every refusal of [`canonicalise_module_in_project`]; under
+/// [`Refusals::Collect`], none that is one value declaration's or one module
+/// check's.
+#[allow(clippy::too_many_lines)] // one linear resolution pass over a module's declarations
+fn canonicalise_module_refusing(
+    m: &src::Module,
+    expected_path: &[Symbol],
+    deps: &BTreeMap<Vec<Symbol>, &crate::ModuleExports>,
+    catalog: &crate::ModuleCatalog,
+    origin: ModuleOrigin,
+    interner: &mut Interner,
+    refusals: Refusals,
+) -> DResult<PartialModule> {
     let home = m.name.value.clone();
 
     // IPE-N0023: declared module name must match the path the build driver
@@ -754,11 +917,37 @@ pub fn canonicalise_module_in_project(
     // The type home and dependency aliases of each qualifier, read from the
     // owner `Env::install_import` decided for it, so a qualified type reaches
     // exactly the module its qualified values reach.
-    let mut qualifier_paths = source_qualifier_homes(&env);
-    for (&qualifier, path) in &qualifier_paths {
+    for (&qualifier, path) in &source_qualifier_homes(&env) {
         let Some(dep) = deps.get(path) else {
             continue;
         };
+        // The dep's declared type names: a qualified type resolves only through
+        // this table, so a name the dep does not export is refused, never
+        // minted at the qualifier's home. An exported builtin keeps precedence
+        // over a same-named alias.
+        let mut types: BTreeMap<Symbol, QualifiedType> = dep
+            .types
+            .iter()
+            .map(|(&name, exported)| {
+                let target = match exported {
+                    crate::ExportedType::Builtin { home, row } => {
+                        QualifiedType::Builtin(BoundBuiltin {
+                            row: *row,
+                            home: home.clone(),
+                        })
+                    }
+                    crate::ExportedType::Union { home, .. } => QualifiedType::Union(home.clone()),
+                };
+                (name, target)
+            })
+            .collect();
+        for &alias_name in dep.aliases.keys() {
+            types.entry(alias_name).or_insert(QualifiedType::Alias);
+        }
+        for &private in &dep.private_types {
+            types.entry(private).or_insert(QualifiedType::Private);
+        }
+        Rc::make_mut(&mut env.qualified_types).insert(qualifier, types);
         // Every exported alias of the dep registers under a synthetic
         // `Qualifier.Name` key so a qualified annotation (`Money.Price`)
         // expands the alias exactly as an `exposing`-injected one would; the
@@ -771,15 +960,21 @@ pub fn canonicalise_module_in_project(
             qualified_aliases.entry(key).or_insert_with(|| ea.clone());
         }
     }
-    fold_html_stdlib_qualifier_homes(&m.imports, &env, &mut qualifier_paths, interner)?;
 
+    let mut names = NameSink::new();
+    let mut failures = Vec::new();
+    let decl_refusals = match refusals {
+        Refusals::FailFirst => DeclRefusals::FailFirst,
+        Refusals::Collect => DeclRefusals::Collect(&mut failures),
+    };
     let (mut canon_mod, kernel_aliases, own_aliases) = canonicalise_with_env(
         m,
         &mut env,
-        &qualifier_paths,
         &qualified_aliases,
         origin,
         interner,
+        &mut names,
+        decl_refusals,
     )?;
     // The record-alias auto-constructors that were actually synthesized:
     // exactly the defs whose name is an alias name. A function-field alias is
@@ -803,25 +998,11 @@ pub fn canonicalise_module_in_project(
     // deep-stdlib unification failure (or exit-0-then-cargo-fail) into an explicit
     // build-time invariant. It can never fire for user code (User origin skips
     // this block); synthesised record-alias ctors are `Def::Typed`, so they pass.
-    if matches!(
-        origin,
-        ModuleOrigin::EmbeddedStdlib | ModuleOrigin::FfiInterface
-    ) {
-        for d in &canon_mod.defs {
-            if let canon::Def::Untyped { name, .. } = d {
-                let binding = name_str(interner, name.value)?;
-                let module = path_to_dot_string(interner, &home);
-                return Err(Diagnostic::CompilerBug {
-                    where_: "canon.stdlib_unannotated",
-                    detail: format!(
-                        "compiled-source stdlib module `{module}` binding `{binding}` \
-                         must carry a type annotation (annotation-driven generalisation \
-                         is required for stdlib modules)"
-                    ),
-                });
-            }
-        }
-    }
+    let mut module_errors = Vec::new();
+    refusals.check(
+        &mut module_errors,
+        check_stdlib_annotated(&canon_mod, origin, &home, interner),
+    )?;
 
     // Build the export surface from the module's own `exposing (…)` clause.
     let exports = build_module_exports(
@@ -839,18 +1020,78 @@ pub fn canonicalise_module_in_project(
     // `Ipe.Web.Console` helpers are static and never import a shape, and only
     // USER modules are subject to the Program/TEA distinction.
     if origin == ModuleOrigin::User {
-        check_main_not_runtime_branched(&canon_mod, interner)?;
-        check_program_tea_import_gate(m, &canon_mod, interner)?;
-        check_cross_shape_cmd_sub_gate(m, &canon_mod, interner)?;
-        check_input_fields_are_subscriptions(&canon_mod, interner)?;
-        check_library_ssot_import_gate(m, interner)?;
+        // Each check runs only once every earlier one passed, unless collecting.
+        refusals.check(
+            &mut module_errors,
+            check_main_not_runtime_branched(&canon_mod, interner),
+        )?;
+        refusals.check(
+            &mut module_errors,
+            check_program_tea_import_gate(m, &canon_mod, interner),
+        )?;
+        refusals.check(
+            &mut module_errors,
+            check_cross_shape_cmd_sub_gate(m, &canon_mod, interner),
+        )?;
+        refusals.check(
+            &mut module_errors,
+            check_input_fields_are_subscriptions(&canon_mod, interner),
+        )?;
+        refusals.check(
+            &mut module_errors,
+            check_library_ssot_import_gate(m, interner),
+        )?;
         // Thread a sibling top-level `config` binding into the app entry
         // (`main = Web.tea { … }` becomes `Web.appWith config { … }`), or reject
-        // a `config` binding that no app entry consumes (IPE-N0043).
-        thread_config_binding(&mut canon_mod, interner)?;
+        // a `config` binding that no app entry consumes (IPE-N0043). A module
+        // a check refused is never threaded.
+        if module_errors.is_empty() {
+            refusals.check(
+                &mut module_errors,
+                thread_config_binding(&mut canon_mod, interner),
+            )?;
+        }
     }
 
-    Ok((canon_mod, exports))
+    Ok(PartialModule {
+        module: canon_mod,
+        exports,
+        names: names.finish(),
+        failures,
+        module_errors,
+    })
+}
+
+/// Refuse an un-annotated top-level binding in a compiled-source stdlib or FFI module.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] naming the first un-annotated binding.
+fn check_stdlib_annotated(
+    canon_mod: &canon::Module,
+    origin: ModuleOrigin,
+    home: &[Symbol],
+    interner: &Interner,
+) -> DResult<()> {
+    if matches!(
+        origin,
+        ModuleOrigin::EmbeddedStdlib | ModuleOrigin::FfiInterface
+    ) {
+        for d in &canon_mod.defs {
+            if let canon::Def::Untyped { name, .. } = d {
+                let binding = name_str(interner, name.value)?;
+                let module = path_to_dot_string(interner, home);
+                return Err(Diagnostic::CompilerBug {
+                    where_: "canon.stdlib_unannotated",
+                    detail: format!(
+                        "compiled-source stdlib module `{module}` binding `{binding}` \
+                         must carry a type annotation (annotation-driven generalisation \
+                         is required for stdlib modules)"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The reserved name of the app's cross-cutting settings binding — a top-level
@@ -1980,11 +2221,12 @@ fn wrong_shape_cmd_sub(span: Span, segment: &str, family: CmdOrSub, app: AppSurf
 /// * `exposing (name, …)` binds each named value at [`Tier::Explicit`]. A
 ///   lowercase name that is not a value member of the module is
 ///   [`NameError::NameNotExposed`], never an invented binding.
-/// * `exposing (Type(..))` or `Type(A, …)` binds the constructors the filter
-///   admits of a built-in union with a qualified home (`HttpMethod`'s
-///   `Get`/`Post`) at [`Tier::Explicit`]. Those constructors are otherwise
-///   reachable only qualified (`Http.Post`), so a bare `Post` with no import
-///   never shadows a user constructor.
+/// * `exposing (Type(..))` or `Type(A, …)` is judged against the type's
+///   constructors by [`judge_ctor_clause`], then binds the ones it delivers of a
+///   built-in union with a qualified home (`HttpMethod`'s `Get`/`Post`) at
+///   [`Tier::Explicit`]. Those constructors are otherwise reachable only
+///   qualified (`Http.Post`), so a bare `Post` with no import never shadows a
+///   user constructor.
 ///
 /// Each binding is cloned verbatim from the qualified table, so a bare use
 /// lowers exactly as the qualified `M.member` does. A type exposure binds the
@@ -1994,10 +2236,11 @@ fn wrong_shape_cmd_sub(span: Span, segment: &str, family: CmdOrSub, app: AppSurf
 /// [`inject_dep_exports`], and an unknown `Ipe.*` path was already refused.
 ///
 /// # Errors
-/// [`NameError::NameNotExposed`] for a name the module does not export, or
-/// `T(..)` on a type without constructors; [`NameError::AmbiguousImport`] for
-/// an explicit name another explicit import already binds to a different
-/// definition; or [`Diagnostic::CompilerBug`] if interning exhausts the interner.
+/// [`NameError::NameNotExposed`] for a name the module does not export;
+/// [`NameError::CtorNotExposed`] for a constructor clause the type does not
+/// honour; [`NameError::AmbiguousImport`] for an explicit name another explicit
+/// import already binds to a different definition; or
+/// [`Diagnostic::CompilerBug`] if interning exhausts the interner.
 fn bind_stdlib_kernel_import(
     import: &src::Import,
     env: &mut Env,
@@ -2012,7 +2255,7 @@ fn bind_stdlib_kernel_import(
     let Some(module) = env.kernel_module(dep_path, interner)? else {
         return Ok(());
     };
-    let (member_map, ctor_map) = env.kernel_module_members(module);
+    let (member_map, _) = env.kernel_module_members(module);
     let members: Vec<(Symbol, VarHome)> = member_map.into_iter().collect();
     let kernel_types = Rc::clone(&env.kernel_types);
     let types = kernel_types.get(&module);
@@ -2068,18 +2311,21 @@ fn bind_stdlib_kernel_import(
                         bind_expr(env, name, Tier::Explicit, origin, interner)?;
                     }
                     src::Exposed::Type(type_name, privacy) => {
-                        let export = kernel_type_exposure(
-                            types, *type_name, privacy, item.span, dep_path, interner,
+                        let export =
+                            kernel_type_exposure(types, *type_name, item.span, dep_path, interner)?;
+                        let (offer, pooled) = match export {
+                            KernelTypeExport::Builtin(row) => (
+                                builtin_ctor_offer(*row, interner)?,
+                                builtin_import_ctors(*row, env, interner)?,
+                            ),
+                            KernelTypeExport::Alias(_) => (CtorOffer::Alias, Vec::new()),
+                        };
+                        let judged = judge_import_ctors(
+                            privacy, &offer, dep_path, *type_name, item.span, interner,
                         )?;
                         let origin = kernel_type_origin(export, dep_path, item.span);
                         bind_type(env, *type_name, Tier::Explicit, origin, interner)?;
-                        let filter = exposed_ctor_filter(privacy);
-                        let ctors: Vec<CtorHome> = ctor_map
-                            .values()
-                            .filter(|c| c.type_name == *type_name && filter.admits(c.name))
-                            .cloned()
-                            .collect();
-                        for ctor in ctors {
+                        for ctor in pooled.into_iter().filter(|c| judged.admits(c.name)) {
                             let name = ctor.name;
                             let origin = imported(
                                 ExprTarget::Ctor(ctor.clone()),
@@ -2097,16 +2343,14 @@ fn bind_stdlib_kernel_import(
     Ok(())
 }
 
-/// The type a kernel module exports as `type_name`, admitted by `privacy`.
+/// The type a kernel module exports as `type_name`.
 ///
 /// # Errors
-/// [`NameError::NameNotExposed`] for a name the module does not export, or
-/// `T(..)` on a type without constructors; [`Diagnostic::CompilerBug`] for an
-/// unresolvable symbol.
+/// [`NameError::NameNotExposed`] for a name the module does not export;
+/// [`Diagnostic::CompilerBug`] for an unresolvable symbol.
 fn kernel_type_exposure<'a>(
     types: Option<&'a BTreeMap<&'static str, KernelTypeExport>>,
     type_name: Symbol,
-    privacy: &src::Privacy,
     span: Span,
     dep_path: &[Symbol],
     interner: &Interner,
@@ -2129,22 +2373,6 @@ fn kernel_type_exposure<'a>(
             },
         });
     };
-    // A builtin union's constructors may be ambient (`RedirectPolicy`) rather
-    // than pooled under the module, so the union table decides.
-    let has_ctors = matches!(export, KernelTypeExport::Builtin(_))
-        && crate::builtins::BUILTIN_UNIONS
-            .iter()
-            .any(|union| union.type_name == &*name_s);
-    if !has_ctors && !matches!(privacy, src::Privacy::Private) {
-        return Err(Diagnostic::Name {
-            span,
-            msg: NameError::NameNotExposed {
-                module: path_to_dot_string(interner, dep_path),
-                name: format!("{name_s}(..)").into(),
-                suggestions: Candidates::hints(Box::new([])),
-            },
-        });
-    }
     Ok(export)
 }
 
@@ -2166,7 +2394,7 @@ fn kernel_type_origin(
             span,
         ),
         KernelTypeExport::Builtin(builtin) => imported(
-            ScopeType::Builtin(*builtin),
+            ScopeType::Builtin(BoundBuiltin::at_empty_home(*builtin)),
             Identity::Type(Vec::new()),
             importer,
             span,
@@ -2317,38 +2545,233 @@ fn bind_type(
     })
 }
 
-/// Which of a type's constructors an `exposing` clause opens into unqualified
-/// scope. Derived once from a [`src::Privacy`] by [`exposed_ctor_filter`] so both
-/// the built-in and user-dep injectors select the same set by construction: a
-/// `Type(A, B)` subset opens exactly `A`/`B`, never a withheld sibling.
-enum CtorFilter {
-    /// `Type(..)` — every constructor of the type.
-    All,
-    /// `Type(A, B)` — only the named constructors.
-    Only(BTreeSet<Symbol>),
-    /// `Type` (opaque) — no constructors.
-    None,
-}
+/// The constructor selection of an `exposing` clause, on both sides of an import.
+///
+/// The producer side reads a clause through [`exposed_ctor_filter`]. The
+/// importer side holds only a [`JudgedCtors`], which [`judge_ctor_clause`]
+/// builds by comparing the clause against the producer's [`CtorOffer`]: every
+/// constructor the clause names is delivered, or the import is refused.
+mod ctor_clause {
+    use std::collections::BTreeSet;
 
-impl CtorFilter {
-    /// Whether the constructor named `ctor` is opened by this filter.
-    fn admits(&self, ctor: Symbol) -> bool {
-        match self {
-            Self::All => true,
-            Self::Only(set) => set.contains(&ctor),
-            Self::None => false,
+    use ipe_intern::Symbol;
+    use ipe_syntax as src;
+
+    /// Which of a type's constructors an `exposing` clause opens into
+    /// unqualified scope: a `Type(A, B)` subset opens exactly `A`/`B`, never a
+    /// withheld sibling.
+    pub(super) enum CtorFilter {
+        /// `Type(..)`: every constructor of the type.
+        All,
+        /// `Type(A, B)`: only the named constructors.
+        Only(BTreeSet<Symbol>),
+        /// `Type` (opaque): no constructors.
+        None,
+    }
+
+    impl CtorFilter {
+        /// Whether the constructor named `ctor` is opened by this filter.
+        pub(super) fn admits(&self, ctor: Symbol) -> bool {
+            match self {
+                Self::All => true,
+                Self::Only(set) => set.contains(&ctor),
+                Self::None => false,
+            }
+        }
+    }
+
+    /// The constructor filter a module's own `exposing` privacy opens.
+    ///
+    /// Fail-closed: an opaque exposure admits nothing; a subset admits only the
+    /// named constructors.
+    pub(super) fn exposed_ctor_filter(privacy: &src::Privacy) -> CtorFilter {
+        match privacy {
+            src::Privacy::Public => CtorFilter::All,
+            src::Privacy::Private => CtorFilter::None,
+            src::Privacy::PublicCtors(names) => CtorFilter::Only(names.iter().copied().collect()),
+        }
+    }
+
+    /// The constructors a producer offers under one exported type name.
+    pub(super) enum CtorOffer {
+        /// A union, or a builtin union, with at least one constructor exported.
+        Ctors(BTreeSet<Symbol>),
+        /// A union exported without any of its constructors.
+        Abstract,
+        /// A type alias, which never has constructors.
+        Alias,
+        /// A builtin carrier with no constructors.
+        Opaque,
+    }
+
+    /// An importer-side constructor selection, built only by [`judge_ctor_clause`]
+    /// or, for an open import, [`JudgedCtors::open_import`].
+    pub(super) struct JudgedCtors(CtorFilter);
+
+    impl JudgedCtors {
+        /// The selection of `import M exposing (..)`: every constructor `M`
+        /// exposes. The clause names no constructor, so there is none to withhold.
+        pub(super) const fn open_import() -> Self {
+            Self(CtorFilter::All)
+        }
+
+        /// Whether the constructor named `ctor` is delivered.
+        pub(super) fn admits(&self, ctor: Symbol) -> bool {
+            self.0.admits(ctor)
+        }
+    }
+
+    /// Why a constructor clause is refused.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum Withheld<'offer> {
+        /// The type is exported without constructors.
+        Abstract,
+        /// `ctor`, the first named constructor in source order, is not `offered`.
+        Unknown {
+            ctor: Symbol,
+            offered: &'offer BTreeSet<Symbol>,
+        },
+        /// The type is an alias.
+        Alias,
+        /// The type is a builtin carrier with no constructors.
+        Opaque,
+    }
+
+    /// Judge an import's constructor clause `privacy` against the producer's `offer`.
+    ///
+    /// `T` asks for nothing and always passes. `T(..)` asks for every constructor
+    /// the producer exposes and needs at least one. `T(A, …)` needs every named
+    /// constructor among those exposed.
+    ///
+    /// # Errors
+    /// The [`Withheld`] reason when the clause asks for a constructor the offer
+    /// does not hold.
+    pub(super) fn judge_ctor_clause<'offer>(
+        privacy: &src::Privacy,
+        offer: &'offer CtorOffer,
+    ) -> Result<JudgedCtors, Withheld<'offer>> {
+        match (privacy, offer) {
+            (
+                src::Privacy::Private,
+                CtorOffer::Ctors(_) | CtorOffer::Abstract | CtorOffer::Alias | CtorOffer::Opaque,
+            ) => Ok(JudgedCtors(CtorFilter::None)),
+            (src::Privacy::Public, CtorOffer::Ctors(_)) => Ok(JudgedCtors(CtorFilter::All)),
+            (src::Privacy::PublicCtors(names), CtorOffer::Ctors(offered)) => {
+                match names.iter().find(|name| !offered.contains(name)) {
+                    Some(&ctor) => Err(Withheld::Unknown { ctor, offered }),
+                    None => Ok(JudgedCtors(CtorFilter::Only(
+                        names.iter().copied().collect(),
+                    ))),
+                }
+            }
+            (src::Privacy::Public | src::Privacy::PublicCtors(_), CtorOffer::Abstract) => {
+                Err(Withheld::Abstract)
+            }
+            (src::Privacy::Public | src::Privacy::PublicCtors(_), CtorOffer::Alias) => {
+                Err(Withheld::Alias)
+            }
+            (src::Privacy::Public | src::Privacy::PublicCtors(_), CtorOffer::Opaque) => {
+                Err(Withheld::Opaque)
+            }
         }
     }
 }
 
-/// The constructor filter an `exposing` privacy opens. Fail-closed: an opaque
-/// exposure admits nothing; a subset admits only the named constructors.
-fn exposed_ctor_filter(privacy: &src::Privacy) -> CtorFilter {
-    match privacy {
-        src::Privacy::Public => CtorFilter::All,
-        src::Privacy::Private => CtorFilter::None,
-        src::Privacy::PublicCtors(names) => CtorFilter::Only(names.iter().copied().collect()),
+/// Judge an import's constructor clause, refusing it at `span` with IPE-N0022.
+///
+/// # Errors
+/// [`NameError::CtorNotExposed`] when `module` does not expose a constructor
+/// the clause asks for under `type_name`; [`Diagnostic::CompilerBug`] for an
+/// unresolvable symbol.
+fn judge_import_ctors(
+    privacy: &src::Privacy,
+    offer: &CtorOffer,
+    module: &[Symbol],
+    type_name: Symbol,
+    span: Span,
+    interner: &Interner,
+) -> DResult<JudgedCtors> {
+    let withheld = match judge_ctor_clause(privacy, offer) {
+        Ok(judged) => return Ok(judged),
+        Err(withheld) => withheld,
+    };
+    let why = match withheld {
+        Withheld::Abstract => CtorWithheld::Abstract,
+        Withheld::Alias => CtorWithheld::Alias,
+        Withheld::Opaque => CtorWithheld::Opaque,
+        Withheld::Unknown { ctor, offered } => CtorWithheld::Unknown {
+            ctor: name_str(interner, ctor)?,
+            suggestions: Candidates::hints(suggestions(
+                ctor,
+                Shape::Flat,
+                offered.iter().copied(),
+                interner,
+            )),
+        },
+    };
+    Err(Diagnostic::Name {
+        span,
+        msg: NameError::CtorNotExposed {
+            module: path_to_dot_string(interner, module),
+            type_name: name_str(interner, type_name)?,
+            why: Box::new(why),
+        },
+    })
+}
+
+/// The constructors a builtin `row` offers: its union's, or none for a carrier.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] if interning a constructor name exhausts the interner.
+fn builtin_ctor_offer(row: BuiltinType, interner: &mut Interner) -> DResult<CtorOffer> {
+    let Some(union) = crate::builtins::builtin_union_of(row) else {
+        return Ok(CtorOffer::Opaque);
+    };
+    let mut ctors = BTreeSet::new();
+    for &(name, _, _) in union.ctors {
+        ctors.insert(interner.intern(name)?);
     }
+    Ok(CtorOffer::Ctors(ctors))
+}
+
+/// The constructors a builtin `row` binds under an explicit import.
+///
+/// A union with a qualified home (`HttpMethod` under `Http`) binds the entries
+/// pooled under that kernel module, the same ones a qualified `Http.Get`
+/// reaches. An ambient union (`Maybe`) is bound at the ambient tier already,
+/// and a carrier has no constructors, so both yield none.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] when a union's qualified home names no kernel module.
+fn builtin_import_ctors(
+    row: BuiltinType,
+    env: &Env,
+    interner: &Interner,
+) -> DResult<Vec<CtorHome>> {
+    let Some(union) = crate::builtins::builtin_union_of(row) else {
+        return Ok(Vec::new());
+    };
+    let Some(qualifier) = union.qualified_home else {
+        return Ok(Vec::new());
+    };
+    let pooled = interner
+        .lookup(qualifier)
+        .and_then(|q| env.kernel_module_of(q))
+        .zip(interner.lookup(union.type_name));
+    let Some((module, type_name)) = pooled else {
+        return Err(Diagnostic::CompilerBug {
+            where_: "ipe_canon::builtin_import_ctors",
+            detail: format!(
+                "builtin union `{}` names qualified home `{qualifier}`, which pools no constructors",
+                union.type_name
+            ),
+        });
+    };
+    let (_, ctors) = env.kernel_module_members(module);
+    Ok(ctors
+        .into_values()
+        .filter(|ctor| ctor.type_name == type_name)
+        .collect())
 }
 
 /// Builtin type names whose lowering (`ipe_lower::ir_type_from_{ty,canon}`)
@@ -2394,8 +2817,8 @@ const HOME_SENSITIVE_BUILTIN_TYPES: &[&str] = &["Attribute", "Event"];
 /// * Only names in [`HOME_SENSITIVE_BUILTIN_TYPES`] are touched — a no-op for
 ///   every home-insensitive builtin.
 /// * The QUALIFIED `Attr.Attribute` / `Ui.Attribute` case is handled separately
-///   by [`fold_html_stdlib_qualifier_homes`] (keyed on the QUALIFIER, so the two
-///   stay distinct); this pass must touch ONLY names exposed UNQUALIFIED, or it
+///   by the qualifier's own export table ([`source_qualified_type`],
+///   [`kernel_type_export`]), so the two stay distinct; this pass must touch ONLY names exposed UNQUALIFIED, or it
 ///   would also hijack a qualified `Ui.Attribute` in the same module (whose
 ///   fallback also reads the bare type namespace) — the exact regression in
 ///   `26-ui-showcase/RegressionGates.testId : Ui.Attribute msg`.
@@ -2528,6 +2951,12 @@ fn bind_html_type_home(
     if env.module_scope.ty.eager_bound(name) {
         return Ok(());
     }
+    let row = BuiltinType::of_bare_name(name_str(interner, name)?.as_ref()).ok_or_else(|| {
+        Diagnostic::CompilerBug {
+            where_: "ipe_canon::bind_html_type_home",
+            detail: "a home-sensitive builtin type name has no builtin row".into(),
+        }
+    })?;
     let home = vec![html_sym];
     let importers = if importer.is_empty() {
         BTreeSet::new()
@@ -2535,99 +2964,15 @@ fn bind_html_type_home(
         BTreeSet::from([importer.to_vec()])
     };
     let origin = Origin {
-        target: ScopeType::Union(home.clone()),
+        target: ScopeType::Builtin(BoundBuiltin {
+            row,
+            home: home.clone(),
+        }),
         identity: Identity::Type(home),
         importers,
         span,
     };
     bind_type(env, name, Tier::Explicit, origin, interner)
-}
-
-/// Fold each Html-family STDLIB import qualifier into `qualifier_paths`, mapping
-/// it to the canonical `["Html"]` type home.
-///
-/// Stdlib kernel imports are skipped by the ordinary `qualifier_paths`
-/// construction (they carry no `deps` entry), so a QUALIFIED `Attr.Attribute`
-/// (from `import Ipe.Html.Attributes as Attr`) would fall through to the
-/// bare `Attribute` type binding — a single binding that cannot tell
-/// `Attr.Attribute` (Html) from `Ui.Attribute` (Ui), so both mis-lowered to the
-/// same newtype. Registering the qualifier here — `Attr` (and the canonical
-/// `Html`) → `["Html"]` — makes the `TType` arm resolve `Attr.Attribute` to the
-/// `html::Attribute` home directly, while `Ui.Attribute` (Ui-family qualifier,
-/// deliberately NOT folded) keeps falling through to the empty Ui sentinel.
-///
-/// The `["Html"]` value is the SAME single-segment home the HM constrainer uses
-/// for the Ipe.Html attribute type (`constrain.rs` `html_attr`), so the emitted
-/// type unifies with `Html.node`'s parameter rather than minting a distinct
-/// `Ipe.Html.Attributes.Attribute`.
-///
-/// An Html-family qualifier resolves to `["Html"]` even when the same qualifier
-/// was already bound to the compiled-source `Ipe.Html.Attributes` dep path: a
-/// qualified `Attr.Attribute` type ref must lower to the `html::Attribute` home
-/// the HM constrainer and the lowerer's `is_html` check both expect. Forcing
-/// `["Html"]` here (over the just-inserted `["Ipe","Html","Attributes"]` dep
-/// path) is the qualified-type counterpart of the `["Html"]` builtin home
-/// recorded in `build_module_exports`.
-///
-/// The force-home is a per-qualifier sentinel, but its authority is name-scoped
-/// at the `TType` consumer: it homes only the reserved builtin view-type NAMES
-/// (`Attribute`/`Html`). A compiled-source ADT declared in `Ipe.Html.Attributes`
-/// (e.g. `Attr.LinkTarget`) is not a reserved builtin, so the consumer keeps its
-/// real `["Ipe","Html","Attributes"]` home rather than this
-/// `["Html"]` sentinel. Value members are likewise unaffected — they resolve
-/// through the compiled-source module, not `qualifier_paths`.
-///
-/// # Errors
-/// [`Diagnostic::CompilerBug`] if interning `Html` exhausts the interner.
-fn fold_html_stdlib_qualifier_homes(
-    imports: &[src::Import],
-    env: &Env,
-    qualifier_paths: &mut BTreeMap<Symbol, Vec<Symbol>>,
-    interner: &mut Interner,
-) -> DResult<()> {
-    let html_sym = interner.intern("Html")?;
-    for import in imports {
-        let dep_path = &import.name.value;
-        let is_html_family = dep_path
-            .iter()
-            .any(|s| interner.resolve(*s) == Some("Html"));
-        if !is_html_family {
-            continue;
-        }
-        // Effective qualifier: explicit `as Alias`, else the Elm last-segment
-        // default (`import Ipe.Html.Attributes` → `Attributes`).
-        let qualifier = import
-            .alias
-            .unwrap_or_else(|| dep_path.last().copied().unwrap_or_else(name_zero));
-        // The spelling must denote this import's module: one another import
-        // owns, or one left ambiguous, takes no home from this import.
-        if !owned_by_import(env, qualifier, dep_path, interner)? {
-            continue;
-        }
-        // Register the qualifier's REAL dep path (or the bare `["Html"]` builtin
-        // home for a builtin-only module such as `Ipe.Html` that carries no
-        // compiled source). The `TType` consumer force-homes the builtin
-        // view-type NAMES (`Attribute`/`Html`) to `["Html"]` when the qualifier
-        // is Html-family, so `Attr.Attribute` lowers to `html::Attribute` while a
-        // compiled-source ADT (`Attr.LinkTarget`) keeps this real module home. A
-        // stdlib kernel import carries no user-dep `qualifier_paths` entry, so
-        // this fill is what makes an Html-family qualifier resolvable at all.
-        let is_stdlib_html = matches!(
-            dep_path.first().and_then(|s| interner.resolve(*s)),
-            Some("Ipe")
-        );
-        let home = if dep_path.len() > 1 {
-            dep_path.clone()
-        } else {
-            vec![html_sym]
-        };
-        if is_stdlib_html {
-            qualifier_paths.insert(qualifier, home);
-        } else {
-            qualifier_paths.entry(qualifier).or_insert(home);
-        }
-    }
-    Ok(())
 }
 
 /// The dependency path of every spelling a source module owns in `env`'s scope.
@@ -2644,25 +2989,6 @@ fn source_qualifier_homes(env: &Env) -> BTreeMap<Symbol, Vec<Symbol>> {
             ModuleIdentity::Kernel(_) => None,
         })
         .collect()
-}
-
-/// Whether `spelling` is owned in `env`'s scope by the module `dep_path` names.
-///
-/// # Errors
-/// [`Diagnostic::CompilerBug`] if interning a canonical exhausts the interner.
-fn owned_by_import(
-    env: &Env,
-    spelling: Symbol,
-    dep_path: &[Symbol],
-    interner: &mut Interner,
-) -> DResult<bool> {
-    let Some(claim) = env.import_scope.qualifier_owner.get(&spelling) else {
-        return Ok(false);
-    };
-    Ok(match &claim.owner {
-        ModuleIdentity::Source(path) => path.as_slice() == dep_path,
-        ModuleIdentity::Kernel(module) => env.kernel_module(dep_path, interner)? == Some(*module),
-    })
 }
 
 /// The canonical module, its kernel aliases, and its own aliases resolved in its scope.
@@ -2699,10 +3025,11 @@ type CanonicalisedModule = (
 fn canonicalise_with_env(
     m: &src::Module,
     env: &mut Env,
-    qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
     qualified_aliases: &QualifiedAliases,
     origin: ModuleOrigin,
     interner: &mut Interner,
+    names: &mut NameSink,
+    mut refusals: DeclRefusals<'_>,
 ) -> DResult<CanonicalisedModule> {
     let home = env.home.clone();
 
@@ -2775,8 +3102,7 @@ fn canonicalise_with_env(
 
     // Each own alias body resolved once, in this module's scope: the form an
     // importer receives through `ModuleExports::aliases`.
-    let own_aliases =
-        resolve_own_aliases(m, &slots, env, qualifier_paths, qualified_aliases, interner)?;
+    let own_aliases = resolve_own_aliases(m, &slots, env, qualified_aliases, interner)?;
 
     // Second union pass: now that aliases are collected, canonicalise every
     // constructor's payload field types (a field may reference an alias or
@@ -2786,7 +3112,6 @@ fn canonicalise_with_env(
         unions.push(canonicalise_union(
             &u.value,
             env,
-            qualifier_paths,
             qualified_aliases,
             interner,
         )?);
@@ -2809,7 +3134,6 @@ fn canonicalise_with_env(
         m,
         &home,
         env,
-        qualifier_paths,
         qualified_aliases,
         &user_value_names,
         interner,
@@ -2865,25 +3189,43 @@ fn canonicalise_with_env(
     // witness's fields at its call site by lookup alone. Built here — the single
     // point where the module's values, aliases, imports, and type context all
     // coexist — and stored on the env, which every value body's resolution clones.
-    let codec_auto =
-        build_codec_auto_context(m, env, qualifier_paths, qualified_aliases, interner)?;
+    let codec_auto = build_codec_auto_context(m, env, qualified_aliases, interner)?;
     env.codec_auto = Rc::new(codec_auto);
 
     // Canonicalise each value declaration. A kernel alias has no runtime body —
     // it lowers as its kernel at every call site — so it is skipped here, exactly
     // as a kernel-qualifier member is never a compiled def.
     let mut defs = Vec::with_capacity(m.values.len() + synth_ctor_defs.len());
+    let mut cx = ResolveCx { interner, names };
     for v in &m.values {
         if kernel_aliases.contains_key(&v.value.name.value) {
             continue;
         }
-        defs.push(canonicalise_value(
-            &v.value,
-            env,
-            qualifier_paths,
-            qualified_aliases,
-            interner,
-        )?);
+        match (
+            canonicalise_value(&v.value, env, qualified_aliases, &mut cx),
+            &mut refusals,
+        ) {
+            (Ok(def), _) => defs.push(def),
+            (Err(error), DeclRefusals::FailFirst) => return Err(error),
+            (Err(error), DeclRefusals::Collect(failures)) => {
+                let signature = v.value.type_annotation.as_ref().and_then(|ann| {
+                    canonicalise_annotation(ann, env, qualified_aliases, cx.interner)
+                        .ok()
+                        .map(|(free_vars, ty)| DeclaredSignature {
+                            name: v.value.name,
+                            free_vars,
+                            ty,
+                            has_params: !v.value.patterns.is_empty(),
+                        })
+                });
+                failures.push(DeclFailure {
+                    name: v.value.name.value,
+                    extent: decl_extent(v),
+                    error,
+                    signature,
+                });
+            }
+        }
     }
     // The synthesized constructor defs are already fully canonical.
     defs.extend(synth_ctor_defs);
@@ -2919,7 +3261,6 @@ fn resolve_own_aliases(
     m: &src::Module,
     slots: &[Symbol],
     env: &Env,
-    qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
     qualified_aliases: &QualifiedAliases,
     interner: &Interner,
 ) -> DResult<BTreeMap<Symbol, crate::ExportedAlias>> {
@@ -2931,7 +3272,6 @@ fn resolve_own_aliases(
         let params = alias_params(decl, slots);
         let ctx = TypeCtx {
             env,
-            qualifier_paths,
             qualified_aliases,
             interner,
             ann_span: decl.body.span,
@@ -3438,18 +3778,17 @@ fn field_type_nonderivable(interner: &Interner, t: &canon::Type) -> bool {
 fn build_codec_auto_context(
     m: &src::Module,
     env: &Env,
-    qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
     qualified_aliases: &QualifiedAliases,
     interner: &mut Interner,
 ) -> DResult<crate::env::CodecAutoContext> {
-    // Qualifiers bound to `Ipe.Codec`: any import qualifier whose resolved path
-    // is exactly `["Ipe", "Codec"]`. A compiled-source stdlib module is a build
-    // dep, so its import registers in `qualifier_paths` like a user module.
+    // Qualifiers bound to `Ipe.Codec`: any spelling a source module owns whose
+    // path is exactly `["Ipe", "Codec"]`. A compiled-source stdlib module is a
+    // build dep, so its import owns its spellings like a user module.
     let ipe_seg = interner.intern("Ipe")?;
     let codec_seg = interner.intern("Codec")?;
     let codec_path = [ipe_seg, codec_seg];
     let mut qualifiers: BTreeSet<Symbol> = BTreeSet::new();
-    for (&qual, path) in qualifier_paths {
+    for (qual, path) in source_qualifier_homes(env) {
         if path.as_slice() == codec_path {
             qualifiers.insert(qual);
         }
@@ -3464,14 +3803,9 @@ fn build_codec_auto_context(
         let Some(ann) = &v.value.type_annotation else {
             continue;
         };
-        if let Some(fields) = witness_record_fields(
-            &ann.value,
-            env,
-            qualifier_paths,
-            qualified_aliases,
-            interner,
-            ann.span,
-        )? {
+        if let Some(fields) =
+            witness_record_fields(&ann.value, env, qualified_aliases, interner, ann.span)?
+        {
             witness_records.insert(v.value.name.value, fields);
         }
     }
@@ -3491,14 +3825,12 @@ fn build_codec_auto_context(
 fn witness_record_fields(
     ann: &src::TypeAnnotation,
     env: &Env,
-    qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
     qualified_aliases: &QualifiedAliases,
     interner: &Interner,
     ann_span: Span,
 ) -> DResult<Option<Vec<(Symbol, canon::Type)>>> {
     let ctx = TypeCtx {
         env,
-        qualifier_paths,
         qualified_aliases,
         interner,
         ann_span,
@@ -4195,7 +4527,6 @@ fn synthesize_record_alias_ctors(
     m: &src::Module,
     home: &[Symbol],
     env: &Env,
-    qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
     qualified_aliases: &QualifiedAliases,
     user_value_names: &BTreeSet<Symbol>,
     interner: &Interner,
@@ -4227,7 +4558,6 @@ fn synthesize_record_alias_ctors(
         // return record is byte-identical to the annotation expansion.
         let ctx = TypeCtx {
             env,
-            qualifier_paths,
             qualified_aliases,
             interner,
             ann_span: a.value.body.span,
@@ -4377,33 +4707,80 @@ fn bind_dep_value(
 
 /// The scope target of a type a dependency exports.
 ///
-/// A re-exported builtin at the empty home is its row, never a union: the
-/// row carries the arity gate and the empty home only a builtin mints.
+/// A re-exported builtin is its row at the home the export records, never a
+/// union: the row carries the arity gate, whatever home the use mints.
 fn dep_type_target(exported: &crate::ExportedType) -> ScopeType {
     match exported {
-        crate::ExportedType::Builtin { home, row } if home.is_empty() => ScopeType::Builtin(*row),
-        crate::ExportedType::Union { home, .. } | crate::ExportedType::Builtin { home, .. } => {
-            ScopeType::Union(home.clone())
-        }
+        crate::ExportedType::Builtin { home, row } => ScopeType::Builtin(BoundBuiltin {
+            row: *row,
+            home: home.clone(),
+        }),
+        crate::ExportedType::Union { home, .. } => ScopeType::Union(home.clone()),
     }
 }
 
-/// Bind a dependency's exported type `type_name` and the constructors `filter`
-/// admits at `tier`.
+/// The constructors a dependency offers under its exported type `type_name`.
+///
+/// A source union always declares at least one constructor (the parser refuses
+/// `type T` with no `=`), so a union exported with none of them is abstract.
 ///
 /// # Errors
-/// The clash [`bind_type`] or [`bind_expr`] reports.
+/// [`Diagnostic::CompilerBug`] if interning a builtin constructor name exhausts
+/// the interner.
+fn dep_ctor_offer(
+    dep: &crate::ModuleExports,
+    type_name: Symbol,
+    exported: Option<&crate::ExportedType>,
+    interner: &mut Interner,
+) -> DResult<CtorOffer> {
+    match exported {
+        Some(crate::ExportedType::Union { .. }) => {
+            let ctors: BTreeSet<Symbol> = dep
+                .ctors
+                .values()
+                .filter(|ctor| ctor.type_name == type_name)
+                .map(|ctor| ctor.name)
+                .collect();
+            Ok(if ctors.is_empty() {
+                CtorOffer::Abstract
+            } else {
+                CtorOffer::Ctors(ctors)
+            })
+        }
+        Some(crate::ExportedType::Builtin { row, .. }) => builtin_ctor_offer(*row, interner),
+        None => Ok(CtorOffer::Alias),
+    }
+}
+
+/// Bind a dependency's exported type `type_name` and the constructors `judged`
+/// delivers at `tier`.
+///
+/// A re-exported builtin union with a qualified home binds the constructors
+/// pooled under that home, the ones its own kernel import binds.
+///
+/// # Errors
+/// The clash [`bind_type`] or [`bind_expr`] reports; [`Diagnostic::CompilerBug`]
+/// when a builtin union's qualified home pools no constructors.
 #[allow(clippy::too_many_arguments)] // each argument is one independent fact of the binding
 fn bind_dep_union(
     dep: &crate::ModuleExports,
     type_name: Symbol,
     exported: &crate::ExportedType,
-    filter: &CtorFilter,
+    judged: &JudgedCtors,
     tier: Tier,
     span: Span,
     env: &mut Env,
     interner: &Interner,
 ) -> DResult<()> {
+    let ctors: Vec<CtorHome> = match exported {
+        crate::ExportedType::Union { .. } => dep
+            .ctors
+            .values()
+            .filter(|ctor| ctor.type_name == type_name)
+            .cloned()
+            .collect(),
+        crate::ExportedType::Builtin { row, .. } => builtin_import_ctors(*row, env, interner)?,
+    };
     let origin = imported(
         dep_type_target(exported),
         Identity::Type(exported.home().to_vec()),
@@ -4411,16 +4788,11 @@ fn bind_dep_union(
         span,
     );
     bind_type(env, type_name, tier, origin, interner)?;
-    for ctor in dep.ctors.values() {
-        if ctor.type_name == type_name && filter.admits(ctor.name) {
-            let origin = imported(
-                ExprTarget::Ctor(ctor.clone()),
-                ctor_identity(ctor),
-                &dep.path,
-                span,
-            );
-            bind_expr(env, ctor.name, tier, origin, interner)?;
-        }
+    for ctor in ctors.into_iter().filter(|ctor| judged.admits(ctor.name)) {
+        let identity = ctor_identity(&ctor);
+        let name = ctor.name;
+        let origin = imported(ExprTarget::Ctor(ctor), identity, &dep.path, span);
+        bind_expr(env, name, tier, origin, interner)?;
     }
     Ok(())
 }
@@ -4460,13 +4832,15 @@ fn bind_dep_alias(
 ///   explicit tier, where a second definition under one name is refused at the
 ///   import (IPE-N0024 for a value or constructor, IPE-N0012 for a type).
 /// * IPE-N0022 (`NameNotExposed`) when the exposing list names a value or type
-///   the dep does not export.
+///   the dep does not export, and (`CtorNotExposed`) when a type's constructor
+///   clause asks for a constructor [`judge_ctor_clause`] finds the dep withholds.
 /// * Qualifier installation through [`Env::install_import`] (`import M as Q`,
 ///   or the last segment and dotted path of a bare import).
 ///
 /// # Errors
-/// [`NameError::NameNotExposed`] / [`NameError::AmbiguousImport`] /
-/// [`NameError::DuplicateType`] / [`NameError::DuplicateQualifier`]; or
+/// [`NameError::NameNotExposed`] / [`NameError::CtorNotExposed`] /
+/// [`NameError::AmbiguousImport`] / [`NameError::DuplicateType`] /
+/// [`NameError::DuplicateQualifier`]; or
 /// [`Diagnostic::CompilerBug`] on an unresolvable symbol.
 #[allow(clippy::too_many_lines)] // declarative injection table — splitting would obscure flow
 fn inject_dep_exports(
@@ -4495,7 +4869,7 @@ fn inject_dep_exports(
                     dep,
                     type_name,
                     exported,
-                    &CtorFilter::All,
+                    &JudgedCtors::open_import(),
                     Tier::Open,
                     span,
                     env,
@@ -4553,12 +4927,16 @@ fn inject_dep_exports(
                                 },
                             });
                         }
+                        let offer = dep_ctor_offer(dep, *type_name, exported, interner)?;
+                        let judged = judge_import_ctors(
+                            privacy, &offer, dep_path, *type_name, item.span, interner,
+                        )?;
                         if let Some(exported) = exported {
                             bind_dep_union(
                                 dep,
                                 *type_name,
                                 exported,
-                                &exposed_ctor_filter(privacy),
+                                &judged,
                                 Tier::Explicit,
                                 item.span,
                                 env,
@@ -4641,6 +5019,25 @@ fn inject_dep_exports(
     Ok(())
 }
 
+/// The home of the import binding `name` re-exports, when `name` is bound to
+/// `row` by an import.
+///
+/// A re-export names the definition it imported, so two modules exposing one
+/// imported row (`Ipe.Ui.Cells` re-exporting `Ipe.Ui.Tui`'s `Screen`) export
+/// one identity, and an open import of both is one binding, never an
+/// ambiguity.
+fn imported_builtin_home(env: &Env, name: Symbol, row: BuiltinType) -> Option<Vec<Symbol>> {
+    match env.module_scope.ty.resolve(name) {
+        Resolved::Found(origin, Tier::Explicit | Tier::Open) => match &origin.target {
+            ScopeType::Builtin(bound) if bound.row == row => Some(bound.home.clone()),
+            ScopeType::Builtin(_) | ScopeType::Union(_) | ScopeType::Alias(_) => None,
+        },
+        Resolved::Found(_, Tier::Local | Tier::Ambient)
+        | Resolved::Ambiguous { .. }
+        | Resolved::Missing => None,
+    }
+}
+
 /// The type home a compiled-source stdlib module records for a
 /// reserved builtin TYPE it re-exports (`Ipe.Ui exposing (Attribute)`,
 /// `Ipe.Html exposing (Attribute)`, `Ipe.Path exposing (Path)`).
@@ -4663,11 +5060,12 @@ fn inject_dep_exports(
 /// the exporting module's own path.
 fn reexported_builtin_type_home(
     resolved: &str,
+    row: BuiltinType,
     home: &[Symbol],
     interner: &Interner,
 ) -> Vec<Symbol> {
     if !HOME_SENSITIVE_BUILTIN_TYPES.contains(&resolved)
-        || terminal_attribute_builtin(home, resolved, interner).is_some()
+        || terminal_attribute_builtin(home, row, interner).is_some()
     {
         return home.to_owned();
     }
@@ -4679,6 +5077,55 @@ fn reexported_builtin_type_home(
     } else {
         // Ui carrier — the empty-home sentinel that lowers to `UiAttribute`.
         Vec::new()
+    }
+}
+
+/// The export of the builtin `row`, spelled `resolved`, from the module at
+/// `home`: the home the module's own import binds it at, else the home the
+/// re-export records.
+fn builtin_export(
+    env: &Env,
+    type_name: Symbol,
+    resolved: &str,
+    row: BuiltinType,
+    home: &[Symbol],
+    interner: &Interner,
+) -> crate::ExportedType {
+    let builtin_home = imported_builtin_home(env, type_name, row)
+        .unwrap_or_else(|| reexported_builtin_type_home(resolved, row, home, interner));
+    crate::ExportedType::Builtin {
+        home: builtin_home,
+        row,
+    }
+}
+
+/// Export every reserved builtin the module at `home` declares as its own.
+///
+/// [`BuiltinRow::declared_in`](ipe_kernels::BuiltinRow::declared_in) names the
+/// module, so `Q.Set` under `import Ipe.Set as Q` and `exposing (Set)` resolve
+/// to the row whether or not the module's `exposing` clause lists it. A row
+/// whose name the interner has not seen is not exported, so a use of it fails
+/// closed at IPE-N0005; the declaring module's own signatures spell the name.
+fn export_declared_builtins(
+    types: &mut BTreeMap<Symbol, crate::ExportedType>,
+    home: &[Symbol],
+    env: &Env,
+    interner: &Interner,
+) {
+    let Some(segments) = home
+        .iter()
+        .map(|segment| interner.resolve(*segment))
+        .collect::<Option<Vec<&str>>>()
+    else {
+        return;
+    };
+    for row in BuiltinType::declared_by_module(&segments) {
+        let resolved = row.row().name();
+        if let Some(type_name) = interner.lookup(resolved) {
+            types
+                .entry(type_name)
+                .or_insert_with(|| builtin_export(env, type_name, resolved, row, home, interner));
+        }
     }
 }
 
@@ -4771,14 +5218,9 @@ fn build_module_exports(
                             // (Attribute)`. Record it so an importer's `exposing
                             // (T)` resolves instead of failing `NameNotExposed`; no
                             // constructors (a builtin carrier has none at source).
-                            let builtin_home =
-                                reexported_builtin_type_home(resolved, home, interner);
                             exports.types.insert(
                                 *type_name,
-                                crate::ExportedType::Builtin {
-                                    home: builtin_home,
-                                    row,
-                                },
+                                builtin_export(env, *type_name, resolved, row, home, interner),
                             );
                         } else if let Some(resolved) = own_aliases.get(type_name) {
                             exports.aliases.insert(*type_name, resolved.clone());
@@ -4794,6 +5236,15 @@ fn build_module_exports(
             }
         }
     }
+    export_declared_builtins(&mut exports.types, home, env, interner);
+    // Every declared type name the export lists leave out, so a qualified use
+    // of one is refused as private, never resolved.
+    exports.private_types = own_types
+        .keys()
+        .copied()
+        .chain(m.aliases.iter().map(|a| a.value.name.value))
+        .filter(|name| !exports.types.contains_key(name) && !exports.aliases.contains_key(name))
+        .collect();
 
     // Record every EXPORTED kernel alias so importers register `Alias.f` as the
     // kernel rather than a `TopLevel` reference. A kernel alias is an ordinary
@@ -4941,7 +5392,6 @@ fn register_union(
 fn canonicalise_union(
     u: &src::Union,
     env: &Env,
-    qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
     qualified_aliases: &QualifiedAliases,
     interner: &Interner,
 ) -> DResult<canon::Union> {
@@ -4957,7 +5407,6 @@ fn canonicalise_union(
         let arity = c.value.args.len();
         let ctx = TypeCtx {
             env,
-            qualifier_paths,
             qualified_aliases,
             interner,
             ann_span: c.span,
@@ -5003,17 +5452,15 @@ fn canonicalise_union(
 fn canonicalise_value(
     val: &src::Value,
     env: &Env,
-    qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
     qualified_aliases: &QualifiedAliases,
-    interner: &mut Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<canon::Def> {
     // The reserved `CustomElement.fromFile "<js-path>"` constructor is recognised BEFORE
     // the body is canonicalised: its qualified head is otherwise an unknown member,
     // and only this position (the whole body of a `CustomElement`-annotated
     // binding) is legal. A malformed use fails closed here (IPE-N0044); any other
     // appearance of the qualified name is rejected downstream by `resolve_qual_var`.
-    if let Some(def) =
-        detect_custom_element_constructor(val, env, qualifier_paths, qualified_aliases, interner)?
+    if let Some(def) = detect_custom_element_constructor(val, env, qualified_aliases, cx.interner)?
     {
         return Ok(def);
     }
@@ -5021,15 +5468,15 @@ fn canonicalise_value(
     // Add parameter-bound names to a body-local environment.
     let mut body_env = env.clone();
     for p in &val.patterns {
-        bind_pattern_names(&p.value, &mut body_env);
+        bind_pattern_names(p, &mut body_env, cx.names);
     }
 
     let mut patterns = Vec::with_capacity(val.patterns.len());
     for p in &val.patterns {
-        reject_duplicate_pattern_binders(p, interner)?;
-        patterns.push(canonicalise_pattern(p, env, interner)?);
+        reject_duplicate_pattern_binders(p, cx.interner)?;
+        patterns.push(canonicalise_pattern(p, env, cx)?);
     }
-    let body = canonicalise_expr(&val.body, &body_env, interner)?;
+    let body = canonicalise_expr(&val.body, &body_env, cx)?;
 
     match &val.type_annotation {
         None => Ok(canon::Def::Untyped {
@@ -5039,33 +5486,8 @@ fn canonicalise_value(
             body,
         }),
         Some(ann) => {
-            let mut free_vars = BTreeSet::new();
-            let mut visited = Vec::new();
-            let ctx = TypeCtx {
-                env,
-                qualifier_paths,
-                qualified_aliases,
-                interner,
-                ann_span: ann.span,
-            };
-            let no_params = ParamSlots::empty();
-            let mut budget = TYPE_EXPANSION_NODE_LIMIT;
-            let ty = canonicalise_type(
-                &ann.value,
-                &ctx,
-                &no_params,
-                &mut free_vars,
-                &mut visited,
-                &mut budget,
-                0,
-            )?;
-            // Order the quantified type variables by their resolved NAME, not by
-            // `Symbol` id (intern order is allocation-dependent, hence not a
-            // stable wire order). Determinism gate: a multi-tyvar annotation
-            // must yield the same `free_vars` regardless of how the interner
-            // happened to number the names.
-            let mut free_vars: Vec<Symbol> = free_vars.into_iter().collect();
-            free_vars.sort_by(|a, b| interner.resolve(*a).cmp(&interner.resolve(*b)));
+            let (free_vars, ty) =
+                canonicalise_annotation(ann, env, qualified_aliases, cx.interner)?;
             Ok(canon::Def::Typed {
                 home: env.home.clone(),
                 name: val.name,
@@ -5078,9 +5500,69 @@ fn canonicalise_value(
     }
 }
 
-/// Bind every variable a pattern introduces as a local in the environment.
-fn bind_pattern_names(p: &src::Pattern_, env: &mut Env) {
-    match p {
+/// Canonicalise a value's annotation, with its quantified variables ordered by name.
+///
+/// # Errors
+/// Any refusal the annotation's canonicalisation raises.
+fn canonicalise_annotation(
+    ann: &Located<src::TypeAnnotation>,
+    env: &Env,
+    qualified_aliases: &QualifiedAliases,
+    interner: &Interner,
+) -> DResult<(Vec<Symbol>, canon::Type)> {
+    let mut free_vars = BTreeSet::new();
+    let mut visited = Vec::new();
+    let ctx = TypeCtx {
+        env,
+        qualified_aliases,
+        interner,
+        ann_span: ann.span,
+    };
+    let no_params = ParamSlots::empty();
+    let mut budget = TYPE_EXPANSION_NODE_LIMIT;
+    let ty = canonicalise_type(
+        &ann.value,
+        &ctx,
+        &no_params,
+        &mut free_vars,
+        &mut visited,
+        &mut budget,
+        0,
+    )?;
+    // Order the quantified type variables by their resolved NAME, not by
+    // `Symbol` id (intern order is allocation-dependent, hence not a
+    // stable wire order). Determinism gate: a multi-tyvar annotation
+    // must yield the same `free_vars` regardless of how the interner
+    // happened to number the names.
+    let mut free_vars: Vec<Symbol> = free_vars.into_iter().collect();
+    free_vars.sort_by(|a, b| interner.resolve(*a).cmp(&interner.resolve(*b)));
+    Ok((free_vars, ty))
+}
+
+/// Bind every variable a pattern introduces as a local, recording each binder.
+///
+/// Each binder is recorded at its own span as the site that introduced it. An
+/// or-pattern binds its first alternative's names; the same name in every
+/// other alternative is recorded as an occurrence of that first binder.
+fn bind_pattern_names(p: &src::Pattern, env: &mut Env, names: &mut NameSink) {
+    visit_binders(p, true, &mut |name, span, binds| {
+        if binds {
+            let site = BinderSite::of(span);
+            env.add_local(name, site);
+            names.record(span, Target::Local(site));
+        } else if let Some(site) = env.lookup_local(name) {
+            names.record(span, Target::Local(site));
+        }
+    });
+}
+
+/// Visit every binder of a pattern with its name, its span, and whether it binds.
+///
+/// A binder binds when `binds` holds and it lies outside every non-first
+/// or-pattern alternative; the binders of a later alternative are visited
+/// after the first alternative's, with `binds` false.
+fn visit_binders<F: FnMut(Symbol, Span, bool)>(p: &src::Pattern, binds: bool, visit: &mut F) {
+    match &p.value {
         // The wildcard, the dev-only `Debug._` catch-all, the unit pattern, and
         // the literal leaves all bind nothing.
         src::Pattern_::PAnything
@@ -5090,39 +5572,43 @@ fn bind_pattern_names(p: &src::Pattern_, env: &mut Env) {
         | src::Pattern_::PBool(_)
         | src::Pattern_::PChar(_)
         | src::Pattern_::PStr(_) => {}
-        src::Pattern_::PVar(name) => env.add_local(*name),
+        src::Pattern_::PVar(name) => visit(*name, p.span, binds),
         src::Pattern_::PCtor(_, _, args) => {
             for a in args {
-                bind_pattern_names(&a.value, env);
+                visit_binders(a, binds, visit);
             }
         }
         // A tuple and a list pattern both bind every element's names.
         src::Pattern_::PTuple(elems) | src::Pattern_::PList(elems) => {
             for e in elems {
-                bind_pattern_names(&e.value, env);
+                visit_binders(e, binds, visit);
             }
         }
         src::Pattern_::PRecord(fields) => {
             // Field-pun: each field name binds a local of the same name.
             for f in fields {
-                env.add_local(f.value);
+                visit(f.value, f.span, binds);
             }
         }
         src::Pattern_::PAlias(inner, name) => {
             // The alias binds its name AND every name its inner pattern binds.
-            bind_pattern_names(&inner.value, env);
-            env.add_local(name.value);
+            visit_binders(inner, binds, visit);
+            visit(name.value, name.span, binds);
         }
         src::Pattern_::PCons(head, tail) => {
-            bind_pattern_names(&head.value, env);
-            bind_pattern_names(&tail.value, env);
+            visit_binders(head, binds, visit);
+            visit_binders(tail, binds, visit);
         }
         src::Pattern_::POr(alts) => {
             // Every alternative binds the identical name set (proved in
-            // `canonicalise_pattern`), so binding the FIRST alternative's names
-            // introduces the whole or-pattern's common binder set exactly once.
-            if let Some(first) = alts.first() {
-                bind_pattern_names(&first.value, env);
+            // `canonicalise_pattern`), so the FIRST alternative introduces the
+            // whole or-pattern's common binder set exactly once.
+            let mut rest = alts.iter();
+            if let Some(first) = rest.next() {
+                visit_binders(first, binds, visit);
+            }
+            for alt in rest {
+                visit_binders(alt, false, visit);
             }
         }
     }
@@ -5299,7 +5785,7 @@ fn resolve_pattern_ctor<'e>(
 fn canonicalise_pattern(
     p: &src::Pattern,
     env: &Env,
-    interner: &Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<canon::Pattern> {
     let span = p.span;
     let node = match &p.value {
@@ -5308,13 +5794,14 @@ fn canonicalise_pattern(
         src::Pattern_::PUnit => canon::Pattern_::PUnit,
         src::Pattern_::PVar(name) => canon::Pattern_::PVar(*name),
         src::Pattern_::PCtor(name, segments, args) => {
-            let ctor = resolve_pattern_ctor(*name, segments.is_empty(), span, env, interner)?;
+            let ctor = resolve_pattern_ctor(*name, segments.is_empty(), span, env, cx.interner)?;
+            cx.names.record(span, ctor_target(ctor));
             let home = ctor.home.clone();
             let type_name = ctor.type_name;
             let index = ctor.index;
             let mut can_args = Vec::with_capacity(args.len());
             for a in args {
-                can_args.push(canonicalise_pattern(a, env, interner)?);
+                can_args.push(canonicalise_pattern(a, env, cx)?);
             }
             canon::Pattern_::PCtor {
                 home,
@@ -5327,7 +5814,7 @@ fn canonicalise_pattern(
         src::Pattern_::PTuple(elems) => {
             let mut can_elems = Vec::with_capacity(elems.len());
             for e in elems {
-                can_elems.push(canonicalise_pattern(e, env, interner)?);
+                can_elems.push(canonicalise_pattern(e, env, cx)?);
             }
             canon::Pattern_::PTuple(can_elems)
         }
@@ -5341,19 +5828,19 @@ fn canonicalise_pattern(
         src::Pattern_::PChar(c) => canon::Pattern_::PChar(c.clone()),
         src::Pattern_::PStr(s) => canon::Pattern_::PStr(s.clone()),
         src::Pattern_::PAlias(inner, name) => {
-            let can_inner = canonicalise_pattern(inner, env, interner)?;
+            let can_inner = canonicalise_pattern(inner, env, cx)?;
             canon::Pattern_::PAlias(Box::new(can_inner), *name)
         }
         src::Pattern_::PList(elems) => {
             let mut can_elems = Vec::with_capacity(elems.len());
             for e in elems {
-                can_elems.push(canonicalise_pattern(e, env, interner)?);
+                can_elems.push(canonicalise_pattern(e, env, cx)?);
             }
             canon::Pattern_::PList(can_elems)
         }
         src::Pattern_::PCons(head, tail) => {
-            let can_head = canonicalise_pattern(head, env, interner)?;
-            let can_tail = canonicalise_pattern(tail, env, interner)?;
+            let can_head = canonicalise_pattern(head, env, cx)?;
+            let can_tail = canonicalise_pattern(tail, env, cx)?;
             canon::Pattern_::PCons(Box::new(can_head), Box::new(can_tail))
         }
         src::Pattern_::POr(alts) => {
@@ -5380,7 +5867,7 @@ fn canonicalise_pattern(
                         reference
                             .symmetric_difference(&this)
                             .copied()
-                            .map(|sym| name_str(interner, sym)),
+                            .map(|sym| name_str(cx.interner, sym)),
                     )?;
                     return Err(Diagnostic::Type {
                         span: alt.span,
@@ -5390,7 +5877,7 @@ fn canonicalise_pattern(
             }
             let mut can_alts = Vec::with_capacity(alts.len());
             for alt in alts {
-                can_alts.push(canonicalise_pattern(alt, env, interner)?);
+                can_alts.push(canonicalise_pattern(alt, env, cx)?);
             }
             canon::Pattern_::POr(can_alts)
         }
@@ -5400,7 +5887,7 @@ fn canonicalise_pattern(
 
 /// Canonicalise an expression, resolving every name.
 #[allow(clippy::too_many_lines)] // one arm per source expression form
-fn canonicalise_expr(e: &src::Expr, env: &Env, interner: &mut Interner) -> DResult<canon::Expr> {
+fn canonicalise_expr(e: &src::Expr, env: &Env, cx: &mut ResolveCx<'_>) -> DResult<canon::Expr> {
     let span = e.span;
     let node = match &e.value {
         src::Expr_::Int(n) => canon::Expr_::Int(*n),
@@ -5409,40 +5896,38 @@ fn canonicalise_expr(e: &src::Expr, env: &Env, interner: &mut Interner) -> DResu
         // Triple-quoted strings: desugar `{{expr}}` interpolation into a `++`
         // chain at canonicalise time. Mirrors `Ipe.Canonicalise.Expression.hs`
         // line 42 (`Src.MultilineStr s -> desugarMultiline env s`).
-        src::Expr_::MultilineStr { raw, anchor } => {
-            desugar_multiline(raw, *anchor, span, env, interner)?
-        }
+        src::Expr_::MultilineStr { raw, anchor } => desugar_multiline(raw, *anchor, span, env, cx)?,
         src::Expr_::Char(c) => canon::Expr_::Char(c.clone()),
         src::Expr_::Unit => canon::Expr_::Unit,
-        src::Expr_::VarLocal(name) => resolve_var(*name, span, env, interner)?,
-        src::Expr_::VarQual(qual, name) => resolve_qual_var(*qual, *name, span, env, interner)?,
-        src::Expr_::TaskAndThen => resolve_task_and_then(span, env, interner)?,
+        src::Expr_::VarLocal(name) => resolve_var(*name, span, env, cx)?,
+        src::Expr_::VarQual(qual, name) => resolve_qual_var(*qual, *name, span, env, cx)?,
+        src::Expr_::TaskAndThen => resolve_task_and_then(span, env, cx.interner)?,
         src::Expr_::Call(f, args) => {
-            if let Some(node) = canonicalise_foreign_call(f, args, span, env, interner)? {
+            if let Some(node) = canonicalise_foreign_call(f, args, span, env, cx)? {
                 node
-            } else if let Some(node) = canonicalise_asserted_call(f, args, span, env, interner)? {
+            } else if let Some(node) = canonicalise_asserted_call(f, args, span, env, cx)? {
                 node
-            } else if let Some(node) = canonicalise_codec_auto(f, args, span, env, interner)? {
+            } else if let Some(node) = canonicalise_codec_auto(f, args, span, env, cx.interner)? {
                 node
             } else {
-                let callee = canonicalise_expr(f, env, interner)?;
+                let callee = canonicalise_expr(f, env, cx)?;
                 let mut can_args = Vec::with_capacity(args.len());
                 for a in args {
-                    can_args.push(canonicalise_expr(a, env, interner)?);
+                    can_args.push(canonicalise_expr(a, env, cx)?);
                 }
                 canon::Expr_::Call(Box::new(callee), can_args)
             }
         }
         src::Expr_::Case(scrut, arms) => {
-            let can_scrut = canonicalise_expr(scrut, env, interner)?;
+            let can_scrut = canonicalise_expr(scrut, env, cx)?;
             let mut branches = Vec::with_capacity(arms.len());
             for (pat, body) in arms {
                 // Pattern-bound names are local in the arm body.
                 let mut arm_env = env.clone();
-                bind_pattern_names(&pat.value, &mut arm_env);
-                reject_duplicate_pattern_binders(pat, interner)?;
-                let can_pat = canonicalise_pattern(pat, env, interner)?;
-                let can_body = canonicalise_expr(body, &arm_env, interner)?;
+                bind_pattern_names(pat, &mut arm_env, cx.names);
+                reject_duplicate_pattern_binders(pat, cx.interner)?;
+                let can_pat = canonicalise_pattern(pat, env, cx)?;
+                let can_body = canonicalise_expr(body, &arm_env, cx)?;
                 branches.push(canon::CaseBranch {
                     pat: can_pat,
                     body: can_body,
@@ -5460,14 +5945,14 @@ fn canonicalise_expr(e: &src::Expr, env: &Env, interner: &mut Interner) -> DResu
             let mut body_env = env.clone();
             let mut can_params = Vec::with_capacity(params.len());
             for p in params {
-                reject_duplicate_pattern_binders(p, interner)?;
-                bind_pattern_names(&p.value, &mut body_env);
-                can_params.push(canonicalise_pattern(p, env, interner)?);
+                reject_duplicate_pattern_binders(p, cx.interner)?;
+                bind_pattern_names(p, &mut body_env, cx.names);
+                can_params.push(canonicalise_pattern(p, env, cx)?);
             }
-            let can_body = canonicalise_expr(body, &body_env, interner)?;
+            let can_body = canonicalise_expr(body, &body_env, cx)?;
             canon::Expr_::Lambda(can_params, Box::new(can_body))
         }
-        src::Expr_::Binops(pairs, final_) => canonicalise_binops(pairs, final_, env, interner)?,
+        src::Expr_::Binops(pairs, final_) => canonicalise_binops(pairs, final_, env, cx)?,
         src::Expr_::Let(bindings, body) => {
             // Sequential (`let*`) scoping: each binding's value is resolved
             // against the enclosing scope plus the bindings before it, then its
@@ -5478,22 +5963,22 @@ fn canonicalise_expr(e: &src::Expr, env: &Env, interner: &mut Interner) -> DResu
             let mut let_env = env.clone();
             let mut can_bindings = Vec::with_capacity(bindings.len());
             for b in bindings {
-                let can_body = canonicalise_expr(&b.body, &let_env, interner)?;
+                let can_body = canonicalise_expr(&b.body, &let_env, cx)?;
                 // The binder's value is resolved against the scope so far; then
                 // every variable it introduces (a plain name, or each leaf of a
                 // tuple / record destructure) becomes a local for the bindings
                 // that follow and the `in` body. The binder pattern itself is
                 // canonicalised against the enclosing env (consistent with how
                 // `case` arms and lambda parameters resolve their patterns).
-                reject_duplicate_pattern_binders(&b.pat, interner)?;
-                let can_pat = canonicalise_pattern(&b.pat, &let_env, interner)?;
-                bind_pattern_names(&b.pat.value, &mut let_env);
+                reject_duplicate_pattern_binders(&b.pat, cx.interner)?;
+                let can_pat = canonicalise_pattern(&b.pat, &let_env, cx)?;
+                bind_pattern_names(&b.pat, &mut let_env, cx.names);
                 can_bindings.push(canon::LetBinding {
                     pat: can_pat,
                     body: can_body,
                 });
             }
-            let can_in = canonicalise_expr(body, &let_env, interner)?;
+            let can_in = canonicalise_expr(body, &let_env, cx)?;
             canon::Expr_::Let(can_bindings, Box::new(can_in))
         }
         src::Expr_::If(branches, else_expr) => {
@@ -5501,11 +5986,11 @@ fn canonicalise_expr(e: &src::Expr, env: &Env, interner: &mut Interner) -> DResu
             // against the same enclosing scope.
             let mut can_branches = Vec::with_capacity(branches.len());
             for (cond, body) in branches {
-                let can_cond = canonicalise_expr(cond, env, interner)?;
-                let can_body = canonicalise_expr(body, env, interner)?;
+                let can_cond = canonicalise_expr(cond, env, cx)?;
+                let can_body = canonicalise_expr(body, env, cx)?;
                 can_branches.push((can_cond, can_body));
             }
-            let can_else = canonicalise_expr(else_expr, env, interner)?;
+            let can_else = canonicalise_expr(else_expr, env, cx)?;
             canon::Expr_::If(can_branches, Box::new(can_else))
         }
         src::Expr_::Tuple(elems) => {
@@ -5513,7 +5998,7 @@ fn canonicalise_expr(e: &src::Expr, env: &Env, interner: &mut Interner) -> DResu
             // same enclosing scope.
             let mut can_elems = Vec::with_capacity(elems.len());
             for elem in elems {
-                can_elems.push(canonicalise_expr(elem, env, interner)?);
+                can_elems.push(canonicalise_expr(elem, env, cx)?);
             }
             canon::Expr_::Tuple(can_elems)
         }
@@ -5522,7 +6007,7 @@ fn canonicalise_expr(e: &src::Expr, env: &Env, interner: &mut Interner) -> DResu
             // against the same enclosing scope.
             let mut can_elems = Vec::with_capacity(elems.len());
             for elem in elems {
-                can_elems.push(canonicalise_expr(elem, env, interner)?);
+                can_elems.push(canonicalise_expr(elem, env, cx)?);
             }
             canon::Expr_::List(can_elems)
         }
@@ -5530,12 +6015,12 @@ fn canonicalise_expr(e: &src::Expr, env: &Env, interner: &mut Interner) -> DResu
             // A record introduces no bindings: every field value resolves against
             // the same enclosing scope. The field names are labels, carried
             // unresolved; a duplicate is rejected (see `canonicalise_fields`).
-            canon::Expr_::Record(canonicalise_fields(fields, env, interner)?)
+            canon::Expr_::Record(canonicalise_fields(fields, env, cx)?)
         }
         src::Expr_::Access(record, field) => {
             // `record.field`: the record sub-expression resolves against the
             // enclosing scope; the field is a label carried through unresolved.
-            let can_record = canonicalise_expr(record, env, interner)?;
+            let can_record = canonicalise_expr(record, env, cx)?;
             canon::Expr_::Access(Box::new(can_record), field.value)
         }
         src::Expr_::Update(base, fields) => {
@@ -5544,9 +6029,9 @@ fn canonicalise_expr(e: &src::Expr, env: &Env, interner: &mut Interner) -> DResu
             // would be (an unknown name is the usual `ValueNotFound`). The updated
             // fields resolve the same way as a literal's, with the same
             // duplicate-field rejection.
-            let base_node = resolve_var(base.value, base.span, env, interner)?;
+            let base_node = resolve_var(base.value, base.span, env, cx)?;
             let can_base = Located::new(base.span, base_node);
-            let can_fields = canonicalise_fields(fields, env, interner)?;
+            let can_fields = canonicalise_fields(fields, env, cx)?;
             canon::Expr_::Update(Box::new(can_base), can_fields)
         }
     };
@@ -5563,7 +6048,7 @@ fn canonicalise_expr(e: &src::Expr, env: &Env, interner: &mut Interner) -> DResu
 fn canonicalise_fields(
     fields: &[(Located<Symbol>, src::Expr)],
     env: &Env,
-    interner: &mut Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<Vec<(Symbol, canon::Expr)>> {
     let mut seen: BTreeMap<Symbol, Span> = BTreeMap::new();
     let mut can_fields = Vec::with_capacity(fields.len());
@@ -5572,13 +6057,13 @@ fn canonicalise_fields(
             return Err(Diagnostic::Name {
                 span: name.span,
                 msg: NameError::DuplicateValue {
-                    name: name_str(interner, name.value)?,
+                    name: name_str(cx.interner, name.value)?,
                     first: *first,
                 },
             });
         }
         seen.insert(name.value, name.span);
-        let can_value = canonicalise_expr(value, env, interner)?;
+        let can_value = canonicalise_expr(value, env, cx)?;
         can_fields.push((name.value, can_value));
     }
     Ok(can_fields)
@@ -5591,21 +6076,118 @@ fn canonicalise_fields(
 /// # Errors
 /// [`NameError::AmbiguousImport`] for two open-import definitions no higher
 /// tier shadows; [`NameError::ValueNotFound`] when no tier binds the name.
-fn resolve_var(name: Symbol, span: Span, env: &Env, interner: &Interner) -> DResult<canon::Expr_> {
-    if let Some(home) = env.lookup_var(name) {
+fn resolve_var(
+    name: Symbol,
+    span: Span,
+    env: &Env,
+    cx: &mut ResolveCx<'_>,
+) -> DResult<canon::Expr_> {
+    if let Some(site) = env.lookup_local(name) {
         // A lexical binder shadows every module-level binding of its spelling.
-        return Ok(var_home_to_expr(name, home));
+        cx.names.record(span, Target::Local(site));
+        return Ok(canon::Expr_::VarLocal(name));
     }
     match env.module_scope.expr.resolve(name) {
-        Resolved::Found(origin, _) => Ok(match &origin.target {
-            ExprTarget::Ctor(ctor) => ctor_expr(ctor),
-            ExprTarget::Value(home) => var_home_to_expr(name, home),
+        Resolved::Found(origin, tier) => Ok(match &origin.target {
+            ExprTarget::Ctor(ctor) => {
+                cx.names.record(span, ctor_target(ctor));
+                ctor_expr(ctor)
+            }
+            ExprTarget::Value(home) => {
+                let declared_in = bare_declaring_module(origin, tier, env);
+                record_value(cx.names, span, name, home, declared_in);
+                var_home_to_expr(name, home)
+            }
         }),
         Resolved::Ambiguous { importers } => {
-            let modules = importer_names(&importers, interner);
-            Err(ambiguous_import(name, span, modules, interner)?)
+            let modules = importer_names(&importers, cx.interner);
+            Err(ambiguous_import(name, span, modules, cx.interner)?)
         }
-        Resolved::Missing => Err(value_not_found(name, span, env, interner)?),
+        Resolved::Missing => Err(value_not_found(name, span, env, cx.interner)?),
+    }
+}
+
+/// The module declaring the bare value `origin` binds, when it is an Ipê module.
+///
+/// A value of this module is declared here. An imported one is declared in the
+/// one source module it was imported from; a value two modules bring in, or one
+/// from a kernel module or the ambient prelude, has no single Ipê declaration.
+fn bare_declaring_module<'o>(
+    origin: &'o Origin<ExprTarget>,
+    tier: Tier,
+    env: &'o Env,
+) -> Option<&'o [Symbol]> {
+    match tier {
+        Tier::Local => Some(&env.home),
+        Tier::Explicit | Tier::Open => {
+            let mut importers = origin.importers.iter();
+            match (importers.next(), importers.next()) {
+                (Some(only), None)
+                    if env
+                        .import_scope
+                        .imported_modules
+                        .contains(&ModuleIdentity::Source(only.clone())) =>
+                {
+                    Some(only)
+                }
+                _ => None,
+            }
+        }
+        Tier::Ambient => None,
+    }
+}
+
+/// The source module a qualifier spelling resolves into, when it is an Ipê module.
+fn qualifier_declaring_module(qualifier: Symbol, env: &Env) -> Option<&[Symbol]> {
+    env.import_scope
+        .qualifier_owner
+        .get(&qualifier)
+        .and_then(|claim| match &claim.owner {
+            ModuleIdentity::Source(path) => Some(path.as_slice()),
+            ModuleIdentity::Kernel(_) => None,
+        })
+}
+
+/// Record the value occurrence at `span` resolving `name` to `home`.
+///
+/// `declared_in` is the Ipê module the occurrence reached the value through; a
+/// kernel takes it as the declaration of its alias. A module-level table never
+/// holds a lexical binder, so a [`VarHome::Local`] there carries no site and is
+/// not recorded.
+fn record_value(
+    names: &mut NameSink,
+    span: Span,
+    name: Symbol,
+    home: &VarHome,
+    declared_in: Option<&[Symbol]>,
+) {
+    let target = match home {
+        VarHome::Local => return,
+        VarHome::TopLevel(module) => Target::TopLevel {
+            home: module.clone(),
+            name,
+        },
+        VarHome::Kernel(id, _, _) => Target::Kernel {
+            id: Some(*id),
+            declared: declared_in.map(|module| DeclHome {
+                module: module.to_vec(),
+                name,
+            }),
+        },
+        VarHome::ReservedKernel { .. } => Target::Kernel {
+            id: None,
+            declared: None,
+        },
+    };
+    names.record(span, target);
+}
+
+/// The index target of a resolved constructor.
+fn ctor_target(ctor: &CtorHome) -> Target {
+    Target::Ctor {
+        home: ctor.home.clone(),
+        type_name: ctor.type_name,
+        name: ctor.name,
     }
 }
 
@@ -5664,7 +6246,7 @@ fn value_not_found(
                 suggestions(
                     name,
                     Shape::Flat,
-                    env.vars
+                    env.locals
                         .keys()
                         .copied()
                         .chain(env.module_scope.expr.names()),
@@ -5968,20 +6550,20 @@ fn resolve_qual_var(
     name: Symbol,
     span: Span,
     env: &Env,
-    interner: &Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<canon::Expr_> {
     // A bare reference to a reserved literal-only constructor (`Rust.Ffi.call`,
     // `CustomElement.fromFile`) has no value to denote — each is legal only fully
     // applied in a sanctioned position, so refuse it with a teachable diagnostic
     // rather than a no-such-member miss.
-    if let Some(diag) = reject_bare_reserved_constructor(qualifier, name, span, env, interner) {
+    if let Some(diag) = reject_bare_reserved_constructor(qualifier, name, span, env, cx.interner) {
         return Err(diag);
     }
     // Resolve the qualifier and member text once and reuse across the
     // removed-surface and negate gates below — the interner lookup is a Vec
     // index plus a content compare, and both symbols are consulted twice.
-    let qualifier_text = interner.resolve(qualifier);
-    let name_text = interner.resolve(name);
+    let qualifier_text = cx.interner.resolve(qualifier);
+    let name_text = cx.interner.resolve(name);
     // Removed-surface gate (IPE-N0036): bindings intentionally dropped from
     // the Ipê surface are intercepted here before any catalog lookup, so the
     // user gets a clear migration diagnostic rather than "no such member".
@@ -6021,6 +6603,13 @@ fn resolve_qual_var(
     // (Tier A) and is not otherwise a resolvable qualifier, so this is the sole
     // `Basics.member` spelling — no member table to consult.
     if qualifier_text == Some("Basics") && name_text == Some("negate") {
+        cx.names.record(
+            span,
+            Target::Kernel {
+                id: Some(StdlibKernel::BasicsNegate),
+                declared: None,
+            },
+        );
         return Ok(canon::Expr_::VarKernel {
             id: Some(StdlibKernel::BasicsNegate),
             module: qualifier,
@@ -6032,61 +6621,44 @@ fn resolve_qual_var(
     // classified once (IPE-N0027 / IPE-N0034 / IPE-N0004).
     let token = qualified_token(span, qualifier_text, name_text);
     let Some(members) = env.qual_members(qualifier) else {
-        return Err(absent_qualifier(qualifier, span, token, env, interner)?);
+        return Err(absent_qualifier(qualifier, span, token, env, cx.interner)?);
     };
-    match members.get(&name) {
-        Some(VarHome::Kernel(id, m, f)) => Ok(canon::Expr_::VarKernel {
-            id: Some(*id),
-            module: *m,
-            name: *f,
-        }),
-        // Reachable-but-unbacked member: no registry id, IPE-L0108 at type-check.
-        Some(VarHome::ReservedKernel { module, name }) => Ok(canon::Expr_::VarKernel {
-            id: None,
-            module: *module,
-            name: *name,
-        }),
-        Some(VarHome::TopLevel(module)) => Ok(canon::Expr_::VarTopLevel {
-            module: module.clone(),
-            name,
-        }),
-        Some(VarHome::Local) => Ok(canon::Expr_::VarLocal(name)),
-        // The qualifier resolves via qual_vars but the member is not a value.
-        // Check qual_ctors — needed for compiled-source ADT constructors accessed
-        // as `Alias.CtorName` (e.g. `Money.USD`, `Money.EUR`).
-        None => {
-            if let Some(ctor_map) = env.qual_ctors.get(&qualifier)
-                && let Some(ch) = ctor_map.get(&name)
-            {
-                return Ok(canon::Expr_::VarCtor {
-                    home: ch.home.clone(),
-                    type_name: ch.type_name,
-                    name: ch.name,
-                    index: ch.index,
-                });
-            }
-            let member = name_str(interner, name)?;
-            Err(Diagnostic::Name {
-                span,
-                msg: NameError::NoSuchMember {
-                    module: name_str(interner, qualifier)?,
-                    suggestions: Candidates::at(
-                        token.and_then(|t| EditTarget::suffix(t, &member)),
-                        suggestions(
-                            name,
-                            Shape::Flat,
-                            members
-                                .keys()
-                                .chain(env.qual_ctors.get(&qualifier).iter().flat_map(|m| m.keys()))
-                                .copied(),
-                            interner,
-                        ),
-                    ),
-                    member,
-                },
-            })
-        }
+    // A reachable-but-unbacked member lowers with no registry id: IPE-L0108
+    // at type-check.
+    if let Some(home) = members.get(&name) {
+        let declared_in = qualifier_declaring_module(qualifier, env);
+        record_value(cx.names, span, name, home, declared_in);
+        return Ok(var_home_to_expr(name, home));
     }
+    // The qualifier resolves via qual_vars but the member is not a value.
+    // Check qual_ctors — needed for compiled-source ADT constructors accessed
+    // as `Alias.CtorName` (e.g. `Money.USD`, `Money.EUR`).
+    if let Some(ctor_map) = env.qual_ctors.get(&qualifier)
+        && let Some(ch) = ctor_map.get(&name)
+    {
+        cx.names.record(span, ctor_target(ch));
+        return Ok(ctor_expr(ch));
+    }
+    let member = name_str(cx.interner, name)?;
+    Err(Diagnostic::Name {
+        span,
+        msg: NameError::NoSuchMember {
+            module: name_str(cx.interner, qualifier)?,
+            suggestions: Candidates::at(
+                token.and_then(|t| EditTarget::suffix(t, &member)),
+                suggestions(
+                    name,
+                    Shape::Flat,
+                    members
+                        .keys()
+                        .chain(env.qual_ctors.get(&qualifier).iter().flat_map(|m| m.keys()))
+                        .copied(),
+                    cx.interner,
+                ),
+            ),
+            member,
+        },
+    })
 }
 
 /// Canonicalise a binary-operator chain into a precedence-correct tree.
@@ -6111,29 +6683,29 @@ fn canonicalise_binops(
     pairs: &[(src::Expr, Located<Symbol>)],
     final_: &src::Expr,
     env: &Env,
-    interner: &mut Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<canon::Expr_> {
     // No operators: just the final operand.
     if pairs.is_empty() {
-        return Ok(canonicalise_expr(final_, env, interner)?.value);
+        return Ok(canonicalise_expr(final_, env, cx)?.value);
     }
 
-    let basics = interner.intern("Basics")?;
+    let basics = cx.interner.intern("Basics")?;
 
     // Canonicalise every operand once, left to right, into a front-poppable
     // queue; parse each operator into the closed set.
     let mut operands: VecDeque<canon::Expr> = VecDeque::with_capacity(pairs.len() + 1);
     let mut ops: VecDeque<Located<BinOp>> = VecDeque::with_capacity(pairs.len());
     for (operand, op) in pairs {
-        operands.push_back(canonicalise_expr(operand, env, interner)?);
-        let text = resolve_or_bug(interner, op.value, "ipe_canon::canonicalise_binops")?;
+        operands.push_back(canonicalise_expr(operand, env, cx)?);
+        let text = resolve_or_bug(cx.interner, op.value, "ipe_canon::canonicalise_binops")?;
         let bin_op = BinOp::from_text(text).ok_or_else(|| Diagnostic::CompilerBug {
             where_: "ipe_canon::canonicalise_binops",
             detail: format!("operator `{text}` is outside the closed operator set"),
         })?;
         ops.push_back(Located::new(op.span, bin_op));
     }
-    operands.push_back(canonicalise_expr(final_, env, interner)?);
+    operands.push_back(canonicalise_expr(final_, env, cx)?);
 
     let left = operands
         .pop_front()
@@ -6141,7 +6713,7 @@ fn canonicalise_binops(
             where_: "ipe_canon::canonicalise_binops",
             detail: "binop chain with operators but no operands".to_owned(),
         })?;
-    let tree = climb_binops(left, &mut operands, &mut ops, basics, env, interner)?;
+    let tree = climb_binops(left, &mut operands, &mut ops, basics, env, cx.interner)?;
     Ok(tree.value)
 }
 
@@ -6239,7 +6811,7 @@ impl SiteBinder {
 fn mint_site_binder(site: SiteBinder, env: &Env, interner: &mut Interner) -> DResult<Symbol> {
     let taken = |interner: &Interner, name: &str| {
         interner.lookup(name).is_some_and(|sym| {
-            env.vars.contains_key(&sym)
+            env.locals.contains_key(&sym)
                 || !matches!(env.module_scope.expr.resolve(sym), Resolved::Missing)
         })
     };
@@ -6248,7 +6820,7 @@ fn mint_site_binder(site: SiteBinder, env: &Env, interner: &mut Interner) -> DRe
         return interner.intern(&base);
     }
     let ceiling = env
-        .vars
+        .locals
         .len()
         .checked_add(env.module_scope.expr.names().count())
         .and_then(|n| n.checked_add(1))
@@ -6451,8 +7023,9 @@ enum TypeName<'a> {
     Union(Vec<Symbol>),
     /// Two open imports bring in the name from distinct homes.
     Ambiguous { modules: SortedNames },
-    /// An empty-home builtin row, bound by a kernel import or reserved.
-    Builtin(BuiltinType),
+    /// A builtin row with the home its use mints, bound by an import or
+    /// reserved.
+    Builtin(BoundBuiltin),
     /// No tier binds the name.
     Missing,
 }
@@ -6473,7 +7046,7 @@ fn resolve_unqualified_type_name<'a>(
             Resolved::Found(origin, _) => {
                 return Ok(match &origin.target {
                     ScopeType::Union(home) => TypeName::Union(home.clone()),
-                    ScopeType::Builtin(builtin) => TypeName::Builtin(*builtin),
+                    ScopeType::Builtin(builtin) => TypeName::Builtin(builtin.clone()),
                     ScopeType::Alias(AliasBody::Local { params, body }) => {
                         TypeName::Alias(ResolvedAlias::Local { params, body })
                     }
@@ -6495,7 +7068,11 @@ fn resolve_unqualified_type_name<'a>(
         name,
         "ipe_canon::resolve_unqualified_type_name",
     )?;
-    Ok(BuiltinType::of_bare_name(name_s).map_or(TypeName::Missing, TypeName::Builtin))
+    Ok(
+        BuiltinType::of_bare_name(name_s).map_or(TypeName::Missing, |row| {
+            TypeName::Builtin(BoundBuiltin::at_empty_home(row))
+        }),
+    )
 }
 
 /// The IPE-N0002 for a bare type name no tier binds, ranked over every type
@@ -6524,15 +7101,10 @@ fn type_not_found(name: Symbol, ctx: &TypeCtx) -> DResult<Diagnostic> {
 enum TypeTarget<'a> {
     /// An alias to expand, with the key a recursive use is tracked under.
     Alias(Symbol, ResolvedAlias<'a>),
-    /// A builtin row, minted at the empty home its kernel schemes use.
-    Builtin(BuiltinType),
+    /// A builtin row, minted at the home its binding carries.
+    Builtin(BoundBuiltin),
     /// A union declared at a module home.
     Union(UnionHome),
-}
-
-/// The empty home of a builtin head; only a builtin witness mints it.
-const fn builtin_home(_witness: BuiltinType) -> Vec<Symbol> {
-    Vec::new()
 }
 
 /// The home of a union: a module path, never the empty builtin home.
@@ -6608,6 +7180,131 @@ fn kernel_type_export<'a>(
     })
 }
 
+/// What a source-module-qualified type reference `qualifier.name` resolves to.
+///
+/// The qualifier's dependency export table is the only authority: an exported
+/// builtin is its row at the export's home (a declared row included, see
+/// [`export_declared_builtins`]), an exported union its home, an exported
+/// alias expands through its synthetic key. No target is built from the
+/// spelling.
+///
+/// # Errors
+/// [`NameError::NameNotExposed`] (IPE-N0022) for a type the dependency declares
+/// and does not export; [`NameError::NoSuchMember`] (IPE-N0005) for any other
+/// name the dependency does not export, both ranked over the names it does;
+/// [`Diagnostic::CompilerBug`] when a symbol is not interned, the qualifier has
+/// no export table, or an exported alias has no qualified key.
+fn source_qualified_type<'a>(
+    qualifier: Symbol,
+    qualifier_str: &str,
+    name: Symbol,
+    ctx: &TypeCtx<'a>,
+) -> DResult<TypeTarget<'a>> {
+    let Some(types) = ctx.env.qualified_types.get(&qualifier) else {
+        return Err(Diagnostic::CompilerBug {
+            where_: "ipe_canon::source_qualified_type",
+            detail: "a source qualifier with no export table".into(),
+        });
+    };
+    match types.get(&name) {
+        Some(QualifiedType::Builtin(bound)) => Ok(TypeTarget::Builtin(bound.clone())),
+        Some(QualifiedType::Union(home)) => Ok(TypeTarget::Union(UnionHome::of(home.clone())?)),
+        Some(QualifiedType::Alias) => {
+            let alias_key =
+                alias_lookup_key(qualifier_str, name, ctx.qualified_aliases, ctx.interner)?;
+            match alias_key
+                .and_then(|key| ctx.qualified_aliases.get(&key).map(|alias| (key, alias)))
+            {
+                Some((key, alias)) => Ok(TypeTarget::Alias(key, ResolvedAlias::Imported(alias))),
+                None => Err(Diagnostic::CompilerBug {
+                    where_: "ipe_canon::source_qualified_type",
+                    detail: "an exported alias with no qualified key".into(),
+                }),
+            }
+        }
+        Some(QualifiedType::Private) => Err(unexported_qualified_type(
+            Unexported::Private,
+            qualifier,
+            name,
+            types,
+            ctx,
+        )?),
+        None => Err(unexported_qualified_type(
+            Unexported::Undeclared,
+            qualifier,
+            name,
+            types,
+            ctx,
+        )?),
+    }
+}
+
+/// Why a source qualifier's dependency does not export a type name.
+#[derive(Clone, Copy)]
+enum Unexported {
+    /// The dependency declares the name and does not expose it.
+    Private,
+    /// The dependency declares no type of the name.
+    Undeclared,
+}
+
+/// The refusal of `qualifier.name`, a type its dependency does not export:
+/// IPE-N0022 for a private declaration, IPE-N0005 otherwise, both naming the
+/// dependency's module path (the module whose `exposing` list decides, not the
+/// importer's spelling of it) and ranked over the exported names of `types`.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] when a symbol is not interned or no source
+/// module owns `qualifier`.
+fn unexported_qualified_type(
+    why: Unexported,
+    qualifier: Symbol,
+    name: Symbol,
+    types: &BTreeMap<Symbol, QualifiedType>,
+    ctx: &TypeCtx,
+) -> DResult<Diagnostic> {
+    let name_s = resolve_or_bug(ctx.interner, name, "ipe_canon::unexported_qualified_type")?;
+    let module = match ctx
+        .env
+        .import_scope
+        .qualifier_owner
+        .get(&qualifier)
+        .map(|claim| &claim.owner)
+    {
+        Some(ModuleIdentity::Source(path)) => path_to_dot_string(ctx.interner, path),
+        Some(ModuleIdentity::Kernel(_)) | None => {
+            return Err(Diagnostic::CompilerBug {
+                where_: "ipe_canon::unexported_qualified_type",
+                detail: "a source qualifier no source module owns".into(),
+            });
+        }
+    };
+    let suggestions = Candidates::hints(ranked_names(
+        name_s,
+        Shape::Flat,
+        types
+            .iter()
+            .filter(|(_, target)| target.is_exported())
+            .filter_map(|(sym, _)| ctx.interner.resolve(*sym)),
+    ));
+    let msg = match why {
+        Unexported::Private => NameError::NameNotExposed {
+            module,
+            name: name_s.into(),
+            suggestions,
+        },
+        Unexported::Undeclared => NameError::NoSuchMember {
+            module,
+            member: name_s.into(),
+            suggestions,
+        },
+    };
+    Ok(Diagnostic::Name {
+        span: ctx.ann_span,
+        msg,
+    })
+}
+
 /// The IPE-N0024 for a bare name two imports bring in from distinct homes.
 ///
 /// # Errors
@@ -6625,52 +7322,6 @@ fn ambiguous_import(
             modules,
         },
     })
-}
-
-/// The home of a qualified union reference `qualifier.name` that names no alias.
-///
-/// `qualifier` is owned by a source module, so it has a path in
-/// `qualifier_paths`; a kernel-module qualifier never reaches here.
-///
-/// Html-family builtin force-home: `fold_html_stdlib_qualifier_homes` registers
-/// an Html-family stdlib qualifier's real dep path, but the reserved builtin
-/// VIEW-TYPE names (`Attribute`/`Html`) must lower to the `["Html"]` carrier the
-/// HM constrainer and the lowerer's `is_html` check both expect. So a
-/// reserved-builtin name under an Html-family qualifier force-homes to
-/// `["Html"]`. A compiled-source ADT declared in `Ipe.Html.Attributes` (e.g.
-/// `Attr.LinkTarget`) is NOT a reserved builtin, so it keeps its real module
-/// home; homing it to `["Html"]` would mint a phantom `html::LinkTarget` the
-/// runtime has no type for. `Ui.Attribute` (a non-Html qualifier) is untouched
-/// — it falls through to the empty Ui sentinel.
-///
-/// # Errors
-/// [`Diagnostic::CompilerBug`] for a qualifier with no path.
-fn qualified_type_home(qualifier: Symbol, name: Symbol, ctx: &TypeCtx) -> DResult<Vec<Symbol>> {
-    let qualifier_home = ctx
-        .qualifier_paths
-        .get(&qualifier)
-        .cloned()
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_canon::qualified_type_home",
-            detail: "a source qualifier with no path".into(),
-        })?;
-    let qualifier_is_html_family = qualifier_home
-        .iter()
-        .any(|s| ctx.interner.resolve(*s) == Some("Html"));
-    let name_is_reserved_builtin = ctx
-        .interner
-        .resolve(name)
-        .is_some_and(is_reserved_builtin_type_name);
-    if qualifier_is_html_family && name_is_reserved_builtin {
-        // `Html` is interned by `fold_html_stdlib_qualifier_homes` whenever any
-        // Html-family import exists, so a hit here is the norm; the qualifier's
-        // own home is the fail-closed fallback.
-        return Ok(ctx
-            .interner
-            .lookup("Html")
-            .map_or(qualifier_home, |html| vec![html]));
-    }
-    Ok(qualifier_home)
 }
 
 /// Spend one node of a type expansion against its depth and node ceilings.
@@ -6980,6 +7631,44 @@ fn canonicalise_type(
                     ctx.interner,
                 )?);
             }
+            // Resolve the reference once, before its arguments: an alias
+            // expands in place, a union yields its home, a builtin its row at
+            // the home its binding carries. A bare name goes through the one
+            // precedence ladder (`resolve_unqualified_type_name`). A
+            // kernel-module qualifier (`Http.HttpResponse`) reads that module's
+            // type exports, and a miss is IPE-N0005. A source-module qualifier
+            // reads its dependency's export table only: an exported builtin,
+            // union or alias resolves, a private one is IPE-N0022, and any
+            // other name is IPE-N0005.
+            let target = if qualifier_str.is_empty() {
+                match resolve_unqualified_type_name(name, ctx, visited)? {
+                    TypeName::Alias(alias) => TypeTarget::Alias(name, alias),
+                    TypeName::Union(home) => TypeTarget::Union(UnionHome::of(home)?),
+                    TypeName::Builtin(builtin) => TypeTarget::Builtin(builtin),
+                    TypeName::Ambiguous { modules } => {
+                        return Err(ambiguous_import(name, ctx.ann_span, modules, ctx.interner)?);
+                    }
+                    TypeName::Missing => return Err(type_not_found(name, ctx)?),
+                }
+            } else if let Some(module) = kernel_qualifier_owner(*qualifier, ctx.env) {
+                // A kernel alias body is a closed builtin tree, so its
+                // expansion never meets the alias again: its use-site name is
+                // a sufficient cycle key.
+                match kernel_type_export(module, *qualifier, name, ctx)? {
+                    KernelTypeExport::Alias(exported) => {
+                        TypeTarget::Alias(name, ResolvedAlias::Imported(exported))
+                    }
+                    KernelTypeExport::Builtin(builtin) => {
+                        TypeTarget::Builtin(BoundBuiltin::at_empty_home(*builtin))
+                    }
+                }
+            } else {
+                source_qualified_type(*qualifier, qualifier_str, name, ctx)?
+            };
+            let tag = match &target {
+                TypeTarget::Builtin(bound) => bound.row.row().tag(),
+                TypeTarget::Union(_) | TypeTarget::Alias(..) => None,
+            };
             // `View engine msg` — the engine-tagged view carrier and SSOT view
             // surface. It canonicalises to a real 2-argument `Con(View, [engine
             // tag, msg])` that survives into inference: the engine tag is a
@@ -6995,8 +7684,7 @@ fn canonicalise_type(
             // denotation and is rejected fail-closed as an unresolved type name.
             // Only the `msg` argument is a real type, canonicalised with the
             // current parameters in scope.
-            if qualifier_str.is_empty()
-                && ctx.interner.resolve(name) == Some("View")
+            if tag == Some(BuiltinTag::View)
                 && args.len() == 2
                 && let Some(src::TypeAnnotation::TType(engine_qual, engine_segs, engine_args)) =
                     args.first()
@@ -7058,10 +7746,10 @@ fn canonicalise_type(
             // combinator schemes yield, with no parallel surface: the alias and
             // the carrier are one canonical type. The public module-qualified
             // spellings a user writes (`Ui.Element`, the terminal `Screen` /
-            // `Lines` equivalents) alias identically: each name is a RESERVED
-            // builtin no user module can declare, so the qualifier cannot name a
-            // different type, and an unknown qualifier is already turned away by
-            // the qualifier gate above. The bare arity-0 form (`view : Element`)
+            // `Lines` equivalents) alias identically: the use resolved to the
+            // row above, so only a spelling bound to the row aliases, and a
+            // qualifier whose module does not export the name was already
+            // refused. The bare arity-0 form (`view : Element`)
             // is an alias too: its implicit message parameter arity-fills with
             // the `any` wildcard right here, so it canonicalises to the same
             // `View <engine> any` carrier the arity-1 form yields — never a
@@ -7069,10 +7757,10 @@ fn canonicalise_type(
             // combinators produce. Only the arity-0 and arity-1 forms are
             // aliases; a mis-arity use falls through.
             if args.len() <= 1
-                && let Some(engine_name) = match ctx.interner.resolve(name) {
-                    Some("Element") => Some("Web"),
-                    Some("Screen") => Some("Tui"),
-                    Some("Lines") => Some("Cli"),
+                && let Some(engine_name) = match tag {
+                    Some(BuiltinTag::UiElement) => Some("Web"),
+                    Some(BuiltinTag::Cells) => Some("Tui"),
+                    Some(BuiltinTag::CliLines) => Some("Cli"),
                     _ => None,
                 }
             {
@@ -7132,49 +7820,13 @@ fn canonicalise_type(
                     depth.saturating_add(1),
                 )?);
             }
-            // Resolve the reference once: an alias expands in place, a union
-            // yields its home, a builtin the empty home. A bare name goes
-            // through the one precedence ladder (`resolve_unqualified_type_name`).
-            // A kernel-module qualifier (`Http.HttpResponse`) reads that module's
-            // type exports, and a miss is IPE-N0005. A source-module qualifier
-            // (`Money.Price`) expands the module's alias through its synthetic
-            // key, and otherwise names a union of the module.
-            let target = if qualifier_str.is_empty() {
-                match resolve_unqualified_type_name(name, ctx, visited)? {
-                    TypeName::Alias(alias) => TypeTarget::Alias(name, alias),
-                    TypeName::Union(home) => TypeTarget::Union(UnionHome::of(home)?),
-                    TypeName::Builtin(builtin) => TypeTarget::Builtin(builtin),
-                    TypeName::Ambiguous { modules } => {
-                        return Err(ambiguous_import(name, ctx.ann_span, modules, ctx.interner)?);
-                    }
-                    TypeName::Missing => return Err(type_not_found(name, ctx)?),
-                }
-            } else if let Some(module) = kernel_qualifier_owner(*qualifier, ctx.env) {
-                // A kernel alias body is a closed builtin tree, so its
-                // expansion never meets the alias again: its use-site name is
-                // a sufficient cycle key.
-                match kernel_type_export(module, *qualifier, name, ctx)? {
-                    KernelTypeExport::Alias(exported) => {
-                        TypeTarget::Alias(name, ResolvedAlias::Imported(exported))
-                    }
-                    KernelTypeExport::Builtin(builtin) => TypeTarget::Builtin(*builtin),
-                }
-            } else if let Some(alias_key) =
-                alias_lookup_key(qualifier_str, name, ctx.qualified_aliases, ctx.interner)?
-                && !visited.contains(&alias_key)
-                && let Some(exported) = ctx.qualified_aliases.get(&alias_key)
-            {
-                TypeTarget::Alias(alias_key, ResolvedAlias::Imported(exported))
-            } else {
-                TypeTarget::Union(UnionHome::of(qualified_type_home(*qualifier, name, ctx)?)?)
-            };
-            let builtin = match target {
-                TypeTarget::Builtin(builtin) => Some(builtin),
+            let builtin = match &target {
+                TypeTarget::Builtin(bound) => Some(bound.row),
                 TypeTarget::Union(_) | TypeTarget::Alias(..) => None,
             };
             let home = match target {
                 TypeTarget::Union(home) => home.into_vec(),
-                TypeTarget::Builtin(builtin) => builtin_home(builtin),
+                TypeTarget::Builtin(bound) => bound.home,
                 // An alias not already mid-expansion (cycle) is expanded. Arity
                 // must match exactly — a type alias has to be fully applied.
                 TypeTarget::Alias(alias_key, alias) => {
@@ -7260,19 +7912,16 @@ fn canonicalise_type(
             // canonicalises to that same builtin, so the documented type is
             // nameable. The bare form arity-fills its message parameter exactly
             // as the DOM `Attribute` does.
-            if let Some(builtin) = ctx
-                .interner
-                .resolve(name)
-                .and_then(|n| terminal_attribute_builtin(&home, n, ctx.interner))
+            if let Some(terminal) =
+                builtin.and_then(|row| terminal_attribute_builtin(&home, row, ctx.interner))
                 && can_args.len() <= 1
             {
-                let name = ctx
-                    .interner
-                    .lookup(builtin)
-                    .ok_or_else(|| Diagnostic::CompilerBug {
+                let name = ctx.interner.lookup(terminal.row().name()).ok_or_else(|| {
+                    Diagnostic::CompilerBug {
                         where_: "ipe_canon::canonicalise_type::terminal_attribute",
                         detail: "a terminal attribute builtin name is not interned".into(),
-                    })?;
+                    }
+                })?;
                 let args = if can_args.is_empty() {
                     vec![canon::Type::Wildcard]
                 } else {
@@ -7317,7 +7966,7 @@ fn canonicalise_type(
             //
             // On passing both, the type resolves to a `Con` with the empty-home
             // sentinel and lowers to the opaque widget handle.
-            if ctx.interner.resolve(name) == Some("CustomElement") {
+            if tag == Some(BuiltinTag::CustomElement) {
                 for arg in &can_args {
                     if let Some(reason) = boundary_seal_rejection(arg, ctx.interner) {
                         return Err(Diagnostic::Name {
@@ -7396,8 +8045,7 @@ impl ArityGate {
 ///
 /// One rule for every non-alias head: a declared union takes its declared
 /// parameters (an over- or under-application has no emitted Rust spelling,
-/// E0107); `CustomElement` takes its down-state and up-event under any home;
-/// a builtin takes the [`TypeParams`] of the row the use resolved to, however
+/// E0107); a builtin takes the [`TypeParams`] of the row the use resolved to, however
 /// it was spelled (a mis-arity would reach the lowerer's catch-all, IPE-I0001,
 /// or an annotation no value can inhabit). `None` for the effect carriers
 /// (`Task`, `Cmd`, `Sub`), whose count inference checks (IPE-T0016). An alias
@@ -7411,9 +8059,6 @@ fn type_arity_gate(
     if let Some(params) = ctx.env.union_params.of(home, name) {
         return Some(ArityGate::Exactly(params));
     }
-    if ctx.interner.resolve(name) == Some("CustomElement") {
-        return Some(ArityGate::Exactly(2));
-    }
     match builtin?.row().params() {
         TypeParams::Exact(n) => Some(ArityGate::Exactly(usize::from(n))),
         TypeParams::OptionalMessage => Some(ArityGate::OptionalMessage),
@@ -7421,23 +8066,28 @@ fn type_arity_gate(
     }
 }
 
-/// The reserved builtin a terminal engine's `Attribute` resolves to:
+/// The reserved builtin a terminal engine's `Attribute` row resolves to:
 /// `Ipe.Ui.Tui.Attribute` (re-exposed by `Ipe.Ui.Cells`) is `TuiAttr`,
 /// `Ipe.Ui.Cli.Attribute` is `CliAttr`.
+///
+/// Keyed on the row witness (`BuiltinTag::UiAttribute`), so only a use bound
+/// to the `Attribute` row, never another type spelled `Attribute`, is a
+/// terminal attribute.
 fn terminal_attribute_builtin(
     home: &[Symbol],
-    name: &str,
+    row: BuiltinType,
     interner: &Interner,
-) -> Option<&'static str> {
-    if name != "Attribute" {
+) -> Option<BuiltinType> {
+    if row.row().tag() != Some(BuiltinTag::UiAttribute) {
         return None;
     }
     let segments: Vec<&str> = home.iter().filter_map(|s| interner.resolve(*s)).collect();
-    match segments.as_slice() {
-        ["Ipe", "Ui", "Tui" | "Cells"] => Some("TuiAttr"),
-        ["Ipe", "Ui", "Cli"] => Some("CliAttr"),
-        _ => None,
-    }
+    let terminal = match segments.as_slice() {
+        ["Ipe", "Ui", "Tui" | "Cells"] => "TuiAttr",
+        ["Ipe", "Ui", "Cli"] => "CliAttr",
+        _ => return None,
+    };
+    BuiltinType::of_bare_name(terminal)
 }
 
 /// Resolve a symbol to an owned name for a diagnostic payload.
@@ -7494,7 +8144,7 @@ fn canonicalise_foreign_call(
     args: &[src::Expr],
     span: Span,
     env: &Env,
-    interner: &mut Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<Option<canon::Expr_>> {
     if env.origin != ModuleOrigin::FfiInterface {
         return Ok(None);
@@ -7502,15 +8152,15 @@ fn canonicalise_foreign_call(
     let src::Expr_::VarQual(qualifier, member) = &callee.value else {
         return Ok(None);
     };
-    let ffi_sym = interner.intern("Ffi")?;
+    let ffi_sym = cx.interner.intern("Ffi")?;
     // The `asserted` spelling is matched by RESOLVE, not intern: interning a
     // symbol the module never spells would shift the deterministic interning
     // sequence (and with it, golden byte identity) for every pre-existing
     // FFI program. A module that does spell `Ffi.asserted` interned the word
     // at parse, so resolve finds it.
-    let binding_sym = interner.intern("binding")?;
+    let binding_sym = cx.interner.intern("binding")?;
     let member_is_binding = *member == binding_sym;
-    let asserted = interner.resolve(*member) == Some("asserted");
+    let asserted = cx.interner.resolve(*member) == Some("asserted");
     if *qualifier != ffi_sym || (!member_is_binding && !asserted) {
         return Ok(None);
     }
@@ -7538,10 +8188,10 @@ fn canonicalise_foreign_call(
     }
     let mut can_args = Vec::with_capacity(value_args.len());
     for a in value_args {
-        can_args.push(canonicalise_expr(a, env, interner)?);
+        can_args.push(canonicalise_expr(a, env, cx)?);
     }
     Ok(Some(canon::Expr_::ForeignCall {
-        ident: interner.intern(ident)?,
+        ident: cx.interner.intern(ident)?,
         args: can_args,
         asserted,
     }))
@@ -7570,7 +8220,7 @@ fn canonicalise_asserted_call(
     args: &[src::Expr],
     span: Span,
     env: &Env,
-    interner: &mut Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<Option<canon::Expr_>> {
     if env.origin != ModuleOrigin::User {
         return Ok(None);
@@ -7580,7 +8230,7 @@ fn canonicalise_asserted_call(
     // would shift the deterministic interning sequence (golden byte identity).
     // A module that does spell `Rust.Ffi.call` / `Rust.fn` interned the
     // symbols at parse.
-    let Some(which) = crate::asserted::classify_asserted_callee(callee, interner) else {
+    let Some(which) = crate::asserted::classify_asserted_callee(callee, cx.interner) else {
         return Ok(None);
     };
     let malformed = |detail: String| Diagnostic::Name {
@@ -7620,18 +8270,18 @@ fn canonicalise_asserted_call(
         crate::asserted::AssertedCallee::RustConst => path.const_def_name(),
         _ => path.def_name(),
     };
-    let def_sym = interner.intern(&def_name)?;
+    let def_sym = cx.interner.intern(&def_name)?;
     // The generated module is imported as `import Rust.Ffi` (unaliased), which
     // registers it under its LAST path segment like every dep import — so the
     // rewritten reference resolves through the `Ffi` qualifier even though the
     // surface spelling is the full `Rust.Ffi.call`.
-    let ffi_qualifier = interner.intern("Ffi")?;
+    let ffi_qualifier = cx.interner.intern("Ffi")?;
     let raw_path = path.as_str().to_owned();
     // `Ffi` must denote the generated module itself: a spelling another import
     // owns (`import App.Shim as Ffi`) would otherwise answer the forwarder's
     // name with an ordinary definition of that module. Read by `lookup`, never
     // `intern`, for the interning-sequence reason above.
-    let rust = interner.lookup("Rust");
+    let rust = cx.interner.lookup("Rust");
     let foreign_ffi = env
         .import_scope
         .qualifier_owner
@@ -7649,7 +8299,7 @@ fn canonicalise_asserted_call(
              module, which no other import may spell `Ffi`"
         )));
     }
-    let target = resolve_qual_var(ffi_qualifier, def_sym, span, env, interner).map_err(|_| {
+    let target = resolve_qual_var(ffi_qualifier, def_sym, span, env, cx).map_err(|_| {
         malformed(format!(
             "no asserted binding exists for `{raw_path}` — a native binding needs \
              `import Rust.Ffi` (unaliased), the target crate installed via `ipe rust \
@@ -7670,7 +8320,7 @@ fn canonicalise_asserted_call(
     }
     let mut can_args = Vec::with_capacity(value_args.len());
     for a in value_args {
-        can_args.push(canonicalise_expr(a, env, interner)?);
+        can_args.push(canonicalise_expr(a, env, cx)?);
     }
     Ok(Some(canon::Expr_::Call(
         Box::new(ipe_diagnostics::Located::new(callee.span, target)),
@@ -7755,7 +8405,6 @@ fn annotation_head_name<'a>(ann: &src::TypeAnnotation, interner: &'a Interner) -
 fn detect_custom_element_constructor(
     val: &src::Value,
     env: &Env,
-    qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
     qualified_aliases: &QualifiedAliases,
     interner: &Interner,
 ) -> DResult<Option<canon::Def>> {
@@ -7823,7 +8472,6 @@ fn detect_custom_element_constructor(
     let mut visited = Vec::new();
     let ctx = TypeCtx {
         env,
-        qualifier_paths,
         qualified_aliases,
         interner,
         ann_span: ann.span,
@@ -8130,7 +8778,7 @@ const fn name_zero() -> Symbol {
 // Faithful Rust port of `Ipe.Canonicalise.Expression.desugarMultiline` /
 // `splitInterpolation` / `chunkToExpr` / `resolveInterpolationRef`.
 //
-// Entry point: `desugar_multiline(raw, span, env, interner)` — called from
+// Entry point: `desugar_multiline(raw, span, env, cx)` — called from
 // `canonicalise_expr` when it sees `src::Expr_::MultilineStr`.
 //
 // The raw string is split into alternating `Lit` / `Interp` chunks, each
@@ -8222,7 +8870,7 @@ fn chunk_to_expr(
     chunk: Chunk,
     span: Span,
     env: &Env,
-    interner: &mut Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<canon::Expr> {
     match chunk {
         Chunk::Lit(s) => Ok(Located::new(span, canon::Expr_::Str(s))),
@@ -8230,9 +8878,9 @@ fn chunk_to_expr(
             // Trim leading/trailing whitespace, matching the reference compiler
             // `dropWhile (== ' ') (reverse (dropWhile …))`.
             let trimmed = body.trim();
-            let resolved = resolve_interp_ref(trimmed, span, env, interner)?;
-            let mod_sym = interner.intern("_internal_")?;
-            let fn_sym = interner.intern("interpolate")?;
+            let resolved = resolve_interp_ref(trimmed, span, env, cx)?;
+            let mod_sym = cx.interner.intern("_internal_")?;
+            let fn_sym = cx.interner.intern("interpolate")?;
             let stringify = Located::new(
                 span,
                 canon::Expr_::VarKernel {
@@ -8264,22 +8912,22 @@ fn resolve_interp_ref(
     s: &str,
     span: Span,
     env: &Env,
-    interner: &mut Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<canon::Expr> {
     // Check for `func arg` (a single space separates them).
     if let Some(space_pos) = s.find(' ') {
         let func_str = &s[..space_pos];
         let arg_str = s[space_pos + 1..].trim();
         if !func_str.is_empty() && !arg_str.is_empty() {
-            let func_expr = resolve_interp_ref(func_str, span, env, interner)?;
-            let arg_expr = resolve_interp_ref(arg_str, span, env, interner)?;
+            let func_expr = resolve_interp_ref(func_str, span, env, cx)?;
+            let arg_expr = resolve_interp_ref(arg_str, span, env, cx)?;
             return Ok(Located::new(
                 span,
                 canon::Expr_::Call(Box::new(func_expr), vec![arg_expr]),
             ));
         }
     }
-    resolve_simple_interp_ref(s, span, env, interner)
+    resolve_simple_interp_ref(s, span, env, cx)
 }
 
 /// Resolve a qualified interpolation reference `Q.member` (`Q` may be dotted).
@@ -8298,7 +8946,7 @@ fn resolve_interp_qualified(
     s: &str,
     span: Span,
     env: &Env,
-    interner: &mut Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<canon::Expr> {
     let segments: Vec<&str> = s.split('.').collect();
     let qualifier_len = segments
@@ -8321,11 +8969,11 @@ fn resolve_interp_qualified(
             canon::Expr_::Str(format!("{{{{{s}}}}}")),
         ));
     }
-    let qualifier = interner.intern(&qualifier_segments.join("."))?;
-    let name = interner.intern(member)?;
+    let qualifier = cx.interner.intern(&qualifier_segments.join("."))?;
+    let name = cx.interner.intern(member)?;
     Ok(Located::new(
         span,
-        resolve_qual_var(qualifier, name, span, env, interner)?,
+        resolve_qual_var(qualifier, name, span, env, cx)?,
     ))
 }
 
@@ -8335,7 +8983,7 @@ fn resolve_simple_interp_ref(
     s: &str,
     span: Span,
     env: &Env,
-    interner: &mut Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<canon::Expr> {
     // Numeric literal. A body that begins with an ASCII digit can never be an
     // identifier (Ipê identifiers never start with a digit), so it is an
@@ -8382,15 +9030,15 @@ fn resolve_simple_interp_ref(
             ));
         }
         if first.starts_with(char::is_uppercase) {
-            return resolve_interp_qualified(s, span, env, interner);
+            return resolve_interp_qualified(s, span, env, cx);
         }
         // Lowercase `record.field` → `Access(record, field)`, the record read
         // through `resolve_var` exactly as a bare name is: a local stays
         // `VarLocal`, a top-level value is `VarTopLevel`, an unknown name is
         // IPE-N0001.
-        let rec_sym = interner.intern(first)?;
-        let field_sym = interner.intern(rest)?;
-        let record = resolve_var(rec_sym, span, env, interner)?;
+        let rec_sym = cx.interner.intern(first)?;
+        let field_sym = cx.interner.intern(rest)?;
+        let record = resolve_var(rec_sym, span, env, cx)?;
         return Ok(Located::new(
             span,
             canon::Expr_::Access(Box::new(Located::new(span, record)), field_sym),
@@ -8404,8 +9052,8 @@ fn resolve_simple_interp_ref(
     // interpolation. Emitting `VarLocal` for an unbound/unknown name would
     // leak it past canonicalisation and fire the `constrain` unbound-local
     // ICE, so every name this path emits as `VarLocal` is provably bound.
-    let sym = interner.intern(s)?;
-    Ok(Located::new(span, resolve_var(sym, span, env, interner)?))
+    let sym = cx.interner.intern(s)?;
+    Ok(Located::new(span, resolve_var(sym, span, env, cx)?))
 }
 
 /// Desugar a triple-quoted string into a balanced `++` tree of its chunks.
@@ -8416,7 +9064,7 @@ fn desugar_multiline(
     anchor: u32,
     span: Span,
     env: &Env,
-    interner: &mut Interner,
+    cx: &mut ResolveCx<'_>,
 ) -> DResult<canon::Expr_> {
     // Strip the source indentation margin before splitting, so the runtime
     // value drops the leading whitespace the author used to lay the block out.
@@ -8427,17 +9075,25 @@ fn desugar_multiline(
     let stripped = src::strip_anchor_margin(raw, anchor);
     let chunks = split_interpolation(&stripped);
     // Build one canonical expression per chunk.
+    // An interpolated name has no span of its own: every chunk carries the
+    // whole string's span, so a record there would answer the name at every
+    // offset of the string. Its occurrences resolve into a sink that is dropped.
+    let mut unlocated = NameSink::new();
+    let mut chunk_cx = ResolveCx {
+        interner: &mut *cx.interner,
+        names: &mut unlocated,
+    };
     let mut parts: Vec<canon::Expr> = Vec::with_capacity(chunks.len());
     for chunk in chunks {
-        parts.push(chunk_to_expr(chunk, span, env, interner)?);
+        parts.push(chunk_to_expr(chunk, span, env, &mut chunk_cx)?);
     }
     match parts.len() {
         0 => Ok(canon::Expr_::Str(String::new())),
         1 => Ok(parts.remove(0).value),
         _ => {
-            let op_sym = interner.intern("++")?;
-            let home_sym = interner.intern("Basics")?;
-            let func_sym = interner.intern("append")?;
+            let op_sym = cx.interner.intern("++")?;
+            let home_sym = cx.interner.intern("Basics")?;
+            let func_sym = cx.interner.intern("append")?;
             Ok(balanced_append(parts, op_sym, home_sym, func_sym)
                 .map_or_else(|| canon::Expr_::Str(String::new()), |joined| joined.value))
         }
@@ -8881,10 +9537,11 @@ mod suggestion_ranking_tests {
 mod exposed_ctor_subset_tests {
     //! `exposing (Type(subset))` opens ONLY the named constructors unqualified.
     //! Both constructor binders ([`bind_dep_union`], the user-dep path, and
-    //! [`bind_stdlib_kernel_import`], the built-in path) route their
-    //! selection through [`exposed_ctor_filter`], so a withheld sibling stays
-    //! out of unqualified scope by construction — it remains reachable only
-    //! through its qualifier.
+    //! [`bind_stdlib_kernel_import`], the built-in path) take the selection
+    //! [`judge_ctor_clause`] builds, so a withheld sibling stays out of
+    //! unqualified scope by construction — it remains reachable only through its
+    //! qualifier — and a clause naming a constructor the producer does not
+    //! expose is refused at the import (IPE-N0022).
 
     use super::*;
 
@@ -8937,12 +9594,22 @@ mod exposed_ctor_subset_tests {
         assert!(!filter.admits(a.name), "opaque Type opens no constructor");
     }
 
-    /// Canonicalise a producer then an importer against it, returning the
-    /// importer's result. The producer exposes BOTH constructors so `dep.ctors`
-    /// carries A and B; the importer's `exposing` clause is the sole selector.
+    /// The producer of the acceptance pins: it exposes BOTH constructors, so
+    /// `dep.ctors` carries A and B and the importer's clause is the sole selector.
+    const OPEN_PRODUCER: &str = "module Dep exposing (T(..))\n\ntype T = A | B\n";
+
+    /// Canonicalise [`OPEN_PRODUCER`] then an importer against it.
     fn import_against_producer(importer_src: &str) -> (DResult<canon::Module>, Interner) {
+        import_against(OPEN_PRODUCER, importer_src)
+    }
+
+    /// Canonicalise `producer_src` as `Dep`, then `importer_src` against it,
+    /// returning the importer's result.
+    fn import_against(
+        producer_src: &str,
+        importer_src: &str,
+    ) -> (DResult<canon::Module>, Interner) {
         let mut i = Interner::new();
-        let producer_src = "module Dep exposing (T(..))\n\ntype T = A | B\n";
         let dep_path = vec![sym(&mut i, "Dep")];
         let main_path = vec![sym(&mut i, "Main")];
         let mut deps: BTreeMap<Vec<Symbol>, crate::ModuleExports> = BTreeMap::new();
@@ -9040,13 +9707,349 @@ mod exposed_ctor_subset_tests {
             "qualified Dep.A stays reachable under opaque T"
         );
     }
+
+    /// An importer `Main` with `import <import_line>` and `x = <body>`.
+    fn importer(import_line: &str, body: &str) -> String {
+        format!("module Main exposing (x)\n\nimport {import_line}\n\nx =\n    {body}\n")
+    }
+
+    /// The span of `clause`'s first occurrence in `src`.
+    fn span_of(src: &str, clause: &str) -> Span {
+        let lo = src.find(clause).expect("clause occurs in the source");
+        Span {
+            lo: u32::try_from(lo).expect("small source"),
+            hi: u32::try_from(lo + clause.len()).expect("small source"),
+        }
+    }
+
+    /// The refusal `result` carries when it is a `CtorNotExposed`: its span,
+    /// type name and reason.
+    fn ctor_refusal(result: &DResult<canon::Module>) -> Option<(Span, &str, &CtorWithheld)> {
+        match result {
+            Err(Diagnostic::Name {
+                span,
+                msg: NameError::CtorNotExposed { type_name, why, .. },
+            }) => Some((*span, &**type_name, &**why)),
+            _ => None,
+        }
+    }
+
+    /// The unknown constructor a refusal names, when the reason is `Unknown`.
+    fn unknown_ctor(result: &DResult<canon::Module>) -> Option<&str> {
+        match ctor_refusal(result) {
+            Some((_, _, CtorWithheld::Unknown { ctor, .. })) => Some(&**ctor),
+            _ => None,
+        }
+    }
+
+    /// A producer exporting `T` without its constructors, and `make` to build one.
+    const ABSTRACT_PRODUCER: &str =
+        "module Dep exposing (T, make)\n\ntype T = A | B\n\nmake : T\nmake =\n    A\n";
+
+    /// R1: a constructor of a type exported without constructors is refused at
+    /// the import item, never dropped into a later N0001 at the use.
+    #[test]
+    fn subset_of_abstract_type_is_refused_at_the_item() {
+        let src = importer("Dep exposing (T(A))", "A");
+        let (result, _) = import_against(ABSTRACT_PRODUCER, &src);
+        let refusal = ctor_refusal(&result);
+        assert!(
+            matches!(refusal, Some((_, "T", CtorWithheld::Abstract))),
+            "{result:?}"
+        );
+        assert_eq!(
+            refusal.map(|r| r.0.lo),
+            Some(span_of(&src, "T(A)").lo),
+            "the refusal sits on the import item"
+        );
+    }
+
+    /// R1b: the `Abstract` remedy — import the type alone and build values
+    /// through the functions the module exposes — clears the refusal.
+    #[test]
+    fn abstract_remedy_import_type_alone_is_accepted() {
+        let (result, _) = import_against(
+            ABSTRACT_PRODUCER,
+            &importer("Dep exposing (T, make)", "make"),
+        );
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// R2: `T(..)` over an abstract type is refused.
+    #[test]
+    fn open_clause_on_abstract_type_is_refused() {
+        let (result, _) = import_against(ABSTRACT_PRODUCER, &importer("Dep exposing (T(..))", "0"));
+        assert!(
+            matches!(
+                ctor_refusal(&result),
+                Some((_, "T", CtorWithheld::Abstract))
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// R3: a constructor the type does not declare is refused by name.
+    #[test]
+    fn undeclared_ctor_is_refused() {
+        let (result, _) = import_against_producer(&importer("Dep exposing (T(C))", "0"));
+        assert_eq!(unknown_ctor(&result), Some("C"), "{result:?}");
+    }
+
+    /// R4: a declared constructor the producer keeps private is refused.
+    #[test]
+    fn private_sibling_ctor_is_refused() {
+        let producer = "module Dep exposing (T(A))\n\ntype T = A | B\n";
+        let (result, _) = import_against(producer, &importer("Dep exposing (T(B))", "0"));
+        assert_eq!(unknown_ctor(&result), Some("B"), "{result:?}");
+    }
+
+    /// R5: a lowercase name in a constructor clause is no constructor.
+    #[test]
+    fn lowercase_ctor_name_is_refused() {
+        let (result, _) = import_against_producer(&importer("Dep exposing (T(a))", "0"));
+        assert_eq!(unknown_ctor(&result), Some("a"), "{result:?}");
+    }
+
+    /// R6: one unknown constructor refuses the whole item, before `A` binds.
+    #[test]
+    fn one_unknown_ctor_refuses_the_whole_item() {
+        let (result, _) = import_against_producer(&importer("Dep exposing (T(A, C))", "A"));
+        assert_eq!(unknown_ctor(&result), Some("C"), "{result:?}");
+    }
+
+    /// R7: an alias has no constructors to import.
+    #[test]
+    fn open_clause_on_alias_is_refused() {
+        let producer = "module Dep exposing (R)\n\ntype alias R =\n    { x : Int }\n";
+        let (result, _) = import_against(producer, &importer("Dep exposing (R(..))", "0"));
+        assert!(
+            matches!(ctor_refusal(&result), Some((_, "R", CtorWithheld::Alias))),
+            "{result:?}"
+        );
+    }
+
+    /// Canonicalise `importer_src` against a `Dep` that re-exports the builtin
+    /// `row` as `name`.
+    fn import_against_builtin(
+        name: &str,
+        row: Option<BuiltinType>,
+        importer_src: &str,
+    ) -> DResult<canon::Module> {
+        let mut i = Interner::new();
+        let row = row.expect("the builtin row exists");
+        let dep_path = vec![sym(&mut i, "Dep")];
+        let exports = crate::ModuleExports {
+            path: dep_path.clone(),
+            types: BTreeMap::from([(
+                sym(&mut i, name),
+                crate::ExportedType::Builtin {
+                    home: dep_path.clone(),
+                    row,
+                },
+            )]),
+            ..crate::ModuleExports::default()
+        };
+        let deps = BTreeMap::from([(dep_path, exports)]);
+        let main_path = vec![sym(&mut i, "Main")];
+        let parsed = ipe_parse::parse_module(importer_src, &mut i).expect("importer parses");
+        canonicalise_module(&parsed, &main_path, &deps, &mut i).map(|(module, _)| module)
+    }
+
+    /// R8: a re-exported builtin union offers exactly its own constructors.
+    #[test]
+    fn reexported_builtin_union_judges_its_ctors() {
+        let maybe = BuiltinType::of_bare_name("Maybe");
+        let refused =
+            import_against_builtin("Maybe", maybe, &importer("Dep exposing (Maybe(Some))", "0"));
+        assert_eq!(unknown_ctor(&refused), Some("Some"), "{refused:?}");
+        let accepted = import_against_builtin(
+            "Maybe",
+            maybe,
+            &importer("Dep exposing (Maybe(Just))", "Just 1"),
+        );
+        assert!(accepted.is_ok(), "{accepted:?}");
+    }
+
+    /// R9: a re-exported builtin carrier has no constructors to import.
+    #[test]
+    fn reexported_builtin_carrier_is_opaque() {
+        let result = import_against_builtin(
+            "Dict",
+            BuiltinType::of_bare_name("Dict"),
+            &importer("Dep exposing (Dict(..))", "0"),
+        );
+        assert!(
+            matches!(
+                ctor_refusal(&result),
+                Some((_, "Dict", CtorWithheld::Opaque))
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// R11: the `Ipe.Db.Store` `Order` row is opaque, never the ambient `Order`
+    /// union its name shares.
+    #[test]
+    fn homed_order_row_is_opaque_not_the_ambient_union() {
+        let result = import_against_builtin(
+            "Order",
+            BuiltinType::of_head(&["Ipe", "Db", "Store"], "Order"),
+            &importer("Dep exposing (Order(..))", "0"),
+        );
+        assert!(
+            matches!(
+                ctor_refusal(&result),
+                Some((_, "Order", CtorWithheld::Opaque))
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// A re-exported union with a qualified home binds the constructors pooled
+    /// under that home, and judges a clause against them.
+    #[test]
+    fn reexported_homed_union_binds_its_pooled_ctors() {
+        let method = BuiltinType::of_bare_name("HttpMethod");
+        let accepted = import_against_builtin(
+            "HttpMethod",
+            method,
+            &importer("Dep exposing (HttpMethod(Get))", "Get"),
+        );
+        assert!(accepted.is_ok(), "{accepted:?}");
+        let withheld = import_against_builtin(
+            "HttpMethod",
+            method,
+            &importer("Dep exposing (HttpMethod(Get))", "Post"),
+        );
+        assert!(
+            withheld.is_err(),
+            "a withheld sibling stays unbound: {withheld:?}"
+        );
+        let refused = import_against_builtin(
+            "HttpMethod",
+            method,
+            &importer("Dep exposing (HttpMethod(Bogus))", "0"),
+        );
+        assert_eq!(unknown_ctor(&refused), Some("Bogus"), "{refused:?}");
+    }
+
+    /// Canonicalise `importer_src` with no compiled dependency, so a stdlib
+    /// import goes through the kernel path.
+    fn kernel_import(importer_src: &str) -> DResult<canon::Module> {
+        let mut i = Interner::new();
+        let main_path = vec![sym(&mut i, "Main")];
+        let parsed = ipe_parse::parse_module(importer_src, &mut i).expect("importer parses");
+        canonicalise_module(&parsed, &main_path, &BTreeMap::new(), &mut i).map(|(module, _)| module)
+    }
+
+    /// R10: the kernel path judges a clause against the union's constructors.
+    #[test]
+    fn kernel_union_judges_its_ctors() {
+        let refused = kernel_import(&importer("Ipe.Http exposing (HttpMethod(Bogus))", "0"));
+        assert_eq!(unknown_ctor(&refused), Some("Bogus"), "{refused:?}");
+        let accepted = kernel_import(&importer("Ipe.Http exposing (HttpMethod(Get))", "Get"));
+        assert!(accepted.is_ok(), "{accepted:?}");
+    }
+
+    /// R13: a kernel type without constructors is refused by its kind.
+    #[test]
+    fn kernel_types_without_ctors_are_refused_by_kind() {
+        let alias = kernel_import(&importer("Ipe.Http exposing (HttpResponse(..))", "0"));
+        assert!(
+            matches!(
+                ctor_refusal(&alias),
+                Some((_, "HttpResponse", CtorWithheld::Alias))
+            ),
+            "{alias:?}"
+        );
+        let carrier = kernel_import(&importer("Ipe.Json.Decode exposing (Decoder(..))", "0"));
+        assert!(
+            matches!(
+                ctor_refusal(&carrier),
+                Some((_, "Decoder", CtorWithheld::Opaque))
+            ),
+            "{carrier:?}"
+        );
+    }
+
+    /// A union a compiled-source stdlib module declares is judged by its
+    /// source offer, never refused by the kernel path as an opaque carrier.
+    #[test]
+    fn source_owned_stdlib_unions_are_not_judged_by_the_kernel_path() {
+        for clause in [
+            "Ipe.Db.Store exposing (Cond(..), Order(..))",
+            "Ipe.Codec exposing (Codec(..))",
+        ] {
+            let result = kernel_import(&importer(clause, "0"));
+            assert!(ctor_refusal(&result).is_none(), "{clause}: {result:?}");
+            assert!(
+                !matches!(
+                    &result,
+                    Err(Diagnostic::Name {
+                        msg: NameError::NameNotExposed { .. },
+                        ..
+                    })
+                ),
+                "{clause}: {result:?}"
+            );
+        }
+    }
+
+    /// R12: every (ask x offer) cell of the judge.
+    #[test]
+    fn judge_table_covers_every_cell() {
+        let mut i = Interner::new();
+        let a = sym(&mut i, "A");
+        let b = sym(&mut i, "B");
+        let c = sym(&mut i, "C");
+        let offered = BTreeSet::from([a, b]);
+        let offers = [
+            CtorOffer::Ctors(offered.clone()),
+            CtorOffer::Abstract,
+            CtorOffer::Alias,
+            CtorOffer::Opaque,
+        ];
+        for offer in &offers {
+            let judged = judge_ctor_clause(&src::Privacy::Private, offer);
+            assert!(
+                judged.is_ok_and(|j| !j.admits(a) && !j.admits(b)),
+                "`T` alone passes and opens nothing"
+            );
+        }
+        let [ctors, abstract_, alias, opaque] = &offers;
+        let all = judge_ctor_clause(&src::Privacy::Public, ctors);
+        assert!(all.is_ok_and(|j| j.admits(a) && j.admits(b)));
+        let subset = judge_ctor_clause(&src::Privacy::PublicCtors(vec![a]), ctors);
+        assert!(subset.is_ok_and(|j| j.admits(a) && !j.admits(b)));
+        assert_eq!(
+            judge_ctor_clause(&src::Privacy::PublicCtors(vec![c, a]), ctors).err(),
+            Some(Withheld::Unknown {
+                ctor: c,
+                offered: &offered
+            })
+        );
+        for ask in [src::Privacy::Public, src::Privacy::PublicCtors(vec![a])] {
+            assert_eq!(
+                judge_ctor_clause(&ask, abstract_).err(),
+                Some(Withheld::Abstract)
+            );
+            assert_eq!(judge_ctor_clause(&ask, alias).err(), Some(Withheld::Alias));
+            assert_eq!(
+                judge_ctor_clause(&ask, opaque).err(),
+                Some(Withheld::Opaque)
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod seal_container_tests {
-    use ipe_kernels::{BUILTIN_TYPES, KernelHome, SealClass};
+    use ipe_kernels::{BUILTIN_TYPES, BuiltinType, KernelHome, SealClass};
 
-    use super::builtin_empty_home_arity;
+    /// The exact type-argument count of the empty-home row spelled `name`.
+    fn gate_arity(name: &str) -> Option<u8> {
+        BuiltinType::of_bare_name(name).and_then(|row| row.row().fixed_arity())
+    }
 
     /// Every value container the seal recurses into has a gate arity.
     #[test]
@@ -9059,7 +10062,7 @@ mod seal_container_tests {
         for row in containers {
             let name = row.name();
             assert!(
-                builtin_empty_home_arity(Some(name)).is_some(),
+                gate_arity(name).is_some(),
                 "`{name}` is a value container with no gate arity"
             );
             count += 1;
@@ -9071,7 +10074,7 @@ mod seal_container_tests {
     /// container the seal recurses into.
     #[test]
     fn connection_excluded_from_seal_value_containers() {
-        assert_eq!(builtin_empty_home_arity(Some("Connection")), Some(1));
+        assert_eq!(gate_arity("Connection"), Some(1));
         let connection = BUILTIN_TYPES
             .iter()
             .find(|row| row.home() == KernelHome::Builtin && row.name() == "Connection");
@@ -9414,6 +10417,7 @@ mod rust_ffi_auto_inject_tests {
             types: BTreeMap::default(),
             ctors: BTreeMap::default(),
             aliases: BTreeMap::default(),
+            private_types: std::collections::BTreeSet::default(),
             kernel_aliases: BTreeMap::default(),
         }
     }
@@ -9853,12 +10857,12 @@ mod html_qualifier_type_home_tests {
         let mut i = Interner::new();
         let ui_path = vec![sym(&mut i, "Ipe"), sym(&mut i, "Ui")];
         let attribute = sym(&mut i, "Attribute");
-        let home = reexported_builtin_type_home("Attribute", &ui_path, &i);
+        let row = BuiltinType::of_bare_name("Attribute").expect("a bare row");
+        let home = reexported_builtin_type_home("Attribute", row, &ui_path, &i);
         assert!(
             home.is_empty(),
             "the Ui `Attribute` re-export is the empty home"
         );
-        let row = BuiltinType::of_bare_name("Attribute").expect("a bare row");
         let types = BTreeMap::from([(attribute, crate::ExportedType::Builtin { home, row })]);
         let exports = crate::ModuleExports {
             path: ui_path.clone(),
@@ -9920,6 +10924,311 @@ mod html_qualifier_type_home_tests {
                 applied.map(|_| ())
             );
         }
+    }
+
+    /// Canonicalise an importer against a `Dep` module that re-exports the
+    /// builtin `Dict` at the home the production producer gives it (`Dep`'s
+    /// own path) and declares nothing else.
+    fn import_against_dict_dep(importer_src: &str) -> DResult<(canon::Module, Interner)> {
+        let mut i = Interner::new();
+        let dep_path = vec![sym(&mut i, "Dep")];
+        let dict = sym(&mut i, "Dict");
+        let row = BuiltinType::of_bare_name("Dict").expect("a bare row");
+        let home = reexported_builtin_type_home("Dict", row, &dep_path, &i);
+        assert_eq!(home, dep_path, "a plain re-export keeps its module's home");
+        let types = BTreeMap::from([(dict, crate::ExportedType::Builtin { home, row })]);
+        let exports = crate::ModuleExports {
+            path: dep_path.clone(),
+            types,
+            ..crate::ModuleExports::default()
+        };
+        let deps = BTreeMap::from([(dep_path, exports)]);
+        let Ok(parsed_main) = ipe_parse::parse_module(importer_src, &mut i) else {
+            panic!("importer parse failed");
+        };
+        let main_path = vec![sym(&mut i, "Main")];
+        let (module, _) = canonicalise_module(&parsed_main, &main_path, &deps, &mut i)?;
+        Ok((module, i))
+    }
+
+    /// An importer whose `x` is annotated `ty -> Int` under `import_clause`.
+    fn annotated_importer(import_clause: &str, ty: &str) -> String {
+        format!(
+            "module Main exposing (x)\n\nimport {import_clause}\n\nx : {ty} -> Int\nx _ =\n    0\n"
+        )
+    }
+
+    /// A builtin re-exported at a module home binds as its row under every
+    /// spelling: exposed and qualified uses meet the row's arity gate, and a
+    /// legal use keeps the export's home.
+    #[test]
+    fn a_module_home_builtin_reexport_binds_as_its_row() {
+        for (clause, head) in [("Dep exposing (Dict)", "Dict"), ("Dep as D", "D.Dict")] {
+            let short =
+                import_against_dict_dep(&annotated_importer(clause, &format!("{head} Int")));
+            assert!(
+                matches!(
+                    &short,
+                    Err(Diagnostic::Name {
+                        msg: NameError::TypeArity {
+                            expected: 2,
+                            found: 1,
+                            ..
+                        },
+                        ..
+                    })
+                ),
+                "{head} Int: {:?}",
+                short.map(|_| ())
+            );
+            let legal =
+                import_against_dict_dep(&annotated_importer(clause, &format!("{head} Int Int")));
+            let homes: Option<Vec<Option<String>>> = legal.ok().and_then(|(module, i)| {
+                module
+                    .defs
+                    .iter()
+                    .find(|d| i.resolve(d.name().value) == Some("x"))
+                    .and_then(|d| match d {
+                        canon::Def::Typed {
+                            ty: canon::Type::Lambda(arg, _),
+                            ..
+                        } => match &**arg {
+                            canon::Type::Con { home, .. } => Some(
+                                home.iter()
+                                    .map(|s| i.resolve(*s).map(str::to_owned))
+                                    .collect(),
+                            ),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+            });
+            assert_eq!(homes, Some(vec![Some("Dep".to_owned())]), "{head} Int Int");
+        }
+    }
+
+    /// A reserved builtin name the qualifier's module does not export is
+    /// IPE-N0005, never a type minted at the qualifier's home.
+    #[test]
+    fn a_reserved_name_the_qualifier_does_not_export_is_no_such_member() {
+        for ty in ["D.Path", "D.Element Int", "D.Screen Int"] {
+            let refused = import_against_dict_dep(&annotated_importer("Dep as D", ty));
+            assert!(
+                matches!(
+                    &refused,
+                    Err(Diagnostic::Name {
+                        msg: NameError::NoSuchMember { .. },
+                        ..
+                    })
+                ),
+                "{ty}: {:?}",
+                refused.map(|_| ())
+            );
+        }
+    }
+
+    /// The outcome a qualified type use reaches against a canonicalised `Dep`.
+    #[derive(Debug, PartialEq, Eq)]
+    enum QualifiedOutcome {
+        Resolved,
+        /// IPE-N0022, naming the module it reports.
+        NotExposed(String),
+        /// IPE-N0005, naming the module it reports.
+        NoSuchMember(String),
+        Other,
+        /// Building the dependency failed; the failure's rendering.
+        Setup(String),
+    }
+
+    /// Canonicalise `Dep` from source, then an importer annotating `x` with
+    /// `ty` under `import Dep as D`; returns `Dep`'s private type names and the
+    /// importer's outcome.
+    fn qualified_use_against_dep(ty: &str) -> (Vec<String>, QualifiedOutcome) {
+        let dep_src = "module Dep exposing (Box, Count, box)\n\n\
+                       type Box = Box Int\n\n\
+                       type Hidden = Hidden Int\n\n\
+                       type alias Count = Int\n\n\
+                       type alias Tally = Int\n\n\
+                       box : Box\nbox =\n    Box 1\n";
+        let mut i = Interner::new();
+        let dep_path = vec![sym(&mut i, "Dep")];
+        let parsed_dep = match ipe_parse::parse_module(dep_src, &mut i) {
+            Ok(parsed) => parsed,
+            Err(e) => return (Vec::new(), QualifiedOutcome::Setup(format!("{e:?}"))),
+        };
+        let exports = match canonicalise_module(&parsed_dep, &dep_path, &BTreeMap::new(), &mut i) {
+            Ok((_, exports)) => exports,
+            Err(e) => return (Vec::new(), QualifiedOutcome::Setup(format!("{e:?}"))),
+        };
+        let mut private: Vec<String> = exports
+            .private_types
+            .iter()
+            .filter_map(|name| i.resolve(*name).map(str::to_owned))
+            .collect();
+        private.sort();
+        let deps = BTreeMap::from([(dep_path, exports)]);
+        let Ok(parsed_main) = ipe_parse::parse_module(&annotated_importer("Dep as D", ty), &mut i)
+        else {
+            return (private, QualifiedOutcome::Other);
+        };
+        let main_path = vec![sym(&mut i, "Main")];
+        let outcome = match canonicalise_module(&parsed_main, &main_path, &deps, &mut i) {
+            Ok(_) => QualifiedOutcome::Resolved,
+            Err(Diagnostic::Name {
+                msg: NameError::NameNotExposed { module, .. },
+                ..
+            }) => QualifiedOutcome::NotExposed(module.into()),
+            Err(Diagnostic::Name {
+                msg: NameError::NoSuchMember { module, .. },
+                ..
+            }) => QualifiedOutcome::NoSuchMember(module.into()),
+            Err(_) => QualifiedOutcome::Other,
+        };
+        (private, outcome)
+    }
+
+    /// A qualified type resolves only through its dependency's export table:
+    /// a declared union or alias the dependency does not expose is IPE-N0022,
+    /// and any other unexported name, a non-reserved builtin row name included,
+    /// is IPE-N0005. Neither is minted at the qualifier's home. Both name the
+    /// dependency's module (`Dep`), whose `exposing` list decides, never the
+    /// importer's alias (`D`).
+    #[test]
+    fn a_qualified_name_the_dependency_does_not_export_is_refused() {
+        let not_exposed = || QualifiedOutcome::NotExposed("Dep".to_owned());
+        let no_such_member = || QualifiedOutcome::NoSuchMember("Dep".to_owned());
+        for (ty, expected) in [
+            ("D.Box", QualifiedOutcome::Resolved),
+            ("D.Count", QualifiedOutcome::Resolved),
+            ("D.Hidden", not_exposed()),
+            ("D.Tally", not_exposed()),
+            ("D.Nope", no_such_member()),
+            ("D.Value", no_such_member()),
+            ("D.Order", no_such_member()),
+        ] {
+            let (private, outcome) = qualified_use_against_dep(ty);
+            assert_eq!(outcome, expected, "{ty}");
+            assert_eq!(private, ["Hidden", "Tally"], "{ty}: private types");
+        }
+    }
+
+    /// A union a `*.Html.*` source module declares under the name of a
+    /// non-reserved builtin row (`type Order`) keeps its module's home when
+    /// spelled through the module's qualifier: only a builtin row takes the
+    /// `["Html"]` carrier home, never a declared union.
+    #[test]
+    fn an_html_family_module_union_named_like_a_row_keeps_its_home() {
+        let mut i = Interner::new();
+        let dep_path = vec![
+            sym(&mut i, "App"),
+            sym(&mut i, "Html"),
+            sym(&mut i, "Widgets"),
+        ];
+        let order = sym(&mut i, "Order");
+        let types = BTreeMap::from([(
+            order,
+            crate::ExportedType::Union {
+                home: dep_path.clone(),
+                params: 0,
+            },
+        )]);
+        let exports = crate::ModuleExports {
+            path: dep_path.clone(),
+            types,
+            ..crate::ModuleExports::default()
+        };
+        let deps = BTreeMap::from([(dep_path, exports)]);
+        let src = "module Main exposing (x)\n\nimport App.Html.Widgets as W\n\n\
+                   x : W.Order\nx =\n    x\n";
+        let Ok(parsed_main) = ipe_parse::parse_module(src, &mut i) else {
+            panic!("importer parse failed");
+        };
+        let main_path = vec![sym(&mut i, "Main")];
+        let (module, _) = canonicalise_module(&parsed_main, &main_path, &deps, &mut i)
+            .expect("importer must canonicalise");
+        let home = annotation_con_home(&module, &i, "x");
+        let dotted: Vec<_> = home.iter().map(|s| i.resolve(*s)).collect();
+        assert_eq!(
+            dotted,
+            vec![Some("App"), Some("Html"), Some("Widgets")],
+            "W.Order is the module's union, not a builtin minted at [\"Html\"]"
+        );
+    }
+
+    /// The terminal attribute keys on the `Attribute` row: each terminal home
+    /// maps it to the row tagged `TuiAttr` / `CliAttr`, and no other row
+    /// (the view alias `Screen`, the `Html` view) is a terminal attribute.
+    #[test]
+    fn the_terminal_attribute_keys_on_the_attribute_row() {
+        let mut i = Interner::new();
+        let attribute = BuiltinType::of_bare_name("Attribute").expect("a bare row");
+        for (engine, tag) in [
+            ("Tui", BuiltinTag::TuiAttr),
+            ("Cells", BuiltinTag::TuiAttr),
+            ("Cli", BuiltinTag::CliAttr),
+        ] {
+            let home = vec![sym(&mut i, "Ipe"), sym(&mut i, "Ui"), sym(&mut i, engine)];
+            let terminal = terminal_attribute_builtin(&home, attribute, &i);
+            assert_eq!(
+                terminal.and_then(|row| row.row().tag()),
+                Some(tag),
+                "Ipe.Ui.{engine}.Attribute"
+            );
+            for other in ["Screen", "Html", "Element"] {
+                let row = BuiltinType::of_bare_name(other).expect("a bare row");
+                assert_eq!(
+                    terminal_attribute_builtin(&home, row, &i),
+                    None,
+                    "Ipe.Ui.{engine}.{other}"
+                );
+            }
+        }
+        let ui = vec![sym(&mut i, "Ipe"), sym(&mut i, "Ui")];
+        assert_eq!(terminal_attribute_builtin(&ui, attribute, &i), None);
+    }
+
+    /// Every home-sensitive name is a reserved bare row, so the row lookup in
+    /// [`bind_html_type_home`] never takes its `CompilerBug` arm.
+    #[test]
+    fn every_home_sensitive_name_is_a_reserved_bare_row() {
+        for name in HOME_SENSITIVE_BUILTIN_TYPES {
+            let row = BuiltinType::of_bare_name(name);
+            assert!(
+                row.is_some_and(|row| row.row().role().forbids_user_declaration()),
+                "`{name}` is home-sensitive but no reserved bare row"
+            );
+        }
+    }
+
+    /// The Html-family `Attribute` re-export carries its row: a mis-arity
+    /// qualified use is refused.
+    #[test]
+    fn the_html_attribute_reexport_meets_its_arity_gate() {
+        let mut i = Interner::new();
+        let dep_path = vec![
+            sym(&mut i, "Ipe"),
+            sym(&mut i, "Html"),
+            sym(&mut i, "Attributes"),
+        ];
+        let exports = html_attributes_exports(&mut i, &dep_path);
+        let deps = BTreeMap::from([(dep_path, exports)]);
+        let src = annotated_importer("Ipe.Html.Attributes as Attr", "Attr.Attribute Int Int");
+        let Ok(parsed_main) = ipe_parse::parse_module(&src, &mut i) else {
+            panic!("importer parse failed");
+        };
+        let main_path = vec![sym(&mut i, "Main")];
+        let refused = canonicalise_module(&parsed_main, &main_path, &deps, &mut i);
+        assert!(
+            matches!(
+                &refused,
+                Err(Diagnostic::Name {
+                    msg: NameError::TypeArity { .. },
+                    ..
+                })
+            ),
+            "{:?}",
+            refused.map(|_| ())
+        );
     }
 }
 

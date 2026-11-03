@@ -51,8 +51,8 @@ impl Surface for DiagnosticSurface {
         "diagnostic"
     }
 
-    fn all(&self) -> Vec<Code> {
-        ALL_CODES.to_vec()
+    fn all(&self) -> Result<Vec<Code>, crate::coverage::error::CoverageError> {
+        Ok(ALL_CODES.to_vec())
     }
 
     fn label(item: &Code) -> String {

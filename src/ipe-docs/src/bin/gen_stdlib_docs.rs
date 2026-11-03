@@ -325,6 +325,7 @@ mod tests {
                 signature: Some("thing : Int".to_owned()),
                 doc: None,
             }],
+            tier: ipe_stdlib::StdTier::Public,
         };
         let detail = render_module_detail(&module);
         assert!(detail.contains("# `Blank`"));

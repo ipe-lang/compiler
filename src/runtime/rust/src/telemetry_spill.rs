@@ -90,9 +90,12 @@ fn rfc3339(ts_ms: u64) -> String {
     // Fall back to `now` rather than "" on an out-of-range ts: an empty `time`
     // column sorts before every real row and would never satisfy `time < cutoff`
     // with a real cutoff in a prunable way — making a bad row un-prunable. `now`
-    // keeps the row bounded by the same retention window. (Unreachable for real
-    // u64 ms timestamps; this is a belt-and-braces total fallback.)
-    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ts_ms as i64)
+    // keeps the row bounded by the same retention window. A timestamp past
+    // `i64` takes the same fallback: reinterpreted as `i64` it would read as a
+    // pre-epoch instant and sort before every real row.
+    i64::try_from(ts_ms)
+        .ok()
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
         .map(|d| d.to_rfc3339())
         .unwrap_or_else(|| chrono::Utc::now().to_rfc3339())
 }
@@ -265,6 +268,22 @@ mod tests {
     use super::super::core::IpeResult;
     use super::*;
     use sqlx::Row;
+
+    /// A spill timestamp past `i64`, or past chrono's range, is stamped `now`.
+    #[test]
+    fn rfc3339_out_of_range_falls_back_to_now() {
+        let before = chrono::Utc::now().timestamp_millis();
+        let past_i64 = i64::MAX.unsigned_abs() + 1;
+        for ts_ms in [u64::MAX, past_i64, i64::MAX.unsigned_abs()] {
+            let stamped =
+                chrono::DateTime::parse_from_rfc3339(&rfc3339(ts_ms)).map(|d| d.timestamp_millis());
+            assert!(
+                matches!(stamped, Ok(ms) if ms >= before),
+                "ts {ts_ms} stamped {stamped:?}, not now"
+            );
+        }
+        assert!(rfc3339(1_700_000_000_000).starts_with("2023-11-14T22:13:20"));
+    }
 
     /// The batcher's unit of work mapped onto the hub schema — schema creation +
     /// INSERT (logs + spans) + field derivation, read back on one pool. Verifies

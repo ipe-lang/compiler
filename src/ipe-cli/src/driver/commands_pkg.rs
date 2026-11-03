@@ -4,12 +4,13 @@ use super::{
     attribute_post_link_error, build_root_into, build_test_into,
     capabilities_including_served_widgets, create_source_root, emit_machine_error,
     emitted_bin_filename, entry_modules, frame_infer_error, home_to_source_map,
-    lowering_check_query, program_constructs_a_widget, resolve_runtime,
-    resolve_vendored_runtime_dir, run_build, runtime_context_for_message, typecheck_target,
-    working_dir,
+    lowering_check_query, lowering_check_target, program_constructs_a_widget,
+    resolve_vendored_runtime_dir, run_build, runtime_context_for_message, working_dir,
 };
-use crate::cargo_step::{CargoOutput, CargoTarget, Verbosity};
-use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths};
+use crate::cargo_step::{CargoOutput, CargoTarget, TestRunKey, Verbosity};
+use crate::output_dir::{
+    EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths, ReleaseMember,
+};
 use crate::project_root::{AnalysisTarget, FileArg, ProjectRoot, SourceDir};
 use crate::publisher::{AttestedActor, BlessedPublisher};
 use crate::remote_ingest::{InheritedError, InheritedInput, InheritedRole, run_inherited};
@@ -37,15 +38,6 @@ pub enum BundleProfile {
 }
 
 impl BundleProfile {
-    /// The bundle profile a native build finished in `finish` packages: a
-    /// release bundle only behind the release consent witness.
-    pub(crate) const fn of(finish: &NativeFinish<'_>) -> Self {
-        match finish {
-            NativeFinish::Dev => Self::Dev,
-            NativeFinish::Release { .. } => Self::Release,
-        }
-    }
-
     /// The build intent the bundle's crate is emitted with.
     ///
     /// The `release` bundle is a shipped artifact, so it is a release build;
@@ -55,28 +47,6 @@ impl BundleProfile {
             Self::Dev => ipe_backend_rust::BuildIntent::Development,
             Self::Release => ipe_backend_rust::BuildIntent::Release,
         }
-    }
-
-    /// The emitted crate's area under the output root.
-    ///
-    /// `rust/` for [`Self::Dev`], `release/rust/` for [`Self::Release`] — where
-    /// `build` and `release` respectively put it.
-    const fn crate_areas(self) -> &'static [OutputArea] {
-        match self {
-            Self::Dev => &[OutputArea::Rust],
-            Self::Release => &[OutputArea::Release, OutputArea::Rust],
-        }
-    }
-
-    /// Claim the directory this profile's packaged bundles go in.
-    ///
-    /// `dist/` for [`Self::Dev`], `release/dist/` for [`Self::Release`].
-    fn dist_dir(self, output: &OutputRoot) -> Result<OwnedDir, CliError> {
-        let areas: &[OutputArea] = match self {
-            Self::Dev => &[OutputArea::Dist],
-            Self::Release => &[OutputArea::Release, OutputArea::Dist],
-        };
-        output.claim_area(areas)
     }
 
     /// The compiled binary's `target/` profile subdirectory (`debug` / `release`),
@@ -89,41 +59,119 @@ impl BundleProfile {
     }
 }
 
-/// The delivery host a bundling verb (`build`/`release`) targets.
+pub use crate::delivery_set::BundleHost;
+
+/// The posture a bundle is finished in, and where it is written.
 ///
-/// Resolved from the delivery grammar's [`delivery::Host`]: `desktop` routes to
-/// the webview-native desktop packager, `ios`/`android` to the mobile
-/// system-webview packager. The served/default host produces no bundle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BundleHost {
-    /// `web desktop` — a self-contained per-OS desktop bundle for the host OS.
-    Desktop,
-    /// `web client ios` / `web client android` — a native mobile system-webview shell.
-    Mobile(pack::mobile::MobileOs),
+/// A dev bundle writes `rust/` and `dist/` under the output root the build
+/// resolved (`--out`, else the default). A release bundle writes them under
+/// its own release member root (`release/<slug>/`), carried with the consent
+/// witness, so a release bundle without a member place has no representation.
+/// Neither place is created until a product is written.
+pub enum BundleFinish<'a> {
+    /// `ipe dev build`: a debug bundle under `output`.
+    Dev {
+        /// The output root the build resolved.
+        output: OutputRoot,
+    },
+    /// `ipe release build`: an optimised bundle under `member`.
+    Release {
+        /// The capabilities the release consent gates admitted.
+        consented: &'a super::ConsentedCapabilities,
+        /// The database driver the profile's socket allowances follow.
+        driver: ipe_backend_rust::DbDriver,
+        /// The release member root this bundle writes under.
+        member: ReleaseMember,
+    },
 }
 
-impl BundleHost {
-    /// Map a resolved delivery [`delivery::Host`] onto the bundle host it
-    /// packages, or `None` for the served/default host (which produces a plain
-    /// artifact, not a bundle). The mobile host word is the delivery grammar's own
-    /// `ios`/`android`, so the closed-set resolution below cannot fail in practice
-    /// — a refusal is surfaced, never panicked.
+impl<'a> BundleFinish<'a> {
+    /// The native build posture this bundle's binary is finished in.
+    const fn native(&self) -> NativeFinish<'a> {
+        match self {
+            Self::Dev { .. } => NativeFinish::Dev,
+            Self::Release {
+                consented, driver, ..
+            } => NativeFinish::Release {
+                consented,
+                driver: *driver,
+            },
+        }
+    }
+
+    /// The bundle profile this posture packages.
+    const fn profile(&self) -> BundleProfile {
+        match self {
+            Self::Dev { .. } => BundleProfile::Dev,
+            Self::Release { .. } => BundleProfile::Release,
+        }
+    }
+
+    /// The emitted crate's place, `rust/` under the root or the member,
+    /// claimed when the crate is written.
+    fn crate_target(&self) -> EmitTarget {
+        match self {
+            Self::Dev { output } => EmitTarget::Area(output.area(&[OutputArea::Rust])),
+            Self::Release { member, .. } => EmitTarget::Member(member.area(OutputArea::Rust)),
+        }
+    }
+
+    /// Claim the directory the packaged bundles go in: `dist/` under the
+    /// root or the member.
+    fn dist_dir(&self) -> Result<OwnedDir, CliError> {
+        match self {
+            Self::Dev { output } => output.claim_area(&[OutputArea::Dist]),
+            Self::Release { member, .. } => member.area(OutputArea::Dist).claim(),
+        }
+    }
+
+    /// The output root the mobile shell's `web client` bundle build is handed:
+    /// the root, or the member root.
+    ///
+    /// The levels above a member root are claimed first, so the build, which
+    /// claims its own root only when it writes, never creates them unowned.
     ///
     /// # Errors
-    /// [`CliError::Usage`] if the mobile OS resolution refuses (unreachable
-    /// through the typed [`delivery::Host`]).
-    pub fn from_delivery_host(host: delivery::Host) -> Result<Option<Self>, CliError> {
-        let mobile = |word| {
-            pack::mobile::resolve_os(Some(word))
-                .map(Self::Mobile)
-                .map_err(|r| CliError::Usage(crate::text::Message::relay(&r)))
+    /// As [`ReleaseMember::claim_parent`] and [`ReleaseMember::path`].
+    fn wasm_root(&self) -> Result<PathBuf, CliError> {
+        match self {
+            Self::Dev { output } => Ok(output.path().to_path_buf()),
+            Self::Release { member, .. } => {
+                member.claim_parent()?;
+                member.path()
+            }
+        }
+    }
+
+    /// The `www/` tree the mobile shell's `web client` bundle build produced
+    /// under [`Self::wasm_root`].
+    ///
+    /// A dev build writes it in `rust/www/`; a release build in its own member
+    /// `release/<web client slug>/rust/www/` under the root it was handed.
+    fn wasm_www(&self, project: &ProjectPaths) -> Result<PathBuf, CliError> {
+        let crate_dir = match self {
+            Self::Dev { output } => output.claim_area(&[OutputArea::Rust])?,
+            Self::Release { member, .. } => {
+                let slug =
+                    crate::delivery_set::PlannedDelivery::release(MOBILE_BUNDLE_DELIVERY, None)
+                        .map_err(|e| CliError::Pipeline {
+                            file: PathBuf::new(),
+                            src: String::new(),
+                            diag: Box::new(ipe_diagnostics::Diagnostic::CompilerBug {
+                                where_: "mobile bundle delivery",
+                                detail: format!(
+                                    "`{MOBILE_BUNDLE_DELIVERY}` has no release route: {e}"
+                                ),
+                            }),
+                        })?
+                        .slug()?;
+                OutputRoot::at(member.claim()?.path(), project)?
+                    .release_member(&slug)
+                    .area(OutputArea::Rust)
+                    .claim()?
+            }
         };
-        Ok(match host {
-            delivery::Host::Default => None,
-            delivery::Host::Desktop => Some(Self::Desktop),
-            delivery::Host::Ios => Some(mobile("ios")?),
-            delivery::Host::Android => Some(mobile("android")?),
-        })
+        Ok(crate_dir.path_to("www")?.path())
     }
 }
 
@@ -143,12 +191,12 @@ impl BundleHost {
 /// the underlying build's errors; [`CliError::Io`] on any filesystem failure.
 pub fn bundle_delivery(
     host: BundleHost,
-    finish: NativeFinish<'_>,
+    finish: BundleFinish<'_>,
     held: &HeldBuild,
 ) -> Result<(), CliError> {
     match host {
         BundleHost::Desktop => pack_desktop(finish, held),
-        BundleHost::Mobile(os) => pack_mobile(os, BundleProfile::of(&finish), held),
+        BundleHost::Mobile(os) => pack_mobile(os, finish, held),
     }
 }
 
@@ -284,6 +332,7 @@ pub fn validate_mobile_pack(
 struct BundleAssembler<'a> {
     held: &'a HeldBuild,
     profile: BundleProfile,
+    finish: BundleFinish<'a>,
 }
 
 /// A desktop-shape gate witness: proof that [`validate_desktop_shape`] passed
@@ -294,7 +343,6 @@ struct BundleAssembler<'a> {
 /// emitted for the webview host.
 pub struct GatedDesktop<'a> {
     assembler: BundleAssembler<'a>,
-    finish: NativeFinish<'a>,
     webview: delivery::WebViewProof,
 }
 
@@ -312,8 +360,7 @@ impl GatedDesktop<'_> {
     /// Build/emit errors from the underlying compile; [`CliError::Io`] on any
     /// filesystem failure while materialising the bundle.
     pub fn assemble(self, os: pack::desktop::DesktopOs) -> Result<(), CliError> {
-        self.assembler
-            .assemble_desktop(os, self.finish, self.webview)
+        self.assembler.assemble_desktop(os, self.webview)
     }
 
     /// Emit the packaged app's crate into `out` without running cargo.
@@ -339,10 +386,14 @@ impl GatedMobile<'_> {
 }
 
 impl<'a> BundleAssembler<'a> {
-    /// Construct an assembler for the held build `held` at the given profile.
+    /// Construct an assembler for the held build `held` finished in `finish`.
     /// Private: a runnable assembler is reachable only through a gate witness.
-    const fn new(held: &'a HeldBuild, profile: BundleProfile) -> Self {
-        Self { held, profile }
+    const fn new(held: &'a HeldBuild, finish: BundleFinish<'a>) -> Self {
+        Self {
+            held,
+            profile: finish.profile(),
+            finish,
+        }
     }
 
     /// The manifest of the held build.
@@ -360,7 +411,7 @@ impl<'a> BundleAssembler<'a> {
     /// the shape is not webview-capable.
     pub fn gate_desktop(
         held: &'a HeldBuild,
-        finish: NativeFinish<'a>,
+        finish: BundleFinish<'a>,
     ) -> Result<GatedDesktop<'a>, CliError> {
         let declared = held
             .root()
@@ -382,8 +433,7 @@ impl<'a> BundleAssembler<'a> {
             )));
         };
         Ok(GatedDesktop {
-            assembler: Self::new(held, BundleProfile::of(&finish)),
-            finish,
+            assembler: Self::new(held, finish),
             webview,
         })
     }
@@ -399,10 +449,10 @@ impl<'a> BundleAssembler<'a> {
     /// push but names no `delivery.mobile.push`.
     pub fn gate_mobile(
         held: &'a HeldBuild,
-        profile: BundleProfile,
+        finish: BundleFinish<'a>,
     ) -> Result<GatedMobile<'a>, CliError> {
         validate_mobile_pack(held.root().manifest(), held.shape())?;
-        Ok(GatedMobile(Self::new(held, profile)))
+        Ok(GatedMobile(Self::new(held, finish)))
     }
 
     /// Emit the desktop app's crate into `out` for the webview host `webview`
@@ -415,15 +465,16 @@ impl<'a> BundleAssembler<'a> {
         out: OutTarget<'_>,
         webview: delivery::WebViewProof,
     ) -> Result<EmittedCrate, CliError> {
-        let runtime_dir = resolve_vendored_runtime_dir(None, false)?;
+        let options = BuildOptions {
+            intent: self.profile.build_intent(),
+            ..BuildOptions::from_env()
+        };
+        let runtime_dir = resolve_vendored_runtime_dir(None, options.runtime_emit())?;
         build_root_into(
             self.held,
             out,
             &runtime_dir,
-            &BuildOptions {
-                intent: self.profile.build_intent(),
-                ..BuildOptions::from_env()
-            },
+            &options,
             delivery::HostIntent::WebView(webview),
         )
     }
@@ -439,7 +490,6 @@ impl<'a> BundleAssembler<'a> {
     fn assemble_desktop(
         &self,
         os: pack::desktop::DesktopOs,
-        finish: NativeFinish<'_>,
         webview: delivery::WebViewProof,
     ) -> Result<(), CliError> {
         use std::fmt::Write as _;
@@ -462,8 +512,7 @@ impl<'a> BundleAssembler<'a> {
         // Emit + compile the project to a binary. A webview app carries the
         // system webview as a dynamic dependency, so this is a plain
         // (non-static) native build.
-        let output = OutputRoot::resolve(None, &ProjectPaths::from_manifest(manifest))?;
-        let rust_target = EmitTarget::Area(output.area(&[OutputArea::Rust]));
+        let rust_target = self.finish.crate_target();
         let crate_dir = self.emit_desktop(OutTarget::Proven(&rust_target), webview)?;
 
         let cargo_bin = toolchain::require_cargo(toolchain::ToolIntent::Build)?;
@@ -478,7 +527,7 @@ impl<'a> BundleAssembler<'a> {
         FlooredBuild {
             cargo: &cargo_bin,
             crate_dir: &crate_dir,
-            finish,
+            finish: self.finish.native(),
             target: CargoTarget::Host,
             target_dir: &target_dir,
             output: CargoOutput::Human(Verbosity::Progress),
@@ -500,7 +549,7 @@ impl<'a> BundleAssembler<'a> {
             )));
         }
 
-        let dist = self.profile.dist_dir(&output)?.child(os.as_str())?;
+        let dist = self.finish.dist_dir()?.child(os.as_str())?;
         let bundle_root = pack::desktop::materialise(&layout, &binary, icon, &dist)?;
 
         let mut body = format!(
@@ -550,30 +599,24 @@ impl<'a> BundleAssembler<'a> {
         // pipeline (emit + cargo + wasm-bindgen) is the single source of the
         // hostable bundle; invoking it through this binary keeps that pipeline
         // authoritative rather than re-implemented here.
-        let output = OutputRoot::resolve(None, &ProjectPaths::from_manifest(manifest))?;
+        let project = ProjectPaths::from_manifest(manifest);
+        let wasm_root = self.finish.wasm_root()?;
         let manifest_path = self.held.manifest_path();
         build_under_pinned_manifest(manifest_path, &pin, || {
-            build_wasm_for_mobile(manifest_path, output.path(), self.profile)
+            build_wasm_for_mobile(manifest_path, &wasm_root, self.profile)
         })?;
         // The SPA is read from the owned crate; a symlinked `www/` is refused so
         // the shell can never pick up files from outside the build output.
-        let www_dir = output
-            .claim_area(self.profile.crate_areas())?
-            .path_to("www")?
-            .path();
+        let www_dir = self.finish.wasm_www(&project)?;
         let bundle = pack::mobile::SpaBundle::from_www_dir(&www_dir)
             .map_err(|e| CliError::Usage(crate::text::Message::relay(&e)))?;
 
         let layout = pack::mobile::layout(os, self.profile, &shell, &pin, &bundle, icon)?;
 
-        let dist = self.profile.dist_dir(&output)?.child(os.as_str())?;
+        let dist = self.finish.dist_dir()?.child(os.as_str())?;
         let shell_root = pack::mobile::materialise(&layout, icon, &dist)?;
 
-        let note = if os.build_runs_on_linux() {
-            crate::text::mobile_android_note()
-        } else {
-            crate::text::mobile_ios_note()
-        };
+        let note = mobile_release_note(os);
         crate::screen::Screen::new(crate::screen::Stream::Stdout)
             .line(
                 crate::screen::Tone::Text,
@@ -587,6 +630,25 @@ impl<'a> BundleAssembler<'a> {
             .emit();
         Ok(())
     }
+}
+
+/// The note shown under a materialised mobile shell: the platform note, and —
+/// for Android, whose toolchain runs on this host — the build steps indented
+/// under it.
+///
+/// One renderer over [`pack::mobile::android_build_steps`] composes the
+/// layout, so the CLI note and the README (`pack::mobile::android_readme`)
+/// both carry the same catalog steps rather than each assembling its own copy.
+fn mobile_release_note(os: pack::mobile::MobileOs) -> String {
+    if !os.build_runs_on_linux() {
+        return crate::text::mobile_ios_note().to_owned();
+    }
+    let mut note = crate::text::mobile_android_note().to_owned();
+    for line in pack::mobile::android_build_steps().lines() {
+        note.push_str("\n    ");
+        note.push_str(line);
+    }
+    note
 }
 
 /// `build|release web desktop [<path>]` — build the app and lay out a
@@ -606,7 +668,7 @@ impl<'a> BundleAssembler<'a> {
 /// [`CliError::Usage`] wrapping a [`pack::desktop::DesktopRefusal`];
 /// build/emit errors from the underlying compile; [`CliError::Io`] on any
 /// filesystem failure while materialising the bundle.
-pub fn pack_desktop(finish: NativeFinish<'_>, held: &HeldBuild) -> Result<(), CliError> {
+pub fn pack_desktop(finish: BundleFinish<'_>, held: &HeldBuild) -> Result<(), CliError> {
     // The desktop bundle is the host OS's webview-native app; the delivery
     // grammar carries no per-OS override (a cross-OS artifact is finished on that
     // OS's own runner), so the packager always targets this host's OS.
@@ -646,7 +708,7 @@ pub fn pack_desktop(finish: NativeFinish<'_>, held: &HeldBuild) -> Result<(), Cl
 /// collecting the bundle or materialising the shell.
 pub fn pack_mobile(
     os: pack::mobile::MobileOs,
-    profile: BundleProfile,
+    finish: BundleFinish<'_>,
     held: &HeldBuild,
 ) -> Result<(), CliError> {
     // Gate the app's web-delivery capability BEFORE any build: it must be a
@@ -659,7 +721,7 @@ pub fn pack_mobile(
     // name rather than silently packaging a terminal or script app as an SPA.
     // The witness constructor runs the gate and is the only way to obtain a
     // runnable assembler — assembling an ungated shape has no representation.
-    BundleAssembler::gate_mobile(held, profile)?.assemble(os)
+    BundleAssembler::gate_mobile(held, finish)?.assemble(os)
 }
 
 /// The delivery the mobile bundle build is re-invoked with: the browser
@@ -669,7 +731,8 @@ pub const MOBILE_BUNDLE_DELIVERY: delivery::Delivery = delivery::Delivery::web_c
 /// Build the hostable SPA bundle under `output_root` through this binary.
 ///
 /// `ipe dev build web client` for a dev bundle (`<root>/rust/www/`), `ipe
-/// release build web client` for a production one (`<root>/release/rust/www/`).
+/// release build web client` for a production one
+/// (`<root>/release/web-client/rust/www/`).
 ///
 /// Invoking the same binary keeps the wasm bundle pipeline (emit + cargo +
 /// wasm-bindgen) authoritative — the mobile shell hosts exactly the bundle a
@@ -1209,11 +1272,13 @@ pub fn parse_audit_entry_args(rest: &[String]) -> Result<AuditEntryArgs, CliErro
     })
 }
 
-/// `ipe type-check [<path>]` — type-check a program and stop. Runs the same
-/// injection-aware source graph `ipe dev build` uses, but demands only the
-/// `typecheck` query: no IR lowering, no Rust emission, nothing written. Exits
-/// 0 with a friendly framed success line when the program type-checks, or
-/// non-zero carrying the first rendered diagnostic when it does not.
+/// `ipe type-check [<path>]` — check a program and stop short of emitting it.
+///
+/// Runs the same injection-aware source graph `ipe dev build` uses through
+/// type inference, the decoder-direction gate and IR lowering: no Rust
+/// emission, nothing written. Exits 0 with a friendly framed success line when
+/// the program passes, or non-zero carrying the first rendered diagnostic when
+/// it does not.
 ///
 /// With `--json`, each diagnostic is a JSON object on stderr, and success is the
 /// shared machine envelope (`ipe.cli.type-check/1`, `status:ok`, empty payload)
@@ -1242,7 +1307,7 @@ pub fn run_type_check_body(rest: &[String]) -> Result<(), CliError> {
 ///
 /// # Errors
 /// Every refusal of [`analysis_root`], [`analysis_target`] and
-/// [`typecheck_target`].
+/// [`lowering_check_target`].
 pub fn run_type_check_in(cwd: &Path, rest: &[String]) -> Result<(), CliError> {
     let args = cli_args::parse_type_check(rest)?;
     // Propagate any diagnostic raw; `run_type_check` routes it through the
@@ -1412,8 +1477,6 @@ pub fn run_project_tests_with(
     // rather than an opaque OS spawn error.
     let cargo_bin = toolchain::require_cargo(toolchain::ToolIntent::Test)?;
 
-    let runtime_dir = resolve_runtime()?;
-
     // Emit into an exclusively-created, unpredictably-named temp directory so
     // concurrent verify runs cannot collide and an attacker cannot pre-seed the
     // path.
@@ -1429,7 +1492,6 @@ pub fn run_project_tests_with(
             host: crate::delivery::HostIntent::Served,
         },
         &out_scratch,
-        &runtime_dir,
         &cargo_bin,
         stdio,
     );
@@ -1463,22 +1525,26 @@ pub struct TestProgram<'a> {
 /// The build directory is held locked from before the build until the built
 /// binary is copied out ([`crate::target_dir::LinkableTargetDir::for_scratch`]),
 /// pinned or shared alike. Under that lock the crate's `Cargo.lock` is seeded
-/// from the directory's lock slot, every unit of the previous test runner is
-/// cleaned (so the verdict never comes from a stale test unit), the crate is
-/// built, its lock is stored back to the slot, and the binary is copied into a
-/// private directory. The copy runs after the lock is released, so no later
-/// build can replace the binary this run judges.
+/// from the directory's lock slot, the crate is built under a [`TestRunKey`]
+/// minted for this run, its lock is stored back to the slot, and the binary is
+/// copied into a private directory. The runner embeds the key and cargo tracks
+/// it as the crate's environment dependency, so this run's build always
+/// recompiles the runner; the copy is run only once it is found to carry this
+/// run's key, so the verdict never comes from another build's runner. The run
+/// starts after the lock is released, and no later build can replace the copy
+/// this run judges.
 ///
 /// # Errors
 /// The compile/build error on a compile or cargo failure; the refusals of
 /// [`crate::target_dir::LinkableTargetDir::for_scratch`];
+/// [`CliError::TestRunKeyUnavailable`] when the run's key cannot be minted;
 /// [`CliError::Io`] when the lock slot, the binary copy, or the spawn fails;
+/// the refusals of [`verify_test_runner_key`];
 /// [`CliError::TestFailed`] when the binary exits non-zero (a failing case, or
 /// a crash/signal with no exit code).
 pub fn build_and_run_test_entry(
     program: &TestProgram<'_>,
     out_scratch: &scratch::ScratchDir,
-    runtime_dir: &Path,
     cargo_bin: &crate::toolchain::CargoBin,
     stdio: TestStdio,
 ) -> Result<TestOutcome, CliError> {
@@ -1487,9 +1553,9 @@ pub fn build_and_run_test_entry(
         program.view,
         program.host,
         OutTarget::Scratch(out_scratch),
-        runtime_dir,
     )?;
 
+    let key = TestRunKey::fresh().map_err(|source| CliError::TestRunKeyUnavailable { source })?;
     let target = crate::target_dir::LinkableTargetDir::for_scratch(cargo_bin.path(), out_scratch)?;
     seed_test_lock(target.dir().path(), crate_dir.dir())?;
     let build = FlooredBuild {
@@ -1502,8 +1568,7 @@ pub fn build_and_run_test_entry(
         what: "the emitted test runner",
         runtime: runtime_context_for_message(),
     };
-    build.clean_package(ipe_backend_rust::TEST_CRATE_NAME)?;
-    build.run()?;
+    build.run_test_runner(&key)?;
     store_test_lock(target.dir().path(), crate_dir.dir())?;
 
     // Read the compiled binary back from the build directory the build was
@@ -1516,6 +1581,7 @@ pub fn build_and_run_test_entry(
         .map_err(|source| CliError::ScratchUnavailable { source })?;
     let bin = run_dir.path().join(&test_bin_name);
     fs::copy(&compiled, &bin).map_err(|e| io_err(&compiled, e))?;
+    verify_test_runner_key(&bin, &key, TEST_BINARY_SCAN_CEILING)?;
     drop(target.release());
 
     // Run the test binary. `Ipe.Test.runMain` exits 0 on all-pass, 1 on any
@@ -1532,6 +1598,81 @@ pub fn build_and_run_test_entry(
         // failure; classify the absent code as a failure, never a pass.
         let code = run_status.code().unwrap_or(1);
         Err(CliError::TestFailed { code })
+    }
+}
+
+/// The most bytes [`verify_test_runner_key`] reads of a test runner binary.
+pub const TEST_BINARY_SCAN_CEILING: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The bytes one read of a test runner scan fills.
+const TEST_BINARY_SCAN_CHUNK: usize = 64 * 1024;
+
+/// Refuse the test runner at `binary` unless it carries `key`'s marker.
+///
+/// The file is read once, in fixed chunks, up to its length when opened and
+/// never past `ceiling`; a marker spanning two chunks is found.
+///
+/// # Errors
+/// [`CliError::FileTooLarge`] when the file is longer than `ceiling`;
+/// [`CliError::Io`] when it cannot be opened or read;
+/// [`CliError::TestRunnerStale`] when it does not carry the marker.
+pub fn verify_test_runner_key(
+    binary: &Path,
+    key: &TestRunKey,
+    ceiling: u64,
+) -> Result<(), CliError> {
+    let file = fs::File::open(binary).map_err(|e| io_err(binary, e))?;
+    let len = file.metadata().map_err(|e| io_err(binary, e))?.len();
+    if len > ceiling {
+        return Err(CliError::FileTooLarge {
+            path: binary.to_path_buf(),
+            max: ceiling,
+        });
+    }
+    let marker = key.marker();
+    let found = std::io::Read::take(file, len);
+    if contains_marker(found, marker.as_bytes()).map_err(|e| io_err(binary, e))? {
+        Ok(())
+    } else {
+        Err(CliError::TestRunnerStale {
+            binary: style::TerminalSafe::sanitize(&binary.to_string_lossy()),
+        })
+    }
+}
+
+/// Whether `reader` yields `marker` anywhere in its bytes.
+///
+/// The read buffer holds one chunk after the last `marker.len() - 1` bytes of
+/// the previous one, so a marker split across two reads is still seen whole.
+fn contains_marker(mut reader: impl std::io::Read, marker: &[u8]) -> std::io::Result<bool> {
+    let Some(carried) = marker.len().checked_sub(1) else {
+        return Ok(true);
+    };
+    let mut window = vec![0u8; carried.saturating_add(TEST_BINARY_SCAN_CHUNK)];
+    let mut held = 0usize;
+    loop {
+        let Some(free) = window.get_mut(held..) else {
+            return Err(std::io::Error::other("scan window overrun"));
+        };
+        let read = match reader.read(free) {
+            Ok(0) => return Ok(false),
+            Ok(read) => read,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        let filled = held.saturating_add(read);
+        let Some(seen) = window.get(..filled) else {
+            return Err(std::io::Error::other("scan window overrun"));
+        };
+        if seen
+            .windows(marker.len())
+            .any(|candidate| candidate == marker)
+        {
+            return Ok(true);
+        }
+        let keep_from = filled.saturating_sub(carried);
+        window.copy_within(keep_from..filled, 0);
+        held = filled.saturating_sub(keep_from);
     }
 }
 
@@ -1708,11 +1849,25 @@ pub fn run_test(rest: &[String]) -> Result<(), CliError> {
             Ok(())
         }
         Err(err) => {
-            // A failing case (or any build error) settles the stage red before
-            // the error propagates to the exit-code contract.
-            stage.failure("tests failed");
+            // The stage settles red before the error propagates to the
+            // exit-code contract, naming what happened: a failing case, or a
+            // run that never reached the tests.
+            stage.failure(test_stage_failure(&err));
             Err(err)
         }
+    }
+}
+
+/// The settled line of a test stage that ended in `err`.
+///
+/// Only [`CliError::TestFailed`] (the runner ran and a case failed) reads as
+/// failed tests; every other error stopped the run before any test ran.
+#[must_use]
+pub const fn test_stage_failure(err: &CliError) -> &'static str {
+    if matches!(err, CliError::TestFailed { .. }) {
+        "tests failed"
+    } else {
+        "tests did not run"
     }
 }
 
@@ -1843,14 +1998,18 @@ pub fn verify_check_quiet(path: Option<&str>) -> Result<(), CliError> {
     typecheck_in(&working_dir()?, path)
 }
 
-/// Type-check what `arg` names in the project at `cwd`: every entry when there is none.
+/// Judge what `arg` names in the project at `cwd`: every entry when there is none.
+///
+/// The judge is [`lowering_check_target`]: type inference and lowering, the
+/// settings-free stages `ipe dev build` runs, so a program lowering refuses is
+/// refused here too, under the same diagnostic code.
 ///
 /// # Errors
 /// Every refusal of [`analysis_root`], [`analysis_target`] and
-/// [`typecheck_target`].
+/// [`lowering_check_target`].
 pub fn typecheck_in(cwd: &Path, arg: Option<&str>) -> Result<(), CliError> {
     let (root, file) = analysis_root(cwd, arg.map(Path::new))?;
-    typecheck_target(&analysis_target(&root, file.as_ref())?)
+    lowering_check_target(&analysis_target(&root, file.as_ref())?)
 }
 
 /// The test stage in machine-quiet form: the shared runner with the test
@@ -2623,7 +2782,8 @@ pub fn verify_capabilities(
 /// # Errors
 /// [`CliError::Pipeline`] / [`CliError::Io`] when the package cannot be read or
 /// any entry fails to lower; the diagnostic is framed against the module that
-/// owns it.
+/// owns it; [`CliError::DependencyNotCompiled`] when the manifest declares a
+/// dependency.
 pub fn infer_package_capabilities(
     manifest_path: &Path,
 ) -> Result<std::collections::BTreeSet<ipe_ir::Capability>, CliError> {
@@ -2659,6 +2819,7 @@ pub struct PackageSourceSet {
     injected: std::collections::BTreeSet<Vec<String>>,
     ffi_injected: std::collections::BTreeSet<Vec<String>>,
     ffi_emit: Option<ipe_backend_rust::FfiEmit>,
+    deps: project::CompiledDeps,
 }
 
 /// The parts of a [`PackageSourceSet`] the compile core consumes.
@@ -2673,10 +2834,11 @@ pub struct SourceSetParts {
     pub ffi_emit: Option<ipe_backend_rust::FfiEmit>,
 }
 
-/// A module-source map with the modules discovered for it.
+/// A module-source map with the modules discovered for it, and the proof its manifest's dependencies were honored or refused.
 pub type ReadModules = (
     BTreeMap<Vec<String>, (PathBuf, String)>,
     Vec<project::DiscoveredModule>,
+    project::CompiledDeps,
 );
 
 impl PackageSourceSet {
@@ -2686,22 +2848,28 @@ impl PackageSourceSet {
     /// [`project::PackageSnapshot`] through [`PackageSourceSet::from_snapshot`].
     ///
     /// # Errors
-    /// [`CliError::Io`] / manifest errors when the package cannot be read.
+    /// [`CliError::Io`] / manifest errors when the package cannot be read;
+    /// [`CliError::DependencyNotCompiled`] when the manifest declares a
+    /// dependency.
     pub fn read(manifest_path: &Path) -> Result<Self, CliError> {
         let manifest = project::parse_manifest(manifest_path)?;
-        let (sources, entries) = read_package_modules(&manifest)?;
-        Self::assemble(sources, entries, manifest_path)
+        let (sources, entries, deps) = read_package_modules(&manifest)?;
+        Self::assemble(sources, entries, manifest_path, deps)
     }
 
     /// The source set of a captured package: its modules as the snapshot holds them, never re-read.
     ///
     /// # Errors
-    /// The FFI catalog errors of [`ffi::prepare_ffi`].
+    /// The FFI catalog errors of [`ffi::prepare_ffi`];
+    /// [`CliError::DependencyNotCompiled`] when the captured manifest declares
+    /// a dependency.
     pub fn from_snapshot(snapshot: &project::PackageSnapshot) -> Result<Self, CliError> {
+        let deps = snapshot.manifest().compiled_dependencies()?;
         Self::assemble(
             snapshot.sources().clone(),
             snapshot.modules().to_vec(),
             &snapshot_manifest_path(snapshot),
+            deps,
         )
     }
 
@@ -2736,6 +2904,7 @@ impl PackageSourceSet {
             injected,
             ffi_injected: view.ffi().injected.clone(),
             ffi_emit: view.ffi().emit.clone(),
+            deps: view.compiled_deps().clone(),
         }
     }
 
@@ -2779,13 +2948,15 @@ impl PackageSourceSet {
             injected,
             ffi_injected: snapshot.ffi().injected.clone(),
             ffi_emit: snapshot.ffi().emit.clone(),
+            deps: snapshot.compiled_deps().clone(),
         }
     }
 
     /// Inject the compiled-source stdlib closure and the FFI interface modules into `sources`.
     ///
     /// `blame_path` is the project manifest or entry file the FFI catalog
-    /// search walks up from.
+    /// search walks up from; `deps` proves the dependencies were honored or
+    /// refused.
     ///
     /// # Errors
     /// The FFI catalog errors of [`ffi::prepare_ffi`].
@@ -2793,6 +2964,7 @@ impl PackageSourceSet {
         mut sources: BTreeMap<Vec<String>, (PathBuf, String)>,
         mut entries: Vec<project::DiscoveredModule>,
         blame_path: &Path,
+        deps: project::CompiledDeps,
     ) -> Result<Self, CliError> {
         // `injected` is the driver's unforgeable record of which module paths
         // are trusted stdlib source, the only inputs that earn
@@ -2807,6 +2979,7 @@ impl PackageSourceSet {
             injected,
             ffi_injected: ffi.injected,
             ffi_emit: ffi.emit,
+            deps,
         })
     }
 
@@ -2864,6 +3037,7 @@ impl PackageSourceSet {
             injected: self.injected.clone(),
             ffi_injected: self.ffi_injected.clone(),
             ffi_emit: self.ffi_emit.clone(),
+            deps: self.deps.clone(),
         }
     }
 }
@@ -2880,15 +3054,18 @@ pub fn snapshot_manifest_path(snapshot: &project::PackageSnapshot) -> PathBuf {
 /// Read every module under `manifest`'s source root, one bounded read each.
 ///
 /// # Errors
-/// [`CliError::Io`] when the source root cannot be walked or a module read.
+/// [`CliError::DependencyNotCompiled`], before any read, when the manifest
+/// declares a dependency; [`CliError::Io`] when the source root cannot be
+/// walked or a module read.
 pub fn read_package_modules(manifest: &project::ProjectManifest) -> Result<ReadModules, CliError> {
+    let deps = manifest.compiled_dependencies()?;
     let entries = project::discover_modules(&manifest.src_root)?;
     let mut sources: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
     for m in &entries {
         let src = crate::io_bounded::read_walked_source(m.path())?;
         sources.insert(m.module_path().to_vec(), (m.path().to_path_buf(), src));
     }
-    Ok((sources, entries))
+    Ok((sources, entries, deps))
 }
 
 /// [`infer_package_capabilities`] over one caller-supplied database.
@@ -4020,7 +4197,7 @@ mod mobile_base_tests {
     fn delivery_record(base_path: &str, servers: &str, apns: &str) -> String {
         format!(
             "{{ browser = {{ basePath = {base_path:?} }}, servers = [ {servers} ], mobile = {{ \
-             bundleId = \"com.example.app\", push = {{ apns = {apns}, fcm = {{ \
+             bundleId = \"io.acme.app\", push = {{ apns = {apns}, fcm = {{ \
              projectId = \"example-app\", applicationId = \"1:123:android:abc\", \
              apiKey = \"AIza-key_1\", senderId = \"123\" }} }} }} }}"
         )
@@ -4289,7 +4466,7 @@ mod mobile_base_tests {
     /// with identifiers passes.
     #[test]
     fn mobile_gate_refuses_accepted_push_without_identifiers() {
-        let unconfigured = push_project("push_unconfigured", "{ bundleId = \"com.example.app\" }");
+        let unconfigured = push_project("push_unconfigured", "{ bundleId = \"io.acme.app\" }");
         let result = validate_mobile_pack(&unconfigured, delivery::Shape::Web);
         let refusal = text::Message::relay(&pack::mobile::MobileRefusal::PushUnconfigured);
         assert!(
@@ -4299,7 +4476,7 @@ mod mobile_base_tests {
 
         let configured = push_project(
             "push_configured",
-            "{ bundleId = \"com.example.app\", push = { apns = Development, fcm = { \
+            "{ bundleId = \"io.acme.app\", push = { apns = Development, fcm = { \
              projectId = \"example-app\", applicationId = \"1:123:android:abc\", \
              apiKey = \"AIza-key_1\", senderId = \"123\" } } }",
         );
@@ -4344,11 +4521,17 @@ mod pack_gate_tests {
             BundleProfile::Dev => cli_args::parse_build(&rest)?.delivery,
             BundleProfile::Release => cli_args::parse_release_build(&rest)?.delivery,
         };
+        #[allow(clippy::expect_used)]
+        let declared = crate::project::DeliveryConfig::default()
+            .declared(delivery::Shape::Web)
+            .expect("the implicit delivery set of a web package resolves");
         super::super::commands::resolve_delivery(
-            delivery::Shape::Web,
+            &declared,
             &positionals,
+            None,
             false,
             verb.name(),
+            super::super::commands::ADMIT_ANY,
         )
     }
 
@@ -4589,6 +4772,30 @@ mod pack_gate_tests {
             msg.contains("Program") || msg.contains("program") || msg.contains("Web"),
             "refusal names the shape or the required type: {msg}"
         );
+    }
+
+    // ── Mobile release note ─────────────────────────────────────────────────────
+
+    /// The Android release note carries the wrapper-bootstrap step before the
+    /// debug-build step: a reader who stops at the first command still gets a
+    /// working one, instead of `assembleDebug` failing on a missing `./gradlew`.
+    #[test]
+    fn android_release_note_carries_build_steps_wrapper_first() {
+        let note = mobile_release_note(pack::mobile::MobileOs::Android);
+        let wrapper = note.find("gradle wrapper").expect("wrapper step present");
+        let debug = note.find("assembleDebug").expect("debug step present");
+        assert!(
+            wrapper < debug,
+            "wrapper step must precede assembleDebug: {note}"
+        );
+    }
+
+    /// The iOS release note is unchanged: no Android build steps leak into it.
+    #[test]
+    fn ios_release_note_carries_no_android_build_steps() {
+        let note = mobile_release_note(pack::mobile::MobileOs::Ios);
+        assert!(!note.contains("gradlew"), "{note}");
+        assert!(!note.contains("gradle wrapper"), "{note}");
     }
 
     // ── Mobile capability classification ──────────────────────────────────────
@@ -4853,6 +5060,7 @@ mod admission_tests {
             rev: index::PinnedRev::from_full_sha(
                 &package,
                 "9f2c7b1e0a4d5c6f8b2a1e3d4c5b6a7f8e9d0c1b",
+                crate::index::RevSite::IndexEntry,
             )
             .expect("valid pinned rev"),
             sha256,
@@ -4950,7 +5158,10 @@ main =
         let root = ProjectRoot::resolve(crate::project_root::RootArg::at(fixture.path()))
             .expect("the fixture resolves");
         let held = HeldBuild::read(root).expect("the fixture is read");
-        let gated = BundleAssembler::gate_desktop(&held, NativeFinish::Dev)
+        let output =
+            OutputRoot::resolve(None, &ProjectPaths::from_manifest(held.root().manifest()))
+                .expect("the default output root resolves");
+        let gated = BundleAssembler::gate_desktop(&held, BundleFinish::Dev { output })
             .expect("a web app passes the desktop gate");
         let out = ipe_test_temp::temp_root()
             .join(format!("ipe-desktop-packager-emit-{}", std::process::id()));
@@ -4978,6 +5189,118 @@ main =
         assert!(
             !program.contains("ipe_runtime::tea::WebApp("),
             "the served web app was emitted"
+        );
+    }
+}
+
+#[cfg(test)]
+mod test_runner_key_tests {
+    use super::*;
+
+    /// A private file holding `bytes`, removed with the returned directory.
+    #[allow(clippy::expect_used)] // test fixture: the scratch directory and write must succeed
+    fn runner_file(label: &str, bytes: &[u8]) -> (scratch::ScratchDir, PathBuf) {
+        let dir = scratch::ScratchDir::new(label).expect("scratch dir");
+        let path = dir.path().join("ipe-test");
+        fs::write(&path, bytes).expect("write runner");
+        (dir, path)
+    }
+
+    #[allow(clippy::expect_used)] // test fixture: the OS random source is available
+    fn key() -> TestRunKey {
+        TestRunKey::fresh().expect("random source")
+    }
+
+    /// A binary carrying this run's marker passes.
+    #[test]
+    fn a_runner_carrying_the_key_passes() {
+        let key = key();
+        let mut bytes = vec![0u8; 1000];
+        bytes.extend_from_slice(key.marker().as_bytes());
+        bytes.extend_from_slice(&[7u8; 1000]);
+        let (_dir, path) = runner_file("ipe-test-key-present", &bytes);
+        let verdict = verify_test_runner_key(&path, &key, TEST_BINARY_SCAN_CEILING);
+        assert!(verdict.is_ok(), "the marker is present: {verdict:?}");
+    }
+
+    /// A binary without this run's marker is refused, whatever other key it carries.
+    #[test]
+    fn a_runner_without_the_key_is_stale() {
+        let key = key();
+        let other = self::key();
+        assert!(other != key, "two minted keys differ");
+        let mut bytes = vec![0u8; 3 * TEST_BINARY_SCAN_CHUNK];
+        bytes.extend_from_slice(other.marker().as_bytes());
+        let (_dir, path) = runner_file("ipe-test-key-absent", &bytes);
+        let verdict = verify_test_runner_key(&path, &key, TEST_BINARY_SCAN_CEILING);
+        assert!(
+            matches!(verdict, Err(CliError::TestRunnerStale { .. })),
+            "a runner of another build must be refused: {verdict:?}"
+        );
+        let Err(stale) = verdict else { return };
+        assert!(
+            !stale.to_string().contains(&key.marker()),
+            "the refusal never echoes the key"
+        );
+    }
+
+    /// A marker split across two reads is found, at every split point.
+    #[test]
+    fn a_marker_straddling_a_chunk_boundary_is_found() {
+        let key = key();
+        let marker = key.marker();
+        for split in 1..marker.len() {
+            let mut bytes = vec![0u8; TEST_BINARY_SCAN_CHUNK - split];
+            bytes.extend_from_slice(marker.as_bytes());
+            bytes.extend_from_slice(&[0u8; 64]);
+            let (_dir, path) = runner_file("ipe-test-key-straddle", &bytes);
+            let verdict = verify_test_runner_key(&path, &key, TEST_BINARY_SCAN_CEILING);
+            assert!(verdict.is_ok(), "split at {split}: {verdict:?}");
+        }
+    }
+
+    /// A marker past the third chunk boundary, after carried windows, is found.
+    #[test]
+    fn a_marker_after_several_chunks_is_found() {
+        let key = key();
+        let mut bytes = vec![0u8; 3 * TEST_BINARY_SCAN_CHUNK - 5];
+        bytes.extend_from_slice(key.marker().as_bytes());
+        let (_dir, path) = runner_file("ipe-test-key-late", &bytes);
+        let verdict = verify_test_runner_key(&path, &key, TEST_BINARY_SCAN_CEILING);
+        assert!(verdict.is_ok(), "the marker is present: {verdict:?}");
+    }
+
+    /// A runner longer than the ceiling is refused with the typed limit, never read.
+    #[test]
+    fn a_runner_past_the_ceiling_is_refused() {
+        let key = key();
+        let mut bytes = key.marker().into_bytes();
+        bytes.extend_from_slice(&[0u8; 16]);
+        let (_dir, path) = runner_file("ipe-test-key-ceiling", &bytes);
+        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let over = verify_test_runner_key(&path, &key, len - 1);
+        assert!(
+            matches!(over, Err(CliError::FileTooLarge { max, .. }) if max == len - 1),
+            "one byte past the ceiling must be refused: {over:?}"
+        );
+        let at = verify_test_runner_key(&path, &key, len);
+        assert!(
+            at.is_ok(),
+            "a runner exactly at the ceiling is scanned: {at:?}"
+        );
+    }
+
+    /// The marker is the fixed prefix and 32 lowercase hex digits.
+    #[test]
+    fn the_marker_is_prefix_and_lowercase_hex() {
+        let marker = key().marker();
+        let hex = marker.strip_prefix("ipe-test-run-key:");
+        assert!(
+            hex.is_some_and(|hex| hex.len() == 32
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))),
+            "malformed marker: {marker}"
         );
     }
 }

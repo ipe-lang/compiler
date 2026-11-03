@@ -171,8 +171,6 @@ fn the_emitted_crate_and_wrapper_path_dep_build_and_run() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let cargo = ipe_env::var("CARGO").expect("cargo sets CARGO for every test it runs");
-
     let root =
         ipe_test_temp::temp_root().join(format!("ipe_ffi_wrapper_seal_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -250,6 +248,7 @@ pub fn ipe_error_from_foreign<T: std::fmt::Debug>(_e: T) -> IpeError {{ IpeError
 
 {describe}
 
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn main() {{
     // The constructor builds a real wrapper-crate value; the reader consumes it.
     let engine = match engine_wrap_make(7) {{
@@ -266,18 +265,19 @@ fn main() {{
     );
     std::fs::write(root.join("src").join("main.rs"), main_rs).expect("app main.rs");
 
-    let out = std::process::Command::new(&cargo)
-        .arg("run")
-        .arg("--quiet")
-        .current_dir(&root)
-        .output()
-        .expect("cargo run spawns");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let ran = e2e_support::build_and_run_rust("ffi_wrapper_crate", &root);
     assert!(
-        out.status.success(),
+        ran.is_ok(),
+        "{}",
+        ran.as_ref().err().map_or("", String::as_str)
+    );
+    let run = ran.expect("asserted Ok above");
+    let stdout = &run.stdout;
+    assert_eq!(
+        run.exit_code,
+        Some(0),
         "the emitted app crate + wrapper path dep must build and run exit 0.\n\
-         stdout: {stdout}\nstderr: {stderr}"
+         stdout: {stdout}"
     );
     assert!(
         stdout.contains("engine<7>"),

@@ -765,8 +765,6 @@ messages! {
     package_manifest_deps_brace_out_of_range = "package-manifest-deps-brace-out-of-range";
     /// `ipe health --yes` with a data form.
     health_yes_with_format = "health-yes-with-format";
-    /// `ipe fmt` with two paths.
-    fmt_single_path = "fmt-single-path";
     /// `ipe fmt --stdin` with a path.
     fmt_stdin_and_path = "fmt-stdin-and-path";
     /// `ipe fmt --stdin` with a data form.
@@ -851,6 +849,10 @@ messages! {
     delivery_bundle_host_has_no_target(delivery, host, source) = "delivery-bundle-host-has-no-target";
     /// `ipe dev run` was handed a client app-bundle delivery.
     delivery_client_host_has_no_dev_run(delivery, host) = "delivery-client-host-has-no-dev-run";
+    /// `ipe dev watch` was handed a `client` delivery, which has no server to restart.
+    delivery_watch_serves_only(delivery) = "delivery-watch-serves-only";
+    /// A `web client desktop` delivery was asked to build, and no packer builds it.
+    delivery_client_desktop_has_no_packer = "delivery-client-desktop-has-no-packer";
     /// A co-located WASI build was asked for a non-`Direct` shape.
     delivery_wasi_requires_direct_shape(shape) = "delivery-wasi-requires-direct-shape";
     /// A co-located WASI engine was asked for a non-WASI triple.
@@ -977,6 +979,10 @@ messages! {
     cli_target_dir_scratch_cache = "cli-target-dir-scratch-cache";
     /// Another `ipe test` held the shared test build directory past the wall.
     cli_test_target_busy(path: &crate::style::TerminalSafe, wall) = "cli-test-target-busy";
+    /// The test runner found does not carry this `ipe test` run's key.
+    cli_test_runner_stale(binary: &crate::style::TerminalSafe) = "cli-test-runner-stale";
+    /// The system random source could not mint an `ipe test` run's key.
+    cli_test_run_key_unavailable(kind) = "cli-test-run-key-unavailable";
     /// The embedded runtime manifest could not be prepared for bundling.
     cli_bundled_manifest(detail) = "cli-bundled-manifest";
     /// An unlinkable toolchain sysroot.
@@ -1103,9 +1109,25 @@ messages! {
     /// An `ipe.lock` `[[package]]` table lacks a required field.
     lock_missing_field(field) = "lock-missing-field";
     /// An `ipe.lock` package carries an unrecognised `kind`.
-    lock_unknown_kind(package, kind) = "lock-unknown-kind";
+    lock_unknown_kind(package, kind, remedy) = "lock-unknown-kind";
     /// An `ipe.lock` index dependency records a `local` rev.
-    lock_index_dep_local_rev(package) = "lock-index-dep-local-rev";
+    lock_index_dep_local_rev(package, remedy) = "lock-index-dep-local-rev";
+    /// How to recover from an `ipe.lock` the reader refuses.
+    lock_remedy = "lock-remedy";
+    /// An `ipe.lock` line outside the lockfile grammar.
+    lock_unrecognised_line(line, remedy) = "lock-unrecognised-line";
+    /// An `ipe.lock` field with an unknown key.
+    lock_unknown_key(line, key: &crate::style::TerminalSafe, known, remedy) = "lock-unknown-key";
+    /// An `ipe.lock` field before the first `[[package]]`.
+    lock_key_outside_record(line, key, remedy) = "lock-key-outside-record";
+    /// An `ipe.lock` field whose value is not one quoted string.
+    lock_malformed_value(line, key, remedy) = "lock-malformed-value";
+    /// An `ipe.lock` field repeated within one record.
+    lock_duplicate_key(line, key, remedy) = "lock-duplicate-key";
+    /// An `ipe.lock` package locked by two records.
+    lock_duplicate_package(line, package, remedy) = "lock-duplicate-package";
+    /// An `ipe.lock` comment holding a control or invisible character.
+    lock_hidden_character(line, column, code, remedy) = "lock-hidden-character";
     /// A path dependency's `source` cannot be recorded in `ipe.lock`.
     lock_unrecordable_local_source(package, max, raw) = "lock-unrecordable-local-source";
     /// A path dependency names a network share or device.
@@ -1164,6 +1186,10 @@ messages! {
     site_project_modules = "site-project-modules";
     /// The standard library group.
     site_standard_library = "site-standard-library";
+    /// The port-layer modules group, listed apart from the public API.
+    site_port_layers = "site-port-layers";
+    /// A port-layer module page's banner, naming the public module it backs.
+    site_port_layer_banner(of) = "site-port-layer-banner";
     /// A module page's types heading.
     site_types = "site-types";
     /// A module page's values heading.
@@ -1188,6 +1214,10 @@ messages! {
     release_embedded(path) = "release-embedded";
     /// `ipe release build --bundle` wrote a wrapper and app pair.
     release_bundled(path) = "release-bundled";
+    /// The Android build steps: wrapper bootstrap, debug build, install, store build.
+    ///
+    /// The one rendering every producer (CLI note, README, guide) carries verbatim.
+    android_build_steps(gradle, api) = "android-build-steps";
     /// The note under a written Android shell project: unsigned, and how to sign it.
     mobile_android_note = "mobile-android-note";
     /// The note under a written iOS shell project.
@@ -1245,6 +1275,18 @@ messages! {
     fmt_stdin_unformatted = "fmt-stdin-unformatted";
     /// `ipe fmt` was given a missing path.
     fmt_no_such_path(root) = "fmt-no-such-path";
+    /// `ipe fmt` left files that changed after they were read.
+    fmt_changed_while_formatting(list: &crate::text::TerminalBlock) = "fmt-changed-while-formatting";
+    /// `ipe fmt` would hold more rewrite text than its ceiling.
+    fmt_held_bytes_limit(cap, file) = "fmt-held-bytes-limit";
+    /// `ipe fmt` rewrote one file.
+    fmt_formatted(file) = "fmt-formatted";
+    /// `ipe fmt` reached a directory past its walk's depth ceiling.
+    fmt_walk_too_deep(cap, dir) = "fmt-walk-too-deep";
+    /// `ipe fmt` examined more named paths and entries than its walk's ceiling.
+    fmt_walk_too_many_entries(cap, dir) = "fmt-walk-too-many-entries";
+    /// `ipe fmt` found more files than its walk's ceiling.
+    fmt_walk_too_many_files(cap, dir) = "fmt-walk-too-many-files";
     /// `ipe fmt` refused a file whose formatted output would pass its cap.
     fmt_output_too_large(file, cap) = "fmt-output-too-large";
     /// `ipe health` could not locate the home directory.
@@ -1273,10 +1315,44 @@ messages! {
     ships_repeated(delivery) = "ships-repeated";
     /// A `ships` delivery does not fit the shape of `main`.
     ships_shape_mismatch(delivery, shape) = "ships-shape-mismatch";
+    /// A command given no delivery words found several declared deliveries.
+    ships_several(command, choices) = "ships-several";
     /// A retired ship builder is written in `ships`.
     ship_retired_builder(got, now) = "ship-retired-builder";
     /// `ipe add` found the package already declared as an escape dependency.
     pkg_add_escape_dependency(name) = "pkg-add-escape-dependency";
+    /// A declared dependency the compiling commands do not compile.
+    dependency_not_compiled(kind, name) = "dependency-not-compiled";
+    /// A dependency declared twice in `package.ipe`.
+    duplicate_dependency(name) = "duplicate-dependency";
+    /// A `depPath` with an empty path.
+    dep_path_empty(name) = "dep-path-empty";
+    /// A `depPath` past the recorded-path length ceiling.
+    dep_path_too_long(name, max) = "dep-path-too-long";
+    /// A `depPath` holding a character a lockfile cannot record.
+    dep_path_unrecordable(name, path: &crate::style::TerminalSafe) = "dep-path-unrecordable";
+    /// A `depPath` naming a network share or a device.
+    dep_path_remote(name, path: &crate::style::TerminalSafe) = "dep-path-remote";
+    /// A `depPath` holding a backslash.
+    dep_path_backslash(name, path: &crate::style::TerminalSafe) = "dep-path-backslash";
+    /// An absolute `depPath`.
+    dep_path_absolute(name, path: &crate::style::TerminalSafe) = "dep-path-absolute";
+    /// A `depPath` starting with a drive.
+    dep_path_drive_prefix(name, path: &crate::style::TerminalSafe) = "dep-path-drive-prefix";
+    /// A `depPath` with an empty component.
+    dep_path_empty_component(name, path: &crate::style::TerminalSafe) = "dep-path-empty-component";
+    /// A `depPath` with a `.` component.
+    dep_path_dot_component(name, path: &crate::style::TerminalSafe) = "dep-path-dot-component";
+    /// A `depPath` with a `..` after a name.
+    dep_path_ascent_after_name(name, path: &crate::style::TerminalSafe) = "dep-path-ascent-after-name";
+    /// A `depPath` climbing past the ascent ceiling.
+    dep_path_too_many_ascents(name, path: &crate::style::TerminalSafe, max) = "dep-path-too-many-ascents";
+    /// A `depPath` with a Windows device component.
+    dep_path_device(name, path: &crate::style::TerminalSafe) = "dep-path-device";
+    /// A `depPath` with a component that is not a plain name.
+    dep_path_not_a_name(name, path: &crate::style::TerminalSafe) = "dep-path-not-a-name";
+    /// A `depPath` that names no directory.
+    dep_path_no_name(name, path: &crate::style::TerminalSafe) = "dep-path-no-name";
     /// A `package.ipe` program entry has an empty path segment.
     manifest_entry_empty_segment(entry) = "manifest-entry-empty-segment";
     /// A `package.ipe` program entry has a `.` or `..` path segment.
@@ -1303,6 +1379,31 @@ messages! {
     manifest_base_path_dot_segment(base) = "manifest-base-path-dot-segment";
     /// `delivery.browser.basePath` holds a byte outside the unreserved set.
     manifest_base_path_reserved_byte(base, byte) = "manifest-base-path-reserved-byte";
+    /// A refused `delivery.mobile.bundleId`: the reason, then the grammar.
+    manifest_bundle_id_refused(reason, grammar) = "manifest-bundle-id-refused";
+    /// The bundle-id grammar every bundle-id refusal ends with.
+    manifest_bundle_id_grammar(example, max) = "manifest-bundle-id-grammar";
+    /// `delivery.mobile.bundleId` is empty.
+    manifest_bundle_id_empty = "manifest-bundle-id-empty";
+    /// `delivery.mobile.bundleId` is past the length ceiling.
+    manifest_bundle_id_too_long(len, max) = "manifest-bundle-id-too-long";
+    /// `delivery.mobile.bundleId` holds a byte outside the grammar.
+    manifest_bundle_id_byte(byte) = "manifest-bundle-id-byte";
+    /// `delivery.mobile.bundleId` has an empty label.
+    manifest_bundle_id_empty_label = "manifest-bundle-id-empty-label";
+    /// A `delivery.mobile.bundleId` label starts with a digit.
+    manifest_bundle_id_label_starts_with_digit = "manifest-bundle-id-label-starts-with-digit";
+    /// `delivery.mobile.bundleId` has a single label.
+    manifest_bundle_id_one_label = "manifest-bundle-id-one-label";
+    /// A `delivery.mobile.bundleId` label is a Java reserved word.
+    manifest_bundle_id_reserved_word(word) = "manifest-bundle-id-reserved-word";
+    /// `delivery.mobile.bundleId` starts with the Java platform's label.
+    manifest_bundle_id_java_platform(label) = "manifest-bundle-id-java-platform";
+    /// `delivery.mobile.bundleId` is under a prefix Apple reserves.
+    manifest_bundle_id_reserved_app_store(prefix, example) = "manifest-bundle-id-reserved-app-store";
+    /// `delivery.mobile.bundleId` is under a prefix Google Play refuses.
+    manifest_bundle_id_reserved_google_play(prefix, example) =
+        "manifest-bundle-id-reserved-google-play";
     /// `delivery.browser.installable = True` with no top-level `icon`.
     manifest_installable_without_icon = "manifest-installable-without-icon";
     /// The installable app's `icon` cannot be read beneath the project root.
@@ -1817,12 +1918,11 @@ messages! {
     /// An index `rev` shaped like an injection.
     index_rev_injection(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-rev-injection";
     /// A recorded `rev` that is not a full commit SHA.
-    index_rev_not_immutable(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-rev-not-immutable";
+    index_rev_not_immutable(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe, remedy) = "index-rev-not-immutable";
+    /// How to recover from a checkout whose commit is not a SHA-1.
+    index_rev_remedy_sha1 = "index-rev-remedy-sha1";
     /// A requested rev that is hex-shaped but mixed-case.
     index_rev_mixed_case_hex(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-rev-mixed-case-hex";
-    /// A full-SHA requested rev that disagrees with the commit git served.
-    index_rev_served_mismatch(pkg: &crate::package_name::PackageName, requested, served) =
-        "index-rev-served-mismatch";
     /// An index `sha256` that is not a content hash.
     index_sha256_invalid(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-sha256-invalid";
     /// An index entry that exists but cannot be read.
@@ -1848,9 +1948,41 @@ messages! {
         "index-capability-unknown";
     /// A `[[version]]` entry missing a field.
     index_version_missing_field(name: &crate::package_name::PackageName, field) = "index-version-missing-field";
-    /// An index entry `capabilities` that is not an array.
-    index_capabilities_not_array(name: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) =
-        "index-capabilities-not-array";
+    /// How to recover from an index entry the reader refuses.
+    index_entry_remedy = "index-entry-remedy";
+    /// An index entry line outside the entry grammar.
+    index_entry_unrecognised_line(entry: &crate::package_name::PackageName, line, remedy) =
+        "index-entry-unrecognised-line";
+    /// An index entry field with an unknown key.
+    index_entry_unknown_key(entry: &crate::package_name::PackageName, line, key: &crate::style::TerminalSafe, known, remedy) =
+        "index-entry-unknown-key";
+    /// An index entry header field inside a version table.
+    index_entry_key_needs_header(entry: &crate::package_name::PackageName, line, key, remedy) =
+        "index-entry-key-needs-header";
+    /// An index entry version field outside a version table.
+    index_entry_key_needs_version(entry: &crate::package_name::PackageName, line, key, remedy) =
+        "index-entry-key-needs-version";
+    /// An index entry field whose value does not have its key's shape.
+    index_entry_malformed_value(entry: &crate::package_name::PackageName, line, key, shape, remedy) =
+        "index-entry-malformed-value";
+    /// The shape of a one-string index entry value.
+    index_entry_shape_quoted = "index-entry-shape-quoted";
+    /// The shape of an index entry `capabilities` value.
+    index_entry_shape_list = "index-entry-shape-list";
+    /// The shape of an index entry `signature` value.
+    index_entry_shape_signature = "index-entry-shape-signature";
+    /// An index entry field repeated within one table.
+    index_entry_duplicate_key(entry: &crate::package_name::PackageName, line, key, remedy) =
+        "index-entry-duplicate-key";
+    /// An index entry listing one version twice.
+    index_entry_duplicate_version(entry: &crate::package_name::PackageName, line, version, remedy) =
+        "index-entry-duplicate-version";
+    /// An index entry whose `name` is another package.
+    index_entry_name_mismatch(entry: &crate::package_name::PackageName, line, remedy) =
+        "index-entry-name-mismatch";
+    /// An index entry comment holding a control or invisible character.
+    index_entry_hidden_character(entry: &crate::package_name::PackageName, line, column, code, remedy) =
+        "index-entry-hidden-character";
     /// `ipe package publish --rev` naming no commit.
     publish_rev_unresolved(refspec: &crate::style::TerminalSafe, rev: &crate::style::TerminalSafe) =
         "publish-rev-unresolved";
@@ -1889,10 +2021,6 @@ messages! {
     signature_untrusted(pkg, detail: &crate::style::TerminalSafe) = "signature-untrusted";
     /// A malformed registry trust config.
     trust_config_malformed(detail: &crate::style::TerminalSafe) = "trust-config-malformed";
-    /// A path dependency whose directory does not exist.
-    resolve_path_dep_missing(name, path) = "resolve-path-dep-missing";
-    /// An index dependency given to the escape resolver.
-    resolve_index_dep_escape(name) = "resolve-index-dep-escape";
     /// Dependency resolution could not run `git`.
     resolve_git_unavailable(name, detail) = "resolve-git-unavailable";
     /// A `git` step of dependency resolution failed.
@@ -1933,8 +2061,8 @@ mod tests {
             crate::style::TerminalSafe::sanitize("x\u{1b}[31my\u{7}z\u{9b}\u{1b}]0;t\u{7}");
         let table: [(Message, &str); 8] = [
             (
-                index_rev_not_immutable(&pkg, &hostile),
-                "package `pkg`: recorded `rev` is not an immutable commit SHA (expected 40 lowercase hex chars), got: xyz — re-run `ipe add` to record an immutable pin",
+                index_rev_not_immutable(&pkg, &hostile, &"fix it"),
+                "package `pkg`: recorded `rev` is not an immutable commit SHA (expected 40 lowercase hex chars), got: xyz — fix it",
             ),
             (
                 signature_bundle_malformed(&pkg, &hostile),

@@ -2550,7 +2550,8 @@ fn distribute_row_fill(
     }
 }
 
-const SGR_RESET: &str = "\x1b[0m";
+/// The SGR sequence that ends a styled run.
+pub const SGR_RESET: &str = "\x1b[0m";
 
 /// Honour the `NO_COLOR` convention (https://no-color.org): when the env var is
 /// present and non-empty, suppress all COLOUR output (fg/bg) — text attributes
@@ -2661,6 +2662,45 @@ fn sgr_with_profile(style: Style, profile: crate::color::TermProfile) -> String 
     }
 }
 
+/// SGR open sequence for one `Cli` line's style under `profile`.
+///
+/// The line path through the one SGR builder ([`sgr_with_profile`]) the cell
+/// renderer uses, so a style renders the same codes on both surfaces. Empty
+/// for an unstyled line.
+pub fn line_sgr_open(attrs: &super::LineAttrs, profile: crate::color::TermProfile) -> String {
+    sgr_with_profile(Style::of_line(attrs), profile)
+}
+
+impl Style {
+    /// The cell style a `Cli` line's attributes select.
+    fn of_line(attrs: &super::LineAttrs) -> Self {
+        let (fg, fg_palette) = line_color_channels(attrs.fg);
+        let (bg, bg_palette) = line_color_channels(attrs.bg);
+        Self {
+            fg,
+            bg,
+            fg_palette,
+            bg_palette,
+            bold: attrs.bold,
+            dim: attrs.dim,
+            underline: attrs.underline,
+            reverse: attrs.reverse,
+            ..Self::default()
+        }
+    }
+}
+
+/// A line colour split into the truecolour and palette channels of a [`Style`].
+const fn line_color_channels(c: Option<super::LineColor>) -> (Option<(u8, u8, u8)>, Option<u8>) {
+    match c {
+        None => (None, None),
+        Some(super::LineColor::Palette(code)) => (None, Some(code)),
+        Some(super::LineColor::Rgb(r, g, b)) => (Some((r, g, b)), None),
+    }
+}
+
+/// A terminal frame: SGR styling under `profile`, `\r\n` between lines (the
+/// raw-mode screen), each line clipped to `cols`.
 fn emit_block(
     block: &Block,
     cols: usize,
@@ -2669,43 +2709,48 @@ fn emit_block(
     profile: crate::color::TermProfile,
 ) -> String {
     let mut out = String::new();
-    // Lines are CRLF-separated, but the SEPARATOR goes BEFORE each line after the
-    // first — NOT a trailing CRLF after the last visible row. A trailing CRLF on a
-    // full-height frame (visible lines == terminal rows) advances the cursor past
-    // the bottom row and scrolls the whole screen up by one, dropping the top row
-    // (the root padding). `paint()` issues ESC[2J + home first, so a
-    // leading-separator model lands every row correctly.
+    // The SEPARATOR goes BEFORE each line after the first — NOT after the last
+    // visible row. A trailing CRLF on a full-height frame (visible lines ==
+    // terminal rows) advances the cursor past the bottom row and scrolls the
+    // whole screen up by one, dropping the top row (the root padding).
+    // `paint()` issues ESC[2J + home first, so a leading-separator model lands
+    // every row correctly.
     for (i, line) in block.lines.iter().skip(scroll_y).take(rows).enumerate() {
         if i > 0 {
             out.push_str("\r\n");
         }
-        let mut col = 0usize;
-        for run in line {
-            if col >= cols {
-                break;
-            }
-            let mut text = String::new();
-            let mut w = 0usize;
-            for ch in run.text.chars() {
-                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-                if col + w + cw > cols {
-                    break;
-                }
-                text.push(ch);
-                w += cw;
-            }
-            let esc = sgr_with_profile(run.style, profile);
-            if esc.is_empty() {
-                out.push_str(&text);
-            } else {
-                out.push_str(&esc);
-                out.push_str(&text);
-                out.push_str(SGR_RESET);
-            }
-            col += w;
-        }
+        emit_ansi_line(&mut out, line, cols, profile);
     }
     out
+}
+
+/// One styled line, clipped to `cols` display columns.
+fn emit_ansi_line(out: &mut String, line: &[Run], cols: usize, profile: crate::color::TermProfile) {
+    let mut col = 0usize;
+    for run in line {
+        if col >= cols {
+            break;
+        }
+        let mut text = String::new();
+        let mut w = 0usize;
+        for ch in run.text.chars() {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if col + w + cw > cols {
+                break;
+            }
+            text.push(ch);
+            w += cw;
+        }
+        let esc = sgr_with_profile(run.style, profile);
+        if esc.is_empty() {
+            out.push_str(&text);
+        } else {
+            out.push_str(&esc);
+            out.push_str(&text);
+            out.push_str(SGR_RESET);
+        }
+        col += w;
+    }
 }
 
 /// Render the view, returning the ANSI frame (scrolled to `scroll_y`), the
@@ -2722,7 +2767,7 @@ pub fn render_with_focus<M: Clone>(
 ) -> (String, Vec<Focusable<M>>, usize) {
     // Production: auto-detect the terminal colour capability at the single
     // `resolve_term_profile` point.
-    render_with_focus_profiled(
+    render_with_focus_encoded(
         view,
         cols,
         rows,
@@ -2733,10 +2778,10 @@ pub fn render_with_focus<M: Clone>(
     )
 }
 
-/// `render_with_focus` with an explicit [`crate::color::TermProfile`], so a caller
-/// (e.g. a test) can pin the colour capability for a deterministic frame.
+/// `render_with_focus` with an explicit colour profile, so a caller can pin
+/// the colour capability (a deterministic test frame).
 #[allow(clippy::too_many_arguments)]
-fn render_with_focus_profiled<M: Clone>(
+fn render_with_focus_encoded<M: Clone>(
     view: &Element<M>,
     cols: usize,
     rows: usize,
@@ -2811,7 +2856,7 @@ fn element_to_cells_profiled<M: Clone>(
     profile: crate::color::TermProfile,
 ) -> String {
     let mut inputs = InputRegistry::new();
-    render_with_focus_profiled(view, cols, rows, usize::MAX, &mut inputs, 0, profile).0
+    render_with_focus_encoded(view, cols, rows, usize::MAX, &mut inputs, 0, profile).0
 }
 
 #[cfg(test)]

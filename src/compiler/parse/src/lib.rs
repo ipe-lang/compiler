@@ -111,7 +111,10 @@ pub fn try_source_tokens(src: &str) -> Option<Vec<SourceToken>> {
     )
 }
 
-pub use lexer::{KEYWORDS, is_ident_continue, is_ident_start};
+pub use lexer::{
+    KEYWORDS, LexicalRegion, LexicalRegions, PositionContext, is_ident_continue, is_ident_start,
+    lexical_regions, position_context,
+};
 pub use surface::{field_accessor, let_function, negation};
 
 /// Return `true` when `s` is a reserved keyword.
@@ -2426,9 +2429,20 @@ mod tests {
     fn unexpected_token_is_p0001() {
         // A token that cannot begin an expression.
         assert_eq!(err_code(&format!("{HDR}main = )")), "IPE-P0001");
-        // SHOULD-FIX: a qualified constructor in pattern position is rejected.
-        let qual_ctor = format!("{HDR}main =\n    case main of\n        Foo.Bar -> 1\n");
-        assert_eq!(err_code(&qual_ctor), "IPE-P0001");
+    }
+
+    #[test]
+    fn qualified_ctor_in_pattern_is_p0074() {
+        // A qualified constructor (`Module.Ctor`) in pattern position gets its
+        // own diagnostic, not the generic unexpected-token one.
+        let top_level = format!("{HDR}main =\n    case main of\n        Foo.Bar -> 1\n");
+        assert_eq!(err_code(&top_level), "IPE-P0074");
+        // The same detection site is reached recursively, so a qualified
+        // constructor nested inside another pattern is refused the same way.
+        let nested = format!(
+            "{HDR}main =\n    case [ main ] of\n        [ Foo.Bar ] -> 1\n        _ -> 0\n"
+        );
+        assert_eq!(err_code(&nested), "IPE-P0074");
     }
 
     #[test]
