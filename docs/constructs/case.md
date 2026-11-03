@@ -7,17 +7,23 @@ non-exhaustive `case` at compile time.
 
 ## Syntax
 
-    case <expr> of
-        <pattern> -> <result>
-        <pattern> -> <result>
+```ipe ipe:skip a syntax shape with placeholder names, not valid Ipê
+case <expr> of
+    <pattern> -> <result>
+    <pattern> -> <result>
+```
 
 ## Example
 
-    describe : Maybe Int -> String
-    describe m =
-        case m of
-            Just n  -> "got " ++ String.fromInt n
-            Nothing -> "absent"
+```ipe
+import Ipe.String
+
+describe : Maybe Int -> String
+describe m =
+    case m of
+        Just n  -> "got " ++ String.fromInt n
+        Nothing -> "absent"
+```
 
 ## Notes
 

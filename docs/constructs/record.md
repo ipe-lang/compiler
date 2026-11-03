@@ -32,6 +32,11 @@ alice =
 Use `.fieldName` to read a field:
 
 ```ipe
+type alias Person =
+    { name : String
+    , age : Int
+    }
+
 greet : Person -> String
 greet person =
     "Hello, " ++ person.name
@@ -40,6 +45,13 @@ greet person =
 `.name` is also a standalone accessor function of type `{ a | name : b } -> b`:
 
 ```ipe
+import Ipe.List as List
+
+type alias Person =
+    { name : String
+    , age : Int
+    }
+
 names : List Person -> List String
 names people =
     List.map .name people
@@ -50,6 +62,11 @@ names people =
 To produce a new record with one or more fields changed, use `{ old | field = newValue }`:
 
 ```ipe
+type alias Person =
+    { name : String
+    , age : Int
+    }
+
 birthday : Person -> Person
 birthday person =
     { person | age = person.age + 1 }
@@ -62,6 +79,8 @@ This does not modify `person` — it creates a new record with `age` incremented
 Destructure a record directly in a function parameter:
 
 ```ipe
+import Ipe.String as String
+
 greetFull : { name : String, age : Int } -> String
 greetFull { name, age } =
     name ++ " is " ++ String.fromInt age ++ " years old"

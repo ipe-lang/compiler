@@ -17,7 +17,7 @@ forces you to handle both cases, so a failure can never be silently ignored.
 
 ## The Result type
 
-```ipe
+```ipe ipe:skip illustrative; Result is already built in, shown here only to illustrate its shape
 type Result err ok
     = Err err
     | Ok ok
@@ -40,6 +40,15 @@ divide numerator denominator =
 The caller must handle both `Err` and `Ok`:
 
 ```ipe
+import Ipe.String as String
+
+divide : Int -> Int -> Result String Int
+divide numerator denominator =
+    if denominator == 0 then
+        Err "cannot divide by zero"
+    else
+        Ok (numerator // denominator)
+
 showDivision : Int -> Int -> String
 showDivision a b =
     case divide a b of
@@ -55,8 +64,7 @@ showDivision a b =
 Use a custom `type` for your error, not `String`. A `String` error loses
 the structure that lets callers handle each failure mode differently:
 
-```ipe ipe:skip
--- Illustrative anti-pattern: compiles, but callers cannot distinguish error kinds
+```ipe ipe:skip illustrative anti-pattern; compiles, but callers cannot distinguish error kinds
 safeDivide : Int -> Int -> Result String Int
 safeDivide a b =
     if b == 0 then Err "division by zero" else Ok (a // b)
@@ -84,6 +92,9 @@ differently to `DivisionByZero` vs `Overflow` — impossible with a `String`.
 When several steps can each fail, chain them with `Result.andThen`:
 
 ```ipe
+import Ipe.Result as Result
+import Ipe.String as String
+
 type ParseError
     = EmptyInput
     | NotANumber
@@ -118,6 +129,25 @@ at the top-level `main` boundary.
 When you want to transform only the success value, use `Result.map`:
 
 ```ipe
+import Ipe.Result as Result
+import Ipe.String as String
+
+type ParseError
+    = EmptyInput
+    | NotANumber
+
+parsePositive : String -> Result ParseError Int
+parsePositive input =
+    if String.isEmpty input then
+        Err EmptyInput
+    else
+        case String.toInt input of
+            Nothing ->
+                Err NotANumber
+
+            Just n ->
+                Ok n
+
 parsed : Result ParseError Int
 parsed =
     parsePositive "42"
