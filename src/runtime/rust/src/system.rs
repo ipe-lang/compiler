@@ -5455,14 +5455,11 @@ mod pre_exit_tests {
         };
         let stdout = stdout.join().expect("the stdout drain");
         let stderr = stderr.join().expect("the stderr drain");
-        // Test diagnostics: the child's output is only matched and shown.
-        #[allow(clippy::disallowed_methods)]
-        let run = ChildRun {
+        ChildRun {
             status,
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
-        };
-        run
+            stdout: String::from_utf8(stdout).expect("the child's stdout is UTF-8"),
+            stderr: String::from_utf8(stderr).expect("the child's stderr is UTF-8"),
+        }
     }
 
     /// Read `pipe` to its end on its own thread.

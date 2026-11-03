@@ -67,6 +67,7 @@ fn a_session_is_recorded_through_system_exit_and_debug_todo() {
     let runtime = e2e_support::require_runtime().into_path_buf();
     let options = ipe::BuildOptions {
         debugger: true,
+        intent: ipe_backend_rust::BuildIntent::Development,
         ..ipe::BuildOptions::from_env()
     };
     let built = ipe::build_golden_dir(&dir, &out, &runtime, &options);
