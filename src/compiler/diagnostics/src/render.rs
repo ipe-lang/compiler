@@ -2319,8 +2319,8 @@ fn lower_label(msg: &LowerError) -> String {
         }
         LowerError::UiWidgetInNonWebShape { shape } => format!(
             "a `CustomElement` is browser-only; it cannot be constructed or mounted in {}: \
-             its JS is served by the `web` runtime module, which only a `Web.tea` build \
-             links",
+             its JS is served by the `web` runtime module, which only a program serving a \
+             web app (`Web.tea`, or a mounted `Web.embed` app) links",
             shape.phrase()
         ),
         LowerError::LawlessEffectDiscard => {

@@ -1898,11 +1898,12 @@ pub enum LowerError {
     /// so a `Cells` grid has no string denotation. Rejected at ipe time.
     /// [IPE-L0153]
     UiCellsInCliShape(AppShape),
-    /// A `CustomElement.fromFile` handle is constructed in a program whose entry
-    /// shape serves no browser page. The handle's JS ships with the crate
-    /// whether or not a view mounts it, and the `web` runtime module that
-    /// serves it is linked only into a Web build, so the refusal falls on every
-    /// constructor the program links, at the constructor's span.
+    /// A `CustomElement.fromFile` handle is constructed in a program that serves
+    /// no browser page: it links no `web` runtime module (no `Web.tea` entry and
+    /// no `Web.embed` app). The handle's JS ships with the crate whether or not
+    /// a view mounts it, and only the `web` runtime module serves it, so the
+    /// refusal falls on every constructor the program links, at the
+    /// constructor's span.
     /// [IPE-L0147]
     UiWidgetInNonWebShape {
         /// The entry's shape, named in the message.
@@ -3689,8 +3690,9 @@ fn lower_help(msg: &LowerError) -> Vec<HelpLine> {
             format!(
                 "This program is {}, which serves no browser page. A `CustomElement` \
              handle ships its JS whether or not a view mounts it, so construct it \
-             only in a `Web.tea` program, or build the view from native `Ipe.Ui` \
-             elements (`Ui.text`, `Ui.column`, inputs) instead.",
+             only in a program that serves a web app (a `Web.tea` entry, or a \
+             server that mounts a `Web.embed` app), or build the view from native \
+             `Ipe.Ui` elements (`Ui.text`, `Ui.column`, inputs) instead.",
                 shape.phrase()
             )
             .into(),

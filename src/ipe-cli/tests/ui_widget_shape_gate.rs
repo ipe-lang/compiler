@@ -547,3 +547,101 @@ fn non_web_entries_refuse_a_widget_in_a_helper_module() -> Result<(), BoxError> 
     }
     Ok(())
 }
+
+/// A script whose `main` is a server that mounts a `Web.embed` app, and whose
+/// embedded view mounts a custom element. The mounted app is a browser page the
+/// `web` runtime serves, widget assets included, so the script shape alone is
+/// no reason to refuse it.
+const SCRIPT_EMBEDDED_APP_WIDGET: &str = r#"module Main exposing (main)
+
+import Ipe.Ffi.Js.CustomElement as CustomElement
+import Ipe.Server.Http as Server
+import Ipe.Task as Task exposing (Task)
+import Ipe.Tea.Web as Web
+import Ipe.Tea.Web.Cmd as Cmd
+import Ipe.Tea.Web.Sub as Sub
+import Ipe.Ui exposing (Element)
+
+type Msg = Edited String | NoOp
+
+type alias Model = { text : String }
+
+editor : CustomElement String String
+editor = CustomElement.fromFile "js/x.js"
+
+init : WebReq -> ( Model, Cmd.Cmd Msg )
+init _req =
+    ( { text = "" }, Cmd.none )
+
+update : Msg -> Model -> ( Model, Cmd.Cmd Msg )
+update msg model =
+    case msg of
+        Edited text ->
+            ( { model | text = text }, Cmd.none )
+
+        NoOp ->
+            ( model, Cmd.none )
+
+subscriptions : Model -> Sub.Sub Msg
+subscriptions _model =
+    Sub.none
+
+view : Model -> Element Msg
+view model =
+    CustomElement.node editor model.text Edited
+
+editorApp : Web.WebApp
+editorApp =
+    Web.embed
+        { init = init, update = update, view = view, subscriptions = subscriptions
+        , routes = [], notFound = NoOp
+        }
+
+main : Task Error ()
+main =
+    Server.listen 8000 [ Server.mountApp "/" editorApp ]
+"#;
+
+/// A script that mounts a `Web.embed` app serves a browser page through the
+/// linked `web` runtime, so a custom element in its view is accepted: the gate
+/// judges whether the program links the `web` runtime, not the entry's shape.
+#[test]
+fn script_mounting_an_embedded_web_app_accepts_its_widget() -> Result<(), BoxError> {
+    assert_accepted(
+        "script_embedded_app_widget",
+        SCRIPT_EMBEDDED_APP_WIDGET,
+        &[("js/x.js", WIDGET_JS)],
+    )
+}
+
+/// A server script that mounts no web app: it serves HTTP but no browser page.
+const SCRIPT_SERVER_WIDGET_NO_APP: &str = r#"module Main exposing (main)
+
+import Ipe.Ffi.Js.CustomElement as CustomElement
+import Ipe.Server.Http as Server
+import Ipe.Task as Task exposing (Task)
+
+editor : CustomElement String String
+editor = CustomElement.fromFile "js/x.js"
+
+health : Server.Request -> Task Error Server.Response
+health _req =
+    Task.succeed (Server.json "{}")
+
+main : Task Error ()
+main =
+    Server.listen 8000 [ Server.get "/health" health ]
+"#;
+
+/// A server script that mounts no web app links no `web` runtime, so its
+/// constructor is refused like any other script's: serving HTTP is not serving
+/// a browser page.
+#[test]
+fn script_server_without_a_web_app_refuses_its_widget() -> Result<(), BoxError> {
+    assert_placement_refused(
+        "script_server_widget_no_app",
+        SCRIPT_SERVER_WIDGET_NO_APP,
+        &[("js/x.js", WIDGET_JS)],
+        "Main.ipe",
+    )
+}

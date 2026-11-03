@@ -1807,20 +1807,41 @@ pub fn lower_program(db: &dyn Db, root: SourceRoot, entry: SourceFile) -> LowerR
     // hand-nested decoder pipeline through this one query.
     ipe_canon::decoder_pipeline_gate::check_decoder_pipelines(&linked.module)
         .map_err(|d| PipelineError::Lower(d, Vec::new()))?;
+    let shape = entry_shape(db, entry)?;
+    let program = {
+        let mut interner = db.interner().lock();
+        // Provide the entry file's display path and source text so the lowerer
+        // can inject `<file>:<line>` into `Debug.todo` call sites.
+        let src_path = entry.module_path(db).join(".");
+        let src_path = format!("{src_path}.ipe");
+        let src_text = entry.text(db).clone();
+        ipe_lower::lower(&linked.module, &types, &mut interner, &src_path, &src_text)
+            .map_err(|(diag, home)| PipelineError::Lower(diag, home))?
+    };
     // The IPE-L0147 widget-placement gate rides the same admission, so every
-    // consumer refuses a browser custom element in a non-Web program at its
-    // constructor, before emit splices a registration the runtime cannot link.
-    ipe_canon::custom_element_gate::check_widget_placement(&linked.module, entry_shape(db, entry)?)
-        .map_err(|d| PipelineError::Lower(d, Vec::new()))?;
-    let mut interner = db.interner().lock();
-    // Provide the entry file's display path and source text so the lowerer
-    // can inject `<file>:<line>` into `Debug.todo` call sites.
-    let src_path = entry.module_path(db).join(".");
-    let src_path = format!("{src_path}.ipe");
-    let src_text = entry.text(db).clone();
-    ipe_lower::lower(&linked.module, &types, &mut interner, &src_path, &src_text)
-        .map(Arc::new)
-        .map_err(|(diag, home)| PipelineError::Lower(diag, home))
+    // consumer refuses a browser custom element in a program that links no
+    // `web` runtime, at its constructor, before emit splices a registration the
+    // runtime cannot link. It runs after lowering because the `web` fact it
+    // judges is the lowered program's, the same per-module fact the backend
+    // unions into its `uses_web`.
+    ipe_canon::custom_element_gate::check_widget_placement(
+        &linked.module,
+        shape,
+        web_runtime(&program),
+    )
+    .map_err(|d| PipelineError::Lower(d, Vec::new()))?;
+    Ok(Arc::new(program))
+}
+
+/// Whether `program` links the `web` runtime: some lowered module reaches a
+/// `web` kernel. This is the per-module `uses_web` fact the backend unions into
+/// its own `uses_web` feature selector.
+fn web_runtime(program: &ipe_ir::Program) -> ipe_canon::custom_element_gate::WebRuntime {
+    if program.modules.iter().any(|m| m.uses_web) {
+        ipe_canon::custom_element_gate::WebRuntime::Linked
+    } else {
+        ipe_canon::custom_element_gate::WebRuntime::Absent
+    }
 }
 
 /// The delivery shape the entry's `main` pins, read from its parsed module.
