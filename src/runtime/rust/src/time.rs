@@ -135,19 +135,43 @@ pub fn time_time_string(ms: i64) -> String {
     }
 }
 
-/// `Time.addMillis : Int -> Int -> Int` — pure integer addition.
+/// `Time.addMillis : Int -> Int -> Int` — the exact `Int` sum.
 /// Args order: delta first, ms second (matches the Ipê sig
-/// `addMillis : Int -> Int -> Int`, called `Time.addMillis delta ms`).
+/// `addMillis : Int -> Int -> Int`, called `Time.addMillis delta ms`). A sum
+/// outside the 64-bit range trips `IntOverflow`, as `+` does.
 #[must_use]
 pub fn time_add_millis(delta: i64, ms: i64) -> i64 {
-    ms.saturating_add(delta)
+    crate::math::ipe_int_add(ms, delta)
 }
 
-/// `Time.diffMillis : Int -> Int -> Int` — `later - earlier`.
-/// Args: (later, earlier).
+/// `Time.diffMillis : Int -> Int -> Int` — the exact `later - earlier`.
+/// Args: (later, earlier). A difference outside the 64-bit range trips
+/// `IntOverflow`, as `-` does.
 #[must_use]
 pub fn time_diff_millis(later: i64, earlier: i64) -> i64 {
-    later.saturating_sub(earlier)
+    crate::math::ipe_int_sub(later, earlier)
+}
+
+/// `ms` moved by `count` units of `unit_ms` milliseconds, exactly: a product
+/// or sum outside the 64-bit range trips `IntOverflow`, as `*` and `+` do.
+fn add_units(count: i64, unit_ms: i64, ms: i64) -> i64 {
+    crate::math::ipe_int_add(ms, crate::math::ipe_int_mul(count, unit_ms))
+}
+
+/// Whole `unit_ms` units in `later_ms - earlier_ms`, truncated toward zero.
+///
+/// The span is taken in `i128`, where every difference of two `Int`s is
+/// exact; any `unit_ms >= 2` brings the quotient back inside `Int`, so the
+/// narrowing never refuses. The refusal arm trips rather than inventing a
+/// value.
+fn diff_units(later_ms: i64, earlier_ms: i64, unit_ms: i64) -> i64 {
+    let span = i128::from(later_ms) - i128::from(earlier_ms);
+    let units = span / i128::from(unit_ms);
+    i64::try_from(units).unwrap_or_else(|_| {
+        crate::core::trip(crate::core::RuntimeTrip::IntOverflow {
+            op: crate::core::IntOp::Sub,
+        })
+    })
 }
 
 /// `Time.format : String -> Int -> String` — custom timestamp layout.
@@ -256,25 +280,23 @@ pub fn time_in_zone<E: From<String>>(zone: String, ms: i64) -> IpeResult<E, Stri
     IpeResult::Ok(dt.to_rfc3339())
 }
 
-// Saturating arithmetic: extreme caller-controlled Ints would otherwise
-// overflow-panic in debug / wrap silently in release. Saturation keeps these
-// total (no panic path) and is the closest bare-`i64` analogue of the
-// `time_add_months` "return ms on out-of-range" fallback.
+// Exact `Int` arithmetic: a shifted instant outside the 64-bit range trips
+// `IntOverflow` — never a saturated instant that reads as a real one.
 #[must_use]
 pub fn time_add_days(days: i64, ms: i64) -> i64 {
-    ms.saturating_add(days.saturating_mul(86_400_000))
+    add_units(days, 86_400_000, ms)
 }
 #[must_use]
 pub fn time_add_hours(h: i64, ms: i64) -> i64 {
-    ms.saturating_add(h.saturating_mul(3_600_000))
+    add_units(h, 3_600_000, ms)
 }
 #[must_use]
 pub fn time_add_minutes(m: i64, ms: i64) -> i64 {
-    ms.saturating_add(m.saturating_mul(60_000))
+    add_units(m, 60_000, ms)
 }
 #[must_use]
 pub fn time_add_seconds(s: i64, ms: i64) -> i64 {
-    ms.saturating_add(s.saturating_mul(1000))
+    add_units(s, 1000, ms)
 }
 
 #[must_use]
@@ -555,23 +577,22 @@ pub fn time_format_iso8601(ms: i64) -> String {
 // === advanced diff / fromParts / zone kernels ===
 
 /// `diffSeconds later earlier` — integer seconds between two epoch-ms timestamps.
-// Division truncates toward zero (; negative spans truncate toward
-// zero too). `saturating_sub` avoids an overflow-panic on extreme epoch inputs.
+/// Truncates toward zero for both signs; exact for every pair of `Int`s.
 #[must_use]
 pub fn time_diff_seconds(later_ms: i64, earlier_ms: i64) -> i64 {
-    later_ms.saturating_sub(earlier_ms) / 1_000
+    diff_units(later_ms, earlier_ms, 1_000)
 }
 #[must_use]
 pub fn time_diff_minutes(later_ms: i64, earlier_ms: i64) -> i64 {
-    later_ms.saturating_sub(earlier_ms) / 60_000
+    diff_units(later_ms, earlier_ms, 60_000)
 }
 #[must_use]
 pub fn time_diff_hours(later_ms: i64, earlier_ms: i64) -> i64 {
-    later_ms.saturating_sub(earlier_ms) / 3_600_000
+    diff_units(later_ms, earlier_ms, 3_600_000)
 }
 #[must_use]
 pub fn time_diff_days(later_ms: i64, earlier_ms: i64) -> i64 {
-    later_ms.saturating_sub(earlier_ms) / 86_400_000
+    diff_units(later_ms, earlier_ms, 86_400_000)
 }
 
 /// Parses the `Time.fromParts` date parts into a naive local date-time.
@@ -967,5 +988,84 @@ mod narrowing_tests {
         assert_eq!(chunks(i64::from(i32::MAX)), [SLEEP_CHUNK_MS]);
         assert_eq!(chunks(i64::from(i32::MAX) + 1), [SLEEP_CHUNK_MS, 1]);
         assert_eq!(chunks(WRAP + 5), [SLEEP_CHUNK_MS, SLEEP_CHUNK_MS, 7]);
+    }
+}
+
+// The instant arithmetic is the exact `Int` arithmetic: past the 64-bit range
+// it trips `IntOverflow`, never a saturated instant.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod int_arith_tests {
+    use super::{
+        time_add_days, time_add_hours, time_add_millis, time_add_minutes, time_add_seconds,
+        time_diff_days, time_diff_hours, time_diff_millis, time_diff_minutes, time_diff_seconds,
+    };
+    use crate::core::{IntOp, RuntimeTrip, runtime_trip};
+
+    fn outcome(
+        f: impl FnOnce() -> i64 + std::panic::UnwindSafe,
+    ) -> Result<i64, Option<RuntimeTrip>> {
+        std::panic::catch_unwind(f).map_err(|p| runtime_trip(p.as_ref()))
+    }
+
+    fn overflow(op: IntOp) -> Result<i64, Option<RuntimeTrip>> {
+        Err(Some(RuntimeTrip::IntOverflow { op }))
+    }
+
+    #[test]
+    fn instant_shifts_trip_past_the_int_range() {
+        assert_eq!(
+            outcome(|| time_add_millis(1, i64::MAX)),
+            overflow(IntOp::Add)
+        );
+        assert_eq!(
+            outcome(|| time_add_millis(-1, i64::MIN)),
+            overflow(IntOp::Add)
+        );
+        assert_eq!(
+            outcome(|| time_diff_millis(i64::MAX, -1)),
+            overflow(IntOp::Sub)
+        );
+        assert_eq!(
+            outcome(|| time_diff_millis(i64::MIN, 1)),
+            overflow(IntOp::Sub)
+        );
+        assert_eq!(outcome(|| time_add_days(i64::MAX, 0)), overflow(IntOp::Mul));
+        assert_eq!(
+            outcome(|| time_add_hours(i64::MIN, 0)),
+            overflow(IntOp::Mul)
+        );
+        assert_eq!(
+            outcome(|| time_add_minutes(1, i64::MAX)),
+            overflow(IntOp::Add)
+        );
+        assert_eq!(
+            outcome(|| time_add_seconds(-1, i64::MIN)),
+            overflow(IntOp::Add)
+        );
+        assert_eq!(time_add_millis(-1, i64::MAX), i64::MAX - 1);
+        assert_eq!(time_diff_millis(i64::MAX, 0), i64::MAX);
+        assert_eq!(time_add_days(1, 0), 86_400_000);
+        assert_eq!(time_add_hours(-2, 0), -7_200_000);
+        assert_eq!(time_add_minutes(3, 5), 180_005);
+        assert_eq!(time_add_seconds(1, i64::MAX - 1000), i64::MAX);
+    }
+
+    #[test]
+    fn unit_diffs_are_exact_for_every_pair_of_ints() {
+        // The span `i64::MAX - i64::MIN` is past `Int`; its whole-unit
+        // quotient is not, and is the exact one — never a saturated span.
+        assert_eq!(
+            time_diff_seconds(i64::MAX, i64::MIN),
+            18_446_744_073_709_551
+        );
+        assert_eq!(
+            time_diff_seconds(i64::MIN, i64::MAX),
+            -18_446_744_073_709_551
+        );
+        assert_eq!(time_diff_minutes(i64::MAX, i64::MIN), 307_445_734_561_825);
+        assert_eq!(time_diff_hours(i64::MAX, i64::MIN), 5_124_095_576_030);
+        assert_eq!(time_diff_days(i64::MAX, i64::MIN), 213_503_982_334);
+        assert_eq!(time_diff_seconds(-1_999, 0), -1);
+        assert_eq!(time_diff_days(86_400_000, 0), 1);
     }
 }

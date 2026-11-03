@@ -137,6 +137,9 @@ repeat 0 "x" --> []
 repeat 4 0 --> [ 0, 0, 0, 0 ]
 ```
 
+A count of more than 10000000 is refused before anything is built: the
+program ends in a typed `LimitExceeded` error.
+
 ## `reverse`
 
 ```ipe
@@ -239,6 +242,9 @@ range 1 5 --> [ 1, 2, 3, 4, 5 ]
 range 3 3 --> [ 3 ]
 range 5 1 --> []
 ```
+
+A span of more than 10000000 integers is refused, never truncated: the
+program ends in a typed `LimitExceeded` error.
 
 ## `zip`
 
@@ -487,6 +493,9 @@ sum [] --> 0
 sum [ 1.5, 2.5 ] --> 4.0
 ```
 
+An `Int` partial result outside the 64-bit range ends in a typed
+`InvalidInput` error, like the `Int` operator it folds.
+
 ## `product`
 
 ```ipe
@@ -501,6 +510,9 @@ product [ 1, 2, 3, 4 ] --> 24
 product [] --> 1
 product [ 2.0, 0.5 ] --> 1.0
 ```
+
+An `Int` partial result outside the 64-bit range ends in a typed
+`InvalidInput` error, like the `Int` operator it folds.
 
 ## `maximum`
 

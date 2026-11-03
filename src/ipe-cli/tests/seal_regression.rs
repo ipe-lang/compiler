@@ -595,10 +595,9 @@ fn find_projection_bind_wildcard_builds_at_two_types() {
 
 /// `-9223372036854775808` (`i64::MIN`) is a literal in every position it can
 /// occur — a let value, a list and a tuple element, a top-level and a `Just`
-/// payload `case` arm, under unary minus (which wraps back to `i64::MIN`), and
-/// as the left operand of `+` — and a negative literal on the left of `+`
-/// (`-1 + x`) keeps its sign. The program type-checks, its crate builds, and
-/// it prints the arithmetic's values.
+/// payload `case` arm, and as the left operand of `+` — and a negative literal
+/// on the left of `+` (`-1 + x`) keeps its sign. The program type-checks, its
+/// crate builds, and it prints the arithmetic's values.
 #[test]
 fn int_min_literal_builds() {
     let src = format!(
@@ -640,9 +639,7 @@ fn int_min_literal_builds() {
          \x20           , String.fromInt (pairFirst ( -9223372036854775808, 1 ))\n\
          \x20           , classify smallest\n\
          \x20           , classifyMaybe (Just (-9223372036854775808))\n\
-         \x20           , String.fromInt (-smallest)\n\
          \x20           , String.fromInt ((-9223372036854775808) + 1)\n\
-         \x20           , String.fromInt (shift smallest)\n\
          \x20           , String.fromInt (shift 5)\n\
          \x20           ]\n\
          \x20       )\n"
@@ -655,11 +652,58 @@ fn int_min_literal_builds() {
          -9223372036854775808\n\
          min\n\
          just min\n\
-         -9223372036854775808\n\
          -9223372036854775807\n\
-         9223372036854775807\n\
          4\n",
     );
+}
+
+/// Assert that `shown`, printed from a program that binds `smallest` to
+/// `i64::MIN`, overflows `Int`: `ipe` accepts the program and, under `IPE_E2E`,
+/// its crate builds, exits non-zero, and prints nothing — an `Int` overflow is
+/// a typed runtime trip, never a wrap that reaches stdout.
+#[track_caller]
+fn assert_int_min_overflow_trips(name: &str, shown: &str) {
+    let src = format!(
+        "{HEAD}import Ipe.Io as Io\n\
+         import Ipe.String\n\n\
+         smallest : Int\n\
+         smallest =\n\
+         \x20   -9223372036854775808\n\n\
+         main =\n\
+         \x20   Io.println ({shown})\n"
+    );
+    let fixture = write_single(&src);
+    let out = out_dir(name);
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let built = ipe::build_fixture(&fixture, &out, &runtime).map(drop);
+    assert!(built.is_ok(), "{name}: ipe rejected the program: {built:?}");
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let ran = e2e_support::build_and_run_rust(name, &out);
+    assert!(
+        ran.is_ok(),
+        "{name}: emitted crate failed to build: {ran:?}"
+    );
+    let Ok(run) = ran else { return };
+    assert_ne!(
+        run.exit_code,
+        Some(0),
+        "{name}: an Int overflow exited 0 — it wrapped instead of tripping"
+    );
+    assert_eq!(run.stdout, "", "{name}: an overflowed value reached stdout");
+}
+
+/// Negating `i64::MIN` overflows `Int` and trips.
+#[test]
+fn int_min_negation_trips() {
+    assert_int_min_overflow_trips("int_min_negate_trips", "String.fromInt (-smallest)");
+}
+
+/// Adding `-1` to `i64::MIN` overflows `Int` and trips.
+#[test]
+fn int_min_minus_one_trips() {
+    assert_int_min_overflow_trips("int_min_minus_one_trips", "String.fromInt (-1 + smallest)");
 }
 
 /// Render `render(lo, hi)` until the parenthesised expression it returns sits

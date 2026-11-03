@@ -73,6 +73,7 @@ fn tui_teardown() {
     let _ = out.write_all(ALT_SCREEN_OFF.as_bytes());
     let _ = out.flush();
     let _ = crossterm::terminal::disable_raw_mode();
+    crate::color::end_tui_session_profile();
 }
 
 /// RAII terminal-state guard — restores cooked mode + cursor + main screen (and
@@ -153,6 +154,12 @@ impl TuiGuard {
         if let Err(e) = crossterm::terminal::enable_raw_mode() {
             return Err(classify_raw_mode_error(e));
         }
+        // Pin the session's colour profile now, once, before any frame paints —
+        // every `render_with_focus` call for the rest of this session reads this
+        // cached value instead of re-resolving the environment per frame. Paired
+        // with `end_tui_session_profile` in `tui_teardown`, reached from here on
+        // whichever path tears the session down.
+        crate::color::begin_tui_session_profile();
         TUI_MOUSE.store(mouse, Ordering::SeqCst);
         TUI_RESTORE_ACTIVE.store(true, Ordering::SeqCst);
         let mut out = std::io::stdout();

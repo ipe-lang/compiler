@@ -6,9 +6,15 @@
 //!   max    : a -> a -> a
 //!   sqrt   : Float -> Float
 //!   pow    : Float -> Float -> Float
-//!   floor  : Float -> Int                (note: returns Int, truncates)
+//!   floor  : Float -> Int
 //!   ceil   : Float -> Int
 //!   round  : Float -> Int
+//!
+//! An `Int` result outside the 64-bit range, and a `Float` to `Int` conversion
+//! of NaN or an infinity, end in a typed [`RuntimeTrip`], never a wrapped,
+//! saturated or truncated value.
+
+use crate::core::{FloatToIntOp, IntOp, RuntimeTrip, trip};
 
 #[must_use]
 pub fn math_pi() -> f64 {
@@ -48,7 +54,7 @@ pub fn math_is_nan(x: f64) -> bool {
 
 /// Ipê `Math.abs : Int -> Int`, a delegate of the one `abs` definition `basics_abs`.
 ///
-/// Saturates `i64::MIN` to `i64::MAX`, exactly as `Basics.abs` does.
+/// `abs i64::MIN` trips `IntOverflow`, exactly as `Basics.abs` does.
 #[must_use]
 pub fn math_abs(x: i64) -> i64 {
     crate::basics::basics_abs(x)
@@ -85,69 +91,49 @@ pub const fn ipe_int_exact_div(a: i64, b: i64) -> Option<i64> {
 
 /// Integer addition for Ipê's `+` operator on `Int` operands.
 ///
-/// The exact sum when it is in range; the out-of-range edge wraps
-/// (two's complement), regardless of any Cargo `overflow-checks` setting.
+/// The exact sum; a sum outside the 64-bit range trips `IntOverflow`,
+/// regardless of any Cargo `overflow-checks` setting.
 #[must_use]
 pub fn ipe_int_add(a: i64, b: i64) -> i64 {
-    ipe_int_exact_add(a, b).unwrap_or_else(|| a.wrapping_add(b))
+    ipe_int_exact_add(a, b).unwrap_or_else(|| trip(RuntimeTrip::IntOverflow { op: IntOp::Add }))
 }
 
 /// Integer subtraction for Ipê's `-` operator on `Int` operands.
 ///
-/// The exact difference when it is in range; the out-of-range edge wraps.
+/// The exact difference; one outside the 64-bit range trips `IntOverflow`.
 #[must_use]
 pub fn ipe_int_sub(a: i64, b: i64) -> i64 {
-    ipe_int_exact_sub(a, b).unwrap_or_else(|| a.wrapping_sub(b))
+    ipe_int_exact_sub(a, b).unwrap_or_else(|| trip(RuntimeTrip::IntOverflow { op: IntOp::Sub }))
 }
 
 /// Integer multiplication for Ipê's `*` operator on `Int` operands.
 ///
-/// The exact product when it is in range; the out-of-range edge wraps.
+/// The exact product; one outside the 64-bit range trips `IntOverflow`.
 #[must_use]
 pub fn ipe_int_mul(a: i64, b: i64) -> i64 {
-    ipe_int_exact_mul(a, b).unwrap_or_else(|| a.wrapping_mul(b))
+    ipe_int_exact_mul(a, b).unwrap_or_else(|| trip(RuntimeTrip::IntOverflow { op: IntOp::Mul }))
 }
 
 /// Integer division for Ipê's `//` operator.
 ///
-/// Integer division for Ipê's `//` operator.
-///
-/// Two cases the bare Rust `a / b` cannot handle on `i64`:
-///
-/// 1. `b == 0` — Rust panics "attempt to divide by zero", which is classified
-///    as `DivisionByZero` and exits 101. We reproduce the **panic** deliberately
-///    (not a silent 0): a `panic!` here carries the standard "attempt to divide
-///    by zero" message so the process's panic handler classifies it identically
-///    (`exit 101, empty stdout`), matching the `intdiv_by_zero_aborts_exit_101`
-///    golden.
-///
-///    NOTE: Elm's `5 // 0 == 0` (returns 0) is a different design choice and
-///    is **not** this port's target. Diverging from Ipê integer division to
-///    Elm-0 requires an explicit `sanctioned.divergence` marker — never an
-///    implementer's call.
-///
-/// 2. `i64::MIN / -1` — Rust panics "attempt to divide with overflow" even
-///    when `overflow-checks = false`, because this is an unconditional hardware
-///    trap on x86-64. Ipê uses two's-complement integer arithmetic and returns
-///    `i64::MIN` (wraps silently). `wrapping_div` reproduces that.
-///
-/// For every other `(a, b)` pair the result is identical to `a / b` (truncate
-/// toward zero — Elm spec, Rust `wrapping_div`).
+/// The truncating quotient (toward zero). `i64::MIN // -1`, whose exact
+/// quotient `2^63` is outside the 64-bit range, trips `IntOverflow`.
 ///
 /// # Panics
 ///
-/// Panics when `b == 0`, triggering the Ipê integer division-by-zero abort.
+/// Panics when `b == 0`, the Ipê integer division-by-zero abort: the standard
+/// "attempt to divide by zero" message the panic hook classifies as
+/// `DivisionByZero` (exit 101, empty stdout), as the
+/// `intdiv_by_zero_aborts_exit_101` golden pins.
 //
 // `clippy::panic` is suppressed here deliberately: this panic IS the
-// DivisionByZero abort. The lint exists to prevent accidental panics; this is
-// a classified, tested, intentional one. The `intdiv_by_zero_aborts_exit_101`
-// golden verifies exit 101 / empty stdout.
+// DivisionByZero abort, a classified, tested, intentional one.
 #[allow(clippy::panic)]
 #[must_use]
 pub fn ipe_int_div(a: i64, b: i64) -> i64 {
     // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — this abort IS the modeled integer division-by-zero semantics, classified and golden-tested (exit 101) [ledger #boundary]
     assert!(b != 0, "attempt to divide by zero");
-    a.wrapping_div(b)
+    ipe_int_exact_div(a, b).unwrap_or_else(|| trip(RuntimeTrip::IntOverflow { op: IntOp::Div }))
 }
 
 // CONTRACT (documented deliberately): `min`/`max` use a real `PartialOrd`
@@ -171,28 +157,54 @@ pub fn math_pow(base: f64, exp: f64) -> f64 {
     base.powf(exp)
 }
 
-// CONTRACT (documented deliberately): the `as i64` float→int casts SATURATE
-// by Rust's definition — NaN → 0, +∞ → i64::MAX, −∞ → i64::MIN, out-of-range
-// finite → the nearest bound. This is TOTAL (never panics/UB) and is the
-// deliberate contract, pinning safe saturating behaviour for all edge inputs.
-#[must_use]
-pub fn math_floor(x: f64) -> i64 {
-    x.floor() as i64
-}
-#[must_use]
-pub fn math_ceil(x: f64) -> i64 {
-    x.ceil() as i64
+/// The `Int` an integral `Float` names, for conversion `op`.
+///
+/// NaN or an infinity trips `NonFiniteToInt`; a finite value outside the
+/// 64-bit range trips `IntOverflow`. The narrowing itself is
+/// [`crate::narrow::f64_trunc_to_i64`], exact on an integral value in range.
+fn float_to_int(integral: f64, op: FloatToIntOp) -> i64 {
+    if !integral.is_finite() {
+        trip(RuntimeTrip::NonFiniteToInt { op });
+    }
+    crate::narrow::f64_trunc_to_i64(integral).unwrap_or_else(|| {
+        trip(RuntimeTrip::IntOverflow {
+            op: IntOp::FromFloat(op),
+        })
+    })
 }
 
-/// Ipê `round : Float -> Int` — half-away-from-zero ( `math.Round` semantics
-/// match this). Rust's `f64::round` also goes half-away-from-zero, so we just cast.
+/// Ipê `floor : Float -> Int`, the greatest `Int` not above `x`.
+#[must_use]
+pub fn math_floor(x: f64) -> i64 {
+    float_to_int(x.floor(), FloatToIntOp::Floor)
+}
+
+/// Ipê `ceil : Float -> Int`, the least `Int` not below `x`.
+#[must_use]
+pub fn math_ceil(x: f64) -> i64 {
+    float_to_int(x.ceil(), FloatToIntOp::Ceiling)
+}
+
+/// Ipê `round : Float -> Int`, ties toward positive infinity (Elm):
+/// `round 2.5 == 3`, `round (-2.5) == -2`.
+///
+/// The tie test reads `x - floor x`, exact for `|x| >= 1` (Sterbenz) and for
+/// `0 <= x < 1`; for `-1 < x < 0` it is `x + 1`, whose rounding cannot cross
+/// one half because no `x` lies within half an ulp of `-0.5`. So a value below
+/// one half never rounds up, as `floor (x + 0.5)` does for
+/// `0.49999999999999994`. NaN and the infinities reach `float_to_int`
+/// unchanged and trip there.
 #[must_use]
 pub fn math_round(x: f64) -> i64 {
-    x.round() as i64
+    let below = x.floor();
+    let nearest = if x - below >= 0.5 { below + 1.0 } else { below };
+    float_to_int(nearest, FloatToIntOp::Round)
 }
+
+/// Ipê `trunc : Float -> Int`, toward zero.
 #[must_use]
 pub fn math_trunc(x: f64) -> i64 {
-    x.trunc() as i64
+    float_to_int(x.trunc(), FloatToIntOp::Truncate)
 }
 
 // Exponential / logarithmic (Ipe.Math: exp, exp2, log [natural], log2, log10).
@@ -350,41 +362,92 @@ pub fn math_remainder(x: f64, y: f64) -> f64 {
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
+    use crate::core::runtime_trip;
+
+    /// The value `f` returns, or the `RuntimeTrip` it unwinds with.
+    fn outcome<T>(
+        f: impl FnOnce() -> T + std::panic::UnwindSafe,
+    ) -> Result<T, Option<RuntimeTrip>> {
+        std::panic::catch_unwind(f).map_err(|payload| runtime_trip(payload.as_ref()))
+    }
+
+    /// The `IntOverflow` trip of `op`, as [`outcome`] reports it.
+    const fn overflow<T>(op: IntOp) -> Result<T, Option<RuntimeTrip>> {
+        Err(Some(RuntimeTrip::IntOverflow { op }))
+    }
 
     #[test]
-    fn ipe_int_add_wraps_at_max() {
-        assert_eq!(ipe_int_add(i64::MAX, 1), i64::MIN);
+    fn ipe_int_add_trips_at_max() {
+        assert_eq!(outcome(|| ipe_int_add(i64::MAX, 1)), overflow(IntOp::Add));
         assert_eq!(ipe_int_add(0, 0), 0);
         assert_eq!(ipe_int_add(3, 4), 7);
     }
 
     #[test]
-    fn ipe_int_sub_wraps_at_min() {
-        assert_eq!(ipe_int_sub(i64::MIN, 1), i64::MAX);
+    fn ipe_int_sub_trips_at_min() {
+        assert_eq!(outcome(|| ipe_int_sub(i64::MIN, 1)), overflow(IntOp::Sub));
         assert_eq!(ipe_int_sub(10, 3), 7);
         assert_eq!(ipe_int_sub(0, 0), 0);
     }
 
     #[test]
-    fn ipe_int_mul_wraps_on_overflow() {
-        assert_eq!(ipe_int_mul(i64::MAX, 2), -2);
+    fn ipe_int_mul_trips_on_overflow() {
+        assert_eq!(outcome(|| ipe_int_mul(i64::MAX, 2)), overflow(IntOp::Mul));
         assert_eq!(ipe_int_mul(3, 4), 12);
         assert_eq!(ipe_int_mul(0, i64::MAX), 0);
     }
 
-    // The `IpeWrapping*` trait impls (generic `Number a` bodies) and the
-    // `ipe_int_*` operators (monomorphic `Int` bodies) must agree at every edge.
+    // `i64::MIN // -1` has no 64-bit quotient: it trips, never wraps to `MIN`.
     #[test]
-    fn int_wrap_single_definition() {
+    fn ipe_int_div_min_by_neg_one_trips() {
+        assert_eq!(outcome(|| ipe_int_div(i64::MIN, -1)), overflow(IntOp::Div));
+        assert_eq!(ipe_int_div(i64::MIN, 1), i64::MIN);
+        assert_eq!(ipe_int_div(-7, 2), -3);
+    }
+
+    // The `IpeWrapping*` trait impls (generic `Number a` bodies) and the
+    // `ipe_int_*` operators (monomorphic `Int` bodies) agree at every edge:
+    // the same value in range, the same typed `IntOverflow` trip outside it.
+    #[test]
+    fn int_overflow_trips_typed() {
         use crate::basics::{IpeWrappingAdd, IpeWrappingMul, IpeWrappingSub};
         let edges = [i64::MIN, -1, 0, 1, i64::MAX];
+        let mut trips = 0_usize;
         for a in edges {
             for b in edges {
-                assert_eq!(a.ipe_wrapping_add(b), ipe_int_add(a, b), "{a} + {b}");
-                assert_eq!(a.ipe_wrapping_sub(b), ipe_int_sub(a, b), "{a} - {b}");
-                assert_eq!(a.ipe_wrapping_mul(b), ipe_int_mul(a, b), "{a} * {b}");
+                let cases = [
+                    (
+                        outcome(|| a.ipe_wrapping_add(b)),
+                        outcome(|| ipe_int_add(a, b)),
+                        ipe_int_exact_add(a, b),
+                        IntOp::Add,
+                    ),
+                    (
+                        outcome(|| a.ipe_wrapping_sub(b)),
+                        outcome(|| ipe_int_sub(a, b)),
+                        ipe_int_exact_sub(a, b),
+                        IntOp::Sub,
+                    ),
+                    (
+                        outcome(|| a.ipe_wrapping_mul(b)),
+                        outcome(|| ipe_int_mul(a, b)),
+                        ipe_int_exact_mul(a, b),
+                        IntOp::Mul,
+                    ),
+                ];
+                for (generic, int, exact, op) in cases {
+                    assert_eq!(generic, int, "{a} {op:?} {b}");
+                    match exact {
+                        Some(value) => assert_eq!(int, Ok(value), "{a} {op:?} {b}"),
+                        None => {
+                            trips += 1;
+                            assert_eq!(int, overflow(op), "{a} {op:?} {b}");
+                        }
+                    }
+                }
             }
         }
+        assert!(trips > 0, "the edge table reaches the overflow arm");
     }
 
     // The exact half refuses every out-of-range edge and agrees with the
@@ -425,12 +488,19 @@ mod tests {
         }
     }
 
-    // `Math.abs` and `Basics.abs` share one definition, edges included.
+    // `Math.abs` and `Basics.abs` share one definition, edges included:
+    // `abs i64::MIN` trips `IntOverflow` through both.
     #[test]
     fn abs_kernels_agree_on_min() {
         for x in [i64::MIN, i64::MIN + 1, -7, -1, 0, 1, 7, i64::MAX] {
-            assert_eq!(math_abs(x), crate::basics::basics_abs(x), "abs {x}");
+            assert_eq!(
+                outcome(|| math_abs(x)),
+                outcome(|| crate::basics::basics_abs(x)),
+                "abs {x}"
+            );
         }
+        assert_eq!(outcome(|| math_abs(i64::MIN)), overflow(IntOp::Abs));
+        assert_eq!(math_abs(i64::MIN + 1), i64::MAX);
     }
 
     #[test]
@@ -478,9 +548,72 @@ mod tests {
         assert_eq!(math_floor(-3.2), -4);
         assert_eq!(math_ceil(3.2), 4);
         assert_eq!(math_ceil(-3.7), -3);
-        assert_eq!(math_round(3.5), 4);
-        assert_eq!(math_round(-3.5), -4); // half-away-from-zero
         assert_eq!(math_round(2.4), 2);
+        assert_eq!(math_trunc(-3.7), -3);
+    }
+
+    // `round` breaks a tie toward positive infinity, as Elm and the Math
+    // module docs say, never away from zero; a value one ulp below one half
+    // is not a tie.
+    #[test]
+    fn round_ties_toward_positive_infinity() {
+        for (x, rounded) in [
+            (3.5, 4),
+            (2.5, 3),
+            (0.5, 1),
+            (-0.5, 0),
+            (-2.5, -2),
+            (-3.5, -3),
+            (-3.6, -4),
+            (-3.4, -3),
+            (0.499_999_999_999_999_94, 0),
+            (-0.500_000_000_000_000_1, -1),
+            (-1.0e-20, 0),
+            (4_503_599_627_370_495.5, 4_503_599_627_370_496),
+            (-4_503_599_627_370_495.5, -4_503_599_627_370_495),
+        ] {
+            assert_eq!(math_round(x), rounded, "round {x}");
+        }
+    }
+
+    // A non-finite value trips `NonFiniteToInt`; a finite value past either
+    // end of the `Int` range trips `IntOverflow`; the last in-range values
+    // convert exactly.
+    #[test]
+    fn float_to_int_trips_typed() {
+        type Conv = fn(f64) -> i64;
+        let convs: [(Conv, FloatToIntOp); 4] = [
+            (math_floor, FloatToIntOp::Floor),
+            (math_ceil, FloatToIntOp::Ceiling),
+            (math_round, FloatToIntOp::Round),
+            (math_trunc, FloatToIntOp::Truncate),
+        ];
+        for (conv, op) in convs {
+            for x in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                assert_eq!(
+                    outcome(|| conv(x)),
+                    Err(Some(RuntimeTrip::NonFiniteToInt { op })),
+                    "{op:?} {x}"
+                );
+            }
+            for x in [
+                9_223_372_036_854_775_808.0,
+                -9_223_372_036_854_777_856.0,
+                1.0e300,
+            ] {
+                assert_eq!(
+                    outcome(|| conv(x)),
+                    overflow(IntOp::FromFloat(op)),
+                    "{op:?} {x}"
+                );
+            }
+            assert_eq!(conv(-9_223_372_036_854_775_808.0), i64::MIN, "{op:?}");
+            assert_eq!(
+                conv(9_223_372_036_854_774_784.0),
+                9_223_372_036_854_774_784,
+                "{op:?}"
+            );
+        }
     }
 
     // ── go-parity regression tests ──────────────────────

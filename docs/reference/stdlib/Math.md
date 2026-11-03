@@ -15,7 +15,8 @@ namespace clear. Floating-point results follow IEEE 754 — `nan` and
 `inf` are valid `Float` values, and `isNaN` is the correct test for NaN.
 
 `Int` and `Float` never convert implicitly. `floor`, `ceil`, `round`, and
-`trunc` take a `Float` to an `Int`. To take an `Int` to a `Float`, go
+`trunc` take a `Float` to an `Int`; a non-finite or out-of-range `Float` has
+no `Int` result and ends in a typed error. To take an `Int` to a `Float`, go
 through `Ipe.Decimal`, which holds every `Int` exactly:
 `Decimal.toFloat (Decimal.fromInt n)` yields the nearest `Float`, exact
 whenever `abs n <= 2^53`.
@@ -220,6 +221,10 @@ floor (-3.7) --> -4
 floor 3.0 --> 3
 ```
 
+NaN, an infinity, or a value outside the 64-bit `Int` range has no `Int`
+result: the program ends in a typed `InvalidInput` error, never a wrapped
+or saturated number.
+
 ## `ceil`
 
 ```ipe
@@ -233,6 +238,10 @@ ceil 3.2 --> 4
 ceil (-3.2) --> -3
 ceil 3.0 --> 3
 ```
+
+NaN, an infinity, or a value outside the 64-bit `Int` range has no `Int`
+result: the program ends in a typed `InvalidInput` error, never a wrapped
+or saturated number.
 
 ## `round`
 
@@ -250,6 +259,10 @@ round 3.5 --> 4
 round (-3.5) --> -3
 ```
 
+NaN, an infinity, or a value outside the 64-bit `Int` range has no `Int`
+result: the program ends in a typed `InvalidInput` error, never a wrapped
+or saturated number.
+
 ## `trunc`
 
 ```ipe
@@ -265,6 +278,10 @@ trunc 3.7 --> 3
 trunc (-3.7) --> -3
 trunc 3.0 --> 3
 ```
+
+NaN, an infinity, or a value outside the 64-bit `Int` range has no `Int`
+result: the program ends in a typed `InvalidInput` error, never a wrapped
+or saturated number.
 
 ## `sin`
 
