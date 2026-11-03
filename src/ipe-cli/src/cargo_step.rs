@@ -1352,13 +1352,13 @@ impl LineCut {
     }
 }
 
-/// Show one whole stdout line of a JSON build through `live`: a
+/// Show `json`, one whole stdout line of a JSON build, through `live`: a
 /// `compiler-artifact` record counts one crate built, a `compiler-message`
 /// record shows its rendered diagnostic. Any other line, a line that is not
 /// JSON included, shows nothing: progress is advisory, and the kept stream
 /// stays the build's authoritative record.
-fn show_json_line<W: Write>(line: &[u8], live: &Mutex<Live<W>>) {
-    let Ok(record) = serde_json::from_slice::<serde_json::Value>(line) else {
+fn show_json_line<W: Write>(json: &[u8], live: &Mutex<Live<W>>) {
+    let Ok(record) = serde_json::from_slice::<serde_json::Value>(json) else {
         return;
     };
     match record.get("reason").and_then(serde_json::Value::as_str) {
@@ -1960,8 +1960,8 @@ mod tests {
         let mut buf = Vec::new();
         {
             let live = progress_live(&mut buf, Mode::Plain);
-            let line = r#"{"reason":"compiler-artifact","target":{"name":"c"}}"#;
-            let stdout = format!("{line}\n").repeat(5000);
+            let record = r#"{"reason":"compiler-artifact","target":{"name":"c"}}"#;
+            let stdout = format!("{record}\n").repeat(5000);
             feed_stdout(stdout.as_bytes(), super::ARTIFACT_STREAM_CAP, &live);
             assert_eq!(counted(&live), 5000);
             live.into_inner().expect("unpoisoned").finish(true);
@@ -1975,14 +1975,14 @@ mod tests {
     /// Nothing past the kept stream's ceiling is shown or counted.
     #[test]
     fn an_artifact_past_the_kept_ceiling_is_not_counted() {
-        let line = format!(
+        let record = format!(
             "{}\n",
             r#"{"reason":"compiler-artifact","target":{"name":"c"}}"#
         );
-        let stdout = line.repeat(10);
+        let stdout = record.repeat(10);
         let mut buf = Vec::new();
         let live = progress_live(&mut buf, Mode::Plain);
-        feed_stdout(stdout.as_bytes(), line.len() * 3 + 5, &live);
+        feed_stdout(stdout.as_bytes(), record.len() * 3 + 5, &live);
         assert_eq!(counted(&live), 3);
     }
 
@@ -1993,10 +1993,10 @@ mod tests {
         {
             let live = progress_live(&mut buf, Mode::Plain);
             let name = "n".repeat(super::CRATE_NAME_SHOWN * 4);
-            let line = format!(
+            let record = format!(
                 "{{\"reason\":\"compiler-artifact\",\"target\":{{\"name\":\"{name}\"}}}}\n"
             );
-            feed_stdout(line.as_bytes(), super::ARTIFACT_STREAM_CAP, &live);
+            feed_stdout(record.as_bytes(), super::ARTIFACT_STREAM_CAP, &live);
             live.into_inner().expect("unpoisoned").finish(false);
         }
         let out = String::from_utf8(buf).expect("utf8");

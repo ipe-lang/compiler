@@ -2650,7 +2650,7 @@ struct WasmTools<'a> {
 impl WasmTools<'static> {
     /// The tools on `PATH` a `posture` bundle runs: a development bundle
     /// skips the `wasm-opt` size pass.
-    const fn for_posture(posture: BuildPosture) -> Self {
+    fn for_posture(posture: BuildPosture) -> Self {
         Self {
             bindgen: Path::new("wasm-bindgen"),
             opt: match posture {
