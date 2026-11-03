@@ -16,8 +16,8 @@
 //! - A `Server.*` path starts with `/` and is split and its segments read like
 //!   a `Web.route` pattern's. It holds at most `MAX_SERVER_PARAMS` parameters,
 //!   and its router spelling (each literal re-escaped by the runtime's one
-//!   segment alphabet, each parameter `:p` and its ordinal) is within the
-//!   length ceiling.
+//!   segment alphabet, each parameter measured by the runtime's own
+//!   `router_param_len`) is within the length ceiling.
 //! - A `Server.api` spec's method, when it names one, is a method the
 //!   runtime's own `EndpointMethod::parse` admits.
 //! - A `Server.static` or `Server.mountApp` prefix is a string literal parsed
@@ -31,7 +31,9 @@ use ipe_diagnostics::{
     DResult, Diagnostic, LowerError, MountPrefixFault, RoutePatternDefect, Span,
 };
 use ipe_ir::{Callee, Expr, KernelFn, Program};
-use ipe_runtime_rust::encoding::{EndpointMethod, MAX_MOUNT_BASE_LEN, MountBase, MountBaseRefusal};
+use ipe_runtime_rust::encoding::{
+    EndpointMethod, MAX_MOUNT_BASE_LEN, MountBase, MountBaseRefusal, router_param_len,
+};
 
 /// The runtime's `MAX_URL_COMPONENT_LEN`: the longest pattern it parses.
 pub const MAX_PATH_LEN: usize = 32 * 1024 * 1024;
@@ -227,8 +229,8 @@ fn route_segment<'a>(
 /// `TooLong` for a path over [`MAX_PATH_LEN`] bytes, `NotAbsolute` for one
 /// without a leading `/`, then the defect of the first malformed segment, then
 /// `TooManyParams` past [`MAX_SERVER_PARAMS`] parameters, then `TooLong` when
-/// the router spelling (each parameter `:p` and its ordinal) would pass the
-/// ceiling.
+/// the router spelling (each parameter measured by the runtime's
+/// `router_param_len`) would pass the ceiling.
 pub fn server_route_path(path: &str) -> Result<(), RoutePatternDefect> {
     if path.len() > MAX_PATH_LEN {
         return Err(RoutePatternDefect::TooLong { cap: MAX_PATH_LEN });
@@ -246,9 +248,7 @@ pub fn server_route_path(path: &str) -> Result<(), RoutePatternDefect> {
     for raw in trimmed.split('/') {
         let seg_len = match route_segment(raw, &mut names)? {
             SegmentShape::Param => {
-                // `:p` and the ordinal; a path past `MAX_SERVER_PARAMS` (two
-                // digits at most) is refused before its spelling is measured.
-                let spelled_param = if params < 10 { 3 } else { 4 };
+                let spelled_param = router_param_len(params);
                 params = params.saturating_add(1);
                 spelled_param
             }

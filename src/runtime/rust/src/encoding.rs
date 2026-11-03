@@ -1631,6 +1631,32 @@ impl ServerPattern {
     }
 }
 
+/// What opens a parameter's router spelling, before its ordinal.
+const ROUTER_PARAM_OPEN: &str = "{p";
+
+/// What closes a parameter's router spelling, after its ordinal.
+const ROUTER_PARAM_CLOSE: &str = "}";
+
+/// The bytes the router spelling of the parameter numbered `ordinal` takes
+/// ([`ServerPattern::router_path`]): the opener, the ordinal's decimal digits
+/// and the closer.
+///
+/// The compiler measures a literal `Server.*` path's router spelling with it,
+/// so its length ceiling and the runtime's agree on every parameter spelling.
+#[must_use]
+pub const fn router_param_len(ordinal: usize) -> usize {
+    let mut digits: usize = 1;
+    let mut rest = ordinal / 10;
+    while rest > 0 {
+        digits = digits.saturating_add(1);
+        rest /= 10;
+    }
+    ROUTER_PARAM_OPEN
+        .len()
+        .saturating_add(digits)
+        .saturating_add(ROUTER_PARAM_CLOSE.len())
+}
+
 /// The router spelling of `pattern` ([`ServerPattern::router_path`]).
 fn router_spelling(
     pattern: &RoutePattern,
@@ -1657,9 +1683,9 @@ fn router_spelling(
         match seg {
             PatternSeg::Literal(lit) => push(&canonical_segment(lit))?,
             PatternSeg::Param(_) => {
-                push("{p")?;
+                push(ROUTER_PARAM_OPEN)?;
                 push(&ordinal.to_string())?;
-                push("}")?;
+                push(ROUTER_PARAM_CLOSE)?;
                 ordinal = ordinal.saturating_add(1);
             }
         }
@@ -3093,6 +3119,23 @@ mod server_pattern_tests {
         let root = ServerPattern::parse("/").expect("well-formed pattern");
         assert_eq!(root.trailing(), TrailingSlash::Absent);
         assert!(root.pattern().segments().is_empty());
+    }
+
+    /// `router_param_len` measures exactly the spelling the router registers
+    /// for every parameter ordinal a pattern may hold.
+    #[test]
+    #[allow(clippy::expect_used)] // test table: every pattern is well-formed
+    fn router_param_len_measures_the_registered_spelling() {
+        for n in 1..=MAX_SERVER_PARAMS {
+            let raw: String = (0..n).map(|i| format!("/:v{i}")).collect();
+            let pattern = ServerPattern::parse(&raw).expect("well-formed pattern");
+            let measured: usize = (0..n).map(|i| 1 + router_param_len(i)).sum();
+            assert_eq!(pattern.router_path().len(), measured, "{n} params");
+        }
+        assert_eq!(router_param_len(0), "{p0}".len());
+        assert_eq!(router_param_len(10), "{p10}".len());
+        assert_eq!(router_param_len(99), "{p99}".len());
+        assert_eq!(router_param_len(100), "{p100}".len());
     }
 
     /// The router spelling of a literal pattern is the canonical spelling of
