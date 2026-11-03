@@ -351,6 +351,10 @@ pub(crate) enum OriginHeader<'a> {
 #[cfg(feature = "server")]
 impl<'a> OriginHeader<'a> {
     /// The `Origin` of a request head's raw header map.
+    ///
+    /// Read only by the `web` sites that hold a raw request head (`csrf.rs`,
+    /// `console.rs`); `server` alone reads the program-visible dict.
+    #[cfg(feature = "web")]
     pub(crate) fn of(headers: &'a axum::http::HeaderMap) -> Self {
         Self::read(
             headers
@@ -840,11 +844,11 @@ mod tests {
         assert_eq!(canonical_header("über-key"), "über-Key");
     }
 
-    /// The one `Origin` reading: absent, one visible-ASCII copy, or refused
-    /// when repeated (in the raw map or as two spellings in a dict) or not
-    /// visible ASCII.
+    /// The one `Origin` reading of a raw header map: absent, one
+    /// visible-ASCII copy, or refused when repeated or not visible ASCII.
+    #[cfg(feature = "web")]
     #[test]
-    fn origin_header_reads_one_copy_or_refuses() {
+    fn origin_header_reads_one_raw_copy_or_refuses() {
         use super::OriginHeader;
         use axum::http::{HeaderMap, HeaderValue, header::ORIGIN};
         let map = |copies: &[&[u8]]| {
@@ -866,6 +870,15 @@ mod tests {
         assert_eq!(OriginHeader::of(&two), OriginHeader::Refused);
         let obs = map(&[b"https://a.example\xe9"]);
         assert_eq!(OriginHeader::of(&obs), OriginHeader::Refused);
+    }
+
+    /// The one `Origin` reading of a program-visible dict: one copy in any
+    /// name case, refused when two spellings carry it or it is not visible
+    /// ASCII.
+    #[cfg(feature = "server")]
+    #[test]
+    fn origin_header_reads_one_dict_copy_or_refuses() {
+        use super::OriginHeader;
         let dict = |pairs: &[(&str, &str)]| -> crate::dict::IpeDict<String> {
             pairs
                 .iter()
