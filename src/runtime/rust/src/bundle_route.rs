@@ -239,7 +239,7 @@ fn index_at(dir: &str, has: &impl Fn(&BundlePath) -> bool) -> Route {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::{MediaType, Route, route};
     use crate::encoding::{BundlePath, MountBase};
