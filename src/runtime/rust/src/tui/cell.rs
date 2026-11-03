@@ -80,6 +80,35 @@ pub fn sanitize_rune(c: char) -> char {
     if is_display_hazard(c) { ' ' } else { c }
 }
 
+/// Map a display hazard to a space, keeping `'\n'` as the line break it is.
+///
+/// The one rule for text whose line breaks are structure (a paragraph, a
+/// textarea's value and its edits): every other control still becomes a space.
+#[must_use]
+pub fn sanitize_rune_keeping_newline(c: char) -> char {
+    if c == '\n' { c } else { sanitize_rune(c) }
+}
+
+/// Make a whole text frame safe to write to a raw-mode terminal.
+///
+/// Each `'\n'` (with a `'\r'` directly before it) is a row break, written
+/// `"\r\n"` because raw mode moves the cursor down without returning it; every
+/// other character goes through [`sanitize_rune`], so the frame carries no
+/// control sequence, bidi control or line separator of its own.
+#[must_use]
+pub fn sanitize_frame(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' => out.push_str("\r\n"),
+            '\r' if chars.peek() == Some(&'\n') => {}
+            other => out.push(sanitize_rune(other)),
+        }
+    }
+    out
+}
+
 /// Display width of a char, clamped to [0, 2]. A control char (no width) reads
 /// as 1 (it is sanitised to a space upstream).
 pub fn char_width(c: char) -> u8 {
@@ -179,6 +208,44 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// A frame keeps its row breaks as `"\r\n"` and blanks every other hazard.
+    ///
+    /// CI job `runtime-full-features-run`.
+    #[test]
+    fn sanitize_frame_keeps_rows_and_blanks_hazards() {
+        assert_eq!(
+            sanitize_frame("a\x1b]0;x\x07\u{202E}b\nc\r\nd\re"),
+            "a ]0;x  b\r\nc\r\nd e"
+        );
+        assert_eq!(sanitize_frame(""), "");
+        assert_eq!(sanitize_frame("\n"), "\r\n");
+        assert_eq!(sanitize_frame("\r"), " ");
+    }
+
+    /// Every character but the row break leaves a frame as [`sanitize_rune`] maps it.
+    ///
+    /// CI job `runtime-full-features-run`.
+    #[test]
+    fn sanitize_frame_agrees_with_the_rune_sanitiser() -> Result<(), String> {
+        for c in char::MIN..=char::MAX {
+            if c == '\n' {
+                continue;
+            }
+            let framed = sanitize_frame(&c.to_string());
+            if framed != sanitize_rune(c).to_string() {
+                return Err(format!("U+{:04X} frames as {framed:?}", u32::from(c)));
+            }
+            if sanitize_rune_keeping_newline(c) != sanitize_rune(c) {
+                return Err(format!("U+{:04X} kept-newline differs", u32::from(c)));
+            }
+        }
+        if sanitize_rune_keeping_newline('\n') == '\n' {
+            Ok(())
+        } else {
+            Err("the kept line break was blanked".to_owned())
+        }
     }
 
     #[test]

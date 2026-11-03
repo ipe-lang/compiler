@@ -14,7 +14,7 @@
 //! arithmetic; nothing indexes or unwraps.
 
 use super::super::html::{Attribute as HtmlAttribute, Event};
-use super::cell::sanitize_rune;
+use super::cell::sanitize_rune_keeping_newline;
 use std::collections::HashMap;
 
 /// Per-input editor state, keyed by focus (tab-order) index in the registry.
@@ -195,10 +195,7 @@ pub fn edit_input(st: &mut InputState, kind: &str, value: &str) -> bool {
         "char" => {
             // The buffer is drawn as typed, so a pasted display hazard is
             // blanked here; a textarea's Enter arrives as `\n`, its line break.
-            let ins: Vec<char> = value
-                .chars()
-                .map(|c| if c == '\n' { c } else { sanitize_rune(c) })
-                .collect();
+            let ins: Vec<char> = value.chars().map(sanitize_rune_keeping_newline).collect();
             let mut next: Vec<char> = Vec::with_capacity(n + ins.len());
             next.extend_from_slice(runes.get(..st.cursor).unwrap_or(&[]));
             next.extend_from_slice(&ins);
