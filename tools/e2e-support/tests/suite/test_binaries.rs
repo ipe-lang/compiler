@@ -155,7 +155,7 @@ const SYNTHETIC_PATHS: &[(&str, &str)] = &[
 /// [`Reason::Unconsolidated`]. A row may only equal the live count, so moving
 /// a target into a harness lowers it and adding one cannot raise it unseen.
 const UNCONSOLIDATED_CEILINGS: &[(&str, usize)] = &[
-    ("ipe", 140),
+    ("ipe", 141),
     ("ipe-runtime-rust", 44),
     ("ipe_backend_rust", 35),
     ("ipe_bindgen", 1),
@@ -209,6 +209,7 @@ const TEST_BINARIES: &[(&str, &str, Reason)] = &[
     ),
     ("ipe", "capabilities", Reason::Unconsolidated),
     ("ipe", "capability_inference", Reason::Unconsolidated),
+    ("ipe", "cargo_profile_scan", Reason::Unconsolidated),
     ("ipe", "cargo_step_scan", Reason::Unconsolidated),
     ("ipe", "child_runner_scan", Reason::Unconsolidated),
     ("ipe", "clean_vs_incremental_parity", Reason::Unconsolidated),
