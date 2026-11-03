@@ -13,7 +13,7 @@ use ipe_diagnostics::suggest;
 use crate::api_surface::ModulePath;
 use crate::cargo_step::{
     BuildPosture, CargoBuild, CargoCrate, CargoOutput, CargoTarget, EmbeddedApp, TestRunKey,
-    Verbosity,
+    Verbosity, WasmArtifactRefusal,
 };
 use crate::delivery::HostIntent;
 use crate::delivery_set::{ReleaseRoute, release_route};
@@ -2615,7 +2615,7 @@ pub fn bundle_wasm(
     // itself raises is already fail-closed).
     let target_dir =
         crate::target_dir::LinkableTargetDir::for_crate(cargo_bin.path(), out_dir, None)?;
-    let messages = CargoBuild {
+    let build = CargoBuild {
         cargo: &cargo_bin,
         krate: CargoCrate::Emitted(crate_dir),
         posture,
@@ -2624,11 +2624,12 @@ pub fn bundle_wasm(
         output: CargoOutput::JsonStream(Verbosity::Progress),
         what: "the emitted wasm program",
         runtime: runtime_context_for_message(),
-    }
-    .run()?;
+    };
+    let artifacts = build.artifact_dir();
+    let messages = build.run()?;
 
     // Step 2: wasm-bindgen — the .wasm cargo's own record names.
-    let wasm_path = wasm_artifact_path(&messages, posture, CargoTarget::WasmBrowser, out_dir)?;
+    let wasm_path = wasm_artifact_path(&messages, &artifacts, CargoTarget::WasmBrowser, out_dir)?;
 
     bundle_wasm_pkg(
         crate_dir,
@@ -2842,7 +2843,7 @@ pub fn bundle_wasi(crate_dir: &OwnedDir, posture: BuildPosture) -> Result<PathBu
     // `cargo metadata` can invalidate.
     let target_dir =
         crate::target_dir::LinkableTargetDir::for_crate(cargo_bin.path(), out_dir, None)?;
-    let messages = CargoBuild {
+    let build = CargoBuild {
         cargo: &cargo_bin,
         krate: CargoCrate::Emitted(crate_dir),
         posture,
@@ -2851,13 +2852,14 @@ pub fn bundle_wasi(crate_dir: &OwnedDir, posture: BuildPosture) -> Result<PathBu
         output: CargoOutput::JsonStream(Verbosity::Progress),
         what: "the emitted wasm32-wasip1 module",
         runtime: runtime_context_for_message(),
-    }
-    .run()?;
+    };
+    let artifacts = build.artifact_dir();
+    let messages = build.run()?;
 
     // The authoritative module path: the `.wasm` bin artifact cargo reported it
     // wrote. Same value the executor loads — build-output and load-path are one
     // by construction, immune to any target-dir divergence.
-    let module = wasm_artifact_path(&messages, posture, CargoTarget::Wasip1, out_dir)?;
+    let module = wasm_artifact_path(&messages, &artifacts, CargoTarget::Wasip1, out_dir)?;
     let module_size = format_artifact_size(artifact_size_bytes(&module)?);
     crate::screen::chatter(
         crate::screen::Stream::Stderr,
@@ -2872,24 +2874,31 @@ pub fn bundle_wasi(crate_dir: &OwnedDir, posture: BuildPosture) -> Result<PathBu
     Ok(module)
 }
 
-/// The `.wasm` module a `target` build in `posture` wrote, as cargo's
-/// `--message-format=json` record names it ([`crate::cargo_step::wasm_artifact`]).
+/// The `.wasm` module a `target` build wrote into `artifacts`, its
+/// [`CargoBuild::artifact_dir`], as cargo's `--message-format=json` record
+/// names it ([`crate::cargo_step::wasm_artifact`]).
 ///
 /// # Errors
-/// [`CliError::Usage`] when no record names the module (a cargo/JSON-schema
-/// mismatch surfaces here as a precise root-cause message rather than a
-/// downstream "could not load the module" from a guessed path).
+/// [`CliError::Usage`] when no record names the module, or records name two
+/// (a cargo/JSON-schema mismatch surfaces here as a precise root-cause
+/// message rather than a downstream "could not load the module" from a
+/// guessed path).
 fn wasm_artifact_path(
     messages: &str,
-    posture: BuildPosture,
+    artifacts: &Path,
     target: CargoTarget,
     out_dir: &Path,
 ) -> Result<PathBuf, CliError> {
-    crate::cargo_step::wasm_artifact(messages, posture, target).ok_or_else(|| {
-        CliError::Usage(text::msg::wasm_artifact_missing(
-            &target.triple().unwrap_or("host"),
-            &out_dir.display(),
-        ))
+    let triple = target.triple().unwrap_or("host");
+    crate::cargo_step::wasm_artifact(messages, artifacts).map_err(|refusal| {
+        CliError::Usage(match refusal {
+            WasmArtifactRefusal::Missing => {
+                text::msg::wasm_artifact_missing(&triple, &out_dir.display())
+            }
+            WasmArtifactRefusal::Ambiguous => {
+                text::msg::wasm_artifact_ambiguous(&triple, &out_dir.display())
+            }
+        })
     })
 }
 
@@ -5513,11 +5522,23 @@ mod held_crate_tests {
 
 #[cfg(test)]
 mod wasm_locate_tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use super::{WasmTools, wasm_artifact_path};
     use crate::CliError;
     use crate::cargo_step::{BuildPosture, CargoTarget};
+
+    /// The module `stream` names for a `target` build in `posture` under the
+    /// build directory `target_dir`.
+    fn locate(
+        stream: &str,
+        posture: BuildPosture,
+        target: CargoTarget,
+        target_dir: &str,
+    ) -> Result<PathBuf, CliError> {
+        let artifacts = posture.artifact_dir(Path::new(target_dir), target);
+        wasm_artifact_path(stream, &artifacts, target, Path::new("/c"))
+    }
 
     /// The module path is the one cargo's record names, in the build's posture.
     #[test]
@@ -5527,14 +5548,11 @@ mod wasm_locate_tests {
             "\n",
             r#"{"reason":"compiler-artifact","filenames":["/c/t/wasm32-unknown-unknown/debug/ipe_app.wasm"]}"#,
             "\n",
+            r#"{"reason":"compiler-artifact","filenames":["/c/t/wasm32-unknown-unknown/debug/ipe_app.wasm"]}"#,
+            "\n",
             r#"{"reason":"build-finished","success":true}"#,
         );
-        let found = wasm_artifact_path(
-            stream,
-            BuildPosture::Dev,
-            CargoTarget::WasmBrowser,
-            Path::new("/c"),
-        );
+        let found = locate(stream, BuildPosture::Dev, CargoTarget::WasmBrowser, "/c/t");
         assert!(
             found
                 .as_ref()
@@ -5543,9 +5561,9 @@ mod wasm_locate_tests {
         );
     }
 
-    /// No record, a record of another posture or target, a non-artifact
-    /// reason, a non-`.wasm` file and a malformed line each refuse, typed,
-    /// never a guessed path.
+    /// No record, a record of another posture, target or build directory, a
+    /// non-artifact reason, a non-`.wasm` file, a module in a subdirectory and
+    /// a malformed line each refuse, typed, never a guessed path.
     #[test]
     fn a_stream_naming_no_module_of_the_posture_refuses() {
         let refused = [
@@ -5553,18 +5571,15 @@ mod wasm_locate_tests {
             r#"{"reason":"build-finished","success":true}"#,
             r#"{"reason":"compiler-artifact","filenames":["/t/wasm32-unknown-unknown/release/ipe_app.wasm"]}"#,
             r#"{"reason":"compiler-artifact","filenames":["/t/wasm32-wasip1/debug/ipe_app.wasm"]}"#,
+            r#"{"reason":"compiler-artifact","filenames":["/elsewhere/wasm32-unknown-unknown/debug/ipe_app.wasm"]}"#,
+            r#"{"reason":"compiler-artifact","filenames":["/t/wasm32-unknown-unknown/debug/deps/ipe_app.wasm"]}"#,
             r#"{"reason":"compiler-message","filenames":["/t/wasm32-unknown-unknown/debug/ipe_app.wasm"]}"#,
             r#"{"reason":"compiler-artifact","filenames":["/t/wasm32-unknown-unknown/debug/ipe_app.js"]}"#,
             r#"{"reason":"compiler-artifact","filenames":["/t/wasm32-unknown-unknown/debug/ipe_app.wasm""#,
             "/t/wasm32-unknown-unknown/debug/ipe_app.wasm",
         ];
         for stream in refused {
-            let found = wasm_artifact_path(
-                stream,
-                BuildPosture::Dev,
-                CargoTarget::WasmBrowser,
-                Path::new("/c"),
-            );
+            let found = locate(stream, BuildPosture::Dev, CargoTarget::WasmBrowser, "/t");
             assert!(
                 matches!(found, Err(CliError::Usage(_))),
                 "{stream}: {found:?}"
@@ -5572,16 +5587,30 @@ mod wasm_locate_tests {
         }
     }
 
+    /// Records naming two different modules in the artifact directory refuse:
+    /// neither is taken.
+    #[test]
+    fn a_stream_naming_two_modules_refuses() {
+        let stream = concat!(
+            r#"{"reason":"compiler-artifact","filenames":["/t/wasm32-unknown-unknown/debug/ipe_app.wasm"]}"#,
+            "\n",
+            r#"{"reason":"compiler-artifact","filenames":["/t/wasm32-unknown-unknown/debug/other.wasm"]}"#,
+        );
+        let found = locate(stream, BuildPosture::Dev, CargoTarget::WasmBrowser, "/t");
+        assert!(
+            matches!(
+                &found,
+                Err(CliError::Usage(message)) if message.to_string().contains("more than one")
+            ),
+            "two modules must refuse: {found:?}"
+        );
+    }
+
     /// A wasip1 release module is read from its `executable` record.
     #[test]
     fn a_release_wasi_module_is_read_from_its_executable_record() {
         let stream = r#"{"reason":"compiler-artifact","executable":"/t/wasm32-wasip1/release/app.wasm","filenames":[]}"#;
-        let found = wasm_artifact_path(
-            stream,
-            BuildPosture::Release,
-            CargoTarget::Wasip1,
-            Path::new("/c"),
-        );
+        let found = locate(stream, BuildPosture::Release, CargoTarget::Wasip1, "/t");
         assert!(
             found
                 .as_ref()

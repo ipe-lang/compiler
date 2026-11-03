@@ -12,11 +12,12 @@
 //!   `use`, a renaming `use`, a macro token): refused outright;
 //! - spelling a profile directory: a string literal with a `debug` path
 //!   component anywhere, and a string literal with a `release` path component
-//!   handed straight to `.join(..)`, `.push(..)`, `Path::new(..)` or
-//!   `PathBuf::from(..)` (`release` alone also names a command and an output
-//!   level, so only its path-building use is held). Each site is keyed by its
-//!   file, its enclosing item path and the directory, and held to [`ADMITTED`]
-//!   exactly.
+//!   anywhere inside the argument of `.join(..)`, `.push(..)`, `Path::new(..)`,
+//!   `PathBuf::from(..)`, `OsStr::new(..)` or `OsString::from(..)` — a bare
+//!   literal, a borrowed or parenthesised one, a `format!` template, a branch
+//!   (`release` alone also names a command and an output level, so only its
+//!   path-building use is held). Each site is keyed by its file, its enclosing
+//!   item path and the directory, and held to [`ADMITTED`] exactly.
 //!
 //! The scan walks the `ipe` crate's module tree from each crate root, parsing
 //! every reached file with `syn`. An item, impl item, trait item or `mod`
@@ -32,9 +33,7 @@ use std::path::{Path, PathBuf};
 
 use proc_macro2::{Delimiter, Ident, TokenStream, TokenTree};
 use syn::visit::{self, Visit};
-use syn::{
-    Attribute, Expr, ImplItem, Item, ItemImpl, ItemMod, Lit, LitStr, Macro, TraitItem, Type,
-};
+use syn::{Attribute, Expr, ImplItem, Item, ItemImpl, ItemMod, LitStr, Macro, TraitItem, Type};
 
 /// The type no module but `cargo_step.rs` may name.
 const PROFILE_TYPE: &str = "CargoProfile";
@@ -52,32 +51,20 @@ const RELEASE_DIR: &str = "release";
 const PATH_METHODS: &[&str] = &["join", "push"];
 
 /// The `(type, constructor)` calls that make a path from their argument.
-const PATH_CONSTRUCTORS: &[(&str, &str)] = &[("Path", "new"), ("PathBuf", "from")];
+const PATH_CONSTRUCTORS: &[(&str, &str)] = &[
+    ("Path", "new"),
+    ("PathBuf", "from"),
+    ("OsStr", "new"),
+    ("OsString", "from"),
+];
 
 /// The macro that splices a file the walk does not reach.
 const INCLUDE_MACRO: &str = "include";
 
 /// Every admitted site: the file relative to `src/`, the enclosing item path,
 /// the profile directory, and how often it occurs there.
-///
-/// The `commands_pkg.rs` and `watch.rs` rows are directory guesses still to be
-/// read from their build's `artifact_dir`; each row is one count to remove.
-const ADMITTED: &[(&str, &str, &str, usize)] = &[
-    ("cargo_step.rs", "CargoProfile::dir_name", DEBUG_DIR, 1),
-    (
-        "driver/commands_pkg.rs",
-        "BundleProfile::target_subdir",
-        DEBUG_DIR,
-        1,
-    ),
-    (
-        "driver/commands_pkg.rs",
-        "build_and_run_test_entry",
-        DEBUG_DIR,
-        1,
-    ),
-    ("watch.rs", "dir_has_dep_rlib", DEBUG_DIR, 1),
-];
+const ADMITTED: &[(&str, &str, &str, usize)] =
+    &[("cargo_step.rs", "CargoProfile::dir_name", DEBUG_DIR, 1)];
 
 /// Module nesting the walk descends before refusing to go deeper.
 const MAX_DEPTH: usize = 32;
@@ -135,15 +122,38 @@ fn has_component(text: &str, dir: &str) -> bool {
     text.split(['/', '\\']).any(|part| part == dir)
 }
 
-/// The string value of `expr` when it is a string literal.
-fn str_lit(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Lit(lit) => match &lit.lit {
-            Lit::Str(s) => Some(s.value()),
-            _ => None,
-        },
-        _ => None,
+/// Whether any string literal in `tokens`, nested groups included, has the
+/// path component `dir`.
+fn tokens_have_component(tokens: TokenStream, dir: &str) -> bool {
+    tokens.into_iter().any(|tree| match &tree {
+        TokenTree::Group(group) => tokens_have_component(group.stream(), dir),
+        TokenTree::Literal(_) => token_str(&tree).is_some_and(|text| has_component(&text, dir)),
+        TokenTree::Ident(_) | TokenTree::Punct(_) => false,
+    })
+}
+
+/// Whether any string literal anywhere in an expression, macro arguments
+/// included, has the path component `dir`.
+struct HoldsComponent<'d> {
+    dir: &'d str,
+    found: bool,
+}
+
+impl<'ast> Visit<'ast> for HoldsComponent<'_> {
+    fn visit_lit_str(&mut self, lit: &'ast LitStr) {
+        self.found |= has_component(&lit.value(), self.dir);
     }
+
+    fn visit_macro(&mut self, mac: &'ast Macro) {
+        self.found |= tokens_have_component(mac.tokens.clone(), self.dir);
+    }
+}
+
+/// Whether `expr` holds a string literal with the path component `dir`.
+fn expr_has_component(expr: &Expr, dir: &str) -> bool {
+    let mut holds = HoldsComponent { dir, found: false };
+    holds.visit_expr(expr);
+    holds.found
 }
 
 /// The string value of the literal token `tree`, if it is a string literal.
@@ -188,16 +198,16 @@ impl Scanner<'_> {
         }
     }
 
-    /// A `release` path component handed to a path-building call.
-    fn path_arg(&mut self, arg: Option<String>) {
-        if arg.is_some_and(|text| has_component(&text, RELEASE_DIR)) {
+    /// A `release` path component inside the argument of a path-building call.
+    fn path_arg(&mut self, held: bool) {
+        if held {
             self.site(RELEASE_DIR);
         }
     }
 
     /// Every held token in `tokens`, nested groups included: a `CargoProfile`
     /// identifier, a `debug` string literal, and a `release` string literal
-    /// opening the parenthesised argument of a `join` or `push`.
+    /// anywhere in the parenthesised argument of a `join` or `push`.
     fn scan_tokens(&mut self, tokens: TokenStream) {
         let mut path_method = false;
         for tree in tokens {
@@ -209,14 +219,7 @@ impl Scanner<'_> {
                 }
                 TokenTree::Group(group) => {
                     if after_path_method && group.delimiter() == Delimiter::Parenthesis {
-                        self.path_arg(
-                            group
-                                .stream()
-                                .into_iter()
-                                .next()
-                                .as_ref()
-                                .and_then(token_str),
-                        );
+                        self.path_arg(tokens_have_component(group.stream(), RELEASE_DIR));
                     }
                     self.scan_tokens(group.stream());
                 }
@@ -382,7 +385,11 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
     fn visit_expr(&mut self, expr: &'ast Expr) {
         match expr {
             Expr::MethodCall(call) if PATH_METHODS.iter().any(|m| call.method == m) => {
-                self.path_arg(call.args.first().and_then(str_lit));
+                self.path_arg(
+                    call.args
+                        .iter()
+                        .any(|arg| expr_has_component(arg, RELEASE_DIR)),
+                );
             }
             Expr::Call(call) => {
                 if let Expr::Path(func) = &*call.func {
@@ -398,7 +405,11 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
                             && segments.last().is_some_and(|s| s == ctor)
                     });
                     if constructs_a_path {
-                        self.path_arg(call.args.first().and_then(str_lit));
+                        self.path_arg(
+                            call.args
+                                .iter()
+                                .any(|arg| expr_has_component(arg, RELEASE_DIR)),
+                        );
                     }
                 }
             }
@@ -554,20 +565,13 @@ fn admitted_with(rel: &str, extra: &str) -> String {
             "enum CargoProfile { Dev, Release }\n\
              impl CargoProfile { const fn dir_name(self) -> &'static str { match self { Self::Dev => \"debug\", Self::Release => \"release\" } } }\n"
         }
-        "driver/commands_pkg.rs" => {
-            "impl BundleProfile { const fn target_subdir(self) -> &'static str { match self { Self::Dev => \"debug\", Self::Release => \"release\" } } }\n\
-             pub fn build_and_run_test_entry() { let compiled = target.dir().path().join(\"debug\").join(&name); }\n"
-        }
-        "watch.rs" => {
-            "fn dir_has_dep_rlib(target_dir: &Path) -> bool { let deps = target_dir.join(\"debug\").join(\"deps\"); true }\n"
-        }
         _ => "",
     };
     format!("{admitted}{extra}")
 }
 
 /// Every file holding an admitted site.
-const ADMITTED_FILES: &[&str] = &["cargo_step.rs", "driver/commands_pkg.rs", "watch.rs"];
+const ADMITTED_FILES: &[&str] = &["cargo_step.rs"];
 
 #[test]
 fn a_cargo_profile_is_chosen_only_by_the_builds_posture() {
@@ -578,7 +582,11 @@ fn a_cargo_profile_is_chosen_only_by_the_builds_posture() {
         refusals,
         reached,
     } = walk(&root, roots).expect("module tree walkable");
-    for file in ADMITTED_FILES.iter().chain(&["driver/commands.rs"]) {
+    for file in
+        ADMITTED_FILES
+            .iter()
+            .chain(&["driver/commands.rs", "driver/commands_pkg.rs", "watch.rs"])
+    {
         assert!(
             reached.contains(*file),
             "the walk must reach src/{file}, or it is walking the wrong tree"
@@ -651,10 +659,39 @@ fn a_profile_chosen_at_a_build_site_is_refused() {
             "type Profile = crate::cargo_step::CargoProfile;",
         ),
         ("driver/commands.rs", "fn f() { dbg!(CargoProfile::Dev); }"),
-        // A second guess beside an admitted one.
+        // The guesses each build site once spelled.
         (
             "watch.rs",
-            "fn dir_has_dep_rlib2() { let _ = target.join(\"debug\"); }",
+            "fn dir_has_dep_rlib(target_dir: &Path) -> bool { let deps = target_dir.join(\"debug\").join(\"deps\"); true }",
+        ),
+        (
+            "driver/commands_pkg.rs",
+            "impl BundleProfile { const fn target_subdir(self) -> &'static str { match self { Self::Dev => \"debug\", Self::Release => \"release\" } } }",
+        ),
+        (
+            "driver/commands_pkg.rs",
+            "pub fn build_and_run_test_entry() { let compiled = target.dir().path().join(\"debug\").join(&name); }",
+        ),
+        // A `release` directory one expression away from the call.
+        (
+            "driver/commands.rs",
+            "fn f() { let _ = dir.join(format!(\"{triple}/release\")); }",
+        ),
+        (
+            "driver/commands.rs",
+            "fn f() { let _ = dir.join(&\"release\"); }",
+        ),
+        (
+            "driver/commands.rs",
+            "fn f() { let _ = dir.join(if r { \"release\" } else { name }); }",
+        ),
+        (
+            "driver/commands.rs",
+            "fn f() { let _ = std::ffi::OsStr::new(\"release\"); }",
+        ),
+        (
+            "driver/commands.rs",
+            "fn f() { let _ = vec![dir.join(format!(\"{t}/release\"))]; }",
         ),
         ("cargo_step.rs", "fn f() { let _ = dir.join(\"release\"); }"),
         // Source the walk would not see, and a scoped test gate it would.

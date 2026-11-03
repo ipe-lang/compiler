@@ -154,53 +154,74 @@ impl BuildPosture {
     }
 }
 
-/// The `.wasm` module a build of `target` in `posture` wrote, read from the
-/// `compiler-artifact` records of cargo's `--message-format=json` stream.
+/// Why cargo's JSON record named no single `.wasm` module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmArtifactRefusal {
+    /// No `compiler-artifact` record names a `.wasm` directly inside the
+    /// build's artifact directory.
+    Missing,
+    /// Records name more than one such `.wasm`: which one the build means is
+    /// not known, so none is taken.
+    Ambiguous,
+}
+
+/// The `.wasm` module a build wrote into `artifact_dir` (its
+/// [`CargoBuild::artifact_dir`]), read from the `compiler-artifact` records of
+/// cargo's `--message-format=json` stream.
 ///
-/// A record names the module only when one of its files is a `.wasm` directly
-/// inside `<triple>/<profile>/` for this target and posture, so a record of
-/// another posture, another target or another kind of file is never taken. A
-/// line that is not a whole JSON object names nothing. `None` when no record
-/// names the module: the path is never reconstructed from the layout.
-#[must_use]
-pub fn wasm_artifact(
-    messages: &str,
-    posture: BuildPosture,
-    target: CargoTarget,
-) -> Option<PathBuf> {
-    let triple = target.triple()?;
-    let profile_dir = posture.profile().dir_name();
-    let names_module = |path: &Path| {
-        let profile = path.parent();
+/// A record names the module only when one of its files is a `.wasm` whose
+/// parent is `artifact_dir` itself, so a record of another posture, another
+/// target, another build directory or another kind of file is never taken. A
+/// line that is not a whole JSON object names nothing. The path is never
+/// reconstructed from the layout.
+///
+/// # Errors
+/// [`WasmArtifactRefusal::Missing`] when no record names such a module;
+/// [`WasmArtifactRefusal::Ambiguous`] when records name two different ones.
+pub fn wasm_artifact(messages: &str, artifact_dir: &Path) -> Result<PathBuf, WasmArtifactRefusal> {
+    let in_artifact_dir = |path: &Path| {
         path.extension().is_some_and(|ext| ext == "wasm")
-            && profile
-                .and_then(Path::file_name)
-                .is_some_and(|dir| dir == profile_dir)
-            && profile
-                .and_then(Path::parent)
-                .and_then(Path::file_name)
-                .is_some_and(|dir| dir == triple)
+            && path.parent().is_some_and(|parent| {
+                parent == artifact_dir || same_existing_dir(parent, artifact_dir)
+            })
     };
-    messages
+    let mut found: Option<PathBuf> = None;
+    let records = messages
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
         .filter(|msg| {
             msg.get("reason").and_then(serde_json::Value::as_str) == Some("compiler-artifact")
-        })
-        .find_map(|msg| {
-            let executable = msg.get("executable").and_then(serde_json::Value::as_str);
-            let filenames = msg
-                .get("filenames")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(serde_json::Value::as_str);
-            executable
-                .into_iter()
-                .chain(filenames)
-                .map(PathBuf::from)
-                .find(|path| names_module(path))
-        })
+        });
+    for msg in records {
+        let executable = msg.get("executable").and_then(serde_json::Value::as_str);
+        let filenames = msg
+            .get("filenames")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str);
+        for path in executable.into_iter().chain(filenames).map(PathBuf::from) {
+            if !in_artifact_dir(&path) {
+                continue;
+            }
+            match &found {
+                None => found = Some(path),
+                Some(seen) if *seen == path => {}
+                Some(_) => return Err(WasmArtifactRefusal::Ambiguous),
+            }
+        }
+    }
+    found.ok_or(WasmArtifactRefusal::Missing)
+}
+
+/// Whether `a` and `b` name one existing directory through symlinks: cargo
+/// may spell its artifact directory otherwise than the one it was handed. A
+/// path that cannot be resolved names no directory.
+fn same_existing_dir(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// The target a cargo build compiles for.
@@ -646,14 +667,27 @@ pub struct WatchBuild<'a> {
 }
 
 impl WatchBuild<'_> {
+    /// The posture every watch rebuild builds in.
+    const POSTURE: BuildPosture = BuildPosture::Dev;
+
+    /// The target every watch rebuild compiles for.
+    const TARGET: CargoTarget = CargoTarget::Host;
+
+    /// The directory a watch rebuild's artifacts land in under the session's
+    /// build directory `target_dir`.
+    #[must_use]
+    pub fn artifact_dir_in(target_dir: &Path) -> PathBuf {
+        Self::POSTURE.artifact_dir(target_dir, Self::TARGET)
+    }
+
     /// The rebuild's `cargo build --message-format=json` command.
     fn command(&self) -> Command {
         let mut cmd = build_command(
             self.cargo,
             self.krate.path(),
             self.target_dir.path(),
-            BuildPosture::Dev,
-            CargoTarget::Host,
+            Self::POSTURE,
+            Self::TARGET,
             CargoOutput::JsonStream(self.verbosity),
         );
         apply_build_accel_env(&mut cmd, self.accel);
@@ -1757,6 +1791,19 @@ mod tests {
         assert_eq!(
             BuildPosture::Release.artifact_dir(t, CargoTarget::Wasip1),
             Path::new("/t/wasm32-wasip1/release")
+        );
+    }
+
+    /// A watch rebuild's artifacts land in the development host directory.
+    #[test]
+    fn a_watch_build_reads_its_artifacts_from_the_dev_host_directory() {
+        assert_eq!(
+            WatchBuild::artifact_dir_in(Path::new("/t")),
+            BuildPosture::Dev.artifact_dir(Path::new("/t"), CargoTarget::Host)
+        );
+        assert_eq!(
+            WatchBuild::artifact_dir_in(Path::new("/t")),
+            Path::new("/t/debug")
         );
     }
 

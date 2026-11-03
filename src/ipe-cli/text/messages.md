@@ -2527,6 +2527,10 @@ bundle size: {size} ({wasm})
 
 the {triple} build reported no `.wasm` artifact for {dir} — cargo's JSON message stream carried no `compiler-artifact` naming the module
 
+## wasm-artifact-ambiguous
+
+the {triple} build reported more than one `.wasm` artifact for {dir} — cargo's JSON message stream named two modules in the build's artifact directory, so none is taken
+
 ## session-no-recordable
 
 ipe dev run {flag}: {name} has no recordable session — recording and replay capture the update loop of a `Cli.tea` or `Worker.tea` app

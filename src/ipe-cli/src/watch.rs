@@ -3043,14 +3043,14 @@ pub(crate) enum BuildAccel {
 }
 
 /// Whether a resolved target directory already holds a compiled dependency
-/// library (a single `.rlib` under `debug/deps` — the registry crates the emitted
+/// library (a single `.rlib` under the watch build's `deps` — the registry crates the emitted
 /// app links). Fail-safe: any I/O error reads as no-rlib, so the worst case is one
 /// extra sccache-mode build, never a wrong-but-fast one. A target is *warm* once
 /// it holds one; a fresh (or pruned) target holds none. Pure in its argument:
 /// the directory is the session's resolved [`LinkableTargetDir`], the one the
 /// build itself is handed.
 fn dir_has_dep_rlib(target_dir: &Path) -> bool {
-    let deps = target_dir.join("debug").join("deps");
+    let deps = crate::cargo_step::WatchBuild::artifact_dir_in(target_dir).join("deps");
     let Ok(entries) = std::fs::read_dir(&deps) else {
         return false;
     };
