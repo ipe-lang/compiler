@@ -45,7 +45,7 @@ use std::str::FromStr;
 use proc_macro2::{TokenStream, TokenTree};
 use syn::visit::Visit;
 
-mod common;
+use crate::common;
 
 /// The skip-scan fixtures, relative to this crate's manifest directory.
 const FIXTURES: &str = "tests/fixtures/skip_scan";
@@ -804,7 +804,7 @@ fn a_return_err_and_a_closure_return_are_not_skips() {
 fn no_test_target_skips_silently() {
     let (root, files) = common::test_target_files();
     for pinned in [
-        "tools/e2e-support/tests/skip_scan.rs",
+        "tools/e2e-support/tests/suite/skip_scan.rs",
         "src/ipe-cli/tests/support/mod.rs",
     ] {
         assert!(
