@@ -2,6 +2,8 @@
 //!
 
 use super::IpeMaybe;
+use crate::core::{CeilingKernel, RuntimeTrip, trip};
+use crate::narrow::{count_from_int, count_to_int};
 
 // ── Core String kernels (relocated from core.rs so the String surface has one home) ──
 
@@ -20,7 +22,7 @@ pub fn string_append(mut a: String, b: String) -> String {
 }
 #[must_use]
 pub fn string_length(s: String) -> i64 {
-    s.chars().count() as i64
+    count_to_int(s.chars().count())
 }
 #[must_use]
 pub fn string_is_empty(s: String) -> bool {
@@ -94,7 +96,7 @@ pub fn string_from_char(c: char) -> String {
 #[must_use]
 pub fn string_slice(start: i64, end: i64, s: String) -> String {
     let runes: Vec<char> = s.chars().collect();
-    let total = runes.len() as i64;
+    let total = count_to_int(runes.len());
     let mut start = if start < 0 { start + total } else { start };
     let mut end = if end < 0 { end + total } else { end };
     if start < 0 {
@@ -106,10 +108,10 @@ pub fn string_slice(start: i64, end: i64, s: String) -> String {
     if start > end {
         return String::new();
     }
-    // start/end are clamped to [0, total] with start <= end, so the slice is
-    // valid; `.get` keeps it total regardless.
+    // start/end are clamped to [0, total] with start <= end, so each converts
+    // exactly and the slice is valid; `.get` keeps it total regardless.
     runes
-        .get(start as usize..end as usize)
+        .get(count_from_int(start)..count_from_int(end))
         .map(|r| r.iter().collect())
         .unwrap_or_default()
 }
@@ -119,7 +121,7 @@ pub fn string_left(n: i64, s: String) -> String {
     if n <= 0 {
         return String::new();
     }
-    s.chars().take(n as usize).collect()
+    s.chars().take(count_from_int(n)).collect()
 }
 /// `Ipe.String.right n s` — the last `n` characters (clamped).
 #[must_use]
@@ -128,7 +130,11 @@ pub fn string_right(n: i64, s: String) -> String {
         return String::new();
     }
     let runes: Vec<char> = s.chars().collect();
-    let start = runes.len().saturating_sub(n as usize);
+    // `n` past the length keeps every rune.
+    let start = runes
+        .len()
+        .checked_sub(count_from_int(n))
+        .unwrap_or_default();
     runes
         .get(start..)
         .map(|r| r.iter().collect())
@@ -214,43 +220,35 @@ fn fmt_g_exponent(neg: bool, digits: &str, exp: i32) -> String {
 }
 
 /// `'g'`'s `%f` rendering (shortest mode): `ddd[.ddd]`, padding the integer
-/// part with zeros (`1500`) and reading fraction digits past the point.
+/// part with zeros (`1500`) and the fraction with leading zeros (`0.0001`).
+///
+/// `dp` is the decimal-point position: the value is `0.digits * 10^dp`.
 fn fmt_g_positional(neg: bool, digits: &str, dp: i32) -> String {
-    let bytes = digits.as_bytes();
-    let nd = bytes.len() as i32;
-    let frac = (nd - dp).max(0); // fractional digit count
     let mut out = String::new();
     if neg {
         out.push('-');
     }
-    // Integer part: the first `dp` digits, zero-padded if the value has more
-    // integer places than significant digits (e.g. 1500 from digits "15").
-    if dp > 0 {
-        let take = nd.min(dp);
-        for i in 0..take {
-            if let Some(&b) = bytes.get(i as usize) {
-                out.push(b as char);
-            }
-        }
-        for _ in take..dp {
+    // Integer places (`dp > 0`) and the zeros between the point and the first
+    // significant digit (`dp < 0`); `0` on the other side.
+    let int_places = usize::try_from(dp).unwrap_or_default();
+    let lead_zeros = usize::try_from(dp.checked_neg().unwrap_or_default()).unwrap_or_default();
+    let fraction = if int_places > 0 {
+        let (int_digits, fraction) = digits.split_at_checked(int_places).unwrap_or((digits, ""));
+        out.push_str(int_digits);
+        for _ in int_digits.len()..int_places {
             out.push('0');
         }
+        fraction
     } else {
         out.push('0');
-    }
-    // Fraction: each place reads a significant digit when one exists at that
-    // position, otherwise a zero (leading zeros for sub-1 values like 0.0001).
-    if frac > 0 {
+        digits
+    };
+    if lead_zeros > 0 || !fraction.is_empty() {
         out.push('.');
-        for i in 0..frac {
-            let j = dp + i;
-            let ch = if j >= 0 && j < nd {
-                bytes.get(j as usize).map_or(b'0', |&b| b)
-            } else {
-                b'0'
-            };
-            out.push(ch as char);
+        for _ in 0..lead_zeros {
+            out.push('0');
         }
+        out.push_str(fraction);
     }
     out
 }
@@ -328,30 +326,25 @@ pub fn string_ends_with_in(haystack: String, suffix: String) -> bool {
 
 /// Ipê `repeat : Int -> String -> String`. Non-positive `n` returns "".
 ///
-/// `n` is caller-controlled; `n * s.len()` can overflow or exhaust memory, so
-/// the result is bounded at a 64 MiB ceiling. Past the ceiling the count is
-/// clamped to the whole copies that fit rather than collapsed to "": the output
-/// stays a genuine prefix of the requested repetition, never a silent empty
-/// string that a caller could not tell apart from a legitimate `repeat 0 s`.
+/// `n` is caller-controlled, so it picks the result size: a result past its
+/// byte ceiling ([`CeilingKernel::ceiling`]) trips `OutputCeiling` before any
+/// allocation — never a truncated prefix.
 #[must_use]
 pub fn string_repeat(n: i64, s: String) -> String {
     if n <= 0 || s.is_empty() {
         return String::new();
     }
-    const CAP: u64 = 64 * 1024 * 1024;
-    let len = s.len() as u64;
-    let want = n as u64;
-    // Whole copies that fit under the cap; `len > 0` here, so no divide-by-zero.
-    let max_fit = CAP / len;
-    // At least one whole copy for a non-empty `s` with `n > 0` — never collapse to
-    // "" (indistinguishable from `repeat 0 s`). When a single copy already exceeds
-    // the 64 MiB repetition ceiling, emit exactly that one copy: `s` is already
-    // materialised at `len`, so this is a bounded ~2x transient, not an
-    // input-dictated blowup. The cap bounds repetition, not the size of `s` itself.
-    let copies = want.min(max_fit).max(1);
-    // `copies` is `1` (single-copy case) or `<= max_fit` (so `copies * len <= CAP`);
-    // either way it fits `usize` on a 64-bit target, so the cast cannot truncate.
-    s.repeat(copies as usize)
+    let kernel = CeilingKernel::StringRepeat;
+    match usize::try_from(n) {
+        Ok(copies)
+            if copies
+                .checked_mul(s.len())
+                .is_some_and(|bytes| bytes <= kernel.ceiling()) =>
+        {
+            s.repeat(copies)
+        }
+        Ok(_) | Err(_) => trip(RuntimeTrip::OutputCeiling { kernel }),
+    }
 }
 
 /// `String.concat : List String -> String`
@@ -404,15 +397,13 @@ pub fn string_drop_right(n: i64, s: String) -> String {
     if n <= 0 {
         return s;
     }
-    let runes: Vec<char> = s.chars().collect();
-    let len = runes.len() as i64;
-    if n >= len {
-        return String::new();
-    }
-    // 0 < len-n < len here (n>0 and n<len guarded above), so `take` keeps the
-    // leading runes. `take` is total (never panics) — clippy flags the `[..k]`
-    // slice form even though the bound is guaranteed, so use the iterator form.
-    runes.iter().take((len - n) as usize).collect()
+    // `n` at or past the length keeps no rune.
+    let keep = s
+        .chars()
+        .count()
+        .checked_sub(count_from_int(n))
+        .unwrap_or_default();
+    s.chars().take(keep).collect()
 }
 
 /// `String.equalFold : String -> String -> Bool`
@@ -503,53 +494,42 @@ pub fn string_is_email(s: String) -> bool {
 // crate. `String.isUrl` therefore reaches the `regex_kernel` module and selects
 // the `regex` feature, exactly like an `Ipe.Regex` kernel.
 
-/// Ceiling on any pad target width. `n` is caller-controlled; an unbounded
-/// value would OOM on the fill loop, so every pad builder refuses past this.
-const MAX_PAD_WIDTH: i64 = 16_000_000;
-
-/// Bounded number of pad characters to add to reach target width `n` from an
-/// `have`-codepoint string. `None` when no padding is needed (`n <= have`) or
-/// when `n` exceeds `MAX_PAD_WIDTH` — the caller returns the string unchanged,
-/// so no pad builder can exhaust the allocator on caller-controlled `n`.
-fn bounded_pad_count(n: i64, have: i64) -> Option<usize> {
-    if n <= have || n > MAX_PAD_WIDTH {
-        return None;
+/// The pad characters that bring an `have`-character string to width `n`.
+///
+/// `0` when `n <= have`. A width past `kernel`'s character ceiling
+/// ([`CeilingKernel::ceiling`]) trips `OutputCeiling` before any allocation,
+/// whatever `have` is: the width alone is refused.
+fn pad_count(kernel: CeilingKernel, n: i64, have: usize) -> usize {
+    if n <= 0 {
+        return 0;
     }
-    Some((n - have) as usize)
+    match usize::try_from(n) {
+        Ok(width) if width <= kernel.ceiling() => width.checked_sub(have).unwrap_or_default(),
+        Ok(_) | Err(_) => trip(RuntimeTrip::OutputCeiling { kernel }),
+    }
 }
 
 /// `String.padLeft : Int -> Char -> String -> String`
 /// Pads `s` on the left with `ch` until `s` is at least `n` Unicode codepoints
-/// wide. Returns `s` unchanged when already `n` or more codepoints wide.
+/// wide. Returns `s` unchanged when already `n` or more codepoints wide; a
+/// width past the ceiling trips `OutputCeiling`.
 #[must_use]
 pub fn string_pad_left(n: i64, ch: char, s: String) -> String {
-    let rune_count = s.chars().count() as i64;
-    let Some(pad_count) = bounded_pad_count(n, rune_count) else {
-        return s;
-    };
-    let mut out = String::with_capacity(s.len() + pad_count);
-    for _ in 0..pad_count {
-        out.push(ch);
-    }
+    let pad = pad_count(CeilingKernel::StringPadLeft, n, s.chars().count());
+    let mut out: String = std::iter::repeat_n(ch, pad).collect();
     out.push_str(&s);
     out
 }
 
 /// `String.padRight : Int -> Char -> String -> String`
 /// Pads `s` on the right with `ch` until `s` is at least `n` Unicode codepoints
-/// wide. Returns `s` unchanged when already `n` or more codepoints wide.
+/// wide. Returns `s` unchanged when already `n` or more codepoints wide; a
+/// width past the ceiling trips `OutputCeiling`.
 #[must_use]
-pub fn string_pad_right(n: i64, ch: char, s: String) -> String {
-    let rune_count = s.chars().count() as i64;
-    let Some(pad_count) = bounded_pad_count(n, rune_count) else {
-        return s;
-    };
-    let mut out = String::with_capacity(s.len() + pad_count);
-    out.push_str(&s);
-    for _ in 0..pad_count {
-        out.push(ch);
-    }
-    out
+pub fn string_pad_right(n: i64, ch: char, mut s: String) -> String {
+    let pad = pad_count(CeilingKernel::StringPadRight, n, s.chars().count());
+    s.extend(std::iter::repeat_n(ch, pad));
+    s
 }
 
 /// `String.toList : String -> List Char`
@@ -581,23 +561,16 @@ pub fn string_uncons(s: String) -> IpeMaybe<(char, String)> {
 
 /// `String.pad : Int -> Char -> String -> String` — centre-pad `s` to width `n`
 /// with `ch`. Matches Elm: extra padding on the RIGHT when the total is odd.
-/// `n <= length s` returns `s` unchanged.
+/// `n <= length s` returns `s` unchanged; a width past the ceiling trips
+/// `OutputCeiling`.
 #[must_use]
 pub fn string_pad(n: i64, ch: char, s: String) -> String {
-    let len = s.chars().count() as i64;
-    let Some(total) = bounded_pad_count(n, len) else {
-        return s;
-    };
+    let total = pad_count(CeilingKernel::StringPad, n, s.chars().count());
     let left = total / 2;
     let right = total - left;
-    let mut out = String::with_capacity(s.len() + total);
-    for _ in 0..left {
-        out.push(ch);
-    }
+    let mut out: String = std::iter::repeat_n(ch, left).collect();
     out.push_str(&s);
-    for _ in 0..right {
-        out.push(ch);
-    }
+    out.extend(std::iter::repeat_n(ch, right));
     out
 }
 
@@ -622,7 +595,7 @@ pub fn string_indexes(sub: String, s: String) -> Vec<i64> {
             .get(start..start + needle.len())
             .is_some_and(|w| w == needle.as_slice())
         {
-            out.push(start as i64);
+            out.push(count_to_int(start));
         }
     }
     out
@@ -2410,37 +2383,60 @@ mod tests {
     fn test_repeat_empty_string() {
         assert_eq!(string_repeat(1_000, String::new()), "");
     }
-    #[test]
-    fn test_repeat_over_cap_clamps_to_prefix_not_empty() {
-        // A request whose n * len(s) blows past the 64 MiB ceiling must not
-        // collapse to "" for a non-empty s (that would be indistinguishable
-        // from a legitimate `repeat 0 s`). It clamps to the whole copies that
-        // fit, so the output stays a genuine prefix of the requested string.
-        const CAP: usize = 64 * 1024 * 1024;
-        let s = "ab"; // len 2
-        let n: i64 = 100_000_000; // 2 * 1e8 = 200 MB, far past the cap
-        let out = string_repeat(n, s.into());
-        assert!(
-            !out.is_empty(),
-            "over-cap repeat of a non-empty string must not return \"\""
-        );
-        assert!(out.len() <= CAP, "clamped output must respect the ceiling");
-        // The clamped output is exactly the whole copies that fit — a prefix.
-        let fit = CAP / s.len();
-        assert_eq!(out, s.repeat(fit));
-        assert!(out.starts_with(s), "clamped output is a prefix of s*");
+    /// Runs `f`, reading a trip back as its typed payload.
+    fn outcome<T>(
+        f: impl FnOnce() -> T + std::panic::UnwindSafe,
+    ) -> Result<T, Option<RuntimeTrip>> {
+        std::panic::catch_unwind(f).map_err(|p| crate::core::runtime_trip(p.as_ref()))
     }
+
+    /// The trip `kernel` raises past its ceiling.
+    fn tripped<T>(kernel: CeilingKernel) -> Result<T, Option<RuntimeTrip>> {
+        Err(Some(RuntimeTrip::OutputCeiling { kernel }))
+    }
+
+    /// `kernel`'s ceiling as an Ipê `Int`.
+    fn ceiling_int(kernel: CeilingKernel) -> i64 {
+        i64::try_from(kernel.ceiling()).unwrap_or(i64::MAX)
+    }
+
+    // A result of exactly the byte ceiling is built whole.
     #[test]
-    fn test_repeat_single_copy_exceeds_cap_still_emits_one_copy() {
-        // When a SINGLE copy of `s` already exceeds the 64 MiB repetition
-        // ceiling, `n > 0` must still yield exactly one whole copy — never "".
-        // (`s` is already materialised, so one copy is a bounded transient.)
-        const CAP: usize = 64 * 1024 * 1024;
-        let big = "a".repeat(CAP + 1); // one copy already over the ceiling
-        let out = string_repeat(5, big.clone());
+    fn string_repeat_at_ceiling_ok() {
+        let kernel = CeilingKernel::StringRepeat;
+        let half = ceiling_int(kernel) / 2;
         assert_eq!(
-            out, big,
-            "a non-empty s larger than the cap must repeat to exactly one copy, not \"\""
+            outcome(|| string_repeat(half, "ab".into()).len()),
+            Ok(kernel.ceiling())
+        );
+        assert_eq!(
+            outcome(|| string_repeat(1, "a".repeat(kernel.ceiling())).len()),
+            Ok(kernel.ceiling())
+        );
+    }
+
+    // One byte past the ceiling trips before allocating — never a truncated
+    // prefix, never "" — whether the count or the repeated string pushes it
+    // past, and a count whose byte total overflows `usize` trips too.
+    #[test]
+    fn string_repeat_ceiling_plus_one_trips() {
+        let kernel = CeilingKernel::StringRepeat;
+        let at = ceiling_int(kernel);
+        assert_eq!(
+            outcome(|| string_repeat(at + 1, "a".into()).len()),
+            tripped(kernel)
+        );
+        assert_eq!(
+            outcome(|| string_repeat(at / 2, "abc".into()).len()),
+            tripped(kernel)
+        );
+        assert_eq!(
+            outcome(|| string_repeat(1, "a".repeat(kernel.ceiling() + 1)).len()),
+            tripped(kernel)
+        );
+        assert_eq!(
+            outcome(|| string_repeat(i64::MAX, "ab".into()).len()),
+            tripped(kernel)
         );
     }
 
@@ -3145,32 +3141,57 @@ mod tests {
         assert_eq!(string_pad(2, '.', "abc".into()), "abc"); // n<=len → unchanged
     }
 
-    // Refusal: a caller-controlled width past MAX_PAD_WIDTH must return the
-    // string unchanged, never attempt the unbounded fill loop that would OOM.
-    #[test]
-    fn pad_width_past_ceiling_returns_unchanged() {
-        assert_eq!(string_pad(9_000_000_000_000, ' ', "x".into()), "x");
-        assert_eq!(string_pad(i64::MAX, ' ', "x".into()), "x");
+    // Refusal: a caller-controlled width past the character ceiling trips
+    // `OutputCeiling` before the fill loop allocates — never the input
+    // returned unchanged as if no padding were asked for. The width alone is
+    // refused, even for a string already that wide.
+    fn assert_pad_ceiling_plus_one_trips(kernel: CeilingKernel, pad: PadKernel) {
+        let at = ceiling_int(kernel);
+        for n in [at + 1, 9_000_000_000_000, i64::MAX] {
+            assert_eq!(outcome(|| pad(n, ' ', "x".into()).len()), tripped(kernel));
+        }
+        let wide = "x".repeat(kernel.ceiling() + 2);
+        assert_eq!(outcome(|| pad(at + 1, ' ', wide).len()), tripped(kernel));
     }
-    #[test]
-    fn pad_left_width_past_ceiling_returns_unchanged() {
-        assert_eq!(string_pad_left(9_000_000_000_000, '0', "x".into()), "x");
-        assert_eq!(string_pad_left(i64::MAX, '0', "x".into()), "x");
-    }
-    #[test]
-    fn pad_right_width_past_ceiling_returns_unchanged() {
-        assert_eq!(string_pad_right(9_000_000_000_000, '-', "x".into()), "x");
-        assert_eq!(string_pad_right(i64::MAX, '-', "x".into()), "x");
-    }
+
     // The ceiling itself is the last width that still pads.
-    #[test]
-    fn pad_at_exact_ceiling_still_pads() {
-        assert_eq!(
-            bounded_pad_count(MAX_PAD_WIDTH, 0),
-            Some(MAX_PAD_WIDTH as usize)
+    fn assert_pad_at_ceiling_ok(kernel: CeilingKernel, pad: PadKernel) {
+        let padded = outcome(|| pad(ceiling_int(kernel), '-', "x".into()));
+        assert!(
+            padded
+                .as_ref()
+                .is_ok_and(|s| s.chars().count() == kernel.ceiling() && s.contains('x')),
+            "{kernel:?} pads to exactly its ceiling"
         );
-        assert_eq!(bounded_pad_count(MAX_PAD_WIDTH + 1, 0), None);
     }
+
+    #[test]
+    fn string_pad_left_at_ceiling_ok() {
+        assert_pad_at_ceiling_ok(CeilingKernel::StringPadLeft, string_pad_left);
+    }
+    #[test]
+    fn string_pad_left_ceiling_plus_one_trips() {
+        assert_pad_ceiling_plus_one_trips(CeilingKernel::StringPadLeft, string_pad_left);
+    }
+    #[test]
+    fn string_pad_right_at_ceiling_ok() {
+        assert_pad_at_ceiling_ok(CeilingKernel::StringPadRight, string_pad_right);
+    }
+    #[test]
+    fn string_pad_right_ceiling_plus_one_trips() {
+        assert_pad_ceiling_plus_one_trips(CeilingKernel::StringPadRight, string_pad_right);
+    }
+    #[test]
+    fn string_pad_at_ceiling_ok() {
+        assert_pad_at_ceiling_ok(CeilingKernel::StringPad, string_pad);
+    }
+    #[test]
+    fn string_pad_ceiling_plus_one_trips() {
+        assert_pad_ceiling_plus_one_trips(CeilingKernel::StringPad, string_pad);
+    }
+
+    /// A pad kernel's runtime entry point.
+    type PadKernel = fn(i64, char, String) -> String;
 
     #[test]
     fn indexes_matches_elm() {

@@ -32,11 +32,13 @@ use cfg_scan::{cfg_test_only, expr_attrs, impl_item_attrs, item_attrs, trait_ite
 ///
 /// `time.rs` holds the instant arithmetic (`Time.addMillis`, `diffDays`, ...)
 /// and `web/transition.rs` the `Int` arms of the browser interpreter: each
-/// yields an Ipê `Int` exactly as `math.rs` does.
+/// yields an Ipê `Int` exactly as `math.rs` does. `string.rs` yields lengths
+/// and indexes as Ipê `Int`s and reads counts and widths from them.
 const ARITH_FILES: &[&str] = &[
     "math.rs",
     "basics.rs",
     "list.rs",
+    "string.rs",
     "time.rs",
     "web/transition.rs",
 ];

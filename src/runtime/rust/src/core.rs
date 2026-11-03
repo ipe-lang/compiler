@@ -1168,33 +1168,67 @@ pub enum RuntimeTrip {
 /// truncating and never allocating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CeilingKernel {
-    /// `List.repeat`.
+    /// `List.repeat`: the count of elements built.
     ListRepeat,
-    /// `List.range`.
+    /// `List.range`: the count of integers in the span.
     ListRange,
+    /// `String.repeat`: the UTF-8 bytes of the result, `n` times the bytes of
+    /// the repeated string.
+    StringRepeat,
+    /// `String.padLeft`: the requested width, in characters (code points).
+    StringPadLeft,
+    /// `String.padRight`: the requested width, in characters (code points).
+    StringPadRight,
+    /// `String.pad`: the requested width, in characters (code points).
+    StringPad,
 }
 
 impl CeilingKernel {
-    /// The most elements one call of the kernel builds — the one ceiling
-    /// table. [`RuntimeTrip::message`] spells each number; a test pins the
-    /// two equal.
+    /// Every kernel, so a test can pin each row's message to its ceiling.
+    pub const ALL: [Self; 6] = [
+        Self::ListRepeat,
+        Self::ListRange,
+        Self::StringRepeat,
+        Self::StringPadLeft,
+        Self::StringPadRight,
+        Self::StringPad,
+    ];
+
+    /// The most output one call of the kernel builds, in its [`unit`](Self::unit).
+    ///
+    /// The one ceiling table. [`RuntimeTrip::message`] spells each number; a
+    /// test pins the two equal.
     #[must_use]
     pub const fn ceiling(self) -> usize {
         match self {
             Self::ListRepeat | Self::ListRange => 10_000_000,
+            Self::StringRepeat => 64 * 1024 * 1024,
+            Self::StringPadLeft | Self::StringPadRight | Self::StringPad => 16_000_000,
+        }
+    }
+
+    /// The unit [`ceiling`](Self::ceiling) counts, as the trip message spells it.
+    #[must_use]
+    pub const fn unit(self) -> &'static str {
+        match self {
+            Self::ListRepeat | Self::ListRange => "element",
+            Self::StringRepeat => "byte",
+            Self::StringPadLeft | Self::StringPadRight | Self::StringPad => "character",
         }
     }
 }
 
-/// The message of kernel `$kernel` asked past its `$ceiling`-element ceiling.
+/// The message of kernel `$kernel` asked past its `$ceiling`-`$unit` ceiling.
 macro_rules! output_ceiling_message {
-    ($kernel:literal, $ceiling:literal) => {
+    ($kernel:literal, $ceiling:literal, $unit:literal) => {
         concat!(
             "`",
             $kernel,
             "` output exceeds the ",
             $ceiling,
-            "-element ceiling"
+            "-",
+            $unit,
+            " ceiling"
         )
     };
 }
@@ -1298,8 +1332,24 @@ impl RuntimeTrip {
                 FloatToIntOp::Truncate => non_finite_message!("trunc"),
             },
             Self::OutputCeiling { kernel } => match kernel {
-                CeilingKernel::ListRepeat => output_ceiling_message!("List.repeat", "10000000"),
-                CeilingKernel::ListRange => output_ceiling_message!("List.range", "10000000"),
+                CeilingKernel::ListRepeat => {
+                    output_ceiling_message!("List.repeat", "10000000", "element")
+                }
+                CeilingKernel::ListRange => {
+                    output_ceiling_message!("List.range", "10000000", "element")
+                }
+                CeilingKernel::StringRepeat => {
+                    output_ceiling_message!("String.repeat", "67108864", "byte")
+                }
+                CeilingKernel::StringPadLeft => {
+                    output_ceiling_message!("String.padLeft", "16000000", "character")
+                }
+                CeilingKernel::StringPadRight => {
+                    output_ceiling_message!("String.padRight", "16000000", "character")
+                }
+                CeilingKernel::StringPad => {
+                    output_ceiling_message!("String.pad", "16000000", "character")
+                }
             },
         }
     }
@@ -1967,12 +2017,17 @@ mod tests {
     // from the one table and converts to `LimitExceeded` at a boundary.
     #[test]
     fn output_ceiling_trips_are_typed_limit_exceeded() -> Result<(), &'static str> {
-        for (kernel, name) in [
-            (CeilingKernel::ListRepeat, "`List.repeat`"),
-            (CeilingKernel::ListRange, "`List.range`"),
-        ] {
+        for kernel in CeilingKernel::ALL {
+            let name = match kernel {
+                CeilingKernel::ListRepeat => "`List.repeat` ",
+                CeilingKernel::ListRange => "`List.range` ",
+                CeilingKernel::StringRepeat => "`String.repeat` ",
+                CeilingKernel::StringPadLeft => "`String.padLeft` ",
+                CeilingKernel::StringPadRight => "`String.padRight` ",
+                CeilingKernel::StringPad => "`String.pad` ",
+            };
             let fault = RuntimeTrip::OutputCeiling { kernel };
-            let ceiling = format!(" {}-element ", kernel.ceiling());
+            let ceiling = format!(" {}-{} ceiling", kernel.ceiling(), kernel.unit());
             let message = fault.message();
             if fault.label() != "OutputCeiling"
                 || !message.starts_with(name)
