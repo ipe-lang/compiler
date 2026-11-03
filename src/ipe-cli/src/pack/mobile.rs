@@ -1059,7 +1059,7 @@ fn android_layout(
     }
 
     // The offline SPA assets, under the WebViewAssetLoader-served asset root.
-    for asset in &bundle.assets {
+    for asset in bundle.assets() {
         files.push(ShellFile {
             rel_path: format!("app/src/main/assets/www/{}", asset.path.to_shell_rel()),
             content: bundle_content(&asset.path, pin, &plan.reach),
@@ -3511,7 +3511,7 @@ fn ios_layout(
         content: ShellContent::Generated(ios_readme(&root_name, base)),
     });
 
-    for asset in &bundle.assets {
+    for asset in bundle.assets() {
         files.push(ShellFile {
             rel_path: format!("App/www/{}", asset.path.to_shell_rel()),
             content: bundle_content(&asset.path, pin, &reach),
