@@ -990,7 +990,10 @@ mod tests {
                     Some(header_value.as_str()),
                     "{target}"
                 );
-                assert!(meta.contains(header_value.as_str()), "{target}");
+                assert!(
+                    meta.contains(&ipe_runtime_rust::escape::html_attr(header_value)),
+                    "{target}: the header is the policy the meta carries"
+                );
                 assert_eq!(
                     header(&response, "X-Content-Type-Options"),
                     Some("nosniff"),
