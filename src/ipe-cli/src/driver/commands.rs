@@ -2524,35 +2524,6 @@ pub fn read_progress_chunk<R: std::io::Read>(
     Ok(total)
 }
 
-/// Apply three environment variables to `cmd` so `cargo` emits ANSI colour and
-/// its `Building [===]` progress bar even through a pipe — but only when our own
-/// stderr is a real terminal (`NO_COLOR` unset). Without the explicit width,
-/// `cargo` draws no bar at all (it reads the bar width from its piped stderr,
-/// which reports no size).
-#[cfg(unix)]
-pub fn force_cargo_terminal_ui(cmd: &mut std::process::Command) {
-    let stderr = std::io::stderr();
-    if !crate::style::use_color(&stderr) {
-        return;
-    }
-    cmd.env("CARGO_TERM_COLOR", "always");
-    cmd.env("CARGO_TERM_PROGRESS_WHEN", "always");
-    let cols = terminal_width(&stderr).unwrap_or(80);
-    cmd.env("CARGO_TERM_PROGRESS_WIDTH", cols.to_string());
-}
-
-/// No-op shim for non-Unix targets where `rustix::termios` is unavailable.
-#[cfg(not(unix))]
-pub fn force_cargo_terminal_ui(_cmd: &mut std::process::Command) {}
-
-/// The column width of `stream`'s terminal, or `None` when it is not a terminal
-/// or the size cannot be read. Uses `TIOCGWINSZ` via rustix — no libc binding.
-#[cfg(unix)]
-pub fn terminal_width(stream: &impl std::os::fd::AsFd) -> Option<u16> {
-    let ws = rustix::termios::tcgetwinsize(stream).ok()?;
-    (ws.ws_col > 0).then_some(ws.ws_col)
-}
-
 /// The runtime crate the emit will link against, as a [`RuntimeContext`] for a
 /// build-failure message. `None` when no dependency-model runtime is resolved
 /// (a wasm or vendored build), in which case a feature-gap message simply omits

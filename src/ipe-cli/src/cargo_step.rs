@@ -21,16 +21,25 @@
 //! [`CARGO_BUILD_WALL`] in every profile and in every watch rebuild: at the
 //! wall the whole group (cargo, rustc, every build script) is killed and the
 //! build is refused, naming the wall.
+//!
+//! Every byte cargo emits reaches the terminal only through this module, and
+//! only sanitised and bounded: a build's progress is an `ipe` stage counting
+//! the `compiler-artifact` records of cargo's JSON stream, a rendered
+//! diagnostic and a relayed stderr chunk pass [`TerminalSafe`], and a crate
+//! name passes the stage's single-line parse. cargo's own terminal UI is never
+//! asked for.
 
-use std::io::{BufReader, ErrorKind, Read};
+use std::io::{BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use ipe_backend_rust::static_build::StaticTriple;
 
 use crate::output_dir::OwnedDir;
 use crate::output_dir::held::EntryKind;
+use crate::progress::{Mode, Stage};
 use crate::remote_ingest::{
     GroupedChild, LOCK_FETCH_LIMITS, LOCK_RESOLVE_LIMITS, LocalCeiling, LocalRefusal, LocalSource,
     LocalWall, METADATA_LIMITS, RunError, run_local,
@@ -61,6 +70,24 @@ pub const ARTIFACT_STREAM_CAP: usize = 64 * 1024 * 1024;
 /// build forwards every byte; only the kept copy stops here, at a chunk
 /// boundary, so the diagnostic shows the first errors cargo reported.
 pub const STDERR_KEEP_CAP: usize = 1024 * 1024;
+
+/// The longest stdout line of a build the live reader parses for progress,
+/// the one relay ceiling a stderr chunk is cut at too.
+///
+/// A longer line is neither shown nor counted, though it stays in the kept
+/// stream (whose own ceiling is [`ARTIFACT_STREAM_CAP`]) for the artifact and
+/// failure readers. One line never needs more than the whole stream holds.
+const LIVE_LINE_CAP: usize = crate::driver::RELAY_CHUNK_CAP;
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the live line cap leaves the kept stream's bound [ledger #boundary]
+const _: () = assert!(LIVE_LINE_CAP > 0 && LIVE_LINE_CAP <= ARTIFACT_STREAM_CAP);
+
+/// The relabels a plain-mode build stage prints at most: one at each power of
+/// two crates built, until this many. With the opening and the closing line a
+/// plain build log carries at most this plus two progress lines.
+const PLAIN_PROGRESS_LINES: u32 = 9;
+
+/// The characters of a crate name a progress label shows.
+const CRATE_NAME_SHOWN: usize = 64;
 
 /// The cargo build profile. Private: a build names a [`BuildPosture`], and
 /// the profile is [`BuildPosture::profile`] of it, never chosen at a build site.
@@ -208,10 +235,10 @@ impl CargoTarget {
 /// How much of cargo's own progress a build shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verbosity {
-    /// cargo's terminal UI (colour and the progress bar when stderr is a
-    /// terminal), plus the dependency-resolve stage.
+    /// An `ipe` stage counting the crates cargo built, plus the
+    /// dependency-resolve stage.
     Progress,
-    /// cargo's `-q`; no dependency-resolve stage.
+    /// No stage; cargo's diagnostics and stderr only.
     Quiet,
 }
 
@@ -223,14 +250,17 @@ impl Verbosity {
     }
 }
 
-/// Where a build's stdout goes.
+/// What a build's caller reads of its stdout.
+///
+/// Every [`CargoBuild`] runs cargo with `--message-format=json`, its stdout
+/// captured (up to [`ARTIFACT_STREAM_CAP`]) and read live for progress and
+/// diagnostics; the record [`CargoBuild::run`] hands back is the one
+/// authoritative list of the artifacts cargo wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CargoOutput {
-    /// stdout inherited; a `cargo build` writes only status, to stderr.
+    /// The caller reads no artifact record.
     Human(Verbosity),
-    /// `--message-format=json`: stdout is captured (up to
-    /// [`ARTIFACT_STREAM_CAP`]) and handed back, the one authoritative record
-    /// of the artifacts cargo wrote.
+    /// The caller reads the artifact record [`CargoBuild::run`] returns.
     JsonStream(Verbosity),
 }
 
@@ -427,6 +457,10 @@ impl CargoBuild<'_> {
             self.target,
             self.output,
         );
+        if self.output.verbosity() == Verbosity::Progress {
+            // The build's own stage stands in for cargo's status lines.
+            cmd.arg("-q");
+        }
         match self.krate {
             CargoCrate::Emitted(_) => {}
             CargoCrate::TestRunner { key, .. } => {
@@ -445,8 +479,8 @@ impl CargoBuild<'_> {
         cmd
     }
 
-    /// Build against a pinned dependency graph and return the captured stdout
-    /// (empty for [`CargoOutput::Human`]).
+    /// Build against a pinned dependency graph and return the captured stdout,
+    /// cargo's JSON record.
     ///
     /// Every build passes `--locked`, so a transitive point release cannot
     /// change a build with no source change, and any lock-to-manifest drift
@@ -454,9 +488,11 @@ impl CargoBuild<'_> {
     /// runs: the pin holds while an offline `--locked` probe by the build's
     /// toolchain proves it current, and is resolved afresh only once a resolve
     /// input drifts. The release wrapper replays the workspace's committed
-    /// lock and never rewrites it. stderr is relayed live, indented one shared
-    /// column, and kept unindented (up to [`STDERR_KEEP_CAP`]) for the failure
-    /// diagnostic.
+    /// lock and never rewrites it. stderr is relayed live, sanitised and
+    /// indented one shared column, and kept unindented (up to
+    /// [`STDERR_KEEP_CAP`]) for the failure diagnostic. A
+    /// [`Verbosity::Progress`] build shows a stage counting the crates cargo
+    /// built; every build shows each rendered compiler diagnostic as it comes.
     ///
     /// # Errors
     /// - [`CliError::Io`] if cargo cannot be spawned, waited on, or read, or
@@ -492,7 +528,16 @@ impl CargoBuild<'_> {
             LockPolicy::Committed => {}
         }
         cmd.arg("--locked");
-        let drained = run_to_exit(cmd, ARTIFACT_STREAM_CAP, wall).map_err(io_err)?;
+        let stderr = std::io::stderr();
+        let mode = Mode::for_stream(&stderr);
+        let live = Mutex::new(Live::new(stderr, mode, self.output.verbosity(), self.what));
+        let drained = run_to_exit(cmd, ARTIFACT_STREAM_CAP, wall, &live).map_err(io_err)?;
+        let built = matches!(&drained.waited, BuildExit::Exited(status) if status.success())
+            && drained.stdout.error.is_none()
+            && drained.stderr.error.is_none();
+        live.into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
+            .finish(built);
         let stdout = self.verdict(drained)?;
         if let Some(dir) = self.krate.owned() {
             dir.verify()?;
@@ -519,14 +564,10 @@ impl CargoBuild<'_> {
             return Err(io_err(e));
         }
         if !status.success() {
-            let cargo_json_stdout = match self.output {
-                CargoOutput::JsonStream(_) => drained.stdout.text.as_str(),
-                CargoOutput::Human(_) => "",
-            };
             return Err(emitted_build_failed(
                 self.what,
                 status.code().unwrap_or(1),
-                cargo_json_stdout,
+                &drained.stdout.text,
                 &drained.stderr.text,
                 self.runtime.clone(),
             ));
@@ -634,7 +675,7 @@ impl WatchBuild<'_> {
 }
 
 /// The `cargo build` every build kind shares: program, subcommand, working
-/// directory, build directory, profile, target, output mode and terminal UI.
+/// directory, build directory, profile, target and the JSON message stream.
 ///
 /// `target_dir` is always set as `CARGO_TARGET_DIR`, so the directory cargo
 /// writes to is the one the caller resolved and reads artifacts back from,
@@ -664,20 +705,11 @@ fn build_command(
         cmd.env_remove("RUSTFLAGS")
             .env_remove("CARGO_ENCODED_RUSTFLAGS");
     }
-    match output {
-        CargoOutput::Human(_) => {
-            cmd.stdout(Stdio::inherit());
-        }
-        CargoOutput::JsonStream(_) => {
-            cmd.arg("--message-format=json").stdout(Stdio::piped());
-        }
-    }
-    cmd.stderr(Stdio::piped());
-    match output.verbosity() {
-        Verbosity::Quiet => {
-            cmd.arg("-q");
-        }
-        Verbosity::Progress => crate::force_cargo_terminal_ui(&mut cmd),
+    cmd.arg("--message-format=json")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if output.verbosity() == Verbosity::Quiet {
+        cmd.arg("-q");
     }
     cmd
 }
@@ -705,12 +737,14 @@ pub enum BuildExit {
     TimedOut(LocalWall),
 }
 
-/// Spawn `cmd`, drain its pipes while waiting on it under `wall`, and return
-/// how it ended with both drains; the child is reaped before this returns.
-fn run_to_exit(
+/// Spawn `cmd`, drain its pipes while waiting on it under `wall`, showing
+/// them through `live`, and return how it ended with both drains; the child is
+/// reaped before this returns.
+fn run_to_exit<W: Write + Send>(
     cmd: Command,
     stdout_cap: usize,
     wall: LocalWall,
+    live: &Mutex<Live<W>>,
 ) -> std::io::Result<Drained<BuildExit>> {
     let mut child = spawn_cargo(cmd)?;
     let pipes = CargoPipes::take(&mut child, stdout_cap);
@@ -719,7 +753,9 @@ fn run_to_exit(
         waited,
         stdout,
         stderr,
-    } = pipes.drain_while(|| wait_within(&mut child, started, wall));
+    } = pipes.drain_into(live, StdoutShown::JsonLines, || {
+        wait_within(&mut child, started, wall)
+    });
     Ok(Drained {
         waited: waited?,
         stdout,
@@ -1087,6 +1123,18 @@ impl CargoPipes {
     /// stalling cargo. The drains end at end-of-stream, which cargo's exit
     /// (or its kill) brings, so none outlives the build.
     pub fn drain_while<T>(self, wait: impl FnOnce() -> T) -> Drained<T> {
+        let live = Mutex::new(Live::Quiet(std::io::stderr()));
+        self.drain_into(&live, StdoutShown::Kept, wait)
+    }
+
+    /// [`Self::drain_while`], relaying stderr through `live` and, when
+    /// `shown` says so, each JSON line of stdout too.
+    fn drain_into<T, W: Write + Send>(
+        self,
+        live: &Mutex<Live<W>>,
+        shown: StdoutShown,
+        wait: impl FnOnce() -> T,
+    ) -> Drained<T> {
         let Self {
             stdout,
             stdout_cap,
@@ -1095,12 +1143,23 @@ impl CargoPipes {
         std::thread::scope(|scope| {
             let stdout = std::thread::Builder::new().spawn_scoped(scope, move || {
                 stdout
-                    .map(|pipe| stdout_drain(read_capped(pipe, stdout_cap), stdout_cap))
+                    .map(|pipe| {
+                        let kept = match shown {
+                            StdoutShown::Kept => read_capped(pipe, stdout_cap),
+                            StdoutShown::JsonLines => {
+                                let mut lines = LineCut::new(LIVE_LINE_CAP);
+                                read_capped_with(pipe, stdout_cap, |bytes| {
+                                    lines.feed(bytes, |line| show_json_line(line, live));
+                                })
+                            }
+                        };
+                        stdout_drain(kept, stdout_cap)
+                    })
                     .unwrap_or_default()
             });
             let stderr = std::thread::Builder::new().spawn_scoped(scope, move || {
                 stderr
-                    .map(|pipe| relay_stderr(pipe, STDERR_KEEP_CAP))
+                    .map(|pipe| relay_stderr(pipe, STDERR_KEEP_CAP, live))
                     .unwrap_or_default()
             });
             let waited = wait();
@@ -1146,7 +1205,13 @@ struct Kept {
 
 /// Read `pipe` to its end, keeping at most `cap` bytes; the rest is read and
 /// dropped so the writer never blocks.
-fn read_capped(mut pipe: impl Read, cap: usize) -> Kept {
+fn read_capped(pipe: impl Read, cap: usize) -> Kept {
+    read_capped_with(pipe, cap, |_| {})
+}
+
+/// [`read_capped`], handing each run of kept bytes to `on_kept` as it is read;
+/// a byte past `cap` is never handed on.
+fn read_capped_with(mut pipe: impl Read, cap: usize, mut on_kept: impl FnMut(&[u8])) -> Kept {
     let mut kept = Kept::default();
     let mut buf = [0u8; 8 * 1024];
     loop {
@@ -1157,6 +1222,7 @@ fn read_capped(mut pipe: impl Read, cap: usize) -> Kept {
                 let room = cap.saturating_sub(kept.bytes.len());
                 let take = got.get(..room.min(got.len())).unwrap_or_default();
                 kept.bytes.extend_from_slice(take);
+                on_kept(take);
                 if take.len() < got.len() {
                     kept.overflowed = true;
                 }
@@ -1197,14 +1263,14 @@ fn stdout_drain(kept: Kept, cap: usize) -> Drain {
     }
 }
 
-/// Relay `pipe` live to our stderr, one shared column off the edge, and keep
-/// the unindented text up to `keep` bytes.
+/// Relay `pipe` live through `live`, sanitised and one shared column off the
+/// edge, and keep the unindented text up to `keep` bytes.
 ///
-/// Chunks end at a newline or a carriage return
-/// ([`crate::read_progress_chunk`]), so cargo's in-place progress bar flows
-/// without waiting for the next newline. The kept copy stops at the first
-/// chunk that would pass `keep`; the relay goes on to the end of the stream.
-fn relay_stderr(pipe: impl Read, keep: usize) -> Drain {
+/// Chunks end at a newline, a carriage return, or [`LIVE_LINE_CAP`] bytes
+/// ([`crate::read_progress_chunk`]), so a line is shown as soon as it ends.
+/// The kept copy stops at the first chunk that would pass `keep`; the relay
+/// goes on to the end of the stream.
+fn relay_stderr<W: Write>(pipe: impl Read, keep: usize, live: &Mutex<Live<W>>) -> Drain {
     let mut reader = BufReader::new(pipe);
     let mut drain = Drain::default();
     let mut keeping = true;
@@ -1214,10 +1280,7 @@ fn relay_stderr(pipe: impl Read, keep: usize) -> Drain {
         match crate::read_progress_chunk(&mut reader, &mut chunk) {
             Ok(0) => break,
             Ok(_) => {
-                crate::screen::emit_machine(
-                    crate::screen::Stream::Stderr,
-                    &crate::screen::indent_relay_chunk(&chunk),
-                );
+                lock(live).block(&chunk);
                 keeping = keeping && drain.text.len().saturating_add(chunk.len()) <= keep;
                 if keeping {
                     drain.text.push_str(&chunk);
@@ -1232,12 +1295,237 @@ fn relay_stderr(pipe: impl Read, keep: usize) -> Drain {
     drain
 }
 
+/// Which of a build's stdout lines [`CargoPipes::drain_into`] shows live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StdoutShown {
+    /// None: stdout is only kept, for a caller that renders it itself.
+    Kept,
+    /// Each whole JSON line of at most [`LIVE_LINE_CAP`] bytes.
+    JsonLines,
+}
+
+/// Cuts a byte stream into newline-ended lines of at most `cap` bytes.
+///
+/// A line longer than `cap` is dropped whole and an unterminated tail is never
+/// handed on, so a line handed on is exactly one complete line; the buffer
+/// never holds more than `cap` bytes.
+struct LineCut {
+    /// The current line's bytes so far.
+    line: Vec<u8>,
+    /// Whether the current line has passed `cap`.
+    over: bool,
+    /// The longest line handed on.
+    cap: usize,
+}
+
+impl LineCut {
+    const fn new(cap: usize) -> Self {
+        Self {
+            line: Vec::new(),
+            over: false,
+            cap,
+        }
+    }
+
+    /// Feed `bytes`, handing each line they complete to `whole`, without its newline.
+    fn feed(&mut self, bytes: &[u8], mut whole: impl FnMut(&[u8])) {
+        for piece in bytes.split_inclusive(|&b| b == b'\n') {
+            let (body, ended) = piece
+                .strip_suffix(b"\n")
+                .map_or((piece, false), |body| (body, true));
+            if !self.over {
+                if self.line.len().saturating_add(body.len()) > self.cap {
+                    self.over = true;
+                    self.line.clear();
+                } else {
+                    self.line.extend_from_slice(body);
+                }
+            }
+            if ended {
+                if !self.over {
+                    whole(&self.line);
+                }
+                self.line.clear();
+                self.over = false;
+            }
+        }
+    }
+}
+
+/// Show one whole stdout line of a JSON build through `live`: a
+/// `compiler-artifact` record counts one crate built, a `compiler-message`
+/// record shows its rendered diagnostic. Any other line, a line that is not
+/// JSON included, shows nothing: progress is advisory, and the kept stream
+/// stays the build's authoritative record.
+fn show_json_line<W: Write>(line: &[u8], live: &Mutex<Live<W>>) {
+    let Ok(record) = serde_json::from_slice::<serde_json::Value>(line) else {
+        return;
+    };
+    match record.get("reason").and_then(serde_json::Value::as_str) {
+        Some("compiler-artifact") => {
+            if let Some(name) = record
+                .get("target")
+                .and_then(|target| target.get("name"))
+                .and_then(serde_json::Value::as_str)
+            {
+                lock(live).artifact(name);
+            }
+        }
+        Some("compiler-message") => {
+            if let Some(rendered) = record
+                .get("message")
+                .and_then(|message| message.get("rendered"))
+                .and_then(serde_json::Value::as_str)
+            {
+                lock(live).block(rendered);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The value behind `mutex`, also when a thread panicked holding it: the live
+/// view is advisory and its state stays usable.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `raw`, cargo's text, as a sanitised block one shared column off the edge
+/// and ended by a newline; `None` for a bare carriage return, which shows
+/// nothing.
+fn relay_block(raw: &str) -> Option<TerminalSafe> {
+    if !raw.contains('\n') && raw.trim_end_matches('\r').is_empty() {
+        return None;
+    }
+    let mut text = String::with_capacity(raw.len().saturating_add(2));
+    for line in raw.split_inclusive('\n') {
+        text.push_str(&crate::screen::indent_relay_chunk(line));
+    }
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    Some(TerminalSafe::sanitize(&text))
+}
+
+/// `n crates built`, singular for one.
+fn crates_built(n: u32) -> String {
+    if n == 1 {
+        "1 crate built".to_owned()
+    } else {
+        format!("{n} crates built")
+    }
+}
+
+/// Where a build's live cargo text is shown: a stage counting the crates
+/// cargo built, or, for a quiet build, the relay alone.
+///
+/// Everything shown is cargo's, so a block passes [`relay_block`] and a stage
+/// label the stage's single-line parse before it reaches the writer.
+enum Live<W: Write> {
+    /// No stage: diagnostics and stderr only.
+    Quiet(W),
+    /// A stage counting `compiler-artifact` records.
+    Progress(BuildStage<W>),
+}
+
+/// The stage of a [`Verbosity::Progress`] build.
+struct BuildStage<W: Write> {
+    stage: Stage<W>,
+    /// The stage's mode, which bounds how many relabels it prints.
+    mode: Mode,
+    /// What is built, named in the opening and closing labels.
+    what: &'static str,
+    /// The `compiler-artifact` records counted so far.
+    built: u32,
+    /// The relabels a plain stage has printed.
+    plain_lines: u32,
+}
+
+impl<W: Write> Live<W> {
+    /// The live view of a build of `what` at `verbosity`, written to `writer`
+    /// in `mode`; a progress build's stage starts at once.
+    fn new(writer: W, mode: Mode, verbosity: Verbosity, what: &'static str) -> Self {
+        match verbosity {
+            Verbosity::Quiet => Self::Quiet(writer),
+            Verbosity::Progress => Self::Progress(BuildStage {
+                stage: Stage::with_mode(writer, mode, format!("compiling {what}…")),
+                mode,
+                what,
+                built: 0,
+                plain_lines: 0,
+            }),
+        }
+    }
+
+    /// Count one crate cargo built, named `crate_name`.
+    ///
+    /// A terminal stage redraws at every crate. A plain stage prints at each
+    /// power of two only, at most [`PLAIN_PROGRESS_LINES`] times, so a log
+    /// stays short however many crates the graph holds.
+    fn artifact(&mut self, crate_name: &str) {
+        let Self::Progress(build) = self else {
+            return;
+        };
+        build.built = build.built.saturating_add(1);
+        let shown = match build.mode {
+            Mode::Terminal => true,
+            Mode::Plain => {
+                build.built.is_power_of_two() && build.plain_lines < PLAIN_PROGRESS_LINES
+            }
+        };
+        if !shown {
+            return;
+        }
+        if build.mode == Mode::Plain {
+            build.plain_lines = build.plain_lines.saturating_add(1);
+        }
+        let name: String = crate_name.chars().take(CRATE_NAME_SHOWN).collect();
+        build
+            .stage
+            .relabel(format!("compiling {name} ({})", crates_built(build.built)));
+    }
+
+    /// Show `raw`, a diagnostic or a stderr chunk of cargo's, as a sanitised block.
+    fn block(&mut self, raw: &str) {
+        let Some(block) = relay_block(raw) else {
+            return;
+        };
+        match self {
+            Self::Quiet(writer) => {
+                let _ = writer.write_all(block.as_str().as_bytes());
+                let _ = writer.flush();
+            }
+            Self::Progress(build) => build.stage.write_above(&block),
+        }
+    }
+
+    /// Settle the stage: a success naming the crates built, or a failure.
+    fn finish(self, built: bool) {
+        if let Self::Progress(build) = self {
+            if built {
+                build.stage.success(format!(
+                    "compiled {} ({})",
+                    build.what,
+                    crates_built(build.built)
+                ));
+            } else {
+                build
+                    .stage
+                    .failure(format!("compiling {} failed", build.what));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::{
         BuildPosture, CargoBuild, CargoCrate, CargoOutput, CargoTarget, EmbeddedApp, Verbosity,
         WatchBuild,
     };
+    use crate::progress::Mode;
     use crate::target_dir::LinkableTargetDir;
     use crate::toolchain::CargoBin;
     use crate::watch::BuildAccel;
@@ -1328,7 +1616,7 @@ mod tests {
         ] {
             assert!(a.iter().any(|x| x == want), "{want} missing from {a:?}");
         }
-        assert!(!a.iter().any(|x| x == "--message-format=json"), "{a:?}");
+        assert!(a.iter().any(|x| x == "--message-format=json"), "{a:?}");
     }
 
     #[test]
@@ -1414,7 +1702,7 @@ mod tests {
             CargoTarget::Host,
             CargoOutput::Human(Verbosity::Quiet),
         );
-        assert_eq!(args(&cmd), ["build", "-q"]);
+        assert_eq!(args(&cmd), ["build", "--message-format=json", "-q"]);
     }
 
     /// The profile is a total function of the posture: development builds the
@@ -1555,9 +1843,170 @@ mod tests {
 
     #[test]
     fn a_relayed_stderr_keeps_whole_chunks_up_to_its_ceiling() {
-        let drain = super::relay_stderr(&b"aaaa\nbbbb\ncccc\n"[..], 10);
+        let mut shown = Vec::new();
+        let live = Mutex::new(super::Live::Quiet(&mut shown));
+        let drain = super::relay_stderr(&b"aaaa\nbbbb\ncccc\n"[..], 10, &live);
         assert_eq!(drain.text, "aaaa\nbbbb\n");
         assert!(drain.error.is_none());
+        drop(live);
+        let shown = String::from_utf8(shown).expect("utf8");
+        assert_eq!(shown.lines().count(), 3, "the relay goes on: {shown:?}");
+    }
+
+    /// A progress stage over `buf` in `mode`, building `the app`.
+    fn progress_live(buf: &mut Vec<u8>, mode: Mode) -> Mutex<super::Live<&mut Vec<u8>>> {
+        Mutex::new(super::Live::new(buf, mode, Verbosity::Progress, "the app"))
+    }
+
+    /// The crates a progress stage has counted.
+    fn counted(live: &Mutex<super::Live<&mut Vec<u8>>>) -> u32 {
+        match &*super::lock(live) {
+            super::Live::Progress(build) => build.built,
+            super::Live::Quiet(_) => 0,
+        }
+    }
+
+    /// Feed `stdout` through the live JSON reader with a kept-stream ceiling of `cap`.
+    fn feed_stdout(stdout: &[u8], cap: usize, live: &Mutex<super::Live<&mut Vec<u8>>>) {
+        let mut lines = super::LineCut::new(super::LIVE_LINE_CAP);
+        super::read_capped_with(stdout, cap, |bytes| {
+            lines.feed(bytes, |line| super::show_json_line(line, live));
+        });
+    }
+
+    const HOSTILE: &str = concat!(
+        r#"{"reason":"compiler-artifact","target":{"name":"evil\u001b[2J\u001b]0;x\u0007\nforged"}}"#,
+        "\n",
+        r#"{"reason":"compiler-message","message":{"rendered":"warning: \u001b[31mred\u001b]8;;http://x\u0007\n"}}"#,
+        "\n",
+    );
+
+    /// A crate name and a rendered diagnostic are cargo's text: a control
+    /// sequence in either reaches the writer inert, in both modes.
+    #[test]
+    fn cargo_text_in_a_build_stage_renders_inert() {
+        for mode in [Mode::Plain, Mode::Terminal] {
+            let mut buf = Vec::new();
+            {
+                let live = progress_live(&mut buf, mode);
+                feed_stdout(HOSTILE.as_bytes(), super::ARTIFACT_STREAM_CAP, &live);
+                assert_eq!(counted(&live), 1, "{mode:?}");
+                live.into_inner().expect("unpoisoned").finish(true);
+            }
+            let out = String::from_utf8(buf).expect("utf8");
+            for forbidden in ["\x1b[2J", "\x1b]", "\x1b[31m", "\x07"] {
+                assert!(!out.contains(forbidden), "{mode:?} {forbidden:?}: {out:?}");
+            }
+            if mode == Mode::Plain {
+                assert!(!out.contains('\x1b'), "{out:?}");
+            }
+            assert!(out.contains("evil"), "{out:?}");
+            assert!(out.contains("warning:"), "{out:?}");
+        }
+    }
+
+    /// A quiet build shows no stage, and the relay it keeps is sanitised too.
+    #[test]
+    fn a_quiet_relay_renders_cargo_text_inert() {
+        let mut buf = Vec::new();
+        {
+            let live = Mutex::new(super::Live::Quiet(&mut buf));
+            feed_stdout(HOSTILE.as_bytes(), super::ARTIFACT_STREAM_CAP, &live);
+            let drain = super::relay_stderr(&b"error\x1b]0;t\x07: x\n"[..], 100, &live);
+            assert!(drain.error.is_none());
+        }
+        let out = String::from_utf8(buf).expect("utf8");
+        assert!(!out.contains('\x1b'), "{out:?}");
+        assert!(
+            !out.contains("evil"),
+            "a quiet build names no crate: {out:?}"
+        );
+        assert!(out.contains("warning:"), "{out:?}");
+    }
+
+    /// Progress parsing is advisory: a malformed line, an overlong line and an
+    /// unterminated tail are not counted, and none of them panics.
+    #[test]
+    fn a_malformed_overlong_or_unterminated_line_is_not_counted() {
+        let artifact = r#"{"reason":"compiler-artifact","target":{"name":"ok"}}"#;
+        let mut long = String::from(r#"{"reason":"compiler-artifact","target":{"name":""#);
+        long.push_str(&"a".repeat(super::LIVE_LINE_CAP));
+        long.push_str(r#""}}"#);
+        let stdout = format!("{artifact}\nnot json\n{{\"reason\":\n{long}\n{artifact}\n{artifact}");
+        let mut buf = Vec::new();
+        let live = progress_live(&mut buf, Mode::Plain);
+        feed_stdout(stdout.as_bytes(), super::ARTIFACT_STREAM_CAP, &live);
+        assert_eq!(counted(&live), 2);
+    }
+
+    /// A line cut keeps no more than its cap, also across a line split over
+    /// many reads, and delivers the next line whole after an overlong one.
+    #[test]
+    fn a_line_cut_drops_an_overlong_line_and_resumes_at_the_next() {
+        let mut cut = super::LineCut::new(4);
+        let mut whole = Vec::new();
+        for bytes in [&b"ab"[..], b"cd", b"e\nxy", b"z\n", b"tail"] {
+            cut.feed(bytes, |line| whole.push(line.to_vec()));
+            assert!(cut.line.len() <= 4);
+        }
+        assert_eq!(whole, [b"xyz".to_vec()]);
+    }
+
+    /// A plain log stays short however many crates the graph holds: one
+    /// opening line, at most [`super::PLAIN_PROGRESS_LINES`] relabels, one
+    /// closing line.
+    #[test]
+    fn a_plain_build_stage_prints_a_bounded_number_of_lines() {
+        let mut buf = Vec::new();
+        {
+            let live = progress_live(&mut buf, Mode::Plain);
+            let line = r#"{"reason":"compiler-artifact","target":{"name":"c"}}"#;
+            let stdout = format!("{line}\n").repeat(5000);
+            feed_stdout(stdout.as_bytes(), super::ARTIFACT_STREAM_CAP, &live);
+            assert_eq!(counted(&live), 5000);
+            live.into_inner().expect("unpoisoned").finish(true);
+        }
+        let out = String::from_utf8(buf).expect("utf8");
+        let budget = usize::try_from(super::PLAIN_PROGRESS_LINES).expect("small") + 2;
+        assert!(out.lines().count() <= budget, "{out}");
+        assert!(out.contains("5000 crates built"), "{out}");
+    }
+
+    /// Nothing past the kept stream's ceiling is shown or counted.
+    #[test]
+    fn an_artifact_past_the_kept_ceiling_is_not_counted() {
+        let line = format!(
+            "{}\n",
+            r#"{"reason":"compiler-artifact","target":{"name":"c"}}"#
+        );
+        let stdout = line.repeat(10);
+        let mut buf = Vec::new();
+        let live = progress_live(&mut buf, Mode::Plain);
+        feed_stdout(stdout.as_bytes(), line.len() * 3 + 5, &live);
+        assert_eq!(counted(&live), 3);
+    }
+
+    /// A crate name is clipped, so one record cannot flood a label.
+    #[test]
+    fn a_long_crate_name_is_clipped_in_its_label() {
+        let mut buf = Vec::new();
+        {
+            let live = progress_live(&mut buf, Mode::Plain);
+            let name = "n".repeat(super::CRATE_NAME_SHOWN * 4);
+            let line = format!(
+                "{{\"reason\":\"compiler-artifact\",\"target\":{{\"name\":\"{name}\"}}}}\n"
+            );
+            feed_stdout(line.as_bytes(), super::ARTIFACT_STREAM_CAP, &live);
+            live.into_inner().expect("unpoisoned").finish(false);
+        }
+        let out = String::from_utf8(buf).expect("utf8");
+        let shown = "n".repeat(super::CRATE_NAME_SHOWN);
+        assert!(
+            out.contains(&format!("compiling {shown} (1 crate built)")),
+            "{out}"
+        );
+        assert!(!out.contains(&format!("{shown}n")), "{out}");
+        assert!(out.contains("compiling the app failed"), "{out}");
     }
 
     #[test]
