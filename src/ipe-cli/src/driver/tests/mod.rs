@@ -276,22 +276,6 @@ fn read_progress_chunk_stops_at_newline_or_carriage_return() {
     assert!(out.is_empty());
 }
 
-/// Cargo terminal UI should be forced only when our stderr is a TTY and
-/// `NO_COLOR` is unset — both conditions must hold. Checked via a
-/// closed-form helper that mirrors the guard inside `force_cargo_terminal_ui`.
-#[test]
-fn force_cargo_ui_truth_table() {
-    // Pure function extracted from the guard: is_tty && no_color is unset.
-    let should_force = |is_tty: bool, no_color: bool| -> bool { is_tty && !no_color };
-    assert!(should_force(true, false), "tty + color on → force");
-    assert!(!should_force(false, false), "not a tty → no force");
-    assert!(!should_force(true, true), "NO_COLOR set → no force");
-    assert!(
-        !should_force(false, true),
-        "not a tty + NO_COLOR → no force"
-    );
-}
-
 /// `missing_runtime_feature` pulls the feature name out of `cargo`'s
 /// feature-resolution error, whether the name is backtick- or single-quoted,
 /// and yields `None` for an unrelated failure.
