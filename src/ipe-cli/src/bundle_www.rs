@@ -1,6 +1,6 @@
 //! The client bundle: the one held, bounded collector of a `web client` build's `www/`.
 //!
-//! The emitted crate's `www/` is an intermediate. [`SpaBundle::from_www_dir`]
+//! The emitted crate's `www/` is an intermediate. [`SpaBundle::from_crate`]
 //! walks it through held directory handles, refusing a link, a special file, a
 //! name the bundle cannot carry, and a tree past its depth or entry ceiling.
 //! Every read of what the walk admitted goes through one [`HeldSpa`], capped
@@ -377,7 +377,7 @@ impl SpaBundle {
         Self::from_www_dir_with(www_dir, AssetLimits::PRODUCTION)
     }
 
-    /// [`SpaBundle::from_www_dir`] under the ceilings `limits`.
+    /// [`SpaBundle::from_crate`] under the ceilings `limits`.
     #[cfg(test)]
     fn from_www_dir_with(www_dir: &Path, limits: AssetLimits) -> Result<Self, BundleError> {
         let root = open_www(www_dir)
