@@ -12,7 +12,7 @@ use ipe_diagnostics::suggest;
 
 use crate::api_surface::ModulePath;
 use crate::cargo_step::{
-    CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, EmbeddedApp, TestRunKey,
+    BuildPosture, CargoBuild, CargoCrate, CargoOutput, CargoTarget, EmbeddedApp, TestRunKey,
     Verbosity,
 };
 use crate::delivery::HostIntent;
@@ -1260,9 +1260,10 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
         CompileTarget::WasmClient => Some(bundle_wasm(
             crate_dir.dir(),
             &crate::bundle_www::BundleHome::Dev(output),
+            BuildPosture::Dev,
         )?),
         CompileTarget::WasmWasi => {
-            bundle_wasi(crate_dir.dir())?;
+            bundle_wasi(crate_dir.dir(), BuildPosture::Dev)?;
             None
         }
         CompileTarget::Native => Some(compile_and_finalize_native_build(
@@ -1331,6 +1332,14 @@ pub enum NativeFinish<'a> {
 }
 
 impl NativeFinish<'_> {
+    /// The build posture: it picks the cargo profile the crate is built with.
+    const fn build_posture(&self) -> BuildPosture {
+        match self {
+            Self::Dev => BuildPosture::Dev,
+            Self::Release { .. } => BuildPosture::Release,
+        }
+    }
+
     /// The posture's name in an internal-bug diagnostic.
     const fn posture(&self) -> &'static str {
         match self {
@@ -1348,7 +1357,8 @@ pub struct FlooredBuild<'a> {
     /// The emitted crate, both floored and built; the floor line it was
     /// written with must be the one [`Self::finish`] builds.
     pub(crate) crate_dir: &'a EmittedCrate,
-    /// The posture: it decides the floor and picks the cargo profile, so a
+    /// The posture: it decides the floor and, through
+    /// [`NativeFinish::build_posture`], the cargo profile, so a
     /// release floor is never built as a debug binary and a dev build carries
     /// only the development marker.
     pub(crate) finish: NativeFinish<'a>,
@@ -1365,6 +1375,15 @@ pub struct FlooredBuild<'a> {
 }
 
 impl FlooredBuild<'_> {
+    /// The directory this build's artifacts land in, a function of its
+    /// posture, target and build directory alone.
+    #[must_use]
+    pub(crate) fn artifact_dir(&self) -> PathBuf {
+        self.finish
+            .build_posture()
+            .artifact_dir(self.target_dir.path(), self.target)
+    }
+
     /// Run cargo in the build's posture. A release build first writes the
     /// `ipe.profile` mirror and the embedded floor, so the binary cargo
     /// produces carries exactly this build's floor — never none and never a
@@ -1396,10 +1415,10 @@ impl FlooredBuild<'_> {
     /// [`Self::run`], building the runner under `key` when one is given.
     fn run_for(self, key: Option<&TestRunKey>) -> Result<String, CliError> {
         let crate_dir = self.crate_dir.dir();
-        let profile = match (self.crate_dir.floor(), self.finish) {
+        let posture = self.finish.build_posture();
+        match (self.crate_dir.floor(), self.finish) {
             (run_sandbox::EmitFloor::DevelopmentMarker, NativeFinish::Dev) => {
                 run_sandbox::write_dev_floor_marker(crate_dir)?;
-                CargoProfile::Dev
             }
             (
                 run_sandbox::EmitFloor::ReleaseFloorAtBuild,
@@ -1407,7 +1426,6 @@ impl FlooredBuild<'_> {
             ) => {
                 let floor = run_sandbox::build_profile(consented.resolved(), driver)?;
                 run_sandbox::write_build_artifacts(crate_dir, &floor)?;
-                CargoProfile::Release
             }
             (floor @ run_sandbox::EmitFloor::NoNativeBinary, finish)
             | (
@@ -1423,7 +1441,7 @@ impl FlooredBuild<'_> {
                     ),
                 ));
             }
-        };
+        }
         let krate = key.map_or(CargoCrate::Emitted(crate_dir), |key| {
             CargoCrate::TestRunner {
                 dir: crate_dir,
@@ -1433,7 +1451,7 @@ impl FlooredBuild<'_> {
         CargoBuild {
             cargo: self.cargo,
             krate,
-            profile,
+            posture,
             target: self.target,
             target_dir: self.target_dir,
             output: self.output,
@@ -1447,6 +1465,8 @@ impl FlooredBuild<'_> {
 /// Build the pure-native release binary of `crate_dir` for `triple`: an
 /// optimised static build carrying the floor `consented` lowers to.
 ///
+/// Returns the directory the binary landed in.
+///
 /// # Errors
 /// The errors of [`FlooredBuild::run`].
 fn build_pure_native_release(
@@ -1457,8 +1477,8 @@ fn build_pure_native_release(
     triple: ipe_backend_rust::static_build::StaticTriple,
     target_dir: &crate::target_dir::LinkableTargetDir,
     verbosity: Verbosity,
-) -> Result<String, CliError> {
-    FlooredBuild {
+) -> Result<PathBuf, CliError> {
+    let build = FlooredBuild {
         cargo,
         crate_dir,
         finish: NativeFinish::Release { consented, driver },
@@ -1467,8 +1487,10 @@ fn build_pure_native_release(
         output: CargoOutput::Human(verbosity),
         what: "the release binary",
         runtime: None,
-    }
-    .run()
+    };
+    let artifacts = build.artifact_dir();
+    build.run()?;
+    Ok(artifacts)
 }
 
 /// Compile the just-emitted native dev crate. Split out of [`run_build`] so
@@ -1520,7 +1542,7 @@ pub fn compile_and_finalize_native_build(
     };
     let target_dir =
         crate::target_dir::LinkableTargetDir::for_crate(cargo_bin.path(), out_dir, None)?;
-    FlooredBuild {
+    let build = FlooredBuild {
         cargo: &cargo_bin,
         crate_dir,
         finish: NativeFinish::Dev,
@@ -1531,8 +1553,9 @@ pub fn compile_and_finalize_native_build(
         output: CargoOutput::Human(Verbosity::of_quiet(quiet)),
         what: "the emitted program",
         runtime,
-    }
-    .run()?;
+    };
+    let artifacts = build.artifact_dir();
+    build.run()?;
 
     // Copy the just-built binary into a stable per-project location. With the
     // Ipê-recommended shared `CARGO_TARGET_DIR`, the artifact lands in the
@@ -1543,10 +1566,9 @@ pub fn compile_and_finalize_native_build(
     // closed (no stale copy). Copy (never hardlink): the shared target is often
     // a different mount.
     let artifact = copy_native_artifact(
-        target_dir.path(),
+        &artifacts,
         out_dir,
         &output.claim_area(&[OutputArea::Bin])?,
-        static_plan.as_ref(),
         manifest,
     )?;
     Ok(artifact)
@@ -1556,17 +1578,16 @@ pub fn compile_and_finalize_native_build(
 /// cargo target directory into `<project>/out/bin/<name>`, a stable path under
 /// the project the user can find and run regardless of `CARGO_TARGET_DIR`.
 ///
-/// The source path is `target_dir`, the build directory the build was handed
-/// (never a guess at where cargo put it), plus the `debug` profile and — under
-/// a static plan — the explicit target triple, exactly as the `release` path
-/// resolves its own artifact. Returns the destination path so
+/// The source path is under `artifacts`, the directory the build's own
+/// posture, target and build directory name (never a guess at where cargo put
+/// it), exactly as the `release` path resolves its own artifact. Returns the
+/// destination path so
 /// the caller can report it. Copy (not hardlink): the shared target is often on
 /// a different mount.
 fn copy_native_artifact(
-    target_dir: &Path,
+    artifacts: &Path,
     out_dir: &Path,
     bin_dir: &OwnedDir,
-    static_plan: Option<&ipe_backend_rust::static_build::StaticPlan>,
     manifest: Option<&project::ProjectManifest>,
 ) -> Result<PathBuf, CliError> {
     // LOCATE the built binary by its emitted crate identity (the hashed
@@ -1575,12 +1596,7 @@ fn copy_native_artifact(
     // regardless of the internal per-project identity hash.
     let bin_name = emitted_bin_filename(out_dir)?;
     let friendly = friendly_artifact_filename(manifest);
-    let mut src = target_dir.to_path_buf();
-    if let Some(plan) = static_plan {
-        src.push(plan.triple.as_str());
-    }
-    src.push("debug");
-    src.push(&bin_name);
+    let src = artifacts.join(&bin_name);
     if !src.is_file() {
         return Err(CliError::Usage(text::msg::build_binary_missing(
             &src.display(),
@@ -2025,6 +2041,7 @@ pub fn release_pipeline(
                 let www = bundle_wasm(
                     crate_dir.dir(),
                     &crate::bundle_www::BundleHome::Release(member),
+                    BuildPosture::Release,
                 )?;
                 if show_progress {
                     crate::screen::chatter(
@@ -2119,7 +2136,7 @@ pub fn release_pipeline(
                     crate_dir.path(),
                     None,
                 )?;
-                build_pure_native_release(
+                let artifacts = build_pure_native_release(
                     &cargo_bin,
                     &crate_dir,
                     &consented,
@@ -2135,11 +2152,7 @@ pub fn release_pipeline(
                 // crate carries only to own a unique shared-target slot never leaks into a
                 // distributed filename.
                 let bin_name = emitted_bin_filename(crate_dir.path())?;
-                let bin_path = app_target_dir
-                    .path()
-                    .join(triple.as_str())
-                    .join("release")
-                    .join(&bin_name);
+                let bin_path = artifacts.join(&bin_name);
                 if !bin_path.is_file() {
                     return Err(CliError::Usage(text::msg::release_binary_missing(
                         &bin_path.display(),
@@ -2212,7 +2225,7 @@ pub fn release_pipeline(
                 app_dir.path(),
                 None,
             )?;
-            FlooredBuild {
+            let app_build = FlooredBuild {
                 cargo: &cargo_bin,
                 crate_dir: &app_dir,
                 finish: NativeFinish::Release {
@@ -2224,15 +2237,12 @@ pub fn release_pipeline(
                 output: CargoOutput::Human(Verbosity::Progress),
                 what: "the release app",
                 runtime: None,
-            }
-            .run()?;
+            };
+            let app_artifacts = app_build.artifact_dir();
+            app_build.run()?;
 
             let release_bin_name = emitted_bin_filename(app_dir.path())?;
-            let app_binary = app_target_dir
-                .path()
-                .join(triple.as_str())
-                .join("release")
-                .join(&release_bin_name);
+            let app_binary = app_artifacts.join(&release_bin_name);
             if !app_binary.is_file() {
                 return Err(CliError::Usage(text::msg::release_app_binary_missing(
                     &app_binary.display(),
@@ -2258,30 +2268,27 @@ pub fn release_pipeline(
                 wrapper_source.root(),
                 None,
             )?;
-            CargoBuild {
+            let wrapper_build = CargoBuild {
                 cargo: &cargo_bin,
                 krate: CargoCrate::ReleaseWrapper {
                     source: &wrapper_source,
                     embed,
                 },
-                profile: CargoProfile::Release,
+                posture: BuildPosture::Release,
                 target: CargoTarget::Static(wrapper_static_plan.triple),
                 target_dir: &wrapper_target_dir,
                 output: CargoOutput::Human(Verbosity::Progress),
                 what: "the release wrapper",
                 runtime: None,
-            }
-            .run()?;
+            };
+            let wrapper_artifacts = wrapper_build.artifact_dir();
+            wrapper_build.run()?;
 
             // Step 3: lay out the bundle.
             let bundle_dir = member.area(OutputArea::Bundle).claim()?;
 
-            // The wrapper binary is read back from the build directory its build was handed.
-            let wrapper_src = wrapper_target_dir
-                .path()
-                .join(wrapper_static_plan.triple.as_str())
-                .join("release")
-                .join(RELEASE_WRAPPER);
+            // The wrapper binary is read back from the directory its build wrote.
+            let wrapper_src = wrapper_artifacts.join(RELEASE_WRAPPER);
 
             let artifact = match args.mode {
                 cli_args::ReleaseMode::Embed => {
@@ -2600,9 +2607,10 @@ pub fn format_artifact_size(bytes: u64) -> String {
 const WASM_BINDGEN_VERSION: &str = "0.2.126";
 
 /// Run the three post-emit bundle steps for the `web client` delivery:
-/// 1. `cargo build --target wasm32-unknown-unknown --release` (THE SEAL cross-target)
+/// 1. `cargo build --target wasm32-unknown-unknown` in `posture`'s profile
+///    (THE SEAL cross-target)
 /// 2. `wasm-bindgen` CLI — emits the JS glue + `www/pkg/ipe_app_bg.wasm`
-/// 3. `wasm-opt -Oz` — optional; silently skipped when not on PATH
+/// 3. `wasm-opt -Oz` — a release bundle only; silently skipped when not on PATH
 ///
 /// Both tools run under [`crate::remote_ingest::WASM_TOOL_LIMITS`].
 /// The tools write `www/pkg/` into the crate's `www/`, an intermediate; the
@@ -2612,13 +2620,15 @@ const WASM_BINDGEN_VERSION: &str = "0.2.126";
 ///
 /// # Errors
 /// [`CliError::EmittedBuildFailed`] when the wasm `cargo build` fails;
-/// [`CliError::Usage`] when `wasm-bindgen` fails;
+/// [`CliError::Usage`] when cargo's record names no `.wasm` module, or when
+/// `wasm-bindgen` fails;
 /// [`CliError::LocalLimitExceeded`] when `wasm-bindgen` crosses its ceiling;
 /// [`CliError::OutputRefused`] when `crate_dir` was replaced since its claim;
 /// [`CliError::ProjectRefused`] when the crate's `www/` cannot be published.
 pub fn bundle_wasm(
     crate_dir: &OwnedDir,
     home: &crate::bundle_www::BundleHome,
+    posture: BuildPosture,
 ) -> Result<PathBuf, CliError> {
     let out_dir = crate_dir.path();
     // Fail closed before the cross-compile: a missing toolchain becomes a clear
@@ -2634,49 +2644,50 @@ pub fn bundle_wasm(
     // itself raises is already fail-closed).
     let target_dir =
         crate::target_dir::LinkableTargetDir::for_crate(cargo_bin.path(), out_dir, None)?;
-    CargoBuild {
+    let messages = CargoBuild {
         cargo: &cargo_bin,
         krate: CargoCrate::Emitted(crate_dir),
-        profile: CargoProfile::Release,
+        posture,
         target: CargoTarget::WasmBrowser,
         target_dir: &target_dir,
-        output: CargoOutput::Human(Verbosity::Progress),
+        output: CargoOutput::JsonStream(Verbosity::Progress),
         what: "the emitted wasm program",
         runtime: runtime_context_for_message(),
     }
     .run()?;
 
-    // Step 2: wasm-bindgen — the .wasm the cargo build just produced.
-    let wasm_path = browser_wasm_artifact(&target_dir);
+    // Step 2: wasm-bindgen — the .wasm cargo's own record names.
+    let wasm_path = wasm_artifact_path(&messages, posture, CargoTarget::WasmBrowser, out_dir)?;
 
     bundle_wasm_pkg(
         crate_dir,
         &wasm_path,
-        &WasmTools {
-            bindgen: Path::new("wasm-bindgen"),
-            opt: Path::new("wasm-opt"),
-        },
+        &WasmTools::for_posture(posture),
         crate::remote_ingest::WASM_TOOL_LIMITS,
         || home.claim(),
     )
-}
-
-/// The `.wasm` a browser release build writes, read from the build directory
-/// the build was handed.
-fn browser_wasm_artifact(target_dir: &crate::target_dir::LinkableTargetDir) -> PathBuf {
-    target_dir
-        .path()
-        .join("wasm32-unknown-unknown")
-        .join("release")
-        .join("ipe_app.wasm")
 }
 
 /// The post-link wasm tools `bundle_wasm` runs, by program path.
 struct WasmTools<'a> {
     /// The `wasm-bindgen` CLI.
     bindgen: &'a Path,
-    /// The optional `wasm-opt` size pass.
-    opt: &'a Path,
+    /// The `wasm-opt` size pass, run on a release bundle only.
+    opt: Option<&'a Path>,
+}
+
+impl WasmTools<'static> {
+    /// The tools on `PATH` a `posture` bundle runs: a development bundle
+    /// skips the `wasm-opt` size pass.
+    const fn for_posture(posture: BuildPosture) -> Self {
+        Self {
+            bindgen: Path::new("wasm-bindgen"),
+            opt: match posture {
+                BuildPosture::Dev => None,
+                BuildPosture::Release => Some(Path::new("wasm-opt")),
+            },
+        }
+    }
 }
 
 /// The bundle `wasm-bindgen` writes into `www/pkg/`.
@@ -2755,14 +2766,17 @@ fn bundle_wasm_pkg(
     }
     prove_pkg()?;
 
-    // Step 3: wasm-opt -Oz — optional size pass; silently skipped when absent
-    // (spawning a missing program through `Command::new` reports `NotFound`).
+    // Step 3: wasm-opt -Oz — optional size pass of a release bundle; silently
+    // skipped when absent (spawning a missing program through `Command::new`
+    // reports `NotFound`).
     let bundle = crate_dir.path_to(pkg_rel.join(WASM_BUNDLE_FILE))?;
     let bg_wasm = bundle.path();
-    if bg_wasm.is_file() {
+    if let Some(opt_tool) = tools.opt
+        && bg_wasm.is_file()
+    {
         let staged = crate_dir.path_to(pkg_rel.join(WASM_OPT_STAGED_FILE))?;
         staged.remove()?;
-        let mut opt = std::process::Command::new(tools.opt);
+        let mut opt = std::process::Command::new(opt_tool);
         opt.arg(&bg_wasm).args(["-Oz", "-o"]).arg(staged.path());
         let skipped = match run_local(opt, ceiling, LocalSource::WasmTool) {
             Ok(captured) if captured.status.success() => {
@@ -2773,7 +2787,7 @@ fn bundle_wasm_pkg(
                 Some(WasmOptSkip::Missing)
             }
             Err(e) => Some(WasmOptSkip::Run(crate::cargo_step::local_run_error(
-                tools.opt, e,
+                opt_tool, e,
             ))),
         };
         // The staged file is removed on every outcome, after the crate is
@@ -2839,10 +2853,13 @@ fn bundle_ready_message(www: &Path, size: &str) -> text::Message {
 /// which would mask the emitted linker override) — the module an end user gets
 /// is governed by exactly the config the emitter ships.
 ///
+/// The module is built in `posture`'s cargo profile.
+///
 /// # Errors
 /// [`CliError::EmittedBuildFailed`] when the wasip1 `cargo build` fails;
+/// [`CliError::Usage`] when cargo's record names no `.wasm` module;
 /// [`CliError::OutputRefused`] when `crate_dir` was replaced since its claim.
-pub fn bundle_wasi(crate_dir: &OwnedDir) -> Result<PathBuf, CliError> {
+pub fn bundle_wasi(crate_dir: &OwnedDir, posture: BuildPosture) -> Result<PathBuf, CliError> {
     let out_dir = crate_dir.path();
     // Fail closed before the cross-compile: a missing toolchain becomes a clear
     // root-cause message rather than an opaque OS spawn error.
@@ -2857,7 +2874,7 @@ pub fn bundle_wasi(crate_dir: &OwnedDir) -> Result<PathBuf, CliError> {
     let messages = CargoBuild {
         cargo: &cargo_bin,
         krate: CargoCrate::Emitted(crate_dir),
-        profile: CargoProfile::Release,
+        posture,
         target: CargoTarget::Wasip1,
         target_dir: &target_dir,
         output: CargoOutput::JsonStream(Verbosity::Progress),
@@ -2869,7 +2886,7 @@ pub fn bundle_wasi(crate_dir: &OwnedDir) -> Result<PathBuf, CliError> {
     // The authoritative module path: the `.wasm` bin artifact cargo reported it
     // wrote. Same value the executor loads — build-output and load-path are one
     // by construction, immune to any target-dir divergence.
-    let module = wasi_artifact_path(&messages, out_dir)?;
+    let module = wasm_artifact_path(&messages, posture, CargoTarget::Wasip1, out_dir)?;
     let module_size = format_artifact_size(artifact_size_bytes(&module)?);
     crate::screen::chatter(
         crate::screen::Stream::Stderr,
@@ -2884,56 +2901,25 @@ pub fn bundle_wasi(crate_dir: &OwnedDir) -> Result<PathBuf, CliError> {
     Ok(module)
 }
 
-/// Extract the emitted `wasm32-wasip1` module path from cargo's
-/// `--message-format=json` stream. Each stdout line is a JSON object; a
-/// `compiler-artifact` message for a `bin` target carries the produced files in
-/// `filenames` (and `executable`). The module is the `.wasm` under
-/// `wasm32-wasip1/release` — parsed from the build, never reconstructed.
+/// The `.wasm` module a `target` build in `posture` wrote, as cargo's
+/// `--message-format=json` record names it ([`crate::cargo_step::wasm_artifact`]).
 ///
 /// # Errors
-/// [`CliError::Usage`] when no such artifact appears in the stream (a
-/// cargo/JSON-schema mismatch surfaces here as a precise root-cause message
-/// rather than a downstream "could not load the module" from a guessed path).
-fn wasi_artifact_path(messages: &str, out_dir: &Path) -> Result<PathBuf, CliError> {
-    let is_wasi_wasm = |p: &Path| {
-        p.extension().is_some_and(|e| e == "wasm")
-            && p.components().any(|c| c.as_os_str() == "wasm32-wasip1")
-    };
-
-    for line in messages.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
-            // A non-JSON line (colour codes forced onto stdout, a stray print)
-            // is not the artifact stream — skip rather than fail the parse.
-            continue;
-        };
-        if msg.get("reason").and_then(serde_json::Value::as_str) != Some("compiler-artifact") {
-            continue;
-        }
-        // Prefer the explicit executable, then any produced filename; take the
-        // first that is a `.wasm` under the wasip1 triple.
-        let candidates = msg.get("executable").into_iter().chain(
-            msg.get("filenames")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten(),
-        );
-        for candidate in candidates {
-            if let Some(path) = candidate.as_str() {
-                let path = PathBuf::from(path);
-                if is_wasi_wasm(&path) {
-                    return Ok(path);
-                }
-            }
-        }
-    }
-
-    Err(CliError::Usage(text::msg::wasi_artifact_missing(
-        &out_dir.display(),
-    )))
+/// [`CliError::Usage`] when no record names the module (a cargo/JSON-schema
+/// mismatch surfaces here as a precise root-cause message rather than a
+/// downstream "could not load the module" from a guessed path).
+fn wasm_artifact_path(
+    messages: &str,
+    posture: BuildPosture,
+    target: CargoTarget,
+    out_dir: &Path,
+) -> Result<PathBuf, CliError> {
+    crate::cargo_step::wasm_artifact(messages, posture, target).ok_or_else(|| {
+        CliError::Usage(text::msg::wasm_artifact_missing(
+            &target.triple().unwrap_or("host"),
+            &out_dir.display(),
+        ))
+    })
 }
 
 /// The session env a recording or replaying child gets.
@@ -3454,15 +3440,19 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     //   * Native — fall through to the cargo build + exec below.
     match compile_target {
         CompileTarget::WasmClient => {
-            return bundle_wasm(crate_dir.dir(), &crate::bundle_www::BundleHome::Dev(output))
-                .map(drop);
+            return bundle_wasm(
+                crate_dir.dir(),
+                &crate::bundle_www::BundleHome::Dev(output),
+                BuildPosture::Dev,
+            )
+            .map(drop);
         }
         CompileTarget::WasmWasi => {
             // The `wasi_run` feature gate already fired before emit (above), so
             // reaching here means the embedded engine is linked. Build the module
             // first — a green build is THE SEAL (ipe-accepts ⇒ cargo-builds for
             // the target) — then run it.
-            let module = bundle_wasi(crate_dir.dir())?;
+            let module = bundle_wasi(crate_dir.dir(), BuildPosture::Dev)?;
             let working_tree = std::env::current_dir().map_err(|e| CliError::Io {
                 path: PathBuf::from("."),
                 source: e,
@@ -3497,7 +3487,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     };
     let target_dir =
         crate::target_dir::LinkableTargetDir::for_crate(cargo_bin.path(), crate_dir.path(), None)?;
-    FlooredBuild {
+    let build = FlooredBuild {
         cargo: &cargo_bin,
         crate_dir: &crate_dir,
         finish: NativeFinish::Dev,
@@ -3508,8 +3498,9 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
         output: CargoOutput::Human(Verbosity::of_quiet(args.quiet)),
         what: "the emitted program",
         runtime,
-    }
-    .run()?;
+    };
+    let artifacts = build.artifact_dir();
+    build.run()?;
 
     // --- Step 3: exec the emitted binary, forwarding args and exit code ---
     // The binary name is read from the emitted crate's `Cargo.toml` — the
@@ -3520,12 +3511,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     // `CARGO_TARGET_DIR` env or a `[build] target-dir` pin never sends the run
     // to a missing or stale binary.
     let bin_name = emitted_bin_filename(&out_dir)?;
-    let mut bin = target_dir.path().to_path_buf();
-    if let Some(plan) = &static_plan {
-        bin.push(plan.triple.as_str());
-    }
-    bin.push("debug");
-    bin.push(&bin_name);
+    let bin = artifacts.join(&bin_name);
 
     // The binary runs with the developer's own permissions: `ipe dev` checks
     // no capabilities and runs no jail.
@@ -4766,7 +4752,7 @@ mod held_crate_tests {
     use super::{WasmTools, bundle_wasm_pkg};
     use crate::CliError;
     use crate::cargo_step::{
-        CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, Verbosity,
+        BuildPosture, CargoBuild, CargoCrate, CargoOutput, CargoTarget, Verbosity,
     };
     use crate::output_dir::{OutputRefusal, OwnedDir};
     use crate::remote_ingest::{
@@ -4825,7 +4811,7 @@ mod held_crate_tests {
         CargoBuild {
             cargo: &CargoBin::stub(cargo.to_path_buf()),
             krate: CargoCrate::Emitted(crate_dir),
-            profile: CargoProfile::Dev,
+            posture: BuildPosture::Dev,
             target: CargoTarget::Host,
             target_dir: &crate::target_dir::LinkableTargetDir::assume(Path::new("/t")),
             output: CargoOutput::JsonStream(Verbosity::Quiet),
@@ -4891,7 +4877,10 @@ mod held_crate_tests {
         bundle_wasm_pkg(
             crate_dir,
             &base.join("ipe_app.wasm"),
-            &WasmTools { bindgen, opt },
+            &WasmTools {
+                bindgen,
+                opt: Some(opt),
+            },
             ceiling,
             || OwnedDir::claim(&base.join("out")),
         )
@@ -5127,7 +5116,7 @@ mod held_crate_tests {
             &base.join("ipe_app.wasm"),
             &WasmTools {
                 bindgen: &bindgen,
-                opt: &opt,
+                opt: Some(&opt),
             },
             WASM_TOOL_LIMITS,
             || home.claim(),
@@ -5553,33 +5542,91 @@ mod held_crate_tests {
 
 #[cfg(test)]
 mod wasm_locate_tests {
-    use crate::target_dir::{HostLinker, LinkableTargetDir, TargetDirOrigin, TargetDirSources};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
-    /// A relocated build directory is where the browser artifact is read from,
-    /// never the crate's own `target`.
+    use super::{WasmTools, wasm_artifact_path};
+    use crate::CliError;
+    use crate::cargo_step::{BuildPosture, CargoTarget};
+
+    /// The module path is the one cargo's record names, in the build's posture.
     #[test]
-    fn the_browser_artifact_is_read_from_the_relocated_build_directory() {
-        let crate_dir = Path::new("/home/jos\u{e9}/app/out/rust");
-        let sources = TargetDirSources {
-            cache_base: Some(PathBuf::from("/home/cache")),
-            ..TargetDirSources::default()
-        };
-        let resolved = LinkableTargetDir::resolve(HostLinker::AsciiOnly, crate_dir, &sources)
-            .expect("an ASCII cache base relocates the build directory");
-        assert_eq!(resolved.origin(), TargetDirOrigin::UserCache);
-        let wasm = super::browser_wasm_artifact(&resolved);
-        assert!(
-            wasm.starts_with(resolved.path()),
-            "{} is under the resolved build directory",
-            wasm.display()
+    fn the_module_is_read_from_cargos_record_in_the_builds_posture() {
+        let stream = concat!(
+            r#"{"reason":"compiler-artifact","filenames":["/c/t/wasm32-unknown-unknown/debug/deps/libx.rlib"]}"#,
+            "\n",
+            r#"{"reason":"compiler-artifact","filenames":["/c/t/wasm32-unknown-unknown/debug/ipe_app.wasm"]}"#,
+            "\n",
+            r#"{"reason":"build-finished","success":true}"#,
+        );
+        let found = wasm_artifact_path(
+            stream,
+            BuildPosture::Dev,
+            CargoTarget::WasmBrowser,
+            Path::new("/c"),
         );
         assert!(
-            !wasm.starts_with(crate_dir),
-            "{} is not under the crate's own target",
-            wasm.display()
+            found
+                .as_ref()
+                .is_ok_and(|p| p == Path::new("/c/t/wasm32-unknown-unknown/debug/ipe_app.wasm")),
+            "{found:?}"
         );
-        assert!(wasm.ends_with("wasm32-unknown-unknown/release/ipe_app.wasm"));
+    }
+
+    /// No record, a record of another posture or target, a non-artifact
+    /// reason, a non-`.wasm` file and a malformed line each refuse, typed,
+    /// never a guessed path.
+    #[test]
+    fn a_stream_naming_no_module_of_the_posture_refuses() {
+        let refused = [
+            "",
+            r#"{"reason":"build-finished","success":true}"#,
+            r#"{"reason":"compiler-artifact","filenames":["/t/wasm32-unknown-unknown/release/ipe_app.wasm"]}"#,
+            r#"{"reason":"compiler-artifact","filenames":["/t/wasm32-wasip1/debug/ipe_app.wasm"]}"#,
+            r#"{"reason":"compiler-message","filenames":["/t/wasm32-unknown-unknown/debug/ipe_app.wasm"]}"#,
+            r#"{"reason":"compiler-artifact","filenames":["/t/wasm32-unknown-unknown/debug/ipe_app.js"]}"#,
+            r#"{"reason":"compiler-artifact","filenames":["/t/wasm32-unknown-unknown/debug/ipe_app.wasm""#,
+            "/t/wasm32-unknown-unknown/debug/ipe_app.wasm",
+        ];
+        for stream in refused {
+            let found = wasm_artifact_path(
+                stream,
+                BuildPosture::Dev,
+                CargoTarget::WasmBrowser,
+                Path::new("/c"),
+            );
+            assert!(
+                matches!(found, Err(CliError::Usage(_))),
+                "{stream}: {found:?}"
+            );
+        }
+    }
+
+    /// A wasip1 release module is read from its `executable` record.
+    #[test]
+    fn a_release_wasi_module_is_read_from_its_executable_record() {
+        let stream = r#"{"reason":"compiler-artifact","executable":"/t/wasm32-wasip1/release/app.wasm","filenames":[]}"#;
+        let found = wasm_artifact_path(
+            stream,
+            BuildPosture::Release,
+            CargoTarget::Wasip1,
+            Path::new("/c"),
+        );
+        assert!(
+            found
+                .as_ref()
+                .is_ok_and(|p| p == Path::new("/t/wasm32-wasip1/release/app.wasm")),
+            "{found:?}"
+        );
+    }
+
+    /// Only a release bundle runs the `wasm-opt -Oz` size pass.
+    #[test]
+    fn only_a_release_bundle_runs_wasm_opt() {
+        assert!(WasmTools::for_posture(BuildPosture::Dev).opt.is_none());
+        assert_eq!(
+            WasmTools::for_posture(BuildPosture::Release).opt,
+            Some(Path::new("wasm-opt"))
+        );
     }
 }
 

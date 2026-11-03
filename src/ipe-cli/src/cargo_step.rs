@@ -62,13 +62,118 @@ pub const ARTIFACT_STREAM_CAP: usize = 64 * 1024 * 1024;
 /// boundary, so the diagnostic shows the first errors cargo reported.
 pub const STDERR_KEEP_CAP: usize = 1024 * 1024;
 
-/// The cargo build profile.
+/// The cargo build profile. Private: a build names a [`BuildPosture`], and
+/// the profile is [`BuildPosture::profile`] of it, never chosen at a build site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CargoProfile {
+enum CargoProfile {
     /// cargo's default `dev` profile (a debug binary).
     Dev,
     /// `--release`.
     Release,
+}
+
+impl CargoProfile {
+    /// The flag that selects this profile on `cargo build`, if any.
+    const fn flag(self) -> Option<&'static str> {
+        match self {
+            Self::Dev => None,
+            Self::Release => Some("--release"),
+        }
+    }
+
+    /// The directory, under the build directory (and the target triple, when
+    /// one is named), that cargo writes this profile's artifacts into.
+    const fn dir_name(self) -> &'static str {
+        match self {
+            Self::Dev => "debug",
+            Self::Release => "release",
+        }
+    }
+}
+
+/// The posture a command builds in: `ipe dev` builds for development,
+/// `ipe release` for distribution.
+///
+/// A build's cargo profile and the directory its artifacts land in are total
+/// functions of the posture, so no build step picks either one itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildPosture {
+    /// `ipe dev`: cargo's `dev` profile.
+    Dev,
+    /// `ipe release`: cargo's `release` profile.
+    Release,
+}
+
+impl BuildPosture {
+    /// The cargo profile this posture builds with.
+    const fn profile(self) -> CargoProfile {
+        match self {
+            Self::Dev => CargoProfile::Dev,
+            Self::Release => CargoProfile::Release,
+        }
+    }
+
+    /// The directory cargo writes this posture's artifacts for `target` into,
+    /// under the build directory `target_dir`: `<target_dir>/[<triple>/]<profile>`,
+    /// the layout `build_command`'s `--target` and `--release` flags select.
+    #[must_use]
+    pub fn artifact_dir(self, target_dir: &Path, target: CargoTarget) -> PathBuf {
+        let mut dir = target_dir.to_path_buf();
+        if let Some(triple) = target.triple() {
+            dir.push(triple);
+        }
+        dir.push(self.profile().dir_name());
+        dir
+    }
+}
+
+/// The `.wasm` module a build of `target` in `posture` wrote, read from the
+/// `compiler-artifact` records of cargo's `--message-format=json` stream.
+///
+/// A record names the module only when one of its files is a `.wasm` directly
+/// inside `<triple>/<profile>/` for this target and posture, so a record of
+/// another posture, another target or another kind of file is never taken. A
+/// line that is not a whole JSON object names nothing. `None` when no record
+/// names the module: the path is never reconstructed from the layout.
+#[must_use]
+pub fn wasm_artifact(
+    messages: &str,
+    posture: BuildPosture,
+    target: CargoTarget,
+) -> Option<PathBuf> {
+    let triple = target.triple()?;
+    let profile_dir = posture.profile().dir_name();
+    let names_module = |path: &Path| {
+        let profile = path.parent();
+        path.extension().is_some_and(|ext| ext == "wasm")
+            && profile
+                .and_then(Path::file_name)
+                .is_some_and(|dir| dir == profile_dir)
+            && profile
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .is_some_and(|dir| dir == triple)
+    };
+    messages
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .filter(|msg| {
+            msg.get("reason").and_then(serde_json::Value::as_str) == Some("compiler-artifact")
+        })
+        .find_map(|msg| {
+            let executable = msg.get("executable").and_then(serde_json::Value::as_str);
+            let filenames = msg
+                .get("filenames")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str);
+            executable
+                .into_iter()
+                .chain(filenames)
+                .map(PathBuf::from)
+                .find(|path| names_module(path))
+        })
 }
 
 /// The target a cargo build compiles for.
@@ -90,7 +195,7 @@ pub enum CargoTarget {
 
 impl CargoTarget {
     /// The `--target` triple, or `None` for the host.
-    const fn triple(self) -> Option<&'static str> {
+    pub(crate) const fn triple(self) -> Option<&'static str> {
         match self {
             Self::Host => None,
             Self::Static(triple) => Some(triple.as_str()),
@@ -281,8 +386,8 @@ pub struct CargoBuild<'a> {
     pub cargo: &'a CargoBin,
     /// The crate to build; cargo runs with it as its working directory.
     pub krate: CargoCrate<'a>,
-    /// The build profile.
-    pub profile: CargoProfile,
+    /// The posture the build is for; it picks the cargo profile.
+    pub posture: BuildPosture,
     /// The compile target.
     pub target: CargoTarget,
     /// The build directory, set as the child's `CARGO_TARGET_DIR`.
@@ -296,6 +401,14 @@ pub struct CargoBuild<'a> {
 }
 
 impl CargoBuild<'_> {
+    /// The directory this build's artifacts land in, a function of its
+    /// posture, target and build directory alone.
+    #[must_use]
+    pub fn artifact_dir(&self) -> PathBuf {
+        self.posture
+            .artifact_dir(self.target_dir.path(), self.target)
+    }
+
     /// The directory cargo runs in.
     fn dir(&self) -> &Path {
         match self.krate {
@@ -310,7 +423,7 @@ impl CargoBuild<'_> {
             self.cargo.path(),
             self.dir(),
             self.target_dir.path(),
-            self.profile,
+            self.posture,
             self.target,
             self.output,
         );
@@ -498,7 +611,7 @@ impl WatchBuild<'_> {
             self.cargo,
             self.krate.path(),
             self.target_dir.path(),
-            CargoProfile::Dev,
+            BuildPosture::Dev,
             CargoTarget::Host,
             CargoOutput::JsonStream(self.verbosity),
         );
@@ -530,7 +643,7 @@ fn build_command(
     cargo: &Path,
     dir: &Path,
     target_dir: &Path,
-    profile: CargoProfile,
+    posture: BuildPosture,
     target: CargoTarget,
     output: CargoOutput,
 ) -> Command {
@@ -541,8 +654,8 @@ fn build_command(
         .current_dir(dir)
         .env("CARGO_TARGET_DIR", target_dir)
         .stdin(Stdio::null());
-    if profile == CargoProfile::Release {
-        cmd.arg("--release");
+    if let Some(flag) = posture.profile().flag() {
+        cmd.arg(flag);
     }
     if let Some(triple) = target.triple() {
         cmd.args(["--target", triple]);
@@ -1122,7 +1235,7 @@ fn relay_stderr(pipe: impl Read, keep: usize) -> Drain {
 #[cfg(test)]
 mod tests {
     use super::{
-        CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, EmbeddedApp, Verbosity,
+        BuildPosture, CargoBuild, CargoCrate, CargoOutput, CargoTarget, EmbeddedApp, Verbosity,
         WatchBuild,
     };
     use crate::target_dir::LinkableTargetDir;
@@ -1172,7 +1285,7 @@ mod tests {
         CargoBuild {
             cargo: &CARGO,
             krate: CargoCrate::ReleaseWrapper { source, embed },
-            profile: CargoProfile::Release,
+            posture: BuildPosture::Release,
             target: CargoTarget::Static(StaticTriple::X8664LinuxMusl),
             target_dir: &TARGET,
             output: CargoOutput::Human(Verbosity::Quiet),
@@ -1244,7 +1357,7 @@ mod tests {
             Path::new("cargo"),
             Path::new("/c"),
             Path::new("/t"),
-            CargoProfile::Release,
+            BuildPosture::Release,
             CargoTarget::Wasip1,
             CargoOutput::JsonStream(Verbosity::Quiet),
         );
@@ -1257,7 +1370,7 @@ mod tests {
                 Path::new("cargo"),
                 Path::new("/c"),
                 Path::new("/t"),
-                CargoProfile::Dev,
+                BuildPosture::Dev,
                 target,
                 CargoOutput::Human(Verbosity::Quiet),
             );
@@ -1279,7 +1392,7 @@ mod tests {
                 Path::new("cargo"),
                 Path::new("/c"),
                 Path::new("/elsewhere"),
-                CargoProfile::Dev,
+                BuildPosture::Dev,
                 target,
                 CargoOutput::Human(Verbosity::Quiet),
             );
@@ -1297,11 +1410,66 @@ mod tests {
             Path::new("cargo"),
             Path::new("/c"),
             Path::new("/t"),
-            CargoProfile::Dev,
+            BuildPosture::Dev,
             CargoTarget::Host,
             CargoOutput::Human(Verbosity::Quiet),
         );
         assert_eq!(args(&cmd), ["build", "-q"]);
+    }
+
+    /// The profile is a total function of the posture: development builds the
+    /// `dev` profile into `debug/`, release builds `--release` into `release/`.
+    #[test]
+    fn the_posture_alone_picks_the_profile_and_its_directory() {
+        assert_eq!(BuildPosture::Dev.profile(), super::CargoProfile::Dev);
+        assert_eq!(
+            BuildPosture::Release.profile(),
+            super::CargoProfile::Release
+        );
+        let table = [
+            (BuildPosture::Dev, None, "debug"),
+            (BuildPosture::Release, Some("--release"), "release"),
+        ];
+        for (posture, flag, dir) in table {
+            assert_eq!(posture.profile().flag(), flag, "{posture:?}");
+            assert_eq!(posture.profile().dir_name(), dir, "{posture:?}");
+            let cmd = super::build_command(
+                Path::new("cargo"),
+                Path::new("/c"),
+                Path::new("/t"),
+                posture,
+                CargoTarget::WasmBrowser,
+                CargoOutput::JsonStream(Verbosity::Quiet),
+            );
+            assert_eq!(
+                args(&cmd).iter().any(|a| a == "--release"),
+                flag.is_some(),
+                "{posture:?}"
+            );
+        }
+    }
+
+    /// The artifact directory follows the posture and names the triple exactly
+    /// when the build passes `--target`.
+    #[test]
+    fn the_artifact_directory_follows_the_posture_and_the_target() {
+        let t = Path::new("/t");
+        assert_eq!(
+            BuildPosture::Dev.artifact_dir(t, CargoTarget::Host),
+            Path::new("/t/debug")
+        );
+        assert_eq!(
+            BuildPosture::Release.artifact_dir(t, CargoTarget::Host),
+            Path::new("/t/release")
+        );
+        assert_eq!(
+            BuildPosture::Dev.artifact_dir(t, CargoTarget::WasmBrowser),
+            Path::new("/t/wasm32-unknown-unknown/debug")
+        );
+        assert_eq!(
+            BuildPosture::Release.artifact_dir(t, CargoTarget::Wasip1),
+            Path::new("/t/wasm32-wasip1/release")
+        );
     }
 
     #[test]
@@ -1471,7 +1639,7 @@ mod tests {
         //! Builds driven through a stub `cargo` that logs every invocation.
 
         use super::super::{
-            CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, LockOutcome, LockProbe,
+            BuildPosture, CargoBuild, CargoCrate, CargoOutput, CargoTarget, LockOutcome, LockProbe,
             Verbosity, WatchBuild, lock_dependencies_within, lock_offline, lock_offline_within,
             probe_lock_within, target_directory, target_directory_within,
         };
@@ -1524,7 +1692,7 @@ mod tests {
             CargoBuild {
                 cargo,
                 krate,
-                profile: CargoProfile::Dev,
+                posture: BuildPosture::Dev,
                 target: CargoTarget::Host,
                 target_dir: &TARGET,
                 output: CargoOutput::JsonStream(Verbosity::Quiet),
@@ -2025,7 +2193,7 @@ mod tests {
                 CargoBuild {
                     cargo: &cargo,
                     krate: CargoCrate::Emitted(&crate_dir),
-                    profile: CargoProfile::Dev,
+                    posture: BuildPosture::Dev,
                     target: CargoTarget::Wasip1,
                     target_dir: &TARGET,
                     output: CargoOutput::JsonStream(Verbosity::Quiet),
@@ -2174,7 +2342,7 @@ mod tests {
             let verdict = CargoBuild {
                 cargo: &cargo,
                 krate: CargoCrate::Emitted(&crate_dir),
-                profile: CargoProfile::Dev,
+                posture: BuildPosture::Dev,
                 target: CargoTarget::Host,
                 target_dir: &TARGET,
                 output: CargoOutput::JsonStream(Verbosity::Quiet),
@@ -2212,7 +2380,7 @@ mod tests {
             let built = CargoBuild {
                 cargo,
                 krate,
-                profile: CargoProfile::Dev,
+                posture: BuildPosture::Dev,
                 target: CargoTarget::Host,
                 target_dir: &TARGET,
                 output: CargoOutput::JsonStream(Verbosity::Quiet),
