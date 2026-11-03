@@ -26,13 +26,14 @@ use std::ops::RangeInclusive;
 pub const DENIED_FORMAT_CHARS: &[RangeInclusive<char>] = &[
     '\u{00AD}'..='\u{00AD}', // SOFT HYPHEN
     '\u{0600}'..='\u{0605}', // ARABIC NUMBER SIGN .. NUMBER MARK ABOVE
-    '\u{061C}'..='\u{061C}', // ARABIC LETTER MARK
+    ARABIC_LETTER_MARK..=ARABIC_LETTER_MARK,
     '\u{06DD}'..='\u{06DD}', // ARABIC END OF AYAH
     '\u{070F}'..='\u{070F}', // SYRIAC ABBREVIATION MARK
     '\u{0890}'..='\u{0891}', // ARABIC POUND / PIASTRE MARK ABOVE
     '\u{08E2}'..='\u{08E2}', // ARABIC DISPUTED END OF AYAH
     '\u{180E}'..='\u{180E}', // MONGOLIAN VOWEL SEPARATOR
-    '\u{200B}'..='\u{200F}', // ZERO WIDTH SPACE, NON-JOINER, JOINER, LRM, RLM
+    '\u{200B}'..='\u{200D}', // ZERO WIDTH SPACE, NON-JOINER, JOINER
+    DIRECTIONAL_MARKS,
     LINE_AND_PARAGRAPH_SEPARATORS,
     BIDI_EMBEDDINGS_AND_OVERRIDES,
     '\u{2060}'..='\u{2064}', // WORD JOINER, invisible operators
@@ -48,6 +49,12 @@ pub const DENIED_FORMAT_CHARS: &[RangeInclusive<char>] = &[
     '\u{1D173}'..='\u{1D17A}', // MUSICAL SYMBOL BEGIN/END controls
     '\u{E0000}'..='\u{E007F}', // TAG block
 ];
+
+/// ARABIC LETTER MARK, a bidi mark that sets the direction of the text around it.
+pub const ARABIC_LETTER_MARK: char = '\u{061C}';
+
+/// LEFT-TO-RIGHT MARK and RIGHT-TO-LEFT MARK, which set the direction of the text around them.
+pub const DIRECTIONAL_MARKS: RangeInclusive<char> = '\u{200E}'..='\u{200F}';
 
 /// The LINE SEPARATOR and PARAGRAPH SEPARATOR, which a viewer draws as a line break.
 pub const LINE_AND_PARAGRAPH_SEPARATORS: RangeInclusive<char> = '\u{2028}'..=PARAGRAPH_SEPARATOR;
@@ -96,6 +103,8 @@ pub enum SourceHazard {
     ControlBreak,
     /// LINE or PARAGRAPH SEPARATOR: a line break to a viewer, admitted only in a literal.
     SeparatorBreak,
+    /// A bidi mark (ALM, LRM or RLM), admitted only in a literal.
+    BidiMark,
     /// An embedding, the pop, or an override, admitted nowhere in source.
     BidiOverride,
     /// An isolate opener, admitted only in a literal that closes it.
@@ -112,10 +121,19 @@ pub enum SourceHazard {
 }
 
 /// Every source display hazard, as the code points it covers and its role.
+///
+/// Its non-control code points are exactly the runtime display sanitiser's
+/// `tui::cell::BIDI_AND_SEPARATOR_HAZARDS`; a test in `ipe_backend_rust` pins the
+/// two equal, since neither crate can import the other.
 pub const SOURCE_DISPLAY_HAZARDS: &[(RangeInclusive<char>, SourceHazard)] = &[
     (CONTROL_LINE_BREAKS, SourceHazard::ControlBreak),
     (NEXT_LINE..=NEXT_LINE, SourceHazard::ControlBreak),
     (LINE_AND_PARAGRAPH_SEPARATORS, SourceHazard::SeparatorBreak),
+    (
+        ARABIC_LETTER_MARK..=ARABIC_LETTER_MARK,
+        SourceHazard::BidiMark,
+    ),
+    (DIRECTIONAL_MARKS, SourceHazard::BidiMark),
     (BIDI_EMBEDDINGS_AND_OVERRIDES, SourceHazard::BidiOverride),
     (BIDI_ISOLATE_OPENERS, SourceHazard::IsolateOpen),
     (
@@ -207,7 +225,7 @@ impl SourceHazard {
     pub const fn admitted_in_literal(self) -> bool {
         matches!(
             self,
-            Self::SeparatorBreak | Self::IsolateOpen | Self::IsolateClose
+            Self::SeparatorBreak | Self::BidiMark | Self::IsolateOpen | Self::IsolateClose
         )
     }
 }
@@ -624,10 +642,13 @@ mod tests {
     /// character has a role.
     #[test]
     fn source_display_hazards_are_the_breaks_bidi_and_terminal_controls() {
-        let expected: [(char, SourceHazard); 14] = [
+        let expected: [(char, SourceHazard); 17] = [
             ('\u{000B}', SourceHazard::ControlBreak),
             ('\u{000C}', SourceHazard::ControlBreak),
             ('\u{0085}', SourceHazard::ControlBreak),
+            ('\u{061C}', SourceHazard::BidiMark),
+            ('\u{200E}', SourceHazard::BidiMark),
+            ('\u{200F}', SourceHazard::BidiMark),
             ('\u{2028}', SourceHazard::SeparatorBreak),
             ('\u{2029}', SourceHazard::SeparatorBreak),
             ('\u{202A}', SourceHazard::BidiOverride),
@@ -700,7 +721,7 @@ mod tests {
         assert!(!SourceHazard::TerminalControl.admitted_in_literal());
     }
 
-    /// Only the separators and isolates may stand in a literal, and the bidi
+    /// Only the separators, bidi marks and isolates may stand in a literal, and the bidi
     /// paragraph ends are the UAX #9 class `B` characters.
     #[test]
     fn literal_admission_and_paragraph_ends() {
@@ -713,6 +734,8 @@ mod tests {
             admitted,
             [
                 SourceHazard::SeparatorBreak,
+                SourceHazard::BidiMark,
+                SourceHazard::BidiMark,
                 SourceHazard::IsolateOpen,
                 SourceHazard::IsolateClose
             ]

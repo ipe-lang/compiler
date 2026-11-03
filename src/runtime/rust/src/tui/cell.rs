@@ -2,9 +2,11 @@
 //!
 //! Pure (no terminal I/O): the building block for the cell renderer. Every
 //! access is total — out-of-bounds writes are no-ops, reads return `None`, and
-//! `sanitize_rune` maps control bytes to a space — so no Ipê-reachable path can
-//! panic or index out of bounds (the `#![cfg_attr(not(test), deny(...))]` gate).
+//! `sanitize_rune` maps every display hazard to a space — so no Ipê-reachable
+//! path can panic or index out of bounds (the `#![cfg_attr(not(test), deny(...))]`
+//! gate), and no display sink holds a character that reorders or splits a line.
 
+use core::ops::RangeInclusive;
 use unicode_width::UnicodeWidthChar;
 
 /// A single terminal cell. `width` is display columns: 1 (normal), 2 (wide CJK
@@ -42,15 +44,40 @@ impl Default for Cell {
     }
 }
 
-/// Map a control byte to a space — total. C0 controls (< 0x20), DEL (0x7f),
-/// and C1 controls (0x80..=0x9f) become ' '.
+/// The bidi controls and line separators a terminal draws as reordered or broken text.
+///
+/// Each one makes a terminal show a line in an order other than its bytes', or
+/// split it where the program wrote no line break, so untrusted text carrying
+/// one could display as text the program never printed. The compiler's
+/// `ipe_diagnostics::terminal::SOURCE_DISPLAY_HAZARDS` names the same set
+/// beside its control roles; a test in `ipe_backend_rust` pins the two equal.
+pub const BIDI_AND_SEPARATOR_HAZARDS: &[RangeInclusive<char>] = &[
+    '\u{061C}'..='\u{061C}', // ARABIC LETTER MARK
+    '\u{200E}'..='\u{200F}', // LEFT-TO-RIGHT MARK, RIGHT-TO-LEFT MARK
+    '\u{2028}'..='\u{2029}', // LINE SEPARATOR, PARAGRAPH SEPARATOR
+    '\u{202A}'..='\u{202E}', // LRE, RLE, PDF, LRO, RLO
+    '\u{2066}'..='\u{2069}', // LRI, RLI, FSI, PDI
+];
+
+/// Whether a terminal would run `c` as a command or draw it as reordered or broken text.
+///
+/// The `Cc` controls (C0, `DEL` and C1) and every [`BIDI_AND_SEPARATOR_HAZARDS`]
+/// character.
+#[must_use]
+pub fn is_display_hazard(c: char) -> bool {
+    c.is_control()
+        || BIDI_AND_SEPARATOR_HAZARDS
+            .iter()
+            .any(|range| range.contains(&c))
+}
+
+/// Map a display hazard to a space, every other character to itself.
+///
+/// Every text a Cli `Line` or a Tui view shows passes through here, so a
+/// control, a bidi control or a line separator never reaches the terminal.
+#[must_use]
 pub fn sanitize_rune(c: char) -> char {
-    let u = c as u32;
-    if u < 0x20 || u == 0x7f || (0x80..=0x9f).contains(&u) {
-        ' '
-    } else {
-        c
-    }
+    if is_display_hazard(c) { ' ' } else { c }
 }
 
 /// Display width of a char, clamped to [0, 2]. A control char (no width) reads
@@ -115,6 +142,43 @@ mod tests {
         assert_eq!(sanitize_rune('\x7f'), ' '); // DEL
         assert_eq!(sanitize_rune('A'), 'A');
         assert_eq!(sanitize_rune('é'), 'é');
+    }
+
+    /// The sanitiser blanks exactly the `Cc` controls and the bidi and separator table.
+    ///
+    /// CI job `runtime-full-features-run`.
+    #[test]
+    fn sanitize_blanks_exactly_controls_and_the_bidi_table() -> Result<(), String> {
+        for c in char::MIN..=char::MAX {
+            let listed = BIDI_AND_SEPARATOR_HAZARDS
+                .iter()
+                .any(|range| range.contains(&c));
+            let want = if c.is_control() || listed { ' ' } else { c };
+            if sanitize_rune(c) != want {
+                return Err(format!("U+{:04X} sanitises wrongly", u32::from(c)));
+            }
+        }
+        Ok(())
+    }
+
+    /// A bidi control or a separator in a Tui text never reaches the frame.
+    ///
+    /// CI job `runtime-full-features-run`.
+    #[test]
+    fn bidi_override_never_reaches_a_cell() -> Result<(), String> {
+        use super::super::layout::element_to_cells;
+        use crate::ui::Element;
+        for c in BIDI_AND_SEPARATOR_HAZARDS.iter().flat_map(Clone::clone) {
+            let view: Element<()> = Element::Text(format!("a{c}b"));
+            let frame = element_to_cells(&view, 20, 2);
+            if frame.contains(c) {
+                return Err(format!("U+{:04X} reached a frame", u32::from(c)));
+            }
+            if !frame.contains("a b") {
+                return Err(format!("U+{:04X} was not blanked", u32::from(c)));
+            }
+        }
+        Ok(())
     }
 
     #[test]

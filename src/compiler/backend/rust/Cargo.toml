@@ -33,7 +33,9 @@ ipe_env = { path = "../../env" }
 # guarantee. The transition conformance test additionally decodes a
 # `CompileTransition::to_json` datum into the runtime `web::transition::Transition`
 # and runs the compiled `apply_transition`, so the `web` feature is enabled.
-ipe-runtime-rust = { path = "../../../runtime/rust", features = ["web"] }
+# The display-hazard parity test reads the runtime sanitiser in `tui::cell`, so
+# the `tui` feature is enabled too.
+ipe-runtime-rust = { path = "../../../runtime/rust", features = ["web", "tui"] }
 # The transition conformance test decodes the emitted datum JSON into the
 # runtime `Transition` to prove the compile-time serializer and the runtime
 # codec agree byte-for-byte, and derives serde on a small fixture Model.
