@@ -575,6 +575,7 @@ pub const fn appearance_literal_args(k: KernelFn) -> &'static [(usize, LitKind)]
         | KernelFn::BasicsNegate
         | KernelFn::BasicsAbs
         | KernelFn::BasicsSqrt
+        | KernelFn::BasicsToFloat
         | KernelFn::BasicsMin
         | KernelFn::BasicsMax
         | KernelFn::BasicsCompare

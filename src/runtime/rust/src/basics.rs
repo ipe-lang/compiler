@@ -1,5 +1,9 @@
-//! Ipe.Basics kernels: modBy + errorToString.
+//! Ipe.Basics kernels: modBy, compare, the numerics (`negate`, `abs`,
+//! `toFloat`) and errorToString.
 //!
+//! The one `i64 -> f64` cast is `int_to_float`; any other precision-losing
+//! cast in this module is a clippy error.
+#![deny(clippy::cast_precision_loss)]
 
 use crate::core::{IntOp, RuntimeTrip, trip};
 
@@ -248,6 +252,16 @@ pub fn basics_abs<T: PartialOrd + IpeNegate + Copy + Default>(x: T) -> T {
     } else {
         x
     }
+}
+
+/// Ipê `toFloat : Int -> Float` — the nearest `Float` to `n`.
+///
+/// Exact whenever `|n| <= 2^53`. Past that, ties round to even. Total: never
+/// NaN, never infinite, never a panic.
+#[must_use]
+#[allow(clippy::cast_precision_loss)] // IPE-RUST-AUDIT:ACCEPTED — i64 -> f64 is IEEE 754 round-to-nearest-even on every target; the precision loss past 2^53 is the documented semantics of `toFloat`
+pub fn int_to_float(n: i64) -> f64 {
+    n as f64
 }
 
 // ── end Basics numerics ──────────────────────────────────────────────

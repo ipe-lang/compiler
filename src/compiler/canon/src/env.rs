@@ -1955,6 +1955,92 @@ const _: () = {
     }
 };
 
+/// The unqualified prelude values (the Tier-A `Ipe.Basics` surface), keyed by
+/// spelling and the kernel each one names. A row's module and member are its
+/// kernel's own [`StdlibKernel::decl`], never re-spelled here: `errorToString`
+/// is the unqualified form of `Error.toString`.
+const PRELUDE_VALUES: &[(&str, StdlibKernel)] = &[
+    ("identity", StdlibKernel::BasicsIdentity),
+    ("always", StdlibKernel::BasicsAlways),
+    ("not", StdlibKernel::BasicsNot),
+    ("modBy", StdlibKernel::BasicsModBy),
+    ("clamp", StdlibKernel::BasicsClamp),
+    ("fst", StdlibKernel::BasicsFst),
+    ("snd", StdlibKernel::BasicsSnd),
+    ("errorToString", StdlibKernel::ErrorToString),
+    ("compare", StdlibKernel::BasicsCompare),
+    ("negate", StdlibKernel::BasicsNegate),
+    ("abs", StdlibKernel::BasicsAbs),
+    ("sqrt", StdlibKernel::BasicsSqrt),
+    ("toFloat", StdlibKernel::BasicsToFloat),
+    ("min", StdlibKernel::BasicsMin),
+    ("max", StdlibKernel::BasicsMax),
+];
+
+/// The `(qualifier, name)` identity of each [`PRELUDE_VALUES`] row's kernel,
+/// projected once so the tripwire below compares strings, not kernels.
+#[allow(clippy::indexing_slicing)] // index guarded by `i < PRELUDE_VALUES.len()`; see note above
+const PRELUDE_VALUE_DECLS: [(&str, &str); PRELUDE_VALUES.len()] = {
+    let mut pairs = [("", ""); PRELUDE_VALUES.len()];
+    let mut i = 0;
+    while i < PRELUDE_VALUES.len() {
+        let decl = PRELUDE_VALUES[i].1.decl();
+        pairs[i] = (decl.qualifier, decl.name);
+        i += 1;
+    }
+    pairs
+};
+
+/// **Compile-time prelude tripwire (fail-closed).** The prelude values are the
+/// registry's projection: every wired kernel whose `decl().qualifier` is
+/// `"Basics"` is the kernel of some [`PRELUDE_VALUES`] row, and no two rows
+/// share a spelling. A Basics kernel added without its prelude row, or a
+/// duplicated spelling, fails the build.
+///
+/// The `allow(long_running_const_eval)` covers the bounded
+/// `REGISTRY_LEN × PRELUDE_VALUES.len()` cross-scan.
+#[allow(long_running_const_eval)]
+#[allow(clippy::indexing_slicing)] // indices guarded by `i < len`; see note above
+const _: () = {
+    let mut ki = 0;
+    while ki < REGISTRY_LEN {
+        let (qualifier, member) = REGISTRY_DECL_PAIRS[ki];
+        if const_str_eq(qualifier, "Basics") {
+            let mut bound = false;
+            let mut ri = 0;
+            while ri < PRELUDE_VALUE_DECLS.len() {
+                let (q, n) = PRELUDE_VALUE_DECLS[ri];
+                if const_str_eq(q, qualifier) && const_str_eq(n, member) {
+                    bound = true;
+                }
+                ri += 1;
+            }
+            // IPE-RUST-AUDIT:ACCEPTED — this `assert!` runs during const-eval of the
+            // enclosing `const _` block, so it fails the build on prelude drift and
+            // can never panic at runtime; it is a compile-time proof, not a runtime abort.
+            assert!(
+                bound,
+                "prelude drift: a StdlibKernel with decl().qualifier == \"Basics\" \
+                 has no PRELUDE_VALUES row. Add its (spelling, kernel) row.",
+            );
+        }
+        ki += 1;
+    }
+    let mut a = 0;
+    while a < PRELUDE_VALUES.len() {
+        let mut b = a + 1;
+        while b < PRELUDE_VALUES.len() {
+            // IPE-RUST-AUDIT:ACCEPTED — const-eval only, as above.
+            assert!(
+                !const_str_eq(PRELUDE_VALUES[a].0, PRELUDE_VALUES[b].0),
+                "prelude drift: two PRELUDE_VALUES rows share a spelling.",
+            );
+            b += 1;
+        }
+        a += 1;
+    }
+};
+
 impl Env {
     /// Build the base environment with Ipê's built-in variables and the
     /// auto-qualified prelude kernel modules. The `home` module's top-level
@@ -1985,8 +2071,6 @@ impl Env {
         interner.intern("Web")?;
         interner.intern("Tui")?;
         interner.intern("Cli")?;
-        // install_prelude_qualifiers MUST run first — it populates
-        // stdlib_index, which install_builtin_vars consults for the fast-path id.
         env.install_prelude_qualifiers(interner)?;
         env.install_builtin_ctors(interner)?;
         env.install_builtin_vars(interner)?;
@@ -2407,47 +2491,22 @@ impl Env {
             })
     }
 
-    /// Built-in unqualified variables (the Tier-A `Ipe.Basics` surface).
-    /// Supported subset of `Environment.builtinVars`.
-    ///
-    /// Must run AFTER `install_prelude_qualifiers` so `stdlib_index` is
-    /// populated and the id fast-path can be threaded in.
+    /// Built-in unqualified variables (the Tier-A `Ipe.Basics` surface): one
+    /// binding per [`PRELUDE_VALUES`] row, homed at its kernel's own decl.
     fn install_builtin_vars(&mut self, interner: &mut Interner) -> DResult<()> {
-        let basics = interner.intern("Basics")?;
-        let error_sym = interner.intern("Error")?;
-        let basics_path = vec![interner.intern("Ipe")?, basics];
+        let basics_path = vec![interner.intern("Ipe")?, interner.intern("Basics")?];
         let prelude_bug = || Diagnostic::CompilerBug {
             where_: "canon.prelude_value",
             detail: "a prelude value has no module-level identity".to_owned(),
         };
-        for (name, module, func) in [
-            ("identity", basics, "identity"),
-            ("always", basics, "always"),
-            ("not", basics, "not"),
-            ("modBy", basics, "modBy"),
-            ("clamp", basics, "clamp"),
-            ("fst", basics, "fst"),
-            ("snd", basics, "snd"),
-            // `errorToString` is the Basics-exposed unqualified form of
-            // `Error.toString`.  The kernel declaration uses module="Error" /
-            // func="toString", so the stdlib_index key is (Error, toString).
-            // We must register with the same key so `id` resolves to
-            // `Some(StdlibKernel::ErrorToString)` and the type-checker
-            // can look up its scheme without hitting IPE-L0108.
-            ("errorToString", error_sym, "toString"),
-            // Three-way comparison — `compare : comparable -> comparable -> Order`.
-            ("compare", basics, "compare"),
-            // ── Basics numerics ─────────────────────────────────────────────
-            ("negate", basics, "negate"),
-            ("abs", basics, "abs"),
-            ("sqrt", basics, "sqrt"),
-            ("min", basics, "min"),
-            ("max", basics, "max"),
-            // ── end Basics numerics ─────────────────────────────────────────
-        ] {
+        for &(name, kernel) in PRELUDE_VALUES {
+            let decl = kernel.decl();
             let key = interner.intern(name)?;
-            let func_sym = interner.intern(func)?;
-            let home = kernel_home(&self.stdlib_index, module, func_sym);
+            let home = VarHome::Kernel(
+                kernel,
+                interner.intern(decl.qualifier)?,
+                interner.intern(decl.name)?,
+            );
             let identity = ValueIdentity::of(&home, key).ok_or_else(prelude_bug)?;
             let origin = Origin {
                 identity: Identity::Value(identity),

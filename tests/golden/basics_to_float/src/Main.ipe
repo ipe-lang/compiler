@@ -1,0 +1,23 @@
+module Main exposing (main)
+
+import Conv
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.String as String
+
+
+-- Each line is a `Bool`, so the oracle never depends on `Float` formatting.
+checks : List String
+checks =
+    [ "exact=" ++ String.fromBool (toFloat 9007199254740992 == 9007199254740992.0)
+    , "tieDown=" ++ String.fromBool (toFloat 9007199254740993 == 9007199254740992.0)
+    , "tieUp=" ++ String.fromBool (toFloat 9007199254740995 == 9007199254740996.0)
+    , "least=" ++ String.fromBool (toFloat (negate 9223372036854775807 - 1) == -9223372036854775808.0)
+    , "greatest=" ++ String.fromBool (toFloat 9223372036854775807 == 9223372036854775808.0)
+    , "arith=" ++ String.fromBool (toFloat 3 + 0.5 == 3.5)
+    , "shadow=" ++ String.fromBool (Conv.twice 21 == 42)
+    ]
+
+
+main =
+    Io.println (String.join "\n" checks)
