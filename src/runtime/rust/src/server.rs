@@ -3268,6 +3268,76 @@ pub(crate) fn exposure_warning(host: crate::app_config::ListenHost) -> Option<[S
     ])
 }
 
+/// The router serving `routes`: each handler at its pattern's router
+/// spelling, and every static and `Server.mountApp` mount, the root `/`
+/// included, behind the handlers through one [`MountTable`] fallback, never a
+/// router nest.
+///
+/// # Errors
+///
+/// `RouterRejected` when the router refuses a handler insert.
+async fn listener_routes(routes: Vec<ParsedRoute>) -> Result<axum::Router, ServerStartRefusal> {
+    let mut app: axum::Router = axum::Router::new();
+    let mut mounts = Vec::new();
+    // The bases of the mounted web apps: the only prefixes below which a
+    // worker script fetch may pass the listener's worker gate.
+    #[cfg(feature = "web")]
+    let mut worker_bases = Vec::new();
+    for r in routes {
+        match r.target {
+            ParsedTarget::Static(base, dir) => {
+                let files = axum::Router::new()
+                    .fallback_service(strict_serve_dir(std::path::PathBuf::from(dir)));
+                mounts.push((base, files));
+            }
+            ParsedTarget::Handler(method, pattern, h) => {
+                let endpoint = quoted_endpoint(&r.method.to_uppercase(), &r.path);
+                let path = pattern.router_path().to_owned();
+                let mr = method_router(method, pattern, h);
+                app = insert_endpoint(app, &path, mr, endpoint)?;
+            }
+            // `Server.mountApp`: build the embedded web app's router for its
+            // parsed base and serve it below that prefix on this same
+            // listener (one port). Each app carries its own base in its
+            // state, so any number of apps mount at distinct prefixes. The
+            // builder is taken once; a duplicate (a cloned route) finds
+            // `None` and is skipped — inert.
+            #[cfg(feature = "web")]
+            ParsedTarget::MountWeb(base, cell) => {
+                let builder = cell
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(build) = builder {
+                    let sub = build(base.clone()).await;
+                    worker_bases.push(base.clone());
+                    mounts.push((base, sub));
+                }
+            }
+        }
+    }
+    #[cfg(feature = "web")]
+    let mounted_workers = AdmittedWorkerPaths::of_bases(&worker_bases);
+    #[cfg(not(feature = "web"))]
+    let mounted_workers = AdmittedWorkerPaths::none();
+    Ok(worker_gated(app, mounts, mounted_workers))
+}
+
+/// The listener's router over `routes`, parsed, conflict-checked and
+/// assembled exactly as [`server_listen`] does before it binds; `None` when
+/// the listen refuses them.
+#[cfg(test)]
+pub(crate) async fn listen_router(routes: Vec<ServerRoute>) -> Option<axum::Router> {
+    let routes = parse_routes(routes).ok()?;
+    if endpoint_conflict(&routes)
+        .or_else(|| mount_conflict(&routes))
+        .is_some()
+    {
+        return None;
+    }
+    listener_routes(routes).await.ok().map(behind_listener)
+}
+
 pub fn server_listen<E: crate::FromIpeError + Send + 'static>(
     port: i64,
     routes: Vec<ServerRoute>,
@@ -3324,53 +3394,10 @@ pub fn server_listen<E: crate::FromIpeError + Send + 'static>(
                 "Server.listen: {refusal}"
             ))));
         }
-        let mut app: axum::Router = axum::Router::new();
-        let mut mounts = Vec::new();
-        // The bases of the mounted web apps: the only prefixes below which a
-        // worker script fetch may pass the listener's worker gate.
-        #[cfg(feature = "web")]
-        let mut worker_bases = Vec::new();
-        for r in routes {
-            match r.target {
-                ParsedTarget::Static(base, dir) => {
-                    let files = axum::Router::new()
-                        .fallback_service(strict_serve_dir(std::path::PathBuf::from(dir)));
-                    mounts.push((base, files));
-                }
-                ParsedTarget::Handler(method, pattern, h) => {
-                    let endpoint = quoted_endpoint(&r.method.to_uppercase(), &r.path);
-                    let path = pattern.router_path().to_owned();
-                    let mr = method_router(method, pattern, h);
-                    app = match insert_endpoint(app, &path, mr, endpoint) {
-                        Ok(next) => next,
-                        Err(refusal) => return refuse(refusal),
-                    };
-                }
-                // `Server.mountApp`: build the embedded web app's router for its
-                // parsed base and serve it below that prefix on this same
-                // listener (one port). Each app carries its own base in its
-                // state, so any number of apps mount at distinct prefixes. The
-                // builder is taken once; a duplicate (a cloned route) finds
-                // `None` and is skipped — inert.
-                #[cfg(feature = "web")]
-                ParsedTarget::MountWeb(base, cell) => {
-                    let builder = cell
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .take();
-                    if let Some(build) = builder {
-                        let sub = build(base.clone()).await;
-                        worker_bases.push(base.clone());
-                        mounts.push((base, sub));
-                    }
-                }
-            }
-        }
-        #[cfg(feature = "web")]
-        let mounted_workers = AdmittedWorkerPaths::of_bases(&worker_bases);
-        #[cfg(not(feature = "web"))]
-        let mounted_workers = AdmittedWorkerPaths::none();
-        let app = worker_gated(app, mounts, mounted_workers);
+        let app = match listener_routes(routes).await {
+            Ok(app) => app,
+            Err(refusal) => return refuse(refusal),
+        };
         // Ipê doctrine: a panicking handler returns 500, never crashes the
         // process. The custom
         // responder classifies + logs the panic SERVER-SIDE (errId) and returns a

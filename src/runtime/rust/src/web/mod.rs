@@ -15828,6 +15828,71 @@ mod emitted_router_behavior_tests {
         });
     }
 
+    /// `Server.mountApp "/"` beside a `Server.get` route: the listener's own
+    /// route assembly starts (the router panics on a nest at `/`, so the root
+    /// mount must never be one), the handler answers its path and the app
+    /// answers every other one, its page and its runtime routes alike.
+    #[test]
+    #[allow(clippy::expect_used)] // test: fixed requests build and bodies are UTF-8
+    fn a_root_mounted_app_starts_beside_server_routes() {
+        let app = crate::tea::WebApp(crate::tea::WebAppKind::Mountable {
+            serve: Box::pin(async { crate::IpeResult::Ok(()) }),
+            router: web_embed_router(
+                init,
+                update,
+                view,
+                subs,
+                "memory".to_string(),
+                String::new(),
+                [0u8; 32],
+            ),
+        });
+        let routes = vec![
+            crate::server::server_get::<String, _>(
+                "/api".to_owned(),
+                |_req: crate::server::ServerRequest| {
+                    Box::pin(async {
+                        crate::IpeResult::Ok(crate::server::server_text("api".to_owned()))
+                    }) as crate::IpeTask<String, crate::server::ServerResponse>
+                },
+            ),
+            crate::server::server_mount_app("/".to_owned(), app),
+        ];
+        block_on(async move {
+            let listener = crate::server::listen_router(routes)
+                .await
+                .expect("a root mount beside a route starts");
+            for (uri, status, body) in [
+                ("/api", StatusCode::OK, Some("api")),
+                ("/", StatusCode::OK, None),
+                ("/elsewhere", StatusCode::OK, None),
+                ("/_ipe/healthz", StatusCode::OK, None),
+            ] {
+                let resp = listener
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("GET")
+                            .uri(uri)
+                            .body(Body::empty())
+                            .expect("build GET"),
+                    )
+                    .await
+                    .expect("router responds");
+                assert_eq!(resp.status(), status, "{uri}");
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .expect("read body");
+                let text = String::from_utf8(bytes.to_vec()).expect("the body is UTF-8");
+                if let Some(want) = body {
+                    assert_eq!(text, want, "{uri}");
+                } else {
+                    assert_ne!(text, "api", "{uri} is served by the app");
+                }
+            }
+        });
+    }
+
     /// A mounted app whose store config this build cannot honour answers every
     /// path with the fixed 503 body, never the store detail.
     #[cfg(not(feature = "redis_store"))]
