@@ -9,7 +9,6 @@
 //! cargo test -p ipe --test golden_aud14_duplicate_qualifier
 //! ```
 
-use std::fs;
 use std::path::PathBuf;
 
 use ipe::RootFixture;

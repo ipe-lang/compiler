@@ -21,7 +21,6 @@
 //! cargo test -p ipe --test golden_ffi_kernel_alias_seal
 //! ```
 
-use std::fs;
 use std::path::PathBuf;
 
 /// Build the user project and assert `ipe` rejects it with the origin-gate

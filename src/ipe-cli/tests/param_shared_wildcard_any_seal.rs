@@ -13,7 +13,6 @@
 
 mod support;
 
-use std::fs;
 use std::path::PathBuf;
 
 #[allow(clippy::expect_used)]

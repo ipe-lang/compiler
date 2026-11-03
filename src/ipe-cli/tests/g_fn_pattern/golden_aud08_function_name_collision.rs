@@ -25,7 +25,6 @@
 //! cargo test -p ipe --test golden_aud08_function_name_collision
 //! ```
 
-use std::fs;
 use std::path::PathBuf;
 
 #[test]

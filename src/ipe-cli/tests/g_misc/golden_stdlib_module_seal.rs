@@ -22,7 +22,6 @@
 //! IPE_E2E=1 cargo test -p ipe --test golden_stdlib_module_seal
 //! ```
 
-use std::fs;
 use std::path::PathBuf;
 
 /// A project fixture whose only module `Main` holds `main`.
