@@ -31,7 +31,7 @@ out.
 
 The shift takes an instant and a span and returns an instant:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/timestamp-scheduling/src/Main.ipe
 oneHourLater : Timestamp
 oneHourLater =
     Timestamp.add (Duration.minutes 60) start
@@ -40,7 +40,7 @@ oneHourLater =
 The measurement takes two instants and returns a span, which we read out as
 seconds:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/timestamp-scheduling/src/Main.ipe
 gapSeconds : Int
 gapSeconds =
     Duration.toMillis (Timestamp.diff oneHourLater start) // 1000
@@ -48,7 +48,7 @@ gapSeconds =
 
 Running it (`ipe dev run`):
 
-```
+```text
 start (unix ms): 1000000000000
 one hour later:  1000003600000
 gap between them: 3600 seconds

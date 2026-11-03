@@ -34,7 +34,7 @@ is a minimal `Ipe.Tea.Web` counter. The whole page is one `view` function.
 places two buttons and the live count side by side. Colours and padding are
 typed attributes; each button carries a typed `Msg`:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/web/ui-layout/src/Main.ipe
 view : Model -> Element Msg
 view model =
     Ui.column
@@ -42,18 +42,20 @@ view model =
         , Ui.padding 24
         ]
         [ Ui.el
-            [ Ui.style "font-weight" "bold" ]
+            [ Ui.style "font-weight" "bold", Ui.describe (Ui.descHeading 1) ]
             (Ui.text "Counter")
         , Ui.row
             [ Ui.spacing 12 ]
             [ Ui.button
-                [ Ui.padding 8, Ui.onClick Decrement ]
+                [ Ui.padding 8, Ui.onClick Decrement, Ui.ariaLabel "Decrement" ]
                 { onPress = Just Decrement, label = Ui.text "-" }
             , Ui.el
-                [ Ui.style "color" (Ui.colorCss (Ui.rgb 30 30 60)) ]
+                [ Ui.style "color" (Ui.colorCss (Ui.rgb 30 30 60))
+                , Ui.ariaLive Ui.LivePolite
+                ]
                 (Ui.text (String.fromInt model.count))
             , Ui.button
-                [ Ui.padding 8, Ui.onClick Increment ]
+                [ Ui.padding 8, Ui.onClick Increment, Ui.ariaLabel "Increment" ]
                 { onPress = Just Increment, label = Ui.text "+" }
             ]
         ]
@@ -61,11 +63,10 @@ view model =
 
 `update` folds a `Msg` into the model, and the runtime re-renders the view:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/web/ui-layout/src/Main.ipe
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
-
         Increment ->
             ( { model | count = model.count + 1 }, Cmd.none )
 
@@ -140,13 +141,22 @@ dark ones. High-contrast / Windows HCM modes use the system `Highlight` colour.
 You can restyle the ring per control without losing it:
 
 ```ipe
-Ui.button
-    [ Ui.focusVisible
-        [ Ui.style "outline" "3px solid #e63946"
-        , Ui.style "outline-offset" "3px"
+import Ipe.Ui as Ui
+
+
+type Msg
+    = Submit
+
+
+restyledFocus : Element Msg
+restyledFocus =
+    Ui.button
+        [ Ui.focusVisible
+            [ Ui.style "outline" "3px solid #e63946"
+            , Ui.style "outline-offset" "3px"
+            ]
         ]
-    ]
-    { onPress = Just Submit, label = Ui.text "Submit" }
+        { onPress = Just Submit, label = Ui.text "Submit" }
 ```
 
 **Erasing it is a lint error.** The `no-silent-outline-none` rule fires when
@@ -156,8 +166,13 @@ non-none outline). Fail-closed: absent proof of a replacement, the removal is
 flagged. To suppress intentionally:
 
 ```ipe
--- ipe-lint: allow no-silent-outline-none
-Ui.focusVisible [ Ui.style "outline" "none", Ui.style "box-shadow" "0 0 0 4px #0060df" ]
+import Ipe.Ui as Ui
+
+
+restyledAttr : Attribute msg
+restyledAttr =
+    -- ipe-lint: allow no-silent-outline-none
+    Ui.focusVisible [ Ui.style "outline" "none", Ui.style "box-shadow" "0 0 0 4px #0060df" ]
 ```
 
 (The example above would not need suppression — `box-shadow` is a visible

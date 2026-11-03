@@ -38,10 +38,13 @@ span back, and reads two pure calendar helpers.
 A fixed instant is built from milliseconds since the epoch, and a deadline is that
 instant plus a duration:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/time-calendar/src/Main.ipe
+launch : Timestamp.Timestamp
 launch =
     Timestamp.fromUnixMillis 1709208000000
 
+
+deadline : Timestamp.Timestamp
 deadline =
     Time.add (Duration.minutes 120) launch
 ```
@@ -51,7 +54,7 @@ UTC string (the launch at noon, the deadline two hours later). `diff` recovers t
 span between the two as a `Duration`, and the calendar helpers are pure `Int`
 maths:
 
-```ipe
+```ipe ipe:skip inline result annotations alongside the worked example above, not a standalone program
 Duration.toMillis (Time.diff deadline launch) // 60000   -- 120 (minutes)
 Time.isLeapYear 2024                                     -- True
 Time.daysInMonth 2024 2                                  -- 29
@@ -59,7 +62,7 @@ Time.daysInMonth 2024 2                                  -- 29
 
 Running it (`ipe dev run`) prints the two UTC instants, then:
 
-```
+```text
 window span: 120 minutes
 2024 is a leap year: yes
 Feb 2024 has 29 days

@@ -18,10 +18,16 @@ From [`examples/shapes/script/parse-port`](https://github.com/ipe-lang/compiler/
 The boundary parser turns a `String` into a `Maybe Port`:
 
 ```ipe
+import Ipe.String as String
+
+
+type alias Port =
+    { number : Int }
+
+
 parsePort : String -> Maybe Port
 parsePort raw =
     case String.toInt raw of
-
         Nothing ->
             Nothing
 
@@ -38,6 +44,13 @@ string *cannot* produce a `Port`. Downstream code takes a `Port`, never a raw
 `String` or `Int`, so it does no checking of its own:
 
 ```ipe
+import Ipe.String as String
+
+
+type alias Port =
+    { number : Int }
+
+
 describe : Port -> String
 describe port_ =
     "listening on " ++ String.fromInt port_.number

@@ -25,7 +25,7 @@ The example under
 [`examples/shapes/script/transform-props`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/transform-props/src/Main.ipe)
 builds a small "lift" transform — nudge up, shrink slightly, tilt — and renders it.
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/transform-props/src/Main.ipe
 lift : List Prop
 lift =
     [ Transform.translateY (-4)
@@ -36,7 +36,7 @@ lift =
 
 Running it (`ipe dev run`):
 
-```
+```text
 The transform declaration (propsToCss emits the property name and value):
   transform:translateY(-4px) scale(0.98) rotate(2deg)
 ```

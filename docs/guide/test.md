@@ -34,11 +34,13 @@ assertions, and wires the tree to `runMain`.
 Each test is a `name` paired with a thunk that returns a `TestResult`; the suite
 is a plain list of them:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/test-suite/src/Main.ipe
 suite : Test
 suite =
     Test.suite "arithmetic"
         [ Test.test "doubling two is four" (\_ -> Test.equal 4 (doubled 2))
+        , Test.test "doubling zero is zero" (\_ -> Test.equal 0 (doubled 0))
+        , Test.test "list length" (\_ -> Test.equal 3 (List.length [ 1, 2, 3 ]))
         , Test.test "positive parse succeeds" (\_ -> Test.ok (parsePositive 7))
         , Test.test "non-positive parse fails" (\_ -> Test.err (parsePositive 0))
         , Test.test "membership is true" (\_ -> Test.isTrue (List.member 2 [ 1, 2, 3 ]))
@@ -47,7 +49,7 @@ suite =
 
 `main` is nothing but the runner over the tree:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/test-suite/src/Main.ipe
 main =
     Test.runMain [ suite ]
 ```
@@ -55,7 +57,7 @@ main =
 Running it (`ipe dev run`) prints the summary and exits `0` because every assertion
 passed:
 
-```
+```text
 6 passed, 0 failed (6 total)
 ```
 
