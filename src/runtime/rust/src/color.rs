@@ -858,9 +858,9 @@ fn no_color_from(read: Result<String, std::env::VarError>) -> bool {
 ///   unless the environment explicitly asks for less.
 #[must_use]
 pub fn resolve_term_profile() -> TermProfile {
-    // The ONLY read of `NO_COLOR` (and `COLORTERM`/`TERM`) in the runtime —
-    // every Tui/Cli colour decision reads the typed `TermProfile` this
-    // produces, never the raw env var again.
+    // `NO_COLOR` through its one predicate, and the ONLY read of
+    // `COLORTERM`/`TERM` in the runtime — every Tui/Cli colour decision reads
+    // the typed `TermProfile` this produces, never a raw env var again.
     if no_color_requested() {
         return TermProfile::NoColor;
     }

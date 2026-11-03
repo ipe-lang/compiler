@@ -80,33 +80,35 @@ pub fn sanitize_rune(c: char) -> char {
     if is_display_hazard(c) { ' ' } else { c }
 }
 
-/// Map a display hazard to a space, keeping `'\n'` as the line break it is.
+/// Make text whose line breaks are structure safe to draw, keeping its rows.
 ///
-/// The one rule for text whose line breaks are structure (a paragraph, a
-/// textarea's value and its edits): every other control still becomes a space.
+/// The runtime's one line model for drawn text: a `'\n'`, or a `"\r\n"` pair,
+/// is a row break and comes out as `'\n'`; every other character, a lone
+/// `'\r'` included, goes through [`sanitize_rune`]. A paragraph, a textarea's
+/// value and its edits, and a String view's frame all read rows this way.
 #[must_use]
-pub fn sanitize_rune_keeping_newline(c: char) -> char {
-    if c == '\n' { c } else { sanitize_rune(c) }
-}
-
-/// Make a whole text frame safe to write to a raw-mode terminal.
-///
-/// Each `'\n'` (with a `'\r'` directly before it) is a row break, written
-/// `"\r\n"` because raw mode moves the cursor down without returning it; every
-/// other character goes through [`sanitize_rune`], so the frame carries no
-/// control sequence, bidi control or line separator of its own.
-#[must_use]
-pub fn sanitize_frame(s: &str) -> String {
+pub fn sanitize_text_keeping_newlines(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '\n' => out.push_str("\r\n"),
+            '\n' => out.push('\n'),
             '\r' if chars.peek() == Some(&'\n') => {}
             other => out.push(sanitize_rune(other)),
         }
     }
     out
+}
+
+/// Make a whole text frame safe to write to a raw-mode terminal.
+///
+/// The rows [`sanitize_text_keeping_newlines`] keeps, each break written
+/// `"\r\n"` because raw mode moves the cursor down without returning it; the
+/// frame carries no control sequence, bidi control or line separator of its
+/// own.
+#[must_use]
+pub fn sanitize_frame(s: &str) -> String {
+    sanitize_text_keeping_newlines(s).replace('\n', "\r\n")
 }
 
 /// Display width of a char, clamped to [0, 2]. A control char (no width) reads
@@ -237,14 +239,30 @@ mod tests {
             if framed != sanitize_rune(c).to_string() {
                 return Err(format!("U+{:04X} frames as {framed:?}", u32::from(c)));
             }
-            if sanitize_rune_keeping_newline(c) != sanitize_rune(c) {
-                return Err(format!("U+{:04X} kept-newline differs", u32::from(c)));
+            if sanitize_text_keeping_newlines(&c.to_string()) != sanitize_rune(c).to_string() {
+                return Err(format!("U+{:04X} kept-newline text differs", u32::from(c)));
             }
         }
-        if sanitize_rune_keeping_newline('\n') == '\n' {
+        if sanitize_text_keeping_newlines("\n") == "\n" {
             Ok(())
         } else {
             Err("the kept line break was blanked".to_owned())
+        }
+    }
+
+    /// A `"\r\n"` is one row break in kept-newline text, as it is in a frame;
+    /// a lone `'\r'` is blanked in both.
+    ///
+    /// CI job `runtime-full-features-run`.
+    #[test]
+    fn kept_newline_text_reads_rows_like_a_frame() {
+        assert_eq!(sanitize_text_keeping_newlines("a\r\nb\rc\n"), "a\nb c\n");
+        assert_eq!(sanitize_text_keeping_newlines("\r\r\n"), " \n");
+        for text in ["a\r\nb", "a\nb\r", "\r\r\n\x1b\n", "x\u{2028}y\r\n"] {
+            assert_eq!(
+                sanitize_frame(text),
+                sanitize_text_keeping_newlines(text).replace('\n', "\r\n")
+            );
         }
     }
 
