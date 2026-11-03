@@ -36,7 +36,7 @@ Each block is a distinct constructor, so `describe` is an exhaustive `case` — 
 compiler requires every variant be handled, so a new block type can't slip through
 a wildcard:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/markdown-parse/src/Main.ipe
 describe : Block -> String
 describe block =
     case block of
@@ -49,12 +49,25 @@ describe block =
         BulletBlock items ->
             "bullet list of " ++ String.fromInt (List.length items)
 
-        -- … one arm per remaining variant …
+        NumberedBlock items ->
+            "numbered list of " ++ String.fromInt (List.length items)
+
+        CodeBlock body ->
+            "code block (" ++ String.fromInt (String.length body) ++ " chars)"
+
+        TableBlock _ rows ->
+            "table of " ++ String.fromInt (List.length rows) ++ " rows"
+
+        RuleBlock ->
+            "horizontal rule"
+
+        BlockquoteBlock inner ->
+            "blockquote of " ++ String.fromInt (List.length inner) ++ " blocks"
 ```
 
 Parsing the note and describing each block (`ipe dev run`):
 
-```
+```text
 Parsed markdown blocks:
   header H1: Release notes
   paragraph (37 chars)

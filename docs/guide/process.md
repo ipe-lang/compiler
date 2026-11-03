@@ -37,7 +37,7 @@ show an argument passed literally and the exit code captured.
 
 `run` binds the child's stdout with `<-`, like any effect:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/process-run/src/Main.ipe
 greeting <- Process.run "echo" [ "hello", "from", "a", "child" ]
 Io.println ("run -> " ++ String.trim greeting)
 ```
@@ -45,21 +45,22 @@ Io.println ("run -> " ++ String.trim greeting)
 `runWith` takes a config record and returns exit code, stdout, and stderr — and
 the `$HOME`-shaped argument comes back verbatim, proving no shell expanded it:
 
-```ipe
-result <-
-    Process.runWith
-        { command = "printf"
-        , args = [ "%s\n", "$HOME is not expanded" ]
-        , cwd = Nothing
-        , env = []
-        }
+```ipe ipe:excerpt examples/shapes/script/process-run/src/Main.ipe
+-- The rich form: an argument that LOOKS like a shell variable is passed
+-- literally, and a non-zero exit is a normal result, not a failure.
+result <- Process.runWith
+            { command = "printf"
+            , args = [ "%s\n", "$HOME is not expanded" ]
+            , cwd = Nothing
+            , env = []
+            }
 Io.println ("exit=" ++ String.fromInt result.exitCode)
 Io.println ("stdout -> " ++ String.trim result.stdout)
 ```
 
 Running it (`ipe dev run`) prints:
 
-```
+```text
 run -> hello from a child
 exit=0
 stdout -> $HOME is not expanded

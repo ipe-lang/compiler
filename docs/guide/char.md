@@ -34,6 +34,17 @@ upper- and lower-case letters shift (each relative to its own base), and anythin
 else passes through unchanged:
 
 ```ipe
+import Ipe.Char as Char
+
+
+rotate n base c =
+    let
+        offset =
+            Char.toCode c - base
+    in
+    Char.fromCode (base + modBy 26 (offset + n))
+
+
 shiftChar n c =
     if Char.isUpper c then
         rotate n (Char.toCode 'A') c
@@ -50,6 +61,9 @@ shift, wrap with `modBy 26`, add the base back, and convert the code point to a
 `Char`:
 
 ```ipe
+import Ipe.Char as Char
+
+
 rotate n base c =
     let
         offset =
@@ -62,6 +76,29 @@ Enciphering the whole string is `String.map` — the per-character shift applied
 across the text, reassembled into a new `String`:
 
 ```ipe
+import Ipe.Char as Char
+import Ipe.String as String
+
+
+rotate n base c =
+    let
+        offset =
+            Char.toCode c - base
+    in
+    Char.fromCode (base + modBy 26 (offset + n))
+
+
+shiftChar n c =
+    if Char.isUpper c then
+        rotate n (Char.toCode 'A') c
+
+    else if Char.isLower c then
+        rotate n (Char.toCode 'a') c
+
+    else
+        c
+
+
 encipher n text =
     String.map (shiftChar n) text
 ```
@@ -69,7 +106,7 @@ encipher n text =
 Running it (`ipe dev run`) shifts the letters by three, leaves the digits and
 punctuation alone, and the inverse shift recovers the original:
 
-```
+```text
 plain:     Attack at Dawn! (07:00)
 shift +3:  Dwwdfn dw Gdzq! (07:00)
 recovered: Attack at Dawn! (07:00)

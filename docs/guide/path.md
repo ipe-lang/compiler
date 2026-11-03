@@ -42,10 +42,9 @@ single gate, then reads components off the parsed paths.
 `fromString` is the one gate: a clean string becomes `Ok Path`, a traversal
 escape a typed `Err`, and only a parsed `Path` reaches the accessors:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/path-safe-join/src/Main.ipe
 describe raw =
     case Path.fromString raw of
-
         Ok path ->
             String.join "  "
                 [ Path.toString path
@@ -61,7 +60,7 @@ describe raw =
 Running it (`ipe dev run`) accepts the clean paths, reads their components, and
 rejects the `..` escape:
 
-```
+```text
 uploads/report.csv  base=report.csv  ext=.csv  abs=no
 uploads/../../etc/passwd  ->  REJECTED (traversal or NUL)
 /var/log/app.log  base=app.log  ext=.log  abs=yes

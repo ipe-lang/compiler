@@ -33,6 +33,9 @@ Each cap carries a `ByteSize`, built with its unit named, and a deliberate
 negative that becomes zero:
 
 ```ipe
+import Ipe.ByteSize as ByteSize
+
+
 caps =
     [ { resource = "upload", limit = ByteSize.mib 10 }
     , { resource = "avatar", limit = ByteSize.kib 256 }
@@ -44,6 +47,10 @@ caps =
 The quantity becomes a raw byte count only at the boundary, through `toBytes`:
 
 ```ipe
+import Ipe.ByteSize as ByteSize
+import Ipe.String as String
+
+
 render cap =
     String.padRight 8 ' ' cap.resource
         ++ String.fromInt (ByteSize.toBytes cap.limit)
@@ -52,7 +59,7 @@ render cap =
 
 Running it (`ipe dev run`) expands each binary unit correctly and clamps the negative:
 
-```
+```text
 Resource caps:
   upload  10485760 bytes
   avatar  262144 bytes

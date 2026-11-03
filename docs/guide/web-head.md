@@ -39,7 +39,7 @@ The canonical URL is emitted only when it parses — `Url.fromString` is the one
 constructor and the boundary where an unparseable URL is turned away rather than
 carried into a trusted tag:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/web/head-seo/src/Main.ipe
 head : Model -> List (Html Msg)
 head model =
     let
@@ -47,12 +47,18 @@ head model =
             [ Head.title model.pageTitle
             , Head.meta "description" "A minimal Ipe.Web page with typed head tags."
             , Head.metaProperty "og:title" model.pageTitle
+            , Head.metaProperty "og:type" "website"
             , Head.themeColor "#1a1a2e"
             ]
     in
     case Url.fromString "https://example.com/" of
         Ok url ->
-            base ++ [ Head.canonical url ]
+            case Head.canonical url of
+                Ok tag ->
+                    base ++ [ tag ]
+
+                Err _ ->
+                    base
 
         Err _ ->
             base
@@ -60,12 +66,15 @@ head model =
 
 The callback is wired through the optional `head` field on `Web.tea`:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/web/head-seo/src/Main.ipe
 main =
     Web.tea
-        { init = init, update = update, view = view
+        { init = init
+        , update = update
+        , view = view
         , subscriptions = subscriptions
-        , routes = [], notFound = Ignored
+        , routes = []
+        , notFound = Ignored
         , head = head
         }
 ```

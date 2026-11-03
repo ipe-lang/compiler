@@ -30,7 +30,7 @@ pixels.
 Because `Shade` is closed, naming its constructors is exhaustive by construction —
 the `case` cannot forget a token:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/palette-shades/src/Main.ipe
 shadeName : Shade -> String
 shadeName shade =
     case shade of
@@ -44,7 +44,7 @@ shadeName shade =
 The spacing scale is a list of named `Spacing` values; the raw pixel count is
 recovered only at the render boundary through `spacingPx`:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/palette-shades/src/Main.ipe
 scale : List Spacing
 scale =
     [ Sp 4, Sp 8, Sp 16 ]
@@ -52,7 +52,7 @@ scale =
 
 Running it (`ipe dev run`) prints:
 
-```
+```text
 Dark -> #000
 Light -> #fff
 spacing px: 4, 8, 16

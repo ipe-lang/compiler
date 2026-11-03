@@ -35,7 +35,7 @@ character.
 
 One ability score *is* a generator — `Gen.int 3 18` has type `Seed -> ( Int, nextSeed )`:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/random-character-sheet/src/Main.ipe
 ability : Gen.Seed -> ( Int, Gen.Seed )
 ability =
     Gen.int 3 18
@@ -46,11 +46,13 @@ draws and combines them, handing back the seed they left off at; `listOf`
 continues from *that* seed to draw six dice. Each draw feeds the next — no seed is
 ever reused:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/random-character-sheet/src/Main.ipe
+rollSheet : Gen.Seed -> Sheet
 rollSheet seed0 =
     let
         ( abilities, seed1 ) =
-            Gen.map3 (\s d w -> { strength = s, dexterity = d, wisdom = w })
+            Gen.map3
+                (\s d w -> { strength = s, dexterity = d, wisdom = w })
                 ability
                 ability
                 ability
@@ -59,13 +61,17 @@ rollSheet seed0 =
         ( dice, _ ) =
             Gen.listOf 6 (Gen.int 1 8) seed1
     in
-    ...
+    { strength = abilities.strength
+    , dexterity = abilities.dexterity
+    , wisdom = abilities.wisdom
+    , hitDice = dice
+    }
 ```
 
 Running it (`ipe dev run`) rolls seed 42 twice — identical both times — and seed 99
 once, different, proving reproducibility:
 
-```
+```text
 seed 42:
   STR 6
   DEX 16

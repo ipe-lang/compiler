@@ -36,7 +36,7 @@ detection.
 The segment distance is `Math.hypot` — `sqrt(dx² + dy²)` computed without
 intermediate overflow, the idiomatic 2-D distance:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/math-path-length/src/Main.ipe
 distance : Point -> Point -> Float
 distance a b =
     Math.hypot (b.x - a.x) (b.y - a.y)
@@ -45,7 +45,7 @@ distance a b =
 The four rounding functions on one value make their directions visible at a
 glance — the first knot, concretely:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/math-path-length/src/Main.ipe
 roundingReport : Float -> String
 roundingReport v =
     String.join "  "
@@ -59,7 +59,7 @@ roundingReport v =
 And NaN is detected structurally — `sqrt (-1)` is `NaN`, caught by `isNaN`, never
 by `==`:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/math-path-length/src/Main.ipe
 sqrtReport : Float -> String
 sqrtReport v =
     let
@@ -76,7 +76,7 @@ sqrtReport v =
 Running it (`ipe dev run`) prints — note the four rounding directions differ on a
 fractional length, and the negative square root is caught:
 
-```
+```text
 path length: 8.60555127546399
 rounded: floor=8  ceil=9  round=9  trunc=8
 sqrt 2 = 1.4142135623730951

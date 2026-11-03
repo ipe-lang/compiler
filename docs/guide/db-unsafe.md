@@ -35,8 +35,8 @@ import Ipe.Db.Unsafe exposing (unsafeQuery)
 -- The query TEXT is caller-authored verbatim; only the binds are parameterised.
 -- The caller now owns the injection invariant `Db.queryDecode` would have held.
 -- Each row maps a column to its cell text, `Nothing` for SQL `NULL`.
-rows : Task Error (List (Dict String (Maybe String)))
-rows =
+rows : Db -> String -> Task Error (List (Dict String (Maybe String)))
+rows conn cutoff =
     unsafeQuery conn "SELECT * FROM audit WHERE ts > ?" [ SqlString cutoff ]
 ```
 

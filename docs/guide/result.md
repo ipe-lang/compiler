@@ -35,7 +35,7 @@ parses a raw three-field form into a typed `Account`. The `Account` type is the
 target — and its existence is proof the input was valid, because it can only be
 built from already-parsed fields:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/result-signup-form/src/Main.ipe
 type alias Account =
     { username : String
     , age : Int
@@ -48,7 +48,7 @@ shows `andThen` chaining a fallible step onto another: `String.toInt` gives a
 `Maybe`, `Result.fromMaybe` lifts the absent case into a typed error, and
 `andThen` runs the range check only on a parsed number:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/result-signup-form/src/Main.ipe
 parseAge : String -> Result String Int
 parseAge raw =
     String.toInt (String.trim raw)
@@ -69,7 +69,7 @@ The whole-form parse is one `map3`: it applies the `Account` constructor to the
 three parsed fields, short-circuiting on the first failure. No nested `case`, no
 field-order bookkeeping:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/result-signup-form/src/Main.ipe
 parseForm : RawForm -> Result String Account
 parseForm form =
     Result.map3 Account
@@ -81,7 +81,7 @@ parseForm form =
 Running it (`ipe dev run`) over five forms — one valid, four each tripping a
 different check — prints:
 
-```
+```text
 OK: ada <ada@example.com> age 36
 REJECTED: username is required
 REJECTED: age must be a whole number

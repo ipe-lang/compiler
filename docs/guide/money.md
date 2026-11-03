@@ -32,15 +32,17 @@ The example under
 adds an 18% tip to a bill, splits it three ways, verifies the parts re-sum to the
 total, and shows a cross-currency add being rejected.
 
-The bill is a `Money` in USD; the tipped total is exact decimal arithmetic wrapped
-back into the same currency:
+The bill is a `Money` in USD:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/money-split-bill/src/Main.ipe
 bill : Money
 bill =
     Money.fromMajor USD 100
+```
 
+The tipped total is exact decimal arithmetic wrapped back into the same currency:
 
+```ipe ipe:excerpt examples/shapes/script/money-split-bill/src/Main.ipe
 withTip : Money
 withTip =
     Money.mul (Decimal.fromString "1.18" |> Result.withDefault Decimal.one) bill
@@ -50,7 +52,7 @@ withTip =
 share, so the three parts sum to the input *exactly* — `Money.sumOf` recovers it
 to the penny:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/money-split-bill/src/Main.ipe
 shares =
     Money.allocate 3 withTip
 
@@ -61,14 +63,14 @@ resummed =
 Adding a euro amount to the dollar bill is a currency mismatch — `Money.add`
 returns `Err`, so the impossible sum has no value to leak downstream:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/money-split-bill/src/Main.ipe
 crossCurrency =
     Money.add bill (Money.fromMajor EUR 50)
 ```
 
 Running it (`ipe dev run`):
 
-```
+```text
 Bill + 18% tip: $118.00
 Split 3 ways (parts sum to the total exactly):
   diner 1: $39.34

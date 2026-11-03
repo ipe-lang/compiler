@@ -16,7 +16,7 @@ refused at type-check: interpolate its fields instead.
 
 A gnarly concatenation like this:
 
-```ipe ipe:skip
+```ipe ipe:skip the string-concatenation chain the interpolated form below replaces; not a standalone declaration
 "Deploying " ++ service ++ " v" ++ String.fromInt version ++ " to " ++ region ++ "\n"
 ```
 

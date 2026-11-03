@@ -37,6 +37,9 @@ The target record and its decoder sit side by side. `map4` applies the
 `[server]` table:
 
 ```ipe
+import Ipe.Config as Config exposing (Decoder)
+
+
 type alias AppConfig =
     { host : String
     , port : Int
@@ -59,6 +62,27 @@ document whose `port` is a string where an int is expected fails the whole
 decode — one typed error, not a silently-coerced value:
 
 ```ipe
+import Ipe.Config as Config exposing (Decoder)
+import Ipe.String as String
+
+
+type alias AppConfig =
+    { host : String
+    , port : Int
+    , debug : Bool
+    , tags : List String
+    }
+
+
+configDecoder : Decoder AppConfig
+configDecoder =
+    Config.map4 AppConfig
+        (Config.at [ "server", "host" ] Config.string)
+        (Config.at [ "server", "port" ] Config.int)
+        (Config.field "debug" Config.bool)
+        (Config.field "tags" (Config.list Config.string))
+
+
 report : String -> String -> String
 report label toml =
     case Config.decodeToml toml configDecoder of
@@ -72,7 +96,7 @@ report label toml =
 
 Running it (`ipe dev run`) over a valid and a broken document prints:
 
-```
+```text
 valid : OK 0.0.0.0:8080 debug=on tags=web,api
 broken: rejected (typed decode error)
 ```

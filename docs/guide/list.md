@@ -35,7 +35,7 @@ The reduction is one `foldl`: it threads the growing `table` through every match
 then a `sortWith` ranks it. Because `creditTeam` returns a *new* table each time,
 the fold is a pure left-to-right accumulation with no shared mutable state:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/list-scoreboard/src/Main.ipe
 standings : List Match -> List Standing
 standings matches =
     List.foldl addMatch [] matches
@@ -47,14 +47,14 @@ table into (this team's row, everyone else); the row is rebuilt with updated
 points and consed back on. Here the tuple is destructured first, then the list is
 matched.
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/list-scoreboard/src/Main.ipe
+creditTeam : String -> Int -> List Standing -> List Standing
 creditTeam team earned table =
     let
         ( mine, rest ) =
             List.partition (\row -> row.team == team) table
     in
     case mine of
-
         row :: _ ->
             { row | points = row.points + earned, played = row.played + 1 } :: rest
 
@@ -65,10 +65,10 @@ creditTeam team earned table =
 Ranking is a `sortWith` over a full comparator — most points first, ties broken
 alphabetically — so a compound sort key is one `Order`-returning function:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/list-scoreboard/src/Main.ipe
+byRank : Standing -> Standing -> Order
 byRank a b =
     case compare b.points a.points of
-
         EQ ->
             compare a.team b.team
 
@@ -83,7 +83,8 @@ The leaders are picked with `filterMap`: the lambda returns `Just team` for a
 top-scoring row and `Nothing` otherwise, so the test and the field extraction are
 a single traversal:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/list-scoreboard/src/Main.ipe
+leaderNames : List Standing -> Int -> List String
 leaderNames table topPoints =
     List.filterMap
         (\row ->
@@ -100,7 +101,8 @@ Presentation fans a list of values out to a list of effects: `indexedMap` number
 each row, `List.map Io.println` turns each into a print task, and `Task.sequence`
 runs them in order (the idiom for "print a whole list"):
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/list-scoreboard/src/Main.ipe
+printTable : List Standing -> Task Error ()
 printTable table =
     List.indexedMap renderRow table
         |> List.map Io.println
@@ -110,7 +112,7 @@ printTable table =
 
 Running it (`ipe dev run`) prints the ranked table and the leader:
 
-```
+```text
 Standings
  1. Lions     5 pts (4 played)
  2. Bears     4 pts (3 played)

@@ -97,7 +97,7 @@ This writes a `package.ipe` manifest whose shape differs from an app's — inste
 of a delivery block it carries `exposedModules`, the list of modules other
 projects may import:
 
-```ipe
+```ipe ipe:skip a package.ipe field fragment, not a standalone program; Ipe.Package is read only from a project's own manifest, never importable from ordinary Ipê source
 module Package exposing (package)
 
 import Ipe.Package exposing (..)
@@ -229,7 +229,7 @@ records the dependency in **both** `package.ipe` (the `dependencies` block, so a
 fresh clone re-resolves it) and `ipe.lock` (the exact resolved revision, for a
 reproducible build). Then import an exposed module and build as usual:
 
-```ipe
+```ipe ipe:skip illustrative; Mypackage is an external package, not present in this project's src/, so it cannot resolve standalone
 import Mypackage
 ```
 

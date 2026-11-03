@@ -31,7 +31,8 @@ entropy, so it is deterministic despite the randomness.
 Minting three v7 ids is a `Task.sequence` of three effects — each `Uuid.v7 ()` is
 a task, run in order:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/uuid-record-ids/src/Main.ipe
+mintBatch : Task Error (List String)
 mintBatch =
     Task.sequence
         [ Uuid.v7 ()
@@ -43,7 +44,8 @@ mintBatch =
 The v7 time-ordering is testable without knowing the exact ids: because later ids
 compare greater, sorting the batch leaves it unchanged:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/uuid-record-ids/src/Main.ipe
+isOrdered : List String -> Bool
 isOrdered ids =
     List.sort ids == ids
 ```
@@ -51,7 +53,8 @@ isOrdered ids =
 And `parse` is the pure boundary check — every minted id parses, and obvious
 garbage is rejected:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/uuid-record-ids/src/Main.ipe
+allValid : List String -> Bool
 allValid ids =
     List.all (\id -> Maybe.isJust (Uuid.parse id)) ids
 ```
@@ -59,7 +62,7 @@ allValid ids =
 Running it (`ipe dev run`) confirms the structural facts — 36-character canonical
 form, all parse, v7 batch already in creation order, and a non-UUID rejected:
 
-```
+```text
 minted 3 v7 ids
 all 36 chars: yes
 all parse as UUIDs: yes

@@ -45,6 +45,15 @@ about it — and test it — as a plain function, with no loop and no runtime
 involved:
 
 ```ipe
+type alias Model =
+    { count : Int }
+
+
+type Msg
+    = Increment
+    | Decrement
+
+
 update : Msg -> Model -> Model
 update msg model =
     case msg of
@@ -63,6 +72,28 @@ Since `update` is pure, applying a sequence of events is a
 [fold](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/List.md) over them:
 
 ```ipe
+import Ipe.List as List
+
+
+type alias Model =
+    { count : Int }
+
+
+type Msg
+    = Increment
+    | Decrement
+
+
+update : Msg -> Model -> Model
+update msg model =
+    case msg of
+        Increment ->
+            { model | count = model.count + 1 }
+
+        Decrement ->
+            { model | count = model.count - 1 }
+
+
 -- Apply a sequence of messages, oldest first, to a starting model.
 applyAll : Model -> List Msg -> Model
 applyAll start msgs =
@@ -134,4 +165,3 @@ write a plain `main` (see [getting started](getting-started.md)).
 - [Views: Ui and Html](glossary.md#ui) — what `view` returns and how to build it.
 - [Glossary](glossary.md) — `Model`, `Msg`, `Cmd`, `subscriptions`,
   `record update`.
-```
