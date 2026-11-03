@@ -6002,6 +6002,8 @@ TOOL_INVOCATIONS: dict[str, dict[Argv, ToolRole]] = {
     "test_strict_yaml.py": _SELF_TEST,
     "test_change_class.py": _SELF_TEST,
     "test_e2e_shard.py": _SELF_TEST,
+    "test_e2e_shard_cover.py": _SELF_TEST,
+    "test_test_id_map.py": _SELF_TEST,
     "test_rerun_policy.py": _SELF_TEST,
     "test_nightly_green.py": _SELF_TEST,
     "test_trust_roots.py": _SELF_TEST,

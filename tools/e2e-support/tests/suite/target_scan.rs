@@ -46,7 +46,7 @@ use proc_macro2::{TokenStream, TokenTree};
 use quote::ToTokens;
 use syn::visit::Visit;
 
-mod common;
+use crate::common;
 
 /// The target-scan fixtures, relative to this crate's manifest directory.
 const FIXTURES: &str = "tests/fixtures/target_scan";
@@ -60,7 +60,7 @@ const TARGET_RS: &str = "tools/e2e-support/src/target.rs";
 /// for (`TARGET_DIR_SUBSTR` below), and that is not itself an operation this
 /// scan's own rules are about — exactly as `cargo_step_scan.rs`'s own
 /// `"cargo"`-matching code is not a cargo spawn.
-const SELF: &str = "tools/e2e-support/tests/target_scan.rs";
+const SELF: &str = "tools/e2e-support/tests/suite/target_scan.rs";
 
 /// The substring rule 1 refuses outside [`TARGET_RS`]/[`SELF`].
 const TARGET_DIR_SUBSTR: &str = "TARGET_DIR";
@@ -616,7 +616,7 @@ fn a_path_module_target_is_reached_and_scanned() {
 fn no_test_target_spawns_a_build_outside_the_one_decision_point() {
     let (root, files) = common::test_target_files();
     for pinned in [
-        "tools/e2e-support/tests/target_scan.rs",
+        "tools/e2e-support/tests/suite/target_scan.rs",
         "src/ipe-cli/tests/support/mod.rs",
     ] {
         assert!(

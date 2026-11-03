@@ -9,8 +9,17 @@ so "the e2e shards run every archived test" is checked on every run, never
 assumed. The plan's shape and its tie to the `e2e` matrix are pinned by
 `.github/ci/e2e_shard.py --lint`.
 
-Every failure exits non-zero; a malformed plan, a malformed listing, or an
-empty archive is a failure, never a pass.
+It also lists the archive once per distinct `.config/nextest.toml` override
+filter (every profile) and refuses one that selects no test, except the
+filters `PLATFORM_ONLY` names, whose tests the Linux archive cannot hold; a
+`PLATFORM_ONLY` entry no override still carries is refused too. Every shard
+group of the plan must select at least one test. So a group, a timeout or a
+test-group override keyed by a binary or module that moved is caught on the
+run that moves it. The full sorted test-id list is written to `test-ids.txt`
+for the job to upload, so two runs' test sets can be compared id by id.
+
+Every failure exits non-zero; a malformed plan, a malformed listing, a
+malformed override table, or an empty archive is a failure, never a pass.
 """
 
 from __future__ import annotations
@@ -25,6 +34,12 @@ ARCHIVE_ARGS = ("--archive-file", "nextest.tar.zst", "--workspace-remap", ".", "
 MAX_SHARDS = 256
 MAX_PLAN_CHARS = 64 * 1024
 LIST_TIMEOUT_S = 300
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+NEXTEST_CONFIG = os.path.join(REPO, ".config", "nextest.toml")
+TEST_IDS_FILE = "test-ids.txt"
+# Override filters whose tests are `cfg`-gated off Linux, so the archive this
+# job lists holds none of them.
+PLATFORM_ONLY = frozenset({"package(ipe) & kind(lib) & test(/junction/)"})
 
 
 class CoverError(Exception):
@@ -106,6 +121,65 @@ def partition_errors(full: list[str], shards: dict[int, list[str]], count: int) 
     return errors
 
 
+def override_filters(text: str) -> list[str]:
+    """Return every `[[profile.<name>.overrides]]` filter of a nextest config, in order.
+
+    Each override table must carry exactly one `filter = '...'` (or `"..."`
+    without escapes) on one line; any other shape is refused, so a filter
+    this reader cannot see is never silently left unchecked.
+    """
+    filters: list[str] = []
+    in_override = False
+    seen = 0
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if line.startswith("["):
+            if in_override and seen != 1:
+                raise CoverError(f"nextest.toml override before line {number} has {seen} filters, expected 1")
+            in_override = line.startswith("[[profile.") and line.endswith(".overrides]]")
+            seen = 0
+            continue
+        if not in_override or not line.startswith("filter"):
+            continue
+        key, sep, value = line.partition("=")
+        value = value.strip()
+        quote = value[:1]
+        if key.strip() != "filter" or not sep or quote not in ("'", '"') or not value.endswith(quote) or len(value) < 3:
+            raise CoverError(f"nextest.toml line {number}: unreadable filter {raw!r}")
+        body = value[1:-1]
+        if quote in body or (quote == '"' and "\\" in body):
+            raise CoverError(f"nextest.toml line {number}: unreadable filter {raw!r}")
+        filters.append(body)
+        seen += 1
+    if in_override and seen != 1:
+        raise CoverError(f"the last nextest.toml override has {seen} filters, expected 1")
+    if not filters:
+        raise CoverError("nextest.toml declares no override filter: the reader no longer matches the file")
+    return filters
+
+
+def filter_errors(counts: dict[str, int]) -> list[str]:
+    """Return why the override filters' match `counts` fail, or [] when every one is live."""
+    errors: list[str] = []
+    for filt in sorted(counts):
+        if filt in PLATFORM_ONLY:
+            if counts[filt] > 0:
+                errors.append(f"PLATFORM_ONLY filter {filt!r} selects {counts[filt]} archived tests: drop it from PLATFORM_ONLY")
+        elif counts[filt] == 0:
+            errors.append(f"nextest.toml override {filt!r} selects no archived test: it names a binary, module or test that no longer exists")
+    for filt in sorted(PLATFORM_ONLY - set(counts)):
+        errors.append(f"PLATFORM_ONLY filter {filt!r} is no override in nextest.toml: drop the stale entry")
+    return errors
+
+
+def group_errors(plan: dict[int, tuple[str, str]], shards: dict[int, list[str]]) -> list[str]:
+    """Return every plan filter (one shard group) whose shards together select no test."""
+    totals: dict[str, int] = {}
+    for shard, (filt, _) in plan.items():
+        totals[filt] = totals.get(filt, 0) + len(shards.get(shard, []))
+    return [f"the shard group {filt!r} selects no archived test" for filt, total in totals.items() if total == 0]
+
+
 def _list(extra: list[str]) -> list[str]:
     cmd = ["cargo", "nextest", "list", *ARCHIVE_ARGS, "--message-format", "json", *extra]
     proc = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=LIST_TIMEOUT_S)
@@ -117,14 +191,20 @@ def _list(extra: list[str]) -> list[str]:
 def cover(plan_text: str) -> int:
     """Fail unless the plan's selections partition the archive's test set exactly."""
     plan = parse_plan(plan_text)
+    with open(NEXTEST_CONFIG, encoding="utf-8") as handle:
+        filters = list(dict.fromkeys(override_filters(handle.read())))
     full = _list([])
+    with open(TEST_IDS_FILE, "w", encoding="utf-8") as handle:
+        handle.writelines(f"{test}\n" for test in sorted(full))
     shards = {k: _list(["-E", filt, "--partition", part]) for k, (filt, part) in plan.items()}
-    errors = partition_errors(full, shards, len(plan))
+    counts = {filt: len(_list(["-E", filt])) for filt in filters}
+    errors = partition_errors(full, shards, len(plan)) + group_errors(plan, shards) + filter_errors(counts)
     for err in errors:
         print(f"e2e shard cover: {err}", file=sys.stderr)
     if errors:
         return 1
     print(f"e2e shard cover: {len(plan)} shards partition all {len(full)} archived tests exactly once.")
+    print(f"e2e shard cover: all {len(filters)} nextest.toml override filters select archived tests.")
     return 0
 
 
