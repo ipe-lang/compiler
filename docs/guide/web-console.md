@@ -39,7 +39,7 @@ the `Ipe.Web.Console` builders.
 The callback is a `Task` returning `Maybe Identity` — a real app reads a session
 from the request; returning `Nothing` denies with a 403 and an audit log:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/web/console-auth/src/Main.ipe
 identify : Request -> Task Error (Maybe Identity)
 identify _req =
     Task.succeed
@@ -53,12 +53,15 @@ identify _req =
 
 It is wired through the optional `consoleAuth` field on `Web.tea`:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/web/console-auth/src/Main.ipe
 main =
     Web.tea
-        { init = init, update = update, view = view
+        { init = init
+        , update = update
+        , view = view
         , subscriptions = subscriptions
-        , routes = [], notFound = Ignored
+        , routes = []
+        , notFound = Ignored
         , consoleAuth = identify
         }
 ```

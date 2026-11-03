@@ -26,7 +26,7 @@ effect step.
 
 Written with `Task.andThen`, a three-step chain drifts to the right in a pyramid:
 
-```ipe
+```ipe ipe:skip the right-drifting Task.andThen pyramid the do block below replaces; illustrative, not a standalone program
 main =
     let version = "1.4.0" in
     Io.println ("Preflight for v" ++ version)
@@ -40,6 +40,12 @@ The same logic as a `do` block reads straight down —
 from [`examples/shapes/script/release-preflight`](https://github.com/ipe-lang/compiler/tree/main/examples/shapes/script/release-preflight):
 
 ```ipe
+import Ipe.Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.String as String
+import Ipe.Task as Task
+
+
 main =
     let version = "1.4.0" in
     do
@@ -50,6 +56,26 @@ main =
             , checkGitClean
             ]
         Io.println (report version results)
+
+
+checkBuild : Task Error String
+checkBuild =
+    Task.succeed "build     ok  — artifact present"
+
+
+checkChangelog : Task Error String
+checkChangelog =
+    Task.succeed "changelog ok  — entry for this version"
+
+
+checkGitClean : Task Error String
+checkGitClean =
+    Task.succeed "git       ok  — working tree clean"
+
+
+report : String -> List String -> String
+report version results =
+    "v" ++ version ++ " preflight passed:\n  " ++ String.join "\n  " results
 ```
 
 The two are the *same* program — `do` desugars to that `andThen` chain. The block
@@ -60,7 +86,7 @@ form makes the order of effects, and each binding, plain.
 When a task's result is `()` and you don't use it, run it as a **bare line** —
 never bind it to `_`:
 
-```ipe ipe:skip
+```ipe ipe:skip the two forms of a discarded bind contrasted side by side; not a standalone program
 _ <- Io.println "starting"    -- avoid: the discard is noise
 Io.println "starting"         -- prefer: a bare line already discards
 ```

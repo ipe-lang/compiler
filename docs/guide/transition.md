@@ -25,7 +25,7 @@ The example under
 [`examples/shapes/script/transition-shorthand`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/transition-shorthand/src/Main.ipe)
 builds a fade — opacity, 200ms, a 50ms delay, ease-in-out — and renders it.
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/transition-shorthand/src/Main.ipe
 fade : List Step
 fade =
     [ Transition.property "opacity"
@@ -37,7 +37,7 @@ fade =
 
 Running it (`ipe dev run`):
 
-```
+```text
 transition (shorthand value):
   opacity 200ms ease-in-out 50ms
 ```

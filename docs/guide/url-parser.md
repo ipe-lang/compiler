@@ -35,10 +35,10 @@ Each route is one `parse` against a pure-data pattern; the first to match wins,
 and its captures build the `Page`. `slash` sequences path segments; `int` and
 `string` capture; `withQuery` attaches a query key:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/url-router/src/Main.ipe
+page : Url.Url -> Page
 page url =
     case Parser.parse (Parser.slash (Parser.s "blog") Parser.int) url of
-
         Just caps ->
             BlogPost (Maybe.withDefault 0 (Parser.firstInt caps))
 
@@ -48,10 +48,10 @@ page url =
 
 The search route captures a query value, read back with `firstQuery`:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/url-router/src/Main.ipe
+pageSearch : Url.Url -> Page
 pageSearch url =
     case Parser.parse (Parser.withQuery (Parser.s "search") (Parser.query "q")) url of
-
         Just caps ->
             Search (Parser.firstQuery caps)
 
@@ -62,10 +62,10 @@ pageSearch url =
 Dispatch parses the raw path into a validated `Url` first — routing never sees a
 raw string — then matches it:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/url-router/src/Main.ipe
+dispatch : String -> String
 dispatch rawPath =
     case Url.fromString ("https://app.example.com" ++ rawPath) of
-
         Ok url ->
             rawPath ++ "  ->  " ++ render (page url)
 
@@ -76,7 +76,7 @@ dispatch rawPath =
 Running it (`ipe dev run`) matches each path to its typed page, with the unmatched one
 falling through to `NotFound`:
 
-```
+```text
 Routing:
   /  ->  Home
   /blog/42  ->  BlogPost 42
