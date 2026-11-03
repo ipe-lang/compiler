@@ -1248,7 +1248,8 @@ const STDIN_READER_THREAD: &str = "ipe-stdin-reader";
 /// `tokio` program (web/server, no terminal shape) never compiles this entry.
 ///
 /// A `--debugger` build takes the program's session `codec` too: the recorder
-/// dumps the trace and typed log through it on exit, and with
+/// dumps the trace and typed log through it when the run ends, normally or
+/// through `System.exit`, and with
 /// `IPE_DEBUGGER_REPLAY` set the loop never starts — the named log is replayed
 /// instead (see [`crate::debugger::session_log`]).
 #[cfg(all(not(target_arch = "wasm32"), feature = "tui"))]
@@ -1332,11 +1333,11 @@ where
 
         let (mut model, cmd0) = init(());
         // Time-travel recorder above the sink: cfg-gated, records each accepted
-        // `(msg, model)` after `update`. Bounded ring (`DEFAULT_HISTORY_CAP`);
-        // zero code when the feature is off.
+        // `(msg, model)` after `update` while `IPE_DEBUGGER_RECORD` names a
+        // destination. Bounded ring (`DEFAULT_HISTORY_CAP`); zero code when the
+        // feature is off.
         #[cfg(feature = "debugger")]
-        let mut recorder =
-            crate::debugger::RecordBuffer::new(model.clone(), crate::debugger::DEFAULT_HISTORY_CAP);
+        let recorder = crate::debugger::record_sink::start(model.clone(), codec);
         cli_run_cmd_tracked(cmd0, &tx, Some(&outstanding));
         let mut submgr = SubManager::new(tx.clone());
         submgr.update(subscriptions(model.clone()));
@@ -1361,15 +1362,24 @@ where
         // pre-effect model and duplicate the frame. An effect-free `init`
         // (`Cmd.none`) has nothing to settle, so its initial model renders now
         // (the `lines: 0` frame the separator fixture pins).
-        // A slot another driver holds leaves no exit path to end an open
-        // line, so the decision then ends every frame in `\n`.
-        let exit_close = crate::system::register_exit_hook(crate::tui::close_open_line_on_exit)
-            .map_or(crate::terminal_access::ExitClose::Unavailable, |()| {
-                crate::terminal_access::ExitClose::Registered
-            });
+        // A line-close stage another driver holds leaves no exit path to end
+        // an open line, so the decision then ends every frame in `\n`.
+        let line_ticket = crate::system::pre_exit::register(
+            crate::system::pre_exit::Registration::LineClose(crate::tui::close_open_line_on_exit),
+        )
+        .ok();
+        let exit_close = if line_ticket.is_some() {
+            crate::terminal_access::ExitClose::Registered
+        } else {
+            crate::terminal_access::ExitClose::Unavailable
+        };
         let surface =
             crate::terminal_access::decide_line(&crate::terminal_access::probe_line(exit_close));
-        let mut line_state = crate::tui::LineState::for_exit_hook();
+        let mut line_state = if line_ticket.is_some() {
+            crate::tui::LineState::for_exit_stage()
+        } else {
+            crate::tui::LineState::new()
+        };
         if outstanding.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             let frame = crate::tui::write_frame(&view(model.clone()), &surface, &mut line_state);
             line_state.emit(&mut std::io::stdout().lock(), &frame);
@@ -1427,11 +1437,13 @@ where
             let mut cmds = Vec::with_capacity(msgs.len());
             for msg in msgs {
                 #[cfg(feature = "debugger")]
-                let msg_for_recorder = msg.clone();
+                let msg_for_recorder = recorder.as_ref().map(|_| msg.clone());
                 let (next, cmd) = update(msg, model);
                 model = next;
                 #[cfg(feature = "debugger")]
-                recorder.record(msg_for_recorder, model.clone(), &update);
+                if let (Some(recording), Some(msg)) = (&recorder, msg_for_recorder) {
+                    recording.record(msg, model.clone(), &update);
+                }
                 cmds.push(cmd);
                 submgr.update(subscriptions(model.clone()));
             }
@@ -1449,11 +1461,15 @@ where
         submgr.stop_all();
         let close = line_state.close();
         line_state.emit(&mut std::io::stdout().lock(), close);
+        if let Some(ticket) = line_ticket {
+            ticket.retire();
+        }
         // Dump the recorded session (plain trace + typed log) to the
-        // `IPE_DEBUGGER_RECORD` destination, a no-op when that env var is unset.
-        // The recorder ring already bounds the log.
+        // `IPE_DEBUGGER_RECORD` destination.
         #[cfg(feature = "debugger")]
-        crate::debugger::record_sink::dump_session(&recorder, &update, &codec);
+        if let Some(recording) = recorder {
+            recording.finish();
+        }
         ok_res(())
     })
 }
@@ -1726,8 +1742,7 @@ where
         // no view surface, so no appearance hot-swap applies — the recorder is
         // for replay/inspection only.
         #[cfg(feature = "debugger")]
-        let mut recorder =
-            crate::debugger::RecordBuffer::new(model.clone(), crate::debugger::DEFAULT_HISTORY_CAP);
+        let recorder = crate::debugger::record_sink::start(model.clone(), codec);
         worker_run_cmd(cmd0, &tx, &outstanding);
         let mut subs = SubRuntime::new(tx.clone());
         subs.reconcile(subscriptions(model.clone()));
@@ -1737,7 +1752,9 @@ where
         // event can ever arrive — terminate rather than block forever on `recv`.
         if live_subs == 0 && outstanding.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             #[cfg(feature = "debugger")]
-            crate::debugger::record_sink::dump_session(&recorder, &update, &codec);
+            if let Some(recording) = recorder {
+                recording.finish();
+            }
             return ok_res(());
         }
 
@@ -1750,11 +1767,13 @@ where
                 }
             };
             #[cfg(feature = "debugger")]
-            let msg_for_recorder = msg.clone();
+            let msg_for_recorder = recorder.as_ref().map(|_| msg.clone());
             let (next, cmd) = update(msg, model);
             model = next;
             #[cfg(feature = "debugger")]
-            recorder.record(msg_for_recorder, model.clone(), &update);
+            if let (Some(recording), Some(msg)) = (&recorder, msg_for_recorder) {
+                recording.record(msg, model.clone(), &update);
+            }
             worker_run_cmd(cmd, &tx, &outstanding);
             subs.reconcile(subscriptions(model.clone()));
             live_subs = subs.live();
@@ -1767,10 +1786,12 @@ where
         }
         drop(subs);
         // Dump the recorded session (plain trace + typed log) to the
-        // `IPE_DEBUGGER_RECORD` destination, a no-op when that env var is unset.
-        // A worker has no view surface, so this dump is its only debugger output.
+        // `IPE_DEBUGGER_RECORD` destination. A worker has no view surface, so
+        // this dump is its only debugger output.
         #[cfg(feature = "debugger")]
-        crate::debugger::record_sink::dump_session(&recorder, &update, &codec);
+        if let Some(recording) = recorder {
+            recording.finish();
+        }
         ok_res(())
     })
 }

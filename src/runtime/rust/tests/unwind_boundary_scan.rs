@@ -149,12 +149,12 @@ const CATCH_SITES: &[CatchSite] = &[
     },
     CatchSite {
         file: "system.rs",
-        function: "run_pre_exit_stages",
+        function: "run_guarded",
         shape: "catch_unwind",
-        count: 3,
+        count: 1,
         route: Route::NoIpeCode(
-            "the exit-time teardown (terminal-restore hook, exporter flush, console stop); \
-             the process ends either way",
+            "the exit-time stages (terminal restore, line close, session dump, exporter \
+             flush, console stop); the process ends either way",
         ),
     },
     CatchSite {
