@@ -3326,7 +3326,7 @@ async fn listener_routes(routes: Vec<ParsedRoute>) -> Result<axum::Router, Serve
 /// The listener's router over `routes`, parsed, conflict-checked and
 /// assembled exactly as [`server_listen`] does before it binds; `None` when
 /// the listen refuses them.
-#[cfg(test)]
+#[cfg(all(test, feature = "web"))]
 pub(crate) async fn listen_router(routes: Vec<ServerRoute>) -> Option<axum::Router> {
     let routes = parse_routes(routes).ok()?;
     if endpoint_conflict(&routes)
