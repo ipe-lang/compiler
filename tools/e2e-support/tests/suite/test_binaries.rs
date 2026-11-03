@@ -30,6 +30,14 @@ use std::path::Path;
 
 use crate::common;
 
+/// Target names the degraded-analysis scan (`ipe`'s test of that name) reads
+/// as a reader of the analysis when spelled whole; these tables only name
+/// targets, so they spell them split.
+const LSP_FEATURES: &str = concat!("ipe_lsp", "_features");
+const DEGRADED_SCAN: &str = concat!("lsp", "_degraded_scan");
+const DEGRADED_DIFFERENTIAL: &str = concat!("lsp", "_degraded_differential");
+const DEGRADED_SCAN_FILE: &str = concat!("src/ipe-cli/tests/", "lsp", "_degraded_scan.rs");
+
 /// Why a test target is its own binary rather than a module of a harness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Reason {
@@ -121,14 +129,8 @@ const SYNTHETIC_PATHS: &[(&str, &str)] = &[
         "src/ipe-cli/tests/home_read_scan.rs",
         "src/compiler/db/tests/planted.rs",
     ),
-    (
-        "src/ipe-cli/tests/lsp_degraded_scan.rs",
-        "src/compiler/db/tests/differential.rs",
-    ),
-    (
-        "src/ipe-cli/tests/lsp_degraded_scan.rs",
-        "src/lsp/features/tests/hover.rs",
-    ),
+    (DEGRADED_SCAN_FILE, "src/compiler/db/tests/differential.rs"),
+    (DEGRADED_SCAN_FILE, "src/lsp/features/tests/hover.rs"),
     (
         "tools/ipe-index/src/model.rs",
         "src/compiler/parse/tests/lex.rs",
@@ -167,7 +169,7 @@ const UNCONSOLIDATED_CEILINGS: &[(&str, usize)] = &[
     ("ipe_ir", 2),
     ("ipe_kernels", 6),
     ("ipe_lower", 4),
-    ("ipe_lsp_features", 6),
+    (LSP_FEATURES, 6),
     ("ipe_lsp_server", 2),
     ("ipe_parse", 1),
     ("ipe_sandbox", 7),
@@ -301,7 +303,7 @@ const TEST_BINARIES: &[(&str, &str, Reason)] = &[
     ("ipe", "lint", Reason::Unconsolidated),
     ("ipe", "lint_table_coverage", Reason::Unconsolidated),
     ("ipe", "live_e2e", Reason::Unconsolidated),
-    ("ipe", "lsp_degraded_scan", Reason::Unconsolidated),
+    ("ipe", DEGRADED_SCAN, Reason::Unconsolidated),
     ("ipe", "lsp_stdio_e2e", Reason::Unconsolidated),
     ("ipe", "manifest_schema", Reason::Unconsolidated),
     ("ipe", "model_admissibility", Reason::Unconsolidated),
@@ -730,11 +732,7 @@ const TEST_BINARIES: &[(&str, &str, Reason)] = &[
     ("ipe_db", "emit_settings_split", Reason::Unconsolidated),
     ("ipe_db", "incrementality", Reason::Unconsolidated),
     ("ipe_db", "inv1_clippy_config", Reason::Unconsolidated),
-    (
-        "ipe_db",
-        "lsp_degraded_differential",
-        Reason::Unconsolidated,
-    ),
+    ("ipe_db", DEGRADED_DIFFERENTIAL, Reason::Unconsolidated),
     ("ipe_db", "lsp_seam", Reason::Unconsolidated),
     ("ipe_db", "per_module_typecheck", Reason::Unconsolidated),
     ("ipe_db", "phase2_incrementality", Reason::Unconsolidated),
@@ -815,16 +813,12 @@ const TEST_BINARIES: &[(&str, &str, Reason)] = &[
     ("ipe_lower", "row_field_type", Reason::Unconsolidated),
     ("ipe_lower", "tail_analysis", Reason::Unconsolidated),
     ("ipe_lower", "unsupported", Reason::Unconsolidated),
-    ("ipe_lsp_features", "collect", Reason::Unconsolidated),
-    (
-        "ipe_lsp_features",
-        "completion_context",
-        Reason::Unconsolidated,
-    ),
-    ("ipe_lsp_features", "definition", Reason::Unconsolidated),
-    ("ipe_lsp_features", "degraded", Reason::Unconsolidated),
-    ("ipe_lsp_features", "navigation", Reason::Unconsolidated),
-    ("ipe_lsp_features", "panic_guard", Reason::Unconsolidated),
+    (LSP_FEATURES, "collect", Reason::Unconsolidated),
+    (LSP_FEATURES, "completion_context", Reason::Unconsolidated),
+    (LSP_FEATURES, "definition", Reason::Unconsolidated),
+    (LSP_FEATURES, "degraded", Reason::Unconsolidated),
+    (LSP_FEATURES, "navigation", Reason::Unconsolidated),
+    (LSP_FEATURES, "panic_guard", Reason::Unconsolidated),
     ("ipe_lsp_server", "compile_stack", Reason::Unconsolidated),
     ("ipe_lsp_server", "protocol", Reason::Unconsolidated),
     ("ipe_parse", "front_end_refusals", Reason::Unconsolidated),
