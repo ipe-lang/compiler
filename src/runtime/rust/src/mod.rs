@@ -366,6 +366,11 @@ pub mod encoding;
 #[cfg(feature = "encoding")]
 pub use encoding::*;
 
+// The one request-to-asset route and media-type table every client-bundle host
+// answers through.
+#[cfg(feature = "encoding")]
+pub mod bundle_route;
+
 // `Ipe.Bytes` — distinct `Vec<u8>` byte buffer. Behind `encoding` (its hex /
 // base64 kernels use those crates; the std-only half moves with it — module-
 // granular gating, matched by the emitted `mod.rs` append).

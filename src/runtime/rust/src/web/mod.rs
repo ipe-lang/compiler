@@ -4959,29 +4959,13 @@ fn noise_candidate(
     Some((candidate, mime))
 }
 
-/// Content type for a browser-noise file served from the static root. The
-/// extensions here mirror what browsers actually probe at the origin root.
+/// Content type for a browser-noise file served from the static root: the
+/// one bundle media-type table ([`crate::bundle_route::MediaType`]), so a file
+/// the static root answers and the same file in a client bundle carry one type.
 /// Anything unknown falls back to octet-stream rather than guessing.
 #[cfg(feature = "web")]
 fn static_noise_mime(ext: &str) -> &'static str {
-    match ext {
-        "ico" => "image/x-icon",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "svg" => "image/svg+xml",
-        "webp" => "image/webp",
-        "css" => "text/css; charset=utf-8",
-        "js" => "application/javascript; charset=utf-8",
-        "map" | "json" => "application/json",
-        "txt" => "text/plain; charset=utf-8",
-        "xml" => "application/xml",
-        "woff" => "font/woff",
-        "woff2" => "font/woff2",
-        "ttf" => "font/ttf",
-        "wasm" => "application/wasm",
-        _ => "application/octet-stream",
-    }
+    crate::bundle_route::MediaType::of_extension(ext).header_value()
 }
 
 /// Where an SSE reconnect's `?path=` lands in this app's route table.
@@ -10912,10 +10896,7 @@ mod static_noise_mime_tests {
         assert_eq!(static_noise_mime("ico"), "image/x-icon");
         assert_eq!(static_noise_mime("png"), "image/png");
         assert_eq!(static_noise_mime("css"), "text/css; charset=utf-8");
-        assert_eq!(
-            static_noise_mime("js"),
-            "application/javascript; charset=utf-8"
-        );
+        assert_eq!(static_noise_mime("js"), "text/javascript; charset=utf-8");
         assert_eq!(static_noise_mime("json"), "application/json");
         assert_eq!(static_noise_mime("woff2"), "font/woff2");
     }
@@ -10923,6 +10904,34 @@ mod static_noise_mime_tests {
     #[test]
     fn wasm_serves_as_application_wasm() {
         assert_eq!(static_noise_mime("wasm"), "application/wasm");
+    }
+
+    #[test]
+    fn static_noise_mime_agrees_with_media_type() {
+        use crate::bundle_route::MediaType;
+        for (ext, media) in MediaType::BY_EXTENSION {
+            assert_eq!(static_noise_mime(ext), media.header_value(), "{ext}");
+        }
+        for (ext, kept) in [
+            ("ico", "image/x-icon"),
+            ("png", "image/png"),
+            ("jpg", "image/jpeg"),
+            ("jpeg", "image/jpeg"),
+            ("gif", "image/gif"),
+            ("svg", "image/svg+xml"),
+            ("webp", "image/webp"),
+            ("css", "text/css; charset=utf-8"),
+            ("map", "application/json"),
+            ("json", "application/json"),
+            ("txt", "text/plain; charset=utf-8"),
+            ("xml", "application/xml"),
+            ("woff", "font/woff"),
+            ("woff2", "font/woff2"),
+            ("ttf", "font/ttf"),
+            ("wasm", "application/wasm"),
+        ] {
+            assert_eq!(static_noise_mime(ext), kept, "{ext}");
+        }
     }
 
     #[test]
