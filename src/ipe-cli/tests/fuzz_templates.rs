@@ -88,15 +88,23 @@ main =
     println (String.fromInt (1 + @addend@))
 ";
 
-/// A well-typed program that divides by zero at run time.
-const DIVIDES_BY_ZERO: &str = r"module Main exposing (main)
+/// A well-typed program whose integer division overflows at run time
+/// (`minInt // -1`), ending in a typed `IntOverflow` error.
+const TRIPS_AT_RUN_TIME: &str = r"module Main exposing (main)
 
 import Ipe.Io as Io
 import Ipe.String as String
+import Ipe.Task as Task
+
+
+minInt : Int
+minInt =
+    (-9223372036854775807) - 1
 
 
 main =
-    Io.println (String.fromInt (42 // 0))
+    Task.succeed ()
+        |> Task.andThen (\_ -> Io.println (String.fromInt (minInt // (-1))))
 ";
 
 /// Parse `main` as a one-file well-typed template.
@@ -631,15 +639,15 @@ fn every_well_typed_template_builds_and_runs() {
 }
 
 #[test]
-fn the_detector_flags_division_by_zero() {
+fn the_detector_flags_a_runtime_trip() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let template = well_typed(DIVIDES_BY_ZERO);
+    let template = well_typed(TRIPS_AT_RUN_TIME);
     let template = template.expect("template is Ok");
     let built = harness::accept_well_typed(&template, FillPlan::Min, &runtime());
     let built = built.expect("built is Ok");
-    let judged = harness::build_and_run(&built, "fuzz_divides_by_zero");
+    let judged = harness::build_and_run(&built, "fuzz_trips_at_run_time");
     assert!(
         matches!(
             judged,

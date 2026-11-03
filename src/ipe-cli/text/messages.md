@@ -2523,9 +2523,13 @@ wasm-bindgen failed (exit {code}); ensure wasm-bindgen-cli {version} is installe
 wasm bundle ready at {www}/
 bundle size: {size} ({wasm})
 
-## wasi-artifact-missing
+## wasm-artifact-missing
 
-the wasm32-wasip1 build reported no `.wasm` artifact for {dir} — cargo's JSON message stream carried no `compiler-artifact` naming the module
+the {triple} build reported no `.wasm` artifact for {dir} — cargo's JSON message stream carried no `compiler-artifact` naming the module
+
+## wasm-artifact-ambiguous
+
+the {triple} build reported more than one `.wasm` artifact for {dir} — cargo's JSON message stream named two modules in the build's artifact directory, so none is taken
 
 ## session-no-recordable
 

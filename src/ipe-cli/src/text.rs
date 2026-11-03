@@ -1785,8 +1785,10 @@ messages! {
     wasm_bindgen_failed(code, version) = "wasm-bindgen-failed";
     /// A `web client` bundle was published.
     wasm_bundle_ready(www, size, wasm) = "wasm-bundle-ready";
-    /// The `wasm32-wasip1` build reported no `.wasm` artifact.
-    wasi_artifact_missing(dir) = "wasi-artifact-missing";
+    /// A wasm build's JSON record named no `.wasm` artifact.
+    wasm_artifact_missing(triple, dir) = "wasm-artifact-missing";
+    /// A wasm build's JSON record named two `.wasm` artifacts.
+    wasm_artifact_ambiguous(triple, dir) = "wasm-artifact-ambiguous";
     /// `ipe dev run --record`/`--replay` on a program with no recordable session.
     session_no_recordable(flag, name) = "session-no-recordable";
     /// `ipe dev run --record`/`--replay` with `--target wasi`.
