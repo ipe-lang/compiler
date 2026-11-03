@@ -564,9 +564,6 @@ repeat : Int -> String -> String
 
 `repeat n s` — concatenate `s` with itself `n` times.
 
-The result is bounded at a 64 MiB ceiling. When `n * length s` would exceed it,
-the count is clamped to the whole copies that fit, so the output is always a
-genuine prefix of the requested repetition — never silently collapsed to "".
 A non-positive `n`, or an empty `s`, yields "".
 
 ```ipe
@@ -574,6 +571,10 @@ repeat 3 "ab" --> "ababab"
 repeat 0 "abc" --> ""
 repeat 1 "x" --> "x"
 ```
+
+A result of more than 67108864 bytes (64 MiB of UTF-8) is refused before
+anything is built, never truncated: the program ends in a typed `LimitExceeded`
+error.
 
 ## `padLeft`
 
@@ -589,6 +590,9 @@ padLeft 3 ' ' "hi" --> " hi"
 padLeft 2 '-' "abc" --> "abc"
 ```
 
+A width of more than 16000000 characters is refused before anything is built:
+the program ends in a typed `LimitExceeded` error.
+
 ## `padRight`
 
 ```ipe
@@ -601,6 +605,9 @@ padRight : Int -> Char -> String -> String
 padRight 5 '.' "hi" --> "hi..."
 padRight 3 ' ' "abc" --> "abc"
 ```
+
+A width of more than 16000000 characters is refused before anything is built:
+the program ends in a typed `LimitExceeded` error.
 
 ## `left`
 
@@ -669,6 +676,9 @@ pad : Int -> Char -> String -> String
 pad 7 '.' "hello" --> ".hello."
 pad 3 ' ' "hello" --> "hello"
 ```
+
+A width of more than 16000000 characters is refused before anything is built:
+the program ends in a typed `LimitExceeded` error.
 
 ## `indexes`
 
