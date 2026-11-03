@@ -26,7 +26,7 @@ fn cross_module_chained_msg_slot_emits_generic_helpers() -> Result<(), String> {
     let root = repo_root();
     let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_cross_module_chained_msg_slot_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     crate::support::build_golden(&golden_dir, &out, &runtime)
@@ -52,7 +52,7 @@ fn cross_module_chained_msg_slot_seal_builds() {
     let root = repo_root();
     let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_cross_module_chained_msg_slot_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);

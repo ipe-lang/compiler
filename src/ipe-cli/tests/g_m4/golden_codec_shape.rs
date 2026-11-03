@@ -41,7 +41,7 @@ fn assert_runs_and_matches_oracle(name: &str) {
     let root = repo_root();
     let dir = golden_dir(&root, name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&dir, &out, &runtime);
@@ -59,7 +59,7 @@ fn codec_shape_accepts_and_emits() {
     let root = repo_root();
     let golden_project = golden_dir(&root, "codec_shape");
     let out = crate::support::scratch_root().join("ipec_codec_shape_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -88,7 +88,7 @@ fn codec_timestamp_role_rejects_raw_int() {
     let root = repo_root();
     let golden_project = golden_dir(&root, "codec_timestamp_role_reject");
     let out = crate::support::scratch_root().join("ipec_codec_timestamp_role_reject_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);

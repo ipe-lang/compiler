@@ -33,7 +33,7 @@ fn immutable_update_drops_immutable_column_from_set() {
     let root = repo_root();
     let entry = fixture_project(&root);
     let out = crate::support::scratch_root().join("ipec_db_store_immutable_update_seal_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&entry, &out, &runtime);
@@ -86,7 +86,7 @@ fn immutable_update_seal_builds() {
     let root = repo_root();
     let entry = fixture_project(&root);
     let out = crate::support::scratch_root().join("ipec_db_store_immutable_update_seal_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&entry, &out, &runtime);

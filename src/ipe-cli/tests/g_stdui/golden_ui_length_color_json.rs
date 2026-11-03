@@ -47,7 +47,7 @@ fn ui_length_color_and_json_value_render_end_to_end() {
         .join("golden")
         .join("ui_length_color_json");
     let out = crate::support::scratch_root().join("ipec_m7_ui_length_color_json_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

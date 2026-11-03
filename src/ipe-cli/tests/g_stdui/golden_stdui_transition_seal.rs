@@ -64,7 +64,7 @@ main =
 fn build_transition_project(slot: &str) -> (PathBuf, Result<(), ipe::CliError>) {
     let out =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("stdui_transition_seal_{slot}"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     std::fs::create_dir_all(&out).expect("create the scratch output dir");
     let fixture = ipe::RootFixture::main(MAIN_IPE).expect("the inline Main project resolves");
     let emit = out.join("emit");

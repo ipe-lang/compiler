@@ -35,7 +35,7 @@ fn html_element_family_renders_correct_tags() {
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("html_elements");
     let out = crate::support::scratch_root().join("ipec_m7_html_elements_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&dir, &out, &runtime);

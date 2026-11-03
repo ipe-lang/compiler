@@ -21,7 +21,7 @@ fn assert_emits_golden(name: &str) {
     let root = repo_root();
     let dir = golden_dir(&root, name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_emit"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -40,7 +40,7 @@ fn assert_runs_golden(name: &str) {
     let root = repo_root();
     let dir = golden_dir(&root, name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&dir, &out, &runtime);
@@ -69,7 +69,7 @@ fn map_error_binder_unrendered_pin_pulls_in_no_json() {
     let root = repo_root();
     let dir = golden_dir(&root, MAP_ERROR_GOLDEN);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("phantom_map_error_no_json_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());

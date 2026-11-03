@@ -52,7 +52,7 @@ fn try_build(name: &str) -> Result<(), String> {
         return Err(format!("fixture not found: {}", dir.display()));
     }
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_ipec_out"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     crate::support::build_golden(&dir, &out, &runtime).map_err(|e| e.to_string())

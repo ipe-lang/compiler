@@ -24,7 +24,7 @@ fn runtime() -> PathBuf {
 #[allow(clippy::expect_used)] // an unwritable test temp root is a broken setup
 fn fresh_dir(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     fs::create_dir_all(dir.join("src")).expect("create src/");
     dir
 }
@@ -49,7 +49,7 @@ fn write_project(dir: &Path, extra: &str, main: &str) {
 /// An `ipe` rejection, a cargo failure, or a nonzero exit, as a message.
 fn build_and_run(name: &str, dir: &Path) -> Result<String, String> {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_out"));
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     match ipe::build_project(&dir.join("package.ipe"), &out, &runtime()) {
         Ok(()) => {}
         Err(CliError::Pipeline { diag, .. }) => {

@@ -19,7 +19,7 @@ use ipe_ir::Capability;
 #[test]
 fn a_package_that_cannot_lower_surfaces_the_real_diagnostic() -> Result<(), Box<dyn Error>> {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipe_capinfer_bad_entry");
-    let _ = fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     fs::create_dir_all(dir.join("src"))?;
     fs::write(
         dir.join("package.ipe"),
@@ -105,7 +105,7 @@ const NETWORK_CLOCK_WITH_BROKEN_SIBLING: &[(&str, &str)] = &[
 fn scratch_package(tag: &str, files: &[(&str, &str)]) -> Result<PathBuf, Box<dyn Error>> {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("ipe_capinfer_shared_{tag}_{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     fs::create_dir_all(dir.join("src"))?;
     fs::write(dir.join("package.ipe"), MANIFEST)?;
     for (rel, src) in files {

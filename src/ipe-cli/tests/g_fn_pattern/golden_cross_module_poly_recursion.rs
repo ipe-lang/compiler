@@ -51,7 +51,7 @@ fn i201_ipec_accepts_and_emits_clone_bounded_generic() {
     let golden_project = golden_dir(&root);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("i201_cross_module_poly_recursion_ipec_out");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -89,7 +89,7 @@ fn i201_cargo_builds_and_runs() {
     let root = repo_root();
     let golden_project = golden_dir(&root);
     let out = crate::support::scratch_root().join("ipec_i201_cross_module_poly_recursion_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

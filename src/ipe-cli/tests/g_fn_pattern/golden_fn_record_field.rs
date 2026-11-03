@@ -39,7 +39,7 @@ fn dispatch_table_emits_byte_identical_main_rs() {
         .join("golden")
         .join("fn_record_field_dispatch");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fn_record_field_dispatch_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -56,7 +56,7 @@ fn dispatch_table_end_to_end_prints_twenty_six() {
     let root = repo_root();
     let golden = golden_dir(&root);
     let out = crate::support::scratch_root().join("ipec_fn_record_field_dispatch_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden, &out, &runtime);
@@ -71,7 +71,7 @@ fn dispatch_table_end_to_end_prints_twenty_six() {
 fn build_source(name: &str, source: &str) -> Result<(), CliError> {
     let fixture = crate::root_fixture::main(source);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     crate::root_fixture::build(&fixture, &out, &runtime)
 }

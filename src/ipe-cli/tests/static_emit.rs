@@ -56,7 +56,7 @@ fn default_line(manifest: &str) -> String {
 #[test]
 fn static_emit_activates_dlmalloc_and_dynamic_rebuild_restores_baseline() {
     let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("static_emit_shape");
-    let _ = std::fs::remove_dir_all(&scratch);
+    e2e_support::scratch::fresh(&scratch);
     let project = hello_project();
     let out = scratch.join("out");
     let runtime = e2e_support::require_runtime().into_path_buf();
@@ -103,7 +103,7 @@ fn static_emit_activates_dlmalloc_and_dynamic_rebuild_restores_baseline() {
 #[test]
 fn dynamic_build_leaves_user_cargo_config_alone() {
     let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("static_emit_user_config");
-    let _ = std::fs::remove_dir_all(&scratch);
+    e2e_support::scratch::fresh(&scratch);
     let project = hello_project();
     let out = scratch.join("out");
     let runtime = e2e_support::require_runtime().into_path_buf();
@@ -126,7 +126,7 @@ fn dynamic_build_leaves_user_cargo_config_alone() {
 #[test]
 fn static_emit_mimalloc_optin_activates_mimalloc() {
     let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("static_emit_mimalloc");
-    let _ = std::fs::remove_dir_all(&scratch);
+    e2e_support::scratch::fresh(&scratch);
     let project = hello_project();
     let out = scratch.join("out");
     let runtime = e2e_support::require_runtime().into_path_buf();
@@ -164,7 +164,7 @@ fn cli_refusals_are_typed_and_artifact_free() {
     let project_arg = project.path().to_string_lossy().into_owned();
     // A fresh, guaranteed-absent out dir per case; the refusal must not create it.
     let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("cli_refusal_out");
-    let _ = std::fs::remove_dir_all(&scratch);
+    e2e_support::scratch::fresh(&scratch);
     let mut case = 0u32;
     let mut refuse = |args: &[&str], label: &str| -> CliError {
         let out = scratch.join(format!("case_{case}"));
@@ -356,7 +356,7 @@ fn run_subcommand_refuses_like_build() {
 #[test]
 fn package_ipe_rust_stages_parse_and_reject_typos() {
     let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("static_toml_rust");
-    let _ = std::fs::remove_dir_all(&scratch);
+    e2e_support::scratch::fresh(&scratch);
     std::fs::create_dir_all(scratch.join("src")).expect("mk src");
     std::fs::write(
         scratch.join("src").join("Main.ipe"),
@@ -1426,7 +1426,7 @@ fn end_to_end_static_binary_is_static_and_runs() {
         .join("hello-world")
         .join("package.ipe");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("static_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     let plan = dlmalloc_plan();
@@ -1502,7 +1502,7 @@ fn ipe_run_static_builds_and_executes_a_static_binary() {
         .join("non-tea")
         .join("hello-world");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("static_run_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     // The static musl build's dependency tree is not the shared target's: an
     // exclusive private tree.

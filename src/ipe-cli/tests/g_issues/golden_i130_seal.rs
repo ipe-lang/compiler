@@ -45,7 +45,7 @@ fn assert_ipec_gate(fixture: &str, out_suffix: &str, expected: ipe_diagnostics::
     let root = repo_root();
     let golden_dir = root.join("tests").join("golden").join(fixture);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);
@@ -78,7 +78,7 @@ fn c01_enum_capture_fix1() {
     let root = repo_root();
     let golden_dir = root.join("tests").join("golden").join("enum_capture");
     let out = crate::support::scratch_root().join("ipec_i130_enum_capture_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -119,7 +119,7 @@ fn c02_record_capture_fix1() {
     let root = repo_root();
     let golden_dir = root.join("tests").join("golden").join("record_capture");
     let out = crate::support::scratch_root().join("ipec_i130_record_capture_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -161,7 +161,7 @@ fn c13_complex_arg_hoist_t4() {
     let root = repo_root();
     let golden_dir = root.join("tests").join("golden").join("complex_arg_hoist");
     let out = crate::support::scratch_root().join("ipec_i130_complex_arg_hoist_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -208,7 +208,7 @@ fn c14_nested_lambda_noncopy_promoted_accepts() {
         .join("golden")
         .join("nested_lambda_noncopy");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i130_nested_lambda_noncopy_accept");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);
@@ -247,7 +247,7 @@ fn c05_streamwriter_capture_forward() {
         .join("golden")
         .join("streamwriter_capture");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("streamwriter_capture");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);
@@ -285,7 +285,7 @@ fn c06_stream_string_capture_seal() {
         .join("golden")
         .join("stream_string_capture");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("stream_string_capture");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);

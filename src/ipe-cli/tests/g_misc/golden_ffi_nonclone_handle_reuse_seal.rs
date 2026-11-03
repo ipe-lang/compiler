@@ -114,7 +114,7 @@ fn nonclone_handle_reused_fails_closed_before_cargo() {
     );
 
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_nonclone_handle_reuse_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let built = ipe::build_fixture(&fixture, &out, &runtime);
     let Err(err) = built else {
@@ -168,7 +168,7 @@ fn nonclone_handle_threaded_linearly_builds() {
     );
 
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_nonclone_handle_thread_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     match ipe::build_fixture(&fixture, &out, &runtime) {
         Ok(_) => {}

@@ -9,7 +9,6 @@
 //! cargo test -p ipe --test golden_aud14_duplicate_qualifier
 //! ```
 
-use std::fs;
 use std::path::PathBuf;
 
 use ipe::RootFixture;
@@ -52,7 +51,7 @@ import Ipe.Io
     ]);
 
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("aud14_duplicate_qualifier_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let built = ipe::build_fixture(&fixture, &out, &runtime);
     let Err(err) = built else {
@@ -95,7 +94,7 @@ import Ipe.Io
 
     let out =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("aud14_duplicate_qualifier_diamond_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let built = ipe::build_fixture(&fixture, &out, &runtime);
     assert!(

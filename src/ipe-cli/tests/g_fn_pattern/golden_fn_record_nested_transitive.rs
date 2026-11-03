@@ -30,7 +30,7 @@ fn nested_transitive_emits_byte_identical_main_rs() {
         .join("golden")
         .join("fn_record_nested_transitive");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fn_record_nested_transitive_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
@@ -47,7 +47,7 @@ fn nested_transitive_end_to_end_prints_twenty_seven() {
     let root = repo_root();
     let golden = golden_dir(&root);
     let out = crate::support::scratch_root().join("ipec_fn_record_nested_transitive_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden, &out, &runtime);

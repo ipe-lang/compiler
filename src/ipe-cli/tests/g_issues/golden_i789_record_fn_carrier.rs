@@ -36,7 +36,7 @@ fn record_fn_literal_emits_byte_identical() {
     let golden_dir = fixture_dir(&root);
     let golden_project = root.join("tests").join("golden").join("fcf_record_fn");
     let out = crate::support::scratch_root().join("ipec_i789_fcf_record_fn_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);
@@ -59,7 +59,7 @@ fn record_fn_literal_builds_and_runs() {
     let root = repo_root();
     let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_i789_fcf_record_fn_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_dir, &out, &runtime);

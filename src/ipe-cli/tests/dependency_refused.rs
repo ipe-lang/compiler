@@ -63,7 +63,7 @@ fn fresh_dir(tag: &str) -> PathBuf {
         "ipe_dependency_refused_{tag}_{}_{n}",
         std::process::id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     dir
 }
 

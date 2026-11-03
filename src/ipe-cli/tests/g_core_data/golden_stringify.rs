@@ -25,7 +25,7 @@ fn compile_golden(name: &str) -> PathBuf {
     let root = repo_root();
     let golden = golden_dir(&root, name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
@@ -53,7 +53,7 @@ fn tostring_record_and_adt_are_refused() {
     let root = repo_root();
     let golden = golden_dir(&root, "m_tostring_composite");
     let out = crate::support::scratch_root().join("ipec_m_tostring_composite_refused");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let code = match crate::support::build_golden(&golden, &out, &runtime) {
         Err(ipe::CliError::Pipeline { diag, .. }) => Some(diag.code()),
@@ -74,7 +74,7 @@ fn log_info_with_scalar_attrs_compiles() {
     let root = repo_root();
     let golden = golden_dir(&root, "m_log_with");
     let out = crate::support::scratch_root().join("ipec_m_log_with_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
@@ -92,7 +92,7 @@ fn tostring_on_function_is_rejected_at_typecheck() {
     let root = repo_root();
     let golden = golden_dir(&root, "m_tostring_fn_rejected");
     let out = crate::support::scratch_root().join("ipec_m_tostring_fn_rejected_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(

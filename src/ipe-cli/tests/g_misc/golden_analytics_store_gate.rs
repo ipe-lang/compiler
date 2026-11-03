@@ -42,7 +42,7 @@ event-count-login:0";
 fn analytics_store_gate_resolves_and_builds() {
     let root = repo_root();
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("analytics_store_gate_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -66,7 +66,7 @@ fn analytics_store_gate_end_to_end() {
 
     let root = repo_root();
     let out = crate::support::scratch_root().join("ipec_analytics_store_gate_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

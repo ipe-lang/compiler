@@ -51,7 +51,7 @@ fn build_propagates_a_failed_emitted_cargo_build() {
 
     let dir =
         std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipe_build_cargo_fail_e2e");
-    let _ = fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     let bin_dir = dir.join("fakebin");
     let out_dir = dir.join("out");
     let setup = fs::create_dir_all(&bin_dir);

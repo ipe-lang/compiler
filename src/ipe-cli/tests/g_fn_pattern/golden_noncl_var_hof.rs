@@ -35,7 +35,7 @@ fn assert_ipec_ok(fixture: &str, out_suffix: &str) {
     let root = repo_root();
     let golden = root.join("tests").join("golden").join(fixture);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden, &out, &runtime);
@@ -60,7 +60,7 @@ fn a1_noncl_var_task_and_then_compiles() {
         let root = repo_root();
         let golden = root.join("tests").join("golden").join("noncl_var_hof");
         let out = crate::support::scratch_root().join("ipec_i149_noncl_var_hof_e2e");
-        let _ = std::fs::remove_dir_all(&out);
+        e2e_support::scratch::fresh(&out);
 
         let runtime = e2e_support::require_runtime().into_path_buf();
 

@@ -52,7 +52,7 @@ fn i218_clone_relay_ipec_accepts() {
     let golden = golden_dir(&root);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("i218_clone_relay_intermediate_eta_ipec_out");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -84,7 +84,7 @@ fn i218_clone_relay_cargo_builds_and_runs() {
     let root = repo_root();
     let golden = golden_dir(&root);
     let out = crate::support::scratch_root().join("ipec_i218_clone_relay_intermediate_eta_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

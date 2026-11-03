@@ -44,7 +44,7 @@ fn emits_byte_identical_main_rs() {
     let dir = fixture_dir(&root);
     let golden_project = fixture_dir(&root);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("l0105_alias_move_seal_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -66,7 +66,7 @@ fn no_by_value_alias_uses_at_subpattern() {
     let root = repo_root();
     let dir = fixture_dir(&root);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("l0105_alias_move_seal_shapes");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&dir, &out, &runtime);
@@ -109,7 +109,7 @@ fn end_to_end_builds_and_prints_the_concatenation() {
     let root = repo_root();
     let dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_l0105_alias_move_seal_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&dir, &out, &runtime);

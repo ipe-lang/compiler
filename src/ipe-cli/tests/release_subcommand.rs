@@ -151,7 +151,7 @@ fn release_no_project_is_refused_as_no_manifest() {
     let dir = {
         let d =
             std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipe_release_test_empty");
-        let _ = std::fs::remove_dir_all(&d);
+        e2e_support::scratch::fresh(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
     };
@@ -187,7 +187,7 @@ fn release_unsupported_native_target_is_usage_error() {
     let dir = {
         let d = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
             .join("ipe_release_test_bad_triple");
-        let _ = std::fs::remove_dir_all(&d);
+        e2e_support::scratch::fresh(&d);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(
             d.join("package.ipe"),
@@ -280,7 +280,7 @@ main =
 fn release_env_wasm_is_refused_end_to_end() {
     const NAME: &str = "release_env_wasm_refused";
     let root = support::scratch_root().join(NAME);
-    let _ = std::fs::remove_dir_all(&root);
+    e2e_support::scratch::fresh(&root);
     support::expect_scratch_step(NAME, std::fs::create_dir_all(root.join("src")));
     support::expect_scratch_step(
         NAME,
@@ -322,7 +322,7 @@ fn release_env_wasm_is_refused_end_to_end() {
 /// written through the scratch steps of test `name`.
 fn web_project(name: &str, ships: &str) -> std::path::PathBuf {
     let root = support::scratch_root().join(name);
-    let _ = std::fs::remove_dir_all(&root);
+    e2e_support::scratch::fresh(&root);
     support::expect_scratch_step(name, std::fs::create_dir_all(root.join("src")));
     let manifest = if ships.is_empty() {
         support::package_ipe(name)

@@ -39,7 +39,7 @@ fn i191_ipec_accepts_and_hoists_capture_clone() {
     let root = repo_root();
     let entry = project_path(&root);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i191_input_arc_capture_ipec_out");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -98,7 +98,7 @@ fn i191_cargo_builds_and_runs() {
     let root = repo_root();
     let entry = project_path(&root);
     let out = crate::support::scratch_root().join("ipec_i191_input_arc_capture_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

@@ -18,7 +18,7 @@ use ipe_ir::Capability;
 fn scratch_project(name: &str, main_src: &str) -> Result<std::path::PathBuf, Box<dyn Error>> {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("ipe_unsafe_ack_{name}"));
-    let _ = fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     fs::create_dir_all(dir.join("src"))?;
     fs::write(
         dir.join("package.ipe"),

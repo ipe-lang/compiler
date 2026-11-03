@@ -46,7 +46,7 @@ fn emits_byte_identical_main_rs() {
     let dir = example_dir(&root);
     let golden_project = root.join("tests").join("golden").join(NAME);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{NAME}_emit"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -68,7 +68,7 @@ fn end_to_end_builds_and_prints_one_four_five() {
     let root = repo_root();
     let dir = example_dir(&root);
     let out = crate::support::scratch_root().join(format!("{NAME}_e2e"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&dir, &out, &runtime);

@@ -484,7 +484,7 @@ fn emit_bounds_program(slug: &str) -> Option<PathBuf> {
     let fixture = fixture.ok()?;
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("markdown_bounds_{slug}_{pid}_{uid}_out"));
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let built = ipe::build_fixture(&fixture, &out, &runtime);
     assert!(
         built.is_ok(),

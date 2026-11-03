@@ -107,7 +107,7 @@ const BOUNDS: e2e_support::BoundedRun = e2e_support::BoundedRun {
 fn scratch(test_name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("emit_settings_{test_name}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     dir
 }
 

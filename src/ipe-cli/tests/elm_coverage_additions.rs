@@ -41,7 +41,7 @@ fn manifest() -> PathBuf {
 #[test]
 fn project_builds_and_emits_all_three_surfaces() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("elm_coverage_additions");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let res = ipe::build_project(&manifest(), &out, &runtime());
     assert!(
@@ -83,7 +83,7 @@ fn e2e_runs_and_prints_deterministic_line() {
         return;
     }
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("elm_coverage_additions_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let res = ipe::build_project(&manifest(), &out, &runtime());
     assert!(res.is_ok(), "build must succeed: {:?}", res.err());

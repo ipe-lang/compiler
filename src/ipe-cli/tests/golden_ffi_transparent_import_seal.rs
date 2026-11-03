@@ -134,7 +134,7 @@ fn ffi_fixture(main_ipe: &str) -> RootFixture {
 /// A fresh scratch directory `name` for files that sit outside the project.
 fn scratch(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     dir
 }
 
@@ -226,7 +226,7 @@ fn transparent_import_emits_the_conversion_seam() {
 
     let fixture = ffi_fixture(MAIN_IPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_transparent_import_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!("transparent-import fixture must build, got: {err}")
@@ -278,7 +278,7 @@ fn transparent_import_emitted_crate_builds_and_runs() {
 
     let fixture = ffi_fixture(MAIN_IPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_transparent_import_e2e_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!("transparent-import fixture must build, got: {err}")
     }
@@ -331,7 +331,7 @@ fn build_show_transparent() -> (RootFixture, PathBuf) {
         fs::read_to_string(&source).unwrap_or_else(|e| panic!("read {}: {e}", source.display()));
     let fixture = ffi_fixture(&main);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("show_transparent_foreign_out");
-    let _ = fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!("showing a transparent union must be accepted, got: {err}")
     }

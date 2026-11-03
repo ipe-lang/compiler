@@ -588,7 +588,7 @@ fn check_rejects_an_unexpected_option() -> TestResult {
 /// imports `Api.Types` by its full module path, and return its root.
 fn nested_import_project(name: &str) -> Result<PathBuf, Box<dyn Error>> {
     let root = support::scratch_root().join(name);
-    let _ = std::fs::remove_dir_all(&root);
+    e2e_support::scratch::fresh(&root);
     let api = root.join("src").join("Api");
     std::fs::create_dir_all(&api)?;
     std::fs::write(root.join("package.ipe"), support::package_ipe("app"))?;

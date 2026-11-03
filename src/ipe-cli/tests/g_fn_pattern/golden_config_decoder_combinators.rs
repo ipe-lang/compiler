@@ -30,7 +30,7 @@ fn config_decoder_combinators_ipec_cargo_and_run_zero() {
         .join("golden")
         .join("config_decoder_combinators");
     let out = crate::support::scratch_root().join("ipec_config_decoder_combinators_e2e");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 

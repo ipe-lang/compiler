@@ -78,7 +78,7 @@ fn widget_project(tag: &str) -> Result<PathBuf, Box<dyn Error>> {
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     std::fs::create_dir_all(dir.join("src/js"))?;
     std::fs::write(
         dir.join("package.ipe"),
@@ -332,7 +332,7 @@ fn server_mount_project(tag: &str) -> Result<PathBuf, Box<dyn Error>> {
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     std::fs::create_dir_all(dir.join("src"))?;
     std::fs::write(
         dir.join("package.ipe"),
@@ -464,7 +464,7 @@ fn unmounted_widget_project(tag: &str) -> Result<PathBuf, Box<dyn Error>> {
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     std::fs::create_dir_all(dir.join("src/js"))?;
     std::fs::write(
         dir.join("package.ipe"),
@@ -523,7 +523,7 @@ fn a_handle_constructed_in_an_imported_module_discloses_custom_element() -> Test
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     std::fs::create_dir_all(dir.join("src/js"))?;
     std::fs::write(
         dir.join("package.ipe"),
@@ -564,7 +564,7 @@ fn the_run_resolver_discloses_an_unmounted_handle() -> TestResult {
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     create_project_dir(&dir)?;
     std::fs::create_dir_all(dir.join("src/js"))?;
     std::fs::write(dir.join("src/Main.ipe"), UNMOUNTED_WIDGET_APP)?;
@@ -644,7 +644,7 @@ fn js_port_project(tag: &str) -> Result<PathBuf, Box<dyn Error>> {
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     create_project_dir(&dir)?;
     std::fs::write(dir.join("src/Main.ipe"), JS_PORT_APP)?;
     Ok(dir)
@@ -720,7 +720,7 @@ fn importing_browser_clipboard_discloses_js_port_clipboard() -> TestResult {
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     create_project_dir(&dir)?;
     std::fs::write(dir.join("src/Main.ipe"), CLIPBOARD_APP)?;
     // The `:clipboard` characterised axis AND the `:raw` kernel floor (the
@@ -749,7 +749,7 @@ fn a_transitive_browser_import_reaches_the_linked_set() -> TestResult {
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     create_project_dir(&dir)?;
     // `Widget` is the intermediate dep: it imports the browser module and re-exposes
     // a plain helper. `Main` imports only `Widget`, never the browser module.
@@ -888,7 +888,7 @@ fn write_single(tag: &str, src: &str) -> Result<PathBuf, Box<dyn Error>> {
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     create_project_dir(&dir)?;
     std::fs::write(dir.join("src/Main.ipe"), src)?;
     Ok(dir)

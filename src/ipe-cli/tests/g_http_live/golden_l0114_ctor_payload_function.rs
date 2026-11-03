@@ -103,7 +103,7 @@ fn fixture_src_dir(root: &Path, name: &str) -> PathBuf {
 fn built_code(root: &Path, name: &str) -> (Result<(), CliError>, PathBuf) {
     let entry = fixture_project(root, name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_emit"));
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     (crate::support::build_golden(&entry, &out, &runtime), out)
 }
@@ -377,7 +377,7 @@ fn and_map_cross_module_annotated_wrapper_accepted() {
     let golden_project = fixture_src_dir(&root, "and_map_cross_module_wrapper_accepted");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("l0114_and_map_cross_module_wrapper_accepted_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(
@@ -401,7 +401,7 @@ fn and_map_forwarder_curried_is_ipe_t0014() {
     let golden_project = fixture_src_dir(&root, "and_map_forwarder_curried_is_t0014");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("l0114_and_map_forwarder_curried_is_t0014_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
     let code = match &built {
@@ -598,7 +598,7 @@ fn and_map_cross_module_untyped_forwarder_curried_rejected() {
     let golden_project = fixture_src_dir(&root, "and_map_cross_module_untyped_forwarder_curried");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("l0114_and_map_cross_module_untyped_forwarder_curried_emit");
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = crate::support::build_golden(&golden_project, &out, &runtime);
     let code = match &built {

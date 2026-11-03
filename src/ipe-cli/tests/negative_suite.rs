@@ -40,7 +40,7 @@ fn write_entry(name: &str, source: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite")
         .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     std::fs::create_dir_all(&dir).expect("scratch setup must succeed");
     let entry = dir.join("Main.ipe");
     std::fs::write(&entry, source).expect("scratch setup must succeed");
@@ -70,7 +70,7 @@ fn compile(name: &str, source: &str, target: Target) -> Outcome {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-out")
         .join(name);
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let options = BuildOptions {
         target,
@@ -91,7 +91,7 @@ fn compile_production(name: &str, source: &str) -> Outcome {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-prod-out")
         .join(name);
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let options = BuildOptions {
         intent: ipe_backend_rust::BuildIntent::Release,
@@ -139,7 +139,7 @@ fn compile_project(name: &str, files: &[(&str, &str)]) -> Outcome {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-proj-out")
         .join(name);
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     match ipe::build_fixture(&fixture, &out, &runtime) {
         Ok(_) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
@@ -1861,7 +1861,7 @@ fn compile_with_files(name: &str, source: &str, extra: &[(&str, &str)]) -> Outco
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-ce-out")
         .join(name);
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     match ipe::build_fixture_with_options(&fixture, &out, &runtime, &BuildOptions::default()) {
         Ok(_) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
@@ -2144,7 +2144,7 @@ fn custom_element_ctor_symlink_escape_rejected_at_build_gate() {
 
     let name = "custom_element_symlink_escape";
     let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("negsuite-ce-symlink");
-    let _ = std::fs::remove_dir_all(&base);
+    e2e_support::scratch::fresh(&base);
     let outside = base.join("outside");
     // The out-of-project directory and a real file inside it (the escape target).
     crate::support::expect_scratch_step(name, std::fs::create_dir_all(&outside));
@@ -5010,7 +5010,7 @@ fn row_generic_in_scope_web_embed_refused_undetermined() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-out")
         .join(name);
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     match ipe::build_fixture_with_options(&fixture, &out, &runtime, &BuildOptions::default()) {
         Err(CliError::Pipeline { diag, .. }) => match *diag {
@@ -5079,7 +5079,7 @@ fn unpinned_msg_web_embed_refused() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-out")
         .join(name);
-    let _ = std::fs::remove_dir_all(&out);
+    e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
     match ipe::build_fixture_with_options(&fixture, &out, &runtime, &BuildOptions::default()) {
         Err(CliError::Pipeline { diag, .. }) => match *diag {
