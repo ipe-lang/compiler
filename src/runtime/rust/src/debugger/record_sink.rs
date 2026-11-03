@@ -708,7 +708,7 @@ mod tests {
         (msg, IpeCmd::None)
     }
 
-    /// A ring of `count` steps whose trace lines are each `width + 4` bytes
+    /// A ring of `count` steps whose trace lines are each `width + 5` bytes
     /// (`"<text> => <text>\n"` with the text half each side).
     fn padded(count: usize, width: usize) -> RecordBuffer<Pad, Pad> {
         let mut buf = RecordBuffer::new(Pad(String::new()), count.max(1));
@@ -761,7 +761,12 @@ mod tests {
     #[test]
     fn trace_keeps_the_newest_steps_within_the_cap() {
         let buf = padded(40, 200);
-        let line = 204usize;
+        let line = 205usize;
+        assert_eq!(
+            buf.replay_lines().map(|l| plain_line(&l).len()).max(),
+            Some(line)
+        );
+        // Ten whole lines fill the cap exactly, so the marker evicts one.
         let cap = line * 10;
         let blob = render_capped(&buf, cap);
         assert!(blob.len() <= cap, "{} > {cap}", blob.len());

@@ -5436,6 +5436,11 @@ mod pre_exit_tests {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("start the child");
+        // The pipes drain while the child runs: a child that fills a pipe
+        // nobody reads blocks in `write`, holding the stdout lock its exit
+        // needs, and reads as a hung exit.
+        let stdout = drain(process.stdout.take().expect("the child's stdout"));
+        let stderr = drain(process.stderr.take().expect("the child's stderr"));
         let started = std::time::Instant::now();
         let status = loop {
             if let Some(status) = process.try_wait().expect("poll the child") {
@@ -5443,21 +5448,33 @@ mod pre_exit_tests {
             }
             if started.elapsed() > CHILD_LIMIT {
                 let _ = process.kill();
+                let _ = process.wait();
                 break None;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
-        let out = process
-            .wait_with_output()
-            .expect("collect the child's output");
+        let stdout = stdout.join().expect("the stdout drain");
+        let stderr = stderr.join().expect("the stderr drain");
         // Test diagnostics: the child's output is only matched and shown.
         #[allow(clippy::disallowed_methods)]
         let run = ChildRun {
             status,
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
         };
         run
+    }
+
+    /// Read `pipe` to its end on its own thread.
+    #[allow(clippy::expect_used)] // test harness: a refused OS thread is an environment issue
+    fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::Builder::new()
+            .spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = pipe.read_to_end(&mut bytes);
+                bytes
+            })
+            .expect("start a pipe drain")
     }
 
     fn ended_with(run: &ChildRun, code: i64) -> bool {
@@ -5618,6 +5635,8 @@ mod pre_exit_tests {
     #[test]
     fn racing_writer_child() {
         static WRITTEN: AtomicUsize = AtomicUsize::new(0);
+        // Bounded so a writer the exit never preempts still ends.
+        const WRITER_BYTES: u32 = 1 << 20;
         fn line(out: &mut StdoutLock<'static>) {
             let _ = out.write_all(LINE_END_MARK.as_bytes());
             let _ = out.flush();
@@ -5625,7 +5644,7 @@ mod pre_exit_tests {
         let _line = register(Registration::LineClose(line)).expect("registers");
         let _writer = std::thread::Builder::new()
             .spawn(|| {
-                for _ in 0..u32::MAX {
+                for _ in 0..WRITER_BYTES {
                     let mut out = std::io::stdout().lock();
                     let _ = out.write_all(b"w");
                     let _ = out.flush();
