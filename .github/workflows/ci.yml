@@ -1112,7 +1112,7 @@ jobs:
               if ! RUSTFLAGS="" "$IPE" dev build "$dir" web client --out "$dir/out"; then
                 echo "::error::ipe dev build regressed: $dir"; fail=1; echo "::endgroup::"; continue
               fi
-              if [ ! -f "$dir/out/rust/www/index.html" ]; then
+              if [ ! -f "$dir/out/www/index.html" ]; then
                 echo "::error::wasm bundle has no www/index.html: $dir"; fail=1
               fi
               echo "::endgroup::"; continue
@@ -2794,11 +2794,11 @@ jobs:
           OUT="$RUNNER_TEMP/wasm-client-clipboard-emitted"
           "$RUNNER_TEMP/ipe-release/ipe" dev build examples/shapes/web/wasm-client-clipboard web client --out "$OUT"
           # Fail closed: a bundle without its shell leaves the spec nothing to serve.
-          if [ ! -f "$OUT/rust/www/index.html" ]; then
-            echo "wasm-client-clipboard bundle has no www/index.html under '$OUT/rust'" >&2
+          if [ ! -f "$OUT/www/index.html" ]; then
+            echo "wasm-client-clipboard bundle has no www/index.html under '$OUT'" >&2
             exit 1
           fi
-          bash "$GITHUB_WORKSPACE/.github/ci/github-env.sh" CI_JOB_WASM_CLIENT_WWW "$OUT/rust/www"
+          bash "$GITHUB_WORKSPACE/.github/ci/github-env.sh" CI_JOB_WASM_CLIENT_WWW "$OUT/www"
       - name: Run Playwright specs (geo + clipboard, layout fill, focus across patch, csp styles, install offer)
         working-directory: tools/scripts/browser-e2e
         run: IPE_WASM_CLIENT_WWW="$CI_JOB_WASM_CLIENT_WWW" npx playwright test --config playwright.config.mjs

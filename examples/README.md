@@ -50,4 +50,4 @@ Each example is a self-contained Ipê project. Build it with
 `cargo run --manifest-path out/rust/Cargo.toml`.
 
 For a WASM example, run `ipe dev build <dir> web client` and serve
-`out/rust/www/` with any HTTP server.
+`out/www/` with any HTTP server.

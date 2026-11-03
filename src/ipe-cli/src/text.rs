@@ -122,7 +122,7 @@ relayable!(
     crate::build_plan::Refusal,
     crate::delivery::DeliveryError,
     crate::pack::mobile::MobileRefusal,
-    crate::pack::mobile::BundleError,
+    crate::bundle_www::BundleError,
     crate::pack::desktop::DesktopRefusal,
     crate::ffi::WrapperRefusal,
     crate::ffi::BuildScriptsBanner,
@@ -1432,6 +1432,8 @@ messages! {
     mobile_bundle_too_deep(limit, path) = "mobile-bundle-too-deep";
     /// The emitted wasm bundle holds more entries than the walk's ceiling.
     mobile_bundle_too_many(limit) = "mobile-bundle-too-many";
+    /// The emitted wasm bundle's assets hold more bytes in all than the bundle's total.
+    mobile_bundle_too_large(limit) = "mobile-bundle-too-large";
     /// The emitted wasm bundle was replaced between its collection and its copy.
     mobile_bundle_replaced(path) = "mobile-bundle-replaced";
     /// The bundle's `index.html` does not carry the one policy meta the pin admits.
@@ -1781,6 +1783,8 @@ messages! {
     release_run_wrapper_unverifiable(dir) = "release-run-wrapper-unverifiable";
     /// `wasm-bindgen` failed while bundling a `web client` build.
     wasm_bindgen_failed(code, version) = "wasm-bindgen-failed";
+    /// A `web client` bundle was published.
+    wasm_bundle_ready(www, size, wasm) = "wasm-bundle-ready";
     /// The `wasm32-wasip1` build reported no `.wasm` artifact.
     wasi_artifact_missing(dir) = "wasi-artifact-missing";
     /// `ipe dev run --record`/`--replay` on a program with no recordable session.

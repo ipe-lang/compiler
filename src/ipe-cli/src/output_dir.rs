@@ -639,6 +639,15 @@ impl OwnedDir {
         &self.path
     }
 
+    /// The identity of the directory that was claimed.
+    ///
+    /// A reader that opens the owned tree through its own handle compares the
+    /// directory it opened against this before reading below it.
+    #[must_use]
+    pub const fn id(&self) -> held::DirId {
+        self.id
+    }
+
     /// Claim the owned subdirectory `name`, a single plain path component.
     ///
     /// # Errors
@@ -1527,6 +1536,8 @@ pub enum OutputArea {
     App,
     /// The jailed release's launcher bundle (`bundle/`).
     Bundle,
+    /// The published `web client` bundle (`www/`).
+    Www,
 }
 
 impl OutputArea {
@@ -1540,6 +1551,7 @@ impl OutputArea {
             Self::Dist => "dist",
             Self::App => "app",
             Self::Bundle => "bundle",
+            Self::Www => "www",
         }
     }
 }

@@ -24,4 +24,4 @@ dir: a project directory (default: the current directory). shape is derived from
 
 ## Output
 
-a native build lands the runnable binary at `out/bin/<project-name>` under the project (copied there within the build), so it is findable even when a shared `CARGO_TARGET_DIR` places cargo's own output outside the project.
+a native build lands the runnable binary at `out/bin/<project-name>` under the project (copied there within the build), so it is findable even when a shared `CARGO_TARGET_DIR` places cargo's own output outside the project. A `web client` build publishes the browser bundle at `out/www/`, beside the emitted crate at `out/rust/`.

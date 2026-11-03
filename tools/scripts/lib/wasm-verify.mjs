@@ -7,7 +7,7 @@
 // Usage:
 //   node wasm-verify.mjs <www-dir> <scenario> [port]
 //
-// <www-dir>   — path to the `out/rust/www/` directory (must contain
+// <www-dir>   — path to the `out/www/` directory (must contain
 //               index.html + pkg/ipe_app.js + pkg/ipe_app_bg.wasm)
 // <scenario>  — a scenario key, or "smoke" (boot + non-empty body only)
 // [port]      — TCP port for the local HTTP server (default: auto-pick)

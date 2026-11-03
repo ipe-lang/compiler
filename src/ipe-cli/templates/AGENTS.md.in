@@ -1093,7 +1093,7 @@ through the `Ui.html : Html msg -> Element msg` node.
 
 `ipe dev build web client` compiles single-page `Web.tea` program to
 browser bundle: emitted project = `cdylib` crate (wasm-bindgen glue, no
-tokio/axum/sqlx) plus static `www/` shell (CSP `script-src 'self'
+tokio/axum/sqlx) plus static `www/` shell, published at `out/www/` (CSP `script-src 'self'
 'wasm-unsafe-eval'` — no JS eval). Bundle w/
 `cargo build --target wasm32-unknown-unknown --release` + `wasm-bindgen`
 CLI (build prints exact commands).
@@ -1236,7 +1236,7 @@ ipe init [name]                    # new project
 # not expressible. A `build` / `run` with no group in front is refused: the
 # group names the posture.
 ipe dev build                      # compile the project here → out/app
-ipe dev build web client          # browser-WASM project (cdylib + www/ shell)
+ipe dev build web client          # browser-WASM bundle → out/www/
 ipe dev run                        # build + run
 ipe release build                  # PRODUCTION build; rejects any Debug.* use
                                    #  (IPE-L0140)
