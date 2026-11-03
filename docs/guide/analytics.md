@@ -34,7 +34,7 @@ serialises a few prop values and fires one event in each consent state.
 The config is a value you build and thread — `defaultConfig` starts fail-closed,
 `setConsent` moves it:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/analytics-consent/src/Main.ipe
 configWith : ConsentState -> Config
 configWith state =
     Analytics.defaultConfig Analytics.Stderr
@@ -44,7 +44,7 @@ configWith state =
 A `PPii` prop serialises to the redacted sentinel — calling the encode path does
 not reveal the plaintext:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/analytics-consent/src/Main.ipe
 showProp name value =
     name ++ " -> " ++ Encode.encode 0 (Analytics.encodePropValue value)
 ```
@@ -53,7 +53,7 @@ Running it (`ipe dev run`) redacts the PII, keeps the plain and numeric props, a
 gates the event on consent — the `Granted` event reaches the stderr sink; the
 `Pending` and `Denied` events are dropped, and their Tasks still succeed:
 
-```
+```text
 email -> "[redacted]"
 plan -> "pro"
 seats -> 5

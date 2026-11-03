@@ -43,6 +43,9 @@ The key is built at the boundary — `keyFromString` returns `Maybe Key`, so the
 fallible parse happens once and everything downstream holds a real `Key`:
 
 ```ipe
+import Ipe.Crypto as Crypto
+
+
 signingKey =
     Crypto.keyFromString "s3cret-signing-key"
 ```
@@ -51,6 +54,9 @@ signingKey =
 compares in constant time:
 
 ```ipe
+import Ipe.Crypto as Crypto
+
+
 sign key message =
     Crypto.macToHex (Crypto.hmacSha256 key message)
 
@@ -60,7 +66,7 @@ verify key message presented =
 
 Running it (`ipe dev run`) prints the hash, the signature, and the two verifications:
 
-```
+```text
 sha256(hello): 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
 signature: 2c69896ccfef8cf87755eab6f2d7525f23a4ea54455d196d952d3c64e6cbbeb9
 verify (correct): accepted

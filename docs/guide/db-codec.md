@@ -42,6 +42,9 @@ The codec is derived from a named, annotated witness — the field names become
 the columns, one derivation:
 
 ```ipe
+import Ipe.Codec as Codec exposing (Codec)
+
+
 type alias User =
     { id : String
     , age : Int
@@ -66,6 +69,28 @@ runs the codec's own decoder — on success the result is a real `User`; on
 drift, a typed `Err`:
 
 ```ipe
+import Ipe.Codec as Codec exposing (Codec)
+import Ipe.Db.Codec as DbCodec
+import Ipe.Dict as Dict exposing (Dict)
+
+
+type alias User =
+    { id : String
+    , age : Int
+    , active : Bool
+    }
+
+
+blankUser : User
+blankUser =
+    { id = "", age = 0, active = False }
+
+
+userCodec : Codec User
+userCodec =
+    Codec.auto blankUser
+
+
 readRow : Dict String (Maybe String) -> String
 readRow row =
     case DbCodec.codecFromRow userCodec row of
@@ -78,7 +103,7 @@ readRow row =
 
 Running it (`ipe dev run`) reads the good row and turns the three drifted rows away:
 
-```
+```text
 well-formed row -> Ok User { id = u-42, age = 30, active = True }
 missing column  -> rejected (schema drift — fail-closed)
 bad cell type   -> rejected (schema drift — fail-closed)

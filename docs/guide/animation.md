@@ -28,7 +28,7 @@ The example under
 builds a pulse — 600ms, ease-in-out, running forever, holding its final frame — and
 renders the shorthand.
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/animation-spec/src/Main.ipe
 pulse : Animation.Spec
 pulse =
     Animation.defaultSpec "pulse"
@@ -40,7 +40,7 @@ pulse =
 
 Running it (`ipe dev run`):
 
-```
+```text
 animation shorthand tail (name is added by the render sink):
   600ms ease-in-out 0ms infinite forwards
 ```
