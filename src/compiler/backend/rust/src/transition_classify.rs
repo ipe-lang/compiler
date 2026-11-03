@@ -762,17 +762,18 @@ mod tests {
 
     #[test]
     fn peeled_non_inert_let_refuses() {
-        // `let x = count // 0 in ({ m | count = 5 }, Cmd.none)` — the peeled binding
-        // aborts when evaluated. The compiled arm takes that abort; the transition
-        // datum would silently skip it, so the classifier must refuse (keep the arm
-        // compiled) rather than emit a diverging Some.
+        // `let x = count // -1 in ({ m | count = 5 }, Cmd.none)` — the peeled
+        // binding trips `IntOverflow` when `count` is the least `Int`. The compiled
+        // arm takes that trip; the transition datum would silently skip it, so the
+        // classifier must refuse (keep the arm compiled) rather than emit a
+        // diverging Some.
         let x = Symbol::from_raw(201);
         let model_pos = Expr::Let {
             name: x,
             value: Box::new(Expr::BinOp {
                 op: BinOp::IntDiv,
                 lhs: Box::new(model_access(count_sym())),
-                rhs: Box::new(Expr::Int(0)),
+                rhs: Box::new(Expr::Int(-1)),
             }),
             body: Box::new(Expr::Update {
                 record: Box::new(Expr::Var(model_sym())),

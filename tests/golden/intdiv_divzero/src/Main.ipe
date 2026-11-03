@@ -2,12 +2,10 @@ module Main exposing (main)
 import Ipe.Io as Io
 import Ipe.String
 
--- m2lex negative gate: integer division by zero through `//`. The divisor flows
--- in as a function parameter so it is opaque at the division site (a literal
--- `10 // 0` would be rejected at *compile* time by the backend's
--- unconditional-panic check; this exercises the *runtime* path instead). The
--- runtime must abort with a DivisionByZero panic (exit 101) rather than emit a
--- wrong answer.
+-- Integer division by zero through `//` at runtime. The divisor flows in as a
+-- function parameter so it is opaque at the division site, exercising the
+-- runtime operator rather than a constant fold. `x // 0` is `0`, as in Elm: the
+-- program prints `0` and exits 0, never aborting.
 
 divBy : Int -> Int
 divBy d =
