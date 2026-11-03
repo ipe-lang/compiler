@@ -44,7 +44,7 @@ The example under
 [`examples/wasm/env-public`](https://github.com/ipe-lang/compiler/blob/main/examples/wasm/env-public/src/Main.ipe) is a wasm
 web app. Its `package.ipe` allowlists exactly one name:
 
-```ipe
+```ipe ipe:skip a package.ipe fragment: read syntactically, never type-checked, so a partial record is fine here
 package : Package
 package =
     { name = "wasm-env-public"
@@ -56,7 +56,8 @@ package =
 `init` reads the allowlisted name — which resolves — and also probes a
 secret-shaped name that is *not* allowlisted, to show it reads as absent:
 
-```ipe
+```ipe ipe:excerpt examples/wasm/env-public/src/Main.ipe
+init : WebReq -> ( Model, Cmd Msg )
 init _req =
     ( { apiBaseUrl = Maybe.withDefault "(none)" (Env.public "API_BASE_URL")
       , secretProbe = Maybe.withDefault "(none)" (Env.public "IPE_AUTH_TOKEN_SECRET")

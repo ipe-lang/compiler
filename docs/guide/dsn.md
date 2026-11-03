@@ -53,7 +53,7 @@ a cleartext-transport DSN and an unknown-driver DSN both rejected.
 `parse` returns `Result Error Dsn`, so an accepted and a rejected string are the
 two arms of one `case`; `redacted` is the only rendering of a `Dsn`:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/dsn-parse-redact/src/Main.ipe
 describe : String -> String
 describe raw =
     case Dsn.parse raw of
@@ -73,7 +73,7 @@ describe raw =
 
 Running it (`ipe dev run`) over three descriptors prints:
 
-```
+```text
 accepted: postgres://app@db.internal:5432/store (tls=verify-full, password=[redacted]) | driver=postgres host=db.internal port=5432
 rejected (fail-closed): postgres://app:s3cr3t@db.internal:5432/store?sslmode=disable
 rejected (fail-closed): mysql://app@db.internal/store
