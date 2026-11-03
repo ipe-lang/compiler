@@ -39,11 +39,15 @@ A fixed instant is built from milliseconds since the epoch, and a deadline is th
 instant plus a duration:
 
 ```ipe ipe:excerpt examples/shapes/script/time-calendar/src/Main.ipe
+-- A fixed instant pinned in milliseconds since the Unix epoch, so the output is
+-- reproducible: it falls on the leap day of a leap year, at noon UTC.
 launch : Timestamp.Timestamp
 launch =
     Timestamp.fromUnixMillis 1709208000000
 
 
+-- A deadline two hours after the instant above. `Ipe.Duration` is non-negative
+-- by design, so spans move an instant forward; `Time.add` shifts `launch` by it.
 deadline : Timestamp.Timestamp
 deadline =
     Time.add (Duration.minutes 120) launch

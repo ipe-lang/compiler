@@ -151,7 +151,7 @@ type Msg
 restyledFocus : Element Msg
 restyledFocus =
     Ui.button
-        [ Ui.focusVisible
+        [ Ui.onPseudo Ui.focusVisible
             [ Ui.style "outline" "3px solid #e63946"
             , Ui.style "outline-offset" "3px"
             ]
@@ -172,7 +172,7 @@ import Ipe.Ui as Ui
 restyledAttr : Attribute msg
 restyledAttr =
     -- ipe-lint: allow no-silent-outline-none
-    Ui.focusVisible [ Ui.style "outline" "none", Ui.style "box-shadow" "0 0 0 4px #0060df" ]
+    Ui.onPseudo Ui.focusVisible [ Ui.style "outline" "none", Ui.style "box-shadow" "0 0 0 4px #0060df" ]
 ```
 
 (The example above would not need suppression — `box-shadow` is a visible
