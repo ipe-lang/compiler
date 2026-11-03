@@ -780,6 +780,9 @@ mod tests {
             "/boot.js%00",
             "/pkg\\ipe_app_bg.wasm",
             "//boot.js",
+            "//etc/passwd",
+            "/pkg/%2F",
+            "/x/%2F",
         ] {
             let reply = site.respond(Method::Get, target);
             assert_eq!(reply.status, Status::NotFound, "{target}");
@@ -821,7 +824,19 @@ mod tests {
         );
         let ok = site.respond(Method::Get, "/app/boot.js");
         assert_eq!((ok.status, ok.body), (Status::Ok, b"boot()".as_slice()));
-        for target in ["/boot.js", "/apple/boot.js", "/index.html", "/", "/other/x"] {
+        let index = site.respond(Method::Get, "/app/");
+        assert_eq!(
+            (index.status, index.body),
+            (Status::Ok, b"<html>app".as_slice())
+        );
+        for target in [
+            "/x",
+            "/boot.js",
+            "/apple/boot.js",
+            "/index.html",
+            "/",
+            "/other/x",
+        ] {
             assert_eq!(
                 site.respond(Method::Get, target).status,
                 Status::NotFound,
@@ -871,6 +886,68 @@ mod tests {
         assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
         assert_eq!(header(&head, "Content-Length"), Some("6"));
         assert_eq!(body(&head), "", "a HEAD answer carries no body");
+    }
+
+    #[test]
+    fn media_type_is_wasm_for_pkg_wasm_and_octet_stream_for_unknown() {
+        let of = |path: &str| MediaType::of(&BundlePath::parse(path).expect("a bundle path"));
+        assert_eq!(of("pkg/ipe_app_bg.wasm").header_value(), "application/wasm");
+        assert_eq!(
+            of("boot.js").header_value(),
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(of("index.html").header_value(), "text/html; charset=utf-8");
+        for unknown in ["data.bin", "noext", "x.WASM", "archive.tar.gz"] {
+            assert_eq!(
+                of(unknown).header_value(),
+                "application/octet-stream",
+                "{unknown}"
+            );
+        }
+    }
+
+    #[test]
+    fn opener_is_called_only_from_the_seam_default() {
+        // Each served-preview caller names the opener exactly as the seam's
+        // production argument, outside any test item.
+        for (file, source, seam) in [
+            (
+                "doc.rs",
+                include_str!("doc.rs"),
+                ".then_some(crate::browser::open_url);",
+            ),
+            (
+                "driver/commands.rs",
+                include_str!("driver/commands.rs"),
+                "Some(crate::browser::open_url),",
+            ),
+        ] {
+            let (production, tests) = source
+                .split_once("#[cfg(test)]\nmod tests {")
+                .unwrap_or((source, ""));
+            let calls: Vec<&str> = production
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.contains("open_url") && !line.starts_with("//"))
+                .collect();
+            assert_eq!(
+                calls,
+                [seam],
+                "{file}: the opener is only the seam's argument"
+            );
+            assert!(
+                !tests.contains("browser::open_url"),
+                "{file}: no test reaches the real opener"
+            );
+        }
+        let own = include_str!("loopback_http.rs");
+        let own_tests = own
+            .split_once("#[cfg(test)]\nmod tests {")
+            .map_or("", |(_, tests)| tests);
+        assert!(
+            !own_tests.contains(&["browser::open", "_url("].concat()),
+            "loopback_http tests call no real opener"
+        );
     }
 
     #[test]
@@ -941,7 +1018,7 @@ mod tests {
     #[test]
     fn bundle_port_refuses_a_malformed_ipe_web_port() {
         use ipe_runtime_rust::env_registry::web::WEB_PORT;
-        for raw in ["abc", "", "0", "65536", "+80", " 80", "-1", "80 "] {
+        for raw in ["abc", "", "0", "65536", "70000", "+80", " 80", "-1", "80 "] {
             let read = WEB_PORT.parse(Ok(raw.to_owned()));
             let expected = read.clone().expect_err("a malformed port is refused");
             let refused = bundle_listen_port(read);
@@ -1047,6 +1124,9 @@ mod tests {
         let site = plain_site();
         for outcome in [
             OpenOutcome::OpenerMissing,
+            #[cfg(unix)]
+            OpenOutcome::OpenerFailed(std::os::unix::process::ExitStatusExt::from_raw(256)),
+            OpenOutcome::Refused(crate::browser::OpenerRefusal::QueryAmpersand),
             OpenOutcome::WaitFailed(std::io::ErrorKind::Other),
         ] {
             let listener = bind_bundle(BundlePort::Ephemeral).expect("bind");
@@ -1072,13 +1152,12 @@ mod tests {
                 let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connect");
                 client
                     .write_all(
-                        format!("GET /boot.js HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n")
-                            .as_bytes(),
+                        format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").as_bytes(),
                     )
                     .expect("send");
                 let mut response = String::new();
                 client.read_to_string(&mut response).expect("read");
-                assert_eq!(body(&response), "boot()");
+                assert_eq!(body(&response), "<html>page", "the index is still served");
             });
         }
         let listener = bind_bundle(BundlePort::Ephemeral).expect("bind");

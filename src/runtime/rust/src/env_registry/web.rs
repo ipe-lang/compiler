@@ -20,7 +20,8 @@ pub const WEB_PORT: PortKey = PortKey::new(
                   value (empty, non-numeric, signed, `0`, or too large) refuses \
                   startup, naming the variable. Under `ipe dev watch` the supervisor \
                   chooses the port and a valid value has no effect, but a malformed one \
-                  still refuses.",
+                  still refuses. `ipe dev run` of a `web client` delivery serves its \
+                  bundle on this port, loopback only; unset, it picks a free port.",
     },
 );
 

@@ -249,10 +249,10 @@ impl InitShape {
 
     /// The command the next steps advise, building the delivery the scaffold declares.
     ///
-    /// A `web client` scaffold declares the browser client, which `ipe dev run`
-    /// has no executable form for, so it advises `ipe dev build` spelled with
-    /// that delivery's own words; every other scaffold declares its shape's
-    /// default delivery, which a bare `ipe dev run` builds and runs.
+    /// A `web client` scaffold declares the browser client, so it advises
+    /// `ipe dev build` spelled with that delivery's own words, which publishes
+    /// the bundle; every other scaffold declares its shape's default
+    /// delivery, which a bare `ipe dev run` builds and runs.
     fn next_step_command(self, runtime: Runtime) -> String {
         let client = match self {
             Self::Web => match runtime {

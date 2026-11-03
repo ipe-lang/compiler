@@ -27,6 +27,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use ipe_ir::{Capability, WebCapability};
+use ipe_runtime_rust::bundle_route::MediaType;
 use ipe_runtime_rust::csp::{
     self, BundleHost, BundleReach, BundleWorker, ContentSecurityPolicy, ReachRefusal,
 };
@@ -3700,13 +3701,15 @@ fn render_ios_app_delegate(base: &MountBase) -> String {
 /// 404), maps the bare directory to `index.html`, refuses an empty, `.` or `..`
 /// segment and a `\`, and serves a resolved file only when it lies below the
 /// `www/` directory plus `/`. Every refusal answers a local 404. The base's
-/// segments reach the Swift text only as [`SwiftStringLiteral`]s.
+/// segments reach the Swift text only as [`SwiftStringLiteral`]s. Its
+/// `mimeType(for:)` table is [`swift_mime_cases`].
 fn render_ios_scheme_handler(base: &MountBase) -> String {
     let segments = base
         .segments()
         .map(|segment| SwiftStringLiteral::of(segment).to_string())
         .collect::<Vec<_>>()
         .join(", ");
+    let mime_cases = swift_mime_cases();
     format!(
         "import Foundation\n\
          import WebKit\n\
@@ -3784,17 +3787,30 @@ fn render_ios_scheme_handler(base: &MountBase) -> String {
          \x20   }}\n\
          \n\
          \x20   static func mimeType(for ext: String) -> String {{\n\
-         \x20       switch ext.lowercased() {{\n\
-         \x20       case \"html\": return \"text/html\"\n\
-         \x20       case \"js\": return \"text/javascript\"\n\
-         \x20       case \"wasm\": return \"application/wasm\"\n\
-         \x20       case \"json\": return \"application/json\"\n\
-         \x20       case \"css\": return \"text/css\"\n\
-         \x20       default: return \"application/octet-stream\"\n\
+         \x20       switch ext {{\n\
+         {mime_cases}\
+         \x20       default: return \"{octet}\"\n\
          \x20       }}\n\
          \x20   }}\n\
-         }}\n"
+         }}\n",
+        octet = MediaType::OctetStream.essence(),
     )
+}
+
+/// The `case` lines of the iOS shell's `mimeType(for:)`: one per extension
+/// [`MediaType::BY_EXTENSION`] names, with that type's essence, in its order.
+///
+/// Case-sensitive, as the served bundle's lookup is.
+fn swift_mime_cases() -> String {
+    let mut cases = String::new();
+    for (ext, media) in MediaType::BY_EXTENSION {
+        cases.push_str("        case ");
+        cases.push_str(&SwiftStringLiteral::of(ext).to_string());
+        cases.push_str(": return ");
+        cases.push_str(&SwiftStringLiteral::of(media.essence()).to_string());
+        cases.push('\n');
+    }
+    cases
 }
 
 /// The iOS shell's build/README note.
@@ -4465,6 +4481,48 @@ mod tests {
             .expect("app delegate");
         assert!(delegate.contains("URL(string: \"ipe-app://app/\")"));
         assert!(!delegate.contains("http://"));
+    }
+
+    #[test]
+    fn ios_scheme_handler_mime_table_agrees_with_media_type() {
+        use ipe_runtime_rust::bundle_route::MediaType;
+        let handler = render_ios_scheme_handler(&MountBase::root());
+        let body = handler
+            .split_once("switch ext {\n")
+            .and_then(|(_, rest)| rest.split_once("        default: return "))
+            .expect("the mimeType(for:) switch");
+        let shell: Vec<(String, String)> = body
+            .0
+            .lines()
+            .map(|line| {
+                let (ext, media) = line
+                    .trim()
+                    .strip_prefix("case \"")
+                    .and_then(|rest| rest.split_once("\": return \""))
+                    .and_then(|(ext, rest)| Some((ext, rest.strip_suffix('"')?)))
+                    .expect("a `case \"ext\": return \"type\"` line");
+                (ext.to_owned(), media.to_owned())
+            })
+            .collect();
+        let runtime: Vec<(String, String)> = MediaType::BY_EXTENSION
+            .iter()
+            .map(|(ext, media)| ((*ext).to_owned(), media.essence().to_owned()))
+            .collect();
+        assert_eq!(
+            shell, runtime,
+            "every case is a runtime type, and every runtime type a case"
+        );
+        for (ext, media) in &shell {
+            assert_eq!(MediaType::of_extension(ext).essence(), media, "{ext}");
+        }
+        assert!(
+            body.1.starts_with("\"application/octet-stream\"\n"),
+            "an unknown extension is octet-stream, as the runtime's"
+        );
+        assert!(
+            !handler.contains("lowercased()"),
+            "case-sensitive, as the runtime's"
+        );
     }
 
     #[test]
