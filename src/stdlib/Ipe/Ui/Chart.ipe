@@ -277,16 +277,16 @@ projectPoint w h xR yR pt =
             h - plotInset.top - plotInset.bottom
 
         plotWf =
-            intToFloat plotW
+            toFloat plotW
 
         plotHf =
-            intToFloat plotH
+            toFloat plotH
 
         leftF =
-            intToFloat plotInset.left
+            toFloat plotInset.left
 
         topF =
-            intToFloat plotInset.top
+            toFloat plotInset.top
 
         nx =
             if xSpan == 0.0 then
@@ -305,16 +305,6 @@ projectPoint w h xR yR pt =
     { px = leftF + nx * plotWf
     , py = topF + (1.0 - ny) * plotHf
     }
-
-
-intToFloat : Int -> Float
-intToFloat n =
-    case String.toFloat (String.fromInt n) of
-        Just f ->
-            f
-
-        Nothing ->
-            0.0
 
 
 svgRootAttrs : Cfg -> List (Attr.Attribute msg)
@@ -378,13 +368,13 @@ gridLine : String -> String -> Int -> Int -> Int -> Html msg
 gridLine x1 x2 _ plotH idx =
     let
         plotHf =
-            intToFloat plotH
+            toFloat plotH
 
         idxf =
-            intToFloat idx
+            toFloat idx
 
         yPx =
-            intToFloat plotInset.top + (idxf / 4.0) * plotHf
+            toFloat plotInset.top + (idxf / 4.0) * plotHf
 
         yStr =
             String.fromFloat yPx
@@ -581,7 +571,7 @@ areaOne cfg xR yR s =
             cfg.height - plotInset.top - plotInset.bottom
 
         baselineY =
-            intToFloat (plotInset.top + plotH)
+            toFloat (plotInset.top + plotH)
 
         pathD =
             buildAreaD baselineY projected
@@ -692,16 +682,16 @@ barOne cfg allSeries yR seriesIdx s =
             cfg.height - plotInset.top - plotInset.bottom
 
         plotWf =
-            intToFloat plotW
+            toFloat plotW
 
         plotHf =
-            intToFloat plotH
+            toFloat plotH
 
         groupCountF =
-            intToFloat (Math.max 1 groupCount)
+            toFloat (Math.max 1 groupCount)
 
         nSeriesF =
-            intToFloat (Math.max 1 nSeries)
+            toFloat (Math.max 1 nSeries)
 
         groupWidth =
             plotWf / groupCountF
@@ -719,22 +709,22 @@ barOne cfg allSeries yR seriesIdx s =
             yR.hi - yR.lo
 
         baselineY =
-            intToFloat (plotInset.top + plotH)
+            toFloat (plotInset.top + plotH)
 
         leftF =
-            intToFloat plotInset.left
+            toFloat plotInset.left
 
         topF =
-            intToFloat plotInset.top
+            toFloat plotInset.top
 
         seriesIdxF =
-            intToFloat seriesIdx
+            toFloat seriesIdx
     in
     List.indexedMap
         (\gi pt ->
             let
                 giF =
-                    intToFloat gi
+                    toFloat gi
 
                 groupX =
                     leftF + groupGap * 0.5 + giF * groupWidth
@@ -782,10 +772,10 @@ sparkline cfg values =
             Ui.colorCss cfg.color
 
         wf =
-            intToFloat cfg.width
+            toFloat cfg.width
 
         hf =
-            intToFloat cfg.height
+            toFloat cfg.height
 
         ys =
             case cfg.yRange of
@@ -810,14 +800,14 @@ sparkline cfg values =
             ys.hi - ys.lo
 
         nF =
-            intToFloat (Math.max 1 (n - 1))
+            toFloat (Math.max 1 (n - 1))
 
         projected =
             List.indexedMap
                 (\i v ->
                     let
                         iF =
-                            intToFloat i
+                            toFloat i
 
                         x =
                             (iF / nF) * wf
@@ -892,16 +882,16 @@ heatmap cfg grid =
             heatmapMaxCols grid
 
         wf =
-            intToFloat cfg.width
+            toFloat cfg.width
 
         hf =
-            intToFloat cfg.height
+            toFloat cfg.height
 
         rowsF =
-            intToFloat (Math.max 1 nRows)
+            toFloat (Math.max 1 nRows)
 
         colsF =
-            intToFloat (Math.max 1 nCols)
+            toFloat (Math.max 1 nCols)
 
         cellW =
             wf / colsF
@@ -934,7 +924,7 @@ heatmapRow : Cfg -> Float -> Float -> Float -> Float -> Int -> List Float -> Lis
 heatmapRow cfg cellW cellH gMin gMax rowIdx row =
     let
         rowIdxF =
-            intToFloat rowIdx
+            toFloat rowIdx
 
         gSpan =
             gMax - gMin
@@ -946,7 +936,7 @@ heatmapRow cfg cellW cellH gMin gMax rowIdx row =
         (\colIdx v ->
             let
                 colIdxF =
-                    intToFloat colIdx
+                    toFloat colIdx
 
                 x =
                     colIdxF * cellW
