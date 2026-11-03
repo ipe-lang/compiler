@@ -33,18 +33,21 @@ one that clamps to zero.
 Each stage carries a `Duration`, built with its unit named — `seconds 5`,
 `millis 750`, `minutes 2` — and a deliberate negative that becomes zero:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/duration-timeouts/src/Main.ipe
+schedule : List Stage
 schedule =
     [ { label = "connect", budget = Duration.seconds 5 }
     , { label = "handshake", budget = Duration.millis 750 }
     , { label = "download", budget = Duration.minutes 2 }
-    , { label = "cleanup", budget = Duration.seconds (0 - 3) } -- clamps to zero
+    , { label = "cleanup", budget = Duration.seconds (0 - 3) }
+    -- clamps to zero
     ]
 ```
 
 The span becomes a raw number only at the boundary, through `toMillis`:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/duration-timeouts/src/Main.ipe
+render : Stage -> String
 render stage =
     String.padRight 10 ' ' stage.label
         ++ String.fromInt (Duration.toMillis stage.budget)
@@ -53,7 +56,7 @@ render stage =
 
 Running it (`ipe dev run`) converts each unit correctly and clamps the negative span:
 
-```
+```text
 Timeout schedule:
   connect   5000 ms
   handshake 750 ms

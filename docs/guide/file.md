@@ -33,24 +33,26 @@ The example under
 creates a fresh temp directory, writes two notes, reads one back, and lists the
 directory — a whole session as one `do` block:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/file-scratchpad/src/Main.ipe
 main =
     do
+        -- `File.tempDir` returns the new directory's absolute path as a String.
         dir <- File.tempDir "scratchpad"
         Io.println ("scratch dir: " ++ dir)
-
+        -- Build validated paths under it. `toPath` lifts the `Result` from
+        -- `Path.fromString` into the task chain with `Task.fromResult`, so a
+        -- bad path fails the whole task rather than slipping through.
         notePath <- toPath (dir ++ "/note.txt")
         todoPath <- toPath (dir ++ "/todo.txt")
-
+        -- Write two files. `writeFile` overwrites; both return `Task Error ()`.
         File.writeFile notePath "remember to water the plants\n"
         File.writeFile todoPath "- ship the docs\n- rest\n"
-
+        -- Read one back and print it.
         contents <- File.readFile notePath
         Io.println ("note.txt says: " ++ String.trim contents)
-
+        -- Confirm existence through the typed path, and list the directory.
         present <- File.exists todoPath
         Io.println ("todo.txt exists: " ++ boolText present)
-
         dirPath <- toPath dir
         entries <- File.readDir dirPath
         Io.println ("entries: " ++ String.join ", " (List.sort entries))
@@ -60,7 +62,7 @@ The `toPath` helper is the parse-don't-validate boundary. Every raw path string
 passes through it, becoming a `Path` or failing the task — so `writeFile`,
 `readFile`, and the rest never see an unvalidated string:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/file-scratchpad/src/Main.ipe
 toPath : String -> Task Error Path
 toPath raw =
     Task.fromResult (Path.fromString raw)
@@ -68,7 +70,7 @@ toPath raw =
 
 Running it (`ipe dev run`) prints the session (the temp path varies per run):
 
-```
+```text
 scratch dir: /tmp/scratchpad<unique>
 note.txt says: remember to water the plants
 todo.txt exists: yes

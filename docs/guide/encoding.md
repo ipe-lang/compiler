@@ -32,7 +32,7 @@ what a decoder does with malformed input.
 The round-trip helper captures the asymmetry directly: `encode` is called
 plainly, `decode` returns a `Result` that the verdict must handle:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/encoding-round-trip/src/Main.ipe
 roundTrip : String -> (String -> String) -> (String -> Result Error String) -> String
 roundTrip label encode decode =
     let
@@ -41,7 +41,6 @@ roundTrip label encode decode =
 
         verdict =
             case decode encoded of
-
                 Ok back ->
                     if back == payload then
                         "round-trips"
@@ -58,11 +57,10 @@ roundTrip label encode decode =
 Malformed input is not an exception — it is an `Err` the caller pattern-matches.
 `"!!!"` is not valid base64:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/encoding-round-trip/src/Main.ipe
 badDecode : String
 badDecode =
     case Encoding.base64Decode "!!!" of
-
         Ok _ ->
             "unexpectedly decoded"
 
@@ -73,7 +71,7 @@ badDecode =
 Running it (`ipe dev run`) over a payload with non-ASCII text (`café ☕`) shows all
 three encodings round-trip, and the malformed decode is rejected cleanly:
 
-```
+```text
 original: user=ada&note=café ☕
 base64: dXNlcj1hZGEmbm90ZT1jYWbDqSDimJU=  (round-trips)
 url   : user%3Dada%26note%3Dcaf%C3%A9+%E2%98%95  (round-trips)

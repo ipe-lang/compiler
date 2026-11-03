@@ -38,7 +38,7 @@ Per-host settings (a window title, a mobile bundle id) live in the `delivery`
 record of `package.ipe`. Every field is optional; omit the record for the
 defaults.
 
-```ipe
+```ipe ipe:skip a package.ipe fragment: read syntactically, never type-checked, so a partial record is fine here
 package : Package
 package =
     { name = "ui-layout"
@@ -64,7 +64,7 @@ and at most 2 MiB; any other icon stops the build with an error naming the
 rule. The served base path comes from the server (`IPE_WEB_BASE_PATH` or
 `Server.mountApp`), not from `basePath`.
 
-```ipe
+```ipe ipe:skip a package.ipe fragment: read syntactically, never type-checked, so a partial record is fine here
 package : Package
 package =
     { name = "todo"
@@ -87,7 +87,7 @@ the `main` head `Web.tea` is enough.
 
 Package it:
 
-```
+```sh
 ipe release build web desktop
 ```
 
@@ -95,14 +95,14 @@ This compiles the app and lays out a bundle for the host OS. Every release write
 under its own `out/release/<delivery>/` — the delivery words joined by `-`, here
 `web-desktop` — so the deliveries of one `release build` never overwrite each other:
 
-```
+```text
 packaged `ui-layout` for linux → out/release/web-desktop/dist/linux/ui-layout
   This app requires WebKitGTK at runtime (Debian/Ubuntu: libwebkit2gtk-4.1-0).
 ```
 
 The Linux bundle is a self-contained tree:
 
-```
+```text
 out/release/web-desktop/dist/linux/ui-layout/
   bin/                 the compiled binary
   ui-layout.desktop    the desktop-entry launcher
@@ -123,7 +123,7 @@ WebAssembly and hosted offline from app assets inside a native iOS/Android
 webview. Because it is the `client` runtime, the app must enable the wasm client in
 `package.ipe`:
 
-```ipe
+```ipe ipe:skip a package.ipe fragment: read syntactically, never type-checked, so a partial record is fine here
 package : Package
 package =
     { name = "ui-layout"
@@ -135,13 +135,13 @@ package =
 Then package for a device OS. Because mobile is the `client` runtime, the host is
 spelled `web client <os>`:
 
-```
+```sh
 ipe release build web client android
 ```
 
 This builds the wasm bundle and materialises a native shell:
 
-```
+```text
   wasm bundle ready at out/release/web-client-android/release/web-client/www/
   bundle size: 196 KB (out/release/web-client-android/release/web-client/www/pkg/ipe_app_bg.wasm)
 packaged `ui-layout` for android → out/release/web-client-android/dist/android/ui-layout-android
@@ -170,7 +170,7 @@ on a machine without a display (desktop) or without the device (mobile).
 `ipe dev run web desktop` compiles and opens the app in a native webview window. To
 run the packaged build instead, launch the emitted binary directly:
 
-```
+```sh
 ipe release build web desktop
 ./out/release/web-desktop/dist/linux/<name>/bin/<name>
 ```
@@ -179,7 +179,7 @@ Linux needs WebKitGTK (`libwebkit2gtk-4.1-0`); macOS uses the system WebKit;
 Windows needs the Edge WebView2 runtime. On a **headless** box (CI, a server),
 run it under a virtual display:
 
-```
+```sh
 xvfb-run -a ./out/release/web-desktop/dist/linux/<name>/bin/<name>
 ```
 
@@ -189,7 +189,7 @@ xvfb-run -a ./out/release/web-desktop/dist/linux/<name>/bin/<name>
 `out/release/web-client-android/dist/android/<name>-android/`. To **simulate**, boot an emulator
 first (or start one from Android Studio's Device Manager):
 
-```
+```sh
 emulator -avd <your-avd> &
 ```
 
@@ -212,7 +212,7 @@ Android SDK.
 `WKWebView` plus a scheme handler serving the wasm client). Simulating needs
 **macOS + Xcode**:
 
-```
+```sh
 open out/release/web-client-ios/dist/ios/<name>-ios/          # open the Xcode project, pick an iOS Simulator, press ⌘R
 # headless macOS:
 xcrun simctl boot "iPhone 15"
@@ -232,13 +232,13 @@ a bundle can neither under-declare nor smuggle a permission the app never took.
 See exactly what a consent set yields, without building, with a read-only
 dry-run:
 
-```
+```sh
 ipe release build --emit-permissions android
 ```
 
 For an app that accepts `JsPort Geolocation`, that prints:
 
-```
+```text
 OS permissions for `geo-clipboard` on android
   js-port:geolocation → android.permission.ACCESS_FINE_LOCATION, android.permission.ACCESS_COARSE_LOCATION
 
