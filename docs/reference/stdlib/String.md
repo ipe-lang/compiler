@@ -674,6 +674,7 @@ pad : Int -> Char -> String -> String
 
 ```ipe
 pad 7 '.' "hello" --> ".hello."
+pad 5 ' ' "11" --> "  11 "
 pad 3 ' ' "hello" --> "hello"
 ```
 

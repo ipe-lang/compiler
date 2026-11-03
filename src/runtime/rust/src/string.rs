@@ -553,14 +553,14 @@ pub fn string_uncons(s: String) -> IpeMaybe<(char, String)> {
 }
 
 /// `String.pad : Int -> Char -> String -> String` — centre-pad `s` to width `n`
-/// with `ch`. Matches Elm: extra padding on the RIGHT when the total is odd.
-/// `n <= length s` returns `s` unchanged; a width past the ceiling trips
+/// with `ch`. Matches Elm: the extra character of an odd total goes on the
+/// LEFT. `n <= length s` returns `s` unchanged; a width past the ceiling trips
 /// `OutputCeiling`.
 #[must_use]
 pub fn string_pad(n: i64, ch: char, s: String) -> String {
     let total = pad_count(CeilingKernel::StringPad, n, s.chars().count());
-    let left = total / 2;
-    let right = total - left;
+    let right = total / 2;
+    let left = total - right;
     let mut out: String = std::iter::repeat_n(ch, left).collect();
     out.push_str(&s);
     out.extend(std::iter::repeat_n(ch, right));
@@ -3128,8 +3128,12 @@ mod tests {
 
     #[test]
     fn pad_matches_elm() {
-        // Elm: pad 5 ' ' "abc" == "  abc " (extra pad on the right when odd).
         assert_eq!(string_pad(5, ' ', "abc".into()), " abc ");
+        // Elm's own rows: the extra character of an odd total goes LEFT.
+        assert_eq!(string_pad(5, ' ', "1".into()), "  1  ");
+        assert_eq!(string_pad(5, ' ', "11".into()), "  11 ");
+        assert_eq!(string_pad(5, ' ', "121".into()), " 121 ");
+        assert_eq!(string_pad(4, '.', "a".into()), "..a.");
         assert_eq!(string_pad(4, '.', "ab".into()), ".ab.");
         assert_eq!(string_pad(2, '.', "abc".into()), "abc"); // n<=len → unchanged
     }
