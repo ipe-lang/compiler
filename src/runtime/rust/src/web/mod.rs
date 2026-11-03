@@ -7860,9 +7860,8 @@ where
         // before forwarding, so routes sit at the root and only the URLs the
         // page and glue carry are built from the app's base.
         let route_root = crate::encoding::MountBase::root();
-        for asset in widget_assets::registered() {
-            let path = route_root.url_of(&widget_assets::widget_asset_path(&asset.content));
-            let content: &'static str = &asset.content;
+        for (asset_path, content) in widget_assets::served_assets(widget_assets::registered()) {
+            let path = route_root.url_of(&asset_path);
             router = router.route(&path, get(move || async move { serve_widget_js(content) }));
         }
         let glue_path = route_root.url_of(&widget_assets::glue_path(

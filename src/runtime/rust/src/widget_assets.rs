@@ -176,6 +176,25 @@ pub fn widget_asset_path(content: &str) -> BundlePath {
     BundlePath::hashed(HashedAsset::Widget, digest_head(&content_digest(content)))
 }
 
+/// Each distinct content address of `assets` with the content it serves, in
+/// asset order.
+///
+/// Two hook files of identical bytes share one address, so the address is
+/// served once: a server registers each route exactly once, and the router
+/// refuses a second handler for the same path and method.
+#[must_use]
+pub fn served_assets(assets: &[WidgetAsset]) -> Vec<(BundlePath, &str)> {
+    let mut seen = std::collections::HashSet::with_capacity(assets.len());
+    assets
+        .iter()
+        .filter_map(|asset| {
+            let path = widget_asset_path(&asset.content);
+            seen.insert(path.clone())
+                .then_some((path, asset.content.as_str()))
+        })
+        .collect()
+}
+
 /// The `sha256-<b64>` SRI value for one widget asset's content.
 #[must_use]
 pub fn widget_asset_integrity(content: &str) -> String {
@@ -503,6 +522,76 @@ fn url_attr(out: &mut String, url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two hook files of identical bytes under distinct tags are served at
+    /// their one shared address once; distinct bytes keep their own address.
+    #[test]
+    fn identical_hook_files_are_served_once() {
+        let asset = |tag: &str, content: &str| WidgetAsset {
+            tag: tag.to_owned(),
+            content: content.to_owned(),
+        };
+        let assets = [
+            asset("ipe-ce-a", "export function mount() {}"),
+            asset("ipe-ce-b", "export function mount() {}"),
+            asset("ipe-ce-c", "export function mount() { return 1; }"),
+        ];
+        assert_eq!(
+            served_assets(&assets),
+            vec![
+                (
+                    widget_asset_path("export function mount() {}"),
+                    "export function mount() {}"
+                ),
+                (
+                    widget_asset_path("export function mount() { return 1; }"),
+                    "export function mount() { return 1; }"
+                ),
+            ]
+        );
+    }
+
+    /// Every served address mounts as its own route: a router given the
+    /// served set of two identical hook files builds, where the same two
+    /// files routed one by one hand the router a second handler at one path,
+    /// which it refuses.
+    #[cfg(feature = "web")]
+    #[test]
+    fn served_assets_mount_without_a_repeated_route() {
+        let assets = [
+            WidgetAsset {
+                tag: "ipe-ce-a".to_owned(),
+                content: "export function mount() {}".to_owned(),
+            },
+            WidgetAsset {
+                tag: "ipe-ce-b".to_owned(),
+                content: "export function mount() {}".to_owned(),
+            },
+        ];
+        let root = MountBase::root();
+        let built = std::panic::catch_unwind(|| {
+            served_assets(&assets)
+                .iter()
+                .fold(axum::Router::<()>::new(), |router, (path, _)| {
+                    router.route(&root.url_of(path), axum::routing::get(|| async {}))
+                })
+        });
+        assert!(built.is_ok(), "the served set routes each address once");
+        let repeated = std::panic::catch_unwind(|| {
+            assets
+                .iter()
+                .fold(axum::Router::<()>::new(), |router, asset| {
+                    router.route(
+                        &root.url_of(&widget_asset_path(&asset.content)),
+                        axum::routing::get(|| async {}),
+                    )
+                })
+        });
+        assert!(
+            repeated.is_err(),
+            "the router refuses one address routed twice, which the served set prevents"
+        );
+    }
 
     /// A URL that would close its attribute is escaped by the one seam; a
     /// URL with no attribute-special byte is written unchanged.
