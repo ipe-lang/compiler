@@ -36,7 +36,7 @@ list of scalar context values — each a `String`, `Int`, `Float`, `Bool` or
 `Char` — alongside the message. A record, `Secret` or other opaque value is
 refused at type-check; convert it first (`Error.toString e`, `Secret.redacted s`):
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/log-severities/src/Main.ipe
 main =
     do
         Log.info "service starting"
@@ -49,7 +49,7 @@ main =
 Running it (`ipe dev run`) writes each record as a timestamped, level-tagged line —
 the plain shape is `<timestamp> <LEVEL> <message>`:
 
-```
+```text
 <ts> INFO service starting
 <ts> WARN cache warm-up skipped
 <ts> INFO request handled GET /health 200
@@ -68,8 +68,11 @@ only non-deterministic part of the line.
 
 ```ipe
 import Ipe.Level as Level
+import Ipe.Log as Log
 
-Web.appWith [ Log.level Level.warn ] { ... }
+settings : List (Setting a)
+settings =
+    [ Log.level Level.warn ]
 ```
 
 With that setting, only `warn` and `error` records are emitted. The precedence is
