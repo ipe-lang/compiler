@@ -32,11 +32,13 @@ use cfg_scan::{cfg_test_only, expr_attrs, impl_item_attrs, item_attrs, trait_ite
 ///
 /// `time.rs` holds the instant arithmetic (`Time.addMillis`, `diffDays`, ...)
 /// and `web/transition.rs` the `Int` arms of the browser interpreter: each
-/// yields an Ipê `Int` exactly as `math.rs` does.
+/// yields an Ipê `Int` exactly as `math.rs` does. `string.rs` yields lengths
+/// and indexes as Ipê `Int`s and reads counts and widths from them.
 const ARITH_FILES: &[&str] = &[
     "math.rs",
     "basics.rs",
     "list.rs",
+    "string.rs",
     "time.rs",
     "web/transition.rs",
 ];
@@ -76,6 +78,31 @@ const ADMITTED: &[Admitted] = &[
         shape: "saturating_sub",
         count: 1,
         why: "a `usize` capacity hint for the output `Vec`, never an Ipê value",
+    },
+    Admitted {
+        file: "string.rs",
+        function: "string_right",
+        shape: "saturating_sub",
+        count: 1,
+        why: "the `usize` rune index the kept suffix starts at; a count past the \
+              length keeps every rune, so `0` is the exact index, never an Ipê value",
+    },
+    Admitted {
+        file: "string.rs",
+        function: "string_drop_right",
+        shape: "saturating_sub",
+        count: 1,
+        why: "the `usize` count of runes kept; dropping at least the length keeps \
+              none, so `0` is the exact count, never an Ipê value",
+    },
+    Admitted {
+        file: "string.rs",
+        function: "pad_count",
+        shape: "saturating_sub",
+        count: 1,
+        why: "the `usize` count of pad characters, below the ceiling-checked width; \
+              a string already that wide needs none, so `0` is the exact count, \
+              never an Ipê value",
     },
     Admitted {
         file: "time.rs",

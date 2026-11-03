@@ -45,7 +45,6 @@ PROSE_FILES = frozenset(
         "CONTRIBUTING.md",
         "LICENSE",
         "NOTICE",
-        "docs/divergences-from-elm.md",
     }
 )
 PROSE_DIRS = ("docs/adr/", "docs/assets/", "misc/")

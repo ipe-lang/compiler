@@ -1160,41 +1160,83 @@ pub enum RuntimeTrip {
     },
 }
 
-/// The kernels whose output size an `Int` argument chooses.
+/// Declares [`CeilingKernel`] and [`CeilingKernel::ALL`] from one list.
 ///
-/// The program computes the count or span from its input, so it picks the
-/// allocation size: each kernel refuses a request past its
-/// [`ceiling`](Self::ceiling) with [`RuntimeTrip::OutputCeiling`], never
-/// truncating and never allocating.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CeilingKernel {
-    /// `List.repeat`.
+/// A variant cannot be missing from `ALL`: both expand from the same rows.
+macro_rules! ceiling_kernels {
+    ($($(#[$meta:meta])* $variant:ident,)+) => {
+        /// The kernels whose output size an `Int` argument chooses.
+        ///
+        /// The program computes the count or span from its input, so it picks the
+        /// allocation size: each kernel refuses a request past its
+        /// [`ceiling`](Self::ceiling) with [`RuntimeTrip::OutputCeiling`], never
+        /// truncating and never allocating.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum CeilingKernel {
+            $($(#[$meta])* $variant,)+
+        }
+
+        impl CeilingKernel {
+            /// Every kernel, once each, in declaration order.
+            pub const ALL: [Self; Self::COUNT] = [$(Self::$variant),+];
+
+            const COUNT: usize = [$(Self::$variant),+].len();
+        }
+    };
+}
+
+ceiling_kernels! {
+    /// `List.repeat`: the count of elements built.
     ListRepeat,
-    /// `List.range`.
+    /// `List.range`: the count of integers in the span.
     ListRange,
+    /// `String.repeat`: the UTF-8 bytes of the result, `n` times the bytes of
+    /// the repeated string.
+    StringRepeat,
+    /// `String.padLeft`: the requested width, in characters (code points).
+    StringPadLeft,
+    /// `String.padRight`: the requested width, in characters (code points).
+    StringPadRight,
+    /// `String.pad`: the requested width, in characters (code points).
+    StringPad,
 }
 
 impl CeilingKernel {
-    /// The most elements one call of the kernel builds — the one ceiling
-    /// table. [`RuntimeTrip::message`] spells each number; a test pins the
-    /// two equal.
+    /// The most output one call of the kernel builds, in its [`unit`](Self::unit).
+    ///
+    /// The one ceiling table. [`RuntimeTrip::message`] spells each number; a
+    /// test pins the two equal.
     #[must_use]
     pub const fn ceiling(self) -> usize {
         match self {
             Self::ListRepeat | Self::ListRange => 10_000_000,
+            Self::StringRepeat => 64 * 1024 * 1024,
+            Self::StringPadLeft | Self::StringPadRight | Self::StringPad => 16_000_000,
+        }
+    }
+
+    /// The unit [`ceiling`](Self::ceiling) counts, as the trip message spells it.
+    #[must_use]
+    pub const fn unit(self) -> &'static str {
+        match self {
+            Self::ListRepeat | Self::ListRange => "element",
+            Self::StringRepeat => "byte",
+            Self::StringPadLeft | Self::StringPadRight | Self::StringPad => "character",
         }
     }
 }
 
-/// The message of kernel `$kernel` asked past its `$ceiling`-element ceiling.
+/// The message of kernel `$kernel` asked past its `$ceiling`-`$unit` ceiling.
 macro_rules! output_ceiling_message {
-    ($kernel:literal, $ceiling:literal) => {
+    ($kernel:literal, $ceiling:literal, $unit:literal) => {
         concat!(
             "`",
             $kernel,
             "` output exceeds the ",
             $ceiling,
-            "-element ceiling"
+            "-",
+            $unit,
+            " ceiling"
         )
     };
 }
@@ -1298,8 +1340,24 @@ impl RuntimeTrip {
                 FloatToIntOp::Truncate => non_finite_message!("trunc"),
             },
             Self::OutputCeiling { kernel } => match kernel {
-                CeilingKernel::ListRepeat => output_ceiling_message!("List.repeat", "10000000"),
-                CeilingKernel::ListRange => output_ceiling_message!("List.range", "10000000"),
+                CeilingKernel::ListRepeat => {
+                    output_ceiling_message!("List.repeat", "10000000", "element")
+                }
+                CeilingKernel::ListRange => {
+                    output_ceiling_message!("List.range", "10000000", "element")
+                }
+                CeilingKernel::StringRepeat => {
+                    output_ceiling_message!("String.repeat", "67108864", "byte")
+                }
+                CeilingKernel::StringPadLeft => {
+                    output_ceiling_message!("String.padLeft", "16000000", "character")
+                }
+                CeilingKernel::StringPadRight => {
+                    output_ceiling_message!("String.padRight", "16000000", "character")
+                }
+                CeilingKernel::StringPad => {
+                    output_ceiling_message!("String.pad", "16000000", "character")
+                }
             },
         }
     }
@@ -1964,12 +2022,17 @@ mod tests {
     // from the one table and converts to `LimitExceeded` at a boundary.
     #[test]
     fn output_ceiling_trips_are_typed_limit_exceeded() -> Result<(), &'static str> {
-        for (kernel, name) in [
-            (CeilingKernel::ListRepeat, "`List.repeat`"),
-            (CeilingKernel::ListRange, "`List.range`"),
-        ] {
+        for kernel in CeilingKernel::ALL {
+            let name = match kernel {
+                CeilingKernel::ListRepeat => "`List.repeat` ",
+                CeilingKernel::ListRange => "`List.range` ",
+                CeilingKernel::StringRepeat => "`String.repeat` ",
+                CeilingKernel::StringPadLeft => "`String.padLeft` ",
+                CeilingKernel::StringPadRight => "`String.padRight` ",
+                CeilingKernel::StringPad => "`String.pad` ",
+            };
             let fault = RuntimeTrip::OutputCeiling { kernel };
-            let ceiling = format!(" {}-element ", kernel.ceiling());
+            let ceiling = format!(" {}-{} ceiling", kernel.ceiling(), kernel.unit());
             let message = fault.message();
             if fault.label() != "OutputCeiling"
                 || !message.starts_with(name)
@@ -1989,6 +2052,96 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// The stdlib source of each kernel's doc, and the function it documents.
+    const fn ceiling_doc_site(kernel: CeilingKernel) -> (&'static str, &'static str) {
+        const LIST: &str = include_str!("../../../stdlib/Ipe/List.ipe");
+        const STRING: &str = include_str!("../../../stdlib/Ipe/String.ipe");
+        match kernel {
+            CeilingKernel::ListRepeat => (LIST, "repeat"),
+            CeilingKernel::ListRange => (LIST, "range"),
+            CeilingKernel::StringRepeat => (STRING, "repeat"),
+            CeilingKernel::StringPadLeft => (STRING, "padLeft"),
+            CeilingKernel::StringPadRight => (STRING, "padRight"),
+            CeilingKernel::StringPad => (STRING, "pad"),
+        }
+    }
+
+    /// The long numbers `text` spells: digit runs of six or more digits.
+    fn long_numbers(text: &str) -> Vec<&str> {
+        text.split(|c: char| !c.is_ascii_digit())
+            .filter(|run| run.len() >= 6)
+            .collect()
+    }
+
+    /// Whether `text` spells `ceiling` and every other long number it spells
+    /// is one of `known`.
+    fn spells_ceiling(text: &str, ceiling: usize, known: &[usize]) -> bool {
+        let numbers = long_numbers(text);
+        let want = ceiling.to_string();
+        numbers.contains(&want.as_str())
+            && numbers
+                .iter()
+                .all(|n| known.iter().any(|k| k.to_string() == *n))
+    }
+
+    // Every kernel's stdlib doc spells its ceiling from the one table and no
+    // other long number; its `docs/divergences-from-elm.md` section spells it
+    // too, beside no number outside the table.
+    #[test]
+    fn ceiling_docs_spell_the_table_ceiling() -> Result<(), String> {
+        const DIVERGENCES: &str = include_str!("../../../../docs/divergences-from-elm.md");
+        let table: Vec<usize> = CeilingKernel::ALL.iter().map(|k| k.ceiling()).collect();
+        for kernel in CeilingKernel::ALL {
+            let ceiling = kernel.ceiling();
+            let (source, function) = ceiling_doc_site(kernel);
+            let signature = format!("\n{function} : ");
+            let doc = source
+                .find(&signature)
+                .and_then(|at| source.get(..at))
+                .and_then(|before| before.rfind("{-|").and_then(|open| before.get(open..)))
+                .ok_or_else(|| format!("{kernel:?}: no doc block above `{function} :`"))?;
+            if !spells_ceiling(doc, ceiling, &[ceiling]) {
+                return Err(format!(
+                    "{kernel:?}: the `{function}` doc must spell {ceiling} and no other long number"
+                ));
+            }
+            let name = RuntimeTrip::OutputCeiling { kernel }
+                .message()
+                .split('`')
+                .nth(1)
+                .ok_or_else(|| format!("{kernel:?}: the trip message names no kernel"))?;
+            let section = DIVERGENCES
+                .split("\n## ")
+                .find(|section| {
+                    [format!("`{name}`"), format!("`{name} ")]
+                        .iter()
+                        .any(|spelled| section.contains(spelled.as_str()))
+                })
+                .ok_or_else(|| format!("{kernel:?}: no divergences section names `{name}`"))?;
+            if !spells_ceiling(section, ceiling, &table) {
+                return Err(format!(
+                    "{kernel:?}: the divergences section for `{name}` must spell {ceiling} \
+                     and no number outside the table"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    // The doc pin goes red on a stale, foreign or missing number.
+    #[test]
+    fn a_stale_ceiling_doc_is_refused() {
+        let at = 16_000_000;
+        assert!(spells_ceiling("more than 16000000 characters", at, &[at]));
+        assert!(!spells_ceiling("more than 16000001 characters", at, &[at]));
+        assert!(!spells_ceiling(
+            "more than 16000000, was 8000000",
+            at,
+            &[at]
+        ));
+        assert!(!spells_ceiling("no number at all", at, &[at]));
     }
 
     // [B8] The Ipê-visible message NEVER contains the foreign error's Debug detail
