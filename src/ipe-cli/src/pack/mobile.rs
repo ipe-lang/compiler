@@ -605,13 +605,8 @@ fn swapped_policy(
         path: shown.to_path_buf(),
     };
     let page = String::from_utf8(bytes).map_err(|_| mismatch())?;
-    let mut held = swaps.iter().filter(|swap| page.contains(&swap.served));
-    let (Some(swap), None) = (held.next(), held.next()) else {
-        return Err(mismatch());
-    };
-    if page.matches(&swap.served).nth(1).is_some() {
-        return Err(mismatch());
-    }
+    let swap = crate::bundle_www::sole_policy(&page, swaps, |swap| swap.served.as_str())
+        .ok_or_else(mismatch)?;
     Ok(page.replacen(&swap.served, &swap.hosted, 1))
 }
 
