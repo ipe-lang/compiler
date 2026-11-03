@@ -538,6 +538,10 @@ def wiring_errors(workflow: dict, groups: tuple[tuple[str, str, int], ...] = GRO
 DISK_SCRIPT = "tools/scripts/e2e-disk.py"
 DISK_FLOOR_INVOCATION = f"python3 {DISK_SCRIPT} --disk-floor"
 FREE_DISK_MARKER = "sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL"
+# Every job frees runner disk through this one composite action, which runs
+# `FREE_DISK_MARKER`; `--lint` pins both the step and the action's body.
+FREE_DISK_ACTION = "./.github/actions/free-disk-space"
+FREE_DISK_ACTION_FILE = os.path.join(REPO, ".github", "actions", "free-disk-space", "action.yml")
 DOWNLOAD_ACTION = "actions/download-artifact@"
 # The nextest every workflow installs. `taiki-e/install-action` installs the
 # latest release unless `tool:` names a version, so an unpinned install changes
@@ -600,7 +604,7 @@ def disk_order_errors(workflow: dict) -> list[str]:
         return [f"ci.yml has no `{E2E_JOB}` job"]
     steps = _steps(job)
     order = (
-        ("the free-disk step", _index(steps, lambda s: _runs(s, FREE_DISK_MARKER))),
+        ("the free-disk step", _index(steps, lambda s: s.get("uses") == FREE_DISK_ACTION)),
         ("the archive download", _index(steps, lambda s: str(s.get("uses", "")).startswith(DOWNLOAD_ACTION))),
         ("the unpack-then-delete step", _index(steps, lambda s: s.get("run", "").strip() == EXTRACT_RUN)),
         ("the disk floor", _index(steps, lambda s: s.get("run", "").strip() == DISK_FLOOR_INVOCATION)),
@@ -660,6 +664,23 @@ def load_disk_script():
     return mod
 
 
+def free_disk_action_errors(path: str = FREE_DISK_ACTION_FILE) -> list[str]:
+    """Return why the shared free-disk action could stop freeing the runner's disk."""
+    sys.path.insert(0, HERE)
+    import strict_yaml  # noqa: PLC0415  # PyYAML-backed; only `--lint` needs it
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            action = strict_yaml.safe_load(fh)
+    except Exception as exc:  # noqa: BLE001  # any load failure is a refusal
+        return [f"{FREE_DISK_ACTION} is unloadable: {exc}"]
+    runs = action.get("runs") if isinstance(action, dict) else None
+    steps = runs.get("steps") if isinstance(runs, dict) else None
+    if not isinstance(steps, list) or not any(isinstance(st, dict) and _runs(st, FREE_DISK_MARKER) for st in steps):
+        return [f"{FREE_DISK_ACTION} must run `{FREE_DISK_MARKER}`"]
+    return []
+
+
 def disk_script_errors(load=load_disk_script) -> list[str]:
     """Return why the disk floor could budget a thread count other than the shard's."""
     try:
@@ -698,7 +719,7 @@ def lint(path: str = CI_WORKFLOW) -> int:
         print(f"e2e shard lint: ci.yml is unreadable: {exc}", file=sys.stderr)
         return 1
     errors = [*group_errors(GROUPS), *wiring_errors(workflow)]
-    errors += shared_target_errors(workflow) + disk_order_errors(workflow) + disk_script_errors()
+    errors += shared_target_errors(workflow) + disk_order_errors(workflow) + disk_script_errors() + free_disk_action_errors()
     try:
         errors += nextest_pin_errors(_load_workflows())
     except Exception as exc:  # noqa: BLE001  # any read or parse failure is a refusal
