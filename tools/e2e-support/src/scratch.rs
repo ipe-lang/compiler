@@ -64,14 +64,16 @@ mod tests {
             .join(format!("e2e_support_scratch_claim_{}", std::process::id()));
         let tree = root.join("emitted");
         let worker_tree = tree.clone();
-        let removed = std::thread::spawn(move || {
-            fresh(&worker_tree);
-            std::fs::create_dir_all(worker_tree.join("src")).expect("create the scratch tree");
-            std::fs::write(worker_tree.join("src").join("main.rs"), "fn main() {}")
-                .expect("write into the scratch tree");
-            assert!(worker_tree.join("src").join("main.rs").is_file());
-        })
-        .join();
+        let removed = std::thread::Builder::new()
+            .spawn(move || {
+                fresh(&worker_tree);
+                std::fs::create_dir_all(worker_tree.join("src")).expect("create the scratch tree");
+                std::fs::write(worker_tree.join("src").join("main.rs"), "fn main() {}")
+                    .expect("write into the scratch tree");
+                assert!(worker_tree.join("src").join("main.rs").is_file());
+            })
+            .expect("spawn the claiming thread")
+            .join();
         assert!(removed.is_ok(), "the claiming thread ran to its end");
         assert!(
             !tree.exists(),
@@ -88,12 +90,13 @@ mod tests {
         let tree = root.join("emitted");
         std::fs::create_dir_all(&tree).expect("create the stale tree");
         std::fs::write(tree.join("stale.rs"), "").expect("write the stale file");
-        let worker_tree = tree.clone();
-        let seen = std::thread::spawn(move || {
-            fresh(&worker_tree);
-            worker_tree.exists()
-        })
-        .join();
+        let seen = std::thread::Builder::new()
+            .spawn(move || {
+                fresh(&tree);
+                tree.exists()
+            })
+            .expect("spawn the claiming thread")
+            .join();
         assert!(
             matches!(seen, Ok(false)),
             "a claim must empty the earlier run's tree before the test writes"
