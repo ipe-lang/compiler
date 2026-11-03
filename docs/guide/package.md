@@ -8,7 +8,7 @@ Ipe.Package` for the full type.
 
 ## Minimal
 
-```ipe
+```ipe ipe:excerpt examples/shapes/non-tea/hello-world/package.ipe
 module Package exposing (package)
 
 import Ipe.Package exposing (..)
@@ -16,7 +16,7 @@ import Ipe.Package exposing (..)
 
 package : Package
 package =
-    { name = "my-app"
+    { name = "ipe-app"
     , version = "0.1.0"
     }
 ```
@@ -45,7 +45,7 @@ package =
 
 Build each entry with a smart constructor — never hand-write the record:
 
-```ipe
+```ipe ipe:skip a package.ipe field fragment, not a standalone program; Ipe.Package is read only from a project's own manifest, never importable from ordinary Ipê source
 dependencies =
     [ dep "ipe-http" "^1.2"                                   -- from the index, by semver
     , depGit "lib" "https://github.com/example/lib.git"       -- git, latest
@@ -65,7 +65,7 @@ this package's `src/`. `ipe fmt` keeps working, and `ipe add <pkg>[@<req>]` stil
 writes a `dep` line and pins it in `ipe.lock`; `depGit`/`depPath` lines are
 author-written and never rewritten. Rust crates for FFI:
 
-```ipe
+```ipe ipe:skip a package.ipe field fragment, not a standalone program; Ipe.Package is read only from a project's own manifest, never importable from ordinary Ipê source
 rustDependencies =
     [ rustDep "uuid" "1.10"
     , rustDepWith "tokio" "1" [ "rt", "macros" ]
@@ -77,7 +77,7 @@ rustDependencies =
 A program's capabilities are *inferred*; `capabilities` lets you pin the
 expected set (`declares`) and pre-accept an escape hatch (`accepts`):
 
-```ipe
+```ipe ipe:skip a package.ipe field fragment, not a standalone program; Ipe.Package is read only from a project's own manifest, never importable from ordinary Ipê source
 capabilities =
     { declares = [ Network, Clock, Database ]
     , accepts = [ JsPort Geolocation, Unsafe ]
@@ -95,7 +95,7 @@ The vocabulary: `Network`, `Filesystem`, `Database`, `Env`, `Subprocess`,
 `wasm` turns on a WebAssembly client — required for a `client` web app (browser
 or mobile). Off by default:
 
-```ipe
+```ipe ipe:skip a package.ipe field fragment, not a standalone program; Ipe.Package is read only from a project's own manifest, never importable from ordinary Ipê source
 wasm = On { mode = Render }          -- a self-contained SPA
 -- On { mode = Hydrate }            -- hydrate a server-rendered page
 -- optional: entry, mount ("#app"), publicEnv, optLevel
@@ -104,7 +104,7 @@ wasm = On { mode = Render }          -- a self-contained SPA
 `delivery` holds per-host settings; every sub-record is optional and falls back
 to its default:
 
-```ipe
+```ipe ipe:skip a package.ipe field fragment, not a standalone program; Ipe.Package is read only from a project's own manifest, never importable from ordinary Ipê source
 delivery =
     { ships = [ binary, desktop, clientAndroid ]   -- default: [ binary ]
     , desktop = { title = "My App", width = 1024, height = 768 }
@@ -138,7 +138,7 @@ and at most 2 MiB; any other icon stops the build with an error naming the
 rule. The served base path comes from the server (`IPE_WEB_BASE_PATH` or
 `Server.mountApp`), not from `basePath`.
 
-```ipe
+```ipe ipe:skip a package.ipe field fragment, not a standalone program; Ipe.Package is read only from a project's own manifest, never importable from ordinary Ipê source
 package : Package
 package =
     { name = "todo"
@@ -172,7 +172,7 @@ value.
 A mobile app that accepts `JsPort Push` names its push identifiers under
 `delivery.mobile.push`:
 
-```ipe
+```ipe ipe:skip a package.ipe field fragment, not a standalone program; Ipe.Package is read only from a project's own manifest, never importable from ordinary Ipê source
 mobile =
     { bundleId = "io.acme.myapp"
     , push =
@@ -199,7 +199,7 @@ app](delivery.md) for the build/run/simulate grammar these feed.
 
 ## Build
 
-```ipe
+```ipe ipe:skip a package.ipe field fragment, not a standalone program; Ipe.Package is read only from a project's own manifest, never importable from ordinary Ipê source
 build =
     { database = Sqlite          -- Sqlite | Postgres
     , static = False             -- link a fully-static musl binary
@@ -211,7 +211,7 @@ build =
 
 ## A fully-populated manifest
 
-```ipe
+```ipe ipe:skip a package.ipe field fragment, not a standalone program; Ipe.Package is read only from a project's own manifest, never importable from ordinary Ipê source — and this declared dependency would itself be refused before the manifest's own fields matter
 module Package exposing (package)
 
 import Ipe.Package exposing (..)

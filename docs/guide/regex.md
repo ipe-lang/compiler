@@ -38,7 +38,7 @@ Patterns are compiled **once**, at a boundary. `Result.combine` collects the lis
 of compile results into a single `Result` — a typo in any pattern is one
 observable error here, never a silent miss later:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/regex-log-scrub/src/Main.ipe
 rules : Result Error (List Rule)
 rules =
     Result.combine
@@ -56,21 +56,22 @@ compileRule pattern replacement =
 Redaction is `Regex.replace`: every match of a rule's pattern becomes its
 replacement text. Folding the rules over a line applies them all:
 
-```ipe
-scrub : List Rule -> String -> String
-scrub ruleList line =
-    List.foldl applyRule line ruleList
-
-
+```ipe ipe:excerpt examples/shapes/script/regex-log-scrub/src/Main.ipe
 applyRule : Rule -> String -> String
 applyRule rule line =
     Regex.replace rule.pattern rule.replacement line
+
+
+-- Scrub a line by folding every rule over it.
+scrub : List Rule -> String -> String
+scrub ruleList line =
+    List.foldl applyRule line ruleList
 ```
 
 The audit uses `Regex.findAll` to list every token seen — each non-overlapping
 match, in order:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/regex-log-scrub/src/Main.ipe
 leakedTokens : Rule -> String -> List String
 leakedTokens tokenRule line =
     Regex.findAll tokenRule.pattern line
@@ -78,7 +79,7 @@ leakedTokens tokenRule line =
 
 Running it (`ipe dev run`) prints the scrubbed log and the collected tokens:
 
-```
+```text
 Scrubbed log:
   user [email] logged in
   token=[redacted] issued for [email]
