@@ -82,11 +82,14 @@ pub const fn ipe_int_exact_mul(a: i64, b: i64) -> Option<i64> {
     a.checked_mul(b)
 }
 
-/// The exact Ipê `Int` truncating quotient, or `None` for a zero divisor or
-/// `i64::MIN / -1`.
+/// The Ipê `Int` truncating quotient, or `None` for `i64::MIN / -1`.
+///
+/// A zero divisor yields `0`, as in Elm and as `modBy 0` does: the one
+/// definition of `x // 0` every evaluator (runtime operator, constant folder)
+/// reads.
 #[must_use]
 pub const fn ipe_int_exact_div(a: i64, b: i64) -> Option<i64> {
-    a.checked_div(b)
+    if b == 0 { Some(0) } else { a.checked_div(b) }
 }
 
 /// Integer addition for Ipê's `+` operator on `Int` operands.
@@ -116,23 +119,11 @@ pub fn ipe_int_mul(a: i64, b: i64) -> i64 {
 
 /// Integer division for Ipê's `//` operator.
 ///
-/// The truncating quotient (toward zero). `i64::MIN // -1`, whose exact
-/// quotient `2^63` is outside the 64-bit range, trips `IntOverflow`.
-///
-/// # Panics
-///
-/// Panics when `b == 0`, the Ipê integer division-by-zero abort: the standard
-/// "attempt to divide by zero" message the panic hook classifies as
-/// `DivisionByZero` (exit 101, empty stdout), as the
-/// `intdiv_by_zero_aborts_exit_101` golden pins.
-//
-// `clippy::panic` is suppressed here deliberately: this panic IS the
-// DivisionByZero abort, a classified, tested, intentional one.
-#[allow(clippy::panic)]
+/// The truncating quotient (toward zero); `x // 0` is `0`, as in Elm.
+/// `i64::MIN // -1`, whose exact quotient `2^63` is outside the 64-bit range,
+/// trips `IntOverflow`.
 #[must_use]
 pub fn ipe_int_div(a: i64, b: i64) -> i64 {
-    // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — this abort IS the modeled integer division-by-zero semantics, classified and golden-tested (exit 101) [ledger #boundary]
-    assert!(b != 0, "attempt to divide by zero");
     ipe_int_exact_div(a, b).unwrap_or_else(|| trip(RuntimeTrip::IntOverflow { op: IntOp::Div }))
 }
 
@@ -405,6 +396,16 @@ mod tests {
         assert_eq!(ipe_int_div(-7, 2), -3);
     }
 
+    // `x // 0` is `0` for every dividend, the least `Int` included: no abort,
+    // no trip, and the exact half answers the same `0`.
+    #[test]
+    fn ipe_int_div_by_zero_is_zero() {
+        for a in [i64::MIN, i64::MIN + 1, -7, -1, 0, 1, 7, i64::MAX] {
+            assert_eq!(outcome(|| ipe_int_div(a, 0)), Ok(0), "{a} // 0");
+            assert_eq!(ipe_int_exact_div(a, 0), Some(0), "{a} // 0");
+        }
+    }
+
     // The `IpeWrapping*` trait impls (generic `Number a` bodies) and the
     // `ipe_int_*` operators (monomorphic `Int` bodies) agree at every edge:
     // the same value in range, the same typed `IntOverflow` trip outside it.
@@ -458,7 +459,7 @@ mod tests {
         assert_eq!(ipe_int_exact_sub(i64::MIN, 1), None);
         assert_eq!(ipe_int_exact_mul(i64::MIN, -1), None);
         assert_eq!(ipe_int_exact_div(i64::MIN, -1), None);
-        assert_eq!(ipe_int_exact_div(7, 0), None);
+        assert_eq!(ipe_int_exact_div(7, 0), Some(0));
         let edges = [
             i64::MIN,
             i64::MIN + 1,

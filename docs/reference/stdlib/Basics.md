@@ -15,6 +15,8 @@ builtin `Order` is exposed so `Basics.Order` names it.
 `Int` is 64-bit. An `Int` result outside that range — from `+`, `-`, `*`,
 `//` (the least `Int` divided by `-1`), `negate`, or `abs` — ends in a
 typed `InvalidInput` error, never a wrapped number.
+Division by zero is not a range error: `x // 0` is `0`, as in Elm, just as
+`modBy 0 x` is `0`.
 
 ## `identity`
 

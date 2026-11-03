@@ -1046,17 +1046,17 @@ fn eval_with_local(
 /// total, deterministic operations the pure builders use are folded: string
 /// append (`++`), integer/float arithmetic (exact / IEEE-754, matching the
 /// runtime), and the boolean / comparison operators. An integer result outside
-/// the `Int` range, integer division by zero, and any operand-kind mismatch
-/// yield `None` (unfolded), so the runtime trips and a fold never diverges.
+/// the `Int` range and any operand-kind mismatch yield `None` (unfolded), so
+/// the runtime trips and a fold never diverges.
 fn eval_binop(op: BinOp, l: &ConstValue, r: &ConstValue) -> Option<ConstValue> {
     use ConstValue::{Bool, Float, Int, Str};
     match (op, l, r) {
         (BinOp::Append, Str(a), Str(b)) => Some(Str(format!("{a}{b}"))),
 
         // Int arithmetic folds only through the runtime's exact half: an
-        // in-range result is the runtime operator's result, and an out-of-range
-        // edge (overflow, a zero divisor, `MIN // -1`) does not fold, so the
-        // emitted runtime call alone decides it.
+        // in-range result (`x // 0` is `0`) is the runtime operator's result,
+        // and an out-of-range edge (overflow, `MIN // -1`) does not fold, so
+        // the emitted runtime call alone decides it.
         (BinOp::IntAdd | BinOp::Add, Int(a), Int(b)) => ipe_int_exact_add(*a, *b).map(Int),
         (BinOp::IntSub | BinOp::Sub, Int(a), Int(b)) => ipe_int_exact_sub(*a, *b).map(Int),
         (BinOp::IntMul | BinOp::Mul, Int(a), Int(b)) => ipe_int_exact_mul(*a, *b).map(Int),
@@ -1906,10 +1906,10 @@ mod tests {
         assert_eq!(fold_const(&pipeline, &env), Some(ConstValue::Str(expected)));
     }
 
-    /// An Int edge the runtime decides (overflow, zero divisor, `MIN // -1`)
-    /// never folds to a baked constant; an in-range fold equals the emitted
-    /// runtime operator byte for byte. The runtime operator is called only on
-    /// a pair the folder answers, since an out-of-range pair trips it.
+    /// An Int edge the runtime decides (overflow, `MIN // -1`) never folds to
+    /// a baked constant; an in-range fold, `x // 0` included, equals the
+    /// emitted runtime operator byte for byte. The runtime operator is called
+    /// only on a pair the folder answers, since an out-of-range pair trips it.
     #[test]
     fn int_fold_declines_every_out_of_range_edge() {
         use ConstValue::Int;
@@ -1922,7 +1922,6 @@ mod tests {
             (BinOp::IntMul, i64::MIN, -1),
             (BinOp::Mul, i64::MAX, 2),
             (BinOp::IntDiv, i64::MIN, -1),
-            (BinOp::IntDiv, 10, 0),
         ];
         for (op, a, b) in edges {
             assert_eq!(eval_binop(op, &Int(a), &Int(b)), None, "{op:?} {a} {b}");
@@ -1940,14 +1939,27 @@ mod tests {
                         assert_eq!(folded, Int(runtime(a, b)), "{op:?} {a} {b}");
                     }
                 }
-                if b != 0 {
-                    assert_eq!(
-                        eval_binop(BinOp::IntDiv, &Int(a), &Int(b)),
-                        Some(Int(ipe_runtime_rust::math::ipe_int_div(a, b))),
-                        "{a} // {b}"
-                    );
-                }
+                assert_eq!(
+                    eval_binop(BinOp::IntDiv, &Int(a), &Int(b)),
+                    Some(Int(ipe_runtime_rust::math::ipe_int_div(a, b))),
+                    "{a} // {b}"
+                );
             }
+        }
+    }
+
+    /// `x // 0` folds to `0`, the runtime operator's own result, for every
+    /// dividend: the folder and the runtime share the one definition.
+    #[test]
+    fn int_div_by_zero_folds_to_runtime_zero() {
+        use ConstValue::Int;
+        for a in [i64::MIN, -7, 0, 7, i64::MAX] {
+            assert_eq!(
+                eval_binop(BinOp::IntDiv, &Int(a), &Int(0)),
+                Some(Int(0)),
+                "{a} // 0"
+            );
+            assert_eq!(ipe_runtime_rust::math::ipe_int_div(a, 0), 0, "{a} // 0");
         }
     }
 }

@@ -555,7 +555,8 @@ pub const fn operator_meaning(op: BinOp) -> &'static str {
         BinOp::FloatDiv => "Divides one `Float` by another: `7.0 / 2.0 == 3.5`.",
         BinOp::IntDiv => {
             "Divides one `Int` by another, truncating the quotient toward zero: \
-             `7 // 2 == 3`, `-7 // 2 == -3`."
+             `7 // 2 == 3`, `-7 // 2 == -3`. Dividing by zero gives zero, as in Elm: \
+             `7 // 0 == 0`."
         }
         BinOp::Add => "Adds two numbers, both `Int` or both `Float`: `1 + 2 == 3`.",
         BinOp::Sub => {
@@ -1049,6 +1050,15 @@ mod tests {
             let precedence = format!("Precedence {} ", op.fixity().prec());
             assert!(entry.text.contains(&precedence), "{key}: {}", entry.text);
         }
+    }
+
+    /// `ipe doc //` states what `x // 0` gives, so the zero divisor is never
+    /// left for the reader to guess.
+    #[test]
+    fn int_div_entry_states_the_zero_divisor() {
+        let idx = Index::build_embedded().expect("embedded index build must succeed");
+        let entry = idx.resolve("//").expect("`//` resolves");
+        assert!(entry.text.contains("`7 // 0 == 0`"), "{}", entry.text);
     }
 
     /// An operator whose text another source already holds is refused, never

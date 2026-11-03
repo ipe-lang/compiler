@@ -44,6 +44,8 @@ and is exercised by the first-party examples sweep.
   `List.sum`, and `List.product` either return the exact result or end in a
   typed `InvalidInput` error — never a wrapped or rounded number. This covers
   the least `Int` divided by `-1` and `negate`/`abs` of the least `Int`.
+  Division by zero is not a range error: `x // 0` is `0`, as in Elm, just as
+  `modBy 0 x` is `0`.
 
 - **`floor`, `ceil`, `round`, and `trunc` refuse a `Float` with no `Int`
   value.** Elm returns a non-integer number for NaN or an infinity. In Ipê, NaN,
