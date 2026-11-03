@@ -4108,11 +4108,6 @@ mod tests {
         SpaBundle::from_www_dir(&www).expect("collect the bundle")
     }
 
-    /// The `/`-joined asset paths of `spa`, in bundle order.
-    fn rels(spa: &SpaBundle) -> Vec<&str> {
-        spa.assets().iter().map(|a| a.path.to_shell_rel()).collect()
-    }
-
     // ── OS resolution ─────────────────────────────────────────────────────────
 
     #[test]
