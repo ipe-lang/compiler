@@ -1259,7 +1259,7 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
     let artifact = match compile_target {
         CompileTarget::WasmClient => Some(bundle_wasm(
             crate_dir.dir(),
-            &crate::bundle_www::BundleHome::Dev(output.clone()),
+            &crate::bundle_www::BundleHome::Dev(output),
         )?),
         CompileTarget::WasmWasi => {
             bundle_wasi(crate_dir.dir())?;
@@ -3454,11 +3454,8 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     //   * Native — fall through to the cargo build + exec below.
     match compile_target {
         CompileTarget::WasmClient => {
-            return bundle_wasm(
-                crate_dir.dir(),
-                &crate::bundle_www::BundleHome::Dev(output.clone()),
-            )
-            .map(drop);
+            return bundle_wasm(crate_dir.dir(), &crate::bundle_www::BundleHome::Dev(output))
+                .map(drop);
         }
         CompileTarget::WasmWasi => {
             // The `wasi_run` feature gate already fired before emit (above), so
