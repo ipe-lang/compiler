@@ -32,6 +32,27 @@ Encoding to bytes and out to the transport forms is all total — no `Maybe` in
 sight, because none of these steps can fail:
 
 ```ipe
+import Ipe.Bytes as Bytes
+import Ipe.Io as Io
+import Ipe.String as String
+
+
+message : String
+message =
+    "café ☕"
+
+
+decodeText : Bytes -> String
+decodeText buffer =
+    case Bytes.toString buffer of
+
+        Just text ->
+            "\"" ++ text ++ "\""
+
+        Nothing ->
+            "(not valid UTF-8)"
+
+
 main =
     let
         buffer =
@@ -56,6 +77,9 @@ and slicing the first four bytes cuts through the middle of a multi-byte
 character, leaving a buffer that is not valid UTF-8:
 
 ```ipe
+import Ipe.Bytes as Bytes
+
+
 decodeText : Bytes -> String
 decodeText buffer =
     case Bytes.toString buffer of
@@ -70,7 +94,7 @@ decodeText buffer =
 Running it (`ipe dev run`) shows the full buffer round-trips but the truncated window
 does not:
 
-```
+```text
 message: café ☕
 byte length: 9
 hex: 636166c3a920e29895

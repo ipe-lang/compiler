@@ -39,7 +39,11 @@ The cache is built once from an explicit config. `withMaxEntries 2` sets the cap
 millisecond count:
 
 ```ipe
-buildCache : Task Error (Cache String String)
+import Ipe.Cache as Cache
+import Ipe.Duration as Duration
+
+
+buildCache : Task Error (Cache.Cache String String)
 buildCache =
     Cache.new
         (Cache.defaultCfg
@@ -65,7 +69,7 @@ lookupText key found =
 With both slots full, writing a third key evicts the least-recently-used one.
 Running it (`ipe dev run`) prints:
 
-```
+```text
 hit  alice -> editor
 miss bob (absent or evicted)
 hit  carol -> admin

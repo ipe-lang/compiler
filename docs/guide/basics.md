@@ -40,7 +40,7 @@ A thermostat only trusts a reading in `[ -40, 125 ]`. `clamp` pins each one into
 that band, so a stuck-high or stuck-low sensor becomes a boundary value rather
 than poisoning the result — the conservative, in-range outcome by construction:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/basics-clamp-normalize/src/Main.ipe
 normalize : Reading -> Reading
 normalize reading =
     { reading | celsius = clamp (negate 40) 125 reading.celsius }
@@ -49,7 +49,7 @@ normalize reading =
 Sorting is one `sortWith` over `compare`, which returns the `Order` the sort
 needs — no bespoke comparison operators:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/basics-clamp-normalize/src/Main.ipe
 byTemp : Reading -> Reading -> Order
 byTemp a b =
     compare a.celsius b.celsius
@@ -58,7 +58,7 @@ byTemp a b =
 `min` and `max` collapse the list to its extremes inside a `foldl`, and
 `String.fromInt` renders each `Int` for the report:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/basics-clamp-normalize/src/Main.ipe
 render : Reading -> String
 render reading =
     String.padRight 8 ' ' reading.sensor ++ String.fromInt reading.celsius ++ " C"
@@ -67,7 +67,7 @@ render reading =
 Running it (`ipe dev run`) clamps the two impossible readings to the band edges,
 orders the rest, and prints the range:
 
-```
+```text
 Sensor readings (clamped to [-40, 125], coldest first):
   cellar  -40 C
   hall    21 C

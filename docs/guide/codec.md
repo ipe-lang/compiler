@@ -35,6 +35,9 @@ unknown tag.
 The `List Int` codec is *derived* from the `Int` codec — no separate array parser:
 
 ```ipe
+import Ipe.Codec as Codec exposing (Codec)
+
+
 numbersCodec : Codec (List Int)
 numbersCodec =
     Codec.list Codec.int
@@ -44,6 +47,23 @@ Because `toJson` and `fromJson` read the same codec, encoding then decoding
 recovers the original exactly — the round-trip law, live:
 
 ```ipe
+import Ipe.Codec as Codec exposing (Codec)
+
+
+numbersCodec : Codec (List Int)
+numbersCodec =
+    Codec.list Codec.int
+
+
+boolText : Bool -> String
+boolText b =
+    if b then
+        "yes"
+
+    else
+        "no"
+
+
 roundTripNumbers xs =
     let
         json =
@@ -59,6 +79,19 @@ The `Priority` enum maps each constructor to a wire name. Decoding a tag that
 isn't in the list is a typed `Err` — fail-closed, never a wrong constructor:
 
 ```ipe
+import Ipe.Codec as Codec exposing (Codec)
+
+
+type Priority
+    = Low
+    | High
+
+
+priorityEq : Priority -> Priority -> Bool
+priorityEq a b =
+    a == b
+
+
 priorityCodec : Codec Priority
 priorityCodec =
     Codec.enum priorityEq [ ( Low, "low" ), ( High, "high" ) ]
@@ -66,7 +99,7 @@ priorityCodec =
 
 Running it (`ipe dev run`):
 
-```
+```text
 encoded [3,1,4,1,5] ; decoded == original: yes
 decode "high" -> High
 decode "urgent" -> rejected (unknown tag — fail-closed)

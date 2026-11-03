@@ -35,6 +35,9 @@ then grants, tests, and revokes them.
 Each capability is a single-bit mask, built by shifting `1` into position:
 
 ```ipe
+import Ipe.Bitwise as Bitwise
+
+
 read =
     Bitwise.shiftLeftBy 0 1
 
@@ -50,6 +53,9 @@ against the mask (every bit of the mask is set); revoking is AND with the
 complement (clear that bit, leave the rest):
 
 ```ipe
+import Ipe.Bitwise as Bitwise
+
+
 grant a b =
     Bitwise.or a b
 
@@ -62,7 +68,7 @@ revoke mask flags =
 
 Running it (`ipe dev run`) shows a set built up and then narrowed:
 
-```
+```text
 read|write   -> read write -
 read|write|x -> read write exec
 revoke write -> read - exec

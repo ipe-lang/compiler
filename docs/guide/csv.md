@@ -34,6 +34,10 @@ Filtering is an ordinary `List.filter` over the typed `rows`, rebuilt into the
 document with `withRows`:
 
 ```ipe
+import Ipe.Csv as Csv exposing (Csv)
+import Ipe.List as List
+
+
 shippedOnly : Csv -> Csv
 shippedOnly csv =
     Csv.withRows (List.filter isShipped csv.rows) csv
@@ -42,6 +46,11 @@ shippedOnly csv =
 isShipped : List String -> Bool
 isShipped row =
     elementAt 2 row == Just "shipped"
+
+
+elementAt : Int -> List a -> Maybe a
+elementAt n xs =
+    List.head (List.drop n xs)
 ```
 
 The cell read is deliberately safe — `elementAt` returns a `Maybe`, so a ragged
@@ -49,6 +58,9 @@ row without a status column simply fails the match instead of indexing out of
 bounds:
 
 ```ipe
+import Ipe.List as List
+
+
 elementAt : Int -> List a -> Maybe a
 elementAt n xs =
     List.head (List.drop n xs)
@@ -58,6 +70,38 @@ Parsing is the boundary: the whole pipeline runs only inside the `Ok` branch, so
 every downstream step holds a real `Csv`:
 
 ```ipe
+import Ipe.Csv as Csv exposing (Csv)
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.String as String
+
+
+export : String
+export =
+    String.join "\n"
+        [ "id,customer,status,total"
+        , "1,Ada,shipped,42.00"
+        , "2,Grace,pending,17.50"
+        , "3,Linus,shipped,8.99"
+        , "4,\"Doe, Jane\",cancelled,0.00"
+        ]
+
+
+shippedOnly : Csv -> Csv
+shippedOnly csv =
+    Csv.withRows (List.filter isShipped csv.rows) csv
+
+
+isShipped : List String -> Bool
+isShipped row =
+    elementAt 2 row == Just "shipped"
+
+
+elementAt : Int -> List a -> Maybe a
+elementAt n xs =
+    List.head (List.drop n xs)
+
+
 main =
     case Csv.parse export of
 
@@ -74,7 +118,7 @@ main =
 The export includes a quoted cell containing a comma — `"Doe, Jane"` — which the
 parser reads as a single field. Running it (`ipe dev run`) prints:
 
-```
+```text
 parsed rows: 4
 shipped orders re-encoded:
 id,customer,status,total

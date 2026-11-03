@@ -37,6 +37,9 @@ an injected selector, then renders them.
 A rule is a selector and a list of typed declarations:
 
 ```ipe
+import Ipe.Css as Css
+
+
 card : Css.CssRule
 card =
     Css.rule ".card"
@@ -53,6 +56,9 @@ sink. The sanitizer rejects it, so the whole rule becomes `CssRuleDropped` and
 renders as nothing — the attempt never reaches the output:
 
 ```ipe
+import Ipe.Css as Css
+
+
 injected : Css.CssRule
 injected =
     Css.rule ".card { } </style><script>alert(1)</script>"
@@ -62,6 +68,33 @@ injected =
 `Css.stylesheet` renders the list; the dropped rule contributes nothing:
 
 ```ipe
+import Ipe.Css as Css
+
+
+card : Css.CssRule
+card =
+    Css.rule ".card"
+        [ Css.background (Css.hex "#1a1a2e")
+        , Css.color (Css.hex "#e2e8f0")
+        , Css.padding (Css.px 16)
+        , Css.borderRadius (Css.px 8)
+        , Css.fontSize (Css.rem 1.0)
+        ]
+
+
+wideCard : Css.CssRule
+wideCard =
+    Css.media
+        "screen and (min-width: 640px)"
+        [ Css.rule ".card" [ Css.padding (Css.px 32) ] ]
+
+
+injected : Css.CssRule
+injected =
+    Css.rule ".card { } </style><script>alert(1)</script>"
+        [ Css.color (Css.hex "#ff0000") ]
+
+
 sheet : String
 sheet =
     Css.stylesheet [ card, wideCard, injected ]
