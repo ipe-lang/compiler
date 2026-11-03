@@ -1,22 +1,18 @@
-//! The `CustomElement.node` shape-admissibility gate (IPE-L0147).
+//! The custom-element placement gate (IPE-L0147).
 //!
-//! `CustomElement.node : CustomElement down up -> down -> (up -> msg) -> Element msg`
-//! mounts a server-driven browser custom element. Its up-event payload rides the
-//! seal codec, which is compiled in only when a browser shape forces the runtime
-//! `json` feature (the `Web` shape, served or webview-hosted). Under a
-//! `Terminal` / `Program`
-//! shape the widget has NO transport for its handler, so the node would be inert
-//! and the emitted crate's non-`json` runtime fallback would leave the up-event
-//! type parameter unconstrained (rustc E0282). The backend gate converts that
-//! into a fail-closed `IPE-L0147` the moment `CustomElement.node` is emitted outside a
-//! browser shape (SECURITY — fail closed, never a `cargo` failure and never a
-//! panic).
+//! A `CustomElement.fromFile` handle names browser JS the build ships whether or
+//! not a view mounts it, and only a Web build links the `web` runtime module that
+//! serves it. The front gate inside `lower_program` therefore refuses every
+//! constructor a non-Web program links (script, terminal app, worker), at the
+//! constructor's span, before emit splices a registration the runtime cannot
+//! link. Every consumer of the lowered program (`type-check`, `dev build`, the
+//! LSP) reaches the refusal through that one query.
 //!
-//! These tests are COMPILE-ONLY (they run the `ipe` pipeline + write the
+//! These tests are COMPILE-ONLY (they run the `ipe` pipeline and write the
 //! project, but never invoke `cargo`), so they are fast and NOT gated on
-//! `IPE_E2E`. The `customElement` constructor requires its JS source file to be
-//! present at build time, so each fixture is written as a two-file project (the
-//! `.ipe` entry plus its `js/*.js`) through [`compile_with_files`].
+//! `IPE_E2E`. The constructor requires its JS source file to be present at build
+//! time, so each fixture is written as a multi-file project (the `.ipe` modules
+//! plus their `js/*.js`) through [`compile_with_files`].
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -315,4 +311,239 @@ fn cli_view_with_ui_widget_is_rejected() -> Result<(), BoxError> {
         Err(ipe::CliError::Pipeline { .. }) => Ok(()),
         Err(other) => Err(format!("cli_ui_widget: expected a type error, got {other:?}").into()),
     }
+}
+
+/// Assert the build refuses with IPE-L0147, framed against the file ending in
+/// `file_suffix`, with the primary span starting at that file's
+/// `CustomElement.fromFile` constructor.
+fn assert_placement_refused(
+    test_name: &str,
+    source: &str,
+    extra: &[(&str, &str)],
+    file_suffix: &str,
+) -> Result<(), BoxError> {
+    match compile_with_files(test_name, source, extra)? {
+        Ok(()) => Err(format!("{test_name}: expected IPE-L0147, but ipe accepted").into()),
+        Err(ipe::CliError::Pipeline { file, src, diag }) => {
+            let code = diag.code();
+            if code.as_str() != "IPE-L0147" {
+                return Err(
+                    format!("{test_name}: expected IPE-L0147, got {code:?}: {diag:?}").into(),
+                );
+            }
+            if !file.to_string_lossy().ends_with(file_suffix) {
+                return Err(format!(
+                    "{test_name}: expected the refusal framed against `{file_suffix}`, got {}",
+                    file.display()
+                )
+                .into());
+            }
+            let lo = usize::try_from(diag.primary_span().lo)?;
+            match src.get(lo..) {
+                Some(rest) if rest.starts_with("CustomElement.fromFile") => Ok(()),
+                rest => Err(format!(
+                    "{test_name}: expected the span at the constructor, got {:?}",
+                    rest.map(|r| r.chars().take(40).collect::<String>())
+                )
+                .into()),
+            }
+        }
+        Err(other) => Err(format!("{test_name}: expected IPE-L0147, got {other:?}").into()),
+    }
+}
+
+/// A script (`main : Task Error ()`) that constructs a handle and mounts it
+/// nowhere. The constructor alone ships the JS, so it is refused even though no
+/// view exists.
+const SCRIPT_UNMOUNTED_WIDGET: &str = r#"module Main exposing (main)
+
+import Ipe.Ffi.Js.CustomElement as CustomElement
+import Ipe.Io as Io
+
+editor : CustomElement String String
+editor =
+    CustomElement.fromFile "js/x.js"
+
+main : Task Error ()
+main =
+    Io.println "hi"
+"#;
+
+/// A script with an unmounted constructor is refused at `dev build` with
+/// IPE-L0147 at the constructor. The JS file is present, so the file-existence
+/// gate passes and the placement gate is what refuses.
+#[test]
+fn script_with_unmounted_widget_is_refused_at_build() -> Result<(), BoxError> {
+    assert_placement_refused(
+        "script_unmounted_widget",
+        SCRIPT_UNMOUNTED_WIDGET,
+        &[("js/x.js", WIDGET_JS)],
+        "Main.ipe",
+    )
+}
+
+/// `ipe type-check` reaches the same refusal through `lower_program`: it exits
+/// non-zero and its JSON diagnostic names IPE-L0147 at the constructor's line.
+#[test]
+fn script_with_unmounted_widget_is_refused_at_type_check() -> Result<(), BoxError> {
+    let fixture = ipe::RootFixture::main(SCRIPT_UNMOUNTED_WIDGET)
+        .map_err(|e| -> BoxError { format!("fixture: {e}").into() })?;
+    let js = fixture.path().join("src/js/x.js");
+    if let Some(parent) = js.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&js, WIDGET_JS)?;
+    let out = std::process::Command::new(e2e_support::cargo_bin!("ipe"))
+        .args(["type-check", "--json", "src/Main.ipe"])
+        .current_dir(fixture.path())
+        .env("NO_COLOR", "1")
+        .output()?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if out.status.success() {
+        return Err(
+            format!("type-check accepted a script that constructs a widget: {stderr}").into(),
+        );
+    }
+    let line = SCRIPT_UNMOUNTED_WIDGET
+        .lines()
+        .position(|l| l.contains("CustomElement.fromFile"))
+        .map(|i| i + 1)
+        .ok_or("fixture has no constructor line")?;
+    if stderr.contains("IPE-L0147") && stderr.contains(&format!("\"line\":{line}")) {
+        Ok(())
+    } else {
+        Err(format!("expected IPE-L0147 at line {line}, got:\n{stderr}").into())
+    }
+}
+
+/// A helper module with no `main` that only constructs a handle.
+const WIDGETS_MODULE: &str = r#"module Widgets exposing (editor)
+
+import Ipe.Ffi.Js.CustomElement as CustomElement
+
+editor : CustomElement String String
+editor =
+    CustomElement.fromFile "js/x.js"
+"#;
+
+/// A `Tui.tea` entry that imports [`WIDGETS_MODULE`] and renders native cells.
+const TUI_WITH_WIDGET_HELPER: &str = r#"module Main exposing (main)
+
+import Ipe.Tea.Tui as Tui
+import Ipe.Ui.Cells as Cells
+import Ipe.Ui.Cells exposing (Screen)
+import Ipe.Tea.Tui.Cmd
+import Ipe.Tea.Tui.Sub
+import Widgets
+
+type Msg = NoOp
+
+type alias Model = { count : Int }
+
+init : () -> ( Model, Cmd Msg )
+init _unit =
+    ( { count = 0 }, Cmd.none )
+
+update : Msg -> Model -> ( Model, Cmd Msg )
+update _msg model =
+    ( model, Cmd.none )
+
+view : Model -> Screen Msg
+view _model =
+    Cells.text "hello"
+
+subscriptions : Model -> Sub Msg
+subscriptions _model =
+    Sub.none
+
+main =
+    Tui.tea
+        { init = init, update = update, view = view
+        , subscriptions = subscriptions
+        }
+"#;
+
+/// A `Cli.tea` entry that imports [`WIDGETS_MODULE`] and renders native lines.
+const CLI_WITH_WIDGET_HELPER: &str = r#"module Main exposing (main)
+
+import Ipe.Tea.Cli as Cli
+import Ipe.Tea.Cli.Cmd
+import Ipe.Tea.Cli.Sub
+import Ipe.Ui.Cli as Ui
+import Ipe.Ui.Cli exposing (Lines)
+import Widgets
+
+type Msg = NoOp
+
+type alias Model = { count : Int }
+
+init : () -> ( Model, Cmd Msg )
+init _unit =
+    ( { count = 0 }, Cmd.none )
+
+update : Msg -> Model -> ( Model, Cmd Msg )
+update _msg model =
+    ( model, Cmd.none )
+
+view : Model -> Lines Msg
+view _model =
+    Ui.text "ok"
+
+subscriptions : Model -> Sub Msg
+subscriptions _model =
+    Sub.none
+
+main =
+    Cli.tea
+        { init = init, update = update, view = view
+        , subscriptions = subscriptions
+        }
+"#;
+
+/// A view-less `Worker.tea` entry that imports [`WIDGETS_MODULE`].
+const WORKER_WITH_WIDGET_HELPER: &str = r#"module Main exposing (main)
+
+import Ipe.Tea.Worker as Worker
+import Ipe.Tea.Worker.Cmd
+import Ipe.Tea.Worker.Sub
+import Widgets
+
+type Msg = NoOp
+
+type alias Model = { ticks : Int }
+
+init : () -> ( Model, Cmd Msg )
+init _unit =
+    ( { ticks = 0 }, Cmd.none )
+
+update : Msg -> Model -> ( Model, Cmd Msg )
+update _msg model =
+    ( model, Cmd.none )
+
+subscriptions : Model -> Sub Msg
+subscriptions _model =
+    Sub.none
+
+main =
+    Worker.tea { init = init, update = update, subscriptions = subscriptions }
+"#;
+
+/// A terminal app, a line app and a worker each refuse a constructor that lives
+/// in an imported helper module and is never used: the gate judges the whole
+/// linked set the build ships, and frames the refusal against the helper.
+#[test]
+fn non_web_entries_refuse_a_widget_in_a_helper_module() -> Result<(), BoxError> {
+    for (name, entry) in [
+        ("tui_widget_helper", TUI_WITH_WIDGET_HELPER),
+        ("cli_widget_helper", CLI_WITH_WIDGET_HELPER),
+        ("worker_widget_helper", WORKER_WITH_WIDGET_HELPER),
+    ] {
+        assert_placement_refused(
+            name,
+            entry,
+            &[("Widgets.ipe", WIDGETS_MODULE), ("js/x.js", WIDGET_JS)],
+            "Widgets.ipe",
+        )?;
+    }
+    Ok(())
 }

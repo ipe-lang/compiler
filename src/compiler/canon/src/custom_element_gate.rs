@@ -11,15 +11,23 @@
 //! fail-closed IPE-N0044 (Security #5: a widget cannot register against a file
 //! that is not there).
 //!
+//! The same walk judges placement: a program whose entry shape serves no browser
+//! page refuses every constructor it links with IPE-L0147
+//! ([`check_widget_placement`]). The judged set is the one
+//! [`collect_widget_files`] returns, the pre-elimination linked set, because
+//! the build ships a registration for every linked constructor whether or not
+//! the entry reaches it.
+//!
 //! By construction a `CustomElementCtor` node appears only as the whole body of a
 //! `CustomElement`-annotated binding (`resolve::detect_custom_element_constructor`
 //! is the sole mint site), but this walk is exhaustive over the expression tree
 //! anyway — defence in depth, so a future node placement cannot slip past the
 //! existence check.
 
-use ipe_diagnostics::Span;
+use ipe_diagnostics::{DResult, Diagnostic, LowerError, NonWebShape, Span};
 
 use crate::ast::{CaseBranch, Def, Expr, Expr_, LetBinding, Module};
+use crate::shape_runtime::Shape;
 
 /// One `CustomElement.fromFile "<js-path>"` constructor reached in a linked program: its
 /// CLEANED, in-project-checked relative path and the span to blame if the file
@@ -44,6 +52,42 @@ pub fn collect_widget_files(module: &Module) -> Vec<WidgetFile> {
         }
     }
     out
+}
+
+/// Refuse every `CustomElement.fromFile` constructor in `linked` when the
+/// entry's shape is not [`Shape::Web`].
+///
+/// A `CustomElement.node` needs a handle and `fromFile` is the only way to make
+/// one, so refusing every constructor also refuses every mount. The first
+/// constructor in source order is the one reported.
+///
+/// # Errors
+/// IPE-L0147 at the first constructor's span, naming the entry's shape.
+pub fn check_widget_placement(linked: &Module, entry_shape: Shape) -> DResult<()> {
+    let Some(shape) = non_web_shape(entry_shape) else {
+        return Ok(());
+    };
+    match collect_widget_files(linked)
+        .into_iter()
+        .min_by_key(|widget| (widget.span.lo, widget.span.hi))
+    {
+        None => Ok(()),
+        Some(widget) => Err(Diagnostic::Lower {
+            span: widget.span,
+            msg: LowerError::UiWidgetInNonWebShape { shape },
+        }),
+    }
+}
+
+/// The browser-less shape `shape` names, or `None` for the Web shape.
+const fn non_web_shape(shape: Shape) -> Option<NonWebShape> {
+    match shape {
+        Shape::Script => Some(NonWebShape::Script),
+        Shape::Tui => Some(NonWebShape::Tui),
+        Shape::Cli => Some(NonWebShape::Cli),
+        Shape::Worker => Some(NonWebShape::Worker),
+        Shape::Web => None,
+    }
 }
 
 fn walk(e: &Expr, out: &mut Vec<WidgetFile>) {

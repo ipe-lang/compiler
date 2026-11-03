@@ -1997,14 +1997,12 @@ fn path_before_a_string_with_no_path_binder_is_unresolved() {
     assert_rejected("path_is_an_ordinary_name", &src, "IPE-N0001");
 }
 
-/// (e) A well-formed `customElement "js/x.js"` with the file PRESENT type-checks
-/// (the shape + path + existence gates all pass) and — with the WP4 transport
-/// shipped — now LOWERS to the opaque widget handle rather than being refused at
-/// emission. Here the binding is unused (a bare `main = 1`, no `CustomElement.node`), so
-/// it is DCE'd and the program compiles cleanly. A real Web-shape program that
-/// PLACES the widget is the WP4 SEAL golden (`custom_element_widget` fixture).
+/// (e) A well-formed `customElement "js/x.js"` with the file PRESENT passes the
+/// path and existence gates, but the entry is a script (`main : Task Error ()`):
+/// the constructor ships browser JS that only a Web build serves, so the
+/// placement gate refuses it (IPE-L0147) even though nothing mounts it.
 #[test]
-fn custom_element_ctor_present_file_lowers_and_compiles() {
+fn custom_element_ctor_present_file_in_a_script_is_refused() {
     let src = format!(
         "{HEAD}import Ipe.Io as Io\n\
          import Ipe.Ffi.Js.CustomElement as CustomElement\n\
@@ -2014,22 +2012,15 @@ fn custom_element_ctor_present_file_lowers_and_compiles() {
          main =\n\
          \x20   Io.println \"ok\"\n"
     );
-    let outcome = compile_with_files(
+    assert_rejected_with_files(
         "custom_element_present",
         &src,
         &[(
             "js/x.js",
             "export function mount(host, emit) { return {}; }\n",
         )],
+        "IPE-L0147",
     );
-    match outcome {
-        Outcome::Accepted(how) if how.starts_with("compiled successfully") => {}
-        other => assert!(
-            false_marker(),
-            "custom_element_present: expected a clean compile once WP4 ships the \
-             transport, got {other:?}"
-        ),
-    }
 }
 
 /// (f) A `CustomElement` value is an opaque, non-serialisable handle, so it can

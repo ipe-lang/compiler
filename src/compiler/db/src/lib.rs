@@ -1807,6 +1807,11 @@ pub fn lower_program(db: &dyn Db, root: SourceRoot, entry: SourceFile) -> LowerR
     // hand-nested decoder pipeline through this one query.
     ipe_canon::decoder_pipeline_gate::check_decoder_pipelines(&linked.module)
         .map_err(|d| PipelineError::Lower(d, Vec::new()))?;
+    // The IPE-L0147 widget-placement gate rides the same admission, so every
+    // consumer refuses a browser custom element in a non-Web program at its
+    // constructor, before emit splices a registration the runtime cannot link.
+    ipe_canon::custom_element_gate::check_widget_placement(&linked.module, entry_shape(db, entry)?)
+        .map_err(|d| PipelineError::Lower(d, Vec::new()))?;
     let mut interner = db.interner().lock();
     // Provide the entry file's display path and source text so the lowerer
     // can inject `<file>:<line>` into `Debug.todo` call sites.
@@ -1816,6 +1821,20 @@ pub fn lower_program(db: &dyn Db, root: SourceRoot, entry: SourceFile) -> LowerR
     ipe_lower::lower(&linked.module, &types, &mut interner, &src_path, &src_text)
         .map(Arc::new)
         .map_err(|(diag, home)| PipelineError::Lower(diag, home))
+}
+
+/// The delivery shape the entry's `main` pins, read from its parsed module.
+fn entry_shape(
+    db: &dyn Db,
+    entry: SourceFile,
+) -> Result<ipe_canon::shape_runtime::Shape, PipelineError> {
+    let module = parse(db, entry)
+        .clone()
+        .map_err(|d| PipelineError::Lower(d, Vec::new()))?;
+    let interner = db.interner().lock();
+    Ok(ipe_canon::shape_runtime::Shape::from_main(
+        ipe_canon::shape_source::classify_main_shape(&module, &interner),
+    ))
 }
 
 /// [`lower_program`]'s IR after Phase-2 partial evaluation — the ONE program the

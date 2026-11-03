@@ -140,9 +140,7 @@ explain/IPE-L0146.md:16
 explain/IPE-L0146.md:25
 explain/IPE-L0146.md:37
 explain/IPE-L0146.md:44
-explain/IPE-L0147.md:19
-explain/IPE-L0147.md:44
-explain/IPE-L0147.md:67
+explain/IPE-L0147.md:15
 explain/IPE-L0148.md:18
 explain/IPE-L0148.md:28
 explain/IPE-L0148.md:47

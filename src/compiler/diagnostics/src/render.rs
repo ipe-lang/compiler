@@ -972,10 +972,11 @@ fn lower_prose(msg: &LowerError) -> String {
             "`Ui.cells` paints a terminal character grid, so it has no meaning in a Cli (line-oriented) app."
                 .to_string()
         }
-        LowerError::UiWidgetInNonWebShape => {
-            "`CustomElement.node` mounts a browser custom element, so it has no meaning in a terminal app."
-                .to_string()
-        }
+        LowerError::UiWidgetInNonWebShape { shape } => format!(
+            "This `CustomElement` is constructed in {}, which serves no browser page to \
+             mount it in.",
+            shape.phrase()
+        ),
         LowerError::LawlessEffectDiscard => {
             "Discarding this `Task` here would quietly run its effect from a function that isn't \
              supposed to do any."
@@ -2316,12 +2317,12 @@ fn lower_label(msg: &LowerError) -> String {
              content as a `String` for line output"
                 .to_string()
         }
-        LowerError::UiWidgetInNonWebShape => {
-            "`CustomElement.node` is browser-only; not available outside a Web shape — its \
-             up-event handler is carried over the seal codec, which exists only in a \
-             browser build. Use it only under `Web.tea`"
-                .to_string()
-        }
+        LowerError::UiWidgetInNonWebShape { shape } => format!(
+            "a `CustomElement` is browser-only; it cannot be constructed or mounted in {}: \
+             its JS is served by the `web` runtime module, which only a `Web.tea` build \
+             links",
+            shape.phrase()
+        ),
         LowerError::LawlessEffectDiscard => {
             "discarding this `Task` with `let _ = …` in a function that does not return \
              a `Task` would run its effect through a hidden `Task.run` — a plainly-typed \
