@@ -259,9 +259,8 @@ pub fn basics_abs<T: PartialOrd + IpeNegate + Copy + Default>(x: T) -> T {
 /// Exact whenever `|n| <= 2^53`. Past that, ties round to even. Total: never
 /// NaN, never infinite, never a panic.
 #[must_use]
-#[allow(clippy::cast_precision_loss)] // IPE-RUST-AUDIT:ACCEPTED — i64 -> f64 is IEEE 754 round-to-nearest-even on every target; the precision loss past 2^53 is the documented semantics of `toFloat`
 pub fn int_to_float(n: i64) -> f64 {
-    n as f64
+    crate::narrow::int_to_f64(n)
 }
 
 // ── end Basics numerics ──────────────────────────────────────────────
