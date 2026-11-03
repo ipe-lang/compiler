@@ -106,11 +106,11 @@ bundle_client() {
   rm -rf "$out"
   "$IPE" dev build "$REPO_ROOT/examples/shapes/web/$name" web client --out "$out"
   # Fail closed: a bundle without its shell leaves the spec nothing to serve.
-  if [ ! -f "$out/rust/www/index.html" ]; then
-    echo "   $name bundle has no www/index.html under '$out/rust'" >&2
+  if [ ! -f "$out/www/index.html" ]; then
+    echo "   $name bundle has no www/index.html under '$out'" >&2
     exit 1
   fi
-  export IPE_WASM_CLIENT_WWW="$out/rust/www"
+  export IPE_WASM_CLIENT_WWW="$out/www"
 }
 
 bundle_client wasm-client-clipboard

@@ -143,14 +143,14 @@ impl<'a> BundleFinish<'a> {
         }
     }
 
-    /// The `www/` tree the mobile shell's `web client` bundle build produced
-    /// under [`Self::wasm_root`].
+    /// The claimed emitted crate holding the `www/` tree the mobile shell's
+    /// `web client` bundle build produced under [`Self::wasm_root`].
     ///
     /// A dev build writes it in `rust/www/`; a release build in its own member
     /// `release/<web client slug>/rust/www/` under the root it was handed.
-    fn wasm_www(&self, project: &ProjectPaths) -> Result<PathBuf, CliError> {
-        let crate_dir = match self {
-            Self::Dev { output } => output.claim_area(&[OutputArea::Rust])?,
+    fn wasm_crate(&self, project: &ProjectPaths) -> Result<OwnedDir, CliError> {
+        match self {
+            Self::Dev { output } => output.claim_area(&[OutputArea::Rust]),
             Self::Release { member, .. } => {
                 let slug =
                     crate::delivery_set::PlannedDelivery::release(MOBILE_BUNDLE_DELIVERY, None)
@@ -168,10 +168,9 @@ impl<'a> BundleFinish<'a> {
                 OutputRoot::at(member.claim()?.path(), project)?
                     .release_member(&slug)
                     .area(OutputArea::Rust)
-                    .claim()?
+                    .claim()
             }
-        };
-        Ok(crate_dir.path_to("www")?.path())
+        }
     }
 }
 
@@ -605,10 +604,11 @@ impl<'a> BundleAssembler<'a> {
         build_under_pinned_manifest(manifest_path, &pin, || {
             build_wasm_for_mobile(manifest_path, &wasm_root, self.profile)
         })?;
-        // The SPA is read from the owned crate; a symlinked `www/` is refused so
-        // the shell can never pick up files from outside the build output.
-        let www_dir = self.finish.wasm_www(&project)?;
-        let bundle = pack::mobile::SpaBundle::from_www_dir(&www_dir)
+        // The SPA is read through the owned crate, proven the directory that
+        // was claimed; a symlinked `www/` is refused so the shell can never
+        // pick up files from outside the build output.
+        let wasm_crate = self.finish.wasm_crate(&project)?;
+        let bundle = crate::bundle_www::SpaBundle::from_crate(&wasm_crate)
             .map_err(|e| CliError::Usage(crate::text::Message::relay(&e)))?;
 
         let layout = pack::mobile::layout(os, self.profile, &shell, &pin, &bundle, icon)?;
@@ -4355,7 +4355,7 @@ mod mobile_base_tests {
         std::fs::create_dir_all(&www).expect("create www/");
         std::fs::write(www.join("index.html"), b"<html>").expect("write index.html");
         let parsed = project::parse_manifest(&manifest).expect("the manifest reads");
-        let bundle = pack::mobile::SpaBundle::from_www_dir(&www).expect("collect the bundle");
+        let bundle = crate::bundle_www::SpaBundle::from_www_dir(&www).expect("collect the bundle");
         let pin = pack::mobile::ManifestPin::of(&parsed);
         let shell = pack::mobile::ShellIdentity::of(&parsed);
         let lay = |os| {
