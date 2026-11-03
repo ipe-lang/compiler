@@ -1611,18 +1611,15 @@ pub(crate) fn format_task_error(msg: &str, use_color: bool) -> String {
 
 /// Print a task-error message to stderr, styled like the CLI: a red `✗` glyph
 /// on the first line with a 2-space gutter, then each continuation line
-/// indented by the same gutter. When stderr is not a terminal or `NO_COLOR` is
-/// set, the glyph and gutter are still printed but without ANSI colour codes.
+/// indented by the same gutter. When stderr is not a terminal or
+/// [`crate::color::no_color_requested`] holds, the glyph and gutter are still
+/// printed but without ANSI colour codes.
 ///
 /// Intended for the emitted app's `fn main` to replace the raw `{:?}` debug
 /// print with a readable, consistently styled failure.
 pub fn eprint_task_error(msg: &str) {
     use std::io::{IsTerminal as _, Write as _};
-    let use_color = std::io::stderr().is_terminal()
-        && matches!(
-            super::system::read_env_var("NO_COLOR"),
-            Err(std::env::VarError::NotPresent)
-        );
+    let use_color = std::io::stderr().is_terminal() && !super::color::no_color_requested();
     let formatted = format_task_error(msg, use_color);
     let _ = std::io::stderr().write_all(formatted.as_bytes());
 }
