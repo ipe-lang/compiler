@@ -131,10 +131,7 @@ pub fn string_right(n: i64, s: String) -> String {
     }
     let runes: Vec<char> = s.chars().collect();
     // `n` past the length keeps every rune.
-    let start = runes
-        .len()
-        .checked_sub(count_from_int(n))
-        .unwrap_or_default();
+    let start = runes.len().saturating_sub(count_from_int(n));
     runes
         .get(start..)
         .map(|r| r.iter().collect())
@@ -398,11 +395,7 @@ pub fn string_drop_right(n: i64, s: String) -> String {
         return s;
     }
     // `n` at or past the length keeps no rune.
-    let keep = s
-        .chars()
-        .count()
-        .checked_sub(count_from_int(n))
-        .unwrap_or_default();
+    let keep = s.chars().count().saturating_sub(count_from_int(n));
     s.chars().take(keep).collect()
 }
 
@@ -504,7 +497,7 @@ fn pad_count(kernel: CeilingKernel, n: i64, have: usize) -> usize {
         return 0;
     }
     match usize::try_from(n) {
-        Ok(width) if width <= kernel.ceiling() => width.checked_sub(have).unwrap_or_default(),
+        Ok(width) if width <= kernel.ceiling() => width.saturating_sub(have),
         Ok(_) | Err(_) => trip(RuntimeTrip::OutputCeiling { kernel }),
     }
 }

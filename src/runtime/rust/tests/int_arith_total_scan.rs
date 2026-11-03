@@ -80,6 +80,31 @@ const ADMITTED: &[Admitted] = &[
         why: "a `usize` capacity hint for the output `Vec`, never an Ipê value",
     },
     Admitted {
+        file: "string.rs",
+        function: "string_right",
+        shape: "saturating_sub",
+        count: 1,
+        why: "the `usize` rune index the kept suffix starts at; a count past the \
+              length keeps every rune, so `0` is the exact index, never an Ipê value",
+    },
+    Admitted {
+        file: "string.rs",
+        function: "string_drop_right",
+        shape: "saturating_sub",
+        count: 1,
+        why: "the `usize` count of runes kept; dropping at least the length keeps \
+              none, so `0` is the exact count, never an Ipê value",
+    },
+    Admitted {
+        file: "string.rs",
+        function: "pad_count",
+        shape: "saturating_sub",
+        count: 1,
+        why: "the `usize` count of pad characters, below the ceiling-checked width; \
+              a string already that wide needs none, so `0` is the exact count, \
+              never an Ipê value",
+    },
+    Admitted {
         file: "time.rs",
         function: "sleep_chunks",
         shape: "saturating_sub",
