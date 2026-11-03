@@ -377,7 +377,7 @@ impl SpaBundle {
         Self::from_www_dir_with(www_dir, AssetLimits::PRODUCTION)
     }
 
-    /// [`SpaBundle::from_crate`] under the ceilings `limits`.
+    /// [`SpaBundle::from_www_dir`] under the ceilings `limits`.
     #[cfg(test)]
     fn from_www_dir_with(www_dir: &Path, limits: AssetLimits) -> Result<Self, BundleError> {
         let root = open_www(www_dir)
