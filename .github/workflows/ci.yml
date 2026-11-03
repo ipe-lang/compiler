@@ -815,9 +815,7 @@ jobs:
       RUSTFLAGS: -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - run: df -h /
       - uses: ./.github/actions/free-disk-space
-      - run: df -h /
       - uses: ./.github/actions/rust-toolchain-pinned
       - uses: ./.github/actions/mold
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -890,9 +888,7 @@ jobs:
       IPE_RUNTIME_DIR: ${{ github.workspace }}/src/runtime/rust/src
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - run: df -h /
       - uses: ./.github/actions/free-disk-space
-      - run: df -h /
       - uses: ./.github/actions/rust-toolchain-pinned
       - uses: ./.github/actions/mold
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -1457,13 +1453,8 @@ jobs:
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
         with:
           tool: nextest@0.9.146
-      # The runner image ships toolchains no e2e step uses (Android SDK, .NET,
-      # GHC, CodeQL, cached docker images); removing them raises the disk
-      # ceiling the shard's bounded peak must fit under.
-      - name: Free the runner's unused preinstalled toolchains
-        run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
-          docker image prune -af
+      # Raises the disk ceiling the shard's bounded peak must fit under.
+      - uses: ./.github/actions/free-disk-space
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: nextest-archive

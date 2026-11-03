@@ -14,5 +14,7 @@ runs:
     - name: Remove unused preinstalled toolchains and prune Docker images
       shell: bash
       run: |
+        df -h /
         sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
         sudo docker image prune --all --force || true
+        df -h /
