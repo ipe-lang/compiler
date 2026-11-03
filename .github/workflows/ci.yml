@@ -815,6 +815,9 @@ jobs:
       RUSTFLAGS: -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: df -h /
+      - uses: ./.github/actions/free-disk-space
+      - run: df -h /
       - uses: ./.github/actions/rust-toolchain-pinned
       - uses: ./.github/actions/mold
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -830,6 +833,8 @@ jobs:
           name: nextest-archive
           path: nextest.tar.zst
           retention-days: 1
+      # Already uploaded; the doctest step below never reads the archive.
+      - run: rm nextest.tar.zst
       # Doctests can't be archived/partitioned by nextest, so they run here once
       # against the just-warmed target (rustdoc drives them separately).
       - run: cargo test --doc --workspace
@@ -885,6 +890,9 @@ jobs:
       IPE_RUNTIME_DIR: ${{ github.workspace }}/src/runtime/rust/src
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: df -h /
+      - uses: ./.github/actions/free-disk-space
+      - run: df -h /
       - uses: ./.github/actions/rust-toolchain-pinned
       - uses: ./.github/actions/mold
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
