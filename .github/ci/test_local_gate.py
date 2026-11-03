@@ -756,7 +756,7 @@ class E2eSupportSuiteAtQuick(unittest.TestCase):
         self.assertEqual(len(hits), 1)
 
     def test_runs_for_a_change_in_any_crate(self) -> None:
-        for path in ("src/runtime/rust/src/lib.rs", "src/ipe-cli/tests/g_misc/main.rs"):
+        for path in ("src/runtime/rust/src/lib.rs", "src/compiler/parse/src/lib.rs"):
             with self.subTest(path):
                 steps = lg.plan(lg.Tier.QUICK, self.entries, self.parsed, [path], self.WS)
                 self.assertIn(self.ARGV, [s.argv for s in steps])

@@ -1331,13 +1331,11 @@ fn check_ceilings(policy: &Policy<'_>) -> Vec<String> {
         }
     }
     let ceilings: BTreeMap<&str, usize> = policy.ceilings.iter().copied().collect();
+    for package in ceilings.keys() {
+        counts.entry(package).or_default();
+    }
     let mut errors = Vec::new();
-    for package in counts
-        .keys()
-        .chain(ceilings.keys())
-        .collect::<BTreeSet<_>>()
-    {
-        let live = counts.get(package).copied().unwrap_or_default();
+    for (package, &live) in &counts {
         let ceiling = ceilings.get(package).copied().unwrap_or_default();
         if live != ceiling {
             errors.push(format!(
@@ -1484,9 +1482,9 @@ fn check_times(model: &Model, text: &Text) -> Vec<String> {
             continue;
         }
         let words: Vec<&str> = line.split_whitespace().collect();
-        let (id, test) = match words.as_slice() {
+        let (id, case) = match words.as_slice() {
             [id, secs] if secs.parse::<u64>().is_ok() => (*id, None),
-            [id, test, secs] if secs.parse::<u64>().is_ok() => (*id, Some(*test)),
+            [id, case, secs] if secs.parse::<u64>().is_ok() => (*id, Some(*case)),
             _ => {
                 errors.push(format!(
                     "{at}: `{line}` is not `<binary-id> [<test>] <seconds>`"
@@ -1511,7 +1509,7 @@ fn check_times(model: &Model, text: &Text) -> Vec<String> {
         if live.is_empty() {
             errors.push(format!("{at}: `{id}` names no test target"));
         }
-        if let Some((module, _)) = test.and_then(|t| t.split_once("::"))
+        if let Some((module, _)) = case.and_then(|t| t.split_once("::"))
             && live.iter().all(|t| !t.modules.contains(module))
         {
             errors.push(format!("{at}: `{id}` declares no module `{module}`"));
@@ -1594,6 +1592,16 @@ fn slash(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+/// Whether the file name `name` ends in one of `extensions` (each without
+/// its dot), compared exactly: cargo and the scanned tools read only the
+/// lower-case spellings.
+fn has_extension(name: &str, extensions: &[&str]) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|ext| extensions.contains(&ext))
+}
+
 /// Every file under `dir` whose name `keep` accepts, skipping `skip_dir`
 /// directories, relative to `root`.
 #[allow(clippy::expect_used)] // an unreadable tree fails the ratchet: the designed outcome
@@ -1639,11 +1647,12 @@ fn live_model() -> (std::path::PathBuf, Model) {
     };
     for package in &workspace.packages {
         let tests = package.manifest_dir.join("tests");
-        model
-            .tests_files
-            .extend(walk(&root, &tests, &|n| n.ends_with(".rs"), &|_, n| {
-                n == "target"
-            }));
+        model.tests_files.extend(walk(
+            &root,
+            &tests,
+            &|n| has_extension(n, &["rs"]),
+            &|_, n| n == "target",
+        ));
     }
     for target in targets {
         let files: BTreeSet<String> = target.files.iter().map(|f| slash(f)).collect();
@@ -1673,21 +1682,20 @@ fn live_model() -> (std::path::PathBuf, Model) {
 
 #[allow(clippy::expect_used)] // a missing configuration file fails the ratchet: the designed outcome
 fn live_texts(root: &Path) -> Vec<Text> {
-    let mut paths: Vec<String> = FILTER_FILES.iter().map(|p| (*p).to_owned()).collect();
-    paths.extend(walk(
+    let workflows = walk(
         root,
         &root.join(".github/workflows"),
-        &|n| n.ends_with(".yml") || n.ends_with(".yaml"),
+        &|n| has_extension(n, &["yml", "yaml"]),
         &|_, _| false,
-    ));
-    paths.extend(walk(
-        root,
-        &root.join("tools/scripts"),
-        &|_| true,
-        &|_, n| n == "node_modules" || n == "__pycache__",
-    ));
-    paths
-        .into_iter()
+    );
+    let scripts = walk(root, &root.join("tools/scripts"), &|_| true, &|_, n| {
+        n == "node_modules" || n == "__pycache__"
+    });
+    FILTER_FILES
+        .iter()
+        .map(|p| (*p).to_owned())
+        .chain(workflows)
+        .chain(scripts)
         .filter_map(|path| {
             let bytes = std::fs::read(root.join(&path)).expect("read a configuration file");
             String::from_utf8(bytes)
@@ -1750,7 +1758,7 @@ fn live_literals(root: &Path) -> Vec<(String, String)> {
             || ignored.covers(rel, name)
             || (name.starts_with('.') && rel != ".github" && rel != ".config")
     };
-    let keep = |n: &str| n.ends_with(".rs") || n.ends_with(".py") || n.ends_with(".sh");
+    let keep = |n: &str| has_extension(n, &["rs", "py", "sh"]);
     walk(root, root, &keep, &skip_dir)
         .into_iter()
         .filter(|file| file != SELF)
