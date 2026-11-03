@@ -183,7 +183,7 @@ const SITES: &[SiteRow] = &[
     (
         "driver/commands.rs",
         "bundle_wasm_pkg",
-        "tools.opt",
+        "opt_tool",
         Runner::Local("WASM_TOOL_LIMITS"),
         1,
     ),

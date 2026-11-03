@@ -417,7 +417,7 @@ const UNROUTED: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "driver/commands.rs",
-        "wasi_artifact_path",
+        "wasm_artifact_path",
         1,
         "built in a file another lane owns; its route is decided there",
     ),

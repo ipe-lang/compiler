@@ -48,15 +48,6 @@ impl BundleProfile {
             Self::Release => ipe_backend_rust::BuildIntent::Release,
         }
     }
-
-    /// The compiled binary's `target/` profile subdirectory (`debug` / `release`),
-    /// matching the cargo profile [`FlooredBuild`] picks for the same posture.
-    const fn target_subdir(self) -> &'static str {
-        match self {
-            Self::Dev => "debug",
-            Self::Release => "release",
-        }
-    }
 }
 
 pub use crate::delivery_set::BundleHost;
@@ -523,7 +514,7 @@ impl<'a> BundleAssembler<'a> {
             crate_dir.path(),
             None,
         )?;
-        FlooredBuild {
+        let build = FlooredBuild {
             cargo: &cargo_bin,
             crate_dir: &crate_dir,
             finish: self.finish.native(),
@@ -532,16 +523,14 @@ impl<'a> BundleAssembler<'a> {
             output: CargoOutput::Human(Verbosity::Progress),
             what: "the desktop app",
             runtime: None,
-        }
-        .run()?;
+        };
+        let artifacts = build.artifact_dir();
+        build.run()?;
 
-        // Read the compiled binary back from the build directory the build was
-        // handed, then materialise (Linux) or describe (macOS/Windows).
+        // Read the compiled binary back from the directory the build's own
+        // posture names, then materialise (Linux) or describe (macOS/Windows).
         let bin_name = emitted_bin_filename(crate_dir.path())?;
-        let binary = target_dir
-            .path()
-            .join(self.profile.target_subdir())
-            .join(&bin_name);
+        let binary = artifacts.join(&bin_name);
         if !binary.is_file() {
             return Err(CliError::Usage(text::msg::app_binary_missing(
                 &binary.display(),
@@ -1568,14 +1557,15 @@ pub fn build_and_run_test_entry(
         what: "the emitted test runner",
         runtime: runtime_context_for_message(),
     };
+    let artifacts = build.artifact_dir();
     build.run_test_runner(&key)?;
     store_test_lock(target.dir().path(), crate_dir.dir())?;
 
-    // Read the compiled binary back from the build directory the build was
-    // handed, so a `CARGO_TARGET_DIR` or `[build] target-dir` pin is the one
-    // the build used.
+    // Read the compiled binary back from the directory the build's own
+    // posture names under the build directory it was handed, so a
+    // `CARGO_TARGET_DIR` or `[build] target-dir` pin is the one the build used.
     let test_bin_name = emitted_bin_filename(crate_dir.path())?;
-    let compiled = target.dir().path().join("debug").join(&test_bin_name);
+    let compiled = artifacts.join(&test_bin_name);
     let run_dir = scratch::ScratchDir::new_under(target.dir().path(), "ipe-test-run")
         .or_else(|_| scratch::ScratchDir::new("ipe-test-run"))
         .map_err(|source| CliError::ScratchUnavailable { source })?;

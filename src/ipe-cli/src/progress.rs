@@ -27,7 +27,7 @@
 
 use std::io::{IsTerminal, Write};
 
-use ipe_diagnostics::terminal::TerminalLine;
+use ipe_diagnostics::terminal::{TerminalLine, TerminalSafe};
 
 use crate::style::{self, GUTTER, Outcome, Palette};
 
@@ -211,6 +211,42 @@ impl<W: Write> Stage<W> {
         let _ = self.writer.flush();
     }
 
+    /// Replace the running label with `label`, parsed into a [`TerminalLine`]
+    /// here.
+    ///
+    /// Terminal: the running line is redrawn in place. Plain: the new label is
+    /// one more line, so a caller that relabels often bounds how many it emits.
+    pub fn relabel(&mut self, label: impl Into<String>) {
+        self.label = TerminalLine::sanitize(&label.into());
+        let _ = write!(
+            self.writer,
+            "{}",
+            running_line(self.mode, &self.label, self.frame_index)
+        );
+        let _ = self.writer.flush();
+    }
+
+    /// Write `block`, a newline-ended block of already-sanitised lines, above
+    /// the running line.
+    ///
+    /// Terminal: the running line is cleared, the block written, and the
+    /// running line redrawn beneath it, so foreign output and the stage never
+    /// share a row. Plain: the block is written as is.
+    pub fn write_above(&mut self, block: &TerminalSafe) {
+        if self.mode == Mode::Terminal {
+            let _ = write!(self.writer, "\r{CLEAR_TO_EOL}");
+        }
+        let _ = self.writer.write_all(block.as_str().as_bytes());
+        if self.mode == Mode::Terminal {
+            let _ = write!(
+                self.writer,
+                "{}",
+                running_line(self.mode, &self.label, self.frame_index)
+            );
+        }
+        let _ = self.writer.flush();
+    }
+
     /// Finish the stage as a success, rewriting the running line to a
     /// light-green check and `msg`.
     pub fn success(mut self, msg: impl AsRef<str>) {
@@ -379,6 +415,47 @@ mod tests {
     }
 
     /// Foreign label and outcome text reach a plain stage as one terminal line each.
+    #[test]
+    fn a_relabel_redraws_in_place_on_a_terminal_and_adds_a_line_in_plain() {
+        let mut buf = Vec::new();
+        {
+            let mut stage = Stage::with_mode(&mut buf, Mode::Plain, "first");
+            stage.relabel("second\x1b[2J");
+            stage.success("done");
+        }
+        let out = String::from_utf8(buf).expect("utf8");
+        assert_eq!(out.lines().count(), 3, "{out:?}");
+        assert!(!out.contains('\x1b'), "{out:?}");
+
+        let mut buf = Vec::new();
+        {
+            let mut stage = Stage::with_mode(&mut buf, Mode::Terminal, "first");
+            stage.relabel("second\x1b]0;x\x07");
+        }
+        let out = String::from_utf8(buf).expect("utf8");
+        assert!(out.contains("second"), "{out:?}");
+        assert!(!out.contains("\x1b]"), "{out:?}");
+        // Two in-place frames and the settling newline of the drop.
+        assert_eq!(out.matches('\n').count(), 1, "{out:?}");
+    }
+
+    #[test]
+    fn a_block_written_above_a_terminal_stage_never_shares_its_row() {
+        let mut buf = Vec::new();
+        {
+            let mut stage = Stage::with_mode(&mut buf, Mode::Terminal, "running");
+            stage.write_above(&TerminalSafe::sanitize(" warning: x\n"));
+        }
+        let out = String::from_utf8(buf).expect("utf8");
+        let cleared = format!("\r{CLEAR_TO_EOL} warning: x\n");
+        assert!(out.contains(&cleared), "{out:?}");
+        let after = out.split(&cleared).nth(1).unwrap_or_default();
+        assert!(
+            after.contains("running"),
+            "the stage is redrawn below: {out:?}"
+        );
+    }
+
     #[test]
     fn plain_stage_lines_are_terminal_lines() {
         let mut buf: Vec<u8> = Vec::new();
