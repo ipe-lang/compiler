@@ -1,14 +1,15 @@
 //! Ipe.Basics kernels: modBy + errorToString.
 //!
 
+use crate::core::{IntOp, RuntimeTrip, trip};
+
 /// Ipê `modBy : Int -> Int -> Int` — floored modulo, result takes the divisor's sign.
 ///
 /// Divisor-first (Elm/pipeline order). `divisor == 0` yields `0`. Otherwise the
 /// result lies in `[0, divisor)` for a positive divisor and `(divisor, 0]` for a
 /// negative one. `i64::MIN % -1` overflows in Rust; `checked_rem` maps it to the
 /// mathematical remainder `0`. When the truncated remainder and the divisor have
-/// opposite signs, `|r + divisor| < |divisor|`, so the adjusting add never
-/// overflows.
+/// opposite signs, `|r + divisor| < |divisor|`, so the adjusting add is exact.
 #[must_use]
 pub fn basics_mod_by(divisor: i64, n: i64) -> i64 {
     if divisor == 0 {
@@ -16,7 +17,8 @@ pub fn basics_mod_by(divisor: i64, n: i64) -> i64 {
     }
     let r = n.checked_rem(divisor).unwrap_or(0);
     if r != 0 && (r < 0) != (divisor < 0) {
-        r.wrapping_add(divisor)
+        // Opposite signs: the sum lies strictly between `divisor` and `0`.
+        r + divisor
     } else {
         r
     }
@@ -105,59 +107,62 @@ pub fn basics_clamp<T: PartialOrd>(lo: T, hi: T, x: T) -> T {
 
 // ── Basics numerics ──────────────────────────────────────────────────
 
-/// Ipê `negate : number -> number` — wrapping unary negation on Int or Float.
+/// Ipê `negate : number -> number`, unary negation on Int or Float.
 ///
-/// This is also the runtime target for the `-x` desugar in the parser
-/// (`negate x`). Uses `IpeWrappingNeg` so `negate(i64::MIN) == i64::MIN`
-/// (the unique two's-complement fixed point) rather than panicking under
-/// `overflow-checks=on`. `f64` negation is total and byte-identical to
-/// the plain `-x` form.
-pub fn basics_negate<T: IpeWrappingNeg>(x: T) -> T {
-    x.ipe_wrapping_neg()
+/// The runtime target of the parser's `-x` desugar too. `negate i64::MIN`,
+/// whose exact result `2^63` is outside the `Int` range, trips `IntOverflow`.
+/// `f64` negation is total and byte-identical to the plain `-x` form.
+pub fn basics_negate<T: IpeNegate>(x: T) -> T {
+    x.ipe_checked_neg()
+        .unwrap_or_else(|| trip(RuntimeTrip::IntOverflow { op: IntOp::Negate }))
 }
 
-/// Wrapping negation for Ipê numeric types.
+/// Exact negation for Ipê numeric types, the one definition `negate` and
+/// `abs` share.
 ///
-/// `i64` uses `wrapping_neg` so `i64::MIN.ipe_wrapping_neg() == i64::MIN`
-/// (two's-complement identity — the unique fixed point of wrapping negate).
-/// `f64` uses plain negation, which is total (never overflows in IEEE 754).
-/// Do NOT reuse `SaturatingNeg` here: `negate` wraps, `abs` saturates —
-/// those are different contracts.
-pub trait IpeWrappingNeg: Sized {
+/// `i64` answers `None` for `i64::MIN`, whose negation has no `Int` value;
+/// `f64` negation is total in IEEE 754.
+pub trait IpeNegate: Sized {
+    /// The exact negation, or `None` when it leaves the type's range.
     #[must_use]
-    fn ipe_wrapping_neg(self) -> Self;
+    fn ipe_checked_neg(self) -> Option<Self>;
 }
-impl IpeWrappingNeg for i64 {
-    fn ipe_wrapping_neg(self) -> Self {
-        self.wrapping_neg()
+impl IpeNegate for i64 {
+    fn ipe_checked_neg(self) -> Option<Self> {
+        self.checked_neg()
     }
 }
-impl IpeWrappingNeg for f64 {
-    fn ipe_wrapping_neg(self) -> Self {
-        -self
+impl IpeNegate for f64 {
+    fn ipe_checked_neg(self) -> Option<Self> {
+        Some(-self)
     }
 }
 
-/// Wrapping addition for polymorphic `Number a` functions.
+/// Addition for polymorphic `Number a` functions.
 ///
-/// `i64` delegates to `math::ipe_int_add`, the one Int `+` definition; `f64`
-/// uses plain IEEE 754 addition (total — overflow yields ±∞, never panics). Generic `Number a`
-/// functions that emit `BinOp::Add` use this trait so the generic body is
-/// safe under `overflow-checks=on` regardless of how the call site
-/// monomorphises.
+/// The emitted name of generic `+`. `i64` delegates to `math::ipe_int_add`, the
+/// one `Int` `+` definition, so a sum outside the `Int` range trips
+/// `IntOverflow`; `f64` uses plain IEEE 754 addition (total — overflow yields
+/// ±∞). The generic body is the same under any `overflow-checks` setting.
 pub trait IpeWrappingAdd<Rhs = Self>: Sized {
     type Output;
-    /// The additive identity — the seed a wrapping additive fold starts from,
-    /// so an empty fold yields `0` / `0.0`.
+    /// The additive identity — the seed an additive fold starts from, so an
+    /// empty fold yields `0` / `0.0`.
     const IPE_ADD_IDENTITY: Self;
     #[must_use]
     fn ipe_wrapping_add(self, rhs: Rhs) -> Self::Output;
+    /// The exact sum, or `None` when it leaves the type's range.
+    #[must_use]
+    fn ipe_exact_add(self, rhs: Rhs) -> Option<Self::Output>;
 }
 impl IpeWrappingAdd for i64 {
     type Output = i64;
     const IPE_ADD_IDENTITY: i64 = 0;
     fn ipe_wrapping_add(self, rhs: i64) -> i64 {
         crate::math::ipe_int_add(self, rhs)
+    }
+    fn ipe_exact_add(self, rhs: i64) -> Option<i64> {
+        crate::math::ipe_int_exact_add(self, rhs)
     }
 }
 impl IpeWrappingAdd for f64 {
@@ -166,11 +171,15 @@ impl IpeWrappingAdd for f64 {
     fn ipe_wrapping_add(self, rhs: f64) -> f64 {
         self + rhs
     }
+    fn ipe_exact_add(self, rhs: f64) -> Option<f64> {
+        Some(self + rhs)
+    }
 }
 
-/// Wrapping subtraction for polymorphic `Number a` functions.
+/// Subtraction for polymorphic `Number a` functions.
 ///
-/// `i64` delegates to `math::ipe_int_sub`; `f64` is total.
+/// `i64` delegates to `math::ipe_int_sub` (out of range trips `IntOverflow`);
+/// `f64` is total.
 pub trait IpeWrappingSub<Rhs = Self>: Sized {
     type Output;
     #[must_use]
@@ -189,22 +198,29 @@ impl IpeWrappingSub for f64 {
     }
 }
 
-/// Wrapping multiplication for polymorphic `Number a` functions.
+/// Multiplication for polymorphic `Number a` functions.
 ///
-/// `i64` delegates to `math::ipe_int_mul`; `f64` is total.
+/// `i64` delegates to `math::ipe_int_mul` (out of range trips `IntOverflow`);
+/// `f64` is total.
 pub trait IpeWrappingMul<Rhs = Self>: Sized {
     type Output;
-    /// The multiplicative identity — the seed a wrapping multiplicative fold
-    /// starts from, so an empty fold yields `1` / `1.0`.
+    /// The multiplicative identity — the seed a multiplicative fold starts
+    /// from, so an empty fold yields `1` / `1.0`.
     const IPE_MUL_IDENTITY: Self;
     #[must_use]
     fn ipe_wrapping_mul(self, rhs: Rhs) -> Self::Output;
+    /// The exact product, or `None` when it leaves the type's range.
+    #[must_use]
+    fn ipe_exact_mul(self, rhs: Rhs) -> Option<Self::Output>;
 }
 impl IpeWrappingMul for i64 {
     type Output = i64;
     const IPE_MUL_IDENTITY: i64 = 1;
     fn ipe_wrapping_mul(self, rhs: i64) -> i64 {
         crate::math::ipe_int_mul(self, rhs)
+    }
+    fn ipe_exact_mul(self, rhs: i64) -> Option<i64> {
+        crate::math::ipe_int_exact_mul(self, rhs)
     }
 }
 impl IpeWrappingMul for f64 {
@@ -213,38 +229,25 @@ impl IpeWrappingMul for f64 {
     fn ipe_wrapping_mul(self, rhs: f64) -> f64 {
         self * rhs
     }
-}
-
-/// Saturating negation — used only by `basics_abs`, NOT by `basics_negate`.
-///
-/// `abs` saturates at `i64::MAX` for `i64::MIN` (deliberate divergence from
-/// wrapping behaviour). `negate` uses `IpeWrappingNeg`
-/// instead (wrapping contract, not saturating).
-pub trait SaturatingNeg: Sized {
-    #[must_use]
-    fn saturating_neg(self) -> Self;
-}
-impl SaturatingNeg for i64 {
-    fn saturating_neg(self) -> Self {
-        self.checked_neg().unwrap_or(i64::MAX)
-    }
-}
-impl SaturatingNeg for f64 {
-    fn saturating_neg(self) -> Self {
-        -self
+    fn ipe_exact_mul(self, rhs: f64) -> Option<f64> {
+        Some(self * rhs)
     }
 }
 
 /// Ipê `abs : number -> number` — absolute value on Int or Float.
 ///
-/// Uses `T::default()` as the zero sentinel (`0_i64` / `0.0_f64`), both of
-/// which satisfy `Default`. The `Copy` bound allows reusing `x` after the
-/// comparison without a clone. At `i64::MIN`, saturates to `i64::MAX` rather
-/// than wrapping to a NEGATIVE "absolute value" — deliberate divergence from
-/// two's-complement wrap (sanctioned; soundness over wrapping).
-pub fn basics_abs<T: PartialOrd + SaturatingNeg + Copy + Default>(x: T) -> T {
+/// Uses `T::default()` as the zero sentinel (`0_i64` / `0.0_f64`). The `Copy`
+/// bound allows reusing `x` after the comparison without a clone. `abs
+/// i64::MIN`, whose exact result `2^63` is outside the `Int` range, trips
+/// `IntOverflow`, so `abs x >= 0` holds for every `Int` it returns.
+pub fn basics_abs<T: PartialOrd + IpeNegate + Copy + Default>(x: T) -> T {
     let zero = T::default();
-    if x < zero { x.saturating_neg() } else { x }
+    if x < zero {
+        x.ipe_checked_neg()
+            .unwrap_or_else(|| trip(RuntimeTrip::IntOverflow { op: IntOp::Abs }))
+    } else {
+        x
+    }
 }
 
 // ── end Basics numerics ──────────────────────────────────────────────
@@ -277,6 +280,19 @@ pub fn interpolate_to_string<T: crate::stringify::IpeInterpolate>(v: T) -> Strin
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
+    use crate::core::runtime_trip;
+
+    /// The value `f` returns, or the `RuntimeTrip` it unwinds with.
+    fn outcome<T>(
+        f: impl FnOnce() -> T + std::panic::UnwindSafe,
+    ) -> Result<T, Option<RuntimeTrip>> {
+        std::panic::catch_unwind(f).map_err(|payload| runtime_trip(payload.as_ref()))
+    }
+
+    /// The `IntOverflow` trip of `op`, as [`outcome`] reports it.
+    const fn overflow<T>(op: IntOp) -> Result<T, Option<RuntimeTrip>> {
+        Err(Some(RuntimeTrip::IntOverflow { op }))
+    }
 
     #[test]
     fn error_to_string_renders_kind_and_message() {
@@ -353,12 +369,20 @@ mod tests {
         assert_eq!(basics_error_to_string(vec![1i64, 2, 3]), "[1 2 3]");
     }
 
-    // ── wrapping negate (IpeWrappingNeg) ───────────────────────────────
-    // negate(i64::MIN) must not panic; the two's-complement fixed point is
-    // i64::MIN itself (wrapping_neg(i64::MIN) == i64::MIN).
+    // ── negate (IpeNegate) ─────────────────────────────────────────────
+    // negate(i64::MIN) has no Int value: it trips `IntOverflow`, never wraps
+    // to i64::MIN and never panics with a foreign payload.
     #[test]
-    fn negate_wraps_at_min_i64() {
-        assert_eq!(basics_negate(i64::MIN), i64::MIN);
+    fn negate_trips_at_min_i64() {
+        assert_eq!(outcome(|| basics_negate(i64::MIN)), overflow(IntOp::Negate));
+        assert_eq!(basics_negate(i64::MIN + 1), i64::MAX);
+    }
+    // abs(i64::MIN) trips `IntOverflow`, never saturates to i64::MAX.
+    #[test]
+    fn abs_trips_at_min_i64() {
+        assert_eq!(outcome(|| basics_abs(i64::MIN)), overflow(IntOp::Abs));
+        assert_eq!(basics_abs(i64::MIN + 1), i64::MAX);
+        assert_eq!(basics_abs(-7_i64), 7);
     }
     #[test]
     fn negate_negates_positive_i64() {
@@ -377,12 +401,20 @@ mod tests {
 
     // ── IpeWrappingAdd ─────────────────────────────────────────────────
     #[test]
-    fn ipe_wrapping_add_i64_max_plus_one() {
-        assert_eq!(i64::MAX.ipe_wrapping_add(1), i64::MIN);
+    fn ipe_wrapping_add_i64_max_plus_one_trips() {
+        assert_eq!(
+            outcome(|| i64::MAX.ipe_wrapping_add(1)),
+            overflow(IntOp::Add)
+        );
+        assert_eq!(i64::MAX.ipe_exact_add(1), None);
     }
     #[test]
-    fn ipe_wrapping_add_i64_min_plus_neg_one() {
-        assert_eq!(i64::MIN.ipe_wrapping_add(-1), i64::MAX);
+    fn ipe_wrapping_add_i64_min_plus_neg_one_trips() {
+        assert_eq!(
+            outcome(|| i64::MIN.ipe_wrapping_add(-1)),
+            overflow(IntOp::Add)
+        );
+        assert_eq!(i64::MIN.ipe_exact_add(1), Some(i64::MIN + 1));
     }
     #[test]
     #[allow(clippy::float_cmp)]
@@ -392,12 +424,18 @@ mod tests {
 
     // ── IpeWrappingSub ─────────────────────────────────────────────────
     #[test]
-    fn ipe_wrapping_sub_i64_min_minus_one() {
-        assert_eq!(i64::MIN.ipe_wrapping_sub(1), i64::MAX);
+    fn ipe_wrapping_sub_i64_min_minus_one_trips() {
+        assert_eq!(
+            outcome(|| i64::MIN.ipe_wrapping_sub(1)),
+            overflow(IntOp::Sub)
+        );
     }
     #[test]
-    fn ipe_wrapping_sub_i64_max_minus_neg_one() {
-        assert_eq!(i64::MAX.ipe_wrapping_sub(-1), i64::MIN);
+    fn ipe_wrapping_sub_i64_max_minus_neg_one_trips() {
+        assert_eq!(
+            outcome(|| i64::MAX.ipe_wrapping_sub(-1)),
+            overflow(IntOp::Sub)
+        );
     }
     #[test]
     #[allow(clippy::float_cmp)]
@@ -407,12 +445,20 @@ mod tests {
 
     // ── IpeWrappingMul ─────────────────────────────────────────────────
     #[test]
-    fn ipe_wrapping_mul_i64_max_times_two() {
-        assert_eq!(i64::MAX.ipe_wrapping_mul(2), -2);
+    fn ipe_wrapping_mul_i64_max_times_two_trips() {
+        assert_eq!(
+            outcome(|| i64::MAX.ipe_wrapping_mul(2)),
+            overflow(IntOp::Mul)
+        );
+        assert_eq!(i64::MAX.ipe_exact_mul(2), None);
     }
     #[test]
-    fn ipe_wrapping_mul_i64_min_times_neg_one() {
-        assert_eq!(i64::MIN.ipe_wrapping_mul(-1), i64::MIN);
+    fn ipe_wrapping_mul_i64_min_times_neg_one_trips() {
+        assert_eq!(
+            outcome(|| i64::MIN.ipe_wrapping_mul(-1)),
+            overflow(IntOp::Mul)
+        );
+        assert_eq!(i64::MIN.ipe_exact_mul(1), Some(i64::MIN));
     }
     #[test]
     #[allow(clippy::float_cmp)]

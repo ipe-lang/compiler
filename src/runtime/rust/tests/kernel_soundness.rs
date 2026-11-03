@@ -9,6 +9,7 @@
 // `with_default` names the `random`- and `decimal`-gated tests use; the other
 // tests fully qualify their kernel paths, so the glob is dead without either
 // feature.
+use ipe_runtime_rust::core::{FloatToIntOp, IntOp, RuntimeTrip, runtime_trip};
 #[cfg(any(feature = "random", feature = "decimal"))]
 use ipe_runtime_rust::*;
 use proptest::prelude::*;
@@ -67,7 +68,14 @@ proptest! {
     }
 }
 
-// ── math — out-of-domain inputs are defined (NaN/inf), never panic ─────────
+// ── math — out-of-domain inputs are defined (NaN/inf) or a typed trip ──────
+
+/// Runs `math_round(x)`: its `Int`, or the typed trip it ended in (`None` for a
+/// foreign panic, which no input may reach).
+fn round_outcome(x: f64) -> Result<i64, Option<RuntimeTrip>> {
+    std::panic::catch_unwind(|| ipe_runtime_rust::math::math_round(x))
+        .map_err(|payload| runtime_trip(payload.as_ref()))
+}
 
 #[test]
 // Exact-equality comparisons here are intentional: sqrt(4) and pow(2,10)
@@ -78,17 +86,44 @@ fn math_out_of_domain_is_total() {
     assert_eq!(ipe_runtime_rust::math::math_sqrt(4.0), 2.0);
     assert!(ipe_runtime_rust::math::math_log(0.0).is_infinite());
     assert!(ipe_runtime_rust::math::math_log(-1.0).is_nan());
-    // round of a non-finite / huge float saturates into i64 (defined `as` cast).
-    let _ = ipe_runtime_rust::math::math_round(f64::NAN);
-    let _ = ipe_runtime_rust::math::math_round(f64::INFINITY);
+    // round of a non-finite float has no Int value: a typed trip, never a
+    // saturated cast.
+    let non_finite = Err(Some(RuntimeTrip::NonFiniteToInt {
+        op: FloatToIntOp::Round,
+    }));
+    assert_eq!(round_outcome(f64::NAN), non_finite);
+    assert_eq!(round_outcome(f64::INFINITY), non_finite);
+    assert_eq!(round_outcome(f64::NEG_INFINITY), non_finite);
+    assert_eq!(
+        round_outcome(1e300),
+        Err(Some(RuntimeTrip::IntOverflow {
+            op: IntOp::FromFloat(FloatToIntOp::Round),
+        }))
+    );
     assert_eq!(ipe_runtime_rust::math::math_round(2.5), 3);
+    assert_eq!(ipe_runtime_rust::math::math_round(-2.5), -2);
     assert_eq!(ipe_runtime_rust::math::math_pow(2.0, 10.0), 1024.0);
 }
 
 proptest! {
     #[test]
-    fn prop_math_round_never_panics(x in any::<f64>()) {
-        let _ = ipe_runtime_rust::math::math_round(x); // must not panic for any f64
+    fn prop_math_round_is_exact_or_typed_trip(x in any::<f64>()) {
+        // Elm's `round`: half away from zero, except a negative tie (a
+        // fraction of exactly -0.5) goes up toward positive infinity.
+        let rounded = if x - x.trunc() == -0.5 { x.round() + 1.0 } else { x.round() };
+        let expected = if !rounded.is_finite() {
+            Err(Some(RuntimeTrip::NonFiniteToInt { op: FloatToIntOp::Round }))
+        } else if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&rounded) {
+            // In range: the integral value converts exactly.
+            #[allow(clippy::cast_possible_truncation)] // checked in range just above
+            let exact = rounded as i64;
+            Ok(exact)
+        } else {
+            Err(Some(RuntimeTrip::IntOverflow {
+                op: IntOp::FromFloat(FloatToIntOp::Round),
+            }))
+        };
+        prop_assert_eq!(round_outcome(x), expected);
     }
     #[test]
     fn prop_math_sqrt_never_panics(x in any::<f64>()) {

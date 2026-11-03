@@ -35,3 +35,25 @@ keeps Elm's names and semantics for `succeed`, `map`, `andThen`, `oneOf`,
 The shipped example under `examples/shapes/script/parser-demo` composes the full
 combinator surface — `map2`, `keep`, `ignore`, nested `andThen`, and `oneOf` —
 and is exercised by the first-party examples sweep.
+
+## `Int` arithmetic and `Float` to `Int` (vs `elm/core` `Basics`)
+
+- **`Int` is 64-bit, and a result outside that range is a typed error.** Elm
+  compiles `Int` to a JavaScript number, so a result past `2^53` silently loses
+  precision. In Ipê, `+`, `-`, `*`, `//`, `negate`, `abs`,
+  `List.sum`, and `List.product` either return the exact result or end in a
+  typed `InvalidInput` error — never a wrapped or rounded number. This covers
+  the least `Int` divided by `-1` and `negate`/`abs` of the least `Int`.
+
+- **`floor`, `ceil`, `round`, and `trunc` refuse a `Float` with no `Int`
+  value.** Elm returns a non-integer number for NaN or an infinity. In Ipê, NaN,
+  an infinity, or a value outside the 64-bit `Int` range ends in a typed
+  `InvalidInput` error, never a saturated `Int`.
+
+## `List.range` and `List.repeat` ceilings (vs `elm/core` `List`)
+
+- **A list builder refuses more than 10000000 elements.** Elm builds whatever
+  length it is asked for, until memory runs out. In Ipê, `List.range lo hi`
+  with a span past 10000000, or `List.repeat n x` with `n` past 10000000,
+  ends in a typed `LimitExceeded` error before anything is allocated — never a
+  truncated list.

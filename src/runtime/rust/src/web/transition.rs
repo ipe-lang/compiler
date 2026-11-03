@@ -32,12 +32,14 @@
 //! A [`Transition`] carries only: a field NAME (a string), one of a small closed
 //! set of [`TransitionOp`]s, and a [`Source`] that is a literal or the named
 //! field itself. It has no code, no call, no nesting — [`apply_transition`]
-//! cannot run arbitrary logic, cannot panic/unwrap/index (integer ops wrap in
-//! two's complement, the defined Ipê `Int` semantics, never abort), and refuses
-//! (returns the input model unchanged) anything it cannot prove applies: a
-//! missing field, a type mismatch, a non-object model, an oversized model, or a
-//! strict-decode failure. The dev patch channel is untrusted; every failure is a
-//! total no-op that leaves the caller's `Model` exactly as it was.
+//! cannot run arbitrary logic, cannot unwrap/index, and refuses (returns the
+//! input model unchanged) anything it cannot prove applies: a missing field, a
+//! type mismatch, a non-object model, an oversized model, or a strict-decode
+//! failure. The dev patch channel is untrusted; every such failure is a total
+//! no-op that leaves the caller's `Model` exactly as it was. An integer op whose
+//! exact result leaves the `Int` range is not a refusal: it raises the same
+//! typed `IntOverflow` trip the compiled arm's `ipe_int_add`/`ipe_int_sub`
+//! raises, so the datum path never diverges from the compiled arm.
 
 /// Hard ceiling on a `Model`'s JSON body considered for a transition. Mirrors
 /// [`super::additive::MAX_ADDITIVE_BODY_BYTES`] so both value-level Model
@@ -64,10 +66,10 @@ pub enum Source {
 
 /// The closed set of field operations a [`Transition`] can describe. Exhaustive
 /// and wildcard-free: a new op shape forces a compile-time decision here and in
-/// the classifier, never a silent mis-encode. Every arithmetic op wraps in
-/// two's complement (the defined Ipê `Int` semantics, matching the compiled
-/// arm) and refuses (via [`apply_transition`] returning the input model) on a
-/// type mismatch, so none can panic.
+/// the classifier, never a silent mis-encode. Every arithmetic op is the exact
+/// Ipê `Int` operation the compiled arm runs: a result outside the `Int` range
+/// trips `IntOverflow`, and a type mismatch refuses (via [`apply_transition`]
+/// returning the input model).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TransitionOp {
     /// Replace the field with the source value (`SetName s -> { m | name = s }`,
@@ -75,11 +77,11 @@ pub enum TransitionOp {
     /// field's existing type or the strict re-decode refuses.
     Set,
     /// Integer add: `field = field + source` (`Increment -> { m | count = count + 1 }`).
-    /// Both the field and the source must be integers; overflow wraps (two's
-    /// complement), matching the compiled arm's `ipe_int_add`.
+    /// Both the field and the source must be integers; a sum outside the `Int`
+    /// range trips `IntOverflow`, matching the compiled arm's `ipe_int_add`.
     IntAdd,
     /// Integer subtract: `field = field - source` (`Decrement -> …`). Both
-    /// integers; overflow wraps, matching `ipe_int_sub`.
+    /// integers; out of range trips `IntOverflow`, matching `ipe_int_sub`.
     IntSub,
     /// Boolean negate: `field = not field` (`Toggle -> { m | on = not on }`).
     /// The field must be a boolean; the source is ignored.
@@ -119,11 +121,12 @@ impl Transition {
 /// Total and fail-closed: on ANY condition it cannot prove — a non-object model,
 /// an oversized model, a missing target field, a source field that is absent, a
 /// type mismatch between the op and the field/source, or a strict-decode failure
-/// of the merged object — it returns `model` UNCHANGED. (Integer overflow is not
-/// a refusal: it wraps, matching the compiled arm's defined `Int` semantics.)
-/// It never panics, never unwraps, never indexes, and never coerces a value into
-/// the `Model`: the final strict decode is the backstop that rejects anything
-/// that would not type-check as the compiled arm.
+/// of the merged object — it returns `model` UNCHANGED. Integer overflow is not
+/// a refusal: it trips the typed `IntOverflow` the compiled arm's `ipe_int_add`
+/// / `ipe_int_sub` raises, after the datum computation, never inside it. It
+/// never unwraps, never indexes, and never coerces a value into the `Model`:
+/// the final strict decode is the backstop that rejects anything that would
+/// not type-check as the compiled arm.
 ///
 /// The `Model` and the transition datum are BOTH treated as untrusted at the dev
 /// boundary; this routine is the single place that mutates the server-held Model
@@ -135,32 +138,58 @@ where
     Model: serde::Serialize + serde::de::DeserializeOwned,
 {
     match try_apply(transition, &model) {
-        Some(next) => next,
+        Ok(Some(next)) => next,
         // Refuse: hand the caller back the model it gave us, unchanged. The
         // move-in `model` is returned so no clone is needed on the happy path's
         // sibling.
-        None => model,
+        Ok(None) => model,
+        // The exact result has no `Int` value: the compiled arm's own trip.
+        Err(fault) => crate::core::trip(fault),
     }
 }
 
-/// The fallible core of [`apply_transition`]: `Some(next)` only when the
+/// The fallible core of [`apply_transition`]: `Ok(Some(next))` only when the
 /// transition provably applies and the result strict-decodes into `Model`;
-/// `None` on every refusal (the caller then returns the input model unchanged).
+/// `Ok(None)` on every refusal (the caller then returns the input model
+/// unchanged); `Err` with the trip the compiled arm raises when an integer
+/// op's exact result leaves the `Int` range.
 #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
-fn try_apply<Model>(transition: &Transition, model: &Model) -> Option<Model>
+fn try_apply<Model>(
+    transition: &Transition,
+    model: &Model,
+) -> Result<Option<Model>, crate::core::RuntimeTrip>
 where
     Model: serde::Serialize + serde::de::DeserializeOwned,
 {
-    let value = serde_json::to_value(model).ok()?;
-    // Bound the object we walk: a Model whose serialized form exceeds the ceiling
-    // is not transitioned (the re-encode below would already have produced it, so
-    // this bounds the re-decode input, matching the additive path's ceiling).
-    let obj = value.as_object()?;
+    let Ok(value) = serde_json::to_value(model) else {
+        return Ok(None);
+    };
+    let Some(obj) = value.as_object() else {
+        return Ok(None);
+    };
     // The target field must already exist — a transition never INTRODUCES a field
     // (that would be a schema change, i.e. logic). Read its current value.
-    let current = obj.get(&transition.field)?;
-    let next_field = compute_next(&transition.op, current, &transition.source, obj)?;
+    let Some(current) = obj.get(&transition.field) else {
+        return Ok(None);
+    };
+    let Some(next_field) = compute_next(&transition.op, current, &transition.source, obj)? else {
+        return Ok(None);
+    };
+    Ok(merge_and_decode(transition, obj, next_field))
+}
 
+/// Write `next_field` over the target field and strict-decode the merged
+/// object into `Model`, or `None` (refuse) when it does not decode or exceeds
+/// [`MAX_TRANSITION_MODEL_BYTES`].
+#[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
+fn merge_and_decode<Model>(
+    transition: &Transition,
+    obj: &serde_json::Map<String, serde_json::Value>,
+    next_field: serde_json::Value,
+) -> Option<Model>
+where
+    Model: serde::de::DeserializeOwned,
+{
     let mut merged = obj.clone();
     // `field` was proven present above; this only overwrites an existing key.
     merged.insert(transition.field.clone(), next_field);
@@ -178,40 +207,41 @@ where
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Compute the field's next JSON value under the closed op, or `None` (refuse) on
-/// any type mismatch or missing source field. Arithmetic wraps (two's
-/// complement, the defined `Int` semantics), so overflow is not a refusal.
+/// Compute the field's next JSON value under the closed op: `Ok(None)`
+/// (refuse) on any type mismatch or missing source field, `Err` with the
+/// compiled arm's `IntOverflow` trip when an integer op's exact result leaves
+/// the `Int` range.
 #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
 fn compute_next(
     op: &TransitionOp,
     current: &serde_json::Value,
     source: &Source,
     obj: &serde_json::Map<String, serde_json::Value>,
-) -> Option<serde_json::Value> {
+) -> Result<Option<serde_json::Value>, crate::core::RuntimeTrip> {
+    use crate::core::{IntOp, RuntimeTrip};
+    // The exact half of the one `Int` definition the compiled arm also emits,
+    // so the datum path and the direct compiled arm agree at the i64 boundary.
+    let exact_int = |exact: fn(i64, i64) -> Option<i64>,
+                     int_op: IntOp|
+     -> Result<Option<serde_json::Value>, RuntimeTrip> {
+        let Some((a, b)) = current
+            .as_i64()
+            .zip(resolve_source(source, obj).and_then(|v| v.as_i64()))
+        else {
+            return Ok(None);
+        };
+        exact(a, b)
+            .map(|n| Some(serde_json::Value::from(n)))
+            .ok_or(RuntimeTrip::IntOverflow { op: int_op })
+    };
     match op {
         // Replace with the resolved source value. The strict re-decode in the
         // caller enforces the type match (a `Set` of the wrong type is rejected
         // there), so `Set` itself only needs to resolve the source.
-        TransitionOp::Set => resolve_source(source, obj),
-        TransitionOp::IntAdd => {
-            let a = current.as_i64()?;
-            let b = resolve_source(source, obj)?.as_i64()?;
-            // The one Int `+` definition the compiled arm also emits, so the
-            // datum path and the direct compiled arm agree at the i64 boundary.
-            let sum = crate::math::ipe_int_add(a, b);
-            Some(serde_json::Value::from(sum))
-        }
-        TransitionOp::IntSub => {
-            let a = current.as_i64()?;
-            let b = resolve_source(source, obj)?.as_i64()?;
-            // The one Int `-` definition (see `IntAdd`).
-            let diff = crate::math::ipe_int_sub(a, b);
-            Some(serde_json::Value::from(diff))
-        }
-        TransitionOp::BoolNot => {
-            let b = current.as_bool()?;
-            Some(serde_json::Value::Bool(!b))
-        }
+        TransitionOp::Set => Ok(resolve_source(source, obj)),
+        TransitionOp::IntAdd => exact_int(crate::math::ipe_int_exact_add, IntOp::Add),
+        TransitionOp::IntSub => exact_int(crate::math::ipe_int_exact_sub, IntOp::Sub),
+        TransitionOp::BoolNot => Ok(current.as_bool().map(|b| serde_json::Value::Bool(!b))),
     }
 }
 
@@ -367,6 +397,7 @@ where
 #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
 mod tests {
     use super::{Source, Transition, TransitionOp, apply_transition};
+    use crate::core::{IntOp, RuntimeTrip, runtime_trip};
     use serde::{Deserialize, Serialize};
 
     #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
@@ -494,37 +525,59 @@ mod tests {
         assert_eq!(apply_transition(&t, model()), model());
     }
 
-    #[test]
-    fn int_add_overflow_wraps_matching_compiled_arm() {
+    /// The `RuntimeTrip` `f` unwinds with, if any.
+    fn trip_of<T>(f: impl FnOnce() -> T + std::panic::UnwindSafe) -> Option<RuntimeTrip> {
+        std::panic::catch_unwind(f)
+            .err()
+            .and_then(|payload| runtime_trip(payload.as_ref()))
+    }
+
+    /// `op` with source `1` over a model whose `count` is `count`: the datum
+    /// path and the direct compiled arm raise the same trip (dev == prod).
+    fn overflow_matches_compiled_arm(
+        count: i64,
+        op: TransitionOp,
+        compiled: fn(i64, i64) -> i64,
+        int_op: IntOp,
+    ) -> Result<(), &'static str> {
         let m = Counter {
-            count: i64::MAX,
+            count,
             name: "a".to_string(),
             on: false,
         };
         let t = Transition {
             field: "count".to_string(),
-            op: TransitionOp::IntAdd,
+            op,
             source: Source::Int(1),
         };
-        // Wraps to `i64::MIN`, exactly as the compiled arm's `ipe_int_add` — the
-        // datum path must not diverge from the direct arm at the i64 boundary.
-        assert_eq!(apply_transition(&t, m).count, i64::MIN);
+        let expected = Some(RuntimeTrip::IntOverflow { op: int_op });
+        if trip_of(|| compiled(count, 1)) != expected {
+            return Err("the compiled arm trips IntOverflow");
+        }
+        if trip_of(move || apply_transition(&t, m)) != expected {
+            return Err("the datum path trips the compiled arm's IntOverflow");
+        }
+        Ok(())
     }
 
     #[test]
-    fn int_sub_overflow_wraps_matching_compiled_arm() {
-        let m = Counter {
-            count: i64::MIN,
-            name: "a".to_string(),
-            on: false,
-        };
-        let t = Transition {
-            field: "count".to_string(),
-            op: TransitionOp::IntSub,
-            source: Source::Int(1),
-        };
-        // Wraps to `i64::MAX`, matching `ipe_int_sub`.
-        assert_eq!(apply_transition(&t, m).count, i64::MAX);
+    fn int_add_overflow_trips_matching_compiled_arm() -> Result<(), &'static str> {
+        overflow_matches_compiled_arm(
+            i64::MAX,
+            TransitionOp::IntAdd,
+            crate::math::ipe_int_add,
+            IntOp::Add,
+        )
+    }
+
+    #[test]
+    fn int_sub_overflow_trips_matching_compiled_arm() -> Result<(), &'static str> {
+        overflow_matches_compiled_arm(
+            i64::MIN,
+            TransitionOp::IntSub,
+            crate::math::ipe_int_sub,
+            IntOp::Sub,
+        )
     }
 
     #[test]
