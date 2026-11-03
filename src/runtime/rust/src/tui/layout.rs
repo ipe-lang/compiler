@@ -2553,18 +2553,6 @@ fn distribute_row_fill(
 /// The SGR sequence that ends a styled run.
 pub const SGR_RESET: &str = "\x1b[0m";
 
-/// Honour the `NO_COLOR` convention (https://no-color.org): when the env var is
-/// present and non-empty, suppress all COLOUR output (fg/bg) — text attributes
-/// (bold/italic/underline/…) are kept, only colour is dropped. Cached once.
-fn no_color() -> bool {
-    static NC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *NC.get_or_init(|| {
-        crate::system::read_env_var_os("NO_COLOR")
-            .map(|v| !v.is_empty())
-            .unwrap_or(false)
-    })
-}
-
 /// Parse a `"fg:<code>"` / `"bg:<code>"` palette decoration into its SGR code.
 /// The `<code>` is produced by the terminal-attribute lowering from
 /// [`crate::color::AnsiColor::named_sgr_code`] (plus the `39`/`49` reset), so it
@@ -2640,7 +2628,7 @@ fn sgr_with_profile(style: Style, profile: crate::color::TermProfile) -> String 
     if style.reverse {
         codes.push("7".to_string());
     }
-    if !no_color() {
+    if profile != crate::color::TermProfile::NoColor {
         // A named-palette code takes precedence over truecolour: the portable
         // path emits its own SGR code (30-37 / 90-97 / 39), else the cell colour
         // degrades through `Color::to_ansi`.
@@ -2765,8 +2753,8 @@ pub fn render_with_focus<M: Clone>(
     inputs: &mut InputRegistry,
     scroll_y: usize,
 ) -> (String, Vec<Focusable<M>>, usize) {
-    // Production: auto-detect the terminal colour capability at the single
-    // `resolve_term_profile` point.
+    // Production: the Tui session's profile, pinned once at session start by
+    // `TuiGuard::enter`/`enter_mouse` — a frame never re-reads the environment.
     render_with_focus_encoded(
         view,
         cols,
@@ -2774,7 +2762,7 @@ pub fn render_with_focus<M: Clone>(
         focus_idx,
         inputs,
         scroll_y,
-        crate::color::resolve_term_profile(),
+        crate::color::active_term_profile(),
     )
 }
 
@@ -3860,5 +3848,36 @@ mod tests {
         let div = || tagged("div", vec![]);
         assert_eq!(as_section(div()), 1);
         assert!(as_section(div()) < as_bare(div()));
+    }
+
+    /// `TermProfile::NoColor` drops every colour code — truecolour AND the
+    /// named-palette codes `sgr_with_profile` emits directly — but keeps text
+    /// attributes. Red if the palette branch is still gated by a second,
+    /// independent `NO_COLOR` read instead of `profile`.
+    ///
+    /// CI job `runtime-full-features-run`.
+    #[test]
+    fn no_color_profile_drops_palette_keeps_bold() {
+        let style = Style {
+            bold: true,
+            fg_palette: Some(32),
+            bg_palette: Some(44),
+            fg: Some((255, 0, 0)),
+            bg: Some((0, 255, 0)),
+            ..Style::default()
+        };
+        let out = sgr_with_profile(style, TermProfile::NoColor);
+        assert!(out.contains("\x1b[1m"), "bold must survive NoColor: {out}");
+        assert!(
+            !out.contains("38;"),
+            "fg colour must drop under NoColor: {out}"
+        );
+        assert!(
+            !out.contains("48;"),
+            "bg colour must drop under NoColor: {out}"
+        );
+        // Bold is the ONLY code left: the palette codes (`32`/`44`) and the RGB
+        // fallback are both dropped, not merely the RGB path.
+        assert_eq!(out, "\x1b[1m", "{out}");
     }
 }

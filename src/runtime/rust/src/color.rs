@@ -832,8 +832,10 @@ fn nearest_256(r: i64, g: i64, b: i64) -> i64 {
 ///   unless the environment explicitly asks for less.
 #[must_use]
 pub fn resolve_term_profile() -> TermProfile {
-    // `NO_COLOR` present and non-empty (<https://no-color.org>) forces no colour,
-    // matching the terminal renderer's own `no_color()` gate.
+    // `NO_COLOR` present and non-empty (<https://no-color.org>) forces no colour.
+    // The ONLY read of `NO_COLOR` (and `COLORTERM`/`TERM`) in the runtime — every
+    // Tui/Cli colour decision reads the typed `TermProfile` this produces, never
+    // the raw env var again.
     if matches!(crate::system::read_env_var("NO_COLOR"), Ok(v) if !v.is_empty()) {
         return TermProfile::NoColor;
     }
@@ -848,6 +850,65 @@ pub fn resolve_term_profile() -> TermProfile {
         Ok(term) if term.contains("256color") => TermProfile::Ansi256,
         _ => TermProfile::TrueColor,
     }
+}
+
+/// Encodes the Tui session's pinned [`TermProfile`] for [`active_term_profile`]:
+/// `0` means no session has pinned one (resolve fresh); `1..=4` is the pinned
+/// variant. A Tui session is a process-wide singleton (`TuiGuard::enter*`
+/// refuses a second one while one is active), so a process-wide pin is exact —
+/// never a stale value left over from a different session.
+#[cfg(feature = "tui")]
+static TUI_SESSION_PROFILE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(feature = "tui")]
+impl TermProfile {
+    const fn encode(self) -> u8 {
+        match self {
+            Self::TrueColor => 1,
+            Self::Ansi256 => 2,
+            Self::Ansi16 => 3,
+            Self::NoColor => 4,
+        }
+    }
+
+    const fn decode(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::TrueColor),
+            2 => Some(Self::Ansi256),
+            3 => Some(Self::Ansi16),
+            4 => Some(Self::NoColor),
+            _ => None,
+        }
+    }
+}
+
+/// Resolve the profile once and pin it for the Tui session about to start, so
+/// every frame that session paints reads the SAME value for its whole life
+/// instead of re-deriving it per frame — the one env read happens here, through
+/// [`resolve_term_profile`]. Called from `TuiGuard::enter`/`enter_mouse`.
+#[cfg(feature = "tui")]
+pub(crate) fn begin_tui_session_profile() {
+    TUI_SESSION_PROFILE.store(
+        resolve_term_profile().encode(),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+}
+
+/// Un-pin the session profile on teardown, so the next render — a fresh
+/// session, or a one-shot render with no session (e.g. `element_to_cells`) —
+/// resolves fresh again. Called from `tui_teardown`.
+#[cfg(feature = "tui")]
+pub(crate) fn end_tui_session_profile() {
+    TUI_SESSION_PROFILE.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The profile a Tui frame renders with: the active session's pinned profile,
+/// or a fresh [`resolve_term_profile`] when no session has pinned one.
+#[cfg(feature = "tui")]
+#[must_use]
+pub(crate) fn active_term_profile() -> TermProfile {
+    TermProfile::decode(TUI_SESSION_PROFILE.load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or_else(resolve_term_profile)
 }
 
 /// The curated named-colour set (`fromName`). Deliberately small — the CSS
