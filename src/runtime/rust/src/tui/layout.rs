@@ -21,7 +21,7 @@ use super::super::ui::{
     Attribute, Description, Element, HAlign, Length, Location, Portion, SectionHead, VAlign,
     WhiteSpace, section_head,
 };
-use super::cell::sanitize_rune;
+use super::cell::{sanitize_rune, sanitize_text_keeping_newlines};
 use super::focus::{Focusable, InputRegistry};
 use crate::color::Color;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -1135,12 +1135,15 @@ fn render_input<M: Clone>(
     };
     // Sanitize value/placeholder: both are seeded from Ipê `Attr.value` /
     // `Attr.placeholder` (attacker-controllable model data) and rendered into the
-    // terminal stream — an unescaped `\x1b` would inject ANSI/OSC sequences.
-    let value: String = attr_str(attrs, "value")
-        .unwrap_or("")
-        .chars()
-        .map(sanitize_rune)
-        .collect();
+    // terminal stream — an unescaped `\x1b` would inject ANSI/OSC sequences. A
+    // textarea's `\n` is its line break: blanking it would seed a one-line edit
+    // buffer whose next edit sends the joined text back through `onInput`.
+    let raw_value = attr_str(attrs, "value").unwrap_or("");
+    let value: String = if is_multiline {
+        sanitize_text_keeping_newlines(raw_value)
+    } else {
+        raw_value.chars().map(sanitize_rune).collect()
+    };
     let placeholder: String = attr_str(attrs, "placeholder")
         .unwrap_or("")
         .chars()
@@ -1883,16 +1886,13 @@ fn extract_text<M>(el: &Element<M>, keep_newlines: bool) -> String {
         // Sanitize: paragraph/textColumn text flows here to the terminal stream;
         // an unescaped `\x1b` would inject ANSI/OSC sequences (same vector as the
         // Element::Text render path, which already sanitizes).
-        Element::Text(t) => t
-            .chars()
-            .map(|c| {
-                if keep_newlines && c == '\n' {
-                    c
-                } else {
-                    sanitize_rune(c)
-                }
-            })
-            .collect(),
+        Element::Text(t) => {
+            if keep_newlines {
+                sanitize_text_keeping_newlines(t)
+            } else {
+                t.chars().map(sanitize_rune).collect()
+            }
+        }
         Element::Node(_, _, kids) | Element::TaggedNode(_, _, _, kids) => kids
             .iter()
             .map(|k| extract_text(k, keep_newlines))
@@ -3223,6 +3223,57 @@ mod tests {
             "reverse-video cursor present (focused): {frame:?}"
         );
         assert!(!frame.contains('▏'), "no inserted cursor glyph: {frame:?}");
+    }
+
+    /// A textarea's model `\n` stays a line break in its buffer and through the next edit.
+    ///
+    /// CI job `runtime-full-features-run`.
+    #[test]
+    fn textarea_value_keeps_its_line_break_through_an_edit() -> Result<(), String> {
+        let t: Element<()> = Element::TaggedNode(
+            "textarea".into(),
+            Description::NoDescription,
+            vec![Attribute::AttrAttribute("value".into(), "a\x1b\nb".into())],
+            vec![],
+        );
+        let mut reg = InputRegistry::new();
+        let (frame, _f, _h) = render_with_focus(&t, 80, 24, 0, &mut reg, 0);
+        let row_of = |c: char| frame.split("\r\n").position(|row| row.contains(c));
+        match (row_of('a'), row_of('b')) {
+            (Some(a), Some(b)) if a < b => {}
+            rows => return Err(format!("{rows:?} are not two buffer lines: {frame:?}")),
+        }
+        let st = reg.get(0);
+        if st.buffer != "a \nb" {
+            return Err(format!("seeded buffer {:?}", st.buffer));
+        }
+        if !super::super::focus::edit_input(st, "char", "x") || st.buffer != "a \nbx" {
+            return Err(format!("edited buffer {:?}", st.buffer));
+        }
+        Ok(())
+    }
+
+    /// A textarea's `"\r\n"` is one line break, so an edit sends no stray space back.
+    ///
+    /// CI job `runtime-full-features-run`.
+    #[test]
+    fn textarea_crlf_value_is_one_line_break_through_an_edit() -> Result<(), String> {
+        let t: Element<()> = Element::TaggedNode(
+            "textarea".into(),
+            Description::NoDescription,
+            vec![Attribute::AttrAttribute("value".into(), "a\r\nb".into())],
+            vec![],
+        );
+        let mut reg = InputRegistry::new();
+        let _ = render_with_focus(&t, 80, 24, 0, &mut reg, 0);
+        let st = reg.get(0);
+        if st.buffer != "a\nb" {
+            return Err(format!("seeded buffer {:?}", st.buffer));
+        }
+        if !super::super::focus::edit_input(st, "char", "x\r\ny") || st.buffer != "a\nbx\ny" {
+            return Err(format!("edited buffer {:?}", st.buffer));
+        }
+        Ok(())
     }
 
     #[test]

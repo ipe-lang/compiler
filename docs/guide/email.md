@@ -58,9 +58,17 @@ send from to =
 An `EmailAddress` is obtained only through the parse boundary:
 
 ```ipe
-case Email.parseAddress "alice@example.com" of
-    Just addr -> {- addr : EmailAddress -}
-    Nothing   -> {- not a valid address -}
+import Ipe.Email as Email
+
+
+describe : String -> String
+describe raw =
+    case Email.parseAddress raw of
+        Just addr ->
+            Email.addressToString addr
+
+        Nothing ->
+            "not a valid address"
 ```
 
 Explore the full surface — the `with*` builders, the SES / SMTP config records,

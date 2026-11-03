@@ -34,7 +34,7 @@ it, and drops a `Debug.log` into the reserve step.
 The whole flow is one span; the value the inner pipeline produces is exactly what
 `checkout` returns — the span is transparent to the result:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/trace-checkout-span/src/Main.ipe
 checkout : Int -> Task Error Int
 checkout qty =
     Trace.span "checkout"
@@ -50,7 +50,7 @@ checkout qty =
 `Debug.log` sits inside an expression and returns its argument, so the reserve
 step's value flows straight through it:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/trace-checkout-span/src/Main.ipe
 reserveStock : Int -> Task Error Int
 reserveStock qty =
     Task.succeed (Debug.log "reserved" qty)
@@ -58,7 +58,7 @@ reserveStock qty =
 
 Running it (`ipe dev run`) prints the computed total on stdout:
 
-```
+```text
 checkout total (cents): 3000
 ```
 
@@ -66,7 +66,7 @@ The `Debug.log` line (`reserved: 3`) goes to stderr — always, since `Debug.log
 is unconditional. The span lines appear on stderr only when `IPE_TRACE` is set;
 with `IPE_TRACE=1` the run's stderr adds the span frame and its event/attr:
 
-```
+```text
 [trace] span start checkout
 [trace] event reserve-start
 [trace] attr ipe.trace.sku = widget-42

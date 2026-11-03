@@ -32,10 +32,9 @@ port with a safe default.
 `fromInt` is the one gate: each candidate becomes `Ok Port` or a typed `Err`, and
 the raw number is recovered with `toInt` only at the boundary:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/net-port-guard/src/Main.ipe
 describe n =
     case Net.fromInt n of
-
         Ok port ->
             String.fromInt n ++ "  ->  ok (Port " ++ String.fromInt (Net.toInt port) ++ ")"
 
@@ -47,7 +46,7 @@ A config default runs through the *same* gate and falls back to `Net.min` — a
 total, known-valid port — so the result is always a real `Port`, never a
 half-checked integer:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/net-port-guard/src/Main.ipe
 configPort raw =
     Result.withDefault Net.min (Net.fromInt raw)
 ```
@@ -55,7 +54,7 @@ configPort raw =
 Running it (`ipe dev run`) accepts the in-range ports, rejects `0`, `70000`, and `-1`,
 and shows the default fallback:
 
-```
+```text
 Port validation:
   443  ->  ok (Port 443)
   8080  ->  ok (Port 8080)

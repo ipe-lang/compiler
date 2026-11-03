@@ -22,6 +22,7 @@ use super::super::tea::{
     CliEvent, InputBudget, IpeCmd, IpeSub, MAX_QUEUED_INPUT, SubManager, cli_run_cmd,
 };
 use super::CellsView;
+use super::cell::sanitize_frame;
 use super::focus::{
     Focusable, InputRegistry, clamp_focus, edit_input, ensure_focus_visible, extract_click_msg,
     extract_input_msg, extract_msg_named, hit_test, parse_mouse,
@@ -485,10 +486,24 @@ fn spawn_control_bridge() -> tokio::sync::mpsc::UnboundedReceiver<ControlRequest
     req_rx
 }
 
-/// `tui_app` — terminal TEA driver for a `view : Model -> String` (the raw
-/// frame is painted verbatim), the vehicle for the `Ui.cells` raw-cell escape.
-/// Each decoded key's `(kind, value)` goes to every `Tui.Sub.onKey` handler the
-/// current `subscriptions` declares (the codegen wraps the user's
+/// The text frame a String view paints for `model`.
+///
+/// The view's text is model data, so it passes [`sanitize_frame`] whole: its
+/// rows stay rows and no control sequence, bidi control or line separator in it
+/// reaches the terminal.
+fn string_view_frame<Model, FView>(view: &FView, model: &Model) -> String
+where
+    Model: Clone,
+    FView: Fn(Model) -> String,
+{
+    sanitize_frame(&view(model.clone()))
+}
+
+/// `tui_app` — terminal TEA driver for a `view : Model -> String` (each frame
+/// painted as text through [`string_view_frame`]), the vehicle for the
+/// `Ui.cells` raw-cell escape. Each decoded key's `(kind, value)` goes to
+/// every `Tui.Sub.onKey` handler the current `subscriptions` declares (the
+/// codegen wraps the user's
 /// `KeyEvent -> Msg` so the `{ kind, value }` record is built there); a key no
 /// handler subscribes to is unobserved.
 #[allow(clippy::type_complexity)]
@@ -543,7 +558,9 @@ where
             TuiDebugger::new(model.clone(), move |msg, mdl| upd(msg, mdl))
         };
 
-        let render_frame = move |m: &Model| view(m.clone());
+        // `view` moves into this closure, the one place the loop can call it,
+        // so every frame it paints has passed the frame sanitiser.
+        let render_frame = move |m: &Model| string_view_frame(&view, m);
 
         // Initial paint.
         #[cfg(all(feature = "debugger", not(target_arch = "wasm32")))]
@@ -2246,7 +2263,9 @@ mod tui_enter_error_tests {
 
 #[cfg(test)]
 mod key_reader_tests {
-    use super::{AtomicBool, CliEvent, decode_key, paint_to, read_keys_from};
+    use super::{
+        AtomicBool, CLEAR_HOME, CliEvent, decode_key, paint_to, read_keys_from, string_view_frame,
+    };
 
     /// The `(kind, value)` events one byte stream yields, in order, with
     /// `"interrupt"` / `"eof"` standing for the two terminal events.
@@ -2348,6 +2367,29 @@ mod key_reader_tests {
         let active = AtomicBool::new(true);
         paint_to(&mut out, &active, "frame");
         assert!(out.ends_with(b"frame"), "{out:?}");
+    }
+
+    /// A String view's control sequence, bell and bidi override never reach the terminal.
+    ///
+    /// CI job `runtime-full-features-run`.
+    #[test]
+    fn a_string_view_paints_no_control_or_bidi_character() -> Result<(), String> {
+        let view = |(): ()| "a\x1b]0;x\x07\u{202E}b\nc".to_owned();
+        let frame = string_view_frame(&view, &());
+        let mut out: Vec<u8> = Vec::new();
+        paint_to(&mut out, &AtomicBool::new(true), &frame);
+        let painted = String::from_utf8(out).map_err(|e| e.to_string())?;
+        let Some(body) = painted.strip_prefix(CLEAR_HOME) else {
+            return Err(format!("no clear before the frame: {painted:?}"));
+        };
+        if body.contains(['\x1b', '\x07', '\u{202E}']) {
+            return Err(format!("a hazard reached the terminal: {body:?}"));
+        }
+        if body == "a ]0;x  b\r\nc" {
+            Ok(())
+        } else {
+            Err(format!("rows or text changed: {body:?}"))
+        }
     }
 
     /// A reader that hands out `chunks` one read each; a read past them records

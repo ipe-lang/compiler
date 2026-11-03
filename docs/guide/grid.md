@@ -29,7 +29,7 @@ The example under
 builds a column list — a fixed sidebar, a flexible main column with a minimum, and
 three equal cards — and renders it.
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/grid-tracks/src/Main.ipe
 columns : List Track
 columns =
     [ Grid.px 200
@@ -40,7 +40,7 @@ columns =
 
 Running it (`ipe dev run`):
 
-```
+```text
 grid-template-columns:
   200px minmax(100px, 1fr) repeat(3, 1fr)
 single track (auto): auto

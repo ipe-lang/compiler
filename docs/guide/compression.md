@@ -33,7 +33,7 @@ confirms the bytes came back identical.
 The payload is text converted to `Bytes` at the boundary — the same line repeated,
 so gzip has real redundancy to squeeze:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/compression-round-trip/src/Main.ipe
 original : Bytes
 original =
     Bytes.fromString (String.repeat 40 "the quick brown fox\n")
@@ -42,23 +42,27 @@ original =
 `main` binds the compress and decompress Tasks with `<-`, then compares sizes and
 confirms the round-trip:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/compression-round-trip/src/Main.ipe
 main =
     do
         compressed <- Compression.gzip original
         restored <- Compression.gunzip compressed
         Io.println
-            ("original " ++ String.fromInt (Bytes.length original)
-                ++ " bytes -> gzip " ++ String.fromInt (Bytes.length compressed)
-                ++ " bytes")
+            ("original "
+                ++ String.fromInt (Bytes.length original)
+                ++ " bytes -> gzip "
+                ++ String.fromInt (Bytes.length compressed)
+                ++ " bytes"
+            )
         Io.println
             ("round-trip recovers the original: "
-                ++ boolText (Bytes.length restored == Bytes.length original))
+                ++ boolText (Bytes.length restored == Bytes.length original)
+            )
 ```
 
 Running it (`ipe dev run`):
 
-```
+```text
 original 800 bytes -> gzip 59 bytes
 round-trip recovers the original: yes
 first line back: the quick brown fox

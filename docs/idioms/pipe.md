@@ -15,7 +15,7 @@ naturally.
 
 Nested, a multi-step transform reads inside-out — you find the start in the middle:
 
-```ipe
+```ipe ipe:skip the nested, inside-out form the pipeline below replaces; not a standalone program
 report text =
     String.join "\n" (List.map formatRow (List.take 3 (ranked (tally (tokenize text)))))
 ```
@@ -23,7 +23,7 @@ report text =
 As a pipeline it reads as a recipe, top to bottom — from
 [`examples/shapes/script/word-frequency`](https://github.com/ipe-lang/compiler/tree/main/examples/shapes/script/word-frequency):
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/word-frequency/src/Main.ipe
 report : String -> String
 report text =
     text

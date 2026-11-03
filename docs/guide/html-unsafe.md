@@ -28,7 +28,7 @@ The example under
 renders the *same* trusted string twice — once through `Html.text`, once through
 `Unsafe.unsafeRaw` — so the difference is visible in one output.
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/html-unsafe-boundary/src/Main.ipe
 comparison : Html msg
 comparison =
     Html.div
@@ -40,7 +40,7 @@ comparison =
 
 The manifest pre-accepts the capability:
 
-```ipe
+```ipe ipe:skip a package.ipe fragment: read syntactically, never type-checked, so a partial record is fine here
 package : Package
 package =
     { name = "html-unsafe-boundary"
@@ -51,7 +51,7 @@ package =
 
 Running it (`ipe dev run`):
 
-```
+```text
 Same string, escaped (safe) then verbatim (unsafe):
 <div class="compare"><p class="safe">&lt;em&gt;featured&lt;/em&gt;</p><p class="raw"><em>featured</em></p></div>
 ```

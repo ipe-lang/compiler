@@ -35,7 +35,7 @@ row label count ratio enabled =
 
 Running it (`ipe dev run`):
 
-```
+```text
 alpha: count=3 ratio=0.75 enabled=true
 beta: count=128 ratio=1.5 enabled=false
 ```
@@ -48,7 +48,7 @@ unchanged. Interpolation takes exactly these scalars — `String`, `Int`,
 at type-check, so render its fields one by one. Outside a `"""…"""` string,
 the same row is built with the explicit conversions:
 
-```ipe ipe:skip
+```ipe ipe:skip a syntax shape, not a standalone declaration
 label ++ ": count=" ++ String.fromInt count ++ " enabled=" ++ String.fromBool enabled
 ```
 

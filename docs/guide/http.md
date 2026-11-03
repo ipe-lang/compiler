@@ -35,7 +35,7 @@ query string — all without sending.
 Building runs the parse boundary, then refines the typed request with the pure
 `with*` builders:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/http-request-builder/src/Main.ipe
 buildRequest : String -> Result Error Http.HttpRequest
 buildRequest raw =
     Http.defaultRequestFromString raw
@@ -47,11 +47,10 @@ buildRequest raw =
 Because the boundary narrows the scheme, a `file:` or `ftp:` target never yields
 a request:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/http-request-builder/src/Main.ipe
 describe : String -> String
 describe raw =
     case buildRequest raw of
-
         Ok req ->
             raw ++ "  ->  " ++ Http.methodToString req.method ++ " " ++ req.url
 
@@ -63,13 +62,15 @@ Inbound verbs pass through the single parse boundary, and `Http.parseQuery`
 decodes a query string into a `Dict`, percent-decoding each key and value. A
 malformed escape or invalid UTF-8 anywhere refuses the whole query as an `Err`:
 
-```ipe
-case Http.parseQuery "?q=red%20shoes&page=2" of
-    Ok params ->
-        Maybe.withDefault "?" (Dict.get "q" params)
+```ipe ipe:excerpt examples/shapes/script/http-request-builder/src/Main.ipe
+queryParam : String -> String -> String
+queryParam key raw =
+    case Http.parseQuery raw of
+        Ok params ->
+            Maybe.withDefault "?" (Dict.get key params)
 
-    Err _ ->
-        "(refused)"
+        Err _ ->
+            "(refused)"
 ```
 
 Running it (`ipe dev run`) shows the two http(s) targets assembled into `POST`

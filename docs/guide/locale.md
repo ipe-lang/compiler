@@ -39,11 +39,10 @@ returning `Nothing` on a structurally invalid tag.
 `fromTag` is the one gate. A valid tag becomes `Just Locale`; an invalid one
 becomes `Nothing`. Only a parsed `Locale` can reach the locale-aware functions:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/locale-turkish-i/src/Main.ipe
 showCase : String -> String -> String
 showCase tag word =
     case Locale.fromTag tag of
-
         Just locale ->
             tag
                 ++ ": toUpperIn \""
@@ -59,7 +58,7 @@ showCase tag word =
 The program chains several IO steps with `do`, sequencing from the header line
 through the case comparisons to the invalid-tag demonstration:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/locale-turkish-i/src/Main.ipe
 main =
     do
         _ <- Io.println "-- locale-aware case mapping (Turkish-i demo) --"
@@ -74,7 +73,7 @@ main =
 Running it (`ipe dev run`) confirms the Turkish and English paths diverge exactly
 where they should, and the invalid tag is a `Nothing`:
 
-```
+```text
 -- locale-aware case mapping (Turkish-i demo) --
 default toUpper "istanbul" = "ISTANBUL"
 tr: toUpperIn "istanbul" = "İSTANBUL"

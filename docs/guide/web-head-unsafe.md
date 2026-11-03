@@ -27,7 +27,7 @@ The example under
 [`examples/shapes/script/jsonld-structured-data`](https://github.com/ipe-lang/compiler/blob/main/examples/shapes/script/jsonld-structured-data/src/Main.ipe)
 emits a JSON-LD block for a product page from a trusted constant.
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/jsonld-structured-data/src/Main.ipe
 head : Html msg
 head =
     HeadU.unsafeJsonLd productJsonLd
@@ -35,7 +35,7 @@ head =
 
 Running it (`ipe dev run`):
 
-```
+```text
 Rendered JSON-LD (script body emitted verbatim, not escaped):
 <script type="application/ld+json">{"@context":"https://schema.org","@type":"Product","name":"Widget","sku":"W-1"}</script>
 ```

@@ -49,8 +49,12 @@ nor hand one to another principal. Compose `immutable` to pin a
 column at insert:
 
 ```ipe
-Store.ownerColumn .author
-    |> Store.andPolicy (Store.immutable .createdAt)
+import Ipe.Db.Store as Store
+
+
+ownerPolicy =
+    Store.ownerColumn .author
+        |> Store.andPolicy (Store.immutable .createdAt)
 ```
 
 **RBAC** — *role-based access control*: who may see or change a row is decided by
@@ -60,14 +64,20 @@ fail-closed caller leaves, alone or in a disjunction with a row match. "Only an 
 may read"; "the owner-value row OR any admin may read":
 
 ```ipe
-Store.readOnly (Store.role "admin")
+import Ipe.Db.Store as Store
 
-Store.readOnly
-    (Store.anyOf
-        [ Store.matchWhere (Store.eq .author "root")
-        , Store.role "admin"
-        ]
-    )
+
+adminOnly =
+    Store.readOnly (Store.role "admin")
+
+
+ownerOrAdmin =
+    Store.readOnly
+        (Store.anyOf
+            [ Store.matchWhere (Store.eq .author "root")
+            , Store.role "admin"
+            ]
+        )
 ```
 
 **Tenant** — in a multi-tenant application one deployment serves many independent
@@ -79,7 +89,11 @@ caller with no tenant sees nothing). For per-row isolation across many tenants,
 correlate each row against a caller-scoped memberships store with `existsIn` instead:
 
 ```ipe
-Store.readOnly (Store.claimEquals "tenant" "acme")
+import Ipe.Db.Store as Store
+
+
+tenantOnly =
+    Store.readOnly (Store.claimEquals "tenant" "acme")
 ```
 
 **Sharing** — one user explicitly grants another user (or a team) access to a
@@ -90,16 +104,33 @@ store is itself secured to the caller, its own read policy composes into the `EX
 subquery — defence in depth: a share the caller cannot read cannot open a row:
 
 ```ipe
-Store.readOnly
-    (Store.existsIn securedShares
-        (\share doc -> Store.correlate share.docId doc.id)
-    )
+import Ipe.Db.Store as Store exposing (Policy, Secured)
+
+
+type alias Doc =
+    { id : String
+    , body : String
+    }
+
+
+type alias Share =
+    { docId : String
+    , member : String
+    }
+
+
+sharedPolicy : Secured Share -> Policy Doc
+sharedPolicy securedShares =
+    Store.readOnly
+        (Store.existsIn securedShares
+            (\share doc -> Store.correlate share.docId doc.id)
+        )
 ```
 
 `Store.explain` renders the sharing policy's read clause as transparent text, so a
 reviewer reads the intent beside the generated SQL:
 
-```
+```text
 exists in shares where shares.doc_id = id and its read policy: (member = caller subject)
 ```
 

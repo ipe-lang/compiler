@@ -34,7 +34,7 @@ the render sink neutralising it.
 The card is a tree of typed builders; the untrusted `author` goes through
 `Html.text`, the safe-by-construction content node:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/html-escaping/src/Main.ipe
 commentCard : String -> String -> Html msg
 commentCard author body =
     Html.div

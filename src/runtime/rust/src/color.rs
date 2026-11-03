@@ -819,11 +819,37 @@ fn nearest_256(r: i64, g: i64, b: i64) -> i64 {
     }
 }
 
+/// Whether `NO_COLOR` suppresses colour — the ONE predicate every colour
+/// decision in the runtime calls; no other site reads the `NO_COLOR`
+/// environment variable. Per <https://no-color.org>: suppressed iff the
+/// variable is present and its value is non-empty. A value that is present but
+/// not valid Unicode (`VarError::NotUnicode`) is, by construction, a non-empty
+/// value too, so it counts as present-and-non-empty rather than failing open.
+#[must_use]
+pub(crate) fn no_color_requested() -> bool {
+    no_color_from(crate::system::read_env_var("NO_COLOR"))
+}
+
+/// The pure core of [`no_color_requested`], taking the read result directly so
+/// a test can drive every case — absent, empty, non-empty, non-Unicode —
+/// without touching the process environment.
+#[must_use]
+fn no_color_from(read: Result<String, std::env::VarError>) -> bool {
+    match read {
+        Ok(value) => !value.is_empty(),
+        Err(std::env::VarError::NotPresent) => false,
+        // The variable is set to something other than cleanly absent, so it
+        // counts as present-and-non-empty — fail closed rather than leaving
+        // colour on.
+        Err(std::env::VarError::NotUnicode(_)) => true,
+    }
+}
+
 /// Resolve the terminal colour capability once, deterministically, from the
 /// environment — the single place `Tui`/`Cli` decide how far a truecolour must
 /// degrade (the lipgloss/termenv resolution order, made total and explicit).
 ///
-/// * `NO_COLOR` set (any value, per <https://no-color.org>) → [`TermProfile::NoColor`].
+/// * [`no_color_requested`] → [`TermProfile::NoColor`].
 /// * `COLORTERM` = `truecolor` / `24bit` → [`TermProfile::TrueColor`].
 /// * `TERM` containing `256color` → [`TermProfile::Ansi256`].
 /// * `TERM` = `dumb` → [`TermProfile::NoColor`].
@@ -832,11 +858,10 @@ fn nearest_256(r: i64, g: i64, b: i64) -> i64 {
 ///   unless the environment explicitly asks for less.
 #[must_use]
 pub fn resolve_term_profile() -> TermProfile {
-    // `NO_COLOR` present and non-empty (<https://no-color.org>) forces no colour.
-    // The ONLY read of `NO_COLOR` (and `COLORTERM`/`TERM`) in the runtime — every
-    // Tui/Cli colour decision reads the typed `TermProfile` this produces, never
-    // the raw env var again.
-    if matches!(crate::system::read_env_var("NO_COLOR"), Ok(v) if !v.is_empty()) {
+    // `NO_COLOR` through its one predicate, and the ONLY read of
+    // `COLORTERM`/`TERM` in the runtime — every Tui/Cli colour decision reads
+    // the typed `TermProfile` this produces, never a raw env var again.
+    if no_color_requested() {
         return TermProfile::NoColor;
     }
     if let Ok(ct) = crate::system::read_env_var("COLORTERM") {
@@ -1679,5 +1704,32 @@ mod tests {
             let (.., a) = sim.to_rgba();
             assert!((a - 0.5).abs() < 1e-9);
         }
+    }
+
+    // ── `NO_COLOR` SSOT: every case `no_color_requested` can observe ────────
+
+    #[test]
+    fn no_color_from_absent_is_false() {
+        assert!(!no_color_from(Err(std::env::VarError::NotPresent)));
+    }
+
+    #[test]
+    fn no_color_from_empty_is_false() {
+        // Per <https://no-color.org>: present but empty does NOT suppress.
+        assert!(!no_color_from(Ok(String::new())));
+    }
+
+    #[test]
+    fn no_color_from_non_empty_is_true() {
+        assert!(no_color_from(Ok("1".to_owned())));
+    }
+
+    #[test]
+    fn no_color_from_non_unicode_fails_closed() {
+        // A present-but-not-UTF-8 value is, by construction, non-empty: it must
+        // suppress colour (fail closed), never leave colour on by default.
+        assert!(no_color_from(Err(std::env::VarError::NotUnicode(
+            std::ffi::OsString::from("non-utf8-stand-in")
+        ))));
     }
 }

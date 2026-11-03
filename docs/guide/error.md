@@ -35,7 +35,7 @@ using the kind, not the message text.
 The failures are built with kind-naming constructors, so each carries its
 classification:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/error-retry-policy/src/Main.ipe
 samples : List Error
 samples =
     [ Error.network "connection reset"
@@ -49,7 +49,7 @@ samples =
 The decision is one `isRetryable` on the structured value — the message text is
 never inspected, so a reworded message can't break the policy:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/error-retry-policy/src/Main.ipe
 policyLine : Error -> String
 policyLine err =
     let
@@ -65,7 +65,7 @@ policyLine err =
 
 Running it (`ipe dev run`):
 
-```
+```text
 Failure -> retry policy (by error kind, not message text):
   RETRY Network: connection reset
   FAIL  InvalidInput: port must be 1..65535

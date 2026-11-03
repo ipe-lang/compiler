@@ -34,6 +34,15 @@ shows the three knots in a few lines.
 The classic float trap, avoided — `0.1 + 0.2` is exactly `0.3`:
 
 ```ipe
+import Ipe.Decimal as Decimal exposing (Decimal)
+import Ipe.Result as Result
+
+
+dec : String -> Decimal
+dec s =
+    Decimal.fromString s |> Result.withDefault Decimal.zero
+
+
 exactSum : String
 exactSum =
     Decimal.add (dec "0.1") (dec "0.2")
@@ -44,6 +53,9 @@ Division returns a `Result`, so a zero divisor is an `Err` value that a `case`
 handles — the program can't be tripped into a trap by a runtime-supplied divisor:
 
 ```ipe
+import Ipe.Decimal as Decimal exposing (Decimal)
+
+
 safeDivide : Decimal -> Decimal -> String
 safeDivide a b =
     case Decimal.div a b of
@@ -58,14 +70,27 @@ Rounding `2.5` at zero places two ways shows why the mode is explicit — banker
 rounds to the even `2`, half-up rounds away to `3`:
 
 ```ipe
+import Ipe.Decimal as Decimal exposing (Decimal)
+import Ipe.Result as Result
+
+
+dec : String -> Decimal
+dec s =
+    Decimal.fromString s |> Result.withDefault Decimal.zero
+
+
 roundingContrast =
+    let
+        half =
+            dec "2.5"
+    in
     "banker's " ++ Decimal.toString (Decimal.round 0 half)
         ++ ", half-up " ++ Decimal.toString (Decimal.roundHalfUp 0 half)
 ```
 
 Running it (`ipe dev run`):
 
-```
+```text
 0.1 + 0.2 = 0.3 (exact, not 0.3000…04)
 10 / 3 = 3.3333
 10 / 0 = <undefined: division by zero>

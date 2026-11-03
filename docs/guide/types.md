@@ -56,6 +56,9 @@ returning a [`Maybe a`](https://github.com/ipe-lang/compiler/blob/main/docs/refe
 `Nothing` (no value):
 
 ```ipe
+import Ipe.String as String
+
+
 -- Parse a port number, keeping only values in range.
 parsePort : String -> Maybe Int
 parsePort text =
@@ -72,6 +75,19 @@ string is a number. To *use* the result you must handle both cases — the
 compiler will not let you treat a `Maybe Int` as an `Int`:
 
 ```ipe
+import Ipe.String as String
+
+
+parsePort : String -> Maybe Int
+parsePort text =
+    case String.toInt text of
+        Just n ->
+            if n >= 1 && n <= 65535 then Just n else Nothing
+
+        Nothing ->
+            Nothing
+
+
 describe : String -> String
 describe text =
     case parsePort text of
@@ -84,7 +100,7 @@ describe text =
 
 Running `describe` on a few inputs:
 
-```
+```text
 8080 -> port 8080
 99999 -> not a valid port
 https -> not a valid port
@@ -144,4 +160,3 @@ impossible.
   [`Ipe.Result`](https://github.com/ipe-lang/compiler/blob/main/docs/reference/stdlib/Result.md) — the full combinator reference.
 - [Glossary](glossary.md) — `type variable`, `constructor`, `exhaustive`, and
   more.
-```

@@ -35,7 +35,7 @@ carry it: `update` to tally, `get` to price.
 
 The price book is a `Dict String Int` (SKU to cents), built with `fromList`:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/dict-inventory/src/Main.ipe
 priceBook : Dict String Int
 priceBook =
     Dict.fromList
@@ -49,7 +49,7 @@ The scanner emits repeats. Tallying them is a `List.foldl` threading a growing
 `Dict`, with `Dict.update` doing the upsert — the `Nothing` branch handles a
 never-seen SKU, the `Just` branch bumps a running count:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/dict-inventory/src/Main.ipe
 counts : List String -> Dict String Int
 counts skus =
     List.foldl bump Dict.empty skus
@@ -63,7 +63,6 @@ bump sku tally =
 increment : Maybe Int -> Maybe Int
 increment current =
     case current of
-
         Nothing ->
             Just 1
 
@@ -75,7 +74,7 @@ Pricing a line is a `Dict.get`, whose `Maybe Int` result forces the missing-SKU
 case into the open. Here `"GUM"` is scanned but absent from the book, so it takes
 the `Nothing` branch and is flagged rather than silently priced at zero:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/dict-inventory/src/Main.ipe
 lineItem : ( String, Int ) -> String
 lineItem pair =
     let
@@ -86,7 +85,6 @@ lineItem pair =
             String.padRight 8 ' ' (Tuple.first pair) ++ "x" ++ String.fromInt qty ++ "  "
     in
     case priced pair of
-
         Just cents ->
             label ++ money (cents * qty)
 
@@ -97,7 +95,7 @@ lineItem pair =
 Running it (`ipe dev run`) prints a receipt sorted by SKU — `Dict.toList` order is
 unspecified, so the rows are sorted before printing:
 
-```
+```text
 Receipt
 -------
 APPLE   x3  $1.80

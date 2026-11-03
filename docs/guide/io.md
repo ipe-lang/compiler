@@ -32,7 +32,7 @@ The greeting CLI under
 It writes its diagnostic — the argument count — to stderr, and its actual result —
 the greeting — to stdout:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/system-greet-cli/src/Main.ipe
 main =
     do
         argv <- System.args ()
@@ -42,7 +42,7 @@ main =
 
 Running it (`ipe dev run`) with the streams shown separately:
 
-```
+```text
 user args: 0          # stderr
 Hello, world!         # stdout
 ```

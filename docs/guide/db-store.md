@@ -62,11 +62,19 @@ The row type and codec — the field names become the columns (`author`,
 `created_at`, `body`):
 
 ```ipe
+import Ipe.Codec as Codec exposing (Codec)
+
+
 type alias Note =
     { author : String
     , createdAt : String
     , body : String
     }
+
+
+blankNote : Note
+blankNote =
+    { author = "", createdAt = "", body = "" }
 
 
 noteCodec : Codec Note
@@ -78,6 +86,16 @@ The policy: each row is owned by its `.author`, and `.createdAt` is immutable �
 fixed at insert, dropped from every update SET so a later write cannot change it:
 
 ```ipe
+import Ipe.Db.Store as Store
+
+
+type alias Note =
+    { author : String
+    , createdAt : String
+    , body : String
+    }
+
+
 notePolicy : Store.Policy Note
 notePolicy =
     Store.ownerColumn .author
@@ -88,6 +106,33 @@ notePolicy =
 policy names a column the store does not have:
 
 ```ipe
+import Ipe.Codec as Codec exposing (Codec)
+import Ipe.Db.Store as Store exposing (Secured)
+
+
+type alias Note =
+    { author : String
+    , createdAt : String
+    , body : String
+    }
+
+
+blankNote : Note
+blankNote =
+    { author = "", createdAt = "", body = "" }
+
+
+noteCodec : Codec Note
+noteCodec =
+    Codec.auto blankNote
+
+
+notePolicy : Store.Policy Note
+notePolicy =
+    Store.ownerColumn .author
+        |> Store.andPolicy (Store.immutable .createdAt)
+
+
 securedNotes : Result Error (Secured Note)
 securedNotes =
     case Store.fromCodec "notes" noteCodec of
@@ -105,6 +150,55 @@ that same caller. The `do` block chains the `Task`s — each `x <- task` line de
 to `Task.andThen`:
 
 ```ipe
+import Ipe.Auth as Auth
+import Ipe.Codec as Codec exposing (Codec)
+import Ipe.Db as Db
+import Ipe.Db.Store as Store exposing (Secured)
+import Ipe.Http.Server as Server
+import Ipe.Http.Server exposing (Request, Response)
+import Ipe.List as List
+import Ipe.String as String
+import Ipe.Task as Task exposing (Task)
+
+
+type alias Note =
+    { author : String
+    , createdAt : String
+    , body : String
+    }
+
+
+blankNote : Note
+blankNote =
+    { author = "", createdAt = "", body = "" }
+
+
+noteCodec : Codec Note
+noteCodec =
+    Codec.auto blankNote
+
+
+notePolicy : Store.Policy Note
+notePolicy =
+    Store.ownerColumn .author
+        |> Store.andPolicy (Store.immutable .createdAt)
+
+
+securedNotes : Result Error (Secured Note)
+securedNotes =
+    case Store.fromCodec "notes" noteCodec of
+        Err e ->
+            Err e
+
+        Ok store ->
+            Store.secured notePolicy (Store.primaryKey .body store)
+
+
+newNote : Note
+newNote =
+    { author = "ignored", createdAt = "2024-01-01", body = "hello" }
+
+
 handleAddNote : Request -> Auth.Principal -> Task Error Response
 handleAddNote _ principal =
     Task.onError (\_ -> Task.succeed (Server.text "none"))
@@ -125,7 +219,7 @@ handleAddNote _ principal =
 The handler is reachable only behind an authenticated route, where the middleware
 mints the `principal`:
 
-```ipe
+```ipe ipe:skip a syntax shape with placeholder names, not valid Ipê
 main =
     ...
         (Server.listen
@@ -140,7 +234,7 @@ Running it (`ipe dev run`) prints its name — the store is assembled and the ro
 but the never-served `listen` is caught by `Task.onError`, so no live database or
 network is needed to prove the model compiles and the security path type-checks:
 
-```
+```text
 store-secured-owner
 ```
 

@@ -36,11 +36,10 @@ of their roles; an action *requires* a set; access is a subset test.
 Each role's grants are a set built with `fromList`, which de-duplicates as it
 builds:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/set-access-control/src/Main.ipe
 roleGrants : String -> Set String
 roleGrants role =
     case role of
-
         "viewer" ->
             Set.fromList [ "read" ]
 
@@ -58,7 +57,7 @@ A user holds several roles, so their effective permissions are the **union** of
 each role's grants. `List.foldl` threads the growing set as its accumulator — the
 immutable stand-in for a "keep adding to the set" loop:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/set-access-control/src/Main.ipe
 effectivePermissions : List String -> Set String
 effectivePermissions roles =
     List.foldl mergeRole Set.empty roles
@@ -69,12 +68,13 @@ mergeRole role acc =
     Set.union acc (roleGrants role)
 ```
 
-The access check is the third knot made concrete. `Set.diff required effective`
-is exactly the permissions the action needs but the user lacks; if that set
-`isEmpty`, nothing is missing, so access is granted. The subset relation is never
-spelled out by hand — it falls out of the difference being empty:
+The access check is the third knot made concrete. `missingFor required
+effective` — a one-line `Set.diff` wrapper — is exactly the permissions the
+action needs but the user lacks; if that set `isEmpty`, nothing is missing, so
+access is granted. The subset relation is never spelled out by hand — it falls
+out of the difference being empty:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/set-access-control/src/Main.ipe
 decide : String -> List String -> Set String -> String
 decide action roles required =
     let
@@ -82,7 +82,7 @@ decide action roles required =
             effectivePermissions roles
 
         missing =
-            Set.diff required effective
+            missingFor required effective
     in
     if Set.isEmpty missing then
         action ++ ": GRANTED"
@@ -94,7 +94,7 @@ decide action roles required =
 Because order is unspecified, the report sorts the elements before joining them —
 a human-facing string must not depend on hash order:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/set-access-control/src/Main.ipe
 showSet : Set String -> String
 showSet s =
     s
@@ -105,7 +105,7 @@ showSet s =
 
 Running it (`ipe dev run`) prints:
 
-```
+```text
 alice reads: GRANTED
 alice deletes: DENIED (missing delete)
 bob reads: GRANTED
