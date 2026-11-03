@@ -4,13 +4,11 @@
 //! golden per feature, not just an AST-shape assertion; this file covers
 //! five surfaces.
 //!
-//! ## Positives (build → run → byte-diff against the cached oracle)
+//! ## Positives (build → run → byte-diff against `expected.txt`)
 //!
 //! Each single-file positive compiles `tests/golden/<name>/src/Main.ipe` through
 //! `ipe`, builds the emitted Rust project in the shared cargo target, runs it,
-//! and checks stdout against the cached golden oracle (`oracle.meta` +
-//! `expected_go.txt`). All three carry `oracle_divergence = false` ...//! reference compiler produces byte-identical stdout, captured via
-//! `refresh-oracle`.
+//! and checks stdout byte for byte against the golden's `expected.txt`.
 //!
 //! * `intdiv` — `//` integer division. `20 // 2` → `10` and `(-7) // 2` →
 //!   `-3` (truncation toward zero, Elm parity; a floor-division backend
@@ -20,6 +18,9 @@
 //! * `blockcomment` — a `{- … -}` block comment containing an em-dash plus a
 //!   nested `{- {- -} -}` comment; both are skipped and the program prints.
 //!   Output: `"ok"`.
+//! * `intdiv_divzero` — `10 // d` with `d = 0` flowing in as a parameter, so
+//!   the runtime operator decides it. `x // 0` is `0`, as in Elm: the program
+//!   prints `0` and exits 0, never aborting. Output: `"0"`.
 //!
 //! The multi-module positive builds a `package.ipe` golden project
 //! (with a `Lib` module) through `support::build_golden`, then runs the emitted binary:
@@ -32,10 +33,6 @@
 //!
 //! ## Negatives (assert the exact `IPE-*` diagnostic / runtime classification)
 //!
-//! * `intdiv_divzero` — `10 // 0` at runtime. The runtime classifies this
-//!   as `DivisionByZero` and aborts with exit code 101 (a Rust panic), rather
-//!   than emitting a wrong answer. Asserted by building + running the emitted
-//!   binary and checking the exit code (gated on `IPE_E2E`).
 //! * `intdiv_minint` — `minInt // -1` inside a task step. The quotient `2^63`
 //!   is outside the 64-bit `Int` range, so `ipe_int_div` trips `IntOverflow`
 //!   and the program ends in a typed error: exit 1, nothing printed — never a
@@ -137,35 +134,10 @@ fn qualtype_project_builds_and_prints_42() {
     assert_eq!(outcome.exit_code, Some(0), "clean exit");
 }
 
-// ---------------------------------------------------------------------------
-// Runtime negative: `//` division by zero → DivisionByZero, exit 101.
-// ---------------------------------------------------------------------------
-
+/// `10 // 0` at runtime prints `0` and exits 0: `x // 0` is `0`, as in Elm.
 #[test]
-fn intdiv_by_zero_aborts_exit_101() {
-    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
-        return;
-    }
-    let name = "intdiv_divzero";
-    let dir = golden_dir(name);
-    let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
-    e2e_support::scratch::fresh(&out);
-
-    // Codegen succeeds — the failure is a *runtime* classification, not a
-    // compile error.
-    let built = crate::support::build_golden(&dir, &out, &runtime());
-    assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
-
-    let outcome = crate::support::build_and_run_emitted(name, &out);
-    assert_eq!(
-        outcome.exit_code,
-        Some(101),
-        "division by zero must abort with the Rust panic exit code, not print a value"
-    );
-    assert_eq!(
-        outcome.stdout, "",
-        "no value is printed once DivisionByZero fires"
-    );
+fn intdiv_by_zero_prints_zero() {
+    assert_single_oracle("intdiv_divzero");
 }
 
 /// `minInt // -1` ends in a typed `IntOverflow` error, never a panic or a wrap.

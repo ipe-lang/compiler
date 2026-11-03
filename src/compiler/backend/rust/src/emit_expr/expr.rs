@@ -103,9 +103,8 @@ pub fn emit_expr_at(
                 // `//` (integer division). Raw Rust `/` on `i64` panics on
                 // `b == 0` AND on `i64::MIN / -1`; `//` is itself a Rust line
                 // comment, so raw infix emit is doubly unsound. Route through
-                // the runtime helper: b==0 → panic("attempt to divide by
-                // zero") (abort, exit 101); i64::MIN / -1 → a typed
-                // `IntOverflow` trip.
+                // the runtime helper: `x // 0` is `0` (as in Elm);
+                // i64::MIN / -1 → a typed `IntOverflow` trip.
                 BinOp::IntDiv => Ok(format!("ipe_runtime::math::ipe_int_div({l}, {r})")),
                 // Integer `+`/`-`/`*` on `i64`: raw Rust infix panics or wraps
                 // on overflow depending on `overflow-checks`. Route through the

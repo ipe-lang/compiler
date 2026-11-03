@@ -161,10 +161,10 @@ pub fn transition_of_arm(
     // not just the surface syntax.
     //
     // The compiled arm evaluates every leading `let` value, so a peeled value with
-    // its own semantics (an abort like `1 // 0`, or any effect the emitted
-    // transition datum would never reproduce) must refuse — otherwise the hot
-    // `apply_transition` path silently drops that evaluation and diverges from the
-    // compiled arm. Only a value drawn from the inert vocabulary (a literal, a
+    // its own semantics (a typed trip like `minInt // -1`, or any effect the
+    // emitted transition datum would never reproduce) must refuse — otherwise the
+    // hot `apply_transition` path silently drops that evaluation and diverges from
+    // the compiled arm. Only a value drawn from the inert vocabulary (a literal, a
     // Model-field read, or a recognised int-op / `not` over those) is safe to peel;
     // anything else returns `None` (the arm stays compiled).
     let mut env: Vec<(Symbol, &Expr)> = Vec::new();
@@ -177,7 +177,60 @@ pub fn transition_of_arm(
         cursor = body.as_ref();
     }
 
-    single_field_update(cursor, model_param, resolve, &env)
+    let transition = single_field_update(cursor, model_param, resolve, &env)?;
+    // An inert int op still trips `IntOverflow` at the `Int` edge. The datum
+    // reproduces exactly one evaluation: the op its field RHS reaches. Every other
+    // peeled binding that can trip is an evaluation the compiled arm makes and the
+    // datum skips, so the arm stays compiled.
+    let reproduced = reproduced_binding(cursor, &env);
+    if env
+        .iter()
+        .any(|(name, value)| may_trip(value) && Some(*name) != reproduced)
+    {
+        return None;
+    }
+    Some(transition)
+}
+
+/// The peeled binding the single-field update's RHS dereferences to (the last
+/// hop of its `Var` chain), whose value the transition datum's op reproduces; or
+/// `None` when the RHS reaches no binding.
+fn reproduced_binding(update: &Expr, env: &[(Symbol, &Expr)]) -> Option<Symbol> {
+    let Expr::Update { fields, .. } = update else {
+        return None;
+    };
+    let [(_, rhs)] = fields.as_slice() else {
+        return None;
+    };
+    let mut current = rhs;
+    let mut last = None;
+    // Bounded by the environment length, as in `deref_subst`.
+    for _ in 0..=env.len() {
+        let sym = match current {
+            Expr::Var(s) | Expr::CloneVar(s) => *s,
+            _ => return last,
+        };
+        match env.iter().find(|(name, _)| *name == sym) {
+            Some((name, value)) => {
+                last = Some(*name);
+                current = value;
+            }
+            None => return last,
+        }
+    }
+    last
+}
+
+/// Whether evaluating an inert-peelable value can end in a runtime trip: any
+/// operator does (an `IntAdd` / `IntSub` trips `IntOverflow` at the `Int` edge);
+/// a literal, a variable, a field read, or `not` over those cannot.
+fn may_trip(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinOp { .. } => true,
+        Expr::Access { record, .. } => may_trip(record),
+        Expr::Call { args, .. } => args.iter().any(may_trip),
+        _ => false,
+    }
 }
 
 /// Resolve `expr` through the peeled-`let` substitution environment: a bare
@@ -210,7 +263,7 @@ fn deref_subst<'e>(expr: &'e Expr, env: &[(Symbol, &'e Expr)]) -> &'e Expr {
 /// `Model` parameter itself or of one of its fields; a variable already bound in
 /// the peeled environment (a temporary whose own value was already vetted inert
 /// when it was peeled); and an `IntAdd` / `IntSub` or a `not` whose operands are
-/// themselves inert. Anything else — a division (which may abort), any other
+/// themselves inert. Anything else — a division (which may trip), any other
 /// operator, a call, a field expression, an unbound variable — is NOT inert and
 /// refuses, keeping the arm compiled.
 fn is_inert_peelable(expr: &Expr, model_param: Symbol, env: &[(Symbol, &Expr)]) -> bool {
@@ -223,7 +276,8 @@ fn is_inert_peelable(expr: &Expr, model_param: Symbol, env: &[(Symbol, &Expr)]) 
         // A field read on the Model parameter (`model.field`).
         Expr::Access { record, .. } => is_inert_peelable(record, model_param, env),
         // Only the closed int ops the transition vocabulary reproduces; a division
-        // or any other operator can carry an abort and refuses.
+        // or any other operator refuses. A peeled `IntAdd` / `IntSub` the datum
+        // does not reproduce refuses later (`may_trip`).
         Expr::BinOp { op, lhs, rhs } => {
             matches!(op, BinOp::IntAdd | BinOp::IntSub)
                 && is_inert_peelable(lhs, model_param, env)
@@ -762,17 +816,18 @@ mod tests {
 
     #[test]
     fn peeled_non_inert_let_refuses() {
-        // `let x = count // 0 in ({ m | count = 5 }, Cmd.none)` — the peeled binding
-        // aborts when evaluated. The compiled arm takes that abort; the transition
-        // datum would silently skip it, so the classifier must refuse (keep the arm
-        // compiled) rather than emit a diverging Some.
+        // `let x = count // -1 in ({ m | count = 5 }, Cmd.none)` — the peeled
+        // binding trips `IntOverflow` when `count` is the least `Int`. The compiled
+        // arm takes that trip; the transition datum would silently skip it, so the
+        // classifier must refuse (keep the arm compiled) rather than emit a
+        // diverging Some.
         let x = Symbol::from_raw(201);
         let model_pos = Expr::Let {
             name: x,
             value: Box::new(Expr::BinOp {
                 op: BinOp::IntDiv,
                 lhs: Box::new(model_access(count_sym())),
-                rhs: Box::new(Expr::Int(0)),
+                rhs: Box::new(Expr::Int(-1)),
             }),
             body: Box::new(Expr::Update {
                 record: Box::new(Expr::Var(model_sym())),
@@ -781,6 +836,77 @@ mod tests {
         };
         let body = Expr::Tuple(vec![model_pos, cmd_none()]);
         assert_eq!(classify(&body), None);
+    }
+
+    #[test]
+    fn peeled_unreproduced_int_op_refuses() {
+        // `let x = count + 1 in ({ m | count = 5 }, Cmd.none)` — the compiled arm
+        // evaluates `count + 1`, which trips `IntOverflow` when `count` is the
+        // greatest `Int`; the datum `Set 5` never evaluates it, so the arm must
+        // stay compiled.
+        let x = Symbol::from_raw(202);
+        let inc = Expr::BinOp {
+            op: BinOp::IntAdd,
+            lhs: Box::new(model_access(count_sym())),
+            rhs: Box::new(Expr::Int(1)),
+        };
+        let unused = Expr::Let {
+            name: x,
+            value: Box::new(inc.clone()),
+            body: Box::new(Expr::Update {
+                record: Box::new(Expr::Var(model_sym())),
+                fields: vec![(count_sym(), Expr::Int(5))],
+            }),
+        };
+        assert_eq!(classify(&Expr::Tuple(vec![unused, cmd_none()])), None);
+
+        // A second op beside the reproduced one is skipped by the datum too.
+        let y = Symbol::from_raw(203);
+        let both = Expr::Let {
+            name: x,
+            value: Box::new(inc.clone()),
+            body: Box::new(Expr::Let {
+                name: y,
+                value: Box::new(inc),
+                body: Box::new(Expr::Update {
+                    record: Box::new(Expr::Var(model_sym())),
+                    fields: vec![(count_sym(), Expr::Var(y))],
+                }),
+            }),
+        };
+        assert_eq!(classify(&Expr::Tuple(vec![both, cmd_none()])), None);
+    }
+
+    #[test]
+    fn peeled_total_let_beside_reproduced_op_classifies() {
+        // `let n = count in let t = n + 1 in ({ m | count = t }, Cmd.none)` — `n`
+        // is a total field read and `t` is the op the datum reproduces.
+        let n = Symbol::from_raw(204);
+        let t = Symbol::from_raw(205);
+        let model_pos = Expr::Let {
+            name: n,
+            value: Box::new(model_access(count_sym())),
+            body: Box::new(Expr::Let {
+                name: t,
+                value: Box::new(Expr::BinOp {
+                    op: BinOp::IntAdd,
+                    lhs: Box::new(Expr::Var(n)),
+                    rhs: Box::new(Expr::Int(1)),
+                }),
+                body: Box::new(Expr::Update {
+                    record: Box::new(Expr::Var(model_sym())),
+                    fields: vec![(count_sym(), Expr::Var(t))],
+                }),
+            }),
+        };
+        assert_eq!(
+            classify(&Expr::Tuple(vec![model_pos, cmd_none()])),
+            Some(CompileTransition {
+                field: "count".to_owned(),
+                op: CompileOp::IntAdd,
+                source: CompileSource::Int(1),
+            })
+        );
     }
 
     // ── acceptance: the four data-describable shapes ──────────────────────
