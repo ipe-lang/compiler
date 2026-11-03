@@ -103,9 +103,6 @@ fn previous_let<'a>(lines: &'a [&'a str], at: usize) -> Option<&'a [&'a str]> {
     let mut start = end;
     loop {
         let line = lines.get(start)?;
-        if line.starts_with("let ") {
-            return lines.get(start..at);
-        }
         if line.is_empty()
             || line.starts_with("//")
             || line.ends_with('{')
@@ -113,6 +110,9 @@ fn previous_let<'a>(lines: &'a [&'a str], at: usize) -> Option<&'a [&'a str]> {
             || (start != end && line.ends_with(';'))
         {
             return None;
+        }
+        if line.starts_with("let ") {
+            return lines.get(start..at);
         }
         start = start.checked_sub(1)?;
     }
