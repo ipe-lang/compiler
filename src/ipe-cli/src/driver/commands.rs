@@ -1499,7 +1499,7 @@ fn build_pure_native_release(
 /// The compile is the SEAL: a reported build success MUST mean the crate
 /// actually built, so a non-zero cargo exit surfaces as a typed
 /// [`CliError::EmittedBuildFailed`] rather than a silent exit-0 that would mask a
-/// miscompile. It also produces the `target/debug/ipe-app` binary that
+/// miscompile. It also produces the development binary that
 /// `ipe release run` later runs. CWD = the emitted crate dir so the generated
 /// `.cargo/config.toml` is discovered; a static plan additionally selects the
 /// target triple explicitly.

@@ -238,6 +238,13 @@ impl Scanner<'_> {
 }
 
 impl<'ast> Visit<'ast> for Scanner<'_> {
+    /// A doc comment is prose about a path, never a path a build reads.
+    fn visit_attribute(&mut self, attr: &'ast Attribute) {
+        if !attr.path().is_ident("doc") {
+            visit::visit_attribute(self, attr);
+        }
+    }
+
     fn visit_item(&mut self, item: &'ast Item) {
         let attrs = match item {
             Item::Const(i) => &i.attrs,
@@ -690,7 +697,7 @@ fn a_test_only_site_and_another_meaning_of_release_are_not_sites() {
         ),
         (
             "driver/commands.rs",
-            "/// Read from `target/debug`.\nfn documented() {}",
+            "/// Read from `target/debug/app`.\n#[doc = \"target/release\"]\nfn documented() {}",
         ),
         (
             "driver/commands.rs",
