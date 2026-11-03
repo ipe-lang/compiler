@@ -63,16 +63,14 @@ type Tree a
 ## Type parameters
 
 A type can be parameterised. The parameter appears before `=` and inside
-constructor payloads:
+constructor payloads. `Result` is built-in and shaped this way, but you can
+define your own parameterised types the same way:
 
 ```ipe
-type Result err ok
-    = Err err
-    | Ok ok
+type Outcome err ok
+    = Failure err
+    | Success ok
 ```
-
-`Result` is built-in, but you can define your own parameterised types the same
-way.
 
 ## Using constructors
 
@@ -80,6 +78,17 @@ Constructors are values. Apply them like functions to produce a value of the
 union type:
 
 ```ipe
+type Shape
+    = Circle Float
+    | Rectangle Float Float
+    | Point
+
+type Direction
+    = North
+    | South
+    | East
+    | West
+
 myShape : Shape
 myShape =
     Circle 5.0
@@ -95,6 +104,11 @@ Inspect a union value with `case`. The compiler enforces exhaustiveness —
 every constructor must have a branch:
 
 ```ipe
+type Shape
+    = Circle Float
+    | Rectangle Float Float
+    | Point
+
 area : Shape -> Float
 area shape =
     case shape of

@@ -16,7 +16,7 @@ same type, just spelled differently.
 
 ## Basic form
 
-```ipe
+```ipe ipe:skip a syntax shape with placeholder names, not valid Ipê
 type alias AliasName = ExistingType
 ```
 
@@ -60,6 +60,11 @@ A record alias also generates a **constructor function** with the same name as
 the alias, taking fields in the order they appear:
 
 ```ipe
+type alias Point =
+    { x : Float
+    , y : Float
+    }
+
 myPoint : Point
 myPoint =
     Point 3.0 4.0

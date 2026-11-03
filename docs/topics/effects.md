@@ -30,7 +30,7 @@ Representing effects as values means:
 
 ## The shape of a Task
 
-```ipe
+```ipe ipe:skip a type shape, not a standalone program
 Task Error result
 ```
 
@@ -43,19 +43,25 @@ returning a useful value.
 Use `Task.andThen` to run one task and then another, passing the result forward:
 
 ```ipe
+import Ipe.Io as Io
+import Ipe.Task as Task
+
 main : Task Error ()
 main =
-    Io.readLine
+    Io.readLine ()
         |> Task.andThen (\line -> Io.println ("You typed: " ++ line))
 ```
 
 Or use a `do` block for the same thing in top-to-bottom order:
 
 ```ipe
+import Ipe.Io as Io
+import Ipe.Task as Task
+
 main : Task Error ()
 main =
     do
-        line <- Io.readLine
+        line <- Io.readLine ()
         Io.println ("You typed: " ++ line)
 ```
 
@@ -64,9 +70,13 @@ Both forms are equivalent. See [`do`](do) for the full syntax.
 ## Idiom: never `let _ = task`
 
 Binding a `Task` to `_` in a `let` expression silently discards the effect
-outside the `Task` discipline. The compiler rejects it (IPE-L0141):
+outside the `Task` discipline. A bare `_` is not even a legal whole-pattern for
+a `let` binding, so the compiler rejects it outright (IPE-P0064) — the shape
+that would discard the effect cannot be written at all:
 
-```ipe ipe:error IPE-L0141
+```ipe ipe:error IPE-P0064
+import Ipe.Io as Io
+
 -- Wrong: the effect is described but never run
 main : Task Error ()
 main =
@@ -79,6 +89,9 @@ main =
 Thread effects with `Task.andThen` or use a `do` block instead:
 
 ```ipe
+import Ipe.Io as Io
+import Ipe.Task as Task
+
 -- Correct: both effects are sequenced and will run
 main : Task Error ()
 main =
@@ -93,18 +106,23 @@ steps unconnected. Every step must be part of the same `Task.andThen` / `do`
 chain:
 
 ```ipe ipe:error IPE-T0001
+import Ipe.Io as Io
+
 -- Wrong: the readLine Task is never connected to the println
 badMain : Task Error ()
 badMain =
-    Io.readLine
+    Io.readLine ()
     Io.println "done"
 ```
 
 ```ipe
+import Ipe.Io as Io
+import Ipe.Task as Task
+
 -- Correct: chain them
 goodMain : Task Error ()
 goodMain =
-    Io.readLine
+    Io.readLine ()
         |> Task.andThen (\_ -> Io.println "done")
 ```
 
@@ -114,9 +132,13 @@ When you want to transform the *result* of a task without running another
 effect, use `Task.map`:
 
 ```ipe
+import Ipe.Io as Io
+import Ipe.String as String
+import Ipe.Task as Task
+
 readUpperLine : Task Error String
 readUpperLine =
-    Task.map String.toUpper Io.readLine
+    Task.map String.toUpper (Io.readLine ())
 ```
 
 ## Glossary

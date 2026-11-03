@@ -15,13 +15,13 @@ except for the fields you name. It never mutates the original.
 
 ## Basic form
 
-```ipe
+```ipe ipe:skip a syntax shape, not a standalone program
 { originalRecord | fieldName = newValue }
 ```
 
 You can update multiple fields in one expression:
 
-```ipe
+```ipe ipe:skip a syntax shape, not a standalone program
 { originalRecord | field1 = value1, field2 = value2 }
 ```
 

@@ -24,9 +24,14 @@ state in Ipê.
 ## Minimal TEA example (Cli shape)
 
 ```ipe
-module Main exposing (..)
+module Main exposing (main)
 
-import Terminal
+import Ipe.String as String
+import Ipe.Tea.Cli exposing (tea)
+import Ipe.Tea.Cli.Cmd as Cmd
+import Ipe.Tea.Cli.Sub as Sub
+import Ipe.Ui.Cli as Ui
+import Ipe.Ui.Cli exposing (Lines)
 
 type alias Model =
     { count : Int }
@@ -35,29 +40,33 @@ type Msg
     = Increment
     | Decrement
 
-init : Model
-init =
-    { count = 0 }
+init : () -> ( Model, Cmd Msg )
+init _unit =
+    ( { count = 0 }, Cmd.none )
 
-update : Msg -> Model -> Model
+update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
         Increment ->
-            { model | count = model.count + 1 }
+            ( { model | count = model.count + 1 }, Cmd.none )
 
         Decrement ->
-            { model | count = model.count - 1 }
+            ( { model | count = model.count - 1 }, Cmd.none )
 
 view : Model -> Lines Msg
 view model =
     Ui.text ("Count: " ++ String.fromInt model.count)
 
-main : Task Error ()
+subscriptions : Model -> Sub Msg
+subscriptions _model =
+    Sub.none
+
 main =
-    Cli.tea
+    tea
         { init = init
         , update = update
         , view = view
+        , subscriptions = subscriptions
         }
 ```
 
@@ -76,14 +85,15 @@ decision, not a limitation to work around. The reason: if behaviour can differ
 because a function stored in a field differs, you need to track which function
 is there — and that tracking is exactly what a union type does, more safely:
 
-```ipe ipe:skip
--- Illustrative: IPE-L0107 (function in record field) is a project-build gate, not a standalone type error
+```ipe ipe:skip IPE-L0107 (function in record field) is a project-build gate, not a standalone type error
 -- Wrong: function in a record field
 type alias Handler =
     { onEvent : String -> String }
 ```
 
 ```ipe
+import Ipe.String as String
+
 -- Correct: model the variation with a union type
 type HandlerKind
     = UpperCase
@@ -114,7 +124,7 @@ code only ever receives it as a parameter.
 When `update` needs to trigger an effect (fire an HTTP request, start a timer),
 it returns a pair of the new model and a command:
 
-```ipe
+```ipe ipe:skip illustrative; Http and the FetchData message are defined elsewhere
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
