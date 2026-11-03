@@ -56,6 +56,7 @@ Or use a `do` block for the same thing in top-to-bottom order:
 
 ```ipe
 import Ipe.Io as Io
+import Ipe.Task as Task
 
 main : Task Error ()
 main =
@@ -69,9 +70,11 @@ Both forms are equivalent. See [`do`](do) for the full syntax.
 ## Idiom: never `let _ = task`
 
 Binding a `Task` to `_` in a `let` expression silently discards the effect
-outside the `Task` discipline. The compiler rejects it (IPE-L0141):
+outside the `Task` discipline. A bare `_` is not even a legal whole-pattern for
+a `let` binding, so the compiler rejects it outright (IPE-P0064) — the shape
+that would discard the effect cannot be written at all:
 
-```ipe ipe:error IPE-L0141
+```ipe ipe:error IPE-P0064
 import Ipe.Io as Io
 
 -- Wrong: the effect is described but never run

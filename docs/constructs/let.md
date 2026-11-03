@@ -72,11 +72,12 @@ main =
 
 ## `let _ = task` is not allowed
 
-Binding a `Task` to `_` discards its effect outside the effect discipline and
-is rejected (IPE-L0141). Thread effects sequentially with `Task.andThen` or use
-a `do` block instead:
+Binding a `Task` to `_` would discard its effect outside the effect discipline.
+A bare `_` is not even a legal whole-pattern for a `let` binding, so the
+compiler rejects it outright (IPE-P0064). Thread effects sequentially with
+`Task.andThen` or use a `do` block instead:
 
-```ipe ipe:error IPE-L0141
+```ipe ipe:error IPE-P0064
 import Ipe.Io as Io
 import Ipe.Task as Task
 
