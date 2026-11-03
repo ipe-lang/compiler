@@ -19,7 +19,7 @@ does **not** disclose the `unsafe` capability. Reach for
 express, where you genuinely need the raw `String` to escape the seal and you take
 ownership of where it lands.
 
-```ipe
+```ipe ipe:skip illustrative; apiKey stands for a Secret already held by the caller, not defined inline
 import Ipe.Secret.Unsafe exposing (unsafeReveal)
 
 -- The plaintext now escapes the seal's protections — redaction, no-Debug,

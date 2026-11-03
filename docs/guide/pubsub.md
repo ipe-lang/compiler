@@ -37,7 +37,7 @@ is a `Web.tea` that broadcasts on a shared topic and shows the subscriber count.
 The topic is one shared handle — its `String` payload type is what any publish
 and any subscription on the same value must agree on:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/web/task-publish/src/Main.ipe
 roomTopic : PubSub.Topic String
 roomTopic =
     PubSub.topic "room"
@@ -46,20 +46,25 @@ roomTopic =
 Because `publish` is a `Task`, it composes into the update loop through
 `Cmd.perform`, which runs it and routes its result back as a message:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/web/task-publish/src/Main.ipe
 update msg model =
     case msg of
         Publish ->
+            -- `PubSub.publish` is a Task; `Cmd.perform` runs it and routes its
+            -- result back as `Published`.
             ( model
             , Cmd.perform (PubSub.publish roomTopic "hello") Published
             )
 
-        Published (Ok count) ->
-            ( { model | lastCount = count }, Cmd.none )
+        Published result ->
+            case result of
+                Ok count ->
+                    ( { model | lastCount = count }, Cmd.none )
 
-        Published (Err _) ->
-            -- No bus in this process: keep the model unchanged.
-            ( model, Cmd.none )
+                Err _ ->
+                    -- No bus in this process (e.g. before the server bound its
+                    -- port): keep the model unchanged.
+                    ( model, Cmd.none )
 ```
 
 Building it (`ipe dev build`) compiles the app; serving it, a click broadcasts on the

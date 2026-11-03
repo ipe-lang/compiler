@@ -37,7 +37,7 @@ variable, and writes the result to stdout with a diagnostic on stderr.
 The first argument is `List.head` of `args ()` — a `Maybe`, defaulted to `"world"`,
 so no argument is a normal case rather than a crash:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/system-greet-cli/src/Main.ipe
 firstName : List String -> String
 firstName argv =
     List.head argv
@@ -47,7 +47,7 @@ firstName argv =
 The greeting word comes from `getenvOr` — the sync read, because the default
 handles an unset `GREETING`, so it is a bare `String` with no `<-`:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/system-greet-cli/src/Main.ipe
 greeting : String
 greeting =
     System.getenvOr "GREETING" "Hello"
@@ -57,7 +57,7 @@ greeting =
 *stderr* (a diagnostic) and the greeting to *stdout* (the result), so a caller can
 capture one stream without the other:
 
-```ipe
+```ipe ipe:excerpt examples/shapes/script/system-greet-cli/src/Main.ipe
 main =
     do
         argv <- System.args ()
@@ -67,7 +67,7 @@ main =
 
 Running it with no arguments (`ipe dev run`) prints:
 
-```
+```text
 user args: 0
 Hello, world!
 ```
