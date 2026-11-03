@@ -297,7 +297,7 @@ const UNROUTED: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "driver/commands.rs",
-        "bundle_wasm_pkg",
+        "bundle_wasm_pkg_with",
         1,
         "built in a file another lane owns; its route is decided there",
     ),

@@ -175,14 +175,14 @@ const SITES: &[SiteRow] = &[
     ),
     (
         "driver/commands.rs",
-        "bundle_wasm_pkg",
+        "bundle_wasm_pkg_with",
         "tools.bindgen",
         Runner::Local("WASM_TOOL_LIMITS"),
         1,
     ),
     (
         "driver/commands.rs",
-        "bundle_wasm_pkg",
+        "bundle_wasm_pkg_with",
         "opt_tool",
         Runner::Local("WASM_TOOL_LIMITS"),
         1,
