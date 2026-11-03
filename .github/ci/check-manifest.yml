@@ -132,6 +132,13 @@ checks:
             (every `tests/*_scan.rs` and `tests/*_ratchet.rs`, pinned by
             test_local_gate.py), which read every crate, so any change fails
             them at `quick` instead of first in the merge queue
+        - cmd: cargo nextest run --locked -p e2e-support --test suite --profile ci
+          tier: quick
+          differs: >-
+            narrows to the workspace's test-tree scans (the `suite` harness:
+            the test-binary ratchet, the skip and target scans), which read
+            every crate's tests, so a new, moved or unlisted test binary fails
+            at `quick` instead of first in the merge queue
         - cmd: cargo nextest run --locked -p ipe --features wasi_run --profile ci --test wasi_target_seal
           env:
             IPE_E2E: "1"
@@ -151,6 +158,8 @@ checks:
         - python3 .github/ci/test_change_class.py -v
         - python3 .github/ci/e2e_shard.py --lint
         - python3 .github/ci/test_e2e_shard.py -v
+        - python3 .github/ci/test_e2e_shard_cover.py -v
+        - python3 .github/ci/test_test_id_map.py -v
         - python3 .github/ci/rerun_policy.py --lint
         - python3 .github/ci/test_rerun_policy.py -v
         - python3 .github/ci/nightly_green.py --lint

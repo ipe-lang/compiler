@@ -716,8 +716,8 @@ class IpeScansAtQuick(unittest.TestCase):
     def scan_command(self) -> lg.Command:
         disp = self.parsed["test"]
         assert isinstance(disp, lg.RunLocal)
-        hits = [c for c in disp.commands if c.tier is lg.Tier.QUICK]
-        self.assertEqual(len(hits), 1, "the test entry has exactly one quick-tier command")
+        hits = [c for c in disp.commands if c.tier is lg.Tier.QUICK and "ipe" in c.argv]
+        self.assertEqual(len(hits), 1, "the test entry has exactly one quick-tier `ipe` command")
         return hits[0]
 
     def test_test_set_is_every_scan_and_ratchet_file(self) -> None:
@@ -732,6 +732,34 @@ class IpeScansAtQuick(unittest.TestCase):
     def test_runs_for_a_change_in_another_crate(self) -> None:
         steps = lg.plan(lg.Tier.QUICK, self.entries, self.parsed, ["src/runtime/rust/src/lib.rs"], self.WS)
         self.assertIn(self.scan_command().argv, [s.argv for s in steps])
+
+
+class E2eSupportSuiteAtQuick(unittest.TestCase):
+    """`gate quick` runs the `e2e-support` `suite` harness (the test-binary
+    ratchet and the test-tree scans) on any change, since a test target added
+    or moved in any crate must fail locally, not first in the merge queue."""
+
+    WS = RuntimeScanAtQuick.WS
+    ARGV = ("cargo", "nextest", "run", "--locked", "-p", "e2e-support", "--test", "suite", "--profile", "ci")
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.entries = lg.load_manifest_entries()
+        errs: list[str] = []
+        cls.parsed = lg.check_local_dispositions(cls.entries, errs)
+        assert errs == [], errs
+
+    def test_the_test_entry_carries_the_suite_at_quick(self) -> None:
+        disp = self.parsed["test"]
+        assert isinstance(disp, lg.RunLocal)
+        hits = [c for c in disp.commands if c.tier is lg.Tier.QUICK and c.argv == self.ARGV]
+        self.assertEqual(len(hits), 1)
+
+    def test_runs_for_a_change_in_any_crate(self) -> None:
+        for path in ("src/runtime/rust/src/lib.rs", "src/ipe-cli/tests/g_misc/main.rs"):
+            with self.subTest(path):
+                steps = lg.plan(lg.Tier.QUICK, self.entries, self.parsed, [path], self.WS)
+                self.assertIn(self.ARGV, [s.argv for s in steps])
 
 
 def _load_gate_runner():
