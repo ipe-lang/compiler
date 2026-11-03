@@ -13,8 +13,7 @@
 # `junit-e2e-<shard>` artifact of a green run, sum each `<testcase>` `time` per
 # `classname`, round up, and keep the per-test lines for the isolated tests.
 e2e-support 7
-e2e-support::resolve 1
-e2e-support::skip_scan 3
+e2e-support::suite 4
 ipe 307
 ipe-ffi-inspector::bin/ipe-ffi-inspector 2
 ipe-runtime-rust 35

@@ -7,8 +7,8 @@
 //!
 //! ```ipe
 //! Db.Decode.succeed User
-//!     |> Db.Decode.required "name" Db.Decode.string
-//!     |> Db.Decode.required "email" Db.Decode.string
+//!     |> Db.Decode.required "name" (Db.Decode.string "name")
+//!     |> Db.Decode.required "email" (Db.Decode.string "email")
 //! ```
 //!
 //! Read top-to-bottom, the fields bind to the constructor in source order.
@@ -16,8 +16,8 @@
 //! to the constructor first:
 //!
 //! ```ipe
-//! Db.Decode.required "name" Db.Decode.string
-//!     (Db.Decode.required "email" Db.Decode.string
+//! Db.Decode.required "name" (Db.Decode.string "name")
+//!     (Db.Decode.required "email" (Db.Decode.string "email")
 //!         (Db.Decode.succeed User))
 //! ```
 //!
