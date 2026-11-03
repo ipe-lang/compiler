@@ -64,6 +64,7 @@
 
 mod clippy_paths_resolve;
 mod long_lived;
+pub mod lsp_degraded;
 mod metadata;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -445,48 +446,110 @@ pub type CanonResult = Result<Arc<CanonicalModule>, Diagnostic>;
 #[salsa::tracked]
 pub fn canonicalize(db: &dyn Db, root: SourceRoot, file: SourceFile) -> CanonResult {
     let parsed = parse(db, file).clone()?;
-    let resolutions = resolve_imports(db, root, file).clone()?;
-
     // Demand every dep interface BEFORE taking the interner lock: a cold
     // demand recurses into `canonicalize(dep)`, which locks the
     // (non-reentrant) interner itself.
     let mut dep_interfaces: Vec<(Vec<String>, Arc<ModuleExports>)> = Vec::new();
+    for (path, dep) in canon_dep_files(db, root, file)? {
+        dep_interfaces.push((path, module_interface(db, root, dep).clone()?));
+    }
+    canonicalise_against(
+        db,
+        root,
+        file,
+        &dep_interfaces,
+        |input, interner| {
+            let (module, exports, names) = ipe_canon::canonicalise_module_indexed(
+                input.module,
+                input.expected_path,
+                input.deps,
+                input.catalog,
+                input.origin,
+                interner,
+            )?;
+            Ok(Arc::new(CanonicalModule {
+                module,
+                exports,
+                names,
+            }))
+        },
+        &parsed,
+    )
+}
+
+/// The resolved dependencies whose interfaces canonicalising `file` reads, by import path.
+///
+/// Every resolved import in source order, then the driver-generated
+/// `Rust.Ffi` forwarder module when `file` imports `Ipe.Ffi.Rust` without
+/// importing `Rust.Ffi` itself.
+fn canon_dep_files(
+    db: &dyn Db,
+    root: SourceRoot,
+    file: SourceFile,
+) -> Result<Vec<(Vec<String>, SourceFile)>, Diagnostic> {
+    let resolutions = resolve_imports(db, root, file).clone()?;
+    let mut dep_files: Vec<(Vec<String>, SourceFile)> = Vec::new();
     // Track whether this module imports `Ipe.Ffi.Rust` — the taxonomy-native
-    // native-binding qualifier (#1762 ergonomic fix). When it does, the
-    // resolver's `canonicalise_asserted_call` rewrites `Rust.fn` calls to
-    // references in the driver-generated `Rust.Ffi` forwarder module. Without
-    // an explicit `import Rust.Ffi`, that module would be absent from `deps`,
-    // causing IPE-N0038 despite a valid call. The fix: auto-inject the
-    // `Rust.Ffi` interface when (a) `Ipe.Ffi.Rust` is imported and (b) the
-    // driver generated the `Rust.Ffi` module (it is present in `root.files`).
+    // native-binding qualifier. When it does, the resolver's
+    // `canonicalise_asserted_call` rewrites `Rust.fn` calls to references in
+    // the driver-generated `Rust.Ffi` forwarder module. Without an explicit
+    // `import Rust.Ffi`, that module would be absent from `deps`, causing
+    // IPE-N0038 despite a valid call, so its interface is injected when (a)
+    // `Ipe.Ffi.Rust` is imported and (b) the driver generated the `Rust.Ffi`
+    // module (it is present in `root.files`).
     let mut imports_ipe_ffi_rust = false;
     for (path, resolution) in resolutions.iter() {
         if let ImportResolution::Resolved(dep) = resolution {
-            dep_interfaces.push((path.clone(), module_interface(db, root, *dep).clone()?));
+            dep_files.push((path.clone(), *dep));
         }
         if path.as_slice() == ["Ipe", "Ffi", "Rust"] {
             imports_ipe_ffi_rust = true;
         }
     }
-    // Auto-inject `Rust.Ffi` when needed (ergonomic fix for #1762).
-    let rust_ffi_path = vec!["Rust".to_owned(), "Ffi".to_owned()];
     if imports_ipe_ffi_rust {
         let files = root.files(db);
+        let rust_ffi_path = vec!["Rust".to_owned(), "Ffi".to_owned()];
         if let Some(rust_ffi_file) = files.get(&rust_ffi_path) {
-            // Only inject when not already explicitly imported (already in
-            // dep_interfaces at this path) — idempotent.
-            let already_present = dep_interfaces
+            // Only inject when not already explicitly imported — idempotent.
+            let already_present = dep_files
                 .iter()
                 .any(|(p, _)| p.as_slice() == ["Rust", "Ffi"]);
             if !already_present {
-                dep_interfaces.push((
-                    rust_ffi_path,
-                    module_interface(db, root, *rust_ffi_file).clone()?,
-                ));
+                dep_files.push((rust_ffi_path, *rust_ffi_file));
             }
         }
     }
+    Ok(dep_files)
+}
 
+/// What one canonicalisation of a module reads, its paths interned.
+struct CanonInput<'a> {
+    /// The parsed module.
+    module: &'a Module,
+    /// The module path the driver expects the module to declare.
+    expected_path: &'a [Symbol],
+    /// Each dependency's interface, by interned module path.
+    deps: &'a BTreeMap<Vec<Symbol>, &'a ModuleExports>,
+    /// The importable-module catalog.
+    catalog: &'a ipe_canon::ModuleCatalog,
+    /// The trust origin of the module's source.
+    origin: ipe_canon::ModuleOrigin,
+}
+
+/// Run `canonicalise` over `file` against `dep_interfaces`, under the interner lock.
+///
+/// One lock scope covers expected-path interning and canonicalisation, the
+/// exact interning sequence every canonicalisation of a module produces (dep
+/// paths were interned when each dep's own canonicalisation ran, so those
+/// interns are lookups, not appends).
+fn canonicalise_against<T>(
+    db: &dyn Db,
+    root: SourceRoot,
+    file: SourceFile,
+    dep_interfaces: &[(Vec<String>, Arc<ModuleExports>)],
+    canonicalise: impl FnOnce(&CanonInput<'_>, &mut Interner) -> Result<T, Diagnostic>,
+    parsed: &Module,
+) -> Result<T, Diagnostic> {
     // The importable-module catalog: project files plus compiled-source stdlib
     // modules (the kernel paths are seeded by the catalog itself). Read only on
     // diagnostic paths (IPE-N0020 did-you-mean, IPE-N0034 for an unbound
@@ -505,10 +568,6 @@ pub fn canonicalize(db: &dyn Db, root: SourceRoot, file: SourceFile) -> CanonRes
     );
     let origin = file.origin(db);
 
-    // One lock scope covers expected-path interning + canonicalisation — the
-    // exact interning sequence the pre-salsa driver produced (dep paths were
-    // interned when each dep's own canonicalize ran, so those interns below
-    // are lookups, not appends).
     let mut interner = db.interner().lock();
     let expected_path: Vec<Symbol> = file
         .module_path(db)
@@ -516,26 +575,21 @@ pub fn canonicalize(db: &dyn Db, root: SourceRoot, file: SourceFile) -> CanonRes
         .map(|segment| interner.intern(segment))
         .collect::<Result<_, _>>()?;
     let mut deps: BTreeMap<Vec<Symbol>, &ModuleExports> = BTreeMap::new();
-    for (path, interface) in &dep_interfaces {
+    for (path, interface) in dep_interfaces {
         let key: Vec<Symbol> = path
             .iter()
             .map(|segment| interner.intern(segment))
             .collect::<Result<_, _>>()?;
         deps.insert(key, interface.as_ref());
     }
-    let (module, exports, names) = ipe_canon::canonicalise_module_indexed(
-        &parsed,
-        &expected_path,
-        &deps,
-        &catalog,
-        *origin,
-        &mut interner,
-    )?;
-    Ok(Arc::new(CanonicalModule {
-        module,
-        exports,
-        names,
-    }))
+    let input = CanonInput {
+        module: parsed,
+        expected_path: &expected_path,
+        deps: &deps,
+        catalog: &catalog,
+        origin: *origin,
+    };
+    canonicalise(&input, &mut interner)
 }
 
 /// The cross-module interface of one module — its export surface, projected

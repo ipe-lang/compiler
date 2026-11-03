@@ -1,5 +1,7 @@
 use strum::EnumCount as _;
 
+use ipe_diagnostics::Located;
+
 use super::{
     BTreeMap, BTreeSet, BinopClass, Builder, Builtins, CallSite, Constraint, ConstraintOrigin,
     Content, CtorScheme, DResult, Diagnostic, FlatType, Generated, InferError, Interner,
@@ -22,7 +24,7 @@ impl<'a> Builder<'a> {
         interner: &'a mut Interner,
         module: &canon::Module,
     ) -> Result<Generated, InferError> {
-        Self::run_seeded(uf, interner, module, &[], BTreeMap::new())
+        Self::run_seeded(uf, interner, module, &[], BTreeMap::new(), &[])
     }
 
     /// [`Self::run`] over ONE module of a multi-module program, seeded with
@@ -32,7 +34,10 @@ impl<'a> Builder<'a> {
     /// `seed_top_level` pre-populates the `(home, name)` scheme table with
     /// the deps' exported binding schemes (so a cross-module `VarTopLevel`
     /// reference takes the ordinary instantiate-fresh-per-use-site path).
-    /// With empty seeds this IS [`Self::run`] — one code path, no drift.
+    /// `declared` registers the annotation of each own value whose body
+    /// failed, so a reference to it instantiates its declared scheme; such a
+    /// value has no body to constrain. With empty seeds this IS [`Self::run`]
+    /// — one code path, no drift.
     ///
     /// # Errors
     /// Same conditions as [`Self::run`].
@@ -43,6 +48,7 @@ impl<'a> Builder<'a> {
         module: &canon::Module,
         dep_unions: &[&canon::Union],
         seed_top_level: BTreeMap<(Vec<Symbol>, Symbol), Rc<Ty>>,
+        declared: &[ipe_canon::DeclaredSignature],
     ) -> Result<Generated, InferError> {
         let builtins = Builtins::new(interner).map_err(InferError::unsited)?;
         let builtin_ctors = builtins
@@ -160,59 +166,7 @@ impl<'a> Builder<'a> {
             match def {
                 canon::Def::Typed {
                     name, ty, patterns, ..
-                } => {
-                    let raw = from_canon(ty);
-                    // ex15: a binding annotated `Handler` is really
-                    // `Request -> Task Response` at call sites.  The internal
-                    // constrain_def pass already expands Handler for the body so
-                    // `req` gets type `Request`; here we must also expand for the
-                    // top_level table so callers (e.g. Server.get) unify correctly.
-                    let expanded = if let Ty::Con {
-                        name: tname, args, ..
-                    } = &raw
-                    {
-                        if *tname == builder.builtins.handler
-                            && args.is_empty()
-                            && !patterns.is_empty()
-                        {
-                            Ty::Fun(
-                                Box::new(Ty::Con {
-                                    module: Vec::new(),
-                                    name: builder.builtins.server_request,
-                                    args: Vec::new(),
-                                }),
-                                Box::new(Ty::Con {
-                                    module: Vec::new(),
-                                    name: builder.builtins.task,
-                                    args: vec![Ty::Con {
-                                        module: Vec::new(),
-                                        name: builder.builtins.server_response,
-                                        args: Vec::new(),
-                                    }],
-                                }),
-                            )
-                        } else {
-                            raw
-                        }
-                    } else {
-                        raw
-                    };
-                    let normalized = builder
-                        .normalize_annotation_ty(expanded, name.span)
-                        .map_err(|d| InferError::sited_at_path(d, def.home()))?;
-                    // A bare wildcard `any` in the annotation's RETURN position
-                    // severs the body from every use (see
-                    // [`Builder::tie_wildcard_any_uses_to_bodies`]); record the
-                    // binding so each reference is tied back to its body.
-                    if Builder::annotation_returns_wildcard_any(&normalized) {
-                        builder
-                            .wildcard_any_return_bindings
-                            .insert((home_key.clone(), name.value));
-                    }
-                    builder
-                        .top_level
-                        .insert((home_key, name.value), Rc::new(normalized));
-                }
+                } => builder.register_annotation(home_key, *name, ty, !patterns.is_empty())?,
                 canon::Def::Untyped { name, .. } => {
                     let var = builder.flex().map_err(InferError::unsited)?;
                     builder.untyped.insert(
@@ -224,6 +178,15 @@ impl<'a> Builder<'a> {
                     );
                 }
             }
+        }
+
+        for signature in declared {
+            builder.register_annotation(
+                module.name.clone(),
+                signature.name,
+                &signature.ty,
+                signature.has_params,
+            )?;
         }
 
         // Second pass: constrain each binding's body.
@@ -769,4 +732,60 @@ impl<'a> Builder<'a> {
     }
 
     // ── the walk ────────────────────────────────────────────────────────────
+}
+
+impl Builder<'_> {
+    /// Record a typed binding's annotation as its scheme in the top-level table.
+    ///
+    /// # Errors
+    /// [`InferError::Sited`] at `home` when the annotation does not normalise.
+    fn register_annotation(
+        &mut self,
+        home: Vec<Symbol>,
+        name: Located<Symbol>,
+        ty: &canon::Type,
+        has_params: bool,
+    ) -> Result<(), InferError> {
+        let raw = from_canon(ty);
+        // ex15: a binding annotated `Handler` is really
+        // `Request -> Task Response` at call sites.  The internal
+        // constrain_def pass already expands Handler for the body so
+        // `req` gets type `Request`; here we must also expand for the
+        // top_level table so callers (e.g. Server.get) unify correctly.
+        let expanded = match &raw {
+            Ty::Con {
+                name: tname, args, ..
+            } if *tname == self.builtins.handler && args.is_empty() && has_params => Ty::Fun(
+                Box::new(Ty::Con {
+                    module: Vec::new(),
+                    name: self.builtins.server_request,
+                    args: Vec::new(),
+                }),
+                Box::new(Ty::Con {
+                    module: Vec::new(),
+                    name: self.builtins.task,
+                    args: vec![Ty::Con {
+                        module: Vec::new(),
+                        name: self.builtins.server_response,
+                        args: Vec::new(),
+                    }],
+                }),
+            ),
+            _ => raw,
+        };
+        let normalized = self
+            .normalize_annotation_ty(expanded, name.span)
+            .map_err(|d| InferError::sited_at_path(d, &home))?;
+        // A bare wildcard `any` in the annotation's RETURN position
+        // severs the body from every use (see
+        // [`Builder::tie_wildcard_any_uses_to_bodies`]); record the
+        // binding so each reference is tied back to its body.
+        if Self::annotation_returns_wildcard_any(&normalized) {
+            self.wildcard_any_return_bindings
+                .insert((home.clone(), name.value));
+        }
+        self.top_level
+            .insert((home, name.value), Rc::new(normalized));
+        Ok(())
+    }
 }
