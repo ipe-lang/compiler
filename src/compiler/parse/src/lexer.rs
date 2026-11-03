@@ -689,7 +689,7 @@ fn literal_char(open: &mut Option<OpenIsolate>, at: usize, c: char) -> Option<Ha
         return Some(unclosed_isolate(unclosed));
     }
     match SourceHazard::of(c) {
-        None | Some(SourceHazard::SeparatorBreak) => None,
+        None | Some(SourceHazard::SeparatorBreak | SourceHazard::BidiMark) => None,
         Some(SourceHazard::IsolateOpen) => {
             open_isolate(open, at, c);
             None
@@ -1695,7 +1695,7 @@ mod display_hazard_tests {
         }
     }
 
-    /// Balanced isolates and line or paragraph separators in a literal still lex.
+    /// Balanced isolates, bidi marks and line or paragraph separators in a literal still lex.
     #[test]
     fn balanced_isolates_and_separators_in_a_literal_are_accepted() {
         let accepted = [
@@ -1707,6 +1707,10 @@ mod display_hazard_tests {
             "x = \"a\u{2028}b\u{2029}c\"",
             "x = '\u{2028}'",
             "x = '\u{2029}'",
+            "x = \"a\u{200F}b\u{200E}c\u{061C}d\"",
+            "x = '\u{061C}'",
+            "x = '\u{200E}'",
+            "x = '\u{200F}'",
             "x = \"say \\\"hi\\\" a<b>c&d\u{2028}e\u{2029}f\"",
         ];
         for src in accepted {

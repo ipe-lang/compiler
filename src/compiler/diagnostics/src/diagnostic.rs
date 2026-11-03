@@ -495,7 +495,7 @@ pub enum ParseError {
 pub enum HazardRefusal {
     /// VT, FF, NEL, or a bidi embedding, pop or override: refused in every position.
     Anywhere,
-    /// A line or paragraph separator or a bidi isolate in a comment or among code.
+    /// A line or paragraph separator, a bidi mark or a bidi isolate in a comment or among code.
     OutsideLiteral,
     /// An isolate opener its literal does not close before the literal or its line ends.
     UnclosedIsolate,

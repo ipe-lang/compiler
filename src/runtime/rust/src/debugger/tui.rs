@@ -33,6 +33,10 @@
 //!   the buffer without limit.
 //! - `Secret`-bearing `Msg` values are rendered via `IpeStringify::ipe_show`,
 //!   which returns `<redacted>` — the raw payload never appears in the overlay.
+//! - A message label is escaped by `system::scrub_log_controls` before it
+//!   reaches the status line, so text a message carries (an escape, a bidi
+//!   control, a line separator) shows as a visible escape and never runs or
+//!   reorders on the terminal.
 
 #![cfg(all(feature = "debugger", not(target_arch = "wasm32")))]
 
@@ -40,6 +44,7 @@ use std::sync::Arc;
 
 use crate::debugger::{DEFAULT_HISTORY_CAP, RecordBuffer};
 use crate::stringify::IpeStringify;
+use crate::system::scrub_log_controls;
 use crate::tea::IpeCmd;
 
 /// Maximum label characters shown per message row in the status line.
@@ -263,7 +268,7 @@ where
                 let labels: Vec<String> = self
                     .buf
                     .msgs()
-                    .map(|m| truncate(&m.ipe_show(), MAX_LABEL_LEN))
+                    .map(|m| truncate(&scrub_log_controls(&m.ipe_show()), MAX_LABEL_LEN))
                     .collect();
                 let cur = labels
                     .get(idx)
@@ -443,6 +448,43 @@ mod tests {
             at_end_1, at_end_2,
             "repeated step_fwd at tail must be idempotent"
         );
+    }
+
+    // ── A message label never carries a terminal hazard ──────────────────────
+
+    /// A message whose text holds an escape, a bidi override or a line
+    /// separator reaches the status line only as a visible escape.
+    ///
+    /// CI job `runtime-full-features-run`.
+    #[test]
+    fn hazardous_message_label_is_escaped_in_status_line() -> Result<(), String> {
+        #[derive(Clone)]
+        struct Said(String);
+
+        impl IpeStringify for Said {
+            fn ipe_show(&self) -> String {
+                format!("Said({})", self.0)
+            }
+        }
+
+        let mut dbg = TuiDebugger::new((), |_msg: Said, m: ()| (m, IpeCmd::None));
+        dbg.record(Said("a\u{1b}]0;x\u{7}\u{202E}b\u{2028}c".to_owned()), ());
+        dbg.toggle();
+        let status = dbg.status_line();
+        let label = status
+            .strip_prefix("\x1b[7m")
+            .and_then(|rest| rest.strip_suffix("\x1b[m"))
+            .ok_or_else(|| format!("unframed status line: {status:?}"))?;
+        if label
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\u{202E}' | '\u{2028}'))
+        {
+            return Err(format!("a hazard reached the status line: {status:?}"));
+        }
+        if !label.contains("\\u{202e}") {
+            return Err(format!("the override is not shown escaped: {status:?}"));
+        }
+        Ok(())
     }
 
     // ── status_line renders the correct live / scrub text ────────────────────
