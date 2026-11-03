@@ -16,7 +16,7 @@ spot where naming the function separately would be more ceremony than clarity.
 
 ## Basic form
 
-```ipe
+```ipe ipe:skip a syntax shape with placeholder names, not valid Ipê
 \param -> body
 ```
 
@@ -26,6 +26,8 @@ then `->`, then the body expression.
 ## Single parameter
 
 ```ipe
+import Ipe.List as List
+
 double : List Int -> List Int
 double xs =
     List.map (\n -> n * 2) xs
@@ -34,6 +36,8 @@ double xs =
 ## Multiple parameters
 
 ```ipe
+import Ipe.List as List
+
 add : List Int -> List Int -> List Int
 add xs ys =
     List.map2 (\x y -> x + y) xs ys
@@ -44,6 +48,8 @@ add xs ys =
 A lambda is a value. Bind it to a name with `let` or pass it directly:
 
 ```ipe
+import Ipe.Io as Io
+
 main : Task Error ()
 main =
     let
@@ -58,6 +64,9 @@ The most common use of `\_ ->` is discarding the result of one `Task` step
 before running the next:
 
 ```ipe
+import Ipe.Io as Io
+import Ipe.Task as Task
+
 main : Task Error ()
 main =
     Io.println "first"

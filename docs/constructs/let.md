@@ -16,7 +16,7 @@ bound, the name always refers to the same value.
 
 ## Basic form
 
-```ipe
+```ipe ipe:skip a syntax shape with placeholder names, not valid Ipê
 let
     name = expression
 in
@@ -58,6 +58,9 @@ hypotenuse a b =
 A binding can itself have parameters, making it a local function:
 
 ```ipe
+import Ipe.Io as Io
+import Ipe.String as String
+
 main : Task Error ()
 main =
     let
@@ -69,11 +72,15 @@ main =
 
 ## `let _ = task` is not allowed
 
-Binding a `Task` to `_` discards its effect outside the effect discipline and
-is rejected (IPE-L0141). Thread effects sequentially with `Task.andThen` or use
-a `do` block instead:
+Binding a `Task` to `_` would discard its effect outside the effect discipline.
+A bare `_` is not even a legal whole-pattern for a `let` binding, so the
+compiler rejects it outright (IPE-P0064). Thread effects sequentially with
+`Task.andThen` or use a `do` block instead:
 
-```ipe ipe:error IPE-L0141
+```ipe ipe:error IPE-P0064
+import Ipe.Io as Io
+import Ipe.Task as Task
+
 main : Task Error ()
 main =
     let
@@ -83,6 +90,9 @@ main =
 ```
 
 ```ipe
+import Ipe.Io as Io
+import Ipe.Task as Task
+
 main : Task Error ()
 main =
     Io.println "step one"

@@ -17,6 +17,8 @@ takes `main`, runs its effect, and exits. `main` must have type `Task Error ()`.
 ## The canonical shape
 
 ```ipe
+import Ipe.Io as Io
+
 main : Task Error ()
 main =
     Io.println "Hello, world!"
@@ -30,13 +32,13 @@ produces `()` (unit — "nothing useful") on success.
 All four app shapes produce a `Task Error ()`. So `main` always has the same
 type, regardless of which shape you use:
 
-```ipe
+```ipe ipe:skip illustrative; init/update/view/subscriptions are defined elsewhere — see shapes.md
 main : Task Error ()
 main =
     Web.tea { init = init, update = update, view = view, subscriptions = subscriptions }
 ```
 
-```ipe
+```ipe ipe:skip illustrative; init/update/view are defined elsewhere — see shapes.md
 main : Task Error ()
 main =
     Tui.tea { init = init, update = update, view = view }
@@ -50,16 +52,14 @@ The shape entry function (`Web.tea`, `Tui.tea`, etc.) returns a
 A `main` whose type is anything else — an `Int`, a `String`, a `Bool`, a
 function — cannot be run. The compiler rejects it with IPE-L0136:
 
-```ipe ipe:skip
--- Illustrative: IPE-L0136 fires when building a project; not a standalone type error
+```ipe ipe:skip IPE-L0136 fires when building a project; not a standalone type error
 -- Wrong: main is an Int, not a Task
 main : Int
 main =
     42
 ```
 
-```ipe ipe:skip
--- Illustrative: IPE-L0136 fires when building a project; not a standalone type error
+```ipe ipe:skip IPE-L0136 fires when building a project; not a standalone type error
 -- Wrong: main is a function, not a Task
 main : String -> Task Error ()
 main greeting =
@@ -67,6 +67,8 @@ main greeting =
 ```
 
 ```ipe
+import Ipe.Io as Io
+
 -- Correct: main is a Task Error ()
 main : Task Error ()
 main =
@@ -75,17 +77,28 @@ main =
 
 ## The `Error` type
 
-The `Error` in `Task Error ()` is your program's top-level error type. For
-scripts and simple programs, `String` works; for structured programs, define a
-custom `type`:
+The `Error` in `Task Error ()` is your program's top-level error type. It is
+built in and structured: a value carries an `ErrorKind` tag (`network`, `io`,
+`notFound`, …) and a message, so a failure can be classified without parsing
+text:
 
 ```ipe
-type AppError
-    = NetworkError String
-    | ParseError String
-    | NotFound
+import Ipe.Error as Error
+import Ipe.String as String
+import Ipe.Task as Task
 
-main : Task AppError ()
+fetchData : Task Error String
+fetchData =
+    Task.succeed "data"
+
+processData : String -> Task Error ()
+processData data =
+    if String.isEmpty data then
+        Task.fail (Error.notFound)
+    else
+        Task.succeed ()
+
+main : Task Error ()
 main =
     fetchData
         |> Task.andThen processData
@@ -99,14 +112,15 @@ The top-level `main` binding requires a type annotation. Without one, the
 compiler reports IPE-L0106 (top-level function needs a type signature). Always
 annotate `main`:
 
-```ipe ipe:skip
--- Illustrative: IPE-L0106 fires when building a project; standalone type-check accepts unannotated bindings
+```ipe ipe:skip IPE-L0106 fires when building a project; standalone type-check accepts unannotated bindings
 -- Wrong: no type annotation
 main =
     Io.println "Hello!"
 ```
 
 ```ipe
+import Ipe.Io as Io
+
 -- Correct: annotated
 main : Task Error ()
 main =

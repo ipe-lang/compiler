@@ -139,6 +139,79 @@ subscription: `Sub.onKey` (from `Ipe.Tea.Tui.Sub`) takes a handler that maps a
 `{ kind : String, value : String }` key event to a `Msg`.
 
 ```ipe
+module Main exposing (main)
+
+import Ipe.String as String
+import Ipe.Tea.Tui as Tui
+import Ipe.Tea.Tui.Cmd as Cmd
+import Ipe.Tea.Tui.Sub as Sub
+import Ipe.Ui.Tui as Ui
+import Ipe.Ui.Tui exposing (Screen)
+
+
+type Msg
+    = Increment
+    | Decrement
+    | Quit
+    | NoOp
+
+
+type alias Model =
+    { count : Int }
+
+
+init : () -> ( Model, Cmd Msg )
+init _unit =
+    ( { count = 0 }, Cmd.none )
+
+
+update : Msg -> Model -> ( Model, Cmd Msg )
+update msg model =
+    case msg of
+        Increment ->
+            ( { model | count = model.count + 1 }, Cmd.none )
+
+        Decrement ->
+            ( { model | count = model.count - 1 }, Cmd.none )
+
+        Quit ->
+            ( model, Cmd.none )
+
+        NoOp ->
+            ( model, Cmd.none )
+
+
+view : Model -> Screen Msg
+view model =
+    Ui.column
+        [ Ui.spacing 1, Ui.padding 2 ]
+        [ Ui.el [ Ui.bold ] (Ui.text "Ipê counter")
+        , Ui.el [ Ui.reverse ] (Ui.text ("count = " ++ String.fromInt model.count))
+        , Ui.el [ Ui.dim ] (Ui.text "(Up +, Down -, q quit)")
+        ]
+
+
+type alias KeyEvent =
+    { kind : String
+    , value : String
+    }
+
+
+onKey : KeyEvent -> Msg
+onKey key =
+    if key.kind == "up" then
+        Increment
+
+    else if key.kind == "down" then
+        Decrement
+
+    else if key.kind == "char" && key.value == "q" then
+        Quit
+
+    else
+        NoOp
+
+
 subscriptions : Model -> Sub Msg
 subscriptions _model =
     Sub.onKey onKey
@@ -163,7 +236,7 @@ too, with the terminal restored and exit status 130; it never reaches `onKey`.
 
 The scaffolded counter (`Up` +, `Down` -, `q` quit) renders as:
 
-```
+```text
 Ipê counter
  count = 0
 (Up +, Down -, q quit)
@@ -176,6 +249,70 @@ subscription: `Sub.onLine` (from `Ipe.Tea.Cli.Sub`) takes a handler that maps
 each stdin line to a `Msg`.
 
 ```ipe
+module Main exposing (main)
+
+import Ipe.String as String
+import Ipe.Tea.Cli as Cli
+import Ipe.Tea.Cli.Cmd as Cmd
+import Ipe.Tea.Cli.Sub as Sub
+import Ipe.Ui.Cli as Ui
+import Ipe.Ui.Cli exposing (Lines)
+
+
+type Msg
+    = Echo String
+    | Quit
+    | NoOp
+
+
+type alias Model =
+    { count : Int
+    , last : String
+    }
+
+
+init : () -> ( Model, Cmd Msg )
+init _unit =
+    ( { count = 0, last = "" }, Cmd.none )
+
+
+update : Msg -> Model -> ( Model, Cmd Msg )
+update msg model =
+    case msg of
+        Echo line ->
+            ( { count = model.count + 1, last = line }, Cmd.none )
+
+        Quit ->
+            ( model, Cmd.none )
+
+        NoOp ->
+            ( model, Cmd.none )
+
+
+view : Model -> Lines Msg
+view model =
+    Ui.text
+        ("echoed "
+            ++ String.fromInt model.count
+            ++ " ["
+            ++ model.last
+            ++ "] > "
+        )
+
+
+onLine : String -> Msg
+onLine line =
+    case String.trim line of
+        "q" ->
+            Quit
+
+        "" ->
+            NoOp
+
+        trimmed ->
+            Echo trimmed
+
+
 subscriptions : Model -> Sub Msg
 subscriptions _model =
     Sub.onLine onLine
@@ -199,7 +336,7 @@ escape sequences) ending in a newline, so scripts can read the output.
 
 The scaffolded echo REPL (type text, `q` quits):
 
-```
+```text
 echoed 0 [] > hello
 echoed 1 [hello] > q
 ```
@@ -210,6 +347,55 @@ A view-less TEA loop — `init` / `update` / `subscriptions`, **no `view`**. For
 background jobs, timers, and pipelines.
 
 ```ipe
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.String as String
+import Ipe.Task as Task
+import Ipe.Tea.Worker as Worker
+import Ipe.Tea.Worker.Cmd as Cmd
+import Ipe.Tea.Worker.Sub as Sub
+
+
+type Msg
+    = Tick
+    | Logged
+
+
+type alias Model =
+    { ticks : Int }
+
+
+init : () -> ( Model, Cmd Msg )
+init _unit =
+    ( { ticks = 0 }, Cmd.none )
+
+
+update : Msg -> Model -> ( Model, Cmd Msg )
+update msg model =
+    case msg of
+        Tick ->
+            let
+                next =
+                    model.ticks + 1
+            in
+            ( { ticks = next }
+            , Task.attempt (\_result -> Logged) (Io.println ("tick " ++ String.fromInt next))
+            )
+
+        Logged ->
+            ( model, Cmd.none )
+
+
+subscriptions : Model -> Sub Msg
+subscriptions model =
+    if model.ticks >= 3 then
+        Sub.none
+
+    else
+        Sub.every 50 Tick
+
+
 main =
     Worker.tea
         { init = init

@@ -11,7 +11,7 @@ left gutter on prose lines, and colour when — and only when — the output is 
 terminal. Piped or redirected output, or any run with `NO_COLOR` set, is clean
 plain text with no escape codes.
 
-```
+```text
 $ ipe capabilities examples/shapes/script/release-preflight
   This program exercises 2 security capabilities:
     • network
@@ -28,7 +28,7 @@ is a light-yellow spinner and label; on success the same line is rewritten in
 place to a light-green `✓` and message, on failure to a light-red `✗` and
 message. Illustrative — the three states of one line, not three commands:
 
-```
+```text
   ⠙ Resolving the latest release…      (while it runs)
   ✓ Found ipe-v0.1.36                  (on success — the same line)
   ✗ Binary for latest release not found — set IPE_VERSION=vX.Y.Z   (on failure)
@@ -54,7 +54,7 @@ these flags — they are not data producers.
 
 ### `capabilities`
 
-```
+```text
 $ ipe capabilities --plain <entry>
 network
 clock
@@ -75,7 +75,7 @@ reads it.
 
 ### `version`
 
-```
+```text
 $ ipe version --plain
 0.1.11
 

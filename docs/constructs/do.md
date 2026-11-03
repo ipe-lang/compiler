@@ -9,16 +9,26 @@ The desugaring is mechanical: every `name <- task` becomes a
 
 Three statement forms are available inside a `do` block:
 
-    do
-        <name> <- <task-expr>   -- bind: run the task, name its result
-        <name> = <pure-expr>    -- pure let: bind a pure value, no task run
-        <task-expr>             -- run: run the task, discard the ()
+```ipe ipe:skip a syntax shape with placeholder names, not valid Ipê
+do
+    <name> <- <task-expr>   -- bind: run the task, name its result
+    <name> = <pure-expr>    -- pure let: bind a pure value, no task run
+    <task-expr>             -- run: run the task, discard the ()
+```
 
 To run a task only for its effect and discard its `()` result, write it as a
 bare line — do NOT write `_ <- task`. The `_ <-` bind is redundant noise:
 
-    _ <- Io.println x           -- avoid
-    Io.println x                -- prefer
+```ipe
+import Ipe.Io as Io
+import Ipe.Task
+
+demo : String -> Task Error ()
+demo x =
+    do
+        _ <- Io.println x           -- avoid
+        Io.println x                -- prefer
+```
 
 A `do` block must contain at least one `<-` bind or bare-run step. A block
 whose every statement is a `=` pure-let binding is rejected at compile time
