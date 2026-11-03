@@ -501,7 +501,7 @@ main =
 "#;
 
 /// A view-less `Worker.tea` entry that imports [`WIDGETS_MODULE`].
-const WORKER_WITH_WIDGET_HELPER: &str = r#"module Main exposing (main)
+const WORKER_WITH_WIDGET_HELPER: &str = r"module Main exposing (main)
 
 import Ipe.Tea.Worker as Worker
 import Ipe.Tea.Worker.Cmd
@@ -526,7 +526,7 @@ subscriptions _model =
 
 main =
     Worker.tea { init = init, update = update, subscriptions = subscriptions }
-"#;
+";
 
 /// A terminal app, a line app and a worker each refuse a constructor that lives
 /// in an imported helper module and is never used: the gate judges the whole

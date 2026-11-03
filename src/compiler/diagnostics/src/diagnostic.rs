@@ -1681,10 +1681,11 @@ pub enum AppShape {
     Cli,
 }
 
-/// A delivery shape that serves no browser page, so it cannot carry a browser
-/// custom element. Mirrors the canon delivery shapes other than Web; canon maps
-/// its shape onto this through a total `match`. Drives the wording rendered for
-/// [`LowerError::UiWidgetInNonWebShape`].
+/// A delivery shape that serves no browser page.
+///
+/// It cannot carry a browser custom element. Mirrors the canon delivery shapes
+/// other than Web; canon maps its shape onto this through a total `match`.
+/// Drives the wording rendered for [`LowerError::UiWidgetInNonWebShape`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum NonWebShape {
     /// `main : Task ()`: a native binary that renders nothing.
