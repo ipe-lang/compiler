@@ -2317,6 +2317,8 @@ pub enum StdlibKernel {
     BasicsAbs,
     /// `sqrt : Float -> Float` — square root (Float-only, matches Elm).
     BasicsSqrt,
+    /// `toFloat : Int -> Float` — the nearest `Float` to an `Int`.
+    BasicsToFloat,
     /// `min : comparable -> comparable -> comparable` — Basics.min.
     BasicsMin,
     /// `max : comparable -> comparable -> comparable` — Basics.max.
@@ -4826,6 +4828,7 @@ impl StdlibKernel {
             Self::BasicsNegate => d("Basics", "negate", 1, Pure, "basics_negate", IpeOrder),
             Self::BasicsAbs => d("Basics", "abs", 1, Pure, "basics_abs", IpeOrder),
             Self::BasicsSqrt => d("Basics", "sqrt", 1, Pure, "math_sqrt", IpeOrder),
+            Self::BasicsToFloat => d("Basics", "toFloat", 1, Pure, "int_to_float", IpeOrder),
             Self::BasicsMin => d("Basics", "min", 2, Pure, "math_min", IpeOrder),
             Self::BasicsMax => d("Basics", "max", 2, Pure, "math_max", IpeOrder),
             Self::BasicsCompare => d("Basics", "compare", 2, Pure, "basics_compare", IpeOrder),
@@ -8365,6 +8368,7 @@ impl StdlibKernel {
         Self::BasicsNegate,
         Self::BasicsAbs,
         Self::BasicsSqrt,
+        Self::BasicsToFloat,
         Self::BasicsMin,
         Self::BasicsMax,
         Self::BasicsCompare,
@@ -9642,6 +9646,7 @@ impl StdlibKernel {
         const INT_TO_CHAR: TyShape = TyShape::Fun(&INT, &CHAR);
         const FLOAT_TO_FLOAT: TyShape = TyShape::Fun(&FLOAT, &FLOAT);
         const FLOAT_TO_INT: TyShape = TyShape::Fun(&FLOAT, &INT);
+        const INT_TO_FLOAT: TyShape = TyShape::Fun(&INT, &FLOAT);
         const FLOAT_TO_BOOL: TyShape = TyShape::Fun(&FLOAT, &BOOL);
         const FLOAT_TO_STRING: TyShape = TyShape::Fun(&FLOAT, &STRING);
         const FLOAT_TO_FLOAT_TO_FLOAT: TyShape = TyShape::Fun(&FLOAT, &FLOAT_TO_FLOAT);
@@ -12506,6 +12511,7 @@ impl StdlibKernel {
             | Self::MathAcosh
             | Self::MathAtanh
             | Self::BasicsSqrt => Some(&FLOAT_TO_FLOAT),
+            Self::BasicsToFloat => Some(&INT_TO_FLOAT),
             Self::MathFloor | Self::MathCeil | Self::MathRound | Self::MathTrunc => {
                 Some(&FLOAT_TO_INT)
             }
@@ -14552,6 +14558,7 @@ impl StdlibKernel {
             | Self::BasicsNegate
             | Self::BasicsAbs
             | Self::BasicsSqrt
+            | Self::BasicsToFloat
             | Self::BasicsMin
             | Self::BasicsMax
             | Self::BasicsCompare
@@ -16826,6 +16833,7 @@ impl StdlibKernel {
             | Self::BasicsNegate
             | Self::BasicsAbs
             | Self::BasicsSqrt
+            | Self::BasicsToFloat
             | Self::BasicsMin
             | Self::BasicsMax
             | Self::BasicsCompare

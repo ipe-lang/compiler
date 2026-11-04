@@ -4426,6 +4426,56 @@ mod tests {
     }
 
     #[test]
+    fn a_local_to_float_shadows_the_prelude_without_a_duplicate() {
+        let src = "module Main exposing (main)\n\
+                   toFloat : Int -> Int\n\
+                   toFloat n = n\n\
+                   main = toFloat\n";
+        let Some((m, i)) = canon_src(src) else {
+            assert!(
+                false_marker(),
+                "a local `toFloat` is no duplicate of the prelude's"
+            );
+            return;
+        };
+        let Some(Def::Untyped { body, .. }) = find_def(&m, &i, "main") else {
+            assert!(false_marker(), "main should be an untyped def");
+            return;
+        };
+        assert!(
+            matches!(body.value, Expr_::VarTopLevel { name, .. } if i.resolve(name) == Some("toFloat")),
+            "a bare `toFloat` names the local definition, got {:?}",
+            body.value
+        );
+    }
+
+    #[test]
+    fn prelude_values_bind_every_basics_kernel() {
+        let src = "module Main exposing (main)\n\
+                   main = toFloat\n";
+        let Some((m, i)) = canon_src(src) else {
+            assert!(false_marker(), "the prelude binds `toFloat`");
+            return;
+        };
+        assert_main_is_kernel(&m, &i, "Basics", "toFloat");
+        let Some(Def::Untyped { body, .. }) = find_def(&m, &i, "main") else {
+            assert!(false_marker(), "main should be an untyped def");
+            return;
+        };
+        assert!(
+            matches!(
+                body.value,
+                Expr_::VarKernel {
+                    id: Some(ipe_kernels::StdlibKernel::BasicsToFloat),
+                    ..
+                }
+            ),
+            "a bare `toFloat` resolves to the `Basics.toFloat` kernel, got {:?}",
+            body.value
+        );
+    }
+
+    #[test]
     fn stdlib_wildcard_shadowed_by_explicit_exposing() {
         // An explicit `exposing (color)` (the explicit tier) wins over
         // a wildcard `color`; the pair is NOT ambiguous. Resolves to Font.color.
