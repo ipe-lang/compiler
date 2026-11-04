@@ -10,6 +10,13 @@ Entries below the header are maintained by
 section is generated from Conventional Commit messages and prepended when the
 standing release pull request is merged.
 
+## [0.7.4](https://github.com/ipe-lang/compiler/compare/ipe-v0.7.3...ipe-v0.7.4) (2026-11-04)
+
+
+### Features
+
+* **cli:** ipe dev run serves a web client bundle on loopback ([#4062](https://github.com/ipe-lang/compiler/issues/4062)) ([34f0ff8](https://github.com/ipe-lang/compiler/commit/34f0ff8f6afe3c16e744656492a56a6a65d937b8))
+
 ## [0.7.3](https://github.com/ipe-lang/compiler/compare/ipe-v0.7.2...ipe-v0.7.3) (2026-11-04)
 
 
