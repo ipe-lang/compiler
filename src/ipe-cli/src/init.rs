@@ -196,9 +196,9 @@ impl InitShape {
             Self::Web => match runtime {
                 Runtime::Served => "Then open http://localhost:8000 and click the counter buttons.",
                 Runtime::Client => {
-                    "This is a `client` app: the build writes its wasm bundle and prints \
-                     the command that serves it; open the address it serves and click \
-                     the counter buttons."
+                    "This is a `client` app: the run publishes its wasm bundle, serves it \
+                     on 127.0.0.1 and opens it in a browser (or prints the address to open); \
+                     then click the counter buttons."
                 }
             },
             Self::Tui => "Then press the Up/Down arrow keys to change the count; press q to quit.",
@@ -250,9 +250,9 @@ impl InitShape {
     /// The command the next steps advise, building the delivery the scaffold declares.
     ///
     /// A `web client` scaffold declares the browser client, so it advises
-    /// `ipe dev build` spelled with that delivery's own words, which publishes
-    /// the bundle; every other scaffold declares its shape's default
-    /// delivery, which a bare `ipe dev run` builds and runs.
+    /// `ipe dev run` spelled with that delivery's own words, which publishes
+    /// the bundle and serves it; every other scaffold declares its shape's
+    /// default delivery, which a bare `ipe dev run` builds and runs.
     fn next_step_command(self, runtime: Runtime) -> String {
         let client = match self {
             Self::Web => match runtime {
@@ -265,7 +265,7 @@ impl InitShape {
             || format!("ipe {}", Verb::DEV_RUN.name()),
             |delivery| {
                 let words: Vec<&str> = delivery.words().collect();
-                format!("ipe {} {}", Verb::DEV_BUILD.name(), words.join(" "))
+                format!("ipe {} {}", Verb::DEV_RUN.name(), words.join(" "))
             },
         )
     }
@@ -1440,11 +1440,10 @@ mod tests {
     }
 
     /// The command a scaffold's next steps and README advise builds exactly the
-    /// delivery its manifest declares: parsed by the advised verb's own argument
-    /// parser and resolved by the build's delivery resolver, it names the one
-    /// declared delivery, and it is `dev run` only when that delivery derives a
-    /// target `dev run` executes (a `web client` derives the browser bundle, so
-    /// its command is `dev build web client`).
+    /// delivery its manifest declares: it is always `dev run` (a `web client`
+    /// is served, every other delivery executed), and, parsed by `dev run`'s
+    /// own argument parser and resolved by the build's delivery resolver, it
+    /// names the one declared delivery.
     #[test]
     fn the_advised_next_step_builds_the_declared_delivery() {
         use crate::delivery::TargetTriple;
@@ -1468,23 +1467,19 @@ mod tests {
 
                 let command = shape.next_step_command(runtime);
                 let rest = command.strip_prefix("ipe ").unwrap_or_default();
-                let (verb, tail) = [Verb::DEV_RUN, Verb::DEV_BUILD]
-                    .into_iter()
-                    .find_map(|verb| rest.strip_prefix(verb.name()).map(|tail| (verb, tail)))
-                    .expect("the advised command is `ipe dev run` or `ipe dev build`");
+                let tail = rest
+                    .strip_prefix(Verb::DEV_RUN.name())
+                    .expect("the advised command is `ipe dev run`");
                 let args: Vec<String> = tail.split_whitespace().map(str::to_owned).collect();
-                let positionals = if verb == Verb::DEV_RUN {
-                    crate::cli_args::parse_run(&args).map(|a| a.delivery)
-                } else {
-                    crate::cli_args::parse_build(&args).map(|a| a.delivery)
-                }
-                .expect("the advised verb's parser reads the command");
+                let positionals = crate::cli_args::parse_run(&args)
+                    .map(|a| a.delivery)
+                    .expect("`dev run`'s parser reads the command");
                 let advised = resolve_delivery(
                     &declared_set,
                     &positionals,
                     None,
                     false,
-                    verb.name(),
+                    Verb::DEV_RUN.name(),
                     ADMIT_ANY,
                 )
                 .expect("the advised delivery resolves");
@@ -1495,10 +1490,10 @@ mod tests {
 
                 let derived = derive_target(TargetVerb::Dev, advised, None, None, false)
                     .expect("the advised delivery derives a dev target");
-                assert_eq!(
-                    verb == Verb::DEV_RUN,
-                    !derived.is_some_and(TargetTriple::is_wasm),
-                    "{label}: `{command}` runs only a delivery `dev run` can execute"
+                assert!(
+                    !derived.is_some_and(TargetTriple::is_wasm)
+                        || advised == Delivery::web_client(),
+                    "{label}: `{command}` runs a delivery `dev run` executes or serves"
                 );
 
                 let readme = managed_files("swept-app", shape, runtime)

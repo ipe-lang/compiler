@@ -5902,13 +5902,20 @@ mod tests {
         }
     }
 
-    /// Serve the doc site over `pages` on `listener` through the loopback core.
+    /// Serve the doc site over `pages` on `listener` through the loopback core,
+    /// one connection at a time: a stalled peer then holds the only slot, so
+    /// only the budget's deadline frees the server for the next request.
     fn serve_site(
         listener: &std::net::TcpListener,
         pages: &BTreeMap<String, String>,
         budget: std::time::Duration,
     ) {
-        crate::loopback_http::serve_site(listener, &doc_site(pages), budget);
+        crate::loopback_http::serve_site_with(
+            listener,
+            &doc_site(pages),
+            budget,
+            std::num::NonZeroUsize::MIN,
+        );
     }
 
     /// Serve one request on `conn` from the doc site over `pages`.
@@ -8359,6 +8366,7 @@ serve app
             format!("Content-Security-Policy: {}\r\n", headers.csp),
             "X-Content-Type-Options: nosniff\r\n".to_owned(),
             "Referrer-Policy: no-referrer\r\n".to_owned(),
+            "Cross-Origin-Resource-Policy: same-origin\r\n".to_owned(),
             "X-Frame-Options: DENY\r\n".to_owned(),
         ];
         for response in &responses {

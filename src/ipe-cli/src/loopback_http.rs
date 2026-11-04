@@ -1,12 +1,13 @@
 //! The one loopback HTTP server: `ipe doc --serve` and a served `web client` bundle.
 //!
-//! A single-threaded, read-only HTTP/1.1 loop over a listener bound to
-//! [`LOOPBACK`] only. Each connection's head is read under
-//! [`REQUEST_HEAD_CAP`] and an [`IO_BUDGET`] wall-clock deadline, its target
-//! authority is judged (an IP literal or a loopback name; a rebound DNS name
-//! is a `421`), and the request is answered by a [`Site`] from bytes it
-//! already holds. Every response leaves through [`write_reply`] with the
-//! site's policy, `nosniff`, no referrer, `no-store` and `Connection: close`.
+//! A read-only HTTP/1.1 server over a listener bound to [`LOOPBACK`] only,
+//! serving at most [`MAX_CONNECTIONS`] connections at once. Each connection's
+//! head is read under [`REQUEST_HEAD_CAP`] and an [`IO_BUDGET`] wall-clock
+//! deadline, its target authority is judged (an IP literal or a loopback name;
+//! a rebound DNS name is a `421`), and the request is answered by a [`Site`]
+//! from bytes it already holds. Every response leaves through [`write_reply`]
+//! with the site's policy, `nosniff`, no referrer, a same-origin resource
+//! policy, `no-store` and `Connection: close`.
 //!
 //! A browser is opened only through the opener [`announce`] takes: the
 //! production callers pass [`crate::browser::open_url`], and a test passes a
@@ -14,7 +15,9 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
+use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use ipe_runtime_rust::bundle_route::{MediaType, Route, route};
@@ -42,7 +45,7 @@ pub const REQUEST_HEAD_CAP: usize = 16 * 1024;
 ///
 /// The bound is on the whole head and the whole response, not on each read or
 /// write: a peer that never sends, drips a byte at a time, or never reads its
-/// response stalls the one-connection-at-a-time loop briefly, never forever.
+/// response holds its connection slot briefly, never forever.
 pub const IO_BUDGET: Duration = Duration::from_secs(10);
 
 /// The fixed body of a `421` answered to a request whose host is not admitted.
@@ -152,14 +155,95 @@ pub trait Site {
     fn respond(&self, method: Method, path: &str) -> Reply<'_>;
 }
 
-/// Serve `site` on `listener`, one connection at a time, until the process ends.
+/// The most connections a loopback server serves at once.
 ///
-/// A single dropped connection must not take the server down; `flatten` skips
-/// the `Err`s and serves each accepted stream. `budget` bounds each
-/// connection's head read and response write, each in wall-clock.
-pub fn serve_site<S: Site + ?Sized>(listener: &TcpListener, site: &S, budget: Duration) {
-    for conn in listener.incoming().flatten() {
-        serve_one(&conn, site, budget);
+/// A browser opens speculative connections it may never send a request on;
+/// served one at a time, each such socket would hold every real request for a
+/// whole [`IO_BUDGET`]. Past this many, the next accepted connection waits
+/// until one ends, so the threads serving are bounded.
+pub const MAX_CONNECTIONS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(7);
+
+/// Serve `site` on `listener`, at most [`MAX_CONNECTIONS`] connections at
+/// once, until the process ends.
+///
+/// `budget` bounds each connection's head read and response write, each in
+/// wall-clock.
+pub fn serve_site<S: Site + Sync + ?Sized>(listener: &TcpListener, site: &S, budget: Duration) {
+    serve_site_with(listener, site, budget, MAX_CONNECTIONS);
+}
+
+/// [`serve_site`], serving at most `connections` connections at once.
+///
+/// Each accepted connection is served on its own thread once a slot is free;
+/// the accept loop waits for a slot first, so no more than `connections`
+/// threads serve at once. A single dropped connection must not take the server
+/// down: `flatten` skips the accept `Err`s, and a connection whose thread
+/// cannot start is closed unserved.
+pub fn serve_site_with<S: Site + Sync + ?Sized>(
+    listener: &TcpListener,
+    site: &S,
+    budget: Duration,
+    connections: NonZeroUsize,
+) {
+    let slots = Slots::new(connections);
+    std::thread::scope(|scope| {
+        for conn in listener.incoming().flatten() {
+            let slot = slots.acquire();
+            let _ = std::thread::Builder::new()
+                .name("ipe-loopback-http".to_owned())
+                .spawn_scoped(scope, move || {
+                    let _slot = slot;
+                    serve_one(&conn, site, budget);
+                });
+        }
+    });
+}
+
+/// A count of the connections being served, capped.
+struct Slots {
+    busy: Mutex<usize>,
+    freed: Condvar,
+    cap: NonZeroUsize,
+}
+
+impl Slots {
+    const fn new(cap: NonZeroUsize) -> Self {
+        Self {
+            busy: Mutex::new(0),
+            freed: Condvar::new(),
+            cap,
+        }
+    }
+
+    /// Wait for a free slot and hold it until the returned [`Slot`] drops.
+    fn acquire(&self) -> Slot<'_> {
+        let mut busy = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
+        while *busy >= self.cap.get() {
+            busy = self
+                .freed
+                .wait(busy)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        *busy = busy.saturating_add(1);
+        Slot { slots: self }
+    }
+}
+
+/// One held connection slot, released on drop.
+struct Slot<'s> {
+    slots: &'s Slots,
+}
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        let mut busy = self
+            .slots
+            .busy
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *busy = busy.saturating_sub(1);
+        drop(busy);
+        self.slots.freed.notify_one();
     }
 }
 
@@ -215,8 +299,10 @@ pub fn serve_one<S: Site + ?Sized>(conn: &TcpStream, site: &S, budget: Duration)
 /// Every status and content type carries the site's policy, `nosniff`, no
 /// referrer, the site's framing, an explicit `Content-Length`, a
 /// `Connection: close` (the loop serves one request per connection), and
-/// `Cache-Control: no-store` (the site is a live preview held in memory). A
-/// `405` names the methods served.
+/// `Cache-Control: no-store` (the site is a live preview held in memory), and
+/// `Cross-Origin-Resource-Policy: same-origin` (a page of another origin cannot
+/// load a served file as its own script, image or module). A `405` names the
+/// methods served.
 #[must_use]
 pub fn response_head(
     headers: SiteHeaders<'_>,
@@ -237,7 +323,8 @@ pub fn response_head(
         "HTTP/1.1 {}\r\nContent-Type: {content_type}\r\n\
          Content-Length: {len}\r\nCache-Control: no-store\r\n\
          Content-Security-Policy: {}\r\nX-Content-Type-Options: nosniff\r\n\
-         Referrer-Policy: no-referrer\r\n{framing}{allow}\
+         Referrer-Policy: no-referrer\r\n\
+         Cross-Origin-Resource-Policy: same-origin\r\n{framing}{allow}\
          Connection: close\r\n\r\n",
         status.line(),
         headers.csp,
@@ -1000,6 +1087,11 @@ mod tests {
                     "{target}"
                 );
                 assert_eq!(header(&response, "Referrer-Policy"), Some("no-referrer"));
+                assert_eq!(
+                    header(&response, "Cross-Origin-Resource-Policy"),
+                    Some("same-origin"),
+                    "{target}: no other origin loads it as a subresource"
+                );
                 assert_eq!(header(&response, "Cache-Control"), Some("no-store"));
                 assert_eq!(header(&response, "X-Frame-Options"), None, "{target}");
             }
@@ -1062,6 +1154,72 @@ mod tests {
         assert_eq!(
             bundle_listen_port(read).expect("a port is admitted"),
             BundlePort::Pinned(ListenPort::parse("8123").expect("a port"))
+        );
+    }
+
+    /// Serve the plain site on a fresh loopback port, at most `connections`
+    /// at once, under `budget`; the server thread lives until the test ends.
+    fn serve_plain(connections: NonZeroUsize, budget: Duration) -> std::net::SocketAddr {
+        let listener = bind_loopback(0).expect("bind loopback");
+        let addr = listener.local_addr().expect("bound address");
+        std::thread::Builder::new()
+            .spawn(move || serve_site_with(&listener, &plain_site(), budget, connections))
+            .expect("spawn the server");
+        addr
+    }
+
+    /// A connection to `addr` that sends nothing, as a browser's speculative
+    /// preconnect does, held long enough for the server to accept it.
+    fn idle_connection(addr: std::net::SocketAddr) -> TcpStream {
+        let idle = TcpStream::connect(addr).expect("connect idle");
+        std::thread::sleep(Duration::from_millis(200));
+        idle
+    }
+
+    /// A fresh connection to `addr` that has sent `GET /`.
+    fn get_index(addr: std::net::SocketAddr) -> TcpStream {
+        let mut client = TcpStream::connect(addr).expect("connect");
+        let head = format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", addr.port());
+        client.write_all(head.as_bytes()).expect("write request");
+        client
+    }
+
+    /// The whole response on `client`, or `None` when none ends within `wait`.
+    fn response_within(client: &mut TcpStream, wait: Duration) -> Option<String> {
+        client.set_read_timeout(Some(wait)).expect("read timeout");
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).ok()?;
+        String::from_utf8(response).ok()
+    }
+
+    #[test]
+    fn an_idle_connection_does_not_hold_the_next_request() {
+        let addr = serve_plain(MAX_CONNECTIONS, Duration::from_secs(60));
+        let _idle = idle_connection(addr);
+        let response = response_within(&mut get_index(addr), Duration::from_secs(10));
+        assert!(
+            response.is_some_and(|r| r.starts_with("HTTP/1.1 200 OK\r\n")),
+            "a request is answered while a preconnected socket sits idle"
+        );
+    }
+
+    #[test]
+    fn the_server_serves_at_most_its_connection_cap_at_once() {
+        let two = NonZeroUsize::MIN.saturating_add(1);
+        let addr = serve_plain(two, Duration::from_secs(60));
+        let first = idle_connection(addr);
+        let _second = idle_connection(addr);
+        let mut third = get_index(addr);
+        assert_eq!(
+            response_within(&mut third, Duration::from_millis(500)),
+            None,
+            "past the cap, a connection waits for a slot"
+        );
+        drop(first);
+        let response = response_within(&mut third, Duration::from_secs(10));
+        assert!(
+            response.is_some_and(|r| r.starts_with("HTTP/1.1 200 OK\r\n")),
+            "a freed slot serves the waiting connection"
         );
     }
 

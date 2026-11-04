@@ -70,7 +70,7 @@ unsupported target `{target}` — supported: wasm, wasi, {supported}
 
 ## run-wasm-target
 
-ipe dev run builds and executes a native binary; --target wasm has no native artifact to run — use `ipe dev build web client` to produce a browser bundle
+ipe dev run --target wasm names no native artifact to run — use `ipe dev run web client` to build the browser bundle and serve it on 127.0.0.1
 
 ## run-wasi-native-flags
 

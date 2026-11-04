@@ -1966,10 +1966,12 @@ mod tests {
 
     #[test]
     fn run_wasm_target_rejected() {
-        assert!(matches!(
-            parse_run(&s(&["--target", "wasm"])),
-            Err(CliError::Usage(_))
-        ));
+        let refused = parse_run(&s(&["--target", "wasm"]));
+        assert!(
+            matches!(&refused, Err(CliError::Usage(message))
+                if message.as_str().contains("`ipe dev run web client`")),
+            "the refusal advises the run that serves the browser bundle: {refused:?}"
+        );
     }
 
     #[test]
