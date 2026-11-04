@@ -2164,9 +2164,13 @@ fn check_scheme_applications(
             let ty = zonk_emitted(uf, budget, *fresh).map_err(InferError::unsited)?;
             if !emitted_bound_satisfied(interner, *b, &ty, enum_embeds) {
                 return Err(InferError::sited(
-                    super_unsatisfied(interner, *b, &ty, app.span, |bit| {
-                        emitted_bound_satisfied(interner, bit, &ty, enum_embeds)
-                    }),
+                    refusal_of_duty(
+                        interner,
+                        *b,
+                        emitted_unmet(interner, *b, &ty, enum_embeds),
+                        &ty,
+                        app.span,
+                    ),
                     &app.use_home,
                 ));
             }
@@ -2812,7 +2816,44 @@ pub(crate) fn super_unsatisfied(
     span: Span,
     ok: impl Fn(TyBounds) -> bool,
 ) -> Diagnostic {
-    let Some(owed) = first_unmet(bounds, ok) else {
+    refusal_of_duty(interner, bounds, first_unmet(bounds, ok), ty, span)
+}
+
+/// The duty `ty` fails among `bounds` at a generic emission. An ordering a
+/// concrete pin admits but the emitted generic refuses (`String`, outside
+/// [`ipe_diagnostics::GENERIC_ORDERED_TYPES`]) is the generic's own duty, never
+/// a `comparable` the type already is.
+fn emitted_unmet(
+    interner: &Interner,
+    bounds: TyBounds,
+    ty: &Ty,
+    enum_embeds: &EnumEmbeds,
+) -> Option<Owed> {
+    let at = |site| move |bit| super_bounds_satisfied(interner, bit, ty, site, enum_embeds);
+    let comparable = Some(Owed::Class(TypeClass::Comparable));
+    let unmet = first_unmet(bounds, at(super_bounds::BoundSite::EmittedGeneric));
+    // The number duty reads no site, so a concrete pin failing first at
+    // `comparable` fails the class itself; any later result means every
+    // comparable bit holds there and only the generic's ordering is unmet.
+    if unmet == comparable
+        && first_unmet(bounds, at(super_bounds::BoundSite::ConcretePin)) != comparable
+    {
+        Some(Owed::GenericOrdering)
+    } else {
+        unmet
+    }
+}
+
+/// The IPE-T0014 refusal of `ty` for `unmet`, the duty among `bounds` it
+/// fails. No unmet duty leaves nothing to refuse, so that is a compiler bug.
+fn refusal_of_duty(
+    interner: &Interner,
+    bounds: TyBounds,
+    unmet: Option<Owed>,
+    ty: &Ty,
+    span: Span,
+) -> Diagnostic {
+    let Some(owed) = unmet else {
         return Diagnostic::CompilerBug {
             where_: "ipe_types::super_unsatisfied",
             detail: format!("refused {ty:?} meets every obligation in {bounds:?}"),
@@ -9751,10 +9792,40 @@ h x =
                 );
             }
         }
+    }
+
+    /// A `String` ordered through a generic forwarder is refused as the
+    /// generic-ordering duty, never as a `comparable` it already is; a record
+    /// there still fails the class itself.
+    #[test]
+    fn a_string_ordered_by_a_generic_owes_the_generic_ordering() {
+        let mut i = Interner::new();
+        let embeds = EnumEmbeds::default();
+        let string = con_ty(&mut i, &[], "String");
+        let int = con_ty(&mut i, &[], "Int");
+        let x = i.intern("x").expect("intern x");
+        let record = Ty::Record(BTreeMap::from([(x, int.clone())]), RowTail::Closed);
+        for bounds in [TyBounds::ord(), TyBounds::ord().union(TyBounds::eq())] {
+            assert_eq!(
+                emitted_unmet(&i, bounds, &string, &embeds),
+                Some(Owed::GenericOrdering),
+                "{bounds:?} at `String`"
+            );
+            assert_eq!(
+                emitted_unmet(&i, bounds, &record, &embeds),
+                Some(Owed::Class(TypeClass::Comparable)),
+                "{bounds:?} at a record"
+            );
+            assert_eq!(
+                emitted_unmet(&i, bounds, &int, &embeds),
+                None,
+                "{bounds:?} at `Int`"
+            );
+        }
         assert_eq!(
-            super_bounds::SQL_PARAM,
-            ipe_diagnostics::SQL_PARAM_TYPES.as_slice(),
-            "the gate's prim table and the rendered list must agree"
+            emitted_unmet(&i, TyBounds::add().union(TyBounds::ord()), &string, &embeds),
+            Some(Owed::Class(TypeClass::Number)),
+            "a `String` that also fails `number` owes the class first"
         );
     }
 

@@ -324,19 +324,16 @@ fn callee_label(interner: &Interner, callee: CalleeName) -> Option<Box<str>> {
     Some(format!("{last}.{name}").into_boxed_str())
 }
 
-/// The class a variable owing `bounds` is named after: the first of number,
-/// comparable, appendable, equatable it owes.
-const fn owed_class(bounds: TyBounds) -> Option<TypeClass> {
-    if bounds.has_number() {
-        Some(TypeClass::Number)
-    } else if bounds.has_ord() || bounds.has_comparable_key() {
-        Some(TypeClass::Comparable)
-    } else if bounds.has_append() {
-        Some(TypeClass::Appendable)
-    } else if bounds.has_eq() {
-        Some(TypeClass::Equatable)
-    } else {
-        None
+/// The class a variable owing `bounds` is named after: the first class duty
+/// it owes, in the order a refusal picks it.
+fn owed_class(bounds: TyBounds) -> Option<TypeClass> {
+    match crate::first_unmet(bounds, |_| false)? {
+        Owed::Class(class) => Some(class),
+        Owed::GenericOrdering
+        | Owed::Stringify
+        | Owed::PlainCallbackResult
+        | Owed::SqlParam
+        | Owed::Interpolable => None,
     }
 }
 

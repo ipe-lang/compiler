@@ -11,9 +11,9 @@
 //!   which reads by its class stem (`comparable`).
 //! * **Through a generic forwarder** (`byKey : (a -> b) -> List a -> List a`):
 //!   `IPE-T0014`, the forwarder's key variable inherits the obligation and its
-//!   instantiation does not meet it. An ordering generic is emitted with a
-//!   `Copy` bound, so a `String` key is refused here while the direct call
-//!   accepts it.
+//!   instantiation does not meet it. A generic orders only the types it can
+//!   copy, so a `String` key is refused here, as the generic-ordering duty and
+//!   never as a missing `comparable`, while the direct call accepts it.
 //! * **Non-equatable element** (a record holding a function): `IPE-T0014`, the
 //!   deep equality check over the pinned element.
 //!
@@ -162,7 +162,7 @@ fn sort_by_forwarder_string_key_is_ipe_t0014() {
         "sort_by_wrapper_string_gate",
         "m4e_sort_by_wrapper_string_gate_emit",
         ipe_diagnostics::IPE_T0014,
-        "`String` is not a `comparable` type",
+        "`String` is `comparable`, but a generic function orders its type variable only at",
     );
 }
 

@@ -34,7 +34,7 @@ pub const NUMBER: &[&str] = &ipe_diagnostics::NUMBER_TYPES;
 /// `String` is excluded: Rust ordering generics require `Copy`, which `String`
 /// does not implement. A direct `"a" > "b"` (concrete-pin) borrows, so
 /// `String` is admitted there via [`ORD_BORROW`].
-pub const ORD_COPY: &[&str] = &["Int", "Float", "Char", "Bool"];
+pub const ORD_COPY: &[&str] = &ipe_diagnostics::GENERIC_ORDERED_TYPES;
 
 /// Prim names that satisfy `ord` at a **concrete-pin** site.
 ///
@@ -53,7 +53,7 @@ pub const ORD_BORROW: &[&str] = &ipe_diagnostics::COMPARABLE_TYPES;
 pub const COMPARABLE_KEY: &[&str] = &ipe_diagnostics::COMPARABLE_TYPES;
 
 /// Prim names that satisfy the SQL-bind-parameter constraint.
-pub const SQL_PARAM: &[&str] = &["Int", "Float", "String", "Bool", "SqlValue"];
+pub const SQL_PARAM: &[&str] = &ipe_diagnostics::SQL_PARAM_TYPES;
 
 /// The bare scalar prim that satisfies `append` (the `++` operator on scalars).
 ///

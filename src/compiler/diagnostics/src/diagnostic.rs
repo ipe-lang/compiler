@@ -1142,6 +1142,14 @@ pub const NUMBER_TYPES: [&str; 2] = ["Int", "Float"];
 /// `COMPARABLE_KEY`) and the help line for [`TypeClass::Comparable`] read.
 pub const COMPARABLE_TYPES: [&str; 5] = ["Int", "Float", "Char", "String", "Bool"];
 
+/// The [`COMPARABLE_TYPES`] a generic function can order through a type
+/// variable: the emitted ordering bound copies its values, so `String` is left
+/// out.
+///
+/// The single table the type gate (`ipe_types::super_bounds::ORD_COPY`) and the
+/// IPE-T0014 sentence for [`Owed::GenericOrdering`] read.
+pub const GENERIC_ORDERED_TYPES: [&str; 4] = ["Int", "Float", "Char", "Bool"];
+
 /// A class a constrained type variable owes, as a diagnostic names it.
 ///
 /// A solved variable owing one renders by the class stem (`number`,
@@ -1182,7 +1190,12 @@ impl TypeClass {
 pub enum Owed {
     /// One of the user-nameable classes.
     Class(TypeClass),
-    /// `Debug.log`: a value with a rendering at every leaf (no function).
+    /// An ordering through a generic function's type variable: exactly
+    /// [`GENERIC_ORDERED_TYPES`]. A `comparable` type outside that list
+    /// (`String`) owes this, not the class it already belongs to.
+    GenericOrdering,
+    /// `Debug.log` and `errorToString`: a value with a rendering at every leaf
+    /// (no function).
     Stringify,
     /// A higher-order kernel's callback result: a plain value, never a
     /// function, because the kernel applies its callback at one exact arity.

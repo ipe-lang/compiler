@@ -2048,7 +2048,9 @@ fn import_required_label(qualifier: &str, candidates: &[Box<str>]) -> String {
 /// The label of an IPE-T0014 refusal: the duty `owed`, stated against the
 /// offending type `found`.
 fn unmet_duty_label(owed: crate::diagnostic::Owed, found: &str) -> String {
-    use crate::diagnostic::{INTERPOLABLE_TYPES, Owed, SQL_PARAM_TYPES, TypeClass};
+    use crate::diagnostic::{
+        GENERIC_ORDERED_TYPES, INTERPOLABLE_TYPES, Owed, SQL_PARAM_TYPES, TypeClass,
+    };
     match owed {
         Owed::Class(class) => {
             let article = match class {
@@ -2057,6 +2059,11 @@ fn unmet_duty_label(owed: crate::diagnostic::Owed, found: &str) -> String {
             };
             format!("`{found}` is not {article} `{}` type", class.stem())
         }
+        Owed::GenericOrdering => format!(
+            "`{found}` is `comparable`, but a generic function orders its type variable \
+             only at {}; give the ordered value the concrete type `{found}`",
+            GENERIC_ORDERED_TYPES.join(", ")
+        ),
         Owed::Stringify => {
             format!("`{found}` has no text rendering, so it cannot be shown as text")
         }
@@ -3500,6 +3507,21 @@ mod tests {
             !out.contains("quatable"),
             "a SQL refusal names no class:\n{out}"
         );
+    }
+
+    /// The generic-ordering duty grants the class the type has and names the
+    /// types a generic orders, never "is not a `comparable` type".
+    #[test]
+    fn generic_ordering_duty_grants_the_class_and_lists_the_types() {
+        let out = unmet_duty(crate::diagnostic::Owed::GenericOrdering, con("String"));
+        assert!(
+            out.contains("`String` is `comparable`, but a generic function orders"),
+            "generic-ordering label missing:\n{out}"
+        );
+        for ty in crate::diagnostic::GENERIC_ORDERED_TYPES {
+            assert!(out.contains(ty), "ordered type `{ty}` not named:\n{out}");
+        }
+        assert!(!out.contains("is not a `comparable`"), "{out}");
     }
 
     /// The interpolation duty names the accepted scalars and the conversions.
