@@ -929,8 +929,13 @@ const SHAPE_APP_RETURN_TYPES: &[&str] = &[
 /// reaches the codec crates so the selected feature (and its `base64` / `hex` /
 /// `percent-encoding` deps) and the module declarations can never disagree — the
 /// same fail-closed SSOT discipline as `jwt` / `url`.
-const RUNTIME_MOD_RS_ENCODING_APPEND: &str =
-    "pub mod encoding;\npub use encoding::*;\npub mod bytes;\npub use bytes::*;\n";
+///
+/// `bundle_route` (the one request-to-asset route and media-type table, typed
+/// over `encoding`'s `BundlePath` / `MountBase`) sits behind the same `encoding`
+/// feature in the runtime source, so it is declared with `encoding`: the served
+/// `web` surface names `crate::bundle_route` for its static-asset media types.
+const RUNTIME_MOD_RS_ENCODING_APPEND: &str = "pub mod encoding;\npub use encoding::*;\n\
+     pub mod bytes;\npub use bytes::*;\npub mod bundle_route;\n";
 
 // ── Ipe.Regex — regular expressions + String.isUrl ──────────────────────────
 

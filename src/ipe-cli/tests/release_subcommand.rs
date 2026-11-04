@@ -473,3 +473,33 @@ fn remedy_lines_keep_the_project_dir_the_user_typed() {
         assert!(stderr.contains(&remedy), "offers `{remedy}`: {stderr}");
     }
 }
+
+/// `dev run` of a `web client` delivery refuses a malformed `IPE_WEB_PORT`
+/// before any build: the error names the variable and nothing is emitted.
+#[test]
+#[allow(clippy::panic)] // test assertion: an `ipe` binary that cannot spawn IS the failure
+fn dev_run_client_refuses_a_malformed_port_before_any_build() {
+    let root = web_project("dev_run_client_malformed_port", "client");
+    let out = root.join("out");
+    let output = std::process::Command::new(support::ipe_bin())
+        .args(["dev".as_ref(), "run".as_ref(), root.as_os_str()])
+        .env("NO_COLOR", "1")
+        .env("IPE_WEB_PORT", "abc")
+        .output();
+    let wrote = out.exists();
+    let _ = std::fs::remove_dir_all(&root);
+    let output = match output {
+        Ok(output) => output,
+        Err(e) => panic!("spawn `ipe`: {e}"),
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a malformed port must refuse: {stderr}"
+    );
+    assert!(
+        stderr.contains("IPE_WEB_PORT"),
+        "names the variable: {stderr}"
+    );
+    assert!(!wrote, "a refused run emits nothing");
+}

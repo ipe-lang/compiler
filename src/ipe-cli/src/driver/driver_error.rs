@@ -144,6 +144,18 @@ pub enum CliError {
         /// Every spelling the variable admits.
         admitted: Vec<&'static str>,
     },
+    /// A registry environment variable is set to a value its grammar refuses.
+    ///
+    /// The refusal names the variable and the form it accepts; a refused value
+    /// never falls back to the variable's default.
+    EnvRefused(ipe_runtime_rust::env_grammar::EnvRefusal),
+    /// The port `IPE_WEB_PORT` pins for a served bundle is already in use.
+    ///
+    /// No other port is tried: the operator asked for this one.
+    ServePortTaken {
+        /// The pinned port.
+        port: ipe_runtime_rust::env_grammar::ListenPort,
+    },
     /// Writing the embedded runtime source to `<IPE_HOME>/runtime/<version>/rust`
     /// failed (disk full, permission denied, or a drifted embed). This is a
     /// fail-closed refusal — the build stops rather than link a wrong or empty
@@ -820,6 +832,8 @@ impl CliError {
             Self::CacheHomeUnknown => "cache-home-unknown",
             Self::EnvDirNotAbsolute { .. } => "env-dir-not-absolute",
             Self::EnvSwitchNotRecognised { .. } => "env-switch-not-recognised",
+            Self::EnvRefused(_) => "env-refused",
+            Self::ServePortTaken { .. } => "serve-port-taken",
             Self::RuntimeMaterializeFailed { .. } => "runtime-materialize-failed",
             Self::RuntimeVersionMismatch { .. } => "runtime-version-mismatch",
             Self::EmittedBuildFailed { .. } => "emitted-build-failed",
@@ -933,6 +947,8 @@ impl CliError {
             | Self::CacheHomeUnknown
             | Self::EnvDirNotAbsolute { .. }
             | Self::EnvSwitchNotRecognised { .. }
+            | Self::EnvRefused(_)
+            | Self::ServePortTaken { .. }
             | Self::RuntimeMaterializeFailed { .. }
             | Self::UnknownCode { .. }
             | Self::DocNotFound { .. }
@@ -1080,6 +1096,11 @@ impl std::fmt::Display for CliError {
             Self::EnvSwitchNotRecognised { var, got, admitted } => f.write_str(
                 &text::cli_env_switch_not_recognised(var, got, &admitted.join(", ")),
             ),
+            Self::EnvRefused(refusal) => write!(f, "{refusal}"),
+            Self::ServePortTaken { port } => f.write_str(&text::serve_port_taken(
+                &port.get(),
+                &ipe_runtime_rust::env_registry::web::WEB_PORT.name(),
+            )),
             Self::RuntimeDirInvalid { .. }
             | Self::RuntimeHomeUnknown
             | Self::RuntimeMaterializeFailed { .. }

@@ -1237,6 +1237,8 @@ ipe init [name]                    # new project
 # group names the posture.
 ipe dev build                      # compile the project here → out/app
 ipe dev build web client          # browser-WASM bundle → out/www/
+ipe dev run web client            # bundle → out/www/, served on 127.0.0.1
+                                   #  (IPE_WEB_PORT, else a free port)
 ipe dev run                        # build + run
 ipe release build                  # PRODUCTION build; rejects any Debug.* use
                                    #  (IPE-L0140)

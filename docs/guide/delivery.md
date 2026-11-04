@@ -165,6 +165,16 @@ around a fast dev client; `release web client <os>` hosts the production client.
 Building lays out a bundle; here is how to actually *run* one locally — including
 on a machine without a display (desktop) or without the device (mobile).
 
+### Browser
+
+`ipe dev run web client` builds the client bundle, publishes it to `out/www/`,
+and serves it read-only on `127.0.0.1`, then prints the URL and opens it in a
+browser. The server answers only with the bytes it published, under
+`basePath`, with the bundle's own `Content-Security-Policy`. It listens on the
+port `IPE_WEB_PORT` names, or on a free port when that is unset; a malformed
+or taken port stops the run with an error naming the variable. Ctrl-C stops
+the server.
+
 ### Desktop
 
 `ipe dev run web desktop` compiles and opens the app in a native webview window. To

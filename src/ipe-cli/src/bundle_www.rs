@@ -54,14 +54,47 @@ impl BundleHome {
 /// a link or a swapped directory under `into`; [`CliError::Io`] on a
 /// filesystem failure.
 pub fn publish_www(crate_dir: &OwnedDir, into: &OwnedDir) -> Result<PathBuf, CliError> {
-    publish_www_with(crate_dir, into, AssetLimits::PRODUCTION)
+    publish_www_with(crate_dir, into, AssetLimits::PRODUCTION, |_, _| Ok(()))
 }
 
-/// [`publish_www`] under the ceilings `limits`.
+/// [`publish_www`], also holding every published asset's bytes, keyed by its
+/// bundle path, as the snapshot a loopback server answers from.
+///
+/// The snapshot is the very bytes the publish wrote, read once through the
+/// held `www/`: no second walk, and no path a request names reaches the disk.
+///
+/// # Errors
+/// As [`publish_www`], and [`CliError::ProjectRefused`] carrying
+/// [`BundleError::NotABundlePath`] for an asset whose name a served bundle
+/// cannot carry; such a bundle is neither published nor served.
+pub fn publish_www_snapshot(
+    crate_dir: &OwnedDir,
+    into: &OwnedDir,
+) -> Result<(PathBuf, crate::loopback_http::BundleSnapshot), CliError> {
+    publish_www_snapshot_with(crate_dir, into, AssetLimits::PRODUCTION)
+}
+
+/// [`publish_www_snapshot`] under the ceilings `limits`.
+fn publish_www_snapshot_with(
+    crate_dir: &OwnedDir,
+    into: &OwnedDir,
+    limits: AssetLimits,
+) -> Result<(PathBuf, crate::loopback_http::BundleSnapshot), CliError> {
+    let mut snapshot = crate::loopback_http::BundleSnapshot::default();
+    let published = publish_www_with(crate_dir, into, limits, |asset, bytes| {
+        snapshot.insert(asset.to_bundle_path()?, bytes.to_vec());
+        Ok(())
+    })?;
+    Ok((published, snapshot))
+}
+
+/// [`publish_www`] under the ceilings `limits`, handing `keep` each asset's
+/// path and bytes before they are staged.
 fn publish_www_with(
     crate_dir: &OwnedDir,
     into: &OwnedDir,
     limits: AssetLimits,
+    mut keep: impl FnMut(&AssetPath, &[u8]) -> Result<(), BundleError>,
 ) -> Result<PathBuf, CliError> {
     let refused = |e: BundleError| CliError::ProjectRefused(Message::relay(&e));
     let bundle = SpaBundle::from_crate_with(crate_dir, limits).map_err(refused)?;
@@ -69,6 +102,7 @@ fn publish_www_with(
     let staged = into.stage_dir(OutputArea::Www.dir_name())?;
     for asset in &bundle.assets {
         let bytes = www.read_asset(&asset.path).map_err(refused)?;
+        keep(&asset.path, &bytes).map_err(refused)?;
         let rel: PathBuf = asset
             .path
             .segments()
@@ -79,6 +113,25 @@ fn publish_www_with(
     }
     bundle.spa.verify_unreplaced().map_err(refused)?;
     staged.promote()
+}
+
+/// The one of `candidates` whose policy meta `page` carries, exactly once.
+///
+/// `None` when the page carries no candidate's meta, more than one
+/// candidate's, or one candidate's twice: a page whose policy is not exactly
+/// one known value is refused, never guessed at.
+pub fn sole_policy<'c, T>(
+    page: &str,
+    candidates: &'c [T],
+    meta: impl Fn(&T) -> &str,
+) -> Option<&'c T> {
+    let mut held = candidates
+        .iter()
+        .filter(|candidate| page.contains(meta(candidate)));
+    let (Some(one), None) = (held.next(), held.next()) else {
+        return None;
+    };
+    page.matches(meta(one)).nth(1).is_none().then_some(one)
 }
 
 /// How deep below `www/` the asset walk descends, in directory levels.
@@ -165,6 +218,21 @@ impl AssetPath {
     #[must_use]
     pub fn to_shell_rel(&self) -> &str {
         &self.shell_rel
+    }
+
+    /// The bundle path this asset is served under: the one conversion from a
+    /// collected name to a served one.
+    ///
+    /// # Errors
+    /// [`BundleError::NotABundlePath`] when the name is outside the bundle
+    /// path grammar (`[A-Za-z0-9._-]` segments, bounded length).
+    pub fn to_bundle_path(&self) -> Result<ipe_runtime_rust::encoding::BundlePath, BundleError> {
+        ipe_runtime_rust::encoding::BundlePath::parse(&self.shell_rel).map_err(|reason| {
+            BundleError::NotABundlePath {
+                path: self.shell_rel.clone(),
+                reason,
+            }
+        })
     }
 
     /// Whether this is the top-level `index.html`.
@@ -720,6 +788,13 @@ pub enum BundleError {
         /// The `index.html` path, for the message only.
         path: PathBuf,
     },
+    /// An asset's name is outside the bundle path grammar a served bundle carries.
+    NotABundlePath {
+        /// The asset's `/`-joined name, for the message only.
+        path: String,
+        /// Why it is not a bundle path.
+        reason: ipe_runtime_rust::encoding::BundlePathRefusal,
+    },
     /// The bundle's `index.html` is larger than the pack reads.
     IndexTooLarge {
         /// The `index.html` path, for the message only.
@@ -754,6 +829,9 @@ impl std::fmt::Display for BundleError {
             }
             Self::IndexTooLarge { path, cap } => {
                 text::mobile_bundle_index_too_large(&EscapedPath(path), cap)
+            }
+            Self::NotABundlePath { path, reason } => {
+                text::bundle_not_a_bundle_path(&EscapedPath(Path::new(path)), reason)
             }
             Self::Io { path, source } => text::mobile_bundle_io(&EscapedPath(path), source),
         };
@@ -839,12 +917,127 @@ mod tests {
     }
 
     /// Whether `result` is a project refusal whose message is `error`'s.
-    fn refused_with(result: &Result<PathBuf, CliError>, error: &BundleError) -> bool {
+    fn refused_with<T>(result: &Result<T, CliError>, error: &BundleError) -> bool {
         matches!(result, Err(CliError::ProjectRefused(message))
             if message.as_str() == Message::relay(error).as_str())
     }
 
+    /// A publish that keeps nothing beside the published copy.
+    #[allow(clippy::unnecessary_wraps)] // the signature `publish_www_with` takes
+    fn keep_none(_: &AssetPath, _: &[u8]) -> Result<(), BundleError> {
+        Ok(())
+    }
+
     // ── Publishing the client bundle ──────────────────────────────────────────
+
+    #[test]
+    fn bundle_snapshot_holds_exactly_the_published_bytes() {
+        let (base, _) = www_with("snapshot-bytes", &["boot.js", "pkg/app_bg.wasm"]);
+        let (published, snapshot) =
+            publish_www_snapshot(&crate_of(&base), &out_root(&base)).expect("a plain bundle");
+        for rel in ["index.html", "boot.js", "pkg/app_bg.wasm"] {
+            let path = ipe_runtime_rust::encoding::BundlePath::parse(rel).expect("a bundle path");
+            let on_disk = std::fs::read(rel.split('/').fold(published.clone(), |p, s| p.join(s)))
+                .expect("the published file");
+            assert_eq!(
+                snapshot.get(&path).map(|(_, bytes)| bytes),
+                Some(on_disk.as_slice()),
+                "{rel}"
+            );
+        }
+        assert_eq!(snapshot.index_html(), Some(b"<html>".as_slice()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundle_snapshot_refuses_a_symlink_and_a_bundle_past_its_total_ceiling() {
+        let (base, www) = www_with("snapshot-link", &["boot.js"]);
+        std::fs::remove_file(www.join("boot.js")).expect("drop boot.js");
+        std::os::unix::fs::symlink("/etc/passwd", www.join("boot.js")).expect("plant link");
+        let linked = publish_www_snapshot(&crate_of(&base), &out_root(&base));
+        assert!(
+            matches!(linked, Err(CliError::ProjectRefused(_))),
+            "a linked asset is refused, never followed"
+        );
+        assert!(!base.join("out").join("www").exists());
+
+        // `index.html` is six bytes and `boot.js` one: seven in all.
+        let (base, _) = www_with("snapshot-total", &["boot.js"]);
+        let past = publish_www_snapshot_with(&crate_of(&base), &out_root(&base), total_of(6));
+        let error = BundleError::TooLarge {
+            limit: NonZeroU64::new(6).expect("six"),
+        };
+        assert!(refused_with(&past, &error), "past the total is refused");
+        assert!(!base.join("out").join("www").exists());
+        let (_, snapshot) =
+            publish_www_snapshot_with(&crate_of(&base), &out_root(&base), total_of(7))
+                .expect("exactly the total is held");
+        assert!(snapshot.index_html().is_some());
+    }
+
+    #[test]
+    fn bundle_snapshot_refuses_an_asset_name_outside_the_bundle_path_grammar() {
+        use ipe_runtime_rust::encoding::BundlePathRefusal;
+        for (tag, name, byte) in [
+            ("snapshot-space", "a b.js", b' '),
+            ("snapshot-non-ascii", "caf\u{e9}.js", 0xC3),
+        ] {
+            let (base, _) = www_with(tag, &[name]);
+            let served = publish_www_snapshot(&crate_of(&base), &out_root(&base));
+            let error = BundleError::NotABundlePath {
+                path: name.to_owned(),
+                reason: BundlePathRefusal::Reserved { byte },
+            };
+            assert!(refused_with(&served, &error), "{name}: typed refusal");
+            assert!(
+                !base.join("out").join("www").exists(),
+                "{name}: nothing is published, so nothing is served"
+            );
+            assert!(staging_leftovers(&base.join("out")).is_empty());
+        }
+    }
+
+    #[test]
+    fn bundle_site_answers_only_snapshot_bytes() {
+        use crate::loopback_http::{BundleSite, Method, Site, Status};
+        let (base, _) = www_with("snapshot-site", &["boot.js"]);
+        let (published, snapshot) =
+            publish_www_snapshot(&crate_of(&base), &out_root(&base)).expect("a plain bundle");
+        std::fs::write(published.join("late.js"), b"late").expect("a file added after");
+        std::fs::write(base.join("outside.js"), b"outside").expect("a file outside www");
+        let site = BundleSite {
+            base: ipe_runtime_rust::encoding::MountBase::root(),
+            snapshot,
+            csp: String::new(),
+        };
+        assert_eq!(site.respond(Method::Get, "/boot.js").status, Status::Ok);
+        for path in ["/late.js", "/outside.js", "/../outside.js"] {
+            let reply = site.respond(Method::Get, path);
+            assert_eq!(reply.status, Status::NotFound, "{path}");
+            assert_eq!(reply.body, b"not found\n", "{path}");
+        }
+    }
+
+    #[test]
+    fn sole_policy_admits_exactly_one_candidate_once() {
+        fn meta<'x>(candidate: &'x &str) -> &'x str {
+            candidate
+        }
+        let candidates = ["<m a>", "<m b>"];
+        assert_eq!(sole_policy("x<m a>y", &candidates, meta), Some(&"<m a>"));
+        assert_eq!(sole_policy("x<m b>y", &candidates, meta), Some(&"<m b>"));
+        assert_eq!(sole_policy("x", &candidates, meta), None, "none held");
+        assert_eq!(
+            sole_policy("<m a><m b>", &candidates, meta),
+            None,
+            "two held"
+        );
+        assert_eq!(
+            sole_policy("<m a><m a>", &candidates, meta),
+            None,
+            "one twice"
+        );
+    }
 
     #[cfg(unix)]
     #[test]
@@ -917,18 +1110,18 @@ mod tests {
         // `index.html` is six bytes and `boot.js` one: seven in all.
         let (base, _) = www_with("publish-total", &["boot.js"]);
         let out = out_root(&base);
-        publish_www_with(&crate_of(&base), &out, total_of(7))
+        publish_www_with(&crate_of(&base), &out, total_of(7), keep_none)
             .expect("exactly the total is published");
 
         let limit = NonZeroU64::new(6).expect("a non-zero total");
-        let past = publish_www_with(&crate_of(&base), &out, total_of(6));
+        let past = publish_www_with(&crate_of(&base), &out, total_of(6), keep_none);
         assert!(
             refused_with(&past, &BundleError::TooLarge { limit }),
             "{past:?}"
         );
 
         let fresh = scratch("publish-total-fresh");
-        let past = publish_www_with(&crate_of(&base), &out_root(&fresh), total_of(6));
+        let past = publish_www_with(&crate_of(&base), &out_root(&fresh), total_of(6), keep_none);
         assert!(past.is_err(), "{past:?}");
         assert!(!fresh.join("out").join("www").exists());
         assert!(staging_leftovers(&fresh.join("out")).is_empty());
@@ -942,7 +1135,7 @@ mod tests {
             ..AssetLimits::PRODUCTION
         };
         let limit = limits.entries;
-        let past = publish_www_with(&crate_of(&base), &out_root(&base), limits);
+        let past = publish_www_with(&crate_of(&base), &out_root(&base), limits, keep_none);
         assert!(
             refused_with(&past, &BundleError::TooManyAssets { limit }),
             "{past:?}"
@@ -957,7 +1150,7 @@ mod tests {
             depth: NonZeroUsize::MIN,
             ..AssetLimits::PRODUCTION
         };
-        let past = publish_www_with(&crate_of(&base), &out_root(&base), limits);
+        let past = publish_www_with(&crate_of(&base), &out_root(&base), limits, keep_none);
         assert!(
             matches!(&past, Err(CliError::ProjectRefused(_))),
             "{past:?}"
@@ -988,7 +1181,7 @@ mod tests {
 
         // `boot.js` is copied first and fits; `index.html` is past what is left.
         std::fs::write(www.join("boot.js"), b"newer").expect("rewrite boot.js");
-        let mid_copy = publish_www_with(&crate_of(&base), &out, total_of(5));
+        let mid_copy = publish_www_with(&crate_of(&base), &out, total_of(5), keep_none);
         assert!(
             matches!(mid_copy, Err(CliError::ProjectRefused(_))),
             "{mid_copy:?}"

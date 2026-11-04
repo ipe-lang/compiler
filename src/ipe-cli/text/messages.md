@@ -70,7 +70,7 @@ unsupported target `{target}` — supported: wasm, wasi, {supported}
 
 ## run-wasm-target
 
-ipe dev run builds and executes a native binary; --target wasm has no native artifact to run — use `ipe dev build web client` to produce a browser bundle
+ipe dev run --target wasm names no native artifact to run — use `ipe dev run web client` to build the browser bundle and serve it on 127.0.0.1
 
 ## run-wasi-native-flags
 
@@ -1792,6 +1792,10 @@ the emitted wasm bundle's page at {path} does not carry exactly one Content-Secu
 
 the emitted wasm bundle's page at {path} is larger than {cap} bytes, more than a bundle page holds — build and package again
 
+## bundle-not-a-bundle-path
+
+the emitted wasm bundle holds {path}, which a served bundle cannot carry ({reason}) — name every file in `www/` with ASCII letters, digits, `.`, `_` and `-`
+
 ## mobile-asset-origin-listed
 
 package.ipe: `delivery.servers` lists {origin}, the Android shell's own local asset origin — the shell answers that origin from the bundle, so it cannot also be a server. Remove it from `delivery.servers`.
@@ -2522,6 +2526,22 @@ wasm-bindgen failed (exit {code}); ensure wasm-bindgen-cli {version} is installe
 
 wasm bundle ready at {www}/
 bundle size: {size} ({wasm})
+
+## bundle-serving
+
+serving {www} at {url} (read-only, loopback; Ctrl-C to stop)
+
+## doc-serve-serving
+
+serving docs at {url} (read-only, loopback; Ctrl-C to stop)
+
+## serve-open-failed
+
+could not open a browser; open {url}
+
+## serve-port-taken
+
+port {port}, which {var} names, is already in use — stop what listens there, set {var} to another port, or unset it to serve on a free port
 
 ## wasm-artifact-missing
 

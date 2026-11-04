@@ -56,6 +56,7 @@ pub mod line_grammar;
 pub mod lint;
 pub mod lockfile;
 pub mod login;
+mod loopback_http;
 pub mod loose_file;
 mod lsp;
 pub mod machine_output;
