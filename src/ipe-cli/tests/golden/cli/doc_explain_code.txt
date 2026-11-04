@@ -56,9 +56,16 @@ exit: 0
   parameter to whatever concrete record you pass at the one call site:
 
   ```ipe
+  import Ipe.Io as Io
+
   -- accepted: no signature; the compiler infers a concrete record shape
+  -- from its one call site below
   describe rec =
       rec.name
+
+  main : Task Error ()
+  main =
+      Io.println (describe { name = "Ada", age = 36 })
   ```
 
   ## Why this happens
