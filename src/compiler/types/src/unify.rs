@@ -27,7 +27,7 @@
 
 use std::collections::BTreeMap;
 
-use ipe_diagnostics::{ArgCount, DResult, Diagnostic, Span, TypeClass, TypeError};
+use ipe_diagnostics::{ArgCount, DResult, Diagnostic, Owed, Span, TypeClass, TypeError};
 use ipe_intern::Interner;
 
 use crate::constrain::zonk_reported;
@@ -340,35 +340,6 @@ const fn owed_class(bounds: TyBounds) -> Option<TypeClass> {
     }
 }
 
-/// The first class a variable owing `bounds` needs that the structure `flat`
-/// lacks at its head, or `None` when the head meets every named class.
-fn unmet_class(interner: &Interner, bounds: TyBounds, flat: &FlatType) -> Option<TypeClass> {
-    let head = SuperHead::of(interner, flat);
-    [
-        (bounds.has_number(), TypeClass::Number, TyBounds::add()),
-        (bounds.has_ord(), TypeClass::Comparable, TyBounds::ord()),
-        (
-            bounds.has_set_elem(),
-            TypeClass::Comparable,
-            TyBounds::set_elem(),
-        ),
-        (
-            bounds.has_dict_key(),
-            TypeClass::Comparable,
-            TyBounds::dict_key(),
-        ),
-        (
-            bounds.has_append(),
-            TypeClass::Appendable,
-            TyBounds::appendable(),
-        ),
-        (bounds.has_eq(), TypeClass::Equatable, TyBounds::eq()),
-    ]
-    .into_iter()
-    .find(|(owed, _, single)| *owed && !super_head_ok(*single, head))
-    .map(|(_, class, _)| class)
-}
-
 /// Every solver variable in `tys` still owing a named class, keyed by the raw
 /// its [`Ty::Var`] carries, so a rendering names it by the class stem.
 fn owed_classes(uf: &UnionFind<Content>, tys: &[&Ty]) -> BTreeMap<u32, TypeClass> {
@@ -468,23 +439,38 @@ fn unify_step(
                 let (super_var, structure_var) = if a_is_structure { (rb, ra) } else { (ra, rb) };
                 occurs_guard(uf, budget, interner, span, super_var, structure_var)?;
                 uf.union(ra, rb, structure)
-            } else if !rigid && bounds.has_interpolable() {
-                // An interpolation hole names the capability the value lacks
-                // (IPE-T0014), not a bare shape mismatch against no written type.
-                let structure_var = if a_is_structure { ra } else { rb };
-                let ty = zonk_reported(uf, budget, structure_var, span)?;
-                let mut namer = VarNamer::with_classes(owed_classes(uf, &[&ty]));
-                Err(crate::super_unsatisfied_named(
-                    interner, bounds, &ty, span, &mut namer,
-                ))
             } else {
-                // A flex whose class the structure lacks names that class, so
-                // the mismatch says what the class admits.
+                // A flex states the duty the structure fails: a class duty as a
+                // mismatch naming the class, every other duty as IPE-T0014, the
+                // code its deferred check gives the same duty. A rigid cannot
+                // pin at all, so it is a plain mismatch.
                 let unmet = match &structure {
-                    Content::Structure(flat) if !rigid => unmet_class(interner, bounds, flat),
+                    Content::Structure(flat) if !rigid => {
+                        let head = SuperHead::of(interner, flat);
+                        crate::first_unmet(bounds, |bit| super_head_ok(bit, head))
+                    }
                     _ => None,
                 };
-                Err(mismatch_owing(uf, budget, interner, span, ra, rb, unmet))
+                match unmet {
+                    Some(Owed::Class(class)) => Err(mismatch_owing(
+                        uf,
+                        budget,
+                        interner,
+                        span,
+                        ra,
+                        rb,
+                        Some(class),
+                    )),
+                    Some(duty) => {
+                        let structure_var = if a_is_structure { ra } else { rb };
+                        let ty = zonk_reported(uf, budget, structure_var, span)?;
+                        let mut namer = VarNamer::with_classes(owed_classes(uf, &[&ty]));
+                        Err(crate::super_unsatisfied_named(
+                            interner, duty, &ty, span, &mut namer,
+                        ))
+                    }
+                    None => Err(mismatch_owing(uf, budget, interner, span, ra, rb, None)),
+                }
             }
         }
         // A rigid against a concrete structure is a mismatch — the annotation

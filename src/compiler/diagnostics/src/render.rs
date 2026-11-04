@@ -2045,6 +2045,38 @@ fn import_required_label(qualifier: &str, candidates: &[Box<str>]) -> String {
     }
 }
 
+/// The label of an IPE-T0014 refusal: the duty `owed`, stated against the
+/// offending type `found`.
+fn unmet_duty_label(owed: crate::diagnostic::Owed, found: &str) -> String {
+    use crate::diagnostic::{INTERPOLABLE_TYPES, Owed, SQL_PARAM_TYPES, TypeClass};
+    match owed {
+        Owed::Class(class) => {
+            let article = match class {
+                TypeClass::Number | TypeClass::Comparable => "a",
+                TypeClass::Appendable | TypeClass::Equatable => "an",
+            };
+            format!("`{found}` is not {article} `{}` type", class.stem())
+        }
+        Owed::Stringify => {
+            format!("`{found}` has no text rendering, so it cannot be shown as text")
+        }
+        Owed::PlainCallbackResult => {
+            format!("this callback result must be a plain value, not a function; this is `{found}`")
+        }
+        Owed::SqlParam => format!(
+            "`{found}` cannot be bound as a SQL parameter — a parameter is one of {}",
+            SQL_PARAM_TYPES.join(", ")
+        ),
+        Owed::Interpolable => format!(
+            "`{found}` cannot be interpolated or logged — `{{{{…}}}}` and `Log.*With` \
+             accept only {}; convert the value first with `String.fromInt`, \
+             `String.fromFloat`, `String.fromBool` or `String.fromChar`, or with your own \
+             function that renders a record or custom type as a `String`",
+            INTERPOLABLE_TYPES.join(", ")
+        ),
+    }
+}
+
 #[allow(clippy::too_many_lines)] // one match arm per TypeError variant — mechanical dispatch
 fn type_label(msg: &TypeError) -> Option<String> {
     match msg {
@@ -2100,31 +2132,8 @@ fn type_label(msg: &TypeError) -> Option<String> {
         } => Some(format!(
             "`{ctor}` binds {found} field(s) but its declaration has {expected}"
         )),
-        TypeError::SuperTypeUnsatisfied { class, found } => {
-            if &**class == crate::diagnostic::HOF_KERNEL_RESULT_CLASS {
-                // Tailored sentence: the generic template below would read as
-                // a double negative for this internal arity obligation
-                // ("`a` is not a non-function callback result … type").
-                Some(format!(
-                    "the callback's result type {} may itself be a function — \
-                     higher-order kernels (List.map / List.foldl / Maybe.map2 / \
-                     andMap / …) apply their callback at one exact arity, so the \
-                     callback must return a plain (non-function) value",
-                    ty_to_string(found)
-                ))
-            } else if &**class == crate::diagnostic::INTERPOLABLE_CLASS {
-                Some(format!(
-                    "{} cannot be interpolated or logged — `{{{{…}}}}` and `Log.*With` \
-                     accept only {}; convert the value first with `String.fromInt`, \
-                     `String.fromFloat`, `String.fromBool` or `String.fromChar`, or \
-                     with your own function that renders a record or custom type as a \
-                     `String`",
-                    ty_to_string(found),
-                    crate::diagnostic::INTERPOLABLE_TYPES.join(", ")
-                ))
-            } else {
-                Some(format!("{} is not a {class} type", ty_to_string(found)))
-            }
+        TypeError::SuperTypeUnsatisfied { owed, found, .. } => {
+            Some(unmet_duty_label(*owed, &ty_to_string(found)))
         }
         TypeError::RefutablePatternParameter => {
             Some("this parameter pattern can fail to match".to_string())
@@ -3413,59 +3422,93 @@ mod tests {
         assert!(!out.contains('\x1b'), "must be plain in tests:\n{out}");
     }
 
-    #[test]
-    fn hof_kernel_result_super_type_renders_without_double_negative() {
-        // The generic SuperTypeUnsatisfied template ("`X` is not a `<class>`
-        // type") reads as a confusing double negative for the
-        // higher-order-kernel callback-result obligation ("`a` is not a
-        // non-function callback result … type"). That class label must render
-        // through the tailored sentence instead.
+    /// The rendered IPE-T0014 refusal of `found` for the unmet duty `owed`.
+    fn unmet_duty(owed: crate::diagnostic::Owed, found: TyDoc) -> String {
         let src = "module Main exposing (main)\n\nmain =\n    foo\n";
         let d = Diagnostic::Type {
             span: Span::new(40, 43),
             msg: TypeError::SuperTypeUnsatisfied {
-                class: crate::diagnostic::HOF_KERNEL_RESULT_CLASS.into(),
-                found: Box::new(TyDoc::Var("a".into())),
+                owed,
+                found: Box::new(found),
+                origin: None,
             },
         };
-        let out = render(&d, "test.ipe", src);
+        render(&d, "test.ipe", src)
+    }
+
+    fn int_to_int() -> TyDoc {
+        TyDoc::Fun(Box::new(con("Int")), Box::new(con("Int")))
+    }
+
+    /// A class duty names the class by its stem with the stem's article.
+    #[test]
+    fn class_duty_names_the_stem_with_its_article() {
+        use crate::diagnostic::{Owed, TypeClass};
+        for (class, phrase) in [
+            (TypeClass::Number, "`Bool` is not a `number` type"),
+            (TypeClass::Comparable, "`Bool` is not a `comparable` type"),
+            (TypeClass::Appendable, "`Bool` is not an `appendable` type"),
+            (TypeClass::Equatable, "`Bool` is not an `equatable` type"),
+        ] {
+            let out = unmet_duty(Owed::Class(class), con("Bool"));
+            assert!(out.contains(phrase), "{class:?} label missing:\n{out}");
+            assert!(out.contains("IPE-T0014"), "code missing:\n{out}");
+            assert!(!out.contains("is not a Equatable"), "{out}");
+        }
+    }
+
+    /// The stringify duty names the type it cannot show and no kernel: the
+    /// duty is owed at `Debug.log` and `errorToString` alike.
+    #[test]
+    fn stringify_duty_names_the_type_and_no_kernel() {
+        let out = unmet_duty(crate::diagnostic::Owed::Stringify, int_to_int());
         assert!(
-            !out.contains("is not a non-function"),
-            "double-negative template must not fire for the HOF label:\n{out}"
+            out.contains("`Int -> Int` has no text rendering, so it cannot be shown as text"),
+            "stringify label missing:\n{out}"
         );
+        assert!(!out.contains("Debug.log"), "names one kernel:\n{out}");
+    }
+
+    /// The callback-result duty states the duty, never a kernel list or a
+    /// "may be".
+    #[test]
+    fn plain_callback_result_duty_states_the_duty() {
+        let out = unmet_duty(crate::diagnostic::Owed::PlainCallbackResult, int_to_int());
         assert!(
-            out.contains("must return a plain (non-function) value"),
-            "tailored sentence missing:\n{out}"
+            out.contains(
+                "this callback result must be a plain value, not a function; this is `Int -> Int`"
+            ),
+            "callback-result label missing:\n{out}"
         );
-        // Every other class label keeps the generic template.
-        let generic = Diagnostic::Type {
-            span: Span::new(40, 43),
-            msg: TypeError::SuperTypeUnsatisfied {
-                class: "Number".into(),
-                found: Box::new(con("String")),
-            },
-        };
-        let out2 = render(&generic, "test.ipe", src);
+        assert!(!out.contains("may itself"), "{out}");
+        assert!(!out.contains("List.map"), "{out}");
+    }
+
+    /// The SQL-parameter duty lists every bindable type and names no class.
+    #[test]
+    fn sql_param_duty_lists_the_bindable_types() {
+        let record = TyDoc::Record(Box::new([("x".into(), con("Int"))]));
+        let out = unmet_duty(crate::diagnostic::Owed::SqlParam, record);
         assert!(
-            out2.contains("String is not a Number type"),
-            "generic template regressed:\n{out2}"
+            out.contains("cannot be bound as a SQL parameter"),
+            "sql label missing:\n{out}"
+        );
+        for ty in crate::diagnostic::SQL_PARAM_TYPES {
+            assert!(out.contains(ty), "bindable type `{ty}` not named:\n{out}");
+        }
+        assert!(
+            !out.contains("quatable"),
+            "a SQL refusal names no class:\n{out}"
         );
     }
 
+    /// The interpolation duty names the accepted scalars and the conversions.
     #[test]
-    fn interpolable_super_type_names_the_scalars_and_the_fix() {
-        let src = "module Main exposing (main)\n\nmain =\n    foo\n";
-        let d = Diagnostic::Type {
-            span: Span::new(40, 43),
-            msg: TypeError::SuperTypeUnsatisfied {
-                class: crate::diagnostic::INTERPOLABLE_CLASS.into(),
-                found: Box::new(con("Maybe")),
-            },
-        };
-        let out = render(&d, "test.ipe", src);
+    fn interpolable_duty_names_the_scalars_and_the_fix() {
+        let out = unmet_duty(crate::diagnostic::Owed::Interpolable, con("Maybe"));
         assert!(
-            out.contains("Maybe cannot be interpolated or logged"),
-            "tailored sentence missing:\n{out}"
+            out.contains("`Maybe` cannot be interpolated or logged"),
+            "interpolation label missing:\n{out}"
         );
         for ty in crate::diagnostic::INTERPOLABLE_TYPES {
             assert!(out.contains(ty), "accepted type `{ty}` not named:\n{out}");
@@ -3478,10 +3521,6 @@ mod tests {
         ] {
             assert!(out.contains(conv), "conversion `{conv}` not named:\n{out}");
         }
-        assert!(
-            !out.contains("is not a interpolable"),
-            "generic template must not fire for the interpolation label:\n{out}"
-        );
     }
 
     #[test]

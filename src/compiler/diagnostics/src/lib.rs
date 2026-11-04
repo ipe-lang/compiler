@@ -23,12 +23,12 @@ pub use code::*;
 pub use diagnostic::{
     AliasExpansionKind, AliasRowFault, AppShape, Applicability, ArgCount, COMPARABLE_TYPES,
     Candidates, CaseDefect, CmdSubShapeMismatch, CodecAutoRejection, ConsentError, Construct,
-    CtorWithheld, DResult, Diagnostic, EditTarget, EmitSite, Expected, ExpectedSet, ExposingDefect,
-    Feature, FfiError, GenericAppEntryReach, HOF_KERNEL_RESULT_CLASS, HazardRefusal, HeaderDefect,
-    HelpLine, Hint, INTERPOLABLE_CLASS, INTERPOLABLE_TYPES, IfDefect, ImportedAs, InterceptContext,
-    LetDefect, LowerError, MainRetName, ModelLeaf, ModulePlacementReason, ModulePlacementRejection,
-    MountPrefixFault, NUMBER_TYPES, NameError, NonWebShape, ParseError, RoutePatternDefect,
-    RustNameFoldKind, SandboxError, SealRejection, SortedNames, SpanRole, StdlibReach,
+    CtorWithheld, DResult, Diagnostic, DutyOrigin, EditTarget, EmitSite, Expected, ExpectedSet,
+    ExposingDefect, Feature, FfiError, GenericAppEntryReach, HazardRefusal, HeaderDefect, HelpLine,
+    Hint, INTERPOLABLE_TYPES, IfDefect, ImportedAs, InterceptContext, LetDefect, LowerError,
+    MainRetName, ModelLeaf, ModulePlacementReason, ModulePlacementRejection, MountPrefixFault,
+    NUMBER_TYPES, NameError, NonWebShape, Owed, ParseError, RoutePatternDefect, RustNameFoldKind,
+    SQL_PARAM_TYPES, SandboxError, SealRejection, SortedNames, SpanRole, StdlibReach,
     StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc, TypeClass,
     TypeDeclDefect, TypeError, TypeSizeOrigin, WildcardDependence,
 };

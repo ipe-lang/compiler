@@ -1114,16 +1114,6 @@ pub enum AliasExpansionKind {
     Nodes,
 }
 
-/// Class label for the higher-order-kernel callback-result obligation.
-///
-/// A higher-order kernel (`List.map`, `List.foldl`, `Maybe.map2`, …) applies
-/// its callback at one exact arity, so the callback's result must not itself
-/// be a function. Shared between the constructor (`ipe_types::super_unsatisfied`)
-/// and the renderer's tailored [`TypeError::SuperTypeUnsatisfied`] sentence so
-/// the two sites cannot drift — the generic "`X` is not a `<class>` type"
-/// template would read as a confusing double negative for this label.
-pub const HOF_KERNEL_RESULT_CLASS: &str = "non-function callback result (higher-order kernel)";
-
 /// The closed set of Ipê types that `{{…}}` interpolation and `Log.*With`
 /// attributes accept.
 ///
@@ -1132,12 +1122,12 @@ pub const HOF_KERNEL_RESULT_CLASS: &str = "non-function callback result (higher-
 /// are all checked against.
 pub const INTERPOLABLE_TYPES: [&str; 5] = ["String", "Int", "Float", "Bool", "Char"];
 
-/// Class label for the interpolation obligation.
+/// The Ipê types a SQL statement binds as a parameter (`Db.exec`,
+/// `Db.query`, `Db.queryDecode`).
 ///
-/// Shared between the constructor (`ipe_types::super_unsatisfied`) and the
-/// renderer's tailored [`TypeError::SuperTypeUnsatisfied`] sentence, which
-/// names the accepted types and the conversion that fixes the call.
-pub const INTERPOLABLE_CLASS: &str = "interpolable scalar";
+/// The renderable list the IPE-T0014 sentence names; the types crate asserts
+/// it equals the set its SQL-parameter gate accepts.
+pub const SQL_PARAM_TYPES: [&str; 5] = ["Int", "Float", "String", "Bool", "SqlValue"];
 
 /// The Ipê types that satisfy the `number` class (`+`, `-`, `*`).
 ///
@@ -1181,6 +1171,37 @@ impl TypeClass {
             Self::Equatable => "equatable",
         }
     }
+}
+
+/// The duty a constrained type variable owes, as a refusal states it.
+///
+/// Every solver obligation maps to exactly one variant: a class a user can
+/// name ([`TypeClass`]), or a duty a kernel imposes on one of its slots. The
+/// declaration order is the order a refusal picks among several unmet duties.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Owed {
+    /// One of the user-nameable classes.
+    Class(TypeClass),
+    /// `Debug.log`: a value with a rendering at every leaf (no function).
+    Stringify,
+    /// A higher-order kernel's callback result: a plain value, never a
+    /// function, because the kernel applies its callback at one exact arity.
+    PlainCallbackResult,
+    /// A SQL parameter: exactly [`SQL_PARAM_TYPES`].
+    SqlParam,
+    /// `{{…}}` interpolation and `Log.*With` attributes: exactly
+    /// [`INTERPOLABLE_TYPES`].
+    Interpolable,
+}
+
+/// Where a duty was imposed: the kernel that owes it and the reference to
+/// that kernel in the source.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DutyOrigin {
+    /// The kernel as the user reads it (`Dict.map`).
+    pub kernel_label: Box<str>,
+    /// The reference to the kernel.
+    pub at: Span,
 }
 
 /// The argument count of a call against the count its function takes.
@@ -1286,18 +1307,16 @@ pub enum TypeError {
         expected: usize,
         found: usize,
     },
-    /// A generic binding whose body constrains a type variable to a Ipê
-    /// super-type — `Number` (`+ - *`) or `Comparable` (`< > <= >=`) — is used
-    /// at a type that does not provide those operations (`double True`, where
-    /// `double` needs `Number`), or at a type that stays non-concrete (the
-    /// obligation cannot be propagated across the use). `class` names the
-    /// super-type; `found` is the offending type. A `class` equal to
-    /// [`HOF_KERNEL_RESULT_CLASS`] renders through a tailored sentence — the
-    /// generic "`X` is not a `<class>` type" template reads as a confusing
-    /// double negative for that internal arity obligation; a `class` equal to
-    /// [`INTERPOLABLE_CLASS`] renders a sentence naming the accepted scalars
-    /// and the conversion to apply. [IPE-T0014]
-    SuperTypeUnsatisfied { class: Box<str>, found: Box<TyDoc> },
+    /// A value meets a type variable that owes a duty its type does not
+    /// fulfil: `double True`, where `double` adds; a record bound as a SQL
+    /// parameter; a callback returning a function to a higher-order kernel.
+    /// `owed` is the unmet duty, `found` the offending type, `origin` the
+    /// kernel that imposed the duty when one did. [IPE-T0014]
+    SuperTypeUnsatisfied {
+        owed: Owed,
+        found: Box<TyDoc>,
+        origin: Option<DutyOrigin>,
+    },
     /// A **parameter** pattern (lambda param, function-def head, or `let`
     /// binder) is **refutable** — it can fail to match some value of its type
     /// (`\(Just x) ->`, `\1 ->`, `\[a] ->`, `f (Just x) =`). A binding position

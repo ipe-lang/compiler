@@ -150,7 +150,7 @@ fn sort_by_forwarder_record_key_is_ipe_t0014() {
         "sort_by_wrapper_record_gate",
         "m4e_sort_by_wrapper_record_gate_emit",
         ipe_diagnostics::IPE_T0014,
-        "{ name : String } is not a Comparable",
+        "`{ name : String }` is not a `comparable` type",
     );
 }
 
@@ -162,7 +162,7 @@ fn sort_by_forwarder_string_key_is_ipe_t0014() {
         "sort_by_wrapper_string_gate",
         "m4e_sort_by_wrapper_string_gate_emit",
         ipe_diagnostics::IPE_T0014,
-        "String is not a Comparable",
+        "`String` is not a `comparable` type",
     );
 }
 
@@ -175,7 +175,7 @@ fn member_function_record_is_ipe_t0014() {
         "member_fn_record_gate",
         "m4e_member_fn_record_gate_emit",
         ipe_diagnostics::IPE_T0014,
-        "{ name : String, run : Int -> Int } is not a Equatable",
+        "`{ name : String, run : Int -> Int }` is not an `equatable` type",
     );
 }
 
@@ -188,7 +188,7 @@ fn unique_forwarder_function_record_is_ipe_t0014() {
         "unique_fn_record_gate",
         "m4e_unique_fn_record_gate_emit",
         ipe_diagnostics::IPE_T0014,
-        "{ name : String, run : Int -> Int } is not a Equatable",
+        "`{ name : String, run : Int -> Int }` is not an `equatable` type",
     );
 }
 
