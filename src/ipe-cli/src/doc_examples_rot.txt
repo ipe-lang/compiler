@@ -89,12 +89,12 @@ Ipe.Db.Store:806
 Ipe.Debug:20
 Ipe.Debug:39
 Ipe.Debug:8
-Ipe.Decimal:221
-Ipe.Decimal:239
+Ipe.Decimal:105
+Ipe.Decimal:235
+Ipe.Decimal:253
 Ipe.Decimal:42
-Ipe.Decimal:61
-Ipe.Decimal:73
-Ipe.Decimal:91
+Ipe.Decimal:67
+Ipe.Decimal:79
 Ipe.Dict:16
 Ipe.Email:23
 Ipe.File:111

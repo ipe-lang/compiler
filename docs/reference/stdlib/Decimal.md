@@ -51,7 +51,12 @@ Parse a decimal from its string representation.
 fromInt : Int -> Decimal
 ```
 
-Convert an `Int` to a `Decimal` exactly.
+Convert an `Int` to a `Decimal` exactly, with no precision loss — unlike
+the prelude's `toFloat`, which rounds past `2^53`.
+
+```ipe
+Decimal.toString (Decimal.fromInt 7) --> "7"
+```
 
 ## `fromFloat`
 
@@ -97,7 +102,14 @@ Render with a fixed number of decimal places.
 toFloat : Decimal -> Float
 ```
 
-Convert to the nearest `Float`.  May lose precision.
+Convert to the nearest `Float`. May lose precision past `2^53`, the same
+boundary as the prelude's `toFloat : Int -> Float`. Going from an `Int`
+straight to a `Float` needs only that `toFloat`; reach for `Decimal` first
+when the arithmetic in between must stay exact.
+
+```ipe
+Decimal.toFloat (Decimal.fromInt 7) --> 7.0
+```
 
 ## `toInt`
 

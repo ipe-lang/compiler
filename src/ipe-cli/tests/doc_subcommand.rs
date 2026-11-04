@@ -906,3 +906,90 @@ fn help_doc_examples_all_resolve() -> io::Result<()> {
     }
     Ok(())
 }
+
+// ── toFloat discoverability (basics-to-float-kernel-spec.md §3, Slice B) ──
+
+/// The prelude's `toFloat` is reachable both as its own member page (the
+/// `Int`/`2^53` doc-comment and its checked example) and, for the full
+/// `Int -> Float` signature, from `Basics`'s module page — the two surfaces
+/// `ipe doc` splits a symbol lookup across (comment prose vs. signature
+/// listing).
+#[test]
+fn doc_basics_to_float_member_page_renders_int_to_float() -> io::Result<()> {
+    let dir = fresh_dir("basics_to_float_member");
+    fs::create_dir_all(&dir)?;
+
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "Basics.toFloat", "--plain"]);
+    assert!(
+        ok,
+        "`ipe doc Basics.toFloat` must resolve:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("2^53"),
+        "the member page states the exactness boundary:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("toFloat 3 --> 3.0"),
+        "the member page's checked example shows an `Int` becoming a `Float`:\n{stdout}"
+    );
+
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "Basics", "--plain"]);
+    assert!(ok, "`ipe doc Basics` must resolve:\n{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("toFloat : Int -> Float"),
+        "the module page lists `toFloat`'s full signature:\n{stdout}"
+    );
+    Ok(())
+}
+
+/// A bare `toFloat` is ambiguous across three modules and must resolve to
+/// none of them alone, listing every home as a ready-to-run key.
+///
+/// Guards 12a: deleting the qualified-only keying in `ipe-docs/src/lib.rs`
+/// (inserting a bare `toFloat` key) would resolve this query to a single
+/// entry, and this test would go red.
+#[test]
+fn doc_bare_to_float_lists_every_home() -> io::Result<()> {
+    let dir = fresh_dir("bare_to_float");
+    fs::create_dir_all(&dir)?;
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "toFloat", "--plain"]);
+    assert!(!ok, "a bare `toFloat` must not resolve to a single home");
+    assert!(stdout.is_empty(), "{stdout}");
+    for home in [
+        "Ipe.Basics.toFloat",
+        "Ipe.String.toFloat",
+        "Ipe.Decimal.toFloat",
+    ] {
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.starts_with(&format!("{home}\t"))),
+            "the ranked miss list must name {home}:\n{stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// `Ipe.Math`'s module page names `toFloat` for the `Int -> Float` direction
+/// in its header prose, and never points a reader at `Decimal.fromInt` —
+/// Decimal stays the exact-arithmetic route, not the conversion route.
+#[test]
+fn doc_math_header_names_to_float() -> io::Result<()> {
+    let dir = fresh_dir("math_header_to_float");
+    fs::create_dir_all(&dir)?;
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "Math"]);
+    assert!(ok, "`ipe doc Math` must resolve:\n{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("toFloat"),
+        "the header names `toFloat` for the reverse direction:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("2^53"),
+        "the header states the same exactness boundary as the prelude:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Decimal.fromInt"),
+        "the header must not point to the old Decimal route:\n{stdout}"
+    );
+    Ok(())
+}

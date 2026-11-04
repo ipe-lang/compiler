@@ -82,9 +82,9 @@ Two tiers are ambient — in scope with no `import`; a third requires an explici
 - **Tier A — `Ipe.Basics`.** The grammar-level surface, unqualified in every
   module: the arithmetic/comparison/function operators (`+ - * / //`,
   `== /= < > <= >=`, `<| |> << >>`, `++`), the base types
-  `Int`/`Float`/`Char`/`String`, `Bool` with `not`/`&&`/`||`/`xor`, `Order` with
-  `LT`/`EQ`/`GT`, `Never`/`never`, `identity`/`always`, and the numeric helpers
-  `min`/`max`/`abs`/`clamp`/`negate`/`compare`.
+  `Int`/`Float`/`Char`/`String`, `Bool` with `not`/`&&`/`||`, `Order` with
+  `LT`/`EQ`/`GT`, `identity`/`always`, and the numeric helpers
+  `min`/`max`/`abs`/`clamp`/`negate`/`compare`/`toFloat`.
 - **Tier B — core type vocabulary.** Ambient with normal local shadowing: the
   types `List`, `Maybe`, `Result` and their constructors `Just`/`Nothing`,
   `Ok`/`Err`, plus `True`/`False`. A local `map` binds without a diagnostic.
@@ -364,14 +364,14 @@ app code.
 
 | Module | Path | Key functions |
 |---|---|---|
-| `Basics` | `Ipe.Basics` (Tier A — ambient, no import; see Auto-import) | identity, always, not, modBy, clamp, fst, snd, compare, negate, abs, sqrt, min, max |
+| `Basics` | `Ipe.Basics` (Tier A — ambient, no import; see Auto-import) | identity, always, not, modBy, clamp, fst, snd, compare, negate, abs, sqrt, `toFloat`, min, max |
 | `String` | `Ipe.String` | length, reverse, append, split, join, contains/containsIn, startsWith/startsWithIn, endsWith/endsWithIn (haystack-first In-suffixed), toInt, fromInt, toFloat, fromFloat, toUpper, toLower, trim/trimStart/trimEnd, replace, slice, dropLeft, dropRight (Elm-shaped rune-based), isEmpty, fromBool, fromChar, toList, fromList, repeat, padLeft, padRight, casefold, equalFold, isEmail, isUrl, words, lines, concat |
 | `List` | `Ipe.List` | map, filter, foldl, foldr, length, head, tail, take, drop, append, concat, concatMap, reverse, member, any, all, range, zip, find, isEmpty, indexedMap, cons + reverseHelp/indexedMapHelp |
 | `Dict` | `Ipe.Dict` (kernel) | empty, insert, get, remove, member, keys, values, toList, fromList, map, foldl, union |
 | `Set` | `Ipe.Set` (kernel) | empty, insert, remove, member, union, diff, intersect, fromList, toList, size |
 | `Maybe` | `Ipe.Maybe` | withDefault, map, andThen, map2-5, andMap, combine, isJust, isNothing |
 | `Result` | `Ipe.Result` | withDefault, map, andThen, mapError, map2-5, andMap, combine |
-| `Math` | `Ipe.Math` | abs, min, max; sqrt, pow, cbrt, hypot; exp, exp2, log, log2, log10; floor, ceil, round, trunc; sin, cos, tan; asin, acos, atan, atan2; sinh, cosh, tanh, asinh, acosh, atanh; mod, remainder; pi, e, phi, sqrt2, inf, nan |
+| `Math` | `Ipe.Math` | abs, min, max; sqrt, pow, cbrt, hypot; exp, exp2, log, log2, log10; floor, ceil, round, trunc (Float -> Int; toFloat for the reverse direction lives in Basics); sin, cos, tan; asin, acos, atan, atan2; sinh, cosh, tanh, asinh, acosh, atanh; mod, remainder; pi, e, phi, sqrt2, inf, nan |
 | `Regex` | `Ipe.Regex` | match, find, findAll, replace, split |
 | `Char` | `Ipe.Char` | isAlpha, isDigit, isLower, isUpper, toUpper, toLower |
 | `Path` | `Ipe.Path` | base, dir, ext, isAbsolute, under (join a relative child beneath a root; never concatenate path strings), absolute. `under`/`absolute` are lexical: they never follow or forbid a symlink, so a link below the root can still reach outside it |
