@@ -1681,6 +1681,36 @@ pub enum AppShape {
     Cli,
 }
 
+/// A delivery shape that serves no browser page.
+///
+/// It cannot carry a browser custom element. Mirrors the canon delivery shapes
+/// other than Web; canon maps its shape onto this through a total `match`.
+/// Drives the wording rendered for [`LowerError::UiWidgetInNonWebShape`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum NonWebShape {
+    /// `main : Task ()`: a native binary that renders nothing.
+    Script,
+    /// `main = Tui.tea …`: a full-screen terminal app.
+    Tui,
+    /// `main = Cli.tea …`: a line-oriented terminal app.
+    Cli,
+    /// `main = Worker.tea …`: a view-less TEA loop.
+    Worker,
+}
+
+impl NonWebShape {
+    /// The shape as the user wrote it, for a diagnostic sentence.
+    #[must_use]
+    pub const fn phrase(self) -> &'static str {
+        match self {
+            Self::Script => "a script (`main : Task ()`)",
+            Self::Tui => "a terminal app (`Tui.tea`)",
+            Self::Cli => "a terminal app (`Cli.tea`)",
+            Self::Worker => "a worker (`Worker.tea`)",
+        }
+    }
+}
+
 /// The category of the non-admissible payload found inside a Model.
 ///
 /// The leaf whose rendered Rust type lacks the trait the app entry requires. The
@@ -1868,17 +1898,17 @@ pub enum LowerError {
     /// so a `Cells` grid has no string denotation. Rejected at ipe time.
     /// [IPE-L0153]
     UiCellsInCliShape(AppShape),
-    /// `CustomElement.node` (a server-driven custom element) appears outside a browser
-    /// shape. Its up-event handler is carried over the seal codec, which is
-    /// present only when the `json` runtime feature is on — and only the browser
-    /// shape (`Web.tea`) forces it. Under `Terminal` / `Program`
-    /// the widget has no transport for its handler, so the node would be inert
-    /// (a widget with no seam). The SECURITY-tier fail-closed gate converts that
-    /// would-be dead element into an ipe-time refusal rather than emit a crate
-    /// whose non-`json` runtime fallback leaves the up-event type parameter
-    /// unconstrained (rustc E0282). Admissible only under `Web` / `WebView`.
+    /// A `CustomElement.fromFile` handle is constructed in a program that serves
+    /// no browser page: it links no `web` runtime module (no `Web.tea` entry and
+    /// no `Web.embed` app). The handle's JS ships with the crate whether or not
+    /// a view mounts it, and only the `web` runtime module serves it, so the
+    /// refusal falls on every constructor the program links, at the
+    /// constructor's span.
     /// [IPE-L0147]
-    UiWidgetInNonWebShape,
+    UiWidgetInNonWebShape {
+        /// The entry's shape, named in the message.
+        shape: NonWebShape,
+    },
     /// A `Task`-typed value was discarded as `let _ = <task>` inside a
     /// non-`Task` context (a function whose return type is not itself a
     /// `Task`). Emitting this discard would run the effect through an implicit
@@ -3064,7 +3094,7 @@ const fn lower_code(msg: &LowerError) -> Code {
         LowerError::DevOnlyKernelInProduction { .. } => IPE_L0140,
         LowerError::UiCellsInWebShape(_) => IPE_L0132,
         LowerError::UiCellsInCliShape(_) => IPE_L0153,
-        LowerError::UiWidgetInNonWebShape => IPE_L0147,
+        LowerError::UiWidgetInNonWebShape { .. } => IPE_L0147,
         LowerError::LawlessEffectDiscard => IPE_L0141,
         LowerError::RoutedAppMissingPageField { .. } => IPE_L0124,
         LowerError::NonEntryMain { .. } => IPE_L0136,
@@ -3656,12 +3686,16 @@ fn lower_help(msg: &LowerError) -> Vec<HelpLine> {
              format the content as a `String` instead."
                 .into(),
         )],
-        LowerError::UiWidgetInNonWebShape => vec![HelpLine::Note(
-            "`CustomElement.node` mounts a server-driven custom element whose up-events ride the \
-             seal codec, which exists only in a browser build. Use it only under \
-             `Web.tea`. In a `Terminal` app, build the view from native \
-             `Ipe.Ui` elements (`Ui.text`, `Ui.column`, inputs) instead."
-                .into(),
+        LowerError::UiWidgetInNonWebShape { shape } => vec![HelpLine::Note(
+            format!(
+                "This program is {}, which serves no browser page. A `CustomElement` \
+             handle ships its JS whether or not a view mounts it, so construct it \
+             only in a program that serves a web app (a `Web.tea` entry, or a \
+             server that mounts a `Web.embed` app), or build the view from native \
+             `Ipe.Ui` elements (`Ui.text`, `Ui.column`, inputs) instead.",
+                shape.phrase()
+            )
+            .into(),
         )],
         LowerError::LawlessEffectDiscard => lawless_effect_discard_help(),
         LowerError::RoutedAppMissingPageField { route_count } => {

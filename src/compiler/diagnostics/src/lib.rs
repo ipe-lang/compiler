@@ -27,10 +27,10 @@ pub use diagnostic::{
     Feature, FfiError, GenericAppEntryReach, HOF_KERNEL_RESULT_CLASS, HazardRefusal, HeaderDefect,
     HelpLine, Hint, INTERPOLABLE_CLASS, INTERPOLABLE_TYPES, IfDefect, ImportedAs, InterceptContext,
     LetDefect, LowerError, MainRetName, ModelLeaf, ModulePlacementReason, ModulePlacementRejection,
-    MountPrefixFault, NUMBER_TYPES, NameError, ParseError, RoutePatternDefect, RustNameFoldKind,
-    SandboxError, SealRejection, SortedNames, SpanRole, StdlibReach, StoreEqAccessorDefect,
-    StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc, TypeClass, TypeDeclDefect,
-    TypeError, TypeSizeOrigin, WildcardDependence,
+    MountPrefixFault, NUMBER_TYPES, NameError, NonWebShape, ParseError, RoutePatternDefect,
+    RustNameFoldKind, SandboxError, SealRejection, SortedNames, SpanRole, StdlibReach,
+    StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc, TypeClass,
+    TypeDeclDefect, TypeError, TypeSizeOrigin, WildcardDependence,
 };
 pub use render::{DOC_HINT_CMD, plain_message, render, render_json, render_ty};
 pub use span::{Located, Span};
