@@ -2981,8 +2981,8 @@ pub fn emit_ui_plan(
     }
 
     // The widget-placement front gate (IPE-L0147, run inside `lower_program`)
-    // refuses every `CustomElement.fromFile` constructor outside a Web entry, and
-    // a node needs a handle only that constructor makes. A node reaching emit in
+    // refuses every `CustomElement.fromFile` constructor in a program that links
+    // no web runtime, and a node needs a handle only that constructor makes. A node reaching emit in
     // a build that links no browser runtime means the front gate and the
     // backend's `uses_web` disagree: a compiler defect, never a user error.
     if plan.guard == Guard::RejectInNonWebShape && !(ctx.uses_web || ctx.uses_webview) {
