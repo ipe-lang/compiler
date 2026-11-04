@@ -19,8 +19,8 @@
 //!    oracle is the cached output (`oracle_divergence = false`) and Ipê must
 //!    match it byte-for-byte: `Math.min` / `Math.max` on `Int` (Ipê's `AsInt`
 //!    path gives the correct result for integers), `abs`, `sqrt` (incl. the
-//!    `sqrt (-1.0)` NaN domain edge), `pow`, `round` (half-away-from-zero, both
-//!    signs), `floor` / `ceil` / `trunc` on a negative (the three round
+//!    `sqrt (-1.0)` NaN domain edge), the prelude `toFloat`, `pow`, `round`
+//!    (half-away-from-zero, both signs), `floor` / `ceil` / `trunc` on a negative (the three round
 //!    differently), `mod` vs `remainder`, and the `pi` / `nan` constants.
 //!
 //! Every test is gated on `IPE_E2E=1`; without it the test returns early. Run:
@@ -130,6 +130,16 @@ fn math_sqrt() {
 #[test]
 fn math_sqrt_negative_is_nan() {
     assert_runs_and_matches_oracle("math_sqrt_neg");
+}
+
+// ── toFloat — Int to Float, nearest-even ─────────────────────────────────────
+
+/// The prelude `toFloat`: exact up to `2^53`, ties to even past it, the least
+/// and greatest `Int` at `-2^63` / `2^63`, and a module's own top-level
+/// `toFloat` outranking the prelude's.
+#[test]
+fn basics_to_float() {
+    assert_runs_and_matches_oracle("basics_to_float");
 }
 
 // ── pow ──────────────────────────────────────────────────────────────────────

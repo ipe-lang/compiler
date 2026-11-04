@@ -669,6 +669,7 @@ mod registry_phase_c_tests {
             K::BasicsNegate,
             K::BasicsAbs,
             K::BasicsSqrt,
+            K::BasicsToFloat,
             K::BasicsMin,
             K::BasicsMax,
             K::BasicsCompare,

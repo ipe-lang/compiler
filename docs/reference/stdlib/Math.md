@@ -21,6 +21,11 @@ through `Ipe.Decimal`, which holds every `Int` exactly:
 `Decimal.toFloat (Decimal.fromInt n)` yields the nearest `Float`, exact
 whenever `abs n <= 2^53`.
 
+`Int` is 64-bit two's-complement; `abs` of the least `Int` has no positive
+counterpart and ends in a typed error the same way `floor`/`ceil`/`round`/
+`trunc` do for a non-finite or out-of-range `Float`. See the `arithmetic`
+topic guide for the full contract.
+
 ## `abs`
 
 ```ipe
@@ -34,6 +39,9 @@ Math.abs (-7) --> 7
 Math.abs 7 --> 7
 Math.abs 0 --> 0
 ```
+
+The least `Int` has no positive counterpart: `Math.abs minInt` ends in a
+typed `InvalidInput` error, never `minInt` unchanged.
 
 ## `min`
 

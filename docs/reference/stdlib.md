@@ -202,6 +202,7 @@ Ipe.Basics — the implicit prelude, imported into every module.
 | `negate` | `negate x` — arithmetic negation. |
 | `abs` | `abs x` — absolute value. |
 | `sqrt` | `sqrt x` — the non-negative square root of `x`. |
+| `toFloat` | `toFloat n` — the nearest `Float` to the `Int` `n`. |
 | `min` | `min a b` — the smaller of two comparable values. |
 | `max` | `max a b` — the larger of two comparable values. |
 | `compare` | `compare a b` — the `Order` relation between two comparable values. |

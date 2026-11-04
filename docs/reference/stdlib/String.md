@@ -184,9 +184,9 @@ toFloat : String -> Maybe Float
 `toFloat s` — parse `s` as a floating-point number; `Nothing` if not valid.
 
 ```ipe
-toFloat "3.14" --> Just 3.14
-toFloat "-0.5" --> Just -0.5
-toFloat "abc" --> Nothing
+String.toFloat "3.14" --> Just 3.14
+String.toFloat "-0.5" --> Just -0.5
+String.toFloat "abc" --> Nothing
 ```
 
 ## `toUpper`

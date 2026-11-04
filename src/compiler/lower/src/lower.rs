@@ -28430,6 +28430,7 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::BasicsNegate
                 | KernelFn::BasicsAbs
                 | KernelFn::BasicsSqrt
+                | KernelFn::BasicsToFloat
                 // ── end Basics numerics ──────────────────────────────
                 | KernelFn::ResultOkDefault
                 // ── Result/Maybe combine — arity 1 ─────────────────────
@@ -30862,6 +30863,7 @@ impl<'a> Lowerer<'a> {
                     ("Basics", "negate") => Ok(Callee::Kernel(KernelFn::BasicsNegate)),
                     ("Basics", "abs") => Ok(Callee::Kernel(KernelFn::BasicsAbs)),
                     ("Basics", "sqrt") => Ok(Callee::Kernel(KernelFn::BasicsSqrt)),
+                    ("Basics", "toFloat") => Ok(Callee::Kernel(KernelFn::BasicsToFloat)),
                     ("Basics", "min") => Ok(Callee::Kernel(KernelFn::BasicsMin)),
                     ("Basics", "max") => Ok(Callee::Kernel(KernelFn::BasicsMax)),
                     // `compare : comparable -> comparable -> Order`

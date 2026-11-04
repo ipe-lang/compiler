@@ -4,7 +4,7 @@ title: "errors: typed error handling with Result"
 summary: "How Ipê models failure with Result and Task, and why Result Error beats Result String."
 idiom: true
 aliases: ["error-handling", "result", "result-error", "failure"]
-see_also: ["effects", "main", "state"]
+see_also: ["effects", "main", "state", "arithmetic"]
 ---
 
 # `errors` — typed error handling with Result
