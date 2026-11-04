@@ -82,7 +82,7 @@ fn a_session_is_recorded_through_system_exit_and_debug_todo() {
         "{}",
         exe.as_ref().err().map_or("", String::as_str)
     );
-    let Ok(exe) = exe else { return };
+    let exe = exe.expect("`exe` must succeed");
 
     let logs = crate::support::scratch_root()
         .join(format!("ipe_session_record_on_exit_{}", std::process::id()));
@@ -93,7 +93,7 @@ fn a_session_is_recorded_through_system_exit_and_debug_todo() {
     let typed = logs.join("quit.ipemsgs");
     let quit = run_with(&exe, ipe_runtime_rust::RECORD_ENV, &trace, b"hello\nquit\n");
     assert!(quit.is_some(), "the recording run did not start");
-    let Some((code, stdout)) = quit else { return };
+    let (code, stdout) = quit.expect("the recording run must start");
     assert_eq!(code, Some(0), "a `System.exit 0` run exits 0");
     assert_eq!(
         String::from_utf8_lossy(&stdout),
