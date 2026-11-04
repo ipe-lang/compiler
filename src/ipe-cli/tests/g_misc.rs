@@ -102,6 +102,8 @@ mod golden_phantom_binder_reuse;
 mod golden_region_seal;
 #[path = "g_misc/golden_secret.rs"]
 mod golden_secret;
+#[path = "g_misc/golden_session_record_on_exit.rs"]
+mod golden_session_record_on_exit;
 #[path = "g_misc/golden_session_replay_seal.rs"]
 mod golden_session_replay_seal;
 #[path = "g_misc/golden_show_policy.rs"]

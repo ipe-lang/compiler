@@ -470,29 +470,34 @@ impl<Msg: Clone, Model: Clone, K> RecordBuffer<Msg, Model, K> {
     ///
     /// Each line pairs the step's redacted message label (the message rendered
     /// through `IpeStringify::ipe_show`, as [`RecordBuffer::labels`] does) with
-    /// the reconstructed post-step model (via [`RecordBuffer::inspect_model`]).
-    /// Both halves render through
+    /// the model recorded after that step. Both halves render through
     /// `IpeStringify::ipe_show`, so `Secret`-bearing values stay redacted and no
-    /// ANSI/control byte can appear. This is the shape-neutral dump a caller can
-    /// print or persist to replay a session; it never mutates the log and fires
-    /// no `Cmd`.
+    /// ANSI/control byte can appear. It reads only the recorded values: no
+    /// `update` runs and no `Cmd` fires, so it is safe on the process exit path.
     #[cfg(feature = "debugger")]
-    pub fn replay_log<F>(&self, update: &F) -> Vec<String>
+    pub fn replay_log(&self) -> Vec<String>
     where
-        F: Fn(Msg, Model) -> (Model, IpeCmd<Msg>),
         Msg: crate::stringify::IpeStringify,
         Model: crate::stringify::IpeStringify,
     {
-        (0..self.log.len())
-            .filter_map(|n| {
-                let msg_label = self
-                    .log
-                    .get(n)
-                    .map(|s| crate::stringify::IpeStringify::ipe_show(s.msg()))?;
-                let model = self.inspect_model(n, update)?;
-                Some(format!("{msg_label} => {model}"))
-            })
-            .collect()
+        self.replay_lines().collect()
+    }
+
+    /// The lines of [`RecordBuffer::replay_log`], each rendered only when
+    /// read, from either end.
+    #[cfg(feature = "debugger")]
+    pub fn replay_lines(&self) -> impl DoubleEndedIterator<Item = String> + ExactSizeIterator
+    where
+        Msg: crate::stringify::IpeStringify,
+        Model: crate::stringify::IpeStringify,
+    {
+        self.log.iter().map(|step| {
+            format!(
+                "{} => {}",
+                crate::stringify::IpeStringify::ipe_show(step.msg()),
+                crate::stringify::IpeStringify::ipe_show(step.model_after())
+            )
+        })
     }
 }
 
@@ -603,8 +608,8 @@ impl<Msg: Clone, Model: Clone> History<Msg, Model> {
     }
 
     /// The portable record/replay log — one plain `"<msg> => <model>"` line per
-    /// retained step. Delegates to [`RecordBuffer::replay_log`] with the stored
-    /// `update` fn pointer.
+    /// retained step, from the recorded models. Delegates to
+    /// [`RecordBuffer::replay_log`].
     #[cfg(feature = "debugger")]
     #[must_use]
     pub fn replay_log(&self) -> Vec<String>
@@ -612,8 +617,7 @@ impl<Msg: Clone, Model: Clone> History<Msg, Model> {
         Msg: crate::stringify::IpeStringify,
         Model: crate::stringify::IpeStringify,
     {
-        let update = self.update;
-        self.inner.replay_log(&move |m, mdl| update(m, mdl))
+        self.inner.replay_log()
     }
 }
 
@@ -1479,7 +1483,7 @@ mod tests {
         assert_eq!(step0, "PModel { n = 2 }");
         assert_eq!(step1, "PModel { n = 7 }");
 
-        let log = buf.replay_log(&p_update);
+        let log = buf.replay_log();
         assert_eq!(log.len(), 2);
         assert_eq!(log[0], "Bump(2) => PModel { n = 2 }");
         assert_eq!(log[1], "Bump(5) => PModel { n = 7 }");

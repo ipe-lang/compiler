@@ -136,15 +136,16 @@ pub enum SameTerminal {
     Unknown,
 }
 
-/// Whether a `Cli.tea` run holds the exit hook that ends an open line on exit.
+/// Whether a `Cli.tea` run holds the line-close exit stage that ends an open
+/// line on exit.
 ///
 /// `System.exit` skips the loop's own close, so a line may stay open only
-/// when the hook that ends it on that path is registered.
+/// when the stage that ends it on that path is registered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExitClose {
-    /// The hook is registered: an exit ends an open line.
+    /// The stage is registered: an exit ends an open line.
     Registered,
-    /// Another driver holds the one exit-hook slot, so an exit could leave a
+    /// Another driver holds the line-close stage, so an exit could leave a
     /// line open.
     Unavailable,
 }
@@ -441,7 +442,7 @@ mod line_tests {
     }
 
     #[test]
-    fn an_unheld_exit_hook_ends_every_frame() {
+    fn an_unheld_line_close_stage_ends_every_frame() {
         let facts = LineFacts {
             exit_close: ExitClose::Unavailable,
             ..interactive()
@@ -450,7 +451,7 @@ mod line_tests {
     }
 
     // A target that reads no echo or device fact (off unix) keeps no line
-    // open, even with both fds terminals and the exit hook held.
+    // open, even with both fds terminals and the line-close stage held.
     #[test]
     fn unprobed_echo_and_device_end_every_frame() {
         let (stdin_echo, same_terminal) = UNPROBED_ECHO_AND_DEVICE;

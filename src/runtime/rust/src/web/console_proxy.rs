@@ -572,7 +572,7 @@ mod tests {
             .expect("the store sits in its scratch directory")
             .to_path_buf();
         assert!(dir.is_dir());
-        crate::system::run_pre_exit_stages();
+        crate::system::pre_exit::run_fixed_stages();
         assert!(
             !dir.exists(),
             "the pre-exit stages leave the console store directory behind"
