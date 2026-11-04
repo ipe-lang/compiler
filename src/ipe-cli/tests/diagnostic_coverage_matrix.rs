@@ -158,11 +158,6 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "refusal-tested",
-        "IPE-L0147",
-        "CustomElement.node browser-only gate not yet reached by any constant assertion or wire literal",
-    ),
-    (
-        "refusal-tested",
         "IPE-L0153",
         "Ui.cells Cli shape gate not yet reached by any constant assertion or wire literal",
     ),

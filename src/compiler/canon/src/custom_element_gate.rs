@@ -11,15 +11,25 @@
 //! fail-closed IPE-N0044 (Security #5: a widget cannot register against a file
 //! that is not there).
 //!
+//! The same walk judges placement: a program that links no `web` runtime
+//! refuses every constructor it links with IPE-L0147
+//! ([`check_widget_placement`]). The judged set is the one
+//! [`collect_widget_files`] returns, the pre-elimination linked set, because
+//! the build ships a registration for every linked constructor whether or not
+//! the entry reaches it. The `web` runtime fact is the lowered program's own
+//! (the one the backend reads), never the entry's shape: a script that mounts a
+//! `Web.embed` app serves a browser page too.
+//!
 //! By construction a `CustomElementCtor` node appears only as the whole body of a
 //! `CustomElement`-annotated binding (`resolve::detect_custom_element_constructor`
 //! is the sole mint site), but this walk is exhaustive over the expression tree
 //! anyway — defence in depth, so a future node placement cannot slip past the
 //! existence check.
 
-use ipe_diagnostics::Span;
+use ipe_diagnostics::{DResult, Diagnostic, LowerError, NonWebShape, Span};
 
 use crate::ast::{CaseBranch, Def, Expr, Expr_, LetBinding, Module};
+use crate::shape_runtime::Shape;
 
 /// One `CustomElement.fromFile "<js-path>"` constructor reached in a linked program: its
 /// CLEANED, in-project-checked relative path and the span to blame if the file
@@ -44,6 +54,66 @@ pub fn collect_widget_files(module: &Module) -> Vec<WidgetFile> {
         }
     }
     out
+}
+
+/// Whether the lowered program links the `web` runtime module, the one that
+/// serves a custom element's JS.
+///
+/// Read off the lowered program's own per-module web fact, so the gate and the
+/// backend that picks the runtime features judge the same thing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WebRuntime {
+    /// Some lowered module reaches a `web` kernel (`Web.tea`, `Web.embed`, ...).
+    Linked,
+    /// No lowered module reaches a `web` kernel.
+    Absent,
+}
+
+/// Refuse every `CustomElement.fromFile` constructor in `linked` when the
+/// program links no `web` runtime.
+///
+/// A `CustomElement.node` needs a handle and `fromFile` is the only way to make
+/// one, so refusing every constructor also refuses every mount. The first
+/// constructor in source order is the one reported, naming the entry's shape.
+///
+/// # Errors
+/// IPE-L0147 at the first constructor's span when `web` is
+/// [`WebRuntime::Absent`] and the entry is not [`Shape::Web`];
+/// [`Diagnostic::CompilerBug`] when a [`Shape::Web`] entry links no `web`
+/// runtime yet holds a constructor, since every Web entry kernel is a `web`
+/// kernel.
+pub fn check_widget_placement(linked: &Module, entry_shape: Shape, web: WebRuntime) -> DResult<()> {
+    match web {
+        WebRuntime::Linked => return Ok(()),
+        WebRuntime::Absent => {}
+    }
+    let Some(widget) = collect_widget_files(linked)
+        .into_iter()
+        .min_by_key(|widget| (widget.span.lo, widget.span.hi))
+    else {
+        return Ok(());
+    };
+    match non_web_shape(entry_shape) {
+        Some(shape) => Err(Diagnostic::Lower {
+            span: widget.span,
+            msg: LowerError::UiWidgetInNonWebShape { shape },
+        }),
+        None => Err(Diagnostic::CompilerBug {
+            where_: "ipe_canon::custom_element_gate::check_widget_placement",
+            detail: "a `Web.tea` entry lowered to a program that links no `web` runtime".to_owned(),
+        }),
+    }
+}
+
+/// The browser-less shape `shape` names, or `None` for the Web shape.
+const fn non_web_shape(shape: Shape) -> Option<NonWebShape> {
+    match shape {
+        Shape::Script => Some(NonWebShape::Script),
+        Shape::Tui => Some(NonWebShape::Tui),
+        Shape::Cli => Some(NonWebShape::Cli),
+        Shape::Worker => Some(NonWebShape::Worker),
+        Shape::Web => None,
+    }
 }
 
 fn walk(e: &Expr, out: &mut Vec<WidgetFile>) {
