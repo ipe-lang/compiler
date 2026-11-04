@@ -9,7 +9,8 @@ Ipe.Basics — the implicit prelude, imported into every module.
 Polymorphic members with ordering or numeric obligations (`clamp`, `min`,
 `max`, `negate`, `abs`, `compare`) carry the bound implicitly — the
 type-checker's `Comparable`/`Number` obligation rejects a function, record,
-list, or tuple argument. `sqrt` is monomorphically `Float -> Float`. The
+list, or tuple argument. `sqrt` is monomorphically `Float -> Float`, and
+`toFloat` is monomorphically `Int -> Float`. The
 builtin `Order` is exposed so `Basics.Order` names it.
 
 `Int` is 64-bit. An `Int` result outside that range — from `+`, `-`, `*`,
@@ -176,13 +177,33 @@ sqrt : Float -> Float
 
 `sqrt x` — the non-negative square root of `x`.
 
-Returns `NaN` for negative inputs (follows IEEE 754). For integer square
-roots, convert with `round`, `floor`, or `ceil`.
+Returns `NaN` for negative inputs (follows IEEE 754). To take the root of
+an `Int`, convert it with `toFloat` first; convert the result back with
+`round`, `floor`, or `ceil`.
 
 ```ipe
 sqrt 9.0 --> 3.0
 sqrt 2.0 --> 1.4142135623730951
 sqrt 0.0 --> 0.0
+```
+
+## `toFloat`
+
+```ipe
+toFloat : Int -> Float
+```
+
+`toFloat n` — the nearest `Float` to the `Int` `n`.
+
+The result is exact whenever `n` lies within `2^53` of zero
+(`9007199254740992`). Past that, `n` rounds to the nearest `Float`, and a
+tie rounds to the even neighbour. The greatest `Int`, `9223372036854775807`,
+becomes `2^63`, a `Float` no `Int` holds. The conversion never fails.
+
+```ipe
+toFloat 3 --> 3.0
+toFloat (-7) --> -7.0
+toFloat 9007199254740993 == 9007199254740992.0 --> True
 ```
 
 ## `min`

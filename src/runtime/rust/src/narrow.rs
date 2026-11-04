@@ -97,6 +97,18 @@ pub fn f64_trunc_to_i64(f: f64) -> Option<i64> {
     }
 }
 
+/// Rounds an Ipê `Int` to the nearest `f64`, ties to even.
+///
+/// Exact whenever `|n| <= 2^53`; past that the nearest representable float,
+/// so the result is never NaN and never infinite.
+#[must_use]
+// IEEE 754 round-to-nearest-even on every target: the precision loss past
+// 2^53 is the documented semantics of `toFloat`.
+#[allow(clippy::as_conversions, clippy::cast_precision_loss)] // IPE-RUST-AUDIT:ACCEPTED — the one i64 -> f64 rounding home
+pub fn int_to_f64(n: i64) -> f64 {
+    n as f64
+}
+
 /// The time since the Unix epoch on a host clock; zero for a clock before it.
 #[cfg(not(all(target_arch = "wasm32", feature = "wasm-client")))]
 fn since_epoch() -> std::time::Duration {
@@ -148,7 +160,7 @@ pub fn unix_secs() -> i64 {
 mod tests {
     use super::{
         I64_CEIL, I64_FLOOR, byte_saturating, count_from_int, count_to_int, count_to_int_u64,
-        f64_trunc_to_i64, saturating_count, u128_saturating_u64,
+        f64_trunc_to_i64, int_to_f64, saturating_count, u128_saturating_u64,
     };
 
     /// `2^32`: the first value a 32-bit narrowing wraps back to zero.
@@ -243,6 +255,20 @@ mod tests {
         assert_eq!(u128_saturating_u64(u128::from(u64::MAX) + 1), u64::MAX);
         assert_eq!(u128_saturating_u64(u128::MAX), u64::MAX);
         assert_eq!(u128_saturating_u64(9), 9);
+    }
+
+    #[test]
+    fn int_to_f64_is_exact_to_2_pow_53_then_rounds_to_even() {
+        const EXACT: i64 = 1 << 53;
+        assert_eq!(int_to_f64(0), 0.0);
+        assert_eq!(int_to_f64(-7), -7.0);
+        assert_eq!(int_to_f64(EXACT), 9_007_199_254_740_992.0);
+        assert_eq!(int_to_f64(-EXACT), -9_007_199_254_740_992.0);
+        // `2^53 + 1` is a tie between `2^53` and `2^53 + 2`; the even one wins.
+        assert_eq!(int_to_f64(EXACT + 1), 9_007_199_254_740_992.0);
+        assert_eq!(int_to_f64(EXACT + 3), 9_007_199_254_740_996.0);
+        assert_eq!(int_to_f64(i64::MAX), I64_CEIL);
+        assert_eq!(int_to_f64(i64::MIN), I64_FLOOR);
     }
 
     #[test]

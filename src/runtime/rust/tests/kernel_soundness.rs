@@ -68,6 +68,39 @@ proptest! {
     }
 }
 
+// ── int_to_float — IEEE 754 nearest-even, total ────────────────────────────
+
+/// Expected values are IEEE 754 binary64 facts spelled by hand: `2^53 + 1` and
+/// `2^53 + 3` are ties that round to the even neighbour, and `i64::MAX` rounds
+/// up to `2^63`, which no `Int` holds, so the way back is refused.
+#[test]
+#[allow(clippy::float_cmp)]
+fn int_to_float_is_nearest_even_and_total() {
+    use ipe_runtime_rust::basics::int_to_float;
+    assert_eq!(int_to_float(9_007_199_254_740_992), 9_007_199_254_740_992.0);
+    assert_eq!(
+        int_to_float(-9_007_199_254_740_992),
+        -9_007_199_254_740_992.0
+    );
+    assert_eq!(int_to_float(9_007_199_254_740_993), 9_007_199_254_740_992.0);
+    assert_eq!(int_to_float(9_007_199_254_740_995), 9_007_199_254_740_996.0);
+    assert_eq!(
+        int_to_float(-9_007_199_254_740_993),
+        -9_007_199_254_740_992.0
+    );
+    assert_eq!(int_to_float(i64::MAX), 9_223_372_036_854_775_808.0);
+    assert_eq!(int_to_float(i64::MIN), -9_223_372_036_854_775_808.0);
+    assert_eq!(int_to_float(1), 1.0);
+    assert_eq!(int_to_float(-1), -1.0);
+    assert_eq!(int_to_float(-7), -7.0);
+    assert_eq!(int_to_float(0), 0.0);
+    assert!(int_to_float(0).is_sign_positive());
+    assert_eq!(
+        ipe_runtime_rust::narrow::f64_trunc_to_i64(int_to_float(i64::MAX)),
+        None
+    );
+}
+
 // ── math — out-of-domain inputs are defined (NaN/inf) or a typed trip ──────
 
 /// Runs `math_round(x)`: its `Int`, or the typed trip it ended in (`None` for a

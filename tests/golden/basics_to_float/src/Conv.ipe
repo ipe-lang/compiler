@@ -1,0 +1,13 @@
+module Conv exposing (twice)
+
+-- A top-level `toFloat` outranks the prelude's inside its own module.
+
+
+toFloat : Int -> Int
+toFloat n =
+    n * 2
+
+
+twice : Int -> Int
+twice n =
+    toFloat n
