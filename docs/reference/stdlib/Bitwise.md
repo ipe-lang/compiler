@@ -11,7 +11,9 @@ kernel via the `Kernel.kernel` mechanism.
 
 `Int` is 64-bit two's-complement here, so `complement` and
 `shiftRightZfBy` cover the full 64-bit width rather than wrapping at
-Elm's 32 bits.  Shift amounts are taken modulo the word width.
+Elm's 32 bits.  A shift offset is masked to the low 6 bits (`offset & 63`)
+before it shifts, so every offset is total: no offset ever panics or
+shifts a bit out of range.  See the `arithmetic` topic guide.
 
 ## `and`
 
