@@ -1966,7 +1966,7 @@ mod tests {
 
     #[test]
     fn run_wasm_target_rejected() {
-        let refused = parse_run(&s(&["--target", "wasm"]));
+        let refused = parse_run(&s(&["--target", "wasm"])).map(|_| ());
         assert!(
             matches!(&refused, Err(CliError::Usage(message))
                 if message.as_str().contains("`ipe dev run web client`")),

@@ -217,14 +217,13 @@ impl Slots {
 
     /// Wait for a free slot and hold it until the returned [`Slot`] drops.
     fn acquire(&self) -> Slot<'_> {
-        let mut busy = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
-        while *busy >= self.cap.get() {
-            busy = self
-                .freed
-                .wait(busy)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
+        let held = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut busy = self
+            .freed
+            .wait_while(held, |busy| *busy >= self.cap.get())
+            .unwrap_or_else(PoisonError::into_inner);
         *busy = busy.saturating_add(1);
+        drop(busy);
         Slot { slots: self }
     }
 }
