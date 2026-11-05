@@ -44,7 +44,9 @@ use std::sync::Arc;
 
 use ipe_canon::ModuleExports;
 use ipe_canon::ast as canon;
-use ipe_diagnostics::{DResult, Diagnostic, LowerError, Span, TypeError, WildcardDependence};
+use ipe_diagnostics::{
+    DResult, Diagnostic, LowerError, Owed, Span, TypeClass, TypeError, WildcardDependence,
+};
 use ipe_intern::{Interner, Symbol};
 
 pub use constrain::{Builtins, KernelScheme, KernelSchemeTable, kernel_type_table};
@@ -1009,7 +1011,9 @@ fn infer_core(
                 };
                 if !concrete_super_ok(interner, bounds, &int_ty, &enum_embeds) {
                     return Err(InferError::sited(
-                        super_unsatisfied(interner, bounds, &int_ty, *span),
+                        super_unsatisfied(interner, bounds, &int_ty, *span, |b| {
+                            concrete_super_ok(interner, b, &int_ty, &enum_embeds)
+                        }),
                         home,
                     ));
                 }
@@ -1035,7 +1039,9 @@ fn infer_core(
                 };
                 if !concrete_super_ok(interner, bounds, &sqlvalue_ty, &enum_embeds) {
                     return Err(InferError::sited(
-                        super_unsatisfied(interner, bounds, &sqlvalue_ty, *span),
+                        super_unsatisfied(interner, bounds, &sqlvalue_ty, *span, |b| {
+                            concrete_super_ok(interner, b, &sqlvalue_ty, &enum_embeds)
+                        }),
                         home,
                     ));
                 }
@@ -1061,7 +1067,9 @@ fn infer_core(
                 };
                 if !concrete_super_ok(interner, bounds, &string_ty, &enum_embeds) {
                     return Err(InferError::sited(
-                        super_unsatisfied(interner, bounds, &string_ty, *span),
+                        super_unsatisfied(interner, bounds, &string_ty, *span, |b| {
+                            concrete_super_ok(interner, b, &string_ty, &enum_embeds)
+                        }),
                         home,
                     ));
                 }
@@ -1097,7 +1105,9 @@ fn infer_core(
         let ty = lift!(zonk_emitted(&mut uf, budget, root));
         if !concrete_super_ok(interner, orig_bounds, &ty, &enum_embeds) {
             return Err(InferError::sited(
-                super_unsatisfied(interner, orig_bounds, &ty, span),
+                super_unsatisfied(interner, orig_bounds, &ty, span, |b| {
+                    concrete_super_ok(interner, b, &ty, &enum_embeds)
+                }),
                 home,
             ));
         }
@@ -2154,7 +2164,13 @@ fn check_scheme_applications(
             let ty = zonk_emitted(uf, budget, *fresh).map_err(InferError::unsited)?;
             if !emitted_bound_satisfied(interner, *b, &ty, enum_embeds) {
                 return Err(InferError::sited(
-                    super_unsatisfied(interner, *b, &ty, app.span),
+                    refusal_of_duty(
+                        interner,
+                        *b,
+                        emitted_unmet(interner, *b, &ty, enum_embeds),
+                        &ty,
+                        app.span,
+                    ),
                     &app.use_home,
                 ));
             }
@@ -2733,70 +2749,128 @@ fn ty_is_equatable(interner: &Interner, ty: &Ty, enum_embeds: &EnumEmbeds) -> bo
     }
 }
 
-/// Build the [`TypeError::SuperTypeUnsatisfied`] (IPE-T0014) for a super-typed
-/// binding used at a type that does not meet its obligations.
+/// The duty a single obligation bit stands for, or `None` for a set that is
+/// not one of the obligation bits [`TyBounds::ALL_BITS`] lists.
+const fn owed_of_bit(bit: TyBounds) -> Option<Owed> {
+    if bit.has_number() {
+        Some(Owed::Class(TypeClass::Number))
+    } else if bit.has_ord() || bit.has_comparable_key() {
+        Some(Owed::Class(TypeClass::Comparable))
+    } else if bit.has_append() {
+        Some(Owed::Class(TypeClass::Appendable))
+    } else if bit.has_eq() {
+        Some(Owed::Class(TypeClass::Equatable))
+    } else if bit.has_show() {
+        Some(Owed::Stringify)
+    } else if bit.has_hof_kernel_result() {
+        Some(Owed::PlainCallbackResult)
+    } else if bit.has_sql_param() {
+        Some(Owed::SqlParam)
+    } else if bit.has_interpolable() {
+        Some(Owed::Interpolable)
+    } else {
+        None
+    }
+}
+
+/// Whether every obligation bit maps to a duty.
+const fn every_bit_owes_a_duty() -> bool {
+    let mut rest = TyBounds::ALL_BITS;
+    while let [bit, tail @ ..] = rest {
+        if owed_of_bit(*bit).is_none() {
+            return false;
+        }
+        rest = tail;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED compile-time completeness assert, evaluated by the
+// build, never a runtime panic path. `ty.rs` proves `ALL_BITS` enumerates
+// exactly `TyBounds::ALL`; this proves each of those bits names a duty, so a
+// new obligation bit without an `Owed` mapping breaks the build.
+const _: () = assert!(
+    every_bit_owes_a_duty(),
+    "every TyBounds obligation bit must map to an `Owed` duty in `owed_of_bit`"
+);
+
+/// The first duty in `bounds` a type fails, testing each obligation bit alone
+/// through `ok`, the gate's per-bound predicate for that type. Duties are
+/// ordered by [`Owed`]'s declaration: classes first, then the kernel duties.
+/// `None` when every bit `bounds` carries passes.
+pub(crate) fn first_unmet(bounds: TyBounds, ok: impl Fn(TyBounds) -> bool) -> Option<Owed> {
+    TyBounds::ALL_BITS
+        .iter()
+        .filter(|bit| bounds.union(**bit) == bounds && !ok(**bit))
+        .filter_map(|bit| owed_of_bit(*bit))
+        .min()
+}
+
+/// Build the [`TypeError::SuperTypeUnsatisfied`] (IPE-T0014) for a type that
+/// fails the obligations `bounds`, judged per bit by `ok`. A type that fails
+/// none of them has no refusal to state, so that is a compiler bug.
 pub(crate) fn super_unsatisfied(
     interner: &Interner,
     bounds: TyBounds,
     ty: &Ty,
     span: Span,
+    ok: impl Fn(TyBounds) -> bool,
 ) -> Diagnostic {
-    super_unsatisfied_named(interner, bounds, ty, span, &mut VarNamer::new())
+    refusal_of_duty(interner, bounds, first_unmet(bounds, ok), ty, span)
 }
 
-/// [`super_unsatisfied`], rendering `ty`'s variables through `namer`.
-pub(crate) fn super_unsatisfied_named(
+/// The duty `ty` fails among `bounds` at a generic emission. An ordering a
+/// concrete pin admits but the emitted generic refuses (`String`, outside
+/// [`ipe_diagnostics::GENERIC_ORDERED_TYPES`]) is the generic's own duty, never
+/// a `comparable` the type already is.
+fn emitted_unmet(
     interner: &Interner,
     bounds: TyBounds,
+    ty: &Ty,
+    enum_embeds: &EnumEmbeds,
+) -> Option<Owed> {
+    let at = |site| move |bit| super_bounds_satisfied(interner, bit, ty, site, enum_embeds);
+    let comparable = Some(Owed::Class(TypeClass::Comparable));
+    let unmet = first_unmet(bounds, at(super_bounds::BoundSite::EmittedGeneric));
+    // The number duty reads no site, so a concrete pin failing first at
+    // `comparable` fails the class itself; any later result means every
+    // comparable bit holds there and only the generic's ordering is unmet.
+    if unmet == comparable
+        && first_unmet(bounds, at(super_bounds::BoundSite::ConcretePin)) != comparable
+    {
+        Some(Owed::GenericOrdering)
+    } else {
+        unmet
+    }
+}
+
+/// The IPE-T0014 refusal of `ty` for `unmet`, the duty among `bounds` it
+/// fails. No unmet duty leaves nothing to refuse, so that is a compiler bug.
+fn refusal_of_duty(
+    interner: &Interner,
+    bounds: TyBounds,
+    unmet: Option<Owed>,
+    ty: &Ty,
+    span: Span,
+) -> Diagnostic {
+    let Some(owed) = unmet else {
+        return Diagnostic::CompilerBug {
+            where_: "ipe_types::super_unsatisfied",
+            detail: format!("refused {ty:?} meets every obligation in {bounds:?}"),
+        };
+    };
+    super_unsatisfied_named(interner, owed, ty, span, &mut VarNamer::new())
+}
+
+/// The IPE-T0014 refusal of `ty` for the unmet duty `owed`, rendering `ty`'s
+/// variables through `namer`.
+pub(crate) fn super_unsatisfied_named(
+    interner: &Interner,
+    owed: Owed,
     ty: &Ty,
     span: Span,
     namer: &mut VarNamer,
 ) -> Diagnostic {
-    // Name every super-type the variable owes, in a fixed order, joined with
-    // `+` (`Number + Equatable` when a variable is both added and compared for
-    // equality). A bound set always carries at least one obligation at a call
-    // site, so the join is non-empty; the fallback keeps the function total.
-    let mut classes: Vec<&str> = Vec::new();
-    if bounds.has_number() {
-        classes.push("Number");
-    }
-    // A `Set` element / `Dict` key obligation is a Ipê `Comparable` (the same
-    // class the ordering operators impose); name it once even when both an
-    // ordering use and a Set/Dict use constrained the variable.
-    if bounds.has_ord() || bounds.has_comparable_key() {
-        classes.push("Comparable");
-    }
-    if bounds.has_eq() {
-        classes.push("Equatable");
-    }
-    if bounds.has_show() {
-        classes.push("Stringify");
-    }
-    if bounds.has_append() {
-        classes.push("Appendable");
-    }
-    // The higher-order-kernel callback-result obligation. Named
-    // distinctly from the other classes (it is not a Ipê super-type a user
-    // annotates against — it is an internal arity restriction on the
-    // callback-result slot of a higher-order kernel such as `List.map`,
-    // `List.foldl`, or `Maybe.map2`): the callback's final result must not itself be a
-    // function, because the runtime kernel applies the callback at one exact
-    // arity while the IR flattens curried functions.
-    if bounds.has_hof_kernel_result() {
-        // Shared constant: the renderer keys a tailored (non-double-negative)
-        // sentence off this exact label.
-        classes.push(ipe_diagnostics::HOF_KERNEL_RESULT_CLASS);
-    }
-    // The interpolation obligation's closed scalar set is a subset of every
-    // sibling class's domain, so it alone names the failure; the shared label
-    // keys the renderer's tailored sentence (accepted scalars + the fix).
-    let class = if bounds.has_interpolable() {
-        ipe_diagnostics::INTERPOLABLE_CLASS.to_owned()
-    } else if classes.is_empty() {
-        "Equatable".to_owned()
-    } else {
-        classes.join(" + ")
-    };
     let found = match ty_to_doc(ty, interner, namer) {
         Ok(d) => d,
         Err(bug) => return bug,
@@ -2804,8 +2878,9 @@ pub(crate) fn super_unsatisfied_named(
     Diagnostic::Type {
         span,
         msg: TypeError::SuperTypeUnsatisfied {
-            class: class.into_boxed_str(),
+            owed,
             found: Box::new(found),
+            origin: None,
         },
     }
 }
@@ -8685,15 +8760,20 @@ mod tests {
                     "a Stringify obligation on {ty:?} must be refused at {site:?}"
                 );
             }
-            let refusal = super_unsatisfied(&i, show, &ty, Span::DUMMY);
+            let refusal = super_unsatisfied(&i, show, &ty, Span::DUMMY, |b| {
+                super_bounds_satisfied(&i, b, &ty, super_bounds::BoundSite::ConcretePin, &embeds)
+            });
             assert_eq!(refusal.code().as_str(), "IPE-T0014");
             assert!(
                 matches!(
                     &refusal,
                     Diagnostic::Type {
-                        msg: TypeError::SuperTypeUnsatisfied { class, .. },
+                        msg: TypeError::SuperTypeUnsatisfied {
+                            owed: Owed::Stringify,
+                            ..
+                        },
                         ..
-                    } if &**class == "Stringify"
+                    }
                 ),
                 "the refusal of {ty:?} must name the Stringify class, got {refusal:?}"
             );
@@ -8987,9 +9067,12 @@ mod tests {
         matches!(
             solved,
             Err(Diagnostic::Type {
-                msg: TypeError::SuperTypeUnsatisfied { class, .. },
+                msg: TypeError::SuperTypeUnsatisfied {
+                    owed: Owed::Interpolable,
+                    ..
+                },
                 ..
-            }) if &**class == ipe_diagnostics::INTERPOLABLE_CLASS
+            })
         )
     }
 
@@ -9227,8 +9310,10 @@ h x =
     fn is_not_interpolable(msg: &TypeError) -> bool {
         matches!(
             msg,
-            TypeError::SuperTypeUnsatisfied { class, .. }
-                if &**class == ipe_diagnostics::INTERPOLABLE_CLASS
+            TypeError::SuperTypeUnsatisfied {
+                owed: Owed::Interpolable,
+                ..
+            }
         )
     }
 
@@ -9449,6 +9534,298 @@ h x =
         assert!(
             sole_bound(&solved, &mut i, "insertOne").is_some_and(TyBounds::has_sql_param),
             "`insertOne`'s wildcard must carry the SQL-parameter obligation"
+        );
+    }
+
+    // ── duty refusals: one typed duty, one code ─────────────────────────────
+
+    /// The higher-order kernels the duty tests call, declared as the embedded
+    /// stdlib declares them.
+    const DUTY_STDLIB: [(&str, &str); 5] = [
+        (
+            "Ipe.List",
+            "module Ipe.List exposing (map, foldl, map2)\n\n\
+             import Ipe.Ffi.Kernel as Kernel\n\n\
+             map : (a -> b) -> List a -> List b\nmap = Kernel.kernel \"List_map\"\n\n\
+             foldl : (a -> b -> b) -> b -> List a -> b\nfoldl = Kernel.kernel \"List_foldl\"\n\n\
+             map2 : (a -> b -> r) -> List a -> List b -> List r\n\
+             map2 = Kernel.kernel \"List_map2\"\n",
+        ),
+        (
+            "Ipe.Maybe",
+            "module Ipe.Maybe exposing (map)\n\n\
+             import Ipe.Ffi.Kernel as Kernel\n\n\
+             map : (a -> b) -> Maybe a -> Maybe b\nmap = Kernel.kernel \"Maybe_map\"\n",
+        ),
+        (
+            "Ipe.Dict",
+            "module Ipe.Dict exposing (map)\n\n\
+             import Ipe.Ffi.Kernel as Kernel\n\n\
+             map : (k -> a -> b) -> Dict k a -> Dict k b\nmap = Kernel.kernel \"Dict_map\"\n",
+        ),
+        (
+            "Ipe.Debug",
+            "module Ipe.Debug exposing (log)\n\n\
+             import Ipe.Ffi.Kernel as Kernel\n\n\
+             log : String -> a -> a\nlog = Kernel.kernel \"Debug_log\"\n",
+        ),
+        (
+            "Ipe.Error",
+            "module Ipe.Error exposing (toString)\n\n\
+             import Ipe.Ffi.Kernel as Kernel\n\n\
+             toString : a -> String\ntoString = Kernel.kernel \"Error_toString\"\n",
+        ),
+    ];
+
+    /// Infer `src` as module `Main` linked over [`DUTY_STDLIB`].
+    fn infer_over_duty_stdlib(src: &str) -> Option<DResult<SolvedTypes>> {
+        let mut modules = DUTY_STDLIB.to_vec();
+        modules.push(("Main", src));
+        let mut i = Interner::new();
+        let canon = canon_with_stdlib_origin(&modules, &mut i)?;
+        let entry = canon.last().map(|(path, _, _)| path.clone())?;
+        let linked =
+            ipe_canon::link::link(entry, canon.into_iter().map(|(_, cm, _)| cm).collect(), &i)
+                .ok()?;
+        Some(infer(&linked, &mut i))
+    }
+
+    /// The IPE-T0014 duty `src` is refused with, plus the refusal as the
+    /// terminal renders it; `None` when inference yields anything else.
+    fn duty_refusal(src: &str) -> Option<(Owed, String)> {
+        let solved = infer_over_duty_stdlib(src)?;
+        match solved {
+            Err(
+                d @ Diagnostic::Type {
+                    msg: TypeError::SuperTypeUnsatisfied { owed, .. },
+                    ..
+                },
+            ) => Some((owed, ipe_diagnostics::render(&d, "Main.ipe", src))),
+            _ => None,
+        }
+    }
+
+    /// Every backticked lone letter in `rendered` is a word of `src`, so the
+    /// refusal names no type variable the user did not write.
+    fn names_no_invented_letter(src: &str, rendered: &str) -> bool {
+        let words: BTreeSet<&str> = src
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .collect();
+        ('a'..='z').all(|c| {
+            let lone = format!("`{c}`");
+            !rendered.contains(&lone) || words.contains(c.to_string().as_str())
+        })
+    }
+
+    /// A callback returning a function to a higher-order kernel, or a function
+    /// handed to `Debug.log` or `errorToString`, is refused as the unmet duty
+    /// (IPE-T0014), never
+    /// as a mismatch against a scheme variable the user never wrote.
+    #[test]
+    #[allow(clippy::panic)] // a case that is not refused at all fails with its result
+    fn a_kernel_duty_refusal_states_the_duty_not_a_variable() {
+        let cases = [
+            (
+                "Dict.map callback",
+                "module Main exposing (go)\n\nimport Ipe.Dict as Dict\n\n\
+                 go : Dict String (Int -> Int) -> Dict String (Int -> Int)\n\
+                 go handlers =\n    Dict.map (\\_ f -> f) handlers\n",
+                Owed::PlainCallbackResult,
+            ),
+            (
+                "Debug.log of a function",
+                "module Main exposing (main)\n\nimport Ipe.Debug as Debug\n\n\
+                 main =\n    Debug.log \"f\" (\\n -> n + 1)\n",
+                Owed::Stringify,
+            ),
+            (
+                "errorToString of a function",
+                "module Main exposing (main)\n\n\
+                 main =\n    errorToString (\\n -> n + 1)\n",
+                Owed::Stringify,
+            ),
+            (
+                "List.map curried callback",
+                "module Main exposing (main)\n\nimport Ipe.List as List\n\n\
+                 main =\n    List.map (\\x -> \\y -> x + y) [ 1, 2 ]\n",
+                Owed::PlainCallbackResult,
+            ),
+            (
+                "List.foldl curried accumulator",
+                "module Main exposing (main)\n\nimport Ipe.List as List\n\n\
+                 main =\n    List.foldl (\\x acc -> \\y -> acc)\n",
+                Owed::PlainCallbackResult,
+            ),
+            (
+                "List.map2 curried callback",
+                "module Main exposing (main)\n\nimport Ipe.List as List\n\n\
+                 main =\n    List.map2 (\\p q -> \\r -> p) [ 1 ] [ 2 ]\n",
+                Owed::PlainCallbackResult,
+            ),
+        ];
+        for (what, src, want) in cases {
+            let Some((owed, rendered)) = duty_refusal(src) else {
+                let solved = infer_over_duty_stdlib(src);
+                panic!("{what} must be refused as IPE-T0014, got {solved:?}");
+            };
+            assert_eq!(owed, want, "{what}: wrong duty\n{rendered}");
+            assert!(rendered.contains("IPE-T0014"), "{what}:\n{rendered}");
+            assert!(
+                names_no_invented_letter(src, &rendered),
+                "{what} names a variable the user never wrote:\n{rendered}"
+            );
+        }
+    }
+
+    /// A record bound as a SQL parameter is refused as the SQL-parameter duty,
+    /// never as a class a record satisfies.
+    #[test]
+    fn a_record_sql_parameter_is_refused_as_the_sql_duty() {
+        let src = "module Main exposing (run)\n\nimport Ipe.Db as Db\n\n\
+             run : Db -> Task Error Int\n\
+             run conn =\n    Db.exec conn \"INSERT INTO t (v) VALUES (?)\" [ { x = 1 } ]\n";
+        let refusal = duty_refusal(src);
+        assert!(
+            matches!(&refusal, Some((Owed::SqlParam, _))),
+            "a record parameter must be refused as the SQL duty: {refusal:?}"
+        );
+        if let Some((_, rendered)) = refusal {
+            assert!(!rendered.contains("quatable"), "names a class:\n{rendered}");
+            assert!(rendered.contains("SqlValue"), "lists no types:\n{rendered}");
+        }
+    }
+
+    /// The same duty refused eagerly (the kernel called directly) and when
+    /// deferred (through an annotated forwarder) carries one code and one duty.
+    #[test]
+    fn eager_and_deferred_refusals_of_one_duty_agree() {
+        let eager = "module Main exposing (main)\n\nimport Ipe.Maybe as Maybe\n\n\
+             main =\n    Maybe.map (\\x -> \\y -> x + y) (Just 1)\n";
+        let deferred = "module Main exposing (main)\n\nimport Ipe.Maybe as Maybe\n\n\
+             fwd : (a -> b) -> Maybe a -> Maybe b\nfwd f m =\n    Maybe.map f m\n\n\
+             main =\n    fwd (\\x -> \\y -> x + y) (Just 1)\n";
+        let eager = duty_refusal(eager).map(|(owed, _)| owed);
+        let deferred = duty_refusal(deferred).map(|(owed, _)| owed);
+        assert_eq!(eager, Some(Owed::PlainCallbackResult), "eager");
+        assert_eq!(deferred, eager, "deferred must match eager");
+    }
+
+    /// A type that meets every obligation it is checked against has no duty
+    /// to refuse: the constructor reports a compiler bug, never a class.
+    #[test]
+    fn a_refusal_with_no_unmet_duty_is_a_compiler_bug() {
+        let mut i = Interner::new();
+        let ty = con_ty(&mut i, &[], "Int");
+        for bounds in TyBounds::ALL_BITS {
+            assert_eq!(first_unmet(*bounds, |_| true), None);
+            let refusal = super_unsatisfied(&i, *bounds, &ty, Span::DUMMY, |_| true);
+            assert!(
+                matches!(refusal, Diagnostic::CompilerBug { .. }),
+                "{bounds:?} met in full must be a compiler bug, got {refusal:?}"
+            );
+        }
+    }
+
+    /// A class duty outranks a kernel duty, and each bit names its own duty.
+    #[test]
+    fn first_unmet_orders_classes_before_kernel_duties() {
+        let all_fail = |_: TyBounds| false;
+        let mixed = TyBounds::hof_kernel_result().union(TyBounds::eq());
+        assert_eq!(
+            first_unmet(mixed, all_fail),
+            Some(Owed::Class(TypeClass::Equatable))
+        );
+        assert_eq!(
+            first_unmet(TyBounds::sql_param(), all_fail),
+            Some(Owed::SqlParam)
+        );
+        assert_eq!(
+            first_unmet(TyBounds::interpolable(), all_fail),
+            Some(Owed::Interpolable)
+        );
+        assert_eq!(
+            first_unmet(TyBounds::show(), all_fail),
+            Some(Owed::Stringify)
+        );
+        assert_eq!(first_unmet(TyBounds::EMPTY, all_fail), None);
+    }
+
+    /// `SQL_PARAM_TYPES`, the list the refusal names, is exactly the set the
+    /// SQL-parameter gate accepts: each listed type passes at both sites, and a
+    /// record, a function, `Char` and a `List` are refused.
+    #[test]
+    fn sql_param_types_equal_the_sql_param_gate() {
+        let mut i = Interner::new();
+        let embeds = EnumEmbeds::default();
+        let sql = TyBounds::sql_param();
+        let sites = [
+            super_bounds::BoundSite::ConcretePin,
+            super_bounds::BoundSite::EmittedGeneric,
+        ];
+        for name in ipe_diagnostics::SQL_PARAM_TYPES {
+            let ty = con_ty(&mut i, &[], name);
+            for site in sites {
+                assert!(
+                    super_bounds_satisfied(&i, sql, &ty, site, &embeds),
+                    "listed `{name}` must bind at {site:?}"
+                );
+            }
+        }
+        let int = con_ty(&mut i, &[], "Int");
+        let x = i.intern("x").expect("intern x");
+        let list = i.intern("List").expect("intern List");
+        let refused = [
+            Ty::Record(BTreeMap::from([(x, int.clone())]), RowTail::Closed),
+            Ty::Fun(Box::new(int.clone()), Box::new(int.clone())),
+            con_ty(&mut i, &[], "Char"),
+            Ty::Con {
+                module: Vec::new(),
+                name: list,
+                args: vec![int],
+            },
+        ];
+        for ty in refused {
+            for site in sites {
+                assert!(
+                    !super_bounds_satisfied(&i, sql, &ty, site, &embeds),
+                    "unlisted {ty:?} must not bind at {site:?}"
+                );
+            }
+        }
+    }
+
+    /// A `String` ordered through a generic forwarder is refused as the
+    /// generic-ordering duty, never as a `comparable` it already is; a record
+    /// there still fails the class itself.
+    #[test]
+    fn a_string_ordered_by_a_generic_owes_the_generic_ordering() {
+        let mut i = Interner::new();
+        let embeds = EnumEmbeds::default();
+        let string = con_ty(&mut i, &[], "String");
+        let int = con_ty(&mut i, &[], "Int");
+        let x = i.intern("x").expect("intern x");
+        let record = Ty::Record(BTreeMap::from([(x, int.clone())]), RowTail::Closed);
+        for bounds in [TyBounds::ord(), TyBounds::ord().union(TyBounds::eq())] {
+            assert_eq!(
+                emitted_unmet(&i, bounds, &string, &embeds),
+                Some(Owed::GenericOrdering),
+                "{bounds:?} at `String`"
+            );
+            assert_eq!(
+                emitted_unmet(&i, bounds, &record, &embeds),
+                Some(Owed::Class(TypeClass::Comparable)),
+                "{bounds:?} at a record"
+            );
+            assert_eq!(
+                emitted_unmet(&i, bounds, &int, &embeds),
+                None,
+                "{bounds:?} at `Int`"
+            );
+        }
+        assert_eq!(
+            emitted_unmet(&i, TyBounds::add().union(TyBounds::ord()), &string, &embeds),
+            Some(Owed::Class(TypeClass::Number)),
+            "a `String` that also fails `number` owes the class first"
         );
     }
 

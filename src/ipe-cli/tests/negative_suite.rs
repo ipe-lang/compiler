@@ -828,7 +828,7 @@ fn security_db_bind_list_refuses_non_sql_param_elements() {
         assert_compiles(&format!("db_bind_list_{label}_control"), &control);
         for (shape, binds, code) in [
             ("record", "[ { id = 1 } ]", "IPE-T0014"),
-            ("function", "[ not ]", "IPE-T0001"),
+            ("function", "[ not ]", "IPE-T0014"),
         ] {
             let src = db_bind_list_program(imports, probe, binds);
             assert_rejected(&format!("db_bind_list_{label}_{shape}"), &src, code);
@@ -2813,14 +2813,14 @@ fn hof_program(expr: &str) -> String {
 #[test]
 fn type_list_map_curried_callback_refused() {
     let src = hof_program("List.map add [ 1, 2, 3 ]");
-    assert_rejected("type_list_map_curried_callback", &src, "IPE-T0001");
+    assert_rejected("type_list_map_curried_callback", &src, "IPE-T0014");
 }
 
 /// A curried lambda callback (`\n -> \x -> x + n`) is the same hazard spelled inline.
 #[test]
 fn type_list_map_curried_lambda_refused() {
     let src = hof_program("List.map (\\n -> \\x -> x + n) [ 1, 2, 3 ]");
-    assert_rejected("type_list_map_curried_lambda", &src, "IPE-T0001");
+    assert_rejected("type_list_map_curried_lambda", &src, "IPE-T0014");
 }
 
 /// A fold whose accumulator is a function returns an arrow from its step callback.
@@ -2829,7 +2829,7 @@ fn type_list_foldl_function_accumulator_refused() {
     let src = hof_program(
         "List.map (List.foldl (\\x f -> \\y -> f y + x) (\\y -> y) [ 1, 2 ]) [ 1, 2, 3 ]",
     );
-    assert_rejected("type_list_foldl_function_accumulator", &src, "IPE-T0001");
+    assert_rejected("type_list_foldl_function_accumulator", &src, "IPE-T0014");
 }
 
 /// Contrapositive: a plain-result callback (`\x -> x + 1`) still compiles.
