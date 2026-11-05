@@ -1440,6 +1440,8 @@ messages! {
     mobile_bundle_policy_mismatch(path) = "mobile-bundle-policy-mismatch";
     /// The bundle's `index.html` is larger than the pack reads.
     mobile_bundle_index_too_large(path, cap) = "mobile-bundle-index-too-large";
+    /// A served bundle's asset name is outside the bundle path grammar.
+    bundle_not_a_bundle_path(path, reason) = "bundle-not-a-bundle-path";
     /// `delivery.servers` names the Android shell's local asset origin.
     mobile_asset_origin_listed(origin) = "mobile-asset-origin-listed";
     /// A filesystem failure while walking the emitted wasm bundle.
@@ -1785,6 +1787,14 @@ messages! {
     wasm_bindgen_failed(code, version) = "wasm-bindgen-failed";
     /// A `web client` bundle was published.
     wasm_bundle_ready(www, size, wasm) = "wasm-bundle-ready";
+    /// `ipe dev run` serves a `web client` bundle on loopback.
+    bundle_serving(www, url) = "bundle-serving";
+    /// `ipe doc --serve` serves the doc preview on loopback.
+    doc_serve_serving(url) = "doc-serve-serving";
+    /// No browser opened on a served URL.
+    serve_open_failed(url) = "serve-open-failed";
+    /// The port `IPE_WEB_PORT` pins for a served bundle is already in use.
+    serve_port_taken(port, var) = "serve-port-taken";
     /// A wasm build's JSON record named no `.wasm` artifact.
     wasm_artifact_missing(triple, dir) = "wasm-artifact-missing";
     /// A wasm build's JSON record named two `.wasm` artifacts.

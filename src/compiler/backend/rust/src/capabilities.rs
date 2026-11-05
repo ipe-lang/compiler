@@ -257,7 +257,7 @@ pub const CAPABILITIES: &[RuntimeCapability] = &[
     //
     // A cli (`uses_console`) is excluded: it has no repaintable appearance
     // surface to hot-swap, and its dev-loop debugger records to the
-    // `IPE_DEBUGGER_RECORD` dump at loop exit rather than driving the control
+    // `IPE_DEBUGGER_RECORD` dump at exit rather than driving the control
     // socket accept-loop. The `debugger` flag is likewise NOT a disjunct here:
     // the `debugger` Cargo feature already implies `control-wire` in the crate
     // graph (`debugger = ["control-wire", …]`), so a `--debugger` build pulls the

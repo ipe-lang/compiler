@@ -6,7 +6,7 @@ ipe dev run [<dir>]
 
 ## Arguments
 
-A project directory (default: the current directory). With no delivery args, `dev run` runs the one delivery declared in `ships` in package.ipe (the served default when `ships` is absent); when `ships` declares several, it refuses and lists the command for each.
+A project directory (default: the current directory). With no delivery args, `dev run` runs the one delivery declared in `ships` in package.ipe (the served default when `ships` is absent); when `ships` declares several, it refuses and lists the command for each. A `web client` delivery has no binary to run: `dev run` publishes its bundle to out/www/ and serves it, read-only, on 127.0.0.1 — on the port `IPE_WEB_PORT` names, else a free one — then prints the URL and opens it in a browser. Ctrl-C stops it.
 
 ## Options
 

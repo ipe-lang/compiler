@@ -47,23 +47,25 @@ const KEY_READER_THREAD: &str = "ipe-tui-keys";
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Whether a TUI session is currently active (terminal in raw mode + alt screen).
-/// Gates `tui_teardown` so the restore runs exactly once, from whichever path
-/// fires first (Drop on a clean break / panic unwind, OR the System.exit hook).
+/// Gates `tui_teardown_on` so the restore runs exactly once, from whichever path
+/// fires first (Drop on a clean break / panic unwind, OR the `System.exit`
+/// terminal-restore stage).
 static TUI_RESTORE_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Whether mouse reporting was enabled (so the teardown emits MOUSE_OFF).
 static TUI_MOUSE: AtomicBool = AtomicBool::new(false);
 
 /// Idempotent terminal restore: mouse off → cursor shown → main screen → cooked
-/// mode. Runs once (AtomicBool gate). Called from EITHER the `TuiGuard` Drop
-/// (clean break / panic unwind) OR the `System.exit` hook — the latter is the
-/// load-bearing path: `std::process::exit` bypasses Drop, so without the hook a
-/// `Cmd.perform (System.exit n)` quit would leave the TTY in raw mode + the
+/// mode, written to `out`, the stdout lock's holder. Runs once (AtomicBool
+/// gate). Reached from EITHER the `TuiGuard` Drop (clean break / panic unwind)
+/// OR the `System.exit` terminal-restore stage — the latter is the
+/// load-bearing path: `std::process::exit` bypasses Drop, so without the stage
+/// a `Cmd.perform (System.exit n)` quit would leave the TTY in raw mode + the
 /// alternate screen (needing `reset`). Implements `tuiTeardown`. Never panics.
-fn tui_teardown() {
-    // The stdout lock is taken BEFORE the gate flips, so a `paint` on another
-    // thread either finishes its frame first or sees the session ended and
-    // writes nothing: no frame lands on the main screen after the restore.
-    let mut out = std::io::stdout().lock();
+///
+/// The caller holds the stdout lock BEFORE the gate flips, so a `paint` on
+/// another thread either finishes its frame first or sees the session ended
+/// and writes nothing: no frame lands on the main screen after the restore.
+fn tui_teardown_on(out: &mut std::io::StdoutLock<'static>) {
     if !TUI_RESTORE_ACTIVE.swap(false, Ordering::SeqCst) {
         return; // already restored, or never entered
     }
@@ -79,9 +81,12 @@ fn tui_teardown() {
 
 /// RAII terminal-state guard — restores cooked mode + cursor + main screen (and
 /// mouse reporting, when enabled) on Drop (normal exit or panic unwind) AND via
-/// the registered `System.exit` hook (process::exit bypasses Drop). Best-effort,
-/// never panics.
-struct TuiGuard;
+/// the registered `System.exit` terminal-restore stage (process::exit bypasses
+/// Drop). Drop retires the stage, running the restore once. Best-effort, never
+/// panics.
+struct TuiGuard {
+    restore: Option<crate::system::pre_exit::StageTicket>,
+}
 
 /// Why `TuiGuard::enter*` refused to start a Tui session — typed so a caller
 /// can classify a "no terminal" refusal as `Unavailable` instead of folding
@@ -93,9 +98,9 @@ enum TuiEnterError {
     /// A residual `enable_raw_mode` failure the probe did not predict; kept
     /// with its raw OS context.
     RawMode(std::io::Error),
-    /// Another terminal driver holds the process exit hook, so a
+    /// Another terminal driver holds the terminal-restore exit stage, so a
     /// `System.exit` could not restore the terminal.
-    ExitHookTaken,
+    ExitStageHeld,
 }
 
 impl TuiEnterError {
@@ -103,7 +108,7 @@ impl TuiEnterError {
         match self {
             Self::NoTerminal(reason) => E::from_unavailable(reason.text().to_owned()),
             Self::RawMode(e) => format!("Tui: enable raw mode: {e}").into(),
-            Self::ExitHookTaken => "Tui: another terminal driver already runs in this process"
+            Self::ExitStageHeld => "Tui: another terminal driver already runs in this process"
                 .to_owned()
                 .into(),
         }
@@ -146,19 +151,22 @@ impl TuiGuard {
         }
         // Register the teardown before raw mode is entered, so a `System.exit`
         // quit restores the terminal even though process::exit skips Drop
-        // (idempotent with the Drop path below). A slot another driver holds
+        // (idempotent with the Drop path below). A stage another driver holds
         // refuses the session: raw mode with no exit restore would strand the
         // terminal.
-        if crate::system::register_exit_hook(tui_teardown).is_err() {
-            return Err(TuiEnterError::ExitHookTaken);
-        }
+        let Ok(restore) = crate::system::pre_exit::register(
+            crate::system::pre_exit::Registration::TerminalRestore(tui_teardown_on),
+        ) else {
+            return Err(TuiEnterError::ExitStageHeld);
+        };
         if let Err(e) = crossterm::terminal::enable_raw_mode() {
+            restore.retire();
             return Err(classify_raw_mode_error(e));
         }
         // Pin the session's colour profile now, once, before any frame paints —
         // every `render_with_focus` call for the rest of this session reads this
         // cached value instead of re-resolving the environment per frame. Paired
-        // with `end_tui_session_profile` in `tui_teardown`, reached from here on
+        // with `end_tui_session_profile` in `tui_teardown_on`, reached from here on
         // whichever path tears the session down.
         crate::color::begin_tui_session_profile();
         TUI_MOUSE.store(mouse, Ordering::SeqCst);
@@ -170,13 +178,17 @@ impl TuiGuard {
             let _ = out.write_all(MOUSE_ON.as_bytes());
         }
         let _ = out.flush();
-        Ok(TuiGuard)
+        Ok(TuiGuard {
+            restore: Some(restore),
+        })
     }
 }
 
 impl Drop for TuiGuard {
     fn drop(&mut self) {
-        tui_teardown();
+        if let Some(restore) = self.restore.take() {
+            restore.retire();
+        }
     }
 }
 
@@ -188,7 +200,7 @@ fn paint(frame: &str) {
 /// Write one frame to `out`, the stdout lock's holder, only while the session
 /// `active` gate is still set.
 ///
-/// A `System.exit` effect runs `tui_teardown` on a worker thread while the loop
+/// A `System.exit` effect runs `tui_teardown_on` on a worker thread while the loop
 /// may still be painting; the teardown takes the same lock before it clears
 /// the gate, so a frame painted after the restore (clearing the main screen and
 /// drawing on it) has no path.

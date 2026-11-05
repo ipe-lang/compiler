@@ -183,6 +183,22 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
         "manifest_emit_settings",
         1,
     ),
+    // A served `web client` bundle is answered under the mount base and with
+    // the CSP candidates of the same in-memory manifest its build was
+    // configured from; the page's own meta must then match exactly one
+    // candidate, or the serve is refused.
+    (
+        "field delivery.browser.base",
+        "src/ipe-cli/src/driver/commands.rs",
+        "serve_client_bundle",
+        1,
+    ),
+    (
+        "field delivery.servers",
+        "src/ipe-cli/src/driver/commands.rs",
+        "serve_client_bundle",
+        1,
+    ),
     // The mobile shell is laid out from the manifest pin, and a pin that
     // changes during the build is refused: the pin's one constructor reads
     // each field, the driver none.
@@ -1155,7 +1171,9 @@ const fn admitted_sources() -> [(&'static str, &'static str); 7] {
              fn run_eject() { go(HostIntent::Served); }\n\
              fn release_pipeline() { go(HostIntent::Served); go(HostIntent::Served); \
              go(HostIntent::Served); }\n\
-             fn front_check() { go(HostIntent::Served); }\n",
+             fn front_check() { go(HostIntent::Served); }\n\
+             fn serve_client_bundle() { let b = manifest.delivery.browser.base.clone(); \
+             let s = &manifest.delivery.servers; }\n",
         ),
         (
             "src/ipe-cli/src/run_sandbox.rs",

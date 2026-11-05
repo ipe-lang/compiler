@@ -346,6 +346,13 @@ fn hex(tag: &SchemaTag) -> String {
 }
 
 /// Encode `buf`'s messages with `start` under the program's tags.
+///
+/// The log is held to `DEFAULT_SEAL_MAX_INPUT_BYTES`, the cap its decoder
+/// reads, so no log is written that its own decoder would refuse.
+///
+/// # Errors
+/// [`ReplayError::Oversized`] past the cap, [`ReplayError::Encode`] when a
+/// value fails to serialise.
 fn encode_wire<Msg, Model, B>(
     tags: Tags,
     start: Start<B>,
@@ -363,10 +370,73 @@ where
         start,
         msgs: buf.msgs().collect(),
     };
-    let mut bytes = Vec::new();
+    let mut bytes = CappedVec::new(DEFAULT_SEAL_MAX_INPUT_BYTES);
     let mut ser = serde_json::Serializer::with_formatter(&mut bytes, ControlEscaping);
-    serde::Serialize::serialize(&wire, &mut ser).map_err(|_| ReplayError::Encode)?;
-    Ok(bytes)
+    match serde::Serialize::serialize(&wire, &mut ser) {
+        Ok(()) => Ok(bytes.into_bytes()),
+        Err(_) if bytes.overflowed() => Err(ReplayError::Oversized {
+            cap: DEFAULT_SEAL_MAX_INPUT_BYTES,
+        }),
+        Err(_) => Err(ReplayError::Encode),
+    }
+}
+
+/// A byte buffer that refuses any write past its cap.
+///
+/// A refused write leaves the buffer as it was and is remembered, so the
+/// encoder tells an oversized log from a value that failed to serialise.
+struct CappedVec {
+    bytes: Vec<u8>,
+    cap: usize,
+    overflowed: bool,
+}
+
+impl CappedVec {
+    const fn new(cap: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            cap,
+            overflowed: false,
+        }
+    }
+
+    const fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+/// The refusal of a write past a [`CappedVec`]'s cap.
+#[derive(Debug)]
+struct PastCap;
+
+impl core::fmt::Display for PastCap {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("the session log is larger than its cap")
+    }
+}
+
+impl std::error::Error for PastCap {}
+
+impl Write for CappedVec {
+    fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len().saturating_add(chunk.len()) > self.cap {
+            self.overflowed = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                PastCap,
+            ));
+        }
+        self.bytes.extend_from_slice(chunk);
+        Ok(chunk.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Compact JSON that escapes every log hazard (`Cc ∪ Cf ∪ Zl ∪ Zp`), not only C0.
@@ -631,6 +701,47 @@ mod tests {
         let encoded = full().encode(buf);
         assert!(encoded.is_ok(), "encode must succeed: {encoded:?}");
         encoded.unwrap_or_default()
+    }
+
+    /// The full codec's log of one `Say` message carrying `pad` bytes of text.
+    fn say_log(pad: usize) -> Result<Vec<u8>, ReplayError> {
+        let (buf, _) = record(&[Msg::Say("a".repeat(pad))], 4);
+        full().encode(&buf)
+    }
+
+    // A log that fills the decoder's cap exactly is written and decodes; one
+    // byte more is refused at encode, so the encoder never writes a log its
+    // own decoder refuses.
+    #[test]
+    fn typed_log_at_the_cap_decodes() {
+        let bare = say_log(0).map(|bytes| bytes.len());
+        assert!(bare.is_ok(), "{bare:?}");
+        let bare = bare.unwrap_or_default();
+        let pad = DEFAULT_SEAL_MAX_INPUT_BYTES.saturating_sub(bare);
+        let at_cap = say_log(pad);
+        assert_eq!(
+            at_cap.as_ref().map(Vec::len),
+            Ok(DEFAULT_SEAL_MAX_INPUT_BYTES)
+        );
+        let decoded = at_cap.as_deref().map(decode_full);
+        assert!(matches!(decoded, Ok(Ok(_))), "a log at the cap must decode");
+        assert_eq!(
+            say_log(pad.saturating_add(1)).map(|bytes| bytes.len()),
+            Err(ReplayError::Oversized {
+                cap: DEFAULT_SEAL_MAX_INPUT_BYTES
+            })
+        );
+    }
+
+    // A refused write leaves the buffer as it was and is remembered.
+    #[test]
+    fn capped_vec_refuses_a_write_past_its_cap() {
+        let mut capped = CappedVec::new(4);
+        assert!(capped.write_all(b"abcd").is_ok());
+        assert!(!capped.overflowed());
+        assert!(capped.write_all(b"e").is_err());
+        assert!(capped.overflowed());
+        assert_eq!(capped.into_bytes(), b"abcd");
     }
 
     // A replay prints the live session's models, from `init`, byte-identically

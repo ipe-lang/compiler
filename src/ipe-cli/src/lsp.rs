@@ -93,6 +93,8 @@ fn load_error(err: &CliError) -> LoadError {
         | CliError::CacheHomeUnknown
         | CliError::EnvDirNotAbsolute { .. }
         | CliError::EnvSwitchNotRecognised { .. }
+        | CliError::EnvRefused(_)
+        | CliError::ServePortTaken { .. }
         | CliError::RuntimeMaterializeFailed { .. }
         | CliError::RuntimeVersionMismatch { .. }
         | CliError::EmittedBuildFailed { .. }

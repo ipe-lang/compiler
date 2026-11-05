@@ -1209,7 +1209,7 @@ mod tests {
     /// child records one batch and ends through `system::system_exit` at once,
     /// long before the batcher's own tick; only the exit funnel's flush can
     /// carry the batch to the child's ingest, which prints
-    /// [`CHILD_RECEIVED`] before it answers. A child still alive after
+    /// [`CHILD_RECEIVED`] to stderr before it answers. A child still alive after
     /// [`CHILD_LIMIT`] is killed and fails the test.
     #[cfg(feature = "web")]
     #[allow(clippy::expect_used)] // test harness: a test binary that cannot re-run itself is an environment issue
@@ -1257,7 +1257,7 @@ mod tests {
             "the exit-funnel child did not exit 0 ({status:?}):\n{stdout}\n{stderr}"
         );
         assert!(
-            stdout.contains(CHILD_RECEIVED),
+            stderr.contains(CHILD_RECEIVED),
             "the process ended before its exporter's final batch reached the ingest:\n{stdout}\n{stderr}"
         );
     }
@@ -1274,7 +1274,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn exit_funnel_child() {
         let (port, _) = marker_ingest(Duration::ZERO, || {
-            crate::system::write_stdout_line(CHILD_RECEIVED);
+            // Stderr: the exiting thread holds the stdout lock until the end.
+            crate::system::write_stderr_line(CHILD_RECEIVED);
         })
         .await;
         let token = IngestToken::mint().expect("mint an ingest token");
@@ -1325,9 +1326,9 @@ mod tests {
         use axum::{Router, routing::any};
         async fn gate(
             State((want, accepted)): State<(String, Arc<AtomicUsize>)>,
-            headers: axum::http::HeaderMap,
+            head: axum::http::request::Parts,
         ) -> axum::response::Response {
-            match super::super::console::ingest_decision(&headers, Some(&want), None) {
+            match super::super::console::ingest_decision(&head, Some(&want), None) {
                 Some(refusal) => refusal,
                 None => {
                     accepted.fetch_add(1, Ordering::SeqCst);

@@ -116,7 +116,6 @@ use std::sync::OnceLock;
 use ipe_diagnostics::TyDoc;
 use ipe_docs::{CommandInfo, Index, html};
 use ipe_intern::Interner;
-use ipe_runtime_rust::inbound_authority::{Authority, AuthorityRefusal, DeclaredNames};
 use ipe_types::{Ty, VarNamer, ty_to_doc};
 
 use crate::CliError;
@@ -5035,6 +5034,14 @@ struct PreviewHeaders {
 }
 
 impl PreviewHeaders {
+    /// The headers every preview response carries: the policy, and no framing.
+    fn site_headers(&self) -> crate::loopback_http::SiteHeaders<'_> {
+        crate::loopback_http::SiteHeaders {
+            csp: &self.csp,
+            framing: crate::loopback_http::Framing::Deny,
+        }
+    }
+
     /// The policy as a written page's `<meta http-equiv>` carries it.
     fn meta_csp(&self) -> String {
         self.csp
@@ -5783,366 +5790,74 @@ fn render_html_module(module: &ModuleDoc, index: &AnchorIndex, search_script: &s
 /// [`CliError::Io`] if the loopback port cannot be bound (a pinned port already
 /// in use), plus any error from [`build_docs`].
 fn serve(path: &Path, port: Option<u16>) -> Result<(), CliError> {
-    use std::net::TcpListener;
-
     crate::style::print_command_header();
     let (docs, _) = build_docs_or_stdlib(path)?;
     let bundle = build_doc_bundle(&DocsOverlay::for_project(path)?)?;
     let site = render_site_for_serve(&docs, &bundle);
 
-    let addr = format!("127.0.0.1:{}", port.unwrap_or(0));
-    let listener = TcpListener::bind(&addr).map_err(|e| crate::io_err(Path::new(&addr), e))?;
-    let bound = listener
-        .local_addr()
-        .map_err(|e| crate::io_err(Path::new(&addr), e))?;
-
-    let url = format!("http://{bound}/");
-    crate::screen::status(
-        crate::screen::Stream::Stdout,
-        true,
-        &crate::style::TerminalSafe::sanitize(&format!(
-            "serving docs at {url} (read-only, loopback; Ctrl-C to stop)"
-        )),
-    );
+    let port = port.unwrap_or(0);
+    let listener = crate::loopback_http::bind_loopback(port).map_err(|e| {
+        let addr = std::net::SocketAddrV4::new(crate::loopback_http::LOOPBACK, port).to_string();
+        crate::io_err(Path::new(&addr), e)
+    })?;
     // A headless caller (CI, a test, a remote shell) opts out of the browser pop
-    // with `IPE_DOC_NO_OPEN`; the URL is already printed, so the preview stays
-    // reachable.
-    if ipe_env::var_os("IPE_DOC_NO_OPEN").is_none()
-        && let Ok(url) =
-            crate::browser::BrowserUrl::parse(&url, crate::browser::BrowserOrigin::Loopback)
-    {
-        let _ = crate::browser::open_url(&url);
-    }
+    // with `IPE_DOC_NO_OPEN`; the URL is printed either way, so the preview
+    // stays reachable.
+    let opener = ipe_env::var_os("IPE_DOC_NO_OPEN")
+        .is_none()
+        .then_some(crate::browser::open_url);
+    crate::loopback_http::announce(
+        &listener,
+        "/",
+        |url| text::msg::doc_serve_serving(&url.as_str()),
+        opener,
+    )?;
 
-    serve_site(&listener, &site, DOC_SERVE_IO_BUDGET);
+    crate::loopback_http::serve_site(
+        &listener,
+        &DocSite {
+            pages: &site,
+            headers: preview_headers(),
+        },
+        crate::loopback_http::IO_BUDGET,
+    );
     Ok(())
 }
 
-/// Serve `site` on `listener`, one connection at a time, until the process ends.
-///
-/// A single dropped connection must not take the server down; `flatten` skips
-/// the `Err`s and serves each accepted stream. `budget` bounds each
-/// connection's head read and response write, each in wall-clock.
-fn serve_site(
-    listener: &std::net::TcpListener,
-    site: &BTreeMap<String, String>,
-    budget: std::time::Duration,
-) {
-    for conn in listener.incoming().flatten() {
-        serve_one(&conn, site, budget);
-    }
+/// The doc preview as a loopback [`Site`](crate::loopback_http::Site): the
+/// built pages, by file name, under the preview's policy.
+struct DocSite<'s> {
+    pages: &'s BTreeMap<String, String>,
+    headers: &'s PreviewHeaders,
 }
 
-/// The most bytes the doc server reads of one request head, request line and
-/// headers together.
-///
-/// A few kilobytes covers any real head, and the cap turns a client that streams
-/// bytes without ending its head into a bounded read rather than unbounded buffer
-/// growth.
-const DOC_SERVE_REQUEST_HEAD_CAP: usize = 16 * 1024;
-
-/// The wall-clock the doc server spends reading one request head, and again
-/// writing one response, before it abandons the connection.
-///
-/// The bound is on the whole head and the whole response, not on each read or
-/// write: a peer that never sends, drips a byte at a time, or never reads its
-/// response stalls the one-connection-at-a-time loop briefly, never forever.
-const DOC_SERVE_IO_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// One connection's socket under a wall-clock deadline: each read or write
-/// waits at most the time left, and none starts once the deadline has passed.
-struct DeadlineConn<'a> {
-    conn: &'a std::net::TcpStream,
-    deadline: std::time::Instant,
-}
-
-impl DeadlineConn<'_> {
-    /// The time left before the deadline.
-    ///
-    /// # Errors
-    ///
-    /// [`std::io::ErrorKind::TimedOut`] once the deadline has passed.
-    fn time_left(&self) -> std::io::Result<std::time::Duration> {
-        let left = self
-            .deadline
-            .saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() {
-            Err(std::io::ErrorKind::TimedOut.into())
-        } else {
-            Ok(left)
-        }
-    }
-}
-
-impl std::io::Read for DeadlineConn<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.conn.set_read_timeout(Some(self.time_left()?))?;
-        let mut conn = self.conn;
-        std::io::Read::read(&mut conn, buf)
-    }
-}
-
-impl std::io::Write for DeadlineConn<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.conn.set_write_timeout(Some(self.time_left()?))?;
-        let mut conn = self.conn;
-        std::io::Write::write(&mut conn, buf)
+impl crate::loopback_http::Site for DocSite<'_> {
+    fn headers(&self) -> crate::loopback_http::SiteHeaders<'_> {
+        self.headers.site_headers()
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        let mut conn = self.conn;
-        std::io::Write::flush(&mut conn)
+    /// The built file `path` names (`/` is `index.html`), whatever the method,
+    /// or a `404` when it names no built file.
+    fn respond(
+        &self,
+        _method: crate::loopback_http::Method,
+        path: &str,
+    ) -> crate::loopback_http::Reply<'_> {
+        use crate::loopback_http::{Reply, Status};
+        let name = serve_file_name(path);
+        self.pages.get(&name).map_or(
+            Reply {
+                status: Status::NotFound,
+                content_type: "text/plain; charset=utf-8",
+                body: b"not found\n",
+            },
+            |body| Reply {
+                status: Status::Ok,
+                content_type: content_type(&name),
+                body: body.as_bytes(),
+            },
+        )
     }
-}
-
-/// The fixed body of a `421` answered to a request whose host is not admitted.
-const DOC_SERVE_REFUSED_HOST_BODY: &str = r#"{"status":"host_not_admitted"}"#;
-
-/// The `Host` headers one request head carries.
-#[derive(Debug, PartialEq, Eq)]
-enum HostHeader {
-    /// No `Host` header.
-    Absent,
-    /// Exactly one `Host` header, its value trimmed of optional whitespace.
-    One(String),
-    /// Two or more `Host` headers.
-    Duplicate,
-}
-
-/// The parts of a request head the doc server acts on.
-#[derive(Debug)]
-struct RequestHead {
-    /// The request target, as the request line spells it.
-    target: String,
-    /// The head's `Host` headers.
-    host: HostHeader,
-}
-
-/// Why a request head is not read to its end.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HeadRefusal {
-    /// The head fills [`DOC_SERVE_REQUEST_HEAD_CAP`] without ending: `431`.
-    TooLarge,
-    /// A line is not UTF-8 or not a `name: value` header field: `400`.
-    Malformed,
-    /// The peer closed or stalled before ending the head: nothing is answered.
-    Abandoned,
-}
-
-impl RequestHead {
-    /// The path to serve, when the request's target authority is admitted.
-    ///
-    /// The doc server declares no DNS name, so only an IP literal or a loopback
-    /// name admits: a rebound DNS name pointed at the loopback server is refused.
-    ///
-    /// # Errors
-    ///
-    /// The [`AuthorityRefusal`] of an absent, duplicated, disagreeing or
-    /// malformed authority, or [`AuthorityRefusal::Malformed`] for a target in
-    /// neither origin nor absolute form; `Ok(None)` for an undeclared DNS name.
-    fn admitted_path(&self) -> Result<Option<&str>, AuthorityRefusal> {
-        let (path, target_authority) = split_request_target(&self.target)?;
-        let authority = request_authority(target_authority, &self.host)?;
-        Ok(DeclaredNames::none()
-            .admits(authority.host())
-            .then_some(path))
-    }
-}
-
-/// Split a request target into the path to serve and the authority it names.
-///
-/// Origin form (`/path`) names no authority; absolute form
-/// (`scheme://authority/path`) names its authority.
-///
-/// # Errors
-///
-/// [`AuthorityRefusal::Malformed`] for any other form.
-fn split_request_target(target: &str) -> Result<(&str, Option<&str>), AuthorityRefusal> {
-    if target.starts_with('/') {
-        return Ok((target, None));
-    }
-    let (_, rest) = target
-        .split_once("://")
-        .ok_or(AuthorityRefusal::Malformed)?;
-    let (authority, path) = rest
-        .find(['/', '?', '#'])
-        .and_then(|end| rest.split_at_checked(end))
-        .unwrap_or((rest, ""));
-    Ok((if path.is_empty() { "/" } else { path }, Some(authority)))
-}
-
-/// The request's target authority: the absolute-form target's, else the one
-/// `Host` header's.
-///
-/// # Errors
-///
-/// [`AuthorityRefusal::Duplicate`] for two `Host` headers,
-/// [`AuthorityRefusal::Absent`] for neither source,
-/// [`AuthorityRefusal::Disagrees`] when both are present and differ, and
-/// [`AuthorityRefusal::Malformed`] when either does not parse.
-fn request_authority(
-    target_authority: Option<&str>,
-    host: &HostHeader,
-) -> Result<Authority, AuthorityRefusal> {
-    let header = match host {
-        HostHeader::Duplicate => return Err(AuthorityRefusal::Duplicate),
-        HostHeader::Absent => None,
-        HostHeader::One(value) => Some(value.as_str()),
-    };
-    match (target_authority, header) {
-        (None, None) => Err(AuthorityRefusal::Absent),
-        (Some(raw), None) | (None, Some(raw)) => Authority::parse(raw),
-        (Some(target), Some(value)) => {
-            let target = Authority::parse(target)?;
-            if Authority::parse(value)? == target {
-                Ok(target)
-            } else {
-                Err(AuthorityRefusal::Disagrees)
-            }
-        }
-    }
-}
-
-/// Read one request head: its request line, then header lines up to the blank
-/// line that ends it.
-///
-/// Every line read consumes at least its newline from the capped reader, so the
-/// loop ends within [`DOC_SERVE_REQUEST_HEAD_CAP`] bytes.
-///
-/// # Errors
-///
-/// [`HeadRefusal::TooLarge`] when the cap runs out first,
-/// [`HeadRefusal::Malformed`] for a request line with no target or a line
-/// that is not a header field, and
-/// [`HeadRefusal::Abandoned`] when the peer stops sending.
-fn read_head<R: std::io::Read>(
-    reader: &mut std::io::BufReader<std::io::Take<R>>,
-) -> Result<RequestHead, HeadRefusal> {
-    let mut line = String::new();
-    read_head_line(reader, &mut line)?;
-    let target = line
-        .split_whitespace()
-        .nth(1)
-        .ok_or(HeadRefusal::Malformed)?
-        .to_owned();
-    let mut host = HostHeader::Absent;
-    loop {
-        read_head_line(reader, &mut line)?;
-        if line.is_empty() {
-            return Ok(RequestHead { target, host });
-        }
-        let (name, value) = header_field(&line).ok_or(HeadRefusal::Malformed)?;
-        if name.eq_ignore_ascii_case("host") {
-            host = match host {
-                HostHeader::Absent => HostHeader::One(value.to_owned()),
-                HostHeader::One(_) | HostHeader::Duplicate => HostHeader::Duplicate,
-            };
-        }
-    }
-}
-
-/// Read one head line into `line`, its `\n` or `\r\n` terminator removed.
-///
-/// # Errors
-///
-/// [`HeadRefusal::TooLarge`] for a line the cap cuts short,
-/// [`HeadRefusal::Malformed`] for a line that is not UTF-8, and
-/// [`HeadRefusal::Abandoned`] for a peer that closes or stalls mid-line.
-fn read_head_line<R: std::io::Read>(
-    reader: &mut std::io::BufReader<std::io::Take<R>>,
-    line: &mut String,
-) -> Result<(), HeadRefusal> {
-    use std::io::BufRead;
-
-    line.clear();
-    match reader.read_line(line) {
-        Ok(_) if line.ends_with('\n') => {
-            line.pop();
-            if line.ends_with('\r') {
-                line.pop();
-            }
-            Ok(())
-        }
-        Ok(_) if reader.get_ref().limit() == 0 => Err(HeadRefusal::TooLarge),
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Err(HeadRefusal::Malformed),
-        Ok(_) | Err(_) => Err(HeadRefusal::Abandoned),
-    }
-}
-
-/// A header line's name and its value trimmed of optional whitespace.
-///
-/// `None` for a folded continuation line or a line that is not `name: value`.
-fn header_field(line: &str) -> Option<(&str, &str)> {
-    let (name, value) = line.split_once(':')?;
-    let token = !name.is_empty() && name.bytes().all(|b| b.is_ascii_graphic());
-    token.then(|| (name, value.trim_matches([' ', '\t'])))
-}
-
-/// Serve one HTTP/1.1 request from the in-memory `site`, read-only.
-///
-/// Reads the request head under a byte cap and a `budget` deadline, judges the
-/// request's target authority, maps its path to a built file (`/` →
-/// `index.html`), and writes, under a fresh `budget` deadline, the file with its
-/// content type, a `404` when the path names no built file, or a `421` when the
-/// host is not admitted. The body, if any, is ignored (nothing here writes or
-/// executes).
-fn serve_one(
-    conn: &std::net::TcpStream,
-    site: &BTreeMap<String, String>,
-    budget: std::time::Duration,
-) {
-    use std::io::{BufReader, Read, Write};
-    use std::time::Instant;
-
-    let Some(deadline) = Instant::now().checked_add(budget) else {
-        return;
-    };
-    let headers = preview_headers();
-    let mut reader =
-        BufReader::new(DeadlineConn { conn, deadline }.take(DOC_SERVE_REQUEST_HEAD_CAP as u64));
-    let response = match read_head(&mut reader) {
-        Err(HeadRefusal::Abandoned) => return,
-        Err(HeadRefusal::TooLarge) => http_response(
-            headers,
-            "431 Request Header Fields Too Large",
-            "text/plain; charset=utf-8",
-            "request head too large\n",
-        ),
-        Err(HeadRefusal::Malformed) => http_response(
-            headers,
-            "400 Bad Request",
-            "text/plain; charset=utf-8",
-            "malformed request head\n",
-        ),
-        Ok(head) => match head.admitted_path() {
-            Ok(Some(path)) => {
-                let name = serve_file_name(path);
-                site.get(&name).map_or_else(
-                    || {
-                        http_response(
-                            headers,
-                            "404 Not Found",
-                            "text/plain; charset=utf-8",
-                            "not found\n",
-                        )
-                    },
-                    |body| http_response(headers, "200 OK", content_type(&name), body),
-                )
-            }
-            Ok(None) | Err(_) => http_response(
-                headers,
-                "421 Misdirected Request",
-                "application/json",
-                DOC_SERVE_REFUSED_HOST_BODY,
-            ),
-        },
-    };
-    let Some(deadline) = Instant::now().checked_add(budget) else {
-        return;
-    };
-    let mut writer = DeadlineConn { conn, deadline };
-    let _ = writer.write_all(response.as_bytes());
-    let _ = writer.flush();
 }
 
 /// Map a request path to a built-file key: `/` (or empty) → `index.html`,
@@ -6170,28 +5885,69 @@ fn content_type(name: &str) -> &'static str {
     }
 }
 
-/// A complete HTTP/1.1 response: the one production sink every served byte
-/// leaves through.
-///
-/// Every status and content type carries the security headers (the policy,
-/// `nosniff`, no referrer, no framing), an explicit `Content-Length`, a
-/// `Connection: close` (the loop serves one request per connection), and
-/// `Cache-Control: no-store` (the site is a live preview built in memory).
-fn http_response(headers: &PreviewHeaders, status: &str, content_type: &str, body: &str) -> String {
-    format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n\
-         Content-Length: {}\r\nCache-Control: no-store\r\n\
-         Content-Security-Policy: {}\r\nX-Content-Type-Options: nosniff\r\n\
-         Referrer-Policy: no-referrer\r\nX-Frame-Options: DENY\r\n\
-         Connection: close\r\n\r\n{body}",
-        body.len(),
-        headers.csp,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::loopback_http::{
+        IO_BUDGET as DOC_SERVE_IO_BUDGET, REFUSED_HOST_BODY as DOC_SERVE_REFUSED_HOST_BODY,
+        REQUEST_HEAD_CAP as DOC_SERVE_REQUEST_HEAD_CAP, Status,
+    };
+
+    /// The doc site over `pages` under the preview's headers.
+    fn doc_site(pages: &BTreeMap<String, String>) -> DocSite<'_> {
+        DocSite {
+            pages,
+            headers: preview_headers(),
+        }
+    }
+
+    /// Serve the doc site over `pages` on `listener` through the loopback core,
+    /// one connection at a time: a stalled peer then holds the only slot, so
+    /// only the budget's deadline frees the server for the next request.
+    fn serve_site(
+        listener: &std::net::TcpListener,
+        pages: &BTreeMap<String, String>,
+        budget: std::time::Duration,
+    ) {
+        crate::loopback_http::serve_site_with(
+            listener,
+            &doc_site(pages),
+            budget,
+            std::num::NonZeroUsize::MIN,
+        );
+    }
+
+    /// Serve one request on `conn` from the doc site over `pages`.
+    fn serve_one(
+        conn: &std::net::TcpStream,
+        pages: &BTreeMap<String, String>,
+        budget: std::time::Duration,
+    ) {
+        crate::loopback_http::serve_one(conn, &doc_site(pages), budget);
+    }
+
+    /// The whole response the doc server writes to a `GET` answered with `status`.
+    fn http_response(
+        headers: &PreviewHeaders,
+        status: Status,
+        content_type: &'static str,
+        body: &str,
+    ) -> String {
+        let mut out = Vec::new();
+        crate::loopback_http::write_reply(
+            &mut out,
+            headers.site_headers(),
+            crate::loopback_http::Method::Get,
+            &crate::loopback_http::Reply {
+                status,
+                content_type,
+                body: body.as_bytes(),
+            },
+        )
+        .expect("a Vec takes every write");
+        String::from_utf8(out).expect("a UTF-8 response")
+    }
 
     #[test]
     fn build_kernel_module_docs_is_non_vacuous_over_the_live_registry() {
@@ -8538,7 +8294,7 @@ serve app
     fn http_response_has_length_and_close() {
         let r = http_response(
             preview_headers(),
-            "200 OK",
+            Status::Ok,
             "text/html; charset=utf-8",
             "hi",
         );
@@ -8594,14 +8350,14 @@ serve app
     fn every_preview_response_carries_the_security_headers() {
         let headers = preview_headers();
         let responses = [
-            http_response(headers, "200 OK", content_type("index.html"), "<p>hi</p>"),
-            http_response(headers, "200 OK", content_type("style.css"), "body{}"),
-            http_response(headers, "200 OK", content_type("x.js"), "1"),
-            http_response(headers, "200 OK", content_type("M.md"), "# M"),
-            http_response(headers, "200 OK", content_type("notes.txt"), "plain"),
+            http_response(headers, Status::Ok, content_type("index.html"), "<p>hi</p>"),
+            http_response(headers, Status::Ok, content_type("style.css"), "body{}"),
+            http_response(headers, Status::Ok, content_type("x.js"), "1"),
+            http_response(headers, Status::Ok, content_type("M.md"), "# M"),
+            http_response(headers, Status::Ok, content_type("notes.txt"), "plain"),
             http_response(
                 headers,
-                "404 Not Found",
+                Status::NotFound,
                 "text/plain; charset=utf-8",
                 "not found\n",
             ),
@@ -8610,6 +8366,7 @@ serve app
             format!("Content-Security-Policy: {}\r\n", headers.csp),
             "X-Content-Type-Options: nosniff\r\n".to_owned(),
             "Referrer-Policy: no-referrer\r\n".to_owned(),
+            "Cross-Origin-Resource-Policy: same-origin\r\n".to_owned(),
             "X-Frame-Options: DENY\r\n".to_owned(),
         ];
         for response in &responses {
@@ -9949,45 +9706,6 @@ withBaseMs = something
             served.starts_with("HTTP/1.1 200 OK\r\n"),
             "a head ended inside the cap must be served: {served}"
         );
-    }
-
-    #[test]
-    fn request_authority_refusals_are_typed() {
-        let one = |v: &str| HostHeader::One(v.to_owned());
-        assert_eq!(
-            request_authority(None, &HostHeader::Absent),
-            Err(AuthorityRefusal::Absent)
-        );
-        assert_eq!(
-            request_authority(None, &HostHeader::Duplicate),
-            Err(AuthorityRefusal::Duplicate)
-        );
-        assert_eq!(
-            request_authority(Some("127.0.0.1"), &HostHeader::Duplicate),
-            Err(AuthorityRefusal::Duplicate)
-        );
-        assert_eq!(
-            request_authority(Some("127.0.0.1:80"), &one("127.0.0.1")),
-            Err(AuthorityRefusal::Disagrees)
-        );
-        assert_eq!(
-            request_authority(None, &one("user@127.0.0.1")),
-            Err(AuthorityRefusal::Malformed)
-        );
-        assert_eq!(
-            split_request_target("index.html"),
-            Err(AuthorityRefusal::Malformed)
-        );
-        assert_eq!(
-            request_authority(Some("127.0.0.1:80"), &one("127.0.0.1:80")),
-            Authority::parse("127.0.0.1:80"),
-            "an agreeing pair is the one authority"
-        );
-        assert_eq!(
-            split_request_target("http://127.0.0.1:80?x"),
-            Ok(("?x", Some("127.0.0.1:80")))
-        );
-        assert_eq!(split_request_target("http://a"), Ok(("/", Some("a"))));
     }
 
     #[test]

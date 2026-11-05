@@ -100,7 +100,7 @@ static EXIT_LINE: ExitLine = ExitLine::new();
 ///
 /// Only a [`FrameEnd::PromptOpen`] frame opens it; the next frame, a
 /// newline-ended input line, or [`LineState::close`] ends it. A state made by
-/// [`LineState::for_exit_hook`] publishes the bit to the exit stage once the
+/// [`LineState::for_exit_stage`] publishes the bit to the exit stage once the
 /// bytes that set it are written ([`LineState::emit`]), so `System.exit` ends
 /// an open line too. It is neither `Clone` nor `Copy`: a copy would publish a
 /// second, diverging bit to the same exit stage.
@@ -120,7 +120,7 @@ impl std::fmt::Debug for LineState {
 }
 
 impl LineState {
-    /// A state before its first frame, seen by no exit hook: no line open.
+    /// A state before its first frame, seen by no exit stage: no line open.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -131,13 +131,17 @@ impl LineState {
 
     /// The process run's state, published to [`close_open_line_on_exit`].
     #[must_use]
-    pub fn for_exit_hook() -> Self {
+    pub fn for_exit_stage() -> Self {
         Self::published_to(&EXIT_LINE)
     }
 
     /// A state before its first frame whose open bit `exit_line` follows.
+    ///
+    /// Called only while this run holds the line-close stage, so the seal a
+    /// previous run's retired stage left is lifted for the new run.
     fn published_to(exit_line: &'static ExitLine) -> Self {
         exit_line.open.store(false, Ordering::SeqCst);
+        exit_line.ended.store(false, Ordering::SeqCst);
         Self {
             line_open: false,
             exit_line: Some(exit_line),
@@ -205,15 +209,15 @@ impl LineState {
     }
 }
 
-/// The `System.exit` stage of a `Cli.tea` run: end the open line, if any.
+/// The line-close exit stage of a `Cli.tea` run: end the open line, if any.
 ///
-/// Registered as the process exit hook, because `process::exit` skips the
-/// loop's own [`LineState::close`]. It holds stdout's lock while it reads and
-/// seals the shared bits, so the loop's close and this stage write the closing
-/// `\n` at most once between them, and no frame follows it.
-pub fn close_open_line_on_exit() {
-    let mut out = std::io::stdout().lock();
-    end_output(&EXIT_LINE, &mut out);
+/// Registered as the run's `pre_exit` line-close stage, because
+/// `process::exit` skips the loop's own [`LineState::close`]. It writes through
+/// `out`, the stdout lock its caller holds, while it reads and seals the shared
+/// bits, so the loop's close and this stage write the closing `\n` at most
+/// once between them, and no frame follows it.
+pub fn close_open_line_on_exit(out: &mut std::io::StdoutLock<'static>) {
+    end_output(&EXIT_LINE, out);
 }
 
 /// Seal `exit_line`, then write the `\n` an open line needs to `out`.
@@ -666,6 +670,22 @@ mod tests {
         let mut free = Vec::new();
         emit_frame(&prompt(), &PLAIN_PROMPT, &mut unseen, &mut free);
         assert_eq!(free, b"> ");
+    }
+
+    // A run that holds the line-close stage after an earlier run's stage was
+    // retired writes its frames: the earlier seal does not silence it.
+    #[test]
+    fn a_run_after_a_retired_close_writes_its_frames() {
+        static EXIT: ExitLine = ExitLine::new();
+        let mut first = LineState::published_to(&EXIT);
+        let mut out = Vec::new();
+        emit_frame(&prompt(), &PLAIN_PROMPT, &mut first, &mut out);
+        end_output(&EXIT, &mut out);
+        assert_eq!(out, b"> \n");
+        let mut second = LineState::published_to(&EXIT);
+        let mut next = Vec::new();
+        emit_frame(&prompt(), &PLAIN_PROMPT, &mut second, &mut next);
+        assert_eq!(next, b"> ", "the earlier run's seal silenced the new run");
     }
 
     /// Whether `T` is `Clone`: the inherent constant applies only to a

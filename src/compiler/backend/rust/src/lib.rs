@@ -2459,7 +2459,7 @@ impl<'a> EmitCtx<'a> {
             //     loopback control socket (no HTTP endpoint).
             // A cli (`uses_console`) is excluded: it has no repaintable
             // appearance surface, and its dev-loop debugger uses the
-            // `IPE_DEBUGGER_RECORD` dump at loop exit, not the control socket. A
+            // `IPE_DEBUGGER_RECORD` dump at exit, not the control socket. A
             // pure webview shape (`uses_webview && !uses_web`) is likewise gated
             // off: it ships `web-core` (so the table would build) but runs no
             // control port to push to. With the flag off (`ipe dev build`/`ipe

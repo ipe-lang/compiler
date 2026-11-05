@@ -921,7 +921,7 @@ pub(crate) fn begin_tui_session_profile() {
 
 /// Un-pin the session profile on teardown, so the next render — a fresh
 /// session, or a one-shot render with no session (e.g. `element_to_cells`) —
-/// resolves fresh again. Called from `tui_teardown`.
+/// resolves fresh again. Called from `tui::app::tui_teardown_on`.
 #[cfg(feature = "tui")]
 pub(crate) fn end_tui_session_profile() {
     TUI_SESSION_PROFILE.store(0, std::sync::atomic::Ordering::SeqCst);
