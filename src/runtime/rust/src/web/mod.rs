@@ -4959,29 +4959,13 @@ fn noise_candidate(
     Some((candidate, mime))
 }
 
-/// Content type for a browser-noise file served from the static root. The
-/// extensions here mirror what browsers actually probe at the origin root.
+/// Content type for a browser-noise file served from the static root: the
+/// one bundle media-type table ([`crate::bundle_route::MediaType`]), so a file
+/// the static root answers and the same file in a client bundle carry one type.
 /// Anything unknown falls back to octet-stream rather than guessing.
 #[cfg(feature = "web")]
 fn static_noise_mime(ext: &str) -> &'static str {
-    match ext {
-        "ico" => "image/x-icon",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "svg" => "image/svg+xml",
-        "webp" => "image/webp",
-        "css" => "text/css; charset=utf-8",
-        "js" => "application/javascript; charset=utf-8",
-        "map" | "json" => "application/json",
-        "txt" => "text/plain; charset=utf-8",
-        "xml" => "application/xml",
-        "woff" => "font/woff",
-        "woff2" => "font/woff2",
-        "ttf" => "font/ttf",
-        "wasm" => "application/wasm",
-        _ => "application/octet-stream",
-    }
+    crate::bundle_route::MediaType::of_extension(ext).header_value()
 }
 
 /// Where an SSE reconnect's `?path=` lands in this app's route table.
@@ -7573,7 +7557,7 @@ where
     // changes, making `Cache-Control: immutable` safe. This route is CSRF-
     // exempt (GET; the CSRF middleware only checks mutating verbs) and open
     // to all (it's a static public asset). It is registered BEFORE the
-    // catch-all `/*path` route so it is matched first.
+    // catch-all `/{*path}` route so it is matched first.
     let client_js_route_path = client_js_path(); // e.g. "/_ipe/client.a1b2c3d4e5f6a7b8.js"
     async fn serve_client_js() -> impl axum::response::IntoResponse {
         use axum::http::header;
@@ -7850,7 +7834,7 @@ where
     // registered author module + one for the generated registration glue.
     // Each serves a `&'static str` (the bytes interned in the process-global
     // registry at startup) with the same `immutable` discipline as the client
-    // asset. Registered BEFORE the `/*path` page catch-all so a widget URL
+    // asset. Registered BEFORE the `/{*path}` page catch-all so a widget URL
     // hits its static handler, not the page handler. The routes are static
     // public GETs (CSRF-exempt, open) — the served bytes are the exact bytes
     // the page's SRI pins, so a tampered asset makes the browser refuse the
@@ -7860,9 +7844,8 @@ where
         // before forwarding, so routes sit at the root and only the URLs the
         // page and glue carry are built from the app's base.
         let route_root = crate::encoding::MountBase::root();
-        for asset in widget_assets::registered() {
-            let path = route_root.url_of(&widget_assets::widget_asset_path(&asset.content));
-            let content: &'static str = &asset.content;
+        for (asset_path, content) in widget_assets::served_assets(widget_assets::registered()) {
+            let path = route_root.url_of(&asset_path);
             router = router.route(&path, get(move || async move { serve_widget_js(content) }));
         }
         let glue_path = route_root.url_of(&widget_assets::glue_path(
@@ -7889,7 +7872,7 @@ where
     router = install::mount_routes(router, install::registered(), mount.base());
 
     // `IPE_WEB_STATIC_DIR`, set by whoever runs the app → serve files at
-    // /static/* via ServeDir. The nest outranks the `/*path` page catch-all, so
+    // /static/* via ServeDir. The nest outranks the `/{*path}` page catch-all, so
     // a /static/<file> request hits ServeDir, not the page handler (which
     // would return HTML). Inside the nest a `MountTable` re-bases the
     // listener's parse and the URI below `/static` exactly as a `Server.static`
@@ -7914,7 +7897,7 @@ where
             get(handlers::page::<Model, Msg, FInit, FUpdate, FView, FSubs>),
         )
         .route(
-            "/*path",
+            "/{*path}",
             get(handlers::page::<Model, Msg, FInit, FUpdate, FView, FSubs>),
         )
         // Layer order (axum: last `.layer` = outermost): CSRF is INNER of
@@ -10912,10 +10895,7 @@ mod static_noise_mime_tests {
         assert_eq!(static_noise_mime("ico"), "image/x-icon");
         assert_eq!(static_noise_mime("png"), "image/png");
         assert_eq!(static_noise_mime("css"), "text/css; charset=utf-8");
-        assert_eq!(
-            static_noise_mime("js"),
-            "application/javascript; charset=utf-8"
-        );
+        assert_eq!(static_noise_mime("js"), "text/javascript; charset=utf-8");
         assert_eq!(static_noise_mime("json"), "application/json");
         assert_eq!(static_noise_mime("woff2"), "font/woff2");
     }
@@ -10923,6 +10903,34 @@ mod static_noise_mime_tests {
     #[test]
     fn wasm_serves_as_application_wasm() {
         assert_eq!(static_noise_mime("wasm"), "application/wasm");
+    }
+
+    #[test]
+    fn static_noise_mime_agrees_with_media_type() {
+        use crate::bundle_route::MediaType;
+        for (ext, media) in MediaType::BY_EXTENSION {
+            assert_eq!(static_noise_mime(ext), media.header_value(), "{ext}");
+        }
+        for (ext, kept) in [
+            ("ico", "image/x-icon"),
+            ("png", "image/png"),
+            ("jpg", "image/jpeg"),
+            ("jpeg", "image/jpeg"),
+            ("gif", "image/gif"),
+            ("svg", "image/svg+xml"),
+            ("webp", "image/webp"),
+            ("css", "text/css; charset=utf-8"),
+            ("map", "application/json"),
+            ("json", "application/json"),
+            ("txt", "text/plain; charset=utf-8"),
+            ("xml", "application/xml"),
+            ("woff", "font/woff"),
+            ("woff2", "font/woff2"),
+            ("ttf", "font/ttf"),
+            ("wasm", "application/wasm"),
+        ] {
+            assert_eq!(static_noise_mime(ext), kept, "{ext}");
+        }
     }
 
     #[test]
@@ -15828,6 +15836,71 @@ mod emitted_router_behavior_tests {
         });
     }
 
+    /// `Server.mountApp "/"` beside a `Server.get` route: the listener's own
+    /// route assembly starts (the router panics on a nest at `/`, so the root
+    /// mount must never be one), the handler answers its path and the app
+    /// answers every other one, its page and its runtime routes alike.
+    #[test]
+    #[allow(clippy::expect_used)] // test: fixed requests build and bodies are UTF-8
+    fn a_root_mounted_app_starts_beside_server_routes() {
+        let app = crate::tea::WebApp(crate::tea::WebAppKind::Mountable {
+            serve: Box::pin(async { crate::IpeResult::Ok(()) }),
+            router: web_embed_router(
+                init,
+                update,
+                view,
+                subs,
+                "memory".to_string(),
+                String::new(),
+                [0u8; 32],
+            ),
+        });
+        let routes = vec![
+            crate::server::server_get::<String, _>(
+                "/api".to_owned(),
+                |_req: crate::server::ServerRequest| {
+                    Box::pin(async {
+                        crate::IpeResult::Ok(crate::server::server_text("api".to_owned()))
+                    }) as crate::IpeTask<String, crate::server::ServerResponse>
+                },
+            ),
+            crate::server::server_mount_app("/".to_owned(), app),
+        ];
+        block_on(async move {
+            let listener = crate::server::listen_router(routes)
+                .await
+                .expect("a root mount beside a route starts");
+            for (uri, status, body) in [
+                ("/api", StatusCode::OK, Some("api")),
+                ("/", StatusCode::OK, None),
+                ("/elsewhere", StatusCode::OK, None),
+                ("/_ipe/healthz", StatusCode::OK, None),
+            ] {
+                let resp = listener
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("GET")
+                            .uri(uri)
+                            .body(Body::empty())
+                            .expect("build GET"),
+                    )
+                    .await
+                    .expect("router responds");
+                assert_eq!(resp.status(), status, "{uri}");
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .expect("read body");
+                let text = String::from_utf8(bytes.to_vec()).expect("the body is UTF-8");
+                if let Some(want) = body {
+                    assert_eq!(text, want, "{uri}");
+                } else {
+                    assert_ne!(text, "api", "{uri} is served by the app");
+                }
+            }
+        });
+    }
+
     /// A mounted app whose store config this build cannot honour answers every
     /// path with the fixed 503 body, never the store detail.
     #[cfg(not(feature = "redis_store"))]
@@ -18695,7 +18768,7 @@ mod route_entry_cmd_tests {
                 let page_hits = Arc::new(AtomicUsize::new(0));
                 let hits = Arc::clone(&page_hits);
                 let catch_all = axum::Router::new().route(
-                    "/*path",
+                    "/{*path}",
                     axum::routing::get(move || {
                         let hits = Arc::clone(&hits);
                         async move {

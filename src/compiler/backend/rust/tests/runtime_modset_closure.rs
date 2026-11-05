@@ -1,48 +1,45 @@
 //! Fast static SEAL lint for the emitted runtime-module set.
 //!
 //! The backend trims `ipe_runtime/mod.rs` to a base module set and appends
-//! feature-modules per `uses_*` flag. Each appended module carries a
-//! `use crate::<dep>` closure that MUST itself be declared in the same emitted
-//! `mod.rs` — otherwise `ipe` exits 0 and the emitted crate fails `cargo build`
-//! (E0432/E0425/E0412), the module-set SEAL breach class.
+//! feature-modules per `uses_*` flag. Every `crate::<dep>` path a compiled
+//! module names MUST resolve to a module the same emitted `mod.rs` compiles —
+//! otherwise `ipe` exits 0 and the emitted crate fails `cargo build`
+//! (E0432/E0433/E0425/E0412), the module-set SEAL breach class.
 //!
-//! This test proves that closure WITHOUT invoking cargo: for every reachable
-//! combination of the `Module` `uses_*` flags it emits the `ipe_runtime/mod.rs`
-//! via the real backend, then checks that every top-level module the emitted
-//! `mod.rs` declares has all of its UNCONDITIONAL `use crate::<dep>::`
-//! references also declared. It is the fast counterpart to the ground-truth
-//! `ipe`-crate `seal_modset` E2E gate (which does the actual `cargo build`).
-//!
-//! "Unconditional" means: any `crate::<dep>::` or matching-length `super::`-chain
-//! reference in the production body — `use` imports, inline path expressions, and
-//! macro invocations (`crate::ct_eq::impl_ct_eq!(…)`) alike. Lines immediately
-//! preceded by a `#[cfg(...)]` attribute, or living inside a `#[cfg(test)]`
-//! module, are excluded (their target is pulled in by the same cfg, not the base
-//! append — matches the runtime's db-gated telemetry refs, which are correctly
-//! NOT a SEAL requirement).
+//! This test proves that closure WITHOUT invoking cargo. For a flag mask it
+//! emits `ipe_runtime/mod.rs` and `Cargo.toml` through the real backend and
+//! evaluates every `#[cfg(..)]` against the configuration the emitted crate
+//! builds under: the features the manifest's `default` list enables, closed
+//! under its `[features]` table, a native or wasm32 target, and never `test`.
+//! A declaration counts only when its predicate holds. A module is scanned
+//! whenever its declaration does not fail, and each `crate::` (or exact
+//! `super::`-chain) path in it — `use` imports, path expressions, macro
+//! invocations alike — is required when its enclosing predicates (item,
+//! statement, expression, inner `#![cfg]`, child `mod` declaration) do not
+//! fail. A predicate the build host decides (`unix`, `target_os`) varies, so a
+//! reference under it is required; a predicate the evaluator cannot read is
+//! refused. It is the fast counterpart to the ground-truth `ipe`-crate
+//! `seal_modset` E2E gate (which does the actual `cargo build`).
 //!
 //! ## Why not an exhaustive `2^FLAG_COUNT` sweep
 //!
 //! Brute-forcing every flag mask is `O(2^FLAG_COUNT)` — infeasible as the
-//! runtime feature count grows. This SEAL proves the SAME closure in linear
-//! time by per-flag closure + monotonicity + composition (the featureset SEAL
-//! carries the full argument). The declared-module set is monotone in the mask
-//! — the emitter only APPENDS feature modules — so a superset of flags declares
-//! a superset of modules. Each module's unconditional `use crate::<dep>` closure
-//! is source-only (mask-independent). Therefore: if every singleton flag's
-//! declared set is closed under its deps, and the declared set is monotone, then
-//! every union is closed (the composed all-flags declaration is exactly the
-//! union of the per-flag declarations, and each dep-target it needs is present
-//! in the flag that introduced its module). A bounded, deterministic sampled
-//! sweep is retained as a backstop.
+//! runtime feature count grows. The declared-module set is monotone in the mask
+//! (the emitter only APPENDS feature modules), but a module's references are
+//! not mask-independent: a flag that enables a Cargo feature turns on the
+//! references gated by it, which may need a module only another flag declares.
+//! So the proof checks every singleton and every PAIR of flags (each two-flag
+//! interaction), plus the all-flags mask and a bounded, deterministic sample of
+//! full masks as the backstop for wider interactions.
 
-use std::collections::{BTreeSet, HashMap};
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 
 use ipe_backend::Backend;
-use ipe_backend_rust::RustBackend;
+use ipe_backend_rust::{BuildIntent, RustBackend};
 use ipe_intern::Interner;
 use ipe_ir::{ModPath, Module, Program, Target};
+use syn::visit::Visit;
 
 /// A `Module` with every module-set-relevant `uses_*` flag independently
 /// settable, all else empty. The record fold is index-driven: bit `i` of `mask`
@@ -266,29 +263,6 @@ fn duplicate_declarations(mod_rs: &str) -> BTreeSet<String> {
     dups
 }
 
-/// For one runtime module `name`, read its source (`<name>.rs` or
-/// `<name>/mod.rs`) and return the set of top-level modules it references via an
-/// UNCONDITIONAL `use crate::<dep>` (dep = first path segment after `crate::`).
-/// cfg-/test-gated `use`s are excluded (their target is pulled in by the same
-/// cfg, not the base append), and so is every file of a child module whose
-/// `mod` declaration is cfg-gated.
-fn unconditional_crate_deps(runtime_root: &Path, name: &str) -> BTreeSet<String> {
-    let mut deps = BTreeSet::new();
-    let flat = runtime_root.join(format!("{name}.rs"));
-    let dir = runtime_root.join(name);
-    if flat.is_file() {
-        // `<name>.rs` is a top-level module — its module path is `crate::<name>`,
-        // so `super` reaches the crate root (1 hop).
-        scan_file_deps(&flat, 1, &mut deps);
-    }
-    if dir.is_dir() {
-        // Files under `<name>/`: `<name>/mod.rs` is `crate::<name>` (1 super to
-        // root); `<name>/foo.rs` is `crate::<name>::foo` (2); each nested dir +1.
-        collect_dir_deps(&dir, &flat, 1, &mut deps);
-    }
-    deps
-}
-
 /// The child modules whose `mod <child>;` declaration in `decl_src` carries a
 /// `#[cfg(...)]` attribute.
 ///
@@ -347,158 +321,6 @@ fn dir_child_declarations(dir: &Path, outer_file: &Path) -> BTreeSet<String> {
     std::fs::read_to_string(decl)
         .map(|src| cfg_gated_child_modules(&src))
         .unwrap_or_default()
-}
-
-/// Recurse a module's directory, scanning each `.rs` file for crate-root deps.
-/// `mod_depth` is the module-path depth of `<dir>/mod.rs` (= supers to root);
-/// `outer_file` is the `<dir>.rs` that declares the children when there is no
-/// `<dir>/mod.rs`. A child whose `mod` declaration is cfg-gated is skipped
-/// whole, file and directory alike.
-fn collect_dir_deps(dir: &Path, outer_file: &Path, mod_depth: usize, deps: &mut BTreeSet<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let gated = dir_child_declarations(dir, outer_file);
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let stem = path
-            .file_stem()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .to_owned();
-        if gated.contains(&stem) {
-            continue;
-        }
-        if path.is_dir() {
-            let child_outer = dir.join(format!("{stem}.rs"));
-            collect_dir_deps(&path, &child_outer, mod_depth + 1, deps);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            // `mod.rs` sits at `mod_depth`; any other `<file>.rs` is one module
-            // level deeper (`crate::…::<dir>::<file>`).
-            let is_mod_rs = path.file_name().is_some_and(|n| n == "mod.rs");
-            let supers = if is_mod_rs { mod_depth } else { mod_depth + 1 };
-            scan_file_deps(&path, supers, deps);
-        }
-    }
-}
-
-/// Extract every UNCONDITIONAL crate-root module dep from one file whose module
-/// reaches the crate root in `supers_to_root` `super::` hops. Both
-/// `use crate::<dep>` / `crate::<dep>::path()` and a matching-length
-/// `super`-chain name a top-level module. cfg-/test-gated lines are excluded.
-fn scan_file_deps(path: &Path, supers_to_root: usize, deps: &mut BTreeSet<String>) {
-    let src = blank_literals(&std::fs::read_to_string(path).unwrap_or_default());
-
-    // Three skip-regions, checked in priority order:
-    // 1. `in_cfg_test_mod` — `#[cfg(test)] mod tests { … }`: skip entire block.
-    // 2. `cfg_gated_depth` — inside a `#[cfg(…)]`-gated brace block: skip until
-    //    depth returns to 0.
-    // 3. `cfg_item_pending` — a `#[cfg(…)]` was seen; skip the annotated item
-    //    (including its stacked attributes, doc-comments, and multi-line signature)
-    //    until we have consumed at least one opening brace and the depth closes.
-    let mut in_cfg_test_mod = false;
-    let mut cfg_test_brace_depth: i32 = 0;
-    // `cfg_test_opened`: true once the `#[cfg(test)]` block's first `{` has been
-    // seen. Until then, stacked attributes (`#[cfg(any(feature = …))]`) and
-    // doc-comments before the `mod tests {` header keep the depth at 0 — the
-    // block must NOT be considered closed during that pre-brace window.
-    let mut cfg_test_opened = false;
-    let mut cfg_gated_depth: i32 = 0;
-    // `cfg_item_pending`: true after a `#[cfg(…)]` attr and until the cfg-gated
-    // item's block closes (or a `;`-terminated single-line item is consumed).
-    let mut cfg_item_pending = false;
-    // `cfg_item_opened`: true once the first `{` of the cfg-gated item has been
-    // seen; until then, more lines (signature / where-clause) are still gated.
-    let mut cfg_item_opened = false;
-    for line in src.lines() {
-        let t = line.trim();
-
-        // ── region 1: inside a `#[cfg(test)]` block ──────────────────────────
-        if in_cfg_test_mod {
-            cfg_test_brace_depth += unquoted_brace_delta(t);
-            if cfg_test_brace_depth > 0 {
-                // The `mod tests {` header (possibly after stacked attributes)
-                // has been reached; the block is now genuinely open.
-                cfg_test_opened = true;
-            }
-            // Only leave the test region once the block has actually opened AND
-            // its braces have balanced back to 0 — never during the pre-brace
-            // window where stacked attributes leave the depth at 0.
-            if cfg_test_opened && cfg_test_brace_depth <= 0 {
-                in_cfg_test_mod = false;
-            }
-            cfg_item_pending = false;
-            cfg_item_opened = false;
-            continue;
-        }
-        // `#[cfg(test)]` opens the test region on the NEXT non-attr line.
-        if t.starts_with("#[cfg(test)]") {
-            in_cfg_test_mod = true;
-            cfg_test_brace_depth = 0;
-            cfg_test_opened = false;
-            cfg_item_pending = false;
-            cfg_item_opened = false;
-            continue;
-        }
-
-        // ── region 2: inside a `#[cfg(…)]`-gated brace block ────────────────
-        if cfg_gated_depth > 0 {
-            cfg_gated_depth += unquoted_brace_delta(t);
-            if cfg_gated_depth <= 0 {
-                cfg_gated_depth = 0;
-                cfg_item_pending = false;
-                cfg_item_opened = false;
-            }
-            continue;
-        }
-
-        // ── region 3: cfg-item pending (pre- or mid-signature) ───────────────
-        if cfg_item_pending {
-            // Stacked attributes and doc-comments before the actual item header.
-            if t.starts_with("#[") || t.starts_with("//") {
-                continue; // remain in cfg_item_pending
-            }
-            let delta = unquoted_brace_delta(t);
-            if !cfg_item_opened {
-                // Still scanning the item header (could be multi-line `fn`/`impl`
-                // signature before the `{`). If this line has a net opening brace,
-                // the block has started; otherwise keep skipping signature lines.
-                if delta > 0 {
-                    cfg_item_opened = true;
-                    cfg_gated_depth = delta;
-                    if cfg_gated_depth <= 0 {
-                        // e.g. a one-liner `fn foo() {}` — item done.
-                        cfg_item_pending = false;
-                        cfg_item_opened = false;
-                    }
-                }
-                // else: no brace yet (still in `fn` / `where` / type params line)
-            }
-            // single-line item with semicolon and no braces: `use …;` / `type …;`
-            if delta == 0 && t.ends_with(';') {
-                cfg_item_pending = false;
-                cfg_item_opened = false;
-            }
-            continue;
-        }
-
-        // ── normal scanning ───────────────────────────────────────────────────
-
-        // Skip comment lines — `//` and `///` doc-comments may name `crate::X`
-        // in backtick links or prose; they carry no compile-time dependency.
-        if t.starts_with("//") {
-            continue;
-        }
-
-        let is_cfg_attr = t.starts_with("#[cfg(") || t.starts_with("#[cfg_attr(");
-        if is_cfg_attr {
-            cfg_item_pending = true;
-            cfg_item_opened = false;
-            continue;
-        }
-
-        crate_refs_in_line(t, supers_to_root, deps);
-    }
 }
 
 /// Blank the block comment whose `/` was just emitted, `at` being the `*`;
@@ -641,73 +463,821 @@ fn unquoted_brace_delta(line: &str) -> i32 {
     })
 }
 
-/// Scan one source line for ALL occurrences of crate-root module references —
-/// `use crate::<seg>::`, inline path expressions `crate::<seg>::fn()`, and macro
-/// invocations `crate::<seg>::mac!(…)`, plus the equivalent `super::`-chain forms
-/// — and insert every first segment into `deps`.
-///
-/// A recorded segment is followed by `::`: a module (`crate::tea::{…}`,
-/// `crate::ct_eq::impl_ct_eq!(...)`) or a root item reached through
-/// (`crate::IoFailure::on_path(..)`); [`RootScope::resolve`] maps each to the
-/// module that supplies it. A bare `crate::Foo` with no trailing `::` is not
-/// recorded.
-///
-/// The `super::`-chain form is recognised only for an EXACT chain of
-/// `supers_to_root` hops, which resolves to the crate root from this file's
-/// module depth; shorter or longer chains refer to intermediate modules, not the
-/// crate root, and are ignored.
-fn crate_refs_in_line(line: &str, supers_to_root: usize, deps: &mut BTreeSet<String>) {
-    // Build the exact `super::` prefix we accept (e.g. `super::super::` for depth 2).
-    let super_prefix: String = "super::".repeat(supers_to_root);
+// ── cfg evaluation ───────────────────────────────────────────────────────────
 
-    let mut rest = line;
-    while !rest.is_empty() {
-        // Try to match `crate::` at the current position.
-        if let Some(after_crate) = rest.strip_prefix("crate::") {
-            if let Some(seg) = extract_seg_with_trailing_colons(after_crate) {
-                deps.insert(seg);
+/// Whether a `#[cfg(..)]` predicate holds in one emitted build: it holds, it
+/// fails, or it varies with the host the emitted crate is built on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Truth {
+    Holds,
+    Fails,
+    Varies,
+}
+
+impl Truth {
+    const fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Fails, _) | (_, Self::Fails) => Self::Fails,
+            (Self::Holds, Self::Holds) => Self::Holds,
+            (Self::Holds | Self::Varies, Self::Varies) | (Self::Varies, Self::Holds) => {
+                Self::Varies
             }
-            // Advance past `crate::` to continue scanning the remainder.
-            rest = after_crate;
-            continue;
         }
-        // Try to match the exact `super::…` chain reaching the crate root.
-        if !super_prefix.is_empty()
-            && let Some(after_supers) = rest.strip_prefix(super_prefix.as_str())
-        {
-            // Must not start with another `super::` — that would be a deeper chain
-            // pointing above the crate root (impossible in Rust, but guard it).
-            if !after_supers.starts_with("super::")
-                && let Some(seg) = extract_seg_with_trailing_colons(after_supers)
-            {
-                deps.insert(seg);
+    }
+
+    const fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Holds, _) | (_, Self::Holds) => Self::Holds,
+            (Self::Fails, Self::Fails) => Self::Fails,
+            (Self::Fails | Self::Varies, Self::Varies) | (Self::Varies, Self::Fails) => {
+                Self::Varies
             }
-            rest = after_supers;
-            continue;
         }
-        // Advance by one character and keep scanning.
-        let mut chars = rest.chars();
-        chars.next();
-        rest = chars.as_str();
+    }
+
+    /// The truth of a decided atom.
+    const fn of(holds: bool) -> Self {
+        if holds { Self::Holds } else { Self::Fails }
+    }
+
+    const fn not(self) -> Self {
+        match self {
+            Self::Holds => Self::Fails,
+            Self::Fails => Self::Holds,
+            Self::Varies => Self::Varies,
+        }
     }
 }
 
-/// Extract the first identifier segment from `s` and return it if it is
-/// immediately followed by `::` (i.e. the path reaches INTO that module).
-/// Returns `None` for a bare item name (`IpeMaybe`) with no `::` suffix.
-fn extract_seg_with_trailing_colons(s: &str) -> Option<String> {
-    let seg: String = s
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect();
-    if seg.is_empty() {
-        return None;
+/// One parsed `#[cfg(..)]` predicate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Cfg {
+    /// `feature = "<name>"`.
+    Feature(String),
+    /// `test`, and a `#[test]` function: never set in an emitted build.
+    Test,
+    /// `target_arch = "wasm32"` / `target_family = "wasm"`.
+    Wasm,
+    /// An atom the build host decides: `unix`, `windows`, `target_os = ..`,
+    /// `panic = ..`, a `--cfg` flag the toolchain sets.
+    Host,
+    All(Vec<Self>),
+    Any(Vec<Self>),
+    Not(Box<Self>),
+}
+
+/// The bare cfg flags the build host decides.
+const HOST_CFG_FLAGS: &[&str] = &["unix", "windows", "debug_assertions", "ipe_asan"];
+
+/// The `key = ".."` cfg atoms the build host decides, whatever the value.
+const HOST_CFG_KEYS: &[&str] = &[
+    "target_os",
+    "target_vendor",
+    "target_env",
+    "target_pointer_width",
+    "target_endian",
+    "target_has_atomic",
+    "panic",
+];
+
+/// Parse one cfg predicate. A predicate the evaluator cannot read is refused,
+/// never read as either truth.
+fn parse_cfg(meta: &syn::Meta) -> Result<Cfg, String> {
+    let name = meta
+        .path()
+        .get_ident()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    match meta {
+        syn::Meta::Path(_) => match name.as_str() {
+            "test" => Ok(Cfg::Test),
+            flag if HOST_CFG_FLAGS.contains(&flag) => Ok(Cfg::Host),
+            _ => Err(format!("unknown cfg flag `{name}`")),
+        },
+        syn::Meta::NameValue(pair) => {
+            let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(value),
+                ..
+            }) = &pair.value
+            else {
+                return Err(format!("cfg `{name} = ..` carries no string value"));
+            };
+            let value = value.value();
+            match (name.as_str(), value.as_str()) {
+                ("feature", _) => Ok(Cfg::Feature(value)),
+                ("target_arch", "wasm32") | ("target_family", "wasm") => Ok(Cfg::Wasm),
+                ("target_arch" | "target_family", _) => Ok(Cfg::Host),
+                (key, _) if HOST_CFG_KEYS.contains(&key) => Ok(Cfg::Host),
+                _ => Err(format!("unknown cfg atom `{name} = \"{value}\"`")),
+            }
+        }
+        syn::Meta::List(list) => {
+            let args = list
+                .parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                )
+                .map_err(|e| format!("cfg `{name}(..)` does not parse: {e}"))?
+                .iter()
+                .map(parse_cfg)
+                .collect::<Result<Vec<_>, _>>()?;
+            match name.as_str() {
+                "all" => Ok(Cfg::All(args)),
+                "any" => Ok(Cfg::Any(args)),
+                "not" => {
+                    let mut args = args.into_iter();
+                    match (args.next(), args.next()) {
+                        (Some(one), None) => Ok(Cfg::Not(Box::new(one))),
+                        _ => Err("cfg `not(..)` takes exactly one predicate".to_owned()),
+                    }
+                }
+                _ => Err(format!("unknown cfg combinator `{name}(..)`")),
+            }
+        }
     }
-    match s.get(seg.len()..) {
-        Some(tail) if tail.starts_with("::") => Some(seg),
+}
+
+/// The predicate `attrs` compile their node under: every `#[cfg(..)]` joined,
+/// with a `#[test]` function compiled only by a test build. `None` when no
+/// attribute gates the node; `#[cfg_attr(..)]` gates nothing.
+fn attrs_cfg(attrs: &[syn::Attribute]) -> Result<Option<Cfg>, String> {
+    let mut all = Vec::new();
+    for attr in attrs {
+        let path = attr.path();
+        if path.is_ident("cfg") {
+            let meta = attr
+                .parse_args::<syn::Meta>()
+                .map_err(|e| format!("`#[cfg(..)]` does not parse: {e}"))?;
+            all.push(parse_cfg(&meta)?);
+        } else if path.segments.last().is_some_and(|seg| seg.ident == "test") {
+            all.push(Cfg::Test);
+        }
+    }
+    Ok((!all.is_empty()).then_some(Cfg::All(all)))
+}
+
+/// The `#[path = ".."]` of a file-backed `mod` declaration.
+fn path_attr(attrs: &[syn::Attribute]) -> Option<String> {
+    attrs.iter().find_map(|attr| match &attr.meta {
+        syn::Meta::NameValue(pair) if pair.path.is_ident("path") => match &pair.value {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(value),
+                ..
+            }) => Some(value.value()),
+            _ => None,
+        },
         _ => None,
+    })
+}
+
+/// The configuration one emitted crate builds under: the Cargo features its
+/// manifest enables and whether it targets wasm32. `test` is never set.
+struct CfgEnv {
+    features: BTreeSet<String>,
+    wasm: bool,
+}
+
+impl CfgEnv {
+    /// No feature on, a native target.
+    const fn bare() -> Self {
+        Self {
+            features: BTreeSet::new(),
+            wasm: false,
+        }
+    }
+
+    /// The configuration of an emitted crate from its `Cargo.toml`.
+    fn of_manifest(cargo_toml: &str, wasm: bool) -> Self {
+        Self {
+            features: enabled_features(cargo_toml),
+            wasm,
+        }
+    }
+
+    fn eval(&self, cfg: &Cfg) -> Truth {
+        match cfg {
+            Cfg::Feature(name) => Truth::of(self.features.contains(name)),
+            Cfg::Test => Truth::Fails,
+            Cfg::Wasm => Truth::of(self.wasm),
+            Cfg::Host => Truth::Varies,
+            Cfg::All(all) => all
+                .iter()
+                .fold(Truth::Holds, |truth, c| truth.and(self.eval(c))),
+            Cfg::Any(any) => any
+                .iter()
+                .fold(Truth::Fails, |truth, c| truth.or(self.eval(c))),
+            Cfg::Not(inner) => self.eval(inner).not(),
+        }
     }
 }
+
+/// The features an emitted `Cargo.toml` enables: its `[features]` `default`
+/// list closed under the `[features]` table. An entry naming a dependency
+/// feature (`x/y`) enables `x`; a `dep:x` or weak `x?/y` entry enables no
+/// feature. A manifest with no `default` entry enables none.
+fn enabled_features(cargo_toml: &str) -> BTreeSet<String> {
+    let quoted = |value: &str| -> Vec<String> {
+        value
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect()
+    };
+    let mut table: HashMap<String, Vec<String>> = HashMap::new();
+    let mut in_features = false;
+    let mut open: Option<(String, String)> = None;
+    for line in cargo_toml.lines() {
+        let code = line.split_once('#').map_or(line, |(code, _)| code).trim();
+        if let Some((key, mut value)) = open.take() {
+            value.push_str(code);
+            if value.contains(']') {
+                table.insert(key, quoted(&value));
+            } else {
+                open = Some((key, value));
+            }
+            continue;
+        }
+        if code.starts_with('[') && !code.contains('"') {
+            in_features = code == "[features]";
+            continue;
+        }
+        let Some((key, value)) = code.split_once('=').filter(|_| in_features) else {
+            continue;
+        };
+        let key = key.trim().trim_matches('"').to_owned();
+        if value.contains(']') {
+            table.insert(key, quoted(value));
+        } else {
+            open = Some((key, value.to_owned()));
+        }
+    }
+    let mut enabled = BTreeSet::new();
+    let mut work = table.get("default").cloned().unwrap_or_default();
+    while let Some(entry) = work.pop() {
+        if entry.starts_with("dep:") || entry.contains("?/") {
+            continue;
+        }
+        let name = entry.split_once('/').map_or(entry.as_str(), |(dep, _)| dep);
+        if enabled.insert(name.to_owned())
+            && let Some(implied) = table.get(name)
+        {
+            work.extend(implied.iter().cloned());
+        }
+    }
+    enabled
+}
+
+// ── gated `crate::` reference scan ───────────────────────────────────────────
+
+/// One crate-root reference and the predicate it is compiled under.
+#[derive(Clone, Debug)]
+struct GatedRef {
+    /// The first segment after the crate root (`crate::<seg>`), or a
+    /// `<no file ..>` marker for a `mod` declaration whose file is absent.
+    seg: String,
+    cond: Cfg,
+}
+
+/// A child module file still to scan, with the position it is declared at.
+struct PendingFile {
+    path: PathBuf,
+    /// The directory its own file-backed children live in.
+    child_dir: PathBuf,
+    /// The `super::` hops from it to the crate root.
+    depth: usize,
+    conds: Vec<Cfg>,
+}
+
+/// Walks the syntax of one runtime module, recording every crate-root
+/// reference under the stack of predicates enclosing it: the item, statement,
+/// arm, field and expression `#[cfg(..)]`s, the inner `#![cfg(..)]` of each
+/// file, and the `#[cfg(..)]` of each child `mod` declaration. A child module
+/// is followed to the file rustc reads for it (`#[path]` included); a file no
+/// declaration names is never read. A `#[cfg(..)]` on a node the walk does
+/// not scope is refused, so no gate is silently read as absent.
+struct RefScanner<'r> {
+    runtime_root: &'r Path,
+    overlay: &'r Overlay,
+    /// The address of every `#[cfg(..)]` attribute a scope consumed.
+    consumed: BTreeSet<usize>,
+    conds: Vec<Cfg>,
+    depth: usize,
+    child_dir: PathBuf,
+    file_dir: PathBuf,
+    file: PathBuf,
+    refs: Vec<GatedRef>,
+    pending: Vec<PendingFile>,
+    errors: Vec<String>,
+}
+
+impl<'r> RefScanner<'r> {
+    fn new(runtime_root: &'r Path, overlay: &'r Overlay, child_dir: PathBuf, depth: usize) -> Self {
+        Self {
+            runtime_root,
+            overlay,
+            consumed: BTreeSet::new(),
+            conds: Vec::new(),
+            depth,
+            child_dir,
+            file_dir: runtime_root.to_path_buf(),
+            file: runtime_root.to_path_buf(),
+            refs: Vec::new(),
+            pending: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    /// Run `walk` under the predicate `attrs` add.
+    fn gated(&mut self, attrs: &[syn::Attribute], walk: impl FnOnce(&mut Self)) {
+        self.consumed.extend(
+            attrs
+                .iter()
+                .filter(|a| a.path().is_ident("cfg"))
+                .map(|a| std::ptr::from_ref(a) as usize),
+        );
+        let pushed = match attrs_cfg(attrs) {
+            Ok(Some(cfg)) => {
+                self.conds.push(cfg);
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                self.errors.push(format!("{}: {e}", self.file.display()));
+                false
+            }
+        };
+        walk(self);
+        if pushed {
+            self.conds.pop();
+        }
+    }
+
+    fn push_ref(&mut self, seg: String) {
+        let cond = Cfg::All(self.conds.clone());
+        self.refs.push(GatedRef { seg, cond });
+    }
+
+    /// Record the crate-root segment of the path `segs` (`continues`: a glob
+    /// follows it). `crate::<seg>` and an exact `super::` chain back to the
+    /// crate root both reach `<seg>`; a shorter `super::` chain names an
+    /// intermediate module. A last segment is recorded only when it names a
+    /// runtime module (`use crate::encoding;`): a bare root item is resolved by
+    /// no module.
+    fn record_path(&mut self, segs: &[String], continues: bool) {
+        let reach = match segs.first().map(String::as_str) {
+            Some("crate") => 1,
+            Some("super") => {
+                let hops = segs.iter().take_while(|s| *s == "super").count();
+                if hops != self.depth {
+                    return;
+                }
+                hops
+            }
+            _ => return,
+        };
+        let Some(seg) = segs.get(reach) else {
+            return;
+        };
+        let followed = continues || segs.len() > reach + 1;
+        let is_module = self.exists(&self.runtime_root.join(format!("{seg}.rs")))
+            || self.runtime_root.join(seg).is_dir();
+        if followed || is_module {
+            self.push_ref(seg.clone());
+        }
+    }
+
+    fn use_tree(&mut self, tree: &syn::UseTree, prefix: &mut Vec<String>) {
+        match tree {
+            syn::UseTree::Path(path) => {
+                prefix.push(path.ident.to_string());
+                self.use_tree(&path.tree, prefix);
+                prefix.pop();
+            }
+            syn::UseTree::Name(name) => {
+                prefix.push(name.ident.to_string());
+                self.record_path(prefix, false);
+                prefix.pop();
+            }
+            syn::UseTree::Rename(rename) => {
+                prefix.push(rename.ident.to_string());
+                self.record_path(prefix, false);
+                prefix.pop();
+            }
+            syn::UseTree::Glob(_) => self.record_path(prefix, true),
+            syn::UseTree::Group(group) => {
+                for item in &group.items {
+                    self.use_tree(item, prefix);
+                }
+            }
+        }
+    }
+
+    /// Record the paths inside a macro's unparsed tokens. A predicate inside
+    /// them is not read, so each reference takes the macro's own predicate.
+    fn macro_tokens(&mut self, stream: proc_macro2::TokenStream) {
+        use proc_macro2::TokenTree;
+        let toks: Vec<TokenTree> = stream.into_iter().collect();
+        let is_colon =
+            |k: usize| matches!(toks.get(k), Some(TokenTree::Punct(p)) if p.as_char() == ':');
+        let mut i = 0_usize;
+        while let Some(tok) = toks.get(i) {
+            match tok {
+                TokenTree::Group(group) => {
+                    self.macro_tokens(group.stream());
+                    i += 1;
+                }
+                TokenTree::Ident(ident) => {
+                    let mid_path = i >= 2 && is_colon(i - 1) && is_colon(i - 2);
+                    let mut segs = vec![ident.to_string()];
+                    let mut next = i + 1;
+                    let mut glob = false;
+                    while is_colon(next) && is_colon(next + 1) {
+                        match toks.get(next + 2) {
+                            Some(TokenTree::Ident(seg)) => {
+                                segs.push(seg.to_string());
+                                next += 3;
+                            }
+                            Some(TokenTree::Punct(p)) if p.as_char() == '*' => {
+                                glob = true;
+                                next += 3;
+                                break;
+                            }
+                            _ => break,
+                        }
+                    }
+                    if !mid_path {
+                        self.record_path(&segs, glob);
+                    }
+                    i = next;
+                }
+                TokenTree::Punct(_) | TokenTree::Literal(_) => i += 1,
+            }
+        }
+    }
+
+    /// A child `mod` declaration: an inline body is walked in place, a
+    /// file-backed child is queued under the current predicates.
+    fn module(&mut self, node: &syn::ItemMod) {
+        let name = node.ident.to_string();
+        if let Some((_, items)) = &node.content {
+            let child_dir = self.child_dir.join(&name);
+            let outer_dir = std::mem::replace(&mut self.child_dir, child_dir);
+            self.depth += 1;
+            for item in items {
+                self.visit_item(item);
+            }
+            self.depth -= 1;
+            self.child_dir = outer_dir;
+            return;
+        }
+        let (path, child_dir) = if let Some(rel) = path_attr(&node.attrs) {
+            let path = self.file_dir.join(rel);
+            let dir = path.parent().map_or_else(PathBuf::new, Path::to_path_buf);
+            (path, dir)
+        } else {
+            let flat = self.child_dir.join(format!("{name}.rs"));
+            let nested = self.child_dir.join(&name).join("mod.rs");
+            let path = if self.exists(&flat) { flat } else { nested };
+            (path, self.child_dir.join(&name))
+        };
+        if self.exists(&path) {
+            self.pending.push(PendingFile {
+                path,
+                child_dir,
+                depth: self.depth + 1,
+                conds: self.conds.clone(),
+            });
+        } else {
+            self.push_ref(format!("<no file {} for `mod {name};`>", path.display()));
+        }
+    }
+
+    /// Whether the emitted runtime carries the file `path`: an emitted file, or
+    /// one of the runtime tree.
+    fn exists(&self, path: &Path) -> bool {
+        self.overlay.contains_key(path) || path.is_file()
+    }
+
+    /// The source of `path` in the emitted runtime: an emitted file overrides
+    /// the runtime tree's.
+    fn read(&self, path: &Path) -> Result<String, String> {
+        self.overlay.get(path).map_or_else(
+            || std::fs::read_to_string(path).map_err(|e| e.to_string()),
+            |src| Ok(src.clone()),
+        )
+    }
+
+    /// Scan every queued file, each once per predicate stack.
+    fn drain(&mut self) {
+        let mut seen: BTreeSet<(PathBuf, String)> = BTreeSet::new();
+        while let Some(next) = self.pending.pop() {
+            if !seen.insert((next.path.clone(), format!("{:?}", next.conds))) {
+                continue;
+            }
+            let file = match self
+                .read(&next.path)
+                .and_then(|src| syn::parse_file(&src).map_err(|e| e.to_string()))
+            {
+                Ok(file) => file,
+                Err(e) => {
+                    self.errors
+                        .push(format!("{} does not parse: {e}", next.path.display()));
+                    continue;
+                }
+            };
+            self.conds = next.conds;
+            self.depth = next.depth;
+            self.child_dir = next.child_dir;
+            self.file_dir = next
+                .path
+                .parent()
+                .map_or_else(PathBuf::new, Path::to_path_buf);
+            self.file = next.path;
+            self.gated(&file.attrs, |scanner| {
+                for item in &file.items {
+                    scanner.visit_item(item);
+                }
+            });
+        }
+    }
+}
+
+/// Override each `visit_<node>` of a node that carries attributes so its walk
+/// runs under the predicate its `#[cfg(..)]`s add.
+macro_rules! cfg_scoped {
+    ($lt:lifetime; $($method:ident($ty:ident);)*) => {$(
+        fn $method(&mut self, node: &$lt syn::$ty) {
+            self.gated(&node.attrs, |scanner| syn::visit::$method(scanner, node));
+        }
+    )*};
+}
+
+impl<'ast> syn::visit::Visit<'ast> for RefScanner<'_> {
+    fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
+        if attr.path().is_ident("cfg")
+            && !self.consumed.contains(&(std::ptr::from_ref(attr) as usize))
+        {
+            self.errors.push(format!(
+                "{}: a `#[cfg(..)]` on a node the scan does not scope",
+                self.file.display()
+            ));
+        }
+    }
+
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        if path.leading_colon.is_none() {
+            let segs: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+            self.record_path(&segs, false);
+        }
+        syn::visit::visit_path(self, path);
+    }
+
+    fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+        self.gated(&node.attrs, |scanner| {
+            if node.leading_colon.is_none() {
+                scanner.use_tree(&node.tree, &mut Vec::new());
+            }
+        });
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        self.visit_path(&mac.path);
+        self.macro_tokens(mac.tokens.clone());
+    }
+
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        self.gated(&node.attrs, |scanner| scanner.module(node));
+    }
+
+    cfg_scoped! {
+        'ast;
+        visit_item_const(ItemConst);
+        visit_item_enum(ItemEnum);
+        visit_item_extern_crate(ItemExternCrate);
+        visit_item_fn(ItemFn);
+        visit_item_foreign_mod(ItemForeignMod);
+        visit_item_impl(ItemImpl);
+        visit_item_macro(ItemMacro);
+        visit_item_static(ItemStatic);
+        visit_item_struct(ItemStruct);
+        visit_item_trait(ItemTrait);
+        visit_item_trait_alias(ItemTraitAlias);
+        visit_item_type(ItemType);
+        visit_item_union(ItemUnion);
+        visit_impl_item_const(ImplItemConst);
+        visit_impl_item_fn(ImplItemFn);
+        visit_impl_item_macro(ImplItemMacro);
+        visit_impl_item_type(ImplItemType);
+        visit_trait_item_const(TraitItemConst);
+        visit_trait_item_fn(TraitItemFn);
+        visit_trait_item_macro(TraitItemMacro);
+        visit_trait_item_type(TraitItemType);
+        visit_foreign_item_fn(ForeignItemFn);
+        visit_foreign_item_macro(ForeignItemMacro);
+        visit_foreign_item_static(ForeignItemStatic);
+        visit_foreign_item_type(ForeignItemType);
+        visit_arm(Arm);
+        visit_field(Field);
+        visit_field_value(FieldValue);
+        visit_field_pat(FieldPat);
+        visit_variant(Variant);
+        visit_type_param(TypeParam);
+        visit_lifetime_param(LifetimeParam);
+        visit_const_param(ConstParam);
+        visit_pat_type(PatType);
+        visit_receiver(Receiver);
+        visit_local(Local);
+        visit_stmt_macro(StmtMacro);
+        visit_expr_array(ExprArray);
+        visit_expr_assign(ExprAssign);
+        visit_expr_async(ExprAsync);
+        visit_expr_await(ExprAwait);
+        visit_expr_binary(ExprBinary);
+        visit_expr_block(ExprBlock);
+        visit_expr_break(ExprBreak);
+        visit_expr_call(ExprCall);
+        visit_expr_cast(ExprCast);
+        visit_expr_closure(ExprClosure);
+        visit_expr_const(ExprConst);
+        visit_expr_continue(ExprContinue);
+        visit_expr_field(ExprField);
+        visit_expr_for_loop(ExprForLoop);
+        visit_expr_group(ExprGroup);
+        visit_expr_if(ExprIf);
+        visit_expr_index(ExprIndex);
+        visit_expr_infer(ExprInfer);
+        visit_expr_let(ExprLet);
+        visit_expr_lit(ExprLit);
+        visit_expr_loop(ExprLoop);
+        visit_expr_macro(ExprMacro);
+        visit_expr_match(ExprMatch);
+        visit_expr_method_call(ExprMethodCall);
+        visit_expr_paren(ExprParen);
+        visit_expr_path(ExprPath);
+        visit_expr_range(ExprRange);
+        visit_expr_raw_addr(ExprRawAddr);
+        visit_expr_reference(ExprReference);
+        visit_expr_repeat(ExprRepeat);
+        visit_expr_return(ExprReturn);
+        visit_expr_struct(ExprStruct);
+        visit_expr_try(ExprTry);
+        visit_expr_try_block(ExprTryBlock);
+        visit_expr_tuple(ExprTuple);
+        visit_expr_unary(ExprUnary);
+        visit_expr_unsafe(ExprUnsafe);
+        visit_expr_while(ExprWhile);
+        visit_expr_yield(ExprYield);
+    }
+}
+
+/// One top-level module declaration of an emitted `ipe_runtime/mod.rs`.
+#[derive(Clone)]
+struct Decl<'f> {
+    name: String,
+    /// The predicate the declaration holds under.
+    cond: Cfg,
+    /// Its `#[path = ".."]`, relative to the runtime root.
+    path: Option<String>,
+    /// The body of an inline `pub mod <name> { .. }`.
+    inline: Option<&'f [syn::Item]>,
+}
+
+/// An emitted `mod.rs`, parsed.
+fn parse_mod_rs(mod_rs: &str) -> Result<syn::File, String> {
+    syn::parse_file(mod_rs).map_err(|e| format!("emitted `mod.rs` does not parse: {e}"))
+}
+
+/// Every top-level module declaration of an emitted `mod.rs`, with the
+/// predicate each holds under.
+fn declarations(file: &syn::File) -> Result<Vec<Decl<'_>>, String> {
+    let file_cond = attrs_cfg(&file.attrs)?;
+    file.items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Mod(m) => Some(m),
+            _ => None,
+        })
+        .map(|m| {
+            let mut all: Vec<Cfg> = file_cond.iter().cloned().collect();
+            all.extend(attrs_cfg(&m.attrs)?);
+            Ok(Decl {
+                name: m.ident.to_string(),
+                cond: Cfg::All(all),
+                path: path_attr(&m.attrs),
+                inline: m.content.as_ref().map(|(_, items)| items.as_slice()),
+            })
+        })
+        .collect()
+}
+
+/// The file rustc reads for the file-backed declaration `decl`, and the
+/// directory its own file-backed children live in.
+fn decl_file(runtime_root: &Path, overlay: &Overlay, decl: &Decl) -> (PathBuf, PathBuf) {
+    let child_dir = runtime_root.join(&decl.name);
+    if let Some(rel) = &decl.path {
+        let path = runtime_root.join(rel);
+        let dir = path.parent().map_or_else(PathBuf::new, Path::to_path_buf);
+        return (path, dir);
+    }
+    let flat = runtime_root.join(format!("{}.rs", decl.name));
+    if overlay.contains_key(&flat) || flat.is_file() {
+        (flat, child_dir)
+    } else {
+        (child_dir.join("mod.rs"), child_dir)
+    }
+}
+
+/// The files an emitted project writes into its runtime tree, keyed by the
+/// path they take under the runtime root. They override the tree's own.
+type Overlay = HashMap<PathBuf, String>;
+
+/// Every crate-root reference the declared module `decl` compiles, with the
+/// predicate (within the module) it is compiled under. `errors` collects every
+/// file that does not parse and every predicate the evaluator cannot read.
+fn module_refs(
+    runtime_root: &Path,
+    overlay: &Overlay,
+    decl: &Decl,
+    errors: &mut Vec<String>,
+) -> Vec<GatedRef> {
+    let mut scanner = RefScanner::new(runtime_root, overlay, runtime_root.join(&decl.name), 1);
+    if let Some(items) = decl.inline {
+        for item in items {
+            syn::visit::Visit::visit_item(&mut scanner, item);
+        }
+    } else {
+        let (path, child_dir) = decl_file(runtime_root, overlay, decl);
+        if scanner.exists(&path) {
+            scanner.pending.push(PendingFile {
+                path,
+                child_dir,
+                depth: 1,
+                conds: Vec::new(),
+            });
+        } else {
+            scanner.push_ref(format!(
+                "<no file {} for `mod {};`>",
+                path.display(),
+                decl.name
+            ));
+        }
+    }
+    scanner.drain();
+    errors.append(&mut scanner.errors);
+    scanner.refs
+}
+
+/// The crate-root segments `decl`'s module requires in the build `env`: every
+/// reference whose predicate (with the declaration's) does not fail.
+fn required_segs(refs: &[GatedRef], decl_cond: &Cfg, env: &CfgEnv) -> BTreeSet<String> {
+    let decl = env.eval(decl_cond);
+    refs.iter()
+        .filter(|r| decl.and(env.eval(&r.cond)) != Truth::Fails)
+        .map(|r| r.seg.clone())
+        .collect()
+}
+
+/// The crate-root segments the file-backed module `name` requires in `env`.
+fn module_required(runtime_root: &Path, name: &str, env: &CfgEnv) -> BTreeSet<String> {
+    let decl = Decl {
+        name: name.to_owned(),
+        cond: Cfg::All(Vec::new()),
+        path: None,
+        inline: None,
+    };
+    let mut errors = Vec::new();
+    let refs = module_refs(runtime_root, &Overlay::new(), &decl, &mut errors);
+    assert!(errors.is_empty(), "scan refused: {errors:?}");
+    required_segs(&refs, &decl.cond, env)
+}
+
+/// The crate-root segments the source `src`, read as the top-level module
+/// `probe` of an otherwise empty runtime, requires with no feature on.
+#[allow(clippy::expect_used)] // test scaffolding: a fixture write cannot be skipped
+fn source_required(src: &str) -> BTreeSet<String> {
+    let dir = ipe_test_temp::temp_root().join(format!(
+        "ipe_modset_closure_source_{}_{}",
+        std::process::id(),
+        SOURCE_PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("create probe dir");
+    let path = dir.join("probe.rs");
+    std::fs::write(&path, src).expect("write probe source");
+    let decl = Decl {
+        name: "probe".to_owned(),
+        cond: Cfg::All(Vec::new()),
+        path: Some(path.to_string_lossy().into_owned()),
+        inline: None,
+    };
+    let mut errors = Vec::new();
+    let refs = module_refs(&dir, &Overlay::new(), &decl, &mut errors);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(errors.is_empty(), "scan refused: {errors:?}");
+    required_segs(&refs, &decl.cond, &CfgEnv::bare())
+}
+
+/// Distinguishes the probe files of concurrent [`source_required`] calls.
+static SOURCE_PROBES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// What the first segment of a `crate::<seg>::…` reference names at the crate
 /// root of one emitted `ipe_runtime/mod.rs`.
@@ -1093,11 +1663,142 @@ fn mod_rs_for_mask(interner: &Interner, main: ipe_intern::Symbol, mask: u32) -> 
         .clone()
 }
 
-/// The per-mask closure obligation: the declared module set is CLOSED under
-/// every declared module's unconditional `use crate::<dep>` references. Shared
-/// by the per-flag, composed, and sampled proofs so they run an identical check.
-/// Each `crate::<seg>` reference resolves through [`RootScope`] of the mask's
-/// emitted `mod.rs` to the module that supplies `<seg>`.
+/// Every way one emitted `mod.rs` fails to build in the configuration `env`:
+/// a module it compiles reaches `crate::<seg>` under a predicate that does not
+/// fail, and the module supplying `<seg>` is not declared under a predicate
+/// that holds (or under the referencing module's own predicate). A source the
+/// scan cannot parse and a predicate it cannot read are violations too.
+fn closure_violations(
+    runtime_root: &Path,
+    emit: &Emit,
+    env: &CfgEnv,
+    cache: &mut ScanCache,
+) -> Vec<String> {
+    let file = match parse_mod_rs(&emit.mod_rs) {
+        Ok(file) => file,
+        Err(e) => return vec![e],
+    };
+    let decls = match declarations(&file) {
+        Ok(decls) => decls,
+        Err(e) => return vec![e],
+    };
+    let overlay: Overlay = emit
+        .runtime_files
+        .iter()
+        .map(|(rel, src)| (runtime_root.join(rel), src.clone()))
+        .collect();
+    let conds: HashMap<&str, &Cfg> = decls.iter().map(|d| (d.name.as_str(), &d.cond)).collect();
+    let scope = RootScope::new(runtime_root, &emit.mod_rs);
+    let mut out = Vec::new();
+    for decl in &decls {
+        if env.eval(&decl.cond) == Truth::Fails {
+            continue;
+        }
+        let emitted_file = decl.inline.is_some()
+            || overlay.contains_key(&decl_file(runtime_root, &overlay, decl).0);
+        let mut own_errors = Vec::new();
+        let (refs, errors) = if emitted_file {
+            let refs = module_refs(runtime_root, &overlay, decl, &mut own_errors);
+            (std::borrow::Cow::Owned(refs), own_errors.as_slice())
+        } else {
+            let (refs, errors) = cache
+                .refs
+                .entry((decl.name.clone(), decl.path.clone()))
+                .or_insert_with(|| {
+                    let mut errors = Vec::new();
+                    let refs = module_refs(runtime_root, &overlay, decl, &mut errors);
+                    (refs, errors)
+                });
+            (
+                std::borrow::Cow::Borrowed(refs.as_slice()),
+                errors.as_slice(),
+            )
+        };
+        out.extend(errors.iter().map(|e| format!("`{}`: {e}", decl.name)));
+        let required = required_segs(&refs, &decl.cond, env);
+        for (seg, dep) in scope.deps_of(&required, &mut cache.defs) {
+            let declared = conds
+                .get(dep.as_str())
+                .is_some_and(|c| env.eval(c) == Truth::Holds || **c == decl.cond);
+            if !declared {
+                out.push(format!(
+                    "`{}` reaches `crate::{seg}` (supplied by `{dep}`), but `{dep}` is not \
+                     declared under a predicate that holds",
+                    decl.name
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// The build intents every flag mask is checked under: a release emit and a
+/// development emit (`dev-posture`). The vendored runtime refuses a
+/// `--debugger` emit, so the `debugger` feature never reaches it.
+const EMIT_INTENTS: [BuildIntent; 2] = [BuildIntent::Release, BuildIntent::Development];
+
+/// The parts of one emitted project the closure check reads.
+struct Emit {
+    mod_rs: String,
+    cargo_toml: String,
+    /// Every other file the project writes under `src/ipe_runtime/`, keyed by
+    /// its path under the runtime root.
+    runtime_files: BTreeMap<String, String>,
+}
+
+impl Emit {
+    /// A fixture project: `mod_rs` and no other emitted runtime file.
+    fn of_mod_rs(mod_rs: &str) -> Self {
+        Self {
+            mod_rs: mod_rs.to_owned(),
+            cargo_toml: String::new(),
+            runtime_files: BTreeMap::new(),
+        }
+    }
+}
+
+/// The emitted project of one flag mask.
+#[allow(clippy::expect_used)] // test scaffolding: a body-free emit cannot fail
+fn emit_mask(
+    interner: &Interner,
+    main: ipe_intern::Symbol,
+    mask: u32,
+    target: Target,
+    intent: BuildIntent,
+) -> Emit {
+    let prog = Program {
+        imports_unsafe_submodule: false,
+        imported_web_capabilities: std::collections::BTreeSet::new(),
+        modules: vec![module_for_mask(main, mask)],
+    };
+    let emitted = RustBackend::new(interner)
+        .with_target(target)
+        .with_build_intent(intent)
+        .emit(&prog)
+        .expect("emit must succeed for a body-free program");
+    let mut runtime_files = BTreeMap::new();
+    let mut mod_rs = None;
+    for (path, src) in emitted.files {
+        match path.as_str().strip_prefix("src/ipe_runtime/") {
+            Some("mod.rs") => mod_rs = Some(src),
+            Some(rel) => {
+                runtime_files.insert(rel.to_owned(), src);
+            }
+            None => {}
+        }
+    }
+    Emit {
+        mod_rs: mod_rs.expect("emitted project must contain ipe_runtime/mod.rs"),
+        cargo_toml: emitted.cargo_toml,
+        runtime_files,
+    }
+}
+
+/// The per-mask closure obligation, under every [`EMIT_INTENTS`] entry: in the
+/// configuration the emitted `Cargo.toml` builds under, every module the
+/// emitted `mod.rs` compiles reaches only modules it declares as compiled.
+/// Shared by the per-flag, pairwise, composed, and sampled proofs so they run
+/// an identical check.
 fn assert_mask_closed(
     runtime_root: &Path,
     interner: &Interner,
@@ -1105,31 +1806,32 @@ fn assert_mask_closed(
     mask: u32,
     cache: &mut ScanCache,
 ) {
-    let mod_rs = mod_rs_for_mask(interner, main, mask);
-    let scope = RootScope::new(runtime_root, &mod_rs);
-    let declared = &scope.declared;
-    for m in declared {
-        let raw = cache
-            .raw
-            .entry(m.clone())
-            .or_insert_with(|| unconditional_crate_deps(runtime_root, m));
-        for (seg, dep) in scope.deps_of(raw, &mut cache.defs) {
-            assert!(
-                declared.contains(&dep),
-                "module-set SEAL breach: emitted `mod.rs` declares `{m}` \
-                 (which reaches `crate::{seg}`, supplied by module `{dep}`) but does \
-                 NOT declare `{dep}` — flag mask {mask:#019b}. The emitted crate would \
-                 fail `cargo build`. Declared modules: {declared:?}"
-            );
-        }
+    for intent in EMIT_INTENTS {
+        let emit = emit_mask(interner, main, mask, Target::Native, intent);
+        let env = CfgEnv::of_manifest(&emit.cargo_toml, false);
+        let violations = closure_violations(runtime_root, &emit, &env, cache);
+        assert!(
+            violations.is_empty(),
+            "module-set SEAL breach — flag mask {mask:#019b}, {intent:?} emit, features {:?}. \
+             The emitted crate would fail `cargo build` though `ipe` exits 0:\n{}",
+            env.features,
+            violations.join("\n")
+        );
     }
 }
 
-/// Memoised source scans: each module's raw `crate::<seg>` segments and each
-/// module path's top-level definitions. Both are mask-independent.
+/// A file-backed declaration: its name and its `#[path]`.
+type DeclKey = (String, Option<String>);
+
+/// One module's gated `crate::` references and its scan errors.
+type ScannedRefs = (Vec<GatedRef>, Vec<String>);
+
+/// Memoised source scans: each file-backed module's gated `crate::` references
+/// with its scan errors, and each module path's top-level definitions. Both are
+/// mask-independent.
 #[derive(Default)]
 struct ScanCache {
-    raw: HashMap<String, BTreeSet<String>>,
+    refs: HashMap<DeclKey, ScannedRefs>,
     defs: DefCache,
 }
 
@@ -1327,60 +2029,28 @@ fn emitted_mod_rs_declares_no_module_twice() {
 
 /// The always-on-core rule: a runtime module in the always-compiled BASE floor
 /// (the module set emitted for a program that uses no `uses_*` feature — mask 0)
-/// must NOT unconditionally `use crate::<gated_module>`. A base→gated
-/// unconditional edge would force the gated module always-on (re-coupling the
-/// two), defeating the point of gating and pulling the gated module's crates
-/// into every program. The base floor must be closed under its OWN unconditional
-/// deps: every such dep is itself a base module.
-///
-/// This is the STRUCTURAL guard that keeps a future module on the correct side
-/// of the base/gated boundary — a PR that adds a base→gated edge (e.g. an
-/// base-floor module reaching into a gated `crypto`/`jwt`/`compression`
-/// surface) fails HERE, statically, instead of silently re-coupling the deps or
-/// breaking the emitted `cargo build` only under a specific feature combo.
+/// must reach only base modules in the base configuration. A base→gated edge
+/// would force the gated module always-on (re-coupling the two), defeating the
+/// point of gating and pulling the gated module's crates into every program.
 ///
 /// The base floor is derived, not hardcoded: it is exactly the module set the
-/// backend emits for the featureless program, so it tracks the template
-/// automatically.
+/// backend emits for the featureless program, read under the features its
+/// `Cargo.toml` enables, so it tracks the template automatically.
 #[test]
 fn base_modules_do_not_reach_gated_modules() {
     let runtime_root = e2e_support::require_runtime().into_path_buf();
-
     let mut interner = Interner::new();
     let main = interner.intern("Main").expect("intern Main");
-
-    // The always-compiled BASE floor: the module set emitted with every `uses_*`
-    // flag off.
-    let base_prog = Program {
-        imports_unsafe_submodule: false,
-        imported_web_capabilities: std::collections::BTreeSet::new(),
-        modules: vec![module_for_mask(main, 0)],
-    };
-    let emitted = RustBackend::new(&interner)
-        .emit(&base_prog)
-        .expect("emit must succeed for the featureless base program");
-    let base_mod_rs = emitted
-        .files
-        .get("src/ipe_runtime/mod.rs")
-        .expect("emitted project must contain ipe_runtime/mod.rs");
-    let scope = RootScope::new(&runtime_root, base_mod_rs);
-    let base = &scope.declared;
-    let mut defs = DefCache::new();
-
-    for m in base {
-        let raw = unconditional_crate_deps(&runtime_root, m);
-        for (seg, dep) in scope.deps_of(&raw, &mut defs) {
-            assert!(
-                base.contains(&dep),
-                "always-on-core rule violation: base module `{m}` reaches \
-                 `crate::{seg}` (supplied by `{dep}`) unconditionally, but `{dep}` is NOT in the \
-                 always-compiled base floor — it is a gated feature module. A \
-                 base module must reach only other base modules (outside \
-                 `#[cfg(...)]` / `#[cfg(test)]`); move the reach behind a cfg, or \
-                 promote `{dep}` to the base floor. Base floor: {base:?}"
-            );
-        }
-    }
+    let emit = emit_mask(&interner, main, 0, Target::Native, BuildIntent::Release);
+    let env = CfgEnv::of_manifest(&emit.cargo_toml, false);
+    let violations = closure_violations(&runtime_root, &emit, &env, &mut ScanCache::default());
+    assert!(
+        violations.is_empty(),
+        "always-on-core rule violation: a base module reaches a module the \
+         featureless base does not compile. Move the reach behind the gated \
+         module's own cfg, or promote the module to the base floor:\n{}",
+        violations.join("\n")
+    );
 }
 
 /// Guard the `ct_eq` closure edge: `crypto_core` and `secret` both
@@ -1483,161 +2153,39 @@ fn http_kernel_shape_declares_http_stream() {
 
 // ── wasm vendored module-set closure ─────────────────────────────────────────
 
-/// The unconditional crate-root deps of a top-level module in the WASM
-/// vendored module set. Differs from [`unconditional_crate_deps`] in how it
-/// handles inline module declarations such as `pub mod web { pub mod route; }`:
-/// an inline block compiles ONLY its explicitly-declared children (here just
-/// `web/route.rs`), not the whole `web/` directory (which includes
-/// `web/mod.rs` with server-only deps). For a regular `pub mod foo;` module
-/// the two functions are equivalent.
-///
-/// `inline_children`: a pre-parsed map from module name → its explicitly-listed
-/// children (populated from `pub mod X { pub mod Y; … }` blocks in
-/// `WASM_RUNTIME_MOD_RS`).
-fn wasm_unconditional_crate_deps(
-    runtime_root: &Path,
-    name: &str,
-    inline_children: &HashMap<String, Vec<String>>,
-) -> BTreeSet<String> {
-    let mut deps = BTreeSet::new();
-    if let Some(children) = inline_children.get(name) {
-        // Inline block: only the declared child files are compiled.
-        for child in children {
-            let child_file = runtime_root.join(name).join(format!("{child}.rs"));
-            if child_file.is_file() {
-                // Child is 1 level inside `crate::<name>`, so 2 supers to root.
-                scan_file_deps(&child_file, 2, &mut deps);
-            }
-        }
-    } else {
-        // Regular `pub mod name;`: use the shared scanner.
-        let flat = runtime_root.join(format!("{name}.rs"));
-        let dir = runtime_root.join(name);
-        if flat.is_file() {
-            scan_file_deps(&flat, 1, &mut deps);
-        }
-        if dir.is_dir() {
-            collect_dir_deps(&dir, &flat, 1, &mut deps);
-        }
-    }
-    deps
-}
-
-/// Parse the inline-block children from a `WASM_RUNTIME_MOD_RS`-style string.
-/// Returns a map from top-level inline module name → list of declared children.
-/// Example: `pub mod web { pub mod route; }` → `{"web": ["route"]}`.
-fn parse_inline_modules(mod_rs: &str) -> HashMap<String, Vec<String>> {
-    let mut result: HashMap<String, Vec<String>> = HashMap::new();
-    let mut in_block: Option<String> = None;
-    let mut brace_depth: i32 = 0;
-    for line in mod_rs.lines() {
-        let t = line.trim();
-        if let Some(ref parent) = in_block.clone() {
-            let opens = i32::try_from(t.matches('{').count()).unwrap_or(0);
-            let closes = i32::try_from(t.matches('}').count()).unwrap_or(0);
-            brace_depth += opens - closes;
-            if brace_depth <= 0 {
-                in_block = None;
-                brace_depth = 0;
-            } else {
-                // Parse `pub mod child;` inside the block.
-                let rest = t
-                    .strip_prefix("pub mod ")
-                    .or_else(|| t.strip_prefix("mod "));
-                if let Some(rest) = rest
-                    && let Some(child) = rest.strip_suffix(';')
-                    && child.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                {
-                    result
-                        .entry(parent.clone())
-                        .or_default()
-                        .push(child.to_owned());
-                }
-            }
-            continue;
-        }
-        // Check for an inline-block opener: `pub mod name {`.
-        let rest = t
-            .strip_prefix("pub mod ")
-            .or_else(|| t.strip_prefix("mod "));
-        if let Some(rest) = rest {
-            let name: String = rest
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            if !name.is_empty() {
-                let after = rest.get(name.len()..).unwrap_or("").trim_start();
-                if after.starts_with('{') {
-                    in_block = Some(name.clone());
-                    brace_depth = 1;
-                    result.entry(name).or_default();
-                }
-            }
-        }
-    }
-    result
-}
-
-/// The wasm vendored `WASM_RUNTIME_MOD_RS` module set is closed under the
-/// unconditional `use crate::<dep>` references of every module it declares.
+/// The wasm vendored `WASM_RUNTIME_MOD_RS` module set is closed in the wasm32
+/// configuration its `Cargo.toml` builds under: every module it compiles
+/// reaches only modules it compiles.
 ///
 /// The vendored path emits `src/ipe_runtime/mod.rs` from a STATIC constant
 /// (`WASM_RUNTIME_MOD_RS`) rather than a per-flag append list, so a module that
-/// calls `crate::<dep>::…` without a `#[cfg(...)]` guard can only compile if
-/// `<dep>` is also declared in that constant. This test proves closure WITHOUT
-/// invoking cargo — the same obligation the per-flag native tests above prove for
-/// the native module set, applied to the wasm vendored constant.
+/// calls `crate::<dep>::…` in a wasm32 build can only compile if `<dep>` is
+/// also declared in that constant. The breach class: `ipe` exits 0; the
+/// emitted wasm crate fails `cargo check` (E0433). The native closure tests do
+/// not reach this set: they emit through the native template and its appends.
 ///
-/// The breach class is: a module `M` in `WASM_RUNTIME_MOD_RS` calls
-/// `crate::<dep>::fn()` unconditionally, but `<dep>` is absent from the
-/// constant. `ipe` exits 0; the emitted wasm crate fails `cargo check` (E0433).
-/// A regression in the native modset closure tests would not catch this because
-/// those tests emit via `RustBackend::new(interner)` (the NATIVE path, which
-/// uses the native template + per-flag appends — not `WASM_RUNTIME_MOD_RS`).
-///
-/// Inline modules (e.g. `pub mod web { pub mod route; }`) are handled correctly:
-/// only the explicitly-listed child files are scanned, not the whole directory.
+/// An inline module (`pub mod web { pub mod route; }`) compiles only the
+/// children it declares, never the rest of its directory.
 #[test]
 fn wasm_vendored_modset_is_closed() {
     let runtime_root = e2e_support::require_runtime().into_path_buf();
     let mut interner = Interner::new();
     let main = interner.intern("Main").expect("intern Main");
-
-    // Emit the wasm VENDORED mod.rs (no `with_runtime_dep`) — this path writes
-    // `WASM_RUNTIME_MOD_RS` into `src/ipe_runtime/mod.rs`.
-    let prog = Program {
-        imports_unsafe_submodule: false,
-        imported_web_capabilities: std::collections::BTreeSet::new(),
-        modules: vec![module_for_mask(main, 0)],
-    };
-    let emitted = RustBackend::new(&interner)
-        .with_target(Target::WasmClient)
-        .emit(&prog)
-        .expect("wasm vendored emit must succeed for a body-free program");
-    let mod_rs = emitted
-        .files
-        .get("src/ipe_runtime/mod.rs")
-        .expect("wasm vendored emit must include src/ipe_runtime/mod.rs");
-    let declared = declared_modules(mod_rs);
-    let inline_children = parse_inline_modules(mod_rs);
-
-    let scope = RootScope::new(&runtime_root, mod_rs);
-    let mut defs = DefCache::new();
-    for m in &declared {
-        let raw = wasm_unconditional_crate_deps(&runtime_root, m, &inline_children);
-        for (seg, dep) in scope.deps_of(&raw, &mut defs) {
-            assert!(
-                declared.contains(&dep),
-                "wasm vendored module-set SEAL breach: `WASM_RUNTIME_MOD_RS` declares \
-                 `{m}` (which reaches `crate::{seg}`, supplied by `{dep}`, \
-                 unconditionally) but does NOT \
-                 declare `{dep}`. The emitted wasm crate fails `cargo check \
-                 --target wasm32-unknown-unknown` (E0433) though `ipe` exits 0. \
-                 Add `pub mod {dep};` to `WASM_RUNTIME_MOD_RS` in \
-                 `src/compiler/backend/rust/src/project.rs`. \
-                 Declared wasm modules: {declared:?}"
-            );
-        }
+    let mut cache = ScanCache::default();
+    for intent in EMIT_INTENTS {
+        let emit = emit_mask(&interner, main, 0, Target::WasmClient, intent);
+        let env = CfgEnv::of_manifest(&emit.cargo_toml, true);
+        let violations = closure_violations(&runtime_root, &emit, &env, &mut cache);
+        assert!(
+            violations.is_empty(),
+            "wasm vendored module-set SEAL breach — {intent:?} emit, features {:?}. \
+             The emitted wasm crate fails `cargo check --target \
+             wasm32-unknown-unknown` (E0433) though `ipe` exits 0; declare the \
+             missing module in `WASM_RUNTIME_MOD_RS` \
+             (`src/compiler/backend/rust/src/project.rs`):\n{}",
+            env.features,
+            violations.join("\n")
+        );
     }
 }
 
@@ -1726,10 +2274,10 @@ fn wasm_vendored_modset_declares_seal_codec() {
 /// Every emitted module set declares `narrow`, the narrowing helpers any kernel
 /// module may call under any `cfg`.
 ///
-/// The closure scanners skip a `#[cfg(...)]`-gated item, and the callers of
-/// `narrow` that sit inside one (`time::time_now`'s two target arms,
-/// `tea::EveryInterval::browser_delay_ms`) would pass them with a set missing
-/// it and then fail the emitted `cargo build` (E0433). The featureless native
+/// The callers of `narrow` sit inside target-gated items
+/// (`time::time_now`'s two target arms, `tea::EveryInterval::browser_delay_ms`),
+/// so a set missing it fails the emitted `cargo build` (E0433) on the target
+/// that compiles them. The featureless native
 /// base set is the floor every flag mask extends
 /// (`declared_modset_is_monotone`), so the base and the wasm set together
 /// cover every emitted set.
@@ -1765,52 +2313,44 @@ fn every_emitted_modset_declares_narrow() {
 
 // ── scanner unit tests: inline-path and cfg(test) regression ─────────────────
 
-/// The `crate_refs_in_line` scanner must detect `crate::<seg>::` occurrences
-/// that are NOT `use` statements — path expressions and macro calls. This is the
-/// exact false-negative class that let the `wasm app_config` and `revocation`
-/// E0433 SEAL breaches reach main undetected.
+/// The scan detects `crate::<seg>::` occurrences that are NOT `use`
+/// statements — path expressions and macro calls. This is the false-negative
+/// class that let the `wasm app_config` and `revocation` E0433 SEAL breaches
+/// reach main undetected.
 #[test]
 fn scanner_detects_inline_crate_path_expressions() {
-    let mut deps = BTreeSet::new();
-    // Inline function call — matches `crate::app_config::resolve_log_level_override()`.
-    crate_refs_in_line(
-        "    if let Some(tag) = crate::app_config::resolve_log_level_override() {",
-        1,
-        &mut deps,
+    let deps = source_required(
+        "fn f() {\n    if let Some(tag) = crate::app_config::resolve_log_level_override() {}\n}\n",
     );
     assert!(
         deps.contains("app_config"),
-        "scanner must detect `crate::app_config::` in an inline path expression; got {deps:?}"
+        "the scan must detect `crate::app_config::` in an inline path expression; got {deps:?}"
     );
-
-    let mut deps2 = BTreeSet::new();
-    // Macro invocation — matches `crate::ct_eq::impl_ct_eq!(Key)`.
-    crate_refs_in_line("crate::ct_eq::impl_ct_eq!(Key);", 1, &mut deps2);
+    let deps = source_required("crate::ct_eq::impl_ct_eq!(Key);\n");
     assert!(
-        deps2.contains("ct_eq"),
-        "scanner must detect `crate::ct_eq::` in a macro invocation; got {deps2:?}"
+        deps.contains("ct_eq"),
+        "the scan must detect `crate::ct_eq::` in a macro invocation; got {deps:?}"
     );
-
-    let mut deps3 = BTreeSet::new();
-    // Multiple refs on one line — `crate::jwt::…` appears twice.
-    crate_refs_in_line(
-        "    if secret.len() < crate::jwt::HS256_MIN_SECRET_BYTES { crate::jwt::hs256_short_secret_msg() }",
-        1,
-        &mut deps3,
+    let deps = source_required(
+        "fn f() { if secret.len() < crate::jwt::HS256_MIN_SECRET_BYTES { crate::jwt::msg() } }\n",
     );
     assert!(
-        deps3.contains("jwt"),
-        "scanner must detect repeated `crate::jwt::` refs on one line; got {deps3:?}"
+        deps.contains("jwt"),
+        "the scan must detect repeated `crate::jwt::` refs; got {deps:?}"
+    );
+    let deps = source_required("fn f() { format!(\"{}\", crate::locale::tag()); }\n");
+    assert!(
+        deps.contains("locale"),
+        "the scan must detect a `crate::` path inside a macro's arguments; got {deps:?}"
     );
 }
 
-/// A `crate::Foo` reference with NO trailing `::` is a re-exported item, not a
-/// module dependency — the scanner must NOT register it as a dep.
+/// A `crate::Foo` reference with NO trailing `::` that names no runtime module
+/// is a re-exported item, not a module dependency — the scan must NOT register
+/// it as a dep.
 #[test]
 fn scanner_ignores_bare_crate_item_without_module_path() {
-    let mut deps = BTreeSet::new();
-    // `crate::IpeMaybe` — a re-export from the crate root, no `::` suffix.
-    crate_refs_in_line("use crate::IpeMaybe;", 1, &mut deps);
+    let deps = source_required("use crate::IpeMaybe;\n");
     assert!(
         deps.is_empty(),
         "bare `crate::Item` (no trailing `::`) must NOT register as a module dep; got {deps:?}"
@@ -1959,17 +2499,12 @@ fn root_scope_resolves_a_crate_item_path_to_its_providing_module() {
     let scope = RootScope::new(&root, mod_rs);
     let mut defs = DefCache::new();
 
-    let mut raw = BTreeSet::new();
-    crate_refs_in_line(
-        "Io(io) => crate::IoFailure::on_path(\"read CSV file\", path, io).into(),",
-        1,
-        &mut raw,
+    let raw = source_required(
+        "fn f() {\n    crate::IoFailure::on_path(\"read CSV file\", path, io);\n    \
+         crate::csv::read();\n    crate::NoSuchItem::x();\n    crate::Held::new();\n    \
+         crate::Bytes::new();\n    crate::root_helper::x();\n    crate::Gated::x();\n    \
+         crate::Nested::x();\n}\n",
     );
-    crate_refs_in_line("crate::csv::read();", 1, &mut raw);
-    crate_refs_in_line("crate::NoSuchItem::x();", 1, &mut raw);
-    crate_refs_in_line("crate::Held::new(); crate::Bytes::new();", 1, &mut raw);
-    crate_refs_in_line("crate::root_helper::x(); crate::Gated::x();", 1, &mut raw);
-    crate_refs_in_line("crate::Nested::x();", 1, &mut raw);
     let pairs = scope.deps_of(&raw, &mut defs);
     let resolved: HashMap<&str, &str> = pairs
         .iter()
@@ -2047,41 +2582,25 @@ fn root_scope_refuses_an_undeclared_or_gated_provider() {
     );
 }
 
-/// References inside a `#[cfg(test)] mod tests` block must NOT register as
-/// production deps. This is the false-positive class (`ui → helpers`) the
-/// cfg(test)-exclusion logic prevents.
+/// References inside a `#[cfg(test)] mod tests` block never compile in an
+/// emitted build, so they are not deps.
 #[test]
 fn scanner_excludes_crate_refs_inside_cfg_test_mod() {
-    use std::path::PathBuf;
-    // Synthesise a file that has an inline `crate::nonexistent_module::fn()` ONLY
-    // inside a `#[cfg(test)] mod tests` block — not in production code.
-    let src = r"
-// production function — no crate:: dep
+    let deps = source_required(
+        r"
 pub fn prod() -> i32 { 42 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    // This would be a false breach if not excluded:
     use crate::nonexistent_module::helper;
     fn check() { crate::nonexistent_module::run(); }
 }
-";
-    // Write to a temp file and scan it.
-    let dir = ipe_test_temp::temp_root();
-    let path: PathBuf = dir.join("ipe_modset_closure_cfg_test_regression.rs");
-    std::fs::write(&path, src).expect("write temp file");
-    let mut deps = BTreeSet::new();
-    scan_file_deps(&path, 1, &mut deps);
-    let _ = std::fs::remove_file(&path);
-    assert!(
-        !deps.contains("nonexistent_module"),
-        "scanner must NOT register `crate::nonexistent_module` from inside \
-         `#[cfg(test)] mod tests`; got {deps:?}"
+",
     );
     assert!(
         deps.is_empty(),
-        "no production crate-root deps in this fixture; got {deps:?}"
+        "no compiled crate-root deps in this fixture; got {deps:?}"
     );
 }
 
@@ -2108,10 +2627,11 @@ fn blank_literals_empties_every_literal_and_keeps_code() {
 
 /// A test module whose fixtures hold letter char literals, raw byte strings and
 /// multi-line strings with unbalanced braces keeps its `crate::` references out
-/// of the production deps, and a production reference after it is still found.
+/// of the deps, and a production reference after it is still found.
 #[test]
 fn scanner_excludes_a_test_mod_with_literal_fixtures() {
-    let src = r###"
+    let deps = source_required(
+        r###"
 pub fn prod() -> i32 { 42 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -2140,13 +2660,8 @@ mod tests {
 }
 
 pub fn after() { crate::real_dep::run(); }
-"###;
-    let dir = ipe_test_temp::temp_root();
-    let path = dir.join("ipe_modset_closure_literal_fixture_regression.rs");
-    std::fs::write(&path, src).expect("write temp file");
-    let mut deps = BTreeSet::new();
-    scan_file_deps(&path, 1, &mut deps);
-    let _ = std::fs::remove_file(&path);
+"###,
+    );
     assert_eq!(
         deps,
         BTreeSet::from(["real_dep".to_owned()]),
@@ -2155,9 +2670,12 @@ pub fn after() { crate::real_dep::run(); }
 }
 
 /// A child module whose `mod` declaration is cfg-gated is gated whole: its
-/// file's `crate::` references are not unconditional deps of the parent, even
-/// on lines carrying no cfg of their own. An ungated sibling's still are.
+/// file's `crate::` references hold only under that cfg, even on lines carrying
+/// no cfg of their own. An ungated sibling's hold always, a
+/// `#[cfg(not(..))]` child's hold while its feature is off, and a
+/// `#[cfg_attr(..)]` gates nothing.
 #[test]
+#[allow(clippy::expect_used)] // test scaffolding: a fixture write cannot be skipped
 fn scanner_scopes_a_cfg_gated_mod_declaration_to_the_child_file() {
     let root = ipe_test_temp::temp_root().join(format!(
         "ipe_modset_closure_gated_child_{}",
@@ -2187,35 +2705,296 @@ fn scanner_scopes_a_cfg_gated_mod_declaration_to_the_child_file() {
     for (path, src) in &files {
         std::fs::write(path, src).expect("write fixture file");
     }
-    let deps = unconditional_crate_deps(&root, "web");
+    let bare = module_required(&root, "web", &CfgEnv::bare());
+    let with = |features: &[&str]| CfgEnv {
+        features: features.iter().map(|f| (*f).to_owned()).collect(),
+        wasm: false,
+    };
+    let server = module_required(&root, "web", &with(&["server"]));
+    let db = module_required(&root, "web", &with(&["db"]));
     let _ = std::fs::remove_dir_all(&root);
+    let set =
+        |names: &[&str]| -> BTreeSet<String> { names.iter().map(|n| (*n).to_owned()).collect() };
     assert_eq!(
-        deps,
-        BTreeSet::from(["alpha".to_owned(), "beta".to_owned(), "tea".to_owned()]),
-        "only the children whose `mod` declaration is not cfg-gated are dep sources"
+        bare,
+        set(&["alpha", "beta", "tea"]),
+        "with no feature on only the ungated children and the `not(db)` child compile"
+    );
+    assert_eq!(
+        server,
+        set(&["alpha", "beta", "server", "session", "tea"]),
+        "the `server` feature compiles the `server`-gated child and item"
+    );
+    assert_eq!(
+        db,
+        set(&["alpha", "db", "tea"]),
+        "the `db` feature compiles `hub` and drops the `not(db)` child"
     );
 }
 
-/// Prove the fix direction: if `app_config` were removed from the wasm constant,
-/// the structural `wasm_vendored_modset_is_closed` test would catch it (via
-/// `log.rs`'s inline `crate::app_config::` call). This named test asserts the
-/// SAME closure edge via the scanner directly, so a regression is identified by
-/// name and not just by the structural test's catch-all message.
+/// `log.rs`'s inline `crate::app_config::` and `crate::system::` calls are
+/// deps of `log` in every configuration, so a module set declaring `log`
+/// without `app_config` is refused by name.
 #[test]
 fn scanner_detects_log_rs_dep_on_app_config() {
     let runtime_root = e2e_support::require_runtime().into_path_buf();
-    // `log.rs` uses `crate::app_config::resolve_log_level_override()` and
-    // `crate::system::read_env_var()` unconditionally — both are inline paths,
-    // not `use` statements. The reworked scanner must catch them.
-    let deps = unconditional_crate_deps(&runtime_root, "log");
+    let deps = module_required(&runtime_root, "log", &CfgEnv::bare());
     assert!(
         deps.contains("app_config"),
-        "`log.rs` must register `app_config` as an unconditional dep \
+        "`log.rs` must register `app_config` as a dep \
          (via `crate::app_config::resolve_log_level_override()`); got {deps:?}"
     );
     assert!(
         deps.contains("system"),
-        "`log.rs` must register `system` as an unconditional dep \
+        "`log.rs` must register `system` as a dep \
          (via `crate::system::read_env_var()`); got {deps:?}"
+    );
+}
+
+// ── pairwise closure — the feature interactions composition cannot see ─────
+
+/// Every PAIR of `uses_*` flags emits a closed module set. A module's
+/// references depend on the features the manifest enables (a `web`-gated item
+/// in `web/mod.rs` reaching `crate::bundle_route`), so a reference one flag's
+/// feature turns on may need a module only another flag declares: closure of
+/// each singleton does not compose to their union. Every two-flag interaction
+/// is checked here; wider ones are covered by the sampled and all-flags masks.
+#[test]
+fn flag_pairs_declare_a_closed_modset() {
+    let runtime_root = e2e_support::require_runtime().into_path_buf();
+    let mut interner = Interner::new();
+    let main = interner.intern("Main").expect("intern Main");
+    let mut cache = ScanCache::default();
+    for a in 0..FLAG_COUNT {
+        for b in (a + 1)..FLAG_COUNT {
+            let mask = (1u32 << a) | (1u32 << b);
+            assert_mask_closed(&runtime_root, &interner, main, mask, &mut cache);
+        }
+    }
+}
+
+/// A `uses_web` shape compiles `bundle_route`: the served `web` surface's
+/// static-asset media types (`web::static_noise_mime`, `web`-gated) name
+/// `crate::bundle_route::MediaType`. A named witness of the edge the closure
+/// proofs check structurally.
+#[test]
+fn web_shape_declares_bundle_route() {
+    let mut interner = Interner::new();
+    let main = interner.intern("Main").expect("intern Main");
+    for intent in EMIT_INTENTS {
+        let emit = emit_mask(&interner, main, 1 << 3, Target::Native, intent);
+        let env = CfgEnv::of_manifest(&emit.cargo_toml, false);
+        let file = parse_mod_rs(&emit.mod_rs).expect("the emitted `mod.rs` parses");
+        let decls = declarations(&file).expect("the emitted `mod.rs` predicates read");
+        let compiled = |name: &str| {
+            decls
+                .iter()
+                .any(|d| d.name == name && env.eval(&d.cond) == Truth::Holds)
+        };
+        assert!(
+            compiled("web") && compiled("bundle_route"),
+            "uses_web must compile both `web` and `bundle_route` — {intent:?} emit, \
+             features {:?}",
+            env.features
+        );
+    }
+}
+
+/// A runtime fixture for the closure-check refusal tests: `files` written
+/// under a fresh root. The caller removes it.
+#[allow(clippy::expect_used)] // test scaffolding: a temp fixture write cannot be skipped
+fn closure_fixture(tag: &str, files: &[(&str, &str)]) -> PathBuf {
+    let root = ipe_test_temp::temp_root().join(format!(
+        "ipe_modset_closure_cfg_{tag}_{}",
+        std::process::id()
+    ));
+    for (rel, src) in files {
+        let path = root.join(rel);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).expect("create fixture dir");
+        }
+        std::fs::write(&path, src).expect("write fixture file");
+    }
+    root
+}
+
+/// The violations of the fixture `mod_rs` with exactly `features` on.
+fn fixture_violations(root: &Path, mod_rs: &str, features: &[&str]) -> Vec<String> {
+    let env = CfgEnv {
+        features: features.iter().map(|f| (*f).to_owned()).collect(),
+        wasm: false,
+    };
+    closure_violations(
+        root,
+        &Emit::of_mod_rs(mod_rs),
+        &env,
+        &mut ScanCache::default(),
+    )
+}
+
+/// The shape of the served-asset breach: a module whose feature-gated item
+/// reaches a module declared under a feature the manifest leaves off is
+/// refused; with that feature on, or the item's feature off, it builds.
+#[test]
+fn a_feature_gated_reference_needs_its_module_compiled() {
+    let root = closure_fixture(
+        "feature",
+        &[
+            (
+                "web.rs",
+                "#[cfg(feature = \"web\")]\nfn mime() -> u8 { crate::bundle_route::of() }\n",
+            ),
+            ("bundle_route.rs", "pub fn of() -> u8 { 0 }\n"),
+        ],
+    );
+    let mod_rs = "pub mod web;\n#[cfg(feature = \"encoding\")]\npub mod bundle_route;\n";
+    let breach = fixture_violations(&root, mod_rs, &["web"]);
+    let encoded = fixture_violations(&root, mod_rs, &["web", "encoding"]);
+    let unserved = fixture_violations(&root, mod_rs, &[]);
+    let ungated = fixture_violations(&root, "pub mod web;\npub mod bundle_route;\n", &["web"]);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        breach.iter().any(|v| v.contains("`bundle_route`")),
+        "`web` reaches `bundle_route` under `web`, which is on, and `bundle_route` \
+         is declared under `encoding`, which is off: refused; got {breach:?}"
+    );
+    assert!(encoded.is_empty(), "both features on: {encoded:?}");
+    assert!(
+        unserved.is_empty(),
+        "the referencing item compiles out: {unserved:?}"
+    );
+    assert!(ungated.is_empty(), "an ungated declaration: {ungated:?}");
+}
+
+/// A reference under a predicate the build host decides (`#[cfg(unix)]`) is
+/// required, since some host compiles it; a module declared under the same
+/// predicate as its referrer satisfies it, one under another does not.
+#[test]
+fn a_host_gated_reference_is_required() {
+    let root = closure_fixture(
+        "host",
+        &[
+            ("a.rs", "#[cfg(unix)]\npub fn f() { crate::b::g(); }\n"),
+            ("b.rs", "pub fn g() {}\n"),
+        ],
+    );
+    let undeclared = fixture_violations(&root, "pub mod a;\n", &[]);
+    let same_gate = fixture_violations(
+        &root,
+        "#[cfg(unix)]\npub mod a;\n#[cfg(unix)]\npub mod b;\n",
+        &[],
+    );
+    let other_gate = fixture_violations(&root, "pub mod a;\n#[cfg(windows)]\npub mod b;\n", &[]);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        undeclared.iter().any(|v| v.contains("`b`")),
+        "a `cfg(unix)` reference to an undeclared module: {undeclared:?}"
+    );
+    assert!(
+        same_gate.is_empty(),
+        "both under `cfg(unix)`: {same_gate:?}"
+    );
+    assert!(
+        other_gate.iter().any(|v| v.contains("`b`")),
+        "`b` under `cfg(windows)` does not hold where `a` reaches it: {other_gate:?}"
+    );
+}
+
+/// A predicate the evaluator cannot read is refused, never read as either
+/// truth.
+#[test]
+fn an_unreadable_cfg_predicate_is_refused() {
+    let root = closure_fixture(
+        "unreadable",
+        &[("a.rs", "#[cfg(frobnicate)]\npub fn f() {}\n")],
+    );
+    let in_source = fixture_violations(&root, "pub mod a;\n", &[]);
+    let in_mod_rs = fixture_violations(&root, "#[cfg(target_banana = \"x\")]\npub mod a;\n", &[]);
+    let not_pair = fixture_violations(&root, "#[cfg(not(test, unix))]\npub mod a;\n", &[]);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        in_source.iter().any(|v| v.contains("frobnicate")),
+        "an unknown cfg flag in a module source: {in_source:?}"
+    );
+    assert!(
+        in_mod_rs.iter().any(|v| v.contains("target_banana")),
+        "an unknown cfg atom on a declaration: {in_mod_rs:?}"
+    );
+    assert!(
+        not_pair.iter().any(|v| v.contains("not(..)")),
+        "`not` over two predicates: {not_pair:?}"
+    );
+}
+
+/// A file's inner `#![cfg(..)]` gates every reference in it, a `#[test]`
+/// function never compiles, a `#[path]` child is read at the path it names, a
+/// child declared without a file is refused, and an exact `super::` chain
+/// reaches the crate root.
+#[test]
+fn file_gates_and_child_paths_are_followed() {
+    let root = closure_fixture(
+        "files",
+        &[
+            (
+                "inner.rs",
+                "#![cfg(feature = \"f\")]\npub fn f() { crate::b::g(); }\n",
+            ),
+            ("tested.rs", "#[test]\nfn t() { crate::b::g(); }\n"),
+            (
+                "pathed.rs",
+                "#[path = \"elsewhere/impl_file.rs\"]\nmod child;\n",
+            ),
+            ("elsewhere/impl_file.rs", "pub fn f() { crate::b::g(); }\n"),
+            ("ghost.rs", "mod missing;\n"),
+            ("chain/mod.rs", "mod leaf;\n"),
+            ("chain/leaf.rs", "pub fn f() { super::super::b::g(); }\n"),
+        ],
+    );
+    let inner_off = fixture_violations(&root, "pub mod inner;\n", &[]);
+    let inner_on = fixture_violations(&root, "pub mod inner;\n", &["f"]);
+    let tested = fixture_violations(&root, "pub mod tested;\n", &[]);
+    let pathed = fixture_violations(&root, "pub mod pathed;\n", &[]);
+    let ghost = fixture_violations(&root, "pub mod ghost;\n", &[]);
+    let chain = fixture_violations(&root, "pub mod chain;\n", &[]);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(inner_off.is_empty(), "the file compiles out: {inner_off:?}");
+    assert!(
+        inner_on.iter().any(|v| v.contains("`b`")),
+        "the file compiles with `f` on: {inner_on:?}"
+    );
+    assert!(tested.is_empty(), "a `#[test]` fn: {tested:?}");
+    assert!(
+        pathed.iter().any(|v| v.contains("`b`")),
+        "the `#[path]` child's reference: {pathed:?}"
+    );
+    assert!(
+        ghost.iter().any(|v| v.contains("no file")),
+        "a `mod` with no file: {ghost:?}"
+    );
+    assert!(
+        chain.iter().any(|v| v.contains("`b`")),
+        "`super::super::` from depth 2 reaches the crate root: {chain:?}"
+    );
+}
+
+/// The features a manifest enables are its `default` list closed under the
+/// `[features]` table, dependency features naming their feature and `dep:`
+/// entries none.
+#[test]
+fn enabled_features_close_the_default_list() {
+    let manifest = "[package]\nname = \"x\"\n\n[features]\n\
+                    default = [\"json\", \"web\"] # served\n\
+                    web = [\n    \"web-core\",\n    \"widget-assets\",\n    \"dep:axum\",\n]\n\
+                    web-core = [\"tokio/rt\"]\nwidget-assets = []\nencoding = []\n\
+                    json = [\"serde?/std\"]\n\n[dependencies]\ntokio = { version = \"1\" }\n";
+    let enabled = enabled_features(manifest);
+    let expected: BTreeSet<String> = ["json", "tokio", "web", "web-core", "widget-assets"]
+        .iter()
+        .map(|f| (*f).to_owned())
+        .collect();
+    assert_eq!(enabled, expected);
+    assert!(
+        enabled_features("[package]\nname = \"x\"\n").is_empty(),
+        "no `default` entry enables nothing"
     );
 }

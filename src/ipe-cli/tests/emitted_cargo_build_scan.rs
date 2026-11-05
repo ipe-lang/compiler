@@ -90,7 +90,7 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
         "TestRunner",
         1,
     ),
-    ("driver/commands.rs", "bundle_wasm", "Emitted", 1),
+    ("driver/commands.rs", "bundle_wasm_with", "Emitted", 1),
     ("driver/commands.rs", "bundle_wasi", "Emitted", 1),
     ("watch.rs", "spawn_cargo_build", "WatchBuild", 1),
 ];
@@ -551,7 +551,7 @@ fn admitted_with(rel: &str, extra: &str) -> String {
         "driver/commands.rs" => {
             "impl<'a> FlooredBuild<'a> { fn run_for(self) { let _ = CargoCrate::Emitted(self.crate_dir); \
              let _ = CargoCrate::TestRunner { dir: self.crate_dir, key }; } }\n\
-             pub fn bundle_wasm(d: &OwnedDir) { let _ = CargoCrate::Emitted(d); }\n\
+             pub fn bundle_wasm_with(d: &OwnedDir) { let _ = CargoCrate::Emitted(d); }\n\
              pub fn bundle_wasi(d: &OwnedDir) { let _ = CargoCrate::Emitted(d); }\n"
         }
         "cargo_step.rs" => {
@@ -676,7 +676,7 @@ fn a_held_act_elsewhere_is_refused() {
         ),
         (
             "driver/commands.rs",
-            "fn bundle_wasm2() { fn bundle_wasm() { let _ = CargoCrate::Emitted(d); } }",
+            "fn bundle_wasm_with2() { fn bundle_wasm_with() { let _ = CargoCrate::Emitted(d); } }",
         ),
         (
             "driver/commands.rs",

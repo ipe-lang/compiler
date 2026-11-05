@@ -3600,75 +3600,337 @@ fn clamp_u16(n: i64) -> u16 {
     u16::try_from(n.clamp(0, i64::from(u16::MAX))).unwrap_or(u16::MAX)
 }
 
-/// Process-exit cleanup hook. `std::process::exit` (what `System.exit` lowers to)
-/// bypasses Drop, so an RAII guard's destructor never runs on that path. A backend
-/// driver whose output or terminal needs a closing act (the Ipe.Tui driver's
-/// raw mode, alternate screen, hidden cursor and mouse reporting; the
-/// `Cli.tea` driver's open prompt line) registers its idempotent teardown
-/// here; `exit_process` runs it BEFORE `process::exit`. A plain `fn()` keeps the
-/// boundary clean: `system` (always compiled) never references the
-/// feature-gated `tui`/crossterm; the driver provides the function.
-static EXIT_HOOK: ExitHookSlot = ExitHookSlot::new();
+/// The teardowns a backend driver owes the process exit, as typed stages.
+///
+/// `std::process::exit` (what `System.exit` lowers to) skips Drop, so a
+/// driver's own closing act (the Tui driver's terminal restore, the `Cli.tea`
+/// driver's open prompt line, a `--debugger` session dump) would be lost on
+/// every exit that does not return through the driver's loop. Each such
+/// teardown is a [`StageKind`] in one closed list, and registering its stage
+/// is the only way a driver owns it:
+///
+/// - [`exit_process`](super::exit_process) runs the list once, in
+///   [`StageKind::ORDER`], holding the stdout lock from the first stage until
+///   the process ends, so no byte from any thread follows a stdout stage;
+/// - a driver's normal end runs its stage through [`StageTicket::retire`],
+///   and whichever comes first, the retire or the exit, takes the stage, so
+///   it runs at most once;
+/// - distinct kinds never refuse each other; a second owner of one kind is
+///   refused with [`StageRefused::Held`], never ignored;
+/// - no stage runs program code: each reads only values already stored.
+///
+/// `system` is always compiled and never names the feature-gated drivers:
+/// each driver hands its teardown in as a [`Registration`].
+pub mod pre_exit {
+    use std::io::StdoutLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, MutexGuard, PoisonError};
 
-/// A second driver asked for the exit hook one driver already holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ExitHookTaken;
-
-/// One exit-hook slot: the first registrant holds it, any later one is refused.
-struct ExitHookSlot(std::sync::OnceLock<fn()>);
-
-impl ExitHookSlot {
-    const fn new() -> Self {
-        Self(std::sync::OnceLock::new())
+    /// One teardown a driver owes the exit. Declaration order is run order.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum StageKind {
+        /// The Tui driver's terminal restore (raw mode, alternate screen,
+        /// cursor, mouse reporting).
+        TerminalRestore,
+        /// The `Cli.tea` driver's end of an open prompt line.
+        LineClose,
+        /// The `--debugger` recorder's session dump.
+        SessionDump,
     }
 
-    fn register(&self, f: fn()) -> Result<(), ExitHookTaken> {
-        self.0.set(f).map_err(|_| ExitHookTaken)
+    /// Whether a stage writes stdout.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum StageSink {
+        /// The stage writes through the held stdout lock.
+        Stdout,
+        /// The stage never writes stdout.
+        NotStdout,
     }
 
-    fn run(&self) {
-        if let Some(f) = self.0.get() {
-            f();
+    impl StageKind {
+        /// The run order of the stages, each kind exactly once.
+        pub const ORDER: [Self; 3] = [Self::TerminalRestore, Self::LineClose, Self::SessionDump];
+
+        /// The stream the stage writes.
+        #[must_use]
+        pub const fn sink(self) -> StageSink {
+            match self {
+                Self::TerminalRestore | Self::LineClose => StageSink::Stdout,
+                Self::SessionDump => StageSink::NotStdout,
+            }
+        }
+
+        /// The kind's position in [`StageKind::ORDER`].
+        const fn rank(self) -> usize {
+            match self {
+                Self::TerminalRestore => 0,
+                Self::LineClose => 1,
+                Self::SessionDump => 2,
+            }
+        }
+
+        /// Whether the kind writes stdout.
+        const fn writes_stdout(self) -> bool {
+            matches!(self.sink(), StageSink::Stdout)
         }
     }
-}
 
-/// Register the process-exit cleanup.
-///
-/// One driver runs per process, so the slot is set once; a second
-/// registration is refused with [`ExitHookTaken`] and the first hook stays, so
-/// the caller must choose an outcome that needs no exit hook.
-///
-/// # Errors
-///
-/// [`ExitHookTaken`] when a hook is already registered.
-pub fn register_exit_hook(f: fn()) -> Result<(), ExitHookTaken> {
-    EXIT_HOOK.register(f)
-}
+    /// Whether [`StageKind::ORDER`] lists each kind at its rank and every
+    /// stdout stage before every other stage.
+    const fn order_is_sound() -> bool {
+        let [first, second, third] = StageKind::ORDER;
+        let ranked = first.rank() == 0 && second.rank() == 1 && third.rank() == 2;
+        let stdout_prefix = (first.writes_stdout() || !second.writes_stdout())
+            && (second.writes_stdout() || !third.writes_stdout());
+        ranked && stdout_prefix
+    }
 
-/// Run the registered exit hook, if any. Called by `exit_process`; also safe to
-/// call from a backend driver's own normal-exit path (the hook is idempotent).
-pub fn run_exit_hook() {
-    EXIT_HOOK.run();
-}
+    // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the stage order lists a kind twice or out of rank, or runs a stdout stage after one that does not write stdout [ledger #boundary]
+    const _: () = assert!(order_is_sound());
 
-/// The teardown `process::exit` would otherwise skip, in order: the registered
-/// exit hook (terminal restore); then, in a build with the telemetry exporters,
-/// a flush of their buffered batches bounded by the exporters' flush deadline;
-/// then the stop of the console child and the removal of its store directory,
-/// after the flush that may still push to it.
-///
-/// A stage that panics is abandoned, never the exit: each stage runs under
-/// `catch_unwind`, so the process ends whatever a stage does (a tokio
-/// thread-start refusal inside the flush's `block_in_place`, a panicking
-/// hook). Without that, the panic would unwind out of the `-> !` exit and the
-/// caller (a shutdown grace timer, a second signal) would keep running.
-pub(crate) fn run_pre_exit_stages() {
-    let _ = std::panic::catch_unwind(run_exit_hook);
-    #[cfg(all(feature = "web", feature = "http_client", not(target_arch = "wasm32")))]
-    {
-        let _ = std::panic::catch_unwind(crate::web::flush_exporters_before_exit);
-        let _ = std::panic::catch_unwind(crate::web::console_proxy::shutdown_console);
+    /// A stdout stage: it writes through the lock the exit holds.
+    type StdoutStage = fn(&mut StdoutLock<'static>);
+
+    /// A stage a driver registers. The payload type is fixed per kind, so a
+    /// kind and a payload of another kind cannot be paired.
+    pub enum Registration {
+        /// The terminal restore.
+        TerminalRestore(StdoutStage),
+        /// The end of an open prompt line.
+        LineClose(StdoutStage),
+        /// The session dump.
+        SessionDump(Box<dyn ExitDump + Send>),
+    }
+
+    impl Registration {
+        const fn kind(&self) -> StageKind {
+            match self {
+                Self::TerminalRestore(_) => StageKind::TerminalRestore,
+                Self::LineClose(_) => StageKind::LineClose,
+                Self::SessionDump(_) => StageKind::SessionDump,
+            }
+        }
+    }
+
+    /// The session dump stage's work. It reads only recorded values and runs
+    /// no program code.
+    pub trait ExitDump {
+        /// Write the dump.
+        fn dump(self: Box<Self>);
+    }
+
+    /// Why a stage was not registered.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum StageRefused {
+        /// Another owner holds this kind.
+        Held(StageKind),
+        /// The process exit has begun; no stage can join it.
+        Exiting,
+    }
+
+    /// The hold on a registered stage.
+    ///
+    /// It is neither `Clone` nor `Drop`: a ticket dropped unretired (a panic
+    /// unwinding out of the driver's loop) leaves its stage for the exit,
+    /// which is how a crashed session is still dumped.
+    #[must_use = "a stage is run at the driver's normal end only through `retire`"]
+    #[derive(Debug)]
+    pub struct StageTicket {
+        kind: StageKind,
+        stages: &'static PreExitStages,
+    }
+
+    impl StageTicket {
+        /// Run the stage now, unless the exit already took it, and free its
+        /// kind for a later owner.
+        pub fn retire(self) {
+            self.stages.retire(self.kind);
+        }
+    }
+
+    /// The registered stages, one slot per kind.
+    pub(crate) struct PreExitStages {
+        exiting: AtomicBool,
+        terminal: Mutex<Option<StdoutStage>>,
+        line: Mutex<Option<StdoutStage>>,
+        dump: Mutex<Option<Box<dyn ExitDump + Send>>>,
+    }
+
+    impl std::fmt::Debug for PreExitStages {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("PreExitStages")
+                .field("exiting", &self.exiting.load(Ordering::SeqCst))
+                .finish_non_exhaustive()
+        }
+    }
+
+    /// Lock a slot. A slot only ever swaps an `Option`, so a poisoned one
+    /// holds a whole value.
+    fn slot<T>(slot: &Mutex<T>) -> MutexGuard<'_, T> {
+        slot.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    impl PreExitStages {
+        /// An empty set of stages.
+        pub(crate) const fn new() -> Self {
+            Self {
+                exiting: AtomicBool::new(false),
+                terminal: Mutex::new(None),
+                line: Mutex::new(None),
+                dump: Mutex::new(None),
+            }
+        }
+
+        /// Hold `registration`'s kind until it is retired or the exit runs it.
+        ///
+        /// # Errors
+        /// [`StageRefused::Held`] while the kind has an owner;
+        /// [`StageRefused::Exiting`] once the exit has begun.
+        pub(crate) fn register(
+            &'static self,
+            registration: Registration,
+        ) -> Result<StageTicket, StageRefused> {
+            let kind = registration.kind();
+            match registration {
+                Registration::TerminalRestore(stage) => self.fill(&self.terminal, stage, kind),
+                Registration::LineClose(stage) => self.fill(&self.line, stage, kind),
+                Registration::SessionDump(dump) => self.fill(&self.dump, dump, kind),
+            }?;
+            Ok(StageTicket { kind, stages: self })
+        }
+
+        /// Put `payload` in an empty `held` slot. The exit flag is read under
+        /// the slot's lock, so a registration either lands before the exit
+        /// takes the slot or is refused.
+        fn fill<T>(
+            &self,
+            held: &Mutex<Option<T>>,
+            payload: T,
+            kind: StageKind,
+        ) -> Result<(), StageRefused> {
+            let mut held = slot(held);
+            if self.exiting.load(Ordering::SeqCst) {
+                return Err(StageRefused::Exiting);
+            }
+            if held.is_some() {
+                return Err(StageRefused::Held(kind));
+            }
+            *held = Some(payload);
+            Ok(())
+        }
+
+        /// Run `kind`'s stage now, if the exit has not taken it, and leave the
+        /// kind free. A stdout stage takes the stdout lock first, the lock the
+        /// exit holds, so the two take locks in one order. The slot stays
+        /// locked while the stage runs, so the exit waits for it rather than
+        /// finding it half done.
+        fn retire(&self, kind: StageKind) {
+            match kind {
+                StageKind::TerminalRestore => retire_stdout(&self.terminal),
+                StageKind::LineClose => retire_stdout(&self.line),
+                StageKind::SessionDump => {
+                    let mut held = slot(&self.dump);
+                    if let Some(dump) = held.take() {
+                        run_guarded(|| dump.dump());
+                    }
+                }
+            }
+        }
+
+        /// Run every registered stage once, in [`StageKind::ORDER`], writing
+        /// stdout through `out`. Every later registration is refused.
+        pub(crate) fn run_stages(&self, out: &mut StdoutLock<'static>) {
+            self.exiting.store(true, Ordering::SeqCst);
+            for kind in StageKind::ORDER {
+                match kind {
+                    StageKind::TerminalRestore => run_stdout(&self.terminal, out),
+                    StageKind::LineClose => run_stdout(&self.line, out),
+                    StageKind::SessionDump => {
+                        let taken = slot(&self.dump).take();
+                        if let Some(dump) = taken {
+                            run_guarded(|| dump.dump());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Retire one stdout stage under a freshly taken stdout lock.
+    fn retire_stdout(held: &Mutex<Option<StdoutStage>>) {
+        let mut out = std::io::stdout().lock();
+        let mut held = slot(held);
+        if let Some(stage) = held.take() {
+            run_guarded(|| stage(&mut out));
+        }
+    }
+
+    /// Run one stdout stage of the exit through the held lock.
+    fn run_stdout(held: &Mutex<Option<StdoutStage>>, out: &mut StdoutLock<'static>) {
+        let taken = slot(held).take();
+        if let Some(stage) = taken {
+            run_guarded(|| stage(out));
+        }
+    }
+
+    /// Run one stage, abandoning it if it panics: a panicking stage never
+    /// cancels the exit or the stages after it.
+    pub(crate) fn run_guarded(stage: impl FnOnce()) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(stage));
+    }
+
+    /// The process's stages.
+    static STAGES: PreExitStages = PreExitStages::new();
+
+    /// The process's stages, for a registrar that also runs against fresh
+    /// stages under test.
+    #[cfg(feature = "debugger")]
+    pub(crate) fn stages() -> &'static PreExitStages {
+        &STAGES
+    }
+
+    /// Hold `registration`'s kind among the process's exit stages.
+    ///
+    /// # Errors
+    /// [`StageRefused::Held`] while another owner holds the kind;
+    /// [`StageRefused::Exiting`] once the process exit has begun.
+    pub fn register(registration: Registration) -> Result<StageTicket, StageRefused> {
+        STAGES.register(registration)
+    }
+
+    std::thread_local! {
+        /// Whether this thread is running the exit stages.
+        static IN_EXIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Run the process's exit stages, then the runtime's own fixed stages,
+    /// once per process, writing stdout through `out`.
+    ///
+    /// An exit requested from inside a stage, on the thread running the
+    /// stages, returns at once, so the caller exits with its own status
+    /// instead of waiting on the run it is part of.
+    pub(crate) fn run_all(out: &mut StdoutLock<'static>) {
+        if IN_EXIT.with(|in_exit| in_exit.replace(true)) {
+            return;
+        }
+        static RUN: std::sync::Once = std::sync::Once::new();
+        RUN.call_once(|| {
+            STAGES.run_stages(out);
+            run_fixed_stages();
+        });
+    }
+
+    /// The runtime's fixed exit stages, after the drivers' stages: in a build
+    /// with the telemetry exporters, a flush of their buffered batches bounded
+    /// by the exporters' flush deadline; then the stop of the console child
+    /// and the removal of its store directory, after the flush that may still
+    /// push to it. Neither writes stdout.
+    pub(crate) fn run_fixed_stages() {
+        #[cfg(all(feature = "web", feature = "http_client", not(target_arch = "wasm32")))]
+        {
+            run_guarded(crate::web::flush_exporters_before_exit);
+            run_guarded(crate::web::console_proxy::shutdown_console);
+        }
     }
 }
 
@@ -3729,10 +3991,13 @@ const _: () = assert!(
 ///
 /// The one process exit in the runtime; the runtime `clippy.toml` denies
 /// `std::process::exit` everywhere else. `process::exit` skips Drop, so the
-/// stages Drop would have run happen here first (`run_pre_exit_stages`).
+/// stages Drop would have run happen here first ([`pre_exit`]). The stdout
+/// lock is taken before the first stage and never released, so no thread
+/// writes a stdout byte after a stdout stage.
 #[deny(clippy::as_conversions)]
 pub fn exit_process(status: ProcessStatus) -> ! {
-    run_pre_exit_stages();
+    let mut out = std::io::stdout().lock();
+    pre_exit::run_all(&mut out);
     #[expect(clippy::disallowed_methods)] // the one process exit; proves the ban fires
     // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — the runtime's one process-exit funnel: every exit request (`System.exit`, server shutdown, a CLI db op) ends here after the pre-exit stages [ledger #boundary]
     std::process::exit(status.code());
@@ -4937,40 +5202,228 @@ mod getenv_kind_tests {
 
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
-mod exit_hook_tests {
-    use super::{ExitHookSlot, ExitHookTaken, register_exit_hook};
+mod pre_exit_tests {
+    use super::pre_exit::{
+        ExitDump, PreExitStages, Registration, StageKind, StageRefused, register,
+    };
+    use std::io::{StdoutLock, Write};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static CALLS: AtomicUsize = AtomicUsize::new(0);
-    fn bump() {
-        CALLS.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// The code the panicking-stage child asks to exit with.
-    const PANICKING_STAGE_EXIT_CODE: i64 = 7;
-
-    /// How long the parent waits for the panicking-stage child before it fails the test.
+    /// How long the parent waits for a child before it fails the test.
     const CHILD_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-    /// An exit hook that panics, standing in for any panicking pre-exit stage.
-    fn panicking_exit_hook() {
-        panic!("a pre-exit stage panicked");
+    /// The code the exiting children ask to exit with.
+    const CHILD_EXIT_CODE: i64 = 7;
+
+    /// The code a stage's own re-entrant exit asks for.
+    const REENTRANT_EXIT_CODE: i64 = 9;
+
+    /// A fresh set of stages, apart from the process's own.
+    fn fresh() -> &'static PreExitStages {
+        Box::leak(Box::new(PreExitStages::new()))
     }
 
-    /// A panicking pre-exit stage cannot cancel the exit it precedes.
-    ///
-    /// Runs [`panicking_stage_child`] as a child process of this test binary,
-    /// so its process-wide hook and its exit stay out of this process. A panic
-    /// that unwinds out of `exit_process` fails the child's test, which ends the
-    /// child with the test harness's failure code instead of the one asked for.
-    #[allow(clippy::expect_used)] // test harness: a test binary that cannot re-run itself is an environment issue
+    /// Run `stages` the way the exit does.
+    fn run(stages: &PreExitStages) {
+        stages.run_stages(&mut std::io::stdout().lock());
+    }
+
+    /// A dump stage that counts its runs.
+    struct CountingDump(&'static AtomicUsize);
+
+    impl ExitDump for CountingDump {
+        fn dump(self: Box<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A dump stage that logs its kind into `log`.
+    struct LoggingDump(&'static Mutex<Vec<StageKind>>);
+
+    impl ExitDump for LoggingDump {
+        fn dump(self: Box<Self>) {
+            log_into(self.0, StageKind::SessionDump);
+        }
+    }
+
+    fn log_into(log: &Mutex<Vec<StageKind>>, kind: StageKind) {
+        log.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(kind);
+    }
+
+    fn logged(log: &Mutex<Vec<StageKind>>) -> Vec<StageKind> {
+        log.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[allow(clippy::expect_used)] // test: a refused registration fails the test
     #[test]
-    fn a_panicking_pre_exit_stage_still_ends_the_process() {
+    fn stages_run_in_declared_order() {
+        static LOG: Mutex<Vec<StageKind>> = Mutex::new(Vec::new());
+        fn terminal(_: &mut StdoutLock<'static>) {
+            log_into(&LOG, StageKind::TerminalRestore);
+        }
+        fn line(_: &mut StdoutLock<'static>) {
+            log_into(&LOG, StageKind::LineClose);
+        }
+        let stages = fresh();
+        let _dump = stages
+            .register(Registration::SessionDump(Box::new(LoggingDump(&LOG))))
+            .expect("the dump registers");
+        let _line = stages
+            .register(Registration::LineClose(line))
+            .expect("the line close registers");
+        let _terminal = stages
+            .register(Registration::TerminalRestore(terminal))
+            .expect("the terminal restore registers");
+        run(stages);
+        assert_eq!(logged(&LOG), StageKind::ORDER.to_vec());
+    }
+
+    #[test]
+    fn distinct_kinds_never_refuse_each_other() {
+        fn noop(_: &mut StdoutLock<'static>) {}
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        let stages = fresh();
+        let terminal = stages.register(Registration::TerminalRestore(noop));
+        let line = stages.register(Registration::LineClose(noop));
+        let dump = stages.register(Registration::SessionDump(Box::new(CountingDump(&RUNS))));
+        assert!(terminal.is_ok(), "{terminal:?}");
+        assert!(line.is_ok(), "{line:?}");
+        assert!(dump.is_ok(), "{dump:?}");
+    }
+
+    #[allow(clippy::expect_used)] // test: a refused first registration fails the test
+    #[test]
+    fn a_second_owner_of_one_kind_is_refused_and_the_first_runs() {
+        static FIRST: AtomicUsize = AtomicUsize::new(0);
+        static SECOND: AtomicUsize = AtomicUsize::new(0);
+        fn first(_: &mut StdoutLock<'static>) {
+            FIRST.fetch_add(1, Ordering::SeqCst);
+        }
+        fn second(_: &mut StdoutLock<'static>) {
+            SECOND.fetch_add(1, Ordering::SeqCst);
+        }
+        let stages = fresh();
+        let _held = stages
+            .register(Registration::LineClose(first))
+            .expect("the first owner registers");
+        assert_eq!(
+            stages.register(Registration::LineClose(second)).map(|_| ()),
+            Err(StageRefused::Held(StageKind::LineClose))
+        );
+        // One step past: the holder registering again is refused too.
+        assert_eq!(
+            stages.register(Registration::LineClose(first)).map(|_| ()),
+            Err(StageRefused::Held(StageKind::LineClose))
+        );
+        run(stages);
+        assert_eq!(FIRST.load(Ordering::SeqCst), 1);
+        assert_eq!(SECOND.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn registration_after_exit_began_is_refused() {
+        fn noop(_: &mut StdoutLock<'static>) {}
+        let stages = fresh();
+        run(stages);
+        assert_eq!(
+            stages
+                .register(Registration::TerminalRestore(noop))
+                .map(|_| ()),
+            Err(StageRefused::Exiting)
+        );
+    }
+
+    #[allow(clippy::expect_used)] // test: a refused registration fails the test
+    #[test]
+    fn a_retired_kind_can_be_held_again() {
+        fn noop(_: &mut StdoutLock<'static>) {}
+        let stages = fresh();
+        stages
+            .register(Registration::TerminalRestore(noop))
+            .expect("the first session registers")
+            .retire();
+        let again = stages.register(Registration::TerminalRestore(noop));
+        assert!(again.is_ok(), "a retired kind stayed held: {again:?}");
+    }
+
+    #[allow(clippy::expect_used)] // test: a refused registration fails the test
+    #[test]
+    fn a_stage_runs_at_most_once() {
+        static RETIRE_THEN_RUN: AtomicUsize = AtomicUsize::new(0);
+        static RUN_THEN_RETIRE: AtomicUsize = AtomicUsize::new(0);
+        static RUN_TWICE: AtomicUsize = AtomicUsize::new(0);
+
+        let stages = fresh();
+        stages
+            .register(Registration::SessionDump(Box::new(CountingDump(
+                &RETIRE_THEN_RUN,
+            ))))
+            .expect("registers")
+            .retire();
+        run(stages);
+        assert_eq!(RETIRE_THEN_RUN.load(Ordering::SeqCst), 1);
+
+        let stages = fresh();
+        let ticket = stages
+            .register(Registration::SessionDump(Box::new(CountingDump(
+                &RUN_THEN_RETIRE,
+            ))))
+            .expect("registers");
+        run(stages);
+        ticket.retire();
+        assert_eq!(RUN_THEN_RETIRE.load(Ordering::SeqCst), 1);
+
+        let stages = fresh();
+        let _ticket = stages
+            .register(Registration::SessionDump(Box::new(CountingDump(
+                &RUN_TWICE,
+            ))))
+            .expect("registers");
+        run(stages);
+        run(stages);
+        assert_eq!(RUN_TWICE.load(Ordering::SeqCst), 1);
+    }
+
+    #[allow(clippy::expect_used, clippy::panic)] // test: the stage panics on purpose
+    #[test]
+    fn a_panicking_stage_does_not_skip_later_stages() {
+        static DUMPS: AtomicUsize = AtomicUsize::new(0);
+        fn panicking(_: &mut StdoutLock<'static>) {
+            panic!("a pre-exit stage panicked");
+        }
+        let stages = fresh();
+        let _line = stages
+            .register(Registration::LineClose(panicking))
+            .expect("registers");
+        let _dump = stages
+            .register(Registration::SessionDump(Box::new(CountingDump(&DUMPS))))
+            .expect("registers");
+        run(stages);
+        assert_eq!(DUMPS.load(Ordering::SeqCst), 1);
+    }
+
+    /// What a child process of this test binary ended with.
+    struct ChildRun {
+        status: Option<std::process::ExitStatus>,
+        stdout: String,
+        stderr: String,
+    }
+
+    /// Run the ignored test `child` of this module as a child process of this
+    /// test binary, so its process-wide stages and its exit stay out of this
+    /// process. `status` is `None` when the child outlived [`CHILD_LIMIT`].
+    #[allow(clippy::expect_used)] // test harness: a test binary that cannot re-run itself is an environment issue
+    fn run_child(child: &str) -> ChildRun {
         let module = module_path!();
         let module = module.split_once("::").map_or(module, |(_, rest)| rest);
-        let filter = format!("{module}::panicking_stage_child");
+        let filter = format!("{module}::{child}");
         let exe = std::env::current_exe().expect("the test binary");
-        let mut child = std::process::Command::new(exe)
+        let mut process = std::process::Command::new(exe)
             .args([
                 "--exact",
                 filter.as_str(),
@@ -4982,75 +5435,225 @@ mod exit_hook_tests {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .expect("start the panicking-stage child");
+            .expect("start the child");
+        // The pipes drain while the child runs: a child that fills a pipe
+        // nobody reads blocks in `write`, holding the stdout lock its exit
+        // needs, and reads as a hung exit.
+        let stdout = drain(process.stdout.take().expect("the child's stdout"));
+        let stderr = drain(process.stderr.take().expect("the child's stderr"));
         let started = std::time::Instant::now();
         let status = loop {
-            if let Some(status) = child.try_wait().expect("poll the panicking-stage child") {
+            if let Some(status) = process.try_wait().expect("poll the child") {
                 break Some(status);
             }
             if started.elapsed() > CHILD_LIMIT {
-                let _ = child.kill();
+                let _ = process.kill();
+                let _ = process.wait();
                 break None;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
-        let out = child
-            .wait_with_output()
-            .expect("collect the child's output");
-        let stdout = String::from_utf8(out.stdout).unwrap_or_default();
-        let stderr = String::from_utf8(out.stderr).unwrap_or_default();
+        let stdout = stdout.join().expect("the stdout drain");
+        let stderr = stderr.join().expect("the stderr drain");
+        ChildRun {
+            status,
+            stdout: String::from_utf8(stdout).expect("the child's stdout is UTF-8"),
+            stderr: String::from_utf8(stderr).expect("the child's stderr is UTF-8"),
+        }
+    }
+
+    /// Read `pipe` to its end on its own thread.
+    #[allow(clippy::expect_used)] // test harness: a refused OS thread is an environment issue
+    fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::Builder::new()
+            .spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = pipe.read_to_end(&mut bytes);
+                bytes
+            })
+            .expect("start a pipe drain")
+    }
+
+    fn ended_with(run: &ChildRun, code: i64) -> bool {
+        run.status
+            .is_some_and(|s| s.code() == Some(super::ProcessStatus::requested(code).code()))
+    }
+
+    /// The stderr marker each stage of the exiting children writes.
+    const TERMINAL_MARK: &str = "<terminal-restore>";
+    const LINE_MARK: &str = "<line-close>";
+    const DUMP_MARK: &str = "<session-dump>";
+    /// The stdout byte the line close writes last.
+    const LINE_END_MARK: &str = "<line-end>";
+
+    fn mark(text: &str) {
+        let _ = writeln!(std::io::stderr().lock(), "{text}");
+    }
+
+    struct MarkingDump;
+
+    impl ExitDump for MarkingDump {
+        fn dump(self: Box<Self>) {
+            mark(DUMP_MARK);
+        }
+    }
+
+    #[test]
+    fn a_panicking_pre_exit_stage_still_ends_the_process() {
+        let run = run_child("panicking_stage_child");
         assert!(
-            status.is_some_and(|s| {
-                s.code() == Some(super::ProcessStatus::requested(PANICKING_STAGE_EXIT_CODE).code())
-            }),
-            "a panicking pre-exit stage cancelled the exit ({status:?}):\n{stdout}\n{stderr}"
+            ended_with(&run, CHILD_EXIT_CODE),
+            "a panicking pre-exit stage cancelled the exit ({:?}):\n{}\n{}",
+            run.status,
+            run.stdout,
+            run.stderr
         );
     }
 
-    /// The child half of `a_panicking_pre_exit_stage_still_ends_the_process`.
-    ///
-    /// Ignored so it runs only as that test's child.
+    #[allow(clippy::expect_used, clippy::panic)] // test child: the stage panics on purpose
     #[ignore = "run as a child process by a_panicking_pre_exit_stage_still_ends_the_process"]
     #[test]
     fn panicking_stage_child() {
-        assert_eq!(register_exit_hook(panicking_exit_hook), Ok(()));
-        super::exit_process(super::ProcessStatus::requested(PANICKING_STAGE_EXIT_CODE));
+        fn panicking(_: &mut StdoutLock<'static>) {
+            panic!("a pre-exit stage panicked");
+        }
+        let _ticket = register(Registration::LineClose(panicking)).expect("registers");
+        super::exit_process(super::ProcessStatus::requested(CHILD_EXIT_CODE));
     }
 
     #[test]
-    fn exit_hook_runs_and_is_safe_without_registration() {
-        static RUNS: AtomicUsize = AtomicUsize::new(0);
-        fn count() {
-            RUNS.fetch_add(1, Ordering::SeqCst);
+    fn exit_runs_every_registered_stage_once() {
+        let run = run_child("every_stage_child");
+        assert!(
+            ended_with(&run, CHILD_EXIT_CODE),
+            "the exit did not end with its status ({:?}):\n{}",
+            run.status,
+            run.stderr
+        );
+        for marker in [TERMINAL_MARK, LINE_MARK, DUMP_MARK] {
+            assert_eq!(
+                run.stderr.matches(marker).count(),
+                1,
+                "{marker}:\n{}",
+                run.stderr
+            );
         }
-        // No hook registered yet: running the slot is a safe no-op (the common
-        // CLI / server case; System.exit must not require a hook).
-        let slot = ExitHookSlot::new();
-        slot.run();
-        assert_eq!(RUNS.load(Ordering::SeqCst), 0);
-        // A registered hook runs on every call (each driver's hook is idempotent).
-        assert_eq!(slot.register(count), Ok(()));
-        slot.run();
-        assert_eq!(RUNS.load(Ordering::SeqCst), 1);
+        let terminal = run.stderr.find(TERMINAL_MARK);
+        let line = run.stderr.find(LINE_MARK);
+        let dump = run.stderr.find(DUMP_MARK);
+        assert!(
+            terminal < line && line < dump,
+            "out of order:\n{}",
+            run.stderr
+        );
     }
 
-    // The slot never silently drops a registrant: a second driver is told the
-    // hook is taken, and the first hook is still the one that runs.
+    #[allow(clippy::expect_used)] // test child: a refused registration fails the test
+    #[ignore = "run as a child process by exit_runs_every_registered_stage_once"]
     #[test]
-    fn second_exit_hook_registration_is_refused() {
-        static SECOND: AtomicUsize = AtomicUsize::new(0);
-        fn second() {
-            SECOND.fetch_add(1, Ordering::SeqCst);
+    fn every_stage_child() {
+        fn terminal(_: &mut StdoutLock<'static>) {
+            mark(TERMINAL_MARK);
         }
-        let slot = ExitHookSlot::new();
-        assert_eq!(slot.register(bump), Ok(()));
-        assert_eq!(slot.register(second), Err(ExitHookTaken));
-        // One step past: re-registering the holder itself is refused too.
-        assert_eq!(slot.register(bump), Err(ExitHookTaken));
-        let before = CALLS.load(Ordering::SeqCst);
-        slot.run();
-        assert_eq!(CALLS.load(Ordering::SeqCst), before.saturating_add(1));
-        assert_eq!(SECOND.load(Ordering::SeqCst), 0);
+        fn line(_: &mut StdoutLock<'static>) {
+            mark(LINE_MARK);
+        }
+        let _dump = register(Registration::SessionDump(Box::new(MarkingDump))).expect("registers");
+        let _line = register(Registration::LineClose(line)).expect("registers");
+        let _terminal = register(Registration::TerminalRestore(terminal)).expect("registers");
+        super::exit_process(super::ProcessStatus::requested(CHILD_EXIT_CODE));
+    }
+
+    #[test]
+    fn two_threads_exiting_run_the_stages_once() {
+        let run = run_child("two_exits_child");
+        assert!(
+            ended_with(&run, CHILD_EXIT_CODE),
+            "the exit did not end with its status ({:?}):\n{}",
+            run.status,
+            run.stderr
+        );
+        assert_eq!(run.stderr.matches(DUMP_MARK).count(), 1, "{}", run.stderr);
+    }
+
+    #[allow(clippy::expect_used)] // test child: a refused registration fails the test
+    #[ignore = "run as a child process by two_threads_exiting_run_the_stages_once"]
+    #[test]
+    fn two_exits_child() {
+        let _dump = register(Registration::SessionDump(Box::new(MarkingDump))).expect("registers");
+        let _other = std::thread::Builder::new()
+            .spawn(|| {
+                super::exit_process(super::ProcessStatus::requested(CHILD_EXIT_CODE));
+            })
+            .expect("start the second exiting thread");
+        super::exit_process(super::ProcessStatus::requested(CHILD_EXIT_CODE));
+    }
+
+    #[test]
+    fn a_reentrant_exit_from_a_stage_ends_the_process() {
+        let run = run_child("reentrant_exit_child");
+        assert!(
+            ended_with(&run, REENTRANT_EXIT_CODE),
+            "a re-entrant exit did not end the process ({:?}):\n{}",
+            run.status,
+            run.stderr
+        );
+    }
+
+    #[allow(clippy::expect_used)] // test child: a refused registration fails the test
+    #[ignore = "run as a child process by a_reentrant_exit_from_a_stage_ends_the_process"]
+    #[test]
+    fn reentrant_exit_child() {
+        fn exiting(_: &mut StdoutLock<'static>) {
+            super::exit_process(super::ProcessStatus::requested(REENTRANT_EXIT_CODE));
+        }
+        let _line = register(Registration::LineClose(exiting)).expect("registers");
+        super::exit_process(super::ProcessStatus::requested(CHILD_EXIT_CODE));
+    }
+
+    #[test]
+    fn no_stdout_byte_after_the_line_close() {
+        let run = run_child("racing_writer_child");
+        assert!(
+            ended_with(&run, CHILD_EXIT_CODE),
+            "the exit did not end with its status ({:?}):\n{}",
+            run.status,
+            run.stderr
+        );
+        assert!(
+            run.stdout.ends_with(LINE_END_MARK),
+            "a stdout byte followed the line close:\n{}",
+            run.stdout
+        );
+    }
+
+    #[allow(clippy::expect_used)] // test child: a refused registration fails the test
+    #[ignore = "run as a child process by no_stdout_byte_after_the_line_close"]
+    #[test]
+    fn racing_writer_child() {
+        static WRITTEN: AtomicUsize = AtomicUsize::new(0);
+        // Bounded so a writer the exit never preempts still ends.
+        const WRITER_BYTES: u32 = 1 << 20;
+        fn line(out: &mut StdoutLock<'static>) {
+            let _ = out.write_all(LINE_END_MARK.as_bytes());
+            let _ = out.flush();
+        }
+        let _line = register(Registration::LineClose(line)).expect("registers");
+        let _writer = std::thread::Builder::new()
+            .spawn(|| {
+                for _ in 0..WRITER_BYTES {
+                    let mut out = std::io::stdout().lock();
+                    let _ = out.write_all(b"w");
+                    let _ = out.flush();
+                    drop(out);
+                    WRITTEN.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .expect("start the racing writer");
+        while WRITTEN.load(Ordering::SeqCst) < 64 {
+            std::thread::yield_now();
+        }
+        super::exit_process(super::ProcessStatus::requested(CHILD_EXIT_CODE));
     }
 }
 
@@ -7035,7 +7638,7 @@ mod system_load_env_spawn_blocking_tests {
     /// `set_current_dir` mutates process-global state; safe here only
     /// because this crate's tests run one-process-per-test under `cargo
     /// nextest` (the codebase's existing convention for tests that mutate
-    /// global process state — e.g. this same file's `exit_hook_tests` /
+    /// global process state — e.g. this same file's `pre_exit_tests` /
     /// `console.rs`'s `ingest_token_gate` mutate env vars directly for the
     /// same reason).
     #[test]

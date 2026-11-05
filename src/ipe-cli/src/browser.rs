@@ -283,6 +283,11 @@ fn opener_argv(
 /// On Windows, once the CLI has joined its own kill-on-close job, the opener
 /// breaks away from it, so the browser outlives the CLI; where a job the CLI
 /// was started in forbids breaking away, the opener starts inside the CLI's job.
+///
+/// A loopback server (`ipe doc --serve`, `ipe dev run` of a `web client`)
+/// reaches it only as the opener it hands `loopback_http::announce`: that
+/// seam is the one barrier between a test and a real browser, and a test
+/// hands it a recording closure instead.
 pub fn open_url(url: &BrowserUrl) -> OpenOutcome {
     let (program, args) = match opener_argv(Platform::HOST, url) {
         Ok(argv) => argv,

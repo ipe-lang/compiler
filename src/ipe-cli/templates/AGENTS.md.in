@@ -210,6 +210,7 @@ ipe init [<dir>] [<shape>]     # scaffold
 ipe dev run                    # build + run (full permissions, Debug.* on)
 ipe dev build                  # native binary in out/bin/
 ipe dev build web client       # browser WASM bundle in out/www/
+ipe dev run web client         # bundle served on 127.0.0.1 (IPE_WEB_PORT, else a free port)
 ipe dev watch                  # rebuild + restart on change
 ipe release build              # production: optimised, Debug.* rejected, jailed
 ipe release run                # run the production artifact, jailed

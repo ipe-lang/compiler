@@ -86,7 +86,7 @@ pub const SQLX_DRIVERS: &[&str] = &["sqlite-bundled", "postgres"];
 pub const AXUM: PinnedCrate = PinnedCrate {
     spec: CrateSpec {
         name: "axum",
-        version: "0.7",
+        version: "0.8",
     },
     default_features: true,
     features: &["ws"],

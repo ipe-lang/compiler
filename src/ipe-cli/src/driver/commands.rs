@@ -2601,6 +2601,34 @@ pub fn bundle_wasm(
     home: &crate::bundle_www::BundleHome,
     posture: BuildPosture,
 ) -> Result<PathBuf, CliError> {
+    bundle_wasm_with(crate_dir, home, posture, publish_copy).map(|(www, ())| www)
+}
+
+/// The publish of a built bundle: its `www/` copied into the claimed directory.
+fn publish_copy(crate_dir: &OwnedDir, into: &OwnedDir) -> Result<(PathBuf, ()), CliError> {
+    crate::bundle_www::publish_www(crate_dir, into).map(|www| (www, ()))
+}
+
+/// The publish of a bundle `ipe dev run` serves: its `www/` copied into the
+/// claimed directory, and the very bytes copied held as the served snapshot.
+fn publish_served(
+    crate_dir: &OwnedDir,
+    into: &OwnedDir,
+) -> Result<(PathBuf, crate::loopback_http::BundleSnapshot), CliError> {
+    crate::bundle_www::publish_www_snapshot(crate_dir, into)
+}
+
+/// [`bundle_wasm`], publishing the finished `www/` through `publish`, which
+/// returns the published path and what it kept.
+///
+/// # Errors
+/// As [`bundle_wasm`], and whatever `publish` returns.
+fn bundle_wasm_with<T>(
+    crate_dir: &OwnedDir,
+    home: &crate::bundle_www::BundleHome,
+    posture: BuildPosture,
+    publish: impl FnOnce(&OwnedDir, &OwnedDir) -> Result<(PathBuf, T), CliError>,
+) -> Result<(PathBuf, T), CliError> {
     let out_dir = crate_dir.path();
     // Fail closed before the cross-compile: a missing toolchain becomes a clear
     // root-cause message rather than an opaque OS spawn error.
@@ -2631,12 +2659,13 @@ pub fn bundle_wasm(
     // Step 2: wasm-bindgen — the .wasm cargo's own record names.
     let wasm_path = wasm_artifact_path(&messages, &artifacts, CargoTarget::WasmBrowser, out_dir)?;
 
-    bundle_wasm_pkg(
+    bundle_wasm_pkg_with(
         crate_dir,
         &wasm_path,
         &WasmTools::for_posture(posture),
         crate::remote_ingest::WASM_TOOL_LIMITS,
         || home.claim(),
+        publish,
     )
 }
 
@@ -2692,6 +2721,7 @@ enum WasmOptSkip {
 /// `crate_dir` was replaced before or while either tool ran; [`CliError::Io`]
 /// on a filesystem or spawn failure; as [`crate::bundle_www::publish_www`]
 /// when the finished `www/` is published into the directory `into` claims.
+#[cfg(test)]
 fn bundle_wasm_pkg(
     crate_dir: &OwnedDir,
     wasm_path: &Path,
@@ -2699,6 +2729,19 @@ fn bundle_wasm_pkg(
     ceiling: crate::remote_ingest::LocalCeiling,
     into: impl FnOnce() -> Result<OwnedDir, CliError>,
 ) -> Result<PathBuf, CliError> {
+    bundle_wasm_pkg_with(crate_dir, wasm_path, tools, ceiling, into, publish_copy)
+        .map(|(www, ())| www)
+}
+
+/// [`bundle_wasm_pkg`], publishing the finished `www/` through `publish`.
+fn bundle_wasm_pkg_with<T>(
+    crate_dir: &OwnedDir,
+    wasm_path: &Path,
+    tools: &WasmTools<'_>,
+    ceiling: crate::remote_ingest::LocalCeiling,
+    into: impl FnOnce() -> Result<OwnedDir, CliError>,
+    publish: impl FnOnce(&OwnedDir, &OwnedDir) -> Result<(PathBuf, T), CliError>,
+) -> Result<(PathBuf, T), CliError> {
     use crate::remote_ingest::{LocalSource, RunError, run_local};
     // `wasm-bindgen` and `wasm-opt` write into `www/pkg/` by path, so it is
     // rebuilt empty under the owned crate: a symlink at any level is refused and
@@ -2794,13 +2837,79 @@ fn bundle_wasm_pkg(
     let bundle_size = format_artifact_size(artifact_size_bytes(&bg_wasm)?);
     // The published copy is the artifact: claimed only now, past every
     // fallible step above, so a refused bundle leaves no area behind.
-    let published = crate::bundle_www::publish_www(crate_dir, &into()?)?;
+    let (published, kept) = publish(crate_dir, &into()?)?;
     crate::screen::chatter(
         crate::screen::Stream::Stderr,
         crate::screen::Tone::Text,
         bundle_ready_message(&published, &bundle_size).as_str(),
     );
-    Ok(published)
+    Ok((published, kept))
+}
+
+/// Build the `web client` bundle in the owned `crate_dir`, publish it into
+/// `output`'s `www/`, and serve the published bytes on loopback at `port`
+/// until the process is stopped.
+///
+/// The server answers only from the snapshot the publish held; its
+/// `Content-Security-Policy` header is the one policy the page's meta carries.
+/// The served URL is printed, then opened through the one browser opener.
+///
+/// # Errors
+/// As [`bundle_wasm`]; [`CliError::ProjectRefused`] when the page does not
+/// carry exactly one policy the build renders; as
+/// [`crate::loopback_http::bind_bundle`] when the port cannot be bound.
+fn serve_client_bundle(
+    crate_dir: &OwnedDir,
+    output: OutputRoot,
+    manifest: &project::ProjectManifest,
+    port: crate::loopback_http::BundlePort,
+) -> Result<(), CliError> {
+    use crate::loopback_http::{BundleSite, IO_BUDGET, announce, bind_bundle, serve_site};
+    use ipe_runtime_rust::csp::{BundleWorker, ContentSecurityPolicy};
+    let (published, snapshot) = bundle_wasm_with(
+        crate_dir,
+        &crate::bundle_www::BundleHome::Dev(output),
+        BuildPosture::Dev,
+        publish_served,
+    )?;
+    let policies: Vec<(String, String)> = [BundleWorker::None, BundleWorker::Push]
+        .into_iter()
+        .map(|worker| {
+            let policy = ContentSecurityPolicy::bundle(&manifest.delivery.servers, worker);
+            (policy.header_value(), policy.meta_element())
+        })
+        .collect();
+    let page = snapshot
+        .index_html()
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .unwrap_or_default();
+    let csp = crate::bundle_www::sole_policy(page, &policies, |(_, meta)| meta.as_str())
+        .map(|(header, _)| header.clone())
+        .ok_or_else(|| {
+            CliError::ProjectRefused(text::Message::relay(
+                &crate::bundle_www::BundleError::PolicyMismatch {
+                    path: published.join("index.html"),
+                },
+            ))
+        })?;
+    let listener = bind_bundle(port)?;
+    let base = manifest.delivery.browser.base.clone();
+    announce(
+        &listener,
+        &base.dir_url(),
+        |url| text::msg::bundle_serving(&published.display(), &url.as_str()),
+        Some(crate::browser::open_url),
+    )?;
+    serve_site(
+        &listener,
+        &BundleSite {
+            base,
+            snapshot,
+            csp,
+        },
+        IO_BUDGET,
+    );
+    Ok(())
 }
 
 /// The note naming the published bundle at `www` and its wasm's size.
@@ -3325,6 +3434,15 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     .map_err(|refusal| refusal.into_cli(Verb::DEV_RUN))?;
     let wasm_target = compile_target.is_wasm();
 
+    // A served `web client` bundle reads its port once, here, before any build:
+    // a malformed `IPE_WEB_PORT` refuses the run with no wasted work.
+    let client_port = match compile_target {
+        CompileTarget::WasmClient => Some(crate::loopback_http::bundle_listen_port(
+            ipe_runtime_rust::env_registry::web::WEB_PORT.read(),
+        )?),
+        CompileTarget::Native | CompileTarget::WasmWasi => None,
+    };
+
     // A session over a shape or target with no recordable update loop is
     // refused before any build work.
     if let Some(flag) = session.flag() {
@@ -3412,20 +3530,24 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     )?;
 
     // Post-emit routing per compile target:
-    //   * WasmClient — a browser bundle has no executable form under `ipe dev run`;
-    //     produce the bundle (same step as `ipe dev build web client`) and stop.
+    //   * WasmClient — produce the bundle (same step as `ipe dev build web
+    //     client`) and serve it on loopback until stopped.
     //   * WasmWasi — build the `wasm32-wasip1` module (THE SEAL, via the SAME
     //     `bundle_wasi` build path `ipe dev build --target wasi` uses) and then
     //     EXECUTE it under embedded wasmtime with the dev ambient context.
     //   * Native — fall through to the cargo build + exec below.
     match compile_target {
         CompileTarget::WasmClient => {
-            return bundle_wasm(
-                crate_dir.dir(),
-                &crate::bundle_www::BundleHome::Dev(output),
-                BuildPosture::Dev,
-            )
-            .map(drop);
+            // `client_port` is `Some` on this branch: it was read before the
+            // build. The fallback reads it again rather than unwrapping, so the
+            // refusal stays typed even if the branch invariant ever changes.
+            let port = match client_port {
+                Some(port) => port,
+                None => crate::loopback_http::bundle_listen_port(
+                    ipe_runtime_rust::env_registry::web::WEB_PORT.read(),
+                )?,
+            };
+            return serve_client_bundle(crate_dir.dir(), output, manifest, port);
         }
         CompileTarget::WasmWasi => {
             // The `wasi_run` feature gate already fired before emit (above), so
