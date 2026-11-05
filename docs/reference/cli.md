@@ -23,11 +23,11 @@ Scaffold a new Ipê project.
 ipe init [<directory>] [<shape>] [<runtime>]
 ```
 
-**Arguments:** directory: where to scaffold (`.` or omitted → the current directory). shape: script | tui | cli | server | web (default web) — picks the template. runtime (web only): `client` for the self-contained client; omit it for served (the default, never written) — seeds the declared delivery set (`ships`) and the delivery the next steps build. Host and target are delivery choices, chosen later at build/release. On a TTY an omitted positional is prompted; a re-run reconciles (creates only missing files) and refuses a shape that conflicts with the existing `main`.
+**Arguments:** directory: where to scaffold (`.` or omitted → the current directory). shape: script | tui | cli | server | web | worker (default web) — picks the template. runtime (web only): `client` for the self-contained client; omit it for served (the default, never written) — seeds the declared delivery set (`ships`) and the delivery the next steps build. Host and target are delivery choices, chosen later at build/release. On a TTY an omitted positional is prompted; a re-run reconciles (creates only missing files) and refuses a shape that conflicts with the existing `main`.
 
 **Flags:**
 
-- `[--shape <shape>]` — select the shape without a positional (script|tui|cli|server|web)
+- `[--shape <shape>]` — select the shape without a positional (script|tui|cli|server|web|worker)
 - `[--force]` — overwrite a non-empty target directory
 - `[--lib]` — scaffold a library package (exposedModules) instead of an application
 

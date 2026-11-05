@@ -2,7 +2,7 @@
 
 A handful of names are in scope in *every* Ipê module with no import: `identity`,
 `always`, `not`, `fst`, `snd`, `clamp`, `modBy`, `negate`, `abs`, `sqrt`,
-`min`, `max`, and `compare`. This is the implicit prelude — the smallest
+`toFloat`, `min`, `max`, and `compare`. This is the implicit prelude — the smallest
 set of helpers a program reaches for constantly, so common code stays free of
 ceremony.
 

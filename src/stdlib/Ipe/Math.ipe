@@ -10,10 +10,12 @@
 --
 -- `Int` and `Float` never convert implicitly. `floor`, `ceil`, `round`, and
 -- `trunc` take a `Float` to an `Int`; a non-finite or out-of-range `Float` has
--- no `Int` result and ends in a typed error. To take an `Int` to a `Float`, go
--- through `Ipe.Decimal`, which holds every `Int` exactly:
--- `Decimal.toFloat (Decimal.fromInt n)` yields the nearest `Float`, exact
--- whenever `abs n <= 2^53`.
+-- no `Int` result and ends in a typed error. To take an `Int` to a `Float`,
+-- use the prelude's `toFloat`: exact up to `2^53`, nearest-even past it.
+--
+-- ```ipe
+-- toFloat 7 / 2 --> 3.5
+-- ```
 --
 -- `Int` is 64-bit two's-complement; `abs` of the least `Int` has no positive
 -- counterpart and ends in a typed error the same way `floor`/`ceil`/`round`/

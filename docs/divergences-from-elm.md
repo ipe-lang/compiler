@@ -52,6 +52,11 @@ and is exercised by the first-party examples sweep.
   an infinity, or a value outside the 64-bit `Int` range ends in a typed
   `InvalidInput` error, never a saturated `Int`.
 
+- **`toFloat` can round.** Elm's `Int` is a JavaScript number, so `toFloat`
+  there never loses precision. Ipê's `Int` is 64-bit, so `toFloat` is exact
+  only up to `2^53`; past that it rounds to the nearest `Float`, ties to even.
+  `toFloat` is still total — it never fails and never panics.
+
 ## `List.range` and `List.repeat` ceilings (vs `elm/core` `List`)
 
 - **A list builder refuses more than 10000000 elements.** Elm builds whatever
