@@ -10320,6 +10320,7 @@ mod agents_template_truth {
     }
 
     #[test]
+    #[allow(clippy::panic)] // an unrecognised command block line is the test failure
     fn every_commands_block_line_is_a_real_ipe_invocation() {
         for raw in commands_block().lines() {
             let line = raw.split('#').next().unwrap_or("").trim();
