@@ -398,12 +398,12 @@ where
 }
 
 /// A run being recorded: the recorder and the hold on its dump stage.
-pub struct Recording<Msg, Model> {
+pub struct Recording<'s, Msg, Model> {
     buf: Arc<Mutex<RecordBuffer<Msg, Model>>>,
-    ticket: StageTicket,
+    ticket: StageTicket<'s>,
 }
 
-impl<Msg: Clone, Model: Clone> Recording<Msg, Model> {
+impl<Msg: Clone, Model: Clone> Recording<'_, Msg, Model> {
     /// Record one accepted step. The recorder is locked only for the step.
     pub fn record<F>(&self, msg: Msg, model_after: Model, update: &F)
     where
@@ -441,11 +441,11 @@ fn refused_line(refused: StageRefused) -> &'static str {
 
 /// Start recording a run from `initial` into `stages`, dumping to `dest`.
 fn start_in<Msg, Model, C>(
-    stages: &'static PreExitStages,
+    stages: &PreExitStages,
     dest: Option<RecordDest>,
     initial: Model,
     codec: C,
-) -> Result<Recording<Msg, Model>, NotRecording>
+) -> Result<Recording<'_, Msg, Model>, NotRecording>
 where
     Msg: Clone + Send + IpeStringify + 'static,
     Model: Clone + Send + IpeStringify + 'static,
@@ -474,7 +474,7 @@ where
 /// no stage is registered. A dump stage another recorder holds is reported
 /// once on the runtime log and the run goes unrecorded: two dumps never race
 /// on one destination.
-pub fn start<Msg, Model, C>(initial: Model, codec: C) -> Option<Recording<Msg, Model>>
+pub fn start<Msg, Model, C>(initial: Model, codec: C) -> Option<Recording<'static, Msg, Model>>
 where
     Msg: Clone + Send + IpeStringify + 'static,
     Model: Clone + Send + IpeStringify + 'static,
@@ -728,11 +728,6 @@ mod tests {
         dir
     }
 
-    /// A fresh set of stages, apart from the process's own.
-    fn fresh_stages() -> &'static PreExitStages {
-        Box::leak(Box::new(PreExitStages::new()))
-    }
-
     // The dump reads the recorded models: rendering a recorded session never
     // calls `update`, so the exit path runs no program code.
     #[test]
@@ -915,7 +910,7 @@ mod tests {
     #[test]
     fn absent_record_env_registers_no_stage() {
         use crate::debugger::session_log::{TraceOnly, Unreplayable};
-        let stages = fresh_stages();
+        let stages = &PreExitStages::new();
         let started = start_in::<Msg, Model, _>(
             stages,
             None,
@@ -939,7 +934,7 @@ mod tests {
     #[test]
     fn a_second_recorder_is_refused_and_reported() {
         use crate::debugger::session_log::{TraceOnly, Unreplayable};
-        let stages = fresh_stages();
+        let stages = &PreExitStages::new();
         let first = start_in::<Msg, Model, _>(
             stages,
             Some(RecordDest::Stderr),

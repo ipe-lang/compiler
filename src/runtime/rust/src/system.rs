@@ -3735,12 +3735,12 @@ pub mod pre_exit {
     /// which is how a crashed session is still dumped.
     #[must_use = "a stage is run at the driver's normal end only through `retire`"]
     #[derive(Debug)]
-    pub struct StageTicket {
+    pub struct StageTicket<'s> {
         kind: StageKind,
-        stages: &'static PreExitStages,
+        stages: &'s PreExitStages,
     }
 
-    impl StageTicket {
+    impl StageTicket<'_> {
         /// Run the stage now, unless the exit already took it, and free its
         /// kind for a later owner.
         pub fn retire(self) {
@@ -3787,9 +3787,9 @@ pub mod pre_exit {
         /// [`StageRefused::Held`] while the kind has an owner;
         /// [`StageRefused::Exiting`] once the exit has begun.
         pub(crate) fn register(
-            &'static self,
+            &self,
             registration: Registration,
-        ) -> Result<StageTicket, StageRefused> {
+        ) -> Result<StageTicket<'_>, StageRefused> {
             let kind = registration.kind();
             match registration {
                 Registration::TerminalRestore(stage) => self.fill(&self.terminal, stage, kind),
@@ -3894,7 +3894,7 @@ pub mod pre_exit {
     /// # Errors
     /// [`StageRefused::Held`] while another owner holds the kind;
     /// [`StageRefused::Exiting`] once the process exit has begun.
-    pub fn register(registration: Registration) -> Result<StageTicket, StageRefused> {
+    pub fn register(registration: Registration) -> Result<StageTicket<'static>, StageRefused> {
         STAGES.register(registration)
     }
 
@@ -5219,11 +5219,6 @@ mod pre_exit_tests {
     /// The code a stage's own re-entrant exit asks for.
     const REENTRANT_EXIT_CODE: i64 = 9;
 
-    /// A fresh set of stages, apart from the process's own.
-    fn fresh() -> &'static PreExitStages {
-        Box::leak(Box::new(PreExitStages::new()))
-    }
-
     /// Run `stages` the way the exit does.
     fn run(stages: &PreExitStages) {
         stages.run_stages(&mut std::io::stdout().lock());
@@ -5269,7 +5264,7 @@ mod pre_exit_tests {
         fn line(_: &mut StdoutLock<'static>) {
             log_into(&LOG, StageKind::LineClose);
         }
-        let stages = fresh();
+        let stages = &PreExitStages::new();
         let _dump = stages
             .register(Registration::SessionDump(Box::new(LoggingDump(&LOG))))
             .expect("the dump registers");
@@ -5287,7 +5282,7 @@ mod pre_exit_tests {
     fn distinct_kinds_never_refuse_each_other() {
         fn noop(_: &mut StdoutLock<'static>) {}
         static RUNS: AtomicUsize = AtomicUsize::new(0);
-        let stages = fresh();
+        let stages = &PreExitStages::new();
         let terminal = stages.register(Registration::TerminalRestore(noop));
         let line = stages.register(Registration::LineClose(noop));
         let dump = stages.register(Registration::SessionDump(Box::new(CountingDump(&RUNS))));
@@ -5307,7 +5302,7 @@ mod pre_exit_tests {
         fn second(_: &mut StdoutLock<'static>) {
             SECOND.fetch_add(1, Ordering::SeqCst);
         }
-        let stages = fresh();
+        let stages = &PreExitStages::new();
         let _held = stages
             .register(Registration::LineClose(first))
             .expect("the first owner registers");
@@ -5328,7 +5323,7 @@ mod pre_exit_tests {
     #[test]
     fn registration_after_exit_began_is_refused() {
         fn noop(_: &mut StdoutLock<'static>) {}
-        let stages = fresh();
+        let stages = &PreExitStages::new();
         run(stages);
         assert_eq!(
             stages
@@ -5342,7 +5337,7 @@ mod pre_exit_tests {
     #[test]
     fn a_retired_kind_can_be_held_again() {
         fn noop(_: &mut StdoutLock<'static>) {}
-        let stages = fresh();
+        let stages = &PreExitStages::new();
         stages
             .register(Registration::TerminalRestore(noop))
             .expect("the first session registers")
@@ -5358,7 +5353,7 @@ mod pre_exit_tests {
         static RUN_THEN_RETIRE: AtomicUsize = AtomicUsize::new(0);
         static RUN_TWICE: AtomicUsize = AtomicUsize::new(0);
 
-        let stages = fresh();
+        let stages = &PreExitStages::new();
         stages
             .register(Registration::SessionDump(Box::new(CountingDump(
                 &RETIRE_THEN_RUN,
@@ -5368,7 +5363,7 @@ mod pre_exit_tests {
         run(stages);
         assert_eq!(RETIRE_THEN_RUN.load(Ordering::SeqCst), 1);
 
-        let stages = fresh();
+        let stages = &PreExitStages::new();
         let ticket = stages
             .register(Registration::SessionDump(Box::new(CountingDump(
                 &RUN_THEN_RETIRE,
@@ -5378,7 +5373,7 @@ mod pre_exit_tests {
         ticket.retire();
         assert_eq!(RUN_THEN_RETIRE.load(Ordering::SeqCst), 1);
 
-        let stages = fresh();
+        let stages = &PreExitStages::new();
         let _ticket = stages
             .register(Registration::SessionDump(Box::new(CountingDump(
                 &RUN_TWICE,
@@ -5396,7 +5391,7 @@ mod pre_exit_tests {
         fn panicking(_: &mut StdoutLock<'static>) {
             panic!("a pre-exit stage panicked");
         }
-        let stages = fresh();
+        let stages = &PreExitStages::new();
         let _line = stages
             .register(Registration::LineClose(panicking))
             .expect("registers");
