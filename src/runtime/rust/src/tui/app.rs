@@ -85,7 +85,7 @@ fn tui_teardown_on(out: &mut std::io::StdoutLock<'static>) {
 /// Drop). Drop retires the stage, running the restore once. Best-effort, never
 /// panics.
 struct TuiGuard {
-    restore: Option<crate::system::pre_exit::StageTicket>,
+    restore: Option<crate::system::pre_exit::StageTicket<'static>>,
 }
 
 /// Why `TuiGuard::enter*` refused to start a Tui session — typed so a caller
