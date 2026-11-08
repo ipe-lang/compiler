@@ -452,8 +452,10 @@ csv_kernel = ["csv", "tokio", "random"]
 cache_kernel = ["tokio", "random"]
 # `tokio`: tea.rs (the shared Cli/Tui event loop, pulled by tui/app.rs) uses
 # `tokio::sync::mpsc`. Without it the standalone `--features tui` build fails to
-# resolve the `tea` module + `tokio`.
-tui = ["unicode-width", "crossterm", "tokio", "random"]
+# resolve the `tea` module + `tokio`. `tokio/signal`: the stop-signal relay
+# (`system::exit_signals`) every Cli/Tui driver installs listens through
+# `tokio::signal` — matching the emitted `tui_cargo_toml` tokio feature set.
+tui = ["unicode-width", "crossterm", "tokio", "tokio/signal", "random"]
 # The server-free render core: the target-neutral `crate::dom` diff/dispatch/form
 # pipeline, the `web::style_inject`/`page_shell` render helpers, and the
 # `dom::req::WebReq` init context — everything a patch consumer needs to render an

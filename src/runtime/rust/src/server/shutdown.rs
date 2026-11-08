@@ -19,11 +19,20 @@
 //! still running, and mints the [`WorkSettled`] proof [`close_owned_pools`]
 //! requires, so no counted work outlives the pools it uses.
 //!
-//! A signal the process inherited as ignored stays ignored (Linux).
+//! A signal the process inherited as ignored stays ignored (Linux). While the
+//! owner is armed, a terminal driver's stop relay leaves every request to it.
 
+#[cfg(windows)]
+use crate::system::ConsoleEvent;
 use crate::system::ProcessStatus;
+use crate::system::SIGNAL_QUEUE;
+pub use crate::system::StopSignal as Signal;
+#[cfg(unix)]
+use crate::system::inherited_ignored;
 use std::future::Future;
 use std::pin::Pin;
+#[cfg(all(feature = "tui", not(target_arch = "wasm32")))]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -69,9 +78,6 @@ const CLOSING_BIT: usize = 1 << (usize::BITS - 1);
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the work ceiling could reach the closing bit [ledger #boundary]
 const _: () = assert!(WORK_CEILING < CLOSING_BIT);
 
-/// The most signals queued between the OS listeners and the owner.
-const SIGNAL_QUEUE: usize = 8;
-
 /// The grace window a drain waits for in-flight work, from the first signal.
 ///
 /// Zero is accepted and means the drain does not wait.
@@ -101,26 +107,6 @@ pub enum Phase {
     Draining,
     /// Closing after the grace: work still running is cancelled.
     Closing,
-}
-
-/// A request to stop the process.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Signal {
-    /// `SIGINT`, Ctrl-C or Ctrl-Break.
-    Interrupt,
-    /// `SIGTERM`, or a Windows console close, logoff or shutdown event.
-    Terminate,
-}
-
-impl Signal {
-    /// The exit status of a process this signal forces to end: `128 + signo`.
-    #[must_use]
-    pub const fn forced_exit_status(self) -> ProcessStatus {
-        match self {
-            Self::Interrupt => ProcessStatus::INTERRUPTED,
-            Self::Terminate => ProcessStatus::TERMINATED,
-        }
-    }
 }
 
 /// Proof that the phase is closing and the counted work was given its
@@ -363,7 +349,7 @@ async fn run_signals(shutdown: Arc<Shutdown>, mut source: mpsc::Receiver<Signal>
                             shutdown.tag,
                             "forcing exit (second signal)",
                         );
-                        exit(signal.forced_exit_status());
+                        exit(signal.exit_status());
                     }
                     None if !torn_down => teardown.as_mut().await,
                     None => {}
@@ -380,6 +366,17 @@ type Slot = Mutex<Option<Arc<Shutdown>>>;
 
 /// The process's armed owner.
 static PROCESS: Slot = Mutex::new(None);
+
+/// Whether the process's owner is armed and holds the stop signals.
+#[cfg(all(feature = "tui", not(target_arch = "wasm32")))]
+static OWNS_SIGNALS: AtomicBool = AtomicBool::new(false);
+
+/// Whether the process's armed owner holds the stop signals, so a terminal
+/// driver's stop relay leaves each request to it.
+#[cfg(all(feature = "tui", not(target_arch = "wasm32")))]
+pub(crate) fn owns_stop_signals() -> bool {
+    OWNS_SIGNALS.load(Ordering::Acquire)
+}
 
 /// Proof that the shutdown owner was armed for a serve site.
 pub struct Armed {
@@ -632,7 +629,7 @@ impl Drop for WorkGuard {
 /// A signal listener that cannot be registered refuses startup, as does an
 /// arm outside a tokio runtime.
 pub fn arm(plan: ShutdownPlan, grace: Duration) -> std::io::Result<Armed> {
-    arm_in(
+    let armed = arm_in(
         &PROCESS,
         plan,
         grace,
@@ -641,7 +638,10 @@ pub fn arm(plan: ShutdownPlan, grace: Duration) -> std::io::Result<Armed> {
             crate::system::exit_process(status);
         }),
         process_pools(),
-    )
+    )?;
+    #[cfg(all(feature = "tui", not(target_arch = "wasm32")))]
+    OWNS_SIGNALS.store(true, Ordering::Release);
+    Ok(armed)
 }
 
 /// Arm the owner held in `slot`, its signals from `register`.
@@ -829,28 +829,6 @@ fn os_signals() -> std::io::Result<mpsc::Receiver<Signal>> {
     Ok(rx)
 }
 
-/// A Windows console control event.
-#[cfg(any(windows, test))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ConsoleEvent {
-    CtrlC,
-    CtrlBreak,
-    Close,
-    Logoff,
-    Shutdown,
-}
-
-#[cfg(any(windows, test))]
-impl ConsoleEvent {
-    /// The stop request this event makes.
-    const fn signal(self) -> Signal {
-        match self {
-            Self::CtrlC | Self::CtrlBreak => Signal::Interrupt,
-            Self::Close | Self::Logoff | Self::Shutdown => Signal::Terminate,
-        }
-    }
-}
-
 /// Register the console control listeners: Ctrl-C and Ctrl-Break must
 /// register; close, logoff and shutdown start the drain when they can.
 #[cfg(windows)]
@@ -882,28 +860,6 @@ fn os_signals() -> std::io::Result<mpsc::Receiver<Signal>> {
         std::io::ErrorKind::Unsupported,
         "no stop signal can be registered on this platform",
     ))
-}
-
-/// A set of signals, bit `n - 1` standing for signal `n`.
-/// The signals this process inherited as ignored, read once; none when the
-/// status cannot be read or parsed, so a stop request is never lost to a
-/// misreading.
-#[cfg(target_os = "linux")]
-fn inherited_ignored() -> crate::system::SignalSet {
-    use crate::system::{SignalSet, StatusMask, read_self_status, status_mask};
-    static READ: OnceLock<SignalSet> = OnceLock::new();
-    *READ.get_or_init(|| {
-        read_self_status()
-            .and_then(|status| status_mask(&status, StatusMask::Ignored))
-            .unwrap_or(SignalSet(0))
-    })
-}
-
-/// The signals this process inherited as ignored: unread off Linux, so every
-/// stop signal is registered.
-#[cfg(all(unix, not(target_os = "linux")))]
-const fn inherited_ignored() -> crate::system::SignalSet {
-    crate::system::SignalSet(0)
 }
 
 #[cfg(test)]
@@ -1277,15 +1233,6 @@ pub mod tests {
         assert!(ignored.is_some_and(|set| set.contains(SignalKind::interrupt().as_raw_value())));
         assert!(ignored.is_some_and(|set| !set.contains(SignalKind::hangup().as_raw_value())));
         assert_eq!(status_mask("SigIgn:\tnot-hex\n", StatusMask::Ignored), None);
-    }
-
-    #[test]
-    fn console_events_map_to_their_stop_request() {
-        assert_eq!(ConsoleEvent::CtrlC.signal(), Signal::Interrupt);
-        assert_eq!(ConsoleEvent::CtrlBreak.signal(), Signal::Interrupt);
-        assert_eq!(ConsoleEvent::Close.signal(), Signal::Terminate);
-        assert_eq!(ConsoleEvent::Logoff.signal(), Signal::Terminate);
-        assert_eq!(ConsoleEvent::Shutdown.signal(), Signal::Terminate);
     }
 
     #[cfg(windows)]

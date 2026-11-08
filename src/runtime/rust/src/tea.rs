@@ -1291,6 +1291,9 @@ where
                 Err(refusal) => IpeResult::Err(E::from(refusal.to_string())),
             };
         }
+        // A stop signal runs the pre-exit stages, then exits `128 + signo`; a
+        // refused relay is logged once and leaves each signal its default.
+        let _ = crate::system::exit_signals::install();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CliEvent<Msg>>();
 
         // Blocking stdin reader → raw Line events, then Eof. The line handlers are
@@ -1732,6 +1735,10 @@ where
                 Err(refusal) => IpeResult::Err(E::from(refusal.to_string())),
             };
         }
+        // A stop signal runs the pre-exit stages, then exits `128 + signo`; a
+        // refused relay is logged once and leaves each signal its default.
+        #[cfg(feature = "tui")]
+        let _ = crate::system::exit_signals::install();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WorkerEvent<Msg>>();
         let outstanding = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 

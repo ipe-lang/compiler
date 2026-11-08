@@ -890,3 +890,143 @@ mod pre_exit_stages {
         assert!(!names("run_exit_hooks()", "run_exit_hook"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// A stop signal reaches the process only through its one relay.
+// ---------------------------------------------------------------------------
+
+mod stop_signals {
+    //! A stop signal ends the process only through the stop relay or the
+    //! server's owner.
+    //!
+    //! The relay (`system::exit_signals`) and the server's owner
+    //! (`server::shutdown`) are the only listeners; a third would race them
+    //! for the same delivery. The process ends only through
+    //! `system::exit_process` and the stop relay's `system::force_exit`, and
+    //! every driver entry that registers a pre-exit stage installs the relay,
+    //! so a stop signal runs the stages it would otherwise skip.
+
+    /// The files that may name a `tokio::signal` listener, with the count of
+    /// code lines naming one: the server owner's listeners (and its test),
+    /// and in `system.rs` the spawn probe's listener and the relay's.
+    const SIGNAL_LISTENERS: &[(&str, usize)] = &[("server/shutdown.rs", 3), ("system.rs", 4)];
+
+    /// The files that may name `process::exit`, with the count of code lines
+    /// naming it: `exit_process` and `force_exit`.
+    const PROCESS_EXITS: &[(&str, usize)] = &[("system.rs", 2)];
+
+    /// Each driver entry that registers a pre-exit stage, by file and the
+    /// line that opens it, and the relay install it must call.
+    const DRIVER_ENTRIES: &[(&str, &str)] = &[
+        ("tea.rs", "pub fn console_app<"),
+        ("tea.rs", "pub fn worker_app<"),
+        ("tui/app.rs", "fn enter_with("),
+    ];
+
+    /// The relay install a driver entry calls.
+    const INSTALL: &str = "exit_signals::install()";
+
+    fn runtime_sources() -> Vec<(String, String)> {
+        super::rust_sources(&e2e_support::manifest_dir!().join("src"))
+    }
+
+    /// The count of lines in `text` naming `needle` outside a line comment.
+    fn code_lines_naming(text: &str, needle: &str) -> usize {
+        text.lines()
+            .filter(|line| !line.trim_start().starts_with("//") && line.contains(needle))
+            .count()
+    }
+
+    /// Every file naming `needle` in code, with its count, against `allowed`.
+    fn sites_differ(needle: &str, allowed: &[(&str, usize)]) -> Vec<String> {
+        let mut found: Vec<(String, usize)> = runtime_sources()
+            .into_iter()
+            .map(|(path, text)| {
+                let count = code_lines_naming(&text, needle);
+                (path, count)
+            })
+            .filter(|(_, count)| *count > 0)
+            .collect();
+        found.sort();
+        let expected: Vec<(String, usize)> = allowed
+            .iter()
+            .map(|(path, count)| ((*path).to_owned(), *count))
+            .collect();
+        if found == expected {
+            Vec::new()
+        } else {
+            vec![format!("expected {expected:?}, found {found:?}")]
+        }
+    }
+
+    /// The item `opener` begins in `text`, up to the closing brace at the
+    /// opener's own indentation.
+    fn item_body<'t>(text: &'t str, opener: &str) -> Option<&'t str> {
+        let at = text.find(opener)?;
+        let line_start = text.get(..at)?.rfind('\n').map_or(0, |nl| nl + 1);
+        let indent = text.get(line_start..at)?;
+        let close = format!("\n{indent}}}\n");
+        let rest = text.get(at..)?;
+        let end = rest.find(&close)?;
+        rest.get(..end)
+    }
+
+    #[test]
+    fn the_stop_relay_is_the_only_signal_listener_outside_the_server() {
+        let differ = sites_differ("tokio::signal", SIGNAL_LISTENERS);
+        assert!(
+            differ.is_empty(),
+            "a stop-signal listener sits outside the relay and the server owner:\n{}",
+            differ.join("\n")
+        );
+    }
+
+    #[test]
+    fn std_process_exit_has_exactly_two_sites() {
+        let differ = sites_differ("process::exit", PROCESS_EXITS);
+        assert!(
+            differ.is_empty(),
+            "the process ends outside `exit_process` and `force_exit`:\n{}",
+            differ.join("\n")
+        );
+    }
+
+    #[test]
+    fn every_driver_entry_installs_the_relay() {
+        let sources = runtime_sources();
+        let mut missing = Vec::new();
+        for (file, opener) in DRIVER_ENTRIES {
+            let installs = sources
+                .iter()
+                .find(|(path, _)| path == file)
+                .and_then(|(_, text)| item_body(text, opener))
+                .is_some_and(|body| code_lines_naming(body, INSTALL) == 1);
+            if !installs {
+                missing.push(format!("{file}: {opener}"));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "a driver entry does not install the stop relay exactly once:\n{}",
+            missing.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_scan_reads_code_lines_and_item_bodies() {
+        assert_eq!(
+            code_lines_naming(
+                "// process::exit\nstd::process::exit(1);\n",
+                "process::exit"
+            ),
+            1
+        );
+        let text =
+            "impl T {\n    fn enter_with() {\n        install();\n    }\n    fn other() {}\n}\n";
+        assert_eq!(
+            item_body(text, "fn enter_with("),
+            Some("fn enter_with() {\n        install();")
+        );
+        assert_eq!(item_body(text, "fn absent("), None);
+    }
+}

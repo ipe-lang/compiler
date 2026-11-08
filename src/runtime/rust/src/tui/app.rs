@@ -101,6 +101,8 @@ enum TuiEnterError {
     /// Another terminal driver holds the terminal-restore exit stage, so a
     /// `System.exit` could not restore the terminal.
     ExitStageHeld,
+    /// The process exit had begun, so no session may enter raw mode.
+    Exiting,
 }
 
 impl TuiEnterError {
@@ -111,6 +113,7 @@ impl TuiEnterError {
             Self::ExitStageHeld => "Tui: another terminal driver already runs in this process"
                 .to_owned()
                 .into(),
+            Self::Exiting => "Tui: the process is exiting".to_owned().into(),
         }
     }
 }
@@ -144,22 +147,48 @@ impl TuiGuard {
         Self::enter_with(true)
     }
     fn enter_with(mouse: bool) -> Result<Self, TuiEnterError> {
+        // A stop signal runs the pre-exit stages, the terminal restore among
+        // them, then exits `128 + signo`; a refused relay is logged once and
+        // leaves each signal its default.
+        let _ = crate::system::exit_signals::install();
         if let crate::terminal_access::TerminalAccess::Refused(reason) =
             crate::terminal_access::probe()
         {
             return Err(TuiEnterError::NoTerminal(reason));
         }
+        Self::enter_on(
+            crate::system::pre_exit::stages(),
+            mouse,
+            crossterm::terminal::enable_raw_mode,
+        )
+    }
+
+    /// Enter a session whose restore is a stage of `stages`, switching the
+    /// terminal to raw mode through `raw_mode`.
+    ///
+    /// The whole enter runs under the stdout lock, the lock an exit holds
+    /// while it runs the stages, taken before the stage's slot as the exit
+    /// takes them. An exit therefore either runs first, and the registration
+    /// is refused before raw mode is entered, or runs after the session is
+    /// marked active, and its restore undoes the whole enter.
+    fn enter_on(
+        stages: &'static crate::system::pre_exit::PreExitStages,
+        mouse: bool,
+        raw_mode: fn() -> std::io::Result<()>,
+    ) -> Result<Self, TuiEnterError> {
+        use crate::system::pre_exit::{Registration, StageRefused};
+        let mut out = std::io::stdout().lock();
         // Register the teardown before raw mode is entered, so a `System.exit`
         // quit restores the terminal even though process::exit skips Drop
         // (idempotent with the Drop path below). A stage another driver holds
         // refuses the session: raw mode with no exit restore would strand the
         // terminal.
-        let Ok(restore) = crate::system::pre_exit::register(
-            crate::system::pre_exit::Registration::TerminalRestore(tui_teardown_on),
-        ) else {
-            return Err(TuiEnterError::ExitStageHeld);
+        let restore = match stages.register(Registration::TerminalRestore(tui_teardown_on)) {
+            Ok(restore) => restore,
+            Err(StageRefused::Held(_)) => return Err(TuiEnterError::ExitStageHeld),
+            Err(StageRefused::Exiting) => return Err(TuiEnterError::Exiting),
         };
-        if let Err(e) = crossterm::terminal::enable_raw_mode() {
+        if let Err(e) = raw_mode() {
             restore.retire();
             return Err(classify_raw_mode_error(e));
         }
@@ -171,7 +200,6 @@ impl TuiGuard {
         crate::color::begin_tui_session_profile();
         TUI_MOUSE.store(mouse, Ordering::SeqCst);
         TUI_RESTORE_ACTIVE.store(true, Ordering::SeqCst);
-        let mut out = std::io::stdout();
         let _ = out.write_all(ALT_SCREEN_ON.as_bytes());
         let _ = out.write_all(HIDE_CURSOR.as_bytes());
         if mouse {
@@ -2470,5 +2498,50 @@ mod key_reader_tests {
         assert!(ctrl_c.is_interrupt());
         assert!(!ctrl_d.is_interrupt());
         assert!(!c.is_interrupt());
+    }
+}
+
+#[cfg(test)]
+mod enter_tests {
+    use super::{TuiEnterError, TuiGuard};
+    use crate::system::pre_exit::PreExitStages;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// How long the exit holds the stdout lock while the enter waits on it.
+    const ENTER_HEAD_START: Duration = Duration::from_millis(100);
+
+    static STAGES: PreExitStages = PreExitStages::new();
+    static RAW_ENTERED: AtomicBool = AtomicBool::new(false);
+
+    fn fake_raw_mode() -> std::io::Result<()> {
+        RAW_ENTERED.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)] // a refused thread or a panicked enter fails the test
+    fn an_exit_holding_stdout_refuses_a_waiting_enter_before_raw_mode() {
+        let mut out = std::io::stdout().lock();
+        let enter = std::thread::Builder::new()
+            .spawn(|| {
+                matches!(
+                    TuiGuard::enter_on(&STAGES, false, fake_raw_mode),
+                    Err(TuiEnterError::Exiting)
+                )
+            })
+            .expect("the enter thread starts");
+        std::thread::sleep(ENTER_HEAD_START);
+        STAGES.run_stages(&mut out);
+        drop(out);
+        let refused = enter.join().expect("the enter returns");
+        assert!(
+            refused,
+            "an enter waiting on the exit is refused as exiting"
+        );
+        assert!(
+            !RAW_ENTERED.load(Ordering::SeqCst),
+            "raw mode is never entered once the exit has begun"
+        );
     }
 }
