@@ -754,7 +754,7 @@ mod tests {
         let block = judge_first("x =\n  \"\"\"\n  a\n   b\n  \"\"\"");
         assert!(block.is_ok(), "{block:?}");
         let Ok(block) = block else { return };
-        assert_eq!(block.string.margin().map(|c| c.get()), Some(nz(3)));
+        assert_eq!(block.string.margin().map(Column::get), Some(nz(3)));
         assert_eq!(block.string.lines().collect::<Vec<_>>(), ["a", " b"]);
         let one = judge_first("x = \"\"\"a\"\"\"");
         assert!(one.is_ok(), "{one:?}");
