@@ -461,19 +461,19 @@ fn token_region(lx: &mut Lexer<'_>, c: char, lo: u32) -> (PositionContext, bool)
     let opener = Opener::of(lx, c);
     let context = opener.context();
     match lex_opened(lx, opener, c, lo) {
-        Ok(_) => (context, false),
         // A refused code token keeps the bytes its recogniser read — digits,
         // a fraction, an exponent, or one operator character, never a comment
         // or literal opener — so reading resumes where it stopped and no byte
         // is read twice. A refusal that read nothing (an unknown character)
-        // is advanced past by the progress guard in `next`.
-        Err(_) if context == PositionContext::Code => (context, false),
-        // A `"""` string refused for its shape is read through its closing
-        // `"""`, so it is one closed region and reading resumes past it.
-        Err(Diagnostic::Parse {
+        // is advanced past by the progress guard in `next`. A `"""` string
+        // refused for its shape is read through its closing `"""`, so it is
+        // one closed region and reading resumes past it.
+        Ok(_)
+        | Err(Diagnostic::Parse {
             msg: ParseError::MalformedTripleString(_),
             ..
         }) => (context, false),
+        Err(_) if context == PositionContext::Code => (context, false),
         Err(_) => {
             lx.skip_to_line_end();
             (context, true)

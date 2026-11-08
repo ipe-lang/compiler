@@ -193,12 +193,12 @@ pub fn judge(src: &str, opener: Opener) -> Result<Judged, TripleRefusal> {
     if after_opener < body_end {
         let body = inner.get(after_opener..body_end).unwrap_or_default();
         let mut line_lo = offset(inner_lo, after_opener);
-        let mut line_no = opener.line;
+        let mut line = opener.line;
         for raw in body.split_inclusive('\n') {
-            line_no = line_no.saturating_add(1);
+            line = line.saturating_add(1);
             let content = raw.strip_suffix('\n').unwrap_or(raw);
             let content = content.strip_suffix('\r').unwrap_or(content);
-            lines.push(judge_body_line(content, line_lo, line_no, margin).map_err(&malformed)?);
+            lines.push(judge_body_line(content, line_lo, line, margin).map_err(&malformed)?);
             line_lo = offset(line_lo, raw.len());
         }
     }
@@ -232,16 +232,13 @@ fn judge_closer_line(
             margin,
         });
     }
-    match prefix.find('\t') {
-        Some(tab) => {
-            let lo = offset(prefix_lo, tab);
-            Err(TripleStringDefect::TabInMargin {
-                span: Span::new(lo, offset(lo, 1)),
-                margin,
-            })
-        }
-        None => Ok(()),
-    }
+    prefix.find('\t').map_or(Ok(()), |tab| {
+        let lo = offset(prefix_lo, tab);
+        Err(TripleStringDefect::TabInMargin {
+            span: Span::new(lo, offset(lo, 1)),
+            margin,
+        })
+    })
 }
 
 /// Judge one block body line against the margin and strip it.
