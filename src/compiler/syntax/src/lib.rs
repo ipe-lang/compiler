@@ -6,13 +6,17 @@
 mod ast;
 pub mod fixity;
 mod literal;
+mod triple;
 
 pub use ast::{
     Ctor, DocString, Exposed, Exposing, Expr, Expr_, ForeignDecl, Import, LetBinding, Module,
-    Pattern, Pattern_, Privacy, TypeAlias, TypeAnnotation, Union, Value, strip_anchor_margin,
+    Pattern, Pattern_, Privacy, TypeAlias, TypeAnnotation, Union, Value,
 };
 pub use fixity::{Assoc, BinOp, Fixity};
 pub use literal::{ESCAPES, escape_char_body, escape_str_body};
+pub use triple::{
+    Column, Judged, Opener, Piece, TripleRefusal, TripleStr, extent, interpolation_pieces, judge,
+};
 
 #[cfg(test)]
 mod tests {

@@ -34,9 +34,10 @@ use crate::diagnostic::{
     AppShape, Applicability, ArgCount, CaseDefect, CodecAutoRejection, ConsentError, CtorWithheld,
     Diagnostic, Expected, ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach,
     HazardRefusal, HeaderDefect, HelpLine, Hint, IfDefect, ImportedAs, LetDefect, LowerError,
-    MountPrefixFault, NameError, ParseError, RoutePatternDefect, SandboxError, SealRejection,
-    SpanRole, StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc,
-    TypeDeclDefect, TypeError, TypeSizeOrigin, WildcardDependence, intercept_context_phrase,
+    MountPrefixFault, NameError, OpenerText, ParseError, RoutePatternDefect, SandboxError,
+    SealRejection, SpanRole, StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion,
+    TokenKind, TripleStringDefect, TyDoc, TypeDeclDefect, TypeError, TypeSizeOrigin,
+    WildcardDependence, intercept_context_phrase,
 };
 use crate::span::Span;
 use crate::terminal::BIDI_ISOLATE_CLOSER;
@@ -439,6 +440,85 @@ fn parse_prose(msg: &ParseError) -> String {
             "`{qualified}` is a constructor, but a pattern can't name it with its \
              module qualifier — only the bare name `{bare}` is matched here."
         ),
+        ParseError::MalformedTripleString(defect) => triple_string_prose(*defect),
+    }
+}
+
+/// The prose band for a malformed `"""` string: which of the two forms it breaks.
+fn triple_string_prose(defect: TripleStringDefect) -> String {
+    const FORMS: &str = "A `\"\"\"` string is either one line (`\"\"\"text\"\"\"`) or a \
+         block: the opening `\"\"\"` ends its line, and the closing `\"\"\"` stands alone \
+         on its own line in the opener's column, the margin.";
+    match defect {
+        TripleStringDefect::TextAfterOpener { .. } => {
+            format!("This string runs past its first line, so it is a block. {FORMS}")
+        }
+        TripleStringDefect::CloserEndsContentLine { .. } => {
+            format!("The closing `\"\"\"` of this block ends a line of content. {FORMS}")
+        }
+        TripleStringDefect::Misaligned {
+            closer_col, margin, ..
+        } => format!(
+            "The closing `\"\"\"` stands in column {closer_col}, but the opening one in \
+             column {margin}. {FORMS}"
+        ),
+        TripleStringDefect::LineUnderMargin { line, margin, .. } => format!(
+            "Line {line} starts left of this block's margin, column {margin}. Every body line \
+             is indented at least to the margin, which is the opening `\"\"\"`'s column; \
+             the margin is not part of the value."
+        ),
+        TripleStringDefect::TabInMargin { margin, .. } => format!(
+            "A tab stands left of this block's margin, column {margin}. Only spaces indent \
+             a body line to the margin, because a tab is as wide as each viewer makes it."
+        ),
+    }
+}
+
+/// The primary label for a malformed `"""` string.
+fn triple_string_label(defect: TripleStringDefect) -> String {
+    match defect {
+        TripleStringDefect::TextAfterOpener {
+            text: OpenerText::Whitespace,
+            ..
+        } => "trailing whitespace after the opening `\"\"\"`".to_string(),
+        TripleStringDefect::TextAfterOpener {
+            text: OpenerText::Content,
+            ..
+        } => "text after the opening `\"\"\"` of a block".to_string(),
+        TripleStringDefect::CloserEndsContentLine { .. } => {
+            "this `\"\"\"` ends a line of content".to_string()
+        }
+        TripleStringDefect::Misaligned {
+            closer_col, margin, ..
+        } => format!("this `\"\"\"` is in column {closer_col}, not column {margin}"),
+        TripleStringDefect::LineUnderMargin { margin, .. } => {
+            format!("this line starts left of column {margin}")
+        }
+        TripleStringDefect::TabInMargin { .. } => "a tab inside the margin".to_string(),
+    }
+}
+
+/// The one fix for a malformed `"""` string, applied by hand at the defect's span.
+fn triple_string_fix(defect: TripleStringDefect) -> String {
+    match defect {
+        TripleStringDefect::TextAfterOpener {
+            text: OpenerText::Whitespace,
+            ..
+        } => "remove the trailing whitespace after `\"\"\"`".to_string(),
+        TripleStringDefect::TextAfterOpener {
+            text: OpenerText::Content,
+            ..
+        } => "move the text to the next line".to_string(),
+        TripleStringDefect::CloserEndsContentLine { margin, .. } => {
+            format!("put the closing `\"\"\"` on its own line in column {margin}")
+        }
+        TripleStringDefect::Misaligned { margin, .. } => {
+            format!("move the closing `\"\"\"` to column {margin}")
+        }
+        TripleStringDefect::LineUnderMargin { margin, .. } => {
+            format!("indent this line to at least column {margin}")
+        }
+        TripleStringDefect::TabInMargin { .. } => "replace the tab with spaces".to_string(),
     }
 }
 
@@ -556,7 +636,8 @@ fn lexical_prose(msg: &ParseError) -> String {
         | ParseError::MissingDocString { .. }
         | ParseError::AnnotationWithoutBinding { .. }
         | ParseError::DuplicateAnnotation { .. }
-        | ParseError::QualifiedCtorInPattern { .. } => {
+        | ParseError::QualifiedCtorInPattern { .. }
+        | ParseError::MalformedTripleString(_) => {
             "I couldn't make sense of this part of the file.".to_string()
         }
     }
@@ -1291,6 +1372,7 @@ pub fn render_json(d: &Diagnostic, file: &str, source: &str) -> String {
                         SpanRole::FirstDefinition => "first_definition",
                         SpanRole::Opener => "opener",
                         SpanRole::Definition => "definition",
+                        SpanRole::MarginOpener => "margin_opener",
                     };
                     secondary_json_parts.push(format!(
                         "{{\"file\":{},\"byte_lo\":{},\"byte_hi\":{},\
@@ -1712,6 +1794,7 @@ fn parse_label(msg: &ParseError) -> Option<String> {
         ParseError::QualifiedCtorInPattern { bare, .. } => Some(format!(
             "patterns match the bare name `{bare}`, not the qualified one"
         )),
+        ParseError::MalformedTripleString(defect) => Some(triple_string_label(*defect)),
         ParseError::Unexpected
         | ParseError::TooDeep
         | ParseError::SteplessDo
@@ -2577,6 +2660,7 @@ const fn role_label(role: SpanRole) -> &'static str {
         SpanRole::FirstDefinition => "first defined here",
         SpanRole::Opener => "the unclosed delimiter opened here",
         SpanRole::Definition => "the type was fixed here",
+        SpanRole::MarginOpener => "this `\"\"\"` sets the margin column",
     }
 }
 
@@ -2717,6 +2801,7 @@ fn hint_text(hint: Hint) -> String {
         Hint::QualifiedCtorInPattern => "bring the type's constructors into scope with \
              `import Module exposing (Type(..))`, then match the bare name"
             .to_string(),
+        Hint::TripleStringFix(defect) => triple_string_fix(defect),
     }
 }
 

@@ -24,7 +24,9 @@
 
 use ipe_diagnostics::Located;
 use ipe_intern::Symbol;
-use ipe_syntax::{Expr, Expr_};
+use std::borrow::Cow;
+
+use ipe_syntax::{Expr, Expr_, Piece, interpolation_pieces};
 
 use crate::finding::Finding;
 use crate::rules::Ctx;
@@ -59,10 +61,16 @@ fn is_ui_icon_button(ctx: &Ctx, expr: &Expr) -> bool {
 /// (`""""""` / `""" """` → a nameless/whitespace `aria-label`), so it must be
 /// caught here too. A triple-quote carrying `{{…}}` interpolation is computed,
 /// not a literal — out of a lint's reach, so it is left alone.
-fn str_val(expr: &Expr) -> Option<&str> {
+fn str_val(expr: &Expr) -> Option<Cow<'_, str>> {
     match &expr.value {
-        Expr_::Str(s) => Some(s.as_str()),
-        Expr_::MultilineStr { raw, .. } if !raw.contains("{{") => Some(raw.as_str()),
+        Expr_::Str(s) => Some(Cow::Borrowed(s.as_str())),
+        Expr_::MultilineStr(string) => {
+            let value = string.value();
+            let computed = interpolation_pieces(&value)
+                .iter()
+                .any(|piece| matches!(piece, Piece::Interp { .. }));
+            (!computed).then_some(value)
+        }
         _ => None,
     }
 }
@@ -104,7 +112,7 @@ fn check_record(ctx: &Ctx, fields: &[(Located<Symbol>, Expr)], out: &mut Vec<Fin
             continue;
         }
         if let Some(raw) = str_val(value)
-            && is_meaningless_name(raw)
+            && is_meaningless_name(&raw)
         {
             out.push(
                 ctx.advisory(

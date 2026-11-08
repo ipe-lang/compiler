@@ -30,13 +30,15 @@ use crate::code::{
     IPE_P0017, IPE_P0018, IPE_P0020, IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041,
     IPE_P0050, IPE_P0060, IPE_P0061, IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066,
     IPE_P0067, IPE_P0068, IPE_P0069, IPE_P0070, IPE_P0071, IPE_P0072, IPE_P0073, IPE_P0074,
-    IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004, IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004,
-    IPE_T0010, IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017,
-    IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021, IPE_T0022, IPE_T0023, IPE_T0024, Severity,
+    IPE_P0075, IPE_P0076, IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004, IPE_T0001, IPE_T0002,
+    IPE_T0003, IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015,
+    IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021, IPE_T0022, IPE_T0023,
+    IPE_T0024, Severity,
 };
 use crate::span::Span;
 use crate::suggest::{Confidence, Hit};
 use crate::terminal::TerminalSafe;
+use std::num::NonZeroU32;
 
 // ===========================================================================
 // Plain-old-data payload enums
@@ -318,6 +320,58 @@ pub enum LetDefect {
     BareWildcardBinding,
 }
 
+/// What follows the opening `"""` of a string that runs past its line.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum OpenerText {
+    /// Only spaces or tabs: trailing whitespace after the opener.
+    Whitespace,
+    /// Content the multiline form puts on the next line.
+    Content,
+}
+
+/// Which shape rule of a triple-quoted string a literal breaks.
+///
+/// A `"""` string has two forms: one line (`"""text"""`), or a block whose
+/// opener ends its line and whose closer stands alone in the opener's column
+/// (the margin). Each variant carries the span of the defect itself; columns
+/// count Unicode scalars from 1, as the lexer does.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum TripleStringDefect {
+    /// Text follows the opening `"""` of a string that runs past its line. [IPE-P0075]
+    TextAfterOpener { span: Span, text: OpenerText },
+    /// The closing `"""` of a block ends a line that holds content. [IPE-P0075]
+    CloserEndsContentLine { span: Span, margin: NonZeroU32 },
+    /// The closing `"""` stands alone, but not in the opener's column. [IPE-P0075]
+    Misaligned {
+        span: Span,
+        opener: Span,
+        closer_col: NonZeroU32,
+        margin: NonZeroU32,
+    },
+    /// A body line holds a non-space character left of the margin. [IPE-P0076]
+    LineUnderMargin {
+        span: Span,
+        line: NonZeroU32,
+        margin: NonZeroU32,
+    },
+    /// A tab stands left of the margin. [IPE-P0076]
+    TabInMargin { span: Span, margin: NonZeroU32 },
+}
+
+impl TripleStringDefect {
+    /// The source span of the defect itself.
+    #[must_use]
+    pub const fn span(self) -> Span {
+        match self {
+            Self::TextAfterOpener { span, .. }
+            | Self::CloserEndsContentLine { span, .. }
+            | Self::Misaligned { span, .. }
+            | Self::LineUnderMargin { span, .. }
+            | Self::TabInMargin { span, .. } => span,
+        }
+    }
+}
+
 /// Which part of an `if … then … else …` expression is malformed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum IfDefect {
@@ -488,6 +542,9 @@ pub enum ParseError {
     /// `qualified` is the full dotted name as written, `bare` the trailing
     /// unqualified segment. [IPE-P0074]
     QualifiedCtorInPattern { qualified: Box<str>, bare: Box<str> },
+    /// A `"""` string in neither of its two forms, or with a line left of its
+    /// margin. [IPE-P0075] for the form, [IPE-P0076] for the margin.
+    MalformedTripleString(TripleStringDefect),
 }
 
 /// Why a source display hazard is refused where it stands.
@@ -2561,6 +2618,8 @@ pub enum SpanRole {
     Opener,
     /// The definition that fixed an inferred type.
     Definition,
+    /// The opening `"""` whose column is a block string's margin.
+    MarginOpener,
 }
 
 /// A fixed, payload-free guidance line. Keeping these as an enum (not a
@@ -2568,6 +2627,8 @@ pub enum SpanRole {
 /// owns the wording.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Hint {
+    /// The one fix for a malformed `"""` string, worded from its defect.
+    TripleStringFix(TripleStringDefect),
     /// Show the canonical module header `module Main exposing (main)`.
     ModuleHeaderExample,
     /// Suggest `..` or `Module.name` for a stray dot.
@@ -3026,6 +3087,14 @@ const fn parse_code(msg: &ParseError) -> Code {
         ParseError::SourceDisplayHazard { .. } => IPE_P0072,
         ParseError::SourceTerminalControl { .. } => IPE_P0073,
         ParseError::QualifiedCtorInPattern { .. } => IPE_P0074,
+        ParseError::MalformedTripleString(
+            TripleStringDefect::TextAfterOpener { .. }
+            | TripleStringDefect::CloserEndsContentLine { .. }
+            | TripleStringDefect::Misaligned { .. },
+        ) => IPE_P0075,
+        ParseError::MalformedTripleString(
+            TripleStringDefect::LineUnderMargin { .. } | TripleStringDefect::TabInMargin { .. },
+        ) => IPE_P0076,
     })
 }
 
@@ -3247,6 +3316,26 @@ fn parse_help(msg: &ParseError) -> Vec<HelpLine> {
         ParseError::QualifiedCtorInPattern { .. } => {
             vec![HelpLine::Hint(Hint::QualifiedCtorInPattern)]
         }
+        ParseError::MalformedTripleString(defect) => triple_string_help(*defect),
+    }
+}
+
+/// The help for a malformed `"""` string: the opener that sets the margin, when
+/// the closer strays from it, then the one fix for the defect.
+fn triple_string_help(defect: TripleStringDefect) -> Vec<HelpLine> {
+    let fix = HelpLine::Hint(Hint::TripleStringFix(defect));
+    match defect {
+        TripleStringDefect::Misaligned { opener, .. } => vec![
+            HelpLine::SecondarySpan {
+                span: opener,
+                role: SpanRole::MarginOpener,
+            },
+            fix,
+        ],
+        TripleStringDefect::TextAfterOpener { .. }
+        | TripleStringDefect::CloserEndsContentLine { .. }
+        | TripleStringDefect::LineUnderMargin { .. }
+        | TripleStringDefect::TabInMargin { .. } => vec![fix],
     }
 }
 

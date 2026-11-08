@@ -33,7 +33,8 @@
 
 use ipe_diagnostics::terminal::{SourceHazard, ends_bidi_paragraph};
 use ipe_diagnostics::{DResult, Diagnostic, HazardRefusal, ParseError, Span};
-use ipe_syntax::ESCAPES;
+use ipe_syntax::{Column, ESCAPES, TripleRefusal, TripleStr};
+use std::num::NonZeroU32;
 
 /// Unsigned magnitude of an integer literal as lexed, bounded to `0 ..= 2^63`.
 ///
@@ -178,21 +179,10 @@ pub enum Tok {
     /// UNESCAPED value (escape sequences such as `\n` / `\"` are resolved here),
     /// so downstream stages see the runtime string verbatim.
     Str(String),
-    /// A triple-quoted string literal `"""..."""`.
-    ///
-    /// `raw` is the RAW content — escape sequences (`\n`, `\\`) and `{{expr}}`
-    /// interpolation markers are NOT resolved here; the canonicaliser handles
-    /// them downstream.
-    ///
-    /// `anchor` is the 1-based source column of the first non-whitespace content
-    /// character (the anchor column A). The canonicaliser strips up to `A - 1`
-    /// leading whitespace characters from every physical line after the first,
-    /// so an indented `"""…"""` block does not carry its source margin into the
-    /// runtime value.
-    TripleStr {
-        raw: String,
-        anchor: u32,
-    },
+    /// A triple-quoted string literal `"""..."""`, judged into one of its two
+    /// forms. Escape sequences and `{{expr}}` markers in its value are not
+    /// resolved here; the canonicaliser handles them downstream.
+    TripleStr(TripleStr),
     /// A character literal `'a'`. The carried [`String`] is the single UNESCAPED
     /// character's text (exactly one `char`), so `'\n'` carries a one-character
     /// newline string. The backend renders it as a Rust `char` literal.
@@ -452,8 +442,9 @@ impl LexicalRegion {
 ///
 /// Unlike [`lex`] it never fails, because completion answers over a buffer
 /// mid-edit. A literal or comment the lexer refuses is one region running to
-/// the end of the line it was refused on (to end of input for a `"""` string
-/// or a comment, where the refusal stands); a code token the lexer refuses is
+/// the end of the line it was refused on (to end of input for an unterminated
+/// `"""` string or comment, where the refusal stands); a `"""` string refused
+/// for its shape is one closed region through its closing `"""`; a code token the lexer refuses is
 /// one region of code over the bytes its recogniser read (at least one
 /// character), and reading resumes where it stopped. No byte is read twice,
 /// so the walk is linear in `src.len()`.
@@ -477,6 +468,12 @@ fn token_region(lx: &mut Lexer<'_>, c: char, lo: u32) -> (PositionContext, bool)
         // is read twice. A refusal that read nothing (an unknown character)
         // is advanced past by the progress guard in `next`.
         Err(_) if context == PositionContext::Code => (context, false),
+        // A `"""` string refused for its shape is read through its closing
+        // `"""`, so it is one closed region and reading resumes past it.
+        Err(Diagnostic::Parse {
+            msg: ParseError::MalformedTripleString(_),
+            ..
+        }) => (context, false),
         Err(_) => {
             lx.skip_to_line_end();
             (context, true)
@@ -646,7 +643,7 @@ struct OpenIsolate {
 
 /// Whether `kind` is a literal whose body the compiler reads as data.
 const fn is_text_literal(kind: &Tok) -> bool {
-    matches!(kind, Tok::Str(_) | Tok::TripleStr { .. } | Tok::Char(_))
+    matches!(kind, Tok::Str(_) | Tok::TripleStr(_) | Tok::Char(_))
 }
 
 /// The first source display hazard no string or char literal proves admissible.
@@ -655,12 +652,8 @@ const fn is_text_literal(kind: &Tok) -> bool {
 /// doc comment, whitespace or code refuses every hazard. Inside a literal an
 /// isolate must be closed before the literal ends and before any bidi
 /// paragraph separator (a `\n` in a `"""` body), which closes it for a viewer.
-fn unproven_literal_hazard(src: &str, tokens: &[Token]) -> Option<HazardHit> {
-    let mut literals = tokens
-        .iter()
-        .filter(|token| is_text_literal(&token.kind))
-        .map(|token| token.span)
-        .peekable();
+fn unproven_literal_hazard(src: &str, literals: impl Iterator<Item = Span>) -> Option<HazardHit> {
+    let mut literals = literals.peekable();
     let mut open: Option<OpenIsolate> = None;
     for (at, c) in src.char_indices() {
         let offset = u32::try_from(at).unwrap_or(u32::MAX);
@@ -796,7 +789,18 @@ pub fn lex(src: &str) -> DResult<Vec<Token>> {
         let lo = lx.offset();
 
         let opener = Opener::of(&lx, c);
-        let kind = lex_opened(&mut lx, opener, c, lo)?;
+        let kind = match lex_opened(&mut lx, opener, c, lo) {
+            Ok(kind) => kind,
+            Err(
+                refusal @ Diagnostic::Parse {
+                    msg: ParseError::MalformedTripleString(_),
+                    ..
+                },
+            ) => {
+                return Err(hazard_before_shape(src, &out, &lx, lo, hazards).unwrap_or(refusal));
+            }
+            Err(refusal) => return Err(refusal),
+        };
 
         let hi = lx.offset();
         out.push(Token {
@@ -807,11 +811,38 @@ pub fn lex(src: &str) -> DResult<Vec<Token>> {
         });
     }
     if hazards == HazardScan::LiteralOnly
-        && let Some(hit) = unproven_literal_hazard(src, &out)
+        && let Some(hit) = unproven_literal_hazard(src, literal_spans(&out))
     {
         return Err(display_hazard_error(hit));
     }
     Ok(out)
+}
+
+/// The spans of the text literals among `tokens`, in source order.
+fn literal_spans(tokens: &[Token]) -> impl Iterator<Item = Span> {
+    tokens
+        .iter()
+        .filter(|token| is_text_literal(&token.kind))
+        .map(|token| token.span)
+}
+
+/// A display hazard that outranks the refusal of a `"""` string judged
+/// malformed at `lo`: the string is still a literal through its closing
+/// `"""`, where the cursor stands, so its body is judged as one.
+fn hazard_before_shape(
+    src: &str,
+    out: &[Token],
+    lx: &Lexer<'_>,
+    lo: u32,
+    hazards: HazardScan,
+) -> Option<Diagnostic> {
+    if hazards != HazardScan::LiteralOnly {
+        return None;
+    }
+    let hi = lx.offset();
+    let read = src.get(..hi as usize)?;
+    let shaped = std::iter::once(Span::new(lo, hi));
+    unproven_literal_hazard(read, literal_spans(out).chain(shaped)).map(display_hazard_error)
 }
 
 /// Which token recogniser the character at the cursor opens.
@@ -1063,69 +1094,39 @@ fn lex_string(lx: &mut Lexer, lo: u32) -> DResult<Tok> {
     }
 }
 
-/// Lex a triple-quoted string `"""…"""`.  The opening `"""` has already been
-/// consumed by [`lex_string`].
+/// Lex a `"""` string, judged into one of its two forms by
+/// [`ipe_syntax::judge`]. The opening `"""` at `lo` has already been consumed by
+/// [`lex_string`], so the opener stands three columns left of the cursor.
 ///
-/// The closing terminator is exactly three consecutive `"` characters.  A lone
-/// `"` or a pair `""` not followed by a third `"` is treated as literal content
-/// — this is the critical invariant that fixes the bug where inline HTML
-/// (`class="card"`) terminated the string early.
-///
-/// Raw content is returned without escape processing: `{{expr}}` interpolation,
-/// `\{{` literal-brace escapes, and `\\` collapse are handled downstream by the
-/// canonicaliser (mirroring `Ipe.Parse.String.findTripleClose` in the reference compiler
-/// reference, which performs no escape resolution).
-///
-/// The anchor column A is the source column of the first non-whitespace content
-/// character. The lexer's `col` cursor tracks the current source column; a
-/// newline resets it to column 1 in [`Lexer::advance`], so the column recorded
-/// at the first character that is neither a newline nor leading indentation is
-/// A. The margin the canonicaliser strips is exactly this indentation, so
-/// leading spaces and tabs are skipped when locating A. A body that is only
-/// whitespace (or empty) anchors at column 1, which strips nothing downstream.
-///
-/// Reaching end of input before `"""` is [`ParseError::UnterminatedString`].
+/// With no closing `"""` the string is [`ParseError::UnterminatedString`] over
+/// the opener to end of input. A string in neither form is
+/// [`ParseError::MalformedTripleString`] at its defect; the cursor still moves
+/// past the string's closing `"""`, so reading resumes after the whole string.
 fn lex_triple_string(lx: &mut Lexer, lo: u32) -> DResult<Tok> {
-    let content_lo = lx.offset();
-    let mut anchor: Option<u32> = None;
-    loop {
-        match lx.peek() {
-            None => {
-                let hi = lx.offset();
-                return Err(Diagnostic::Parse {
-                    span: Span::new(lo, hi),
-                    msg: ParseError::UnterminatedString,
-                });
-            }
-            Some('"') => {
-                // Check whether the current `"` starts the closing `"""`.
-                // peek() is `"` (confirmed by this arm); peek2() and peek3()
-                // must also be `"` for a triple-close.
-                if lx.peek2() == Some('"') && lx.peek3() == Some('"') {
-                    let closer_lo = lx.offset();
-                    lx.advance(); // consume first `"`  of `"""`
-                    lx.advance(); // consume second `"` of `"""`
-                    lx.advance(); // consume third `"`  of `"""`
-                    // The raw body is exactly the source between the opening and
-                    // closing `"""`; the loop transforms no char (escape and
-                    // interpolation resolution is downstream), so the slice
-                    // equals the concatenation a per-char buffer produced.
-                    return Ok(Tok::TripleStr {
-                        raw: lx.slice(content_lo, closer_lo).to_owned(),
-                        anchor: anchor.unwrap_or(1),
-                    });
-                }
-                // A literal `"` is content, so it fixes the anchor.
-                anchor.get_or_insert(lx.col);
-                lx.advance();
-            }
-            Some(c) => {
-                if c != '\n' && c != '\r' && c != ' ' && c != '\t' {
-                    anchor.get_or_insert(lx.col);
-                }
-                lx.advance();
-            }
-        }
+    let opener = ipe_syntax::Opener {
+        lo,
+        line: NonZeroU32::new(lx.line).unwrap_or(NonZeroU32::MIN),
+        column: Column::new(NonZeroU32::new(lx.col.saturating_sub(3)).unwrap_or(NonZeroU32::MIN)),
+    };
+    let judged = ipe_syntax::judge(lx.src, opener);
+    let end = match &judged {
+        Ok(found) => found.end,
+        Err(TripleRefusal::Malformed { end, .. }) => *end,
+        Err(TripleRefusal::Unterminated { eof }) => *eof,
+    };
+    while lx.peek().is_some() && lx.offset() < end {
+        lx.advance();
+    }
+    match judged {
+        Ok(found) => Ok(Tok::TripleStr(found.string)),
+        Err(TripleRefusal::Unterminated { eof }) => Err(Diagnostic::Parse {
+            span: Span::new(lo, eof),
+            msg: ParseError::UnterminatedString,
+        }),
+        Err(TripleRefusal::Malformed { defect, .. }) => Err(Diagnostic::Parse {
+            span: defect.span(),
+            msg: ParseError::MalformedTripleString(defect),
+        }),
     }
 }
 
