@@ -4673,6 +4673,7 @@ pub(crate) mod exit_signals {
         /// The relay did not report within its start wait.
         Start,
         /// No stop signal can be listened to on this target.
+        #[cfg(not(any(unix, windows)))]
         Unsupported,
     }
 
@@ -4683,6 +4684,7 @@ pub(crate) mod exit_signals {
                 Self::Runtime => f.write_str("the relay runtime could not start"),
                 Self::Listen(kind) => write!(f, "a listener could not be registered ({kind})"),
                 Self::Start => f.write_str("the relay did not start in time"),
+                #[cfg(not(any(unix, windows)))]
                 Self::Unsupported => f.write_str("this target has no stop signal to listen to"),
             }
         }
@@ -5395,7 +5397,7 @@ pub(crate) mod exit_signals {
                 assert!(
                     child.alive_after(IGNORED_WAIT),
                     "an inherited-ignored hangup ended the child:\n{}",
-                    child.stderr()
+                    child.log()
                 );
                 child.send(Signal::TERM);
                 let ended = child.finish();
