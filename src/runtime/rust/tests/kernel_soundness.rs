@@ -110,6 +110,39 @@ fn round_outcome(x: f64) -> Result<i64, Option<RuntimeTrip>> {
         .map_err(|payload| runtime_trip(payload.as_ref()))
 }
 
+/// The outcome `math_round` must reach. A trip is read by pattern: code outside
+/// the runtime cannot build one to compare against.
+#[derive(Debug, Clone, Copy)]
+enum Rounded {
+    /// The exact `Int`.
+    Exact(i64),
+    /// A `NonFiniteToInt` trip.
+    NonFinite,
+    /// An `IntOverflow` trip.
+    Overflow,
+}
+
+/// Whether `outcome` is `expected`.
+fn rounds_to(outcome: Result<i64, Option<RuntimeTrip>>, expected: Rounded) -> bool {
+    match expected {
+        Rounded::Exact(n) => outcome == Ok(n),
+        Rounded::NonFinite => matches!(
+            outcome,
+            Err(Some(RuntimeTrip::NonFiniteToInt {
+                op: FloatToIntOp::Round,
+                ..
+            }))
+        ),
+        Rounded::Overflow => matches!(
+            outcome,
+            Err(Some(RuntimeTrip::IntOverflow {
+                op: IntOp::FromFloat(FloatToIntOp::Round),
+                ..
+            }))
+        ),
+    }
+}
+
 #[test]
 // Exact-equality comparisons here are intentional: sqrt(4) and pow(2,10)
 // produce exact IEEE 754 results (2.0 and 1024.0 respectively).
@@ -121,18 +154,10 @@ fn math_out_of_domain_is_total() {
     assert!(ipe_runtime_rust::math::math_log(-1.0).is_nan());
     // round of a non-finite float has no Int value: a typed trip, never a
     // saturated cast.
-    let non_finite = Err(Some(RuntimeTrip::NonFiniteToInt {
-        op: FloatToIntOp::Round,
-    }));
-    assert_eq!(round_outcome(f64::NAN), non_finite);
-    assert_eq!(round_outcome(f64::INFINITY), non_finite);
-    assert_eq!(round_outcome(f64::NEG_INFINITY), non_finite);
-    assert_eq!(
-        round_outcome(1e300),
-        Err(Some(RuntimeTrip::IntOverflow {
-            op: IntOp::FromFloat(FloatToIntOp::Round),
-        }))
-    );
+    for x in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(rounds_to(round_outcome(x), Rounded::NonFinite), "{x}");
+    }
+    assert!(rounds_to(round_outcome(1e300), Rounded::Overflow));
     assert_eq!(ipe_runtime_rust::math::math_round(2.5), 3);
     assert_eq!(ipe_runtime_rust::math::math_round(-2.5), -2);
     assert_eq!(ipe_runtime_rust::math::math_pow(2.0, 10.0), 1024.0);
@@ -145,23 +170,73 @@ proptest! {
         // fraction of exactly -0.5) goes up toward positive infinity.
         let rounded = if x - x.trunc() == -0.5 { x.round() + 1.0 } else { x.round() };
         let expected = if !rounded.is_finite() {
-            Err(Some(RuntimeTrip::NonFiniteToInt { op: FloatToIntOp::Round }))
+            Rounded::NonFinite
         } else if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&rounded) {
             // In range: the integral value converts exactly.
             #[allow(clippy::cast_possible_truncation)] // checked in range just above
             let exact = rounded as i64;
-            Ok(exact)
+            Rounded::Exact(exact)
         } else {
-            Err(Some(RuntimeTrip::IntOverflow {
-                op: IntOp::FromFloat(FloatToIntOp::Round),
-            }))
+            Rounded::Overflow
         };
-        prop_assert_eq!(round_outcome(x), expected);
+        let outcome = round_outcome(x);
+        prop_assert!(rounds_to(outcome, expected), "{outcome:?} is not {expected:?}");
     }
     #[test]
     fn prop_math_sqrt_never_panics(x in any::<f64>()) {
         let _ = ipe_runtime_rust::math::math_sqrt(x);
     }
+}
+
+// ── Ipe.Time calendar — the rules agree with chrono's calendar ─────────────
+
+/// The proleptic Gregorian calendar repeats every 400 years, so one cycle of
+/// chrono's dates is an oracle for every `Int` year.
+#[cfg(feature = "time-core")]
+#[test]
+fn calendar_oracle() {
+    use chrono::{Datelike, NaiveDate};
+    use ipe_runtime_rust::time::{time_days_in_month, time_is_leap_year};
+    for year in 1600..2000 {
+        let Ok(chrono_year) = i32::try_from(year) else {
+            continue;
+        };
+        let leap = NaiveDate::from_ymd_opt(chrono_year, 12, 31).map(|d| d.ordinal() == 366);
+        assert_eq!(Some(time_is_leap_year(year)), leap, "year {year}");
+        for month in 1..=12u32 {
+            let first = NaiveDate::from_ymd_opt(chrono_year, month, 1);
+            let next = first.and_then(|d| d.checked_add_months(chrono::Months::new(1)));
+            let days = first
+                .zip(next)
+                .map(|(a, b)| b.signed_duration_since(a).num_days());
+            for far in [0, 4_000_000_000, -4_000_000_000, 9_000_000_000_000_000_000] {
+                let shifted = year + far;
+                assert_eq!(Some(time_is_leap_year(shifted)), leap, "year {shifted}");
+                assert_eq!(
+                    Some(time_days_in_month(shifted, i64::from(month))),
+                    days,
+                    "{shifted}-{month}"
+                );
+            }
+        }
+    }
+}
+
+/// `Ipe.Time`'s documented year range is chrono's calendar range.
+#[cfg(feature = "time-core")]
+#[test]
+fn time_docs_state_the_calendar_range() {
+    use chrono::{Datelike, NaiveDate};
+    const TIME_IPE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../stdlib/Ipe/Time.ipe"
+    ));
+    let range = format!(
+        "years {} to {}",
+        NaiveDate::MIN.year(),
+        NaiveDate::MAX.year()
+    );
+    assert!(TIME_IPE.contains(&range), "Time.ipe must state `{range}`");
 }
 
 // ── seeded random — deterministic, in-range, empty-safe ────────────────────

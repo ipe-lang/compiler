@@ -216,3 +216,150 @@ fn each_spelling_of_a_raw_process_end_is_refused() -> Result<(), String> {
     );
     Ok(())
 }
+
+/// The names that construct or raise a runtime trip. The vendored runtime is a
+/// module of the emitted crate, so its crate-private `trip` and its
+/// `#[non_exhaustive]` constructors are in reach of emitted code; only the
+/// runtime may raise one.
+const TRIP_NAMES: &[&str] = &["RuntimeTrip", "panic_any"];
+
+/// The spellings of a trip in emitted text (a string literal the backend
+/// writes out).
+const TRIP_TEXT: &[&str] = &["RuntimeTrip", "panic_any", "core::trip"];
+
+/// Each trip-raising site in one Rust source: a [`TRIP_NAMES`] identifier, a
+/// `core::trip` path, or a string literal spelling one.
+///
+/// A `#[doc]` attribute is prose, never emitted, so it is skipped.
+fn trip_sites(src: &str) -> Result<Vec<String>, String> {
+    let stream: TokenStream = src.parse().map_err(|e| format!("does not lex: {e}"))?;
+    let mut sites = Vec::new();
+    let mut pending = vec![stream];
+    while let Some(stream) = pending.pop() {
+        let mut path: Vec<String> = Vec::new();
+        for tok in stream {
+            match tok {
+                TokenTree::Group(g) => {
+                    let is_doc = g.delimiter() == proc_macro2::Delimiter::Bracket
+                        && g.stream()
+                            .into_iter()
+                            .next()
+                            .is_some_and(|first| first.to_string() == "doc");
+                    if !is_doc {
+                        pending.push(g.stream());
+                    }
+                    path.clear();
+                }
+                TokenTree::Ident(id) => {
+                    let spelled = id.to_string();
+                    let name = spelled.strip_prefix("r#").unwrap_or(&spelled).to_owned();
+                    let core_path = path.ends_with(&["core", ":", ":"].map(String::from));
+                    if TRIP_NAMES.contains(&name.as_str()) || (name == "trip" && core_path) {
+                        sites.push(name.clone());
+                    }
+                    path.push(name);
+                }
+                TokenTree::Punct(p) => path.push(p.as_char().to_string()),
+                TokenTree::Literal(lit) => {
+                    let text = lit.to_string();
+                    sites.extend(
+                        TRIP_TEXT
+                            .iter()
+                            .filter(|spelling| text.contains(**spelling))
+                            .map(|spelling| (*spelling).to_owned()),
+                    );
+                    path.clear();
+                }
+            }
+        }
+    }
+    Ok(sites)
+}
+
+/// Every `.rs` file under `dir`, in path order.
+///
+/// A symlink or any entry that is neither a file nor a directory is refused.
+fn rust_sources(dir: &Path, depth: usize, out: &mut Vec<std::path::PathBuf>) -> Result<(), String> {
+    if depth > MAX_DEPTH {
+        return Err(format!("{} nests past {MAX_DEPTH} levels", dir.display()));
+    }
+    let mut entries = BTreeMap::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+        let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+        let kind = entry
+            .file_type()
+            .map_err(|e| format!("{}: {e}", entry.path().display()))?;
+        entries.insert(entry.path(), kind);
+    }
+    for (path, kind) in entries {
+        if kind.is_dir() {
+            rust_sources(&path, depth + 1, out)?;
+        } else if kind.is_file() {
+            if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        } else {
+            return Err(format!(
+                "{} is neither a file nor a directory",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// No template and no emitting source (the backend and the FFI glue) spells a
+/// runtime trip, so emitted code never forges one.
+#[test]
+fn emitted_code_never_constructs_a_runtime_trip() -> Result<(), String> {
+    let manifest = e2e_support::manifest_dir!();
+    let mut files = Vec::new();
+    for dir in [
+        manifest.join("templates"),
+        manifest.join("src"),
+        manifest.join("../../ffi/src"),
+    ] {
+        rust_sources(&dir, 0, &mut files)?;
+    }
+    assert!(files.len() > 2, "the scan reads the emitting sources");
+    let mut found = Vec::new();
+    for file in &files {
+        let src = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
+        let sites = trip_sites(&src).map_err(|e| format!("{}: {e}", file.display()))?;
+        if !sites.is_empty() {
+            found.push((file.display().to_string(), sites));
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "only the runtime raises a `RuntimeTrip`; emitted code never spells one: {found:?}"
+    );
+    Ok(())
+}
+
+/// Each spelling of a forged trip is refused; a doc mention is not.
+#[test]
+fn each_spelling_of_a_forged_trip_is_refused() -> Result<(), String> {
+    let cases: [(&str, &[&str]); 5] = [
+        ("fn f() { ipe_runtime::core::trip(x); }", &["trip"]),
+        (
+            "fn f() { let _ = RuntimeTrip::RecursionLimit {}; }",
+            &["RuntimeTrip"],
+        ),
+        ("fn f() { std::panic::panic_any(1); }", &["panic_any"]),
+        (
+            "fn f() { out.push_str(\"ipe_runtime::core::trip(f)\"); }",
+            &["core::trip"],
+        ),
+        ("fn f() { quote!(r#RuntimeTrip); }", &["RuntimeTrip"]),
+    ];
+    for (src, want) in cases {
+        assert_eq!(trip_sites(src)?, want.to_vec(), "{src}");
+    }
+    assert!(
+        trip_sites("/// Raises a `RuntimeTrip` through `core::trip`.\nfn f() { trip(x); }")?
+            .is_empty(),
+        "a doc mention and an unrelated `trip` are not trip sites"
+    );
+    Ok(())
+}
