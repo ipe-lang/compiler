@@ -754,9 +754,9 @@ mod tests {
 
     /// In a uniform `\r\n` buffer a range edit breaks with `\r\n`.
     ///
-    /// It never doubles a `\r\n` the engine carried verbatim (a block comment,
-    /// a `"""` body), the buffer keeps one line ending, and a second request is
-    /// a no-op.
+    /// It never doubles a `\r\n` the engine carried verbatim (a block
+    /// comment), the buffer keeps one line ending, and a second request is a
+    /// no-op.
     #[test]
     fn range_format_keeps_a_uniform_crlf_buffer_crlf() {
         let db = IpeDatabase::new();

@@ -44,8 +44,17 @@ impl Column {
 }
 
 /// A `"""` string in one of its two forms.
-#[derive(Clone, PartialEq, Eq, Debug)]
+///
+/// Its `Debug` shows the value only: the form's source positions and margin
+/// say where the string stands, not what it means.
+#[derive(Clone, PartialEq, Eq)]
 pub struct TripleStr(Form);
+
+impl std::fmt::Debug for TripleStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("TripleStr").field(&self.value()).finish()
+    }
+}
 
 /// The two forms; private so no other shape is representable.
 #[derive(Clone, PartialEq, Eq, Debug)]

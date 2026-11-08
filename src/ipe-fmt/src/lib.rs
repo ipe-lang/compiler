@@ -38,8 +38,8 @@ mod faithful;
 
 use ipe_syntax::{
     BinOp, Ctor, Exposed, Exposing, Expr, Expr_, ForeignDecl, Import, LetBinding, Module, Pattern,
-    Pattern_, Privacy, TypeAlias, TypeAnnotation, Union, Value, escape_char_body, escape_str_body,
-    strip_anchor_margin,
+    Pattern_, Privacy, TripleStr, TypeAlias, TypeAnnotation, Union, Value, escape_char_body,
+    escape_str_body,
 };
 
 /// The column budget elm-format targets before breaking a construct onto
@@ -893,13 +893,12 @@ impl ModuleTree {
     }
 }
 
-/// `debug` with every `Span { lo: …, hi: … }` and triple-quoted string
-/// `anchor: …` column replaced by `_`, and every `Symbol(n)` by
-/// `Symbol("text")`, leaving the contents of string literals untouched; `None`
-/// on a shape the rewrite does not recognise.
+/// `debug` with every `Span { lo: …, hi: … }` replaced by `_`, and every
+/// `Symbol(n)` by `Symbol("text")`, leaving the contents of string literals
+/// untouched; `None` on a shape the rewrite does not recognise.
 ///
-/// The anchor is a position: what it means, the margin stripped from the
-/// string's value, is compared by [`ModuleText`], which prints that value.
+/// A triple-quoted string's `Debug` is already its value alone: its margin
+/// and source positions are where it stands, not what it means.
 fn erase_positions(debug: &str, interner: &Interner) -> Option<String> {
     let mut out = String::with_capacity(debug.len());
     let mut rest = debug;
@@ -913,10 +912,6 @@ fn erase_positions(debug: &str, interner: &Interner) -> Option<String> {
             let (_, after) = split_digits(after.strip_prefix(", hi: ")?)?;
             out.push('_');
             rest = after.strip_prefix(" }")?;
-        } else if let Some(after) = rest.strip_prefix("anchor: ") {
-            let (_, after) = split_digits(after)?;
-            out.push_str("anchor: _");
-            rest = after;
         } else if let Some(after) = rest.strip_prefix("Symbol(") {
             let (digits, after) = split_digits(after)?;
             let text = interner.resolve(ipe_intern::Symbol::from_raw(digits.parse().ok()?))?;
@@ -2518,13 +2513,7 @@ impl<'a> Printer<'a> {
             Expr_::Int(n) => n.to_string(),
             Expr_::Float(f) => format_float(*f),
             Expr_::Str(s) => format!("\"{}\"", escape_str_body(s)),
-            // The equivalence projection (no source) prints the string's value,
-            // its margin stripped at its anchor column: a printed string moved to
-            // another column strips another margin, and must read as different.
-            Expr_::MultilineStr { raw, anchor } => match self.src {
-                Some(_) => format!("\"\"\"{raw}\"\"\""),
-                None => format!("\"\"\"{}\"\"\"", strip_anchor_margin(raw, *anchor)),
-            },
+            Expr_::MultilineStr(string) => self.triple_str(string, col),
             Expr_::Char(c) => format!("'{}'", escape_char_body(c)),
             Expr_::Unit => "()".to_owned(),
             Expr_::Call(head, args) => self.call(head, args, col, e.span),
@@ -2651,7 +2640,7 @@ impl<'a> Printer<'a> {
             ) || ipe_parse::field_accessor(a).is_some()
         };
         let first_is_block =
-            |a: &Expr| matches!(&a.value, Expr_::MultilineStr { raw, .. } if raw.contains('\n'));
+            |a: &Expr| matches!(&a.value, Expr_::MultilineStr(s) if s.margin().is_some());
         let later_block = |tail_strs: &[String]| tail_strs.iter().any(|s| has_layout_newline(s));
         // A head owning an end-of-line comment ends its line: it stands alone.
         let head_hi = head.span.hi as usize;
@@ -2680,6 +2669,29 @@ impl<'a> Printer<'a> {
         out
     }
 
+    /// A `"""` string in its own form, opening at `col`.
+    ///
+    /// A one-line string prints as written. A block prints each body line
+    /// right of a margin at `col`, so its value is the same wherever it lands;
+    /// an empty body line stays empty. The equivalence projection (no source)
+    /// prints the value alone, which no column changes.
+    fn triple_str(&self, string: &TripleStr, col: Col) -> String {
+        let value = string.value();
+        if self.src.is_none() || string.margin().is_none() {
+            return format!("\"\"\"{value}\"\"\"");
+        }
+        let mut out = String::from("\"\"\"");
+        for line in string.lines() {
+            out.push('\n');
+            if !line.is_empty() {
+                let _ = write!(out, "{}", self.pad(col));
+            }
+            out.push_str(line);
+        }
+        let _ = write!(out, "\n{}\"\"\"", self.pad(col));
+        out
+    }
+
     /// Whether argument `a`, already rendered as `rendered` (the same string
     /// `call`'s one-line pass computed — passed in rather than re-rendered
     /// here, so this check costs no extra tree walk), may share the
@@ -2688,19 +2700,11 @@ impl<'a> Printer<'a> {
     /// that renders on a single line AND is not itself a block form
     /// (non-empty list / record / tuple / update / parenthesised compound).
     fn joins_on_head_line(a: &Expr, rendered: &str) -> bool {
-        // A triple-quoted string hugs the function line only when it opens with
-        // visible content on its first physical line (`interpolate """head\n…"""`).
-        // One that opens with a newline (`"""\n…`) — or any string literal that is
-        // a single line — drops to its own indented line instead.
-        if let Expr_::MultilineStr { raw: s, .. } = &a.value {
-            // A triple-quoted string hugs the function line only when its first
-            // physical line opens with visible, non-whitespace content
-            // (`"""head…`). One that opens with a newline (`"""\n…`) or with
-            // leading indentation (`"""    …`) drops to its own line.
-            return match s.split_once('\n') {
-                Some((first, _)) => first.starts_with(|c: char| !c.is_whitespace()),
-                None => false,
-            };
+        // A triple-quoted string never hugs the function line: a one-line
+        // string stacks like any literal, and a block's opener ends its line,
+        // so the block drops to its own indented line.
+        if matches!(a.value, Expr_::MultilineStr(_)) {
+            return false;
         }
         if rendered.contains('\n') {
             return false;
@@ -3343,18 +3347,21 @@ fn skip_quoted(rest: &str, quote: char) -> Option<&str> {
 }
 
 /// Whether the head plus its first argument fits on one line before the
-/// argument's own break. For a multi-line triple-quoted string the join line is
-/// `head """first-content-line`; elm-format only hugs the string to the function
-/// when that opening line stays within the width budget, otherwise the string
-/// drops to its own indented line. Other joinable first arguments (names, empty
-/// collections) are short and always fit.
+/// argument's own break. For a triple-quoted string the join line is
+/// `head """`, followed by the text and closer of a one-line string; other
+/// joinable first arguments (names, empty collections) are short and always
+/// fit.
 fn head_line_fits(head_s: &str, first: &Expr, col: Col) -> bool {
-    let Expr_::MultilineStr { raw: s, .. } = &first.value else {
+    let Expr_::MultilineStr(s) = &first.value else {
         return true;
     };
-    let first_content = s.split_once('\n').map_or(s.as_str(), |(f, _)| f);
-    // column of the head + head + ` ` + `"""` + first content line
-    let end = col.past(head_s.chars().count() + 1 + 3 + first_content.chars().count());
+    let one_line = if s.margin().is_some() {
+        0
+    } else {
+        s.value().chars().count() + 3
+    };
+    // column of the head + head + ` ` + `"""` + a one-line string's rest
+    let end = col.past(head_s.chars().count() + 1 + 3 + one_line);
     end.0 <= MAX_WIDTH
 }
 
@@ -5011,17 +5018,35 @@ mod tests {
         );
     }
 
-    /// A triple-quoted string strips the margin of its anchor column from
-    /// every later line, so moving it to another column changes its value:
-    /// the formatter refuses rather than printing the moved string.
+    /// A block string moved to another column is re-indented to its new
+    /// margin, so its value is unchanged and the output is a fixed point.
     #[test]
-    fn a_triple_quoted_string_moved_to_another_margin_is_refused() {
+    fn a_block_string_moved_to_another_margin_keeps_its_value() {
+        let src = "module M exposing (x)\n\n\nx =\n    let\n        msg =\n                \"\"\"\n                abc\n\n                  def\n                \"\"\"\n    in\n    msg\n";
+        let once = format_source(src);
+        assert!(once.is_ok(), "{once:?}");
+        let Ok(once) = once else { return };
+        assert_ne!(
+            once, src,
+            "the block must move to its binding's body column"
+        );
+        let twice = format_source(&once);
+        assert!(
+            twice.as_ref().is_ok_and(|twice| *twice == once),
+            "{twice:?}"
+        );
+    }
+
+    /// A string in neither `"""` form is refused by the parser before any
+    /// print, so the formatter never re-reads it under another margin.
+    #[test]
+    fn text_after_a_block_opener_is_not_formatted() {
         let src = "module M exposing (x)\n\n\nx =\n    foo  \"\"\"abc\n            def\"\"\"\n";
-        let detail = match format_source(src) {
-            Err(FmtError::RoundTrip(fault)) => fault.to_string(),
-            other => format!("not a refusal: {other:?}"),
-        };
-        assert_eq!(detail, "formatted output parsed to a different AST");
+        let refused = format_source(src);
+        assert!(
+            matches!(refused, Err(FmtError::Parse { ref diag, .. }) if diag.code().as_str() == "IPE-P0075"),
+            "{refused:?}"
+        );
     }
 
     /// A one-line triple-quoted string has no margin, so its column is free.
