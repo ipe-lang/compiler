@@ -2197,7 +2197,9 @@ mod tests {
                     UnwindBoundary::Task("async task panicked"),
                 ] {
                     let payload: Box<dyn std::any::Any + Send> = Box::new(fault);
-                    if ipe_error_from_unwind(boundary, payload) != fault.to_ipe_error() {
+                    if ipe_error_from_unwind::<crate::IpeError>(boundary, payload)
+                        != fault.to_ipe_error()
+                    {
                         return Err(format!("{op:?}: a calendar trip keeps its kind"));
                     }
                 }

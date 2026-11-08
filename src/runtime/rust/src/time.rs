@@ -642,8 +642,11 @@ mod calendar_tests {
         assert!(time_is_leap_year(i64::MIN));
     }
 
+    /// A formatter of a Unix-millis instant.
+    type Render = fn(i64) -> String;
+
     /// Each formatter, one per `TimeOp` it raises.
-    fn formatters() -> [(TimeOp, fn(i64) -> String); 5] {
+    fn formatters() -> [(TimeOp, Render); 5] {
         [
             (TimeOp::TimeString, time_time_string),
             (TimeOp::Format, |ms| {
