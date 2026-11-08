@@ -19,7 +19,7 @@ pub enum Truth {
 }
 
 impl Truth {
-    const fn and(self, other: Self) -> Self {
+    pub const fn and(self, other: Self) -> Self {
         match (self, other) {
             (Self::Fails, _) | (_, Self::Fails) => Self::Fails,
             (Self::Holds, Self::Holds) => Self::Holds,
@@ -29,7 +29,7 @@ impl Truth {
         }
     }
 
-    const fn or(self, other: Self) -> Self {
+    pub const fn or(self, other: Self) -> Self {
         match (self, other) {
             (Self::Holds, _) | (_, Self::Holds) => Self::Holds,
             (Self::Fails, Self::Fails) => Self::Fails,
@@ -44,7 +44,7 @@ impl Truth {
         if holds { Self::Holds } else { Self::Fails }
     }
 
-    const fn not(self) -> Self {
+    pub const fn not(self) -> Self {
         match self {
             Self::Holds => Self::Fails,
             Self::Fails => Self::Holds,
