@@ -100,6 +100,7 @@ const TEST_DATA_DIRS: &[&str] = &[
 /// its own, so sharing it never runs one test twice.
 const SHARED_MODULES: &[&str] = &[
     "src/compiler/backend/rust/tests/seal_e2e/mod.rs",
+    "src/compiler/backend/rust/tests/support/cfg.rs",
     "src/compiler/kernels/tests/veneer_helpers.rs",
     "src/ipe-cli/tests/parity_shards/mod.rs",
     "src/ipe-cli/tests/support/mod.rs",
