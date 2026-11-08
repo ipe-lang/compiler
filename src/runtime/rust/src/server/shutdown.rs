@@ -31,7 +31,7 @@ pub use crate::system::StopSignal as Signal;
 use crate::system::inherited_ignored;
 use std::future::Future;
 use std::pin::Pin;
-#[cfg(all(feature = "tui", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -368,12 +368,12 @@ type Slot = Mutex<Option<Arc<Shutdown>>>;
 static PROCESS: Slot = Mutex::new(None);
 
 /// Whether the process's owner is armed and holds the stop signals.
-#[cfg(all(feature = "tui", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 static OWNS_SIGNALS: AtomicBool = AtomicBool::new(false);
 
 /// Whether the process's armed owner holds the stop signals, so a terminal
 /// driver's stop relay leaves each request to it.
-#[cfg(all(feature = "tui", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 pub(crate) fn owns_stop_signals() -> bool {
     OWNS_SIGNALS.load(Ordering::Acquire)
 }
@@ -639,7 +639,7 @@ pub fn arm(plan: ShutdownPlan, grace: Duration) -> std::io::Result<Armed> {
         }),
         process_pools(),
     )?;
-    #[cfg(all(feature = "tui", not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
     OWNS_SIGNALS.store(true, Ordering::Release);
     Ok(armed)
 }

@@ -3893,7 +3893,7 @@ pub mod pre_exit {
     }
 
     /// Whether the process exit has begun running the stages.
-    #[cfg(all(feature = "tui", not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
     pub(crate) fn exit_begun() -> bool {
         STAGES.exiting.load(Ordering::Acquire)
     }
@@ -3964,17 +3964,26 @@ impl ProcessStatus {
     /// server's forced shutdown, or a terminal app's Ctrl-C in raw mode.
     ///
     /// Never built from a program's `Int`.
-    #[cfg(any(feature = "server", all(not(target_arch = "wasm32"), feature = "tui")))]
+    #[cfg(any(
+        feature = "server",
+        all(feature = "tokio", not(target_arch = "wasm32"))
+    ))]
     pub(crate) const INTERRUPTED: Self = Self(130);
     /// `128 + SIGTERM`: the status of a program a terminate request ends.
     ///
     /// Never built from a program's `Int`.
-    #[cfg(any(feature = "server", all(not(target_arch = "wasm32"), feature = "tui")))]
+    #[cfg(any(
+        feature = "server",
+        all(feature = "tokio", not(target_arch = "wasm32"))
+    ))]
     pub(crate) const TERMINATED: Self = Self(143);
     /// `128 + SIGHUP`: the status of a program a hangup ends.
     ///
     /// Never built from a program's `Int`.
-    #[cfg(any(feature = "server", all(not(target_arch = "wasm32"), feature = "tui")))]
+    #[cfg(any(
+        feature = "server",
+        all(feature = "tokio", not(target_arch = "wasm32"))
+    ))]
     pub(crate) const HANGUP: Self = Self(129);
 
     /// Parse a program's `System.exit` request; total, and only `0` maps to success.
@@ -4034,7 +4043,7 @@ pub fn system_exit(code: i64) -> ! {
 /// even while that exit is stuck in a stage or waits on the stdout lock. It
 /// takes no lock and writes nothing; std's exit-time stdout flush only tries
 /// the stdout lock, so a lock the stuck exit holds cannot block it.
-#[cfg(all(feature = "tui", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 pub(crate) fn force_exit(status: ProcessStatus) -> ! {
     #[expect(clippy::disallowed_methods)] // the forced exit skips the stages on purpose
     // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — the forced exit of a repeated stop request: it must not wait on the stage run or the stdout lock the first exit holds [ledger #boundary]
@@ -4042,7 +4051,10 @@ pub(crate) fn force_exit(status: ProcessStatus) -> ! {
 }
 
 /// A request to stop the process.
-#[cfg(any(feature = "server", all(feature = "tui", not(target_arch = "wasm32"))))]
+#[cfg(any(
+    feature = "server",
+    all(feature = "tokio", not(target_arch = "wasm32"))
+))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopSignal {
     /// `SIGINT`, Ctrl-C or Ctrl-Break.
@@ -4053,7 +4065,10 @@ pub enum StopSignal {
     Hangup,
 }
 
-#[cfg(any(feature = "server", all(feature = "tui", not(target_arch = "wasm32"))))]
+#[cfg(any(
+    feature = "server",
+    all(feature = "tokio", not(target_arch = "wasm32"))
+))]
 impl StopSignal {
     /// The exit status of a process this request ends: `128 + signo`.
     #[must_use]
@@ -4526,13 +4541,19 @@ pub fn read_self_status() -> Option<String> {
 
 /// The most stop requests a listener queues for its owner. A request past it
 /// is dropped: the owner only needs to know that another one arrived.
-#[cfg(any(feature = "server", all(feature = "tui", not(target_arch = "wasm32"))))]
+#[cfg(any(
+    feature = "server",
+    all(feature = "tokio", not(target_arch = "wasm32"))
+))]
 pub(crate) const SIGNAL_QUEUE: usize = 8;
 
 /// A Windows console control event.
 #[cfg(all(
     any(windows, test),
-    any(feature = "server", all(feature = "tui", not(target_arch = "wasm32")))
+    any(
+        feature = "server",
+        all(feature = "tokio", not(target_arch = "wasm32"))
+    )
 ))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConsoleEvent {
@@ -4545,7 +4566,10 @@ pub(crate) enum ConsoleEvent {
 
 #[cfg(all(
     any(windows, test),
-    any(feature = "server", all(feature = "tui", not(target_arch = "wasm32")))
+    any(
+        feature = "server",
+        all(feature = "tokio", not(target_arch = "wasm32"))
+    )
 ))]
 impl ConsoleEvent {
     /// The stop request this event makes.
@@ -4565,7 +4589,10 @@ impl ConsoleEvent {
 /// after another cannot read the other's handler as the inherited state.
 #[cfg(all(
     target_os = "linux",
-    any(feature = "server", all(feature = "tui", not(target_arch = "wasm32")))
+    any(
+        feature = "server",
+        all(feature = "tokio", not(target_arch = "wasm32"))
+    )
 ))]
 pub(crate) fn inherited_ignored() -> SignalSet {
     static READ: std::sync::OnceLock<SignalSet> = std::sync::OnceLock::new();
@@ -4580,7 +4607,10 @@ pub(crate) fn inherited_ignored() -> SignalSet {
 #[cfg(all(
     unix,
     not(target_os = "linux"),
-    any(feature = "server", all(feature = "tui", not(target_arch = "wasm32")))
+    any(
+        feature = "server",
+        all(feature = "tokio", not(target_arch = "wasm32"))
+    )
 ))]
 pub(crate) const fn inherited_ignored() -> SignalSet {
     SignalSet(0)
@@ -4588,7 +4618,10 @@ pub(crate) const fn inherited_ignored() -> SignalSet {
 
 #[cfg(all(
     test,
-    any(feature = "server", all(feature = "tui", not(target_arch = "wasm32")))
+    any(
+        feature = "server",
+        all(feature = "tokio", not(target_arch = "wasm32"))
+    )
 ))]
 mod stop_signal_tests {
     use super::{ConsoleEvent, StopSignal};
@@ -4620,8 +4653,8 @@ mod stop_signal_tests {
     }
 }
 
-/// The stop signals of a terminal driver's process. Each OS request is only a
-/// message, and one relay thread decides what it does.
+/// The stop signals of a TEA driver's process (`Cli`, `Tui` or worker). Each OS
+/// request is only a message, and one relay thread decides what it does.
 ///
 /// The OS handler (tokio's signal registry) records the signal and returns.
 /// The relay thread runs its own runtime, so a program runtime blocked in
@@ -4639,7 +4672,7 @@ mod stop_signal_tests {
 /// A signal the process inherited as ignored stays ignored, and the hangup is
 /// taken only where that inheritance is read (Linux). In raw mode Ctrl-C
 /// stays a key the driver reads, never a signal.
-#[cfg(all(feature = "tui", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 pub(crate) mod exit_signals {
     use super::{ProcessStatus, StopSignal};
     use std::sync::OnceLock;
@@ -8820,7 +8853,10 @@ mod process_status_tests {
         assert_eq!(ProcessStatus::FAILURE.code(), 1);
     }
 
-    #[cfg(any(feature = "server", all(not(target_arch = "wasm32"), feature = "tui")))]
+    #[cfg(any(
+        feature = "server",
+        all(feature = "tokio", not(target_arch = "wasm32"))
+    ))]
     #[test]
     fn the_stop_statuses_are_128_plus_the_signal() {
         assert_eq!(ProcessStatus::INTERRUPTED.code(), 130);

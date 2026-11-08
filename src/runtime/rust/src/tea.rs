@@ -1737,7 +1737,6 @@ where
         }
         // A stop signal runs the pre-exit stages, then exits `128 + signo`; a
         // refused relay is logged once and leaves each signal its default.
-        #[cfg(feature = "tui")]
         let _ = crate::system::exit_signals::install();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WorkerEvent<Msg>>();
         let outstanding = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));

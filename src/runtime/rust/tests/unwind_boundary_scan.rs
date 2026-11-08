@@ -926,6 +926,16 @@ mod stop_signals {
     /// The relay install a driver entry calls.
     const INSTALL: &str = "exit_signals::install()";
 
+    /// The gate of the relay and of the widest driver entry (`worker_app`):
+    /// the relay compiles wherever a driver entry does.
+    const RELAY_GATE: &str = r#"#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]"#;
+
+    /// The items that must carry exactly [`RELAY_GATE`], by file and opener.
+    const RELAY_GATED: &[(&str, &str)] = &[
+        ("system.rs", "pub(crate) mod exit_signals {"),
+        ("tea.rs", "pub fn worker_app<"),
+    ];
+
     fn runtime_sources() -> Vec<(String, String)> {
         super::rust_sources(&e2e_support::manifest_dir!().join("src"))
     }
@@ -991,6 +1001,20 @@ mod stop_signals {
         );
     }
 
+    /// The line directly above the line `opener` begins on, trimmed.
+    fn line_above<'t>(text: &'t str, opener: &str) -> Option<&'t str> {
+        let at = text.find(opener)?;
+        let line_start = text.get(..at)?.rfind('\n')?;
+        text.get(..line_start)?.lines().next_back().map(str::trim)
+    }
+
+    /// Whether `body` names `needle` on exactly one code line, and that line
+    /// stands under no `#[cfg` attribute of its own.
+    fn names_once_unconditionally(body: &str, needle: &str) -> bool {
+        code_lines_naming(body, needle) == 1
+            && line_above(body, needle).is_some_and(|above| !above.starts_with("#[cfg"))
+    }
+
     #[test]
     fn every_driver_entry_installs_the_relay() {
         let sources = runtime_sources();
@@ -1000,15 +1024,35 @@ mod stop_signals {
                 .iter()
                 .find(|(path, _)| path == file)
                 .and_then(|(_, text)| item_body(text, opener))
-                .is_some_and(|body| code_lines_naming(body, INSTALL) == 1);
+                .is_some_and(|body| names_once_unconditionally(body, INSTALL));
             if !installs {
                 missing.push(format!("{file}: {opener}"));
             }
         }
         assert!(
             missing.is_empty(),
-            "a driver entry does not install the stop relay exactly once:\n{}",
+            "a driver entry does not install the stop relay exactly once, unconditionally:\n{}",
             missing.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_relay_compiles_wherever_a_driver_entry_does() {
+        let sources = runtime_sources();
+        let mut differ = Vec::new();
+        for (file, opener) in RELAY_GATED {
+            let gate = sources
+                .iter()
+                .find(|(path, _)| path == file)
+                .and_then(|(_, text)| line_above(text, opener));
+            if gate != Some(RELAY_GATE) {
+                differ.push(format!("{file}: {opener} is gated {gate:?}"));
+            }
+        }
+        assert!(
+            differ.is_empty(),
+            "the relay and the widest driver entry must share {RELAY_GATE}:\n{}",
+            differ.join("\n")
         );
     }
 
@@ -1028,5 +1072,14 @@ mod stop_signals {
             Some("fn enter_with() {\n        install();")
         );
         assert_eq!(item_body(text, "fn absent("), None);
+        let gated = "fn entry() {\n    #[cfg(feature = \"tui\")]\n    let _ = install();\n}\n";
+        assert!(!names_once_unconditionally(gated, "install()"));
+        let plain = "fn entry() {\n    // installs\n    let _ = install();\n}\n";
+        assert!(names_once_unconditionally(plain, "install()"));
+        assert_eq!(
+            line_above("#[cfg(x)]\npub mod relay {\n}\n", "pub mod relay {"),
+            Some("#[cfg(x)]")
+        );
+        assert_eq!(line_above("pub mod relay {\n}\n", "pub mod relay {"), None);
     }
 }

@@ -3360,6 +3360,14 @@ fn assemble_project_text(
     } else {
         cargo_toml
     };
+    // The stop-signal relay compiles wherever the runtime's `tokio` feature
+    // does (every manifest the async runtime restored), so its `"signal"`
+    // rides the same gate. Runs after every exact-`tokio`-line anchor.
+    let cargo_toml = if ctx.uses_async_runtime {
+        tokio_signal_cargo_toml(&cargo_toml)?
+    } else {
+        cargo_toml
+    };
     // Build intent: a dev-verb emit promotes `dev-posture`, the one input that
     // lets the vendored runtime's console default open (loopback only). A
     // release emit leaves the feature declared but off.
@@ -4076,17 +4084,59 @@ fn db_cargo_toml(base: &str, driver: crate::DbDriver) -> DResult<String> {
 /// Returns [`Diagnostic::CompilerBug`] when the manifest has no `tokio`
 /// dependency line with a feature list — a golden-drift invariant violation.
 fn ssrf_cargo_toml(base: &str) -> DResult<String> {
-    const NET: &str = "\"net\"";
+    tokio_feature_cargo_toml(
+        base,
+        "\"net\"",
+        "ipe_backend_rust::project::ssrf_cargo_toml",
+        "the ssrf runtime module",
+    )
+}
+
+/// Add tokio's `"signal"` feature to the manifest's `tokio` dependency line.
+///
+/// The stop-signal relay (`system::exit_signals`) compiles wherever the
+/// runtime's `tokio` feature does, and every Cli, Tui and worker driver
+/// installs it, so every manifest that restores `"tokio"` declares
+/// `"signal"`. Idempotent: a line that already lists it (the server surface
+/// added it) is returned unchanged.
+///
+/// # Errors
+///
+/// Returns [`Diagnostic::CompilerBug`] when the manifest has no `tokio`
+/// dependency line with a feature list — a golden-drift invariant violation.
+fn tokio_signal_cargo_toml(base: &str) -> DResult<String> {
+    tokio_feature_cargo_toml(
+        base,
+        "\"signal\"",
+        "ipe_backend_rust::project::tokio_signal_cargo_toml",
+        "the stop-signal relay",
+    )
+}
+
+/// Append `feature` (a quoted TOML string) to the `tokio` dependency line's
+/// feature list, unless the list already holds it. `needed_by` names the
+/// runtime code that requires it, for the drift diagnostic.
+///
+/// # Errors
+///
+/// Returns [`Diagnostic::CompilerBug`] when the manifest has no `tokio`
+/// dependency line with a feature list — a golden-drift invariant violation.
+fn tokio_feature_cargo_toml(
+    base: &str,
+    feature: &str,
+    where_: &'static str,
+    needed_by: &str,
+) -> DResult<String> {
     let tokio_prefix = format!(
         "{} = {{ version = \"{}\", features = [",
         crate_specs::TOKIO.name,
         crate_specs::TOKIO.version,
     );
     let bug = || Diagnostic::CompilerBug {
-        where_: "ipe_backend_rust::project::ssrf_cargo_toml",
+        where_,
         detail: format!(
-            "Cargo.toml anchor {tokio_prefix:?} not found — golden drifted; the ssrf \
-             runtime module requires tokio \"net\""
+            "Cargo.toml anchor {tokio_prefix:?} not found — golden drifted; {needed_by} \
+             requires tokio {feature}"
         ),
     };
     let list_start = base
@@ -4101,14 +4151,14 @@ fn ssrf_cargo_toml(base: &str) -> DResult<String> {
     if base
         .get(list_start..list_end)
         .ok_or_else(bug)?
-        .contains(NET)
+        .contains(feature)
     {
         return Ok(base.to_owned());
     }
-    let mut out = String::with_capacity(base.len() + NET.len() + 2);
+    let mut out = String::with_capacity(base.len() + feature.len() + 2);
     out.push_str(base.get(..list_end).ok_or_else(bug)?);
     out.push_str(", ");
-    out.push_str(NET);
+    out.push_str(feature);
     out.push_str(base.get(list_end..).ok_or_else(bug)?);
     Ok(out)
 }
@@ -4340,9 +4390,7 @@ fn web_cargo_toml(base: &str) -> DResult<String> {
 ///
 /// 1. Adding `"tui"` to the `default` feature list.
 /// 2. Adding `"sync"` to the `tokio` dependency's feature list (`tui/app.rs`
-///    uses `tokio::sync::mpsc::unbounded_channel`), and `"signal"` (the
-///    stop-signal relay every Cli/Tui driver installs listens through
-///    `tokio::signal`), each only when absent.
+///    uses `tokio::sync::mpsc::unbounded_channel`) when absent.
 /// 3. Appending `crossterm` and `unicode-width` dependencies before
 ///    `[profile.dev]`.  These two crates are the compile-time gates on the
 ///    runtime's `tui` feature; the emitted project vendors the runtime source
@@ -4360,7 +4408,6 @@ fn tui_cargo_toml(base: &str) -> DResult<String> {
     // All anchor consts must precede the first `let` statement.
     const DEFAULT_PREFIX: &str = "default = [";
     const PROFILE_ANCHOR: &str = "[profile.dev]";
-    const SIGNAL: &str = "\"signal\"";
     // Versions + names from the SSOT. `tui_deps` are bare `name = "ver"` lines;
     // the two tokio forms (the replacen anchor and its sync successor) share the
     // one SSOT version so the anchor cannot skew from the golden base manifest.
@@ -4437,43 +4484,6 @@ fn tui_cargo_toml(base: &str) -> DResult<String> {
             });
         }
         replaced
-    };
-
-    // Step 2b — add `"signal"` to the tokio feature list when absent. The
-    // server surface already lists it; any other list gains it at its end.
-    let tokio_prefix = tokio_time_only
-        .find('[')
-        .and_then(|open| tokio_time_only.get(..=open))
-        .unwrap_or(&tokio_time_only);
-    let signal_bug = || Diagnostic::CompilerBug {
-        where_: "ipe_backend_rust::project::tui_cargo_toml",
-        detail: format!(
-            "Cargo.toml anchor {tokio_prefix:?} not found — golden drifted; the stop-signal \
-             relay requires tokio {SIGNAL}"
-        ),
-    };
-    let list_start = step2
-        .find(tokio_prefix)
-        .map(|at| at + tokio_prefix.len())
-        .ok_or_else(signal_bug)?;
-    let list_end = step2
-        .get(list_start..)
-        .and_then(|rest| rest.find(']'))
-        .map(|len| list_start + len)
-        .ok_or_else(signal_bug)?;
-    let step2 = if step2
-        .get(list_start..list_end)
-        .ok_or_else(signal_bug)?
-        .contains(SIGNAL)
-    {
-        step2
-    } else {
-        let mut with_signal = String::with_capacity(step2.len() + SIGNAL.len() + 2);
-        with_signal.push_str(step2.get(..list_end).ok_or_else(signal_bug)?);
-        with_signal.push_str(", ");
-        with_signal.push_str(SIGNAL);
-        with_signal.push_str(step2.get(list_end..).ok_or_else(signal_bug)?);
-        with_signal
     };
 
     // Step 3 — append crossterm + unicode-width before `[profile.dev]`.
@@ -5962,9 +5972,9 @@ mod tests {
         async_runtime_cargo_toml, config_cargo_toml, crypto_core_heavy_cargo_toml, db_cargo_toml,
         dev_posture_cargo_toml, email_cargo_toml, http_client_cargo_toml,
         insert_wasi_linker_config, jwt_cargo_toml, promote_default_feature, runtime_bindings,
-        server_cargo_toml, shake_ffi_by_fn_ident, ssrf_cargo_toml, tui_cargo_toml,
-        wasm_hydrate_entry, wasm_present_modules, wasm_runtime_bindings, web_cargo_toml,
-        websocket_cargo_toml, wrapper_call_paths,
+        server_cargo_toml, shake_ffi_by_fn_ident, ssrf_cargo_toml, tokio_signal_cargo_toml,
+        tui_cargo_toml, wasm_hydrate_entry, wasm_present_modules, wasm_runtime_bindings,
+        web_cargo_toml, websocket_cargo_toml, wrapper_call_paths,
     };
     use crate::DbDriver;
     use crate::crate_specs;
@@ -6082,25 +6092,37 @@ mod tests {
         );
     }
 
-    /// `tui_cargo_toml` gives tokio `"signal"` exactly once, whether the line
-    /// lacked it (the async base) or already listed it (the server surface):
-    /// the stop-signal relay every Cli/Tui driver installs needs it.
+    /// `tokio_signal_cargo_toml` gives tokio `"signal"` exactly once, whether
+    /// the line lacked it (the async base a worker, `Cli` or `Tui` program
+    /// starts from) or already listed it (the server surface), and refuses a
+    /// manifest with no `tokio` line: the stop-signal relay compiles wherever
+    /// the runtime's `tokio` feature does.
     #[test]
-    fn tui_manifest_enables_tokio_signal() {
+    fn tokio_signal_toml_declares_signal_exactly_once() {
         let base = async_runtime_cargo_toml(CARGO_TOML).expect("async base");
         assert!(
             tokio_line(&base).is_some_and(|l| !l.contains(r#""signal""#)),
             "the async base line must lack \"signal\" for this test to bite: {base}"
         );
+        let tui = tui_cargo_toml(&base).expect("tui manifest");
         for manifest in [
             base.clone(),
+            tui,
             server_cargo_toml(&base).expect("server manifest"),
         ] {
-            let tui = tui_cargo_toml(&manifest).expect("tui manifest");
-            let line = tokio_line(&tui).unwrap_or_default();
+            let with_signal = tokio_signal_cargo_toml(&manifest).expect("signal manifest");
+            let line = tokio_line(&with_signal).unwrap_or_default();
             assert_eq!(line.matches(r#""signal""#).count(), 1, "{line}");
-            assert_eq!(line.matches(r#""sync""#).count(), 1, "{line}");
+            assert_eq!(
+                tokio_signal_cargo_toml(&with_signal).expect("idempotent"),
+                with_signal,
+                "a line already listing \"signal\" must be unchanged"
+            );
         }
+        assert!(
+            tokio_signal_cargo_toml(CARGO_TOML).is_err(),
+            "a manifest with no tokio line must be refused"
+        );
     }
 
     /// `ssrf_cargo_toml` adds tokio `"net"` to a line lacking it (the db-only
