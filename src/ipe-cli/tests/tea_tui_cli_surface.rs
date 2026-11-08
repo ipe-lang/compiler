@@ -922,7 +922,7 @@ fn over_applied_dict_foldl_function_accumulator_refused() -> Result<(), BoxError
     assert_rejected_code(
         "over_applied_dict_foldl_fn_acc",
         &over_applied_dict_foldl()?,
-        "IPE-T0001",
+        "IPE-T0014",
     )
 }
 

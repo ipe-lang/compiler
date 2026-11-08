@@ -23,22 +23,12 @@
 //!   variable, reopens those bypasses.
 //!   This is a TYPE-LEVEL check, so it survives arbitrary Ipê-level
 //!   aliasing by construction. It
-//!   surfaces as ONE of two diagnostics depending on HOW the obligated
-//!   variable is used, mirroring the existing `Math.min` gate's documented
-//!   split (`golden_m4c_math_gate.rs`): a DIRECT `andMap` call pins the
-//!   obligated variable straight to a concrete `Fun` structure at the
-//!   unifier's own head-pin check — the "eager pin" case — surfacing a plain
-//!   `IPE-T0001` (`TypeMismatch`); an ANNOTATED GENERIC FORWARDER around
-//!   `andMap` instead lifts the obligation onto its own skolem and defers to
-//!   the `SchemeApp`/`check_scheme_applications` pass, re-verified at each of
-//!   the forwarder's own external call sites — surfacing the friendlier,
-//!   specifically-labelled `IPE-T0014` (`SuperTypeUnsatisfied`,
-//!   "non-function callback result (higher-order kernel)").
-//!   Both are clean Ipê diagnostics, never a cargo-fail;
-//!   which one you see depends only on whether `andMap` was called directly
-//!   or through a forwarder, confirmed empirically below (not merely
-//!   predicted by the design doc, which anticipated IPE-T0014 as the sole
-//!   Tier-2 code for every shape).
+//!   surfaces as ONE diagnostic, `IPE-T0014` (`SuperTypeUnsatisfied`, the
+//!   plain-callback-result duty), whether `andMap` is called directly — the
+//!   obligated variable meets a concrete `Fun` at the unifier's head check —
+//!   or through an annotated generic forwarder, where the obligation lifts
+//!   onto the forwarder's skolem and is re-checked at each external call
+//!   site. Never a cargo failure.
 //! * T3 Tier 1 (backstop) — `reject_hof_callback_function_result`
 //!   (`IPE-L0154`), inside `lower_callee` itself (the single funnel every
 //!   kernel/top-level reference resolves through). It reads the kernel
@@ -53,28 +43,27 @@
 //!
 //! Every shape the incident history found (or the revised design's fixture
 //! matrix names) gets its own red (still correctly rejected) fixture, each
-//! going through `assert_hof_curried_rejected` (accepts IPE-T0001 /
-//! IPE-T0014 / IPE-L0154 — see that helper's doc comment):
+//! going through `assert_hof_curried_rejected` (IPE-T0014 only):
 //!
 //! | Shape | Fixture | Observed code |
 //! |---|---|---|
-//! | Direct call / pipe-desugared | `and_map_curried_stays_gated` | IPE-T0001 |
-//! | `let`-bound partial application | `and_map_let_bound_alias_stays_gated` | IPE-T0001 |
-//! | Bare, point-free top-level re-export | `and_map_bare_alias_stays_gated` | IPE-T0001 |
-//! | Higher-order argument | `and_map_higher_order_arg_stays_gated` | IPE-T0001 |
-//! | Record-field extraction | `and_map_record_field_stays_gated` | IPE-T0001 (Tier 2 fires before the pipeline reaches the unrelated IPE-L0107 record-field gate — see the test's own doc comment) |
-//! | Annotated generic forwarder | `and_map_forwarder_curried_is_t0014` | IPE-T0014 (the friendly-message path) |
+//! | Direct call / pipe-desugared | `and_map_curried_stays_gated` | IPE-T0014 |
+//! | `let`-bound partial application | `and_map_let_bound_alias_stays_gated` | IPE-T0014 |
+//! | Bare, point-free top-level re-export | `and_map_bare_alias_stays_gated` | IPE-T0014 |
+//! | Higher-order argument | `and_map_higher_order_arg_stays_gated` | IPE-T0014 |
+//! | Record-field extraction | `and_map_record_field_stays_gated` | IPE-T0014 (Tier 2 fires before the pipeline reaches the unrelated IPE-L0107 record-field gate — see the test's own doc comment) |
+//! | Annotated generic forwarder | `and_map_forwarder_curried_is_t0014` | IPE-T0014 |
 //! | **Annotated DOUBLE forwarder** | `and_map_annotated_double_forwarder_curried` | IPE-T0014 (fail-closed at the inner `am1` reference) |
 //! | Annotated double forwarder, SAFE arity-1 payload | `and_map_annotated_double_forwarder_arity1` | IPE-T0014 (conservative reject; a documented precision loss matching `Math.min`'s conservatism on the identical shape) |
 //! | Annotated TRIPLE forwarder | `and_map_triple_forwarder_curried` | IPE-T0014 (rejected at the first hop) |
 //! | Eta-reduced annotated forwarder (`am2 = am1`) | `and_map_eta_reduced_forwarder_curried` | IPE-T0014 |
 //! | Unannotated same-module double forwarder | `and_map_untyped_double_forwarder_curried` (+ green twin `…_arity1`) | IPE-T0014 (concrete found-type via `CLocal`; green twin ACCEPTED, runs, prints 42) |
 //! | Cross-module UNANNOTATED double forwarder | `and_map_cross_module_untyped_forwarder_curried` | IPE-T0014 |
-//! | **`Result.map` curried callback** | `map_curried_stays_gated` (Maybe variant) | IPE-T0001 (`map`/`map2..5`/`mapError` share the same FnOnce-vs-flattened hazard as `andMap`, otherwise reaching cargo as E0277) |
-//! | `Maybe.map2` arity-3 callback | `map2_extra_arity_stays_gated` (+ exact-arity green twin) | IPE-T0001 |
-//! | `Result.mapError` curried callback | `map_error_curried_stays_gated` (+ arity-1 green twin) | IPE-T0001 |
-//! | Bare re-export of `Result.map` | `map_bare_alias_stays_gated` | IPE-T0001 |
-//! | **User applicative `map2` via `Result.map`+`andMap`** | `user_map2_via_andmap_stays_gated` | IPE-T0001 (cargo-fails even at a SAFE arity-2 use without the generalized obligation) |
+//! | **`Result.map` curried callback** | `map_curried_stays_gated` (Maybe variant) | IPE-T0014 (`map`/`map2..5`/`mapError` share the same FnOnce-vs-flattened hazard as `andMap`, otherwise reaching cargo as E0277) |
+//! | `Maybe.map2` arity-3 callback | `map2_extra_arity_stays_gated` (+ exact-arity green twin) | IPE-T0014 |
+//! | `Result.mapError` curried callback | `map_error_curried_stays_gated` (+ arity-1 green twin) | IPE-T0014 |
+//! | Bare re-export of `Result.map` | `map_bare_alias_stays_gated` | IPE-T0014 |
+//! | **User applicative `map2` via `Result.map`+`andMap`** | `user_map2_via_andmap_stays_gated` | IPE-T0014 (cargo-fails even at a SAFE arity-2 use without the generalized obligation) |
 //! | Annotated `map` forwarder, curried | `map_annotated_forwarder_curried_is_t0014` (+ arity-1 green twin) | IPE-T0014 |
 //! | `Result.andThen` returning `Ok fn` | `and_then_fn_payload_accepted` | n/a — accepted (`andThen` needs NO obligation, Con-headed callback result; a callback legitimately returning `Ok fn` stays ACCEPTED and computes 42) |
 //! | Import alias | *(not constructible)* | n/a (`Result`/`Maybe` are compiler-kernel qualifiers in `ipe-lang`, not backed by an importable Ipe-source module — `crates/ipe_canon/src/resolve.rs`'s fixed kernel-qualifier list — so there is no module to `import … as …`) |
@@ -267,32 +256,10 @@ fn fn_extracted_called_twice_accepted() {
 
 // ── T3: the andMap curried-payload gate — every aliasing shape ─────────────
 
-/// Assert `name`'s `Main.ipe` is rejected with one of the three CLEAN outcomes
-/// the two-tier design can produce — never silently accepted, never a
-/// cargo-fail.
-///
-/// * `IPE-T0001` (ordinary `TypeMismatch`) — the "eager pin" case: every
-///   fixture here calls `Maybe.andMap` / `Result.andMap` DIRECTLY (not
-///   through a generic forwarder), so the curried payload's `b` unifies
-///   HEAD-TO-HEAD against a concrete `Fun` structure during ordinary
-///   solving. `unify.rs`'s `super_concrete_ok` head-pin-check rejects any
-///   `Fun` meeting ANY bounded variable at the unification site itself,
-///   before the deferred, nicely-labelled `SuperTypeUnsatisfied` pass ever
-///   runs — EXACTLY the same "eager-pin sibling" behaviour already
-///   documented for `Math.min`/`Math.max` called directly on two
-///   non-comparable values (`crates/ipe/tests/golden_m4c_math_gate.rs`:
-///   "Calling `Math.min` directly on two non-comparable values is the
-///   eager-pin sibling and surfaces IPE-T0001 instead"). This is the
-///   EXPECTED code for every fixture in this matrix, verified against the
-///   actual behaviour of this pass, not merely predicted.
-/// * `IPE-T0014` (`SuperTypeUnsatisfied`) — reached when the obligated
-///   variable escapes into an ANNOTATED GENERIC FORWARDER (the
-///   `check_scheme_applications` / `SchemeApp` path) rather than pinning
-///   directly — see `and_map_curried_forwarder_is_ipe_t0014` below for the
-///   fixture that exercises this path with the friendly "single-argument
-///   function" message.
-/// * `IPE-L0154` — the Tier-1 lowering backstop, the accepted
-///   defense-in-depth outcome should Tier 2's wiring ever miss a shape.
+/// Assert `name`'s `Main.ipe` is refused as IPE-T0014, the unmet
+/// plain-callback-result duty: the refusal names the duty whether the curried
+/// payload meets the kernel directly or through a forwarder, never a mismatch
+/// against a scheme variable, and never a cargo failure.
 fn assert_hof_curried_rejected(name: &str) {
     let root = repo_root();
     let (built, _out) = built_code(&root, name);
@@ -300,14 +267,11 @@ fn assert_hof_curried_rejected(name: &str) {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,
     };
-    assert!(
-        code == Some(ipe_diagnostics::IPE_T0001)
-            || code == Some(ipe_diagnostics::IPE_T0014)
-            || code == Some(ipe_diagnostics::IPE_L0154),
-        "{name}: curried higher-order-kernel callback must be rejected with IPE-T0001 (Tier 2, \
-         eager pin — the expected outcome for a DIRECT `andMap` call), IPE-T0014 \
-         (Tier 2, deferred — reached only through a generic forwarder), or \
-         IPE-L0154 (Tier 1 backstop), got: {built:?}"
+    assert_eq!(
+        code,
+        Some(ipe_diagnostics::IPE_T0014),
+        "{name}: a curried higher-order-kernel callback must be refused as the \
+         plain-callback-result duty (IPE-T0014), got: {built:?}"
     );
 }
 
@@ -348,7 +312,7 @@ fn and_map_curried_higher_order_arg_stays_gated() {
 
 /// Record-field extraction — `{ combiner = Result.andMap }`, later called
 /// with a curried payload through the extracted field. Verified: this hits
-/// the SAME Tier-2 eager-pin path (`IPE-T0001`) as every other direct-call
+/// the SAME Tier-2 refusal (`IPE-T0014`) as every other direct-call
 /// shape in this matrix — type-checking runs BEFORE lowering, so the T3
 /// obligation on `Result.andMap`'s own occurrence (which does not care what
 /// larger expression contains it — a record-field initializer is just
@@ -389,10 +353,9 @@ fn and_map_cross_module_annotated_wrapper_accepted() {
 
 /// The "forwarder" companion of `and_map_cross_module_annotated_wrapper_accepted`:
 /// the SAME annotated `andMapAlias` wrapper, this time instantiated at a
-/// CURRIED (arity >= 3) payload. Proves the FRIENDLY, deferred
-/// `SuperTypeUnsatisfied` (`IPE-T0014`) diagnostic path genuinely fires
-/// (not just the eager-pin `IPE-T0001` every direct-call fixture above hits)
-/// — the obligation propagates onto the wrapper's own annotation skolem and
+/// CURRIED (arity >= 3) payload. Proves the deferred
+/// `SuperTypeUnsatisfied` (`IPE-T0014`) path fires with the same code the
+/// direct-call fixtures above get — the obligation propagates onto the wrapper's own annotation skolem and
 /// is re-verified at THIS external call site, exactly like `Math.min`'s
 /// `pickMin` forwarder gate.
 #[test]
@@ -412,7 +375,7 @@ fn and_map_forwarder_curried_is_ipe_t0014() {
         code,
         Some(ipe_diagnostics::IPE_T0014),
         "a curried payload through an ANNOTATED andMap forwarder must surface \
-         the friendly SuperTypeUnsatisfied diagnostic (IPE-T0014), got: {built:?}"
+         the SuperTypeUnsatisfied diagnostic (IPE-T0014), got: {built:?}"
     );
 }
 
