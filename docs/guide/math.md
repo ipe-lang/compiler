@@ -14,7 +14,9 @@ Three knots.
   whole number back, that is a deliberate *conversion*, and there are four of them
   that differ only in direction: `floor` (down), `ceil` (up), `round` (nearest),
   `trunc` (toward zero). All four are `Float -> Int`. Picking the wrong direction
-  is the classic off-by-one; picking on purpose is the point.
+  is the classic off-by-one; picking on purpose is the point. The reverse
+  direction, `Int -> Float`, is not a `Math` function at all — it's the
+  prelude's `toFloat`, exact up to `2^53` and nearest-even past it.
 - **NaN is a Float value, not an error — and it is not equal to itself.**
   `sqrt (-1)` does not crash and does not throw; it produces `NaN`, an ordinary
   `Float`. The trap: `NaN == NaN` is `False`, so an equality check will *miss* it.

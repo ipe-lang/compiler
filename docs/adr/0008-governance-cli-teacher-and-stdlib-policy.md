@@ -57,9 +57,11 @@ Each governance fact lives in exactly one document:
    crate map + pipeline, build/test/gate commands, kernel anti-drift discipline,
    and one-way links down. Short.
 2. **`src/ipe-cli/templates/AGENTS.md.in`** — the language authoring reference
-   shipped by `ipe init`, containing syntax, the interrogation loop, the
-   architecture/shape model, a generated module index, mandatory idioms, and a
-   "Writing idiomatic Ipê" section — never compiler internals.
+   shipped by `ipe init`: a lean bootstrap over syntax, the tier model for
+   ambient vs. imported names, the shape/entry-point map, and the mandatory
+   idioms a signature can't express, pointing every lookup (module contents,
+   signatures, diagnostics) at the live `ipe doc` — never compiler internals,
+   never a transcribed or embedded stdlib index.
 3. **`PRINCIPLES.md`** — values, principles, and rules only; the operational
    *mechanics* are kept out of it, leaving each rule plus a link to its procedure.
 4. **Deep operational procedure** — the intended home is
@@ -80,22 +82,20 @@ either `AGENTS.md`, rejects it and points the content at its one home.
 
 The shipped authoring reference teaches only what an agent cannot introspect —
 surface syntax as a dense example cheat-sheet, the interrogation loop framed as
-"the compiler is your ground truth," the architecture map the type system enforces
-but won't teach, a thin names-only module index, and the handful of idioms a
-signature cannot express — and delegates the rest to the live compiler: full
-signatures to `ipe doc <Module>`, error meanings to `ipe explain <CODE>`, the
-capability model to `ipe capabilities`. The module index is *generated* from `ipe
-doc --list` so it cannot drift, and an agent parsing command output passes `--json`
-(the stable contract; human/`--plain` forms are for reading). The invariant: the
-reference must not transcribe any per-function signature or diagnostic text the
-compiler can emit, and its module index must be generated, not hand-maintained.
-
-> **NEEDS UPDATE AFTER IMPLEMENTATION** — the shipped `AGENTS.md.in` is still
-> ~1181 lines (a near-full mirror), not the ~300-line bootstrap this decision
-> targets, and there is no `upgrade-agents` command generating the module index
-> from `ipe doc --list` (untracked). Once the shrink lands and the index is
-> generated, drop this banner; until then the "delegates signatures to `ipe doc`"
-> claim is the target, not the current file.
+"the compiler is your ground truth," the architecture/shape map, the ambient
+tier model (what needs no import vs. what does), and the handful of idioms a
+signature cannot express — and delegates the rest to the live compiler: module
+contents and full signatures to `ipe doc <Module>`, diagnostics to `ipe doc
+<CODE>`, the capability model to `ipe capabilities`. It carries no stdlib
+index at all, generated or hand-maintained — a `ipe doc list`/`ipe doc
+<Module>` pointer cannot drift the way an embedded index can, which is a
+stronger form of the same no-drift invariant the original design reached for
+with a generated index. The invariant: the reference must not transcribe any
+per-function signature or diagnostic text the compiler can emit. A unit test
+(`doc::agents_template_truth` in `src/ipe-cli/src/doc.rs`) checks the names and
+commands the file does claim — the Tier A function list and the `ipe`
+commands block — against the live compiler, so those few claims cannot drift
+either.
 
 ### Stdlib placement — capability, security-defense, perf, or computation
 

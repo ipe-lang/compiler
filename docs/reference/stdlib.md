@@ -1750,12 +1750,12 @@ Ipe.Decimal — arbitrary-precision decimal arithmetic.
 | `one` | The multiplicative identity. |
 | `oneHundred` | The value 100. |
 | `fromString` | Parse a decimal from its string representation. |
-| `fromInt` | Convert an `Int` to a `Decimal` exactly. |
+| `fromInt` | Convert an `Int` to a `Decimal` exactly, with no precision loss — unlike |
 | `fromFloat` | Convert a `Float` to a `Decimal`.  Subject to the same precision limits as |
 | `fromMinor` | Construct a `Decimal` from a minor-unit integer and a scale. |
 | `toString` | Render the decimal as a plain decimal string (no thousands separators). |
 | `toStringFixed` | Render with a fixed number of decimal places. |
-| `toFloat` | Convert to the nearest `Float`.  May lose precision. |
+| `toFloat` | Convert to the nearest `Float`. May lose precision past `2^53`, the same |
 | `toInt` | Truncate to an `Int` (towards zero). |
 | `toMinor` | Return the minor-unit integer at the given scale. |
 | `add` | Add two decimals. |
