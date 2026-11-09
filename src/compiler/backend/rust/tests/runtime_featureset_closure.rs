@@ -41,19 +41,18 @@
 //! 2. **Monotonicity** ([`feature_selection_is_monotone`],
 //!    [`emitted_references_are_monotone`]): the SSOT and the emitted-reference
 //!    set are monotone in the flag mask — a superset of flags selects a
-//!    superset of features and references. Cargo feature resolution and
-//!    `Cfg::eval` are both monotone in the feature set. Property-tested on a
-//!    fixed sample of flag PAIRS: `f(a | b) = f(a) ∪ f(b)`.
+//!    superset of features and references. Cargo feature resolution is
+//!    monotone in the feature set. Property-tested on a fixed sample of flag
+//!    PAIRS: `f(a | b) = f(a) ∪ f(b)`.
 //! 3. **Composition** ([`composed_full_universe_is_closed`]): per-flag + monotone
 //!    ⇒ EVERY mask is closed. Proof: for any mask `M = ⋃ bit_i`, monotonicity
 //!    gives `refs(M) = ⋃ refs(bit_i)` and `features(M) = ⋃ features(bit_i)`.
-//!    Each `refs(bit_i)` is cfg-satisfied by `features(bit_i)` (check 1); since
-//!    `Cfg::eval` is monotone-up in the feature set and
-//!    `features(bit_i) ⊆ features(M)`, each reference stays satisfied under the
-//!    union. So the union of individually-closed sets is closed — no
-//!    combination can drop a needed module or leave a reference uncovered. This
-//!    test builds the composed all-flags reference/feature sets and asserts
-//!    closure directly, standing in for the whole `2^FLAG_COUNT` space.
+//!    Each `refs(bit_i)` is cfg-satisfied by `features(bit_i)` (check 1), and
+//!    `features(bit_i) ⊆ features(M)`; a reference stays satisfied under the
+//!    union only while its module gate is monotone in the feature set. A gate
+//!    under `not(feature = ..)` is not, so this test also checks the composed
+//!    all-flags reference/feature sets directly rather than relying on the
+//!    union argument alone.
 //!
 //! A bounded, deterministic **sampled sweep** ([`sampled_full_masks_are_closed`])
 //! runs the original whole-mask check on a fixed pseudo-random selection of full
@@ -66,6 +65,9 @@
 
 mod seal_e2e;
 
+#[path = "support/cfg.rs"]
+mod cfg;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -76,6 +78,8 @@ use ipe_intern::Interner;
 use ipe_ir::{
     CallPin, Callee, Expr, Func, FuncId, IrType, KernelFn, ModPath, Module, OnFormKind, Program,
 };
+
+use cfg::{CfgEnv, ModuleGates};
 
 /// The flag space, identical to `runtime_modset_closure.rs`: bit `i` sets
 /// `uses_*` flag `i`. The two SEALs share one flag layout so the featureset
@@ -281,201 +285,23 @@ fn resolve_features(selected: &[&str], table: &BTreeMap<String, Vec<String>>) ->
     resolved
 }
 
-// ── the runtime crate's `src/mod.rs` cfg gates ─────────────────────────────
+// ── the runtime crate's `src/mod.rs` module gates ───────────────────────────
 
-/// A `#[cfg(...)]` predicate over the runtime crate's features, restricted to
-/// the shapes `src/mod.rs` uses on module declarations.
-#[derive(Debug, Clone)]
-enum Cfg {
-    /// Always compiled (no cfg).
-    Always,
-    /// `feature = "x"`.
-    Feature(String),
-    /// `all(...)`.
-    All(Vec<Self>),
-    /// `any(...)`.
-    Any(Vec<Self>),
-    /// `target_arch = "wasm32"` (or any other non-feature atom) — evaluated as
-    /// its constant truth on the native target this SEAL models.
-    TargetAtom(bool),
-}
-
-impl Cfg {
-    /// Evaluate under the resolved native-target feature set.
-    fn eval(&self, feats: &BTreeSet<String>) -> bool {
-        match self {
-            Self::Always => true,
-            Self::Feature(f) => feats.contains(f),
-            Self::All(cs) => cs.iter().all(|c| c.eval(feats)),
-            Self::Any(cs) => cs.iter().any(|c| c.eval(feats)),
-            Self::TargetAtom(v) => *v,
-        }
+/// The runtime crate's native build under the resolved feature set.
+fn native_env(resolved: &BTreeSet<String>) -> CfgEnv {
+    CfgEnv {
+        features: resolved.clone(),
+        wasm: false,
     }
 }
 
-/// Parse a `#[cfg(...)]` inner-predicate string (the text between the outer
-/// parentheses) into a [`Cfg`]. `target_arch = "wasm32"` is false on the native
-/// target this SEAL models; any other `target_*`/`unix` atom is likewise a
-/// non-feature and evaluated false (the emitted references this SEAL checks are
-/// native-target references — a wasm-only module is never referenced by native
-/// emitted output).
-fn parse_cfg_pred(inner: &str) -> Cfg {
-    let s = inner.trim();
-    if let Some(rest) = s.strip_prefix("all(") {
-        let body = rest.strip_suffix(')').unwrap_or(rest);
-        return Cfg::All(
-            split_cfg_args(body)
-                .iter()
-                .map(|a| parse_cfg_pred(a))
-                .collect(),
-        );
-    }
-    if let Some(rest) = s.strip_prefix("any(") {
-        let body = rest.strip_suffix(')').unwrap_or(rest);
-        return Cfg::Any(
-            split_cfg_args(body)
-                .iter()
-                .map(|a| parse_cfg_pred(a))
-                .collect(),
-        );
-    }
-    if let Some(rest) = s.strip_prefix("feature") {
-        // `feature = "x"`.
-        if let Some(eq) = rest.trim_start().strip_prefix('=') {
-            let name: String = eq.trim().trim_matches('"').to_owned();
-            return Cfg::Feature(name);
-        }
-    }
-    // `target_arch = "wasm32"` and friends: non-feature atom → native-false.
-    Cfg::TargetAtom(false)
-}
-
-/// Split the comma-separated arguments of an `all(...)`/`any(...)` at the top
-/// nesting level (commas inside a nested `all`/`any` stay with their group).
-fn split_cfg_args(body: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut depth = 0i32;
-    let mut cur = String::new();
-    for ch in body.chars() {
-        match ch {
-            '(' => {
-                depth += 1;
-                cur.push(ch);
-            }
-            ')' => {
-                depth -= 1;
-                cur.push(ch);
-            }
-            ',' if depth == 0 => {
-                if !cur.trim().is_empty() {
-                    out.push(cur.trim().to_owned());
-                }
-                cur.clear();
-            }
-            _ => cur.push(ch),
-        }
-    }
-    if !cur.trim().is_empty() {
-        out.push(cur.trim().to_owned());
-    }
-    out
-}
-
-/// Walk the runtime crate's `src/mod.rs` and return `module -> gating Cfg` for
-/// every top-level `pub mod X;` / `mod X;` declaration. A declaration preceded
-/// by one or more `#[cfg(...)]` attribute lines carries their conjunction; an
-/// un-attributed declaration is [`Cfg::Always`].
-fn module_gates(mod_rs: &str) -> BTreeMap<String, Cfg> {
-    let mut gates = BTreeMap::new();
-    let mut pending: Vec<Cfg> = Vec::new();
-    for raw in mod_rs.lines() {
-        let line = raw.trim();
-        // A one-line `#[cfg(...)] pub mod x;` would be parsed as neither an
-        // attribute (no trailing `)]`) nor a `mod` decl (starts with `#`) and so
-        // slip through UN-gated — a silent false negative. The crate keeps every
-        // cfg attribute on its own line; assert that, so a future inline edit
-        // trips here instead of weakening the closure check.
-        assert!(
-            !(line.contains("#[cfg(") && line.contains(" mod ")),
-            "runtime src/mod.rs has an inline `#[cfg(...)] mod` on one line — the \
-             featureset-closure gate parser needs the cfg attribute on its own \
-             line above the `mod` decl: {line}"
-        );
-        if let Some(inner) = cfg_attr_inner(line) {
-            pending.push(parse_cfg_pred(&inner));
-            continue;
-        }
-        let decl = line
-            .strip_prefix("pub mod ")
-            .or_else(|| line.strip_prefix("mod "));
-        if let Some(rest) = decl
-            && let Some(name) = rest.strip_suffix(';')
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
-            let gate = match pending.as_slice() {
-                [] => Cfg::Always,
-                [only] => only.clone(),
-                _ => Cfg::All(pending.clone()),
-            };
-            // First declaration wins (the `pub use` lines that follow repeat the
-            // same cfg but are not `mod` decls, so they are skipped anyway).
-            gates.entry(name.to_owned()).or_insert(gate);
-            pending.clear();
-            continue;
-        }
-        // Any non-attribute, non-mod line (blank, comment, `pub use …`, other
-        // item) breaks a pending attribute run that did not attach to a `mod`.
-        if !line.is_empty() && !line.starts_with("//") {
-            pending.clear();
-        }
-    }
-    gates
-}
-
-/// If `line` is a single-line `#[cfg(...)]` attribute, return its inner
-/// predicate text (between the outer parens). Multi-line cfg attributes are
-/// joined by the caller before this is reached — but `src/mod.rs` keeps each on
-/// its own logical run; a cfg opened on one line and closed on another is
-/// reassembled by [`join_cfg_attrs`].
-fn cfg_attr_inner(line: &str) -> Option<String> {
-    let s = line.strip_prefix("#[cfg(")?;
-    let inner = s.strip_suffix(")]")?;
-    Some(inner.to_owned())
-}
-
-/// Join `src/mod.rs` so every `#[cfg(...)]` attribute is on ONE line — the
-/// crate wraps the multi-line `any(feature = …, …)` gates across several source
-/// lines, which [`cfg_attr_inner`] cannot parse line-by-line.
-fn join_cfg_attrs(src: &str) -> String {
-    let mut out = String::new();
-    let mut buf = String::new();
-    let mut in_attr = false;
-    for line in src.lines() {
-        let t = line.trim();
-        if in_attr {
-            buf.push(' ');
-            buf.push_str(t);
-            if t.ends_with(")]") {
-                out.push_str(buf.trim());
-                out.push('\n');
-                buf.clear();
-                in_attr = false;
-            }
-            continue;
-        }
-        if t.starts_with("#[cfg(") && !t.ends_with(")]") {
-            in_attr = true;
-            buf.push_str(t);
-            continue;
-        }
-        out.push_str(t);
-        out.push('\n');
-    }
-    if !buf.is_empty() {
-        out.push_str(buf.trim());
-        out.push('\n');
-    }
-    out
+/// The runtime crate's `src/mod.rs` module gates, parsed through the shared
+/// cfg grammar; an unreadable predicate fails the read.
+#[allow(clippy::expect_used)] // test scaffolding: the crate sources always parse
+fn runtime_module_gates(crate_root: &Path) -> ModuleGates {
+    let mod_rs =
+        std::fs::read_to_string(crate_root.join("src").join("mod.rs")).expect("read src/mod.rs");
+    ModuleGates::parse(&mod_rs).expect("runtime src/mod.rs module gates must parse")
 }
 
 // ── emitted-output scan: every `ipe_runtime::<mod>::` hard reference ────────
@@ -516,7 +342,7 @@ fn referenced_runtime_modules(emitted: &str) -> BTreeSet<String> {
 /// one parse.
 struct SealFixtures {
     table: BTreeMap<String, Vec<String>>,
-    gates: BTreeMap<String, Cfg>,
+    gates: ModuleGates,
 }
 
 #[allow(clippy::expect_used)] // test scaffolding: the crate sources always parse
@@ -529,9 +355,7 @@ fn load_fixtures() -> SealFixtures {
         !table.is_empty(),
         "runtime crate [features] table parsed empty"
     );
-    let mod_rs_raw =
-        std::fs::read_to_string(crate_root.join("src").join("mod.rs")).expect("read src/mod.rs");
-    let gates = module_gates(&join_cfg_attrs(&mod_rs_raw));
+    let gates = runtime_module_gates(&crate_root);
     assert!(
         !gates.is_empty(),
         "runtime src/mod.rs module gates parsed empty"
@@ -625,17 +449,15 @@ fn assert_mask_closed(fx: &SealFixtures, interner: &Interner, main: ipe_intern::
     );
 
     // (4) every emitted `ipe_runtime::<mod>::` reference is cfg-satisfied.
-    for m in emitted_module_references(interner, main, mask) {
-        let gate = fx.gates.get(&m).cloned().unwrap_or(Cfg::Always);
-        assert!(
-            gate.eval(&resolved),
-            "featureset SEAL breach: emitted reference `ipe_runtime::{m}::…` for \
-             flag mask {mask:#019b}, but the runtime crate gates `mod {m}` behind \
-             {gate:?}, UNSATISFIED by the selected feature set {selected:?} \
-             (resolved {resolved:?}). The emitted crate would fail `cargo build` \
-             (E0433)."
-        );
-    }
+    let refs = emitted_module_references(interner, main, mask);
+    let unsatisfied = fx.gates.unsatisfied(&refs, &native_env(&resolved));
+    assert!(
+        unsatisfied.is_empty(),
+        "featureset SEAL breach for flag mask {mask:#019b}, selected feature set \
+         {selected:?} (resolved {resolved:?}); the emitted crate would fail \
+         `cargo build` (E0433):\n{}",
+        unsatisfied.join("\n")
+    );
 }
 
 // ── (1) per-flag closure — O(FLAG_COUNT) ────────────────────────────────────
@@ -739,8 +561,9 @@ fn emitted_references_are_monotone() {
 /// (union distributes), this stands in for the entire `2^FLAG_COUNT` sweep: any
 /// mask `M` decomposes into its set bits, `features(M)`/`refs(M)` are the unions
 /// of the per-bit sets, each per-bit reference is satisfied by its per-bit
-/// features (⊆ `features(M)`), and `Cfg::eval` is monotone-up, so every
-/// reference stays satisfied under `features(M)`.
+/// features (⊆ `features(M)`), and a module gate monotone in the feature set
+/// keeps every reference satisfied under `features(M)`; a `not(feature = ..)`
+/// gate is not monotone, which the direct check below still evaluates.
 #[test]
 fn composed_full_universe_is_closed() {
     let fx = load_fixtures();
@@ -778,15 +601,13 @@ fn composed_full_universe_is_closed() {
         &fx.table,
     );
     let full_refs = emitted_module_references(&interner, main, all);
-    for m in &full_refs {
-        let gate = fx.gates.get(m).cloned().unwrap_or(Cfg::Always);
-        assert!(
-            gate.eval(&resolved),
-            "composed-closure breach: full-mask reference `ipe_runtime::{m}::…` \
-             is gated behind {gate:?}, UNSATISFIED by the composed feature set \
-             {composed_features:?} (resolved {resolved:?})."
-        );
-    }
+    let unsatisfied = fx.gates.unsatisfied(&full_refs, &native_env(&resolved));
+    assert!(
+        unsatisfied.is_empty(),
+        "composed-closure breach under the composed feature set \
+         {composed_features:?} (resolved {resolved:?}):\n{}",
+        unsatisfied.join("\n")
+    );
     // Sanity: the emitter did not invent a reference outside the composed union
     // that the per-flag proofs never saw (would break the composition base).
     assert!(
@@ -830,9 +651,7 @@ fn prelude_reference_gap_fails_closed() {
     let cargo_toml =
         std::fs::read_to_string(crate_root.join("Cargo.toml")).expect("read runtime Cargo.toml");
     let table = parse_feature_table(&cargo_toml);
-    let mod_rs_raw =
-        std::fs::read_to_string(crate_root.join("src").join("mod.rs")).expect("read src/mod.rs");
-    let gates = module_gates(&join_cfg_attrs(&mod_rs_raw));
+    let gates = runtime_module_gates(&crate_root);
 
     let mut interner = Interner::new();
     let main = interner.intern("Main").expect("intern Main");
@@ -853,6 +672,7 @@ fn prelude_reference_gap_fails_closed() {
         full.contains(&"jwt"),
         "precondition: a uses_auth program selects `jwt` (auth's gate); got {full:?}"
     );
+    let covered = resolve_features(&full, &table);
     let mutated: Vec<&str> = full.into_iter().filter(|f| *f != "jwt").collect();
     let resolved = resolve_features(&mutated, &table);
 
@@ -864,8 +684,12 @@ fn prelude_reference_gap_fails_closed() {
         for m in referenced_runtime_modules(text) {
             if m == "auth" {
                 saw_ref = true;
-                let gate = gates.get("auth").cloned().unwrap_or(Cfg::Always);
-                if !gate.eval(&resolved) {
+                let refs = BTreeSet::from([m]);
+                assert!(
+                    gates.unsatisfied(&refs, &native_env(&covered)).is_empty(),
+                    "the full feature set of a uses_auth program must cover `ipe_runtime::auth::…`"
+                );
+                if !gates.unsatisfied(&refs, &native_env(&resolved)).is_empty() {
                     uncovered = true;
                 }
             }
@@ -1189,4 +1013,95 @@ fn email_parse_address_only_cargo_builds() -> DResult<()> {
         built.err()
     );
     Ok(())
+}
+
+// ── the shared cfg grammar's refusals ───────────────────────────────────────
+
+/// A runtime crate root holding a declaration under `not(feature = "x")`.
+const NOT_GATED_ROOT: &str = r#"
+#[cfg(not(feature = "x"))]
+pub mod gated;
+"#;
+
+fn env_with(features: &[&str]) -> CfgEnv {
+    native_env(&features.iter().map(|f| (*f).to_owned()).collect())
+}
+
+/// A reference to a module declared under `not(feature = "x")` is refused once
+/// `x` is on: the negation is evaluated, never read as compiled.
+#[test]
+#[allow(clippy::expect_used)] // test scaffolding: the fixture root parses
+fn not_feature_gate_refuses_reference_when_feature_on() {
+    let gates = ModuleGates::parse(NOT_GATED_ROOT).expect("fixture root parses");
+    let refs = BTreeSet::from(["gated".to_owned()]);
+    assert_eq!(
+        gates.unsatisfied(&refs, &env_with(&["x"])),
+        vec![
+            "`ipe_runtime::gated::` needs `mod gated`, which is not compiled \
+             (declared under [All([Not(Feature(\"x\"))])])"
+                .to_owned()
+        ],
+    );
+    assert!(gates.unsatisfied(&refs, &env_with(&[])).is_empty());
+}
+
+/// A reference to a module the crate root never declares is refused.
+#[test]
+#[allow(clippy::expect_used)] // test scaffolding: the fixture root parses
+fn undeclared_module_reference_is_refused() {
+    let gates = ModuleGates::parse(NOT_GATED_ROOT).expect("fixture root parses");
+    let refs = BTreeSet::from(["absent".to_owned()]);
+    assert_eq!(
+        gates.unsatisfied(&refs, &env_with(&["x"])),
+        vec![
+            "`ipe_runtime::absent::` needs `mod absent`, which is not declared (declared under [])"
+                .to_owned()
+        ],
+    );
+}
+
+/// A module the build host decides is refused: it is absent on some host.
+#[test]
+#[allow(clippy::expect_used)] // test scaffolding: the fixture root parses
+fn host_gated_module_reference_is_refused() {
+    let gates = ModuleGates::parse("#[cfg(unix)]\npub mod host;\n").expect("fixture root parses");
+    let refs = BTreeSet::from(["host".to_owned()]);
+    assert_eq!(
+        gates.unsatisfied(&refs, &env_with(&[])),
+        vec![
+            "`ipe_runtime::host::` needs `mod host`, which is compiled only on some \
+             build hosts (declared under [All([Host])])"
+                .to_owned()
+        ],
+    );
+}
+
+/// A module declared once per side of a feature is compiled either way.
+#[test]
+#[allow(clippy::expect_used)] // test scaffolding: the fixture root parses
+fn module_declared_on_both_sides_of_a_feature_holds() {
+    let gates = ModuleGates::parse(
+        "#[cfg(not(feature = \"pg\"))]\npub mod config;\n\
+         #[cfg(feature = \"pg\")]\n#[path = \"config_pg.rs\"]\npub mod config;\n",
+    )
+    .expect("fixture root parses");
+    let refs = BTreeSet::from(["config".to_owned()]);
+    assert!(gates.unsatisfied(&refs, &env_with(&[])).is_empty());
+    assert!(gates.unsatisfied(&refs, &env_with(&["pg"])).is_empty());
+}
+
+/// An atom the grammar does not know is refused, never read as false.
+#[test]
+fn unknown_cfg_atom_is_refused() {
+    let flag = ModuleGates::parse("#[cfg(madeup)]\npub mod m;\n").map(|g| g.is_empty());
+    assert_eq!(flag, Err("unknown cfg flag `madeup`".to_owned()));
+    let atom = ModuleGates::parse("#[cfg(madeup = \"v\")]\npub mod m;\n").map(|g| g.is_empty());
+    assert_eq!(atom, Err("unknown cfg atom `madeup = \"v\"`".to_owned()));
+    let nested = ModuleGates::parse("#[cfg(not(madeup))]\npub mod m;\n").map(|g| g.is_empty());
+    assert_eq!(nested, Err("unknown cfg flag `madeup`".to_owned()));
+    let combinator = ModuleGates::parse("#[cfg(either(test))]\npub mod m;\n").map(|g| g.is_empty());
+    assert_eq!(
+        combinator,
+        Err("unknown cfg combinator `either(..)`".to_owned())
+    );
 }

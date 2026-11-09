@@ -36,6 +36,11 @@ use ipe_backend_rust::{RuntimeDep, RustBackend};
 use ipe_intern::Interner;
 use ipe_ir::{ModPath, Module, Program, Target};
 
+#[path = "support/cfg.rs"]
+mod cfg;
+
+use cfg::{CfgEnv, ModuleGates};
+
 /// The browser-admissible flag space. Only surfaces `assert_wasm_admissible`
 /// permits are exercised (db/server/tui/webview/email/auth/ffi are rejected
 /// upstream, so a wasm program can never set them). The mask drives the pure /
@@ -202,158 +207,14 @@ fn resolve_features(selected: &[&str], table: &BTreeMap<String, Vec<String>>) ->
     resolved
 }
 
-// ── the runtime crate's `src/mod.rs` cfg gates (wasm32 = TRUE) ──────────────
+// ── the runtime crate's `src/mod.rs` module gates (wasm32 = TRUE) ───────────
 
-#[derive(Debug, Clone)]
-enum Cfg {
-    Always,
-    Feature(String),
-    All(Vec<Self>),
-    Any(Vec<Self>),
-    /// A non-feature atom. `target_arch = "wasm32"` is TRUE here (this SEAL models
-    /// the wasm target); every other `target_*`/`unix` atom is native-false.
-    Atom(bool),
-}
-
-impl Cfg {
-    fn eval(&self, feats: &BTreeSet<String>) -> bool {
-        match self {
-            Self::Always => true,
-            Self::Feature(f) => feats.contains(f),
-            Self::All(cs) => cs.iter().all(|c| c.eval(feats)),
-            Self::Any(cs) => cs.iter().any(|c| c.eval(feats)),
-            Self::Atom(v) => *v,
-        }
+/// The runtime crate's wasm32 build under the resolved feature set.
+fn wasm_env(resolved: &BTreeSet<String>) -> CfgEnv {
+    CfgEnv {
+        features: resolved.clone(),
+        wasm: true,
     }
-}
-
-fn parse_cfg_pred(inner: &str) -> Cfg {
-    let s = inner.trim();
-    if let Some(rest) = s.strip_prefix("all(") {
-        let body = rest.strip_suffix(')').unwrap_or(rest);
-        return Cfg::All(
-            split_cfg_args(body)
-                .iter()
-                .map(|a| parse_cfg_pred(a))
-                .collect(),
-        );
-    }
-    if let Some(rest) = s.strip_prefix("any(") {
-        let body = rest.strip_suffix(')').unwrap_or(rest);
-        return Cfg::Any(
-            split_cfg_args(body)
-                .iter()
-                .map(|a| parse_cfg_pred(a))
-                .collect(),
-        );
-    }
-    if let Some(rest) = s.strip_prefix("feature")
-        && let Some(eq) = rest.trim_start().strip_prefix('=')
-    {
-        return Cfg::Feature(eq.trim().trim_matches('"').to_owned());
-    }
-    // `target_arch = "wasm32"` → TRUE on this SEAL's target; any other atom false.
-    Cfg::Atom(s.contains("wasm32"))
-}
-
-fn split_cfg_args(body: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut depth = 0i32;
-    let mut cur = String::new();
-    for ch in body.chars() {
-        match ch {
-            '(' => {
-                depth += 1;
-                cur.push(ch);
-            }
-            ')' => {
-                depth -= 1;
-                cur.push(ch);
-            }
-            ',' if depth == 0 => {
-                if !cur.trim().is_empty() {
-                    out.push(cur.trim().to_owned());
-                }
-                cur.clear();
-            }
-            _ => cur.push(ch),
-        }
-    }
-    if !cur.trim().is_empty() {
-        out.push(cur.trim().to_owned());
-    }
-    out
-}
-
-fn module_gates(mod_rs: &str) -> BTreeMap<String, Cfg> {
-    let mut gates = BTreeMap::new();
-    let mut pending: Vec<Cfg> = Vec::new();
-    for raw in mod_rs.lines() {
-        let line = raw.trim();
-        if let Some(inner) = cfg_attr_inner(line) {
-            pending.push(parse_cfg_pred(&inner));
-            continue;
-        }
-        let decl = line
-            .strip_prefix("pub mod ")
-            .or_else(|| line.strip_prefix("mod "));
-        if let Some(rest) = decl
-            && let Some(name) = rest.strip_suffix(';')
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
-            let gate = match pending.as_slice() {
-                [] => Cfg::Always,
-                [only] => only.clone(),
-                _ => Cfg::All(pending.clone()),
-            };
-            gates.entry(name.to_owned()).or_insert(gate);
-            pending.clear();
-            continue;
-        }
-        if !line.is_empty() && !line.starts_with("//") {
-            pending.clear();
-        }
-    }
-    gates
-}
-
-fn cfg_attr_inner(line: &str) -> Option<String> {
-    let s = line.strip_prefix("#[cfg(")?;
-    let inner = s.strip_suffix(")]")?;
-    Some(inner.to_owned())
-}
-
-/// Join `src/mod.rs` so every multi-line `#[cfg(...)]` attribute is on ONE line.
-fn join_cfg_attrs(src: &str) -> String {
-    let mut out = String::new();
-    let mut buf = String::new();
-    let mut in_attr = false;
-    for line in src.lines() {
-        let t = line.trim();
-        if in_attr {
-            buf.push(' ');
-            buf.push_str(t);
-            if t.ends_with(")]") {
-                out.push_str(buf.trim());
-                out.push('\n');
-                buf.clear();
-                in_attr = false;
-            }
-            continue;
-        }
-        if t.starts_with("#[cfg(") && !t.ends_with(")]") {
-            in_attr = true;
-            buf.push_str(t);
-            continue;
-        }
-        out.push_str(t);
-        out.push('\n');
-    }
-    if !buf.is_empty() {
-        out.push_str(buf.trim());
-        out.push('\n');
-    }
-    out
 }
 
 // ── emitted-output scan ─────────────────────────────────────────────────────
@@ -384,7 +245,7 @@ fn referenced_runtime_modules(emitted: &str) -> BTreeSet<String> {
 
 struct SealFixtures {
     table: BTreeMap<String, Vec<String>>,
-    gates: BTreeMap<String, Cfg>,
+    gates: ModuleGates,
 }
 
 #[allow(clippy::expect_used)]
@@ -394,9 +255,9 @@ fn load_fixtures() -> SealFixtures {
         std::fs::read_to_string(crate_root.join("Cargo.toml")).expect("read runtime Cargo.toml");
     let table = parse_feature_table(&cargo_toml);
     assert!(!table.is_empty(), "runtime [features] table parsed empty");
-    let mod_rs_raw =
+    let mod_rs =
         std::fs::read_to_string(crate_root.join("src").join("mod.rs")).expect("read src/mod.rs");
-    let gates = module_gates(&join_cfg_attrs(&mod_rs_raw));
+    let gates = ModuleGates::parse(&mod_rs).expect("runtime src/mod.rs module gates must parse");
     assert!(!gates.is_empty(), "runtime src/mod.rs gates parsed empty");
     SealFixtures { table, gates }
 }
@@ -478,16 +339,15 @@ fn assert_mask_closed(fx: &SealFixtures, interner: &Interner, main: ipe_intern::
     );
 
     // (3) every emitted `ipe_runtime::<mod>::` reference is cfg-satisfied on wasm32.
-    for m in emitted_module_references(interner, main, mask) {
-        let gate = fx.gates.get(&m).cloned().unwrap_or(Cfg::Always);
-        assert!(
-            gate.eval(&resolved),
-            "wasm featureset SEAL breach: emitted reference `ipe_runtime::{m}::…` for mask \
-             {mask:#b}, but the runtime crate gates `mod {m}` behind {gate:?}, UNSATISFIED by the \
-             `wasm-client` floor {resolved:?} on wasm32. The emitted wasm crate would fail \
-             `cargo build --target wasm32-unknown-unknown` (E0433)."
-        );
-    }
+    let refs = emitted_module_references(interner, main, mask);
+    let unsatisfied = fx.gates.unsatisfied(&refs, &wasm_env(&resolved));
+    assert!(
+        unsatisfied.is_empty(),
+        "wasm featureset SEAL breach for mask {mask:#b} under the `wasm-client` floor \
+         {resolved:?} on wasm32; the emitted wasm crate would fail \
+         `cargo build --target wasm32-unknown-unknown` (E0433):\n{}",
+        unsatisfied.join("\n")
+    );
 }
 
 /// Every browser-admissible single flag (and the featureless base) selects the
@@ -532,10 +392,19 @@ fn wasm_reference_gap_fails_closed() {
         refs.contains("wasm"),
         "a wasm TEA program must emit at least one `ipe_runtime::wasm::…` reference: {refs:?}"
     );
-    let gate = fx.gates.get("wasm").cloned().unwrap_or(Cfg::Always);
+    let wasm = BTreeSet::from(["wasm".to_owned()]);
     // The correct floor covers it; the mutated (empty) set drops `wasm-client`.
-    let covered = gate.eval(&resolve_features(&["wasm-client"], &fx.table));
-    let uncovered = !gate.eval(&resolve_features(&[], &fx.table));
+    let covered = fx
+        .gates
+        .unsatisfied(
+            &wasm,
+            &wasm_env(&resolve_features(&["wasm-client"], &fx.table)),
+        )
+        .is_empty();
+    let uncovered = !fx
+        .gates
+        .unsatisfied(&wasm, &wasm_env(&resolve_features(&[], &fx.table)))
+        .is_empty();
     assert!(
         covered,
         "precondition: the `wasm-client` floor must cover the `ipe_runtime::wasm::…` reference"
@@ -544,5 +413,23 @@ fn wasm_reference_gap_fails_closed() {
         uncovered,
         "fail-closed proof: dropping `wasm-client` must leave the `ipe_runtime::wasm::…` \
          reference UNCOVERED — the closure check would have a false negative otherwise"
+    );
+}
+
+/// A module declared only off wasm32 is refused on wasm32: the negated target
+/// atom is evaluated, never matched as the substring `wasm32`.
+#[test]
+#[allow(clippy::expect_used)] // test scaffolding: the fixture root parses
+fn native_only_module_is_refused_on_wasm() {
+    let gates = ModuleGates::parse("#[cfg(not(target_arch = \"wasm32\"))]\npub mod native;\n")
+        .expect("fixture root parses");
+    let refs = BTreeSet::from(["native".to_owned()]);
+    assert_eq!(
+        gates.unsatisfied(&refs, &wasm_env(&BTreeSet::new())),
+        vec![
+            "`ipe_runtime::native::` needs `mod native`, which is not compiled \
+             (declared under [All([Not(Wasm)])])"
+                .to_owned()
+        ],
     );
 }

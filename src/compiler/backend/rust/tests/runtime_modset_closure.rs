@@ -41,6 +41,11 @@ use ipe_intern::Interner;
 use ipe_ir::{ModPath, Module, Program, Target};
 use syn::visit::Visit;
 
+#[path = "support/cfg.rs"]
+mod cfg;
+
+use cfg::{Cfg, CfgEnv, Truth, attrs_cfg, top_level_mods};
+
 /// A `Module` with every module-set-relevant `uses_*` flag independently
 /// settable, all else empty. The record fold is index-driven: bit `i` of `mask`
 /// sets flag `i`.
@@ -463,157 +468,7 @@ fn unquoted_brace_delta(line: &str) -> i32 {
     })
 }
 
-// ── cfg evaluation ───────────────────────────────────────────────────────────
-
-/// Whether a `#[cfg(..)]` predicate holds in one emitted build: it holds, it
-/// fails, or it varies with the host the emitted crate is built on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Truth {
-    Holds,
-    Fails,
-    Varies,
-}
-
-impl Truth {
-    const fn and(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Fails, _) | (_, Self::Fails) => Self::Fails,
-            (Self::Holds, Self::Holds) => Self::Holds,
-            (Self::Holds | Self::Varies, Self::Varies) | (Self::Varies, Self::Holds) => {
-                Self::Varies
-            }
-        }
-    }
-
-    const fn or(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Holds, _) | (_, Self::Holds) => Self::Holds,
-            (Self::Fails, Self::Fails) => Self::Fails,
-            (Self::Fails | Self::Varies, Self::Varies) | (Self::Varies, Self::Fails) => {
-                Self::Varies
-            }
-        }
-    }
-
-    /// The truth of a decided atom.
-    const fn of(holds: bool) -> Self {
-        if holds { Self::Holds } else { Self::Fails }
-    }
-
-    const fn not(self) -> Self {
-        match self {
-            Self::Holds => Self::Fails,
-            Self::Fails => Self::Holds,
-            Self::Varies => Self::Varies,
-        }
-    }
-}
-
-/// One parsed `#[cfg(..)]` predicate.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Cfg {
-    /// `feature = "<name>"`.
-    Feature(String),
-    /// `test`, and a `#[test]` function: never set in an emitted build.
-    Test,
-    /// `target_arch = "wasm32"` / `target_family = "wasm"`.
-    Wasm,
-    /// An atom the build host decides: `unix`, `windows`, `target_os = ..`,
-    /// `panic = ..`, a `--cfg` flag the toolchain sets.
-    Host,
-    All(Vec<Self>),
-    Any(Vec<Self>),
-    Not(Box<Self>),
-}
-
-/// The bare cfg flags the build host decides.
-const HOST_CFG_FLAGS: &[&str] = &["unix", "windows", "debug_assertions", "ipe_asan"];
-
-/// The `key = ".."` cfg atoms the build host decides, whatever the value.
-const HOST_CFG_KEYS: &[&str] = &[
-    "target_os",
-    "target_vendor",
-    "target_env",
-    "target_pointer_width",
-    "target_endian",
-    "target_has_atomic",
-    "panic",
-];
-
-/// Parse one cfg predicate. A predicate the evaluator cannot read is refused,
-/// never read as either truth.
-fn parse_cfg(meta: &syn::Meta) -> Result<Cfg, String> {
-    let name = meta
-        .path()
-        .get_ident()
-        .map(ToString::to_string)
-        .unwrap_or_default();
-    match meta {
-        syn::Meta::Path(_) => match name.as_str() {
-            "test" => Ok(Cfg::Test),
-            flag if HOST_CFG_FLAGS.contains(&flag) => Ok(Cfg::Host),
-            _ => Err(format!("unknown cfg flag `{name}`")),
-        },
-        syn::Meta::NameValue(pair) => {
-            let syn::Expr::Lit(syn::ExprLit {
-                lit: syn::Lit::Str(value),
-                ..
-            }) = &pair.value
-            else {
-                return Err(format!("cfg `{name} = ..` carries no string value"));
-            };
-            let value = value.value();
-            match (name.as_str(), value.as_str()) {
-                ("feature", _) => Ok(Cfg::Feature(value)),
-                ("target_arch", "wasm32") | ("target_family", "wasm") => Ok(Cfg::Wasm),
-                ("target_arch" | "target_family", _) => Ok(Cfg::Host),
-                (key, _) if HOST_CFG_KEYS.contains(&key) => Ok(Cfg::Host),
-                _ => Err(format!("unknown cfg atom `{name} = \"{value}\"`")),
-            }
-        }
-        syn::Meta::List(list) => {
-            let args = list
-                .parse_args_with(
-                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-                )
-                .map_err(|e| format!("cfg `{name}(..)` does not parse: {e}"))?
-                .iter()
-                .map(parse_cfg)
-                .collect::<Result<Vec<_>, _>>()?;
-            match name.as_str() {
-                "all" => Ok(Cfg::All(args)),
-                "any" => Ok(Cfg::Any(args)),
-                "not" => {
-                    let mut args = args.into_iter();
-                    match (args.next(), args.next()) {
-                        (Some(one), None) => Ok(Cfg::Not(Box::new(one))),
-                        _ => Err("cfg `not(..)` takes exactly one predicate".to_owned()),
-                    }
-                }
-                _ => Err(format!("unknown cfg combinator `{name}(..)`")),
-            }
-        }
-    }
-}
-
-/// The predicate `attrs` compile their node under: every `#[cfg(..)]` joined,
-/// with a `#[test]` function compiled only by a test build. `None` when no
-/// attribute gates the node; `#[cfg_attr(..)]` gates nothing.
-fn attrs_cfg(attrs: &[syn::Attribute]) -> Result<Option<Cfg>, String> {
-    let mut all = Vec::new();
-    for attr in attrs {
-        let path = attr.path();
-        if path.is_ident("cfg") {
-            let meta = attr
-                .parse_args::<syn::Meta>()
-                .map_err(|e| format!("`#[cfg(..)]` does not parse: {e}"))?;
-            all.push(parse_cfg(&meta)?);
-        } else if path.segments.last().is_some_and(|seg| seg.ident == "test") {
-            all.push(Cfg::Test);
-        }
-    }
-    Ok((!all.is_empty()).then_some(Cfg::All(all)))
-}
+// ── emitted build configuration ──────────────────────────────────────────────
 
 /// The `#[path = ".."]` of a file-backed `mod` declaration.
 fn path_attr(attrs: &[syn::Attribute]) -> Option<String> {
@@ -629,44 +484,19 @@ fn path_attr(attrs: &[syn::Attribute]) -> Option<String> {
     })
 }
 
-/// The configuration one emitted crate builds under: the Cargo features its
-/// manifest enables and whether it targets wasm32. `test` is never set.
-struct CfgEnv {
-    features: BTreeSet<String>,
-    wasm: bool,
+/// No feature on, a native target.
+const fn bare_env() -> CfgEnv {
+    CfgEnv {
+        features: BTreeSet::new(),
+        wasm: false,
+    }
 }
 
-impl CfgEnv {
-    /// No feature on, a native target.
-    const fn bare() -> Self {
-        Self {
-            features: BTreeSet::new(),
-            wasm: false,
-        }
-    }
-
-    /// The configuration of an emitted crate from its `Cargo.toml`.
-    fn of_manifest(cargo_toml: &str, wasm: bool) -> Self {
-        Self {
-            features: enabled_features(cargo_toml),
-            wasm,
-        }
-    }
-
-    fn eval(&self, cfg: &Cfg) -> Truth {
-        match cfg {
-            Cfg::Feature(name) => Truth::of(self.features.contains(name)),
-            Cfg::Test => Truth::Fails,
-            Cfg::Wasm => Truth::of(self.wasm),
-            Cfg::Host => Truth::Varies,
-            Cfg::All(all) => all
-                .iter()
-                .fold(Truth::Holds, |truth, c| truth.and(self.eval(c))),
-            Cfg::Any(any) => any
-                .iter()
-                .fold(Truth::Fails, |truth, c| truth.or(self.eval(c))),
-            Cfg::Not(inner) => self.eval(inner).not(),
-        }
+/// The configuration of an emitted crate from its `Cargo.toml`.
+fn manifest_env(cargo_toml: &str, wasm: bool) -> CfgEnv {
+    CfgEnv {
+        features: enabled_features(cargo_toml),
+        wasm,
     }
 }
 
@@ -1150,24 +980,15 @@ fn parse_mod_rs(mod_rs: &str) -> Result<syn::File, String> {
 /// Every top-level module declaration of an emitted `mod.rs`, with the
 /// predicate each holds under.
 fn declarations(file: &syn::File) -> Result<Vec<Decl<'_>>, String> {
-    let file_cond = attrs_cfg(&file.attrs)?;
-    file.items
-        .iter()
-        .filter_map(|item| match item {
-            syn::Item::Mod(m) => Some(m),
-            _ => None,
+    Ok(top_level_mods(file)?
+        .into_iter()
+        .map(|(m, cond)| Decl {
+            name: m.ident.to_string(),
+            cond,
+            path: path_attr(&m.attrs),
+            inline: m.content.as_ref().map(|(_, items)| items.as_slice()),
         })
-        .map(|m| {
-            let mut all: Vec<Cfg> = file_cond.iter().cloned().collect();
-            all.extend(attrs_cfg(&m.attrs)?);
-            Ok(Decl {
-                name: m.ident.to_string(),
-                cond: Cfg::All(all),
-                path: path_attr(&m.attrs),
-                inline: m.content.as_ref().map(|(_, items)| items.as_slice()),
-            })
-        })
-        .collect()
+        .collect())
 }
 
 /// The file rustc reads for the file-backed declaration `decl`, and the
@@ -1273,7 +1094,7 @@ fn source_required(src: &str) -> BTreeSet<String> {
     let refs = module_refs(&dir, &Overlay::new(), &decl, &mut errors);
     let _ = std::fs::remove_dir_all(&dir);
     assert!(errors.is_empty(), "scan refused: {errors:?}");
-    required_segs(&refs, &decl.cond, &CfgEnv::bare())
+    required_segs(&refs, &decl.cond, &bare_env())
 }
 
 /// Distinguishes the probe files of concurrent [`source_required`] calls.
@@ -1808,7 +1629,7 @@ fn assert_mask_closed(
 ) {
     for intent in EMIT_INTENTS {
         let emit = emit_mask(interner, main, mask, Target::Native, intent);
-        let env = CfgEnv::of_manifest(&emit.cargo_toml, false);
+        let env = manifest_env(&emit.cargo_toml, false);
         let violations = closure_violations(runtime_root, &emit, &env, cache);
         assert!(
             violations.is_empty(),
@@ -2042,7 +1863,7 @@ fn base_modules_do_not_reach_gated_modules() {
     let mut interner = Interner::new();
     let main = interner.intern("Main").expect("intern Main");
     let emit = emit_mask(&interner, main, 0, Target::Native, BuildIntent::Release);
-    let env = CfgEnv::of_manifest(&emit.cargo_toml, false);
+    let env = manifest_env(&emit.cargo_toml, false);
     let violations = closure_violations(&runtime_root, &emit, &env, &mut ScanCache::default());
     assert!(
         violations.is_empty(),
@@ -2174,7 +1995,7 @@ fn wasm_vendored_modset_is_closed() {
     let mut cache = ScanCache::default();
     for intent in EMIT_INTENTS {
         let emit = emit_mask(&interner, main, 0, Target::WasmClient, intent);
-        let env = CfgEnv::of_manifest(&emit.cargo_toml, true);
+        let env = manifest_env(&emit.cargo_toml, true);
         let violations = closure_violations(&runtime_root, &emit, &env, &mut cache);
         assert!(
             violations.is_empty(),
@@ -2705,7 +2526,7 @@ fn scanner_scopes_a_cfg_gated_mod_declaration_to_the_child_file() {
     for (path, src) in &files {
         std::fs::write(path, src).expect("write fixture file");
     }
-    let bare = module_required(&root, "web", &CfgEnv::bare());
+    let bare = module_required(&root, "web", &bare_env());
     let with = |features: &[&str]| CfgEnv {
         features: features.iter().map(|f| (*f).to_owned()).collect(),
         wasm: false,
@@ -2738,7 +2559,7 @@ fn scanner_scopes_a_cfg_gated_mod_declaration_to_the_child_file() {
 #[test]
 fn scanner_detects_log_rs_dep_on_app_config() {
     let runtime_root = e2e_support::require_runtime().into_path_buf();
-    let deps = module_required(&runtime_root, "log", &CfgEnv::bare());
+    let deps = module_required(&runtime_root, "log", &bare_env());
     assert!(
         deps.contains("app_config"),
         "`log.rs` must register `app_config` as a dep \
@@ -2783,7 +2604,7 @@ fn web_shape_declares_bundle_route() {
     let main = interner.intern("Main").expect("intern Main");
     for intent in EMIT_INTENTS {
         let emit = emit_mask(&interner, main, 1 << 3, Target::Native, intent);
-        let env = CfgEnv::of_manifest(&emit.cargo_toml, false);
+        let env = manifest_env(&emit.cargo_toml, false);
         let file = parse_mod_rs(&emit.mod_rs).expect("the emitted `mod.rs` parses");
         let decls = declarations(&file).expect("the emitted `mod.rs` predicates read");
         let compiled = |name: &str| {
