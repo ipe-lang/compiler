@@ -1,0 +1,12 @@
+-- A TRIPLE-QUOTED STRING LINE LEFT OF ITS MARGIN ---------- test.ipe
+
+Line 6 starts left of this block's margin, column 5. Every body line is indented at least to the margin, which is the opening `"""`'s column; the margin is not part of the value.
+
+ --> test.ipe:6:1
+  |
+6 |   b
+  | ^^^ this line starts left of column 5
+  |
+  = help: indent this line to at least column 5
+
+IPE-P0076 · run `ipe doc IPE-P0076`

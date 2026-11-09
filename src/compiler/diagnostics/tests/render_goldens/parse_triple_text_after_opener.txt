@@ -1,0 +1,12 @@
+-- A TRIPLE-QUOTED STRING IN NEITHER OF ITS TWO FORMS ------ test.ipe
+
+This string runs past its first line, so it is a block. A `"""` string is either one line (`"""text"""`) or a block: the opening `"""` ends its line, and the closing `"""` stands alone on its own line in the opener's column, the margin.
+
+ --> test.ipe:4:8
+  |
+4 |     """line one
+  |        ^^^^^^^^ text after the opening `"""` of a block
+  |
+  = help: move the text to the next line
+
+IPE-P0075 · run `ipe doc IPE-P0075`
