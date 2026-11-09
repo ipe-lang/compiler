@@ -608,20 +608,21 @@ pub fn exec_verified_jailed(
 
 /// Resolve the inferred and declared capability sets for a run of the project `manifest` governs.
 ///
-/// The inferred set is the package-wide union over `package` (every shipped
-/// module), the capability posture the package audit takes; the declared set
-/// is the manifest's `[capabilities]`. `package` is the source set the build
-/// compiles, so the capabilities consented to are those of the program that
-/// ships.
+/// The inferred set is the package-wide union over `front`'s source set
+/// (every shipped module), the capability posture the package audit takes;
+/// the declared set is the manifest's `[capabilities]`. `front` is the front
+/// end the build compiles from, so the capabilities consented to are those of
+/// the program that ships. Inference runs on the compile thread.
 ///
 /// # Errors
 ///
-/// Propagates lowering failures from capability inference.
+/// Propagates lowering failures from capability inference, and
+/// [`CliError::ThreadRefused`] when the OS refused the compile thread.
 pub fn resolve_for_run(
     manifest: &ProjectManifest,
-    package: &crate::PackageSourceSet,
+    front: &crate::PackageFrontEnd,
 ) -> Result<ResolvedCapabilities, CliError> {
-    let inferred = crate::infer_package_capabilities_in(&ipe_db::IpeDatabase::new(), package)?;
+    let inferred = front.infer_capabilities()?;
     Ok(ResolvedCapabilities {
         inferred,
         declared: manifest.capabilities.clone(),

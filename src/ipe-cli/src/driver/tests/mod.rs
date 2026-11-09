@@ -5903,18 +5903,19 @@ const DEBUG_DESKTOP_PACKAGE: &str = "module Package exposing (package)\n\nimport
 /// The `main` of [`DEBUG_DESKTOP_PACKAGE`].
 const DEBUG_DESKTOP_MAIN: &str = "module Main exposing (main)\n\nimport Ipe.Tea.Web as Web\nimport Ipe.Tea.Web.Cmd as Cmd\nimport Ipe.Tea.Web.Sub as Sub\nimport Ipe.Debug as Debug\nimport Ipe.String as String\nimport Ipe.Ui as Ui\n\n\ntype alias Model =\n    { count : Int }\n\n\ntype Msg\n    = Increment\n    | NoOp\n\n\ninit : WebReq -> ( Model, Cmd.Cmd Msg )\ninit _req =\n    ( { count = 0 }, Cmd.none )\n\n\nupdate : Msg -> Model -> ( Model, Cmd.Cmd Msg )\nupdate msg model =\n    case msg of\n        Increment ->\n            ( { model | count = Debug.log \"count\" (model.count + 1) }, Cmd.none )\n\n        NoOp ->\n            ( model, Cmd.none )\n\n\nsubscriptions : Model -> Sub.Sub Msg\nsubscriptions _model =\n    Sub.none\n\n\nview : Model -> Element Msg\nview model =\n    Ui.column []\n        [ Ui.button [] { onPress = Just Increment, label = Ui.text \"+\" }\n        , Ui.text (String.fromInt model.count)\n        ]\n\n\nmain =\n    Web.tea\n        { init = init\n        , update = update\n        , view = view\n        , subscriptions = subscriptions\n        , routes = []\n        , notFound = NoOp\n        }\n";
 
-/// Bundle the Debug-using desktop app: a release bundle behind `consented`,
+/// Bundle the Debug-using desktop app: a release bundle admitting `consented`,
 /// written under its own release member root, else a dev bundle.
 ///
 /// Also answers whether the bundle left a `release/` directory under the
 /// default output root.
 fn bundle_debug_desktop(
-    consented: Option<&ConsentedCapabilities>,
+    consented: Option<crate::run_sandbox::ResolvedCapabilities>,
     label: &str,
 ) -> (Result<(), CliError>, bool) {
     let (tmp, _) = debug_project(label, DEBUG_DESKTOP_PACKAGE, DEBUG_DESKTOP_MAIN);
     let result = held_build(&tmp, false).and_then(|held| {
-        let finish = match consented {
+        let judged = consented.map(|resolved| JudgedRelease::admitted(&held, resolved));
+        let finish = match &judged {
             None => BundleFinish::Dev {
                 output: crate::output_dir::OutputRoot::resolve(
                     None,
@@ -5939,7 +5940,7 @@ fn bundle_debug_desktop(
                 )?
                 .release_member(&slug);
                 BundleFinish::Release {
-                    consented,
+                    judged: consented,
                     driver: ipe_backend_rust::DbDriver::Sqlite,
                     member,
                 }
@@ -5959,11 +5960,11 @@ fn bundle_debug_desktop(
 /// release creates no `release/<slug>/`.
 #[test]
 fn release_desktop_bundle_gates_debug() {
-    let consented = ConsentedCapabilities::admitted(crate::run_sandbox::ResolvedCapabilities {
+    let consented = crate::run_sandbox::ResolvedCapabilities {
         inferred: std::collections::BTreeSet::new(),
         declared: std::collections::BTreeSet::new(),
-    });
-    let (result, left_release) = bundle_debug_desktop(Some(&consented), "release-desktop-debug");
+    };
+    let (result, left_release) = bundle_debug_desktop(Some(consented), "release-desktop-debug");
     assert!(
         is_debug_gate(&result),
         "a release desktop bundle refuses Debug.log with IPE-L0140: {result:?}"

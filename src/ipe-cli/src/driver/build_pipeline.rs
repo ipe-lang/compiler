@@ -701,7 +701,7 @@ pub fn build_test_into(
         .map_or_else(|| manifest_path.clone(), |held| held.path().to_path_buf());
     let cache_site = cache::env_cache_dir(&target.path()?)?;
     compile_source_set_observed(
-        super::PackageSourceSet::from_test_view(view),
+        &PackageFrontEnd::cold(super::PackageSourceSet::from_test_view(view)),
         view.entry(),
         &target,
         &runtime_dir,
@@ -1045,7 +1045,7 @@ pub fn compile_modules_observed(
     };
     let settings = emit_settings(source, &options, target.bundle_role());
     compile_source_set_observed(
-        source_set,
+        &PackageFrontEnd::cold(source_set),
         entry_path,
         target,
         runtime_dir,
@@ -1070,10 +1070,11 @@ const fn refuse_debugger_without_runtime_dep(options: &BuildOptions) -> Result<(
     Ok(())
 }
 
-/// [`compile_modules_observed`] over an already-assembled [`super::PackageSourceSet`].
+/// [`compile_modules_observed`] over the front end of an already-assembled [`super::PackageSourceSet`].
 ///
 /// The set is compiled as given: no source is read and nothing is injected
-/// here, so what is emitted is exactly the set a caller judged.
+/// here, so what is emitted is exactly the set a caller judged, demanded on
+/// the database that judged it.
 ///
 /// `settings` is the one value every emit chain, the cache key and the salsa
 /// config read; this core fills its `ffi` and `runtime_dep` once resolved.
@@ -1084,7 +1085,7 @@ const fn refuse_debugger_without_runtime_dep(options: &BuildOptions) -> Result<(
 /// the program admitted is bounded by the declared compile stack on every OS.
 #[allow(clippy::too_many_arguments)]
 fn compile_source_set_observed(
-    source_set: super::PackageSourceSet,
+    front: &PackageFrontEnd,
     entry_path: &[String],
     target: &EmitTarget,
     runtime_dir: &Path,
@@ -1093,9 +1094,10 @@ fn compile_source_set_observed(
     cache_site: Option<&cache::CacheSite>,
     options: &BuildOptions,
 ) -> (Result<EmittedCrate, CliError>, CacheOutcome) {
-    crate::threads::run_compile(|| {
+    let front = front.on_compile_thread();
+    crate::threads::run_compile(move || {
         compile_source_set_here(
-            source_set,
+            &front,
             entry_path,
             target,
             runtime_dir,
@@ -1111,7 +1113,7 @@ fn compile_source_set_observed(
 /// [`compile_source_set_observed`] on the calling thread.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn compile_source_set_here(
-    source_set: super::PackageSourceSet,
+    front: &CompileThreadFront<'_>,
     entry_path: &[String],
     target: &EmitTarget,
     runtime_dir: &Path,
@@ -1126,9 +1128,9 @@ fn compile_source_set_here(
     let super::SourceSetParts {
         sources,
         injected,
-        ffi_injected,
         ffi_emit,
-    } = source_set.into_parts();
+        ..
+    } = front.set.parts();
 
     // Resolve the dependency-model runtime crate ONCE, fail-closed: if the
     // opt-in is set but no verified `ipe-runtime-rust` crate root is found, the
@@ -1160,7 +1162,7 @@ fn compile_source_set_here(
         cache_site
     };
     let settings = ipe_backend_rust::EmitSettings {
-        ffi: ffi_emit,
+        ffi: ffi_emit.cloned(),
         runtime_dep,
         ..settings
     };
@@ -1170,7 +1172,7 @@ fn compile_source_set_here(
     // `ipe` binary's own content hash and the active `rustc`'s fingerprint
     // (see `cache::derive_epoch`'s doc for why this makes
     // "refuse, don't guess" structural rather than a runtime check).
-    let cache_key = cache::compute_project_key(&sources, &injected, entry_path, &settings);
+    let cache_key = cache::compute_project_key(sources, injected, entry_path, &settings);
     let epoch = cache_site.and_then(|_| cache::derive_epoch());
     if let (Some(site), Some(epoch)) = (cache_site, epoch.as_deref())
         && let Some(emitted) = cache::try_load(site, epoch, &cache_key)
@@ -1190,14 +1192,14 @@ fn compile_source_set_here(
 
     // The lowered-IR cache tier (see `crate::cache`'s module doc
     // section for the full design). A hit here skips parse -> canon -> link
-    // -> infer -> lower ENTIRELY — no `IpeDatabase` is constructed at all —
+    // -> infer -> lower ENTIRELY — no query is demanded on the front end —
     // running only `RustBackend::emit` over the relocated `Program` before
     // falling through to the SAME disk-write + tier-1-warming path a full
     // pipeline run uses. The `ir_key` deliberately excludes `db_driver`
     // (`compute_ir_key`'s own doc explains why), so this tier can still hit
     // when the `EmittedProject` tier just missed on a `db_driver`-only edit.
     if let (Some(site), Some(epoch)) = (cache_site, epoch.as_deref()) {
-        let ir_key = cache::compute_ir_key(&sources, &injected, entry_path, settings.target);
+        let ir_key = cache::compute_ir_key(sources, injected, entry_path, settings.target);
         let fresh_interner: std::sync::Arc<std::sync::Mutex<ipe_intern::Interner>> =
             std::sync::Arc::new(std::sync::Mutex::new(ipe_intern::Interner::new()));
         if let Some(program) = cache::try_load_ir(site, epoch, &ir_key, &fresh_interner) {
@@ -1216,7 +1218,7 @@ fn compile_source_set_here(
                         kernel: "Debug.*".into(),
                     },
                 };
-                let (file, src) = entry_blame_source(&sources, entry_path, blame_path);
+                let (file, src) = entry_blame_source(sources, entry_path, blame_path);
                 return (
                     Err(CliError::Pipeline {
                         file,
@@ -1260,23 +1262,21 @@ fn compile_source_set_here(
         }
     }
 
-    // Salsa database (see
-    // docs/architecture/salsa-incremental-compilation-2026-07-11.md). The
-    // driver parses external state ONCE into typed inputs here (`SourceFile`
-    // per module + the `SourceRoot` file set); the front-end stages are
-    // demanded as memoized queries inside `compile_prepared`. The database is
-    // cold and per-invocation, and queries are demanded in the fixed topo
-    // order, so the interning sequence — and therefore emitted bytes — is
-    // deterministic across runs (golden-suite-enforced).
-    let db = ipe_db::IpeDatabase::new();
-    let source_root = create_source_root(&db, &sources, &injected, &ffi_injected);
-    // One fresh `BuildConfig` per one-shot invocation: this driver never
-    // re-demands `emit_project` against a second config instance.
+    // The front end's salsa database (see
+    // docs/architecture/salsa-incremental-compilation-2026-07-11.md): its typed
+    // inputs (`SourceFile` per module + the `SourceRoot` file set) were minted
+    // once when the front end was opened, and the front-end stages are demanded
+    // as memoized queries inside `compile_prepared`. A release's consent warmed
+    // these memos; the emitted bytes are the cold ones either way
+    // (`clean_vs_incremental_parity.rs` pins it).
+    let db = &front.db;
+    let source_root = front.root;
+    // One `BuildConfig` per emit: each emit's settings key its own
+    // `emit_project` memo.
     let ir_target = settings.target;
-    let config = ipe_db::BuildConfig::new(&db, settings);
+    let config = ipe_db::BuildConfig::new(db, settings);
 
-    let emitted = match compile_prepared(&db, source_root, &sources, entry_path, blame_path, config)
-    {
+    let emitted = match compile_prepared(db, source_root, sources, entry_path, blame_path, config) {
         Ok(emitted) => emitted,
         Err(e) => return (Err(e), CacheOutcome::Miss),
     };
@@ -1306,21 +1306,113 @@ fn compile_source_set_here(
         // entry-file lookup failure or a serialize failure never turns a
         // successful build into a reported failure (same advisory contract
         // as the `EmittedProject` tier's own store).
-        if let Some(entry_file) = source_root.files(&db).get(entry_path).copied()
-            && let Ok(program) = ipe_db::lower_program(&db, source_root, entry_file)
+        if let Some(entry_file) = source_root.files(db).get(entry_path).copied()
+            && let Ok(program) = ipe_db::lower_program(db, source_root, entry_file)
         {
-            let ir_key = cache::compute_ir_key(&sources, &injected, entry_path, ir_target);
+            let ir_key = cache::compute_ir_key(sources, injected, entry_path, ir_target);
             cache::store_ir(
                 &root,
                 epoch,
                 &ir_key,
                 program,
-                ipe_db::Db::interner(&db).as_arc(),
+                ipe_db::Db::interner(db).as_arc(),
             );
         }
     }
 
     (written, CacheOutcome::Miss)
+}
+
+/// One package's front end: its source set, the salsa inputs minted for it once, and every memo demanded over them.
+///
+/// A release opens one and both judges its capabilities and emits every
+/// member from it, so the program consented to is the program emitted. Every
+/// query runs on the declared compile thread ([`crate::threads::run_compile`])
+/// over a handle sharing this database's storage; none runs on the caller's.
+/// The inputs never change after [`Self::cold`], so the memos it holds grow
+/// only with the emits one command asks for.
+pub struct PackageFrontEnd {
+    set: super::PackageSourceSet,
+    db: ipe_db::IpeDatabase,
+    root: ipe_db::SourceRoot,
+}
+
+/// A [`PackageFrontEnd`] handle a compile thread owns: a database handle over the same storage.
+struct CompileThreadFront<'a> {
+    set: &'a super::PackageSourceSet,
+    db: ipe_db::IpeDatabase,
+    root: ipe_db::SourceRoot,
+}
+
+impl PackageFrontEnd {
+    /// Open the front end of `set` on a fresh database, minting its inputs and demanding no query.
+    #[must_use]
+    pub fn cold(set: super::PackageSourceSet) -> Self {
+        Self::over(set, ipe_db::IpeDatabase::new())
+    }
+
+    /// [`Self::cold`] on a database that hands `on_query` the debug key of every query it executes.
+    #[cfg(test)]
+    pub fn observed(
+        set: super::PackageSourceSet,
+        on_query: impl Fn(String) + Send + Sync + 'static,
+    ) -> Self {
+        const EXECUTES: &str = "WillExecute { database_key: ";
+        let db = ipe_db::IpeDatabase::with_event_callback(Box::new(move |event| {
+            if let Some(key) = format!("{:?}", event.kind).strip_prefix(EXECUTES) {
+                on_query(key.to_owned());
+            }
+        }));
+        Self::over(set, db)
+    }
+
+    /// Mint `set`'s inputs on `db`.
+    fn over(set: super::PackageSourceSet, db: ipe_db::IpeDatabase) -> Self {
+        let parts = set.parts();
+        let root = create_source_root(&db, parts.sources, parts.injected, parts.ffi_injected);
+        Self { set, db, root }
+    }
+
+    /// The source set this front end compiles.
+    #[must_use]
+    pub const fn sources(&self) -> &super::PackageSourceSet {
+        &self.set
+    }
+
+    /// The database, for the warm-vs-cold parity harness.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn db(&self) -> &ipe_db::IpeDatabase {
+        &self.db
+    }
+
+    /// The source root, for the warm-vs-cold parity harness.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn root(&self) -> ipe_db::SourceRoot {
+        self.root
+    }
+
+    /// The package's capabilities, inferred on a compile thread over this front end's database.
+    ///
+    /// # Errors
+    /// [`CliError::ThreadRefused`] when the OS refused the compile thread;
+    /// every refusal of [`super::infer_package_capabilities_in`].
+    pub fn infer_capabilities(
+        &self,
+    ) -> Result<std::collections::BTreeSet<ipe_ir::Capability>, CliError> {
+        let front = self.on_compile_thread();
+        crate::threads::run_compile(move || super::infer_on(&front.db, front.root, front.set))?
+    }
+
+    /// A handle to this front end that a compile thread can own.
+    fn on_compile_thread(&self) -> CompileThreadFront<'_> {
+        CompileThreadFront {
+            set: &self.set,
+            db: self.db.clone(),
+            root: self.root,
+        }
+    }
 }
 
 /// Create the salsa inputs for one build: a [`ipe_db::SourceFile`] per module
@@ -3027,7 +3119,7 @@ pub fn build_parsed_project_into(
     build_from_sources_for(
         manifest,
         manifest_path,
-        source_set,
+        &PackageFrontEnd::cold(source_set),
         out,
         runtime_dir,
         options,
@@ -3055,6 +3147,28 @@ pub fn build_root_into(
     options: &BuildOptions,
     host: crate::delivery::HostIntent,
 ) -> Result<EmittedCrate, CliError> {
+    build_held_into(
+        held,
+        &PackageFrontEnd::cold(held.sources()),
+        out,
+        runtime_dir,
+        options,
+        host,
+    )
+}
+
+/// [`build_root_into`] on `front`, the front end opened over `held`'s sources.
+///
+/// # Errors
+/// As [`build_root_into`].
+pub fn build_held_into(
+    held: &super::HeldBuild,
+    front: &PackageFrontEnd,
+    out: OutTarget<'_>,
+    runtime_dir: &Path,
+    options: &BuildOptions,
+    host: crate::delivery::HostIntent,
+) -> Result<EmittedCrate, CliError> {
     refuse_debugger_without_runtime_dep(options)?;
     if let crate::delivery::HostIntent::WebView(_) = host {
         crate::pack::desktop::require_webview(super::desktop_app_shape(held.shape()))
@@ -3064,7 +3178,7 @@ pub fn build_root_into(
     build_from_sources_for(
         held.root().manifest(),
         held.manifest_path(),
-        super::PackageSourceSet::from_build_snapshot(held.snapshot()),
+        front,
         out,
         runtime_dir,
         options,
@@ -3132,7 +3246,7 @@ pub fn build_from_sources(
     build_from_sources_for(
         manifest,
         manifest_path,
-        source_set,
+        &PackageFrontEnd::cold(source_set),
         out,
         Path::new(""),
         &BuildOptions::gate(),
@@ -3147,7 +3261,7 @@ pub fn build_from_sources(
 fn build_from_sources_for(
     manifest: &project::ProjectManifest,
     manifest_path: &Path,
-    source_set: super::PackageSourceSet,
+    front: &PackageFrontEnd,
     out: OutTarget<'_>,
     runtime_dir: &Path,
     options: &BuildOptions,
@@ -3161,7 +3275,7 @@ fn build_from_sources_for(
     let entry_path = manifest.resolved_entry()?;
     if manifest.default_program().is_none()
         && !manifest.exposed_modules.is_empty()
-        && !source_set.has_module(&entry_path)
+        && !front.sources().has_module(&entry_path)
     {
         return Err(CliError::ProjectRefused(
             text::msg::library_package_no_entry(),
@@ -3193,7 +3307,7 @@ fn build_from_sources_for(
     );
     let cache_site = cache::env_cache_dir(&target.path()?)?;
     compile_source_set_observed(
-        source_set,
+        front,
         &entry_path,
         &target,
         runtime_dir,

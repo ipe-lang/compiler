@@ -1,10 +1,10 @@
 use super::{
-    BuildOptions, BundleFinish, BundleHost, CliError, EmittedCrate, OutTarget, RuntimeContext,
-    RuntimeEmit, SettingsSource, apply_fixes_cmd, attribute_canon_errors,
-    attribute_post_link_error, bluegreen_enabled, build_root_into, bundle_delivery,
-    compile_prepared, create_source_root, emit_machine_error, emit_permissions, emit_settings,
-    find_manifest_for_ipe_file, frame_infer_error, gate_decoder_pipelines, home_to_source_map,
-    io_err, resolve_vendored_runtime_dir, run_version, runtime_dep_from_env,
+    BuildOptions, BundleFinish, BundleHost, CliError, EmittedCrate, OutTarget, PackageFrontEnd,
+    RuntimeContext, RuntimeEmit, SettingsSource, apply_fixes_cmd, attribute_canon_errors,
+    attribute_post_link_error, bluegreen_enabled, build_held_into, build_root_into,
+    bundle_delivery, compile_prepared, create_source_root, emit_machine_error, emit_permissions,
+    emit_settings, find_manifest_for_ipe_file, frame_infer_error, gate_decoder_pipelines,
+    home_to_source_map, io_err, resolve_vendored_runtime_dir, run_version, runtime_dep_from_env,
 };
 use std::num::NonZeroU8;
 
@@ -1905,7 +1905,7 @@ pub fn release_pipeline(
     // carries no `--accept-risks` and never prompts, so an ungranted disclosure
     // fails closed here, and the durable manifest `[capabilities]` grant is the
     // only way through (a CI release must not block on a TTY prompt).
-    let consented = consent_to_capabilities(&held)?;
+    let release = consent_to_capabilities(&held)?;
 
     // Every release member writes under its own `release/<slug>/` root, the
     // slug a function of the member's release identity, so two members never
@@ -1958,7 +1958,7 @@ pub fn release_pipeline(
                 bundle_delivery(
                     host,
                     BundleFinish::Release {
-                        consented: &consented,
+                        judged: &release,
                         driver,
                         member,
                     },
@@ -2036,8 +2036,12 @@ pub fn release_pipeline(
                     );
                 }
 
-                let crate_dir =
-                    held.emit(&rust, &runtime_dir, &options, member_delivery.host_intent())?;
+                let crate_dir = release.emit(
+                    OutTarget::Proven(&rust),
+                    &runtime_dir,
+                    &options,
+                    member_delivery.host_intent(),
+                )?;
                 let www = bundle_wasm(
                     crate_dir.dir(),
                     &crate::bundle_www::BundleHome::Release(member),
@@ -2077,7 +2081,7 @@ pub fn release_pipeline(
 
             // The consented capabilities discriminate between native-bearing (needs jail
             // wrapper) and pure-native (plain optimised binary).
-            let resolved = consented.resolved();
+            let resolved = release.consented().resolved();
 
             // The pure-native and the jailed path emit the same statically linked app,
             // so one options value drives both emits and the runtime resolution.
@@ -2124,8 +2128,8 @@ pub fn release_pipeline(
 
                 // A desktop host returned through the bundler above, so this static
                 // artifact is the served program.
-                let crate_dir = held.emit(
-                    &EmitTarget::Member(member.area(OutputArea::Rust)),
+                let crate_dir = release.emit(
+                    OutTarget::Proven(&EmitTarget::Member(member.area(OutputArea::Rust))),
                     &runtime_dir,
                     &options,
                     HostIntent::Served,
@@ -2139,7 +2143,7 @@ pub fn release_pipeline(
                 let artifacts = build_pure_native_release(
                     &cargo_bin,
                     &crate_dir,
-                    &consented,
+                    release.consented(),
                     driver,
                     triple,
                     &app_target_dir,
@@ -2211,8 +2215,8 @@ pub fn release_pipeline(
             // Step 1: emit + build the app binary (static, musl, production).
             // A desktop host returned through the bundler above, so this static
             // artifact is the served program.
-            let app_dir = held.emit(
-                &EmitTarget::Member(member.area(OutputArea::App)),
+            let app_dir = release.emit(
+                OutTarget::Proven(&EmitTarget::Member(member.area(OutputArea::App))),
                 &runtime_dir,
                 &options,
                 HostIntent::Served,
@@ -2229,7 +2233,7 @@ pub fn release_pipeline(
                 cargo: &cargo_bin,
                 crate_dir: &app_dir,
                 finish: NativeFinish::Release {
-                    consented: &consented,
+                    consented: release.consented(),
                     driver,
                 },
                 target: CargoTarget::Static(triple),
@@ -4248,7 +4252,7 @@ impl SourceGraph {
 /// The program's resolved capability sets, admitted by every trust-boundary
 /// consent gate.
 ///
-/// The one constructor is [`consent_to_capabilities`]: it resolves (infers) the
+/// The one constructor is [`consent_on`]: it resolves (infers) the
 /// capability set exactly once and runs the `.Unsafe`, web, and native-crossing
 /// gates over that single value. Every downstream consumer — the release
 /// floor and profile, the release jail — takes this witness, so none of them
@@ -4272,25 +4276,90 @@ impl ConsentedCapabilities {
     }
 }
 
-/// Resolve the program's capabilities once and pass them through every
-/// trust-boundary consent gate of `ipe release`: the `.Unsafe`
-/// acknowledgment, then the app-boundary web
-/// consent, then the app-boundary native-crossing consent. All three judge the
-/// SAME resolved value, and the value is released only once all three admit it.
+/// A release every consent gate admitted, with the one front end it was judged on.
 ///
-/// Inference and every scan run over the modules `held` read, the ones the
-/// emit compiles.
+/// The one constructor is [`consent_on`]: the front end is opened over the
+/// sources `held` read, the capabilities are inferred on it, and the gates
+/// admit them. [`Self::emit`] compiles from that same database, so the
+/// program a release consented to is, by construction, the program it emits;
+/// no second front end is opened for it.
+pub struct JudgedRelease<'h> {
+    held: &'h HeldBuild,
+    front: PackageFrontEnd,
+    consented: ConsentedCapabilities,
+}
+
+impl JudgedRelease<'_> {
+    /// The capabilities the consent gates admitted.
+    #[must_use]
+    pub const fn consented(&self) -> &ConsentedCapabilities {
+        &self.consented
+    }
+
+    /// Emit the judged program into `out` for `host`, from the front end consent judged.
+    ///
+    /// # Errors
+    /// As [`build_root_into`].
+    pub fn emit(
+        &self,
+        out: OutTarget<'_>,
+        runtime_dir: &Path,
+        options: &BuildOptions,
+        host: HostIntent,
+    ) -> Result<EmittedCrate, CliError> {
+        build_held_into(self.held, &self.front, out, runtime_dir, options, host)
+    }
+}
+
+#[cfg(test)]
+impl<'h> JudgedRelease<'h> {
+    /// A release over `held` admitting `resolved` with no gate run, for a test.
+    pub fn admitted(held: &'h HeldBuild, resolved: run_sandbox::ResolvedCapabilities) -> Self {
+        Self {
+            held,
+            front: PackageFrontEnd::cold(held.sources()),
+            consented: ConsentedCapabilities::admitted(resolved),
+        }
+    }
+}
+
+/// Judge the release of `held` on a fresh front end over the modules it read.
+///
+/// # Errors
+/// As [`consent_on`].
+pub fn consent_to_capabilities(held: &HeldBuild) -> Result<JudgedRelease<'_>, CliError> {
+    consent_on(held, PackageFrontEnd::cold)
+}
+
+/// Resolve the program's capabilities once and pass them through every
+/// trust-boundary consent gate of `ipe release`.
+///
+/// The gates run in order: the `.Unsafe` acknowledgment, then the
+/// app-boundary web consent, then the app-boundary native-crossing consent.
+/// All three judge the SAME resolved value, and the value is released only
+/// once all three admit it.
+///
+/// `open` opens the front end over the modules `held` read, the ones the emit
+/// compiles; inference runs on it and every scan runs over the same read.
 ///
 /// # Errors
 /// The first gate refusal (`IPE-S0001` / `IPE-S0002` / `IPE-S0003`); the
 /// capability-resolution errors it composes.
-pub fn consent_to_capabilities(held: &HeldBuild) -> Result<ConsentedCapabilities, CliError> {
+pub fn consent_on(
+    held: &HeldBuild,
+    open: impl FnOnce(super::PackageSourceSet) -> PackageFrontEnd,
+) -> Result<JudgedRelease<'_>, CliError> {
     let manifest = held.root().manifest();
-    let resolved = run_sandbox::resolve_for_run(manifest, &held.sources())?;
+    let front = open(held.sources());
+    let resolved = run_sandbox::resolve_for_run(manifest, &front)?;
     acknowledge_unsafe_imports(&resolved, manifest, held)?;
     gate_web_consent(&resolved, manifest, held)?;
     gate_native_ffi_consent(&resolved, manifest, held)?;
-    Ok(ConsentedCapabilities { resolved })
+    Ok(JudgedRelease {
+        held,
+        front,
+        consented: ConsentedCapabilities { resolved },
+    })
 }
 
 /// The acknowledgment gate for `Ipe.<M>.Unsafe` escape-hatch imports.
@@ -4767,11 +4836,11 @@ mod capability_resolution_once_tests {
 
     #[test]
     fn capability_resolution_has_one_consent_site() {
-        // `consent_to_capabilities` (release) is the one resolution site;
+        // `consent_on` (release) is the one resolution site;
         // `ipe capabilities` is the inspection form.
         assert_eq!(SOURCE.matches(RESOLVE_CALL).count(), 1);
         assert_eq!(SOURCE.matches(INFER_CALL).count(), 0);
-        let site = "consent_to_capabilities";
+        let site = "consent_on";
         let body = fn_body(site);
         assert!(body.is_some(), "{site} is defined in this module");
         let Some(body) = body else { return };

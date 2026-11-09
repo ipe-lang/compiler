@@ -329,9 +329,9 @@ mod nullary_union_tests {
 mod driver;
 
 pub use driver::{
-    AdvisoryVulnerablePayload, BuildOptions, CliError, INSTALL_SH_URL, PackageSourceSet,
-    RuntimeContext, UPGRADE_TAG_FILE_ENV, UPGRADE_WRAPPED_ENV, apply_fixes, bluegreen_enabled,
-    build, build_loose_file, build_loose_file_with_options, build_project,
+    AdvisoryVulnerablePayload, BuildOptions, CliError, INSTALL_SH_URL, PackageFrontEnd,
+    PackageSourceSet, RuntimeContext, UPGRADE_TAG_FILE_ENV, UPGRADE_WRAPPED_ENV, apply_fixes,
+    bluegreen_enabled, build, build_loose_file, build_loose_file_with_options, build_project,
     build_project_with_options, build_with_options, code_index, compile_prepared,
     create_source_root, emit_ir_text, explain_lookup, front_check, hot_appearance_enabled,
     infer_package_capabilities, infer_package_capabilities_in, resolve_runtime, run_cli,
