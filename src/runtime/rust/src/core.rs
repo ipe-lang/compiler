@@ -1196,12 +1196,14 @@ pub enum RuntimeTrip {
         kernel: CeilingKernel,
     },
     /// An `Ipe.Time` kernel met an argument outside its calendar domain.
+    ///
+    /// Each kernel refuses by exactly one rule ([`TimeOp::cause`]), so the
+    /// rule is read from the kernel, never stored beside it: a kernel paired
+    /// with a rule it cannot break has no representation.
     #[non_exhaustive]
     TimeDomain {
         /// The kernel that refused the argument.
         op: TimeOp,
-        /// The calendar rule the argument broke.
-        cause: TimeDomainCause,
     },
 }
 
@@ -1240,6 +1242,21 @@ time_ops! {
     FormatRfc3339,
 }
 
+impl TimeOp {
+    /// The one calendar rule this kernel refuses an argument by.
+    #[must_use]
+    pub const fn cause(self) -> TimeDomainCause {
+        match self {
+            Self::DaysInMonth => TimeDomainCause::MonthOutsideYear,
+            Self::TimeString
+            | Self::Format
+            | Self::FormatHttp
+            | Self::FormatIso8601
+            | Self::FormatRfc3339 => TimeDomainCause::InstantOutsideCalendar,
+        }
+    }
+}
+
 /// The calendar rule a [`RuntimeTrip::TimeDomain`] argument broke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeDomainCause {
@@ -1250,9 +1267,34 @@ pub enum TimeDomainCause {
     InstantOutsideCalendar,
 }
 
+/// The text of [`TimeDomainCause::MonthOutsideYear`].
+macro_rules! month_rule {
+    () => {
+        "the month must be 1 to 12"
+    };
+}
+
+/// The text of [`TimeDomainCause::InstantOutsideCalendar`].
+macro_rules! instant_rule {
+    () => {
+        "the instant lies outside the calendar years `Ipe.Time` renders"
+    };
+}
+
+impl TimeDomainCause {
+    /// The rule as a refusal message states it.
+    #[must_use]
+    pub const fn rule(self) -> &'static str {
+        match self {
+            Self::MonthOutsideYear => month_rule!(),
+            Self::InstantOutsideCalendar => instant_rule!(),
+        }
+    }
+}
+
 /// The message of `Ipe.Time` kernel `$kernel` refusing an argument by `$rule`.
 macro_rules! time_domain_message {
-    ($kernel:literal, $rule:literal) => {
+    ($kernel:literal, $rule:expr) => {
         concat!("`", $kernel, "`: ", $rule)
     };
 }
@@ -1457,44 +1499,32 @@ impl RuntimeTrip {
                     output_ceiling_message!("String.pad", "16000000", "character")
                 }
             },
-            Self::TimeDomain { op, cause } => Self::time_domain_message(op, cause),
+            Self::TimeDomain { op } => Self::time_domain_message(op),
         }
     }
 
-    /// The message of an `Ipe.Time` kernel refusing an argument by a rule.
-    const fn time_domain_message(op: TimeOp, cause: TimeDomainCause) -> &'static str {
+    /// The message of an `Ipe.Time` kernel refusing an argument by its one
+    /// rule ([`TimeOp::cause`]).
+    const fn time_domain_message(op: TimeOp) -> &'static str {
         /// The month rule.
         macro_rules! month {
             ($kernel:literal) => {
-                time_domain_message!($kernel, "the month must be 1 to 12")
+                time_domain_message!($kernel, month_rule!())
             };
         }
         /// The calendar-range rule.
         macro_rules! instant {
             ($kernel:literal) => {
-                time_domain_message!(
-                    $kernel,
-                    "the instant lies outside the calendar years `Ipe.Time` renders"
-                )
+                time_domain_message!($kernel, instant_rule!())
             };
         }
-        match cause {
-            TimeDomainCause::MonthOutsideYear => match op {
-                TimeOp::DaysInMonth => month!("Time.daysInMonth"),
-                TimeOp::TimeString => month!("Time.timeString"),
-                TimeOp::Format => month!("Time.format"),
-                TimeOp::FormatHttp => month!("Time.formatHTTP"),
-                TimeOp::FormatIso8601 => month!("Time.formatISO8601"),
-                TimeOp::FormatRfc3339 => month!("Time.formatRFC3339"),
-            },
-            TimeDomainCause::InstantOutsideCalendar => match op {
-                TimeOp::DaysInMonth => instant!("Time.daysInMonth"),
-                TimeOp::TimeString => instant!("Time.timeString"),
-                TimeOp::Format => instant!("Time.format"),
-                TimeOp::FormatHttp => instant!("Time.formatHTTP"),
-                TimeOp::FormatIso8601 => instant!("Time.formatISO8601"),
-                TimeOp::FormatRfc3339 => instant!("Time.formatRFC3339"),
-            },
+        match op {
+            TimeOp::DaysInMonth => month!("Time.daysInMonth"),
+            TimeOp::TimeString => instant!("Time.timeString"),
+            TimeOp::Format => instant!("Time.format"),
+            TimeOp::FormatHttp => instant!("Time.formatHTTP"),
+            TimeOp::FormatIso8601 => instant!("Time.formatISO8601"),
+            TimeOp::FormatRfc3339 => instant!("Time.formatRFC3339"),
         }
     }
 
@@ -2159,49 +2189,47 @@ mod tests {
         Ok(())
     }
 
-    // A calendar trip names its kernel and the rule, never the argument, and
-    // converts to `InvalidInput` at every boundary.
+    // A calendar trip names its kernel and the kernel's one rule, never the
+    // argument, and converts to `InvalidInput` at every boundary.
     #[test]
     fn time_domain_trips_are_typed_invalid_input() -> Result<(), String> {
-        let causes = [
-            (
-                TimeDomainCause::MonthOutsideYear,
-                "the month must be 1 to 12",
-            ),
-            (
-                TimeDomainCause::InstantOutsideCalendar,
-                "the instant lies outside the calendar years `Ipe.Time` renders",
-            ),
-        ];
+        let month = "the month must be 1 to 12";
+        let instant = "the instant lies outside the calendar years `Ipe.Time` renders";
+        if TimeDomainCause::MonthOutsideYear.rule() != month
+            || TimeDomainCause::InstantOutsideCalendar.rule() != instant
+        {
+            return Err("each calendar rule states its own text".to_owned());
+        }
         for op in TimeOp::ALL {
-            let kernel = match op {
-                TimeOp::DaysInMonth => "`Time.daysInMonth`",
-                TimeOp::TimeString => "`Time.timeString`",
-                TimeOp::Format => "`Time.format`",
-                TimeOp::FormatHttp => "`Time.formatHTTP`",
-                TimeOp::FormatIso8601 => "`Time.formatISO8601`",
-                TimeOp::FormatRfc3339 => "`Time.formatRFC3339`",
+            let (kernel, rule) = match op {
+                TimeOp::DaysInMonth => ("`Time.daysInMonth`", month),
+                TimeOp::TimeString => ("`Time.timeString`", instant),
+                TimeOp::Format => ("`Time.format`", instant),
+                TimeOp::FormatHttp => ("`Time.formatHTTP`", instant),
+                TimeOp::FormatIso8601 => ("`Time.formatISO8601`", instant),
+                TimeOp::FormatRfc3339 => ("`Time.formatRFC3339`", instant),
             };
-            for (cause, rule) in causes {
-                let fault = RuntimeTrip::TimeDomain { op, cause };
-                let message = format!("{kernel}: {rule}");
-                if fault.label() != "TimeDomain" || fault.message() != message {
-                    return Err(format!("{op:?}: {:?} is not {message:?}", fault.message()));
-                }
-                let crate::IpeError::Error(kind, _) = fault.to_ipe_error();
-                if kind != crate::IpeErrorKind::InvalidInput {
-                    return Err(format!("{op:?}: a calendar trip converts to InvalidInput"));
-                }
-                for boundary in [
-                    UnwindBoundary::Foreign("foreign call panicked"),
-                    UnwindBoundary::Task("async task panicked"),
-                ] {
-                    let payload: Box<dyn std::any::Any + Send> = Box::new(fault);
-                    if ipe_error_from_unwind::<crate::IpeError>(boundary, payload)
-                        != fault.to_ipe_error()
-                    {
-                        return Err(format!("{op:?}: a calendar trip keeps its kind"));
-                    }
+            if op.cause().rule() != rule {
+                return Err(format!("{op:?} refuses by {:?}, not {rule:?}", op.cause()));
+            }
+            let fault = RuntimeTrip::TimeDomain { op };
+            let message = format!("{kernel}: {rule}");
+            if fault.label() != "TimeDomain" || fault.message() != message {
+                return Err(format!("{op:?}: {:?} is not {message:?}", fault.message()));
+            }
+            let crate::IpeError::Error(kind, _) = fault.to_ipe_error();
+            if kind != crate::IpeErrorKind::InvalidInput {
+                return Err(format!("{op:?}: a calendar trip converts to InvalidInput"));
+            }
+            for boundary in [
+                UnwindBoundary::Foreign("foreign call panicked"),
+                UnwindBoundary::Task("async task panicked"),
+            ] {
+                let payload: Box<dyn std::any::Any + Send> = Box::new(fault);
+                if ipe_error_from_unwind::<crate::IpeError>(boundary, payload)
+                    != fault.to_ipe_error()
+                {
+                    return Err(format!("{op:?}: a calendar trip keeps its kind"));
                 }
             }
         }

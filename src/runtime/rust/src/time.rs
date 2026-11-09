@@ -119,7 +119,7 @@ pub fn time_unix_millis<E: 'static>(_: ()) -> IpeTask<E, i64> {
 //
 // Every kernel below returns the exact answer or trips a typed `TimeDomain`
 // naming itself: no sentinel `0`, `false`, or `""` stands in for a refusal.
-use crate::core::{RuntimeTrip, TimeDomainCause, TimeOp, trip};
+use crate::core::{RuntimeTrip, TimeOp, trip};
 use chrono::format::{Fixed, Item, Numeric, Pad};
 use chrono::{DateTime, TimeZone, Utc};
 
@@ -128,12 +128,9 @@ use chrono::{DateTime, TimeZone, Utc};
 /// The formatters render years `-262143` to `262142` (chrono's calendar); an
 /// instant outside them has no rendering.
 fn calendar_instant(ms: i64, op: TimeOp) -> DateTime<Utc> {
-    Utc.timestamp_millis_opt(ms).single().unwrap_or_else(|| {
-        trip(RuntimeTrip::TimeDomain {
-            op,
-            cause: TimeDomainCause::InstantOutsideCalendar,
-        })
-    })
+    Utc.timestamp_millis_opt(ms)
+        .single()
+        .unwrap_or_else(|| trip(RuntimeTrip::TimeDomain { op }))
 }
 
 /// `Time.timeString : Int -> String` — the UTC wall-clock time as `HH:MM:SS`.
@@ -261,30 +258,58 @@ impl<'a> LayoutPiece<'a> {
     }
 }
 
-/// Parses a `Time.format` layout once, left to right, taking the longest
-/// token at each position; every other character is literal text.
-fn parse_layout(layout: &str) -> Vec<LayoutPiece<'_>> {
-    let mut pieces = Vec::new();
-    let mut literal_from = layout;
-    let mut rest = layout;
-    loop {
-        let token = LayoutToken::longest_prefix(rest);
-        if (token.is_some() || rest.is_empty())
-            && let Some(literal) = literal_from.strip_suffix(rest).filter(|l| !l.is_empty())
-        {
-            pieces.push(LayoutPiece::Literal(literal));
+/// A `Time.format` layout parsed left to right, taking the longest token at
+/// each position; every other character is literal text.
+///
+/// Lazy and linear in the layout: each step consumes a token or one
+/// character, a literal run is sliced once by its byte length, and no piece is
+/// buffered, so rendering holds no allocation proportional to the layout.
+#[derive(Debug, Clone)]
+struct LayoutPieces<'a> {
+    /// The layout text not yet parsed.
+    rest: &'a str,
+    /// A token parsed together with the literal run before it, owed next.
+    owed: Option<LayoutToken>,
+}
+
+impl<'a> Iterator for LayoutPieces<'a> {
+    type Item = LayoutPiece<'a>;
+
+    fn next(&mut self) -> Option<LayoutPiece<'a>> {
+        if let Some(token) = self.owed.take() {
+            return Some(LayoutPiece::Token(token));
         }
-        if let Some((token, after)) = token {
-            pieces.push(LayoutPiece::Token(token));
-            rest = after;
-            literal_from = rest;
-        } else {
-            let mut chars = rest.chars();
-            if chars.next().is_none() {
-                return pieces;
+        let start = self.rest;
+        // The literal run is the first `literal_len` bytes of `start`, a
+        // prefix ending on a character boundary.
+        let mut literal_len = 0;
+        loop {
+            let literal = start.get(..literal_len).filter(|text| !text.is_empty());
+            if let Some((token, after)) = LayoutToken::longest_prefix(self.rest) {
+                self.rest = after;
+                return Some(match literal {
+                    Some(text) => {
+                        self.owed = Some(token);
+                        LayoutPiece::Literal(text)
+                    }
+                    None => LayoutPiece::Token(token),
+                });
             }
-            rest = chars.as_str();
+            let mut chars = self.rest.chars();
+            let Some(ch) = chars.next() else {
+                return literal.map(LayoutPiece::Literal);
+            };
+            literal_len += ch.len_utf8();
+            self.rest = chars.as_str();
         }
+    }
+}
+
+/// Parses a `Time.format` layout once into its pieces.
+const fn parse_layout(layout: &str) -> LayoutPieces<'_> {
+    LayoutPieces {
+        rest: layout,
+        owed: None,
     }
 }
 
@@ -297,12 +322,10 @@ fn parse_layout(layout: &str) -> Vec<LayoutPiece<'_>> {
 #[must_use]
 pub fn time_format(layout: String, ms: i64) -> String {
     let instant = calendar_instant(ms, TimeOp::Format);
-    let items: Vec<Item<'_>> = parse_layout(&layout)
-        .into_iter()
-        .map(LayoutPiece::item)
-        .collect();
     // Every item names a field a UTC `DateTime` carries, so the render is total.
-    instant.format_with_items(items.iter()).to_string()
+    instant
+        .format_with_items(parse_layout(&layout).map(LayoutPiece::item))
+        .to_string()
 }
 
 /// `Time.formatHTTP : Int -> String` — the HTTP-date (RFC 7231) rendering,
@@ -411,7 +434,6 @@ pub fn time_days_in_month(year: i64, month: i64) -> i64 {
         || {
             trip(RuntimeTrip::TimeDomain {
                 op: TimeOp::DaysInMonth,
-                cause: TimeDomainCause::MonthOutsideYear,
             })
         },
         |month| i64::from(month.days(time_is_leap_year(year))),
@@ -550,17 +572,47 @@ mod kernel_tests {
 mod layout_tests {
     use super::{LayoutPiece, LayoutToken, parse_layout, time_format};
 
+    /// Every piece of `layout`, in order.
+    fn pieces(layout: &str) -> Vec<LayoutPiece<'_>> {
+        parse_layout(layout).collect()
+    }
+
+    /// Parsing is linear in the layout: a layout of a million tokens parses in
+    /// well under the time a rescan of the rest per token would take.
+    #[test]
+    fn a_long_layout_parses_in_linear_time() {
+        const TOKENS: usize = 1 << 20;
+        let layout = "2006".repeat(TOKENS);
+        let started = std::time::Instant::now();
+        assert_eq!(parse_layout(&layout).count(), TOKENS);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "{TOKENS} tokens took {elapsed:?}"
+        );
+        let mixed = "x2006".repeat(TOKENS);
+        assert_eq!(parse_layout(&mixed).count(), 2 * TOKENS);
+    }
+
     #[test]
     fn literal_text_is_never_a_token() {
         assert_eq!(
-            parse_layout("Monday"),
+            pieces("Monday"),
             [
                 LayoutPiece::Token(LayoutToken::WeekdayName),
                 LayoutPiece::Literal("day")
             ]
         );
-        assert_eq!(parse_layout("%Y"), [LayoutPiece::Literal("%Y")]);
-        assert_eq!(parse_layout(""), []);
+        assert_eq!(pieces("%Y"), [LayoutPiece::Literal("%Y")]);
+        assert_eq!(pieces(""), []);
+        assert_eq!(
+            pieces("a2006b"),
+            [
+                LayoutPiece::Literal("a"),
+                LayoutPiece::Token(LayoutToken::Year),
+                LayoutPiece::Literal("b")
+            ]
+        );
         // A `%` is literal text, never a strftime directive.
         assert_eq!(time_format("%Y %m".to_owned(), 0), "%Y %m");
         assert_eq!(time_format("at 2006!".to_owned(), 0), "at 1970!");
@@ -572,14 +624,14 @@ mod layout_tests {
     #[test]
     fn the_longest_token_wins() {
         assert_eq!(
-            parse_layout("05.000000"),
+            pieces("05.000000"),
             [
                 LayoutPiece::Token(LayoutToken::Second),
                 LayoutPiece::Token(LayoutToken::Micros)
             ]
         );
         assert_eq!(
-            parse_layout("é.0000"),
+            pieces("é.0000"),
             [
                 LayoutPiece::Literal("é"),
                 LayoutPiece::Token(LayoutToken::Millis),
@@ -606,9 +658,9 @@ mod calendar_tests {
             .and_then(|payload| runtime_trip(payload.as_ref()))
     }
 
-    /// Whether `trip` is kernel `op` refusing by `cause`.
+    /// Whether `trip` is kernel `op` refusing by `cause`, its one rule.
     fn is_domain(trip: Option<RuntimeTrip>, op: TimeOp, cause: TimeDomainCause) -> bool {
-        trip == Some(RuntimeTrip::TimeDomain { op, cause })
+        op.cause() == cause && trip == Some(RuntimeTrip::TimeDomain { op })
     }
 
     #[test]

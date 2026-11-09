@@ -224,20 +224,26 @@ fn each_spelling_of_a_raw_process_end_is_refused() -> Result<(), String> {
 const TRIP_NAMES: &[&str] = &["RuntimeTrip", "panic_any"];
 
 /// The spellings of a trip in emitted text (a string literal the backend
-/// writes out).
-const TRIP_TEXT: &[&str] = &["RuntimeTrip", "panic_any", "core::trip"];
+/// writes out), compared with whitespace removed: a type or raise fn named
+/// through any path (`core::trip`, the root re-export `ipe_runtime::trip`) or
+/// a grouped import (`core::{trip}`, `{RuntimeTrip, trip}`).
+const TRIP_TEXT: &[&str] = &["RuntimeTrip", "panic_any", "::trip", "{trip", ",trip"];
 
 /// Each trip-raising site in one Rust source: a [`TRIP_NAMES`] identifier, a
-/// `core::trip` path, or a string literal spelling one.
+/// `trip` named through a path or a grouped `use`, or a string literal
+/// spelling one.
 ///
 /// A `#[doc]` attribute is prose, never emitted, so it is skipped.
 fn trip_sites(src: &str) -> Result<Vec<String>, String> {
     let stream: TokenStream = src.parse().map_err(|e| format!("does not lex: {e}"))?;
     let mut sites = Vec::new();
-    let mut pending = vec![stream];
-    while let Some(stream) = pending.pop() {
+    // Each stream, with whether it is a `{..}` group opened right after `::`
+    // (a grouped import, whose names are path segments).
+    let mut pending = vec![(stream, false)];
+    while let Some((stream, path_group)) = pending.pop() {
         let mut path: Vec<String> = Vec::new();
         for tok in stream {
+            let after_colons = path.ends_with(&[":", ":"].map(String::from));
             match tok {
                 TokenTree::Group(g) => {
                     let is_doc = g.delimiter() == proc_macro2::Delimiter::Bracket
@@ -246,22 +252,28 @@ fn trip_sites(src: &str) -> Result<Vec<String>, String> {
                             .next()
                             .is_some_and(|first| first.to_string() == "doc");
                     if !is_doc {
-                        pending.push(g.stream());
+                        let grouped_use =
+                            g.delimiter() == proc_macro2::Delimiter::Brace && after_colons;
+                        pending.push((g.stream(), grouped_use));
                     }
                     path.clear();
                 }
                 TokenTree::Ident(id) => {
                     let spelled = id.to_string();
                     let name = spelled.strip_prefix("r#").unwrap_or(&spelled).to_owned();
-                    let core_path = path.ends_with(&["core", ":", ":"].map(String::from));
-                    if TRIP_NAMES.contains(&name.as_str()) || (name == "trip" && core_path) {
+                    let named_trip = name == "trip" && (after_colons || path_group);
+                    if TRIP_NAMES.contains(&name.as_str()) || named_trip {
                         sites.push(name.clone());
                     }
                     path.push(name);
                 }
                 TokenTree::Punct(p) => path.push(p.as_char().to_string()),
                 TokenTree::Literal(lit) => {
-                    let text = lit.to_string();
+                    let text: String = lit
+                        .to_string()
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .collect();
                     sites.extend(
                         TRIP_TEXT
                             .iter()
@@ -340,8 +352,22 @@ fn emitted_code_never_constructs_a_runtime_trip() -> Result<(), String> {
 /// Each spelling of a forged trip is refused; a doc mention is not.
 #[test]
 fn each_spelling_of_a_forged_trip_is_refused() -> Result<(), String> {
-    let cases: [(&str, &[&str]); 5] = [
+    let cases: [(&str, &[&str]); 10] = [
         ("fn f() { ipe_runtime::core::trip(x); }", &["trip"]),
+        ("fn f() { crate::ipe_runtime::trip(x); }", &["trip"]),
+        ("use ipe_runtime::core::{trip as t};", &["trip"]),
+        (
+            "fn f() { out.push_str(\"ipe_runtime :: trip(f)\"); }",
+            &["::trip"],
+        ),
+        (
+            "fn f() { out.push_str(\"use ipe_runtime::core::{ trip };\"); }",
+            &["{trip"],
+        ),
+        (
+            "fn f() { out.push_str(\"use ipe_runtime::core::{runtime_trip, trip};\"); }",
+            &[",trip"],
+        ),
         (
             "fn f() { let _ = RuntimeTrip::RecursionLimit {}; }",
             &["RuntimeTrip"],
@@ -349,7 +375,7 @@ fn each_spelling_of_a_forged_trip_is_refused() -> Result<(), String> {
         ("fn f() { std::panic::panic_any(1); }", &["panic_any"]),
         (
             "fn f() { out.push_str(\"ipe_runtime::core::trip(f)\"); }",
-            &["core::trip"],
+            &["::trip"],
         ),
         ("fn f() { quote!(r#RuntimeTrip); }", &["RuntimeTrip"]),
     ];
