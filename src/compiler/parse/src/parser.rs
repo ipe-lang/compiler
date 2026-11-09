@@ -1714,12 +1714,9 @@ impl<'a> Parser<'a> {
             Tok::Float(f) => Ok(Located::new(span, Expr_::Float(f))),
             // String payloads move directly into the AST node — no secondary copy.
             Tok::Str(s) => Ok(Located::new(span, Expr_::Str(s))),
-            // Triple-quoted strings carry raw content; the canonicaliser desugars
-            // `{{expr}}` interpolation at name-resolution time. Mirrors the reference compiler
-            // parser's `MultiLine str -> return (Src.MultilineStr str)` arm.
-            Tok::TripleStr { raw, anchor } => {
-                Ok(Located::new(span, Expr_::MultilineStr { raw, anchor }))
-            }
+            // A triple-quoted string carries its judged form; the canonicaliser
+            // desugars `{{expr}}` interpolation in its value at name-resolution time.
+            Tok::TripleStr(string) => Ok(Located::new(span, Expr_::MultilineStr(string))),
             Tok::Char(c) => Ok(Located::new(span, Expr_::Char(c))),
             Tok::Minus => self.parse_negative_literal(span, threshold, depth),
             Tok::Ident(text) => {
@@ -3012,12 +3009,11 @@ impl<'a> Parser<'a> {
                 Pattern_::PInt(int_value(*n, Sign::Plus, tok.span)?),
             )),
             Tok::Str(s) => Ok(Located::new(tok.span, Pattern_::PStr(s.clone()))),
-            // A triple-quoted string in pattern position matches the same
-            // margin-stripped value its expression form produces, so the strip
-            // is applied here too (patterns carry no interpolation to desugar).
-            Tok::TripleStr { raw, anchor } => Ok(Located::new(
+            // A triple-quoted string in pattern position matches the same value
+            // its expression form produces (patterns carry no interpolation).
+            Tok::TripleStr(string) => Ok(Located::new(
                 tok.span,
-                Pattern_::PStr(ipe_syntax::strip_anchor_margin(raw, *anchor)),
+                Pattern_::PStr(string.value().into_owned()),
             )),
             Tok::Char(c) => Ok(Located::new(tok.span, Pattern_::PChar(c.clone()))),
             // A negative integer literal pattern `-3`. The digit must be

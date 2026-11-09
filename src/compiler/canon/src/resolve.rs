@@ -5894,9 +5894,8 @@ fn canonicalise_expr(e: &src::Expr, env: &Env, cx: &mut ResolveCx<'_>) -> DResul
         src::Expr_::Float(f) => canon::Expr_::Float(*f),
         src::Expr_::Str(s) => canon::Expr_::Str(s.clone()),
         // Triple-quoted strings: desugar `{{expr}}` interpolation into a `++`
-        // chain at canonicalise time. Mirrors `Ipe.Canonicalise.Expression.hs`
-        // line 42 (`Src.MultilineStr s -> desugarMultiline env s`).
-        src::Expr_::MultilineStr { raw, anchor } => desugar_multiline(raw, *anchor, span, env, cx)?,
+        // chain at canonicalise time.
+        src::Expr_::MultilineStr(string) => desugar_multiline(string, span, env, cx)?,
         src::Expr_::Char(c) => canon::Expr_::Char(c.clone()),
         src::Expr_::Unit => canon::Expr_::Unit,
         src::Expr_::VarLocal(name) => resolve_var(*name, span, env, cx)?,
@@ -8775,110 +8774,51 @@ const fn name_zero() -> Symbol {
 
 // ── Triple-quoted string interpolation desugar ────────────────────────────────
 //
-// Faithful Rust port of `Ipe.Canonicalise.Expression.desugarMultiline` /
-// `splitInterpolation` / `chunkToExpr` / `resolveInterpolationRef`.
-//
-// Entry point: `desugar_multiline(raw, span, env, cx)` — called from
-// `canonicalise_expr` when it sees `src::Expr_::MultilineStr`.
-//
-// The raw string is split into alternating `Lit` / `Interp` chunks, each
-// expression chunk is wrapped in the internal `Interpolate` renderer, and the
-// whole list is joined into a balanced `++` (String.append) binop tree.
+// `desugar_multiline` splits a `"""` string's value at its `{{expr}}` markers
+// (`ipe_syntax::interpolation_pieces`), wraps each expression piece in the
+// internal `Interpolate` renderer, and joins the pieces into a balanced `++`
+// (String.append) binop tree. Every piece and every name in it carries the
+// source span its value bytes map back to through the string's form.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A parsed chunk from a triple-quoted string.
-enum Chunk {
-    /// A literal string segment (no interpolation).
-    Lit(String),
-    /// An interpolation body — the raw text between `{{` and `}}`.
-    Interp(String),
+/// Where the value bytes of one `"""` string stand in source.
+#[derive(Clone, Copy)]
+struct ValueSpans<'a> {
+    string: &'a src::TripleStr,
+    /// The whole string's span, for a range that maps to no source bytes.
+    whole: Span,
 }
 
-/// Split a raw triple-quoted string body into alternating literal / expression
-/// chunks. Direct Rust port of `Ipe.Canonicalise.Expression.splitInterpolation`.
-///
-/// Escape grammar (spec from upstream `splitInterpolation` comments):
-///   `\{{`  → literal `{{`  (no interpolation consumed)
-///   `\\`   → literal `\`
-///   `\X`   → literal `\X` for any other `X` (verbatim pass-through)
-/// An unclosed `{{` (no matching `}}`) is treated as literal content.
-fn split_interpolation(raw: &str) -> Vec<Chunk> {
-    let chars: Vec<char> = raw.chars().collect();
-    let mut result: Vec<Chunk> = Vec::new();
-    let mut acc = String::new();
-    let mut i = 0;
-    while let Some(&c0) = chars.get(i) {
-        let c1 = chars.get(i + 1).copied();
-        let c2 = chars.get(i + 2).copied();
-        match (c0, c1, c2) {
-            // `\{{` → emit literal `{{`, skip 3 chars.
-            ('\\', Some('{'), Some('{')) => {
-                acc.push_str("{{");
-                i += 3;
-            }
-            // `\\` → emit literal `\`, skip 2 chars.
-            ('\\', Some('\\'), _) => {
-                acc.push('\\');
-                i += 2;
-            }
-            // `{{` → start an interpolation. Flush accumulated literal first.
-            ('{', Some('{'), _) => {
-                if !acc.is_empty() {
-                    result.push(Chunk::Lit(std::mem::take(&mut acc)));
-                }
-                i += 2;
-                // Collect the body up to the matching `}}`.
-                let mut body = String::new();
-                let mut closed = false;
-                while let Some(&bc) = chars.get(i) {
-                    if bc == '}' && chars.get(i + 1).copied() == Some('}') {
-                        i += 2;
-                        closed = true;
-                        break;
-                    }
-                    body.push(bc);
-                    i += 1;
-                }
-                if closed {
-                    result.push(Chunk::Interp(body));
-                } else {
-                    // Unclosed `{{` — treat entire `{{body` as literal content.
-                    acc.push_str("{{");
-                    acc.push_str(&body);
-                }
-            }
-            // Any other character — copy verbatim.
-            _ => {
-                acc.push(c0);
-                i += 1;
-            }
-        }
+impl ValueSpans<'_> {
+    /// The source span of the value bytes `range`.
+    fn of(self, range: std::ops::Range<usize>) -> Span {
+        self.string.source_span(range).unwrap_or(self.whole)
     }
-    if !acc.is_empty() {
-        result.push(Chunk::Lit(acc));
-    }
-    result
 }
 
-/// Convert a `Chunk` to a canonical expression.
-/// Port of `Ipe.Canonicalise.Expression.chunkToExpr`.
+/// Convert one interpolation piece of `value` to a canonical expression.
 ///
-/// `Lit` → `Expr_::Str`.
-/// `Interp` → resolve the body as a simple ref, then wrap in the internal
-/// `Interpolate` renderer (no surface binding — only `{{…}}` reaches it).
-fn chunk_to_expr(
-    chunk: Chunk,
-    span: Span,
+/// Text becomes `Expr_::Str`; an `{{expr}}` body is resolved as a simple
+/// reference and wrapped in the internal `Interpolate` renderer (no surface
+/// binding — only `{{…}}` reaches it).
+fn piece_to_expr(
+    piece: src::Piece,
+    value: &str,
+    spans: ValueSpans<'_>,
     env: &Env,
     cx: &mut ResolveCx<'_>,
 ) -> DResult<canon::Expr> {
-    match chunk {
-        Chunk::Lit(s) => Ok(Located::new(span, canon::Expr_::Str(s))),
-        Chunk::Interp(body) => {
-            // Trim leading/trailing whitespace, matching the reference compiler
-            // `dropWhile (== ' ') (reverse (dropWhile …))`.
+    match piece {
+        src::Piece::Text { text, range } => {
+            Ok(Located::new(spans.of(range), canon::Expr_::Str(text)))
+        }
+        src::Piece::Interp { range } => {
+            let span = spans.of(range.clone());
+            let body = value.get(range.clone()).unwrap_or_default();
+            let lead = body.len().saturating_sub(body.trim_start().len());
             let trimmed = body.trim();
-            let resolved = resolve_interp_ref(trimmed, span, env, cx)?;
+            let resolved =
+                resolve_interp_ref(trimmed, range.start.saturating_add(lead), spans, env, cx)?;
             let mod_sym = cx.interner.intern("_internal_")?;
             let fn_sym = cx.interner.intern("interpolate")?;
             let stringify = Located::new(
@@ -8897,8 +8837,8 @@ fn chunk_to_expr(
     }
 }
 
-/// Resolve a simple interpolation reference.
-/// Port of `Ipe.Canonicalise.Expression.resolveInterpolationRef`.
+/// Resolve a simple interpolation reference `s`, which starts at value byte
+/// `at` of its string.
 ///
 /// Handles four shapes:
 ///   `foo`          — bare identifier → local var (or kernel if in scope)
@@ -8910,24 +8850,29 @@ fn chunk_to_expr(
 /// to the developer that only simple expressions are interpolable).
 fn resolve_interp_ref(
     s: &str,
-    span: Span,
+    at: usize,
+    spans: ValueSpans<'_>,
     env: &Env,
     cx: &mut ResolveCx<'_>,
 ) -> DResult<canon::Expr> {
     // Check for `func arg` (a single space separates them).
     if let Some(space_pos) = s.find(' ') {
         let func_str = &s[..space_pos];
-        let arg_str = s[space_pos + 1..].trim();
+        let after = &s[space_pos + 1..];
+        let arg_str = after.trim();
         if !func_str.is_empty() && !arg_str.is_empty() {
-            let func_expr = resolve_interp_ref(func_str, span, env, cx)?;
-            let arg_expr = resolve_interp_ref(arg_str, span, env, cx)?;
+            let arg_at = at
+                .saturating_add(space_pos + 1)
+                .saturating_add(after.len() - after.trim_start().len());
+            let func_expr = resolve_interp_ref(func_str, at, spans, env, cx)?;
+            let arg_expr = resolve_interp_ref(arg_str, arg_at, spans, env, cx)?;
             return Ok(Located::new(
-                span,
+                spans.of(at..at.saturating_add(s.len())),
                 canon::Expr_::Call(Box::new(func_expr), vec![arg_expr]),
             ));
         }
     }
-    resolve_simple_interp_ref(s, span, env, cx)
+    resolve_simple_interp_ref(s, at, spans, env, cx)
 }
 
 /// Resolve a qualified interpolation reference `Q.member` (`Q` may be dotted).
@@ -8977,14 +8922,16 @@ fn resolve_interp_qualified(
     ))
 }
 
-/// Inner resolver for an interpolation reference without a space (no call form).
-/// Port of `resolveSimpleRef` inside `resolveInterpolationRef`.
+/// Inner resolver for an interpolation reference without a space (no call
+/// form), starting at value byte `at` of its string.
 fn resolve_simple_interp_ref(
     s: &str,
-    span: Span,
+    at: usize,
+    spans: ValueSpans<'_>,
     env: &Env,
     cx: &mut ResolveCx<'_>,
 ) -> DResult<canon::Expr> {
+    let span = spans.of(at..at.saturating_add(s.len()));
     // Numeric literal. A body that begins with an ASCII digit can never be an
     // identifier (Ipê identifiers never start with a digit), so it is an
     // integer or float literal — NOT a local reference. Emitting `VarLocal`
@@ -9038,10 +8985,11 @@ fn resolve_simple_interp_ref(
         // IPE-N0001.
         let rec_sym = cx.interner.intern(first)?;
         let field_sym = cx.interner.intern(rest)?;
-        let record = resolve_var(rec_sym, span, env, cx)?;
+        let record_span = spans.of(at..at.saturating_add(dot_pos));
+        let record = resolve_var(rec_sym, record_span, env, cx)?;
         return Ok(Located::new(
             span,
-            canon::Expr_::Access(Box::new(Located::new(span, record)), field_sym),
+            canon::Expr_::Access(Box::new(Located::new(record_span, record)), field_sym),
         ));
     }
     // Bare identifier — resolve through the one canonical bare-name path
@@ -9056,36 +9004,30 @@ fn resolve_simple_interp_ref(
     Ok(Located::new(span, resolve_var(sym, span, env, cx)?))
 }
 
-/// Desugar a triple-quoted string into a balanced `++` tree of its chunks.
-/// Entry point from `canonicalise_expr`. Port of
-/// `Ipe.Canonicalise.Expression.desugarMultiline`.
+/// Desugar a triple-quoted string into a balanced `++` tree of its pieces.
+/// Entry point from `canonicalise_expr`.
 fn desugar_multiline(
-    raw: &str,
-    anchor: u32,
+    string: &src::TripleStr,
     span: Span,
     env: &Env,
     cx: &mut ResolveCx<'_>,
 ) -> DResult<canon::Expr_> {
-    // Strip the source indentation margin before splitting, so the runtime
-    // value drops the leading whitespace the author used to lay the block out.
-    // The strip removes only leading whitespace (never a `{{`/`}}` marker or its
-    // body), so every interpolation expression is extracted from the same text
-    // it would have been without a margin — sub-spans and the node span are
-    // unchanged.
-    let stripped = src::strip_anchor_margin(raw, anchor);
-    let chunks = split_interpolation(&stripped);
-    // Build one canonical expression per chunk.
-    // An interpolated name has no span of its own: every chunk carries the
-    // whole string's span, so a record there would answer the name at every
-    // offset of the string. Its occurrences resolve into a sink that is dropped.
+    let value = string.value();
+    let pieces = src::interpolation_pieces(&value);
+    let spans = ValueSpans {
+        string,
+        whole: span,
+    };
+    // Interpolated names resolve into a sink that is dropped: a name inside
+    // `{{…}}` is not recorded as an occurrence of its binding.
     let mut unlocated = NameSink::new();
     let mut chunk_cx = ResolveCx {
         interner: &mut *cx.interner,
         names: &mut unlocated,
     };
-    let mut parts: Vec<canon::Expr> = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        parts.push(chunk_to_expr(chunk, span, env, &mut chunk_cx)?);
+    let mut parts: Vec<canon::Expr> = Vec::with_capacity(pieces.len());
+    for piece in pieces {
+        parts.push(piece_to_expr(piece, &value, spans, env, &mut chunk_cx)?);
     }
     match parts.len() {
         0 => Ok(canon::Expr_::Str(String::new())),

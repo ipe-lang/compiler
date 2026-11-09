@@ -262,22 +262,21 @@ pub fn scan_identifier_words(src: &str) -> Option<std::collections::BTreeSet<Str
                     }
                 }
             }
-            lexer::Tok::TripleStr { raw, .. } => {
+            lexer::Tok::TripleStr(string) => {
                 // `{{expr}}` interpolation bodies are canonicalised as real
-                // expressions; collect their identifier-shaped words.
-                let mut rest = raw.as_str();
-                while let Some(open) = rest.find("{{") {
-                    let after = rest.get(open.saturating_add(2)..).unwrap_or("");
-                    let Some(close) = after.find("}}") else {
-                        break;
+                // expressions; collect their identifier-shaped words through
+                // the same splitter the canonicaliser reads them with.
+                let value = string.value();
+                for piece in ipe_syntax::interpolation_pieces(&value) {
+                    let ipe_syntax::Piece::Interp { range } = piece else {
+                        continue;
                     };
-                    let body = after.get(..close).unwrap_or("");
+                    let body = value.get(range).unwrap_or_default();
                     for word in body.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
                         if !word.is_empty() {
                             words.insert(word.to_owned());
                         }
                     }
-                    rest = after.get(close.saturating_add(2)..).unwrap_or("");
                 }
             }
             _ => {}
@@ -2994,134 +2993,145 @@ mod tests {
     // Reference: Ipe.Parse.String.findTripleClose (the compiler) — the closing
     // terminator is exactly `"""`, never a lone `"`.
 
+    /// The value of the one `"""` string `src` lexes to.
+    fn triple_value(src: &str) -> Option<String> {
+        match lexer::lex(src).ok()?.as_slice() {
+            [
+                lexer::Token {
+                    kind: lexer::Tok::TripleStr(string),
+                    ..
+                },
+            ] => Some(string.value().into_owned()),
+            _ => None,
+        }
+    }
+
+    /// The code and the source text of the refusal `src` lexes to.
+    fn triple_refusal(src: &str) -> Option<(String, &str)> {
+        use ipe_diagnostics::Diagnostic;
+        let Err(Diagnostic::Parse { span, msg }) = lexer::lex(src) else {
+            return None;
+        };
+        let refusal = Diagnostic::Parse { span, msg };
+        let text = src.get(span.lo as usize..span.hi as usize)?;
+        Some((refusal.code().as_str().to_owned(), text))
+    }
+
     /// A triple-quoted string containing a lone `"` must not terminate early.
-    /// This is the core 33-websocket-echo regression: inline HTML such as
-    /// `<div class="card">` caused a premature close on the `"` after `class=`,
-    /// making the rest lex as identifiers and triggering a misleading IPE-N0001.
+    /// Inline HTML such as `<div class="card">` must not close the string on
+    /// the `"` after `class=`.
     #[test]
     fn triple_string_lone_quote_does_not_terminate_early() {
-        use lexer::{Tok, lex};
-        // A triple-quoted string with an embedded `"` (HTML attribute value).
         let src = r#""""<div class="card"></div>""""#;
-        let toks = lex(src).expect("triple string with lone quote must lex");
-        assert_eq!(toks.len(), 1, "must produce exactly one token");
         assert_eq!(
-            toks.first().map(|t| t.kind.clone()),
-            Some(Tok::TripleStr {
-                raw: r#"<div class="card"></div>"#.to_owned(),
-                anchor: 4,
-            }),
-            "content including embedded quote is preserved verbatim"
+            triple_value(src).as_deref(),
+            Some(r#"<div class="card"></div>"#)
         );
     }
 
-    /// A triple-quoted string containing `""` (two consecutive quotes) must
-    /// also lex correctly — two quotes are literal, not a premature close.
+    /// Two consecutive quotes inside a `"""` string are content, not a close.
     #[test]
     fn triple_string_two_consecutive_quotes_are_literal() {
-        use lexer::{Tok, lex};
-        // `""` inside triple quotes is literal content, not an early close.
         let src = "\"\"\"before\"\"after\"\"\"";
-        let toks = lex(src).expect("triple string with double quote must lex");
-        assert_eq!(toks.len(), 1);
-        assert_eq!(
-            toks.first().map(|t| t.kind.clone()),
-            Some(Tok::TripleStr {
-                raw: "before\"\"after".to_owned(),
-                anchor: 4,
-            }),
-        );
+        assert_eq!(triple_value(src).as_deref(), Some("before\"\"after"));
     }
 
-    /// `{{interp}}` inside a triple-quoted string is preserved verbatim at the
-    /// lexer stage (interpolation is resolved downstream by the canonicaliser,
-    /// mirroring `findTripleClose` which performs no escape resolution).
+    /// `{{interp}}` inside a triple-quoted string is kept verbatim by the lexer;
+    /// the canonicaliser resolves it.
     #[test]
     fn triple_string_interpolation_braces_preserved_verbatim() {
-        use lexer::{Tok, lex};
         let src = "\"\"\"hello {{name}}!\"\"\"";
-        let toks = lex(src).expect("triple string with interpolation must lex");
-        assert_eq!(toks.len(), 1);
-        assert_eq!(
-            toks.first().map(|t| t.kind.clone()),
-            Some(Tok::TripleStr {
-                raw: "hello {{name}}!".to_owned(),
-                anchor: 4,
-            }),
-        );
+        assert_eq!(triple_value(src).as_deref(), Some("hello {{name}}!"));
     }
 
-    /// `\{{` (escaped open brace) inside a triple-quoted string is preserved
-    /// verbatim — the lexer does not resolve it; the canonicaliser does.
+    /// `\{{` inside a triple-quoted string is kept verbatim by the lexer.
     #[test]
     fn triple_string_escaped_brace_preserved_verbatim() {
-        use lexer::{Tok, lex};
         let src = r#""""price: \{{amount}}""""#;
-        let toks = lex(src).expect("triple string with escaped brace must lex");
-        assert_eq!(toks.len(), 1);
-        assert_eq!(
-            toks.first().map(|t| t.kind.clone()),
-            Some(Tok::TripleStr {
-                raw: r"price: \{{amount}}".to_owned(),
-                anchor: 4,
-            }),
-        );
+        assert_eq!(triple_value(src).as_deref(), Some(r"price: \{{amount}}"));
     }
 
-    /// `\\` inside a triple-quoted string is preserved verbatim (two backslashes
-    /// in the source → two backslashes in the token content; the canonicaliser
-    /// collapses them to one).
+    /// `\\` inside a triple-quoted string is kept verbatim by the lexer.
     #[test]
     fn triple_string_double_backslash_preserved_verbatim() {
-        use lexer::{Tok, lex};
         let src = "\"\"\"a\\\\b\"\"\"";
-        let toks = lex(src).expect("triple string with double backslash must lex");
-        assert_eq!(toks.len(), 1);
-        assert_eq!(
-            toks.first().map(|t| t.kind.clone()),
-            Some(Tok::TripleStr {
-                raw: "a\\\\b".to_owned(),
-                anchor: 4,
-            }),
-        );
+        assert_eq!(triple_value(src).as_deref(), Some("a\\\\b"));
     }
 
-    /// A multiline triple-quoted string spanning real newlines lexes correctly.
+    /// An indented block's value drops the margin, the opener's line break and
+    /// the line break before the closer.
     #[test]
-    fn triple_string_spanning_newlines_lexes() {
-        use lexer::{Tok, lex};
+    fn indented_block_lexes_to_its_margin_stripped_value() {
+        let src = "        \"\"\"\n        hello\n          world\n        \"\"\"";
+        assert_eq!(triple_value(src).as_deref(), Some("hello\n  world"));
+    }
+
+    /// Text after a block's opener is IPE-P0075 at that text.
+    #[test]
+    fn text_after_the_opener_is_p0075() {
         let src = "\"\"\"line one\nline two\nline three\"\"\"";
-        let toks = lex(src).expect("multiline triple string must lex");
-        assert_eq!(toks.len(), 1);
         assert_eq!(
-            toks.first().map(|t| t.kind.clone()),
-            Some(Tok::TripleStr {
-                raw: "line one\nline two\nline three".to_owned(),
-                anchor: 4,
-            }),
+            triple_refusal(src),
+            Some(("IPE-P0075".to_owned(), "line one"))
         );
     }
 
-    /// The anchor column A is the source column of the first non-newline content
-    /// character. For an indented block opened with `"""` immediately followed
-    /// by a newline, A is the indentation of the first content line — later
-    /// lines are stripped up to `A - 1` downstream in the canonicaliser.
+    /// A closer ending a content line is IPE-P0075 at the closer.
     #[test]
-    fn indented_triple_string_records_anchor_column() {
-        use lexer::{Tok, lex};
-        // The `"""` opens at column 9; a newline follows, then `hello` at column
-        // 9 of line 2 (eight leading spaces). The anchor is that column, 9.
+    fn closer_ending_a_content_line_is_p0075() {
         let src = "        \"\"\"\n        hello\n        world\"\"\"";
-        let toks = lex(src).expect("indented triple string must lex");
-        let kind = toks.first().map(|t| t.kind.clone());
         assert_eq!(
-            kind,
-            Some(Tok::TripleStr {
-                raw: "\n        hello\n        world".to_owned(),
-                anchor: 9,
-            }),
-            "raw body is verbatim; anchor is the first content column"
+            triple_refusal(src),
+            Some(("IPE-P0075".to_owned(), "\"\"\""))
         );
+    }
+
+    /// A body line left of the margin is IPE-P0076 through its first character.
+    #[test]
+    fn line_left_of_the_margin_is_p0076() {
+        let src = "    \"\"\"\n    a\n  b\n    \"\"\"";
+        assert_eq!(triple_refusal(src), Some(("IPE-P0076".to_owned(), "  b")));
+    }
+
+    /// A display hazard inside a malformed `"""` string outranks its shape:
+    /// the unclosed isolate is refused, not the text after the opener.
+    #[test]
+    fn display_hazard_precedes_the_shape_refusal() {
+        let src = "\"\"\"\u{2066}a\nb\"\"\"";
+        assert!(matches!(
+            triple_refusal(src),
+            Some((code, _)) if code == "IPE-P0072"
+        ));
+    }
+
+    /// A `"""` string refused for its shape is one closed region through its
+    /// closing `"""`, and the code after it is read as code.
+    #[test]
+    fn malformed_triple_string_is_one_closed_region() {
+        let src = "x = \"\"\"bad\n  y\n\"\"\" z";
+        let regions: Vec<_> = lexical_regions(src).collect();
+        let string = regions
+            .iter()
+            .find(|r| r.context == PositionContext::String);
+        assert!(
+            matches!(string, Some(r) if r.span == Span::new(4, 18) && !r.open_end),
+            "{regions:?}"
+        );
+        assert!(
+            regions
+                .last()
+                .is_some_and(|r| r.context == PositionContext::Code && r.span == Span::new(19, 20)),
+            "{regions:?}"
+        );
+    }
+
+    /// A block string in pattern position matches its block value.
+    #[test]
+    fn block_string_pattern_matches_its_value() {
+        let src = format!(
+            "{HDR}main =\n    case x of\n        \"\"\"\n        a\n        \"\"\" -> 1\n        _ -> 0\n"
+        );
+        assert_eq!(err_code(&src), "OK");
     }
 
     /// Locate the first `MultilineStr` node anywhere in an expression tree.
@@ -3232,16 +3242,7 @@ mod tests {
 
     #[test]
     fn empty_triple_string_lexes_to_empty_str() {
-        use lexer::{Tok, lex};
-        let toks = lex("\"\"\"\"\"\"").expect("empty triple string must lex");
-        assert_eq!(toks.len(), 1);
-        assert_eq!(
-            toks.first().map(|t| t.kind.clone()),
-            Some(Tok::TripleStr {
-                raw: String::new(),
-                anchor: 1,
-            })
-        );
+        assert_eq!(triple_value("\"\"\"\"\"\"").as_deref(), Some(""));
     }
 
     /// Regression non-regression: regular single-line strings still lex

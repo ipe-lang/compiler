@@ -1,0 +1,12 @@
+-- A TRIPLE-QUOTED STRING IN NEITHER OF ITS TWO FORMS ------ test.ipe
+
+The closing `"""` of this block ends a line of content. A `"""` string is either one line (`"""text"""`) or a block: the opening `"""` ends its line, and the closing `"""` stands alone on its own line in the opener's column, the margin.
+
+ --> test.ipe:6:10
+  |
+6 |     world"""
+  |          ^^^ this `"""` ends a line of content
+  |
+  = help: put the closing `"""` on its own line in column 5
+
+IPE-P0075 · run `ipe doc IPE-P0075`

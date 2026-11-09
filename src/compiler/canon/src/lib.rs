@@ -5242,6 +5242,23 @@ mod tests {
         );
     }
 
+    /// An unknown name inside a block string's `{{…}}` is reported at that
+    /// name's own source bytes, through the block's margin.
+    #[test]
+    fn interp_unknown_name_in_a_block_points_at_the_name() {
+        let src = "module Main exposing (main)\n\
+                   main =\n    \"\"\"\n    hi\n      {{ typoo }}\n    \"\"\"\n";
+        let err = canon_err(src);
+        let named = match &err {
+            Some(Diagnostic::Name {
+                span,
+                msg: NameError::ValueNotFound { .. },
+            }) => src.get(span.lo as usize..span.hi as usize),
+            _ => None,
+        };
+        assert_eq!(named, Some("typoo"), "{err:?}");
+    }
+
     /// A bare constructor spelling that names no constructor in scope
     /// (`{{Nope}}`) is likewise turned back with the typed unknown-name
     /// diagnostic rather than resolving or ICE-ing downstream.

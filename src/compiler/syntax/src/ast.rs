@@ -12,6 +12,8 @@
 use ipe_diagnostics::{Located, Span};
 use ipe_intern::Symbol;
 
+use crate::triple::TripleStr;
+
 /// A doc-string attached to a top-level declaration.
 ///
 /// Built from a `{-| … -}` block comment placed immediately above the
@@ -294,17 +296,13 @@ pub enum Expr_ {
     /// downstream stages see the runtime string verbatim. Mirrors the reference compiler
     /// compiler's `Src.Str`.
     Str(String),
-    /// A triple-quoted string `"""..."""`.
+    /// A triple-quoted string `"""..."""`, judged into one of its two forms.
     ///
-    /// `raw` is the RAW content — the lexer does NOT resolve escape sequences or
-    /// `{{expr}}` interpolation markers. The canonicaliser strips the anchor
-    /// margin (see `anchor`), then desugars the result into a `++` chain of
-    /// string literals and `Interpolate`-wrapped expressions (the internal renderer kernel).
-    ///
-    /// `anchor` is the 1-based source column of the first non-whitespace content
-    /// character (the anchor column A). The margin strip removes up to `A - 1`
-    /// leading whitespace characters from every physical line after the first.
-    MultilineStr { raw: String, anchor: u32 },
+    /// The lexer resolves neither escape sequences nor `{{expr}}` markers; the
+    /// canonicaliser desugars the form's value into a `++` chain of string
+    /// literals and `Interpolate`-wrapped expressions (the internal renderer
+    /// kernel), mapping each part back to source through the form.
+    MultilineStr(TripleStr),
     /// A character literal `'a'`. The carried [`String`] is the source character
     /// text — a single grapheme for an ordinary char, or a backslash-escape pair
     /// (`\n`, `\\`) for an escaped one — matching the reference compiler's
@@ -488,126 +486,6 @@ pub enum TypeAnnotation {
     /// of this type is any record carrying *at least* the listed fields.
     /// Mirrors the reference compiler's `Src.TRecord fields (Just rowVar)`.
     TRecordOpen(Symbol, Vec<(Located<Symbol>, Self)>),
-}
-
-/// Strip the source indentation margin from a triple-quoted string body using
-/// its anchor column.
-///
-/// The anchor column `A` (1-based) is the source column of the first
-/// non-whitespace content character. This removes up to `A - 1` leading
-/// whitespace characters from every physical line *after the first*, and drops
-/// one leading newline immediately following the opening `"""`. The first line
-/// is left untouched: its leading text is content the author placed on the
-/// opening-delimiter line.
-///
-/// Only whitespace is removed, and never past a line's content: a line indented
-/// less than `A - 1` is stripped only to its first content character, so a
-/// content character is never dropped. Removing whole leading-whitespace
-/// characters (not bytes) keeps every surviving character's source offset intact
-/// relative to its line, which is what makes downstream `{{expr}}` sub-spans and
-/// diagnostic offsets land correctly.
-#[must_use]
-pub fn strip_anchor_margin(raw: &str, anchor: u32) -> String {
-    // A body whose first content character sits in column 1 (or an all-whitespace
-    // / empty body, which anchors at 1) has no margin to remove. The leading
-    // newline is still dropped below.
-    let strip = anchor.saturating_sub(1);
-
-    let mut out = String::with_capacity(raw.len());
-    // `split_inclusive('\n')` keeps each line's trailing newline, so newlines are
-    // preserved verbatim and only per-line leading whitespace is a strip target.
-    // Line 0 is the opening-delimiter line; its leading text is content the
-    // author placed there, never a margin, so it is copied verbatim.
-    for (line_index, line) in raw.split_inclusive('\n').enumerate() {
-        if line_index == 0 {
-            out.push_str(line);
-            continue;
-        }
-        // Count leading space/tab characters, capped at the margin width. Space
-        // and tab are single-byte ASCII, so the character count is also the byte
-        // offset at which the copied remainder begins.
-        let consumed = line
-            .bytes()
-            .take(strip as usize)
-            .take_while(|&b| b == b' ' || b == b'\t')
-            .count();
-        // The remainder (from the first content char, a newline, or end of line)
-        // is copied verbatim, so a content character is never dropped.
-        out.push_str(&line[consumed..]);
-    }
-
-    // Drop exactly one leading newline right after the opening `"""`, so a block
-    // written as `"""<newline>first content line` starts at that content line.
-    // A `\r\n` pair counts as the one such newline. This runs after the per-line
-    // strip so "the first line" is the opening-delimiter line of the RAW body.
-    if out.starts_with("\r\n") {
-        out.drain(..2);
-    } else if out.starts_with('\n') {
-        out.drain(..1);
-    }
-    out
-}
-
-#[cfg(test)]
-mod strip_tests {
-    use super::strip_anchor_margin;
-
-    #[test]
-    fn non_indented_block_is_unchanged() {
-        // Anchor column 1: nothing to strip; body round-trips verbatim.
-        let raw = "line one\nline two\nline three";
-        assert_eq!(strip_anchor_margin(raw, 1), raw);
-    }
-
-    #[test]
-    fn strips_anchor_margin_from_lines_after_the_first() {
-        // Opening `"""` at some column, content anchored at column 9 (A = 9),
-        // so up to 8 leading whitespace chars come off every later line.
-        let raw = "first\n        second\n        third";
-        assert_eq!(strip_anchor_margin(raw, 9), "first\nsecond\nthird");
-    }
-
-    #[test]
-    fn drops_one_leading_newline_after_opener() {
-        // `"""` immediately followed by a newline: that newline is dropped and
-        // the margin is stripped from the (now-first-physical, but still
-        // after-opener) lines.
-        let raw = "\n        first\n        second";
-        assert_eq!(strip_anchor_margin(raw, 9), "first\nsecond");
-    }
-
-    #[test]
-    fn line_indented_less_than_margin_strips_only_to_content() {
-        // A = 9 (strip up to 8), but the second line has only 3 spaces before
-        // content: strip stops at the content char, never consuming it.
-        let raw = "first\n   short\n        deep";
-        assert_eq!(strip_anchor_margin(raw, 9), "first\nshort\ndeep");
-    }
-
-    #[test]
-    fn never_strips_content_characters() {
-        // A line whose leading run is entirely whitespace-then-content: the
-        // content `x` survives even when fewer than `strip` spaces precede it.
-        let raw = "a\n x\n  y";
-        // A = 4 → strip up to 3: ` x` → `x`, `  y` → `y`.
-        assert_eq!(strip_anchor_margin(raw, 4), "a\nx\ny");
-    }
-
-    #[test]
-    fn blank_line_is_preserved_as_empty() {
-        // A fully blank interior line shorter than the margin collapses to empty
-        // but keeps its newline; content lines strip to the margin.
-        let raw = "first\n\n        third";
-        assert_eq!(strip_anchor_margin(raw, 9), "first\n\nthird");
-    }
-
-    #[test]
-    fn interpolation_marker_survives_margin_strip() {
-        // Only leading whitespace is removed; `{{expr}}` markers and their inner
-        // spans are untouched.
-        let raw = "head\n        value={{count}}";
-        assert_eq!(strip_anchor_margin(raw, 9), "head\nvalue={{count}}");
-    }
 }
 
 #[cfg(test)]

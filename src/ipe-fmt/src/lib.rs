@@ -38,9 +38,11 @@ mod faithful;
 
 use ipe_syntax::{
     BinOp, Ctor, Exposed, Exposing, Expr, Expr_, ForeignDecl, Import, LetBinding, Module, Pattern,
-    Pattern_, Privacy, TypeAlias, TypeAnnotation, Union, Value, escape_char_body, escape_str_body,
-    strip_anchor_margin,
+    Pattern_, Privacy, TripleStr, TypeAlias, TypeAnnotation, Union, Value, escape_char_body,
+    escape_str_body,
 };
+use ipe_syntax::{Column, Opener};
+use std::num::NonZeroU32;
 
 /// The column budget elm-format targets before breaking a construct onto
 /// multiple lines.
@@ -893,13 +895,12 @@ impl ModuleTree {
     }
 }
 
-/// `debug` with every `Span { lo: …, hi: … }` and triple-quoted string
-/// `anchor: …` column replaced by `_`, and every `Symbol(n)` by
-/// `Symbol("text")`, leaving the contents of string literals untouched; `None`
-/// on a shape the rewrite does not recognise.
+/// `debug` with every `Span { lo: …, hi: … }` replaced by `_`, and every
+/// `Symbol(n)` by `Symbol("text")`, leaving the contents of string literals
+/// untouched; `None` on a shape the rewrite does not recognise.
 ///
-/// The anchor is a position: what it means, the margin stripped from the
-/// string's value, is compared by [`ModuleText`], which prints that value.
+/// A triple-quoted string's `Debug` is already its value alone: its margin
+/// and source positions are where it stands, not what it means.
 fn erase_positions(debug: &str, interner: &Interner) -> Option<String> {
     let mut out = String::with_capacity(debug.len());
     let mut rest = debug;
@@ -913,10 +914,6 @@ fn erase_positions(debug: &str, interner: &Interner) -> Option<String> {
             let (_, after) = split_digits(after.strip_prefix(", hi: ")?)?;
             out.push('_');
             rest = after.strip_prefix(" }")?;
-        } else if let Some(after) = rest.strip_prefix("anchor: ") {
-            let (_, after) = split_digits(after)?;
-            out.push_str("anchor: _");
-            rest = after;
         } else if let Some(after) = rest.strip_prefix("Symbol(") {
             let (digits, after) = split_digits(after)?;
             let text = interner.resolve(ipe_intern::Symbol::from_raw(digits.parse().ok()?))?;
@@ -1549,7 +1546,7 @@ impl<'a> Printer<'a> {
             let leading = self.anchored(start);
             let mut lead = String::new();
             comments::emit(&mut lead, &leading, zero, TOP_LEVEL_HEAD);
-            let body = self.decl(decl, start, owner_end(start));
+            let body = self.place_blocks(&self.decl(decl, start, owner_end(start)));
             let missed = unplaced(owned_from(start), &format!("{lead}{body}"));
             let mut item = String::new();
             comments::emit(&mut item, &missed, zero, hoist_tail(&leading));
@@ -2518,13 +2515,7 @@ impl<'a> Printer<'a> {
             Expr_::Int(n) => n.to_string(),
             Expr_::Float(f) => format_float(*f),
             Expr_::Str(s) => format!("\"{}\"", escape_str_body(s)),
-            // The equivalence projection (no source) prints the string's value,
-            // its margin stripped at its anchor column: a printed string moved to
-            // another column strips another margin, and must read as different.
-            Expr_::MultilineStr { raw, anchor } => match self.src {
-                Some(_) => format!("\"\"\"{raw}\"\"\""),
-                None => format!("\"\"\"{}\"\"\"", strip_anchor_margin(raw, *anchor)),
-            },
+            Expr_::MultilineStr(string) => self.triple_str(string),
             Expr_::Char(c) => format!("'{}'", escape_char_body(c)),
             Expr_::Unit => "()".to_owned(),
             Expr_::Call(head, args) => self.call(head, args, col, e.span),
@@ -2590,11 +2581,12 @@ impl<'a> Printer<'a> {
                 .unwrap_or_default();
             if !trail.is_empty() {
                 format!("({inner}{trail}\n{})", self.pad(col))
-            } else if inner.contains('\n') {
+            } else if has_layout_newline(&inner) {
                 // A multiline compound in parens: the content starts right
                 // after `(`, one column in, and the closing `)` sits on its
                 // own line at the `(` column — elm-format's
-                // parenthesised-block layout.
+                // parenthesised-block layout. A block string's lines are one
+                // token, not layout: its closer keeps the `)`.
                 format!("({}\n{})", inner, self.pad(col))
             } else {
                 format!("({inner})")
@@ -2651,7 +2643,7 @@ impl<'a> Printer<'a> {
             ) || ipe_parse::field_accessor(a).is_some()
         };
         let first_is_block =
-            |a: &Expr| matches!(&a.value, Expr_::MultilineStr { raw, .. } if raw.contains('\n'));
+            |a: &Expr| matches!(&a.value, Expr_::MultilineStr(s) if s.margin().is_some());
         let later_block = |tail_strs: &[String]| tail_strs.iter().any(|s| has_layout_newline(s));
         // A head owning an end-of-line comment ends its line: it stands alone.
         let head_hi = head.span.hi as usize;
@@ -2680,6 +2672,68 @@ impl<'a> Printer<'a> {
         out
     }
 
+    /// A `"""` string in its own form.
+    ///
+    /// A one-line string prints as written. A block prints its body lines
+    /// against the first column, a provisional margin: where the opener lands
+    /// is known only once the whole declaration is laid out, and
+    /// [`Printer::place_blocks`] then moves every block to that margin. The
+    /// equivalence projection (no source) prints the value alone, which no
+    /// column changes.
+    fn triple_str(&self, string: &TripleStr) -> String {
+        if self.src.is_none() || string.margin().is_none() {
+            return format!("{TRIPLE_QUOTES}{}{TRIPLE_QUOTES}", string.value());
+        }
+        let mut out = String::new();
+        self.write_block(&mut out, string, Col::ZERO);
+        out
+    }
+
+    /// Write block `string` with its opener at `col`: each body line right of
+    /// a margin at `col`, an empty line left empty, and the closer alone on
+    /// its line in the opener's column, so its value is the same wherever it
+    /// lands.
+    fn write_block(&self, out: &mut String, string: &TripleStr, col: Col) {
+        out.push_str(TRIPLE_QUOTES);
+        for line in string.lines() {
+            out.push('\n');
+            if !line.is_empty() {
+                let _ = write!(out, "{}", self.pad(col));
+            }
+            out.push_str(line);
+        }
+        let _ = write!(out, "\n{}{TRIPLE_QUOTES}", self.pad(col));
+    }
+
+    /// `text`, a rendering that starts at a line start, with every block
+    /// string moved to the margin of the column its opener stands at.
+    ///
+    /// The margin a block's value is cut at is its opener's column in the
+    /// output, a fact of the finished text alone: a block is read back at the
+    /// margin it was written at (its closer's column) by the lexer's own
+    /// judge, then written again at its opener's column. A string the judge
+    /// refuses is left as printed, for the output guard to refuse.
+    fn place_blocks(&self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut col = 0usize;
+        let mut rest = text;
+        while let Some((lexeme, tail)) = next_lexeme(rest) {
+            rest = tail;
+            if let Lexeme::Triple(quoted) = lexeme
+                && let Some(block) = written_block(quoted)
+            {
+                let lo = out.len();
+                self.write_block(&mut out, &block, Col(col));
+                col = advance_col(col, out.get(lo..).unwrap_or_default());
+                continue;
+            }
+            let piece = lexeme.text();
+            out.push_str(piece);
+            col = advance_col(col, piece);
+        }
+        out
+    }
+
     /// Whether argument `a`, already rendered as `rendered` (the same string
     /// `call`'s one-line pass computed — passed in rather than re-rendered
     /// here, so this check costs no extra tree walk), may share the
@@ -2688,19 +2742,11 @@ impl<'a> Printer<'a> {
     /// that renders on a single line AND is not itself a block form
     /// (non-empty list / record / tuple / update / parenthesised compound).
     fn joins_on_head_line(a: &Expr, rendered: &str) -> bool {
-        // A triple-quoted string hugs the function line only when it opens with
-        // visible content on its first physical line (`interpolate """head\n…"""`).
-        // One that opens with a newline (`"""\n…`) — or any string literal that is
-        // a single line — drops to its own indented line instead.
-        if let Expr_::MultilineStr { raw: s, .. } = &a.value {
-            // A triple-quoted string hugs the function line only when its first
-            // physical line opens with visible, non-whitespace content
-            // (`"""head…`). One that opens with a newline (`"""\n…`) or with
-            // leading indentation (`"""    …`) drops to its own line.
-            return match s.split_once('\n') {
-                Some((first, _)) => first.starts_with(|c: char| !c.is_whitespace()),
-                None => false,
-            };
+        // A triple-quoted string never hugs the function line: a one-line
+        // string stacks like any literal, and a block's opener ends its line,
+        // so the block drops to its own indented line.
+        if matches!(a.value, Expr_::MultilineStr(_)) {
+            return false;
         }
         if rendered.contains('\n') {
             return false;
@@ -3285,44 +3331,121 @@ const fn needs_parens_as_atom(e: &Expr_) -> bool {
 
 /// Whether `s` contains a newline that is part of the source *layout*.
 ///
-/// The scan follows the lexer's token boundaries: a `\n` inside a
-/// triple-quoted string is content, and a `"""` inside a normal string, a
-/// char literal, or a comment opens nothing. A newline inside a block comment
-/// is layout, as is a token left unterminated (the conservative reading).
+/// The scan follows the lexer's token boundaries ([`next_lexeme`]): a `\n`
+/// inside a triple-quoted string is content, and a `"""` inside a normal
+/// string, a char literal, or a comment opens nothing. A newline inside a
+/// block comment is layout, as is a token left unterminated (the
+/// conservative reading).
 fn has_layout_newline(s: &str) -> bool {
     let mut rest = s;
-    loop {
-        rest = if let Some(after) = rest.strip_prefix("\"\"\"") {
-            match after.split_once("\"\"\"") {
-                Some((_, tail)) => tail,
-                None => return true,
-            }
-        } else if let Some(after) = rest.strip_prefix("--") {
-            after
-                .find('\n')
-                .map_or("", |end| after.get(end..).unwrap_or(""))
-        } else if let Some(after) = rest.strip_prefix("{-") {
-            let tail = skip_block_comment_body(after);
-            let body = after
-                .get(..after.len().saturating_sub(tail.len()))
-                .unwrap_or(after);
-            if body.contains('\n') || !body.ends_with("-}") {
-                return true;
-            }
-            tail
-        } else {
-            let mut chars = rest.chars();
-            match chars.next() {
-                None => return false,
-                Some('\n') => return true,
-                Some(quote @ ('"' | '\'')) => match skip_quoted(chars.as_str(), quote) {
-                    Some(tail) => tail,
-                    None => return true,
-                },
-                Some(_) => chars.as_str(),
-            }
-        };
+    while let Some((lexeme, tail)) = next_lexeme(rest) {
+        match lexeme {
+            Lexeme::LineBreak(_) | Lexeme::Broken(_) => return true,
+            Lexeme::Triple(_) | Lexeme::Flat(_) => rest = tail,
+        }
     }
+    false
+}
+
+/// The `"""` both string forms open and close with.
+const TRIPLE_QUOTES: &str = "\"\"\"";
+
+/// One lexeme of printed text, cut where the lexer cuts it.
+enum Lexeme<'s> {
+    /// A `"""` string, from its opener through its closer.
+    Triple(&'s str),
+    /// A line break outside every token and comment.
+    LineBreak(&'s str),
+    /// A token, a comment, or a character of layout on one line.
+    Flat(&'s str),
+    /// A block comment spanning lines, or a token left unterminated: either
+    /// breaks the layout.
+    Broken(&'s str),
+}
+
+impl<'s> Lexeme<'s> {
+    /// The lexeme's text.
+    const fn text(&self) -> &'s str {
+        match self {
+            Self::Triple(text) | Self::LineBreak(text) | Self::Flat(text) | Self::Broken(text) => {
+                text
+            }
+        }
+    }
+}
+
+/// The lexeme `rest` starts with and the text after it; `None` at its end.
+///
+/// A `"""` string runs to the first `"""` after its opener, by the lexer's
+/// own [`ipe_syntax::extent`].
+fn next_lexeme<'s>(rest: &'s str) -> Option<(Lexeme<'s>, &'s str)> {
+    type Make<'s> = fn(&'s str) -> Lexeme<'s>;
+    let (triple, line_break, flat, broken): (Make<'s>, Make<'s>, Make<'s>, Make<'s>) = (
+        Lexeme::Triple,
+        Lexeme::LineBreak,
+        Lexeme::Flat,
+        Lexeme::Broken,
+    );
+    let (lexeme, tail) = if rest.starts_with(TRIPLE_QUOTES) {
+        ipe_syntax::extent(rest, 0)
+            .and_then(|range| rest.get(range.end..))
+            .map_or((broken, ""), |tail| (triple, tail))
+    } else if let Some(after) = rest.strip_prefix("--") {
+        let tail = after
+            .find('\n')
+            .map_or("", |end| after.get(end..).unwrap_or(""));
+        (flat, tail)
+    } else if let Some(after) = rest.strip_prefix("{-") {
+        let tail = skip_block_comment_body(after);
+        let body = after
+            .get(..after.len().saturating_sub(tail.len()))
+            .unwrap_or(after);
+        if body.contains('\n') || !body.ends_with("-}") {
+            (broken, tail)
+        } else {
+            (flat, tail)
+        }
+    } else {
+        let mut chars = rest.chars();
+        match chars.next()? {
+            '\n' => (line_break, chars.as_str()),
+            quote @ ('"' | '\'') => {
+                skip_quoted(chars.as_str(), quote).map_or((broken, ""), |tail| (flat, tail))
+            }
+            _ => (flat, chars.as_str()),
+        }
+    };
+    let piece = rest
+        .get(..rest.len().saturating_sub(tail.len()))
+        .unwrap_or(rest);
+    Some((lexeme(piece), tail))
+}
+
+/// The column after writing `piece` from column `col`, counted as the lexer
+/// counts it: one per Unicode scalar, back to the first after a line break.
+fn advance_col(col: usize, piece: &str) -> usize {
+    piece.rfind('\n').map_or_else(
+        || col.saturating_add(piece.chars().count()),
+        |at| {
+            piece
+                .get(at.saturating_add(1)..)
+                .map_or(0, |line| line.chars().count())
+        },
+    )
+}
+
+/// The block string `quoted` holds, read at the margin it was written at: its
+/// closer's column. `None` for a one-line string or a text the judge refuses.
+fn written_block(quoted: &str) -> Option<TripleStr> {
+    let closer_line = quoted.strip_suffix(TRIPLE_QUOTES)?.rsplit('\n').next()?;
+    let width = u32::try_from(closer_line.chars().count()).ok()?;
+    let opener = Opener {
+        lo: 0,
+        line: NonZeroU32::MIN,
+        column: Column::new(NonZeroU32::MIN.checked_add(width)?),
+    };
+    let string = ipe_syntax::judge(quoted, opener).ok()?.string;
+    string.margin().is_some().then_some(string)
 }
 
 /// What follows a single-line quoted token whose opening `quote` is already
@@ -3343,18 +3466,21 @@ fn skip_quoted(rest: &str, quote: char) -> Option<&str> {
 }
 
 /// Whether the head plus its first argument fits on one line before the
-/// argument's own break. For a multi-line triple-quoted string the join line is
-/// `head """first-content-line`; elm-format only hugs the string to the function
-/// when that opening line stays within the width budget, otherwise the string
-/// drops to its own indented line. Other joinable first arguments (names, empty
-/// collections) are short and always fit.
+/// argument's own break. For a triple-quoted string the join line is
+/// `head """`, followed by the text and closer of a one-line string; other
+/// joinable first arguments (names, empty collections) are short and always
+/// fit.
 fn head_line_fits(head_s: &str, first: &Expr, col: Col) -> bool {
-    let Expr_::MultilineStr { raw: s, .. } = &first.value else {
+    let Expr_::MultilineStr(s) = &first.value else {
         return true;
     };
-    let first_content = s.split_once('\n').map_or(s.as_str(), |(f, _)| f);
-    // column of the head + head + ` ` + `"""` + first content line
-    let end = col.past(head_s.chars().count() + 1 + 3 + first_content.chars().count());
+    let one_line = if s.margin().is_some() {
+        0
+    } else {
+        s.value().chars().count() + 3
+    };
+    // column of the head + head + ` ` + `"""` + a one-line string's rest
+    let end = col.past(head_s.chars().count() + 1 + 3 + one_line);
     end.0 <= MAX_WIDTH
 }
 
@@ -5011,17 +5137,123 @@ mod tests {
         );
     }
 
-    /// A triple-quoted string strips the margin of its anchor column from
-    /// every later line, so moving it to another column changes its value:
-    /// the formatter refuses rather than printing the moved string.
+    /// A block string moved to another column is re-indented to its new
+    /// margin, so its value is unchanged and the output is a fixed point.
     #[test]
-    fn a_triple_quoted_string_moved_to_another_margin_is_refused() {
+    fn a_block_string_moved_to_another_margin_keeps_its_value() {
+        let src = "module M exposing (x)\n\n\nx =\n    let\n        msg =\n                \"\"\"\n                abc\n\n                  def\n                \"\"\"\n    in\n    msg\n";
+        let once = format_source(src);
+        assert!(once.is_ok(), "{once:?}");
+        let Ok(once) = once else { return };
+        assert_ne!(
+            once, src,
+            "the block must move to its binding's body column"
+        );
+        let twice = format_source(&once);
+        assert!(
+            twice.as_ref().is_ok_and(|twice| *twice == once),
+            "{twice:?}"
+        );
+    }
+
+    /// A string in neither `"""` form is refused by the parser before any
+    /// print, so the formatter never re-reads it under another margin.
+    #[test]
+    fn text_after_a_block_opener_is_not_formatted() {
         let src = "module M exposing (x)\n\n\nx =\n    foo  \"\"\"abc\n            def\"\"\"\n";
-        let detail = match format_source(src) {
-            Err(FmtError::RoundTrip(fault)) => fault.to_string(),
-            other => format!("not a refusal: {other:?}"),
-        };
-        assert_eq!(detail, "formatted output parsed to a different AST");
+        let refused = format_source(src);
+        assert!(
+            matches!(refused, Err(FmtError::Parse { ref diag, .. }) if diag.code().as_str() == "IPE-P0075"),
+            "{refused:?}"
+        );
+    }
+
+    /// `template` with `{S}` replaced by a block string of `lines` whose
+    /// margin is the column `{S}` stands at, so the source lexes.
+    fn with_block_at_its_opener(template: &str, lines: &[&str]) -> String {
+        let (before, after) = template.split_once("{S}").unwrap_or((template, ""));
+        let margin = " ".repeat(before.rsplit('\n').next().unwrap_or("").chars().count());
+        let mut block = String::from("\"\"\"");
+        for line in lines {
+            block.push('\n');
+            if !line.is_empty() {
+                block.push_str(&margin);
+            }
+            block.push_str(line);
+        }
+        block.push('\n');
+        block.push_str(&margin);
+        block.push_str("\"\"\"");
+        format!("{before}{block}{after}")
+    }
+
+    /// A block string prints at the margin its opener lands at in the
+    /// output, in every position an expression can stand: each print lexes,
+    /// keeps the string's value, and is its own fixed point. The printer's
+    /// indentation column for an expression is not where its opener lands
+    /// (`{ s = """` opens past the record's column), so a block written at
+    /// that column misaligns its closer and the output does not lex.
+    #[test]
+    fn every_block_string_prints_at_its_openers_column() {
+        let contexts = [
+            "x =\n    {S}\n",
+            "x =\n    { s = {S}\n    }\n",
+            "x =\n    { s = {S} }\n",
+            "x =\n    [ { n = 1\n      , s = {S}\n      }\n    ]\n",
+            "x =\n    f {S} 1\n",
+            "x =\n    foo bar {S}\n",
+            "x =\n    {S} ++ \"b\"\n",
+            "x =\n    \"a\" ++ {S}\n",
+            "x =\n    ( {S}, 1 )\n",
+            "x =\n    [ {S}, \"\"\"q\"\"\" ]\n",
+            "x =\n    Just (g {S})\n",
+            "x =\n    g (\\_ -> {S})\n",
+            "x =\n    if c then {S} else \"e\"\n",
+            "x =\n    case n of\n        0 ->\n            {S}\n\n        _ ->\n            \"\"\n",
+            "x =\n    let\n        v = h ({S} ++ \"b\")\n    in\n    v\n",
+            "x =\n    s |> h {S}\n",
+            "x =\n    f { r = {S} } 2\n",
+        ];
+        let bodies: [&[&str]; 5] = [
+            &["a"],
+            &["a", "", "  b", "c"],
+            &["{{n}} x", "  {{m}}"],
+            &[],
+            &["", "a", ""],
+        ];
+        for context in contexts {
+            for lines in bodies {
+                let src = format!(
+                    "module M exposing (x)\n\n\n{}",
+                    with_block_at_its_opener(context, lines)
+                );
+                let once = format_source(&src);
+                assert!(once.is_ok(), "{src}\n{once:?}");
+                let Ok(once) = once else { return };
+                let twice = format_source(&once);
+                assert!(
+                    twice.as_ref().is_ok_and(|twice| *twice == once),
+                    "{src}\n--- once\n{once}\n--- twice\n{twice:?}"
+                );
+            }
+        }
+    }
+
+    /// The re-margin pass reads blocks the lexer's way: a `"""` inside a
+    /// normal string, a char, or a comment opens nothing, and a one-line
+    /// string is kept as written.
+    #[test]
+    fn place_blocks_moves_only_block_strings() {
+        let interner = Interner::new();
+        let trivia = scan_trivia("").expect("empty source lexes");
+        let budget = Demoted::default();
+        let printer = Printer::new(&interner, &trivia, None, OutputCap::for_input(64), &budget);
+        let text =
+            "a = \"\\\"\\\"\\\"\" -- \"\"\"\n  {- \"\"\" -} \"\"\"one\"\"\" f \"\"\"\nb\n\"\"\" 1";
+        assert_eq!(
+            printer.place_blocks(text),
+            "a = \"\\\"\\\"\\\"\" -- \"\"\"\n  {- \"\"\" -} \"\"\"one\"\"\" f \"\"\"\n                        b\n                        \"\"\" 1"
+        );
     }
 
     /// A one-line triple-quoted string has no margin, so its column is free.

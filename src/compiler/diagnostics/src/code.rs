@@ -357,6 +357,10 @@ code! {
     IPE_P0073 = "IPE-P0073", "a control character a terminal runs as a command", "IPE-P0073";
     /// a `Module.Ctor` constructor reference in pattern position — patterns take the bare name
     IPE_P0074 = "IPE-P0074", "a qualified constructor in pattern position", "IPE-P0074";
+    /// a `"""` string in neither form: text after a block's opener, or a closer off its own line or column
+    IPE_P0075 = "IPE-P0075", "a triple-quoted string in neither of its two forms", "IPE-P0075";
+    /// a block `"""` string line with a tab or a non-space character left of its margin
+    IPE_P0076 = "IPE-P0076", "a triple-quoted string line left of its margin", "IPE-P0076";
 
     // -----------------------------------------------------------------------
     // Name resolution (IPE-N####)

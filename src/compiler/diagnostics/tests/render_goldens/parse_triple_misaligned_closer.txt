@@ -1,0 +1,15 @@
+-- A TRIPLE-QUOTED STRING IN NEITHER OF ITS TWO FORMS ------ test.ipe
+
+The closing `"""` stands in column 7, but the opening one in column 5. A `"""` string is either one line (`"""text"""`) or a block: the opening `"""` ends its line, and the closing `"""` stands alone on its own line in the opener's column, the margin.
+
+ --> test.ipe:6:7
+  |
+6 |       """
+  |       ^^^ this `"""` is in column 7, not column 5
+  |
+4 |     """
+  |     --- this `"""` sets the margin column
+  |
+  = help: move the closing `"""` to column 5
+
+IPE-P0075 · run `ipe doc IPE-P0075`

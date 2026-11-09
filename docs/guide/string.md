@@ -85,9 +85,10 @@ parsed 2 contacts:
 
 ## Multiline strings and `{{}}` interpolation
 
-A **triple-quoted string** `"""…"""` spans multiple lines, and its opening-line
-indentation margin is stripped — the block's layout in the source does not enter
-the value. Inside one, `{{expr}}` **interpolation** substitutes a scalar
+A **triple-quoted string** is either one line, `"""…"""`, or a block: the
+opening `"""` ends its line and the closing `"""` stands alone in the opener's
+column. That column is the block's margin, which is not part of the value, so
+the block's layout in the source does not enter it. Inside one, `{{expr}}` **interpolation** substitutes a scalar
 (`String`, `Int`, `Float`, `Bool` or `Char`), rendered exactly as its
 `String.from*` conversion, so an `Int` needs no `String.fromInt`. Any other
 type is refused at type-check (IPE-T0014) — interpolate its fields instead:

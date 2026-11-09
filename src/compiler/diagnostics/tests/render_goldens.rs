@@ -14,12 +14,13 @@
 //! pattern (name, source, diagnostic), run with `UPDATE_GOLDENS=1` once to
 //! capture the current output, commit the new `.txt`.
 
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use ipe_diagnostics::{
     AliasExpansionKind, Candidates, Construct, Diagnostic, EditTarget, Expected, ExpectedSet,
-    Feature, LowerError, NameError, ParseError, SortedNames, Span, TokenKind, TyDoc, TypeError,
-    suggest,
+    Feature, LowerError, NameError, OpenerText, ParseError, SortedNames, Span, TokenKind,
+    TripleStringDefect, TyDoc, TypeError, suggest,
 };
 
 // ---------------------------------------------------------------------------
@@ -153,6 +154,71 @@ fn golden_parse_unterminated_string() -> Result<(), Box<dyn std::error::Error>> 
         msg: ParseError::UnterminatedString,
     };
     check_golden("parse_unterminated_string", &d, "test.ipe", source)
+}
+
+#[test]
+fn golden_parse_triple_text_after_opener() -> Result<(), Box<dyn std::error::Error>> {
+    // IPE-P0075: text follows the opener of a string that runs past its line.
+    let source = "module Main exposing (main)\n\nmain =\n    \"\"\"line one\n    line two\"\"\"\n";
+    let d = Diagnostic::Parse {
+        span: Span::new(43, 51),
+        msg: ParseError::MalformedTripleString(TripleStringDefect::TextAfterOpener {
+            span: Span::new(43, 51),
+            text: OpenerText::Content,
+        }),
+    };
+    check_golden("parse_triple_text_after_opener", &d, "test.ipe", source)
+}
+
+#[test]
+fn golden_parse_triple_closer_ends_content_line() -> Result<(), Box<dyn std::error::Error>> {
+    // IPE-P0075: a block's closer ends a line that holds content.
+    let source = "module Main exposing (main)\n\nmain =\n    \"\"\"\n    hello\n    world\"\"\"\n";
+    let d = Diagnostic::Parse {
+        span: Span::new(63, 66),
+        msg: ParseError::MalformedTripleString(TripleStringDefect::CloserEndsContentLine {
+            span: Span::new(63, 66),
+            margin: NonZeroU32::MIN.saturating_add(4),
+        }),
+    };
+    check_golden(
+        "parse_triple_closer_ends_content_line",
+        &d,
+        "test.ipe",
+        source,
+    )
+}
+
+#[test]
+fn golden_parse_triple_misaligned_closer() -> Result<(), Box<dyn std::error::Error>> {
+    // IPE-P0075: the closer stands alone, right of the opener's column; the
+    // opener is the secondary span that sets the margin.
+    let source = "module Main exposing (main)\n\nmain =\n    \"\"\"\n    hello\n      \"\"\"\n";
+    let d = Diagnostic::Parse {
+        span: Span::new(60, 63),
+        msg: ParseError::MalformedTripleString(TripleStringDefect::Misaligned {
+            span: Span::new(60, 63),
+            opener: Span::new(40, 43),
+            closer_col: NonZeroU32::MIN.saturating_add(6),
+            margin: NonZeroU32::MIN.saturating_add(4),
+        }),
+    };
+    check_golden("parse_triple_misaligned_closer", &d, "test.ipe", source)
+}
+
+#[test]
+fn golden_parse_triple_line_under_margin() -> Result<(), Box<dyn std::error::Error>> {
+    // IPE-P0076: a body line starts left of the block's margin.
+    let source = "module Main exposing (main)\n\nmain =\n    \"\"\"\n    a\n  b\n    \"\"\"\n";
+    let d = Diagnostic::Parse {
+        span: Span::new(50, 53),
+        msg: ParseError::MalformedTripleString(TripleStringDefect::LineUnderMargin {
+            span: Span::new(50, 53),
+            line: NonZeroU32::MIN.saturating_add(5),
+            margin: NonZeroU32::MIN.saturating_add(4),
+        }),
+    };
+    check_golden("parse_triple_line_under_margin", &d, "test.ipe", source)
 }
 
 #[test]

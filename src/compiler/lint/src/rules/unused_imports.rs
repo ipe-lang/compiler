@@ -388,8 +388,12 @@ impl Uses {
                 }
             }
             Expr_::Access(rec, _) => self.expr(rec),
-            Expr_::MultilineStr { raw, .. } => {
-                if raw.contains("{{") {
+            Expr_::MultilineStr(string) => {
+                let value = string.value();
+                if ipe_syntax::interpolation_pieces(&value)
+                    .iter()
+                    .any(|piece| matches!(piece, ipe_syntax::Piece::Interp { .. }))
+                {
                     self.opaque = true;
                 }
             }

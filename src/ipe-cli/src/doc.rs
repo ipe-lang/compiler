@@ -8085,12 +8085,12 @@ module Ipe.Demo exposing (foo)
 banner : String
 banner =
     \"\"\"
-{-|
-```ipe
-notCode
-```
--}
-\"\"\"
+    {-|
+    ```ipe
+    notCode
+    ```
+    -}
+    \"\"\"
 
 {-| Adds one.
 
