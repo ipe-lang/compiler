@@ -87,7 +87,7 @@ const ESCAPE_HATCH_SITES: &[(&str, usize)] = &[
     ("src/runtime/rust/src/scratch_core.rs", 2),
     ("src/runtime/rust/src/server.rs", 4),
     ("src/runtime/rust/src/ssrf.rs", 1),
-    ("src/runtime/rust/src/system.rs", 11),
+    ("src/runtime/rust/src/system.rs", 12),
     ("src/runtime/rust/src/terminal_access.rs", 1),
     ("src/runtime/rust/src/threads.rs", 1),
     ("src/runtime/rust/src/tui/key.rs", 1),

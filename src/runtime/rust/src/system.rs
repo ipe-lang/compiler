@@ -3884,9 +3884,18 @@ pub mod pre_exit {
 
     /// The process's stages, for a registrar that also runs against fresh
     /// stages under test.
-    #[cfg(feature = "debugger")]
+    #[cfg(any(
+        feature = "debugger",
+        all(feature = "tui", not(target_arch = "wasm32"))
+    ))]
     pub(crate) fn stages() -> &'static PreExitStages {
         &STAGES
+    }
+
+    /// Whether the process exit has begun running the stages.
+    #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+    pub(crate) fn exit_begun() -> bool {
+        STAGES.exiting.load(Ordering::Acquire)
     }
 
     /// Hold `registration`'s kind among the process's exit stages.
@@ -3955,13 +3964,27 @@ impl ProcessStatus {
     /// server's forced shutdown, or a terminal app's Ctrl-C in raw mode.
     ///
     /// Never built from a program's `Int`.
-    #[cfg(any(feature = "server", all(not(target_arch = "wasm32"), feature = "tui")))]
+    #[cfg(any(
+        feature = "server",
+        all(feature = "tokio", not(target_arch = "wasm32"))
+    ))]
     pub(crate) const INTERRUPTED: Self = Self(130);
-    /// `128 + SIGTERM`: the runtime's own forced-shutdown status on a terminate.
+    /// `128 + SIGTERM`: the status of a program a terminate request ends.
     ///
-    /// Native-server only; never built from a program's `Int`.
-    #[cfg(feature = "server")]
+    /// Never built from a program's `Int`.
+    #[cfg(any(
+        feature = "server",
+        all(feature = "tokio", not(target_arch = "wasm32"))
+    ))]
     pub(crate) const TERMINATED: Self = Self(143);
+    /// `128 + SIGHUP`: the status of a program a hangup ends.
+    ///
+    /// Never built from a program's `Int`.
+    #[cfg(any(
+        feature = "server",
+        all(feature = "tokio", not(target_arch = "wasm32"))
+    ))]
+    pub(crate) const HANGUP: Self = Self(129);
 
     /// Parse a program's `System.exit` request; total, and only `0` maps to success.
     ///
@@ -3989,8 +4012,9 @@ const _: () = assert!(
 
 /// Ends the process with `status` after every pre-exit stage has run.
 ///
-/// The one process exit in the runtime; the runtime `clippy.toml` denies
-/// `std::process::exit` everywhere else. `process::exit` skips Drop, so the
+/// The runtime's process exit; the runtime `clippy.toml` denies
+/// `std::process::exit` everywhere else but the stage-skipping `force_exit` a
+/// repeated stop request takes. `process::exit` skips Drop, so the
 /// stages Drop would have run happen here first ([`pre_exit`]). The stdout
 /// lock is taken before the first stage and never released, so no thread
 /// writes a stdout byte after a stdout stage.
@@ -3998,7 +4022,7 @@ const _: () = assert!(
 pub fn exit_process(status: ProcessStatus) -> ! {
     let mut out = std::io::stdout().lock();
     pre_exit::run_all(&mut out);
-    #[expect(clippy::disallowed_methods)] // the one process exit; proves the ban fires
+    #[expect(clippy::disallowed_methods)] // the stage-running process exit; proves the ban fires
     // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — the runtime's one process-exit funnel: every exit request (`System.exit`, server shutdown, a CLI db op) ends here after the pre-exit stages [ledger #boundary]
     std::process::exit(status.code());
 }
@@ -4010,6 +4034,51 @@ pub fn exit_process(status: ProcessStatus) -> ! {
 #[deny(clippy::as_conversions)]
 pub fn system_exit(code: i64) -> ! {
     exit_process(ProcessStatus::requested(code))
+}
+
+/// Ends the process with `status` at once, running no pre-exit stage.
+///
+/// The second sanctioned process exit, beside [`exit_process`]. A repeated
+/// stop request, or one that arrives once an exit has begun, ends the process
+/// even while that exit is stuck in a stage or waits on the stdout lock. It
+/// takes no lock and writes nothing; std's exit-time stdout flush only tries
+/// the stdout lock, so a lock the stuck exit holds cannot block it.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+pub(crate) fn force_exit(status: ProcessStatus) -> ! {
+    #[expect(clippy::disallowed_methods)] // the forced exit skips the stages on purpose
+    // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — the forced exit of a repeated stop request: it must not wait on the stage run or the stdout lock the first exit holds [ledger #boundary]
+    std::process::exit(status.code());
+}
+
+/// A request to stop the process.
+#[cfg(any(
+    feature = "server",
+    all(feature = "tokio", not(target_arch = "wasm32"))
+))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopSignal {
+    /// `SIGINT`, Ctrl-C or Ctrl-Break.
+    Interrupt,
+    /// `SIGTERM`, or a Windows console close, logoff or shutdown event.
+    Terminate,
+    /// `SIGHUP`: the controlling terminal hung up.
+    Hangup,
+}
+
+#[cfg(any(
+    feature = "server",
+    all(feature = "tokio", not(target_arch = "wasm32"))
+))]
+impl StopSignal {
+    /// The exit status of a process this request ends: `128 + signo`.
+    #[must_use]
+    pub const fn exit_status(self) -> ProcessStatus {
+        match self {
+            Self::Interrupt => ProcessStatus::INTERRUPTED,
+            Self::Terminate => ProcessStatus::TERMINATED,
+            Self::Hangup => ProcessStatus::HANGUP,
+        }
+    }
 }
 
 /// `Ipe.System.getenv key : String -> Task Error String` — the env var as a
@@ -4468,6 +4537,979 @@ pub fn read_self_status() -> Option<String> {
         })
         .ok()
         .map(|_| status)
+}
+
+/// The most stop requests a listener queues for its owner. A request past it
+/// is dropped: the owner only needs to know that another one arrived.
+#[cfg(any(
+    feature = "server",
+    all(feature = "tokio", not(target_arch = "wasm32"))
+))]
+pub(crate) const SIGNAL_QUEUE: usize = 8;
+
+/// A Windows console control event.
+#[cfg(all(
+    any(windows, test),
+    any(
+        feature = "server",
+        all(feature = "tokio", not(target_arch = "wasm32"))
+    )
+))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConsoleEvent {
+    CtrlC,
+    CtrlBreak,
+    Close,
+    Logoff,
+    Shutdown,
+}
+
+#[cfg(all(
+    any(windows, test),
+    any(
+        feature = "server",
+        all(feature = "tokio", not(target_arch = "wasm32"))
+    )
+))]
+impl ConsoleEvent {
+    /// The stop request this event makes.
+    pub(crate) const fn signal(self) -> StopSignal {
+        match self {
+            Self::CtrlC | Self::CtrlBreak => StopSignal::Interrupt,
+            Self::Close | Self::Logoff | Self::Shutdown => StopSignal::Terminate,
+        }
+    }
+}
+
+/// The signals this process inherited as ignored, read once; none when the
+/// status cannot be read or parsed, so a stop request is never lost to a
+/// misreading.
+///
+/// Every stop-signal owner reads this one value, so an owner that registers
+/// after another cannot read the other's handler as the inherited state.
+#[cfg(all(
+    target_os = "linux",
+    any(
+        feature = "server",
+        all(feature = "tokio", not(target_arch = "wasm32"))
+    )
+))]
+pub(crate) fn inherited_ignored() -> SignalSet {
+    static READ: std::sync::OnceLock<SignalSet> = std::sync::OnceLock::new();
+    *READ.get_or_init(|| {
+        read_self_status()
+            .and_then(|status| status_mask(&status, StatusMask::Ignored))
+            .unwrap_or(SignalSet(0))
+    })
+}
+
+/// The signals this process inherited as ignored: unread off Linux.
+#[cfg(all(
+    unix,
+    not(target_os = "linux"),
+    any(
+        feature = "server",
+        all(feature = "tokio", not(target_arch = "wasm32"))
+    )
+))]
+pub(crate) const fn inherited_ignored() -> SignalSet {
+    SignalSet(0)
+}
+
+#[cfg(all(
+    test,
+    any(
+        feature = "server",
+        all(feature = "tokio", not(target_arch = "wasm32"))
+    )
+))]
+mod stop_signal_tests {
+    use super::{ConsoleEvent, StopSignal};
+
+    #[test]
+    fn console_events_map_to_stop_signals() {
+        assert_eq!(ConsoleEvent::CtrlC.signal(), StopSignal::Interrupt);
+        assert_eq!(ConsoleEvent::CtrlBreak.signal(), StopSignal::Interrupt);
+        assert_eq!(ConsoleEvent::Close.signal(), StopSignal::Terminate);
+        assert_eq!(ConsoleEvent::Logoff.signal(), StopSignal::Terminate);
+        assert_eq!(ConsoleEvent::Shutdown.signal(), StopSignal::Terminate);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_statuses_are_128_plus_signo() {
+        use rustix::process::Signal;
+        for (stop, signal) in [
+            (StopSignal::Interrupt, Signal::INT),
+            (StopSignal::Terminate, Signal::TERM),
+            (StopSignal::Hangup, Signal::HUP),
+        ] {
+            assert_eq!(
+                stop.exit_status().code(),
+                signal.as_raw().saturating_add(128),
+                "{stop:?}"
+            );
+        }
+    }
+}
+
+/// The stop signals of a TEA driver's process (`Cli`, `Tui` or worker). Each OS
+/// request is only a message, and one relay thread decides what it does.
+///
+/// The OS handler (tokio's signal registry) records the signal and returns.
+/// The relay thread runs its own runtime, so a program runtime blocked in
+/// `update` cannot stall it, and decides each request with [`on_stop`]:
+///
+/// - the first request on an idle process starts the one exit
+///   ([`exit_process`](super::exit_process) with `128 + signo`) on a fresh
+///   thread, which runs every pre-exit stage once;
+/// - a later request, or any request once an exit has begun by any path,
+///   ends the process at once through [`force_exit`](super::force_exit),
+///   taking no lock and waiting on no stage;
+/// - while a served app's shutdown owner holds the signals, the request is
+///   left to it.
+///
+/// A signal the process inherited as ignored stays ignored, and the hangup is
+/// taken only where that inheritance is read (Linux). In raw mode Ctrl-C
+/// stays a key the driver reads, never a signal.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+pub(crate) mod exit_signals {
+    use super::{ProcessStatus, StopSignal};
+    use std::sync::OnceLock;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    /// The relay thread's name (within the 15 bytes a Linux thread name keeps).
+    const RELAY_THREAD: &str = "ipe-stop-relay";
+    /// The name of the thread a stop request's exit runs on.
+    const EXIT_THREAD: &str = "ipe-stop-exit";
+    /// How long [`install`] waits for the relay to report its listeners.
+    const RELAY_START_WAIT: Duration = Duration::from_secs(1);
+    /// The runtime log tag of a refused relay.
+    const LOG_TAG: &str = "signals";
+
+    /// Proof that the relay is listening.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Relay {
+        _private: (),
+    }
+
+    /// Why the relay does not hold every stop signal it would take.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum RelayRefused {
+        /// The OS refused the relay thread.
+        Thread,
+        /// The relay's runtime could not start.
+        Runtime,
+        /// A listener could not be registered.
+        Listen(std::io::ErrorKind),
+        /// The relay did not report within its start wait.
+        Start,
+        /// No stop signal can be listened to on this target.
+        #[cfg(not(any(unix, windows)))]
+        Unsupported,
+    }
+
+    impl std::fmt::Display for RelayRefused {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Thread => f.write_str("the OS refused the relay thread"),
+                Self::Runtime => f.write_str("the relay runtime could not start"),
+                Self::Listen(kind) => write!(f, "a listener could not be registered ({kind})"),
+                Self::Start => f.write_str("the relay did not start in time"),
+                #[cfg(not(any(unix, windows)))]
+                Self::Unsupported => f.write_str("this target has no stop signal to listen to"),
+            }
+        }
+    }
+
+    /// Registers the stop listeners, each forwarding into the queue. A
+    /// listener registered before a later one fails keeps forwarding.
+    type Listen = fn(&mpsc::Sender<StopSignal>) -> Result<(), RelayRefused>;
+
+    /// The relay's start outcome, once per process.
+    static OUTCOME: OnceLock<Result<(), RelayRefused>> = OnceLock::new();
+
+    /// Start the process's stop-signal relay, once; a later call returns the
+    /// first outcome.
+    ///
+    /// A refusal is written once to the runtime log, and every signal the
+    /// relay did not take keeps its default action: the process still ends
+    /// on it, only without the pre-exit stages.
+    ///
+    /// # Errors
+    /// [`RelayRefused`] when the relay thread, its runtime or a listener
+    /// could not start.
+    pub fn install() -> Result<Relay, RelayRefused> {
+        install_with(os_listeners)
+    }
+
+    /// [`install`] over the listeners `listen` registers.
+    fn install_with(listen: Listen) -> Result<Relay, RelayRefused> {
+        let outcome = *OUTCOME.get_or_init(|| {
+            let started = start(listen);
+            if let Err(refused) = started {
+                super::emit_runtime_log(
+                    LOG_TAG,
+                    &format!("stop signals keep their default action: {refused}"),
+                );
+            }
+            started
+        });
+        outcome.map(|()| Relay { _private: () })
+    }
+
+    /// Start the relay thread and wait, at most [`RELAY_START_WAIT`], for it
+    /// to report its listeners.
+    fn start(listen: Listen) -> Result<(), RelayRefused> {
+        let (ready, reported) = std::sync::mpsc::sync_channel(1);
+        crate::threads::spawn_named(RELAY_THREAD, move || run_relay(listen, &ready))
+            .map_err(|_| RelayRefused::Thread)?;
+        reported
+            .recv_timeout(RELAY_START_WAIT)
+            .unwrap_or(Err(RelayRefused::Start))
+    }
+
+    /// The relay thread: register the listeners on its own runtime, report
+    /// them, then decide every request.
+    fn run_relay(listen: Listen, ready: &std::sync::mpsc::SyncSender<Result<(), RelayRefused>>) {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+        else {
+            let _ = ready.send(Err(RelayRefused::Runtime));
+            return;
+        };
+        runtime.block_on(async {
+            let (tx, mut requests) = mpsc::channel(super::SIGNAL_QUEUE);
+            let listening = listen(&tx);
+            drop(tx);
+            let _ = ready.send(listening);
+            let mut seen = Seen::Nothing;
+            while let Some(signal) = requests.recv().await {
+                let action = on_stop(seen, super::pre_exit::exit_begun(), server_owns(), signal);
+                if matches!(action, StopAction::BeginExit(_)) {
+                    seen = Seen::Requested;
+                }
+                act(action);
+            }
+        });
+    }
+
+    /// Whether a served app's shutdown owner holds the stop signals.
+    #[cfg(feature = "server")]
+    fn server_owns() -> bool {
+        crate::server::shutdown::owns_stop_signals()
+    }
+
+    /// Whether a served app's shutdown owner holds the stop signals: never
+    /// without a server.
+    #[cfg(not(feature = "server"))]
+    const fn server_owns() -> bool {
+        false
+    }
+
+    /// Whether the relay already started an exit.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Seen {
+        /// No request started an exit yet.
+        Nothing,
+        /// A request started the exit.
+        Requested,
+    }
+
+    /// What one stop request does.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum StopAction {
+        /// Start the one exit, which runs every pre-exit stage.
+        BeginExit(ProcessStatus),
+        /// End the process at once, running no stage.
+        Force(ProcessStatus),
+        /// The served app's shutdown owner handles the request.
+        LeaveToServer,
+    }
+
+    /// Decide one stop request: only the first on an idle process exits
+    /// through the stages, and any request once an exit has begun forces.
+    const fn on_stop(
+        seen: Seen,
+        exit_begun: bool,
+        server_owns: bool,
+        signal: StopSignal,
+    ) -> StopAction {
+        let status = signal.exit_status();
+        match (seen, exit_begun, server_owns) {
+            (Seen::Requested, _, _) | (Seen::Nothing, true, _) => StopAction::Force(status),
+            (Seen::Nothing, false, true) => StopAction::LeaveToServer,
+            (Seen::Nothing, false, false) => StopAction::BeginExit(status),
+        }
+    }
+
+    /// Carry out `action`. The exit runs on its own thread, never the relay's,
+    /// so the relay stays free to force on the next request; a refused exit
+    /// thread forces at once.
+    fn act(action: StopAction) {
+        match action {
+            StopAction::BeginExit(status) => {
+                let exit = crate::threads::spawn_named(EXIT_THREAD, move || {
+                    super::exit_process(status);
+                });
+                if exit.is_err() {
+                    super::force_exit(status);
+                }
+            }
+            StopAction::Force(status) => super::force_exit(status),
+            StopAction::LeaveToServer => {}
+        }
+    }
+
+    /// Forward each delivery of `listener` into `tx` as `signal`, on its own
+    /// task; a full queue drops the copy.
+    macro_rules! forward {
+        ($listener:expr, $tx:expr, $signal:expr) => {{
+            let mut listener = $listener;
+            let tx = $tx.clone();
+            let signal = $signal;
+            tokio::spawn(async move {
+                while listener.recv().await.is_some() {
+                    if matches!(
+                        tx.try_send(signal),
+                        Err(mpsc::error::TrySendError::Closed(_))
+                    ) {
+                        return;
+                    }
+                }
+            });
+        }};
+    }
+
+    /// Whether the relay takes `signal` on this target: the hangup only where
+    /// its inherited disposition is read, so an unread `nohup` is never
+    /// overridden.
+    #[cfg(unix)]
+    const fn takes(signal: StopSignal) -> bool {
+        match signal {
+            StopSignal::Interrupt | StopSignal::Terminate => true,
+            StopSignal::Hangup => cfg!(target_os = "linux"),
+        }
+    }
+
+    /// Register a listener for each stop signal the relay takes and the
+    /// process did not inherit as ignored.
+    #[cfg(unix)]
+    fn os_listeners(tx: &mpsc::Sender<StopSignal>) -> Result<(), RelayRefused> {
+        use tokio::signal::unix::{SignalKind, signal};
+        let ignored = super::inherited_ignored();
+        let mut refused = None;
+        for (kind, which) in [
+            (SignalKind::interrupt(), StopSignal::Interrupt),
+            (SignalKind::terminate(), StopSignal::Terminate),
+            (SignalKind::hangup(), StopSignal::Hangup),
+        ] {
+            if !takes(which) || ignored.contains(kind.as_raw_value()) {
+                continue;
+            }
+            match signal(kind) {
+                Ok(listener) => forward!(listener, tx, which),
+                Err(e) if refused.is_none() => refused = Some(RelayRefused::Listen(e.kind())),
+                Err(_) => {}
+            }
+        }
+        refused.map_or(Ok(()), Err)
+    }
+
+    /// Register the console control listeners: Ctrl-C and Ctrl-Break must
+    /// register; close, logoff and shutdown are taken when they can be.
+    #[cfg(windows)]
+    fn os_listeners(tx: &mpsc::Sender<StopSignal>) -> Result<(), RelayRefused> {
+        use super::ConsoleEvent;
+        use tokio::signal::windows;
+        let refused = |e: std::io::Error| RelayRefused::Listen(e.kind());
+        forward!(
+            windows::ctrl_c().map_err(refused)?,
+            tx,
+            ConsoleEvent::CtrlC.signal()
+        );
+        forward!(
+            windows::ctrl_break().map_err(refused)?,
+            tx,
+            ConsoleEvent::CtrlBreak.signal()
+        );
+        if let Ok(close) = windows::ctrl_close() {
+            forward!(close, tx, ConsoleEvent::Close.signal());
+        }
+        if let Ok(logoff) = windows::ctrl_logoff() {
+            forward!(logoff, tx, ConsoleEvent::Logoff.signal());
+        }
+        if let Ok(shutdown) = windows::ctrl_shutdown() {
+            forward!(shutdown, tx, ConsoleEvent::Shutdown.signal());
+        }
+        Ok(())
+    }
+
+    /// No stop signal can be listened to on this target.
+    #[cfg(not(any(unix, windows)))]
+    const fn os_listeners(_: &mpsc::Sender<StopSignal>) -> Result<(), RelayRefused> {
+        Err(RelayRefused::Unsupported)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::StopSignal;
+        use super::{Seen, StopAction, on_stop};
+
+        #[test]
+        fn stop_decision_table_is_total() {
+            for signal in [
+                StopSignal::Interrupt,
+                StopSignal::Terminate,
+                StopSignal::Hangup,
+            ] {
+                let status = signal.exit_status();
+                for (seen, begun, owns, expected) in [
+                    (Seen::Nothing, false, false, StopAction::BeginExit(status)),
+                    (Seen::Nothing, false, true, StopAction::LeaveToServer),
+                    (Seen::Nothing, true, false, StopAction::Force(status)),
+                    (Seen::Nothing, true, true, StopAction::Force(status)),
+                    (Seen::Requested, false, false, StopAction::Force(status)),
+                    (Seen::Requested, false, true, StopAction::Force(status)),
+                    (Seen::Requested, true, false, StopAction::Force(status)),
+                    (Seen::Requested, true, true, StopAction::Force(status)),
+                ] {
+                    assert_eq!(
+                        on_stop(seen, begun, owns, signal),
+                        expected,
+                        "{seen:?} begun={begun} server={owns} {signal:?}"
+                    );
+                }
+            }
+        }
+
+        /// Child-process cases: each child is an ignored test of this module,
+        /// re-run by the parent in a fresh process of this test binary, so its
+        /// relay, its stages and its exit stay out of the parent.
+        #[cfg(unix)]
+        mod children {
+            use super::super::super::pre_exit::{ExitDump, Registration, StageTicket, register};
+            use super::super::super::{ProcessStatus, exit_process};
+            use super::super::{RelayRefused, install, install_with};
+            use rustix::process::{Pid, Signal, kill_process};
+            use std::io::{BufRead as _, StdoutLock, Write as _};
+            use std::process::{ChildStdout, Command, ExitStatus, Stdio};
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use std::sync::mpsc::Receiver;
+            use std::time::{Duration, Instant};
+
+            /// How long the parent waits for any one child event.
+            const CHILD_LIMIT: Duration = Duration::from_secs(30);
+            /// How long the parent waits for a dead child's last stderr lines.
+            const DRAIN_WAIT: Duration = Duration::from_secs(5);
+            /// How long an ignored signal must leave a child running.
+            const IGNORED_WAIT: Duration = Duration::from_millis(300);
+            /// Racing exits the parent drives.
+            const RACES: usize = 200;
+            /// The status the children's own exit asks for.
+            const CHILD_EXIT_CODE: i64 = 7;
+
+            /// The child's stderr line once its relay and stages are set.
+            const READY: &str = "<ready>";
+            /// The line a hanging stage writes before it parks.
+            const ENTERED: &str = "<entered>";
+            const TERMINAL_MARK: &str = "<terminal-restore>";
+            const LINE_MARK: &str = "<line-close>";
+            const DUMP_MARK: &str = "<session-dump>";
+            /// The runtime log text of a refused relay.
+            const REFUSED_LOG: &str = "stop signals keep their default action";
+
+            /// How the parent starts a child.
+            #[derive(Clone, Copy)]
+            enum Launch {
+                Direct,
+                /// Through a shell that sets `SIGHUP` ignored, as `nohup` does.
+                #[cfg(target_os = "linux")]
+                IgnoringHangup,
+            }
+
+            /// A running child; dropping it kills a child still running.
+            struct Child {
+                process: std::process::Child,
+                lines: Receiver<String>,
+                stderr: Vec<String>,
+                /// Held open and never read, so a writer that fills it blocks.
+                _stdout: Option<ChildStdout>,
+            }
+
+            /// What a child ended with; `status` is `None` when it outlived
+            /// [`CHILD_LIMIT`].
+            struct Ended {
+                status: Option<ExitStatus>,
+                stderr: String,
+            }
+
+            impl Ended {
+                fn exited_with(&self, status: ProcessStatus) -> bool {
+                    self.status.is_some_and(|s| s.code() == Some(status.code()))
+                }
+
+                fn marks(&self, mark: &str) -> usize {
+                    self.stderr.matches(mark).count()
+                }
+            }
+
+            #[allow(clippy::expect_used)] // test harness: a test binary that cannot re-run itself is an environment issue
+            fn spawn(child: &str, launch: Launch) -> Child {
+                let module = module_path!();
+                let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+                let filter = format!("{module}::{child}");
+                let exe = std::env::current_exe().expect("the test binary");
+                let args = [
+                    "--exact",
+                    filter.as_str(),
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ];
+                let mut command = match launch {
+                    Launch::Direct => Command::new(exe),
+                    #[cfg(target_os = "linux")]
+                    Launch::IgnoringHangup => {
+                        let mut shell = Command::new("/bin/sh");
+                        shell
+                            .args(["-c", r#"trap "" HUP; exec "$0" "$@""#])
+                            .arg(exe);
+                        shell
+                    }
+                };
+                let mut process = command
+                    .args(args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("start the child");
+                let stdout = process.stdout.take();
+                let stderr = process.stderr.take().expect("the child's stderr");
+                let (tx, lines) = std::sync::mpsc::channel();
+                std::thread::Builder::new()
+                    .spawn(move || {
+                        for line in std::io::BufReader::new(stderr).lines() {
+                            let Ok(line) = line else { return };
+                            if tx.send(line).is_err() {
+                                return;
+                            }
+                        }
+                    })
+                    .expect("start the stderr reader");
+                Child {
+                    process,
+                    lines,
+                    stderr: Vec::new(),
+                    _stdout: stdout,
+                }
+            }
+
+            impl Child {
+                fn send(&self, signal: Signal) {
+                    let _ = kill_process(Pid::from_child(&self.process), signal);
+                }
+
+                /// Read stderr until a line holding `mark`, at most
+                /// [`CHILD_LIMIT`]; whether it came.
+                fn wait_for(&mut self, mark: &str) -> bool {
+                    let started = Instant::now();
+                    loop {
+                        if self.stderr.iter().any(|line| line.contains(mark)) {
+                            return true;
+                        }
+                        let left = CHILD_LIMIT.saturating_sub(started.elapsed());
+                        match self.lines.recv_timeout(left) {
+                            Ok(line) => self.stderr.push(line),
+                            Err(_) => return false,
+                        }
+                    }
+                }
+
+                fn alive_after(&mut self, wait: Duration) -> bool {
+                    std::thread::sleep(wait);
+                    matches!(self.process.try_wait(), Ok(None))
+                }
+
+                /// Wait for the child's end, at most [`CHILD_LIMIT`].
+                fn finish(&mut self) -> Ended {
+                    let started = Instant::now();
+                    let status = loop {
+                        match self.process.try_wait() {
+                            Ok(Some(status)) => break Some(status),
+                            Ok(None) if started.elapsed() <= CHILD_LIMIT => {
+                                std::thread::sleep(Duration::from_millis(20));
+                            }
+                            _ => break None,
+                        }
+                    };
+                    if status.is_none() {
+                        let _ = self.process.kill();
+                        let _ = self.process.wait();
+                    }
+                    while let Ok(line) = self.lines.recv_timeout(DRAIN_WAIT) {
+                        self.stderr.push(line);
+                    }
+                    Ended {
+                        status,
+                        stderr: self.stderr.join("\n"),
+                    }
+                }
+
+                fn log(&self) -> String {
+                    self.stderr.join("\n")
+                }
+            }
+
+            impl Drop for Child {
+                fn drop(&mut self) {
+                    if matches!(self.process.try_wait(), Ok(None)) {
+                        let _ = self.process.kill();
+                        let _ = self.process.wait();
+                    }
+                }
+            }
+
+            /// Whether this process inherited `signal` as ignored: a child
+            /// inherits the ignore too, and the relay rightly leaves it be.
+            fn ignored_here(signal: Signal) -> bool {
+                #[cfg(target_os = "linux")]
+                {
+                    use crate::system::{StatusMask, read_self_status, status_mask};
+                    read_self_status()
+                        .and_then(|status| status_mask(&status, StatusMask::Ignored))
+                        .is_some_and(|set| set.contains(signal.as_raw()))
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = signal;
+                    false
+                }
+            }
+
+            /// Start `child`, wait for its ready line, then send `signal`.
+            fn signalled(child: &str, launch: Launch, signal: Signal) -> Child {
+                let mut child = spawn(child, launch);
+                assert!(child.wait_for(READY), "never ready:\n{}", child.log());
+                child.send(signal);
+                child
+            }
+
+            fn mark(text: &str) {
+                let _ = writeln!(std::io::stderr().lock(), "{text}");
+            }
+
+            fn park_forever() -> ! {
+                loop {
+                    std::thread::park();
+                }
+            }
+
+            fn terminal(_: &mut StdoutLock<'static>) {
+                mark(TERMINAL_MARK);
+            }
+
+            fn line(_: &mut StdoutLock<'static>) {
+                mark(LINE_MARK);
+            }
+
+            fn hanging_line(_: &mut StdoutLock<'static>) {
+                mark(ENTERED);
+                park_forever();
+            }
+
+            struct MarkingDump;
+
+            impl ExitDump for MarkingDump {
+                fn dump(self: Box<Self>) {
+                    mark(DUMP_MARK);
+                }
+            }
+
+            /// Install the relay and register all three stages, `line_stage`
+            /// as the line close.
+            #[allow(clippy::expect_used)] // test child: a refused relay or stage fails the test
+            fn installed_with_stages(
+                line_stage: fn(&mut StdoutLock<'static>),
+            ) -> [StageTicket<'static>; 3] {
+                install().expect("the relay starts");
+                let dump =
+                    register(Registration::SessionDump(Box::new(MarkingDump))).expect("registers");
+                let line = register(Registration::LineClose(line_stage)).expect("registers");
+                let terminal =
+                    register(Registration::TerminalRestore(terminal)).expect("registers");
+                [terminal, line, dump]
+            }
+
+            fn assert_every_stage_ran_once_in_order(ended: &Ended) {
+                for marker in [TERMINAL_MARK, LINE_MARK, DUMP_MARK] {
+                    assert_eq!(ended.marks(marker), 1, "{marker}:\n{}", ended.stderr);
+                }
+                let terminal = ended.stderr.find(TERMINAL_MARK);
+                let line = ended.stderr.find(LINE_MARK);
+                let dump = ended.stderr.find(DUMP_MARK);
+                assert!(
+                    terminal < line && line < dump,
+                    "out of order:\n{}",
+                    ended.stderr
+                );
+            }
+
+            /// Send `signal` to a staged child; it must run every stage and
+            /// end with `status`.
+            fn assert_signal_runs_the_stages(signal: Signal, status: ProcessStatus) {
+                if ignored_here(signal) {
+                    return;
+                }
+                let ended = signalled("staged_child", Launch::Direct, signal).finish();
+                assert!(
+                    ended.exited_with(status),
+                    "{:?} instead of {status:?}:\n{}",
+                    ended.status,
+                    ended.stderr
+                );
+                assert_every_stage_ran_once_in_order(&ended);
+            }
+
+            #[ignore = "run as a child process by the signal tests"]
+            #[test]
+            fn staged_child() {
+                let _held = installed_with_stages(line);
+                mark(READY);
+                park_forever();
+            }
+
+            #[test]
+            fn sigterm_runs_every_stage_then_exits_143() {
+                assert_signal_runs_the_stages(Signal::TERM, ProcessStatus::TERMINATED);
+            }
+
+            #[test]
+            fn sigint_exits_130() {
+                assert_signal_runs_the_stages(Signal::INT, ProcessStatus::INTERRUPTED);
+            }
+
+            #[cfg(target_os = "linux")]
+            #[test]
+            fn sighup_exits_129() {
+                assert_signal_runs_the_stages(Signal::HUP, ProcessStatus::HANGUP);
+            }
+
+            #[test]
+            fn a_second_signal_forces_exit_while_a_stage_hangs() {
+                if ignored_here(Signal::TERM) || ignored_here(Signal::INT) {
+                    return;
+                }
+                let mut child = signalled("hanging_stage_child", Launch::Direct, Signal::TERM);
+                assert!(child.wait_for(ENTERED), "no stage ran:\n{}", child.log());
+                child.send(Signal::INT);
+                let ended = child.finish();
+                assert!(
+                    ended.exited_with(ProcessStatus::INTERRUPTED),
+                    "{:?}:\n{}",
+                    ended.status,
+                    ended.stderr
+                );
+                assert_eq!(ended.marks(DUMP_MARK), 0, "{}", ended.stderr);
+            }
+
+            #[ignore = "run as a child process by a_second_signal_forces_exit_while_a_stage_hangs"]
+            #[test]
+            fn hanging_stage_child() {
+                let _held = installed_with_stages(hanging_line);
+                mark(READY);
+                park_forever();
+            }
+
+            #[test]
+            fn a_stalled_stdout_reader_cannot_hold_the_process() {
+                if ignored_here(Signal::TERM) {
+                    return;
+                }
+                let mut child = signalled("stalled_stdout_child", Launch::Direct, Signal::TERM);
+                std::thread::sleep(IGNORED_WAIT);
+                child.send(Signal::TERM);
+                let ended = child.finish();
+                assert!(
+                    ended.exited_with(ProcessStatus::TERMINATED),
+                    "{:?}:\n{}",
+                    ended.status,
+                    ended.stderr
+                );
+            }
+
+            #[allow(clippy::expect_used)] // test child: a refused relay or thread fails the test
+            #[ignore = "run as a child process by a_stalled_stdout_reader_cannot_hold_the_process"]
+            #[test]
+            fn stalled_stdout_child() {
+                static WRITES: AtomicUsize = AtomicUsize::new(0);
+                let _held = installed_with_stages(line);
+                // The writer keeps the stdout lock while the unread pipe fills.
+                std::thread::Builder::new()
+                    .spawn(|| {
+                        let mut out = std::io::stdout().lock();
+                        while out.write_all(&[b'x'; 4096]).is_ok() {
+                            WRITES.fetch_add(1, Ordering::SeqCst);
+                        }
+                    })
+                    .expect("start the stalled writer");
+                while WRITES.load(Ordering::SeqCst) == 0 {
+                    std::thread::yield_now();
+                }
+                mark(READY);
+                park_forever();
+            }
+
+            #[test]
+            fn a_signal_during_a_program_exit_forces() {
+                if ignored_here(Signal::TERM) {
+                    return;
+                }
+                let mut child = spawn("exiting_child", Launch::Direct);
+                assert!(child.wait_for(ENTERED), "no stage ran:\n{}", child.log());
+                child.send(Signal::TERM);
+                let ended = child.finish();
+                assert!(
+                    ended.exited_with(ProcessStatus::TERMINATED),
+                    "{:?}:\n{}",
+                    ended.status,
+                    ended.stderr
+                );
+            }
+
+            #[ignore = "run as a child process by a_signal_during_a_program_exit_forces"]
+            #[test]
+            fn exiting_child() {
+                let _held = installed_with_stages(hanging_line);
+                exit_process(ProcessStatus::requested(CHILD_EXIT_CODE));
+            }
+
+            #[test]
+            fn a_signal_racing_a_program_exit_never_double_runs_stages() {
+                if ignored_here(Signal::TERM) {
+                    return;
+                }
+                let own = ProcessStatus::requested(CHILD_EXIT_CODE);
+                for race in 0..RACES {
+                    let ended =
+                        signalled("racing_exit_child", Launch::Direct, Signal::TERM).finish();
+                    assert!(
+                        ended.exited_with(own) || ended.exited_with(ProcessStatus::TERMINATED),
+                        "race {race}: {:?}:\n{}",
+                        ended.status,
+                        ended.stderr
+                    );
+                    for marker in [TERMINAL_MARK, LINE_MARK, DUMP_MARK] {
+                        assert!(
+                            ended.marks(marker) <= 1,
+                            "race {race}: {marker} ran twice:\n{}",
+                            ended.stderr
+                        );
+                    }
+                }
+            }
+
+            #[ignore = "run as a child process by a_signal_racing_a_program_exit_never_double_runs_stages"]
+            #[test]
+            fn racing_exit_child() {
+                let _held = installed_with_stages(line);
+                mark(READY);
+                exit_process(ProcessStatus::requested(CHILD_EXIT_CODE));
+            }
+
+            #[cfg(target_os = "linux")]
+            #[test]
+            fn an_inherited_ignored_hangup_stays_ignored() {
+                if ignored_here(Signal::TERM) {
+                    return;
+                }
+                let mut child = signalled("staged_child", Launch::IgnoringHangup, Signal::HUP);
+                assert!(
+                    child.alive_after(IGNORED_WAIT),
+                    "an inherited-ignored hangup ended the child:\n{}",
+                    child.log()
+                );
+                child.send(Signal::TERM);
+                let ended = child.finish();
+                assert!(
+                    ended.exited_with(ProcessStatus::TERMINATED),
+                    "{:?}:\n{}",
+                    ended.status,
+                    ended.stderr
+                );
+            }
+
+            #[test]
+            fn a_relay_refusal_keeps_the_default_action() {
+                use std::os::unix::process::ExitStatusExt;
+                if ignored_here(Signal::TERM) {
+                    return;
+                }
+                let ended = signalled("refused_relay_child", Launch::Direct, Signal::TERM).finish();
+                assert_eq!(
+                    ended.status.as_ref().and_then(ExitStatusExt::signal),
+                    Some(Signal::TERM.as_raw()),
+                    "{:?}:\n{}",
+                    ended.status,
+                    ended.stderr
+                );
+                assert_eq!(ended.marks(LINE_MARK), 0, "{}", ended.stderr);
+                assert_eq!(ended.marks(REFUSED_LOG), 1, "{}", ended.stderr);
+            }
+
+            #[allow(clippy::expect_used)] // test child: a refused stage fails the test
+            #[ignore = "run as a child process by a_relay_refusal_keeps_the_default_action"]
+            #[test]
+            fn refused_relay_child() {
+                fn refusing(
+                    _: &tokio::sync::mpsc::Sender<crate::system::StopSignal>,
+                ) -> Result<(), RelayRefused> {
+                    Err(RelayRefused::Listen(std::io::ErrorKind::Other))
+                }
+                assert_eq!(
+                    install_with(refusing),
+                    Err(RelayRefused::Listen(std::io::ErrorKind::Other))
+                );
+                let _held = register(Registration::LineClose(line)).expect("registers");
+                mark(READY);
+                park_forever();
+            }
+
+            #[cfg(target_os = "linux")]
+            #[test]
+            fn install_is_idempotent() {
+                let ended = spawn("idempotent_child", Launch::Direct).finish();
+                assert!(
+                    ended.status.is_some_and(|s| s.success()),
+                    "{:?}:\n{}",
+                    ended.status,
+                    ended.stderr
+                );
+                assert_eq!(ended.marks(READY), 1, "{}", ended.stderr);
+            }
+
+            #[cfg(target_os = "linux")]
+            #[ignore = "run as a child process by install_is_idempotent"]
+            #[test]
+            fn idempotent_child() {
+                let first = install();
+                assert!(first.is_ok(), "{first:?}");
+                assert_eq!(install(), first);
+                let relays = std::fs::read_dir("/proc/self/task")
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter_map(|task| std::fs::read_to_string(task.path().join("comm")).ok())
+                    .filter(|name| name.trim_end() == super::super::RELAY_THREAD)
+                    .count();
+                assert_eq!(relays, 1);
+                mark(READY);
+            }
+        }
+    }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -7811,11 +8853,15 @@ mod process_status_tests {
         assert_eq!(ProcessStatus::FAILURE.code(), 1);
     }
 
-    #[cfg(feature = "server")]
+    #[cfg(any(
+        feature = "server",
+        all(feature = "tokio", not(target_arch = "wasm32"))
+    ))]
     #[test]
-    fn the_forced_shutdown_statuses_are_128_plus_the_signal() {
+    fn the_stop_statuses_are_128_plus_the_signal() {
         assert_eq!(ProcessStatus::INTERRUPTED.code(), 130);
         assert_eq!(ProcessStatus::TERMINATED.code(), 143);
+        assert_eq!(ProcessStatus::HANGUP.code(), 129);
     }
 }
 

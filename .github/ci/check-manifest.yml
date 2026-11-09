@@ -99,8 +99,8 @@ checks:
       The Windows output-directory, `ipe_fs_open`, `ipe_sandbox` and
       runtime code compiles, tests included, so its held-handle,
       reparse-point-refusing file operations, the runtime's fail-closed
-      root-confined read and other Windows-only refusals ship rather than
-      rot unbuilt.
+      root-confined read, the terminal drivers' console stop-signal relay
+      and other Windows-only refusals ship rather than rot unbuilt.
   - context: quick-check
     disposition: gate
     producer: ci.yml

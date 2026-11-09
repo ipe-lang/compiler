@@ -223,11 +223,14 @@ rustix = { version = "1", features = ["pty", "termios", "fs", "process", "std"] 
 # Narrow feature set matching the emitted floor async runtime (project.rs
 # `async_runtime_cargo_toml`): `rt`/`rt-multi-thread`/`macros`/`time`, plus
 # `sync` (the shared Cli/Tui event loop `tea.rs` — compiled under the `tokio`
-# feature — uses `tokio::sync::mpsc`). The `net` arm is added only by the
-# `server`/`web`/`websocket_client` surface features. `full` is deliberately
-# NOT used here so depending on the crate does not pull all of tokio.
+# feature — uses `tokio::sync::mpsc`), plus `signal` (the stop-signal relay
+# `system::exit_signals`, compiled wherever tokio is, which every Cli, Tui and
+# worker driver installs; matches the emitted `tokio_signal_cargo_toml` step).
+# The `net` arm is added only by the `server`/`web`/`websocket_client` surface
+# features. `full` is deliberately NOT used here so depending on the crate does
+# not pull all of tokio.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"], optional = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "signal"], optional = true }
 
 # wasm32 floor: the static wasm module set declares `uuid_kernel`, so the
 # crate is always present there. Like the native entry it carries no RNG
@@ -452,7 +455,8 @@ csv_kernel = ["csv", "tokio", "random"]
 cache_kernel = ["tokio", "random"]
 # `tokio`: tea.rs (the shared Cli/Tui event loop, pulled by tui/app.rs) uses
 # `tokio::sync::mpsc`. Without it the standalone `--features tui` build fails to
-# resolve the `tea` module + `tokio`.
+# resolve the `tea` module + `tokio`. The stop-signal relay's `tokio/signal`
+# rides the base tokio dependency.
 tui = ["unicode-width", "crossterm", "tokio", "random"]
 # The server-free render core: the target-neutral `crate::dom` diff/dispatch/form
 # pipeline, the `web::style_inject`/`page_shell` render helpers, and the

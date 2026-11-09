@@ -31,7 +31,9 @@ allow-expect-in-tests = true
 #
 # The process ends only through `system::exit_process`, which runs the pre-exit
 # stages Drop would have run (terminal restore, telemetry exporter flush) before
-# its one `std::process::exit`.
+# its `std::process::exit`. The one other exit is `system::force_exit`, taken by
+# a repeated stop request: it must end the process while the first exit is stuck
+# in a stage or waits on the stdout lock.
 #
 # Every random mint draws from `entropy::fill_entropy`, the one OS entropy
 # source, which refuses with `EntropyError` instead of panicking. A direct
@@ -45,7 +47,7 @@ disallowed-methods = [
     { path = "core::option::Option::unwrap_unchecked", reason = "UB on None; return a Result or model the invariant in a type" },
     { path = "core::result::Result::unwrap_unchecked", reason = "UB on Err; return a Result or model the invariant in a type" },
     { path = "std::process::abort", reason = "abrupt termination that skips Drop; return a Result" },
-    { path = "std::process::exit", reason = "skips the pre-exit stages (terminal restore, exporter flush); end the process through `system::exit_process`" },
+    { path = "std::process::exit", reason = "skips the pre-exit stages (terminal restore, exporter flush); end the process through `system::exit_process` (only a repeated stop request's `system::force_exit` skips them)" },
     { path = "std::panic::panic_any", reason = "a panic; return a Result" },
     { path = "core::hint::unreachable_unchecked", reason = "UB; model the invariant in a type instead" },
     { path = "std::env::home_dir", reason = "an unvalidated home; read it through `system::home_dir`" },

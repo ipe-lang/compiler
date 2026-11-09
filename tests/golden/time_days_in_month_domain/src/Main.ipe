@@ -1,0 +1,14 @@
+module Main exposing (main)
+import Ipe.Io as Io
+import Ipe.String
+import Ipe.Task as Task
+import Ipe.Time as Time
+
+-- Month 13 lies outside every year, so `Time.daysInMonth` has no answer: the
+-- program ends in a typed InvalidInput error (exit 1, nothing printed)
+-- instead of a sentinel day count. The call runs inside a task step, where a
+-- runtime trip becomes the program's typed error.
+
+main =
+    Task.succeed ()
+        |> Task.andThen (\_ -> Io.println (String.fromInt (Time.daysInMonth 2024 13)))

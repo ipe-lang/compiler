@@ -332,6 +332,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --locked -p ipe -p ipe_fs_open -p ipe_sandbox --all-targets
       - run: cargo check --locked -p ipe-runtime-rust --lib --tests --no-default-features
+      - run: cargo check --locked -p ipe-runtime-rust --lib --tests --features tui
 
   # No compiler-internal jargon or raw Rust types leak into user-facing text
   # (rendered diagnostic goldens + `ipe explain` pages). Pure git + ripgrep, no

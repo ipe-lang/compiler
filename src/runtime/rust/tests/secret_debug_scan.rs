@@ -453,7 +453,7 @@ const DEBUG_SITES: &[DebugSite] = &[
     },
     DebugSite {
         file: "rust/src/project.rs",
-        func: "ssrf_cargo_toml",
+        func: "tokio_feature_cargo_toml",
         count: 1,
         why: DIAGNOSTIC,
     },

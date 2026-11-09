@@ -1128,7 +1128,7 @@ pub(crate) fn recursion_depth_for_test() -> usize {
 
 /// A typed fault the runtime raises inside pure code.
 ///
-/// The one payload [`trip`] unwinds with. A guard deep inside a pure
+/// The one payload `trip` unwinds with. A guard deep inside a pure
 /// computation has no error channel to return through, so it unwinds with a
 /// value of this type, and every catch boundary reads it back with
 /// [`runtime_trip`] — by type, never by a substring of a message — and turns it
@@ -1137,27 +1137,166 @@ pub(crate) fn recursion_depth_for_test() -> usize {
 /// a new variant cannot reach a boundary without all three. A variant carries
 /// only `Copy` data (static names, counts), so the payload stays trivially
 /// droppable on the unwind path.
+///
+/// Only the runtime mints a trip: every variant is `#[non_exhaustive]`, so code
+/// outside the crate reads one by pattern (`RuntimeTrip::RecursionLimit { .. }`)
+/// but cannot build one, and `trip` is crate-private. A catch boundary can
+/// therefore trust a payload that downcasts to this type as the runtime's own.
+///
+/// ```compile_fail,E0639
+/// use ipe_runtime_rust::core::{IntOp, RuntimeTrip};
+/// let _forged = RuntimeTrip::IntOverflow { op: IntOp::Add };
+/// ```
+///
+/// ```compile_fail
+/// use ipe_runtime_rust::core::RuntimeTrip;
+/// let _forged = RuntimeTrip::RecursionLimit;
+/// ```
+///
+/// ```compile_fail
+/// use ipe_runtime_rust::core::{IntOp, RuntimeTrip, runtime_trip};
+/// let caught = std::panic::catch_unwind(|| ipe_runtime_rust::math::ipe_int_add(i64::MAX, 1));
+/// let tripped = caught.err().and_then(|payload| runtime_trip(payload.as_ref()));
+/// if let Some(fault @ RuntimeTrip::IntOverflow { op: IntOp::Add, .. }) = tripped {
+///     ipe_runtime_rust::core::trip(fault);
+/// }
+/// ```
+///
+/// The same imports read a trip the runtime raised:
+///
+/// ```
+/// use ipe_runtime_rust::core::{IntOp, RuntimeTrip, runtime_trip};
+/// let caught = std::panic::catch_unwind(|| ipe_runtime_rust::math::ipe_int_add(i64::MAX, 1));
+/// let tripped = caught.err().and_then(|payload| runtime_trip(payload.as_ref()));
+/// assert!(matches!(tripped, Some(RuntimeTrip::IntOverflow { op: IntOp::Add, .. })));
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeTrip {
     /// The per-thread recursion depth budget, or the stack red zone, was
     /// exceeded.
+    #[non_exhaustive]
     RecursionLimit,
     /// An `Int` operation's exact result lies outside the 64-bit `Int` range.
+    #[non_exhaustive]
     IntOverflow {
         /// The operation whose result left the range.
         op: IntOp,
     },
     /// A `Float` to `Int` conversion met NaN or an infinity.
+    #[non_exhaustive]
     NonFiniteToInt {
         /// The conversion that met the non-finite value.
         op: FloatToIntOp,
     },
     /// A kernel was asked for more output than its declared ceiling
     /// ([`CeilingKernel::ceiling`]).
+    #[non_exhaustive]
     OutputCeiling {
         /// The kernel whose requested output passed its ceiling.
         kernel: CeilingKernel,
     },
+    /// An `Ipe.Time` kernel met an argument outside its calendar domain.
+    ///
+    /// Each kernel refuses by exactly one rule ([`TimeOp::cause`]), so the
+    /// rule is read from the kernel, never stored beside it: a kernel paired
+    /// with a rule it cannot break has no representation.
+    #[non_exhaustive]
+    TimeDomain {
+        /// The kernel that refused the argument.
+        op: TimeOp,
+    },
+}
+
+/// Declares [`TimeOp`] and [`TimeOp::ALL`] from one list.
+///
+/// A variant cannot be missing from `ALL`: both expand from the same rows.
+macro_rules! time_ops {
+    ($($(#[$meta:meta])* $variant:ident,)+) => {
+        /// The `Ipe.Time` kernels that refuse an argument outside the calendar.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum TimeOp {
+            $($(#[$meta])* $variant,)+
+        }
+
+        impl TimeOp {
+            /// Every kernel, once each, in declaration order.
+            pub const ALL: [Self; Self::COUNT] = [$(Self::$variant),+];
+
+            const COUNT: usize = [$(Self::$variant),+].len();
+        }
+    };
+}
+
+time_ops! {
+    /// `Time.daysInMonth`.
+    DaysInMonth,
+    /// `Time.timeString`.
+    TimeString,
+    /// `Time.format`.
+    Format,
+    /// `Time.formatHTTP`.
+    FormatHttp,
+    /// `Time.formatISO8601`.
+    FormatIso8601,
+    /// `Time.formatRFC3339`.
+    FormatRfc3339,
+}
+
+impl TimeOp {
+    /// The one calendar rule this kernel refuses an argument by.
+    #[must_use]
+    pub const fn cause(self) -> TimeDomainCause {
+        match self {
+            Self::DaysInMonth => TimeDomainCause::MonthOutsideYear,
+            Self::TimeString
+            | Self::Format
+            | Self::FormatHttp
+            | Self::FormatIso8601
+            | Self::FormatRfc3339 => TimeDomainCause::InstantOutsideCalendar,
+        }
+    }
+}
+
+/// The calendar rule a [`RuntimeTrip::TimeDomain`] argument broke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeDomainCause {
+    /// A month number outside `1..=12`.
+    MonthOutsideYear,
+    /// An instant before the first or after the last calendar year the
+    /// formatters render.
+    InstantOutsideCalendar,
+}
+
+/// The text of [`TimeDomainCause::MonthOutsideYear`].
+macro_rules! month_rule {
+    () => {
+        "the month must be 1 to 12"
+    };
+}
+
+/// The text of [`TimeDomainCause::InstantOutsideCalendar`].
+macro_rules! instant_rule {
+    () => {
+        "the instant lies outside the calendar years `Ipe.Time` renders"
+    };
+}
+
+impl TimeDomainCause {
+    /// The rule as a refusal message states it.
+    #[must_use]
+    pub const fn rule(self) -> &'static str {
+        match self {
+            Self::MonthOutsideYear => month_rule!(),
+            Self::InstantOutsideCalendar => instant_rule!(),
+        }
+    }
+}
+
+/// The message of `Ipe.Time` kernel `$kernel` refusing an argument by `$rule`.
+macro_rules! time_domain_message {
+    ($kernel:literal, $rule:expr) => {
+        concat!("`", $kernel, "`: ", $rule)
+    };
 }
 
 /// Declares [`CeilingKernel`] and [`CeilingKernel::ALL`] from one list.
@@ -1311,6 +1450,7 @@ impl RuntimeTrip {
             Self::IntOverflow { .. } => "IntOverflow",
             Self::NonFiniteToInt { .. } => "NonFiniteToInt",
             Self::OutputCeiling { .. } => "OutputCeiling",
+            Self::TimeDomain { .. } => "TimeDomain",
         }
     }
 
@@ -1359,12 +1499,38 @@ impl RuntimeTrip {
                     output_ceiling_message!("String.pad", "16000000", "character")
                 }
             },
+            Self::TimeDomain { op } => Self::time_domain_message(op),
+        }
+    }
+
+    /// The message of an `Ipe.Time` kernel refusing an argument by its one
+    /// rule ([`TimeOp::cause`]).
+    const fn time_domain_message(op: TimeOp) -> &'static str {
+        /// The month rule.
+        macro_rules! month {
+            ($kernel:literal) => {
+                time_domain_message!($kernel, month_rule!())
+            };
+        }
+        /// The calendar-range rule.
+        macro_rules! instant {
+            ($kernel:literal) => {
+                time_domain_message!($kernel, instant_rule!())
+            };
+        }
+        match op {
+            TimeOp::DaysInMonth => month!("Time.daysInMonth"),
+            TimeOp::TimeString => instant!("Time.timeString"),
+            TimeOp::Format => instant!("Time.format"),
+            TimeOp::FormatHttp => instant!("Time.formatHTTP"),
+            TimeOp::FormatIso8601 => instant!("Time.formatISO8601"),
+            TimeOp::FormatRfc3339 => instant!("Time.formatRFC3339"),
         }
     }
 
     /// The typed error a catch boundary hands the program for this trip.
     ///
-    /// An arithmetic trip is `InvalidInput`: the operands admit no `Int`
+    /// An arithmetic or calendar trip is `InvalidInput`: the operands admit no
     /// result at any bound, so no larger limit would accept them. A recursion
     /// or output-ceiling trip is `LimitExceeded`: a larger declared bound would
     /// accept the same input.
@@ -1374,7 +1540,7 @@ impl RuntimeTrip {
             Self::RecursionLimit | Self::OutputCeiling { .. } => {
                 crate::IpeError::limit_exceeded(self.message().to_owned())
             }
-            Self::IntOverflow { .. } | Self::NonFiniteToInt { .. } => {
+            Self::IntOverflow { .. } | Self::NonFiniteToInt { .. } | Self::TimeDomain { .. } => {
                 crate::IpeError::invalid_input(self.message().to_owned())
             }
         }
@@ -1390,9 +1556,10 @@ impl std::fmt::Display for RuntimeTrip {
 /// Raise `fault` as a typed unwind that a catch boundary converts to its error.
 ///
 /// The runtime's sole deliberate `panic_any` site: every guard that trips
-/// unwinds through here with a [`RuntimeTrip`] payload.
+/// unwinds through here with a [`RuntimeTrip`] payload. Crate-private, so only
+/// the runtime raises a trip.
 #[cold]
-pub fn trip(fault: RuntimeTrip) -> ! {
+pub(crate) fn trip(fault: RuntimeTrip) -> ! {
     // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — the deliberate, sole trip path: it converts a fault pure code cannot return (an uncatchable stack-overflow abort, among others) into a containable unwind carrying the typed `RuntimeTrip` payload, which every catch boundary converts by type through `ipe_error_from_unwind` [ledger #boundary]
     #[allow(clippy::panic, clippy::disallowed_methods)]
     // panic_any is the trip: a typed payload the catch boundary downcasts, not a stringly-typed message
@@ -1419,7 +1586,7 @@ pub struct RecursionGuard {
 
 /// Enter one level of guarded recursion, returning a [`RecursionGuard`] whose
 /// drop leaves it. Called at the top of every emitted user function body. Trips
-/// with [`RuntimeTrip::RecursionLimit`] (through [`trip`]) when the per-thread
+/// with [`RuntimeTrip::RecursionLimit`] (through `trip`) when the per-thread
 /// depth budget is exceeded or — on native targets with a recorded floor — when
 /// the remaining stack falls into the red zone. Every boundary reads that type
 /// back (never a message substring), so the trip can never misclassify as
@@ -2016,6 +2183,53 @@ mod tests {
                 let err: crate::IpeError = ipe_error_from_unwind(boundary, payload);
                 if err != fault.to_ipe_error() {
                     return Err("an arithmetic trip keeps its kind at every boundary");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // A calendar trip names its kernel and the kernel's one rule, never the
+    // argument, and converts to `InvalidInput` at every boundary.
+    #[test]
+    fn time_domain_trips_are_typed_invalid_input() -> Result<(), String> {
+        let month = "the month must be 1 to 12";
+        let instant = "the instant lies outside the calendar years `Ipe.Time` renders";
+        if TimeDomainCause::MonthOutsideYear.rule() != month
+            || TimeDomainCause::InstantOutsideCalendar.rule() != instant
+        {
+            return Err("each calendar rule states its own text".to_owned());
+        }
+        for op in TimeOp::ALL {
+            let (kernel, rule) = match op {
+                TimeOp::DaysInMonth => ("`Time.daysInMonth`", month),
+                TimeOp::TimeString => ("`Time.timeString`", instant),
+                TimeOp::Format => ("`Time.format`", instant),
+                TimeOp::FormatHttp => ("`Time.formatHTTP`", instant),
+                TimeOp::FormatIso8601 => ("`Time.formatISO8601`", instant),
+                TimeOp::FormatRfc3339 => ("`Time.formatRFC3339`", instant),
+            };
+            if op.cause().rule() != rule {
+                return Err(format!("{op:?} refuses by {:?}, not {rule:?}", op.cause()));
+            }
+            let fault = RuntimeTrip::TimeDomain { op };
+            let message = format!("{kernel}: {rule}");
+            if fault.label() != "TimeDomain" || fault.message() != message {
+                return Err(format!("{op:?}: {:?} is not {message:?}", fault.message()));
+            }
+            let crate::IpeError::Error(kind, _) = fault.to_ipe_error();
+            if kind != crate::IpeErrorKind::InvalidInput {
+                return Err(format!("{op:?}: a calendar trip converts to InvalidInput"));
+            }
+            for boundary in [
+                UnwindBoundary::Foreign("foreign call panicked"),
+                UnwindBoundary::Task("async task panicked"),
+            ] {
+                let payload: Box<dyn std::any::Any + Send> = Box::new(fault);
+                if ipe_error_from_unwind::<crate::IpeError>(boundary, payload)
+                    != fault.to_ipe_error()
+                {
+                    return Err(format!("{op:?}: a calendar trip keeps its kind"));
                 }
             }
         }

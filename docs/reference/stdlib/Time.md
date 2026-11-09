@@ -46,7 +46,9 @@ for the runtime kernel.
 timeString : Timestamp -> String
 ```
 
-`timeString t` — format `t` as a human-readable local-time string.
+`timeString t` — the UTC wall-clock time of `t` as `HH:MM:SS`.  Renders
+instants in the calendar years -262143 to 262142; an instant outside them
+ends in a typed `InvalidInput` error naming the function.
 
 ## `format`
 
@@ -54,7 +56,15 @@ timeString : Timestamp -> String
 format : String -> Timestamp -> String
 ```
 
-`format pattern t` — format `t` using a strftime-style `pattern`.
+`format layout t` — format `t` in UTC by a `layout` that spells the
+fields of the reference time `Mon Jan 2 15:04:05 MST 2006`: `2006` year, `01`
+month, `02` day, `15` hour, `04` minute, `05` second, `Jan` month name,
+`Mon` weekday name, `MST` zone (always `UTC`), `.000` milliseconds,
+`.000000` microseconds, `PM` or `pm` the half of the day.  The longest
+token wins at each position; every other character, `%` included, is
+literal.  Renders instants in the calendar years -262143 to 262142; an
+instant outside them ends in a typed `InvalidInput` error naming the
+function.
 
 ## `formatHTTP`
 
@@ -62,7 +72,9 @@ format : String -> Timestamp -> String
 formatHTTP : Timestamp -> String
 ```
 
-`formatHTTP t` — format `t` as an HTTP-date string (RFC 7231).
+`formatHTTP t` — format `t` as an HTTP-date string (RFC 7231).  Renders
+instants in the calendar years -262143 to 262142; an instant outside them
+ends in a typed `InvalidInput` error naming the function.
 
 ## `formatISO8601`
 
@@ -70,7 +82,9 @@ formatHTTP : Timestamp -> String
 formatISO8601 : Timestamp -> String
 ```
 
-`formatISO8601 t` — format `t` as an ISO 8601 string.
+`formatISO8601 t` — format `t` as an ISO 8601 string in UTC.  Renders
+instants in the calendar years -262143 to 262142; an instant outside them
+ends in a typed `InvalidInput` error naming the function.
 
 ## `formatRFC3339`
 
@@ -78,7 +92,9 @@ formatISO8601 : Timestamp -> String
 formatRFC3339 : Timestamp -> String
 ```
 
-`formatRFC3339 t` — format `t` as an RFC 3339 string.
+`formatRFC3339 t` — format `t` as an RFC 3339 string in UTC.  Renders
+instants in the calendar years -262143 to 262142; an instant outside them
+ends in a typed `InvalidInput` error naming the function.
 
 ## `add`
 
@@ -154,7 +170,8 @@ milliseconds (about 24.8 days) is capped at that maximum.
 isLeapYear : Int -> Bool
 ```
 
-`isLeapYear year` — True when `year` is a leap year.
+`isLeapYear year` — True when `year` is a leap year of the proleptic
+Gregorian calendar.  Every `Int` year has an answer.
 
 ## `daysInMonth`
 
@@ -162,5 +179,7 @@ isLeapYear : Int -> Bool
 daysInMonth : Int -> Int -> Int
 ```
 
-`daysInMonth year month` — number of days in `month` of `year`.
+`daysInMonth year month` — number of days in `month` (1 to 12) of `year`,
+any `Int` year of the proleptic Gregorian calendar.  A month outside 1 to
+12 ends in a typed `InvalidInput` error.
 

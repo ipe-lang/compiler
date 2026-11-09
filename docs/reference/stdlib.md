@@ -2860,11 +2860,11 @@ Ipe.Time -- clock + formatting + parsing.
 | `now` | `now ()` — the current instant. |
 | `unixMillis` | `unixMillis ()` — the current instant (alias for `now`). |
 | `sleep` | `sleep span` -- resolve after `span` elapses.  Takes a typed |
-| `timeString` | `timeString t` — format `t` as a human-readable local-time string. |
-| `format` | `format pattern t` — format `t` using a strftime-style `pattern`. |
-| `formatHTTP` | `formatHTTP t` — format `t` as an HTTP-date string (RFC 7231). |
-| `formatISO8601` | `formatISO8601 t` — format `t` as an ISO 8601 string. |
-| `formatRFC3339` | `formatRFC3339 t` — format `t` as an RFC 3339 string. |
+| `timeString` | `timeString t` — the UTC wall-clock time of `t` as `HH:MM:SS`.  Renders |
+| `format` | `format layout t` — format `t` in UTC by a `layout` that spells the |
+| `formatHTTP` | `formatHTTP t` — format `t` as an HTTP-date string (RFC 7231).  Renders |
+| `formatISO8601` | `formatISO8601 t` — format `t` as an ISO 8601 string in UTC.  Renders |
+| `formatRFC3339` | `formatRFC3339 t` — format `t` as an RFC 3339 string in UTC.  Renders |
 | `add` | `add span t` — shift instant `t` forward by `span`. |
 | `diff` | `diff a b` — the `Duration` from instant `b` to instant `a`.  Clamped to |
 | `fromMillis` | `fromMillis ms` — build a `Timestamp` from raw milliseconds since the Unix |
@@ -2872,8 +2872,8 @@ Ipe.Time -- clock + formatting + parsing.
 | `addMillis` | `addMillis ms t` — shift instant `t` by `ms` raw milliseconds.  Prefer |
 | `diffMillis` | `diffMillis a b` — raw milliseconds from instant `b` to instant `a`. |
 | `every` | `every interval msg` -- Ipe.Web / Ipe.Tui subscription that emits `msg` once |
-| `isLeapYear` | `isLeapYear year` — True when `year` is a leap year. |
-| `daysInMonth` | `daysInMonth year month` — number of days in `month` of `year`. |
+| `isLeapYear` | `isLeapYear year` — True when `year` is a leap year of the proleptic |
+| `daysInMonth` | `daysInMonth year month` — number of days in `month` (1 to 12) of `year`, |
 
 ## Time.Timestamp
 
