@@ -1,7 +1,7 @@
 # string interpolation
 
-A triple-quoted string `"""…"""` is a multiline string literal, and inside one
-`{{expr}}` interpolation substitutes a value into the text. Interpolation
+A triple-quoted string `"""…"""` is a string literal that may span lines, and
+inside one `{{expr}}` interpolation substitutes a value into the text. Interpolation
 renders a scalar — a `String`, `Int`, `Float`, `Bool` or `Char` — so you build
 readable text without a chain of `++`.
 
@@ -15,9 +15,24 @@ readable text without a chain of `++`.
 """
 ```
 
-The opening-line margin is stripped: the block's indentation lays out the source
-but does not enter the value. Each `{{…}}` body is trimmed, wrapped in
-the internal interpolation renderer, and the whole literal is joined with `++`.
+A triple-quoted string has exactly two forms:
+
+- **One line:** `"""text"""` — the value is the text between the quotes.
+- **A block:** the opening `"""` ends its line, and the closing `"""` stands
+  alone on its own line in the opener's column. That column is the block's
+  **margin**: every body line is indented at least to it, and the margin is not
+  part of the value. The value is the body lines, margin removed, joined with
+  line breaks — the line break after the opener and the one before the closer
+  are not part of it.
+
+Any other shape is refused: text after a block's opener, a closer that ends a
+content line, or a closer outside the opener's column is IPE-P0075; a body line
+or a tab left of the margin is IPE-P0076. Because the margin is the opener's
+column, a block moved to another column keeps its value once its body moves
+with it.
+
+Each `{{…}}` body is trimmed, wrapped in the internal interpolation renderer,
+and the whole literal is joined with `++`.
 
 An interpolation body may be one of exactly **four simple shapes**:
 

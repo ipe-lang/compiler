@@ -1520,7 +1520,7 @@ mod lone_carriage_return_tests {
         ("x\r= 1", 1),
         ("x = 1 -- note\rif", 13),
         ("x = {- a\rb -} 1", 8),
-        ("x = \"\"\"\na\rb\n\"\"\"", 9),
+        ("x = \"\"\"\n    a\rb\n    \"\"\"", 13),
         ("x = 1\r", 5),
         ("x = \"a\rb\"", 6),
         ("x = '\r'", 5),
@@ -1640,7 +1640,11 @@ mod display_hazard_tests {
     }
 
     /// Each literal a hazard can stand in, with `{}` for the hazard.
-    pub(super) const LITERALS: [&str; 3] = ["x = \"a{}b\"", "x = \"\"\"\na{}b\n\"\"\"", "x = '{}'"];
+    pub(super) const LITERALS: [&str; 3] = [
+        "x = \"a{}b\"",
+        "x = \"\"\"\n    a{}b\n    \"\"\"",
+        "x = '{}'",
+    ];
 
     /// VT, FF, NEL and every embedding, pop or override is refused in a literal too.
     #[test]
@@ -1684,7 +1688,7 @@ mod display_hazard_tests {
                 UnclosedIsolate,
             ),
             (
-                "x = \"\"\"\na\u{2066}b\nc\u{2069}\n\"\"\"",
+                "x = \"\"\"\n    a\u{2066}b\n    c\u{2069}\n    \"\"\"",
                 '\u{2066}',
                 UnclosedIsolate,
             ),
@@ -1704,7 +1708,7 @@ mod display_hazard_tests {
             "x = \"a\u{2067}b\u{2069}c\"",
             "x = \"a\u{2068}b\u{2069}c\"",
             "x = \"\u{2066}a\u{2067}b\u{2069}c\u{2069}\"",
-            "x = \"\"\"\na\u{2067}b\u{2069}c\nd\u{2028}e\n\"\"\"",
+            "x = \"\"\"\n    a\u{2067}b\u{2069}c\n    d\u{2028}e\n    \"\"\"",
             "x = \"a\u{2028}b\u{2029}c\"",
             "x = '\u{2028}'",
             "x = '\u{2029}'",
@@ -1795,7 +1799,7 @@ mod terminal_control_tests {
         let accepted = [
             "x = \"a\tb\"",
             "x = '\t'",
-            "x = \"\"\"\na\tb\r\nc\n\"\"\"",
+            "x = \"\"\"\n    a\tb\r\n    c\n    \"\"\"",
             "x = 1 -- a\tb\r\ny = 2\n",
             "x = {- a\tb\r\nc -} 1",
             "x = \"plain text, no control\"",

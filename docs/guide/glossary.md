@@ -115,8 +115,9 @@ See [`Ipe.Task`](https://github.com/ipe-lang/compiler/blob/main/docs/reference/s
 
 ## triple-quoted string
 
-A multiline string literal written between `"""` delimiters. Its opening-line
-indentation margin is stripped, and it is the only place
+A string literal written between `"""` delimiters: one line, or a block whose
+opener ends its line and whose closer stands alone in the opener's column, the
+block's margin. The margin is not part of the value, and it is the only place
 [string interpolation](#string-interpolation) applies. See
 [`string-interpolation`](../constructs/string-interpolation.md).
 

@@ -997,7 +997,7 @@ fn like_strings_are_caught_wherever_the_lexer_keeps_them() {
         ),
         (
             "triple-quoted over lines",
-            "frag = Sql.raw \"\"\"\n    n\n    LIKE ?\n\"\"\"",
+            "frag =\n    Sql.raw\n        \"\"\"\n        n\n        LIKE ?\n        \"\"\"",
         ),
         (
             "after a quote char",
