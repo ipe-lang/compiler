@@ -67,8 +67,8 @@ pub enum BundleFinish<'a> {
     },
     /// `ipe release build`: an optimised bundle under `member`.
     Release {
-        /// The capabilities the release consent gates admitted.
-        consented: &'a super::ConsentedCapabilities,
+        /// The release consent judged, holding the front end every emit reads.
+        judged: &'a super::JudgedRelease<'a>,
         /// The database driver the profile's socket allowances follow.
         driver: ipe_backend_rust::DbDriver,
         /// The release member root this bundle writes under.
@@ -81,10 +81,8 @@ impl<'a> BundleFinish<'a> {
     const fn native(&self) -> NativeFinish<'a> {
         match self {
             Self::Dev { .. } => NativeFinish::Dev,
-            Self::Release {
-                consented, driver, ..
-            } => NativeFinish::Release {
-                consented,
+            Self::Release { judged, driver, .. } => NativeFinish::Release {
+                consented: judged.consented(),
                 driver: *driver,
             },
         }
@@ -460,13 +458,13 @@ impl<'a> BundleAssembler<'a> {
             ..BuildOptions::from_env()
         };
         let runtime_dir = resolve_vendored_runtime_dir(None, options.runtime_emit())?;
-        build_root_into(
-            self.held,
-            out,
-            &runtime_dir,
-            &options,
-            delivery::HostIntent::WebView(webview),
-        )
+        let host = delivery::HostIntent::WebView(webview);
+        match &self.finish {
+            BundleFinish::Dev { .. } => {
+                build_root_into(self.held, out, &runtime_dir, &options, host)
+            }
+            BundleFinish::Release { judged, .. } => judged.emit(out, &runtime_dir, &options, host),
+        }
     }
 
     /// Emit + compile the app to a binary, generate the desktop bundle layout,
@@ -2812,16 +2810,16 @@ pub struct PackageSourceSet {
     deps: project::CompiledDeps,
 }
 
-/// The parts of a [`PackageSourceSet`] the compile core consumes.
-pub struct SourceSetParts {
+/// The parts of a [`PackageSourceSet`] the compile core reads.
+pub struct SourceSetParts<'a> {
     /// Every module source, injected ones included.
-    pub sources: BTreeMap<Vec<String>, (PathBuf, String)>,
+    pub sources: &'a BTreeMap<Vec<String>, (PathBuf, String)>,
     /// The compiled-source stdlib module paths the driver injected.
-    pub injected: std::collections::BTreeSet<Vec<String>>,
+    pub injected: &'a std::collections::BTreeSet<Vec<String>>,
     /// The FFI interface module paths the driver injected.
-    pub ffi_injected: std::collections::BTreeSet<Vec<String>>,
+    pub ffi_injected: &'a std::collections::BTreeSet<Vec<String>>,
     /// The FFI emission inputs, when any crate is installed.
-    pub ffi_emit: Option<ipe_backend_rust::FfiEmit>,
+    pub ffi_emit: Option<&'a ipe_backend_rust::FfiEmit>,
 }
 
 /// A module-source map with the modules discovered for it, and the proof its manifest's dependencies were honored or refused.
@@ -2987,14 +2985,14 @@ impl PackageSourceSet {
         self.sources.contains_key(module_path)
     }
 
-    /// The parts the compile core consumes.
+    /// The parts the compile core reads.
     #[must_use]
-    pub fn into_parts(self) -> SourceSetParts {
+    pub const fn parts(&self) -> SourceSetParts<'_> {
         SourceSetParts {
-            sources: self.sources,
-            injected: self.injected,
-            ffi_injected: self.ffi_injected,
-            ffi_emit: self.ffi_emit,
+            sources: &self.sources,
+            injected: &self.injected,
+            ffi_injected: &self.ffi_injected,
+            ffi_emit: self.ffi_emit.as_ref(),
         }
     }
 
@@ -3087,7 +3085,18 @@ pub fn infer_package_capabilities_in(
         &package.injected,
         &package.ffi_injected,
     );
+    infer_on(db, source_root, package)
+}
 
+/// [`infer_package_capabilities_in`] over `source_root`, the inputs already minted for `package` on `db`.
+///
+/// # Errors
+/// As [`infer_package_capabilities_in`].
+pub fn infer_on(
+    db: &ipe_db::IpeDatabase,
+    source_root: ipe_db::SourceRoot,
+    package: &PackageSourceSet,
+) -> Result<std::collections::BTreeSet<ipe_ir::Capability>, CliError> {
     // The fresh-name collision universe the build path sets: the identifier
     // words of every module in the root — a pure function of the source inputs,
     // so the lowering pools mint the same names whatever entries ran before on

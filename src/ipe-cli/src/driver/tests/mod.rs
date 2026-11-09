@@ -5903,18 +5903,19 @@ const DEBUG_DESKTOP_PACKAGE: &str = "module Package exposing (package)\n\nimport
 /// The `main` of [`DEBUG_DESKTOP_PACKAGE`].
 const DEBUG_DESKTOP_MAIN: &str = "module Main exposing (main)\n\nimport Ipe.Tea.Web as Web\nimport Ipe.Tea.Web.Cmd as Cmd\nimport Ipe.Tea.Web.Sub as Sub\nimport Ipe.Debug as Debug\nimport Ipe.String as String\nimport Ipe.Ui as Ui\n\n\ntype alias Model =\n    { count : Int }\n\n\ntype Msg\n    = Increment\n    | NoOp\n\n\ninit : WebReq -> ( Model, Cmd.Cmd Msg )\ninit _req =\n    ( { count = 0 }, Cmd.none )\n\n\nupdate : Msg -> Model -> ( Model, Cmd.Cmd Msg )\nupdate msg model =\n    case msg of\n        Increment ->\n            ( { model | count = Debug.log \"count\" (model.count + 1) }, Cmd.none )\n\n        NoOp ->\n            ( model, Cmd.none )\n\n\nsubscriptions : Model -> Sub.Sub Msg\nsubscriptions _model =\n    Sub.none\n\n\nview : Model -> Element Msg\nview model =\n    Ui.column []\n        [ Ui.button [] { onPress = Just Increment, label = Ui.text \"+\" }\n        , Ui.text (String.fromInt model.count)\n        ]\n\n\nmain =\n    Web.tea\n        { init = init\n        , update = update\n        , view = view\n        , subscriptions = subscriptions\n        , routes = []\n        , notFound = NoOp\n        }\n";
 
-/// Bundle the Debug-using desktop app: a release bundle behind `consented`,
+/// Bundle the Debug-using desktop app: a release bundle admitting `consented`,
 /// written under its own release member root, else a dev bundle.
 ///
 /// Also answers whether the bundle left a `release/` directory under the
 /// default output root.
 fn bundle_debug_desktop(
-    consented: Option<&ConsentedCapabilities>,
+    consented: Option<crate::run_sandbox::ResolvedCapabilities>,
     label: &str,
 ) -> (Result<(), CliError>, bool) {
     let (tmp, _) = debug_project(label, DEBUG_DESKTOP_PACKAGE, DEBUG_DESKTOP_MAIN);
     let result = held_build(&tmp, false).and_then(|held| {
-        let finish = match consented {
+        let judged = consented.map(|resolved| JudgedRelease::admitted(&held, resolved));
+        let finish = match &judged {
             None => BundleFinish::Dev {
                 output: crate::output_dir::OutputRoot::resolve(
                     None,
@@ -5939,7 +5940,7 @@ fn bundle_debug_desktop(
                 )?
                 .release_member(&slug);
                 BundleFinish::Release {
-                    consented,
+                    judged: consented,
                     driver: ipe_backend_rust::DbDriver::Sqlite,
                     member,
                 }
@@ -5959,11 +5960,11 @@ fn bundle_debug_desktop(
 /// release creates no `release/<slug>/`.
 #[test]
 fn release_desktop_bundle_gates_debug() {
-    let consented = ConsentedCapabilities::admitted(crate::run_sandbox::ResolvedCapabilities {
+    let consented = crate::run_sandbox::ResolvedCapabilities {
         inferred: std::collections::BTreeSet::new(),
         declared: std::collections::BTreeSet::new(),
-    });
-    let (result, left_release) = bundle_debug_desktop(Some(&consented), "release-desktop-debug");
+    };
+    let (result, left_release) = bundle_debug_desktop(Some(consented), "release-desktop-debug");
     assert!(
         is_debug_gate(&result),
         "a release desktop bundle refuses Debug.log with IPE-L0140: {result:?}"
@@ -6548,5 +6549,439 @@ fn a_user_named_fix_target_symlink_is_refused() {
     assert!(
         matches!(&fixed, Err(CliError::SymlinkInSource { path }) if path.ends_with("src/Helper.ipe")),
         "a named fix target link must be refused: {fixed:?}"
+    );
+}
+
+// ---- one front end per release ---------------------------------------
+
+/// The debug keys of the queries an observed front end executed, in order.
+#[derive(Clone, Default)]
+struct QueryLog(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl QueryLog {
+    /// A sink appending every executed key to this log.
+    fn sink(&self) -> impl Fn(String) + Send + Sync + 'static {
+        let log = self.clone();
+        move |key| log.keys().push(key)
+    }
+
+    /// The keys logged so far.
+    fn keys(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// How many times the query `name` executed.
+    fn executions_of(&self, name: &str) -> usize {
+        self.keys()
+            .iter()
+            .filter(|key| key.split('(').next() == Some(name))
+            .count()
+    }
+}
+
+/// The entry of the one-front-end fixture: it imports [`RELEASE_GREETING`].
+const RELEASE_MAIN: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Lib.Greeting exposing (greeting)\n\n\nmain =\n    Io.println greeting\n";
+
+/// The second module of the one-front-end fixture.
+const RELEASE_GREETING: &str =
+    "module Lib.Greeting exposing (greeting)\n\n\ngreeting : String\ngreeting =\n    \"hello\"\n";
+
+/// A release's consent and every member emit run on one front-end database.
+///
+/// Consent parses, solves (`typecheck`, the joint solve the build path
+/// lowers through) and lowers every user module as its own entry on the
+/// observed front end; the two member emits after it, under two
+/// configurations, execute no front-end query there, only their own emit. A build that opens its own front end
+/// leaves the log untouched: the negative control that the log sees this
+/// front end alone, so a judged emit that opened a second one would leave
+/// no emit in it.
+#[test]
+#[allow(clippy::expect_used)] // a failed fixture setup is the test failure
+fn one_front_end_judges_and_emits_every_release_member() {
+    let tree = SourceTree::main(RELEASE_MAIN).module("Lib.Greeting", RELEASE_GREETING);
+    let fixture = crate::RootFixture::from_tree(&tree).expect("fixture");
+    let held = held_build(fixture.path(), false).expect("the fixture is read");
+    let log = QueryLog::default();
+    let release = consent_on(&held, || PackageFrontEnd::observed_database(log.sink()));
+    assert!(
+        release.is_ok(),
+        "the fixture's release is consented: {:?}",
+        release.as_ref().err()
+    );
+    let Ok(release) = release else {
+        return;
+    };
+    for query in ["parse", "typecheck", "lower_program"] {
+        assert!(
+            log.executions_of(query) >= 2,
+            "consent executes `{query}` for each user module: {:?}",
+            log.keys()
+        );
+    }
+    log.keys().clear();
+
+    let out = ipe_test_temp::temp_root().join(format!("ipe-one-front-end-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&out);
+    let members = [
+        ("release", ipe_backend_rust::BuildIntent::Release),
+        ("development", ipe_backend_rust::BuildIntent::Development),
+    ];
+    for (member, intent) in members {
+        let options = BuildOptions {
+            intent,
+            ..BuildOptions::default()
+        };
+        let runtime_dir = resolve_vendored_runtime_dir(None, options.runtime_emit())
+            .expect("the vendored runtime resolves");
+        let emitted = release.emit(
+            OutTarget::Path(&out.join(member)),
+            &runtime_dir,
+            &options,
+            crate::delivery::HostIntent::Served,
+        );
+        assert!(
+            emitted.is_ok(),
+            "member `{member}` emits: {:?}",
+            emitted.as_ref().err()
+        );
+    }
+    for query in [
+        "parse",
+        "canonicalize",
+        "typecheck",
+        "infer_module_scoped",
+        "lower_program",
+    ] {
+        assert_eq!(
+            log.executions_of(query),
+            0,
+            "a judged emit re-ran `{query}` instead of reading consent's memo: {:?}",
+            log.keys()
+        );
+    }
+    assert!(
+        log.executions_of("emit_manifest") >= members.len(),
+        "each member's emit executes on the judged front end: {:?}",
+        log.keys()
+    );
+
+    let observed = log.keys().len();
+    let options = BuildOptions::default();
+    let runtime_dir = resolve_vendored_runtime_dir(None, options.runtime_emit())
+        .expect("the vendored runtime resolves");
+    let cold = build_root_into(
+        &held,
+        OutTarget::Path(&out.join("cold")),
+        &runtime_dir,
+        &options,
+        crate::delivery::HostIntent::Served,
+    );
+    let _ = fs::remove_dir_all(&out);
+    assert!(
+        cold.is_ok(),
+        "the cold build emits: {:?}",
+        cold.as_ref().err()
+    );
+    assert_eq!(
+        log.keys().len(),
+        observed,
+        "a build on its own front end reaches the observed log"
+    );
+}
+
+// ---- no second front end in a release body ---------------------------
+
+/// Paths a release body never names: each opens, or compiles on, a front end other than the judged one.
+const SECOND_FRONT_ENDS: &[&str] = &[
+    "held.emit(",
+    "build_root_into",
+    "PackageFrontEnd::cold",
+    "IpeDatabase::new",
+    "IpeDatabase::with_event_callback",
+    "infer_package_capabilities",
+];
+
+/// `stream` as compact Rust: identifiers and punctuation verbatim, every literal as `""`.
+///
+/// Comments never reach a token stream, and whitespace between tokens is
+/// dropped, so a path matches however it is spaced or commented.
+fn compact(stream: proc_macro2::TokenStream) -> String {
+    let mut out = String::new();
+    push_compact(stream, &mut out);
+    out
+}
+
+/// Append the compact form of `stream` to `out`.
+fn push_compact(stream: proc_macro2::TokenStream, out: &mut String) {
+    use proc_macro2::{Delimiter, TokenTree};
+    let word_gap = |out: &mut String| {
+        if out.ends_with(|c: char| c.is_alphanumeric() || c == '_') {
+            out.push(' ');
+        }
+    };
+    for tree in stream {
+        match tree {
+            TokenTree::Ident(ident) => {
+                word_gap(out);
+                out.push_str(&ident.to_string());
+            }
+            TokenTree::Punct(punct) => out.push(punct.as_char()),
+            TokenTree::Literal(_) => {
+                word_gap(out);
+                out.push_str("\"\"");
+            }
+            TokenTree::Group(group) => {
+                let (open, close) = match group.delimiter() {
+                    Delimiter::Parenthesis => ("(", ")"),
+                    Delimiter::Brace => ("{", "}"),
+                    Delimiter::Bracket => ("[", "]"),
+                    Delimiter::None => ("", ""),
+                };
+                out.push_str(open);
+                push_compact(group.stream(), out);
+                out.push_str(close);
+            }
+        }
+    }
+}
+
+/// The token stream of the Rust source `source`.
+fn rust_tokens(source: &str) -> Option<proc_macro2::TokenStream> {
+    source.parse().ok()
+}
+
+/// The body of the first `fn name` in `stream`, at any depth.
+fn fn_body_tokens(
+    stream: proc_macro2::TokenStream,
+    name: &str,
+) -> Option<proc_macro2::TokenStream> {
+    use proc_macro2::{Delimiter, TokenTree};
+    let trees: Vec<TokenTree> = stream.into_iter().collect();
+    for (at, tree) in trees.iter().enumerate() {
+        if let TokenTree::Group(group) = tree {
+            if let Some(body) = fn_body_tokens(group.stream(), name) {
+                return Some(body);
+            }
+            continue;
+        }
+        let is_fn = matches!(tree, TokenTree::Ident(ident) if *ident == "fn");
+        let named = matches!(trees.get(at + 1), Some(TokenTree::Ident(ident)) if *ident == name);
+        if is_fn && named {
+            return trees.iter().skip(at + 2).find_map(|tree| match tree {
+                TokenTree::Group(group) if group.delimiter() == Delimiter::Brace => {
+                    Some(group.stream())
+                }
+                _ => None,
+            });
+        }
+    }
+    None
+}
+
+/// The compact body of the first match arm in `stream` whose pattern opens with `owner::variant`.
+fn arm_body(stream: proc_macro2::TokenStream, owner: &str, variant: &str) -> Option<String> {
+    use proc_macro2::{Delimiter, TokenTree};
+    let trees: Vec<TokenTree> = stream.into_iter().collect();
+    let punct =
+        |at: usize, c: char| matches!(trees.get(at), Some(TokenTree::Punct(p)) if p.as_char() == c);
+    let ident =
+        |at: usize, name: &str| matches!(trees.get(at), Some(TokenTree::Ident(i)) if *i == name);
+    for (at, tree) in trees.iter().enumerate() {
+        if let TokenTree::Group(group) = tree {
+            if let Some(body) = arm_body(group.stream(), owner, variant) {
+                return Some(body);
+            }
+            continue;
+        }
+        if !(ident(at, owner) && punct(at + 1, ':') && punct(at + 2, ':') && ident(at + 3, variant))
+        {
+            continue;
+        }
+        let arrow = (at + 4..trees.len()).find(|&i| punct(i, '=') && punct(i + 1, '>'))?;
+        if let Some(TokenTree::Group(group)) = trees.get(arrow + 2)
+            && group.delimiter() == Delimiter::Brace
+        {
+            return Some(compact(group.stream()));
+        }
+        return Some(compact(
+            trees
+                .iter()
+                .skip(arrow + 2)
+                .take_while(|tree| !matches!(tree, TokenTree::Punct(p) if p.as_char() == ','))
+                .cloned()
+                .collect(),
+        ));
+    }
+    None
+}
+
+/// How `consent_on` opens the judged front end: over the held read, on the caller's database only.
+const CONSENT_OPENS_HELD_SOURCES: &str = "PackageFrontEnd::over(held.sources(),";
+
+/// The [`SECOND_FRONT_ENDS`] paths `code` names.
+fn second_front_ends(code: &str) -> Vec<&'static str> {
+    SECOND_FRONT_ENDS
+        .iter()
+        .copied()
+        .filter(|path| code.contains(path))
+        .collect()
+}
+
+/// No release body can reach a front end other than the one consent judged.
+///
+/// `release_pipeline` (its `release_one` closure included) and the
+/// `BundleFinish::Release` arm of `emit_desktop` emit only through the judged
+/// release, `resolve_for_run` infers only on the front end it is handed, and
+/// `consent_on` opens that front end over the sources `held` read itself, so
+/// no caller can hand it a front end over other sources.
+#[test]
+fn release_bodies_name_no_second_front_end() {
+    let commands = rust_tokens(include_str!("../commands.rs"));
+    let bundles = rust_tokens(include_str!("../commands_pkg.rs"));
+    let sandbox = rust_tokens(include_str!("../../run_sandbox.rs"));
+    assert!(
+        commands.is_some() && bundles.is_some() && sandbox.is_some(),
+        "the scanned sources lex"
+    );
+    let (Some(commands), Some(bundles), Some(sandbox)) = (commands, bundles, sandbox) else {
+        return;
+    };
+    let consent = fn_body_tokens(commands.clone(), "consent_on").map(compact);
+    assert!(
+        consent
+            .as_deref()
+            .is_some_and(|body| body.contains(CONSENT_OPENS_HELD_SOURCES)),
+        "consent_on opens its front end over the held sources: {consent:?}"
+    );
+    let pipeline = fn_body_tokens(commands, "release_pipeline").map(compact);
+    let desktop = fn_body_tokens(bundles, "emit_desktop")
+        .and_then(|body| arm_body(body, "BundleFinish", "Release"));
+    for (site, body, judged) in [
+        ("release_pipeline", pipeline, "release.emit("),
+        ("emit_desktop's release arm", desktop, "judged.emit("),
+    ] {
+        assert!(body.is_some(), "{site} is found");
+        let Some(body) = body else {
+            return;
+        };
+        assert!(
+            body.contains(judged),
+            "{site} emits through `{judged}`: {body}"
+        );
+        assert!(
+            second_front_ends(&body).is_empty(),
+            "{site} names a second front end: {:?}",
+            second_front_ends(&body)
+        );
+    }
+    let sandbox = compact(sandbox);
+    assert!(
+        !sandbox.contains("IpeDatabase::new")
+            && !sandbox.contains("IpeDatabase::with_event_callback"),
+        "run_sandbox.rs opens a database of its own"
+    );
+}
+
+/// The second-front-end scan sees every banned path however it is spaced, and no comment or string.
+#[test]
+fn the_second_front_end_scan_sees_every_banned_path() {
+    for banned in SECOND_FRONT_ENDS {
+        let call = format!(
+            "{} /* c */ ( )",
+            banned
+                .trim_end_matches('(')
+                .replace('.', " . ")
+                .replace("::", " :: ")
+        );
+        let fixture = format!("fn release_pipeline() {{ let _ = {call}; }}");
+        let body =
+            rust_tokens(&fixture).and_then(|tokens| fn_body_tokens(tokens, "release_pipeline"));
+        assert!(
+            body.map(compact)
+                .is_some_and(|body| second_front_ends(&body) == [*banned]),
+            "the scan must see `{banned}` in {fixture}"
+        );
+    }
+    let quiet = "fn release_pipeline() { // held.emit(\n let _ = \"build_root_into(\"; }";
+    let body = rust_tokens(quiet).and_then(|tokens| fn_body_tokens(tokens, "release_pipeline"));
+    assert!(
+        body.map(compact)
+            .is_some_and(|body| second_front_ends(&body).is_empty()),
+        "a comment or string names no path"
+    );
+    let arms = "fn emit_desktop() { match f { BundleFinish::Dev { .. } => build_root_into(a), \
+                BundleFinish::Release { judged, .. } => held.emit(b), } }";
+    let arm = rust_tokens(arms)
+        .and_then(|tokens| fn_body_tokens(tokens, "emit_desktop"))
+        .and_then(|body| arm_body(body, "BundleFinish", "Release"));
+    assert!(
+        arm.as_deref()
+            .is_some_and(|arm| second_front_ends(arm) == ["held.emit("]),
+        "the release arm alone is scanned: {arm:?}"
+    );
+}
+
+// ---- consent runs on the compile thread ------------------------------
+
+/// A caller stack far smaller than the compile stack: inference run on it,
+/// rather than on the compile thread, overflows at the parser's ceiling.
+const SMALL_CONSENT_CALLER_STACK: usize = 128 << 10;
+
+/// A module `Deep` whose value is a `let` block of `n` bindings after `x0`.
+fn deep_let_module(n: usize) -> String {
+    let bindings = (1..=n)
+        .map(|i| format!("        x{i} = x{} + 1\n", i - 1))
+        .collect::<Vec<_>>()
+        .concat();
+    format!(
+        "module Deep exposing (deep)\n\n\ndeep : Int\ndeep =\n    let\n        x0 = 0\n{bindings}    in\n    x{n}\n"
+    )
+}
+
+/// The entry of the deep consent fixture.
+const DEEP_MAIN: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.String as String\nimport Deep exposing (deep)\n\n\nmain =\n    Io.println (String.fromInt deep)\n";
+
+/// Consent infers a package nested to the parser's ceiling from a small caller stack.
+///
+/// The caller only opens the front end; inference runs on the compile
+/// thread, so the caller's stack never holds the nesting.
+#[test]
+#[allow(clippy::expect_used)] // a failed fixture setup is the test failure
+fn consent_infers_on_the_compile_thread() {
+    let limit =
+        usize::try_from(ipe_diagnostics::nesting::SOURCE_NESTING_LIMIT).unwrap_or(usize::MAX);
+    let parses = |n: &usize| {
+        ipe_parse::parse_module(&deep_let_module(*n), &mut ipe_intern::Interner::new()).is_ok()
+    };
+    let deepest = (0..=2 * limit).take_while(parses).last();
+    assert!(
+        deepest.is_some_and(|n| n > 0 && n < 2 * limit),
+        "the parser must admit some depth and refuse a deeper one: {deepest:?}"
+    );
+    let Some(n) = deepest else {
+        return;
+    };
+    let tree = SourceTree::main(DEEP_MAIN).module("Deep", &deep_let_module(n));
+    let fixture = crate::RootFixture::from_tree(&tree).expect("fixture");
+    let held = held_build(fixture.path(), false).expect("the fixture is read");
+    let manifest = held.root().manifest();
+    let set = held.sources();
+    let consented = std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(SMALL_CONSENT_CALLER_STACK)
+            .spawn_scoped(scope, move || {
+                let front = PackageFrontEnd::cold(set);
+                crate::run_sandbox::resolve_for_run(manifest, &front)
+                    .map(|resolved| resolved.inferred)
+                    .map_err(|refusal| refusal.to_string())
+            })
+            .expect("spawn the small caller")
+            .join()
+    });
+    assert!(
+        matches!(consented, Ok(Ok(_))),
+        "{n} bindings must be consented from a small caller stack: {consented:?}"
     );
 }

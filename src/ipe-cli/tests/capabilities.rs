@@ -573,7 +573,8 @@ fn the_run_resolver_discloses_an_unmounted_handle() -> TestResult {
     let manifest_path = dir.join("package.ipe");
     let manifest = ipe::project::parse_manifest(&manifest_path)?;
     let package = ipe::PackageSourceSet::read(&manifest_path)?;
-    let resolved = ipe::run_sandbox::resolve_for_run(&manifest, &package)?;
+    let resolved =
+        ipe::run_sandbox::resolve_for_run(&manifest, &ipe::PackageFrontEnd::cold(package))?;
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         resolved.inferred.contains(&Capability::CustomElement),

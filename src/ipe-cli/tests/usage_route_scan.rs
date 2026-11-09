@@ -255,7 +255,7 @@ const UNROUTED: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "driver/build_pipeline.rs",
-        "build_root_into",
+        "build_held_into",
         1,
         "built in a file another lane owns; its route is decided there",
     ),
