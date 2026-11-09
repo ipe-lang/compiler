@@ -324,6 +324,142 @@ fn probe_fixture(label: &str, state0: &UserSources) {
     );
 }
 
+/// Native emit settings under `intent` and `db_driver`.
+fn native_settings(
+    intent: ipe_backend_rust::BuildIntent,
+    db_driver: ipe_backend_rust::DbDriver,
+) -> ipe_backend_rust::EmitSettings {
+    ipe_backend_rust::EmitSettings {
+        db_driver,
+        ffi: None,
+        target: ipe_ir::Target::Native,
+        wasm_public_env: Vec::new(),
+        mount_base: ipe_backend_rust::MountBase::root(),
+        server_origins: ipe_backend_rust::ServerOrigins::none(),
+        wasm_hydrate_mode: false,
+        runtime_dep: None,
+        debugger: false,
+        crate_name: ipe_backend_rust::CrateName::SingleFile,
+        hot_appearance: false,
+        host: ipe_backend_rust::EmitHost::Served(ipe_backend_rust::ServedInstall::Off),
+        intent,
+    }
+}
+
+/// The two member configurations a consent-warmed release emits in turn.
+fn member_configs() -> [ipe_backend_rust::EmitSettings; 2] {
+    [
+        native_settings(
+            ipe_backend_rust::BuildIntent::Release,
+            ipe_backend_rust::DbDriver::Sqlite,
+        ),
+        native_settings(
+            ipe_backend_rust::BuildIntent::Development,
+            ipe_backend_rust::DbDriver::Postgres,
+        ),
+    ]
+}
+
+/// Emit `front`'s package under `settings` on the database `db` over `root`.
+fn emit_on(
+    db: &ipe_db::IpeDatabase,
+    root: ipe_db::SourceRoot,
+    front: &ipe::PackageFrontEnd,
+    blame: &Path,
+    settings: ipe_backend_rust::EmitSettings,
+) -> CompileOutcome {
+    let config = ipe_db::BuildConfig::new(db, settings);
+    ipe::compile_prepared(
+        db,
+        root,
+        front.sources().parts().sources,
+        &entry_path(),
+        blame,
+        config,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// A release's emits from its consent-warmed front end equal cold emits.
+///
+/// The package at `dir` is opened as one front end, its capabilities are
+/// inferred on it as consent infers them, and each [`member_configs`] entry
+/// is emitted on that same database in turn; every emit must be
+/// byte-identical to a single emit of the same configuration on a fresh
+/// database over the same sources. A directory the package read refuses is
+/// not a release and is skipped.
+fn consent_warmed_parity(label: &str, dir: &Path) {
+    let Ok(set) = ipe::PackageSourceSet::read(&dir.join("package.ipe")) else {
+        return;
+    };
+    let front = ipe::PackageFrontEnd::cold(set);
+    let consented = front.infer_capabilities().is_ok();
+    for (member, settings) in member_configs().into_iter().enumerate() {
+        let warm = emit_on(front.db(), front.root(), &front, dir, settings.clone());
+        let cold_db = ipe_db::IpeDatabase::new();
+        let parts = front.sources().parts();
+        let cold_root =
+            ipe::create_source_root(&cold_db, parts.sources, parts.injected, parts.ffi_injected);
+        let cold = emit_on(&cold_db, cold_root, &front, dir, settings);
+        assert_parity(
+            &format!("{label}/consent-warmed member {member} (consent ok={consented})"),
+            &warm,
+            &cold,
+        );
+    }
+}
+
+/// The entry of the consent-warmed fixture: it imports [`CONSENT_UTIL`].
+const CONSENT_MAIN: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.String as String\nimport Lib.Util as Util\n\n\nmain =\n    Io.println (String.fromInt (Util.bump 41))\n";
+
+/// The second module of the consent-warmed fixture.
+const CONSENT_UTIL: &str =
+    "module Lib.Util exposing (bump)\n\n\nbump : Int -> Int\nbump x =\n    x + 1\n";
+
+/// A multi-module package emits the same bytes for each member after consent as cold.
+#[test]
+#[allow(clippy::expect_used)] // a failed fixture setup is the test failure
+fn consent_warmed_members_equal_cold() {
+    let dir = ipe_test_temp::temp_root()
+        .join(format!("ipe-parity-consent-warmed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let lib = dir.join("src").join("Lib");
+    std::fs::create_dir_all(&lib).expect("create src/Lib");
+    std::fs::write(
+        dir.join("package.ipe"),
+        "module Package exposing (package)\n\n\npackage =\n    { name = \"consent-warmed\" }\n",
+    )
+    .expect("write package.ipe");
+    std::fs::write(dir.join("src").join("Main.ipe"), CONSENT_MAIN).expect("write Main");
+    std::fs::write(lib.join("Util.ipe"), CONSENT_UTIL).expect("write Lib.Util");
+    let set = ipe::PackageSourceSet::read(&dir.join("package.ipe"));
+    assert!(set.is_ok(), "the fixture package reads: {:?}", set.err());
+    let Ok(set) = set else {
+        return;
+    };
+    let front = ipe::PackageFrontEnd::cold(set);
+    let consented = front.infer_capabilities();
+    assert!(consented.is_ok(), "consent infers: {:?}", consented.err());
+    let mut emitted = 0usize;
+    for (member, settings) in member_configs().into_iter().enumerate() {
+        let warm = emit_on(front.db(), front.root(), &front, &dir, settings.clone());
+        let parts = front.sources().parts();
+        let cold_db = ipe_db::IpeDatabase::new();
+        let cold_root =
+            ipe::create_source_root(&cold_db, parts.sources, parts.injected, parts.ffi_injected);
+        let cold = emit_on(&cold_db, cold_root, &front, &dir, settings);
+        assert!(
+            warm.is_ok(),
+            "member {member} emits: {:?}",
+            warm.as_ref().err()
+        );
+        emitted += usize::from(warm.is_ok());
+        assert_parity(&format!("consent-warmed member {member}"), &warm, &cold);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(emitted, 2, "both members emit");
+}
+
 /// Drive one shard of the golden fixture population; the union of all shards
 /// is the full set.
 fn probe_shard(shard: usize, count: usize) {
@@ -346,6 +482,7 @@ fn probe_shard(shard: usize, count: usize) {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         probe_fixture(&label, &state0);
+        consent_warmed_parity(&label, dir);
         covered += 1;
     }
     assert!(
