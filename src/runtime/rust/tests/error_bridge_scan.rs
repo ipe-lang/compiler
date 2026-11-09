@@ -78,7 +78,6 @@ const TRANSITIONAL_FROM_STRING: &[(&str, usize)] = &[
     ("server_stream.rs", 3),
     ("system.rs", 1),
     ("tea.rs", 2),
-    ("time.rs", 23),
     ("tui/app.rs", 3),
     ("web/hub.rs", 14),
     ("web/pubsub.rs", 2),
