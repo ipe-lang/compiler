@@ -6590,9 +6590,10 @@ const RELEASE_GREETING: &str =
 
 /// A release's consent and every member emit run on one front-end database.
 ///
-/// Consent parses and infers every module on the observed front end; the two
-/// member emits after it, under two configurations, execute no front-end
-/// query there, only their own emit. A build that opens its own front end
+/// Consent parses, solves (`typecheck`, the joint solve the build path
+/// lowers through) and lowers every user module as its own entry on the
+/// observed front end; the two member emits after it, under two
+/// configurations, execute no front-end query there, only their own emit. A build that opens its own front end
 /// leaves the log untouched: the negative control that the log sees this
 /// front end alone, so a judged emit that opened a second one would leave
 /// no emit in it.
@@ -6612,7 +6613,7 @@ fn one_front_end_judges_and_emits_every_release_member() {
     let Ok(release) = release else {
         return;
     };
-    for query in ["parse", "infer_module_scoped"] {
+    for query in ["parse", "typecheck", "lower_program"] {
         assert!(
             log.executions_of(query) >= 2,
             "consent executes `{query}` for each user module: {:?}",
@@ -6649,6 +6650,7 @@ fn one_front_end_judges_and_emits_every_release_member() {
     for query in [
         "parse",
         "canonicalize",
+        "typecheck",
         "infer_module_scoped",
         "lower_program",
     ] {
