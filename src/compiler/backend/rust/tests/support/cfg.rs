@@ -177,11 +177,21 @@ pub fn top_level_mods(file: &syn::File) -> Result<Vec<(&syn::ItemMod, Cfg)>, Str
             _ => None,
         })
         .map(|m| {
-            let mut all: Vec<Cfg> = file_cond.iter().cloned().collect();
-            all.extend(attrs_cfg(&m.attrs)?);
+            let mut all = conjuncts(file_cond.clone());
+            all.extend(conjuncts(attrs_cfg(&m.attrs)?));
             Ok((m, Cfg::All(all)))
         })
         .collect()
+}
+
+/// The predicates `cfg` joins: the members of an `All`, or `cfg` alone, so a
+/// join of joins stays one flat `All`.
+fn conjuncts(cfg: Option<Cfg>) -> Vec<Cfg> {
+    match cfg {
+        Some(Cfg::All(all)) => all,
+        Some(one) => vec![one],
+        None => Vec::new(),
+    }
 }
 
 /// The configuration one emitted crate builds under.

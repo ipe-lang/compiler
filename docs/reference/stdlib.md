@@ -2861,7 +2861,7 @@ Ipe.Time -- clock + formatting + parsing.
 | `unixMillis` | `unixMillis ()` — the current instant (alias for `now`). |
 | `sleep` | `sleep span` -- resolve after `span` elapses.  Takes a typed |
 | `timeString` | `timeString t` — the UTC wall-clock time of `t` as `HH:MM:SS`.  Renders |
-| `format` | `format layout t` — format `t` in UTC by a Go reference-time `layout`, |
+| `format` | `format layout t` — format `t` in UTC by a `layout` that spells the |
 | `formatHTTP` | `formatHTTP t` — format `t` as an HTTP-date string (RFC 7231).  Renders |
 | `formatISO8601` | `formatISO8601 t` — format `t` as an ISO 8601 string in UTC.  Renders |
 | `formatRFC3339` | `formatRFC3339 t` — format `t` as an RFC 3339 string in UTC.  Renders |

@@ -161,7 +161,7 @@ pub fn time_diff_millis(later: i64, earlier: i64) -> i64 {
     crate::math::ipe_int_sub(later, earlier)
 }
 
-/// A field of the Go reference time `Mon Jan 2 15:04:05 MST 2006` in a
+/// A field of the reference time `Mon Jan 2 15:04:05 MST 2006` in a
 /// `Time.format` layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LayoutToken {

@@ -77,7 +77,12 @@ const ALLOWED: &[(&str, &str, Breach, usize)] = &[
     ("project.rs", "jwt_cargo_toml", Breach::HandQuote, 1),
     ("project.rs", "locale_cargo_toml", Breach::HandQuote, 1),
     ("project.rs", "server_cargo_toml", Breach::HandQuote, 3),
-    ("project.rs", "ssrf_cargo_toml", Breach::HandQuote, 1),
+    (
+        "project.rs",
+        "tokio_feature_cargo_toml",
+        Breach::HandQuote,
+        1,
+    ),
     (
         "project.rs",
         "substitute_dep_manifest_anchors",

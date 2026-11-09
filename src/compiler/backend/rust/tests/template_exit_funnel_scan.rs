@@ -229,6 +229,14 @@ const TRIP_NAMES: &[&str] = &["RuntimeTrip", "panic_any"];
 /// a grouped import (`core::{trip}`, `{RuntimeTrip, trip}`).
 const TRIP_TEXT: &[&str] = &["RuntimeTrip", "panic_any", "::trip", "{trip", ",trip"];
 
+/// Whether `text` holds `spelling` as a whole name: some occurrence is not
+/// continued by an identifier character, so `{triple}` is not `{trip`.
+fn spells_whole(text: &str, spelling: &str) -> bool {
+    text.split(spelling)
+        .skip(1)
+        .any(|rest| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+}
+
 /// Each trip-raising site in one Rust source: a [`TRIP_NAMES`] identifier, a
 /// `trip` named through a path or a grouped `use`, or a string literal
 /// spelling one.
@@ -277,7 +285,7 @@ fn trip_sites(src: &str) -> Result<Vec<String>, String> {
                     sites.extend(
                         TRIP_TEXT
                             .iter()
-                            .filter(|spelling| text.contains(**spelling))
+                            .filter(|spelling| spells_whole(&text, spelling))
                             .map(|spelling| (*spelling).to_owned()),
                     );
                     path.clear();
@@ -386,6 +394,10 @@ fn each_spelling_of_a_forged_trip_is_refused() -> Result<(), String> {
         trip_sites("/// Raises a `RuntimeTrip` through `core::trip`.\nfn f() { trip(x); }")?
             .is_empty(),
         "a doc mention and an unrelated `trip` are not trip sites"
+    );
+    assert!(
+        trip_sites("fn f() { out.push_str(\"[target.{triple}]\\n\"); }")?.is_empty(),
+        "a longer name that starts with `trip` is not a trip site"
     );
     Ok(())
 }

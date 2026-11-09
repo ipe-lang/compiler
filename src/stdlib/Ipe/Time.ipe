@@ -82,8 +82,8 @@ formatKernel : String -> Int -> String
 formatKernel = Kernel.kernel "Time_format"
 
 
--- | `format layout t` — format `t` in UTC by a Go reference-time `layout`,
--- which spells fields of `Mon Jan 2 15:04:05 MST 2006`: `2006` year, `01`
+-- | `format layout t` — format `t` in UTC by a `layout` that spells the
+-- fields of the reference time `Mon Jan 2 15:04:05 MST 2006`: `2006` year, `01`
 -- month, `02` day, `15` hour, `04` minute, `05` second, `Jan` month name,
 -- `Mon` weekday name, `MST` zone (always `UTC`), `.000` milliseconds,
 -- `.000000` microseconds, `PM` or `pm` the half of the day.  The longest
