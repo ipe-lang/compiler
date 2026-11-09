@@ -1351,23 +1351,21 @@ impl PackageFrontEnd {
         Self::over(set, ipe_db::IpeDatabase::new())
     }
 
-    /// [`Self::cold`] on a database that hands `on_query` the debug key of every query it executes.
+    /// A fresh database that hands `on_query` the debug key of every query it executes.
     #[cfg(test)]
-    pub fn observed(
-        set: super::PackageSourceSet,
+    pub fn observed_database(
         on_query: impl Fn(String) + Send + Sync + 'static,
-    ) -> Self {
+    ) -> ipe_db::IpeDatabase {
         const EXECUTES: &str = "WillExecute { database_key: ";
-        let db = ipe_db::IpeDatabase::with_event_callback(Box::new(move |event| {
+        ipe_db::IpeDatabase::with_event_callback(Box::new(move |event| {
             if let Some(key) = format!("{:?}", event.kind).strip_prefix(EXECUTES) {
                 on_query(key.to_owned());
             }
-        }));
-        Self::over(set, db)
+        }))
     }
 
-    /// Mint `set`'s inputs on `db`.
-    fn over(set: super::PackageSourceSet, db: ipe_db::IpeDatabase) -> Self {
+    /// Open the front end of `set` on `db`, minting its inputs and demanding no query.
+    pub(super) fn over(set: super::PackageSourceSet, db: ipe_db::IpeDatabase) -> Self {
         let parts = set.parts();
         let root = create_source_root(&db, parts.sources, parts.injected, parts.ffi_injected);
         Self { set, db, root }

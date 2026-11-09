@@ -4328,7 +4328,7 @@ impl<'h> JudgedRelease<'h> {
 /// # Errors
 /// As [`consent_on`].
 pub fn consent_to_capabilities(held: &HeldBuild) -> Result<JudgedRelease<'_>, CliError> {
-    consent_on(held, PackageFrontEnd::cold)
+    consent_on(held, ipe_db::IpeDatabase::new)
 }
 
 /// Resolve the program's capabilities once and pass them through every
@@ -4339,18 +4339,20 @@ pub fn consent_to_capabilities(held: &HeldBuild) -> Result<JudgedRelease<'_>, Cl
 /// All three judge the SAME resolved value, and the value is released only
 /// once all three admit it.
 ///
-/// `open` opens the front end over the modules `held` read, the ones the emit
-/// compiles; inference runs on it and every scan runs over the same read.
+/// The front end is opened here, on the database `open_db` yields, over the
+/// modules `held` read, the ones the emit compiles: a caller picks the
+/// database, never the sources. Inference runs on it and every scan runs over
+/// the same read.
 ///
 /// # Errors
 /// The first gate refusal (`IPE-S0001` / `IPE-S0002` / `IPE-S0003`); the
 /// capability-resolution errors it composes.
 pub fn consent_on(
     held: &HeldBuild,
-    open: impl FnOnce(super::PackageSourceSet) -> PackageFrontEnd,
+    open_db: impl FnOnce() -> ipe_db::IpeDatabase,
 ) -> Result<JudgedRelease<'_>, CliError> {
     let manifest = held.root().manifest();
-    let front = open(held.sources());
+    let front = PackageFrontEnd::over(held.sources(), open_db());
     let resolved = run_sandbox::resolve_for_run(manifest, &front)?;
     acknowledge_unsafe_imports(&resolved, manifest, held)?;
     gate_web_consent(&resolved, manifest, held)?;

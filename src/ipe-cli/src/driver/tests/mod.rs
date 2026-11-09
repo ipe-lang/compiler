@@ -6603,7 +6603,7 @@ fn one_front_end_judges_and_emits_every_release_member() {
     let fixture = crate::RootFixture::from_tree(&tree).expect("fixture");
     let held = held_build(fixture.path(), false).expect("the fixture is read");
     let log = QueryLog::default();
-    let release = consent_on(&held, |set| PackageFrontEnd::observed(set, log.sink()));
+    let release = consent_on(&held, || PackageFrontEnd::observed_database(log.sink()));
     assert!(
         release.is_ok(),
         "the fixture's release is consented: {:?}",
@@ -6815,6 +6815,9 @@ fn arm_body(stream: proc_macro2::TokenStream, owner: &str, variant: &str) -> Opt
     None
 }
 
+/// How `consent_on` opens the judged front end: over the held read, on the caller's database only.
+const CONSENT_OPENS_HELD_SOURCES: &str = "PackageFrontEnd::over(held.sources(),";
+
 /// The [`SECOND_FRONT_ENDS`] paths `code` names.
 fn second_front_ends(code: &str) -> Vec<&'static str> {
     SECOND_FRONT_ENDS
@@ -6828,7 +6831,9 @@ fn second_front_ends(code: &str) -> Vec<&'static str> {
 ///
 /// `release_pipeline` (its `release_one` closure included) and the
 /// `BundleFinish::Release` arm of `emit_desktop` emit only through the judged
-/// release, and `resolve_for_run` infers only on the front end it is handed.
+/// release, `resolve_for_run` infers only on the front end it is handed, and
+/// `consent_on` opens that front end over the sources `held` read itself, so
+/// no caller can hand it a front end over other sources.
 #[test]
 fn release_bodies_name_no_second_front_end() {
     let commands = rust_tokens(include_str!("../commands.rs"));
@@ -6841,6 +6846,13 @@ fn release_bodies_name_no_second_front_end() {
     let (Some(commands), Some(bundles), Some(sandbox)) = (commands, bundles, sandbox) else {
         return;
     };
+    let consent = fn_body_tokens(commands.clone(), "consent_on").map(compact);
+    assert!(
+        consent
+            .as_deref()
+            .is_some_and(|body| body.contains(CONSENT_OPENS_HELD_SOURCES)),
+        "consent_on opens its front end over the held sources: {consent:?}"
+    );
     let pipeline = fn_body_tokens(commands, "release_pipeline").map(compact);
     let desktop = fn_body_tokens(bundles, "emit_desktop")
         .and_then(|body| arm_body(body, "BundleFinish", "Release"));

@@ -387,10 +387,11 @@ fn emit_on(
 /// is emitted on that same database in turn; every emit must be
 /// byte-identical to a single emit of the same configuration on a fresh
 /// database over the same sources. A directory the package read refuses is
-/// not a release and is skipped.
-fn consent_warmed_parity(label: &str, dir: &Path) {
+/// not a release and is skipped; the answer is whether the package was
+/// compared.
+fn consent_warmed_parity(label: &str, dir: &Path) -> bool {
     let Ok(set) = ipe::PackageSourceSet::read(&dir.join("package.ipe")) else {
-        return;
+        return false;
     };
     let front = ipe::PackageFrontEnd::cold(set);
     let consented = front.infer_capabilities().is_ok();
@@ -407,6 +408,7 @@ fn consent_warmed_parity(label: &str, dir: &Path) {
             &cold,
         );
     }
+    true
 }
 
 /// The entry of the consent-warmed fixture: it imports [`CONSENT_UTIL`].
@@ -467,6 +469,7 @@ fn probe_shard(shard: usize, count: usize) {
         dirs.len()
     );
     let mut covered = 0usize;
+    let mut consent_covered = 0usize;
     for (i, dir) in dirs.iter().enumerate() {
         if !parity_shards::owns(i, shard, count) {
             continue;
@@ -479,12 +482,16 @@ fn probe_shard(shard: usize, count: usize) {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         probe_fixture(&label, &state0);
-        consent_warmed_parity(&label, dir);
+        consent_covered += usize::from(consent_warmed_parity(&label, dir));
         covered += 1;
     }
     assert!(
         covered > 0,
         "shard {shard} of {count} covered zero fixtures"
+    );
+    assert!(
+        consent_covered > 0,
+        "shard {shard} of {count} compared no consent-warmed release: every package read refused"
     );
 }
 
