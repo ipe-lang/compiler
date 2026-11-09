@@ -6917,9 +6917,10 @@ const SMALL_CONSENT_CALLER_STACK: usize = 128 << 10;
 
 /// A module `Deep` whose value is a `let` block of `n` bindings after `x0`.
 fn deep_let_module(n: usize) -> String {
-    let bindings: String = (1..=n)
+    let bindings = (1..=n)
         .map(|i| format!("        x{i} = x{} + 1\n", i - 1))
-        .collect();
+        .collect::<Vec<_>>()
+        .concat();
     format!(
         "module Deep exposing (deep)\n\n\ndeep : Int\ndeep =\n    let\n        x0 = 0\n{bindings}    in\n    x{n}\n"
     )

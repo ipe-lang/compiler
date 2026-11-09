@@ -325,7 +325,7 @@ fn probe_fixture(label: &str, state0: &UserSources) {
 }
 
 /// Native emit settings under `intent` and `db_driver`.
-fn native_settings(
+const fn native_settings(
     intent: ipe_backend_rust::BuildIntent,
     db_driver: ipe_backend_rust::DbDriver,
 ) -> ipe_backend_rust::EmitSettings {
@@ -347,7 +347,7 @@ fn native_settings(
 }
 
 /// The two member configurations a consent-warmed release emits in turn.
-fn member_configs() -> [ipe_backend_rust::EmitSettings; 2] {
+const fn member_configs() -> [ipe_backend_rust::EmitSettings; 2] {
     [
         native_settings(
             ipe_backend_rust::BuildIntent::Release,
@@ -432,11 +432,8 @@ fn consent_warmed_members_equal_cold() {
     .expect("write package.ipe");
     std::fs::write(dir.join("src").join("Main.ipe"), CONSENT_MAIN).expect("write Main");
     std::fs::write(lib.join("Util.ipe"), CONSENT_UTIL).expect("write Lib.Util");
-    let set = ipe::PackageSourceSet::read(&dir.join("package.ipe"));
-    assert!(set.is_ok(), "the fixture package reads: {:?}", set.err());
-    let Ok(set) = set else {
-        return;
-    };
+    let set =
+        ipe::PackageSourceSet::read(&dir.join("package.ipe")).expect("the fixture package reads");
     let front = ipe::PackageFrontEnd::cold(set);
     let consented = front.infer_capabilities();
     assert!(consented.is_ok(), "consent infers: {:?}", consented.err());
