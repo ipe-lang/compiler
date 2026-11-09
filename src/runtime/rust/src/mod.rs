@@ -232,12 +232,11 @@ pub mod task;
 pub mod narrow;
 // `time` is behind the `time-core` feature (base `chrono`). The whole module —
 // the reactor-free clock reads (`Time.now`/`unixMillis`), the `Time.sleep`
-// timer, the calendar math, and the `chrono-tz`-gated IANA zone helpers — lives
-// behind `time-core`; a program that reaches no `Ipe.Time` kernel (and no
-// Log/Db/Web surface) drops the module and `chrono`. The IANA zone helpers keep
-// their inner `#[cfg(feature = "time")]` on top (they additionally need
-// `chrono-tz`). wasm32: `wasm-client` implies `time`, so the static wasm module
-// set resolves; its arms read `js_sys::Date`/`gloo-timers`, not `chrono`.
+// timer, and the UTC calendar rules and formatters — lives behind `time-core`;
+// a program that reaches no `Ipe.Time` kernel (and no Log/Db/Web surface)
+// drops the module and `chrono`. No item in it reads the `time` feature or
+// `chrono-tz`. wasm32: the browser clock and timer arms read
+// `js_sys::Date`/`gloo-timers`, not `chrono`.
 #[cfg(feature = "time-core")]
 pub mod time;
 // Always declared, matching the emitted floor and the browser module set: the

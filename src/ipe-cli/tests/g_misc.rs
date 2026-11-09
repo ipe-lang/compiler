@@ -116,6 +116,8 @@ mod golden_stdlib_markdown_bounds;
 mod golden_stdlib_module_seal;
 #[path = "g_misc/golden_test_summary_line_219.rs"]
 mod golden_test_summary_line_219;
+#[path = "g_misc/golden_time_days_in_month_domain.rs"]
+mod golden_time_days_in_month_domain;
 #[path = "g_misc/golden_time_format_arith.rs"]
 mod golden_time_format_arith;
 #[path = "g_misc/golden_time_from_to_millis.rs"]

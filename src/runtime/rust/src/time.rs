@@ -1,9 +1,5 @@
-// Time kernel — basic helpers (tokio-gated on native, wasm-client-gated in the
-// browser) + Ipe.Time advanced (always available).
-// `IpeResult` backs only the IANA-zone helpers (the `Result`-returning zone
-// surface), all gated behind the `time` feature — so its import is gated too.
-#[cfg(feature = "time")]
-use super::IpeResult;
+// Time kernel — the clock and sleep (tokio-gated on native, wasm-client-gated
+// in the browser) + the Ipe.Time calendar formatters and rules.
 // `IpeTask`/`ok_res` back every native time kernel (the reactor-free clock reads
 // AND the `Time.sleep` timer), so they are available on any native build,
 // `tokio` or not; the wasm arm re-imports them under its own cfg.
@@ -119,20 +115,33 @@ pub fn time_unix_millis<E: 'static>(_: ()) -> IpeTask<E, i64> {
     time_now(())
 }
 
-/// `Time.timeString : Int -> String` — formats the Unix-millis instant as
-/// `HH:MM:SS`. Pins UTC so a pure formatter is host-independent, matching every
-/// sibling formatter in this module.
+// === Ipe.Time calendar kernels — UTC, proleptic Gregorian ===
+//
+// Every kernel below returns the exact answer or trips a typed `TimeDomain`
+// naming itself: no sentinel `0`, `false`, or `""` stands in for a refusal.
+use crate::core::{RuntimeTrip, TimeOp, trip};
+use chrono::format::{Fixed, Item, Numeric, Pad};
+use chrono::{DateTime, TimeZone, Utc};
+
+/// The UTC calendar instant `ms` names, or a `TimeDomain` trip for `op`.
+///
+/// The formatters render years `-262143` to `262142` (chrono's calendar); an
+/// instant outside them has no rendering.
+fn calendar_instant(ms: i64, op: TimeOp) -> DateTime<Utc> {
+    Utc.timestamp_millis_opt(ms)
+        .single()
+        .unwrap_or_else(|| trip(RuntimeTrip::TimeDomain { op }))
+}
+
+/// `Time.timeString : Int -> String` — the UTC wall-clock time as `HH:MM:SS`.
+///
+/// Pinned to UTC, so a pure formatter is host-independent. The millis-native
+/// construction floors a pre-epoch sub-second instant to the prior second.
 #[must_use]
 pub fn time_time_string(ms: i64) -> String {
-    use chrono::{TimeZone, Utc};
-    // Millis-native construction (shared with every sibling formatter): dividing
-    // ms by 1000 truncates toward zero, which shifts a pre-epoch (negative) ms
-    // to the wrong second, so a sub-second-before-epoch instant would render the
-    // epoch second instead of the prior day's wall-clock time.
-    match Utc.timestamp_millis_opt(ms).single() {
-        Some(dt) => dt.format("%H:%M:%S").to_string(),
-        None => String::new(),
-    }
+    calendar_instant(ms, TimeOp::TimeString)
+        .format("%H:%M:%S")
+        .to_string()
 }
 
 /// `Time.addMillis : Int -> Int -> Int` — the exact `Int` sum.
@@ -152,541 +161,283 @@ pub fn time_diff_millis(later: i64, earlier: i64) -> i64 {
     crate::math::ipe_int_sub(later, earlier)
 }
 
-/// `ms` moved by `count` units of `unit_ms` milliseconds, exactly: a product
-/// or sum outside the 64-bit range trips `IntOverflow`, as `*` and `+` do.
-fn add_units(count: i64, unit_ms: i64, ms: i64) -> i64 {
-    crate::math::ipe_int_add(ms, crate::math::ipe_int_mul(count, unit_ms))
+/// A field of the Go reference time `Mon Jan 2 15:04:05 MST 2006` in a
+/// `Time.format` layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayoutToken {
+    /// `2006`: the year.
+    Year,
+    /// `01`: the zero-padded month number.
+    Month,
+    /// `02`: the zero-padded day of the month.
+    Day,
+    /// `15`: the zero-padded 24-hour hour.
+    Hour,
+    /// `04`: the zero-padded minute.
+    Minute,
+    /// `05`: the zero-padded second.
+    Second,
+    /// `Jan`: the abbreviated month name.
+    MonthName,
+    /// `Mon`: the abbreviated weekday name.
+    WeekdayName,
+    /// `MST`: the zone name, always `UTC`.
+    ZoneName,
+    /// `.000`: a dot and the milliseconds.
+    Millis,
+    /// `.000000`: a dot and the microseconds.
+    Micros,
+    /// `PM`: `AM` or `PM`.
+    UpperMeridiem,
+    /// `pm`: `am` or `pm`.
+    LowerMeridiem,
 }
 
-/// Whole `unit_ms` units in `later_ms - earlier_ms`, truncated toward zero.
+impl LayoutToken {
+    /// Every token with its layout spelling.
+    const ALL: [(&'static str, Self); 13] = [
+        ("2006", Self::Year),
+        ("01", Self::Month),
+        ("02", Self::Day),
+        ("15", Self::Hour),
+        ("04", Self::Minute),
+        ("05", Self::Second),
+        ("Jan", Self::MonthName),
+        ("Mon", Self::WeekdayName),
+        ("MST", Self::ZoneName),
+        (".000", Self::Millis),
+        (".000000", Self::Micros),
+        ("PM", Self::UpperMeridiem),
+        ("pm", Self::LowerMeridiem),
+    ];
+
+    /// The longest token spelled at the start of `rest`, with the text after it.
+    fn longest_prefix(rest: &str) -> Option<(Self, &str)> {
+        Self::ALL
+            .into_iter()
+            .filter_map(|(spelling, token)| Some((token, rest.strip_prefix(spelling)?)))
+            .min_by_key(|(_, after)| after.len())
+    }
+
+    /// The chrono item that renders this field.
+    const fn item(self) -> Item<'static> {
+        match self {
+            Self::Year => Item::Numeric(Numeric::Year, Pad::Zero),
+            Self::Month => Item::Numeric(Numeric::Month, Pad::Zero),
+            Self::Day => Item::Numeric(Numeric::Day, Pad::Zero),
+            Self::Hour => Item::Numeric(Numeric::Hour, Pad::Zero),
+            Self::Minute => Item::Numeric(Numeric::Minute, Pad::Zero),
+            Self::Second => Item::Numeric(Numeric::Second, Pad::Zero),
+            Self::MonthName => Item::Fixed(Fixed::ShortMonthName),
+            Self::WeekdayName => Item::Fixed(Fixed::ShortWeekdayName),
+            Self::ZoneName => Item::Literal("UTC"),
+            Self::Millis => Item::Fixed(Fixed::Nanosecond3),
+            Self::Micros => Item::Fixed(Fixed::Nanosecond6),
+            Self::UpperMeridiem => Item::Fixed(Fixed::UpperAmPm),
+            Self::LowerMeridiem => Item::Fixed(Fixed::LowerAmPm),
+        }
+    }
+}
+
+/// One piece of a parsed `Time.format` layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayoutPiece<'a> {
+    /// A reference-time field.
+    Token(LayoutToken),
+    /// Text rendered verbatim, `%` included.
+    Literal(&'a str),
+}
+
+impl<'a> LayoutPiece<'a> {
+    /// The chrono item that renders this piece.
+    const fn item(self) -> Item<'a> {
+        match self {
+            Self::Token(token) => token.item(),
+            Self::Literal(text) => Item::Literal(text),
+        }
+    }
+}
+
+/// A `Time.format` layout parsed left to right, taking the longest token at
+/// each position; every other character is literal text.
 ///
-/// The span is taken in `i128`, where every difference of two `Int`s is
-/// exact; any `unit_ms >= 2` brings the quotient back inside `Int`, so the
-/// narrowing never refuses. The refusal arm trips rather than inventing a
-/// value.
-fn diff_units(later_ms: i64, earlier_ms: i64, unit_ms: i64) -> i64 {
-    let span = i128::from(later_ms) - i128::from(earlier_ms);
-    let units = span / i128::from(unit_ms);
-    i64::try_from(units).unwrap_or_else(|_| {
-        crate::core::trip(crate::core::RuntimeTrip::IntOverflow {
-            op: crate::core::IntOp::Sub,
-        })
-    })
+/// Lazy and linear in the layout: each step consumes a token or one
+/// character, a literal run is sliced once by its byte length, and no piece is
+/// buffered, so rendering holds no allocation proportional to the layout.
+#[derive(Debug, Clone)]
+struct LayoutPieces<'a> {
+    /// The layout text not yet parsed.
+    rest: &'a str,
+    /// A token parsed together with the literal run before it, owed next.
+    owed: Option<LayoutToken>,
 }
 
-/// `Time.format : String -> Int -> String` — custom timestamp layout.
-/// Accepts the `2006-01-02 15:04:05` reference-time token format and
-/// translates it to chrono strftime internally. Falls back to a best-effort
-/// strftime render for any unrecognised tokens.
+impl<'a> Iterator for LayoutPieces<'a> {
+    type Item = LayoutPiece<'a>;
+
+    fn next(&mut self) -> Option<LayoutPiece<'a>> {
+        if let Some(token) = self.owed.take() {
+            return Some(LayoutPiece::Token(token));
+        }
+        let start = self.rest;
+        // The literal run is the first `literal_len` bytes of `start`, a
+        // prefix ending on a character boundary.
+        let mut literal_len = 0;
+        loop {
+            let literal = start.get(..literal_len).filter(|text| !text.is_empty());
+            if let Some((token, after)) = LayoutToken::longest_prefix(self.rest) {
+                self.rest = after;
+                return Some(match literal {
+                    Some(text) => {
+                        self.owed = Some(token);
+                        LayoutPiece::Literal(text)
+                    }
+                    None => LayoutPiece::Token(token),
+                });
+            }
+            let mut chars = self.rest.chars();
+            let Some(ch) = chars.next() else {
+                return literal.map(LayoutPiece::Literal);
+            };
+            literal_len += ch.len_utf8();
+            self.rest = chars.as_str();
+        }
+    }
+}
+
+/// Parses a `Time.format` layout once into its pieces.
+const fn parse_layout(layout: &str) -> LayoutPieces<'_> {
+    LayoutPieces {
+        rest: layout,
+        owed: None,
+    }
+}
+
+/// `Time.format : String -> Int -> String` — the UTC instant in a Go
+/// reference-time layout.
+///
+/// The layout spells fields of `Mon Jan 2 15:04:05 MST 2006`: `2006 01 02 15
+/// 04 05 Jan Mon MST .000 .000000 PM pm`. It is parsed into those tokens once,
+/// longest match first; every other character, `%` included, is literal.
 #[must_use]
 pub fn time_format(layout: String, ms: i64) -> String {
-    use chrono::{TimeZone, Utc};
-    let Some(dt) = Utc.timestamp_millis_opt(ms).single() else {
-        return String::new();
-    };
-    // Translate reference-time placeholders to chrono strftime.
-    // Reference time: Mon Jan 2 15:04:05 MST 2006 (= 2006-01-02 15:04:05).
-    let strfmt = layout
-        .replace("2006", "%Y")
-        .replace("01", "%m")
-        .replace("02", "%d")
-        .replace("15", "%H")
-        .replace("04", "%M")
-        .replace("05", "%S")
-        .replace("Jan", "%b")
-        .replace("Mon", "%a")
-        .replace("MST", "UTC")
-        // Longer fractional-second token MUST be translated before the shorter
-        // one, else `.000` shadows the `.000000` form (it matches the leading 4
-        // chars and leaves a stray `000`).
-        .replace(".000000", ".%6f")
-        .replace(".000", ".%3f")
-        .replace("PM", "%p")
-        .replace("pm", "%P");
-    // Non-panicking render: chrono's DelayedFormat Display can return Err on an
-    // invalid/unterminated format specifier (e.g. a stray `%`), and std's
-    // to_string() panics when a Display impl returns Err. Use write! instead.
-    let mut out = String::new();
-    match std::fmt::write(&mut out, format_args!("{}", dt.format(&strfmt))) {
-        Ok(()) => out,
-        Err(_) => String::new(),
-    }
+    let instant = calendar_instant(ms, TimeOp::Format);
+    // Every item names a field a UTC `DateTime` carries, so the render is total.
+    instant
+        .format_with_items(parse_layout(&layout).map(LayoutPiece::item))
+        .to_string()
 }
 
-/// `Time.formatHTTP : Int -> String` — HTTP date header format.
-/// Produces "Mon, 02 Jan 2006 15:04:05 GMT" (RFC 7231 / HTTP-date).
+/// `Time.formatHTTP : Int -> String` — the HTTP-date (RFC 7231) rendering,
+/// `Mon, 02 Jan 2006 15:04:05 GMT`.
 #[must_use]
 pub fn time_format_http(ms: i64) -> String {
-    use chrono::{TimeZone, Utc};
-    match Utc.timestamp_millis_opt(ms).single() {
-        Some(dt) => dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
-        None => String::new(),
-    }
+    calendar_instant(ms, TimeOp::FormatHttp)
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string()
 }
 
-/// `Time.formatRFC3339 : Int -> String` — RFC 3339 / ISO 8601 timestamp.
-/// Sub-second precision is included when non-zero.
+/// `Time.formatRFC3339 : Int -> String` — the RFC 3339 rendering, with
+/// sub-second precision when non-zero.
 #[must_use]
 pub fn time_format_rfc3339(ms: i64) -> String {
-    use chrono::{TimeZone, Utc};
-    match Utc.timestamp_millis_opt(ms).single() {
-        Some(dt) => dt.to_rfc3339(),
-        None => String::new(),
-    }
+    calendar_instant(ms, TimeOp::FormatRfc3339).to_rfc3339()
 }
 
-#[cfg(feature = "time")]
-use chrono::{DateTime, Duration, Weekday};
-/// === Ipe.Time advanced — IANA zones + calendar math ===
-// Core calendar math (add/diff/isLeapYear/daysInMonth) uses only these,
-// unconditionally. `DateTime` / `Duration` / `Weekday` appear only in the
-// `time`-gated zone helpers, so they are imported under that feature.
-use chrono::{Datelike, NaiveDate, TimeZone, Timelike, Utc};
-// `chrono-tz` (the embedded IANA zone DB) backs the zone helpers below; it is
-// gated behind the `time` Cargo feature, promoted only for a program that
-// reaches an `Ipe.Time` kernel. A no-Time program compiles this module without
-// the crate — every `Tz`-using fn is `#[cfg(feature = "time")]`. The chrono-core
-// calendar math (add/diff/isLeapYear/daysInMonth) stays unconditional.
-#[cfg(feature = "time")]
-use chrono_tz::Tz;
-
-#[cfg(feature = "time")]
-fn parse_zone<E: From<String>>(z: &str) -> IpeResult<E, Tz> {
-    match z.parse::<Tz>() {
-        Ok(t) => IpeResult::Ok(t),
-        Err(_) => IpeResult::Err(format!("Ipe.Time: unknown zone: {z}").into()),
-    }
-}
-
-#[cfg(feature = "time")]
-fn millis_to_zoned<E: From<String>>(zone: &str, ms: i64) -> IpeResult<E, DateTime<Tz>> {
-    let tz = match parse_zone::<E>(zone) {
-        IpeResult::Ok(t) => t,
-        IpeResult::Err(e) => return IpeResult::Err(e),
-    };
-    match Utc.timestamp_millis_opt(ms).single() {
-        Some(utc) => IpeResult::Ok(utc.with_timezone(&tz)),
-        None => IpeResult::Err(format!("Ipe.Time: epoch ms out of range: {ms}").into()),
-    }
-}
-
-#[cfg(feature = "time")]
-#[must_use]
-pub fn time_in_zone<E: From<String>>(zone: String, ms: i64) -> IpeResult<E, String> {
-    let dt = match millis_to_zoned::<E>(&zone, ms) {
-        IpeResult::Ok(d) => d,
-        IpeResult::Err(e) => return IpeResult::Err(e),
-    };
-    IpeResult::Ok(dt.to_rfc3339())
-}
-
-// Exact `Int` arithmetic: a shifted instant outside the 64-bit range trips
-// `IntOverflow` — never a saturated instant that reads as a real one.
-#[must_use]
-pub fn time_add_days(days: i64, ms: i64) -> i64 {
-    add_units(days, 86_400_000, ms)
-}
-#[must_use]
-pub fn time_add_hours(h: i64, ms: i64) -> i64 {
-    add_units(h, 3_600_000, ms)
-}
-#[must_use]
-pub fn time_add_minutes(m: i64, ms: i64) -> i64 {
-    add_units(m, 60_000, ms)
-}
-#[must_use]
-pub fn time_add_seconds(s: i64, ms: i64) -> i64 {
-    add_units(s, 1000, ms)
-}
-
-#[must_use]
-pub fn time_add_months(months: i64, ms: i64) -> i64 {
-    let Some(utc) = Utc.timestamp_millis_opt(ms).single() else {
-        return ms;
-    };
-    let y = i64::from(utc.year());
-    // `months` is caller-controlled (Ipê `Ipe.Time.addMonths`): saturating_add
-    // avoids the i64 overflow (debug panic / release silent-wrap) on an extreme
-    // value. A saturated `m` puts the target year outside `i32`, so the parse
-    // below refuses it and the function returns `ms` unchanged (total, no panic).
-    let m = (i64::from(utc.month()) - 1).saturating_add(months);
-    // Parse the target year into chrono's i32 domain (don't truncate): a lossy
-    // `as i32` on a large-but-non-saturating result would wrap a far-future/past
-    // year back into a valid band → a WRONG in-range date. try_from → out-of-range
-    // returns `ms` unchanged (the intended total fallthrough).
-    let Ok(new_y) = i32::try_from(y.saturating_add(m.div_euclid(12))) else {
-        return ms;
-    };
-    let Ok(new_m) = u32::try_from(m.rem_euclid(12) + 1) else {
-        return ms;
-    };
-    // Clamp day to month end
-    let first = NaiveDate::from_ymd_opt(new_y, new_m, 1);
-    let max_day = match first {
-        Some(d) => {
-            let (ny, nm) = if new_m == 12 {
-                (new_y + 1, 1u32)
-            } else {
-                (new_y, new_m + 1)
-            };
-            let first_next = NaiveDate::from_ymd_opt(ny, nm, 1).unwrap_or(d);
-            let Ok(days) = u32::try_from(first_next.signed_duration_since(d).num_days()) else {
-                return ms;
-            };
-            days
-        }
-        None => return ms,
-    };
-    let day = utc.day().min(max_day);
-    match NaiveDate::from_ymd_opt(new_y, new_m, day).and_then(|d| {
-        d.and_hms_milli_opt(
-            utc.hour(),
-            utc.minute(),
-            utc.second(),
-            utc.timestamp_subsec_millis(),
-        )
-    }) {
-        Some(ndt) => Utc.from_utc_datetime(&ndt).timestamp_millis(),
-        None => ms,
-    }
-}
-
-#[must_use]
-pub fn time_add_years(years: i64, ms: i64) -> i64 {
-    time_add_months(years.saturating_mul(12), ms)
-}
-
-#[cfg(feature = "time")]
-fn zoned_field<E: From<String>, F>(zone: String, ms: i64, f: F) -> IpeResult<E, i64>
-where
-    F: FnOnce(DateTime<Tz>) -> i64,
-{
-    let dt = match millis_to_zoned::<E>(&zone, ms) {
-        IpeResult::Ok(d) => d,
-        IpeResult::Err(e) => return IpeResult::Err(e),
-    };
-    IpeResult::Ok(f(dt))
-}
-
-#[cfg(feature = "time")]
-#[must_use]
-pub fn time_year<E: From<String>>(z: String, ms: i64) -> IpeResult<E, i64> {
-    zoned_field(z, ms, |dt| i64::from(dt.year()))
-}
-#[cfg(feature = "time")]
-#[must_use]
-pub fn time_month<E: From<String>>(z: String, ms: i64) -> IpeResult<E, i64> {
-    zoned_field(z, ms, |dt| i64::from(dt.month()))
-}
-#[cfg(feature = "time")]
-#[must_use]
-pub fn time_day<E: From<String>>(z: String, ms: i64) -> IpeResult<E, i64> {
-    zoned_field(z, ms, |dt| i64::from(dt.day()))
-}
-#[cfg(feature = "time")]
-#[must_use]
-pub fn time_day_of_week<E: From<String>>(z: String, ms: i64) -> IpeResult<E, i64> {
-    zoned_field(z, ms, |dt| match dt.weekday() {
-        Weekday::Mon => 1,
-        Weekday::Tue => 2,
-        Weekday::Wed => 3,
-        Weekday::Thu => 4,
-        Weekday::Fri => 5,
-        Weekday::Sat => 6,
-        Weekday::Sun => 7,
-    })
-}
-#[cfg(feature = "time")]
-#[must_use]
-pub fn time_day_of_year<E: From<String>>(z: String, ms: i64) -> IpeResult<E, i64> {
-    zoned_field(z, ms, |dt| i64::from(dt.ordinal()))
-}
-#[cfg(feature = "time")]
-#[must_use]
-pub fn time_week_of_year<E: From<String>>(z: String, ms: i64) -> IpeResult<E, i64> {
-    zoned_field(z, ms, |dt| i64::from(dt.iso_week().week()))
-}
-#[cfg(feature = "time")]
-#[must_use]
-pub fn time_is_weekend<E: From<String>>(z: String, ms: i64) -> IpeResult<E, bool> {
-    let dt = match millis_to_zoned::<E>(&z, ms) {
-        IpeResult::Ok(d) => d,
-        IpeResult::Err(e) => return IpeResult::Err(e),
-    };
-    IpeResult::Ok(matches!(dt.weekday(), Weekday::Sat | Weekday::Sun))
-}
-
-#[must_use]
-pub fn time_is_leap_year(y: i64) -> bool {
-    // AUD-09: parse into chrono's i32 domain rather than truncating — a lossy
-    // `as i32` cast on a large caller Int wraps to a valid band, giving a
-    // wrong (but plausible-looking) leap-year answer instead of failing
-    // closed. Mirrors `time_days_in_month`'s existing pattern below.
-    let Ok(y) = i32::try_from(y) else {
-        return false;
-    };
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
-}
-
-#[must_use]
-pub fn time_days_in_month(year: i64, month: i64) -> i64 {
-    // Parse year into chrono's i32 domain rather than truncating: a lossy cast on
-    // a large caller Int would wrap to a valid band → wrong day count. Out-of-range → 0.
-    let Ok(y) = i32::try_from(year) else {
-        return 0;
-    };
-    // A month past `u32` is refused rather than narrowed: a narrowed `2^32 + 1`
-    // would read as January.
-    let Ok(m) = u32::try_from(month) else {
-        return 0;
-    };
-    if !(1..=12).contains(&m) {
-        return 0;
-    }
-    // saturating_add: `year` is caller-controlled; y+1 at i32::MAX would panic
-    // (debug) / wrap (release). A saturated year makes from_ymd_opt return None → 0.
-    let (ny, nm) = if m == 12 {
-        (y.saturating_add(1), 1)
-    } else {
-        (y, m + 1)
-    };
-    match (
-        NaiveDate::from_ymd_opt(ny, nm, 1),
-        NaiveDate::from_ymd_opt(y, m, 1),
-    ) {
-        (Some(next), Some(this)) => next.signed_duration_since(this).num_days(),
-        _ => 0,
-    }
-}
-
-#[cfg(feature = "time")]
-fn local_midnight_in_zone<E: From<String>>(
-    zone: String,
-    ms: i64,
-    h: u32,
-    mi: u32,
-    se: u32,
-    mi_lli: u32,
-    target_date: impl Fn(DateTime<Tz>) -> NaiveDate,
-) -> IpeResult<E, i64> {
-    let dt = match millis_to_zoned::<E>(&zone, ms) {
-        IpeResult::Ok(d) => d,
-        IpeResult::Err(e) => return IpeResult::Err(e),
-    };
-    let date = target_date(dt);
-    let Some(local) = date.and_hms_milli_opt(h, mi, se, mi_lli) else {
-        return IpeResult::Err("Ipe.Time: invalid date components".to_string().into());
-    };
-    match dt.timezone().from_local_datetime(&local).single() {
-        Some(z) => IpeResult::Ok(z.timestamp_millis()),
-        None => IpeResult::Err("Ipe.Time: ambiguous local time".to_string().into()),
-    }
-}
-
-#[cfg(feature = "time")]
-#[must_use]
-pub fn time_start_of_day<E: From<String>>(zone: String, ms: i64) -> IpeResult<E, i64> {
-    local_midnight_in_zone(zone, ms, 0, 0, 0, 0, |dt| dt.date_naive())
-}
-#[cfg(feature = "time")]
-#[must_use]
-pub fn time_end_of_day<E: From<String>>(zone: String, ms: i64) -> IpeResult<E, i64> {
-    match time_start_of_day::<E>(zone, ms) {
-        IpeResult::Ok(start) => IpeResult::Ok(start + 86_400_000 - 1),
-        IpeResult::Err(e) => IpeResult::Err(e),
-    }
-}
-#[cfg(feature = "time")]
-#[must_use]
-pub fn time_start_of_week<E: From<String>>(zone: String, ms: i64) -> IpeResult<E, i64> {
-    local_midnight_in_zone(zone, ms, 0, 0, 0, 0, |dt| {
-        let wd = dt.weekday().num_days_from_monday();
-        dt.date_naive() - Duration::days(i64::from(wd))
-    })
-}
-#[cfg(feature = "time")]
-#[must_use]
-pub fn time_start_of_month<E: From<String>>(zone: String, ms: i64) -> IpeResult<E, i64> {
-    local_midnight_in_zone(zone, ms, 0, 0, 0, 0, |dt| {
-        NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1).unwrap_or(dt.date_naive())
-    })
-}
-#[cfg(feature = "time")]
-#[must_use]
-pub fn time_end_of_month<E: From<String>>(zone: String, ms: i64) -> IpeResult<E, i64> {
-    let dt = match millis_to_zoned::<E>(&zone, ms) {
-        IpeResult::Ok(d) => d,
-        IpeResult::Err(e) => return IpeResult::Err(e),
-    };
-    let dim = u32::try_from(time_days_in_month(
-        i64::from(dt.year()),
-        i64::from(dt.month()),
-    ))
-    .unwrap_or(0);
-    let target = NaiveDate::from_ymd_opt(dt.year(), dt.month(), dim);
-    let target_date = target.unwrap_or(dt.date_naive());
-    local_midnight_in_zone::<E>(zone, ms, 23, 59, 59, 999, move |_| target_date)
-}
-#[cfg(feature = "time")]
-#[must_use]
-pub fn time_start_of_year<E: From<String>>(zone: String, ms: i64) -> IpeResult<E, i64> {
-    local_midnight_in_zone(zone, ms, 0, 0, 0, 0, |dt| {
-        NaiveDate::from_ymd_opt(dt.year(), 1, 1).unwrap_or(dt.date_naive())
-    })
-}
-#[cfg(feature = "time")]
-#[must_use]
-pub fn time_end_of_year<E: From<String>>(zone: String, ms: i64) -> IpeResult<E, i64> {
-    local_midnight_in_zone(zone, ms, 23, 59, 59, 999, |dt| {
-        NaiveDate::from_ymd_opt(dt.year(), 12, 31).unwrap_or(dt.date_naive())
-    })
-}
-
-#[cfg(feature = "time")]
-#[must_use]
-pub fn time_format_in_zone<E: From<String>>(
-    pattern: String,
-    zone: String,
-    ms: i64,
-) -> IpeResult<E, String> {
-    let dt = match millis_to_zoned::<E>(&zone, ms) {
-        IpeResult::Ok(d) => d,
-        IpeResult::Err(e) => return IpeResult::Err(e),
-    };
-    // Non-panicking render: same risk as time_format — stray `%` in a
-    // Ipê-supplied pattern causes DelayedFormat::fmt to return Err, which
-    // to_string() turns into a panic. Use write! and fall back to "".
-    let mut out = String::new();
-    match std::fmt::write(&mut out, format_args!("{}", dt.format(&pattern))) {
-        Ok(()) => IpeResult::Ok(out),
-        Err(_) => IpeResult::Ok(String::new()),
-    }
-}
-
-/// `Ipe.Time.formatISO8601 ms` — the UTC instant as an RFC3339 / ISO-8601
-/// string .Format(time.RFC3339)`). Infallible (`""` only on
-/// an out-of-range timestamp).
+/// `Time.formatISO8601 : Int -> String` — the ISO 8601 rendering of the UTC
+/// instant (the RFC 3339 profile).
 #[must_use]
 pub fn time_format_iso8601(ms: i64) -> String {
-    match Utc.timestamp_millis_opt(ms).single() {
-        Some(dt) => dt.to_rfc3339(),
-        None => String::new(),
-    }
+    calendar_instant(ms, TimeOp::FormatIso8601).to_rfc3339()
 }
 
-// === advanced diff / fromParts / zone kernels ===
-
-/// `diffSeconds later earlier` — integer seconds between two epoch-ms timestamps.
-/// Truncates toward zero for both signs; exact for every pair of `Int`s.
+/// `Time.isLeapYear : Int -> Bool` — the proleptic Gregorian leap rule, over
+/// every `Int` year.
 #[must_use]
-pub fn time_diff_seconds(later_ms: i64, earlier_ms: i64) -> i64 {
-    diff_units(later_ms, earlier_ms, 1_000)
-}
-#[must_use]
-pub fn time_diff_minutes(later_ms: i64, earlier_ms: i64) -> i64 {
-    diff_units(later_ms, earlier_ms, 60_000)
-}
-#[must_use]
-pub fn time_diff_hours(later_ms: i64, earlier_ms: i64) -> i64 {
-    diff_units(later_ms, earlier_ms, 3_600_000)
-}
-#[must_use]
-pub fn time_diff_days(later_ms: i64, earlier_ms: i64) -> i64 {
-    diff_units(later_ms, earlier_ms, 86_400_000)
+pub const fn time_is_leap_year(year: i64) -> bool {
+    year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0)
 }
 
-/// Parses the `Time.fromParts` date parts into a naive local date-time.
-///
-/// Every part is parsed into chrono's domain rather than narrowed: a narrowing
-/// cast keeps the low bits, so a year past `i32` would land in a valid band and
-/// a month of `2^32 + 3` would read as March, each passing the "invalid date
-/// parts" refusal. Any part out of range yields `None`.
-#[cfg(feature = "time")]
-fn naive_from_parts(
-    y: i64,
-    m: i64,
-    d: i64,
-    h: i64,
-    mins: i64,
-    s: i64,
-) -> Option<chrono::NaiveDateTime> {
-    let y = i32::try_from(y).ok()?;
-    let [m, d, h, mins, s] = [m, d, h, mins, s].map(|part| u32::try_from(part).ok());
-    let (m, d, h, mins, s) = (m?, d?, h?, mins?, s?);
-    NaiveDate::from_ymd_opt(y, m, d)?.and_hms_opt(h, mins, s)
+/// A month of the Gregorian year.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Month {
+    /// Month 1.
+    January,
+    /// Month 2.
+    February,
+    /// Month 3.
+    March,
+    /// Month 4.
+    April,
+    /// Month 5.
+    May,
+    /// Month 6.
+    June,
+    /// Month 7.
+    July,
+    /// Month 8.
+    August,
+    /// Month 9.
+    September,
+    /// Month 10.
+    October,
+    /// Month 11.
+    November,
+    /// Month 12.
+    December,
 }
 
-/// Ipê source: `fromParts zone y m d h mins s -> Result Error Int`.
-/// Computes the UTC epoch-ms for the given local date/time in the given IANA
-/// zone. Invalid parts return Err. Unknown timezone returns Err.
-#[cfg(feature = "time")]
-#[must_use]
-pub fn time_from_parts<E: From<String>>(
-    zone: String,
-    y: i64,
-    m: i64,
-    d: i64,
-    h: i64,
-    mins: i64,
-    s: i64,
-) -> IpeResult<E, i64> {
-    let tz: Tz = match zone.parse() {
-        Ok(t) => t,
-        Err(_) => {
-            return IpeResult::Err(format!("Time.fromParts: unknown timezone {zone:?}").into());
+impl Month {
+    /// The month numbered `number`, if it is in `1..=12`.
+    const fn from_number(number: i64) -> Option<Self> {
+        match number {
+            1 => Some(Self::January),
+            2 => Some(Self::February),
+            3 => Some(Self::March),
+            4 => Some(Self::April),
+            5 => Some(Self::May),
+            6 => Some(Self::June),
+            7 => Some(Self::July),
+            8 => Some(Self::August),
+            9 => Some(Self::September),
+            10 => Some(Self::October),
+            11 => Some(Self::November),
+            12 => Some(Self::December),
+            _ => None,
         }
-    };
-    let Some(naive) = naive_from_parts(y, m, d, h, mins, s) else {
-        return IpeResult::Err(
-            format!("Time.fromParts: invalid date parts {y}-{m:02}-{d:02} {h:02}:{mins:02}:{s:02}")
-                .into(),
-        );
-    };
-    match tz.from_local_datetime(&naive).single() {
-        Some(zoned) => IpeResult::Ok(zoned.with_timezone(&Utc).timestamp_millis()),
-        None => IpeResult::Err(format!(
-            "Time.fromParts: ambiguous/non-existent local time {y}-{m:02}-{d:02} {h:02}:{mins:02}:{s:02} in {zone}").into()),
+    }
+
+    /// The month's length in a leap or common year.
+    const fn days(self, leap: bool) -> u8 {
+        match self {
+            Self::February if leap => 29,
+            Self::February => 28,
+            Self::April | Self::June | Self::September | Self::November => 30,
+            Self::January
+            | Self::March
+            | Self::May
+            | Self::July
+            | Self::August
+            | Self::October
+            | Self::December => 31,
+        }
     }
 }
 
-/// `zoneOffset zone ms -> Result Error Int` — UTC offset in seconds for the
-/// instant in the given zone. Unknown zones return Err.
-#[cfg(feature = "time")]
+/// `Time.daysInMonth : Int -> Int -> Int` — the days in `month` of `year`.
+///
+/// Every `Int` year is a proleptic Gregorian year; a month outside `1..=12`
+/// trips `TimeDomain`.
 #[must_use]
-pub fn time_zone_offset<E: From<String>>(zone_name: String, ms: i64) -> IpeResult<E, i64> {
-    use chrono::Offset;
-    let utc: DateTime<Utc> = match Utc.timestamp_millis_opt(ms).single() {
-        Some(t) => t,
-        None => return IpeResult::Err(format!("Time.zoneOffset: invalid epoch ms {ms}").into()),
-    };
-    match zone_name.parse::<Tz>() {
-        Ok(tz) => IpeResult::Ok(i64::from(
-            tz.from_utc_datetime(&utc.naive_utc())
-                .offset()
-                .fix()
-                .local_minus_utc(),
-        )),
-        Err(_) => IpeResult::Err(format!("Time.zoneOffset: unknown timezone {zone_name:?}").into()),
-    }
-}
-
-/// `zoneName zone ms -> Result Error String` — short timezone abbreviation
-/// (e.g. "EST", "PDT"). Unknown zones return Err.
-#[cfg(feature = "time")]
-#[must_use]
-pub fn time_zone_name<E: From<String>>(zone_name: String, ms: i64) -> IpeResult<E, String> {
-    let utc: DateTime<Utc> = match Utc.timestamp_millis_opt(ms).single() {
-        Some(t) => t,
-        None => return IpeResult::Err(format!("Time.zoneName: invalid epoch ms {ms}").into()),
-    };
-    match zone_name.parse::<Tz>() {
-        Ok(tz) => IpeResult::Ok(
-            tz.from_utc_datetime(&utc.naive_utc())
-                .format("%Z")
-                .to_string(),
-        ),
-        Err(_) => IpeResult::Err(format!("Time.zoneName: unknown timezone {zone_name:?}").into()),
-    }
+pub fn time_days_in_month(year: i64, month: i64) -> i64 {
+    Month::from_number(month).map_or_else(
+        || {
+            trip(RuntimeTrip::TimeDomain {
+                op: TimeOp::DaysInMonth,
+            })
+        },
+        |month| i64::from(month.days(time_is_leap_year(year))),
+    )
 }
 
 // `time_time_string` is unconditional (no `time` feature), so its regression
@@ -762,38 +513,12 @@ mod time_string_tests {
     }
 }
 
-// Exercises the IANA-zone helpers, so it needs the `chrono-tz`-backed surface
-// the `time` feature gates. The chrono-core calendar math (add/diff/isLeapYear)
-// is covered here too; running the whole module under `--features time` keeps a
-// single fixture set rather than splitting core from zone tests.
-#[cfg(all(test, feature = "time"))]
-#[cfg(not(target_arch = "wasm32"))]
-mod time_advanced_tests {
-    use super::*;
-
-    // 2026-05-29 12:00:00 UTC is a Friday
-    const T1: i64 = 1_780_400_400_000;
-
-    #[test]
-    fn test_in_zone_utc() {
-        let r: IpeResult<String, String> = time_in_zone("UTC".to_string(), T1);
-        assert!(matches!(r, IpeResult::Ok(ref s) if s.contains("2026")));
-    }
-
-    #[test]
-    fn test_in_zone_unknown() {
-        let r: IpeResult<String, String> = time_in_zone("Not/AZone".to_string(), T1);
-        assert!(matches!(r, IpeResult::Err(_)));
-    }
-
-    #[test]
-    fn test_day_of_week_friday() {
-        let r: IpeResult<String, i64> = time_day_of_week("UTC".to_string(), T1);
-        assert!(
-            matches!(r, IpeResult::Ok(d) if (1..=7).contains(&d)),
-            "got {r:?}"
-        );
-    }
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod kernel_tests {
+    use super::{
+        time_diff_millis, time_format, time_format_http, time_format_iso8601, time_format_rfc3339,
+        time_is_leap_year,
+    };
 
     #[test]
     fn test_is_leap_year() {
@@ -804,128 +529,10 @@ mod time_advanced_tests {
     }
 
     #[test]
-    fn test_add_days_months() {
-        // adding 1 day = +86400000 ms
-        assert_eq!(time_add_days(1, T1), T1 + 86_400_000);
-        // adding months returns SOME result (no panic)
-        let added = time_add_months(1, T1);
-        assert!(added > T1);
-    }
-
-    // advanced kernel tests
-
-    #[test]
-    fn test_diff_seconds() {
-        assert_eq!(time_diff_seconds(5_500, 3_000), 2);
-        assert_eq!(time_diff_seconds(0, 2_500), -2);
-    }
-
-    #[test]
-    fn test_diff_minutes_hours_days() {
-        assert_eq!(time_diff_minutes(120_000, 0), 2);
-        assert_eq!(time_diff_hours(3_600_000 * 5, 0), 5);
-        assert_eq!(time_diff_days(86_400_000 * 7, 0), 7);
-    }
-
-    #[test]
-    fn test_from_parts_epoch_utc() {
-        let r: IpeResult<String, i64> = time_from_parts("UTC".into(), 1970, 1, 1, 0, 0, 0);
-        assert!(matches!(r, IpeResult::Ok(0)));
-    }
-
-    #[test]
-    fn test_from_parts_invalid_returns_err() {
-        let r1: IpeResult<String, i64> = time_from_parts("UTC".into(), 2024, 13, 1, 0, 0, 0); // month 13
-        let r2: IpeResult<String, i64> = time_from_parts("UTC".into(), 2024, 2, 30, 0, 0, 0); // Feb 30
-        let r3: IpeResult<String, i64> = time_from_parts("Not/AZone".into(), 2024, 1, 1, 0, 0, 0);
-        assert!(matches!(r1, IpeResult::Err(_)));
-        assert!(matches!(r2, IpeResult::Err(_)));
-        assert!(matches!(r3, IpeResult::Err(_))); // unknown timezone
-    }
-
-    /// `2^32`: the first value a `u32` narrowing wraps back to zero.
-    const WRAP: i64 = 1 << 32;
-
-    /// Each part, one step past its last legal value and at `2^32 + valid`
-    /// (which a narrowing cast reads as the valid part), is refused.
-    #[test]
-    fn from_parts_refuses_each_out_of_range_part() {
-        let legal = [2024, 3, 1, 0, 0, 0];
-        let past_last = [(1, 13), (2, 32), (3, 24), (4, 60), (5, 60)];
-        let wrapped = [
-            (1, WRAP + 3),
-            (2, WRAP + 1),
-            (3, WRAP + 1),
-            (4, WRAP + 1),
-            (5, WRAP + 1),
-        ];
-        let negative = [(1, -1), (2, -1), (3, -1), (4, -1), (5, -1)];
-        for (slot, value) in past_last.into_iter().chain(wrapped).chain(negative) {
-            let mut p = legal;
-            if let Some(part) = p.get_mut(slot) {
-                *part = value;
-            }
-            let [y, m, d, h, mins, s] = p;
-            let r: IpeResult<String, i64> = time_from_parts("UTC".into(), y, m, d, h, mins, s);
-            assert!(
-                matches!(r, IpeResult::Err(ref e) if e.contains("invalid date parts")),
-                "part {slot} = {value} was accepted: {r:?}"
-            );
-        }
-        let ok: IpeResult<String, i64> = time_from_parts("UTC".into(), 2024, 12, 31, 23, 59, 59);
-        assert!(
-            matches!(ok, IpeResult::Ok(_)),
-            "last legal parts refused: {ok:?}"
-        );
-    }
-
-    /// A year one past `i32` and `2^32 + 2024` are refused, not wrapped.
-    #[test]
-    fn from_parts_refuses_a_year_past_i32() {
-        for y in [i64::from(i32::MAX) + 1, WRAP + 2024] {
-            let r: IpeResult<String, i64> = time_from_parts("UTC".into(), y, 1, 1, 0, 0, 0);
-            assert!(
-                matches!(r, IpeResult::Err(_)),
-                "year {y} was accepted: {r:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_zone_offset_utc() {
-        let r: IpeResult<String, i64> = time_zone_offset("UTC".into(), 0);
-        assert!(matches!(r, IpeResult::Ok(0)));
-    }
-
-    #[test]
-    fn test_zone_offset_ny_winter() {
-        // 1970-01-01 00:00 UTC; America/New_York was EST (-5h) on that day.
-        let r: IpeResult<String, i64> = time_zone_offset("America/New_York".into(), 0);
-        assert!(matches!(r, IpeResult::Ok(v) if v == -5 * 3_600));
-    }
-
-    #[test]
-    fn test_zone_name_utc() {
-        let r: IpeResult<String, String> = time_zone_name("UTC".into(), 0);
-        match r {
-            IpeResult::Ok(name) => assert!(name == "UTC" || name == "Z"),
-            IpeResult::Err(_) => panic!("UTC should be a known timezone"),
-        }
-    }
-
-    #[test]
-    fn test_zone_offset_unknown_returns_err() {
-        let r: IpeResult<String, i64> = time_zone_offset("Not/AZone".into(), 0);
-        assert!(matches!(r, IpeResult::Err(_)));
-    }
-
-    // ── go-parity kernels ─────────────────────────
-
-    #[test]
     fn test_add_millis() {
-        assert_eq!(time_add_millis(1000, 5000), 6000);
-        assert_eq!(time_add_millis(-500, 1000), 500);
-        assert_eq!(time_add_millis(0, 999), 999);
+        assert_eq!(super::time_add_millis(1000, 5000), 6000);
+        assert_eq!(super::time_add_millis(-500, 1000), 500);
+        assert_eq!(super::time_add_millis(0, 999), 999);
     }
 
     #[test]
@@ -937,46 +544,228 @@ mod time_advanced_tests {
 
     #[test]
     fn test_format_http() {
-        // 1970-01-01 00:00:00 UTC = epoch 0.
-        //  http.TimeFormat gives "Thu, 01 Jan 1970 00:00:00 GMT".
-        let s = time_format_http(0);
-        assert!(s.contains("1970"), "HTTP format for epoch 0: {s}");
-        assert!(s.ends_with("GMT"), "HTTP format must end in GMT: {s}");
+        assert_eq!(time_format_http(0), "Thu, 01 Jan 1970 00:00:00 GMT");
     }
 
     #[test]
     fn test_format_rfc3339() {
-        let s = time_format_rfc3339(0);
-        // chrono's to_rfc3339 produces "1970-01-01T00:00:00+00:00" for epoch 0.
-        assert!(s.starts_with("1970-01-01T"), "RFC3339 for epoch 0: {s}");
+        assert_eq!(time_format_rfc3339(0), "1970-01-01T00:00:00+00:00");
+        assert_eq!(time_format_iso8601(1_500), "1970-01-01T00:00:01.500+00:00");
     }
 
+    /// Every reference-time token renders its field of one instant.
     #[test]
-    fn test_format_http_out_of_range() {
-        // An invalid timestamp should return "" rather than panic.
-        let s = time_format_http(i64::MAX);
-        // Either empty or some valid string — just must not panic.
-        let _ = s;
+    fn every_layout_token_renders_its_field() {
+        // 2021-03-14 15:30:45.123 UTC, a Sunday.
+        let ms = 1_615_735_845_123;
+        assert_eq!(time_format("2006-01-02".to_owned(), ms), "2021-03-14");
+        assert_eq!(
+            time_format("Mon Jan 02 15:04:05.000 MST 2006".to_owned(), ms),
+            "Sun Mar 14 15:30:45.123 UTC 2021"
+        );
+        assert_eq!(time_format(".000000 PM pm".to_owned(), ms), ".123000 PM pm");
     }
 }
 
-// The calendar and sleep narrowings, outside the `time` feature so the
-// featureless runtime runs them too.
+// `Time.format` parses its layout once into closed tokens and literal text.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod layout_tests {
+    use super::{LayoutPiece, LayoutToken, parse_layout, time_format};
+
+    /// Every piece of `layout`, in order.
+    fn pieces(layout: &str) -> Vec<LayoutPiece<'_>> {
+        parse_layout(layout).collect()
+    }
+
+    /// Parsing is linear in the layout: a layout of a million tokens parses in
+    /// well under the time a rescan of the rest per token would take.
+    #[test]
+    fn a_long_layout_parses_in_linear_time() {
+        const TOKENS: usize = 1 << 20;
+        let layout = "2006".repeat(TOKENS);
+        let started = std::time::Instant::now();
+        assert_eq!(parse_layout(&layout).count(), TOKENS);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "{TOKENS} tokens took {elapsed:?}"
+        );
+        let mixed = "x2006".repeat(TOKENS);
+        assert_eq!(parse_layout(&mixed).count(), 2 * TOKENS);
+    }
+
+    #[test]
+    fn literal_text_is_never_a_token() {
+        assert_eq!(
+            pieces("Monday"),
+            [
+                LayoutPiece::Token(LayoutToken::WeekdayName),
+                LayoutPiece::Literal("day")
+            ]
+        );
+        assert_eq!(pieces("%Y"), [LayoutPiece::Literal("%Y")]);
+        assert_eq!(pieces(""), []);
+        assert_eq!(
+            pieces("a2006b"),
+            [
+                LayoutPiece::Literal("a"),
+                LayoutPiece::Token(LayoutToken::Year),
+                LayoutPiece::Literal("b")
+            ]
+        );
+        // A `%` is literal text, never a strftime directive.
+        assert_eq!(time_format("%Y %m".to_owned(), 0), "%Y %m");
+        assert_eq!(time_format("at 2006!".to_owned(), 0), "at 1970!");
+        // Text a replace chain would rewrite twice renders once.
+        assert_eq!(time_format("2006".to_owned(), 0), "1970");
+    }
+
+    /// The longer fractional token wins over the shorter at the same position.
+    #[test]
+    fn the_longest_token_wins() {
+        assert_eq!(
+            pieces("05.000000"),
+            [
+                LayoutPiece::Token(LayoutToken::Second),
+                LayoutPiece::Token(LayoutToken::Micros)
+            ]
+        );
+        assert_eq!(
+            pieces("é.0000"),
+            [
+                LayoutPiece::Literal("é"),
+                LayoutPiece::Token(LayoutToken::Millis),
+                LayoutPiece::Literal("0")
+            ]
+        );
+    }
+}
+
+// Every calendar kernel answers exactly or trips a typed `TimeDomain`.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod calendar_tests {
+    use super::{
+        time_days_in_month, time_format, time_format_http, time_format_iso8601,
+        time_format_rfc3339, time_is_leap_year, time_time_string,
+    };
+    use crate::core::{RuntimeTrip, TimeDomainCause, TimeOp, runtime_trip};
+    use chrono::NaiveDate;
+
+    /// The trip `f` raised, or `None` when it returned.
+    fn tripped<T>(f: impl FnOnce() -> T + std::panic::UnwindSafe) -> Option<RuntimeTrip> {
+        std::panic::catch_unwind(f)
+            .err()
+            .and_then(|payload| runtime_trip(payload.as_ref()))
+    }
+
+    /// Whether `trip` is kernel `op` refusing by `cause`, its one rule.
+    fn is_domain(trip: Option<RuntimeTrip>, op: TimeOp, cause: TimeDomainCause) -> bool {
+        op.cause() == cause && trip == Some(RuntimeTrip::TimeDomain { op })
+    }
+
+    #[test]
+    fn days_in_month_refuses_a_month_outside_the_year() {
+        assert_eq!(time_days_in_month(2024, 12), 31);
+        assert_eq!(time_days_in_month(2024, 2), 29);
+        assert_eq!(time_days_in_month(2023, 2), 28);
+        assert_eq!(time_days_in_month(i64::MAX, 4), 30);
+        assert_eq!(time_days_in_month(i64::MIN, 2), 29);
+        for month in [0, 13, -1, (1 << 32) + 1, i64::MAX, i64::MIN] {
+            assert!(
+                is_domain(
+                    tripped(|| time_days_in_month(2024, month)),
+                    TimeOp::DaysInMonth,
+                    TimeDomainCause::MonthOutsideYear
+                ),
+                "month {month}"
+            );
+        }
+    }
+
+    #[test]
+    fn leap_rule_holds_past_i32() {
+        assert!(time_is_leap_year(4_000_000_000));
+        assert!(!time_is_leap_year(4_000_000_100));
+        assert!(time_is_leap_year(4_000_000_004));
+        assert!(time_is_leap_year(-4));
+        assert!(!time_is_leap_year(-100));
+        assert!(time_is_leap_year(-400));
+        assert!(!time_is_leap_year(i64::MAX));
+        assert!(time_is_leap_year(i64::MIN));
+    }
+
+    /// A formatter of a Unix-millis instant.
+    type Render = fn(i64) -> String;
+
+    /// Each formatter, one per `TimeOp` it raises.
+    fn formatters() -> [(TimeOp, Render); 5] {
+        [
+            (TimeOp::TimeString, time_time_string),
+            (TimeOp::Format, |ms| {
+                time_format("2006-01-02".to_owned(), ms)
+            }),
+            (TimeOp::FormatHttp, time_format_http),
+            (TimeOp::FormatIso8601, time_format_iso8601),
+            (TimeOp::FormatRfc3339, time_format_rfc3339),
+        ]
+    }
+
+    #[test]
+    fn formatters_refuse_an_instant_outside_the_calendar() {
+        for (op, render) in formatters() {
+            for ms in [i64::MAX, i64::MIN] {
+                assert!(
+                    is_domain(
+                        tripped(|| render(ms)),
+                        op,
+                        TimeDomainCause::InstantOutsideCalendar
+                    ),
+                    "{op:?} at {ms}"
+                );
+            }
+        }
+    }
+
+    /// The first and last calendar milliseconds render; one step past either
+    /// trips.
+    #[test]
+    fn last_in_range_instant_formats() {
+        let last = NaiveDate::MAX
+            .and_hms_milli_opt(23, 59, 59, 999)
+            .map(|dt| dt.and_utc().timestamp_millis());
+        let first = NaiveDate::MIN
+            .and_hms_milli_opt(0, 0, 0, 0)
+            .map(|dt| dt.and_utc().timestamp_millis());
+        let (Some(last), Some(first)) = (last, first) else {
+            assert!(last.is_some() && first.is_some(), "chrono's range edges");
+            return;
+        };
+        assert_eq!(time_format("2006".to_owned(), last), "+262142");
+        assert_eq!(time_format("2006".to_owned(), first), "-262143");
+        for (op, render) in formatters() {
+            assert!(tripped(|| render(last)).is_none(), "{op:?} at {last}");
+            assert!(tripped(|| render(first)).is_none(), "{op:?} at {first}");
+            for past in [last + 1, first - 1] {
+                assert!(
+                    is_domain(
+                        tripped(|| render(past)),
+                        op,
+                        TimeDomainCause::InstantOutsideCalendar
+                    ),
+                    "{op:?} at {past}"
+                );
+            }
+        }
+    }
+}
+
+// The sleep narrowing, outside any feature so the featureless runtime runs it.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod narrowing_tests {
-    use super::{SLEEP_CHUNK_MS, sleep_chunks, time_days_in_month};
+    use super::{SLEEP_CHUNK_MS, sleep_chunks};
 
     /// `2^32`: the first value a `u32` narrowing wraps back to zero.
     const WRAP: i64 = 1 << 32;
-
-    #[test]
-    fn days_in_month_refuses_a_month_past_u32() {
-        assert_eq!(time_days_in_month(2024, 12), 31);
-        assert_eq!(time_days_in_month(2024, 2), 29);
-        for month in [0, 13, -1, WRAP + 1, WRAP + 2, i64::MAX, i64::MIN] {
-            assert_eq!(time_days_in_month(2024, month), 0, "month {month}");
-        }
-    }
 
     #[test]
     fn sleep_chunks_sum_to_the_request_and_fit_a_browser_timer() {
@@ -995,10 +784,7 @@ mod narrowing_tests {
 // it trips `IntOverflow`, never a saturated instant.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod int_arith_tests {
-    use super::{
-        time_add_days, time_add_hours, time_add_millis, time_add_minutes, time_add_seconds,
-        time_diff_days, time_diff_hours, time_diff_millis, time_diff_minutes, time_diff_seconds,
-    };
+    use super::{time_add_millis, time_diff_millis};
     use crate::core::{IntOp, RuntimeTrip, runtime_trip};
 
     fn outcome(
@@ -1029,43 +815,7 @@ mod int_arith_tests {
             outcome(|| time_diff_millis(i64::MIN, 1)),
             overflow(IntOp::Sub)
         );
-        assert_eq!(outcome(|| time_add_days(i64::MAX, 0)), overflow(IntOp::Mul));
-        assert_eq!(
-            outcome(|| time_add_hours(i64::MIN, 0)),
-            overflow(IntOp::Mul)
-        );
-        assert_eq!(
-            outcome(|| time_add_minutes(1, i64::MAX)),
-            overflow(IntOp::Add)
-        );
-        assert_eq!(
-            outcome(|| time_add_seconds(-1, i64::MIN)),
-            overflow(IntOp::Add)
-        );
         assert_eq!(time_add_millis(-1, i64::MAX), i64::MAX - 1);
         assert_eq!(time_diff_millis(i64::MAX, 0), i64::MAX);
-        assert_eq!(time_add_days(1, 0), 86_400_000);
-        assert_eq!(time_add_hours(-2, 0), -7_200_000);
-        assert_eq!(time_add_minutes(3, 5), 180_005);
-        assert_eq!(time_add_seconds(1, i64::MAX - 1000), i64::MAX);
-    }
-
-    #[test]
-    fn unit_diffs_are_exact_for_every_pair_of_ints() {
-        // The span `i64::MAX - i64::MIN` is past `Int`; its whole-unit
-        // quotient is not, and is the exact one — never a saturated span.
-        assert_eq!(
-            time_diff_seconds(i64::MAX, i64::MIN),
-            18_446_744_073_709_551
-        );
-        assert_eq!(
-            time_diff_seconds(i64::MIN, i64::MAX),
-            -18_446_744_073_709_551
-        );
-        assert_eq!(time_diff_minutes(i64::MAX, i64::MIN), 307_445_734_561_825);
-        assert_eq!(time_diff_hours(i64::MAX, i64::MIN), 5_124_095_576_030);
-        assert_eq!(time_diff_days(i64::MAX, i64::MIN), 213_503_982_334);
-        assert_eq!(time_diff_seconds(-1_999, 0), -1);
-        assert_eq!(time_diff_days(86_400_000, 0), 1);
     }
 }
