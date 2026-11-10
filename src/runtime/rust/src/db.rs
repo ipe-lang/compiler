@@ -7174,21 +7174,6 @@ pub fn db_insert_fields_returning<
 mod tests {
     use super::*;
 
-    /// Read a raw row's cell text in an assertion.
-    trait CellText {
-        /// The text of column `col`; `None` when the column is absent or SQL `NULL`.
-        fn text(&self, col: &str) -> Option<&str>;
-    }
-
-    impl CellText for RowCells {
-        fn text(&self, col: &str) -> Option<&str> {
-            match self.get(col) {
-                Some(IpeMaybe::Just(s)) => Some(s.as_str()),
-                Some(IpeMaybe::Nothing) | None => None,
-            }
-        }
-    }
-
     #[test]
     fn env_ceilings_honour_the_shared_contract() {
         crate::system::assert_env_ceiling_contract(DB_CONNECTIONS_CEILING);
@@ -11116,6 +11101,21 @@ mod tests {
     #[cfg(not(feature = "db-postgres"))]
     mod sqlite_tests {
         use super::*;
+
+        /// Read a raw row's cell text in an assertion.
+        trait CellText {
+            /// The text of column `col`; `None` when the column is absent or SQL `NULL`.
+            fn text(&self, col: &str) -> Option<&str>;
+        }
+
+        impl CellText for RowCells {
+            fn text(&self, col: &str) -> Option<&str> {
+                match self.get(col) {
+                    Some(IpeMaybe::Just(s)) => Some(s.as_str()),
+                    Some(IpeMaybe::Nothing) | None => None,
+                }
+            }
+        }
 
         #[test]
         fn url_is_cacheable_bare_memory_is_not_cacheable() {
