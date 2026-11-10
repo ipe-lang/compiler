@@ -1655,18 +1655,29 @@ pub fn html_render_<M>(node: Html<M>) -> String {
 /// `Ipe.Html.Attributes.{class,id,href,…}` and the generic
 /// `attribute k v` — a string-valued HTML attribute. The key is a literal for
 /// the fixed-key builders and a runtime string for `attribute`; both are gated
-/// at the render sink.
+/// at the render sink. A runtime-owned name
+/// ([`is_runtime_owned_attr_name`]) builds no attribute: the program never
+/// sets a marker the runtime or its client reads.
 #[must_use]
 pub fn html_named_attr_<M>(key: String, val: String) -> Attribute<M> {
-    Attribute::Attr(key, val)
+    if is_runtime_owned_attr_name(&key) {
+        Attribute::NoAttr
+    } else {
+        Attribute::Attr(key, val)
+    }
 }
 
 /// `Ipe.Html.Attributes.{checked,disabled,…}` and the generic
 /// `boolAttribute k b` — a boolean HTML attribute. Renders as `key="true"`
 /// when `on` is `true`; omitted when `false` (via the `BoolAttr` render path).
+/// A runtime-owned name builds no attribute, as in [`html_named_attr_`].
 #[must_use]
 pub fn html_bool_named_attr_<M>(key: String, on: bool) -> Attribute<M> {
-    Attribute::BoolAttr(key, on)
+    if is_runtime_owned_attr_name(&key) {
+        Attribute::NoAttr
+    } else {
+        Attribute::BoolAttr(key, on)
+    }
 }
 
 /// `Ipe.Html.Attributes.noAttr` — the identity attribute (renders nothing).
@@ -3567,6 +3578,71 @@ mod tests {
             vec![],
         );
         assert!(!render_html(&unstamped).contains("r_9_button"));
+    }
+
+    /// Prove the refusal: a program-built name in the runtime's namespace
+    /// (computed, so no compile-time check reads it) builds no attribute in
+    /// any case spelling, through every program-facing constructor. The
+    /// keyed-list `ipe-key` and ordinary names are kept.
+    #[test]
+    fn program_attribute_constructors_drop_runtime_owned_names() {
+        use crate::ui::helpers::{ui_el_, ui_html_attribute_, ui_text_};
+        let owned = [
+            "data-ipe-mq-rules",
+            "Data-Ipe-Ev-Ipe-File-Max-Size",
+            "DATA-IPE-SCRIPT-REVIVED",
+            "data-ipe-path",
+            "ipe-click",
+            "nonce",
+        ];
+        for name in owned {
+            assert!(
+                matches!(
+                    html_named_attr_::<()>(name.into(), "x".into()),
+                    Attribute::NoAttr
+                ),
+                "{name}"
+            );
+            assert!(
+                matches!(
+                    html_bool_named_attr_::<()>(name.into(), true),
+                    Attribute::NoAttr
+                ),
+                "{name}"
+            );
+            assert!(
+                matches!(
+                    ui_html_attribute_::<()>(name.into(), "x".into()),
+                    crate::ui::element::Attribute::NoAttribute
+                ),
+                "{name}"
+            );
+        }
+        for name in ["ipe-key", "data-x", "data-ipe", "title"] {
+            assert!(
+                matches!(
+                    html_named_attr_::<()>(name.into(), "x".into()),
+                    Attribute::Attr(..)
+                ),
+                "{name}"
+            );
+            assert!(
+                matches!(
+                    ui_html_attribute_::<()>(name.into(), "x".into()),
+                    crate::ui::element::Attribute::AttrAttribute(..)
+                ),
+                "{name}"
+            );
+        }
+        let elem = ui_el_::<()>(
+            vec![ui_html_attribute_(
+                "data-ipe-mq-rules".into(),
+                "@media{}".into(),
+            )],
+            ui_text_("t".into()),
+        );
+        let out = render_html(&crate::ui::render::ui_layout(vec![], elem));
+        assert!(!out.contains("@media{}"), "{out}");
     }
 
     #[test]

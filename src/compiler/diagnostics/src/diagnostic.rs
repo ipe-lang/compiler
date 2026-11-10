@@ -3802,8 +3802,8 @@ fn lower_help(msg: &LowerError) -> Vec<HelpLine> {
             "add a `page` field to the Model to route the app, or remove `onNavigate`.".into(),
         )],
         LowerError::ReservedAttributeName { .. } => vec![HelpLine::Note(
-            "rename the attribute out of the `ipe-` and `data-ipe-` namespaces. A routed \
-             app's URL already follows `model.page`, so set the page in `update` instead \
+            "rename the attribute out of the `ipe-` and `data-ipe-` namespaces and away \
+             from `nonce`. A routed app's URL already follows `model.page`, so set the page in `update` instead \
              of naming a path; attach events with the `Ui.on*` attributes."
                 .into(),
         )],

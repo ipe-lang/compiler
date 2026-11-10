@@ -464,17 +464,25 @@ fn refuse_unliteral_mount(k: KernelFn) -> DResult<()> {
 /// # Errors
 ///
 /// IPE-L0156 for a malformed literal path at this site.
-pub fn refuse_route_site(site: KernelSite<'_>) -> DResult<()> {
+pub fn refuse_route_site(site: KernelSite<'_, '_>) -> DResult<()> {
     match site {
         KernelSite::Value(k) if matches!(route_path_of(k), Some(RoutePath::Mount)) => {
             refuse_unliteral_mount(k)
         }
-        KernelSite::Call { kernel, args } => {
+        KernelSite::Call { kernel, args, .. } => {
+            // A mount prefix must be written at the call; a route path is
+            // judged wherever a literal reaches it, a partial application's
+            // hoisted capture included.
             if let Some(grammar) = route_path_of(kernel) {
-                match (grammar, args.first()) {
-                    (_, Some(Expr::Str(lit))) => refuse_literal(kernel, grammar, lit.as_str())?,
-                    (RoutePath::Mount, _) => refuse_unliteral_mount(kernel)?,
-                    (RoutePath::Web | RoutePath::Server | RoutePath::ServerApi, _) => {}
+                match (grammar, args.first(), site.literal_arg(0)) {
+                    (RoutePath::Mount, Some(Expr::Str(lit)), _) => {
+                        refuse_literal(kernel, grammar, lit.as_str())?;
+                    }
+                    (RoutePath::Mount, _, _) => refuse_unliteral_mount(kernel)?,
+                    (RoutePath::Web | RoutePath::Server | RoutePath::ServerApi, _, Some(lit)) => {
+                        refuse_literal(kernel, grammar, lit)?;
+                    }
+                    (RoutePath::Web | RoutePath::Server | RoutePath::ServerApi, _, None) => {}
                 }
             }
             if matches!(kernel, KernelFn::ServerListen)
@@ -780,6 +788,32 @@ mod walk_tests {
                 "Server.api".into(),
                 RoutePatternDefect::ParamDuplicate { name: "id".into() }
             ))
+        );
+    }
+
+    /// Prove the refusal: a partially applied route kernel reads its path
+    /// through the hoisted `let`, so a malformed path is refused there too.
+    #[test]
+    fn a_partially_applied_route_path_is_refused() {
+        let cap = ipe_intern::Symbol::from_raw(1);
+        let eta = ipe_intern::Symbol::from_raw(2);
+        let partial = Expr::Let {
+            name: cap,
+            value: Box::new(Expr::Str("/:".to_owned())),
+            body: Box::new(Expr::Lambda {
+                params: vec![(eta, IrType::Unit)],
+                ret: IrType::Unit,
+                body: Box::new(Expr::Call {
+                    callee: Callee::Kernel(KernelFn::WebRoute),
+                    args: vec![Expr::CloneVar(cap), Expr::Var(eta)],
+                    pin: CallPin::None,
+                    on_form: OnFormKind::NotForm,
+                }),
+            }),
+        };
+        assert_eq!(
+            defect(&partial),
+            Some(("Web.route".into(), RoutePatternDefect::ParamEmpty))
         );
     }
 

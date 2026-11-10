@@ -4804,7 +4804,7 @@ fn data_ipe_path_attribute_refused() {
         )
         .replace(
             "import Ipe.Ui as Ui\n",
-            "import Ipe.Ui as Ui\nimport Ipe.Html as Html\nimport Ipe.Html.Attributes as Attr\n",
+            "import Ipe.Ui as Ui\nimport Ipe.Html as Html\nimport Ipe.Html.Attributes as Attr\nimport Ipe.List as List\n",
         )
         .replace("view _model = Ui.text \"hi\"", view)
     };
@@ -4828,6 +4828,14 @@ fn data_ipe_path_attribute_refused() {
         (
             "data_ipe_hid_attribute",
             r#"view _model = Ui.html (Html.node "div" [ Attr.attribute "data-ipe-hid" "1" ] [])"#,
+        ),
+        (
+            "data_ipe_attribute_partially_applied",
+            r#"view _model = Ui.html (Html.node "div" (List.map (Attr.attribute "data-ipe-mq-rules") [ "a" ]) [])"#,
+        ),
+        (
+            "data_ipe_attribute_let_bound",
+            "view _model =\n    let\n        name = \"data-ipe-path\"\n    in\n    Ui.el [ Ui.htmlAttribute name \"/about\" ] (Ui.text \"hi\")",
         ),
     ] {
         assert_rejected(name, &with_view(view), "IPE-L0163");
