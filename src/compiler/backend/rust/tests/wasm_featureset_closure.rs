@@ -263,7 +263,7 @@ fn load_fixtures() -> SealFixtures {
 }
 
 /// The wasm dependency-model backend the emit exercises.
-fn wasm_backend(interner: &Interner) -> RustBackend<'_> {
+const fn wasm_backend(interner: &Interner) -> RustBackend<'_> {
     RustBackend::new(interner)
         .with_target(Target::WasmClient)
         .with_runtime_dep(Some(RuntimeDep {
