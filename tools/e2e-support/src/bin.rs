@@ -16,8 +16,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 pub use ipe_env::artifact::{
-    ProvenBin, ProvenRuntime, ResolveError, Source, Tried, resolve_bin, resolve_bin_from,
-    resolve_runtime_src,
+    ProvenBin, ProvenRuntime, ResolveError, Source, Tried, in_repo_runtime_src, resolve_bin,
+    resolve_bin_from,
 };
 
 /// The tier-selecting variable.
@@ -85,20 +85,20 @@ pub fn require_bin(name: &'static str, baked: &str) -> ProvenBin {
     resolve_bin(name, runtime, Path::new(baked)).unwrap_or_else(|e| fail(format_args!("{e}")))
 }
 
-/// Resolve the runtime module tree (`src/runtime/rust/src`).
+/// Resolve the checkout's runtime module tree (`src/runtime/rust/src`).
 ///
-/// `$IPE_RUNTIME_DIR` when set (authoritative), else the upward walk from the
-/// current directory.
+/// Anchored at the manifest directory [`require_manifest_dir`] proves (the
+/// run-time value first, so the anchor holds under an archive's workspace
+/// remap) and found by [`in_repo_runtime_src`]. No variable and no current
+/// directory names another tree: the tests of a checkout run on its runtime.
 ///
 /// # Panics
 ///
 /// With the [`ResolveError`] when no runtime tree resolves.
 #[must_use]
 pub fn require_runtime() -> ProvenRuntime {
-    let cwd = std::env::current_dir()
-        .unwrap_or_else(|e| fail(format_args!("current directory unreadable: {e}")));
-    resolve_runtime_src(ipe_env::var_os(ipe_env::artifact::RUNTIME_DIR_VAR), &cwd)
-        .unwrap_or_else(|e| fail(format_args!("{e}")))
+    let anchor = require_manifest_dir(env!("CARGO_MANIFEST_DIR"));
+    in_repo_runtime_src(&anchor).unwrap_or_else(|e| fail(format_args!("{e}")))
 }
 
 /// Resolve the runtime crate root, the directory holding its `Cargo.toml`.

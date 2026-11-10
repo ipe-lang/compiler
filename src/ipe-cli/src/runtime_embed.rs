@@ -672,8 +672,9 @@ impl AncestorCeiling {
     }
 }
 
-/// The ceiling of the override lookup.
-const RUNTIME_LOOKUP_CEILING: AncestorCeiling = AncestorCeiling(64);
+/// The ceiling of the override lookup, shared with the harness lookup.
+const RUNTIME_LOOKUP_CEILING: AncestorCeiling =
+    AncestorCeiling(ipe_env::artifact::RUNTIME_LOOKUP_CEILING);
 
 #[cfg(test)]
 mod tests {

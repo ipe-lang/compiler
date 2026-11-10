@@ -18,6 +18,14 @@ use ipe::coverage::contract::{AspectCheck, Cell, StdlibSymbol, Surface};
 use ipe::coverage::matrix::run;
 use ipe::coverage::surface::StdlibSurface;
 
+/// The module tree of the runtime embedded in this compiler.
+#[allow(clippy::expect_used)] // an unreadable embedded runtime is a harness setup failure
+fn embedded_runtime() -> ipe::runtime_embed::RuntimeModuleTree {
+    ipe::runtime_embed::RuntimeSource::Embedded
+        .module_tree()
+        .expect("the embedded runtime's module tree reads")
+}
+
 /// The bounded worker count for the parallel build+run sweep.
 ///
 /// Each probe shells out to `ipe dev run`, which cargo-builds the emitted crate; the
@@ -180,8 +188,9 @@ fn runtime_fn_and_wasm_columns_report_no_holes() {
     if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
         let mut unexpected = String::new();
         for column in [
-            Box::new(ipe::coverage::columns_runtime::RuntimeFnExistsColumn::new())
-                as Box<dyn AspectCheck<StdlibSymbol>>,
+            Box::new(ipe::coverage::columns_runtime::RuntimeFnExistsColumn::new(
+                &embedded_runtime(),
+            )) as Box<dyn AspectCheck<StdlibSymbol>>,
             Box::new(ipe::coverage::columns_runtime::WasmColumn),
         ] {
             let aspect = column.name();
@@ -271,8 +280,9 @@ fn dynamic_columns_pass_over_the_whole_surface() {
         let report = run(
             &StdlibSurface,
             &[
-                Box::new(ipe::coverage::columns_runtime::RuntimeFnExistsColumn::new())
-                    as Box<dyn AspectCheck<StdlibSymbol>>,
+                Box::new(ipe::coverage::columns_runtime::RuntimeFnExistsColumn::new(
+                    &embedded_runtime(),
+                )) as Box<dyn AspectCheck<StdlibSymbol>>,
                 Box::new(ipe::coverage::columns_runtime::WasmColumn),
             ],
         )

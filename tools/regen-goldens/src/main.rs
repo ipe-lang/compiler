@@ -43,15 +43,6 @@ fn main() -> ExitCode {
     let repo_root = repo_root();
     let golden_root = repo_root.join("tests").join("golden");
 
-    // Anchor the CWD at the repo root so every emit runs from the same place
-    // regardless of where the tool was launched from.
-    if let Err(e) = std::env::set_current_dir(&repo_root) {
-        eprintln!(
-            "regen-goldens: cannot chdir to repo root {}: {e}",
-            repo_root.display()
-        );
-        return ExitCode::FAILURE;
-    }
     // The in-repo runtime crate root, named explicitly: the emit proves it.
     let runtime = repo_root.join("src/runtime/rust");
 
