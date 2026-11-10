@@ -1576,10 +1576,9 @@ impl<'a> Parser<'a> {
             }) => return Err(defect(closer, InterpolationDefect::BodyEnded)),
             parsed => parsed?,
         };
-        match leftover {
-            Some(span) => Err(defect(span, InterpolationDefect::TrailingTokens)),
-            None => Ok(expr),
-        }
+        leftover.map_or(Ok(expr), |span| {
+            Err(defect(span, InterpolationDefect::TrailingTokens))
+        })
     }
 
     /// Whether a chain with `charged` levels over its deepest operand so far
@@ -3048,6 +3047,21 @@ impl<'a> Parser<'a> {
         Err(Self::unexpected_token(&tok, &[Expected::Identifier]))
     }
 
+    /// A triple-quoted string in pattern position: it matches its value,
+    /// escapes decoded. A pattern matches a fixed string, so one that
+    /// interpolates is refused at its first `{{…}}`.
+    fn triple_pattern(span: Span, triple: &TripleStr, segments: &[Segment]) -> DResult<Pattern> {
+        if let Some(at) = segments.iter().find_map(Segment::delimited) {
+            return Err(Diagnostic::Parse {
+                span: at,
+                msg: ParseError::MalformedInterpolation(InterpolationDefect::InPattern),
+            });
+        }
+        let template = Template::assemble(triple.clone(), segments.to_vec(), Vec::new())?;
+        let value = template.literal_value().unwrap_or_default().into_owned();
+        Ok(Located::new(span, Pattern_::PStr(value)))
+    }
+
     fn parse_pattern_atom(&mut self, depth: u32) -> DResult<Pattern> {
         if depth > MAX_DEPTH {
             return Err(self.too_deep(Construct::Pattern));
@@ -3065,22 +3079,9 @@ impl<'a> Parser<'a> {
                 Pattern_::PInt(int_value(*n, Sign::Plus, tok.span)?),
             )),
             Tok::Str(s) => Ok(Located::new(tok.span, Pattern_::PStr(s.clone()))),
-            // A triple-quoted string in pattern position matches its value,
-            // escapes decoded; a pattern matches a fixed string, so one that
-            // interpolates is refused at its first `{{…}}`.
             Tok::TripleStr {
                 triple, segments, ..
-            } => {
-                if let Some(span) = segments.iter().find_map(Segment::delimited) {
-                    return Err(Diagnostic::Parse {
-                        span,
-                        msg: ParseError::MalformedInterpolation(InterpolationDefect::InPattern),
-                    });
-                }
-                let template = Template::assemble(triple.clone(), segments.clone(), Vec::new())?;
-                let value = template.literal_value().unwrap_or_default().into_owned();
-                Ok(Located::new(tok.span, Pattern_::PStr(value)))
-            }
+            } => Self::triple_pattern(tok.span, triple, segments),
             Tok::Char(c) => Ok(Located::new(tok.span, Pattern_::PChar(c.clone()))),
             // A negative integer literal pattern `-3`. The digit must be
             // byte-span adjacent to the `-` (no intervening whitespace); a gap
