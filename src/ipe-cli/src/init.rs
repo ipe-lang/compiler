@@ -2846,7 +2846,7 @@ mod tests {
         );
         let missing = place_managed(
             &dir,
-            &root_file("LICENSE", "new"),
+            &root_file("Makefile", "new"),
             Existing::Force,
             Missing::Write,
         );
