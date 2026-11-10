@@ -742,6 +742,20 @@ impl<'r> RefScanner<'r> {
         }
     }
 
+    /// Record a `use` leaf path. A leaf naming the `tokio` crate itself
+    /// (`use tokio;`, `use tokio as t;`) is recorded as the bare crate path,
+    /// which the tokio classification refuses: paths through the alias are not
+    /// read.
+    fn record_use_leaf(&mut self, segs: &[String]) {
+        if let [only] = segs
+            && only == "tokio"
+        {
+            self.push(RefKind::Tokio, only.clone());
+            return;
+        }
+        self.record_path(segs, false);
+    }
+
     fn use_tree(&mut self, tree: &syn::UseTree, prefix: &mut Vec<String>) {
         match tree {
             syn::UseTree::Path(path) => {
@@ -751,12 +765,12 @@ impl<'r> RefScanner<'r> {
             }
             syn::UseTree::Name(name) => {
                 prefix.push(name.ident.to_string());
-                self.record_path(prefix, false);
+                self.record_use_leaf(prefix);
                 prefix.pop();
             }
             syn::UseTree::Rename(rename) => {
                 prefix.push(rename.ident.to_string());
-                self.record_path(prefix, false);
+                self.record_use_leaf(prefix);
                 prefix.pop();
             }
             syn::UseTree::Glob(_) => self.record_path(prefix, true),
@@ -957,11 +971,19 @@ impl<'ast> syn::visit::Visit<'ast> for RefScanner<'_> {
         self.gated(&node.attrs, |scanner| scanner.module(node));
     }
 
+    fn visit_item_extern_crate(&mut self, node: &'ast syn::ItemExternCrate) {
+        self.gated(&node.attrs, |scanner| {
+            if node.ident == "tokio" {
+                scanner.push(RefKind::Tokio, "tokio".to_owned());
+            }
+            syn::visit::visit_item_extern_crate(scanner, node);
+        });
+    }
+
     cfg_scoped! {
         'ast;
         visit_item_const(ItemConst);
         visit_item_enum(ItemEnum);
-        visit_item_extern_crate(ItemExternCrate);
         visit_item_fn(ItemFn);
         visit_item_foreign_mod(ItemForeignMod);
         visit_item_impl(ItemImpl);
@@ -1188,6 +1210,14 @@ fn tokio_need(path: &str) -> Result<&'static [TokioFeature], String> {
     ];
     let segs: Vec<&str> = path.split("::").skip(1).collect();
     match segs.as_slice() {
+        [] => Err(format!(
+            "`{path}` names the tokio crate whole, so its paths are not read; \
+             name each tokio path from `tokio::`"
+        )),
+        ["io" | "time"] | ["io" | "time", "*"] => Err(format!(
+            "`{path}` hides which of its items are used, and they need different \
+             tokio features; import the items by name"
+        )),
         ["sync", ..] => Ok(&[F::Sync]),
         ["net", ..] | ["io", "unix", ..] => Ok(&[F::Net]),
         ["signal", ..] => Ok(&[F::Signal]),
@@ -1203,7 +1233,7 @@ fn tokio_need(path: &str) -> Result<&'static [TokioFeature], String> {
         ["spawn" | "task_local"] | ["task" | "runtime", ..] => Ok(&[F::Rt]),
         ["main"] => Ok(&[F::Macros, F::RtMultiThread]),
         ["select" | "join" | "try_join" | "test"] => Ok(&[F::Macros]),
-        ["pin" | "io"] => Ok(&[]),
+        ["pin"] => Ok(&[]),
         ["io", item, ..] if NO_FEATURE_IO.contains(item) => Ok(&[]),
         ["io", item, ..]
             if IO_UTIL.contains(item)
@@ -3180,6 +3210,58 @@ fn an_unclassified_tokio_path_is_refused() {
             "`{path}` must be refused: {refused:?}"
         );
     }
+}
+
+/// An import that hides which tokio items it reaches is refused even with every
+/// tokio feature declared: the crate imported whole or renamed, and a module
+/// (`io`, `time`) imported bare, renamed, through `self` or by glob, whose items
+/// need different features.
+#[test]
+fn tokio_imports_hiding_their_items_are_refused() {
+    let root = closure_fixture(
+        "tokio_hiding",
+        &[
+            (
+                "a.rs",
+                "use tokio::io;\npub fn f() { let _ = io::sink(); }\n",
+            ),
+            ("b.rs", "use tokio::{io::{self as tio}, time::*};\n"),
+            ("c.rs", "use tokio as t;\n"),
+            ("d.rs", "extern crate tokio as tk;\n"),
+            ("e.rs", "use ::tokio;\n"),
+        ],
+    );
+    let every: Vec<&str> = TokioFeature::ALL.iter().map(|f| f.as_str()).collect();
+    let refused = tokio_fixture_violations(
+        &root,
+        "pub mod a;\npub mod b;\npub mod c;\npub mod d;\npub mod e;\n",
+        &[],
+        Some(&every),
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    let hiding = |path: &str| {
+        refused
+            .iter()
+            .any(|v| v.contains(&format!("`{path}` hides which of its items are used")))
+    };
+    assert!(hiding("tokio::io"), "a bare `io` import: {refused:?}");
+    assert!(hiding("tokio::time::*"), "a `time` glob: {refused:?}");
+    let whole = refused
+        .iter()
+        .filter(|v| v.contains("`tokio` names the tokio crate whole"))
+        .count();
+    assert_eq!(
+        whole, 3,
+        "renamed, `extern crate` and bare crate imports: {refused:?}"
+    );
+    let io_imports = refused
+        .iter()
+        .filter(|v| v.contains("`tokio::io` hides"))
+        .count();
+    assert_eq!(
+        io_imports, 2,
+        "`io` bare and through `self as`: {refused:?}"
+    );
 }
 
 /// Grouped and renamed imports, macro paths, a leading-colon path inside macro

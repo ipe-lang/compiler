@@ -21,6 +21,7 @@ use super::{
 use crate::crate_specs::tokio_base_features;
 use crate::runtime_features::{RuntimeFeature, RuntimeFeatureSet};
 use ipe_diagnostics::{DResult, Diagnostic};
+use ipe_ir::Target;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -518,24 +519,58 @@ fn vendored_tokio_disagreement_is_a_compiler_bug() {
     fn bug<T>(r: &DResult<T>) -> bool {
         matches!(r, Err(Diagnostic::CompilerBug { .. }))
     }
-    let reactor_without_tokio = vendored_tokio_for(true, &set(&[]));
+    let reactor_without_tokio = vendored_tokio_for(Target::Native, true, &set(&[]));
     assert!(
         bug(&reactor_without_tokio),
         "a reactor program with no tokio feature must refuse: {reactor_without_tokio:?}"
     );
-    let server_without_reactor = vendored_tokio_for(false, &set(&[RuntimeFeature::Server]));
+    let server_without_reactor =
+        vendored_tokio_for(Target::Native, false, &set(&[RuntimeFeature::Server]));
     assert!(
         bug(&server_without_reactor),
         "a tokio surface without the reactor must refuse: {server_without_reactor:?}"
     );
     assert!(matches!(
-        vendored_tokio_for(false, &set(&[RuntimeFeature::Compression])),
+        vendored_tokio_for(Target::Native, false, &set(&[RuntimeFeature::Compression])),
         Ok(None)
     ));
-    assert!(matches!(vendored_tokio_for(false, &set(&[])), Ok(None)));
-    let async_only = vendored_tokio_for(true, &set(&[RuntimeFeature::Async]));
+    assert!(matches!(
+        vendored_tokio_for(Target::Native, false, &set(&[])),
+        Ok(None)
+    ));
+    let async_only = vendored_tokio_for(Target::Native, true, &set(&[RuntimeFeature::Async]));
     assert!(
         matches!(async_only, Ok(Some(ref tokio)) if *tokio == tokio_base_features()),
         "an async-only program declares the base set: {async_only:?}"
     );
+}
+
+/// A wasip1 vendored emit declares no tokio line, reactor or not.
+///
+/// The wasip1 reactor spine is the std-only `block_on`: a program reaching
+/// `File`, `Time.sleep` or `Task` on wasip1 sets the reactor flag with an empty
+/// tokio projection, and must emit, not refuse. A wasip1 feature set that
+/// enables tokio, and the browser target, refuse at `ipe` time.
+#[test]
+fn wasip1_vendored_tokio_is_never_declared() {
+    fn set(members: &[RuntimeFeature]) -> RuntimeFeatureSet {
+        members.iter().copied().collect()
+    }
+    for reactor in [true, false] {
+        let resolved = vendored_tokio_for(Target::WasmWasi, reactor, &set(&[]));
+        assert!(
+            matches!(resolved, Ok(None)),
+            "a wasip1 program (reactor {reactor}) declares no tokio line: {resolved:?}"
+        );
+        let server = vendored_tokio_for(Target::WasmWasi, reactor, &set(&[RuntimeFeature::Server]));
+        assert!(
+            matches!(server, Err(Diagnostic::CompilerBug { .. })),
+            "a wasip1 feature set enabling tokio must refuse: {server:?}"
+        );
+        let browser = vendored_tokio_for(Target::WasmClient, reactor, &set(&[]));
+        assert!(
+            matches!(browser, Err(Diagnostic::CompilerBug { .. })),
+            "the browser target never resolves a vendored tokio line: {browser:?}"
+        );
+    }
 }

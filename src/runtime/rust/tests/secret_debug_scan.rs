@@ -472,7 +472,7 @@ const DEBUG_SITES: &[DebugSite] = &[
     DebugSite {
         file: "rust/src/project.rs",
         func: "vendored_tokio_for",
-        count: 2,
+        count: 3,
         why: DIAGNOSTIC,
     },
     DebugSite {

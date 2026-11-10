@@ -4887,6 +4887,7 @@ fn crypto_core_heavy_cargo_toml(base: &str) -> DResult<String> {
 /// [`EmitCtx::uses_async_runtime`] disagree (see [`vendored_tokio_for`]).
 fn vendored_tokio(ctx: &EmitCtx) -> DResult<Option<BTreeSet<TokioFeature>>> {
     vendored_tokio_for(
+        ctx.target,
         ctx.uses_async_runtime,
         &crate::runtime_features::runtime_features(ctx),
     )
@@ -4894,16 +4895,24 @@ fn vendored_tokio(ctx: &EmitCtx) -> DResult<Option<BTreeSet<TokioFeature>>> {
 
 /// Reconcile the reactor flag with the runtime-feature tokio projection.
 ///
-/// A reactor program declares the projected set. A reactor-free program
-/// declares no line; its features may enable only the spine (`compression`,
-/// `csv_kernel`, `cache_kernel` compile without the reactor in the vendored
-/// tree), never a tokio API beyond the base set.
+/// On the native target a reactor program declares the projected set. A
+/// reactor-free program declares no line; its features may enable only the
+/// spine (`compression`, `csv_kernel`, `cache_kernel` compile without the
+/// reactor in the vendored tree), never a tokio API beyond the base set.
+///
+/// On `wasm32-wasip1` the reactor spine is the std-only `block_on`, so no
+/// tokio line is declared whatever the reactor flag: the wasip1 feature set
+/// selects no tokio-enabling feature, and tokio's multi-thread runtime and
+/// signal driver do not build there.
 ///
 /// # Errors
 ///
 /// Returns [`Diagnostic::CompilerBug`] when the reactor is on and no feature
-/// enables tokio, or when it is off and a feature needs tokio beyond the base.
+/// enables tokio, when it is off and a feature needs tokio beyond the base, when
+/// a wasip1 feature set enables tokio, or for the browser target (whose emit
+/// never reaches the vendored manifest).
 fn vendored_tokio_for(
+    target: ipe_ir::Target,
     uses_async_runtime: bool,
     features: &crate::runtime_features::RuntimeFeatureSet,
 ) -> DResult<Option<BTreeSet<TokioFeature>>> {
@@ -4911,6 +4920,23 @@ fn vendored_tokio_for(
         where_: "ipe_backend_rust::project::vendored_tokio",
         detail,
     };
+    match target {
+        ipe_ir::Target::Native => {}
+        ipe_ir::Target::WasmWasi => {
+            return match features.tokio_features() {
+                None => Ok(None),
+                Some(_) => Err(bug(format!(
+                    "the wasip1 runtime features {:?} enable tokio",
+                    features.as_feature_names()
+                ))),
+            };
+        }
+        ipe_ir::Target::WasmClient => {
+            return Err(bug(
+                "the browser-wasm emit has no vendored tokio manifest".to_owned()
+            ));
+        }
+    }
     match (uses_async_runtime, features.tokio_features()) {
         (true, Some(tokio)) => Ok(Some(tokio)),
         (true, None) => Err(bug(format!(
