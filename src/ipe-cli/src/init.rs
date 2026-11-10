@@ -2442,32 +2442,59 @@ mod tests {
     /// The marker opening this file's test module; the source before it is production.
     const TESTS_MARKER: &str = "#[cfg(test)]\nmod tests {";
 
-    /// Every `fs` path production may name, with its count: the one target
-    /// creation, and the staged-file type the held writer hands to a fill.
-    const ADMITTED_FS: [(&str, usize); 2] = [
+    /// Every `fs` path production may name, each at its one site and count:
+    /// the target creation, and the staged-file type the held writer hands to
+    /// a fill. A site is pinned with its context, so an alias swapped in for
+    /// one of them changes a count.
+    const ADMITTED_FS: [(&str, usize); 3] = [
         ("std::fs::create_dir_all(target_dir)", 1),
-        ("std::fs::File", 3),
+        ("fn fill_with(file: &mut std::fs::File,", 1),
+        ("|staged: &mut std::fs::File|", 2),
     ];
 
-    /// Path-based writes, reads and probes production may not name: the crate's
-    /// by-path writers and every `Path` method that touches the filesystem.
-    const PATH_BASED: [&str; 16] = [
+    /// The crate paths production may reach other filesystem helpers through,
+    /// each with the items it may name and how often: the byte cap, the one
+    /// no-follow by-level read of the re-run's `src/Main.ipe`, and the one
+    /// hold of the target.
+    const ADMITTED_ITEMS: [(&str, &[(&str, usize)]); 3] = [
+        ("ipe_fs_open::", &[("ByteCap", 1)]),
+        ("io_bounded::", &[("SOURCE_CAP", 4), ("read_named_in", 1)]),
+        ("HeldDir::", &[("open_following", 1)]),
+    ];
+
+    /// The crate's by-path writers and `std`'s by-path open options, never named in production.
+    const PATH_BASED: [&str; 4] = [
         "rewrite_user_file",
         "backup_user_file",
         "write_atomic",
         "OpenOptions",
-        "std::fs::write",
-        "File::create",
-        "std::fs::read_dir",
-        ".exists()",
-        ".is_dir()",
-        ".try_exists(",
-        ".is_file(",
-        ".is_symlink(",
-        ".metadata(",
-        ".symlink_metadata(",
-        ".read_link(",
-        ".canonicalize(",
+    ];
+
+    /// Filesystem calls production may not make, in method (`.name(`) or
+    /// path (`::name(`) form: every `std::fs` and `Path` entry point that
+    /// opens, probes, lists or changes an entry by path.
+    const PATH_CALLS: [&str; 21] = [
+        "exists",
+        "try_exists",
+        "is_dir",
+        "is_file",
+        "is_symlink",
+        "metadata",
+        "symlink_metadata",
+        "read_link",
+        "canonicalize",
+        "read_dir",
+        "read_to_string",
+        "create",
+        "open",
+        "options",
+        "write",
+        "remove_file",
+        "remove_dir",
+        "remove_dir_all",
+        "rename",
+        "copy",
+        "hard_link",
     ];
 
     /// How many times `word` occurs in `text` as a whole identifier.
@@ -2482,6 +2509,27 @@ mod tests {
                 !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
             })
             .count()
+    }
+
+    /// How many times `text` calls `name` as `.name(` or `::name(`.
+    fn call_count(text: &str, name: &str) -> usize {
+        [".", "::"]
+            .into_iter()
+            .map(|lead| text.matches(&format!("{lead}{name}(")).count())
+            .fold(0_usize, usize::saturating_add)
+    }
+
+    /// The identifier right after each `prefix` in `text`.
+    fn items_after<'t>(text: &'t str, prefix: &str) -> Vec<&'t str> {
+        let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+        text.match_indices(prefix)
+            .filter_map(|(at, _)| text.get(at.saturating_add(prefix.len())..))
+            .map(|tail| {
+                tail.split(|c: char| !is_ident(c))
+                    .next()
+                    .unwrap_or_default()
+            })
+            .collect()
     }
 
     /// What in `source`'s production part reaches the filesystem by path.
@@ -2505,10 +2553,30 @@ mod tests {
         if named != admitted {
             found.push(format!("{named} `fs` paths, {admitted} admitted"));
         }
+        for (prefix, items) in ADMITTED_ITEMS {
+            let seen = items_after(production, prefix);
+            for item in &seen {
+                if !items.iter().any(|(admitted, _)| admitted == item) {
+                    found.push(format!("`{prefix}{item}` is not admitted"));
+                }
+            }
+            for (item, want) in items {
+                let count = seen.iter().filter(|seen| *seen == item).count();
+                if count != *want {
+                    found.push(format!("{count} `{prefix}{item}` sites, {want} admitted"));
+                }
+            }
+        }
         for needle in PATH_BASED {
-            let count = production.matches(needle).count();
+            let count = word_count(production, needle);
             if count != 0 {
                 found.push(format!("{count} `{needle}` sites"));
+            }
+        }
+        for name in PATH_CALLS {
+            let count = call_count(production, name);
+            if count != 0 {
+                found.push(format!("{count} `{name}(` calls"));
             }
         }
         found
@@ -2528,12 +2596,35 @@ mod tests {
         );
         for evasion in [
             "use std::fs as disk;",
+            "use std::{fs, io};",
+            "fn planted() { let _ = tokio::fs::write(\"x\", \"\"); }",
             "fn planted() { let _ = std::fs::metadata(\"x\"); }",
             "fn planted() { let _ = Path::new(\"x\").try_exists(); }",
             "fn planted() { let _ = std::fs::File::options(); }",
+            "fn planted() { let _ = Path::new(\"x\").read_dir(); }",
+            "fn planted() { let _ = Path::exists(Path::new(\"x\")); }",
+            "fn planted() { let _ = Path::is_dir(Path::new(\"x\")); }",
+            "fn planted() { let _ = crate::io_bounded::read_user_named(Path::new(\"x\"), crate::io_bounded::SOURCE_CAP); }",
+            "fn planted() { let _ = ipe_fs_open::HeldDir::open_root(Path::new(\"x\")); }",
+            "fn planted() { let _ = HeldDir::open(Path::new(\"x\")); }",
         ] {
             assert!(!plant(evasion).is_empty(), "{evasion} goes unnoticed");
         }
+        let swapped = source
+            .replacen(
+                "fn fill_with(file: &mut std::fs::File,",
+                "use std::fs::File as Disk;\nfn fill_with(file: &mut Disk,",
+                1,
+            )
+            .replacen(
+                TESTS_MARKER,
+                &format!("fn planted() {{ let _ = Disk::create_new(\"x\"); }}\n{TESTS_MARKER}"),
+                1,
+            );
+        assert!(
+            !path_based_sites(&swapped).is_empty(),
+            "an alias swapped in for an admitted site goes unnoticed"
+        );
     }
 
     /// A fresh scratch directory for one test.
