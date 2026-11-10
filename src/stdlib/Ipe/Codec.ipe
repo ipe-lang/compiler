@@ -72,54 +72,57 @@
 --
 -- Minimal round-trips:
 --
---     import Ipe.Codec as Codec exposing (Codec)
+--     import Ipe.Json.Decode.Pipeline as Pipeline
 --
---     scores : Codec (Dict String Int)
---     scores =
---         Codec.dict Codec.int
---
---     -- Codec.fromJson scores (Codec.toJson scores d) == Ok d
+--     let
+--         d =
+--             Dict.fromList [ ( "alice", 10 ) ]
+--     in
+--     Codec.fromJson (Codec.dict Codec.int) (Codec.toJson (Codec.dict Codec.int) d) == Ok d
+--     --> True
 --
 --     type Rank = Bronze | Silver | Gold
 --
---     rankCodec : Codec Rank
---     rankCodec =
---         Codec.enum rankEq
---             [ ( Bronze, "bronze" ), ( Silver, "silver" ), ( Gold, "gold" ) ]
+--     let
+--         rankEq a b =
+--             a == b
+--     in
+--     let
+--         rankCodec =
+--             Codec.enum rankEq [ ( Bronze, "bronze" ), ( Silver, "silver" ), ( Gold, "gold" ) ]
+--     in
+--     Codec.fromJson rankCodec (Codec.toJson rankCodec Gold) == Ok Gold
+--     --> True
 --
---     -- Codec.fromJson rankCodec (Codec.toJson rankCodec Gold) == Ok Gold
---     -- Codec.fromJson rankCodec "\"platinum\"" == Err … (unknown tag)
+--     type alias User = { id : String, age : Int, active : Bool }
 --
---     type alias User =
---         { id : String, age : Int, active : Bool }
---
---     makeUser : String -> Int -> Bool -> User
---     makeUser id age active =
---         { id = id, age = age, active = active }
---
---     userCodec : Codec User
---     userCodec =
---         Codec
---             { enc =
---                 \u ->
---                     Encode.object
---                         [ ( "id", Codec.toValue Codec.string u.id )
---                         , ( "age", Codec.toValue Codec.int u.age )
---                         , ( "active", Codec.toValue Codec.bool u.active )
---                         ]
---             , mkDec =
---                 \_ ->
---                     Decode.succeed makeUser
---                         |> Pipeline.required "id" Decode.string
---                         |> Pipeline.required "age" Decode.int
---                         |> Pipeline.required "active" Decode.bool
---             , shp =
---                 SRecord [ ( "id", CText ), ( "age", CInt ), ( "active", CBool ) ]
---             }
---
---     -- Codec.fromJson userCodec (Codec.toJson userCodec u) == Ok u
---     -- Codec.shape userCodec
---     --     == SRecord [ ( "id", CText ), ( "age", CInt ), ( "active", CBool ) ]
+--     let
+--         userCodec =
+--             Codec
+--                 { enc =
+--                     \u ->
+--                         Encode.object
+--                             [ ( "id", Codec.toValue Codec.string u.id )
+--                             , ( "age", Codec.toValue Codec.int u.age )
+--                             , ( "active", Codec.toValue Codec.bool u.active )
+--                             ]
+--                 , mkDec =
+--                     \_ ->
+--                         Decode.succeed
+--                             (\id age active -> { id = id, age = age, active = active })
+--                             |> Pipeline.required "id" Decode.string
+--                             |> Pipeline.required "age" Decode.int
+--                             |> Pipeline.required "active" Decode.bool
+--                 , shp =
+--                     SRecord [ ( "id", CText ), ( "age", CInt ), ( "active", CBool ) ]
+--                 }
+--     in
+--     let
+--         u =
+--             { id = "u1", age = 30, active = True }
+--     in
+--     Codec.fromJson userCodec (Codec.toJson userCodec u) == Ok u
+--     --> True
 module Ipe.Codec exposing
     ( Codec(..)
     , ColType(..), Shape(..)
@@ -196,7 +199,9 @@ type Codec a
 -- scalar column type (`SScalar`), or one JSON-TEXT blob column (`SBlob`).
 --
 --     shape (Codec.list Codec.int) == SBlob
+--
 --     shape Codec.int == SScalar CInt
+--
 --     shape (Codec.maybe Codec.string) == SScalar (CNull CText)
 shape : Codec a -> Shape
 shape codec =
@@ -511,6 +516,7 @@ encodePair encVal pair =
 -- when writing the `SRecord` list of a record codec.
 --
 --     columnOf (shape Codec.int) == CInt
+--
 --     columnOf (shape (Codec.list Codec.int)) == CBlob
 columnOf : Shape -> ColType
 columnOf s =

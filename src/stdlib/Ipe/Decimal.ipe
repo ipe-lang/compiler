@@ -39,8 +39,8 @@ oneHundred = Kernel.kernel "Decimal_oneHundred"
 
 -- | Parse a decimal from its string representation.
 --
---     Decimal.fromString "3.14"  → Ok (…)
---     Decimal.fromString "nope"  → Err …
+--     Decimal.fromString "3.14" |> Result.map Decimal.toString --> Ok "3.14"
+--     Decimal.fromString "nope" |> Result.map Decimal.toString |> Result.withDefault "parse error" --> "parse error"
 fromString : String -> Result Error Decimal
 fromString = Kernel.kernel "Decimal_fromString"
 
@@ -64,7 +64,7 @@ fromFloat = Kernel.kernel "Decimal_fromFloat"
 
 -- | Construct a `Decimal` from a minor-unit integer and a scale.
 --
---     Decimal.fromMinor 2 314  → 3.14
+--     Decimal.toString (Decimal.fromMinor 2 314) --> "3.14"
 fromMinor : Int -> Int -> Decimal
 fromMinor = Kernel.kernel "Decimal_fromMinor"
 
@@ -76,8 +76,7 @@ toString = Kernel.kernel "Decimal_toString"
 
 -- | Render with a fixed number of decimal places.
 --
---     Decimal.toStringFixed 2 (Decimal.fromString "3.1" |> Result.withDefault Decimal.zero)
---         → "3.10"
+--     Decimal.toStringFixed 2 (Decimal.fromString "3.1" |> Result.withDefault Decimal.zero) --> "3.10"
 toStringFixed : Int -> Decimal -> String
 toStringFixed = Kernel.kernel "Decimal_toStringFixed"
 
@@ -102,8 +101,7 @@ toInt = Kernel.kernel "Decimal_toInt"
 
 -- | Return the minor-unit integer at the given scale.
 --
---     Decimal.toMinor 2 (Decimal.fromString "3.14" |> Result.withDefault Decimal.zero)
---         → 314
+--     Decimal.toMinor 2 (Decimal.fromString "3.14" |> Result.withDefault Decimal.zero) --> 314
 toMinor : Int -> Decimal -> Int
 toMinor = Kernel.kernel "Decimal_toMinor"
 
@@ -232,8 +230,7 @@ isNegative = Kernel.kernel "Decimal_isNegative"
 
 -- | `percentOf pct base` — the value of `pct`% of `base`.
 --
---     Decimal.percentOf (Decimal.fromInt 10) (Decimal.fromInt 200)
---         → 20.00
+--     Decimal.toString (Decimal.percentOf (Decimal.fromInt 10) (Decimal.fromInt 200)) --> "20"
 percentOf : Decimal -> Decimal -> Decimal
 percentOf = Kernel.kernel "Decimal_percentOf"
 
@@ -250,7 +247,6 @@ subPercent = Kernel.kernel "Decimal_subPercent"
 
 -- | `formatWith thousandsSep decimalSep places value` — locale-style formatting.
 --
---     Decimal.formatWith "," "." 2 (Decimal.fromInt 1234567)
---         → "1,234,567.00"
+--     Decimal.formatWith "," "." 2 (Decimal.fromInt 1234567) --> "1,234,567.00"
 formatWith : String -> String -> Int -> Decimal -> String
 formatWith = Kernel.kernel "Decimal_formatWith"

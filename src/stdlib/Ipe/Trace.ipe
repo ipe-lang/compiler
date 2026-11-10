@@ -9,14 +9,16 @@
 -- — a named, logical unit of work that groups the auto-spans
 -- underneath it:
 --
---     import Ipe.Trace as Trace
+-- ```ipe ipe:skip illustrative; Cart/Receipt/reserveStock/chargeCard/issueReceipt are placeholder names, not a standalone program
+-- import Ipe.Trace as Trace
 --
---     checkout : Cart -> Task Error Receipt
---     checkout cart =
---         Trace.span "checkout"
---             (reserveStock cart
---                 |> Task.andThen chargeCard
---                 |> Task.andThen issueReceipt)
+-- checkout : Cart -> Task Error Receipt
+-- checkout cart =
+--     Trace.span "checkout"
+--         (reserveStock cart
+--             |> Task.andThen chargeCard
+--             |> Task.andThen issueReceipt)
+-- ```
 --
 -- The `db.*` / `http.*` spans opened inside `reserveStock` /
 -- `chargeCard` / `issueReceipt` nest under "checkout" in the trace.
