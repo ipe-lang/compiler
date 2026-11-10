@@ -1335,6 +1335,86 @@ fn no_declared_runtime_feature_is_dead() {
     );
 }
 
+/// The runtime feature names a CI command line selects.
+///
+/// Only a line building `ipe-runtime-rust` counts; its `--features` list is
+/// split on commas, with both the `--features x` and `--features=x` forms read.
+fn ci_runtime_feature_selections(text: &str) -> Vec<(usize, String)> {
+    let mut found = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if !line.contains("-p ipe-runtime-rust") {
+            continue;
+        }
+        let mut words = line.split_whitespace();
+        while let Some(word) = words.next() {
+            let list = match word.strip_prefix("--features") {
+                Some("") => words.next(),
+                Some(rest) => rest.strip_prefix('='),
+                None => None,
+            };
+            for name in list.into_iter().flat_map(|l| l.split(',')) {
+                let name = name.trim_matches(|c| c == '"' || c == '\'');
+                if !name.is_empty() {
+                    found.push((index + 1, name.to_owned()));
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Every runtime feature a CI command selects is declared by the runtime.
+///
+/// Cargo refuses an unknown feature only on the runner that builds that line,
+/// so a removed feature left in a CI list surfaces one CI round later; this
+/// reads every such list against the manifest instead.
+#[test]
+#[allow(clippy::expect_used)] // test scaffolding: the CI files are readable
+fn ci_selects_only_declared_runtime_features() {
+    let (cargo_toml, _) = runtime_manifest_and_code();
+    let declared = raw_feature_table(&cargo_toml);
+    let repo = e2e_support::require_runtime_crate()
+        .ancestors()
+        .nth(3)
+        .expect("the runtime crate sits three levels under the repo root")
+        .to_path_buf();
+    let mut seen = 0;
+    let mut undeclared = Vec::new();
+    for file in [".github/workflows/ci.yml", ".github/ci/check-manifest.yml"] {
+        let text = std::fs::read_to_string(repo.join(file)).expect("read a CI file");
+        for (line, name) in ci_runtime_feature_selections(&text) {
+            seen += 1;
+            if !declared.contains_key(&name) {
+                undeclared.push(format!("{file}:{line} `{name}`"));
+            }
+        }
+    }
+    assert!(
+        seen > 0,
+        "precondition: CI selects runtime features somewhere"
+    );
+    assert!(
+        undeclared.is_empty(),
+        "CI selects runtime features the manifest does not declare: {undeclared:?}"
+    );
+}
+
+/// Prove the refusal: a removed feature in a CI list is read as selected.
+#[test]
+fn a_ci_feature_list_is_read_in_both_spellings() {
+    let text = "run: cargo build -p ipe-runtime-rust --features time,json\n\
+                run: cargo clippy -p ipe-runtime-rust --features=debugger\n\
+                run: cargo build -p ipe --features time\n";
+    assert_eq!(
+        ci_runtime_feature_selections(text),
+        vec![
+            (1, "time".to_owned()),
+            (1, "json".to_owned()),
+            (2, "debugger".to_owned())
+        ]
+    );
+}
+
 /// Every optional runtime dependency is named by runtime code.
 ///
 /// The declared feature-unification pins are the only exemption.
