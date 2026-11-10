@@ -182,6 +182,45 @@ pub fn note_foreign_panic(context: &str, payload: Box<dyn std::any::Any + Send>)
     err_id
 }
 
+/// An unwind caught where foreign code called an Ipê closure, classified once.
+///
+/// The two variants are the only outcomes a closure adapter distinguishes: the
+/// runtime's own typed trip, which must end typed, and any other payload,
+/// which is foreign-controlled text the adapter answers in its own channel.
+#[derive(Debug)]
+pub enum ClosureUnwind {
+    /// The runtime's typed trip, raised by the Ipê code the closure ran.
+    Trip(RuntimeTrip),
+    /// Any other payload; it is logged redacted, never shown to Ipê.
+    Foreign(Box<dyn std::any::Any + Send>),
+}
+
+/// Classify a caught unwind payload as a [`RuntimeTrip`] or a foreign payload.
+#[must_use]
+pub fn closure_unwind(payload: Box<dyn std::any::Any + Send>) -> ClosureUnwind {
+    match payload.downcast::<RuntimeTrip>() {
+        Ok(fault) => ClosureUnwind::Trip(*fault),
+        Err(payload) => ClosureUnwind::Foreign(payload),
+    }
+}
+
+/// End the process on an unwind caught at a boundary with no error channel.
+///
+/// A trip prints its typed error; any other payload is logged redacted and
+/// prints `context` plus its correlation id as an `Unexpected` error. Both end
+/// through the one exit funnel with status 1, so the pre-exit stages run.
+/// `context` is an emitter- or runtime-owned constant, never payload text.
+pub fn end_on_unchanneled_unwind(context: &'static str, unwind: ClosureUnwind) -> ! {
+    let error = match unwind {
+        ClosureUnwind::Trip(fault) => fault.to_ipe_error(),
+        ClosureUnwind::Foreign(payload) => {
+            crate::IpeError::unexpected(redacted_panic_message(context, payload))
+        }
+    };
+    eprint_task_error(&error.to_string());
+    crate::system::exit_process(crate::system::ProcessStatus::FAILURE)
+}
+
 /// [B8] Server-log a foreign FFI failure's raw detail under a correlation id,
 /// honouring `IPE_LOG_FORMAT=json`. The detail is for OPERATORS ONLY — it can
 /// carry secrets / PII / internal paths from a transport error or a panic
@@ -2525,6 +2564,25 @@ mod tests {
         assert_eq!(
             runtime_trip(payload.as_ref()),
             Some(RuntimeTrip::RecursionLimit)
+        );
+    }
+
+    // A closure adapter tells the runtime's own trip from a foreign panic, so
+    // a trip is never answered as a foreign `None`.
+    #[test]
+    fn closure_unwind_separates_a_trip_from_a_foreign_payload() {
+        let tripped = std::panic::catch_unwind(|| trip(RuntimeTrip::RecursionLimit));
+        assert!(tripped.is_err(), "a trip must unwind");
+        let Err(payload) = tripped else { return };
+        assert!(matches!(
+            closure_unwind(payload),
+            ClosureUnwind::Trip(RuntimeTrip::RecursionLimit)
+        ));
+        let foreign: Box<dyn std::any::Any + Send> = Box::new("x");
+        let classified = closure_unwind(foreign);
+        assert!(
+            matches!(&classified, ClosureUnwind::Foreign(p) if p.downcast_ref::<&str>() == Some(&"x")),
+            "a foreign payload stays foreign and intact: {classified:?}"
         );
     }
 

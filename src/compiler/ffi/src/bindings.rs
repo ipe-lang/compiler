@@ -1780,10 +1780,13 @@ fn opaque_path_tokens(raw: &str) -> Vec<(String, String)> {
 ///
 /// Per-call soundness (design §3.3): each call re-enters the Ipê closure inside
 /// `std::panic::catch_unwind` (the module-top `panic="abort"` fence makes that
-/// sound). A `Total` (scalar-only) return has NO error channel, so a panic
-/// `std::process::abort()`s — fabricating a `Default` would launder a real Ipê
-/// panic into a silently-consumed wrong value. A `Result`/`Option` return folds
-/// the panic in-band to `Err`/`None`.
+/// sound). A `Result` return hands every unwind to the caller as a typed `Err`
+/// (a runtime trip keeps its kind). A `Total` (scalar-only) return has NO
+/// error channel, so any unwind ends the process typed through
+/// `end_on_unchanneled_unwind` — fabricating a `Default` would launder a real
+/// Ipê fault into a silently-consumed wrong value. An `Option` return folds a
+/// foreign panic to `None` but ends the process typed on a runtime trip, which
+/// no `None` describes truly.
 ///
 /// Everything renders from the parsed [`ClosureSig`] — no raw manifest string
 /// reaches this emitted Rust.
@@ -1900,26 +1903,35 @@ fn closure_adapter_lines(
 
 /// The per-call closure body the adapter's returned closure runs each call.
 ///
-/// A SYNC return is a single `catch_unwind` `match` expression: a `Total`
-/// (scalar) return has no error channel so a panic ABORTS (never fabricating a
-/// `Default` — that would launder a real Ipê panic into a wrong value); a
-/// `Result`/`Option` return folds the panic in-band to `Err`/`None`.
+/// A SYNC return is a single `catch_unwind` `match` expression. Every caught
+/// payload is classified once by `closure_unwind`: a `Result` return hands it
+/// to the caller as a typed `Err`; a `Total` return ends the process typed
+/// through `end_on_unchanneled_unwind`; an `Option` return ends typed on a
+/// runtime trip and folds only a foreign panic to `None`. No arm aborts and no
+/// arm turns a trip into a value.
 ///
 /// An ASYNC return produces the `IpeTask` future under `catch_unwind` (a
-/// production-panic yields an immediate-error future), then returns a boxed
-/// future that awaits it under a spawned task — a poll-panic surfaces as a
-/// `JoinError` folded to `Err`/`None`, and an `AbortOnDrop` guard cancels the
+/// production-time unwind folds as the sync arm of its shape), then returns a
+/// boxed future that awaits it under a spawned task: the `Result` shape joins
+/// through `ffi_spawn_guarded` (typed `Err`), the `Option` shape through
+/// `ffi_spawn_guarded_unchanneled` (a trip ends typed, a foreign panic is
+/// `None`), and an `AbortOnDrop` guard cancels the
 /// inner task if the outer one is dropped (no Ipê side effect after cancel). The
 /// captured `Arc` is consumed PRODUCING the future, before the await, so only
 /// `{JoinHandle, AbortHandle}` cross the await point and the returned future
 /// stays `Send` even though `IpeTask` is `!Sync`.
 fn closure_per_call_body(ret: &ClosureRet, call: &str, wrapper: &str) -> Vec<String> {
+    /// The fold of a caught unwind where `None` is the only failure channel: a
+    /// runtime trip ends the process typed, a foreign panic is `None`.
+    const OPTION_UNWIND_FOLD: &str = "match closure_unwind(__p) { \
+         ClosureUnwind::Trip(__t) => end_on_unchanneled_unwind(\"foreign closure tripped\", \
+         ClosureUnwind::Trip(__t)), \
+         ClosureUnwind::Foreign(__f) => { note_foreign_panic(\"foreign closure panicked\", __f); None } }";
     match ret {
         ClosureRet::Total(_) => vec![format!(
             "        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {call})) \
-             {{ Ok(v) => v, Err(__p) => {{ \
-             note_foreign_panic(\"Ipê closure `{wrapper}` panicked; aborting \
-             (total return has no error channel)\", __p); std::process::abort(); }} }}"
+             {{ Ok(v) => v, Err(__p) => end_on_unchanneled_unwind(\"Ipê closure `{wrapper}` \
+             panicked (total return has no error channel)\", closure_unwind(__p)) }}"
         )],
         ClosureRet::Result(_) => vec![format!(
             "        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {call})) \
@@ -1927,26 +1939,27 @@ fn closure_per_call_body(ret: &ClosureRet, call: &str, wrapper: &str) -> Vec<Str
         )],
         ClosureRet::Option(_) => vec![format!(
             "        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {call})) \
-             {{ Ok(inner) => inner, Err(__p) => {{ note_foreign_panic(\"foreign closure panicked\", __p); None }} }}"
+             {{ Ok(inner) => inner, Err(__p) => {OPTION_UNWIND_FOLD} }}"
         )],
         ClosureRet::AsyncResult(_) | ClosureRet::AsyncOption(_) => {
             // The production seam (building the future) keeps its own
-            // `catch_unwind`; the spawn + cancel-guard + join-error funnel is
-            // the single `ffi_spawn_guarded` choke-point. Its `Err` is already
-            // the funnelled outcome (a poll panic redacted, a cancel funnelled),
-            // so the `Result` shape returns it verbatim and the `Option` shape
-            // folds it to `None` (the funnel has already logged the detail).
-            let (prod_fold, join_fold) = if matches!(ret, ClosureRet::AsyncResult(_)) {
+            // `catch_unwind`; the spawn + cancel-guard + join funnel is the
+            // runtime's one raw join, read by the fold of the shape's channel.
+            let (prod_fold, join) = if matches!(ret, ClosureRet::AsyncResult(_)) {
                 (
                     "{ let __e = ipe_error_from_panic(\"foreign closure panicked\", __p); \
-                     return Box::pin(async move { Err(__e) }); }",
-                    "Err(__e) => Err(__e)",
+                     return Box::pin(async move { Err(__e) }); }"
+                        .to_owned(),
+                    "            match ffi_spawn_guarded(__fut).await \
+                     { Ok(inner) => inner, Err(__e) => Err(__e) }",
                 )
             } else {
                 (
-                    "{ note_foreign_panic(\"foreign closure panicked\", __p); \
-                     return Box::pin(async move { None }); }",
-                    "Err(_) => None",
+                    format!(
+                        "{{ let __none = {OPTION_UNWIND_FOLD}; \
+                         return Box::pin(async move {{ __none }}); }}"
+                    ),
+                    "            ffi_spawn_guarded_unchanneled(__fut).await",
                 )
             };
             vec![
@@ -1956,9 +1969,7 @@ fn closure_per_call_body(ret: &ClosureRet, call: &str, wrapper: &str) -> Vec<Str
                      {{ Ok(f) => f, Err(__p) => {prod_fold} }};"
                 ),
                 "        Box::pin(async move {".to_owned(),
-                format!(
-                    "            match ffi_spawn_guarded(__fut).await {{ Ok(inner) => inner, {join_fold} }}"
-                ),
+                join.to_owned(),
                 "        })".to_owned(),
             ]
         }
@@ -2255,10 +2266,10 @@ fn plain_lines(cx: &WrapperCx<'_>) -> Vec<String> {
 /// An OPAQUE-typed field is the one shape here whose `.clone()` runs foreign
 /// code (the crate's own `Clone` impl), so that body executes inside
 /// `catch_unwind`; the bare return has no error channel, so a caught foreign
-/// panic funnel-logs and aborts — the same sanctioned no-error-channel
-/// response as a total-return closure, never a laundered value and never an
-/// unwind that some unrelated recovery layer could absorb over half-broken
-/// foreign state. Scalar/`String`-family fields stay bare: their access runs
+/// panic is logged redacted and ends the process typed through
+/// `end_on_unchanneled_unwind` — the same no-error-channel response as a
+/// total-return closure, never a laundered value and never an unwind that some
+/// unrelated recovery layer could absorb over half-broken foreign state. Scalar/`String`-family fields stay bare: their access runs
 /// no foreign code, so they are infallible by construction.
 fn field_get_lines(cx: &WrapperCx<'_>) -> Vec<String> {
     let f = cx.f;
@@ -2290,9 +2301,8 @@ fn field_get_lines(cx: &WrapperCx<'_>) -> Vec<String> {
     let body = if clone_runs_foreign_code {
         format!(
             "    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {})) \
-             {{ Ok(v) => v, Err(__p) => {{ \
-             note_foreign_panic(\"foreign `Clone` panicked in field getter `{}`; aborting \
-             (field getter has no error channel)\", __p); std::process::abort(); }} }}",
+             {{ Ok(v) => v, Err(__p) => end_on_unchanneled_unwind(\"foreign `Clone` panicked \
+             in field getter `{}` (field getter has no error channel)\", closure_unwind(__p)) }}",
             co(&access),
             cx.rust_name
         )
@@ -2961,7 +2971,7 @@ pub fn semver_major_field_from_version(arg0: ::semver::Version) -> i64 {
     }
 
     #[test]
-    fn closure_adapter_total_return_aborts_on_panic_never_fabricates() {
+    fn closure_adapter_total_return_ends_typed_never_fabricates() {
         let out = closure_region("Fn(Int, Bool) -> Int + Send + Sync + 'static");
         // The returned boxed closure is surfaced as an opaque handle nominal, its
         // full `Box<dyn Fn …>` type carried by a `pub type` alias in the SAME
@@ -2985,8 +2995,16 @@ pub fn semver_major_field_from_version(arg0: ::semver::Version) -> i64 {
         assert!(out.contains("std::sync::Arc::new(__ipe_fn)"), "{out}");
         // Panic-isolated per-call re-entry.
         assert!(out.contains("std::panic::catch_unwind"), "{out}");
-        // A total return has no error channel: abort, NEVER fabricate a Default.
-        assert!(out.contains("std::process::abort()"), "{out}");
+        // A total return has no error channel: end typed, NEVER fabricate a
+        // Default and never abort.
+        assert!(
+            out.contains(
+                "Err(__p) => end_on_unchanneled_unwind(\"Ipê closure `semver_update_fn` \
+                 panicked (total return has no error channel)\", closure_unwind(__p))"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("abort()"), "{out}");
         assert!(!out.contains("Default::default"), "{out}");
         // Sentinel bracketing so DCE can drop an unreached adapter by name.
         assert!(out.contains("// IPE-FFI-WRAPPER BEGIN update_fn"), "{out}");
@@ -3014,7 +3032,7 @@ pub fn semver_major_field_from_version(arg0: ::semver::Version) -> i64 {
     }
 
     #[test]
-    fn closure_adapter_option_return_folds_the_panic_to_none() {
+    fn closure_adapter_option_return_folds_a_foreign_panic_to_none() {
         let out = closure_region("Fn(Int) -> Option<Int> + Send + Sync + 'static");
         assert!(
             out.contains(
@@ -3026,11 +3044,12 @@ pub fn semver_major_field_from_version(arg0: ::semver::Version) -> i64 {
         assert!(out.contains("-> UpdateFnClosure {"), "{out}");
         assert!(
             out.contains(
-                "Err(__p) => { note_foreign_panic(\"foreign closure panicked\", __p); None }"
+                "ClosureUnwind::Foreign(__f) => { note_foreign_panic(\"foreign closure \
+                 panicked\", __f); None }"
             ),
             "{out}"
         );
-        assert!(!out.contains("std::process::abort()"), "{out}");
+        assert!(!out.contains("abort()"), "{out}");
     }
 
     // ── async-returning closure adapters ───────────────────────────────────
@@ -3060,7 +3079,7 @@ pub fn semver_major_field_from_version(arg0: ::semver::Version) -> i64 {
         assert!(out.contains("ffi_spawn_guarded(__fut)"), "{out}");
         // Both panic sites fold to Err — never abort, never fabricate: a
         // production-panic funnels the caught payload; a poll-panic rides the
-        // choke-point's already-funnelled `Err`.
+        // choke-point's already-typed `Err` (a trip keeps its kind).
         assert!(
             out.contains(
                 "let __e = ipe_error_from_panic(\"foreign closure panicked\", __p); \
@@ -3090,23 +3109,72 @@ pub fn semver_major_field_from_version(arg0: ::semver::Version) -> i64 {
             "{out}"
         );
         assert!(out.contains("-> UpdateFnClosure {"), "{out}");
-        assert!(out.contains("ffi_spawn_guarded(__fut)"), "{out}");
-        // A production-panic and a poll-panic both fold to None. The poll-panic
-        // is redacted+logged inside the choke-point's funnel, so the Option
-        // shape just maps its `Err` to `None`.
+        // A production-time unwind folds as the sync `Option` arm; the poll is
+        // joined by the unchanneled funnel, which ends typed on a trip and
+        // folds only a foreign panic or a cancel to `None`.
         assert!(
-            out.contains(
-                "Err(__p) => { note_foreign_panic(\"foreign closure panicked\", __p); \
-                 return Box::pin(async move { None }); }"
-            ),
+            out.contains("Err(__p) => { let __none = match closure_unwind(__p) {"),
             "{out}"
         );
         assert!(
-            out.contains(
-                "match ffi_spawn_guarded(__fut).await { Ok(inner) => inner, Err(_) => None }"
-            ),
+            out.contains("return Box::pin(async move { __none }); }"),
             "{out}"
         );
+        assert!(
+            out.contains("ffi_spawn_guarded_unchanneled(__fut).await"),
+            "{out}"
+        );
+        assert!(!out.contains("Err(_) => None"), "{out}");
+    }
+
+    /// Every adapter shape a foreign caller can reach without an error channel.
+    const UNCHANNELED_SIGS: &[&str] = &[
+        "Fn(Int, Bool) -> Int + Send + Sync + 'static",
+        "Fn(Int) -> Option<Int> + Send + Sync + 'static",
+        "Fn(Int) -> impl Future<Output = Option<Int>> + Send + Sync + 'static",
+    ];
+
+    #[test]
+    fn no_closure_or_getter_adapter_aborts() {
+        for sig in UNCHANNELED_SIGS.iter().chain([
+            &"Fn(Int) -> Result<Int, Error> + Send + Sync + 'static",
+            &"Fn(Int) -> impl Future<Output = Result<Int, Error>> + Send + Sync + 'static",
+        ]) {
+            let out = closure_region(sig);
+            assert!(!out.contains("abort()"), "{sig}: {out}");
+        }
+        for sig in UNCHANNELED_SIGS {
+            let out = closure_region(sig);
+            assert!(out.contains("closure_unwind(__p)"), "{sig}: {out}");
+            assert!(out.contains("end_on_unchanneled_unwind("), "{sig}: {out}");
+        }
+        let getter = emit_bindings(&semver_pkg(&json!([{
+            "name": "build_field",
+            "params": [{"name": "self", "type": "Version", "ipeType": "Version", "rustType": "&Version"}],
+            "results": [{"name": "", "type": "BuildMetadata", "rustType": "semver::BuildMetadata"}],
+            "effect": "pure",
+            "recvType": "Version",
+            "recvRustType": "semver::Version",
+            "methodName": "build",
+            "isField": true
+        }])));
+        assert!(!getter.contains("abort()"), "{getter}");
+        assert!(getter.contains("closure_unwind(__p)"), "{getter}");
+    }
+
+    #[test]
+    fn option_adapter_never_folds_a_trip_to_none() {
+        let trip_ends = "ClosureUnwind::Trip(__t) => end_on_unchanneled_unwind(\"foreign closure \
+                         tripped\", ClosureUnwind::Trip(__t))";
+        for sig in &UNCHANNELED_SIGS[1..] {
+            let out = closure_region(sig);
+            assert!(out.contains(trip_ends), "{sig}: {out}");
+            // The only `None` the adapter yields on an unwind is the foreign arm's.
+            assert!(
+                !out.contains("note_foreign_panic(\"foreign closure panicked\", __p)"),
+                "{sig}: an unclassified payload must not fold to None: {out}"
+            );
+        }
     }
 
     // ── opaque-return closure adapters (opaque-map threaded) ───────────────
@@ -3205,7 +3273,8 @@ pub fn semver_major_field_from_version(arg0: ::semver::Version) -> i64 {
         );
         assert!(
             out.contains(
-                "Err(__p) => { note_foreign_panic(\"foreign closure panicked\", __p); None }"
+                "ClosureUnwind::Foreign(__f) => { note_foreign_panic(\"foreign closure \
+                 panicked\", __f); None }"
             ),
             "{out}"
         );
@@ -3724,8 +3793,8 @@ pub fn semver_major_field_from_version(arg0: ::semver::Version) -> i64 {
     fn an_opaque_field_getter_contains_the_foreign_clone() {
         // A non-Copy opaque field's `.clone()` dispatches into the crate's own
         // `Clone` impl — foreign code — so the getter body runs under
-        // catch_unwind and a caught panic funnel-logs then aborts (the bare
-        // return has no error channel).
+        // catch_unwind and a caught panic is logged redacted and ends the
+        // process typed (the bare return has no error channel).
         let pkg = semver_pkg(&json!([{
             "name": "build_field",
             "params": [{"name": "self", "type": "Version", "ipeType": "Version", "rustType": "&Version"}],
@@ -3746,10 +3815,10 @@ pub fn semver_major_field_from_version(arg0: ::semver::Version) -> i64 {
         assert!(
             out.contains(
                 "match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || \
-                 arg0.build.clone())) { Ok(v) => v, Err(__p) => { \
-                 note_foreign_panic(\"foreign `Clone` panicked in field getter \
-                 `semver_build_field_from_version`; aborting (field getter has no error \
-                 channel)\", __p); std::process::abort(); } }"
+                 arg0.build.clone())) { Ok(v) => v, Err(__p) => \
+                 end_on_unchanneled_unwind(\"foreign `Clone` panicked in field getter \
+                 `semver_build_field_from_version` (field getter has no error channel)\", \
+                 closure_unwind(__p)) }"
             ),
             "{out}"
         );
@@ -3772,7 +3841,7 @@ pub fn semver_major_field_from_version(arg0: ::semver::Version) -> i64 {
         }]));
         let out = emit_bindings(&pkg);
         assert!(
-            out.contains("note_foreign_panic(\"foreign `Clone` panicked in field getter"),
+            out.contains("end_on_unchanneled_unwind(\"foreign `Clone` panicked in field getter"),
             "an unrecognised field type must not slip past the boundary:\n{out}"
         );
     }
