@@ -17,9 +17,9 @@
 //!
 //! Every source is parsed with `syn`, so the scan reads the same syntax tree
 //! rustc does: comments and string literals are never code, and a
-//! `#[cfg(test)]` attribute removes exactly the node it is attached to (an
-//! item, field, variant, match arm, statement, or expression) and nothing
-//! after it. A node whose `cfg` is not proven test-only is scanned, so an
+//! `#[cfg(test)]` attribute removes exactly the node it is attached to (a
+//! file, through its inner `#![cfg(test)]`, an item, field, variant, match
+//! arm, statement, or expression) and nothing after it. A node whose `cfg` is not proven test-only is scanned, so an
 //! unrecognised shape can only turn the scan red, never vacuously green. A
 //! macro body is scanned as the expressions or statements it parses as, or,
 //! when it parses as neither, token by token, where every dial-named
@@ -35,7 +35,7 @@ use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
 use syn::{
     Arm, Attribute, Block, Expr, ExprAssign, ExprCall, ExprMethodCall, ExprPath, Field, FieldValue,
-    ForeignItem, ForeignItemFn, Ident, ImplItem, ImplItemFn, Item, ItemFn, ItemImpl, ItemUse,
+    File, ForeignItem, ForeignItemFn, Ident, ImplItem, ImplItemFn, Item, ItemFn, ItemImpl, ItemUse,
     Local, Macro, Pat, PatIdent, Stmt, Token, TraitItem, TraitItemFn, Type, TypeParam, UseTree,
     Variant,
 };
@@ -609,6 +609,13 @@ impl Scan {
 }
 
 impl<'ast> Visit<'ast> for Scan {
+    fn visit_file(&mut self, file: &'ast File) {
+        if self.prunes(&file.attrs) {
+            return;
+        }
+        visit::visit_file(self, file);
+    }
+
     fn visit_item(&mut self, item: &'ast Item) {
         if self.prunes(item_attrs(item)) {
             return;
@@ -1131,6 +1138,25 @@ fn production() {
         1,
         "fn production: raw dial `connect`",
     );
+}
+
+/// A file whose inner attribute is `#![cfg(test)]` is dropped whole; an
+/// inner `cfg` not proven test-only leaves the file scanned.
+#[test]
+fn a_cfg_test_file_is_dropped_and_any_other_inner_cfg_is_scanned() {
+    let body = "\nfn open() {\n    PgPool::connect(url);\n}\n";
+    assert_violations(
+        &caller_url_violations("fixture.rs", &format!("#![cfg(test)]{body}")),
+        0,
+        "",
+    );
+    for inner in ["#![cfg(not(test))]", "#![cfg(any(test, feature = \"db\"))]"] {
+        assert_violations(
+            &caller_url_violations("fixture.rs", &format!("{inner}{body}")),
+            1,
+            "fn open: raw dial `connect`",
+        );
+    }
 }
 
 #[test]

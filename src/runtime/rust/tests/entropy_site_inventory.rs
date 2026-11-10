@@ -107,12 +107,6 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
     ("clippy_paths_resolve.rs", "_RAND_CORE", "OsRng", 1),
     // A view of the in-tree `config_postgres.rs`, which the walk also reads.
     ("config_postgres_test.rs", MODULE_LEVEL, "#[path] mod pg", 1),
-    (
-        "postgres_placeholder_rewrite_test.rs",
-        MODULE_LEVEL,
-        INCLUDE,
-        1,
-    ),
     // The driver-selected `config`: the in-tree `config_postgres.rs`.
     ("mod.rs", MODULE_LEVEL, "#[path] mod config", 1),
     // The bridge's wire grammar, a child module of the port glue; it draws

@@ -560,6 +560,19 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       is refused.  So a rustc warning or clippy lint that fires only under
       a wasm32 cfg cannot merge.  LIMIT: native (target, feature) legs have
       no such check.
+  26. Every host `cargo clippy` that can reach `ipe-runtime-rust` lints
+      every target: each `cargo clippy` command of a workflow step's `run:`
+      line (backslash continuations joined; `;`, `&&`, `||`, `|` split it
+      into commands) and of a manifest entry's `local.run` carries
+      `--all-targets` before `--`, unless it names only other packages
+      (`-p X`, `-pX`, `--package X`, `--package=X`), excludes the runtime
+      from a `--workspace`, or lints only `wasm32-*` targets.  A clippy
+      naming no package reaches every workspace member, the runtime
+      included.  A library-only host row leaves the runtime's test code
+      unlinted under that row's cfg set, where it rots unseen; a wasm32
+      row is a cross-target leg whose test sets check 25 holds.  A line
+      naming `clippy` that `shlex` cannot split is refused.  LIMIT: a cargo
+      reached through a variable or script is not read.
   LIMIT (checks 15, 16, 20, 22): a cargo line is read as run, not proven
   to reach its step's exit status — `cargo .. || true`, an `exit 0` before
   it, `set +e`, `if ! cargo ..` or a pipeline without `pipefail` are not
@@ -8552,6 +8565,138 @@ def check_release_target_parity(wfs: WorkflowSet, errors: list[str]) -> None:
             errors.append(f"check 23: {RELEASE_WORKFLOW}'s completeness gate expects {name!r}, which no job publishes")
 
 
+RUNTIME_PACKAGE = "ipe-runtime-rust"
+
+
+def _joined_lines(text: str) -> list[str]:
+    """The shell lines of a `run:` text, a trailing-backslash line joined
+    to the next."""
+    out: list[str] = []
+    pending = ""
+    for line in _run_lines(text):
+        if line.rstrip().endswith("\\"):
+            pending += line.rstrip()[:-1] + " "
+            continue
+        out.append(pending + line)
+        pending = ""
+    if pending:
+        out.append(pending)
+    return out
+
+
+_SHELL_PUNCTUATION = frozenset(";&|()")
+
+
+def _shell_commands(line: str) -> list[list[str]] | None:
+    """The word lists of the commands one shell line runs, split at `;`,
+    `&&`, `||`, `|`, `&` and parentheses, or None when `shlex` cannot split it."""
+    lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        words = list(lexer)
+    except ValueError:
+        return None
+    commands: list[list[str]] = [[]]
+    for word in words:
+        if word and set(word) <= _SHELL_PUNCTUATION:
+            commands.append([])
+        else:
+            commands[-1].append(word)
+    return [command for command in commands if command]
+
+
+def _clippy_flags(words: list[str]) -> list[str] | None:
+    """The words a `cargo clippy` command passes cargo (those before `--`),
+    or None when the command is not a `cargo clippy`."""
+    for at, word in enumerate(words):
+        if word != "cargo" and not word.endswith("/cargo"):
+            continue
+        rest = words[at + 1:]
+        if rest and rest[0].startswith("+"):
+            rest = rest[1:]
+        if rest and rest[0] == "clippy":
+            args = rest[1:]
+            return args[: args.index("--")] if "--" in args else args
+    return None
+
+
+def _flag_values(flags: list[str], long: str, short: str | None) -> list[str]:
+    """Every value `flags` gives `long` (`--x V`, `--x=V`) or `short` (`-s V`, `-sV`)."""
+    values: list[str] = []
+    i = 0
+    while i < len(flags):
+        word = flags[i]
+        if word == long or word == short:
+            if i + 1 < len(flags):
+                values.append(flags[i + 1])
+            i += 2
+            continue
+        if word.startswith(long + "="):
+            values.append(word.removeprefix(long + "="))
+        elif short is not None and word.startswith(short) and not word.startswith("--"):
+            values.append(word.removeprefix(short))
+        i += 1
+    return values
+
+
+def _clippy_reaches_runtime(flags: list[str]) -> bool:
+    """Whether a `cargo clippy` with these cargo flags can lint the runtime:
+    it names it, or names no package and does not exclude it."""
+    packages = _flag_values(flags, "--package", "-p")
+    if packages:
+        return RUNTIME_PACKAGE in packages
+    return RUNTIME_PACKAGE not in _flag_values(flags, "--exclude", None)
+
+
+def _runtime_clippy_refusal(line: str, where: str) -> str | None:
+    """Check 26's refusal of one shell line, or None."""
+    commands = _shell_commands(line)
+    if commands is None:
+        if "clippy" not in line:
+            return None
+        return (
+            f"check 26: {where}: `{line.strip()}` names `clippy` but cannot be "
+            "split, so the targets it lints are unread"
+        )
+    for words in commands:
+        flags = _clippy_flags(words)
+        if flags is None or not _clippy_reaches_runtime(flags) or "--all-targets" in flags:
+            continue
+        targets = _flag_values(flags, "--target", None)
+        if targets and all(target.startswith("wasm32-") for target in targets):
+            continue
+        return (
+            f"check 26: {where}: `{line.strip()}` lints `{RUNTIME_PACKAGE}` without "
+            "`--all-targets`, so its test code goes unlinted under that cfg set"
+        )
+    return None
+
+
+def check_runtime_clippy_all_targets(wfs: WorkflowSet, entries: object, errors: list[str]) -> None:
+    """Check 26: every host `cargo clippy` of the runtime lints every target."""
+    for wf in wfs.workflows:
+        for job in wf.jobs:
+            steps = job.raw.get("steps")
+            for n, step in enumerate(steps if isinstance(steps, list) else []):
+                run = step.get("run") if isinstance(step, dict) else None
+                if not isinstance(run, str):
+                    continue
+                for line in _joined_lines(run):
+                    why = _runtime_clippy_refusal(line, f"{wf.fname} job `{job.job_id}` step {n}")
+                    if why is not None:
+                        errors.append(why)
+    for entry in entries if isinstance(entries, list) else []:
+        local = entry.get("local") if isinstance(entry, dict) else None
+        runs = local.get("run") if isinstance(local, dict) else None
+        for line in runs if isinstance(runs, list) else []:
+            if not isinstance(line, str):
+                continue
+            for joined in _joined_lines(line):
+                why = _runtime_clippy_refusal(joined, f"manifest `{entry.get('context')}` local.run")
+                if why is not None:
+                    errors.append(why)
+
+
 def read_manifest(path: str) -> object:
     """`check-manifest.yml` at `path`, parsed: the one manifest load. Raises
     `OSError`/`yaml.YAMLError` for the caller to refuse."""
@@ -8728,6 +8873,9 @@ def main() -> int:
 
     # ---- 25. every wasm32 build and test set has a `-D warnings` lint leg ----
     check_wasm_clippy_legs(workflows, errors)
+
+    # ---- 26. every runtime clippy row lints every target ----
+    check_runtime_clippy_all_targets(workflows, entries, errors)
 
     # ---- 3. fail-closed dependency surfacing ----
     def surfaced_dispositions(job: Job) -> set[str]:
