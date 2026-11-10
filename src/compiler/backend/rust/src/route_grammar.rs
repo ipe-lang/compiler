@@ -573,6 +573,8 @@ mod tests {
             ("FETCH /x", "FETCH"),
             ("po\u{17f}t /x", "po\u{17f}t"),
             ("G-ET /x", "G-ET"),
+            ("TRACE  /a/:id", "TRACE"),
+            ("connect /x", "connect"),
         ] {
             assert_eq!(
                 server_api_spec(spec),
@@ -589,7 +591,7 @@ mod tests {
             "Any /x",
             "/x",
             " /x",
-            "TRACE  /a/:id",
+            "DELETE  /a/:id",
         ] {
             assert_eq!(server_api_spec(spec), Ok(()), "{spec:?}");
         }
@@ -1164,7 +1166,8 @@ mod agreement_tests {
     }
 
     /// The compiler admits a literal `Server.api` method exactly when the
-    /// server's listen-time parse does, whatever its case or bytes.
+    /// server's listen-time parse does, whatever its case or bytes, and reads
+    /// the same method set from it.
     #[test]
     fn server_api_method_matches_runtime() {
         use ipe_runtime_rust::encoding::EndpointMethod;
@@ -1176,24 +1179,57 @@ mod agreement_tests {
             "GET\t /u",
             "\tGET /u",
             "Any /u",
+            "TRACE /u",
+            "connect /u",
             "/u",
             " /u",
             "",
         ] {
             let (method, _) = api_spec_parts(spec);
-            let runtime = method.is_empty() || EndpointMethod::parse(&method).is_some();
-            let ours =
-                super::server_api_method(spec).is_none_or(|m| EndpointMethod::parse(m).is_some());
-            assert_eq!(ours, runtime, "{spec:?}");
-            assert_eq!(
-                super::server_api_method(spec).unwrap_or("ANY"),
-                if method.is_empty() {
-                    "ANY"
-                } else {
-                    method.as_str()
-                },
+            let ours = super::server_api_method(spec)
+                .map_or(Some(EndpointMethod::Any), EndpointMethod::parse);
+            assert_eq!(ours, method.ok(), "{spec:?}");
+        }
+    }
+
+    /// The method names the IPE-L0156 hint offers are exactly the methods a
+    /// route may serve, so the hint never offers a refused method nor omits a
+    /// served one.
+    #[test]
+    fn unknown_method_hint_names_the_routable_set() {
+        use ipe_runtime_rust::encoding::RoutableMethod;
+        let mut hint = ipe_diagnostics::ROUTABLE_METHOD_NAMES.to_vec();
+        let mut served: Vec<&str> = RoutableMethod::ALL
+            .into_iter()
+            .map(RoutableMethod::as_str)
+            .collect();
+        hint.sort_unstable();
+        served.sort_unstable();
+        assert_eq!(hint, served);
+    }
+
+    /// Prove the refusals: a literal `Server.api` method naming `TRACE`,
+    /// `CONNECT` or no method at all is refused at compile time, and the
+    /// server's listen-time parse refuses it with the matching cause.
+    #[test]
+    fn server_api_unknown_verb_refused() {
+        use ipe_runtime_rust::encoding::EndpointMethodRefusal as R;
+        for (spec, cause) in [
+            ("TRACE /x", R::NotRoutable),
+            ("CONNECT /x", R::NotRoutable),
+            ("trace /x", R::NotRoutable),
+            ("FETCH /x", R::Unknown),
+            ("MOUNT /x", R::Unknown),
+        ] {
+            assert!(
+                matches!(
+                    super::server_api_spec(spec),
+                    Err(RoutePatternDefect::UnknownMethod { .. })
+                ),
                 "{spec:?}"
             );
+            let (method, _) = api_spec_parts(spec);
+            assert_eq!(method.err().map(|m| m.cause()), Some(cause), "{spec:?}");
         }
     }
 

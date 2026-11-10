@@ -7,7 +7,8 @@
 --
 --     import Ipe.Debug as Debug
 --
---     total =
+--     total : Int -> Int -> Int
+--     total subtotal tax =
 --         Debug.log "subtotal" subtotal + tax
 --
 -- `log label value` prints `"label: value"` to stderr and returns `value`
@@ -18,6 +19,10 @@
 -- ## `todo`
 --
 --     import Ipe.Debug as Debug
+--
+--     type Shape
+--         = Circle Float
+--         | Rectangle Float Float
 --
 --     describeShape : Shape -> String
 --     describeShape shape =

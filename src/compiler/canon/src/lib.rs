@@ -5691,6 +5691,154 @@ mod tests {
         Ok(())
     }
 
+    /// The one interpolated expression of `main`'s single-part template.
+    fn interp_arg(body: Option<Expr_>) -> Option<Expr> {
+        let Some(Expr_::Call(callee, args)) = body else {
+            return None;
+        };
+        let interpolate = matches!(
+            callee.value,
+            Expr_::VarKernel {
+                id: Some(ipe_kernels::StdlibKernel::Interpolate),
+                ..
+            }
+        );
+        let [arg] = <[Expr; 1]>::try_from(args).ok()?;
+        interpolate.then_some(arg)
+    }
+
+    /// A call with arguments inside `{{…}}` is an expression: the renderer
+    /// wraps the resolved call, its callee and arguments resolved in scope.
+    #[test]
+    fn interp_body_is_a_call_expression() {
+        let mut i = Interner::new();
+        let body = canon_body(
+            &mut i,
+            "module Main exposing (main)\n\
+             join sep xs = sep\n\
+             map g ys = ys\n\
+             f x = x\n\
+             main xs =\n    \"\"\"{{join \", \" (map f xs)}}\"\"\"\n",
+            "main",
+        );
+        let arg = interp_arg(body);
+        assert!(
+            matches!(&arg, Some(Expr { value: Expr_::Call(callee, args), .. })
+                if args.len() == 2
+                    && matches!(&callee.value, Expr_::VarTopLevel { name, .. }
+                        if i.resolve(*name) == Some("join"))),
+            "`{{{{join \", \" (map f xs)}}}}` interpolates the resolved call, got {arg:?}"
+        );
+    }
+
+    /// An operator application and a nested field path are expressions too.
+    #[test]
+    fn interp_body_takes_operators_and_field_paths() {
+        let mut i = Interner::new();
+        let sum = canon_body(
+            &mut i,
+            "module Main exposing (main)\nmain a b =\n    \"\"\"{{a + b}}\"\"\"\n",
+            "main",
+        );
+        let sum = interp_arg(sum);
+        assert!(
+            matches!(
+                &sum,
+                Some(Expr {
+                    value: Expr_::Binop { .. },
+                    ..
+                })
+            ),
+            "`{{{{a + b}}}}` interpolates a binop, got {sum:?}"
+        );
+        let mut i = Interner::new();
+        let record = canon_body(
+            &mut i,
+            "module Main exposing (main)\n\
+             f r = r\n\
+             main =\n    \"\"\"{{ f {a = {b = 1} } }}\"\"\"\n",
+            "main",
+        );
+        let record = interp_arg(record);
+        assert!(
+            matches!(&record, Some(Expr { value: Expr_::Call(_, args), .. })
+                if matches!(args.first().map(|a| &a.value), Some(Expr_::Record(_)))),
+            "a record literal inside a body is an argument, got {record:?}"
+        );
+    }
+
+    /// `{{r.x.y}}` reads field `y` of field `x` of `r`: a nested access,
+    /// never one field named `"x.y"`.
+    #[test]
+    fn interp_field_path_is_a_nested_access() {
+        let mut i = Interner::new();
+        let body = canon_body(
+            &mut i,
+            "module Main exposing (main)\nmain r =\n    \"\"\"{{r.x.y}}\"\"\"\n",
+            "main",
+        );
+        let arg = interp_arg(body);
+        let Some(Expr {
+            value: Expr_::Access(inner, outer),
+            ..
+        }) = &arg
+        else {
+            assert!(false_marker(), "`{{{{r.x.y}}}}` is an access, got {arg:?}");
+            return;
+        };
+        assert_eq!(i.resolve(*outer), Some("y"));
+        assert!(
+            matches!(&inner.value, Expr_::Access(record, field)
+                if matches!(record.value, Expr_::VarLocal(_)) && i.resolve(*field) == Some("x")),
+            "the record of `.y` is `r.x`, got {inner:?}"
+        );
+    }
+
+    /// The `[lo, hi)` of a name diagnostic's span, or `None` for any other
+    /// outcome.
+    fn name_error_span(err: Option<&Diagnostic>) -> Option<(usize, usize)> {
+        match err {
+            Some(Diagnostic::Name { span, .. }) => Some((span.lo as usize, span.hi as usize)),
+            _ => None,
+        }
+    }
+
+    /// An unknown qualifier inside a body is a name error at the qualified
+    /// name, never across the whole string.
+    #[test]
+    fn interp_unknown_qualifier_points_at_its_name() {
+        let src = "module Main exposing (main)\nmain =\n    \"\"\"hi {{Nope.x}} there\"\"\"\n";
+        let err = canon_err(src);
+        let at = src.find("Nope").unwrap_or_default();
+        let span = name_error_span(err.as_ref());
+        assert!(
+            matches!(span, Some((lo, hi)) if lo == at && hi <= at + "Nope.x".len()),
+            "the name error lands on `Nope`, got {err:?}"
+        );
+    }
+
+    /// An unknown bare name inside a body is IPE-N0001 at that name's bytes.
+    #[test]
+    fn interp_unknown_name_points_at_its_name() {
+        let src = "module Main exposing (main)\nmain =\n    \"\"\"hi {{missing}} there\"\"\"\n";
+        let err = canon_err(src);
+        let at = src.find("missing").unwrap_or_default();
+        assert!(
+            matches!(
+                &err,
+                Some(Diagnostic::Name {
+                    msg: NameError::ValueNotFound { .. },
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            name_error_span(err.as_ref()),
+            Some((at, at + "missing".len()))
+        );
+    }
+
     /// A module whose first value fails, then a value whose body mints a binder.
     const FAIL_THEN_MINT: &str = "module Main exposing (main)\n\n\
                                   bad =\n    missing\n\n\

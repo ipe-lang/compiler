@@ -535,15 +535,18 @@ mod resolver_tests {
                                 greet who =\n    \"\"\"hi {{who}} there\"\"\"\n";
 
     #[test]
-    fn an_interpolated_name_is_never_answered_across_its_whole_string() -> Outcome {
+    fn an_interpolated_name_is_answered_at_its_own_span_and_nowhere_else() -> Outcome {
         let (index, _) = index_of(&[], INTERPOLATED)?;
+        let binder = local_at(INTERPOLATED, "who", 0)?;
+        assert_eq!(index.get(span_of(INTERPOLATED, "who", 0)?), Some(&binder));
+        // The use inside `{{…}}` answers its binder at the name's own bytes.
+        assert_eq!(index.get(span_of(INTERPOLATED, "who", 1)?), Some(&binder));
         let string = span_of(INTERPOLATED, "\"\"\"hi {{who}} there\"\"\"", 0)?;
         assert_eq!(index.get(string), None);
         let literal = span_of(INTERPOLATED, "hi ", 0)?;
         assert_eq!(index.at(literal.lo), None);
-        // The binder itself is still recorded at its own span.
-        let binder = local_at(INTERPOLATED, "who", 0)?;
-        assert_eq!(index.get(span_of(INTERPOLATED, "who", 0)?), Some(&binder));
+        let after = span_of(INTERPOLATED, " there", 0)?;
+        assert_eq!(index.at(after.lo), None);
         Ok(())
     }
 

@@ -32,9 +32,11 @@
 //! `Char.fromCode`.
 
 use ipe_diagnostics::terminal::{SourceHazard, ends_bidi_paragraph};
-use ipe_diagnostics::{DResult, Diagnostic, HazardRefusal, ParseError, Span};
-use ipe_syntax::{Column, ESCAPES, TripleRefusal, TripleStr};
+use ipe_diagnostics::{DResult, Diagnostic, HazardRefusal, InterpolationDefect, ParseError, Span};
+use ipe_syntax::{Column, ESCAPES, Segment, TripleRefusal, TripleStr};
+use std::collections::VecDeque;
 use std::num::NonZeroU32;
+use std::ops::Range;
 
 /// Unsigned magnitude of an integer literal as lexed, bounded to `0 ..= 2^63`.
 ///
@@ -180,9 +182,15 @@ pub enum Tok {
     /// so downstream stages see the runtime string verbatim.
     Str(String),
     /// A triple-quoted string literal `"""..."""`, judged into one of its two
-    /// forms. Escape sequences and `{{expr}}` markers in its value are not
-    /// resolved here; the canonicaliser handles them downstream.
-    TripleStr(TripleStr),
+    /// forms and split at its `{{expr}}` markers.
+    ///
+    /// `bodies` holds the tokens of each [`Segment::Body`] in `segments`, in
+    /// order, each lexed by this lexer over the body's own source bytes.
+    TripleStr {
+        triple: TripleStr,
+        segments: Vec<Segment>,
+        bodies: Vec<Vec<Token>>,
+    },
     /// A character literal `'a'`. The carried [`String`] is the single UNESCAPED
     /// character's text (exactly one `char`), so `'\n'` carries a one-character
     /// newline string. The backend renders it as a Rust `char` literal.
@@ -221,6 +229,8 @@ struct Lexer<'src> {
     window: [Option<(usize, char)>; 3],
     /// The remaining source characters after the lookahead window.
     rest: std::str::CharIndices<'src>,
+    /// The byte offset in `src` that `rest` counts its offsets from.
+    base: usize,
     /// Byte offset one past the last character in `src` — the EOF position used
     /// by `offset()` when the window is empty.
     eof_offset: u32,
@@ -231,17 +241,46 @@ struct Lexer<'src> {
 impl<'src> Lexer<'src> {
     fn new(src: &'src str) -> Self {
         let eof_offset = u32::try_from(src.len()).unwrap_or(u32::MAX);
-        let mut iter = src.char_indices();
-        let a = iter.next();
-        let b = iter.next();
-        let c = iter.next();
+        Self::reading(src, src.char_indices(), 0, eof_offset, (1, 1))
+    }
+
+    /// A lexer over the bytes `range` of `src` only, its first character at
+    /// `origin` (line, column); `None` when `range` is not on char boundaries
+    /// of `src`.
+    ///
+    /// Offsets stay those of `src`, so every span it records is a source span.
+    fn over(src: &'src str, range: Range<u32>, origin: (u32, u32)) -> Option<Self> {
+        let src = src.get(..range.end as usize)?;
+        let rest = src.get(range.start as usize..)?.char_indices();
+        Some(Self::reading(
+            src,
+            rest,
+            range.start as usize,
+            range.end,
+            origin,
+        ))
+    }
+
+    /// A lexer reading `rest`, whose offsets count from `base` in `src`.
+    fn reading(
+        src: &'src str,
+        mut rest: std::str::CharIndices<'src>,
+        base: usize,
+        eof_offset: u32,
+        (line, col): (u32, u32),
+    ) -> Self {
+        let shift = |item: Option<(usize, char)>| item.map(|(at, c)| (at.saturating_add(base), c));
+        let a = shift(rest.next());
+        let b = shift(rest.next());
+        let c = shift(rest.next());
         Self {
             src,
             window: [a, b, c],
-            rest: iter,
+            rest,
+            base,
             eof_offset,
-            line: 1,
-            col: 1,
+            line,
+            col,
         }
     }
 
@@ -290,7 +329,10 @@ impl<'src> Lexer<'src> {
             }
             self.window[0] = self.window[1];
             self.window[1] = self.window[2];
-            self.window[2] = self.rest.next();
+            self.window[2] = self
+                .rest
+                .next()
+                .map(|(at, c)| (at.saturating_add(self.base), c));
         }
     }
 
@@ -403,9 +445,8 @@ pub enum PositionContext {
     BlockComment,
     /// Inside a `{-| … -}` doc comment (not nestable, see [`lex_doc_comment`]).
     DocComment,
-    /// Inside a `"…"` or `"""…"""` string literal, `{{expr}}` interpolation
-    /// bodies included: their grammar is the canonicaliser's, so they are
-    /// never claimed as code here.
+    /// Inside a `"…"` or `"""…"""` string literal; the body of a `{{expr}}`
+    /// interpolation is code, read region by region like any other.
     String,
     /// Inside a `'…'` character literal.
     Char,
@@ -452,15 +493,29 @@ impl LexicalRegion {
 pub fn lexical_regions(src: &str) -> LexicalRegions<'_> {
     LexicalRegions {
         lx: Lexer::new(src),
+        pending: VecDeque::new(),
     }
 }
 
 /// The region one token read from `c` at `lo` covers: its context, and
 /// whether it is open-ended because the lexer refused it.
-fn token_region(lx: &mut Lexer<'_>, c: char, lo: u32) -> (PositionContext, bool) {
+///
+/// A `"""` string with interpolations queues its own regions on `pending`:
+/// the text between its bodies, then each body read region by region.
+fn token_region(
+    lx: &mut Lexer<'_>,
+    c: char,
+    lo: u32,
+    pending: &mut VecDeque<LexicalRegion>,
+) -> (PositionContext, bool) {
     let opener = Opener::of(lx, c);
     let context = opener.context();
-    match lex_opened(lx, opener, c, lo) {
+    let read = if opener == Opener::Str && opens_triple(lx) {
+        template_regions(lx, lo, pending)
+    } else {
+        lex_opened(lx, opener, c, lo).map(drop)
+    };
+    match read {
         // A refused code token keeps the bytes its recogniser read — digits,
         // a fraction, an exponent, or one operator character, never a comment
         // or literal opener — so reading resumes where it stopped and no byte
@@ -468,9 +523,9 @@ fn token_region(lx: &mut Lexer<'_>, c: char, lo: u32) -> (PositionContext, bool)
         // is advanced past by the progress guard in `next`. A `"""` string
         // refused for its shape is read through its closing `"""`, so it is
         // one closed region and reading resumes past it.
-        Ok(_)
+        Ok(())
         | Err(Diagnostic::Parse {
-            msg: ParseError::MalformedTripleString(_),
+            msg: ParseError::MalformedTripleString(_) | ParseError::MalformedInterpolation(_),
             ..
         }) => (context, false),
         Err(_) if context == PositionContext::Code => (context, false),
@@ -492,31 +547,80 @@ impl Trivia {
     }
 }
 
+/// Whether the cursor, a `"`, opens a `"""` string.
+fn opens_triple(lx: &Lexer<'_>) -> bool {
+    lx.peek2() == Some('"') && lx.peek3() == Some('"')
+}
+
+/// Read the `"""` string at `lo` (the cursor on its opener) for its regions,
+/// queueing them on `pending` when it interpolates.
+///
+/// Each body is read by [`lexical_regions`] over its own bytes, so a body is
+/// code wherever the lexer reads code; its tokens need not lex.
+fn template_regions(
+    lx: &mut Lexer<'_>,
+    lo: u32,
+    pending: &mut VecDeque<LexicalRegion>,
+) -> DResult<()> {
+    let read = read_triple(lx, lo)?;
+    let mut text_lo = lo;
+    for (source, origin) in read.bodies() {
+        pending.push_back(string_region(text_lo, source.start));
+        if let Some(body) = Lexer::over(lx.src, source.clone(), origin) {
+            pending.extend(LexicalRegions {
+                lx: body,
+                pending: VecDeque::new(),
+            });
+        }
+        text_lo = source.end;
+    }
+    if !pending.is_empty() {
+        pending.push_back(string_region(text_lo, lx.offset()));
+    }
+    Ok(())
+}
+
+/// A closed string region over `[lo, hi)`.
+const fn string_region(lo: u32, hi: u32) -> LexicalRegion {
+    LexicalRegion {
+        span: Span::new(lo, hi),
+        context: PositionContext::String,
+        open_end: false,
+    }
+}
+
 /// The iterator [`lexical_regions`] returns.
 pub struct LexicalRegions<'src> {
     lx: Lexer<'src>,
+    /// The regions of an interpolating `"""` string still to be yielded.
+    pending: VecDeque<LexicalRegion>,
 }
 
 impl Iterator for LexicalRegions<'_> {
     type Item = LexicalRegion;
 
     fn next(&mut self) -> Option<LexicalRegion> {
+        if let Some(region) = self.pending.pop_front() {
+            return Some(region);
+        }
         let lx = &mut self.lx;
+        let pending = &mut self.pending;
         let lo = lx.offset();
         let c = lx.peek()?;
         let (context, open_end) = lx
             .trivia_step()
-            .map_or_else(|| token_region(lx, c, lo), Trivia::region);
+            .map_or_else(|| token_region(lx, c, lo, pending), Trivia::region);
         // A refusal of an unknown character reads nothing; one character of
         // progress per region keeps the walk finite.
         if lx.offset() <= lo {
             lx.advance();
         }
-        Some(LexicalRegion {
+        let whole = LexicalRegion {
             span: Span::new(lo, lx.offset()),
             context,
             open_end,
-        })
+        };
+        Some(pending.pop_front().unwrap_or(whole))
     }
 }
 
@@ -643,7 +747,7 @@ struct OpenIsolate {
 
 /// Whether `kind` is a literal whose body the compiler reads as data.
 const fn is_text_literal(kind: &Tok) -> bool {
-    matches!(kind, Tok::Str(_) | Tok::TripleStr(_) | Tok::Char(_))
+    matches!(kind, Tok::Str(_) | Tok::TripleStr { .. } | Tok::Char(_))
 }
 
 /// The first source display hazard no string or char literal proves admissible.
@@ -776,11 +880,23 @@ pub fn lex(src: &str) -> DResult<Vec<Token>> {
     if let HazardScan::Refused(at, ch) = hazards {
         return Err(display_hazard_error((at, ch, HazardRefusal::Anywhere)));
     }
-    let mut lx = Lexer::new(src);
+    let out = lex_tokens(&mut Lexer::new(src), hazards)?;
+    if hazards == HazardScan::LiteralOnly
+        && let Some(hit) = unproven_literal_hazard(src, literal_spans(&out).into_iter())
+    {
+        return Err(display_hazard_error(hit));
+    }
+    Ok(out)
+}
+
+/// Every token `lx` reads up to its end of input: the one token loop, run over
+/// a whole source by [`lex`] and over each interpolation body.
+fn lex_tokens(lx: &mut Lexer<'_>, hazards: HazardScan) -> DResult<Vec<Token>> {
+    let src = lx.src;
     // Roughly one token per four source bytes reserves enough for most files up
     // front, eliminating nearly all growth reallocs; a bad estimate only
     // over-reserves transiently and degrades to plain growth.
-    let mut out = Vec::with_capacity(src.len() / 4);
+    let mut out = Vec::with_capacity((lx.eof_offset.saturating_sub(lx.offset()) / 4) as usize);
     loop {
         lx.skip_trivia()?;
         let Some(c) = lx.peek() else { break };
@@ -788,16 +904,17 @@ pub fn lex(src: &str) -> DResult<Vec<Token>> {
         let col = lx.col;
         let lo = lx.offset();
 
-        let opener = Opener::of(&lx, c);
-        let kind = match lex_opened(&mut lx, opener, c, lo) {
+        let opener = Opener::of(lx, c);
+        let kind = match lex_opened(lx, opener, c, lo) {
             Ok(kind) => kind,
             Err(
                 refusal @ Diagnostic::Parse {
-                    msg: ParseError::MalformedTripleString(_),
+                    msg:
+                        ParseError::MalformedTripleString(_) | ParseError::MalformedInterpolation(_),
                     ..
                 },
             ) => {
-                return Err(hazard_before_shape(src, &out, &lx, lo, hazards).unwrap_or(refusal));
+                return Err(hazard_before_shape(src, &out, lx, lo, hazards).unwrap_or(refusal));
             }
             Err(refusal) => return Err(refusal),
         };
@@ -810,20 +927,45 @@ pub fn lex(src: &str) -> DResult<Vec<Token>> {
             span: Span::new(lo, hi),
         });
     }
-    if hazards == HazardScan::LiteralOnly
-        && let Some(hit) = unproven_literal_hazard(src, literal_spans(&out))
-    {
-        return Err(display_hazard_error(hit));
-    }
     Ok(out)
 }
 
 /// The spans of the text literals among `tokens`, in source order.
-fn literal_spans(tokens: &[Token]) -> impl Iterator<Item = Span> {
-    tokens
-        .iter()
-        .filter(|token| is_text_literal(&token.kind))
-        .map(|token| token.span)
+///
+/// A `"""` string is literal only outside its interpolation bodies: a body is
+/// code, and the literals among its tokens are collected in their place.
+fn literal_spans(tokens: &[Token]) -> Vec<Span> {
+    let mut out = Vec::new();
+    push_literal_spans(tokens, &mut out);
+    out
+}
+
+/// Append the spans of the text literals among `tokens` to `out`.
+fn push_literal_spans(tokens: &[Token], out: &mut Vec<Span>) {
+    for token in tokens {
+        if let Tok::TripleStr {
+            segments, bodies, ..
+        } = &token.kind
+        {
+            let mut text_lo = token.span.lo;
+            for (source, body) in segments.iter().filter_map(body_source).zip(bodies) {
+                out.push(Span::new(text_lo, source.start));
+                push_literal_spans(body, out);
+                text_lo = source.end;
+            }
+            out.push(Span::new(text_lo, token.span.hi));
+        } else if is_text_literal(&token.kind) {
+            out.push(token.span);
+        }
+    }
+}
+
+/// The source bytes of a body segment; `None` for text.
+fn body_source(segment: &Segment) -> Option<Range<u32>> {
+    match segment {
+        Segment::Body { source, .. } => Some(source.clone()),
+        Segment::Lit { .. } => None,
+    }
 }
 
 /// A display hazard that outranks the refusal of a `"""` string judged
@@ -841,8 +983,9 @@ fn hazard_before_shape(
     }
     let hi = lx.offset();
     let read = src.get(..hi as usize)?;
-    let shaped = std::iter::once(Span::new(lo, hi));
-    unproven_literal_hazard(read, literal_spans(out).chain(shaped)).map(display_hazard_error)
+    let mut spans = literal_spans(out);
+    spans.push(Span::new(lo, hi));
+    unproven_literal_hazard(read, spans.into_iter()).map(display_hazard_error)
 }
 
 /// Which token recogniser the character at the cursor opens.
@@ -1094,15 +1237,41 @@ fn lex_string(lx: &mut Lexer, lo: u32) -> DResult<Tok> {
     }
 }
 
-/// Lex a `"""` string, judged into one of its two forms by
-/// [`ipe_syntax::judge`]. The opening `"""` at `lo` has already been consumed by
-/// [`lex_string`], so the opener stands three columns left of the cursor.
+/// A `"""` string as read: judged, split at its markers, and where each body
+/// starts as a (line, column).
+struct ReadTriple {
+    string: TripleStr,
+    segments: Vec<Segment>,
+    origins: Vec<(u32, u32)>,
+}
+
+impl ReadTriple {
+    /// Each body's source bytes with the (line, column) it starts at.
+    fn bodies(&self) -> impl Iterator<Item = (Range<u32>, (u32, u32))> + '_ {
+        self.segments
+            .iter()
+            .filter_map(body_source)
+            .zip(self.origins.iter().copied())
+    }
+}
+
+/// Read a `"""` string, judged into one of its two forms by
+/// [`ipe_syntax::judge`] and split by [`ipe_syntax::segments`]. The opening
+/// `"""` at `lo` has already been consumed, so the opener stands three
+/// columns left of the cursor.
 ///
-/// With no closing `"""` the string is [`ParseError::UnterminatedString`] over
-/// the opener to end of input. A string in neither form is
-/// [`ParseError::MalformedTripleString`] at its defect; the cursor still moves
-/// past the string's closing `"""`, so reading resumes after the whole string.
-fn lex_triple_string(lx: &mut Lexer, lo: u32) -> DResult<Tok> {
+/// The cursor moves past the string's closing `"""` (or to end of input)
+/// whatever the outcome, so reading resumes after the whole string; on the
+/// way it notes the line and column each body starts at, from the lexer's
+/// own line model.
+///
+/// # Errors
+///
+/// With no closing `"""` the string is [`ParseError::UnterminatedString`]
+/// over the opener to end of input. A string in neither form is
+/// [`ParseError::MalformedTripleString`] at its defect; a `{{` with no `}}`
+/// after it is [`ParseError::MalformedInterpolation`] at the `{{`.
+fn read_triple(lx: &mut Lexer, lo: u32) -> DResult<ReadTriple> {
     let opener = ipe_syntax::Opener {
         lo,
         line: NonZeroU32::new(lx.line).unwrap_or(NonZeroU32::MIN),
@@ -1114,20 +1283,124 @@ fn lex_triple_string(lx: &mut Lexer, lo: u32) -> DResult<Tok> {
         Err(TripleRefusal::Malformed { end, .. }) => *end,
         Err(TripleRefusal::Unterminated { eof }) => *eof,
     };
+    let split = judged
+        .as_ref()
+        .ok()
+        .map(|found| ipe_syntax::segments(&found.string));
+    let starts: Vec<u32> = split
+        .as_ref()
+        .and_then(|split| split.as_ref().ok())
+        .map(|segments| {
+            segments
+                .iter()
+                .filter_map(body_source)
+                .map(|source| source.start)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut starts = starts.into_iter().peekable();
+    let mut origins = Vec::new();
     while lx.peek().is_some() && lx.offset() < end {
+        while starts.next_if(|&at| at <= lx.offset()).is_some() {
+            origins.push((lx.line, lx.col));
+        }
         lx.advance();
     }
-    match judged {
-        Ok(found) => Ok(Tok::TripleStr(found.string)),
-        Err(TripleRefusal::Unterminated { eof }) => Err(Diagnostic::Parse {
-            span: Span::new(lo, eof),
-            msg: ParseError::UnterminatedString,
-        }),
-        Err(TripleRefusal::Malformed { defect, .. }) => Err(Diagnostic::Parse {
-            span: defect.span(),
-            msg: ParseError::MalformedTripleString(defect),
-        }),
+    let found = match judged {
+        Ok(found) => found,
+        Err(TripleRefusal::Unterminated { eof }) => {
+            return Err(Diagnostic::Parse {
+                span: Span::new(lo, eof),
+                msg: ParseError::UnterminatedString,
+            });
+        }
+        Err(TripleRefusal::Malformed { defect, .. }) => {
+            return Err(Diagnostic::Parse {
+                span: defect.span(),
+                msg: ParseError::MalformedTripleString(defect),
+            });
+        }
+    };
+    let segments = split.unwrap_or_else(|| Ok(Vec::new()))?;
+    if starts.next().is_some() {
+        return Err(Diagnostic::CompilerBug {
+            where_: "ipe_parse::lexer::read_triple",
+            detail: "an interpolation body starts past its string's closing `\"\"\"`".to_owned(),
+        });
     }
+    Ok(ReadTriple {
+        string: found.string,
+        segments,
+        origins,
+    })
+}
+
+/// Lex a `"""` string read by [`read_triple`], each `{{expr}}` body by the
+/// one token loop over its own source bytes.
+///
+/// # Errors
+///
+/// Every refusal of [`read_triple`] and of [`lex_bodies`].
+fn lex_triple_string(lx: &mut Lexer, lo: u32) -> DResult<Tok> {
+    let read = read_triple(lx, lo)?;
+    let bodies = lex_bodies(lx, lo, &read)?;
+    Ok(Tok::TripleStr {
+        triple: read.string,
+        segments: read.segments,
+        bodies,
+    })
+}
+
+/// The tokens of each body of `read`, the string read from `lo`, in order.
+///
+/// # Errors
+///
+/// A body's own lex refusal at its span; [`InterpolationDefect::Empty`] over
+/// a body holding no token.
+fn lex_bodies(lx: &Lexer, lo: u32, read: &ReadTriple) -> DResult<Vec<Vec<Token>>> {
+    let value = read.string.value();
+    let mut bodies = Vec::with_capacity(read.origins.len());
+    for segment in &read.segments {
+        let Segment::Body {
+            value: range,
+            source,
+        } = segment
+        else {
+            continue;
+        };
+        let origin = read
+            .origins
+            .get(bodies.len())
+            .copied()
+            .unwrap_or((lx.line, lx.col));
+        let text = lx.src.get(source.start as usize..source.end as usize);
+        let body_value = value.get(range.start as usize..range.end as usize);
+        let sub = match (text, body_value) {
+            (Some(text), Some(body_value)) if read.string.source_reads(text, body_value) => {
+                Lexer::over(lx.src, source.clone(), origin)
+            }
+            _ => None,
+        };
+        let Some(mut sub) = sub else {
+            return Err(Diagnostic::CompilerBug {
+                where_: "ipe_parse::lexer::lex_triple_string",
+                detail: format!(
+                    "the source bytes {source:?} of an interpolation body do not read as its value"
+                ),
+            });
+        };
+        let tokens = lex_tokens(&mut sub, HazardScan::Clean)?;
+        if tokens.is_empty() {
+            return Err(Diagnostic::Parse {
+                span: segment
+                    .delimited()
+                    .unwrap_or_else(|| Span::new(lo, lx.offset())),
+                msg: ParseError::MalformedInterpolation(InterpolationDefect::Empty),
+            });
+        }
+        bodies.push(tokens);
+    }
+    Ok(bodies)
 }
 
 /// Lex a character literal `'c'` or `'\n'`. The opening `'` is the current char.

@@ -1,0 +1,12 @@
+-- A MALFORMED STRING INTERPOLATION ------------------------ test.ipe
+
+The first `}}` ends this interpolation before its expression is complete. A `{{…}}` in a `"""` string holds one expression, and the first `}}` after the `{{` ends it.
+
+ --> test.ipe:4:16
+  |
+4 |     """a {{f (x}} b"""
+  |                ^^ this `}}` ends the interpolation
+  |
+  = help: the first `}}` ends the interpolation; balance the brackets or bind the expression to a name
+
+IPE-P0077 · run `ipe doc IPE-P0077`

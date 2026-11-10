@@ -234,8 +234,7 @@ pub mod narrow;
 // the reactor-free clock reads (`Time.now`/`unixMillis`), the `Time.sleep`
 // timer, and the UTC calendar rules and formatters — lives behind `time-core`;
 // a program that reaches no `Ipe.Time` kernel (and no Log/Db/Web surface)
-// drops the module and `chrono`. No item in it reads the `time` feature or
-// `chrono-tz`. wasm32: the browser clock and timer arms read
+// drops the module and `chrono`. wasm32: the browser clock and timer arms read
 // `js_sys::Date`/`gloo-timers`, not `chrono`.
 #[cfg(feature = "time-core")]
 pub mod time;

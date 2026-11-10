@@ -9424,9 +9424,9 @@ struct KernelUsage {
     /// `websocket_client` Cargo feature + `ws_client` runtime module.
     websocket: bool,
     /// Any non-TEA `Ipe.Time` kernel (`Time.now` / `unixMillis` / `sleep` /
-    /// `timeString` / `isLeapYear` / `daysInMonth`) — gates the `time` Cargo
-    /// feature and the `chrono-tz` dependency (the IANA-zone calendar surface).
-    /// `chrono` core is gated by `time-core`/`log`. `Time.every` is TEA, tracked by `tea`.
+    /// `timeString` / `isLeapYear` / `daysInMonth`) — one reacher of the
+    /// `time-core` Cargo feature (the `time.rs` module and `chrono`). `Time.every`
+    /// is TEA, tracked by `tea`.
     time: bool,
     /// Any `Ipe.Email` kernel (`Email.send`, `EmailAddress.parse`,
     /// `EmailAddress.toString`) — gates the `email` runtime module.
@@ -17303,10 +17303,8 @@ impl<'a> Lowerer<'a> {
         // `locale_from_tag` compiles but always returns `Nothing`.
         let uses_locale = kernel_usage.locale
             || program_type_mentions(&funcs, &records, &types_ir, &ir_type_mentions_locale);
-        // detect non-TEA `Ipe.Time` kernel usage — the backend enables the
-        // `time` Cargo feature and adds the `chrono-tz` dependency (the IANA-zone
-        // calendar surface); a program that reaches no Time kernel drops the
-        // crate. `chrono` core is gated by `time-core`/`log`.
+        // detect non-TEA `Ipe.Time` kernel usage — one reacher of the
+        // `time-core` Cargo feature (the `time.rs` module and `chrono`).
         let uses_time = kernel_usage.time;
         // detect `Ipe.Env` `Env.public` usage — the backend uses this flag to
         // emit the per-project `env_public.rs` and append `pub mod

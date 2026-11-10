@@ -440,7 +440,7 @@ pub fn time_days_in_month(year: i64, month: i64) -> i64 {
     )
 }
 
-// `time_time_string` is unconditional (no `time` feature), so its regression
+// `time_time_string` carries no gate of its own, so its regression
 // test lives in an always-compiled module. It asserts a fixed instant formats
 // to a constant UTC `HH:MM:SS` regardless of the process `TZ`.
 #[cfg(test)]

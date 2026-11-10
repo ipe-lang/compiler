@@ -21,17 +21,24 @@ builder helpers so future field additions don't break record literals.
 
 Example:
 
+    type alias User =
+        { name : String }
+
     usersCache : Task Error (Cache String User)
     usersCache =
         Cache.new
             (Cache.defaultCfg
                 |> Cache.withMaxEntries 10000
-                |> Cache.withTTL 60000  -- 60s
+                |> Cache.withTTL (Duration.seconds 60)
             )
 
-    -- ...
-    Cache.get cache "alice"           -- Task Error (Maybe User)
-    Cache.put cache "alice" newUser   -- Task Error ()
+    lookup : Cache String User -> Task Error (Maybe User)
+    lookup cache =
+        Cache.get cache "alice"
+
+    remember : Cache String User -> User -> Task Error ()
+    remember cache newUser =
+        Cache.put cache "alice" newUser
 
 ## `Cache`
 

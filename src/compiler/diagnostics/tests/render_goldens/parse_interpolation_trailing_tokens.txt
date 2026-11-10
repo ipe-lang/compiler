@@ -1,0 +1,12 @@
+-- A MALFORMED STRING INTERPOLATION ------------------------ test.ipe
+
+This interpolation holds more than one expression. A `{{…}}` in a `"""` string holds one expression, and the first `}}` after the `{{` ends it.
+
+ --> test.ipe:1:27
+  |
+1 | module Main exposing (main)
+  |                           ^ the expression ends before this
+  |
+  = help: remove the extra tokens, or wrap the expression in parentheses
+
+IPE-P0077 · run `ipe doc IPE-P0077`

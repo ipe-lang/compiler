@@ -26,7 +26,7 @@ use ipe_diagnostics::Located;
 use ipe_intern::Symbol;
 use std::borrow::Cow;
 
-use ipe_syntax::{Expr, Expr_, Piece, interpolation_pieces};
+use ipe_syntax::{Expr, Expr_};
 
 use crate::finding::Finding;
 use crate::rules::Ctx;
@@ -57,20 +57,14 @@ fn is_ui_icon_button(ctx: &Ctx, expr: &Expr) -> bool {
 
 /// If `expr` is a string literal, return its value; else `None`.
 ///
-/// An empty/whitespace triple-quoted label parses to `MultilineStr`, not `Str`
+/// An empty/whitespace triple-quoted label parses to a `Template`, not `Str`
 /// (`""""""` / `""" """` → a nameless/whitespace `aria-label`), so it must be
-/// caught here too. A triple-quote carrying `{{…}}` interpolation is computed,
+/// caught here too. A template carrying a `{{…}}` expression is computed,
 /// not a literal — out of a lint's reach, so it is left alone.
 fn str_val(expr: &Expr) -> Option<Cow<'_, str>> {
     match &expr.value {
         Expr_::Str(s) => Some(Cow::Borrowed(s.as_str())),
-        Expr_::MultilineStr(string) => {
-            let value = string.value();
-            let computed = interpolation_pieces(&value)
-                .iter()
-                .any(|piece| matches!(piece, Piece::Interp { .. }));
-            (!computed).then_some(value)
-        }
+        Expr_::Template(template) => template.literal_value(),
         _ => None,
     }
 }
@@ -188,6 +182,11 @@ fn walk_children(ctx: &Ctx, expr: &Expr, out: &mut Vec<Finding>) {
                 walk_expr(ctx, value, out);
             }
         }
+        Expr_::Template(template) => {
+            for part in template.exprs() {
+                walk_expr(ctx, part, out);
+            }
+        }
         _ => {}
     }
 }
@@ -257,7 +256,7 @@ view =
         );
     }
 
-    // Prove the refusal: an empty TRIPLE-quoted label parses to `MultilineStr`,
+    // Prove the refusal: an empty TRIPLE-quoted label parses to a `Template`,
     // not `Str` — it must still be flagged, else `label = """"""` is a
     // fail-open nameless control.
     #[test]
@@ -272,7 +271,7 @@ view =
 "#;
         assert!(
             !findings_for(src).is_empty(),
-            "an empty triple-quoted label (MultilineStr) must be flagged"
+            "an empty triple-quoted label (a template) must be flagged"
         );
     }
 

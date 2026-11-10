@@ -93,6 +93,33 @@ fn hover_on_main_discloses_the_derived_control_model() {
     assert_eq!(info.control_model, None);
 }
 
+/// A hover on an interpolated expression reads that expression's own type,
+/// never the `String` of the interpolation standing around it: the renderer
+/// call owns the whole `{{…}}`, a span strictly wider than the expression.
+#[test]
+fn hover_on_an_interpolated_expression_reads_its_own_type() {
+    const SRC: &str = "module Main exposing (main)\n\n\
+        count : Int\ncount =\n    3\n\n\
+        main = \"\"\"a {{count}} b {{ count + 1 }} c\"\"\"\n";
+    let db = IpeDatabase::new();
+    let entry = file(&db, &["Main"], SRC);
+    let root = root_of(&db, &[(&["Main"], entry)]);
+    // The hover byte is `skip` bytes into the first `needle`.
+    let hover_ty = |needle: &str, skip: usize| {
+        let at = SRC.find(needle).expect("needle") + skip;
+        let byte = u32::try_from(at).expect("fits");
+        ipe_lsp_features::hover::hover(&db, root, entry, entry, &["Main".to_owned()], byte, None)
+            .expect("hover hit")
+            .ty
+    };
+    // A name that is the whole body.
+    assert_eq!(hover_ty("count}}", 0), "Int");
+    // The space inside the operator chain: only the chain's region holds it.
+    assert_eq!(hover_ty("count + 1", "count".len()), "Int");
+    // The `{{` itself belongs to the interpolation alone.
+    assert_eq!(hover_ty("{{ count", 0), "String");
+}
+
 #[test]
 fn document_symbols_cover_values_unions_and_ctors() {
     let db = IpeDatabase::new();

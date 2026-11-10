@@ -1101,6 +1101,7 @@ mod tests {
         let epoch = crate::dom::dispatch::Rendered::first(
             crate::dom::dispatch::SessionKeys::distinct(),
             crate::html::Html::<()>::HText(String::new()),
+            crate::dom::dispatch::PageUrl::Unrouted,
         )
         .epoch();
         let page = crate::web::render_page_full(
@@ -1108,6 +1109,7 @@ mod tests {
             &crate::encoding::MountBase::root(),
             "<p>hi</p>",
             &epoch,
+            &crate::dom::dispatch::PageUrl::Unrouted,
             "tok",
         );
         assert!(page.is_ok(), "{page:?}");
@@ -1164,6 +1166,7 @@ mod tests {
                 crate::dom::dispatch::Rendered::first(
                     keys,
                     crate::html::Html::<()>::HText(String::new()),
+                    crate::dom::dispatch::PageUrl::Unrouted,
                 )
                 .stamp()
             })

@@ -301,36 +301,32 @@ pub enum RenderArg<'a> {
     Text(&'a str),
 }
 
-/// Why a page has no URL its own route table reads back to it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RenderRefusal {
-    /// The rendered path is claimed by an earlier route, so it would not
-    /// read back to this page's route.
-    Shadowed,
-    /// A text param is empty, so its segment would vanish from the path.
-    EmptySegment,
-    /// A text param is `.` or `..`, which a client normalizes away.
-    DotSegment,
-    /// A float param is NaN or infinite, which no route param reads back.
-    NonFinite,
-    /// The rendered path is longer than `MAX_URL_COMPONENT_LEN`.
-    TooLong,
-    /// The route index or param count does not fit the table: the emitted
-    /// renderer and the table disagree.
-    NoRoute,
+pub use crate::dom::dispatch::{BrowserPath, PageUrl, RenderRefusal};
+
+/// The URL of a routed page, from its rendered route under the mount `base`.
+///
+/// A route that renders is joined to the base by [`BrowserPath::of`]; a
+/// refusal is kept, so the page writes no URL.
+#[must_use]
+pub fn page_url(
+    base: &crate::encoding::EncodedBase,
+    rendered: Result<RoutePath, RenderRefusal>,
+) -> PageUrl {
+    match rendered {
+        Ok(path) => PageUrl::Routed(BrowserPath::of(base, &path)),
+        Err(refusal) => PageUrl::Unrenderable(refusal),
+    }
 }
 
-impl std::fmt::Display for RenderRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Shadowed => "the page's path is claimed by an earlier route",
-            Self::EmptySegment => "an empty text cannot be a path segment",
-            Self::DotSegment => "`.` and `..` cannot be path segments",
-            Self::NonFinite => "a NaN or infinite float cannot be a path segment",
-            Self::TooLong => "the page's path is too long",
-            Self::NoRoute => "the page's route is not in the route table",
-        })
-    }
+/// The emitted projection of a model onto its page, as written.
+///
+/// Fixes the closure's signature to a borrow in, a borrow out, so an emitted
+/// `|m| &m.page` reads the page without a clone.
+pub const fn page_of<Model, Page, F>(project: F) -> F
+where
+    F: for<'a> Fn(&'a Model) -> &'a Page,
+{
+    project
 }
 
 /// A page's canonical path: rendered from its route and proven to read back
@@ -485,8 +481,7 @@ pub fn canonical_redirect(
     if spelling == crate::server::Spelling::Canonical && path == canonical.as_str() {
         return Redirect::Serve;
     }
-    let mut location = String::from(base.as_str());
-    location.push_str(canonical.as_str());
+    let mut location = String::from(BrowserPath::of(base, canonical).as_str());
     if let Some(raw) = raw_query {
         let Ok(query) = QueryText::parse(raw) else {
             return Redirect::BadQuery;
@@ -824,6 +819,25 @@ mod tests {
         // A respelled request is redirected though its respelled text matches.
         let to = canonical_redirect(&base("/m"), Respelled, "/apps/foo", Some("q=1"), &canon);
         assert_eq!(location_of(&to), "/m/apps/foo?q=1");
+    }
+
+    /// A page's browser path is the base joined once with its route, the same
+    /// join the canonical redirect writes, and a refused route has no path.
+    #[cfg(feature = "web")]
+    #[test]
+    fn browser_path_joins_base_once() {
+        let entry = canonical_of("/apps/one");
+        let joined = page_url(&base("/app"), Ok(entry.clone()));
+        assert_eq!(joined.path(), Some("/app/apps/one"));
+        assert_eq!(
+            page_url(&base("/"), Ok(entry.clone())).path(),
+            Some("/apps/one")
+        );
+        let redirect = canonical_redirect(&base("/app"), Respelled, "/apps/one", None, &entry);
+        assert_eq!(joined.path(), Some(location_of(&redirect).as_str()));
+        let refused = page_url(&base("/app"), Err(RenderRefusal::Shadowed));
+        assert_eq!(refused, PageUrl::Unrenderable(RenderRefusal::Shadowed));
+        assert_eq!(refused.path(), None, "an unrenderable page writes no route");
     }
 
     /// A redirect target redirects no further: render(parse(canonical)) is

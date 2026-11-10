@@ -5,10 +5,12 @@
 //! token dispatch, so completion never fires inside a comment or a literal.
 
 use std::collections::BTreeSet;
+use std::num::NonZeroU32;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use ipe_db::{IpeDatabase, ModuleOrigin, SourceFile, SourceRoot};
-use ipe_diagnostics::TokenKind;
+use ipe_diagnostics::{Span, TokenKind};
 use ipe_lsp_features::PositionEncoding;
 use ipe_lsp_features::completion::{completions, qualified_completions};
 use ipe_parse::{PositionContext, TokenClass};
@@ -339,12 +341,14 @@ fn an_unclosed_char_literal_holds_the_rest_of_its_line() {
     assert_eq!(context_after(SRC, "next = Font."), PositionContext::Code);
 }
 
-/// `{{expr}}` inside `"""` is the canonicaliser's grammar, not the lexer's:
-/// it reads as string, so completion stays off rather than guessing.
+/// A `{{expr}}` body inside `"""` is code the lexer reads, so completion
+/// answers there; the text around it and its markers read as string.
 #[test]
-fn a_triple_string_interpolation_body_reads_as_string() {
+fn a_triple_string_interpolation_body_reads_as_code() {
     const SRC: &str = "main = \"\"\"a {{ Font. }} b\"\"\"\n";
-    assert_eq!(context_after(SRC, "Font."), PositionContext::String);
+    assert_eq!(context_after(SRC, "Font."), PositionContext::Code);
+    assert_eq!(context_after(SRC, "\"\"\"a"), PositionContext::String);
+    assert_eq!(context_after(SRC, "}} b"), PositionContext::String);
 }
 
 /// The cursor between the two characters of a closer is still inside the
@@ -542,7 +546,10 @@ fn expected_regions(src: &str, label: &str) -> Option<Vec<Expected>> {
         gap_comments(src, prev, tok.span.lo, &mut out, label);
         let context = match tok.class {
             TokenClass::DocComment => Some(PositionContext::DocComment),
-            TokenClass::Code(TokenKind::Str) => Some(PositionContext::String),
+            TokenClass::Code(TokenKind::Str) => {
+                string_regions(src, tok.span, &mut out, label);
+                None
+            }
             TokenClass::Code(TokenKind::Char) => Some(PositionContext::Char),
             TokenClass::Code(_) => None,
         };
@@ -554,6 +561,60 @@ fn expected_regions(src: &str, label: &str) -> Option<Vec<Expected>> {
     let end = u32::try_from(src.len()).expect("fits u32");
     gap_comments(src, prev, end, &mut out, label);
     Some(out)
+}
+
+/// The regions of the string token at `span`: one string region, or, for a
+/// `"""` string with `{{expr}}` bodies, the text between the bodies as string
+/// and each body's own regions per [`expected_regions`] over its bytes.
+#[allow(clippy::expect_used)] // test oracle: a lexed `"""` string judges and splits
+fn string_regions(src: &str, span: Span, out: &mut Vec<Expected>, label: &str) {
+    let whole = (span.lo, span.hi, PositionContext::String, false);
+    let lo = span.lo as usize;
+    if !src.get(lo..).is_some_and(|tail| tail.starts_with("\"\"\"")) {
+        out.push(whole);
+        return;
+    }
+    let before = src.get(..lo).expect("token on a char boundary");
+    let count =
+        |n: usize| NonZeroU32::new(u32::try_from(n + 1).expect("fits u32")).expect("one-based");
+    let line = count(before.matches('\n').count());
+    let column = count(before.rsplit('\n').next().map_or(0, |l| l.chars().count()));
+    let judged = ipe_syntax::judge(
+        src,
+        ipe_syntax::Opener {
+            lo: span.lo,
+            line,
+            column: ipe_syntax::Column::new(column),
+        },
+    )
+    .expect("a lexed string judges");
+    let bodies: Vec<Range<u32>> = ipe_syntax::segments(&judged.string)
+        .expect("a lexed string splits")
+        .into_iter()
+        .filter_map(|segment| match segment {
+            ipe_syntax::Segment::Body { source, .. } => Some(source),
+            ipe_syntax::Segment::Lit { .. } => None,
+        })
+        .collect();
+    if bodies.is_empty() {
+        out.push(whole);
+        return;
+    }
+    let mut text_lo = span.lo;
+    for body in bodies {
+        out.push((text_lo, body.start, PositionContext::String, false));
+        let text = src
+            .get(body.start as usize..body.end as usize)
+            .expect("body on char boundaries");
+        let inner = expected_regions(text, label).expect("a lexed body lexes");
+        out.extend(
+            inner
+                .into_iter()
+                .map(|(lo, hi, context, open)| (lo + body.start, hi + body.start, context, open)),
+        );
+        text_lo = body.end;
+    }
+    out.push((text_lo, span.hi, PositionContext::String, false));
 }
 
 /// The non-code regions `lexical_regions` reads in `src`.
@@ -568,6 +629,7 @@ fn read_regions(src: &str) -> Vec<Expected> {
 const SYNTHETIC_FIXTURES: &[&str] = &[
     "module Main exposing (main)\n\n{- a {- nested -} block comment -}\nmain : Int\nmain = 1\n",
     "main = 'a' -- c\r\nx = \"\"\"a -- b {- c\"\"\" ++ \"{-\" <--y\n",
+    "main = \"\"\"a {{ f \"x\" {- c -} 'y' }} b \\{{ c\"\"\"\n",
 ];
 
 #[test]

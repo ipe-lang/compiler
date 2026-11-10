@@ -1,0 +1,14 @@
+module Package exposing (package)
+
+import Ipe.Package exposing (..)
+
+
+package : Package
+package =
+    { name = "page-navigation"
+    , version = "0.1.0"
+    , capabilities =
+        { declares = []
+        , accepts = []
+        }
+    }

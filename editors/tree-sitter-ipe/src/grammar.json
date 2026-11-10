@@ -2985,7 +2985,7 @@
         },
         {
           "type": "PATTERN",
-          "value": "[^}]*"
+          "value": "([^}]|\\}[^}])*"
         },
         {
           "type": "STRING",
