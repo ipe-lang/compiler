@@ -27,12 +27,18 @@
 //! `main` already pins is refused with a pedagogical error, never silently
 //! reshaped.
 
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 
+use ipe_fs_open::ByteCap;
+
 use crate::delivery::{Delivery, Runtime};
 use crate::delivery_set::ShipEntry;
+use crate::output_dir::held::{
+    BackedUp, BackupName, Created, EntryKind, HeldDir, ReadMiss, Unread, read_miss,
+};
 use crate::project::BundleId;
 use crate::screen::Interactive;
 use crate::verb::Verb;
@@ -314,24 +320,114 @@ struct InitArgs {
 
 // ── managed-file model ────────────────────────────────────────────────────────
 
-/// One file `ipe init` manages: where it lives, relative to the target, and
-/// the content it would write there.
-struct ManagedFile {
-    /// The file's path relative to the target directory.
-    rel: PathBuf,
-    /// The exact bytes `init` would write.
-    content: String,
+/// The target's subdirectory a managed file lives in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedDir {
+    /// The target directory itself.
+    Root,
+    /// The target's `src` directory.
+    Src,
 }
 
-/// What `init` will do with a single managed file, decided once from its
-/// on-disk presence and the run's consent mode. Keeping the choice as a value
-/// separates the decision (which may prompt) from the write (which never prompts).
-enum FileAction {
-    /// Write the file — it is absent, or the user consented to overwrite it.
+/// The name of the target's source directory.
+const SRC_DIR: &str = "src";
+
+/// One file `ipe init` manages: its directory, its single-component name, the
+/// content it would write, and the cap its existing copy is read under.
+struct ManagedFile {
+    dir: ManagedDir,
+    name: String,
+    /// The exact bytes `init` would write.
+    content: String,
+    cap: ByteCap,
+}
+
+impl ManagedFile {
+    /// A managed source or project file, read under [`crate::io_bounded::SOURCE_CAP`].
+    fn source(dir: ManagedDir, name: impl Into<String>, content: String) -> Self {
+        Self {
+            dir,
+            name: name.into(),
+            content,
+            cap: crate::io_bounded::SOURCE_CAP,
+        }
+    }
+
+    /// The coding-agent guide, read under [`crate::agents_guide::GUIDE_READ_CAP`].
+    fn guide() -> Self {
+        Self {
+            dir: ManagedDir::Root,
+            name: crate::agents_guide::FILE_NAME.to_owned(),
+            content: crate::agents_guide::rendered(),
+            cap: crate::agents_guide::GUIDE_READ_CAP,
+        }
+    }
+
+    /// The file's path relative to the target, for display only; never opened.
+    fn rel(&self) -> PathBuf {
+        match self.dir {
+            ManagedDir::Root => PathBuf::from(&self.name),
+            ManagedDir::Src => Path::new(SRC_DIR).join(&self.name),
+        }
+    }
+}
+
+/// What to do with a managed file that exists and was read.
+#[derive(Clone, Copy)]
+enum Existing<'a> {
+    /// Ask on the terminal; the default is to keep it.
+    Ask(&'a Interactive),
+    /// Back it up and replace it.
+    Force,
+    /// Keep it, for the reason given.
+    Keep(KeepWhy),
+}
+
+/// What to do with a managed file that is absent.
+#[derive(Clone, Copy)]
+enum Missing<'a> {
+    /// Ask on the terminal; the default is to write it.
+    Ask(&'a Interactive),
+    /// Write it.
     Write,
-    /// Leave the file untouched — the user declined, or a non-interactive run
-    /// refused to overwrite silently.
-    Skip,
+}
+
+/// Why a policy keeps an existing managed file without asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeepWhy {
+    /// No terminal to ask on.
+    NoTerminal,
+    /// A fresh scaffold without `--force`.
+    NotForced,
+}
+
+/// What [`place_managed`] did with one managed file.
+#[derive(Debug)]
+enum Placed {
+    /// The absent file was written.
+    Created,
+    /// The existing file was backed up, then replaced.
+    Replaced(BackupName),
+    /// Nothing was written.
+    Kept(Kept),
+}
+
+/// Why [`place_managed`] wrote nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kept {
+    /// The question was answered no.
+    Declined,
+    /// The policy keeps an existing file.
+    Policy(KeepWhy),
+    /// An entry has the name and was not read: a link, a non-regular file, an
+    /// oversize or non-UTF-8 file, or an unreadable one.
+    Unread(Unread),
+    /// An entry took the name between the read and the create.
+    Appeared,
+    /// The file changed between the read and the replace.
+    Changed,
+    /// Every backup slot is taken.
+    BackupSlotsFull,
 }
 
 // ── template string escaping ─────────────────────────────────────────────────
@@ -788,9 +884,9 @@ fn run_scaffold(
     force: bool,
     kind: ScaffoldKind,
 ) -> Result<(), CliError> {
-    let fresh = is_fresh_target(target_dir)?;
-    if fresh || force {
-        scaffold(target_dir, files, force)?;
+    let root = hold_target(target_dir)?;
+    if is_fresh_target(&root)? || force {
+        scaffold(&root, files, force)?;
         let terminal = Interactive::detect();
         let interactive = should_offer_health_check(terminal.is_some(), force);
         match kind {
@@ -807,7 +903,7 @@ fn run_scaffold(
             let _ = health::run_health_inline();
         }
     } else {
-        reconcile_existing(target_dir, files)?;
+        reconcile_existing(&root, files)?;
     }
     Ok(())
 }
@@ -821,30 +917,23 @@ fn run_scaffold(
 /// shape-independent files.
 fn managed_files(project_name: &str, shape: InitShape, runtime: Runtime) -> Vec<ManagedFile> {
     vec![
-        ManagedFile {
-            rel: PathBuf::from("package.ipe"),
-            content: fill_package(shape.package_ipe(), project_name, runtime),
-        },
-        ManagedFile {
-            rel: PathBuf::from("src").join("Main.ipe"),
-            content: shape.main_ipe().to_owned(),
-        },
-        ManagedFile {
-            rel: PathBuf::from("README.md"),
-            content: README_MD
+        ManagedFile::source(
+            ManagedDir::Root,
+            "package.ipe",
+            fill_package(shape.package_ipe(), project_name, runtime),
+        ),
+        ManagedFile::source(ManagedDir::Src, "Main.ipe", shape.main_ipe().to_owned()),
+        ManagedFile::source(
+            ManagedDir::Root,
+            "README.md",
+            README_MD
                 .replace("{name}", project_name)
                 .replace("{description}", shape.readme_description(runtime))
                 .replace("{run_command}", &shape.next_step_command(runtime))
                 .replace("{run_hint}", shape.open_hint(runtime)),
-        },
-        ManagedFile {
-            rel: PathBuf::from(".gitignore"),
-            content: GITIGNORE.to_owned(),
-        },
-        ManagedFile {
-            rel: PathBuf::from("AGENTS.md"),
-            content: crate::agents_guide::rendered(),
-        },
+        ),
+        ManagedFile::source(ManagedDir::Root, ".gitignore", GITIGNORE.to_owned()),
+        ManagedFile::guide(),
     ]
 }
 
@@ -866,26 +955,11 @@ fn library_files(project_name: &str) -> Vec<ManagedFile> {
             .replace("{module}", &module)
     };
     vec![
-        ManagedFile {
-            rel: PathBuf::from("package.ipe"),
-            content: fill_ipe(PACKAGE_LIB_IPE),
-        },
-        ManagedFile {
-            rel: PathBuf::from("src").join(format!("{module}.ipe")),
-            content: fill_ipe(LIB_IPE),
-        },
-        ManagedFile {
-            rel: PathBuf::from("README.md"),
-            content: fill_markdown(README_LIB_MD),
-        },
-        ManagedFile {
-            rel: PathBuf::from(".gitignore"),
-            content: GITIGNORE.to_owned(),
-        },
-        ManagedFile {
-            rel: PathBuf::from("AGENTS.md"),
-            content: crate::agents_guide::rendered(),
-        },
+        ManagedFile::source(ManagedDir::Root, "package.ipe", fill_ipe(PACKAGE_LIB_IPE)),
+        ManagedFile::source(ManagedDir::Src, format!("{module}.ipe"), fill_ipe(LIB_IPE)),
+        ManagedFile::source(ManagedDir::Root, "README.md", fill_markdown(README_LIB_MD)),
+        ManagedFile::source(ManagedDir::Root, ".gitignore", GITIGNORE.to_owned()),
+        ManagedFile::guide(),
     ]
 }
 
@@ -905,96 +979,205 @@ fn module_name_for(project_name: &str) -> String {
     }
 }
 
-/// Whether the target holds none of `init`'s footprint: no manifest
-/// (`package.ipe` or a legacy `ipe.toml`) and no non-empty `src/`.
-fn is_fresh_target(target_dir: &Path) -> Result<bool, CliError> {
-    if target_dir.join("package.ipe").exists() || target_dir.join("ipe.toml").exists() {
-        return Ok(false);
-    }
-    let src = target_dir.join("src");
-    if src.is_dir() {
-        let mut entries = std::fs::read_dir(&src).map_err(|e| CliError::Io {
-            path: src.clone(),
-            source: e,
-        })?;
-        if entries.next().is_some() {
+/// Create the target directory the user named, then hold it.
+///
+/// # Errors
+/// [`CliError::Io`] when it cannot be created or opened.
+fn hold_target(target_dir: &Path) -> Result<HeldDir, CliError> {
+    std::fs::create_dir_all(target_dir).map_err(|source| CliError::Io {
+        path: target_dir.to_path_buf(),
+        source,
+    })?;
+    HeldDir::open_following(target_dir)?.ok_or_else(|| CliError::Io {
+        path: target_dir.to_path_buf(),
+        source: std::io::ErrorKind::NotFound.into(),
+    })
+}
+
+/// Whether the held target holds none of `init`'s footprint: no entry at a
+/// manifest name (`package.ipe` or a legacy `ipe.toml`, a link included) and
+/// no non-empty `src/`.
+///
+/// # Errors
+/// A `src` that is a link or not a directory, or a failed listing.
+fn is_fresh_target(root: &HeldDir) -> Result<bool, CliError> {
+    for manifest in ["package.ipe", "ipe.toml"] {
+        let name = root.entry(OsStr::new(manifest))?;
+        if root.kind_of(&name)? != EntryKind::Absent {
             return Ok(false);
         }
     }
-    Ok(true)
+    match root.child(OsStr::new(SRC_DIR))? {
+        Some(src) => src.is_empty(),
+        None => Ok(true),
+    }
 }
 
 /// Reconcile an already-populated target against the managed set, one file at
-/// a time. Interactive runs prompt per file; non-interactive runs write only
+/// a time. Interactive runs ask per file; non-interactive runs write only
 /// missing files and report the existing ones left untouched.
-fn reconcile_existing(target_dir: &Path, files: &[ManagedFile]) -> Result<(), CliError> {
+fn reconcile_existing(root: &HeldDir, files: &[ManagedFile]) -> Result<(), CliError> {
     let terminal = Interactive::detect();
-    let interactive = terminal.is_some();
-    let mut restored: Vec<PathBuf> = Vec::new();
-    let mut skipped: Vec<PathBuf> = Vec::new();
-
-    for file in files {
-        let path = target_dir.join(&file.rel);
-        let exists = path.exists();
-        let action = decide_action(&file.rel, exists, terminal.as_ref());
-        match action {
-            FileAction::Write => {
-                if let Some(parent) = path.parent() {
-                    create_dir_all(parent)?;
-                }
-                if exists {
-                    replace_file(&path, &file.content)?;
-                } else {
-                    write_new_file(&path, &file.content)?;
-                }
-                restored.push(file.rel.clone());
-            }
-            FileAction::Skip => skipped.push(file.rel.clone()),
-        }
-    }
-
-    print_reconcile_summary(interactive, &restored, &skipped);
-    Ok(())
-}
-
-/// Decide what to do with one managed file. Missing files default to being
-/// restored; existing ones default to being left alone.
-fn decide_action(rel: &Path, exists: bool, terminal: Option<&Interactive>) -> FileAction {
-    if !exists {
-        let restore =
-            terminal.is_none_or(|tty| tty.ask_yes_no(&format!("Restore {}?", rel.display()), true));
-        return if restore {
-            FileAction::Write
-        } else {
-            FileAction::Skip
-        };
-    }
-    if terminal.is_some_and(|tty| tty.ask_yes_no(&format!("Overwrite {}?", rel.display()), false)) {
-        FileAction::Write
+    let (existing, missing) = terminal.as_ref().map_or(
+        (Existing::Keep(KeepWhy::NoTerminal), Missing::Write),
+        |tty| (Existing::Ask(tty), Missing::Ask(tty)),
+    );
+    let placed = place_all(root, files, existing, missing)?;
+    let body = placed_report(&placed, true);
+    let body = if body.is_empty() {
+        format!("{}\n", text::init_nothing_to_do())
     } else {
-        FileAction::Skip
-    }
-}
-
-/// Report what `reconcile_existing` did.
-fn print_reconcile_summary(interactive: bool, restored: &[PathBuf], skipped: &[PathBuf]) {
-    let mut body = String::new();
-    for rel in restored {
-        let _ = writeln!(body, "restored {}", rel.display());
-    }
-    for rel in skipped {
-        if interactive {
-            let _ = writeln!(body, "kept {} (unchanged)", rel.display());
-        } else {
-            let _ = writeln!(body, "would overwrite {} (skipped: no TTY)", rel.display());
-        }
-    }
-    if body.is_empty() {
-        body.push_str("nothing to do.\n");
-    }
+        body
+    };
     crate::screen::Screen::new(crate::screen::Stream::Stdout)
         .line(crate::screen::Tone::Text, &body)
         .emit();
+    Ok(())
+}
+
+/// Place every managed file under one policy, in order.
+///
+/// `src` is opened, or created, once before any file is placed.
+///
+/// # Errors
+/// A `src` that is a link or not a directory stops the run before any write;
+/// otherwise as [`place_managed`].
+fn place_all<'f>(
+    root: &HeldDir,
+    files: &'f [ManagedFile],
+    existing: Existing<'_>,
+    missing: Missing<'_>,
+) -> Result<Vec<(&'f ManagedFile, Placed)>, CliError> {
+    let (src, _) = root.create_child(OsStr::new(SRC_DIR))?;
+    files
+        .iter()
+        .map(|file| {
+            let dir = match file.dir {
+                ManagedDir::Root => root,
+                ManagedDir::Src => &src,
+            };
+            place_managed(dir, file, existing, missing).map(|placed| (file, placed))
+        })
+        .collect()
+}
+
+/// Write the file's content to the staged file and sync it.
+fn fill_with(file: &mut std::fs::File, content: &str) -> std::io::Result<()> {
+    file.write_all(content.as_bytes())?;
+    file.sync_all()
+}
+
+/// Place one managed file in the held `dir` under the given policy.
+///
+/// The existing entry is read once, never through a link, under the file's
+/// cap; an entry that cannot be read is kept, never asked about and never
+/// written. A replace backs up and replaces only the entry that was read,
+/// still holding the bytes read, so the file a question names is the file
+/// written.
+///
+/// # Errors
+/// [`CliError::Io`] or [`CliError::OutputRefused`] when the create or the
+/// replace fails.
+fn place_managed(
+    dir: &HeldDir,
+    file: &ManagedFile,
+    existing: Existing<'_>,
+    missing: Missing<'_>,
+) -> Result<Placed, CliError> {
+    let name = dir.entry(OsStr::new(&file.name))?;
+    match dir.read_file_capped_identified(&name, file.cap) {
+        Err(err) => match read_miss(&err) {
+            ReadMiss::Unread(unread) => Ok(Placed::Kept(Kept::Unread(unread))),
+            ReadMiss::Absent => {
+                let write = match missing {
+                    Missing::Write => true,
+                    Missing::Ask(tty) => tty.ask_yes_no(
+                        text::msg::init_restore_ask(&file.rel().display()).as_str(),
+                        true,
+                    ),
+                };
+                if write {
+                    create_managed(dir, file)
+                } else {
+                    Ok(Placed::Kept(Kept::Declined))
+                }
+            }
+        },
+        Ok((bytes, id)) => {
+            let replace = match existing {
+                Existing::Force => true,
+                Existing::Keep(why) => return Ok(Placed::Kept(Kept::Policy(why))),
+                Existing::Ask(tty) => tty.ask_yes_no(
+                    text::msg::init_overwrite_ask(&file.rel().display()).as_str(),
+                    false,
+                ),
+            };
+            if !replace {
+                return Ok(Placed::Kept(Kept::Declined));
+            }
+            let fill = |staged: &mut std::fs::File| fill_with(staged, &file.content);
+            match dir.replace_backed_up(name.as_os_str(), id, &bytes, file.cap, fill)? {
+                BackedUp::Done(backup) => Ok(Placed::Replaced(backup)),
+                BackedUp::Changed => Ok(Placed::Kept(Kept::Changed)),
+                BackedUp::BackupSlotsFull => Ok(Placed::Kept(Kept::BackupSlotsFull)),
+            }
+        }
+    }
+}
+
+/// Create an absent managed file; an entry that took its name first is kept.
+///
+/// # Errors
+/// [`CliError::Io`] or [`CliError::OutputRefused`] when the create fails.
+fn create_managed(dir: &HeldDir, file: &ManagedFile) -> Result<Placed, CliError> {
+    let fill = |staged: &mut std::fs::File| fill_with(staged, &file.content);
+    match dir.create_if_absent(OsStr::new(&file.name), fill)? {
+        Created::Done => Ok(Placed::Created),
+        Created::Exists => Ok(Placed::Kept(Kept::Appeared)),
+    }
+}
+
+/// The report line for one placed file, or none for a silent creation.
+fn placed_line(
+    file: &ManagedFile,
+    placed: &Placed,
+    announce_created: bool,
+) -> Option<text::Message> {
+    let rel = file.rel();
+    let shown = rel.display();
+    let beside = |entry: &dyn std::fmt::Display| {
+        rel.parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(entry.to_string())
+    };
+    Some(match placed {
+        Placed::Created if announce_created => text::msg::init_restored(&shown),
+        Placed::Created => return None,
+        Placed::Replaced(backup) => text::msg::init_backed_up(&shown, &beside(backup).display()),
+        Placed::Kept(Kept::Declined | Kept::Policy(KeepWhy::NotForced)) => {
+            text::msg::init_kept_unchanged(&shown)
+        }
+        Placed::Kept(Kept::Policy(KeepWhy::NoTerminal)) => text::msg::init_kept_no_tty(&shown),
+        Placed::Kept(Kept::Unread(unread)) => {
+            text::msg::init_kept_unread(&shown, &unread.phrase(file.cap))
+        }
+        Placed::Kept(Kept::Appeared) => text::msg::init_kept_appeared(&shown),
+        Placed::Kept(Kept::Changed) => text::msg::init_kept_changed(&shown),
+        Placed::Kept(Kept::BackupSlotsFull) => {
+            text::msg::init_kept_backups_full(&shown, &beside(&crate::driver::BACKUP_DIR).display())
+        }
+    })
+}
+
+/// The report for a placement run, one line per reported file.
+fn placed_report(placed: &[(&ManagedFile, Placed)], announce_created: bool) -> String {
+    let mut body = String::new();
+    for (file, outcome) in placed {
+        if let Some(line) = placed_line(file, outcome, announce_created) {
+            let _ = writeln!(body, "{}", line.as_str());
+        }
+    }
+    body
 }
 
 /// Derive the project name from the last path component of the resolved target.
@@ -1020,67 +1203,19 @@ fn project_name_for(target_dir: &Path) -> Result<String, CliError> {
 ///
 /// A file that already exists is never silently replaced: without `--force` it
 /// is kept as it is (a fresh target can still hold, say, a README), and with
-/// `--force` the original is backed up before it is overwritten.
-fn scaffold(target_dir: &Path, files: &[ManagedFile], force: bool) -> Result<(), CliError> {
-    let mut kept: Vec<&Path> = Vec::new();
-    for file in files {
-        let path = target_dir.join(&file.rel);
-        if let Some(parent) = path.parent() {
-            create_dir_all(parent)?;
-        }
-        if !path.exists() {
-            write_new_file(&path, &file.content)?;
-        } else if force {
-            replace_file(&path, &file.content)?;
-        } else {
-            kept.push(&file.rel);
-        }
-    }
-    if !kept.is_empty() {
-        let mut body = String::new();
-        for rel in kept {
-            let _ = writeln!(body, "kept {} (unchanged)", rel.display());
-        }
+/// `--force` the original is backed up before it is replaced.
+fn scaffold(root: &HeldDir, files: &[ManagedFile], force: bool) -> Result<(), CliError> {
+    let existing = if force {
+        Existing::Force
+    } else {
+        Existing::Keep(KeepWhy::NotForced)
+    };
+    let placed = place_all(root, files, existing, Missing::Write)?;
+    let body = placed_report(&placed, false);
+    if !body.is_empty() {
         crate::screen::Screen::new(crate::screen::Stream::Stdout)
             .line(crate::screen::Tone::Text, &body)
             .emit();
-    }
-    Ok(())
-}
-
-fn create_dir_all(path: &Path) -> Result<(), CliError> {
-    std::fs::create_dir_all(path).map_err(|e| CliError::Io {
-        path: path.to_path_buf(),
-        source: e,
-    })
-}
-
-/// Create a file that must not exist yet (`create_new`).
-///
-/// A file or symlink that appeared at `path` is never overwritten or written
-/// through.
-fn write_new_file(path: &Path, contents: &str) -> Result<(), CliError> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .and_then(|mut file| file.write_all(contents.as_bytes()))
-        .map_err(|e| CliError::Io {
-            path: path.to_path_buf(),
-            source: e,
-        })
-}
-
-/// Overwrite an existing user file the user asked to replace.
-///
-/// Its original is backed up first, and the replacement is atomic.
-fn replace_file(path: &Path, contents: &str) -> Result<(), CliError> {
-    if let Some(backup) = crate::rewrite_user_file(path, contents, crate::RewriteKind::Lossy)? {
-        crate::screen::chatter(
-            crate::screen::Stream::Stdout,
-            crate::screen::Tone::Text,
-            &format!("backed up {} to {}", path.display(), backup.display()),
-        );
     }
     Ok(())
 }
@@ -1090,16 +1225,14 @@ const fn should_offer_health_check(is_tty: bool, force: bool) -> bool {
     is_tty && !force
 }
 
-/// Print the friendly next-steps message, tuned to the resolved shape (and, for
-/// `web`, its runtime) so the hint matches how the scaffolded app actually runs
-/// (spec § 0.1).
-fn print_next_steps(
+/// The next-steps message for a freshly scaffolded application.
+fn next_steps_body(
     target_arg: &str,
     project_name: &str,
     interactive: bool,
     shape: InitShape,
     runtime: Runtime,
-) {
+) -> String {
     let command = shape.next_step_command(runtime);
     let run_cmd = if target_arg == "." {
         format!("    {command}")
@@ -1109,18 +1242,39 @@ fn print_next_steps(
     let health_tip = if interactive {
         String::new()
     } else {
-        "\nTip: run  ipe health  to tune your toolchain for faster builds.\n".to_owned()
+        "\nTip: run  ipe health  to tune your toolchain for faster builds.".to_owned()
     };
     let open_hint = shape.open_hint(runtime);
-    let body = format!(
+    let guide = guide_pointer();
+    let guide = guide.as_str();
+    format!(
         "Created Ipê project `{project_name}`.\n\
          \n\
          Next steps:\n\
          {run_cmd}\n\
          \n\
          {open_hint}\
-         {health_tip}"
-    );
+         {health_tip}\n\
+         \n\
+         {guide}\n"
+    )
+}
+
+/// The line pointing coding agents at the authoring guide.
+fn guide_pointer() -> text::Message {
+    text::msg::init_guide_pointer(&crate::agents_guide::GUIDE_TERM)
+}
+
+/// Print the friendly next-steps message, tuned to the resolved shape (and, for
+/// `web`, its runtime) so the hint matches how the scaffolded app actually runs.
+fn print_next_steps(
+    target_arg: &str,
+    project_name: &str,
+    interactive: bool,
+    shape: InitShape,
+    runtime: Runtime,
+) {
+    let body = next_steps_body(target_arg, project_name, interactive, shape, runtime);
     crate::screen::Screen::new(crate::screen::Stream::Stdout)
         .line(crate::screen::Tone::Text, &body)
         .emit();
@@ -1128,22 +1282,30 @@ fn print_next_steps(
 
 /// Print the next-steps message for a freshly scaffolded library.
 fn print_next_steps_lib(target_arg: &str, project_name: &str) {
+    let body = next_steps_lib_body(target_arg, project_name);
+    crate::screen::Screen::new(crate::screen::Stream::Stdout)
+        .line(crate::screen::Tone::Text, &body)
+        .emit();
+}
+
+/// The next-steps message for a freshly scaffolded library.
+fn next_steps_lib_body(target_arg: &str, project_name: &str) -> String {
     let build_cmd = if target_arg == "." {
         "    ipe dev build".to_owned()
     } else {
         format!("    cd {target_arg} && ipe dev build")
     };
-    let body = format!(
+    format!(
         "Created Ipê library `{project_name}`.\n\
          \n\
          Next steps:\n\
          {build_cmd}\n\
          \n\
-         Add public modules under src/ and list each in package.ipe's exposedModules.\n"
-    );
-    crate::screen::Screen::new(crate::screen::Stream::Stdout)
-        .line(crate::screen::Tone::Text, &body)
-        .emit();
+         Add public modules under src/ and list each in package.ipe's exposedModules.\n\
+         \n\
+         {guide}\n",
+        guide = guide_pointer().as_str()
+    )
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -1184,7 +1346,7 @@ mod tests {
 
     /// Whether `file` is one `ipe fmt` reads.
     fn is_ipe(file: &ManagedFile) -> bool {
-        file.rel.extension().is_some_and(|ext| ext == "ipe")
+        file.rel().extension().is_some_and(|ext| ext == "ipe")
     }
 
     /// Each `.ipe` file among `files` that is not its own formatted form, labelled
@@ -1194,7 +1356,8 @@ mod tests {
             .iter()
             .filter(|file| is_ipe(file))
             .filter_map(|file| {
-                let rel = file.rel.display();
+                let rel = file.rel();
+                let rel = rel.display();
                 match crate::fmt::format_source(&file.content) {
                     Ok(formatted) if formatted == file.content => None,
                     Ok(formatted) => Some(format!(
@@ -1210,14 +1373,14 @@ mod tests {
     ///
     /// This keeps the fixed-point check from passing over a set it never read.
     fn assert_two_ipe_files(context: &str, files: &[ManagedFile]) {
-        let ipe: Vec<&Path> = files
+        let ipe: Vec<PathBuf> = files
             .iter()
             .filter(|file| is_ipe(file))
-            .map(|file| file.rel.as_path())
+            .map(ManagedFile::rel)
             .collect();
         assert!(
             matches!(ipe.as_slice(), [manifest, module]
-                if *manifest == Path::new("package.ipe") && module.starts_with("src")),
+                if manifest == Path::new("package.ipe") && module.starts_with("src")),
             "{context}: expected package.ipe and one src module, got {ipe:?}"
         );
     }
@@ -1248,19 +1411,21 @@ mod tests {
 
     #[test]
     fn an_unformatted_scaffold_file_is_reported() {
-        let files = [ManagedFile {
-            rel: Path::new("src").join("Main.ipe"),
-            content: "module Main exposing (main)\n\nimport Ipe.Task as Task\nimport Ipe.Io as Io\n\n\nmain : Task Error ()\nmain =\n    Io.println \"Hello, world!\"\n".to_owned(),
-        }];
+        let files = [ManagedFile::source(
+            ManagedDir::Src,
+            "Main.ipe",
+            "module Main exposing (main)\n\nimport Ipe.Task as Task\nimport Ipe.Io as Io\n\n\nmain : Task Error ()\nmain =\n    Io.println \"Hello, world!\"\n".to_owned(),
+        )];
         assert_eq!(unformatted("refusal", &files).len(), 1);
     }
 
     #[test]
     fn a_scaffold_file_fmt_refuses_is_reported() {
-        let files = [ManagedFile {
-            rel: PathBuf::from("package.ipe"),
-            content: "module Package exposing (package)\n\npackage =\n    {\n".to_owned(),
-        }];
+        let files = [ManagedFile::source(
+            ManagedDir::Root,
+            "package.ipe",
+            "module Package exposing (package)\n\npackage =\n    {\n".to_owned(),
+        )];
         assert_eq!(unformatted("refusal", &files).len(), 1);
     }
 
@@ -1269,7 +1434,7 @@ mod tests {
         let files = managed_files("demo-app", InitShape::Web, Runtime::Served);
         let manifest = files
             .iter()
-            .find(|f| f.rel == Path::new("package.ipe"))
+            .find(|f| f.rel() == Path::new("package.ipe"))
             .expect("init writes a package.ipe");
 
         let root = ipe_test_temp::temp_root().join("ipe_init_web_roundtrip");
@@ -1294,7 +1459,7 @@ mod tests {
         let files = managed_files("client-app", InitShape::Web, Runtime::Client);
         let manifest = files
             .iter()
-            .find(|f| f.rel == Path::new("package.ipe"))
+            .find(|f| f.rel() == Path::new("package.ipe"))
             .expect("init writes a package.ipe");
 
         let root = ipe_test_temp::temp_root().join("ipe_init_client_ships");
@@ -1327,7 +1492,7 @@ mod tests {
             let files = managed_files("admitted-app", InitShape::Web, runtime);
             let manifest = files
                 .iter()
-                .find(|f| f.rel == Path::new("package.ipe"))
+                .find(|f| f.rel() == Path::new("package.ipe"))
                 .expect("init writes a package.ipe");
             let root = ipe_test_temp::temp_root().join(&label);
             let _ = std::fs::remove_dir_all(&root);
@@ -1383,7 +1548,7 @@ mod tests {
         let files = managed_files("swept-app", shape, runtime);
         let main = files
             .iter()
-            .find(|f| f.rel == Path::new("src").join("Main.ipe"))
+            .find(|f| f.rel() == Path::new("src").join("Main.ipe"))
             .expect("init writes a src/Main.ipe");
         let mut interner = ipe_intern::Interner::new();
         let module =
@@ -1402,7 +1567,7 @@ mod tests {
         let files = managed_files("swept-app", shape, runtime);
         let manifest = files
             .iter()
-            .find(|f| f.rel == Path::new("package.ipe"))
+            .find(|f| f.rel() == Path::new("package.ipe"))
             .expect("init writes a package.ipe");
         let root = ipe_test_temp::temp_root().join(format!(
             "ipe_init_{tag}_{}_{}",
@@ -1498,7 +1663,7 @@ mod tests {
 
                 let readme = managed_files("swept-app", shape, runtime)
                     .into_iter()
-                    .find(|f| f.rel == Path::new("README.md"))
+                    .find(|f| f.rel() == Path::new("README.md"))
                     .expect("init writes a README.md");
                 assert!(
                     readme.content.contains(&format!("\n{command}\n")),
@@ -1515,7 +1680,7 @@ mod tests {
         let files = managed_files("served-app", InitShape::Web, Runtime::Served);
         let manifest = files
             .iter()
-            .find(|f| f.rel == Path::new("package.ipe"))
+            .find(|f| f.rel() == Path::new("package.ipe"))
             .expect("init writes a package.ipe");
         assert!(
             !manifest.content.contains("ships"),
@@ -1550,7 +1715,7 @@ mod tests {
             let files = managed_files("proj", shape, Runtime::Client);
             let manifest = files
                 .iter()
-                .find(|f| f.rel == Path::new("package.ipe"))
+                .find(|f| f.rel() == Path::new("package.ipe"))
                 .expect("package.ipe present");
             assert!(
                 !manifest.content.contains("{ships}"),
@@ -1570,7 +1735,7 @@ mod tests {
         let files = managed_files("tui-app", InitShape::Tui, Runtime::Served);
         let manifest = files
             .iter()
-            .find(|f| f.rel == Path::new("package.ipe"))
+            .find(|f| f.rel() == Path::new("package.ipe"))
             .expect("init writes a package.ipe");
 
         let root = ipe_test_temp::temp_root().join("ipe_init_tui_roundtrip");
@@ -1590,7 +1755,7 @@ mod tests {
         let files = managed_files("my-script", InitShape::Script, Runtime::Served);
         let manifest = files
             .iter()
-            .find(|f| f.rel == Path::new("package.ipe"))
+            .find(|f| f.rel() == Path::new("package.ipe"))
             .expect("init writes a package.ipe");
 
         let root = ipe_test_temp::temp_root().join("ipe_init_script_roundtrip");
@@ -1610,7 +1775,7 @@ mod tests {
         let files = managed_files("tick-worker", InitShape::Worker, Runtime::Served);
         let manifest = files
             .iter()
-            .find(|f| f.rel == Path::new("package.ipe"))
+            .find(|f| f.rel() == Path::new("package.ipe"))
             .expect("init writes a package.ipe");
 
         let root = ipe_test_temp::temp_root().join("ipe_init_worker_roundtrip");
@@ -1637,7 +1802,7 @@ mod tests {
         let main = |files: &[ManagedFile]| {
             files
                 .iter()
-                .find(|f| f.rel == Path::new("src/Main.ipe"))
+                .find(|f| f.rel() == Path::new("src/Main.ipe"))
                 .map(|f| f.content.clone())
                 .expect("a Main.ipe is scaffolded")
         };
@@ -2004,7 +2169,7 @@ mod tests {
         let files = managed_files("proj", InitShape::Web, Runtime::Served);
         let manifest = files
             .iter()
-            .find(|f| f.rel == Path::new("package.ipe"))
+            .find(|f| f.rel() == Path::new("package.ipe"))
             .expect("package.ipe present");
 
         let root = ipe_test_temp::temp_root().join("ipe_init_delivery_defaults");
@@ -2036,19 +2201,19 @@ mod tests {
         let files = library_files("my-cool-lib");
         let manifest = files
             .iter()
-            .find(|f| f.rel == Path::new("package.ipe"))
+            .find(|f| f.rel() == Path::new("package.ipe"))
             .expect("init --lib writes a package.ipe");
 
         assert!(
             files
                 .iter()
-                .any(|f| f.rel == Path::new("src").join("MyCoolLib.ipe")),
+                .any(|f| f.rel() == Path::new("src").join("MyCoolLib.ipe")),
             "the public module src/MyCoolLib.ipe is scaffolded"
         );
         assert!(
             !files
                 .iter()
-                .any(|f| f.rel == Path::new("src").join("Main.ipe")),
+                .any(|f| f.rel() == Path::new("src").join("Main.ipe")),
             "a library does not scaffold a runnable src/Main.ipe"
         );
 
@@ -2084,7 +2249,7 @@ mod tests {
     fn managed_set_omits_legacy_ipe_toml() {
         let files = managed_files("x", InitShape::default(), Runtime::Served);
         assert!(
-            !files.iter().any(|f| f.rel == Path::new("ipe.toml")),
+            !files.iter().any(|f| f.rel() == Path::new("ipe.toml")),
             "init must not scaffold a legacy ipe.toml"
         );
     }
@@ -2134,7 +2299,7 @@ mod tests {
         let files = managed_files(hostile, InitShape::Web, Runtime::Served);
         let manifest = files
             .iter()
-            .find(|f| f.rel == Path::new("package.ipe"))
+            .find(|f| f.rel() == Path::new("package.ipe"))
             .expect("init writes a package.ipe");
 
         let root = ipe_test_temp::temp_root().join("ipe_init_hostile_name_roundtrip");
@@ -2166,7 +2331,7 @@ mod tests {
             let files = managed_files(name, InitShape::Web, Runtime::Served);
             let manifest = files
                 .iter()
-                .find(|f| f.rel == Path::new("package.ipe"))
+                .find(|f| f.rel() == Path::new("package.ipe"))
                 .expect("init writes a package.ipe");
 
             let root =
@@ -2272,5 +2437,347 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── held writes ──────────────────────────────────────────────────────────
+
+    /// The marker opening this file's test module; the source before it is production.
+    const TESTS_MARKER: &str = "#[cfg(test)]\nmod tests {";
+
+    /// Every `fs` path production may name, with its count: the one target
+    /// creation, and the staged-file type the held writer hands to a fill.
+    const ADMITTED_FS: [(&str, usize); 2] = [
+        ("std::fs::create_dir_all(target_dir)", 1),
+        ("std::fs::File", 3),
+    ];
+
+    /// Path-based writes, reads and probes production may not name: the crate's
+    /// by-path writers and every `Path` method that touches the filesystem.
+    const PATH_BASED: [&str; 16] = [
+        "rewrite_user_file",
+        "backup_user_file",
+        "write_atomic",
+        "OpenOptions",
+        "std::fs::write",
+        "File::create",
+        "std::fs::read_dir",
+        ".exists()",
+        ".is_dir()",
+        ".try_exists(",
+        ".is_file(",
+        ".is_symlink(",
+        ".metadata(",
+        ".symlink_metadata(",
+        ".read_link(",
+        ".canonicalize(",
+    ];
+
+    /// How many times `word` occurs in `text` as a whole identifier.
+    fn word_count(text: &str, word: &str) -> usize {
+        let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+        text.match_indices(word)
+            .filter(|(at, _)| {
+                let before = text.get(..*at).and_then(|head| head.chars().next_back());
+                let after = text
+                    .get(at.saturating_add(word.len())..)
+                    .and_then(|tail| tail.chars().next());
+                !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+            })
+            .count()
+    }
+
+    /// What in `source`'s production part reaches the filesystem by path.
+    fn path_based_sites(source: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        let marked: Vec<_> = source.match_indices(TESTS_MARKER).collect();
+        let [(at, _)] = marked.as_slice() else {
+            found.push(format!("the test marker occurs {} times", marked.len()));
+            return found;
+        };
+        let production = source.get(..*at).unwrap_or_default();
+        let mut admitted = 0_usize;
+        for (site, want) in ADMITTED_FS {
+            let count = production.matches(site).count();
+            admitted = admitted.saturating_add(count);
+            if count != want {
+                found.push(format!("{count} `{site}` sites, {want} admitted"));
+            }
+        }
+        let named = word_count(production, "fs");
+        if named != admitted {
+            found.push(format!("{named} `fs` paths, {admitted} admitted"));
+        }
+        for needle in PATH_BASED {
+            let count = production.matches(needle).count();
+            if count != 0 {
+                found.push(format!("{count} `{needle}` sites"));
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn init_writes_only_through_held_dir() {
+        let source = include_str!("init.rs");
+        assert_eq!(path_based_sites(source), Vec::<String>::new());
+        let plant = |line: &str| {
+            path_based_sites(&source.replacen(TESTS_MARKER, &format!("{line}\n{TESTS_MARKER}"), 1))
+        };
+        let planted = plant("fn planted() { let _ = std::fs::OpenOptions::new(); }");
+        assert!(
+            planted.contains(&"1 `OpenOptions` sites".to_owned()),
+            "{planted:?}"
+        );
+        for evasion in [
+            "use std::fs as disk;",
+            "fn planted() { let _ = std::fs::metadata(\"x\"); }",
+            "fn planted() { let _ = Path::new(\"x\").try_exists(); }",
+            "fn planted() { let _ = std::fs::File::options(); }",
+        ] {
+            assert!(!plant(evasion).is_empty(), "{evasion} goes unnoticed");
+        }
+    }
+
+    /// A fresh scratch directory for one test.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = ipe_test_temp::temp_root()
+            .join(format!("ipe_init_managed_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("make scratch");
+        dir
+    }
+
+    /// `dir`, held.
+    fn held(dir: &Path) -> HeldDir {
+        HeldDir::open_following(dir)
+            .expect("open scratch")
+            .expect("scratch exists")
+    }
+
+    /// The names in `dir`, sorted; an absent directory lists nothing.
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// A managed root file `name` holding `content`.
+    fn root_file(name: &str, content: &str) -> ManagedFile {
+        ManagedFile::source(ManagedDir::Root, name, content.to_owned())
+    }
+
+    /// Every placement policy; the asking ones only when a terminal is attached.
+    fn every_policy(tty: Option<&Interactive>) -> Vec<(Existing<'_>, Missing<'_>)> {
+        let mut policies = vec![
+            (Existing::Force, Missing::Write),
+            (Existing::Keep(KeepWhy::NoTerminal), Missing::Write),
+            (Existing::Keep(KeepWhy::NotForced), Missing::Write),
+        ];
+        if let Some(tty) = tty {
+            policies.push((Existing::Ask(tty), Missing::Ask(tty)));
+        }
+        policies
+    }
+
+    /// A managed name that is a link, live or dangling, is kept unread under every policy.
+    #[cfg(unix)]
+    #[test]
+    fn managed_write_linked_file_kept_under_every_policy() {
+        let base = scratch("linked_file");
+        let outside = scratch("linked_file_outside");
+        std::fs::write(outside.join("victim"), "outside").expect("plant outside file");
+        std::os::unix::fs::symlink(outside.join("victim"), base.join("README.md"))
+            .expect("plant live link");
+        std::os::unix::fs::symlink(outside.join("absent"), base.join(".gitignore"))
+            .expect("plant dangling link");
+        let dir = held(&base);
+        let tty = Interactive::detect();
+        for (existing, missing) in every_policy(tty.as_ref()) {
+            for name in ["README.md", ".gitignore"] {
+                let placed = place_managed(&dir, &root_file(name, "new"), existing, missing);
+                assert!(
+                    matches!(placed, Ok(Placed::Kept(Kept::Unread(Unread::Link)))),
+                    "{name}: {placed:?}"
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(outside.join("victim"))
+                .ok()
+                .as_deref(),
+            Some("outside")
+        );
+        assert_eq!(names_in(&outside), vec!["victim".to_owned()]);
+        assert_eq!(
+            names_in(&base),
+            vec![".gitignore".to_owned(), "README.md".to_owned()]
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// A linked `src` stops the run before any write; nothing lands outside.
+    #[cfg(unix)]
+    #[test]
+    fn managed_write_linked_src_refused() {
+        let base = scratch("linked_src");
+        let outside = scratch("linked_src_outside");
+        std::os::unix::fs::symlink(&outside, base.join(SRC_DIR)).expect("plant src link");
+        let root = held(&base);
+        let fresh = is_fresh_target(&root);
+        assert!(
+            matches!(&fresh, Err(CliError::OutputRefused(crate::output_dir::OutputRefusal::Symlink(path))) if path.ends_with(SRC_DIR)),
+            "{fresh:?}"
+        );
+        let files = managed_files("demo", InitShape::Cli, Runtime::Served);
+        let placed = place_all(&root, &files, Existing::Force, Missing::Write);
+        assert!(
+            matches!(&placed, Err(CliError::OutputRefused(crate::output_dir::OutputRefusal::Symlink(path))) if path.ends_with(SRC_DIR)),
+            "{:?}",
+            placed.as_ref().map(Vec::len)
+        );
+        assert!(names_in(&outside).is_empty(), "nothing lands outside");
+        assert_eq!(names_in(&base), vec![SRC_DIR.to_owned()]);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// A FIFO at a managed name is kept unread, without blocking on it.
+    #[cfg(unix)]
+    #[test]
+    fn managed_write_fifo_kept_without_blocking() {
+        let base = scratch("fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(base.join("README.md"))
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo creates the fixture");
+        let (sent, received) = std::sync::mpsc::channel();
+        let at = base.clone();
+        std::thread::Builder::new()
+            .spawn(move || {
+                let placed = place_managed(
+                    &held(&at),
+                    &root_file("README.md", "new"),
+                    Existing::Force,
+                    Missing::Write,
+                );
+                let _ = sent.send(matches!(
+                    placed,
+                    Ok(Placed::Kept(Kept::Unread(Unread::NotRegular)))
+                ));
+            })
+            .expect("spawn the worker");
+        let kept = received.recv_timeout(std::time::Duration::from_secs(5));
+        assert_eq!(kept, Ok(true), "kept unread within the timeout");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A forced placement backs the file up beside it, a fresh slot each time.
+    #[test]
+    fn managed_write_force_backs_up_then_replaces() {
+        let base = scratch("force_backup");
+        std::fs::write(base.join("README.md"), "old").expect("plant README");
+        let dir = held(&base);
+        let backups = base.join(crate::driver::BACKUP_DIR);
+        let file = root_file("README.md", "new");
+        let placed = place_managed(&dir, &file, Existing::Force, Missing::Write);
+        assert!(
+            matches!(&placed, Ok(Placed::Replaced(backup)) if backup.slot().as_os_str() == "README.md.bak"),
+            "{placed:?}"
+        );
+        let Ok(placed) = placed else {
+            return;
+        };
+        assert_eq!(
+            placed_line(&file, &placed, false).map(|line| line.as_str().to_owned()),
+            Some("backed up README.md to .ipe-backup/README.md.bak".to_owned())
+        );
+        assert_eq!(
+            std::fs::read_to_string(backups.join("README.md.bak"))
+                .ok()
+                .as_deref(),
+            Some("old")
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("README.md"))
+                .ok()
+                .as_deref(),
+            Some("new")
+        );
+        let again = place_managed(
+            &dir,
+            &root_file("README.md", "newer"),
+            Existing::Force,
+            Missing::Write,
+        );
+        assert!(
+            matches!(&again, Ok(Placed::Replaced(backup)) if backup.slot().as_os_str() == "README.md.bak.1"),
+            "{again:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(backups.join("README.md.bak.1"))
+                .ok()
+                .as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("README.md"))
+                .ok()
+                .as_deref(),
+            Some("newer")
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An entry that takes the name before the create is kept, its bytes untouched.
+    #[test]
+    fn managed_write_appeared_is_kept() {
+        let base = scratch("appeared");
+        let dir = held(&base);
+        let file = root_file("README.md", "new");
+        std::fs::write(base.join("README.md"), "theirs").expect("plant the racing file");
+        let placed = create_managed(&dir, &file);
+        assert!(
+            matches!(placed, Ok(Placed::Kept(Kept::Appeared))),
+            "{placed:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("README.md"))
+                .ok()
+                .as_deref(),
+            Some("theirs")
+        );
+        let missing = place_managed(
+            &dir,
+            &root_file("LICENSE", "new"),
+            Existing::Force,
+            Missing::Write,
+        );
+        assert!(matches!(missing, Ok(Placed::Created)), "{missing:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Both next-steps messages point coding agents at the guide term.
+    #[test]
+    fn init_next_steps_name_guide_term() {
+        let pointer = format!("ipe doc {}", crate::agents_guide::GUIDE_TERM);
+        for shape in InitShape::ALL {
+            for runtime in Runtime::ALL {
+                for interactive in [false, true] {
+                    let body = next_steps_body("app", "demo", interactive, shape, runtime);
+                    assert!(body.contains(&pointer), "{shape:?}/{runtime:?}: {body}");
+                }
+            }
+        }
+        let body = next_steps_lib_body(".", "demo");
+        assert!(body.contains(&pointer), "lib: {body}");
     }
 }

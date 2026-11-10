@@ -2100,6 +2100,54 @@ ipe init: unknown runtime `{word}` — expected 1-2, or `{runtime}` (press Enter
 
 init: cannot derive a project name from target {target}
 
+## init-restore-ask
+
+Restore {file}?
+
+## init-overwrite-ask
+
+Overwrite {file}?
+
+## init-restored
+
+restored {file}
+
+## init-backed-up
+
+backed up {file} to {backup}
+
+## init-kept-unchanged
+
+kept {file} (unchanged)
+
+## init-kept-no-tty
+
+would overwrite {file} (skipped: no TTY)
+
+## init-kept-unread
+
+kept {file} (not read: {reason})
+
+## init-kept-appeared
+
+kept {file} (appeared while ipe was writing it)
+
+## init-kept-changed
+
+kept {file} (changed while ipe was writing it)
+
+## init-kept-backups-full
+
+kept {file} (no free backup name in {dir}/)
+
+## init-nothing-to-do
+
+nothing to do.
+
+## init-guide-pointer
+
+Coding agents: run  ipe doc {term}  for the authoring guide.
+
 # ipe login
 
 ## login-verification-url-refused

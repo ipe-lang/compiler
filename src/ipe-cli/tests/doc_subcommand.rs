@@ -1003,3 +1003,14 @@ fn doc_math_header_names_to_float() -> io::Result<()> {
     );
     Ok(())
 }
+
+/// The doc help names the term that opens the coding-agent guide.
+#[test]
+fn help_doc_names_guide_term() {
+    let (ok, stdout, stderr) = run(&["doc", "--help"]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains(ipe::agents_guide::GUIDE_TERM),
+        "stdout: {stdout}"
+    );
+}

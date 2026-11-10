@@ -1622,6 +1622,30 @@ messages! {
     init_unknown_runtime_choice(word, runtime) = "init-unknown-runtime-choice";
     /// `ipe init` could not derive a project name.
     init_no_project_name(target) = "init-no-project-name";
+    /// `ipe init`'s question before restoring a missing managed file.
+    init_restore_ask(file) = "init-restore-ask";
+    /// `ipe init`'s question before replacing an existing managed file.
+    init_overwrite_ask(file) = "init-overwrite-ask";
+    /// `ipe init` wrote a missing managed file.
+    init_restored(file) = "init-restored";
+    /// `ipe init` backed up a managed file, then replaced it.
+    init_backed_up(file, backup) = "init-backed-up";
+    /// `ipe init` kept an existing managed file as asked.
+    init_kept_unchanged(file) = "init-kept-unchanged";
+    /// `ipe init` kept an existing managed file with no terminal to ask on.
+    init_kept_no_tty(file) = "init-kept-no-tty";
+    /// `ipe init` kept a managed name it did not read.
+    init_kept_unread(file, reason) = "init-kept-unread";
+    /// `ipe init` kept a managed file created while it was writing it.
+    init_kept_appeared(file) = "init-kept-appeared";
+    /// `ipe init` kept a managed file changed while it was replacing it.
+    init_kept_changed(file) = "init-kept-changed";
+    /// `ipe init` kept a managed file with every backup slot taken.
+    init_kept_backups_full(file, dir) = "init-kept-backups-full";
+    /// `ipe init` found every managed file in place.
+    init_nothing_to_do = "init-nothing-to-do";
+    /// `ipe init`'s pointer to the coding-agent authoring guide.
+    init_guide_pointer(term) = "init-guide-pointer";
     /// GitHub returned a verification URL off `https://github.com`.
     login_verification_url_refused = "login-verification-url-refused";
     /// The device code expired before approval.
