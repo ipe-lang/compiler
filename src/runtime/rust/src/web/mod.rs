@@ -4492,8 +4492,8 @@ where
 {
     Box::new(move |base: crate::encoding::MountBase| {
         Box::pin(async move {
-            // A mount has no task-error channel (it yields a `Router`, not an
-            // `IpeTask`), so an unhonourable store config fails closed as a
+            // A mount has no task-error channel (it yields a served router, not
+            // an `IpeTask`), so an unhonourable store config fails closed as a
             // router that answers every path with the fixed 503 body (the
             // operator detail goes to the runtime log) — never a silent downgrade to a different backend and never a mount
             // that quietly serves real sessions on the wrong store.
@@ -4535,7 +4535,10 @@ where
             // `serve_web` task's result), so `build_web_router` carries no `E`.
             build_web_router::<Model, Msg, FInit, FUpdate, FView, FSubs>(state, false)
                 .unwrap_or_else(|cause| fail_closed_router(&cause))
-        }) as std::pin::Pin<Box<dyn std::future::Future<Output = axum::Router> + Send>>
+        })
+            as std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::server::ServedRouter> + Send>,
+            >
     })
 }
 
@@ -4654,7 +4657,10 @@ where
             };
             build_web_router::<Model, Msg, FInit, FUpdate, FView, FSubs>(state, false)
                 .unwrap_or_else(|cause| fail_closed_router(&cause))
-        }) as std::pin::Pin<Box<dyn std::future::Future<Output = axum::Router> + Send>>
+        })
+            as std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::server::ServedRouter> + Send>,
+            >
     })
 }
 
@@ -4913,21 +4919,21 @@ fn parse_mount_base(base: &str) -> Result<crate::encoding::MountBase, StartupRef
     })
 }
 
-/// The `/static` file service of a `Web` app over `dir`: a [`MountTable`]
-/// holding the one `/static` mount, so the listener's parse and the URI are
-/// re-based below the prefix as every `Server` mount re-bases them.
-///
-/// [`MountTable`]: crate::server::MountTable
+/// The `/static` file service of a `Web` app over `dir`: one `/static`
+/// mount, so the listener's parse and the URI are re-based below the prefix
+/// as every `Server` mount re-bases them.
 ///
 /// # Errors
 ///
 /// `StartupRefusal::MountBase` if `/static` were outside the mount-base
 /// grammar.
 #[cfg(feature = "web")]
-fn web_static_mount(dir: std::path::PathBuf) -> Result<axum::Router, StartupRefusal> {
+fn web_static_mount(
+    dir: std::path::PathBuf,
+) -> Result<crate::server::ServedRouter, StartupRefusal> {
+    use crate::server::ServedRouter;
     let base = parse_mount_base(WEB_STATIC_PREFIX)?;
-    let files = axum::Router::new().fallback_service(crate::server::strict_serve_dir(dir));
-    Ok(crate::server::MountTable::new(vec![(base, files)]).below(axum::Router::new()))
+    Ok(ServedRouter::nothing().below_mounts(vec![(base, ServedRouter::static_files(dir))]))
 }
 
 /// The prefix a `Web` app's `[web] static` directory is served below.
@@ -4940,9 +4946,9 @@ const WEB_STATIC_PREFIX: &str = "/static";
 /// is down, but never serves a real session on a silently-degraded store or a
 /// silently-dead route. The cause is logged once here, server-side only.
 #[cfg(feature = "web")]
-fn fail_closed_router(cause: &StartupRefusal) -> axum::Router {
+fn fail_closed_router(cause: &StartupRefusal) -> crate::server::ServedRouter {
     crate::system::emit_runtime_log("live", &format!("mounted web app disabled: {cause}"));
-    axum::Router::new().fallback(|| async {
+    crate::server::ServedRouter::answering_everywhere(|| async {
         (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             FAIL_CLOSED_BODY,
@@ -7746,7 +7752,7 @@ pub(crate) fn build_web_router<Model, Msg, FInit, FUpdate, FView, FSubs>(
         allow(unused_variables)
     )]
     use_console_proxy: bool,
-) -> Result<axum::Router, StartupRefusal>
+) -> Result<crate::server::ServedRouter, StartupRefusal>
 where
     // IpeStringify: required by inspect_handler for the live-datum GET.
     // Generated Model types always satisfy this bound.
@@ -7769,8 +7775,7 @@ where
     FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
     FSubs: Fn(Model) -> IpeSub<Msg> + Send + Sync + 'static,
 {
-    use axum::Router;
-    use axum::routing::{get, post};
+    use crate::server::{MethodSet, RouteTable};
 
     // The app's base, parsed once where its state was built: the SSE
     // reconnect strips it from a client route, the widget routes scope to it,
@@ -7798,7 +7803,7 @@ where
     // The framing policy every page carries is parsed here, so a value with no
     // header representation refuses the router; the page path re-checks it.
     crate::telemetry::frame_ancestors_config().map_err(StartupRefusal::FrameAncestors)?;
-    let sse_route = get(
+    let sse_route = MethodSet::GET.on(
         move |st: axum::extract::State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
               strict: Option<axum::Extension<crate::server::StrictUrl>>,
               headers: axum::http::HeaderMap| {
@@ -7814,14 +7819,16 @@ where
     // Body-size cap on /_ipe/event. axum's DefaultBodyLimit applies
     // before the handler sees the bytes, so an over-sized payload is
     // rejected at the extract layer with 413 Payload Too Large.
-    let event_route = post(handlers::event_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
-        .layer(axum::extract::DefaultBodyLimit::max(body_limit));
+    let event_route = MethodSet::POST
+        .on(handlers::event_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
+        .body_limit(body_limit);
 
     // Inbound `Ipe.Ffi.Js` port route: same body-size cap as `/_ipe/event`, so an
     // over-sized port frame is rejected at the extract layer (413) before the
     // handler's own seal-boundary budget even runs.
-    let port_route = post(handlers::port_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
-        .layer(axum::extract::DefaultBodyLimit::max(body_limit));
+    let port_route = MethodSet::POST
+        .on(handlers::port_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
+        .body_limit(body_limit);
 
     // Content-addressed client JS asset route. The URL is computed once at
     // startup from SHA-256(CLIENT_JS) so the path changes when the file
@@ -7880,16 +7887,16 @@ where
         )
     }
 
-    let router = Router::new()
+    let router = RouteTable::new()
         .route("/_ipe/sse", sse_route)
         .route("/_ipe/event", event_route)
         .route("/_ipe/port", port_route)
-        .route(&client_js_route_path, get(serve_client_js))
+        .route(&client_js_route_path, MethodSet::GET.on(serve_client_js))
         // The worker route is root-relative like every route here; a mount
         // strips its base before this router sees the path.
         .route(
             &format!("/{}", crate::server::WORKER_SCRIPT_NAME),
-            get(serve_worker),
+            MethodSet::GET.on(serve_worker),
         );
     // The `Ipe.Ffi.Js` browser port surface (`window.ipe`), served
     // content-addressed with SRI — the same static, immutable discipline as
@@ -7899,47 +7906,47 @@ where
     #[cfg(feature = "widget-assets")]
     let router = router.route(
         &crate::js_port_glue::port_glue_path(),
-        get(|| async { serve_widget_js(crate::js_port_glue::port_glue_js()) }),
+        MethodSet::GET.on(|| async { serve_widget_js(crate::js_port_glue::port_glue_js()) }),
     );
     #[cfg(feature = "debugger")]
     let router = router.route(
         "/_ipe/debug/scrub",
-        post(handlers::scrub_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>),
+        MethodSet::POST.on(handlers::scrub_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>),
     );
     #[cfg(feature = "debugger")]
     let router = router.route(
         "/_ipe/debug/reset",
-        post(handlers::reset_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>),
+        MethodSet::POST.on(handlers::reset_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>),
     );
     #[cfg(feature = "debugger")]
     let router = router.route(
         "/_ipe/debug/export",
-        get(handlers::export_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>),
+        MethodSet::GET.on(handlers::export_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>),
     );
     #[cfg(feature = "debugger")]
     let router = router.route(
         "/_ipe/debug/import",
-        post(handlers::import_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>),
+        MethodSet::POST.on(handlers::import_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>),
     );
     #[cfg(feature = "debugger")]
     let router = router.route(
         "/_ipe/debug/step-to",
-        post(handlers::step_to_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>),
+        MethodSet::POST.on(handlers::step_to_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>),
     );
     #[cfg(feature = "debugger")]
     let router = router.route(
         "/_ipe/debug/back",
-        post(handlers::back_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>),
+        MethodSet::POST.on(handlers::back_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>),
     );
     #[cfg(feature = "debugger")]
     let router = router.route(
         "/_ipe/debug/forward",
-        post(handlers::forward_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>),
+        MethodSet::POST.on(handlers::forward_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>),
     );
     #[cfg(feature = "debugger")]
     let router = router.route(
         "/_ipe/debug/inspect",
-        get(handlers::inspect_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>),
+        MethodSet::GET.on(handlers::inspect_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>),
     );
     // Dev-only appearance-hot-swap control leg. MOUNTED only when the hot
     // overlay is active (flag on AND non-production), so the route is entirely
@@ -7948,8 +7955,9 @@ where
     let router = if literal_table::dev_overlay_active() {
         router.route(
             "/_ipe/hot-appearance",
-            post(handlers::hot_appearance_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
-                .layer(axum::extract::DefaultBodyLimit::max(body_limit)),
+            MethodSet::POST
+                .on(handlers::hot_appearance_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
+                .body_limit(body_limit),
         )
     } else {
         router
@@ -7962,8 +7970,9 @@ where
     let router = if literal_table::dev_overlay_active() {
         router.route(
             "/_ipe/hot-transition",
-            post(handlers::hot_transition_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
-                .layer(axum::extract::DefaultBodyLimit::max(body_limit)),
+            MethodSet::POST
+                .on(handlers::hot_transition_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
+                .body_limit(body_limit),
         )
     } else {
         router
@@ -7977,8 +7986,9 @@ where
     let router = if literal_table::dev_overlay_active() {
         router.route(
             "/_ipe/hot-msg",
-            post(handlers::hot_msg_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
-                .layer(axum::extract::DefaultBodyLimit::max(body_limit)),
+            MethodSet::POST
+                .on(handlers::hot_msg_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
+                .body_limit(body_limit),
         )
     } else {
         router
@@ -7991,8 +8001,9 @@ where
     let router = if literal_table::dev_overlay_active() {
         router.route(
             "/_ipe/hot-init",
-            post(handlers::hot_init_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
-                .layer(axum::extract::DefaultBodyLimit::max(body_limit)),
+            MethodSet::POST
+                .on(handlers::hot_init_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
+                .body_limit(body_limit),
         )
     } else {
         router
@@ -8005,8 +8016,9 @@ where
     let router = if literal_table::dev_overlay_active() {
         router.route(
             "/_ipe/hot-subs",
-            post(handlers::hot_subs_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
-                .layer(axum::extract::DefaultBodyLimit::max(body_limit)),
+            MethodSet::POST
+                .on(handlers::hot_subs_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
+                .body_limit(body_limit),
         )
     } else {
         router
@@ -8019,8 +8031,9 @@ where
     let router = if literal_table::dev_overlay_active() {
         router.route(
             "/_ipe/hot-wiring",
-            post(handlers::hot_wiring_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
-                .layer(axum::extract::DefaultBodyLimit::max(body_limit)),
+            MethodSet::POST
+                .on(handlers::hot_wiring_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
+                .body_limit(body_limit),
         )
     } else {
         router
@@ -8032,25 +8045,29 @@ where
     let router = if watch_banner_active(mount.base().prefix()) {
         router.route(
             "/_ipe/watch/status",
-            post(handlers::watch_status_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
-                .layer(axum::extract::DefaultBodyLimit::max(body_limit)),
+            MethodSet::POST
+                .on(handlers::watch_status_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
+                .body_limit(body_limit),
         )
     } else {
         router
     };
     let mut router = router
         // Observability surface.
-        .route("/_ipe/healthz", get(observability::healthz))
-        .route("/_ipe/readyz", get(observability::readyz))
-        .route("/_ipe/buildinfo", get(observability::buildinfo))
-        .route("/_ipe/metrics", get(observability::metrics))
+        .route("/_ipe/healthz", MethodSet::GET.on(observability::healthz))
+        .route("/_ipe/readyz", MethodSet::GET.on(observability::readyz))
+        .route(
+            "/_ipe/buildinfo",
+            MethodSet::GET.on(observability::buildinfo),
+        )
+        .route("/_ipe/metrics", MethodSet::GET.on(observability::metrics))
         // Observability federation receiver stays on the parent regardless
         // of console mode (sub-apps push telemetry here). Body-capped (reuses
         // the /_ipe/event limit) so an unbounded ingest POST can't exhaust
         // memory before the JSON parse.
         .route(
             "/_ipe/observability/ingest",
-            post(console::ingest).layer(axum::extract::DefaultBodyLimit::max(body_limit)),
+            MethodSet::POST.on(console::ingest).body_limit(body_limit),
         );
 
     // The console + metrics auth gate applies whether or not a console is
@@ -8117,7 +8134,10 @@ where
         let route_root = crate::encoding::MountBase::root();
         for (asset_path, content) in widget_assets::served_assets(widget_assets::registered()) {
             let path = route_root.url_of(&asset_path);
-            router = router.route(&path, get(move || async move { serve_widget_js(content) }));
+            router = router.route(
+                &path,
+                MethodSet::GET.on(move || async move { serve_widget_js(content) }),
+            );
         }
         let glue_path = route_root.url_of(&widget_assets::glue_path(
             mount.base(),
@@ -8133,7 +8153,7 @@ where
         );
         router = router.route(
             &glue_path,
-            get(move || async move { serve_widget_js(glue_body) }),
+            MethodSet::GET.on(move || async move { serve_widget_js(glue_body) }),
         );
     }
 
@@ -8159,74 +8179,79 @@ where
         .ok()
         .filter(|d| !d.is_empty())
     {
-        router = router.nest_service("/static", web_static_mount(std::path::PathBuf::from(dir))?);
+        router = router.nest_served("/static", web_static_mount(std::path::PathBuf::from(dir))?);
     }
 
-    let app: Router = router
+    let router = router
         .route(
             "/",
-            get(handlers::page::<Model, Msg, FInit, FUpdate, FView, FSubs>),
+            MethodSet::GET.on(handlers::page::<Model, Msg, FInit, FUpdate, FView, FSubs>),
         )
         .route(
             "/{*path}",
-            get(handlers::page::<Model, Msg, FInit, FUpdate, FView, FSubs>),
-        )
-        // Layer order (axum: last `.layer` = outermost): CSRF is INNER of
-        // observability::track so a rejected CSRF POST still gets counted +
-        // access-logged.
-        .layer(axum::middleware::from_fn_with_state(
-            Arc::clone(&mount),
-            csrf::csrf_middleware,
-        ))
-        // Second boundary over every route here (page, SSE, event, port,
-        // assets, static): a request that reaches this router without the
-        // listener's URL parse is answered with the fixed 500 before CSRF or
-        // any handler runs. Inner of `track`, so a refusal is still counted
-        // and access-logged.
-        .layer(axum::middleware::from_fn(
-            crate::server::refuse_unparsed_url,
-        ))
-        // Every worker script fetch but one of this app's worker route is
-        // refused before CSRF or any handler runs, so a static file, a
-        // browser-noise file or a page can never be installed as a worker.
-        // The router is root-relative, so the admitted base is the root; a
-        // parent `Ipe.Http.Server` gates the unstripped path too.
-        .layer(axum::middleware::from_fn_with_state(
-            Arc::new(crate::server::AdmittedWorkerPaths::of_bases([
-                &crate::encoding::MountBase::root(),
-            ])),
-            crate::server::refuse_foreign_worker,
-        ))
-        // Per-request panic recovery: a handler or csrf-mw panic becomes a 500
-        // instead of an unwound tokio task that drops the connection with no
-        // response. Symmetric with Ipe.Http.Server (server.rs). The Rust thesis
-        // is that well-typed Ipê can't panic, so this is the defense-in-depth
-        // FLOOR, not the foundation. Placed INNER of `track` (and OUTER of
-        // csrf + the route handlers) so the converted 500 returns through
-        // track's `next.run().await` normally — track still counts +
-        // access-logs + histograms it as status 500
-        // recover is innermost; the outer middleware observes the 500). If it
-        // were outermost the panic would unwind through track, skipping its
-        // post-`next.run` metering. The custom responder classifies + logs the
-        // panic SERVER-SIDE (errId, via core::panic_500_body) and returns a 500
-        // carrying ONLY the errId — never the panic message (no info leak).
-        // Symmetric with Ipe.Http.Server (the body shape is shared in `core`).
-        .layer(tower_http::catch_panic::CatchPanicLayer::custom(
-            |err: Box<dyn std::any::Any + Send + 'static>| {
-                use axum::response::IntoResponse;
-                (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    [(axum::http::header::CONTENT_TYPE, "application/json")],
-                    crate::core::panic_500_body(&*err),
-                )
-                    .into_response()
-            },
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            mount,
-            observability::track,
-        ))
-        .with_state(state);
+            MethodSet::GET.on(handlers::page::<Model, Msg, FInit, FUpdate, FView, FSubs>),
+        );
+    // The layers wrap the router alone: the `Allow` oracle beside it runs no
+    // handler, so it needs none of them.
+    let app = router.into_served(|router| {
+        router
+            // Layer order (axum: last `.layer` = outermost): CSRF is INNER of
+            // observability::track so a rejected CSRF POST still gets counted +
+            // access-logged.
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&mount),
+                csrf::csrf_middleware,
+            ))
+            // Second boundary over every route here (page, SSE, event, port,
+            // assets, static): a request that reaches this router without the
+            // listener's URL parse is answered with the fixed 500 before CSRF or
+            // any handler runs. Inner of `track`, so a refusal is still counted
+            // and access-logged.
+            .layer(axum::middleware::from_fn(
+                crate::server::refuse_unparsed_url,
+            ))
+            // Every worker script fetch but one of this app's worker route is
+            // refused before CSRF or any handler runs, so a static file, a
+            // browser-noise file or a page can never be installed as a worker.
+            // The router is root-relative, so the admitted base is the root; a
+            // parent `Ipe.Http.Server` gates the unstripped path too.
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(crate::server::AdmittedWorkerPaths::of_bases([
+                    &crate::encoding::MountBase::root(),
+                ])),
+                crate::server::refuse_foreign_worker,
+            ))
+            // Per-request panic recovery: a handler or csrf-mw panic becomes a 500
+            // instead of an unwound tokio task that drops the connection with no
+            // response. Symmetric with Ipe.Http.Server (server.rs). The Rust thesis
+            // is that well-typed Ipê can't panic, so this is the defense-in-depth
+            // FLOOR, not the foundation. Placed INNER of `track` (and OUTER of
+            // csrf + the route handlers) so the converted 500 returns through
+            // track's `next.run().await` normally — track still counts +
+            // access-logs + histograms it as status 500
+            // recover is innermost; the outer middleware observes the 500). If it
+            // were outermost the panic would unwind through track, skipping its
+            // post-`next.run` metering. The custom responder classifies + logs the
+            // panic SERVER-SIDE (errId, via core::panic_500_body) and returns a 500
+            // carrying ONLY the errId — never the panic message (no info leak).
+            // Symmetric with Ipe.Http.Server (the body shape is shared in `core`).
+            .layer(tower_http::catch_panic::CatchPanicLayer::custom(
+                |err: Box<dyn std::any::Any + Send + 'static>| {
+                    use axum::response::IntoResponse;
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        crate::core::panic_500_body(&*err),
+                    )
+                        .into_response()
+                },
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                mount,
+                observability::track,
+            ))
+            .with_state(state)
+    });
 
     pubsub::mark_web_running();
     WEB_SERVING.store(true, std::sync::atomic::Ordering::Release);
@@ -16014,7 +16039,7 @@ mod emitted_router_behavior_tests {
 
     /// GET `/` against a mount, returning the status and body text.
     #[allow(clippy::expect_used)] // test helper: request build / body read failure is a test environment issue
-    async fn mounted_get(router: axum::Router) -> (StatusCode, String) {
+    async fn mounted_get(router: crate::server::ServedRouter) -> (StatusCode, String) {
         let resp = crate::server::behind_listener(router)
             .oneshot(
                 Request::builder()
@@ -16207,7 +16232,7 @@ mod emitted_router_behavior_tests {
             let base = crate::encoding::MountBase::parse("/billing").expect("the prefix parses");
             let sub = builder(base.clone()).await;
             let app = crate::server::behind_listener(
-                crate::server::MountTable::new(vec![(base, sub)]).below(axum::Router::new()),
+                crate::server::ServedRouter::nothing().below_mounts(vec![(base, sub)]),
             );
             let status_of = |uri: &'static str| {
                 let app = app.clone();
@@ -16256,8 +16281,8 @@ mod emitted_router_behavior_tests {
             let sub_b = second(b.clone()).await;
             let sub_a = first(a.clone()).await;
             let app = crate::server::behind_listener(
-                crate::server::MountTable::new(vec![(a.clone(), sub_a), (b.clone(), sub_b)])
-                    .below(axum::Router::new()),
+                crate::server::ServedRouter::nothing()
+                    .below_mounts(vec![(a.clone(), sub_a), (b.clone(), sub_b)]),
             );
             for base in [a, b] {
                 let resp = app
@@ -16349,6 +16374,123 @@ mod emitted_router_behavior_tests {
                     assert_ne!(text, "api", "{uri} is served by the app");
                 }
             }
+        });
+    }
+
+    /// Prove the refusals: on a listener mounting an app at `/billing` beside
+    /// a `Server.get` route, a `TRACE` inside the mount is answered `405`
+    /// naming the app's methods for that path, a `TRACE` on the handler path
+    /// names the handler's, and a path neither serves is answered `404`.
+    #[test]
+    #[allow(clippy::expect_used)] // test: fixed requests build
+    fn trace_on_a_mounted_app_names_the_apps_methods() {
+        let app = crate::tea::WebApp(crate::tea::WebAppKind::Mountable {
+            serve: Box::pin(async { crate::IpeResult::Ok(()) }),
+            router: web_embed_router(
+                init,
+                update,
+                view,
+                subs,
+                "memory".to_string(),
+                String::new(),
+                [0u8; 32],
+            ),
+        });
+        let routes = vec![
+            crate::server::server_get::<String, _>(
+                "/api".to_owned(),
+                |_req: crate::server::ServerRequest| {
+                    Box::pin(async {
+                        crate::IpeResult::Ok(crate::server::server_text("api".to_owned()))
+                    }) as crate::IpeTask<String, crate::server::ServerResponse>
+                },
+            ),
+            crate::server::server_mount_app("/billing".to_owned(), app),
+        ];
+        block_on(async move {
+            let listener = crate::server::listen_router(routes)
+                .await
+                .expect("a mount beside a route starts");
+            for (uri, status, want) in [
+                (
+                    "/billing",
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    Some("GET, HEAD"),
+                ),
+                (
+                    "/billing/page",
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    Some("GET, HEAD"),
+                ),
+                (
+                    "/billing/_ipe/event",
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    Some("POST"),
+                ),
+                ("/api", StatusCode::METHOD_NOT_ALLOWED, Some("GET, HEAD")),
+                ("/elsewhere", StatusCode::NOT_FOUND, None),
+                ("/", StatusCode::NOT_FOUND, None),
+            ] {
+                let resp = listener
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("TRACE")
+                            .uri(uri)
+                            .body(Body::empty())
+                            .expect("build TRACE"),
+                    )
+                    .await
+                    .expect("router responds");
+                assert_eq!(resp.status(), status, "{uri}");
+                let allow = resp
+                    .headers()
+                    .get(header::ALLOW)
+                    .and_then(|v| v.to_str().ok());
+                assert_eq!(allow, want, "{uri}");
+            }
+        });
+    }
+
+    /// Prove the refusal: a mounted app that failed closed still names every
+    /// routable method in its `405`, never `TRACE` or `CONNECT`.
+    #[cfg(not(feature = "redis_store"))]
+    #[test]
+    #[allow(clippy::expect_used)] // test: fixed requests build
+    fn trace_on_a_failed_closed_mount_names_every_routable_method() {
+        let app = crate::tea::WebApp(crate::tea::WebAppKind::Mountable {
+            serve: Box::pin(async { crate::IpeResult::Ok(()) }),
+            router: web_embed_router(
+                init,
+                update,
+                view,
+                subs,
+                "redis".to_string(),
+                String::new(),
+                [0u8; 32],
+            ),
+        });
+        let routes = vec![crate::server::server_mount_app("/down".to_owned(), app)];
+        block_on(async move {
+            let listener = crate::server::listen_router(routes)
+                .await
+                .expect("a failed-closed mount still starts");
+            let resp = listener
+                .oneshot(
+                    Request::builder()
+                        .method("TRACE")
+                        .uri("/down/anything")
+                        .body(Body::empty())
+                        .expect("build TRACE"),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+            let allow = resp
+                .headers()
+                .get(header::ALLOW)
+                .and_then(|v| v.to_str().ok());
+            assert_eq!(allow, Some("DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT"));
         });
     }
 
@@ -17362,7 +17504,8 @@ mod route_entry_cmd_tests {
         run(false, || async {
             let sessions = Arc::new(AtomicUsize::new(0));
             let bare = build_web_router(fixture_state(memory(), sessions.clone()), false)
-                .expect("the fixture route table and base are well-formed");
+                .expect("the fixture route table and base are well-formed")
+                .into_router();
             for (method, uri) in [
                 ("GET", "/"),
                 ("GET", "/items/3"),
@@ -17546,6 +17689,48 @@ mod route_entry_cmd_tests {
             crate::system::locked_remove_var(crate::env_registry::web::WEB_PORT.name());
             crate::system::locked_remove_var("IPE_CONSOLE_EMBED");
             crate::system::locked_remove_var("IPE_HTTP_BIND");
+        });
+    }
+
+    /// Prove the refusals: a `TRACE` on a `Web` page or runtime route is
+    /// answered `405` before any handler runs, its `Allow` naming the methods
+    /// the path serves and never `TRACE` or `CONNECT`; no session starts.
+    #[test]
+    #[allow(clippy::expect_used)] // test: fixed requests build
+    fn trace_on_a_web_page_names_its_methods_in_allow() {
+        run(false, || async {
+            let sessions = Arc::new(AtomicUsize::new(0));
+            let app = router_counted(memory(), sessions.clone());
+            for (uri, want) in [
+                ("/", "GET, HEAD"),
+                ("/somewhere/else", "GET, HEAD"),
+                ("/_ipe/event", "POST"),
+            ] {
+                for method in ["TRACE", "CONNECT"] {
+                    let resp = app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method(method)
+                                .uri(uri)
+                                .body(Body::empty())
+                                .expect("build request"),
+                        )
+                        .await
+                        .expect("router responds");
+                    assert_eq!(
+                        resp.status(),
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "{method} {uri}"
+                    );
+                    let allow = resp
+                        .headers()
+                        .get(header::ALLOW)
+                        .and_then(|v| v.to_str().ok());
+                    assert_eq!(allow, Some(want), "{method} {uri}");
+                }
+            }
+            assert_eq!(sessions.load(Ordering::SeqCst), 0);
         });
     }
 
@@ -19231,9 +19416,9 @@ mod route_entry_cmd_tests {
             ] {
                 let page_hits = Arc::new(AtomicUsize::new(0));
                 let hits = Arc::clone(&page_hits);
-                let catch_all = axum::Router::new().route(
+                let catch_all = crate::server::RouteTable::new().route(
                     "/{*path}",
-                    axum::routing::get(move || {
+                    crate::server::MethodSet::GET.on(move || {
                         let hits = Arc::clone(&hits);
                         async move {
                             hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -19241,7 +19426,9 @@ mod route_entry_cmd_tests {
                         }
                     }),
                 );
-                let app = install::mount_routes(catch_all, Some(offer), &base);
+                let app = install::mount_routes(catch_all, Some(offer), &base)
+                    .into_served(|router| router)
+                    .into_router();
                 let root = crate::encoding::MountBase::root();
                 for (path, content_type, want) in [
                     (
@@ -21743,8 +21930,11 @@ mod web_static_mount_tests {
         std::fs::create_dir_all(&dir).expect("temp static dir");
         std::fs::write(dir.join("hello.txt"), "hi").expect("static fixture file");
         let mount = web_static_mount(dir.clone()).expect("`/static` is a mount base");
-        let app =
-            crate::server::behind_listener(axum::Router::new().nest_service("/static", mount));
+        let app = crate::server::behind_listener(
+            crate::server::RouteTable::new()
+                .nest_served("/static", mount)
+                .into_served(|router| router),
+        );
         let wire = axum::http::Request::builder()
             .method("GET")
             .uri(uri)
