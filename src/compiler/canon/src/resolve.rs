@@ -8782,16 +8782,22 @@ const fn name_zero() -> Symbol {
 /// stands, wrapped in the internal `Interpolate` renderer (no surface
 /// binding — only `{{…}}` reaches it).
 ///
-/// The renderer is written nowhere in the source, so its reference owns no
-/// source bytes: an empty span at the body's start, which no token or
-/// occurrence over the body's own names can collide with.
-fn interpolate(expr: &src::Expr, env: &Env, cx: &mut ResolveCx<'_>) -> DResult<canon::Expr> {
+/// The renderer call stands on `delimited`, the whole `{{…}}`, which is
+/// strictly wider than `expr`: the call's `String` region never overwrites the
+/// expression's own type at the expression's span. The renderer is written
+/// nowhere in the source, so its reference owns no source bytes: an empty
+/// span on the opening `{{`, which no name in the body can collide with.
+fn interpolate(
+    expr: &src::Expr,
+    delimited: Span,
+    env: &Env,
+    cx: &mut ResolveCx<'_>,
+) -> DResult<canon::Expr> {
     let resolved = canonicalise_expr(expr, env, cx)?;
-    let span = resolved.span;
     let mod_sym = cx.interner.intern("_internal_")?;
     let fn_sym = cx.interner.intern("interpolate")?;
     let stringify = Located::new(
-        Span::new(span.lo, span.lo),
+        Span::new(delimited.lo, delimited.lo),
         canon::Expr_::VarKernel {
             id: Some(StdlibKernel::Interpolate),
             module: mod_sym,
@@ -8799,7 +8805,7 @@ fn interpolate(expr: &src::Expr, env: &Env, cx: &mut ResolveCx<'_>) -> DResult<c
         },
     );
     Ok(Located::new(
-        span,
+        delimited,
         canon::Expr_::Call(Box::new(stringify), vec![resolved]),
     ))
 }
@@ -8817,7 +8823,7 @@ fn desugar_template(
             src::TemplatePart::Lit(text) => {
                 Located::new(text.span, canon::Expr_::Str(text.value.clone()))
             }
-            src::TemplatePart::Expr(expr) => interpolate(expr, env, cx)?,
+            src::TemplatePart::Expr { delimited, expr } => interpolate(expr, *delimited, env, cx)?,
         });
     }
     if parts.len() == 1

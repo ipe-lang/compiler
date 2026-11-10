@@ -3182,7 +3182,7 @@ mod tests {
         let Some(template) = template else { return };
         let y = src.find("y }}").unwrap_or_default();
         let arg = template.parts().iter().find_map(|part| match part {
-            ipe_syntax::TemplatePart::Expr(e) => match &e.value {
+            ipe_syntax::TemplatePart::Expr { expr: e, .. } => match &e.value {
                 Expr_::Call(_, args) => args.first().map(|a| a.span),
                 _ => None,
             },
@@ -3198,7 +3198,7 @@ mod tests {
             .iter()
             .filter_map(|part| match part {
                 ipe_syntax::TemplatePart::Lit(text) => Some(text.value.as_str()),
-                ipe_syntax::TemplatePart::Expr(_) => None,
+                ipe_syntax::TemplatePart::Expr { .. } => None,
             })
             .collect();
         assert_eq!(texts, ["a ", " b"]);

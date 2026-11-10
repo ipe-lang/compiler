@@ -1241,6 +1241,17 @@ mod tests {
         assert!(rename_texts(&[("Main", src, user)], "Main", "name", 0, "who").is_none());
     }
 
+    /// The only `y` in the module binds inside a body, so only the names the
+    /// body records can refuse renaming `x` onto it: the rename would make the
+    /// lambda capture `x`.
+    #[test]
+    fn a_rename_onto_a_binder_only_a_body_holds_is_refused() {
+        let src = "module Main exposing (main)\n\nshow : String -> String\nshow x =\n    \"\"\"{{ (\\y -> x ++ y) \"!\" }}\"\"\"\n\nmain : String\nmain = show \"a\"\n";
+        let user = ModuleOrigin::User;
+        assert!(rename_texts(&[("Main", src, user)], "Main", "x =", 0, "z").is_some());
+        assert!(rename_texts(&[("Main", src, user)], "Main", "x =", 0, "y").is_none());
+    }
+
     #[test]
     fn a_record_pattern_field_binder_is_refused() {
         let src = "module Main exposing (main)\n\nwidth : { w : Int } -> Int\nwidth r =\n    case r of\n        { w } -> w\n\nmain : Int\nmain = width { w = 1 }\n";

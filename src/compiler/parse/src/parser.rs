@@ -65,6 +65,10 @@ pub struct Parser<'a> {
     /// depth includes: a `do` block's statements, a `let`'s bindings, or an
     /// `else if` chain's arms.
     run: Option<SequenceStart>,
+    /// Where a refusal for running out of tokens points: the last token of
+    /// the input, read before any token is consumed, or the `}}` that closes
+    /// an interpolation body.
+    end: Span,
 }
 
 /// Where a sequence the parser charges nesting levels for begins.
@@ -307,6 +311,10 @@ fn segment_count(text: &str) -> u32 {
 impl<'a> Parser<'a> {
     pub const fn new(toks: Vec<Token>, interner: &'a mut Interner) -> Self {
         Self {
+            end: match toks.as_slice().last() {
+                Some(last) => last.span,
+                None => Span::DUMMY,
+            },
             toks,
             pos: 0,
             interner,
@@ -350,9 +358,14 @@ impl<'a> Parser<'a> {
         Ok(tok)
     }
 
-    /// Byte span to point at when input has run out: the end of the last token.
-    fn eof_err_span(&self) -> Span {
-        self.toks.last().map_or(Span::DUMMY, |t| t.span)
+    /// Byte span to point at when input has run out: the input's last token,
+    /// or the `}}` closing an interpolation body.
+    ///
+    /// Read from `end`, fixed before any token is consumed: [`Self::bump`]
+    /// leaves a spanless placeholder in each consumed slot, so the last slot
+    /// at end of input no longer holds the last token's span.
+    const fn eof_err_span(&self) -> Span {
+        self.end
     }
 
     /// Byte span to point at "here": the next token, or end-of-input.
@@ -1555,11 +1568,15 @@ impl<'a> Parser<'a> {
     /// The body is parsed by a parser of its own over the same interner, at
     /// the enclosing depth, so nesting through bodies stays under
     /// [`MAX_DEPTH`]. Running out of tokens mid-expression means the first
-    /// `}}` cut it short ([`InterpolationDefect::BodyEnded`] at that `}}`); a
-    /// token after a whole expression is [`InterpolationDefect::TrailingTokens`].
+    /// `}}` cut it short: every refusal the body parser raises at its end of
+    /// input stands on `closer` and is [`InterpolationDefect::BodyEnded`]
+    /// there, whatever construct was left open (a bracket, an `if`, a `case`,
+    /// an operator), except the nesting ceiling. A token after a whole
+    /// expression is [`InterpolationDefect::TrailingTokens`].
     fn parse_body(&mut self, tokens: Vec<Token>, closer: Span, depth: u32) -> DResult<Expr> {
         let (parsed, leftover, deepest) = {
             let mut body = Parser::new(tokens, self.interner);
+            body.end = closer;
             body.deepest = self.deepest;
             let parsed = body.parse_expr(0, depth.saturating_add(1));
             (parsed, body.peek().map(|token| token.span), body.deepest)
@@ -1570,10 +1587,11 @@ impl<'a> Parser<'a> {
             msg: ParseError::MalformedInterpolation(defect),
         };
         let expr = match parsed {
-            Err(Diagnostic::Parse {
-                msg: ParseError::UnexpectedEof { .. },
-                ..
-            }) => return Err(defect(closer, InterpolationDefect::BodyEnded)),
+            Err(Diagnostic::Parse { span, msg })
+                if span == closer && !matches!(msg, ParseError::NestingTooDeep { .. }) =>
+            {
+                return Err(defect(closer, InterpolationDefect::BodyEnded));
+            }
             parsed => parsed?,
         };
         leftover.map_or(Ok(expr), |span| {
@@ -2302,7 +2320,7 @@ impl<'a> Parser<'a> {
 
     /// The unexpected-EOF diagnostic for an unterminated record (literal or
     /// update).
-    fn record_eof(&self) -> Diagnostic {
+    const fn record_eof(&self) -> Diagnostic {
         Diagnostic::Parse {
             span: self.eof_err_span(),
             msg: ParseError::UnexpectedEof {

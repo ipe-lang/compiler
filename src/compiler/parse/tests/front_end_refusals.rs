@@ -759,15 +759,55 @@ fn parses(src: &str) -> bool {
 }
 
 /// A body whose expression is still open at the first `}}` is IPE-P0077
-/// `BodyEnded` at that `}}`; the balanced body parses.
+/// `BodyEnded` at that `}}`, whatever construct is left open: a bracket, an
+/// `if` without `else`, a `case` without branches, an operator, a lambda, a
+/// record. The balanced body parses.
 #[test]
 fn a_body_cut_short_by_its_closer_is_body_ended() {
-    let src = module_with_main("\"\"\"a {{f (x}} b\"\"\"");
-    assert_eq!(
-        interpolation_refusal(&src),
-        span_at(&src, "}}", 0).map(|at| (InterpolationDefect::BodyEnded, at))
-    );
+    for body in [
+        "f (x",
+        "[ 1, 2",
+        "if a then b",
+        "case x of",
+        "x +",
+        "\\y ->",
+        "let a = 1 in",
+    ] {
+        let src = module_with_main(&format!("\"\"\"a {{{{{body}}}}} b\"\"\""));
+        assert_eq!(
+            interpolation_refusal(&src),
+            span_at(&src, "}}", 0).map(|at| (InterpolationDefect::BodyEnded, at)),
+            "IPE-P0077 BodyEnded at the closer for {src}"
+        );
+    }
     assert!(parses(&module_with_main("\"\"\"a {{f (x)}} b\"\"\"")));
+}
+
+/// A module that runs out of tokens mid-expression is refused at its last
+/// token, never at a location-less span.
+#[test]
+fn running_out_of_tokens_points_at_the_last_token() {
+    for (body, last) in [
+        ("f (x", "x"),
+        ("[ 1, 2", "2"),
+        ("if a then b", "b"),
+        ("case x of", "of"),
+        ("x +", "+"),
+    ] {
+        let src = format!("module Main exposing (main)\n\nmain =\n    {body}");
+        let mut i = Interner::new();
+        let span = match parse_module(&src, &mut i) {
+            Err(Diagnostic::Parse { span, .. }) => Some(span),
+            _ => None,
+        };
+        let at = src.rfind(last).and_then(|lo| {
+            Some(Span::new(
+                u32::try_from(lo).ok()?,
+                u32::try_from(lo + last.len()).ok()?,
+            ))
+        });
+        assert_eq!(span, at, "refused at the last token for {src:?}");
+    }
 }
 
 /// A record literal closing back to back ends the body at its first `}}`:
@@ -820,7 +860,8 @@ fn a_token_after_the_body_expression_is_refused() {
     let src = module_with_main("\"\"\"{{a )}}\"\"\"");
     assert_eq!(
         interpolation_refusal(&src),
-        span_at(&src, ")", 0).map(|at| (InterpolationDefect::TrailingTokens, at))
+        // Occurrence 0 is the header's `exposing (main)`.
+        span_at(&src, ")", 1).map(|at| (InterpolationDefect::TrailingTokens, at))
     );
     assert!(parses(&module_with_main("\"\"\"{{a}}\"\"\"")));
 }

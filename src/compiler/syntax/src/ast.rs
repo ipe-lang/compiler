@@ -390,8 +390,12 @@ pub struct Template {
 pub enum TemplatePart {
     /// Literal text, escapes resolved, at its source span.
     Lit(Located<String>),
-    /// The expression a `{{…}}` body holds.
-    Expr(Expr),
+    /// The expression a `{{…}}` body holds, and the source span of the whole
+    /// interpolation with its `{{` and `}}`.
+    ///
+    /// `delimited` is strictly wider than `expr`'s span, so the node standing
+    /// for the interpolation never shares a span with the expression inside it.
+    Expr { delimited: Span, expr: Expr },
 }
 
 impl Template {
@@ -418,7 +422,10 @@ impl Template {
                     let range = value.start as usize..value.end as usize;
                     TemplatePart::Lit(Located::new(mapped_span(&triple, range)?, text))
                 }
-                Segment::Body { .. } => TemplatePart::Expr(bodies.next().ok_or_else(mismatch)?),
+                Segment::Body { .. } => TemplatePart::Expr {
+                    delimited: segment.delimited().ok_or_else(mismatch)?,
+                    expr: bodies.next().ok_or_else(mismatch)?,
+                },
             });
         }
         if bodies.next().is_some() {
@@ -442,14 +449,9 @@ impl Template {
     /// The interpolated expressions, in source order.
     pub fn exprs(&self) -> impl Iterator<Item = &Expr> {
         self.parts.iter().filter_map(|part| match part {
-            TemplatePart::Expr(expr) => Some(expr),
+            TemplatePart::Expr { expr, .. } => Some(expr),
             TemplatePart::Lit(_) => None,
         })
-    }
-
-    /// The parts in source order, for a pass that rewrites their spans.
-    pub fn parts_mut(&mut self) -> &mut [TemplatePart] {
-        &mut self.parts
     }
 
     /// The string's value when it interpolates nothing; `None` otherwise.
@@ -462,7 +464,7 @@ impl Template {
                     value = Cow::Borrowed(text.value.as_str());
                 }
                 TemplatePart::Lit(text) => value.to_mut().push_str(&text.value),
-                TemplatePart::Expr(_) => return None,
+                TemplatePart::Expr { .. } => return None,
             }
         }
         Some(value)
