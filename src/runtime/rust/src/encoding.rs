@@ -1460,10 +1460,13 @@ pub struct ServerPattern {
     router_path: String,
 }
 
-/// The request methods one `Ipe.Server` handler serves.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EndpointMethod {
-    Connect,
+/// A request method an `Ipe.Server` handler may serve.
+///
+/// The seven RFC 9110 methods a route can name; `TRACE` and `CONNECT` are
+/// recognised on the wire ([`WireMethod`]) but have no representation here, so
+/// no route can serve them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RoutableMethod {
     Delete,
     Get,
     Head,
@@ -1471,36 +1474,154 @@ pub enum EndpointMethod {
     Patch,
     Post,
     Put,
+}
+
+impl RoutableMethod {
+    /// Every routable method: the set an author's "every method" serves.
+    pub const ALL: [Self; 7] = [
+        Self::Delete,
+        Self::Get,
+        Self::Head,
+        Self::Options,
+        Self::Patch,
+        Self::Post,
+        Self::Put,
+    ];
+
+    /// The method's wire token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Delete => "DELETE",
+            Self::Get => "GET",
+            Self::Head => "HEAD",
+            Self::Options => "OPTIONS",
+            Self::Patch => "PATCH",
+            Self::Post => "POST",
+            Self::Put => "PUT",
+        }
+    }
+}
+
+/// A request's method as it arrived on the wire, parsed once at the listener.
+///
+/// The nine RFC 9110 methods, matched byte-exact: every other token, a
+/// lowercase spelling included, has no representation and is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WireMethod {
+    /// A method a route may serve.
+    Routable(RoutableMethod),
+    /// `TRACE`: recognised, never routed.
     Trace,
-    /// Every method.
+    /// `CONNECT`: recognised, never routed.
+    Connect,
+}
+
+/// Why a wire method was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WireMethodRefusal {
+    /// The token is none of the nine RFC 9110 methods, byte for byte.
+    Unrecognised,
+}
+
+impl WireMethod {
+    /// The one method table: every method's wire token.
+    const NAMES: [(&'static str, Self); 9] = [
+        ("CONNECT", Self::Connect),
+        ("DELETE", Self::Routable(RoutableMethod::Delete)),
+        ("GET", Self::Routable(RoutableMethod::Get)),
+        ("HEAD", Self::Routable(RoutableMethod::Head)),
+        ("OPTIONS", Self::Routable(RoutableMethod::Options)),
+        ("PATCH", Self::Routable(RoutableMethod::Patch)),
+        ("POST", Self::Routable(RoutableMethod::Post)),
+        ("PUT", Self::Routable(RoutableMethod::Put)),
+        ("TRACE", Self::Trace),
+    ];
+
+    /// The method a request's wire token names, byte-exact.
+    ///
+    /// # Errors
+    ///
+    /// `Unrecognised` for any token that is not exactly one of the nine RFC
+    /// 9110 method names.
+    pub fn parse(token: &str) -> Result<Self, WireMethodRefusal> {
+        Self::NAMES
+            .iter()
+            .find(|(known, _)| *known == token)
+            .map(|(_, method)| *method)
+            .ok_or(WireMethodRefusal::Unrecognised)
+    }
+
+    /// The method a route may serve; `None` for `TRACE` and `CONNECT`.
+    #[must_use]
+    pub const fn routable(self) -> Option<RoutableMethod> {
+        match self {
+            Self::Routable(method) => Some(method),
+            Self::Trace | Self::Connect => None,
+        }
+    }
+}
+
+/// The request methods one `Ipe.Server` handler serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndpointMethod {
+    /// One routable method.
+    One(RoutableMethod),
+    /// Every routable method ([`RoutableMethod::ALL`]), never one outside
+    /// them.
     Any,
 }
 
+/// Why a route's method text names no method a handler may serve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndpointMethodRefusal {
+    /// The text names no HTTP method.
+    Unknown,
+    /// The text names `TRACE` or `CONNECT`, which no route serves.
+    NotRoutable,
+}
+
 impl EndpointMethod {
-    /// The method a route names, `ANY` for every method, matched without
-    /// regard to ASCII case; `None` for a name that is no HTTP method.
+    /// The method a route names, `ANY` for every routable method, matched
+    /// without regard to ASCII case.
     ///
-    /// This is the one method grammar: the server refuses a handler whose
-    /// method it does not name at listen, and the compiler refuses a literal
-    /// `Server.api` method it does not name.
-    #[must_use]
-    pub fn parse(name: &str) -> Option<Self> {
-        const NAMES: [(&str, EndpointMethod); 10] = [
-            ("CONNECT", EndpointMethod::Connect),
-            ("DELETE", EndpointMethod::Delete),
-            ("GET", EndpointMethod::Get),
-            ("HEAD", EndpointMethod::Head),
-            ("OPTIONS", EndpointMethod::Options),
-            ("PATCH", EndpointMethod::Patch),
-            ("POST", EndpointMethod::Post),
-            ("PUT", EndpointMethod::Put),
-            ("TRACE", EndpointMethod::Trace),
-            ("ANY", EndpointMethod::Any),
-        ];
-        NAMES
+    /// This is the one author method grammar: the server refuses at listen a
+    /// handler whose method it refuses, and the compiler refuses a literal
+    /// `Server.api` method it refuses.
+    ///
+    /// # Errors
+    ///
+    /// `NotRoutable` for `TRACE` or `CONNECT`, `Unknown` for any other text
+    /// that names no HTTP method.
+    pub fn read(name: &str) -> Result<Self, EndpointMethodRefusal> {
+        if "ANY".eq_ignore_ascii_case(name) {
+            return Ok(Self::Any);
+        }
+        let wire = WireMethod::NAMES
             .iter()
             .find(|(known, _)| known.eq_ignore_ascii_case(name))
             .map(|(_, method)| *method)
+            .ok_or(EndpointMethodRefusal::Unknown)?;
+        wire.routable()
+            .map(Self::One)
+            .ok_or(EndpointMethodRefusal::NotRoutable)
+    }
+
+    /// The method a route names, as [`EndpointMethod::read`] reads it.
+    ///
+    /// `None` for text it refuses.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::read(name).ok()
+    }
+
+    /// The name a route spells this method set with.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::One(method) => method.as_str(),
+            Self::Any => "ANY",
+        }
     }
 
     /// Whether some request method is served by both.
@@ -2934,6 +3055,74 @@ mod server_pattern_tests {
 
     fn refusal(raw: &str) -> Option<ServerPatternRefusal> {
         ServerPattern::parse(raw).err()
+    }
+
+    /// Prove the refusals: the wire method is one of the nine RFC 9110
+    /// methods byte for byte, and only seven of them are routable.
+    #[test]
+    fn wire_method_parse_is_closed() {
+        let long = "G".repeat(64 * 1024);
+        for token in [
+            "get",
+            "Get",
+            "gET",
+            "BREW",
+            "",
+            " GET",
+            "GET ",
+            "ANY",
+            "MOUNT",
+            "delete",
+            long.as_str(),
+        ] {
+            assert_eq!(
+                WireMethod::parse(token),
+                Err(WireMethodRefusal::Unrecognised),
+                "{token:?}"
+            );
+        }
+        for method in RoutableMethod::ALL {
+            assert_eq!(
+                WireMethod::parse(method.as_str()).map(WireMethod::routable),
+                Ok(Some(method)),
+                "{method:?}"
+            );
+        }
+        for token in ["TRACE", "CONNECT"] {
+            let parsed = WireMethod::parse(token);
+            assert!(
+                matches!(parsed, Ok(WireMethod::Trace | WireMethod::Connect)),
+                "{token}"
+            );
+            assert_eq!(parsed.map(WireMethod::routable), Ok(None), "{token}");
+        }
+    }
+
+    /// Prove the refusals: an author names `TRACE` or `CONNECT` in any case
+    /// only to be refused as unroutable, and `ANY` means the seven routable
+    /// methods.
+    #[test]
+    fn endpoint_method_refuses_trace_and_connect() {
+        for name in ["TRACE", "trace", "CONNECT", "Connect"] {
+            assert_eq!(
+                EndpointMethod::read(name),
+                Err(EndpointMethodRefusal::NotRoutable),
+                "{name}"
+            );
+            assert_eq!(EndpointMethod::parse(name), None, "{name}");
+        }
+        for name in ["FETCH", "", "MOUNT", "GET /x"] {
+            assert_eq!(
+                EndpointMethod::read(name),
+                Err(EndpointMethodRefusal::Unknown),
+                "{name:?}"
+            );
+        }
+        assert_eq!(
+            EndpointMethod::read("patch"),
+            Ok(EndpointMethod::One(RoutableMethod::Patch))
+        );
+        assert_eq!(EndpointMethod::read("Any"), Ok(EndpointMethod::Any));
     }
 
     /// Prove the refusals: a pattern the router could misread, or one no

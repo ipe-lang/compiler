@@ -24,6 +24,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::encoding::{EndpointMethod, EndpointMethodRefusal, RoutableMethod, WireMethod};
 use crate::entropy::EntropyError;
 use crate::redact::{Redacted, redacting_debug};
 use crate::system::RefusedText;
@@ -283,7 +284,8 @@ type MountCell = Arc<std::sync::Mutex<Option<crate::tea::MountBuilder>>>;
 /// two `Option` fields so both-None is unrepresentable.
 #[derive(Clone)]
 enum RouteTarget {
-    Handler(ErasedHandler),
+    /// A handler, with the method its author named.
+    Handler(AuthorMethod, ErasedHandler),
     Static(String),
     /// `Server.mountApp prefix webApp`: nest the embedded web app's router
     /// under `path` (the prefix) on the shared server port.
@@ -291,12 +293,81 @@ enum RouteTarget {
     MountWeb(MountCell),
 }
 
+impl RouteTarget {
+    /// How a listen error names this route's method.
+    fn method_label(&self) -> std::borrow::Cow<'static, str> {
+        match self {
+            Self::Handler(Ok(method), _) => RouteKind::Endpoint(*method).label().into(),
+            Self::Handler(Err(refused), _) => refused.written.to_uppercase().into(),
+            Self::Static(_) => RouteKind::Static.label().into(),
+            #[cfg(feature = "web")]
+            Self::MountWeb(_) => RouteKind::Mount.label().into(),
+        }
+    }
+}
+
+/// What one parsed route serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RouteKind {
+    /// A handler serving the requests of one method set.
+    Endpoint(EndpointMethod),
+    /// A static-file directory.
+    Static,
+    /// An embedded Web app.
+    #[cfg(feature = "web")]
+    Mount,
+}
+
+impl RouteKind {
+    /// How a listen error names this route's method.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Endpoint(method) => method.as_str(),
+            Self::Static => "GET",
+            #[cfg(feature = "web")]
+            Self::Mount => "MOUNT",
+        }
+    }
+}
+
+/// A handler route's method as its author named it: the method set the
+/// handler serves, or the text that names none, refused at listen.
+pub type AuthorMethod = Result<EndpointMethod, RefusedMethod>;
+
+/// A handler route's method text that names no method a handler serves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefusedMethod {
+    /// The text as the author wrote it, quoted (scrubbed) by the refusal.
+    written: String,
+    cause: EndpointMethodRefusal,
+}
+
+impl RefusedMethod {
+    /// Why the text names no method a handler serves.
+    #[must_use]
+    pub const fn cause(&self) -> EndpointMethodRefusal {
+        self.cause
+    }
+}
+
+/// Read a handler route's method text by the one author method grammar.
+fn author_method(name: &str) -> AuthorMethod {
+    EndpointMethod::read(name).map_err(|cause| RefusedMethod {
+        written: name.to_owned(),
+        cause,
+    })
+}
+
+/// A handler route serving `method` alone.
+const fn one(method: RoutableMethod) -> AuthorMethod {
+    Ok(EndpointMethod::One(method))
+}
+
 /// Ipe.Http.Server.Route (opaque). Non-generic — see ErasedHandler.
 #[derive(Clone)]
 pub struct ServerRoute {
-    pub method: String,
     pub path: String,
-    target: RouteTarget, // private; was the two pub Options
+    target: RouteTarget,
 }
 
 crate::stringify::show_row!("ServerRoute", Internals, [] ServerRoute, |_| "<Ipe.Http.Server.Route>".to_owned());
@@ -321,15 +392,14 @@ where
     })
 }
 
-fn route<E, H>(method: &str, path: String, h: H) -> ServerRoute
+fn route<E, H>(method: AuthorMethod, path: String, h: H) -> ServerRoute
 where
     E: Send + 'static,
     H: IntoServerHandler<E>,
 {
     ServerRoute {
-        method: method.to_string(),
         path,
-        target: RouteTarget::Handler(erase(h.into_server_handler())),
+        target: RouteTarget::Handler(method, erase(h.into_server_handler())),
     }
 }
 
@@ -340,7 +410,7 @@ where
     E: Send + 'static,
     H: IntoServerHandler<E>,
 {
-    route("GET", path, h)
+    route(one(RoutableMethod::Get), path, h)
 }
 
 pub fn server_post<E, H>(path: String, h: H) -> ServerRoute
@@ -348,7 +418,7 @@ where
     E: Send + 'static,
     H: IntoServerHandler<E>,
 {
-    route("POST", path, h)
+    route(one(RoutableMethod::Post), path, h)
 }
 
 pub fn server_put<E, H>(path: String, h: H) -> ServerRoute
@@ -356,7 +426,7 @@ where
     E: Send + 'static,
     H: IntoServerHandler<E>,
 {
-    route("PUT", path, h)
+    route(one(RoutableMethod::Put), path, h)
 }
 
 pub fn server_delete<E, H>(path: String, h: H) -> ServerRoute
@@ -364,49 +434,51 @@ where
     E: Send + 'static,
     H: IntoServerHandler<E>,
 {
-    route("DELETE", path, h)
+    route(one(RoutableMethod::Delete), path, h)
 }
 
+/// `Server.any`: the handler serves every routable method
+/// ([`RoutableMethod::ALL`]), never `TRACE`, `CONNECT` or an unknown method.
 pub fn server_any<E, H>(path: String, h: H) -> ServerRoute
 where
     E: Send + 'static,
     H: IntoServerHandler<E>,
 {
-    route("ANY", path, h)
+    route(Ok(EndpointMethod::Any), path, h)
 }
 
 /// Server.api : String -> (Request -> Task Error Response) -> Route
 ///
 /// `spec` is "METHOD /path" (e.g. "POST /v1/generate"); an omitted method
-/// matches any verb. The CSRF exemption (`WithoutCsrf`) is a browser-session /
-/// double-submit concern from Ipe.Web with no analogue on the Rust HTTP server,
-/// so it has no effect here.
+/// matches every routable method. The CSRF exemption (`WithoutCsrf`) is a
+/// browser-session / double-submit concern from Ipe.Web with no analogue on
+/// the Rust HTTP server, so it has no effect here.
 pub fn server_api<E, H>(spec: String, h: H) -> ServerRoute
 where
     E: Send + 'static,
     H: IntoServerHandler<E>,
 {
     let (method, path) = api_spec_parts(&spec);
-    route(&method, path, h)
+    route(method, path, h)
 }
 
-/// Split a `Server.api` spec `"METHOD /path"` into its upper-cased method and
-/// its trimmed path; a spec with no method before the first space is `ANY`
-/// over the whole trimmed spec.
+/// Split a `Server.api` spec `"METHOD /path"` into its method, read by the
+/// one author method grammar, and its trimmed path; a spec with no method
+/// before the first space serves every routable method over the whole
+/// trimmed spec.
 #[must_use]
-pub fn api_spec_parts(spec: &str) -> (String, String) {
+pub fn api_spec_parts(spec: &str) -> (AuthorMethod, String) {
     // split_once is total by construction — no raw `spec[..idx]` range slice
     // (the restriction-lint footgun if the delimiter ever became multi-byte).
     match spec.split_once(' ') {
-        Some((m, p)) if !m.is_empty() => (m.trim().to_string(), p.trim().to_string()),
-        _ => ("ANY".to_string(), spec.trim().to_string()),
+        Some((m, p)) if !m.is_empty() => (author_method(m.trim()), p.trim().to_string()),
+        _ => (Ok(EndpointMethod::Any), spec.trim().to_string()),
     }
 }
 
 /// Server.static : String -> String -> Route  (urlPrefix, dir)
 pub fn server_static(path: String, dir: String) -> ServerRoute {
     ServerRoute {
-        method: "GET".to_string(),
         path,
         target: RouteTarget::Static(dir),
     }
@@ -427,7 +499,6 @@ pub fn server_static(path: String, dir: String) -> ServerRoute {
 pub fn server_mount_app(prefix: String, app: crate::tea::WebApp) -> ServerRoute {
     let cell: MountCell = Arc::new(std::sync::Mutex::new(app.into_mount_builder()));
     ServerRoute {
-        method: "MOUNT".to_string(),
         path: prefix,
         target: RouteTarget::MountWeb(cell),
     }
@@ -693,7 +764,12 @@ fn reissue_set_cookie_with(
 /// not been reached, a fresh token is minted and attached via `Set-Cookie`.
 /// `iat`, `cap`, and `jti` are carried verbatim from the verified-origin
 /// `ReissueContext` — a client cannot move the cap outward or change the session id.
-fn authed_route<E, F>(method: &str, path: String, cfg: AuthConfig, handler: F) -> ServerRoute
+fn authed_route<E, F>(
+    method: RoutableMethod,
+    path: String,
+    cfg: AuthConfig,
+    handler: F,
+) -> ServerRoute
 where
     E: Send + 'static,
     F: Fn(ServerRequest, crate::principal::Principal) -> IpeTask<E, ServerResponse>
@@ -818,7 +894,7 @@ where
             resp
         })
     };
-    route::<E, _>(method, path, guarded)
+    route::<E, _>(one(method), path, guarded)
 }
 
 #[cfg(feature = "jwt")]
@@ -831,7 +907,7 @@ where
         + Sync
         + 'static,
 {
-    authed_route("GET", path, cfg, handler)
+    authed_route(RoutableMethod::Get, path, cfg, handler)
 }
 
 #[cfg(feature = "jwt")]
@@ -844,7 +920,7 @@ where
         + Sync
         + 'static,
 {
-    authed_route("POST", path, cfg, handler)
+    authed_route(RoutableMethod::Post, path, cfg, handler)
 }
 
 #[cfg(feature = "jwt")]
@@ -857,7 +933,7 @@ where
         + Sync
         + 'static,
 {
-    authed_route("PUT", path, cfg, handler)
+    authed_route(RoutableMethod::Put, path, cfg, handler)
 }
 
 #[cfg(feature = "jwt")]
@@ -870,7 +946,7 @@ where
         + Sync
         + 'static,
 {
-    authed_route("DELETE", path, cfg, handler)
+    authed_route(RoutableMethod::Delete, path, cfg, handler)
 }
 
 // ─── response builders (pure) ─────────────────────────────────────────────
@@ -1531,6 +1607,11 @@ pub(crate) enum RequestRejection {
     /// The router reached a handler whose pattern does not match the
     /// request's decoded path: the router and the pattern disagree.
     Unrouted,
+    /// The request method is no method the language knows ([`WireMethod`]):
+    /// an extension token, or a known name in another case.
+    MethodNotImplemented,
+    /// The request method is `TRACE` or `CONNECT`, which no route serves.
+    MethodNotRoutable,
 }
 
 impl RequestRejection {
@@ -1552,7 +1633,24 @@ impl RequestRejection {
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal Server Error",
             ),
+            Self::MethodNotImplemented => {
+                (axum::http::StatusCode::NOT_IMPLEMENTED, "Not Implemented")
+            }
+            Self::MethodNotRoutable => (
+                axum::http::StatusCode::METHOD_NOT_ALLOWED,
+                "Method Not Allowed",
+            ),
         }
+    }
+
+    /// The fixed refusal answered for this rejection, with the response
+    /// security headers.
+    fn refused(self) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        with_security_headers(
+            self.status_and_reason().into_response(),
+            response_security_headers(),
+        )
     }
 }
 
@@ -1883,8 +1981,16 @@ impl MountTable {
     }
 }
 
-/// The outermost URL service of every app listener: one strict parse, then
-/// the canonical respelling of the path, before any router sees the request.
+/// The outermost URL service of every app listener: one strict parse of the
+/// method and the URL, then the canonical respelling of the path, before any
+/// router sees the request.
+///
+/// The method is read once into the closed [`WireMethod`]: a method the
+/// language does not know is answered `501`, and `TRACE` or `CONNECT` `405`,
+/// before any router or handler sees the request, so no route (`ANY`
+/// included) is ever reached by a method outside [`RoutableMethod`]. The `405`
+/// names the methods its path serves in `Allow` when the listener carries an
+/// [`AllowOracle`] and the path is a handler's.
 ///
 /// A malformed path or query is answered with the fixed 400 before routing, so
 /// an unrouted path and the fallback are refused alike; the 400 carries the
@@ -1898,20 +2004,84 @@ impl MountTable {
 #[derive(Clone)]
 pub(crate) struct CanonicalUrl<S> {
     inner: S,
+    allow: Option<AllowOracle>,
 }
 
 impl<S> CanonicalUrl<S> {
-    /// The canonical-URL service in front of `inner`.
+    /// The canonical-URL service in front of `inner`, with no `Allow` on a
+    /// refused method.
     pub(crate) const fn new(inner: S) -> Self {
-        Self { inner }
+        Self { inner, allow: None }
+    }
+
+    /// The canonical-URL service in front of `inner`, naming in `Allow` the
+    /// methods `allow` serves at a refused method's path.
+    pub(crate) const fn with_allow(inner: S, allow: Option<AllowOracle>) -> Self {
+        Self { inner, allow }
     }
 }
 
-/// The future of [`CanonicalUrl`]: the refusal, or the inner call.
+/// The future of [`CanonicalUrl`]: a refusal, or the inner call.
 type CanonicalFuture<F> = futures_util::future::Either<
-    std::future::Ready<Result<axum::response::Response, std::convert::Infallible>>,
+    futures_util::future::Either<
+        std::future::Ready<Result<axum::response::Response, std::convert::Infallible>>,
+        futures_util::future::BoxFuture<
+            'static,
+            Result<axum::response::Response, std::convert::Infallible>,
+        >,
+    >,
     F,
 >;
+
+/// The methods a listener's handler paths serve, asked for a refused
+/// method's `Allow`.
+///
+/// A router with every handler's path and method set over a handler that
+/// never runs, so asking it reaches no Ipê code.
+#[derive(Clone)]
+pub(crate) struct AllowOracle(axum::Router);
+
+impl AllowOracle {
+    /// The `Allow` the router names for `request`'s path: present only when a
+    /// handler path matches and refuses the method.
+    async fn allow(self, request: axum::extract::Request) -> Option<axum::http::HeaderValue> {
+        use tower::ServiceExt;
+        let response = match self.0.oneshot(request).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        };
+        if response.status() == axum::http::StatusCode::METHOD_NOT_ALLOWED {
+            response.headers().get(axum::http::header::ALLOW).cloned()
+        } else {
+            None
+        }
+    }
+}
+
+/// The `405` for a `TRACE` or `CONNECT` request, with the `Allow` its path's
+/// handlers name, if any; the request reaches no handler.
+///
+/// Only an origin-form target (a path) names a resource, so an
+/// authority-form `CONNECT` target is answered with no `Allow`.
+async fn unroutable_method(
+    mut request: axum::extract::Request,
+    allow: Option<AllowOracle>,
+) -> Result<axum::response::Response, std::convert::Infallible> {
+    let origin_form = request.uri().path().starts_with('/');
+    let named = match (origin_form, allow) {
+        (true, Some(oracle)) if canonicalise(&mut request).is_ok() => oracle.allow(request).await,
+        _ => None,
+    };
+    let mut response = RequestRejection::MethodNotRoutable.refused();
+    if let Some(methods) = named
+        && response.status() == axum::http::StatusCode::METHOD_NOT_ALLOWED
+    {
+        response
+            .headers_mut()
+            .insert(axum::http::header::ALLOW, methods);
+    }
+    Ok(response)
+}
 
 impl<S> tower::Service<axum::extract::Request> for CanonicalUrl<S>
 where
@@ -1933,15 +2103,23 @@ where
     }
 
     fn call(&mut self, mut request: axum::extract::Request) -> Self::Future {
-        use axum::response::IntoResponse;
-        match canonicalise(&mut request) {
-            Ok(()) => futures_util::future::Either::Right(self.inner.call(request)),
-            Err(rejection) => {
-                futures_util::future::Either::Left(std::future::ready(Ok(with_security_headers(
-                    rejection.status_and_reason().into_response(),
-                    response_security_headers(),
-                ))))
+        use futures_util::future::Either;
+        let refuse = |rejection: RequestRejection| {
+            Either::Left(Either::Left(std::future::ready(Ok(rejection.refused()))))
+        };
+        match WireMethod::parse(request.method().as_str()).map(WireMethod::routable) {
+            Err(_) => return refuse(RequestRejection::MethodNotImplemented),
+            Ok(None) => {
+                return Either::Left(Either::Right(Box::pin(unroutable_method(
+                    request,
+                    self.allow.clone(),
+                ))));
             }
+            Ok(Some(_)) => {}
+        }
+        match canonicalise(&mut request) {
+            Ok(()) => Either::Right(self.inner.call(request)),
+            Err(rejection) => refuse(rejection),
         }
     }
 }
@@ -2585,29 +2763,38 @@ fn method_router(
             scoped.await
         }
     };
-    match method.filter() {
-        Some(filter) => axum::routing::on(filter, svc),
-        None => axum::routing::any(svc),
+    axum::routing::on(method.filter(), svc)
+}
+
+impl RoutableMethod {
+    /// The router's filter for this method.
+    const fn filter(self) -> axum::routing::MethodFilter {
+        use axum::routing::MethodFilter as F;
+        match self {
+            Self::Delete => F::DELETE,
+            Self::Get => F::GET,
+            Self::Head => F::HEAD,
+            Self::Options => F::OPTIONS,
+            Self::Patch => F::PATCH,
+            Self::Post => F::POST,
+            Self::Put => F::PUT,
+        }
     }
 }
 
-use crate::encoding::EndpointMethod;
-
 impl EndpointMethod {
-    /// The router's filter for this method; `None` for `Any`.
-    const fn filter(self) -> Option<axum::routing::MethodFilter> {
-        use axum::routing::MethodFilter as F;
+    /// The router's filter for this method set: `Any` is the union of every
+    /// routable method, never the router's every-method wildcard.
+    fn filter(self) -> axum::routing::MethodFilter {
         match self {
-            Self::Connect => Some(F::CONNECT),
-            Self::Delete => Some(F::DELETE),
-            Self::Get => Some(F::GET),
-            Self::Head => Some(F::HEAD),
-            Self::Options => Some(F::OPTIONS),
-            Self::Patch => Some(F::PATCH),
-            Self::Post => Some(F::POST),
-            Self::Put => Some(F::PUT),
-            Self::Trace => Some(F::TRACE),
-            Self::Any => None,
+            Self::One(method) => method.filter(),
+            // Seeded with one member of the set, so the union is over the set
+            // alone (a filter is never empty).
+            Self::Any => RoutableMethod::ALL
+                .into_iter()
+                .fold(RoutableMethod::Get.filter(), |set, method| {
+                    set.or(method.filter())
+                }),
         }
     }
 }
@@ -2638,12 +2825,20 @@ impl ParsedTarget {
             Self::MountWeb(base, _) => Some(base),
         }
     }
+
+    /// What this route serves.
+    const fn kind(&self) -> RouteKind {
+        match self {
+            Self::Handler(method, ..) => RouteKind::Endpoint(*method),
+            Self::Static(..) => RouteKind::Static,
+            #[cfg(feature = "web")]
+            Self::MountWeb(..) => RouteKind::Mount,
+        }
+    }
 }
 
 /// One `Ipe.Server` route parsed at listen, before any router insert.
 struct ParsedRoute {
-    /// The method as the program named it, for messages.
-    method: String,
     /// The path as the program wrote it, for messages.
     path: String,
     target: ParsedTarget,
@@ -2656,8 +2851,8 @@ enum RouteCause {
     Pattern(crate::encoding::ServerPatternRefusal),
     /// A mount's prefix is not a mount base.
     Prefix(crate::encoding::MountBaseRefusal),
-    /// A handler's method is no HTTP method.
-    Method,
+    /// A handler's method names no method a handler serves.
+    Method(EndpointMethodRefusal),
 }
 
 impl RouteCause {
@@ -2692,7 +2887,7 @@ impl RouteCause {
                 | M::DotSegment
                 | M::Reserved { .. },
             )
-            | Self::Method => false,
+            | Self::Method(_) => false,
         }
     }
 }
@@ -2745,10 +2940,15 @@ impl std::fmt::Display for EndpointRefusal {
                 f,
                 "Server.listen: mount `{endpoint}` is not a well-formed mount prefix: {refusal}"
             ),
-            RouteCause::Method => write!(
+            RouteCause::Method(EndpointMethodRefusal::Unknown) => write!(
                 f,
                 "Server.listen: endpoint `{endpoint}` names no HTTP method; use GET, POST, PUT, \
-                 DELETE, PATCH, HEAD, OPTIONS, TRACE, CONNECT or ANY"
+                 DELETE, PATCH, HEAD, OPTIONS or ANY"
+            ),
+            RouteCause::Method(EndpointMethodRefusal::NotRoutable) => write!(
+                f,
+                "Server.listen: endpoint `{endpoint}` names TRACE or CONNECT, which no route \
+                 serves; use GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS or ANY"
             ),
         }
     }
@@ -2825,7 +3025,7 @@ fn parse_routes(routes: Vec<ServerRoute>) -> Result<Vec<ParsedRoute>, EndpointRe
         .into_iter()
         .map(|r| {
             let refuse = |cause| EndpointRefusal {
-                endpoint: quoted_endpoint(&r.method.to_uppercase(), &r.path),
+                endpoint: quoted_endpoint(&r.target.method_label(), &r.path),
                 cause,
             };
             let pattern = || {
@@ -2837,10 +3037,10 @@ fn parse_routes(routes: Vec<ServerRoute>) -> Result<Vec<ParsedRoute>, EndpointRe
                     .map_err(|refusal| refuse(RouteCause::Prefix(refusal)))
             };
             let target = match r.target {
-                RouteTarget::Handler(h) => {
+                RouteTarget::Handler(method, h) => {
                     let pattern = pattern()?;
-                    let method = EndpointMethod::parse(&r.method)
-                        .ok_or_else(|| refuse(RouteCause::Method))?;
+                    let method =
+                        method.map_err(|refused| refuse(RouteCause::Method(refused.cause)))?;
                     ParsedTarget::Handler(method, pattern, h)
                 }
                 RouteTarget::Static(dir) => ParsedTarget::Static(prefix()?, dir),
@@ -2848,7 +3048,6 @@ fn parse_routes(routes: Vec<ServerRoute>) -> Result<Vec<ParsedRoute>, EndpointRe
                 RouteTarget::MountWeb(cell) => ParsedTarget::MountWeb(prefix()?, cell),
             };
             Ok(ParsedRoute {
-                method: r.method,
                 path: r.path,
                 target,
             })
@@ -2859,7 +3058,7 @@ fn parse_routes(routes: Vec<ServerRoute>) -> Result<Vec<ParsedRoute>, EndpointRe
 impl ParsedRoute {
     /// This route as a listen error quotes it.
     fn endpoint(&self) -> RefusedText {
-        quoted_endpoint(&self.method.to_uppercase(), &self.path)
+        quoted_endpoint(self.target.kind().label(), &self.path)
     }
 }
 
@@ -3070,11 +3269,12 @@ pub(crate) async fn bind_app_listener(
 #[allow(clippy::disallowed_methods)] // the one app serve site; Host admission wraps the router
 pub(crate) async fn serve_app(
     app: AppListener,
-    router: axum::Router,
+    router: impl Into<ServedRouter>,
     armed: shutdown::Armed,
 ) -> std::io::Result<shutdown::Stopped> {
     use axum::ServiceExt as _;
     use tower::Layer as _;
+    let ServedRouter { router, allow } = router.into();
     let mut served: std::io::Result<()> = Ok(());
     if !armed.is_draining() {
         let AppListener {
@@ -3086,7 +3286,7 @@ pub(crate) async fn serve_app(
             count: armed.work_count(),
         };
         let svc = crate::inbound_authority::HostAdmissionLayer::new(admission, tag)
-            .layer(work.layer(CanonicalUrl::new(router)));
+            .layer(work.layer(CanonicalUrl::with_allow(router, allow)));
         let mut stop = armed.drain();
         let serve = std::future::IntoFuture::into_future(
             axum::serve(
@@ -3098,6 +3298,23 @@ pub(crate) async fn serve_app(
         served = serve_until_drained(serve, &armed).await;
     }
     stop_after_serve(&armed, served).await
+}
+
+/// The router an app listener serves, and the methods its handler paths
+/// serve for a refused method's `Allow`.
+pub(crate) struct ServedRouter {
+    router: axum::Router,
+    allow: Option<AllowOracle>,
+}
+
+impl From<axum::Router> for ServedRouter {
+    /// A router whose refused methods name no `Allow`.
+    fn from(router: axum::Router) -> Self {
+        Self {
+            router,
+            allow: None,
+        }
+    }
 }
 
 /// Run `serve` until it ends, or until the drain plus what is left of the
@@ -3273,11 +3490,16 @@ pub(crate) fn exposure_warning(host: crate::app_config::ListenHost) -> Option<[S
 /// included, behind the handlers through one [`MountTable`] fallback, never a
 /// router nest.
 ///
+/// Beside it, the [`AllowOracle`] over the same handler paths and method sets.
+///
 /// # Errors
 ///
 /// `RouterRejected` when the router refuses a handler insert.
-async fn listener_routes(routes: Vec<ParsedRoute>) -> Result<axum::Router, ServerStartRefusal> {
+async fn listener_routes(
+    routes: Vec<ParsedRoute>,
+) -> Result<(axum::Router, AllowOracle), ServerStartRefusal> {
     let mut app: axum::Router = axum::Router::new();
+    let mut allow: axum::Router = axum::Router::new();
     let mut mounts = Vec::new();
     // The bases of the mounted web apps: the only prefixes below which a
     // worker script fetch may pass the listener's worker gate.
@@ -3291,8 +3513,12 @@ async fn listener_routes(routes: Vec<ParsedRoute>) -> Result<axum::Router, Serve
                 mounts.push((base, files));
             }
             ParsedTarget::Handler(method, pattern, h) => {
-                let endpoint = quoted_endpoint(&r.method.to_uppercase(), &r.path);
+                let endpoint = quoted_endpoint(method.as_str(), &r.path);
                 let path = pattern.router_path().to_owned();
+                let named = axum::routing::on(method.filter(), || async {
+                    axum::http::StatusCode::METHOD_NOT_ALLOWED
+                });
+                allow = insert_endpoint(allow, &path, named, endpoint.clone())?;
                 let mr = method_router(method, pattern, h);
                 app = insert_endpoint(app, &path, mr, endpoint)?;
             }
@@ -3320,7 +3546,10 @@ async fn listener_routes(routes: Vec<ParsedRoute>) -> Result<axum::Router, Serve
     let mounted_workers = AdmittedWorkerPaths::of_bases(&worker_bases);
     #[cfg(not(feature = "web"))]
     let mounted_workers = AdmittedWorkerPaths::none();
-    Ok(worker_gated(app, mounts, mounted_workers))
+    Ok((
+        worker_gated(app, mounts, mounted_workers),
+        AllowOracle(allow),
+    ))
 }
 
 /// The listener's router over `routes`, parsed, conflict-checked and
@@ -3335,7 +3564,8 @@ pub(crate) async fn listen_router(routes: Vec<ServerRoute>) -> Option<axum::Rout
     {
         return None;
     }
-    listener_routes(routes).await.ok().map(behind_listener)
+    let (router, allow) = listener_routes(routes).await.ok()?;
+    Some(axum::Router::new().fallback_service(CanonicalUrl::with_allow(router, Some(allow))))
 }
 
 pub fn server_listen<E: crate::FromIpeError + Send + 'static>(
@@ -3394,8 +3624,8 @@ pub fn server_listen<E: crate::FromIpeError + Send + 'static>(
                 "Server.listen: {refusal}"
             ))));
         }
-        let app = match listener_routes(routes).await {
-            Ok(app) => app,
+        let (app, allow) = match listener_routes(routes).await {
+            Ok(served) => served,
             Err(refusal) => return refuse(refusal),
         };
         // Ipê doctrine: a panicking handler returns 500, never crashes the
@@ -3486,7 +3716,11 @@ pub fn server_listen<E: crate::FromIpeError + Send + 'static>(
         };
         // `serve_app` serves with connect-info, so each request carries the peer
         // `SocketAddr` (`ServerRequest.remoteAddr`, per-IP rate limiting).
-        match serve_app(listener, app, armed).await {
+        let served = ServedRouter {
+            router: app,
+            allow: Some(allow),
+        };
+        match serve_app(listener, served, armed).await {
             Ok(shutdown::Stopped { .. }) => ok_res(()),
             Err(e) => IpeResult::Err(E::from_ipe_error(IpeError::io(format!(
                 "Server.listen: serve: {}",
@@ -5504,7 +5738,7 @@ mod revocation_env_tests {
             Box::pin(std::future::ready(ok_res(server_text(subject))))
         });
         crate::system::locked_remove_var(ENV);
-        let RouteTarget::Handler(handler) = route.target else {
+        let RouteTarget::Handler(_, handler) = route.target else {
             return 500;
         };
         let req = ServerRequest {
@@ -6148,9 +6382,8 @@ mod tests {
 
     fn handler_route(method: &str, path: &str) -> ServerRoute {
         ServerRoute {
-            method: method.to_string(),
             path: path.to_string(),
-            target: RouteTarget::Handler(name_echo()),
+            target: RouteTarget::Handler(author_method(method), name_echo()),
         }
     }
 
@@ -6178,10 +6411,9 @@ mod tests {
 
     /// Prove the refusals: two handlers of one shape with an overlapping
     /// method are refused before any insert, whatever their parameter names
-    /// or literal spellings. The router refuses two filtered methods itself,
-    /// but registers `ANY` beside a filtered method as a method fallback, so
-    /// for those sets the check is the one gate that keeps a handler from
-    /// silently shadowing part of another.
+    /// or literal spellings. `ANY` is the union of the routable methods, so
+    /// the router itself refuses it beside any of them, and the check names
+    /// both endpoints before that insert could panic.
     #[test]
     fn handlers_of_one_shape_and_method_conflict() {
         for (set, router_refuses) in [
@@ -6189,8 +6421,8 @@ mod tests {
             ([("GET", "/café"), ("GET", "/caf%C3%A9")], true),
             ([("GET", "/api"), ("GET", "/%61pi")], true),
             ([("get", "/a"), ("GET", "/a")], true),
-            ([("ANY", "/hook"), ("POST", "/hook")], false),
-            ([("PATCH", "/x/:id"), ("ANY", "/x/:key")], false),
+            ([("ANY", "/hook"), ("POST", "/hook")], true),
+            ([("PATCH", "/x/:id"), ("ANY", "/x/:key")], true),
         ] {
             let (verdict, inserted) = conflict_and_router(&set);
             assert!(
@@ -6243,10 +6475,9 @@ mod tests {
         for (method, path) in [("FETCH", "/x"), ("", "/x"), ("MOUNT", "/x")] {
             let refused = parse_routes(vec![handler_route(method, path)]).err();
             assert!(
-                refused
-                    .as_ref()
-                    .is_some_and(|r| r.cause == RouteCause::Method
-                        && r.endpoint == quoted_endpoint(&method.to_uppercase(), path)),
+                refused.as_ref().is_some_and(|r| r.cause
+                    == RouteCause::Method(EndpointMethodRefusal::Unknown)
+                    && r.endpoint == quoted_endpoint(&method.to_uppercase(), path)),
                 "{method:?}"
             );
             assert!(
@@ -6254,7 +6485,7 @@ mod tests {
                 "{method:?}"
             );
         }
-        assert!(EndpointMethod::parse("patch") == Some(EndpointMethod::Patch));
+        assert!(EndpointMethod::parse("patch") == Some(EndpointMethod::One(RoutableMethod::Patch)));
     }
 
     /// A handler serves its own method only: a `PATCH` handler answers
@@ -6286,6 +6517,177 @@ mod tests {
                 Err(e) => match e {},
             };
             assert_eq!(resp.status(), status, "{method}");
+        }
+    }
+
+    /// A handler that counts its runs in `runs`.
+    fn counting_handler(runs: &Arc<std::sync::atomic::AtomicUsize>) -> ErasedHandler {
+        let runs = Arc::clone(runs);
+        Arc::new(move |_req: ServerRequest| {
+            runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { Ok(server_text("ran".to_owned())) })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<ServerResponse, String>> + Send>,
+                >
+        })
+    }
+
+    /// `routes` behind the listener's URL service exactly as `server_listen`
+    /// serves them: parsed, assembled with their `Allow` oracle, and wrapped
+    /// in the outermost [`CanonicalUrl`].
+    #[allow(clippy::expect_used)] // test: the fixed routes parse and assemble
+    async fn served(routes: Vec<ServerRoute>) -> CanonicalUrl<axum::Router> {
+        let parsed = parse_routes(routes).expect("the routes parse");
+        let (router, allow) = listener_routes(parsed).await.expect("the routes assemble");
+        CanonicalUrl::with_allow(router, Some(allow))
+    }
+
+    /// The listener's answer to one `method` request for `uri`.
+    #[allow(clippy::expect_used)] // test: the fixed requests build
+    async fn answer(
+        app: &CanonicalUrl<axum::Router>,
+        method: &str,
+        uri: &str,
+    ) -> axum::response::Response {
+        use tower::ServiceExt;
+        let wire = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .expect("test request builds");
+        match app.clone().oneshot(wire).await {
+            Ok(r) => r,
+            Err(e) => match e {},
+        }
+    }
+
+    /// Whether `resp` carries every response security header.
+    #[allow(clippy::expect_used)] // test: the default security headers resolve
+    fn carries_security_headers(resp: &axum::response::Response) -> bool {
+        response_security_headers()
+            .expect("the default security headers resolve")
+            .iter()
+            .all(|(name, _)| resp.headers().contains_key(*name))
+    }
+
+    /// Prove the refusals: `TRACE` and `CONNECT` reach no handler, `ANY`
+    /// included. Each is answered `405` with the security headers before any
+    /// router runs; on a handler path `Allow` names the methods it serves,
+    /// never `TRACE` or `CONNECT`, and a `CONNECT` in authority form names
+    /// none.
+    #[tokio::test]
+    async fn trace_and_connect_never_reach_a_handler() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let runs = Arc::new(AtomicUsize::new(0));
+        let app = served(vec![ServerRoute {
+            path: "/".to_owned(),
+            target: RouteTarget::Handler(Ok(EndpointMethod::Any), counting_handler(&runs)),
+        }])
+        .await;
+        for (method, uri, names_allow) in [
+            ("TRACE", "/", true),
+            ("CONNECT", "/", true),
+            ("CONNECT", "example.com:443", false),
+            ("TRACE", "/unrouted", false),
+        ] {
+            let resp = answer(&app, method, uri).await;
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {uri}"
+            );
+            assert!(carries_security_headers(&resp), "{method} {uri}");
+            let allow = resp
+                .headers()
+                .get(axum::http::header::ALLOW)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            assert_eq!(allow.is_some(), names_allow, "{method} {uri}: {allow:?}");
+            if let Some(allow) = allow {
+                assert!(allow.contains("GET") && allow.contains("POST"), "{allow}");
+                assert!(
+                    !allow.contains("TRACE") && !allow.contains("CONNECT"),
+                    "{allow}"
+                );
+            }
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        let reached = answer(&app, "GET", "/").await;
+        assert_eq!(reached.status(), axum::http::StatusCode::OK);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    /// Prove the refusals: an `ANY` route serves the seven routable methods
+    /// only. An extension method, or a known one in another case, is answered
+    /// `501` with the security headers and reaches no handler.
+    #[tokio::test]
+    async fn any_route_refuses_extension_methods() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let runs = Arc::new(AtomicUsize::new(0));
+        let app = served(vec![ServerRoute {
+            path: "/hook".to_owned(),
+            target: RouteTarget::Handler(Ok(EndpointMethod::Any), counting_handler(&runs)),
+        }])
+        .await;
+        for method in ["BREW", "delete", "Get", "PROPFIND", "ANY", "MOUNT"] {
+            let resp = answer(&app, method, "/hook").await;
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::NOT_IMPLEMENTED,
+                "{method}"
+            );
+            assert!(carries_security_headers(&resp), "{method}");
+            assert!(
+                !resp.headers().contains_key(axum::http::header::ALLOW),
+                "{method}"
+            );
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        for method in RoutableMethod::ALL {
+            let resp = answer(&app, method.as_str(), "/hook").await;
+            assert_eq!(resp.status(), axum::http::StatusCode::OK, "{method:?}");
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), RoutableMethod::ALL.len());
+    }
+
+    /// Prove the refusal at listen: a `Server.api` spec naming `TRACE` or
+    /// `CONNECT` refuses the route set with a typed cause before binding.
+    #[tokio::test]
+    async fn api_trace_connect_refused_at_listen() {
+        for spec in ["TRACE /x", "connect /x"] {
+            let api = server_api::<String, _>(spec.to_owned(), |_req: ServerRequest| {
+                Box::pin(ready(ok_res::<String, _>(server_text("hi".to_owned()))))
+                    as IpeTask<String, ServerResponse>
+            });
+            let refused = parse_routes(vec![api]).err();
+            assert_eq!(
+                refused.as_ref().map(|r| r.cause.clone()),
+                Some(RouteCause::Method(EndpointMethodRefusal::NotRoutable)),
+                "{spec}"
+            );
+            let listened: IpeResult<crate::IpeError, ()> = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                server_listen(
+                    0,
+                    vec![handler_route(spec.split(' ').next().unwrap_or(spec), "/x")],
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| IpeResult::Ok(()));
+            let IpeResult::Err(error) = listened else {
+                assert!(
+                    matches!(listened, IpeResult::Err(_)),
+                    "{spec}: a refused route set must return before binding"
+                );
+                return;
+            };
+            assert_eq!(
+                crate::ipe_error_kind(error.clone()),
+                crate::IpeErrorKind::InvalidInput,
+                "{spec}"
+            );
+            let msg = crate::ipe_error_message(error);
+            assert!(msg.contains("names TRACE or CONNECT"), "{spec}: {msg}");
         }
     }
 
@@ -6329,9 +6731,8 @@ mod tests {
 
     fn get_route(path: &str) -> ServerRoute {
         ServerRoute {
-            method: "GET".to_string(),
             path: path.to_string(),
-            target: RouteTarget::Handler(name_echo()),
+            target: RouteTarget::Handler(one(RoutableMethod::Get), name_echo()),
         }
     }
 
@@ -6475,7 +6876,11 @@ mod tests {
         let at_cap = params_path(cap);
         let pattern = crate::encoding::ServerPattern::parse(&at_cap).expect("at the cap parses");
         let path = pattern.router_path().to_owned();
-        let mr = method_router(EndpointMethod::Get, pattern, name_echo());
+        let mr = method_router(
+            EndpointMethod::One(RoutableMethod::Get),
+            pattern,
+            name_echo(),
+        );
         assert!(
             insert_endpoint(
                 axum::Router::new(),
@@ -6504,7 +6909,13 @@ mod tests {
     #[allow(clippy::expect_used)] // test: the fixed pattern parses
     fn a_router_rejected_insert_is_its_own_refusal() {
         let pattern = || crate::encoding::ServerPattern::parse("/a").expect("parses");
-        let mr = || method_router(EndpointMethod::Get, pattern(), name_echo());
+        let mr = || {
+            method_router(
+                EndpointMethod::One(RoutableMethod::Get),
+                pattern(),
+                name_echo(),
+            )
+        };
         let app = insert_endpoint(
             axum::Router::new(),
             "/a",
@@ -6565,7 +6976,7 @@ mod tests {
         let refused = parse_routes(vec![handler_route(&method, "/ok")]).err();
         assert_eq!(
             refused.as_ref().map(|r| r.cause.clone()),
-            Some(RouteCause::Method)
+            Some(RouteCause::Method(EndpointMethodRefusal::Unknown))
         );
         let msg = refused.map(|r| r.to_string()).unwrap_or_default();
         let quoted = format!("`{} /ok`", excerpt(&method, METHOD_EXCERPT_CHARS));
@@ -6590,7 +7001,14 @@ mod tests {
             cap: crate::encoding::MAX_SERVER_PARAMS,
         };
         let cases = [
-            (route(RouteCause::Method), K::InvalidInput),
+            (
+                route(RouteCause::Method(EndpointMethodRefusal::Unknown)),
+                K::InvalidInput,
+            ),
+            (
+                route(RouteCause::Method(EndpointMethodRefusal::NotRoutable)),
+                K::InvalidInput,
+            ),
             (
                 route(RouteCause::Pattern(ServerPatternRefusal::NotAbsolute)),
                 K::InvalidInput,
@@ -6646,7 +7064,11 @@ mod tests {
             let path = pattern.router_path().to_owned();
             app = app.route(
                 &path,
-                method_router(EndpointMethod::Get, pattern, name_echo()),
+                method_router(
+                    EndpointMethod::One(RoutableMethod::Get),
+                    pattern,
+                    name_echo(),
+                ),
             );
         }
         let app = behind_listener(app);
@@ -6687,7 +7109,11 @@ mod tests {
             app = insert_endpoint(
                 app,
                 &path,
-                method_router(EndpointMethod::Get, pattern, name_echo()),
+                method_router(
+                    EndpointMethod::One(RoutableMethod::Get),
+                    pattern,
+                    name_echo(),
+                ),
                 RefusedText::new(raw),
             )
             .expect("a brace literal registers as a literal");
@@ -7083,7 +7509,10 @@ mod tests {
     fn endpoint_router(raw: &str, h: ErasedHandler) -> axum::Router {
         let pattern = crate::encoding::ServerPattern::parse(raw).expect("well-formed");
         let path = pattern.router_path().to_owned();
-        axum::Router::new().route(&path, method_router(EndpointMethod::Get, pattern, h))
+        axum::Router::new().route(
+            &path,
+            method_router(EndpointMethod::One(RoutableMethod::Get), pattern, h),
+        )
     }
 
     /// Run `build_request` inside a router matched on `pattern`.
@@ -7966,8 +8395,10 @@ mod tests {
             Box::pin(ready(ok_res::<String, _>(server_text("hi".to_string()))))
                 as IpeTask<String, ServerResponse>
         });
-        assert_eq!(r.method, "GET");
-        assert!(matches!(r.target, RouteTarget::Handler(_)));
+        assert!(matches!(
+            r.target,
+            RouteTarget::Handler(Ok(EndpointMethod::One(RoutableMethod::Get)), _)
+        ));
         let resp = server_with_status(404, server_text("nope".to_string()));
         assert_eq!(resp.status, 404);
     }
@@ -10909,7 +11340,7 @@ mod tests {
                 let subject = crate::principal::principal_subject(p);
                 Box::pin(std::future::ready(ok_res(server_text(subject))))
             });
-            let RouteTarget::Handler(h) = route.target else {
+            let RouteTarget::Handler(_, h) = route.target else {
                 panic!("authed route must carry a handler");
             };
             dispatch(&h, req)
@@ -10935,7 +11366,7 @@ mod tests {
                     .unwrap_or_default();
                 Box::pin(std::future::ready(ok_res(server_text(bound.to_string()))))
             });
-            let RouteTarget::Handler(h) = route.target else {
+            let RouteTarget::Handler(_, h) = route.target else {
                 return plain_resp(500, "no handler", &[]);
             };
             dispatch(&h, req)
@@ -11569,7 +12000,7 @@ mod tests {
                     Box::pin(std::future::ready(ok_res(server_text(String::new()))))
                 },
             );
-            let RouteTarget::Handler(h) = route.target else {
+            let RouteTarget::Handler(_, h) = route.target else {
                 panic!("a GET route carries a handler");
             };
             let admitted = dispatch(&h, bearer_req(claims))
@@ -11688,8 +12119,8 @@ mod tests {
                     )
                 },
             );
-            assert!(matches!(route.target, RouteTarget::Handler(_)));
-            let RouteTarget::Handler(h) = route.target else {
+            assert!(matches!(route.target, RouteTarget::Handler(..)));
+            let RouteTarget::Handler(_, h) = route.target else {
                 return;
             };
             let (resp, streams) = dispatch(&h, bearer_req(&claims)).await;
@@ -11829,7 +12260,7 @@ mod tests {
                         format!("{verified}|{bound}"),
                     )))) as IpeTask<String, ServerResponse>
                 });
-            let RouteTarget::Handler(h) = route.target else {
+            let RouteTarget::Handler(_, h) = route.target else {
                 panic!("a GET route carries a handler");
             };
             assert_eq!(
@@ -12036,7 +12467,7 @@ mod tests {
                         },
                     )
                 });
-            let RouteTarget::Handler(h) = route.target else {
+            let RouteTarget::Handler(_, h) = route.target else {
                 panic!("a GET route carries a handler");
             };
             let (resp, streams) = dispatch(&h, req_with(&[], &[])).await;
@@ -12354,7 +12785,11 @@ mod worker_gate_tests {
                 let path = pattern.router_path().to_owned();
                 router.route(
                     &path,
-                    method_router(EndpointMethod::Get, pattern, script_handler()),
+                    method_router(
+                        EndpointMethod::One(RoutableMethod::Get),
+                        pattern,
+                        script_handler(),
+                    ),
                 )
             })
     }
