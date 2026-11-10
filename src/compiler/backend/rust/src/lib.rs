@@ -491,15 +491,33 @@ impl CrateIdentity {
 /// compiler container, offline, CI) without a host-absolute path. Absent (the
 /// default) emits the byte-identical vendored-source project.
 ///
-/// The `root` field identifies the resolved runtime crate root. It is resolved
-/// by the driver (fail-closed — a missing or wrong-package root is a loud
-/// refusal) and retained for diagnostics and cache-key purposes; the emitter no
-/// longer embeds it in the manifest.
+/// The `content` field names the bytes of the runtime crate the dependency
+/// resolves to; it keys the emit settings and never reaches an emitted byte.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RuntimeDep {
-    /// The absolute, canonical runtime crate root (the directory holding the
-    /// runtime `Cargo.toml`), retained for diagnostics and cache keying.
-    pub root: std::path::PathBuf,
+    /// The content identity of the runtime crate the emitted project links.
+    pub content: RuntimeContentId,
+}
+
+/// The content identity of a runtime crate.
+///
+/// It is built only from a digest of the runtime's bytes and has no default,
+/// so a dependency always names the runtime it was emitted against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RuntimeContentId([u8; 16]);
+
+impl RuntimeContentId {
+    /// The identity of the runtime whose content digest is `bytes`.
+    #[must_use]
+    pub const fn from_digest_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// The digest bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
 }
 
 impl<'a> RustBackend<'a> {

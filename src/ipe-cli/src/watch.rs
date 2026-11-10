@@ -160,7 +160,13 @@ pub enum RestartOutcomeKind {
 pub struct WatchOptions {
     pub entry: PathBuf,
     pub out_dir: PathBuf,
-    pub runtime_dir: PathBuf,
+    /// The runtime source every rebuild's emit carries, resolved once by the
+    /// caller.
+    pub runtime: crate::runtime_embed::RuntimeSource,
+    /// Whether each rebuild links the runtime as a dependency or vendors its
+    /// tree. [`WatchOptions::new`] defaults to linked; the CLI layer sets it
+    /// from `IPE_RUNTIME_VENDORED` as every other dev build does.
+    pub runtime_emit: crate::RuntimeEmit,
     /// The port the user reaches the app on: the spawned child's listen port in
     /// direct mode (injected through the listener relocation var
     /// [`ipe_runtime_rust::LISTEN_PORT_RELOCATION_ENV`]), the proxy's port in
@@ -225,11 +231,16 @@ pub struct WatchOptions {
 
 impl WatchOptions {
     #[must_use]
-    pub fn new(entry: PathBuf, out_dir: PathBuf, runtime_dir: PathBuf) -> Self {
+    pub fn new(
+        entry: PathBuf,
+        out_dir: PathBuf,
+        runtime: crate::runtime_embed::RuntimeSource,
+    ) -> Self {
         Self {
             entry,
             out_dir,
-            runtime_dir,
+            runtime,
+            runtime_emit: crate::RuntimeEmit::Linked,
             port: 8000,
             debounce: ipe_watch::DebounceConfig::default(),
             restart_timeouts: ipe_watch::RestartTimeouts::for_dev_watch(),
@@ -621,12 +632,14 @@ fn watch_emit_settings(
     resolved: &ResolvedProject,
     debugger: bool,
     hot_appearance: bool,
+    runtime_emit: crate::RuntimeEmit,
 ) -> ipe_backend_rust::EmitSettings {
     let options = crate::BuildOptions {
         target: REBUILD_TARGET,
         intent: REBUILD_INTENT,
         debugger,
         hot_appearance,
+        runtime_emit,
         ..crate::BuildOptions::default()
     };
     let manifest_path = resolved.blame_path();
@@ -639,6 +652,30 @@ fn watch_emit_settings(
         &options,
         crate::runtime_embed::BundleRole::Out,
     )
+}
+
+/// The runtime dependency every rebuild of `opts` names, derived once before
+/// the loop starts.
+///
+/// A linked emit names the runtime's content; a vendored one names none and
+/// copies the runtime tree instead.
+///
+/// # Errors
+/// [`CliError::Usage`] for the debugger on a vendored emit (the vendored
+/// runtime tree carries no debugger), refused as every other dev build
+/// refuses it; the runtime's bundling errors.
+fn watch_runtime_dep(
+    opts: &WatchOptions,
+) -> Result<Option<ipe_backend_rust::RuntimeDep>, CliError> {
+    match opts.runtime_emit {
+        crate::RuntimeEmit::Linked => Ok(Some(ipe_backend_rust::RuntimeDep {
+            content: opts.runtime.content_id()?,
+        })),
+        crate::RuntimeEmit::Vendored if opts.debugger => Err(CliError::Usage(
+            crate::text::msg::debugger_needs_runtime_dep(),
+        )),
+        crate::RuntimeEmit::Vendored => Ok(None),
+    }
 }
 
 /// The floor every watch rebuild's crate carries: the development marker.
@@ -1045,11 +1082,7 @@ fn run_inner(
         })?;
     }
 
-    // Resolve the runtime crate root once, fail-closed, before the event loop
-    // starts. The path-dependency emit needs the CRATE ROOT (the directory
-    // holding the runtime `Cargo.toml`), not the source sub-tree. This
-    // mirrors how `ipe dev build` resolves it via `runtime_embed::resolve()`.
-    let runtime_dep_root = crate::runtime_embed::resolve()?.root().to_path_buf();
+    let runtime_dep = watch_runtime_dep(&opts)?;
 
     // The DEV-ONLY blue-green front proxy. When engaged it binds the user's port
     // up front and holds it for the whole session; the app binaries run behind it
@@ -1207,7 +1240,12 @@ fn run_inner(
                         continue;
                     }
                 };
-                let settings = watch_emit_settings(&resolved, opts.debugger, opts.hot_appearance);
+                let settings = watch_emit_settings(
+                    &resolved,
+                    opts.debugger,
+                    opts.hot_appearance,
+                    opts.runtime_emit,
+                );
                 // Borrow each module's text from the snapshot:
                 // `sync_source_root` clones only at the real mutation points
                 // (a new input, or an actually-changed set), so the database
@@ -1233,16 +1271,9 @@ fn run_inner(
                         // The backend writes FFI bindings (src/ffi.rs) into the
                         // emitted project — the same slot `run_build` fills.
                         ffi: resolved.snapshot.ffi().emit.clone(),
-                        // Dependency-model emit: the project links the runtime
-                        // as a path dependency (what `ipe dev build` uses by
-                        // default), so no runtime source is vendored into
-                        // `src/ipe_runtime/`. `runtime_dep_root` is the verified
-                        // crate root (holds `Cargo.toml`), resolved once before
-                        // the loop via `runtime_embed::resolve()`, matching
-                        // `ipe dev build`'s path.
-                        runtime_dep: Some(ipe_backend_rust::RuntimeDep {
-                            root: runtime_dep_root.clone(),
-                        }),
+                        // The runtime dependency the session's emit model names,
+                        // derived once before the loop.
+                        runtime_dep: runtime_dep.clone(),
                         ..settings
                     },
                 });
@@ -1523,7 +1554,7 @@ fn run_inner(
                         let crate_dir = match write_emitted_project(
                             &emitted,
                             &out_target,
-                            &opts.runtime_dir,
+                            &opts.runtime,
                             None,
                             false,
                             REBUILD_FLOOR,
@@ -3282,10 +3313,40 @@ mod tests {
         emitted_is_tui, emitted_is_web, env_flag_on, first_error_line, mint_hot_token, mpsc,
         prove_green_crate, push_control_appearance, resolve_project_sources,
         schedule_resolve_retry, send_control_frame, spawn_command, strip_ansi, watch_emit_settings,
-        watch_line, watch_status_body,
+        watch_line, watch_runtime_dep, watch_status_body,
     };
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
+
+    /// A watch session follows its runtime emit model.
+    ///
+    /// A vendored session names no runtime dependency and refuses the
+    /// debugger; a linked one names the embedded runtime's content.
+    #[test]
+    fn a_watch_session_follows_its_runtime_emit_model() {
+        let session = |runtime_emit, debugger| {
+            let mut opts = super::WatchOptions::new(
+                PathBuf::from("Main.ipe"),
+                PathBuf::from("out"),
+                crate::runtime_embed::RuntimeSource::Embedded,
+            );
+            opts.runtime_emit = runtime_emit;
+            opts.debugger = debugger;
+            watch_runtime_dep(&opts)
+        };
+        assert!(matches!(
+            session(crate::RuntimeEmit::Vendored, false),
+            Ok(None)
+        ));
+        assert!(matches!(
+            session(crate::RuntimeEmit::Vendored, true),
+            Err(crate::CliError::Usage(_))
+        ));
+        assert!(matches!(
+            session(crate::RuntimeEmit::Linked, false),
+            Ok(Some(_))
+        ));
+    }
 
     /// A watch rebuild names its crate by the project's identity, exactly as a
     /// cold build of the same project does.
@@ -3298,7 +3359,7 @@ mod tests {
         ))
         .expect("root");
         let resolved = resolve_project_sources(root).expect("resolved");
-        let settings = watch_emit_settings(&resolved, false, false);
+        let settings = watch_emit_settings(&resolved, false, false, crate::RuntimeEmit::Linked);
         let canonical = std::fs::canonicalize(fixture.path()).expect("canonical");
         let expected = ipe_backend_rust::crate_identity(
             &ipe_backend_rust::sanitize_cargo_name(&fixture.root().manifest().name),
@@ -4255,7 +4316,7 @@ mod tests {
         let opts = super::WatchOptions::new(
             PathBuf::from("Main.ipe"),
             PathBuf::from("out"),
-            PathBuf::from("runtime"),
+            crate::runtime_embed::RuntimeSource::Embedded,
         );
         assert!(matches!(
             super::spawn(opts),
@@ -4359,7 +4420,7 @@ mod tests {
         let written = super::write_emitted_project(
             &emitted_with_main("fn main() {\n    run();\n}\n"),
             &super::EmitTarget::Claimed(claimed),
-            &base.join("no-runtime"),
+            &crate::runtime_embed::RuntimeSource::Embedded,
             None,
             false,
             super::REBUILD_FLOOR,

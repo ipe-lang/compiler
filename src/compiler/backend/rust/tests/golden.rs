@@ -5,11 +5,9 @@
 //! [`RustBackend::emit`] reproduces the golden `main.rs` and `Cargo.toml`
 //! byte-for-byte. The golden is the correctness contract.
 
-use std::path::{Path, PathBuf};
-
 use ipe_backend::Backend;
 use ipe_backend_rust::golden_form::golden_cargo_toml;
-use ipe_backend_rust::{RuntimeDep, RustBackend};
+use ipe_backend_rust::{RuntimeContentId, RuntimeDep, RustBackend};
 use ipe_diagnostics::{DResult, Diagnostic};
 use ipe_intern::Interner;
 use ipe_ir::{
@@ -24,32 +22,13 @@ const GOLDEN_CARGO: &str = include_str!("../../../../../tests/golden/basics/Carg
 /// `golden_cargo_toml` replaces with the portable placeholder.
 const BASICS_PROJECT_NAME: &str = "basics_00000000";
 
-/// Locate the runtime crate root (`src/runtime/rust`) by walking up from the
-/// crate manifest dir — the same in-repo resolution the driver performs. Used
-/// to build the [`RuntimeDep`] the dependency-model emit needs.
-#[allow(clippy::expect_used)]
-fn runtime_crate_root() -> PathBuf {
-    let manifest = e2e_support::manifest_dir!();
-    let mut here: Option<&Path> = Some(&manifest);
-    let found = std::iter::from_fn(|| {
-        let dir = here?;
-        here = dir.parent();
-        Some(dir.join("src").join("runtime").join("rust"))
-    })
-    .find(|candidate| candidate.join("Cargo.toml").is_file())
-    .expect("the ipe-runtime-rust crate root (src/runtime/rust) must resolve for the golden test");
-    found
-        .canonicalize()
-        .expect("runtime crate root canonicalizes")
-}
-
 /// The dependency-model backend the golden emit now exercises (the default
 /// native emit shape).
 fn dep_backend(interner: &Interner) -> RustBackend<'_> {
     RustBackend::new(interner)
         .with_project_name(BASICS_PROJECT_NAME)
         .with_runtime_dep(Some(RuntimeDep {
-            root: runtime_crate_root(),
+            content: RuntimeContentId::from_digest_bytes([0; 16]),
         }))
 }
 

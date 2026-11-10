@@ -859,8 +859,6 @@ messages! {
     delivery_wasi_requires_wasi_triple(triple) = "delivery-wasi-requires-wasi-triple";
     /// A static-build request was refused.
     cli_static_refusal(refusal) = "cli-static-refusal";
-    /// The Ipe runtime module tree could not be located.
-    cli_runtime_not_found = "cli-runtime-not-found";
     /// Neither `$XDG_CACHE_HOME` nor `$HOME` names an absolute directory.
     cli_cache_home_unknown = "cli-cache-home-unknown";
     /// A directory environment variable is set to a relative path.
@@ -869,7 +867,7 @@ messages! {
     cli_env_switch_not_recognised(var, got: &crate::style::TerminalSafe, admitted) = "cli-env-switch-not-recognised";
     /// The registry URL environment variable is set to a value that is not an `https://` base URL.
     cli_registry_url_not_https(var, reason) = "cli-registry-url-not-https";
-    /// `$IPE_RUNTIME_DIR` does not name a runtime crate root.
+    /// A named runtime directory is not a runtime crate root.
     cli_runtime_dir_invalid(path) = "cli-runtime-dir-invalid";
     /// The invalid runtime dir looks like the inner module directory.
     cli_runtime_dir_invalid_inner_hint = "cli-runtime-dir-invalid-inner-hint";
@@ -879,6 +877,12 @@ messages! {
     cli_runtime_materialize_failed(detail) = "cli-runtime-materialize-failed";
     /// The resolved runtime crate declares a different version than the compiler.
     cli_runtime_version_mismatch(path, found, expected) = "cli-runtime-version-mismatch";
+    /// The runtime refusal remedy on a surface without `--runtime`.
+    cli_runtime_remedy_env_only = "cli-runtime-remedy-env-only";
+    /// The runtime refusal remedy on a surface taking `--runtime`.
+    cli_runtime_remedy_with_flag = "cli-runtime-remedy-with-flag";
+    /// The runtime a linked emit bundles, named in a feature-gap message.
+    cli_runtime_embedded_copy = "cli-runtime-embedded-copy";
     /// `cargo` failed because the runtime lacks a feature the emitted project needs.
     cli_emitted_build_feature_missing(what, feature) = "cli-emitted-build-feature-missing";
     /// The runtime root/version context appended to a feature-gap message.

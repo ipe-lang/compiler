@@ -629,7 +629,7 @@ mod tests {
         let dep = RustBackend::new(&interner)
             .with_debugger(true)
             .with_runtime_dep(Some(crate::RuntimeDep {
-                root: std::path::PathBuf::from("ipe_runtime_dep"),
+                content: crate::RuntimeContentId::from_digest_bytes([0; 16]),
             }));
         let ctx = dep.emit_ctx_for_tests(&prog).expect("build EmitCtx");
         let emitted = crate::project::assemble_project_files(&ctx, Vec::new());

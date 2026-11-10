@@ -517,10 +517,6 @@ a co-located WASI build compiles only to `wasm32-wasip1`, but `{triple}` was req
 
 static build refused: {refusal}
 
-## cli-runtime-not-found
-
-could not locate the Ipe runtime; set IPE_RUNTIME_DIR to an explicit path or pass --runtime <dir>
-
 ## cli-cache-home-unknown
 
 could not determine the per-user cache directory: neither XDG_CACHE_HOME nor the home directory (HOME, or USERPROFILE on Windows) is set to an absolute path; set XDG_CACHE_HOME to an absolute, writable directory
@@ -539,11 +535,11 @@ could not determine the per-user cache directory: neither XDG_CACHE_HOME nor the
 
 ## cli-runtime-dir-invalid
 
-IPE_RUNTIME_DIR points at {path}, which is not an Ipe runtime crate root (its Cargo.toml must declare `name = "ipe-runtime-rust"`)
+the runtime directory {path} is not an Ipe runtime crate root (its Cargo.toml must declare `name = "ipe-runtime-rust"`)
 
 ## cli-runtime-dir-invalid-inner-hint
 
-  = help: this looks like the inner runtime module directory; point IPE_RUNTIME_DIR at the crate root that holds Cargo.toml (e.g. `src/runtime/rust`), not the `src/ipe_runtime` inside it
+  = help: this looks like the inner runtime module directory; point the runtime root at the crate root that holds Cargo.toml (e.g. `src/runtime/rust`), not the `src/ipe_runtime` inside it
 
 ## cli-runtime-home-unknown
 
@@ -557,7 +553,18 @@ could not install the Ipe runtime: {detail}
 ## cli-runtime-version-mismatch
 
 the Ipe runtime at {path} is version {found}, but this compiler is {expected}; a program emitted by this compiler cannot link a different runtime.
-  = help: this runtime is out of date. Remove the stale copy (the project's `out/` directory, or whatever `IPE_RUNTIME_DIR` points at) and rebuild — the matching runtime re-materializes automatically.
+
+## cli-runtime-remedy-env-only
+
+  = help: point IPE_RUNTIME_DIR at a runtime crate root of this compiler's version, or unset it to use the runtime embedded in ipe
+
+## cli-runtime-remedy-with-flag
+
+  = help: point IPE_RUNTIME_DIR or --runtime <dir> at a runtime crate root of this compiler's version, or drop both to use the runtime embedded in ipe
+
+## cli-runtime-embedded-copy
+
+embedded in ipe
 
 ## cli-emitted-build-feature-missing
 
@@ -565,11 +572,11 @@ building {what} failed: it needs the runtime feature `{feature}`
 
 ## cli-emitted-build-feature-context
 
-, but the runtime at {root} (version {version}) does not provide it
+, but the runtime ({root}, version {version}) does not provide it
 
 ## cli-emitted-build-stale-runtime-hint
 
-  = help: the runtime is out of date. Remove the stale copy (the project's `out/` directory, or whatever `IPE_RUNTIME_DIR` points at) and rebuild — the matching runtime re-materializes automatically.
+  = help: the runtime is out of date. Remove the stale copy (the project's `out/` directory) and rebuild; a runtime IPE_RUNTIME_DIR names must match this compiler's version.
 
 ## cli-cargo-fetch-failed
 

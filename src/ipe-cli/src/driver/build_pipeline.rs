@@ -6,6 +6,7 @@ use crate::output_dir::OutputRefusal;
 use crate::output_dir::{EmitTarget, OwnedDir, OwnedPath, ProjectPaths};
 use crate::project_root::ProjectRoot;
 pub use crate::runtime_embed::RuntimeEmit;
+use crate::runtime_embed::{RuntimeModuleTree, RuntimeRemedy, RuntimeSource};
 use crate::source_snapshot::TestView;
 use crate::{
     BTreeMap, BTreeSet, Diagnostic, Interner, Path, PathBuf, build_plan, cache, contained_path, fs,
@@ -502,12 +503,17 @@ impl BuildOptions {
     }
 }
 
-/// Build `entry` into a Rust Cargo project under `out_dir`, vendoring the
-/// runtime module tree from `runtime_dir`.
+/// Build `entry` into a Rust Cargo project under `out_dir`.
+///
+/// `runtime_dir` names the runtime crate root explicitly, the slot `--runtime`
+/// fills; [`RuntimeSource::resolve`] proves it once, and a gate's options take
+/// the embedded runtime instead.
 ///
 /// # Errors
 /// Returns [`CliError::Pipeline`] when the compiler rejects the program,
-/// [`CliError::Io`] on any filesystem failure.
+/// [`CliError::Io`] on any filesystem failure, and the refusals of
+/// [`RuntimeSource::resolve`] when `runtime_dir` is not a runtime crate root of
+/// this compiler's version.
 pub fn build(entry: &Path, out_dir: &Path, runtime_dir: &Path) -> Result<(), CliError> {
     build_with_options(entry, out_dir, runtime_dir, BuildOptions::from_env()?)
 }
@@ -538,6 +544,11 @@ pub fn build_with_options_into(
     options: BuildOptions,
 ) -> Result<EmittedCrate, CliError> {
     let target = out.prove(&ProjectPaths::of_file(entry))?;
+    let runtime = RuntimeSource::resolve(
+        options.runtime_origin,
+        Some(runtime_dir),
+        RuntimeRemedy::EnvOnly,
+    )?;
     let source = crate::io_bounded::read_user_named(entry, crate::io_bounded::SOURCE_CAP)?;
 
     // Parse ONCE with a throwaway interner to learn the entry's declared module
@@ -576,7 +587,7 @@ pub fn build_with_options_into(
         project::CompiledDeps::none(),
         &entry_path,
         &target,
-        runtime_dir,
+        &runtime,
         entry,
         &SettingsSource::Loose,
         options,
@@ -633,6 +644,11 @@ pub fn build_loose_file_into(
     options: BuildOptions,
 ) -> Result<EmittedCrate, CliError> {
     let target = out.prove(&ProjectPaths::of_file(entry))?;
+    let runtime = RuntimeSource::resolve(
+        options.runtime_origin,
+        Some(runtime_dir),
+        RuntimeRemedy::EnvOnly,
+    )?;
     let collected = collect_entry_and_siblings(entry)?;
 
     compile_modules(
@@ -641,7 +657,7 @@ pub fn build_loose_file_into(
         project::CompiledDeps::none(),
         &collected.entry_module_path,
         &target,
-        runtime_dir,
+        &runtime,
         entry,
         &SettingsSource::Loose,
         options,
@@ -654,8 +670,9 @@ pub fn build_loose_file_into(
 /// closure and the FFI preparation were all read once, from the handles `root`
 /// holds, so nothing is discovered or read again here. The settings are the
 /// manifest's, the ones the project build uses, its database driver included,
-/// but for the test crate's name. The runtime is resolved from those options
-/// through [`resolve_vendored_runtime_dir`], as `ipe dev build` resolves it.
+/// but for the test crate's name. The runtime is resolved by
+/// [`RuntimeSource::resolve`] with no explicit root: `IPE_RUNTIME_DIR` when it
+/// is set, else the embedded runtime.
 ///
 /// Returns the claimed crate directory.
 ///
@@ -664,8 +681,7 @@ pub fn build_loose_file_into(
 /// on any filesystem failure; [`CliError::StaticRefusal`] when the emitted app
 /// shape cannot be static; [`CliError::OutputRefused`] when `out` overlaps the
 /// project's `src/` or `tests/` tree; the refusals of
-/// [`resolve_vendored_runtime_dir`] and of the compile core's runtime
-/// resolution.
+/// [`RuntimeSource::resolve`].
 pub fn build_test_into(
     root: &ProjectRoot,
     view: &TestView,
@@ -677,7 +693,7 @@ pub fn build_test_into(
     let target =
         out.prove(&ProjectPaths::from_manifest(root.manifest()).with_sources(&test_sources))?;
     let options = test_build_options()?;
-    let runtime_dir = resolve_vendored_runtime_dir(None, options.runtime_emit())?;
+    let runtime = RuntimeSource::resolve(options.runtime_origin, None, RuntimeRemedy::EnvOnly)?;
     let settings = emit_settings(
         &SettingsSource::Manifest {
             manifest: root.manifest(),
@@ -697,7 +713,7 @@ pub fn build_test_into(
         &PackageFrontEnd::cold(super::PackageSourceSet::from_test_view(view)),
         view.entry(),
         &target,
-        &runtime_dir,
+        &runtime,
         &blame_path,
         settings,
         cache_site.as_ref(),
@@ -974,7 +990,7 @@ pub fn compile_modules(
     deps: project::CompiledDeps,
     entry_path: &[String],
     target: &EmitTarget,
-    runtime_dir: &Path,
+    runtime: &RuntimeSource,
     blame_path: &Path,
     source: &SettingsSource<'_>,
     options: BuildOptions,
@@ -986,7 +1002,7 @@ pub fn compile_modules(
         deps,
         entry_path,
         target,
-        runtime_dir,
+        runtime,
         blame_path,
         source,
         cache_site.as_ref(),
@@ -1023,7 +1039,7 @@ pub fn compile_modules_observed(
     deps: project::CompiledDeps,
     entry_path: &[String],
     target: &EmitTarget,
-    runtime_dir: &Path,
+    runtime: &RuntimeSource,
     blame_path: &Path,
     source: &SettingsSource<'_>,
     cache_site: Option<&cache::CacheSite>,
@@ -1043,7 +1059,7 @@ pub fn compile_modules_observed(
         &PackageFrontEnd::cold(source_set),
         entry_path,
         target,
-        runtime_dir,
+        runtime,
         blame_path,
         settings,
         cache_site,
@@ -1083,7 +1099,7 @@ fn compile_source_set_observed(
     front: &PackageFrontEnd,
     entry_path: &[String],
     target: &EmitTarget,
-    runtime_dir: &Path,
+    runtime: &RuntimeSource,
     blame_path: &Path,
     settings: ipe_backend_rust::EmitSettings,
     cache_site: Option<&cache::CacheSite>,
@@ -1092,14 +1108,7 @@ fn compile_source_set_observed(
     let front = front.on_compile_thread();
     crate::threads::run_compile(move || {
         compile_source_set_here(
-            &front,
-            entry_path,
-            target,
-            runtime_dir,
-            blame_path,
-            settings,
-            cache_site,
-            options,
+            &front, entry_path, target, runtime, blame_path, settings, cache_site, options,
         )
     })
     .unwrap_or_else(|refused| (Err(refused), CacheOutcome::Miss))
@@ -1111,7 +1120,7 @@ fn compile_source_set_here(
     front: &CompileThreadFront<'_>,
     entry_path: &[String],
     target: &EmitTarget,
-    runtime_dir: &Path,
+    runtime: &RuntimeSource,
     blame_path: &Path,
     settings: ipe_backend_rust::EmitSettings,
     cache_site: Option<&cache::CacheSite>,
@@ -1127,17 +1136,13 @@ fn compile_source_set_here(
         ..
     } = front.set.parts();
 
-    // Resolve the dependency-model runtime crate ONCE, fail-closed: if the
-    // opt-in is set but no verified `ipe-runtime-rust` crate root is found, the
-    // build refuses loudly here rather than falling back to a vendored — or
-    // worse, a wrong — runtime. Native and wasm share the ONE dependency model
-    // (the wasm emit selects the crate's `wasm-client` floor + reached surface,
-    // built for `wasm32-unknown-unknown`).
+    // The dependency-model runtime is named by its content, fail-closed: a
+    // runtime whose bytes cannot be bundled refuses the build here. Native and
+    // wasm share the ONE dependency model (the wasm emit selects the crate's
+    // `wasm-client` floor + reached surface, built for `wasm32-unknown-unknown`).
     let runtime_dep = if options.links_runtime_dependency() {
-        match runtime_embed::resolve_for(options.runtime_origin) {
-            Ok(resolved) => Some(ipe_backend_rust::RuntimeDep {
-                root: resolved.root().to_path_buf(),
-            }),
+        match runtime.content_id() {
+            Ok(content) => Some(ipe_backend_rust::RuntimeDep { content }),
             Err(e) => return (Err(e), CacheOutcome::Miss),
         }
     } else {
@@ -1176,7 +1181,7 @@ fn compile_source_set_here(
             write_emitted_project(
                 &emitted,
                 target,
-                runtime_dir,
+                runtime,
                 options.static_plan.as_ref(),
                 options.tree_shake_vendored,
                 floor,
@@ -1233,7 +1238,7 @@ fn compile_source_set_here(
                 let written = write_emitted_project(
                     &emitted,
                     target,
-                    runtime_dir,
+                    runtime,
                     options.static_plan.as_ref(),
                     options.tree_shake_vendored,
                     floor,
@@ -1279,7 +1284,7 @@ fn compile_source_set_here(
     let written = write_emitted_project(
         &emitted,
         target,
-        runtime_dir,
+        runtime,
         options.static_plan.as_ref(),
         options.tree_shake_vendored,
         floor,
@@ -2399,8 +2404,8 @@ pub fn inject_wasm_widget_bundle(
     Ok(())
 }
 
-/// Write an emitted project to `target`, vendoring the runtime module tree
-/// from `runtime_dir`.
+/// Write an emitted project to `target`, vendoring the module tree of `runtime`
+/// when the emit is vendored.
 ///
 /// The emit→cargo bridge (design doc H7/H8):
 /// assembles the COMPLETE intended project (`build_emit_manifest`) — the
@@ -2439,7 +2444,7 @@ pub fn inject_wasm_widget_bundle(
 pub fn write_emitted_project(
     emitted: &ipe_backend::EmittedProject,
     target: &EmitTarget,
-    runtime_dir: &Path,
+    runtime: &RuntimeSource,
     static_plan: Option<&ipe_backend_rust::static_build::StaticPlan>,
     tree_shake_vendored: bool,
     floor: crate::run_sandbox::EmitFloor,
@@ -2447,7 +2452,7 @@ pub fn write_emitted_project(
     use ipe_backend_rust::static_build;
 
     let role = target.bundle_role();
-    let mut manifest = build_emit_manifest(emitted, runtime_dir, tree_shake_vendored, role)?;
+    let mut manifest = build_emit_manifest(emitted, runtime, tree_shake_vendored, role)?;
     match floor {
         crate::run_sandbox::EmitFloor::DevelopmentMarker => {
             let main_rs = manifest
@@ -2632,10 +2637,9 @@ pub fn remove_stale_static_config(crate_dir: &OwnedDir) -> Result<(), CliError> 
 /// used ("vendor first, emit second" — the backend's trimmed
 /// `ipe_runtime/mod.rs` / `config.rs` must win over the fuller copies from
 /// the source tree):
-///   1. The vendored runtime module tree (`runtime_dir`, read recursively
-///      under `src/ipe_runtime/`) — a driver-boundary filesystem read, the
-///      same discipline as reading the entry file (never inside a
-///      salsa-tracked query). For the dependency model this step is replaced
+///   1. The vendored runtime module tree ([`RuntimeSource::module_tree`],
+///      under `src/ipe_runtime/`) — read at the driver boundary, never inside
+///      a salsa-tracked query. For the dependency model this step is replaced
 ///      by bundling the embedded runtime source under `ipe_runtime_dep/` so
 ///      the relative path dep in the emitted `Cargo.toml` is always satisfied.
 ///   2. `Cargo.toml` at the project root.
@@ -2644,14 +2648,12 @@ pub fn remove_stale_static_config(crate_dir: &OwnedDir) -> Result<(), CliError> 
 ///      entry here can escape `out_dir`).
 ///
 /// # Errors
-/// [`CliError::Io`] on any filesystem failure reading `runtime_dir` (including
-/// a non-UTF-8 file, surfaced as an I/O error rather than a panic — the
-/// runtime tree is trusted in-repo source, so this is not expected to fire in
-/// practice). [`CliError::RuntimeMaterializeFailed`] when the embedded runtime
-/// crate contains non-UTF-8 files (unexpected for in-repo source).
+/// The refusals of [`RuntimeSource::module_tree`] for a vendored emit;
+/// [`CliError::RuntimeMaterializeFailed`] when the embedded runtime crate
+/// contains non-UTF-8 files (unexpected for in-repo source).
 pub fn build_emit_manifest(
     emitted: &ipe_backend::EmittedProject,
-    runtime_dir: &Path,
+    runtime: &RuntimeSource,
     tree_shake_vendored: bool,
     role: runtime_embed::BundleRole,
 ) -> Result<BTreeMap<PathBuf, String>, CliError> {
@@ -2666,20 +2668,19 @@ pub fn build_emit_manifest(
         .map(|(_, contents)| contents.as_str());
     if let Some(mod_rs) = emitted_mod_rs {
         // Vendored model: copy the runtime source tree into `src/ipe_runtime/`.
+        let tree = runtime.module_tree()?;
+        let prefix = Path::new("src/ipe_runtime");
         if tree_shake_vendored {
             // Eject shape: vendor only the runtime source the program reaches.
             // The emitted `mod.rs` declares `pub mod X;` for exactly the reached
             // top-level modules; a source file whose module is never declared is
             // one rustc would drop anyway, so omitting it from the tree is
             // behaviour-preserving and shrinks the shippable, auditable artifact.
-            collect_reachable_runtime_text(
-                runtime_dir,
-                Path::new("src/ipe_runtime"),
-                mod_rs,
-                &mut manifest,
-            )?;
+            collect_reachable_runtime_text(&tree, prefix, mod_rs, &mut manifest);
         } else {
-            collect_dir_text(runtime_dir, Path::new("src/ipe_runtime"), &mut manifest)?;
+            for (rel, text) in tree.files() {
+                manifest.insert(prefix.join(rel), text.clone());
+            }
         }
     } else {
         // Dependency model: the emitted `Cargo.toml` declares the runtime via
@@ -2740,9 +2741,9 @@ fn refuse_unlexable_rust(manifest: &BTreeMap<PathBuf, String>) -> Result<(), Cli
 ///
 /// The emitted `ipe_runtime/mod.rs` is a flat, non-`cfg`-gated list of `pub mod
 /// X;` for exactly the top-level modules the program reaches. For each declared
-/// name this copies either the single file `X.rs` or, when `X` is a directory
-/// module, the ENTIRE `X/` subtree — never parsing the subtree's own nested
-/// `mod` declarations. Copying a reached directory whole is the fail-closed
+/// name this copies the file `X.rs` when the tree holds one and the ENTIRE `X/`
+/// subtree when it holds that directory — never parsing the subtree's own
+/// nested `mod` declarations. Copying a reached directory whole is the fail-closed
 /// choice the eject contract requires: it can only ever include a file, never
 /// omit one a nested `mod` needs, so the vendored tree always compiles. The
 /// modules a directory does not reach are already excluded at the top level
@@ -2752,29 +2753,24 @@ fn refuse_unlexable_rust(manifest: &BTreeMap<PathBuf, String>) -> Result<(), Cli
 /// `mod.rs` itself is always copied (it IS the emitted file, overlaid verbatim
 /// by the caller's `emitted.files` pass afterwards); the loop only resolves the
 /// modules it names.
-///
-/// # Errors
-/// [`CliError::Io`] on any filesystem failure reading `runtime_dir`.
 pub fn collect_reachable_runtime_text(
-    runtime_dir: &Path,
+    tree: &RuntimeModuleTree,
     dst_prefix: &Path,
     emitted_mod_rs: &str,
     manifest: &mut BTreeMap<PathBuf, String>,
-) -> Result<(), CliError> {
-    for name in declared_modules(emitted_mod_rs) {
-        let file = runtime_dir.join(format!("{name}.rs"));
-        let dir = runtime_dir.join(&name);
-        if dir.is_dir() {
-            collect_dir_text(&dir, &dst_prefix.join(&name), manifest)?;
-        } else if file.is_file() {
-            let text = fs::read_to_string(&file).map_err(|e| io_err(&file, e))?;
-            manifest.insert(dst_prefix.join(format!("{name}.rs")), text);
+) {
+    let declared = declared_modules(emitted_mod_rs);
+    // A `pub mod X;` with neither `X.rs` nor `X/` in the tree is an inline
+    // module (a `pub mod web { pub mod route; }` block) — it has no separate
+    // source file to vendor, so nothing is copied for it.
+    for (rel, text) in tree.files() {
+        let reached = declared
+            .iter()
+            .any(|name| rel.starts_with(name) || rel.as_path() == Path::new(&format!("{name}.rs")));
+        if reached {
+            manifest.insert(dst_prefix.join(rel), text.clone());
         }
-        // A `pub mod X;` with neither `X.rs` nor `X/` on disk is an inline
-        // module (a `pub mod web { pub mod route; }` block) — it has no separate
-        // source file to vendor, so there is nothing to copy for it here.
     }
-    Ok(())
 }
 
 /// The module names a runtime `mod.rs` declares with `pub mod X;` / `mod X;`.
@@ -3017,8 +3013,9 @@ fn prune_dir(
 }
 
 /// Build a multi-module Ipe project rooted at `manifest_path` (`package.ipe`)
-/// into a Rust Cargo project under `out_dir`, vendoring the runtime from
-/// `runtime_dir`.
+/// into a Rust Cargo project under `out_dir`.
+///
+/// `runtime_dir` names the runtime crate root explicitly, as for [`build`].
 ///
 /// The build pipeline:
 /// 1. Parse `package.ipe` to locate the source root.
@@ -3035,6 +3032,7 @@ fn prune_dir(
 /// # Errors
 /// [`CliError::Io`] on any filesystem failure.
 /// [`CliError::Pipeline`] carrying the first compiler diagnostic.
+/// The refusals of [`RuntimeSource::resolve`] for `runtime_dir`.
 pub fn build_project(
     manifest_path: &Path,
     out_dir: &Path,
@@ -3084,8 +3082,13 @@ pub fn build_project_into(
     options: &BuildOptions,
     host: crate::delivery::HostIntent,
 ) -> Result<EmittedCrate, CliError> {
+    let runtime = RuntimeSource::resolve(
+        options.runtime_origin,
+        Some(runtime_dir),
+        RuntimeRemedy::EnvOnly,
+    )?;
     let manifest = project::parse_manifest(manifest_path)?;
-    build_parsed_project_into(&manifest, manifest_path, out, runtime_dir, options, host)
+    build_parsed_project_into(&manifest, manifest_path, out, &runtime, options, host)
 }
 
 /// [`build_project_into`] for a manifest the caller already parsed from
@@ -3101,7 +3104,7 @@ pub fn build_parsed_project_into(
     manifest: &project::ProjectManifest,
     manifest_path: &Path,
     out: OutTarget<'_>,
-    runtime_dir: &Path,
+    runtime: &RuntimeSource,
     options: &BuildOptions,
     host: crate::delivery::HostIntent,
 ) -> Result<EmittedCrate, CliError> {
@@ -3114,7 +3117,7 @@ pub fn build_parsed_project_into(
         manifest_path,
         &PackageFrontEnd::cold(source_set),
         out,
-        runtime_dir,
+        runtime,
         options,
         host,
     )
@@ -3136,7 +3139,7 @@ pub fn build_parsed_project_into(
 pub fn build_root_into(
     held: &super::HeldBuild,
     out: OutTarget<'_>,
-    runtime_dir: &Path,
+    runtime: &RuntimeSource,
     options: &BuildOptions,
     host: crate::delivery::HostIntent,
 ) -> Result<EmittedCrate, CliError> {
@@ -3144,7 +3147,7 @@ pub fn build_root_into(
         held,
         &PackageFrontEnd::cold(held.sources()),
         out,
-        runtime_dir,
+        runtime,
         options,
         host,
     )
@@ -3158,7 +3161,7 @@ pub fn build_held_into(
     held: &super::HeldBuild,
     front: &PackageFrontEnd,
     out: OutTarget<'_>,
-    runtime_dir: &Path,
+    runtime: &RuntimeSource,
     options: &BuildOptions,
     host: crate::delivery::HostIntent,
 ) -> Result<EmittedCrate, CliError> {
@@ -3173,7 +3176,7 @@ pub fn build_held_into(
         held.manifest_path(),
         front,
         out,
-        runtime_dir,
+        runtime,
         options,
         host,
     )
@@ -3234,14 +3237,14 @@ pub fn build_from_sources(
     source_set: super::PackageSourceSet,
     out: OutTarget<'_>,
 ) -> Result<EmittedCrate, CliError> {
-    // An audit emits the served program it judges. A gate build is always the
-    // dependency model, so the vendored-tree directory is never read.
+    // An audit emits the served program it judges, against the embedded
+    // runtime a gate links.
     build_from_sources_for(
         manifest,
         manifest_path,
         &PackageFrontEnd::cold(source_set),
         out,
-        Path::new(""),
+        &RuntimeSource::Embedded,
         &BuildOptions::gate(),
         crate::delivery::HostIntent::Served,
     )
@@ -3256,7 +3259,7 @@ fn build_from_sources_for(
     manifest_path: &Path,
     front: &PackageFrontEnd,
     out: OutTarget<'_>,
-    runtime_dir: &Path,
+    runtime: &RuntimeSource,
     options: &BuildOptions,
     host: crate::delivery::HostIntent,
 ) -> Result<EmittedCrate, CliError> {
@@ -3303,34 +3306,13 @@ fn build_from_sources_for(
         front,
         &entry_path,
         &target,
-        runtime_dir,
+        runtime,
         manifest_path,
         settings,
         cache_site.as_ref(),
         options,
     )
     .0
-}
-
-/// Locate the Ipê runtime module tree (`src/runtime/rust/src/`).
-///
-/// Delegates to [`ipe_env::artifact::resolve_runtime_src`], the one runtime
-/// module-tree resolver: `$IPE_RUNTIME_DIR` when set (authoritative — a value
-/// that is not a directory is refused, never walked past), else the upward walk
-/// from the current directory.
-///
-/// # Errors
-/// Returns [`CliError::RuntimeNotFound`] when the override is not a directory or
-/// no walk candidate exists, or [`CliError::Io`] if the current directory cannot
-/// be read.
-pub fn resolve_runtime() -> Result<PathBuf, CliError> {
-    let cwd = std::env::current_dir().map_err(|e| io_err(Path::new("."), e))?;
-    ipe_env::artifact::resolve_runtime_src(
-        ipe_env::var_os(ipe_env::artifact::RUNTIME_DIR_VAR),
-        &cwd,
-    )
-    .map(ipe_env::artifact::ProvenRuntime::into_path_buf)
-    .map_err(|_| CliError::RuntimeNotFound)
 }
 
 impl BuildOptions {
@@ -3343,35 +3325,6 @@ impl BuildOptions {
         } else {
             RuntimeEmit::Vendored
         }
-    }
-}
-
-/// Resolve the vendored runtime MODULE tree the emit copies into the project,
-/// but only when that emit shape actually needs it.
-///
-/// Every command that emits a crate resolves its runtime tree here, from the
-/// [`RuntimeEmit`] of the options its emit runs with. A linked emit carries no
-/// vendored `src/ipe_runtime/` tree: it names the runtime as a path
-/// dependency, resolved inside the compile core by [`runtime_embed::resolve_for`]
-/// (`$IPE_RUNTIME_DIR`, the in-repo crate, or the installed embedded copy), so
-/// requiring a vendored tree up front would fail a valid build run outside a
-/// repo checkout. Only a [`RuntimeEmit::Vendored`] emit needs the tree.
-///
-/// `cli_override` is the explicit `--runtime <dir>` value, honoured verbatim when
-/// present. When the vendored tree is not needed, an empty sentinel path is
-/// returned; the linked emit never reads it.
-///
-/// # Errors
-/// [`CliError::RuntimeNotFound`] / [`CliError::Io`] from [`resolve_runtime`] when
-/// a vendored tree is required but cannot be located.
-pub fn resolve_vendored_runtime_dir(
-    cli_override: Option<String>,
-    emit: RuntimeEmit,
-) -> Result<PathBuf, CliError> {
-    match (cli_override, emit) {
-        (Some(r), _) => Ok(PathBuf::from(r)),
-        (None, RuntimeEmit::Vendored) => resolve_runtime(),
-        (None, RuntimeEmit::Linked) => Ok(PathBuf::new()),
     }
 }
 
@@ -3436,7 +3389,7 @@ mod tests {
     /// past every renderer, and names the hazard without echoing it.
     #[test]
     fn manifest_refuses_a_raw_lexer_hazard() {
-        let missing = Path::new("/nonexistent-runtime-dir");
+        let embedded = RuntimeSource::Embedded;
         for (path, body) in [
             ("src/main.rs", "fn main() { let _ = \"a\u{202E}b\"; }\n"),
             ("src/ipe_runtime/x.rs", "// a\rb\n"),
@@ -3444,7 +3397,7 @@ mod tests {
         ] {
             let refused = build_emit_manifest(
                 &vendored_project(&[(path, body)]),
-                missing,
+                &embedded,
                 true,
                 runtime_embed::BundleRole::Out,
             );
@@ -3481,7 +3434,7 @@ mod tests {
             assert!(
                 build_emit_manifest(
                     &vendored_project(&[(path, body)]),
-                    missing,
+                    &embedded,
                     true,
                     runtime_embed::BundleRole::Out,
                 )
@@ -3879,7 +3832,7 @@ main =
         let refused = build_project_into(
             &fixture.manifest_path(),
             OutTarget::Path(&out),
-            Path::new("/nonexistent-runtime-dir"),
+            &e2e_support::require_runtime().into_path_buf(),
             &BuildOptions::default(),
             crate::delivery::Delivery::web_desktop().host_intent(),
         );

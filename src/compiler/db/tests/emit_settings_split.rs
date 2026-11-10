@@ -152,7 +152,7 @@ fn settings(debugger: bool, host: EmitHost) -> EmitSettings {
         server_origins: ipe_backend_rust::ServerOrigins::none(),
         wasm_hydrate_mode: false,
         runtime_dep: Some(RuntimeDep {
-            root: std::path::PathBuf::from("/ipe-runtime"),
+            content: ipe_backend_rust::RuntimeContentId::from_digest_bytes([0; 16]),
         }),
         debugger,
         crate_name: CrateName::SingleFile,

@@ -1941,7 +1941,7 @@ mod tests {
             flip("wasm_hydrate_mode", |s| s.wasm_hydrate_mode = true),
             flip("runtime_dep", |s| {
                 s.runtime_dep = Some(RuntimeDep {
-                    root: std::path::PathBuf::from("/runtime"),
+                    content: ipe_backend_rust::RuntimeContentId::from_digest_bytes([1; 16]),
                 });
             }),
             flip("debugger", |s| s.debugger = true),

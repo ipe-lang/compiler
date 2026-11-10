@@ -605,11 +605,11 @@ fn names(xs: &[&str]) -> Vec<String> {
     xs.iter().map(|s| (*s).to_owned()).collect()
 }
 
-/// A build that failed without a diagnostic (here: no runtime — the same shape
-/// as a fixture that cannot be loaded) is NOT a refusal.
+/// A build that failed without a diagnostic (here: no home directory — the same
+/// shape as a fixture that cannot be loaded) is NOT a refusal.
 #[test]
 fn judge_rejection_refuses_a_non_diagnostic_error() {
-    let r: Result<(), CliError> = Err(CliError::RuntimeNotFound);
+    let r: Result<(), CliError> = Err(CliError::RuntimeHomeUnknown);
     assert!(matches!(
         judge_rejection(&r, IPE_T0001, None),
         Err(RejectionFault::NotADiagnostic(_))

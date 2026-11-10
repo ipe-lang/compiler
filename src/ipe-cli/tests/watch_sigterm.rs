@@ -444,8 +444,11 @@ fn spawn_never_installs_a_sigterm_forwarder() -> Result<(), BoxError> {
     // Red-build source: parses (so setup succeeds) but never compiles green,
     // so no cargo build ever starts — the loop just stays alive.
     let fixture = project_fixture(RED_BUILD_SOURCE)?;
-    let runtime_dir = e2e_support::require_runtime().into_path_buf();
-    let opts = ipe::watch::WatchOptions::new(fixture.path().to_path_buf(), out_dir, runtime_dir);
+    let opts = ipe::watch::WatchOptions::new(
+        fixture.path().to_path_buf(),
+        out_dir,
+        ipe::runtime_embed::RuntimeSource::Embedded,
+    );
     let (join, handle) = ipe::watch::spawn(opts)
         .map_err(|e| -> BoxError { format!("spawn the watch session: {e}").into() })?;
 

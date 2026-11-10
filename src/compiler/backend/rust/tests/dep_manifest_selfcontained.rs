@@ -13,10 +13,9 @@
 //! emitted crate.
 
 use ipe_backend::Backend;
-use ipe_backend_rust::{RuntimeDep, RustBackend};
+use ipe_backend_rust::{RuntimeContentId, RuntimeDep, RustBackend};
 use ipe_intern::Interner;
 use ipe_ir::{ModPath, Module, Program, Target};
-use std::path::Path;
 
 // ── minimal program helpers ───────────────────────────────────────────────────
 
@@ -74,12 +73,13 @@ fn minimal_native_program() -> (Program, Interner) {
     (program, interner)
 }
 
-/// A dummy `RuntimeDep` with a placeholder root — the root is no longer
-/// embedded in the emitted manifest, so any path value selects the dep-model
-/// branch without affecting the emitted text.
+/// A `RuntimeDep` with a placeholder content identity.
+///
+/// The identity never reaches the emitted manifest, so any value selects the
+/// dep-model branch without affecting the emitted text.
 fn dummy_runtime_dep() -> RuntimeDep {
     RuntimeDep {
-        root: Path::new("/placeholder").to_path_buf(),
+        content: RuntimeContentId::from_digest_bytes([0; 16]),
     }
 }
 

@@ -334,8 +334,8 @@ pub use driver::{
     apply_fixes, bluegreen_enabled, build, build_loose_file, build_loose_file_with_options,
     build_project, build_project_with_options, build_with_options, code_index, compile_prepared,
     create_source_root, emit_ir_text, explain_lookup, front_check, hot_appearance_enabled,
-    infer_package_capabilities, infer_package_capabilities_in, resolve_runtime, run_cli,
-    run_upgrade, select_non_overlapping, verify_capabilities, watch_banner_enabled,
+    infer_package_capabilities, infer_package_capabilities_in, run_cli, run_upgrade,
+    select_non_overlapping, verify_capabilities, watch_banner_enabled,
 };
 #[cfg(any(test, feature = "test-fixtures"))]
 pub use driver::{emitted_bin_filename, emitted_bin_name};

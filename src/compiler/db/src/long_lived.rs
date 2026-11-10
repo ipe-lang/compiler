@@ -515,7 +515,7 @@ mod tests {
                     .unwrap_or_else(ipe_backend_rust::ServerOrigins::none),
                 wasm_hydrate_mode: true,
                 runtime_dep: Some(ipe_backend_rust::RuntimeDep {
-                    root: std::path::PathBuf::from("/runtime"),
+                    content: ipe_backend_rust::RuntimeContentId::from_digest_bytes([3; 16]),
                 }),
                 debugger: true,
                 crate_name: pinned("second"),

@@ -43,9 +43,8 @@ fn main() -> ExitCode {
     let repo_root = repo_root();
     let golden_root = repo_root.join("tests").join("golden");
 
-    // The emit path resolves the runtime by walking up from the CWD. Anchor the
-    // CWD at the repo root so resolution is deterministic regardless of where the
-    // tool was launched from.
+    // Anchor the CWD at the repo root so every emit runs from the same place
+    // regardless of where the tool was launched from.
     if let Err(e) = std::env::set_current_dir(&repo_root) {
         eprintln!(
             "regen-goldens: cannot chdir to repo root {}: {e}",
@@ -53,13 +52,8 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    let runtime = match ipe::resolve_runtime() {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("regen-goldens: cannot resolve runtime: {e:?}");
-            return ExitCode::FAILURE;
-        }
-    };
+    // The in-repo runtime crate root, named explicitly: the emit proves it.
+    let runtime = repo_root.join("src/runtime/rust");
 
     let goldens = match collect_goldens(&golden_root, &filter) {
         Ok(g) => g,

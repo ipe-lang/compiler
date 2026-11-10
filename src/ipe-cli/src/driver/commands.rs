@@ -4,8 +4,9 @@ use super::{
     attribute_post_link_error, bluegreen_enabled, build_held_into, build_root_into,
     bundle_delivery, compile_prepared, create_source_root, emit_machine_error, emit_permissions,
     emit_settings, find_manifest_for_ipe_file, frame_infer_error, gate_decoder_pipelines,
-    home_to_source_map, io_err, resolve_vendored_runtime_dir, run_version,
+    home_to_source_map, io_err, run_version,
 };
+use crate::runtime_embed::{RuntimeRemedy, RuntimeSource};
 use std::num::NonZeroU8;
 
 use ipe_diagnostics::suggest;
@@ -432,11 +433,11 @@ impl HeldBuild {
     pub fn emit(
         &self,
         target: &EmitTarget,
-        runtime_dir: &Path,
+        runtime: &RuntimeSource,
         options: &BuildOptions,
         host: HostIntent,
     ) -> Result<EmittedCrate, CliError> {
-        build_root_into(self, OutTarget::Proven(target), runtime_dir, options, host)
+        build_root_into(self, OutTarget::Proven(target), runtime, options, host)
     }
 }
 
@@ -516,11 +517,15 @@ pub fn run_watch(rest: &[String]) -> Result<(), CliError> {
     // A Tui app with no interactive terminal is refused right here — before
     // any compile or cargo work — same as `ipe dev run`.
     gate_terminal(Verb::DEV_WATCH.name(), delivery.shape())?;
-    // Watch is always a native linked dev build (it never vendors the runtime
-    // tree, nor targets wasm): its rebuild emit names the crate root
-    // `runtime_embed::resolve` gives once the loop starts (see `watch::run`), so
-    // no vendored tree is required; one passed with `--runtime` is honoured.
-    let runtime_dir = resolve_vendored_runtime_dir(args.runtime.clone(), RuntimeEmit::Linked)?;
+    // Watch is a native dev build whose runtime emit follows
+    // `IPE_RUNTIME_VENDORED`, as every other dev build's does; a `--runtime`
+    // root is proved here, once, before the loop starts.
+    let runtime_emit = RuntimeEmit::from_env()?;
+    let runtime = RuntimeSource::resolve(
+        runtime_embed::RuntimeOrigin::Developer,
+        args.runtime.as_deref().map(Path::new),
+        RuntimeRemedy::WithRuntimeFlag,
+    )?;
 
     // Fail closed before the watch loop starts: `ipe dev watch` rebuilds with cargo
     // on every change, so a missing toolchain is reported once, up front, with
@@ -531,7 +536,8 @@ pub fn run_watch(rest: &[String]) -> Result<(), CliError> {
     let rust_area = output.area(&[OutputArea::Rust]);
     let out_dir = rust_area.path()?;
 
-    let mut opts = watch::WatchOptions::new(held.root().path().to_path_buf(), out_dir, runtime_dir);
+    let mut opts = watch::WatchOptions::new(held.root().path().to_path_buf(), out_dir, runtime);
+    opts.runtime_emit = runtime_emit;
     opts.out_target = Some(EmitTarget::Area(rust_area));
     opts.port = args.port;
     opts.cargo_path = cargo_bin.path().to_path_buf();
@@ -1227,7 +1233,11 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
         // A developer build links the runtime its environment names.
         runtime_origin: runtime_embed::RuntimeOrigin::Developer,
     };
-    let runtime_dir = resolve_vendored_runtime_dir(args.runtime, options.runtime_emit())?;
+    let runtime = RuntimeSource::resolve(
+        options.runtime_origin,
+        args.runtime.as_deref().map(Path::new),
+        RuntimeRemedy::WithRuntimeFlag,
+    )?;
 
     // Fail closed before emitting: `ipe dev build` compiles the emitted project so a
     // reported success means the crate actually built. A missing toolchain is a
@@ -1251,7 +1261,7 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
     // selects the webview executor; every other delivery is served.
     let crate_dir = held.emit(
         &EmitTarget::Area(rust_area),
-        &runtime_dir,
+        &runtime,
         &options,
         delivery.host_intent(),
     )?;
@@ -1535,8 +1545,8 @@ pub fn compile_and_finalize_native_build(
         None => toolchain::require_cargo(toolchain::ToolIntent::Build)?,
     };
     let out_dir = crate_dir.path();
-    let runtime = if matches!(runtime_emit, RuntimeEmit::Linked) {
-        runtime_context_for_message()
+    let runtime_context = if matches!(runtime_emit, RuntimeEmit::Linked) {
+        Some(runtime_context_for_message())
     } else {
         None
     };
@@ -1552,7 +1562,7 @@ pub fn compile_and_finalize_native_build(
         target_dir: &target_dir,
         output: CargoOutput::Human(Verbosity::of_quiet(quiet)),
         what: "the emitted program",
-        runtime,
+        runtime: runtime_context,
     };
     let artifacts = build.artifact_dir();
     build.run()?;
@@ -1675,7 +1685,11 @@ pub fn run_eject(rest: &[String]) -> Result<(), CliError> {
     }
 
     let options = eject_options();
-    let runtime_dir = resolve_vendored_runtime_dir(args.runtime, options.runtime_emit())?;
+    let runtime = RuntimeSource::resolve(
+        options.runtime_origin,
+        args.runtime.as_deref().map(Path::new),
+        RuntimeRemedy::WithRuntimeFlag,
+    )?;
 
     // The ejected project is handed to the user, so it goes to a fresh
     // directory clear of the sources and of every tree ipe owns — never over
@@ -1700,7 +1714,7 @@ pub fn run_eject(rest: &[String]) -> Result<(), CliError> {
 
     held.emit(
         &EmitTarget::Claimed(target.owned().clone()),
-        &runtime_dir,
+        &runtime,
         &options,
         // An ejected tree is the served program.
         HostIntent::Served,
@@ -2018,8 +2032,11 @@ pub fn release_pipeline(
                     // A developer build links the runtime its environment names.
                     runtime_origin: runtime_embed::RuntimeOrigin::Developer,
                 };
-                let runtime_dir =
-                    resolve_vendored_runtime_dir(args.runtime.clone(), options.runtime_emit())?;
+                let runtime = RuntimeSource::resolve(
+                    options.runtime_origin,
+                    args.runtime.as_deref().map(Path::new),
+                    RuntimeRemedy::WithRuntimeFlag,
+                )?;
 
                 let show_progress = {
                     use std::io::IsTerminal as _;
@@ -2038,7 +2055,7 @@ pub fn release_pipeline(
 
                 let crate_dir = release.emit(
                     OutTarget::Proven(&rust),
-                    &runtime_dir,
+                    &runtime,
                     &options,
                     member_delivery.host_intent(),
                 )?;
@@ -2098,8 +2115,11 @@ pub fn release_pipeline(
                 tree_shake_vendored: false,
                 ..BuildOptions::default()
             };
-            let runtime_dir =
-                resolve_vendored_runtime_dir(args.runtime.clone(), options.runtime_emit())?;
+            let runtime = RuntimeSource::resolve(
+                options.runtime_origin,
+                args.runtime.as_deref().map(Path::new),
+                RuntimeRemedy::WithRuntimeFlag,
+            )?;
 
             let show_progress = {
                 use std::io::IsTerminal as _;
@@ -2130,7 +2150,7 @@ pub fn release_pipeline(
                 // artifact is the served program.
                 let crate_dir = release.emit(
                     OutTarget::Proven(&EmitTarget::Member(member.area(OutputArea::Rust))),
-                    &runtime_dir,
+                    &runtime,
                     &options,
                     HostIntent::Served,
                 )?;
@@ -2217,7 +2237,7 @@ pub fn release_pipeline(
             // artifact is the served program.
             let app_dir = release.emit(
                 OutTarget::Proven(&EmitTarget::Member(member.area(OutputArea::App))),
-                &runtime_dir,
+                &runtime,
                 &options,
                 HostIntent::Served,
             )?;
@@ -2528,16 +2548,17 @@ pub fn read_progress_chunk<R: std::io::Read>(
     Ok(total)
 }
 
-/// The runtime crate the emit will link against, as a [`RuntimeContext`] for a
-/// build-failure message. `None` when no dependency-model runtime is resolved
-/// (a wasm or vendored build), in which case a feature-gap message simply omits
-/// the crate reference. Resolution failure is swallowed to `None` — this is only
-/// for enriching an error message, never a gate.
-pub fn runtime_context_for_message() -> Option<RuntimeContext> {
-    runtime_embed::resolve().ok().map(|r| RuntimeContext {
-        root: TerminalSafe::sanitize(&r.root().display().to_string()),
-        version: TerminalSafe::sanitize(r.version()),
-    })
+/// The runtime crate a linked emit bundles, as a [`RuntimeContext`] for a
+/// build-failure message.
+///
+/// A linked emit bundles the embedded runtime whatever its source, so the
+/// context names the embedded copy at the compiler's version.
+#[must_use]
+pub fn runtime_context_for_message() -> RuntimeContext {
+    RuntimeContext {
+        root: TerminalSafe::sanitize(text::cli_runtime_embedded_copy()),
+        version: TerminalSafe::sanitize(runtime_embed::COMPILER_VERSION),
+    }
 }
 
 /// The on-disk size of a just-produced artifact, or a typed [`CliError::Io`]
@@ -2655,7 +2676,7 @@ fn bundle_wasm_with<T>(
         target_dir: &target_dir,
         output: CargoOutput::JsonStream(Verbosity::Progress),
         what: "the emitted wasm program",
-        runtime: runtime_context_for_message(),
+        runtime: Some(runtime_context_for_message()),
     };
     let artifacts = build.artifact_dir();
     let messages = build.run()?;
@@ -2964,7 +2985,7 @@ pub fn bundle_wasi(crate_dir: &OwnedDir, posture: BuildPosture) -> Result<PathBu
         target_dir: &target_dir,
         output: CargoOutput::JsonStream(Verbosity::Progress),
         what: "the emitted wasm32-wasip1 module",
-        runtime: runtime_context_for_message(),
+        runtime: Some(runtime_context_for_message()),
     };
     let artifacts = build.artifact_dir();
     let messages = build.run()?;
@@ -3506,7 +3527,11 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
         // A developer build links the runtime its environment names.
         runtime_origin: runtime_embed::RuntimeOrigin::Developer,
     };
-    let runtime_dir = resolve_vendored_runtime_dir(args.runtime, options.runtime_emit())?;
+    let runtime = RuntimeSource::resolve(
+        options.runtime_origin,
+        args.runtime.as_deref().map(Path::new),
+        RuntimeRemedy::WithRuntimeFlag,
+    )?;
 
     // Fail closed before emitting: `ipe dev run` shells out to cargo to build the
     // emitted project, so a missing toolchain is a clear root-cause error now,
@@ -3528,7 +3553,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     // selects the webview executor; every other delivery is served.
     let crate_dir = held.emit(
         &EmitTarget::Area(rust_area),
-        &runtime_dir,
+        &runtime,
         &options,
         delivery.host_intent(),
     )?;
@@ -3586,8 +3611,8 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
         Some(bin) => bin,
         None => toolchain::require_cargo(toolchain::ToolIntent::Run)?,
     };
-    let runtime = if matches!(runtime_emit, RuntimeEmit::Linked) && !wasm_target {
-        runtime_context_for_message()
+    let runtime_context = if matches!(runtime_emit, RuntimeEmit::Linked) && !wasm_target {
+        Some(runtime_context_for_message())
     } else {
         None
     };
@@ -3603,7 +3628,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
         target_dir: &target_dir,
         output: CargoOutput::Human(Verbosity::of_quiet(args.quiet)),
         what: "the emitted program",
-        runtime,
+        runtime: runtime_context,
     };
     let artifacts = build.artifact_dir();
     build.run()?;
@@ -4303,11 +4328,11 @@ impl JudgedRelease<'_> {
     pub fn emit(
         &self,
         out: OutTarget<'_>,
-        runtime_dir: &Path,
+        runtime: &RuntimeSource,
         options: &BuildOptions,
         host: HostIntent,
     ) -> Result<EmittedCrate, CliError> {
-        build_held_into(self.held, &self.front, out, runtime_dir, options, host)
+        build_held_into(self.held, &self.front, out, runtime, options, host)
     }
 }
 
@@ -6066,7 +6091,7 @@ mod parsed_manifest_tests {
         assert_ne!(edited, text, "the fixture declares `database = Sqlite`");
         std::fs::write(&manifest_path, edited).expect("edit package.ipe");
 
-        let runtime = super::super::resolve_runtime().expect("the in-repo runtime resolves");
+        let runtime = crate::runtime_embed::RuntimeSource::Embedded;
         let base =
             ipe_test_temp::temp_root().join(format!("ipe-parsed-manifest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -6135,7 +6160,7 @@ mod parsed_manifest_tests {
         held: &HeldBuild,
         base: &std::path::Path,
     ) -> Result<super::EmittedCrate, crate::CliError> {
-        let runtime = super::super::resolve_runtime()?;
+        let runtime = crate::runtime_embed::RuntimeSource::Embedded;
         std::fs::create_dir_all(base).map_err(|e| crate::io_err(base, e))?;
         let crate_dir = OwnedDir::claim(&base.join("crate"))?;
         held.emit(

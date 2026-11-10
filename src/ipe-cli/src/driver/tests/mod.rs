@@ -2,6 +2,7 @@ use super::*;
 use crate::io_bounded::SourceRefusal;
 use crate::output_dir::{EmitTarget, OutputRefusal, ProjectPaths};
 use crate::project_root::{ScratchRoot, SourceTree};
+use crate::runtime_embed::{RuntimeModuleTree, RuntimeSource};
 use crate::verb::Verb;
 use crate::{
     ALL_CODES, Applicability, BTreeMap, Diagnostic, Interner, Path, PathBuf, Suggestion, cli_args,
@@ -111,31 +112,6 @@ fn registry_unreachable_matches_network_signals_only() {
     assert!(!is_registry_unreachable("error[E0433]: cannot find crate"));
 }
 
-#[test]
-fn vendored_runtime_dir_is_required_only_when_vendoring() {
-    // The dependency-model path (default `ipe dev build`/`run`, and `ipe dev watch`)
-    // never vendors the runtime source tree — it reaches the runtime as a
-    // crate dependency — so it must resolve to an empty sentinel WITHOUT
-    // demanding a runtime dir. Requiring the vendored tree here is what made
-    // `ipe dev watch` fail to locate the runtime in an installed checkout.
-    assert_eq!(
-        resolve_vendored_runtime_dir(None, RuntimeEmit::Linked).ok(),
-        Some(PathBuf::new()),
-    );
-    // An explicit `--runtime` is honoured verbatim, vendoring or not — so the
-    // vendoring path (e.g. `ipe release eject`) resolves a runtime dir even when the
-    // ambient vendored tree is absent.
-    assert_eq!(
-        resolve_vendored_runtime_dir(Some("/opt/ipe-runtime".to_owned()), RuntimeEmit::Linked).ok(),
-        Some(PathBuf::from("/opt/ipe-runtime")),
-    );
-    assert_eq!(
-        resolve_vendored_runtime_dir(Some("/opt/ipe-runtime".to_owned()), RuntimeEmit::Vendored)
-            .ok(),
-        Some(PathBuf::from("/opt/ipe-runtime")),
-    );
-}
-
 /// The test build resolves its runtime by the same emit model as `ipe dev build`.
 ///
 /// Both read the ambient environment, so a dependency-model `dev build` that
@@ -170,11 +146,6 @@ fn runtime_emit_follows_the_runtime_link() {
         ..BuildOptions::default()
     };
     assert_eq!(vendored.runtime_emit(), RuntimeEmit::Vendored);
-    assert_eq!(
-        resolve_vendored_runtime_dir(None, linked.runtime_emit()).ok(),
-        Some(PathBuf::new()),
-        "a linked emit never demands the vendored source tree",
-    );
 }
 
 /// The test stage names a test failure only when a test ran and failed.
@@ -188,7 +159,7 @@ fn test_stage_failure_names_only_a_real_test_failure() {
         "tests failed",
     );
     assert_eq!(
-        test_stage_failure(&CliError::RuntimeNotFound),
+        test_stage_failure(&CliError::RuntimeHomeUnknown),
         "tests did not run",
     );
 }
@@ -1024,9 +995,7 @@ fn generic_record_program_builds_and_prints_forty_two() {
     let created = fs::create_dir_all(&dir).and_then(|()| fs::write(&entry, SRC));
     assert!(created.is_ok(), "write source: {created:?}");
 
-    let runtime = resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve: {runtime:?}");
-    let runtime = runtime.expect("`runtime` must succeed");
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let out = dir.join("out");
     let built = build(&entry, &out, &runtime);
@@ -1503,8 +1472,7 @@ Task.fail (Error.unexpected \"intentional\")
     |> Task.onError (\\e -> Io.println (Error.toString e))
 ";
 
-    let runtime = resolve_runtime();
-    let runtime = runtime.expect("`runtime` must succeed");
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let dir = ipe_test_temp::temp_root().join("ipec_panything_regression");
     let _ = fs::remove_dir_all(&dir);
@@ -1539,8 +1507,7 @@ main =
 Io.println \"hello from main task\"
 ";
 
-    let runtime = resolve_runtime();
-    let runtime = runtime.expect("`runtime` must succeed");
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let dir = ipe_test_temp::temp_root().join("ipec_taskrun_elision_regression");
     let _ = fs::remove_dir_all(&dir);
@@ -1655,7 +1622,7 @@ Web.tea
 /// without an installed runtime crate).
 #[allow(clippy::expect_used)] // a failed scratch setup is the test failure
 fn emit_web_app_source(hot_appearance: bool, tag: &str) -> String {
-    let runtime = resolve_runtime().expect("the in-repo runtime resolves");
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let dir = ipe_test_temp::temp_root().join(format!("ipec_hot_appearance_{tag}"));
     let _ = fs::remove_dir_all(&dir);
     let entry = dir.join("Main.ipe");
@@ -1749,8 +1716,7 @@ fn find_manifest_returns_none_when_absent() {
 /// `build_loose_file` must compile both without IPE-N0020.
 #[test]
 fn sibling_discovery_compiles_two_module_program() {
-    let runtime = resolve_runtime();
-    let runtime = runtime.expect("`runtime` must succeed");
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let tmp = ipe_test_temp::temp_root().join("ipec_sibling_disc_test");
     let _ = fs::remove_dir_all(&tmp);
@@ -2025,7 +1991,7 @@ fn a_test_calling_an_uninstalled_crate_refuses_the_run_not_the_build() {
         "{run:?}"
     );
 
-    let runtime = resolve_runtime().expect("the in-repo runtime resolves");
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let out = session_scratch("test_run_ffi_build_out").join("out");
     let built = crate::build_fixture(&fixture, &out, &runtime);
     let _ = fs::remove_dir_all(out.parent().unwrap_or(&out));
@@ -2047,7 +2013,7 @@ fn a_planted_error_in_the_test_entry_fails_the_run_naming_it() {
     let run = test_run_in(fixture.path(), None);
     assert!(blamed_on(&run, "tests/Main.ipe"), "{run:?}");
 
-    let runtime = resolve_runtime().expect("the in-repo runtime resolves");
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let out = session_scratch("test_run_planted_build_out").join("out");
     let built = crate::build_fixture(&fixture, &out, &runtime);
     let _ = fs::remove_dir_all(out.parent().unwrap_or(&out));
@@ -2090,10 +2056,10 @@ fn infer_error_in_dep_module_names_dep_file() {
     )
     .expect("write Main.ipe");
 
-    // Runtime is never accessed: a type error fires at infer, before lower/emit.
-    let dummy_runtime = ipe_test_temp::temp_root();
+    // A type error fires at infer, before the runtime is read.
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let out = tmp.join("out");
-    let result = build_loose_file(&main_path, &out, &dummy_runtime);
+    let result = build_loose_file(&main_path, &out, &runtime);
 
     // Must fail — the program has a type error in Helper.
     assert!(
@@ -2196,9 +2162,9 @@ fn home_discriminant_cross_module_type_error_names_correct_file() {
     )
     .expect("write Main.ipe");
 
-    let dummy_runtime = ipe_test_temp::temp_root();
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let out = tmp.join("out");
-    let result = build_loose_file(&src.join("Main.ipe"), &out, &dummy_runtime);
+    let result = build_loose_file(&src.join("Main.ipe"), &out, &runtime);
 
     // Must fail — type error in Lib.
     assert!(
@@ -2274,7 +2240,7 @@ fn find_single_cache_entry(cache_root: &Path) -> Option<PathBuf> {
 fn on_disk_cache_hit_serves_a_tampered_entry_verbatim() {
     const SENTINEL: &str = "# CACHE-HIT-SENTINEL\n";
 
-    let runtime = resolve_runtime().expect("the in-repo runtime resolves");
+    let runtime = RuntimeSource::Embedded;
 
     let tmp = ipe_test_temp::temp_root().join(format!("ipe-cache-e2e-{}", std::process::id()));
     let cache_dir = tmp.join("cache");
@@ -2373,7 +2339,7 @@ fn on_disk_cache_hit_serves_a_tampered_entry_verbatim() {
 #[cfg(unix)] // a cache hit needs a file identity check
 #[test]
 fn cold_build_with_the_cache_inside_a_fresh_output_dir_claims_it() {
-    let runtime = resolve_runtime().expect("the in-repo runtime resolves");
+    let runtime = RuntimeSource::Embedded;
 
     let tmp = ipe_test_temp::temp_root().join(format!("ipe-cache-in-out-{}", std::process::id()));
     let _ = fs::remove_dir_all(&tmp);
@@ -2458,9 +2424,7 @@ enum PlantedCacheLink {
 #[allow(clippy::expect_used)] // a failed precondition is the test failure
 fn build_through_planted_cache_link(tag: &str, planted: PlantedCacheLink) {
     // A refusal test that skips proves nothing, so a missing runtime fails it.
-    let runtime = resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve: {runtime:?}");
-    let runtime = runtime.expect("`runtime` must succeed");
+    let runtime = RuntimeSource::Embedded;
 
     let tmp =
         ipe_test_temp::temp_root().join(format!("ipe-cache-link-{tag}-{}", std::process::id()));
@@ -2650,7 +2614,7 @@ fn edit_driver_to_postgres(manifest_path: &Path) -> project::ProjectManifest {
 #[cfg(unix)] // a cache hit needs a file identity check
 #[test]
 fn ir_cache_hit_reuses_lowered_program_across_a_db_driver_only_edit() {
-    let runtime = resolve_runtime().expect("the in-repo runtime resolves");
+    let runtime = RuntimeSource::Embedded;
     let tmp =
         ipe_test_temp::temp_root().join(format!("ipec-ir-cache-driver-{}", std::process::id()));
     let cache_dir = tmp.join("cache");
@@ -2735,7 +2699,7 @@ fn ir_cache_hit_reuses_lowered_program_across_a_db_driver_only_edit() {
 #[cfg(unix)] // a cache hit needs a file identity check
 #[test]
 fn on_disk_ir_cache_hit_serves_a_tampered_entry_verbatim() {
-    let runtime = resolve_runtime().expect("the in-repo runtime resolves");
+    let runtime = RuntimeSource::Embedded;
     let tmp =
         ipe_test_temp::temp_root().join(format!("ipec-ir-cache-tamper-{}", std::process::id()));
     let cache_dir = tmp.join("cache");
@@ -2845,7 +2809,7 @@ fn shipped_artifact_builds_are_release() {
 #[cfg(unix)] // a cache hit needs a file identity check
 #[test]
 fn production_ir_cache_hit_blames_the_in_memory_entry_source() {
-    let runtime = resolve_runtime().expect("the in-repo runtime resolves");
+    let runtime = RuntimeSource::Embedded;
     let tmp =
         ipe_test_temp::temp_root().join(format!("ipec-ir-cache-blame-{}", std::process::id()));
     let cache_dir = tmp.join("cache");
@@ -2930,7 +2894,7 @@ fn production_ir_cache_hit_blames_the_in_memory_entry_source() {
 /// caching purposes and always runs the full pipeline.
 #[test]
 fn cache_dir_none_disables_caching_entirely() {
-    let runtime = resolve_runtime().expect("the in-repo runtime resolves");
+    let runtime = RuntimeSource::Embedded;
     let tmp = ipe_test_temp::temp_root().join(format!("ipe-cache-disabled-{}", std::process::id()));
     let out_dir = tmp.join("out");
     let _ = fs::remove_dir_all(&tmp);
@@ -3199,30 +3163,33 @@ pub mod route;
 /// compile.
 #[test]
 fn reachable_runtime_copy_takes_declared_files_and_whole_reached_dirs() {
-    let tmp = ipe_test_temp::temp_root().join("ipe_eject_reach_copy");
-    let _ = fs::remove_dir_all(&tmp);
-    let rt = tmp.join("ipe_runtime");
-    fs::create_dir_all(rt.join("web")).expect("create web/");
-    fs::create_dir_all(rt.join("db")).expect("create db/");
-    fs::write(rt.join("mod.rs"), "pub mod core;\npub mod web;\n").expect("mod.rs");
-    fs::write(rt.join("core.rs"), "// core").expect("core.rs");
-    fs::write(rt.join("unreached.rs"), "// unreached").expect("unreached.rs");
-    fs::write(rt.join("web").join("mod.rs"), "pub mod route;").expect("web/mod.rs");
-    fs::write(rt.join("web").join("route.rs"), "// route").expect("web/route.rs");
-    // An unreached directory module: its whole subtree must be dropped.
-    fs::write(rt.join("db").join("mod.rs"), "// db").expect("db/mod.rs");
+    let tree = RuntimeModuleTree::from_files(
+        [
+            ("mod.rs", "pub mod core;\npub mod web;\n"),
+            ("core.rs", "// core"),
+            ("unreached.rs", "// unreached"),
+            ("web/mod.rs", "pub mod route;"),
+            ("web/route.rs", "// route"),
+            // A sibling sharing a reached name's prefix is not reached.
+            ("webhook.rs", "// webhook"),
+            // An unreached directory module: its whole subtree must be dropped.
+            ("db/mod.rs", "// db"),
+        ]
+        .into_iter()
+        .map(|(path, text)| (PathBuf::from(path), text.to_owned()))
+        .collect(),
+    );
 
     // The emitted mod.rs reaches `core` (file) and `web` (directory), never
     // `unreached` or `db`.
     let emitted_mod_rs = "pub mod core;\npub mod web;\n";
     let mut manifest = BTreeMap::new();
     collect_reachable_runtime_text(
-        &rt,
+        &tree,
         Path::new("src/ipe_runtime"),
         emitted_mod_rs,
         &mut manifest,
-    )
-    .expect("copy reachable runtime");
+    );
 
     let has = |p: &str| manifest.contains_key(&PathBuf::from(p));
     assert!(has("src/ipe_runtime/core.rs"), "reached file copied");
@@ -3238,7 +3205,10 @@ fn reachable_runtime_copy_takes_declared_files_and_whole_reached_dirs() {
         !manifest.keys().any(|k| k.starts_with("src/ipe_runtime/db")),
         "an undeclared directory module's whole subtree is tree-shaken away"
     );
-    let _ = fs::remove_dir_all(&tmp);
+    assert!(
+        !has("src/ipe_runtime/webhook.rs"),
+        "a file sharing a reached name's prefix is not reached"
+    );
 }
 
 /// Eject refuses a wasm-target project from the `[wasm].mode` manifest tier —
@@ -3649,7 +3619,7 @@ fn build_refuses_a_pure_library_with_a_clean_message() {
     let result = build_project_with_options(
         &tmp.join("package.ipe"),
         &out,
-        Path::new("."),
+        &e2e_support::require_runtime().into_path_buf(),
         &BuildOptions::from_env().expect("BuildOptions from env"),
     );
     assert!(
@@ -3658,6 +3628,45 @@ fn build_refuses_a_pure_library_with_a_clean_message() {
     );
     assert!(!out.exists(), "the refusal fires before any emit");
     let _ = fs::remove_dir_all(&tmp);
+}
+
+/// An explicit runtime root declaring another version is refused before any
+/// emit, whichever emit model the build selects.
+#[test]
+fn an_explicit_runtime_root_of_another_version_is_refused_for_every_emit_model() {
+    let tmp = ipe_test_temp::temp_root().join("ipe_build_refuse_runtime_version");
+    let _ = fs::remove_dir_all(&tmp);
+    let project = tmp.join("app");
+    let runtime = tmp.join("runtime");
+    fs::create_dir_all(project.join("src")).expect("create src/");
+    fs::create_dir_all(runtime.join("src")).expect("create runtime src/");
+    fs::write(
+        runtime.join("Cargo.toml"),
+        "[package]\nname = \"ipe-runtime-rust\"\nversion = \"0.0.1\"\n",
+    )
+    .expect("runtime manifest");
+    fs::write(project.join("src/Main.ipe"), CLEAN_MAIN).expect("main");
+    let refused = |runtime_emit: RuntimeEmit| {
+        let out = tmp.join(format!("out-{runtime_emit:?}"));
+        let result = build_project_with_options(
+            &project.join("src/Main.ipe"),
+            &out,
+            &runtime,
+            &BuildOptions {
+                runtime_emit,
+                ..BuildOptions::default()
+            },
+        );
+        (
+            matches!(result, Err(CliError::RuntimeVersionMismatch { .. })),
+            out.exists(),
+        )
+    };
+    let linked = refused(RuntimeEmit::Linked);
+    let vendored = refused(RuntimeEmit::Vendored);
+    let _ = fs::remove_dir_all(&tmp);
+    assert_eq!(linked, (true, false), "a linked build refuses the root");
+    assert_eq!(vendored, (true, false), "a vendored build refuses the root");
 }
 
 // =========================================================================
@@ -4464,9 +4473,9 @@ fn obligation_error_blames_owning_module_not_narrower_padded_sibling() {
     )
     .expect("write Main.ipe");
 
-    let dummy_runtime = ipe_test_temp::temp_root();
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let out = tmp.join("out");
-    let result = build_loose_file(&src.join("Main.ipe"), &out, &dummy_runtime);
+    let result = build_loose_file(&src.join("Main.ipe"), &out, &runtime);
 
     assert!(
         result.is_err(),
@@ -4970,7 +4979,7 @@ fn emitting_into_a_user_directory_is_refused_untouched() {
             write_emitted_project(
                 &emitted,
                 &target,
-                &dir.join("no-runtime"),
+                &RuntimeSource::Embedded,
                 None,
                 false,
                 crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild,
@@ -5162,7 +5171,7 @@ fn a_replaced_claimed_target_is_refused_untouched() {
     let result = write_emitted_project(
         &emitted,
         &EmitTarget::Claimed(claimed),
-        &base.join("no-runtime"),
+        &RuntimeSource::Embedded,
         None,
         false,
         crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild,
@@ -5206,7 +5215,7 @@ fn emitting_into_a_marked_dir_with_planted_links_is_refused() {
     let result = write_emitted_project(
         &emitted,
         &emit_target(&dir_link),
-        &base.join("no-runtime"),
+        &RuntimeSource::Embedded,
         None,
         false,
         crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild,
@@ -5224,7 +5233,7 @@ fn emitting_into_a_marked_dir_with_planted_links_is_refused() {
     let result = write_emitted_project(
         &emitted,
         &emit_target(&file_link),
-        &base.join("no-runtime"),
+        &RuntimeSource::Embedded,
         None,
         false,
         crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild,
@@ -5799,7 +5808,7 @@ const DEBUG_LOG_MAIN: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io
 
 /// Compile [`DEBUG_LOG_MAIN`] under `verb`'s posture, uncached.
 fn compile_debug_log_as(verb: Verb, label: &str) -> Result<crate::driver::EmittedCrate, CliError> {
-    let runtime = resolve_runtime().expect("the in-repo runtime resolves");
+    let runtime = RuntimeSource::Embedded;
     let tmp = ipe_test_temp::temp_root()
         .join(format!("ipec-verb-posture-{label}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&tmp);
@@ -6495,7 +6504,7 @@ fn vendored_debugger_build_is_refused_before_compiling() {
             crate::project::CompiledDeps::none(),
             &entry_path,
             &emit_target(&out),
-            Path::new("<no-runtime>"),
+            &RuntimeSource::Embedded,
             Path::new("<vendored-debugger>"),
             &SettingsSource::Loose,
             None,
@@ -6631,11 +6640,9 @@ fn one_front_end_judges_and_emits_every_release_member() {
             intent,
             ..BuildOptions::default()
         };
-        let runtime_dir = resolve_vendored_runtime_dir(None, options.runtime_emit())
-            .expect("the vendored runtime resolves");
         let emitted = release.emit(
             OutTarget::Path(&out.join(member)),
-            &runtime_dir,
+            &RuntimeSource::Embedded,
             &options,
             crate::delivery::HostIntent::Served,
         );
@@ -6667,12 +6674,10 @@ fn one_front_end_judges_and_emits_every_release_member() {
 
     let observed = log.keys().len();
     let options = BuildOptions::default();
-    let runtime_dir = resolve_vendored_runtime_dir(None, options.runtime_emit())
-        .expect("the vendored runtime resolves");
     let cold = build_root_into(
         &held,
         OutTarget::Path(&out.join("cold")),
-        &runtime_dir,
+        &RuntimeSource::Embedded,
         &options,
         crate::delivery::HostIntent::Served,
     );

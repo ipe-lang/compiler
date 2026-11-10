@@ -643,7 +643,7 @@ fn tui_app_vendored_builds() {
 
 /// The runtime source tree the SEAL tests above vendor and build must resolve
 /// to the ACTUAL runtime module tree — not merely to some directory.
-/// `resolve_runtime` returns the module-tree root (the crate's `src/`), which
+/// `e2e_support::require_runtime` returns the module-tree root (the crate's `src/`), which
 /// the emit SEALs copy and trim/append as `ipe_runtime/mod.rs`; the crate
 /// `Cargo.toml` the SEALs splice feature flags into sits one level up. If
 /// either load-bearing entry moved, every SEAL above would fail deep inside a

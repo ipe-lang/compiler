@@ -91,10 +91,9 @@ export IPE_BIN="${IPE_BIN:-$CARGO_TARGET_DIR/release/ipe$_exe}"
 unset _exe
 
 # ── Vendored runtime dir (ipe --runtime) ────────────────────────────────────
-# ipe's build vendors the runtime module tree into each emitted crate. Left
-# UNSET it auto-resolves by walking up to `$REPO/src/runtime/rust/src`
-# (resolve_runtime() in src/ipe-cli/src/lib.rs). We export the explicit path so
-# the sweep is independent of the invocation CWD; callers may override. The tree
+# Left UNSET, ipe builds against the runtime embedded in its own binary. We
+# export the checkout's runtime source so the sweep builds against the tree under
+# test, independent of the invocation CWD; callers may override. The tree
 # is the `ipe-runtime-rust` crate's source root — the `.rs` module files sit
 # directly under it (no nested `ipe_runtime`/`ipe_runtime` subdir); a wrong path
 # here makes `ipe dev build` mis-vendor the runtime and the emitted crate cargo-fails.
