@@ -15,6 +15,7 @@ pub mod bin;
 pub mod live_page;
 pub mod scratch;
 pub mod target;
+pub mod warnings;
 
 pub use bin::{
     ProvenBin, ProvenRuntime, ResolveError, Tier, e2e_tier, require_manifest_dir, require_runtime,
@@ -232,27 +233,54 @@ fn build_emitted_binary_with_env(
     let mut cmd = target::cargo_command(&build_target);
     cmd.arg("build")
         .arg("--locked")
-        .arg("--message-format=json")
         .current_dir(emitted_dir)
         .envs(envs.iter().copied());
-    let build = run_bounded_build(
-        cmd,
-        golden_name,
-        emitted_build_timeout(),
-        emitted_build_idle(),
-    )?;
-    if !build.status.success() {
-        return Err(format!(
-            "{golden_name}: emitted project must build\n--- cargo stderr ---\n{}",
-            String::from_utf8_lossy(&build.stderr)
-        ));
-    }
-
-    let json_stdout = String::from_utf8_lossy(&build.stdout);
+    let json_stdout = checked_cargo_build(cmd, golden_name, &unique_pkg)?;
     let exe = find_executable(&json_stdout, &unique_pkg).ok_or_else(|| {
         format!("{golden_name}: no `executable` artifact for package `{unique_pkg}` in cargo JSON")
     })?;
     Ok(SharedBuild::new(exe, build_target, &unique_pkg))
+}
+
+/// Run the `cargo build` in `cmd` with `--message-format=json` under the build
+/// ceilings, returning cargo's JSON stdout.
+///
+/// The build fails when cargo fails, and also when it prints any warning
+/// attributed to the runtime crate or to `app_package` (see [`warnings`]).
+fn checked_cargo_build(mut cmd: Command, label: &str, app_package: &str) -> Result<String, String> {
+    cmd.arg("--message-format=json");
+    let build = run_bounded_build(cmd, label, emitted_build_timeout(), emitted_build_idle())?;
+    if !build.status.success() {
+        return Err(format!(
+            "{label}: emitted project must build\n--- cargo stderr ---\n{}",
+            String::from_utf8_lossy(&build.stderr)
+        ));
+    }
+    let json_stdout = String::from_utf8_lossy(&build.stdout).into_owned();
+    warnings::refuse_owned_warnings(&json_stdout, app_package).map_err(|refusal| {
+        format!("{label}: emitted project must build without warnings\n{refusal}")
+    })?;
+    Ok(json_stdout)
+}
+
+/// Build the Cargo project at `project_dir` into `build_target`, failing on a
+/// cargo failure or on any warning from the runtime crate or `app_package`.
+///
+/// For an emitted project whose package name is fixed by the command under
+/// test, so it cannot go through the renaming [`build_rust_binary`] path.
+///
+/// # Errors
+/// Returns a message carrying cargo's stderr when the build fails, or every
+/// rendered warning when the runtime or the app crate printed one.
+pub fn build_project_checked(
+    label: &str,
+    project_dir: &Path,
+    build_target: &target::BuildTarget,
+    app_package: &str,
+) -> Result<(), String> {
+    let mut cmd = target::cargo_command(build_target);
+    cmd.arg("build").current_dir(project_dir);
+    checked_cargo_build(cmd, label, app_package).map(drop)
 }
 
 /// Resolve the emitted crate's dependency graph ONCE into a per-emit

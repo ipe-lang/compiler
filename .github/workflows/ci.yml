@@ -639,6 +639,46 @@ jobs:
       # `Db` is one, and every other test compiles against the PostgreSQL `Db`.
       - run: cargo clippy -p ipe-runtime-rust --no-default-features --features db-postgres --all-targets -- -D warnings
       - run: cargo clippy -p ipe-runtime-rust --features full,db-postgres --all-targets -- -D warnings
+      # The native feature sets the backend selects, one leg each, with no
+      # default features: every surface alone, each database driver, and each
+      # dev-loop build mode. A runtime warning that fires only under one set
+      # would otherwise reach the emitted build's output. The set list is
+      # pinned by `native_featureset_closure`, which reads the backend's
+      # feature selection and prints any leg a new feature set needs.
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,random --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,crypto-core,encoding,random,server,uuid --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,crypto-core,encoding,json,random,server,time-core,uuid,web --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,random,tui --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features tui --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,crypto-core,encoding,json,random,time-core,uuid,webview --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features crypto-core,encoding,json,jwt,secret,uuid --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,random,url,websocket_client --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,crypto-core,email,encoding,http_client,random,url --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features locale --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features time-core --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,encoding,http_client,random,url --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features config,json --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features compression --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features csv_kernel --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features cache_kernel --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features encoding --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features regex --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features uuid --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features random --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features log,time-core --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features decimal --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features char-category --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features crypto-core --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features crypto-core,secret --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features json --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features crypto,crypto-core,encoding --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features url --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,crypto-core,db-sqlite,decimal,encoding,json,random,time-core,url --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,crypto-core,db-postgres,decimal,encoding,json,random,time-core,url --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features dev-posture --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features debugger,dev-posture --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,control-wire,dev-posture,random,tui --all-targets -- -D warnings
 
   # Required context for `runtime-feature-combos-run`: the phase verdict (see the header).
   runtime-feature-combos:
