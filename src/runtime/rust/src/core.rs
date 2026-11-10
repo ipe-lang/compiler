@@ -206,15 +206,16 @@ pub fn closure_unwind(payload: Box<dyn std::any::Any + Send>) -> ClosureUnwind {
 
 /// End the process on an unwind caught at a boundary with no error channel.
 ///
-/// A trip prints its typed error; any other payload is logged redacted and
-/// prints `context` plus its correlation id as an `Unexpected` error. Both end
-/// through the one exit funnel with status 1, so the pre-exit stages run.
+/// A trip prints its typed error; any other payload is a foreign panic, logged
+/// redacted and printed as an `Ffi` error naming `context` and its correlation
+/// id. Both end through the one exit funnel with status 1, so the pre-exit
+/// stages run.
 /// `context` is an emitter- or runtime-owned constant, never payload text.
 pub fn end_on_unchanneled_unwind(context: &'static str, unwind: ClosureUnwind) -> ! {
     let error = match unwind {
         ClosureUnwind::Trip(fault) => fault.to_ipe_error(),
         ClosureUnwind::Foreign(payload) => {
-            crate::IpeError::unexpected(redacted_panic_message(context, payload))
+            ipe_error_from_panic::<crate::IpeError>(context, payload)
         }
     };
     eprint_task_error(&error.to_string());
