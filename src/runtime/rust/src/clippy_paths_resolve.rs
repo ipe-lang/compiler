@@ -49,12 +49,46 @@ const _RAND_CORE: () = {
     let _: Option<::aes_gcm::aead::OsRng> = None;
 };
 
+/// The future the task-start namings start.
+#[cfg(feature = "tokio")]
+type Ready = ::std::future::Ready<()>;
+
 #[cfg(feature = "tokio")]
 const _TOKIO: () = {
     #[expect(clippy::disallowed_methods)]
     let _ = ::tokio::task::spawn_blocking::<fn(), ()>;
     #[expect(clippy::disallowed_methods)]
     let _ = ::tokio::runtime::Handle::spawn_blocking::<fn(), ()>;
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::tokio::runtime::Handle::spawn::<Ready>;
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::tokio::runtime::Runtime::spawn::<Ready>;
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::tokio::task::spawn_local::<Ready>;
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::tokio::task::LocalSet::spawn_local::<Ready>;
+    #[expect(clippy::disallowed_types)]
+    let _: Option<::tokio::task::JoinSet<()>> = None;
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::tokio::task::JoinSet::<()>::spawn::<Ready>;
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::tokio::task::JoinSet::<()>::spawn_on::<Ready>;
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::tokio::task::JoinSet::<()>::spawn_local::<Ready>;
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::tokio::task::JoinSet::<()>::spawn_local_on::<Ready>;
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::tokio::task::JoinSet::<()>::spawn_blocking::<fn()>;
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::tokio::task::JoinSet::<()>::spawn_blocking_on::<fn()>;
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::tokio::task::JoinSet::<()>::join_next;
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::tokio::task::JoinSet::<()>::try_join_next;
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::tokio::task::JoinSet::<()>::join_next_with_id;
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::tokio::task::JoinSet::<()>::join_all;
 };
 
 #[cfg(feature = "encoding")]

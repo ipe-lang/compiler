@@ -6,6 +6,12 @@
 //! error channel, never a panic. The runtime `clippy.toml` denies the
 //! panicking starts (`std::thread::spawn`, `std::thread::Scope::spawn`,
 //! `tokio::task::spawn_blocking`, `tokio::runtime::Handle::spawn_blocking`).
+//!
+//! Every async task the runtime starts goes through [`spawn_task`] or
+//! [`IpeJoinSet`]: its scope is chosen ([`TaskScope`]), its handle aborts
+//! the task when dropped, a join resumes a [`crate::core::RuntimeTrip`] on
+//! the joiner, and a detached task names who answers for its end
+//! ([`Detached`]). The `clippy.toml` denies the other starts and joins.
 
 use std::fmt;
 use std::thread::JoinHandle;
@@ -220,6 +226,458 @@ mod blocking {
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 pub use blocking::{join_blocking, offload_blocking};
 
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+mod tasks {
+    use super::{RefusalCause, ThreadRefused};
+    use crate::core::{ClosureUnwind, RuntimeTrip, closure_unwind};
+    use crate::task::AbortOnDrop;
+    use std::fmt;
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, OnceLock};
+
+    /// The task-local scopes a started task runs in.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TaskScope {
+        /// Its starter's: the task works on the caller's behalf, so a
+        /// credential it verifies binds to the caller's session or request.
+        Caller,
+        /// None: runtime-owned work; the text says why no caller scope applies.
+        RuntimeOwned(&'static str),
+    }
+
+    /// How a joined task ended without its output; a trip never reaches here.
+    pub enum TaskEnded {
+        /// The task was aborted, or its runtime shut down first.
+        Cancelled(tokio::task::JoinError),
+        /// The task panicked with a payload that is not a trip.
+        Panicked(Box<dyn std::any::Any + Send>),
+    }
+
+    impl fmt::Debug for TaskEnded {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Cancelled(join_err) => f.debug_tuple("Cancelled").field(join_err).finish(),
+                Self::Panicked(_) => f.write_str("Panicked(..)"),
+            }
+        }
+    }
+
+    impl TaskEnded {
+        /// Whether the task was cancelled rather than panicking.
+        #[must_use]
+        pub const fn is_cancelled(&self) -> bool {
+            matches!(self, Self::Cancelled(_))
+        }
+
+        /// The end as the caller's error, kinded `Unexpected`.
+        ///
+        /// A panic or a cancel is a defect in runtime or compiled code: the
+        /// error names `role` and the end, its detail logged under the
+        /// correlation id it shows.
+        #[must_use]
+        pub fn into_error<E: crate::FromIpeError>(self, role: &str) -> E {
+            match self {
+                Self::Panicked(payload) => crate::core::ipe_error_from_unwind(
+                    crate::core::UnwindBoundary::Task(&format!("{role} panicked")),
+                    payload,
+                ),
+                Self::Cancelled(join_err) => {
+                    E::from_ipe_error(crate::IpeError::unexpected(format!(
+                        "{role} cancelled (ref {})",
+                        crate::core::note_foreign_error(join_err)
+                    )))
+                }
+            }
+        }
+    }
+
+    /// How a contained join ended without its output, the trip kept a value.
+    #[derive(Debug)]
+    pub enum Unjoined {
+        /// The task's Ipê code raised the runtime's typed trip.
+        Trip(RuntimeTrip),
+        /// The task panicked otherwise, or was cancelled.
+        Ended(TaskEnded),
+    }
+
+    /// The one classification of a task's `JoinError`.
+    fn classify(failed: tokio::task::JoinError) -> Unjoined {
+        match failed.try_into_panic() {
+            Ok(payload) => match closure_unwind(payload) {
+                ClosureUnwind::Trip(fault) => Unjoined::Trip(fault),
+                ClosureUnwind::Foreign(other) => Unjoined::Ended(TaskEnded::Panicked(other)),
+            },
+            Err(cancelled) => Unjoined::Ended(TaskEnded::Cancelled(cancelled)),
+        }
+    }
+
+    /// A task end, with a trip resumed on the calling task.
+    fn resume_trip(unjoined: Unjoined) -> TaskEnded {
+        match unjoined {
+            Unjoined::Trip(fault) => std::panic::resume_unwind(Box::new(fault)),
+            Unjoined::Ended(ended) => ended,
+        }
+    }
+
+    /// Who answers for a detached task once nothing joins it.
+    #[derive(Debug)]
+    pub enum Detached {
+        /// The task runs no Ipê code, so no trip can end it; the text says
+        /// what it runs.
+        NoIpeCode(&'static str),
+        /// The task may run Ipê code: its trip or panic is delivered to the
+        /// owner of this sink, which ends its own run with the typed error.
+        IpeOwned(TripSink),
+    }
+
+    /// A started async task: joined, detached, or aborted when dropped.
+    #[must_use = "a dropped handle aborts its task; join it or detach it"]
+    pub struct TaskHandle<T> {
+        role: &'static str,
+        handle: tokio::task::JoinHandle<T>,
+        guard: AbortOnDrop,
+        runtime: tokio::runtime::Handle,
+    }
+
+    impl<T> fmt::Debug for TaskHandle<T> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("TaskHandle")
+                .field("role", &self.role)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl<T> TaskHandle<T> {
+        /// The task's output, a trip in it resumed on this task.
+        ///
+        /// # Errors
+        ///
+        /// The task panicked with another payload, or was cancelled.
+        pub async fn joined(self) -> Result<T, TaskEnded> {
+            self.join_contained().await.map_err(resume_trip)
+        }
+
+        /// The task's output, a trip in it returned as a value.
+        ///
+        /// For a joiner no unwind may leave, such as a future a foreign
+        /// executor polls.
+        ///
+        /// # Errors
+        ///
+        /// The task tripped, panicked, or was cancelled.
+        pub async fn join_contained(self) -> Result<T, Unjoined> {
+            let Self { handle, guard, .. } = self;
+            let joined = handle.await;
+            guard.defuse();
+            joined.map_err(classify)
+        }
+
+        /// The task's output as [`Self::join_contained`] gives it, the task
+        /// running on to its end when this join is dropped first.
+        ///
+        /// # Errors
+        ///
+        /// The task tripped, panicked, or was cancelled.
+        pub async fn join_shielded(self) -> Result<T, Unjoined> {
+            let Self { handle, guard, .. } = self;
+            guard.defuse();
+            handle.await.map_err(classify)
+        }
+
+        /// A handle that aborts the task without joining it.
+        #[must_use]
+        pub fn abort_handle(&self) -> tokio::task::AbortHandle {
+            self.handle.abort_handle()
+        }
+
+        /// Aborts the task; a join then ends `Cancelled` unless it finished.
+        pub fn abort(&self) {
+            self.handle.abort();
+        }
+
+        /// Whether the task has finished.
+        #[must_use]
+        pub fn is_finished(&self) -> bool {
+            self.handle.is_finished()
+        }
+    }
+
+    impl<T: Send + 'static> TaskHandle<T> {
+        /// Lets the task run on unjoined, answered for by `owner`.
+        pub fn detach(self, owner: Detached) {
+            let Self {
+                role,
+                handle,
+                guard,
+                runtime,
+            } = self;
+            guard.defuse();
+            match owner {
+                Detached::NoIpeCode(_) => drop(handle),
+                Detached::IpeOwned(sink) => {
+                    let watch = async move {
+                        if let Err(failed) = handle.await {
+                            sink.deliver(role, failed);
+                        }
+                    };
+                    // The watcher runs no Ipê code: it only delivers the
+                    // watched task's end.
+                    #[allow(clippy::disallowed_methods)]
+                    drop(runtime.spawn(watch));
+                }
+            }
+        }
+    }
+
+    /// Starts `task` on the running runtime in `scope`.
+    ///
+    /// # Errors
+    ///
+    /// No tokio runtime is running on the calling thread.
+    pub fn spawn_task<F>(
+        role: &'static str,
+        scope: TaskScope,
+        task: F,
+    ) -> Result<TaskHandle<F::Output>, ThreadRefused>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| ThreadRefused {
+            role,
+            cause: RefusalCause::NoRuntime,
+        })?;
+        Ok(spawn_task_on(role, &runtime, scope, task))
+    }
+
+    /// Starts `task` on `runtime` in `scope`.
+    #[allow(clippy::disallowed_methods)] // the one task start: its handle joins typed and aborts on drop
+    pub fn spawn_task_on<F>(
+        role: &'static str,
+        runtime: &tokio::runtime::Handle,
+        scope: TaskScope,
+        task: F,
+    ) -> TaskHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let handle = match scope {
+            TaskScope::Caller => runtime.spawn(crate::task::on_behalf_of_caller(task)),
+            TaskScope::RuntimeOwned(_) => runtime.spawn(task),
+        };
+        let guard = AbortOnDrop::new(handle.abort_handle());
+        TaskHandle {
+            role,
+            handle,
+            guard,
+            runtime: runtime.clone(),
+        }
+    }
+
+    /// Starts `task` runtime-owned and detached, for a service that runs no
+    /// Ipê code; `runs` says what it runs.
+    ///
+    /// # Errors
+    ///
+    /// No tokio runtime is running on the calling thread.
+    pub fn spawn_service<F>(
+        role: &'static str,
+        runs: &'static str,
+        task: F,
+    ) -> Result<(), ThreadRefused>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        spawn_task(role, TaskScope::RuntimeOwned(runs), task)?.detach(Detached::NoIpeCode(runs));
+        Ok(())
+    }
+
+    /// Starts `task` in its caller's scopes as a bare tokio handle.
+    ///
+    /// The start of the callers not yet behind [`TaskHandle`]; it panics
+    /// with no runtime running.
+    pub fn spawn_unmigrated<F>(task: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        tokio::spawn(crate::task::on_behalf_of_caller(task))
+    }
+
+    /// A set of tasks joined in completion order, each join resuming a trip.
+    #[allow(clippy::disallowed_types)] // the one `JoinSet`: its joins resume trips
+    pub struct IpeJoinSet<T> {
+        role: &'static str,
+        set: tokio::task::JoinSet<T>,
+    }
+
+    impl<T> fmt::Debug for IpeJoinSet<T> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("IpeJoinSet")
+                .field("role", &self.role)
+                .finish_non_exhaustive()
+        }
+    }
+
+    #[allow(clippy::disallowed_types, clippy::disallowed_methods)] // the one `JoinSet`: its joins resume trips
+    impl<T: Send + 'static> IpeJoinSet<T> {
+        /// An empty set whose tasks do the work of `role`.
+        #[must_use]
+        pub fn new(role: &'static str) -> Self {
+            Self {
+                role,
+                set: tokio::task::JoinSet::new(),
+            }
+        }
+
+        /// Starts `task` in the set, in `scope`.
+        ///
+        /// # Errors
+        ///
+        /// No tokio runtime is running on the calling thread.
+        pub fn start<F>(&mut self, scope: TaskScope, task: F) -> Result<(), ThreadRefused>
+        where
+            F: Future<Output = T> + Send + 'static,
+        {
+            let runtime = tokio::runtime::Handle::try_current().map_err(|_| ThreadRefused {
+                role: self.role,
+                cause: RefusalCause::NoRuntime,
+            })?;
+            let started = match scope {
+                TaskScope::Caller => self
+                    .set
+                    .spawn_on(crate::task::on_behalf_of_caller(task), &runtime),
+                TaskScope::RuntimeOwned(_) => self.set.spawn_on(task, &runtime),
+            };
+            drop(started);
+            Ok(())
+        }
+
+        /// The next task to finish, a trip in it resumed on this task.
+        ///
+        /// `None` once the set is empty.
+        pub async fn next_joined(&mut self) -> Option<Result<T, TaskEnded>> {
+            let joined = self.set.join_next().await?;
+            Some(joined.map_err(|failed| resume_trip(classify(failed))))
+        }
+    }
+
+    /// How a detached task that may run Ipê code ended.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum OwnerEnd {
+        /// Its Ipê code raised the runtime's typed trip.
+        Trip(RuntimeTrip),
+        /// It panicked otherwise; the payload is logged under `reference`.
+        Panicked {
+            /// The work the task did.
+            role: &'static str,
+            /// The correlation id the payload is logged under.
+            reference: String,
+        },
+    }
+
+    impl OwnerEnd {
+        /// The end as the owner's typed error.
+        ///
+        /// A trip keeps its kind; a panic is kinded `Unexpected`, naming only
+        /// the task's role and the correlation id.
+        #[must_use]
+        pub fn to_ipe_error(&self) -> crate::IpeError {
+            match self {
+                Self::Trip(fault) => fault.to_ipe_error(),
+                Self::Panicked { role, reference } => {
+                    crate::IpeError::unexpected(format!("{role}: task panicked (ref {reference})"))
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct SinkCell {
+        end: OnceLock<OwnerEnd>,
+        ended: tokio::sync::Notify,
+        owned: AtomicBool,
+    }
+
+    /// Where detached tasks deliver their end; the first end wins.
+    #[derive(Debug, Clone, Default)]
+    pub struct TripSink(Arc<SinkCell>);
+
+    /// A second owner registration on one [`TripSink`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TripSinkTaken;
+
+    impl fmt::Display for TripSinkTaken {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("the trip sink already has an owner")
+        }
+    }
+
+    impl std::error::Error for TripSinkTaken {}
+
+    impl TripSink {
+        /// A sink with no end and no owner yet.
+        #[must_use]
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// The sink's one owner.
+        ///
+        /// # Errors
+        ///
+        /// The sink already has an owner.
+        pub fn owner(&self) -> Result<TripOwner, TripSinkTaken> {
+            if self.0.owned.swap(true, Ordering::AcqRel) {
+                return Err(TripSinkTaken);
+            }
+            Ok(TripOwner(Arc::clone(&self.0)))
+        }
+
+        /// Records the end of a detached task, unless one is recorded already.
+        fn deliver(&self, role: &'static str, failed: tokio::task::JoinError) {
+            let end = match classify(failed) {
+                Unjoined::Trip(fault) => OwnerEnd::Trip(fault),
+                Unjoined::Ended(TaskEnded::Panicked(payload)) => OwnerEnd::Panicked {
+                    role,
+                    reference: crate::core::classify_and_log_panic(payload.as_ref()),
+                },
+                Unjoined::Ended(TaskEnded::Cancelled(_)) => return,
+            };
+            if self.0.end.set(end).is_ok() {
+                self.0.ended.notify_waiters();
+            }
+        }
+    }
+
+    /// The one owner of a [`TripSink`]: it awaits the first delivered end.
+    #[derive(Debug)]
+    pub struct TripOwner(Arc<SinkCell>);
+
+    impl TripOwner {
+        /// The first end a detached task delivered, once one has.
+        pub async fn ended(&self) -> OwnerEnd {
+            loop {
+                let notified = self.0.ended.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if let Some(end) = self.0.end.get() {
+                    return end.clone();
+                }
+                notified.await;
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+pub use tasks::{
+    Detached, IpeJoinSet, OwnerEnd, TaskEnded, TaskHandle, TaskScope, TripOwner, TripSink,
+    TripSinkTaken, Unjoined, spawn_service, spawn_task, spawn_task_on, spawn_unmigrated,
+};
+
 /// Runs `f` inline: without a blocking pool there is no thread to start.
 ///
 /// # Errors
@@ -398,5 +856,163 @@ mod tests {
             ran.map_err(crate::ipe_error_kind),
             Err(crate::IpeErrorKind::Unavailable)
         ));
+    }
+
+    #[cfg(feature = "tokio")]
+    fn tripping() -> i64 {
+        crate::core::trip(crate::core::RuntimeTrip::RecursionLimit)
+    }
+
+    #[cfg(feature = "tokio")]
+    fn foreign_panic() -> i64 {
+        std::panic::resume_unwind(Box::new("sk_live_SECRET"))
+    }
+
+    #[cfg(feature = "tokio")]
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn a_trip_in_a_joined_task_resumes_on_the_joiner() {
+        let outer = spawn_task("ipe-test-outer", TaskScope::RuntimeOwned("test"), async {
+            let inner = spawn_task("ipe-test-inner", TaskScope::Caller, async { tripping() });
+            if let Ok(inner) = inner {
+                drop(inner.joined().await);
+            }
+        });
+        assert!(outer.is_ok(), "a runtime is running");
+        let Ok(outer) = outer else { return };
+        let joined = outer.join_contained().await;
+        assert!(
+            matches!(
+                joined,
+                Err(Unjoined::Trip(crate::core::RuntimeTrip::RecursionLimit))
+            ),
+            "the inner trip must leave the joiner's join as the same trip: {joined:?}"
+        );
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn a_joinset_member_trip_resumes_on_the_joiner() {
+        let outer = spawn_task("ipe-test-outer", TaskScope::RuntimeOwned("test"), async {
+            let mut set = IpeJoinSet::new("ipe-test-member");
+            if set.start(TaskScope::Caller, async { tripping() }).is_ok() {
+                drop(set.next_joined().await);
+            }
+        });
+        assert!(outer.is_ok(), "a runtime is running");
+        let Ok(outer) = outer else { return };
+        let joined = outer.join_contained().await;
+        assert!(
+            matches!(
+                joined,
+                Err(Unjoined::Trip(crate::core::RuntimeTrip::RecursionLimit))
+            ),
+            "a member's trip must leave `next_joined` as the same trip: {joined:?}"
+        );
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn spawn_without_a_runtime_refuses_typed() {
+        let started = spawn_task("ipe-test-none", TaskScope::Caller, async { 7_i64 });
+        assert!(
+            matches!(&started, Err(refused) if refused.cause() == RefusalCause::NoRuntime),
+            "{started:?}"
+        );
+        let mut set = IpeJoinSet::new("ipe-test-none");
+        let member = set.start(TaskScope::RuntimeOwned("test"), async { 7_i64 });
+        assert!(
+            matches!(&member, Err(refused) if refused.cause() == RefusalCause::NoRuntime),
+            "{member:?}"
+        );
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn an_ipe_owned_detached_trip_reaches_its_owner() {
+        let sink = TripSink::new();
+        let owner = sink.owner();
+        assert!(owner.is_ok(), "a fresh sink has no owner");
+        let Ok(owner) = owner else { return };
+        let started = spawn_task("ipe-test-detached", TaskScope::Caller, async { tripping() });
+        assert!(started.is_ok(), "a runtime is running");
+        let Ok(started) = started else { return };
+        started.detach(Detached::IpeOwned(sink));
+        let ended = tokio::time::timeout(DEADLINE, owner.ended()).await;
+        assert!(
+            matches!(
+                &ended,
+                Ok(OwnerEnd::Trip(crate::core::RuntimeTrip::RecursionLimit))
+            ),
+            "{ended:?}"
+        );
+        let Ok(end) = ended else { return };
+        assert_eq!(
+            crate::ipe_error_kind(end.to_ipe_error()),
+            crate::IpeErrorKind::LimitExceeded
+        );
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn an_ipe_owned_detached_panic_reaches_its_owner_redacted() {
+        let sink = TripSink::new();
+        let owner = sink.owner();
+        assert!(owner.is_ok(), "a fresh sink has no owner");
+        let Ok(owner) = owner else { return };
+        let started = spawn_task("ipe-test-detached", TaskScope::Caller, async {
+            foreign_panic()
+        });
+        assert!(started.is_ok(), "a runtime is running");
+        let Ok(started) = started else { return };
+        started.detach(Detached::IpeOwned(sink));
+        let ended = tokio::time::timeout(DEADLINE, owner.ended()).await;
+        assert!(
+            matches!(
+                &ended,
+                Ok(OwnerEnd::Panicked {
+                    role: "ipe-test-detached",
+                    ..
+                })
+            ),
+            "{ended:?}"
+        );
+        let Ok(end) = ended else { return };
+        let err = end.to_ipe_error();
+        assert_eq!(
+            crate::ipe_error_kind(err.clone()),
+            crate::IpeErrorKind::Unexpected
+        );
+        assert!(!crate::ipe_error_message(err).contains("sk_live_SECRET"));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn a_second_sink_registration_is_refused() {
+        let sink = TripSink::new();
+        let first = sink.owner();
+        assert!(first.is_ok(), "a fresh sink has no owner");
+        let shared = sink.clone();
+        assert!(matches!(shared.owner(), Err(TripSinkTaken)));
+        assert!(matches!(sink.owner(), Err(TripSinkTaken)));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn a_dropped_unjoined_handle_cancels_its_task() {
+        let (held, released) = tokio::sync::oneshot::channel::<()>();
+        let started = spawn_task("ipe-test-dropped", TaskScope::RuntimeOwned("test"), async {
+            let _held = held;
+            std::future::pending::<()>().await;
+        });
+        assert!(started.is_ok(), "a runtime is running");
+        drop(started);
+        let released = tokio::time::timeout(DEADLINE, released).await;
+        assert!(
+            matches!(released, Ok(Err(_))),
+            "dropping the handle must abort the task and drop its state: {released:?}"
+        );
     }
 }
