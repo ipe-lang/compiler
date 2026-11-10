@@ -8,7 +8,7 @@
 use std::fmt::Write as _;
 
 use ipe_diagnostics::nesting::{COMPOSE_NESTING, SOURCE_NESTING_LIMIT};
-use ipe_diagnostics::{Diagnostic, ParseError};
+use ipe_diagnostics::{Diagnostic, InterpolationDefect, ParseError, Span};
 use ipe_intern::Interner;
 use ipe_parse::parse_module;
 use ipe_syntax::{Expr_, Pattern_};
@@ -720,5 +720,216 @@ fn access_chain_after_do_block_is_refused_at_parse() {
         (at_lo, at_hi),
         expected,
         "the refusal spans the chain from `r` through segment {boundary}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Interpolation bodies — IPE-P0077
+// ---------------------------------------------------------------------------
+
+/// The interpolation defect and span `src` is refused with, or `None` when
+/// it parses or fails another way.
+fn interpolation_refusal(src: &str) -> Option<(InterpolationDefect, Span)> {
+    let mut i = Interner::new();
+    let diag = parse_module(src, &mut i).err()?;
+    let Diagnostic::Parse {
+        span,
+        msg: ParseError::MalformedInterpolation(defect),
+    } = diag
+    else {
+        return None;
+    };
+    assert_eq!(diag.code().as_str(), "IPE-P0077");
+    Some((defect, span))
+}
+
+/// The `[lo, hi)` span of the `nth` occurrence of `needle` in `src`.
+fn span_at(src: &str, needle: &str, nth: usize) -> Option<Span> {
+    let lo = src.match_indices(needle).nth(nth)?.0;
+    Some(Span::new(
+        u32::try_from(lo).ok()?,
+        u32::try_from(lo + needle.len()).ok()?,
+    ))
+}
+
+/// Whether `src` parses.
+fn parses(src: &str) -> bool {
+    let mut i = Interner::new();
+    parse_module(src, &mut i).is_ok()
+}
+
+/// A body whose expression is still open at the first `}}` is IPE-P0077
+/// `BodyEnded` at that `}}`, whatever construct is left open: a bracket, an
+/// `if` without `else`, a `case` without branches, an operator, a lambda, a
+/// record. The balanced body parses.
+#[test]
+fn a_body_cut_short_by_its_closer_is_body_ended() {
+    for body in [
+        "f (x",
+        "[ 1, 2",
+        "if a then b",
+        "case x of",
+        "x +",
+        "\\y ->",
+        "let a = 1 in",
+    ] {
+        let src = module_with_main(&format!("\"\"\"a {{{{{body}}}}} b\"\"\""));
+        assert_eq!(
+            interpolation_refusal(&src),
+            span_at(&src, "}}", 0).map(|at| (InterpolationDefect::BodyEnded, at)),
+            "IPE-P0077 BodyEnded at the closer for {src}"
+        );
+    }
+    assert!(parses(&module_with_main("\"\"\"a {{f (x)}} b\"\"\"")));
+}
+
+/// A module that runs out of tokens mid-expression is refused at its last
+/// token, never at a location-less span.
+#[test]
+fn running_out_of_tokens_points_at_the_last_token() {
+    for (body, last) in [
+        ("f (x", "x"),
+        ("[ 1, 2", "2"),
+        ("if a then b", "b"),
+        ("case x of", "of"),
+        ("x +", "+"),
+    ] {
+        let src = format!("module Main exposing (main)\n\nmain =\n    {body}");
+        let mut i = Interner::new();
+        let span = match parse_module(&src, &mut i) {
+            Err(Diagnostic::Parse { span, .. }) => Some(span),
+            _ => None,
+        };
+        let at = src.rfind(last).and_then(|lo| {
+            Some(Span::new(
+                u32::try_from(lo).ok()?,
+                u32::try_from(lo + last.len()).ok()?,
+            ))
+        });
+        assert_eq!(span, at, "refused at the last token for {src:?}");
+    }
+}
+
+/// A record literal closing back to back ends the body at its first `}}`:
+/// IPE-P0077 `BodyEnded`; spacing the braces apart parses.
+#[test]
+fn a_nested_record_closing_back_to_back_is_body_ended() {
+    let src = module_with_main("\"\"\"{{ f {a = {b = 1}} }}\"\"\"");
+    assert_eq!(
+        interpolation_refusal(&src),
+        span_at(&src, "}}", 0).map(|at| (InterpolationDefect::BodyEnded, at))
+    );
+    assert!(parses(&module_with_main(
+        "\"\"\"{{ f {a = {b = 1} } }}\"\"\""
+    )));
+}
+
+/// An empty or blank body is IPE-P0077 `Empty`; a body naming a value parses.
+#[test]
+fn an_empty_body_is_refused() {
+    for body in ["{{}}", "{{  }}"] {
+        let src = module_with_main(&format!("\"\"\"a {body} b\"\"\""));
+        assert!(
+            matches!(
+                interpolation_refusal(&src),
+                Some((InterpolationDefect::Empty, _))
+            ),
+            "IPE-P0077 Empty for {src}"
+        );
+    }
+    assert!(parses(&module_with_main("\"\"\"a {{x}} b\"\"\"")));
+}
+
+/// A `{{` with no `}}` after it is IPE-P0077 `Unclosed` at the `{{`.
+#[test]
+fn an_unclosed_body_is_refused() {
+    let src = module_with_main("\"\"\"a {{b\"\"\"");
+    let refused = interpolation_refusal(&src);
+    let at = span_at(&src, "{{", 0).map(|s| s.lo);
+    assert!(
+        matches!(refused, Some((InterpolationDefect::Unclosed, span)) if Some(span.lo) == at),
+        "IPE-P0077 Unclosed at the opener, got {refused:?}"
+    );
+    assert!(parses(&module_with_main("\"\"\"a {{b}}\"\"\"")));
+}
+
+/// A token after a whole body expression is IPE-P0077 `TrailingTokens` at
+/// that token.
+#[test]
+fn a_token_after_the_body_expression_is_refused() {
+    let src = module_with_main("\"\"\"{{a )}}\"\"\"");
+    assert_eq!(
+        interpolation_refusal(&src),
+        // Occurrence 0 is the header's `exposing (main)`.
+        span_at(&src, ")", 1).map(|at| (InterpolationDefect::TrailingTokens, at))
+    );
+    assert!(parses(&module_with_main("\"\"\"{{a}}\"\"\"")));
+}
+
+/// A module whose `main s` cases `s` on `pattern`, then a wildcard.
+fn case_module(pattern: &str) -> String {
+    format!(
+        "module Main exposing (main)\n\nmain s =\n    case s of\n        {pattern} ->\n            1\n\n        _ ->\n            0\n"
+    )
+}
+
+/// A string holding an interpolation is IPE-P0077 `InPattern` at its `{{…}}`;
+/// an escaped `\{{` is literal text, and the pattern matches the decoded value.
+#[test]
+fn an_interpolation_in_a_pattern_is_refused() {
+    let src = case_module("\"\"\"x{{y}}\"\"\"");
+    assert_eq!(
+        interpolation_refusal(&src),
+        span_at(&src, "{{y}}", 0).map(|at| (InterpolationDefect::InPattern, at))
+    );
+    let escaped = case_module("\"\"\"x\\{{y\"\"\"");
+    let mut i = Interner::new();
+    let parsed = parse_module(&escaped, &mut i);
+    let first = parsed.as_ref().ok().and_then(|m| {
+        m.values.first().and_then(|v| match &v.value.body.value {
+            Expr_::Case(_, arms) => arms.first().map(|(pat, _)| pat.value.clone()),
+            _ => None,
+        })
+    });
+    assert!(
+        matches!(&first, Some(Pattern_::PStr(value)) if value == "x{{y"),
+        "{parsed:?}"
+    );
+}
+
+/// Expression nesting inside a body counts against the same ceiling as
+/// nesting anywhere else: IPE-P0003, never a stack overflow.
+#[test]
+fn deep_nesting_inside_a_body_is_p0003() {
+    let mut body = String::with_capacity(DEPTH * 2 + 1);
+    for _ in 0..DEPTH {
+        body.push('(');
+    }
+    body.push('1');
+    for _ in 0..DEPTH {
+        body.push(')');
+    }
+    let src = module_with_main(&format!("\"\"\"{{{{ {body} }}}}\"\"\""));
+    let mut i = Interner::new();
+    assert_nesting_too_deep(parse_module(&src, &mut i), "deep body expr");
+}
+
+/// Each IPE-P0077 remedy clears its refusal: binding the value to a name
+/// first, balancing the body, and dropping the stray token.
+#[test]
+fn each_interpolation_remedy_clears_the_refusal() {
+    let bound = "module Main exposing (main)\n\nmain =\n    let\n        r = {a = {b = 1}}\n    in\n    \"\"\"{{ f r }}\"\"\"\n";
+    assert!(parses(bound), "binding to a name clears BodyEnded");
+    assert!(
+        parses(&module_with_main("\"\"\"{{ f (x) }}\"\"\"")),
+        "balancing clears BodyEnded"
+    );
+    assert!(
+        parses(&module_with_main("\"\"\"{{ a }}\"\"\"")),
+        "dropping the stray token clears TrailingTokens"
+    );
+    assert!(
+        parses(&case_module("\"\"\"xy\"\"\"")),
+        "a pattern with no interpolation parses"
     );
 }

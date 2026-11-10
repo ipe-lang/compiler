@@ -66,16 +66,16 @@ Minimal store usage:
 
     import Ipe.Analytics as Analytics exposing (Config, ConsentState(..))
     import Ipe.Db.Store as Store
-    import Ipe.Path as Path
+    import Ipe.Path exposing (Path)
 
-    cfg : Config
-    cfg =
-        Analytics.defaultConfig (Analytics.Jsonl (Path.fromString "/var/log/events.jsonl"))
+    cfg : Path -> Config
+    cfg eventsFile =
+        Analytics.defaultConfig (Analytics.Jsonl eventsFile)
             |> Analytics.setConsent Granted
             |> Analytics.identify "user-42" Analytics.noTraits
 
-    main : Task Error ()
-    main =
+    recordSignup : Db -> Path -> Task Error ()
+    recordSignup db eventsFile =
         case Analytics.eventsStore of
             Err e ->
                 Task.fail e
@@ -83,7 +83,7 @@ Minimal store usage:
             Ok store ->
                 Store.create db store
                     |> Task.andThen (\_ ->
-                        Analytics.persist db store cfg "button_click"
+                        Analytics.persist db store (cfg eventsFile) "button_click"
                             (Analytics.props [ ( "label", Analytics.PText "Sign up" ) ])
                     )
 

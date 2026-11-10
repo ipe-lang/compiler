@@ -497,6 +497,28 @@ fn push_syn_pattern(out: &mut Vec<Raw>, pat: &ipe_syntax::Pattern, interner: &In
     }
 }
 
+/// Colour a `"""` string: its text and delimiters as one string token per
+/// stretch between bodies, each body's expression by its own tokens.
+fn push_syn_template(
+    out: &mut Vec<Raw>,
+    span: Span,
+    template: &ipe_syntax::Template,
+    interner: &Interner,
+) {
+    let mut cursor = span.lo;
+    for body in template.exprs() {
+        Raw::push(
+            out,
+            Span::new(cursor, body.span.lo),
+            TokenClass::StringLit,
+            None,
+        );
+        push_syn_expr(out, body, interner);
+        cursor = cursor.max(body.span.hi);
+    }
+    Raw::push(out, Span::new(cursor, span.hi), TokenClass::StringLit, None);
+}
+
 fn push_syn_expr(out: &mut Vec<Raw>, expr: &ipe_syntax::Expr, interner: &Interner) {
     match &expr.value {
         ipe_syntax::Expr_::VarLocal(_) => {
@@ -508,10 +530,11 @@ fn push_syn_expr(out: &mut Vec<Raw>, expr: &ipe_syntax::Expr, interner: &Interne
         ipe_syntax::Expr_::Int(_) | ipe_syntax::Expr_::Float(_) => {
             Raw::push(out, expr.span, TokenClass::Number, None);
         }
-        ipe_syntax::Expr_::Str(_)
-        | ipe_syntax::Expr_::MultilineStr { .. }
-        | ipe_syntax::Expr_::Char(_) => {
+        ipe_syntax::Expr_::Str(_) | ipe_syntax::Expr_::Char(_) => {
             Raw::push(out, expr.span, TokenClass::StringLit, None);
+        }
+        ipe_syntax::Expr_::Template(template) => {
+            push_syn_template(out, expr.span, template, interner);
         }
         // A `do` bind's callee spans the `<-` operator: no name to colour.
         ipe_syntax::Expr_::TaskAndThen | ipe_syntax::Expr_::Unit => {}
@@ -650,6 +673,35 @@ mod tests {
         assert_eq!(second.byte_start, 10);
         // First occurrence at byte 0 wins — Keyword.
         assert_eq!(first.class, TokenClass::Keyword);
+    }
+
+    #[test]
+    fn a_body_name_is_its_own_token_between_string_tokens() {
+        let src = "module Main exposing (greet)\ngreet who = \"\"\"hi {{who}} there\"\"\"\n";
+        let (m, i) = parse(src);
+        let tokens = annotate_syntax(&m, &i);
+        let at = u32::try_from(src.rfind("who").unwrap_or_default()).unwrap_or(0);
+        let open = u32::try_from(src.find("\"\"\"").unwrap_or_default()).unwrap_or(0);
+        let mut end = open;
+        for t in tokens.iter().filter(|t| t.byte_start >= open) {
+            assert!(t.byte_start >= end, "overlapping tokens: {tokens:?}");
+            end = t.byte_start + t.byte_len;
+        }
+        let class_at = |lo: u32| {
+            tokens
+                .iter()
+                .find(|t| t.byte_start == lo)
+                .map(|t| (t.byte_len, t.class))
+        };
+        assert_eq!(class_at(at), Some((3, TokenClass::Variable)), "{tokens:?}");
+        assert!(
+            matches!(class_at(open), Some((_, TokenClass::StringLit))),
+            "{tokens:?}"
+        );
+        assert!(
+            matches!(class_at(at + 3), Some((_, TokenClass::StringLit))),
+            "{tokens:?}"
+        );
     }
 
     #[test]

@@ -1716,13 +1716,27 @@ mod tests {
         assert!(found.is_empty(), "{found:?}");
     }
 
-    /// An interpolating triple-quoted string hides references: nothing is flagged.
+    /// An import used only inside a `{{…}}` body is used: nothing is flagged.
     #[test]
-    fn interpolation_keeps_every_import() {
-        let src =
-            "module Main exposing (main)\n\nimport App.Fmt\n\nmain = \"\"\"{{Fmt.show 1}}\"\"\"\n";
+    fn an_import_used_in_a_body_is_kept() {
+        let src = "module Main exposing (main)\n\nimport App.Fmt as Fmt\n\n\
+                   main = \"\"\"{{Fmt.show 1}}\"\"\"\n";
         let found = unused_imports(src);
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// An interpolation hides nothing: an unused import beside one is
+    /// still reported, and only that one.
+    #[test]
+    fn an_unused_import_beside_an_interpolation_is_reported() {
+        let src = "module Main exposing (main)\n\nimport App.Fmt as Fmt\nimport Unused\n\n\
+                   main = \"\"\"{{Fmt.show 1}}\"\"\"\n";
+        let found = unused_imports(src);
+        let at = src.find("import Unused").unwrap_or_default();
+        assert!(
+            matches!(found.as_slice(), [f] if f.span.lo as usize == at),
+            "{found:?}"
+        );
     }
 
     /// A clean unused import carries a fix spanning exactly its own line.
@@ -1767,6 +1781,42 @@ mod tests {
     }
 
     // ── unused-bindings tests ─────────────────────────────────────────────────
+
+    /// The `unused-bindings` findings of `src`, as the bound names' texts.
+    fn unused_binding_names(src: &str) -> Vec<String> {
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
+        report
+            .findings
+            .iter()
+            .filter(|f| f.rule == "unused-bindings")
+            .filter_map(|f| src.get(f.span.lo as usize..f.span.hi as usize))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// A binding read only inside a `{{…}}` body is used; an unused sibling
+    /// is still reported.
+    #[test]
+    fn a_binding_used_only_in_a_body_is_not_flagged() {
+        let src = concat!(
+            "module Main exposing (main)\n\n",
+            "main =\n",
+            "    let\n",
+            "        name = \"Ana\"\n",
+            "        unused = 42\n",
+            "    in\n",
+            "    \"\"\"hi {{String.toUpper name}}\"\"\"\n",
+        );
+        let names = unused_binding_names(src);
+        assert!(
+            names.iter().all(|n| !n.contains("name")),
+            "a binding used in a body is used, got {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.contains("unused")),
+            "the unused sibling is reported, got {names:?}"
+        );
+    }
 
     /// A `let` binding whose name never appears in the body or later bindings
     /// must be flagged as `unused-bindings`.

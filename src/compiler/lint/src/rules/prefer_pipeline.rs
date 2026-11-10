@@ -102,13 +102,17 @@ fn walk(ctx: &Ctx, expr: &Expr, out: &mut Vec<Finding>, in_binop_operand: bool) 
             }
         }
         Expr_::Access(base, _field) => walk(ctx, base, out, false),
+        Expr_::Template(template) => {
+            for part in template.exprs() {
+                walk(ctx, part, out, false);
+            }
+        }
         Expr_::VarLocal(_)
         | Expr_::VarQual(_, _)
         | Expr_::TaskAndThen
         | Expr_::Int(_)
         | Expr_::Float(_)
         | Expr_::Str(_)
-        | Expr_::MultilineStr { .. }
         | Expr_::Char(_)
         | Expr_::Unit => {}
     }
@@ -254,7 +258,7 @@ impl SubjectKind {
             | Expr_::Int(_)
             | Expr_::Float(_)
             | Expr_::Str(_)
-            | Expr_::MultilineStr { .. }
+            | Expr_::Template(_)
             | Expr_::Char(_)
             | Expr_::Unit
             | Expr_::Call(..)

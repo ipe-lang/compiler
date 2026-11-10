@@ -78,13 +78,17 @@ fn walk_expr(ctx: &Ctx, expr: &Expr, out: &mut Vec<Finding>) {
             }
         }
         Expr_::Access(rec, _) => walk_expr(ctx, rec, out),
+        Expr_::Template(template) => {
+            for part in template.exprs() {
+                walk_expr(ctx, part, out);
+            }
+        }
         Expr_::VarLocal(_)
         | Expr_::VarQual(_, _)
         | Expr_::TaskAndThen
         | Expr_::Int(_)
         | Expr_::Float(_)
         | Expr_::Str(_)
-        | Expr_::MultilineStr { .. }
         | Expr_::Char(_)
         | Expr_::Unit => {}
     }
@@ -187,12 +191,16 @@ fn collect_used(expr: &Expr, used: &mut HashSet<Symbol>) {
             }
         }
         Expr_::Access(rec, _) => collect_used(rec, used),
+        Expr_::Template(template) => {
+            for part in template.exprs() {
+                collect_used(part, used);
+            }
+        }
         Expr_::VarQual(_, _)
         | Expr_::TaskAndThen
         | Expr_::Int(_)
         | Expr_::Float(_)
         | Expr_::Str(_)
-        | Expr_::MultilineStr { .. }
         | Expr_::Char(_)
         | Expr_::Unit => {}
     }

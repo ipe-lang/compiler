@@ -296,13 +296,17 @@ fn visit_expr(expr: &Expr, f: &mut impl FnMut(&Expr)) {
                 visit_expr(value, f);
             }
         }
+        Expr_::Template(template) => {
+            for part in template.exprs() {
+                visit_expr(part, f);
+            }
+        }
         Expr_::VarLocal(_)
         | Expr_::VarQual(_, _)
         | Expr_::TaskAndThen
         | Expr_::Int(_)
         | Expr_::Float(_)
         | Expr_::Str(_)
-        | Expr_::MultilineStr { .. }
         | Expr_::Char(_)
         | Expr_::Unit => {}
     }

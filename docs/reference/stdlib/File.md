@@ -140,7 +140,9 @@ walk and receives each file's absolute `Path`.
 
 Example — collect only `.ipe` source files:
 
-    walkMatching root (\p -> String.endsWith ".ipe" (Path.toString p))
+    ipeSources : Path -> Task Error (List Path)
+    ipeSources root =
+        walkMatching root (\p -> String.endsWith ".ipe" (Path.toString p))
 
 ## `tempFile`
 

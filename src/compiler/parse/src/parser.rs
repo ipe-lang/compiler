@@ -26,12 +26,14 @@
 use ipe_diagnostics::nesting::{COMPOSE_NESTING, SOURCE_NESTING_LIMIT};
 use ipe_diagnostics::{
     CaseDefect, Construct, DResult, Diagnostic, Expected, ExpectedSet, ExposingDefect,
-    HeaderDefect, IfDefect, LetDefect, Located, ParseError, Span, TokenKind, TypeDeclDefect,
+    HeaderDefect, IfDefect, InterpolationDefect, LetDefect, Located, ParseError, Span, TokenKind,
+    TypeDeclDefect,
 };
 use ipe_intern::{Interner, Symbol};
 use ipe_syntax::{
     BinOp, Ctor, DocString, Exposed, Exposing, Expr, Expr_, ForeignDecl, Import, LetBinding,
-    Module, Pattern, Pattern_, Privacy, TypeAlias, TypeAnnotation, Union, Value,
+    Module, Pattern, Pattern_, Privacy, Segment, Template, TripleStr, TypeAlias, TypeAnnotation,
+    Union, Value,
 };
 
 use crate::layout;
@@ -63,6 +65,10 @@ pub struct Parser<'a> {
     /// depth includes: a `do` block's statements, a `let`'s bindings, or an
     /// `else if` chain's arms.
     run: Option<SequenceStart>,
+    /// Where a refusal for running out of tokens points: the last token of
+    /// the input, read before any token is consumed, or the `}}` that closes
+    /// an interpolation body.
+    end: Span,
 }
 
 /// Where a sequence the parser charges nesting levels for begins.
@@ -305,6 +311,10 @@ fn segment_count(text: &str) -> u32 {
 impl<'a> Parser<'a> {
     pub const fn new(toks: Vec<Token>, interner: &'a mut Interner) -> Self {
         Self {
+            end: match toks.as_slice().last() {
+                Some(last) => last.span,
+                None => Span::DUMMY,
+            },
             toks,
             pos: 0,
             interner,
@@ -348,9 +358,14 @@ impl<'a> Parser<'a> {
         Ok(tok)
     }
 
-    /// Byte span to point at when input has run out: the end of the last token.
-    fn eof_err_span(&self) -> Span {
-        self.toks.last().map_or(Span::DUMMY, |t| t.span)
+    /// Byte span to point at when input has run out: the input's last token,
+    /// or the `}}` closing an interpolation body.
+    ///
+    /// Read from `end`, fixed before any token is consumed: [`Self::bump`]
+    /// leaves a spanless placeholder in each consumed slot, so the last slot
+    /// at end of input no longer holds the last token's span.
+    const fn eof_err_span(&self) -> Span {
+        self.end
     }
 
     /// Byte span to point at "here": the next token, or end-of-input.
@@ -1531,6 +1546,59 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The [`Template`] a `"""` string token holds: each body parsed as one
+    /// whole expression one level under `depth`.
+    fn parse_template(
+        &mut self,
+        triple: TripleStr,
+        segments: Vec<Segment>,
+        bodies: Vec<Vec<Token>>,
+        depth: u32,
+    ) -> DResult<Template> {
+        let closers = segments.iter().filter_map(Segment::closer);
+        let mut exprs = Vec::with_capacity(bodies.len());
+        for (tokens, closer) in bodies.into_iter().zip(closers) {
+            exprs.push(self.parse_body(tokens, closer, depth)?);
+        }
+        Template::assemble(triple, segments, exprs)
+    }
+
+    /// The expression the tokens of one `{{…}}` body, closed by `closer`, spell.
+    ///
+    /// The body is parsed by a parser of its own over the same interner, at
+    /// the enclosing depth, so nesting through bodies stays under
+    /// [`MAX_DEPTH`]. Running out of tokens mid-expression means the first
+    /// `}}` cut it short: every refusal the body parser raises at its end of
+    /// input stands on `closer` and is [`InterpolationDefect::BodyEnded`]
+    /// there, whatever construct was left open (a bracket, an `if`, a `case`,
+    /// an operator), except the nesting ceiling. A token after a whole
+    /// expression is [`InterpolationDefect::TrailingTokens`].
+    fn parse_body(&mut self, tokens: Vec<Token>, closer: Span, depth: u32) -> DResult<Expr> {
+        let (parsed, leftover, deepest) = {
+            let mut body = Parser::new(tokens, self.interner);
+            body.end = closer;
+            body.deepest = self.deepest;
+            let parsed = body.parse_expr(0, depth.saturating_add(1));
+            (parsed, body.peek().map(|token| token.span), body.deepest)
+        };
+        self.reach(deepest);
+        let defect = |span, defect| Diagnostic::Parse {
+            span,
+            msg: ParseError::MalformedInterpolation(defect),
+        };
+        let expr = match parsed {
+            Err(Diagnostic::Parse { span, msg })
+                if span == closer && !matches!(msg, ParseError::NestingTooDeep { .. }) =>
+            {
+                return Err(defect(closer, InterpolationDefect::BodyEnded));
+            }
+            parsed => parsed?,
+        };
+        leftover.map_or(Ok(expr), |span| {
+            Err(defect(span, InterpolationDefect::TrailingTokens))
+        })
+    }
+
     /// Whether a chain with `charged` levels over its deepest operand so far
     /// nests past [`MAX_DEPTH`].
     const fn chain_too_deep(&self, charged: u32) -> bool {
@@ -1714,9 +1782,14 @@ impl<'a> Parser<'a> {
             Tok::Float(f) => Ok(Located::new(span, Expr_::Float(f))),
             // String payloads move directly into the AST node — no secondary copy.
             Tok::Str(s) => Ok(Located::new(span, Expr_::Str(s))),
-            // A triple-quoted string carries its judged form; the canonicaliser
-            // desugars `{{expr}}` interpolation in its value at name-resolution time.
-            Tok::TripleStr(string) => Ok(Located::new(span, Expr_::MultilineStr(string))),
+            Tok::TripleStr {
+                triple,
+                segments,
+                bodies,
+            } => {
+                let template = self.parse_template(triple, segments, bodies, depth)?;
+                Ok(Located::new(span, Expr_::Template(template)))
+            }
             Tok::Char(c) => Ok(Located::new(span, Expr_::Char(c))),
             Tok::Minus => self.parse_negative_literal(span, threshold, depth),
             Tok::Ident(text) => {
@@ -2247,7 +2320,7 @@ impl<'a> Parser<'a> {
 
     /// The unexpected-EOF diagnostic for an unterminated record (literal or
     /// update).
-    fn record_eof(&self) -> Diagnostic {
+    const fn record_eof(&self) -> Diagnostic {
         Diagnostic::Parse {
             span: self.eof_err_span(),
             msg: ParseError::UnexpectedEof {
@@ -2992,6 +3065,21 @@ impl<'a> Parser<'a> {
         Err(Self::unexpected_token(&tok, &[Expected::Identifier]))
     }
 
+    /// A triple-quoted string in pattern position: it matches its value,
+    /// escapes decoded. A pattern matches a fixed string, so one that
+    /// interpolates is refused at its first `{{…}}`.
+    fn triple_pattern(span: Span, triple: &TripleStr, segments: &[Segment]) -> DResult<Pattern> {
+        if let Some(at) = segments.iter().find_map(Segment::delimited) {
+            return Err(Diagnostic::Parse {
+                span: at,
+                msg: ParseError::MalformedInterpolation(InterpolationDefect::InPattern),
+            });
+        }
+        let template = Template::assemble(triple.clone(), segments.to_vec(), Vec::new())?;
+        let value = template.literal_value().unwrap_or_default().into_owned();
+        Ok(Located::new(span, Pattern_::PStr(value)))
+    }
+
     fn parse_pattern_atom(&mut self, depth: u32) -> DResult<Pattern> {
         if depth > MAX_DEPTH {
             return Err(self.too_deep(Construct::Pattern));
@@ -3009,12 +3097,9 @@ impl<'a> Parser<'a> {
                 Pattern_::PInt(int_value(*n, Sign::Plus, tok.span)?),
             )),
             Tok::Str(s) => Ok(Located::new(tok.span, Pattern_::PStr(s.clone()))),
-            // A triple-quoted string in pattern position matches the same value
-            // its expression form produces (patterns carry no interpolation).
-            Tok::TripleStr(string) => Ok(Located::new(
-                tok.span,
-                Pattern_::PStr(string.value().into_owned()),
-            )),
+            Tok::TripleStr {
+                triple, segments, ..
+            } => Self::triple_pattern(tok.span, triple, segments),
             Tok::Char(c) => Ok(Located::new(tok.span, Pattern_::PChar(c.clone()))),
             // A negative integer literal pattern `-3`. The digit must be
             // byte-span adjacent to the `-` (no intervening whitespace); a gap

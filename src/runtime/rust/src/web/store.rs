@@ -2611,7 +2611,11 @@ mod tests {
         let tree: Html<()> = Html::HText(String::new());
         Arc::new(Mutex::new(SessionEntry {
             model: (),
-            rendered: crate::web::Rendered::first(crate::web::SessionKeys::distinct(), tree),
+            rendered: crate::web::Rendered::first(
+                crate::web::SessionKeys::distinct(),
+                tree,
+                crate::web::PageUrl::Unrouted,
+            ),
             tabs: crate::web::TabSeqs::default(),
             seq: 0,
             sse_tx: None,
@@ -2822,7 +2826,11 @@ mod tests {
         let tree: Html<()> = Html::HText(String::new());
         Arc::new(Mutex::new(SessionEntry {
             model,
-            rendered: crate::web::Rendered::first(crate::web::SessionKeys::distinct(), tree),
+            rendered: crate::web::Rendered::first(
+                crate::web::SessionKeys::distinct(),
+                tree,
+                crate::web::PageUrl::Unrouted,
+            ),
             tabs: crate::web::TabSeqs::default(),
             seq: 0,
             sse_tx: None,
@@ -3703,7 +3711,11 @@ mod tests {
         assert_eq!(restored_i32(&restarted, sid).await, Some(42));
         #[allow(clippy::expect_used)] // the test host's CSPRNG yields entropy
         let keys = crate::web::SessionKeys::mint().expect("fresh session keys");
-        let fresh = crate::web::Rendered::first(keys, Html::<()>::HText(String::new()));
+        let fresh = crate::web::Rendered::first(
+            keys,
+            Html::<()>::HText(String::new()),
+            crate::web::PageUrl::Unrouted,
+        );
         assert_ne!(
             fresh.stamp().as_token(),
             token,
@@ -4429,7 +4441,11 @@ mod tests {
             cmds: Arc::new(crate::web::budget::SessionCmds::new()),
             port_life: None,
             model,
-            rendered: crate::web::Rendered::first(crate::web::SessionKeys::distinct(), tree),
+            rendered: crate::web::Rendered::first(
+                crate::web::SessionKeys::distinct(),
+                tree,
+                crate::web::PageUrl::Unrouted,
+            ),
             tabs: crate::web::TabSeqs::default(),
             seq: 0,
             sse_tx: None,

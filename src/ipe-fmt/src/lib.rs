@@ -2515,7 +2515,7 @@ impl<'a> Printer<'a> {
             Expr_::Int(n) => n.to_string(),
             Expr_::Float(f) => format_float(*f),
             Expr_::Str(s) => format!("\"{}\"", escape_str_body(s)),
-            Expr_::MultilineStr(string) => self.triple_str(string),
+            Expr_::Template(template) => self.triple_str(template.triple()),
             Expr_::Char(c) => format!("'{}'", escape_char_body(c)),
             Expr_::Unit => "()".to_owned(),
             Expr_::Call(head, args) => self.call(head, args, col, e.span),
@@ -2643,7 +2643,7 @@ impl<'a> Printer<'a> {
             ) || ipe_parse::field_accessor(a).is_some()
         };
         let first_is_block =
-            |a: &Expr| matches!(&a.value, Expr_::MultilineStr(s) if s.margin().is_some());
+            |a: &Expr| matches!(&a.value, Expr_::Template(t) if t.triple().margin().is_some());
         let later_block = |tail_strs: &[String]| tail_strs.iter().any(|s| has_layout_newline(s));
         // A head owning an end-of-line comment ends its line: it stands alone.
         let head_hi = head.span.hi as usize;
@@ -2745,7 +2745,7 @@ impl<'a> Printer<'a> {
         // A triple-quoted string never hugs the function line: a one-line
         // string stacks like any literal, and a block's opener ends its line,
         // so the block drops to its own indented line.
-        if matches!(a.value, Expr_::MultilineStr(_)) {
+        if matches!(a.value, Expr_::Template(_)) {
             return false;
         }
         if rendered.contains('\n') {
@@ -3471,9 +3471,10 @@ fn skip_quoted(rest: &str, quote: char) -> Option<&str> {
 /// joinable first arguments (names, empty collections) are short and always
 /// fit.
 fn head_line_fits(head_s: &str, first: &Expr, col: Col) -> bool {
-    let Expr_::MultilineStr(s) = &first.value else {
+    let Expr_::Template(template) = &first.value else {
         return true;
     };
+    let s = template.triple();
     let one_line = if s.margin().is_some() {
         0
     } else {
@@ -5262,6 +5263,29 @@ mod tests {
         let src = "module M exposing (x)\n\n\nx =\n    let\n        msg = \"\"\"n={{n}}\"\"\"\n    in\n    msg\n";
         let once = format_source(src).expect("formats");
         assert_eq!(format_source(&once).expect("second pass"), once);
+    }
+
+    /// A string whose bodies hold calls, operators, field paths and a body
+    /// across block lines formats, and formatting it again changes nothing.
+    #[test]
+    fn expression_bodies_are_a_fixed_point() {
+        let values = [
+            "x xs =\n    \"\"\"{{String.join \", \" (List.map f xs)}}\"\"\"\n",
+            "x a b =\n    \"\"\"{{a + b}} and {{a.b.c}}\"\"\"\n",
+            "x =\n    \"\"\"{{ f {a = {b = 1} } }}\"\"\"\n",
+            "x y =\n    \"\"\"\n    hi {{ f\n        y }}\n    \"\"\"\n",
+        ];
+        for value in values {
+            let src = format!("module M exposing (x)\n\n\n{value}");
+            let once = format_source(&src);
+            assert!(once.is_ok(), "{src}\n{once:?}");
+            let Ok(once) = once else { return };
+            let twice = format_source(&once);
+            assert!(
+                twice.as_ref().is_ok_and(|twice| *twice == once),
+                "{src}\n--- once\n{once}\n--- twice\n{twice:?}"
+            );
+        }
     }
 
     /// The structural projection erases positions and resolves symbols, but

@@ -33,13 +33,12 @@ summary service version region =
 Both produce the same text. The interpolated form puts the values where they
 land in the output, and `{{version}}` stringifies the `Int` on its own.
 
-## Only simple references interpolate
+## Name a long body
 
-An interpolation body is one of four simple shapes: a bare identifier
-`{{name}}`, a field access `{{record.field}}`, a qualified name
-`{{Module.value}}`, or a single application `{{fn arg}}`. Anything more complex
-stays as literal `{{…}}` text — so compute it into a `let` binding first and
-interpolate the name:
+An interpolation body is any expression — `{{a + b}}`, `{{user.name}}` and
+`{{String.join ", " tags}}` all interpolate. When a body grows past a short
+call, compute it into a `let` binding and interpolate the name, so the text
+still reads as the text it produces:
 
 ```ipe
 line : Int -> Int -> String

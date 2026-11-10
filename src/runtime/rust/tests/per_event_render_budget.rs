@@ -16,7 +16,7 @@ use std::cell::Cell;
 
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 
-use ipe_runtime_rust::dom::{RENDER_HISTORY_DEPTH, Rendered, SessionKeys};
+use ipe_runtime_rust::dom::{PageUrl, RENDER_HISTORY_DEPTH, Rendered, SessionKeys};
 use ipe_runtime_rust::html::{Attribute, Event, Html, assign_ipe_ids};
 use ipe_runtime_rust::{Bytes, RetainedBytes};
 
@@ -122,9 +122,11 @@ fn rows() -> u64 {
 /// A history moved past its depth, so it holds a full set of retained renders.
 #[allow(clippy::expect_used)] // the fixture commits far below the counter's end
 fn full_history() -> Rendered<TestMsg> {
-    let mut rendered = Rendered::first(keys(), view(0));
+    let mut rendered = Rendered::first(keys(), view(0), PageUrl::Unrouted);
     for selected in 1..=RENDER_HISTORY_DEPTH.get().saturating_add(1) {
-        rendered.commit(view(selected)).expect("commit");
+        rendered
+            .commit(view(selected), PageUrl::Unrouted)
+            .expect("commit");
     }
     rendered
 }
@@ -147,7 +149,7 @@ fn a_commit_measures_each_handler_once_for_the_view_and_once_for_its_index() {
     let mut rendered = full_history();
     let next = view(ROWS.saturating_sub(1));
     let before = measures();
-    assert!(rendered.commit(next).is_ok());
+    assert!(rendered.commit(next, PageUrl::Unrouted).is_ok());
     let visits = measures().saturating_sub(before);
     assert_eq!(Some(visits), rows().checked_mul(2));
 }
@@ -159,7 +161,7 @@ fn a_commit_measures_each_handler_once_for_the_view_and_once_for_its_index() {
 #[allow(clippy::expect_used)] // the fixture commits far below the counter's end
 #[test]
 fn the_cached_charge_equals_a_fresh_walk_after_every_commit() {
-    let mut rendered = Rendered::first(keys(), view(0));
+    let mut rendered = Rendered::first(keys(), view(0), PageUrl::Unrouted);
     assert_eq!(rendered.resident_bytes(), rendered.measured_fresh());
     let mut seen = Vec::new();
     for selected in 1..=20 {
@@ -168,7 +170,7 @@ fn the_cached_charge_equals_a_fresh_walk_after_every_commit() {
             &TestMsg::Select("k".repeat(selected)),
             Some("t".repeat(selected.saturating_mul(13))),
         );
-        rendered.commit(sized).expect("commit");
+        rendered.commit(sized, PageUrl::Unrouted).expect("commit");
         let view_bytes = rendered.last_view().view_bytes();
         assert!(
             !seen.contains(&view_bytes),
@@ -192,13 +194,16 @@ fn the_cached_charge_equals_a_fresh_walk_after_every_commit() {
 #[test]
 fn a_grown_view_moves_the_cache_and_the_fresh_walk_alike() {
     let mut rendered = full_history();
-    rendered.commit(view(1)).expect("commit");
+    rendered.commit(view(1), PageUrl::Unrouted).expect("commit");
     let cached = rendered.resident_bytes().map(Bytes::get);
     let fresh = rendered.measured_fresh().map(Bytes::get);
     let plain = rendered.last_view().view_bytes().map(Bytes::get);
     let text = "x".repeat(4096);
     rendered
-        .commit(view_with(2, &TestMsg::Select(String::new()), Some(text)))
+        .commit(
+            view_with(2, &TestMsg::Select(String::new()), Some(text)),
+            PageUrl::Unrouted,
+        )
         .expect("commit");
     let grown = rendered.last_view().view_bytes().map(Bytes::get);
     let delta = |after: Option<u64>, before: Option<u64>| {
@@ -225,20 +230,22 @@ fn an_unmeasured_render_keeps_the_charge_unmeasured_until_it_is_evicted() {
     let mut rendered = full_history();
     assert!(rendered.resident_bytes().is_some());
     rendered
-        .commit(view_with(0, &TestMsg::Unmeasured, None))
+        .commit(view_with(0, &TestMsg::Unmeasured, None), PageUrl::Unrouted)
         .expect("commit");
     assert_eq!(rendered.resident_bytes(), None);
     assert_eq!(rendered.measured_fresh(), None);
     // The unmeasured render leaves the current view but stays in the history.
-    rendered.commit(view(1)).expect("commit");
+    rendered.commit(view(1), PageUrl::Unrouted).expect("commit");
     assert_eq!(rendered.resident_bytes(), None);
     assert_eq!(rendered.measured_fresh(), None);
     for selected in 2..RENDER_HISTORY_DEPTH.get() {
-        rendered.commit(view(selected)).expect("commit");
+        rendered
+            .commit(view(selected), PageUrl::Unrouted)
+            .expect("commit");
         assert_eq!(rendered.resident_bytes(), None, "commit {selected}");
     }
     // One more commit evicts the unmeasured render.
-    rendered.commit(view(0)).expect("commit");
+    rendered.commit(view(0), PageUrl::Unrouted).expect("commit");
     assert!(rendered.resident_bytes().is_some());
     assert_eq!(rendered.resident_bytes(), rendered.measured_fresh());
 }

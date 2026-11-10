@@ -131,6 +131,11 @@ fn walk_children(ctx: &Ctx, expr: &Expr, out: &mut Vec<Finding>) {
                 walk(ctx, value, out);
             }
         }
+        Expr_::Template(template) => {
+            for part in template.exprs() {
+                walk(ctx, part, out);
+            }
+        }
         // Leaves: bare references (reported at `walk`'s top), the `do` bind's
         // identity head, literals, and unit.
         Expr_::VarLocal(_)
@@ -139,7 +144,6 @@ fn walk_children(ctx: &Ctx, expr: &Expr, out: &mut Vec<Finding>) {
         | Expr_::Int(_)
         | Expr_::Float(_)
         | Expr_::Str(_)
-        | Expr_::MultilineStr { .. }
         | Expr_::Char(_)
         | Expr_::Unit => {}
     }

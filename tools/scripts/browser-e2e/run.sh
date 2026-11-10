@@ -2,19 +2,21 @@
 # Run the browser E2E Playwright specs against locally built binaries.
 #
 # Usage:
-#   bash tools/scripts/browser-e2e/run.sh [GEO_PORT] [LAYOUT_PORT] [FOCUS_PORT] [CSP_STYLES_PORT] [INSTALL_OFFER_PORT] [INSTALL_OFFER_OFF_PORT]
+#   bash tools/scripts/browser-e2e/run.sh [GEO_PORT] [LAYOUT_PORT] [FOCUS_PORT] [CSP_STYLES_PORT] [INSTALL_OFFER_PORT] [INSTALL_OFFER_OFF_PORT] [PAGE_NAVIGATION_PORT]
 #
 # GEO_PORT defaults to 18080, LAYOUT_PORT to 18081, FOCUS_PORT to 18082,
-# CSP_STYLES_PORT to 18083, INSTALL_OFFER_PORT to 18084 and
-# INSTALL_OFFER_OFF_PORT to 18085.
+# CSP_STYLES_PORT to 18083, INSTALL_OFFER_PORT to 18084,
+# INSTALL_OFFER_OFF_PORT to 18085 and PAGE_NAVIGATION_PORT to 18086.
 # The script:
 #   1. Builds the ipe compiler (cargo build -p ipe --release).
 #   2. Compiles each example (geo-clipboard, layout-fill, focus-across-patch,
-#      csp-styles, install-offer, install-offer-off) via `ipe dev build`.
+#      csp-styles, install-offer, install-offer-off, page-navigation) via
+#      `ipe dev build`.
 #   3. Cargo-builds each emitted Rust project.
 #   4. Spawns each binary on its port.
-#   5. Builds the wasm-client-clipboard browser bundle (`ipe dev build … web client`),
-#      which the spec serves from its `www/` directory with no server.
+#   5. Builds the wasm-client-clipboard and page-navigation browser bundles
+#      (`ipe dev build … web client`), which the specs serve from their `www/`
+#      directories with no server.
 #   6. Runs the Playwright specs.
 #   7. Kills the binaries on exit.
 #
@@ -31,6 +33,7 @@ FOCUS_PORT="${3:-18082}"
 CSP_STYLES_PORT="${4:-18083}"
 INSTALL_OFFER_PORT="${5:-18084}"
 INSTALL_OFFER_OFF_PORT="${6:-18085}"
+PAGE_NAVIGATION_PORT="${7:-18086}"
 
 export IPE_GEO_CLIPBOARD_PORT="$GEO_PORT"
 export IPE_LAYOUT_FILL_PORT="$LAYOUT_PORT"
@@ -38,6 +41,7 @@ export IPE_FOCUS_ACROSS_PATCH_PORT="$FOCUS_PORT"
 export IPE_CSP_STYLES_PORT="$CSP_STYLES_PORT"
 export IPE_INSTALL_OFFER_PORT="$INSTALL_OFFER_PORT"
 export IPE_INSTALL_OFFER_OFF_PORT="$INSTALL_OFFER_OFF_PORT"
+export IPE_PAGE_NAVIGATION_PORT="$PAGE_NAVIGATION_PORT"
 export IPE_RUNTIME_DIR="${IPE_RUNTIME_DIR:-$REPO_ROOT/src/runtime/rust/src}"
 
 echo "==> Building ipe compiler..."
@@ -95,12 +99,14 @@ serve focus-across-patch "$FOCUS_PORT"
 serve csp-styles "$CSP_STYLES_PORT"
 serve install-offer "$INSTALL_OFFER_PORT"
 serve install-offer-off "$INSTALL_OFFER_OFF_PORT"
+serve page-navigation "$PAGE_NAVIGATION_PORT"
 
-# bundle_client NAME — build examples/shapes/web/NAME as the `web client` browser
-# bundle and export its `www/` directory, which the spec serves with no server.
+# bundle_client NAME VAR — build examples/shapes/web/NAME as the `web client`
+# browser bundle and export its `www/` directory as VAR, which the spec serves
+# with no server.
 bundle_client() {
-  local name="$1"
-  local out="${TMPDIR:-/tmp}/$name-browser-e2e"
+  local name="$1" var="$2"
+  local out="${TMPDIR:-/tmp}/$name-client-browser-e2e"
 
   echo "==> Building the $name browser bundle..."
   rm -rf "$out"
@@ -110,10 +116,11 @@ bundle_client() {
     echo "   $name bundle has no www/index.html under '$out'" >&2
     exit 1
   fi
-  export IPE_WASM_CLIENT_WWW="$out/www"
+  export "$var=$out/www"
 }
 
-bundle_client wasm-client-clipboard
+bundle_client wasm-client-clipboard IPE_WASM_CLIENT_WWW
+bundle_client page-navigation IPE_PAGE_NAVIGATION_WWW
 
 echo "==> Installing Playwright + Chromium (if not cached)..."
 cd "$SPEC_DIR"

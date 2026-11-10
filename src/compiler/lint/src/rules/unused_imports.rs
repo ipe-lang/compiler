@@ -273,8 +273,8 @@ struct Uses {
     unqualified: HashSet<Symbol>,
     /// Whether some reference is invisible to this walk.
     ///
-    /// Set by an interpolating triple-quoted string or a module-qualified
-    /// constructor pattern; the rule then reports nothing for the module.
+    /// Set by a module-qualified constructor pattern; the rule then reports
+    /// nothing for the module.
     opaque: bool,
 }
 
@@ -388,13 +388,9 @@ impl Uses {
                 }
             }
             Expr_::Access(rec, _) => self.expr(rec),
-            Expr_::MultilineStr(string) => {
-                let value = string.value();
-                if ipe_syntax::interpolation_pieces(&value)
-                    .iter()
-                    .any(|piece| matches!(piece, ipe_syntax::Piece::Interp { .. }))
-                {
-                    self.opaque = true;
+            Expr_::Template(template) => {
+                for part in template.exprs() {
+                    self.expr(part);
                 }
             }
             Expr_::Int(_) | Expr_::Float(_) | Expr_::Str(_) | Expr_::Char(_) | Expr_::Unit => {}

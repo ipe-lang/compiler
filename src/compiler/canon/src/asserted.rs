@@ -606,13 +606,15 @@ fn find_asserted_use(
         Expr_::Update(_, fields) => fields
             .iter()
             .find_map(|(_, e)| find_asserted_use(e, interner)),
+        Expr_::Template(template) => template
+            .exprs()
+            .find_map(|e| find_asserted_use(e, interner)),
         Expr_::VarLocal(_)
         | Expr_::VarQual(..)
         | Expr_::TaskAndThen
         | Expr_::Int(_)
         | Expr_::Float(_)
         | Expr_::Str(_)
-        | Expr_::MultilineStr { .. }
         | Expr_::Char(_)
         | Expr_::Unit => None,
     }
@@ -632,6 +634,39 @@ fn fnv1a64(s: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{AssertedPath, AssertedPathDefect, LocalTypeKind, LocalTypeNames};
+
+    /// The asserted-call refusal of `src`'s scan, as the refused span's text.
+    fn misplaced_asserted_call(src: &str) -> Option<String> {
+        let mut interner = ipe_intern::Interner::new();
+        let module = ipe_parse::parse_module(src, &mut interner).ok()?;
+        match super::scan_module(&module, &interner) {
+            Err(ipe_diagnostics::Diagnostic::Name {
+                span,
+                msg: ipe_diagnostics::NameError::AssertedCallMalformed { .. },
+            }) => src
+                .get(span.lo as usize..span.hi as usize)
+                .map(str::to_owned),
+            _ => None,
+        }
+    }
+
+    /// An asserted call inside a `{{…}}` body is part of a larger expression:
+    /// refused at its callee, exactly as one nested anywhere else in a body.
+    #[test]
+    fn an_asserted_call_inside_an_interpolation_is_refused() {
+        let src = "module Main exposing (main)\n\nmain : String\nmain =\n    \
+                   \"\"\"n = {{Rust.Ffi.call \"tm::shift\" 1}}\"\"\"\n";
+        assert_eq!(
+            misplaced_asserted_call(src).as_deref(),
+            Some("Rust.Ffi.call")
+        );
+        let nested = "module Main exposing (main)\n\nmain : String\nmain =\n    \
+                      show (Rust.Ffi.call \"tm::shift\" 1)\n";
+        assert_eq!(
+            misplaced_asserted_call(nested).as_deref(),
+            Some("Rust.Ffi.call")
+        );
+    }
 
     #[test]
     fn every_ssot_keyword_is_rejected_as_a_path_segment() {
