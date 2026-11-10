@@ -5621,9 +5621,8 @@ mod tests {
         async_runtime_cargo_toml, config_cargo_toml, crypto_core_heavy_cargo_toml, db_cargo_toml,
         dev_posture_cargo_toml, email_cargo_toml, http_client_cargo_toml,
         insert_wasi_linker_config, jwt_cargo_toml, promote_default_feature, runtime_bindings,
-        server_cargo_toml, shake_ffi_by_fn_ident, tui_cargo_toml, wasm_hydrate_entry,
-        wasm_present_modules, wasm_runtime_bindings, web_cargo_toml, websocket_cargo_toml,
-        wrapper_call_paths,
+        server_cargo_toml, shake_ffi_by_fn_ident, wasm_hydrate_entry, wasm_present_modules,
+        wasm_runtime_bindings, web_cargo_toml, websocket_cargo_toml, wrapper_call_paths,
     };
     use crate::DbDriver;
     use crate::crate_specs;
