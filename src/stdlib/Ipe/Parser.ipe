@@ -24,17 +24,21 @@
 --
 -- Example — classify a token as an integer or a word:
 --
---     type Token = Number Int | Word String
+--     import Ipe.Parser as Parser exposing (Parser)
+--     import Ipe.Char as Char
 --
---     let
---         token =
---             Parser.oneOf
---                 [ Parser.map Number Parser.int
---                 , Parser.map Word (Parser.getChompedString (Parser.chompWhile Char.isAlpha))
---                 ]
---     in
---     Parser.run token "42"
---     --> Ok (Number 42)
+--     type Token
+--         = Number Int
+--         | Word String
+--
+--     token : Parser Token
+--     token =
+--         Parser.oneOf
+--             [ Parser.map Number Parser.int
+--             , Parser.map Word (Parser.getChompedString (Parser.chompWhile Char.isAlpha))
+--             ]
+--
+--     Parser.run token "42" --> Ok (Number 42)
 --
 -- Divergences from `elm/parser` (recorded in `docs/divergences-from-elm.md`):
 --

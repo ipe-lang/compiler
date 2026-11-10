@@ -3660,59 +3660,352 @@ fn extract_module_imports(src: &str) -> Vec<String> {
         .collect()
 }
 
+/// What one top-level unit of a doc-example body is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChunkKind {
+    /// An `import` line with its indented continuation: hoisted into the
+    /// synthesized module's import section.
+    Import,
+    /// A declaration — `type`, `type alias`, a signature, a definition —
+    /// emitted verbatim at top level.
+    Decl,
+    /// An expression, bound to a fresh `docCheckN` so the type-checker reaches
+    /// it without a `main` entry point.
+    Expr,
+}
+
+/// One top-level unit of a doc-example body, its lines exactly as written.
+///
+/// Lines keep their own indentation, so the layout-sensitive grammar of a
+/// multi-line `type alias`, a `case … of`, a `let` with signatures, or a
+/// pipeline parses in the synthesized module exactly as it reads in the doc.
+#[derive(Debug, PartialEq, Eq)]
+struct ExampleChunk<'a> {
+    /// What the unit is.
+    kind: ChunkKind,
+    /// Its lines, indentation kept; a blank line inside it is empty.
+    lines: Vec<&'a str>,
+    /// Brackets its lines opened minus brackets they closed.
+    depth: isize,
+}
+
+impl<'a> ExampleChunk<'a> {
+    /// A unit of `kind` opened by `line`.
+    fn new(kind: ChunkKind, line: &'a str) -> Self {
+        Self {
+            kind,
+            lines: vec![line],
+            depth: scan_code(line).depth,
+        }
+    }
+
+    /// Append `line` to the unit.
+    fn push(&mut self, line: &'a str) {
+        self.depth = self.depth.saturating_add(scan_code(line).depth);
+        self.lines.push(line);
+    }
+}
+
+/// Words that open an expression or a construct, never a top-level binding.
+const EXAMPLE_KEYWORDS: &[&str] = &[
+    "let", "in", "case", "of", "if", "then", "else", "type", "module", "import", "as", "exposing",
+    "port", "where",
+];
+
+/// Whether `line` opens a top-level signature (`name : T`) or definition
+/// (`name pats = …`): a lowercase non-keyword name, then a lone `:` or a lone
+/// `=` outside every bracket and string.
+fn is_decl_head(line: &str) -> bool {
+    let ident_len = line
+        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '\''))
+        .unwrap_or(line.len());
+    let (ident, rest) = line.split_at_checked(ident_len).unwrap_or((line, ""));
+    if !ident.starts_with(char::is_lowercase) || EXAMPLE_KEYWORDS.contains(&ident) {
+        return false;
+    }
+    let rest = rest.trim_start();
+    if rest.starts_with(':') {
+        return !rest.starts_with("::");
+    }
+    scan_code(rest).lone_equals
+}
+
+/// What one line of example code holds outside its strings and its trailing
+/// `--` comment.
+struct CodeScan {
+    /// Brackets opened minus brackets closed.
+    depth: isize,
+    /// Whether a binding `=` — not `==`, `/=`, `<=`, `>=`, `=>` — stands
+    /// outside every bracket the line opened.
+    lone_equals: bool,
+}
+
+/// Scan one line of example code: its bracket balance, and whether it holds a
+/// binding `=` at its own top level.
+fn scan_code(text: &str) -> CodeScan {
+    let mut scan = CodeScan {
+        depth: 0,
+        lone_equals: false,
+    };
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut prev = ' ';
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let next = chars.peek().copied().unwrap_or(' ');
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else {
+            match c {
+                '"' => in_string = true,
+                '-' if next == '-' => break,
+                '(' | '[' | '{' => scan.depth = scan.depth.saturating_add(1),
+                ')' | ']' | '}' => scan.depth = scan.depth.saturating_sub(1),
+                '=' if scan.depth <= 0
+                    && !"=<>/!:+-*|&^%.".contains(prev)
+                    && !"=>".contains(next) =>
+                {
+                    scan.lone_equals = true;
+                }
+                _ => {}
+            }
+        }
+        prev = c;
+    }
+    scan
+}
+
+/// What a column-0 code line opens.
+fn chunk_kind_of(line: &str) -> ChunkKind {
+    if line.starts_with("import ") {
+        ChunkKind::Import
+    } else if line == "type" || line.starts_with("type ") || is_decl_head(line) {
+        ChunkKind::Decl
+    } else {
+        ChunkKind::Expr
+    }
+}
+
+/// Keywords after which an expression is not finished.
+const EXPRESSION_OPENERS: &[&str] = &["let", "in", "of", "then", "else", "if", "case"];
+
+/// Keywords that can only continue an expression, never open one.
+const EXPRESSION_CONTINUERS: &[&str] = &["in", "of", "then", "else"];
+
+/// Whether a column-0 expression line continues the expression above it
+/// rather than opening a new one. A module reads a column-0 line as part of
+/// the line above only when that line left the expression open: a bracket the
+/// chunk opened is still unclosed, the line above ends on an operator or a
+/// keyword that awaits more, or this line opens with an operator, a closing
+/// bracket, or a keyword that only continues (`in`, `of`, `then`, `else`).
+fn continues_expression(chunk: &ExampleChunk<'_>, line: &str) -> bool {
+    let operator = |c: char| "|+-*/<>=&:.^%!,".contains(c);
+    let first_word = line.split_whitespace().next().unwrap_or("");
+    let last = chunk.lines.last().map_or("", |l| l.trim_end());
+    let last_word = last.split_whitespace().next_back().unwrap_or("");
+    chunk.depth > 0
+        || line.starts_with(operator)
+        || line.starts_with([')', ']', '}'])
+        || EXPRESSION_CONTINUERS.contains(&first_word)
+        || last.ends_with(operator)
+        || last.ends_with(['(', '[', '{'])
+        || last.ends_with("->")
+        || EXPRESSION_OPENERS.contains(&last_word)
+}
+
+/// Split a doc-example body into its top-level units, each line kept as
+/// written.
+///
+/// A column-0 line opens a unit, as it does in a module: an `import`, a
+/// declaration, or an expression (consecutive column-0 expression lines stay
+/// one expression). Indented lines, and blank lines followed by an indented
+/// line, continue the unit above. An expression also ends at a `-->` result
+/// (inline or standalone, its indented continuation dropped) and at a
+/// column-0 `--` comment, the `-- ==` annotation of an order-unspecified
+/// result; a column-0 comment elsewhere is dropped.
+fn example_chunks(body: &str) -> Vec<ExampleChunk<'_>> {
+    let lines: Vec<&str> = body.lines().map(str::trim_end).collect();
+    let indented = |line: &str| line.starts_with([' ', '\t']);
+    // For each line: whether the next non-blank line after it is indented.
+    let mut next_is_indented = vec![false; lines.len()];
+    let mut seen_indented = false;
+    for (slot, &line) in next_is_indented.iter_mut().zip(&lines).rev() {
+        *slot = seen_indented;
+        if !line.trim().is_empty() {
+            seen_indented = indented(line);
+        }
+    }
+    let mut chunks: Vec<ExampleChunk<'_>> = Vec::new();
+    let mut open: Option<ExampleChunk<'_>> = None;
+    let mut in_result = false;
+    for (&line, &continues) in lines.iter().zip(&next_is_indented) {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            match open.as_mut() {
+                Some(chunk) if continues => chunk.push(""),
+                _ => chunks.extend(open.take()),
+            }
+            continue;
+        }
+        if trimmed.starts_with("-->") {
+            if open.as_ref().is_some_and(|c| c.kind == ChunkKind::Expr) {
+                chunks.extend(open.take());
+                in_result = true;
+            } else if let Some(chunk) = open.as_mut() {
+                chunk.push(line);
+            }
+            continue;
+        }
+        if in_result && indented(line) {
+            continue;
+        }
+        in_result = false;
+        let col0 = !indented(line);
+        if trimmed.starts_with("--") {
+            if col0 {
+                if open.as_ref().is_some_and(|c| c.kind == ChunkKind::Expr) {
+                    chunks.extend(open.take());
+                }
+            } else if let Some(chunk) = open.as_mut() {
+                chunk.push(line);
+            }
+            continue;
+        }
+        let inline_result = line.find("-->");
+        let code = inline_result
+            .and_then(|at| line.get(..at))
+            .map_or(line, str::trim_end);
+        let chunk = if col0 {
+            let kind = chunk_kind_of(code);
+            match open.take() {
+                Some(mut chunk)
+                    if kind == ChunkKind::Expr
+                        && chunk.kind == ChunkKind::Expr
+                        && continues_expression(&chunk, code) =>
+                {
+                    chunk.push(code);
+                    chunk
+                }
+                previous => {
+                    chunks.extend(previous);
+                    ExampleChunk::new(kind, code)
+                }
+            }
+        } else {
+            match open.take() {
+                Some(mut chunk) => {
+                    // A `-->` inside a declaration is a comment there; only an
+                    // expression's result annotation is cut away.
+                    chunk.push(if chunk.kind == ChunkKind::Expr {
+                        code
+                    } else {
+                        line
+                    });
+                    chunk
+                }
+                None => ExampleChunk::new(ChunkKind::Expr, code),
+            }
+        };
+        if inline_result.is_some() && chunk.kind == ChunkKind::Expr {
+            chunks.push(chunk);
+            in_result = true;
+        } else {
+            open = Some(chunk);
+        }
+    }
+    chunks.extend(open);
+    chunks
+}
+
+/// The alias an `import` line gives its module, if it names one.
+fn import_alias(import: &str) -> Option<&str> {
+    let mut words = import.split_whitespace();
+    words.find(|w| *w == "as")?;
+    words.next()
+}
+
 /// Synthesize a minimal compilable module wrapping `body`.
 ///
 /// If `body` already starts with `module ` it is returned as-is; it is checked
-/// as its project's `Main` module, so its header must name `Main`. Otherwise a
-/// `module Main exposing (..)` header is prepended. The module that the
-/// doc-string belongs to (`source_module`, e.g. `Ipe.Maybe`) is imported with
-/// `exposing (..)` so unqualified names from it resolve, and that module's own
-/// imports (`module_imports`, e.g. `import Ipe.Duration as Duration`) are
-/// injected so an example naming a qualified import of the documenting module
-/// resolves exactly as it does inside that module.
+/// as its project's `Main` module, so its header must name `Main`. Otherwise
+/// the body is split into its top-level units by [`example_chunks`], each kept
+/// with its lines exactly as written:
 ///
-/// Lines that contain `-->` are treated as expression/result assertions. The
-/// expression (the part before `-->`) is assigned to a fresh top-level binding
-/// (`docCheckN = <expr>`) so the type-checker can infer its type without
-/// needing a `main` entry point.
+/// - every `import` the example writes is hoisted into the import section,
+///   wherever in the body it sits;
+/// - the module the doc-string belongs to (`source_module`, e.g. `Ipe.Maybe`)
+///   is imported `exposing (..)` so its unqualified names resolve — under the
+///   example's own alias when the example imports it too;
+/// - that module's own imports (`module_imports`, e.g.
+///   `import Ipe.Duration as Duration`) are injected, so a qualified name of
+///   the documenting module resolves exactly as it does inside that module,
+///   unless the example imports the same module itself;
+/// - a declaration is emitted verbatim at top level;
+/// - an expression is bound to a fresh `docCheckN`, its lines indented under
+///   the binding, so the type-checker infers its type without a `main`.
+///
+/// No module is imported twice: a duplicate import is itself a type error.
 fn synthesize_module(body: &str, source_module: &str, module_imports: &[String]) -> String {
     if body.trim_start().starts_with("module ") {
         return body.to_owned();
     }
 
-    let mut out = String::from("module Main exposing (..)\n");
+    let chunks = example_chunks(body);
+    let example_imports: Vec<String> = chunks
+        .iter()
+        .filter(|c| c.kind == ChunkKind::Import)
+        .map(|c| c.lines.join("\n"))
+        .collect();
 
-    // Track which modules are already imported so no module is imported twice
-    // (a duplicate import is itself a type error).
+    let mut out = String::from("module Main exposing (..)\n\n");
     let mut imported: Vec<&str> = Vec::new();
 
-    // Import the module whose doc-string this example comes from; its
-    // unqualified names are in scope in the example.
+    // The documenting module: its unqualified names are in scope in the
+    // example, under the example's own alias when it imports the module.
     if !source_module.is_empty() {
+        let own = example_imports
+            .iter()
+            .find(|i| import_line_module(i) == Some(source_module));
         let short = source_module
             .split('.')
             .next_back()
             .unwrap_or(source_module);
-        out.push('\n');
-        let _ = writeln!(out, "import {source_module} as {short} exposing (..)");
+        match own.map(|i| import_alias(i)) {
+            Some(Some(alias)) => {
+                let _ = writeln!(out, "import {source_module} as {alias} exposing (..)");
+            }
+            Some(None) => {
+                let _ = writeln!(out, "import {source_module} exposing (..)");
+            }
+            None => {
+                let _ = writeln!(out, "import {source_module} as {short} exposing (..)");
+            }
+        }
         imported.push(source_module);
     }
 
-    // Inject the documenting module's own imports, so the example resolves the
-    // qualified names that module has in scope (aliases and `exposing` included).
-    for import in module_imports {
+    // Every import the example writes, as written, then the documenting
+    // module's own imports, so the example resolves the qualified names that
+    // module has in scope (aliases and `exposing` included).
+    for import in example_imports.iter().chain(module_imports) {
         if let Some(module) = import_line_module(import)
             && !imported.contains(&module)
         {
-            out.push('\n');
             out.push_str(import);
+            out.push('\n');
             imported.push(module);
         }
     }
 
-    // Fall back to a fixed set of common imports for a qualified prefix the
-    // example uses that the documenting module does not itself import (e.g. a
-    // `Ipe.Maybe` example that reaches for `List.map`).
+    // A fixed set of common imports for a qualified prefix the example uses
+    // that neither it nor the documenting module imports (e.g. a `Ipe.Maybe`
+    // example that reaches for `List.map`).
     for (prefix, import) in &[
         ("Maybe.", "import Ipe.Maybe as Maybe exposing (Maybe(..))"),
         ("List.", "import Ipe.List as List"),
@@ -3733,89 +4026,37 @@ fn synthesize_module(body: &str, source_module: &str, module_imports: &[String])
             continue;
         };
         if body.contains(prefix) && !imported.contains(&module_for_prefix) {
-            out.push('\n');
             out.push_str(import);
+            out.push('\n');
             imported.push(module_for_prefix);
         }
     }
 
-    out.push('\n');
-
-    // Every example body is one or more expressions, each optionally followed
-    // by a `-->` result or a `-- ==` explanatory comment. An expression may span
-    // several lines (a pipeline, a call with bracketed arguments), so a bare
-    // expression cannot be emitted as a top-level line — it needs a binding.
-    // Each expression becomes a `docCheckN = <expr>` top-level binding so the
-    // type-checker can reach it without a `main` entry point.
-    //
-    // Grouping: blank lines separate independent expressions. Within a run of
-    // non-blank lines, a line carrying an inline `-->` (non-empty left side) is
-    // one complete single-line expression; consecutive lines without an inline
-    // `-->` accumulate into one multi-line expression, terminated by a blank
-    // line, a following inline-`-->` line, or a trailing annotation line (a
-    // standalone `-->` result or a `-- ==` comment).
     let mut check_idx = 0usize;
-    let mut pending: Vec<&str> = Vec::new();
-
-    let flush = |out: &mut String, check_idx: &mut usize, pending: &mut Vec<&str>| {
-        if pending.is_empty() {
-            return;
-        }
-        let expr = pending.join(" ");
-        let expr = expr.trim();
-        if !expr.is_empty() {
-            *check_idx += 1;
-            out.push('\n');
-            let _ = writeln!(out, "docCheck{check_idx} = {expr}");
-        }
-        pending.clear();
-    };
-
-    for line in body.lines() {
-        let trimmed = line.trim();
-
-        if trimmed.is_empty() {
-            flush(&mut out, &mut check_idx, &mut pending);
-            continue;
-        }
-
-        // A `-- ==` comment shows an order-unspecified expected result for the
-        // preceding expression; it annotates, it does not extend the expression.
-        if trimmed.starts_with("-- ") || trimmed == "--" {
-            flush(&mut out, &mut check_idx, &mut pending);
-            continue;
-        }
-
-        // A top-level construct (an example that opens with its own `import`) is
-        // emitted verbatim, never folded into an expression binding.
-        if trimmed.starts_with("import ")
-            || trimmed.starts_with("module ")
-            || trimmed.starts_with("type ")
-        {
-            flush(&mut out, &mut check_idx, &mut pending);
-            out.push('\n');
-            out.push_str(line);
-            continue;
-        }
-
-        if let Some(arrow_pos) = line.find("-->") {
-            let expr = line[..arrow_pos].trim();
-            // A standalone `--> result` closes the accumulated expression; an
-            // inline `expr --> result` closes any pending expression, then binds
-            // the single-line expression on its own.
-            flush(&mut out, &mut check_idx, &mut pending);
-            if !expr.is_empty() {
-                pending.push(expr);
-                flush(&mut out, &mut check_idx, &mut pending);
+    for chunk in &chunks {
+        match chunk.kind {
+            ChunkKind::Import => {}
+            ChunkKind::Decl => {
+                out.push('\n');
+                for line in &chunk.lines {
+                    out.push_str(line);
+                    out.push('\n');
+                }
             }
-            continue;
+            ChunkKind::Expr => {
+                check_idx = check_idx.saturating_add(1);
+                out.push('\n');
+                let _ = writeln!(out, "docCheck{check_idx} =");
+                for line in &chunk.lines {
+                    if !line.is_empty() {
+                        out.push_str("    ");
+                        out.push_str(line);
+                    }
+                    out.push('\n');
+                }
+            }
         }
-
-        pending.push(trimmed);
     }
-    flush(&mut out, &mut check_idx, &mut pending);
-
-    out.push('\n');
     out
 }
 
@@ -9421,6 +9662,139 @@ withBaseMs = something
             out.matches("import Ipe.List").count(),
             1,
             "Ipe.List must be imported exactly once:\n{out}"
+        );
+    }
+
+    /// Type-check `body` as a doc example of `module_name`: `None` when it is
+    /// accepted, else why not.
+    fn example_verdict(module_name: &str, body: &str) -> Option<String> {
+        let expected: Vec<String> = Vec::new();
+        judge_example_compile(
+            module_name,
+            "",
+            "Test:1",
+            ExampleExpect::Accepted,
+            body,
+            &expected,
+        )
+        .expect("the example is judged")
+    }
+
+    #[test]
+    fn example_keeps_a_multi_line_type_alias() {
+        let body = "\
+type alias User =
+    { id : String, age : Int }
+
+alice : User
+alice =
+    { id = \"a\", age = 3 }
+
+alice.age --> 3";
+        assert_eq!(example_verdict("Ipe.List", body), None);
+    }
+
+    #[test]
+    fn example_keeps_a_function_signature() {
+        let body = "\
+double : Int -> Int
+double n =
+    n * 2
+
+double 21 --> 42";
+        assert_eq!(example_verdict("Ipe.List", body), None);
+    }
+
+    #[test]
+    fn example_keeps_a_multi_branch_case() {
+        let body = "\
+type Shape
+    = Circle Float
+    | Square Float
+
+area : Shape -> Float
+area shape =
+    case shape of
+        Circle r ->
+            3.0 * r * r
+
+        Square s ->
+            s * s
+
+area (Square 2.0) --> 4.0";
+        assert_eq!(example_verdict("Ipe.List", body), None);
+    }
+
+    #[test]
+    fn example_hoists_an_import_written_between_sub_examples() {
+        let body = "\
+List.length [ 1, 2 ] --> 2
+
+import Ipe.Decimal as Decimal
+
+Decimal.toString (Decimal.fromInt 7) --> \"7\"";
+        assert_eq!(example_verdict("Ipe.List", body), None);
+    }
+
+    #[test]
+    fn example_importing_its_own_module_keeps_one_import() {
+        let body = "\
+import Ipe.Dict as Dict
+
+scores : Dict String Int
+scores =
+    Dict.fromList [ ( \"alice\", 90 ) ]
+
+Dict.get \"alice\" scores --> Just 90";
+        assert_eq!(example_verdict("Ipe.Dict", body), None);
+    }
+
+    #[test]
+    fn example_that_is_ill_typed_is_still_refused() {
+        assert!(example_verdict("Ipe.List", "1 + \"one\" --> 2").is_some());
+        let body = "\
+total : Int
+total =
+    \"not an int\"";
+        assert!(example_verdict("Ipe.List", body).is_some());
+    }
+
+    #[test]
+    fn example_chunks_split_declarations_from_expressions() {
+        let kinds = |body: &str| {
+            example_chunks(body)
+                .iter()
+                .map(|c| c.kind)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            kinds("x == y\nf (\\r -> { r | a = 1 })\ncount = 3\nsize : Int"),
+            vec![
+                ChunkKind::Expr,
+                ChunkKind::Expr,
+                ChunkKind::Decl,
+                ChunkKind::Decl
+            ]
+        );
+        assert_eq!(
+            kinds("valid \"a\" == True\nvalid \"a.\" == False\nf (g\nx) [\n1 ]\n|> h"),
+            vec![ChunkKind::Expr, ChunkKind::Expr, ChunkKind::Expr]
+        );
+        assert_eq!(
+            kinds("xs\n    |> List.map f --> [ 2 ]\nys --> []"),
+            vec![ChunkKind::Expr, ChunkKind::Expr]
+        );
+        assert_eq!(
+            kinds("let\n    d = 1\nin\nd + 1 --> 2"),
+            vec![ChunkKind::Expr]
+        );
+        assert_eq!(
+            kinds("unique [ 3, 1, 3 ]\n-- == [ 3, 1 ]\n\ncase x of\n    A -> 1\n\n    B -> 2"),
+            vec![ChunkKind::Expr, ChunkKind::Expr]
+        );
+        assert_eq!(
+            kinds("import Ipe.Set as Set\n    exposing (Set)\nx :: xs"),
+            vec![ChunkKind::Import, ChunkKind::Expr]
         );
     }
 

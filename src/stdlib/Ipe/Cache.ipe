@@ -15,18 +15,17 @@
 --
 -- Example:
 --
--- ```ipe ipe:skip illustrative; User/cache/newUser are placeholder names, not a standalone program
--- usersCache : Task Error (Cache String User)
--- usersCache =
---     Cache.new
---         (Cache.defaultCfg
---             |> Cache.withMaxEntries 10000
---             |> Cache.withTTL 60000  -- 60s
---         )
+--     usersCache : Task Error (Cache String User)
+--     usersCache =
+--         Cache.new
+--             (Cache.defaultCfg
+--                 |> Cache.withMaxEntries 10000
+--                 |> Cache.withTTL 60000  -- 60s
+--             )
 --
--- Cache.get cache "alice"           -- Task Error (Maybe User)
--- Cache.put cache "alice" newUser   -- Task Error ()
--- ```
+--     -- ...
+--     Cache.get cache "alice"           -- Task Error (Maybe User)
+--     Cache.put cache "alice" newUser   -- Task Error ()
 module Ipe.Cache exposing
     ( Cache(..)
     , CacheCfg

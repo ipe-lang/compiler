@@ -10,16 +10,16 @@
 -- `String`, or `Bool`; a `Float`, list, tuple, record, or function element is
 -- rejected. Membership is O(1) amortised.
 --
--- Example (`Set.toList` order is unspecified, so the result is sorted
--- before comparing):
+-- Example:
 --
---     let
---         unique =
---             Set.fromList >> Set.toList
---     in
+--     import Ipe.Set as Set
+--
+--     unique : List comparable -> List comparable
+--     unique =
+--         Set.fromList >> Set.toList
+--
 --     unique [ 3, 1, 4, 1, 5, 9, 2, 6, 5 ]
---         |> List.sort
---     --> [ 1, 2, 3, 4, 5, 6, 9 ]
+--     -- == [ 3, 1, 4, 5, 9, 2, 6 ]   (order unspecified)
 --
 -- See also: `Ipe.Dict` (key-value map), `Ipe.List.unique`.
 module Ipe.Set exposing

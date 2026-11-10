@@ -73,10 +73,8 @@ errorWith = Kernel.kernel "Log_errorWith"
 -- constructor from `Ipe.Level` and returns a cross-shape `Setting a` for
 -- use in an app's settings list.
 --
--- ```ipe ipe:skip illustrative; Web.appWith's other settings are elided, not a standalone program
--- import Ipe.Level as Level
+--     import Ipe.Level as Level
 --
--- Web.appWith [ Log.level Level.warn ] settings
--- ```
+--     Web.appWith [ Log.level Level.warn ] { ... }
 level : LogLevel -> Setting a
 level = Kernel.kernel "Log_level"
