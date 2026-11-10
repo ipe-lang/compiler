@@ -342,13 +342,13 @@ fn main() {{
     );
     std::fs::write(dir.join("src").join("main.rs"), main_rs).expect("main.rs");
 
-    let built = e2e_support::build_rust_binary("ffi_closure_trip", &dir);
+    let outcome = e2e_support::build_rust_binary("ffi_closure_trip", &dir);
     assert!(
-        built.is_ok(),
+        outcome.is_ok(),
         "{}",
-        built.as_ref().err().map_or("", String::as_str)
+        outcome.as_ref().err().map_or("", String::as_str)
     );
-    let build = built.expect("asserted Ok above");
+    let build = outcome.expect("asserted Ok above");
     for mode in ["total", "option"] {
         let run = std::process::Command::new(build.path())
             .arg(mode)
