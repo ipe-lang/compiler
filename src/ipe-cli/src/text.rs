@@ -1210,6 +1210,44 @@ messages! {
     upgrade_available(current, latest) = "upgrade-available";
     /// `ipe upgrade`'s confirmation prompt.
     upgrade_confirm = "upgrade-confirm";
+    /// `ipe upgrade --agents` given a flag of the binary upgrade.
+    upgrade_agents_alone(flag) = "upgrade-agents-alone";
+    /// `ipe upgrade --agents`'s question before replacing a hand-edited guide.
+    upgrade_agents_ask(file) = "upgrade-agents-ask";
+    /// `ipe upgrade --agents` found the guide current.
+    upgrade_agents_current(file, running) = "upgrade-agents-current";
+    /// `ipe upgrade --agents` replaced an older untouched guide.
+    upgrade_agents_rewritten(file, from, running) = "upgrade-agents-rewritten";
+    /// `ipe upgrade --agents` wrote a missing guide.
+    upgrade_agents_created(file, running) = "upgrade-agents-created";
+    /// `ipe upgrade --agents` backed up a hand-edited guide and replaced it.
+    upgrade_agents_replaced(file, backup, running) = "upgrade-agents-replaced";
+    /// `ipe upgrade` installed a new ipe, whose guide each project takes on its own.
+    upgrade_agents_each_project(hint, file) = "upgrade-agents-each-project";
+    /// `ipe upgrade` found this project's guide stale; `--agents` refreshes it.
+    upgrade_guide_refresh(file, phrase, hint) = "upgrade-guide-refresh";
+    /// `ipe upgrade` found this project's guide stale; `ipe health` says how to refresh it.
+    upgrade_guide_see_health(file, phrase) = "upgrade-guide-see-health";
+    /// `ipe upgrade --agents` outside a project.
+    agents_guide_no_manifest(hint) = "agents-guide-no-manifest";
+    /// `ipe upgrade --agents` could not open the project directory.
+    agents_guide_unheld(file) = "agents-guide-unheld";
+    /// `ipe upgrade --agents` left a hand-edited guide unchanged.
+    agents_guide_hand_edited(file, reason, term, hint) = "agents-guide-hand-edited";
+    /// `ipe upgrade --agents` left a newer ipe's guide unchanged.
+    agents_guide_newer(file, written_by, running) = "agents-guide-newer";
+    /// `ipe upgrade --agents` could not read the guide.
+    agents_guide_unread(file, reason) = "agents-guide-unread";
+    /// `ipe upgrade --agents` found the guide changed after judging it.
+    agents_guide_changed(file, hint) = "agents-guide-changed";
+    /// `ipe upgrade --agents` found every backup slot taken.
+    agents_guide_backups_full(file, dir, slots, hint) = "agents-guide-backups-full";
+    /// `ipe health`'s remedy for a missing or older guide.
+    health_guide_refresh(hint) = "health-guide-refresh";
+    /// `ipe health`'s remedy for a guide a newer ipe wrote.
+    health_guide_upgrade_first(hint) = "health-guide-upgrade-first";
+    /// `ipe health`'s remedy for a hand-edited guide.
+    health_guide_hand_edited(term, hint) = "health-guide-hand-edited";
     /// `ipe release` wrote a single self-jailing binary.
     release_embedded(path) = "release-embedded";
     /// `ipe release build --bundle` wrote a wrapper and app pair.

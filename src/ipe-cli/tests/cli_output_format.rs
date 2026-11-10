@@ -942,3 +942,185 @@ fn fmt_check_rejects_plain_and_json_together() {
     let r = run(&["fmt", "--check", "--plain", "--json"]);
     assert!(!r.ok, "`--plain --json` together must be a usage error");
 }
+
+// ---- upgrade --agents ------------------------------------------------------
+
+/// A fresh project directory (a `package.ipe`, no `AGENTS.md`).
+fn guide_project(tag: &str) -> PathBuf {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let dir = support::scratch_root().join(format!(
+        "agents_guide_{tag}_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("make the project");
+    fs::write(dir.join("package.ipe"), support::package_ipe("guide")).expect("write manifest");
+    dir
+}
+
+/// Run `ipe <args>` in `dir` with `stdin` piped in, so there is no terminal.
+fn run_piped(dir: &Path, args: &[&str], stdin: &str) -> Run {
+    use std::io::Write as _;
+    let child = Command::new(support::ipe_bin())
+        .args(args)
+        .current_dir(dir)
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    let output = child.and_then(|mut child| {
+        if let Some(mut input) = child.stdin.take() {
+            let _ = input.write_all(stdin.as_bytes());
+        }
+        child.wait_with_output()
+    });
+    match output {
+        Ok(output) => Run {
+            ok: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        },
+        Err(e) => Run {
+            ok: false,
+            stdout: String::new(),
+            stderr: format!("failed to run ipe {args:?} in {}: {e}", dir.display()),
+        },
+    }
+}
+
+/// Hand-edited guides of each kind, with the phrase naming the kind.
+fn hand_edited_guides() -> Vec<(String, &'static str)> {
+    let stamped = ipe::agents_guide::rendered();
+    let (stamp, body) = stamped.split_once('\n').expect("a stamped guide");
+    vec![
+        (format!("{stamp}\n{body}edit\n"), "edited by hand"),
+        (body.to_owned(), "no ipe stamp"),
+        (
+            format!("<!-- ipe-guide:2 whatever -->\n{body}"),
+            "unrecognised stamp",
+        ),
+    ]
+}
+
+/// Without a terminal a hand-edited guide is refused, even with `y` on stdin.
+#[test]
+fn agents_hand_edited_refused_without_terminal() {
+    for (guide, phrase) in hand_edited_guides() {
+        let dir = guide_project("no_tty");
+        fs::write(dir.join("AGENTS.md"), &guide).expect("plant the guide");
+        let r = run_piped(&dir, &["upgrade", "--agents"], "y\n");
+        assert!(!r.ok, "{phrase}: refused; stdout: {}", r.stdout);
+        assert!(r.stderr.contains(phrase), "{phrase}: stderr {}", r.stderr);
+        assert!(
+            !r.stdout.contains("Back it up"),
+            "no question: {}",
+            r.stdout
+        );
+        assert_eq!(fs::read_to_string(dir.join("AGENTS.md")).ok(), Some(guide));
+        assert!(
+            !dir.join(".ipe-backup").exists(),
+            "{phrase}: nothing backed up"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// Machine output never asks and never writes a hand-edited guide.
+#[test]
+fn agents_hand_edited_machine_never_asks() {
+    for format in ["--plain", "--json"] {
+        for (guide, phrase) in hand_edited_guides() {
+            let dir = guide_project("machine_asks");
+            fs::write(dir.join("AGENTS.md"), &guide).expect("plant the guide");
+            let r = run_piped(&dir, &["upgrade", "--agents", format], "y\n");
+            assert!(!r.ok, "{format} {phrase}: refused");
+            assert!(r.stderr.contains(phrase), "{format}: stderr {}", r.stderr);
+            assert!(!r.stdout.contains("Back it up"), "{format}: {}", r.stdout);
+            assert_eq!(fs::read_to_string(dir.join("AGENTS.md")).ok(), Some(guide));
+            assert!(!dir.join(".ipe-backup").exists());
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+/// Outside a project nothing is written, and a legacy manifest is named.
+#[test]
+fn agents_outside_project_refused() {
+    let dir = guide_project("outside");
+    fs::remove_file(dir.join("package.ipe")).expect("drop the manifest");
+    let r = run_in(&dir, &["upgrade", "--agents"]);
+    assert!(!r.ok, "refused outside a project");
+    assert!(!dir.join("AGENTS.md").exists());
+    fs::write(dir.join("ipe.toml"), "").expect("plant a legacy manifest");
+    let r = run_in(&dir, &["upgrade", "--agents"]);
+    assert!(!r.ok, "refused beside a legacy manifest");
+    assert!(r.stderr.contains("ipe.toml"), "stderr: {}", r.stderr);
+    assert!(!dir.join("AGENTS.md").exists());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `--agents` writes the guide without consulting the release feed.
+#[test]
+fn agents_never_reaches_the_feed() {
+    let dir = guide_project("no_feed");
+    let r = match Command::new(support::ipe_bin())
+        .args(["upgrade", "--agents"])
+        .current_dir(&dir)
+        .env("NO_COLOR", "1")
+        .env(ipe::UPGRADE_TAG_FILE_ENV, dir.join("absent-tag"))
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("https_proxy", "http://127.0.0.1:9")
+        .output()
+    {
+        Ok(output) => Run {
+            ok: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        },
+        Err(e) => Run {
+            ok: false,
+            stdout: String::new(),
+            stderr: format!("failed to spawn ipe: {e}"),
+        },
+    };
+    assert!(r.ok, "stderr: {}", r.stderr);
+    assert_eq!(
+        fs::read_to_string(dir.join("AGENTS.md")).ok(),
+        Some(ipe::agents_guide::rendered())
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `--json` is one object of the documented keys; `--plain` is one line; neither is framed.
+#[test]
+fn agents_machine_output() {
+    let dir = guide_project("machine");
+    let r = run_in(&dir, &["upgrade", "--agents", "--json"]);
+    assert!(r.ok, "stderr: {}", r.stderr);
+    let json: serde_json::Value = serde_json::from_str(&r.stdout).expect("one JSON object");
+    let mut keys: Vec<&str> = json
+        .as_object()
+        .map(|object| object.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    keys.sort_unstable();
+    assert_eq!(keys, ["backup", "file", "from", "ipe", "outcome"]);
+    assert_eq!(json["outcome"], "created");
+    assert_eq!(json["file"], "AGENTS.md");
+    let r = run_in(&dir, &["upgrade", "--agents", "--plain"]);
+    assert!(r.ok, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "current\n");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The upgrade help names the command that refreshes the guide.
+#[test]
+fn help_upgrade_names_upgrade_hint() {
+    let r = run(&["upgrade", "--help"]);
+    assert!(
+        r.stdout.contains(ipe::agents_guide::UPGRADE_HINT),
+        "stdout: {}",
+        r.stdout
+    );
+}

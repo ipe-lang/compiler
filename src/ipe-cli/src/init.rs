@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 use crate::delivery::{Delivery, Runtime};
 use crate::delivery_set::ShipEntry;
 use crate::project::BundleId;
+use crate::screen::Interactive;
 use crate::verb::Verb;
 use crate::{CliError, health, style, text};
 
@@ -436,7 +437,7 @@ pub fn run_init(rest: &[String]) -> Result<(), CliError> {
         );
     }
 
-    let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let is_tty = Interactive::detect().is_some();
 
     // Determine shape: explicit positional/flag → no prompt; TTY → prompt; else
     // default. The wizard prompts only for a positional the caller omitted.
@@ -790,15 +791,19 @@ fn run_scaffold(
     let fresh = is_fresh_target(target_dir)?;
     if fresh || force {
         scaffold(target_dir, files, force)?;
-        let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-        let interactive = should_offer_health_check(is_tty, force);
+        let terminal = Interactive::detect();
+        let interactive = should_offer_health_check(terminal.is_some(), force);
         match kind {
             ScaffoldKind::Library => print_next_steps_lib(target_arg, project_name),
             ScaffoldKind::App { shape, runtime } => {
                 print_next_steps(target_arg, project_name, interactive, shape, runtime);
             }
         }
-        if interactive && prompt_yes_no("Verify your toolchain now?", true) {
+        if interactive
+            && terminal
+                .as_ref()
+                .is_some_and(|tty| tty.ask_yes_no("Verify your toolchain now?", true))
+        {
             let _ = health::run_health_inline();
         }
     } else {
@@ -923,14 +928,15 @@ fn is_fresh_target(target_dir: &Path) -> Result<bool, CliError> {
 /// a time. Interactive runs prompt per file; non-interactive runs write only
 /// missing files and report the existing ones left untouched.
 fn reconcile_existing(target_dir: &Path, files: &[ManagedFile]) -> Result<(), CliError> {
-    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let terminal = Interactive::detect();
+    let interactive = terminal.is_some();
     let mut restored: Vec<PathBuf> = Vec::new();
     let mut skipped: Vec<PathBuf> = Vec::new();
 
     for file in files {
         let path = target_dir.join(&file.rel);
         let exists = path.exists();
-        let action = decide_action(&file.rel, exists, interactive);
+        let action = decide_action(&file.rel, exists, terminal.as_ref());
         match action {
             FileAction::Write => {
                 if let Some(parent) = path.parent() {
@@ -953,26 +959,21 @@ fn reconcile_existing(target_dir: &Path, files: &[ManagedFile]) -> Result<(), Cl
 
 /// Decide what to do with one managed file. Missing files default to being
 /// restored; existing ones default to being left alone.
-fn decide_action(rel: &Path, exists: bool, interactive: bool) -> FileAction {
+fn decide_action(rel: &Path, exists: bool, terminal: Option<&Interactive>) -> FileAction {
     if !exists {
-        if !interactive || prompt_yes_no(&format!("Restore {}?", rel.display()), true) {
-            return FileAction::Write;
-        }
-        return FileAction::Skip;
+        let restore =
+            terminal.is_none_or(|tty| tty.ask_yes_no(&format!("Restore {}?", rel.display()), true));
+        return if restore {
+            FileAction::Write
+        } else {
+            FileAction::Skip
+        };
     }
-    if interactive && prompt_yes_no(&format!("Overwrite {}?", rel.display()), false) {
+    if terminal.is_some_and(|tty| tty.ask_yes_no(&format!("Overwrite {}?", rel.display()), false)) {
         FileAction::Write
     } else {
         FileAction::Skip
     }
-}
-
-/// Ask a `[Y/n]` / `[y/N]` question and read the answer.
-fn prompt_yes_no(question: &str, default: bool) -> bool {
-    let hint = if default { "[Y/n]" } else { "[y/N]" };
-    crate::screen::prompt(&format!("{question} {hint} "));
-    let _ = std::io::stdout().flush();
-    crate::read_yes_no_default(default)
 }
 
 /// Report what `reconcile_existing` did.

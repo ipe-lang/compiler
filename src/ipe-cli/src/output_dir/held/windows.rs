@@ -259,6 +259,11 @@ pub fn create_new(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
     open_at(dir, name, &options)
 }
 
+/// Exclusively create the new file `name` in `dir` for writing; it inherits the directory's access list.
+pub fn create_private(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
+    create_new(dir, name)
+}
+
 /// Options opening the claim file to read, write, and lock, sharing every access and never following a reparse point.
 ///
 /// Delete sharing lets the holder unlink the name while another claimant

@@ -67,6 +67,17 @@ pub fn create_new(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
     Ok(File::from(fd))
 }
 
+/// Exclusively create the new file `name` in `dir` for writing, readable by its owner only.
+pub fn create_private(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
+    let fd = rustix::fs::openat(
+        dir.handle(),
+        name.as_os_str(),
+        new_file_flags(),
+        claim_mode(),
+    )?;
+    Ok(File::from(fd))
+}
+
 /// Exclusively create the claim file `name` in `dir`, open to read, write, and lock.
 pub fn create_claim(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
     let fd = rustix::fs::openat(
