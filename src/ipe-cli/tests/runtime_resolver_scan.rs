@@ -510,18 +510,75 @@ fn repo_root() -> PathBuf {
 }
 
 /// Scan every non-test source of [`TREES`], keyed by its path from the root.
+fn scan_trees() -> Result<BTreeMap<String, Scan>, String> {
+    let root = repo_root();
+    let trees: Vec<PathBuf> = TREES.iter().map(|tree| root.join(tree)).collect();
+    scan_roots(&root, &trees)
+}
+
+/// The `src/` tree of every workspace member the root manifest lists.
+///
+/// The harness locator is defined in `ipe_env`, a dependency of crates beyond
+/// [`TREES`], so its pin reads every member rather than a hand-kept list.
+fn member_trees(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let manifest_path = root.join("Cargo.toml");
+    let text = std::fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+    let manifest: toml::Table =
+        toml::from_str(&text).map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+    let members = manifest
+        .get("workspace")
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| format!("{}: no `[workspace] members` list", manifest_path.display()))?;
+    members
+        .iter()
+        .map(|member| {
+            member
+                .as_str()
+                .map(|dir| root.join(dir).join("src"))
+                .ok_or_else(|| {
+                    format!("{}: member {member} is not a path", manifest_path.display())
+                })
+        })
+        .collect()
+}
+
+/// Each [`HARNESS_LOCATOR`] spelling, or second name for it, `found` holds
+/// outside [`HARNESS`], one line each.
+fn locator_refusals(found: &BTreeMap<String, Scan>) -> Vec<String> {
+    let mut out = Vec::new();
+    for (rel, scan) in found.iter().filter(|(rel, _)| rel.as_str() != HARNESS) {
+        for ((site, what), count) in &scan.sites {
+            if what == HARNESS_LOCATOR {
+                out.push(format!(
+                    "{rel}: `{what}` {count}x in `{site}`: only the harness walks to the checkout's runtime"
+                ));
+            }
+        }
+        for (site, what) in &scan.aliases {
+            if what.contains(HARNESS_LOCATOR) {
+                out.push(format!(
+                    "{rel}: `{what}` in `{site}`: a second name hides the harness locator"
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Scan every non-test source under each of `trees`, keyed by its path from `root`.
 ///
 /// An out-of-line `cfg(test)` module may sort before the file declaring it, so
 /// every file is scanned first and the test modules are dropped after.
-fn scan_trees() -> Result<BTreeMap<String, Scan>, String> {
-    let root = repo_root();
+fn scan_roots(root: &Path, trees: &[PathBuf]) -> Result<BTreeMap<String, Scan>, String> {
     let mut scanned = Vec::new();
-    for tree in TREES {
-        let files = panic_scan::rust_sources(&root.join(tree), panic_scan::Want::RustFiles)
-            .map_err(|e| format!("{tree}: {e}"))?;
+    for tree in trees {
+        let files = panic_scan::rust_sources(tree, panic_scan::Want::RustFiles)
+            .map_err(|e| format!("{}: {e}", tree.display()))?;
         for file in files {
             let rel = file
-                .strip_prefix(&root)
+                .strip_prefix(root)
                 .map_err(|e| format!("{}: {e}", file.display()))?
                 .to_string_lossy()
                 .replace('\\', "/");
@@ -706,6 +763,81 @@ fn a_planted_runtime_read_is_refused() -> Result<(), String> {
         let refused = planted(rel, source)?;
         assert!(!refused.is_empty(), "{rel}: {source} must be refused");
     }
+    Ok(())
+}
+
+/// The harness locator is named in no workspace member's non-test source but
+/// the harness's own, so no crate depending on `ipe_env` walks to the
+/// checkout's runtime tree.
+#[test]
+fn the_harness_locator_is_reached_only_from_the_harness() -> Result<(), String> {
+    let root = repo_root();
+    let found = scan_roots(&root, &member_trees(&root)?)?;
+    let mut refused = locator_refusals(&found);
+    for rel in [HARNESS, "src/compiler/env/src/artifact.rs"] {
+        if !found.contains_key(rel) {
+            refused.push(format!("{rel}: a member source is not scanned"));
+        }
+    }
+    assert!(refused.is_empty(), "{}", refused.join("\n"));
+    Ok(())
+}
+
+/// The harness locator spelled in a member outside [`TREES`] is refused, and
+/// the harness's own admitted shape is not.
+#[test]
+fn a_planted_harness_locator_in_any_member_is_refused() -> Result<(), String> {
+    let backend = "src/compiler/backend/rust/src/lib.rs";
+    let cases = [
+        (
+            backend,
+            "fn locate() { ipe_env::artifact::in_repo_runtime_src(&anchor); }\n",
+        ),
+        (
+            backend,
+            "use ipe_env::artifact::in_repo_runtime_src as locate;\n",
+        ),
+        (
+            "src/lsp/server/src/main.rs",
+            "fn other() { m!(e2e_support::bin::in_repo_runtime_src(&p)); }\n",
+        ),
+    ];
+    for (rel, source) in cases {
+        let mut found = BTreeMap::new();
+        found.insert(rel.to_owned(), scan(rel, source)?);
+        assert!(
+            !locator_refusals(&found).is_empty(),
+            "{rel}: {source} must be refused"
+        );
+    }
+    let mut harness = BTreeMap::new();
+    harness.insert(HARNESS.to_owned(), scan(HARNESS, baseline(HARNESS))?);
+    let refused = locator_refusals(&harness);
+    assert!(refused.is_empty(), "{}", refused.join("\n"));
+    Ok(())
+}
+
+/// The compile core without its gate admission is refused.
+#[test]
+fn a_compile_core_without_the_admission_is_refused() -> Result<(), String> {
+    let admission = "let r = o.runtime_origin.admitted_runtime(r); ";
+    let baseline = baseline(PIPELINE);
+    if !baseline.contains(admission) {
+        return Err(format!("{PIPELINE}: the baseline lost its admission line"));
+    }
+    let mut found = BTreeMap::new();
+    found.insert(
+        PIPELINE.to_owned(),
+        scan(PIPELINE, &baseline.replace(admission, ""))?,
+    );
+    let refused = refusals(&found);
+    assert!(
+        refused
+            .iter()
+            .any(|line| line.contains(ADMISSION) && line.contains("never met")),
+        "the dropped admission must be refused; got:\n{}",
+        refused.join("\n")
+    );
     Ok(())
 }
 
