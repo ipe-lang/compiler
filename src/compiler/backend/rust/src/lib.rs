@@ -590,7 +590,7 @@ impl<'a> RustBackend<'a> {
     /// any browser-admissible surface it reaches — one emit model, no vendored
     /// subtree on either target.
     #[must_use]
-    pub fn with_runtime_dep(mut self, runtime_dep: Option<RuntimeDep>) -> Self {
+    pub const fn with_runtime_dep(mut self, runtime_dep: Option<RuntimeDep>) -> Self {
         self.settings.runtime_dep = runtime_dep;
         self
     }
