@@ -1559,15 +1559,12 @@ fn ask(prompt: &str) -> Answer {
     use std::io::Write as _;
     crate::screen::prompt(&format!("{prompt} [Y/n] "));
     let _ = std::io::stdout().flush();
-    let mut line = String::new();
-    match std::io::stdin().read_line(&mut line) {
-        Ok(n) if n > 0 => match line.trim().to_ascii_lowercase().as_str() {
-            "" | "y" | "yes" => Answer::Yes,
-            _ => Answer::No,
-        },
-        // EOF (`Ok(0)`) or a read error: no answer we can trust — decline rather
-        // than assume consent to a trust action.
-        _ => Answer::No,
+    // EOF, a read error, or a refused line: no answer we can trust — decline
+    // rather than assume consent to a trust action.
+    if crate::prompt_reply::read_stdin_yes_no().consents(true, false) {
+        Answer::Yes
+    } else {
+        Answer::No
     }
 }
 

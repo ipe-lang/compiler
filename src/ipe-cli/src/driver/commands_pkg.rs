@@ -2467,13 +2467,7 @@ fn run_upgrade_binary(
         use std::io::Write as _;
         crate::screen::prompt(&format!("{}{} ", style::GUTTER, text::upgrade_confirm()));
         let _ = std::io::stdout().flush();
-        let mut line = String::new();
-        match std::io::stdin().read_line(&mut line) {
-            Ok(n) if n > 0 => {
-                matches!(line.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes")
-            }
-            _ => false,
-        }
+        crate::prompt_reply::read_stdin_yes_no().consents(true, false)
     } else {
         // Non-TTY stdout or --yes: treat as confirmed.
         yes || !stdout_is_tty
@@ -4016,20 +4010,10 @@ pub fn read_yes_no() -> bool {
 /// Read a line from stdin and interpret it as a yes/no answer, taking `default`
 /// when the answer is empty (a bare Enter). An explicit `y`/`yes` or `n`/`no`
 /// overrides the default; EOF or any read error takes the default, so the caller
-/// controls the fail-safe direction (default `false` for a mutating action).
+/// controls the fail-safe direction (default `false` for a mutating action). A
+/// line over the answer cap or not UTF-8 is never consent.
 pub fn read_yes_no_default(default: bool) -> bool {
-    let mut line = String::new();
-    match std::io::stdin().read_line(&mut line) {
-        Ok(_) => {
-            let a = line.trim();
-            if a.is_empty() {
-                default
-            } else {
-                a.eq_ignore_ascii_case("y") || a.eq_ignore_ascii_case("yes")
-            }
-        }
-        Err(_) => default,
-    }
+    crate::prompt_reply::read_stdin_yes_no().consents(default, default)
 }
 
 /// Replace a user-owned file atomically.

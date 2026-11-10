@@ -857,12 +857,12 @@ fn runtime_choice(answer: &str) -> Result<Runtime, CliError> {
         })
 }
 
-/// Read one trimmed line from stdin, or `None` on EOF / read error.
+/// Read one line from stdin, its terminator removed, or `None` on EOF, a read
+/// error, or a line over the answer cap or not UTF-8.
 fn read_line_trimmed() -> Option<String> {
-    let mut buf = String::new();
-    match std::io::stdin().read_line(&mut buf) {
-        Ok(0) | Err(_) => None,
-        Ok(_) => Some(buf.trim_end_matches(['\n', '\r']).to_owned()),
+    match crate::prompt_reply::read_stdin_reply() {
+        crate::prompt_reply::Reply::Line(line) => Some(line),
+        crate::prompt_reply::Reply::Ended | crate::prompt_reply::Reply::Refused(_) => None,
     }
 }
 

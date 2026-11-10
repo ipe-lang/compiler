@@ -1819,8 +1819,92 @@ pub fn read_miss(err: &CliError) -> ReadMiss {
             SourceRefusal::AccessDenied => Unread::Denied,
         }),
         CliError::FileTooLarge { .. } => ReadMiss::Unread(Unread::TooLarge),
-        // No other variant comes out of a capped read; any that did is a failed read.
-        _ => ReadMiss::Unread(Unread::Io),
+        // No other variant comes out of a capped read; any that did is a failed
+        // read. Each is named, so a new variant is judged here, not swallowed.
+        CliError::Usage(..)
+        | CliError::ProjectRefused(..)
+        | CliError::DependencyNotCompiled { .. }
+        | CliError::CheckFailed(..)
+        | CliError::UnknownCommand { .. }
+        | CliError::ScratchUnavailable { .. }
+        | CliError::Pipeline { .. }
+        | CliError::RuntimeNotFound
+        | CliError::RuntimeDirInvalid { .. }
+        | CliError::RuntimeHomeUnknown
+        | CliError::CacheHomeUnknown
+        | CliError::EnvDirNotAbsolute { .. }
+        | CliError::EnvSwitchNotRecognised { .. }
+        | CliError::EnvRefused(..)
+        | CliError::ServePortTaken { .. }
+        | CliError::RuntimeMaterializeFailed { .. }
+        | CliError::RuntimeVersionMismatch { .. }
+        | CliError::EmittedBuildFailed { .. }
+        | CliError::CargoBuildTimedOut { .. }
+        | CliError::TargetDirUnlinkable { .. }
+        | CliError::BundledManifest { .. }
+        | CliError::TestRunnerStale { .. }
+        | CliError::TestRunKeyUnavailable { .. }
+        | CliError::TestTargetBusy { .. }
+        | CliError::UnknownCode { .. }
+        | CliError::DocNotFound { .. }
+        | CliError::StaticRefusal(..)
+        | CliError::CapabilityMismatch { .. }
+        | CliError::Resolve(..)
+        | CliError::LockRefused(..)
+        | CliError::IndexEntryRefused(..)
+        | CliError::HashMismatch { .. }
+        | CliError::Diff(..)
+        | CliError::SemverRejected { .. }
+        | CliError::PackageAudit(..)
+        | CliError::Publish(..)
+        | CliError::VersionRefused { .. }
+        | CliError::DocCoverage(..)
+        | CliError::DocExamplesFailed(..)
+        | CliError::CommandUsage { .. }
+        | CliError::UnknownGroupSub { .. }
+        | CliError::GroupRequired { .. }
+        | CliError::NoRunForm { .. }
+        | CliError::WrapperSourceRefused(..)
+        | CliError::AgentsGuideRefused(..)
+        | CliError::VerifyFailed { .. }
+        | CliError::TestFailed { .. }
+        | CliError::UpgradeNoPrebuilt { .. }
+        | CliError::ToolchainMissing(..)
+        | CliError::HealthCritical
+        | CliError::LintGateFailed
+        | CliError::EjectUnsupported { .. }
+        | CliError::DiagnosticJsonEmitted
+        | CliError::FmtOutputTooLarge { .. }
+        | CliError::RemoteIngestExceeded(..)
+        | CliError::LocalLimitExceeded(..)
+        | CliError::ChildPipeHeld(..)
+        | CliError::ThreadRefused { .. }
+        | CliError::ChildPipeUnread(..)
+        | CliError::Interrupted
+        | CliError::PathEscape { .. }
+        | CliError::NoManifest { .. }
+        | CliError::NoSrcDir { .. }
+        | CliError::EntryMissing { .. }
+        | CliError::NoDefaultEntry { .. }
+        | CliError::EntryEscapes { .. }
+        | CliError::ExposedModuleMissing { .. }
+        | CliError::SourceTree(..)
+        | CliError::SymlinkInSource { .. }
+        | CliError::FileOutsideRoot { .. }
+        | CliError::DirectoryExpected { .. }
+        | CliError::OutputRefused(..)
+        | CliError::DiscoveryLimitReached { .. }
+        | CliError::TrustRefused(..)
+        | CliError::FfiPrep(..)
+        | CliError::DeviceNamedModule { .. }
+        | CliError::UpgradeFeedUnreachable
+        | CliError::UpgradeCheckExit { .. }
+        | CliError::AdvisoryVulnerable(_)
+        | CliError::AdvisoryDbUnreachable { .. }
+        | CliError::AdvisoryDbMalformed { .. }
+        | CliError::WasiRunFeatureDisabled
+        | CliError::WasiRunFailed { .. }
+        | CliError::WasiRunExited { .. } => ReadMiss::Unread(Unread::Io),
     }
 }
 
