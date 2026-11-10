@@ -287,17 +287,90 @@ if GIT_CEILING_DIRECTORIES="$WORK" sh "$NOGIT/editors/zed/configure.sh" > "$SB/o
 else
     ok "Zed pin: refuses a copy outside a git checkout"
 fi
+# The query comes from the pinned commit even when the working tree hides a
+# change from `git status` (skip-worktree): Zed builds the commit's grammar.
+fake_git update-index --skip-worktree "$GRAMMAR_REL/queries/highlights.scm"
+printf '; hidden from git status\n' >> "$FAKE/$GRAMMAR_REL/queries/highlights.scm"
+sh "$FAKE/editors/zed/configure.sh" > "$SB/out" 2>&1 && ok "Zed pin: re-run with a skip-worktree query" || bad "Zed pin: re-run with a skip-worktree query"
+check "Zed pin: the assembled query is the pinned commit's, not the working tree's" \
+    'fake_git cat-file blob "HEAD:$GRAMMAR_REL/queries/highlights.scm" | cmp -s - "$ZED_EXT/languages/ipe/highlights.scm" && zed_pin_truthful "$ZED_EXT" "$FAKE"'
+fake_git update-index --no-skip-worktree "$GRAMMAR_REL/queries/highlights.scm"
+fake_git checkout -q -- "$GRAMMAR_REL/queries/highlights.scm"
+# Zed keeps a grammar directory only when `git remote get-url origin` without
+# the global git config prints the pinned URL; every other directory goes.
+FAKE_URL="file://$(cd "$FAKE" && pwd -P)"
+rm -rf "$ZED_EXT/grammars/ipe"
+mkdir -p "$ZED_EXT/grammars/ipe"
+git -C "$ZED_EXT/grammars/ipe" init -q
+git --git-dir "$ZED_EXT/grammars/ipe/.git" remote add origin "https://example.invalid/ipe-grammar"
+printf '[url "%s"]\n\tinsteadOf = https://example.invalid/ipe-grammar\n' "$FAKE_URL" > "$HOME/.gitconfig"
+sh "$FAKE/editors/zed/configure.sh" > "$SB/out" 2>&1 && ok "Zed pin: re-run with a global insteadOf" || bad "Zed pin: re-run with a global insteadOf"
+rm -f "$HOME/.gitconfig"
+check "Zed pin: a clone matching only through the global git config is removed" '[ ! -e "$ZED_EXT/grammars/ipe" ]'
+mkdir -p "$ZED_EXT/grammars/ipe"
+: > "$ZED_EXT/grammars/ipe/leftover"
+sh "$FAKE/editors/zed/configure.sh" > "$SB/out" 2>&1 && ok "Zed pin: re-run over a non-clone grammar directory" || bad "Zed pin: re-run over a non-clone grammar directory"
+check "Zed pin: a grammar directory that is not a clone is removed" '[ ! -e "$ZED_EXT/grammars/ipe" ]'
+# Refusal: a symlinked grammars directory is never deleted through.
+OUTSIDE="$WORK/outside-zed-cache"
+mkdir -p "$OUTSIDE/ipe"
+git -C "$OUTSIDE/ipe" init -q
+git --git-dir "$OUTSIDE/ipe/.git" remote add origin "https://example.invalid/elsewhere"
+rm -rf "$ZED_EXT/grammars"
+ln -s "$OUTSIDE" "$ZED_EXT/grammars"
+if sh "$FAKE/editors/zed/configure.sh" > "$SB/out" 2>&1; then bad "Zed pin: refuses to delete through a symlinked grammars directory"; else ok "Zed pin: refuses to delete through a symlinked grammars directory"; fi
+check "Zed pin: the symlink target survives" '[ -d "$OUTSIDE/ipe/.git" ]'
+rm -f "$ZED_EXT/grammars"
+# Refusal: a checkout path ending in whitespace, which Zed trims off the
+# clone's origin URL and so never matches on a rebuild.
+for trail in ' ' "$(printf '\302\240')"; do
+    TRAIL="$WORK/trail$trail"
+    copy_editors "$TRAIL"
+    git -C "$TRAIL" -c user.name=t -c user.email=t@t -c commit.gpgsign=false init -q
+    git -C "$TRAIL" add -A
+    git -C "$TRAIL" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q -m fixture
+    if sh "$TRAIL/editors/zed/configure.sh" > "$SB/out" 2>&1; then
+        bad "Zed pin: refuses a checkout path ending in whitespace ($(printf '%s' "$trail" | od -An -tx1 | tr -d ' '))"
+    else
+        check "Zed pin: refuses a checkout path ending in whitespace ($(printf '%s' "$trail" | od -An -tx1 | tr -d ' '))" \
+            'grep -q "ends in whitespace" "$SB/out"'
+    fi
+done
 
 # --- lib: IPE_EDITORS_REF resolution (curl installs) -------------------------------------
 sandbox resolve
-stub git 'printf "%s\t%s\n" 1111111111111111111111111111111111111111 refs/heads/main 2222222222222222222222222222222222222222 refs/tags/v1 3333333333333333333333333333333333333333 "refs/tags/v1^{}" 4444444444444444444444444444444444444444 refs/heads/both 5555555555555555555555555555555555555555 refs/tags/both'
-resolve() { (IPE_SRC_ROOT="$ROOT"; . "$ROOT/editors/lib/ipe-editors.sh"; ipe_resolve_ref "$1") 2> /dev/null; }
-check "lib: a branch resolves to its commit" '[ "$(resolve main)" = 1111111111111111111111111111111111111111 ]'
-check "lib: an annotated tag resolves to its peeled commit" '[ "$(resolve v1)" = 3333333333333333333333333333333333333333 ]'
+# A real repository behind the GitHub URL (git's insteadOf), so ls-remote's
+# own output is parsed: an annotated tag, a tag of a tag, a lightweight tag,
+# and a name that is both a branch and a tag.
+REMOTE="$WORK/remote"
+rgit() { git -C "$REMOTE" -c user.name=t -c user.email=t@t -c commit.gpgsign=false -c tag.gpgsign=false "$@"; }
+git init -q "$REMOTE"
+rgit commit -q --allow-empty -m one
+C1="$(rgit rev-parse HEAD)"
+rgit tag -a v1 -m v1
+rgit -c advice.nestedTag=false tag -a v2 -m v2 v1
+rgit tag v0
+rgit commit -q --allow-empty -m two
+C2="$(rgit rev-parse HEAD)"
+rgit branch -M main
+rgit branch both
+rgit tag both
+resolve() {
+    (IPE_SRC_ROOT="$ROOT"; . "$ROOT/editors/lib/ipe-editors.sh"
+        GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="url.file://$REMOTE.insteadOf" \
+            GIT_CONFIG_VALUE_0="https://github.com/$IPE_REPO_SLUG" ipe_resolve_ref "$1") 2> /dev/null
+}
+check "lib: a branch resolves to its commit" '[ "$(resolve main)" = "$C2" ]'
+check "lib: an annotated tag resolves to its peeled commit" '[ "$(resolve v1)" = "$C1" ]'
+check "lib: a tag of a tag resolves to its peeled commit" '[ "$(resolve v2)" = "$C1" ]'
+check "lib: a lightweight tag resolves to its commit" '[ "$(resolve v0)" = "$C1" ]'
 check "lib: a full commit id resolves to itself" '[ "$(resolve 0123456789abcdef0123456789abcdef01234567)" = 0123456789abcdef0123456789abcdef01234567 ]'
 check "lib: refuses a name that is both a branch and a tag" '! resolve both > /dev/null'
 check "lib: refuses an unknown ref" '! resolve nope > /dev/null'
 check "lib: refuses a ref outside the ref-name alphabet" '! resolve "main;rm" > /dev/null && ! resolve "-x" > /dev/null && ! resolve "" > /dev/null'
+stub git 'exit 128'
+hash -r
+check "lib: refuses when the refs cannot be listed" '! resolve main > /dev/null'
 
 # --- drift checks ---------------------------------------------------------------------------
 PATH="$ORIG_PATH"

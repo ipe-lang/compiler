@@ -14,7 +14,7 @@ highlighting (the query is not duplicated here).
   `rev`: `configure.sh` fills them with the source and commit the assembled
   highlight query came from (a checkout's `HEAD`, served from the checkout, or
   the commit `IPE_EDITORS_REF` names on GitHub), so the grammar Zed builds and
-  the query always match; a grammar change needs no pin bump.
+  the query always match; the pin is never edited by hand.
   `editors/tests/configure-test.sh` replays Zed's grammar checkout and refuses
   a pin whose grammar differs.
 - `src/lib.rs` starts `ipe lsp` from the project's `PATH`.

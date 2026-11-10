@@ -82,6 +82,19 @@ if [ -n "$IPE_SRC_ROOT" ]; then
     esac
     [ -z "$(printf '%s' "$SRC_REAL" | LC_ALL=C tr -d '\040-\176\200-\377')" ] \
         || die "the checkout path $SRC_REAL contains a control character — move the checkout"
+    # Zed trims the clone's origin URL before comparing it, so a URL ending in
+    # whitespace (Unicode White_Space) never matches on a rebuild.
+    for _ws in ' ' "$(printf '\302\205')" "$(printf '\302\240')" "$(printf '\341\232\200')" \
+        "$(printf '\342\200\200')" "$(printf '\342\200\201')" "$(printf '\342\200\202')" \
+        "$(printf '\342\200\203')" "$(printf '\342\200\204')" "$(printf '\342\200\205')" \
+        "$(printf '\342\200\206')" "$(printf '\342\200\207')" "$(printf '\342\200\210')" \
+        "$(printf '\342\200\211')" "$(printf '\342\200\212')" "$(printf '\342\200\250')" \
+        "$(printf '\342\200\251')" "$(printf '\342\200\257')" "$(printf '\342\201\237')" \
+        "$(printf '\343\200\200')"; do
+        case "$SRC_REAL" in
+            *"$_ws") die "the checkout path $SRC_REAL ends in whitespace, which Zed's grammar URL cannot carry — move the checkout" ;;
+        esac
+    done
     GRAMMAR_REPOSITORY="file://$SRC_REAL"
 else
     GRAMMAR_REV="$(ipe_resolve_ref "$IPE_EDITORS_REF")"
@@ -99,7 +112,16 @@ for f in extension.toml Cargo.toml Cargo.lock .cargo/config.toml src/lib.rs lang
 done
 # Zed reads only highlights.scm from these; it rejects a capture-less
 # injections query, so none is shipped.
-ipe_fetch "$IPE_GRAMMAR_DIR/queries/highlights.scm" "$X/languages/ipe/highlights.scm"
+# From a checkout the query is read from the pinned commit itself, never the
+# working tree, so it is the grammar commit's query by construction.
+if [ -n "$IPE_SRC_ROOT" ]; then
+    mkdir -p "$X/languages/ipe"
+    git -C "$SRC_REAL" cat-file blob "$GRAMMAR_REV:$IPE_GRAMMAR_DIR/queries/highlights.scm" \
+        > "$X/languages/ipe/highlights.scm" \
+        || die "$GRAMMAR_REV has no $IPE_GRAMMAR_DIR/queries/highlights.scm"
+else
+    ipe_fetch "$IPE_GRAMMAR_DIR/queries/highlights.scm" "$X/languages/ipe/highlights.scm"
+fi
 GRAMMAR_REPOSITORY="$GRAMMAR_REPOSITORY" GRAMMAR_REV="$GRAMMAR_REV" awk '
     $0 == "repository = \"@IPE_GRAMMAR_REPOSITORY@\"" { print "repository = \"" ENVIRON["GRAMMAR_REPOSITORY"] "\""; r++; next }
     $0 == "rev = \"@IPE_GRAMMAR_REV@\"" { print "rev = \"" ENVIRON["GRAMMAR_REV"] "\""; v++; next }
@@ -111,14 +133,23 @@ mv -f "$X/extension.toml.pinned" "$X/extension.toml"
 grep -Eq '^rev = "[0-9a-f]{40}"$' "$X/extension.toml" \
     || die "extension.toml does not pin the grammar to a commit"
 
-# Zed refuses to reuse a grammar clone whose origin is another repository (an
-# install from the other source, or a moved checkout); the clone is Zed's own
-# rebuildable cache, so it goes and Zed clones afresh.
-GRAMMAR_CLONE="$EXT_DIR/grammars/ipe"
-if [ -d "$GRAMMAR_CLONE/.git" ] \
-    && [ "$(git --git-dir "$GRAMMAR_CLONE/.git" remote get-url origin 2> /dev/null)" != "$GRAMMAR_REPOSITORY" ]; then
-    rm -rf "$GRAMMAR_CLONE" "$EXT_DIR/grammars/ipe.wasm" || die "cannot remove $GRAMMAR_CLONE"
-    say "removed Zed's grammar clone of another source ($GRAMMAR_CLONE); Zed clones $GRAMMAR_REPOSITORY on the next build"
+# Zed reuses an existing grammar directory only when
+# `git remote get-url origin`, run with GIT_CONFIG_GLOBAL=/dev/null, prints this
+# exact URL; anything else (an install from the other source, a moved checkout,
+# a directory that is not a clone) it refuses. The directory is Zed's own
+# rebuildable cache, so it goes and Zed clones afresh — never through a
+# symlinked grammars directory, which would delete outside Zed's cache.
+GRAMMARS="$EXT_DIR/grammars"
+GRAMMAR_CLONE="$GRAMMARS/ipe"
+if [ -e "$GRAMMAR_CLONE" ] || [ -L "$GRAMMAR_CLONE" ]; then
+    _origin="$(GIT_CONFIG_GLOBAL=/dev/null git --git-dir "$GRAMMAR_CLONE/.git" remote get-url origin 2> /dev/null)" \
+        || _origin=""
+    if [ "$_origin" != "$GRAMMAR_REPOSITORY" ]; then
+        [ ! -L "$GRAMMARS" ] \
+            || die "$GRAMMARS is a symlink; remove the stale grammar clone $GRAMMAR_CLONE by hand, then re-run"
+        rm -rf "$GRAMMAR_CLONE" "$GRAMMARS/ipe.wasm" || die "cannot remove $GRAMMAR_CLONE"
+        say "removed Zed's grammar directory that is not a clone of $GRAMMAR_REPOSITORY ($GRAMMAR_CLONE); Zed clones it afresh on the next build"
+    fi
 fi
 
 for f in extension.toml Cargo.toml Cargo.lock .cargo/config.toml src/lib.rs \

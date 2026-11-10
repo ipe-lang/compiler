@@ -173,9 +173,9 @@ host loads:
 cd editors/tree-sitter-ipe && tree-sitter generate --abi 14
 ```
 
-A grammar or query change needs no Zed pin bump: `editors/zed/configure.sh`
-fills `extension.toml`'s grammar `repository` and `rev` with the source and
-commit it assembled the highlight query from, and refuses a checkout whose
+Zed's grammar pin is never edited by hand: `editors/zed/configure.sh` fills
+`extension.toml`'s grammar `repository` and `rev` with one source and commit,
+reads the highlight query from that same commit, and refuses a checkout whose
 grammar or query has uncommitted changes. `editors/tests/configure-test.sh`
 replays Zed's grammar checkout from the assembled pin and fails when its grammar
 or query differs from what was assembled.
