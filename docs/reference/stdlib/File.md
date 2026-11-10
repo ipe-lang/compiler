@@ -116,17 +116,15 @@ itself is not a readable directory.
 
 Example:
 
-    case Path.fromString "/my/project" of
-        Err e ->
-            Task.fail e
+    import Ipe.Io as Io
+    import Ipe.Task as Task
+    import Ipe.String as String
+    import Ipe.List as List
 
-        Ok root ->
-            File.walk root
-                |> Task.andThen
-                    (\files ->
-                        -- files : List Path
-                        Io.println (String.join "\n" (List.map Path.toString files))
-                    )
+    Path.fromString "/my/project"
+        |> Task.fromResult
+        |> Task.andThen File.walk
+        |> Task.andThen (\files -> Io.println (String.join "\n" (List.map Path.toString files)))
 
 ## `walkMatching`
 
@@ -140,7 +138,12 @@ walk and receives each file's absolute `Path`.
 
 Example — collect only `.ipe` source files:
 
-    walkMatching root (\p -> String.endsWith ".ipe" (Path.toString p))
+    import Ipe.Task as Task
+    import Ipe.String as String
+
+    Path.fromString "/my/project"
+        |> Task.fromResult
+        |> Task.andThen (\root -> File.walkMatching root (\p -> String.endsWith ".ipe" (Path.toString p)))
 
 ## `tempFile`
 

@@ -137,10 +137,15 @@ runtime charset gate is why the Ipê-level check and the kernel check agree.
 Example:
 
     Store.validSqlIdent "users" == True
+
     Store.validSqlIdent "users.id" == True
+
     Store.validSqlIdent "user table" == False
+
     Store.validSqlIdent "users;drop" == False
+
     Store.validSqlIdent "users." == False
+
     Store.validSqlIdent "a..b" == False
 
 ## `validSqlIdentPlain`
@@ -265,17 +270,31 @@ unclassified `Draft` is unqueryable by construction).
 
 Example:
 
-    import Ipe.Db.Store as Store exposing (Store)
     import Ipe.Result as Result exposing (Result(..))
+    import Ipe.Json.Decode.Pipeline as Pipeline
 
-    countries : Result Error (Store Country)
-    countries =
-        case Store.fromCodec "countries" countryCodec of
-            Err e ->
-                Err e
+    type alias Country = { code : String, name : String }
 
-            Ok draft ->
-                Ok (Store.public (Store.primaryKey .code draft))
+    let
+        countryCodec =
+            Codec
+                { enc =
+                    \c ->
+                        Encode.object
+                            [ ( "code", Codec.toValue Codec.string c.code )
+                            , ( "name", Codec.toValue Codec.string c.name )
+                            ]
+                , mkDec =
+                    \_ ->
+                        Decode.succeed (\code name -> { code = code, name = name })
+                            |> Pipeline.required "code" Decode.string
+                            |> Pipeline.required "name" Decode.string
+                , shp =
+                    SRecord [ ( "code", CText ), ( "name", CText ) ]
+                }
+    in
+    Store.fromCodec "countries" countryCodec
+        |> Result.map (\draft -> Store.public (Store.primaryKey .code draft))
 
 ## `primaryKey`
 
@@ -295,14 +314,13 @@ every read and write on the resulting store fails with before any SQL runs.
 
 Example:
 
-    import Ipe.Db.Store as Store exposing (Store)
+    type alias Country = { code : String, name : String }
 
-    type alias Country =
-        { code : String, name : String }
-
-    countriesDraft : Store.Draft Country -> Store.Draft Country
-    countriesDraft draft =
-        Store.primaryKey .code draft
+    let
+        countriesDraft draft =
+            Store.primaryKey .code draft
+    in
+    countriesDraft
 
 ## `serial`
 
@@ -347,11 +365,11 @@ A plain text default (`"active"`) is unaffected.
 
 Example:
 
-    import Ipe.Db.Store as Store exposing (Store)
-
-    withStatusDefault : Store { status : String } -> Store { status : String }
-    withStatusDefault store =
-        Store.defaultText .status "active" store
+    let
+        withStatusDefault draft =
+            Store.defaultText .status "active" draft
+    in
+    withStatusDefault
 
 ## `defaultInt`
 
@@ -366,11 +384,11 @@ literal is always safe.
 
 Example:
 
-    import Ipe.Db.Store as Store exposing (Store)
-
-    withRetryDefault : Store { retries : Int } -> Store { retries : Int }
-    withRetryDefault store =
-        Store.defaultInt .retries 0 store
+    let
+        withRetryDefault draft =
+            Store.defaultInt .retries 0 draft
+    in
+    withRetryDefault
 
 ## `touchOnUpdate`
 
@@ -385,11 +403,11 @@ can never overwrite it — the database owns the column's value.
 
 Example:
 
-    import Ipe.Db.Store as Store exposing (Store)
-
-    withUpdatedAt : Store { updatedAt : String } -> Store { updatedAt : String }
-    withUpdatedAt store =
-        Store.touchOnUpdate .updatedAt store
+    let
+        withUpdatedAt draft =
+            Store.touchOnUpdate .updatedAt draft
+    in
+    withUpdatedAt
 
 ## `compositePrimaryKey2`
 
@@ -422,14 +440,13 @@ the store fails with.
 
 Example:
 
-    import Ipe.Db.Store as Store exposing (Store)
+    type alias Membership = { userId : String, groupId : String, role : String }
 
-    type alias Membership =
-        { userId : String, groupId : String, role : String }
-
-    membershipDraft : Store.Draft Membership -> Store.Draft Membership
-    membershipDraft draft =
-        Store.compositePrimaryKey2 .userId .groupId draft
+    let
+        membershipDraft draft =
+            Store.compositePrimaryKey2 .userId .groupId draft
+    in
+    membershipDraft
 
 ## `compositePrimaryKey3`
 
@@ -450,14 +467,13 @@ must already exist. For more than three columns, or a raw-column
 
 Example:
 
-    import Ipe.Db.Store as Store exposing (Store)
+    type alias Reading = { sensor : String, day : String, hour : Int, value : Float }
 
-    type alias Reading =
-        { sensor : String, day : String, hour : Int, value : Float }
-
-    readingDraft : Store.Draft Reading -> Store.Draft Reading
-    readingDraft draft =
-        Store.compositePrimaryKey3 .sensor .day .hour draft
+    let
+        readingDraft draft =
+            Store.compositePrimaryKey3 .sensor .day .hour draft
+    in
+    readingDraft
 
 ## `primaryKeyNamed`
 
@@ -497,16 +513,16 @@ SQL runs:
 
 Example:
 
-    import Ipe.Db.Store as Store exposing (Store)
-
-    membershipsDraft : Result Error (Store.Draft Store.Row)
-    membershipsDraft =
-        Store.fromColumns "memberships"
-            [ Store.textColumn "user_id"
-            , Store.textColumn "group_id"
-            , Store.textColumn "role"
-            ]
-            |> Result.map (Store.compositePrimaryKeyNamed [ "user_id", "group_id" ])
+    let
+        membershipsDraft =
+            Store.fromColumns "memberships"
+                [ Store.textColumn "user_id"
+                , Store.textColumn "group_id"
+                , Store.textColumn "role"
+                ]
+                |> Result.map (Store.compositePrimaryKeyNamed [ "user_id", "group_id" ])
+    in
+    membershipsDraft
 
 ## `serialNamed`
 
@@ -563,19 +579,40 @@ The index is emitted as a separate `CREATE INDEX` ledger entry after the
 
 Example:
 
-    import Ipe.Db.Store as Store exposing (Store)
+    import Ipe.Json.Decode.Pipeline as Pipeline
 
-    type alias Post =
-        { id : Int, authorId : String, publishedAt : String }
+    type alias Post = { id : Int, authorId : String, publishedAt : String }
 
-    postsStore : Result Error (Store Post)
-    postsStore =
-        Store.fromCodec "posts" postCodec
-            |> Result.map (Store.serial .id)
-            |> Result.map (Store.primaryKey .id)
-            |> Result.map (Store.index [ "author_id" ])
-            |> Result.map (Store.index [ "author_id", "published_at" ])
-            |> Result.map Store.public
+    let
+        postCodec =
+            Codec
+                { enc =
+                    \p ->
+                        Encode.object
+                            [ ( "id", Codec.toValue Codec.int p.id )
+                            , ( "authorId", Codec.toValue Codec.string p.authorId )
+                            , ( "publishedAt", Codec.toValue Codec.string p.publishedAt )
+                            ]
+                , mkDec =
+                    \_ ->
+                        Decode.succeed
+                            (\id authorId publishedAt ->
+                                { id = id, authorId = authorId, publishedAt = publishedAt }
+                            )
+                            |> Pipeline.required "id" Decode.int
+                            |> Pipeline.required "authorId" Decode.string
+                            |> Pipeline.required "publishedAt" Decode.string
+                , shp =
+                    SRecord
+                        [ ( "id", CInt ), ( "authorId", CText ), ( "publishedAt", CText ) ]
+                }
+    in
+    Store.fromCodec "posts" postCodec
+        |> Result.map (Store.serial .id)
+        |> Result.map (Store.primaryKey .id)
+        |> Result.map (Store.index [ "author_id" ])
+        |> Result.map (Store.index [ "author_id", "published_at" ])
+        |> Result.map Store.public
 
 ## `indexNamed`
 
@@ -592,18 +629,39 @@ the schema, this refines the `Draft` before classification.
 
 Example:
 
-    import Ipe.Db.Store as Store exposing (Store)
+    import Ipe.Json.Decode.Pipeline as Pipeline
 
-    type alias Post =
-        { id : Int, authorId : String, publishedAt : String }
+    type alias Post = { id : Int, authorId : String, publishedAt : String }
 
-    postsStore : Result Error (Store Post)
-    postsStore =
-        Store.fromCodec "posts" postCodec
-            |> Result.map (Store.serial .id)
-            |> Result.map (Store.primaryKey .id)
-            |> Result.map (Store.indexNamed "posts_author_published" [ "author_id", "published_at" ])
-            |> Result.map Store.public
+    let
+        postCodec =
+            Codec
+                { enc =
+                    \p ->
+                        Encode.object
+                            [ ( "id", Codec.toValue Codec.int p.id )
+                            , ( "authorId", Codec.toValue Codec.string p.authorId )
+                            , ( "publishedAt", Codec.toValue Codec.string p.publishedAt )
+                            ]
+                , mkDec =
+                    \_ ->
+                        Decode.succeed
+                            (\id authorId publishedAt ->
+                                { id = id, authorId = authorId, publishedAt = publishedAt }
+                            )
+                            |> Pipeline.required "id" Decode.int
+                            |> Pipeline.required "authorId" Decode.string
+                            |> Pipeline.required "publishedAt" Decode.string
+                , shp =
+                    SRecord
+                        [ ( "id", CInt ), ( "authorId", CText ), ( "publishedAt", CText ) ]
+                }
+    in
+    Store.fromCodec "posts" postCodec
+        |> Result.map (Store.serial .id)
+        |> Result.map (Store.primaryKey .id)
+        |> Result.map (Store.indexNamed "posts_author_published" [ "author_id", "published_at" ])
+        |> Result.map Store.public
 
 ## `tableName`
 
@@ -714,17 +772,16 @@ store's type, is a typed `Err`. Fails closed with no SQL on a non-record codec.
 Example:
 
     import Ipe.Db as Db exposing (Db)
-    import Ipe.Db.Store as Store exposing (Store)
     import Ipe.Task as Task exposing (Task)
     import Ipe.Error exposing (Error)
 
-    type alias Item =
-        { id : Int, name : String }
+    type alias Item = { id : Int, name : String }
 
-    -- `id` is `serial`, so the DB assigns it; `insertReturning` gives it back.
-    addItem : Db -> Store Item -> String -> Task Error Item
-    addItem conn store name =
-        Store.insertReturning conn store { id = 0, name = name }
+    let
+        addItem conn store name =
+            Store.insertReturning conn store { id = 0, name = name }
+    in
+    addItem
 
 ## `upsert`
 
@@ -769,17 +826,16 @@ every identifier and binds every value.
 Example:
 
     import Ipe.Db as Db exposing (Db)
-    import Ipe.Db.Store as Store exposing (Store)
     import Ipe.Task as Task exposing (Task)
     import Ipe.Error exposing (Error)
 
-    type alias Setting =
-        { name : String, value : String }
+    type alias Pref = { name : String, value : String }
 
-    -- `name` is the primary key: the first call inserts, the next updates.
-    saveSetting : Db -> Store Setting -> String -> String -> Task Error Int
-    saveSetting conn store name value =
-        Store.upsert conn store { name = name, value = value }
+    let
+        saveSetting conn store name value =
+            Store.upsert conn store { name = name, value = value }
+    in
+    saveSetting
 
 ## `all`
 
@@ -894,16 +950,16 @@ closed with a typed `Err`.
 Example:
 
     import Ipe.Db as Db exposing (Db)
-    import Ipe.Db.Store as Store exposing (Store)
     import Ipe.Task as Task exposing (Task)
     import Ipe.Error exposing (Error)
 
-    type alias User =
-        { id : String, name : String, age : Int }
+    type alias User = { id : String, name : String, age : Int }
 
-    renameUser : Db -> Store User -> User -> Task Error Int
-    renameUser conn store user =
-        Store.update conn store { user | name = "renamed" }
+    let
+        user =
+            { id = "u1", name = "alice", age = 30 }
+    in
+    \conn store -> Store.update conn store { user | name = "renamed" }
 
 ## `updateWhere`
 
@@ -929,16 +985,16 @@ SET columns, binds every value, and refuses an unscoped UPDATE.
 Example:
 
     import Ipe.Db as Db exposing (Db)
-    import Ipe.Db.Store as Store exposing (Store)
     import Ipe.Task as Task exposing (Task)
     import Ipe.Error exposing (Error)
 
-    type alias User =
-        { id : String, name : String, age : Int }
+    type alias User = { id : String, name : String, age : Int }
 
-    renameAdults : Db -> Store User -> User -> Task Error Int
-    renameAdults conn store template =
-        Store.updateWhere conn store (Store.eq .active True) template
+    let
+        renameAdults conn store template =
+            Store.updateWhere conn store (Store.gte .age 18) template
+    in
+    renameAdults
 
 ## `deleteWhere`
 
@@ -955,16 +1011,16 @@ text. Routes through the audited `Db.deleteWhere`.
 Example:
 
     import Ipe.Db as Db exposing (Db)
-    import Ipe.Db.Store as Store exposing (Store)
     import Ipe.Task as Task exposing (Task)
     import Ipe.Error exposing (Error)
 
-    type alias User =
-        { id : String, name : String, age : Int }
+    type alias User = { id : String, name : String, age : Int }
 
-    purgeMinors : Db -> Store User -> Task Error Int
-    purgeMinors conn store =
-        Store.deleteWhere conn store (Store.eq .active False)
+    let
+        purgeMinors conn store =
+            Store.deleteWhere conn store (Store.lt .age 18)
+    in
+    purgeMinors
 
 ## `findBy`
 
@@ -984,16 +1040,16 @@ builder (`query |> where …`) or the raw-fragment escape `findWhere`.
 Example:
 
     import Ipe.Db as Db exposing (Db)
-    import Ipe.Db.Store as Store exposing (Store)
     import Ipe.Task as Task exposing (Task)
     import Ipe.Error exposing (Error)
 
-    type alias User =
-        { id : String, name : String, age : Int }
+    type alias User = { id : String, name : String, age : Int }
 
-    adults : Db -> Store User -> Task Error (List User)
-    adults conn store =
-        Store.findBy conn store "age" (SqlInt 18)
+    let
+        adults conn store =
+            Store.findBy conn store "age" (SqlInt 18)
+    in
+    adults
 
 ## `renameColumn`
 
@@ -1034,33 +1090,26 @@ and is refused by `migrations`, so a store carrying it cannot be migrated.
 
 Example:
 
-    import Ipe.Db.Store as Store exposing (Store)
     import Ipe.Db.Store.Unsafe as StoreU
     import Ipe.Result as Result exposing (Result(..))
     import Ipe.Db as Db
     import Ipe.Task as Task
 
-    -- Build a store with a column rename in the schema-op log, then
-    -- render it to a migration list and apply it.
-    applyRename : Db -> Task Error (List String)
-    applyRename conn =
-        let
-            storeResult =
-                Store.fromColumns "users"
-                    [ Store.textColumn "id"
-                    , Store.textColumn "name"
-                    , Store.intColumn "age"
-                    ]
-                    |> Result.map (StoreU.primaryKey "id")
-                    |> Result.map Store.public
-                    |> Result.map (Store.renameColumn "name" "full_name")
-        in
-        case storeResult |> Result.andThen Store.migrations of
-            Ok ms ->
-                Db.migrate conn ms
-
-            Err e ->
-                Task.fail e
+    let
+        applyRename conn =
+            Store.fromColumns "users"
+                [ Store.textColumn "id"
+                , Store.textColumn "name"
+                , Store.intColumn "age"
+                ]
+                |> Result.map (StoreU.primaryKey "id")
+                |> Result.map Store.public
+                |> Result.map (Store.renameColumn "name" "full_name")
+                |> Result.andThen Store.migrations
+                |> Task.fromResult
+                |> Task.andThen (Db.migrate conn)
+    in
+    applyRename
 
 ## `renameTable`
 
@@ -1078,31 +1127,25 @@ unconditionally and validated in `migrations` when SQL text is built.
 
 Example:
 
-    import Ipe.Db.Store as Store exposing (Store)
     import Ipe.Db.Store.Unsafe as StoreU
     import Ipe.Result as Result exposing (Result(..))
     import Ipe.Db as Db
     import Ipe.Task as Task
 
-    -- Build a store with a table rename, render to migrations, and apply.
-    applyTableRename : Db -> Task Error (List String)
-    applyTableRename conn =
-        let
-            storeResult =
-                Store.fromColumns "users"
-                    [ Store.textColumn "id"
-                    , Store.textColumn "email"
-                    ]
-                    |> Result.map (StoreU.primaryKey "id")
-                    |> Result.map Store.public
-                    |> Result.map (Store.renameTable "accounts")
-        in
-        case storeResult |> Result.andThen Store.migrations of
-            Ok ms ->
-                Db.migrate conn ms
-
-            Err e ->
-                Task.fail e
+    let
+        applyTableRename conn =
+            Store.fromColumns "users"
+                [ Store.textColumn "id"
+                , Store.textColumn "email"
+                ]
+                |> Result.map (StoreU.primaryKey "id")
+                |> Result.map Store.public
+                |> Result.map (Store.renameTable "accounts")
+                |> Result.andThen Store.migrations
+                |> Task.fromResult
+                |> Task.andThen (Db.migrate conn)
+    in
+    applyTableRename
 
 ## `migrations`
 
@@ -1128,37 +1171,26 @@ entry — identical to calling `Store.create`, which routes through here.
 
 Example:
 
-    import Ipe.Db.Store as Store exposing (Store)
     import Ipe.Db.Store.Unsafe as StoreU
     import Ipe.Result as Result exposing (Result(..))
     import Ipe.Db as Db
     import Ipe.Task as Task
 
-    -- Render a store (with a column rename) to its ordered migration list.
-    buildMigrations : Db -> Task Error (List String)
-    buildMigrations conn =
-        let
-            storeResult =
-                Store.fromColumns "users"
-                    [ Store.textColumn "id"
-                    , Store.textColumn "name"
-                    , Store.intColumn "age"
-                    ]
-                    |> Result.map (StoreU.primaryKey "id")
-                    |> Result.map Store.public
-                    |> Result.map (Store.renameColumn "name" "full_name")
-        in
-        case storeResult |> Result.andThen Store.migrations of
-            Ok ms ->
-                -- ms = [ { name = "create_users", sql = "CREATE TABLE …" }
-                --       , { name = "rename_column_users_name_to_full_name"
-                --         , sql = "ALTER TABLE users RENAME COLUMN name TO full_name"
-                --         }
-                --       ]
-                Db.migrate conn ms
-
-            Err e ->
-                Task.fail e
+    let
+        buildMigrations conn =
+            Store.fromColumns "users"
+                [ Store.textColumn "id"
+                , Store.textColumn "name"
+                , Store.intColumn "age"
+                ]
+                |> Result.map (StoreU.primaryKey "id")
+                |> Result.map Store.public
+                |> Result.map (Store.renameColumn "name" "full_name")
+                |> Result.andThen Store.migrations
+                |> Task.fromResult
+                |> Task.andThen (Db.migrate conn)
+    in
+    buildMigrations
 
 ## `noopRenameError`
 
@@ -1220,20 +1252,20 @@ pagination. Refine it with `where` / `orderAsc` / `orderDesc` / `limit` /
 Example:
 
     import Ipe.Db as Db exposing (Db)
-    import Ipe.Db.Store as Store exposing (Store)
     import Ipe.Task as Task exposing (Task)
     import Ipe.Error exposing (Error)
 
-    type alias User =
-        { id : String, name : String, age : Int }
+    type alias User = { id : String, name : String, age : Int }
 
-    topAdults : Db -> Store User -> Task Error (List User)
-    topAdults conn store =
-        Store.query store
-            |> Store.where (Store.eq .age 18)
-            |> Store.orderDesc "age"
-            |> Store.limit 10
-            |> Store.toList conn
+    let
+        topAdults conn store =
+            Store.query store
+                |> Store.where (Store.gte .age 18)
+                |> Store.orderDesc "age"
+                |> Store.limit 10
+                |> Store.toList conn
+    in
+    topAdults
 
 ## `where`
 
@@ -1247,9 +1279,11 @@ reads as a conjunction.
 
 Example:
 
-    Store.query store
-        |> Store.where (Store.eq .status "active")
-        |> Store.where (Store.eq .active True)
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.where (Store.eq .status "active")
+    |> Store.where (Store.eq .active True)
+```
 
 ## `eq`
 
@@ -1269,8 +1303,10 @@ column whose field is an enum or newtype needs its codec: use `eqBy`.
 
 Example:
 
-    Store.query store
-        |> Store.where (Store.eq .age 18)
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.where (Store.eq .age 18)
+```
 
 ## `eqBy`
 
@@ -1287,8 +1323,10 @@ validated at lowering; `value` binds as a parameter.
 
 Example:
 
-    Store.query store
-        |> Store.where (Store.eqBy rankCodec .rank Gold)
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.where (Store.eqBy rankCodec .rank Gold)
+```
 
 ## `neq`
 
@@ -1302,8 +1340,10 @@ NOT equal to `value`. Scalar fields only; for an enum or newtype column use
 
 Example:
 
-    Store.query store
-        |> Store.where (Store.neq .status "deleted")
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.where (Store.neq .status "deleted")
+```
 
 ## `neqBy`
 
@@ -1317,8 +1357,10 @@ enum or newtype column. Projects `value` through `codec` to a bound
 
 Example:
 
-    Store.query store
-        |> Store.where (Store.neqBy rankCodec .rank Gold)
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.where (Store.neqBy rankCodec .rank Gold)
+```
 
 ## `gt`
 
@@ -1332,8 +1374,10 @@ greater than `value`. Scalar fields only; for an enum or newtype column use
 
 Example:
 
-    Store.query store
-        |> Store.where (Store.gt .age 18)
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.where (Store.gt .age 18)
+```
 
 ## `gtBy`
 
@@ -1346,8 +1390,10 @@ enum or newtype column.
 
 Example:
 
-    Store.query store
-        |> Store.where (Store.gtBy priceCodec .price minPrice)
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.where (Store.gtBy priceCodec .price minPrice)
+```
 
 ## `gte`
 
@@ -1361,8 +1407,10 @@ or newtype columns.
 
 Example:
 
-    Store.query store
-        |> Store.where (Store.gte .age 18)
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.where (Store.gte .age 18)
+```
 
 ## `gteBy`
 
@@ -1385,8 +1433,10 @@ columns.
 
 Example:
 
-    Store.query store
-        |> Store.where (Store.lt .age 65)
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.where (Store.lt .age 65)
+```
 
 ## `ltBy`
 
@@ -1409,8 +1459,10 @@ newtype columns.
 
 Example:
 
-    Store.query store
-        |> Store.where (Store.lte .age 64)
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.where (Store.lte .age 64)
+```
 
 ## `lteBy`
 
@@ -1438,8 +1490,10 @@ For a literal prefix, use `Store.startsWith`. The accessor must name a
 
 Example:
 
-    Store.query store
-        |> Store.where (Store.like .name "al%")
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.where (Store.like .name "al%")
+```
 
 ## `startsWith`
 
@@ -1460,8 +1514,10 @@ refused as a typed error before any SQL is sent. The accessor must name a
 
 Example:
 
-    Store.query store
-        |> Store.where (Store.startsWith .name searchText)
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.where (Store.startsWith .name searchText)
+```
 
 ## `isNull`
 
@@ -1474,8 +1530,10 @@ NULL. The accessor names the column; no value argument.
 
 Example:
 
-    Store.query store
-        |> Store.where (Store.isNull .deletedAt)
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.where (Store.isNull .deletedAt)
+```
 
 ## `notNull`
 
@@ -1488,8 +1546,10 @@ SQL NULL.
 
 Example:
 
-    Store.query store
-        |> Store.where (Store.notNull .email)
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.where (Store.notNull .email)
+```
 
 ## `inList`
 
@@ -1506,8 +1566,10 @@ an enum or newtype column use `inListBy`.
 
 Example:
 
-    Store.query store
-        |> Store.where (Store.inList .status [ "active", "trial" ])
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.where (Store.inList .status [ "active", "trial" ])
+```
 
 ## `inListBy`
 
@@ -1523,8 +1585,10 @@ all-dropped list matches no row (`OrList []`).
 
 Example:
 
-    Store.query store
-        |> Store.where (Store.inListBy rankCodec .rank [ Gold, Silver ])
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.where (Store.inListBy rankCodec .rank [ Gold, Silver ])
+```
 
 ## `and`
 
@@ -1537,13 +1601,15 @@ matches every row (the identity of conjunction, `(1 = 1)`).
 
 Example:
 
-    Store.query store
-        |> Store.where
-            (Store.and
-                [ Store.eq .active True
-                , Store.eq .status "active"
-                ]
-            )
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.where
+        (Store.and
+            [ Store.eq .active True
+            , Store.eq .status "active"
+            ]
+        )
+```
 
 ## `or`
 
@@ -1556,13 +1622,15 @@ matches no row (the identity of disjunction, `(1 = 0)`).
 
 Example:
 
-    Store.query store
-        |> Store.where
-            (Store.or
-                [ Store.eq .status "active"
-                , Store.eq .status "trial"
-                ]
-            )
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.where
+        (Store.or
+            [ Store.eq .status "active"
+            , Store.eq .status "trial"
+            ]
+        )
+```
 
 ## `not`
 
@@ -1574,8 +1642,10 @@ not : Cond row -> Cond row
 
 Example:
 
-    Store.query store
-        |> Store.where (Store.not (Store.eq .status "deleted"))
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.where (Store.not (Store.eq .status "deleted"))
+```
 
 ## `orderAsc`
 
@@ -1589,8 +1659,10 @@ is validated against the store's columns at query time.
 
 Example:
 
-    Store.query store
-        |> Store.orderAsc "name"
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.orderAsc "name"
+```
 
 ## `orderDesc`
 
@@ -1602,8 +1674,10 @@ orderDesc : String -> Query a -> Query a
 
 Example:
 
-    Store.query store
-        |> Store.orderDesc "age"
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.orderDesc "age"
+```
 
 ## `limit`
 
@@ -1616,9 +1690,11 @@ zero `n` keeps no rows.
 
 Example:
 
-    Store.query store
-        |> Store.orderDesc "age"
-        |> Store.limit 10
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.orderDesc "age"
+    |> Store.limit 10
+```
 
 ## `offset`
 
@@ -1631,10 +1707,12 @@ offset : Int -> Query a -> Query a
 
 Example:
 
-    Store.query store
-        |> Store.orderAsc "name"
-        |> Store.offset 20
-        |> Store.limit 10
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.orderAsc "name"
+    |> Store.offset 20
+    |> Store.limit 10
+```
 
 ## `toList`
 
@@ -1650,11 +1728,13 @@ store's columns, is a typed `Err`.
 
 Example:
 
-    Store.query store
-        |> Store.where (Store.eq .age 18)
-        |> Store.orderDesc "age"
-        |> Store.limit 10
-        |> Store.toList conn
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.where (Store.eq .age 18)
+    |> Store.orderDesc "age"
+    |> Store.limit 10
+    |> Store.toList conn
+```
 
 ## `toMaybe`
 
@@ -1668,9 +1748,11 @@ required; `toMaybe` reads the head of the ordered result.
 
 Example:
 
-    Store.query store
-        |> Store.where (Store.eq .email "a@example.com")
-        |> Store.toMaybe conn
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.where (Store.eq .email "a@example.com")
+    |> Store.toMaybe conn
+```
 
 ## `count`
 
@@ -1684,9 +1766,11 @@ decides membership).
 
 Example:
 
-    Store.query store
-        |> Store.where (Store.eq .status "active")
-        |> Store.count conn
+```ipe ipe:skip illustrative; store is the caller's already-built Store row, not a standalone program
+Store.query store
+    |> Store.where (Store.eq .status "active")
+    |> Store.count conn
+```
 
 ## `Order`
 
@@ -1722,20 +1806,19 @@ each accessor's validated column and calls `joinNamed`.
 Example:
 
     import Ipe.Db as Db exposing (Db)
-    import Ipe.Db.Store as Store exposing (Store)
     import Ipe.Task as Task exposing (Task)
     import Ipe.Error exposing (Error)
 
-    type alias Book =
-        { id : String, title : String, authorId : String }
+    type alias Book = { id : String, title : String, authorId : String }
 
-    type alias Author =
-        { id : String, name : String }
+    type alias Author = { id : String, name : String }
 
-    booksByAuthor : Db -> Store Book -> Store Author -> Task Error (List ( Book, Author ))
-    booksByAuthor conn books authors =
-        Store.join books .authorId authors .id
-            |> Store.joinToList conn
+    let
+        booksByAuthor conn books authors =
+            Store.join books .authorId authors .id
+                |> Store.joinToList conn
+    in
+    booksByAuthor
 
 ## `joinNamed`
 
@@ -1772,8 +1855,10 @@ Repeated filters AND-join.
 
 Example:
 
-    Store.join books .authorId authors .id
-        |> Store.joinFilterLeft (Store.eq .available True)
+```ipe ipe:skip illustrative; books/authors are the caller's already-built Store rows, not a standalone program
+Store.join books .authorId authors .id
+    |> Store.joinFilterLeft (Store.eq .available True)
+```
 
 ## `joinFilterRight`
 
@@ -1788,8 +1873,10 @@ columns and qualified with the right alias (`a1.col`).
 
 Example:
 
-    Store.join books .authorId authors .id
-        |> Store.joinFilterRight (Store.eq .active True)
+```ipe ipe:skip illustrative; books/authors are the caller's already-built Store rows, not a standalone program
+Store.join books .authorId authors .id
+    |> Store.joinFilterRight (Store.eq .active True)
+```
 
 ## `orderByLeft`
 
@@ -1805,9 +1892,11 @@ Only the last `orderByLeft` / `orderByRight` call on a `Joined` takes effect.
 
 Example:
 
-    Store.join books .authorId authors .id
-        |> Store.orderByLeft .title Asc
-        |> Store.joinToList db
+```ipe ipe:skip illustrative; books/authors are the caller's already-built Store rows, not a standalone program
+Store.join books .authorId authors .id
+    |> Store.orderByLeft .title Asc
+    |> Store.joinToList db
+```
 
 ## `orderByRight`
 
@@ -1820,10 +1909,12 @@ the RIGHT side (`a1`). Symmetric to `orderByLeft`.
 
 Example:
 
-    Store.join books .authorId authors .id
-        |> Store.joinFilterRight (Store.eq .active True)
-        |> Store.orderByRight .name Desc
-        |> Store.joinToList db
+```ipe ipe:skip illustrative; books/authors are the caller's already-built Store rows, not a standalone program
+Store.join books .authorId authors .id
+    |> Store.joinFilterRight (Store.eq .active True)
+    |> Store.orderByRight .name Desc
+    |> Store.joinToList db
+```
 
 ## `orderByLeftNamed`
 
@@ -1865,9 +1956,11 @@ SQL `NULL` cell reaches each side's codec as `Nothing`.
 
 Example:
 
-    Store.join books .authorId authors .id
-        |> Store.joinFilterRight (Store.eq .active True)
-        |> Store.joinToList conn
+```ipe ipe:skip illustrative; books/authors are the caller's already-built Store rows, not a standalone program
+Store.join books .authorId authors .id
+    |> Store.joinFilterRight (Store.eq .active True)
+    |> Store.joinToList conn
+```
 
 ## `joinToMaybe`
 
@@ -1881,9 +1974,11 @@ codec as `Nothing`.
 
 Example:
 
-    Store.join books .authorId authors .id
-        |> Store.joinFilterLeft (Store.eq .id "book-1")
-        |> Store.joinToMaybe conn
+```ipe ipe:skip illustrative; books/authors are the caller's already-built Store rows, not a standalone program
+Store.join books .authorId authors .id
+    |> Store.joinFilterLeft (Store.eq .id "book-1")
+    |> Store.joinToMaybe conn
+```
 
 ## `joinCount`
 
@@ -1896,9 +1991,11 @@ match. Decodes nothing; counts the matched join rows.
 
 Example:
 
-    Store.join books .authorId authors .id
-        |> Store.joinFilterRight (Store.eq .active True)
-        |> Store.joinCount conn
+```ipe ipe:skip illustrative; books/authors are the caller's already-built Store rows, not a standalone program
+Store.join books .authorId authors .id
+    |> Store.joinFilterRight (Store.eq .active True)
+    |> Store.joinCount conn
+```
 
 ## `Select`
 
@@ -1934,15 +2031,17 @@ tuple projection yields the tuple — no positional read in caller code.
 
 Example:
 
-    -- one column: a `List String`
-    Store.join books .authorId authors .id
-        |> Store.select (\( _, author ) -> author.name)
-        |> Store.selectToList db
+```ipe ipe:skip illustrative; books/authors are the caller's already-built Store rows, not a standalone program
+-- one column: a `List String`
+Store.join books .authorId authors .id
+    |> Store.select (\( _, author ) -> author.name)
+    |> Store.selectToList db
 
-    -- two columns: a `List ( String, String )`
-    Store.join books .authorId authors .id
-        |> Store.select (\( book, author ) -> ( book.title, author.name ))
-        |> Store.selectToList db
+-- two columns: a `List ( String, String )`
+Store.join books .authorId authors .id
+    |> Store.select (\( book, author ) -> ( book.title, author.name ))
+    |> Store.selectToList db
+```
 
 ## `selectNamed`
 
@@ -1975,11 +2074,13 @@ point-free or partially-applied `literal` is a fail-closed build error.
 
 Example:
 
-    Store.join books .authorId authors .id
-        |> Store.select (\( _, author ) -> ( literal "fiction", author.name ))
-        |> Store.selectToList db
-        -- : Task Error (List ( String, String ))
-        -- SQL: SELECT ? AS p0, a1.name AS p1 FROM …
+```ipe ipe:skip illustrative; books/authors are the caller's already-built Store rows, not a standalone program
+Store.join books .authorId authors .id
+    |> Store.select (\( _, author ) -> ( literal "fiction", author.name ))
+    |> Store.selectToList db
+    -- : Task Error (List ( String, String ))
+    -- SQL: SELECT ? AS p0, a1.name AS p1 FROM …
+```
 
 ## `upper`
 
@@ -1996,10 +2097,12 @@ compile time and re-checked by the runtime.
 
 Example:
 
-    joinedBooks
-        |> Store.select (\( _, author ) -> upper author.name)
-        |> Store.selectToList db
-        -- SQL: SELECT UPPER(a1.name) AS p0 FROM …
+```ipe ipe:skip illustrative; joinedBooks is the caller's already-built Joined row value, not a standalone program
+joinedBooks
+    |> Store.select (\( _, author ) -> upper author.name)
+    |> Store.selectToList db
+    -- SQL: SELECT UPPER(a1.name) AS p0 FROM …
+```
 
 ## `lower`
 
@@ -2012,10 +2115,12 @@ a `String` column reference. The same structural restrictions apply.
 
 Example:
 
-    joinedBooks
-        |> Store.select (\( book, _ ) -> lower book.title)
-        |> Store.selectToList db
-        -- SQL: SELECT LOWER(a0.title) AS p0 FROM …
+```ipe ipe:skip illustrative; joinedBooks is the caller's already-built Joined row value, not a standalone program
+joinedBooks
+    |> Store.select (\( book, _ ) -> lower book.title)
+    |> Store.selectToList db
+    -- SQL: SELECT LOWER(a0.title) AS p0 FROM …
+```
 
 ## `coalesce`
 
@@ -2036,10 +2141,12 @@ runtime.
 
 Example:
 
-    Store.join books .authorId authors .id
-        |> Store.select (\( _, author ) -> coalesce author.name (literal "unknown"))
-        |> Store.selectToList db
-        -- SQL: SELECT COALESCE(a1.name, ?) AS p0 FROM …
+```ipe ipe:skip illustrative; books/authors are the caller's already-built Store rows, not a standalone program
+Store.join books .authorId authors .id
+    |> Store.select (\( _, author ) -> coalesce author.name (literal "unknown"))
+    |> Store.selectToList db
+    -- SQL: SELECT COALESCE(a1.name, ?) AS p0 FROM …
+```
 
 ## `add`
 
@@ -2059,10 +2166,12 @@ runtime.
 
 Example:
 
-    Store.join lineItems .orderId orders .id
-        |> Store.select (\( item, _ ) -> add item.price (literal 10))
-        |> Store.selectToList db
-        -- SQL: SELECT (a0.price + ?) AS p0 FROM …
+```ipe ipe:skip illustrative; lineItems/orders are the caller's already-built Store rows, not a standalone program
+Store.join lineItems .orderId orders .id
+    |> Store.select (\( item, _ ) -> add item.price (literal 10))
+    |> Store.selectToList db
+    -- SQL: SELECT (a0.price + ?) AS p0 FROM …
+```
 
 ## `sub`
 
@@ -2110,10 +2219,12 @@ not fire.
 
 Example:
 
-    Store.join books .authorId authors .id
-        |> Store.select (\( book, author ) -> ( book.title, author.name ))
-        |> Store.selectToList db
-        -- : Task Error (List ( String, String ))
+```ipe ipe:skip illustrative; books/authors are the caller's already-built Store rows, not a standalone program
+Store.join books .authorId authors .id
+    |> Store.select (\( book, author ) -> ( book.title, author.name ))
+    |> Store.selectToList db
+    -- : Task Error (List ( String, String ))
+```
 
 ## `selectToMaybe`
 
@@ -2327,7 +2438,9 @@ at lowering.
 
 Example:
 
-    Store.existsIn shares (\share doc -> Store.correlate share.docId doc.id)
+```ipe ipe:skip illustrative; shares is the caller's already-built Secured row, not a standalone program
+Store.existsIn shares (\share doc -> Store.correlate share.docId doc.id)
+```
 
 ## `existsIn`
 
@@ -2348,10 +2461,12 @@ the subquery adds no injection surface. `secured` re-validates every column
 
 Example (a doc is readable when the caller has a share row for it):
 
-    Store.readOnly
-        (Store.existsIn securedShares
-            (\share doc -> Store.correlate share.docId doc.id)
-        )
+```ipe ipe:skip illustrative; securedShares is the caller's already-built Secured row, not a standalone program
+Store.readOnly
+    (Store.existsIn securedShares
+        (\share doc -> Store.correlate share.docId doc.id)
+    )
+```
 
 ## `existsInNamed`
 
@@ -2537,11 +2652,13 @@ operations.
 
 Example:
 
-    Store.secured
-        (Store.ownerColumn .author
-            |> Store.andPolicy (Store.immutable .createdAt)
-        )
-        draft
+```ipe ipe:skip illustrative; draft is the caller's already-built Draft row, not a standalone program
+Store.secured
+    (Store.ownerColumn .author
+        |> Store.andPolicy (Store.immutable .createdAt)
+    )
+    draft
+```
 
 ## `ownerColumnNamed`
 

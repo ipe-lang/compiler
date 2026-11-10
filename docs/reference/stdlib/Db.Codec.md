@@ -37,13 +37,15 @@ A scalar that does not match its `ColType` is a typed `Err`, never a silently
 mis-typed bind. An exact-decimal or money field (whose codec encodes to a JSON
 string) round-trips as TEXT — it is never coerced through a lossy `Float`.
 
-    import Ipe.Db.Codec as DbCodec
-    import Ipe.Codec as Codec exposing (Codec)
+```ipe ipe:skip illustrative; userCodec/user/row are placeholder names, not a standalone program
+import Ipe.Db.Codec as DbCodec
+import Ipe.Codec as Codec exposing (Codec)
 
-    -- Given `userCodec : Codec User` (an `SRecord` codec):
-    --   DbCodec.codecToBinds userCodec user
-    --       == Ok [ ( "id", SqlString "…" ), ( "age", SqlInt 30 ), … ]
-    --   DbCodec.codecFromRow userCodec row == Ok user   (row from those binds)
+-- Given `userCodec : Codec User` (an `SRecord` codec):
+--   DbCodec.codecToBinds userCodec user
+--       == Ok [ ( "id", SqlString "..." ), ( "age", SqlInt 30 ), ... ]
+--   DbCodec.codecFromRow userCodec row == Ok user   (row from those binds)
+```
 
 ## `codecToBinds`
 
