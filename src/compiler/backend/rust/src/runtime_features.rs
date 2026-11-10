@@ -643,6 +643,8 @@ mod tests {
     /// line at all.
     #[test]
     fn vendored_async_emit_declares_tokio_signal() {
+        /// One async program shape: its name and the flags it sets.
+        type Shape = (&'static str, fn(&mut Module));
         let tokio_line = |toml: &str| {
             toml.lines()
                 .find(|l| l.starts_with("tokio = {"))
@@ -662,7 +664,7 @@ mod tests {
                 .expect("a vendored native emit assembles")
                 .cargo_toml
         };
-        let shapes: [(&str, fn(&mut Module)); 4] = [
+        let shapes: [Shape; 4] = [
             ("worker", |m| m.uses_async_runtime = true),
             ("tui", |m| {
                 m.uses_tui = true;
