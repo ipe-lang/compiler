@@ -10,7 +10,7 @@ readable text without a chain of `++`.
 ```ipe ipe:skip a syntax shape with placeholder names, not valid Ipê
 """
 <text, spanning as many lines as you like>
-{{<simple-ref>}}   -- substitutes the value, stringified
+{{<expression>}}   -- substitutes the value, stringified
 \{{                -- a literal `{{` (no interpolation)
 """
 ```
@@ -31,22 +31,26 @@ or a tab left of the margin is IPE-P0076. Because the margin is the opener's
 column, a block moved to another column keeps its value once its body moves
 with it.
 
-Each `{{…}}` body is trimmed, wrapped in the internal interpolation renderer,
-and the whole literal is joined with `++`.
-
-An interpolation body may be one of exactly **four simple shapes**:
+An interpolation body is any Ipê expression — a name, a field path, a call,
+an operator, a parenthesised or record expression — parsed and resolved exactly
+as it would be outside the string. Each body's value goes through the internal
+interpolation renderer, and the whole literal is joined with `++`.
 
 ```ipe ipe:skip a syntax shape with placeholder names, not valid Ipê
-{{name}}           -- a bare identifier
-{{record.field}}   -- a field access
-{{Module.value}}   -- a qualified name
-{{fn arg}}         -- a single function application
+{{name}}                              -- a name
+{{record.field.sub}}                  -- a field path
+{{String.join ", " (List.map f xs)}}  -- a call
+{{a + b}}                             -- an operator
 ```
 
-Anything more complex — operators, multi-argument calls, parenthesised
-expressions — is left as **literal `{{…}}` text**, a deliberate signal that only
-simple references interpolate. Compute the value into a `let` binding first and
-interpolate the name.
+A body ends at the **first** `}}` after its `{{`. A record expression whose
+closing braces would meet there is cut short — write `{a = {b = 1} }` with a
+space, or bind the value to a name first.
+
+A body that is not one whole expression is refused with IPE-P0077
+(`ipe doc IPE-P0077`), never kept as literal text: an empty `{{}}`, a `{{` with
+no `}}`, a token after the expression, an expression still open at the `}}`,
+or an interpolation inside a pattern string.
 
 ## Example
 
@@ -74,14 +78,12 @@ value even though the block is indented in the source.
   its fields, or convert it first (`Error.toString`, `Secret.redacted`).
 - **Interpolation is only in triple-quoted strings.** A single-line `"…"` string
   does NOT interpolate — `{{x}}` there is literal text. This is the common trap.
-- The four body shapes above are the whole grammar; a more complex body stays
-  literal `{{…}}` rather than failing — bind it to a name and interpolate that.
-- A qualified body `{{Module.value}}` resolves exactly as it does outside a
-  string: the module must be imported under that qualifier, or the body is
-  refused (IPE-N0034, or IPE-N0004 for an unknown qualifier), never printed as
-  literal text.
-- `\{{` emits a literal `{{`. An unclosed `{{` with no matching `}}` is treated
-  as literal content.
+- A body resolves exactly as the same expression outside a string: an
+  unknown name or qualifier is refused at that name (IPE-N0001, IPE-N0004,
+  IPE-N0034), and a name used only inside a body counts as used.
+- A long body reads better bound to a `let` name first and interpolated by that
+  name.
+- `\{{` emits a literal `{{`. A `{{` with no matching `}}` is IPE-P0077.
 - Interpolation joins with `++`, so an interpolated string is exactly the
   concatenation you would write by hand — prefer it over a long `++` chain for
   readability.

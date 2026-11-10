@@ -9,9 +9,9 @@
 //! Every edit replaces exactly one token spelling the old name. The rename is
 //! refused (`None`) — never applied partially — when an occurrence's token
 //! cannot be isolated, when a touched module does not canonicalise or lex,
-//! when the new name could capture or be captured, when a site is a record
-//! pattern's field label, or when a string interpolation may mention either
-//! spelling (the resolver records no occurrence inside one).
+//! when the new name could capture or be captured, or when a site is a record
+//! pattern's field label. A name inside a `{{…}}` body is an ordinary recorded
+//! occurrence and is renamed with the rest.
 //!
 //! The `new_name` string from the LSP client is untrusted: [`ValidatedIdentifier`]
 //! is the parse-don't-validate boundary; only the validated form reaches the
@@ -222,29 +222,23 @@ pub fn rename(
     let new_name = ValidatedIdentifier::parse(req.new_name, symbol_kind_of(old_name))?;
     let new_name = new_name.as_str();
 
-    let (recorded, scanned): (Vec<NameRef>, Vec<Vec<String>>) = match &def.target {
+    let recorded: Vec<NameRef> = match &def.target {
         NameTarget::Local { .. } => {
             let mut sites = vec![NameRef {
                 module: def.module.clone(),
                 span: def.span,
             }];
             sites.extend(occurrences(db, root, entry, &def.target));
-            (sites, vec![def.module.clone()])
+            sites
         }
         NameTarget::Declared { .. } => {
             let mut sites = declared_sites(db, root, entry, &def.module, old_name, new_name)?;
             sites.extend(signature_sites(db, root, &def.module, old_name)?);
-            let user_modules = files
-                .iter()
-                .filter(|(_, file)| *file.origin(db) == ModuleOrigin::User)
-                .map(|(path, _)| path.clone())
-                .collect();
-            (sites, user_modules)
+            sites
         }
     };
     let sites = narrowed_sites(db, root, recorded, old_name)?;
     refuse_capture(db, root, entry, &sites, new_name)?;
-    refuse_interpolation(db, root, &scanned, old_name, new_name)?;
 
     let mut edits_by_uri = edits_by_uri(&sites, new_name, resolver, req.encoding)?;
     if matches!(def.target, NameTarget::Declared { .. }) {
@@ -557,51 +551,6 @@ fn record_pattern_labels(tokens: &[SourceToken]) -> Vec<Span> {
         }
     }
     labels
-}
-
-/// Refuse (`None`) when a string literal in `modules` may interpolate the old
-/// or the new name.
-///
-/// The resolver records no occurrence inside an interpolation, so a rename
-/// cannot rewrite one; a `{{ … }}` string mentioning either spelling as a word
-/// would silently keep the old name or start naming the renamed value.
-fn refuse_interpolation(
-    db: &IpeDatabase,
-    root: SourceRoot,
-    modules: &[Vec<String>],
-    old_name: &str,
-    new_name: &str,
-) -> Option<()> {
-    let files = root.files(db);
-    for module in modules {
-        let text = files.get(module)?.text(db);
-        let tokens = ipe_parse::try_source_tokens(text)?;
-        let interpolates = tokens
-            .iter()
-            .filter(|token| token.class == TokenClass::Code(TokenKind::Str))
-            .filter_map(|token| span_text(text, token.span))
-            .any(|literal| {
-                literal.contains("{{")
-                    && (has_word(literal, old_name) || has_word(literal, new_name))
-            });
-        if interpolates {
-            return None;
-        }
-    }
-    Some(())
-}
-
-/// Whether `word` occurs in `hay` with no identifier character on either side.
-fn has_word(hay: &str, word: &str) -> bool {
-    hay.match_indices(word).any(|(at, _)| {
-        let before = hay.get(..at).and_then(|s| s.chars().next_back());
-        let after = at
-            .checked_add(word.len())
-            .and_then(|end| hay.get(end..))
-            .and_then(|s| s.chars().next());
-        !before.is_some_and(ipe_parse::is_ident_continue)
-            && !after.is_some_and(ipe_parse::is_ident_continue)
-    })
 }
 
 /// Group the sites into `new_name` edits keyed by document URI.
@@ -1272,10 +1221,35 @@ mod tests {
     }
 
     #[test]
-    fn a_name_an_interpolation_mentions_is_refused() {
+    fn a_name_an_interpolation_uses_is_renamed_there_too() {
         let src = "module Main exposing (main)\n\ngreet : String -> String\ngreet name =\n    \"\"\"hi {{name}}\"\"\"\n\nmain : String\nmain = greet \"x\"\n";
         let user = ModuleOrigin::User;
+        let texts = rename_texts(&[("Main", src, user)], "Main", "name", 0, "who")
+            .expect("a local used in a body is renamed");
+        assert_eq!(
+            texts.get("Main").map(String::as_str),
+            Some(
+                "module Main exposing (main)\n\ngreet : String -> String\ngreet who =\n    \"\"\"hi {{who}}\"\"\"\n\nmain : String\nmain = greet \"x\"\n"
+            )
+        );
+    }
+
+    #[test]
+    fn a_rename_onto_a_name_a_body_uses_is_refused() {
+        let src = "module Main exposing (main)\n\ngreet : String -> String -> String\ngreet name who =\n    \"\"\"{{name}} {{who}}\"\"\"\n\nmain : String\nmain = greet \"x\" \"y\"\n";
+        let user = ModuleOrigin::User;
         assert!(rename_texts(&[("Main", src, user)], "Main", "name", 0, "who").is_none());
+    }
+
+    /// The only `y` in the module binds inside a body, so only the names the
+    /// body records can refuse renaming `x` onto it: the rename would make the
+    /// lambda capture `x`.
+    #[test]
+    fn a_rename_onto_a_binder_only_a_body_holds_is_refused() {
+        let src = "module Main exposing (main)\n\nshow : String -> String\nshow x =\n    \"\"\"{{ (\\y -> x ++ y) \"!\" }}\"\"\"\n\nmain : String\nmain = show \"a\"\n";
+        let user = ModuleOrigin::User;
+        assert!(rename_texts(&[("Main", src, user)], "Main", "x =", 0, "z").is_some());
+        assert!(rename_texts(&[("Main", src, user)], "Main", "x =", 0, "y").is_none());
     }
 
     #[test]

@@ -99,3 +99,22 @@ f xs =
       right: (application
         function: (value_qualified (qualified_lower))
         argument: (string_literal)))))
+
+================================================================================
+Interpolation body holding braces ends at the first closer
+================================================================================
+
+module M exposing (v)
+
+v =
+    """a {{ {a = 1}.a }} b"""
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (module_declaration
+    name: (module_name (upper_identifier))
+    exposing: (exposing_list (exposed_item (lower_identifier))))
+  (value_declaration
+    name: (lower_identifier)
+    body: (triple_string_literal (interpolation))))

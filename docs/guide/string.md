@@ -102,9 +102,8 @@ banner name count =
     """
 ```
 
-An interpolation body may be a bare identifier, a field access, a qualified
-name, or a single function application; anything more complex stays as literal
-`{{…}}` text. Interpolation works **only** in triple-quoted strings — in a
+An interpolation body is any expression — a name, a field path, a call, an
+operator — resolved exactly as it would be outside the string. Interpolation works **only** in triple-quoted strings — in a
 single-line `"…"` string `{{x}}` is literal. Prefer an interpolated
 `"""…"""` over a long `++` chain when stitching text and values together. See
 [`string-interpolation`](../constructs/string-interpolation.md) for the full

@@ -467,15 +467,15 @@ module.exports = grammar({
       ),
 
     // Triple-quoted string. Content is raw; the closing terminator is exactly
-    // three quotes (lexer.rs lex_triple_string). Interpolation `{{expr}}` is
-    // raw content here (resolved downstream by the canonicaliser).
+    // three quotes. An interpolation `{{expr}}` body ends at the first `}}`
+    // after its `{{`, the same extent the compiler's lexer reads.
     triple_string_literal: ($) =>
       seq('"""', repeat(choice($.interpolation, $._triple_string_content)), '"""'),
 
     _triple_string_content: ($) =>
       token.immediate(prec(1, /([^"{\\]|"[^"]|""[^"]|\\.|\{[^{])+/)),
 
-    interpolation: ($) => seq('{{', /[^}]*/, '}}'),
+    interpolation: ($) => seq('{{', /([^}]|\}[^}])*/, '}}'),
 
     char_literal: ($) =>
       seq("'", choice($.escape_sequence, token.immediate(/[^'\\\n]/)), "'"),

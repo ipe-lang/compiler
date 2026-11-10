@@ -30,10 +30,10 @@ use crate::code::{
     IPE_P0017, IPE_P0018, IPE_P0020, IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041,
     IPE_P0050, IPE_P0060, IPE_P0061, IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066,
     IPE_P0067, IPE_P0068, IPE_P0069, IPE_P0070, IPE_P0071, IPE_P0072, IPE_P0073, IPE_P0074,
-    IPE_P0075, IPE_P0076, IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004, IPE_T0001, IPE_T0002,
-    IPE_T0003, IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015,
-    IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021, IPE_T0022, IPE_T0023,
-    IPE_T0024, Severity,
+    IPE_P0075, IPE_P0076, IPE_P0077, IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004, IPE_T0001,
+    IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014,
+    IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021, IPE_T0022,
+    IPE_T0023, IPE_T0024, Severity,
 };
 use crate::span::Span;
 use crate::suggest::{Confidence, Hit};
@@ -372,6 +372,24 @@ impl TripleStringDefect {
     }
 }
 
+/// Why a `{{…}}` interpolation in a `"""` string is refused.
+///
+/// The body between `{{` and the first `}}` after it is one expression, read
+/// by the language's own lexer and parser. [IPE-P0077]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum InterpolationDefect {
+    /// The body holds no expression: `{{}}` or only whitespace.
+    Empty,
+    /// A `{{` with no `}}` after it in the string.
+    Unclosed,
+    /// The body holds one whole expression and more tokens after it.
+    TrailingTokens,
+    /// The first `}}` ends the body before its expression is complete.
+    BodyEnded,
+    /// A string with an interpolation stands where a pattern is expected.
+    InPattern,
+}
+
 /// Which part of an `if … then … else …` expression is malformed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum IfDefect {
@@ -545,6 +563,9 @@ pub enum ParseError {
     /// A `"""` string in neither of its two forms, or with a line left of its
     /// margin. [IPE-P0075] for the form, [IPE-P0076] for the margin.
     MalformedTripleString(TripleStringDefect),
+    /// A `{{…}}` interpolation that is not one whole expression, or one in a
+    /// pattern. [IPE-P0077]
+    MalformedInterpolation(InterpolationDefect),
 }
 
 /// Why a source display hazard is refused where it stands.
@@ -2629,6 +2650,8 @@ pub enum SpanRole {
 pub enum Hint {
     /// The one fix for a malformed `"""` string, worded from its defect.
     TripleStringFix(TripleStringDefect),
+    /// The one fix for a malformed `{{…}}` interpolation, worded from its defect.
+    InterpolationFix(InterpolationDefect),
     /// Show the canonical module header `module Main exposing (main)`.
     ModuleHeaderExample,
     /// Suggest `..` or `Module.name` for a stray dot.
@@ -3095,6 +3118,7 @@ const fn parse_code(msg: &ParseError) -> Code {
         ParseError::MalformedTripleString(
             TripleStringDefect::LineUnderMargin { .. } | TripleStringDefect::TabInMargin { .. },
         ) => IPE_P0076,
+        ParseError::MalformedInterpolation(_) => IPE_P0077,
     })
 }
 
@@ -3317,6 +3341,9 @@ fn parse_help(msg: &ParseError) -> Vec<HelpLine> {
             vec![HelpLine::Hint(Hint::QualifiedCtorInPattern)]
         }
         ParseError::MalformedTripleString(defect) => triple_string_help(*defect),
+        ParseError::MalformedInterpolation(defect) => {
+            vec![HelpLine::Hint(Hint::InterpolationFix(*defect))]
+        }
     }
 }
 

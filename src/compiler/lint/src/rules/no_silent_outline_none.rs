@@ -294,6 +294,11 @@ fn walk_children(ctx: &Ctx, expr: &Expr, out: &mut Vec<Finding>) {
                 walk_expr(ctx, value, out);
             }
         }
+        Expr_::Template(template) => {
+            for part in template.exprs() {
+                walk_expr(ctx, part, out);
+            }
+        }
         _ => {}
     }
 }

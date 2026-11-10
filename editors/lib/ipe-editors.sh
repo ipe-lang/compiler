@@ -62,6 +62,38 @@ ipe_fetch() {
     fi
 }
 
+# ipe_resolve_ref REF — print the commit REF names on GitHub: a 40-hex REF as
+# is, else the one branch or tag called REF (a tag peeled to its commit).
+# Refuses a REF outside the ref-name alphabet, an unknown REF, and a REF that
+# names both a branch and a tag. ls-remote prints a tag's peeled `^{}` line
+# only when asked for that exact name, so it is listed explicitly.
+ipe_resolve_ref() {
+    case "$1" in
+        "" | -* | *[!A-Za-z0-9._/-]*) die "IPE_EDITORS_REF '$1' is not a branch, tag or commit name" ;;
+    esac
+    case "$1" in
+        *[!0-9a-f]*) ;;
+        *) if [ "${#1}" -eq 40 ]; then printf '%s\n' "$1"; return 0; fi ;;
+    esac
+    _refs="$(git ls-remote "https://github.com/$IPE_REPO_SLUG" "refs/heads/$1" "refs/tags/$1" "refs/tags/$1^{}")" \
+        || die "cannot list the refs of https://github.com/$IPE_REPO_SLUG"
+    _sha="$(printf '%s\n' "$_refs" | awk -v r="$1" '
+        $2 == "refs/heads/" r { head = $1; n++ }
+        $2 == "refs/tags/" r { tag = $1; n++ }
+        $2 == "refs/tags/" r "^{}" { peeled = $1 }
+        END {
+            if (n != 1) exit 1
+            if (head != "") print head
+            else if (peeled != "") print peeled
+            else print tag
+        }')" || die "IPE_EDITORS_REF '$1' names no single branch or tag of https://github.com/$IPE_REPO_SLUG"
+    case "$_sha" in
+        "" | *[!0-9a-f]*) die "git ls-remote returned no commit for '$1'" ;;
+    esac
+    [ "${#_sha}" -eq 40 ] || die "git ls-remote returned no commit for '$1'"
+    printf '%s\n' "$_sha"
+}
+
 # ipe_backup FILE — copy FILE to a fresh, never-reused backup name; prints it.
 ipe_backup() {
     stamp="$(date +%Y%m%d-%H%M%S)"

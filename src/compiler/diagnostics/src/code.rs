@@ -361,6 +361,8 @@ code! {
     IPE_P0075 = "IPE-P0075", "a triple-quoted string in neither of its two forms", "IPE-P0075";
     /// a block `"""` string line with a tab or a non-space character left of its margin
     IPE_P0076 = "IPE-P0076", "a triple-quoted string line left of its margin", "IPE-P0076";
+    /// a `{{…}}` interpolation body that is not one whole expression, or one in a pattern
+    IPE_P0077 = "IPE-P0077", "a malformed string interpolation", "IPE-P0077";
 
     // -----------------------------------------------------------------------
     // Name resolution (IPE-N####)

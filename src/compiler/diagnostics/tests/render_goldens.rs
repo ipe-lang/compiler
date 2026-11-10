@@ -19,8 +19,8 @@ use std::path::PathBuf;
 
 use ipe_diagnostics::{
     AliasExpansionKind, Candidates, Construct, Diagnostic, EditTarget, Expected, ExpectedSet,
-    Feature, LowerError, NameError, OpenerText, ParseError, SortedNames, Span, TokenKind,
-    TripleStringDefect, TyDoc, TypeError, suggest,
+    Feature, InterpolationDefect, LowerError, NameError, OpenerText, ParseError, SortedNames, Span,
+    TokenKind, TripleStringDefect, TyDoc, TypeError, suggest,
 };
 
 // ---------------------------------------------------------------------------
@@ -232,6 +232,81 @@ fn golden_parse_unexpected_eof() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
     check_golden("parse_unexpected_eof", &d, "test.ipe", source)
+}
+
+/// Render IPE-P0077 `defect` at the first `needle` of the `main` value
+/// `body`, against the golden `name.txt`.
+fn check_interpolation_golden(
+    name: &str,
+    body: &str,
+    needle: &str,
+    defect: InterpolationDefect,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source = format!("module Main exposing (main)\n\nmain =\n    {body}\n");
+    let lo = source
+        .find(needle)
+        .ok_or_else(|| format!("{needle:?} not in {source:?}"))?;
+    let span = Span::new(u32::try_from(lo)?, u32::try_from(lo + needle.len())?);
+    let d = Diagnostic::Parse {
+        span,
+        msg: ParseError::MalformedInterpolation(defect),
+    };
+    check_golden(name, &d, "test.ipe", &source)
+}
+
+#[test]
+fn golden_parse_interpolation_empty() -> Result<(), Box<dyn std::error::Error>> {
+    // IPE-P0077: a `{{}}` body holds no expression.
+    check_interpolation_golden(
+        "parse_interpolation_empty",
+        "\"\"\"a {{}} b\"\"\"",
+        "{{}}",
+        InterpolationDefect::Empty,
+    )
+}
+
+#[test]
+fn golden_parse_interpolation_unclosed() -> Result<(), Box<dyn std::error::Error>> {
+    // IPE-P0077: a `{{` with no `}}` after it.
+    check_interpolation_golden(
+        "parse_interpolation_unclosed",
+        "\"\"\"a {{b\"\"\"",
+        "{{",
+        InterpolationDefect::Unclosed,
+    )
+}
+
+#[test]
+fn golden_parse_interpolation_trailing_tokens() -> Result<(), Box<dyn std::error::Error>> {
+    // IPE-P0077: a token follows the body's whole expression.
+    check_interpolation_golden(
+        "parse_interpolation_trailing_tokens",
+        "\"\"\"{{a )}}\"\"\"",
+        ")",
+        InterpolationDefect::TrailingTokens,
+    )
+}
+
+#[test]
+fn golden_parse_interpolation_body_ended() -> Result<(), Box<dyn std::error::Error>> {
+    // IPE-P0077: the first `}}` ends a body whose expression is still open.
+    check_interpolation_golden(
+        "parse_interpolation_body_ended",
+        "\"\"\"a {{f (x}} b\"\"\"",
+        "}}",
+        InterpolationDefect::BodyEnded,
+    )
+}
+
+#[test]
+fn golden_parse_interpolation_in_pattern() -> Result<(), Box<dyn std::error::Error>> {
+    // IPE-P0077: a pattern string holds an interpolation.
+    check_interpolation_golden(
+        "parse_interpolation_in_pattern",
+        "case s of\n        \"\"\"x{{y}}\"\"\" ->\n            1\n\n        _ ->\n            0",
+        "{{y}}",
+        InterpolationDefect::InPattern,
+    )
 }
 
 // ---------------------------------------------------------------------------

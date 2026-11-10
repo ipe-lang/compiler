@@ -226,9 +226,8 @@ pub fn scan_import_paths(src: &str) -> Option<Vec<Vec<String>>> {
 ///
 /// Lexes `src` with the real lexer and collects, for every `Ident` token,
 /// the full (possibly dotted) text AND each dot-segment — a superset of every
-/// identifier string [`parse_module`] interns from this module. Triple-quoted
-/// strings contribute the words inside their `{{…}}` interpolation regions
-/// (the canonicaliser resolves those as real identifier references); plain
+/// identifier string [`parse_module`] interns from this module. The tokens of
+/// each `{{…}}` body of a triple-quoted string are read the same way; plain
 /// string/char literal contents and comments contribute nothing, matching
 /// what the parser actually interns.
 ///
@@ -243,7 +242,13 @@ pub fn scan_import_paths(src: &str) -> Option<Vec<Vec<String>>> {
 pub fn scan_identifier_words(src: &str) -> Option<std::collections::BTreeSet<String>> {
     let toks = lexer::lex(src).ok()?;
     let mut words = std::collections::BTreeSet::new();
-    for tok in &toks {
+    collect_identifier_words(&toks, &mut words);
+    Some(words)
+}
+
+/// Add the identifier words of `toks`, interpolation bodies included, to `words`.
+fn collect_identifier_words(toks: &[lexer::Token], words: &mut std::collections::BTreeSet<String>) {
+    for tok in toks {
         match &tok.kind {
             lexer::Tok::Ident(text) => {
                 // Guard each insert with a membership check: repeated identifiers
@@ -262,27 +267,14 @@ pub fn scan_identifier_words(src: &str) -> Option<std::collections::BTreeSet<Str
                     }
                 }
             }
-            lexer::Tok::TripleStr(string) => {
-                // `{{expr}}` interpolation bodies are canonicalised as real
-                // expressions; collect their identifier-shaped words through
-                // the same splitter the canonicaliser reads them with.
-                let value = string.value();
-                for piece in ipe_syntax::interpolation_pieces(&value) {
-                    let ipe_syntax::Piece::Interp { range } = piece else {
-                        continue;
-                    };
-                    let body = value.get(range).unwrap_or_default();
-                    for word in body.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
-                        if !word.is_empty() {
-                            words.insert(word.to_owned());
-                        }
-                    }
+            lexer::Tok::TripleStr { bodies, .. } => {
+                for body in bodies {
+                    collect_identifier_words(body, words);
                 }
             }
             _ => {}
         }
     }
-    Some(words)
 }
 
 /// The bounds of the identifier-like run touching `byte`.
@@ -2998,10 +2990,10 @@ mod tests {
         match lexer::lex(src).ok()?.as_slice() {
             [
                 lexer::Token {
-                    kind: lexer::Tok::TripleStr(string),
+                    kind: lexer::Tok::TripleStr { triple, .. },
                     ..
                 },
-            ] => Some(string.value().into_owned()),
+            ] => Some(triple.value().into_owned()),
             _ => None,
         }
     }
@@ -3125,6 +3117,145 @@ mod tests {
         );
     }
 
+    /// The 1-based line and column of byte `at` in `src`, read from the text.
+    fn line_col(src: &str, at: usize) -> (u32, u32) {
+        let before = src.get(..at).unwrap_or_default();
+        let line = before.matches('\n').count() + 1;
+        let line_start = before.rfind('\n').map_or(0, |nl| nl + 1);
+        let col = before.get(line_start..).unwrap_or_default().chars().count() + 1;
+        (
+            u32::try_from(line).unwrap_or(0),
+            u32::try_from(col).unwrap_or(0),
+        )
+    }
+
+    /// The body tokens of the first `"""` string `src` lexes to.
+    fn body_tokens(src: &str) -> Vec<Vec<lexer::Token>> {
+        lexer::lex(src)
+            .ok()
+            .and_then(|toks| {
+                toks.into_iter().find_map(|tok| match tok.kind {
+                    lexer::Tok::TripleStr { bodies, .. } => Some(bodies),
+                    _ => None,
+                })
+            })
+            .unwrap_or_default()
+    }
+
+    /// A body across block lines is lexed over its own source bytes: each
+    /// token keeps the line and column it stands at.
+    #[test]
+    fn a_block_body_lexes_at_its_real_lines_and_columns() {
+        let src = "x =\n    \"\"\"\n    hi {{ f\n      y }}\n    \"\"\"";
+        let bodies = body_tokens(src);
+        let found: Vec<(u32, u32, &str)> = bodies
+            .iter()
+            .flatten()
+            .map(|t| {
+                let text = src.get(t.span.lo as usize..t.span.hi as usize);
+                (t.line, t.col, text.unwrap_or_default())
+            })
+            .collect();
+        let f = src.find("f\n").unwrap_or_default();
+        let y = src.find("y }}").unwrap_or_default();
+        let at = |at: usize, text| {
+            let (line, col) = line_col(src, at);
+            (line, col, text)
+        };
+        assert_eq!(found, [at(f, "f"), at(y, "y")]);
+    }
+
+    /// A body is code: an expression inside `{{…}}` parses into the
+    /// template, its names at their own spans.
+    #[test]
+    fn a_body_parses_as_an_expression_at_its_own_spans() {
+        let src = format!("{HDR}main =\n    \"\"\"\n    a {{{{ f\n      y }}}} b\n    \"\"\"\n");
+        let mut i = Interner::new();
+        let parsed = parse_module(&src, &mut i);
+        assert!(parsed.is_ok(), "{parsed:?}");
+        let Ok(m) = parsed else { return };
+        let template = m.values.iter().find_map(|v| match &v.value.body.value {
+            Expr_::Template(t) => Some(t),
+            _ => None,
+        });
+        assert!(template.is_some(), "no template in {m:?}");
+        let Some(template) = template else { return };
+        let y = src.find("y }}").unwrap_or_default();
+        let arg = template.parts().iter().find_map(|part| match part {
+            ipe_syntax::TemplatePart::Expr { expr: e, .. } => match &e.value {
+                Expr_::Call(_, args) => args.first().map(|a| a.span),
+                _ => None,
+            },
+            ipe_syntax::TemplatePart::Lit(_) => None,
+        });
+        assert_eq!(
+            arg.map(|s| s.lo as usize..s.hi as usize),
+            Some(y..y + 1),
+            "{template:?}"
+        );
+        let texts: Vec<&str> = template
+            .parts()
+            .iter()
+            .filter_map(|part| match part {
+                ipe_syntax::TemplatePart::Lit(text) => Some(text.value.as_str()),
+                ipe_syntax::TemplatePart::Expr { .. } => None,
+            })
+            .collect();
+        assert_eq!(texts, ["a ", " b"]);
+    }
+
+    /// The bytes of an interpolation body are code to completion; the text
+    /// around them stays string, and the regions still tile the source.
+    #[test]
+    fn a_body_reads_as_code_between_string_regions() {
+        let src = "x = \"\"\"a {{ Font.x {- c -} }} b\"\"\" ++ z";
+        let after = |needle: &str| {
+            u32::try_from(src.find(needle).unwrap_or_default() + needle.len()).unwrap_or(0)
+        };
+        assert_eq!(position_context(src, after("Font.")), PositionContext::Code);
+        assert_eq!(
+            position_context(src, after("{- ")),
+            PositionContext::BlockComment
+        );
+        assert_eq!(
+            position_context(src, after("\"\"\"a")),
+            PositionContext::String
+        );
+        assert_eq!(position_context(src, after("}} ")), PositionContext::String);
+        assert_eq!(position_context(src, after("++ ")), PositionContext::Code);
+        let regions: Vec<_> = lexical_regions(src).collect();
+        let mut end = 0;
+        for region in &regions {
+            assert_eq!(region.span.lo, end, "{regions:?}");
+            end = region.span.hi;
+        }
+        assert_eq!(end as usize, src.len(), "{regions:?}");
+    }
+
+    /// An isolate is admitted inside a literal only: one crossing an
+    /// interpolation body is refused, while one closed within the text, or
+    /// within a string inside the body, stands.
+    #[test]
+    fn an_isolate_crossing_a_body_is_refused() {
+        let crossing = "x = \"\"\"\u{2066}{{y}}\u{2069}\"\"\"";
+        assert!(
+            matches!(triple_refusal(crossing), Some((code, _)) if code == "IPE-P0072"),
+            "{:?}",
+            triple_refusal(crossing)
+        );
+        assert!(lexer::lex("x = \"\"\"\u{2066}a\u{2069}{{y}}\"\"\"").is_ok());
+        assert!(lexer::lex("x = \"\"\"{{ \"\u{2066}a\u{2069}\" }}\"\"\"").is_ok());
+    }
+
+    /// The identifier words of a body come from its tokens: a name in a body
+    /// is a word, a word in a body's string literal is not.
+    #[test]
+    fn identifier_words_read_body_tokens() {
+        let words = scan_identifier_words("x = \"\"\"{{ f.g \"lit\" }}\"\"\"").unwrap_or_default();
+        assert!(words.contains("f.g") && words.contains("f") && words.contains("g"));
+        assert!(!words.contains("lit"), "{words:?}");
+    }
+
     /// A block string in pattern position matches its block value.
     #[test]
     fn block_string_pattern_matches_its_value() {
@@ -3134,10 +3265,10 @@ mod tests {
         assert_eq!(err_code(&src), "OK");
     }
 
-    /// Locate the first `MultilineStr` node anywhere in an expression tree.
+    /// Locate the first `Template` node anywhere in an expression tree.
     fn find_multiline(e: &Expr) -> Option<&Expr> {
         match &e.value {
-            Expr_::MultilineStr { .. } => Some(e),
+            Expr_::Template(_) => Some(e),
             Expr_::Call(f, args) => {
                 find_multiline(f).or_else(|| args.iter().find_map(find_multiline))
             }
@@ -3149,7 +3280,7 @@ mod tests {
         }
     }
 
-    /// Span integrity: the `MultilineStr` node's span still covers the exact
+    /// Span integrity: the `Template` node's span still covers the exact
     /// `"""…"""` source token, including its `{{expr}}` interpolation, even for
     /// an indented block. The margin strip is a value-only transform applied
     /// later (in the canonicaliser); it never moves this node span, so a
@@ -3166,7 +3297,7 @@ mod tests {
             .values
             .iter()
             .find_map(|v| find_multiline(&v.value.body))
-            .expect("a MultilineStr node must be present");
+            .expect("a Template node must be present");
 
         let lo = node.span.lo as usize;
         let hi = node.span.hi as usize;
