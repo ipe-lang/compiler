@@ -1487,8 +1487,8 @@ where
 // keeping the emit path concrete (no `dyn`).
 
 /// A concrete-erased builder that, given the app's parsed mount base, produces
-/// the embedded web app's fully-layered axum `Router` (the same router the
-/// standalone `serve_web` binds). Boxed so `WebApp` stays non-generic — the box
+/// the embedded web app's fully-layered router beside its `Allow` oracle (the
+/// same served router the standalone `serve_web` binds). Boxed so `WebApp` stays non-generic — the box
 /// is over the *builder*, NOT the app's handlers: `init`/`update`/`view`/`subs`
 /// are concrete monomorphised closures captured inside, so the mounted app is
 /// erased-free at the handler level (§9: no `dyn` over the app / handlers).
@@ -1496,8 +1496,9 @@ where
 pub type MountBuilder = Box<
     dyn FnOnce(
             crate::encoding::MountBase,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = axum::Router> + Send>>
-        + Send,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::server::ServedRouter> + Send>,
+        > + Send,
 >;
 
 /// Opaque app handle returned by `Web.tea` / `Web.appRouted` / `Web.appWith`
