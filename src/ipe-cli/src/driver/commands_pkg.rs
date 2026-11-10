@@ -4,8 +4,8 @@ use super::{
     attribute_post_link_error, build_root_into, build_test_into,
     capabilities_including_served_widgets, create_source_root, emit_machine_error,
     emitted_bin_filename, entry_modules, frame_infer_error, home_to_source_map,
-    lowering_check_query, lowering_check_target, program_constructs_a_widget,
-    resolve_vendored_runtime_dir, run_build, runtime_context_for_message, working_dir,
+    lowering_check_query, lowering_check_target, program_constructs_a_widget, run_build,
+    runtime_context_for_message, working_dir,
 };
 use crate::cargo_step::{CargoOutput, CargoTarget, TestRunKey, Verbosity};
 use crate::output_dir::{
@@ -455,15 +455,17 @@ impl<'a> BundleAssembler<'a> {
     ) -> Result<EmittedCrate, CliError> {
         let options = BuildOptions {
             intent: self.profile.build_intent(),
-            ..BuildOptions::from_env()
+            ..BuildOptions::from_env()?
         };
-        let runtime_dir = resolve_vendored_runtime_dir(None, options.runtime_emit())?;
+        let runtime = crate::runtime_embed::RuntimeSource::resolve(
+            options.runtime_origin,
+            None,
+            crate::runtime_embed::RuntimeRemedy::EnvOnly,
+        )?;
         let host = delivery::HostIntent::WebView(webview);
         match &self.finish {
-            BundleFinish::Dev { .. } => {
-                build_root_into(self.held, out, &runtime_dir, &options, host)
-            }
-            BundleFinish::Release { judged, .. } => judged.emit(out, &runtime_dir, &options, host),
+            BundleFinish::Dev { .. } => build_root_into(self.held, out, &runtime, &options, host),
+            BundleFinish::Release { judged, .. } => judged.emit(out, &runtime, &options, host),
         }
     }
 
@@ -1553,7 +1555,7 @@ pub fn build_and_run_test_entry(
         target_dir: target.dir(),
         output: CargoOutput::Human(Verbosity::Progress),
         what: "the emitted test runner",
-        runtime: runtime_context_for_message(),
+        runtime: Some(runtime_context_for_message()),
     };
     let artifacts = build.artifact_dir();
     build.run_test_runner(&key)?;

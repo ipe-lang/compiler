@@ -58,6 +58,7 @@ mod project;
 mod render;
 mod route_grammar;
 mod runtime_features;
+pub use runtime_features::{TokioProjection, tokio_projection_table};
 mod rust_file;
 pub mod static_build;
 // The `update`-arm → transition-datum classifier: the compile-time half of the
@@ -493,15 +494,33 @@ impl CrateIdentity {
 /// compiler container, offline, CI) without a host-absolute path. Absent (the
 /// default) emits the byte-identical vendored-source project.
 ///
-/// The `root` field identifies the resolved runtime crate root. It is resolved
-/// by the driver (fail-closed — a missing or wrong-package root is a loud
-/// refusal) and retained for diagnostics and cache-key purposes; the emitter no
-/// longer embeds it in the manifest.
+/// The `content` field names the bytes of the runtime crate the dependency
+/// resolves to; it keys the emit settings and never reaches an emitted byte.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RuntimeDep {
-    /// The absolute, canonical runtime crate root (the directory holding the
-    /// runtime `Cargo.toml`), retained for diagnostics and cache keying.
-    pub root: std::path::PathBuf,
+    /// The content identity of the runtime crate the emitted project links.
+    pub content: RuntimeContentId,
+}
+
+/// The content identity of a runtime crate.
+///
+/// It is built only from a digest of the runtime's bytes and has no default,
+/// so a dependency always names the runtime it was emitted against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RuntimeContentId([u8; 16]);
+
+impl RuntimeContentId {
+    /// The identity of the runtime whose content digest is `bytes`.
+    #[must_use]
+    pub const fn from_digest_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// The digest bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
 }
 
 impl<'a> RustBackend<'a> {
@@ -574,7 +593,7 @@ impl<'a> RustBackend<'a> {
     /// any browser-admissible surface it reaches — one emit model, no vendored
     /// subtree on either target.
     #[must_use]
-    pub fn with_runtime_dep(mut self, runtime_dep: Option<RuntimeDep>) -> Self {
+    pub const fn with_runtime_dep(mut self, runtime_dep: Option<RuntimeDep>) -> Self {
         self.settings.runtime_dep = runtime_dep;
         self
     }
@@ -2280,14 +2299,13 @@ impl<'a> EmitCtx<'a> {
         //   2. any reactor SURFACE flag, even when reached by a reserved-type
         //      mention alone (e.g. a `Request`-typed handler sets `uses_server`
         //      without calling a server kernel). Every surface OR'd in here has
-        //      an augmenter that inserts, extends, or depends on the base `tokio`
-        //      dependency line, and a runtime module that parks on the reactor —
+        //      a runtime module that parks on the reactor —
         //      so it MUST link tokio and enter through its runtime. Folding them
         //      in makes this flag a true superset of the surface set, so the
-        //      `async_runtime_cargo_toml` restore always precedes the per-surface
-        //      tokio-line surgery, and a reactor program never gets a synchronous
-        //      `fn main`. Pure surfaces (crypto/url/config/csv/compression) are
-        //      excluded — their runtime resolves without the reactor, so forcing
+        //      projected `tokio` line is written for every reactor surface, and
+        //      a reactor program never gets a synchronous `fn main`. Pure
+        //      surfaces (crypto/url/config/csv/compression) are excluded — their
+        //      runtime resolves without the reactor, so forcing
         //      tokio would relink a subtree they shed.
         let uses_async_runtime = program.modules.iter().any(|m| m.uses_async_runtime)
             || uses_db

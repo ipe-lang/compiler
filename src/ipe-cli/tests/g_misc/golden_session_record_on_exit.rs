@@ -68,7 +68,7 @@ fn a_session_is_recorded_through_system_exit_and_debug_todo() {
     let options = ipe::BuildOptions {
         debugger: true,
         intent: ipe_backend_rust::BuildIntent::Development,
-        ..ipe::BuildOptions::from_env()
+        ..ipe::BuildOptions::from_env().expect("BuildOptions from env")
     };
     let built = ipe::build_golden_dir(&dir, &out, &runtime, &options);
     assert!(

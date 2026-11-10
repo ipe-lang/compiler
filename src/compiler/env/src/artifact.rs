@@ -4,15 +4,16 @@
 //! whose constructor is private to this module, or a typed [`ResolveError`]
 //! naming every location it tried. No resolver falls through to a `PATH` lookup,
 //! and an explicit override that does not hold the artifact is refused rather
-//! than silently replaced by a later candidate.
+//! than silently replaced by a later candidate. No resolver reads the current
+//! directory: a lookup starts at an anchor its caller names.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// The runtime-tree override variable.
-pub const RUNTIME_DIR_VAR: &str = "IPE_RUNTIME_DIR";
+/// The most directories a runtime lookup visits, its start included.
+pub const RUNTIME_LOOKUP_CEILING: usize = 64;
 
 /// Where a candidate artifact path came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,13 +62,6 @@ pub enum ResolveError {
         /// The offending path.
         path: PathBuf,
     },
-    /// A runtime-tree candidate exists but is not a directory.
-    NotADir {
-        /// The artifact name.
-        name: &'static str,
-        /// The offending path.
-        path: PathBuf,
-    },
     /// A candidate's metadata could not be read.
     Unreadable {
         /// The artifact name.
@@ -92,11 +86,6 @@ impl fmt::Display for ResolveError {
             Self::NotAFile { name, path } => write!(
                 f,
                 "artifact `{name}` at {} is not a regular file",
-                path.display()
-            ),
-            Self::NotADir { name, path } => write!(
-                f,
-                "artifact `{name}` at {} is not a directory",
                 path.display()
             ),
             Self::Unreadable { name, path, kind } => write!(
@@ -236,62 +225,29 @@ pub fn resolve_bin_from(
     Err(ResolveError::Missing { name, tried })
 }
 
-/// The runtime module-tree candidates under one ancestor directory, in order.
-fn runtime_candidates(dir: &Path) -> [PathBuf; 3] {
-    [
-        dir.join("src").join("runtime").join("rust").join("src"),
-        dir.join("ipe")
-            .join("runtime-rust")
-            .join("src")
-            .join("ipe_runtime"),
-        dir.join("runtime-rust").join("src").join("ipe_runtime"),
-    ]
-}
-
 /// The artifact name every runtime resolution reports.
 const RUNTIME_NAME: &str = "ipe runtime";
 
-/// Resolve the runtime module tree: the override when given, else the upward walk from `start`.
+/// The checkout's runtime module tree at or above `anchor`.
 ///
-/// A given override is authoritative: when it is not a directory the
-/// resolution fails, it never falls through to the walk. The walk checks, at
-/// `start` and each ancestor, `src/runtime/rust/src`, then the sibling
-/// `ipe/runtime-rust/src/ipe_runtime`, then `runtime-rust/src/ipe_runtime`.
-/// Directories are followed through symlinks (a linked checkout is a
-/// legitimate runtime tree).
+/// Visits at most [`RUNTIME_LOOKUP_CEILING`] directories, `anchor` first, and
+/// accepts one layout: `src/runtime/rust/src` whose parent holds `Cargo.toml`.
+/// Reads no variable and never the current directory, so only the anchor the
+/// caller names decides the tree.
 ///
 /// # Errors
 ///
-/// [`ResolveError::Missing`] when the override or every walk candidate is
-/// absent; [`ResolveError::NotADir`] when the override names a non-directory.
-pub fn resolve_runtime_src(
-    override_dir: Option<OsString>,
-    start: &Path,
-) -> Result<ProvenRuntime, ResolveError> {
-    if let Some(dir) = override_dir {
-        let path = PathBuf::from(dir);
-        return if path.is_dir() {
-            Ok(ProvenRuntime(path))
-        } else if path.exists() {
-            Err(ResolveError::NotADir {
-                name: RUNTIME_NAME,
-                path,
-            })
-        } else {
-            Err(ResolveError::Missing {
-                name: RUNTIME_NAME,
-                tried: vec![(Source::RuntimeEnv(RUNTIME_DIR_VAR), path)],
-            })
-        };
-    }
-    start
+/// [`ResolveError::Missing`] when no visited directory holds the tree.
+pub fn in_repo_runtime_src(anchor: &Path) -> Result<ProvenRuntime, ResolveError> {
+    anchor
         .ancestors()
-        .flat_map(runtime_candidates)
-        .find(|candidate| candidate.is_dir())
-        .map(ProvenRuntime)
+        .take(RUNTIME_LOOKUP_CEILING)
+        .map(|dir| dir.join("src").join("runtime").join("rust"))
+        .find(|krate| krate.join("Cargo.toml").is_file() && krate.join("src").is_dir())
+        .map(|krate| ProvenRuntime(krate.join("src")))
         .ok_or_else(|| ResolveError::Missing {
             name: RUNTIME_NAME,
-            tried: vec![(Source::AncestorWalk, start.to_path_buf())],
+            tried: vec![(Source::AncestorWalk, anchor.to_path_buf())],
         })
 }
 
@@ -307,46 +263,59 @@ mod tests {
         dir
     }
 
-    #[test]
-    fn a_missing_override_is_refused_not_walked_past() {
-        let root = scratch("override");
-        std::fs::create_dir_all(root.join("src/runtime/rust/src")).unwrap();
-        let missing = root.join("absent");
-        let got = resolve_runtime_src(Some(missing.clone().into_os_string()), &root);
-        assert_eq!(
-            got,
-            Err(ResolveError::Missing {
-                name: RUNTIME_NAME,
-                tried: vec![(Source::RuntimeEnv(RUNTIME_DIR_VAR), missing)],
-            })
-        );
-    }
-
-    #[test]
-    fn a_file_override_is_not_a_dir() {
-        let root = scratch("override-file");
-        let file = root.join("f");
-        std::fs::write(&file, b"").unwrap();
-        let got = resolve_runtime_src(Some(file.clone().into_os_string()), &root);
-        assert_eq!(
-            got,
-            Err(ResolveError::NotADir {
-                name: RUNTIME_NAME,
-                path: file,
-            })
-        );
-    }
-
-    #[test]
-    fn the_walk_finds_the_in_repo_tree_from_a_descendant() {
-        let root = scratch("walk");
+    /// A checkout root holding the runtime crate (manifest and module tree).
+    fn checkout(tag: &str) -> (PathBuf, PathBuf) {
+        let root = scratch(tag);
         let tree = root.join("src/runtime/rust/src");
         std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(root.join("src/runtime/rust/Cargo.toml"), b"").unwrap();
+        (root, tree)
+    }
+
+    #[test]
+    fn the_in_repo_tree_is_found_from_a_descendant() {
+        let (root, tree) = checkout("walk");
         let deep = root.join("a/b");
         std::fs::create_dir_all(&deep).unwrap();
         assert_eq!(
-            resolve_runtime_src(None, &deep).map(ProvenRuntime::into_path_buf),
+            in_repo_runtime_src(&deep).map(ProvenRuntime::into_path_buf),
             Ok(tree)
         );
+    }
+
+    #[test]
+    fn a_tree_without_its_crate_manifest_is_not_taken() {
+        let root = scratch("no-manifest");
+        std::fs::create_dir_all(root.join("src/runtime/rust/src")).unwrap();
+        assert_eq!(
+            in_repo_runtime_src(&root),
+            Err(ResolveError::Missing {
+                name: RUNTIME_NAME,
+                tried: vec![(Source::AncestorWalk, root)],
+            })
+        );
+    }
+
+    /// The lookup visits the anchor and its next ancestors up to the ceiling:
+    /// a tree the last visited directory holds is found, one a directory
+    /// further up holds is not.
+    #[test]
+    fn the_lookup_stops_at_the_ceiling() {
+        let (root, tree) = checkout("ceiling");
+        let below = |levels: usize| {
+            let dir = (0..levels).fold(root.clone(), |dir, _| dir.join("d"));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        };
+        let last_visited = below(RUNTIME_LOOKUP_CEILING - 1);
+        let past_ceiling = below(RUNTIME_LOOKUP_CEILING);
+        assert_eq!(
+            in_repo_runtime_src(&last_visited).map(ProvenRuntime::into_path_buf),
+            Ok(tree)
+        );
+        assert!(matches!(
+            in_repo_runtime_src(&past_ceiling),
+            Err(ResolveError::Missing { .. })
+        ));
     }
 }

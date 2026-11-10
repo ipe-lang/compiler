@@ -1513,187 +1513,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "db")]
-    #[tokio::test]
-    async fn test_email_normalized_case_insensitive() {
-        let pool = match DbPool::connect("sqlite::memory:").await {
-            Ok(p) => p,
-            Err(_) => return, // in-memory connect can't realistically fail; skip if it does
-        };
-        // Register with mixed case + surrounding whitespace.
-        let id: IpeResult<String, i64> = auth_register(
-            pool.clone(),
-            "  Alice@Example.COM ".into(),
-            "hunter2!".into(),
-        )
-        .await;
-        let uid = match id {
-            IpeResult::Ok(i) => i,
-            IpeResult::Err(_) => 0,
-        };
-        assert!(uid > 0, "register with mixed-case email should succeed");
-        // Login with a DIFFERENT case must resolve to the SAME account.
-        let login: IpeResult<String, i64> =
-            auth_login(pool.clone(), "alice@example.com".into(), "hunter2!".into()).await;
-        assert!(
-            matches!(login, IpeResult::Ok(u) if u == uid),
-            "login must be case-insensitive"
-        );
-        // A case-variant re-register must hit the UNIQUE constraint (no dup account).
-        let dup: IpeResult<String, i64> =
-            auth_register(pool.clone(), "ALICE@example.com".into(), "hunter2!".into()).await;
-        assert!(
-            matches!(dup, IpeResult::Err(_)),
-            "case-variant must not create a duplicate account"
-        );
-    }
-
-    /// A pool over a fresh in-memory database whose `users` object is built by
-    /// `setup` before any kernel runs.
-    #[cfg(feature = "db")]
-    async fn pool_with(setup: &'static str) -> DbPool {
-        let pool = DbPool::connect("sqlite::memory:")
-            .await
-            .expect("in-memory connect");
-        sqlx::query(setup).execute(&pool).await.expect("setup");
-        pool
-    }
-
-    /// The database failure an auth kernel's error carries, with its message.
-    #[cfg(feature = "db")]
-    fn database_failure<T: std::fmt::Debug>(r: IpeResult<IpeError, T>) -> (IpeDbFailure, String) {
-        match r {
-            IpeResult::Err(IpeError::Error(_, info)) => match info.details {
-                IpeMaybe::Just(IpeErrorDetails::Database(f)) => (f, info.message),
-                other => panic!("no Database details ({other:?}): {}", info.message),
-            },
-            IpeResult::Ok(v) => panic!("accepted: {v:?}"),
-        }
-    }
-
-    /// A duplicate registration is `Database UniqueViolation` with the fixed
-    /// message, never the driver's text.
-    #[cfg(feature = "db")]
-    #[tokio::test]
-    async fn register_duplicate_is_classified_unique_violation() {
-        let pool = DbPool::connect("sqlite::memory:")
-            .await
-            .expect("in-memory connect");
-        let first: IpeResult<IpeError, i64> =
-            auth_register(pool.clone(), "dup@example.com".into(), "hunter2!".into()).await;
-        assert!(
-            matches!(first, IpeResult::Ok(_)),
-            "first register: {first:?}"
-        );
-        let (failure, message) = database_failure(
-            auth_register::<IpeError>(pool, "dup@example.com".into(), "hunter2!".into()).await,
-        );
-        assert_eq!(failure, IpeDbFailure::UniqueViolation);
-        assert_eq!(message, "auth.register: email already registered");
-    }
-
-    /// Any other failed register insert is classified, and its message names
-    /// neither the table nor the column the driver's message names.
-    #[cfg(feature = "db")]
-    #[tokio::test]
-    async fn register_driver_failure_is_classified_without_driver_text() {
-        let pool = pool_with(
-            "CREATE TABLE users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                email TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                role TEXT NOT NULL DEFAULT 'user',
-                created_at BIGINT NOT NULL,
-                nickname TEXT NOT NULL
-            )",
-        )
-        .await;
-        let (failure, message) = database_failure(
-            auth_register::<IpeError>(pool, "n@example.com".into(), "hunter2!".into()).await,
-        );
-        assert_eq!(failure, IpeDbFailure::NotNullViolation);
-        assert!(message.starts_with("auth.register: db: "), "{message}");
-        assert!(!message.contains("nickname"), "{message}");
-        assert!(!message.contains("users"), "{message}");
-    }
-
-    /// A failed login query is classified without the driver's text.
-    #[cfg(feature = "db")]
-    #[tokio::test]
-    async fn login_driver_failure_is_classified_without_driver_text() {
-        let pool = pool_with("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)").await;
-        let (failure, message) = database_failure(
-            auth_login::<IpeError>(pool, "x@example.com".into(), "hunter2!".into()).await,
-        );
-        assert_eq!(failure, IpeDbFailure::InvalidStatement);
-        assert!(message.starts_with("auth.login: db: "), "{message}");
-        assert!(!message.contains("password_hash"), "{message}");
-        assert!(!message.contains("no such column"), "{message}");
-    }
-
-    /// A failed role update is classified without the driver's text.
-    #[cfg(feature = "db")]
-    #[tokio::test]
-    async fn set_role_driver_failure_is_classified_without_driver_text() {
-        let pool = pool_with("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)").await;
-        let (failure, message) =
-            database_failure(auth_set_role::<IpeError>(pool, 1, "admin".into()).await);
-        assert_eq!(failure, IpeDbFailure::InvalidStatement);
-        assert!(message.starts_with("auth.setRole: db: "), "{message}");
-        assert!(!message.contains("role"), "{message}");
-        assert!(!message.contains("no such column"), "{message}");
-    }
-
-    /// A failed `users` schema statement is classified without the driver's
-    /// text: an index already named `users` refuses the table.
-    #[cfg(feature = "db")]
-    #[tokio::test]
-    async fn users_schema_failure_is_classified_without_driver_text() {
-        let pool = pool_with("CREATE TABLE t (x INTEGER)").await;
-        sqlx::query("CREATE INDEX users ON t (x)")
-            .execute(&pool)
-            .await
-            .expect("index");
-        let (failure, message) =
-            database_failure(auth_set_role::<IpeError>(pool, 1, "admin".into()).await);
-        assert_eq!(failure, IpeDbFailure::InvalidStatement);
-        assert!(message.starts_with("auth.users schema: db: "), "{message}");
-        assert!(!message.contains("index"), "{message}");
-    }
-
-    #[cfg(feature = "db")]
-    #[tokio::test]
-    async fn test_register_login_flow() {
-        let pool = DbPool::connect("sqlite::memory:").await.expect("connect");
-        // register
-        let id: IpeResult<String, i64> =
-            auth_register(pool.clone(), "alice@example.com".into(), "hunter2!".into()).await;
-        let user_id = match id {
-            IpeResult::Ok(i) => i,
-            IpeResult::Err(e) => panic!("{}", e),
-        };
-        assert!(user_id > 0);
-        // login correct
-        let login_ok: IpeResult<String, i64> =
-            auth_login(pool.clone(), "alice@example.com".into(), "hunter2!".into()).await;
-        assert!(matches!(login_ok, IpeResult::Ok(uid) if uid == user_id));
-        // login wrong password
-        let login_bad: IpeResult<String, i64> =
-            auth_login(pool.clone(), "alice@example.com".into(), "wrong".into()).await;
-        assert!(matches!(login_bad, IpeResult::Err(_)));
-        // login non-existent email
-        let login_noexist: IpeResult<String, i64> =
-            auth_login(pool.clone(), "nobody@example.com".into(), "anything".into()).await;
-        assert!(matches!(login_noexist, IpeResult::Err(_)));
-        // duplicate register
-        let dup: IpeResult<String, i64> =
-            auth_register(pool.clone(), "alice@example.com".into(), "hunter2!".into()).await;
-        assert!(matches!(dup, IpeResult::Err(_)));
-        // set role
-        let role: IpeResult<String, ()> = auth_set_role(pool, user_id, "admin".into()).await;
-        assert!(matches!(role, IpeResult::Ok(())));
-    }
-
     #[test]
     fn test_sign_token_negative_expiry_rejected() {
         // A negative TTL must NOT mint a token (it would otherwise underflow
@@ -1708,140 +1527,6 @@ mod tests {
         let secret = "a-test-secret-of-32-bytes-padding".to_string();
         let token2: IpeResult<String, String> = auth_sign_token(secret, HashMap::new(), i64::MIN);
         assert!(matches!(token2, IpeResult::Err(_)));
-    }
-
-    #[cfg(feature = "db")]
-    #[tokio::test]
-    async fn test_login_id_decode_failure_yields_err_not_user_zero() {
-        let pool = match DbPool::connect("sqlite::memory:").await {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-        // Pre-create the users table with a TEXT id so a row's id column will
-        // FAIL to decode into i64. ensure_users_schema uses CREATE TABLE IF NOT
-        // EXISTS, so it leaves this schema in place.
-        sqlx::query(
-            "CREATE TABLE users (
-                id TEXT PRIMARY KEY,
-                email TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                role TEXT NOT NULL DEFAULT 'user',
-                created_at BIGINT NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create table");
-        sqlx::query(
-            "INSERT INTO users (id, email, password_hash, role, created_at) \
-             VALUES ('not-a-number', 'badid@example.com', 'x', 'user', 0)",
-        )
-        .execute(&pool)
-        .await
-        .expect("insert");
-        // The matched-email branch reads id first; a decode failure must fail
-        // closed (Err), NOT silently authenticate as user 0.
-        let login: IpeResult<String, i64> =
-            auth_login(pool, "badid@example.com".into(), "whatever".into()).await;
-        assert!(
-            matches!(login, IpeResult::Err(_)),
-            "a failed id-column decode must yield Err, never Ok(0)"
-        );
-    }
-
-    /// A login against a stored hash whose cost is above the ceiling, or that
-    /// is not a bcrypt hash at all, is refused as invalid credentials without
-    /// running the KDF at that cost.
-    #[cfg(feature = "db")]
-    #[tokio::test]
-    async fn login_refuses_a_stored_hash_above_the_cost_ceiling() {
-        let pool = match DbPool::connect("sqlite::memory:").await {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-        let IpeResult::Ok(()) = ensure_users_schema::<IpeError>(&pool).await else {
-            panic!("users schema");
-        };
-        let at_floor = bcrypt::hash("hunter2!", BCRYPT_COST_MIN).expect("hash");
-        let over_ceiling = at_floor.replacen("$04$", "$31$", 1);
-        assert_ne!(over_ceiling, at_floor, "the fixture raised the cost field");
-        // A cost-12 prefix whose digest is one character short: bcrypt refuses
-        // it before hashing.
-        let at_default = at_floor.replacen("$04$", "$12$", 1);
-        let (malformed, _) = at_default
-            .split_at_checked(at_default.len() - 1)
-            .expect("a full hash");
-        assert!(bcrypt::verify("hunter2!", malformed).is_err());
-        let at_register = bcrypt::hash("hunter2!", REGISTER_COST.get()).expect("hash");
-        for (email, stored) in [
-            ("control@example.com", at_register.as_str()),
-            ("floor@example.com", at_floor.as_str()),
-            ("over@example.com", over_ceiling.as_str()),
-            ("malformed@example.com", malformed),
-            ("plain@example.com", "hunter2!"),
-        ] {
-            sqlx::query(
-                "INSERT INTO users (email, password_hash, role, created_at) \
-                 VALUES (?, ?, 'user', 0)",
-            )
-            .bind(email)
-            .bind(stored)
-            .execute(&pool)
-            .await
-            .expect("insert");
-        }
-        let login = |email: &str| {
-            auth_login::<IpeError>(pool.clone(), email.to_owned(), "hunter2!".to_owned())
-        };
-        assert!(
-            matches!(login("control@example.com").await, IpeResult::Ok(_)),
-            "the control: a hash at the registration cost logs in"
-        );
-        assert!(
-            matches!(login("floor@example.com").await, IpeResult::Err(_)),
-            "a hash inside the ceiling but below the registration cost never logs in"
-        );
-        let started = std::time::Instant::now();
-        let over = login("over@example.com").await;
-        let elapsed = started.elapsed();
-        assert!(
-            matches!(
-                &over,
-                IpeResult::Err(IpeError::Error(_, info))
-                    if info.message == "auth.login: invalid credentials"
-            ),
-            "{over:?}"
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(120),
-            "no cost-31 KDF ran: {elapsed:?}"
-        );
-        let started = std::time::Instant::now();
-        assert!(matches!(
-            bcrypt::verify("hunter2!", dummy_bcrypt_hash()),
-            Ok(false)
-        ));
-        let decoy_kdf = started.elapsed();
-        let started = std::time::Instant::now();
-        let malformed = login("malformed@example.com").await;
-        let elapsed = started.elapsed();
-        assert!(
-            matches!(
-                &malformed,
-                IpeResult::Err(IpeError::Error(_, info))
-                    if info.message == "auth.login: invalid credentials"
-            ),
-            "{malformed:?}"
-        );
-        assert!(
-            elapsed >= decoy_kdf / 10,
-            "a stored hash bcrypt refuses before hashing costs a decoy KDF: \
-             {elapsed:?} vs {decoy_kdf:?}"
-        );
-        assert!(
-            matches!(login("plain@example.com").await, IpeResult::Err(_)),
-            "a plaintext stored password never logs in"
-        );
     }
 
     // ── Absolute lifetime cap (P1) ────────────────────────────────────────────
@@ -2869,29 +2554,6 @@ mod tests {
         assert!(LoginHash::parse(&at_register).is_ok());
     }
 
-    /// Both hashes the login path can run bcrypt on are `LoginHash`es: the
-    /// decoy, its fallback, and the hash `register` writes.
-    #[cfg(feature = "db")]
-    #[tokio::test]
-    async fn a_registered_hash_is_a_login_hash() {
-        assert!(LoginHash::parse(dummy_bcrypt_hash()).is_ok());
-        assert!(LoginHash::parse(DECOY_FALLBACK_HASH).is_ok());
-        let pool = DbPool::connect("sqlite::memory:")
-            .await
-            .expect("in-memory connect");
-        let registered: IpeResult<IpeError, i64> =
-            auth_register(pool.clone(), "login@example.com".into(), "hunter2!".into()).await;
-        assert!(matches!(registered, IpeResult::Ok(_)), "{registered:?}");
-        let stored: String = sqlx::query_scalar("SELECT password_hash FROM users")
-            .fetch_one(&pool)
-            .await
-            .expect("the registered row");
-        assert!(
-            LoginHash::parse(&stored).is_ok(),
-            "the writer's hash is the reader's type: {stored}"
-        );
-    }
-
     /// An unknown email and a known email whose stored hash is at a foreign
     /// cost take the same path, the decoy; only a `LoginHash` is verified.
     #[cfg(feature = "db")]
@@ -2916,55 +2578,6 @@ mod tests {
             "ipe-login-timing-defence",
             dummy_bcrypt_hash()
         ));
-    }
-
-    /// A row whose stored hash is at a cost other than the registration cost
-    /// never logs in, right password or not; rehashing at the registration
-    /// cost is what readmits it.
-    #[cfg(feature = "db")]
-    #[tokio::test]
-    async fn a_stored_hash_at_another_cost_never_logs_in() {
-        let floor = floor_hash();
-        let pool = DbPool::connect("sqlite::memory:")
-            .await
-            .expect("in-memory connect");
-        let schema = ensure_users_schema::<IpeError>(&pool).await;
-        assert!(matches!(schema, IpeResult::Ok(())), "users schema");
-        sqlx::query(
-            "INSERT INTO users (email, password_hash, role, created_at) \
-             VALUES ('floor@example.com', ?, 'user', 0)",
-        )
-        .bind(&floor)
-        .execute(&pool)
-        .await
-        .expect("insert");
-        let login = |password: &str| {
-            auth_login::<IpeError>(
-                pool.clone(),
-                "floor@example.com".to_owned(),
-                password.to_owned(),
-            )
-        };
-        let right = login("hunter2!").await;
-        assert!(
-            matches!(
-                &right,
-                IpeResult::Err(IpeError::Error(_, info))
-                    if info.message == "auth.login: invalid credentials"
-            ),
-            "the right password at a foreign cost: {right:?}"
-        );
-        let at_register = bcrypt::hash("hunter2!", REGISTER_COST.get()).expect("hash");
-        sqlx::query("UPDATE users SET password_hash = ? WHERE email = 'floor@example.com'")
-            .bind(&at_register)
-            .execute(&pool)
-            .await
-            .expect("rehash");
-        assert!(
-            matches!(login("hunter2!").await, IpeResult::Ok(_)),
-            "the same account logs in once rehashed at the registration cost"
-        );
-        assert!(matches!(login("wrong-pass").await, IpeResult::Err(_)));
     }
 
     // ── Armed revocation gate ─────────────────────────────────────────────────
@@ -3903,5 +3516,370 @@ fn caller() -> u8 { decoy() }
             }
         }
         assert!(scanned > 3, "the scan walked the runtime sources");
+    }
+
+    /// The tests that open a pool: SQLite pools, so compiled exactly when `Db` is one.
+    #[cfg(all(feature = "db", not(feature = "db-postgres")))]
+    mod sqlite_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_email_normalized_case_insensitive() {
+            let pool = crate::test_db::memory().await;
+            // Register with mixed case + surrounding whitespace.
+            let id: IpeResult<String, i64> = auth_register(
+                pool.clone(),
+                "  Alice@Example.COM ".into(),
+                "hunter2!".into(),
+            )
+            .await;
+            let uid = match id {
+                IpeResult::Ok(i) => i,
+                IpeResult::Err(_) => 0,
+            };
+            assert!(uid > 0, "register with mixed-case email should succeed");
+            // Login with a DIFFERENT case must resolve to the SAME account.
+            let login: IpeResult<String, i64> =
+                auth_login(pool.clone(), "alice@example.com".into(), "hunter2!".into()).await;
+            assert!(
+                matches!(login, IpeResult::Ok(u) if u == uid),
+                "login must be case-insensitive"
+            );
+            // A case-variant re-register must hit the UNIQUE constraint (no dup account).
+            let dup: IpeResult<String, i64> =
+                auth_register(pool.clone(), "ALICE@example.com".into(), "hunter2!".into()).await;
+            assert!(
+                matches!(dup, IpeResult::Err(_)),
+                "case-variant must not create a duplicate account"
+            );
+        }
+
+        /// A pool over a fresh in-memory database whose `users` object is built by
+        /// `setup` before any kernel runs.
+        async fn pool_with(setup: &'static str) -> DbPool {
+            let pool = crate::test_db::memory().await;
+            sqlx::query(setup).execute(&pool).await.expect("setup");
+            pool
+        }
+
+        /// The database failure an auth kernel's error carries, with its message.
+        fn database_failure<T: std::fmt::Debug>(
+            r: IpeResult<IpeError, T>,
+        ) -> (IpeDbFailure, String) {
+            match r {
+                IpeResult::Err(IpeError::Error(_, info)) => match info.details {
+                    IpeMaybe::Just(IpeErrorDetails::Database(f)) => (f, info.message),
+                    other => panic!("no Database details ({other:?}): {}", info.message),
+                },
+                IpeResult::Ok(v) => panic!("accepted: {v:?}"),
+            }
+        }
+
+        /// A duplicate registration is `Database UniqueViolation` with the fixed
+        /// message, never the driver's text.
+        #[tokio::test]
+        async fn register_duplicate_is_classified_unique_violation() {
+            let pool = crate::test_db::memory().await;
+            let first: IpeResult<IpeError, i64> =
+                auth_register(pool.clone(), "dup@example.com".into(), "hunter2!".into()).await;
+            assert!(
+                matches!(first, IpeResult::Ok(_)),
+                "first register: {first:?}"
+            );
+            let (failure, message) = database_failure(
+                auth_register::<IpeError>(pool, "dup@example.com".into(), "hunter2!".into()).await,
+            );
+            assert_eq!(failure, IpeDbFailure::UniqueViolation);
+            assert_eq!(message, "auth.register: email already registered");
+        }
+
+        /// Any other failed register insert is classified, and its message names
+        /// neither the table nor the column the driver's message names.
+        #[tokio::test]
+        async fn register_driver_failure_is_classified_without_driver_text() {
+            let pool = pool_with(
+                "CREATE TABLE users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
+                created_at BIGINT NOT NULL,
+                nickname TEXT NOT NULL
+            )",
+            )
+            .await;
+            let (failure, message) = database_failure(
+                auth_register::<IpeError>(pool, "n@example.com".into(), "hunter2!".into()).await,
+            );
+            assert_eq!(failure, IpeDbFailure::NotNullViolation);
+            assert!(message.starts_with("auth.register: db: "), "{message}");
+            assert!(!message.contains("nickname"), "{message}");
+            assert!(!message.contains("users"), "{message}");
+        }
+
+        /// A failed login query is classified without the driver's text.
+        #[tokio::test]
+        async fn login_driver_failure_is_classified_without_driver_text() {
+            let pool = pool_with("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)").await;
+            let (failure, message) = database_failure(
+                auth_login::<IpeError>(pool, "x@example.com".into(), "hunter2!".into()).await,
+            );
+            assert_eq!(failure, IpeDbFailure::InvalidStatement);
+            assert!(message.starts_with("auth.login: db: "), "{message}");
+            assert!(!message.contains("password_hash"), "{message}");
+            assert!(!message.contains("no such column"), "{message}");
+        }
+
+        /// A failed role update is classified without the driver's text.
+        #[tokio::test]
+        async fn set_role_driver_failure_is_classified_without_driver_text() {
+            let pool = pool_with("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)").await;
+            let (failure, message) =
+                database_failure(auth_set_role::<IpeError>(pool, 1, "admin".into()).await);
+            assert_eq!(failure, IpeDbFailure::InvalidStatement);
+            assert!(message.starts_with("auth.setRole: db: "), "{message}");
+            assert!(!message.contains("role"), "{message}");
+            assert!(!message.contains("no such column"), "{message}");
+        }
+
+        /// A failed `users` schema statement is classified without the driver's
+        /// text: an index already named `users` refuses the table.
+        #[tokio::test]
+        async fn users_schema_failure_is_classified_without_driver_text() {
+            let pool = pool_with("CREATE TABLE t (x INTEGER)").await;
+            sqlx::query("CREATE INDEX users ON t (x)")
+                .execute(&pool)
+                .await
+                .expect("index");
+            let (failure, message) =
+                database_failure(auth_set_role::<IpeError>(pool, 1, "admin".into()).await);
+            assert_eq!(failure, IpeDbFailure::InvalidStatement);
+            assert!(message.starts_with("auth.users schema: db: "), "{message}");
+            assert!(!message.contains("index"), "{message}");
+        }
+
+        #[tokio::test]
+        async fn test_register_login_flow() {
+            let pool = crate::test_db::memory().await;
+            // register
+            let id: IpeResult<String, i64> =
+                auth_register(pool.clone(), "alice@example.com".into(), "hunter2!".into()).await;
+            let user_id = match id {
+                IpeResult::Ok(i) => i,
+                IpeResult::Err(e) => panic!("{}", e),
+            };
+            assert!(user_id > 0);
+            // login correct
+            let login_ok: IpeResult<String, i64> =
+                auth_login(pool.clone(), "alice@example.com".into(), "hunter2!".into()).await;
+            assert!(matches!(login_ok, IpeResult::Ok(uid) if uid == user_id));
+            // login wrong password
+            let login_bad: IpeResult<String, i64> =
+                auth_login(pool.clone(), "alice@example.com".into(), "wrong".into()).await;
+            assert!(matches!(login_bad, IpeResult::Err(_)));
+            // login non-existent email
+            let login_noexist: IpeResult<String, i64> =
+                auth_login(pool.clone(), "nobody@example.com".into(), "anything".into()).await;
+            assert!(matches!(login_noexist, IpeResult::Err(_)));
+            // duplicate register
+            let dup: IpeResult<String, i64> =
+                auth_register(pool.clone(), "alice@example.com".into(), "hunter2!".into()).await;
+            assert!(matches!(dup, IpeResult::Err(_)));
+            // set role
+            let role: IpeResult<String, ()> = auth_set_role(pool, user_id, "admin".into()).await;
+            assert!(matches!(role, IpeResult::Ok(())));
+        }
+
+        #[tokio::test]
+        async fn test_login_id_decode_failure_yields_err_not_user_zero() {
+            let pool = crate::test_db::memory().await;
+            // Pre-create the users table with a TEXT id so a row's id column will
+            // FAIL to decode into i64. ensure_users_schema uses CREATE TABLE IF NOT
+            // EXISTS, so it leaves this schema in place.
+            sqlx::query(
+                "CREATE TABLE users (
+                id TEXT PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
+                created_at BIGINT NOT NULL
+            )",
+            )
+            .execute(&pool)
+            .await
+            .expect("create table");
+            sqlx::query(
+                "INSERT INTO users (id, email, password_hash, role, created_at) \
+             VALUES ('not-a-number', 'badid@example.com', 'x', 'user', 0)",
+            )
+            .execute(&pool)
+            .await
+            .expect("insert");
+            // The matched-email branch reads id first; a decode failure must fail
+            // closed (Err), NOT silently authenticate as user 0.
+            let login: IpeResult<String, i64> =
+                auth_login(pool, "badid@example.com".into(), "whatever".into()).await;
+            assert!(
+                matches!(login, IpeResult::Err(_)),
+                "a failed id-column decode must yield Err, never Ok(0)"
+            );
+        }
+
+        /// A login against a stored hash whose cost is above the ceiling, or that
+        /// is not a bcrypt hash at all, is refused as invalid credentials without
+        /// running the KDF at that cost.
+        #[tokio::test]
+        async fn login_refuses_a_stored_hash_above_the_cost_ceiling() {
+            let pool = crate::test_db::memory().await;
+            let IpeResult::Ok(()) = ensure_users_schema::<IpeError>(&pool).await else {
+                panic!("users schema");
+            };
+            let at_floor = bcrypt::hash("hunter2!", BCRYPT_COST_MIN).expect("hash");
+            let over_ceiling = at_floor.replacen("$04$", "$31$", 1);
+            assert_ne!(over_ceiling, at_floor, "the fixture raised the cost field");
+            // A cost-12 prefix whose digest is one character short: bcrypt refuses
+            // it before hashing.
+            let at_default = at_floor.replacen("$04$", "$12$", 1);
+            let (malformed, _) = at_default
+                .split_at_checked(at_default.len() - 1)
+                .expect("a full hash");
+            assert!(bcrypt::verify("hunter2!", malformed).is_err());
+            let at_register = bcrypt::hash("hunter2!", REGISTER_COST.get()).expect("hash");
+            for (email, stored) in [
+                ("control@example.com", at_register.as_str()),
+                ("floor@example.com", at_floor.as_str()),
+                ("over@example.com", over_ceiling.as_str()),
+                ("malformed@example.com", malformed),
+                ("plain@example.com", "hunter2!"),
+            ] {
+                sqlx::query(
+                    "INSERT INTO users (email, password_hash, role, created_at) \
+                 VALUES (?, ?, 'user', 0)",
+                )
+                .bind(email)
+                .bind(stored)
+                .execute(&pool)
+                .await
+                .expect("insert");
+            }
+            let login = |email: &str| {
+                auth_login::<IpeError>(pool.clone(), email.to_owned(), "hunter2!".to_owned())
+            };
+            assert!(
+                matches!(login("control@example.com").await, IpeResult::Ok(_)),
+                "the control: a hash at the registration cost logs in"
+            );
+            assert!(
+                matches!(login("floor@example.com").await, IpeResult::Err(_)),
+                "a hash inside the ceiling but below the registration cost never logs in"
+            );
+            let started = std::time::Instant::now();
+            let over = login("over@example.com").await;
+            let elapsed = started.elapsed();
+            assert!(
+                matches!(
+                    &over,
+                    IpeResult::Err(IpeError::Error(_, info))
+                        if info.message == "auth.login: invalid credentials"
+                ),
+                "{over:?}"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(120),
+                "no cost-31 KDF ran: {elapsed:?}"
+            );
+            let started = std::time::Instant::now();
+            assert!(matches!(
+                bcrypt::verify("hunter2!", dummy_bcrypt_hash()),
+                Ok(false)
+            ));
+            let decoy_kdf = started.elapsed();
+            let started = std::time::Instant::now();
+            let malformed = login("malformed@example.com").await;
+            let elapsed = started.elapsed();
+            assert!(
+                matches!(
+                    &malformed,
+                    IpeResult::Err(IpeError::Error(_, info))
+                        if info.message == "auth.login: invalid credentials"
+                ),
+                "{malformed:?}"
+            );
+            assert!(
+                elapsed >= decoy_kdf / 10,
+                "a stored hash bcrypt refuses before hashing costs a decoy KDF: \
+             {elapsed:?} vs {decoy_kdf:?}"
+            );
+            assert!(
+                matches!(login("plain@example.com").await, IpeResult::Err(_)),
+                "a plaintext stored password never logs in"
+            );
+        }
+
+        /// Both hashes the login path can run bcrypt on are `LoginHash`es: the
+        /// decoy, its fallback, and the hash `register` writes.
+        #[tokio::test]
+        async fn a_registered_hash_is_a_login_hash() {
+            assert!(LoginHash::parse(dummy_bcrypt_hash()).is_ok());
+            assert!(LoginHash::parse(DECOY_FALLBACK_HASH).is_ok());
+            let pool = crate::test_db::memory().await;
+            let registered: IpeResult<IpeError, i64> =
+                auth_register(pool.clone(), "login@example.com".into(), "hunter2!".into()).await;
+            assert!(matches!(registered, IpeResult::Ok(_)), "{registered:?}");
+            let stored: String = sqlx::query_scalar("SELECT password_hash FROM users")
+                .fetch_one(&pool)
+                .await
+                .expect("the registered row");
+            assert!(
+                LoginHash::parse(&stored).is_ok(),
+                "the writer's hash is the reader's type: {stored}"
+            );
+        }
+
+        /// A row whose stored hash is at a cost other than the registration cost
+        /// never logs in, right password or not; rehashing at the registration
+        /// cost is what readmits it.
+        #[tokio::test]
+        async fn a_stored_hash_at_another_cost_never_logs_in() {
+            let floor = floor_hash();
+            let pool = crate::test_db::memory().await;
+            let schema = ensure_users_schema::<IpeError>(&pool).await;
+            assert!(matches!(schema, IpeResult::Ok(())), "users schema");
+            sqlx::query(
+                "INSERT INTO users (email, password_hash, role, created_at) \
+             VALUES ('floor@example.com', ?, 'user', 0)",
+            )
+            .bind(&floor)
+            .execute(&pool)
+            .await
+            .expect("insert");
+            let login = |password: &str| {
+                auth_login::<IpeError>(
+                    pool.clone(),
+                    "floor@example.com".to_owned(),
+                    password.to_owned(),
+                )
+            };
+            let right = login("hunter2!").await;
+            assert!(
+                matches!(
+                    &right,
+                    IpeResult::Err(IpeError::Error(_, info))
+                        if info.message == "auth.login: invalid credentials"
+                ),
+                "the right password at a foreign cost: {right:?}"
+            );
+            let at_register = bcrypt::hash("hunter2!", REGISTER_COST.get()).expect("hash");
+            sqlx::query("UPDATE users SET password_hash = ? WHERE email = 'floor@example.com'")
+                .bind(&at_register)
+                .execute(&pool)
+                .await
+                .expect("rehash");
+            assert!(
+                matches!(login("hunter2!").await, IpeResult::Ok(_)),
+                "the same account logs in once rehashed at the registration cost"
+            );
+            assert!(matches!(login("wrong-pass").await, IpeResult::Err(_)));
+        }
     }
 }

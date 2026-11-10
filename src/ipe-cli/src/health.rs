@@ -168,7 +168,7 @@ impl ConfigTarget {
     }
 
     /// Resolve the on-disk path for this target. `$IPE_HOME/config.toml` uses
-    /// the same [`runtime_embed::ipe_home`] resolution the runtime install uses;
+    /// the same [`runtime_embed::ipe_home`] resolution every Ipê data file uses;
     /// `~/.cargo/config.toml` honours `$CARGO_HOME`, else `~/.cargo`.
     ///
     /// # Errors
@@ -589,20 +589,27 @@ fn check_rust_toolchain() -> Vec<Check> {
     vec![rustc, cargo]
 }
 
-/// The runtime crate is resolvable (the install-resolution story): the embedded
-/// source materializes, an in-repo checkout is found, or `$IPE_RUNTIME_DIR`
-/// verifies. This drives the same [`runtime_embed::resolve`] a real build uses.
+/// The runtime source a developer build resolves: the embedded copy, or the
+/// override `$IPE_RUNTIME_DIR` names once it verifies.
+///
+/// This drives the same [`runtime_embed::RuntimeSource::resolve`] a real build
+/// uses; a refusal carries its own remedy.
 fn check_runtime() -> Check {
-    match runtime_embed::resolve() {
-        Ok(resolved) => Check {
+    runtime_check(runtime_embed::RuntimeSource::resolve(
+        runtime_embed::RuntimeOrigin::Developer,
+        None,
+        runtime_embed::RuntimeRemedy::EnvOnly,
+    ))
+}
+
+/// The health check reporting `resolved`, a developer build's runtime source.
+fn runtime_check(resolved: Result<runtime_embed::RuntimeSource, CliError>) -> Check {
+    match resolved {
+        Ok(source) => Check {
             group: Group::Toolchain,
             id: "runtime",
             status: Status::Ok,
-            detail: format!(
-                "runtime crate resolvable ({} at {})",
-                resolved.version(),
-                resolved.root().display()
-            ),
+            detail: format!("runtime crate resolvable ({})", source.describe()),
             suggestion: None,
             fix: None,
         },
@@ -611,10 +618,7 @@ fn check_runtime() -> Check {
             id: "runtime",
             status: Status::Missing,
             detail: format!("runtime crate could not be resolved: {e}"),
-            suggestion: Some(
-                "set IPE_HOME to a writable directory so the embedded runtime can materialize"
-                    .to_owned(),
-            ),
+            suggestion: None,
             fix: None,
         },
     }
@@ -1927,6 +1931,22 @@ fn write_atomic_config(path: &Path, contents: &str) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A runtime root of another version reports the runtime missing, naming
+    /// both versions; the embedded copy reports it resolvable.
+    #[test]
+    fn a_runtime_of_another_version_is_reported_missing() {
+        let mismatch = runtime_check(Err(CliError::RuntimeVersionMismatch {
+            path: PathBuf::from("/runtime"),
+            found: "0.0.1".to_owned(),
+            expected: runtime_embed::COMPILER_VERSION.to_owned(),
+            remedy: runtime_embed::RuntimeRemedy::EnvOnly,
+        }));
+        assert_eq!(mismatch.status, Status::Missing);
+        assert!(mismatch.detail.contains("0.0.1"), "{}", mismatch.detail);
+        let embedded = runtime_check(Ok(runtime_embed::RuntimeSource::Embedded));
+        assert_eq!(embedded.status, Status::Ok);
+    }
 
     #[test]
     fn exe_name_gains_exe_only_under_windows() {

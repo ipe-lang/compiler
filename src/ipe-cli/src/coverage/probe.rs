@@ -595,7 +595,7 @@ mod root_tests {
                 manifest_path: &manifest_path,
                 host: crate::delivery::HostIntent::Served,
             },
-            &crate::driver::BuildOptions::from_env(),
+            &crate::driver::BuildOptions::from_env().expect("BuildOptions from env"),
             crate::runtime_embed::BundleRole::Out,
         )
         .crate_name

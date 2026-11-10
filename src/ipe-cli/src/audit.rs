@@ -4357,10 +4357,7 @@ mod tests {
         const AMBIENT_READS: &[&str] = &[
             "current_dir",
             "from_env",
-            "resolve_runtime",
-            "resolve_runtime_src",
-            "resolve_vendored_runtime_dir",
-            "runtime_dep_from_env",
+            "in_repo_runtime_src",
             "var",
             "var_os",
             "vars",
@@ -4378,8 +4375,10 @@ mod tests {
         /// Each offers a runtime crate, or a set of build options, that a
         /// developer resolver fills from the environment or the working
         /// directory; any segment of a path, a `use`, or a macro argument naming
-        /// one is a hit, alias and re-export forms included.
-        const AMBIENT_OWNERS: &[&str] = &["runtime_embed", "BuildOptions"];
+        /// one is a hit, alias and re-export forms included. `RuntimeSource`
+        /// is listed by its type, since its resolver's own name, `resolve`, is
+        /// shared by unrelated items.
+        const AMBIENT_OWNERS: &[&str] = &["runtime_embed", "RuntimeSource", "BuildOptions"];
 
         /// The one production function allowed to read the sandbox facts.
         const POSTURE_SITE: &str = "establish";
@@ -4612,50 +4611,47 @@ mod tests {
         }
 
         #[test]
-        fn the_ambient_scan_sees_a_runtime_tree_resolution() {
+        fn the_ambient_scan_sees_a_runtime_source_resolution() {
             let mutated = format!(
-                "{AUDIT_SOURCE}\nfn policy_beside_runtime() -> bool {{ crate::resolve_runtime().is_ok() }}\n"
+                "{AUDIT_SOURCE}\nfn policy_beside_runtime() -> bool {{ crate::RuntimeSource::resolve(o, None, r).is_ok() }}\n\
+                 use crate::RuntimeSource as Source;\n"
             );
             let hits = ambient_reads(&mutated).unwrap_or_default();
-            assert_eq!(
-                hits.get(&(
-                    String::from("policy_beside_runtime"),
-                    String::from("resolve_runtime")
-                )),
-                Some(&1),
-                "a runtime tree resolved from the cwd or the environment is an ambient read"
-            );
-        }
-
-        #[test]
-        fn the_ambient_scan_sees_a_vendored_runtime_resolution() {
-            let mutated = format!(
-                "{AUDIT_SOURCE}\nfn vendored_tree() -> bool {{ crate::resolve_vendored_runtime_dir(None, RuntimeEmit::Vendored).is_ok() }}\n"
-            );
-            let hits = ambient_reads(&mutated).unwrap_or_default();
-            assert_eq!(
-                hits.get(&(
-                    String::from("vendored_tree"),
-                    String::from("resolve_vendored_runtime_dir")
-                )),
-                Some(&1),
-                "a vendored runtime tree resolved from the cwd or the environment is a hit"
-            );
+            for scope in ["policy_beside_runtime", "<item>"] {
+                assert_eq!(
+                    hits.get(&(String::from(scope), String::from("RuntimeSource"))),
+                    Some(&1),
+                    "a runtime chosen from the environment is an ambient read in `{scope}`"
+                );
+            }
         }
 
         #[test]
         fn the_ambient_scan_sees_an_environment_emit_model() {
             let mutated = format!(
-                "{AUDIT_SOURCE}\nfn emit_model() -> bool {{ crate::runtime_dep_from_env() }}\n"
+                "{AUDIT_SOURCE}\nfn emit_model() -> bool {{ crate::RuntimeEmit::from_env().is_ok() }}\n"
+            );
+            let hits = ambient_reads(&mutated).unwrap_or_default();
+            assert_eq!(
+                hits.get(&(String::from("emit_model"), String::from("from_env"))),
+                Some(&1),
+                "an emit model read from the environment is a hit"
+            );
+        }
+
+        #[test]
+        fn the_ambient_scan_sees_an_in_repo_runtime_lookup() {
+            let mutated = format!(
+                "{AUDIT_SOURCE}\nfn in_repo_tree(p: &Path) -> bool {{ ipe_env::artifact::in_repo_runtime_src(p).is_ok() }}\n"
             );
             let hits = ambient_reads(&mutated).unwrap_or_default();
             assert_eq!(
                 hits.get(&(
-                    String::from("emit_model"),
-                    String::from("runtime_dep_from_env")
+                    String::from("in_repo_tree"),
+                    String::from("in_repo_runtime_src")
                 )),
                 Some(&1),
-                "an emit model read from the environment is a hit"
+                "a runtime tree found from a checkout is an ambient read"
             );
         }
 
@@ -4678,7 +4674,7 @@ mod tests {
         fn the_ambient_scan_sees_the_runtime_resolver_through_an_alias() {
             let mutated = format!(
                 "{AUDIT_SOURCE}\nuse crate::runtime_embed as embedded;\n\
-                 fn linked() -> bool {{ embedded::resolve().is_ok() }}\n"
+                 fn linked() -> bool {{ embedded::RuntimeEmit::from_env().is_ok() }}\n"
             );
             let hits = ambient_reads(&mutated).unwrap_or_default();
             assert_eq!(
@@ -4691,9 +4687,9 @@ mod tests {
         #[test]
         fn the_ambient_scan_sees_the_runtime_resolver_by_path_use_and_macro() {
             let mutated = format!(
-                "{AUDIT_SOURCE}\nfn by_path() -> bool {{ crate::runtime_embed::resolve().is_ok() }}\n\
-                 fn in_args() -> String {{ format!(\"{{:?}}\", crate::runtime_embed::resolve().is_ok()) }}\n\
-                 use crate::runtime_embed::{{resolve as linked}};\n"
+                "{AUDIT_SOURCE}\nfn by_path() -> bool {{ crate::runtime_embed::RuntimeEmit::from_env().is_ok() }}\n\
+                 fn in_args() -> String {{ format!(\"{{:?}}\", crate::runtime_embed::RuntimeEmit::from_env().is_ok()) }}\n\
+                 use crate::runtime_embed::{{RuntimeEmit as Emit}};\n"
             );
             let hits = ambient_reads(&mutated).unwrap_or_default();
             for scope in ["by_path", "in_args", "<item>"] {

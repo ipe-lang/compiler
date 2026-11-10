@@ -167,8 +167,11 @@ fn start_watch(
     std::thread::JoinHandle<Result<(), ipe::CliError>>,
     WatchHandle,
 ) {
-    let runtime_dir = e2e_support::require_runtime().into_path_buf();
-    let mut opts = WatchOptions::new(entry.to_path_buf(), out_dir.to_path_buf(), runtime_dir);
+    let mut opts = WatchOptions::new(
+        entry.to_path_buf(),
+        out_dir.to_path_buf(),
+        ipe::runtime_embed::RuntimeSource::Embedded,
+    );
     opts.port = port;
     // Forward CI's warm shared target (exported ONLY as IPE_ORACLE_SHARED_TARGET)
     // into the watch rebuild's cargo build, so it links against a pre-compiled
@@ -198,8 +201,11 @@ fn start_watch_bluegreen(
     std::thread::JoinHandle<Result<(), ipe::CliError>>,
     WatchHandle,
 ) {
-    let runtime_dir = e2e_support::require_runtime().into_path_buf();
-    let mut opts = WatchOptions::new(entry.to_path_buf(), out_dir.to_path_buf(), runtime_dir);
+    let mut opts = WatchOptions::new(
+        entry.to_path_buf(),
+        out_dir.to_path_buf(),
+        ipe::runtime_embed::RuntimeSource::Embedded,
+    );
     opts.port = port;
     opts.bluegreen = true;
     opts.target_dir = e2e_support::child_shared_target_from_env().map(PathBuf::from);

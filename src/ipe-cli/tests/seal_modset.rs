@@ -53,8 +53,8 @@ fn emit_and_build(name: &str, ipe_source: &str) -> Result<(), BoxError> {
         .map_err(|e| -> BoxError { e.into() })
 }
 
-/// Like `emit_and_build` but forces the VENDORED emit model (`runtime_dep:
-/// false`), regardless of the `IPE_RUNTIME_VENDORED` environment variable.
+/// Like `emit_and_build` but forces the VENDORED emit model
+/// (`RuntimeEmit::Vendored`), regardless of the `IPE_RUNTIME_VENDORED` environment variable.
 ///
 /// The vendored model copies the runtime source into the emitted crate and
 /// compiles it with the feature flags declared in the emitted `Cargo.toml`.
@@ -74,7 +74,7 @@ fn emit_and_build_vendored(name: &str, ipe_source: &str) -> Result<(), BoxError>
     // Force the vendored emit model so `#[cfg(feature = "...")]` coverage in
     // the vendored runtime source is verified — the dep-model never exercises it.
     let options = ipe::BuildOptions {
-        runtime_dep: false,
+        runtime_emit: ipe::RuntimeEmit::Vendored,
         ..ipe::BuildOptions::default()
     };
     ipe::build_fixture_with_options(&fixture, &out_dir, &runtime, &options).map_err(
@@ -562,7 +562,7 @@ fn json_object_order_vendored_builds_and_keeps_insertion_order() {
     e2e_support::scratch::fresh(&out_dir);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let options = ipe::BuildOptions {
-        runtime_dep: false,
+        runtime_emit: ipe::RuntimeEmit::Vendored,
         ..ipe::BuildOptions::default()
     };
     ipe::build_fixture_with_options(&fixture, &out_dir, &runtime, &options)
@@ -641,9 +641,31 @@ fn tui_app_vendored_builds() {
     );
 }
 
+/// A `Task`-only program: no `Cmd`, `Sub`, server or `Tui` surface.
+const TASK_MAIN: &str = "module Main exposing (main)\n\
+    import Ipe.Io as Io\n\
+    main : Task Error ()\n\
+    main = Io.println \"task\"\n";
+
+/// Under the vendored emit model a `Task`-only program must cargo-build.
+///
+/// Its runtime reaches the stop-signal relay in `system.rs`, which names
+/// `tokio::sync` and `tokio::signal`; the vendored `tokio` line is the runtime
+/// feature projection, so it carries both.
+#[test]
+fn task_main_vendored_builds() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    emit_and_build_vendored("task_main_vendored", TASK_MAIN).expect(
+        "a Task-only main must cargo-build under the vendored emit model \
+         (the vendored tokio line must carry sync and signal)",
+    );
+}
+
 /// The runtime source tree the SEAL tests above vendor and build must resolve
 /// to the ACTUAL runtime module tree — not merely to some directory.
-/// `resolve_runtime` returns the module-tree root (the crate's `src/`), which
+/// `e2e_support::require_runtime` returns the module-tree root (the crate's `src/`), which
 /// the emit SEALs copy and trim/append as `ipe_runtime/mod.rs`; the crate
 /// `Cargo.toml` the SEALs splice feature flags into sits one level up. If
 /// either load-bearing entry moved, every SEAL above would fail deep inside a

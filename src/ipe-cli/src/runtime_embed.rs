@@ -1,48 +1,47 @@
-//! The runtime crate source, embedded in the `ipe` binary and materialized on
-//! demand.
+//! The runtime crate source, embedded in the `ipe` binary, and the one locator
+//! that picks the runtime an emit carries.
 //!
 //! A copied `ipe` binary must be able to build a program with nothing beside it
 //! but a Rust toolchain — no separate runtime download, no version-mismatch
 //! hazard. To make that true, the runtime crate SOURCE (`src/runtime/rust`: its
 //! `Cargo.toml` + `src/**`) is compiled into this binary as a byte-tree and
-//! written to `<IPE_HOME>/runtime/<version>/rust` the first time a build needs
-//! it. Because the binary materializes its OWN embedded source, the runtime the
-//! emitted project links against matches the compiler that emitted it by
-//! construction — there is no cross-machine version to drift.
+//! bundled from memory into every emitted project that needs it, so the
+//! runtime matches the compiler that emitted it by construction. Nothing is
+//! written outside the emitted project.
 //!
 //! Only SOURCE is embedded; it is compiled locally by the user's toolchain. No
 //! prebuilt object code ships (that would be an ABI/trust surface, not a source
 //! distribution).
 //!
+//! [`RuntimeSource::resolve`] is the one reader of `IPE_RUNTIME_DIR` and
+//! [`RuntimeEmit::from_env`] the one reader of `IPE_RUNTIME_VENDORED`.
+//!
 //! # `IPE_HOME`
-//! The materialized runtime lives under `IPE_HOME`, resolved once:
+//! The per-user data root, resolved once:
 //! 1. `$IPE_HOME` — explicit override; refused unless absolute.
 //! 2. `$XDG_DATA_HOME/ipe` — the XDG data root, when absolute.
 //! 3. `$HOME/.ipe` — the default, when `HOME` is absolute.
-//!
-//! Nothing is ever written outside the resolved `IPE_HOME`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use include_dir::{Dir, include_dir};
+use ipe_backend_rust::RuntimeContentId;
 
 use crate::CliError;
 
 /// The runtime crate source tree, embedded at build time from the workspace
 /// `src/runtime/rust` directory (the crate ROOT, so the materialized tree is a
 /// self-contained buildable crate). `tests/` is present in the source tree but
-/// is not needed to build the crate as a path dependency; it is skipped on
-/// materialize (see [`materialize`]) so the on-disk runtime is the minimal
-/// buildable crate.
+/// is not needed to build the crate as a path dependency; it is skipped when
+/// the tree is bundled (see [`bundled_runtime`]).
 static RUNTIME_CRATE: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../runtime/rust");
 
 /// The compiler's own version — the workspace-synced `version` field.
 ///
-/// The embedded runtime crate is materialized WITH this version (see
-/// [`concretize_manifest`]), so the on-disk runtime version equals the compiler
-/// version by construction.
+/// The embedded runtime crate is bundled WITH this version, so the bundled
+/// runtime's version equals the compiler version by construction.
 pub const COMPILER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The runtime crate's package name.
@@ -52,42 +51,65 @@ pub const COMPILER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// — never walked past to a wrong runtime.
 pub const RUNTIME_PACKAGE: &str = "ipe-runtime-rust";
 
-/// A resolved, verified runtime crate root: the directory holding the runtime
-/// `Cargo.toml` an emitted project names as its path dependency, paired with the
-/// version that root declares.
+/// A runtime crate root an operator named, proved by the override walk.
 ///
-/// The only way to obtain one is through [`resolve`], which constructs it solely
-/// from a candidate that has been checked to hold a `Cargo.toml` declaring the
-/// [`RUNTIME_PACKAGE`]. An empty, half-present, or wrong-package directory can
-/// never be represented as a `ResolvedRuntime` — a wrong runtime is
-/// unrepresentable, not merely unlikely.
+/// The only constructor is that walk: it found, within
+/// [`RUNTIME_LOOKUP_CEILING`] ancestors of the named path, a `Cargo.toml`
+/// declaring [`RUNTIME_PACKAGE`] at [`COMPILER_VERSION`]. An empty,
+/// wrong-package or other-version directory has no `ProvenRoot`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResolvedRuntime {
+pub struct ProvenRoot {
     root: PathBuf,
-    version: String,
 }
 
-impl ResolvedRuntime {
-    /// The verified, absolute crate root.
+impl ProvenRoot {
+    /// The canonical crate root.
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// The version the resolved crate's `Cargo.toml` declares.
-    #[must_use]
-    pub fn version(&self) -> &str {
-        &self.version
+    /// Prove the runtime crate root at or above `path`.
+    ///
+    /// # Errors
+    /// [`CliError::RuntimeDirInvalid`] when no runtime crate root lies within
+    /// the ceiling at or above `path`; [`CliError::RuntimeVersionMismatch`]
+    /// when the nearest one declares another version; [`CliError::Io`] when it
+    /// cannot be canonicalized. Each refusal offers `remedy`.
+    fn prove(path: &Path, remedy: RuntimeRemedy) -> Result<Self, CliError> {
+        // The crate root itself or any path inside it (`…/rust/src`,
+        // `…/src/ipe_runtime`) names the crate.
+        for dir in RUNTIME_LOOKUP_CEILING.ancestors(path) {
+            let Some(version) = runtime_version_at(dir) else {
+                continue;
+            };
+            let root = dir.canonicalize().map_err(|e| CliError::Io {
+                path: dir.to_path_buf(),
+                source: e,
+            })?;
+            if version != COMPILER_VERSION {
+                return Err(CliError::RuntimeVersionMismatch {
+                    path: root,
+                    found: version,
+                    expected: COMPILER_VERSION.to_owned(),
+                    remedy,
+                });
+            }
+            return Ok(Self { root });
+        }
+        let points_at_inner = path.file_name() == Some(std::ffi::OsStr::new("ipe_runtime"))
+            || path.ends_with("rust/src")
+            || path.ends_with("runtime/rust/src");
+        Err(CliError::RuntimeDirInvalid {
+            path: path.to_path_buf(),
+            points_at_inner,
+            remedy,
+        })
     }
 }
 
 /// The relative path, from a runtime crate root, of the manifest.
 const MANIFEST: &str = "Cargo.toml";
-
-/// The `version.workspace = true` line the embedded manifest carries (it inherits
-/// the version from the workspace at build time). A standalone materialized crate
-/// has no parent workspace, so this line is rewritten to a concrete version.
-const WORKSPACE_VERSION_LINE: &str = "version.workspace = true";
 
 /// Read a candidate crate root's manifest and return its declared version iff the
 /// manifest declares the runtime package. `None` means "not a runtime crate
@@ -102,7 +124,7 @@ fn runtime_version_at(root: &Path) -> Option<String> {
     if !declares_package {
         return None;
     }
-    // A materialized crate carries a concrete `version = "…"`; an in-repo crate
+    // A standalone crate carries a concrete `version = "…"`; an in-repo crate
     // inherits it via `version.workspace = true`. In-repo, the version is the
     // compiler's own (both are the workspace version), so report that.
     let concrete = text.lines().find_map(|l| {
@@ -114,32 +136,12 @@ fn runtime_version_at(root: &Path) -> Option<String> {
     Some(concrete.unwrap_or_else(|| COMPILER_VERSION.to_owned()))
 }
 
-/// Verify that `root` is a runtime crate root and, if so, canonicalize it into a
-/// [`ResolvedRuntime`]. A non-runtime directory yields `Ok(None)`; the caller
-/// decides whether that is a hard error (an explicit override) or a fall-through
-/// (an in-repo probe).
-fn verify(root: &Path) -> Result<Option<ResolvedRuntime>, CliError> {
-    let Some(version) = runtime_version_at(root) else {
-        return Ok(None);
-    };
-    let canonical = root.canonicalize().map_err(|e| CliError::Io {
-        path: root.to_path_buf(),
-        source: e,
-    })?;
-    Ok(Some(ResolvedRuntime {
-        root: canonical,
-        version,
-    }))
-}
-
-/// Resolve `IPE_HOME` (see the module doc). The returned path is not created;
-/// [`materialize`] creates it under the runtime subdirectory as needed.
+/// Resolve `IPE_HOME` (see the module doc). The returned path is not created.
 ///
 /// # Errors
 /// - [`CliError::EnvDirNotAbsolute`] when `IPE_HOME` is set but not absolute.
 /// - [`CliError::RuntimeHomeUnknown`] when no override, no absolute
-///   `XDG_DATA_HOME`, and no absolute home are set — there is no directory to
-///   materialize into.
+///   `XDG_DATA_HOME`, and no absolute home are set.
 pub fn ipe_home() -> Result<PathBuf, CliError> {
     ipe_home_from(
         ipe_env::var_os("IPE_HOME"),
@@ -161,25 +163,6 @@ fn ipe_home_from(
         .map(|xdg| xdg.join("ipe"))
         .or_else(|| home.map(|h| h.join(".ipe")))
         .ok_or(CliError::RuntimeHomeUnknown)
-}
-
-/// Rewrite the embedded manifest's `version.workspace = true` into a concrete
-/// `version = "<COMPILER_VERSION>"`, so the materialized crate builds standalone
-/// (it has no parent workspace to inherit from) AND declares exactly the
-/// compiler's version. Every other line is preserved verbatim.
-fn concretize_manifest(manifest: &str) -> String {
-    manifest
-        .lines()
-        .map(|line| {
-            if line.trim() == WORKSPACE_VERSION_LINE {
-                format!("version = \"{COMPILER_VERSION}\"")
-            } else {
-                line.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + if manifest.ends_with('\n') { "\n" } else { "" }
 }
 
 /// Which emission a bundled runtime copy serves, stamped into its version.
@@ -244,6 +227,12 @@ impl RuntimeDigest {
     #[must_use]
     pub fn hex(self) -> String {
         hex::encode(self.0)
+    }
+
+    /// The digest's bytes.
+    #[must_use]
+    pub const fn bytes(self) -> [u8; RUNTIME_DIGEST_LEN] {
+        self.0
     }
 }
 
@@ -455,137 +444,11 @@ fn collect_dir_text_from_embedded(
     Ok(())
 }
 
-/// Write the embedded crate tree under `dest` (a fresh directory), rewriting the
-/// root manifest's version and skipping the `tests/` subtree. Fails closed on the
-/// first filesystem error — a partially written tree under `dest` is a temp dir
-/// the caller discards, never the live runtime.
-fn write_tree(dir: &Dir<'_>, dest: &Path, at_root: bool) -> Result<(), CliError> {
-    std::fs::create_dir_all(dest).map_err(|e| CliError::Io {
-        path: dest.to_path_buf(),
-        source: e,
-    })?;
-    for entry in dir.entries() {
-        match entry {
-            include_dir::DirEntry::Dir(sub) => {
-                let name = sub.path().file_name().unwrap_or_default();
-                // `tests/` is not part of the buildable dependency and carries a
-                // nested proof crate; skip it so the on-disk runtime is minimal.
-                if at_root && name == std::ffi::OsStr::new("tests") {
-                    continue;
-                }
-                write_tree(sub, &dest.join(name), false)?;
-            }
-            include_dir::DirEntry::File(file) => {
-                let name = file.path().file_name().unwrap_or_default();
-                let target = dest.join(name);
-                if at_root && name == std::ffi::OsStr::new(MANIFEST) {
-                    let text = std::str::from_utf8(file.contents()).map_err(|_| {
-                        CliError::RuntimeMaterializeFailed {
-                            detail: "embedded runtime manifest is not valid UTF-8".to_owned(),
-                        }
-                    })?;
-                    std::fs::write(&target, concretize_manifest(text)).map_err(|e| {
-                        CliError::Io {
-                            path: target,
-                            source: e,
-                        }
-                    })?;
-                } else {
-                    std::fs::write(&target, file.contents()).map_err(|e| CliError::Io {
-                        path: target,
-                        source: e,
-                    })?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Materialize the embedded runtime source to `<IPE_HOME>/runtime/<version>/rust`
-/// and return the verified root.
-///
-/// Atomic: the whole tree is written to a sibling temp directory under the same
-/// `runtime/` parent, then renamed into place — a build never sees a
-/// half-written runtime. Idempotent: if `<version>/rust` already exists and
-/// verifies as a runtime crate root, the write is skipped (the fast path). Every
-/// path is under `IPE_HOME`; nothing is written elsewhere.
-///
-/// # Errors
-/// - [`CliError::RuntimeHomeUnknown`] if no `IPE_HOME` can be resolved.
-/// - [`CliError::Io`] / [`CliError::RuntimeMaterializeFailed`] on any filesystem
-///   failure — a disk-full or permission error is a loud, fail-closed refusal,
-///   never a wrong or empty runtime.
-pub fn materialize() -> Result<ResolvedRuntime, CliError> {
-    let home = ipe_home()?;
-    let runtime_parent = home.join("runtime");
-    let version_dir = runtime_parent.join(COMPILER_VERSION);
-    let final_root = version_dir.join("rust");
-
-    // Fast path: an already-materialized, valid runtime for this version.
-    if let Some(resolved) = verify(&final_root)? {
-        return Ok(resolved);
-    }
-
-    std::fs::create_dir_all(&runtime_parent).map_err(|e| CliError::Io {
-        path: runtime_parent.clone(),
-        source: e,
-    })?;
-
-    // Stage the whole `<version>` directory in a sibling temp, then rename it
-    // into place: the observable `<version>/rust` appears atomically and fully
-    // formed. The temp name carries the pid so concurrent `ipe` processes do not
-    // collide on the staging directory.
-    let staging = runtime_parent.join(format!(
-        ".staging-{COMPILER_VERSION}-{}",
-        std::process::id()
-    ));
-    // A leftover staging dir from a crashed prior run would poison the write; the
-    // remove is best-effort and only ever touches our own staging path.
-    let _ = std::fs::remove_dir_all(&staging);
-    let staged_root = staging.join("rust");
-
-    let write_result = write_tree(&RUNTIME_CRATE, &staged_root, true);
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err(e);
-    }
-
-    // Verify the staged tree BEFORE it becomes the live runtime — a staged tree
-    // that does not verify is a bug in the embed, surfaced loudly here.
-    let staged_ok = verify(&staged_root)?.is_some();
-    if !staged_ok {
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err(CliError::RuntimeMaterializeFailed {
-            detail: "the staged runtime tree did not verify as a runtime crate root".to_owned(),
-        });
-    }
-
-    // Rename the staged `<version>` into place. If a concurrent process won the
-    // race and created `<version>` first, treat an existing valid target as
-    // success (idempotent) and discard our staging copy.
-    if std::fs::rename(&staging, &version_dir).is_err() {
-        let _ = std::fs::remove_dir_all(&staging);
-        if verify(&final_root)?.is_none() {
-            return Err(CliError::RuntimeMaterializeFailed {
-                detail: format!("could not place the runtime at {}", version_dir.display()),
-            });
-        }
-    }
-
-    verify(&final_root)?.ok_or_else(|| CliError::RuntimeMaterializeFailed {
-        detail: format!(
-            "materialized runtime at {} did not verify",
-            final_root.display()
-        ),
-    })
-}
-
 /// Who chooses the runtime crate an emitted project links.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RuntimeOrigin {
-    /// A developer build: `$IPE_RUNTIME_DIR`, else an in-repo crate above the
-    /// current directory, else the embedded copy (see [`resolve`]).
+    /// A developer build: an explicit root, else `$IPE_RUNTIME_DIR`, else the
+    /// embedded copy (see [`RuntimeSource::resolve`]).
     #[default]
     Developer,
     /// A gate judging a package: always the compiler's embedded copy.
@@ -596,93 +459,226 @@ pub enum RuntimeOrigin {
     Gate,
 }
 
-/// Resolve the runtime crate root for the dependency-model emit.
-///
-/// The resolution chain, in order:
-///
-/// 1. `$IPE_RUNTIME_DIR` — an explicit override (dev / advanced). It may name the
-///    runtime crate root (`Cargo.toml` declaring [`RUNTIME_PACKAGE`]) or any path
-///    inside it (e.g. the historical `…/rust/src` source-tree location); the crate
-///    root is found by walking up. A path with no runtime crate root at or above
-///    it is a loud error.
-/// 2. In-repo `src/runtime/rust` — an upward walk from the current directory, so
-///    a repository checkout builds against the live source (dev workflow and
-///    goldens unchanged).
-/// 3. Otherwise materialize the embedded source to `<IPE_HOME>/runtime/<version>/rust`
-///    and use that (the normal installed path).
-///
-/// Whichever branch resolves, the result must declare the compiler's own
-/// version: emitting against a differently-versioned runtime is unrepresentable,
-/// so a stale override or drifted in-repo crate is refused here rather than
-/// linked into a `cargo` build that fails opaquely.
-///
-/// # Errors
-/// - [`CliError::RuntimeDirInvalid`] when `$IPE_RUNTIME_DIR` is set but has no
-///   runtime crate root at or above it.
-/// - [`CliError::RuntimeVersionMismatch`] when the resolved runtime's declared
-///   version is not the compiler's.
-/// - Any error from [`materialize`] when the embedded fallback is taken.
-pub fn resolve() -> Result<ResolvedRuntime, CliError> {
-    resolve_for(RuntimeOrigin::Developer)
-}
+/// The one runtime source a [`RuntimeOrigin::Gate`] admits.
+static EMBEDDED_RUNTIME: RuntimeSource = RuntimeSource::Embedded;
 
-/// Resolve the runtime crate root `origin` allows.
-///
-/// [`RuntimeOrigin::Developer`] is the [`resolve`] chain;
-/// [`RuntimeOrigin::Gate`] is [`materialize`] alone.
-///
-/// # Errors
-/// As [`resolve`] for a developer build; as [`materialize`] for a gate.
-pub fn resolve_for(origin: RuntimeOrigin) -> Result<ResolvedRuntime, CliError> {
-    resolve_through(origin, developer_runtime, materialize)
-}
-
-/// The resolution of `origin`, given the developer's ambient lookup and the embedded copy.
-fn resolve_through(
-    origin: RuntimeOrigin,
-    developer: impl FnOnce() -> Result<Option<ResolvedRuntime>, CliError>,
-    embedded: impl FnOnce() -> Result<ResolvedRuntime, CliError>,
-) -> Result<ResolvedRuntime, CliError> {
-    let resolved = match origin {
-        RuntimeOrigin::Gate => embedded()?,
-        RuntimeOrigin::Developer => developer()?.map_or_else(embedded, Ok)?,
-    };
-    check_version(resolved)
-}
-
-/// The developer's ambient runtime: the override, else an in-repo crate.
-///
-/// `$IPE_RUNTIME_DIR` when set, else an in-repo crate above the current
-/// directory; `Ok(None)` means neither names one.
-fn developer_runtime() -> Result<Option<ResolvedRuntime>, CliError> {
-    if let Some(dir) = ipe_env::var_os("IPE_RUNTIME_DIR") {
-        return resolve_override(&PathBuf::from(dir)).map(Some);
+impl RuntimeOrigin {
+    /// The runtime source this origin lets an emit carry, given the `runtime`
+    /// its caller resolved.
+    ///
+    /// A gate carries the embedded copy whatever it was handed, so a caller
+    /// pairing gate options with an override root cannot steer a judged build;
+    /// a developer build carries `runtime` as resolved.
+    #[must_use]
+    pub const fn admitted_runtime(self, runtime: &RuntimeSource) -> &RuntimeSource {
+        match self {
+            Self::Gate => &EMBEDDED_RUNTIME,
+            Self::Developer => runtime,
+        }
     }
-    let cwd = std::env::current_dir().map_err(|e| CliError::Io {
-        path: PathBuf::from("."),
-        source: e,
-    })?;
-    resolve_in_repo(&cwd)
 }
 
-/// Refuse a resolved runtime whose declared version is not the compiler's own.
-/// The emitted project pins features against the compiler's runtime, so linking
-/// a differently-versioned crate fails deep inside `cargo`; this catches the
-/// drift at resolution time and refuses loudly instead. A [`materialize`]d
-/// runtime declares [`COMPILER_VERSION`] by construction and always passes; the
-/// guard bites a stale `IPE_RUNTIME_DIR` override or an in-repo crate whose
-/// manifest has drifted.
-fn check_version(resolved: ResolvedRuntime) -> Result<ResolvedRuntime, CliError> {
-    if resolved.version() == COMPILER_VERSION {
-        Ok(resolved)
-    } else {
-        Err(CliError::RuntimeVersionMismatch {
-            path: resolved.root().to_path_buf(),
-            found: resolved.version().to_owned(),
-            expected: COMPILER_VERSION.to_owned(),
+/// The variable that selects the runtime source an emit carries.
+pub const RUNTIME_VENDORED_VAR: &str = "IPE_RUNTIME_VENDORED";
+
+/// What runtime source an emit carries.
+///
+/// Parsed once from [`RUNTIME_VENDORED_VAR`] by [`RuntimeEmit::from_env`], the
+/// variable's one reader, so no second reader can give it another grammar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeEmit {
+    /// The emitted project names the runtime crate as a path dependency and
+    /// carries no vendored module tree.
+    Linked,
+    /// The emitted project carries the runtime module tree under `src/ipe_runtime/`.
+    Vendored,
+}
+
+/// Every admitted spelling of [`RUNTIME_VENDORED_VAR`] and the emit it names.
+///
+/// The table is the whole grammar: a match is exact (no case folding, no
+/// trimming), and a set value outside it is refused.
+const RUNTIME_VENDORED_SPELLINGS: &[(&str, RuntimeEmit)] =
+    &[("0", RuntimeEmit::Linked), ("1", RuntimeEmit::Vendored)];
+
+impl RuntimeEmit {
+    /// The emit the environment selects; unset is [`RuntimeEmit::Linked`].
+    ///
+    /// # Errors
+    /// [`CliError::EnvSwitchNotRecognised`] for a set value outside
+    /// [`RUNTIME_VENDORED_SPELLINGS`], the empty and the non-UTF-8 value included.
+    pub fn from_env() -> Result<Self, CliError> {
+        Self::parse(ipe_env::var_os(RUNTIME_VENDORED_VAR).as_deref())
+    }
+
+    /// The emit a raw [`RUNTIME_VENDORED_VAR`] value names; unset is `Linked`.
+    ///
+    /// # Errors
+    /// [`CliError::EnvSwitchNotRecognised`] for a set value outside
+    /// [`RUNTIME_VENDORED_SPELLINGS`].
+    pub fn parse(raw: Option<&std::ffi::OsStr>) -> Result<Self, CliError> {
+        let Some(raw) = raw else {
+            return Ok(Self::Linked);
+        };
+        RUNTIME_VENDORED_SPELLINGS
+            .iter()
+            .find(|(spelling, _)| raw == std::ffi::OsStr::new(spelling))
+            .map(|&(_, emit)| emit)
+            .ok_or_else(|| CliError::EnvSwitchNotRecognised {
+                var: RUNTIME_VENDORED_VAR,
+                got: crate::style::TerminalSafe::sanitize(&raw.to_string_lossy()),
+                admitted: RUNTIME_VENDORED_SPELLINGS
+                    .iter()
+                    .map(|&(spelling, _)| spelling)
+                    .collect(),
+            })
+    }
+}
+
+/// The variable naming an operator's runtime crate root.
+pub const RUNTIME_DIR_VAR: &str = "IPE_RUNTIME_DIR";
+
+/// Which remedy a runtime refusal offers, by the surface that reached it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeRemedy {
+    /// The command takes `--runtime <dir>`: the remedy names the flag beside
+    /// `IPE_RUNTIME_DIR`.
+    WithRuntimeFlag,
+    /// The surface has no `--runtime`: the remedy names `IPE_RUNTIME_DIR` only.
+    EnvOnly,
+}
+
+/// Where the runtime crate an emit carries comes from.
+///
+/// Resolved once per command by [`RuntimeSource::resolve`] and carried through
+/// the compile chain; nothing else looks a runtime up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimeSource {
+    /// The runtime crate compiled into this binary.
+    Embedded,
+    /// An operator-named runtime crate root.
+    Override(ProvenRoot),
+}
+
+/// The runtime crate's module tree: each file under its `src/`, keyed relative to `src/`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeModuleTree(BTreeMap<PathBuf, String>);
+
+impl RuntimeModuleTree {
+    /// Every module file, keyed relative to the crate's `src/`, with its text.
+    #[must_use]
+    pub const fn files(&self) -> &BTreeMap<PathBuf, String> {
+        &self.0
+    }
+
+    /// A tree holding exactly `files`.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn from_files(files: BTreeMap<PathBuf, String>) -> Self {
+        Self(files)
+    }
+}
+
+impl RuntimeSource {
+    /// Resolve the runtime source `origin` admits.
+    ///
+    /// Precedence: a [`RuntimeOrigin::Gate`] takes [`Self::Embedded`] and reads
+    /// neither `explicit` nor the environment. A developer build takes
+    /// `explicit` (the `--runtime` root, or a library caller's root), else
+    /// `$IPE_RUNTIME_DIR` (read as raw OS text, so a non-UTF-8 path is still a
+    /// path), else [`Self::Embedded`]. A named root must be proved by
+    /// [`ProvenRoot`]'s walk; it is never passed over for another source.
+    ///
+    /// # Errors
+    /// The refusals of the override walk, each offering `remedy`.
+    pub fn resolve(
+        origin: RuntimeOrigin,
+        explicit: Option<&Path>,
+        remedy: RuntimeRemedy,
+    ) -> Result<Self, CliError> {
+        let ambient = ipe_env::var_os(RUNTIME_DIR_VAR);
+        Self::resolve_from(origin, explicit, ambient.as_deref(), remedy)
+    }
+
+    /// [`Self::resolve`] over the environment's value `ambient`.
+    fn resolve_from(
+        origin: RuntimeOrigin,
+        explicit: Option<&Path>,
+        ambient: Option<&std::ffi::OsStr>,
+        remedy: RuntimeRemedy,
+    ) -> Result<Self, CliError> {
+        match origin {
+            RuntimeOrigin::Gate => Ok(Self::Embedded),
+            RuntimeOrigin::Developer => explicit
+                .or_else(|| ambient.map(Path::new))
+                .map_or(Ok(Self::Embedded), |named| {
+                    ProvenRoot::prove(named, remedy).map(Self::Override)
+                }),
+        }
+    }
+
+    /// The module tree a vendored emit copies into `src/ipe_runtime/`.
+    ///
+    /// # Errors
+    /// [`CliError::RuntimeMaterializeFailed`] / [`CliError::BundledManifest`]
+    /// when the embedded tree cannot be bundled; [`CliError::Io`] when an
+    /// override's `src/` cannot be read.
+    pub fn module_tree(&self) -> Result<RuntimeModuleTree, CliError> {
+        match self {
+            Self::Embedded => {
+                let (files, _) = unstamped_bundle().as_ref().map_err(BundleFault::to_error)?;
+                Ok(RuntimeModuleTree(
+                    files
+                        .iter()
+                        .filter_map(|(path, text)| {
+                            path.strip_prefix(RUNTIME_SRC_DIR)
+                                .ok()
+                                .map(|rel| (rel.to_path_buf(), text.clone()))
+                        })
+                        .collect(),
+                ))
+            }
+            Self::Override(proven) => {
+                let mut files = BTreeMap::new();
+                crate::driver::collect_dir_text(
+                    &proven.root().join(RUNTIME_SRC_DIR),
+                    Path::new(""),
+                    &mut files,
+                )?;
+                Ok(RuntimeModuleTree(files))
+            }
+        }
+    }
+
+    /// The content identity of the runtime a linked emit bundles.
+    ///
+    /// A linked emit bundles the embedded tree whatever the source, so the
+    /// identity is the embedded tree's digest.
+    ///
+    /// # Errors
+    /// As [`bundled_runtime`] when the embedded tree cannot be bundled.
+    pub fn content_id(&self) -> Result<RuntimeContentId, CliError> {
+        match self {
+            Self::Embedded | Self::Override(_) => {
+                let (_, digest) = unstamped_bundle().as_ref().map_err(BundleFault::to_error)?;
+                Ok(RuntimeContentId::from_digest_bytes(digest.bytes()))
+            }
+        }
+    }
+
+    /// The source, for a health line or an error's context: `embedded <version>`
+    /// or `override <path>`, terminal-safe.
+    #[must_use]
+    pub fn describe(&self) -> crate::style::TerminalSafe {
+        crate::style::TerminalSafe::sanitize(&match self {
+            Self::Embedded => format!("embedded {COMPILER_VERSION}"),
+            Self::Override(proven) => format!("override {}", proven.root().display()),
         })
     }
 }
+
+/// The crate directory holding the runtime's module tree.
+const RUNTIME_SRC_DIR: &str = "src";
 
 /// The most directories a runtime lookup visits, its start included.
 #[derive(Clone, Copy, Debug)]
@@ -695,158 +691,115 @@ impl AncestorCeiling {
     }
 }
 
-/// The ceiling of the override and in-repo runtime lookups.
-const RUNTIME_LOOKUP_CEILING: AncestorCeiling = AncestorCeiling(64);
-
-/// Resolve the `$IPE_RUNTIME_DIR` override: verify it names a runtime crate root,
-/// else a loud, typed refusal (with a targeted hint when it points at the inner
-/// module directory).
-fn resolve_override(path: &Path) -> Result<ResolvedRuntime, CliError> {
-    // Accept the crate root directly, or any path inside the crate — the
-    // historical source-tree locations (`…/rust/src`, `…/src/ipe_runtime`) — by
-    // walking up to the crate root that holds `Cargo.toml`. This keeps every
-    // existing `IPE_RUNTIME_DIR` setting working across the meaning change from
-    // "source tree" to "crate root".
-    for dir in RUNTIME_LOOKUP_CEILING.ancestors(path) {
-        if let Some(resolved) = verify(dir)? {
-            return Ok(resolved);
-        }
-    }
-    // Nothing within the ceiling at or above the given path names a runtime
-    // crate root.
-    let points_at_inner = path.file_name() == Some(std::ffi::OsStr::new("ipe_runtime"))
-        || path.ends_with("rust/src")
-        || path.ends_with("runtime/rust/src");
-    Err(CliError::RuntimeDirInvalid {
-        path: path.to_path_buf(),
-        points_at_inner,
-    })
-}
-
-/// Upward walk from `start` for the in-repo `src/runtime/rust` crate root.
-///
-/// `Ok(None)` means no in-repo runtime is within the ceiling above `start` (the
-/// normal case for an installed binary run outside a checkout).
-fn resolve_in_repo(start: &Path) -> Result<Option<ResolvedRuntime>, CliError> {
-    for dir in RUNTIME_LOOKUP_CEILING.ancestors(start) {
-        let candidate = dir.join("src").join("runtime").join("rust");
-        if let Some(resolved) = verify(&candidate)? {
-            return Ok(Some(resolved));
-        }
-    }
-    Ok(None)
-}
+/// The ceiling of the override lookup, shared with the harness lookup.
+const RUNTIME_LOOKUP_CEILING: AncestorCeiling =
+    AncestorCeiling(ipe_env::artifact::RUNTIME_LOOKUP_CEILING);
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The embedded runtime crate's declared version equals the compiler
-    /// version. This is the version guarantee: the binary materializes its own
-    /// embedded source, and that source names the compiler's version, so an
-    /// emitted project can never link a mismatched runtime (barring the explicit
-    /// `IPE_RUNTIME_DIR` override).
+    /// The bundled runtime manifest declares the compiler's version, so an
+    /// emitted project can never link a mismatched embedded runtime.
     #[test]
     fn embedded_runtime_version_matches_compiler() {
-        let manifest = RUNTIME_CRATE
-            .get_file("Cargo.toml")
-            .expect("embedded runtime crate must carry a Cargo.toml");
-        let text = std::str::from_utf8(manifest.contents()).expect("embedded manifest is UTF-8");
-        // The in-repo manifest inherits the version from the workspace; the
-        // concretized form names it literally. Either way the effective version
-        // is the compiler's.
-        assert!(
-            text.contains(WORKSPACE_VERSION_LINE),
-            "embedded runtime manifest must inherit the workspace version"
-        );
-        let concretized = concretize_manifest(text);
-        assert!(
-            concretized.contains(&format!("version = \"{COMPILER_VERSION}\"")),
-            "concretized runtime manifest must declare the compiler version {COMPILER_VERSION}"
-        );
-        assert!(
-            !concretized.contains(WORKSPACE_VERSION_LINE),
-            "concretized manifest must not keep the workspace-inherit line"
-        );
+        let (files, _) = unstamped_bundle()
+            .as_ref()
+            .expect("the embedded runtime bundles");
+        let manifest = files
+            .get(Path::new(MANIFEST))
+            .expect("the bundle carries a Cargo.toml");
+        let table: toml::Table = manifest.parse().expect("the bundled manifest parses");
+        let version = table
+            .get("package")
+            .and_then(|package| package.get("version"))
+            .and_then(toml::Value::as_str);
+        assert_eq!(version, Some(COMPILER_VERSION));
     }
 
-    /// The embedded tree declares the runtime package — a materialize would
-    /// verify.
+    /// The embedded tree declares the runtime package.
     #[test]
     fn embedded_runtime_declares_package() {
         let manifest = RUNTIME_CRATE
             .get_file("Cargo.toml")
             .expect("embedded runtime crate must carry a Cargo.toml");
-        let text = std::str::from_utf8(manifest.contents()).unwrap();
+        let text = std::str::from_utf8(manifest.contents()).expect("embedded manifest is UTF-8");
         assert!(
             text.lines()
                 .any(|l| l.trim() == format!("name = \"{RUNTIME_PACKAGE}\""))
         );
     }
 
-    /// A resolved runtime whose manifest declares a version other than the
-    /// compiler's is refused by [`check_version`] with the typed
-    /// [`CliError::RuntimeVersionMismatch`], naming the resolved path and both
-    /// versions. This is the guard that keeps a stale runtime from being emitted
-    /// against.
-    #[test]
-    fn mismatched_runtime_version_is_rejected() {
-        let sd = crate::scratch::ScratchDir::new("ipe-runtime-version-test").expect("scratch dir");
-        let dir = sd.into_path(); // the test's explicit remove_dir_all cleans up
-        let bogus = "0.0.0-stale";
-        assert_ne!(bogus, COMPILER_VERSION, "the test version must differ");
+    /// A fresh scratch directory holding a runtime manifest at `version`.
+    #[allow(clippy::expect_used)] // a failed scratch setup is the test failure
+    fn runtime_root_at(tag: &str, version: &str) -> PathBuf {
+        let dir = crate::scratch::ScratchDir::new(tag)
+            .expect("scratch dir")
+            .into_path();
         std::fs::write(
             dir.join(MANIFEST),
-            format!("[package]\nname = \"{RUNTIME_PACKAGE}\"\nversion = \"{bogus}\"\n"),
+            format!("[package]\nname = \"{RUNTIME_PACKAGE}\"\nversion = \"{version}\"\n"),
         )
-        .expect("write bogus manifest");
+        .expect("write runtime manifest");
+        dir
+    }
 
-        let resolved = verify(&dir)
-            .expect("verify does not error on a well-formed manifest")
-            .expect("a manifest declaring the package verifies");
-        assert_eq!(resolved.version(), bogus);
-
-        let err = check_version(resolved).expect_err("a mismatched version must be rejected");
+    /// A named runtime declaring another version is refused with
+    /// [`CliError::RuntimeVersionMismatch`], naming both versions and the
+    /// remedy the surface offers.
+    #[test]
+    fn mismatched_runtime_version_is_rejected() {
+        let bogus = "0.0.1";
+        assert_ne!(bogus, COMPILER_VERSION, "the test version must differ");
+        let dir = runtime_root_at("ipe-runtime-version-test", bogus);
+        let err = RuntimeSource::resolve_from(
+            RuntimeOrigin::Developer,
+            Some(&dir),
+            None,
+            RuntimeRemedy::EnvOnly,
+        );
+        let ambient = RuntimeSource::resolve_from(
+            RuntimeOrigin::Developer,
+            None,
+            Some(dir.as_os_str()),
+            RuntimeRemedy::WithRuntimeFlag,
+        );
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
             matches!(
                 &err,
-                CliError::RuntimeVersionMismatch { found, expected, path }
+                Err(CliError::RuntimeVersionMismatch { found, expected, remedy, .. })
                     if found == bogus
                         && expected == COMPILER_VERSION
-                        && path.ends_with(dir.file_name().expect("temp dir has a name"))
+                        && *remedy == RuntimeRemedy::EnvOnly
             ),
-            "expected a RuntimeVersionMismatch naming {bogus} vs {COMPILER_VERSION}, got {err:?}"
+            "an explicit root of another version is refused, got {err:?}"
+        );
+        assert!(
+            matches!(
+                &ambient,
+                Err(CliError::RuntimeVersionMismatch { remedy, .. })
+                    if *remedy == RuntimeRemedy::WithRuntimeFlag
+            ),
+            "an IPE_RUNTIME_DIR of another version is refused, got {ambient:?}"
         );
     }
 
-    /// A resolved runtime declaring the compiler's own version passes
-    /// [`check_version`] unchanged — the materialized path is exactly this case.
+    /// A named runtime declaring the compiler's own version is an override.
     #[test]
     fn matching_runtime_version_is_accepted() {
-        let sd = crate::scratch::ScratchDir::new("ipe-runtime-version-ok").expect("scratch dir");
-        let dir = sd.into_path(); // the test's explicit remove_dir_all cleans up
-        std::fs::write(
-            dir.join(MANIFEST),
-            format!("[package]\nname = \"{RUNTIME_PACKAGE}\"\nversion = \"{COMPILER_VERSION}\"\n"),
-        )
-        .expect("write matching manifest");
-        let resolved = verify(&dir).expect("verify ok").expect("verifies");
-        assert!(check_version(resolved).is_ok());
+        let dir = runtime_root_at("ipe-runtime-version-ok", COMPILER_VERSION);
+        let resolved = RuntimeSource::resolve_from(
+            RuntimeOrigin::Developer,
+            Some(&dir),
+            None,
+            RuntimeRemedy::EnvOnly,
+        );
+        let canonical = dir.canonicalize().expect("scratch dir canonicalizes");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// `concretize_manifest` touches only the version line and preserves the rest
-    /// verbatim (including a trailing newline).
-    #[test]
-    fn concretize_preserves_other_lines() {
-        let input = "[package]\nname = \"ipe-runtime-rust\"\nversion.workspace = true\nedition = \"2024\"\n";
-        let out = concretize_manifest(input);
-        assert_eq!(
-            out,
-            format!(
-                "[package]\nname = \"ipe-runtime-rust\"\nversion = \"{COMPILER_VERSION}\"\nedition = \"2024\"\n"
-            )
+        assert!(
+            matches!(&resolved, Ok(RuntimeSource::Override(proven)) if proven.root() == canonical),
+            "got {resolved:?}"
         );
     }
 
@@ -1039,70 +992,95 @@ mod tests {
         ));
     }
 
-    /// A runtime root declaring the compiler's version, at a path no lookup reads.
-    fn planted_runtime(tag: &str) -> ResolvedRuntime {
-        ResolvedRuntime {
-            root: PathBuf::from(format!("/nonexistent/{tag}/rust")),
-            version: COMPILER_VERSION.to_owned(),
-        }
-    }
-
-    /// A gate takes the embedded copy and never consults the developer's lookup,
-    /// even when that lookup would name another runtime.
+    /// A gate takes the embedded copy and reads neither the explicit root nor
+    /// the environment, even when both name invalid directories.
     #[test]
     fn a_gate_resolves_only_the_embedded_runtime() {
-        let consulted = std::cell::Cell::new(false);
-        let resolved = resolve_through(
+        let bogus = Path::new("/nonexistent/ipe-runtime-gate");
+        let resolved = RuntimeSource::resolve_from(
             RuntimeOrigin::Gate,
-            || {
-                consulted.set(true);
-                Ok(Some(planted_runtime("override")))
-            },
-            || Ok(planted_runtime("embedded")),
-        )
-        .expect("the embedded copy resolves");
-        assert_eq!(resolved, planted_runtime("embedded"));
-        assert!(
-            !consulted.get(),
-            "a gate never reads the override or the walk"
+            Some(bogus),
+            Some(bogus.as_os_str()),
+            RuntimeRemedy::EnvOnly,
         );
+        assert!(matches!(resolved, Ok(RuntimeSource::Embedded)));
     }
 
-    /// The control: a developer build takes the override when one names a runtime,
-    /// and the embedded copy only when none does.
+    /// A gate admits only the embedded copy even when handed a proven
+    /// override, so gate options paired with an override root cannot steer the
+    /// judged emit; a developer build carries the override it resolved.
     #[test]
-    fn a_developer_build_prefers_its_ambient_runtime() {
-        let ambient = resolve_through(
-            RuntimeOrigin::Developer,
-            || Ok(Some(planted_runtime("override"))),
-            || Ok(planted_runtime("embedded")),
-        )
-        .expect("the override resolves");
-        assert_eq!(ambient, planted_runtime("override"));
-        let fallback = resolve_through(
-            RuntimeOrigin::Developer,
-            || Ok(None),
-            || Ok(planted_runtime("embedded")),
-        )
-        .expect("the embedded copy resolves");
-        assert_eq!(fallback, planted_runtime("embedded"));
+    fn a_gate_admits_only_the_embedded_runtime_whatever_it_is_handed() {
+        let dir = runtime_root_at("ipe-runtime-gate-admit", COMPILER_VERSION);
+        let proven = ProvenRoot::prove(&dir, RuntimeRemedy::EnvOnly);
+        let _ = std::fs::remove_dir_all(&dir);
+        let handed = RuntimeSource::Override(proven.expect("the override root proves"));
+        assert_eq!(
+            RuntimeOrigin::Gate.admitted_runtime(&handed),
+            &RuntimeSource::Embedded
+        );
+        assert_eq!(RuntimeOrigin::Developer.admitted_runtime(&handed), &handed);
     }
 
-    /// A gate's embedded copy is held to the compiler's version like any other.
+    /// An explicit root beats `IPE_RUNTIME_DIR`: a valid explicit root wins
+    /// over an invalid environment value, and with neither the source is
+    /// embedded.
     #[test]
-    fn a_gate_refuses_an_embedded_copy_of_another_version() {
-        let err = resolve_through(
-            RuntimeOrigin::Gate,
-            || Ok(None),
-            || {
-                Ok(ResolvedRuntime {
-                    root: PathBuf::from("/nonexistent/stale/rust"),
-                    version: String::from("0.0.0-stale"),
-                })
-            },
-        )
-        .expect_err("a mismatched version is refused");
-        assert!(matches!(err, CliError::RuntimeVersionMismatch { .. }));
+    fn an_explicit_root_takes_precedence_over_the_environment() {
+        let dir = runtime_root_at("ipe-runtime-precedence", COMPILER_VERSION);
+        let explicit_wins = RuntimeSource::resolve_from(
+            RuntimeOrigin::Developer,
+            Some(&dir),
+            Some(Path::new("/nonexistent/ipe-runtime-env").as_os_str()),
+            RuntimeRemedy::EnvOnly,
+        );
+        let env_refused = RuntimeSource::resolve_from(
+            RuntimeOrigin::Developer,
+            None,
+            Some(Path::new("/nonexistent/ipe-runtime-env").as_os_str()),
+            RuntimeRemedy::EnvOnly,
+        );
+        let neither = RuntimeSource::resolve_from(
+            RuntimeOrigin::Developer,
+            None,
+            None,
+            RuntimeRemedy::EnvOnly,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(explicit_wins, Ok(RuntimeSource::Override(_))));
+        assert!(matches!(
+            env_refused,
+            Err(CliError::RuntimeDirInvalid { .. })
+        ));
+        assert!(matches!(neither, Ok(RuntimeSource::Embedded)));
+    }
+
+    /// No ambient selection: a runtime tree of another version above the
+    /// current directory is never picked when nothing names a root.
+    #[test]
+    fn no_runtime_is_selected_from_the_surrounding_tree() {
+        let resolved = RuntimeSource::resolve_from(
+            RuntimeOrigin::Developer,
+            None,
+            None,
+            RuntimeRemedy::EnvOnly,
+        );
+        assert!(matches!(resolved, Ok(RuntimeSource::Embedded)));
+    }
+
+    /// The embedded module tree is the in-repo `src/runtime/rust/src` tree,
+    /// keyed relative to `src/`.
+    #[test]
+    fn the_embedded_module_tree_is_the_in_repo_source_tree() {
+        let tree = RuntimeSource::Embedded
+            .module_tree()
+            .expect("the embedded tree bundles");
+        let in_repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../runtime/rust/src");
+        let mut on_disk = BTreeMap::new();
+        crate::driver::collect_dir_text(&in_repo, Path::new(""), &mut on_disk)
+            .expect("the in-repo runtime source reads");
+        assert!(tree.files().contains_key(Path::new("mod.rs")));
+        assert_eq!(tree.files(), &on_disk);
     }
 
     /// `root` with `levels` nested `d` directories below it.
@@ -1114,17 +1092,10 @@ mod tests {
     /// the last one it visits is not found.
     #[test]
     fn the_override_lookup_stops_at_its_ceiling() {
-        let root = crate::scratch::ScratchDir::new("ipe-runtime-ceiling-override")
-            .expect("scratch dir")
-            .into_path();
-        std::fs::write(
-            root.join(MANIFEST),
-            format!("[package]\nname = \"{RUNTIME_PACKAGE}\"\nversion = \"{COMPILER_VERSION}\"\n"),
-        )
-        .expect("write manifest");
+        let root = runtime_root_at("ipe-runtime-ceiling-override", COMPILER_VERSION);
         let AncestorCeiling(ceiling) = RUNTIME_LOOKUP_CEILING;
-        let within = resolve_override(&nested(&root, ceiling - 1));
-        let past = resolve_override(&nested(&root, ceiling));
+        let within = ProvenRoot::prove(&nested(&root, ceiling - 1), RuntimeRemedy::EnvOnly);
+        let past = ProvenRoot::prove(&nested(&root, ceiling), RuntimeRemedy::EnvOnly);
         let _ = std::fs::remove_dir_all(&root);
         assert!(within.is_ok(), "the last visited ancestor is found");
         assert!(
@@ -1140,7 +1111,12 @@ mod tests {
         let root = crate::scratch::ScratchDir::new("ipe-runtime-missing-override")
             .expect("scratch dir")
             .into_path();
-        let resolved = resolve_override(&root.join("no-such-runtime"));
+        let resolved = RuntimeSource::resolve_from(
+            RuntimeOrigin::Developer,
+            None,
+            Some(root.join("no-such-runtime").as_os_str()),
+            RuntimeRemedy::EnvOnly,
+        );
         let _ = std::fs::remove_dir_all(&root);
         assert!(
             matches!(resolved, Err(CliError::RuntimeDirInvalid { .. })),
@@ -1148,30 +1124,43 @@ mod tests {
         );
     }
 
-    /// The in-repo lookup stops at its ceiling the same way.
+    /// The admitted spellings of `IPE_RUNTIME_VENDORED`: unset and `0` link,
+    /// `1` vendors.
     #[test]
-    fn the_in_repo_lookup_stops_at_its_ceiling() {
-        let root = crate::scratch::ScratchDir::new("ipe-runtime-ceiling-in-repo")
-            .expect("scratch dir")
-            .into_path();
-        let crate_root = root.join("src").join("runtime").join("rust");
-        std::fs::create_dir_all(&crate_root).expect("create runtime root");
-        std::fs::write(
-            crate_root.join(MANIFEST),
-            format!("[package]\nname = \"{RUNTIME_PACKAGE}\"\nversion = \"{COMPILER_VERSION}\"\n"),
-        )
-        .expect("write manifest");
-        let AncestorCeiling(ceiling) = RUNTIME_LOOKUP_CEILING;
-        let within = resolve_in_repo(&nested(&root, ceiling - 1));
-        let past = resolve_in_repo(&nested(&root, ceiling));
-        let _ = std::fs::remove_dir_all(&root);
-        assert!(
-            matches!(within, Ok(Some(_))),
-            "the last visited ancestor is found"
+    fn the_vendored_switch_admits_exactly_unset_zero_and_one() {
+        assert_eq!(RuntimeEmit::parse(None).ok(), Some(RuntimeEmit::Linked));
+        assert_eq!(
+            RuntimeEmit::parse(Some(std::ffi::OsStr::new("0"))).ok(),
+            Some(RuntimeEmit::Linked)
         );
-        assert!(
-            matches!(past, Ok(None)),
-            "a crate root past the ceiling is not found"
+        assert_eq!(
+            RuntimeEmit::parse(Some(std::ffi::OsStr::new("1"))).ok(),
+            Some(RuntimeEmit::Vendored)
         );
+    }
+
+    /// Every other set value of `IPE_RUNTIME_VENDORED` is refused, naming the
+    /// variable and its admitted spellings; none falls back to a default.
+    #[test]
+    fn the_vendored_switch_refuses_every_other_value() {
+        let refused = |raw: &std::ffi::OsStr| {
+            let parsed = RuntimeEmit::parse(Some(raw));
+            assert!(
+                matches!(
+                    &parsed,
+                    Err(CliError::EnvSwitchNotRecognised { var, admitted, .. })
+                        if *var == RUNTIME_VENDORED_VAR && *admitted == ["0", "1"]
+                ),
+                "{raw:?} must be refused, got {parsed:?}"
+            );
+        };
+        for raw in ["true", "yes", " 1", "", "2", "1 ", "on", "false"] {
+            refused(std::ffi::OsStr::new(raw));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            refused(std::ffi::OsStr::from_bytes(b"1\xff"));
+        }
     }
 }

@@ -187,8 +187,11 @@ fn start_watch(
     std::thread::JoinHandle<Result<(), ipe::CliError>>,
     WatchHandle,
 ) {
-    let runtime_dir = e2e_support::require_runtime().into_path_buf();
-    let mut opts = WatchOptions::new(entry.to_path_buf(), out_dir.to_path_buf(), runtime_dir);
+    let mut opts = WatchOptions::new(
+        entry.to_path_buf(),
+        out_dir.to_path_buf(),
+        ipe::runtime_embed::RuntimeSource::Embedded,
+    );
     opts.port = port;
     opts.bluegreen = bluegreen;
     // Forward CI's warm shared target (exported ONLY as IPE_ORACLE_SHARED_TARGET)

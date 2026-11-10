@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use ipe_backend::Backend;
-use ipe_backend_rust::{RuntimeDep, RustBackend};
+use ipe_backend_rust::{RuntimeContentId, RuntimeDep, RustBackend};
 use ipe_intern::Interner;
 use ipe_ir::{ModPath, Module, Program, Target};
 
@@ -263,11 +263,11 @@ fn load_fixtures() -> SealFixtures {
 }
 
 /// The wasm dependency-model backend the emit exercises.
-fn wasm_backend(interner: &Interner) -> RustBackend<'_> {
+const fn wasm_backend(interner: &Interner) -> RustBackend<'_> {
     RustBackend::new(interner)
         .with_target(Target::WasmClient)
         .with_runtime_dep(Some(RuntimeDep {
-            root: runtime_crate_root(),
+            content: RuntimeContentId::from_digest_bytes([0; 16]),
         }))
 }
 

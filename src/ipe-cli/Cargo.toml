@@ -141,8 +141,7 @@ toml_edit = "0.25"
 # binary carries its own runtime source and never needs a separate download.
 # `include_dir` walks the tree at build time and embeds each file as a byte
 # slice — source only, no object code (the rejected prebuilt-rlib route). The
-# tree is written to `<IPE_HOME>/runtime/<version>/rust` on demand and built
-# locally.
+# tree is bundled into each emitted project and built there.
 include_dir = "0.7"
 # The `ipe package audit` provenance panic-scan reuses the SAME token scanner the
 # repo's abrupt-failure attestation hook runs (`tools/panic-scan`), so the gate

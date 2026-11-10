@@ -9,10 +9,8 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::{Path, PathBuf};
-
 use ipe_backend::Backend;
-use ipe_backend_rust::{RuntimeDep, RustBackend};
+use ipe_backend_rust::{RuntimeContentId, RuntimeDep, RustBackend};
 use ipe_intern::Interner;
 use ipe_ir::{ModPath, Module, Program, Target};
 
@@ -74,23 +72,6 @@ fn minimal_program() -> (Program, Interner) {
     (program, interner)
 }
 
-/// Locate the runtime crate root (`src/runtime/rust`) by walking up from the crate manifest dir.
-#[allow(clippy::expect_used)] // the in-repo runtime root is the test's precondition
-fn runtime_crate_root() -> PathBuf {
-    let manifest = e2e_support::manifest_dir!();
-    let mut here: Option<&Path> = Some(&manifest);
-    let found = std::iter::from_fn(|| {
-        let dir = here?;
-        here = dir.parent();
-        Some(dir.join("src").join("runtime").join("rust"))
-    })
-    .find(|candidate| candidate.join("Cargo.toml").is_file())
-    .expect("the ipe-runtime-rust crate root (src/runtime/rust) must resolve");
-    found
-        .canonicalize()
-        .expect("runtime crate root canonicalizes")
-}
-
 /// Emit the minimal program for `target`, vendored when `dep` is `None`, and return the root `clippy.toml`.
 fn emitted_root_clippy_toml(target: Target, dep: Option<RuntimeDep>) -> Option<String> {
     let (program, interner) = minimal_program();
@@ -132,7 +113,7 @@ fn dep_model_emits_carry_no_root_clippy_toml() {
         let got = emitted_root_clippy_toml(
             target,
             Some(RuntimeDep {
-                root: runtime_crate_root(),
+                content: RuntimeContentId::from_digest_bytes([0; 16]),
             }),
         );
         assert!(

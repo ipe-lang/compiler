@@ -137,6 +137,11 @@ fn async_closure_adapter_builds_and_runs() {
         "Fn(Int) -> impl Future<Output = Result<Int, Error>> + Send + Sync + 'static",
     );
     let result_fn = wrapper_region(&result_region, "handler_fn");
+    let option_region =
+        emit_async_closure("Fn(Int) -> impl Future<Output = Option<Int>> + Send + Sync + 'static");
+    let option_fn = wrapper_region(&option_region, "handler_fn")
+        .replace("pub fn demo_handler_fn(", "pub fn demo_handler_fn_option(")
+        .replace("HandlerFnClosure", "HandlerFnClosureOption");
 
     let dir = ipe_test_temp::temp_root()
         .join(format!("ipe_ffi_async_closure_seal_{}", std::process::id()));
@@ -168,6 +173,13 @@ pub fn note_foreign_panic(_c: &str, _p: Box<dyn std::any::Any + Send>) -> String
 pub fn note_foreign_error<T: std::fmt::Debug>(_e: T) -> String {{ String::new() }}
 pub fn ipe_error_from_foreign<T: std::fmt::Debug, E: From<String>>(_e: T) -> E {{ "external operation failed".to_string().into() }}
 impl From<String> for IpeError {{ fn from(s: String) -> Self {{ IpeError(s) }} }}
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeTrip;
+pub enum ClosureUnwind {{ Trip(RuntimeTrip), Foreign(Box<dyn std::any::Any + Send>) }}
+pub fn closure_unwind(p: Box<dyn std::any::Any + Send>) -> ClosureUnwind {{
+    match p.downcast::<RuntimeTrip>() {{ Ok(t) => ClosureUnwind::Trip(*t), Err(p) => ClosureUnwind::Foreign(p) }}
+}}
+pub fn end_on_unchanneled_unwind(_c: &'static str, _u: ClosureUnwind) -> ! {{ std::process::exit(1) }}
 
 // The cancel guard the emitted async adapter arms around its spawned task: its
 // Drop aborts the inner task unless defused (matches `ipe_runtime::AbortOnDrop`).
@@ -201,6 +213,29 @@ where
     }}
 }}
 
+// The `Option`-shape join (matches `ipe_runtime::ffi_spawn_guarded_unchanneled`):
+// a trip ends the process typed; a foreign panic or a cancel is `None`.
+pub async fn ffi_spawn_guarded_unchanneled<F, T>(future: F) -> Option<T>
+where
+    F: Future<Output = Option<T>> + Send + 'static,
+    T: Send + 'static,
+{{
+    let handle = tokio::task::spawn(future);
+    let guard = AbortOnDrop::new(handle.abort_handle());
+    let joined = handle.await;
+    guard.defuse();
+    match joined {{
+        Ok(output) => output,
+        Err(join_err) => match join_err.try_into_panic() {{
+            Ok(payload) => match closure_unwind(payload) {{
+                ClosureUnwind::Trip(t) => end_on_unchanneled_unwind("foreign async closure tripped", ClosureUnwind::Trip(t)),
+                ClosureUnwind::Foreign(p) => {{ note_foreign_panic("foreign async task panicked", p); None }}
+            }},
+            Err(join_err) => {{ note_foreign_error(join_err); None }}
+        }},
+    }}
+}}
+
 // A tiny async "crate" that takes the boxed handler the adapter returns and
 // awaits it — the exact shape an Axum/Hyper route handler driver would.
 async fn crate_awaits(
@@ -213,6 +248,8 @@ async fn crate_awaits(
 }}
 
 {result_fn}
+
+{option_fn}
 
 #[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn main() {{
@@ -231,6 +268,16 @@ fn main() {{
             Box::new(|_| Box::pin(async move {{ panic!("boom in the future") }}));
         let adapted_panic = demo_handler_fn(ipe_panics);
         let folded = adapted_panic(1).await.map(|_| 0).unwrap_or(-7);
+
+        // The `Option` shape round-trips, and a foreign poll-panic is `None`.
+        let ipe_opt: Box<dyn Fn(i64) -> Pin<Box<dyn Future<Output = Option<i64>> + Send + 'static>> + Send + Sync + 'static> =
+            Box::new(|x| Box::pin(async move {{ Some(x * 3) }}));
+        let tripled = demo_handler_fn_option(ipe_opt)(5).await.unwrap_or(-1);
+        let ipe_opt_panics: Box<dyn Fn(i64) -> Pin<Box<dyn Future<Output = Option<i64>> + Send + 'static>> + Send + Sync + 'static> =
+            Box::new(|_| Box::pin(async move {{ panic!("foreign boom") }}));
+        let none = demo_handler_fn_option(ipe_opt_panics)(1).await.unwrap_or(-9);
+        assert_eq!(tripled, 15, "async option closure round-trips");
+        assert_eq!(none, -9, "a foreign poll-panic folds to None");
 
         assert_eq!(summed, 44, "async closure round-trips its awaited value");
         assert_eq!(folded, -7, "a poll-panic folds to Err, never aborts the executor");

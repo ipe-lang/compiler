@@ -87,7 +87,6 @@ fn load_error(err: &CliError) -> LoadError {
         | CliError::ProjectRefused(_)
         | CliError::UnknownCommand { .. }
         | CliError::Pipeline { .. }
-        | CliError::RuntimeNotFound
         | CliError::RuntimeDirInvalid { .. }
         | CliError::RuntimeHomeUnknown
         | CliError::CacheHomeUnknown
@@ -807,7 +806,7 @@ mod tests {
         }
         for pipeline in [
             CliError::Usage(text::msg::lsp_takes_no_arguments()),
-            CliError::RuntimeNotFound,
+            CliError::RuntimeHomeUnknown,
             CliError::HealthCritical,
             CliError::LintGateFailed,
         ] {

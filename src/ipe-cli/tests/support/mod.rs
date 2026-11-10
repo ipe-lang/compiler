@@ -467,7 +467,7 @@ pub struct RunOutcome {
 /// As `ipe::build_golden_dir`.
 #[allow(dead_code)] // not every golden test binary builds a golden directory
 pub fn build_golden(golden_dir: &Path, out: &Path, runtime: &Path) -> Result<(), ipe::CliError> {
-    ipe::build_golden_dir(golden_dir, out, runtime, &ipe::BuildOptions::from_env())
+    ipe::build_golden_dir(golden_dir, out, runtime, &ipe::BuildOptions::from_env()?)
 }
 
 /// Build the emitted project at `emitted_dir` into the shared target WITHOUT
