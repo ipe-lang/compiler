@@ -3589,4 +3589,69 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    /// The no-replace link names a symbolic link itself, never the file it points at.
+    #[cfg(unix)]
+    #[test]
+    fn the_no_replace_link_never_follows_a_link_at_its_source() {
+        let base = scratch("link_nofollow");
+        std::fs::write(base.join("outside"), "victim").expect("pointed-at file");
+        std::os::unix::fs::symlink("outside", base.join("staged")).expect("symlink");
+        let held = held_at(&base);
+        assert_eq!(
+            sys::link_noreplace(&held.dir, &name("staged"), &name("placed")).ok(),
+            Some(true)
+        );
+        let placed = std::fs::symlink_metadata(base.join("placed")).expect("placed entry");
+        assert!(placed.file_type().is_symlink());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A placed file leaves no second name under its staged name.
+    #[cfg(unix)]
+    #[test]
+    fn a_no_replace_file_rename_leaves_only_the_target() {
+        let base = scratch("file_noreplace_done");
+        std::fs::write(base.join("staged"), "new").expect("staged file");
+        let held = held_at(&base);
+        assert!(sys::rename_file_noreplace(&held.dir, &name("staged"), &name("target")).is_ok());
+        assert!(std::fs::symlink_metadata(base.join("staged")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(base.join("target")).ok().as_deref(),
+            Some("new")
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Linux's exclusive rename refuses a planted file and a planted empty directory itself, before any link or probe.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn the_exclusive_rename_refuses_a_planted_entry() {
+        let base = scratch("exclusive_rename");
+        std::fs::write(base.join("staged"), "new").expect("staged file");
+        std::fs::write(base.join("target"), "old").expect("planted file");
+        std::fs::create_dir(base.join("from_dir")).expect("directory to move");
+        std::fs::create_dir(base.join("planted_dir")).expect("planted empty directory");
+        let held = held_at(&base);
+        assert_eq!(
+            sys::renamed_exclusively(&held.dir, &name("staged"), &name("target"))
+                .map_err(|e| e.kind()),
+            Err(io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("target")).ok().as_deref(),
+            Some("old")
+        );
+        assert_eq!(
+            sys::rename_noreplace(&held.dir, &name("from_dir"), &name("planted_dir"))
+                .map_err(|e| e.kind()),
+            Err(io::ErrorKind::AlreadyExists)
+        );
+        assert!(base.join("from_dir").is_dir());
+        assert_eq!(
+            sys::renamed_exclusively(&held.dir, &name("staged"), &name("fresh")).ok(),
+            Some(true)
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

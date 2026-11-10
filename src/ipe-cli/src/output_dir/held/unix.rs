@@ -113,8 +113,8 @@ pub fn rename(dir: &HeldDir, from: &EntryName, to: &EntryName) -> io::Result<()>
 
 /// Rename the entry `from` to the absent name `to`, both in `dir`, never replacing an entry there.
 ///
-/// Linux (`RENAME_NOREPLACE`) and Apple systems (`RENAME_EXCL`) refuse an
-/// existing `to` atomically. Elsewhere, and on a filesystem without the flag,
+/// Linux refuses an existing `to` atomically (`RENAME_NOREPLACE`). Elsewhere,
+/// and on a filesystem without the flag,
 /// the caller has proven `to` absent and a plain `renameat` follows: in that
 /// window an entry of `from`'s kind planted at `to` is replaced (a file over a
 /// file, a directory over an empty directory). A regular file is placed
@@ -147,9 +147,10 @@ pub fn rename_file_noreplace(dir: &HeldDir, from: &EntryName, to: &EntryName) ->
 
 /// Rename `from` to `to` through the system's own refusal of an existing `to`.
 ///
-/// `Ok(false)` when the system or filesystem has no such rename, with nothing changed.
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-fn renamed_exclusively(dir: &HeldDir, from: &EntryName, to: &EntryName) -> io::Result<bool> {
+/// `Ok(false)` when the kernel or filesystem has no `RENAME_NOREPLACE`
+/// (`EINVAL`, `ENOSYS`), with nothing changed.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn renamed_exclusively(dir: &HeldDir, from: &EntryName, to: &EntryName) -> io::Result<bool> {
     match rustix::fs::renameat_with(
         dir.handle(),
         from.as_os_str(),
@@ -158,36 +159,23 @@ fn renamed_exclusively(dir: &HeldDir, from: &EntryName, to: &EntryName) -> io::R
         rustix::fs::RenameFlags::NOREPLACE,
     ) {
         Ok(()) => Ok(true),
-        Err(errno) if exclusive_rename_unsupported(errno) => Ok(false),
+        Err(rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS) => Ok(false),
         Err(errno) => Err(errno.into()),
     }
 }
 
-/// Rename `from` to `to` through the system's own refusal of an existing `to`; this system has none.
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-const fn renamed_exclusively(
+/// Rename `from` to `to` through the system's own refusal of an existing `to`; none is reachable here, so `Ok(false)`.
+///
+/// The `rustix` this crate builds against exposes the exclusive rename on
+/// Linux kernels only, so every other Unix places a file through
+/// [`link_noreplace`].
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub const fn renamed_exclusively(
     _dir: &HeldDir,
     _from: &EntryName,
     _to: &EntryName,
 ) -> io::Result<bool> {
     Ok(false)
-}
-
-/// Whether `errno` says the exclusive rename is unsupported, rather than refused.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn exclusive_rename_unsupported(errno: rustix::io::Errno) -> bool {
-    [rustix::io::Errno::INVAL, rustix::io::Errno::NOSYS].contains(&errno)
-}
-
-/// Whether `errno` says the exclusive rename is unsupported, rather than refused.
-#[cfg(target_vendor = "apple")]
-fn exclusive_rename_unsupported(errno: rustix::io::Errno) -> bool {
-    [
-        rustix::io::Errno::INVAL,
-        rustix::io::Errno::NOSYS,
-        rustix::io::Errno::NOTSUP,
-    ]
-    .contains(&errno)
 }
 
 /// Hard-link the regular file `from` at the absent name `to`, both in `dir`, never replacing an entry there.
