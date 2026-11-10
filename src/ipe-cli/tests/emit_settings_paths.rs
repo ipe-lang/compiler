@@ -313,3 +313,83 @@ fn shared_cache_keeps_identity() -> Result<(), BoxError> {
     assert_eq!(entries, 2, "the second copy reused the first copy's entry");
     Ok(())
 }
+
+/// Every file under `dir`, recursively, as text (non-UTF-8 files are skipped).
+fn tree_texts(dir: &Path) -> Vec<(PathBuf, String)> {
+    let mut texts = Vec::new();
+    let mut work = vec![dir.to_path_buf()];
+    while let Some(next) = work.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                work.push(path);
+            } else if let Ok(text) = std::fs::read_to_string(&path) {
+                texts.push((path, text));
+            }
+        }
+    }
+    texts
+}
+
+/// No ambient runtime selection: `ipe release eject` run from inside a tree
+/// holding a `src/runtime/rust` crate of another version, with no runtime
+/// named, vendors the runtime embedded in `ipe` and never the surrounding one.
+#[test]
+fn eject_inside_a_foreign_runtime_tree_vendors_the_embedded_runtime() -> Result<(), BoxError> {
+    const PLANTED: &str = "// PLANTED-FOREIGN-RUNTIME\n";
+    let base = scratch("eject_ignores_surrounding_runtime");
+    let planted = base.join("src/runtime/rust");
+    std::fs::create_dir_all(planted.join("src"))?;
+    std::fs::write(
+        planted.join("Cargo.toml"),
+        "[package]\nname = \"ipe-runtime-rust\"\nversion = \"0.0.1\"\n",
+    )?;
+    for file in ["lib.rs", "mod.rs", "basics.rs", "core.rs"] {
+        std::fs::write(planted.join("src").join(file), PLANTED)?;
+    }
+    let cwd = base.join("work/inside");
+    std::fs::create_dir_all(&cwd)?;
+    let fixture = ipe::RootFixture::from_tree(&split_tree())?;
+    let out = base.join("ejected");
+    let mut cmd = std::process::Command::new(e2e_support::cargo_bin!("ipe").into_path_buf());
+    cmd.args([
+        OsStr::new("release"),
+        OsStr::new("eject"),
+        fixture.path().as_os_str(),
+        OsStr::new("--out"),
+        out.as_os_str(),
+    ])
+    .current_dir(&cwd)
+    .env("NO_COLOR", "1")
+    .env_remove("IPE_RUNTIME_DIR")
+    .env_remove("IPE_RUNTIME_VENDORED")
+    .env_remove("IPE_BUILD_CACHE")
+    .stdin(std::process::Stdio::null());
+    let ran = e2e_support::run_bounded(cmd, BOUNDS)?;
+    let texts = tree_texts(&out);
+    let _ = std::fs::remove_dir_all(&base);
+    assert!(
+        ran.status.success(),
+        "eject inside a foreign runtime tree must succeed, got stderr:\n{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|(path, _)| path.starts_with(out.join("src/ipe_runtime"))),
+        "the ejected project vendors a runtime"
+    );
+    let foreign: Vec<&PathBuf> = texts
+        .iter()
+        .filter(|(_, text)| text.contains(PLANTED))
+        .map(|(path, _)| path)
+        .collect();
+    assert!(
+        foreign.is_empty(),
+        "the surrounding runtime tree leaked into the ejected project: {foreign:?}"
+    );
+    Ok(())
+}
