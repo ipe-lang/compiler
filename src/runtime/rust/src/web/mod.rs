@@ -9136,6 +9136,7 @@ mod base_path_tests {
             epoch: HOSTILE.to_string(),
             base: HOSTILE,
             csrf: HOSTILE,
+            route: Some(HOSTILE),
             cfg: super::ClientConfig {
                 banner_enabled: true,
                 swap_toast: false,
@@ -9160,6 +9161,7 @@ mod base_path_tests {
             "/epoch",
             "/base",
             "/csrf",
+            "/route",
             "/cfg/msgReconnecting",
             "/cfg/msgUpdated",
             "/cfg/msgOffline",
@@ -9186,7 +9188,7 @@ mod base_path_tests {
             &crate::encoding::MountBase::root(),
             "<b>x</b>",
             &page_epoch(),
-            &PageUrl::Unrouted,
+            &crate::dom::PageUrl::Unrouted,
             "tok1",
             "",
         );
@@ -10005,8 +10007,15 @@ mod base_path_tests {
         epoch: &RenderEpoch,
         csrf: &str,
     ) -> String {
-        render_page_full(sid, base, "<b>x</b>", epoch, &PageUrl::Unrouted, csrf)
-            .expect("the page builds")
+        render_page_full(
+            sid,
+            base,
+            "<b>x</b>",
+            epoch,
+            &crate::dom::PageUrl::Unrouted,
+            csrf,
+        )
+        .expect("the page builds")
     }
 
     fn boot_open_tag() -> String {
@@ -10050,7 +10059,7 @@ mod base_path_tests {
         Rendered::first(
             SessionKeys::distinct(),
             Html::<()>::HText(String::new()),
-            PageUrl::Unrouted,
+            crate::dom::PageUrl::Unrouted,
         )
         .epoch()
     }
@@ -10107,7 +10116,7 @@ mod base_path_tests {
             base,
             "<b>x</b>",
             epoch,
-            &PageUrl::Unrouted,
+            &crate::dom::PageUrl::Unrouted,
             "tok1",
             "",
         )
@@ -15873,19 +15882,22 @@ mod emitted_router_behavior_tests {
     /// store is chosen or port bound.
     #[test]
     fn standalone_routed_app_refuses_malformed_route_table() {
-        let result = block_on(web_app_routed::<String, Model, Msg, (), _, _, _, _, _, _>(
-            init,
-            update,
-            view,
-            subs,
-            malformed_routes(),
-            (),
-            |_page: (), model: Model| (model, IpeCmd::None),
-            |_page: &()| Err(crate::web::route::RenderRefusal::NoRoute),
-            "memory".to_string(),
-            String::new(),
-            [0u8; 32],
-        ));
+        let result = block_on(
+            web_app_routed::<String, Model, Msg, (), _, _, _, _, _, _, _>(
+                init,
+                update,
+                view,
+                subs,
+                malformed_routes(),
+                (),
+                |_page: (), model: Model| (model, IpeCmd::None),
+                crate::web::route::page_of(|_model: &Model| &()),
+                |_page: &()| Err(crate::web::route::RenderRefusal::NoRoute),
+                "memory".to_string(),
+                String::new(),
+                [0u8; 32],
+            ),
+        );
         assert!(
             matches!(
                 &result,
@@ -15921,6 +15933,7 @@ mod emitted_router_behavior_tests {
             _,
             _,
             _,
+            _,
         >(
             init,
             update,
@@ -15929,6 +15942,7 @@ mod emitted_router_behavior_tests {
             vec![crate::web::route::Route::new("/", |_| Some(()))],
             (),
             |_page: (), model: Model| (model, IpeCmd::None),
+            crate::web::route::page_of(|_model: &Model| &()),
             |_page: &()| Err(crate::web::route::RenderRefusal::NoRoute),
             "postgres".to_string(),
             "mysql://db.example/app".to_string(),
@@ -15996,6 +16010,7 @@ mod emitted_router_behavior_tests {
             malformed_routes(),
             (),
             |_page: (), model: Model| (model, IpeCmd::None),
+            crate::web::route::page_of(|_model: &Model| &()),
             |_page: &()| Err(crate::web::route::RenderRefusal::NoRoute),
             "memory".to_string(),
             String::new(),
