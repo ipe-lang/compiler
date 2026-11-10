@@ -486,7 +486,7 @@ mod tests {
             2,
             "the definition and the call inside the gated apply: {OVERLAY_JS}"
         );
-        assert!(OVERLAY_JS.contains("root.innerHTML=d.body;highlight(step);});"));
+        assert!(OVERLAY_JS.contains("root.innerHTML=d.body;highlight(step);},d.route);"));
     }
 
     // ── SessionHistory ─────────────────────────────────────────────────────────

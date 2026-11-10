@@ -14928,7 +14928,7 @@ mod emitted_router_behavior_tests {
                 1 => 1,
                 _ => 2,
             };
-            route::page_url(&base, route::render_route(&*routes, index, &[]))
+            route::page_url(&base, route::render_route(&routes, index, &[]))
         })
     }
 

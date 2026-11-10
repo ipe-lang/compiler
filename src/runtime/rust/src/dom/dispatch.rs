@@ -1156,7 +1156,7 @@ mod tests {
             assert_eq!(src.matches(api).count(), 1, "{api} has one caller");
             assert!(writer.contains(api), "{api} is called by `write_url`");
         }
-        for entry in ["fn dispatch<", "fn navigate_to<"] {
+        for entry in ["fn flush<", "fn navigate_to<"] {
             assert!(
                 body_of(entry).contains("frozen_step(app)"),
                 "`{entry}` keeps a scrubbed step shown, so the URL stays the shown step's"
