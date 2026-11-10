@@ -354,7 +354,15 @@ fn eject_inside_a_foreign_runtime_tree_vendors_the_embedded_runtime() -> Result<
     std::fs::create_dir_all(&cwd)?;
     let fixture = ipe::RootFixture::from_tree(&split_tree())?;
     let out = base.join("ejected");
-    let mut cmd = std::process::Command::new(e2e_support::cargo_bin!("ipe").into_path_buf());
+    // Eject builds nothing; the target keeps the spawn on the one decision point.
+    let target = match e2e_support::target::shared()? {
+        Some(shared) => e2e_support::target::BuildTarget::Shared(shared),
+        None => e2e_support::target::BuildTarget::Isolated(e2e_support::target::isolated(
+            e2e_support::target::IsolationReason::DefaultResolutionUnderTest,
+        )?),
+    };
+    let mut cmd =
+        e2e_support::target::ipe_command(&e2e_support::cargo_bin!("ipe").into_path_buf(), &target);
     cmd.args([
         OsStr::new("release"),
         OsStr::new("eject"),

@@ -1079,7 +1079,7 @@ mod tests {
         let mut on_disk = BTreeMap::new();
         crate::driver::collect_dir_text(&in_repo, Path::new(""), &mut on_disk)
             .expect("the in-repo runtime source reads");
-        assert!(tree.files().contains_key(Path::new("lib.rs")));
+        assert!(tree.files().contains_key(Path::new("mod.rs")));
         assert_eq!(tree.files(), &on_disk);
     }
 
