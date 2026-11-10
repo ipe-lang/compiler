@@ -5893,9 +5893,7 @@ fn canonicalise_expr(e: &src::Expr, env: &Env, cx: &mut ResolveCx<'_>) -> DResul
         src::Expr_::Int(n) => canon::Expr_::Int(*n),
         src::Expr_::Float(f) => canon::Expr_::Float(*f),
         src::Expr_::Str(s) => canon::Expr_::Str(s.clone()),
-        // Triple-quoted strings: desugar `{{expr}}` interpolation into a `++`
-        // chain at canonicalise time.
-        src::Expr_::MultilineStr(string) => desugar_multiline(string, span, env, cx)?,
+        src::Expr_::Template(template) => desugar_template(template, env, cx)?,
         src::Expr_::Char(c) => canon::Expr_::Char(c.clone()),
         src::Expr_::Unit => canon::Expr_::Unit,
         src::Expr_::VarLocal(name) => resolve_var(*name, span, env, cx)?,
@@ -8772,274 +8770,66 @@ const fn name_zero() -> Symbol {
     Symbol::from_raw(0)
 }
 
-// ── Triple-quoted string interpolation desugar ────────────────────────────────
+// ── Triple-quoted string templates ────────────────────────────────────────────
 //
-// `desugar_multiline` splits a `"""` string's value at its `{{expr}}` markers
-// (`ipe_syntax::interpolation_pieces`), wraps each expression piece in the
-// internal `Interpolate` renderer, and joins the pieces into a balanced `++`
-// (String.append) binop tree. Every piece and every name in it carries the
-// source span its value bytes map back to through the string's form.
+// `desugar_template` joins a `"""` string's parts into a balanced `++`
+// (String.append) binop tree: each literal a string at its source span, each
+// `{{expr}}` expression canonicalised like any other expression and wrapped
+// in the internal `Interpolate` renderer.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Where the value bytes of one `"""` string stand in source.
-#[derive(Clone, Copy)]
-struct ValueSpans<'a> {
-    string: &'a src::TripleStr,
-    /// The whole string's span, for a range that maps to no source bytes.
-    whole: Span,
-}
-
-impl ValueSpans<'_> {
-    /// The source span of the value bytes `range`.
-    fn of(self, range: std::ops::Range<usize>) -> Span {
-        self.string.source_span(range).unwrap_or(self.whole)
-    }
-}
-
-/// Convert one interpolation piece of `value` to a canonical expression.
-///
-/// Text becomes `Expr_::Str`; an `{{expr}}` body is resolved as a simple
-/// reference and wrapped in the internal `Interpolate` renderer (no surface
+/// The canonical expression of one `{{expr}}`: `expr` resolved where it
+/// stands, wrapped in the internal `Interpolate` renderer (no surface
 /// binding — only `{{…}}` reaches it).
-fn piece_to_expr(
-    piece: src::Piece,
-    value: &str,
-    spans: ValueSpans<'_>,
-    env: &Env,
-    cx: &mut ResolveCx<'_>,
-) -> DResult<canon::Expr> {
-    match piece {
-        src::Piece::Text { text, range } => {
-            Ok(Located::new(spans.of(range), canon::Expr_::Str(text)))
-        }
-        src::Piece::Interp { range } => {
-            let span = spans.of(range.clone());
-            let body = value.get(range.clone()).unwrap_or_default();
-            let lead = body.len().saturating_sub(body.trim_start().len());
-            let trimmed = body.trim();
-            let resolved =
-                resolve_interp_ref(trimmed, range.start.saturating_add(lead), spans, env, cx)?;
-            let mod_sym = cx.interner.intern("_internal_")?;
-            let fn_sym = cx.interner.intern("interpolate")?;
-            let stringify = Located::new(
-                span,
-                canon::Expr_::VarKernel {
-                    id: Some(StdlibKernel::Interpolate),
-                    module: mod_sym,
-                    name: fn_sym,
-                },
-            );
-            Ok(Located::new(
-                span,
-                canon::Expr_::Call(Box::new(stringify), vec![resolved]),
-            ))
-        }
-    }
-}
-
-/// Resolve a simple interpolation reference `s`, which starts at value byte
-/// `at` of its string.
 ///
-/// Handles four shapes:
-///   `foo`          — bare identifier → local var (or kernel if in scope)
-///   `record.field` — field access → `Access(record, field)`, `record` resolved as a bare name
-///   `Module.func`  — qualified name → resolved through the qualified reader;
-///                    an unresolved one is refused
-///   `func arg`     — single function call → `Call(resolve(func), [resolve(arg)])`
-/// Anything more complex falls back to a literal `{{...}}` string (clear signal
-/// to the developer that only simple expressions are interpolable).
-fn resolve_interp_ref(
-    s: &str,
-    at: usize,
-    spans: ValueSpans<'_>,
-    env: &Env,
-    cx: &mut ResolveCx<'_>,
-) -> DResult<canon::Expr> {
-    // Check for `func arg` (a single space separates them).
-    if let Some(space_pos) = s.find(' ') {
-        let func_str = &s[..space_pos];
-        let after = &s[space_pos + 1..];
-        let arg_str = after.trim();
-        if !func_str.is_empty() && !arg_str.is_empty() {
-            let arg_at = at
-                .saturating_add(space_pos + 1)
-                .saturating_add(after.len() - after.trim_start().len());
-            let func_expr = resolve_interp_ref(func_str, at, spans, env, cx)?;
-            let arg_expr = resolve_interp_ref(arg_str, arg_at, spans, env, cx)?;
-            return Ok(Located::new(
-                spans.of(at..at.saturating_add(s.len())),
-                canon::Expr_::Call(Box::new(func_expr), vec![arg_expr]),
-            ));
-        }
-    }
-    resolve_simple_interp_ref(s, at, spans, env, cx)
-}
-
-/// Resolve a qualified interpolation reference `Q.member` (`Q` may be dotted).
-///
-/// The qualifier is the maximal leading run of uppercase-initial segments and
-/// the member the one segment after it, read through [`resolve_qual_var`]
-/// exactly as a qualified reference outside an interpolation is: a qualifier
-/// no import installed, or a missing member, is refused. A reference with
-/// further segments after the member is not a simple reference and stays a
-/// literal `{{...}}` string.
-///
-/// # Errors
-/// As [`resolve_qual_var`]; [`Diagnostic::CompilerBug`] if interning exhausts
-/// the interner.
-fn resolve_interp_qualified(
-    s: &str,
-    span: Span,
-    env: &Env,
-    cx: &mut ResolveCx<'_>,
-) -> DResult<canon::Expr> {
-    let segments: Vec<&str> = s.split('.').collect();
-    let qualifier_len = segments
-        .iter()
-        .take_while(|segment| segment.starts_with(char::is_uppercase))
-        .count();
-    let qualifier_segments = segments.get(..qualifier_len).unwrap_or_default();
-    let (Some(&member), true) = (
-        segments.get(qualifier_len),
-        segments.len() == qualifier_len + 1,
-    ) else {
-        return Ok(Located::new(
-            span,
-            canon::Expr_::Str(format!("{{{{{s}}}}}")),
-        ));
-    };
-    if qualifier_segments.is_empty() || member.is_empty() {
-        return Ok(Located::new(
-            span,
-            canon::Expr_::Str(format!("{{{{{s}}}}}")),
-        ));
-    }
-    let qualifier = cx.interner.intern(&qualifier_segments.join("."))?;
-    let name = cx.interner.intern(member)?;
+/// The renderer is written nowhere in the source, so its reference owns no
+/// source bytes: an empty span at the body's start, which no token or
+/// occurrence over the body's own names can collide with.
+fn interpolate(expr: &src::Expr, env: &Env, cx: &mut ResolveCx<'_>) -> DResult<canon::Expr> {
+    let resolved = canonicalise_expr(expr, env, cx)?;
+    let span = resolved.span;
+    let mod_sym = cx.interner.intern("_internal_")?;
+    let fn_sym = cx.interner.intern("interpolate")?;
+    let stringify = Located::new(
+        Span::new(span.lo, span.lo),
+        canon::Expr_::VarKernel {
+            id: Some(StdlibKernel::Interpolate),
+            module: mod_sym,
+            name: fn_sym,
+        },
+    );
     Ok(Located::new(
         span,
-        resolve_qual_var(qualifier, name, span, env, cx)?,
+        canon::Expr_::Call(Box::new(stringify), vec![resolved]),
     ))
 }
 
-/// Inner resolver for an interpolation reference without a space (no call
-/// form), starting at value byte `at` of its string.
-fn resolve_simple_interp_ref(
-    s: &str,
-    at: usize,
-    spans: ValueSpans<'_>,
-    env: &Env,
-    cx: &mut ResolveCx<'_>,
-) -> DResult<canon::Expr> {
-    let span = spans.of(at..at.saturating_add(s.len()));
-    // Numeric literal. A body that begins with an ASCII digit can never be an
-    // identifier (Ipê identifiers never start with a digit), so it is an
-    // integer or float literal — NOT a local reference. Emitting `VarLocal`
-    // here (the fall-through below) would leak an unbound name past
-    // canonicalisation and fire the IPE-I0001 "unbound local `<n>`" ICE in
-    // `constrain`, which treats an unresolved local as a violated invariant
-    // (the resolver is supposed to have resolved every local). Recognise the
-    // literal instead, so e.g. `{{String.fromInt 54}}` lowers to
-    // `String.fromInt 54` and prints "54". This must precede the `.`-split
-    // below, else a float like `1.5` is mis-parsed as `Access(1, 5)`.
-    //
-    // Interpolation segments that start with an ASCII digit cannot be
-    // identifiers (Ipê identifiers never start with a digit), so they must be
-    // integer or float literals — NOT local references. Emitting `VarLocal`
-    // for a digit-leading string would leave an unbound name past
-    // canonicalisation, which fires an ICE in `constrain`. Recognising the
-    // literal here prevents that path.
-    if s.starts_with(|c: char| c.is_ascii_digit()) {
-        if let Ok(n) = s.parse::<i64>() {
-            return Ok(Located::new(span, canon::Expr_::Int(n)));
-        }
-        if let Ok(f) = s.parse::<f64>()
-            && f.is_finite()
-        {
-            return Ok(Located::new(span, canon::Expr_::Float(f)));
-        }
-        // Leading digit but not a valid `Int`/`Float` (e.g. `1e400`, `0xFF`,
-        // `9z`): fall back to the literal `{{...}}` string rather than emit a
-        // `VarLocal` that would ICE. Mirrors the "too complex → literal" policy.
-        return Ok(Located::new(
-            span,
-            canon::Expr_::Str(format!("{{{{{s}}}}}")),
-        ));
-    }
-    if let Some(dot_pos) = s.find('.') {
-        let first = &s[..dot_pos];
-        let rest = &s[dot_pos + 1..];
-        if first.is_empty() || rest.is_empty() {
-            // Degenerate `.foo` or `foo.` — literal fallback.
-            return Ok(Located::new(
-                span,
-                canon::Expr_::Str(format!("{{{{{s}}}}}")),
-            ));
-        }
-        if first.starts_with(char::is_uppercase) {
-            return resolve_interp_qualified(s, span, env, cx);
-        }
-        // Lowercase `record.field` → `Access(record, field)`, the record read
-        // through `resolve_var` exactly as a bare name is: a local stays
-        // `VarLocal`, a top-level value is `VarTopLevel`, an unknown name is
-        // IPE-N0001.
-        let rec_sym = cx.interner.intern(first)?;
-        let field_sym = cx.interner.intern(rest)?;
-        let record_span = spans.of(at..at.saturating_add(dot_pos));
-        let record = resolve_var(rec_sym, record_span, env, cx)?;
-        return Ok(Located::new(
-            span,
-            canon::Expr_::Access(Box::new(Located::new(record_span, record)), field_sym),
-        ));
-    }
-    // Bare identifier — resolve through the one canonical bare-name path
-    // (`resolve_var`): constructor first, then variable, then the wildcard
-    // tier, and an unknown name fails closed with the ordinary IPE-N0001
-    // `ValueNotFound` diagnostic. A bare nullary constructor (`{{Nothing}}`)
-    // thus references its constructor value exactly as it would outside an
-    // interpolation. Emitting `VarLocal` for an unbound/unknown name would
-    // leak it past canonicalisation and fire the `constrain` unbound-local
-    // ICE, so every name this path emits as `VarLocal` is provably bound.
-    let sym = cx.interner.intern(s)?;
-    Ok(Located::new(span, resolve_var(sym, span, env, cx)?))
-}
-
-/// Desugar a triple-quoted string into a balanced `++` tree of its pieces.
+/// Desugar a triple-quoted string into a balanced `++` tree of its parts.
 /// Entry point from `canonicalise_expr`.
-fn desugar_multiline(
-    string: &src::TripleStr,
-    span: Span,
+fn desugar_template(
+    template: &src::Template,
     env: &Env,
     cx: &mut ResolveCx<'_>,
 ) -> DResult<canon::Expr_> {
-    let value = string.value();
-    let pieces = src::interpolation_pieces(&value);
-    let spans = ValueSpans {
-        string,
-        whole: span,
-    };
-    // Interpolated names resolve into a sink that is dropped: a name inside
-    // `{{…}}` is not recorded as an occurrence of its binding.
-    let mut unlocated = NameSink::new();
-    let mut chunk_cx = ResolveCx {
-        interner: &mut *cx.interner,
-        names: &mut unlocated,
-    };
-    let mut parts: Vec<canon::Expr> = Vec::with_capacity(pieces.len());
-    for piece in pieces {
-        parts.push(piece_to_expr(piece, &value, spans, env, &mut chunk_cx)?);
+    let mut parts: Vec<canon::Expr> = Vec::with_capacity(template.parts().len());
+    for part in template.parts() {
+        parts.push(match part {
+            src::TemplatePart::Lit(text) => {
+                Located::new(text.span, canon::Expr_::Str(text.value.clone()))
+            }
+            src::TemplatePart::Expr(expr) => interpolate(expr, env, cx)?,
+        });
     }
-    match parts.len() {
-        0 => Ok(canon::Expr_::Str(String::new())),
-        1 => Ok(parts.remove(0).value),
-        _ => {
-            let op_sym = cx.interner.intern("++")?;
-            let home_sym = cx.interner.intern("Basics")?;
-            let func_sym = cx.interner.intern("append")?;
-            Ok(balanced_append(parts, op_sym, home_sym, func_sym)
-                .map_or_else(|| canon::Expr_::Str(String::new()), |joined| joined.value))
-        }
+    if parts.len() == 1
+        && let Some(only) = parts.pop()
+    {
+        return Ok(only.value);
     }
+    let op_sym = cx.interner.intern("++")?;
+    let home_sym = cx.interner.intern("Basics")?;
+    let func_sym = cx.interner.intern("append")?;
+    Ok(balanced_append(parts, op_sym, home_sym, func_sym)
+        .map_or_else(|| canon::Expr_::Str(String::new()), |joined| joined.value))
 }
 
 /// Join `parts` with `++` into a balanced tree, at most `ceil(log2 n)` deep.

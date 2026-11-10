@@ -12,7 +12,9 @@ use std::borrow::Cow;
 use std::num::NonZeroU32;
 use std::ops::Range;
 
-use ipe_diagnostics::{OpenerText, Span, TripleStringDefect};
+use ipe_diagnostics::{
+    Diagnostic, InterpolationDefect, OpenerText, ParseError, Span, TripleStringDefect,
+};
 
 /// The `"""` delimiter both forms open and close with.
 const QUOTES: &str = "\"\"\"";
@@ -347,27 +349,96 @@ impl TripleStr {
         one.into_iter()
             .chain(block.iter().map(|line| line.text.as_str()))
     }
+
+    /// Whether the body source text `source` reads as the body value `value`.
+    ///
+    /// A block's value drops each line's margin and reads a `\r\n` terminator
+    /// as `\n`; every other source character is the value's own. A body is
+    /// lexed over its source, so the two must agree for the tokens to be the
+    /// body's.
+    #[must_use]
+    pub fn source_reads(&self, source: &str, value: &str) -> bool {
+        let width = self.margin().map_or(0, |margin| {
+            usize::try_from(margin.width_before()).unwrap_or(usize::MAX)
+        });
+        let mut source = source.chars().peekable();
+        let mut value = value.chars();
+        while let Some(c) = source.next() {
+            if c == '\r' && source.peek() == Some(&'\n') {
+                continue;
+            }
+            if value.next() != Some(c) {
+                return false;
+            }
+            if c == '\n' {
+                for _ in 0..width {
+                    if source.next_if_eq(&' ').is_none() {
+                        break;
+                    }
+                }
+            }
+        }
+        value.next().is_none()
+    }
 }
 
-/// One piece of a `"""` string's value, split at its `{{expr}}` markers.
+/// One stretch of a `"""` string's value, split at its `{{expr}}` markers.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Piece {
+pub enum Segment {
     /// Literal text with its escapes resolved (`\{{` reads `{{`, `\\` reads
     /// `\`), and the value bytes it was read from.
-    Text { text: String, range: Range<usize> },
-    /// The value bytes between a `{{` and its `}}`, unparsed.
-    Interp { range: Range<usize> },
+    Lit { text: String, value: Range<u32> },
+    /// An interpolation body: the value bytes between a `{{` and the first
+    /// `}}` after it, and the source bytes they stand on.
+    Body {
+        value: Range<u32>,
+        source: Range<u32>,
+    },
 }
+
+impl Segment {
+    /// The source span of a body with its `{{` and `}}`; `None` for text.
+    #[must_use]
+    pub const fn delimited(&self) -> Option<Span> {
+        match self {
+            Self::Lit { .. } => None,
+            Self::Body { source, .. } => Some(Span::new(
+                source.start.saturating_sub(MARKER_LEN),
+                source.end.saturating_add(MARKER_LEN),
+            )),
+        }
+    }
+
+    /// The source span of a body's closing `}}`; `None` for text.
+    #[must_use]
+    pub const fn closer(&self) -> Option<Span> {
+        match self {
+            Self::Lit { .. } => None,
+            Self::Body { source, .. } => {
+                Some(Span::new(source.end, source.end.saturating_add(MARKER_LEN)))
+            }
+        }
+    }
+}
+
+/// The byte width of the `{{` and `}}` markers.
+const MARKER_LEN: u32 = 2;
 
 /// Split a `"""` string's value into literal text and `{{expr}}` bodies.
 ///
 /// `\{{` is a literal `{{`, `\\` a literal `\`, and any other backslash is
-/// kept as written. A `{{` with no `}}` after it is literal text through the
-/// end of the value, its escapes unresolved. A `{{` always ends the text before
-/// it, so the text pieces are exactly the stretches between markers.
-#[must_use]
-pub fn interpolation_pieces(value: &str) -> Vec<Piece> {
-    let mut pieces = Vec::new();
+/// kept as written. A body opens at an unescaped `{{` and ends at the first
+/// `}}` after it. A `{{` always ends the text before it, so the text segments
+/// are exactly the stretches between markers. The walk reads each value byte
+/// once.
+///
+/// # Errors
+///
+/// [`InterpolationDefect::Unclosed`] over a `{{` with no `}}` after it; a
+/// [`Diagnostic::CompilerBug`] when a value offset has no source offset.
+pub fn segments(string: &TripleStr) -> Result<Vec<Segment>, Diagnostic> {
+    let value = string.value();
+    let mut out = Vec::new();
     let mut text = String::new();
     let mut text_lo = 0;
     let mut at = 0;
@@ -379,27 +450,27 @@ pub fn interpolation_pieces(value: &str) -> Vec<Piece> {
             text.push('\\');
             at = at.saturating_add(2);
         } else if tail.starts_with("{{") {
-            if !text.is_empty() {
-                pieces.push(Piece::Text {
-                    text: std::mem::take(&mut text),
-                    range: text_lo..at,
-                });
-            }
-            let open_lo = at;
             let body_lo = at.saturating_add(2);
-            let close = value.get(body_lo..).and_then(|body| body.find("}}"));
-            if let Some(len) = close {
-                let body_hi = body_lo.saturating_add(len);
-                pieces.push(Piece::Interp {
-                    range: body_lo..body_hi,
+            let Some(len) = value.get(body_lo..).and_then(|body| body.find("}}")) else {
+                return Err(Diagnostic::Parse {
+                    span: mapped_span(string, at..body_lo)?,
+                    msg: ParseError::MalformedInterpolation(InterpolationDefect::Unclosed),
                 });
-                at = body_hi.saturating_add(2);
-                text_lo = at;
-            } else {
-                text.push_str(tail);
-                text_lo = open_lo;
-                at = value.len();
+            };
+            if !text.is_empty() {
+                out.push(Segment::Lit {
+                    text: std::mem::take(&mut text),
+                    value: offset(0, text_lo)..offset(0, at),
+                });
             }
+            let body_hi = body_lo.saturating_add(len);
+            let source = mapped_span(string, body_lo..body_hi)?;
+            out.push(Segment::Body {
+                value: offset(0, body_lo)..offset(0, body_hi),
+                source: source.lo..source.hi,
+            });
+            at = body_hi.saturating_add(2);
+            text_lo = at;
         } else {
             let c = tail.chars().next().unwrap_or_default();
             text.push(c);
@@ -407,18 +478,35 @@ pub fn interpolation_pieces(value: &str) -> Vec<Piece> {
         }
     }
     if !text.is_empty() {
-        pieces.push(Piece::Text {
+        out.push(Segment::Lit {
             text,
-            range: text_lo..value.len(),
+            value: offset(0, text_lo)..offset(0, value.len()),
         });
     }
-    pieces
+    Ok(out)
+}
+
+/// The source span of the value byte range `range` of `string`.
+///
+/// # Errors
+///
+/// A [`Diagnostic::CompilerBug`] when either end has no source offset: the
+/// splitter only names offsets inside the value, which always map.
+pub fn mapped_span(string: &TripleStr, range: Range<usize>) -> Result<Span, Diagnostic> {
+    string
+        .source_span(range.clone())
+        .ok_or_else(|| Diagnostic::CompilerBug {
+            where_: "ipe_syntax::triple::mapped_span",
+            detail: format!("value range {range:?} of a `\"\"\"` string has no source span"),
+        })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Column, Judged, Opener, Piece, TripleRefusal, interpolation_pieces, judge};
-    use ipe_diagnostics::{OpenerText, Span, TripleStringDefect};
+    use super::{Column, Judged, Opener, Segment, TripleRefusal, judge, segments};
+    use ipe_diagnostics::{
+        Diagnostic, InterpolationDefect, OpenerText, ParseError, Span, TripleStringDefect,
+    };
     use std::num::NonZeroU32;
 
     /// Judge the first `"""` of `src`, reading its line and column from the
@@ -763,68 +851,166 @@ mod tests {
         assert_eq!(one.string.lines().collect::<Vec<_>>(), ["a"]);
     }
 
+    /// The segments of the first `"""` string of `src`.
+    fn split(src: &str) -> Result<Vec<Segment>, Diagnostic> {
+        let judged = judge_first(src);
+        assert!(judged.is_ok(), "{judged:?}");
+        judged.map_or_else(|_| Ok(Vec::new()), |j| segments(&j.string))
+    }
+
+    /// The source text of each body among `found`.
+    fn body_sources<'s>(src: &'s str, found: &[Segment]) -> Vec<&'s str> {
+        found
+            .iter()
+            .filter_map(|segment| match segment {
+                Segment::Body { source, .. } => {
+                    Some(text(src, Span::new(source.start, source.end)))
+                }
+                Segment::Lit { .. } => None,
+            })
+            .collect()
+    }
+
     #[test]
-    fn pieces_split_text_and_interpolation_bodies_by_value_range() {
-        let value = "a {{ x }}b{{y}}";
+    fn segments_split_text_and_bodies_by_value_range() {
+        let src = "x = \"\"\"a {{ x }}b{{y}}\"\"\"";
+        let found = split(src);
+        assert!(found.is_ok(), "{found:?}");
+        let Ok(found) = found else { return };
+        let lo = |needle: &str| u32::try_from(src.find(needle).unwrap_or_default()).unwrap_or(0);
         assert_eq!(
-            interpolation_pieces(value),
+            found,
             [
-                Piece::Text {
+                Segment::Lit {
                     text: "a ".to_owned(),
-                    range: 0..2
+                    value: 0..2
                 },
-                Piece::Interp { range: 4..7 },
-                Piece::Text {
+                Segment::Body {
+                    value: 4..7,
+                    source: lo(" x ")..lo(" x ").saturating_add(3)
+                },
+                Segment::Lit {
                     text: "b".to_owned(),
-                    range: 9..10
+                    value: 9..10
                 },
-                Piece::Interp { range: 12..13 },
+                Segment::Body {
+                    value: 12..13,
+                    source: lo("y}")..lo("y}").saturating_add(1)
+                },
             ]
         );
+        assert_eq!(body_sources(src, &found), [" x ", "y"]);
     }
 
     #[test]
-    fn pieces_resolve_brace_and_backslash_escapes() {
+    fn escaped_markers_stay_text_and_a_backslash_pair_opens_nothing() {
+        let found = split(r#"x = """p \{{a}} \\ \n""""#);
         assert_eq!(
-            interpolation_pieces(r"p \{{a}} \\ \n"),
-            [Piece::Text {
+            found.ok(),
+            Some(vec![Segment::Lit {
                 text: r"p {{a}} \ \n".to_owned(),
-                range: 0..14
-            }]
+                value: 0..14
+            }])
         );
+        let src = r#"x = """\\{{y}}""""#;
+        let found = split(src);
+        assert!(found.is_ok(), "{found:?}");
+        let Ok(found) = found else { return };
+        assert!(
+            matches!(found.first(), Some(Segment::Lit { text, .. }) if text == "\\"),
+            "{found:?}"
+        );
+        assert_eq!(body_sources(src, &found), ["y"]);
     }
 
     #[test]
-    fn unclosed_marker_is_text_through_the_end() {
-        assert_eq!(
-            interpolation_pieces("a{{b \\\\"),
-            [
-                Piece::Text {
-                    text: "a".to_owned(),
-                    range: 0..1
-                },
-                Piece::Text {
-                    text: "{{b \\\\".to_owned(),
-                    range: 1..7
-                },
-            ]
+    fn an_unclosed_marker_is_refused_at_its_opener() {
+        let src = "x = \"\"\"a {{b\"\"\"";
+        let found = split(src);
+        assert!(
+            matches!(
+                &found,
+                Err(Diagnostic::Parse {
+                    msg: ParseError::MalformedInterpolation(InterpolationDefect::Unclosed),
+                    ..
+                })
+            ),
+            "{found:?}"
         );
+        let Err(Diagnostic::Parse { span, .. }) = found else {
+            return;
+        };
+        assert_eq!(span.lo as usize, src.find("{{").unwrap_or_default());
+        assert_eq!(text(src, span), "{{");
+        // Its twin with the marker closed splits.
+        assert!(split("x = \"\"\"a {{b}}\"\"\"").is_ok());
     }
 
     #[test]
-    fn interpolation_body_maps_to_its_source_name() {
-        let src = "x =\n    \"\"\"\n    hi\n      {{ name }}\n    \"\"\"";
+    fn the_first_closer_ends_a_body() {
+        let src = "x = \"\"\"{{ {a = {b = 1}} }}\"\"\"";
+        let found = split(src);
+        assert!(found.is_ok(), "{found:?}");
+        let Ok(found) = found else { return };
+        assert_eq!(body_sources(src, &found), [" {a = {b = 1"]);
+        assert!(
+            matches!(found.last(), Some(Segment::Lit { text, .. }) if text == " }}"),
+            "{found:?}"
+        );
+        // A lone `}` is not a closer.
+        let src = "x = \"\"\"{{ {a = 1}.a }}\"\"\"";
+        let found = split(src).unwrap_or_default();
+        assert_eq!(body_sources(src, &found), [" {a = 1}.a "]);
+    }
+
+    #[test]
+    fn a_body_across_block_lines_maps_to_contiguous_source() {
+        let src = "x =\n    \"\"\"\n    hi {{ f\r\n      x }}\n    \"\"\"";
         let judged = judge_first(src);
         assert!(judged.is_ok(), "{judged:?}");
         let Ok(judged) = judged else { return };
+        let found = segments(&judged.string);
+        assert!(found.is_ok(), "{found:?}");
+        let Ok(found) = found else { return };
+        assert_eq!(body_sources(src, &found), [" f\r\n      x "]);
         let value = judged.string.value();
-        let body = interpolation_pieces(&value)
-            .into_iter()
-            .find_map(|piece| match piece {
-                Piece::Interp { range } => Some(range),
-                Piece::Text { .. } => None,
-            });
-        let span = body.and_then(|range| judged.string.source_span(range));
-        assert_eq!(span.map(|s| text(src, s)), Some(" name "));
+        let body = found.iter().find_map(|segment| match segment {
+            Segment::Body { value: range, .. } => {
+                value.get(range.start as usize..range.end as usize)
+            }
+            Segment::Lit { .. } => None,
+        });
+        assert_eq!(body, Some(" f\n  x "));
+        assert!(
+            judged
+                .string
+                .source_reads(" f\r\n      x ", body.unwrap_or_default())
+        );
+        // A source that is not the body's text never reads as it.
+        assert!(!judged.string.source_reads(" f\r\n      y ", " f\n  x "));
+        assert!(!judged.string.source_reads(" f\n  x ", " f\n  x "));
+    }
+
+    #[test]
+    fn body_delimiters_span_the_markers() {
+        let src = "x = \"\"\"a{{b}}c\"\"\"";
+        let found = split(src);
+        let body = found.ok().and_then(|found| {
+            found
+                .into_iter()
+                .find(|s| matches!(s, Segment::Body { .. }))
+        });
+        assert_eq!(
+            body.as_ref()
+                .and_then(Segment::delimited)
+                .map(|s| text(src, s)),
+            Some("{{b}}")
+        );
+        assert_eq!(
+            body.as_ref()
+                .and_then(Segment::closer)
+                .map(|s| text(src, s)),
+            Some("}}")
+        );
     }
 }

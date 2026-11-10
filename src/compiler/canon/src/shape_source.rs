@@ -317,9 +317,11 @@ fn expr_references_sink(
         | Expr_::Int(_)
         | Expr_::Float(_)
         | Expr_::Str(_)
-        | Expr_::MultilineStr { .. }
         | Expr_::Char(_)
         | Expr_::Unit => false,
+        Expr_::Template(template) => template
+            .exprs()
+            .any(|e| expr_references_sink(e, sink, module, interner)),
         Expr_::Call(callee, args) => {
             expr_references_sink(callee, sink, module, interner)
                 || args

@@ -9,10 +9,12 @@
 //! Identifiers are interned [`Symbol`]s; every node that has a source location
 //! is wrapped in [`Located`].
 
-use ipe_diagnostics::{Located, Span};
+use std::borrow::Cow;
+
+use ipe_diagnostics::{Diagnostic, Located, Span};
 use ipe_intern::Symbol;
 
-use crate::triple::TripleStr;
+use crate::triple::{Segment, TripleStr, mapped_span};
 
 /// A doc-string attached to a top-level declaration.
 ///
@@ -296,13 +298,9 @@ pub enum Expr_ {
     /// downstream stages see the runtime string verbatim. Mirrors the reference compiler
     /// compiler's `Src.Str`.
     Str(String),
-    /// A triple-quoted string `"""..."""`, judged into one of its two forms.
-    ///
-    /// The lexer resolves neither escape sequences nor `{{expr}}` markers; the
-    /// canonicaliser desugars the form's value into a `++` chain of string
-    /// literals and `Interpolate`-wrapped expressions (the internal renderer
-    /// kernel), mapping each part back to source through the form.
-    MultilineStr(TripleStr),
+    /// A triple-quoted string `"""..."""`: its literal text and the
+    /// `{{expr}}` expressions between, each parsed by the expression parser.
+    Template(Template),
     /// A character literal `'a'`. The carried [`String`] is the source character
     /// text — a single grapheme for an ordinary char, or a backslash-escape pair
     /// (`\n`, `\\`) for an escaped one — matching the reference compiler's
@@ -376,6 +374,101 @@ pub enum Expr_ {
 /// the reference compiler's `Ipe.AST.Source.Def`, extended with the destructure
 /// form (`DestructDef`).
 // `Eq` is not derived: `body` is an [`Expr`], only `PartialEq` (float literals).
+/// A `"""` string split into literal text and interpolated expressions.
+///
+/// [`Template::assemble`] is the only constructor: it pairs each body the
+/// splitter found with the expression parsed from it, so a part list never
+/// disagrees with its string.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Template {
+    triple: TripleStr,
+    parts: Vec<TemplatePart>,
+}
+
+/// One part of a [`Template`], in source order.
+#[derive(Clone, PartialEq, Debug)]
+pub enum TemplatePart {
+    /// Literal text, escapes resolved, at its source span.
+    Lit(Located<String>),
+    /// The expression a `{{…}}` body holds.
+    Expr(Expr),
+}
+
+impl Template {
+    /// Pair the `segments` of `triple` with the expressions parsed from its bodies.
+    ///
+    /// # Errors
+    ///
+    /// A [`Diagnostic::CompilerBug`] when `bodies` holds a different number of
+    /// expressions than `segments` holds bodies, or a literal has no source span.
+    pub fn assemble(
+        triple: TripleStr,
+        segments: Vec<Segment>,
+        bodies: Vec<Expr>,
+    ) -> Result<Self, Diagnostic> {
+        let mismatch = || Diagnostic::CompilerBug {
+            where_: "ipe_syntax::Template::assemble",
+            detail: "a `\"\"\"` string's parsed bodies do not match its interpolations".to_owned(),
+        };
+        let mut bodies = bodies.into_iter();
+        let mut parts = Vec::with_capacity(segments.len());
+        for segment in segments {
+            parts.push(match segment {
+                Segment::Lit { text, value } => {
+                    let range = value.start as usize..value.end as usize;
+                    TemplatePart::Lit(Located::new(mapped_span(&triple, range)?, text))
+                }
+                Segment::Body { .. } => TemplatePart::Expr(bodies.next().ok_or_else(mismatch)?),
+            });
+        }
+        if bodies.next().is_some() {
+            return Err(mismatch());
+        }
+        Ok(Self { triple, parts })
+    }
+
+    /// The judged string, as written.
+    #[must_use]
+    pub const fn triple(&self) -> &TripleStr {
+        &self.triple
+    }
+
+    /// The parts in source order.
+    #[must_use]
+    pub fn parts(&self) -> &[TemplatePart] {
+        &self.parts
+    }
+
+    /// The interpolated expressions, in source order.
+    pub fn exprs(&self) -> impl Iterator<Item = &Expr> {
+        self.parts.iter().filter_map(|part| match part {
+            TemplatePart::Expr(expr) => Some(expr),
+            TemplatePart::Lit(_) => None,
+        })
+    }
+
+    /// The parts in source order, for a pass that rewrites their spans.
+    pub fn parts_mut(&mut self) -> &mut [TemplatePart] {
+        &mut self.parts
+    }
+
+    /// The string's value when it interpolates nothing; `None` otherwise.
+    #[must_use]
+    pub fn literal_value(&self) -> Option<Cow<'_, str>> {
+        let mut value: Cow<'_, str> = Cow::Borrowed("");
+        for part in &self.parts {
+            match part {
+                TemplatePart::Lit(text) if value.is_empty() => {
+                    value = Cow::Borrowed(text.value.as_str());
+                }
+                TemplatePart::Lit(text) => value.to_mut().push_str(&text.value),
+                TemplatePart::Expr(_) => return None,
+            }
+        }
+        Some(value)
+    }
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct LetBinding {
     pub pat: Pattern,

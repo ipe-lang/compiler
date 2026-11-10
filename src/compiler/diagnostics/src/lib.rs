@@ -26,12 +26,12 @@ pub use diagnostic::{
     CtorWithheld, DResult, Diagnostic, DutyOrigin, EditTarget, EmitSite, Expected, ExpectedSet,
     ExposingDefect, Feature, FfiError, GENERIC_ORDERED_TYPES, GenericAppEntryReach, HazardRefusal,
     HeaderDefect, HelpLine, Hint, INTERPOLABLE_TYPES, IfDefect, ImportedAs, InterceptContext,
-    LetDefect, LowerError, MainRetName, ModelLeaf, ModulePlacementReason, ModulePlacementRejection,
-    MountPrefixFault, NUMBER_TYPES, NameError, NonWebShape, OpenerText, Owed, ParseError,
-    RoutePatternDefect, RustNameFoldKind, SQL_PARAM_TYPES, SandboxError, SealRejection,
-    SortedNames, SpanRole, StdlibReach, StoreEqAccessorDefect, StoreSelectProjectionDefect,
-    Suggestion, TokenKind, TripleStringDefect, TyDoc, TypeClass, TypeDeclDefect, TypeError,
-    TypeSizeOrigin, WildcardDependence,
+    InterpolationDefect, LetDefect, LowerError, MainRetName, ModelLeaf, ModulePlacementReason,
+    ModulePlacementRejection, MountPrefixFault, NUMBER_TYPES, NameError, NonWebShape, OpenerText,
+    Owed, ParseError, RoutePatternDefect, RustNameFoldKind, SQL_PARAM_TYPES, SandboxError,
+    SealRejection, SortedNames, SpanRole, StdlibReach, StoreEqAccessorDefect,
+    StoreSelectProjectionDefect, Suggestion, TokenKind, TripleStringDefect, TyDoc, TypeClass,
+    TypeDeclDefect, TypeError, TypeSizeOrigin, WildcardDependence,
 };
 pub use render::{DOC_HINT_CMD, plain_message, render, render_json, render_ty};
 pub use span::{Located, Span};

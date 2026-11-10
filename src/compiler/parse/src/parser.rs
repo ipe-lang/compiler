@@ -26,12 +26,14 @@
 use ipe_diagnostics::nesting::{COMPOSE_NESTING, SOURCE_NESTING_LIMIT};
 use ipe_diagnostics::{
     CaseDefect, Construct, DResult, Diagnostic, Expected, ExpectedSet, ExposingDefect,
-    HeaderDefect, IfDefect, LetDefect, Located, ParseError, Span, TokenKind, TypeDeclDefect,
+    HeaderDefect, IfDefect, InterpolationDefect, LetDefect, Located, ParseError, Span, TokenKind,
+    TypeDeclDefect,
 };
 use ipe_intern::{Interner, Symbol};
 use ipe_syntax::{
     BinOp, Ctor, DocString, Exposed, Exposing, Expr, Expr_, ForeignDecl, Import, LetBinding,
-    Module, Pattern, Pattern_, Privacy, TypeAlias, TypeAnnotation, Union, Value,
+    Module, Pattern, Pattern_, Privacy, Segment, Template, TripleStr, TypeAlias, TypeAnnotation,
+    Union, Value,
 };
 
 use crate::layout;
@@ -1531,6 +1533,55 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The [`Template`] a `"""` string token holds: each body parsed as one
+    /// whole expression one level under `depth`.
+    fn parse_template(
+        &mut self,
+        triple: TripleStr,
+        segments: Vec<Segment>,
+        bodies: Vec<Vec<Token>>,
+        depth: u32,
+    ) -> DResult<Template> {
+        let closers = segments.iter().filter_map(Segment::closer);
+        let mut exprs = Vec::with_capacity(bodies.len());
+        for (tokens, closer) in bodies.into_iter().zip(closers) {
+            exprs.push(self.parse_body(tokens, closer, depth)?);
+        }
+        Template::assemble(triple, segments, exprs)
+    }
+
+    /// The expression the tokens of one `{{…}}` body, closed by `closer`, spell.
+    ///
+    /// The body is parsed by a parser of its own over the same interner, at
+    /// the enclosing depth, so nesting through bodies stays under
+    /// [`MAX_DEPTH`]. Running out of tokens mid-expression means the first
+    /// `}}` cut it short ([`InterpolationDefect::BodyEnded`] at that `}}`); a
+    /// token after a whole expression is [`InterpolationDefect::TrailingTokens`].
+    fn parse_body(&mut self, tokens: Vec<Token>, closer: Span, depth: u32) -> DResult<Expr> {
+        let (parsed, leftover, deepest) = {
+            let mut body = Parser::new(tokens, self.interner);
+            body.deepest = self.deepest;
+            let parsed = body.parse_expr(0, depth.saturating_add(1));
+            (parsed, body.peek().map(|token| token.span), body.deepest)
+        };
+        self.reach(deepest);
+        let defect = |span, defect| Diagnostic::Parse {
+            span,
+            msg: ParseError::MalformedInterpolation(defect),
+        };
+        let expr = match parsed {
+            Err(Diagnostic::Parse {
+                msg: ParseError::UnexpectedEof { .. },
+                ..
+            }) => return Err(defect(closer, InterpolationDefect::BodyEnded)),
+            parsed => parsed?,
+        };
+        match leftover {
+            Some(span) => Err(defect(span, InterpolationDefect::TrailingTokens)),
+            None => Ok(expr),
+        }
+    }
+
     /// Whether a chain with `charged` levels over its deepest operand so far
     /// nests past [`MAX_DEPTH`].
     const fn chain_too_deep(&self, charged: u32) -> bool {
@@ -1714,9 +1765,14 @@ impl<'a> Parser<'a> {
             Tok::Float(f) => Ok(Located::new(span, Expr_::Float(f))),
             // String payloads move directly into the AST node — no secondary copy.
             Tok::Str(s) => Ok(Located::new(span, Expr_::Str(s))),
-            // A triple-quoted string carries its judged form; the canonicaliser
-            // desugars `{{expr}}` interpolation in its value at name-resolution time.
-            Tok::TripleStr(string) => Ok(Located::new(span, Expr_::MultilineStr(string))),
+            Tok::TripleStr {
+                triple,
+                segments,
+                bodies,
+            } => {
+                let template = self.parse_template(triple, segments, bodies, depth)?;
+                Ok(Located::new(span, Expr_::Template(template)))
+            }
             Tok::Char(c) => Ok(Located::new(span, Expr_::Char(c))),
             Tok::Minus => self.parse_negative_literal(span, threshold, depth),
             Tok::Ident(text) => {
@@ -3009,12 +3065,22 @@ impl<'a> Parser<'a> {
                 Pattern_::PInt(int_value(*n, Sign::Plus, tok.span)?),
             )),
             Tok::Str(s) => Ok(Located::new(tok.span, Pattern_::PStr(s.clone()))),
-            // A triple-quoted string in pattern position matches the same value
-            // its expression form produces (patterns carry no interpolation).
-            Tok::TripleStr(string) => Ok(Located::new(
-                tok.span,
-                Pattern_::PStr(string.value().into_owned()),
-            )),
+            // A triple-quoted string in pattern position matches its value,
+            // escapes decoded; a pattern matches a fixed string, so one that
+            // interpolates is refused at its first `{{…}}`.
+            Tok::TripleStr {
+                triple, segments, ..
+            } => {
+                if let Some(span) = segments.iter().find_map(Segment::delimited) {
+                    return Err(Diagnostic::Parse {
+                        span,
+                        msg: ParseError::MalformedInterpolation(InterpolationDefect::InPattern),
+                    });
+                }
+                let template = Template::assemble(triple.clone(), segments.clone(), Vec::new())?;
+                let value = template.literal_value().unwrap_or_default().into_owned();
+                Ok(Located::new(tok.span, Pattern_::PStr(value)))
+            }
             Tok::Char(c) => Ok(Located::new(tok.span, Pattern_::PChar(c.clone()))),
             // A negative integer literal pattern `-3`. The digit must be
             // byte-span adjacent to the `-` (no intervening whitespace); a gap
