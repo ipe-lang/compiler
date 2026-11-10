@@ -4,7 +4,7 @@ use super::{
     attribute_post_link_error, bluegreen_enabled, build_held_into, build_root_into,
     bundle_delivery, compile_prepared, create_source_root, emit_machine_error, emit_permissions,
     emit_settings, find_manifest_for_ipe_file, frame_infer_error, gate_decoder_pipelines,
-    home_to_source_map, io_err, resolve_vendored_runtime_dir, run_version, runtime_dep_from_env,
+    home_to_source_map, io_err, resolve_vendored_runtime_dir, run_version,
 };
 use std::num::NonZeroU8;
 
@@ -1208,13 +1208,13 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
 
     // The dependency model (native OR wasm) needs no vendored tree — the runtime
     // is a path dependency. Only a dep-model-OFF build vendors the source subtree.
-    let runtime_dep = runtime_dep_from_env();
+    let runtime_emit = RuntimeEmit::from_env()?;
     let options = BuildOptions {
         static_plan,
         target: compile_target.ir_target(),
         // A `dev build` is a development artifact — Debug.* is permitted.
         intent: Verb::DEV_BUILD.intent(),
-        runtime_dep,
+        runtime_emit,
         // `ipe dev build` never tree-shakes the vendored tree — a dep-model build
         // carries no vendored source, and a vendored (`IPE_RUNTIME_VENDORED`)
         // build keeps the full tree so rustc, not the driver, drops the unreached
@@ -1272,7 +1272,7 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
             NativeBuild {
                 cargo: native_cargo,
                 static_plan,
-                runtime_dep,
+                runtime_emit,
                 quiet: args.quiet,
             },
             Some(manifest),
@@ -1306,8 +1306,8 @@ pub struct NativeBuild {
     pub cargo: Option<toolchain::CargoBin>,
     /// The static-link target, when the build is static.
     pub static_plan: Option<ipe_backend_rust::static_build::StaticPlan>,
-    /// Whether the emitted crate depends on the runtime.
-    pub runtime_dep: bool,
+    /// The runtime source the emitted crate carries.
+    pub runtime_emit: RuntimeEmit,
     /// Pass `-q` to cargo instead of its terminal UI.
     pub quiet: bool,
 }
@@ -1524,7 +1524,7 @@ pub fn compile_and_finalize_native_build(
     let NativeBuild {
         cargo: native_cargo,
         static_plan,
-        runtime_dep,
+        runtime_emit,
         quiet,
     } = build;
     // `native_cargo` is `Some` on every native path (the caller's wasm branch
@@ -1535,7 +1535,7 @@ pub fn compile_and_finalize_native_build(
         None => toolchain::require_cargo(toolchain::ToolIntent::Build)?,
     };
     let out_dir = crate_dir.path();
-    let runtime = if runtime_dep {
+    let runtime = if matches!(runtime_emit, RuntimeEmit::Linked) {
         runtime_context_for_message()
     } else {
         None
@@ -1729,13 +1729,13 @@ pub fn run_eject(rest: &[String]) -> Result<(), CliError> {
 ///
 /// Eject hands over a shipped project, so it is a release build. It forces the
 /// vendored, tree-shaken shape: a self-contained project names no runtime path
-/// dependency (`runtime_dep = false`) and carries only the reached runtime
+/// dependency ([`RuntimeEmit::Vendored`]) and carries only the reached runtime
 /// source (`tree_shake_vendored = true`). Static/wasm options stay at their
 /// defaults — eject is the plain native standalone shape.
 pub(super) fn eject_options() -> BuildOptions {
     BuildOptions {
         intent: Verb::RELEASE_EJECT.intent(),
-        runtime_dep: false,
+        runtime_emit: RuntimeEmit::Vendored,
         tree_shake_vendored: true,
         ..BuildOptions::default()
     }
@@ -2003,13 +2003,13 @@ pub fn release_pipeline(
                 let member = resolve_output_root(args.out.as_deref(), manifest)?
                     .release_member(&plan.slug()?);
                 let rust = EmitTarget::Member(member.area(OutputArea::Rust));
-                let runtime_dep = runtime_dep_from_env();
+                let runtime_emit = RuntimeEmit::from_env()?;
                 // Emit the Rust wasm project as a release build so the Debug gate fires.
                 let options = BuildOptions {
                     static_plan: None,
                     target: ipe_ir::Target::WasmClient,
                     intent: verb.intent(),
-                    runtime_dep,
+                    runtime_emit,
                     tree_shake_vendored: false,
                     // The debugger is never enabled on a release build.
                     debugger: false,
@@ -2094,7 +2094,7 @@ pub fn release_pipeline(
                 }),
                 target: ipe_ir::Target::Native,
                 intent: verb.intent(),
-                runtime_dep: runtime_dep_from_env(),
+                runtime_emit: RuntimeEmit::from_env()?,
                 tree_shake_vendored: false,
                 ..BuildOptions::default()
             };
@@ -3488,14 +3488,14 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
 
     // The dependency model (native OR wasm) needs no vendored tree — the runtime
     // is a path dependency. Only a dep-model-OFF build vendors the source subtree.
-    let runtime_dep = runtime_dep_from_env();
+    let runtime_emit = RuntimeEmit::from_env()?;
     // `ipe dev run` is a DEVELOPMENT execution, so `Debug.*` is allowed
     // (production = false).
     let options = BuildOptions {
         static_plan,
         target: compile_target.ir_target(),
         intent: Verb::DEV_RUN.intent(),
-        runtime_dep,
+        runtime_emit,
         // `ipe dev run` builds and executes; it never tree-shakes the vendored tree
         // (only `ipe release eject` does).
         tree_shake_vendored: false,
@@ -3586,7 +3586,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
         Some(bin) => bin,
         None => toolchain::require_cargo(toolchain::ToolIntent::Run)?,
     };
-    let runtime = if runtime_dep && !wasm_target {
+    let runtime = if matches!(runtime_emit, RuntimeEmit::Linked) && !wasm_target {
         runtime_context_for_message()
     } else {
         None
@@ -4563,7 +4563,7 @@ pub fn front_check(root: &ProjectRoot) -> Result<(), CliError> {
     let options = BuildOptions {
         target: ipe_ir::Target::Native,
         intent: ipe_backend_rust::BuildIntent::Development,
-        ..BuildOptions::from_env()
+        ..BuildOptions::from_env()?
     };
     crate::threads::run_compile(|| {
         for graph in analysis_graphs(&AnalysisTarget::Project(root))? {
@@ -5389,7 +5389,7 @@ mod held_crate_tests {
     /// Runs in the Linux `test` CI job.
     #[test]
     fn the_dev_build_embeds_a_development_marker_and_no_release_floor() {
-        use super::{NativeBuild, compile_and_finalize_native_build};
+        use super::{NativeBuild, RuntimeEmit, compile_and_finalize_native_build};
         use crate::output_dir::{OutputRoot, ProjectPaths};
         use crate::run_sandbox;
         use ipe_sandbox::run_jail::{
@@ -5410,7 +5410,7 @@ mod held_crate_tests {
             NativeBuild {
                 cargo: Some(CargoBin::stub(cargo)),
                 static_plan: None,
-                runtime_dep: false,
+                runtime_emit: RuntimeEmit::Vendored,
                 quiet: true,
             },
             None,
@@ -6038,10 +6038,10 @@ mod parsed_manifest_tests {
     //! the ones the emitted crate links.
 
     use super::HeldBuild;
-    use crate::BuildOptions;
     use crate::delivery::HostIntent;
     use crate::output_dir::{EmitTarget, OwnedDir};
     use crate::project_root::{ProjectRoot, RootArg};
+    use crate::{BuildOptions, RuntimeEmit};
 
     /// An edit to `package.ipe` after the root resolved never reaches the
     /// emitted crate: the crate links the resolved manifest's driver.
@@ -6077,7 +6077,7 @@ mod parsed_manifest_tests {
                 &EmitTarget::Claimed(crate_dir),
                 &runtime,
                 &BuildOptions {
-                    runtime_dep: true,
+                    runtime_emit: RuntimeEmit::Linked,
                     ..BuildOptions::default()
                 },
                 HostIntent::Served,
@@ -6142,7 +6142,7 @@ mod parsed_manifest_tests {
             &EmitTarget::Claimed(crate_dir),
             &runtime,
             &BuildOptions {
-                runtime_dep: true,
+                runtime_emit: RuntimeEmit::Linked,
                 ..BuildOptions::default()
             },
             HostIntent::Served,

@@ -596,6 +596,63 @@ pub enum RuntimeOrigin {
     Gate,
 }
 
+/// The variable that selects the runtime source an emit carries.
+pub const RUNTIME_VENDORED_VAR: &str = "IPE_RUNTIME_VENDORED";
+
+/// What runtime source an emit carries.
+///
+/// Parsed once from [`RUNTIME_VENDORED_VAR`] by [`RuntimeEmit::from_env`], the
+/// variable's one reader, so no second reader can give it another grammar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeEmit {
+    /// The emitted project names the runtime crate as a path dependency and
+    /// carries no vendored module tree.
+    Linked,
+    /// The emitted project carries the runtime module tree under `src/ipe_runtime/`.
+    Vendored,
+}
+
+/// Every admitted spelling of [`RUNTIME_VENDORED_VAR`] and the emit it names.
+///
+/// The table is the whole grammar: a match is exact (no case folding, no
+/// trimming), and a set value outside it is refused.
+const RUNTIME_VENDORED_SPELLINGS: &[(&str, RuntimeEmit)] =
+    &[("0", RuntimeEmit::Linked), ("1", RuntimeEmit::Vendored)];
+
+impl RuntimeEmit {
+    /// The emit the environment selects; unset is [`RuntimeEmit::Linked`].
+    ///
+    /// # Errors
+    /// [`CliError::EnvSwitchNotRecognised`] for a set value outside
+    /// [`RUNTIME_VENDORED_SPELLINGS`], the empty and the non-UTF-8 value included.
+    pub fn from_env() -> Result<Self, CliError> {
+        Self::parse(ipe_env::var_os(RUNTIME_VENDORED_VAR).as_deref())
+    }
+
+    /// The emit a raw [`RUNTIME_VENDORED_VAR`] value names; unset is `Linked`.
+    ///
+    /// # Errors
+    /// [`CliError::EnvSwitchNotRecognised`] for a set value outside
+    /// [`RUNTIME_VENDORED_SPELLINGS`].
+    pub fn parse(raw: Option<&std::ffi::OsStr>) -> Result<Self, CliError> {
+        let Some(raw) = raw else {
+            return Ok(Self::Linked);
+        };
+        RUNTIME_VENDORED_SPELLINGS
+            .iter()
+            .find(|(spelling, _)| raw == std::ffi::OsStr::new(spelling))
+            .map(|&(_, emit)| emit)
+            .ok_or_else(|| CliError::EnvSwitchNotRecognised {
+                var: RUNTIME_VENDORED_VAR,
+                got: crate::style::TerminalSafe::sanitize(&raw.to_string_lossy()),
+                admitted: RUNTIME_VENDORED_SPELLINGS
+                    .iter()
+                    .map(|&(spelling, _)| spelling)
+                    .collect(),
+            })
+    }
+}
+
 /// Resolve the runtime crate root for the dependency-model emit.
 ///
 /// The resolution chain, in order:
@@ -1173,5 +1230,45 @@ mod tests {
             matches!(past, Ok(None)),
             "a crate root past the ceiling is not found"
         );
+    }
+
+    /// The admitted spellings of `IPE_RUNTIME_VENDORED`: unset and `0` link,
+    /// `1` vendors.
+    #[test]
+    fn the_vendored_switch_admits_exactly_unset_zero_and_one() {
+        assert_eq!(RuntimeEmit::parse(None).ok(), Some(RuntimeEmit::Linked));
+        assert_eq!(
+            RuntimeEmit::parse(Some(std::ffi::OsStr::new("0"))).ok(),
+            Some(RuntimeEmit::Linked)
+        );
+        assert_eq!(
+            RuntimeEmit::parse(Some(std::ffi::OsStr::new("1"))).ok(),
+            Some(RuntimeEmit::Vendored)
+        );
+    }
+
+    /// Every other set value of `IPE_RUNTIME_VENDORED` is refused, naming the
+    /// variable and its admitted spellings; none falls back to a default.
+    #[test]
+    fn the_vendored_switch_refuses_every_other_value() {
+        let refused = |raw: &std::ffi::OsStr| {
+            let parsed = RuntimeEmit::parse(Some(raw));
+            assert!(
+                matches!(
+                    &parsed,
+                    Err(CliError::EnvSwitchNotRecognised { var, admitted, .. })
+                        if *var == RUNTIME_VENDORED_VAR && *admitted == ["0", "1"]
+                ),
+                "{raw:?} must be refused, got {parsed:?}"
+            );
+        };
+        for raw in ["true", "yes", " 1", "", "2", "1 ", "on", "false"] {
+            refused(std::ffi::OsStr::new(raw));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            refused(std::ffi::OsStr::from_bytes(b"1\xff"));
+        }
     }
 }

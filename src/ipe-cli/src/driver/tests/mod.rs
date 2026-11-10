@@ -146,15 +146,13 @@ fn vendored_runtime_dir_is_required_only_when_vendoring() {
 fn test_build_resolves_the_runtime_like_dev_build() {
     let dev_build = BuildOptions {
         intent: Verb::DEV_BUILD.intent(),
-        ..BuildOptions::from_env()
+        ..BuildOptions::from_env().expect("BuildOptions from env")
     };
+    let test_build = test_build_options().expect("test build options from env");
+    assert_eq!(test_build.runtime_emit(), dev_build.runtime_emit());
     assert_eq!(
-        test_build_options().runtime_emit(),
-        dev_build.runtime_emit()
-    );
-    assert_eq!(
-        test_build_options().runtime_dep,
-        runtime_dep_from_env(),
+        test_build.runtime_emit,
+        RuntimeEmit::from_env().expect("runtime emit from env"),
         "the test build takes its runtime model from the environment, as dev build does",
     );
 }
@@ -163,12 +161,12 @@ fn test_build_resolves_the_runtime_like_dev_build() {
 #[test]
 fn runtime_emit_follows_the_runtime_link() {
     let linked = BuildOptions {
-        runtime_dep: true,
+        runtime_emit: RuntimeEmit::Linked,
         ..BuildOptions::default()
     };
     assert_eq!(linked.runtime_emit(), RuntimeEmit::Linked);
     let vendored = BuildOptions {
-        runtime_dep: false,
+        runtime_emit: RuntimeEmit::Vendored,
         ..BuildOptions::default()
     };
     assert_eq!(vendored.runtime_emit(), RuntimeEmit::Vendored);
@@ -1666,7 +1664,7 @@ fn emit_web_app_source(hot_appearance: bool, tag: &str) -> String {
     let out = dir.join("out");
     let options = BuildOptions {
         hot_appearance,
-        ..BuildOptions::from_env()
+        ..BuildOptions::from_env().expect("BuildOptions from env")
     };
     let built = build_loose_file_with_options(&entry, &out, &runtime, options);
     assert!(built.is_ok(), "web app must compile ({tag}): {built:?}");
@@ -3652,7 +3650,7 @@ fn build_refuses_a_pure_library_with_a_clean_message() {
         &tmp.join("package.ipe"),
         &out,
         Path::new("."),
-        &BuildOptions::from_env(),
+        &BuildOptions::from_env().expect("BuildOptions from env"),
     );
     assert!(
         matches!(&result, Err(CliError::ProjectRefused(msg)) if msg.contains("library package")),
@@ -6490,7 +6488,7 @@ fn vendored_debugger_build_is_refused_before_compiling() {
         PathBuf::from("<vendored-debugger>/Main.ipe"),
         entry_path.clone(),
     )];
-    let refused = |runtime_dep: bool| {
+    let refused = |runtime_emit: RuntimeEmit| {
         let (result, outcome) = compile_modules_observed(
             sources.clone(),
             discovered.clone(),
@@ -6503,7 +6501,7 @@ fn vendored_debugger_build_is_refused_before_compiling() {
             None,
             BuildOptions {
                 debugger: true,
-                runtime_dep,
+                runtime_emit,
                 ..BuildOptions::default()
             },
         );
@@ -6511,14 +6509,14 @@ fn vendored_debugger_build_is_refused_before_compiling() {
         let is_refusal = matches!(&result, Err(CliError::Usage(message)) if *message == expected);
         (is_refusal, outcome, result.err())
     };
-    let (is_refusal, outcome, err) = refused(false);
+    let (is_refusal, outcome, err) = refused(RuntimeEmit::Vendored);
     assert!(
         is_refusal,
         "a vendored `--debugger` build must be refused with the catalog message: {err:?}"
     );
     assert_eq!(outcome, CacheOutcome::Miss);
     assert!(!out.exists(), "the refusal fires before any emit");
-    let (is_refusal, _, err) = refused(true);
+    let (is_refusal, _, err) = refused(RuntimeEmit::Linked);
     assert!(
         !is_refusal,
         "the dependency model is not refused by the debugger gate: {err:?}"

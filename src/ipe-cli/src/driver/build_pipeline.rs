@@ -5,6 +5,7 @@ use crate::loose_file::LooseFileError;
 use crate::output_dir::OutputRefusal;
 use crate::output_dir::{EmitTarget, OwnedDir, OwnedPath, ProjectPaths};
 use crate::project_root::ProjectRoot;
+pub use crate::runtime_embed::RuntimeEmit;
 use crate::source_snapshot::TestView;
 use crate::{
     BTreeMap, BTreeSet, Diagnostic, Interner, Path, PathBuf, build_plan, cache, contained_path, fs,
@@ -26,7 +27,7 @@ use ipe_runtime_rust::encoding::MountBase;
 /// and its on-disk caches stay untouched (their keys deliberately exclude
 /// the plan; the transform is a deterministic function of the plan applied
 /// on cache-hit and cache-miss paths alike).
-// The `bool` fields (`runtime_dep`, `tree_shake_vendored`, `debugger`,
+// The `bool` fields (`tree_shake_vendored`, `debugger`,
 // `hot_appearance`) are genuinely independent, orthogonal build toggles —
 // any combination is valid (a dep-model debugger build, a vendored tree-shaken
 // build, …). They are not the states of one machine, so collapsing them into
@@ -51,17 +52,18 @@ pub struct BuildOptions {
     /// console stays closed until `IPE_CONSOLE_AUTH` is set. Only a dev verb
     /// (`ipe dev build` / `run` / `test` / `watch`) states `Development`.
     pub intent: ipe_backend_rust::BuildIntent,
-    /// `true` (the DEFAULT) selects the dependency-model emit: the emitted
-    /// project declares the runtime as a path dependency with a
-    /// `runtime_features`-selected feature list and vendors no runtime source.
-    /// Applies to BOTH targets — a native project selects the reached native
-    /// features; a wasm project selects the `wasm-client` floor plus any
-    /// browser-admissible surface it reaches, built for
-    /// `wasm32-unknown-unknown`. `false` opts back into the byte-identical
-    /// vendored-source emit — the fallback for debugging / a machine without an
-    /// installed runtime crate — set via `IPE_RUNTIME_VENDORED=1` (or directly by
+    /// The runtime source the emit carries.
+    ///
+    /// [`RuntimeEmit::Linked`] (the environment's default) selects the
+    /// dependency-model emit: the emitted project declares the runtime as a path
+    /// dependency with a `runtime_features`-selected feature list and vendors no
+    /// runtime source. Applies to BOTH targets — a native project selects the
+    /// reached native features; a wasm project selects the `wasm-client` floor
+    /// plus any browser-admissible surface it reaches, built for
+    /// `wasm32-unknown-unknown`. [`RuntimeEmit::Vendored`] is the byte-identical
+    /// vendored-source emit, selected by `IPE_RUNTIME_VENDORED=1` (or directly by
     /// a test).
-    pub runtime_dep: bool,
+    pub runtime_emit: RuntimeEmit,
     /// `true` tree-shakes the vendored runtime tree to only the modules the
     /// program reaches — the `ipe release eject` shape. The emitted `ipe_runtime/mod.rs`
     /// already declares `pub mod X;` for exactly the reached top-level modules,
@@ -90,7 +92,7 @@ pub struct BuildOptions {
     /// Who chooses the runtime crate the emitted project links.
     ///
     /// [`runtime_embed::RuntimeOrigin::Gate`] links only the compiler's embedded
-    /// copy and always selects the dependency model, whatever `runtime_dep`
+    /// copy and always selects the dependency model, whatever `runtime_emit`
     /// says: a vendored tree would be read from a caller's `runtime_dir`, so a
     /// gate build has no vendored shape. Default
     /// [`runtime_embed::RuntimeOrigin::Developer`].
@@ -122,19 +124,6 @@ impl OutTarget<'_> {
             Self::Scratch(scratch) => EmitTarget::in_scratch(scratch, project),
         }
     }
-}
-
-/// Select the emit model from the environment.
-///
-/// The dependency model is the DEFAULT; `IPE_RUNTIME_VENDORED=1` opts back into
-/// the vendored-source emit (debugging / a machine that cannot resolve the
-/// runtime crate). The legacy `IPE_RUNTIME_DEP=1` remains an explicit no-op
-/// affirmation of the default. A [`BuildOptions::runtime_dep`] already set by a
-/// caller (a test) is what is threaded; this function only computes the
-/// env-derived default.
-#[must_use]
-pub fn runtime_dep_from_env() -> bool {
-    !ipe_env::var("IPE_RUNTIME_VENDORED").is_ok_and(|v| v == "1")
 }
 
 /// The emitted-crate name of a no-manifest (single-file) build: the name
@@ -464,7 +453,7 @@ impl Default for BuildOptions {
             static_plan: None,
             target: ipe_ir::Target::default(),
             intent: ipe_backend_rust::BuildIntent::default(),
-            runtime_dep: false,
+            runtime_emit: RuntimeEmit::Vendored,
             tree_shake_vendored: false,
             debugger: false,
             hot_appearance: false,
@@ -481,7 +470,7 @@ impl BuildOptions {
     #[must_use]
     pub fn gate() -> Self {
         Self {
-            runtime_dep: true,
+            runtime_emit: RuntimeEmit::Linked,
             runtime_origin: runtime_embed::RuntimeOrigin::Gate,
             ..Self::default()
         }
@@ -490,7 +479,8 @@ impl BuildOptions {
     /// Whether the emitted project names the runtime as a path dependency.
     #[must_use]
     pub const fn links_runtime_dependency(&self) -> bool {
-        self.runtime_dep || matches!(self.runtime_origin, runtime_embed::RuntimeOrigin::Gate)
+        matches!(self.runtime_emit, RuntimeEmit::Linked)
+            || matches!(self.runtime_origin, runtime_embed::RuntimeOrigin::Gate)
     }
 
     /// The default build options with the emit model resolved from the
@@ -500,12 +490,15 @@ impl BuildOptions {
     /// this so a library caller gets the same default emit model a `ipe dev build`
     /// invocation does, rather than the raw `Default` (which is vendored — the
     /// fallback shape).
-    #[must_use]
-    pub fn from_env() -> Self {
-        Self {
-            runtime_dep: runtime_dep_from_env(),
+    ///
+    /// # Errors
+    /// [`CliError::EnvSwitchNotRecognised`] when `IPE_RUNTIME_VENDORED` holds a
+    /// value outside its closed grammar (see [`RuntimeEmit::from_env`]).
+    pub fn from_env() -> Result<Self, CliError> {
+        Ok(Self {
+            runtime_emit: RuntimeEmit::from_env()?,
             ..Self::default()
-        }
+        })
     }
 }
 
@@ -516,7 +509,7 @@ impl BuildOptions {
 /// Returns [`CliError::Pipeline`] when the compiler rejects the program,
 /// [`CliError::Io`] on any filesystem failure.
 pub fn build(entry: &Path, out_dir: &Path, runtime_dir: &Path) -> Result<(), CliError> {
-    build_with_options(entry, out_dir, runtime_dir, BuildOptions::from_env())
+    build_with_options(entry, out_dir, runtime_dir, BuildOptions::from_env()?)
 }
 
 /// [`build`] with explicit [`BuildOptions`] (the static-plan-aware variant).
@@ -609,7 +602,7 @@ pub fn build_with_options_into(
 /// [`CliError::DiscoveryLimitReached`] when the import closure exceeds
 /// [`crate::loose_file::LooseFileLimits::DEFAULT`].
 pub fn build_loose_file(entry: &Path, out_dir: &Path, runtime_dir: &Path) -> Result<(), CliError> {
-    build_loose_file_with_options(entry, out_dir, runtime_dir, BuildOptions::from_env())
+    build_loose_file_with_options(entry, out_dir, runtime_dir, BuildOptions::from_env()?)
 }
 
 /// [`build_loose_file`] with explicit [`BuildOptions`] (the
@@ -683,7 +676,7 @@ pub fn build_test_into(
     let test_sources = root.test_sources_path();
     let target =
         out.prove(&ProjectPaths::from_manifest(root.manifest()).with_sources(&test_sources))?;
-    let options = test_build_options();
+    let options = test_build_options()?;
     let runtime_dir = resolve_vendored_runtime_dir(None, options.runtime_emit())?;
     let settings = emit_settings(
         &SettingsSource::Manifest {
@@ -715,12 +708,14 @@ pub fn build_test_into(
 
 /// The options a test program builds with: the environment's emit model at
 /// the development intent.
-#[must_use]
-pub fn test_build_options() -> BuildOptions {
-    BuildOptions {
+///
+/// # Errors
+/// The refusal of [`BuildOptions::from_env`].
+pub fn test_build_options() -> Result<BuildOptions, CliError> {
+    Ok(BuildOptions {
         intent: ipe_backend_rust::BuildIntent::Development,
-        ..BuildOptions::from_env()
-    }
+        ..BuildOptions::from_env()?
+    })
 }
 
 /// A loose entry plus the sibling modules its imports reach, ready to feed the shared compile core.
@@ -1064,7 +1059,7 @@ pub fn compile_modules_observed(
 /// # Errors
 /// [`CliError::Usage`] for a debugger build under the vendored runtime.
 const fn refuse_debugger_without_runtime_dep(options: &BuildOptions) -> Result<(), CliError> {
-    if options.debugger && !options.runtime_dep {
+    if options.debugger && matches!(options.runtime_emit, RuntimeEmit::Vendored) {
         return Err(CliError::Usage(text::msg::debugger_needs_runtime_dep()));
     }
     Ok(())
@@ -3049,7 +3044,7 @@ pub fn build_project(
         manifest_path,
         out_dir,
         runtime_dir,
-        &BuildOptions::from_env(),
+        &BuildOptions::from_env()?,
     )
 }
 
@@ -3338,21 +3333,9 @@ pub fn resolve_runtime() -> Result<PathBuf, CliError> {
     .map_err(|_| CliError::RuntimeNotFound)
 }
 
-/// What runtime source an emit carries, read from the options the emit runs with.
-///
-/// The one input [`resolve_vendored_runtime_dir`] decides on, so whether a
-/// build needs the vendored tree is never chosen apart from the emit shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RuntimeEmit {
-    /// The emitted project names the runtime crate as a path dependency and
-    /// carries no vendored module tree.
-    Linked,
-    /// The emitted project carries the runtime module tree under `src/ipe_runtime/`.
-    Vendored,
-}
-
 impl BuildOptions {
-    /// The runtime source the emit these options drive carries.
+    /// The runtime source the emit these options drive carries, a gate's
+    /// always linked.
     #[must_use]
     pub const fn runtime_emit(&self) -> RuntimeEmit {
         if self.links_runtime_dependency() {
@@ -3516,7 +3499,9 @@ mod tests {
             ipe_backend_rust::BuildIntent::Release
         );
         assert_eq!(
-            BuildOptions::from_env().intent,
+            BuildOptions::from_env()
+                .expect("BuildOptions from env")
+                .intent,
             ipe_backend_rust::BuildIntent::Release
         );
     }
@@ -4004,7 +3989,7 @@ main =
     fn test_runner_options() -> BuildOptions {
         BuildOptions {
             intent: ipe_backend_rust::BuildIntent::Development,
-            ..BuildOptions::from_env()
+            ..BuildOptions::from_env().expect("BuildOptions from env")
         }
     }
 
@@ -4061,14 +4046,14 @@ main =
     }
 
     /// A gate build links the embedded runtime as a dependency, whatever its
-    /// `runtime_dep` says; a developer build follows `runtime_dep`.
+    /// `runtime_emit` says; a developer build follows `runtime_emit`.
     #[test]
     fn a_gate_build_always_links_the_embedded_runtime_dependency() {
         let gate = BuildOptions::gate();
         assert_eq!(gate.runtime_origin, runtime_embed::RuntimeOrigin::Gate);
         assert!(gate.links_runtime_dependency());
         let vendored_gate = BuildOptions {
-            runtime_dep: false,
+            runtime_emit: RuntimeEmit::Vendored,
             ..BuildOptions::gate()
         };
         assert!(
@@ -4083,7 +4068,7 @@ main =
         assert!(!developer.links_runtime_dependency());
         assert!(
             BuildOptions {
-                runtime_dep: true,
+                runtime_emit: RuntimeEmit::Linked,
                 ..BuildOptions::default()
             }
             .links_runtime_dependency()

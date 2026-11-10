@@ -1469,3 +1469,75 @@ fn the_port_tag_matrix_covers_every_module_and_permission() {
         assert_eq!(entry.matches(case.as_str()).count(), 1, "{ctor}");
     }
 }
+
+/// Run the built `ipe` binary with `IPE_RUNTIME_VENDORED` set to `value`,
+/// capturing `(success, stderr)`.
+fn run_ipe_with_vendored_switch(
+    args: &[&std::ffi::OsStr],
+    value: &str,
+) -> Result<(bool, String), Box<dyn Error>> {
+    let out = Command::new(support::ipe_bin())
+        .args(args)
+        .env("IPE_RUNTIME_VENDORED", value)
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
+}
+
+/// A set `IPE_RUNTIME_VENDORED` outside its `0`/`1` grammar stops the command
+/// before it writes anything: `ipe dev build` and `ipe test` both exit non-zero
+/// naming the variable and its admitted spellings, and no output is created.
+#[test]
+fn an_unrecognised_vendored_switch_refuses_before_any_output() -> TestResult {
+    let dir = crate::support::scratch_root().join(format!(
+        "ipe_vendored_switch_refused_{}",
+        std::process::id()
+    ));
+    e2e_support::scratch::fresh(&dir);
+    write_project(&dir)?;
+    std::fs::create_dir_all(dir.join("tests"))?;
+    std::fs::copy(
+        fixture("tests_pass.ipe"),
+        dir.join("tests").join("Main.ipe"),
+    )?;
+    let out = dir.join("refused-out");
+    let build = [
+        std::ffi::OsStr::new("dev"),
+        std::ffi::OsStr::new("build"),
+        dir.as_os_str(),
+        std::ffi::OsStr::new("--out"),
+        out.as_os_str(),
+    ];
+    let test = [std::ffi::OsStr::new("test"), dir.as_os_str()];
+    let mut outcomes = Vec::new();
+    for args in [&build[..], &test[..]] {
+        for value in ["true", "", " 1"] {
+            outcomes.push((
+                args.len(),
+                value,
+                run_ipe_with_vendored_switch(args, value)?,
+            ));
+        }
+    }
+    let out_exists = out.exists();
+    let _ = std::fs::remove_dir_all(&dir);
+    for (arity, value, (ok, stderr)) in &outcomes {
+        assert!(
+            !ok,
+            "IPE_RUNTIME_VENDORED={value:?} must be refused ({arity} args)"
+        );
+        assert!(
+            stderr.contains("IPE_RUNTIME_VENDORED") && stderr.contains("0, 1"),
+            "the refusal must name the variable and its spellings, got stderr:\n{stderr}"
+        );
+    }
+    assert!(
+        !out_exists,
+        "the refusal fires before any output is created"
+    );
+    Ok(())
+}

@@ -103,7 +103,7 @@ fn build_project(slot: &str, hot: bool) -> (PathBuf, Result<(), ipe::CliError>) 
     // drive the hot-swap hoist explicitly through the option instead.
     let options = ipe::BuildOptions {
         hot_appearance: hot,
-        ..ipe::BuildOptions::from_env()
+        ..ipe::BuildOptions::from_env().expect("BuildOptions from env")
     };
     let res = ipe::build_fixture_with_options(&fixture, &emit, &runtime(), &options).map(drop);
     (emit, res)

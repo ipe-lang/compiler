@@ -53,8 +53,8 @@ fn emit_and_build(name: &str, ipe_source: &str) -> Result<(), BoxError> {
         .map_err(|e| -> BoxError { e.into() })
 }
 
-/// Like `emit_and_build` but forces the VENDORED emit model (`runtime_dep:
-/// false`), regardless of the `IPE_RUNTIME_VENDORED` environment variable.
+/// Like `emit_and_build` but forces the VENDORED emit model
+/// (`RuntimeEmit::Vendored`), regardless of the `IPE_RUNTIME_VENDORED` environment variable.
 ///
 /// The vendored model copies the runtime source into the emitted crate and
 /// compiles it with the feature flags declared in the emitted `Cargo.toml`.
@@ -74,7 +74,7 @@ fn emit_and_build_vendored(name: &str, ipe_source: &str) -> Result<(), BoxError>
     // Force the vendored emit model so `#[cfg(feature = "...")]` coverage in
     // the vendored runtime source is verified — the dep-model never exercises it.
     let options = ipe::BuildOptions {
-        runtime_dep: false,
+        runtime_emit: ipe::RuntimeEmit::Vendored,
         ..ipe::BuildOptions::default()
     };
     ipe::build_fixture_with_options(&fixture, &out_dir, &runtime, &options).map_err(
@@ -562,7 +562,7 @@ fn json_object_order_vendored_builds_and_keeps_insertion_order() {
     e2e_support::scratch::fresh(&out_dir);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let options = ipe::BuildOptions {
-        runtime_dep: false,
+        runtime_emit: ipe::RuntimeEmit::Vendored,
         ..ipe::BuildOptions::default()
     };
     ipe::build_fixture_with_options(&fixture, &out_dir, &runtime, &options)

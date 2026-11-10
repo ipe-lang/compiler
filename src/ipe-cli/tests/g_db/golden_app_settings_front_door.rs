@@ -218,7 +218,7 @@ fn auth_revocation_seal_builds() {
 }
 
 /// A program with an authenticated route (`Server.getAuthed`) emitted under the
-/// **vendored** emit model (`runtime_dep: false`) must DECLARE the `revocation`
+/// **vendored** emit model (`RuntimeEmit::Vendored`) must DECLARE the `revocation`
 /// module in `ipe_runtime/mod.rs`. `server.rs`'s `authed_route` middleware calls
 /// `crate::revocation::is_revoked` unconditionally, so a missing declaration
 /// produces E0433 (ipe exit 0, then cargo fails). This is the regression tripwire
@@ -241,7 +241,7 @@ fn authed_route_revocation_vendored_declares_module() {
     // Force the vendored emit model regardless of the environment default —
     // the model whose trimmed `mod.rs` template must carry the revocation append.
     let opts = ipe::BuildOptions {
-        runtime_dep: false,
+        runtime_emit: ipe::RuntimeEmit::Vendored,
         ..ipe::BuildOptions::default()
     };
     let built = ipe::build_golden_dir(&entry, &out, &runtime, &opts);

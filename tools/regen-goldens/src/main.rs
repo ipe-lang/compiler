@@ -200,7 +200,9 @@ fn regenerate_one(dir: &Path, out: &Path, runtime: &Path) -> Result<usize, Strin
 /// Run the compiler's emit path for one golden, through the same
 /// [`ipe::build_golden_dir`] the golden tests build through.
 fn emit_golden(dir: &Path, out: &Path, runtime: &Path) -> Result<(), String> {
-    ipe::build_golden_dir(dir, out, runtime, &ipe::BuildOptions::from_env())
+    let options =
+        ipe::BuildOptions::from_env().map_err(|e| format!("emit options refused: {e:?}"))?;
+    ipe::build_golden_dir(dir, out, runtime, &options)
         .map_err(|e| format!("compiler emit failed: {e:?}"))
 }
 

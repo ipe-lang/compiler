@@ -455,7 +455,7 @@ impl<'a> BundleAssembler<'a> {
     ) -> Result<EmittedCrate, CliError> {
         let options = BuildOptions {
             intent: self.profile.build_intent(),
-            ..BuildOptions::from_env()
+            ..BuildOptions::from_env()?
         };
         let runtime_dir = resolve_vendored_runtime_dir(None, options.runtime_emit())?;
         let host = delivery::HostIntent::WebView(webview);
