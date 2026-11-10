@@ -1207,6 +1207,14 @@ pub const INTERPOLABLE_TYPES: [&str; 5] = ["String", "Int", "Float", "Bool", "Ch
 /// it equals the set its SQL-parameter gate accepts.
 pub const SQL_PARAM_TYPES: [&str; 5] = ["Int", "Float", "String", "Bool", "SqlValue"];
 
+/// The methods one `Ipe.Server` route may name besides `ANY`, in hint order.
+///
+/// Mirrors the runtime's routable method set
+/// (`ipe_runtime_rust::encoding::RoutableMethod::ALL`), which the diagnostics
+/// crate cannot import; the backend's route grammar tests assert the two agree.
+pub const ROUTABLE_METHOD_NAMES: [&str; 7] =
+    ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+
 /// The Ipê types that satisfy the `number` class (`+`, `-`, `*`).
 ///
 /// The single table the type gate (`ipe_types::super_bounds::NUMBER`) and the
@@ -4069,10 +4077,15 @@ fn route_pattern_malformed_help(defect: &RoutePatternDefect) -> Vec<HelpLine> {
                 .to_string()
         }
         RoutePatternDefect::UnknownMethod { .. } => {
-            "name one of `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, \
-             `CONNECT`, `TRACE` or `ANY` before the path — or omit the method to serve every \
-             method"
-                .to_string()
+            let names: Vec<String> = ROUTABLE_METHOD_NAMES
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect();
+            format!(
+                "name one of {} or `ANY` before the path — or omit the method to serve \
+                 them all; no route serves `TRACE` or `CONNECT`",
+                names.join(", ")
+            )
         }
         RoutePatternDefect::MountPrefixNotLiteral => {
             "write the mount prefix as a string literal (`Server.static \"/assets\" dir`), so \

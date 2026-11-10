@@ -1192,6 +1192,22 @@ mod agreement_tests {
         }
     }
 
+    /// The method names the IPE-L0156 hint offers are exactly the methods a
+    /// route may serve, so the hint never offers a refused method nor omits a
+    /// served one.
+    #[test]
+    fn unknown_method_hint_names_the_routable_set() {
+        use ipe_runtime_rust::encoding::RoutableMethod;
+        let mut hint = ipe_diagnostics::ROUTABLE_METHOD_NAMES.to_vec();
+        let mut served: Vec<&str> = RoutableMethod::ALL
+            .into_iter()
+            .map(RoutableMethod::as_str)
+            .collect();
+        hint.sort_unstable();
+        served.sort_unstable();
+        assert_eq!(hint, served);
+    }
+
     /// Prove the refusals: a literal `Server.api` method naming `TRACE`,
     /// `CONNECT` or no method at all is refused at compile time, and the
     /// server's listen-time parse refuses it with the matching cause.

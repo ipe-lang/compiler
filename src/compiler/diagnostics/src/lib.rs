@@ -28,8 +28,8 @@ pub use diagnostic::{
     HeaderDefect, HelpLine, Hint, INTERPOLABLE_TYPES, IfDefect, ImportedAs, InterceptContext,
     InterpolationDefect, LetDefect, LowerError, MainRetName, ModelLeaf, ModulePlacementReason,
     ModulePlacementRejection, MountPrefixFault, NUMBER_TYPES, NameError, NonWebShape, OpenerText,
-    Owed, ParseError, RoutePatternDefect, RustNameFoldKind, SQL_PARAM_TYPES, SandboxError,
-    SealRejection, SortedNames, SpanRole, StdlibReach, StoreEqAccessorDefect,
+    Owed, ParseError, ROUTABLE_METHOD_NAMES, RoutePatternDefect, RustNameFoldKind, SQL_PARAM_TYPES,
+    SandboxError, SealRejection, SortedNames, SpanRole, StdlibReach, StoreEqAccessorDefect,
     StoreSelectProjectionDefect, Suggestion, TokenKind, TripleStringDefect, TyDoc, TypeClass,
     TypeDeclDefect, TypeError, TypeSizeOrigin, WildcardDependence,
 };
