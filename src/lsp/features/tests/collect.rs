@@ -1617,6 +1617,37 @@ fn prefer_pipeline_quick_fix_rewrites_the_nested_call() {
     );
 }
 
+/// The LSP's `unused-bindings` diagnostics agree with the lint: a binding
+/// used only inside a `{{…}}` body is used, and its unused sibling is reported.
+#[test]
+fn unused_bindings_counts_a_use_inside_an_interpolation() {
+    let src = concat!(
+        "module Main exposing (main)\n\n",
+        "main =\n",
+        "    let\n",
+        "        name = \"Ana\"\n",
+        "        unused = 42\n",
+        "    in\n",
+        "    \"\"\"hi {{String.toUpper name}}\"\"\"\n",
+    );
+    let mut user_texts = BTreeMap::new();
+    user_texts.insert(vec!["Main".to_owned()], src.to_owned());
+    let Ok(per_module) = collect_lint(
+        &user_texts,
+        &LintConfig::default(),
+        PositionEncoding::Utf16,
+        &NeverCancel,
+    );
+    let code = lsp_types::NumberOrString::String("lint/unused-bindings".to_owned());
+    let lines: Vec<u32> = per_module
+        .into_iter()
+        .flat_map(|(_, diags)| diags)
+        .filter(|d| d.code.as_ref() == Some(&code))
+        .map(|d| d.range.start.line)
+        .collect();
+    assert_eq!(lines, vec![5], "only `unused` (line 5) is reported");
+}
+
 /// `unused-bindings` ships a local [`ipe_lint::Fix`] (prefix the name with
 /// `_`), so the generic mechanism offers it as an LSP quick-fix with no
 /// rule-specific code.
