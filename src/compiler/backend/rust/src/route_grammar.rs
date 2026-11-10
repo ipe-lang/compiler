@@ -573,6 +573,8 @@ mod tests {
             ("FETCH /x", "FETCH"),
             ("po\u{17f}t /x", "po\u{17f}t"),
             ("G-ET /x", "G-ET"),
+            ("TRACE  /a/:id", "TRACE"),
+            ("connect /x", "connect"),
         ] {
             assert_eq!(
                 server_api_spec(spec),
@@ -589,7 +591,7 @@ mod tests {
             "Any /x",
             "/x",
             " /x",
-            "TRACE  /a/:id",
+            "DELETE  /a/:id",
         ] {
             assert_eq!(server_api_spec(spec), Ok(()), "{spec:?}");
         }
