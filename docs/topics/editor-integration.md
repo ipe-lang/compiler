@@ -24,7 +24,7 @@ From a checkout, `sh editors/<editor>/configure.sh` does the same with the
 checkout's files. The scripts are idempotent. Every file they change is first
 copied to a fresh `<file>.ipe-backup-<timestamp>`; in a config file they own
 only the block between the `>>> ipe` / `<<< ipe` marker lines, and leave the
-rest of the file byte for byte. Set `IPE_EDITORS_REF` to fetch a tag or commit
+rest of the file byte for byte. Set `IPE_EDITORS_REF` to fetch a branch, tag or full commit id
 instead of `main`.
 
 Open the folder holding `package.ipe` (not a loose file): go-to-definition and
@@ -140,7 +140,9 @@ only from its UI. `editors/zed/configure.sh` assembles the extension —
 1. In Zed run **zed: install dev extension**.
 2. Choose `~/.local/share/ipe/zed-ipe`.
 
-Zed then compiles the grammar (pinned to a commit in `extension.toml`) and the
+Zed then compiles the grammar (from the commit the highlight query came from:
+a checkout's committed `HEAD`, or the commit `IPE_EDITORS_REF` names, default
+`main`) and the
 extension's small Rust part — a `cargo build --target wasm32-wasip2`, Zed's own
 extension-compile target — highlights `.ipe` files, and starts `ipe lsp` from
 your `PATH`. This needs a **rustup-managed** Rust toolchain (a distro-packaged
@@ -171,6 +173,9 @@ host loads:
 cd editors/tree-sitter-ipe && tree-sitter generate --abi 14
 ```
 
-After a grammar or query change, update `rev` in `editors/zed-ipe/extension.toml`
-to a commit that contains it; `editors/tests/configure-test.sh` fails while the
-pinned commit's grammar differs from the checkout's.
+A grammar or query change needs no Zed pin bump: `editors/zed/configure.sh`
+fills `extension.toml`'s grammar `repository` and `rev` with the source and
+commit it assembled the highlight query from, and refuses a checkout whose
+grammar or query has uncommitted changes. `editors/tests/configure-test.sh`
+replays Zed's grammar checkout from the assembled pin and fails when its grammar
+or query differs from what was assembled.

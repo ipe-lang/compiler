@@ -39,6 +39,28 @@ stub() { printf '#!/bin/sh\n%s\n' "$2" > "$SB/bin/$1"; chmod +x "$SB/bin/$1"; }
 ORIG_PATH="$PATH"
 ORIG_HOME="$HOME"
 
+# The grammar Zed builds and the highlight query assembled beside it.
+GRAMMAR_REL="editors/tree-sitter-ipe"
+GRAMMAR_PATHS="$GRAMMAR_REL/src $GRAMMAR_REL/queries/highlights.scm"
+# zed_pin_truthful EXT_DIR SRC_ROOT — replay Zed's grammar checkout from the
+# assembled extension.toml exactly as Zed runs it (git init; remote add origin
+# <repository>; fetch --depth 1 origin <rev>; checkout <rev>), then require the
+# checked-out grammar to be SRC_ROOT's and its highlight query the assembled one.
+zed_pin_truthful() {
+    local toml="$1/extension.toml" clone="$WORK/zed-grammar-clone" repo rev path
+    repo="$(sed -n '/^\[grammars\.ipe\]$/,/^\[/s/^repository = "\(.*\)"$/\1/p' "$toml")"
+    rev="$(sed -n '/^\[grammars\.ipe\]$/,/^\[/s/^rev = "\([0-9a-f]\{40\}\)"$/\1/p' "$toml")"
+    path="$(sed -n '/^\[grammars\.ipe\]$/,/^\[/s/^path = "\(.*\)"$/\1/p' "$toml")"
+    [ -n "$repo" ] && [ -n "$rev" ] && [ "$path" = "$GRAMMAR_REL" ] || return 1
+    rm -rf "$clone" && mkdir -p "$clone" || return 1
+    git -C "$clone" init -q \
+        && git --git-dir "$clone/.git" remote add origin "$repo" \
+        && git --git-dir "$clone/.git" fetch -q --depth 1 origin "$rev" 2> /dev/null \
+        && (cd "$clone" && git --git-dir "$clone/.git" checkout -q "$rev" 2> /dev/null) \
+        && cmp -s "$clone/$path/queries/highlights.scm" "$1/languages/ipe/highlights.scm" \
+        && diff -r -q "$clone/$path/src" "$2/$GRAMMAR_REL/src" > /dev/null
+}
+
 # --- lib: backups and managed blocks -----------------------------------------------
 sandbox lib
 (
@@ -199,16 +221,109 @@ fi
 sandbox zed-missing
 if sh "$ROOT/editors/zed/configure.sh" > "$SB/out" 2>&1; then bad "Zed: refuses without zed"; else ok "Zed: refuses without zed"; fi
 
+# --- Zed grammar pin, on a throwaway checkout ------------------------------------------
+# A one-commit copy of this checkout's editors/ working tree (with a space in
+# its path) that the refusals below may dirty and re-commit without touching
+# this checkout.
+PATH="$ORIG_PATH"
+copy_editors() { # DEST — the working tree's tracked and unignored editors/ files
+    mkdir -p "$1"
+    git -C "$ROOT" ls-files -z --cached --others --exclude-standard -- editors \
+        | (cd "$ROOT" && tar --null -T - -cf -) | tar -x -C "$1"
+}
+FAKE="$WORK/fake checkout"
+copy_editors "$FAKE"
+fake_git() { git -C "$FAKE" -c user.name=t -c user.email=t@t -c commit.gpgsign=false "$@"; }
+fake_git init -q && fake_git add -A && fake_git commit -q -m fixture
+sandbox zed-pin
+stub zed 'exit 0'
+stub rustup 'exit 0'
+stub cargo 'exit 0'
+ZED_EXT="$XDG_DATA_HOME/ipe/zed-ipe"
+# Zed's grammar clone from another source, left by an earlier install.
+mkdir -p "$ZED_EXT/grammars/ipe"
+git -C "$ZED_EXT/grammars/ipe" init -q
+git --git-dir "$ZED_EXT/grammars/ipe/.git" remote add origin "https://github.com/ipe-lang/compiler"
+: > "$ZED_EXT/grammars/ipe.wasm"
+sh "$FAKE/editors/zed/configure.sh" > "$SB/out" 2>&1 && ok "Zed pin: happy path from a checkout" || { bad "Zed pin: happy path from a checkout"; cat "$SB/out"; }
+check "Zed pin: pinned to the checkout's HEAD, served from the checkout" \
+    'grep -qxF "repository = \"file://$(cd "$FAKE" && pwd -P)\"" "$ZED_EXT/extension.toml" && grep -qx "rev = \"$(fake_git rev-parse HEAD)\"" "$ZED_EXT/extension.toml"'
+check "Zed pin: the replay checks out the checkout's grammar and query" 'zed_pin_truthful "$ZED_EXT" "$FAKE"'
+check "Zed pin: a grammar clone of another source is removed" \
+    '[ ! -e "$ZED_EXT/grammars/ipe" ] && [ ! -e "$ZED_EXT/grammars/ipe.wasm" ]'
+# A clone of the same source is Zed's to update and stays.
+mkdir -p "$ZED_EXT/grammars/ipe"
+git -C "$ZED_EXT/grammars/ipe" init -q
+git --git-dir "$ZED_EXT/grammars/ipe/.git" remote add origin "file://$(cd "$FAKE" && pwd -P)"
+sh "$FAKE/editors/zed/configure.sh" > "$SB/out" 2>&1 && ok "Zed pin: re-run" || bad "Zed pin: re-run"
+check "Zed pin: a grammar clone of the same source is kept" '[ -d "$ZED_EXT/grammars/ipe/.git" ]'
+# A grammar change committed after the install: the re-run pins the new commit.
+printf '; changed\n' >> "$FAKE/$GRAMMAR_REL/queries/highlights.scm"
+fake_git commit -q -am "grammar change"
+sh "$FAKE/editors/zed/configure.sh" > "$SB/out" 2>&1 && ok "Zed pin: re-run after a grammar commit" || bad "Zed pin: re-run after a grammar commit"
+check "Zed pin: a grammar commit moves the pin with it" \
+    'grep -qx "rev = \"$(fake_git rev-parse HEAD)\"" "$ZED_EXT/extension.toml" && zed_pin_truthful "$ZED_EXT" "$FAKE"'
+# Refusal: uncommitted grammar or query changes (Zed would build the commit,
+# the query would be the working tree's) leave the installed extension alone.
+cp "$ZED_EXT/extension.toml" "$SB/toml.before"
+printf '; uncommitted\n' >> "$FAKE/$GRAMMAR_REL/queries/highlights.scm"
+if sh "$FAKE/editors/zed/configure.sh" > "$SB/out" 2>&1; then bad "Zed pin: refuses an uncommitted query change"; else ok "Zed pin: refuses an uncommitted query change"; fi
+check "Zed pin: the refusal names the uncommitted change" 'grep -q "uncommitted grammar or highlight-query changes" "$SB/out"'
+fake_git checkout -q -- "$GRAMMAR_REL/queries/highlights.scm"
+: > "$FAKE/$GRAMMAR_REL/src/untracked.h"
+if sh "$FAKE/editors/zed/configure.sh" > "$SB/out" 2>&1; then bad "Zed pin: refuses an untracked grammar file"; else ok "Zed pin: refuses an untracked grammar file"; fi
+rm -f "$FAKE/$GRAMMAR_REL/src/untracked.h"
+check "Zed pin: refusals left the installed extension.toml unchanged" 'cmp -s "$SB/toml.before" "$ZED_EXT/extension.toml"'
+# Refusal: a template carrying a stored commit instead of the placeholder.
+sed -i.bak 's/^rev = "@IPE_GRAMMAR_REV@"$/rev = "e7ff85a969e481cc46563733dbb501f97a75bff7"/' "$FAKE/editors/zed-ipe/extension.toml"
+rm -f "$FAKE/editors/zed-ipe/extension.toml.bak"
+if sh "$FAKE/editors/zed/configure.sh" > "$SB/out" 2>&1; then bad "Zed pin: refuses a stored grammar commit"; else ok "Zed pin: refuses a stored grammar commit"; fi
+fake_git checkout -q -- editors/zed-ipe/extension.toml
+# Refusal: a copy of editors/ outside any git checkout.
+NOGIT="$WORK/nogit"
+copy_editors "$NOGIT"
+if GIT_CEILING_DIRECTORIES="$WORK" sh "$NOGIT/editors/zed/configure.sh" > "$SB/out" 2>&1; then
+    bad "Zed pin: refuses a copy outside a git checkout"
+else
+    ok "Zed pin: refuses a copy outside a git checkout"
+fi
+
+# --- lib: IPE_EDITORS_REF resolution (curl installs) -------------------------------------
+sandbox resolve
+stub git 'printf "%s\t%s\n" 1111111111111111111111111111111111111111 refs/heads/main 2222222222222222222222222222222222222222 refs/tags/v1 3333333333333333333333333333333333333333 "refs/tags/v1^{}" 4444444444444444444444444444444444444444 refs/heads/both 5555555555555555555555555555555555555555 refs/tags/both'
+resolve() { (IPE_SRC_ROOT="$ROOT"; . "$ROOT/editors/lib/ipe-editors.sh"; ipe_resolve_ref "$1") 2> /dev/null; }
+check "lib: a branch resolves to its commit" '[ "$(resolve main)" = 1111111111111111111111111111111111111111 ]'
+check "lib: an annotated tag resolves to its peeled commit" '[ "$(resolve v1)" = 3333333333333333333333333333333333333333 ]'
+check "lib: a full commit id resolves to itself" '[ "$(resolve 0123456789abcdef0123456789abcdef01234567)" = 0123456789abcdef0123456789abcdef01234567 ]'
+check "lib: refuses a name that is both a branch and a tag" '! resolve both > /dev/null'
+check "lib: refuses an unknown ref" '! resolve nope > /dev/null'
+check "lib: refuses a ref outside the ref-name alphabet" '! resolve "main;rm" > /dev/null && ! resolve "-x" > /dev/null && ! resolve "" > /dev/null'
+
 # --- drift checks ---------------------------------------------------------------------------
 PATH="$ORIG_PATH"
-rev="$(sed -n 's/^rev = "\([0-9a-f]\{40\}\)"$/\1/p' "$ROOT/editors/zed-ipe/extension.toml")"
-if [ -z "$rev" ]; then
-    bad "Zed: extension.toml pins the grammar to a commit"
-elif ! git -C "$ROOT" cat-file -e "$rev^{commit}" 2> /dev/null; then
-    bad "Zed: pinned grammar commit $rev is not in this clone (fetch it or fix the pin)"
+check "Zed: extension.toml stores no grammar commit (configure.sh derives it)" \
+    '! grep -Eq "^rev = \"[0-9a-f]{40}\"" "$ROOT/editors/zed-ipe/extension.toml" && grep -qx "rev = \"@IPE_GRAMMAR_REV@\"" "$ROOT/editors/zed-ipe/extension.toml"'
+if [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=all -- $GRAMMAR_PATHS)" ]; then
+    printf 'skip Zed pin replay on this checkout (uncommitted grammar changes; configure.sh refuses them)\n'
 else
-    check "Zed: pinned grammar commit matches this checkout's grammar" \
-        'git -C "$ROOT" diff --quiet "$rev" HEAD -- editors/tree-sitter-ipe/src editors/tree-sitter-ipe/queries/highlights.scm'
+    check "Zed: the assembled pin checks out this checkout's grammar and query" \
+        'zed_pin_truthful "$ZED_ASSEMBLED" "$ROOT"'
+    # Refusal: the same assembled extension pinned to the parent of the last
+    # grammar change (a stale pin) must fail the replay.
+    last_grammar="$(git -C "$ROOT" log -1 --format=%H -- $GRAMMAR_PATHS)"
+    stale="$(git -C "$ROOT" rev-parse --verify -q "$last_grammar^" || true)"
+    if [ -z "$stale" ] || git -C "$ROOT" diff --quiet "$stale" HEAD -- $GRAMMAR_PATHS; then
+        bad "Zed: a stale-pin fixture exists (a commit before the last grammar change)"
+    else
+        STALE_EXT="$WORK/zed-stale-ext"
+        rm -rf "$STALE_EXT" && cp -R "$ZED_ASSEMBLED" "$STALE_EXT"
+        sed -i.bak "s/^rev = \"[0-9a-f]\{40\}\"\$/rev = \"$stale\"/" "$STALE_EXT/extension.toml"
+        if grep -qx "rev = \"$stale\"" "$STALE_EXT/extension.toml" && ! zed_pin_truthful "$STALE_EXT" "$ROOT"; then
+            ok "Zed: the replay refuses a pin to a commit with another grammar"
+        else
+            bad "Zed: the replay refuses a pin to a commit with another grammar"
+        fi
+    fi
 fi
 
 hl_keywords="$(awk '/^\[/{k=1; buf=""; next} k && /^\] @keyword/{print buf; k=0; next} k{buf=buf" "$0}' \

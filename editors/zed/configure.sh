@@ -9,7 +9,8 @@
 #   1. Preflight: ipe, zed (or zeditor), rustup + cargo (Zed compiles the
 #      extension's Rust part itself), git.
 #   2. Assembles the extension (editors/zed-ipe + the grammar's highlight
-#      queries) into ${XDG_DATA_HOME:-~/.local/share}/ipe/zed-ipe.
+#      queries) into ${XDG_DATA_HOME:-~/.local/share}/ipe/zed-ipe, pinning
+#      Zed's grammar checkout to the commit the queries came from.
 #   3. Prints the one step Zed only offers in its UI: install that directory
 #      as a dev extension. The extension provides highlighting and starts
 #      `ipe lsp` itself — settings.json is never edited.
@@ -57,6 +58,37 @@ rustup target add wasm32-wasip2 > /dev/null 2>&1 \
 
 EXT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/ipe/zed-ipe"
 
+# --- the one revision everything comes from ------------------------------------------
+# Zed clones the grammar from extension.toml's `repository` at `rev`; the
+# highlight query is assembled below. Both come from one commit, fixed here: a
+# checkout's HEAD (served to Zed from the checkout itself, so an unpushed or
+# squash-merged commit works) or the commit IPE_EDITORS_REF names on GitHub.
+GRAMMAR_PATHS="$IPE_GRAMMAR_DIR/src $IPE_GRAMMAR_DIR/queries/highlights.scm"
+if [ -n "$IPE_SRC_ROOT" ]; then
+    SRC_REAL="$(cd "$IPE_SRC_ROOT" && pwd -P)" || die "cannot resolve $IPE_SRC_ROOT"
+    SRC_TOP="$(git -C "$SRC_REAL" rev-parse --show-toplevel 2> /dev/null)" || SRC_TOP=""
+    [ "$SRC_TOP" = "$SRC_REAL" ] \
+        || die "$SRC_REAL is not a git checkout — Zed fetches the grammar with git; use the curl install instead"
+    # shellcheck disable=SC2086
+    dirty="$(git -C "$SRC_REAL" status --porcelain --untracked-files=all -- $GRAMMAR_PATHS)" \
+        || die "cannot read the git status of $SRC_REAL"
+    [ -z "$dirty" ] \
+        || die "uncommitted grammar or highlight-query changes in $SRC_REAL — Zed builds the committed grammar, so commit or stash them first"
+    GRAMMAR_REV="$(git -C "$SRC_REAL" rev-parse --verify 'HEAD^{commit}')" \
+        || die "$SRC_REAL has no commit to pin the grammar to"
+    # Zed compares this URL byte for byte and it lands in a TOML string.
+    case "$SRC_REAL" in
+        *[\"\\%]*) die "the checkout path $SRC_REAL contains \", \\ or %, which Zed's grammar URL cannot carry — move the checkout" ;;
+    esac
+    [ -z "$(printf '%s' "$SRC_REAL" | LC_ALL=C tr -d '\040-\176\200-\377')" ] \
+        || die "the checkout path $SRC_REAL contains a control character — move the checkout"
+    GRAMMAR_REPOSITORY="file://$SRC_REAL"
+else
+    GRAMMAR_REV="$(ipe_resolve_ref "$IPE_EDITORS_REF")"
+    GRAMMAR_REPOSITORY="https://github.com/$IPE_REPO_SLUG"
+    IPE_RAW_BASE="https://raw.githubusercontent.com/$IPE_REPO_SLUG/$GRAMMAR_REV"
+fi
+
 # --- assemble the extension -------------------------------------------------------
 # The highlight queries come straight from the grammar (their single source);
 # the rest is editors/zed-ipe.
@@ -68,8 +100,26 @@ done
 # Zed reads only highlights.scm from these; it rejects a capture-less
 # injections query, so none is shipped.
 ipe_fetch "$IPE_GRAMMAR_DIR/queries/highlights.scm" "$X/languages/ipe/highlights.scm"
+GRAMMAR_REPOSITORY="$GRAMMAR_REPOSITORY" GRAMMAR_REV="$GRAMMAR_REV" awk '
+    $0 == "repository = \"@IPE_GRAMMAR_REPOSITORY@\"" { print "repository = \"" ENVIRON["GRAMMAR_REPOSITORY"] "\""; r++; next }
+    $0 == "rev = \"@IPE_GRAMMAR_REV@\"" { print "rev = \"" ENVIRON["GRAMMAR_REV"] "\""; v++; next }
+    { print }
+    END { if (r != 1 || v != 1) exit 1 }
+' "$X/extension.toml" > "$X/extension.toml.pinned" \
+    || die "extension.toml must hold exactly one grammar repository and one rev placeholder"
+mv -f "$X/extension.toml.pinned" "$X/extension.toml"
 grep -Eq '^rev = "[0-9a-f]{40}"$' "$X/extension.toml" \
     || die "extension.toml does not pin the grammar to a commit"
+
+# Zed refuses to reuse a grammar clone whose origin is another repository (an
+# install from the other source, or a moved checkout); the clone is Zed's own
+# rebuildable cache, so it goes and Zed clones afresh.
+GRAMMAR_CLONE="$EXT_DIR/grammars/ipe"
+if [ -d "$GRAMMAR_CLONE/.git" ] \
+    && [ "$(git --git-dir "$GRAMMAR_CLONE/.git" remote get-url origin 2> /dev/null)" != "$GRAMMAR_REPOSITORY" ]; then
+    rm -rf "$GRAMMAR_CLONE" "$EXT_DIR/grammars/ipe.wasm" || die "cannot remove $GRAMMAR_CLONE"
+    say "removed Zed's grammar clone of another source ($GRAMMAR_CLONE); Zed clones $GRAMMAR_REPOSITORY on the next build"
+fi
 
 for f in extension.toml Cargo.toml Cargo.lock .cargo/config.toml src/lib.rs \
     languages/ipe/config.toml languages/ipe/highlights.scm; do
