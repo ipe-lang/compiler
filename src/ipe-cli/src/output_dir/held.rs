@@ -1768,7 +1768,7 @@ impl HeldDir {
             Ok(Some(_)) => return Ok(Created::Exists),
             Err(refusal) => return Err(refused(&path, refusal)),
         }
-        match sys::rename_noreplace(&self.dir, staging, target) {
+        match sys::rename_file_noreplace(&self.dir, staging, target) {
             Ok(()) => Ok(Created::Done),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(Created::Exists),
             Err(e) => Err(act_err(&path, e)),
@@ -3550,6 +3550,43 @@ mod tests {
             Some("old")
         );
         assert!(staged_in(&base).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The link leg of a file's no-replace rename refuses a file planted at its target, leaving it untouched.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_file_refuses_the_no_replace_link() {
+        let base = scratch("link_noreplace");
+        std::fs::write(base.join("staged"), "new").expect("staged file");
+        std::fs::write(base.join("target"), "old").expect("planted file");
+        let held = held_at(&base);
+        let linked = sys::link_noreplace(&held.dir, &name("staged"), &name("target"));
+        assert_eq!(
+            linked.map_err(|e| e.kind()),
+            Err(io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("target")).ok().as_deref(),
+            Some("old")
+        );
+        let renamed = sys::rename_file_noreplace(&held.dir, &name("staged"), &name("target"));
+        assert_eq!(
+            renamed.map_err(|e| e.kind()),
+            Err(io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("target")).ok().as_deref(),
+            Some("old")
+        );
+        assert_eq!(
+            sys::link_noreplace(&held.dir, &name("staged"), &name("fresh")).ok(),
+            Some(true)
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("fresh")).ok().as_deref(),
+            Some("new")
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }
