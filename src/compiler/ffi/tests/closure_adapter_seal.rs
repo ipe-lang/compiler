@@ -292,7 +292,7 @@ fn ffi_closure_trip_ends_typed() {
     .replace("pub fn demo_apply_fn(", "pub fn demo_apply_fn_option(")
     .replace("ApplyFnClosure", "ApplyFnClosureOption");
 
-    let runtime = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/rust");
+    let runtime = e2e_support::require_runtime_crate();
     let dir =
         ipe_test_temp::temp_root().join(format!("ipe_ffi_closure_trip_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
