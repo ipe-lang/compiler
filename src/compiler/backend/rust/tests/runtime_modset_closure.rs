@@ -1203,7 +1203,7 @@ fn tokio_need(path: &str) -> Result<&'static [TokioFeature], String> {
         ["spawn" | "task_local"] | ["task" | "runtime", ..] => Ok(&[F::Rt]),
         ["main"] => Ok(&[F::Macros, F::RtMultiThread]),
         ["select" | "join" | "try_join" | "test"] => Ok(&[F::Macros]),
-        ["pin"] | ["io"] => Ok(&[]),
+        ["pin" | "io"] => Ok(&[]),
         ["io", item, ..] if NO_FEATURE_IO.contains(item) => Ok(&[]),
         ["io", item, ..]
             if IO_UTIL.contains(item)
