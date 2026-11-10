@@ -68,6 +68,9 @@ mod seal_e2e;
 #[path = "support/cfg.rs"]
 mod cfg;
 
+#[path = "support/rust_lex.rs"]
+mod rust_lex;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -398,12 +401,72 @@ fn optional_deps(cargo_toml: &str) -> BTreeSet<String> {
     deps
 }
 
-/// The runtime crate's reachable Rust code, comment lines dropped.
+/// What the runtime crate's code reads, lexed: the features its `cfg` gates
+/// name and the identifiers it uses as a path root (`x::…`).
 ///
-/// It reads `src/**/*.rs` and `build.rs`; dropping comments keeps prose naming
-/// a feature or crate from reading as use.
+/// Each source is lexed through [`rust_lex`], so a feature or crate named only
+/// in a comment, block comment or string literal is never read as use.
+/// `#[cfg(test)]` items count: the crate's test build compiles them.
+struct RuntimeCode {
+    features: BTreeSet<String>,
+    path_roots: BTreeSet<String>,
+}
+
+impl RuntimeCode {
+    /// Lex each of `sources` on its own, so no source's literal or comment can
+    /// run into the next.
+    fn of<'a>(sources: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut code = Self {
+            features: BTreeSet::new(),
+            path_roots: BTreeSet::new(),
+        };
+        for src in sources {
+            code.features.extend(
+                rust_lex::gate_features(src, true)
+                    .into_iter()
+                    .map(|(_, name)| name),
+            );
+            code.path_roots.extend(path_roots(src));
+        }
+        code
+    }
+
+    /// Whether the code gates anything on the cargo feature `feature`.
+    fn reads_feature(&self, feature: &str) -> bool {
+        self.features.contains(feature)
+    }
+
+    /// Whether the code names the crate `dep` as a path root (`dep::…`).
+    ///
+    /// The crate is looked up under its `-`→`_` library name and its `-`-dropped
+    /// one (`md-5` is `md5`).
+    fn names_crate_path(&self, dep: &str) -> bool {
+        [dep.replace('-', "_"), dep.replace('-', "")]
+            .iter()
+            .any(|ident| self.path_roots.contains(ident))
+    }
+}
+
+/// Every identifier `src` follows with `::`.
+///
+/// A third `:` makes the first colon a type ascription (`x: ::y`), not a path
+/// separator, so `x` is no root there.
+fn path_roots(src: &str) -> BTreeSet<String> {
+    use rust_lex::Tok;
+    let toks = rust_lex::lex(src);
+    let colon = |k: usize| matches!(toks.get(k), Some((_, Tok::Punct(':'))));
+    toks.iter()
+        .enumerate()
+        .filter_map(|(k, (_, tok))| match tok {
+            Tok::Ident(id) if colon(k + 1) && colon(k + 2) && !colon(k + 3) => Some(id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The runtime crate's code: `build.rs` and `src/**/*.rs`.
 #[allow(clippy::expect_used)] // test scaffolding: the runtime sources are readable
-fn runtime_code(crate_root: &Path) -> String {
+fn runtime_code(crate_root: &Path) -> RuntimeCode {
     let mut files = vec![crate_root.join("build.rs")];
     let mut dirs = vec![crate_root.join("src")];
     while let Some(dir) = dirs.pop() {
@@ -416,40 +479,11 @@ fn runtime_code(crate_root: &Path) -> String {
             }
         }
     }
-    let mut code = String::new();
-    for file in files {
-        let text = std::fs::read_to_string(&file).expect("read runtime source file");
-        for line in text.lines() {
-            if !line.trim_start().starts_with("//") {
-                code.push_str(line);
-                code.push('\n');
-            }
-        }
-    }
-    code
-}
-
-/// Whether `code` gates anything on the cargo feature `feature`.
-fn reads_feature(code: &str, feature: &str) -> bool {
-    code.contains(&format!("feature = \"{feature}\""))
-        || code.contains(&format!("feature=\"{feature}\""))
-}
-
-/// Whether `code` names the crate `dep` as a path root (`dep::…`).
-///
-/// The crate is looked up under its `-`→`_` library name and its `-`-dropped
-/// one (`md-5` is `md5`).
-fn names_crate_path(code: &str, dep: &str) -> bool {
-    [dep.replace('-', "_"), dep.replace('-', "")]
+    let texts: Vec<String> = files
         .iter()
-        .any(|ident| {
-            let needle = format!("{ident}::");
-            code.match_indices(&needle).any(|(at, _)| {
-                code.get(..at)
-                    .and_then(|before| before.chars().next_back())
-                    .is_none_or(|c| c != '_' && !c.is_ascii_alphanumeric())
-            })
-        })
+        .map(|file| std::fs::read_to_string(file).expect("read runtime source file"))
+        .collect();
+    RuntimeCode::of(texts.iter().map(String::as_str))
 }
 
 /// Whether one `[features]` token turns on something code uses.
@@ -461,27 +495,27 @@ fn token_contributes(
     token: &str,
     table: &BTreeMap<String, Vec<String>>,
     optional: &BTreeSet<String>,
-    code: &str,
+    code: &RuntimeCode,
 ) -> bool {
     if let Some(dep) = token.strip_prefix("dep:") {
-        return names_crate_path(code, dep);
+        return code.names_crate_path(dep);
     }
     token.contains('/')
-        || (!table.contains_key(token) && optional.contains(token) && names_crate_path(code, token))
+        || (!table.contains_key(token) && optional.contains(token) && code.names_crate_path(token))
 }
 
 /// The declared features that change nothing the build compiles.
 ///
 /// Such a feature is read by no `cfg`, and none of its tokens turns on a used
 /// crate or sub-feature. `default` is exempt, as the crate's empty baseline.
-fn dead_features(cargo_toml: &str, code: &str) -> Vec<String> {
+fn dead_features(cargo_toml: &str, code: &RuntimeCode) -> Vec<String> {
     let table = raw_feature_table(cargo_toml);
     let optional = optional_deps(cargo_toml);
     table
         .iter()
         .filter(|(name, tokens)| {
             name.as_str() != "default"
-                && !reads_feature(code, name)
+                && !code.reads_feature(name)
                 && !tokens
                     .iter()
                     .any(|t| token_contributes(t, &table, &optional, code))
@@ -491,10 +525,10 @@ fn dead_features(cargo_toml: &str, code: &str) -> Vec<String> {
 }
 
 /// The optional dependencies the code never names as a path root.
-fn unused_optional_deps(cargo_toml: &str, code: &str) -> Vec<String> {
+fn unused_optional_deps(cargo_toml: &str, code: &RuntimeCode) -> Vec<String> {
     optional_deps(cargo_toml)
         .into_iter()
-        .filter(|dep| !names_crate_path(code, dep))
+        .filter(|dep| !code.names_crate_path(dep))
         .collect()
 }
 
@@ -1273,7 +1307,7 @@ fn unknown_cfg_atom_is_refused() {
 
 /// The runtime manifest and the code it builds.
 #[allow(clippy::expect_used)] // test scaffolding: the runtime crate is readable
-fn runtime_manifest_and_code() -> (String, String) {
+fn runtime_manifest_and_code() -> (String, RuntimeCode) {
     let crate_root = e2e_support::require_runtime_crate();
     let cargo_toml =
         std::fs::read_to_string(crate_root.join("Cargo.toml")).expect("read runtime Cargo.toml");
@@ -1339,18 +1373,61 @@ time = [
     "time-core",
 ]
 "#;
-    const CODE: &str = "#[cfg(feature = \"time-core\")]\npub mod time;\n\
-                        fn now() { let _ = chrono::Utc::now(); }\n";
-    assert_eq!(dead_features(MANIFEST, CODE), vec!["time".to_owned()]);
+    let code = RuntimeCode::of([LIVE_CODE]);
+    assert_eq!(dead_features(MANIFEST, &code), vec!["time".to_owned()]);
     assert_eq!(
-        unused_optional_deps(MANIFEST, CODE),
+        unused_optional_deps(MANIFEST, &code),
         vec!["chrono-tz".to_owned()]
     );
-    let read = format!("{CODE}#[cfg(feature = \"time\")]\nmod zones;\n");
+    let read = RuntimeCode::of([LIVE_CODE, "#[cfg(feature = \"time\")]\nmod zones;\n"]);
     assert!(dead_features(MANIFEST, &read).is_empty());
-    let used = format!("{CODE}fn zone() {{ let _ = chrono_tz::UTC; }}\n");
+    let used = RuntimeCode::of([LIVE_CODE, "fn zone() { let _ = chrono_tz::UTC; }\n"]);
     assert!(dead_features(MANIFEST, &used).is_empty());
     assert!(unused_optional_deps(MANIFEST, &used).is_empty());
+}
+
+/// Runtime code that reads `time-core` and names `chrono` as a path root.
+const LIVE_CODE: &str = "#[cfg(feature = \"time-core\")]\npub mod time;\n\
+                         fn now() { let _ = chrono::Utc::now(); }\n";
+
+/// A feature or crate named only in a trailing `//` comment, a `/* */` block or
+/// a string literal is not read, so the feature stays dead and the crate unused.
+#[test]
+fn prose_and_literals_are_not_reads() {
+    const MANIFEST: &str = r#"
+[dependencies]
+chrono = { version = "0.4", optional = true }
+chrono-tz = { version = "0.10", optional = true }
+
+[features]
+default = []
+time-core = ["dep:chrono"]
+time = ["dep:chrono-tz"]
+"#;
+    for prose in [
+        "fn a() {} // #[cfg(feature = \"time\")] chrono_tz::UTC\n",
+        "fn b() {} /* #[cfg(feature = \"time\")]\n   let _ = chrono_tz::UTC; */\n",
+        "const S: &str = \"#[cfg(feature = \\\"time\\\")] chrono_tz::UTC\";\n",
+        "const R: &str = r#\"#[cfg(feature = \"time\")] chrono_tz::UTC\"#;\n",
+    ] {
+        let code = RuntimeCode::of([LIVE_CODE, prose]);
+        assert_eq!(
+            dead_features(MANIFEST, &code),
+            vec!["time".to_owned()],
+            "a feature named only in {prose:?} is read"
+        );
+        assert_eq!(
+            unused_optional_deps(MANIFEST, &code),
+            vec!["chrono-tz".to_owned()],
+            "a crate named only in {prose:?} is used"
+        );
+    }
+    let ascribed = RuntimeCode::of([LIVE_CODE, "fn f(chrono_tz: ::std::string::String) {}\n"]);
+    assert_eq!(
+        unused_optional_deps(MANIFEST, &ascribed),
+        vec!["chrono-tz".to_owned()],
+        "a parameter ascribed a `::`-rooted type is no path root"
+    );
 }
 
 /// The emitted manifest of a `uses_time` program on one target and model.
