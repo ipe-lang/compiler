@@ -9111,7 +9111,7 @@ mod base_path_tests {
             &crate::encoding::MountBase::root(),
             "<b>x</b>",
             &page_epoch(),
-            &PageUrl::Unrouted,
+            &crate::dom::PageUrl::Unrouted,
             "tok1",
             "<div data-ipe-debugger></div>",
         )
