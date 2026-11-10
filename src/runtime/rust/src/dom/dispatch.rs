@@ -1122,9 +1122,19 @@ mod tests {
             1,
             "a mounted app's view is rendered only by `render_frame`"
         );
+        let render = body_of("fn render_frame<");
         assert!(
-            body_of("fn render_frame<").contains("(app.view)(model)"),
+            render.contains("(app.view)(model)") && render.contains("(router.url_of)(&model)"),
             "`render_frame` renders the model it takes the URL of"
+        );
+        assert!(
+            !render.contains("app.model"),
+            "`render_frame` never reads the committed model in place of the one it shows"
+        );
+        assert_eq!(
+            src.matches("(router.url_of)(").count(),
+            2,
+            "a page URL is taken by `render_frame` and the mount only"
         );
         assert!(
             src.contains(

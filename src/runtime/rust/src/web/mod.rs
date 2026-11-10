@@ -14940,7 +14940,6 @@ mod emitted_router_behavior_tests {
     #[allow(clippy::expect_used)] // the page and the step replies are fixtures
     fn a_debugger_step_commits_the_shown_models_route() {
         with_csrf_off(|| async {
-            let store = Arc::new(Store::new(Duration::from_secs(60)));
             let routed = |store: Arc<Store>| {
                 let mut state = make_state(store);
                 state.page_url = counted_page_url();
@@ -14964,24 +14963,27 @@ mod emitted_router_behavior_tests {
                     .path()
                     .map(str::to_owned)
             };
-            let (sid, body) = get(routed(store.clone()), "/", None).await;
-            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
-            for count in 1..=2 {
-                let epoch = current_epoch(&store, &sid).await;
-                let event = click_body(&plus, Some(&epoch), None);
-                assert_eq!(
-                    post_event(routed(store.clone()), &sid, &event).await,
-                    StatusCode::OK
-                );
-                await_model(&store, &sid, |m| m.count == count).await;
-            }
-            let handle = session_of(&store, &sid).await;
-            assert_eq!(
-                committed_route(&handle).as_deref(),
-                Some("/many"),
-                "the live render carries the live model's route"
-            );
+            // Each endpoint starts from its own session at `/many`, so a commit
+            // that kept the replaced render's route is seen by every endpoint.
             for endpoint in ["/_ipe/debug/step-to", "/_ipe/debug/scrub"] {
+                let store = Arc::new(Store::new(Duration::from_secs(60)));
+                let (sid, body) = get(routed(store.clone()), "/", None).await;
+                let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+                for count in 1..=2 {
+                    let epoch = current_epoch(&store, &sid).await;
+                    let event = click_body(&plus, Some(&epoch), None);
+                    assert_eq!(
+                        post_event(routed(store.clone()), &sid, &event).await,
+                        StatusCode::OK
+                    );
+                    await_model(&store, &sid, |m| m.count == count).await;
+                }
+                let handle = session_of(&store, &sid).await;
+                assert_eq!(
+                    committed_route(&handle).as_deref(),
+                    Some("/many"),
+                    "the live render carries the live model's route"
+                );
                 let resp = routed(store.clone())
                     .oneshot(
                         Request::builder()
