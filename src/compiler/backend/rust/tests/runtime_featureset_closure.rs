@@ -72,11 +72,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use ipe_backend::Backend;
-use ipe_backend_rust::RustBackend;
+use ipe_backend_rust::{RuntimeDep, RustBackend};
 use ipe_diagnostics::DResult;
 use ipe_intern::Interner;
 use ipe_ir::{
     CallPin, Callee, Expr, Func, FuncId, IrType, KernelFn, ModPath, Module, OnFormKind, Program,
+    Target,
 };
 
 use cfg::{CfgEnv, ModuleGates};
@@ -211,38 +212,49 @@ fn module_for_mask(name: ipe_intern::Symbol, mask: u32) -> Module {
 /// are normalized to the bare feature-or-dep name that a `#[cfg(feature = …)]`
 /// can test.
 fn parse_feature_table(cargo_toml: &str) -> BTreeMap<String, Vec<String>> {
-    let mut table = BTreeMap::new();
+    raw_feature_table(cargo_toml)
+        .into_iter()
+        .map(|(name, tokens)| {
+            let enabled = tokens.iter().map(|t| normalize_feature_token(t)).collect();
+            (name, enabled)
+        })
+        .collect()
+}
+
+/// Parse a manifest's `[features]` table into verbatim token lists.
+///
+/// A list may span lines and carry `#` comments; each token is kept as written
+/// (`dep:x`, `x/y`, `x`) so liveness can tell a dependency activation from a
+/// feature edge.
+fn raw_feature_table(cargo_toml: &str) -> BTreeMap<String, Vec<String>> {
+    let mut table: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut in_features = false;
+    // The feature whose `[ … ]` list is still open across lines.
+    let mut open: Option<String> = None;
     for raw in cargo_toml.lines() {
-        let line = raw.trim();
-        if line.starts_with('#') || line.is_empty() {
+        let line = raw.split_once('#').map_or(raw, |(code, _)| code).trim();
+        if line.is_empty() {
             continue;
         }
-        if line.starts_with('[') {
+        let (name, rhs) = if let Some(name) = open.take() {
+            (name, line)
+        } else if line.starts_with('[') {
             in_features = line == "[features]";
             continue;
-        }
-        if !in_features {
+        } else if !in_features {
             continue;
-        }
-        // `name = ["a", "b/c", "dep:d"]` — may span lines; the crate keeps each
-        // feature on one line, so parse a single-line array.
-        let Some((name, rhs)) = line.split_once('=') else {
+        } else if let Some((name, rhs)) = line.split_once('=') {
+            (name.trim().to_owned(), rhs)
+        } else {
             continue;
         };
-        let name = name.trim();
-        if name.is_empty() {
-            continue;
+        table
+            .entry(name.clone())
+            .or_default()
+            .extend(rhs.split('"').skip(1).step_by(2).map(str::to_owned));
+        if !rhs.contains(']') {
+            open = Some(name);
         }
-        let mut enabled = Vec::new();
-        for tok in rhs.split(['[', ']', ',', '"']) {
-            let t = tok.trim();
-            if t.is_empty() {
-                continue;
-            }
-            enabled.push(normalize_feature_token(t));
-        }
-        table.insert(name.to_owned(), enabled);
     }
     table
 }
@@ -333,6 +345,157 @@ fn referenced_runtime_modules(emitted: &str) -> BTreeSet<String> {
         }
     }
     mods
+}
+
+// ── liveness: every declared feature and optional dependency is used ────────
+
+/// Optional dependencies no runtime code names, on purpose.
+///
+/// `tinyvec` is declared only to force its `std` feature on through Cargo's
+/// feature unification (a transitive dependency of `url`).
+const FEATURE_UNIFICATION_PINS: &[&str] = &["tinyvec"];
+
+/// Whether `text` balances its opening and closing brackets and braces.
+fn balanced(text: &str) -> bool {
+    text.matches(['{', '[']).count() == text.matches(['}', ']']).count()
+}
+
+/// The optional dependencies a manifest's build `[dependencies]` tables
+/// declare, target-specific tables included and dev-dependencies excluded.
+fn optional_deps(cargo_toml: &str) -> BTreeSet<String> {
+    let mut deps = BTreeSet::new();
+    let mut in_deps = false;
+    // The dependency whose inline table or array is still open across lines.
+    let mut open: Option<(String, String)> = None;
+    for raw in cargo_toml.lines() {
+        let line = raw.split_once('#').map_or(raw, |(code, _)| code);
+        let (name, text) = if let Some((name, mut text)) = open.take() {
+            text.push_str(line);
+            (name, text)
+        } else {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_deps = trimmed == "[dependencies]"
+                    || (trimmed.starts_with("[target.") && trimmed.ends_with(".dependencies]"));
+                continue;
+            }
+            if !in_deps || line.starts_with(char::is_whitespace) {
+                continue;
+            }
+            let Some((name, rhs)) = trimmed.split_once('=') else {
+                continue;
+            };
+            (name.trim().to_owned(), rhs.to_owned())
+        };
+        if balanced(&text) {
+            if text.contains("optional = true") {
+                deps.insert(name);
+            }
+        } else {
+            open = Some((name, text));
+        }
+    }
+    deps
+}
+
+/// The runtime crate's reachable Rust code, comment lines dropped.
+///
+/// It reads `src/**/*.rs` and `build.rs`; dropping comments keeps prose naming
+/// a feature or crate from reading as use.
+#[allow(clippy::expect_used)] // test scaffolding: the runtime sources are readable
+fn runtime_code(crate_root: &Path) -> String {
+    let mut files = vec![crate_root.join("build.rs")];
+    let mut dirs = vec![crate_root.join("src")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read runtime source dir") {
+            let path = entry.expect("read runtime source entry").path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    let mut code = String::new();
+    for file in files {
+        let text = std::fs::read_to_string(&file).expect("read runtime source file");
+        for line in text.lines() {
+            if !line.trim_start().starts_with("//") {
+                code.push_str(line);
+                code.push('\n');
+            }
+        }
+    }
+    code
+}
+
+/// Whether `code` gates anything on the cargo feature `feature`.
+fn reads_feature(code: &str, feature: &str) -> bool {
+    code.contains(&format!("feature = \"{feature}\""))
+        || code.contains(&format!("feature=\"{feature}\""))
+}
+
+/// Whether `code` names the crate `dep` as a path root (`dep::…`).
+///
+/// The crate is looked up under its `-`→`_` library name and its `-`-dropped
+/// one (`md-5` is `md5`).
+fn names_crate_path(code: &str, dep: &str) -> bool {
+    [dep.replace('-', "_"), dep.replace('-', "")]
+        .iter()
+        .any(|ident| {
+            let needle = format!("{ident}::");
+            code.match_indices(&needle).any(|(at, _)| {
+                code.get(..at)
+                    .and_then(|before| before.chars().next_back())
+                    .is_none_or(|c| c != '_' && !c.is_ascii_alphanumeric())
+            })
+        })
+}
+
+/// Whether one `[features]` token turns on something code uses.
+///
+/// It does when it is a `dep:x` activation of a crate the code names, a `x/y` sub-feature setting, or a
+/// bare optional dependency the code names. A bare edge to another feature
+/// adds nothing on its own; that feature answers for its own liveness.
+fn token_contributes(
+    token: &str,
+    table: &BTreeMap<String, Vec<String>>,
+    optional: &BTreeSet<String>,
+    code: &str,
+) -> bool {
+    if let Some(dep) = token.strip_prefix("dep:") {
+        return names_crate_path(code, dep);
+    }
+    token.contains('/')
+        || (!table.contains_key(token) && optional.contains(token) && names_crate_path(code, token))
+}
+
+/// The declared features that change nothing the build compiles.
+///
+/// Such a feature is read by no `cfg`, and none of its tokens turns on a used
+/// crate or sub-feature. `default` is exempt, as the crate's empty baseline.
+fn dead_features(cargo_toml: &str, code: &str) -> Vec<String> {
+    let table = raw_feature_table(cargo_toml);
+    let optional = optional_deps(cargo_toml);
+    table
+        .iter()
+        .filter(|(name, tokens)| {
+            name.as_str() != "default"
+                && !reads_feature(code, name)
+                && !tokens
+                    .iter()
+                    .any(|t| token_contributes(t, &table, &optional, code))
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// The optional dependencies the code never names as a path root.
+fn unused_optional_deps(cargo_toml: &str, code: &str) -> Vec<String> {
+    optional_deps(cargo_toml)
+        .into_iter()
+        .filter(|dep| !names_crate_path(code, dep))
+        .collect()
 }
 
 // ── the reusable per-mask closure check + shared fixtures ───────────────────
@@ -1104,4 +1267,172 @@ fn unknown_cfg_atom_is_refused() {
         combinator,
         Err("unknown cfg combinator `either(..)`".to_owned())
     );
+}
+
+// ── liveness: no dead feature, no unused dependency, no `chrono-tz` ──────────
+
+/// The runtime manifest and the code it builds.
+#[allow(clippy::expect_used)] // test scaffolding: the runtime crate is readable
+fn runtime_manifest_and_code() -> (String, String) {
+    let crate_root = e2e_support::require_runtime_crate();
+    let cargo_toml =
+        std::fs::read_to_string(crate_root.join("Cargo.toml")).expect("read runtime Cargo.toml");
+    (cargo_toml, runtime_code(&crate_root))
+}
+
+/// Every declared runtime feature is read by a `cfg` or turns on a used crate.
+///
+/// An emitted manifest selecting a feature then always pays for real code.
+#[test]
+fn no_declared_runtime_feature_is_dead() {
+    let (cargo_toml, code) = runtime_manifest_and_code();
+    let table = raw_feature_table(&cargo_toml);
+    assert!(
+        table
+            .get("wasm-client")
+            .is_some_and(|tokens| tokens.iter().any(|t| t == "time-core")),
+        "precondition: the multi-line `wasm-client` list parses whole: {:?}",
+        table.get("wasm-client")
+    );
+    let dead = dead_features(&cargo_toml, &code);
+    assert!(
+        dead.is_empty(),
+        "runtime features no `cfg` reads and that turn on no used crate: {dead:?}"
+    );
+}
+
+/// Every optional runtime dependency is named by runtime code.
+///
+/// The declared feature-unification pins are the only exemption.
+#[test]
+fn no_optional_runtime_dependency_is_unused() {
+    let (cargo_toml, code) = runtime_manifest_and_code();
+    assert!(
+        optional_deps(&cargo_toml).contains("chrono"),
+        "precondition: the optional dependency scan sees `chrono`"
+    );
+    let unused: Vec<String> = unused_optional_deps(&cargo_toml, &code)
+        .into_iter()
+        .filter(|dep| !FEATURE_UNIFICATION_PINS.contains(&dep.as_str()))
+        .collect();
+    assert!(
+        unused.is_empty(),
+        "optional runtime dependencies no runtime code names: {unused:?}"
+    );
+}
+
+/// A feature that only adds an unused crate to a live feature is refused.
+///
+/// Either a `cfg` read or a use of the crate revives it.
+#[test]
+fn dead_feature_and_unused_dependency_are_refused() {
+    const MANIFEST: &str = r#"
+[dependencies]
+chrono = { version = "0.4", optional = true }
+chrono-tz = { version = "0.10", optional = true }
+
+[features]
+default = []
+time-core = ["dep:chrono"]
+time = [
+    "dep:chrono-tz",
+    "time-core",
+]
+"#;
+    const CODE: &str = "#[cfg(feature = \"time-core\")]\npub mod time;\n\
+                        fn now() { let _ = chrono::Utc::now(); }\n";
+    assert_eq!(dead_features(MANIFEST, CODE), vec!["time".to_owned()]);
+    assert_eq!(
+        unused_optional_deps(MANIFEST, CODE),
+        vec!["chrono-tz".to_owned()]
+    );
+    let read = format!("{CODE}#[cfg(feature = \"time\")]\nmod zones;\n");
+    assert!(dead_features(MANIFEST, &read).is_empty());
+    let used = format!("{CODE}fn zone() {{ let _ = chrono_tz::UTC; }}\n");
+    assert!(dead_features(MANIFEST, &used).is_empty());
+    assert!(unused_optional_deps(MANIFEST, &used).is_empty());
+}
+
+/// The emitted manifest of a `uses_time` program on one target and model.
+#[allow(clippy::expect_used)] // test scaffolding: a body-free emit cannot fail
+fn time_program_cargo_toml(
+    interner: &Interner,
+    prog: &Program,
+    target: Target,
+    dep: bool,
+) -> String {
+    let backend = RustBackend::new(interner).with_target(target);
+    let backend = if dep {
+        backend.with_runtime_dep(Some(RuntimeDep {
+            root: e2e_support::require_runtime_crate(),
+        }))
+    } else {
+        backend
+    };
+    backend
+        .emit(prog)
+        .expect("emit must succeed for a body-free program")
+        .cargo_toml
+}
+
+/// No emitted manifest names `chrono-tz` or selects a dead runtime feature.
+///
+/// A `uses_time` program, alone and beside each other surface, on both targets
+/// and both runtime models, selects `time-core` and nothing unread.
+#[test]
+#[allow(clippy::expect_used)] // test scaffolding: a body-free emit cannot fail
+fn time_programs_emit_no_dead_feature_or_chrono_tz() {
+    let (cargo_toml, code) = runtime_manifest_and_code();
+    let dead = dead_features(&cargo_toml, &code);
+    let mut interner = Interner::new();
+    let main = interner.intern("Main").expect("intern Main");
+    let native = (0..FLAG_COUNT).map(|bit| (Target::Native, 1u32 << bit));
+    let cases = std::iter::once((Target::Native, 0))
+        .chain(native)
+        .chain(std::iter::once((Target::WasmClient, 0)));
+    for (target, mask) in cases {
+        let prog = Program {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: std::collections::BTreeSet::new(),
+            modules: vec![Module {
+                uses_time: true,
+                ..module_for_mask(main, mask)
+            }],
+        };
+        let selected = RustBackend::new(&interner)
+            .with_target(target)
+            .runtime_feature_names(&prog)
+            .expect("runtime_feature_names must succeed for a body-free program");
+        assert!(
+            selected.contains(&"time-core"),
+            "a uses_time program ({target:?}, mask {mask:#b}) must select `time-core`: {selected:?}"
+        );
+        for feature in &selected {
+            assert!(
+                *feature != "time" && !dead.iter().any(|d| d.as_str() == *feature),
+                "a uses_time program ({target:?}, mask {mask:#b}) selects the dead \
+                 feature `{feature}`: {selected:?}"
+            );
+        }
+        for dep in [false, true] {
+            let toml = time_program_cargo_toml(&interner, &prog, target, dep);
+            let code_lines = toml
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !code_lines.contains("chrono-tz") && !code_lines.contains("chrono_tz"),
+                "a uses_time manifest ({target:?}, mask {mask:#b}, dependency model {dep}) \
+                 names `chrono-tz`:\n{toml}"
+            );
+            assert!(
+                !code_lines
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("time = ")),
+                "a uses_time manifest ({target:?}, mask {mask:#b}, dependency model {dep}) \
+                 declares a `time` feature:\n{toml}"
+            );
+        }
+    }
 }

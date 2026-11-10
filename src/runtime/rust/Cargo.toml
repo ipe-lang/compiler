@@ -161,11 +161,6 @@ percent-encoding = { version = "2", optional = true }
 # makes every emitted resolve deterministic and keeps `wasm-bindgen = 0.2.126`
 # the unifiable point version.
 chrono = { version = "=0.4.45", optional = true }
-# `chrono-tz` (the embedded IANA zone DB) is optional: only the `time` runtime
-# module's IANA-zone helpers use it, and they are gated behind the `time`
-# feature (which implies `time-core`, since the zones build on base `chrono`). A
-# program that reaches no `Ipe.Time` kernel drops the crate.
-chrono-tz = { version = "0.10", optional = true }
 # `rust_decimal` (with its `arrayvec` mantissa buffer): optional, behind the
 # `decimal` feature. Backs `decimal.rs` (the `Ipe.Decimal` surface) and `money.rs`
 # (`Ipe.Money`, built on `Decimal`); the `db` surface also decodes numeric columns
@@ -336,19 +331,14 @@ url = ["dep:url", "dep:tinyvec"]
 locale = ["dep:icu_casemap", "dep:icu_locale_core"]
 # Base `chrono` (calendar/clock) + the `time.rs` module. Enabled by any surface
 # that renders a `chrono` timestamp: `log` (the RFC3339-nano log line), an
-# `Ipe.Time` kernel (`time` implies this), or the `db`/`web` surfaces (migration
-# ledger + Live session store timestamps). A program that reaches none drops
-# `chrono`. Separate from `time` so a `Time`-free program that only logs still
-# drops the heavier IANA zone DB.
+# `Ipe.Time` kernel (the whole UTC calendar surface lives in `time.rs`), or the
+# `db`/`web` surfaces (migration ledger + Live session store timestamps). A
+# program that reaches none drops `chrono`.
 time-core = ["dep:chrono"]
 # `log.rs` (`Ipe.Log.*` observability). Its RFC3339-nano timestamp is the one
 # always-emittable `chrono` consumer, so `log` pulls base `chrono` via
 # `time-core`. `Debug.log` (`debug.rs`, a pure passthrough) is NOT gated here.
 log = ["time-core"]
-# Ipe.Time IANA-zone calendar surface (`time.rs`'s zone helpers). Gated so a
-# program that reaches no `Ipe.Time` kernel drops the embedded IANA zone DB. The
-# zones build on base `chrono`, so `time` implies `time-core`.
-time = ["dep:chrono-tz", "time-core"]
 # `Ipe.Encoding` codecs + `Ipe.Bytes` buffer kernels: the `base64` + `hex` +
 # `percent-encoding` crates and the `encoding.rs` / `bytes.rs` modules. Every
 # surface that uses the raw codec crates implies this (crypto/db/server/email/jwt/
@@ -538,7 +528,7 @@ widget-assets = ["crypto-core", "encoding"]
 # runtime's own db tests open, and `full,db-postgres` is the every-feature
 # PostgreSQL build CI lints. `db` links both sqlx drivers. `jwt` + `url` cover
 # the JWT/auth and URL/SSRF surfaces that `db`/`web`/`http_client` reach.
-full = ["async", "json", "jwt", "url", "db", "redis_store", "crypto", "crypto-core", "secret", "compression", "csv_kernel", "cache_kernel", "tui", "config", "server", "http_client", "email", "websocket_client", "web", "time", "log", "regex", "uuid", "random", "decimal", "char-category"]
+full = ["async", "json", "jwt", "url", "db", "redis_store", "crypto", "crypto-core", "secret", "compression", "csv_kernel", "cache_kernel", "tui", "config", "server", "http_client", "email", "websocket_client", "web", "time-core", "log", "regex", "uuid", "random", "decimal", "char-category"]
 # Development-only time-travelling debugger core (recorder / re-fold / export /
 # import). NOT in `full` and NOT implied by `wasm-client` — the debugger is a
 # build-mode opt-in (`ipe dev build/run --debugger`), never a default. `ipe release`
@@ -631,12 +621,12 @@ wasm-client = [
     "random",
     # The static wasm module set also declares `log` and `time` unconditionally.
     # Their wasm arms read `js_sys::Date` / `gloo-timers`, not `chrono`, but the
-    # module declarations are now feature-gated, so `wasm-client` implies both to
-    # satisfy the source `#[cfg]`. `log`/`time` pull `dep:chrono` via `time-core`;
-    # the closed WASM app template (`WASM_CARGO_TOML`) declares `chrono`
-    # non-optional regardless, so this changes no emitted-app dep graph.
+    # module declarations are feature-gated (`log`, `time-core`), so `wasm-client`
+    # implies both to satisfy the source `#[cfg]`. Both pull `dep:chrono`; the
+    # closed WASM app template (`WASM_CARGO_TOML`) declares `chrono` non-optional
+    # regardless, so this changes no emitted-app dep graph.
     "log",
-    "time",
+    "time-core",
     # The static wasm module set declares `char_category`, `decimal`, and `money`
     # unconditionally, so `wasm-client` implies `decimal` + `char-category` to
     # satisfy their source `#[cfg]` gates. The closed WASM app template

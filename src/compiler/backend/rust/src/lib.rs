@@ -1344,12 +1344,8 @@ pub(crate) struct EmitCtx<'a> {
     pub(crate) uses_locale: bool,
     /// `true` when the program uses at least one non-TEA `Ipe.Time` kernel
     /// (`Time.now` / `unixMillis` / `sleep` / `timeString` / `isLeapYear` /
-    /// `daysInMonth`). When set, [`crate::project::assemble_project_files`]
-    /// enables the `time` Cargo feature in the emitted manifest (promoting it
-    /// into the `default` list) and adds the `chrono-tz` dependency — the
-    /// IANA-zone calendar surface of the always-declared `time` runtime module,
-    /// gated behind that feature. A program that reaches no `Ipe.Time` kernel
-    /// drops the crate. The `chrono` core crate is gated by `time-core`/`log`.
+    /// `daysInMonth`). One reacher of the `time-core` Cargo feature
+    /// ([`Self::reaches_time_core`]): the `time.rs` runtime module and `chrono`.
     pub(crate) uses_time: bool,
     /// `true` when the program lowers at least one [`ipe_ir::Callee::Ffi`]
     /// foreign-wrapper call. When set,
@@ -2259,8 +2255,7 @@ impl<'a> EmitCtx<'a> {
         let uses_email = program.modules.iter().any(|m| m.uses_email);
         // detect Ipe.Locale usage (kernel or type-mention).
         let uses_locale = program.modules.iter().any(|m| m.uses_locale);
-        // detect non-TEA Ipe.Time kernel usage — gates the `time` Cargo feature
-        // and the `chrono-tz` dependency.
+        // detect non-TEA Ipe.Time kernel usage — one reacher of `time-core`.
         let uses_time = program.modules.iter().any(|m| m.uses_time);
         // detect Ipe.Env `Env.public` kernel usage.
         let uses_env_public = program.modules.iter().any(|m| m.uses_env_public);
@@ -2879,12 +2874,12 @@ impl<'a> EmitCtx<'a> {
     ///
     /// `chrono` is reached by any of: the `log.rs` timestamp
     /// ([`Self::reaches_log`]); any `Ipe.Time` kernel ([`Self::uses_time`], whose
-    /// whole `time.rs` module — calendar math + the `chrono-tz` zone helpers —
-    /// lives behind `time-core`, with the IANA zones additionally behind `time`);
+    /// whole `time.rs` module — the UTC calendar rules and formatters — lives
+    /// behind `time-core`);
     /// or the `db` / `web` / `webview` surfaces, whose runtime modules render
     /// `chrono` timestamps (migration ledger, session store, console proxy). The
-    /// crate-side feature graph carries the SAME closure — `log`/`time`/`db`/`web`
-    /// each imply `time-core` — so this selection and the manifest agree even at
+    /// crate-side feature graph carries the SAME closure — `log`/`db`/`web` each
+    /// imply `time-core` — so this selection and the manifest agree even at
     /// `--no-default-features`. FAIL-CLOSED: any uncertain `chrono` consumer keeps
     /// `time-core` on; dropping `chrono` from a program that renders a timestamp
     /// is the forbidden failure, over-inclusion the accepted precision loss.

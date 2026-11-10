@@ -164,12 +164,6 @@ pub const CAPABILITIES: &[RuntimeCapability] = &[
         wasip1_legal: false,
     },
     RuntimeCapability {
-        gate: |ctx| ctx.uses_time,
-        select: |_| RuntimeFeature::Time,
-        covers: &[RuntimeFeature::Time],
-        wasip1_legal: true,
-    },
-    RuntimeCapability {
         gate: |ctx| ctx.reaches_encoding(),
         select: |_| RuntimeFeature::Encoding,
         covers: &[RuntimeFeature::Encoding],

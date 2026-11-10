@@ -303,10 +303,6 @@ pub const CHRONO: CrateSpec = CrateSpec {
     name: "chrono",
     version: "=0.4.45",
 };
-pub const CHRONO_TZ: CrateSpec = CrateSpec {
-    name: "chrono-tz",
-    version: "0.10",
-};
 // Like `CHRONO`, these are not surgery-emitted: the dependency-model manifest
 // names only the `ipe_runtime` path dep, and their versions live in the runtime
 // crate (behind the `decimal` / `char-category` features). Consulted only by the
@@ -362,7 +358,6 @@ pub const ALL: &[CrateSpec] = &[
     RSA.spec,
     FUTURES_UTIL,
     CHRONO,
-    CHRONO_TZ,
     RUST_DECIMAL,
     UNICODE_GENERAL_CATEGORY,
     SERDE_JSON.spec,

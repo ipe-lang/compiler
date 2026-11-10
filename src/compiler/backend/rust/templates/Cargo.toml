@@ -104,11 +104,6 @@ time-core = []
 # the vendored runtime source carries.
 decimal = []
 char-category = []
-# Gates the IANA-zone calendar surface of the always-declared `time` runtime
-# module (the `chrono-tz`-backed helpers). Promoted into `default` and paired
-# with the `chrono-tz` dependency only for a program that reaches an `Ipe.Time`
-# kernel; a program that uses no Time kernel keeps it off and drops the crate.
-time = []
 # Declared but inert on native targets: the vendored runtime gates its browser
 # sink on `cfg(all(target_arch = "wasm32", feature = "wasm-client"))`. Declaring
 # the feature keeps rustc's check-cfg quiet without pulling any wasm glue (only
