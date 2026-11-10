@@ -168,7 +168,7 @@ impl ConfigTarget {
     }
 
     /// Resolve the on-disk path for this target. `$IPE_HOME/config.toml` uses
-    /// the same [`runtime_embed::ipe_home`] resolution the runtime install uses;
+    /// the same [`runtime_embed::ipe_home`] resolution every Ipê data file uses;
     /// `~/.cargo/config.toml` honours `$CARGO_HOME`, else `~/.cargo`.
     ///
     /// # Errors

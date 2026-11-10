@@ -543,11 +543,11 @@ the runtime directory {path} is not an Ipe runtime crate root (its Cargo.toml mu
 
 ## cli-runtime-home-unknown
 
-could not determine where to install the Ipe runtime: none of IPE_HOME, XDG_DATA_HOME, or HOME is set; set IPE_HOME to a writable directory
+could not determine the Ipe data directory: none of IPE_HOME, XDG_DATA_HOME, or HOME is set; set IPE_HOME to a writable directory
 
 ## cli-runtime-materialize-failed
 
-could not install the Ipe runtime: {detail}
+could not bundle the Ipe runtime: {detail}
   the build was stopped rather than link an incomplete runtime
 
 ## cli-runtime-version-mismatch

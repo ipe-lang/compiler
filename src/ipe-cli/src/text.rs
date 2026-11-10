@@ -871,9 +871,9 @@ messages! {
     cli_runtime_dir_invalid(path) = "cli-runtime-dir-invalid";
     /// The invalid runtime dir looks like the inner module directory.
     cli_runtime_dir_invalid_inner_hint = "cli-runtime-dir-invalid-inner-hint";
-    /// No directory could be resolved to materialize the embedded runtime.
+    /// No Ipê data directory could be resolved.
     cli_runtime_home_unknown = "cli-runtime-home-unknown";
-    /// Writing the embedded runtime source failed.
+    /// Bundling the embedded runtime source into an emitted project failed.
     cli_runtime_materialize_failed(detail) = "cli-runtime-materialize-failed";
     /// The resolved runtime crate declares a different version than the compiler.
     cli_runtime_version_mismatch(path, found, expected) = "cli-runtime-version-mismatch";

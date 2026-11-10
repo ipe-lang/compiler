@@ -115,9 +115,8 @@ pub enum CliError {
         /// The remedy the refusing surface offers.
         remedy: crate::runtime_embed::RuntimeRemedy,
     },
-    /// No directory could be resolved to materialize the embedded runtime into
-    /// (no `IPE_HOME`, `XDG_DATA_HOME`, or `HOME`). Without a home there is
-    /// nowhere to write the runtime the emitted project links against.
+    /// No Ipê data directory could be resolved (no `IPE_HOME`, `XDG_DATA_HOME`,
+    /// or `HOME`) for a file that lives under it.
     RuntimeHomeUnknown,
     /// No per-user cache directory could be resolved: neither `XDG_CACHE_HOME`
     /// nor the home (`HOME`, or `USERPROFILE` on Windows) names an absolute path. Refused rather than falling back to a
@@ -156,8 +155,8 @@ pub enum CliError {
         /// The pinned port.
         port: ipe_runtime_rust::env_grammar::ListenPort,
     },
-    /// Writing the embedded runtime source to `<IPE_HOME>/runtime/<version>/rust`
-    /// failed (disk full, permission denied, or a drifted embed). This is a
+    /// Bundling the embedded runtime source into an emitted project failed
+    /// (disk full, permission denied, or a drifted embed). This is a
     /// fail-closed refusal — the build stops rather than link a wrong or empty
     /// runtime. Carries a specific detail.
     RuntimeMaterializeFailed {
@@ -1613,7 +1612,7 @@ pub fn fmt_emitted_build_failed(
 /// [`crate::screen::Fault`] follow, so the two never disagree.
 enum EmittedBuildCause {
     /// The runtime crate lacks a feature the emitted crate enables: a stale
-    /// runtime install.
+    /// runtime crate.
     MissingRuntimeFeature(String),
     /// `cargo` could not reach the crate registry: DNS, offline, or a proxy.
     RegistryUnreachable,
