@@ -466,7 +466,6 @@ where
 /// one author method grammar, and its trimmed path; a spec with no method
 /// before the first space serves every routable method over the whole
 /// trimmed spec.
-#[must_use]
 pub fn api_spec_parts(spec: &str) -> (AuthorMethod, String) {
     // split_once is total by construction — no raw `spec[..idx]` range slice
     // (the restriction-lint footgun if the delimiter ever became multi-byte).
@@ -2010,6 +2009,7 @@ pub(crate) struct CanonicalUrl<S> {
 impl<S> CanonicalUrl<S> {
     /// The canonical-URL service in front of `inner`, with no `Allow` on a
     /// refused method.
+    #[cfg(test)]
     pub(crate) const fn new(inner: S) -> Self {
         Self { inner, allow: None }
     }
@@ -3024,8 +3024,9 @@ fn parse_routes(routes: Vec<ServerRoute>) -> Result<Vec<ParsedRoute>, EndpointRe
     routes
         .into_iter()
         .map(|r| {
+            let label = r.target.method_label();
             let refuse = |cause| EndpointRefusal {
-                endpoint: quoted_endpoint(&r.target.method_label(), &r.path),
+                endpoint: quoted_endpoint(&label, &r.path),
                 cause,
             };
             let pattern = || {
@@ -6544,7 +6545,7 @@ mod tests {
 
     /// The listener's answer to one `method` request for `uri`.
     #[allow(clippy::expect_used)] // test: the fixed requests build
-    async fn answer(
+    async fn answer_method(
         app: &CanonicalUrl<axum::Router>,
         method: &str,
         uri: &str,
@@ -6590,7 +6591,7 @@ mod tests {
             ("CONNECT", "example.com:443", false),
             ("TRACE", "/unrouted", false),
         ] {
-            let resp = answer(&app, method, uri).await;
+            let resp = answer_method(&app, method, uri).await;
             assert_eq!(
                 resp.status(),
                 axum::http::StatusCode::METHOD_NOT_ALLOWED,
@@ -6612,7 +6613,7 @@ mod tests {
             }
         }
         assert_eq!(runs.load(Ordering::SeqCst), 0);
-        let reached = answer(&app, "GET", "/").await;
+        let reached = answer_method(&app, "GET", "/").await;
         assert_eq!(reached.status(), axum::http::StatusCode::OK);
         assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
@@ -6630,7 +6631,7 @@ mod tests {
         }])
         .await;
         for method in ["BREW", "delete", "Get", "PROPFIND", "ANY", "MOUNT"] {
-            let resp = answer(&app, method, "/hook").await;
+            let resp = answer_method(&app, method, "/hook").await;
             assert_eq!(
                 resp.status(),
                 axum::http::StatusCode::NOT_IMPLEMENTED,
@@ -6644,7 +6645,7 @@ mod tests {
         }
         assert_eq!(runs.load(Ordering::SeqCst), 0);
         for method in RoutableMethod::ALL {
-            let resp = answer(&app, method.as_str(), "/hook").await;
+            let resp = answer_method(&app, method.as_str(), "/hook").await;
             assert_eq!(resp.status(), axum::http::StatusCode::OK, "{method:?}");
         }
         assert_eq!(runs.load(Ordering::SeqCst), RoutableMethod::ALL.len());
@@ -6673,7 +6674,7 @@ mod tests {
                 ),
             )
             .await
-            .unwrap_or_else(|_| IpeResult::Ok(()));
+            .unwrap_or(IpeResult::Ok(()));
             let IpeResult::Err(error) = listened else {
                 assert!(
                     matches!(listened, IpeResult::Err(_)),
