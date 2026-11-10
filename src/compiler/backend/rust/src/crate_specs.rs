@@ -400,7 +400,7 @@ mod tests {
             assert!(!spec.name.is_empty(), "empty crate name in ALL");
             assert!(!spec.version.is_empty(), "empty version for {}", spec.name);
         }
-        assert_eq!(ALL.len(), 39, "expected 39 surgery-emitted crate specs");
+        assert_eq!(ALL.len(), 38, "expected 38 surgery-emitted crate specs");
         for pinned in ALL_PINNED {
             assert!(
                 ALL.iter().any(|spec| spec.name == pinned.spec.name),
