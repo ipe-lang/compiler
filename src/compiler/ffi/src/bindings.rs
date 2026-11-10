@@ -3166,7 +3166,7 @@ pub fn semver_major_field_from_version(arg0: ::semver::Version) -> i64 {
     fn option_adapter_never_folds_a_trip_to_none() {
         let trip_ends = "ClosureUnwind::Trip(__t) => end_on_unchanneled_unwind(\"foreign closure \
                          tripped\", ClosureUnwind::Trip(__t))";
-        for sig in &UNCHANNELED_SIGS[1..] {
+        for sig in UNCHANNELED_SIGS.iter().skip(1) {
             let out = closure_region(sig);
             assert!(out.contains(trip_ends), "{sig}: {out}");
             // The only `None` the adapter yields on an unwind is the foreign arm's.
