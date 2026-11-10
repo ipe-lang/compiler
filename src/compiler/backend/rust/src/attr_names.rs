@@ -6,8 +6,10 @@
 //! predicate). A view that spells one as a literal, at the call or through a
 //! `let` (a partial application's hoisted argument), is refused here
 //! (IPE-L0163). The runtime's program-facing attribute constructors drop a
-//! reserved name computed at run time, and the page renderer drops a reserved
-//! name again at the sink, so no boundary is the only one.
+//! runtime-owned name computed at run time; the page renderer drops the
+//! `ipe-*` markers, `nonce`, `data-ipe-hid`, and `data-ipe-path` again at the
+//! sink, and the style sinks re-validate the `data-ipe-*` style markers they
+//! read.
 
 use ipe_diagnostics::{DResult, Diagnostic, LowerError, Span};
 use ipe_ir::KernelFn;

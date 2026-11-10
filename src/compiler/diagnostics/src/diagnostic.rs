@@ -1965,8 +1965,9 @@ pub enum LowerError {
     /// would ever call it. [IPE-L0162]
     OnNavigateWithoutPage,
     /// A view spells, as a literal, an attribute name the runtime owns: an
-    /// `ipe-*` marker, `nonce`, or any `data-ipe-*` name. The render sink drops
-    /// such a name, so the attribute would never reach the page. [IPE-L0163]
+    /// `ipe-*` marker, `nonce`, or any `data-ipe-*` name. The runtime's
+    /// attribute constructors drop such a name, so the attribute would never
+    /// reach the page. [IPE-L0163]
     ReservedAttributeName {
         /// The dotted call that received the name (e.g. `Attr.attribute`).
         call: Box<str>,

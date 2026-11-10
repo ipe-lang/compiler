@@ -1261,11 +1261,11 @@ mod tests {
     }
 
     // ── Sink-side forgery gates ───────────────
-    // The style markers are raw String attributes a caller can FORGE via
-    // `Ui.htmlAttribute "data-ipe-mq-rules" "…"`, bypassing the producer's
-    // SafeCssValue / SafeCssMediaQuery gates entirely. The sink builders must
-    // re-validate (parse, don't validate at the real boundary) and drop the
-    // block fail-closed. `strip_style_close` alone did NOT catch `{ } ; @import`.
+    // The style markers are raw String attributes. The program-facing
+    // attribute constructors drop a `data-ipe-*` name, but the marker string
+    // carries no proof it came from the producer's SafeCssValue /
+    // SafeCssMediaQuery gates, so the sink builders re-validate (parse, don't
+    // validate at the real boundary) and drop a forged block fail-closed. `strip_style_close` alone did NOT catch `{ } ; @import`.
 
     #[test]
     fn build_mq_sink_drops_forged_rules_breakout() {
