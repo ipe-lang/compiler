@@ -403,12 +403,9 @@ pub struct Module {
     /// `daysInMonth`) in the module's function bodies.
     ///
     /// Set by `ipe_lower` when any call site resolves to a `KernelFn::is_time()`
-    /// variant. The backend reads this flag to enable the `time` Cargo feature
-    /// and add the `chrono-tz` dependency — the IANA-zone calendar surface of the
-    /// always-declared `time` runtime module, gated behind that feature. A
-    /// program that reaches no `Ipe.Time` kernel drops the crate. The `chrono`
-    /// core crate (reached by the `log`/`db`/`web`/`telemetry` timestamp
-    /// surfaces) is gated separately by `time-core`/`log`, not by this flag.
+    /// variant. The backend reads this flag as one of the `time-core` Cargo
+    /// feature's reachers: the `time.rs` runtime module and base `chrono`, which
+    /// the `log`/`db`/`web`/`telemetry` timestamp surfaces reach too.
     /// `Time.every` is TEA,
     /// tracked by `uses_tea`.
     pub uses_time: bool,

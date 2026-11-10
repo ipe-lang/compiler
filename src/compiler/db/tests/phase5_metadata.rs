@@ -318,8 +318,8 @@ fn program_metadata_reachability_is_transitive() {
 /// Function-level dependency emission: a kernel a program only reaches from a
 /// DEAD helper must not set the module's `uses_*` flag, so its runtime module
 /// and crate subtree are never linked. Here a dead `slow` function calls
-/// `Time.now` (which would set `uses_time` and pull the `chrono-tz` IANA-zone
-/// subtree); `main` never reaches it, so `uses_time` must stay `false`.
+/// `Time.now` (which would set `uses_time` and pull the `time.rs` module and
+/// `chrono`); `main` never reaches it, so `uses_time` must stay `false`.
 #[test]
 fn unreached_kernel_call_does_not_set_module_flag() {
     const DEAD_TIME_CALL: &str = "module Entry exposing (main)\n\n\
@@ -346,7 +346,7 @@ fn unreached_kernel_call_does_not_set_module_flag() {
     assert!(
         !module.uses_time,
         "a Time kernel reached only from a DEAD function must NOT set `uses_time` \
-         (else the emitted program links `chrono-tz` it never invokes)"
+         (else the emitted program links `chrono` it never invokes)"
     );
 }
 

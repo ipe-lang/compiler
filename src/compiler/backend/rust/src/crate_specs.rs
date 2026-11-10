@@ -303,10 +303,6 @@ pub const CHRONO: CrateSpec = CrateSpec {
     name: "chrono",
     version: "=0.4.45",
 };
-pub const CHRONO_TZ: CrateSpec = CrateSpec {
-    name: "chrono-tz",
-    version: "0.10",
-};
 // Like `CHRONO`, these are not surgery-emitted: the dependency-model manifest
 // names only the `ipe_runtime` path dep, and their versions live in the runtime
 // crate (behind the `decimal` / `char-category` features). Consulted only by the
@@ -362,7 +358,6 @@ pub const ALL: &[CrateSpec] = &[
     RSA.spec,
     FUTURES_UTIL,
     CHRONO,
-    CHRONO_TZ,
     RUST_DECIMAL,
     UNICODE_GENERAL_CATEGORY,
     SERDE_JSON.spec,
@@ -405,7 +400,7 @@ mod tests {
             assert!(!spec.name.is_empty(), "empty crate name in ALL");
             assert!(!spec.version.is_empty(), "empty version for {}", spec.name);
         }
-        assert_eq!(ALL.len(), 39, "expected 39 surgery-emitted crate specs");
+        assert_eq!(ALL.len(), 38, "expected 38 surgery-emitted crate specs");
         for pinned in ALL_PINNED {
             assert!(
                 ALL.iter().any(|spec| spec.name == pinned.spec.name),

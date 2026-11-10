@@ -155,11 +155,6 @@ time-core = []
 # `#[cfg(feature = "char-category")]` gates the runtime source carries.
 decimal = []
 char-category = []
-# Gates the IANA-zone calendar surface of the always-declared `time` runtime
-# module (the `chrono-tz`-backed helpers). Promoted into `default` and paired
-# with the `chrono-tz` dependency only for a program that reaches an `Ipe.Time`
-# kernel; a program that uses no Time kernel keeps it off and drops the crate.
-time = []
 
 [lib]
 # Browser WASM module. Same source layout as the binary targets; the crate
@@ -3012,16 +3007,7 @@ fn assemble_project_text(
                 render_env_public_rs(&ctx.wasm_public_env),
             );
         }
-        // Ipe.Time IANA-zone surface: same gate as the native path — the wasm
-        // `time` module is always present, its zone helpers behind the `time`
-        // feature. Promote the feature + re-inject `chrono-tz` only for a Time
-        // program; a no-Time wasm program drops the crate.
-        let wasm_cargo_toml = if ctx.uses_time {
-            chrono_tz_cargo_toml(WASM_CARGO_TOML)?
-        } else {
-            WASM_CARGO_TOML.to_owned()
-        };
-        let wasm_cargo_toml = apply_cargo_name(&wasm_cargo_toml, &safe_name);
+        let wasm_cargo_toml = apply_cargo_name(WASM_CARGO_TOML, &safe_name);
         let assets = install_assets(&ctx.served_install, &files)?;
         return Ok(EmittedProject {
             files,
@@ -3269,20 +3255,6 @@ fn assemble_project_text(
     // not reached by any other surface, so the flag alone gates it.
     let cargo_toml = if ctx.uses_csv {
         csv_cargo_toml(&cargo_toml)?
-    } else {
-        cargo_toml
-    };
-    // Ipe.Time IANA-zone calendar surface (`chrono-tz`): pulled in only when the
-    // program reaches a non-TEA `Ipe.Time` kernel. The `time` runtime module is
-    // always declared, but its zone helpers are gated behind the `time` Cargo
-    // feature; this step promotes the feature and re-injects `chrono-tz`. A
-    // program that uses no Time kernel keeps the base manifest and drops the
-    // crate. `chrono` core is gated separately by `time-core`/`log` (the
-    // log/db/web timestamp surfaces reach it), so it is never touched here.
-    // Anchors on `default = [` /
-    // `chrono = "=0.4.45"`, not the tokio line, so it composes with the sync base.
-    let cargo_toml = if ctx.uses_time {
-        chrono_tz_cargo_toml(&cargo_toml)?
     } else {
         cargo_toml
     };
@@ -4829,77 +4801,6 @@ fn promote_default_feature(base: &str, feature: &str, where_: &'static str) -> D
     Ok(out)
 }
 
-/// Build the time-enabled `Cargo.toml` by promoting the `time` feature into the
-/// `default` list and re-injecting the `chrono-tz` dependency in its original
-/// slot (immediately after the base `chrono` line).
-///
-/// The `time` runtime module is ALWAYS declared, but its IANA-zone calendar
-/// helpers (the sole consumers of `chrono-tz`) are gated behind the `time` Cargo
-/// feature. A program that reaches an `Ipe.Time` kernel promotes the feature and
-/// gets the crate back; a program that uses no `Ipe.Time` kernel keeps the base
-/// manifest — no `time` in `default`, no `chrono-tz` line — so the helpers
-/// compile out and the crate is dropped. `chrono` core (the base crate the
-/// `log`/`db`/`web`/`telemetry` timestamp surfaces reach) is gated separately
-/// by `time-core`/`log` and untouched here.
-///
-/// The dep is re-inserted exactly where the base template declared it (after
-/// `chrono = "=0.4.45"`) so a Time-using manifest is byte-identical to the
-/// pre-gating output. Composes with any prior default-list surgery (`["json"]`,
-/// `["tokio", "json"]`, or the wasm `["wasm-client"]`): the `"time"` element is
-/// appended before the closing `]` regardless of the list's contents. The
-/// version comes from the [`crate_specs`] SSOT (drift-guarded against
-/// `runtime/Cargo.toml`).
-///
-/// # Errors
-///
-/// Returns [`Diagnostic::CompilerBug`] if the `default = [` / `chrono = "=0.4.45"`
-/// anchors are absent — a golden-drift invariant violation (fail-loud, never a
-/// silent no-op).
-fn chrono_tz_cargo_toml(base: &str) -> DResult<String> {
-    const DEFAULT_PREFIX: &str = "default = [";
-    const CHRONO_ANCHOR: &str = "chrono = \"=0.4.45\"\n";
-
-    // Step 1 — promote `time` into the default feature list.
-    let pfx = base
-        .find(DEFAULT_PREFIX)
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::chrono_tz_cargo_toml",
-            detail: format!("Cargo.toml anchor {DEFAULT_PREFIX:?} not found — golden drifted"),
-        })?;
-    let search_from = pfx + DEFAULT_PREFIX.len();
-    let rel = base
-        .get(search_from..)
-        .and_then(|s| s.find(']'))
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::chrono_tz_cargo_toml",
-            detail: "default feature list has no closing ']' — golden drifted".to_owned(),
-        })?;
-    let close = search_from + rel;
-    let mut step1 = String::with_capacity(base.len() + 40);
-    step1.push_str(base.get(..close).unwrap_or(""));
-    step1.push_str(r#", "time""#);
-    step1.push_str(base.get(close..).unwrap_or(""));
-
-    // Step 2 — re-inject `chrono-tz` in its original slot (after `chrono`).
-    let chrono_tz_dep = format!(
-        "{} = \"{}\"\n",
-        crate_specs::CHRONO_TZ.name,
-        crate_specs::CHRONO_TZ.version,
-    );
-    let anchor_pos = step1
-        .find(CHRONO_ANCHOR)
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::chrono_tz_cargo_toml",
-            detail: format!("Cargo.toml anchor {CHRONO_ANCHOR:?} not found — golden drifted"),
-        })?;
-    let insert_at = anchor_pos + CHRONO_ANCHOR.len();
-    let mut result = String::with_capacity(step1.len() + chrono_tz_dep.len());
-    result.push_str(step1.get(..insert_at).unwrap_or(""));
-    result.push_str(&chrono_tz_dep);
-    result.push_str(step1.get(insert_at..).unwrap_or(""));
-    Ok(result)
-}
-
 /// Build the email-enabled `Cargo.toml` by appending the `lettre` dependency
 /// before `[profile.dev]`.
 ///
@@ -5235,7 +5136,7 @@ fn crypto_core_heavy_cargo_toml(base: &str) -> DResult<String> {
     // `"tokio"` when present (keeping the `["tokio", "crypto", "json"]` order
     // byte-identical for async programs) and otherwise make it the first
     // element (`["json"]` → `["crypto", "json"]`), so an earlier promotion
-    // (`"time"`, `"locale"`, `"config"`) never hides the anchor.
+    // (`"locale"`, `"config"`) never hides the anchor.
     let step1 = if let Some(p) = base.find(TOKIO_ANCHOR) {
         let anchor_end = p + TOKIO_ANCHOR.len();
         let mut s = String::with_capacity(base.len() + rsa_dep.len() + 12);

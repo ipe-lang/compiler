@@ -93,8 +93,6 @@ pub enum RuntimeFeature {
     /// `IpeTask` return + its LCG-free eviction clock), so a program that reaches no
     /// `Ipe.Cache` surface drops the module.
     CacheKernel,
-    /// `time` — the IANA-zone calendar surface, `chrono-tz` (`uses_time`).
-    Time,
     /// `encoding` — the `base64` + `hex` + `percent-encoding` codec crates and
     /// the `encoding.rs` / `bytes.rs` runtime modules (`reaches_encoding()`: an
     /// `Ipe.Encoding` / `Ipe.Bytes` kernel, OR a crypto/db/server/email/jwt/web
@@ -125,9 +123,9 @@ pub enum RuntimeFeature {
     /// the graph (the other is `time-core`).
     Log,
     /// `time-core` — base `chrono` and the `time.rs` module
-    /// (`reaches_time_core()`: `log` OR any Time/Db/Web/WebView surface). The IANA
-    /// zone DB (`chrono-tz`) is the separate `Time` feature, which implies this.
-    /// The single selector for whether the emitted crate keeps `chrono`.
+    /// (`reaches_time_core()`: `log` OR any Time/Db/Web/WebView surface). The
+    /// single selector for whether the emitted crate keeps `chrono` and the UTC
+    /// calendar surface.
     TimeCore,
     /// `decimal` — the `decimal.rs`/`money.rs` modules + `rust_decimal`
     /// (`reaches_decimal()`: a `Decimal.*`/`Money.*` kernel OR the `Db` surface,
@@ -160,9 +158,9 @@ pub enum RuntimeFeature {
     /// module floor. Selected ONLY on [`ipe_ir::Target::WasmClient`]. It is the
     /// wasm target's fail-closed floor: the feature transitively pulls the whole
     /// proven wasm module set (`json` → `serde`, `crypto-core`, `secret`, `url`,
-    /// `encoding`, `regex`, `uuid`, `random`, `log`, `time`, `decimal`,
+    /// `encoding`, `regex`, `uuid`, `random`, `log`, `time-core`, `decimal`,
     /// `char-category`), so a wasm program selects it plus whatever additional
-    /// browser-admissible surface it reaches (`websocket_client`, `time`). Never
+    /// build-mode feature applies (`debugger`, `dev-posture`). Never
     /// selected on a native target — the `wasm` runtime module is target-cfg'd to
     /// `wasm32`, so a native crate that enabled it would fail to link.
     WasmClient,
@@ -225,7 +223,6 @@ impl RuntimeFeature {
         Self::Compression,
         Self::CsvKernel,
         Self::CacheKernel,
-        Self::Time,
         Self::Encoding,
         Self::Regex,
         Self::Uuid,
@@ -267,23 +264,22 @@ impl RuntimeFeature {
             Self::Compression => 14,
             Self::CsvKernel => 15,
             Self::CacheKernel => 16,
-            Self::Time => 17,
-            Self::Encoding => 18,
-            Self::Regex => 19,
-            Self::Uuid => 20,
-            Self::Random => 21,
-            Self::Log => 22,
-            Self::TimeCore => 23,
-            Self::Decimal => 24,
-            Self::CharCategory => 25,
-            Self::CryptoCore => 26,
-            Self::Secret => 27,
-            Self::Crypto => 28,
-            Self::Jwt => 29,
-            Self::WasmClient => 30,
-            Self::Debugger => 31,
-            Self::ControlWire => 32,
-            Self::DevPosture => 33,
+            Self::Encoding => 17,
+            Self::Regex => 18,
+            Self::Uuid => 19,
+            Self::Random => 20,
+            Self::Log => 21,
+            Self::TimeCore => 22,
+            Self::Decimal => 23,
+            Self::CharCategory => 24,
+            Self::CryptoCore => 25,
+            Self::Secret => 26,
+            Self::Crypto => 27,
+            Self::Jwt => 28,
+            Self::WasmClient => 29,
+            Self::Debugger => 30,
+            Self::ControlWire => 31,
+            Self::DevPosture => 32,
         }
     }
 
@@ -330,7 +326,6 @@ impl RuntimeFeature {
             Self::Compression => "compression",
             Self::CsvKernel => "csv_kernel",
             Self::CacheKernel => "cache_kernel",
-            Self::Time => "time",
             Self::Encoding => "encoding",
             Self::Regex => "regex",
             Self::Uuid => "uuid",
@@ -380,7 +375,7 @@ pub fn runtime_features(ctx: &EmitCtx) -> RuntimeFeatureSet {
     //   • `wasm-client` is the closed, SSOT-declared browser floor. It
     //     transitively pulls the whole wasm module set (`json` → `serde`, `url`,
     //     `encoding`, `crypto-core`, `secret`, `regex`, `uuid`, `random`, `log`,
-    //     `time`, `decimal`, `char-category`) and its browser-glue crates, so it
+    //     `time-core`, `decimal`, `char-category`) and its browser-glue crates, so it
     //     already covers every kernel a wasm program can reach.
     //   • The native surface features (`web`/`server`/`http_client`/`async`/
     //     `websocket_client`/…) map to the tokio/axum/reqwest/tokio-tungstenite
@@ -637,6 +632,67 @@ mod tests {
             !refused_by(&emitted),
             "a dependency-model `--debugger` emit must not be refused: {:?}",
             emitted.as_ref().err()
+        );
+    }
+
+    /// A vendored native emit gives tokio `"signal"` exactly once.
+    ///
+    /// The stop-signal relay compiles wherever the runtime's `tokio` feature
+    /// does, so every async shape (worker, Tui, console, server) must declare
+    /// it through the real assembly path, and a pure program keeps no `tokio`
+    /// line at all.
+    #[test]
+    fn vendored_async_emit_declares_tokio_signal() {
+        /// One async program shape: its name and the flags it sets.
+        type Shape = (&'static str, fn(&mut Module));
+        let tokio_line = |toml: &str| {
+            toml.lines()
+                .find(|l| l.starts_with("tokio = {"))
+                .map(str::to_owned)
+        };
+        let emit_toml = |configure: fn(&mut Module)| {
+            let mut interner = Interner::new();
+            let main = interner.intern("Main").expect("intern Main");
+            let prog = Program {
+                imports_unsafe_submodule: false,
+                imported_web_capabilities: std::collections::BTreeSet::new(),
+                modules: vec![ctx_module(main, configure)],
+            };
+            let backend = RustBackend::new(&interner);
+            let ctx = backend.emit_ctx_for_tests(&prog).expect("build EmitCtx");
+            crate::project::assemble_project_files(&ctx, Vec::new())
+                .expect("a vendored native emit assembles")
+                .cargo_toml
+        };
+        let shapes: [Shape; 4] = [
+            ("worker", |m| m.uses_async_runtime = true),
+            ("tui", |m| {
+                m.uses_tui = true;
+                m.uses_ui = true;
+                m.uses_async_runtime = true;
+            }),
+            ("console", |m| {
+                m.uses_console = true;
+                m.uses_async_runtime = true;
+            }),
+            ("server", |m| {
+                m.uses_server = true;
+                m.uses_async_runtime = true;
+            }),
+        ];
+        for (shape, configure) in shapes {
+            let toml = emit_toml(configure);
+            let line = tokio_line(&toml).unwrap_or_default();
+            assert_eq!(
+                line.matches(r#""signal""#).count(),
+                1,
+                "a vendored {shape} emit must declare tokio \"signal\" exactly once: {line:?}"
+            );
+        }
+        let pure = emit_toml(|_| {});
+        assert!(
+            tokio_line(&pure).is_none(),
+            "a pure vendored emit must keep the tokio-free base: {pure}"
         );
     }
 
@@ -963,7 +1019,6 @@ mod tests {
             RuntimeFeature::Compression,
             RuntimeFeature::CsvKernel,
             RuntimeFeature::CacheKernel,
-            RuntimeFeature::Time,
             RuntimeFeature::Decimal,
             RuntimeFeature::CharCategory,
             RuntimeFeature::Crypto,

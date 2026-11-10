@@ -15997,14 +15997,12 @@ impl StdlibKernel {
     /// (`Time.now` / `unixMillis` / `sleep` / `timeString` / `isLeapYear` /
     /// `daysInMonth`). Excludes `Time.every`, which is TEA (`is_tea()`).
     ///
-    /// The whole `time.rs` runtime module is behind the `time-core` Cargo feature
-    /// (base `chrono`); its IANA-zone calendar surface additionally needs the
-    /// `time` feature (`chrono-tz`), which implies `time-core`. Used by
-    /// `ipe_lower` to detect `uses_time` and by the backend to enable both
-    /// features and add the `chrono-tz` dependency; a program that reaches no
-    /// `Ipe.Time` kernel drops `chrono-tz` and — unless a Log/Db/Web surface (or
-    /// a webview-native `web desktop` host) also reaches `time-core` — `chrono`
-    /// itself.
+    /// The whole `time.rs` runtime module (the UTC calendar surface) is behind
+    /// the `time-core` Cargo feature (base `chrono`). Used by `ipe_lower` to
+    /// detect `uses_time` and by the backend to select `time-core`; a program
+    /// that reaches no `Ipe.Time` kernel — and no Log/Db/Web surface or
+    /// webview-native `web desktop` host, which also reach `time-core` — drops
+    /// the module and `chrono`.
     #[must_use]
     pub const fn is_time(self) -> bool {
         matches!(
@@ -19398,8 +19396,8 @@ mod tests {
         }
     }
 
-    /// Every non-TEA `Ipe.Time` kernel keys the `uses_time` gate that enables
-    /// the `time` Cargo feature (and the `chrono-tz` dependency). So `qualifier
+    /// Every non-TEA `Ipe.Time` kernel keys the `uses_time` gate that selects
+    /// the `time-core` Cargo feature (and the `chrono` dependency). So `qualifier
     /// == "Time" && !is_tea()` MUST imply `is_time()`, and no other kernel may
     /// report `is_time()`. `Time.every` is TEA, excluded on both sides. Both
     /// directions are asserted, so a new `Time.*` kernel the predicate forgets —
@@ -19413,7 +19411,7 @@ mod tests {
                 k.is_time(),
                 is_time_qualifier,
                 "{k:?}: is_time()={} but (qualifier==\"Time\" && !is_tea()) is {} — \
-                 a Time-using program would either drop chrono-tz it needs or a \
+                 a Time-using program would either drop chrono it needs or a \
                  non-Time program would pull it",
                 k.is_time(),
                 is_time_qualifier,

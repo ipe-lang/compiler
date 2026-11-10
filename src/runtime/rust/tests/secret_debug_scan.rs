@@ -315,12 +315,6 @@ const DEBUG_SITES: &[DebugSite] = &[
     },
     DebugSite {
         file: "rust/src/project.rs",
-        func: "chrono_tz_cargo_toml",
-        count: 2,
-        why: DIAGNOSTIC,
-    },
-    DebugSite {
-        file: "rust/src/project.rs",
         func: "compression_cargo_toml",
         count: 1,
         why: DIAGNOSTIC,
