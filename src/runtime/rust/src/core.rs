@@ -2571,9 +2571,7 @@ mod tests {
     // a trip is never answered as a foreign `None`.
     #[test]
     fn closure_unwind_separates_a_trip_from_a_foreign_payload() {
-        let tripped = std::panic::catch_unwind(|| trip(RuntimeTrip::RecursionLimit));
-        assert!(tripped.is_err(), "a trip must unwind");
-        let Err(payload) = tripped else { return };
+        let Err(payload) = std::panic::catch_unwind(|| trip(RuntimeTrip::RecursionLimit));
         assert!(matches!(
             closure_unwind(payload),
             ClosureUnwind::Trip(RuntimeTrip::RecursionLimit)
