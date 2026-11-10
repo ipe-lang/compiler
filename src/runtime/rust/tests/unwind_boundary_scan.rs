@@ -180,10 +180,10 @@ const CATCH_SITES: &[CatchSite] = &[
     },
     CatchSite {
         file: "task.rs",
-        function: "ffi_spawn_guarded",
+        function: "spawn_guarded_raw",
         shape: "try_into_panic",
         count: 1,
-        route: Route::Typed("ipe_error_from_panic"),
+        route: Route::Typed("closure_unwind"),
     },
     CatchSite {
         file: "task.rs",

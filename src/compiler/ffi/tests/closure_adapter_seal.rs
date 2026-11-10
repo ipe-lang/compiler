@@ -7,15 +7,16 @@
 //! small "crate" fn the boxed closure the adapter returns, and the crate calls
 //! it — the result round-trips.
 //!
-//! Two return shapes are exercised:
-//!  * a `Total(scalar)` adapter, whose emitted region needs only `std` (the
-//!    happy path returns the value; a panic would abort — proven not taken);
-//!  * a `Result` adapter, whose panic-fold arm needs the runtime `str_err` /
-//!    `IpeError` glue (a tiny shim stands in for `use crate::*`).
+//! Three return shapes are exercised — `Total(scalar)`, `Result` and
+//! `Option` — against a tiny shim standing in for `use crate::*`. A second
+//! build links the REAL runtime crate and drives an Ipê closure that recurses
+//! past the depth limit through the `Total` and `Option` adapters: the
+//! process ends typed (status 1, the limit on stderr), never by `abort` and
+//! never as a silent `None`.
 //!
-//! The emit-only assertion runs in the DEFAULT gate; the cargo build+run proof
-//! is `IPE_E2E`-gated (matching the repo's other SEAL fixtures), because it
-//! shells out to `cargo`.
+//! The emit-only assertion runs in the DEFAULT gate; the cargo build+run proofs
+//! are `IPE_E2E`-gated (matching the repo's other SEAL fixtures), because they
+//! shell out to `cargo`.
 #![allow(clippy::expect_used)] // test setup: a failed decode / scratch-dir op IS the failure
 
 use ipe_ffi::bindings::emit_bindings;
@@ -60,7 +61,11 @@ fn closure_adapter_emits_a_wrapper_for_both_return_shapes() {
         ),
         "{total}"
     );
-    assert!(total.contains("std::process::abort()"), "{total}");
+    // No error channel: an unwind ends the process typed, never an abort.
+    assert!(
+        total.contains("end_on_unchanneled_unwind(") && !total.contains("abort()"),
+        "{total}"
+    );
 
     let res = emit_closure("Fn(Int) -> Result<Int, Error> + Send + Sync + 'static");
     assert!(
@@ -118,11 +123,13 @@ fn closure_adapter_builds_and_runs() {
     }
     let total_region = emit_closure("Fn(Int) -> Int + Send + Sync + 'static");
     let result_region = emit_closure("Fn(Int) -> Result<Int, Error> + Send + Sync + 'static");
+    let option_region = emit_closure("Fn(Int) -> Option<Int> + Send + Sync + 'static");
     // Keep only the sentinel-bracketed wrapper regions; drop the emitted
     // preamble (`use crate::*;`, the panic fence) — this fixture supplies its
     // own minimal glue instead of the runtime crate.
     let total_fn = wrapper_region(&total_region, "apply_fn");
     let result_fn = wrapper_region(&result_region, "apply_fn");
+    let option_fn = wrapper_region(&option_region, "apply_fn");
 
     let dir =
         ipe_test_temp::temp_root().join(format!("ipe_ffi_closure_seal_{}", std::process::id()));
@@ -138,8 +145,8 @@ fn closure_adapter_builds_and_runs() {
     .expect("Cargo.toml");
 
     // A minimal stand-in for the runtime glue the emitted arms name
-    // (`str_err`, `IpeError`, the panic funnel). The `Total` arm names only
-    // `note_foreign_panic` before its abort.
+    // (`str_err`, `IpeError`, the panic funnel, the unwind classifier and the
+    // no-error-channel terminal), with the runtime's signatures.
     let main_rs = format!(
         r#"// Minimal runtime glue the emitted Result adapter references.
 #[derive(Debug)]
@@ -150,6 +157,13 @@ pub fn note_foreign_panic(_c: &str, _p: Box<dyn std::any::Any + Send>) -> String
 pub fn note_foreign_error<T: std::fmt::Debug>(_e: T) -> String {{ String::new() }}
 pub fn ipe_error_from_foreign<T: std::fmt::Debug, E: From<String>>(_e: T) -> E {{ "external operation failed".to_string().into() }}
 impl From<String> for IpeError {{ fn from(s: String) -> Self {{ IpeError(s) }} }}
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeTrip;
+pub enum ClosureUnwind {{ Trip(RuntimeTrip), Foreign(Box<dyn std::any::Any + Send>) }}
+pub fn closure_unwind(p: Box<dyn std::any::Any + Send>) -> ClosureUnwind {{
+    match p.downcast::<RuntimeTrip>() {{ Ok(t) => ClosureUnwind::Trip(*t), Err(p) => ClosureUnwind::Foreign(p) }}
+}}
+pub fn end_on_unchanneled_unwind(_c: &'static str, _u: ClosureUnwind) -> ! {{ std::process::exit(1) }}
 
 // A tiny "crate" fn that takes the boxed closure and calls it — the exact
 // shape an Iced `update` / Ratatui `draw` driver would.
@@ -162,10 +176,15 @@ fn crate_takes_result(
 ) -> i64 {{
     f(41).map(|n| n + 1).unwrap_or(-1)
 }}
+fn crate_takes_option(f: Box<dyn Fn(i64) -> Option<i64> + Send + Sync + 'static>) -> i64 {{
+    f(5).unwrap_or(-1)
+}}
 
 {total_fn}
 
 {result_fn}
+
+{option_fn}
 
 fn main() {{
     // The Ipê function value: on the app side this is exactly a
@@ -179,6 +198,11 @@ fn main() {{
         Box::new(|x| Ok(x));
     let adapted_result = demo_apply_fn_result(ipe_result);
     let result = crate_takes_result(adapted_result);
+
+    let ipe_option: Box<dyn Fn(i64) -> Option<i64> + Send + Sync + 'static> =
+        Box::new(|x| Some(x * 2));
+    let option = crate_takes_option(demo_apply_fn_option(ipe_option));
+    assert_eq!(option, 10, "option-return closure round-trip");
 
     // (20+1) + (22+1) = 43 ; (41 -> Ok(41)) + 1 = 42
     assert_eq!(total, 44, "total-return closure round-trip");
@@ -197,6 +221,9 @@ fn main() {{
         result_fn = result_fn
             .replace("pub fn demo_apply_fn(", "pub fn demo_apply_fn_result(")
             .replace("ApplyFnClosure", "ApplyFnClosureResult"),
+        option_fn = option_fn
+            .replace("pub fn demo_apply_fn(", "pub fn demo_apply_fn_option(")
+            .replace("ApplyFnClosure", "ApplyFnClosureOption"),
     );
     std::fs::write(dir.join("src").join("main.rs"), main_rs).expect("main.rs");
 
@@ -241,4 +268,108 @@ fn wrapper_region(bindings: &str, ref_name: &str) -> String {
         }
     }
     out
+}
+
+/// SEAL proof under `IPE_E2E=1`: the emitted `Total` and `Option` adapters,
+/// linked against the real runtime, end the process typed when the Ipê closure
+/// they call trips the recursion limit — status 1 (never 134), the limit named
+/// on stderr, and nothing printed after the call (never a fabricated `None`).
+#[test]
+fn ffi_closure_trip_ends_typed() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let total_fn = wrapper_region(
+        &emit_closure("Fn(Int) -> Int + Send + Sync + 'static"),
+        "apply_fn",
+    )
+    .replace("pub fn demo_apply_fn(", "pub fn demo_apply_fn_total(")
+    .replace("ApplyFnClosure", "ApplyFnClosureTotal");
+    let option_fn = wrapper_region(
+        &emit_closure("Fn(Int) -> Option<Int> + Send + Sync + 'static"),
+        "apply_fn",
+    )
+    .replace("pub fn demo_apply_fn(", "pub fn demo_apply_fn_option(")
+    .replace("ApplyFnClosure", "ApplyFnClosureOption");
+
+    let runtime = e2e_support::require_runtime_crate();
+    let dir =
+        ipe_test_temp::temp_root().join(format!("ipe_ffi_closure_trip_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).expect("mkdir");
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"closure_trip\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\
+             [[bin]]\nname = \"closure_trip\"\npath = \"src/main.rs\"\n\
+             [dependencies]\nipe-runtime-rust = {{ path = {:?} }}\n\
+             [profile.dev]\npanic = \"unwind\"\n",
+            runtime.display().to_string()
+        ),
+    )
+    .expect("Cargo.toml");
+
+    // `deep` is the shape every emitted Ipê function body takes: a depth guard
+    // at the top, then the (here unbounded) recursive call.
+    let main_rs = format!(
+        r#"#![allow(unused_imports, unconditional_recursion)]
+use ipe_runtime_rust::*;
+
+fn deep(n: i64) -> i64 {{
+    let _guard = recursion_guard();
+    deep(n.wrapping_add(1)).wrapping_add(1)
+}}
+
+{total_fn}
+
+{option_fn}
+
+fn main() {{
+    println!("start");
+    match std::env::args().nth(1).as_deref() {{
+        Some("total") => {{
+            let f = demo_apply_fn_total(Box::new(deep));
+            println!("total returned {{}}", f(0));
+        }}
+        Some("option") => {{
+            let f = demo_apply_fn_option(Box::new(|n| Some(deep(n))));
+            println!("option returned {{:?}}", f(0));
+        }}
+        _ => println!("unknown mode"),
+    }}
+}}
+"#
+    );
+    std::fs::write(dir.join("src").join("main.rs"), main_rs).expect("main.rs");
+
+    let outcome = e2e_support::build_rust_binary("ffi_closure_trip", &dir);
+    assert!(
+        outcome.is_ok(),
+        "{}",
+        outcome.as_ref().err().map_or("", String::as_str)
+    );
+    let build = outcome.expect("asserted Ok above");
+    for mode in ["total", "option"] {
+        let run = std::process::Command::new(build.path())
+            .arg(mode)
+            .output()
+            .expect("the built binary runs");
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(
+            run.status.code(),
+            Some(1),
+            "{mode}: a trip in the closure must end the process typed (status 1, never \
+             134).\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_eq!(
+            stdout, "start\n",
+            "{mode}: nothing may run after the tripped call.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("maximum recursion depth exceeded"),
+            "{mode}: the typed limit must reach stderr.\nstderr: {stderr}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
