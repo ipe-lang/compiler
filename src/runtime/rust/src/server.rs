@@ -2316,18 +2316,35 @@ impl AllowOracle {
         Self(axum::Router::new().fallback(move || async move { methods_answer(methods) }))
     }
 
-    /// The oracle of a static-file mount over `dir`: `GET` and `HEAD` on
-    /// every path the static gate admits ([`static_admits`]), the same
-    /// judgement the file service's gate makes.
-    fn static_files(dir: std::path::PathBuf) -> Self {
+    /// The oracle of a static-file mount served by `files`: `GET` and `HEAD`
+    /// on every path where a `GET` finds something, judged by `files` itself
+    /// answering an [`existence_probe`], so a path the gates refuse or no
+    /// file backs is answered `404` like a `GET` there.
+    fn static_files<F>(files: F) -> Self
+    where
+        F: tower::Service<
+                axum::extract::Request,
+                Response = axum::response::Response,
+                Error = std::convert::Infallible,
+            > + Clone
+            + Send
+            + Sync
+            + 'static,
+        F::Future: Send + 'static,
+    {
         Self(
             axum::Router::new().fallback(move |req: axum::extract::Request| {
-                let admitted = static_admits(&req, &dir, crate::path_core::HOST);
+                let files = files.clone();
                 async move {
-                    if admitted {
+                    use axum::response::IntoResponse;
+                    use tower::ServiceExt;
+                    let found = match files.oneshot(existence_probe(req)).await {
+                        Ok(answer) => answer.status() != axum::http::StatusCode::NOT_FOUND,
+                        Err(never) => match never {},
+                    };
+                    if found {
                         methods_answer(MethodSet::GET)
                     } else {
-                        use axum::response::IntoResponse;
                         axum::http::StatusCode::NOT_FOUND.into_response()
                     }
                 }
@@ -2345,6 +2362,16 @@ impl AllowOracle {
         };
         response.extensions().get::<MethodSet>().copied()
     }
+}
+
+/// `request` as a bodiless `HEAD` with no header, for the same target and
+/// listener parse: asks a file service what a `GET` there finds, reading no
+/// file body and honouring no condition or range.
+fn existence_probe(request: axum::extract::Request) -> axum::extract::Request {
+    let (mut parts, _body) = request.into_parts();
+    parts.method = axum::http::Method::HEAD;
+    parts.headers.clear();
+    axum::extract::Request::from_parts(parts, axum::body::Body::empty())
 }
 
 /// The answer to a `TRACE` or `CONNECT` request, which reaches no handler.
@@ -3619,9 +3646,10 @@ impl ServedRouter {
     /// The static files under `dir`, behind the strict URL and static path
     /// gates ([`strict_serve_dir`]).
     pub(crate) fn static_files(dir: std::path::PathBuf) -> Self {
+        let files = strict_serve_dir(dir);
         Self {
-            router: axum::Router::new().fallback_service(strict_serve_dir(dir.clone())),
-            allow: AllowOracle::static_files(dir),
+            router: axum::Router::new().fallback_service(files.clone()),
+            allow: AllowOracle::static_files(files),
         }
     }
 
@@ -7006,13 +7034,15 @@ mod tests {
                 allow_of(&resp)
             );
         }
-        for uri in ["/elsewhere", "/"] {
+        for uri in ["/elsewhere", "/", "/assets/missing.txt"] {
             let resp = answer_method(&app, "TRACE", uri).await;
             assert!(finds_nothing(&resp), "{uri}: {:?}", resp.status());
         }
         assert_eq!(runs.load(Ordering::SeqCst), 0);
         let file = answer_method(&app, "GET", "/assets/hello.txt").await;
         assert_eq!(file.status(), axum::http::StatusCode::OK);
+        let missing = answer_method(&app, "GET", "/assets/missing.txt").await;
+        assert_eq!(missing.status(), axum::http::StatusCode::NOT_FOUND);
         let _ = std::fs::remove_dir_all(dir);
     }
 
