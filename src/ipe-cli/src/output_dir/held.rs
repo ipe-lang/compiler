@@ -1452,6 +1452,69 @@ impl HeldDir {
     }
 }
 
+/// Why a file that is present was not read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unread {
+    /// The name is a symbolic link (or a reparse point), never followed.
+    Link,
+    /// The name is a FIFO, device, socket or directory.
+    NotRegular,
+    /// The file is larger than the read's cap.
+    TooLarge,
+    /// The file is not UTF-8.
+    NotUtf8,
+    /// The process may not open the file.
+    Denied,
+    /// The read failed for another reason.
+    Io,
+}
+
+/// Why a capped read of a named file returned no text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadMiss {
+    /// No entry has the name.
+    Absent,
+    /// An entry has the name and was not read.
+    Unread(Unread),
+}
+
+/// Classify a failed capped read by its typed variant, never by message text.
+#[must_use]
+pub fn read_miss(err: &CliError) -> ReadMiss {
+    use crate::io_bounded::SourceRefusal;
+    match err {
+        CliError::Io { source, .. } => match source.kind() {
+            io::ErrorKind::NotFound => ReadMiss::Absent,
+            io::ErrorKind::InvalidData => ReadMiss::Unread(Unread::NotUtf8),
+            // `io::ErrorKind` is non-exhaustive: every other kind is a failed read.
+            _ => ReadMiss::Unread(Unread::Io),
+        },
+        CliError::SourceRefused { reason, .. } => ReadMiss::Unread(match reason {
+            SourceRefusal::Symlink => Unread::Link,
+            SourceRefusal::NotRegularFile => Unread::NotRegular,
+            SourceRefusal::AccessDenied => Unread::Denied,
+        }),
+        CliError::FileTooLarge { .. } => ReadMiss::Unread(Unread::TooLarge),
+        // No other variant comes out of a capped read; any that did is a failed read.
+        _ => ReadMiss::Unread(Unread::Io),
+    }
+}
+
+impl Unread {
+    /// The fixed reason phrase; `cap` is the read's ceiling.
+    #[must_use]
+    pub fn phrase(self, cap: ByteCap) -> String {
+        match self {
+            Self::Link => "a link".to_owned(),
+            Self::NotRegular => "not a regular file".to_owned(),
+            Self::TooLarge => format!("larger than {} bytes", cap.get()),
+            Self::NotUtf8 => "not UTF-8".to_owned(),
+            Self::Denied => "permission denied".to_owned(),
+            Self::Io => "read failed".to_owned(),
+        }
+    }
+}
+
 /// Test-only hook run after each level of an owned-path walk is held.
 #[cfg(test)]
 pub type LevelHook = Box<dyn FnMut(&Path)>;
@@ -2912,5 +2975,50 @@ mod tests {
             "a removed directory is refused, got {listing:?}"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Each capped-read failure maps to its reason by typed variant.
+    #[test]
+    fn read_miss_maps_each_typed_variant() {
+        use crate::io_bounded::SourceRefusal;
+        let path = PathBuf::from("AGENTS.md");
+        let io_of = |kind| CliError::Io {
+            path: path.clone(),
+            source: io::Error::from(kind),
+        };
+        let refused = |reason| CliError::SourceRefused {
+            path: path.clone(),
+            reason,
+        };
+        let cases = [
+            (io_of(io::ErrorKind::NotFound), ReadMiss::Absent),
+            (
+                io_of(io::ErrorKind::InvalidData),
+                ReadMiss::Unread(Unread::NotUtf8),
+            ),
+            (io_of(io::ErrorKind::Other), ReadMiss::Unread(Unread::Io)),
+            (
+                refused(SourceRefusal::Symlink),
+                ReadMiss::Unread(Unread::Link),
+            ),
+            (
+                refused(SourceRefusal::NotRegularFile),
+                ReadMiss::Unread(Unread::NotRegular),
+            ),
+            (
+                refused(SourceRefusal::AccessDenied),
+                ReadMiss::Unread(Unread::Denied),
+            ),
+            (
+                CliError::FileTooLarge {
+                    path: path.clone(),
+                    max: 1,
+                },
+                ReadMiss::Unread(Unread::TooLarge),
+            ),
+        ];
+        for (err, want) in cases {
+            assert_eq!(read_miss(&err), want, "{err:?}");
+        }
     }
 }

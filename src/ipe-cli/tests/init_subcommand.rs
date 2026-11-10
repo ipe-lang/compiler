@@ -53,6 +53,21 @@ fn init_scaffolds_project_files() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// `ipe init` writes `AGENTS.md` as exactly the stamp line and the embedded guide.
+#[test]
+fn rendered_is_stamp_plus_asset() {
+    let dir = fresh_dir("agents_rendered");
+    let target = dir.join("guided");
+    let args = vec!["init".to_owned(), target.to_string_lossy().into_owned()];
+    assert!(ipe::run_cli(&args).is_ok(), "init must succeed");
+    let written = fs::read_to_string(target.join("AGENTS.md")).unwrap_or_default();
+    assert_eq!(written, ipe::agents_guide::rendered());
+    let (stamp, body) = written.split_once('\n').unwrap_or_default();
+    assert!(stamp.starts_with("<!-- ipe-guide:1 ipe "), "{stamp}");
+    assert_eq!(body, ipe::agents_guide::ASSET);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A second `ipe init` on an already-scaffolded directory never clobbers the
 /// user's project. In this non-interactive harness (no TTY) it succeeds without
 /// prompting and leaves every existing managed file byte-for-byte untouched;

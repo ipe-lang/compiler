@@ -16,6 +16,7 @@
 //! Errors are typed ([`CliError`]); no operation panics or unwraps.
 
 pub mod advisory;
+pub mod agents_guide;
 pub mod api_surface;
 pub mod audit;
 pub mod audit_native;

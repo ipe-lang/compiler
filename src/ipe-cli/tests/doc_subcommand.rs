@@ -69,6 +69,16 @@ fn documented_package(tag: &str) -> io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// `ipe doc guide:agents --plain` prints the embedded guide byte for byte, so
+/// redirecting it to `AGENTS.md` yields a current guide.
+#[test]
+fn guide_agents_plain_is_asset_bytes() {
+    let dir = fresh_dir("guide_agents_plain");
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", ipe::agents_guide::GUIDE_TERM, "--plain"]);
+    assert!(ok, "doc guide:agents must succeed: {stderr}");
+    assert_eq!(stdout, ipe::agents_guide::ASSET);
+}
+
 #[test]
 fn generate_writes_docs_json_and_markdown() -> io::Result<()> {
     let pkg = documented_package("generate")?;

@@ -347,6 +347,7 @@ impl DocBundle {
         for ((_, kind), dir) in OVERLAY_KINDS.iter().zip(EMBEDDED_PAGES) {
             ingest_embedded_dir(dir, *kind, &mut maps)?;
         }
+        ingest_embedded_assets(&EMBEDDED_ASSETS, &mut maps)?;
 
         if let DocsOverlay::Project(root) = overlay {
             ingest_overlay(
@@ -875,6 +876,36 @@ fn is_valid_slug(slug: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
+/// Pages whose body is an asset another command also writes: `(kind, key, title, body)`.
+///
+/// Each row is ingested after the embedded page directories, through
+/// [`insert_entry`], so a page directory holding the same key is a
+/// [`BundleError::DuplicateKey`], and the on-disk overlay can never shadow it.
+pub const EMBEDDED_ASSETS: [(DocKind, &str, &str, &str); 1] = [(
+    DocKind::Guide,
+    crate::agents_guide::GUIDE_KEY,
+    crate::agents_guide::GUIDE_TITLE,
+    crate::agents_guide::ASSET,
+)];
+
+/// Ingest each `assets` row as one entry.
+fn ingest_embedded_assets(
+    assets: &[(DocKind, &str, &str, &str)],
+    maps: &mut BTreeMap<DocKind, BTreeMap<String, DocEntry>>,
+) -> Result<(), BundleError> {
+    for &(kind, key, title, body) in assets {
+        insert_entry(
+            maps,
+            kind,
+            key.to_owned(),
+            title.to_owned(),
+            TerminalSafe::sanitize(body),
+            None,
+        )?;
+    }
+    Ok(())
+}
+
 /// Insert an entry into the per-kind map, returning a hard error on a duplicate.
 fn insert_entry(
     maps: &mut BTreeMap<DocKind, BTreeMap<String, DocEntry>>,
@@ -1124,6 +1155,44 @@ mod tests {
     }
 
     // -- Ingestion ------------------------------------------------------------
+
+    #[test]
+    fn embedded_asset_key_collision_is_duplicate_key() {
+        let mut maps = BTreeMap::new();
+        insert_entry(
+            &mut maps,
+            DocKind::Guide,
+            crate::agents_guide::GUIDE_KEY.to_owned(),
+            "A page".to_owned(),
+            TerminalSafe::sanitize("# A page\n"),
+            None,
+        )
+        .unwrap();
+        let collided = ingest_embedded_assets(&EMBEDDED_ASSETS, &mut maps);
+        assert!(
+            matches!(
+                &collided,
+                Err(BundleError::DuplicateKey { kind: DocKind::Guide, key, .. })
+                    if key == crate::agents_guide::GUIDE_KEY
+            ),
+            "{collided:?}"
+        );
+    }
+
+    #[test]
+    fn project_overlay_cannot_shadow_guide_agents() {
+        let project = tempdir("overlay_guide_agents");
+        let guide = project.join("docs").join("guide");
+        fs::create_dir_all(&guide).unwrap();
+        fs::write(guide.join("agents.md"), "# Not the guide\n\nOther text.\n").unwrap();
+        let bundle = project_bundle(&project).unwrap();
+        let served = bundle
+            .maps
+            .get(&DocKind::Guide)
+            .and_then(|pages| pages.get(crate::agents_guide::GUIDE_KEY))
+            .map(|entry| entry.body.as_str());
+        assert_eq!(served, Some(crate::agents_guide::ASSET));
+    }
 
     #[test]
     fn ingest_topic_without_front_matter() {

@@ -64,7 +64,6 @@ const LIB_IPE: &str = include_str!("../templates/Lib.ipe.in");
 const README_LIB_MD: &str = include_str!("../templates/README.lib.md.in");
 
 const GITIGNORE: &str = include_str!("../templates/gitignore.in");
-const AGENTS_MD: &str = include_str!("../templates/AGENTS.md.in");
 
 // ── shape model ───────────────────────────────────────────────────────────────
 
@@ -839,7 +838,7 @@ fn managed_files(project_name: &str, shape: InitShape, runtime: Runtime) -> Vec<
         },
         ManagedFile {
             rel: PathBuf::from("AGENTS.md"),
-            content: AGENTS_MD.to_owned(),
+            content: crate::agents_guide::rendered(),
         },
     ]
 }
@@ -880,7 +879,7 @@ fn library_files(project_name: &str) -> Vec<ManagedFile> {
         },
         ManagedFile {
             rel: PathBuf::from("AGENTS.md"),
-            content: AGENTS_MD.to_owned(),
+            content: crate::agents_guide::rendered(),
         },
     ]
 }
