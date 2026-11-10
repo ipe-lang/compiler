@@ -34,8 +34,10 @@ parameter; `col` is validated against the store's columns at query time.
 
 Example:
 
-    Store.query store
-        |> Store.where (Unsafe.eq "id" (SqlString "u1"))
+```ipe ipe:skip illustrative; store is the caller's already-built Store, not a standalone program
+Store.query store
+    |> Store.where (Unsafe.eq "id" (SqlString "u1"))
+```
 
 ## `neq`
 
@@ -47,8 +49,10 @@ neq : String -> SqlValue -> Cond row
 
 Example:
 
-    Store.query store
-        |> Store.where (Unsafe.neq "status" (SqlString "deleted"))
+```ipe ipe:skip illustrative; store is the caller's already-built Store, not a standalone program
+Store.query store
+    |> Store.where (Unsafe.neq "status" (SqlString "deleted"))
+```
 
 ## `gt`
 
@@ -60,8 +64,10 @@ gt : String -> SqlValue -> Cond row
 
 Example:
 
-    Store.query store
-        |> Store.where (Unsafe.gt "age" (SqlInt 18))
+```ipe ipe:skip illustrative; store is the caller's already-built Store, not a standalone program
+Store.query store
+    |> Store.where (Unsafe.gt "age" (SqlInt 18))
+```
 
 ## `gte`
 
@@ -73,8 +79,10 @@ gte : String -> SqlValue -> Cond row
 
 Example:
 
-    Store.query store
-        |> Store.where (Unsafe.gte "age" (SqlInt 18))
+```ipe ipe:skip illustrative; store is the caller's already-built Store, not a standalone program
+Store.query store
+    |> Store.where (Unsafe.gte "age" (SqlInt 18))
+```
 
 ## `lt`
 
@@ -86,8 +94,10 @@ lt : String -> SqlValue -> Cond row
 
 Example:
 
-    Store.query store
-        |> Store.where (Unsafe.lt "age" (SqlInt 65))
+```ipe ipe:skip illustrative; store is the caller's already-built Store, not a standalone program
+Store.query store
+    |> Store.where (Unsafe.lt "age" (SqlInt 65))
+```
 
 ## `lte`
 
@@ -99,8 +109,10 @@ lte : String -> SqlValue -> Cond row
 
 Example:
 
-    Store.query store
-        |> Store.where (Unsafe.lte "age" (SqlInt 64))
+```ipe ipe:skip illustrative; store is the caller's already-built Store, not a standalone program
+Store.query store
+    |> Store.where (Unsafe.lte "age" (SqlInt 64))
+```
 
 ## `like`
 
@@ -117,8 +129,10 @@ refused as a typed error.
 
 Example:
 
-    Store.query store
-        |> Store.where (Unsafe.like "name" "al%")
+```ipe ipe:skip illustrative; store is the caller's already-built Store, not a standalone program
+Store.query store
+    |> Store.where (Unsafe.like "name" "al%")
+```
 
 ## `isNull`
 
@@ -130,8 +144,10 @@ isNull : String -> Cond row
 
 Example:
 
-    Store.query store
-        |> Store.where (Unsafe.isNull "deletedAt")
+```ipe ipe:skip illustrative; store is the caller's already-built Store, not a standalone program
+Store.query store
+    |> Store.where (Unsafe.isNull "deletedAt")
+```
 
 ## `notNull`
 
@@ -143,8 +159,10 @@ notNull : String -> Cond row
 
 Example:
 
-    Store.query store
-        |> Store.where (Unsafe.notNull "email")
+```ipe ipe:skip illustrative; store is the caller's already-built Store, not a standalone program
+Store.query store
+    |> Store.where (Unsafe.notNull "email")
+```
 
 ## `inList`
 
@@ -158,8 +176,10 @@ ill-formed `IN ()`.
 
 Example:
 
-    Store.query store
-        |> Store.where (Unsafe.inList "status" [ SqlString "active", SqlString "trial" ])
+```ipe ipe:skip illustrative; store is the caller's already-built Store, not a standalone program
+Store.query store
+    |> Store.where (Unsafe.inList "status" [ SqlString "active", SqlString "trial" ])
+```
 
 ## `primaryKey`
 

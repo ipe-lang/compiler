@@ -79,6 +79,7 @@ The combinator surface:
 Minimal round-trips:
 
     import Ipe.Codec as Codec exposing (Codec)
+    import Ipe.Json.Decode.Pipeline as Pipeline
 
     scores : Codec (Dict String Int)
     scores =
@@ -87,6 +88,10 @@ Minimal round-trips:
     -- Codec.fromJson scores (Codec.toJson scores d) == Ok d
 
     type Rank = Bronze | Silver | Gold
+
+    rankEq : Rank -> Rank -> Bool
+    rankEq a b =
+        a == b
 
     rankCodec : Codec Rank
     rankCodec =

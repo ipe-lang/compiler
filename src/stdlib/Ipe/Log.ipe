@@ -75,6 +75,10 @@ errorWith = Kernel.kernel "Log_errorWith"
 --
 --     import Ipe.Level as Level
 --
---     Web.appWith [ Log.level Level.warn ] { ... }
+--     warnAndAbove : Setting a
+--     warnAndAbove =
+--         Log.level Level.warn
+--
+-- and list it among the settings: `Web.appWith [ warnAndAbove ] app`.
 level : LogLevel -> Setting a
 level = Kernel.kernel "Log_level"

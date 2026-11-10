@@ -49,7 +49,7 @@ int : Int -> Int -> Generator Int
 
 Uniform integer generator over `[lo, hi]`, inclusive on both ends.
 
-    Random.Generator.int 1 6 (Random.Generator.initialSeed 42)
+    Generator.int 1 6 (Generator.initialSeed 42)
 
 ## `float`
 
@@ -67,7 +67,7 @@ map : (a -> b) -> Generator a -> Seed -> ( b, Seed )
 
 Draw from a generator and transform the value.
 
-    map (\n -> n * 2) (int 1 6) seed
+    map (\n -> n * 2) (int 1 6) (initialSeed 42)
 
 ## `map2`
 
