@@ -442,13 +442,7 @@ const DEBUG_SITES: &[DebugSite] = &[
     DebugSite {
         file: "rust/src/project.rs",
         func: "server_cargo_toml",
-        count: 4,
-        why: DIAGNOSTIC,
-    },
-    DebugSite {
-        file: "rust/src/project.rs",
-        func: "tokio_feature_cargo_toml",
-        count: 1,
+        count: 3,
         why: DIAGNOSTIC,
     },
     DebugSite {
@@ -459,14 +453,8 @@ const DEBUG_SITES: &[DebugSite] = &[
     },
     DebugSite {
         file: "rust/src/project.rs",
-        func: "tea_cargo_toml",
-        count: 1,
-        why: DIAGNOSTIC,
-    },
-    DebugSite {
-        file: "rust/src/project.rs",
         func: "tui_cargo_toml",
-        count: 3,
+        count: 2,
         why: DIAGNOSTIC,
     },
     DebugSite {
@@ -483,14 +471,20 @@ const DEBUG_SITES: &[DebugSite] = &[
     },
     DebugSite {
         file: "rust/src/project.rs",
-        func: "web_cargo_toml",
+        func: "vendored_tokio_for",
         count: 3,
         why: DIAGNOSTIC,
     },
     DebugSite {
         file: "rust/src/project.rs",
+        func: "web_cargo_toml",
+        count: 2,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
         func: "websocket_cargo_toml",
-        count: 3,
+        count: 2,
         why: DIAGNOSTIC,
     },
     DebugSite {

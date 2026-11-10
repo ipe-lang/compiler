@@ -23,7 +23,7 @@ use ipe_runtime_rust::csp::{BundleWorker, ContentSecurityPolicy};
 use ipe_runtime_rust::encoding::{BundlePath, MountBase, ServerOrigins};
 
 use crate::EmitCtx;
-use crate::crate_specs;
+use crate::crate_specs::{self, TokioFeature};
 use crate::emit_expr::emit_func;
 use crate::emit_types::{emit_enum, emit_record_struct, emit_row_witnesses};
 use crate::items::Items;
@@ -3106,24 +3106,21 @@ fn assemble_project_text(
     // The async spine (`tokio` + `futures-util` + the `"tokio"` default feature)
     // is off the base template and restored here whenever the program needs the
     // reactor. This runs FIRST, before every per-surface surgery, so their
-    // anchors (`default = ["tokio", "json"]`, the `tokio` dependency line) see
-    // the restored spine and compose byte-identically to the pre-gating output.
+    // `default = ["tokio", "json"]` anchor sees the restored spine.
     // A pure program keeps the tokio-free base and enters through the std-only
     // `block_on` selected in the epilogue below.
     //
-    // Every reactor surface whose augmenter inserts, extends, or depends on the
-    // `tokio` line (db / server / web / webview / websocket / http / tui / tea /
-    // email) is folded into `uses_async_runtime` at its computation site, so this
-    // flag is a superset of that set BY CONSTRUCTION — not by assumption. The
-    // restore is therefore always present when a downstream anchor needs it, even
-    // for a surface reached by a reserved-type mention alone (no async kernel).
-    // The pure surfaces (crypto / jwt / auth / url / config / compression / csv)
-    // anchor on `[profile.dev]`, never the tokio line, so they are correctly
-    // absent from that superset and keep the tokio-free base.
-    let async_base = if ctx.uses_async_runtime {
-        async_runtime_cargo_toml(CARGO_TOML)?
-    } else {
-        CARGO_TOML.to_owned()
+    // The `tokio` line is written once, here, from the runtime-feature
+    // projection (`vendored_tokio`); no later step edits it. Every reactor
+    // surface (db / server / web / webview / websocket / http / tui / tea /
+    // email) is folded into `uses_async_runtime` at its computation site, so the
+    // restore is present whenever a surface needs the reactor, even one reached
+    // by a reserved-type mention alone. The pure surfaces (crypto / jwt / auth /
+    // url / config / compression / csv) anchor on `[profile.dev]`, never the
+    // tokio line, and keep the tokio-free base.
+    let async_base = match vendored_tokio(ctx)? {
+        Some(tokio) => async_runtime_cargo_toml(CARGO_TOML, &tokio)?,
+        None => CARGO_TOML.to_owned(),
     };
     let (cargo_toml, runtime_config_rs) = if ctx.uses_db {
         let cfg = match ctx.db_driver {
@@ -3174,9 +3171,8 @@ fn assemble_project_text(
     } else {
         cargo_toml
     };
-    // Ipe.WebSocket client: promote the `websocket_client` feature +
-    // add tokio-tungstenite + tokio `"sync"`. Applied last; idempotent on the
-    // tokio `"sync"` step so it composes with any prior server/live/tui surgery.
+    // Ipe.WebSocket client: promote the `websocket_client` feature and add the
+    // socket and TLS crates.
     let cargo_toml = if ctx.uses_websocket {
         websocket_cargo_toml(&cargo_toml)?
     } else {
@@ -3298,45 +3294,6 @@ fn assemble_project_text(
     // feature on. Idempotent: `db_cargo_toml` already added it for db programs.
     let cargo_toml = if ctx.reaches_secret() {
         secret_cargo_toml(&cargo_toml)?
-    } else {
-        cargo_toml
-    };
-    // TEA runtime: `tea.rs` drives its event loop over a `tokio::sync::mpsc`
-    // channel, and `revocation.rs` publishes on a `tokio::sync::watch` channel,
-    // so any program that pulls either module on a tokio runtime needs tokio's
-    // `"sync"` feature. The union mirrors the `tea` mod.rs append below (a `Cmd`/`Sub`
-    // kernel, or a surface whose runtime module imports `IpeCmd`/`IpeSub`).
-    // Runs AFTER the server/web/tui/webview steps, which perform their own tokio
-    // feature surgery against the base line — `tea_cargo_toml` is idempotent
-    // (short-circuits when `"sync"` is already present), so it only extends the
-    // pure-TEA base that no other step touched.
-    let cargo_toml = if ctx.uses_tea
-        || ctx.uses_server
-        || ctx.uses_websocket
-        || ctx.uses_web
-        || ctx.uses_tui
-        || ctx.uses_webview
-        || (ctx.uses_async_runtime && ctx.declares_revocation())
-    {
-        tea_cargo_toml(&cargo_toml)?
-    } else {
-        cargo_toml
-    };
-    // SSRF gate: `ssrf.rs` resolves hosts through `tokio::net::lookup_host`, so
-    // the crate that declares the module (the same `reaches_ssrf` gate as its
-    // `mod.rs` append) declares tokio's `"net"` feature itself rather than
-    // relying on a transport crate to enable it. Runs after every step that
-    // anchors on an exact `tokio` line, so none of their anchors sees this edit.
-    let cargo_toml = if ctx.reaches_ssrf() {
-        ssrf_cargo_toml(&cargo_toml)?
-    } else {
-        cargo_toml
-    };
-    // The stop-signal relay compiles wherever the runtime's `tokio` feature
-    // does (every manifest the async runtime restored), so its `"signal"`
-    // rides the same gate. Runs after every exact-`tokio`-line anchor.
-    let cargo_toml = if ctx.uses_async_runtime {
-        tokio_signal_cargo_toml(&cargo_toml)?
     } else {
         cargo_toml
     };
@@ -4045,102 +4002,10 @@ fn db_cargo_toml(base: &str, driver: crate::DbDriver) -> DResult<String> {
     Ok(result)
 }
 
-/// Add tokio's `"net"` feature to the manifest's `tokio` dependency line.
-///
-/// The `ssrf` runtime module resolves hosts through `tokio::net::lookup_host`.
-/// Idempotent: a line that already lists `"net"` (the server or live surface
-/// added it) is returned unchanged.
-///
-/// # Errors
-///
-/// Returns [`Diagnostic::CompilerBug`] when the manifest has no `tokio`
-/// dependency line with a feature list — a golden-drift invariant violation.
-fn ssrf_cargo_toml(base: &str) -> DResult<String> {
-    tokio_feature_cargo_toml(
-        base,
-        "\"net\"",
-        "ipe_backend_rust::project::ssrf_cargo_toml",
-        "the ssrf runtime module",
-    )
-}
-
-/// Add tokio's `"signal"` feature to the manifest's `tokio` dependency line.
-///
-/// The stop-signal relay (`system::exit_signals`) compiles wherever the
-/// runtime's `tokio` feature does, and every Cli, Tui and worker driver
-/// installs it, so every manifest that restores `"tokio"` declares
-/// `"signal"`. Idempotent: a line that already lists it (the server surface
-/// added it) is returned unchanged.
-///
-/// # Errors
-///
-/// Returns [`Diagnostic::CompilerBug`] when the manifest has no `tokio`
-/// dependency line with a feature list — a golden-drift invariant violation.
-fn tokio_signal_cargo_toml(base: &str) -> DResult<String> {
-    tokio_feature_cargo_toml(
-        base,
-        "\"signal\"",
-        "ipe_backend_rust::project::tokio_signal_cargo_toml",
-        "the stop-signal relay",
-    )
-}
-
-/// Append `feature` (a quoted TOML string) to the `tokio` dependency line's
-/// feature list, unless the list already holds it. `needed_by` names the
-/// runtime code that requires it, for the drift diagnostic.
-///
-/// # Errors
-///
-/// Returns [`Diagnostic::CompilerBug`] when the manifest has no `tokio`
-/// dependency line with a feature list — a golden-drift invariant violation.
-fn tokio_feature_cargo_toml(
-    base: &str,
-    feature: &str,
-    where_: &'static str,
-    needed_by: &str,
-) -> DResult<String> {
-    let tokio_prefix = format!(
-        "{} = {{ version = \"{}\", features = [",
-        crate_specs::TOKIO.name,
-        crate_specs::TOKIO.version,
-    );
-    let bug = || Diagnostic::CompilerBug {
-        where_,
-        detail: format!(
-            "Cargo.toml anchor {tokio_prefix:?} not found — golden drifted; {needed_by} \
-             requires tokio {feature}"
-        ),
-    };
-    let list_start = base
-        .find(&tokio_prefix)
-        .map(|at| at + tokio_prefix.len())
-        .ok_or_else(bug)?;
-    let list_end = base
-        .get(list_start..)
-        .and_then(|rest| rest.find(']'))
-        .map(|len| list_start + len)
-        .ok_or_else(bug)?;
-    if base
-        .get(list_start..list_end)
-        .ok_or_else(bug)?
-        .contains(feature)
-    {
-        return Ok(base.to_owned());
-    }
-    let mut out = String::with_capacity(base.len() + feature.len() + 2);
-    out.push_str(base.get(..list_end).ok_or_else(bug)?);
-    out.push_str(", ");
-    out.push_str(feature);
-    out.push_str(base.get(list_end..).ok_or_else(bug)?);
-    Ok(out)
-}
-
 /// Build the server-enabled `Cargo.toml` from the given base manifest by:
 ///
 /// 1. Adding `"server"` to the `default` feature list.
-/// 2. Extending the `tokio` dependency line with the `"net"`, `"sync"` and `"signal"`
-///    features (required by `server.rs`'s `TcpListener` and `mpsc` usage).
-/// 3. Appending `axum`, `tower-http` (with `timeout`), and `tower` (with
+/// 2. Appending `axum`, `tower-http` (with `timeout`), and `tower` (with
 ///    `limit`) dependency lines before `[profile.dev]` — the latter two back
 ///    the front-door denial-of-service ceilings (`TimeoutLayer` +
 ///    `GlobalConcurrencyLimitLayer`).
@@ -4159,19 +4024,6 @@ fn server_cargo_toml(base: &str) -> DResult<String> {
     const DB_FEATURE: &str = "db = []";
     const DB_SERVER_FEATURE: &str = "db = []\nserver = []";
     const PROFILE_ANCHOR: &str = "[profile.dev]";
-    // tokio version + name from the SSOT; the two feature-list forms (the
-    // replacen anchor and its net+sync successor) share the one version so the
-    // anchor and the golden base manifest cannot skew independently.
-    let tokio_time = format!(
-        "{} = {{ version = \"{}\", features = [\"rt\", \"rt-multi-thread\", \"macros\", \"time\"] }}",
-        crate_specs::TOKIO.name,
-        crate_specs::TOKIO.version,
-    );
-    let tokio_net_sync = format!(
-        "{} = {{ version = \"{}\", features = [\"rt\", \"rt-multi-thread\", \"macros\", \"time\", \"net\", \"sync\", \"signal\"] }}",
-        crate_specs::TOKIO.name,
-        crate_specs::TOKIO.version,
-    );
     // `tower` (`limit`) backs the front-door concurrency cap
     // (`GlobalConcurrencyLimitLayer`); `tower-http`'s `timeout` backs the
     // per-request slowloris timeout (`TimeoutLayer`). Both are referenced in
@@ -4232,28 +4084,17 @@ fn server_cargo_toml(base: &str) -> DResult<String> {
         });
     }
 
-    // Step 2 — extend the tokio dependency line with "net", "sync" and "signal"
-    // (the vendored `server/shutdown.rs` drains on `tokio::signal`, as the
-    // runtime's own `server` feature enables `tokio/signal`).
-    let step2 = step1.replacen(&tokio_time, &tokio_net_sync, 1);
-    if step2 == step1 {
-        return Err(Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::server_cargo_toml",
-            detail: format!("Cargo.toml anchor {tokio_time:?} not found — golden drifted"),
-        });
-    }
-
-    // Step 3 — append axum + tower-http before `[profile.dev]`.
-    let anchor_pos = step2
+    // Step 2 — append axum + tower-http before `[profile.dev]`.
+    let anchor_pos = step1
         .find(PROFILE_ANCHOR)
         .ok_or_else(|| Diagnostic::CompilerBug {
             where_: "ipe_backend_rust::project::server_cargo_toml",
             detail: format!("Cargo.toml anchor {PROFILE_ANCHOR:?} not found — golden drifted"),
         })?;
-    let mut result = String::with_capacity(step2.len() + server_deps.len());
-    result.push_str(step2.get(..anchor_pos).unwrap_or(""));
+    let mut result = String::with_capacity(step1.len() + server_deps.len());
+    result.push_str(step1.get(..anchor_pos).unwrap_or(""));
     result.push_str(&server_deps);
-    result.push_str(step2.get(anchor_pos..).unwrap_or(""));
+    result.push_str(step1.get(anchor_pos..).unwrap_or(""));
     Ok(result)
 }
 
@@ -4293,10 +4134,6 @@ fn web_cargo_toml(base: &str) -> DResult<String> {
     // the parent-death floor the live console-proxy relies on), so that single
     // cfg-gated declaration covers every need — adding it again would emit a
     // duplicate `rustix` key and produce invalid TOML.
-    // The `live` runtime mainline uses `tokio::process`; the server manifest emits
-    // `net`+`sync`+`signal` for the HTTP server, so add the one missing feature.
-    const TOKIO_NET_SYNC_FEATURES: &str = "\"time\", \"net\", \"sync\", \"signal\"]";
-    const TOKIO_LIVE_FEATURES: &str = "\"time\", \"net\", \"sync\", \"signal\", \"process\"]";
     // Versions + names from the SSOT; this is a bare `name = "ver"` dep.
     // `serde_urlencoded` is NOT appended here: it is an unconditional base
     // manifest dep now (`dom/form.rs` is always vendored). `rustix` is NOT
@@ -4328,22 +4165,6 @@ fn web_cargo_toml(base: &str) -> DResult<String> {
     step1.push_str(r#", "web""#);
     step1.push_str(base.get(close..).unwrap_or(""));
 
-    // Step 1b — add the tokio `signal` + `process` features the live runtime needs.
-    // Fail loud (like the sibling anchors) if the anchor drifted — a silent no-op
-    // here would ship a manifest without `signal`/`process` and cargo-fail on the
-    // live runtime's `tokio::signal` usage (a fresh exit-0-then-cargo-fail).
-    let step1_tokio = step1.replace(TOKIO_NET_SYNC_FEATURES, TOKIO_LIVE_FEATURES);
-    if step1_tokio == step1 {
-        return Err(Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::web_cargo_toml",
-            detail: format!(
-                "tokio features anchor {TOKIO_NET_SYNC_FEATURES:?} not found — golden drifted; \
-                 the live runtime requires the tokio signal + process features"
-            ),
-        });
-    }
-    let step1 = step1_tokio;
-
     // Step 2 — inject live-specific deps before `[profile.dev]`.
     let anchor_pos = step1
         .find(PROFILE_ANCHOR)
@@ -4361,9 +4182,7 @@ fn web_cargo_toml(base: &str) -> DResult<String> {
 /// Build the tui-enabled `Cargo.toml` from the given base manifest by:
 ///
 /// 1. Adding `"tui"` to the `default` feature list.
-/// 2. Adding `"sync"` to the `tokio` dependency's feature list (`tui/app.rs`
-///    uses `tokio::sync::mpsc::unbounded_channel`) when absent.
-/// 3. Appending `crossterm` and `unicode-width` dependencies before
+/// 2. Appending `crossterm` and `unicode-width` dependencies before
 ///    `[profile.dev]`.  These two crates are the compile-time gates on the
 ///    runtime's `tui` feature; the emitted project vendors the runtime source
 ///    directly, so they MUST appear as explicit `[dependencies]` entries.
@@ -4380,36 +4199,13 @@ fn tui_cargo_toml(base: &str) -> DResult<String> {
     // All anchor consts must precede the first `let` statement.
     const DEFAULT_PREFIX: &str = "default = [";
     const PROFILE_ANCHOR: &str = "[profile.dev]";
-    // Versions + names from the SSOT. `tui_deps` are bare `name = "ver"` lines;
-    // the two tokio forms (the replacen anchor and its sync successor) share the
-    // one SSOT version so the anchor cannot skew from the golden base manifest.
-    //
-    // The tui runtime uses `tokio::sync::mpsc`; add `"sync"` when it is not
-    // yet present.  The base golden has only `"time"` in the tokio feature list;
-    // server_cargo_toml adds `"net", "sync", "signal"`; web_cargo_toml extends to
-    // include `"process"`.  We gate on the SMALLEST known form that lacks
-    // `"sync"` and replace it with the tui-extended form.  If `"sync"` is
-    // already present (because server_cargo_toml ran first) the replacen is a
-    // no-op and we do NOT error — `"sync"` is idempotent to add.
-    //
-    // Three anchors: non-server base, server-only (no live), live (superset).
-    // We check for the presence of `"sync"` and insert it only if absent.
+    // Versions + names from the SSOT; `tui_deps` are bare `name = "ver"` lines.
     let tui_deps = format!(
         "{} = \"{}\"\n{} = \"{}\"\n\n",
         crate_specs::CROSSTERM.name,
         crate_specs::CROSSTERM.version,
         crate_specs::UNICODE_WIDTH.name,
         crate_specs::UNICODE_WIDTH.version,
-    );
-    let tokio_time_only = format!(
-        "{} = {{ version = \"{}\", features = [\"rt\", \"rt-multi-thread\", \"macros\", \"time\"] }}",
-        crate_specs::TOKIO.name,
-        crate_specs::TOKIO.version,
-    );
-    let tokio_time_sync = format!(
-        "{} = {{ version = \"{}\", features = [\"rt\", \"rt-multi-thread\", \"macros\", \"time\", \"sync\"] }}",
-        crate_specs::TOKIO.name,
-        crate_specs::TOKIO.version,
     );
 
     // Step 1 — promote the `tui` feature (generic closing-`]` anchor, same
@@ -4434,41 +4230,17 @@ fn tui_cargo_toml(base: &str) -> DResult<String> {
     step1.push_str(r#", "tui""#);
     step1.push_str(base.get(close..).unwrap_or(""));
 
-    // Step 2 — add `"sync"` to tokio if not already present.
-    // If the manifest already has `"sync"` (from server_cargo_toml or
-    // web_cargo_toml) the `contains` check short-circuits and no change is
-    // made.  Only when the base tokio line lacks `"sync"` do we replace the
-    // known-anchor form (non-server base) with the sync-extended form.
-    let step2 = if step1.contains(r#""sync""#) {
-        // `"sync"` already present — idempotent, no change needed.
-        step1
-    } else {
-        // The only tokio line that can lack `"sync"` on a valid manifest is
-        // the non-server, non-live base form.  Fail-loud if the anchor drifted.
-        let replaced = step1.replacen(&tokio_time_only, &tokio_time_sync, 1);
-        if replaced == step1 {
-            return Err(Diagnostic::CompilerBug {
-                where_: "ipe_backend_rust::project::tui_cargo_toml",
-                detail: format!(
-                    "tokio anchor {tokio_time_only:?} not found and no \"sync\" present — \
-                     golden drifted; tui runtime requires tokio sync"
-                ),
-            });
-        }
-        replaced
-    };
-
-    // Step 3 — append crossterm + unicode-width before `[profile.dev]`.
-    let anchor_pos = step2
+    // Step 2 — append crossterm + unicode-width before `[profile.dev]`.
+    let anchor_pos = step1
         .find(PROFILE_ANCHOR)
         .ok_or_else(|| Diagnostic::CompilerBug {
             where_: "ipe_backend_rust::project::tui_cargo_toml",
             detail: format!("Cargo.toml anchor {PROFILE_ANCHOR:?} not found — golden drifted"),
         })?;
-    let mut result = String::with_capacity(step2.len() + tui_deps.len());
-    result.push_str(step2.get(..anchor_pos).unwrap_or(""));
+    let mut result = String::with_capacity(step1.len() + tui_deps.len());
+    result.push_str(step1.get(..anchor_pos).unwrap_or(""));
     result.push_str(&tui_deps);
-    result.push_str(step2.get(anchor_pos..).unwrap_or(""));
+    result.push_str(step1.get(anchor_pos..).unwrap_or(""));
     Ok(result)
 }
 
@@ -4573,10 +4345,7 @@ fn webview_cargo_toml(base: &str) -> DResult<String> {
 ///    `websocket_client = []` feature is a pure `#[cfg]` gate over `ws_client.rs`
 ///    (its deps are plain, not `dep:`-activated, so promoting it activates the
 ///    module without any feature→dep wiring).
-/// 2. Adding `"sync"` to tokio (the `ws_client` writer/reader tasks use
-///    `tokio::sync::mpsc` / `broadcast`) when not already present — idempotent,
-///    same strategy as `tui_cargo_toml`.
-/// 3. Appending `tokio-tungstenite` (the handshake only), `tokio-rustls`,
+/// 2. Appending `tokio-tungstenite` (the handshake only), `tokio-rustls`,
 ///    `rustls` and `webpki-roots` before `[profile.dev]`, each rendered from its
 ///    [`crate_specs`] pin: the runtime owns the `wss://` TLS and trusts
 ///    `webpki-roots` alone (`futures-util` and `url`, its other deps, are
@@ -4590,16 +4359,6 @@ fn webview_cargo_toml(base: &str) -> DResult<String> {
 fn websocket_cargo_toml(base: &str) -> DResult<String> {
     const DEFAULT_PREFIX: &str = "default = [";
     const PROFILE_ANCHOR: &str = "[profile.dev]";
-    let tokio_time_only = format!(
-        "{} = {{ version = \"{}\", features = [\"rt\", \"rt-multi-thread\", \"macros\", \"time\"] }}",
-        crate_specs::TOKIO.name,
-        crate_specs::TOKIO.version,
-    );
-    let tokio_time_sync = format!(
-        "{} = {{ version = \"{}\", features = [\"rt\", \"rt-multi-thread\", \"macros\", \"time\", \"sync\"] }}",
-        crate_specs::TOKIO.name,
-        crate_specs::TOKIO.version,
-    );
     let ws_dep: String = [
         crate_specs::TOKIO_TUNGSTENITE,
         crate_specs::TOKIO_RUSTLS,
@@ -4631,77 +4390,18 @@ fn websocket_cargo_toml(base: &str) -> DResult<String> {
     step1.push_str(r#", "websocket_client""#);
     step1.push_str(base.get(close..).unwrap_or(""));
 
-    // Step 2 — add `"sync"` to tokio if not already present (idempotent when a
-    // prior server/live/tui surgery already added it).
-    let step2 = if step1.contains(r#""sync""#) {
-        step1
-    } else {
-        let replaced = step1.replacen(&tokio_time_only, &tokio_time_sync, 1);
-        if replaced == step1 {
-            return Err(Diagnostic::CompilerBug {
-                where_: "ipe_backend_rust::project::websocket_cargo_toml",
-                detail: format!(
-                    "tokio anchor {tokio_time_only:?} not found and no \"sync\" present — \
-                     golden drifted; the ws_client runtime requires tokio sync"
-                ),
-            });
-        }
-        replaced
-    };
-
-    // Step 3 — append the socket and TLS crates before `[profile.dev]`.
-    let anchor_pos = step2
+    // Step 2 — append the socket and TLS crates before `[profile.dev]`.
+    let anchor_pos = step1
         .find(PROFILE_ANCHOR)
         .ok_or_else(|| Diagnostic::CompilerBug {
             where_: "ipe_backend_rust::project::websocket_cargo_toml",
             detail: format!("Cargo.toml anchor {PROFILE_ANCHOR:?} not found — golden drifted"),
         })?;
-    let mut result = String::with_capacity(step2.len() + ws_dep.len());
-    result.push_str(step2.get(..anchor_pos).unwrap_or(""));
+    let mut result = String::with_capacity(step1.len() + ws_dep.len());
+    result.push_str(step1.get(..anchor_pos).unwrap_or(""));
     result.push_str(&ws_dep);
-    result.push_str(step2.get(anchor_pos..).unwrap_or(""));
+    result.push_str(step1.get(anchor_pos..).unwrap_or(""));
     Ok(result)
-}
-
-/// Add the tokio `"sync"` feature for a program that uses TEA kernels.
-///
-/// `tea.rs` (the vendored `Cmd` / `Sub` / console-app runtime, always compiled
-/// on native when the program uses TEA) drives its event loop over a
-/// `tokio::sync::mpsc` channel, so it needs tokio's `"sync"` feature. The base
-/// manifest's tokio line does not list it (the async floor is `rt` + `time`),
-/// so it is added here. Idempotent: server / web / tui / websocket manifests
-/// already carry `"sync"`, and the `contains` check short-circuits so composing
-/// this with any of them makes no second change.
-///
-/// # Errors
-///
-/// Returns [`Diagnostic::CompilerBug`] if `"sync"` is absent AND the base tokio
-/// feature-line anchor drifted — a fail-loud golden-drift signal.
-fn tea_cargo_toml(base: &str) -> DResult<String> {
-    if base.contains(r#""sync""#) {
-        return Ok(base.to_owned());
-    }
-    let tokio_time_only = format!(
-        "{} = {{ version = \"{}\", features = [\"rt\", \"rt-multi-thread\", \"macros\", \"time\"] }}",
-        crate_specs::TOKIO.name,
-        crate_specs::TOKIO.version,
-    );
-    let tokio_time_sync = format!(
-        "{} = {{ version = \"{}\", features = [\"rt\", \"rt-multi-thread\", \"macros\", \"time\", \"sync\"] }}",
-        crate_specs::TOKIO.name,
-        crate_specs::TOKIO.version,
-    );
-    let replaced = base.replacen(&tokio_time_only, &tokio_time_sync, 1);
-    if replaced == base {
-        return Err(Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::tea_cargo_toml",
-            detail: format!(
-                "tokio anchor {tokio_time_only:?} not found and no \"sync\" present — \
-                 golden drifted; the TEA runtime requires tokio sync"
-            ),
-        });
-    }
-    Ok(replaced)
 }
 
 /// Build the HTTP-client-enabled `Cargo.toml` by adding the `reqwest`
@@ -5175,23 +4875,101 @@ fn crypto_core_heavy_cargo_toml(base: &str) -> DResult<String> {
     Ok(result)
 }
 
+/// The tokio features the vendored manifest declares, or `None` for a tokio-free emit.
+///
+/// The set is the projection of the program's runtime features
+/// ([`crate::runtime_features::RuntimeFeatureSet::tokio_features`]), so the
+/// vendored line declares what the dependency-model runtime crate resolves.
+///
+/// # Errors
+///
+/// Returns [`Diagnostic::CompilerBug`] when the projection and
+/// [`EmitCtx::uses_async_runtime`] disagree (see [`vendored_tokio_for`]).
+fn vendored_tokio(ctx: &EmitCtx) -> DResult<Option<BTreeSet<TokioFeature>>> {
+    vendored_tokio_for(
+        ctx.target,
+        ctx.uses_async_runtime,
+        &crate::runtime_features::runtime_features(ctx),
+    )
+}
+
+/// Reconcile the reactor flag with the runtime-feature tokio projection.
+///
+/// On the native target a reactor program declares the projected set. A
+/// reactor-free program declares no line; its features may enable only the
+/// spine (`compression`, `csv_kernel`, `cache_kernel` compile without the
+/// reactor in the vendored tree), never a tokio API beyond the base set.
+///
+/// On `wasm32-wasip1` the reactor spine is the std-only `block_on`, so no
+/// tokio line is declared whatever the reactor flag: the wasip1 feature set
+/// selects no tokio-enabling feature, and tokio's multi-thread runtime and
+/// signal driver do not build there.
+///
+/// # Errors
+///
+/// Returns [`Diagnostic::CompilerBug`] when the reactor is on and no feature
+/// enables tokio, when it is off and a feature needs tokio beyond the base, when
+/// a wasip1 feature set enables tokio, or for the browser target (whose emit
+/// never reaches the vendored manifest).
+fn vendored_tokio_for(
+    target: ipe_ir::Target,
+    uses_async_runtime: bool,
+    features: &crate::runtime_features::RuntimeFeatureSet,
+) -> DResult<Option<BTreeSet<TokioFeature>>> {
+    let bug = |detail: String| Diagnostic::CompilerBug {
+        where_: "ipe_backend_rust::project::vendored_tokio",
+        detail,
+    };
+    match target {
+        ipe_ir::Target::Native => {}
+        ipe_ir::Target::WasmWasi => {
+            return match features.tokio_features() {
+                None => Ok(None),
+                Some(_) => Err(bug(format!(
+                    "the wasip1 runtime features {:?} enable tokio",
+                    features.as_feature_names()
+                ))),
+            };
+        }
+        ipe_ir::Target::WasmClient => {
+            return Err(bug(
+                "the browser-wasm emit has no vendored tokio manifest".to_owned()
+            ));
+        }
+    }
+    match (uses_async_runtime, features.tokio_features()) {
+        (true, Some(tokio)) => Ok(Some(tokio)),
+        (true, None) => Err(bug(format!(
+            "the program reaches the async runtime but no selected runtime feature \
+             enables tokio ({:?})",
+            features.as_feature_names()
+        ))),
+        (false, None) => Ok(None),
+        (false, Some(tokio)) if tokio == crate_specs::tokio_base_features() => Ok(None),
+        (false, Some(tokio)) => Err(bug(format!(
+            "runtime features {:?} need tokio {:?} but the program does not reach the \
+             async runtime",
+            features.as_feature_names(),
+            tokio.iter().map(|f| f.as_str()).collect::<Vec<_>>()
+        ))),
+    }
+}
+
 /// Restore the tokio async spine into a program that reaches the reactor.
 ///
 /// The base template ships NO async runtime: a pure program (only `Io.println`,
 /// string / list / math / json computation, the pure `Task` monad ops) enters
 /// through the std-only `block_on` and links neither `tokio` nor `futures-util`.
 /// A program that reaches ANY reactor-requiring kernel
-/// ([`EmitCtx::uses_async_runtime`]) restores exactly what the base template
-/// once carried, so an async program's manifest is byte-for-byte what it was
-/// before the async floor became conditional:
+/// ([`EmitCtx::uses_async_runtime`]) restores the spine:
 ///
 /// 1. re-add `"tokio"` as the FIRST default feature (`["json"]` →
 ///    `["tokio", "json"]`), the slot the per-surface surgeries
 ///    (`db`/`server`/`web`/`crypto_core_heavy`) anchor on. This augmenter runs
 ///    FIRST in the chain, so those downstream anchors see the restored line.
-/// 2. re-add the `tokio` dependency as the first `[dependencies]` line (before
-///    `dlmalloc`), with its original feature set. The `server`/`web` surgeries
-///    extend this exact line with `"net"` / `"sync"`.
+/// 2. write the `tokio` dependency as the first `[dependencies]` line (before
+///    `dlmalloc`), enabling exactly the given `tokio` features — the one place
+///    the line is written; no later step edits it.
 /// 3. re-add `futures-util` in its original slot (after the `bcrypt` base dep).
 ///
 /// The `tokio` / `futures-util` versions come from the [`crate_specs`] SSOT
@@ -5202,7 +4980,7 @@ fn crypto_core_heavy_cargo_toml(base: &str) -> DResult<String> {
 /// Returns [`Diagnostic::CompilerBug`] if the `default = ["json"]`, `dlmalloc`,
 /// or `bcrypt` anchor is absent — a golden-drift invariant violation (fail-loud,
 /// never a silent no-op that would emit an async program without a runtime).
-fn async_runtime_cargo_toml(base: &str) -> DResult<String> {
+fn async_runtime_cargo_toml(base: &str, tokio: &BTreeSet<TokioFeature>) -> DResult<String> {
     const DEFAULT_ANCHOR: &str = r#"default = ["json"]"#;
     const DEFAULT_RESTORED: &str = r#"default = ["tokio", "json"]"#;
     // `tokio` was the first `[dependencies]` line, above the `dlmalloc`
@@ -5211,11 +4989,7 @@ fn async_runtime_cargo_toml(base: &str) -> DResult<String> {
     const DLMALLOC_ANCHOR: &str = r#"dlmalloc = { version = "0.2""#;
     // `futures-util` followed the `bcrypt` base dep.
     const BCRYPT_ANCHOR: &str = "bcrypt = \"0.17\"\n";
-    let tokio_dep = format!(
-        "{} = {{ version = \"{}\", features = [\"rt\", \"rt-multi-thread\", \"macros\", \"time\"] }}\n",
-        crate_specs::TOKIO.name,
-        crate_specs::TOKIO.version,
-    );
+    let tokio_dep = crate_specs::tokio_dependency_line(tokio) + "\n";
     let futures_dep = format!(
         "{} = \"{}\"\n",
         crate_specs::FUTURES_UTIL.name,
@@ -5873,9 +5647,8 @@ mod tests {
         async_runtime_cargo_toml, config_cargo_toml, crypto_core_heavy_cargo_toml, db_cargo_toml,
         dev_posture_cargo_toml, email_cargo_toml, http_client_cargo_toml,
         insert_wasi_linker_config, jwt_cargo_toml, promote_default_feature, runtime_bindings,
-        server_cargo_toml, shake_ffi_by_fn_ident, ssrf_cargo_toml, tokio_signal_cargo_toml,
-        tui_cargo_toml, wasm_hydrate_entry, wasm_present_modules, wasm_runtime_bindings,
-        web_cargo_toml, websocket_cargo_toml, wrapper_call_paths,
+        server_cargo_toml, shake_ffi_by_fn_ident, wasm_hydrate_entry, wasm_present_modules,
+        wasm_runtime_bindings, web_cargo_toml, websocket_cargo_toml, wrapper_call_paths,
     };
     use crate::DbDriver;
     use crate::crate_specs;
@@ -5933,6 +5706,12 @@ mod tests {
                  (efficiency knob; drop it and the guard fails)"
             );
         }
+    }
+
+    /// The async-restored base manifest, with the runtime's base tokio features.
+    fn async_base() -> String {
+        async_runtime_cargo_toml(CARGO_TOML, &crate_specs::tokio_base_features())
+            .expect("async base")
     }
 
     /// The `tokio = { … }` dependency line of `manifest`.
@@ -5993,69 +5772,6 @@ mod tests {
         );
     }
 
-    /// `tokio_signal_cargo_toml` gives tokio `"signal"` exactly once, whether
-    /// the line lacked it (the async base a worker, `Cli` or `Tui` program
-    /// starts from) or already listed it (the server surface), and refuses a
-    /// manifest with no `tokio` line: the stop-signal relay compiles wherever
-    /// the runtime's `tokio` feature does.
-    #[test]
-    fn tokio_signal_toml_declares_signal_exactly_once() {
-        let base = async_runtime_cargo_toml(CARGO_TOML).expect("async base");
-        assert!(
-            tokio_line(&base).is_some_and(|l| !l.contains(r#""signal""#)),
-            "the async base line must lack \"signal\" for this test to bite: {base}"
-        );
-        let tui = tui_cargo_toml(&base).expect("tui manifest");
-        for manifest in [
-            base.clone(),
-            tui,
-            server_cargo_toml(&base).expect("server manifest"),
-        ] {
-            let with_signal = tokio_signal_cargo_toml(&manifest).expect("signal manifest");
-            let line = tokio_line(&with_signal).unwrap_or_default();
-            assert_eq!(line.matches(r#""signal""#).count(), 1, "{line}");
-            assert_eq!(
-                tokio_signal_cargo_toml(&with_signal).expect("idempotent"),
-                with_signal,
-                "a line already listing \"signal\" must be unchanged"
-            );
-        }
-        assert!(
-            tokio_signal_cargo_toml(CARGO_TOML).is_err(),
-            "a manifest with no tokio line must be refused"
-        );
-    }
-
-    /// `ssrf_cargo_toml` adds tokio `"net"` to a line lacking it (the db-only
-    /// manifest), leaves a line that has it unchanged, and refuses a manifest
-    /// with no `tokio` line rather than silently shipping one without it.
-    #[test]
-    fn ssrf_toml_declares_tokio_net_exactly_once() {
-        let db = db_cargo_toml(
-            &async_runtime_cargo_toml(CARGO_TOML).expect("async base"),
-            DbDriver::Sqlite,
-        )
-        .expect("db manifest");
-        assert!(
-            tokio_line(&db).is_some_and(|l| !l.contains(r#""net""#)),
-            "the db-only base line must lack \"net\" for this test to bite: {db}"
-        );
-        let with_net = ssrf_cargo_toml(&db).expect("ssrf manifest");
-        let line = tokio_line(&with_net).unwrap_or_default();
-        assert_eq!(line.matches(r#""net""#).count(), 1, "{line}");
-        assert_eq!(
-            ssrf_cargo_toml(&with_net).expect("idempotent"),
-            with_net,
-            "a line already listing \"net\" must be unchanged"
-        );
-        let server = server_cargo_toml(&db).expect("server manifest");
-        assert_eq!(ssrf_cargo_toml(&server).expect("server + ssrf"), server);
-        assert!(
-            ssrf_cargo_toml(CARGO_TOML).is_err(),
-            "a manifest with no tokio line must be refused"
-        );
-    }
-
     /// Helper: extract the `default = [...]` line from a manifest string.
     fn default_line(manifest: &str) -> &str {
         manifest
@@ -6068,8 +5784,7 @@ mod tests {
     /// not insert "db" into the default list.
     #[test]
     fn server_toml_non_db_inserts_server() {
-        let out = server_cargo_toml(&async_runtime_cargo_toml(CARGO_TOML).expect("async base"))
-            .expect("server_cargo_toml must succeed");
+        let out = server_cargo_toml(&async_base()).expect("server_cargo_toml must succeed");
         let def = default_line(&out);
         assert!(
             def.contains(r#""server""#),
@@ -6084,11 +5799,12 @@ mod tests {
             out.contains("server = []"),
             "manifest must declare the server feature: {out}"
         );
-        // tokio net + sync + signal features must be added (the vendored
-        // `server/shutdown.rs` uses `tokio::signal`).
-        assert!(
-            out.contains(r#""net""#) && out.contains(r#""sync""#) && out.contains(r#""signal""#),
-            "tokio must gain net + sync + signal features: {out}"
+        // The tokio line is written once, by the async restore; the server
+        // step leaves it untouched.
+        assert_eq!(
+            tokio_line(&out),
+            tokio_line(&async_base()),
+            "server_cargo_toml must not edit the tokio line: {out}"
         );
         // axum + tower-http + tower deps must be present. The front-door DoS
         // ceilings need `tower-http`'s `timeout` (per-request `TimeoutLayer`)
@@ -6112,11 +5828,8 @@ mod tests {
     /// the default list, and neither overwrites the other.
     #[test]
     fn server_toml_db_compose_inserts_both() {
-        let db_base = db_cargo_toml(
-            &async_runtime_cargo_toml(CARGO_TOML).expect("async base"),
-            crate::DbDriver::Sqlite,
-        )
-        .expect("db_cargo_toml must succeed");
+        let db_base = db_cargo_toml(&async_base(), crate::DbDriver::Sqlite)
+            .expect("db_cargo_toml must succeed");
         let out = server_cargo_toml(&db_base).expect("server_cargo_toml on db base must succeed");
         let def = default_line(&out);
         // `"crypto"` is NOT expected: it is gated by `crypto_core_heavy_cargo_toml`
@@ -6160,18 +5873,13 @@ mod tests {
     /// leaves open (SSOT ↔ manifests): this is SSOT ↔ emitted output.
     #[test]
     fn emitted_manifests_use_ssot_versions() {
-        let db = db_cargo_toml(
-            &async_runtime_cargo_toml(CARGO_TOML).expect("async base"),
-            crate::DbDriver::Sqlite,
-        )
-        .expect("db_cargo_toml");
+        let db = db_cargo_toml(&async_base(), crate::DbDriver::Sqlite).expect("db_cargo_toml");
         assert!(
             db.lines()
                 .any(|line| line == crate_specs::SQLX.dependency_line(crate_specs::SQLX_DRIVERS)),
             "db manifest must emit the SSOT sqlx line:\n{db}"
         );
-        let srv = server_cargo_toml(&async_runtime_cargo_toml(CARGO_TOML).expect("async base"))
-            .expect("server_cargo_toml");
+        let srv = server_cargo_toml(&async_base()).expect("server_cargo_toml");
         for pinned in [crate_specs::AXUM, crate_specs::TOWER_HTTP] {
             assert!(
                 srv.lines().any(|line| line == pinned.dependency_line(&[])),
@@ -6179,19 +5887,15 @@ mod tests {
                 pinned.spec.name
             );
         }
-        let heavy = crypto_core_heavy_cargo_toml(
-            &async_runtime_cargo_toml(CARGO_TOML).expect("async base"),
-        )
-        .expect("crypto_core_heavy_cargo_toml");
+        let heavy =
+            crypto_core_heavy_cargo_toml(&async_base()).expect("crypto_core_heavy_cargo_toml");
         assert!(
             heavy
                 .lines()
                 .any(|line| line == crate_specs::RSA.dependency_line(&[])),
             "heavy-crypto manifest must emit the SSOT rsa line:\n{heavy}"
         );
-        let http =
-            http_client_cargo_toml(&async_runtime_cargo_toml(CARGO_TOML).expect("async base"))
-                .expect("http_client_cargo_toml");
+        let http = http_client_cargo_toml(&async_base()).expect("http_client_cargo_toml");
         assert!(
             http.lines()
                 .any(|line| line == crate_specs::REQWEST.dependency_line(&[])),
@@ -6212,10 +5916,8 @@ mod tests {
     /// program's manifest is byte-identical to the pre-gating output.
     #[test]
     fn crypto_core_heavy_toml_restores_crypto_and_rsa_in_place() {
-        let out = crypto_core_heavy_cargo_toml(
-            &async_runtime_cargo_toml(CARGO_TOML).expect("async base"),
-        )
-        .expect("crypto_core_heavy_cargo_toml");
+        let out =
+            crypto_core_heavy_cargo_toml(&async_base()).expect("crypto_core_heavy_cargo_toml");
         assert!(
             default_line(&out).contains(r#"default = ["tokio", "crypto", "json"]"#),
             "crypto must land in its original slot after tokio: {}",
@@ -6232,11 +5934,7 @@ mod tests {
     /// adds (`["tokio", "crypto", "json", "db", "secret"]`).
     #[test]
     fn crypto_core_heavy_toml_composes_with_db() {
-        let db = db_cargo_toml(
-            &async_runtime_cargo_toml(CARGO_TOML).expect("async base"),
-            crate::DbDriver::Sqlite,
-        )
-        .expect("db_cargo_toml");
+        let db = db_cargo_toml(&async_base(), crate::DbDriver::Sqlite).expect("db_cargo_toml");
         let out = crypto_core_heavy_cargo_toml(&db).expect("crypto_core_heavy on db base");
         assert!(
             default_line(&out).contains(r#"default = ["tokio", "crypto", "json", "db", "secret"]"#),
@@ -6266,8 +5964,7 @@ mod tests {
     fn dev_posture_toml_promotes_the_feature() {
         let sync = dev_posture_cargo_toml(CARGO_TOML).expect("sync base");
         assert_eq!(default_line(&sync), r#"default = ["json", "dev-posture"]"#);
-        let async_base = async_runtime_cargo_toml(CARGO_TOML).expect("async base");
-        let out = dev_posture_cargo_toml(&async_base).expect("async base");
+        let out = dev_posture_cargo_toml(&async_base()).expect("async base");
         assert_eq!(
             default_line(&out),
             r#"default = ["tokio", "json", "dev-posture"]"#
@@ -6422,8 +6119,7 @@ mod tests {
     /// existing default features without displacing them.
     #[test]
     fn jwt_toml_composes_with_async_base() {
-        let async_base = async_runtime_cargo_toml(CARGO_TOML).expect("async base");
-        let out = jwt_cargo_toml(&async_base).expect("jwt_cargo_toml on async base");
+        let out = jwt_cargo_toml(&async_base()).expect("jwt_cargo_toml on async base");
         let def = default_line(&out);
         assert!(
             def.contains(r#""tokio""#) && def.contains(r#""jwt""#),
@@ -6452,21 +6148,14 @@ mod tests {
     /// Db+Web program passes `ipe` then fails `cargo build` with E0433 (`use of
     /// undeclared crate or module sqlx` in `PgPool::connect`).
     ///
-    /// Note: in `emit_program` the call chain is always
-    /// `db_cargo_toml → server_cargo_toml → web_cargo_toml` when a program
-    /// uses Db AND Web. `web_cargo_toml` expects the tokio `"net"/"sync"`
-    /// features already present from `server_cargo_toml`, so the test must mirror
-    /// that composition order.
+    /// The test mirrors `emit_program`'s composition order for a program that
+    /// uses Db AND Web: `db_cargo_toml → server_cargo_toml → web_cargo_toml`.
     #[test]
     fn web_db_toml_includes_postgres() {
-        let db_base = db_cargo_toml(
-            &async_runtime_cargo_toml(CARGO_TOML).expect("async base"),
-            crate::DbDriver::Sqlite,
-        )
-        .expect("db_cargo_toml must succeed");
+        let db_base = db_cargo_toml(&async_base(), crate::DbDriver::Sqlite)
+            .expect("db_cargo_toml must succeed");
         // server_cargo_toml always runs before web_cargo_toml when uses_web is
-        // true (see emit_program).  It adds the tokio net+sync features that
-        // web_cargo_toml's anchor requires.
+        // true (see emit_program).
         let server_base =
             server_cargo_toml(&db_base).expect("server_cargo_toml on db base must succeed");
         let out =
@@ -6504,9 +6193,7 @@ mod tests {
     /// postgres dep (no sqlx line exists, no-op replace).
     #[test]
     fn web_only_toml_no_postgres() {
-        let server_base =
-            server_cargo_toml(&async_runtime_cargo_toml(CARGO_TOML).expect("async base"))
-                .expect("server_cargo_toml must succeed");
+        let server_base = server_cargo_toml(&async_base()).expect("server_cargo_toml must succeed");
         let out = web_cargo_toml(&server_base).expect("web_cargo_toml on non-db base must succeed");
         assert!(
             !out.contains("\"postgres\""),
@@ -6520,9 +6207,7 @@ mod tests {
     /// duplicate-key TOML error that fails `cargo build` for every live/web shape.
     #[test]
     fn web_toml_declares_rustix_once() {
-        let server_base =
-            server_cargo_toml(&async_runtime_cargo_toml(CARGO_TOML).expect("async base"))
-                .expect("server_cargo_toml must succeed");
+        let server_base = server_cargo_toml(&async_base()).expect("server_cargo_toml must succeed");
         let out = web_cargo_toml(&server_base).expect("web_cargo_toml on non-db base must succeed");
         let rustix_lines = out
             .lines()
@@ -6547,11 +6232,8 @@ mod tests {
     /// sqlite-driver program — omitting it causes E0433 at `cargo build`.
     #[test]
     fn db_cargo_toml_sqlite_driver_enables_both_sqlx_features() {
-        let out = db_cargo_toml(
-            &async_runtime_cargo_toml(CARGO_TOML).expect("async base"),
-            DbDriver::Sqlite,
-        )
-        .expect("db_cargo_toml(Sqlite) must succeed");
+        let out = db_cargo_toml(&async_base(), DbDriver::Sqlite)
+            .expect("db_cargo_toml(Sqlite) must succeed");
         assert_both_sqlx_drivers(&out);
     }
 
@@ -6570,11 +6252,8 @@ mod tests {
     /// of the app's `[database]` driver choice.
     #[test]
     fn db_cargo_toml_postgres_driver_enables_postgres_sqlx_feature() {
-        let out = db_cargo_toml(
-            &async_runtime_cargo_toml(CARGO_TOML).expect("async base"),
-            DbDriver::Postgres,
-        )
-        .expect("db_cargo_toml(Postgres) must succeed");
+        let out = db_cargo_toml(&async_base(), DbDriver::Postgres)
+            .expect("db_cargo_toml(Postgres) must succeed");
         assert_both_sqlx_drivers(&out);
     }
 
@@ -6820,7 +6499,7 @@ mod tests {
     /// declares, so the vendored exporters, console proxy and exit flush compile.
     #[test]
     fn http_client_toml_promotes_its_feature() {
-        let base = async_runtime_cargo_toml(CARGO_TOML).expect("async base");
+        let base = async_base();
         let out = http_client_cargo_toml(&base).expect("http_client_cargo_toml must succeed");
         assert!(
             default_line(&out).contains("\"http_client\""),
@@ -6867,7 +6546,7 @@ mod tests {
     /// SSOT line.
     #[test]
     fn websocket_toml_renders_the_pinned_tls_lines() {
-        let base = async_runtime_cargo_toml(CARGO_TOML).expect("async base");
+        let base = async_base();
         let out = websocket_cargo_toml(&base).expect("websocket_cargo_toml must succeed");
         for pinned in [
             crate_specs::TOKIO_TUNGSTENITE,

@@ -65,8 +65,8 @@ pub enum CoverageError {
     EnvScan(Arc<TreeRefusal>),
     /// A scratch directory for a runtime probe could not be created.
     Scratch(std::io::Error),
-    /// The runtime crate's source tree could not be probed.
-    RuntimeSrc(std::io::Error),
+    /// The runtime crate's module tree could not be read.
+    RuntimeTree(Box<crate::CliError>),
 }
 
 impl fmt::Display for CoverageError {
@@ -106,7 +106,7 @@ impl fmt::Display for CoverageError {
             Self::Lockfile(e) => write!(f, "lockfile: {e}"),
             Self::EnvScan(e) => write!(f, "environment-variable source scan refused: {e}"),
             Self::Scratch(e) => write!(f, "scratch directory for a runtime probe: {e}"),
-            Self::RuntimeSrc(e) => write!(f, "runtime crate source tree probe: {e}"),
+            Self::RuntimeTree(e) => write!(f, "runtime module tree: {e}"),
         }
     }
 }
@@ -114,8 +114,8 @@ impl fmt::Display for CoverageError {
 impl std::error::Error for CoverageError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Manifest(e) | Self::Lockfile(e) => Some(&**e),
-            Self::Scratch(e) | Self::RuntimeSrc(e) => Some(e),
+            Self::Manifest(e) | Self::Lockfile(e) | Self::RuntimeTree(e) => Some(&**e),
+            Self::Scratch(e) => Some(e),
             Self::EnvScan(e) => Some(&**e),
             Self::Extract { source, .. } => Some(source),
             Self::Parse { .. }

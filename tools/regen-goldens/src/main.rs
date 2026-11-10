@@ -43,23 +43,8 @@ fn main() -> ExitCode {
     let repo_root = repo_root();
     let golden_root = repo_root.join("tests").join("golden");
 
-    // The emit path resolves the runtime by walking up from the CWD. Anchor the
-    // CWD at the repo root so resolution is deterministic regardless of where the
-    // tool was launched from.
-    if let Err(e) = std::env::set_current_dir(&repo_root) {
-        eprintln!(
-            "regen-goldens: cannot chdir to repo root {}: {e}",
-            repo_root.display()
-        );
-        return ExitCode::FAILURE;
-    }
-    let runtime = match ipe::resolve_runtime() {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("regen-goldens: cannot resolve runtime: {e:?}");
-            return ExitCode::FAILURE;
-        }
-    };
+    // The in-repo runtime crate root, named explicitly: the emit proves it.
+    let runtime = repo_root.join("src/runtime/rust");
 
     let goldens = match collect_goldens(&golden_root, &filter) {
         Ok(g) => g,
@@ -200,7 +185,9 @@ fn regenerate_one(dir: &Path, out: &Path, runtime: &Path) -> Result<usize, Strin
 /// Run the compiler's emit path for one golden, through the same
 /// [`ipe::build_golden_dir`] the golden tests build through.
 fn emit_golden(dir: &Path, out: &Path, runtime: &Path) -> Result<(), String> {
-    ipe::build_golden_dir(dir, out, runtime, &ipe::BuildOptions::from_env())
+    let options =
+        ipe::BuildOptions::from_env().map_err(|e| format!("emit options refused: {e:?}"))?;
+    ipe::build_golden_dir(dir, out, runtime, &options)
         .map_err(|e| format!("compiler emit failed: {e:?}"))
 }
 

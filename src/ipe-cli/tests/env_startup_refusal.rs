@@ -88,6 +88,7 @@ fn compile_and_build(
     let options = ipe::BuildOptions {
         intent: ipe_backend_rust::BuildIntent::Development,
         ..ipe::BuildOptions::from_env()
+            .map_err(|e| -> BoxError { format!("{test_name}: emit options refused: {e}").into() })?
     };
     ipe::build_fixture_with_options(&fixture, &out_dir, &runtime, &options)
         .map_err(|e| -> BoxError { format!("{test_name}: ipe dev build failed: {e}").into() })?;

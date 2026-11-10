@@ -11,14 +11,13 @@
 //! the E2E path.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
 
 use ipe_kernels::{StdlibKernel, Target};
 
 use crate::coverage::contract::{AspectCheck, Cell, StdlibSymbol, SymbolKind};
 use crate::coverage::error::CoverageError;
 use crate::coverage::probe::{self, ProbeUnavailable, StageOutcome};
-use crate::coverage::source_tree::{TreeRefusal, for_each_source};
+use crate::runtime_embed::RuntimeModuleTree;
 
 /// A scratch dir shared by a program-running column across a whole run, so the
 /// per-symbol probes do not each pay a temp-dir setup. RAII-cleaned on drop.
@@ -446,32 +445,16 @@ fn kernel_for(sym: &StdlibSymbol) -> Option<StdlibKernel> {
 /// kernel whose emit token is not a plain identifier, is `NotApplicable`.
 pub struct RuntimeFnExistsColumn {
     /// Every identifier defined or re-exported in the runtime crate source.
-    runtime_symbols: RuntimeSymbols,
+    runtime_symbols: BTreeSet<String>,
 }
 
 impl RuntimeFnExistsColumn {
+    /// The column over the runtime module tree `tree`, scanned in memory.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(tree: &RuntimeModuleTree) -> Self {
         Self {
-            runtime_symbols: scan_runtime_symbols(),
+            runtime_symbols: scan_runtime_symbols(tree),
         }
-    }
-}
-
-/// The runtime crate's identifiers, or why they could not be collected.
-#[derive(Debug)]
-enum RuntimeSymbols {
-    /// Every identifier the whole runtime source tree defines or re-exports.
-    Scanned(BTreeSet<String>),
-    /// No runtime crate source directory was found.
-    NotLocated,
-    /// The runtime source tree could not be read whole.
-    Refused(TreeRefusal),
-}
-
-impl Default for RuntimeFnExistsColumn {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -497,18 +480,13 @@ impl AspectCheck<StdlibSymbol> for RuntimeFnExistsColumn {
                  constructor emission, not a free runtime function",
             );
         }
-        let symbols = match &self.runtime_symbols {
-            RuntimeSymbols::Scanned(symbols) if !symbols.is_empty() => symbols,
-            RuntimeSymbols::Scanned(_) | RuntimeSymbols::NotLocated => {
-                return Cell::Warn(
-                    "runtime crate source not found; runtime-fn existence not checked".to_owned(),
-                );
-            }
-            RuntimeSymbols::Refused(refusal) => {
-                return Cell::Warn(format!("runtime-fn existence not checked: {refusal}"));
-            }
-        };
-        if symbols.contains(runtime_fn) {
+        if self.runtime_symbols.is_empty() {
+            return Cell::Warn(
+                "the runtime module tree defines no symbol; runtime-fn existence not checked"
+                    .to_owned(),
+            );
+        }
+        if self.runtime_symbols.contains(runtime_fn) {
             Cell::Ok
         } else {
             Cell::Warn(format!(
@@ -523,53 +501,20 @@ impl AspectCheck<StdlibSymbol> for RuntimeFnExistsColumn {
     }
 }
 
-/// Scan the runtime crate source tree for every identifier a `#[cfg]`-satisfied
+/// Scan the runtime module tree for every identifier a `#[cfg]`-satisfied
 /// emit could resolve to: `fn NAME`, `pub fn NAME`, `pub use … NAME`, `macro_rules!
 /// NAME`, and `pub(crate) fn NAME`. The scan is a superset (it does not evaluate
 /// cfgs), which is the fail-safe direction: a genuinely missing symbol is still a
 /// hole, and a symbol present only under an off feature is not falsely flagged —
 /// the featureset-closure SEAL owns the cfg-reachability axis.
-fn scan_runtime_symbols() -> RuntimeSymbols {
-    let Some(root) = runtime_crate_src() else {
-        return RuntimeSymbols::NotLocated;
-    };
-    collect_symbols_under(&root)
-}
-
-/// Collect defined/re-exported identifiers from every `.rs` file under `root`,
-/// or the refusal that kept the walk from reading the tree whole.
-fn collect_symbols_under(root: &Path) -> RuntimeSymbols {
+fn scan_runtime_symbols(tree: &RuntimeModuleTree) -> BTreeSet<String> {
     let mut symbols = BTreeSet::new();
-    match for_each_source(root, panic_scan::Want::RustFiles, |_, text| {
-        collect_symbols_in_text(text, &mut symbols);
-    }) {
-        Ok(()) => RuntimeSymbols::Scanned(symbols),
-        Err(refusal) => RuntimeSymbols::Refused(refusal),
-    }
-}
-
-/// Locate the runtime crate's `src` directory via `IPE_RUNTIME_DIR` or an
-/// ancestor walk to `src/runtime/rust/src`.
-fn runtime_crate_src() -> Option<PathBuf> {
-    if let Ok(dir) = ipe_env::var("IPE_RUNTIME_DIR") {
-        let p = PathBuf::from(dir);
-        if p.join("mod.rs").is_file() || p.join("lib.rs").is_file() {
-            return Some(p);
-        }
-        let src = p.join("src");
-        if src.is_dir() {
-            return Some(src);
+    for (path, text) in tree.files() {
+        if path.extension().is_some_and(|ext| ext == "rs") {
+            collect_symbols_in_text(text, &mut symbols);
         }
     }
-    let mut here = std::env::current_dir().ok();
-    while let Some(dir) = here {
-        let candidate = dir.join("src").join("runtime").join("rust").join("src");
-        if candidate.is_dir() {
-            return Some(candidate);
-        }
-        here = dir.parent().map(Path::to_path_buf);
-    }
-    None
+    symbols
 }
 
 /// Extract every runtime-symbol identifier a kernel emit could name from one
@@ -726,16 +671,11 @@ mod tests {
         let s = sym(&["Ipe", "List"], "map");
         assert_eq!(symbol_scratch_key(&s), symbol_scratch_key(&s));
     }
-    /// A runtime tree the walk cannot read whole is a named refusal, and the
-    /// column reports the cause rather than "source not found" or a miss.
+    /// The column reads the module tree it is given: a kernel's free runtime
+    /// function the tree defines is found, one it lacks is a warning, and an
+    /// empty tree is reported unchecked rather than as a miss.
     #[test]
-    fn an_unlisted_runtime_tree_is_a_named_refusal() {
-        let missing = ipe_test_temp::temp_root().join(format!(
-            "ipe-runtime-symbols-missing-{}",
-            std::process::id()
-        ));
-        let symbols = collect_symbols_under(&missing);
-        assert!(matches!(symbols, RuntimeSymbols::Refused(_)), "{symbols:?}");
+    fn the_runtime_fn_column_reads_the_tree_it_is_given() {
         let kernel = StdlibKernel::ALL
             .iter()
             .copied()
@@ -744,15 +684,36 @@ mod tests {
                 !token.is_empty() && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             })
             .expect("a kernel lowers to a free runtime function");
+        let token = kernel.def().runtime_fn;
         let mut probe = sym(&[kernel.def().qualifier], kernel.def().name);
         probe.has_kernel = true;
-        let column = RuntimeFnExistsColumn {
-            runtime_symbols: symbols,
+        let tree = |files: &[(&str, String)]| {
+            RuntimeModuleTree::from_files(
+                files
+                    .iter()
+                    .map(|(path, text)| (std::path::PathBuf::from(path), text.clone()))
+                    .collect(),
+            )
         };
-        let cell = column.check(&probe);
-        assert!(
-            matches!(&cell, Cell::Warn(msg) if msg.contains("cannot be listed whole")),
-            "{cell:?}"
-        );
+        let defining = tree(&[("core.rs", format!("pub fn {token}() {{}}\n"))]);
+        let lacking = tree(&[("core.rs", "pub fn other() {}\n".to_owned())]);
+        let not_rust = tree(&[("core.txt", format!("pub fn {token}() {{}}\n"))]);
+        let empty = tree(&[]);
+        assert!(matches!(
+            RuntimeFnExistsColumn::new(&defining).check(&probe),
+            Cell::Ok
+        ));
+        assert!(matches!(
+            RuntimeFnExistsColumn::new(&lacking).check(&probe),
+            Cell::Warn(msg) if msg.contains("is not a free function")
+        ));
+        assert!(matches!(
+            RuntimeFnExistsColumn::new(&not_rust).check(&probe),
+            Cell::Warn(msg) if msg.contains("defines no symbol")
+        ));
+        assert!(matches!(
+            RuntimeFnExistsColumn::new(&empty).check(&probe),
+            Cell::Warn(msg) if msg.contains("defines no symbol")
+        ));
     }
 }

@@ -1469,3 +1469,236 @@ fn the_port_tag_matrix_covers_every_module_and_permission() {
         assert_eq!(entry.matches(case.as_str()).count(), 1, "{ctor}");
     }
 }
+
+/// Run the built `ipe` binary with `IPE_RUNTIME_VENDORED` set to `value`,
+/// capturing `(success, stderr)`.
+fn run_ipe_with_vendored_switch(
+    args: &[&std::ffi::OsStr],
+    value: &str,
+) -> Result<(bool, String), Box<dyn Error>> {
+    let out = Command::new(support::ipe_bin())
+        .args(args)
+        .env("IPE_RUNTIME_VENDORED", value)
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
+}
+
+/// A set `IPE_RUNTIME_VENDORED` outside its `0`/`1` grammar stops the command
+/// before it writes anything: `ipe dev build` and `ipe test` both exit non-zero
+/// naming the variable and its admitted spellings, and no output is created.
+#[test]
+fn an_unrecognised_vendored_switch_refuses_before_any_output() -> TestResult {
+    let dir = crate::support::scratch_root().join(format!(
+        "ipe_vendored_switch_refused_{}",
+        std::process::id()
+    ));
+    e2e_support::scratch::fresh(&dir);
+    write_project(&dir)?;
+    std::fs::create_dir_all(dir.join("tests"))?;
+    std::fs::copy(
+        fixture("tests_pass.ipe"),
+        dir.join("tests").join("Main.ipe"),
+    )?;
+    let out = dir.join("refused-out");
+    let build = [
+        std::ffi::OsStr::new("dev"),
+        std::ffi::OsStr::new("build"),
+        dir.as_os_str(),
+        std::ffi::OsStr::new("--out"),
+        out.as_os_str(),
+    ];
+    let test = [std::ffi::OsStr::new("test"), dir.as_os_str()];
+    let mut outcomes = Vec::new();
+    for args in [&build[..], &test[..]] {
+        for value in ["true", "", " 1"] {
+            outcomes.push((
+                args.len(),
+                value,
+                run_ipe_with_vendored_switch(args, value)?,
+            ));
+        }
+    }
+    let out_exists = out.exists();
+    let _ = std::fs::remove_dir_all(&dir);
+    for (arity, value, (ok, stderr)) in &outcomes {
+        assert!(
+            !ok,
+            "IPE_RUNTIME_VENDORED={value:?} must be refused ({arity} args)"
+        );
+        assert!(
+            stderr.contains("IPE_RUNTIME_VENDORED") && stderr.contains("0, 1"),
+            "the refusal must name the variable and its spellings, got stderr:\n{stderr}"
+        );
+    }
+    assert!(
+        !out_exists,
+        "the refusal fires before any output is created"
+    );
+    Ok(())
+}
+
+/// Run `ipe` with `args`, `IPE_RUNTIME_DIR` set to `runtime_dir` when given,
+/// and capture `(success, stderr)`, killing it at a deadline.
+///
+/// A refusal fires before any build or loop; a command still running at the
+/// deadline is killed and reported as a success, so the caller's refusal
+/// assertion fails rather than hangs.
+fn run_ipe_refused_runtime(
+    args: &[&std::ffi::OsStr],
+    runtime_dir: Option<&Path>,
+) -> Result<(bool, String), Box<dyn Error>> {
+    let mut cmd = Command::new(support::ipe_bin());
+    cmd.args(args)
+        .env("NO_COLOR", "1")
+        .env_remove("IPE_RUNTIME_DIR")
+        .env_remove("IPE_RUNTIME_VENDORED")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    if let Some(dir) = runtime_dir {
+        cmd.env("IPE_RUNTIME_DIR", dir);
+    }
+    let mut child = cmd.spawn()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        std::io::Read::read_to_string(&mut pipe, &mut stderr)?;
+    }
+    Ok((status.is_none_or(|s| s.success()), stderr))
+}
+
+/// A runtime root that does not prove is refused on every surface, with the
+/// remedy that surface can act on.
+///
+/// `ipe dev build` and `ipe dev watch` take `--runtime <dir>` and name it;
+/// `ipe test` has no `--runtime` and names `IPE_RUNTIME_DIR` alone. Each
+/// refusal fires before any build, so this runs offline.
+#[test]
+fn a_runtime_root_that_does_not_prove_is_refused_with_the_surface_remedy() -> TestResult {
+    let dir = crate::support::scratch_root()
+        .join(format!("ipe_runtime_root_refused_{}", std::process::id()));
+    e2e_support::scratch::fresh(&dir);
+    write_project(&dir)?;
+    std::fs::create_dir_all(dir.join("tests"))?;
+    std::fs::copy(
+        fixture("tests_pass.ipe"),
+        dir.join("tests").join("Main.ipe"),
+    )?;
+    let bogus =
+        ipe_test_temp::temp_root().join(format!("ipe_runtime_root_bogus_{}", std::process::id()));
+    e2e_support::scratch::fresh(&bogus);
+    std::fs::create_dir_all(&bogus)?;
+    let out = dir.join("refused-out");
+    let os = std::ffi::OsStr::new;
+    let build = [
+        os("dev"),
+        os("build"),
+        dir.as_os_str(),
+        os("--out"),
+        out.as_os_str(),
+        os("--runtime"),
+        bogus.as_os_str(),
+    ];
+    let watch = [
+        os("dev"),
+        os("watch"),
+        dir.as_os_str(),
+        os("--out"),
+        out.as_os_str(),
+        os("--runtime"),
+        bogus.as_os_str(),
+    ];
+    let test = [os("test"), dir.as_os_str()];
+    let with_flag = [
+        ("dev build", run_ipe_refused_runtime(&build, None)?),
+        ("dev watch", run_ipe_refused_runtime(&watch, None)?),
+    ];
+    let env_only = run_ipe_refused_runtime(&test, Some(&bogus))?;
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&bogus);
+    for (surface, (ok, stderr)) in &with_flag {
+        assert!(!ok, "`ipe {surface} --runtime <bogus>` must be refused");
+        assert!(
+            stderr.contains("not an Ipe runtime crate root") && stderr.contains("--runtime <dir>"),
+            "`ipe {surface}` must refuse the root and offer `--runtime`, got stderr:\n{stderr}"
+        );
+    }
+    let (ok, stderr) = &env_only;
+    assert!(
+        !ok,
+        "`ipe test` under a bogus IPE_RUNTIME_DIR must be refused"
+    );
+    assert!(
+        stderr.contains("not an Ipe runtime crate root")
+            && stderr.contains("IPE_RUNTIME_DIR")
+            && !stderr.contains("--runtime"),
+        "`ipe test` must offer IPE_RUNTIME_DIR alone, got stderr:\n{stderr}"
+    );
+    Ok(())
+}
+
+/// A vendored `ipe test` outside any checkout runs on the embedded runtime.
+///
+/// The project lives under the OS temp root, `IPE_RUNTIME_DIR` is unset and
+/// `IPE_HOME` is an empty directory: the tests run and pass, and nothing is
+/// written under `IPE_HOME/runtime`. Gated on `IPE_E2E=1` — it builds and runs
+/// the emitted test binary.
+#[test]
+fn a_vendored_test_outside_a_checkout_runs_on_the_embedded_runtime() -> TestResult {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!("skipping: set IPE_E2E=1 to run the vendored outside-checkout E2E");
+        return Ok(());
+    }
+    let base = ipe_test_temp::temp_root()
+        .join(format!("ipe_test_vendored_outside_{}", std::process::id()));
+    e2e_support::scratch::fresh(&base);
+    let project = base.join("project");
+    write_project(&project)?;
+    std::fs::create_dir_all(project.join("tests"))?;
+    std::fs::copy(
+        fixture("tests_pass.ipe"),
+        project.join("tests").join("Main.ipe"),
+    )?;
+    let home = base.join("home");
+    std::fs::create_dir_all(&home)?;
+    let cache = base.join("cache");
+    std::fs::create_dir_all(&cache)?;
+
+    let mut cmd = ipe_test_command(&project, &cache);
+    cmd.current_dir(&base)
+        .env("IPE_RUNTIME_VENDORED", "1")
+        .env("IPE_HOME", &home)
+        .env_remove("IPE_RUNTIME_DIR");
+    let (ok, stdout, stderr) = run_captured(cmd)?;
+    let runtime_written = home.join("runtime").exists();
+    let _ = std::fs::remove_dir_all(&base);
+    assert!(
+        ok,
+        "a vendored test run outside a checkout must pass, got stderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("all tests passed"),
+        "the settled outcome must appear, got stdout:\n{stdout}"
+    );
+    assert!(
+        !runtime_written,
+        "a vendored test run must write nothing under IPE_HOME/runtime"
+    );
+    Ok(())
+}

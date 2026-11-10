@@ -61,7 +61,7 @@ fn record_then_replay_is_deterministic_and_refuses_bad_logs() {
 
     let options = ipe::BuildOptions {
         debugger: true,
-        ..ipe::BuildOptions::from_env()
+        ..ipe::BuildOptions::from_env().expect("BuildOptions from env")
     };
     let built = ipe::build_golden_dir(&dir, &out, &runtime, &options);
     assert!(

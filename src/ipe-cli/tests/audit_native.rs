@@ -246,15 +246,12 @@ fn the_audit_links_the_embedded_runtime_whatever_the_environment_and_cwd_name() 
         !stdout.contains("0.0.0-planted") && !stderr.contains("0.0.0-planted"),
         "no planted runtime is named; stdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let embedded = ipe_home
-        .join("runtime")
-        .join(env!("CARGO_PKG_VERSION"))
-        .join("rust")
-        .join("Cargo.toml");
+    let installed = ipe_home.join("runtime");
     assert!(
-        embedded.is_file(),
-        "the embedded runtime is materialized under the gate's IPE_HOME at {}",
-        embedded.display()
+        !installed.exists(),
+        "the embedded runtime is bundled into the judged crate, never installed under \
+         the gate's IPE_HOME at {}",
+        installed.display()
     );
     let _ = std::fs::remove_dir_all(&parent);
     let _ = std::fs::remove_dir_all(&index);

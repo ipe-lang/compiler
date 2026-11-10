@@ -102,7 +102,8 @@ fn emit_wasm_under(
     e2e_support::scratch::fresh(&out_dir);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let mut opts = BuildOptions::from_env();
+    let mut opts = BuildOptions::from_env()
+        .map_err(|e| -> BoxError { format!("{test_name}: emit options refused: {e}").into() })?;
     opts.target = ipe_ir::Target::WasmClient;
     ipe::build_fixture_with_options(&fixture, &out_dir, &runtime, &opts)
         .map_err(|e| -> BoxError { format!("{test_name}: wasm emit failed: {e:?}").into() })?;

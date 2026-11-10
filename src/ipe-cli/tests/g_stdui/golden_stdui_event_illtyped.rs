@@ -20,8 +20,8 @@
 //!   (String handler, well-typed) → ipe succeeds (build returns `Ok`).
 //!
 //! Both tests are pure ipe-pipeline checks (no cargo build / runtime binary
-//! required), so they run without `IPE_E2E=1`.  They return early if
-//! [`ipe::resolve_runtime`] cannot locate the embedded runtime.
+//! required), so they run without `IPE_E2E=1`. They fail if
+//! `e2e_support::require_runtime` cannot locate the in-repo runtime.
 
 use std::path::PathBuf;
 
