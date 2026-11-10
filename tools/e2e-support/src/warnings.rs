@@ -37,6 +37,12 @@ pub enum WarningRefusal {
         /// The raw stdout line.
         line: String,
     },
+    /// The stream carried no artifact for the app crate, so a judge keyed on
+    /// that package name would have admitted every app warning.
+    AppNotBuilt {
+        /// The app package name the judge was keyed on.
+        package: String,
+    },
 }
 
 impl fmt::Display for WarningRefusal {
@@ -66,6 +72,12 @@ impl fmt::Display for WarningRefusal {
                     "cargo's JSON stream carried a line that is not JSON: {line}"
                 )
             }
+            Self::AppNotBuilt { package } => {
+                write!(
+                    f,
+                    "cargo's JSON stream reported no artifact for the app package `{package}`"
+                )
+            }
         }
     }
 }
@@ -77,9 +89,12 @@ impl fmt::Display for WarningRefusal {
 ///
 /// [`WarningRefusal::Warnings`] lists every covered warning;
 /// [`WarningRefusal::Unattributable`] and [`WarningRefusal::Malformed`] fail
-/// closed on a record the judge cannot read.
+/// closed on a record the judge cannot read; [`WarningRefusal::AppNotBuilt`]
+/// fails closed when no `compiler-artifact` record names `app_package`, so a
+/// mis-keyed app name cannot leave the app crate unjudged.
 pub fn refuse_owned_warnings(json_stdout: &str, app_package: &str) -> Result<(), WarningRefusal> {
     let mut found = Vec::new();
+    let mut app_built = false;
     for line in json_stdout.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -90,8 +105,17 @@ pub fn refuse_owned_warnings(json_stdout: &str, app_package: &str) -> Result<(),
                 line: trimmed.to_owned(),
             });
         };
-        if value.get("reason").and_then(serde_json::Value::as_str) != Some("compiler-message") {
-            continue;
+        match value.get("reason").and_then(serde_json::Value::as_str) {
+            Some("compiler-message") => {}
+            Some("compiler-artifact") => {
+                app_built |= value
+                    .get("package_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(package_name)
+                    == Some(app_package);
+                continue;
+            }
+            _ => continue,
         }
         let message = value.get("message");
         if message
@@ -123,10 +147,12 @@ pub fn refuse_owned_warnings(json_stdout: &str, app_package: &str) -> Result<(),
             rendered,
         });
     }
-    if found.is_empty() {
-        Ok(())
-    } else {
-        Err(WarningRefusal::Warnings(found))
+    match (found.is_empty(), app_built) {
+        (false, _) => Err(WarningRefusal::Warnings(found)),
+        (true, true) => Ok(()),
+        (true, false) => Err(WarningRefusal::AppNotBuilt {
+            package: app_package.to_owned(),
+        }),
     }
 }
 
@@ -170,6 +196,15 @@ mod tests {
         .to_string()
     }
 
+    /// The artifact record cargo prints once the app crate is built.
+    fn app_artifact() -> String {
+        serde_json::json!({
+            "reason": "compiler-artifact",
+            "package_id": format!("path+file:///scratch/out#{APP}@0.1.0"),
+        })
+        .to_string()
+    }
+
     #[test]
     fn a_runtime_warning_is_refused() {
         let stream = message(
@@ -195,10 +230,14 @@ mod tests {
 
     #[test]
     fn a_warning_from_another_package_is_admitted() {
-        let stream = message(
-            "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0",
-            "warning",
-        );
+        let stream = [
+            message(
+                "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0",
+                "warning",
+            ),
+            app_artifact(),
+        ]
+        .join("\n");
         assert_eq!(refuse_owned_warnings(&stream, APP), Ok(()));
     }
 
@@ -207,6 +246,7 @@ mod tests {
         let stream = [
             message("path+file:///r#ipe-runtime-rust@0.2.3", "error"),
             message("path+file:///r#ipe-runtime-rust@0.2.3", "note"),
+            app_artifact(),
             serde_json::json!({ "reason": "build-finished", "success": true }).to_string(),
         ]
         .join("\n");
@@ -245,6 +285,27 @@ mod tests {
             refuse_owned_warnings("warning: not json", APP),
             Err(WarningRefusal::Malformed { .. })
         ));
+    }
+
+    #[test]
+    fn a_stream_without_the_app_artifact_fails_closed() {
+        let other = serde_json::json!({
+            "reason": "compiler-artifact",
+            "package_id": "path+file:///scratch/out#ipe-app@0.1.0",
+        })
+        .to_string();
+        assert_eq!(
+            refuse_owned_warnings(&other, APP),
+            Err(WarningRefusal::AppNotBuilt {
+                package: APP.to_owned()
+            })
+        );
+        assert_eq!(
+            refuse_owned_warnings("", APP),
+            Err(WarningRefusal::AppNotBuilt {
+                package: APP.to_owned()
+            })
+        );
     }
 
     #[test]

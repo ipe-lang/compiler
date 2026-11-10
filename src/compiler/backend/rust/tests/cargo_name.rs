@@ -131,14 +131,15 @@ fn sanitized_name_project_cargo_builds() -> DResult<()> {
             e2e_support::target::isolated(e2e_support::target::IsolationReason::FixedPackageName)
                 .map_err(|e| seal_e2e::build_bug(format!("{slot}: {e}")))?;
         let build_target = e2e_support::target::BuildTarget::Isolated(isolated);
-        let status = e2e_support::target::cargo_command(&build_target)
-            .arg("build")
-            .current_dir(&out)
-            .status();
+        // The checked build reads the app package from the vendored manifest,
+        // so it judges the sanitized name this test proves, never a guess.
+        let mut cargo = e2e_support::target::cargo_command(&build_target);
+        cargo.arg("build");
+        let built = e2e_support::checked_build(cargo, &slot, &out);
         assert!(
-            matches!(&status, Ok(s) if s.success()),
+            built.is_ok(),
             "sanitized name {expected_cargo_name:?} (from {raw_name:?}): \
-             emitted crate must cargo build: {status:?}"
+             emitted crate must cargo build without warnings: {built:?}"
         );
     }
 

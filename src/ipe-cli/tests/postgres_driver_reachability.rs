@@ -151,18 +151,15 @@ fn postgres_driver_project_cargo_builds() {
         }
         Err(e) => panic!("shared build target: {e}"),
     };
-    #[allow(clippy::expect_used)]
-    let check_output = e2e_support::target::cargo_command(&build_target)
-        .arg("check")
-        .current_dir(&out)
-        .output()
-        .expect("cargo must spawn");
+    // The checked build is bounded and refuses any warning from the runtime
+    // under the postgres feature set or from the app crate.
+    let mut cargo = e2e_support::target::cargo_command(&build_target);
+    cargo.arg("check");
+    let checked = e2e_support::checked_build(cargo, "postgres_cargo_build", &out);
     assert!(
-        check_output.status.success(),
-        "emitted driver=\"postgres\" project must cargo-check clean \
-         (no live Postgres connection needed for `cargo check`)\n\
-         --- cargo stderr ---\n{}",
-        String::from_utf8_lossy(&check_output.stderr),
+        checked.is_ok(),
+        "emitted driver=\"postgres\" project must cargo-check clean, without warnings \
+         (no live Postgres connection needed for `cargo check`): {checked:?}"
     );
 
     let _ = fs::remove_dir_all(&dir);

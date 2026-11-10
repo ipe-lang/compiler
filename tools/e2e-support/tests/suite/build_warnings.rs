@@ -63,7 +63,7 @@ fn build_pair(tag: &str, dead: bool) -> Result<(), String> {
     let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("build-warnings-{tag}"));
     let app = write_pair(&root, dead);
     let tree = isolated(IsolationReason::ColdBuildUnderTest).expect("a private build tree");
-    build_project_checked(tag, &app, &BuildTarget::Isolated(tree), APP)
+    build_project_checked(tag, &app, &BuildTarget::Isolated(tree))
 }
 
 #[test]

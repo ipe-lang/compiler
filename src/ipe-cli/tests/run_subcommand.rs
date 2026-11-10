@@ -108,12 +108,8 @@ fn run_subcommand_builds_and_executes_hello_program() {
         let target = e2e_support::target::BuildTarget::Isolated(isolated);
         // The checked build refuses a cargo failure and any warning from the
         // runtime or the app crate, so a warning-bearing build fails the SEAL.
-        let cargo_build = e2e_support::build_project_checked(
-            "run_subcommand_hello",
-            &out_dir,
-            &target,
-            "ipe-app",
-        );
+        let cargo_build =
+            e2e_support::build_project_checked("run_subcommand_hello", &out_dir, &target);
         assert!(
             cargo_build.is_ok(),
             "cargo build on emitted project must succeed without warnings: {cargo_build:?}"
