@@ -953,7 +953,7 @@ fn guide_project(tag: &str) -> PathBuf {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
-    let _ = fs::remove_dir_all(&dir);
+    e2e_support::scratch::fresh(&dir);
     fs::create_dir_all(&dir).expect("make the project");
     fs::write(dir.join("package.ipe"), support::package_ipe("guide")).expect("write manifest");
     dir
@@ -1106,8 +1106,14 @@ fn agents_machine_output() {
         .unwrap_or_default();
     keys.sort_unstable();
     assert_eq!(keys, ["backup", "file", "from", "ipe", "outcome"]);
-    assert_eq!(json["outcome"], "created");
-    assert_eq!(json["file"], "AGENTS.md");
+    assert_eq!(
+        json.get("outcome"),
+        Some(&serde_json::Value::from("created"))
+    );
+    assert_eq!(
+        json.get("file"),
+        Some(&serde_json::Value::from("AGENTS.md"))
+    );
     let r = run_in(&dir, &["upgrade", "--agents", "--plain"]);
     assert!(r.ok, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "current\n");

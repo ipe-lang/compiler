@@ -449,7 +449,7 @@ impl HandEditedPlan {
 
     /// The refusal of a write no one consented to; the file is left unchanged.
     #[must_use]
-    pub const fn refuse(self) -> GuideRefusal {
+    pub fn refuse(self) -> GuideRefusal {
         GuideRefusal::HandEdited(self.edit)
     }
 }
@@ -481,6 +481,13 @@ pub enum Answer {
 /// Built only by [`consent`]; taken by value, so one answer licenses one write.
 #[derive(Debug)]
 pub struct OverwriteConsent(());
+
+impl OverwriteConsent {
+    /// Uses up the consent on the one write it licenses.
+    const fn spend(self) {
+        let Self(()) = self;
+    }
+}
 
 /// The consent an answer gives; only [`Answer::Yes`] gives one.
 #[must_use]
@@ -642,7 +649,7 @@ pub(crate) fn apply_consented(
     plan: HandEditedPlan,
     consent: OverwriteConsent,
 ) -> Result<UpgradeOutcome, CliError> {
-    let OverwriteConsent(()) = consent;
+    consent.spend();
     let judged = plan.judged;
     match dir.replace_backed_up(
         OsStr::new(FILE_NAME),

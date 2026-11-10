@@ -1007,10 +1007,8 @@ fn is_fresh_target(root: &HeldDir) -> Result<bool, CliError> {
             return Ok(false);
         }
     }
-    match root.child(OsStr::new(SRC_DIR))? {
-        Some(src) => src.is_empty(),
-        None => Ok(true),
-    }
+    root.child(OsStr::new(SRC_DIR))?
+        .map_or(Ok(true), |src| src.is_empty())
 }
 
 /// Reconcile an already-populated target against the managed set, one file at
@@ -1115,8 +1113,8 @@ fn place_managed(
             if !replace {
                 return Ok(Placed::Kept(Kept::Declined));
             }
-            let fill = |staged: &mut std::fs::File| fill_with(staged, &file.content);
-            match dir.replace_backed_up(name.as_os_str(), id, &bytes, file.cap, fill)? {
+            let write_content = |staged: &mut std::fs::File| fill_with(staged, &file.content);
+            match dir.replace_backed_up(name.as_os_str(), id, &bytes, file.cap, write_content)? {
                 BackedUp::Done(backup) => Ok(Placed::Replaced(backup)),
                 BackedUp::Changed => Ok(Placed::Kept(Kept::Changed)),
                 BackedUp::BackupSlotsFull => Ok(Placed::Kept(Kept::BackupSlotsFull)),
@@ -1130,8 +1128,8 @@ fn place_managed(
 /// # Errors
 /// [`CliError::Io`] or [`CliError::OutputRefused`] when the create fails.
 fn create_managed(dir: &HeldDir, file: &ManagedFile) -> Result<Placed, CliError> {
-    let fill = |staged: &mut std::fs::File| fill_with(staged, &file.content);
-    match dir.create_if_absent(OsStr::new(&file.name), fill)? {
+    let write_content = |staged: &mut std::fs::File| fill_with(staged, &file.content);
+    match dir.create_if_absent(OsStr::new(&file.name), write_content)? {
         Created::Done => Ok(Placed::Created),
         Created::Exists => Ok(Placed::Kept(Kept::Appeared)),
     }

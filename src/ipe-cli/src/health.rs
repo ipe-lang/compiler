@@ -487,16 +487,16 @@ fn check_agents_guide() -> Option<Check> {
     let dir = crate::output_dir::held::HeldDir::open(&cwd)
         .ok()
         .flatten()?;
-    Some(guide_check(crate::agents_guide::read_guide(&dir)))
+    Some(guide_check(&crate::agents_guide::read_guide(&dir)))
 }
 
 /// The row reporting the project's `AGENTS.md` against this ipe's guide.
 ///
 /// Never critical and never fixed here: health reports, `ipe upgrade --agents` writes.
-fn guide_check(status: GuideStatus) -> Check {
+fn guide_check(status: &GuideStatus) -> Check {
     use crate::agents_guide::{FILE_NAME, GUIDE_TERM, StaleReason, UPGRADE_HINT};
     use crate::text::msg;
-    let (state, suggestion) = match &status {
+    let (state, suggestion) = match status {
         GuideStatus::Current => (Status::Ok, None),
         GuideStatus::Missing => (
             Status::Missing,
@@ -2656,7 +2656,7 @@ mod tests {
     #[test]
     fn guide_row_has_no_fix_and_yes_never_writes() {
         for status in every_guide_status() {
-            let check = guide_check(status.clone());
+            let check = guide_check(&status);
             assert!(check.fix.is_none(), "{status:?} carries no fix");
             assert_eq!(check.group, Group::Project);
             assert_eq!(check.id, GUIDE_CHECK_ID);
@@ -2674,7 +2674,7 @@ mod tests {
             .expect("open project")
             .expect("project exists");
         let report = Report {
-            checks: vec![guide_check(crate::agents_guide::read_guide(&held))],
+            checks: vec![guide_check(&crate::agents_guide::read_guide(&held))],
         };
         assert!(report.fixable().next().is_none());
         let out = std::fs::File::create(dir.path().join("out")).expect("file");
@@ -2697,7 +2697,7 @@ mod tests {
             .expect("open project")
             .expect("project exists");
         let report = Report {
-            checks: vec![guide_check(crate::agents_guide::read_guide(&held))],
+            checks: vec![guide_check(&crate::agents_guide::read_guide(&held))],
         };
         let stream = std::fs::File::create(dir.path().join("out")).expect("file");
         for out in [
@@ -2716,7 +2716,7 @@ mod tests {
     fn health_exit_code_unchanged_by_stale_guide() {
         for status in every_guide_status() {
             let report = Report {
-                checks: vec![guide_check(status.clone())],
+                checks: vec![guide_check(&status)],
             };
             assert!(!report.has_critical_failure(), "{status:?}");
         }

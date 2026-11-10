@@ -2338,10 +2338,9 @@ fn parse_upgrade(rest: &[String]) -> Result<UpgradeRequest, CliError> {
 
     let format = format.unwrap_or_default();
     if agents {
-        return match binary_flag {
-            Some(flag) => Err(CliError::Usage(text::msg::upgrade_agents_alone(&flag))),
-            None => Ok(UpgradeRequest::Agents { format }),
-        };
+        return binary_flag.map_or(Ok(UpgradeRequest::Agents { format }), |flag| {
+            Err(CliError::Usage(text::msg::upgrade_agents_alone(&flag)))
+        });
     }
     let check = match (check, exit_code_flag) {
         (false, true | false) => CheckMode::Install,
@@ -5659,11 +5658,22 @@ mod upgrade_agents_tests {
         );
         let json: serde_json::Value =
             serde_json::from_str(&upgrade_agents_json(&outcome)).expect("one JSON object");
-        assert_eq!(json["outcome"], "replaced");
-        assert_eq!(json["backup"], ".ipe-backup/AGENTS.md.bak");
-        assert_eq!(json["file"], FILE_NAME);
-        assert!(json["from"].is_null());
-        assert_eq!(json["ipe"], version_check::current_version().to_string());
+        assert_eq!(
+            json.get("outcome"),
+            Some(&serde_json::Value::from("replaced"))
+        );
+        assert_eq!(
+            json.get("backup"),
+            Some(&serde_json::Value::from(".ipe-backup/AGENTS.md.bak"))
+        );
+        assert_eq!(json.get("file"), Some(&serde_json::Value::from(FILE_NAME)));
+        assert_eq!(json.get("from"), Some(&serde_json::Value::Null));
+        assert_eq!(
+            json.get("ipe"),
+            Some(&serde_json::Value::from(
+                version_check::current_version().to_string()
+            ))
+        );
         assert_eq!(json.as_object().map(serde_json::Map::len), Some(5));
         let _ = std::fs::remove_dir_all(&base);
     }
