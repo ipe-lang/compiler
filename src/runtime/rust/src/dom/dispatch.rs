@@ -1156,15 +1156,26 @@ mod tests {
             assert_eq!(src.matches(api).count(), 1, "{api} has one caller");
             assert!(writer.contains(api), "{api} is called by `write_url`");
         }
-        for entry in ["fn flush<", "fn navigate_to<"] {
-            assert!(
-                body_of(entry).contains("frozen_step(app)"),
-                "`{entry}` keeps a scrubbed step shown, so the URL stays the shown step's"
-            );
-        }
         assert!(
-            body_of("fn navigate_to<")
-                .contains("Some(step) => flush_overlay_scrub(app, Some(step)),"),
+            body_of("fn frozen_step<")
+                .contains("app.overlay.as_ref().and_then(|ov| ov.scrub_step())"),
+            "`frozen_step` reads the scrubber's held step"
+        );
+        assert!(
+            body_of("fn flush<").contains(
+                "if frozen_step(app).is_none() {\n        let frame = render_frame(app, model);"
+            ),
+            "`flush` renders the live model only while no step is scrubbed"
+        );
+        let navigate = body_of("fn navigate_to<");
+        assert!(
+            navigate.contains(
+                "match frozen_step(app) {\n        None => commit_view(app, render_frame(app, new_model), None, false),"
+            ),
+            "a navigation commits the live page only while no step is scrubbed"
+        );
+        assert!(
+            navigate.contains("Some(step) => flush_overlay_scrub(app, Some(step)),"),
             "a navigation during a scrub re-commits the scrubbed step and its URL"
         );
     }
