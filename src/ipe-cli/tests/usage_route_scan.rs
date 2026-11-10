@@ -799,6 +799,12 @@ const UNROUTED: &[(&str, &str, usize, &str)] = &[
         4,
         "built in a file another lane owns; its route is decided there",
     ),
+    (
+        "watch.rs",
+        "watch_runtime_dep",
+        1,
+        "the watch mirror of `refuse_debugger_without_runtime_dep`; it routes with that refusal",
+    ),
 ];
 
 /// One source file under scan: its path relative to `src/` (`/`-separated) and its text.
