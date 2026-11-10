@@ -1828,7 +1828,6 @@ pub fn read_miss(err: &CliError) -> ReadMiss {
         | CliError::UnknownCommand { .. }
         | CliError::ScratchUnavailable { .. }
         | CliError::Pipeline { .. }
-        | CliError::RuntimeNotFound
         | CliError::RuntimeDirInvalid { .. }
         | CliError::RuntimeHomeUnknown
         | CliError::CacheHomeUnknown
