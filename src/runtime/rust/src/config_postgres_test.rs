@@ -1,25 +1,24 @@
-// Behavioral regression tests for the Postgres `db_format_sql` placeholder
-// rewriter.
+// Behavioral tests for the Postgres `db_format_sql` placeholder rewriter.
 //
-// The rewriter lives in `config_postgres.rs`, which is NOT part of this crate's
-// module tree in a normal build — it is `include_str!`'d verbatim by the
-// emitter (`ipe_backend_rust::project`) and only ever compiled inside an
-// *emitted* postgres project. `cargo nextest -p ipe-runtime-rust` therefore
-// never exercises the real rewriter (the in-crate `config.rs` `db_format_sql`
-// is the sqlite identity fn).
-//
-// This module re-includes the same source file under `#[path]`, but only under
-// `cfg(all(test, feature = "db"))`, so the exact bytes that get emitted are the
-// bytes under test — a future edit to the quote-aware scan cannot silently
-// desync placeholder numbering without a test here failing. Nothing here is
-// ever emitted: the emitter reads `config_postgres.rs` alone.
+// The rewriter lives in `config_postgres.rs`, the template the emitter
+// `include_str!`s into every postgres project. The bytes under test are the
+// bytes that ship, reached through exactly one module load per build:
+// - under `db-postgres` the crate root compiles that file as `config`, so the
+//   suite drives `crate::config`;
+// - under every other selector the crate root compiles the sqlite `config.rs`,
+//   so the suite re-includes the template under `#[path]` as `pg`.
+// An edit to the quote-aware scan that desyncs placeholder numbering fails here
+// under both selectors. Nothing here is ever emitted.
 
-// The re-included file carries the full production surface (`DbPool`,
-// `ipe_db_url`, `db_last_insert_id`, …); only `db_format_sql` and its scan
-// helpers are exercised, so the rest reads as dead code in this test-only view.
+// The re-included template carries the full driver surface (`DbPool`,
+// `ipe_db_url`, `db_last_insert_id`, ...); only `db_format_sql` is driven, so
+// the rest reads as dead code in this test-only view.
+#[cfg(not(feature = "db-postgres"))]
 #[allow(dead_code)]
 #[path = "config_postgres.rs"]
 mod pg;
+#[cfg(feature = "db-postgres")]
+use crate::config as pg;
 
 #[cfg(test)]
 mod tests {
@@ -194,5 +193,66 @@ mod tests {
     fn no_placeholders_is_identity() {
         assert_eq!(fmt("SELECT 1"), "SELECT 1");
         assert_eq!(fmt(""), "");
+    }
+
+    #[test]
+    fn dollar_tag_with_inner_prefix_needs_full_tag_to_close() {
+        // A `$ta$` inside a `$tag$...$tag$` body is NOT the closer; only the full
+        // `$tag$` ends the span, so the `?` before the real close stays hidden.
+        assert_eq!(
+            fmt("SELECT $tag$x $ta$ y?$tag$ , ?"),
+            "SELECT $tag$x $ta$ y?$tag$ , $1"
+        );
+    }
+
+    #[test]
+    fn dollar_tag_cannot_start_with_a_digit() {
+        // `$1$` is not a valid dollar-quote opening tag (a tag may not start
+        // with a digit), so the text is ordinary and the later `?` renumbers.
+        assert_eq!(fmt("SELECT $1$ , ?"), "SELECT $1$ , $1");
+    }
+
+    #[test]
+    fn lone_trailing_delimiters_are_ordinary_text() {
+        for sql in ["?$", "?-", "?/", "? $é", "?-é", "?/é"] {
+            let expected = sql.replacen('?', "$1", 1);
+            assert_eq!(fmt(sql), expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn unterminated_quote_consumes_remainder() {
+        assert_eq!(fmt("? 'never closes ?"), "$1 'never closes ?");
+        assert_eq!(fmt("? \"never closes ?"), "$1 \"never closes ?");
+        assert_eq!(fmt("'"), "'");
+    }
+
+    #[test]
+    fn escape_string_backslash_quote_keeps_span_open() {
+        // In `E'...'` a `\'` is an embedded quote, so the `?` after it is still
+        // inside the literal; only the later `?` is a placeholder.
+        assert_eq!(fmt(r"SELECT E'it\'s?' , ?"), r"SELECT E'it\'s?' , $1");
+        assert_eq!(fmt(r"SELECT e'\\' , ?"), r"SELECT e'\\' , $1");
+        assert_eq!(fmt(r"SELECT E'a''b?' , ?"), r"SELECT E'a''b?' , $1");
+        assert_eq!(fmt(r"? E'\"), r"$1 E'\");
+        assert_eq!(fmt(r"? E'never closes ?"), r"$1 E'never closes ?");
+    }
+
+    #[test]
+    fn an_identifier_ending_in_e_opens_no_escape_string() {
+        // `type'a\'` is the identifier `type` then the standard literal `'a\'`,
+        // where a backslash is ordinary text, so the literal closes there.
+        assert_eq!(fmt(r"SELECT type'a\' , ?"), r"SELECT type'a\' , $1");
+    }
+
+    #[test]
+    fn a_dollar_inside_an_identifier_opens_no_dollar_quote() {
+        // `a$b$` and `y$b$` are identifiers, not a `$b$...$b$` dollar quote, so
+        // both placeholders between and after them renumber.
+        assert_eq!(
+            fmt("SELECT a$b$ FROM t WHERE x = ? AND y$b$ = ?"),
+            "SELECT a$b$ FROM t WHERE x = $1 AND y$b$ = $2"
+        );
+        assert_eq!(fmt("SELECT é$$a?$$"), "SELECT é$$a$1$$");
     }
 }

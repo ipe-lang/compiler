@@ -62,6 +62,7 @@ check_ci_suites_required = verify_manifest.check_ci_suites_required
 check_feature_coverage = verify_manifest.check_feature_coverage
 check_release_target_parity = verify_manifest.check_release_target_parity
 check_wasm_clippy_legs = verify_manifest.check_wasm_clippy_legs
+check_runtime_clippy_all_targets = verify_manifest.check_runtime_clippy_all_targets
 
 def _load(root: str, errors: list[str]) -> verify_manifest.WorkflowSet:
     """The typed workflow load `main` runs once, its refusals recorded as
@@ -9357,6 +9358,70 @@ class TestWasmClippyLegs(unittest.TestCase):
         errors: list[str] = []
         check_wasm_clippy_legs(_load(self.root, errors), errors)
         self.assertTrue(any("has no `wasm-floor` job" in e for e in errors), errors)
+
+
+_RCA_PG = "cargo clippy -p ipe-runtime-rust --features full,db-postgres --all-targets -- -D warnings"
+
+
+class TestRuntimeClippyAllTargets(unittest.TestCase):
+    """Check 26: every host `cargo clippy` of the runtime lints every target."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def errors(self, run: str, local: list[str]) -> list[str]:
+        step = "\n".join(f"          {line}" for line in run.split("\n"))
+        _write(
+            os.path.join(self.root, "workflows", "ci.yml"),
+            "on: push\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n"
+            f"      - run: |\n{step}\n",
+        )
+        errors: list[str] = []
+        wfs = _load(self.root, errors)
+        found: list[str] = []
+        check_runtime_clippy_all_targets(wfs, [{"context": "rt", "local": {"run": local}}], found)
+        return found
+
+    def test_all_targets_rows_admitted(self) -> None:
+        self.assertEqual(self.errors(_RCA_PG, [_RCA_PG]), [])
+        joined = "cargo clippy -p ipe-runtime-rust \\\n  --features db-postgres --all-targets -- -D warnings"
+        self.assertEqual(self.errors(joined, []), [])
+
+    def test_library_only_row_refused_in_every_package_spelling(self) -> None:
+        for selector in ("-p ipe-runtime-rust", "-pipe-runtime-rust", "--package ipe-runtime-rust", "--package=ipe-runtime-rust"):
+            row = f"cargo clippy {selector} --features full,db-postgres -- -D warnings"
+            for run, local, where in ((row, [], "ci.yml job `lint`"), (_RCA_PG, [row], "manifest `rt` local.run")):
+                errors = self.errors(run, local)
+                self.assertEqual(len(errors), 1, (selector, errors))
+                self.assertTrue(errors[0].startswith(f"check 26: {where}"), errors)
+
+    def test_all_targets_after_the_separator_refused(self) -> None:
+        row = "cargo clippy -p ipe-runtime-rust -- --all-targets -D warnings"
+        self.assertEqual(len(self.errors(row, [])), 1)
+
+    def test_continued_line_and_toolchain_refused(self) -> None:
+        joined = "cargo +1.98.1 clippy \\\n  -p ipe-runtime-rust --features db-postgres -- -D warnings"
+        self.assertEqual(len(self.errors(joined, [])), 1)
+
+    def test_other_package_and_cross_target_rows_not_held(self) -> None:
+        rows = [
+            "cargo clippy -p ipe --features full -- -D warnings",
+            "cargo clippy -p ipe-runtime-rust --target wasm32-unknown-unknown --lib -- -D warnings",
+            "cargo build -p ipe-runtime-rust --lib",
+        ]
+        self.assertEqual(self.errors("\n".join(rows), rows), [])
+
+    def test_runtime_clippy_rows_accept_current_tree(self) -> None:
+        errors: list[str] = []
+        wfs = _load(verify_manifest.REPO_ROOT, errors)
+        manifest = verify_manifest.read_manifest(verify_manifest.MANIFEST)
+        entries = manifest.get("checks") if isinstance(manifest, dict) else None
+        check_runtime_clippy_all_targets(wfs, entries, errors)
+        self.assertEqual(errors, [])
 
 
 if __name__ == "__main__":

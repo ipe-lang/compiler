@@ -525,8 +525,8 @@ web = ["web-core", "widget-assets", "server", "dep:serde_json", "json", "serde",
 # implies it so the server keeps `ipe_runtime::web::widget_assets::*` unchanged.
 widget-assets = ["crypto-core", "encoding"]
 # `full` names no driver selector, so it compiles the sqlite aliases the
-# runtime's own db tests open, and `full,db-postgres` is the every-feature
-# PostgreSQL build CI lints. `db` links both sqlx drivers. `jwt` + `url` cover
+# runtime's pool-opening tests need, and `full,db-postgres` is the every-feature
+# PostgreSQL build CI lints with every target. `db` links both sqlx drivers. `jwt` + `url` cover
 # the JWT/auth and URL/SSRF surfaces that `db`/`web`/`http_client` reach.
 full = ["async", "json", "jwt", "url", "db", "redis_store", "crypto", "crypto-core", "secret", "compression", "csv_kernel", "cache_kernel", "tui", "config", "server", "http_client", "email", "websocket_client", "web", "time-core", "log", "regex", "uuid", "random", "decimal", "char-category"]
 # Development-only time-travelling debugger core (recorder / re-fold / export /

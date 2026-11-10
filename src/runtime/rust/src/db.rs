@@ -603,7 +603,7 @@ impl QueryTarget<'_> {
     /// Test-only observer of the routing decision — lets a test drive the
     /// ambient path (`with_recording_txn`) and assert which arm was chosen
     /// without reaching past the seam into the task-local by hand.
-    #[cfg(test)]
+    #[cfg(all(test, not(feature = "db-postgres")))]
     fn rode_transaction(&self) -> bool {
         matches!(self, QueryTarget::Txn(_))
     }
@@ -611,7 +611,7 @@ impl QueryTarget<'_> {
     /// Test-only: true when this target rode the SAME transaction connection as
     /// `conn`. Lets a nested-flatten test prove the inner scope reused the outer
     /// recording connection rather than opening a second one.
-    #[cfg(test)]
+    #[cfg(all(test, not(feature = "db-postgres")))]
     fn rode_same_txn_as(&self, conn: &TxnConn) -> bool {
         matches!(self, QueryTarget::Txn(c) if std::sync::Arc::ptr_eq(c, conn))
     }
@@ -655,7 +655,7 @@ async fn fetch_one_routed<'q>(pool: &Db, query: DbQuery<'q>) -> Result<DbRow, sq
 /// confines the installed connection to `fut`: it is neither cloned out nor
 /// leaked, preserving the sole-ownership invariant `db_with_transaction` relies
 /// on at commit.
-#[cfg(test)]
+#[cfg(all(test, not(feature = "db-postgres")))]
 async fn with_recording_txn<T>(
     pool: &Db,
     executor: TxnConn,
@@ -7219,13 +7219,6 @@ mod tests {
     }
 
     #[test]
-    fn url_is_cacheable_bare_memory_is_not_cacheable() {
-        assert!(!url_is_cacheable(":memory:"));
-        assert!(!url_is_cacheable("sqlite::memory:"));
-        assert!(!url_is_cacheable("sqlite://:memory:"));
-    }
-
-    #[test]
     fn url_is_cacheable_mode_memory_without_shared_cache_is_not_cacheable() {
         assert!(!url_is_cacheable("file:foo.db?mode=memory"));
     }
@@ -7338,169 +7331,6 @@ mod tests {
         assert_eq!(db_get_string("slug".into(), &req), "general"); // params
         assert_eq!(db_get_string("ipe_sid".into(), &req), "abc"); // cookies
         assert_eq!(db_get_string("nope".into(), &req), ""); // absent -> total ""
-    }
-
-    async fn fresh_db() -> Db {
-        // A SINGLE persistent connection per test. `sqlite::memory:` gives each
-        // pool connection its OWN in-memory database, so a default multi-conn
-        // pool routes BEGIN / INSERT / COMMIT / SELECT to different (empty) DBs
-        // — the source of a parallel-run flake: under load the pool
-        // opens extra connections and ops miss the table / committed row.
-        // min=max=1 pins one connection (one DB, table + transactions always
-        // visible); each test still gets its own isolated pool.
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("connect in-memory sqlite");
-        sqlx::query("CREATE TABLE todos (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0)")
-            .execute(&pool).await.expect("create table");
-        pool
-    }
-
-    /// A seeded external (foreign) SQLite connection, distinct from the app pool —
-    /// stands in for a source of a different dialect that the read runners dial
-    /// through the same codec stack. `ledger` carries an `amount` INTEGER column.
-    #[allow(clippy::expect_used)]
-    async fn fresh_external_conn() -> ExternalConnection {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("connect in-memory external sqlite");
-        sqlx::query(
-            "CREATE TABLE ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, amount INTEGER NOT NULL)",
-        )
-        .execute(&pool)
-        .await
-        .expect("create ledger");
-        sqlx::query("INSERT INTO ledger (amount) VALUES (7), (42)")
-            .execute(&pool)
-            .await
-            .expect("seed ledger");
-        ExternalConnection::Sqlite(pool)
-    }
-
-    /// The external read path decodes seeded rows through the SAME `Decoder<E,A>`
-    /// the app path uses — the §4 "typed reads from a foreign DB via one codec"
-    /// target. `db_conn_query_decode_params` reads `amount` back as `Int`.
-    #[tokio::test]
-    async fn external_query_decode_reads_through_one_codec() {
-        let conn = fresh_external_conn().await;
-        let out: IpeResult<String, Vec<i64>> = db_conn_query_decode_params(
-            conn,
-            "SELECT amount FROM ledger ORDER BY amount".into(),
-            vec![],
-            db_decode_int("amount".into()),
-        )
-        .await;
-        match out {
-            IpeResult::Ok(v) => assert_eq!(v, vec![7, 42]),
-            other => panic!("external queryDecode failed: {:?}", other),
-        }
-    }
-
-    /// The injection barrier is UNCHANGED on the external path: a value carrying SQL
-    /// metacharacters flows through a bound parameter (a `Sql.param` in the
-    /// fragment), so it matches VERBATIM and the surrounding table is untouched — no
-    /// injection executes against the foreign connection.
-    #[tokio::test]
-    async fn external_find_where_binds_params_no_injection() {
-        let conn = fresh_external_conn().await;
-        // A fragment built from the audited `Sql.*` combinators: `amount = ?`, the
-        // value bound (never spliced). The metacharacter value simply doesn't match.
-        let frag = sql_eq(
-            sql_column("amount".to_string()),
-            sql_param(SqlParam::Int(7)),
-        );
-        let rows: IpeResult<String, Vec<RowCells>> =
-            db_conn_find_where(conn.clone(), "ledger".into(), frag).await;
-        match rows {
-            IpeResult::Ok(v) => {
-                assert_eq!(v.len(), 1);
-                assert_eq!(v[0].text("amount"), Some("7"));
-            }
-            other => panic!("external findWhere failed: {:?}", other),
-        }
-        // A hostile TABLE identifier is rejected by the same `SqlIdent` gate — the
-        // read runner never interpolates an unvalidated name into SQL.
-        let bad: IpeResult<String, Vec<RowCells>> = db_conn_find_where(
-            conn,
-            "ledger; DROP TABLE ledger".into(),
-            sql_eq(sql_param(SqlParam::Int(1)), sql_param(SqlParam::Int(1))),
-        )
-        .await;
-        assert!(
-            matches!(bad, IpeResult::Err(_)),
-            "a hostile external table identifier must be rejected before any SQL runs"
-        );
-    }
-
-    /// A hostile column identifier in a `Sql.column` poisons the fragment, which the
-    /// external `findWhere` surfaces as a typed `Err` — the poison marker path is
-    /// identical to the app connection's.
-    #[tokio::test]
-    async fn external_find_where_rejects_poisoned_column() {
-        let conn = fresh_external_conn().await;
-        let poisoned = sql_eq(
-            sql_column("amount; DROP TABLE ledger".to_string()),
-            sql_param(SqlParam::Int(7)),
-        );
-        let rows: IpeResult<String, Vec<RowCells>> =
-            db_conn_find_where(conn, "ledger".into(), poisoned).await;
-        assert!(
-            matches!(rows, IpeResult::Err(_)),
-            "a poisoned column fragment must fail closed on the external path too"
-        );
-    }
-
-    /// `db_conn_get_by_id` binds the id as a positional parameter (never
-    /// interpolated) and returns the matching row from the foreign connection.
-    #[tokio::test]
-    async fn external_get_by_id_binds_id() {
-        let conn = fresh_external_conn().await;
-        let got: IpeResult<String, IpeMaybe<RowCells>> =
-            db_conn_get_by_id(conn, "ledger".into(), "1".into()).await;
-        match got {
-            IpeResult::Ok(IpeMaybe::Just(row)) => {
-                assert_eq!(row.text("amount"), Some("7"));
-            }
-            other => panic!("external getById failed: {:?}", other),
-        }
-    }
-
-    #[tokio::test]
-    async fn ipe_err_redacts_db_row_values() {
-        // A UNIQUE-constraint failure must NOT echo the offending row VALUE into
-        // the Ipê-visible Error. `ipe_err` builds the message from the
-        // classification and the constraint name, never the raw `Display`, which
-        // on PostgreSQL embeds `Key (email)=(victim@…) already exists`.
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("connect in-memory sqlite");
-        sqlx::query("CREATE TABLE secrets (email TEXT UNIQUE NOT NULL)")
-            .execute(&pool)
-            .await
-            .expect("create table");
-        let secret = "victim-PII@example.com";
-        let insert = format!("INSERT INTO secrets (email) VALUES ('{}')", secret);
-        let r1: IpeResult<String, i64> = db_exec(pool.clone(), insert.clone(), Vec::new()).await;
-        assert!(
-            matches!(r1, IpeResult::Ok(_)),
-            "first insert should succeed"
-        );
-        let r2: IpeResult<String, i64> = db_exec(pool.clone(), insert, Vec::new()).await;
-        assert!(
-            matches!(&r2, IpeResult::Err(e)
-                if !e.contains(secret)
-                    && e.starts_with("Conflict: db: unique constraint violated")),
-            "expected the redacted classified form, got: {r2:?}"
-        );
     }
 
     const SECRET_URL: &str = "postgres://admin:s3cr3t-pw@db.internal:5432/prod";
@@ -7985,61 +7815,6 @@ mod tests {
         path
     }
 
-    /// The first failure of opening `path` and reading it: the open, else the
-    /// first query.
-    async fn first_failure(path: &std::path::Path) -> Option<IpeError> {
-        let opened: IpeResult<IpeError, Db> = match file_at(path, FileMode::CreateIfMissing) {
-            IpeResult::Ok(location) => db_open(location).await,
-            IpeResult::Err(e) => IpeResult::Err(e),
-        };
-        match opened {
-            IpeResult::Err(e) => Some(e),
-            IpeResult::Ok(pool) => {
-                let read: IpeResult<IpeError, _> =
-                    db_query(pool, "SELECT * FROM sqlite_master".to_owned(), vec![]).await;
-                match read {
-                    IpeResult::Err(e) => Some(e),
-                    IpeResult::Ok(_) => None,
-                }
-            }
-        }
-    }
-
-    /// `Db.open` on a directory fails as `CannotOpen`.
-    #[tokio::test]
-    async fn open_on_a_directory_is_cannot_open() {
-        let dir = scratch_path("dir_db");
-        let made = std::fs::create_dir_all(&dir);
-        assert!(made.is_ok(), "{made:?}");
-        let failure = first_failure(&dir).await;
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(
-            matches!(&failure, Some(IpeError::Error(IpeErrorKind::NotFound, info))
-                if info.details == IpeMaybe::Just(IpeErrorDetails::Database(IpeDbFailure::CannotOpen))),
-            "{failure:?}"
-        );
-    }
-
-    /// A file that is not a database fails as `NotADatabase`; a real database
-    /// file is the control.
-    #[tokio::test]
-    async fn open_on_a_non_database_file_is_not_a_database() {
-        let file = scratch_path("not_a_db");
-        let written = std::fs::write(&file, "this file is not a database ".repeat(64));
-        assert!(written.is_ok(), "{written:?}");
-        let failure = first_failure(&file).await;
-        let _ = std::fs::remove_file(&file);
-        assert!(
-            matches!(&failure, Some(IpeError::Error(IpeErrorKind::Unexpected, info))
-                if info.details == IpeMaybe::Just(IpeErrorDetails::Database(IpeDbFailure::NotADatabase))),
-            "{failure:?}"
-        );
-        let fresh = scratch_path("real_db");
-        let control = first_failure(&fresh).await;
-        let _ = std::fs::remove_file(&fresh);
-        assert!(control.is_none(), "{control:?}");
-    }
-
     /// A real PostgreSQL driver failure on a URL carrying credentials never
     /// surfaces them: the refusal is either the SSRF gate's (host only) or the
     /// driver's, classified.
@@ -8054,41 +7829,6 @@ mod tests {
         if let Some(refused) = refused {
             assert_credential_free(&refused);
         }
-    }
-
-    /// A real SQLite driver failure never surfaces the path or options it was
-    /// handed.
-    #[tokio::test]
-    async fn vetted_pool_sqlite_refusal_is_credential_free() {
-        for url in [
-            "sqlite:///nonexistent-admin-s3cr3t-pw/x.db?mode=ro",
-            "sqlite://x.db?mode=s3cr3t-pw",
-        ] {
-            let refused = match DbUrl::parse(url) {
-                Ok(url) => VettedPool::<sqlx::Sqlite>::connect(&url, 1).await.err(),
-                Err(refused) => Some(refused),
-            };
-            assert!(refused.is_some(), "{url:?} must be refused");
-            if let Some(refused) = refused {
-                assert_credential_free(&refused);
-            }
-        }
-    }
-
-    /// The bundled SQLite passes every gate and yields a usable pool.
-    #[tokio::test]
-    async fn vetted_pool_admits_the_bundled_sqlite() {
-        let vetted = match DbUrl::parse("sqlite::memory:") {
-            Ok(url) => VettedPool::<sqlx::Sqlite>::connect(&url, 1)
-                .await
-                .map(|_| ()),
-            Err(refused) => Err(refused),
-        };
-        assert!(
-            vetted.is_ok(),
-            "bundled SQLite must connect: {:?}",
-            vetted.err()
-        );
     }
 
     /// The dial-target set covers the authority host, every `host` /
@@ -8306,688 +8046,11 @@ mod tests {
         assert_eq!(line, "  ✓  init\\u{1b}[2J  applied 2026\\u{1b}]0;x\\u{7}");
     }
 
-    #[tokio::test]
-    async fn migrate_is_idempotent_and_drift_guarded() {
-        let db = fresh_db().await;
-        let base = vec![
-            (
-                "001_users".to_string(),
-                "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)".to_string(),
-            ),
-            (
-                "002_email_idx".to_string(),
-                "CREATE INDEX idx_users_email ON users(email)".to_string(),
-            ),
-        ];
-
-        // First run applies both, in declaration order.
-        let r1: IpeResult<String, Vec<String>> = db_migrate_apply(db.clone(), base.clone()).await;
-        match r1 {
-            IpeResult::Ok(v) => assert_eq!(
-                v,
-                vec!["001_users".to_string(), "002_email_idx".to_string()]
-            ),
-            IpeResult::Err(e) => panic!("first migrate: {e}"),
-        }
-
-        // Second run is idempotent — both already applied → 0 applied.
-        let r2: IpeResult<String, Vec<String>> = db_migrate_apply(db.clone(), base.clone()).await;
-        match r2 {
-            IpeResult::Ok(v) => assert!(v.is_empty(), "expected 0 applied on re-run, got {v:?}"),
-            IpeResult::Err(e) => panic!("idempotent re-run: {e}"),
-        }
-
-        // Ledger recorded exactly the two migrations.
-        let ledger: IpeResult<String, Vec<RowCells>> = db_query(
-            db.clone(),
-            "SELECT name, checksum FROM _ipe_migrations ORDER BY name".to_string(),
-            Vec::new(),
-        )
-        .await;
-        match ledger {
-            IpeResult::Ok(rows) => assert_eq!(rows.len(), 2, "ledger rows: {rows:?}"),
-            IpeResult::Err(e) => panic!("read ledger: {e}"),
-        }
-
-        // Drift: same name, edited SQL → checksum-mismatch error, nothing applied.
-        let drift = vec![(
-            "001_users".to_string(),
-            "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, name TEXT)".to_string(),
-        )];
-        let r3: IpeResult<String, Vec<String>> = db_migrate_apply(db.clone(), drift).await;
-        match r3 {
-            IpeResult::Err(e) => assert!(
-                e.contains("checksum mismatch"),
-                "expected drift error, got: {e}"
-            ),
-            IpeResult::Ok(v) => panic!("expected drift error, but applied {v:?}"),
-        }
-
-        // Adding a NEW migration after the applied ones resumes — only it applies.
-        let mut extended = base.clone();
-        extended.push((
-            "003_posts".to_string(),
-            "CREATE TABLE posts (id INTEGER PRIMARY KEY)".to_string(),
-        ));
-        let r4: IpeResult<String, Vec<String>> = db_migrate_apply(db.clone(), extended).await;
-        match r4 {
-            IpeResult::Ok(v) => assert_eq!(v, vec!["003_posts".to_string()]),
-            IpeResult::Err(e) => panic!("resume migrate: {e}"),
-        }
-    }
-
     // ─── Rename-migration data-preservation tests ─────────────────────────────
     //
     // These tests drive `db_migrate_apply` directly with the DDL that
     // `Store.migrations` / `Store.renameColumn` / `Store.renameTable` produce,
     // proving the ledger correctly applies and skips each rename entry.
-
-    /// Column rename preserves existing row data and makes rows readable under
-    /// the new column name.
-    #[tokio::test]
-    async fn rename_column_preserves_data() {
-        let db = new_single_conn_db().await;
-        // Matches what Store.migrations produces for a users store with
-        // renameColumn "name" "full_name".
-        let migrations = vec![
-            (
-                "create_users".to_string(),
-                "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT, age INTEGER)"
-                    .to_string(),
-            ),
-            (
-                "rename_column_users_name_to_full_name".to_string(),
-                "ALTER TABLE users RENAME COLUMN name TO full_name".to_string(),
-            ),
-        ];
-
-        // First apply: both entries run.
-        let r1: IpeResult<String, Vec<String>> =
-            db_migrate_apply(db.clone(), migrations.clone()).await;
-        match r1 {
-            IpeResult::Ok(v) => assert_eq!(
-                v,
-                vec![
-                    "create_users".to_string(),
-                    "rename_column_users_name_to_full_name".to_string()
-                ]
-            ),
-            IpeResult::Err(e) => panic!("first apply: {e}"),
-        }
-
-        // Insert a row using the POST-rename column name.
-        let ins: IpeResult<String, i64> = db_exec(
-            db.clone(),
-            "INSERT INTO users (id, full_name, age) VALUES ('u1', 'Alice', 30)".to_string(),
-            Vec::new(),
-        )
-        .await;
-        assert!(matches!(ins, IpeResult::Ok(1)), "insert: {ins:?}");
-
-        // Row is readable under full_name; the old `name` column is absent.
-        let rows: IpeResult<String, Vec<RowCells>> = db_query(
-            db.clone(),
-            "SELECT full_name, age FROM users WHERE id = 'u1'".to_string(),
-            Vec::new(),
-        )
-        .await;
-        match rows {
-            IpeResult::Ok(v) => {
-                assert_eq!(v.len(), 1, "expected 1 row, got {}", v.len());
-                assert_eq!(
-                    v.first().and_then(|r| r.text("full_name")),
-                    Some("Alice"),
-                    "full_name should be Alice"
-                );
-            }
-            IpeResult::Err(e) => panic!("read after rename: {e}"),
-        }
-
-        // `name` column is gone — selecting it is an error.
-        let bad: IpeResult<String, Vec<RowCells>> =
-            db_query(db.clone(), "SELECT name FROM users".to_string(), Vec::new()).await;
-        assert!(
-            matches!(bad, IpeResult::Err(_)),
-            "selecting the old column name must fail after rename"
-        );
-    }
-
-    /// Re-applying the same migration list is idempotent — no error, no
-    /// re-issue of the rename, data unchanged.
-    #[tokio::test]
-    async fn rename_column_idempotent_rerun() {
-        let db = new_single_conn_db().await;
-        let migrations = vec![
-            (
-                "create_users".to_string(),
-                "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT)".to_string(),
-            ),
-            (
-                "rename_column_users_name_to_full_name".to_string(),
-                "ALTER TABLE users RENAME COLUMN name TO full_name".to_string(),
-            ),
-        ];
-
-        // First apply.
-        let r1: IpeResult<String, Vec<String>> =
-            db_migrate_apply(db.clone(), migrations.clone()).await;
-        assert!(matches!(r1, IpeResult::Ok(_)), "first apply: {r1:?}");
-
-        // Insert after first apply.
-        let ins: IpeResult<String, i64> = db_exec(
-            db.clone(),
-            "INSERT INTO users (id, full_name) VALUES ('u1', 'Bob')".to_string(),
-            Vec::new(),
-        )
-        .await;
-        assert!(matches!(ins, IpeResult::Ok(1)), "insert: {ins:?}");
-
-        // Re-apply: both entries already in ledger → 0 applied.
-        let r2: IpeResult<String, Vec<String>> =
-            db_migrate_apply(db.clone(), migrations.clone()).await;
-        match r2 {
-            IpeResult::Ok(v) => assert!(v.is_empty(), "expected 0 on re-run, got {v:?}"),
-            IpeResult::Err(e) => panic!("re-run: {e}"),
-        }
-
-        // Data unchanged.
-        let rows: IpeResult<String, Vec<RowCells>> = db_query(
-            db.clone(),
-            "SELECT full_name FROM users WHERE id = 'u1'".to_string(),
-            Vec::new(),
-        )
-        .await;
-        match rows {
-            IpeResult::Ok(v) => assert_eq!(
-                v.first().and_then(|r| r.text("full_name")),
-                Some("Bob"),
-                "data unchanged after re-run"
-            ),
-            IpeResult::Err(e) => panic!("read after re-run: {e}"),
-        }
-    }
-
-    /// Applying the same list to a fresh (empty) database converges to the
-    /// same final schema — rows inserted afterward read back under the new name.
-    #[tokio::test]
-    async fn rename_column_fresh_db_convergence() {
-        let db = new_single_conn_db().await;
-        let migrations = vec![
-            (
-                "create_users".to_string(),
-                "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT)".to_string(),
-            ),
-            (
-                "rename_column_users_name_to_full_name".to_string(),
-                "ALTER TABLE users RENAME COLUMN name TO full_name".to_string(),
-            ),
-        ];
-
-        // Apply to a completely empty DB — both entries run.
-        let r: IpeResult<String, Vec<String>> = db_migrate_apply(db.clone(), migrations).await;
-        match r {
-            IpeResult::Ok(v) => assert_eq!(v.len(), 2, "expected 2 applied, got {v:?}"),
-            IpeResult::Err(e) => panic!("fresh-db apply: {e}"),
-        }
-
-        // Insert using the new name.
-        let ins: IpeResult<String, i64> = db_exec(
-            db.clone(),
-            "INSERT INTO users (id, full_name) VALUES ('u2', 'Carol')".to_string(),
-            Vec::new(),
-        )
-        .await;
-        assert!(matches!(ins, IpeResult::Ok(1)), "fresh-db insert: {ins:?}");
-
-        let rows: IpeResult<String, Vec<RowCells>> = db_query(
-            db.clone(),
-            "SELECT full_name FROM users WHERE id = 'u2'".to_string(),
-            Vec::new(),
-        )
-        .await;
-        match rows {
-            IpeResult::Ok(v) => assert_eq!(
-                v.first().and_then(|r| r.text("full_name")),
-                Some("Carol"),
-                "fresh-db convergence"
-            ),
-            IpeResult::Err(e) => panic!("fresh-db read: {e}"),
-        }
-    }
-
-    /// Table rename preserves all row data and makes the table accessible
-    /// under the new name.
-    #[tokio::test]
-    async fn rename_table_preserves_data() {
-        let db = new_single_conn_db().await;
-        // Matches what Store.migrations produces for renameTable "accounts".
-        let migrations = vec![
-            (
-                "create_users".to_string(),
-                "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT)".to_string(),
-            ),
-            (
-                "rename_table_users_to_accounts".to_string(),
-                "ALTER TABLE users RENAME TO accounts".to_string(),
-            ),
-        ];
-
-        let r1: IpeResult<String, Vec<String>> =
-            db_migrate_apply(db.clone(), migrations.clone()).await;
-        assert!(matches!(r1, IpeResult::Ok(_)), "first apply: {r1:?}");
-
-        // Insert under the new table name.
-        let ins: IpeResult<String, i64> = db_exec(
-            db.clone(),
-            "INSERT INTO accounts (id, email) VALUES ('a1', 'dave@example.com')".to_string(),
-            Vec::new(),
-        )
-        .await;
-        assert!(
-            matches!(ins, IpeResult::Ok(1)),
-            "table-rename insert: {ins:?}"
-        );
-
-        let rows: IpeResult<String, Vec<RowCells>> = db_query(
-            db.clone(),
-            "SELECT email FROM accounts WHERE id = 'a1'".to_string(),
-            Vec::new(),
-        )
-        .await;
-        match rows {
-            IpeResult::Ok(v) => assert_eq!(
-                v.first().and_then(|r| r.text("email")),
-                Some("dave@example.com"),
-                "row readable under new table name"
-            ),
-            IpeResult::Err(e) => panic!("read after table rename: {e}"),
-        }
-
-        // Old table name is gone.
-        let bad: IpeResult<String, Vec<RowCells>> =
-            db_query(db.clone(), "SELECT * FROM users".to_string(), Vec::new()).await;
-        assert!(
-            matches!(bad, IpeResult::Err(_)),
-            "old table name must be absent after rename"
-        );
-
-        // Re-apply is idempotent.
-        let r2: IpeResult<String, Vec<String>> = db_migrate_apply(db.clone(), migrations).await;
-        match r2 {
-            IpeResult::Ok(v) => assert!(v.is_empty(), "expected 0 on re-run, got {v:?}"),
-            IpeResult::Err(e) => panic!("table-rename re-run: {e}"),
-        }
-    }
-
-    /// A column rename whose `from` is absent in the schema returns a `Task Err`
-    /// and leaves the ledger unadvanced.
-    #[tokio::test]
-    async fn rename_column_missing_from_fails_closed() {
-        let db = new_single_conn_db().await;
-        // Create a table without a `name` column, then try to rename it.
-        let r_create: IpeResult<String, Vec<String>> = db_migrate_apply(
-            db.clone(),
-            vec![(
-                "create_users".to_string(),
-                "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT)".to_string(),
-            )],
-        )
-        .await;
-        assert!(matches!(r_create, IpeResult::Ok(_)), "create: {r_create:?}");
-
-        // Ledger row count before the failing rename.
-        let before: IpeResult<String, Vec<RowCells>> = db_query(
-            db.clone(),
-            "SELECT name FROM _ipe_migrations ORDER BY name".to_string(),
-            Vec::new(),
-        )
-        .await;
-        let before_count = match before {
-            IpeResult::Ok(v) => v.len(),
-            IpeResult::Err(e) => panic!("ledger read before: {e}"),
-        };
-
-        // Rename a column that does not exist — must error.
-        let r_rename: IpeResult<String, Vec<String>> = db_migrate_apply(
-            db.clone(),
-            vec![
-                (
-                    "create_users".to_string(),
-                    "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT)"
-                        .to_string(),
-                ),
-                (
-                    "rename_column_users_name_to_full_name".to_string(),
-                    "ALTER TABLE users RENAME COLUMN name TO full_name".to_string(),
-                ),
-            ],
-        )
-        .await;
-        assert!(
-            matches!(r_rename, IpeResult::Err(_)),
-            "renaming absent column must return Err"
-        );
-
-        // Ledger must be unadvanced — the failing rename entry was not recorded.
-        let after: IpeResult<String, Vec<RowCells>> = db_query(
-            db.clone(),
-            "SELECT name FROM _ipe_migrations ORDER BY name".to_string(),
-            Vec::new(),
-        )
-        .await;
-        let after_count = match after {
-            IpeResult::Ok(v) => v.len(),
-            IpeResult::Err(e) => panic!("ledger read after: {e}"),
-        };
-        assert_eq!(
-            before_count, after_count,
-            "ledger must be unadvanced after a failing rename"
-        );
-    }
-
-    /// Helper: a single-connection in-memory SQLite pool (no pre-seeded todos
-    /// table — callers control the full schema).
-    async fn new_single_conn_db() -> Db {
-        #[allow(clippy::expect_used)]
-        sqlx::sqlite::SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("connect in-memory sqlite for rename tests")
-    }
-
-    #[tokio::test]
-    async fn exec_query_params_bind_mixed_sqlvalue_types() {
-        // db_exec_params / db_query_params bind the full SqlParam range (the
-        //  mixed-type path) — Text/Int/Bool/Float/Null — and
-        // round-trip through a SqlValue-param WHERE. `with_default` extracts the
-        // Ok value (a wrong/Err result then fails the following assert).
-        let db = fresh_db().await;
-        // exec/unsafeExecRaw now return rows-affected (i64). DDL rows-affected is
-        // driver-defined → assert Ok(_); each INSERT affects exactly 1 row.
-        let mk: IpeResult<String, i64> = db_exec_raw(
-            db.clone(),
-            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER, \
-             active INTEGER, price REAL)"
-                .to_string(),
-        )
-        .await;
-        assert!(matches!(mk, IpeResult::Ok(_)), "create: {mk:?}");
-
-        let ins: IpeResult<String, i64> = db_exec_params(
-            db.clone(),
-            "INSERT INTO items (name, qty, active, price) VALUES (?, ?, ?, ?)".to_string(),
-            vec![
-                SqlParam::Text("widget".to_string()),
-                SqlParam::Int(7),
-                SqlParam::Bool(true),
-                SqlParam::Float(9.99),
-            ],
-        )
-        .await;
-        assert!(matches!(ins, IpeResult::Ok(1)), "mixed insert: {ins:?}");
-
-        // A row with typed NULLs (SqlNull carries a type witness so the
-        // NULL binds with the right driver type-OID — see SqlParam::Null's
-        // doc comment). `name` is TEXT, `price` is REAL: witness each with
-        // the matching leaf variant.
-        let ins2: IpeResult<String, i64> = db_exec_params(
-            db.clone(),
-            "INSERT INTO items (name, qty, active, price) VALUES (?, ?, ?, ?)".to_string(),
-            vec![
-                SqlParam::Null(Box::new(SqlParam::Text(String::new()))),
-                SqlParam::Int(0),
-                SqlParam::Bool(false),
-                SqlParam::Null(Box::new(SqlParam::Float(0.0))),
-            ],
-        )
-        .await;
-        assert!(matches!(ins2, IpeResult::Ok(1)), "null insert: {ins2:?}");
-
-        // SELECT with an Int SqlValue param.
-        let rows: IpeResult<String, Vec<RowCells>> = db_query_params(
-            db.clone(),
-            "SELECT name, qty FROM items WHERE qty = ?".to_string(),
-            vec![SqlParam::Int(7)],
-        )
-        .await;
-        let rs = rows.with_default(Vec::new());
-        assert_eq!(rs.len(), 1, "expected exactly 1 matching row, got {rs:?}");
-        if let Some(r) = rs.first() {
-            assert_eq!(r.text("name"), Some("widget"));
-            assert_eq!(r.text("qty"), Some("7"));
-        }
-    }
-
-    #[tokio::test]
-    async fn test_insert_get_by_id() {
-        let db = fresh_db().await;
-        let mut row = HashMap::new();
-        row.insert("title".to_string(), "buy milk".to_string());
-        row.insert("done".to_string(), "0".to_string());
-        let id: IpeResult<String, i64> = db_insert_row(db.clone(), "todos".into(), row).await;
-        let id = match id {
-            IpeResult::Ok(v) => v,
-            IpeResult::Err(e) => panic!("{}", e),
-        };
-        assert!(id > 0);
-
-        let fetched: IpeResult<String, IpeMaybe<RowCells>> =
-            db_get_by_id(db, "todos".into(), id.to_string()).await;
-        match fetched {
-            IpeResult::Ok(IpeMaybe::Just(m)) => assert_eq!(m.text("title"), Some("buy milk")),
-            other => panic!("unexpected: {:?}", other),
-        }
-    }
-
-    /// Tier-1 regression for the `db_insert_row`/`db_insert_fields`
-    /// fabricated-`id = 0` fix (Class 7 §4b). `DB_USES_RETURNING_ID` is
-    /// `false` on the standalone sqlite build, so `extract_returning_id` is
-    /// called directly here — bypassing the `if DB_USES_RETURNING_ID` gate —
-    /// against a REAL SQLite `RETURNING id` row with a non-integer (`TEXT`)
-    /// PK. This exercises the exact decode-miss path without needing a live
-    /// Postgres (`DB_USES_RETURNING_ID = true` is only reachable once the §3
-    /// Postgres driver template is selected by a real project build).
-    #[tokio::test]
-    async fn extract_returning_id_errs_on_non_integer_pk() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("connect in-memory sqlite");
-        sqlx::query("CREATE TABLE t (id TEXT PRIMARY KEY)")
-            .execute(&pool)
-            .await
-            .expect("create table");
-        let row = fetch_one_routed(
-            &pool,
-            sqlx::query("INSERT INTO t (id) VALUES ('non-integer-pk') RETURNING id"),
-        )
-        .await
-        .expect("insert should succeed");
-        assert!(
-            extract_returning_id(&row).is_err(),
-            "a non-integer id column must surface Err, never a fabricated 0"
-        );
-    }
-
-    #[tokio::test]
-    async fn extract_returning_id_ok_on_integer_pk() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("connect in-memory sqlite");
-        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY)")
-            .execute(&pool)
-            .await
-            .expect("create table");
-        let row = fetch_one_routed(
-            &pool,
-            sqlx::query("INSERT INTO t (id) VALUES (42) RETURNING id"),
-        )
-        .await
-        .expect("insert should succeed");
-        assert_eq!(extract_returning_id(&row), Ok(42));
-    }
-
-    #[tokio::test]
-    async fn test_update_by_id() {
-        let db = fresh_db().await;
-        let mut row = HashMap::new();
-        row.insert("title".to_string(), "x".to_string());
-        let id: IpeResult<String, i64> = db_insert_row(db.clone(), "todos".into(), row).await;
-        let id = match id {
-            IpeResult::Ok(v) => v,
-            _ => panic!("insert"),
-        };
-
-        let mut updates = HashMap::new();
-        updates.insert("title".to_string(), "y".to_string());
-        let affected: IpeResult<String, i64> =
-            db_update_by_id(db.clone(), "todos".into(), id.to_string(), updates).await;
-        assert!(matches!(affected, IpeResult::Ok(1)));
-    }
-
-    #[tokio::test]
-    async fn test_delete_by_id() {
-        let db = fresh_db().await;
-        let mut row = HashMap::new();
-        row.insert("title".to_string(), "z".to_string());
-        let id: IpeResult<String, i64> = db_insert_row(db.clone(), "todos".into(), row).await;
-        let id = match id {
-            IpeResult::Ok(v) => v,
-            _ => panic!("insert"),
-        };
-        let affected: IpeResult<String, i64> =
-            db_delete_by_id(db, "todos".into(), id.to_string()).await;
-        assert!(matches!(affected, IpeResult::Ok(1)));
-    }
-
-    fn where_eq_title(v: &str) -> SqlFragment {
-        SqlFragment {
-            sql: "title = ?".to_string(),
-            binds: vec![SqlParam::Text(v.to_string())],
-            invalid: None,
-        }
-    }
-
-    async fn insert_title(db: &Db, title: &str) {
-        let mut row = HashMap::new();
-        row.insert("title".to_string(), title.to_string());
-        let r: IpeResult<String, i64> = db_insert_row(db.clone(), "todos".into(), row).await;
-        assert!(
-            matches!(r, IpeResult::Ok(_)),
-            "insert {title} failed: {r:?}"
-        );
-    }
-
-    async fn count_title(db: &Db, title: &str) -> usize {
-        let rs: IpeResult<String, Vec<RowCells>> = db_find_many_by_field(
-            db.clone(),
-            "todos".into(),
-            "title".into(),
-            title.to_string(),
-        )
-        .await;
-        match rs {
-            IpeResult::Ok(v) => v.len(),
-            IpeResult::Err(e) => panic!("count {title}: {e}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn db_delete_where_deletes_only_matching_rows() {
-        let db = fresh_db().await;
-        insert_title(&db, "a").await;
-        insert_title(&db, "b").await;
-        let affected: IpeResult<String, i64> =
-            db_delete_where(db.clone(), "todos".into(), where_eq_title("a")).await;
-        assert!(
-            matches!(affected, IpeResult::Ok(1)),
-            "expected 1 deleted, got {affected:?}"
-        );
-        assert_eq!(count_title(&db, "a").await, 0, "matching row must be gone");
-        assert_eq!(
-            count_title(&db, "b").await,
-            1,
-            "non-matching row must remain"
-        );
-    }
-
-    #[tokio::test]
-    async fn db_delete_where_refuses_empty_where_and_preserves_all_rows() {
-        let db = fresh_db().await;
-        insert_title(&db, "a").await;
-        insert_title(&db, "b").await;
-        let frag = SqlFragment {
-            sql: String::new(),
-            binds: vec![],
-            invalid: None,
-        };
-        let affected: IpeResult<String, i64> =
-            db_delete_where(db.clone(), "todos".into(), frag).await;
-        assert!(
-            matches!(affected, IpeResult::Err(_)),
-            "an empty WHERE must be refused, got {affected:?}"
-        );
-        assert_eq!(
-            count_title(&db, "a").await,
-            1,
-            "a refused mass-delete must delete nothing"
-        );
-        assert_eq!(count_title(&db, "b").await, 1);
-    }
-
-    #[tokio::test]
-    async fn db_update_where_updates_only_matching_rows() {
-        let db = fresh_db().await;
-        insert_title(&db, "a").await;
-        insert_title(&db, "b").await;
-        let set = vec![("title".to_string(), Some(SqlParam::Text("A2".to_string())))];
-        let affected: IpeResult<String, i64> =
-            db_update_where(db.clone(), "todos".into(), set, where_eq_title("a")).await;
-        assert!(
-            matches!(affected, IpeResult::Ok(1)),
-            "expected 1 updated, got {affected:?}"
-        );
-        assert_eq!(
-            count_title(&db, "A2").await,
-            1,
-            "matching row must be updated"
-        );
-        assert_eq!(count_title(&db, "b").await, 1, "non-matching row unchanged");
-    }
-
-    #[tokio::test]
-    async fn db_update_where_refuses_whitespace_where_and_changes_nothing() {
-        let db = fresh_db().await;
-        insert_title(&db, "a").await;
-        let set = vec![(
-            "title".to_string(),
-            Some(SqlParam::Text("mutated".to_string())),
-        )];
-        let frag = SqlFragment {
-            sql: "   ".to_string(),
-            binds: vec![],
-            invalid: None,
-        };
-        let affected: IpeResult<String, i64> =
-            db_update_where(db.clone(), "todos".into(), set, frag).await;
-        assert!(
-            matches!(affected, IpeResult::Err(_)),
-            "a whitespace-only WHERE must be refused, got {affected:?}"
-        );
-        assert_eq!(count_title(&db, "a").await, 1, "original row untouched");
-        assert_eq!(
-            count_title(&db, "mutated").await,
-            0,
-            "no mass-update may occur"
-        );
-    }
 
     /// A hand-built fragment with no poison marker.
     fn checked_frag(sql: &str, binds: Vec<SqlParam>) -> SqlFragment {
@@ -9164,359 +8227,6 @@ mod tests {
         }
     }
 
-    /// A checked insert of `title` under the check `check_sql`.
-    async fn checked_insert_title(db: &Db, title: &str, check_sql: &str) -> IpeResult<String, i64> {
-        db_insert_fields_checked(
-            db.clone(),
-            "todos".into(),
-            vec![("title".to_string(), Some(text(title)))],
-            checked_frag(check_sql, vec![]),
-        )
-        .await
-    }
-
-    /// Only a check returning `1` keeps the row; `0`, `NULL`, any other integer
-    /// (`2`, `-1`: a SQLite `bool` decode would read them as `true`), a real,
-    /// and a value that does not decode as a boolean or integer (`'yes'`) each
-    /// roll it back.
-    #[tokio::test]
-    async fn checked_insert_keeps_only_an_admitted_row() {
-        let db = fresh_db().await;
-        let cases = [
-            ("kept", "1", 1i64),
-            ("zero", "0", 0),
-            ("null", "NULL", 0),
-            ("two", "2", 0),
-            ("minus", "-1", 0),
-            ("real", "1.0", 0),
-            ("text", "'yes'", 0),
-        ];
-        for (title, check, want) in cases {
-            let got = checked_insert_title(&db, title, check).await;
-            assert!(
-                matches!(got, IpeResult::Ok(n) if n == want),
-                "check {check}: expected Ok({want}), got {got:?}"
-            );
-            let stored = count_title(&db, title).await;
-            assert_eq!(
-                i64::try_from(stored).ok(),
-                Some(want),
-                "check {check}: the stored row count must equal the returned count"
-            );
-        }
-    }
-
-    /// The checked update keeps a write only when the row satisfies the check
-    /// after the write; a WHERE that matches nothing writes nothing.
-    #[tokio::test]
-    async fn checked_update_rolls_back_a_refused_row() {
-        let db = fresh_db().await;
-        insert_title(&db, "a").await;
-        let update = |to: &str, check_value: &str| {
-            db_update_where_checked::<String>(
-                db.clone(),
-                "todos".into(),
-                vec![("title".to_string(), Some(text(to)))],
-                where_eq_title("a"),
-                checked_frag("title = ?", vec![text(check_value)]),
-            )
-        };
-        let refused = update("b", "c").await;
-        assert!(
-            matches!(refused, IpeResult::Ok(0)),
-            "a row failing the check after the write must give 0, got {refused:?}"
-        );
-        assert_eq!(
-            count_title(&db, "a").await,
-            1,
-            "the refused update rolled back"
-        );
-        assert_eq!(
-            count_title(&db, "b").await,
-            0,
-            "the refused value is not stored"
-        );
-        let kept = update("b", "b").await;
-        assert!(
-            matches!(kept, IpeResult::Ok(1)),
-            "a row satisfying the check after the write must give 1, got {kept:?}"
-        );
-        assert_eq!(
-            count_title(&db, "b").await,
-            1,
-            "the admitted update is stored"
-        );
-        let unmatched = update("z", "z").await;
-        assert!(
-            matches!(unmatched, IpeResult::Ok(0)),
-            "a WHERE matching no row must give 0, got {unmatched:?}"
-        );
-        assert_eq!(count_title(&db, "z").await, 0);
-    }
-
-    /// A correlated `EXISTS` over another table, naming the written row as
-    /// `<table>.<col>`, is evaluated in the `RETURNING` check.
-    #[tokio::test]
-    async fn checked_insert_evaluates_a_correlated_subquery() {
-        let db = fresh_db().await;
-        let created: IpeResult<String, i64> = db_exec(
-            db.clone(),
-            "CREATE TABLE shares (doc_title TEXT NOT NULL)".into(),
-            vec![],
-        )
-        .await;
-        assert!(
-            matches!(created, IpeResult::Ok(_)),
-            "create shares: {created:?}"
-        );
-        let check = "EXISTS (SELECT 1 FROM shares WHERE shares.doc_title = todos.title)";
-        let unshared = checked_insert_title(&db, "y", check).await;
-        assert!(
-            matches!(unshared, IpeResult::Ok(0)),
-            "without a share the insert must give 0, got {unshared:?}"
-        );
-        assert_eq!(count_title(&db, "y").await, 0);
-        let shared: IpeResult<String, i64> = db_exec(
-            db.clone(),
-            "INSERT INTO shares (doc_title) VALUES (?)".into(),
-            vec!["y".to_string()],
-        )
-        .await;
-        assert!(
-            matches!(shared, IpeResult::Ok(_)),
-            "insert share: {shared:?}"
-        );
-        let admitted = checked_insert_title(&db, "y", check).await;
-        assert!(
-            matches!(admitted, IpeResult::Ok(1)),
-            "with a share the insert must give 1, got {admitted:?}"
-        );
-        assert_eq!(count_title(&db, "y").await, 1);
-    }
-
-    /// A refused checked write inside a transaction rolls back only its own
-    /// savepoint: later writes in the same transaction still commit.
-    #[tokio::test]
-    #[allow(clippy::expect_used)] // test: the recording transaction is solely owned once its scope ends
-    async fn checked_write_savepoint_leaves_the_outer_transaction_usable() {
-        let db = fresh_db().await;
-        let rec = recording_txn(&db).await;
-        let (refused, admitted, plain) = with_recording_txn(&db, rec.clone(), async {
-            let refused = checked_insert_title(&db, "refused", "0").await;
-            let admitted = checked_insert_title(&db, "admitted", "1").await;
-            let plain: IpeResult<String, i64> = db_insert_fields(
-                db.clone(),
-                "todos".into(),
-                vec![("title".to_string(), Some(text("plain")))],
-            )
-            .await;
-            (refused, admitted, plain)
-        })
-        .await;
-        assert!(matches!(refused, IpeResult::Ok(0)), "refused: {refused:?}");
-        assert!(
-            matches!(admitted, IpeResult::Ok(1)),
-            "admitted: {admitted:?}"
-        );
-        assert!(matches!(plain, IpeResult::Ok(_)), "plain: {plain:?}");
-        let tx = std::sync::Arc::try_unwrap(rec)
-            .expect("the scope released its clone")
-            .into_inner();
-        tx.commit().await.expect("commit the outer transaction");
-        assert_eq!(
-            count_title(&db, "refused").await,
-            0,
-            "the refused row rolled back"
-        );
-        assert_eq!(
-            count_title(&db, "admitted").await,
-            1,
-            "the admitted row committed"
-        );
-        assert_eq!(
-            count_title(&db, "plain").await,
-            1,
-            "the later plain insert committed"
-        );
-    }
-
-    /// A checked write whose statement fails inside a transaction rolls back
-    /// its own savepoint and reports the error; the transaction stays usable
-    /// and a later write in it commits.
-    #[tokio::test]
-    #[allow(clippy::expect_used)] // test: the recording transaction is solely owned once its scope ends
-    async fn checked_write_error_leaves_the_outer_transaction_usable() {
-        let db = fresh_db().await;
-        let rec = recording_txn(&db).await;
-        let (failed, plain) = with_recording_txn(&db, rec.clone(), async {
-            // `title` is `NOT NULL` and omitted: the insert itself fails.
-            let failed: IpeResult<String, i64> = db_insert_fields_checked(
-                db.clone(),
-                "todos".into(),
-                vec![("done".to_string(), Some(SqlParam::Int(1)))],
-                checked_frag("1", vec![]),
-            )
-            .await;
-            let plain: IpeResult<String, i64> = db_insert_fields(
-                db.clone(),
-                "todos".into(),
-                vec![("title".to_string(), Some(text("after")))],
-            )
-            .await;
-            (failed, plain)
-        })
-        .await;
-        assert!(matches!(failed, IpeResult::Err(_)), "failed: {failed:?}");
-        assert!(matches!(plain, IpeResult::Ok(_)), "plain: {plain:?}");
-        let tx = std::sync::Arc::try_unwrap(rec)
-            .expect("the scope released its clone")
-            .into_inner();
-        tx.commit().await.expect("commit the outer transaction");
-        assert_eq!(
-            count_title(&db, "after").await,
-            1,
-            "the later plain insert committed"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_find_one_by_field() {
-        let db = fresh_db().await;
-        let mut row = HashMap::new();
-        row.insert("title".to_string(), "find me".to_string());
-        let _: IpeResult<String, i64> = db_insert_row(db.clone(), "todos".into(), row).await;
-        let found: IpeResult<String, IpeMaybe<RowCells>> =
-            db_find_one_by_field(db, "todos".into(), "title".into(), "find me".into()).await;
-        assert!(matches!(found, IpeResult::Ok(IpeMaybe::Just(_))));
-    }
-
-    #[tokio::test]
-    async fn test_find_many_and_by_conditions() {
-        let db = fresh_db().await;
-        for t in ["a", "b", "c"] {
-            let mut r = HashMap::new();
-            r.insert("title".to_string(), t.to_string());
-            r.insert("done".to_string(), "1".to_string());
-            let _: IpeResult<String, i64> = db_insert_row(db.clone(), "todos".into(), r).await;
-        }
-        let many: IpeResult<String, Vec<RowCells>> =
-            db_find_many_by_field(db.clone(), "todos".into(), "done".into(), "1".into()).await;
-        match many {
-            IpeResult::Ok(v) => assert_eq!(v.len(), 3),
-            _ => panic!("find many"),
-        }
-
-        let mut cond = HashMap::new();
-        cond.insert("done".to_string(), "1".to_string());
-        cond.insert("title".to_string(), "b".to_string());
-        let one: IpeResult<String, Vec<RowCells>> =
-            db_find_by_conditions(db.clone(), "todos".into(), cond).await;
-        match one {
-            IpeResult::Ok(v) => assert_eq!(v.len(), 1),
-            _ => panic!("conds"),
-        }
-
-        // Empty condition set MUST be refused (would otherwise return every
-        // row — a cross-tenant read when request-derived filters come back empty).
-        let empty_cond: HashMap<String, String> = HashMap::new();
-        let refused: IpeResult<String, Vec<RowCells>> =
-            db_find_by_conditions(db.clone(), "todos".into(), empty_cond).await;
-        assert!(
-            matches!(refused, IpeResult::Err(_)),
-            "empty conditions must be refused, got {refused:?}"
-        );
-
-        // Non-empty conditions still return filtered rows (happy-path regression).
-        let mut only_done = HashMap::new();
-        only_done.insert("done".to_string(), "1".to_string());
-        let filtered: IpeResult<String, Vec<RowCells>> =
-            db_find_by_conditions(db, "todos".into(), only_done).await;
-        match filtered {
-            IpeResult::Ok(v) => assert_eq!(v.len(), 3, "expected 3 done rows"),
-            _ => panic!("non-empty conditions should return rows"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_with_transaction_commit() {
-        let db = fresh_db().await;
-        let r: IpeResult<String, i64> = db_with_transaction(db.clone(), |c| {
-            Box::pin(async move {
-                let mut row = HashMap::new();
-                row.insert("title".to_string(), "txn".to_string());
-                db_insert_row(c, "todos".into(), row).await
-            })
-        })
-        .await;
-        assert!(matches!(r, IpeResult::Ok(_)));
-        // The inserted row should be visible after commit:
-        let found: IpeResult<String, Vec<RowCells>> =
-            db_find_many_by_field(db, "todos".into(), "title".into(), "txn".into()).await;
-        match found {
-            IpeResult::Ok(v) => assert_eq!(v.len(), 1),
-            _ => panic!("post-commit fetch"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_with_transaction_rollback_returns_err() {
-        // Err propagates AND the write is actually undone. With the task-local
-        // dedicated-connection routing, BEGIN / INSERT / ROLLBACK all run on the
-        // same connection, so the row is gone after rollback (single-conn pool).
-        let db = fresh_db().await;
-        let r: IpeResult<String, i64> = db_with_transaction(db.clone(), |c| {
-            Box::pin(async move {
-                let mut row = HashMap::new();
-                row.insert("title".to_string(), "txn-err".to_string());
-                let _: IpeResult<String, i64> = db_insert_row(c, "todos".into(), row).await;
-                IpeResult::Err("boom".to_string())
-            })
-        })
-        .await;
-        assert!(matches!(r, IpeResult::Err(_)));
-        let found: IpeResult<String, Vec<RowCells>> =
-            db_find_many_by_field(db, "todos".into(), "title".into(), "txn-err".into()).await;
-        match found {
-            IpeResult::Ok(v) => assert_eq!(v.len(), 0, "rollback must undo the INSERT"),
-            _ => panic!("post-rollback fetch"),
-        }
-    }
-
-    // Build a FILE-based sqlite pool (temp file, NOT `:memory:` — in-memory
-    // sqlite is per-connection so it can't exhibit the cross-connection bug)
-    // with `max_connections > 1` and WAL. Returns (pool, tempdir-guard); the
-    // guard must outlive the pool so the file isn't deleted early.
-    async fn fresh_file_db(max_conns: u32) -> (Db, std::path::PathBuf) {
-        let mut path = crate::scratch_core::test_temp_root();
-        // Unique per test run to avoid cross-test contamination.
-        let unique = format!(
-            "ipe_txn_test_{}_{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
-        path.push(unique);
-        // Fresh file every time.
-        let _ = std::fs::remove_file(&path);
-        let url = format!("sqlite://{}?mode=rwc", path.display());
-        let options = url
-            .parse::<sqlx::sqlite::SqliteConnectOptions>()
-            .expect("parse file sqlite url")
-            .busy_timeout(SQLITE_BUSY_TIMEOUT);
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(max_conns)
-            .connect_with(options)
-            .await
-            .expect("connect file sqlite");
-        // WAL: concurrent readers alongside a single writer.
-        let _ = sqlx::query("PRAGMA journal_mode=WAL;").execute(&pool).await;
-        sqlx::query("CREATE TABLE todos (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0)")
-            .execute(&pool).await.expect("create table");
-        (pool, path)
-    }
-
     #[test]
     fn a_transaction_that_may_write_begins_immediate_on_sqlite_only() {
         assert_eq!(
@@ -9672,167 +8382,6 @@ mod tests {
         }
     }
 
-    /// Statements that fail at prepare time on a connection whose cached schema
-    /// predates another connection's DDL, before any schema-cookie check runs.
-    const STALE_SENSITIVE: [&str; 2] = [
-        "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
-        "ALTER TABLE t RENAME TO u",
-    ];
-
-    /// The checked-write shape of [`STALE_SENSITIVE`]: an insert into `v`, a
-    /// view in the stale schema and a table in the current one.
-    const STALE_CHECKED_INSERT: &str = "INSERT INTO v (x) VALUES (1) RETURNING (1)";
-
-    /// Connect options for a fresh rollback-journal temp SQLite file.
-    fn schema_test_file() -> (sqlx::sqlite::SqliteConnectOptions, std::path::PathBuf) {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut path = crate::scratch_core::test_temp_root();
-        path.push(format!(
-            "ipe_schema_test_{}_{n}_{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        let _ = std::fs::remove_file(&path);
-        let options = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(&path)
-            .create_if_missing(true)
-            .busy_timeout(SQLITE_BUSY_TIMEOUT);
-        (options, path)
-    }
-
-    /// A two-connection pool with no checkout hook.
-    async fn hookless_pool(options: sqlx::sqlite::SqliteConnectOptions) -> Db {
-        sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(2)
-            .connect_with(options)
-            .await
-            .expect("connect a hookless pool")
-    }
-
-    /// A two-connection pool built by the production [`vetted_pool_options`].
-    async fn vetted_test_pool(options: sqlx::sqlite::SqliteConnectOptions) -> Db {
-        vetted_pool_options::<sqlx::Sqlite>(2, SchemaCache::PerConnection)
-            .connect_with(options)
-            .await
-            .expect("connect a vetted pool")
-    }
-
-    /// Leaves `pool`'s idle connection B with a schema older than the file's.
-    ///
-    /// Connection A creates `t`, `u`, trigger `tr` and view `v`, B caches
-    /// that schema, then A drops `tr` and `u` and replaces view `v` with a
-    /// table. A is returned still held, so the pool, at its two-connection
-    /// cap, hands out B next.
-    async fn stale_schema_pair(pool: &Db) -> sqlx::pool::PoolConnection<sqlx::Sqlite> {
-        let mut a = pool.acquire().await.expect("acquire A");
-        let mut b = pool.acquire().await.expect("acquire B");
-        for ddl in [
-            "CREATE TABLE t (x)",
-            "CREATE TABLE u (x)",
-            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
-            "CREATE TABLE base (x)",
-            "CREATE VIEW v AS SELECT x FROM base",
-        ] {
-            sqlx::query(ddl).execute(&mut *a).await.expect(ddl);
-        }
-        let cached = sqlx::query("SELECT name FROM sqlite_master")
-            .fetch_all(&mut *b)
-            .await
-            .expect("B reads the schema");
-        assert_eq!(cached.len(), 5, "B cached every object");
-        for ddl in [
-            "DROP TRIGGER tr",
-            "DROP TABLE u",
-            "DROP VIEW v",
-            "CREATE TABLE v (x)",
-        ] {
-            sqlx::query(ddl).execute(&mut *a).await.expect(ddl);
-        }
-        drop(b);
-        a
-    }
-
-    /// The premise the schema refresh rests on: with no refresh, each
-    /// stale-sensitive statement fails on the connection that cached the
-    /// older schema, so the refresh tests below are not vacuous.
-    #[tokio::test]
-    async fn sqlite_caches_the_schema_per_connection() {
-        for statement in STALE_SENSITIVE.into_iter().chain([STALE_CHECKED_INSERT]) {
-            let (options, path) = schema_test_file();
-            let pool = hookless_pool(options).await;
-            let held = stale_schema_pair(&pool).await;
-            let ran = sqlx::query(statement).execute(&pool).await;
-            drop(held);
-            pool.close().await;
-            let _ = std::fs::remove_file(&path);
-            let failure = ran
-                .as_ref()
-                .err()
-                .map(|e| (classify_failure(DbEngine::Sqlite, e), e.to_string()));
-            assert!(
-                matches!(failure, Some((IpeDbFailure::InvalidStatement, _))),
-                "{statement} ran on the stale connection: {failure:?}"
-            );
-        }
-    }
-
-    /// An autocommit statement on a vetted pool compiles against the schema
-    /// another connection changed before the checkout.
-    #[tokio::test]
-    async fn a_pooled_connection_compiles_against_schema_another_connection_changed() {
-        for statement in STALE_SENSITIVE {
-            let (options, path) = schema_test_file();
-            let pool = vetted_test_pool(options).await;
-            let held = stale_schema_pair(&pool).await;
-            let ran: IpeResult<String, i64> = db_exec_raw(pool.clone(), statement.to_owned()).await;
-            drop(held);
-            pool.close().await;
-            let _ = std::fs::remove_file(&path);
-            assert!(matches!(ran, IpeResult::Ok(_)), "{statement}: {ran:?}");
-        }
-    }
-
-    /// A write transaction re-reads the schema once it holds the write lock,
-    /// even on a pool with no checkout hook.
-    #[tokio::test]
-    async fn a_write_transaction_compiles_against_schema_committed_before_its_lock() {
-        for statement in STALE_SENSITIVE {
-            let (options, path) = schema_test_file();
-            let pool = hookless_pool(options).await;
-            let held = stale_schema_pair(&pool).await;
-            let sql = statement.to_owned();
-            let ran: IpeResult<String, i64> =
-                db_with_transaction(pool.clone(), move |c| db_exec_raw(c, sql)).await;
-            drop(held);
-            pool.close().await;
-            let _ = std::fs::remove_file(&path);
-            assert!(matches!(ran, IpeResult::Ok(_)), "{statement}: {ran:?}");
-        }
-    }
-
-    /// A checked write on the pool begins through [`begin_write_txn`], so it
-    /// writes into the table that replaced a view the connection cached.
-    #[tokio::test]
-    async fn a_checked_write_on_the_pool_compiles_against_the_current_schema() {
-        let (options, path) = schema_test_file();
-        let pool = hookless_pool(options).await;
-        let held = stale_schema_pair(&pool).await;
-        let ran: IpeResult<String, i64> = db_insert_fields_checked(
-            pool.clone(),
-            "v".into(),
-            vec![("x".to_string(), Some(SqlParam::Int(1)))],
-            checked_frag("1", vec![]),
-        )
-        .await;
-        drop(held);
-        pool.close().await;
-        let _ = std::fs::remove_file(&path);
-        assert!(matches!(ran, IpeResult::Ok(1)), "{ran:?}");
-    }
-
     #[test]
     fn schema_cache_is_per_connection_on_sqlite_only() {
         assert_eq!(
@@ -9848,114 +8397,40 @@ mod tests {
         assert_eq!(KERNEL_SCHEMA_CACHE, SchemaCache::for_engine(KERNEL_ENGINE));
     }
 
-    /// A schema refresh the engine refuses is an error, never a pass: a probe
-    /// that cannot take its read lock reports `Busy`, and the same probe runs
-    /// once the lock is released.
-    #[tokio::test]
-    async fn a_failed_schema_refresh_is_an_error_not_a_pass() {
-        use sqlx::Connection as _;
-        let (options, path) = schema_test_file();
-        let mut holder = sqlx::sqlite::SqliteConnection::connect_with(&options)
-            .await
-            .expect("connect the lock holder");
-        sqlx::query("CREATE TABLE w (x)")
-            .execute(&mut holder)
-            .await
-            .expect("create w");
-        let mut waiter = sqlx::sqlite::SqliteConnection::connect_with(
-            &options.clone().busy_timeout(std::time::Duration::ZERO),
-        )
-        .await
-        .expect("connect the waiter");
-        sqlx::query("BEGIN EXCLUSIVE")
-            .execute(&mut holder)
-            .await
-            .expect("take the exclusive lock");
-        sqlx::query("INSERT INTO w (x) VALUES (1)")
-            .execute(&mut holder)
-            .await
-            .expect("write under the lock");
-        let refused =
-            refresh_schema_cache::<sqlx::Sqlite>(&mut waiter, SchemaCache::PerConnection).await;
-        let _ = sqlx::query("ROLLBACK").execute(&mut holder).await;
-        let control =
-            refresh_schema_cache::<sqlx::Sqlite>(&mut waiter, SchemaCache::PerConnection).await;
-        let _ = holder.close().await;
-        let _ = waiter.close().await;
-        let _ = std::fs::remove_file(&path);
-        let failure = refused
-            .as_ref()
-            .err()
-            .map(|e| classify_failure(DbEngine::Sqlite, e));
-        assert_eq!(failure, Some(IpeDbFailure::Busy), "{refused:?}");
-        assert!(control.is_ok(), "the probe runs once unlocked: {control:?}");
+    /// The production code of a source file: none when its prelude carries
+    /// `#![cfg(test)]`, else everything before its first `#[cfg(test)]` module.
+    fn production_part(source: &str) -> &str {
+        let test_only = source
+            .lines()
+            .take_while(|line| line.is_empty() || line.starts_with("//") || line.starts_with("#!"))
+            .any(|line| line == "#![cfg(test)]");
+        if test_only {
+            return "";
+        }
+        source
+            .split_once("\n#[cfg(test)]\nmod ")
+            .map_or(source, |(head, _)| head)
     }
 
-    /// A pooled connection whose checkout refresh fails is closed, never
-    /// handed out: the checkout is refused or yields a new connection.
-    #[tokio::test]
-    async fn a_pooled_connection_whose_refresh_fails_is_never_handed_out() {
-        use sqlx::Connection as _;
-        let (options, path) = schema_test_file();
-        let mut holder = sqlx::sqlite::SqliteConnection::connect_with(&options)
-            .await
-            .expect("connect the lock holder");
-        sqlx::query("CREATE TABLE w (x)")
-            .execute(&mut holder)
-            .await
-            .expect("create w");
-        let pool: Db = vetted_pool_options::<sqlx::Sqlite>(1, SchemaCache::PerConnection)
-            .acquire_timeout(std::time::Duration::from_millis(500))
-            .connect_with(options.clone().busy_timeout(std::time::Duration::ZERO))
-            .await
-            .expect("connect a one-connection vetted pool");
-        {
-            let mut marked = pool.acquire().await.expect("acquire the connection");
-            sqlx::query("CREATE TEMP TABLE marker (x)")
-                .execute(&mut *marked)
-                .await
-                .expect("mark the connection");
-        }
-        // Control: with no lock held, the refresh passes and the marked
-        // connection is handed out again.
-        let reused = {
-            let mut again = pool.acquire().await.expect("acquire it again");
-            sqlx::query("SELECT x FROM temp.marker")
-                .fetch_all(&mut *again)
-                .await
-                .map(|rows| rows.len())
-        };
-        sqlx::query("BEGIN EXCLUSIVE")
-            .execute(&mut holder)
-            .await
-            .expect("take the exclusive lock");
-        sqlx::query("INSERT INTO w (x) VALUES (1)")
-            .execute(&mut holder)
-            .await
-            .expect("write under the lock");
-        let handed = pool.acquire().await;
-        let _ = sqlx::query("ROLLBACK").execute(&mut holder).await;
-        let outcome = match handed {
-            Err(e) => format!("refused: {e}"),
-            Ok(mut conn) => match sqlx::query("SELECT x FROM temp.marker")
-                .fetch_all(&mut *conn)
-                .await
-            {
-                Ok(_) => "handed out the connection whose refresh failed".to_owned(),
-                Err(e) => format!("a new connection: {e}"),
-            },
-        };
-        pool.close().await;
-        let _ = holder.close().await;
-        let _ = std::fs::remove_file(&path);
-        assert!(
-            matches!(reused, Ok(0)),
-            "control: the idle connection is reused: {reused:?}"
+    /// A file is test-only exactly when its prelude says so: the attribute
+    /// after an item, or a cfg that is not plain `test`, leaves the file production.
+    #[test]
+    fn only_a_test_cfg_prelude_makes_a_file_test_only() {
+        let pool = "fn open() { let _ = PoolOptions::new(); }\n";
+        assert_eq!(
+            production_part(&format!("//! Fixtures.\n#![cfg(test)]\n\n{pool}")),
+            ""
         );
-        assert!(
-            outcome.starts_with("refused")
-                || (outcome.starts_with("a new connection") && outcome.contains("no such table")),
-            "{outcome}"
+        for source in [
+            format!("//! Fixtures.\n\n{pool}#![cfg(test)]\n"),
+            format!("#![cfg(not(test))]\n{pool}"),
+            format!("#![cfg(any(test, feature = \"db\"))]\n{pool}"),
+        ] {
+            assert!(production_part(&source).contains("PoolOptions"), "{source}");
+        }
+        assert_eq!(
+            production_part(&format!("{pool}\n#[cfg(test)]\nmod tests {{}}\n")),
+            pool
         );
     }
 
@@ -9987,10 +8462,7 @@ mod tests {
                     continue;
                 }
                 let source = std::fs::read_to_string(path.as_path()).expect("read a source file");
-                let production = source
-                    .split_once("\n#[cfg(test)]\nmod ")
-                    .map_or(source.as_str(), |(head, _)| head);
-                let code = production
+                let code = production_part(&source)
                     .lines()
                     .filter(|line| !line.trim_start().starts_with("//"))
                     .collect::<Vec<_>>()
@@ -10037,689 +8509,6 @@ mod tests {
         );
     }
 
-    /// A transaction that may write holds the SQLite write lock from its
-    /// `BEGIN`, before its body runs a statement: a second connection asking
-    /// for the write lock with no busy wait is refused.
-    #[tokio::test]
-    async fn a_write_transaction_holds_the_write_lock_from_begin() {
-        let (db, path) = fresh_file_db(1).await;
-        let options = format!("sqlite://{}", path.display())
-            .parse::<sqlx::sqlite::SqliteConnectOptions>()
-            .expect("parse file sqlite url")
-            .busy_timeout(std::time::Duration::ZERO);
-        let other = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("connect second pool");
-        let r: IpeResult<String, bool> = db_with_transaction(db.clone(), move |_c| {
-            Box::pin(async move {
-                let mut probe = other.acquire().await.expect("acquire probe");
-                let taken = sqlx::query("BEGIN IMMEDIATE").execute(&mut *probe).await;
-                if taken.is_ok() {
-                    let _ = sqlx::query("ROLLBACK").execute(&mut *probe).await;
-                }
-                IpeResult::Ok(taken.is_err())
-            })
-        })
-        .await;
-        db.close().await;
-        let _ = std::fs::remove_file(&path);
-        assert!(
-            matches!(r, IpeResult::Ok(true)),
-            "the probe took the write lock inside an open write transaction"
-        );
-    }
-
-    /// Two concurrent read-then-write transactions on one row both commit,
-    /// and the second sees the first's write: it waits at `BEGIN IMMEDIATE`
-    /// instead of failing its read-to-write upgrade with `database busy`.
-    #[tokio::test]
-    async fn concurrent_read_then_write_transactions_on_one_row_both_commit() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let (db, path) = fresh_file_db(2).await;
-        sqlx::query("INSERT INTO todos (id, title, done) VALUES (1, 'counter', 0)")
-            .execute(&db)
-            .await
-            .expect("seed row");
-        let reads = std::sync::Arc::new(AtomicUsize::new(0));
-        let bump = |db: Db, reads: std::sync::Arc<AtomicUsize>| {
-            tokio::spawn(db_with_transaction::<String, i64>(db, move |c| {
-                Box::pin(async move {
-                    let row =
-                        fetch_one_routed(&c, sqlx::query("SELECT done FROM todos WHERE id = 1"))
-                            .await;
-                    let seen: i64 = match row.and_then(|row| row.try_get(0_usize)) {
-                        Ok(n) => n,
-                        Err(e) => return IpeResult::Err(e.to_string()),
-                    };
-                    reads.fetch_add(1, Ordering::SeqCst);
-                    // Hold the read open until the other body has read too (the
-                    // deferred race), or a short wait passes (the second writer
-                    // is parked at its begin).
-                    let deadline =
-                        tokio::time::Instant::now() + std::time::Duration::from_millis(300);
-                    while reads.load(Ordering::SeqCst) < 2 && tokio::time::Instant::now() < deadline
-                    {
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                    }
-                    let write =
-                        sqlx::query("UPDATE todos SET done = ? WHERE id = 1").bind(seen + 1);
-                    match exec_routed(&c, write).await {
-                        Ok(_) => IpeResult::Ok(seen + 1),
-                        Err(e) => IpeResult::Err(e.to_string()),
-                    }
-                })
-            }))
-        };
-        let first = bump(db.clone(), reads.clone());
-        let second = bump(db.clone(), reads.clone());
-        let first = first.await.expect("first transaction task");
-        let second = second.await.expect("second transaction task");
-        let total: i64 = sqlx::query_scalar("SELECT done FROM todos WHERE id = 1")
-            .fetch_one(&db)
-            .await
-            .expect("read counter");
-        db.close().await;
-        let _ = std::fs::remove_file(&path);
-        assert!(
-            matches!(first, IpeResult::Ok(_)),
-            "first writer failed: {first:?}"
-        );
-        assert!(
-            matches!(second, IpeResult::Ok(_)),
-            "second writer failed: {second:?}"
-        );
-        assert_eq!(total, 2, "a committed write was lost");
-    }
-
-    /// A connection that comes back to a vetted pool with a transaction still
-    /// open (a `BEGIN IMMEDIATE` cancelled after SQLite opened it, before the
-    /// driver wrapped it) is closed, not pooled: the next user gets a fresh
-    /// connection outside any transaction, and the write lock is released.
-    #[tokio::test]
-    async fn a_connection_released_inside_a_transaction_is_not_pooled_again() {
-        let (seed, path) = fresh_file_db(1).await;
-        seed.close().await;
-        let url = DbUrl::parse(&format!("sqlite://{}", path.display())).expect("parse file url");
-        let pool = VettedPool::<sqlx::Sqlite>::connect(&url, 1)
-            .await
-            .expect("vetted file pool")
-            .into_pool();
-        let mut conn = pool.acquire().await.expect("acquire");
-        {
-            // The cancelled begin's shape: the transaction is open and nothing
-            // owns its rollback.
-            let _unowned = std::mem::ManuallyDrop::new(
-                sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE")
-                    .await
-                    .expect("begin immediate"),
-            );
-        }
-        drop(conn);
-        let again = pool.acquire().await.expect("reacquire");
-        let inherited = sqlx::Connection::is_in_transaction(&*again);
-        drop(again);
-        let options = format!("sqlite://{}", path.display())
-            .parse::<sqlx::sqlite::SqliteConnectOptions>()
-            .expect("parse file sqlite url")
-            .busy_timeout(std::time::Duration::ZERO);
-        let other = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("connect probe pool");
-        let mut probe = other.acquire().await.expect("acquire probe");
-        let lock_free = sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *probe)
-            .await
-            .is_ok();
-        let _ = sqlx::query("ROLLBACK").execute(&mut *probe).await;
-        drop(probe);
-        other.close().await;
-        pool.close().await;
-        let _ = std::fs::remove_file(&path);
-        assert!(
-            !inherited,
-            "the pool handed out a connection inside a transaction"
-        );
-        assert!(
-            lock_free,
-            "a pooled idle connection still holds the write lock"
-        );
-    }
-
-    /// A connection whose dropped transaction's rollback is still queued comes
-    /// back to the pool and is reused once the rollback has run: the
-    /// in-memory database living on it survives.
-    #[tokio::test]
-    async fn a_connection_whose_dropped_transaction_rolled_back_is_pooled_again() {
-        let url = DbUrl::parse("sqlite::memory:").expect("parse memory url");
-        let pool = VettedPool::<sqlx::Sqlite>::connect(&url, 1)
-            .await
-            .expect("vetted memory pool")
-            .into_pool();
-        sqlx::query("CREATE TABLE kept (id INTEGER)")
-            .execute(&pool)
-            .await
-            .expect("create table");
-        let mut conn = pool.acquire().await.expect("acquire");
-        let tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE")
-            .await
-            .expect("begin immediate");
-        drop(tx);
-        drop(conn);
-        let survived = sqlx::query("SELECT COUNT(*) FROM kept")
-            .execute(&pool)
-            .await
-            .is_ok();
-        pool.close().await;
-        assert!(
-            survived,
-            "a connection whose transaction was rolled back was closed, not pooled"
-        );
-    }
-
-    /// A transaction on a read-only SQLite file still runs, and does not wait
-    /// for a writer: `BEGIN IMMEDIATE` on a read-only database is a read.
-    #[tokio::test]
-    async fn a_transaction_on_a_read_only_sqlite_file_reads_beside_a_writer() {
-        let (writer, path) = fresh_file_db(1).await;
-        sqlx::query("INSERT INTO todos (id, title, done) VALUES (1, 'seen', 0)")
-            .execute(&writer)
-            .await
-            .expect("seed row");
-        let mut held = writer.acquire().await.expect("acquire writer");
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *held)
-            .await
-            .expect("writer takes the write lock");
-        let url = DbUrl::parse(&format!("sqlite://{}?mode=ro", path.display()))
-            .expect("parse read-only url");
-        let reader = VettedPool::<sqlx::Sqlite>::connect(&url, 1)
-            .await
-            .expect("vetted read-only pool")
-            .into_pool();
-        let read = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            db_with_transaction::<String, String>(reader.clone(), |c| {
-                Box::pin(async move {
-                    let row =
-                        fetch_one_routed(&c, sqlx::query("SELECT title FROM todos WHERE id = 1"))
-                            .await;
-                    match row.and_then(|row| row.try_get::<String, _>(0_usize)) {
-                        Ok(title) => IpeResult::Ok(title),
-                        Err(e) => IpeResult::Err(e.to_string()),
-                    }
-                })
-            }),
-        )
-        .await;
-        let _ = sqlx::query("ROLLBACK").execute(&mut *held).await;
-        drop(held);
-        reader.close().await;
-        writer.close().await;
-        let _ = std::fs::remove_file(&path);
-        assert!(
-            matches!(&read, Ok(IpeResult::Ok(title)) if title == "seen"),
-            "a read-only transaction failed or waited on the writer: {read:?}"
-        );
-    }
-
-    /// A write lock held past the busy timeout refuses `withTransaction` at its
-    /// begin as the typed `Database Busy`, never `Unexpected`.
-    ///
-    /// The body's own failure is untyped, so the test is red when the begin is
-    /// deferred and the body is first to want the lock. Once the lock is
-    /// released the same transaction commits.
-    #[tokio::test]
-    async fn lock_held_past_busy_timeout_is_typed_busy() {
-        let (seed, path) = fresh_file_db(1).await;
-        let options = format!("sqlite://{}", path.display())
-            .parse::<sqlx::sqlite::SqliteConnectOptions>()
-            .expect("parse file sqlite url")
-            .busy_timeout(std::time::Duration::from_millis(50));
-        let db = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("connect short-timeout pool");
-        let insert = || {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                db_with_transaction::<IpeError, u64>(db.clone(), |c| {
-                    Box::pin(async move {
-                        let write = sqlx::query("INSERT INTO todos (title) VALUES ('after')");
-                        match exec_routed(&c, write).await {
-                            Ok(done) => IpeResult::Ok(done.rows_affected()),
-                            // Unclassified on purpose: only a refusal at the
-                            // begin carries the typed details.
-                            Err(e) => IpeResult::Err(IpeError::from(e.to_string())),
-                        }
-                    })
-                }),
-            )
-        };
-        let mut held = seed.acquire().await.expect("acquire holder");
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *held)
-            .await
-            .expect("holder takes the write lock");
-        let contended = insert().await;
-        let _ = sqlx::query("ROLLBACK").execute(&mut *held).await;
-        drop(held);
-        let released = insert().await;
-        db.close().await;
-        seed.close().await;
-        let _ = std::fs::remove_file(&path);
-        assert!(
-            matches!(&contended, Ok(IpeResult::Err(IpeError::Error(_, info)))
-                if info.details == IpeMaybe::Just(IpeErrorDetails::Database(IpeDbFailure::Busy))),
-            "a held write lock did not refuse as typed busy: {contended:?}"
-        );
-        assert!(
-            matches!(released, Ok(IpeResult::Ok(1))),
-            "the transaction failed with the lock released: {released:?}"
-        );
-    }
-
-    // THE REGRESSION GATE. On a MULTI-connection (5) file-backed pool, a
-    // withTransaction body that INSERTs then returns Err must roll the INSERT
-    // back. Against the old bare-pool code BEGIN/INSERT/ROLLBACK scattered across
-    // different connections → the INSERT autocommitted on its own connection →
-    // this assert would find the row present (FAIL). With task-local routing all
-    // three run on one connection → row absent (PASS).
-    #[tokio::test]
-    async fn test_with_transaction_cancellation_rolls_back() {
-        // CANCELLATION SAFETY regression: a body future DROPPED mid-transaction
-        // (here via task abort) must NOT leak an open txn onto the pooled
-        // connection — the next checkout would otherwise inherit it. 1-conn pool
-        // forces reuse of the exact connection the cancelled txn ran on.
-        let (db, path) = fresh_file_db(1).await;
-        let started = std::sync::Arc::new(tokio::sync::Notify::new());
-        let started2 = started.clone();
-        let dbc = db.clone();
-        let handle = tokio::spawn(async move {
-            let _: IpeResult<String, i64> = db_with_transaction(dbc, move |c| {
-                let started2 = started2.clone();
-                Box::pin(async move {
-                    let mut row = HashMap::new();
-                    row.insert("title".to_string(), "cancelled".to_string());
-                    let _: IpeResult<String, i64> = db_insert_row(c, "todos".into(), row).await;
-                    started2.notify_one(); // INSERT is in the open txn — signal, then hang
-                    std::future::pending::<()>().await; // dropped by abort below
-                    IpeResult::Ok(0)
-                })
-            })
-            .await;
-        });
-        started.notified().await;
-        handle.abort();
-        let _ = handle.await;
-
-        // Reused connection must NOT be poisoned by an inherited open txn.
-        let r: IpeResult<String, i64> = db_with_transaction(db.clone(), |c| {
-            Box::pin(async move {
-                let mut row = HashMap::new();
-                row.insert("title".to_string(), "after".to_string());
-                db_insert_row(c, "todos".into(), row).await
-            })
-        })
-        .await;
-        assert!(
-            matches!(r, IpeResult::Ok(_)),
-            "post-cancel txn must succeed on the reused connection: {:?}",
-            r
-        );
-        // The cancelled INSERT must have rolled back on drop (fold to a count to
-        // avoid a panic!-form assertion — the risk-precheck flags raw panic!).
-        let cancelled_count = match db_find_many_by_field::<String>(
-            db.clone(),
-            "todos".into(),
-            "title".into(),
-            "cancelled".into(),
-        )
-        .await
-        {
-            IpeResult::Ok(v) => v.len(),
-            IpeResult::Err(_) => usize::MAX,
-        };
-        assert_eq!(
-            cancelled_count, 0,
-            "cancelled INSERT must roll back on drop"
-        );
-        db.close().await;
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[tokio::test]
-    async fn test_with_transaction_rollback_real_on_multiconn_pool() {
-        let (db, path) = fresh_file_db(5).await;
-
-        let r: IpeResult<String, i64> = db_with_transaction(db.clone(), |c| {
-            Box::pin(async move {
-                let mut row = HashMap::new();
-                row.insert("title".to_string(), "rollback-me".to_string());
-                let _: IpeResult<String, i64> = db_insert_row(c, "todos".into(), row).await;
-                IpeResult::Err("forced rollback".to_string())
-            })
-        })
-        .await;
-        assert!(matches!(r, IpeResult::Err(_)), "body Err propagates");
-
-        // The row MUST be absent — rollback actually undid the write.
-        let found: IpeResult<String, Vec<RowCells>> = db_find_many_by_field(
-            db.clone(),
-            "todos".into(),
-            "title".into(),
-            "rollback-me".into(),
-        )
-        .await;
-        match found {
-            IpeResult::Ok(v) => assert_eq!(
-                v.len(),
-                0,
-                "ROLLBACK did not undo the INSERT on a multi-connection pool — \
-                 BEGIN/INSERT/ROLLBACK landed on different connections"
-            ),
-            other => panic!("post-rollback fetch: {:?}", other),
-        }
-
-        db.close().await;
-        let _ = std::fs::remove_file(&path);
-    }
-
-    // Ok-path on a multi-connection file pool: COMMIT must persist the row.
-    #[tokio::test]
-    async fn test_with_transaction_commit_real_on_multiconn_pool() {
-        let (db, path) = fresh_file_db(5).await;
-
-        let r: IpeResult<String, i64> = db_with_transaction(db.clone(), |c| {
-            Box::pin(async move {
-                let mut row = HashMap::new();
-                row.insert("title".to_string(), "commit-me".to_string());
-                db_insert_row(c, "todos".into(), row).await
-            })
-        })
-        .await;
-        assert!(matches!(r, IpeResult::Ok(_)), "body Ok");
-
-        let found: IpeResult<String, Vec<RowCells>> = db_find_many_by_field(
-            db.clone(),
-            "todos".into(),
-            "title".into(),
-            "commit-me".into(),
-        )
-        .await;
-        match found {
-            IpeResult::Ok(v) => assert_eq!(v.len(), 1, "COMMIT must persist the row"),
-            other => panic!("post-commit fetch: {:?}", other),
-        }
-
-        db.close().await;
-        let _ = std::fs::remove_file(&path);
-    }
-
-    // Nested withTransaction must NOT deadlock and must NOT acquire a second
-    // connection. Flattened semantics: the inner block runs on the outer
-    // transaction's connection; an outer Err rolls everything back.
-    #[tokio::test]
-    async fn test_with_transaction_nested_no_deadlock() {
-        let (db, path) = fresh_file_db(5).await;
-        let db_for_inner = db.clone();
-
-        let r: IpeResult<String, i64> = db_with_transaction(db.clone(), move |c| {
-            let inner_db = db_for_inner.clone();
-            Box::pin(async move {
-                let mut row = HashMap::new();
-                row.insert("title".to_string(), "outer".to_string());
-                let _: IpeResult<String, i64> = db_insert_row(c, "todos".into(), row).await;
-                // Nested call — must reuse the held connection (no deadlock).
-                db_with_transaction(inner_db, |c2| {
-                    Box::pin(async move {
-                        let mut row2 = HashMap::new();
-                        row2.insert("title".to_string(), "inner".to_string());
-                        db_insert_row(c2, "todos".into(), row2).await
-                    })
-                })
-                .await
-            })
-        })
-        .await;
-        assert!(matches!(r, IpeResult::Ok(_)), "nested commit Ok");
-
-        // Both rows committed (flattened into one transaction).
-        let outer: IpeResult<String, Vec<RowCells>> =
-            db_find_many_by_field(db.clone(), "todos".into(), "title".into(), "outer".into()).await;
-        let inner: IpeResult<String, Vec<RowCells>> =
-            db_find_many_by_field(db.clone(), "todos".into(), "title".into(), "inner".into()).await;
-        assert!(
-            matches!(outer, IpeResult::Ok(ref v) if v.len() == 1),
-            "outer row present"
-        );
-        assert!(
-            matches!(inner, IpeResult::Ok(ref v) if v.len() == 1),
-            "inner row present"
-        );
-
-        db.close().await;
-        let _ = std::fs::remove_file(&path);
-    }
-
-    // Build a recording `TxnConn` — a real transaction opened on `pool` and
-    // wrapped exactly as `db_with_transaction` wraps its own. Handed to
-    // `with_recording_txn`, it installs into the ambient `TXN_CONN` under the
-    // real `pool_identity`, so a test observes routing through the genuine
-    // ambient path and the `ptr_eq` gate, not a task-local backdoor.
-    async fn recording_txn(pool: &Db) -> TxnConn {
-        let tx = pool.begin().await.expect("begin recording txn");
-        std::sync::Arc::new(tokio::sync::Mutex::new(tx))
-    }
-
-    // (a) An op inside a `withTransaction` scope lands on the txn connection:
-    // `route_for` chooses the Txn arm for the scope's own pool. Outside the
-    // scope the same pool routes back to the Pool arm — the task-local is
-    // scoped, not sticky.
-    #[tokio::test]
-    async fn test_route_inside_scope_rides_txn() {
-        let db = fresh_db().await;
-        let rec = recording_txn(&db).await;
-        assert!(
-            !route_for(&db).rode_transaction(),
-            "outside any scope, a query routes to the pool"
-        );
-        let rode = with_recording_txn(&db, rec, async { route_for(&db).rode_transaction() }).await;
-        assert!(
-            rode,
-            "inside the scope, a query on the scope's pool rides the txn conn"
-        );
-        assert!(
-            !route_for(&db).rode_transaction(),
-            "after the scope ends, the pool arm is chosen again"
-        );
-    }
-
-    // (b) THE AUD-03 REFUSAL. Inside a txn scope opened on `db_a`, a query on a
-    // DIFFERENT pool `db_b` must NOT ride `db_a`'s transaction connection — it
-    // falls through to `db_b`'s pool. This pins the `ptr_eq` pool-identity gate
-    // in `current_txn_conn_for`: with the gate removed (routing on presence
-    // alone), `db_b` would wrongly ride `db_a`'s open transaction — the exact
-    // cross-pool leak the gate closes.
-    #[tokio::test]
-    async fn test_route_cross_pool_inside_scope_falls_through_to_pool() {
-        let db_a = fresh_db().await;
-        let db_b = fresh_db().await;
-        let rec_a = recording_txn(&db_a).await;
-        let (a_rode, b_rode) = with_recording_txn(&db_a, rec_a, async {
-            (
-                route_for(&db_a).rode_transaction(),
-                route_for(&db_b).rode_transaction(),
-            )
-        })
-        .await;
-        assert!(a_rode, "the scope's own pool rides the txn conn");
-        assert!(
-            !b_rode,
-            "AUD-03: a query on a different pool must fall through to its own pool, \
-             never ride another pool's transaction connection"
-        );
-    }
-
-    // (c) Nested `withTransaction` on the SAME pool flattens: inside a scope on
-    // `db`, a query on `db` reuses the very connection installed by the outer
-    // scope (ptr-equal), never a second one — the flatten that
-    // `db_with_transaction` performs when `current_txn_conn_for` is already Some.
-    #[tokio::test]
-    async fn test_route_nested_same_pool_flattens_onto_outer_conn() {
-        let db = fresh_db().await;
-        let rec = recording_txn(&db).await;
-        let rec_probe = rec.clone();
-        let same = with_recording_txn(&db, rec, async {
-            route_for(&db).rode_same_txn_as(&rec_probe)
-        })
-        .await;
-        assert!(
-            same,
-            "a nested op on the same pool reuses the outer transaction connection, not a new one"
-        );
-    }
-
-    // AUD-03 regression: a nested `withTransaction` call for a DIFFERENT `Db`
-    // handle must open its OWN independent transaction, never flatten onto an
-    // outer transaction opened on a different pool (which would silently
-    // execute the nested pool's operations against the wrong physical
-    // connection — cross-database data corruption). Both tests below FAIL
-    // under the pre-fix code (which flattened on ANY active transaction
-    // regardless of pool identity) and pass once nesting is gated on
-    // `current_txn_conn_for`'s pool-identity check.
-    #[tokio::test]
-    async fn test_with_transaction_cross_pool_nested_targets_correct_db() {
-        let (db_a, path_a) = fresh_file_db(5).await;
-        let (db_b, path_b) = fresh_file_db(5).await;
-        let db_b_for_inner = db_b.clone();
-
-        let r: IpeResult<String, i64> = db_with_transaction(db_a.clone(), move |c_a| {
-            let db_b_inner = db_b_for_inner.clone();
-            Box::pin(async move {
-                let mut row_a = HashMap::new();
-                row_a.insert("title".to_string(), "in-a".to_string());
-                let _: IpeResult<String, i64> = db_insert_row(c_a, "todos".into(), row_a).await;
-
-                // Nested withTransaction on a DIFFERENT pool — must open its
-                // own transaction on db_b, not flatten onto db_a's.
-                db_with_transaction(db_b_inner, |c_b| {
-                    Box::pin(async move {
-                        let mut row_b = HashMap::new();
-                        row_b.insert("title".to_string(), "in-b".to_string());
-                        db_insert_row(c_b, "todos".into(), row_b).await
-                    })
-                })
-                .await
-            })
-        })
-        .await;
-        assert!(matches!(r, IpeResult::Ok(_)), "outer+nested commit Ok");
-
-        // The dbB row must land in dbB, NOT dbA.
-        let a_has_b_row: IpeResult<String, Vec<RowCells>> =
-            db_find_many_by_field(db_a.clone(), "todos".into(), "title".into(), "in-b".into())
-                .await;
-        assert!(
-            matches!(a_has_b_row, IpeResult::Ok(ref v) if v.is_empty()),
-            "dbA must NOT contain dbB's row"
-        );
-
-        let b_has_b_row: IpeResult<String, Vec<RowCells>> =
-            db_find_many_by_field(db_b.clone(), "todos".into(), "title".into(), "in-b".into())
-                .await;
-        assert!(
-            matches!(b_has_b_row, IpeResult::Ok(ref v) if v.len() == 1),
-            "dbB must contain its own row"
-        );
-
-        let a_has_a_row: IpeResult<String, Vec<RowCells>> =
-            db_find_many_by_field(db_a.clone(), "todos".into(), "title".into(), "in-a".into())
-                .await;
-        assert!(
-            matches!(a_has_a_row, IpeResult::Ok(ref v) if v.len() == 1),
-            "dbA must contain its own row"
-        );
-
-        db_a.close().await;
-        db_b.close().await;
-        let _ = std::fs::remove_file(&path_a);
-        let _ = std::fs::remove_file(&path_b);
-    }
-
-    #[tokio::test]
-    async fn test_with_transaction_cross_pool_nested_rollback_independent() {
-        let (db_a, path_a) = fresh_file_db(5).await;
-        let (db_b, path_b) = fresh_file_db(5).await;
-        let db_b_for_inner = db_b.clone();
-
-        let r: IpeResult<String, i64> = db_with_transaction(db_a.clone(), move |c_a| {
-            let db_b_inner = db_b_for_inner.clone();
-            Box::pin(async move {
-                let mut row_a = HashMap::new();
-                row_a.insert("title".to_string(), "a-commits".to_string());
-                let _: IpeResult<String, i64> = db_insert_row(c_a, "todos".into(), row_a).await;
-
-                // Inner transaction on a DIFFERENT pool fails and rolls back —
-                // must NOT roll back the outer dbA transaction.
-                let inner: IpeResult<String, i64> = db_with_transaction(db_b_inner, |c_b| {
-                    Box::pin(async move {
-                        let mut row_b = HashMap::new();
-                        row_b.insert("title".to_string(), "b-rolls-back".to_string());
-                        let _: IpeResult<String, i64> =
-                            db_insert_row(c_b, "todos".into(), row_b).await;
-                        IpeResult::<String, i64>::Err("inner fails deliberately".to_string())
-                    })
-                })
-                .await;
-                assert!(
-                    matches!(inner, IpeResult::Err(_)),
-                    "inner reports its own error"
-                );
-
-                IpeResult::Ok(0i64)
-            })
-        })
-        .await;
-        assert!(
-            matches!(r, IpeResult::Ok(_)),
-            "outer commit Ok despite inner rollback"
-        );
-
-        let a_row: IpeResult<String, Vec<RowCells>> = db_find_many_by_field(
-            db_a.clone(),
-            "todos".into(),
-            "title".into(),
-            "a-commits".into(),
-        )
-        .await;
-        assert!(
-            matches!(a_row, IpeResult::Ok(ref v) if v.len() == 1),
-            "dbA row committed"
-        );
-
-        let b_row: IpeResult<String, Vec<RowCells>> = db_find_many_by_field(
-            db_b.clone(),
-            "todos".into(),
-            "title".into(),
-            "b-rolls-back".into(),
-        )
-        .await;
-        assert!(
-            matches!(b_row, IpeResult::Ok(ref v) if v.is_empty()),
-            "dbB row rolled back independently"
-        );
-
-        db_a.close().await;
-        db_b.close().await;
-        let _ = std::fs::remove_file(&path_a);
-        let _ = std::fs::remove_file(&path_b);
-    }
-
     #[tokio::test]
     async fn test_get_bool() {
         let mut r = HashMap::new();
@@ -10732,62 +8521,6 @@ mod tests {
         assert!(db_get_bool("c".into(), &r));
         assert!(!db_get_bool("d".into(), &r));
         assert!(!db_get_bool("missing".into(), &r));
-    }
-
-    #[tokio::test]
-    async fn test_query_decode() {
-        let db = fresh_db().await;
-        let mut row = HashMap::new();
-        row.insert("title".to_string(), "decoded".to_string());
-        let _: IpeResult<String, i64> = db_insert_row(db.clone(), "todos".into(), row).await;
-        // Use the Decoder<E,A> API: db_decode_string reads the "title" column from
-        // the NULL-preserving JsonVal::Object produced by row_to_json.
-        let decoded: IpeResult<String, Vec<String>> = db_query_decode(
-            db,
-            "SELECT title FROM todos".into(),
-            vec![],
-            db_decode_string("title".to_string()),
-        )
-        .await;
-        match decoded {
-            IpeResult::Ok(v) => assert_eq!(v, vec!["decoded".to_string()]),
-            _ => panic!("decode"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_query_decode_int_and_nullable() {
-        let db = fresh_db().await;
-        let mut row = HashMap::new();
-        row.insert("title".to_string(), "item".to_string());
-        row.insert("done".to_string(), "1".to_string());
-        let _: IpeResult<String, i64> = db_insert_row(db.clone(), "todos".into(), row).await;
-
-        // Test db_decode_int decodes the "done" column correctly.
-        let decoded_int: IpeResult<String, Vec<i64>> = db_query_decode(
-            db.clone(),
-            "SELECT done FROM todos".into(),
-            vec![],
-            db_decode_int("done".to_string()),
-        )
-        .await;
-        match decoded_int {
-            IpeResult::Ok(v) => assert_eq!(v, vec![1i64]),
-            _ => panic!("db_decode_int decode failed"),
-        }
-
-        // Test db_decode_bool.
-        let decoded_bool: IpeResult<String, Vec<bool>> = db_query_decode(
-            db.clone(),
-            "SELECT done FROM todos".into(),
-            vec![],
-            db_decode_bool("done".to_string()),
-        )
-        .await;
-        match decoded_bool {
-            IpeResult::Ok(v) => assert_eq!(v, vec![true]),
-            _ => panic!("db_decode_bool decode failed"),
-        }
     }
 
     #[test]
@@ -10836,108 +8569,6 @@ mod tests {
             IpeResult::Ok(i) => assert_eq!(i, i64::MIN),
             IpeResult::Err(e) => panic!("i64::MIN decode failed: {:?}", e),
         }
-    }
-
-    #[tokio::test]
-    async fn test_query_decode_nullable_null() {
-        // SQLite table with a nullable column.
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("connect");
-        sqlx::query("CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)")
-            .execute(&pool)
-            .await
-            .expect("create");
-        // Row with NULL label.
-        sqlx::query("INSERT INTO items (id, label) VALUES (1, NULL)")
-            .execute(&pool)
-            .await
-            .expect("insert null");
-        // Row with non-null label.
-        sqlx::query("INSERT INTO items (id, label) VALUES (2, 'hello')")
-            .execute(&pool)
-            .await
-            .expect("insert some");
-
-        // db_decode_nullable(db_decode_string("label")): NULL → Nothing, "hello" → Just("hello").
-        // (1-arg form: inner.fields = ["label"] provides the NULL-gate column.)
-
-        // Check NULL row → Nothing.
-        let r1: IpeResult<String, Vec<IpeMaybe<String>>> = db_query_decode(
-            pool.clone(),
-            "SELECT label FROM items WHERE id = 1".into(),
-            vec![],
-            db_decode_nullable(db_decode_string("label".to_string())),
-        )
-        .await;
-        match r1 {
-            IpeResult::Ok(v) => {
-                assert_eq!(v.len(), 1);
-                assert!(
-                    matches!(v[0], IpeMaybe::Nothing),
-                    "expected Nothing for NULL, got {:?}",
-                    v[0]
-                );
-            }
-            IpeResult::Err(e) => panic!("unexpected Err on NULL row: {}", e),
-        }
-
-        // Check non-NULL row → Just("hello").
-        let r2: IpeResult<String, Vec<IpeMaybe<String>>> = db_query_decode(
-            pool,
-            "SELECT label FROM items WHERE id = 2".into(),
-            vec![],
-            db_decode_nullable(db_decode_string("label".to_string())),
-        )
-        .await;
-        match r2 {
-            IpeResult::Ok(v) => {
-                assert_eq!(v.len(), 1);
-                assert!(
-                    matches!(&v[0], IpeMaybe::Just(s) if s == "hello"),
-                    "expected Just(\"hello\"), got {:?}",
-                    v[0]
-                );
-            }
-            IpeResult::Err(e) => panic!("unexpected Err on non-null row: {}", e),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_get_by_id_decode() {
-        let db = fresh_db().await;
-        let mut row = HashMap::new();
-        row.insert("title".to_string(), "find-me".to_string());
-        let id: IpeResult<String, i64> = db_insert_row(db.clone(), "todos".into(), row).await;
-        let id = match id {
-            IpeResult::Ok(v) => v,
-            _ => panic!("insert"),
-        };
-
-        let found: IpeResult<String, IpeMaybe<String>> = db_get_by_id_decode(
-            db.clone(),
-            "todos".into(),
-            id,
-            db_decode_string("title".to_string()),
-        )
-        .await;
-        match found {
-            IpeResult::Ok(IpeMaybe::Just(s)) => assert_eq!(s, "find-me"),
-            other => panic!("unexpected: {:?}", other),
-        }
-
-        // Non-existent id → Nothing.
-        let not_found: IpeResult<String, IpeMaybe<String>> = db_get_by_id_decode(
-            db,
-            "todos".into(),
-            99999,
-            db_decode_string("title".to_string()),
-        )
-        .await;
-        assert!(matches!(not_found, IpeResult::Ok(IpeMaybe::Nothing)));
     }
 
     /// A refused column value never appears in the refusal: the message names
@@ -11056,291 +8687,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn test_db_decode_decimal_money_pg_dialect() {
-        // Verifies that the Postgres-dialect INSERT+SELECT statement for a
-        // Decimal/Money column pair uses $N placeholders (not ?), binds values
-        // as TEXT string parameters (never float/REAL), and that the DDL column
-        // type is TEXT.
-        //
-        // No live Postgres cluster is available in CI; this test drives the
-        // statement-generation path directly against the ExternalConnection
-        // Postgres variant to assert correct SQL shape and bind types.
-        //
-        // A live-pg round-trip is unimplementable without new infrastructure
-        // (no DATABASE_URL in CI). The statement-generation assertion here is
-        // the extent of pg coverage possible without that infra.
-        use rust_decimal::Decimal as RD;
-        use std::str::FromStr;
-
-        // Decimal stores as TEXT — confirm from_str round-trips without float
-        // intermediary loss.
-        let d = RD::from_str("9.99").expect("parse");
-        let s = d.to_string();
-        assert_eq!(s, "9.99", "Decimal TEXT round-trip must be exact");
-
-        // Money stores as "CODE AMOUNT" TEXT — confirm the canonical format
-        // the runtime expects on decode.
-        let money_text = "USD 12.34";
-        let (code, amount_str) = money_text.split_once(' ').expect("split");
-        let amount = RD::from_str(amount_str).expect("parse");
-        assert_eq!(code, "USD");
-        assert_eq!(amount, RD::from_str("12.34").unwrap());
-
-        // The Postgres-dialect placeholder test: SqlitePool uses '?' while the
-        // Postgres driver uses '$1', '$2', … The runtime's `into_pg_params`
-        // path (ExternalConnection::Postgres branch in Store's insert_sql)
-        // rewrites '?' to '$N' sequentially. Assert the rewrite is correct for
-        // a 2-parameter INSERT.
-        let sqlite_sql = "INSERT INTO t (decimal_col, money_col) VALUES (?, ?)";
-        let mut n = 0u32;
-        let pg_sql: String =
-            sqlite_sql
-                .split('?')
-                .enumerate()
-                .fold(String::new(), |mut acc, (i, part)| {
-                    acc.push_str(part);
-                    if i < sqlite_sql.matches('?').count() {
-                        n += 1;
-                        acc.push('$');
-                        acc.push_str(&n.to_string());
-                    }
-                    acc
-                });
-        assert!(
-            pg_sql.contains("$1") && pg_sql.contains("$2"),
-            "Postgres rewrite must produce $1/$2 placeholders, got: {pg_sql}"
-        );
-        assert!(
-            !pg_sql.contains('?'),
-            "Postgres rewrite must not leave '?' placeholders, got: {pg_sql}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_row_to_json_null_preservation() {
-        // Verify that a SQL NULL cell becomes JsonVal::Null (not "").
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("connect");
-        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
-            .execute(&pool)
-            .await
-            .expect("create");
-        sqlx::query("INSERT INTO t (id, v) VALUES (1, NULL)")
-            .execute(&pool)
-            .await
-            .expect("insert");
-        let row = sqlx::query("SELECT v FROM t WHERE id = 1")
-            .fetch_one(&pool)
-            .await
-            .expect("fetch");
-        let jv = row_to_json(&row).unwrap_or_else(|e| panic!("row_to_json: {e}"));
-        match jv.get("v") {
-            Some(JsonVal::Null) => { /* correct */ }
-            other => panic!("expected JsonVal::Null, got {:?}", other),
-        }
-    }
-
     // ─── RT-DATA-001: row_to_json/read_cell probe chain ──────────────
-
-    /// BLOB column written via `SqlBytes` decodes as a hex `JsonVal::String`,
-    /// not `JsonVal::Null`. Exercises the bytes arm of `read_cell`.
-    #[tokio::test]
-    async fn test_row_to_json_blob_decodes_as_hex() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap_or_else(|e| panic!("connect: {e}"));
-        sqlx::query("CREATE TABLE blobs (id INTEGER PRIMARY KEY, data BLOB)")
-            .execute(&pool)
-            .await
-            .unwrap_or_else(|e| panic!("create: {e}"));
-        sqlx::query("INSERT INTO blobs (id, data) VALUES (1, ?)")
-            .bind(vec![0xde_u8, 0xad, 0xbe, 0xef])
-            .execute(&pool)
-            .await
-            .unwrap_or_else(|e| panic!("insert: {e}"));
-        let row = sqlx::query("SELECT data FROM blobs WHERE id = 1")
-            .fetch_one(&pool)
-            .await
-            .unwrap_or_else(|e| panic!("fetch: {e}"));
-        let jv = row_to_json(&row).unwrap_or_else(|e| panic!("row_to_json: {e}"));
-        match jv.get("data") {
-            Some(JsonVal::String(s)) => {
-                assert_eq!(s, "deadbeef", "expected hex encoding of bytes");
-            }
-            other => panic!("expected JsonVal::String(hex), got {:?}", other),
-        }
-    }
-
-    /// Bool column decodes as `JsonVal::Bool`, not `JsonVal::Null`. Exercises
-    /// the bool-first probe ordering in `read_cell`.
-    #[tokio::test]
-    async fn test_row_to_json_bool_column() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap_or_else(|e| panic!("connect: {e}"));
-        sqlx::query("CREATE TABLE flags (id INTEGER PRIMARY KEY, active BOOLEAN NOT NULL)")
-            .execute(&pool)
-            .await
-            .unwrap_or_else(|e| panic!("create: {e}"));
-        sqlx::query("INSERT INTO flags (id, active) VALUES (1, TRUE)")
-            .execute(&pool)
-            .await
-            .unwrap_or_else(|e| panic!("insert: {e}"));
-        let row = sqlx::query("SELECT active FROM flags WHERE id = 1")
-            .fetch_one(&pool)
-            .await
-            .unwrap_or_else(|e| panic!("fetch: {e}"));
-        let jv = row_to_json(&row).unwrap_or_else(|e| panic!("row_to_json: {e}"));
-        // On sqlite, BOOLEAN stores as 0/1 INTEGER; read_cell probes bool
-        // first, so we get Bool(true) rather than Number(1).
-        match jv.get("active") {
-            Some(JsonVal::Bool(b)) => assert!(*b, "expected true"),
-            // sqlite may surface as integer — accept Number(1) as correct too
-            Some(JsonVal::Number(n)) => assert_eq!(n.as_i64(), Some(1), "expected 1"),
-            other => panic!("expected Bool or Number(1), got {:?}", other),
-        }
-    }
-
-    /// `db_decode_bytes` round-trip: write `SqlBytes`, read back via
-    /// `db_decode_bytes`, assert the original bytes survive.
-    #[tokio::test]
-    async fn test_db_decode_bytes_roundtrip() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap_or_else(|e| panic!("connect: {e}"));
-        sqlx::query("CREATE TABLE blobs (id INTEGER PRIMARY KEY, data BLOB)")
-            .execute(&pool)
-            .await
-            .unwrap_or_else(|e| panic!("create: {e}"));
-        let original: Vec<u8> = vec![0x01, 0x02, 0x03, 0xff];
-        sqlx::query("INSERT INTO blobs (id, data) VALUES (1, ?)")
-            .bind(original.clone())
-            .execute(&pool)
-            .await
-            .unwrap_or_else(|e| panic!("insert: {e}"));
-        let decoded: IpeResult<String, Vec<Vec<u8>>> = db_query_decode(
-            pool,
-            "SELECT data FROM blobs WHERE id = 1".to_string(),
-            vec![],
-            db_decode_bytes("data".to_string()),
-        )
-        .await;
-        match decoded {
-            IpeResult::Ok(rows) => {
-                assert_eq!(rows.len(), 1, "expected one row");
-                assert_eq!(rows[0], original, "bytes did not survive round-trip");
-            }
-            IpeResult::Err(e) => panic!("decode failed: {e:?}"),
-        }
-    }
-
-    /// One single-connection in-memory SQLite pool holding a `cells` table with
-    /// one row: every [`read_cell`] case is one column.
-    #[allow(clippy::expect_used)] // test fixture: a failed setup is a failed test
-    async fn cells_pool() -> sqlx::sqlite::SqlitePool {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("connect in-memory sqlite");
-        sqlx::query(
-            "CREATE TABLE cells (nul TEXT, empty TEXT, zero INTEGER, ratio REAL, \
-             bytes BLOB, flag BOOLEAN, pinf REAL, ninf REAL)",
-        )
-        .execute(&pool)
-        .await
-        .expect("create cells");
-        sqlx::query("INSERT INTO cells VALUES (NULL, '', 0, 1.5, X'00ff', TRUE, 9e999, -9e999)")
-            .execute(&pool)
-            .await
-            .expect("seed cells");
-        pool
-    }
-
-    /// The `(index, reason)` of a `ColumnDecode` refusal; `None` for any other outcome.
-    fn column_decode_refusal<T>(r: Result<T, sqlx::Error>) -> Option<(String, String)> {
-        match r {
-            Err(sqlx::Error::ColumnDecode { index, source }) => Some((index, source.to_string())),
-            _ => None,
-        }
-    }
-
-    /// `read_cell` keeps SQL NULL as its own arm, reads every storage class to
-    /// its exact cell, and refuses an infinite `REAL` with the typed reason.
-    #[tokio::test]
-    #[allow(clippy::expect_used)] // test fixture: a failed fetch is a failed test
-    async fn read_cell_matrix_keeps_null_and_refuses_non_finite() {
-        let pool = cells_pool().await;
-        let row = sqlx::query("SELECT nul, empty, zero, ratio, bytes, flag, pinf, ninf FROM cells")
-            .fetch_one(&pool)
-            .await
-            .expect("fetch cells");
-        assert_eq!(read_cell(&row, 0).ok(), Some(Cell::Null));
-        assert_eq!(read_cell(&row, 1).ok(), Some(Cell::Text(String::new())));
-        assert_eq!(read_cell(&row, 2).ok(), Some(Cell::Int(0)));
-        assert_eq!(
-            read_cell(&row, 3).ok(),
-            FiniteF64::new(1.5).map(Cell::Float)
-        );
-        assert_eq!(read_cell(&row, 4).ok(), Some(Cell::Bytes(vec![0x00, 0xff])));
-        assert_eq!(read_cell(&row, 5).ok(), Some(Cell::Bool(true)));
-        assert_eq!(
-            column_decode_refusal(read_cell(&row, 6)),
-            Some(("6".to_string(), NON_FINITE_REAL.to_string()))
-        );
-        assert_eq!(
-            column_decode_refusal(read_cell(&row, 7)),
-            Some(("7".to_string(), NON_FINITE_REAL.to_string()))
-        );
-
-        // `into_json` agrees cell by cell.
-        let json: Vec<Option<JsonVal>> = (0..6)
-            .map(|i| read_cell(&row, i).ok().map(Cell::into_json))
-            .collect();
-        assert_eq!(
-            json,
-            vec![
-                Some(JsonVal::Null),
-                Some(crate::json_val::json_val!("")),
-                Some(crate::json_val::json_val!(0)),
-                Some(crate::json_val::json_val!(1.5)),
-                Some(crate::json_val::json_val!("00ff")),
-                Some(JsonVal::Bool(true)),
-            ]
-        );
-
-        // The whole-row projection is the same reader: finite columns give the
-        // exact object, and an infinite cell refuses the row at its index.
-        let finite = sqlx::query("SELECT nul, empty, zero, ratio, bytes, flag FROM cells")
-            .fetch_one(&pool)
-            .await
-            .expect("fetch finite cells");
-        assert_eq!(
-            row_to_json(&finite).ok(),
-            Some(crate::json_val::json_val!({
-                "nul": null, "empty": "", "zero": 0, "ratio": 1.5, "bytes": "00ff", "flag": true
-            }))
-        );
-        assert_eq!(
-            column_decode_refusal(row_to_json(&row)),
-            Some(("6".to_string(), NON_FINITE_REAL.to_string()))
-        );
-    }
 
     /// `FiniteF64::new` admits every finite float and refuses `NaN` / `±Inf`.
     #[test]
@@ -11373,59 +8720,6 @@ mod tests {
                 },
             }),
         }
-    }
-
-    /// `Cell::into_text` keeps SQL NULL as `Nothing`, renders every storage
-    /// class to its exact text, and agrees with the app path cell by cell;
-    /// `row_cells` refuses an infinite `REAL` at its index.
-    #[tokio::test]
-    #[allow(clippy::expect_used)] // test fixture: a failed fetch is a failed test
-    async fn into_text_matrix_keeps_null_and_matches_the_app_path() {
-        let pool = cells_pool().await;
-        let row = sqlx::query("SELECT nul, empty, zero, ratio, bytes, flag, pinf, ninf FROM cells")
-            .fetch_one(&pool)
-            .await
-            .expect("fetch cells");
-        let just = |s: &str| Some(IpeMaybe::Just(s.to_string()));
-        let text: Vec<Option<IpeMaybe<String>>> = (0..6)
-            .map(|i| read_cell(&row, i).ok().map(Cell::into_text))
-            .collect();
-        assert_eq!(
-            text,
-            vec![
-                Some(IpeMaybe::Nothing),
-                just(""),
-                just("0"),
-                just("1.5"),
-                just("00ff"),
-                just("true"),
-            ]
-        );
-        for i in 0..6 {
-            let cell = read_cell(&row, i).ok();
-            assert_eq!(
-                cell.clone().map(Cell::into_text),
-                cell.map(|c| app_text(&c.into_json())),
-                "column {i}"
-            );
-        }
-        assert_eq!(
-            column_decode_refusal(row_cells(&row)),
-            Some(("6".to_string(), NON_FINITE_REAL.to_string()))
-        );
-        let finite = sqlx::query("SELECT nul, empty, zero FROM cells")
-            .fetch_one(&pool)
-            .await
-            .expect("fetch finite cells");
-        let cells = row_cells(&finite).ok();
-        assert_eq!(
-            cells.as_ref().and_then(|c| c.get("nul")),
-            Some(&IpeMaybe::Nothing)
-        );
-        assert_eq!(
-            cells.as_ref().and_then(|c| c.get("empty")),
-            Some(&IpeMaybe::Just(String::new()))
-        );
     }
 
     /// A float cell's raw text is the app path's text for every float the
@@ -11462,515 +8756,7 @@ mod tests {
         );
     }
 
-    /// One single-connection in-memory SQLite pool with a `l` row whose `note`
-    /// is SQL `NULL` and whose `empty` is the empty text, joined by an `r` row
-    /// whose `note` is `NULL` too.
-    #[allow(clippy::expect_used)] // test fixture: a failed setup is a failed test
-    async fn null_cells_pool() -> sqlx::sqlite::SqlitePool {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("connect in-memory sqlite");
-        for sql in [
-            "CREATE TABLE l (id TEXT PRIMARY KEY, k TEXT, note TEXT, empty TEXT)",
-            "CREATE TABLE r (id TEXT PRIMARY KEY, lid TEXT, note TEXT)",
-            "INSERT INTO l VALUES ('1', 'a', NULL, '')",
-            "INSERT INTO r VALUES ('9', '1', NULL)",
-        ] {
-            sqlx::query(sql)
-                .execute(&pool)
-                .await
-                .expect("seed null cells");
-        }
-        pool
-    }
-
-    /// The `note` cell of a one-row raw read; `None` unless it is `Ok` with exactly one row.
-    fn sole_note(read: IpeResult<String, Vec<RowCells>>) -> Option<Option<IpeMaybe<String>>> {
-        match read {
-            IpeResult::Ok(rows) if rows.len() == 1 => {
-                rows.into_iter().next().map(|mut r| r.remove("note"))
-            }
-            _ => None,
-        }
-    }
-
-    /// The `note` cell of a found raw row; `None` unless it is `Ok(Just _)`.
-    fn found_note(read: IpeResult<String, IpeMaybe<RowCells>>) -> Option<Option<IpeMaybe<String>>> {
-        match read {
-            IpeResult::Ok(IpeMaybe::Just(mut r)) => Some(r.remove("note")),
-            _ => None,
-        }
-    }
-
-    /// One looked-up cell: `None` when the column is absent from the row.
-    type FoundCell = Option<IpeMaybe<String>>;
-
-    /// Both sides' `note` cells of a one-row join; `None` unless it is `Ok` with exactly one pair.
-    fn sole_join_notes(read: IpeResult<String, Vec<JoinRow>>) -> Option<(FoundCell, FoundCell)> {
-        match read {
-            IpeResult::Ok(rows) if rows.len() == 1 => rows
-                .into_iter()
-                .next()
-                .map(|(mut l, mut r)| (l.remove("note"), r.remove("note"))),
-            _ => None,
-        }
-    }
-
-    /// Every app raw read gives a SQL `NULL` cell as `Nothing`, on both join sides too.
-    #[tokio::test]
-    async fn app_raw_reads_keep_null_as_nothing() {
-        let db = null_cells_pool().await;
-        let null = Some(Some(IpeMaybe::Nothing));
-        let key = || sql_eq(sql_column("k".to_string()), sql_param("a".to_string()));
-        let on = || {
-            sql_eq(
-                sql_column("a1.lid".to_string()),
-                sql_column("a0.id".to_string()),
-            )
-        };
-        let note_term = || vec![ProjectionTerm::ColumnTerm("a0".into(), "note".into())];
-
-        assert_eq!(
-            sole_note(db_query(db.clone(), "SELECT note FROM l".into(), vec![]).await),
-            null
-        );
-        assert_eq!(
-            sole_note(db_query_params(db.clone(), "SELECT note FROM l".into(), vec![]).await),
-            null
-        );
-        assert_eq!(
-            found_note(db_get_by_id(db.clone(), "l".into(), "1".into()).await),
-            null
-        );
-        assert_eq!(
-            found_note(db_find_one_by_field(db.clone(), "l".into(), "k".into(), "a".into()).await),
-            null
-        );
-        assert_eq!(
-            sole_note(db_find_many_by_field(db.clone(), "l".into(), "k".into(), "a".into()).await),
-            null
-        );
-        let conditions: HashMap<String, String> =
-            std::iter::once(("k".to_string(), "a".to_string())).collect();
-        assert_eq!(
-            sole_note(db_find_by_conditions(db.clone(), "l".into(), conditions).await),
-            null
-        );
-        assert_eq!(
-            sole_note(db_find_where(db.clone(), "l".into(), key()).await),
-            null
-        );
-        let both_null = Some((Some(IpeMaybe::Nothing), Some(IpeMaybe::Nothing)));
-        assert_eq!(
-            sole_join_notes(
-                db_find_join(
-                    db.clone(),
-                    "l".into(),
-                    "a0".into(),
-                    vec!["id".into(), "note".into()],
-                    "r".into(),
-                    "a1".into(),
-                    vec!["id".into(), "note".into()],
-                    on(),
-                )
-                .await
-            ),
-            both_null
-        );
-        assert_eq!(
-            sole_join_notes(
-                db_find_join_ordered(
-                    db.clone(),
-                    "l".into(),
-                    "a0".into(),
-                    vec!["id".into(), "note".into()],
-                    "r".into(),
-                    "a1".into(),
-                    vec!["id".into(), "note".into()],
-                    on(),
-                    "a0".into(),
-                    "id".into(),
-                    true,
-                )
-                .await
-            ),
-            both_null
-        );
-        let p0 = |read: IpeResult<String, Vec<RowCells>>| match read {
-            IpeResult::Ok(rows) if rows.len() == 1 => {
-                rows.into_iter().next().map(|mut r| r.remove("p0"))
-            }
-            _ => None,
-        };
-        assert_eq!(
-            p0(db_find_projection(
-                db.clone(),
-                "l".into(),
-                "a0".into(),
-                "r".into(),
-                "a1".into(),
-                on(),
-                note_term(),
-                vec![],
-            )
-            .await),
-            null
-        );
-        assert_eq!(
-            p0(db_find_projection_ordered(
-                db.clone(),
-                "l".into(),
-                "a0".into(),
-                "r".into(),
-                "a1".into(),
-                on(),
-                note_term(),
-                vec![],
-                "a0".into(),
-                "id".into(),
-                true,
-            )
-            .await),
-            null
-        );
-    }
-
-    /// The external reads give a SQL `NULL` cell as `Nothing` and an empty-text
-    /// cell as `Just("")`.
-    #[tokio::test]
-    async fn external_raw_reads_keep_null_apart_from_empty_text() {
-        let pool = null_cells_pool().await;
-        let conn = || ExternalConnection::Sqlite(pool.clone());
-        let key = sql_eq(sql_column("k".to_string()), sql_param("a".to_string()));
-        let found: IpeResult<String, Vec<RowCells>> =
-            db_conn_find_where(conn(), "l".into(), key).await;
-        let row = match found {
-            IpeResult::Ok(rows) if rows.len() == 1 => rows.into_iter().next(),
-            _ => None,
-        };
-        assert_eq!(
-            row.as_ref().and_then(|r| r.get("note")),
-            Some(&IpeMaybe::Nothing)
-        );
-        assert_eq!(
-            row.as_ref().and_then(|r| r.get("empty")),
-            Some(&IpeMaybe::Just(String::new()))
-        );
-        let got: IpeResult<String, IpeMaybe<RowCells>> =
-            db_conn_get_by_id(conn(), "l".into(), "1".into()).await;
-        let row = match got {
-            IpeResult::Ok(IpeMaybe::Just(r)) => Some(r),
-            _ => None,
-        };
-        assert_eq!(
-            row.as_ref().and_then(|r| r.get("note")),
-            Some(&IpeMaybe::Nothing)
-        );
-        assert_eq!(
-            row.as_ref().and_then(|r| r.get("empty")),
-            Some(&IpeMaybe::Just(String::new()))
-        );
-    }
-
-    /// A migration ledger row with a SQL `NULL` `checksum` or `name` is the
-    /// corrupt-ledger refusal, never a drift or a match against `""`.
-    #[tokio::test]
-    #[allow(clippy::expect_used)] // test fixture: a failed setup is a failed test
-    async fn migrate_refuses_a_ledger_row_with_a_null_identity() {
-        for seed in [
-            "INSERT INTO _ipe_migrations VALUES ('001_users', NULL, '2026-01-01')",
-            "INSERT INTO _ipe_migrations VALUES (NULL, 'abc', '2026-01-01')",
-        ] {
-            let db = fresh_db().await;
-            sqlx::query(
-                "CREATE TABLE _ipe_migrations (name TEXT PRIMARY KEY, checksum TEXT, \
-                 applied_at TEXT)",
-            )
-            .execute(&db)
-            .await
-            .expect("create a nullable ledger");
-            sqlx::query(seed).execute(&db).await.expect("seed ledger");
-            let migrations = vec![(
-                "001_users".to_string(),
-                "CREATE TABLE users (id INTEGER PRIMARY KEY)".to_string(),
-            )];
-            let r: IpeResult<String, Vec<String>> = db_migrate_apply(db, migrations).await;
-            assert_eq!(
-                r,
-                IpeResult::Err(MIGRATION_LEDGER_NULL_IDENTITY.to_string()),
-                "{seed}"
-            );
-        }
-    }
-
-    /// A stored infinite `REAL` is a typed decode refusal on the app and the
-    /// external decoder paths, never `Nothing` through `db_decode_nullable`;
-    /// the same query over a finite value decodes, so the refusal is the
-    /// non-finite cell and nothing else.
-    #[tokio::test]
-    async fn non_finite_real_refuses_on_both_decoder_paths() {
-        let pool = cells_pool().await;
-        let app = |sql: &str| {
-            db_query_decode_params::<String, IpeMaybe<f64>>(
-                pool.clone(),
-                sql.to_string(),
-                vec![],
-                db_decode_nullable(db_decode_float("x".to_string())),
-            )
-        };
-        assert_eq!(
-            app("SELECT ratio AS x FROM cells").await,
-            IpeResult::Ok(vec![IpeMaybe::Just(1.5)])
-        );
-        assert_eq!(
-            app("SELECT nul AS x FROM cells").await,
-            IpeResult::Ok(vec![IpeMaybe::Nothing])
-        );
-        assert_eq!(
-            app("SELECT pinf AS x FROM cells").await,
-            IpeResult::Err("Unexpected: db: column decode error at index 0".to_string())
-        );
-        assert_eq!(
-            app("SELECT ninf AS x FROM cells").await,
-            IpeResult::Err("Unexpected: db: column decode error at index 0".to_string())
-        );
-
-        let external = |sql: &str| {
-            db_conn_query_decode_params::<String, IpeMaybe<f64>>(
-                ExternalConnection::Sqlite(pool.clone()),
-                sql.to_string(),
-                vec![],
-                db_decode_nullable(db_decode_float("x".to_string())),
-            )
-        };
-        assert_eq!(
-            external("SELECT ratio AS x FROM cells").await,
-            IpeResult::Ok(vec![IpeMaybe::Just(1.5)])
-        );
-        assert_eq!(
-            external("SELECT pinf AS x FROM cells").await,
-            IpeResult::Err("Unexpected: db: column decode error at index 0".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn test_close() {
-        let db = fresh_db().await;
-        let r: IpeResult<String, ()> = db_close(db).await;
-        assert!(matches!(r, IpeResult::Ok(())));
-    }
-
     // ─── Ipe.Db.Sql — SqlFragment builder ────────────────────
-
-    async fn insert_todo(db: &Db, title: &str) {
-        let mut r = HashMap::new();
-        r.insert("title".to_string(), title.to_string());
-        let _: IpeResult<String, i64> = db_insert_row(db.clone(), "todos".into(), r).await;
-    }
-
-    /// `Db.findWhere` with a single `Sql.eq` predicate finds exactly the
-    /// matching row — the `SqlFragment`-typed replacement for
-    /// `unsafeFindWhere`, proving the parameterised channel (never string
-    /// interpolation) still works end-to-end.
-    #[tokio::test]
-    async fn test_find_where_eq() {
-        let db = fresh_db().await;
-        insert_todo(&db, "alpha").await;
-        insert_todo(&db, "beta").await;
-        let frag = sql_eq(
-            sql_column("title".to_string()),
-            sql_param("alpha".to_string()),
-        );
-        let found: IpeResult<String, Vec<RowCells>> = db_find_where(db, "todos".into(), frag).await;
-        match found {
-            IpeResult::Ok(v) => {
-                assert_eq!(v.len(), 1);
-                assert_eq!(v[0].text("title"), Some("alpha"));
-            }
-            IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
-        }
-    }
-
-    /// `Sql.and` composes two predicates; `Sql.gt` on the auto-increment `id`
-    /// column proves numeric comparison (not just string equality).
-    #[tokio::test]
-    async fn test_find_where_and_gt() {
-        let db = fresh_db().await;
-        insert_todo(&db, "alpha").await;
-        insert_todo(&db, "beta").await;
-        insert_todo(&db, "beta").await;
-        let frag = sql_and(
-            sql_eq(
-                sql_column("title".to_string()),
-                sql_param("beta".to_string()),
-            ),
-            sql_gt(sql_column("id".to_string()), sql_param(1_i64)),
-        );
-        let found: IpeResult<String, Vec<RowCells>> = db_find_where(db, "todos".into(), frag).await;
-        match found {
-            IpeResult::Ok(v) => assert_eq!(v.len(), 2),
-            IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
-        }
-    }
-
-    /// A two-table `fresh_db` seeded with `authors` and `books`, joined on
-    /// `books.author_id = authors.id`. Author 1 ("Ada") owns two books; author 2
-    /// ("Bob") owns one.
-    async fn fresh_join_db() -> Db {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("connect in-memory sqlite");
-        sqlx::query("CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1)")
-            .execute(&pool)
-            .await
-            .expect("create authors");
-        sqlx::query("CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT NOT NULL, author_id INTEGER NOT NULL)")
-            .execute(&pool)
-            .await
-            .expect("create books");
-        for (id, name, active) in [(1, "Ada", 1), (2, "Bob", 0)] {
-            sqlx::query("INSERT INTO authors (id, name, active) VALUES (?, ?, ?)")
-                .bind(id)
-                .bind(name)
-                .bind(active)
-                .execute(&pool)
-                .await
-                .expect("seed author");
-        }
-        for (id, title, author_id) in [
-            (10, "Structures", 1),
-            (11, "Engines", 1),
-            (12, "Bridges", 2),
-        ] {
-            sqlx::query("INSERT INTO books (id, title, author_id) VALUES (?, ?, ?)")
-                .bind(id)
-                .bind(title)
-                .bind(author_id)
-                .execute(&pool)
-                .await
-                .expect("seed book");
-        }
-        pool
-    }
-
-    /// `Db.findJoin` returns one paired-map result per matched join row: the
-    /// left map keyed by the books' plain columns, the right by the authors'.
-    /// Three books each join to their author, so three pairs come back — proof
-    /// the alias-prefixed projection splits back into two per-side codec-ready
-    /// maps.
-    #[tokio::test]
-    async fn test_find_join_pairs_both_sides() {
-        let db = fresh_join_db().await;
-        let frag = sql_eq(
-            sql_column("a1.id".to_string()),
-            sql_column("a0.author_id".to_string()),
-        );
-        let found: IpeResult<String, Vec<JoinRow>> = db_find_join(
-            db,
-            "books".into(),
-            "a0".into(),
-            vec!["id".into(), "title".into(), "author_id".into()],
-            "authors".into(),
-            "a1".into(),
-            vec!["id".into(), "name".into(), "active".into()],
-            frag,
-        )
-        .await;
-        match found {
-            IpeResult::Ok(v) => {
-                assert_eq!(v.len(), 3, "three books each join their author");
-                // Every pair's book.author_id equals its author.id, and each
-                // side carries its own plain-keyed columns (no `a0__` leakage).
-                for (book, author) in &v {
-                    assert!(book.contains_key("title"), "left map keyed plainly");
-                    assert!(author.contains_key("name"), "right map keyed plainly");
-                    assert!(
-                        !book.keys().any(|k| k.contains("__")),
-                        "no alias prefix leaks"
-                    );
-                    assert_eq!(book.get("author_id"), author.get("id"));
-                }
-            }
-            IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
-        }
-    }
-
-    /// A filter predicate on the joined columns binds its value as a parameter,
-    /// never interpolated: restricting to active authors returns only Ada's two
-    /// books, and the bound `1` never appears in the SQL text (it is a `?`).
-    #[tokio::test]
-    async fn test_find_join_filter_binds_param() {
-        let db = fresh_join_db().await;
-        let frag = sql_and(
-            sql_eq(
-                sql_column("a1.id".to_string()),
-                sql_column("a0.author_id".to_string()),
-            ),
-            sql_eq(sql_column("a1.active".to_string()), sql_param(1_i64)),
-        );
-        // The composed fragment's SQL is placeholder-only: the value 1 is a bind.
-        assert!(
-            !frag.sql.contains('1') || frag.sql.contains('?'),
-            "filter value must bind as ? not interpolate"
-        );
-        assert_eq!(
-            frag.binds.len(),
-            1,
-            "exactly one bound value (the active flag)"
-        );
-        let found: IpeResult<String, Vec<JoinRow>> = db_find_join(
-            db,
-            "books".into(),
-            "a0".into(),
-            vec!["id".into(), "title".into(), "author_id".into()],
-            "authors".into(),
-            "a1".into(),
-            vec!["id".into(), "name".into()],
-            frag,
-        )
-        .await;
-        match found {
-            IpeResult::Ok(v) => {
-                assert_eq!(v.len(), 2, "only active author Ada's two books");
-                for (_book, author) in &v {
-                    assert_eq!(author.text("name"), Some("Ada"));
-                }
-            }
-            IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
-        }
-    }
-
-    /// A join side whose table is not a valid SQL identifier fails closed with a
-    /// typed error, issuing no SQL — the runtime re-validation gate.
-    #[tokio::test]
-    async fn test_find_join_rejects_bad_identifier() {
-        let db = fresh_join_db().await;
-        let frag = sql_eq(
-            sql_column("a1.id".to_string()),
-            sql_column("a0.author_id".to_string()),
-        );
-        let found: IpeResult<String, Vec<JoinRow>> = db_find_join(
-            db,
-            "books; DROP TABLE authors".into(),
-            "a0".into(),
-            vec!["id".into()],
-            "authors".into(),
-            "a1".into(),
-            vec!["id".into()],
-            frag,
-        )
-        .await;
-        assert!(
-            matches!(found, IpeResult::Err(_)),
-            "a non-identifier table must fail closed"
-        );
-    }
 
     /// Golden SQL: an inner join lowers to EXACTLY one parameterized statement
     /// — `SELECT a0.col AS a0__col, … FROM lt AS a0, rt AS a1 WHERE a0.k =
@@ -12043,33 +8829,6 @@ mod tests {
         assert!(
             sql.contains('?') && !sql.contains(" 1)"),
             "the filter value is a placeholder, not interpolated text"
-        );
-    }
-
-    /// Two sides that share an alias are rejected: the projection and WHERE
-    /// could not tell the sides apart, so fail closed rather than emit an
-    /// ambiguous statement.
-    #[tokio::test]
-    async fn test_find_join_rejects_shared_alias() {
-        let db = fresh_join_db().await;
-        let frag = sql_eq(
-            sql_column("a0.id".to_string()),
-            sql_column("a0.author_id".to_string()),
-        );
-        let found: IpeResult<String, Vec<JoinRow>> = db_find_join(
-            db,
-            "books".into(),
-            "a0".into(),
-            vec!["id".into()],
-            "authors".into(),
-            "a0".into(),
-            vec!["id".into()],
-            frag,
-        )
-        .await;
-        assert!(
-            matches!(found, IpeResult::Err(_)),
-            "a shared alias must fail closed"
         );
     }
 
@@ -12232,185 +8991,6 @@ mod tests {
         assert!(built.is_err(), "an empty projection must fail closed");
     }
 
-    /// `Db.findProjection` reads only the projected column, keyed by the output
-    /// name `p0`: projecting the author name over the active-author join returns
-    /// Ada's two books' author name, each row carrying just `p0` (column
-    /// pushdown), and the filter value binds as a parameter.
-    #[tokio::test]
-    async fn test_find_projection_single_column() {
-        let db = fresh_join_db().await;
-        let frag = sql_and(
-            sql_eq(
-                sql_column("a1.id".to_string()),
-                sql_column("a0.author_id".to_string()),
-            ),
-            sql_eq(sql_column("a1.active".to_string()), sql_param(1_i64)),
-        );
-        let found: IpeResult<String, Vec<RowCells>> = db_find_projection(
-            db,
-            "books".into(),
-            "a0".into(),
-            "authors".into(),
-            "a1".into(),
-            frag,
-            vec![ProjectionTerm::ColumnTerm("a1".into(), "name".into())],
-            vec![],
-        )
-        .await;
-        match found {
-            IpeResult::Ok(rows) => {
-                assert_eq!(rows.len(), 2, "only active author Ada's two books");
-                for row in &rows {
-                    assert_eq!(row.text("p0"), Some("Ada"));
-                    assert_eq!(row.len(), 1, "only the projected column is read");
-                }
-            }
-            IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
-        }
-    }
-
-    /// `Db.findProjection` reads two projected columns over the active-author
-    /// join, each keyed by its own output name (`p0` = book title, `p1` = author
-    /// name), in projection order (column pushdown). The filter value binds as a
-    /// parameter; each returned row carries exactly the two projected columns.
-    #[tokio::test]
-    async fn test_find_projection_two_columns() {
-        let db = fresh_join_db().await;
-        let frag = sql_and(
-            sql_eq(
-                sql_column("a1.id".to_string()),
-                sql_column("a0.author_id".to_string()),
-            ),
-            sql_eq(sql_column("a1.active".to_string()), sql_param(1_i64)),
-        );
-        let found: IpeResult<String, Vec<RowCells>> = db_find_projection(
-            db,
-            "books".into(),
-            "a0".into(),
-            "authors".into(),
-            "a1".into(),
-            frag,
-            vec![
-                ProjectionTerm::ColumnTerm("a0".into(), "title".into()),
-                ProjectionTerm::ColumnTerm("a1".into(), "name".into()),
-            ],
-            vec![],
-        )
-        .await;
-        match found {
-            IpeResult::Ok(rows) => {
-                assert_eq!(rows.len(), 2, "only active author Ada's two books");
-                let mut titles: Vec<&str> = rows.iter().filter_map(|r| r.text("p0")).collect();
-                titles.sort_unstable();
-                assert_eq!(titles, ["Engines", "Structures"], "p0 is the book title");
-                for row in &rows {
-                    assert_eq!(row.text("p1"), Some("Ada"));
-                    assert_eq!(row.len(), 2, "exactly the two projected columns");
-                }
-            }
-            IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
-        }
-    }
-
-    /// `Db.deleteWhere` removes exactly the matching rows and returns the
-    /// affected row count.
-    #[tokio::test]
-    async fn test_delete_where() {
-        let db = fresh_db().await;
-        insert_todo(&db, "alpha").await;
-        insert_todo(&db, "beta").await;
-        let frag = sql_eq(
-            sql_column("title".to_string()),
-            sql_param("alpha".to_string()),
-        );
-        let deleted: IpeResult<String, i64> =
-            db_delete_where(db.clone(), "todos".into(), frag).await;
-        assert_eq!(deleted, IpeResult::Ok(1));
-        let remaining: IpeResult<String, Vec<RowCells>> = db_find_where(
-            db,
-            "todos".into(),
-            sql_is_not_null(sql_column("title".to_string())),
-        )
-        .await;
-        match remaining {
-            IpeResult::Ok(v) => assert_eq!(v.len(), 1),
-            IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
-        }
-    }
-
-    /// `Sql.inList` with a non-empty list matches every listed value.
-    #[tokio::test]
-    async fn test_in_list_non_empty() {
-        let db = fresh_db().await;
-        insert_todo(&db, "alpha").await;
-        insert_todo(&db, "beta").await;
-        insert_todo(&db, "gamma").await;
-        let frag = sql_in_list(
-            sql_column("title".to_string()),
-            vec![
-                SqlParam::Text("alpha".to_string()),
-                SqlParam::Text("gamma".to_string()),
-            ],
-        );
-        let found: IpeResult<String, Vec<RowCells>> = db_find_where(db, "todos".into(), frag).await;
-        match found {
-            IpeResult::Ok(v) => assert_eq!(v.len(), 2),
-            IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
-        }
-    }
-
-    /// Empty `Sql.inList` emits `(1 = 0)` (always-false) rather than the SQL
-    /// syntax error `IN ()` — a real column reference stays a real column
-    /// reference, but the whole predicate matches nothing.
-    #[tokio::test]
-    async fn test_in_list_empty_matches_nothing() {
-        let db = fresh_db().await;
-        insert_todo(&db, "alpha").await;
-        let frag = sql_in_list(sql_column("title".to_string()), Vec::new());
-        let found: IpeResult<String, Vec<RowCells>> = db_find_where(db, "todos".into(), frag).await;
-        match found {
-            IpeResult::Ok(v) => assert_eq!(v.len(), 0),
-            IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
-        }
-    }
-
-    /// `Sql.column` accepts a dotted reference (`table.column`) via
-    /// `SqlIdent::parse_dotted`, distinct from `SqlIdent::parse_plain`
-    /// (table-name-only, dot-rejecting) used for the table argument itself.
-    #[tokio::test]
-    async fn test_column_accepts_dotted_reference() {
-        let db = fresh_db().await;
-        insert_todo(&db, "alpha").await;
-        let frag = sql_eq(
-            sql_column("todos.title".to_string()),
-            sql_param("alpha".to_string()),
-        );
-        let found: IpeResult<String, Vec<RowCells>> = db_find_where(db, "todos".into(), frag).await;
-        match found {
-            IpeResult::Ok(v) => assert_eq!(v.len(), 1),
-            IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
-        }
-    }
-
-    /// An invalid `Sql.column` identifier poisons the fragment instead of
-    /// panicking or interpolating unchecked text; `Db.findWhere` surfaces the
-    /// poison as a `Task::Err`, never malformed SQL.
-    #[tokio::test]
-    async fn test_poisoned_column_surfaces_as_task_err() {
-        let db = fresh_db().await;
-        insert_todo(&db, "alpha").await;
-        // Space + semicolon are outside `valid_sql_ident`'s charset.
-        let frag = sql_eq(
-            sql_column("title; DROP TABLE todos".to_string()),
-            sql_param("alpha".to_string()),
-        );
-        let found: IpeResult<String, Vec<RowCells>> = db_find_where(db, "todos".into(), frag).await;
-        assert!(
-            matches!(found, IpeResult::Err(_)),
-            "poisoned column must surface as Task::Err, got {found:?}"
-        );
-    }
-
     /// SECURITY: `sql_unsafe_fragment` (the `Ipe.Db.Unsafe.unsafeFragment`
     /// runtime) DELIBERATELY skips the `valid_sql_ident` gate that
     /// [`sql_column`] applies. On the SAME identifier that `sql_column` poisons,
@@ -12483,74 +9063,6 @@ mod tests {
     // two functions that route through the placeholder path. They lock the
     // contract across the build_sql → db_format_sql+bind deepening: same
     // round-trip values, same injection-safety, no behavior drift.
-
-    /// A parameterised INSERT via db_exec then a parameterised SELECT via
-    /// db_query round-trips the bound values.
-    #[tokio::test]
-    async fn test_exec_and_query_with_params() {
-        let db = fresh_db().await;
-        let ins: IpeResult<String, i64> = db_exec(
-            db.clone(),
-            "INSERT INTO todos (title, done) VALUES (?, ?)".into(),
-            vec!["buy milk".to_string(), "0".to_string()],
-        )
-        .await;
-        assert!(matches!(ins, IpeResult::Ok(1))); // exec returns rows-affected
-
-        let rows: IpeResult<String, Vec<RowCells>> = db_query(
-            db,
-            "SELECT title, done FROM todos WHERE title = ?".into(),
-            vec!["buy milk".to_string()],
-        )
-        .await;
-        match rows {
-            IpeResult::Ok(v) => {
-                assert_eq!(v.len(), 1);
-                assert_eq!(v[0].text("title"), Some("buy milk"));
-                assert_eq!(v[0].text("done"), Some("0"));
-            }
-            other => panic!("unexpected: {:?}", other),
-        }
-    }
-
-    /// The load-bearing safety property: a value carrying single quotes and SQL
-    /// metacharacters is bound, not spliced — stored and returned VERBATIM, and
-    /// the surrounding table is untouched (no injection executes).
-    #[tokio::test]
-    async fn test_query_param_with_quotes_and_metachars_roundtrips_safely() {
-        let db = fresh_db().await;
-        let nasty = "x'); DROP TABLE todos;-- O'Brien".to_string();
-        let ins: IpeResult<String, i64> = db_exec(
-            db.clone(),
-            "INSERT INTO todos (title, done) VALUES (?, ?)".into(),
-            vec![nasty.clone(), "0".to_string()],
-        )
-        .await;
-        assert!(matches!(ins, IpeResult::Ok(1))); // exec returns rows-affected
-
-        // The value comes back byte-for-byte (proves it was bound, not splice-escaped-into-SQL).
-        let rows: IpeResult<String, Vec<RowCells>> = db_query(
-            db.clone(),
-            "SELECT title FROM todos WHERE title = ?".into(),
-            vec![nasty.clone()],
-        )
-        .await;
-        match rows {
-            IpeResult::Ok(v) => {
-                assert_eq!(v.len(), 1);
-                assert_eq!(v[0].text("title"), Some(nasty.as_str()));
-            }
-            other => panic!("unexpected: {:?}", other),
-        }
-
-        // The table still exists with exactly the one row — the DROP never ran.
-        let all: IpeResult<String, Vec<RowCells>> =
-            db_query(db, "SELECT title FROM todos".into(), vec![]).await;
-        match all {
-            IpeResult::Ok(v) => assert_eq!(v.len(), 1, "injection must not have dropped the table"),
-            other => panic!("table gone or errored: {:?}", other),
-        }
-    }
 
     fn upsert_sql(
         target: &[&str],
@@ -12808,402 +9320,6 @@ mod tests {
         }
     }
 
-    /// Round-trip on SQLite: a conflicting upsert UPDATES the row in place —
-    /// rowid unchanged, the column outside the SET list preserved, still one
-    /// row — the semantics `INSERT OR REPLACE` would break. A `DO NOTHING`
-    /// upsert meeting the existing row affects zero rows.
-    #[tokio::test]
-    async fn upsert_fields_updates_in_place_on_sqlite() {
-        let db = fresh_db().await;
-        let mk: IpeResult<String, i64> = db_exec_raw(
-            db.clone(),
-            "CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT, note TEXT DEFAULT 'none')".to_string(),
-        )
-        .await;
-        assert!(matches!(mk, IpeResult::Ok(_)), "create: {mk:?}");
-
-        let upsert = |v: &str| {
-            db_upsert_fields::<String>(
-                db.clone(),
-                "kv".to_string(),
-                vec!["k".to_string()],
-                vec![
-                    ("k".to_string(), Some(SqlParam::Text("a".to_string()))),
-                    ("v".to_string(), Some(SqlParam::Text(v.to_string()))),
-                    ("note".to_string(), None),
-                ],
-            )
-        };
-        let first = upsert("1").await;
-        assert!(matches!(first, IpeResult::Ok(1)), "insert: {first:?}");
-        let noted: IpeResult<String, i64> = db_exec_raw(
-            db.clone(),
-            "UPDATE kv SET note = 'kept' WHERE k = 'a'".to_string(),
-        )
-        .await;
-        assert!(matches!(noted, IpeResult::Ok(1)), "note: {noted:?}");
-        // A later row raises max(rowid), so a delete-then-insert of `a` would
-        // be assigned a fresh rowid rather than reusing its old one.
-        let other: IpeResult<String, i64> = db_exec_raw(
-            db.clone(),
-            "INSERT INTO kv (k, v) VALUES ('b', 'x')".to_string(),
-        )
-        .await;
-        assert!(matches!(other, IpeResult::Ok(1)), "second row: {other:?}");
-
-        let read = || {
-            db_query_params::<String>(
-                db.clone(),
-                "SELECT rowid AS rid, v, note FROM kv WHERE k = 'a'".to_string(),
-                Vec::new(),
-            )
-        };
-        let before = read().await.with_default(Vec::new());
-        let rid_before = before.first().and_then(|r| r.get("rid")).cloned();
-        assert!(rid_before.is_some(), "row missing after insert: {before:?}");
-
-        let second = upsert("2").await;
-        assert!(matches!(second, IpeResult::Ok(1)), "update: {second:?}");
-        let after = read().await.with_default(Vec::new());
-        assert_eq!(
-            after.len(),
-            1,
-            "conflict must update, not add a row: {after:?}"
-        );
-        let all: IpeResult<String, Vec<RowCells>> =
-            db_query_params(db.clone(), "SELECT k FROM kv".to_string(), Vec::new()).await;
-        assert_eq!(all.with_default(Vec::new()).len(), 2, "row count changed");
-        let row = after.first();
-        assert_eq!(
-            row.and_then(|r| r.get("rid")).cloned(),
-            rid_before,
-            "rowid changed"
-        );
-        assert_eq!(row.and_then(|r| r.text("v")), Some("2"));
-        assert_eq!(
-            row.and_then(|r| r.text("note")),
-            Some("kept"),
-            "column outside the SET list must be preserved"
-        );
-
-        let key_only: IpeResult<String, i64> = db_upsert_fields(
-            db.clone(),
-            "kv".to_string(),
-            vec!["k".to_string()],
-            vec![("k".to_string(), Some(SqlParam::Text("a".to_string())))],
-        )
-        .await;
-        assert!(
-            matches!(key_only, IpeResult::Ok(0)),
-            "DO NOTHING on an existing key affects no row: {key_only:?}"
-        );
-        let last = read().await.with_default(Vec::new());
-        assert_eq!(
-            last.first().and_then(|r| r.text("v")),
-            Some("2"),
-            "DO NOTHING must leave the row untouched"
-        );
-    }
-
-    #[tokio::test]
-    async fn update_fields_refuses_unscoped_update() {
-        let db = fresh_db().await;
-        let mk: IpeResult<String, i64> = db_exec_raw(
-            db.clone(),
-            "CREATE TABLE acct (id INTEGER PRIMARY KEY, bal INTEGER)".to_string(),
-        )
-        .await;
-        assert!(matches!(mk, IpeResult::Ok(_)), "create: {mk:?}");
-        let _: IpeResult<String, i64> = db_exec_raw(
-            db.clone(),
-            "INSERT INTO acct (bal) VALUES (10), (20)".to_string(),
-        )
-        .await;
-
-        // Empty WHERE-column set MUST be refused (would otherwise mass-update
-        // every row), NOT silently rewrite the whole table.
-        let r: IpeResult<String, i64> = db_update_fields(
-            db.clone(),
-            "acct".to_string(),
-            vec![], // no WHERE
-            vec![("bal".to_string(), Some(SqlParam::Int(0)))],
-        )
-        .await;
-        assert!(
-            matches!(r, IpeResult::Err(_)),
-            "empty WHERE must be refused, got {r:?}"
-        );
-        // No row should have been zeroed.
-        let zeroed: IpeResult<String, Vec<RowCells>> = db_query_params(
-            db.clone(),
-            "SELECT bal FROM acct WHERE bal = ?".to_string(),
-            vec![SqlParam::Int(0)],
-        )
-        .await;
-        assert_eq!(
-            zeroed.with_default(Vec::new()).len(),
-            0,
-            "no row should have been mass-updated"
-        );
-        // A scoped update still works (affects exactly 1 row).
-        let ok: IpeResult<String, i64> = db_update_fields(
-            db.clone(),
-            "acct".to_string(),
-            vec![("id".to_string(), SqlParam::Int(1))],
-            vec![("bal".to_string(), Some(SqlParam::Int(99)))],
-        )
-        .await;
-        assert!(
-            matches!(ok, IpeResult::Ok(1)),
-            "scoped update should affect 1 row: {ok:?}"
-        );
-    }
-
-    /// The runtime contract the Ipê-side `Store.updateAs` relies on to enforce an
-    /// `immutable` policy column: `updateAs` drops every immutable column from the
-    /// SET (turns it into an OmitField), so the emitted UPDATE never names that
-    /// column. This test drives `db_update_where` exactly as the fixed `updateAs`
-    /// does — the immutable column omitted, a mutable column set, scoped by the
-    /// owner filter — and proves the immutable value is UNCHANGED while the mutable
-    /// value changes. The companion `update_where_sets_immutable_column_when_not_dropped`
-    /// proves the omission is load-bearing: were the column left in the SET (the
-    /// pre-fix behaviour), the value WOULD change. Together they show the drop is
-    /// what enforces immutability, not an incidental no-op.
-    #[tokio::test]
-    async fn update_where_omitting_immutable_column_leaves_it_unchanged() {
-        let db = fresh_db().await;
-        let _: IpeResult<String, i64> = db_exec_raw(
-            db.clone(),
-            "CREATE TABLE docs (body TEXT PRIMARY KEY, owner TEXT, stamped TEXT)".to_string(),
-        )
-        .await;
-        let _: IpeResult<String, i64> = db_exec_raw(
-            db.clone(),
-            "INSERT INTO docs (body, owner, stamped) VALUES ('doc1', 'alice', 'original')"
-                .to_string(),
-        )
-        .await;
-
-        // An update scoped by pk AND the owner filter whose SET carries a
-        // written column but NOT `stamped` (dropped the way `updateAs` drops
-        // every immutable and owner column). The caller's attempt to set a new
-        // `stamped` value is simply absent.
-        let updated: IpeResult<String, i64> = db_update_where(
-            db.clone(),
-            "docs".to_string(),
-            vec![
-                (
-                    "owner".to_string(),
-                    Some(SqlParam::Text("alice".to_string())),
-                ),
-                ("stamped".to_string(), None), // OmitField — dropped by the immutable policy
-            ],
-            sql_and(
-                sql_eq(
-                    sql_column("body".to_string()),
-                    sql_param("doc1".to_string()),
-                ),
-                sql_eq(
-                    sql_column("owner".to_string()),
-                    sql_param("alice".to_string()),
-                ),
-            ),
-        )
-        .await;
-        assert!(
-            matches!(updated, IpeResult::Ok(1)),
-            "the owner-scoped update should affect exactly the caller's row: {updated:?}"
-        );
-
-        let rows: IpeResult<String, Vec<RowCells>> = db_query_params(
-            db.clone(),
-            "SELECT stamped FROM docs WHERE body = ?".to_string(),
-            vec![SqlParam::Text("doc1".to_string())],
-        )
-        .await;
-        match rows {
-            IpeResult::Ok(v) => {
-                assert_eq!(v.len(), 1, "the row must still exist");
-                assert_eq!(
-                    v[0].text("stamped"),
-                    Some("original"),
-                    "the immutable column MUST retain its insert-time value — a \
-                     dropped (OmitField) column is never written by an update"
-                );
-            }
-            other => panic!("read back failed: {other:?}"),
-        }
-    }
-
-    /// The load-bearing half of the immutable proof: if the immutable column were
-    /// NOT dropped (left as a SetField, the pre-fix behaviour), the same update
-    /// WOULD overwrite it. Demonstrates that the `dropColumns` omission in
-    /// `updateAs` is exactly what prevents the change — not an accident of the
-    /// runtime refusing it anyway.
-    #[tokio::test]
-    async fn update_where_sets_immutable_column_when_not_dropped() {
-        let db = fresh_db().await;
-        let _: IpeResult<String, i64> = db_exec_raw(
-            db.clone(),
-            "CREATE TABLE docs (body TEXT PRIMARY KEY, owner TEXT, stamped TEXT)".to_string(),
-        )
-        .await;
-        let _: IpeResult<String, i64> = db_exec_raw(
-            db.clone(),
-            "INSERT INTO docs (body, owner, stamped) VALUES ('doc1', 'alice', 'original')"
-                .to_string(),
-        )
-        .await;
-
-        // Same update, but with `stamped` left IN the SET (SetField). This is
-        // the outcome the fix prevents.
-        let updated: IpeResult<String, i64> = db_update_where(
-            db.clone(),
-            "docs".to_string(),
-            vec![(
-                "stamped".to_string(),
-                Some(SqlParam::Text("tampered".to_string())),
-            )],
-            sql_eq(
-                sql_column("body".to_string()),
-                sql_param("doc1".to_string()),
-            ),
-        )
-        .await;
-        assert!(matches!(updated, IpeResult::Ok(1)), "{updated:?}");
-
-        let rows: IpeResult<String, Vec<RowCells>> = db_query_params(
-            db.clone(),
-            "SELECT stamped FROM docs WHERE body = ?".to_string(),
-            vec![SqlParam::Text("doc1".to_string())],
-        )
-        .await;
-        match rows {
-            IpeResult::Ok(v) => {
-                assert_eq!(
-                    v[0].text("stamped"),
-                    Some("tampered"),
-                    "with the immutable column left in the SET it WOULD change — \
-                     confirming the drop is what enforces immutability"
-                );
-            }
-            other => panic!("read back failed: {other:?}"),
-        }
-    }
-
-    /// `db_update_where` mirrors `db_update_fields`' guards on the WHERE-fragment
-    /// path: an empty WHERE fragment is refused (no mass-update), a scoped update
-    /// touches only the matching rows, and a SET value carrying SQL metacharacters
-    /// is bound (stored verbatim), never spliced.
-    #[tokio::test]
-    async fn update_where_scopes_binds_and_refuses_empty() {
-        let db = fresh_db().await;
-        let mk: IpeResult<String, i64> = db_exec_raw(
-            db.clone(),
-            "CREATE TABLE acct (id INTEGER PRIMARY KEY, owner TEXT, bal INTEGER)".to_string(),
-        )
-        .await;
-        assert!(matches!(mk, IpeResult::Ok(_)), "create: {mk:?}");
-        let _: IpeResult<String, i64> = db_exec_raw(
-            db.clone(),
-            "INSERT INTO acct (id, owner, bal) VALUES (1, 'a', 10), (2, 'b', 20)".to_string(),
-        )
-        .await;
-
-        // Empty WHERE fragment MUST be refused (would otherwise mass-update).
-        let refused: IpeResult<String, i64> = db_update_where(
-            db.clone(),
-            "acct".to_string(),
-            vec![("bal".to_string(), Some(SqlParam::Int(0)))],
-            sql_unsafe_fragment(String::new()),
-        )
-        .await;
-        assert!(
-            matches!(refused, IpeResult::Err(_)),
-            "empty WHERE must be refused, got {refused:?}"
-        );
-        let zeroed: IpeResult<String, Vec<RowCells>> = db_query_params(
-            db.clone(),
-            "SELECT bal FROM acct WHERE bal = ?".to_string(),
-            vec![SqlParam::Int(0)],
-        )
-        .await;
-        assert_eq!(
-            zeroed.with_default(Vec::new()).len(),
-            0,
-            "no row should have been mass-updated"
-        );
-
-        // A scoped update with an injection-laden SET value affects exactly the
-        // matching row and stores the value VERBATIM (bound, not spliced).
-        let nasty = "x'); DROP TABLE acct;-- O'Brien".to_string();
-        let scoped: IpeResult<String, i64> = db_update_where(
-            db.clone(),
-            "acct".to_string(),
-            vec![("owner".to_string(), Some(SqlParam::Text(nasty.clone())))],
-            sql_eq(sql_column("id".to_string()), sql_param(1i64)),
-        )
-        .await;
-        assert!(
-            matches!(scoped, IpeResult::Ok(1)),
-            "scoped update should affect exactly 1 row: {scoped:?}"
-        );
-
-        // The matching row carries the verbatim value; the non-matching row is
-        // untouched; and the table still exists (the DROP never ran).
-        let rows: IpeResult<String, Vec<RowCells>> = db_query_params(
-            db.clone(),
-            "SELECT id, owner FROM acct ORDER BY id".to_string(),
-            vec![],
-        )
-        .await;
-        match rows {
-            IpeResult::Ok(v) => {
-                assert_eq!(v.len(), 2, "injection must not have dropped the table");
-                assert_eq!(
-                    v[0].text("owner"),
-                    Some(nasty.as_str()),
-                    "matching row updated"
-                );
-                assert_eq!(v[1].text("owner"), Some("b"), "non-matching row untouched");
-            }
-            other => panic!("table gone or errored: {other:?}"),
-        }
-
-        // An all-OmitField SET updates no columns and reports zero rows.
-        let omitted: IpeResult<String, i64> = db_update_where(
-            db.clone(),
-            "acct".to_string(),
-            vec![("owner".to_string(), None)],
-            sql_eq(sql_column("id".to_string()), sql_param(2i64)),
-        )
-        .await;
-        assert!(
-            matches!(omitted, IpeResult::Ok(0)),
-            "all-OmitField SET reports zero rows: {omitted:?}"
-        );
-    }
-
-    // AUD-07 (a): when DATABASE_URL is absent, ipe_db_url() returns the sqlite
-    // file default — never the hardcoded "sqlite::memory:" that caused silent
-    // data loss on every Db.connect() call.
-    #[test]
-    fn ipe_db_url_fallback_is_sqlite_file() {
-        if crate::system::read_env_var("DATABASE_URL").is_ok() {
-            // DATABASE_URL already set; test (b) covers the env-read path.
-            return;
-        }
-        let url = crate::config::ipe_db_url();
-        assert!(
-            !url.contains(":memory:"),
-            "default URL must not be in-memory: {url}"
-        );
-        assert!(
-            url.contains("ipe.db"),
-            "default URL must reference a named file: {url}"
-        );
-    }
-
     // AUD-07 (b): with DATABASE_URL set, ipe_db_url() returns it verbatim.
     #[test]
     fn ipe_db_url_reads_database_url_env() {
@@ -13212,45 +9328,6 @@ mod tests {
         let url = crate::config::ipe_db_url();
         locked_remove_var("DATABASE_URL");
         assert_eq!(url, "postgres://ci-host/testdb_aud07");
-    }
-
-    // AUD-07 (c): two sequential operator connects with the same file URL
-    // observe the same database — data written via one pool is visible via the
-    // other. Proves the old sqlite::memory: per-call-fresh-db bug is closed.
-    #[tokio::test]
-    async fn ipe_db_url_shared_connection_sees_same_data() {
-        use crate::system::{locked_remove_var, locked_set_var};
-        let tmp = crate::scratch_core::test_temp_root()
-            .join(format!("ipe_aud07_shared_{}.db", std::process::id()));
-        let url = format!("sqlite://{}?mode=rwc", tmp.display());
-        locked_set_var("DATABASE_URL", &url);
-        let resolved = crate::config::ipe_db_url();
-        locked_remove_var("DATABASE_URL");
-
-        let conn1 = connect_operator::<String>(resolved.clone()).await;
-        let conn2 = connect_operator::<String>(resolved).await;
-        let pool1 = match conn1 {
-            IpeResult::Ok(p) => p,
-            IpeResult::Err(e) => panic!("connect1 failed: {e}"),
-        };
-        let pool2 = match conn2 {
-            IpeResult::Ok(p) => p,
-            IpeResult::Err(e) => panic!("connect2 failed: {e}"),
-        };
-        sqlx::query("CREATE TABLE IF NOT EXISTS aud07_t (v INTEGER NOT NULL)")
-            .execute(&pool1)
-            .await
-            .expect("create table");
-        sqlx::query("INSERT INTO aud07_t VALUES (99)")
-            .execute(&pool1)
-            .await
-            .expect("insert");
-        let (v,): (i64,) = sqlx::query_as("SELECT v FROM aud07_t")
-            .fetch_one(&pool2)
-            .await
-            .expect("select");
-        assert_eq!(v, 99, "data written via pool1 must be visible via pool2");
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// A corpus of identifiers that MUST be rejected at the SQL-interpolation
@@ -13354,205 +9431,6 @@ mod tests {
                 "plain parser must reject dot-bearing {dotted:?}"
             );
         }
-    }
-
-    /// SSOT proof (entry level): every public kernel that interpolates a
-    /// table/column identifier into SQL routes through the single validator and
-    /// fails CLOSED on a hostile identifier. Each entry is driven with a hostile
-    /// value in its identifier position(s); an `IpeResult::Ok` here means a path
-    /// reached SQL without validating — the boundary is broken. A new
-    /// identifier-accepting entry that skips the validator will fail this test.
-    #[tokio::test]
-    async fn every_identifier_entry_rejects_hostile_idents() {
-        let db = fresh_db().await;
-        for &h in HOSTILE_IDENTS {
-            let hs = h.to_string();
-
-            macro_rules! assert_rejects {
-                ($label:expr, $task:expr) => {{
-                    let r: IpeResult<String, _> = $task.await;
-                    assert!(
-                        matches!(r, IpeResult::Err(_)),
-                        "{} must reject hostile identifier {:?}, got Ok",
-                        $label,
-                        h
-                    );
-                }};
-            }
-
-            // Table-identifier position.
-            assert_rejects!(
-                "db_get_by_id(table)",
-                db_get_by_id(db.clone(), hs.clone(), "1".to_string())
-            );
-            assert_rejects!(
-                "db_delete_by_id(table)",
-                db_delete_by_id(db.clone(), hs.clone(), "1".to_string())
-            );
-            assert_rejects!(
-                "db_insert_row(table)",
-                db_insert_row(db.clone(), hs.clone(), {
-                    let mut m = HashMap::new();
-                    m.insert("title".to_string(), "x".to_string());
-                    m
-                })
-            );
-            assert_rejects!(
-                "db_update_by_id(table)",
-                db_update_by_id(db.clone(), hs.clone(), "1".to_string(), {
-                    let mut m = HashMap::new();
-                    m.insert("title".to_string(), "x".to_string());
-                    m
-                })
-            );
-            assert_rejects!(
-                "db_find_by_conditions(table)",
-                db_find_by_conditions(db.clone(), hs.clone(), {
-                    let mut m = HashMap::new();
-                    m.insert("title".to_string(), "x".to_string());
-                    m
-                })
-            );
-            assert_rejects!(
-                "db_find_where(table)",
-                db_find_where(
-                    db.clone(),
-                    hs.clone(),
-                    sql_eq(sql_column("title".to_string()), sql_param("x".to_string())),
-                )
-            );
-            assert_rejects!(
-                "db_delete_where(table)",
-                db_delete_where(
-                    db.clone(),
-                    hs.clone(),
-                    sql_eq(sql_column("title".to_string()), sql_param("x".to_string())),
-                )
-            );
-            assert_rejects!(
-                "db_insert_fields(table)",
-                db_insert_fields(
-                    db.clone(),
-                    hs.clone(),
-                    vec![("title".to_string(), Some(SqlParam::Text("x".to_string())))],
-                )
-            );
-            assert_rejects!(
-                "db_update_fields(table)",
-                db_update_fields(
-                    db.clone(),
-                    hs.clone(),
-                    vec![("id".to_string(), SqlParam::Int(1))],
-                    vec![("title".to_string(), Some(SqlParam::Text("x".to_string())))],
-                )
-            );
-
-            // Field/column-identifier position.
-            assert_rejects!(
-                "db_find_one_by_field(field)",
-                db_find_one_by_field(db.clone(), "todos".to_string(), hs.clone(), "x".to_string())
-            );
-            assert_rejects!(
-                "db_find_many_by_field(field)",
-                db_find_many_by_field(db.clone(), "todos".to_string(), hs.clone(), "x".to_string())
-            );
-            assert_rejects!(
-                "db_find_by_conditions(column)",
-                db_find_by_conditions(db.clone(), "todos".to_string(), {
-                    let mut m = HashMap::new();
-                    m.insert(hs.clone(), "x".to_string());
-                    m
-                })
-            );
-            assert_rejects!(
-                "db_insert_fields(column)",
-                db_insert_fields(
-                    db.clone(),
-                    "todos".to_string(),
-                    vec![(hs.clone(), Some(SqlParam::Text("x".to_string())))],
-                )
-            );
-            assert_rejects!(
-                "db_update_fields(set column)",
-                db_update_fields(
-                    db.clone(),
-                    "todos".to_string(),
-                    vec![("id".to_string(), SqlParam::Int(1))],
-                    vec![(hs.clone(), Some(SqlParam::Text("x".to_string())))],
-                )
-            );
-            assert_rejects!(
-                "db_update_fields(where column)",
-                db_update_fields(
-                    db.clone(),
-                    "todos".to_string(),
-                    vec![(hs.clone(), SqlParam::Int(1))],
-                    vec![("title".to_string(), Some(SqlParam::Text("x".to_string())))],
-                )
-            );
-            assert_rejects!(
-                "db_update_where(table)",
-                db_update_where(
-                    db.clone(),
-                    hs.clone(),
-                    vec![("title".to_string(), Some(SqlParam::Text("x".to_string())))],
-                    sql_eq(sql_column("id".to_string()), sql_param("1".to_string())),
-                )
-            );
-            assert_rejects!(
-                "db_upsert_fields(table)",
-                db_upsert_fields(
-                    db.clone(),
-                    hs.clone(),
-                    vec!["id".to_string()],
-                    vec![("id".to_string(), Some(SqlParam::Int(1)))],
-                )
-            );
-            assert_rejects!(
-                "db_upsert_fields(column)",
-                db_upsert_fields(
-                    db.clone(),
-                    "todos".to_string(),
-                    vec!["id".to_string()],
-                    vec![
-                        ("id".to_string(), Some(SqlParam::Int(1))),
-                        (hs.clone(), Some(SqlParam::Text("x".to_string()))),
-                    ],
-                )
-            );
-            assert_rejects!(
-                "db_upsert_fields(conflict-target column)",
-                db_upsert_fields(
-                    db.clone(),
-                    "todos".to_string(),
-                    vec![hs.clone()],
-                    vec![(hs.clone(), Some(SqlParam::Text("x".to_string())))],
-                )
-            );
-            assert_rejects!(
-                "db_update_where(set column)",
-                db_update_where(
-                    db.clone(),
-                    "todos".to_string(),
-                    vec![(hs.clone(), Some(SqlParam::Text("x".to_string())))],
-                    sql_eq(sql_column("id".to_string()), sql_param("1".to_string())),
-                )
-            );
-
-            // `Sql.column` is the SqlFragment-path identifier entry: a hostile
-            // identifier poisons the fragment, which the consumers surface as Err.
-            assert!(
-                sql_column(hs.clone()).invalid.is_some(),
-                "sql_column must poison hostile identifier {h:?}"
-            );
-        }
-
-        // A legitimate dotted column reference still validates where the dotted
-        // mode is allowed (Sql.column) — the fix does not over-reject.
-        assert!(
-            sql_column("todos.title".to_string()).invalid.is_none(),
-            "a legitimate dotted column must still validate"
-        );
     }
 
     // ── VettedPool SSRF guard tests ───────────────────────────────────────────
@@ -14342,42 +10220,7 @@ mod tests {
         );
     }
 
-    /// SQLite dials no host: its gate only parses the URL.
-    #[tokio::test]
-    async fn sqlite_gate_consults_no_host() {
-        for url in ["sqlite:///app.db", "sqlite::memory:"] {
-            let parsed = DbUrl::parse(url);
-            assert!(parsed.is_ok(), "{url:?}: {:?}", parsed.err());
-            let Ok(parsed) = parsed else { return };
-            let gated =
-                <sqlx::Sqlite as GatedDial>::gated_connect_options(&parsed, 4, &mut None).await;
-            assert!(gated.is_ok(), "{url:?}: {:?}", gated.err());
-        }
-    }
-
     // ── DbUrl: one parse decides the engine, the dial, and WAL ────────────────
-
-    /// The engine each scheme selects.
-    #[test]
-    fn db_url_selects_the_engine_by_scheme() {
-        for (url, engine) in [
-            ("sqlite://app.db?mode=rwc", DbEngine::Sqlite),
-            ("sqlite::memory:", DbEngine::Sqlite),
-            ("file:app.db", DbEngine::Sqlite),
-            ("app.db", DbEngine::Sqlite),
-            ("./data/app.db", DbEngine::Sqlite),
-            (":memory:", DbEngine::Sqlite),
-            ("postgres://u:p@db.example/app", DbEngine::Postgres),
-            ("postgresql://db.example/app", DbEngine::Postgres),
-            ("postgres:///app", DbEngine::Postgres),
-        ] {
-            assert!(
-                DbUrl::parse(url).is_ok_and(|parsed| parsed.engine() == engine),
-                "{url:?} must select {}",
-                engine.name()
-            );
-        }
-    }
 
     /// A scheme selecting no supported engine is refused without echoing it,
     /// since a malformed URL's scheme position can hold its userinfo.
@@ -14452,150 +10295,6 @@ mod tests {
                 },
             ])
         );
-    }
-
-    /// Only a shared SQLite file gets the WAL setup: never a PostgreSQL URL
-    /// that merely mentions `sqlite`, never a private in-memory database.
-    #[test]
-    fn db_url_decides_wal_from_the_parsed_engine() {
-        for (url, wal) in [
-            ("sqlite://app.db?mode=rwc", true),
-            ("app.db", true),
-            ("file::memory:?cache=shared", true),
-            ("sqlite::memory:", false),
-            (":memory:", false),
-            ("postgres://db.example/sqlite", false),
-            ("postgres://db.example/app?application_name=sqlite", false),
-        ] {
-            assert!(
-                DbUrl::parse(url).is_ok_and(|parsed| parsed.is_shared_sqlite_file() == wal),
-                "{url:?}: WAL must be {wal}"
-            );
-        }
-    }
-
-    /// Each driver refuses a URL selecting the other engine, before any dial
-    /// or lookup.
-    #[tokio::test]
-    async fn gated_dial_refuses_a_url_for_the_other_engine() {
-        let postgres = DbUrl::parse("postgres://127.0.0.1/app");
-        assert!(postgres.is_ok(), "{:?}", postgres.as_ref().err());
-        let Ok(postgres) = postgres else { return };
-        assert_eq!(
-            <sqlx::Sqlite as GatedDial>::gated_connect_options(&postgres, 4, &mut None)
-                .await
-                .err(),
-            Some(DbConnectError::EngineMismatch {
-                url: DbEngine::Postgres,
-                driver: DbEngine::Sqlite,
-            })
-        );
-        let sqlite = DbUrl::parse("sqlite::memory:");
-        assert!(sqlite.is_ok(), "{:?}", sqlite.as_ref().err());
-        let Ok(sqlite) = sqlite else { return };
-        assert_eq!(
-            <sqlx::Postgres as GatedDial>::gated_connect_options(&sqlite, 4, &mut None)
-                .await
-                .err(),
-            Some(DbConnectError::EngineMismatch {
-                url: DbEngine::Sqlite,
-                driver: DbEngine::Postgres,
-            })
-        );
-    }
-
-    /// An operator connect refuses an unsupported scheme and a URL for the
-    /// other engine as `InvalidInput`, with the typed reason and no credential.
-    #[tokio::test]
-    async fn operator_connect_refuses_urls_the_build_cannot_open() {
-        for (url, expected) in [
-            (
-                "mysql://admin:s3cr3t-pw@db.example/app",
-                DbConnectError::UnsupportedScheme,
-            ),
-            (
-                "postgres://admin:s3cr3t-pw@1.1.1.1/app",
-                DbConnectError::EngineMismatch {
-                    url: DbEngine::Postgres,
-                    driver: DbEngine::Sqlite,
-                },
-            ),
-        ] {
-            let refused = match connect_operator::<String>(url.to_owned()).await {
-                IpeResult::Err(e) => Some(e),
-                IpeResult::Ok(_) => None,
-            };
-            assert_eq!(
-                refused,
-                Some(format!("InvalidInput: {expected}")),
-                "{url:?}"
-            );
-        }
-    }
-
-    /// The busy timeout of the connection `conn` is running on, in milliseconds.
-    async fn busy_timeout_ms(conn: &mut sqlx::SqliteConnection) -> i64 {
-        sqlx::query_scalar::<_, i64>("PRAGMA busy_timeout")
-            .fetch_one(conn)
-            .await
-            .expect("read busy_timeout")
-    }
-
-    /// Every connection a file pool hands out at once carries the declared
-    /// busy timeout, not only the one a pool-level PRAGMA happened to reach.
-    #[tokio::test]
-    async fn every_pooled_sqlite_connection_carries_the_declared_busy_timeout() {
-        let path = crate::scratch_core::test_temp_root().join(format!(
-            "ipe_busy_timeout_{}_{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let name = SqliteFileName::parse_under(&path.display().to_string(), crate::path_core::HOST)
-            .expect("a scratch path seals");
-        let db_url =
-            DbUrl::sqlite_file(&name, FileMode::CreateIfMissing).expect("a sealed name opens");
-        let pool = match build_pool::<String>(&db_url, Journal::Wal).await {
-            IpeResult::Ok(pool) => Some(pool),
-            IpeResult::Err(_) => None,
-        }
-        .expect("build file pool");
-        let expected = i64::try_from(SQLITE_BUSY_TIMEOUT.as_millis()).expect("timeout fits i64");
-        let max_connections: u32 = DB_CONNECTIONS_CEILING
-            .read()
-            .expect("default connection ceiling");
-        let mut held = Vec::new();
-        for _ in 0..max_connections {
-            held.push(pool.acquire().await.expect("acquire pooled connection"));
-        }
-        assert_eq!(
-            held.len(),
-            usize::try_from(max_connections).expect("u32 fits usize")
-        );
-        for conn in &mut held {
-            assert_eq!(busy_timeout_ms(conn).await, expected);
-        }
-        drop(held);
-        pool.close().await;
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-        }
-    }
-
-    /// The declared busy timeout is a finite, non-zero wait longer than the
-    /// driver's own 5 s default, so declaring it changes what a connection does.
-    #[test]
-    fn the_busy_timeout_is_finite_and_above_the_driver_default() {
-        let driver_default = sqlx::sqlite::SqliteConnectOptions::new();
-        let default_debug = format!("{driver_default:?}");
-        assert!(
-            default_debug.contains("busy_timeout: 5s"),
-            "{default_debug}"
-        );
-        assert!(SQLITE_BUSY_TIMEOUT > std::time::Duration::from_secs(5));
-        assert!(SQLITE_BUSY_TIMEOUT < std::time::Duration::from_secs(600));
     }
 
     /// A PostgreSQL refusal displays under the `db:` prefix.
@@ -14754,75 +10453,6 @@ mod tests {
         );
     }
 
-    /// `db_find_projection` with a `Store.literal` position binds the extra param
-    /// before the WHERE params and returns it as the `p0` column in every row.
-    #[tokio::test]
-    async fn test_find_projection_literal_bind_appears_in_result() {
-        let db = fresh_join_db().await;
-        let frag = sql_and(
-            sql_eq(
-                sql_column("a1.id".to_string()),
-                sql_column("a0.author_id".to_string()),
-            ),
-            sql_eq(sql_column("a1.active".to_string()), sql_param(1_i64)),
-        );
-        let found: IpeResult<String, Vec<RowCells>> = db_find_projection(
-            db,
-            "books".into(),
-            "a0".into(),
-            "authors".into(),
-            "a1".into(),
-            frag,
-            vec![
-                ProjectionTerm::LiteralTerm,
-                ProjectionTerm::ColumnTerm("a1".into(), "name".into()),
-            ],
-            vec![SqlParam::Text("fiction".to_string())],
-        )
-        .await;
-        match found {
-            IpeResult::Ok(rows) => {
-                assert_eq!(rows.len(), 2, "only active author Ada's two books");
-                for row in &rows {
-                    assert_eq!(
-                        row.text("p0"),
-                        Some("fiction"),
-                        "p0 is the literal value bound as a parameter"
-                    );
-                    assert_eq!(row.text("p1"), Some("Ada"), "p1 is the projected column");
-                    assert_eq!(row.len(), 2, "exactly two projected columns");
-                }
-            }
-            IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
-        }
-    }
-
-    /// `db_find_projection` with a mismatched `extra_binds` count fails closed —
-    /// one `LiteralTerm` in the projection but zero extra binds.
-    #[tokio::test]
-    async fn test_find_projection_rejects_mismatched_extra_binds() {
-        let db = fresh_join_db().await;
-        let frag = sql_eq(
-            sql_column("a1.id".to_string()),
-            sql_column("a0.author_id".to_string()),
-        );
-        let found: IpeResult<String, Vec<RowCells>> = db_find_projection(
-            db,
-            "books".into(),
-            "a0".into(),
-            "authors".into(),
-            "a1".into(),
-            frag,
-            vec![ProjectionTerm::LiteralTerm],
-            vec![], // no extra bind for the one literal position — must fail
-        )
-        .await;
-        assert!(
-            matches!(found, IpeResult::Err(_)),
-            "a mismatched extra_binds count must fail closed"
-        );
-    }
-
     // ── Store.coalesce: `COALESCE(a, b) AS pN` ───────────────────────────────
 
     /// Golden SQL: `CoalesceTerm(OperandColumn("a1.name"), OperandLiteral)` emits
@@ -14926,49 +10556,6 @@ mod tests {
             bad_b.is_err(),
             "injection in second COALESCE operand must be rejected fail-closed"
         );
-    }
-
-    /// `db_find_projection` with a COALESCE(column, literal) position binds the
-    /// extra param before the WHERE params and returns the coalesced value in `p0`.
-    #[tokio::test]
-    async fn test_find_projection_coalesce_column_literal() {
-        let db = fresh_join_db().await;
-        let frag = sql_and(
-            sql_eq(
-                sql_column("a1.id".to_string()),
-                sql_column("a0.author_id".to_string()),
-            ),
-            sql_eq(sql_column("a1.active".to_string()), sql_param(1_i64)),
-        );
-        // COALESCE(a1.name, ?) — the column is non-null for active Ada, so COALESCE
-        // returns the column value ("Ada"), not the fallback literal.
-        let found: IpeResult<String, Vec<RowCells>> = db_find_projection(
-            db,
-            "books".into(),
-            "a0".into(),
-            "authors".into(),
-            "a1".into(),
-            frag,
-            vec![ProjectionTerm::CoalesceTerm(
-                ProjectionOperand::OperandColumn("a1.name".into()),
-                ProjectionOperand::OperandLiteral,
-            )],
-            vec![SqlParam::Text("unknown".to_string())],
-        )
-        .await;
-        match found {
-            IpeResult::Ok(rows) => {
-                assert_eq!(rows.len(), 2, "only active author Ada's two books");
-                for row in &rows {
-                    assert_eq!(
-                        row.text("p0"),
-                        Some("Ada"),
-                        "COALESCE returns the non-null column value"
-                    );
-                }
-            }
-            IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
-        }
     }
 
     // ── Store.add / .sub / .mul: `(a <op> b) AS pN` ──────────────────────────
@@ -15109,43 +10696,6 @@ mod tests {
             bad_b.is_err(),
             "injection in second arithmetic operand must be rejected fail-closed"
         );
-    }
-
-    /// `db_find_projection` with an `(a0.id + ?)` position binds the extra param
-    /// before the WHERE params and returns the summed value in `p0`.
-    #[tokio::test]
-    async fn test_find_projection_arith_column_literal() {
-        let db = fresh_join_db().await;
-        let frag = sql_and(
-            sql_eq(
-                sql_column("a1.id".to_string()),
-                sql_column("a0.author_id".to_string()),
-            ),
-            sql_eq(sql_column("a0.id".to_string()), sql_param(10_i64)),
-        );
-        // (a0.id + ?) with the book id 10 and a bound literal 5 → 15.
-        let found: IpeResult<String, Vec<RowCells>> = db_find_projection(
-            db,
-            "books".into(),
-            "a0".into(),
-            "authors".into(),
-            "a1".into(),
-            frag,
-            vec![ProjectionTerm::ArithTerm(
-                ArithOp::ArithAdd,
-                ProjectionOperand::OperandColumn("a0.id".into()),
-                ProjectionOperand::OperandLiteral,
-            )],
-            vec![SqlParam::Int(5)],
-        )
-        .await;
-        match found {
-            IpeResult::Ok(rows) => {
-                assert_eq!(rows.len(), 1, "exactly the one book with id 10");
-                assert_eq!(rows[0].text("p0"), Some("15"), "(a0.id + ?) = 10 + 5 = 15");
-            }
-            IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
-        }
     }
 
     // ─── Engine version floor ────────────────────────────────────────────────
@@ -15307,51 +10857,6 @@ mod tests {
         assert_eq!(DbEngine::from_driver_name(""), None);
     }
 
-    /// The bundled SQLite passes the gate end to end: `build_pool` reads the
-    /// live `sqlite_version()` and admits it.
-    #[tokio::test]
-    async fn engine_floor_admits_the_bundled_sqlite() {
-        let db_url = DbUrl::sqlite_memory();
-        assert!(db_url.is_ok(), "{:?}", db_url.as_ref().err());
-        let Ok(db_url) = db_url else { return };
-        let pool = build_pool::<String>(&db_url, Journal::Unchanged).await;
-        assert!(
-            matches!(pool, IpeResult::Ok(_)),
-            "bundled SQLite must clear its version floor"
-        );
-    }
-
-    /// The shared gate admits a live pool and reports the version it read.
-    #[tokio::test]
-    async fn engine_floor_on_admits_a_live_sqlite_pool() {
-        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await;
-        assert!(pool.is_ok(), "in-memory SQLite must connect");
-        if let Ok(pool) = pool {
-            let admitted = enforce_engine_floor_on(&pool).await;
-            assert!(
-                matches!(admitted, Ok(v) if v >= SQLITE_VERSION_FLOOR),
-                "bundled SQLite must clear the shared gate, got {admitted:?}"
-            );
-        }
-    }
-
-    /// A pool whose version cannot be read is refused, never admitted.
-    #[tokio::test]
-    async fn engine_floor_on_refuses_an_unreadable_pool() {
-        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await;
-        assert!(pool.is_ok(), "in-memory SQLite must connect");
-        if let Ok(pool) = pool {
-            pool.close().await;
-            assert_eq!(
-                enforce_engine_floor_on(&pool).await,
-                Err(DbConnectError::VersionUnreadable(DriverFailure::of(
-                    DbEngine::Sqlite,
-                    &sqlx::Error::PoolClosed
-                )))
-            );
-        }
-    }
-
     /// A floor refusal still names the required floor.
     #[test]
     fn engine_floor_refusal_names_the_required_floor() {
@@ -15413,222 +10918,6 @@ mod tests {
             IpeResult::Ok(sealed) => db_location_file(tag, sealed),
             IpeResult::Err(e) => IpeResult::Err(e),
         }
-    }
-
-    /// Open `location`, or the refusal as its `Kind: message` text.
-    async fn open_at(location: DbLocation) -> Result<Db, String> {
-        match db_open::<String>(location).await {
-            IpeResult::Ok(pool) => Ok(pool),
-            IpeResult::Err(e) => Err(e),
-        }
-    }
-
-    /// The sidecar file `suffix` names next to `path`.
-    fn sidecar(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
-        let mut name = path.as_os_str().to_owned();
-        name.push(suffix);
-        std::path::PathBuf::from(name)
-    }
-
-    /// Closing the owned pools checkpoints a WAL database: no `-wal` or `-shm`
-    /// file is left and the file passes its integrity check.
-    #[tokio::test]
-    async fn closing_owned_pools_leaves_no_wal_sidecar() {
-        let (pool, path) = fresh_file_db(4).await;
-        let wrote = sqlx::query("INSERT INTO todos (title) VALUES ('kept')")
-            .execute(&pool)
-            .await;
-        assert!(wrote.is_ok(), "the write lands: {wrote:?}");
-        assert!(
-            sidecar(&path, "-wal").exists(),
-            "a WAL write leaves its sidecar open"
-        );
-        let pools = OwnedPools::new();
-        assert!(
-            pools
-                .register(PoolRole::Cached, Box::new(pool.clone()), 4)
-                .is_ok()
-        );
-        pools.close_all(std::time::Duration::from_secs(2)).await;
-        assert!(pool.is_closed());
-        assert!(
-            !sidecar(&path, "-wal").exists(),
-            "the close checkpoints the WAL"
-        );
-        assert!(
-            !sidecar(&path, "-shm").exists(),
-            "the close removes the shm"
-        );
-        let url = format!("sqlite://{}?mode=ro", path.display());
-        let reopened = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect(&url)
-            .await;
-        assert!(reopened.is_ok(), "the closed file reopens: {reopened:?}");
-        let Ok(reopened) = reopened else {
-            return;
-        };
-        let check: Result<(String,), _> = sqlx::query_as("PRAGMA integrity_check")
-            .fetch_one(&reopened)
-            .await;
-        assert!(
-            matches!(check, Ok((ref verdict,)) if verdict == "ok"),
-            "{check:?}"
-        );
-        let kept: Result<(i64,), _> = sqlx::query_as("SELECT COUNT(*) FROM todos")
-            .fetch_one(&reopened)
-            .await;
-        assert!(
-            matches!(kept, Ok((1,))),
-            "the write survives the close: {kept:?}"
-        );
-        reopened.close().await;
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// A checkout cut while its checkout hook is still running on the
-    /// connection holds the owned-pool close until that connection has closed:
-    /// the close returns with no `-wal` left behind.
-    #[tokio::test]
-    async fn a_checkout_cut_mid_hook_closes_its_connection_before_the_pools_close() {
-        let mut path = crate::scratch_core::test_temp_root();
-        path.push(format!(
-            "ipe_cut_checkout_{}_{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let _ = std::fs::remove_file(&path);
-        let options = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(&path)
-            .create_if_missing(true)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-            .busy_timeout(SQLITE_BUSY_TIMEOUT);
-        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let in_hook = std::sync::Arc::new(tokio::sync::Notify::new());
-        let (hook_armed, hook_entered) = (armed.clone(), in_hook.clone());
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .before_acquire(move |conn, _meta| {
-                let armed = hook_armed.load(std::sync::atomic::Ordering::SeqCst);
-                let entered = hook_entered.clone();
-                Box::pin(async move {
-                    if armed {
-                        entered.notify_one();
-                        sqlx::query(
-                            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c \
-                             WHERE x < 3000000) SELECT count(*) FROM c",
-                        )
-                        .execute(&mut *conn)
-                        .await?;
-                    }
-                    Ok(true)
-                })
-            })
-            .connect_with(options)
-            .await;
-        assert!(pool.is_ok(), "the WAL pool opens: {pool:?}");
-        let Ok(pool) = pool else {
-            return;
-        };
-        let created = sqlx::query("CREATE TABLE kept (v INTEGER)")
-            .execute(&pool)
-            .await;
-        assert!(created.is_ok(), "the table opens: {created:?}");
-        let wrote = sqlx::query("INSERT INTO kept VALUES (1)")
-            .execute(&pool)
-            .await;
-        assert!(wrote.is_ok(), "the write lands: {wrote:?}");
-        assert!(
-            sidecar(&path, "-wal").exists(),
-            "a WAL write leaves its sidecar open"
-        );
-        armed.store(true, std::sync::atomic::Ordering::SeqCst);
-        let cut_pool = pool.clone();
-        let cut = tokio::spawn(async move { checkout(&cut_pool).await.map(drop) });
-        in_hook.notified().await;
-        cut.abort();
-        let cut = cut.await;
-        assert!(
-            cut.as_ref()
-                .is_err_and(tokio::task::JoinError::is_cancelled),
-            "the checkout is cut mid-hook: {cut:?}"
-        );
-        let pools = OwnedPools::new();
-        assert!(
-            pools
-                .register(PoolRole::Cached, Box::new(pool.clone()), 1)
-                .is_ok()
-        );
-        pools.close_all(std::time::Duration::from_secs(10)).await;
-        assert!(pool.is_closed());
-        assert!(
-            !sidecar(&path, "-wal").exists(),
-            "the cut checkout's connection closed before the pools' close returned"
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// A checked-out connection never holds the close past its deadline.
-    #[tokio::test]
-    async fn a_checked_out_connection_never_holds_the_close_past_its_deadline() {
-        let (pool, path) = fresh_file_db(2).await;
-        let held = pool.acquire().await;
-        assert!(held.is_ok(), "a connection checks out: {held:?}");
-        let pools = OwnedPools::new();
-        assert!(
-            pools
-                .register(PoolRole::Cached, Box::new(pool.clone()), 4)
-                .is_ok()
-        );
-        let deadline = std::time::Duration::from_millis(200);
-        let started = std::time::Instant::now();
-        let bound = deadline * 2 + std::time::Duration::from_secs(2);
-        let closed = tokio::time::timeout(bound, pools.close_all(deadline)).await;
-        assert!(closed.is_ok(), "the close returns within its deadline");
-        assert!(started.elapsed() < bound);
-        drop(held);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// A file database closed by `Db.close` reopens to a working pool, never
-    /// the closed cached one.
-    #[tokio::test]
-    async fn a_closed_file_database_reopens_to_an_open_pool() {
-        let path = scratch_path("db_close_reopen.db");
-        let location = || match file_at(&path, FileMode::CreateIfMissing) {
-            IpeResult::Ok(location) => Some(location),
-            IpeResult::Err(_) => None,
-        };
-        let first = match location() {
-            Some(location) => open_at(location).await,
-            None => Err("the scratch path seals".to_owned()),
-        };
-        assert!(first.is_ok(), "the file opens: {first:?}");
-        let Ok(first) = first else {
-            return;
-        };
-        let closed = db_close::<String>(first.clone()).await;
-        assert!(matches!(closed, IpeResult::Ok(())));
-        assert!(first.is_closed());
-        let second = match location() {
-            Some(location) => open_at(location).await,
-            None => Err("the scratch path seals".to_owned()),
-        };
-        assert!(second.is_ok(), "the closed file reopens: {second:?}");
-        let Ok(second) = second else {
-            return;
-        };
-        assert!(
-            !second.is_closed(),
-            "a reopen never hands out the closed pool"
-        );
-        let queried = sqlx::query("SELECT 1").execute(&second).await;
-        assert!(queried.is_ok(), "the reopened pool answers: {queried:?}");
-        second.close().await;
-        let _ = std::fs::remove_file(&path);
     }
 
     /// A stand-in pool whose closed flag the test sets.
@@ -15733,90 +11022,6 @@ mod tests {
         }
     }
 
-    /// `Db.open` refuses another engine's location before its host is vetted:
-    /// a postgres `Dsn` naming a loopback host (which the dial gate refuses as
-    /// `PermissionDenied`) is an `InvalidInput` engine mismatch under this
-    /// SQLite build, and the refusal never carries the password.
-    #[tokio::test]
-    async fn db_open_refuses_another_engine_before_the_host_is_vetted() {
-        let dsn = crate::dsn::dsn_parse::<String>(
-            "postgres://alice:hunter2@127.0.0.1:5432/app".to_owned(),
-        );
-        let IpeResult::Ok(dsn) = dsn else {
-            assert!(matches!(dsn, IpeResult::Ok(_)), "{dsn:?}");
-            return;
-        };
-        let refused = open_at(db_location_dsn(dsn))
-            .await
-            .err()
-            .unwrap_or_default();
-        assert!(refused.starts_with("InvalidInput: "), "{refused}");
-        assert!(
-            refused.contains("selects PostgreSQL but this build's driver is SQLite"),
-            "{refused}"
-        );
-        assert!(!refused.contains("hunter2"), "{refused}");
-    }
-
-    /// Open the file at `path` under `mode`.
-    async fn open_file(path: &std::path::Path, mode: FileMode) -> Result<Db, String> {
-        match file_at(path, mode) {
-            IpeResult::Ok(location) => open_at(location).await,
-            IpeResult::Err(e) => Err(e.to_ipe_string()),
-        }
-    }
-
-    /// The anchored name `text` seals to under `regime`.
-    fn seal_name(
-        text: &str,
-        regime: crate::path_core::Regime,
-    ) -> Result<String, DbLocationRefusal> {
-        SqliteFileName::parse_under(text, regime).map(|name| name.as_str().to_owned())
-    }
-
-    /// Each URL metacharacter in a file name is an ordinary byte: the file
-    /// created carries the literal name, and a sibling the URL reading would
-    /// name is never created. Unix only: Windows forbids `?` in a file name.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn url_metacharacters_name_a_literal_file() {
-        let dir = scratch_path("db_location_literal");
-        let made = std::fs::create_dir_all(&dir);
-        assert!(made.is_ok(), "{made:?}");
-        for (literal, url_reading) in [
-            ("t.db?mode=memory", "t.db"),
-            ("a#b.db", "a"),
-            ("a.db?mode=ro&cache=shared", "a.db"),
-            ("a%3Fb.db", "a?b.db"),
-        ] {
-            let path = dir.join(literal);
-            let opened = open_file(&path, FileMode::CreateIfMissing).await;
-            assert!(opened.is_ok(), "{literal}: {opened:?}");
-            let Ok(pool) = opened else { return };
-            let wrote = sqlx::query("CREATE TABLE kept (v INTEGER NOT NULL)")
-                .execute(&pool)
-                .await;
-            assert!(wrote.is_ok(), "{literal}: {wrote:?}");
-            let inserted = sqlx::query("INSERT INTO kept VALUES (7)")
-                .execute(&pool)
-                .await;
-            assert!(inserted.is_ok(), "{literal}: {inserted:?}");
-            assert!(path.is_file(), "{literal}: no literal file");
-            assert!(
-                !dir.join(url_reading).exists(),
-                "{literal}: {url_reading} was created"
-            );
-            let reopened = open_file(&path, FileMode::WriteExisting).await;
-            assert!(reopened.is_ok(), "{literal}: {reopened:?}");
-            let Ok(reopened) = reopened else { return };
-            let kept: Result<i64, _> = sqlx::query_scalar("SELECT v FROM kept")
-                .fetch_one(&reopened)
-                .await;
-            assert!(matches!(kept, Ok(7)), "{literal}: {kept:?}");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// A NUL byte is refused by the `Path` seal before a location exists.
     #[test]
     fn a_nul_byte_never_reaches_a_location() {
@@ -15830,154 +11035,6 @@ mod tests {
         );
         let control = crate::path::path_from_string::<IpeError>("ab.db".to_owned());
         assert!(matches!(control, IpeResult::Ok(_)));
-    }
-
-    /// A `:` after the volume is refused, which makes `:memory:` and every
-    /// `file:` URI unrepresentable.
-    #[test]
-    fn a_colon_in_a_file_name_is_refused() {
-        for regime in [
-            crate::path_core::Regime::Unix,
-            crate::path_core::Regime::Windows,
-        ] {
-            for text in [
-                "a:b.db",
-                ":memory:",
-                "file:x.db",
-                "file:x.db?vfs=unix-none",
-                "dir:/x.db",
-                "dir/a.db:stream",
-            ] {
-                assert_eq!(
-                    seal_name(text, regime),
-                    Err(DbLocationRefusal::Colon),
-                    "{text:?} under {regime:?}"
-                );
-            }
-            assert_eq!(seal_name("ab.db", regime), Ok("./ab.db".to_owned()));
-        }
-        assert_eq!(
-            seal_name("C:x.db", crate::path_core::Regime::Windows),
-            Err(DbLocationRefusal::Colon),
-            "a drive-relative path is refused"
-        );
-        assert_eq!(
-            seal_name("C:\\data\\x.db", crate::path_core::Regime::Windows),
-            Ok("C:\\data\\x.db".to_owned())
-        );
-        let refused = DbLocationRefusal::Colon.into_error();
-        assert!(matches!(
-            refused,
-            IpeError::Error(IpeErrorKind::InvalidInput, _)
-        ));
-    }
-
-    /// A relative name is anchored with `./` once; an absolute or anchored
-    /// name keeps its spelling.
-    #[test]
-    fn a_relative_file_name_is_anchored_once() {
-        let unix = crate::path_core::Regime::Unix;
-        assert_eq!(seal_name("x.db", unix), Ok("./x.db".to_owned()));
-        assert_eq!(seal_name("dir/x.db", unix), Ok("./dir/x.db".to_owned()));
-        assert_eq!(seal_name("/tmp/d/x.db", unix), Ok("/tmp/d/x.db".to_owned()));
-        assert_eq!(seal_name("./x.db", unix), Ok("./x.db".to_owned()));
-        let windows = crate::path_core::Regime::Windows;
-        assert_eq!(seal_name(".\\x.db", windows), Ok(".\\x.db".to_owned()));
-        assert_eq!(seal_name("\\x.db", windows), Ok("\\x.db".to_owned()));
-    }
-
-    /// A path naming no file is refused; a file under a directory is the
-    /// control.
-    #[test]
-    fn a_path_naming_no_file_is_refused() {
-        let unix = crate::path_core::Regime::Unix;
-        for text in ["", ".", "..", "/", "dir/", "dir/.", "dir/.."] {
-            assert_eq!(
-                seal_name(text, unix),
-                Err(DbLocationRefusal::NoFileName),
-                "{text:?}"
-            );
-        }
-        assert_eq!(seal_name("dir/x.db", unix), Ok("./dir/x.db".to_owned()));
-        let sealed_empty = crate::path::path_from_string::<IpeError>(String::new());
-        assert!(
-            matches!(&sealed_empty, IpeResult::Ok(_)),
-            "{sealed_empty:?}"
-        );
-        let IpeResult::Ok(sealed_empty) = sealed_empty else {
-            return;
-        };
-        let refused = db_location_file::<IpeError>(2, sealed_empty);
-        assert!(
-            matches!(
-                &refused,
-                IpeResult::Err(IpeError::Error(IpeErrorKind::InvalidInput, _))
-            ),
-            "{refused:?}"
-        );
-    }
-
-    /// The anchored name may hold [`SQLITE_FILE_NAME_MAX`] bytes and no more.
-    #[test]
-    fn a_file_name_past_the_ceiling_is_refused() {
-        let unix = crate::path_core::Regime::Unix;
-        let at_ceiling = "a".repeat(SQLITE_FILE_NAME_MAX - 2);
-        let sealed = seal_name(&at_ceiling, unix);
-        assert!(
-            sealed
-                .as_ref()
-                .is_ok_and(|name| name.len() == SQLITE_FILE_NAME_MAX),
-            "{sealed:?}"
-        );
-        let past = "a".repeat(SQLITE_FILE_NAME_MAX - 1);
-        assert_eq!(
-            seal_name(&past, unix),
-            Err(DbLocationRefusal::TooLong {
-                len: SQLITE_FILE_NAME_MAX + 1
-            })
-        );
-        let refused = DbLocationRefusal::TooLong {
-            len: SQLITE_FILE_NAME_MAX + 1,
-        }
-        .into_error();
-        assert!(matches!(
-            refused,
-            IpeError::Error(IpeErrorKind::InvalidInput, _)
-        ));
-    }
-
-    /// A network share or device path is refused under both regimes.
-    #[test]
-    fn a_network_path_is_refused_on_every_platform() {
-        for regime in [
-            crate::path_core::Regime::Unix,
-            crate::path_core::Regime::Windows,
-        ] {
-            for text in [
-                "//host/s/x.db",
-                "\\\\host\\s\\x.db",
-                "\\\\?\\C:\\x.db",
-                "/\\host\\s\\x.db",
-                "\\/host/s/x.db",
-                "\\??\\UNC\\host\\s\\x.db",
-                "/??/UNC/host/s/x.db",
-                "\\??\\C:\\x.db",
-            ] {
-                assert_eq!(
-                    seal_name(text, regime),
-                    Err(DbLocationRefusal::NetworkPath),
-                    "{text:?} under {regime:?}"
-                );
-            }
-            assert_eq!(
-                seal_name("/host/s/x.db", regime),
-                Ok("/host/s/x.db".to_owned())
-            );
-            assert_eq!(
-                seal_name("/??x/s/x.db", regime),
-                Ok("/??x/s/x.db".to_owned())
-            );
-        }
     }
 
     /// The sink re-check refuses each name SQLite reads specially.
@@ -16019,127 +11076,6 @@ mod tests {
         );
     }
 
-    /// `ReadExisting` and `WriteExisting` never create a file; `CreateIfMissing`
-    /// does.
-    #[tokio::test]
-    async fn only_create_if_missing_creates_the_file() {
-        for mode in [FileMode::ReadExisting, FileMode::WriteExisting] {
-            let path = scratch_path("db_location_absent");
-            let opened = open_file(&path, mode).await;
-            assert!(opened.is_err(), "{mode:?} opened a missing file");
-            assert!(!path.exists(), "{mode:?} created the file");
-        }
-        let path = scratch_path("db_location_created");
-        let created = open_file(&path, FileMode::CreateIfMissing).await;
-        assert!(created.is_ok(), "{created:?}");
-        assert!(path.is_file(), "CreateIfMissing made no file");
-        let reopened = open_file(&path, FileMode::WriteExisting).await;
-        assert!(reopened.is_ok(), "{reopened:?}");
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-        }
-    }
-
-    /// `ReadExisting` refuses a write; `WriteExisting` on the same file accepts it.
-    #[tokio::test]
-    async fn read_existing_refuses_a_write() {
-        let path = scratch_path("db_location_read_only");
-        let created = open_file(&path, FileMode::CreateIfMissing).await;
-        assert!(created.is_ok(), "{created:?}");
-        let Ok(created) = created else { return };
-        let made = sqlx::query("CREATE TABLE t (v INTEGER NOT NULL)")
-            .execute(&created)
-            .await;
-        assert!(made.is_ok(), "{made:?}");
-        let reader = open_file(&path, FileMode::ReadExisting).await;
-        assert!(reader.is_ok(), "{reader:?}");
-        let Ok(reader) = reader else { return };
-        let refused = sqlx::query("INSERT INTO t VALUES (1)")
-            .execute(&reader)
-            .await;
-        assert!(refused.is_err(), "a read-only pool accepted a write");
-        let writer = open_file(&path, FileMode::WriteExisting).await;
-        assert!(writer.is_ok(), "{writer:?}");
-        let Ok(writer) = writer else { return };
-        let accepted = sqlx::query("INSERT INTO t VALUES (1)")
-            .execute(&writer)
-            .await;
-        assert!(accepted.is_ok(), "{accepted:?}");
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-        }
-    }
-
-    /// A file location for the other engine's driver is a typed engine
-    /// mismatch, mapped to `InvalidInput`.
-    #[tokio::test]
-    async fn a_file_location_on_the_postgres_driver_is_an_engine_mismatch() {
-        let name = SqliteFileName::parse_under("x.db", crate::path_core::Regime::Unix);
-        assert!(name.is_ok(), "{name:?}");
-        let Ok(name) = name else { return };
-        let file = DbUrl::sqlite_file(&name, FileMode::CreateIfMissing);
-        assert!(file.is_ok(), "{:?}", file.as_ref().err());
-        let Ok(file) = file else { return };
-        let mismatch = <sqlx::Postgres as GatedDial>::gated_connect_options(&file, 4, &mut None)
-            .await
-            .err();
-        assert_eq!(
-            mismatch,
-            Some(DbConnectError::EngineMismatch {
-                url: DbEngine::Sqlite,
-                driver: DbEngine::Postgres,
-            })
-        );
-        let Some(mismatch) = mismatch else { return };
-        let mapped: String = connect_refusal("", KERNEL_ENGINE, &mismatch);
-        assert!(mapped.starts_with("InvalidInput: "), "{mapped}");
-        let admitted =
-            <sqlx::Sqlite as GatedDial>::gated_connect_options(&file, 4, &mut None).await;
-        assert!(admitted.is_ok(), "{:?}", admitted.err());
-    }
-
-    /// Two memory opens are two databases; a file location is shared per key.
-    #[tokio::test]
-    async fn memory_is_private_and_a_file_is_pooled_per_key() {
-        let first = open_at(db_location_memory()).await;
-        let second = open_at(db_location_memory()).await;
-        assert!(first.is_ok() && second.is_ok(), "{first:?} {second:?}");
-        let (Ok(first), Ok(second)) = (first, second) else {
-            return;
-        };
-        let made = sqlx::query("CREATE TABLE only_first (v INTEGER NOT NULL)")
-            .execute(&first)
-            .await;
-        assert!(made.is_ok(), "{made:?}");
-        let seen = sqlx::query("SELECT v FROM only_first")
-            .fetch_all(&second)
-            .await;
-        assert!(seen.is_err(), "a second memory open saw the first's table");
-
-        let path = scratch_path("db_location_pooled");
-        let location = file_at(&path, FileMode::CreateIfMissing);
-        let IpeResult::Ok(location) = location else {
-            assert!(matches!(location, IpeResult::Ok(_)), "{location:?}");
-            return;
-        };
-        let LocationKind::File { name, .. } = location.0.clone() else {
-            return;
-        };
-        let opened = open_at(location).await;
-        assert!(opened.is_ok(), "{opened:?}");
-        let keyed = pool_cache()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&PoolKey::File {
-                name,
-                mode: FileMode::CreateIfMissing,
-            });
-        assert!(keyed, "a file location was not pooled under its key");
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-        }
-    }
-
     /// A location never prints a `Dsn`'s password; a file location prints its
     /// name.
     #[test]
@@ -16176,25 +11112,5112 @@ mod tests {
         assert!(Some(db_location_memory()) == Some(db_location_memory()));
     }
 
-    /// A pool key never prints a URL's password; a file key prints its name.
-    #[test]
-    fn a_pool_key_debug_never_prints_a_password() {
-        let url = "postgres://u:hunter2@h/d".to_owned();
-        for key in [PoolKey::Dsn(url.clone()), PoolKey::Operator(url)] {
-            let shown = format!("{key:?}");
-            assert!(!shown.contains("hunter2"), "{shown}");
+    /// The tests that open a SQLite pool: compiled exactly when `Db` is a SQLite pool.
+    #[cfg(not(feature = "db-postgres"))]
+    mod sqlite_tests {
+        use super::*;
+
+        #[test]
+        fn url_is_cacheable_bare_memory_is_not_cacheable() {
+            assert!(!url_is_cacheable(":memory:"));
+            assert!(!url_is_cacheable("sqlite::memory:"));
+            assert!(!url_is_cacheable("sqlite://:memory:"));
         }
-        let name = SqliteFileName::parse_under("x.db", crate::path_core::Regime::Unix);
-        assert!(name.is_ok(), "{name:?}");
-        let Ok(name) = name else { return };
-        let shown = format!(
-            "{:?}",
-            PoolKey::File {
-                name,
-                mode: FileMode::ReadExisting
+
+        async fn fresh_db() -> Db {
+            // A SINGLE persistent connection per test. `sqlite::memory:` gives each
+            // pool connection its OWN in-memory database, so a default multi-conn
+            // pool routes BEGIN / INSERT / COMMIT / SELECT to different (empty) DBs
+            // — the source of a parallel-run flake: under load the pool
+            // opens extra connections and ops miss the table / committed row.
+            // min=max=1 pins one connection (one DB, table + transactions always
+            // visible); each test still gets its own isolated pool.
+            let pool = crate::test_db::memory().await;
+            sqlx::query("CREATE TABLE todos (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0)")
+                .execute(&pool).await.expect("create table");
+            pool
+        }
+
+        /// A seeded external (foreign) SQLite connection, distinct from the app pool —
+        /// stands in for a source of a different dialect that the read runners dial
+        /// through the same codec stack. `ledger` carries an `amount` INTEGER column.
+        #[allow(clippy::expect_used)]
+        async fn fresh_external_conn() -> ExternalConnection {
+            let pool = crate::test_db::memory().await;
+            sqlx::query(
+                "CREATE TABLE ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, amount INTEGER NOT NULL)",
+            )
+            .execute(&pool)
+            .await
+            .expect("create ledger");
+            sqlx::query("INSERT INTO ledger (amount) VALUES (7), (42)")
+                .execute(&pool)
+                .await
+                .expect("seed ledger");
+            ExternalConnection::Sqlite(pool)
+        }
+
+        /// The external read path decodes seeded rows through the SAME `Decoder<E,A>`
+        /// the app path uses — the §4 "typed reads from a foreign DB via one codec"
+        /// target. `db_conn_query_decode_params` reads `amount` back as `Int`.
+        #[tokio::test]
+        async fn external_query_decode_reads_through_one_codec() {
+            let conn = fresh_external_conn().await;
+            let out: IpeResult<String, Vec<i64>> = db_conn_query_decode_params(
+                conn,
+                "SELECT amount FROM ledger ORDER BY amount".into(),
+                vec![],
+                db_decode_int("amount".into()),
+            )
+            .await;
+            match out {
+                IpeResult::Ok(v) => assert_eq!(v, vec![7, 42]),
+                other => panic!("external queryDecode failed: {:?}", other),
             }
-        );
-        assert!(shown.contains("x.db"), "{shown}");
+        }
+
+        /// The injection barrier is UNCHANGED on the external path: a value carrying SQL
+        /// metacharacters flows through a bound parameter (a `Sql.param` in the
+        /// fragment), so it matches VERBATIM and the surrounding table is untouched — no
+        /// injection executes against the foreign connection.
+        #[tokio::test]
+        async fn external_find_where_binds_params_no_injection() {
+            let conn = fresh_external_conn().await;
+            // A fragment built from the audited `Sql.*` combinators: `amount = ?`, the
+            // value bound (never spliced). The metacharacter value simply doesn't match.
+            let frag = sql_eq(
+                sql_column("amount".to_string()),
+                sql_param(SqlParam::Int(7)),
+            );
+            let rows: IpeResult<String, Vec<RowCells>> =
+                db_conn_find_where(conn.clone(), "ledger".into(), frag).await;
+            match rows {
+                IpeResult::Ok(v) => {
+                    assert_eq!(v.len(), 1);
+                    assert_eq!(v[0].text("amount"), Some("7"));
+                }
+                other => panic!("external findWhere failed: {:?}", other),
+            }
+            // A hostile TABLE identifier is rejected by the same `SqlIdent` gate — the
+            // read runner never interpolates an unvalidated name into SQL.
+            let bad: IpeResult<String, Vec<RowCells>> = db_conn_find_where(
+                conn,
+                "ledger; DROP TABLE ledger".into(),
+                sql_eq(sql_param(SqlParam::Int(1)), sql_param(SqlParam::Int(1))),
+            )
+            .await;
+            assert!(
+                matches!(bad, IpeResult::Err(_)),
+                "a hostile external table identifier must be rejected before any SQL runs"
+            );
+        }
+
+        /// A hostile column identifier in a `Sql.column` poisons the fragment, which the
+        /// external `findWhere` surfaces as a typed `Err` — the poison marker path is
+        /// identical to the app connection's.
+        #[tokio::test]
+        async fn external_find_where_rejects_poisoned_column() {
+            let conn = fresh_external_conn().await;
+            let poisoned = sql_eq(
+                sql_column("amount; DROP TABLE ledger".to_string()),
+                sql_param(SqlParam::Int(7)),
+            );
+            let rows: IpeResult<String, Vec<RowCells>> =
+                db_conn_find_where(conn, "ledger".into(), poisoned).await;
+            assert!(
+                matches!(rows, IpeResult::Err(_)),
+                "a poisoned column fragment must fail closed on the external path too"
+            );
+        }
+
+        /// `db_conn_get_by_id` binds the id as a positional parameter (never
+        /// interpolated) and returns the matching row from the foreign connection.
+        #[tokio::test]
+        async fn external_get_by_id_binds_id() {
+            let conn = fresh_external_conn().await;
+            let got: IpeResult<String, IpeMaybe<RowCells>> =
+                db_conn_get_by_id(conn, "ledger".into(), "1".into()).await;
+            match got {
+                IpeResult::Ok(IpeMaybe::Just(row)) => {
+                    assert_eq!(row.text("amount"), Some("7"));
+                }
+                other => panic!("external getById failed: {:?}", other),
+            }
+        }
+
+        #[tokio::test]
+        async fn ipe_err_redacts_db_row_values() {
+            // A UNIQUE-constraint failure must NOT echo the offending row VALUE into
+            // the Ipê-visible Error. `ipe_err` builds the message from the
+            // classification and the constraint name, never the raw `Display`, which
+            // on PostgreSQL embeds `Key (email)=(victim@…) already exists`.
+            let pool = crate::test_db::memory().await;
+            sqlx::query("CREATE TABLE secrets (email TEXT UNIQUE NOT NULL)")
+                .execute(&pool)
+                .await
+                .expect("create table");
+            let secret = "victim-PII@example.com";
+            let insert = format!("INSERT INTO secrets (email) VALUES ('{}')", secret);
+            let r1: IpeResult<String, i64> =
+                db_exec(pool.clone(), insert.clone(), Vec::new()).await;
+            assert!(
+                matches!(r1, IpeResult::Ok(_)),
+                "first insert should succeed"
+            );
+            let r2: IpeResult<String, i64> = db_exec(pool.clone(), insert, Vec::new()).await;
+            assert!(
+                matches!(&r2, IpeResult::Err(e)
+                    if !e.contains(secret)
+                        && e.starts_with("Conflict: db: unique constraint violated")),
+                "expected the redacted classified form, got: {r2:?}"
+            );
+        }
+
+        /// The first failure of opening `path` and reading it: the open, else the
+        /// first query.
+        async fn first_failure(path: &std::path::Path) -> Option<IpeError> {
+            let opened: IpeResult<IpeError, Db> = match file_at(path, FileMode::CreateIfMissing) {
+                IpeResult::Ok(location) => db_open(location).await,
+                IpeResult::Err(e) => IpeResult::Err(e),
+            };
+            match opened {
+                IpeResult::Err(e) => Some(e),
+                IpeResult::Ok(pool) => {
+                    let read: IpeResult<IpeError, _> =
+                        db_query(pool, "SELECT * FROM sqlite_master".to_owned(), vec![]).await;
+                    match read {
+                        IpeResult::Err(e) => Some(e),
+                        IpeResult::Ok(_) => None,
+                    }
+                }
+            }
+        }
+
+        /// `Db.open` on a directory fails as `CannotOpen`.
+        #[tokio::test]
+        async fn open_on_a_directory_is_cannot_open() {
+            let dir = scratch_path("dir_db");
+            let made = std::fs::create_dir_all(&dir);
+            assert!(made.is_ok(), "{made:?}");
+            let failure = first_failure(&dir).await;
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(
+                matches!(&failure, Some(IpeError::Error(IpeErrorKind::NotFound, info))
+                    if info.details == IpeMaybe::Just(IpeErrorDetails::Database(IpeDbFailure::CannotOpen))),
+                "{failure:?}"
+            );
+        }
+
+        /// A file that is not a database fails as `NotADatabase`; a real database
+        /// file is the control.
+        #[tokio::test]
+        async fn open_on_a_non_database_file_is_not_a_database() {
+            let file = scratch_path("not_a_db");
+            let written = std::fs::write(&file, "this file is not a database ".repeat(64));
+            assert!(written.is_ok(), "{written:?}");
+            let failure = first_failure(&file).await;
+            let _ = std::fs::remove_file(&file);
+            assert!(
+                matches!(&failure, Some(IpeError::Error(IpeErrorKind::Unexpected, info))
+                    if info.details == IpeMaybe::Just(IpeErrorDetails::Database(IpeDbFailure::NotADatabase))),
+                "{failure:?}"
+            );
+            let fresh = scratch_path("real_db");
+            let control = first_failure(&fresh).await;
+            let _ = std::fs::remove_file(&fresh);
+            assert!(control.is_none(), "{control:?}");
+        }
+
+        /// A real SQLite driver failure never surfaces the path or options it was
+        /// handed.
+        #[tokio::test]
+        async fn vetted_pool_sqlite_refusal_is_credential_free() {
+            for url in [
+                "sqlite:///nonexistent-admin-s3cr3t-pw/x.db?mode=ro",
+                "sqlite://x.db?mode=s3cr3t-pw",
+            ] {
+                let refused = match DbUrl::parse(url) {
+                    Ok(url) => VettedPool::<sqlx::Sqlite>::connect(&url, 1).await.err(),
+                    Err(refused) => Some(refused),
+                };
+                assert!(refused.is_some(), "{url:?} must be refused");
+                if let Some(refused) = refused {
+                    assert_credential_free(&refused);
+                }
+            }
+        }
+
+        /// The bundled SQLite passes every gate and yields a usable pool.
+        #[tokio::test]
+        async fn vetted_pool_admits_the_bundled_sqlite() {
+            let vetted = match DbUrl::parse("sqlite::memory:") {
+                Ok(url) => VettedPool::<sqlx::Sqlite>::connect(&url, 1)
+                    .await
+                    .map(|_| ()),
+                Err(refused) => Err(refused),
+            };
+            assert!(
+                vetted.is_ok(),
+                "bundled SQLite must connect: {:?}",
+                vetted.err()
+            );
+        }
+
+        #[tokio::test]
+        async fn migrate_is_idempotent_and_drift_guarded() {
+            let db = fresh_db().await;
+            let base = vec![
+                (
+                    "001_users".to_string(),
+                    "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)".to_string(),
+                ),
+                (
+                    "002_email_idx".to_string(),
+                    "CREATE INDEX idx_users_email ON users(email)".to_string(),
+                ),
+            ];
+
+            // First run applies both, in declaration order.
+            let r1: IpeResult<String, Vec<String>> =
+                db_migrate_apply(db.clone(), base.clone()).await;
+            match r1 {
+                IpeResult::Ok(v) => assert_eq!(
+                    v,
+                    vec!["001_users".to_string(), "002_email_idx".to_string()]
+                ),
+                IpeResult::Err(e) => panic!("first migrate: {e}"),
+            }
+
+            // Second run is idempotent — both already applied → 0 applied.
+            let r2: IpeResult<String, Vec<String>> =
+                db_migrate_apply(db.clone(), base.clone()).await;
+            match r2 {
+                IpeResult::Ok(v) => {
+                    assert!(v.is_empty(), "expected 0 applied on re-run, got {v:?}")
+                }
+                IpeResult::Err(e) => panic!("idempotent re-run: {e}"),
+            }
+
+            // Ledger recorded exactly the two migrations.
+            let ledger: IpeResult<String, Vec<RowCells>> = db_query(
+                db.clone(),
+                "SELECT name, checksum FROM _ipe_migrations ORDER BY name".to_string(),
+                Vec::new(),
+            )
+            .await;
+            match ledger {
+                IpeResult::Ok(rows) => assert_eq!(rows.len(), 2, "ledger rows: {rows:?}"),
+                IpeResult::Err(e) => panic!("read ledger: {e}"),
+            }
+
+            // Drift: same name, edited SQL → checksum-mismatch error, nothing applied.
+            let drift = vec![(
+                "001_users".to_string(),
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, name TEXT)".to_string(),
+            )];
+            let r3: IpeResult<String, Vec<String>> = db_migrate_apply(db.clone(), drift).await;
+            match r3 {
+                IpeResult::Err(e) => assert!(
+                    e.contains("checksum mismatch"),
+                    "expected drift error, got: {e}"
+                ),
+                IpeResult::Ok(v) => panic!("expected drift error, but applied {v:?}"),
+            }
+
+            // Adding a NEW migration after the applied ones resumes — only it applies.
+            let mut extended = base.clone();
+            extended.push((
+                "003_posts".to_string(),
+                "CREATE TABLE posts (id INTEGER PRIMARY KEY)".to_string(),
+            ));
+            let r4: IpeResult<String, Vec<String>> = db_migrate_apply(db.clone(), extended).await;
+            match r4 {
+                IpeResult::Ok(v) => assert_eq!(v, vec!["003_posts".to_string()]),
+                IpeResult::Err(e) => panic!("resume migrate: {e}"),
+            }
+        }
+
+        // ─── Rename-migration data-preservation tests ─────────────────────────────
+
+        /// Column rename preserves existing row data and makes rows readable under
+        /// the new column name.
+        #[tokio::test]
+        async fn rename_column_preserves_data() {
+            let db = new_single_conn_db().await;
+            // Matches what Store.migrations produces for a users store with
+            // renameColumn "name" "full_name".
+            let migrations = vec![
+                (
+                    "create_users".to_string(),
+                    "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT, age INTEGER)"
+                        .to_string(),
+                ),
+                (
+                    "rename_column_users_name_to_full_name".to_string(),
+                    "ALTER TABLE users RENAME COLUMN name TO full_name".to_string(),
+                ),
+            ];
+
+            // First apply: both entries run.
+            let r1: IpeResult<String, Vec<String>> =
+                db_migrate_apply(db.clone(), migrations.clone()).await;
+            match r1 {
+                IpeResult::Ok(v) => assert_eq!(
+                    v,
+                    vec![
+                        "create_users".to_string(),
+                        "rename_column_users_name_to_full_name".to_string()
+                    ]
+                ),
+                IpeResult::Err(e) => panic!("first apply: {e}"),
+            }
+
+            // Insert a row using the POST-rename column name.
+            let ins: IpeResult<String, i64> = db_exec(
+                db.clone(),
+                "INSERT INTO users (id, full_name, age) VALUES ('u1', 'Alice', 30)".to_string(),
+                Vec::new(),
+            )
+            .await;
+            assert!(matches!(ins, IpeResult::Ok(1)), "insert: {ins:?}");
+
+            // Row is readable under full_name; the old `name` column is absent.
+            let rows: IpeResult<String, Vec<RowCells>> = db_query(
+                db.clone(),
+                "SELECT full_name, age FROM users WHERE id = 'u1'".to_string(),
+                Vec::new(),
+            )
+            .await;
+            match rows {
+                IpeResult::Ok(v) => {
+                    assert_eq!(v.len(), 1, "expected 1 row, got {}", v.len());
+                    assert_eq!(
+                        v.first().and_then(|r| r.text("full_name")),
+                        Some("Alice"),
+                        "full_name should be Alice"
+                    );
+                }
+                IpeResult::Err(e) => panic!("read after rename: {e}"),
+            }
+
+            // `name` column is gone — selecting it is an error.
+            let bad: IpeResult<String, Vec<RowCells>> =
+                db_query(db.clone(), "SELECT name FROM users".to_string(), Vec::new()).await;
+            assert!(
+                matches!(bad, IpeResult::Err(_)),
+                "selecting the old column name must fail after rename"
+            );
+        }
+
+        /// Re-applying the same migration list is idempotent — no error, no
+        /// re-issue of the rename, data unchanged.
+        #[tokio::test]
+        async fn rename_column_idempotent_rerun() {
+            let db = new_single_conn_db().await;
+            let migrations = vec![
+                (
+                    "create_users".to_string(),
+                    "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT)".to_string(),
+                ),
+                (
+                    "rename_column_users_name_to_full_name".to_string(),
+                    "ALTER TABLE users RENAME COLUMN name TO full_name".to_string(),
+                ),
+            ];
+
+            // First apply.
+            let r1: IpeResult<String, Vec<String>> =
+                db_migrate_apply(db.clone(), migrations.clone()).await;
+            assert!(matches!(r1, IpeResult::Ok(_)), "first apply: {r1:?}");
+
+            // Insert after first apply.
+            let ins: IpeResult<String, i64> = db_exec(
+                db.clone(),
+                "INSERT INTO users (id, full_name) VALUES ('u1', 'Bob')".to_string(),
+                Vec::new(),
+            )
+            .await;
+            assert!(matches!(ins, IpeResult::Ok(1)), "insert: {ins:?}");
+
+            // Re-apply: both entries already in ledger → 0 applied.
+            let r2: IpeResult<String, Vec<String>> =
+                db_migrate_apply(db.clone(), migrations.clone()).await;
+            match r2 {
+                IpeResult::Ok(v) => assert!(v.is_empty(), "expected 0 on re-run, got {v:?}"),
+                IpeResult::Err(e) => panic!("re-run: {e}"),
+            }
+
+            // Data unchanged.
+            let rows: IpeResult<String, Vec<RowCells>> = db_query(
+                db.clone(),
+                "SELECT full_name FROM users WHERE id = 'u1'".to_string(),
+                Vec::new(),
+            )
+            .await;
+            match rows {
+                IpeResult::Ok(v) => assert_eq!(
+                    v.first().and_then(|r| r.text("full_name")),
+                    Some("Bob"),
+                    "data unchanged after re-run"
+                ),
+                IpeResult::Err(e) => panic!("read after re-run: {e}"),
+            }
+        }
+
+        /// Applying the same list to a fresh (empty) database converges to the
+        /// same final schema — rows inserted afterward read back under the new name.
+        #[tokio::test]
+        async fn rename_column_fresh_db_convergence() {
+            let db = new_single_conn_db().await;
+            let migrations = vec![
+                (
+                    "create_users".to_string(),
+                    "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT)".to_string(),
+                ),
+                (
+                    "rename_column_users_name_to_full_name".to_string(),
+                    "ALTER TABLE users RENAME COLUMN name TO full_name".to_string(),
+                ),
+            ];
+
+            // Apply to a completely empty DB — both entries run.
+            let r: IpeResult<String, Vec<String>> = db_migrate_apply(db.clone(), migrations).await;
+            match r {
+                IpeResult::Ok(v) => assert_eq!(v.len(), 2, "expected 2 applied, got {v:?}"),
+                IpeResult::Err(e) => panic!("fresh-db apply: {e}"),
+            }
+
+            // Insert using the new name.
+            let ins: IpeResult<String, i64> = db_exec(
+                db.clone(),
+                "INSERT INTO users (id, full_name) VALUES ('u2', 'Carol')".to_string(),
+                Vec::new(),
+            )
+            .await;
+            assert!(matches!(ins, IpeResult::Ok(1)), "fresh-db insert: {ins:?}");
+
+            let rows: IpeResult<String, Vec<RowCells>> = db_query(
+                db.clone(),
+                "SELECT full_name FROM users WHERE id = 'u2'".to_string(),
+                Vec::new(),
+            )
+            .await;
+            match rows {
+                IpeResult::Ok(v) => assert_eq!(
+                    v.first().and_then(|r| r.text("full_name")),
+                    Some("Carol"),
+                    "fresh-db convergence"
+                ),
+                IpeResult::Err(e) => panic!("fresh-db read: {e}"),
+            }
+        }
+
+        /// Table rename preserves all row data and makes the table accessible
+        /// under the new name.
+        #[tokio::test]
+        async fn rename_table_preserves_data() {
+            let db = new_single_conn_db().await;
+            // Matches what Store.migrations produces for renameTable "accounts".
+            let migrations = vec![
+                (
+                    "create_users".to_string(),
+                    "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT)"
+                        .to_string(),
+                ),
+                (
+                    "rename_table_users_to_accounts".to_string(),
+                    "ALTER TABLE users RENAME TO accounts".to_string(),
+                ),
+            ];
+
+            let r1: IpeResult<String, Vec<String>> =
+                db_migrate_apply(db.clone(), migrations.clone()).await;
+            assert!(matches!(r1, IpeResult::Ok(_)), "first apply: {r1:?}");
+
+            // Insert under the new table name.
+            let ins: IpeResult<String, i64> = db_exec(
+                db.clone(),
+                "INSERT INTO accounts (id, email) VALUES ('a1', 'dave@example.com')".to_string(),
+                Vec::new(),
+            )
+            .await;
+            assert!(
+                matches!(ins, IpeResult::Ok(1)),
+                "table-rename insert: {ins:?}"
+            );
+
+            let rows: IpeResult<String, Vec<RowCells>> = db_query(
+                db.clone(),
+                "SELECT email FROM accounts WHERE id = 'a1'".to_string(),
+                Vec::new(),
+            )
+            .await;
+            match rows {
+                IpeResult::Ok(v) => assert_eq!(
+                    v.first().and_then(|r| r.text("email")),
+                    Some("dave@example.com"),
+                    "row readable under new table name"
+                ),
+                IpeResult::Err(e) => panic!("read after table rename: {e}"),
+            }
+
+            // Old table name is gone.
+            let bad: IpeResult<String, Vec<RowCells>> =
+                db_query(db.clone(), "SELECT * FROM users".to_string(), Vec::new()).await;
+            assert!(
+                matches!(bad, IpeResult::Err(_)),
+                "old table name must be absent after rename"
+            );
+
+            // Re-apply is idempotent.
+            let r2: IpeResult<String, Vec<String>> = db_migrate_apply(db.clone(), migrations).await;
+            match r2 {
+                IpeResult::Ok(v) => assert!(v.is_empty(), "expected 0 on re-run, got {v:?}"),
+                IpeResult::Err(e) => panic!("table-rename re-run: {e}"),
+            }
+        }
+
+        /// A column rename whose `from` is absent in the schema returns a `Task Err`
+        /// and leaves the ledger unadvanced.
+        #[tokio::test]
+        async fn rename_column_missing_from_fails_closed() {
+            let db = new_single_conn_db().await;
+            // Create a table without a `name` column, then try to rename it.
+            let r_create: IpeResult<String, Vec<String>> = db_migrate_apply(
+                db.clone(),
+                vec![(
+                    "create_users".to_string(),
+                    "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT)"
+                        .to_string(),
+                )],
+            )
+            .await;
+            assert!(matches!(r_create, IpeResult::Ok(_)), "create: {r_create:?}");
+
+            // Ledger row count before the failing rename.
+            let before: IpeResult<String, Vec<RowCells>> = db_query(
+                db.clone(),
+                "SELECT name FROM _ipe_migrations ORDER BY name".to_string(),
+                Vec::new(),
+            )
+            .await;
+            let before_count = match before {
+                IpeResult::Ok(v) => v.len(),
+                IpeResult::Err(e) => panic!("ledger read before: {e}"),
+            };
+
+            // Rename a column that does not exist — must error.
+            let r_rename: IpeResult<String, Vec<String>> = db_migrate_apply(
+                db.clone(),
+                vec![
+                    (
+                        "create_users".to_string(),
+                        "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT)"
+                            .to_string(),
+                    ),
+                    (
+                        "rename_column_users_name_to_full_name".to_string(),
+                        "ALTER TABLE users RENAME COLUMN name TO full_name".to_string(),
+                    ),
+                ],
+            )
+            .await;
+            assert!(
+                matches!(r_rename, IpeResult::Err(_)),
+                "renaming absent column must return Err"
+            );
+
+            // Ledger must be unadvanced — the failing rename entry was not recorded.
+            let after: IpeResult<String, Vec<RowCells>> = db_query(
+                db.clone(),
+                "SELECT name FROM _ipe_migrations ORDER BY name".to_string(),
+                Vec::new(),
+            )
+            .await;
+            let after_count = match after {
+                IpeResult::Ok(v) => v.len(),
+                IpeResult::Err(e) => panic!("ledger read after: {e}"),
+            };
+            assert_eq!(
+                before_count, after_count,
+                "ledger must be unadvanced after a failing rename"
+            );
+        }
+
+        /// Helper: a single-connection in-memory SQLite pool (no pre-seeded todos
+        /// table — callers control the full schema).
+        async fn new_single_conn_db() -> Db {
+            crate::test_db::memory().await
+        }
+
+        #[tokio::test]
+        async fn exec_query_params_bind_mixed_sqlvalue_types() {
+            // db_exec_params / db_query_params bind the full SqlParam range (the
+            //  mixed-type path) — Text/Int/Bool/Float/Null — and
+            // round-trip through a SqlValue-param WHERE. `with_default` extracts the
+            // Ok value (a wrong/Err result then fails the following assert).
+            let db = fresh_db().await;
+            // exec/unsafeExecRaw now return rows-affected (i64). DDL rows-affected is
+            // driver-defined → assert Ok(_); each INSERT affects exactly 1 row.
+            let mk: IpeResult<String, i64> = db_exec_raw(
+                db.clone(),
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER, \
+             active INTEGER, price REAL)"
+                    .to_string(),
+            )
+            .await;
+            assert!(matches!(mk, IpeResult::Ok(_)), "create: {mk:?}");
+
+            let ins: IpeResult<String, i64> = db_exec_params(
+                db.clone(),
+                "INSERT INTO items (name, qty, active, price) VALUES (?, ?, ?, ?)".to_string(),
+                vec![
+                    SqlParam::Text("widget".to_string()),
+                    SqlParam::Int(7),
+                    SqlParam::Bool(true),
+                    SqlParam::Float(9.99),
+                ],
+            )
+            .await;
+            assert!(matches!(ins, IpeResult::Ok(1)), "mixed insert: {ins:?}");
+
+            // A row with typed NULLs (SqlNull carries a type witness so the
+            // NULL binds with the right driver type-OID — see SqlParam::Null's
+            // doc comment). `name` is TEXT, `price` is REAL: witness each with
+            // the matching leaf variant.
+            let ins2: IpeResult<String, i64> = db_exec_params(
+                db.clone(),
+                "INSERT INTO items (name, qty, active, price) VALUES (?, ?, ?, ?)".to_string(),
+                vec![
+                    SqlParam::Null(Box::new(SqlParam::Text(String::new()))),
+                    SqlParam::Int(0),
+                    SqlParam::Bool(false),
+                    SqlParam::Null(Box::new(SqlParam::Float(0.0))),
+                ],
+            )
+            .await;
+            assert!(matches!(ins2, IpeResult::Ok(1)), "null insert: {ins2:?}");
+
+            // SELECT with an Int SqlValue param.
+            let rows: IpeResult<String, Vec<RowCells>> = db_query_params(
+                db.clone(),
+                "SELECT name, qty FROM items WHERE qty = ?".to_string(),
+                vec![SqlParam::Int(7)],
+            )
+            .await;
+            let rs = rows.with_default(Vec::new());
+            assert_eq!(rs.len(), 1, "expected exactly 1 matching row, got {rs:?}");
+            if let Some(r) = rs.first() {
+                assert_eq!(r.text("name"), Some("widget"));
+                assert_eq!(r.text("qty"), Some("7"));
+            }
+        }
+
+        #[tokio::test]
+        async fn test_insert_get_by_id() {
+            let db = fresh_db().await;
+            let mut row = HashMap::new();
+            row.insert("title".to_string(), "buy milk".to_string());
+            row.insert("done".to_string(), "0".to_string());
+            let id: IpeResult<String, i64> = db_insert_row(db.clone(), "todos".into(), row).await;
+            let id = match id {
+                IpeResult::Ok(v) => v,
+                IpeResult::Err(e) => panic!("{}", e),
+            };
+            assert!(id > 0);
+
+            let fetched: IpeResult<String, IpeMaybe<RowCells>> =
+                db_get_by_id(db, "todos".into(), id.to_string()).await;
+            match fetched {
+                IpeResult::Ok(IpeMaybe::Just(m)) => assert_eq!(m.text("title"), Some("buy milk")),
+                other => panic!("unexpected: {:?}", other),
+            }
+        }
+
+        /// Tier-1 regression for the `db_insert_row`/`db_insert_fields`
+        /// fabricated-`id = 0` fix (Class 7 §4b). `DB_USES_RETURNING_ID` is
+        /// `false` on the standalone sqlite build, so `extract_returning_id` is
+        /// called directly here — bypassing the `if DB_USES_RETURNING_ID` gate —
+        /// against a REAL SQLite `RETURNING id` row with a non-integer (`TEXT`)
+        /// PK. This exercises the exact decode-miss path without needing a live
+        /// Postgres (`DB_USES_RETURNING_ID = true` is only reachable once the §3
+        /// Postgres driver template is selected by a real project build).
+        #[tokio::test]
+        async fn extract_returning_id_errs_on_non_integer_pk() {
+            let pool = crate::test_db::memory().await;
+            sqlx::query("CREATE TABLE t (id TEXT PRIMARY KEY)")
+                .execute(&pool)
+                .await
+                .expect("create table");
+            let row = fetch_one_routed(
+                &pool,
+                sqlx::query("INSERT INTO t (id) VALUES ('non-integer-pk') RETURNING id"),
+            )
+            .await
+            .expect("insert should succeed");
+            assert!(
+                extract_returning_id(&row).is_err(),
+                "a non-integer id column must surface Err, never a fabricated 0"
+            );
+        }
+
+        #[tokio::test]
+        async fn extract_returning_id_ok_on_integer_pk() {
+            let pool = crate::test_db::memory().await;
+            sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                .execute(&pool)
+                .await
+                .expect("create table");
+            let row = fetch_one_routed(
+                &pool,
+                sqlx::query("INSERT INTO t (id) VALUES (42) RETURNING id"),
+            )
+            .await
+            .expect("insert should succeed");
+            assert_eq!(extract_returning_id(&row), Ok(42));
+        }
+
+        #[tokio::test]
+        async fn test_update_by_id() {
+            let db = fresh_db().await;
+            let mut row = HashMap::new();
+            row.insert("title".to_string(), "x".to_string());
+            let id: IpeResult<String, i64> = db_insert_row(db.clone(), "todos".into(), row).await;
+            let id = match id {
+                IpeResult::Ok(v) => v,
+                _ => panic!("insert"),
+            };
+
+            let mut updates = HashMap::new();
+            updates.insert("title".to_string(), "y".to_string());
+            let affected: IpeResult<String, i64> =
+                db_update_by_id(db.clone(), "todos".into(), id.to_string(), updates).await;
+            assert!(matches!(affected, IpeResult::Ok(1)));
+        }
+
+        #[tokio::test]
+        async fn test_delete_by_id() {
+            let db = fresh_db().await;
+            let mut row = HashMap::new();
+            row.insert("title".to_string(), "z".to_string());
+            let id: IpeResult<String, i64> = db_insert_row(db.clone(), "todos".into(), row).await;
+            let id = match id {
+                IpeResult::Ok(v) => v,
+                _ => panic!("insert"),
+            };
+            let affected: IpeResult<String, i64> =
+                db_delete_by_id(db, "todos".into(), id.to_string()).await;
+            assert!(matches!(affected, IpeResult::Ok(1)));
+        }
+
+        fn where_eq_title(v: &str) -> SqlFragment {
+            SqlFragment {
+                sql: "title = ?".to_string(),
+                binds: vec![SqlParam::Text(v.to_string())],
+                invalid: None,
+            }
+        }
+
+        async fn insert_title(db: &Db, title: &str) {
+            let mut row = HashMap::new();
+            row.insert("title".to_string(), title.to_string());
+            let r: IpeResult<String, i64> = db_insert_row(db.clone(), "todos".into(), row).await;
+            assert!(
+                matches!(r, IpeResult::Ok(_)),
+                "insert {title} failed: {r:?}"
+            );
+        }
+
+        async fn count_title(db: &Db, title: &str) -> usize {
+            let rs: IpeResult<String, Vec<RowCells>> = db_find_many_by_field(
+                db.clone(),
+                "todos".into(),
+                "title".into(),
+                title.to_string(),
+            )
+            .await;
+            match rs {
+                IpeResult::Ok(v) => v.len(),
+                IpeResult::Err(e) => panic!("count {title}: {e}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn db_delete_where_deletes_only_matching_rows() {
+            let db = fresh_db().await;
+            insert_title(&db, "a").await;
+            insert_title(&db, "b").await;
+            let affected: IpeResult<String, i64> =
+                db_delete_where(db.clone(), "todos".into(), where_eq_title("a")).await;
+            assert!(
+                matches!(affected, IpeResult::Ok(1)),
+                "expected 1 deleted, got {affected:?}"
+            );
+            assert_eq!(count_title(&db, "a").await, 0, "matching row must be gone");
+            assert_eq!(
+                count_title(&db, "b").await,
+                1,
+                "non-matching row must remain"
+            );
+        }
+
+        #[tokio::test]
+        async fn db_delete_where_refuses_empty_where_and_preserves_all_rows() {
+            let db = fresh_db().await;
+            insert_title(&db, "a").await;
+            insert_title(&db, "b").await;
+            let frag = SqlFragment {
+                sql: String::new(),
+                binds: vec![],
+                invalid: None,
+            };
+            let affected: IpeResult<String, i64> =
+                db_delete_where(db.clone(), "todos".into(), frag).await;
+            assert!(
+                matches!(affected, IpeResult::Err(_)),
+                "an empty WHERE must be refused, got {affected:?}"
+            );
+            assert_eq!(
+                count_title(&db, "a").await,
+                1,
+                "a refused mass-delete must delete nothing"
+            );
+            assert_eq!(count_title(&db, "b").await, 1);
+        }
+
+        #[tokio::test]
+        async fn db_update_where_updates_only_matching_rows() {
+            let db = fresh_db().await;
+            insert_title(&db, "a").await;
+            insert_title(&db, "b").await;
+            let set = vec![("title".to_string(), Some(SqlParam::Text("A2".to_string())))];
+            let affected: IpeResult<String, i64> =
+                db_update_where(db.clone(), "todos".into(), set, where_eq_title("a")).await;
+            assert!(
+                matches!(affected, IpeResult::Ok(1)),
+                "expected 1 updated, got {affected:?}"
+            );
+            assert_eq!(
+                count_title(&db, "A2").await,
+                1,
+                "matching row must be updated"
+            );
+            assert_eq!(count_title(&db, "b").await, 1, "non-matching row unchanged");
+        }
+
+        #[tokio::test]
+        async fn db_update_where_refuses_whitespace_where_and_changes_nothing() {
+            let db = fresh_db().await;
+            insert_title(&db, "a").await;
+            let set = vec![(
+                "title".to_string(),
+                Some(SqlParam::Text("mutated".to_string())),
+            )];
+            let frag = SqlFragment {
+                sql: "   ".to_string(),
+                binds: vec![],
+                invalid: None,
+            };
+            let affected: IpeResult<String, i64> =
+                db_update_where(db.clone(), "todos".into(), set, frag).await;
+            assert!(
+                matches!(affected, IpeResult::Err(_)),
+                "a whitespace-only WHERE must be refused, got {affected:?}"
+            );
+            assert_eq!(count_title(&db, "a").await, 1, "original row untouched");
+            assert_eq!(
+                count_title(&db, "mutated").await,
+                0,
+                "no mass-update may occur"
+            );
+        }
+
+        /// A checked insert of `title` under the check `check_sql`.
+        async fn checked_insert_title(
+            db: &Db,
+            title: &str,
+            check_sql: &str,
+        ) -> IpeResult<String, i64> {
+            db_insert_fields_checked(
+                db.clone(),
+                "todos".into(),
+                vec![("title".to_string(), Some(text(title)))],
+                checked_frag(check_sql, vec![]),
+            )
+            .await
+        }
+
+        /// Only a check returning `1` keeps the row; `0`, `NULL`, any other integer
+        /// (`2`, `-1`: a SQLite `bool` decode would read them as `true`), a real,
+        /// and a value that does not decode as a boolean or integer (`'yes'`) each
+        /// roll it back.
+        #[tokio::test]
+        async fn checked_insert_keeps_only_an_admitted_row() {
+            let db = fresh_db().await;
+            let cases = [
+                ("kept", "1", 1i64),
+                ("zero", "0", 0),
+                ("null", "NULL", 0),
+                ("two", "2", 0),
+                ("minus", "-1", 0),
+                ("real", "1.0", 0),
+                ("text", "'yes'", 0),
+            ];
+            for (title, check, want) in cases {
+                let got = checked_insert_title(&db, title, check).await;
+                assert!(
+                    matches!(got, IpeResult::Ok(n) if n == want),
+                    "check {check}: expected Ok({want}), got {got:?}"
+                );
+                let stored = count_title(&db, title).await;
+                assert_eq!(
+                    i64::try_from(stored).ok(),
+                    Some(want),
+                    "check {check}: the stored row count must equal the returned count"
+                );
+            }
+        }
+
+        /// The checked update keeps a write only when the row satisfies the check
+        /// after the write; a WHERE that matches nothing writes nothing.
+        #[tokio::test]
+        async fn checked_update_rolls_back_a_refused_row() {
+            let db = fresh_db().await;
+            insert_title(&db, "a").await;
+            let update = |to: &str, check_value: &str| {
+                db_update_where_checked::<String>(
+                    db.clone(),
+                    "todos".into(),
+                    vec![("title".to_string(), Some(text(to)))],
+                    where_eq_title("a"),
+                    checked_frag("title = ?", vec![text(check_value)]),
+                )
+            };
+            let refused = update("b", "c").await;
+            assert!(
+                matches!(refused, IpeResult::Ok(0)),
+                "a row failing the check after the write must give 0, got {refused:?}"
+            );
+            assert_eq!(
+                count_title(&db, "a").await,
+                1,
+                "the refused update rolled back"
+            );
+            assert_eq!(
+                count_title(&db, "b").await,
+                0,
+                "the refused value is not stored"
+            );
+            let kept = update("b", "b").await;
+            assert!(
+                matches!(kept, IpeResult::Ok(1)),
+                "a row satisfying the check after the write must give 1, got {kept:?}"
+            );
+            assert_eq!(
+                count_title(&db, "b").await,
+                1,
+                "the admitted update is stored"
+            );
+            let unmatched = update("z", "z").await;
+            assert!(
+                matches!(unmatched, IpeResult::Ok(0)),
+                "a WHERE matching no row must give 0, got {unmatched:?}"
+            );
+            assert_eq!(count_title(&db, "z").await, 0);
+        }
+
+        /// A correlated `EXISTS` over another table, naming the written row as
+        /// `<table>.<col>`, is evaluated in the `RETURNING` check.
+        #[tokio::test]
+        async fn checked_insert_evaluates_a_correlated_subquery() {
+            let db = fresh_db().await;
+            let created: IpeResult<String, i64> = db_exec(
+                db.clone(),
+                "CREATE TABLE shares (doc_title TEXT NOT NULL)".into(),
+                vec![],
+            )
+            .await;
+            assert!(
+                matches!(created, IpeResult::Ok(_)),
+                "create shares: {created:?}"
+            );
+            let check = "EXISTS (SELECT 1 FROM shares WHERE shares.doc_title = todos.title)";
+            let unshared = checked_insert_title(&db, "y", check).await;
+            assert!(
+                matches!(unshared, IpeResult::Ok(0)),
+                "without a share the insert must give 0, got {unshared:?}"
+            );
+            assert_eq!(count_title(&db, "y").await, 0);
+            let shared: IpeResult<String, i64> = db_exec(
+                db.clone(),
+                "INSERT INTO shares (doc_title) VALUES (?)".into(),
+                vec!["y".to_string()],
+            )
+            .await;
+            assert!(
+                matches!(shared, IpeResult::Ok(_)),
+                "insert share: {shared:?}"
+            );
+            let admitted = checked_insert_title(&db, "y", check).await;
+            assert!(
+                matches!(admitted, IpeResult::Ok(1)),
+                "with a share the insert must give 1, got {admitted:?}"
+            );
+            assert_eq!(count_title(&db, "y").await, 1);
+        }
+
+        /// A refused checked write inside a transaction rolls back only its own
+        /// savepoint: later writes in the same transaction still commit.
+        #[tokio::test]
+        #[allow(clippy::expect_used)] // test: the recording transaction is solely owned once its scope ends
+        async fn checked_write_savepoint_leaves_the_outer_transaction_usable() {
+            let db = fresh_db().await;
+            let rec = recording_txn(&db).await;
+            let (refused, admitted, plain) = with_recording_txn(&db, rec.clone(), async {
+                let refused = checked_insert_title(&db, "refused", "0").await;
+                let admitted = checked_insert_title(&db, "admitted", "1").await;
+                let plain: IpeResult<String, i64> = db_insert_fields(
+                    db.clone(),
+                    "todos".into(),
+                    vec![("title".to_string(), Some(text("plain")))],
+                )
+                .await;
+                (refused, admitted, plain)
+            })
+            .await;
+            assert!(matches!(refused, IpeResult::Ok(0)), "refused: {refused:?}");
+            assert!(
+                matches!(admitted, IpeResult::Ok(1)),
+                "admitted: {admitted:?}"
+            );
+            assert!(matches!(plain, IpeResult::Ok(_)), "plain: {plain:?}");
+            let tx = std::sync::Arc::try_unwrap(rec)
+                .expect("the scope released its clone")
+                .into_inner();
+            tx.commit().await.expect("commit the outer transaction");
+            assert_eq!(
+                count_title(&db, "refused").await,
+                0,
+                "the refused row rolled back"
+            );
+            assert_eq!(
+                count_title(&db, "admitted").await,
+                1,
+                "the admitted row committed"
+            );
+            assert_eq!(
+                count_title(&db, "plain").await,
+                1,
+                "the later plain insert committed"
+            );
+        }
+
+        /// A checked write whose statement fails inside a transaction rolls back
+        /// its own savepoint and reports the error; the transaction stays usable
+        /// and a later write in it commits.
+        #[tokio::test]
+        #[allow(clippy::expect_used)] // test: the recording transaction is solely owned once its scope ends
+        async fn checked_write_error_leaves_the_outer_transaction_usable() {
+            let db = fresh_db().await;
+            let rec = recording_txn(&db).await;
+            let (failed, plain) = with_recording_txn(&db, rec.clone(), async {
+                // `title` is `NOT NULL` and omitted: the insert itself fails.
+                let failed: IpeResult<String, i64> = db_insert_fields_checked(
+                    db.clone(),
+                    "todos".into(),
+                    vec![("done".to_string(), Some(SqlParam::Int(1)))],
+                    checked_frag("1", vec![]),
+                )
+                .await;
+                let plain: IpeResult<String, i64> = db_insert_fields(
+                    db.clone(),
+                    "todos".into(),
+                    vec![("title".to_string(), Some(text("after")))],
+                )
+                .await;
+                (failed, plain)
+            })
+            .await;
+            assert!(matches!(failed, IpeResult::Err(_)), "failed: {failed:?}");
+            assert!(matches!(plain, IpeResult::Ok(_)), "plain: {plain:?}");
+            let tx = std::sync::Arc::try_unwrap(rec)
+                .expect("the scope released its clone")
+                .into_inner();
+            tx.commit().await.expect("commit the outer transaction");
+            assert_eq!(
+                count_title(&db, "after").await,
+                1,
+                "the later plain insert committed"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_find_one_by_field() {
+            let db = fresh_db().await;
+            let mut row = HashMap::new();
+            row.insert("title".to_string(), "find me".to_string());
+            let _: IpeResult<String, i64> = db_insert_row(db.clone(), "todos".into(), row).await;
+            let found: IpeResult<String, IpeMaybe<RowCells>> =
+                db_find_one_by_field(db, "todos".into(), "title".into(), "find me".into()).await;
+            assert!(matches!(found, IpeResult::Ok(IpeMaybe::Just(_))));
+        }
+
+        #[tokio::test]
+        async fn test_find_many_and_by_conditions() {
+            let db = fresh_db().await;
+            for t in ["a", "b", "c"] {
+                let mut r = HashMap::new();
+                r.insert("title".to_string(), t.to_string());
+                r.insert("done".to_string(), "1".to_string());
+                let _: IpeResult<String, i64> = db_insert_row(db.clone(), "todos".into(), r).await;
+            }
+            let many: IpeResult<String, Vec<RowCells>> =
+                db_find_many_by_field(db.clone(), "todos".into(), "done".into(), "1".into()).await;
+            match many {
+                IpeResult::Ok(v) => assert_eq!(v.len(), 3),
+                _ => panic!("find many"),
+            }
+
+            let mut cond = HashMap::new();
+            cond.insert("done".to_string(), "1".to_string());
+            cond.insert("title".to_string(), "b".to_string());
+            let one: IpeResult<String, Vec<RowCells>> =
+                db_find_by_conditions(db.clone(), "todos".into(), cond).await;
+            match one {
+                IpeResult::Ok(v) => assert_eq!(v.len(), 1),
+                _ => panic!("conds"),
+            }
+
+            // Empty condition set MUST be refused (would otherwise return every
+            // row — a cross-tenant read when request-derived filters come back empty).
+            let empty_cond: HashMap<String, String> = HashMap::new();
+            let refused: IpeResult<String, Vec<RowCells>> =
+                db_find_by_conditions(db.clone(), "todos".into(), empty_cond).await;
+            assert!(
+                matches!(refused, IpeResult::Err(_)),
+                "empty conditions must be refused, got {refused:?}"
+            );
+
+            // Non-empty conditions still return filtered rows (happy-path regression).
+            let mut only_done = HashMap::new();
+            only_done.insert("done".to_string(), "1".to_string());
+            let filtered: IpeResult<String, Vec<RowCells>> =
+                db_find_by_conditions(db, "todos".into(), only_done).await;
+            match filtered {
+                IpeResult::Ok(v) => assert_eq!(v.len(), 3, "expected 3 done rows"),
+                _ => panic!("non-empty conditions should return rows"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_with_transaction_commit() {
+            let db = fresh_db().await;
+            let r: IpeResult<String, i64> = db_with_transaction(db.clone(), |c| {
+                Box::pin(async move {
+                    let mut row = HashMap::new();
+                    row.insert("title".to_string(), "txn".to_string());
+                    db_insert_row(c, "todos".into(), row).await
+                })
+            })
+            .await;
+            assert!(matches!(r, IpeResult::Ok(_)));
+            // The inserted row should be visible after commit:
+            let found: IpeResult<String, Vec<RowCells>> =
+                db_find_many_by_field(db, "todos".into(), "title".into(), "txn".into()).await;
+            match found {
+                IpeResult::Ok(v) => assert_eq!(v.len(), 1),
+                _ => panic!("post-commit fetch"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_with_transaction_rollback_returns_err() {
+            // Err propagates AND the write is actually undone. With the task-local
+            // dedicated-connection routing, BEGIN / INSERT / ROLLBACK all run on the
+            // same connection, so the row is gone after rollback (single-conn pool).
+            let db = fresh_db().await;
+            let r: IpeResult<String, i64> = db_with_transaction(db.clone(), |c| {
+                Box::pin(async move {
+                    let mut row = HashMap::new();
+                    row.insert("title".to_string(), "txn-err".to_string());
+                    let _: IpeResult<String, i64> = db_insert_row(c, "todos".into(), row).await;
+                    IpeResult::Err("boom".to_string())
+                })
+            })
+            .await;
+            assert!(matches!(r, IpeResult::Err(_)));
+            let found: IpeResult<String, Vec<RowCells>> =
+                db_find_many_by_field(db, "todos".into(), "title".into(), "txn-err".into()).await;
+            match found {
+                IpeResult::Ok(v) => assert_eq!(v.len(), 0, "rollback must undo the INSERT"),
+                _ => panic!("post-rollback fetch"),
+            }
+        }
+
+        // Build a FILE-based sqlite pool (temp file, NOT `:memory:` — in-memory
+        // sqlite is per-connection so it can't exhibit the cross-connection bug)
+        // with `max_connections > 1` and WAL. Returns (pool, tempdir-guard); the
+        // guard must outlive the pool so the file isn't deleted early.
+        async fn fresh_file_db(max_conns: u32) -> (Db, std::path::PathBuf) {
+            let mut path = crate::scratch_core::test_temp_root();
+            // Unique per test run to avoid cross-test contamination.
+            let unique = format!(
+                "ipe_txn_test_{}_{}.db",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            );
+            path.push(unique);
+            // Fresh file every time.
+            let _ = std::fs::remove_file(&path);
+            let url = format!("sqlite://{}?mode=rwc", path.display());
+            let options = url
+                .parse::<sqlx::sqlite::SqliteConnectOptions>()
+                .expect("parse file sqlite url")
+                .busy_timeout(SQLITE_BUSY_TIMEOUT);
+            let pool = crate::test_db::with_options(options, max_conns).await;
+            // WAL: concurrent readers alongside a single writer.
+            let _ = sqlx::query("PRAGMA journal_mode=WAL;").execute(&pool).await;
+            sqlx::query("CREATE TABLE todos (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0)")
+                .execute(&pool).await.expect("create table");
+            (pool, path)
+        }
+
+        /// Statements that fail at prepare time on a connection whose cached schema
+        /// predates another connection's DDL, before any schema-cookie check runs.
+        const STALE_SENSITIVE: [&str; 2] = [
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
+            "ALTER TABLE t RENAME TO u",
+        ];
+
+        /// The checked-write shape of [`STALE_SENSITIVE`]: an insert into `v`, a
+        /// view in the stale schema and a table in the current one.
+        const STALE_CHECKED_INSERT: &str = "INSERT INTO v (x) VALUES (1) RETURNING (1)";
+
+        /// Connect options for a fresh rollback-journal temp SQLite file.
+        fn schema_test_file() -> (sqlx::sqlite::SqliteConnectOptions, std::path::PathBuf) {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut path = crate::scratch_core::test_temp_root();
+            path.push(format!(
+                "ipe_schema_test_{}_{n}_{}.db",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos())
+            ));
+            let _ = std::fs::remove_file(&path);
+            let options = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .busy_timeout(SQLITE_BUSY_TIMEOUT);
+            (options, path)
+        }
+
+        /// A two-connection pool with no checkout hook.
+        async fn hookless_pool(options: sqlx::sqlite::SqliteConnectOptions) -> Db {
+            crate::test_db::with_options(options, 2).await
+        }
+
+        /// A two-connection pool built by the production [`vetted_pool_options`].
+        async fn vetted_test_pool(options: sqlx::sqlite::SqliteConnectOptions) -> Db {
+            vetted_pool_options::<sqlx::Sqlite>(2, SchemaCache::PerConnection)
+                .connect_with(options)
+                .await
+                .expect("connect a vetted pool")
+        }
+
+        /// Leaves `pool`'s idle connection B with a schema older than the file's.
+        ///
+        /// Connection A creates `t`, `u`, trigger `tr` and view `v`, B caches
+        /// that schema, then A drops `tr` and `u` and replaces view `v` with a
+        /// table. A is returned still held, so the pool, at its two-connection
+        /// cap, hands out B next.
+        async fn stale_schema_pair(pool: &Db) -> sqlx::pool::PoolConnection<sqlx::Sqlite> {
+            let mut a = pool.acquire().await.expect("acquire A");
+            let mut b = pool.acquire().await.expect("acquire B");
+            for ddl in [
+                "CREATE TABLE t (x)",
+                "CREATE TABLE u (x)",
+                "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
+                "CREATE TABLE base (x)",
+                "CREATE VIEW v AS SELECT x FROM base",
+            ] {
+                sqlx::query(ddl).execute(&mut *a).await.expect(ddl);
+            }
+            let cached = sqlx::query("SELECT name FROM sqlite_master")
+                .fetch_all(&mut *b)
+                .await
+                .expect("B reads the schema");
+            assert_eq!(cached.len(), 5, "B cached every object");
+            for ddl in [
+                "DROP TRIGGER tr",
+                "DROP TABLE u",
+                "DROP VIEW v",
+                "CREATE TABLE v (x)",
+            ] {
+                sqlx::query(ddl).execute(&mut *a).await.expect(ddl);
+            }
+            drop(b);
+            a
+        }
+
+        /// The premise the schema refresh rests on: with no refresh, each
+        /// stale-sensitive statement fails on the connection that cached the
+        /// older schema, so the refresh tests below are not vacuous.
+        #[tokio::test]
+        async fn sqlite_caches_the_schema_per_connection() {
+            for statement in STALE_SENSITIVE.into_iter().chain([STALE_CHECKED_INSERT]) {
+                let (options, path) = schema_test_file();
+                let pool = hookless_pool(options).await;
+                let held = stale_schema_pair(&pool).await;
+                let ran = sqlx::query(statement).execute(&pool).await;
+                drop(held);
+                pool.close().await;
+                let _ = std::fs::remove_file(&path);
+                let failure = ran
+                    .as_ref()
+                    .err()
+                    .map(|e| (classify_failure(DbEngine::Sqlite, e), e.to_string()));
+                assert!(
+                    matches!(failure, Some((IpeDbFailure::InvalidStatement, _))),
+                    "{statement} ran on the stale connection: {failure:?}"
+                );
+            }
+        }
+
+        /// An autocommit statement on a vetted pool compiles against the schema
+        /// another connection changed before the checkout.
+        #[tokio::test]
+        async fn a_pooled_connection_compiles_against_schema_another_connection_changed() {
+            for statement in STALE_SENSITIVE {
+                let (options, path) = schema_test_file();
+                let pool = vetted_test_pool(options).await;
+                let held = stale_schema_pair(&pool).await;
+                let ran: IpeResult<String, i64> =
+                    db_exec_raw(pool.clone(), statement.to_owned()).await;
+                drop(held);
+                pool.close().await;
+                let _ = std::fs::remove_file(&path);
+                assert!(matches!(ran, IpeResult::Ok(_)), "{statement}: {ran:?}");
+            }
+        }
+
+        /// A write transaction re-reads the schema once it holds the write lock,
+        /// even on a pool with no checkout hook.
+        #[tokio::test]
+        async fn a_write_transaction_compiles_against_schema_committed_before_its_lock() {
+            for statement in STALE_SENSITIVE {
+                let (options, path) = schema_test_file();
+                let pool = hookless_pool(options).await;
+                let held = stale_schema_pair(&pool).await;
+                let sql = statement.to_owned();
+                let ran: IpeResult<String, i64> =
+                    db_with_transaction(pool.clone(), move |c| db_exec_raw(c, sql)).await;
+                drop(held);
+                pool.close().await;
+                let _ = std::fs::remove_file(&path);
+                assert!(matches!(ran, IpeResult::Ok(_)), "{statement}: {ran:?}");
+            }
+        }
+
+        /// A checked write on the pool begins through [`begin_write_txn`], so it
+        /// writes into the table that replaced a view the connection cached.
+        #[tokio::test]
+        async fn a_checked_write_on_the_pool_compiles_against_the_current_schema() {
+            let (options, path) = schema_test_file();
+            let pool = hookless_pool(options).await;
+            let held = stale_schema_pair(&pool).await;
+            let ran: IpeResult<String, i64> = db_insert_fields_checked(
+                pool.clone(),
+                "v".into(),
+                vec![("x".to_string(), Some(SqlParam::Int(1)))],
+                checked_frag("1", vec![]),
+            )
+            .await;
+            drop(held);
+            pool.close().await;
+            let _ = std::fs::remove_file(&path);
+            assert!(matches!(ran, IpeResult::Ok(1)), "{ran:?}");
+        }
+
+        /// A schema refresh the engine refuses is an error, never a pass: a probe
+        /// that cannot take its read lock reports `Busy`, and the same probe runs
+        /// once the lock is released.
+        #[tokio::test]
+        async fn a_failed_schema_refresh_is_an_error_not_a_pass() {
+            use sqlx::Connection as _;
+            let (options, path) = schema_test_file();
+            let mut holder = sqlx::sqlite::SqliteConnection::connect_with(&options)
+                .await
+                .expect("connect the lock holder");
+            sqlx::query("CREATE TABLE w (x)")
+                .execute(&mut holder)
+                .await
+                .expect("create w");
+            let mut waiter = sqlx::sqlite::SqliteConnection::connect_with(
+                &options.clone().busy_timeout(std::time::Duration::ZERO),
+            )
+            .await
+            .expect("connect the waiter");
+            sqlx::query("BEGIN EXCLUSIVE")
+                .execute(&mut holder)
+                .await
+                .expect("take the exclusive lock");
+            sqlx::query("INSERT INTO w (x) VALUES (1)")
+                .execute(&mut holder)
+                .await
+                .expect("write under the lock");
+            let refused =
+                refresh_schema_cache::<sqlx::Sqlite>(&mut waiter, SchemaCache::PerConnection).await;
+            let _ = sqlx::query("ROLLBACK").execute(&mut holder).await;
+            let control =
+                refresh_schema_cache::<sqlx::Sqlite>(&mut waiter, SchemaCache::PerConnection).await;
+            let _ = holder.close().await;
+            let _ = waiter.close().await;
+            let _ = std::fs::remove_file(&path);
+            let failure = refused
+                .as_ref()
+                .err()
+                .map(|e| classify_failure(DbEngine::Sqlite, e));
+            assert_eq!(failure, Some(IpeDbFailure::Busy), "{refused:?}");
+            assert!(control.is_ok(), "the probe runs once unlocked: {control:?}");
+        }
+
+        /// A pooled connection whose checkout refresh fails is closed, never
+        /// handed out: the checkout is refused or yields a new connection.
+        #[tokio::test]
+        async fn a_pooled_connection_whose_refresh_fails_is_never_handed_out() {
+            use sqlx::Connection as _;
+            let (options, path) = schema_test_file();
+            let mut holder = sqlx::sqlite::SqliteConnection::connect_with(&options)
+                .await
+                .expect("connect the lock holder");
+            sqlx::query("CREATE TABLE w (x)")
+                .execute(&mut holder)
+                .await
+                .expect("create w");
+            let pool: Db = vetted_pool_options::<sqlx::Sqlite>(1, SchemaCache::PerConnection)
+                .acquire_timeout(std::time::Duration::from_millis(500))
+                .connect_with(options.clone().busy_timeout(std::time::Duration::ZERO))
+                .await
+                .expect("connect a one-connection vetted pool");
+            {
+                let mut marked = pool.acquire().await.expect("acquire the connection");
+                sqlx::query("CREATE TEMP TABLE marker (x)")
+                    .execute(&mut *marked)
+                    .await
+                    .expect("mark the connection");
+            }
+            // Control: with no lock held, the refresh passes and the marked
+            // connection is handed out again.
+            let reused = {
+                let mut again = pool.acquire().await.expect("acquire it again");
+                sqlx::query("SELECT x FROM temp.marker")
+                    .fetch_all(&mut *again)
+                    .await
+                    .map(|rows| rows.len())
+            };
+            sqlx::query("BEGIN EXCLUSIVE")
+                .execute(&mut holder)
+                .await
+                .expect("take the exclusive lock");
+            sqlx::query("INSERT INTO w (x) VALUES (1)")
+                .execute(&mut holder)
+                .await
+                .expect("write under the lock");
+            let handed = pool.acquire().await;
+            let _ = sqlx::query("ROLLBACK").execute(&mut holder).await;
+            let outcome = match handed {
+                Err(e) => format!("refused: {e}"),
+                Ok(mut conn) => match sqlx::query("SELECT x FROM temp.marker")
+                    .fetch_all(&mut *conn)
+                    .await
+                {
+                    Ok(_) => "handed out the connection whose refresh failed".to_owned(),
+                    Err(e) => format!("a new connection: {e}"),
+                },
+            };
+            pool.close().await;
+            let _ = holder.close().await;
+            let _ = std::fs::remove_file(&path);
+            assert!(
+                matches!(reused, Ok(0)),
+                "control: the idle connection is reused: {reused:?}"
+            );
+            assert!(
+                outcome.starts_with("refused")
+                    || (outcome.starts_with("a new connection")
+                        && outcome.contains("no such table")),
+                "{outcome}"
+            );
+        }
+
+        /// A transaction that may write holds the SQLite write lock from its
+        /// `BEGIN`, before its body runs a statement: a second connection asking
+        /// for the write lock with no busy wait is refused.
+        #[tokio::test]
+        async fn a_write_transaction_holds_the_write_lock_from_begin() {
+            let (db, path) = fresh_file_db(1).await;
+            let options = format!("sqlite://{}", path.display())
+                .parse::<sqlx::sqlite::SqliteConnectOptions>()
+                .expect("parse file sqlite url")
+                .busy_timeout(std::time::Duration::ZERO);
+            let other = crate::test_db::with_options(options, 1).await;
+            let r: IpeResult<String, bool> = db_with_transaction(db.clone(), move |_c| {
+                Box::pin(async move {
+                    let mut probe = other.acquire().await.expect("acquire probe");
+                    let taken = sqlx::query("BEGIN IMMEDIATE").execute(&mut *probe).await;
+                    if taken.is_ok() {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *probe).await;
+                    }
+                    IpeResult::Ok(taken.is_err())
+                })
+            })
+            .await;
+            db.close().await;
+            let _ = std::fs::remove_file(&path);
+            assert!(
+                matches!(r, IpeResult::Ok(true)),
+                "the probe took the write lock inside an open write transaction"
+            );
+        }
+
+        /// Two concurrent read-then-write transactions on one row both commit,
+        /// and the second sees the first's write: it waits at `BEGIN IMMEDIATE`
+        /// instead of failing its read-to-write upgrade with `database busy`.
+        #[tokio::test]
+        async fn concurrent_read_then_write_transactions_on_one_row_both_commit() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let (db, path) = fresh_file_db(2).await;
+            sqlx::query("INSERT INTO todos (id, title, done) VALUES (1, 'counter', 0)")
+                .execute(&db)
+                .await
+                .expect("seed row");
+            let reads = std::sync::Arc::new(AtomicUsize::new(0));
+            let bump = |db: Db, reads: std::sync::Arc<AtomicUsize>| {
+                tokio::spawn(db_with_transaction::<String, i64>(db, move |c| {
+                    Box::pin(async move {
+                        let row = fetch_one_routed(
+                            &c,
+                            sqlx::query("SELECT done FROM todos WHERE id = 1"),
+                        )
+                        .await;
+                        let seen: i64 = match row.and_then(|row| row.try_get(0_usize)) {
+                            Ok(n) => n,
+                            Err(e) => return IpeResult::Err(e.to_string()),
+                        };
+                        reads.fetch_add(1, Ordering::SeqCst);
+                        // Hold the read open until the other body has read too (the
+                        // deferred race), or a short wait passes (the second writer
+                        // is parked at its begin).
+                        let deadline =
+                            tokio::time::Instant::now() + std::time::Duration::from_millis(300);
+                        while reads.load(Ordering::SeqCst) < 2
+                            && tokio::time::Instant::now() < deadline
+                        {
+                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        }
+                        let write =
+                            sqlx::query("UPDATE todos SET done = ? WHERE id = 1").bind(seen + 1);
+                        match exec_routed(&c, write).await {
+                            Ok(_) => IpeResult::Ok(seen + 1),
+                            Err(e) => IpeResult::Err(e.to_string()),
+                        }
+                    })
+                }))
+            };
+            let first = bump(db.clone(), reads.clone());
+            let second = bump(db.clone(), reads.clone());
+            let first = first.await.expect("first transaction task");
+            let second = second.await.expect("second transaction task");
+            let total: i64 = sqlx::query_scalar("SELECT done FROM todos WHERE id = 1")
+                .fetch_one(&db)
+                .await
+                .expect("read counter");
+            db.close().await;
+            let _ = std::fs::remove_file(&path);
+            assert!(
+                matches!(first, IpeResult::Ok(_)),
+                "first writer failed: {first:?}"
+            );
+            assert!(
+                matches!(second, IpeResult::Ok(_)),
+                "second writer failed: {second:?}"
+            );
+            assert_eq!(total, 2, "a committed write was lost");
+        }
+
+        /// A connection that comes back to a vetted pool with a transaction still
+        /// open (a `BEGIN IMMEDIATE` cancelled after SQLite opened it, before the
+        /// driver wrapped it) is closed, not pooled: the next user gets a fresh
+        /// connection outside any transaction, and the write lock is released.
+        #[tokio::test]
+        async fn a_connection_released_inside_a_transaction_is_not_pooled_again() {
+            let (seed, path) = fresh_file_db(1).await;
+            seed.close().await;
+            let url =
+                DbUrl::parse(&format!("sqlite://{}", path.display())).expect("parse file url");
+            let pool = VettedPool::<sqlx::Sqlite>::connect(&url, 1)
+                .await
+                .expect("vetted file pool")
+                .into_pool();
+            let mut conn = pool.acquire().await.expect("acquire");
+            {
+                // The cancelled begin's shape: the transaction is open and nothing
+                // owns its rollback.
+                let _unowned = std::mem::ManuallyDrop::new(
+                    sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE")
+                        .await
+                        .expect("begin immediate"),
+                );
+            }
+            drop(conn);
+            let again = pool.acquire().await.expect("reacquire");
+            let inherited = sqlx::Connection::is_in_transaction(&*again);
+            drop(again);
+            let options = format!("sqlite://{}", path.display())
+                .parse::<sqlx::sqlite::SqliteConnectOptions>()
+                .expect("parse file sqlite url")
+                .busy_timeout(std::time::Duration::ZERO);
+            let other = crate::test_db::with_options(options, 1).await;
+            let mut probe = other.acquire().await.expect("acquire probe");
+            let lock_free = sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *probe)
+                .await
+                .is_ok();
+            let _ = sqlx::query("ROLLBACK").execute(&mut *probe).await;
+            drop(probe);
+            other.close().await;
+            pool.close().await;
+            let _ = std::fs::remove_file(&path);
+            assert!(
+                !inherited,
+                "the pool handed out a connection inside a transaction"
+            );
+            assert!(
+                lock_free,
+                "a pooled idle connection still holds the write lock"
+            );
+        }
+
+        /// A connection whose dropped transaction's rollback is still queued comes
+        /// back to the pool and is reused once the rollback has run: the
+        /// in-memory database living on it survives.
+        #[tokio::test]
+        async fn a_connection_whose_dropped_transaction_rolled_back_is_pooled_again() {
+            let url = DbUrl::parse("sqlite::memory:").expect("parse memory url");
+            let pool = VettedPool::<sqlx::Sqlite>::connect(&url, 1)
+                .await
+                .expect("vetted memory pool")
+                .into_pool();
+            sqlx::query("CREATE TABLE kept (id INTEGER)")
+                .execute(&pool)
+                .await
+                .expect("create table");
+            let mut conn = pool.acquire().await.expect("acquire");
+            let tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE")
+                .await
+                .expect("begin immediate");
+            drop(tx);
+            drop(conn);
+            let survived = sqlx::query("SELECT COUNT(*) FROM kept")
+                .execute(&pool)
+                .await
+                .is_ok();
+            pool.close().await;
+            assert!(
+                survived,
+                "a connection whose transaction was rolled back was closed, not pooled"
+            );
+        }
+
+        /// A transaction on a read-only SQLite file still runs, and does not wait
+        /// for a writer: `BEGIN IMMEDIATE` on a read-only database is a read.
+        #[tokio::test]
+        async fn a_transaction_on_a_read_only_sqlite_file_reads_beside_a_writer() {
+            let (writer, path) = fresh_file_db(1).await;
+            sqlx::query("INSERT INTO todos (id, title, done) VALUES (1, 'seen', 0)")
+                .execute(&writer)
+                .await
+                .expect("seed row");
+            let mut held = writer.acquire().await.expect("acquire writer");
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *held)
+                .await
+                .expect("writer takes the write lock");
+            let url = DbUrl::parse(&format!("sqlite://{}?mode=ro", path.display()))
+                .expect("parse read-only url");
+            let reader = VettedPool::<sqlx::Sqlite>::connect(&url, 1)
+                .await
+                .expect("vetted read-only pool")
+                .into_pool();
+            let read = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                db_with_transaction::<String, String>(reader.clone(), |c| {
+                    Box::pin(async move {
+                        let row = fetch_one_routed(
+                            &c,
+                            sqlx::query("SELECT title FROM todos WHERE id = 1"),
+                        )
+                        .await;
+                        match row.and_then(|row| row.try_get::<String, _>(0_usize)) {
+                            Ok(title) => IpeResult::Ok(title),
+                            Err(e) => IpeResult::Err(e.to_string()),
+                        }
+                    })
+                }),
+            )
+            .await;
+            let _ = sqlx::query("ROLLBACK").execute(&mut *held).await;
+            drop(held);
+            reader.close().await;
+            writer.close().await;
+            let _ = std::fs::remove_file(&path);
+            assert!(
+                matches!(&read, Ok(IpeResult::Ok(title)) if title == "seen"),
+                "a read-only transaction failed or waited on the writer: {read:?}"
+            );
+        }
+
+        /// A write lock held past the busy timeout refuses `withTransaction` at its
+        /// begin as the typed `Database Busy`, never `Unexpected`.
+        ///
+        /// The body's own failure is untyped, so the test is red when the begin is
+        /// deferred and the body is first to want the lock. Once the lock is
+        /// released the same transaction commits.
+        #[tokio::test]
+        async fn lock_held_past_busy_timeout_is_typed_busy() {
+            let (seed, path) = fresh_file_db(1).await;
+            let options = format!("sqlite://{}", path.display())
+                .parse::<sqlx::sqlite::SqliteConnectOptions>()
+                .expect("parse file sqlite url")
+                .busy_timeout(std::time::Duration::from_millis(50));
+            let db = crate::test_db::with_options(options, 1).await;
+            let insert = || {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    db_with_transaction::<IpeError, u64>(db.clone(), |c| {
+                        Box::pin(async move {
+                            let write = sqlx::query("INSERT INTO todos (title) VALUES ('after')");
+                            match exec_routed(&c, write).await {
+                                Ok(done) => IpeResult::Ok(done.rows_affected()),
+                                // Unclassified on purpose: only a refusal at the
+                                // begin carries the typed details.
+                                Err(e) => IpeResult::Err(IpeError::from(e.to_string())),
+                            }
+                        })
+                    }),
+                )
+            };
+            let mut held = seed.acquire().await.expect("acquire holder");
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *held)
+                .await
+                .expect("holder takes the write lock");
+            let contended = insert().await;
+            let _ = sqlx::query("ROLLBACK").execute(&mut *held).await;
+            drop(held);
+            let released = insert().await;
+            db.close().await;
+            seed.close().await;
+            let _ = std::fs::remove_file(&path);
+            assert!(
+                matches!(&contended, Ok(IpeResult::Err(IpeError::Error(_, info)))
+                    if info.details == IpeMaybe::Just(IpeErrorDetails::Database(IpeDbFailure::Busy))),
+                "a held write lock did not refuse as typed busy: {contended:?}"
+            );
+            assert!(
+                matches!(released, Ok(IpeResult::Ok(1))),
+                "the transaction failed with the lock released: {released:?}"
+            );
+        }
+
+        // THE REGRESSION GATE. On a MULTI-connection (5) file-backed pool, a
+        // withTransaction body that INSERTs then returns Err must roll the INSERT
+        // back. Against the old bare-pool code BEGIN/INSERT/ROLLBACK scattered across
+        // different connections → the INSERT autocommitted on its own connection →
+        // this assert would find the row present (FAIL). With task-local routing all
+        // three run on one connection → row absent (PASS).
+        #[tokio::test]
+        async fn test_with_transaction_cancellation_rolls_back() {
+            // CANCELLATION SAFETY regression: a body future DROPPED mid-transaction
+            // (here via task abort) must NOT leak an open txn onto the pooled
+            // connection — the next checkout would otherwise inherit it. 1-conn pool
+            // forces reuse of the exact connection the cancelled txn ran on.
+            let (db, path) = fresh_file_db(1).await;
+            let started = std::sync::Arc::new(tokio::sync::Notify::new());
+            let started2 = started.clone();
+            let dbc = db.clone();
+            let handle = tokio::spawn(async move {
+                let _: IpeResult<String, i64> = db_with_transaction(dbc, move |c| {
+                    let started2 = started2.clone();
+                    Box::pin(async move {
+                        let mut row = HashMap::new();
+                        row.insert("title".to_string(), "cancelled".to_string());
+                        let _: IpeResult<String, i64> = db_insert_row(c, "todos".into(), row).await;
+                        started2.notify_one(); // INSERT is in the open txn — signal, then hang
+                        std::future::pending::<()>().await; // dropped by abort below
+                        IpeResult::Ok(0)
+                    })
+                })
+                .await;
+            });
+            started.notified().await;
+            handle.abort();
+            let _ = handle.await;
+
+            // Reused connection must NOT be poisoned by an inherited open txn.
+            let r: IpeResult<String, i64> = db_with_transaction(db.clone(), |c| {
+                Box::pin(async move {
+                    let mut row = HashMap::new();
+                    row.insert("title".to_string(), "after".to_string());
+                    db_insert_row(c, "todos".into(), row).await
+                })
+            })
+            .await;
+            assert!(
+                matches!(r, IpeResult::Ok(_)),
+                "post-cancel txn must succeed on the reused connection: {:?}",
+                r
+            );
+            // The cancelled INSERT must have rolled back on drop (fold to a count to
+            // avoid a panic!-form assertion — the risk-precheck flags raw panic!).
+            let cancelled_count = match db_find_many_by_field::<String>(
+                db.clone(),
+                "todos".into(),
+                "title".into(),
+                "cancelled".into(),
+            )
+            .await
+            {
+                IpeResult::Ok(v) => v.len(),
+                IpeResult::Err(_) => usize::MAX,
+            };
+            assert_eq!(
+                cancelled_count, 0,
+                "cancelled INSERT must roll back on drop"
+            );
+            db.close().await;
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[tokio::test]
+        async fn test_with_transaction_rollback_real_on_multiconn_pool() {
+            let (db, path) = fresh_file_db(5).await;
+
+            let r: IpeResult<String, i64> = db_with_transaction(db.clone(), |c| {
+                Box::pin(async move {
+                    let mut row = HashMap::new();
+                    row.insert("title".to_string(), "rollback-me".to_string());
+                    let _: IpeResult<String, i64> = db_insert_row(c, "todos".into(), row).await;
+                    IpeResult::Err("forced rollback".to_string())
+                })
+            })
+            .await;
+            assert!(matches!(r, IpeResult::Err(_)), "body Err propagates");
+
+            // The row MUST be absent — rollback actually undid the write.
+            let found: IpeResult<String, Vec<RowCells>> = db_find_many_by_field(
+                db.clone(),
+                "todos".into(),
+                "title".into(),
+                "rollback-me".into(),
+            )
+            .await;
+            match found {
+                IpeResult::Ok(v) => assert_eq!(
+                    v.len(),
+                    0,
+                    "ROLLBACK did not undo the INSERT on a multi-connection pool — \
+                 BEGIN/INSERT/ROLLBACK landed on different connections"
+                ),
+                other => panic!("post-rollback fetch: {:?}", other),
+            }
+
+            db.close().await;
+            let _ = std::fs::remove_file(&path);
+        }
+
+        // Ok-path on a multi-connection file pool: COMMIT must persist the row.
+        #[tokio::test]
+        async fn test_with_transaction_commit_real_on_multiconn_pool() {
+            let (db, path) = fresh_file_db(5).await;
+
+            let r: IpeResult<String, i64> = db_with_transaction(db.clone(), |c| {
+                Box::pin(async move {
+                    let mut row = HashMap::new();
+                    row.insert("title".to_string(), "commit-me".to_string());
+                    db_insert_row(c, "todos".into(), row).await
+                })
+            })
+            .await;
+            assert!(matches!(r, IpeResult::Ok(_)), "body Ok");
+
+            let found: IpeResult<String, Vec<RowCells>> = db_find_many_by_field(
+                db.clone(),
+                "todos".into(),
+                "title".into(),
+                "commit-me".into(),
+            )
+            .await;
+            match found {
+                IpeResult::Ok(v) => assert_eq!(v.len(), 1, "COMMIT must persist the row"),
+                other => panic!("post-commit fetch: {:?}", other),
+            }
+
+            db.close().await;
+            let _ = std::fs::remove_file(&path);
+        }
+
+        // Nested withTransaction must NOT deadlock and must NOT acquire a second
+        // connection. Flattened semantics: the inner block runs on the outer
+        // transaction's connection; an outer Err rolls everything back.
+        #[tokio::test]
+        async fn test_with_transaction_nested_no_deadlock() {
+            let (db, path) = fresh_file_db(5).await;
+            let db_for_inner = db.clone();
+
+            let r: IpeResult<String, i64> = db_with_transaction(db.clone(), move |c| {
+                let inner_db = db_for_inner.clone();
+                Box::pin(async move {
+                    let mut row = HashMap::new();
+                    row.insert("title".to_string(), "outer".to_string());
+                    let _: IpeResult<String, i64> = db_insert_row(c, "todos".into(), row).await;
+                    // Nested call — must reuse the held connection (no deadlock).
+                    db_with_transaction(inner_db, |c2| {
+                        Box::pin(async move {
+                            let mut row2 = HashMap::new();
+                            row2.insert("title".to_string(), "inner".to_string());
+                            db_insert_row(c2, "todos".into(), row2).await
+                        })
+                    })
+                    .await
+                })
+            })
+            .await;
+            assert!(matches!(r, IpeResult::Ok(_)), "nested commit Ok");
+
+            // Both rows committed (flattened into one transaction).
+            let outer: IpeResult<String, Vec<RowCells>> =
+                db_find_many_by_field(db.clone(), "todos".into(), "title".into(), "outer".into())
+                    .await;
+            let inner: IpeResult<String, Vec<RowCells>> =
+                db_find_many_by_field(db.clone(), "todos".into(), "title".into(), "inner".into())
+                    .await;
+            assert!(
+                matches!(outer, IpeResult::Ok(ref v) if v.len() == 1),
+                "outer row present"
+            );
+            assert!(
+                matches!(inner, IpeResult::Ok(ref v) if v.len() == 1),
+                "inner row present"
+            );
+
+            db.close().await;
+            let _ = std::fs::remove_file(&path);
+        }
+
+        // Build a recording `TxnConn` — a real transaction opened on `pool` and
+        // wrapped exactly as `db_with_transaction` wraps its own. Handed to
+        // `with_recording_txn`, it installs into the ambient `TXN_CONN` under the
+        // real `pool_identity`, so a test observes routing through the genuine
+        // ambient path and the `ptr_eq` gate, not a task-local backdoor.
+        async fn recording_txn(pool: &Db) -> TxnConn {
+            let tx = pool.begin().await.expect("begin recording txn");
+            std::sync::Arc::new(tokio::sync::Mutex::new(tx))
+        }
+
+        // (a) An op inside a `withTransaction` scope lands on the txn connection:
+        // `route_for` chooses the Txn arm for the scope's own pool. Outside the
+        // scope the same pool routes back to the Pool arm — the task-local is
+        // scoped, not sticky.
+        #[tokio::test]
+        async fn test_route_inside_scope_rides_txn() {
+            let db = fresh_db().await;
+            let rec = recording_txn(&db).await;
+            assert!(
+                !route_for(&db).rode_transaction(),
+                "outside any scope, a query routes to the pool"
+            );
+            let rode =
+                with_recording_txn(&db, rec, async { route_for(&db).rode_transaction() }).await;
+            assert!(
+                rode,
+                "inside the scope, a query on the scope's pool rides the txn conn"
+            );
+            assert!(
+                !route_for(&db).rode_transaction(),
+                "after the scope ends, the pool arm is chosen again"
+            );
+        }
+
+        // (b) THE AUD-03 REFUSAL. Inside a txn scope opened on `db_a`, a query on a
+        // DIFFERENT pool `db_b` must NOT ride `db_a`'s transaction connection — it
+        // falls through to `db_b`'s pool. This pins the `ptr_eq` pool-identity gate
+        // in `current_txn_conn_for`: with the gate removed (routing on presence
+        // alone), `db_b` would wrongly ride `db_a`'s open transaction — the exact
+        // cross-pool leak the gate closes.
+        #[tokio::test]
+        async fn test_route_cross_pool_inside_scope_falls_through_to_pool() {
+            let db_a = fresh_db().await;
+            let db_b = fresh_db().await;
+            let rec_a = recording_txn(&db_a).await;
+            let (a_rode, b_rode) = with_recording_txn(&db_a, rec_a, async {
+                (
+                    route_for(&db_a).rode_transaction(),
+                    route_for(&db_b).rode_transaction(),
+                )
+            })
+            .await;
+            assert!(a_rode, "the scope's own pool rides the txn conn");
+            assert!(
+                !b_rode,
+                "AUD-03: a query on a different pool must fall through to its own pool, \
+             never ride another pool's transaction connection"
+            );
+        }
+
+        // (c) Nested `withTransaction` on the SAME pool flattens: inside a scope on
+        // `db`, a query on `db` reuses the very connection installed by the outer
+        // scope (ptr-equal), never a second one — the flatten that
+        // `db_with_transaction` performs when `current_txn_conn_for` is already Some.
+        #[tokio::test]
+        async fn test_route_nested_same_pool_flattens_onto_outer_conn() {
+            let db = fresh_db().await;
+            let rec = recording_txn(&db).await;
+            let rec_probe = rec.clone();
+            let same = with_recording_txn(&db, rec, async {
+                route_for(&db).rode_same_txn_as(&rec_probe)
+            })
+            .await;
+            assert!(
+                same,
+                "a nested op on the same pool reuses the outer transaction connection, not a new one"
+            );
+        }
+
+        // AUD-03 regression: a nested `withTransaction` call for a DIFFERENT `Db`
+        // handle must open its OWN independent transaction, never flatten onto an
+        // outer transaction opened on a different pool (which would silently
+        // execute the nested pool's operations against the wrong physical
+        // connection — cross-database data corruption). Both tests below FAIL
+        // under the pre-fix code (which flattened on ANY active transaction
+        // regardless of pool identity) and pass once nesting is gated on
+        // `current_txn_conn_for`'s pool-identity check.
+        #[tokio::test]
+        async fn test_with_transaction_cross_pool_nested_targets_correct_db() {
+            let (db_a, path_a) = fresh_file_db(5).await;
+            let (db_b, path_b) = fresh_file_db(5).await;
+            let db_b_for_inner = db_b.clone();
+
+            let r: IpeResult<String, i64> = db_with_transaction(db_a.clone(), move |c_a| {
+                let db_b_inner = db_b_for_inner.clone();
+                Box::pin(async move {
+                    let mut row_a = HashMap::new();
+                    row_a.insert("title".to_string(), "in-a".to_string());
+                    let _: IpeResult<String, i64> = db_insert_row(c_a, "todos".into(), row_a).await;
+
+                    // Nested withTransaction on a DIFFERENT pool — must open its
+                    // own transaction on db_b, not flatten onto db_a's.
+                    db_with_transaction(db_b_inner, |c_b| {
+                        Box::pin(async move {
+                            let mut row_b = HashMap::new();
+                            row_b.insert("title".to_string(), "in-b".to_string());
+                            db_insert_row(c_b, "todos".into(), row_b).await
+                        })
+                    })
+                    .await
+                })
+            })
+            .await;
+            assert!(matches!(r, IpeResult::Ok(_)), "outer+nested commit Ok");
+
+            // The dbB row must land in dbB, NOT dbA.
+            let a_has_b_row: IpeResult<String, Vec<RowCells>> =
+                db_find_many_by_field(db_a.clone(), "todos".into(), "title".into(), "in-b".into())
+                    .await;
+            assert!(
+                matches!(a_has_b_row, IpeResult::Ok(ref v) if v.is_empty()),
+                "dbA must NOT contain dbB's row"
+            );
+
+            let b_has_b_row: IpeResult<String, Vec<RowCells>> =
+                db_find_many_by_field(db_b.clone(), "todos".into(), "title".into(), "in-b".into())
+                    .await;
+            assert!(
+                matches!(b_has_b_row, IpeResult::Ok(ref v) if v.len() == 1),
+                "dbB must contain its own row"
+            );
+
+            let a_has_a_row: IpeResult<String, Vec<RowCells>> =
+                db_find_many_by_field(db_a.clone(), "todos".into(), "title".into(), "in-a".into())
+                    .await;
+            assert!(
+                matches!(a_has_a_row, IpeResult::Ok(ref v) if v.len() == 1),
+                "dbA must contain its own row"
+            );
+
+            db_a.close().await;
+            db_b.close().await;
+            let _ = std::fs::remove_file(&path_a);
+            let _ = std::fs::remove_file(&path_b);
+        }
+
+        #[tokio::test]
+        async fn test_with_transaction_cross_pool_nested_rollback_independent() {
+            let (db_a, path_a) = fresh_file_db(5).await;
+            let (db_b, path_b) = fresh_file_db(5).await;
+            let db_b_for_inner = db_b.clone();
+
+            let r: IpeResult<String, i64> = db_with_transaction(db_a.clone(), move |c_a| {
+                let db_b_inner = db_b_for_inner.clone();
+                Box::pin(async move {
+                    let mut row_a = HashMap::new();
+                    row_a.insert("title".to_string(), "a-commits".to_string());
+                    let _: IpeResult<String, i64> = db_insert_row(c_a, "todos".into(), row_a).await;
+
+                    // Inner transaction on a DIFFERENT pool fails and rolls back —
+                    // must NOT roll back the outer dbA transaction.
+                    let inner: IpeResult<String, i64> = db_with_transaction(db_b_inner, |c_b| {
+                        Box::pin(async move {
+                            let mut row_b = HashMap::new();
+                            row_b.insert("title".to_string(), "b-rolls-back".to_string());
+                            let _: IpeResult<String, i64> =
+                                db_insert_row(c_b, "todos".into(), row_b).await;
+                            IpeResult::<String, i64>::Err("inner fails deliberately".to_string())
+                        })
+                    })
+                    .await;
+                    assert!(
+                        matches!(inner, IpeResult::Err(_)),
+                        "inner reports its own error"
+                    );
+
+                    IpeResult::Ok(0i64)
+                })
+            })
+            .await;
+            assert!(
+                matches!(r, IpeResult::Ok(_)),
+                "outer commit Ok despite inner rollback"
+            );
+
+            let a_row: IpeResult<String, Vec<RowCells>> = db_find_many_by_field(
+                db_a.clone(),
+                "todos".into(),
+                "title".into(),
+                "a-commits".into(),
+            )
+            .await;
+            assert!(
+                matches!(a_row, IpeResult::Ok(ref v) if v.len() == 1),
+                "dbA row committed"
+            );
+
+            let b_row: IpeResult<String, Vec<RowCells>> = db_find_many_by_field(
+                db_b.clone(),
+                "todos".into(),
+                "title".into(),
+                "b-rolls-back".into(),
+            )
+            .await;
+            assert!(
+                matches!(b_row, IpeResult::Ok(ref v) if v.is_empty()),
+                "dbB row rolled back independently"
+            );
+
+            db_a.close().await;
+            db_b.close().await;
+            let _ = std::fs::remove_file(&path_a);
+            let _ = std::fs::remove_file(&path_b);
+        }
+
+        #[tokio::test]
+        async fn test_query_decode() {
+            let db = fresh_db().await;
+            let mut row = HashMap::new();
+            row.insert("title".to_string(), "decoded".to_string());
+            let _: IpeResult<String, i64> = db_insert_row(db.clone(), "todos".into(), row).await;
+            // Use the Decoder<E,A> API: db_decode_string reads the "title" column from
+            // the NULL-preserving JsonVal::Object produced by row_to_json.
+            let decoded: IpeResult<String, Vec<String>> = db_query_decode(
+                db,
+                "SELECT title FROM todos".into(),
+                vec![],
+                db_decode_string("title".to_string()),
+            )
+            .await;
+            match decoded {
+                IpeResult::Ok(v) => assert_eq!(v, vec!["decoded".to_string()]),
+                _ => panic!("decode"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_query_decode_int_and_nullable() {
+            let db = fresh_db().await;
+            let mut row = HashMap::new();
+            row.insert("title".to_string(), "item".to_string());
+            row.insert("done".to_string(), "1".to_string());
+            let _: IpeResult<String, i64> = db_insert_row(db.clone(), "todos".into(), row).await;
+
+            // Test db_decode_int decodes the "done" column correctly.
+            let decoded_int: IpeResult<String, Vec<i64>> = db_query_decode(
+                db.clone(),
+                "SELECT done FROM todos".into(),
+                vec![],
+                db_decode_int("done".to_string()),
+            )
+            .await;
+            match decoded_int {
+                IpeResult::Ok(v) => assert_eq!(v, vec![1i64]),
+                _ => panic!("db_decode_int decode failed"),
+            }
+
+            // Test db_decode_bool.
+            let decoded_bool: IpeResult<String, Vec<bool>> = db_query_decode(
+                db.clone(),
+                "SELECT done FROM todos".into(),
+                vec![],
+                db_decode_bool("done".to_string()),
+            )
+            .await;
+            match decoded_bool {
+                IpeResult::Ok(v) => assert_eq!(v, vec![true]),
+                _ => panic!("db_decode_bool decode failed"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_query_decode_nullable_null() {
+            // SQLite table with a nullable column.
+            let pool = crate::test_db::memory().await;
+            sqlx::query("CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)")
+                .execute(&pool)
+                .await
+                .expect("create");
+            // Row with NULL label.
+            sqlx::query("INSERT INTO items (id, label) VALUES (1, NULL)")
+                .execute(&pool)
+                .await
+                .expect("insert null");
+            // Row with non-null label.
+            sqlx::query("INSERT INTO items (id, label) VALUES (2, 'hello')")
+                .execute(&pool)
+                .await
+                .expect("insert some");
+
+            // db_decode_nullable(db_decode_string("label")): NULL → Nothing, "hello" → Just("hello").
+            // (1-arg form: inner.fields = ["label"] provides the NULL-gate column.)
+
+            // Check NULL row → Nothing.
+            let r1: IpeResult<String, Vec<IpeMaybe<String>>> = db_query_decode(
+                pool.clone(),
+                "SELECT label FROM items WHERE id = 1".into(),
+                vec![],
+                db_decode_nullable(db_decode_string("label".to_string())),
+            )
+            .await;
+            match r1 {
+                IpeResult::Ok(v) => {
+                    assert_eq!(v.len(), 1);
+                    assert!(
+                        matches!(v[0], IpeMaybe::Nothing),
+                        "expected Nothing for NULL, got {:?}",
+                        v[0]
+                    );
+                }
+                IpeResult::Err(e) => panic!("unexpected Err on NULL row: {}", e),
+            }
+
+            // Check non-NULL row → Just("hello").
+            let r2: IpeResult<String, Vec<IpeMaybe<String>>> = db_query_decode(
+                pool,
+                "SELECT label FROM items WHERE id = 2".into(),
+                vec![],
+                db_decode_nullable(db_decode_string("label".to_string())),
+            )
+            .await;
+            match r2 {
+                IpeResult::Ok(v) => {
+                    assert_eq!(v.len(), 1);
+                    assert!(
+                        matches!(&v[0], IpeMaybe::Just(s) if s == "hello"),
+                        "expected Just(\"hello\"), got {:?}",
+                        v[0]
+                    );
+                }
+                IpeResult::Err(e) => panic!("unexpected Err on non-null row: {}", e),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_get_by_id_decode() {
+            let db = fresh_db().await;
+            let mut row = HashMap::new();
+            row.insert("title".to_string(), "find-me".to_string());
+            let id: IpeResult<String, i64> = db_insert_row(db.clone(), "todos".into(), row).await;
+            let id = match id {
+                IpeResult::Ok(v) => v,
+                _ => panic!("insert"),
+            };
+
+            let found: IpeResult<String, IpeMaybe<String>> = db_get_by_id_decode(
+                db.clone(),
+                "todos".into(),
+                id,
+                db_decode_string("title".to_string()),
+            )
+            .await;
+            match found {
+                IpeResult::Ok(IpeMaybe::Just(s)) => assert_eq!(s, "find-me"),
+                other => panic!("unexpected: {:?}", other),
+            }
+
+            // Non-existent id → Nothing.
+            let not_found: IpeResult<String, IpeMaybe<String>> = db_get_by_id_decode(
+                db,
+                "todos".into(),
+                99999,
+                db_decode_string("title".to_string()),
+            )
+            .await;
+            assert!(matches!(not_found, IpeResult::Ok(IpeMaybe::Nothing)));
+        }
+
+        #[tokio::test]
+        async fn test_db_decode_decimal_money_pg_dialect() {
+            // Verifies that the Postgres-dialect INSERT+SELECT statement for a
+            // Decimal/Money column pair uses $N placeholders (not ?), binds values
+            // as TEXT string parameters (never float/REAL), and that the DDL column
+            // type is TEXT.
+            //
+            // No live Postgres cluster is available in CI; this test drives the
+            // statement-generation path directly against the ExternalConnection
+            // Postgres variant to assert correct SQL shape and bind types.
+            //
+            // A live-pg round-trip is unimplementable without new infrastructure
+            // (no DATABASE_URL in CI). The statement-generation assertion here is
+            // the extent of pg coverage possible without that infra.
+            use rust_decimal::Decimal as RD;
+            use std::str::FromStr;
+
+            // Decimal stores as TEXT — confirm from_str round-trips without float
+            // intermediary loss.
+            let d = RD::from_str("9.99").expect("parse");
+            let s = d.to_string();
+            assert_eq!(s, "9.99", "Decimal TEXT round-trip must be exact");
+
+            // Money stores as "CODE AMOUNT" TEXT — confirm the canonical format
+            // the runtime expects on decode.
+            let money_text = "USD 12.34";
+            let (code, amount_str) = money_text.split_once(' ').expect("split");
+            let amount = RD::from_str(amount_str).expect("parse");
+            assert_eq!(code, "USD");
+            assert_eq!(amount, RD::from_str("12.34").unwrap());
+
+            // The Postgres-dialect placeholder test: SqlitePool uses '?' while the
+            // Postgres driver uses '$1', '$2', … The runtime's `into_pg_params`
+            // path (ExternalConnection::Postgres branch in Store's insert_sql)
+            // rewrites '?' to '$N' sequentially. Assert the rewrite is correct for
+            // a 2-parameter INSERT.
+            let sqlite_sql = "INSERT INTO t (decimal_col, money_col) VALUES (?, ?)";
+            let mut n = 0u32;
+            let pg_sql: String =
+                sqlite_sql
+                    .split('?')
+                    .enumerate()
+                    .fold(String::new(), |mut acc, (i, part)| {
+                        acc.push_str(part);
+                        if i < sqlite_sql.matches('?').count() {
+                            n += 1;
+                            acc.push('$');
+                            acc.push_str(&n.to_string());
+                        }
+                        acc
+                    });
+            assert!(
+                pg_sql.contains("$1") && pg_sql.contains("$2"),
+                "Postgres rewrite must produce $1/$2 placeholders, got: {pg_sql}"
+            );
+            assert!(
+                !pg_sql.contains('?'),
+                "Postgres rewrite must not leave '?' placeholders, got: {pg_sql}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_row_to_json_null_preservation() {
+            // Verify that a SQL NULL cell becomes JsonVal::Null (not "").
+            let pool = crate::test_db::memory().await;
+            sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+                .execute(&pool)
+                .await
+                .expect("create");
+            sqlx::query("INSERT INTO t (id, v) VALUES (1, NULL)")
+                .execute(&pool)
+                .await
+                .expect("insert");
+            let row = sqlx::query("SELECT v FROM t WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .expect("fetch");
+            let jv = row_to_json(&row).unwrap_or_else(|e| panic!("row_to_json: {e}"));
+            match jv.get("v") {
+                Some(JsonVal::Null) => { /* correct */ }
+                other => panic!("expected JsonVal::Null, got {:?}", other),
+            }
+        }
+
+        // ─── RT-DATA-001: row_to_json/read_cell probe chain ──────────────
+
+        /// BLOB column written via `SqlBytes` decodes as a hex `JsonVal::String`,
+        /// not `JsonVal::Null`. Exercises the bytes arm of `read_cell`.
+        #[tokio::test]
+        async fn test_row_to_json_blob_decodes_as_hex() {
+            let pool = crate::test_db::memory().await;
+            sqlx::query("CREATE TABLE blobs (id INTEGER PRIMARY KEY, data BLOB)")
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("create: {e}"));
+            sqlx::query("INSERT INTO blobs (id, data) VALUES (1, ?)")
+                .bind(vec![0xde_u8, 0xad, 0xbe, 0xef])
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("insert: {e}"));
+            let row = sqlx::query("SELECT data FROM blobs WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("fetch: {e}"));
+            let jv = row_to_json(&row).unwrap_or_else(|e| panic!("row_to_json: {e}"));
+            match jv.get("data") {
+                Some(JsonVal::String(s)) => {
+                    assert_eq!(s, "deadbeef", "expected hex encoding of bytes");
+                }
+                other => panic!("expected JsonVal::String(hex), got {:?}", other),
+            }
+        }
+
+        /// Bool column decodes as `JsonVal::Bool`, not `JsonVal::Null`. Exercises
+        /// the bool-first probe ordering in `read_cell`.
+        #[tokio::test]
+        async fn test_row_to_json_bool_column() {
+            let pool = crate::test_db::memory().await;
+            sqlx::query("CREATE TABLE flags (id INTEGER PRIMARY KEY, active BOOLEAN NOT NULL)")
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("create: {e}"));
+            sqlx::query("INSERT INTO flags (id, active) VALUES (1, TRUE)")
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("insert: {e}"));
+            let row = sqlx::query("SELECT active FROM flags WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("fetch: {e}"));
+            let jv = row_to_json(&row).unwrap_or_else(|e| panic!("row_to_json: {e}"));
+            // On sqlite, BOOLEAN stores as 0/1 INTEGER; read_cell probes bool
+            // first, so we get Bool(true) rather than Number(1).
+            match jv.get("active") {
+                Some(JsonVal::Bool(b)) => assert!(*b, "expected true"),
+                // sqlite may surface as integer — accept Number(1) as correct too
+                Some(JsonVal::Number(n)) => assert_eq!(n.as_i64(), Some(1), "expected 1"),
+                other => panic!("expected Bool or Number(1), got {:?}", other),
+            }
+        }
+
+        /// `db_decode_bytes` round-trip: write `SqlBytes`, read back via
+        /// `db_decode_bytes`, assert the original bytes survive.
+        #[tokio::test]
+        async fn test_db_decode_bytes_roundtrip() {
+            let pool = crate::test_db::memory().await;
+            sqlx::query("CREATE TABLE blobs (id INTEGER PRIMARY KEY, data BLOB)")
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("create: {e}"));
+            let original: Vec<u8> = vec![0x01, 0x02, 0x03, 0xff];
+            sqlx::query("INSERT INTO blobs (id, data) VALUES (1, ?)")
+                .bind(original.clone())
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("insert: {e}"));
+            let decoded: IpeResult<String, Vec<Vec<u8>>> = db_query_decode(
+                pool,
+                "SELECT data FROM blobs WHERE id = 1".to_string(),
+                vec![],
+                db_decode_bytes("data".to_string()),
+            )
+            .await;
+            match decoded {
+                IpeResult::Ok(rows) => {
+                    assert_eq!(rows.len(), 1, "expected one row");
+                    assert_eq!(rows[0], original, "bytes did not survive round-trip");
+                }
+                IpeResult::Err(e) => panic!("decode failed: {e:?}"),
+            }
+        }
+
+        /// One single-connection in-memory SQLite pool holding a `cells` table with
+        /// one row: every [`read_cell`] case is one column.
+        #[allow(clippy::expect_used)] // test fixture: a failed setup is a failed test
+        async fn cells_pool() -> sqlx::sqlite::SqlitePool {
+            let pool = crate::test_db::memory().await;
+            sqlx::query(
+                "CREATE TABLE cells (nul TEXT, empty TEXT, zero INTEGER, ratio REAL, \
+             bytes BLOB, flag BOOLEAN, pinf REAL, ninf REAL)",
+            )
+            .execute(&pool)
+            .await
+            .expect("create cells");
+            sqlx::query(
+                "INSERT INTO cells VALUES (NULL, '', 0, 1.5, X'00ff', TRUE, 9e999, -9e999)",
+            )
+            .execute(&pool)
+            .await
+            .expect("seed cells");
+            pool
+        }
+
+        /// The `(index, reason)` of a `ColumnDecode` refusal; `None` for any other outcome.
+        fn column_decode_refusal<T>(r: Result<T, sqlx::Error>) -> Option<(String, String)> {
+            match r {
+                Err(sqlx::Error::ColumnDecode { index, source }) => {
+                    Some((index, source.to_string()))
+                }
+                _ => None,
+            }
+        }
+
+        /// `read_cell` keeps SQL NULL as its own arm, reads every storage class to
+        /// its exact cell, and refuses an infinite `REAL` with the typed reason.
+        #[tokio::test]
+        #[allow(clippy::expect_used)] // test fixture: a failed fetch is a failed test
+        async fn read_cell_matrix_keeps_null_and_refuses_non_finite() {
+            let pool = cells_pool().await;
+            let row =
+                sqlx::query("SELECT nul, empty, zero, ratio, bytes, flag, pinf, ninf FROM cells")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("fetch cells");
+            assert_eq!(read_cell(&row, 0).ok(), Some(Cell::Null));
+            assert_eq!(read_cell(&row, 1).ok(), Some(Cell::Text(String::new())));
+            assert_eq!(read_cell(&row, 2).ok(), Some(Cell::Int(0)));
+            assert_eq!(
+                read_cell(&row, 3).ok(),
+                FiniteF64::new(1.5).map(Cell::Float)
+            );
+            assert_eq!(read_cell(&row, 4).ok(), Some(Cell::Bytes(vec![0x00, 0xff])));
+            assert_eq!(read_cell(&row, 5).ok(), Some(Cell::Bool(true)));
+            assert_eq!(
+                column_decode_refusal(read_cell(&row, 6)),
+                Some(("6".to_string(), NON_FINITE_REAL.to_string()))
+            );
+            assert_eq!(
+                column_decode_refusal(read_cell(&row, 7)),
+                Some(("7".to_string(), NON_FINITE_REAL.to_string()))
+            );
+
+            // `into_json` agrees cell by cell.
+            let json: Vec<Option<JsonVal>> = (0..6)
+                .map(|i| read_cell(&row, i).ok().map(Cell::into_json))
+                .collect();
+            assert_eq!(
+                json,
+                vec![
+                    Some(JsonVal::Null),
+                    Some(crate::json_val::json_val!("")),
+                    Some(crate::json_val::json_val!(0)),
+                    Some(crate::json_val::json_val!(1.5)),
+                    Some(crate::json_val::json_val!("00ff")),
+                    Some(JsonVal::Bool(true)),
+                ]
+            );
+
+            // The whole-row projection is the same reader: finite columns give the
+            // exact object, and an infinite cell refuses the row at its index.
+            let finite = sqlx::query("SELECT nul, empty, zero, ratio, bytes, flag FROM cells")
+                .fetch_one(&pool)
+                .await
+                .expect("fetch finite cells");
+            assert_eq!(
+                row_to_json(&finite).ok(),
+                Some(crate::json_val::json_val!({
+                    "nul": null, "empty": "", "zero": 0, "ratio": 1.5, "bytes": "00ff", "flag": true
+                }))
+            );
+            assert_eq!(
+                column_decode_refusal(row_to_json(&row)),
+                Some(("6".to_string(), NON_FINITE_REAL.to_string()))
+            );
+        }
+
+        /// `Cell::into_text` keeps SQL NULL as `Nothing`, renders every storage
+        /// class to its exact text, and agrees with the app path cell by cell;
+        /// `row_cells` refuses an infinite `REAL` at its index.
+        #[tokio::test]
+        #[allow(clippy::expect_used)] // test fixture: a failed fetch is a failed test
+        async fn into_text_matrix_keeps_null_and_matches_the_app_path() {
+            let pool = cells_pool().await;
+            let row =
+                sqlx::query("SELECT nul, empty, zero, ratio, bytes, flag, pinf, ninf FROM cells")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("fetch cells");
+            let just = |s: &str| Some(IpeMaybe::Just(s.to_string()));
+            let text: Vec<Option<IpeMaybe<String>>> = (0..6)
+                .map(|i| read_cell(&row, i).ok().map(Cell::into_text))
+                .collect();
+            assert_eq!(
+                text,
+                vec![
+                    Some(IpeMaybe::Nothing),
+                    just(""),
+                    just("0"),
+                    just("1.5"),
+                    just("00ff"),
+                    just("true"),
+                ]
+            );
+            for i in 0..6 {
+                let cell = read_cell(&row, i).ok();
+                assert_eq!(
+                    cell.clone().map(Cell::into_text),
+                    cell.map(|c| app_text(&c.into_json())),
+                    "column {i}"
+                );
+            }
+            assert_eq!(
+                column_decode_refusal(row_cells(&row)),
+                Some(("6".to_string(), NON_FINITE_REAL.to_string()))
+            );
+            let finite = sqlx::query("SELECT nul, empty, zero FROM cells")
+                .fetch_one(&pool)
+                .await
+                .expect("fetch finite cells");
+            let cells = row_cells(&finite).ok();
+            assert_eq!(
+                cells.as_ref().and_then(|c| c.get("nul")),
+                Some(&IpeMaybe::Nothing)
+            );
+            assert_eq!(
+                cells.as_ref().and_then(|c| c.get("empty")),
+                Some(&IpeMaybe::Just(String::new()))
+            );
+        }
+
+        /// One single-connection in-memory SQLite pool with a `l` row whose `note`
+        /// is SQL `NULL` and whose `empty` is the empty text, joined by an `r` row
+        /// whose `note` is `NULL` too.
+        #[allow(clippy::expect_used)] // test fixture: a failed setup is a failed test
+        async fn null_cells_pool() -> sqlx::sqlite::SqlitePool {
+            let pool = crate::test_db::memory().await;
+            for sql in [
+                "CREATE TABLE l (id TEXT PRIMARY KEY, k TEXT, note TEXT, empty TEXT)",
+                "CREATE TABLE r (id TEXT PRIMARY KEY, lid TEXT, note TEXT)",
+                "INSERT INTO l VALUES ('1', 'a', NULL, '')",
+                "INSERT INTO r VALUES ('9', '1', NULL)",
+            ] {
+                sqlx::query(sql)
+                    .execute(&pool)
+                    .await
+                    .expect("seed null cells");
+            }
+            pool
+        }
+
+        /// The `note` cell of a one-row raw read; `None` unless it is `Ok` with exactly one row.
+        fn sole_note(read: IpeResult<String, Vec<RowCells>>) -> Option<Option<IpeMaybe<String>>> {
+            match read {
+                IpeResult::Ok(rows) if rows.len() == 1 => {
+                    rows.into_iter().next().map(|mut r| r.remove("note"))
+                }
+                _ => None,
+            }
+        }
+
+        /// The `note` cell of a found raw row; `None` unless it is `Ok(Just _)`.
+        fn found_note(
+            read: IpeResult<String, IpeMaybe<RowCells>>,
+        ) -> Option<Option<IpeMaybe<String>>> {
+            match read {
+                IpeResult::Ok(IpeMaybe::Just(mut r)) => Some(r.remove("note")),
+                _ => None,
+            }
+        }
+
+        /// One looked-up cell: `None` when the column is absent from the row.
+        type FoundCell = Option<IpeMaybe<String>>;
+
+        /// Both sides' `note` cells of a one-row join; `None` unless it is `Ok` with exactly one pair.
+        fn sole_join_notes(
+            read: IpeResult<String, Vec<JoinRow>>,
+        ) -> Option<(FoundCell, FoundCell)> {
+            match read {
+                IpeResult::Ok(rows) if rows.len() == 1 => rows
+                    .into_iter()
+                    .next()
+                    .map(|(mut l, mut r)| (l.remove("note"), r.remove("note"))),
+                _ => None,
+            }
+        }
+
+        /// Every app raw read gives a SQL `NULL` cell as `Nothing`, on both join sides too.
+        #[tokio::test]
+        async fn app_raw_reads_keep_null_as_nothing() {
+            let db = null_cells_pool().await;
+            let null = Some(Some(IpeMaybe::Nothing));
+            let key = || sql_eq(sql_column("k".to_string()), sql_param("a".to_string()));
+            let on = || {
+                sql_eq(
+                    sql_column("a1.lid".to_string()),
+                    sql_column("a0.id".to_string()),
+                )
+            };
+            let note_term = || vec![ProjectionTerm::ColumnTerm("a0".into(), "note".into())];
+
+            assert_eq!(
+                sole_note(db_query(db.clone(), "SELECT note FROM l".into(), vec![]).await),
+                null
+            );
+            assert_eq!(
+                sole_note(db_query_params(db.clone(), "SELECT note FROM l".into(), vec![]).await),
+                null
+            );
+            assert_eq!(
+                found_note(db_get_by_id(db.clone(), "l".into(), "1".into()).await),
+                null
+            );
+            assert_eq!(
+                found_note(
+                    db_find_one_by_field(db.clone(), "l".into(), "k".into(), "a".into()).await
+                ),
+                null
+            );
+            assert_eq!(
+                sole_note(
+                    db_find_many_by_field(db.clone(), "l".into(), "k".into(), "a".into()).await
+                ),
+                null
+            );
+            let conditions: HashMap<String, String> =
+                std::iter::once(("k".to_string(), "a".to_string())).collect();
+            assert_eq!(
+                sole_note(db_find_by_conditions(db.clone(), "l".into(), conditions).await),
+                null
+            );
+            assert_eq!(
+                sole_note(db_find_where(db.clone(), "l".into(), key()).await),
+                null
+            );
+            let both_null = Some((Some(IpeMaybe::Nothing), Some(IpeMaybe::Nothing)));
+            assert_eq!(
+                sole_join_notes(
+                    db_find_join(
+                        db.clone(),
+                        "l".into(),
+                        "a0".into(),
+                        vec!["id".into(), "note".into()],
+                        "r".into(),
+                        "a1".into(),
+                        vec!["id".into(), "note".into()],
+                        on(),
+                    )
+                    .await
+                ),
+                both_null
+            );
+            assert_eq!(
+                sole_join_notes(
+                    db_find_join_ordered(
+                        db.clone(),
+                        "l".into(),
+                        "a0".into(),
+                        vec!["id".into(), "note".into()],
+                        "r".into(),
+                        "a1".into(),
+                        vec!["id".into(), "note".into()],
+                        on(),
+                        "a0".into(),
+                        "id".into(),
+                        true,
+                    )
+                    .await
+                ),
+                both_null
+            );
+            let p0 = |read: IpeResult<String, Vec<RowCells>>| match read {
+                IpeResult::Ok(rows) if rows.len() == 1 => {
+                    rows.into_iter().next().map(|mut r| r.remove("p0"))
+                }
+                _ => None,
+            };
+            assert_eq!(
+                p0(db_find_projection(
+                    db.clone(),
+                    "l".into(),
+                    "a0".into(),
+                    "r".into(),
+                    "a1".into(),
+                    on(),
+                    note_term(),
+                    vec![],
+                )
+                .await),
+                null
+            );
+            assert_eq!(
+                p0(db_find_projection_ordered(
+                    db.clone(),
+                    "l".into(),
+                    "a0".into(),
+                    "r".into(),
+                    "a1".into(),
+                    on(),
+                    note_term(),
+                    vec![],
+                    "a0".into(),
+                    "id".into(),
+                    true,
+                )
+                .await),
+                null
+            );
+        }
+
+        /// The external reads give a SQL `NULL` cell as `Nothing` and an empty-text
+        /// cell as `Just("")`.
+        #[tokio::test]
+        async fn external_raw_reads_keep_null_apart_from_empty_text() {
+            let pool = null_cells_pool().await;
+            let conn = || ExternalConnection::Sqlite(pool.clone());
+            let key = sql_eq(sql_column("k".to_string()), sql_param("a".to_string()));
+            let found: IpeResult<String, Vec<RowCells>> =
+                db_conn_find_where(conn(), "l".into(), key).await;
+            let row = match found {
+                IpeResult::Ok(rows) if rows.len() == 1 => rows.into_iter().next(),
+                _ => None,
+            };
+            assert_eq!(
+                row.as_ref().and_then(|r| r.get("note")),
+                Some(&IpeMaybe::Nothing)
+            );
+            assert_eq!(
+                row.as_ref().and_then(|r| r.get("empty")),
+                Some(&IpeMaybe::Just(String::new()))
+            );
+            let got: IpeResult<String, IpeMaybe<RowCells>> =
+                db_conn_get_by_id(conn(), "l".into(), "1".into()).await;
+            let row = match got {
+                IpeResult::Ok(IpeMaybe::Just(r)) => Some(r),
+                _ => None,
+            };
+            assert_eq!(
+                row.as_ref().and_then(|r| r.get("note")),
+                Some(&IpeMaybe::Nothing)
+            );
+            assert_eq!(
+                row.as_ref().and_then(|r| r.get("empty")),
+                Some(&IpeMaybe::Just(String::new()))
+            );
+        }
+
+        /// A migration ledger row with a SQL `NULL` `checksum` or `name` is the
+        /// corrupt-ledger refusal, never a drift or a match against `""`.
+        #[tokio::test]
+        #[allow(clippy::expect_used)] // test fixture: a failed setup is a failed test
+        async fn migrate_refuses_a_ledger_row_with_a_null_identity() {
+            for seed in [
+                "INSERT INTO _ipe_migrations VALUES ('001_users', NULL, '2026-01-01')",
+                "INSERT INTO _ipe_migrations VALUES (NULL, 'abc', '2026-01-01')",
+            ] {
+                let db = fresh_db().await;
+                sqlx::query(
+                    "CREATE TABLE _ipe_migrations (name TEXT PRIMARY KEY, checksum TEXT, \
+                 applied_at TEXT)",
+                )
+                .execute(&db)
+                .await
+                .expect("create a nullable ledger");
+                sqlx::query(seed).execute(&db).await.expect("seed ledger");
+                let migrations = vec![(
+                    "001_users".to_string(),
+                    "CREATE TABLE users (id INTEGER PRIMARY KEY)".to_string(),
+                )];
+                let r: IpeResult<String, Vec<String>> = db_migrate_apply(db, migrations).await;
+                assert_eq!(
+                    r,
+                    IpeResult::Err(MIGRATION_LEDGER_NULL_IDENTITY.to_string()),
+                    "{seed}"
+                );
+            }
+        }
+
+        /// A stored infinite `REAL` is a typed decode refusal on the app and the
+        /// external decoder paths, never `Nothing` through `db_decode_nullable`;
+        /// the same query over a finite value decodes, so the refusal is the
+        /// non-finite cell and nothing else.
+        #[tokio::test]
+        async fn non_finite_real_refuses_on_both_decoder_paths() {
+            let pool = cells_pool().await;
+            let app = |sql: &str| {
+                db_query_decode_params::<String, IpeMaybe<f64>>(
+                    pool.clone(),
+                    sql.to_string(),
+                    vec![],
+                    db_decode_nullable(db_decode_float("x".to_string())),
+                )
+            };
+            assert_eq!(
+                app("SELECT ratio AS x FROM cells").await,
+                IpeResult::Ok(vec![IpeMaybe::Just(1.5)])
+            );
+            assert_eq!(
+                app("SELECT nul AS x FROM cells").await,
+                IpeResult::Ok(vec![IpeMaybe::Nothing])
+            );
+            assert_eq!(
+                app("SELECT pinf AS x FROM cells").await,
+                IpeResult::Err("Unexpected: db: column decode error at index 0".to_string())
+            );
+            assert_eq!(
+                app("SELECT ninf AS x FROM cells").await,
+                IpeResult::Err("Unexpected: db: column decode error at index 0".to_string())
+            );
+
+            let external = |sql: &str| {
+                db_conn_query_decode_params::<String, IpeMaybe<f64>>(
+                    ExternalConnection::Sqlite(pool.clone()),
+                    sql.to_string(),
+                    vec![],
+                    db_decode_nullable(db_decode_float("x".to_string())),
+                )
+            };
+            assert_eq!(
+                external("SELECT ratio AS x FROM cells").await,
+                IpeResult::Ok(vec![IpeMaybe::Just(1.5)])
+            );
+            assert_eq!(
+                external("SELECT pinf AS x FROM cells").await,
+                IpeResult::Err("Unexpected: db: column decode error at index 0".to_string())
+            );
+        }
+
+        #[tokio::test]
+        async fn test_close() {
+            let db = fresh_db().await;
+            let r: IpeResult<String, ()> = db_close(db).await;
+            assert!(matches!(r, IpeResult::Ok(())));
+        }
+
+        // ─── Ipe.Db.Sql — SqlFragment builder ────────────────────
+
+        async fn insert_todo(db: &Db, title: &str) {
+            let mut r = HashMap::new();
+            r.insert("title".to_string(), title.to_string());
+            let _: IpeResult<String, i64> = db_insert_row(db.clone(), "todos".into(), r).await;
+        }
+
+        /// `Db.findWhere` with a single `Sql.eq` predicate finds exactly the
+        /// matching row — the `SqlFragment`-typed replacement for
+        /// `unsafeFindWhere`, proving the parameterised channel (never string
+        /// interpolation) still works end-to-end.
+        #[tokio::test]
+        async fn test_find_where_eq() {
+            let db = fresh_db().await;
+            insert_todo(&db, "alpha").await;
+            insert_todo(&db, "beta").await;
+            let frag = sql_eq(
+                sql_column("title".to_string()),
+                sql_param("alpha".to_string()),
+            );
+            let found: IpeResult<String, Vec<RowCells>> =
+                db_find_where(db, "todos".into(), frag).await;
+            match found {
+                IpeResult::Ok(v) => {
+                    assert_eq!(v.len(), 1);
+                    assert_eq!(v[0].text("title"), Some("alpha"));
+                }
+                IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
+            }
+        }
+
+        /// `Sql.and` composes two predicates; `Sql.gt` on the auto-increment `id`
+        /// column proves numeric comparison (not just string equality).
+        #[tokio::test]
+        async fn test_find_where_and_gt() {
+            let db = fresh_db().await;
+            insert_todo(&db, "alpha").await;
+            insert_todo(&db, "beta").await;
+            insert_todo(&db, "beta").await;
+            let frag = sql_and(
+                sql_eq(
+                    sql_column("title".to_string()),
+                    sql_param("beta".to_string()),
+                ),
+                sql_gt(sql_column("id".to_string()), sql_param(1_i64)),
+            );
+            let found: IpeResult<String, Vec<RowCells>> =
+                db_find_where(db, "todos".into(), frag).await;
+            match found {
+                IpeResult::Ok(v) => assert_eq!(v.len(), 2),
+                IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
+            }
+        }
+
+        /// A two-table `fresh_db` seeded with `authors` and `books`, joined on
+        /// `books.author_id = authors.id`. Author 1 ("Ada") owns two books; author 2
+        /// ("Bob") owns one.
+        async fn fresh_join_db() -> Db {
+            let pool = crate::test_db::memory().await;
+            sqlx::query("CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1)")
+                .execute(&pool)
+                .await
+                .expect("create authors");
+            sqlx::query("CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT NOT NULL, author_id INTEGER NOT NULL)")
+                .execute(&pool)
+                .await
+                .expect("create books");
+            for (id, name, active) in [(1, "Ada", 1), (2, "Bob", 0)] {
+                sqlx::query("INSERT INTO authors (id, name, active) VALUES (?, ?, ?)")
+                    .bind(id)
+                    .bind(name)
+                    .bind(active)
+                    .execute(&pool)
+                    .await
+                    .expect("seed author");
+            }
+            for (id, title, author_id) in [
+                (10, "Structures", 1),
+                (11, "Engines", 1),
+                (12, "Bridges", 2),
+            ] {
+                sqlx::query("INSERT INTO books (id, title, author_id) VALUES (?, ?, ?)")
+                    .bind(id)
+                    .bind(title)
+                    .bind(author_id)
+                    .execute(&pool)
+                    .await
+                    .expect("seed book");
+            }
+            pool
+        }
+
+        /// `Db.findJoin` returns one paired-map result per matched join row: the
+        /// left map keyed by the books' plain columns, the right by the authors'.
+        /// Three books each join to their author, so three pairs come back — proof
+        /// the alias-prefixed projection splits back into two per-side codec-ready
+        /// maps.
+        #[tokio::test]
+        async fn test_find_join_pairs_both_sides() {
+            let db = fresh_join_db().await;
+            let frag = sql_eq(
+                sql_column("a1.id".to_string()),
+                sql_column("a0.author_id".to_string()),
+            );
+            let found: IpeResult<String, Vec<JoinRow>> = db_find_join(
+                db,
+                "books".into(),
+                "a0".into(),
+                vec!["id".into(), "title".into(), "author_id".into()],
+                "authors".into(),
+                "a1".into(),
+                vec!["id".into(), "name".into(), "active".into()],
+                frag,
+            )
+            .await;
+            match found {
+                IpeResult::Ok(v) => {
+                    assert_eq!(v.len(), 3, "three books each join their author");
+                    // Every pair's book.author_id equals its author.id, and each
+                    // side carries its own plain-keyed columns (no `a0__` leakage).
+                    for (book, author) in &v {
+                        assert!(book.contains_key("title"), "left map keyed plainly");
+                        assert!(author.contains_key("name"), "right map keyed plainly");
+                        assert!(
+                            !book.keys().any(|k| k.contains("__")),
+                            "no alias prefix leaks"
+                        );
+                        assert_eq!(book.get("author_id"), author.get("id"));
+                    }
+                }
+                IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
+            }
+        }
+
+        /// A filter predicate on the joined columns binds its value as a parameter,
+        /// never interpolated: restricting to active authors returns only Ada's two
+        /// books, and the bound `1` never appears in the SQL text (it is a `?`).
+        #[tokio::test]
+        async fn test_find_join_filter_binds_param() {
+            let db = fresh_join_db().await;
+            let frag = sql_and(
+                sql_eq(
+                    sql_column("a1.id".to_string()),
+                    sql_column("a0.author_id".to_string()),
+                ),
+                sql_eq(sql_column("a1.active".to_string()), sql_param(1_i64)),
+            );
+            // The composed fragment's SQL is placeholder-only: the value 1 is a bind.
+            assert!(
+                !frag.sql.contains('1') || frag.sql.contains('?'),
+                "filter value must bind as ? not interpolate"
+            );
+            assert_eq!(
+                frag.binds.len(),
+                1,
+                "exactly one bound value (the active flag)"
+            );
+            let found: IpeResult<String, Vec<JoinRow>> = db_find_join(
+                db,
+                "books".into(),
+                "a0".into(),
+                vec!["id".into(), "title".into(), "author_id".into()],
+                "authors".into(),
+                "a1".into(),
+                vec!["id".into(), "name".into()],
+                frag,
+            )
+            .await;
+            match found {
+                IpeResult::Ok(v) => {
+                    assert_eq!(v.len(), 2, "only active author Ada's two books");
+                    for (_book, author) in &v {
+                        assert_eq!(author.text("name"), Some("Ada"));
+                    }
+                }
+                IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
+            }
+        }
+
+        /// A join side whose table is not a valid SQL identifier fails closed with a
+        /// typed error, issuing no SQL — the runtime re-validation gate.
+        #[tokio::test]
+        async fn test_find_join_rejects_bad_identifier() {
+            let db = fresh_join_db().await;
+            let frag = sql_eq(
+                sql_column("a1.id".to_string()),
+                sql_column("a0.author_id".to_string()),
+            );
+            let found: IpeResult<String, Vec<JoinRow>> = db_find_join(
+                db,
+                "books; DROP TABLE authors".into(),
+                "a0".into(),
+                vec!["id".into()],
+                "authors".into(),
+                "a1".into(),
+                vec!["id".into()],
+                frag,
+            )
+            .await;
+            assert!(
+                matches!(found, IpeResult::Err(_)),
+                "a non-identifier table must fail closed"
+            );
+        }
+
+        /// Two sides that share an alias are rejected: the projection and WHERE
+        /// could not tell the sides apart, so fail closed rather than emit an
+        /// ambiguous statement.
+        #[tokio::test]
+        async fn test_find_join_rejects_shared_alias() {
+            let db = fresh_join_db().await;
+            let frag = sql_eq(
+                sql_column("a0.id".to_string()),
+                sql_column("a0.author_id".to_string()),
+            );
+            let found: IpeResult<String, Vec<JoinRow>> = db_find_join(
+                db,
+                "books".into(),
+                "a0".into(),
+                vec!["id".into()],
+                "authors".into(),
+                "a0".into(),
+                vec!["id".into()],
+                frag,
+            )
+            .await;
+            assert!(
+                matches!(found, IpeResult::Err(_)),
+                "a shared alias must fail closed"
+            );
+        }
+
+        /// `Db.findProjection` reads only the projected column, keyed by the output
+        /// name `p0`: projecting the author name over the active-author join returns
+        /// Ada's two books' author name, each row carrying just `p0` (column
+        /// pushdown), and the filter value binds as a parameter.
+        #[tokio::test]
+        async fn test_find_projection_single_column() {
+            let db = fresh_join_db().await;
+            let frag = sql_and(
+                sql_eq(
+                    sql_column("a1.id".to_string()),
+                    sql_column("a0.author_id".to_string()),
+                ),
+                sql_eq(sql_column("a1.active".to_string()), sql_param(1_i64)),
+            );
+            let found: IpeResult<String, Vec<RowCells>> = db_find_projection(
+                db,
+                "books".into(),
+                "a0".into(),
+                "authors".into(),
+                "a1".into(),
+                frag,
+                vec![ProjectionTerm::ColumnTerm("a1".into(), "name".into())],
+                vec![],
+            )
+            .await;
+            match found {
+                IpeResult::Ok(rows) => {
+                    assert_eq!(rows.len(), 2, "only active author Ada's two books");
+                    for row in &rows {
+                        assert_eq!(row.text("p0"), Some("Ada"));
+                        assert_eq!(row.len(), 1, "only the projected column is read");
+                    }
+                }
+                IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
+            }
+        }
+
+        /// `Db.findProjection` reads two projected columns over the active-author
+        /// join, each keyed by its own output name (`p0` = book title, `p1` = author
+        /// name), in projection order (column pushdown). The filter value binds as a
+        /// parameter; each returned row carries exactly the two projected columns.
+        #[tokio::test]
+        async fn test_find_projection_two_columns() {
+            let db = fresh_join_db().await;
+            let frag = sql_and(
+                sql_eq(
+                    sql_column("a1.id".to_string()),
+                    sql_column("a0.author_id".to_string()),
+                ),
+                sql_eq(sql_column("a1.active".to_string()), sql_param(1_i64)),
+            );
+            let found: IpeResult<String, Vec<RowCells>> = db_find_projection(
+                db,
+                "books".into(),
+                "a0".into(),
+                "authors".into(),
+                "a1".into(),
+                frag,
+                vec![
+                    ProjectionTerm::ColumnTerm("a0".into(), "title".into()),
+                    ProjectionTerm::ColumnTerm("a1".into(), "name".into()),
+                ],
+                vec![],
+            )
+            .await;
+            match found {
+                IpeResult::Ok(rows) => {
+                    assert_eq!(rows.len(), 2, "only active author Ada's two books");
+                    let mut titles: Vec<&str> = rows.iter().filter_map(|r| r.text("p0")).collect();
+                    titles.sort_unstable();
+                    assert_eq!(titles, ["Engines", "Structures"], "p0 is the book title");
+                    for row in &rows {
+                        assert_eq!(row.text("p1"), Some("Ada"));
+                        assert_eq!(row.len(), 2, "exactly the two projected columns");
+                    }
+                }
+                IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
+            }
+        }
+
+        /// `Db.deleteWhere` removes exactly the matching rows and returns the
+        /// affected row count.
+        #[tokio::test]
+        async fn test_delete_where() {
+            let db = fresh_db().await;
+            insert_todo(&db, "alpha").await;
+            insert_todo(&db, "beta").await;
+            let frag = sql_eq(
+                sql_column("title".to_string()),
+                sql_param("alpha".to_string()),
+            );
+            let deleted: IpeResult<String, i64> =
+                db_delete_where(db.clone(), "todos".into(), frag).await;
+            assert_eq!(deleted, IpeResult::Ok(1));
+            let remaining: IpeResult<String, Vec<RowCells>> = db_find_where(
+                db,
+                "todos".into(),
+                sql_is_not_null(sql_column("title".to_string())),
+            )
+            .await;
+            match remaining {
+                IpeResult::Ok(v) => assert_eq!(v.len(), 1),
+                IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
+            }
+        }
+
+        /// `Sql.inList` with a non-empty list matches every listed value.
+        #[tokio::test]
+        async fn test_in_list_non_empty() {
+            let db = fresh_db().await;
+            insert_todo(&db, "alpha").await;
+            insert_todo(&db, "beta").await;
+            insert_todo(&db, "gamma").await;
+            let frag = sql_in_list(
+                sql_column("title".to_string()),
+                vec![
+                    SqlParam::Text("alpha".to_string()),
+                    SqlParam::Text("gamma".to_string()),
+                ],
+            );
+            let found: IpeResult<String, Vec<RowCells>> =
+                db_find_where(db, "todos".into(), frag).await;
+            match found {
+                IpeResult::Ok(v) => assert_eq!(v.len(), 2),
+                IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
+            }
+        }
+
+        /// Empty `Sql.inList` emits `(1 = 0)` (always-false) rather than the SQL
+        /// syntax error `IN ()` — a real column reference stays a real column
+        /// reference, but the whole predicate matches nothing.
+        #[tokio::test]
+        async fn test_in_list_empty_matches_nothing() {
+            let db = fresh_db().await;
+            insert_todo(&db, "alpha").await;
+            let frag = sql_in_list(sql_column("title".to_string()), Vec::new());
+            let found: IpeResult<String, Vec<RowCells>> =
+                db_find_where(db, "todos".into(), frag).await;
+            match found {
+                IpeResult::Ok(v) => assert_eq!(v.len(), 0),
+                IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
+            }
+        }
+
+        /// `Sql.column` accepts a dotted reference (`table.column`) via
+        /// `SqlIdent::parse_dotted`, distinct from `SqlIdent::parse_plain`
+        /// (table-name-only, dot-rejecting) used for the table argument itself.
+        #[tokio::test]
+        async fn test_column_accepts_dotted_reference() {
+            let db = fresh_db().await;
+            insert_todo(&db, "alpha").await;
+            let frag = sql_eq(
+                sql_column("todos.title".to_string()),
+                sql_param("alpha".to_string()),
+            );
+            let found: IpeResult<String, Vec<RowCells>> =
+                db_find_where(db, "todos".into(), frag).await;
+            match found {
+                IpeResult::Ok(v) => assert_eq!(v.len(), 1),
+                IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
+            }
+        }
+
+        /// An invalid `Sql.column` identifier poisons the fragment instead of
+        /// panicking or interpolating unchecked text; `Db.findWhere` surfaces the
+        /// poison as a `Task::Err`, never malformed SQL.
+        #[tokio::test]
+        async fn test_poisoned_column_surfaces_as_task_err() {
+            let db = fresh_db().await;
+            insert_todo(&db, "alpha").await;
+            // Space + semicolon are outside `valid_sql_ident`'s charset.
+            let frag = sql_eq(
+                sql_column("title; DROP TABLE todos".to_string()),
+                sql_param("alpha".to_string()),
+            );
+            let found: IpeResult<String, Vec<RowCells>> =
+                db_find_where(db, "todos".into(), frag).await;
+            assert!(
+                matches!(found, IpeResult::Err(_)),
+                "poisoned column must surface as Task::Err, got {found:?}"
+            );
+        }
+
+        // ─── db_exec / db_query parameter-binding characterization (candidate B) ──────
+
+        /// A parameterised INSERT via db_exec then a parameterised SELECT via
+        /// db_query round-trips the bound values.
+        #[tokio::test]
+        async fn test_exec_and_query_with_params() {
+            let db = fresh_db().await;
+            let ins: IpeResult<String, i64> = db_exec(
+                db.clone(),
+                "INSERT INTO todos (title, done) VALUES (?, ?)".into(),
+                vec!["buy milk".to_string(), "0".to_string()],
+            )
+            .await;
+            assert!(matches!(ins, IpeResult::Ok(1))); // exec returns rows-affected
+
+            let rows: IpeResult<String, Vec<RowCells>> = db_query(
+                db,
+                "SELECT title, done FROM todos WHERE title = ?".into(),
+                vec!["buy milk".to_string()],
+            )
+            .await;
+            match rows {
+                IpeResult::Ok(v) => {
+                    assert_eq!(v.len(), 1);
+                    assert_eq!(v[0].text("title"), Some("buy milk"));
+                    assert_eq!(v[0].text("done"), Some("0"));
+                }
+                other => panic!("unexpected: {:?}", other),
+            }
+        }
+
+        /// The load-bearing safety property: a value carrying single quotes and SQL
+        /// metacharacters is bound, not spliced — stored and returned VERBATIM, and
+        /// the surrounding table is untouched (no injection executes).
+        #[tokio::test]
+        async fn test_query_param_with_quotes_and_metachars_roundtrips_safely() {
+            let db = fresh_db().await;
+            let nasty = "x'); DROP TABLE todos;-- O'Brien".to_string();
+            let ins: IpeResult<String, i64> = db_exec(
+                db.clone(),
+                "INSERT INTO todos (title, done) VALUES (?, ?)".into(),
+                vec![nasty.clone(), "0".to_string()],
+            )
+            .await;
+            assert!(matches!(ins, IpeResult::Ok(1))); // exec returns rows-affected
+
+            // The value comes back byte-for-byte (proves it was bound, not splice-escaped-into-SQL).
+            let rows: IpeResult<String, Vec<RowCells>> = db_query(
+                db.clone(),
+                "SELECT title FROM todos WHERE title = ?".into(),
+                vec![nasty.clone()],
+            )
+            .await;
+            match rows {
+                IpeResult::Ok(v) => {
+                    assert_eq!(v.len(), 1);
+                    assert_eq!(v[0].text("title"), Some(nasty.as_str()));
+                }
+                other => panic!("unexpected: {:?}", other),
+            }
+
+            // The table still exists with exactly the one row — the DROP never ran.
+            let all: IpeResult<String, Vec<RowCells>> =
+                db_query(db, "SELECT title FROM todos".into(), vec![]).await;
+            match all {
+                IpeResult::Ok(v) => {
+                    assert_eq!(v.len(), 1, "injection must not have dropped the table")
+                }
+                other => panic!("table gone or errored: {:?}", other),
+            }
+        }
+
+        /// Round-trip on SQLite: a conflicting upsert UPDATES the row in place —
+        /// rowid unchanged, the column outside the SET list preserved, still one
+        /// row — the semantics `INSERT OR REPLACE` would break. A `DO NOTHING`
+        /// upsert meeting the existing row affects zero rows.
+        #[tokio::test]
+        async fn upsert_fields_updates_in_place_on_sqlite() {
+            let db = fresh_db().await;
+            let mk: IpeResult<String, i64> = db_exec_raw(
+                db.clone(),
+                "CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT, note TEXT DEFAULT 'none')"
+                    .to_string(),
+            )
+            .await;
+            assert!(matches!(mk, IpeResult::Ok(_)), "create: {mk:?}");
+
+            let upsert = |v: &str| {
+                db_upsert_fields::<String>(
+                    db.clone(),
+                    "kv".to_string(),
+                    vec!["k".to_string()],
+                    vec![
+                        ("k".to_string(), Some(SqlParam::Text("a".to_string()))),
+                        ("v".to_string(), Some(SqlParam::Text(v.to_string()))),
+                        ("note".to_string(), None),
+                    ],
+                )
+            };
+            let first = upsert("1").await;
+            assert!(matches!(first, IpeResult::Ok(1)), "insert: {first:?}");
+            let noted: IpeResult<String, i64> = db_exec_raw(
+                db.clone(),
+                "UPDATE kv SET note = 'kept' WHERE k = 'a'".to_string(),
+            )
+            .await;
+            assert!(matches!(noted, IpeResult::Ok(1)), "note: {noted:?}");
+            // A later row raises max(rowid), so a delete-then-insert of `a` would
+            // be assigned a fresh rowid rather than reusing its old one.
+            let other: IpeResult<String, i64> = db_exec_raw(
+                db.clone(),
+                "INSERT INTO kv (k, v) VALUES ('b', 'x')".to_string(),
+            )
+            .await;
+            assert!(matches!(other, IpeResult::Ok(1)), "second row: {other:?}");
+
+            let read = || {
+                db_query_params::<String>(
+                    db.clone(),
+                    "SELECT rowid AS rid, v, note FROM kv WHERE k = 'a'".to_string(),
+                    Vec::new(),
+                )
+            };
+            let before = read().await.with_default(Vec::new());
+            let rid_before = before.first().and_then(|r| r.get("rid")).cloned();
+            assert!(rid_before.is_some(), "row missing after insert: {before:?}");
+
+            let second = upsert("2").await;
+            assert!(matches!(second, IpeResult::Ok(1)), "update: {second:?}");
+            let after = read().await.with_default(Vec::new());
+            assert_eq!(
+                after.len(),
+                1,
+                "conflict must update, not add a row: {after:?}"
+            );
+            let all: IpeResult<String, Vec<RowCells>> =
+                db_query_params(db.clone(), "SELECT k FROM kv".to_string(), Vec::new()).await;
+            assert_eq!(all.with_default(Vec::new()).len(), 2, "row count changed");
+            let row = after.first();
+            assert_eq!(
+                row.and_then(|r| r.get("rid")).cloned(),
+                rid_before,
+                "rowid changed"
+            );
+            assert_eq!(row.and_then(|r| r.text("v")), Some("2"));
+            assert_eq!(
+                row.and_then(|r| r.text("note")),
+                Some("kept"),
+                "column outside the SET list must be preserved"
+            );
+
+            let key_only: IpeResult<String, i64> = db_upsert_fields(
+                db.clone(),
+                "kv".to_string(),
+                vec!["k".to_string()],
+                vec![("k".to_string(), Some(SqlParam::Text("a".to_string())))],
+            )
+            .await;
+            assert!(
+                matches!(key_only, IpeResult::Ok(0)),
+                "DO NOTHING on an existing key affects no row: {key_only:?}"
+            );
+            let last = read().await.with_default(Vec::new());
+            assert_eq!(
+                last.first().and_then(|r| r.text("v")),
+                Some("2"),
+                "DO NOTHING must leave the row untouched"
+            );
+        }
+
+        #[tokio::test]
+        async fn update_fields_refuses_unscoped_update() {
+            let db = fresh_db().await;
+            let mk: IpeResult<String, i64> = db_exec_raw(
+                db.clone(),
+                "CREATE TABLE acct (id INTEGER PRIMARY KEY, bal INTEGER)".to_string(),
+            )
+            .await;
+            assert!(matches!(mk, IpeResult::Ok(_)), "create: {mk:?}");
+            let _: IpeResult<String, i64> = db_exec_raw(
+                db.clone(),
+                "INSERT INTO acct (bal) VALUES (10), (20)".to_string(),
+            )
+            .await;
+
+            // Empty WHERE-column set MUST be refused (would otherwise mass-update
+            // every row), NOT silently rewrite the whole table.
+            let r: IpeResult<String, i64> = db_update_fields(
+                db.clone(),
+                "acct".to_string(),
+                vec![], // no WHERE
+                vec![("bal".to_string(), Some(SqlParam::Int(0)))],
+            )
+            .await;
+            assert!(
+                matches!(r, IpeResult::Err(_)),
+                "empty WHERE must be refused, got {r:?}"
+            );
+            // No row should have been zeroed.
+            let zeroed: IpeResult<String, Vec<RowCells>> = db_query_params(
+                db.clone(),
+                "SELECT bal FROM acct WHERE bal = ?".to_string(),
+                vec![SqlParam::Int(0)],
+            )
+            .await;
+            assert_eq!(
+                zeroed.with_default(Vec::new()).len(),
+                0,
+                "no row should have been mass-updated"
+            );
+            // A scoped update still works (affects exactly 1 row).
+            let ok: IpeResult<String, i64> = db_update_fields(
+                db.clone(),
+                "acct".to_string(),
+                vec![("id".to_string(), SqlParam::Int(1))],
+                vec![("bal".to_string(), Some(SqlParam::Int(99)))],
+            )
+            .await;
+            assert!(
+                matches!(ok, IpeResult::Ok(1)),
+                "scoped update should affect 1 row: {ok:?}"
+            );
+        }
+
+        /// The runtime contract the Ipê-side `Store.updateAs` relies on to enforce an
+        /// `immutable` policy column: `updateAs` drops every immutable column from the
+        /// SET (turns it into an OmitField), so the emitted UPDATE never names that
+        /// column. This test drives `db_update_where` exactly as the fixed `updateAs`
+        /// does — the immutable column omitted, a mutable column set, scoped by the
+        /// owner filter — and proves the immutable value is UNCHANGED while the mutable
+        /// value changes. The companion `update_where_sets_immutable_column_when_not_dropped`
+        /// proves the omission is load-bearing: were the column left in the SET (the
+        /// pre-fix behaviour), the value WOULD change. Together they show the drop is
+        /// what enforces immutability, not an incidental no-op.
+        #[tokio::test]
+        async fn update_where_omitting_immutable_column_leaves_it_unchanged() {
+            let db = fresh_db().await;
+            let _: IpeResult<String, i64> = db_exec_raw(
+                db.clone(),
+                "CREATE TABLE docs (body TEXT PRIMARY KEY, owner TEXT, stamped TEXT)".to_string(),
+            )
+            .await;
+            let _: IpeResult<String, i64> = db_exec_raw(
+                db.clone(),
+                "INSERT INTO docs (body, owner, stamped) VALUES ('doc1', 'alice', 'original')"
+                    .to_string(),
+            )
+            .await;
+
+            // An update scoped by pk AND the owner filter whose SET carries a
+            // written column but NOT `stamped` (dropped the way `updateAs` drops
+            // every immutable and owner column). The caller's attempt to set a new
+            // `stamped` value is simply absent.
+            let updated: IpeResult<String, i64> = db_update_where(
+                db.clone(),
+                "docs".to_string(),
+                vec![
+                    (
+                        "owner".to_string(),
+                        Some(SqlParam::Text("alice".to_string())),
+                    ),
+                    ("stamped".to_string(), None), // OmitField — dropped by the immutable policy
+                ],
+                sql_and(
+                    sql_eq(
+                        sql_column("body".to_string()),
+                        sql_param("doc1".to_string()),
+                    ),
+                    sql_eq(
+                        sql_column("owner".to_string()),
+                        sql_param("alice".to_string()),
+                    ),
+                ),
+            )
+            .await;
+            assert!(
+                matches!(updated, IpeResult::Ok(1)),
+                "the owner-scoped update should affect exactly the caller's row: {updated:?}"
+            );
+
+            let rows: IpeResult<String, Vec<RowCells>> = db_query_params(
+                db.clone(),
+                "SELECT stamped FROM docs WHERE body = ?".to_string(),
+                vec![SqlParam::Text("doc1".to_string())],
+            )
+            .await;
+            match rows {
+                IpeResult::Ok(v) => {
+                    assert_eq!(v.len(), 1, "the row must still exist");
+                    assert_eq!(
+                        v[0].text("stamped"),
+                        Some("original"),
+                        "the immutable column MUST retain its insert-time value — a \
+                     dropped (OmitField) column is never written by an update"
+                    );
+                }
+                other => panic!("read back failed: {other:?}"),
+            }
+        }
+
+        /// The load-bearing half of the immutable proof: if the immutable column were
+        /// NOT dropped (left as a SetField, the pre-fix behaviour), the same update
+        /// WOULD overwrite it. Demonstrates that the `dropColumns` omission in
+        /// `updateAs` is exactly what prevents the change — not an accident of the
+        /// runtime refusing it anyway.
+        #[tokio::test]
+        async fn update_where_sets_immutable_column_when_not_dropped() {
+            let db = fresh_db().await;
+            let _: IpeResult<String, i64> = db_exec_raw(
+                db.clone(),
+                "CREATE TABLE docs (body TEXT PRIMARY KEY, owner TEXT, stamped TEXT)".to_string(),
+            )
+            .await;
+            let _: IpeResult<String, i64> = db_exec_raw(
+                db.clone(),
+                "INSERT INTO docs (body, owner, stamped) VALUES ('doc1', 'alice', 'original')"
+                    .to_string(),
+            )
+            .await;
+
+            // Same update, but with `stamped` left IN the SET (SetField). This is
+            // the outcome the fix prevents.
+            let updated: IpeResult<String, i64> = db_update_where(
+                db.clone(),
+                "docs".to_string(),
+                vec![(
+                    "stamped".to_string(),
+                    Some(SqlParam::Text("tampered".to_string())),
+                )],
+                sql_eq(
+                    sql_column("body".to_string()),
+                    sql_param("doc1".to_string()),
+                ),
+            )
+            .await;
+            assert!(matches!(updated, IpeResult::Ok(1)), "{updated:?}");
+
+            let rows: IpeResult<String, Vec<RowCells>> = db_query_params(
+                db.clone(),
+                "SELECT stamped FROM docs WHERE body = ?".to_string(),
+                vec![SqlParam::Text("doc1".to_string())],
+            )
+            .await;
+            match rows {
+                IpeResult::Ok(v) => {
+                    assert_eq!(
+                        v[0].text("stamped"),
+                        Some("tampered"),
+                        "with the immutable column left in the SET it WOULD change — \
+                     confirming the drop is what enforces immutability"
+                    );
+                }
+                other => panic!("read back failed: {other:?}"),
+            }
+        }
+
+        /// `db_update_where` mirrors `db_update_fields`' guards on the WHERE-fragment
+        /// path: an empty WHERE fragment is refused (no mass-update), a scoped update
+        /// touches only the matching rows, and a SET value carrying SQL metacharacters
+        /// is bound (stored verbatim), never spliced.
+        #[tokio::test]
+        async fn update_where_scopes_binds_and_refuses_empty() {
+            let db = fresh_db().await;
+            let mk: IpeResult<String, i64> = db_exec_raw(
+                db.clone(),
+                "CREATE TABLE acct (id INTEGER PRIMARY KEY, owner TEXT, bal INTEGER)".to_string(),
+            )
+            .await;
+            assert!(matches!(mk, IpeResult::Ok(_)), "create: {mk:?}");
+            let _: IpeResult<String, i64> = db_exec_raw(
+                db.clone(),
+                "INSERT INTO acct (id, owner, bal) VALUES (1, 'a', 10), (2, 'b', 20)".to_string(),
+            )
+            .await;
+
+            // Empty WHERE fragment MUST be refused (would otherwise mass-update).
+            let refused: IpeResult<String, i64> = db_update_where(
+                db.clone(),
+                "acct".to_string(),
+                vec![("bal".to_string(), Some(SqlParam::Int(0)))],
+                sql_unsafe_fragment(String::new()),
+            )
+            .await;
+            assert!(
+                matches!(refused, IpeResult::Err(_)),
+                "empty WHERE must be refused, got {refused:?}"
+            );
+            let zeroed: IpeResult<String, Vec<RowCells>> = db_query_params(
+                db.clone(),
+                "SELECT bal FROM acct WHERE bal = ?".to_string(),
+                vec![SqlParam::Int(0)],
+            )
+            .await;
+            assert_eq!(
+                zeroed.with_default(Vec::new()).len(),
+                0,
+                "no row should have been mass-updated"
+            );
+
+            // A scoped update with an injection-laden SET value affects exactly the
+            // matching row and stores the value VERBATIM (bound, not spliced).
+            let nasty = "x'); DROP TABLE acct;-- O'Brien".to_string();
+            let scoped: IpeResult<String, i64> = db_update_where(
+                db.clone(),
+                "acct".to_string(),
+                vec![("owner".to_string(), Some(SqlParam::Text(nasty.clone())))],
+                sql_eq(sql_column("id".to_string()), sql_param(1i64)),
+            )
+            .await;
+            assert!(
+                matches!(scoped, IpeResult::Ok(1)),
+                "scoped update should affect exactly 1 row: {scoped:?}"
+            );
+
+            // The matching row carries the verbatim value; the non-matching row is
+            // untouched; and the table still exists (the DROP never ran).
+            let rows: IpeResult<String, Vec<RowCells>> = db_query_params(
+                db.clone(),
+                "SELECT id, owner FROM acct ORDER BY id".to_string(),
+                vec![],
+            )
+            .await;
+            match rows {
+                IpeResult::Ok(v) => {
+                    assert_eq!(v.len(), 2, "injection must not have dropped the table");
+                    assert_eq!(
+                        v[0].text("owner"),
+                        Some(nasty.as_str()),
+                        "matching row updated"
+                    );
+                    assert_eq!(v[1].text("owner"), Some("b"), "non-matching row untouched");
+                }
+                other => panic!("table gone or errored: {other:?}"),
+            }
+
+            // An all-OmitField SET updates no columns and reports zero rows.
+            let omitted: IpeResult<String, i64> = db_update_where(
+                db.clone(),
+                "acct".to_string(),
+                vec![("owner".to_string(), None)],
+                sql_eq(sql_column("id".to_string()), sql_param(2i64)),
+            )
+            .await;
+            assert!(
+                matches!(omitted, IpeResult::Ok(0)),
+                "all-OmitField SET reports zero rows: {omitted:?}"
+            );
+        }
+
+        // AUD-07 (a): when DATABASE_URL is absent, ipe_db_url() returns the sqlite
+        // file default — never the hardcoded "sqlite::memory:" that caused silent
+        // data loss on every Db.connect() call.
+        #[test]
+        fn ipe_db_url_fallback_is_sqlite_file() {
+            if crate::system::read_env_var("DATABASE_URL").is_ok() {
+                // DATABASE_URL already set; test (b) covers the env-read path.
+                return;
+            }
+            let url = crate::config::ipe_db_url();
+            assert!(
+                !url.contains(":memory:"),
+                "default URL must not be in-memory: {url}"
+            );
+            assert!(
+                url.contains("ipe.db"),
+                "default URL must reference a named file: {url}"
+            );
+        }
+
+        // AUD-07 (c): two sequential operator connects with the same file URL
+        // observe the same database — data written via one pool is visible via the
+        // other. Proves the old sqlite::memory: per-call-fresh-db bug is closed.
+        #[tokio::test]
+        async fn ipe_db_url_shared_connection_sees_same_data() {
+            use crate::system::{locked_remove_var, locked_set_var};
+            let tmp = crate::scratch_core::test_temp_root()
+                .join(format!("ipe_aud07_shared_{}.db", std::process::id()));
+            let url = format!("sqlite://{}?mode=rwc", tmp.display());
+            locked_set_var("DATABASE_URL", &url);
+            let resolved = crate::config::ipe_db_url();
+            locked_remove_var("DATABASE_URL");
+
+            let conn1 = connect_operator::<String>(resolved.clone()).await;
+            let conn2 = connect_operator::<String>(resolved).await;
+            let pool1 = match conn1 {
+                IpeResult::Ok(p) => p,
+                IpeResult::Err(e) => panic!("connect1 failed: {e}"),
+            };
+            let pool2 = match conn2 {
+                IpeResult::Ok(p) => p,
+                IpeResult::Err(e) => panic!("connect2 failed: {e}"),
+            };
+            sqlx::query("CREATE TABLE IF NOT EXISTS aud07_t (v INTEGER NOT NULL)")
+                .execute(&pool1)
+                .await
+                .expect("create table");
+            sqlx::query("INSERT INTO aud07_t VALUES (99)")
+                .execute(&pool1)
+                .await
+                .expect("insert");
+            let (v,): (i64,) = sqlx::query_as("SELECT v FROM aud07_t")
+                .fetch_one(&pool2)
+                .await
+                .expect("select");
+            assert_eq!(v, 99, "data written via pool1 must be visible via pool2");
+            let _ = std::fs::remove_file(&tmp);
+        }
+
+        /// SSOT proof (entry level): every public kernel that interpolates a
+        /// table/column identifier into SQL routes through the single validator and
+        /// fails CLOSED on a hostile identifier. Each entry is driven with a hostile
+        /// value in its identifier position(s); an `IpeResult::Ok` here means a path
+        /// reached SQL without validating — the boundary is broken. A new
+        /// identifier-accepting entry that skips the validator will fail this test.
+        #[tokio::test]
+        async fn every_identifier_entry_rejects_hostile_idents() {
+            let db = fresh_db().await;
+            for &h in HOSTILE_IDENTS {
+                let hs = h.to_string();
+
+                macro_rules! assert_rejects {
+                    ($label:expr, $task:expr) => {{
+                        let r: IpeResult<String, _> = $task.await;
+                        assert!(
+                            matches!(r, IpeResult::Err(_)),
+                            "{} must reject hostile identifier {:?}, got Ok",
+                            $label,
+                            h
+                        );
+                    }};
+                }
+
+                // Table-identifier position.
+                assert_rejects!(
+                    "db_get_by_id(table)",
+                    db_get_by_id(db.clone(), hs.clone(), "1".to_string())
+                );
+                assert_rejects!(
+                    "db_delete_by_id(table)",
+                    db_delete_by_id(db.clone(), hs.clone(), "1".to_string())
+                );
+                assert_rejects!(
+                    "db_insert_row(table)",
+                    db_insert_row(db.clone(), hs.clone(), {
+                        let mut m = HashMap::new();
+                        m.insert("title".to_string(), "x".to_string());
+                        m
+                    })
+                );
+                assert_rejects!(
+                    "db_update_by_id(table)",
+                    db_update_by_id(db.clone(), hs.clone(), "1".to_string(), {
+                        let mut m = HashMap::new();
+                        m.insert("title".to_string(), "x".to_string());
+                        m
+                    })
+                );
+                assert_rejects!(
+                    "db_find_by_conditions(table)",
+                    db_find_by_conditions(db.clone(), hs.clone(), {
+                        let mut m = HashMap::new();
+                        m.insert("title".to_string(), "x".to_string());
+                        m
+                    })
+                );
+                assert_rejects!(
+                    "db_find_where(table)",
+                    db_find_where(
+                        db.clone(),
+                        hs.clone(),
+                        sql_eq(sql_column("title".to_string()), sql_param("x".to_string())),
+                    )
+                );
+                assert_rejects!(
+                    "db_delete_where(table)",
+                    db_delete_where(
+                        db.clone(),
+                        hs.clone(),
+                        sql_eq(sql_column("title".to_string()), sql_param("x".to_string())),
+                    )
+                );
+                assert_rejects!(
+                    "db_insert_fields(table)",
+                    db_insert_fields(
+                        db.clone(),
+                        hs.clone(),
+                        vec![("title".to_string(), Some(SqlParam::Text("x".to_string())))],
+                    )
+                );
+                assert_rejects!(
+                    "db_update_fields(table)",
+                    db_update_fields(
+                        db.clone(),
+                        hs.clone(),
+                        vec![("id".to_string(), SqlParam::Int(1))],
+                        vec![("title".to_string(), Some(SqlParam::Text("x".to_string())))],
+                    )
+                );
+
+                // Field/column-identifier position.
+                assert_rejects!(
+                    "db_find_one_by_field(field)",
+                    db_find_one_by_field(
+                        db.clone(),
+                        "todos".to_string(),
+                        hs.clone(),
+                        "x".to_string()
+                    )
+                );
+                assert_rejects!(
+                    "db_find_many_by_field(field)",
+                    db_find_many_by_field(
+                        db.clone(),
+                        "todos".to_string(),
+                        hs.clone(),
+                        "x".to_string()
+                    )
+                );
+                assert_rejects!(
+                    "db_find_by_conditions(column)",
+                    db_find_by_conditions(db.clone(), "todos".to_string(), {
+                        let mut m = HashMap::new();
+                        m.insert(hs.clone(), "x".to_string());
+                        m
+                    })
+                );
+                assert_rejects!(
+                    "db_insert_fields(column)",
+                    db_insert_fields(
+                        db.clone(),
+                        "todos".to_string(),
+                        vec![(hs.clone(), Some(SqlParam::Text("x".to_string())))],
+                    )
+                );
+                assert_rejects!(
+                    "db_update_fields(set column)",
+                    db_update_fields(
+                        db.clone(),
+                        "todos".to_string(),
+                        vec![("id".to_string(), SqlParam::Int(1))],
+                        vec![(hs.clone(), Some(SqlParam::Text("x".to_string())))],
+                    )
+                );
+                assert_rejects!(
+                    "db_update_fields(where column)",
+                    db_update_fields(
+                        db.clone(),
+                        "todos".to_string(),
+                        vec![(hs.clone(), SqlParam::Int(1))],
+                        vec![("title".to_string(), Some(SqlParam::Text("x".to_string())))],
+                    )
+                );
+                assert_rejects!(
+                    "db_update_where(table)",
+                    db_update_where(
+                        db.clone(),
+                        hs.clone(),
+                        vec![("title".to_string(), Some(SqlParam::Text("x".to_string())))],
+                        sql_eq(sql_column("id".to_string()), sql_param("1".to_string())),
+                    )
+                );
+                assert_rejects!(
+                    "db_upsert_fields(table)",
+                    db_upsert_fields(
+                        db.clone(),
+                        hs.clone(),
+                        vec!["id".to_string()],
+                        vec![("id".to_string(), Some(SqlParam::Int(1)))],
+                    )
+                );
+                assert_rejects!(
+                    "db_upsert_fields(column)",
+                    db_upsert_fields(
+                        db.clone(),
+                        "todos".to_string(),
+                        vec!["id".to_string()],
+                        vec![
+                            ("id".to_string(), Some(SqlParam::Int(1))),
+                            (hs.clone(), Some(SqlParam::Text("x".to_string()))),
+                        ],
+                    )
+                );
+                assert_rejects!(
+                    "db_upsert_fields(conflict-target column)",
+                    db_upsert_fields(
+                        db.clone(),
+                        "todos".to_string(),
+                        vec![hs.clone()],
+                        vec![(hs.clone(), Some(SqlParam::Text("x".to_string())))],
+                    )
+                );
+                assert_rejects!(
+                    "db_update_where(set column)",
+                    db_update_where(
+                        db.clone(),
+                        "todos".to_string(),
+                        vec![(hs.clone(), Some(SqlParam::Text("x".to_string())))],
+                        sql_eq(sql_column("id".to_string()), sql_param("1".to_string())),
+                    )
+                );
+
+                // `Sql.column` is the SqlFragment-path identifier entry: a hostile
+                // identifier poisons the fragment, which the consumers surface as Err.
+                assert!(
+                    sql_column(hs.clone()).invalid.is_some(),
+                    "sql_column must poison hostile identifier {h:?}"
+                );
+            }
+
+            // A legitimate dotted column reference still validates where the dotted
+            // mode is allowed (Sql.column) — the fix does not over-reject.
+            assert!(
+                sql_column("todos.title".to_string()).invalid.is_none(),
+                "a legitimate dotted column must still validate"
+            );
+        }
+
+        // ── VettedPool SSRF guard tests ───────────────────────────────────────────
+
+        /// SQLite dials no host: its gate only parses the URL.
+        #[tokio::test]
+        async fn sqlite_gate_consults_no_host() {
+            for url in ["sqlite:///app.db", "sqlite::memory:"] {
+                let parsed = DbUrl::parse(url);
+                assert!(parsed.is_ok(), "{url:?}: {:?}", parsed.err());
+                let Ok(parsed) = parsed else { return };
+                let gated =
+                    <sqlx::Sqlite as GatedDial>::gated_connect_options(&parsed, 4, &mut None).await;
+                assert!(gated.is_ok(), "{url:?}: {:?}", gated.err());
+            }
+        }
+
+        // ── DbUrl: one parse decides the engine, the dial, and WAL ────────────────
+
+        /// The engine each scheme selects.
+        #[test]
+        fn db_url_selects_the_engine_by_scheme() {
+            for (url, engine) in [
+                ("sqlite://app.db?mode=rwc", DbEngine::Sqlite),
+                ("sqlite::memory:", DbEngine::Sqlite),
+                ("file:app.db", DbEngine::Sqlite),
+                ("app.db", DbEngine::Sqlite),
+                ("./data/app.db", DbEngine::Sqlite),
+                (":memory:", DbEngine::Sqlite),
+                ("postgres://u:p@db.example/app", DbEngine::Postgres),
+                ("postgresql://db.example/app", DbEngine::Postgres),
+                ("postgres:///app", DbEngine::Postgres),
+            ] {
+                assert!(
+                    DbUrl::parse(url).is_ok_and(|parsed| parsed.engine() == engine),
+                    "{url:?} must select {}",
+                    engine.name()
+                );
+            }
+        }
+
+        /// Only a shared SQLite file gets the WAL setup: never a PostgreSQL URL
+        /// that merely mentions `sqlite`, never a private in-memory database.
+        #[test]
+        fn db_url_decides_wal_from_the_parsed_engine() {
+            for (url, wal) in [
+                ("sqlite://app.db?mode=rwc", true),
+                ("app.db", true),
+                ("file::memory:?cache=shared", true),
+                ("sqlite::memory:", false),
+                (":memory:", false),
+                ("postgres://db.example/sqlite", false),
+                ("postgres://db.example/app?application_name=sqlite", false),
+            ] {
+                assert!(
+                    DbUrl::parse(url).is_ok_and(|parsed| parsed.is_shared_sqlite_file() == wal),
+                    "{url:?}: WAL must be {wal}"
+                );
+            }
+        }
+
+        /// Each driver refuses a URL selecting the other engine, before any dial
+        /// or lookup.
+        #[tokio::test]
+        async fn gated_dial_refuses_a_url_for_the_other_engine() {
+            let postgres = DbUrl::parse("postgres://127.0.0.1/app");
+            assert!(postgres.is_ok(), "{:?}", postgres.as_ref().err());
+            let Ok(postgres) = postgres else { return };
+            assert_eq!(
+                <sqlx::Sqlite as GatedDial>::gated_connect_options(&postgres, 4, &mut None)
+                    .await
+                    .err(),
+                Some(DbConnectError::EngineMismatch {
+                    url: DbEngine::Postgres,
+                    driver: DbEngine::Sqlite,
+                })
+            );
+            let sqlite = DbUrl::parse("sqlite::memory:");
+            assert!(sqlite.is_ok(), "{:?}", sqlite.as_ref().err());
+            let Ok(sqlite) = sqlite else { return };
+            assert_eq!(
+                <sqlx::Postgres as GatedDial>::gated_connect_options(&sqlite, 4, &mut None)
+                    .await
+                    .err(),
+                Some(DbConnectError::EngineMismatch {
+                    url: DbEngine::Sqlite,
+                    driver: DbEngine::Postgres,
+                })
+            );
+        }
+
+        /// An operator connect refuses an unsupported scheme and a URL for the
+        /// other engine as `InvalidInput`, with the typed reason and no credential.
+        #[tokio::test]
+        async fn operator_connect_refuses_urls_the_build_cannot_open() {
+            for (url, expected) in [
+                (
+                    "mysql://admin:s3cr3t-pw@db.example/app",
+                    DbConnectError::UnsupportedScheme,
+                ),
+                (
+                    "postgres://admin:s3cr3t-pw@1.1.1.1/app",
+                    DbConnectError::EngineMismatch {
+                        url: DbEngine::Postgres,
+                        driver: DbEngine::Sqlite,
+                    },
+                ),
+            ] {
+                let refused = match connect_operator::<String>(url.to_owned()).await {
+                    IpeResult::Err(e) => Some(e),
+                    IpeResult::Ok(_) => None,
+                };
+                assert_eq!(
+                    refused,
+                    Some(format!("InvalidInput: {expected}")),
+                    "{url:?}"
+                );
+            }
+        }
+
+        /// The busy timeout of the connection `conn` is running on, in milliseconds.
+        async fn busy_timeout_ms(conn: &mut sqlx::SqliteConnection) -> i64 {
+            sqlx::query_scalar::<_, i64>("PRAGMA busy_timeout")
+                .fetch_one(conn)
+                .await
+                .expect("read busy_timeout")
+        }
+
+        /// Every connection a file pool hands out at once carries the declared
+        /// busy timeout, not only the one a pool-level PRAGMA happened to reach.
+        #[tokio::test]
+        async fn every_pooled_sqlite_connection_carries_the_declared_busy_timeout() {
+            let path = crate::scratch_core::test_temp_root().join(format!(
+                "ipe_busy_timeout_{}_{}.db",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            let name =
+                SqliteFileName::parse_under(&path.display().to_string(), crate::path_core::HOST)
+                    .expect("a scratch path seals");
+            let db_url =
+                DbUrl::sqlite_file(&name, FileMode::CreateIfMissing).expect("a sealed name opens");
+            let pool = match build_pool::<String>(&db_url, Journal::Wal).await {
+                IpeResult::Ok(pool) => Some(pool),
+                IpeResult::Err(_) => None,
+            }
+            .expect("build file pool");
+            let expected =
+                i64::try_from(SQLITE_BUSY_TIMEOUT.as_millis()).expect("timeout fits i64");
+            let max_connections: u32 = DB_CONNECTIONS_CEILING
+                .read()
+                .expect("default connection ceiling");
+            let mut held = Vec::new();
+            for _ in 0..max_connections {
+                held.push(pool.acquire().await.expect("acquire pooled connection"));
+            }
+            assert_eq!(
+                held.len(),
+                usize::try_from(max_connections).expect("u32 fits usize")
+            );
+            for conn in &mut held {
+                assert_eq!(busy_timeout_ms(conn).await, expected);
+            }
+            drop(held);
+            pool.close().await;
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
+        }
+
+        /// The declared busy timeout is a finite, non-zero wait longer than the
+        /// driver's own 5 s default, so declaring it changes what a connection does.
+        #[test]
+        fn the_busy_timeout_is_finite_and_above_the_driver_default() {
+            let driver_default = sqlx::sqlite::SqliteConnectOptions::new();
+            let default_debug = format!("{driver_default:?}");
+            assert!(
+                default_debug.contains("busy_timeout: 5s"),
+                "{default_debug}"
+            );
+            assert!(SQLITE_BUSY_TIMEOUT > std::time::Duration::from_secs(5));
+            assert!(SQLITE_BUSY_TIMEOUT < std::time::Duration::from_secs(600));
+        }
+
+        // ── Store.literal: `? AS pN` in projection SELECT ────────────────────────
+
+        /// `db_find_projection` with a `Store.literal` position binds the extra param
+        /// before the WHERE params and returns it as the `p0` column in every row.
+        #[tokio::test]
+        async fn test_find_projection_literal_bind_appears_in_result() {
+            let db = fresh_join_db().await;
+            let frag = sql_and(
+                sql_eq(
+                    sql_column("a1.id".to_string()),
+                    sql_column("a0.author_id".to_string()),
+                ),
+                sql_eq(sql_column("a1.active".to_string()), sql_param(1_i64)),
+            );
+            let found: IpeResult<String, Vec<RowCells>> = db_find_projection(
+                db,
+                "books".into(),
+                "a0".into(),
+                "authors".into(),
+                "a1".into(),
+                frag,
+                vec![
+                    ProjectionTerm::LiteralTerm,
+                    ProjectionTerm::ColumnTerm("a1".into(), "name".into()),
+                ],
+                vec![SqlParam::Text("fiction".to_string())],
+            )
+            .await;
+            match found {
+                IpeResult::Ok(rows) => {
+                    assert_eq!(rows.len(), 2, "only active author Ada's two books");
+                    for row in &rows {
+                        assert_eq!(
+                            row.text("p0"),
+                            Some("fiction"),
+                            "p0 is the literal value bound as a parameter"
+                        );
+                        assert_eq!(row.text("p1"), Some("Ada"), "p1 is the projected column");
+                        assert_eq!(row.len(), 2, "exactly two projected columns");
+                    }
+                }
+                IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
+            }
+        }
+
+        /// `db_find_projection` with a mismatched `extra_binds` count fails closed —
+        /// one `LiteralTerm` in the projection but zero extra binds.
+        #[tokio::test]
+        async fn test_find_projection_rejects_mismatched_extra_binds() {
+            let db = fresh_join_db().await;
+            let frag = sql_eq(
+                sql_column("a1.id".to_string()),
+                sql_column("a0.author_id".to_string()),
+            );
+            let found: IpeResult<String, Vec<RowCells>> = db_find_projection(
+                db,
+                "books".into(),
+                "a0".into(),
+                "authors".into(),
+                "a1".into(),
+                frag,
+                vec![ProjectionTerm::LiteralTerm],
+                vec![], // no extra bind for the one literal position — must fail
+            )
+            .await;
+            assert!(
+                matches!(found, IpeResult::Err(_)),
+                "a mismatched extra_binds count must fail closed"
+            );
+        }
+
+        // ── Store.coalesce: `COALESCE(a, b) AS pN` ───────────────────────────────
+
+        /// `db_find_projection` with a COALESCE(column, literal) position binds the
+        /// extra param before the WHERE params and returns the coalesced value in `p0`.
+        #[tokio::test]
+        async fn test_find_projection_coalesce_column_literal() {
+            let db = fresh_join_db().await;
+            let frag = sql_and(
+                sql_eq(
+                    sql_column("a1.id".to_string()),
+                    sql_column("a0.author_id".to_string()),
+                ),
+                sql_eq(sql_column("a1.active".to_string()), sql_param(1_i64)),
+            );
+            // COALESCE(a1.name, ?) — the column is non-null for active Ada, so COALESCE
+            // returns the column value ("Ada"), not the fallback literal.
+            let found: IpeResult<String, Vec<RowCells>> = db_find_projection(
+                db,
+                "books".into(),
+                "a0".into(),
+                "authors".into(),
+                "a1".into(),
+                frag,
+                vec![ProjectionTerm::CoalesceTerm(
+                    ProjectionOperand::OperandColumn("a1.name".into()),
+                    ProjectionOperand::OperandLiteral,
+                )],
+                vec![SqlParam::Text("unknown".to_string())],
+            )
+            .await;
+            match found {
+                IpeResult::Ok(rows) => {
+                    assert_eq!(rows.len(), 2, "only active author Ada's two books");
+                    for row in &rows {
+                        assert_eq!(
+                            row.text("p0"),
+                            Some("Ada"),
+                            "COALESCE returns the non-null column value"
+                        );
+                    }
+                }
+                IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
+            }
+        }
+
+        // ── Store.add / .sub / .mul: `(a <op> b) AS pN` ──────────────────────────
+
+        /// `db_find_projection` with an `(a0.id + ?)` position binds the extra param
+        /// before the WHERE params and returns the summed value in `p0`.
+        #[tokio::test]
+        async fn test_find_projection_arith_column_literal() {
+            let db = fresh_join_db().await;
+            let frag = sql_and(
+                sql_eq(
+                    sql_column("a1.id".to_string()),
+                    sql_column("a0.author_id".to_string()),
+                ),
+                sql_eq(sql_column("a0.id".to_string()), sql_param(10_i64)),
+            );
+            // (a0.id + ?) with the book id 10 and a bound literal 5 → 15.
+            let found: IpeResult<String, Vec<RowCells>> = db_find_projection(
+                db,
+                "books".into(),
+                "a0".into(),
+                "authors".into(),
+                "a1".into(),
+                frag,
+                vec![ProjectionTerm::ArithTerm(
+                    ArithOp::ArithAdd,
+                    ProjectionOperand::OperandColumn("a0.id".into()),
+                    ProjectionOperand::OperandLiteral,
+                )],
+                vec![SqlParam::Int(5)],
+            )
+            .await;
+            match found {
+                IpeResult::Ok(rows) => {
+                    assert_eq!(rows.len(), 1, "exactly the one book with id 10");
+                    assert_eq!(rows[0].text("p0"), Some("15"), "(a0.id + ?) = 10 + 5 = 15");
+                }
+                IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
+            }
+        }
+
+        // ─── Engine version floor ────────────────────────────────────────────────
+
+        /// The bundled SQLite passes the gate end to end: `build_pool` reads the
+        /// live `sqlite_version()` and admits it.
+        #[tokio::test]
+        async fn engine_floor_admits_the_bundled_sqlite() {
+            let db_url = DbUrl::sqlite_memory();
+            assert!(db_url.is_ok(), "{:?}", db_url.as_ref().err());
+            let Ok(db_url) = db_url else { return };
+            let pool = build_pool::<String>(&db_url, Journal::Unchanged).await;
+            assert!(
+                matches!(pool, IpeResult::Ok(_)),
+                "bundled SQLite must clear its version floor"
+            );
+        }
+
+        /// The shared gate admits a live pool and reports the version it read.
+        #[tokio::test]
+        async fn engine_floor_on_admits_a_live_sqlite_pool() {
+            let pool = crate::test_db::memory().await;
+            let admitted = enforce_engine_floor_on(&pool).await;
+            assert!(
+                matches!(admitted, Ok(v) if v >= SQLITE_VERSION_FLOOR),
+                "bundled SQLite must clear the shared gate, got {admitted:?}"
+            );
+        }
+
+        /// A pool whose version cannot be read is refused, never admitted.
+        #[tokio::test]
+        async fn engine_floor_on_refuses_an_unreadable_pool() {
+            let pool = crate::test_db::memory().await;
+            pool.close().await;
+            assert_eq!(
+                enforce_engine_floor_on(&pool).await,
+                Err(DbConnectError::VersionUnreadable(DriverFailure::of(
+                    DbEngine::Sqlite,
+                    &sqlx::Error::PoolClosed
+                )))
+            );
+        }
+
+        // ─── Ipe.Db.Location ──────────────────────────────────────────────────────
+
+        /// Open `location`, or the refusal as its `Kind: message` text.
+        async fn open_at(location: DbLocation) -> Result<Db, String> {
+            match db_open::<String>(location).await {
+                IpeResult::Ok(pool) => Ok(pool),
+                IpeResult::Err(e) => Err(e),
+            }
+        }
+
+        /// The sidecar file `suffix` names next to `path`.
+        fn sidecar(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            std::path::PathBuf::from(name)
+        }
+
+        /// Closing the owned pools checkpoints a WAL database: no `-wal` or `-shm`
+        /// file is left and the file passes its integrity check.
+        #[tokio::test]
+        async fn closing_owned_pools_leaves_no_wal_sidecar() {
+            let (pool, path) = fresh_file_db(4).await;
+            let wrote = sqlx::query("INSERT INTO todos (title) VALUES ('kept')")
+                .execute(&pool)
+                .await;
+            assert!(wrote.is_ok(), "the write lands: {wrote:?}");
+            assert!(
+                sidecar(&path, "-wal").exists(),
+                "a WAL write leaves its sidecar open"
+            );
+            let pools = OwnedPools::new();
+            assert!(
+                pools
+                    .register(PoolRole::Cached, Box::new(pool.clone()), 4)
+                    .is_ok()
+            );
+            pools.close_all(std::time::Duration::from_secs(2)).await;
+            assert!(pool.is_closed());
+            assert!(
+                !sidecar(&path, "-wal").exists(),
+                "the close checkpoints the WAL"
+            );
+            assert!(
+                !sidecar(&path, "-shm").exists(),
+                "the close removes the shm"
+            );
+            let url = format!("sqlite://{}?mode=ro", path.display());
+            let reopened = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await;
+            assert!(reopened.is_ok(), "the closed file reopens: {reopened:?}");
+            let Ok(reopened) = reopened else {
+                return;
+            };
+            let check: Result<(String,), _> = sqlx::query_as("PRAGMA integrity_check")
+                .fetch_one(&reopened)
+                .await;
+            assert!(
+                matches!(check, Ok((ref verdict,)) if verdict == "ok"),
+                "{check:?}"
+            );
+            let kept: Result<(i64,), _> = sqlx::query_as("SELECT COUNT(*) FROM todos")
+                .fetch_one(&reopened)
+                .await;
+            assert!(
+                matches!(kept, Ok((1,))),
+                "the write survives the close: {kept:?}"
+            );
+            reopened.close().await;
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// A checkout cut while its checkout hook is still running on the
+        /// connection holds the owned-pool close until that connection has closed:
+        /// the close returns with no `-wal` left behind.
+        #[tokio::test]
+        async fn a_checkout_cut_mid_hook_closes_its_connection_before_the_pools_close() {
+            let mut path = crate::scratch_core::test_temp_root();
+            path.push(format!(
+                "ipe_cut_checkout_{}_{}.db",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            let _ = std::fs::remove_file(&path);
+            let options = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                .busy_timeout(SQLITE_BUSY_TIMEOUT);
+            let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let in_hook = std::sync::Arc::new(tokio::sync::Notify::new());
+            let (hook_armed, hook_entered) = (armed.clone(), in_hook.clone());
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .before_acquire(move |conn, _meta| {
+                    let armed = hook_armed.load(std::sync::atomic::Ordering::SeqCst);
+                    let entered = hook_entered.clone();
+                    Box::pin(async move {
+                        if armed {
+                            entered.notify_one();
+                            sqlx::query(
+                                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c \
+                             WHERE x < 3000000) SELECT count(*) FROM c",
+                            )
+                            .execute(&mut *conn)
+                            .await?;
+                        }
+                        Ok(true)
+                    })
+                })
+                .connect_with(options)
+                .await;
+            assert!(pool.is_ok(), "the WAL pool opens: {pool:?}");
+            let Ok(pool) = pool else {
+                return;
+            };
+            let created = sqlx::query("CREATE TABLE kept (v INTEGER)")
+                .execute(&pool)
+                .await;
+            assert!(created.is_ok(), "the table opens: {created:?}");
+            let wrote = sqlx::query("INSERT INTO kept VALUES (1)")
+                .execute(&pool)
+                .await;
+            assert!(wrote.is_ok(), "the write lands: {wrote:?}");
+            assert!(
+                sidecar(&path, "-wal").exists(),
+                "a WAL write leaves its sidecar open"
+            );
+            armed.store(true, std::sync::atomic::Ordering::SeqCst);
+            let cut_pool = pool.clone();
+            let cut = tokio::spawn(async move { checkout(&cut_pool).await.map(drop) });
+            in_hook.notified().await;
+            cut.abort();
+            let cut = cut.await;
+            assert!(
+                cut.as_ref()
+                    .is_err_and(tokio::task::JoinError::is_cancelled),
+                "the checkout is cut mid-hook: {cut:?}"
+            );
+            let pools = OwnedPools::new();
+            assert!(
+                pools
+                    .register(PoolRole::Cached, Box::new(pool.clone()), 1)
+                    .is_ok()
+            );
+            pools.close_all(std::time::Duration::from_secs(10)).await;
+            assert!(pool.is_closed());
+            assert!(
+                !sidecar(&path, "-wal").exists(),
+                "the cut checkout's connection closed before the pools' close returned"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// A checked-out connection never holds the close past its deadline.
+        #[tokio::test]
+        async fn a_checked_out_connection_never_holds_the_close_past_its_deadline() {
+            let (pool, path) = fresh_file_db(2).await;
+            let held = pool.acquire().await;
+            assert!(held.is_ok(), "a connection checks out: {held:?}");
+            let pools = OwnedPools::new();
+            assert!(
+                pools
+                    .register(PoolRole::Cached, Box::new(pool.clone()), 4)
+                    .is_ok()
+            );
+            let deadline = std::time::Duration::from_millis(200);
+            let started = std::time::Instant::now();
+            let bound = deadline * 2 + std::time::Duration::from_secs(2);
+            let closed = tokio::time::timeout(bound, pools.close_all(deadline)).await;
+            assert!(closed.is_ok(), "the close returns within its deadline");
+            assert!(started.elapsed() < bound);
+            drop(held);
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// A file database closed by `Db.close` reopens to a working pool, never
+        /// the closed cached one.
+        #[tokio::test]
+        async fn a_closed_file_database_reopens_to_an_open_pool() {
+            let path = scratch_path("db_close_reopen.db");
+            let location = || match file_at(&path, FileMode::CreateIfMissing) {
+                IpeResult::Ok(location) => Some(location),
+                IpeResult::Err(_) => None,
+            };
+            let first = match location() {
+                Some(location) => open_at(location).await,
+                None => Err("the scratch path seals".to_owned()),
+            };
+            assert!(first.is_ok(), "the file opens: {first:?}");
+            let Ok(first) = first else {
+                return;
+            };
+            let closed = db_close::<String>(first.clone()).await;
+            assert!(matches!(closed, IpeResult::Ok(())));
+            assert!(first.is_closed());
+            let second = match location() {
+                Some(location) => open_at(location).await,
+                None => Err("the scratch path seals".to_owned()),
+            };
+            assert!(second.is_ok(), "the closed file reopens: {second:?}");
+            let Ok(second) = second else {
+                return;
+            };
+            assert!(
+                !second.is_closed(),
+                "a reopen never hands out the closed pool"
+            );
+            let queried = sqlx::query("SELECT 1").execute(&second).await;
+            assert!(queried.is_ok(), "the reopened pool answers: {queried:?}");
+            second.close().await;
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// `Db.open` refuses another engine's location before its host is vetted:
+        /// a postgres `Dsn` naming a loopback host (which the dial gate refuses as
+        /// `PermissionDenied`) is an `InvalidInput` engine mismatch under this
+        /// SQLite build, and the refusal never carries the password.
+        #[tokio::test]
+        async fn db_open_refuses_another_engine_before_the_host_is_vetted() {
+            let dsn = crate::dsn::dsn_parse::<String>(
+                "postgres://alice:hunter2@127.0.0.1:5432/app".to_owned(),
+            );
+            let IpeResult::Ok(dsn) = dsn else {
+                assert!(matches!(dsn, IpeResult::Ok(_)), "{dsn:?}");
+                return;
+            };
+            let refused = open_at(db_location_dsn(dsn))
+                .await
+                .err()
+                .unwrap_or_default();
+            assert!(refused.starts_with("InvalidInput: "), "{refused}");
+            assert!(
+                refused.contains("selects PostgreSQL but this build's driver is SQLite"),
+                "{refused}"
+            );
+            assert!(!refused.contains("hunter2"), "{refused}");
+        }
+
+        /// Open the file at `path` under `mode`.
+        async fn open_file(path: &std::path::Path, mode: FileMode) -> Result<Db, String> {
+            match file_at(path, mode) {
+                IpeResult::Ok(location) => open_at(location).await,
+                IpeResult::Err(e) => Err(e.to_ipe_string()),
+            }
+        }
+
+        /// The anchored name `text` seals to under `regime`.
+        fn seal_name(
+            text: &str,
+            regime: crate::path_core::Regime,
+        ) -> Result<String, DbLocationRefusal> {
+            SqliteFileName::parse_under(text, regime).map(|name| name.as_str().to_owned())
+        }
+
+        /// Each URL metacharacter in a file name is an ordinary byte: the file
+        /// created carries the literal name, and a sibling the URL reading would
+        /// name is never created. Unix only: Windows forbids `?` in a file name.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn url_metacharacters_name_a_literal_file() {
+            let dir = scratch_path("db_location_literal");
+            let made = std::fs::create_dir_all(&dir);
+            assert!(made.is_ok(), "{made:?}");
+            for (literal, url_reading) in [
+                ("t.db?mode=memory", "t.db"),
+                ("a#b.db", "a"),
+                ("a.db?mode=ro&cache=shared", "a.db"),
+                ("a%3Fb.db", "a?b.db"),
+            ] {
+                let path = dir.join(literal);
+                let opened = open_file(&path, FileMode::CreateIfMissing).await;
+                assert!(opened.is_ok(), "{literal}: {opened:?}");
+                let Ok(pool) = opened else { return };
+                let wrote = sqlx::query("CREATE TABLE kept (v INTEGER NOT NULL)")
+                    .execute(&pool)
+                    .await;
+                assert!(wrote.is_ok(), "{literal}: {wrote:?}");
+                let inserted = sqlx::query("INSERT INTO kept VALUES (7)")
+                    .execute(&pool)
+                    .await;
+                assert!(inserted.is_ok(), "{literal}: {inserted:?}");
+                assert!(path.is_file(), "{literal}: no literal file");
+                assert!(
+                    !dir.join(url_reading).exists(),
+                    "{literal}: {url_reading} was created"
+                );
+                let reopened = open_file(&path, FileMode::WriteExisting).await;
+                assert!(reopened.is_ok(), "{literal}: {reopened:?}");
+                let Ok(reopened) = reopened else { return };
+                let kept: Result<i64, _> = sqlx::query_scalar("SELECT v FROM kept")
+                    .fetch_one(&reopened)
+                    .await;
+                assert!(matches!(kept, Ok(7)), "{literal}: {kept:?}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A `:` after the volume is refused, which makes `:memory:` and every
+        /// `file:` URI unrepresentable.
+        #[test]
+        fn a_colon_in_a_file_name_is_refused() {
+            for regime in [
+                crate::path_core::Regime::Unix,
+                crate::path_core::Regime::Windows,
+            ] {
+                for text in [
+                    "a:b.db",
+                    ":memory:",
+                    "file:x.db",
+                    "file:x.db?vfs=unix-none",
+                    "dir:/x.db",
+                    "dir/a.db:stream",
+                ] {
+                    assert_eq!(
+                        seal_name(text, regime),
+                        Err(DbLocationRefusal::Colon),
+                        "{text:?} under {regime:?}"
+                    );
+                }
+                assert_eq!(seal_name("ab.db", regime), Ok("./ab.db".to_owned()));
+            }
+            assert_eq!(
+                seal_name("C:x.db", crate::path_core::Regime::Windows),
+                Err(DbLocationRefusal::Colon),
+                "a drive-relative path is refused"
+            );
+            assert_eq!(
+                seal_name("C:\\data\\x.db", crate::path_core::Regime::Windows),
+                Ok("C:\\data\\x.db".to_owned())
+            );
+            let refused = DbLocationRefusal::Colon.into_error();
+            assert!(matches!(
+                refused,
+                IpeError::Error(IpeErrorKind::InvalidInput, _)
+            ));
+        }
+
+        /// A relative name is anchored with `./` once; an absolute or anchored
+        /// name keeps its spelling.
+        #[test]
+        fn a_relative_file_name_is_anchored_once() {
+            let unix = crate::path_core::Regime::Unix;
+            assert_eq!(seal_name("x.db", unix), Ok("./x.db".to_owned()));
+            assert_eq!(seal_name("dir/x.db", unix), Ok("./dir/x.db".to_owned()));
+            assert_eq!(seal_name("/tmp/d/x.db", unix), Ok("/tmp/d/x.db".to_owned()));
+            assert_eq!(seal_name("./x.db", unix), Ok("./x.db".to_owned()));
+            let windows = crate::path_core::Regime::Windows;
+            assert_eq!(seal_name(".\\x.db", windows), Ok(".\\x.db".to_owned()));
+            assert_eq!(seal_name("\\x.db", windows), Ok("\\x.db".to_owned()));
+        }
+
+        /// A path naming no file is refused; a file under a directory is the
+        /// control.
+        #[test]
+        fn a_path_naming_no_file_is_refused() {
+            let unix = crate::path_core::Regime::Unix;
+            for text in ["", ".", "..", "/", "dir/", "dir/.", "dir/.."] {
+                assert_eq!(
+                    seal_name(text, unix),
+                    Err(DbLocationRefusal::NoFileName),
+                    "{text:?}"
+                );
+            }
+            assert_eq!(seal_name("dir/x.db", unix), Ok("./dir/x.db".to_owned()));
+            let sealed_empty = crate::path::path_from_string::<IpeError>(String::new());
+            assert!(
+                matches!(&sealed_empty, IpeResult::Ok(_)),
+                "{sealed_empty:?}"
+            );
+            let IpeResult::Ok(sealed_empty) = sealed_empty else {
+                return;
+            };
+            let refused = db_location_file::<IpeError>(2, sealed_empty);
+            assert!(
+                matches!(
+                    &refused,
+                    IpeResult::Err(IpeError::Error(IpeErrorKind::InvalidInput, _))
+                ),
+                "{refused:?}"
+            );
+        }
+
+        /// The anchored name may hold [`SQLITE_FILE_NAME_MAX`] bytes and no more.
+        #[test]
+        fn a_file_name_past_the_ceiling_is_refused() {
+            let unix = crate::path_core::Regime::Unix;
+            let at_ceiling = "a".repeat(SQLITE_FILE_NAME_MAX - 2);
+            let sealed = seal_name(&at_ceiling, unix);
+            assert!(
+                sealed
+                    .as_ref()
+                    .is_ok_and(|name| name.len() == SQLITE_FILE_NAME_MAX),
+                "{sealed:?}"
+            );
+            let past = "a".repeat(SQLITE_FILE_NAME_MAX - 1);
+            assert_eq!(
+                seal_name(&past, unix),
+                Err(DbLocationRefusal::TooLong {
+                    len: SQLITE_FILE_NAME_MAX + 1
+                })
+            );
+            let refused = DbLocationRefusal::TooLong {
+                len: SQLITE_FILE_NAME_MAX + 1,
+            }
+            .into_error();
+            assert!(matches!(
+                refused,
+                IpeError::Error(IpeErrorKind::InvalidInput, _)
+            ));
+        }
+
+        /// A network share or device path is refused under both regimes.
+        #[test]
+        fn a_network_path_is_refused_on_every_platform() {
+            for regime in [
+                crate::path_core::Regime::Unix,
+                crate::path_core::Regime::Windows,
+            ] {
+                for text in [
+                    "//host/s/x.db",
+                    "\\\\host\\s\\x.db",
+                    "\\\\?\\C:\\x.db",
+                    "/\\host\\s\\x.db",
+                    "\\/host/s/x.db",
+                    "\\??\\UNC\\host\\s\\x.db",
+                    "/??/UNC/host/s/x.db",
+                    "\\??\\C:\\x.db",
+                ] {
+                    assert_eq!(
+                        seal_name(text, regime),
+                        Err(DbLocationRefusal::NetworkPath),
+                        "{text:?} under {regime:?}"
+                    );
+                }
+                assert_eq!(
+                    seal_name("/host/s/x.db", regime),
+                    Ok("/host/s/x.db".to_owned())
+                );
+                assert_eq!(
+                    seal_name("/??x/s/x.db", regime),
+                    Ok("/??x/s/x.db".to_owned())
+                );
+            }
+        }
+
+        /// `ReadExisting` and `WriteExisting` never create a file; `CreateIfMissing`
+        /// does.
+        #[tokio::test]
+        async fn only_create_if_missing_creates_the_file() {
+            for mode in [FileMode::ReadExisting, FileMode::WriteExisting] {
+                let path = scratch_path("db_location_absent");
+                let opened = open_file(&path, mode).await;
+                assert!(opened.is_err(), "{mode:?} opened a missing file");
+                assert!(!path.exists(), "{mode:?} created the file");
+            }
+            let path = scratch_path("db_location_created");
+            let created = open_file(&path, FileMode::CreateIfMissing).await;
+            assert!(created.is_ok(), "{created:?}");
+            assert!(path.is_file(), "CreateIfMissing made no file");
+            let reopened = open_file(&path, FileMode::WriteExisting).await;
+            assert!(reopened.is_ok(), "{reopened:?}");
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
+        }
+
+        /// `ReadExisting` refuses a write; `WriteExisting` on the same file accepts it.
+        #[tokio::test]
+        async fn read_existing_refuses_a_write() {
+            let path = scratch_path("db_location_read_only");
+            let created = open_file(&path, FileMode::CreateIfMissing).await;
+            assert!(created.is_ok(), "{created:?}");
+            let Ok(created) = created else { return };
+            let made = sqlx::query("CREATE TABLE t (v INTEGER NOT NULL)")
+                .execute(&created)
+                .await;
+            assert!(made.is_ok(), "{made:?}");
+            let reader = open_file(&path, FileMode::ReadExisting).await;
+            assert!(reader.is_ok(), "{reader:?}");
+            let Ok(reader) = reader else { return };
+            let refused = sqlx::query("INSERT INTO t VALUES (1)")
+                .execute(&reader)
+                .await;
+            assert!(refused.is_err(), "a read-only pool accepted a write");
+            let writer = open_file(&path, FileMode::WriteExisting).await;
+            assert!(writer.is_ok(), "{writer:?}");
+            let Ok(writer) = writer else { return };
+            let accepted = sqlx::query("INSERT INTO t VALUES (1)")
+                .execute(&writer)
+                .await;
+            assert!(accepted.is_ok(), "{accepted:?}");
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
+        }
+
+        /// A file location for the other engine's driver is a typed engine
+        /// mismatch, mapped to `InvalidInput`.
+        #[tokio::test]
+        async fn a_file_location_on_the_postgres_driver_is_an_engine_mismatch() {
+            let name = SqliteFileName::parse_under("x.db", crate::path_core::Regime::Unix);
+            assert!(name.is_ok(), "{name:?}");
+            let Ok(name) = name else { return };
+            let file = DbUrl::sqlite_file(&name, FileMode::CreateIfMissing);
+            assert!(file.is_ok(), "{:?}", file.as_ref().err());
+            let Ok(file) = file else { return };
+            let mismatch =
+                <sqlx::Postgres as GatedDial>::gated_connect_options(&file, 4, &mut None)
+                    .await
+                    .err();
+            assert_eq!(
+                mismatch,
+                Some(DbConnectError::EngineMismatch {
+                    url: DbEngine::Sqlite,
+                    driver: DbEngine::Postgres,
+                })
+            );
+            let Some(mismatch) = mismatch else { return };
+            let mapped: String = connect_refusal("", KERNEL_ENGINE, &mismatch);
+            assert!(mapped.starts_with("InvalidInput: "), "{mapped}");
+            let admitted =
+                <sqlx::Sqlite as GatedDial>::gated_connect_options(&file, 4, &mut None).await;
+            assert!(admitted.is_ok(), "{:?}", admitted.err());
+        }
+
+        /// Two memory opens are two databases; a file location is shared per key.
+        #[tokio::test]
+        async fn memory_is_private_and_a_file_is_pooled_per_key() {
+            let first = open_at(db_location_memory()).await;
+            let second = open_at(db_location_memory()).await;
+            assert!(first.is_ok() && second.is_ok(), "{first:?} {second:?}");
+            let (Ok(first), Ok(second)) = (first, second) else {
+                return;
+            };
+            let made = sqlx::query("CREATE TABLE only_first (v INTEGER NOT NULL)")
+                .execute(&first)
+                .await;
+            assert!(made.is_ok(), "{made:?}");
+            let seen = sqlx::query("SELECT v FROM only_first")
+                .fetch_all(&second)
+                .await;
+            assert!(seen.is_err(), "a second memory open saw the first's table");
+
+            let path = scratch_path("db_location_pooled");
+            let location = file_at(&path, FileMode::CreateIfMissing);
+            let IpeResult::Ok(location) = location else {
+                assert!(matches!(location, IpeResult::Ok(_)), "{location:?}");
+                return;
+            };
+            let LocationKind::File { name, .. } = location.0.clone() else {
+                return;
+            };
+            let opened = open_at(location).await;
+            assert!(opened.is_ok(), "{opened:?}");
+            let keyed = pool_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&PoolKey::File {
+                    name,
+                    mode: FileMode::CreateIfMissing,
+                });
+            assert!(keyed, "a file location was not pooled under its key");
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
+        }
+
+        /// A pool key never prints a URL's password; a file key prints its name.
+        #[test]
+        fn a_pool_key_debug_never_prints_a_password() {
+            let url = "postgres://u:hunter2@h/d".to_owned();
+            for key in [PoolKey::Dsn(url.clone()), PoolKey::Operator(url)] {
+                let shown = format!("{key:?}");
+                assert!(!shown.contains("hunter2"), "{shown}");
+            }
+            let name = SqliteFileName::parse_under("x.db", crate::path_core::Regime::Unix);
+            assert!(name.is_ok(), "{name:?}");
+            let Ok(name) = name else { return };
+            let shown = format!(
+                "{:?}",
+                PoolKey::File {
+                    name,
+                    mode: FileMode::ReadExisting
+                }
+            );
+            assert!(shown.contains("x.db"), "{shown}");
+        }
     }
 }
 
@@ -16209,65 +16232,6 @@ mod like_prefix_tests {
     fn pattern_of(raw: &str) -> Result<String, LikePrefixError> {
         LikePrefix::parse(raw.to_string()).map(|p| p.like_pattern())
     }
-
-    /// One in-memory SQLite connection holding `names(name TEXT NULL)`.
-    #[allow(clippy::expect_used)] // test fixture: a failed in-memory setup is a broken test host
-    async fn names_db(rows: &[Option<&str>]) -> Db {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("connect in-memory sqlite");
-        sqlx::query("CREATE TABLE names (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NULL)")
-            .execute(&pool)
-            .await
-            .expect("create table");
-        for row in rows {
-            sqlx::query("INSERT INTO names (name) VALUES (?)")
-                .bind(*row)
-                .execute(&pool)
-                .await
-                .expect("insert row");
-        }
-        pool
-    }
-
-    /// The sorted `name` values `frag` selects from `names`.
-    async fn names_where(db: &Db, frag: SqlFragment) -> Result<Vec<String>, String> {
-        let found: IpeResult<String, Vec<RowCells>> =
-            db_find_where(db.clone(), "names".into(), frag).await;
-        match found {
-            IpeResult::Ok(rows) => {
-                let mut names: Vec<String> = rows
-                    .iter()
-                    .filter_map(|row| match row.get("name") {
-                        Some(IpeMaybe::Just(name)) => Some(name.clone()),
-                        Some(IpeMaybe::Nothing) | None => None,
-                    })
-                    .collect();
-                names.sort();
-                Ok(names)
-            }
-            IpeResult::Err(e) => Err(e),
-        }
-    }
-
-    const U11_ROWS: [Option<&str>; 13] = [
-        Some("Acme-1"),
-        Some("acme-2"),
-        Some("ACME"),
-        Some("50%off"),
-        Some("50 cents"),
-        Some("500"),
-        Some("a_b-x"),
-        Some("axb-y"),
-        Some("!bang"),
-        Some("!x"),
-        Some("a\\b"),
-        Some("ab"),
-        None,
-    ];
 
     #[test]
     fn like_prefix_refuses_empty_with_full_text() {
@@ -16364,111 +16328,12 @@ mod like_prefix_tests {
         assert!(frag.binds.is_empty());
     }
 
-    /// A prefix one byte past its ceiling fails the read with a
-    /// `LimitExceeded` error, on the read path and on the checked-write build
-    /// path alike; a prefix at the ceiling is accepted, and a NUL-bearing one
-    /// stays a plain refusal.
-    #[tokio::test]
-    async fn a_prefix_one_byte_past_its_ceiling_is_limit_exceeded() {
-        let db = names_db(&[Some("a")]).await;
-        let read = |prefix: String| {
-            let db = db.clone();
-            async move {
-                let frag = sql_starts_with(sql_column("name".to_string()), prefix);
-                match db_find_where::<IpeError>(db, "names".into(), frag).await {
-                    IpeResult::Ok(rows) => Ok(rows.len()),
-                    IpeResult::Err(e) => Err(e),
-                }
-            }
-        };
-        let too_long = "Sql.startsWith: the prefix is longer than 16384 bytes";
-        assert_eq!(
-            read("a".repeat(MAX_LIKE_PREFIX_BYTES + 1)).await,
-            Err(IpeError::limit_exceeded(format!(
-                "db.findWhere: {too_long}"
-            )))
-        );
-        assert_eq!(read("a".repeat(MAX_LIKE_PREFIX_BYTES)).await, Ok(0));
-        assert_eq!(
-            read("a\0".to_string()).await,
-            Err(IpeError::unexpected(
-                "db.findWhere: Sql.startsWith: the prefix contains a NUL character".to_owned()
-            ))
-        );
-        let poisoned = sql_starts_with(
-            sql_column("name".to_string()),
-            "a".repeat(MAX_LIKE_PREFIX_BYTES + 1),
-        );
-        let built = build_update_where_sql(
-            "names",
-            vec![("name".to_string(), Some(SqlParam::Int(1)))],
-            poisoned,
-        );
-        let refused = match built {
-            Err(e) => Some(build_refusal::<IpeError>("db.updateWhere", &e)),
-            Ok(_) => None,
-        };
-        assert_eq!(
-            refused,
-            Some(IpeError::limit_exceeded(format!(
-                "db.updateWhere: {too_long}"
-            )))
-        );
-    }
-
     #[test]
     fn text_prefix_equals_shape_is_the_tenant_shape() {
         assert_eq!(
             text_prefix_equals_sql("service_name"),
             "substr(service_name, 1, length(?)) = ?"
         );
-    }
-
-    #[tokio::test]
-    async fn starts_with_matches_the_literal_prefix_only() {
-        let db = names_db(&U11_ROWS).await;
-        let cases: [(&str, &[&str]); 8] = [
-            ("acme", &["acme-2"]),
-            ("50%", &["50%off"]),
-            ("a_b", &["a_b-x"]),
-            ("!b", &["!bang"]),
-            ("!x", &["!x"]),
-            ("a\\", &["a\\b"]),
-            ("ab", &["ab"]),
-            ("ACME", &["ACME"]),
-        ];
-        for (prefix, expected) in cases {
-            let exact = sql_starts_with(sql_column("name".to_string()), prefix.to_string());
-            let expected: Vec<String> = expected.iter().map(|s| (*s).to_string()).collect();
-            assert_eq!(
-                names_where(&db, exact).await,
-                Ok(expected.clone()),
-                "{prefix:?}"
-            );
-
-            // The LIKE conjunct alone may only widen by ASCII case, never by a
-            // wildcard: every row it keeps starts with the prefix up to case.
-            let pattern = match pattern_of(prefix) {
-                Ok(pattern) => pattern,
-                Err(refused) => panic!("{prefix:?}: {refused:?}"),
-            };
-            let like_only =
-                match names_where(&db, sql_like(sql_column("name".to_string()), pattern)).await {
-                    Ok(names) => names,
-                    Err(e) => panic!("{prefix:?}: {e:?}"),
-                };
-            let folded = prefix.to_ascii_lowercase();
-            assert!(
-                like_only
-                    .iter()
-                    .all(|name| name.to_ascii_lowercase().starts_with(folded.as_str())),
-                "{prefix:?} -> {like_only:?}"
-            );
-            assert!(
-                expected.iter().all(|name| like_only.contains(name)),
-                "{prefix:?}"
-            );
-        }
     }
 
     /// `Sql.like` sends one engine-independent text, `ESCAPE '\'`, to SQLite and
@@ -16497,31 +16362,193 @@ mod like_prefix_tests {
         assert_eq!(paired.binds, vec![text("a\\\\")]);
     }
 
-    #[tokio::test]
-    async fn like_pattern_with_backslash_matches_literal() {
-        let db = names_db(&[Some("a%x"), Some("abx"), Some("a\\x"), Some("a_x")]).await;
-        let column = || sql_column("name".to_string());
-        assert_eq!(
-            names_where(&db, sql_like(column(), "a\\%%".to_string())).await,
-            Ok(vec!["a%x".to_string()])
-        );
-        assert_eq!(
-            names_where(&db, sql_like(column(), "a\\_%".to_string())).await,
-            Ok(vec!["a_x".to_string()])
-        );
-        assert_eq!(
-            names_where(&db, sql_like(column(), "a\\\\%".to_string())).await,
-            Ok(vec!["a\\x".to_string()])
-        );
-        // Unescaped wildcards stay wildcards.
-        assert_eq!(
-            names_where(&db, sql_like(column(), "a_x".to_string())).await,
-            Ok(vec![
-                "a%x".to_string(),
-                "a\\x".to_string(),
-                "a_x".to_string(),
-                "abx".to_string()
-            ])
-        );
+    /// The tests that open a SQLite pool: compiled exactly when `Db` is a SQLite pool.
+    #[cfg(not(feature = "db-postgres"))]
+    mod sqlite_tests {
+        use super::*;
+
+        /// One in-memory SQLite connection holding `names(name TEXT NULL)`.
+        #[allow(clippy::expect_used)] // test fixture: a failed in-memory setup is a broken test host
+        async fn names_db(rows: &[Option<&str>]) -> Db {
+            let pool = crate::test_db::memory().await;
+            sqlx::query(
+                "CREATE TABLE names (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NULL)",
+            )
+            .execute(&pool)
+            .await
+            .expect("create table");
+            for row in rows {
+                sqlx::query("INSERT INTO names (name) VALUES (?)")
+                    .bind(*row)
+                    .execute(&pool)
+                    .await
+                    .expect("insert row");
+            }
+            pool
+        }
+
+        /// The sorted `name` values `frag` selects from `names`.
+        async fn names_where(db: &Db, frag: SqlFragment) -> Result<Vec<String>, String> {
+            let found: IpeResult<String, Vec<RowCells>> =
+                db_find_where(db.clone(), "names".into(), frag).await;
+            match found {
+                IpeResult::Ok(rows) => {
+                    let mut names: Vec<String> = rows
+                        .iter()
+                        .filter_map(|row| match row.get("name") {
+                            Some(IpeMaybe::Just(name)) => Some(name.clone()),
+                            Some(IpeMaybe::Nothing) | None => None,
+                        })
+                        .collect();
+                    names.sort();
+                    Ok(names)
+                }
+                IpeResult::Err(e) => Err(e),
+            }
+        }
+
+        const U11_ROWS: [Option<&str>; 13] = [
+            Some("Acme-1"),
+            Some("acme-2"),
+            Some("ACME"),
+            Some("50%off"),
+            Some("50 cents"),
+            Some("500"),
+            Some("a_b-x"),
+            Some("axb-y"),
+            Some("!bang"),
+            Some("!x"),
+            Some("a\\b"),
+            Some("ab"),
+            None,
+        ];
+
+        /// A prefix one byte past its ceiling fails the read with a
+        /// `LimitExceeded` error, on the read path and on the checked-write build
+        /// path alike; a prefix at the ceiling is accepted, and a NUL-bearing one
+        /// stays a plain refusal.
+        #[tokio::test]
+        async fn a_prefix_one_byte_past_its_ceiling_is_limit_exceeded() {
+            let db = names_db(&[Some("a")]).await;
+            let read = |prefix: String| {
+                let db = db.clone();
+                async move {
+                    let frag = sql_starts_with(sql_column("name".to_string()), prefix);
+                    match db_find_where::<IpeError>(db, "names".into(), frag).await {
+                        IpeResult::Ok(rows) => Ok(rows.len()),
+                        IpeResult::Err(e) => Err(e),
+                    }
+                }
+            };
+            let too_long = "Sql.startsWith: the prefix is longer than 16384 bytes";
+            assert_eq!(
+                read("a".repeat(MAX_LIKE_PREFIX_BYTES + 1)).await,
+                Err(IpeError::limit_exceeded(format!(
+                    "db.findWhere: {too_long}"
+                )))
+            );
+            assert_eq!(read("a".repeat(MAX_LIKE_PREFIX_BYTES)).await, Ok(0));
+            assert_eq!(
+                read("a\0".to_string()).await,
+                Err(IpeError::unexpected(
+                    "db.findWhere: Sql.startsWith: the prefix contains a NUL character".to_owned()
+                ))
+            );
+            let poisoned = sql_starts_with(
+                sql_column("name".to_string()),
+                "a".repeat(MAX_LIKE_PREFIX_BYTES + 1),
+            );
+            let built = build_update_where_sql(
+                "names",
+                vec![("name".to_string(), Some(SqlParam::Int(1)))],
+                poisoned,
+            );
+            let refused = match built {
+                Err(e) => Some(build_refusal::<IpeError>("db.updateWhere", &e)),
+                Ok(_) => None,
+            };
+            assert_eq!(
+                refused,
+                Some(IpeError::limit_exceeded(format!(
+                    "db.updateWhere: {too_long}"
+                )))
+            );
+        }
+
+        #[tokio::test]
+        async fn starts_with_matches_the_literal_prefix_only() {
+            let db = names_db(&U11_ROWS).await;
+            let cases: [(&str, &[&str]); 8] = [
+                ("acme", &["acme-2"]),
+                ("50%", &["50%off"]),
+                ("a_b", &["a_b-x"]),
+                ("!b", &["!bang"]),
+                ("!x", &["!x"]),
+                ("a\\", &["a\\b"]),
+                ("ab", &["ab"]),
+                ("ACME", &["ACME"]),
+            ];
+            for (prefix, expected) in cases {
+                let exact = sql_starts_with(sql_column("name".to_string()), prefix.to_string());
+                let expected: Vec<String> = expected.iter().map(|s| (*s).to_string()).collect();
+                assert_eq!(
+                    names_where(&db, exact).await,
+                    Ok(expected.clone()),
+                    "{prefix:?}"
+                );
+
+                // The LIKE conjunct alone may only widen by ASCII case, never by a
+                // wildcard: every row it keeps starts with the prefix up to case.
+                let pattern = match pattern_of(prefix) {
+                    Ok(pattern) => pattern,
+                    Err(refused) => panic!("{prefix:?}: {refused:?}"),
+                };
+                let like_only =
+                    match names_where(&db, sql_like(sql_column("name".to_string()), pattern)).await
+                    {
+                        Ok(names) => names,
+                        Err(e) => panic!("{prefix:?}: {e:?}"),
+                    };
+                let folded = prefix.to_ascii_lowercase();
+                assert!(
+                    like_only
+                        .iter()
+                        .all(|name| name.to_ascii_lowercase().starts_with(folded.as_str())),
+                    "{prefix:?} -> {like_only:?}"
+                );
+                assert!(
+                    expected.iter().all(|name| like_only.contains(name)),
+                    "{prefix:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn like_pattern_with_backslash_matches_literal() {
+            let db = names_db(&[Some("a%x"), Some("abx"), Some("a\\x"), Some("a_x")]).await;
+            let column = || sql_column("name".to_string());
+            assert_eq!(
+                names_where(&db, sql_like(column(), "a\\%%".to_string())).await,
+                Ok(vec!["a%x".to_string()])
+            );
+            assert_eq!(
+                names_where(&db, sql_like(column(), "a\\_%".to_string())).await,
+                Ok(vec!["a_x".to_string()])
+            );
+            assert_eq!(
+                names_where(&db, sql_like(column(), "a\\\\%".to_string())).await,
+                Ok(vec!["a\\x".to_string()])
+            );
+            // Unescaped wildcards stay wildcards.
+            assert_eq!(
+                names_where(&db, sql_like(column(), "a_x".to_string())).await,
+                Ok(vec![
+                    "a%x".to_string(),
+                    "a\\x".to_string(),
+                    "a_x".to_string(),
+                    "abx".to_string()
+                ])
+            );
+        }
     }
 }
