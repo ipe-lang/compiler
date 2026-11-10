@@ -434,6 +434,7 @@ impl RuntimeFeature {
 }
 
 /// Every runtime feature with its tokio projection, for the manifest seal.
+#[must_use]
 pub fn tokio_projection_table() -> Vec<(&'static str, TokioProjection)> {
     RuntimeFeature::ALL
         .iter()

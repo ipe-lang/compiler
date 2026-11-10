@@ -76,7 +76,9 @@ use std::path::Path;
 
 use ipe_backend::Backend;
 use ipe_backend_rust::crate_specs::{TOKIO_BASE_FEATURES, TokioFeature};
-use ipe_backend_rust::{RuntimeDep, RustBackend, TokioProjection, tokio_projection_table};
+use ipe_backend_rust::{
+    RuntimeContentId, RuntimeDep, RustBackend, TokioProjection, tokio_projection_table,
+};
 use ipe_diagnostics::DResult;
 use ipe_intern::Interner;
 use ipe_ir::{
@@ -1522,7 +1524,7 @@ fn time_program_cargo_toml(
     let backend = RustBackend::new(interner).with_target(target);
     let backend = if dep {
         backend.with_runtime_dep(Some(RuntimeDep {
-            root: e2e_support::require_runtime_crate(),
+            content: RuntimeContentId::from_digest_bytes([0; 16]),
         }))
     } else {
         backend
