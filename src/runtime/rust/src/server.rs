@@ -1609,8 +1609,6 @@ pub(crate) enum RequestRejection {
     /// The request method is no method the language knows ([`WireMethod`]):
     /// an extension token, or a known name in another case.
     MethodNotImplemented,
-    /// The request method is `TRACE` or `CONNECT`, which no route serves.
-    MethodNotRoutable,
 }
 
 impl RequestRejection {
@@ -1635,10 +1633,6 @@ impl RequestRejection {
             Self::MethodNotImplemented => {
                 (axum::http::StatusCode::NOT_IMPLEMENTED, "Not Implemented")
             }
-            Self::MethodNotRoutable => (
-                axum::http::StatusCode::METHOD_NOT_ALLOWED,
-                "Method Not Allowed",
-            ),
         }
     }
 
@@ -1985,11 +1979,10 @@ impl MountTable {
 /// router sees the request.
 ///
 /// The method is read once into the closed [`WireMethod`]: a method the
-/// language does not know is answered `501`, and `TRACE` or `CONNECT` `405`,
-/// before any router or handler sees the request, so no route (`ANY`
-/// included) is ever reached by a method outside [`RoutableMethod`]. The `405`
-/// names the methods its path serves in `Allow` when the listener carries an
-/// [`AllowOracle`] and the path is a handler's.
+/// language does not know is answered `501`, and `TRACE` or `CONNECT` is
+/// answered by [`unroutable_method`] before any router or handler sees the
+/// request, so no route (`ANY` included) is ever reached by a method outside
+/// [`RoutableMethod`].
 ///
 /// A malformed path or query is answered with the fixed 400 before routing, so
 /// an unrouted path and the fallback are refused alike; the 400 carries the
@@ -2003,20 +1996,23 @@ impl MountTable {
 #[derive(Clone)]
 pub(crate) struct CanonicalUrl<S> {
     inner: S,
-    allow: Option<AllowOracle>,
+    allow: AllowOracle,
 }
 
 impl<S> CanonicalUrl<S> {
-    /// The canonical-URL service in front of `inner`, with no `Allow` on a
-    /// refused method.
+    /// The canonical-URL service in front of `inner`, whose paths the oracle
+    /// knows nothing of: a refused method is answered `404` on every path.
     #[cfg(test)]
-    pub(crate) const fn new(inner: S) -> Self {
-        Self { inner, allow: None }
+    pub(crate) fn new(inner: S) -> Self {
+        Self {
+            inner,
+            allow: AllowOracle::nothing(),
+        }
     }
 
-    /// The canonical-URL service in front of `inner`, naming in `Allow` the
-    /// methods `allow` serves at a refused method's path.
-    pub(crate) const fn with_allow(inner: S, allow: Option<AllowOracle>) -> Self {
+    /// The canonical-URL service in front of `inner`, answering a refused
+    /// method by the methods `allow` serves at its path.
+    pub(crate) const fn with_allow(inner: S, allow: AllowOracle) -> Self {
         Self { inner, allow }
     }
 }
@@ -2033,54 +2029,346 @@ type CanonicalFuture<F> = futures_util::future::Either<
     F,
 >;
 
-/// The methods a listener's handler paths serve, asked for a refused
-/// method's `Allow`.
+/// The routable methods one path serves; never empty.
 ///
-/// A router with every handler's path and method set over a handler that
-/// never runs, so asking it reaches no Ipê code.
+/// Built from one method and grown by union, so no empty set exists. A set
+/// holding `GET` serves `HEAD` too (the router answers `HEAD` by the `GET`
+/// endpoint), and its [`MethodSet::not_allowed`] names both.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MethodSet {
+    /// A member, so the set is never empty.
+    first: RoutableMethod,
+    /// One bit per member ([`MethodSet::bit`]).
+    bits: u8,
+}
+
+impl PartialEq for MethodSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.bits == other.bits
+    }
+}
+
+impl Eq for MethodSet {}
+
+impl MethodSet {
+    /// `GET`, and with it `HEAD`.
+    pub(crate) const GET: Self = Self::of(RoutableMethod::Get);
+    /// `POST`.
+    #[cfg(feature = "web")]
+    pub(crate) const POST: Self = Self::of(RoutableMethod::Post);
+    /// Every routable method: what an author's "every method" serves, never
+    /// the router's every-method wildcard.
+    pub(crate) const ALL: Self = Self::of(RoutableMethod::Delete)
+        .or(Self::of(RoutableMethod::Get))
+        .or(Self::of(RoutableMethod::Head))
+        .or(Self::of(RoutableMethod::Options))
+        .or(Self::of(RoutableMethod::Patch))
+        .or(Self::of(RoutableMethod::Post))
+        .or(Self::of(RoutableMethod::Put));
+
+    /// The set of `method` alone.
+    pub(crate) const fn of(method: RoutableMethod) -> Self {
+        Self {
+            first: method,
+            bits: Self::bit(method),
+        }
+    }
+
+    /// The union of the two sets.
+    pub(crate) const fn or(self, other: Self) -> Self {
+        Self {
+            first: self.first,
+            bits: self.bits | other.bits,
+        }
+    }
+
+    /// The bit `method` holds in a set.
+    const fn bit(method: RoutableMethod) -> u8 {
+        match method {
+            RoutableMethod::Delete => 1,
+            RoutableMethod::Get => 1 << 1,
+            RoutableMethod::Head => 1 << 2,
+            RoutableMethod::Options => 1 << 3,
+            RoutableMethod::Patch => 1 << 4,
+            RoutableMethod::Post => 1 << 5,
+            RoutableMethod::Put => 1 << 6,
+        }
+    }
+
+    /// Whether the set's router entry answers `method`.
+    const fn serves(self, method: RoutableMethod) -> bool {
+        self.bits & Self::bit(method) != 0
+            || matches!(method, RoutableMethod::Head)
+                && self.bits & Self::bit(RoutableMethod::Get) != 0
+    }
+
+    /// The router's filter for exactly this set's members.
+    fn filter(self) -> axum::routing::MethodFilter {
+        RoutableMethod::ALL
+            .into_iter()
+            .filter(|method| self.bits & Self::bit(*method) != 0)
+            .fold(self.first.filter(), |filter, method| {
+                filter.or(method.filter())
+            })
+    }
+
+    /// The router entry serving `handler` for exactly this set, beside the
+    /// set it serves.
+    pub(crate) fn on<H, T, S>(self, handler: H) -> Endpoint<S>
+    where
+        H: axum::handler::Handler<T, S>,
+        T: 'static,
+        S: Clone + Send + Sync + 'static,
+    {
+        Endpoint {
+            methods: self,
+            router: axum::routing::on(self.filter(), handler),
+        }
+    }
+
+    /// The `Allow` value naming every method the set serves.
+    fn allow_names(self) -> String {
+        RoutableMethod::ALL
+            .into_iter()
+            .filter(|method| self.serves(*method))
+            .map(RoutableMethod::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The `405` for a method a path does not serve, its `Allow` naming this
+    /// set, with the response security headers.
+    ///
+    /// The only `405` a listener answers before routing, so none ships
+    /// without an `Allow`.
+    fn not_allowed(self) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let response = axum::http::HeaderValue::try_from(self.allow_names()).map_or_else(
+            |_| axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            |names| {
+                (
+                    axum::http::StatusCode::METHOD_NOT_ALLOWED,
+                    [(axum::http::header::ALLOW, names)],
+                    "Method Not Allowed",
+                )
+                    .into_response()
+            },
+        );
+        with_security_headers(response, response_security_headers())
+    }
+}
+
+impl From<EndpointMethod> for MethodSet {
+    fn from(method: EndpointMethod) -> Self {
+        match method {
+            EndpointMethod::One(method) => Self::of(method),
+            EndpointMethod::Any => Self::ALL,
+        }
+    }
+}
+
+/// One route's router entry and the [`MethodSet`] it serves, built together
+/// by [`MethodSet::on`] so the two never disagree.
+pub(crate) struct Endpoint<S = ()> {
+    methods: MethodSet,
+    router: axum::routing::MethodRouter<S>,
+}
+
+impl<S: Clone + Send + Sync + 'static> Endpoint<S> {
+    /// This endpoint with the request body capped at `bytes`.
+    #[cfg(feature = "web")]
+    pub(crate) fn body_limit(self, bytes: usize) -> Self {
+        Self {
+            methods: self.methods,
+            router: self
+                .router
+                .layer(axum::extract::DefaultBodyLimit::max(bytes)),
+        }
+    }
+}
+
+/// A listener's routes, each registered once for both the router and its
+/// [`AllowOracle`].
+///
+/// Every route enters through [`RouteTable::route`] or
+/// [`RouteTable::try_route`] as an [`Endpoint`], and every nested service as
+/// a [`ServedRouter`], so the oracle holds exactly the paths and methods the
+/// router serves.
+pub(crate) struct RouteTable<S = ()> {
+    router: axum::Router<S>,
+    paths: std::collections::BTreeMap<String, MethodSet>,
+    #[cfg(feature = "web")]
+    nested: Vec<(String, axum::Router)>,
+}
+
+impl<S: Clone + Send + Sync + 'static> RouteTable<S> {
+    /// The table with no route.
+    pub(crate) fn new() -> Self {
+        Self {
+            router: axum::Router::new(),
+            paths: std::collections::BTreeMap::new(),
+            #[cfg(feature = "web")]
+            nested: Vec::new(),
+        }
+    }
+
+    /// The table with `endpoint` at the router path `path`, a fixed path the
+    /// runtime spells.
+    #[cfg(feature = "web")]
+    pub(crate) fn route(mut self, path: &str, endpoint: Endpoint<S>) -> Self {
+        self.record(path, endpoint.methods);
+        self.router = self.router.route(path, endpoint.router);
+        self
+    }
+
+    /// The table with `endpoint` at the router path `path`, an author's
+    /// pattern the router may refuse.
+    ///
+    /// # Errors
+    ///
+    /// `RouterRejected` naming `refused` when the router refuses the insert.
+    fn try_route(
+        mut self,
+        path: &str,
+        endpoint: Endpoint<S>,
+        refused: RefusedText,
+    ) -> Result<Self, ServerStartRefusal> {
+        self.router = insert_endpoint(self.router, path, endpoint.router, refused)?;
+        self.record(path, endpoint.methods);
+        Ok(self)
+    }
+
+    /// The table with `served` handling every path below `path`.
+    #[cfg(feature = "web")]
+    pub(crate) fn nest_served(mut self, path: &str, served: ServedRouter) -> Self {
+        self.router = self.router.nest_service(path, served.router);
+        self.nested.push((path.to_owned(), served.allow.0));
+        self
+    }
+
+    /// Record that `path` serves `methods`, beside what it already serves.
+    fn record(&mut self, path: &str, methods: MethodSet) {
+        self.paths
+            .entry(path.to_owned())
+            .and_modify(|served| *served = served.or(methods))
+            .or_insert(methods);
+    }
+
+    /// The served router `finish` makes of the table's router, beside the
+    /// oracle over the same paths.
+    ///
+    /// The oracle's paths are the router's, which the router already
+    /// accepted together, so no oracle insert conflicts.
+    pub(crate) fn into_served(
+        self,
+        finish: impl FnOnce(axum::Router<S>) -> axum::Router,
+    ) -> ServedRouter {
+        let oracle = self
+            .paths
+            .into_iter()
+            .fold(axum::Router::new(), |oracle, (path, methods)| {
+                oracle.route(
+                    &path,
+                    axum::routing::any(move || async move { methods_answer(methods) }),
+                )
+            });
+        #[cfg(feature = "web")]
+        let oracle = self
+            .nested
+            .into_iter()
+            .fold(oracle, |oracle, (path, nested)| {
+                oracle.nest_service(&path, nested)
+            });
+        ServedRouter {
+            router: finish(self.router),
+            allow: AllowOracle(oracle),
+        }
+    }
+}
+
+/// The oracle's answer naming the `methods` a path serves.
+fn methods_answer(methods: MethodSet) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let mut answer = axum::http::StatusCode::NO_CONTENT.into_response();
+    answer.extensions_mut().insert(methods);
+    answer
+}
+
+/// The methods each path of a listener serves, asked when a request's method
+/// is one no route serves.
+///
+/// A router over the listener's paths, built beside the served router from
+/// the same [`RouteTable`] entries and mounts; each path answers its
+/// [`MethodSet`] and runs no Ipê code.
 #[derive(Clone)]
 pub(crate) struct AllowOracle(axum::Router);
 
 impl AllowOracle {
-    /// The `Allow` the router names for `request`'s path: present only when a
-    /// handler path matches and refuses the method.
-    async fn allow(self, request: axum::extract::Request) -> Option<axum::http::HeaderValue> {
+    /// The oracle of a router that serves no path.
+    #[cfg(any(test, feature = "web"))]
+    pub(crate) fn nothing() -> Self {
+        Self(axum::Router::new())
+    }
+
+    /// The oracle of a router serving `methods` on every path.
+    #[cfg(feature = "web")]
+    fn everywhere(methods: MethodSet) -> Self {
+        Self(axum::Router::new().fallback(move || async move { methods_answer(methods) }))
+    }
+
+    /// The oracle of a static-file mount over `dir`: `GET` and `HEAD` on
+    /// every path the static gate admits ([`static_admits`]), the same
+    /// judgement the file service's gate makes.
+    fn static_files(dir: std::path::PathBuf) -> Self {
+        Self(
+            axum::Router::new().fallback(move |req: axum::extract::Request| {
+                let admitted = static_admits(&req, &dir, crate::path_core::HOST);
+                async move {
+                    if admitted {
+                        methods_answer(MethodSet::GET)
+                    } else {
+                        use axum::response::IntoResponse;
+                        axum::http::StatusCode::NOT_FOUND.into_response()
+                    }
+                }
+            }),
+        )
+    }
+
+    /// The methods the listener serves at `request`'s path; `None` when no
+    /// route or mount serves it.
+    async fn methods_at(self, request: axum::extract::Request) -> Option<MethodSet> {
         use tower::ServiceExt;
         let response = match self.0.oneshot(request).await {
             Ok(response) => response,
             Err(never) => match never {},
         };
-        if response.status() == axum::http::StatusCode::METHOD_NOT_ALLOWED {
-            response.headers().get(axum::http::header::ALLOW).cloned()
-        } else {
-            None
-        }
+        response.extensions().get::<MethodSet>().copied()
     }
 }
 
-/// The `405` for a `TRACE` or `CONNECT` request, with the `Allow` its path's
-/// handlers name, if any; the request reaches no handler.
+/// The answer to a `TRACE` or `CONNECT` request, which reaches no handler.
 ///
-/// Only an origin-form target (a path) names a resource, so an
-/// authority-form `CONNECT` target is answered with no `Allow`.
+/// On a path the listener serves, the `405` naming its methods in `Allow`;
+/// on a path nothing serves, the `404` any method gets there. An
+/// authority-form `CONNECT` target names no path, so it is answered `404`.
 async fn unroutable_method(
     mut request: axum::extract::Request,
-    allow: Option<AllowOracle>,
+    allow: AllowOracle,
 ) -> Result<axum::response::Response, std::convert::Infallible> {
-    let origin_form = request.uri().path().starts_with('/');
-    let named = match (origin_form, allow) {
-        (true, Some(oracle)) if canonicalise(&mut request).is_ok() => oracle.allow(request).await,
-        _ => None,
-    };
-    let mut response = RequestRejection::MethodNotRoutable.refused();
-    if let Some(methods) = named
-        && response.status() == axum::http::StatusCode::METHOD_NOT_ALLOWED
-    {
-        response
-            .headers_mut()
-            .insert(axum::http::header::ALLOW, methods);
+    use axum::response::IntoResponse;
+    if request.uri().path().starts_with('/') {
+        if let Err(rejection) = canonicalise(&mut request) {
+            return Ok(rejection.refused());
+        }
+        if let Some(methods) = allow.methods_at(request).await {
+            return Ok(methods.not_allowed());
+        }
     }
-    Ok(response)
+    Ok(with_security_headers(
+        axum::http::StatusCode::NOT_FOUND.into_response(),
+        response_security_headers(),
+    ))
 }
 
 impl<S> tower::Service<axum::extract::Request> for CanonicalUrl<S>
@@ -2721,11 +3009,21 @@ fn to_axum_response_with(
 }
 
 /// The router entry serving `h` for `method` at `pattern`.
+#[cfg(test)]
 fn method_router(
     method: EndpointMethod,
     pattern: crate::encoding::ServerPattern,
     h: ErasedHandler,
 ) -> axum::routing::MethodRouter {
+    handler_endpoint(method, pattern, h).router
+}
+
+/// The endpoint serving `h` for `method` at `pattern`.
+fn handler_endpoint(
+    method: EndpointMethod,
+    pattern: crate::encoding::ServerPattern,
+    h: ErasedHandler,
+) -> Endpoint {
     use axum::response::IntoResponse;
     let pattern = Arc::new(pattern);
     let svc = move |req: axum::extract::Request| {
@@ -2763,7 +3061,7 @@ fn method_router(
             scoped.await
         }
     };
-    axum::routing::on(method.filter(), svc)
+    MethodSet::from(method).on(svc)
 }
 
 impl RoutableMethod {
@@ -2778,23 +3076,6 @@ impl RoutableMethod {
             Self::Patch => F::PATCH,
             Self::Post => F::POST,
             Self::Put => F::PUT,
-        }
-    }
-}
-
-impl EndpointMethod {
-    /// The router's filter for this method set: `Any` is the union of every
-    /// routable method, never the router's every-method wildcard.
-    fn filter(self) -> axum::routing::MethodFilter {
-        match self {
-            Self::One(method) => method.filter(),
-            // Seeded with one member of the set, so the union is over the set
-            // alone (a filter is never empty).
-            Self::Any => RoutableMethod::ALL
-                .into_iter()
-                .fold(RoutableMethod::Get.filter(), |set, method| {
-                    set.or(method.filter())
-                }),
         }
     }
 }
@@ -3130,12 +3411,12 @@ compile_error!(
 /// # Errors
 ///
 /// `RouterRejected` when the router panics on the insert.
-fn insert_endpoint(
-    app: axum::Router,
+fn insert_endpoint<S: Clone + Send + Sync + 'static>(
+    app: axum::Router<S>,
     path: &str,
-    mr: axum::routing::MethodRouter,
+    mr: axum::routing::MethodRouter<S>,
     endpoint: RefusedText,
-) -> Result<axum::Router, ServerStartRefusal> {
+) -> Result<axum::Router<S>, ServerStartRefusal> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || app.route(path, mr)))
         .map_err(|_| ServerStartRefusal::RouterRejected { endpoint })
 }
@@ -3301,21 +3582,92 @@ pub(crate) async fn serve_app(
     stop_after_serve(&armed, served).await
 }
 
-/// The router an app listener serves, and the methods its handler paths
-/// serve for a refused method's `Allow`.
-pub(crate) struct ServedRouter {
+/// The router an app listener serves, beside the [`AllowOracle`] over the
+/// same paths.
+///
+/// Built only from a [`RouteTable`], a static-file mount, a fail-closed
+/// fallback, or mounts of these, so every served path is the oracle's too.
+pub struct ServedRouter {
     router: axum::Router,
-    allow: Option<AllowOracle>,
+    allow: AllowOracle,
 }
 
+#[cfg(test)]
 impl From<axum::Router> for ServedRouter {
-    /// A router whose refused methods name no `Allow`.
+    /// A router whose paths the oracle knows nothing of: a refused method is
+    /// answered `404` on every path.
     fn from(router: axum::Router) -> Self {
         Self {
             router,
-            allow: None,
+            allow: AllowOracle::nothing(),
         }
     }
+}
+
+impl ServedRouter {
+    /// A router serving no path.
+    #[cfg(feature = "web")]
+    pub(crate) fn nothing() -> Self {
+        Self {
+            router: axum::Router::new(),
+            allow: AllowOracle::nothing(),
+        }
+    }
+
+    /// The static files under `dir`, behind the strict URL and static path
+    /// gates ([`strict_serve_dir`]).
+    pub(crate) fn static_files(dir: std::path::PathBuf) -> Self {
+        Self {
+            router: axum::Router::new().fallback_service(strict_serve_dir(dir.clone())),
+            allow: AllowOracle::static_files(dir),
+        }
+    }
+
+    /// A router answering every method on every path with `handler`.
+    #[cfg(feature = "web")]
+    pub(crate) fn answering_everywhere<H, T>(handler: H) -> Self
+    where
+        H: axum::handler::Handler<T, ()>,
+        T: 'static,
+    {
+        Self {
+            router: axum::Router::new().fallback(handler),
+            allow: AllowOracle::everywhere(MethodSet::ALL),
+        }
+    }
+
+    /// This router with `mounts` serving every request no route of it
+    /// matches, through one [`MountTable`] for the router and one for the
+    /// oracle.
+    #[cfg(feature = "web")]
+    pub(crate) fn below_mounts(self, mounts: Vec<(crate::encoding::MountBase, Self)>) -> Self {
+        let (routers, oracles) = split_mounts(mounts);
+        Self {
+            router: MountTable::new(routers).below(self.router),
+            allow: AllowOracle(MountTable::new(oracles).below(self.allow.0)),
+        }
+    }
+
+    /// The served router, for a test that drives it below its own prefix.
+    #[cfg(test)]
+    pub(crate) fn into_router(self) -> axum::Router {
+        self.router
+    }
+}
+
+/// The routers and the oracles of `mounts`, each beside its prefix, in one
+/// order.
+type SplitMounts = (
+    Vec<(crate::encoding::MountBase, axum::Router)>,
+    Vec<(crate::encoding::MountBase, axum::Router)>,
+);
+
+/// Split `mounts` into its routers and its oracles.
+fn split_mounts(mounts: Vec<(crate::encoding::MountBase, ServedRouter)>) -> SplitMounts {
+    mounts
+        .into_iter()
+        .map(|(base, served)| ((base.clone(), served.router), (base, served.allow.0)))
+        .unzip()
 }
 
 /// Run `serve` until it ends, or until the drain plus what is left of the
@@ -3491,16 +3843,15 @@ pub(crate) fn exposure_warning(host: crate::app_config::ListenHost) -> Option<[S
 /// included, behind the handlers through one [`MountTable`] fallback, never a
 /// router nest.
 ///
-/// Beside it, the [`AllowOracle`] over the same handler paths and method sets.
+/// Beside it, the [`AllowOracle`] over the same handler paths, method sets
+/// and mounts: the handlers enter one [`RouteTable`], and the router and the
+/// oracle each serve one table over the same mount list.
 ///
 /// # Errors
 ///
 /// `RouterRejected` when the router refuses a handler insert.
-async fn listener_routes(
-    routes: Vec<ParsedRoute>,
-) -> Result<(axum::Router, AllowOracle), ServerStartRefusal> {
-    let mut app: axum::Router = axum::Router::new();
-    let mut allow: axum::Router = axum::Router::new();
+async fn listener_routes(routes: Vec<ParsedRoute>) -> Result<ServedRouter, ServerStartRefusal> {
+    let mut handlers = RouteTable::new();
     let mut mounts = Vec::new();
     // The bases of the mounted web apps: the only prefixes below which a
     // worker script fetch may pass the listener's worker gate.
@@ -3509,19 +3860,16 @@ async fn listener_routes(
     for r in routes {
         match r.target {
             ParsedTarget::Static(base, dir) => {
-                let files = axum::Router::new()
-                    .fallback_service(strict_serve_dir(std::path::PathBuf::from(dir)));
-                mounts.push((base, files));
+                mounts.push((
+                    base,
+                    ServedRouter::static_files(std::path::PathBuf::from(dir)),
+                ));
             }
             ParsedTarget::Handler(method, pattern, h) => {
                 let endpoint = quoted_endpoint(method.as_str(), &r.path);
                 let path = pattern.router_path().to_owned();
-                let named = axum::routing::on(method.filter(), || async {
-                    axum::http::StatusCode::METHOD_NOT_ALLOWED
-                });
-                allow = insert_endpoint(allow, &path, named, endpoint.clone())?;
-                let mr = method_router(method, pattern, h);
-                app = insert_endpoint(app, &path, mr, endpoint)?;
+                handlers =
+                    handlers.try_route(&path, handler_endpoint(method, pattern, h), endpoint)?;
             }
             // `Server.mountApp`: build the embedded web app's router for its
             // parsed base and serve it below that prefix on this same
@@ -3547,10 +3895,12 @@ async fn listener_routes(
     let mounted_workers = AdmittedWorkerPaths::of_bases(&worker_bases);
     #[cfg(not(feature = "web"))]
     let mounted_workers = AdmittedWorkerPaths::none();
-    Ok((
-        worker_gated(app, mounts, mounted_workers),
-        AllowOracle(allow),
-    ))
+    let handlers = handlers.into_served(|router| router);
+    let (routers, oracles) = split_mounts(mounts);
+    Ok(ServedRouter {
+        router: worker_gated(handlers.router, routers, mounted_workers),
+        allow: AllowOracle(MountTable::new(oracles).below(handlers.allow.0)),
+    })
 }
 
 /// The listener's router over `routes`, parsed, conflict-checked and
@@ -3565,8 +3915,7 @@ pub(crate) async fn listen_router(routes: Vec<ServerRoute>) -> Option<axum::Rout
     {
         return None;
     }
-    let (router, allow) = listener_routes(routes).await.ok()?;
-    Some(axum::Router::new().fallback_service(CanonicalUrl::with_allow(router, Some(allow))))
+    Some(behind_listener(listener_routes(routes).await.ok()?))
 }
 
 pub fn server_listen<E: crate::FromIpeError + Send + 'static>(
@@ -3625,7 +3974,7 @@ pub fn server_listen<E: crate::FromIpeError + Send + 'static>(
                 "Server.listen: {refusal}"
             ))));
         }
-        let (app, allow) = match listener_routes(routes).await {
+        let ServedRouter { router: app, allow } = match listener_routes(routes).await {
             Ok(served) => served,
             Err(refusal) => return refuse(refusal),
         };
@@ -3717,10 +4066,7 @@ pub fn server_listen<E: crate::FromIpeError + Send + 'static>(
         };
         // `serve_app` serves with connect-info, so each request carries the peer
         // `SocketAddr` (`ServerRequest.remoteAddr`, per-IP rate limiting).
-        let served = ServedRouter {
-            router: app,
-            allow: Some(allow),
-        };
+        let served = ServedRouter { router: app, allow };
         match serve_app(listener, served, armed).await {
             Ok(shutdown::Stopped { .. }) => ok_res(()),
             Err(e) => IpeResult::Err(E::from_ipe_error(IpeError::io(format!(
@@ -6539,8 +6885,9 @@ mod tests {
     #[allow(clippy::expect_used)] // test: the fixed routes parse and assemble
     async fn served(routes: Vec<ServerRoute>) -> CanonicalUrl<axum::Router> {
         let parsed = parse_routes(routes).expect("the routes parse");
-        let (router, allow) = listener_routes(parsed).await.expect("the routes assemble");
-        CanonicalUrl::with_allow(router, Some(allow))
+        let ServedRouter { router, allow } =
+            listener_routes(parsed).await.expect("the routes assemble");
+        CanonicalUrl::with_allow(router, allow)
     }
 
     /// The listener's answer to one `method` request for `uri`.
@@ -6571,11 +6918,34 @@ mod tests {
             .all(|(name, _)| resp.headers().contains_key(*name))
     }
 
+    /// The `Allow` header of `resp`, when it carries one.
+    fn allow_of(resp: &axum::response::Response) -> Option<String> {
+        resp.headers()
+            .get(axum::http::header::ALLOW)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    }
+
+    /// Whether `resp` is a `405` naming exactly `methods` in `Allow`, with
+    /// the security headers.
+    fn refuses_naming(resp: &axum::response::Response, methods: &str) -> bool {
+        resp.status() == axum::http::StatusCode::METHOD_NOT_ALLOWED
+            && allow_of(resp).as_deref() == Some(methods)
+            && carries_security_headers(resp)
+    }
+
+    /// Whether `resp` is a `404` with the security headers and no `Allow`.
+    fn finds_nothing(resp: &axum::response::Response) -> bool {
+        resp.status() == axum::http::StatusCode::NOT_FOUND
+            && allow_of(resp).is_none()
+            && carries_security_headers(resp)
+    }
+
     /// Prove the refusals: `TRACE` and `CONNECT` reach no handler, `ANY`
-    /// included. Each is answered `405` with the security headers before any
-    /// router runs; on a handler path `Allow` names the methods it serves,
-    /// never `TRACE` or `CONNECT`, and a `CONNECT` in authority form names
-    /// none.
+    /// included. On a served path each is answered `405` with the security
+    /// headers before any router runs, and `Allow` names the methods it
+    /// serves, never `TRACE` or `CONNECT`. A path nothing serves, and a
+    /// `CONNECT` in authority form, are answered `404`.
     #[tokio::test]
     async fn trace_and_connect_never_reach_a_handler() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -6585,37 +6955,63 @@ mod tests {
             target: RouteTarget::Handler(Ok(EndpointMethod::Any), counting_handler(&runs)),
         }])
         .await;
-        for (method, uri, names_allow) in [
-            ("TRACE", "/", true),
-            ("CONNECT", "/", true),
-            ("CONNECT", "example.com:443", false),
-            ("TRACE", "/unrouted", false),
-        ] {
-            let resp = answer_method(&app, method, uri).await;
-            assert_eq!(
+        for method in ["TRACE", "CONNECT"] {
+            let resp = answer_method(&app, method, "/").await;
+            assert!(
+                refuses_naming(&resp, "DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT"),
+                "{method}: {:?} {:?}",
                 resp.status(),
-                axum::http::StatusCode::METHOD_NOT_ALLOWED,
-                "{method} {uri}"
+                allow_of(&resp)
             );
-            assert!(carries_security_headers(&resp), "{method} {uri}");
-            let allow = resp
-                .headers()
-                .get(axum::http::header::ALLOW)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned);
-            assert_eq!(allow.is_some(), names_allow, "{method} {uri}: {allow:?}");
-            if let Some(allow) = allow {
-                assert!(allow.contains("GET") && allow.contains("POST"), "{allow}");
-                assert!(
-                    !allow.contains("TRACE") && !allow.contains("CONNECT"),
-                    "{allow}"
-                );
-            }
+        }
+        for (method, uri) in [("CONNECT", "example.com:443"), ("TRACE", "/unrouted")] {
+            let resp = answer_method(&app, method, uri).await;
+            assert!(finds_nothing(&resp), "{method} {uri}: {:?}", resp.status());
         }
         assert_eq!(runs.load(Ordering::SeqCst), 0);
         let reached = answer_method(&app, "GET", "/").await;
         assert_eq!(reached.status(), axum::http::StatusCode::OK);
         assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    /// Prove the refusals: a `TRACE` on a static mount names the `GET` and
+    /// `HEAD` it serves, beside a handler path naming its own; a path no route
+    /// or mount serves is answered `404`. No handler runs.
+    #[tokio::test]
+    #[allow(clippy::expect_used)] // test: the fixture file writes
+    async fn trace_on_a_static_mount_names_get_head() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = static_fixture_dir("trace-static");
+        std::fs::write(dir.join("hello.txt"), "hello").expect("the fixture file writes");
+        let runs = Arc::new(AtomicUsize::new(0));
+        let app = served(vec![
+            ServerRoute {
+                path: "/api".to_owned(),
+                target: RouteTarget::Handler(
+                    Ok(EndpointMethod::One(RoutableMethod::Get)),
+                    counting_handler(&runs),
+                ),
+            },
+            server_static("/assets".to_owned(), dir.to_string_lossy().into_owned()),
+        ])
+        .await;
+        for uri in ["/assets/hello.txt", "/api"] {
+            let resp = answer_method(&app, "TRACE", uri).await;
+            assert!(
+                refuses_naming(&resp, "GET, HEAD"),
+                "{uri}: {:?} {:?}",
+                resp.status(),
+                allow_of(&resp)
+            );
+        }
+        for uri in ["/elsewhere", "/"] {
+            let resp = answer_method(&app, "TRACE", uri).await;
+            assert!(finds_nothing(&resp), "{uri}: {:?}", resp.status());
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        let file = answer_method(&app, "GET", "/assets/hello.txt").await;
+        assert_eq!(file.status(), axum::http::StatusCode::OK);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Prove the refusals: an `ANY` route serves the seven routable methods

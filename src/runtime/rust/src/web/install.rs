@@ -213,15 +213,15 @@ fn asset_response(content_type: &'static str, body: axum::body::Body) -> axum::r
 /// once per mounted app and shared by every answer through [`Bytes`].
 ///
 /// [`Bytes`]: axum::body::Bytes
-pub fn mount_routes<S>(
-    router: axum::Router<S>,
+pub(crate) fn mount_routes<S>(
+    router: crate::server::RouteTable<S>,
     offer: Option<&'static InstallOffer>,
     base: &MountBase,
-) -> axum::Router<S>
+) -> crate::server::RouteTable<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    use axum::routing::get;
+    use crate::server::MethodSet;
     let Some(offer) = offer else {
         return router;
     };
@@ -231,14 +231,15 @@ where
     router
         .route(
             &route_root.url_of(offer.manifest_path()),
-            get(move || {
+            MethodSet::GET.on(move || {
                 let manifest = manifest.clone();
                 async move { asset_response(MANIFEST_CONTENT_TYPE, manifest.into()) }
             }),
         )
         .route(
             &route_root.url_of(offer.icon_path()),
-            get(move || async move { asset_response(ICON_CONTENT_TYPE, icon.into()) }),
+            MethodSet::GET
+                .on(move || async move { asset_response(ICON_CONTENT_TYPE, icon.into()) }),
         )
 }
 

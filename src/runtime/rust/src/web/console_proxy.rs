@@ -549,14 +549,20 @@ pub(crate) async fn ensure_console_proxy(mount: &super::MountContext) -> bool {
 /// so this composes into the main `Router<WebState<…>>` before `with_state`,
 /// keeping the proxy under the same `track` middleware as every other route.
 /// Call only when `ensure_console_proxy().await` returned `true`.
-pub fn proxy_routes<S>(router: axum::Router<S>) -> axum::Router<S>
+///
+/// The proxy serves every routable method, never the router's every-method
+/// wildcard, so its paths name their methods in `Allow` like every route.
+pub(crate) fn proxy_routes<S>(router: crate::server::RouteTable<S>) -> crate::server::RouteTable<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    use axum::routing::any;
+    use crate::server::MethodSet;
     router
-        .route(CONSOLE_BASE, any(proxy_entry))
-        .route(&format!("{CONSOLE_BASE}/{{*rest}}"), any(proxy_entry))
+        .route(CONSOLE_BASE, MethodSet::ALL.on(proxy_entry))
+        .route(
+            &format!("{CONSOLE_BASE}/{{*rest}}"),
+            MethodSet::ALL.on(proxy_entry),
+        )
 }
 
 #[cfg(test)]
@@ -571,7 +577,9 @@ mod tests {
     #[allow(clippy::expect_used)] // test: fixed requests build
     async fn proxy_routes_cover_the_console_base_and_beneath_it() {
         use tower::ServiceExt;
-        let app = crate::server::behind_listener(proxy_routes(axum::Router::new()));
+        let app = crate::server::behind_listener(
+            proxy_routes(crate::server::RouteTable::new()).into_served(|router| router),
+        );
         for (path, routed) in [
             ("/_ipe/console", true),
             ("/_ipe/console/api/x", true),

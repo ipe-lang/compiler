@@ -153,14 +153,15 @@ const API_ROUTES: &[ApiRoute] = &[
 
 /// Mount the in-process console: the [`console_html`] shell at
 /// `/_ipe/console` and every [`API_ROUTES`] endpoint.
-pub(super) fn mount_inline<S>(router: axum::Router<S>) -> axum::Router<S>
+pub(super) fn mount_inline<S>(router: crate::server::RouteTable<S>) -> crate::server::RouteTable<S>
 where
     S: Clone + Send + Sync + 'static,
 {
+    use crate::server::MethodSet;
     API_ROUTES.iter().fold(
-        router.route("/_ipe/console", axum::routing::get(console_html)),
+        router.route("/_ipe/console", MethodSet::GET.on(console_html)),
         |router, &(path, body)| {
-            router.route(path, axum::routing::get(move || async move { body() }))
+            router.route(path, MethodSet::GET.on(move || async move { body() }))
         },
     )
 }
