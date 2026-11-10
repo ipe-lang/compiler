@@ -413,14 +413,23 @@ pub(crate) async fn checkout<DB: sqlx::Database>(
 
 /// Run `op` on its own task to its end, even when the caller is dropped first.
 ///
-/// A task the runtime cancelled reads as a closed pool; a panicked one as a
-/// crashed driver.
+/// A task the runtime cancelled, or could not start, reads as a closed pool;
+/// a panicked one as a crashed driver.
 async fn shielded<T: Send + 'static>(
     op: impl std::future::Future<Output = Result<T, sqlx::Error>> + Send + 'static,
 ) -> Result<T, sqlx::Error> {
-    match tokio::spawn(op).await {
+    let Ok(task) = crate::threads::spawn_task(
+        "pool checkout",
+        crate::threads::TaskScope::RuntimeOwned("a pool operation runs no Ipê code"),
+        op,
+    ) else {
+        return Err(sqlx::Error::PoolClosed);
+    };
+    match task.join_shielded().await {
         Ok(done) => done,
-        Err(join) if join.is_cancelled() => Err(sqlx::Error::PoolClosed),
+        Err(crate::threads::Unjoined::Ended(ended)) if ended.is_cancelled() => {
+            Err(sqlx::Error::PoolClosed)
+        }
         Err(_) => Err(sqlx::Error::WorkerCrashed),
     }
 }
@@ -2815,13 +2824,19 @@ impl Default for OwnedPools {
 
 /// Close `pools` concurrently, each under `deadline`, logging the late ones.
 async fn close_within(pools: Vec<OwnedEntry>, deadline: std::time::Duration) {
-    let mut closing = tokio::task::JoinSet::new();
+    let mut closing = crate::threads::IpeJoinSet::new("pool close");
+    let mut late: usize = 0;
     for (_, pool) in pools {
         let close = pool.close_owned();
-        closing.spawn(async move { tokio::time::timeout(deadline, close).await.is_ok() });
+        let started = closing.start(
+            crate::threads::TaskScope::RuntimeOwned("a pool close at exit serves no caller"),
+            async move { tokio::time::timeout(deadline, close).await.is_ok() },
+        );
+        if started.is_err() {
+            late = late.saturating_add(1);
+        }
     }
-    let mut late: usize = 0;
-    while let Some(closed) = closing.join_next().await {
+    while let Some(closed) = closing.next_joined().await {
         if !matches!(closed, Ok(true)) {
             late = late.saturating_add(1);
         }

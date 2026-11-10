@@ -891,7 +891,8 @@ pub enum CloseReason {
     OverCeiling,
     /// Its bound credentials no longer stand.
     Revoked,
-    /// Its render history cannot mint another epoch.
+    /// Its render history cannot mint another epoch, or its driver or a Cmd
+    /// it started tripped or panicked.
     Ended,
 }
 
@@ -2876,13 +2877,23 @@ fn dispatch_cmd<Msg: Send + 'static>(
         IpeCmd::Perform(body) => match cmd_admission::admit(body, cmds) {
             cmd_admission::Admit::Run(cmd) => {
                 let tx = tx.clone();
-                tokio::spawn(scope.clone().scoped(async move {
-                    // Bounded send: the Msg waits for queue room, and is
-                    // dropped with a warn once the session queue is closed.
-                    if let Some(line) = finished_line(&cmd.finish(&tx).await) {
-                        crate::system::emit_runtime_log("live", line);
-                    }
-                }));
+                let started = crate::threads::spawn_task(
+                    "session Cmd",
+                    crate::threads::TaskScope::RuntimeOwned(
+                        "a Cmd runs in its session's scope, which it carries",
+                    ),
+                    scope.clone().scoped(async move {
+                        // Bounded send: the Msg waits for queue room, and is
+                        // dropped with a warn once the session queue is closed.
+                        if let Some(line) = finished_line(&cmd.finish(&tx).await) {
+                            crate::system::emit_runtime_log("live", line);
+                        }
+                    }),
+                );
+                match started {
+                    Ok(task) => task.detach(crate::threads::Detached::IpeOwned(cmds.ends())),
+                    Err(refused) => crate::system::emit_runtime_log("live", &refused.to_string()),
+                }
             }
             cmd_admission::Admit::Refused(msg) => cmd_admission::deliver_refusal(msg, tx, cmds),
         },
@@ -3164,6 +3175,62 @@ async fn take_input<Model, Msg, T>(
     .await
 }
 
+/// The 500 a session publication answers when it panicked or tripped.
+#[cfg(feature = "web")]
+fn publication_500(payload: &(dyn std::any::Any + Send)) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        crate::core::panic_500_body(payload),
+    )
+        .into_response()
+}
+
+/// Leave the session `driver` running, joined by a runtime-owned joiner: a
+/// trip or a panic in it is logged and closes the session.
+#[cfg(feature = "web")]
+fn join_driver<Model, Msg>(
+    driver: crate::threads::TaskHandle<()>,
+    store: Arc<dyn store::SessionStore<Model, Msg>>,
+    sid: String,
+    entry: Weak<Mutex<SessionEntry<Model, Msg>>>,
+) where
+    Model: Send + 'static,
+    Msg: Send + 'static,
+{
+    let joiner = crate::threads::spawn_task(
+        "session driver join",
+        crate::threads::TaskScope::RuntimeOwned(
+            "a session driver outlives the request that opened it",
+        ),
+        async move {
+            let Err(unjoined) = driver.join_contained().await else {
+                return;
+            };
+            let error = match unjoined {
+                crate::threads::Unjoined::Trip(fault) => fault.to_ipe_error(),
+                crate::threads::Unjoined::Ended(ended) => {
+                    ended.into_error::<crate::error::IpeError>("session driver")
+                }
+            };
+            crate::system::emit_runtime_log(
+                "live",
+                &format!(
+                    "the session driver ended: {}",
+                    crate::ipe_error_message(error)
+                ),
+            );
+            close_session(&store, &sid, entry.upgrade().as_ref(), CloseReason::Ended).await;
+        },
+    );
+    if let Ok(joiner) = joiner {
+        joiner.detach(crate::threads::Detached::NoIpeCode(
+            "it joins the session driver and closes the session on its failure",
+        ));
+    }
+}
+
 /// The per-session driver: folds each Msg through `update`, diffs the new view
 /// against the last, pushes patches over SSE (if attached), runs the resulting
 /// Cmd, and re-evaluates subscriptions.
@@ -3221,6 +3288,10 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
     FSubs: Fn(Model) -> IpeSub<Msg> + Send + Sync + 'static,
 {
     let sid = scope.sid().to_owned();
+    // The session's Cmd tasks deliver a trip or a panic here; one ends the session.
+    let Ok(cmd_ends) = cmds.ends().owner() else {
+        return;
+    };
     // One keyed subscription runtime per session: a re-evaluation keeps a
     // still-requested `Sub.every` timer and its phase.
     let mut sub_runtime = SubRuntime::new(msg_tx.clone());
@@ -3359,6 +3430,17 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
                     break;
                 }
                 continue;
+            }
+            end = cmd_ends.ended() => {
+                crate::system::emit_runtime_log(
+                    "live",
+                    &format!(
+                        "a Cmd ended its session: {}",
+                        crate::ipe_error_message(end.to_ipe_error())
+                    ),
+                );
+                close_session(&store, &sid, entry.upgrade().as_ref(), CloseReason::Ended).await;
+                break;
             }
         };
         // Upgrade for THIS iteration only; drop `strong` before the next select!
@@ -5715,61 +5797,86 @@ mod handlers {
         let Ok(work) = drain.work() else {
             return entry_unavailable();
         };
-        let commit = tokio::spawn(under_work(work, async move {
-            let sid = owner.sid();
-            let installed = store.set(sid, entry.clone()).await;
-            match installed {
-                store::Installed::Held => {}
-                // A fresh handle never diverges; were it to, the session is
-                // held live and published like a held one.
-                store::Installed::Diverged(_) => StoreWriteFailure::SetDiverged.count(),
-                store::Installed::Refused(_) => {
-                    StoreWriteFailure::SetRefused.count();
-                    drop(owner);
-                    return installed;
+        let commit = crate::threads::spawn_task(
+            "session publication",
+            crate::threads::TaskScope::RuntimeOwned(
+                "a session's publication outlives the request that opened it",
+            ),
+            under_work(work, async move {
+                let sid = owner.sid();
+                let installed = store.set(sid, entry.clone()).await;
+                match installed {
+                    store::Installed::Held => {}
+                    // A fresh handle never diverges; were it to, the session is
+                    // held live and published like a held one.
+                    store::Installed::Diverged(_) => StoreWriteFailure::SetDiverged.count(),
+                    store::Installed::Refused(_) => {
+                        StoreWriteFailure::SetRefused.count();
+                        drop(owner);
+                        return installed;
+                    }
+                    store::Installed::Displaced => {
+                        drop(owner);
+                        return installed;
+                    }
                 }
-                store::Installed::Displaced => {
-                    drop(owner);
-                    return installed;
+                // The life's port endpoints open now the store holds this session,
+                // before the driver or the seed Cmd can reach them. The life is
+                // recorded on the entry under its lock, the lock an attach binds
+                // under, so an attach binds into this life or none.
+                let port_lease = {
+                    let mut e = entry.lock().unwrap_or_else(|e| e.into_inner());
+                    let lease = crate::js_port::SessionId::parse(sid)
+                        .and_then(|s| crate::js_port::session_open(&s));
+                    e.port_life = lease.as_ref().map(crate::js_port::PortLease::life);
+                    lease
+                };
+                let driver = crate::threads::spawn_task(
+                    "session driver",
+                    crate::threads::TaskScope::RuntimeOwned(
+                        "a session driver outlives the request that opened it; it runs user code in the session's own scope",
+                    ),
+                    drive_session(
+                        Arc::downgrade(&entry),
+                        msg_rx,
+                        msg_tx.clone(),
+                        event_rx,
+                        enter_rx,
+                        update,
+                        view,
+                        subs,
+                        route_entry,
+                        page_url,
+                        store.clone(),
+                        scope.clone(),
+                        Arc::clone(&cmds),
+                        revocation,
+                        drain,
+                        port_lease,
+                        slot,
+                    ),
+                );
+                match driver {
+                    Ok(driver) => join_driver(
+                        driver,
+                        store.clone(),
+                        sid.to_owned(),
+                        Arc::downgrade(&entry),
+                    ),
+                    Err(refused) => crate::system::emit_runtime_log("live", &refused.to_string()),
                 }
-            }
-            // The life's port endpoints open now the store holds this session,
-            // before the driver or the seed Cmd can reach them. The life is
-            // recorded on the entry under its lock, the lock an attach binds
-            // under, so an attach binds into this life or none.
-            let port_lease = {
-                let mut e = entry.lock().unwrap_or_else(|e| e.into_inner());
-                let lease = crate::js_port::SessionId::parse(sid)
-                    .and_then(|s| crate::js_port::session_open(&s));
-                e.port_life = lease.as_ref().map(crate::js_port::PortLease::life);
-                lease
-            };
-            tokio::spawn(drive_session(
-                Arc::downgrade(&entry),
-                msg_rx,
-                msg_tx.clone(),
-                event_rx,
-                enter_rx,
-                update,
-                view,
-                subs,
-                route_entry,
-                page_url,
-                store.clone(),
-                scope.clone(),
-                Arc::clone(&cmds),
-                revocation,
-                drain,
-                port_lease,
-                slot,
-            ));
-            // Fire the entry Cmd into the loop (batched after init's on a miss).
-            pubsub::with_session(&scope, || run_cmd(cmd0, &msg_tx, &scope, &cmds));
-            drop(birth);
-            drop(owner);
-            installed
-        }));
-        match commit.await {
+                // Fire the entry Cmd into the loop (batched after init's on a miss).
+                pubsub::with_session(&scope, || run_cmd(cmd0, &msg_tx, &scope, &cmds));
+                drop(birth);
+                drop(owner);
+                installed
+            }),
+        );
+        let Ok(commit) = commit else {
+            return entry_unavailable();
+        };
+        // The publication runs to its end even when this request is dropped.
+        match commit.join_shielded().await {
             Ok(Some(store::Installed::Held | store::Installed::Diverged(_))) => {}
             // The store cannot persist the session: nothing was published,
             // no cookie is set, and the claim is released.
@@ -5777,16 +5884,15 @@ mod handlers {
             // A displaced sid, or a shutdown that closed first: nothing was
             // published, and the claim is released.
             Ok(Some(store::Installed::Displaced) | None) => return entry_unavailable(),
-            Err(failed) => {
-                return match failed.try_into_panic() {
-                    Ok(payload) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        [(axum::http::header::CONTENT_TYPE, "application/json")],
-                        crate::core::panic_500_body(&*payload),
-                    )
-                        .into_response(),
-                    Err(_) => entry_unavailable(),
-                };
+            Err(crate::threads::Unjoined::Trip(fault)) => {
+                let payload: Box<dyn std::any::Any + Send> = Box::new(fault);
+                return publication_500(&*payload);
+            }
+            Err(crate::threads::Unjoined::Ended(crate::threads::TaskEnded::Panicked(payload))) => {
+                return publication_500(&*payload);
+            }
+            Err(crate::threads::Unjoined::Ended(crate::threads::TaskEnded::Cancelled(_))) => {
+                return entry_unavailable();
             }
         }
 
@@ -6010,25 +6116,32 @@ mod handlers {
             let tx = tx.clone();
             let mut closer = closer.clone();
             let mut drain = drain.clone();
-            tokio::spawn(async move {
-                loop {
-                    // A closed session or a draining server stops its
-                    // heartbeat: the sender clone held here must not outlive
-                    // the stream it keeps alive.
-                    tokio::select! {
-                        _ = session_closed(&mut closer) => break,
-                        () = drain.wait() => break,
-                        () = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+            let beating = crate::threads::spawn_service(
+                "sse heartbeat",
+                "the SSE stream's heartbeat frames",
+                async move {
+                    loop {
+                        // A closed session or a draining server stops its
+                        // heartbeat: the sender clone held here must not
+                        // outlive the stream it keeps alive.
+                        tokio::select! {
+                            _ = session_closed(&mut closer) => break,
+                            () = drain.wait() => break,
+                            () = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+                        }
+                        if tx
+                            .send(SsePatch(sse::frame("heartbeat", "{}")))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
-                    if tx
-                        .send(SsePatch(sse::frame("heartbeat", "{}")))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
+                },
+            );
+            if let Err(refused) = beating {
+                crate::system::emit_runtime_log("live", &refused.to_string());
+            }
         }
 
         // Drop guard tied to the stream lifetime: when the client disconnects
@@ -7703,11 +7816,20 @@ where
     // Background TTL eviction: sweep idle-expired sessions every 60 s under
     // the armed owner. Persistent backends also prune their checkpoint table
     // in `sweep`.
-    tokio::spawn(sweep_sessions(
-        sweep_store,
-        armed.drain(),
-        std::time::Duration::from_secs(60),
-    ));
+    let swept = crate::threads::spawn_service(
+        "session sweep",
+        "the session store's TTL eviction",
+        sweep_sessions(
+            sweep_store,
+            armed.drain(),
+            std::time::Duration::from_secs(60),
+        ),
+    );
+    if let Err(refused) = swept {
+        return IpeResult::Err(E::from_ipe_error(
+            refused.into_error::<crate::error::IpeError>(),
+        ));
+    }
     // Logs the bind-address line (stderr), and the exposure warning if any.
     let listener = match crate::server::bind_app_listener("web", host, port).await {
         Ok(l) => l,
@@ -21605,7 +21727,7 @@ mod web_revocation_tests {
         let bodies = fn_bodies(&code);
         let body = sole_body(&code, &bodies, "dispatch_cmd");
         let spawns = body.matches("spawn").count();
-        let scoped = body.matches("tokio::spawn(scope.clone().scoped(").count();
+        let scoped = body.matches("scope.clone().scoped(asyncmove{").count();
         assert!(scoped >= 1, "`dispatch_cmd` spawns its Perform task");
         assert_eq!(
             spawns, scoped,
@@ -21730,7 +21852,7 @@ mod web_revocation_tests {
         let page = sole_body(&code, &bodies, "serve_page");
         let taken =
             page.find("letdrain=crate::server::shutdown::drain();letOk(work)=drain.work()else{");
-        let commit = page.find("tokio::spawn(under_work(work,asyncmove{");
+        let commit = page.find("under_work(work,asyncmove{");
         let write = page.find("store.set(");
         assert!(
             taken.is_some_and(|t| commit.is_some_and(|c| t < c))
