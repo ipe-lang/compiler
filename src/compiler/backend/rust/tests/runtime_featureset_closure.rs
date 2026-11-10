@@ -1378,12 +1378,14 @@ fn time_program_cargo_toml(
 /// No emitted manifest names `chrono-tz` or selects a dead runtime feature.
 ///
 /// A `uses_time` program, alone and beside each other surface, on both targets
-/// and both runtime models, selects `time-core` and nothing unread.
+/// and both runtime models, enables `time-core` (selected, or implied by a
+/// selected feature such as `wasm-client`) and selects nothing unread.
 #[test]
 #[allow(clippy::expect_used)] // test scaffolding: a body-free emit cannot fail
 fn time_programs_emit_no_dead_feature_or_chrono_tz() {
     let (cargo_toml, code) = runtime_manifest_and_code();
     let dead = dead_features(&cargo_toml, &code);
+    let table = parse_feature_table(&cargo_toml);
     let mut interner = Interner::new();
     let main = interner.intern("Main").expect("intern Main");
     let native = (0..FLAG_COUNT).map(|bit| (Target::Native, 1u32 << bit));
@@ -1404,8 +1406,8 @@ fn time_programs_emit_no_dead_feature_or_chrono_tz() {
             .runtime_feature_names(&prog)
             .expect("runtime_feature_names must succeed for a body-free program");
         assert!(
-            selected.contains(&"time-core"),
-            "a uses_time program ({target:?}, mask {mask:#b}) must select `time-core`: {selected:?}"
+            resolve_features(&selected, &table).contains("time-core"),
+            "a uses_time program ({target:?}, mask {mask:#b}) must enable `time-core`: {selected:?}"
         );
         for feature in &selected {
             assert!(
