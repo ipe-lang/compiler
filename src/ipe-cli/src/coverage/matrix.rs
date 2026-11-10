@@ -48,14 +48,21 @@ pub fn static_columns() -> Result<Vec<Box<dyn AspectCheck<StdlibSymbol>>>, Cover
 /// [`static_columns`] because a doc-string type-check is cheap enough for the
 /// fast path.
 ///
+/// The runtime-fn column reads the runtime embedded in this compiler, the one
+/// a build links when nothing overrides it.
+///
 /// # Errors
-/// A typed [`CoverageError`] if a column's scratch directory cannot be created.
+/// A typed [`CoverageError`] if a column's scratch directory cannot be created
+/// or the embedded runtime's module tree cannot be read.
 pub fn dynamic_columns() -> Result<Vec<Box<dyn AspectCheck<StdlibSymbol>>>, CoverageError> {
+    let runtime = crate::runtime_embed::RuntimeSource::Embedded
+        .module_tree()
+        .map_err(|e| CoverageError::RuntimeTree(Box::new(e)))?;
     Ok(vec![
         Box::new(crate::coverage::columns_runtime::LowersColumn::new()?),
         Box::new(crate::coverage::columns_runtime::ComposesColumn::new()?),
         Box::new(crate::coverage::columns_runtime::BuildRunColumn::new()?),
-        Box::new(crate::coverage::columns_runtime::RuntimeFnExistsColumn::new()),
+        Box::new(crate::coverage::columns_runtime::RuntimeFnExistsColumn::new(&runtime)),
         Box::new(crate::coverage::columns_runtime::WasmColumn),
     ])
 }

@@ -98,7 +98,7 @@ pub fn build_fixture(
     out_dir: &Path,
     runtime_dir: &Path,
 ) -> Result<BuiltFixture, CliError> {
-    build_fixture_with_options(fixture, out_dir, runtime_dir, &BuildOptions::from_env())
+    build_fixture_with_options(fixture, out_dir, runtime_dir, &BuildOptions::from_env()?)
 }
 
 /// [`build_fixture`] with explicit [`BuildOptions`], for the served host.

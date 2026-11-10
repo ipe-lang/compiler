@@ -10,13 +10,12 @@ use crate::{
 /// version.
 ///
 /// Carried into [`CliError::EmittedBuildFailed`] so a `cargo` failure that names
-/// a missing runtime feature can point at the exact stale crate. Both parts come
-/// from outside ipe (an `IPE_RUNTIME_DIR` path, a `Cargo.toml` field), so they
+/// a missing runtime feature can name the runtime the emit bundled. Both parts
 /// are held as [`TerminalSafe`] text: the self-rendering error cannot
 /// interpolate them raw.
 #[derive(Debug, Clone)]
 pub struct RuntimeContext {
-    /// The resolved runtime crate root, as display text.
+    /// Where the bundled runtime came from, as display text.
     pub root: TerminalSafe,
     /// The version that crate declares.
     pub version: TerminalSafe,
@@ -101,10 +100,9 @@ pub enum CliError {
         src: String,
         diag: Box<Diagnostic>,
     },
-    /// The Ipê runtime module tree could not be located.
-    RuntimeNotFound,
-    /// `$IPE_RUNTIME_DIR` was set but does not name a runtime crate root (a
-    /// directory whose `Cargo.toml` declares the `ipe-runtime-rust` package).
+    /// A named runtime root (`--runtime`, `$IPE_RUNTIME_DIR`, or a library
+    /// caller's root) is not a runtime crate root (a directory whose
+    /// `Cargo.toml` declares the `ipe-runtime-rust` package).
     /// The override is a trust decision — an unverified directory is a hard,
     /// typed refusal, never a silent fall-through to a different runtime.
     RuntimeDirInvalid {
@@ -114,10 +112,11 @@ pub enum CliError {
         /// (`…/src/ipe_runtime` or `…/rust/src`) rather than the crate root — a
         /// common misconfiguration worth calling out explicitly.
         points_at_inner: bool,
+        /// The remedy the refusing surface offers.
+        remedy: crate::runtime_embed::RuntimeRemedy,
     },
-    /// No directory could be resolved to materialize the embedded runtime into
-    /// (no `IPE_HOME`, `XDG_DATA_HOME`, or `HOME`). Without a home there is
-    /// nowhere to write the runtime the emitted project links against.
+    /// No Ipê data directory could be resolved (no `IPE_HOME`, `XDG_DATA_HOME`,
+    /// or `HOME`) for a file that lives under it.
     RuntimeHomeUnknown,
     /// No per-user cache directory could be resolved: neither `XDG_CACHE_HOME`
     /// nor the home (`HOME`, or `USERPROFILE` on Windows) names an absolute path. Refused rather than falling back to a
@@ -156,8 +155,8 @@ pub enum CliError {
         /// The pinned port.
         port: ipe_runtime_rust::env_grammar::ListenPort,
     },
-    /// Writing the embedded runtime source to `<IPE_HOME>/runtime/<version>/rust`
-    /// failed (disk full, permission denied, or a drifted embed). This is a
+    /// Bundling the embedded runtime source into an emitted project failed
+    /// (disk full, permission denied, or a drifted embed). This is a
     /// fail-closed refusal — the build stops rather than link a wrong or empty
     /// runtime. Carries a specific detail.
     RuntimeMaterializeFailed {
@@ -168,10 +167,9 @@ pub enum CliError {
     /// compiler's own. The emitted project pins features and shapes against the
     /// compiler's runtime; a crate at a different version lacks those, so linking
     /// it fails deep inside `cargo` with an opaque feature error. This is a hard,
-    /// typed refusal at resolution time — a stale `out/`, a walked-up old crate
-    /// root, or a mismatched `IPE_RUNTIME_DIR` is caught before emit, never
-    /// linked. Carries the resolved root, the version found there, and the
-    /// compiler's expected version.
+    /// typed refusal at resolution time — a named root of another version is
+    /// caught before emit, never linked. Carries the resolved root, the version
+    /// found there, the compiler's expected version, and the remedy.
     RuntimeVersionMismatch {
         /// The resolved runtime crate root whose version disagrees.
         path: PathBuf,
@@ -179,6 +177,8 @@ pub enum CliError {
         found: String,
         /// The compiler's own version, which the runtime must equal.
         expected: String,
+        /// The remedy the refusing surface offers.
+        remedy: crate::runtime_embed::RuntimeRemedy,
     },
     /// Building the emitted Rust project failed — `cargo` exited non-zero while
     /// compiling the program this compiler emitted. This is neither a
@@ -830,7 +830,6 @@ impl CliError {
             Self::Io { .. } => "io",
             Self::ScratchUnavailable { .. } => "scratch-unavailable",
             Self::Pipeline { .. } => "pipeline",
-            Self::RuntimeNotFound => "runtime-not-found",
             Self::RuntimeDirInvalid { .. } => "runtime-dir-invalid",
             Self::RuntimeHomeUnknown => "runtime-home-unknown",
             Self::CacheHomeUnknown => "cache-home-unknown",
@@ -946,7 +945,6 @@ impl CliError {
             | Self::Io { .. }
             | Self::ScratchUnavailable { .. }
             | Self::Pipeline { .. }
-            | Self::RuntimeNotFound
             | Self::RuntimeDirInvalid { .. }
             | Self::RuntimeHomeUnknown
             | Self::CacheHomeUnknown
@@ -1096,7 +1094,6 @@ impl std::fmt::Display for CliError {
             Self::Pipeline { file, src, diag } => {
                 f.write_str(&render(diag, &file.to_string_lossy(), src))
             }
-            Self::RuntimeNotFound => f.write_str(text::cli_runtime_not_found()),
             Self::CacheHomeUnknown => f.write_str(text::cli_cache_home_unknown()),
             Self::EnvDirNotAbsolute { var } => f.write_str(&text::cli_env_dir_not_absolute(var)),
             Self::EnvSwitchNotRecognised { var, got, admitted } => f.write_str(
@@ -1483,13 +1480,14 @@ pub fn fmt_runtime_install_error(
         CliError::RuntimeDirInvalid {
             path,
             points_at_inner,
+            remedy,
         } => {
             let path = path.display();
             f.write_str(&text::cli_runtime_dir_invalid(&path))?;
             if *points_at_inner {
                 write!(f, "\n{}", text::cli_runtime_dir_invalid_inner_hint())?;
             }
-            Ok(())
+            write!(f, "\n{}", runtime_remedy_line(*remedy))
         }
         CliError::RuntimeHomeUnknown => f.write_str(text::cli_runtime_home_unknown()),
         CliError::RuntimeMaterializeFailed { detail } => {
@@ -1499,12 +1497,24 @@ pub fn fmt_runtime_install_error(
             path,
             found,
             expected,
+            remedy,
         } => {
             let path = path.display();
-            f.write_str(&text::cli_runtime_version_mismatch(&path, found, expected))
+            f.write_str(&text::cli_runtime_version_mismatch(&path, found, expected))?;
+            write!(f, "\n{}", runtime_remedy_line(*remedy))
         }
         // The caller only dispatches the runtime-install variants here.
         _ => Ok(()),
+    }
+}
+
+/// The help line a runtime refusal offers on the surface `remedy` names.
+const fn runtime_remedy_line(remedy: crate::runtime_embed::RuntimeRemedy) -> &'static str {
+    match remedy {
+        crate::runtime_embed::RuntimeRemedy::WithRuntimeFlag => {
+            text::cli_runtime_remedy_with_flag()
+        }
+        crate::runtime_embed::RuntimeRemedy::EnvOnly => text::cli_runtime_remedy_env_only(),
     }
 }
 
@@ -1609,7 +1619,7 @@ pub fn fmt_emitted_build_failed(
 /// [`crate::screen::Fault`] follow, so the two never disagree.
 enum EmittedBuildCause {
     /// The runtime crate lacks a feature the emitted crate enables: a stale
-    /// runtime install.
+    /// runtime crate.
     MissingRuntimeFeature(String),
     /// `cargo` could not reach the crate registry: DNS, offline, or a proxy.
     RegistryUnreachable,
@@ -1813,7 +1823,7 @@ mod tests {
     /// framed human banner.
     #[test]
     fn non_pipeline_plain_renders_the_terse_flush_left_record() {
-        let err = CliError::RuntimeNotFound;
+        let err = CliError::RuntimeHomeUnknown;
         let line = machine_output::machine_error(
             OutputFormat::Plain,
             "build",
@@ -1854,12 +1864,63 @@ mod tests {
         );
     }
 
+    /// A runtime refusal offers the remedy its surface can act on.
+    ///
+    /// A surface without `--runtime` names `IPE_RUNTIME_DIR` alone; one with it
+    /// names the flag too. The vendored-switch refusal names its variable and
+    /// every admitted spelling.
+    #[test]
+    fn a_runtime_refusal_offers_the_remedy_of_its_surface() {
+        use crate::runtime_embed::RuntimeRemedy;
+        let invalid = |remedy| {
+            CliError::RuntimeDirInvalid {
+                path: PathBuf::from("/bogus"),
+                points_at_inner: false,
+                remedy,
+            }
+            .to_string()
+        };
+        let mismatch = |remedy| {
+            CliError::RuntimeVersionMismatch {
+                path: PathBuf::from("/old"),
+                found: "0.0.1".to_owned(),
+                expected: crate::runtime_embed::COMPILER_VERSION.to_owned(),
+                remedy,
+            }
+            .to_string()
+        };
+        for text in [
+            invalid(RuntimeRemedy::EnvOnly),
+            mismatch(RuntimeRemedy::EnvOnly),
+        ] {
+            assert!(
+                text.contains("IPE_RUNTIME_DIR") && !text.contains("--runtime"),
+                "{text}"
+            );
+        }
+        for text in [
+            invalid(RuntimeRemedy::WithRuntimeFlag),
+            mismatch(RuntimeRemedy::WithRuntimeFlag),
+        ] {
+            assert!(
+                text.contains("IPE_RUNTIME_DIR") && text.contains("--runtime <dir>"),
+                "{text}"
+            );
+        }
+        let switch = crate::runtime_embed::RuntimeEmit::parse(Some(std::ffi::OsStr::new("yes")))
+            .map_or_else(|e| e.to_string(), |_| String::new());
+        assert!(
+            switch.contains("IPE_RUNTIME_VENDORED") && switch.contains("0, 1"),
+            "{switch}"
+        );
+    }
+
     /// The `kind` tags are stable, distinct words — a consumer's branch keys.
     #[test]
     fn kinds_are_stable_and_distinct_per_named_refusal() {
         assert_eq!(
-            CliError::RuntimeNotFound.machine_kind(),
-            "runtime-not-found"
+            CliError::RuntimeHomeUnknown.machine_kind(),
+            "runtime-home-unknown"
         );
         assert_eq!(
             CliError::CapabilityMismatch {

@@ -82,17 +82,22 @@ pub mod config;
 #[cfg(feature = "db-postgres")]
 #[path = "config_postgres.rs"]
 pub mod config;
+// The in-memory SQLite pools the runtime's tests open: exists exactly when
+// `config` is the sqlite set, so no test can feed a SQLite pool to a Postgres `Db`.
+#[cfg(all(test, feature = "db", not(feature = "db-postgres")))]
+mod test_db;
 // The selected aliases speak the feature's driver: a `config` that drifts from
 // its feature is a type error here, not a pool opened on the other engine.
 #[cfg(all(feature = "db", feature = "db-postgres"))]
 const _: fn(config::DbRow) -> sqlx::postgres::PgRow = |row| row;
 #[cfg(all(feature = "db", not(feature = "db-postgres")))]
 const _: fn(config::DbRow) -> sqlx::sqlite::SqliteRow = |row| row;
-// Behavioral tests for the Postgres `config_postgres.rs` placeholder rewriter
-// in every build, whichever driver this one selects. Test-only, gated on `db`
-// so the re-included sqlx-typed source compiles; nothing here is emitted.
 #[cfg(feature = "config")]
 pub mod config_decode;
+// Behavioral tests for the Postgres `config_postgres.rs` placeholder rewriter
+// under both driver selectors: `crate::config` under `db-postgres`, a `#[path]`
+// re-include otherwise. Test-only, gated on `db` so the sqlx-typed template
+// compiles; nothing here is emitted.
 #[cfg(all(test, feature = "db"))]
 mod config_postgres_test;
 pub mod core;
@@ -301,15 +306,10 @@ pub use dsn::*;
 pub mod external_conn;
 #[cfg(feature = "db")]
 pub use external_conn::*;
-// Regression tests for the Postgres `db_format_sql` placeholder rewriter, which
-// only ships in the emitted `config_postgres.rs` template and is never otherwise
-// compiled in-workspace (the standalone crate uses the sqlite `config.rs`).
 #[cfg(feature = "json")]
 pub mod json;
 #[cfg(feature = "json")]
 pub mod json_val;
-#[cfg(all(test, feature = "db"))]
-mod postgres_placeholder_rewrite_test;
 // The Ipê↔JS boundary-seal codec: the total, fail-closed decode gate a generated
 // per-seal-type decoder runs behind. Shares the `json` canonical substrate, so it
 // carries the same feature gate.

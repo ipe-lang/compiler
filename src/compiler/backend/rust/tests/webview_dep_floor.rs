@@ -13,10 +13,8 @@
 //! is over BOTH the SSOT feature selection (`runtime_feature_names`) and the
 //! emitted dependency-model `Cargo.toml`.
 
-use std::path::{Path, PathBuf};
-
 use ipe_backend::Backend;
-use ipe_backend_rust::{RuntimeDep, RustBackend};
+use ipe_backend_rust::{RuntimeContentId, RuntimeDep, RustBackend};
 use ipe_intern::Interner;
 use ipe_ir::{ModPath, Module, Program};
 
@@ -77,27 +75,6 @@ fn webview_program(interner: &mut Interner) -> Program {
     }
 }
 
-/// Locate the runtime crate root (`src/runtime/rust`) by walking up from the
-/// crate manifest dir — the same resolution `wasm_dep_floor.rs` performs, so the
-/// dependency-model emit gets a real resolvable `path`.
-#[allow(clippy::expect_used)]
-fn runtime_crate_root() -> PathBuf {
-    let manifest = e2e_support::manifest_dir!();
-    let mut here: Option<&Path> = Some(&manifest);
-    let found = std::iter::from_fn(|| {
-        let dir = here?;
-        here = dir.parent();
-        Some(dir.join("src").join("runtime").join("rust"))
-    })
-    .find(|candidate| candidate.join("Cargo.toml").is_file())
-    .expect(
-        "the ipe-runtime-rust crate root (src/runtime/rust) must resolve for the webview floor",
-    );
-    found
-        .canonicalize()
-        .expect("runtime crate root canonicalizes")
-}
-
 /// The dependency-model native manifest — the DEFAULT `ipe dev build` shape: the app
 /// crate declares the runtime as a path dependency selected by the SSOT feature
 /// list, so the security-forbidden crates are absent from the app manifest and
@@ -108,7 +85,7 @@ fn emit_webview_dep_cargo_toml() -> String {
     let program = webview_program(&mut interner);
     RustBackend::new(&interner)
         .with_runtime_dep(Some(RuntimeDep {
-            root: runtime_crate_root(),
+            content: RuntimeContentId::from_digest_bytes([0; 16]),
         }))
         .emit(&program)
         .expect("emit must succeed for a body-free webview dep-model program")

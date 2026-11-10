@@ -2,9 +2,10 @@
 
 use std::ffi::OsStr;
 use std::path::PathBuf;
+use std::process::Command;
 
-use e2e_support::Tier;
-use e2e_support::bin::{ResolveError, Source, parse_tier, resolve_bin, resolve_runtime_src};
+use e2e_support::bin::{ResolveError, Source, in_repo_runtime_src, parse_tier, resolve_bin};
+use e2e_support::{Tier, require_runtime};
 
 #[allow(clippy::expect_used)] // unwritable test scratch is an environment failure, not a case under test
 fn scratch(tag: &str) -> PathBuf {
@@ -114,17 +115,56 @@ fn an_absent_runtime_path_falls_back_to_the_baked_one() {
 }
 
 #[test]
-fn a_runtime_override_naming_a_missing_dir_fails() {
-    let root = scratch("runtime-override");
+fn a_runtime_tree_without_its_crate_manifest_is_not_taken() {
+    let root = outside_scratch("no-manifest");
     std::fs::create_dir_all(root.join("src/runtime/rust/src")).unwrap();
-    let missing = root.join("absent");
-    let got = resolve_runtime_src(Some(missing.clone().into_os_string()), &root);
-    assert_eq!(
-        got,
-        Err(ResolveError::Missing {
-            name: "ipe runtime",
-            tried: vec![(Source::RuntimeEnv("IPE_RUNTIME_DIR"), missing)],
-        })
+    let got = in_repo_runtime_src(&root);
+    assert!(
+        matches!(got, Err(ResolveError::Missing { .. })),
+        "a tree whose crate holds no Cargo.toml is not the runtime: {got:?}"
+    );
+}
+
+#[test]
+fn the_harness_runtime_is_the_checkouts_own_tree() {
+    let tree = require_runtime().into_path_buf();
+    assert!(
+        tree.ends_with("src/runtime/rust/src") && tree.join("../Cargo.toml").is_file(),
+        "{}",
+        tree.display()
+    );
+}
+
+/// The line prefix the probe prints its resolved tree under.
+const PROBE_PREFIX: &str = "resolved runtime: ";
+
+/// The probe half of the override test: prints the harness runtime, which the
+/// parent reads back from a re-spawned run of this binary.
+#[test]
+fn harness_runtime_probe() {
+    println!("{PROBE_PREFIX}{}", require_runtime().path().display());
+}
+
+/// A runtime override never reaches the harness: with `IPE_RUNTIME_DIR`
+/// naming a directory that holds no runtime, the harness still resolves the
+/// checkout's own tree.
+#[test]
+#[allow(clippy::expect_used)] // an unspawnable test binary is an environment failure, not a case under test
+fn the_harness_runtime_ignores_a_runtime_override() {
+    let bogus = outside_scratch("override");
+    let exe = std::env::current_exe().expect("the running test binary");
+    let out = Command::new(exe)
+        .args(["--exact", "resolve::harness_runtime_probe", "--nocapture"])
+        .env("IPE_RUNTIME_DIR", &bogus)
+        .output()
+        .expect("re-spawn the test binary");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let expected = format!("{PROBE_PREFIX}{}", require_runtime().path().display());
+    assert!(
+        out.status.success() && stdout.lines().any(|line| line == expected),
+        "status {:?}; stdout:\n{stdout}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
@@ -147,7 +187,7 @@ fn outside_scratch(tag: &str) -> PathBuf {
 #[test]
 fn a_walk_with_no_runtime_tree_fails() {
     let root = outside_scratch("no-runtime");
-    let got = resolve_runtime_src(None, &root);
+    let got = in_repo_runtime_src(&root);
     assert!(
         matches!(got, Err(ResolveError::Missing { .. })),
         "a walk above a scratch dir must find no runtime tree: {got:?}"

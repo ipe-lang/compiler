@@ -19,6 +19,7 @@ fn repo_root() -> PathBuf {
 
 /// Build the named golden fixture and assert it surfaces exactly `expected` as
 /// a pipeline diagnostic — never a panic, never a silent accept.
+#[allow(clippy::expect_used)] // a refused emit-options switch is the test failure
 fn assert_gate(fixture: &str, out_suffix: &str, expected: ipe_diagnostics::Code) {
     let root = repo_root();
     let golden = root.join("tests").join("golden").join(fixture);
@@ -26,7 +27,12 @@ fn assert_gate(fixture: &str, out_suffix: &str, expected: ipe_diagnostics::Code)
     e2e_support::scratch::fresh(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build_golden_dir(&golden, &out, &runtime, &ipe::BuildOptions::from_env());
+    let built = ipe::build_golden_dir(
+        &golden,
+        &out,
+        &runtime,
+        &ipe::BuildOptions::from_env().expect("BuildOptions from env"),
+    );
     let got = match &built {
         Err(ipe::CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,

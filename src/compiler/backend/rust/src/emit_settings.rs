@@ -7,8 +7,6 @@
 //! both read the struct through an exhaustive destructure, so a new field
 //! that one of them ignores fails the build.
 
-use std::path::Path;
-
 use crate::{
     BuildIntent, CargoPackageName, CrateIdentity, DbDriver, FfiEmit, MountBase, RuntimeDep,
     ServedInstall, ServerOrigins, WebViewWindow,
@@ -196,7 +194,7 @@ impl EmitSettings {
             None => payload.push(0),
             Some(dep) => {
                 payload.push(1);
-                push_framed(&mut payload, path_bytes(&dep.root));
+                push_framed(&mut payload, dep.content.as_bytes());
             }
         }
         emit_field(sink, FieldTag::RuntimeDep, &payload);
@@ -304,11 +302,6 @@ fn len_bytes(len: usize) -> [u8; 8] {
     u64::try_from(len).unwrap_or(u64::MAX).to_le_bytes()
 }
 
-/// A path's platform bytes.
-fn path_bytes(path: &Path) -> &[u8] {
-    path.as_os_str().as_encoded_bytes()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,6 +340,46 @@ mod tests {
         assert_ne!(on, records(&served(offer("todo", b"b"))));
         assert_ne!(on, records(&served(offer("done", b"a"))));
         assert_eq!(on, records(&served(offer("todo", b"a"))));
+    }
+
+    /// The unconfigured settings linking a runtime whose digest is `bytes`.
+    fn linked(bytes: [u8; 16]) -> EmitSettings {
+        EmitSettings {
+            runtime_dep: Some(crate::RuntimeDep {
+                content: crate::RuntimeContentId::from_digest_bytes(bytes),
+            }),
+            ..EmitSettings::unconfigured()
+        }
+    }
+
+    /// The `RuntimeDep` record of `settings`: its payload bytes.
+    fn runtime_dep_payload(settings: &EmitSettings) -> Option<Vec<u8>> {
+        records(settings)
+            .chunks(3)
+            .find(|record| record.first().map(Vec::as_slice) == Some(&[FieldTag::RuntimeDep as u8]))
+            .and_then(|record| record.get(2).cloned())
+    }
+
+    #[test]
+    fn the_runtime_content_id_splits_the_key_and_nothing_else_enters_it() {
+        let base = [7_u8; 16];
+        let mut one_byte_off = base;
+        if let Some(last) = one_byte_off.last_mut() {
+            *last ^= 1;
+        }
+        assert_ne!(records(&linked(base)), records(&linked(one_byte_off)));
+        assert_eq!(records(&linked(base)), records(&linked(base)));
+        assert_ne!(
+            records(&linked(base)),
+            records(&EmitSettings::unconfigured())
+        );
+        let mut expected = vec![1_u8];
+        push_framed(&mut expected, &base);
+        assert_eq!(
+            runtime_dep_payload(&linked(base)),
+            Some(expected),
+            "the dependency record is the presence byte and the framed digest alone",
+        );
     }
 
     #[test]

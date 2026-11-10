@@ -228,7 +228,9 @@ fn compile_and_build_with_files(
         &fixture,
         &out_dir,
         &runtime,
-        &ipe::BuildOptions::from_env(),
+        &ipe::BuildOptions::from_env().map_err(|e| -> BoxError {
+            format!("{test_name}: emit options refused: {e}").into()
+        })?,
         web_desktop_host()?,
     )
     .map_err(|e| -> BoxError { format!("{test_name}: ipe dev build failed: {e}").into() })?;

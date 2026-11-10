@@ -116,10 +116,11 @@ const COUNTER_JS: &str = "export function mount(host, emit) {\n\
 
 /// The `ipe dev build` dev-loop intent: these fixtures exercise the dev posture
 /// (plain cookie names, loopback upstreams), which a release binary refuses.
+#[allow(clippy::expect_used)] // a refused emit-options switch is the test failure
 fn dev_loop_options() -> ipe::BuildOptions {
     ipe::BuildOptions {
         intent: ipe_backend_rust::BuildIntent::Development,
-        ..ipe::BuildOptions::from_env()
+        ..ipe::BuildOptions::from_env().expect("BuildOptions from env")
     }
 }
 

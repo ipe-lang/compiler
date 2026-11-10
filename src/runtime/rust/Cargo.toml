@@ -215,15 +215,15 @@ rustix = { version = "1", features = ["pty", "termios", "fs", "process", "std"] 
 # compile on `wasm32-unknown-unknown`. The `feature = "tokio"` cfg flag is still
 # set on wasm when a tokio-enabling feature is selected, so every `tokio::` use
 # site is guarded by BOTH `feature = "tokio"` AND `not(target_arch = "wasm32")`.
-# Narrow feature set matching the emitted floor async runtime (project.rs
-# `async_runtime_cargo_toml`): `rt`/`rt-multi-thread`/`macros`/`time`, plus
-# `sync` (the shared Cli/Tui event loop `tea.rs` — compiled under the `tokio`
-# feature — uses `tokio::sync::mpsc`), plus `signal` (the stop-signal relay
-# `system::exit_signals`, compiled wherever tokio is, which every Cli, Tui and
-# worker driver installs; matches the emitted `tokio_signal_cargo_toml` step).
-# The `net` arm is added only by the `server`/`web`/`websocket_client` surface
-# features. `full` is deliberately NOT used here so depending on the crate does
-# not pull all of tokio.
+# The base feature set every tokio-enabling feature shares: `rt`/
+# `rt-multi-thread`/`macros`/`time`, plus `sync` (the shared Cli/Tui event loop
+# and `system::exit_signals` use `tokio::sync`), plus `signal` (the stop-signal
+# relay `system::exit_signals`, compiled wherever tokio is). The surface
+# features add `net`, `io-util`, `process` and `fs` through their `tokio/x`
+# entries below. The vendored emit renders its `tokio` line from this base plus
+# the same entries (`RuntimeFeature::tokio_projection`), and a seal asserts the
+# two agree. `full` is deliberately NOT used so depending on the crate does not
+# pull all of tokio.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "signal"], optional = true }
 
@@ -515,7 +515,7 @@ websocket_client = ["tokio", "tokio/net", "tokio/sync", "tokio-tungstenite", "to
 # A web app with an HTTP kernel (`uses_http`) or email selects `http_client`
 # through `reaches_http_client()` in the backend — reqwest never enters a plain
 # web app.
-web = ["web-core", "widget-assets", "server", "dep:serde_json", "json", "serde", "dep:serde_urlencoded", "async-trait", "tokio/signal", "tokio/process", "tokio/io-util", "encoding", "uuid", "time-core", "crypto-core"]
+web = ["web-core", "widget-assets", "server", "dep:serde_json", "json", "serde", "dep:serde_urlencoded", "async-trait", "tokio/signal", "tokio/process", "tokio/io-util", "tokio/fs", "encoding", "uuid", "time-core", "crypto-core"]
 # The `CustomElement.node` custom-element glue generator + SRI-pinned asset addressing
 # (`widget_assets.rs`) as a STANDALONE surface, decoupled from the heavy `web`
 # server. `sha2` (content digest) rides `crypto-core`; `base64` (the SRI value)
@@ -525,8 +525,8 @@ web = ["web-core", "widget-assets", "server", "dep:serde_json", "json", "serde",
 # implies it so the server keeps `ipe_runtime::web::widget_assets::*` unchanged.
 widget-assets = ["crypto-core", "encoding"]
 # `full` names no driver selector, so it compiles the sqlite aliases the
-# runtime's own db tests open, and `full,db-postgres` is the every-feature
-# PostgreSQL build CI lints. `db` links both sqlx drivers. `jwt` + `url` cover
+# runtime's pool-opening tests need, and `full,db-postgres` is the every-feature
+# PostgreSQL build CI lints with every target. `db` links both sqlx drivers. `jwt` + `url` cover
 # the JWT/auth and URL/SSRF surfaces that `db`/`web`/`http_client` reach.
 full = ["async", "json", "jwt", "url", "db", "redis_store", "crypto", "crypto-core", "secret", "compression", "csv_kernel", "cache_kernel", "tui", "config", "server", "http_client", "email", "websocket_client", "web", "time-core", "log", "regex", "uuid", "random", "decimal", "char-category"]
 # Development-only time-travelling debugger core (recorder / re-fold / export /

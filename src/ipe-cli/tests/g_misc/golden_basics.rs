@@ -88,9 +88,8 @@ fn pipeline_error_renders_with_code_and_explain_pointer() {
     let fixture = ipe::RootFixture::main("module Main exposing (main)\n\nmain =\n")
         .expect("an ill-formed module still resolves as a project");
 
-    // The runtime dir is never reached: the parse error fires first. Pass a
-    // path that need not exist.
-    let runtime = dir.join("no-runtime");
+    // The parse error fires before the runtime is read.
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build_fixture(&fixture, &dir.join("out"), &runtime);
 
     assert!(

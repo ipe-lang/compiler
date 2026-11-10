@@ -142,7 +142,7 @@ fn split_root(db: &IpeDatabase, lib: SourceFile, main: SourceFile) -> SourceRoot
 
 /// Dependency-model settings: the debugger module lives only in the linked
 /// runtime crate, so both the plain and the debugger build link one.
-fn settings(debugger: bool, host: EmitHost) -> EmitSettings {
+const fn settings(debugger: bool, host: EmitHost) -> EmitSettings {
     EmitSettings {
         db_driver: DbDriver::Sqlite,
         ffi: None,
@@ -152,7 +152,7 @@ fn settings(debugger: bool, host: EmitHost) -> EmitSettings {
         server_origins: ipe_backend_rust::ServerOrigins::none(),
         wasm_hydrate_mode: false,
         runtime_dep: Some(RuntimeDep {
-            root: std::path::PathBuf::from("/ipe-runtime"),
+            content: ipe_backend_rust::RuntimeContentId::from_digest_bytes([0; 16]),
         }),
         debugger,
         crate_name: CrateName::SingleFile,
