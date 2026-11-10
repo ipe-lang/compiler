@@ -233,7 +233,7 @@ fn loose_emit_settings(
         hot_appearance,
         // Consumed by the compile core and the write step, not by emit settings.
         static_plan: _,
-        runtime_dep: _,
+        runtime_emit: _,
         tree_shake_vendored: _,
         runtime_origin: _,
     } = options;
@@ -281,7 +281,7 @@ fn manifest_emit_settings(
         hot_appearance,
         // Consumed by the compile core and the write step, not by emit settings.
         static_plan: _,
-        runtime_dep: _,
+        runtime_emit: _,
         tree_shake_vendored: _,
         runtime_origin: _,
     } = options;
