@@ -8,13 +8,15 @@
 //! the driver copies into `src/ipe_runtime/`, the trimmed `ipe_runtime/mod.rs`
 //! and stub `config.rs` templates, and the `RUNTIME_MOD_RS_*` appends) and
 //! refuses any feature name outside the set the vendored manifest and its
-//! augmenters declare.
+//! augmenters declare. The converse holds too: every feature an app manifest
+//! declares is read by some compiled gate, so none is selected for nothing.
 
 #![cfg(test)]
 
 use super::{
-    CARGO_TOML, RUNTIME_CONFIG_RS, RUNTIME_MOD_RS, async_runtime_cargo_toml, jwt_cargo_toml,
-    locale_cargo_toml, server_cargo_toml,
+    CARGO_DEP_TOML, CARGO_TOML, CARGO_WASM_DEP_TOML, GOLDEN as MAIN_RS, RUNTIME_CONFIG_RS,
+    RUNTIME_MOD_RS, WASM_CARGO_TOML, async_runtime_cargo_toml, jwt_cargo_toml, locale_cargo_toml,
+    server_cargo_toml,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -330,11 +332,17 @@ fn test_only_item_end(toks: &[(usize, Tok)], at: usize) -> Option<usize> {
 /// Every `feature = "name"` inside a `cfg` / `cfg_attr` attribute or a `cfg!`
 /// macro, with the line it sits on. Items gated by `#[cfg(test)]` are skipped.
 fn cfg_features(src: &str) -> Vec<(usize, String)> {
+    gate_features(src, false)
+}
+
+/// Every `feature = "name"` inside a `cfg` / `cfg_attr` attribute or a `cfg!`
+/// macro, `#[cfg(test)]` items read too only when `with_tests` holds.
+fn gate_features(src: &str, with_tests: bool) -> Vec<(usize, String)> {
     let toks = lex(src);
     let mut found = Vec::new();
     let mut i = 0usize;
     while let Some((_, tok)) = toks.get(i) {
-        if let Some(end) = test_only_item_end(&toks, i) {
+        if !with_tests && let Some(end) = test_only_item_end(&toks, i) {
             i = end + 1;
             continue;
         }
@@ -693,4 +701,122 @@ fn cfg_scan_skips_test_only_items() {
     "#;
     let names: Vec<String> = cfg_features(src).into_iter().map(|(_, n)| n).collect();
     assert_eq!(names, ["before", "not_test", "mixed", "after"]);
+}
+
+/// Every feature a vendored build reads in a `cfg`: the scanned runtime tree,
+/// the `mod.rs` / `config.rs` / `main.rs` templates, and every string the
+/// backend source emits outside its `#[cfg(test)]` items.
+///
+/// The vendored sources' own `#[cfg(test)]` items count: a test build of the
+/// emitted crate compiles them, and rustc's check-cfg reads their gates.
+fn vendored_reads() -> BTreeSet<String> {
+    let root = runtime_src();
+    let mut reads = BTreeSet::new();
+    for rel in rust_files(&root) {
+        let rel_s = rel.to_string_lossy().replace('\\', "/");
+        if REPLACED.contains(&rel_s.as_str()) || EXCLUDED.iter().any(|(f, _)| *f == rel_s) {
+            continue;
+        }
+        let src = std::fs::read_to_string(root.join(rel)).expect("runtime source must read");
+        reads.extend(gate_features(&src, true).into_iter().map(|(_, n)| n));
+    }
+    for text in [RUNTIME_MOD_RS, RUNTIME_CONFIG_RS, MAIN_RS] {
+        reads.extend(gate_features(text, true).into_iter().map(|(_, n)| n));
+    }
+    for body in emitted_strings(PROJECT_RS) {
+        reads.extend(gate_features(&body, true).into_iter().map(|(_, n)| n));
+    }
+    reads
+}
+
+/// The contents of every string literal in `src` outside a `#[cfg(test)]` item.
+fn emitted_strings(src: &str) -> Vec<String> {
+    let toks = lex(src);
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while let Some((_, tok)) = toks.get(i) {
+        if let Some(end) = test_only_item_end(&toks, i) {
+            i = end + 1;
+            continue;
+        }
+        if let Tok::Str(s) = tok {
+            out.push(s.clone());
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The features `manifest` declares that no read in `reads` names.
+///
+/// `default` is exempt: it is the crate's baseline, never a gate.
+fn unread_features(manifest: &str, reads: &BTreeSet<String>) -> Vec<String> {
+    declared_features(manifest)
+        .into_iter()
+        .filter(|name| name != "default" && !reads.contains(name))
+        .collect()
+}
+
+/// Every feature an emitted app manifest declares is read by a `cfg` the build
+/// compiles, so selecting it always changes what compiles.
+#[test]
+fn app_manifest_features_are_read() {
+    let reads = vendored_reads();
+    assert!(
+        reads.contains("time-core") && reads.contains("alloc_mimalloc"),
+        "precondition: the read scan sees runtime and `main.rs` gates: {reads:?}"
+    );
+    let async_base = async_runtime_cargo_toml(CARGO_TOML).expect("async base must build");
+    let manifests = [
+        ("templates/Cargo.toml", CARGO_TOML.to_owned()),
+        (
+            "server augmenter",
+            server_cargo_toml(&async_base).expect("server manifest must build"),
+        ),
+        (
+            "jwt augmenter",
+            jwt_cargo_toml(CARGO_TOML).expect("jwt manifest must build"),
+        ),
+        (
+            "locale augmenter",
+            locale_cargo_toml(CARGO_TOML).expect("locale manifest must build"),
+        ),
+        ("WASM_CARGO_TOML", WASM_CARGO_TOML.to_owned()),
+        ("templates/Cargo.dep.toml", CARGO_DEP_TOML.to_owned()),
+        (
+            "templates/Cargo.wasm-dep.toml",
+            CARGO_WASM_DEP_TOML.to_owned(),
+        ),
+    ];
+    let mut dead = Vec::new();
+    for (name, manifest) in &manifests {
+        assert!(
+            declared_features(manifest).contains("default"),
+            "precondition: {name} declares a `[features]` table"
+        );
+        for feature in unread_features(manifest, &reads) {
+            dead.push(format!("{name}: feature {feature:?}"));
+        }
+    }
+    assert!(
+        dead.is_empty(),
+        "app manifests declare features no compiled `cfg` reads, so selecting one \
+         changes nothing; drop the declaration or gate the code it claims:\n{}",
+        dead.join("\n")
+    );
+}
+
+/// A declared feature no gate reads is reported, and a read revives it.
+#[test]
+fn unread_declared_feature_is_refused() {
+    const MANIFEST: &str =
+        "[features]\ndefault = [\"time-core\"]\ntime-core = []\ntime = []\n\n[dependencies]\n";
+    let reads: BTreeSet<String> = cfg_features("#[cfg(feature = \"time-core\")]\npub mod time;\n")
+        .into_iter()
+        .map(|(_, n)| n)
+        .collect();
+    assert_eq!(unread_features(MANIFEST, &reads), ["time"]);
+    let mut revived = reads;
+    revived.insert("time".to_owned());
+    assert!(unread_features(MANIFEST, &revived).is_empty());
 }

@@ -36,13 +36,6 @@ dev-posture = []
 # keeps rustc's check-cfg quiet AND enables those derives. `json` implies it (the
 # floor `default = ["json"]` keeps serde on), mirroring the runtime crate.
 serde = []
-# Declared but inert in the vendored escape hatch: `regex` / `uuid` deps stay
-# non-optional below, and the emitted `ipe_runtime/mod.rs` declares
-# `regex_kernel` / `uuid_kernel` / `random` by inclusion, not by `#[cfg]`. These
-# entries only keep rustc's check-cfg quiet.
-regex = []
-uuid = []
-random = []
 # The server-free render core (the `crate::dom` diff/dispatch/form pipeline +
 # `style_inject`/`page_shell`). Declared but inert in the vendored escape hatch:
 # its deps (`serde` / `serde_json` / `serde_urlencoded`) stay non-optional below.
