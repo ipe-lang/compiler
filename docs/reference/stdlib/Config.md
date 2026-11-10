@@ -16,17 +16,19 @@ JSON decoding gets a consistent vocabulary for TOML and YAML.
 
 Example:
 
+    import Ipe.Path as Path
+
     type alias DbCfg = { host : String, port : Int, name : String }
 
     dbDecoder : Decoder DbCfg
     dbDecoder =
         Config.succeed (\h p n -> { host = h, port = p, name = n })
             |> Config.andThen
-                (\\f -> Config.map f (Config.field "host" Config.string))
+                (\f -> Config.map f (Config.field "host" Config.string))
             |> Config.andThen
-                (\\f -> Config.map f (Config.field "port" Config.int))
+                (\f -> Config.map f (Config.field "port" Config.int))
             |> Config.andThen
-                (\\f -> Config.map f (Config.field "name" Config.string))
+                (\f -> Config.map f (Config.field "name" Config.string))
 
     loadDb : Task Error DbCfg
     loadDb =

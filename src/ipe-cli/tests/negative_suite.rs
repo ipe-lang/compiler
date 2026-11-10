@@ -4538,6 +4538,16 @@ fn lower_server_api_unknown_method() {
     }
 }
 
+/// No route serves `TRACE` or `CONNECT`, in any case, so a `Server.api` spec
+/// naming either is refused at ipe time.
+#[test]
+fn server_api_trace_refused() {
+    for spec in ["TRACE /x", "CONNECT /x", "trace /x"] {
+        let src = server_route_fixture(&format!(r#"Server.api "{spec}""#));
+        assert_rejected("server_api_trace_refused", &src, "IPE-L0156");
+    }
+}
+
 /// A routed `Web.tea` app (its Model has a `page` field) over `page_ty`,
 /// with `routes` as the table, `not_found` as `notFound`, and `extra` cfg
 /// fields appended (e.g. `, onNavigate = Navigated`).

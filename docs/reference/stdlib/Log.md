@@ -102,5 +102,9 @@ use in an app's settings list.
 
     import Ipe.Level as Level
 
-    Web.appWith [ Log.level Level.warn ] { ... }
+    warnAndAbove : Setting a
+    warnAndAbove =
+        Log.level Level.warn
+
+and list it among the settings: `Web.appWith [ warnAndAbove ] app`.
 

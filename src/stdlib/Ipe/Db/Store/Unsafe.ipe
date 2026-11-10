@@ -31,8 +31,10 @@ import Ipe.Db.Store as Store exposing (Cond(..), CompareOp(..), Draft)
 --
 -- Example:
 --
---     Store.query store
---         |> Store.where (Unsafe.eq "id" (SqlString "u1"))
+-- ```ipe ipe:skip illustrative; store is the caller's already-built Store, not a standalone program
+-- Store.query store
+--     |> Store.where (Unsafe.eq "id" (SqlString "u1"))
+-- ```
 eq : String -> SqlValue -> Cond row
 eq col value =
     Compare OpEq col value
@@ -42,8 +44,10 @@ eq col value =
 --
 -- Example:
 --
---     Store.query store
---         |> Store.where (Unsafe.neq "status" (SqlString "deleted"))
+-- ```ipe ipe:skip illustrative; store is the caller's already-built Store, not a standalone program
+-- Store.query store
+--     |> Store.where (Unsafe.neq "status" (SqlString "deleted"))
+-- ```
 neq : String -> SqlValue -> Cond row
 neq col value =
     Compare OpNeq col value
@@ -53,8 +57,10 @@ neq col value =
 --
 -- Example:
 --
---     Store.query store
---         |> Store.where (Unsafe.gt "age" (SqlInt 18))
+-- ```ipe ipe:skip illustrative; store is the caller's already-built Store, not a standalone program
+-- Store.query store
+--     |> Store.where (Unsafe.gt "age" (SqlInt 18))
+-- ```
 gt : String -> SqlValue -> Cond row
 gt col value =
     Compare OpGt col value
@@ -64,8 +70,10 @@ gt col value =
 --
 -- Example:
 --
---     Store.query store
---         |> Store.where (Unsafe.gte "age" (SqlInt 18))
+-- ```ipe ipe:skip illustrative; store is the caller's already-built Store, not a standalone program
+-- Store.query store
+--     |> Store.where (Unsafe.gte "age" (SqlInt 18))
+-- ```
 gte : String -> SqlValue -> Cond row
 gte col value =
     Compare OpGte col value
@@ -75,8 +83,10 @@ gte col value =
 --
 -- Example:
 --
---     Store.query store
---         |> Store.where (Unsafe.lt "age" (SqlInt 65))
+-- ```ipe ipe:skip illustrative; store is the caller's already-built Store, not a standalone program
+-- Store.query store
+--     |> Store.where (Unsafe.lt "age" (SqlInt 65))
+-- ```
 lt : String -> SqlValue -> Cond row
 lt col value =
     Compare OpLt col value
@@ -86,8 +96,10 @@ lt col value =
 --
 -- Example:
 --
---     Store.query store
---         |> Store.where (Unsafe.lte "age" (SqlInt 64))
+-- ```ipe ipe:skip illustrative; store is the caller's already-built Store, not a standalone program
+-- Store.query store
+--     |> Store.where (Unsafe.lte "age" (SqlInt 64))
+-- ```
 lte : String -> SqlValue -> Cond row
 lte col value =
     Compare OpLte col value
@@ -102,8 +114,10 @@ lte col value =
 --
 -- Example:
 --
---     Store.query store
---         |> Store.where (Unsafe.like "name" "al%")
+-- ```ipe ipe:skip illustrative; store is the caller's already-built Store, not a standalone program
+-- Store.query store
+--     |> Store.where (Unsafe.like "name" "al%")
+-- ```
 like : String -> String -> Cond row
 like col pattern =
     Like col pattern
@@ -113,8 +127,10 @@ like col pattern =
 --
 -- Example:
 --
---     Store.query store
---         |> Store.where (Unsafe.isNull "deletedAt")
+-- ```ipe ipe:skip illustrative; store is the caller's already-built Store, not a standalone program
+-- Store.query store
+--     |> Store.where (Unsafe.isNull "deletedAt")
+-- ```
 isNull : String -> Cond row
 isNull col =
     IsNull col
@@ -124,8 +140,10 @@ isNull col =
 --
 -- Example:
 --
---     Store.query store
---         |> Store.where (Unsafe.notNull "email")
+-- ```ipe ipe:skip illustrative; store is the caller's already-built Store, not a standalone program
+-- Store.query store
+--     |> Store.where (Unsafe.notNull "email")
+-- ```
 notNull : String -> Cond row
 notNull col =
     NotNull col
@@ -137,8 +155,10 @@ notNull col =
 --
 -- Example:
 --
---     Store.query store
---         |> Store.where (Unsafe.inList "status" [ SqlString "active", SqlString "trial" ])
+-- ```ipe ipe:skip illustrative; store is the caller's already-built Store, not a standalone program
+-- Store.query store
+--     |> Store.where (Unsafe.inList "status" [ SqlString "active", SqlString "trial" ])
+-- ```
 inList : String -> List SqlValue -> Cond row
 inList col values =
     InList col values

@@ -13,7 +13,8 @@ Use `ipe dev build` or `ipe dev run` during development.
 
     import Ipe.Debug as Debug
 
-    total =
+    total : Int -> Int -> Int
+    total subtotal tax =
         Debug.log "subtotal" subtotal + tax
 
 `log label value` prints `"label: value"` to stderr and returns `value`
@@ -24,6 +25,10 @@ redacted value; `Error.toString` always keeps the redacted rendering.
 ## `todo`
 
     import Ipe.Debug as Debug
+
+    type Shape
+        = Circle Float
+        | Rectangle Float Float
 
     describeShape : Shape -> String
     describeShape shape =
