@@ -661,19 +661,16 @@ fn watch_emit_settings(
 /// copies the runtime tree instead.
 ///
 /// # Errors
-/// [`CliError::Usage`] for the debugger on a vendored emit (the vendored
-/// runtime tree carries no debugger), refused as every other dev build
-/// refuses it; the runtime's bundling errors.
+/// The debugger refusal every dev build shares, for the debugger on a vendored
+/// emit; the runtime's bundling errors.
 fn watch_runtime_dep(
     opts: &WatchOptions,
 ) -> Result<Option<ipe_backend_rust::RuntimeDep>, CliError> {
+    crate::driver::refuse_debugger_without_runtime_dep(opts.debugger, opts.runtime_emit)?;
     match opts.runtime_emit {
         crate::RuntimeEmit::Linked => Ok(Some(ipe_backend_rust::RuntimeDep {
             content: opts.runtime.content_id()?,
         })),
-        crate::RuntimeEmit::Vendored if opts.debugger => Err(CliError::Usage(
-            crate::text::msg::debugger_needs_runtime_dep(),
-        )),
         crate::RuntimeEmit::Vendored => Ok(None),
     }
 }

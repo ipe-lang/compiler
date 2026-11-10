@@ -55,6 +55,17 @@ const RETIRED: &[&str] = &[
     "resolve_vendored_runtime_dir",
 ];
 
+/// The harness locator: walks up from an anchor to the checkout's runtime
+/// tree, so only the harness's `require_runtime` may reach it.
+const HARNESS_LOCATOR: &str = "in_repo_runtime_src";
+
+/// The harness module that anchors the [`HARNESS_LOCATOR`] walk.
+const HARNESS: &str = "tools/e2e-support/src/bin.rs";
+
+/// The gate's runtime admission: the compile core hands its emit only the
+/// runtime the options' origin admits, so a gate never carries an override.
+const ADMISSION: &str = "admitted_runtime";
+
 /// The label of a zero-argument `ancestors()` walk in a runtime locator.
 const ANCESTORS: &str = "ancestors() in a runtime locator";
 
@@ -112,6 +123,9 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
     ("RUNTIME_VENDORED_VAR", EMBED_MODULE, "from_env", 1),
     ("RUNTIME_VENDORED_VAR", EMBED_MODULE, "parse", 1),
     (ANCESTORS, EMBED_MODULE, "ancestors", 1),
+    (HARNESS_LOCATOR, HARNESS, "<file>", 1),
+    (HARNESS_LOCATOR, HARNESS, "require_runtime", 1),
+    (ADMISSION, PIPELINE, "compile_source_set_here", 1),
 ];
 
 /// Whether `meta` holds only under `cfg(test)`.
@@ -213,7 +227,10 @@ impl Scan {
         let Some(last) = names.last() else {
             return;
         };
-        if VAR_CONSTS.contains(&last.as_str()) || RETIRED.contains(&last.as_str()) {
+        if VAR_CONSTS.contains(&last.as_str())
+            || RETIRED.contains(&last.as_str())
+            || last == HARNESS_LOCATOR
+        {
             self.met(last.clone());
         }
         if let [.., owner, member] = names {
@@ -238,6 +255,9 @@ impl Scan {
 
     /// Count a method call `.name(..)` taking `args` arguments.
     fn method(&mut self, name: &str, args: usize) {
+        if name == ADMISSION {
+            self.met(ADMISSION.to_owned());
+        }
         if !self.in_locator() {
             return;
         }
@@ -385,7 +405,10 @@ impl<'ast> Visit<'ast> for Scan {
 
     fn visit_use_name(&mut self, name: &'ast syn::UseName) {
         let ident = name.ident.to_string();
-        if VAR_CONSTS.contains(&ident.as_str()) || RETIRED.contains(&ident.as_str()) {
+        if VAR_CONSTS.contains(&ident.as_str())
+            || RETIRED.contains(&ident.as_str())
+            || ident == HARNESS_LOCATOR
+        {
             self.met(ident);
         }
         visit::visit_use_name(self, name);
@@ -398,6 +421,7 @@ impl<'ast> Visit<'ast> for Scan {
             || READER_TYPES.contains(&ident.as_str())
             || VAR_CONSTS.contains(&ident.as_str())
             || RETIRED.contains(&ident.as_str())
+            || ident == HARNESS_LOCATOR
             || (self.under_embed() && ident == "self");
         if guarded {
             self.alias(format!("use {ident} as {}", rename.rename));
@@ -535,9 +559,14 @@ fn baseline(rel: &str) -> &'static str {
              fn build_with_options_into() { RuntimeSource::resolve(o, e, r); }\n\
              fn build_loose_file_into() { RuntimeSource::resolve(o, e, r); }\n\
              fn build_test_into() { RuntimeSource::resolve(o, None, r); }\n\
-             fn build_project_into() { RuntimeSource::resolve(o, e, r); }\n"
+             fn build_project_into() { RuntimeSource::resolve(o, e, r); }\n\
+             fn compile_source_set_here() { let r = o.runtime_origin.admitted_runtime(r); }\n"
         }
         HEALTH => "fn check_runtime() { runtime_check(RuntimeSource::resolve(o, None, r)); }\n",
+        HARNESS => {
+            "use ipe_env::artifact::{ProvenRuntime, in_repo_runtime_src};\n\
+             fn require_runtime() { in_repo_runtime_src(&anchor); }\n"
+        }
         EMBED_MODULE => {
             "pub const RUNTIME_DIR_VAR: &str = \"IPE_RUNTIME_DIR\";\n\
              pub const RUNTIME_VENDORED_VAR: &str = \"IPE_RUNTIME_VENDORED\";\n\
@@ -576,7 +605,7 @@ fn runtime_reads_sit_only_at_admitted_sites() -> Result<(), String> {
 /// Each banned shape, planted beside a file's admitted shape, is refused.
 #[test]
 fn a_planted_runtime_read_is_refused() -> Result<(), String> {
-    let harness = "tools/e2e-support/src/bin.rs";
+    let harness = HARNESS;
     let regen = "tools/regen-goldens/src/main.rs";
     let cli = "src/ipe-cli/src/cache.rs";
     let cases = [
@@ -647,6 +676,25 @@ fn a_planted_runtime_read_is_refused() -> Result<(), String> {
             cli,
             "use super::build_pipeline::resolve_vendored_runtime_dir;\n",
         ),
+        // The gate admission dropped from the compile core, or taken twice.
+        (
+            PIPELINE,
+            "fn compile_source_set_here() { m!(o.runtime_origin.admitted_runtime(r)); }\n",
+        ),
+        // The harness locator reached outside the harness anchor.
+        (
+            cli,
+            "fn locate() { ipe_env::artifact::in_repo_runtime_src(&cwd); }\n",
+        ),
+        (cli, "use ipe_env::artifact::in_repo_runtime_src;\n"),
+        (
+            harness,
+            "fn other() { m!(ipe_env::artifact::in_repo_runtime_src(&cwd)); }\n",
+        ),
+        (
+            regen,
+            "use ipe_env::artifact::in_repo_runtime_src as locate;\n",
+        ),
         // Second names.
         (cli, "use crate::runtime_embed as embedded;\n"),
         (cli, "use crate::runtime_embed::{self as embedded};\n"),
@@ -666,7 +714,7 @@ fn a_planted_runtime_read_is_refused() -> Result<(), String> {
 fn the_admitted_shape_passes() -> Result<(), String> {
     let test_code = "#[cfg(test)]\nmod tests { fn t() { resolve_runtime(); } }\n\
                      #[test]\nfn direct() { RuntimeSource::resolve(o, None, r); }\n";
-    for rel in [PIPELINE, HEALTH, EMBED_MODULE] {
+    for rel in [PIPELINE, HEALTH, EMBED_MODULE, HARNESS] {
         let refused = planted(rel, test_code)?;
         assert!(refused.is_empty(), "{rel}: {}", refused.join("\n"));
     }

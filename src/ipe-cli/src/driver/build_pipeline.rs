@@ -1045,7 +1045,9 @@ pub fn compile_modules_observed(
     cache_site: Option<&cache::CacheSite>,
     options: BuildOptions,
 ) -> (Result<EmittedCrate, CliError>, CacheOutcome) {
-    if let Err(refusal) = refuse_debugger_without_runtime_dep(&options) {
+    if let Err(refusal) =
+        refuse_debugger_without_runtime_dep(options.debugger, options.runtime_emit)
+    {
         return (Err(refusal), CacheOutcome::Miss);
     }
     // The same stdlib-closure and FFI injection capability inference sees.
@@ -1074,8 +1076,11 @@ pub fn compile_modules_observed(
 ///
 /// # Errors
 /// [`CliError::Usage`] for a debugger build under the vendored runtime.
-const fn refuse_debugger_without_runtime_dep(options: &BuildOptions) -> Result<(), CliError> {
-    if options.debugger && matches!(options.runtime_emit, RuntimeEmit::Vendored) {
+pub const fn refuse_debugger_without_runtime_dep(
+    debugger: bool,
+    runtime_emit: RuntimeEmit,
+) -> Result<(), CliError> {
+    if debugger && matches!(runtime_emit, RuntimeEmit::Vendored) {
         return Err(CliError::Usage(text::msg::debugger_needs_runtime_dep()));
     }
     Ok(())
@@ -1126,7 +1131,10 @@ fn compile_source_set_here(
     cache_site: Option<&cache::CacheSite>,
     options: &BuildOptions,
 ) -> (Result<EmittedCrate, CliError>, CacheOutcome) {
-    if let Err(refusal) = refuse_debugger_without_runtime_dep(options) {
+    let runtime = options.runtime_origin.admitted_runtime(runtime);
+    if let Err(refusal) =
+        refuse_debugger_without_runtime_dep(options.debugger, options.runtime_emit)
+    {
         return (Err(refusal), CacheOutcome::Miss);
     }
     let super::SourceSetParts {
@@ -3109,7 +3117,7 @@ pub fn build_parsed_project_into(
     host: crate::delivery::HostIntent,
 ) -> Result<EmittedCrate, CliError> {
     let (sources, discovered, deps) = super::read_package_modules(manifest)?;
-    refuse_debugger_without_runtime_dep(options)?;
+    refuse_debugger_without_runtime_dep(options.debugger, options.runtime_emit)?;
     refuse_webview_off_web(host, manifest, &sources)?;
     let source_set = super::PackageSourceSet::assemble(sources, discovered, manifest_path, deps)?;
     build_from_sources_for(
@@ -3165,7 +3173,7 @@ pub fn build_held_into(
     options: &BuildOptions,
     host: crate::delivery::HostIntent,
 ) -> Result<EmittedCrate, CliError> {
-    refuse_debugger_without_runtime_dep(options)?;
+    refuse_debugger_without_runtime_dep(options.debugger, options.runtime_emit)?;
     if let crate::delivery::HostIntent::WebView(_) = host {
         crate::pack::desktop::require_webview(super::desktop_app_shape(held.shape()))
             .map_err(|refusal| CliError::Usage(text::Message::relay(&refusal)))?;

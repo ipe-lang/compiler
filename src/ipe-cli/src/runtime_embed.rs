@@ -459,6 +459,25 @@ pub enum RuntimeOrigin {
     Gate,
 }
 
+/// The one runtime source a [`RuntimeOrigin::Gate`] admits.
+static EMBEDDED_RUNTIME: RuntimeSource = RuntimeSource::Embedded;
+
+impl RuntimeOrigin {
+    /// The runtime source this origin lets an emit carry, given the `runtime`
+    /// its caller resolved.
+    ///
+    /// A gate carries the embedded copy whatever it was handed, so a caller
+    /// pairing gate options with an override root cannot steer a judged build;
+    /// a developer build carries `runtime` as resolved.
+    #[must_use]
+    pub const fn admitted_runtime(self, runtime: &RuntimeSource) -> &RuntimeSource {
+        match self {
+            Self::Gate => &EMBEDDED_RUNTIME,
+            Self::Developer => runtime,
+        }
+    }
+}
+
 /// The variable that selects the runtime source an emit carries.
 pub const RUNTIME_VENDORED_VAR: &str = "IPE_RUNTIME_VENDORED";
 
@@ -985,6 +1004,22 @@ mod tests {
             RuntimeRemedy::EnvOnly,
         );
         assert!(matches!(resolved, Ok(RuntimeSource::Embedded)));
+    }
+
+    /// A gate admits only the embedded copy even when handed a proven
+    /// override, so gate options paired with an override root cannot steer the
+    /// judged emit; a developer build carries the override it resolved.
+    #[test]
+    fn a_gate_admits_only_the_embedded_runtime_whatever_it_is_handed() {
+        let dir = runtime_root_at("ipe-runtime-gate-admit", COMPILER_VERSION);
+        let proven = ProvenRoot::prove(&dir, RuntimeRemedy::EnvOnly);
+        let _ = std::fs::remove_dir_all(&dir);
+        let handed = RuntimeSource::Override(proven.expect("the override root proves"));
+        assert_eq!(
+            RuntimeOrigin::Gate.admitted_runtime(&handed),
+            &RuntimeSource::Embedded
+        );
+        assert_eq!(RuntimeOrigin::Developer.admitted_runtime(&handed), &handed);
     }
 
     /// An explicit root beats `IPE_RUNTIME_DIR`: a valid explicit root wins
