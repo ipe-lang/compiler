@@ -7,11 +7,12 @@ authors = ["Arthur Maciel <arthurmaciel@gmail.com>"]
 repository = "https://github.com/ipe-lang/compiler"
 
 [grammars.ipe]
-repository = "https://github.com/ipe-lang/compiler"
-# A commit whose editors/tree-sitter-ipe matches this checkout's grammar and
-# queries (Zed checks out exactly this revision; a branch name goes stale).
-# editors/tests/configure-test.sh fails when the two drift apart.
-rev = "e7ff85a969e481cc46563733dbb501f97a75bff7"
+# Filled in by editors/zed/configure.sh with the source and the commit the
+# assembled highlight query came from, so Zed's grammar checkout and the query
+# are always one revision. A stored commit could not name a grammar change's
+# own landing commit, and would go stale on every change.
+repository = "@IPE_GRAMMAR_REPOSITORY@"
+rev = "@IPE_GRAMMAR_REV@"
 path = "editors/tree-sitter-ipe"
 
 [language_servers.ipe-lsp]

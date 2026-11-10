@@ -10,9 +10,13 @@ into `~/.local/share/ipe/zed-ipe`; then run **zed: install dev extension** in
 Zed and pick that directory. Installing this directory directly gives no
 highlighting (the query is not duplicated here).
 
-- `extension.toml` pins the grammar to a commit (`rev`); bump it after a
-  grammar or query change — `editors/tests/configure-test.sh` fails while the
-  pin and the checkout disagree.
+- `extension.toml` holds placeholders for the grammar's `repository` and
+  `rev`: `configure.sh` fills them with the source and commit the assembled
+  highlight query came from (a checkout's `HEAD`, served from the checkout, or
+  the commit `IPE_EDITORS_REF` names on GitHub), so the grammar Zed builds and
+  the query always match; the pin is never edited by hand.
+  `editors/tests/configure-test.sh` replays Zed's grammar checkout and refuses
+  a pin whose grammar differs.
 - `src/lib.rs` starts `ipe lsp` from the project's `PATH`.
 - `.cargo/config.toml` keeps host-only `rustflags` from a global cargo config
   (e.g. a mold linker flag) out of Zed's wasm build.

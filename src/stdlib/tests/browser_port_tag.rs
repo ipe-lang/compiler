@@ -314,13 +314,17 @@ fn scan(internals: &Internals, js: Symbol, expr: &Expr, out: &mut PortScan) {
                 scan(internals, js, value, out);
             }
         }
+        Expr_::Template(template) => {
+            for part in template.exprs() {
+                scan(internals, js, part, out);
+            }
+        }
         Expr_::VarLocal(_)
         | Expr_::VarQual(..)
         | Expr_::TaskAndThen
         | Expr_::Int(_)
         | Expr_::Float(_)
         | Expr_::Str(_)
-        | Expr_::MultilineStr { .. }
         | Expr_::Char(_)
         | Expr_::Unit => {}
     }

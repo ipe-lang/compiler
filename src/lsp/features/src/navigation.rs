@@ -19,8 +19,7 @@
 //! binder's own module for a local. The definition site is not included.
 //!
 //! An occurrence the resolver does not record (an operator, a type reference,
-//! an interpolated name, a kernel-only function) resolves to nothing, never
-//! to a guess.
+//! a kernel-only function) resolves to nothing, never to a guess.
 //!
 //! [`NameIndex`]: ipe_canon::name_index::NameIndex
 

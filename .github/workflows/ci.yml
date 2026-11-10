@@ -787,7 +787,7 @@ jobs:
         if: needs.changes.outputs.release_only == 'true'
         run: |
           echo "editors-configure: release-please-only diff (version metadata, no editors-relevant source changed); trivial pass, not a skip."
-      # Full history: the drift check resolves the Zed grammar pin as a commit.
+      # Full history: the stale-pin test replays Zed's fetch at an older grammar commit.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         if: needs.changes.outputs.release_only != 'true'
         with:
