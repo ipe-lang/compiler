@@ -1156,6 +1156,17 @@ mod tests {
             assert_eq!(src.matches(api).count(), 1, "{api} has one caller");
             assert!(writer.contains(api), "{api} is called by `write_url`");
         }
+        for entry in ["fn dispatch<", "fn navigate_to<"] {
+            assert!(
+                body_of(entry).contains("frozen_step(app)"),
+                "`{entry}` keeps a scrubbed step shown, so the URL stays the shown step's"
+            );
+        }
+        assert!(
+            body_of("fn navigate_to<")
+                .contains("Some(step) => flush_overlay_scrub(app, Some(step)),"),
+            "a navigation during a scrub re-commits the scrubbed step and its URL"
+        );
     }
 
     #[test]

@@ -970,10 +970,32 @@ where
     };
     *app.model.borrow_mut() = new_model.clone();
 
-    commit_view(app, render_frame(app, new_model), None, false);
+    // A scrubbed past step stays shown, as in `dispatch`; re-committing it
+    // writes its URL back over the one the browser moved to.
+    match frozen_step(app) {
+        None => commit_view(app, render_frame(app, new_model), None, false),
+        #[cfg(feature = "debugger")]
+        Some(step) => flush_overlay_scrub(app, Some(step)),
+        #[cfg(not(feature = "debugger"))]
+        Some(_) => {}
+    }
 
     run_cmd(app, cmd);
     resync_subscriptions(app);
+}
+
+/// The past step the debugger scrubber holds the view at, `None` when the
+/// view follows the live model.
+fn frozen_step<Model, Msg>(app: &App<Model, Msg>) -> Option<usize> {
+    #[cfg(feature = "debugger")]
+    {
+        app.overlay.as_ref().and_then(|ov| ov.scrub_step())
+    }
+    #[cfg(not(feature = "debugger"))]
+    {
+        let _: &App<Model, Msg> = app;
+        None
+    }
 }
 
 fn document() -> Result<web_sys::Document, MountRefusal> {
@@ -1372,16 +1394,7 @@ where
     // corrupted), but the DOM is NOT updated to the new live model — the user's
     // chosen past step stays visible until they return the scrubber to the end.
     // Effects still fire (they were produced by the live update pass above).
-    #[cfg(feature = "debugger")]
-    let scrub_active = app
-        .overlay
-        .as_ref()
-        .and_then(|ov| ov.scrub_step())
-        .is_some();
-    #[cfg(not(feature = "debugger"))]
-    let scrub_active = false;
-
-    if !scrub_active {
+    if frozen_step(app).is_none() {
         let frame = render_frame(app, model);
         let target = if cause.addressed(&focus_mark()) {
             focus_target(&app.tree.borrow(), &frame.tree)
