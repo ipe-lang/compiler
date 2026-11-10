@@ -137,16 +137,21 @@ pub fn refuse_owned_warnings(json_stdout: &str, app_package: &str) -> Result<(),
 /// `<name> <version> (<source-url>)`.
 fn package_name(id: &str) -> Option<&str> {
     let name = match id.split_once('#') {
-        Some((url, fragment)) => match fragment.split_once('@') {
-            Some((name, _version)) => name,
-            None => {
-                let path = url.split(['?', '#']).next().unwrap_or(url);
-                path.trim_end_matches('/').rsplit('/').next()?
-            }
-        },
+        Some((url, fragment)) => fragment
+            .split_once('@')
+            .map_or_else(|| last_path_segment(url), |(name, _version)| Some(name))?,
         None => id.split_whitespace().next()?,
     };
     (!name.is_empty()).then_some(name)
+}
+
+/// The last path segment of a package-id source URL, ignoring its query.
+fn last_path_segment(url: &str) -> Option<&str> {
+    url.split('?')
+        .next()?
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
 }
 
 #[cfg(test)]
