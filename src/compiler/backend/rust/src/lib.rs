@@ -39,6 +39,7 @@ mod served_install;
 pub use served_install::{
     ICON_MAX_BYTES, IconRefusal, IconSide, MIN_ICON_SIDE, ServedIcon, ServedInstall, test_png,
 };
+mod attr_names;
 mod emit_model_schema;
 mod emit_template;
 mod emit_tui;
@@ -49,6 +50,7 @@ mod emit_web;
 mod emit_webview;
 mod emit_worker;
 mod items;
+mod kernel_walk;
 mod layout_sweep;
 mod naming;
 mod preamble;
@@ -1764,8 +1766,12 @@ impl<'a> EmitCtx<'a> {
             EmitHost::WebView(window) => (true, Some(window), ServedInstall::Off),
         };
         // Every emission entry builds its context here, so a malformed literal
-        // route path is refused whether or not emission reaches the route.
-        route_grammar::refuse_malformed_literals(program)?;
+        // route path or a runtime-owned literal attribute name is refused
+        // whether or not emission reaches the site.
+        kernel_walk::each_kernel_site(program, &mut |site| {
+            route_grammar::refuse_route_site(site)?;
+            attr_names::refuse_reserved_attr_site(site)
+        })?;
         let mut enum_names: BTreeMap<(ModPath, Symbol), String> = BTreeMap::new();
         // Generated Rust type name -> the first Ipê type (dotted) that claimed
         // it. Keyed by the emitted name so a fold collision is an O(1) lookup

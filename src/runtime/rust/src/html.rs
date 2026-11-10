@@ -1208,16 +1208,48 @@ pub(crate) const HANDLER_ID_ATTR: &str = "data-ipe-hid";
 /// admits styles by.
 const NONCE_ATTR: &str = "nonce";
 
+/// The attribute a page would use to name its own URL.
+///
+/// A routed app's URL is the route of its committed page, written by the
+/// runtime alone; a program-built one names no location, so it is reserved and
+/// never reaches the page.
+const PAGE_PATH_ATTR: &str = "data-ipe-path";
+
+/// The attribute-name namespace the runtime's own markers live in.
+///
+/// Runtime-rendered markers (`data-ipe-hid`, the `Ipe.Ui` style and event
+/// markers) and the client's own state flags are spelled under it, so no
+/// program spells a literal name in it.
+const RUNTIME_ATTR_NAMESPACE: &[u8] = b"data-ipe-";
+
+/// True when `name` starts with `prefix`, compared ASCII-case-insensitively.
+fn has_ascii_prefix(name: &str, prefix: &[u8]) -> bool {
+    name.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
 /// True for a name only the runtime writes, compared ASCII-case-insensitively.
 ///
 /// That is a name starting with [`RESERVED_ATTR_PREFIX`], [`HANDLER_ID_ATTR`],
-/// or [`NONCE_ATTR`].
+/// [`NONCE_ATTR`], or [`PAGE_PATH_ATTR`].
 fn is_reserved_attr_name(name: &str) -> bool {
-    name.as_bytes()
-        .get(..RESERVED_ATTR_PREFIX.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_ATTR_PREFIX))
+    has_ascii_prefix(name, RESERVED_ATTR_PREFIX)
         || name.eq_ignore_ascii_case(HANDLER_ID_ATTR)
         || name.eq_ignore_ascii_case(NONCE_ATTR)
+        || name.eq_ignore_ascii_case(PAGE_PATH_ATTR)
+}
+
+/// True for an attribute name a program may not spell as a literal.
+///
+/// That is every reserved name but the exact `ipe-key` the stamper reads a
+/// key from, and every name in [`RUNTIME_ATTR_NAMESPACE`]. The compiler
+/// refuses a literal attribute name through this predicate, so the
+/// compile-time refusal and the render sink share one reserved set.
+#[must_use]
+pub fn is_runtime_owned_attr_name(name: &str) -> bool {
+    (name != KEY_ATTR && is_reserved_attr_name(name))
+        || has_ascii_prefix(name, RUNTIME_ATTR_NAMESPACE)
 }
 
 /// A validated HTML **attribute** name (parse-don't-validate). The ONLY way to
@@ -3381,6 +3413,56 @@ mod tests {
         }
         assert!(SafeAttrName::parse("ipe").is_some());
         assert!(SafeAttrName::parse("data-ipe-x").is_some());
+    }
+
+    /// A program-built page-path attribute, in any ASCII case, reaches no sink.
+    #[test]
+    fn reserved_path_attr_dropped() {
+        for name in [PAGE_PATH_ATTR, "DATA-IPE-PATH", "Data-Ipe-Path"] {
+            assert!(SafeAttrName::parse(name).is_none(), "{name}");
+            assert!(safe_patch_attr(name, "/planted").is_none(), "{name}");
+            let t: Html<()> = Html::HElement(
+                "div".into(),
+                vec![Attribute::Attr(name.into(), "/planted".into())],
+                vec![],
+            );
+            let low = render_html(&t).to_ascii_lowercase();
+            assert!(
+                !low.contains("data-ipe-path") && !low.contains("/planted"),
+                "{low}"
+            );
+        }
+        assert!(SafeAttrName::parse("data-ipe-paths").is_some());
+    }
+
+    /// The literal names the compiler refuses are the reserved set, less the
+    /// exact `ipe-key`, plus the whole `data-ipe-` namespace.
+    #[test]
+    fn runtime_owned_attr_names_cover_the_reserved_set() {
+        for name in [
+            "ipe-id",
+            "IPE-KEY",
+            "ipe-click",
+            "nonce",
+            "NONCE",
+            HANDLER_ID_ATTR,
+            PAGE_PATH_ATTR,
+            "DATA-IPE-PATH",
+            "data-ipe-mq-rules",
+            "Data-Ipe-On",
+        ] {
+            assert!(is_runtime_owned_attr_name(name), "{name}");
+        }
+        for name in [
+            KEY_ATTR,
+            "ipe",
+            "data-ipe",
+            "data-ip-path",
+            "title",
+            "data-x",
+        ] {
+            assert!(!is_runtime_owned_attr_name(name), "{name}");
+        }
     }
 
     /// An unstamped tree still drops every program-built reserved name other

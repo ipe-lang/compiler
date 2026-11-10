@@ -2136,7 +2136,7 @@ pub fn emit_server_call(
         // Route constructors whose first argument is the route path use the
         // standard N-arg call path; a literal path was already held to the
         // runtime's parameter-name grammar (IPE-L0156) by
-        // `route_grammar::refuse_malformed_literals` over the whole program.
+        // `route_grammar::refuse_route_site` over the whole program.
         KernelFn::ServerGet
         | KernelFn::ServerPost
         | KernelFn::ServerPut

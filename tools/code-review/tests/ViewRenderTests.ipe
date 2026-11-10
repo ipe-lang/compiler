@@ -616,11 +616,11 @@ decisionErrorFixedText loaded =
         && not (has "Decision not saved: " (page card))
 
 
--- ── the address the page reports ────────────────────────────────────
--- The path an address reports is an attribute value, escaped at the sink; the
--- three pages report their fixed paths.
-pathAttributeEscaped : Index.UnitView -> Bool
-pathAttributeEscaped loaded =
+-- ── the address follows the page ──────────────────────────────────
+-- The app is routed, so the browser address follows `model.page`; no page
+-- names its own path, and a hostile address never reaches the markup raw.
+noPageNamesItsPath : Index.UnitView -> Bool
+noPageNamesItsPath loaded =
     let
         hostileAddress =
             "\"><script>alert(1)</script>"
@@ -628,15 +628,12 @@ pathAttributeEscaped loaded =
         hostile =
             page (addressModel hostileAddress)
 
-        plain =
-            page (addressModel "abc")
+        pages =
+            [ hostile, page (addressModel "abc"), page baseModel, page (historyModel []), page (cardModel loaded) ]
     in
-    has "data-ipe-path=\"/unit/&#34;&gt;&lt;script&gt;alert(1)&lt;/script&gt;\"" hostile
+    List.all (\html -> not (has "data-ipe-path" html)) pages
         && not (has "<script>" hostile)
         && not (has hostileAddress hostile)
-        && has "data-ipe-path=\"/unit/abc\"" plain
-        && has "data-ipe-path=\"/\"" (page baseModel)
-        && has "data-ipe-path=\"/history\"" (page (historyModel []))
 
 
 -- ── links ──────────────────────────────────────────────────────────
@@ -966,7 +963,7 @@ seededChecks epoch a b =
     , ( "the progress line and the showing header follow the model's counts", countsFollowModel a b )
     , ( "a refused draft shows its case's fixed text in the open refusal panel", refuseErrorFixedText epoch a )
     , ( "a failed decision save shows its case's fixed text in the queue banner", decisionErrorFixedText a )
-    , ( "the reported address is escaped as an attribute value", pathAttributeEscaped a )
+    , ( "no page names its own path, and a hostile address never reaches the markup raw", noPageNamesItsPath a )
     , ( "an unsafe link target renders as plain text with no href", List.all (unsafeLinkHasNoHref a) unsafeTargets )
     , ( "an https link target renders as an href", safeLinkHasHref a )
     , ( "a URL at the href ceiling is linked whole and one byte over is shown cut and never linked", hrefCeilingIsExact a )

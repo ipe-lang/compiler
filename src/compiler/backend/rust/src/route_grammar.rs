@@ -30,7 +30,9 @@ use ipe_diagnostics::terminal::is_display_hazard;
 use ipe_diagnostics::{
     DResult, Diagnostic, LowerError, MountPrefixFault, RoutePatternDefect, Span,
 };
-use ipe_ir::{Callee, Expr, KernelFn, Program};
+use ipe_ir::{Callee, Expr, KernelFn};
+
+use crate::kernel_walk::KernelSite;
 use ipe_runtime_rust::encoding::{
     EndpointMethod, MAX_MOUNT_BASE_LEN, MountBase, MountBaseRefusal, router_param_len,
 };
@@ -452,110 +454,44 @@ fn refuse_unliteral_mount(k: KernelFn) -> DResult<()> {
     )
 }
 
-/// Refuse every malformed literal route path anywhere in `program`.
+/// Refuse a malformed literal route path at one kernel site.
 ///
-/// The check walks the whole lowered program rather than riding on route
-/// emission, so a route the emitted app never serves (an unrouted `Web.tea`
-/// whose `routes` list is dropped, an unreachable helper) is refused the same
-/// as one that is served.
+/// It runs over every kernel site of the whole lowered program (see
+/// `kernel_walk`) rather than riding on route emission, so a route the
+/// emitted app never serves (an unrouted `Web.tea` whose `routes` list is
+/// dropped, an unreachable helper) is refused the same as one that is served.
 ///
 /// # Errors
 ///
-/// IPE-L0156 for the first malformed literal path.
-pub fn refuse_malformed_literals(program: &Program) -> DResult<()> {
-    program
-        .modules
-        .iter()
-        .flat_map(|module| &module.funcs)
-        .try_for_each(|func| literal_routes(&func.body))
-}
-
-/// Refuse every malformed literal route path inside `expr`.
-fn literal_routes(expr: &Expr) -> DResult<()> {
-    match expr {
-        Expr::Int(_)
-        | Expr::Bool(_)
-        | Expr::Float(_)
-        | Expr::Str(_)
-        | Expr::CustomElementRef { .. }
-        | Expr::Char(_)
-        | Expr::Unit
-        | Expr::Var(_)
-        | Expr::CloneVar(_) => Ok(()),
-        Expr::FuncValue { callee, .. } => match callee {
-            Callee::Kernel(k) if matches!(route_path_of(*k), Some(RoutePath::Mount)) => {
-                refuse_unliteral_mount(*k)
-            }
-            _ => Ok(()),
-        },
-        Expr::Call { callee, args, .. } => {
-            if let Callee::Kernel(k) = callee
-                && let Some(grammar) = route_path_of(*k)
-            {
+/// IPE-L0156 for a malformed literal path at this site.
+pub fn refuse_route_site(site: KernelSite<'_>) -> DResult<()> {
+    match site {
+        KernelSite::Value(k) if matches!(route_path_of(k), Some(RoutePath::Mount)) => {
+            refuse_unliteral_mount(k)
+        }
+        KernelSite::Call { kernel, args } => {
+            if let Some(grammar) = route_path_of(kernel) {
                 match (grammar, args.first()) {
-                    (_, Some(Expr::Str(lit))) => refuse_literal(*k, grammar, lit.as_str())?,
-                    (RoutePath::Mount, _) => refuse_unliteral_mount(*k)?,
+                    (_, Some(Expr::Str(lit))) => refuse_literal(kernel, grammar, lit.as_str())?,
+                    (RoutePath::Mount, _) => refuse_unliteral_mount(kernel)?,
                     (RoutePath::Web | RoutePath::Server | RoutePath::ServerApi, _) => {}
                 }
             }
-            if matches!(callee, Callee::Kernel(KernelFn::ServerListen))
+            if matches!(kernel, KernelFn::ServerListen)
                 && let Some(Expr::List { items, .. }) = args.get(1)
             {
                 refuse_duplicate_mounts(items)?;
             }
-            args.iter().try_for_each(literal_routes)
+            Ok(())
         }
-        Expr::Ctor { args, .. } | Expr::TailRecur { args } => {
-            args.iter().try_for_each(literal_routes)
-        }
-        Expr::BinOp { lhs, rhs, .. } => {
-            literal_routes(lhs)?;
-            literal_routes(rhs)
-        }
-        Expr::Let { value, body, .. } | Expr::Destructure { value, body, .. } => {
-            literal_routes(value)?;
-            literal_routes(body)
-        }
-        Expr::If { cond, then_, else_ } => {
-            literal_routes(cond)?;
-            literal_routes(then_)?;
-            literal_routes(else_)
-        }
-        Expr::Match(m) => {
-            literal_routes(m.scrutinee())?;
-            m.arms().iter().try_for_each(|arm| {
-                if let Some(guard) = &arm.guard {
-                    literal_routes(guard)?;
-                }
-                literal_routes(&arm.body)
-            })
-        }
-        Expr::Tuple(items) | Expr::List { items, .. } => items.iter().try_for_each(literal_routes),
-        Expr::Cons { head, tail } => {
-            literal_routes(head)?;
-            literal_routes(tail)
-        }
-        Expr::ListIndexClone { list, .. } | Expr::ListLenCheck { list, .. } => literal_routes(list),
-        Expr::Record { fields, .. } => fields.iter().try_for_each(|(_, e)| literal_routes(e)),
-        Expr::Access { record, .. } => literal_routes(record),
-        Expr::Update { record, fields } => {
-            literal_routes(record)?;
-            fields.iter().try_for_each(|(_, e)| literal_routes(e))
-        }
-        Expr::Lambda { body, .. }
-        | Expr::SharedLambda { body, .. }
-        | Expr::OnceLambda { body, .. }
-        | Expr::TailLoop { body, .. }
-        | Expr::CaptureClones { body, .. } => literal_routes(body),
-        Expr::Apply { func, args } => {
-            literal_routes(func)?;
-            args.iter().try_for_each(literal_routes)
-        }
-        Expr::TaskSeq { effect, rest } => {
-            literal_routes(effect)?;
-            literal_routes(rest)
-        }
+        KernelSite::Value(_) | KernelSite::Applied { .. } => Ok(()),
     }
+}
+
+/// Refuse every malformed literal route path inside `expr`.
+#[cfg(test)]
+fn literal_routes(expr: &Expr) -> DResult<()> {
+    crate::kernel_walk::each_kernel_site_in(expr, &mut refuse_route_site)
 }
 
 #[cfg(test)]
