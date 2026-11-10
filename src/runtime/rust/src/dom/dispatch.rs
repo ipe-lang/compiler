@@ -1102,6 +1102,52 @@ mod tests {
         );
     }
 
+    /// The wasm client renders every frame of a mounted app, live, navigated
+    /// or scrubbed by the debugger, through `render_frame`, which takes the
+    /// page URL from the model it renders; `commit_view` commits that frame
+    /// and writes its URL, and the location has one writer.
+    ///
+    /// The wasm module compiles only for the browser, so its source is read.
+    #[test]
+    fn wasm_writes_the_url_of_every_frame_it_commits() {
+        let src = include_str!("../wasm/mod.rs");
+        let body_of = |sig: &str| {
+            src.split_once(sig)
+                .and_then(|(_, rest)| rest.split_once("\n}\n"))
+                .map(|(body, _)| body)
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            src.matches("(app.view)(").count(),
+            1,
+            "a mounted app's view is rendered only by `render_frame`"
+        );
+        assert!(
+            body_of("fn render_frame<").contains("(app.view)(model)"),
+            "`render_frame` renders the model it takes the URL of"
+        );
+        assert!(
+            src.contains(
+                "    frame: Frame<Msg>,\n    target: Option<&StampedId>,\n    push: bool,"
+            ),
+            "`commit_view` commits a rendered frame, never a bare tree"
+        );
+        assert!(
+            body_of("fn commit_view<").contains("write_url(&url, push);"),
+            "`commit_view` writes the URL of the frame it commits"
+        );
+        assert_eq!(
+            src.matches("write_url(").count(),
+            3,
+            "the location is written by the committer and the mount only"
+        );
+        let writer = body_of("fn write_url(");
+        for api in ["push_state_with_url(", "replace_state_with_url("] {
+            assert_eq!(src.matches(api).count(), 1, "{api} has one caller");
+            assert!(writer.contains(api), "{api} is called by `write_url`");
+        }
+    }
+
     #[test]
     fn commit_at_the_last_counter_is_exhausted_and_keeps_the_view() {
         let mut r =

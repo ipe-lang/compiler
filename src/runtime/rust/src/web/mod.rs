@@ -6842,18 +6842,26 @@ mod handlers {
             .into_response()
     }
 
-    /// Install the render a debugger endpoint shows as the session's current
-    /// render, minting its epoch, and return that epoch with the stamped
-    /// render; `None` when no epoch is left to mint.
+    /// Install the render of `model` a debugger endpoint shows as the
+    /// session's current render, minting its epoch, and return that epoch with
+    /// the stamped render and the page URL it commits; `None` when no epoch is
+    /// left to mint.
+    ///
+    /// The route is taken from the shown model before `render` consumes it, so
+    /// the URL the epoch carries is the shown step's, never the replaced one's.
     #[cfg(feature = "debugger")]
     fn commit_debug_render<Model, Msg: Clone + RetainedBytes>(
         handle: &store::SessionHandle<Model, Msg>,
-        tree: Html<Msg>,
-    ) -> Option<(RenderEpoch, StampedHtml)> {
+        page_url: &PageUrlOf<Model>,
+        model: Model,
+        render: impl FnOnce(Model) -> Html<Msg>,
+    ) -> Option<(RenderEpoch, StampedHtml, PageUrl)> {
+        let route = page_url(&model);
+        log_unrenderable(&route);
+        let tree = render(model);
         let mut e = handle.lock().unwrap_or_else(|e| e.into_inner());
-        let route = e.rendered.route().clone();
-        let epoch = e.rendered.commit(tree, route).ok()?.to;
-        Some((epoch, e.rendered.page()))
+        let epoch = e.rendered.commit(tree, route.clone()).ok()?.to;
+        Some((epoch, e.rendered.page(), route))
     }
 
     /// The retained step a debugger scrub asks to show. The overlay renders
@@ -6956,13 +6964,18 @@ mod handlers {
         let Some((step, model)) = reconstructed else {
             return (axum::http::StatusCode::NOT_FOUND, "step out of range").into_response();
         };
-        let mut tree = pubsub::with_session(&scope, || (st.view)(model));
-        assign_ipe_ids(&mut tree, "r");
-        style_inject::apply_style_injections(&mut tree);
         // The debugger shows this render, so it becomes the session's current
         // render under a new epoch: the ids in the DOM it shows resolve against
-        // its own handler index, never the one it replaced.
-        let Some((epoch, html_body)) = commit_debug_render(&handle, tree) else {
+        // its own handler index, never the one it replaced, and the URL it
+        // carries is the shown model's.
+        let Some((epoch, html_body, route)) =
+            commit_debug_render(&handle, &st.page_url, model, |shown| {
+                let mut tree = pubsub::with_session(&scope, || (st.view)(shown));
+                assign_ipe_ids(&mut tree, "r");
+                style_inject::apply_style_injections(&mut tree);
+                tree
+            })
+        else {
             close_session(&st.store, &sid, Some(&handle), CloseReason::Ended).await;
             return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
         };
@@ -6974,6 +6987,7 @@ mod handlers {
             "body": html_body.as_str(),
             "epoch": epoch.to_token(),
             "step": step,
+            "route": route.path(),
         });
         session_body_response(
             axum::http::StatusCode::OK,
@@ -7278,13 +7292,18 @@ mod handlers {
         if !debug_resident(&st.store, &sid, &handle).await {
             return too_large();
         }
-        let mut tree = pubsub::with_session(&scope, || (st.view)(model_at_n));
-        assign_ipe_ids(&mut tree, "r");
-        style_inject::apply_style_injections(&mut tree);
         // The debugger shows this render, so it becomes the session's current
         // render under a new epoch: the ids in the DOM it shows resolve against
-        // its own handler index, never the one it replaced.
-        let Some((epoch, html_body)) = commit_debug_render(&handle, tree) else {
+        // its own handler index, never the one it replaced, and the URL it
+        // carries is the shown model's.
+        let Some((epoch, html_body, route)) =
+            commit_debug_render(&handle, &st.page_url, model_at_n, |shown| {
+                let mut tree = pubsub::with_session(&scope, || (st.view)(shown));
+                assign_ipe_ids(&mut tree, "r");
+                style_inject::apply_style_injections(&mut tree);
+                tree
+            })
+        else {
             close_session(&st.store, &sid, Some(&handle), CloseReason::Ended).await;
             return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
         };
@@ -7297,6 +7316,7 @@ mod handlers {
             "epoch":  epoch.to_token(),
             "cursor": cursor,
             "total":  total,
+            "route":  route.path(),
         });
         session_body_response(
             axum::http::StatusCode::OK,
@@ -7361,13 +7381,18 @@ mod handlers {
         if !debug_resident(&st.store, &sid, &handle).await {
             return too_large();
         }
-        let mut tree = pubsub::with_session(&scope, || (st.view)(model_at_n));
-        assign_ipe_ids(&mut tree, "r");
-        style_inject::apply_style_injections(&mut tree);
         // The debugger shows this render, so it becomes the session's current
         // render under a new epoch: the ids in the DOM it shows resolve against
-        // its own handler index, never the one it replaced.
-        let Some((epoch, html_body)) = commit_debug_render(&handle, tree) else {
+        // its own handler index, never the one it replaced, and the URL it
+        // carries is the shown model's.
+        let Some((epoch, html_body, route)) =
+            commit_debug_render(&handle, &st.page_url, model_at_n, |shown| {
+                let mut tree = pubsub::with_session(&scope, || (st.view)(shown));
+                assign_ipe_ids(&mut tree, "r");
+                style_inject::apply_style_injections(&mut tree);
+                tree
+            })
+        else {
             close_session(&st.store, &sid, Some(&handle), CloseReason::Ended).await;
             return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
         };
@@ -7380,6 +7405,7 @@ mod handlers {
             "epoch":  epoch.to_token(),
             "cursor": cursor,
             "total":  total,
+            "route":  route.path(),
         });
         session_body_response(
             axum::http::StatusCode::OK,
@@ -7448,13 +7474,18 @@ mod handlers {
         if !debug_resident(&st.store, &sid, &handle).await {
             return too_large();
         }
-        let mut tree = pubsub::with_session(&scope, || (st.view)(model_at_n));
-        assign_ipe_ids(&mut tree, "r");
-        style_inject::apply_style_injections(&mut tree);
         // The debugger shows this render, so it becomes the session's current
         // render under a new epoch: the ids in the DOM it shows resolve against
-        // its own handler index, never the one it replaced.
-        let Some((epoch, html_body)) = commit_debug_render(&handle, tree) else {
+        // its own handler index, never the one it replaced, and the URL it
+        // carries is the shown model's.
+        let Some((epoch, html_body, route)) =
+            commit_debug_render(&handle, &st.page_url, model_at_n, |shown| {
+                let mut tree = pubsub::with_session(&scope, || (st.view)(shown));
+                assign_ipe_ids(&mut tree, "r");
+                style_inject::apply_style_injections(&mut tree);
+                tree
+            })
+        else {
             close_session(&st.store, &sid, Some(&handle), CloseReason::Ended).await;
             return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
         };
@@ -7467,6 +7498,7 @@ mod handlers {
             "epoch":  epoch.to_token(),
             "cursor": cursor,
             "total":  total,
+            "route":  route.path(),
         });
         session_body_response(
             axum::http::StatusCode::OK,
@@ -9580,8 +9612,32 @@ mod base_path_tests {
             );
         }
         assert!(
-            sync.contains("__ipeRecordNav(u.pathname, push, at);"),
+            sync.contains("__ipeRecordNav(path, push, at);"),
             "a render's route is recorded through `__ipeRecordNav`"
+        );
+        // A forged route such as `/app/../evil` or `/app/%2e%2e/evil` passes a
+        // base check on its raw text and resolves outside the base: the route
+        // must resolve to itself, and the base is checked on the resolved path.
+        let at = |needle: &str| sync.find(needle);
+        let (parsed, unchanged, base, recorded) = (
+            at("u = new URL(route, window.location.href);"),
+            at("if (u.origin !== window.location.origin || u.pathname !== route) return;"),
+            at(
+                "if (__ipeBase && path !== __ipeBase && path.indexOf(__ipeBase + \"/\") !== 0) return;",
+            ),
+            at("__ipeRecordNav(path, push, at);"),
+        );
+        assert!(
+            matches!(
+                (parsed, unchanged, base, recorded),
+                (Some(p), Some(u), Some(b), Some(r)) if p < u && u < b && b < r
+            ),
+            "the route is resolved, refused unless unchanged, then base-checked: \
+             {parsed:?} {unchanged:?} {base:?} {recorded:?}"
+        );
+        assert!(
+            !sync.contains("route.indexOf(__ipeBase"),
+            "the base is never checked on the unresolved route text"
         );
         assert!(
             record.contains(
@@ -14854,6 +14910,113 @@ mod emitted_router_behavior_tests {
                 Some(shown.as_str()),
                 "the committed render is the one the debugger shows"
             );
+        });
+    }
+
+    /// The page URL of a count-routed page: `/zero`, `/one`, then `/many`.
+    #[cfg(feature = "debugger")]
+    fn counted_page_url() -> PageUrlOf<Model> {
+        let routes: Arc<[route::Route<()>]> = Arc::new([
+            route::Route::new("/zero", |_| Some(())),
+            route::Route::new("/one", |_| Some(())),
+            route::Route::new("/many", |_| Some(())),
+        ]);
+        let base = crate::encoding::MountBase::root().encoded();
+        Arc::new(move |m: &Model| {
+            let index = match m.count {
+                0 => 0,
+                1 => 1,
+                _ => 2,
+            };
+            route::page_url(&base, route::render_route(&*routes, index, &[]))
+        })
+    }
+
+    /// A debugger step or scrub commits the shown model's URL with the render
+    /// it shows, and names it in its reply: the epoch it mints never carries
+    /// the route of the render it replaced.
+    #[cfg(feature = "debugger")]
+    #[test]
+    #[allow(clippy::expect_used)] // the page and the step replies are fixtures
+    fn a_debugger_step_commits_the_shown_models_route() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let routed = |store: Arc<Store>| {
+                let mut state = make_state(store);
+                state.page_url = counted_page_url();
+                build_web_router::<
+                    Model,
+                    Msg,
+                    fn(WebReq) -> (Model, IpeCmd<Msg>),
+                    fn(Msg, Model) -> (Model, IpeCmd<Msg>),
+                    fn(Model) -> Html<Msg>,
+                    fn(Model) -> IpeSub<Msg>,
+                >(state, false)
+                .map(crate::server::behind_listener)
+                .expect("the unset test base parses")
+            };
+            let committed_route = |handle: &SessionHandle<Model, Msg>| {
+                handle
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .rendered
+                    .route()
+                    .path()
+                    .map(str::to_owned)
+            };
+            let (sid, body) = get(routed(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            for count in 1..=2 {
+                let epoch = current_epoch(&store, &sid).await;
+                let event = click_body(&plus, Some(&epoch), None);
+                assert_eq!(
+                    post_event(routed(store.clone()), &sid, &event).await,
+                    StatusCode::OK
+                );
+                await_model(&store, &sid, |m| m.count == count).await;
+            }
+            let handle = session_of(&store, &sid).await;
+            assert_eq!(
+                committed_route(&handle).as_deref(),
+                Some("/many"),
+                "the live render carries the live model's route"
+            );
+            for endpoint in ["/_ipe/debug/step-to", "/_ipe/debug/scrub"] {
+                let resp = routed(store.clone())
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(endpoint)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .header(
+                                header::COOKIE,
+                                format!(
+                                    "{}={sid}",
+                                    cookie_name_for(&crate::encoding::MountBase::root())
+                                ),
+                            )
+                            .body(Body::from(r#"{"index":0}"#))
+                            .expect("build POST"),
+                    )
+                    .await
+                    .expect("router responds");
+                assert_eq!(resp.status(), StatusCode::OK, "{endpoint}");
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .expect("read body");
+                let reply: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("the step reply is JSON");
+                let shown = reply.get("route").and_then(serde_json::Value::as_str);
+                assert!(
+                    matches!(shown, Some("/zero" | "/one")),
+                    "{endpoint}: the reply names the shown step's route, got {reply}"
+                );
+                assert_eq!(
+                    committed_route(&handle).as_deref(),
+                    shown,
+                    "{endpoint}: the committed epoch carries the shown step's route"
+                );
+            }
         });
     }
 

@@ -228,7 +228,7 @@ pub const OVERLAY_JS: &str = "\n\
             var root=doc.byId('ipe-root');\n\
             var adopt=window.__ipeAdoptFullBody;\n\
             var step=typeof d.step==='number'?d.step:-1;\n\
-            if(root&&typeof adopt==='function')adopt(d.epoch,function(){root.innerHTML=d.body;highlight(step);});\n\
+            if(root&&typeof adopt==='function')adopt(d.epoch,function(){root.innerHTML=d.body;highlight(step);},d.route);\n\
           }\n\
         }catch(e){}\n\
       }\n\
@@ -350,11 +350,12 @@ mod tests {
             "overlay must include the reset button"
         );
         // A scrubbed render is a full render: it is applied, and its epoch
-        // adopted, only through the client's render-history gate, so a stale
-        // document or a render of another history never reaches the DOM.
+        // adopted, only through the client's render-history gate with the route
+        // it was committed with, so a stale document or a render of another
+        // history never reaches the DOM, and the URL follows the shown step.
         assert!(
             html.contains(
-                "if(root&&typeof adopt==='function')adopt(d.epoch,function(){root.innerHTML=d.body;highlight(step);});"
+                "if(root&&typeof adopt==='function')adopt(d.epoch,function(){root.innerHTML=d.body;highlight(step);},d.route);"
             ),
             "a scrubbed render must pass the client's render-history gate"
         );

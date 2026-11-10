@@ -364,15 +364,20 @@ function __ipeAdoptPatches(frame) {
 // never recorded, and a route that is already the location's path records
 // nothing, so its query and fragment stay. A render with no route (an
 // unrouted app, or a page whose route does not render) leaves the URL as it is.
+//
+// The route is judged as the browser resolves it: one the URL parser rewrites
+// (a dot segment, an encoded dot, a backslash, a query or fragment) is not a
+// path the server minted, and the base check reads the resolved path.
 function __ipeSyncRoute(route, push, at) {
   if (typeof route !== "string" || !at) return;
   if (route.charAt(0) !== "/" || route.charAt(1) === "/") return;
-  if (__ipeBase && route !== __ipeBase && route.indexOf(__ipeBase + "/") !== 0) return;
   var u;
   try { u = new URL(route, window.location.href); } catch (_) { return; }
-  if (u.origin !== window.location.origin) return;
-  if (u.pathname === window.location.pathname) return;
-  __ipeRecordNav(u.pathname, push, at);
+  if (u.origin !== window.location.origin || u.pathname !== route) return;
+  var path = u.pathname;
+  if (__ipeBase && path !== __ipeBase && path.indexOf(__ipeBase + "/") !== 0) return;
+  if (path === window.location.pathname) return;
+  __ipeRecordNav(path, push, at);
 }
 // Set once this document has refused a render of another history: from then
 // on it applies no patch and no full render.

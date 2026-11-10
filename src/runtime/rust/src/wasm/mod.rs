@@ -904,7 +904,7 @@ where
     attach_widget_up_listener(&body, &app)?;
     attach_popstate_listener(&app, base)?;
     // The entered page's route rewrites the entry the app was loaded at.
-    sync_url(&app, false);
+    sync_mounted_url(&app);
     // The first paint parsed markup; deliver each widget's decoded
     // down-state PROPERTY once here (later changes ride the diff/patch route).
     widget::sync_widget_properties(&document, &app.tree.borrow());
@@ -970,10 +970,7 @@ where
     };
     *app.model.borrow_mut() = new_model.clone();
 
-    let mut new_tree = (app.view)(new_model);
-    assign_ipe_ids(&mut new_tree, ROOT_IPE_ID);
-    commit_view(app, new_tree, None);
-    sync_url(app, false);
+    commit_view(app, render_frame(app, new_model), None, false);
 
     run_cmd(app, cmd);
     resync_subscriptions(app);
@@ -1385,15 +1382,13 @@ where
     let scrub_active = false;
 
     if !scrub_active {
-        let mut new_tree = (app.view)(model);
-        assign_ipe_ids(&mut new_tree, ROOT_IPE_ID);
+        let frame = render_frame(app, model);
         let target = if cause.addressed(&focus_mark()) {
-            focus_target(&app.tree.borrow(), &new_tree)
+            focus_target(&app.tree.borrow(), &frame.tree)
         } else {
             None
         };
-        commit_view(app, new_tree, target.as_ref());
-        sync_url(app, cause.is_user());
+        commit_view(app, frame, target.as_ref(), cause.is_user());
     }
 
     for cmd in cmds {
@@ -1473,8 +1468,6 @@ where
     Model: Clone + 'static,
     Msg: Clone + 'static,
 {
-    use crate::html::assign_ipe_ids;
-
     let render_model = match step {
         None => {
             // Resuming live: re-render the current live model.
@@ -1499,9 +1492,8 @@ where
         }
     };
 
-    let mut new_tree = (app.view)(render_model);
-    assign_ipe_ids(&mut new_tree, ROOT_IPE_ID);
-    commit_view(app, new_tree, None);
+    // The shown step's page is the location, rewriting the current entry.
+    commit_view(app, render_frame(app, render_model), None, false);
 
     // Refresh the overlay panel to highlight the newly selected step.
     refresh_overlay(app);
@@ -1988,18 +1980,47 @@ fn fragment_target(document: &web_sys::Document) -> Option<web_sys::Element> {
     })
 }
 
-/// Commits `new_tree` as the app's next frame, focusing `target` when the
-/// frame addresses one.
+/// The view of one model with the page URL that model's page has.
 ///
-/// The view the handlers resolve against becomes `new_tree` BEFORE the frame
-/// applies: the frame's own focus moves (the focus keep, `target`) raise
+/// Both halves come from the same model in [`render_frame`], so a committed
+/// frame never carries the URL of another model than the one it shows.
+struct Frame<Msg> {
+    tree: Html<Msg>,
+    url: crate::dom::PageUrl,
+}
+
+/// Renders `model` into the frame [`commit_view`] commits: its page URL is
+/// taken before the view consumes it. An unrouted app's frame has no URL.
+fn render_frame<Model, Msg>(app: &App<Model, Msg>, model: Model) -> Frame<Msg> {
+    let url = app
+        .router
+        .as_ref()
+        .map_or(crate::dom::PageUrl::Unrouted, |router| {
+            (router.url_of)(&model)
+        });
+    let mut tree = (app.view)(model);
+    assign_ipe_ids(&mut tree, ROOT_IPE_ID);
+    Frame { tree, url }
+}
+
+/// Commits `frame` as the app's next frame, focusing `target` when the frame
+/// addresses one, then records the frame's page URL as the location: a new
+/// history entry when `push`, else the current entry rewritten.
+///
+/// The view the handlers resolve against becomes the frame's tree BEFORE the
+/// frame applies: the frame's own focus moves (the focus keep, `target`) raise
 /// `focus`/`focusin` synchronously, and the Msg such an event resolves to must
 /// come from the view on screen, never from the one the frame replaced.
 fn commit_view<Model, Msg: Clone>(
     app: &App<Model, Msg>,
-    new_tree: Html<Msg>,
+    frame: Frame<Msg>,
     target: Option<&StampedId>,
+    push: bool,
 ) {
+    let Frame {
+        tree: new_tree,
+        url,
+    } = frame;
     let patches = diff(&app.tree.borrow(), &new_tree, &RenderCtx::Unstamped);
     *app.index.borrow_mut() = build_index(&new_tree);
     *app.tree.borrow_mut() = new_tree;
@@ -2010,21 +2031,26 @@ fn commit_view<Model, Msg: Clone>(
     if let Ok(document) = document() {
         widget::sync_widget_properties(&document, &app.tree.borrow());
     }
+    write_url(&url, push);
 }
 
-/// Record the route of the page the committed model shows as the location.
-///
-/// A new history entry when `push` (a render of the user's own events),
-/// otherwise the current entry rewritten (mount, `popstate`, navigation, and
-/// every Cmd or Sub result). A route that is already the location writes
-/// nothing, an unrouted app has no route, and a page whose route does not
-/// render leaves the URL as it is and is reported once per commit.
-fn sync_url<Model, Msg>(app: &App<Model, Msg>, push: bool) {
+/// Records the route of the page the mounted model shows as the location,
+/// rewriting the entry the app was loaded at.
+fn sync_mounted_url<Model, Msg>(app: &App<Model, Msg>) {
     let Some(router) = app.router.as_ref() else {
         return;
     };
-    let url = (router.url_of)(&app.model.borrow());
-    let path = match &url {
+    write_url(&(router.url_of)(&app.model.borrow()), false);
+}
+
+/// The one writer of the location: records `url` as a new history entry when
+/// `push` (a render of the user's own events), otherwise rewriting the current
+/// entry (mount, `popstate`, navigation, a debugger scrub, and every Cmd or
+/// Sub result). A route that is already the location writes nothing, an
+/// unrouted app has no route, and a page whose route does not render leaves
+/// the URL as it is and is reported once per commit.
+fn write_url(url: &crate::dom::PageUrl, push: bool) {
+    let path = match url {
         crate::dom::PageUrl::Routed(path) => path.as_str(),
         crate::dom::PageUrl::Unrouted => return,
         crate::dom::PageUrl::Unrenderable(refusal) => {
