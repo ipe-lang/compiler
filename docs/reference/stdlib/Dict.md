@@ -19,12 +19,14 @@ functions through a typed variant so integer keys stay integers after a
 
 Example:
 
-    let
-        scores =
-            Dict.fromList [ ( "alice", 90 ), ( "bob", 75 ) ]
-    in
-    ( Dict.get "alice" scores, Dict.get "carol" scores )
-    --> ( Just 90, Nothing )
+    import Ipe.Dict as Dict
+
+    scores : Dict String Int
+    scores =
+        Dict.fromList [ ( "alice", 90 ), ( "bob", 75 ) ]
+
+    Dict.get "alice" scores --> Just 90
+    Dict.get "carol" scores --> Nothing
 
 See also: `Ipe.Set` (a set of unique values), `Ipe.List`.
 

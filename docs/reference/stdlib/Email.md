@@ -26,28 +26,30 @@ helpers so future field additions don't break record literals.
 
 Example:
 
-```ipe ipe:skip illustrative; wiring a provider, a message and the top-level send, not a standalone program
-import Ipe.Secret
+    import Ipe.Secret
+    import Ipe.System as System
+    import Ipe.Task as Task
+    import Ipe.Error as Error
 
-provider : EmailProvider
-provider =
-    Resend (Secret.fromString (System.getenvOr "RESEND_API_KEY" ""))
+    provider : EmailProvider
+    provider =
+        Resend (Secret.fromString (System.getenvOr "RESEND_API_KEY" ""))
 
-msg : EmailMessage
-msg =
-    case ( Email.parseAddress "noreply@example.com"
-         , Email.parseAddress "alice@example.com"
-         ) of
-        ( Just from, Just to ) ->
-            Email.defaultMessage { from = from, to = [ to ], subject = "Hi" }
-                |> Email.withTextBody "Hello, world!"
-        _ ->
-            -- addresses above are compile-time constants and always parse;
-            -- a real caller still has to cover this arm
+    welcome : EmailAddress -> EmailAddress -> EmailMessage
+    welcome from to =
+        Email.defaultMessage { from = from, to = [ to ], subject = "Hi" }
+            |> Email.withTextBody "Hello, world!"
 
-main =
-    Email.send provider msg
-```
+    main : Task Error String
+    main =
+        case ( Email.parseAddress "noreply@example.com"
+             , Email.parseAddress "alice@example.com"
+             ) of
+            ( Just from, Just to ) ->
+                Email.send provider (welcome from to)
+
+            _ ->
+                Task.fail (Error.invalidInput "not an email address")
 
 ## `EmailMessage`
 

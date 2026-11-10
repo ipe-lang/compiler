@@ -100,9 +100,11 @@ Set the minimum log severity for the application.  Takes a `LogLevel`
 constructor from `Ipe.Level` and returns a cross-shape `Setting a` for
 use in an app's settings list.
 
-```ipe ipe:skip illustrative; Web.appWith's other settings are elided, not a standalone program
-import Ipe.Level as Level
+    import Ipe.Level as Level
 
-Web.appWith [ Log.level Level.warn ] settings
-```
+    warnAndAbove : Setting a
+    warnAndAbove =
+        Log.level Level.warn
+
+and list it among the settings: `Web.appWith [ warnAndAbove ] app`.
 

@@ -43,7 +43,7 @@ fromString : String -> Result Error Decimal
 Parse a decimal from its string representation.
 
     Decimal.fromString "3.14" |> Result.map Decimal.toString --> Ok "3.14"
-    Decimal.fromString "nope" |> Result.map Decimal.toString |> Result.withDefault "parse error" --> "parse error"
+    Decimal.fromString "nope" |> Result.toMaybe --> Nothing
 
 ## `fromInt`
 
@@ -93,7 +93,8 @@ toStringFixed : Int -> Decimal -> String
 
 Render with a fixed number of decimal places.
 
-    Decimal.toStringFixed 2 (Decimal.fromString "3.1" |> Result.withDefault Decimal.zero) --> "3.10"
+    Decimal.toStringFixed 2 (Decimal.fromString "3.1" |> Result.withDefault Decimal.zero)
+        --> "3.10"
 
 ## `toFloat`
 
@@ -126,7 +127,8 @@ toMinor : Int -> Decimal -> Int
 
 Return the minor-unit integer at the given scale.
 
-    Decimal.toMinor 2 (Decimal.fromString "3.14" |> Result.withDefault Decimal.zero) --> 314
+    Decimal.toMinor 2 (Decimal.fromString "3.14" |> Result.withDefault Decimal.zero)
+        --> 314
 
 ## `add`
 
@@ -330,7 +332,8 @@ percentOf : Decimal -> Decimal -> Decimal
 
 `percentOf pct base` — the value of `pct`% of `base`.
 
-    Decimal.toString (Decimal.percentOf (Decimal.fromInt 10) (Decimal.fromInt 200)) --> "20"
+    Decimal.toString (Decimal.percentOf (Decimal.fromInt 10) (Decimal.fromInt 200))
+        --> "20"
 
 ## `addPercent`
 
@@ -356,5 +359,6 @@ formatWith : String -> String -> Int -> Decimal -> String
 
 `formatWith thousandsSep decimalSep places value` — locale-style formatting.
 
-    Decimal.formatWith "," "." 2 (Decimal.fromInt 1234567) --> "1,234,567.00"
+    Decimal.formatWith "," "." 2 (Decimal.fromInt 1234567)
+        --> "1,234,567.00"
 

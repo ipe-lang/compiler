@@ -16,23 +16,25 @@ JSON decoding gets a consistent vocabulary for TOML and YAML.
 
 Example:
 
+    import Ipe.Path as Path
+
     type alias DbCfg = { host : String, port : Int, name : String }
 
-    let
-        dbDecoder =
-            Config.succeed (\h p n -> { host = h, port = p, name = n })
-                |> Config.andThen
-                    (\f -> Config.map f (Config.field "host" Config.string))
-                |> Config.andThen
-                    (\f -> Config.map f (Config.field "port" Config.int))
-                |> Config.andThen
-                    (\f -> Config.map f (Config.field "name" Config.string))
-    in
-    Config.decodeToml "host = \"db\"\nport = 5432\nname = \"app\"" dbDecoder
-    --> Ok { host = "db", port = 5432, name = "app" }
+    dbDecoder : Decoder DbCfg
+    dbDecoder =
+        Config.succeed (\h p n -> { host = h, port = p, name = n })
+            |> Config.andThen
+                (\f -> Config.map f (Config.field "host" Config.string))
+            |> Config.andThen
+                (\f -> Config.map f (Config.field "port" Config.int))
+            |> Config.andThen
+                (\f -> Config.map f (Config.field "name" Config.string))
 
-`loadFromFile` runs the same decoder against a file on disk, picking the
-TOML/YAML/JSON format from its extension.
+    loadDb : Task Error DbCfg
+    loadDb =
+        case Path.fromString "config/database.toml" of
+            Err e  -> Task.fail e
+            Ok p   -> Config.loadFromFile p dbDecoder
 
 ## `Decoder`
 

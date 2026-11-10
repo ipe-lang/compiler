@@ -11,12 +11,11 @@ Use `ipe dev build` or `ipe dev run` during development.
 
 ## `log`
 
-```ipe ipe:skip illustrative; subtotal/tax are placeholder names, not a standalone program
-import Ipe.Debug as Debug
+    import Ipe.Debug as Debug
 
-total =
-    Debug.log "subtotal" subtotal + tax
-```
+    total : Int -> Int -> Int
+    total subtotal tax =
+        Debug.log "subtotal" subtotal + tax
 
 `log label value` prints `"label: value"` to stderr and returns `value`
 unchanged. The value is rendered by the total debug stringifier, so any
@@ -25,18 +24,20 @@ redacted value; `Error.toString` always keeps the redacted rendering.
 
 ## `todo`
 
-```ipe ipe:skip illustrative; Shape is a placeholder type, not a standalone program
-import Ipe.Debug as Debug
+    import Ipe.Debug as Debug
 
-describeShape : Shape -> String
-describeShape shape =
-    case shape of
-        Circle r ->
-            "circle with radius " ++ String.fromFloat r
+    type Shape
+        = Circle Float
+        | Rectangle Float Float
 
-        Rectangle _ _ ->
-            Debug.todo "rectangle case not implemented yet"
-```
+    describeShape : Shape -> String
+    describeShape shape =
+        case shape of
+            Circle r ->
+                "circle with radius " ++ String.fromFloat r
+
+            Rectangle _ _ ->
+                Debug.todo "rectangle case not implemented yet"
 
 `todo note` marks an unfinished code path. The module still compiles so
 the finished branches can be run and tested. Reaching a `todo` at runtime
@@ -46,15 +47,13 @@ an arm is still an error even if another arm contains a `todo`.
 
 ## `explain`
 
-```ipe ipe:skip illustrative; model is a placeholder, not a standalone program
-import Ipe.Debug as Debug
-import Ipe.Ui as Ui
+    import Ipe.Debug as Debug
+    import Ipe.Ui as Ui
 
-view model =
-    Ui.column
-        [ Debug.explain ]
-        [ Ui.text "hello" ]
-```
+    view model =
+        Ui.column
+            [ Debug.explain ]
+            [ Ui.text "hello" ]
 
 `explain` is an `Attribute msg` that draws visible outlines around the
 element it is applied to and every descendant, making the invisible box

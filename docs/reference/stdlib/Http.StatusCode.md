@@ -19,18 +19,18 @@ Use the four classifiers (`isSuccess`, `isRedirect`, `isClientError`,
 
 Typical use inside an `Ipe.Http` callback:
 
-```ipe ipe:skip illustrative; resp is the callback's response argument, not a standalone program
-case Http.statusCode resp of
-    sc ->
+    describe : StatusCode -> String
+    describe sc =
         if StatusCode.isSuccess sc then
-            -- handle 2xx
-            handleOk resp
+            "2xx: handled"
+
         else if StatusCode.isClientError sc then
-            -- handle 4xx
-            handleClientError resp
+            "4xx: the request was refused"
+
         else
-            handleOther resp
-```
+            "another status"
+
+called as `describe (Http.statusCode resp)`.
 
 ## `StatusCode`
 

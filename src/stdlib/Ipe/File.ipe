@@ -129,7 +129,9 @@ walk = Kernel.kernel "File_walk"
 --
 -- Example — collect only `.ipe` source files:
 --
---     walkMatching root (\p -> String.endsWith ".ipe" (Path.toString p))
+--     ipeSources : Path -> Task Error (List Path)
+--     ipeSources root =
+--         walkMatching root (\p -> String.endsWith ".ipe" (Path.toString p))
 walkMatching : Path -> (Path -> Bool) -> Task Error (List Path)
 walkMatching = Kernel.kernel "File_walkMatching"
 

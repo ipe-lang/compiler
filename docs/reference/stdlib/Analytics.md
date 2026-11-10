@@ -64,30 +64,28 @@ fail-closed on a missing or malformed column).
 
 Minimal store usage:
 
-```ipe ipe:skip illustrative; db is the app's already-open connection, not a standalone program
-import Ipe.Analytics as Analytics exposing (Config, ConsentState(..))
-import Ipe.Db.Store as Store
-import Ipe.Path as Path
+    import Ipe.Analytics as Analytics exposing (Config, ConsentState(..))
+    import Ipe.Db.Store as Store
+    import Ipe.Path exposing (Path)
 
-cfg : Config
-cfg =
-    Analytics.defaultConfig (Analytics.Jsonl (Path.fromString "/var/log/events.jsonl"))
-        |> Analytics.setConsent Granted
-        |> Analytics.identify "user-42" Analytics.noTraits
+    cfg : Path -> Config
+    cfg eventsFile =
+        Analytics.defaultConfig (Analytics.Jsonl eventsFile)
+            |> Analytics.setConsent Granted
+            |> Analytics.identify "user-42" Analytics.noTraits
 
-main : Task Error ()
-main =
-    case Analytics.eventsStore of
-        Err e ->
-            Task.fail e
+    recordSignup : Db -> Path -> Task Error ()
+    recordSignup db eventsFile =
+        case Analytics.eventsStore of
+            Err e ->
+                Task.fail e
 
-        Ok store ->
-            Store.create db store
-                |> Task.andThen (\_ ->
-                    Analytics.persist db store cfg "button_click"
-                        (Analytics.props [ ( "label", Analytics.PText "Sign up" ) ])
-                )
-```
+            Ok store ->
+                Store.create db store
+                    |> Task.andThen (\_ ->
+                        Analytics.persist db store (cfg eventsFile) "button_click"
+                            (Analytics.props [ ( "label", Analytics.PText "Sign up" ) ])
+                    )
 
 ## `Config`
 
