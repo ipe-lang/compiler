@@ -252,7 +252,7 @@ ipe health                     # toolchain diagnosis
 ## 11. Gotchas and limits
 
 - `{ model.draft | name = value }` is **not** valid (IPE-P0001). Bind first: `draft = model.draft`, then `{ model | draft = { draft | name = value } }`, or use a setter function.
-- String interpolation accepts simple expressions; a nested call used as an argument may fail. Bind it first: `count = List.length xs`, then `{{String.fromInt count}}`.
+- An interpolation body is any expression, and it ends at the first `}}`: a record closing there (`{{ f {a = {b = 1}} }}`) is IPE-P0077. Space the braces (`{b = 1} }`) or bind the value to a name first.
 - No custom operators, no `where`, no higher-kinded types.
 - `Debug.*` is dev-only; `ipe release` rejects it (IPE-L0140).
 - Non-tail-recursive list operations are O(N) on the call stack. For 200k+ elements, use a tail-recursive accumulator (`foldl`).
