@@ -2674,13 +2674,13 @@ mod fixtures {
     }
     fn multi() {
         let bare = "pub fn sub_fake() { IpeSub::Source(Box::new(move |emit| { \
-                    tokio::spawn(async move {}); SourceTask::Idle })) }";
+                    work::start(async move {}); SourceTask::Idle })) }";
         let quoted = r##"pub fn sub_quoted() {
-    let s = "tokio::spawn(";
+    let s = "work::start(";
 }
 #[cfg(test)]
 mod tests {
-    fn t() { tokio::spawn(async {}); }
+    fn t() { work::start(async {}); }
 "##;
     }
     const GUARD: fn() = crate::root_item::run;
