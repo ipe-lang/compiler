@@ -456,6 +456,9 @@ struct BootConfig<'a> {
     epoch: String,
     base: &'a str,
     csrf: &'a str,
+    /// The browser path of the served page, absent when it has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    route: Option<&'a str>,
     cfg: ClientConfig<'a>,
 }
 
@@ -534,6 +537,7 @@ pub fn render_page_full(
     base: &crate::encoding::MountBase,
     body: &str,
     epoch: &RenderEpoch,
+    route: &PageUrl,
     csrf_token: &str,
 ) -> Result<String, BootRefusal> {
     render_live_page(
@@ -543,6 +547,7 @@ pub fn render_page_full(
         base,
         body,
         epoch,
+        route,
         csrf_token,
         "",
     )
@@ -564,7 +569,8 @@ pub fn render_page_full(
 /// `tuning` is the process's resolved client tuning; a refused one refuses the
 /// page. `install` is the build's install offer: with one, the head carries
 /// the manifest and touch-icon links; with none, the page has neither.
-/// `overlay` is raw HTML placed after `#ipe-root` (empty for none).
+/// `route` is the page's URL the client records; `overlay` is raw HTML placed
+/// after `#ipe-root` (empty for none).
 #[cfg(feature = "web")]
 #[allow(clippy::too_many_arguments)] // the one builder of every live page; each input is a distinct page fact
 fn render_live_page(
@@ -574,6 +580,7 @@ fn render_live_page(
     base: &crate::encoding::MountBase,
     body: &str,
     epoch: &RenderEpoch,
+    route: &PageUrl,
     csrf_token: &str,
     overlay: &str,
 ) -> Result<String, BootRefusal> {
@@ -584,6 +591,7 @@ fn render_live_page(
         epoch: epoch.to_token(),
         base: prefix,
         csrf: csrf_token,
+        route: route.path(),
         cfg: ClientConfig::from_env(tuning),
     })?;
     let dev_banner = dev_console_banner(prefix);
@@ -660,6 +668,7 @@ fn render_page_full_with_overlay(
     base: &crate::encoding::MountBase,
     body: &str,
     epoch: &RenderEpoch,
+    route: &PageUrl,
     csrf_token: &str,
     overlay: &str,
 ) -> Result<String, BootRefusal> {
@@ -670,6 +679,7 @@ fn render_page_full_with_overlay(
         base,
         body,
         epoch,
+        route,
         csrf_token,
         overlay,
     )
@@ -1610,7 +1620,9 @@ const fn standing_after(_scope: &pubsub::SessionScope, _wake: Wake) -> Standing 
 /// local `seq` so it never collides with the client's own POST-local seq gate.
 ///
 /// `from` / `to` are the epochs the commit moved between: the client applies
-/// the patches only onto the DOM of `from`, then adopts `to`.
+/// the patches only onto the DOM of `from`, then adopts `to`. `route` is the
+/// committed page's browser path, absent when the page has none, and
+/// `history` is how the client records it.
 #[derive(serde::Serialize)]
 #[cfg(feature = "web")]
 struct PatchEnvelope<'a> {
@@ -1619,6 +1631,9 @@ struct PatchEnvelope<'a> {
     from: String,
     to: String,
     patches: &'a [crate::web::diff::Patch],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    route: Option<&'a str>,
+    history: HistoryWrite,
     /// The tab whose own event produced the render.
     #[serde(skip_serializing_if = "Option::is_none")]
     tab: Option<String>,
@@ -1629,6 +1644,28 @@ struct PatchEnvelope<'a> {
     /// The element that tab focuses once the patches apply.
     #[serde(skip_serializing_if = "Option::is_none")]
     focus: Option<&'a crate::web::diff::StampedId>,
+}
+
+/// How a client records a committed page's route in its history.
+#[derive(serde::Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+#[cfg(feature = "web")]
+enum HistoryWrite {
+    /// A new history entry: only for the tab whose own event made the commit.
+    Push,
+    /// The current entry is rewritten: every other origin of a commit.
+    Replace,
+}
+
+#[cfg(feature = "web")]
+impl HistoryWrite {
+    /// A push for a render one tab's own event produced, a replace otherwise.
+    const fn of(addressed: Option<&Addressed>) -> Self {
+        match addressed {
+            Some(_) => Self::Push,
+            None => Self::Replace,
+        }
+    }
 }
 
 /// The tab event a render answers, with the element it asks that tab to focus.
@@ -1663,20 +1700,48 @@ async fn send_patches_frame(
     patches: &[crate::web::diff::Patch],
     addressed: Option<&Addressed>,
 ) {
+    log_unrenderable(step.route());
     let Some(sse) = sse else {
         return;
     };
+    if let Some(json) = patches_json(global_seq, &step, patches, addressed) {
+        let _ = sse.send(SsePatch(sse::frame("patches", &json))).await;
+    }
+}
+
+/// One commit's `patches` frame body: its epochs, patches, route and address.
+#[cfg(feature = "web")]
+fn patches_json(
+    global_seq: u64,
+    step: &EpochStep,
+    patches: &[crate::web::diff::Patch],
+    addressed: Option<&Addressed>,
+) -> Option<String> {
     let env = PatchEnvelope {
         global_seq,
         from: step.from.to_token(),
         to: step.to.to_token(),
         patches,
+        route: step.route().path(),
+        history: HistoryWrite::of(addressed),
         tab: addressed.map(|a| a.event.tab.to_token()),
         tab_seq: addressed.map(|a| a.event.seq),
         focus: addressed.and_then(|a| a.focus.as_ref()),
     };
-    if let Ok(json) = serde_json::to_string(&env) {
-        let _ = sse.send(SsePatch(sse::frame("patches", &json))).await;
+    serde_json::to_string(&env).ok()
+}
+
+/// Log a committed page whose route does not render: its URL is left as it is.
+///
+/// Called once per commit, so once per epoch; the refusal goes to the runtime
+/// log, never into the page.
+#[cfg(feature = "web")]
+fn log_unrenderable(route: &PageUrl) {
+    if let PageUrl::Unrenderable(refusal) = route {
+        crate::system::emit_runtime_log(
+            "web",
+            &format!("route.unrenderable: the page's URL is left unchanged: {refusal}"),
+        );
     }
 }
 
@@ -1953,6 +2018,7 @@ fn stale_render_response<Model, Msg: Clone>(
     let body = serde_json::json!({
         "refused": "stale-render",
         "epoch": e.rendered.epoch().to_token(),
+        "route": e.rendered.route().path(),
         "seq": e.seq,
         "body": page.as_str(),
     })
@@ -2123,15 +2189,17 @@ pub struct EnterRequest {
 pub struct PageRender {
     html: StampedHtml,
     epoch: RenderEpoch,
+    route: PageUrl,
 }
 
 #[cfg(feature = "web")]
 impl PageRender {
-    /// The last committed view of `rendered`, at its current epoch.
+    /// The last committed view of `rendered`, at its current epoch and URL.
     fn current<M: Clone>(rendered: &Rendered<M>) -> Self {
         Self {
             html: rendered.page(),
             epoch: rendered.epoch(),
+            route: rendered.route().clone(),
         }
     }
 }
@@ -2529,29 +2597,65 @@ where
     })
 }
 
-/// The three routed resolvers every routed builder installs, all over one
-/// route table and one renderer, so the entry, `req.params` and the lookup
-/// agree on which route a path resolves to.
+/// Boxed page URL: a committed model → the URL its page answers to.
+///
+/// Every commit of a session takes its route from here, so the URL is minted
+/// with the epoch from the model the view was rendered from.
 #[cfg(feature = "web")]
-fn routed_resolvers<Model, Msg, Page, FSetPage, FRender>(
+type PageUrlOf<Model> = Arc<dyn Fn(&Model) -> PageUrl + Send + Sync>;
+
+/// The page URL of an app with no route table: never written.
+#[cfg(feature = "web")]
+fn unrouted_page_url<Model>() -> PageUrlOf<Model> {
+    Arc::new(|_model| PageUrl::Unrouted)
+}
+
+/// The resolvers every routed builder installs, all over one route table and
+/// one renderer, so the entry, `req.params`, the lookup and the committed
+/// page's URL agree on which route a path resolves to.
+#[cfg(feature = "web")]
+struct RoutedResolvers<Model, Msg> {
+    route_entry: RouteEntry<Model, Msg>,
+    param_resolver: ParamResolver,
+    route_matched: RouteMatched,
+    page_url: PageUrlOf<Model>,
+}
+
+/// Build the [`RoutedResolvers`] of a route table served under `base`.
+///
+/// `page_of` projects a model onto its page, the dual of `set_page`; the
+/// page's URL is `render` of that page joined to `base`.
+#[cfg(feature = "web")]
+fn routed_resolvers<Model, Msg, Page, FSetPage, FPageOf, FRender>(
     routes: Vec<route::Route<Page>>,
     not_found: Page,
     set_page: FSetPage,
+    page_of: FPageOf,
     render: FRender,
-) -> (RouteEntry<Model, Msg>, ParamResolver, RouteMatched)
+    base: crate::encoding::EncodedBase,
+) -> RoutedResolvers<Model, Msg>
 where
     Page: Clone + Send + Sync + 'static,
     FSetPage: Fn(Page, Model) -> (Model, IpeCmd<Msg>) + Send + Sync + 'static,
+    FPageOf: for<'a> Fn(&'a Model) -> &'a Page + Send + Sync + 'static,
     FRender: Fn(&Page) -> Result<route::RoutePath, route::RenderRefusal> + Send + Sync + 'static,
 {
     let routes = Arc::new(routes);
     let render = Arc::new(render);
     let routes_for_params = Arc::clone(&routes);
     let route_matched = routed_lookup(Arc::clone(&routes), Arc::clone(&render));
+    let render_for_url = Arc::clone(&render);
     let route_entry = routed_entry(routes, not_found, set_page, render);
     let param_resolver: ParamResolver =
         Arc::new(move |path| route::match_params(&routes_for_params, path));
-    (route_entry, param_resolver, route_matched)
+    let page_url: PageUrlOf<Model> =
+        Arc::new(move |model| route::page_url(&base, (*render_for_url)(page_of(model))));
+    RoutedResolvers {
+        route_entry,
+        param_resolver,
+        route_matched,
+        page_url,
+    }
 }
 /// Boxed param resolver: a decoded GET path → the matched route's
 /// `:name`→value params.
@@ -2618,6 +2722,10 @@ pub(crate) struct WebState<Model, Msg, FInit, FUpdate, FView, FSubs> {
     /// page the browser is showing, silently killing every subsequent event
     /// (form submits included).
     route_matched: RouteMatched,
+    /// The URL of a committed model's page: every commit mints it with the
+    /// epoch. `web_app` never writes one; the routed builders render the
+    /// model's page under the app's base.
+    page_url: PageUrlOf<Model>,
     /// Web driver count for admission control. Each spawned `drive_session`
     /// holds a `SessionSlot` that decrements this on exit; a GET that would
     /// push it past `max_sessions` is answered 503 instead of spawning a
@@ -2652,6 +2760,7 @@ impl<Model, Msg, FInit, FUpdate, FView, FSubs> Clone
             route_entry: self.route_entry.clone(),
             param_resolver: self.param_resolver.clone(),
             route_matched: self.route_matched.clone(),
+            page_url: self.page_url.clone(),
             session_count: self.session_count.clone(),
             max_sessions: self.max_sessions,
             budget: self.budget.clone(),
@@ -2917,6 +3026,7 @@ async fn commit_entry<Model, Msg, FView>(
     entry: &Weak<Mutex<SessionEntry<Model, Msg>>>,
     request: EnterRequest,
     route_entry: &RouteEntry<Model, Msg>,
+    page_url: &PageUrlOf<Model>,
     view: &FView,
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
     scope: &pubsub::SessionScope,
@@ -2947,6 +3057,7 @@ where
     assign_ipe_ids(&mut tree, "r");
     style_inject::apply_style_injections(&mut tree);
     let html = render_stamped(&tree, &stamp);
+    let route = page_url(&entered.model);
     // Re-prove after user code ran: a revocation that landed meanwhile drops
     // the entry, its reply and its Cmd.
     if recheck_scope(scope, None) == Standing::Revoked {
@@ -2955,16 +3066,16 @@ where
     }
     let committed = {
         let mut e = strong.lock().unwrap_or_else(|e| e.into_inner());
-        match e.rendered.commit(tree) {
+        match e.rendered.commit(tree, route) {
             Ok(step) => {
                 e.model = entered.model.clone();
                 e.entered_path = Some(path);
-                Some(step.to)
+                Some(step)
             }
             Err(EpochExhausted) => None,
         }
     };
-    let Some(epoch) = committed else {
+    let Some(step) = committed else {
         // The render history cannot mint another epoch: close the session so
         // the next request takes the session-lost path.
         close_session(store, sid, Some(&strong), CloseReason::Ended).await;
@@ -2976,7 +3087,12 @@ where
         close_session(store, sid, Some(&strong), CloseReason::OverCeiling).await;
         return EntryCommit::SessionGone;
     }
-    let page = PageRender { html, epoch };
+    log_unrenderable(step.route());
+    let page = PageRender {
+        html,
+        epoch: step.to,
+        route: step.route().clone(),
+    };
     if let Err(EnterReply { page }) = reply.send(EnterReply { page }) {
         let (frame, sse_tx) = {
             let mut e = strong.lock().unwrap_or_else(|e| e.into_inner());
@@ -2985,6 +3101,7 @@ where
                 serde_json::json!({
                     "seq": e.seq,
                     "epoch": page.epoch.to_token(),
+                    "route": page.route.path(),
                     "body": page.html.as_str(),
                 })
                 .to_string(),
@@ -3054,7 +3171,7 @@ async fn take_input<Model, Msg, T>(
 /// URL entries arrive on `enter_rx` and are committed by the same loop, so an
 /// entry and an in-flight `update` never overwrite each other's model.
 // Distinct per-session runtime handles (entry, both Msg channel ends, the
-// entry queue, the three Arc'd TEA callbacks, the route entry, the store, the
+// entry queue, the three Arc'd TEA callbacks, the route entry, the page URL, the store, the
 // session scope, the revocation watch, the shutdown drain, the port lease) — bundling them into a struct purely to satisfy the 7-arg heuristic
 // would add indirection without clarifying anything.
 #[allow(clippy::too_many_arguments)]
@@ -3074,6 +3191,7 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
     view: Arc<FView>,
     subs: Arc<FSubs>,
     route_entry: RouteEntry<Model, Msg>,
+    page_url: PageUrlOf<Model>,
     store: Arc<dyn store::SessionStore<Model, Msg>>,
     scope: pubsub::SessionScope,
     // The session's in-flight Cmd budget, shared with the page handler's seed Cmd.
@@ -3183,12 +3301,21 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
                         .await;
                     break;
                 }
-                let (next, cmd) =
-                    match commit_entry(&entry, request, &route_entry, &*view, &store, &scope).await {
-                        EntryCommit::Entered(next, cmd) => (next, cmd),
-                        EntryCommit::AlreadyEntered => continue,
-                        EntryCommit::SessionGone => break,
-                    };
+                let committed = commit_entry(
+                    &entry,
+                    request,
+                    &route_entry,
+                    &page_url,
+                    &*view,
+                    &store,
+                    &scope,
+                )
+                .await;
+                let (next, cmd) = match committed {
+                    EntryCommit::Entered(next, cmd) => (next, cmd),
+                    EntryCommit::AlreadyEntered => continue,
+                    EntryCommit::SessionGone => break,
+                };
                 pubsub::with_session(&scope, || {
                     run_cmd(cmd, &msg_tx, &scope, &cmds);
                     sub_runtime.reconcile(subs(next));
@@ -3284,6 +3411,7 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
         let mut tree = pubsub::with_session(&scope, || view(next.clone()));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
+        let route = page_url(&next);
 
         // Re-prove after user code ran: a revocation that landed meanwhile
         // drops this Msg's commit and its Cmd.
@@ -3304,9 +3432,10 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
             // dispatch has no error channel, so the `err==nil` conjunct is always
             // true and is dropped.
             let noop = cmd_is_none && e.model == next;
-            // The commit builds the handler index and mints the epoch, then
-            // moves the tree into the last view, avoiding a deep VDOM clone.
-            match e.rendered.commit(tree) {
+            // The commit builds the handler index and mints the epoch with the
+            // page's URL, then moves the tree into the last view, avoiding a
+            // deep VDOM clone.
+            match e.rendered.commit(tree, route) {
                 Ok(step) => {
                     e.model = next.clone();
                     e.seq += 1;
@@ -3618,7 +3747,14 @@ fn page_response(
     headers: &axum::http::HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let Ok(html) = render_page_full(sid, base, page.html.as_str(), &page.epoch, csrf_token) else {
+    let Ok(html) = render_page_full(
+        sid,
+        base,
+        page.html.as_str(),
+        &page.epoch,
+        &page.route,
+        csrf_token,
+    ) else {
         return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     // Session cookie carries `Secure` without a dev intent / in frame-ancestors mode, OR
@@ -3662,7 +3798,11 @@ fn page_response(
         html,
     )
         .into_response();
-    with_page_headers(resp, &[&session_cookie, &csrf_cookie], &page.html)
+    with_page_headers(
+        with_route_header(resp, &page.route),
+        &[&session_cookie, &csrf_cookie],
+        &page.html,
+    )
 }
 
 /// Same as [`page_response`] but injects `overlay` (raw HTML) after `#ipe-root`
@@ -3682,6 +3822,7 @@ fn page_response_with_overlay(
         base,
         page.html.as_str(),
         &page.epoch,
+        &page.route,
         csrf_token,
         overlay,
     ) else {
@@ -3707,8 +3848,36 @@ fn page_response_with_overlay(
         html,
     )
         .into_response();
-    with_page_headers(resp, &[&session_cookie, &csrf_cookie], &page.html)
+    with_page_headers(
+        with_route_header(resp, &page.route),
+        &[&session_cookie, &csrf_cookie],
+        &page.html,
+    )
 }
+
+/// `resp` carrying the served page's browser path as `X-Ipe-Route`.
+///
+/// A page with no path, or a path with no header representation, carries no
+/// header, so the client leaves the URL where it is.
+#[cfg(feature = "web")]
+fn with_route_header(
+    mut resp: axum::response::Response,
+    route: &PageUrl,
+) -> axum::response::Response {
+    if let Some(value) = route
+        .path()
+        .and_then(|path| axum::http::HeaderValue::from_str(path).ok())
+    {
+        resp.headers_mut()
+            .insert(axum::http::HeaderName::from_static(ROUTE_HEADER), value);
+    }
+    resp
+}
+
+/// The response header naming a served page's browser path; `client.js`
+/// reads it on navigation.
+#[cfg(feature = "web")]
+const ROUTE_HEADER: &str = "x-ipe-route";
 
 /// `resp` with one `Set-Cookie` header per line of `cookies`, then the
 /// security headers of the page serving `markup`.
@@ -4081,7 +4250,9 @@ async fn apply_literal_patch_to_web_sessions<Model, Msg, FView>(
         let committed = {
             let mut e = handle.lock().unwrap_or_else(|e| e.into_inner());
             let patches = e.rendered.diff_to(&tree);
-            match e.rendered.commit(tree) {
+            // The model is unchanged, so the page and its URL are too.
+            let route = e.rendered.route().clone();
+            match e.rendered.commit(tree, route) {
                 Ok(step) => {
                     e.seq += 1;
                     Some((patches, step, e.seq, e.sse_tx.clone()))
@@ -4258,6 +4429,7 @@ where
             param_resolver: Arc::new(|_path| crate::dict::dict_empty()),
             // No route table: only `/` is a page URL.
             route_matched: Arc::new(RouteLookup::single_page),
+            page_url: unrouted_page_url(),
             session_count: Arc::new(AtomicUsize::new(0)),
             max_sessions,
             budget: budget::shared(),
@@ -4352,6 +4524,7 @@ where
                 }),
                 param_resolver: Arc::new(|_path| crate::dict::dict_empty()),
                 route_matched: Arc::new(RouteLookup::single_page),
+                page_url: unrouted_page_url(),
                 session_count: Arc::new(AtomicUsize::new(0)),
                 max_sessions,
                 budget: budget::shared(),
@@ -4379,7 +4552,18 @@ where
 /// over the app's handlers (§9).
 #[allow(clippy::too_many_arguments)] // mirrors web_app_routed's routed cfg (callbacks + route table + set_page + store)
 #[cfg(feature = "web")]
-pub fn web_embed_router_routed<Model, Msg, Page, FInit, FUpdate, FView, FSubs, FSetPage, FRender>(
+pub fn web_embed_router_routed<
+    Model,
+    Msg,
+    Page,
+    FInit,
+    FUpdate,
+    FView,
+    FSubs,
+    FSetPage,
+    FPageOf,
+    FRender,
+>(
     init: FInit,
     update: FUpdate,
     view: FView,
@@ -4387,6 +4571,7 @@ pub fn web_embed_router_routed<Model, Msg, Page, FInit, FUpdate, FView, FSubs, F
     routes: Vec<route::Route<Page>>,
     not_found: Page,
     set_page: FSetPage,
+    page_of: FPageOf,
     render: FRender,
     store_kind: String,
     store_path: String,
@@ -4417,6 +4602,7 @@ where
     FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
     FSubs: Fn(Model) -> IpeSub<Msg> + Send + Sync + 'static,
     FSetPage: Fn(Page, Model) -> (Model, IpeCmd<Msg>) + Send + Sync + 'static,
+    FPageOf: for<'a> Fn(&'a Model) -> &'a Page + Send + Sync + 'static,
     FRender: Fn(&Page) -> Result<route::RoutePath, route::RenderRefusal> + Send + Sync + 'static,
 {
     Box::new(move |base: crate::encoding::MountBase| {
@@ -4427,8 +4613,12 @@ where
             }
             // Routed resolvers — identical construction to `web_app_routed`; only
             // the terminal `build_web_router` (vs `serve_web`) differs.
-            let (route_entry, param_resolver, route_matched) =
-                routed_resolvers(routes, not_found, set_page, render);
+            let RoutedResolvers {
+                route_entry,
+                param_resolver,
+                route_matched,
+                page_url,
+            } = routed_resolvers(routes, not_found, set_page, page_of, render, base.encoded());
             // A mount has no task-error channel, so an unhonourable store config
             // fails closed as a 503-everywhere router (see `web_embed_router`).
             let ttl = match web_ttl() {
@@ -4455,6 +4645,7 @@ where
                 route_entry,
                 param_resolver,
                 route_matched,
+                page_url,
                 session_count: Arc::new(AtomicUsize::new(0)),
                 max_sessions,
                 budget: budget::shared(),
@@ -4549,7 +4740,18 @@ where
 /// by their bounds, so each half owns a copy.
 #[allow(clippy::too_many_arguments)] // mirrors web_app_routed's routed cfg (callbacks + route table + set_page + store)
 #[cfg(feature = "web")]
-pub fn web_embed_routed<Model, Msg, Page, FInit, FUpdate, FView, FSubs, FSetPage, FRender>(
+pub fn web_embed_routed<
+    Model,
+    Msg,
+    Page,
+    FInit,
+    FUpdate,
+    FView,
+    FSubs,
+    FSetPage,
+    FPageOf,
+    FRender,
+>(
     init: FInit,
     update: FUpdate,
     view: FView,
@@ -4557,6 +4759,7 @@ pub fn web_embed_routed<Model, Msg, Page, FInit, FUpdate, FView, FSubs, FSetPage
     routes: Vec<route::Route<Page>>,
     not_found: Page,
     set_page: FSetPage,
+    page_of: FPageOf,
     render: FRender,
     store_kind: String,
     store_path: String,
@@ -4587,6 +4790,7 @@ where
     FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
     FSubs: Fn(Model) -> IpeSub<Msg> + Send + Sync + 'static,
     FSetPage: Fn(Page, Model) -> (Model, IpeCmd<Msg>) + Send + Sync + 'static,
+    FPageOf: for<'a> Fn(&'a Model) -> &'a Page + Send + Sync + 'static,
     FRender: Fn(&Page) -> Result<route::RoutePath, route::RenderRefusal> + Send + Sync + 'static,
 {
     let init = Arc::new(init);
@@ -4594,17 +4798,19 @@ where
     let view = Arc::new(view);
     let subscriptions = Arc::new(subscriptions);
     let set_page = Arc::new(set_page);
+    let page_of = Arc::new(page_of);
     let render = Arc::new(render);
     let serve = {
-        let (init, update, view, subscriptions, set_page, render) = (
+        let (init, update, view, subscriptions, set_page, page_of, render) = (
             Arc::clone(&init),
             Arc::clone(&update),
             Arc::clone(&view),
             Arc::clone(&subscriptions),
             Arc::clone(&set_page),
+            Arc::clone(&page_of),
             Arc::clone(&render),
         );
-        web_app_routed::<crate::error::IpeError, Model, Msg, Page, _, _, _, _, _, _>(
+        web_app_routed::<crate::error::IpeError, Model, Msg, Page, _, _, _, _, _, _, _>(
             move |req| (*init)(req),
             move |msg, model| (*update)(msg, model),
             move |model| (*view)(model),
@@ -4612,13 +4818,14 @@ where
             routes.clone(),
             not_found.clone(),
             move |page, model| (*set_page)(page, model),
+            route::page_of(move |model: &Model| (*page_of)(model)),
             move |page: &Page| (*render)(page),
             store_kind.clone(),
             store_path.clone(),
             schema_tag,
         )
     };
-    let router = web_embed_router_routed::<Model, Msg, Page, _, _, _, _, _, _>(
+    let router = web_embed_router_routed::<Model, Msg, Page, _, _, _, _, _, _, _>(
         move |req| (*init)(req),
         move |msg, model| (*update)(msg, model),
         move |model| (*view)(model),
@@ -4626,6 +4833,7 @@ where
         routes,
         not_found,
         move |page, model| (*set_page)(page, model),
+        route::page_of(move |model: &Model| (*page_of)(model)),
         move |page: &Page| (*render)(page),
         store_kind,
         store_path,
@@ -4752,7 +4960,19 @@ fn fail_closed_router(cause: &StartupRefusal) -> axum::Router {
 /// original 6 type params.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "web")]
-pub fn web_app_routed<E, Model, Msg, Page, FInit, FUpdate, FView, FSubs, FSetPage, FRender>(
+pub fn web_app_routed<
+    E,
+    Model,
+    Msg,
+    Page,
+    FInit,
+    FUpdate,
+    FView,
+    FSubs,
+    FSetPage,
+    FPageOf,
+    FRender,
+>(
     init: FInit,
     update: FUpdate,
     view: FView,
@@ -4760,6 +4980,7 @@ pub fn web_app_routed<E, Model, Msg, Page, FInit, FUpdate, FView, FSubs, FSetPag
     routes: Vec<route::Route<Page>>,
     not_found: Page,
     set_page: FSetPage,
+    page_of: FPageOf,
     render: FRender,
     store_kind: String,
     store_path: String,
@@ -4798,6 +5019,7 @@ where
     FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
     FSubs: Fn(Model) -> IpeSub<Msg> + Send + Sync + 'static,
     FSetPage: Fn(Page, Model) -> (Model, IpeCmd<Msg>) + Send + Sync + 'static,
+    FPageOf: for<'a> Fn(&'a Model) -> &'a Page + Send + Sync + 'static,
     FRender: Fn(&Page) -> Result<route::RoutePath, route::RenderRefusal> + Send + Sync + 'static,
 {
     Box::pin(async move {
@@ -4807,8 +5029,6 @@ where
                 StartupRefusal::RouteTable(refusal).into(),
             ));
         }
-        let (route_entry, param_resolver, route_matched) =
-            routed_resolvers(routes, not_found, set_page, render);
         // Fail-closed on an unhonourable store config (see `web_app`).
         // The app's base is read from the environment once, here; a value
         // outside the mount-base grammar refuses the start.
@@ -4816,6 +5036,19 @@ where
             Ok(mount) => mount,
             Err(refusal) => return IpeResult::Err(E::from_ipe_error(refusal.into())),
         };
+        let RoutedResolvers {
+            route_entry,
+            param_resolver,
+            route_matched,
+            page_url,
+        } = routed_resolvers(
+            routes,
+            not_found,
+            set_page,
+            page_of,
+            render,
+            mount.base().encoded(),
+        );
         let ttl = match web_ttl() {
             Ok(ttl) => ttl,
             Err(refusal) => {
@@ -4850,6 +5083,7 @@ where
             route_entry,
             param_resolver,
             route_matched,
+            page_url,
             session_count: Arc::new(AtomicUsize::new(0)),
             max_sessions,
             budget: budget::shared(),
@@ -5407,7 +5641,8 @@ mod handlers {
         let Ok(keys) = SessionKeys::mint() else {
             return entry_unavailable();
         };
-        let rendered = Rendered::first(keys, tree);
+        let rendered = Rendered::first(keys, tree, (st.page_url)(&model));
+        log_unrenderable(rendered.route());
         let page = PageRender::current(&rendered);
 
         // Bounded per-session Msg queue: a fast client cannot grow it without
@@ -5463,6 +5698,7 @@ mod handlers {
         let view = st.view.clone();
         let subs = st.subs.clone();
         let route_entry = st.route_entry.clone();
+        let page_url = st.page_url.clone();
         // The session's first turn: from before the store holds it until its
         // seed Cmd holds its own unit.
         let birth = cmds.begin_turn();
@@ -5512,6 +5748,7 @@ mod handlers {
                 view,
                 subs,
                 route_entry,
+                page_url,
                 store.clone(),
                 scope.clone(),
                 Arc::clone(&cmds),
@@ -5736,6 +5973,7 @@ mod handlers {
             serde_json::json!({
                 "seq": g.seq,
                 "epoch": g.rendered.epoch().to_token(),
+                "route": g.rendered.route().path(),
                 "body": html.as_str(),
             })
             .to_string()
@@ -6613,7 +6851,8 @@ mod handlers {
         tree: Html<Msg>,
     ) -> Option<(RenderEpoch, StampedHtml)> {
         let mut e = handle.lock().unwrap_or_else(|e| e.into_inner());
-        let epoch = e.rendered.commit(tree).ok()?.to;
+        let route = e.rendered.route().clone();
+        let epoch = e.rendered.commit(tree, route).ok()?.to;
         Some((epoch, e.rendered.page()))
     }
 
@@ -8006,7 +8245,7 @@ mod reload_push_tests {
         let tree: Html<()> = Html::HText(String::new());
         Arc::new(Mutex::new(SessionEntry {
             model: (),
-            rendered: Rendered::first(SessionKeys::distinct(), tree),
+            rendered: Rendered::first(SessionKeys::distinct(), tree, PageUrl::Unrouted),
             tabs: TabSeqs::default(),
             seq: 0,
             sse_tx,
@@ -8128,7 +8367,7 @@ mod hot_appearance_push_tests {
         let (msg_tx, _rx) = mpsc::channel::<()>(1);
         Arc::new(Mutex::new(SessionEntry {
             model: count,
-            rendered: Rendered::first(SessionKeys::distinct(), tree),
+            rendered: Rendered::first(SessionKeys::distinct(), tree, PageUrl::Unrouted),
             tabs: TabSeqs::default(),
             seq: 0,
             sse_tx,
@@ -8550,11 +8789,19 @@ mod canonical_redirect_handler_tests {
     }
 
     fn make_router_at(mount: crate::web::MountContext) -> Router {
-        let (route_entry, param_resolver, route_matched) = routed_resolvers(
+        static HOME: Page = Page::Home;
+        let RoutedResolvers {
+            route_entry,
+            param_resolver,
+            route_matched,
+            page_url,
+        } = routed_resolvers(
             routes(),
             Page::Home,
             |_page: Page, model: Model| (model, IpeCmd::None),
+            |_model: &Model| &HOME,
             render,
+            mount.base().encoded(),
         );
         let state: WebState<Model, (), Init, Update, View, Subs> = WebState {
             store: Arc::new(MemoryStore::<Model, ()>::new(Duration::from_secs(60)))
@@ -8566,6 +8813,7 @@ mod canonical_redirect_handler_tests {
             route_entry,
             param_resolver,
             route_matched,
+            page_url,
             session_count: Arc::new(AtomicUsize::new(0)),
             max_sessions: std::num::NonZeroUsize::MAX,
             budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
@@ -8863,6 +9111,7 @@ mod base_path_tests {
             &crate::encoding::MountBase::root(),
             "<b>x</b>",
             &page_epoch(),
+            &PageUrl::Unrouted,
             "tok1",
             "<div data-ipe-debugger></div>",
         )
@@ -8937,6 +9186,7 @@ mod base_path_tests {
             &crate::encoding::MountBase::root(),
             "<b>x</b>",
             &page_epoch(),
+            &PageUrl::Unrouted,
             "tok1",
             "",
         );
@@ -9288,7 +9538,7 @@ mod base_path_tests {
     /// The client writes its history in `__ipeRecordNav` only: no other site
     /// names the history API, whatever receiver it reaches it through.
     ///
-    /// A second writer, such as a `data-ipe-path` render calling
+    /// A second writer, such as a render's route calling
     /// `history.pushState` itself, moves the URL without the location the
     /// popstate handler compares against, so Back stops at an entry it takes
     /// for the current one, and a navigation pushes its URL twice.
@@ -9314,7 +9564,7 @@ mod base_path_tests {
                 .count()
         };
         let record = body_of("__ipeRecordNav").unwrap_or_default();
-        let paths = body_of("__ipeRunPaths").unwrap_or_default();
+        let sync = body_of("__ipeSyncRoute").unwrap_or_default();
         assert_eq!(
             (history_reads(js), history_reads(record)),
             (2, 2),
@@ -9328,9 +9578,8 @@ mod base_path_tests {
             );
         }
         assert!(
-            paths.contains("__ipeRecordNav(p, true, at);")
-                && paths.contains("__ipeRecordNav(p, false, at);"),
-            "a render's `data-ipe-path` is recorded through `__ipeRecordNav`"
+            sync.contains("__ipeRecordNav(u.pathname, push, at);"),
+            "a render's route is recorded through `__ipeRecordNav`"
         );
         assert!(
             record.contains(
@@ -9370,8 +9619,8 @@ mod base_path_tests {
         );
         assert_eq!(
             js.matches("__ipeRecordNav(").count(),
-            5,
-            "`__ipeRecordNav` has its definition, two `data-ipe-path` sites, the link and the popstate answer"
+            4,
+            "`__ipeRecordNav` has its definition, the route sync, the link and the popstate answer"
         );
         assert!(
             js.contains("__ipeRecordNav(res.url, true, next);")
@@ -9380,14 +9629,20 @@ mod base_path_tests {
         );
         assert_eq!(
             (
-                js.matches("__ipeRunPaths()").count(),
-                full.matches("__ipeEpoch = token;\n    __ipeRunPaths();")
+                js.matches("__ipeSyncRoute(").count(),
+                full.matches("__ipeEpoch = token;\n    __ipeSyncRoute(route, false, next);")
                     .count(),
-                diff.matches("__ipeEpoch = frame.to;\n    __ipeRunPaths();")
-                    .count()
+                diff.matches(
+                    "__ipeEpoch = frame.to;\n    __ipeSyncRoute(frame.route, own, __ipeOwnEpoch(frame.to));"
+                )
+                .count()
             ),
-            (3, 1, 1),
-            "a render's `data-ipe-path` is read after its epoch is adopted, in the two adopt functions only"
+            (4, 1, 1),
+            "a render's route is recorded after its epoch is adopted, in the two adopt functions and at boot only"
+        );
+        assert!(
+            !js.contains("data-ipe-path") && !js.contains("__ipeRunPaths"),
+            "no element of a render names the location"
         );
     }
 
@@ -9750,7 +10005,8 @@ mod base_path_tests {
         epoch: &RenderEpoch,
         csrf: &str,
     ) -> String {
-        render_page_full(sid, base, "<b>x</b>", epoch, csrf).expect("the page builds")
+        render_page_full(sid, base, "<b>x</b>", epoch, &PageUrl::Unrouted, csrf)
+            .expect("the page builds")
     }
 
     fn boot_open_tag() -> String {
@@ -9791,7 +10047,12 @@ mod base_path_tests {
 
     /// The first epoch of a fresh render history, as a page GET serves it.
     fn page_epoch() -> RenderEpoch {
-        Rendered::first(SessionKeys::distinct(), Html::<()>::HText(String::new())).epoch()
+        Rendered::first(
+            SessionKeys::distinct(),
+            Html::<()>::HText(String::new()),
+            PageUrl::Unrouted,
+        )
+        .epoch()
     }
 
     #[allow(clippy::expect_used)] // a fixed literal inside the mount-base grammar
@@ -9846,6 +10107,7 @@ mod base_path_tests {
             base,
             "<b>x</b>",
             epoch,
+            &PageUrl::Unrouted,
             "tok1",
             "",
         )
@@ -10346,7 +10608,7 @@ mod sse_reconnect_reconcile_tests {
         let (enter_tx, enter_rx) = channel::<EnterRequest>(ENTER_QUEUE_CAP.get());
         let entry = Arc::new(Mutex::new(SessionEntry {
             model,
-            rendered: Rendered::first(SessionKeys::distinct(), last_view),
+            rendered: Rendered::first(SessionKeys::distinct(), last_view, PageUrl::Unrouted),
             tabs: TabSeqs::default(),
             seq: 0,
             sse_tx: None,
@@ -10383,6 +10645,7 @@ mod sse_reconnect_reconcile_tests {
             &Arc::downgrade(&fx.entry),
             request,
             &fx.route_entry,
+            &unrouted_page_url(),
             &*fx.view,
             &fx.store,
             &pubsub::SessionScope::new("sid-test".to_owned()),
@@ -11147,6 +11410,7 @@ mod watch_status_handler_tests {
             }),
             param_resolver: Arc::new(test_param_resolver),
             route_matched: Arc::new(test_route_matched),
+            page_url: crate::web::unrouted_page_url(),
             session_count: Arc::new(AtomicUsize::new(0)),
             max_sessions: std::num::NonZeroUsize::MAX,
             budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
@@ -11178,7 +11442,7 @@ mod watch_status_handler_tests {
         let tree: Html<TestMsg> = Html::HText(String::new());
         Arc::new(Mutex::new(SessionEntry {
             model: (),
-            rendered: Rendered::first(SessionKeys::distinct(), tree),
+            rendered: Rendered::first(SessionKeys::distinct(), tree, PageUrl::Unrouted),
             tabs: TabSeqs::default(),
             seq: 0,
             sse_tx,
@@ -11727,6 +11991,7 @@ mod watch_status_handler_tests {
                 }),
                 param_resolver: Arc::new(test_param_resolver),
                 route_matched: Arc::new(test_route_matched),
+                page_url: crate::web::unrouted_page_url(),
                 session_count: Arc::new(AtomicUsize::new(0)),
                 max_sessions: std::num::NonZeroUsize::MAX,
                 budget: crate::web::budget::SessionBudget::process(
@@ -11838,6 +12103,7 @@ mod hot_transition_handler_tests {
             }),
             param_resolver: Arc::new(test_param_resolver),
             route_matched: Arc::new(test_route_matched),
+            page_url: crate::web::unrouted_page_url(),
             session_count: Arc::new(AtomicUsize::new(0)),
             max_sessions: std::num::NonZeroUsize::MAX,
             budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
@@ -12101,6 +12367,7 @@ mod hot_init_session_scoping_tests {
             }),
             param_resolver: Arc::new(test_param_resolver),
             route_matched: Arc::new(test_route_matched),
+            page_url: crate::web::unrouted_page_url(),
             session_count: Arc::new(AtomicUsize::new(0)),
             max_sessions: std::num::NonZeroUsize::MAX,
             budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
@@ -12359,6 +12626,7 @@ mod hot_msg_handler_tests {
             }),
             param_resolver: Arc::new(test_param_resolver),
             route_matched: Arc::new(test_route_matched),
+            page_url: crate::web::unrouted_page_url(),
             session_count: Arc::new(AtomicUsize::new(0)),
             max_sessions: std::num::NonZeroUsize::MAX,
             budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
@@ -12575,6 +12843,7 @@ mod hot_init_handler_tests {
             }),
             param_resolver: Arc::new(test_param_resolver),
             route_matched: Arc::new(test_route_matched),
+            page_url: crate::web::unrouted_page_url(),
             session_count: Arc::new(AtomicUsize::new(0)),
             max_sessions: std::num::NonZeroUsize::MAX,
             budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
@@ -12795,6 +13064,7 @@ mod hot_wiring_handler_tests {
             }),
             param_resolver: Arc::new(test_param_resolver),
             route_matched: Arc::new(test_route_matched),
+            page_url: crate::web::unrouted_page_url(),
             session_count: Arc::new(AtomicUsize::new(0)),
             max_sessions: std::num::NonZeroUsize::MAX,
             budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
@@ -13338,6 +13608,7 @@ mod emitted_router_behavior_tests {
             }),
             param_resolver: Arc::new(param_resolver),
             route_matched: Arc::new(route_matched),
+            page_url: crate::web::unrouted_page_url(),
             session_count: Arc::new(AtomicUsize::new(0)),
             max_sessions: std::num::NonZeroUsize::MAX,
             budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
@@ -14118,7 +14389,7 @@ mod emitted_router_behavior_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .rendered
-            .commit(tree);
+            .commit(tree, super::PageUrl::Unrouted);
         assert!(step.is_ok(), "a fresh history mints another epoch");
     }
 
@@ -15987,6 +16258,7 @@ mod page_mount_base_tests {
         super::PageRender::current(&super::Rendered::first(
             super::SessionKeys::distinct(),
             super::Html::<()>::HText("x".to_owned()),
+            super::PageUrl::Unrouted,
         ))
     }
 
@@ -16233,8 +16505,19 @@ mod route_entry_cmd_tests {
 
     /// The fixture app's state over `store`, counting its session drivers in `session_count`.
     fn fixture_state(store: Store, session_count: Arc<AtomicUsize>) -> FixtureState {
-        let (route_entry, _, route_matched) =
-            routed_resolvers(routes(), Page::Home, set_page, render);
+        let RoutedResolvers {
+            route_entry,
+            route_matched,
+            page_url,
+            ..
+        } = routed_resolvers(
+            routes(),
+            Page::Home,
+            set_page,
+            |model: &Model| &model.page,
+            render,
+            crate::web::MountContext::Root.base().encoded(),
+        );
         WebState {
             store,
             init: Arc::new(init),
@@ -16244,6 +16527,7 @@ mod route_entry_cmd_tests {
             route_entry,
             param_resolver: Arc::new(|_path| crate::dict::dict_empty()),
             route_matched,
+            page_url,
             session_count,
             max_sessions: std::num::NonZeroUsize::MAX,
             budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
@@ -18117,7 +18401,7 @@ mod route_entry_cmd_tests {
         let (enter_tx, enter_rx) = mpsc::channel::<EnterRequest>(ENTER_QUEUE_CAP.get());
         let entry = Arc::new(Mutex::new(SessionEntry {
             model: model.clone(),
-            rendered: Rendered::first(SessionKeys::distinct(), last_view),
+            rendered: Rendered::first(SessionKeys::distinct(), last_view, PageUrl::Unrouted),
             tabs: TabSeqs::default(),
             seq: 0,
             sse_tx: None,
@@ -18884,7 +19168,8 @@ mod tab_seq_window_tests {
 #[cfg(not(target_arch = "wasm32"))]
 mod render_origin_tests {
     use super::{
-        Addressed, Attribute, Html, Origin, PatchEnvelope, TabEvent, TabId, assign_ipe_ids,
+        Addressed, Attribute, Html, Origin, PageUrl, Rendered, SessionKeys, TabEvent, TabId,
+        assign_ipe_ids, patches_json, route,
     };
 
     const A: TabId = TabId(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff);
@@ -18926,20 +19211,83 @@ mod render_origin_tests {
         h
     }
 
-    fn frame(origin: Origin) -> serde_json::Value {
+    /// The browser path of the one-route table's `/about` page under `/app`.
+    fn about() -> PageUrl {
+        let routes = [route::Route::new("/about", |_| Some(()))];
+        let base = route::DecodedPath::parse("/app")
+            .ok()
+            .and_then(|path| crate::encoding::EncodedBase::encode(&path).ok());
+        assert!(base.is_some(), "`/app` encodes as a base");
+        let Some(base) = base else {
+            return PageUrl::Unrouted;
+        };
+        route::page_url(&base, route::render_route(&routes, 0, &[]))
+    }
+
+    /// The `patches` frame of a commit of `origin` that leaves the page at `url`.
+    fn frame_at(origin: Origin, url: PageUrl) -> serde_json::Value {
         let old = panel(false);
         let new = panel(true);
         let addressed = Addressed::of(origin, &old, &new);
-        let env = PatchEnvelope {
-            global_seq: 1,
-            from: String::new(),
-            to: String::new(),
-            patches: &[],
-            tab: addressed.as_ref().map(|a| a.event.tab.to_token()),
-            tab_seq: addressed.as_ref().map(|a| a.event.seq),
-            focus: addressed.as_ref().and_then(|a| a.focus.as_ref()),
+        let mut rendered = Rendered::first(SessionKeys::distinct(), old, PageUrl::Unrouted);
+        let step = rendered.commit(new, url);
+        assert!(step.is_ok(), "a fresh history mints another epoch");
+        let Ok(step) = step else {
+            return serde_json::Value::Null;
         };
-        serde_json::to_value(&env).unwrap_or_default()
+        patches_json(1, &step, &[], addressed.as_ref())
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default()
+    }
+
+    fn frame(origin: Origin) -> serde_json::Value {
+        frame_at(origin, PageUrl::Unrouted)
+    }
+
+    /// A commit one tab's own event made pushes its route in that tab.
+    #[test]
+    fn own_event_is_push() {
+        let f = frame_at(Origin::Tab(SENT), about());
+        assert_eq!(f["route"].as_str(), Some("/app/about"), "{f}");
+        assert_eq!(f["history"].as_str(), Some("push"), "{f}");
+        assert_eq!(f["tab"].as_str(), Some(A.to_token().as_str()), "{f}");
+    }
+
+    /// A commit no tab's event made (a Cmd or Sub result, a relayed frame)
+    /// replaces the route and names no tab, so no tab pushes it.
+    #[test]
+    fn relayed_frame_is_replace() {
+        let f = frame_at(Origin::None, about());
+        assert_eq!(f["route"].as_str(), Some("/app/about"), "{f}");
+        assert_eq!(f["history"].as_str(), Some("replace"), "{f}");
+        assert!(f.get("tab").is_none(), "{f}");
+    }
+
+    /// A page whose route does not render carries no route: the client leaves
+    /// its URL where it is, for a push and a replace alike.
+    #[test]
+    fn unrenderable_page_writes_no_route() {
+        for origin in [Origin::Tab(SENT), Origin::None] {
+            let f = frame_at(
+                origin,
+                PageUrl::Unrenderable(route::RenderRefusal::Shadowed),
+            );
+            assert!(f.get("route").is_none(), "{f}");
+        }
+        assert!(
+            frame(Origin::None).get("route").is_none(),
+            "an unrouted app writes no route"
+        );
+    }
+
+    /// The step a commit returns carries the route it was committed with.
+    #[test]
+    fn the_committed_route_is_the_steps_route() {
+        let mut rendered =
+            Rendered::first(SessionKeys::distinct(), panel(false), PageUrl::Unrouted);
+        let step = rendered.commit(panel(true), about());
+        assert!(step.is_ok_and(|step| step.route() == rendered.route()));
+        assert_eq!(rendered.route().path(), Some("/app/about"));
     }
 
     /// A render of one tab's event names that tab, the seq of the event it
@@ -19175,6 +19523,7 @@ mod web_revocation_tests {
             }),
             param_resolver: Arc::new(param_resolver),
             route_matched: Arc::new(route_matched),
+            page_url: crate::web::unrouted_page_url(),
             session_count: Arc::new(AtomicUsize::new(0)),
             max_sessions: std::num::NonZeroUsize::MAX,
             budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
@@ -19911,6 +20260,7 @@ mod web_revocation_tests {
                 &Arc::downgrade(&handle),
                 request,
                 &route_entry,
+                &unrouted_page_url(),
                 &view,
                 &dyn_store,
                 &scope,
@@ -21322,7 +21672,7 @@ mod session_history_charge_tests {
         history.record(msg, 1, &|_msg, model| (model, IpeCmd::None));
         SessionEntry {
             model: 1,
-            rendered: Rendered::first(SessionKeys::distinct(), tree),
+            rendered: Rendered::first(SessionKeys::distinct(), tree, PageUrl::Unrouted),
             tabs: TabSeqs::default(),
             seq: 0,
             sse_tx: None,
@@ -21463,7 +21813,11 @@ mod shutdown_work_tests {
         let cmds = Arc::new(budget::SessionCmds::new());
         let entry = Arc::new(Mutex::new(SessionEntry {
             model: 0_i64,
-            rendered: Rendered::first(SessionKeys::distinct(), Html::HText(String::new())),
+            rendered: Rendered::first(
+                SessionKeys::distinct(),
+                Html::HText(String::new()),
+                PageUrl::Unrouted,
+            ),
             tabs: TabSeqs::default(),
             seq: 0,
             sse_tx: None,
@@ -21509,6 +21863,7 @@ mod shutdown_work_tests {
             view,
             subs,
             route_entry,
+            unrouted_page_url(),
             store,
             scope,
             cmds,

@@ -194,14 +194,17 @@ where
 ///
 /// `routes` match a path to a `Page`, `not_found` is entered when none does,
 /// `set_page` applies an entered page to the model (yielding its entry Cmd),
-/// and `render` turns a page back into its canonical path for navigation.
-pub struct RoutedPages<Page, FSetPage, FRender> {
+/// `page_of` reads the model's page, and `render` turns a page back into its
+/// canonical path, for navigation and for the URL every commit records.
+pub struct RoutedPages<Page, FSetPage, FPageOf, FRender> {
     /// The declared route table, checked once at mount.
     pub routes: Vec<crate::web::route::Route<Page>>,
     /// The page a path matching no route enters.
     pub not_found: Page,
     /// Applies an entered page to the model.
     pub set_page: FSetPage,
+    /// Reads the page a model shows.
+    pub page_of: FPageOf,
     /// Renders a page to its canonical path.
     pub render: FRender,
 }
@@ -225,12 +228,24 @@ pub struct RoutedPages<Page, FSetPage, FRender> {
 /// still on it: it enters `notFound`, or the page a pattern with a leading
 /// `:param` segment builds from the base segment (`/:slug` at `/app` enters
 /// `slug = "app"`).
-pub fn wasm_app_routed<E, Model, Msg, Page, FInit, FUpdate, FView, FSubs, FSetPage, FRender>(
+pub fn wasm_app_routed<
+    E,
+    Model,
+    Msg,
+    Page,
+    FInit,
+    FUpdate,
+    FView,
+    FSubs,
+    FSetPage,
+    FPageOf,
+    FRender,
+>(
     init: FInit,
     update: FUpdate,
     view: FView,
     subscriptions: FSubs,
-    pages: RoutedPages<Page, FSetPage, FRender>,
+    pages: RoutedPages<Page, FSetPage, FPageOf, FRender>,
 ) -> IpeTask<E, ()>
 where
     E: crate::FromIpeError + 'static,
@@ -242,6 +257,7 @@ where
     FView: Fn(Model) -> Html<Msg> + 'static,
     FSubs: Fn(Model) -> IpeSub<Msg> + 'static,
     FSetPage: Fn(Page, Model) -> (Model, IpeCmd<Msg>) + 'static,
+    FPageOf: for<'a> Fn(&'a Model) -> &'a Page + 'static,
     FRender: Fn(&Page) -> Result<crate::web::route::RoutePath, crate::web::route::RenderRefusal>
         + 'static,
 {
@@ -328,6 +344,16 @@ type WasmRouter<Model, Msg> = dyn Fn(
     Model,
 ) -> Option<crate::web::route::Entered<Model, IpeCmd<Msg>>>;
 
+/// A routed app's two halves: entering a URL, and the URL a model's page has.
+///
+/// Only a routed app has one, so an unrouted app never writes its URL.
+struct WasmRouting<Model, Msg> {
+    /// Enters a located path into the model.
+    enter: Box<WasmRouter<Model, Msg>>,
+    /// The browser path of the page a model shows.
+    url_of: Box<dyn Fn(&Model) -> crate::dom::PageUrl>,
+}
+
 /// Where a queued Msg came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Source {
@@ -383,6 +409,11 @@ impl<F: PartialEq> Cause<F> {
             Self::User(then) => then == now,
             Self::Idle | Self::Effect => false,
         }
+    }
+
+    /// Whether these Msgs are all the user's own events.
+    const fn is_user(&self) -> bool {
+        matches!(self, Self::User(_))
     }
 
     /// Moves a pending user mark onto `at`, where the focus keep put focus.
@@ -529,7 +560,7 @@ struct App<Model, Msg> {
     /// are left unchanged and no Cmd runs, matching the server's unrouted-GET
     /// guard (prevents handler-index orphaning on noise paths like
     /// `/favicon.ico`).
-    router: Option<Box<WasmRouter<Model, Msg>>>,
+    router: Option<WasmRouting<Model, Msg>>,
     /// Development-only time-travelling debugger recorder. Passive: records
     /// each live-pass `update` step without re-firing any `Cmd`. Present only
     /// when the `debugger` feature is active (`ipe dev build/run --debugger`).
@@ -746,12 +777,12 @@ where
 ///    after `init`'s.
 /// 2. A `popstate` listener is installed so back/forward navigation enters the
 ///    URL (running its entry Cmd).
-fn mount_app_routed<Model, Msg, Page, FInit, FUpdate, FView, FSubs, FSetPage, FRender>(
+fn mount_app_routed<Model, Msg, Page, FInit, FUpdate, FView, FSubs, FSetPage, FPageOf, FRender>(
     init: FInit,
     update: FUpdate,
     view: FView,
     subscriptions: FSubs,
-    pages: RoutedPages<Page, FSetPage, FRender>,
+    pages: RoutedPages<Page, FSetPage, FPageOf, FRender>,
 ) -> Result<(), MountRefusal>
 where
     Model: Clone + 'static,
@@ -762,23 +793,27 @@ where
     FView: Fn(Model) -> Html<Msg> + 'static,
     FSubs: Fn(Model) -> IpeSub<Msg> + 'static,
     FSetPage: Fn(Page, Model) -> (Model, IpeCmd<Msg>) + 'static,
+    FPageOf: for<'a> Fn(&'a Model) -> &'a Page + 'static,
     FRender: Fn(&Page) -> Result<crate::web::route::RoutePath, crate::web::route::RenderRefusal>
         + 'static,
 {
-    use crate::web::route::{DecodedPath, check_route_table, enter_located, navigate};
+    use crate::web::route::{DecodedPath, check_route_table, enter_located, navigate, page_url};
 
     let RoutedPages {
         routes,
         not_found,
         set_page,
+        page_of,
         render,
     } = pages;
 
     // A malformed literal in the route table fails the mount loudly, with the
     // same refusal the server's `web_app_routed` starts with.
     check_route_table(&routes).map_err(MountRefusal::RouteTable)?;
-    // The client is served at the root: the empty base strips nothing.
+    // The client is served at the root: the empty base strips nothing, and
+    // adds nothing to a page's browser path.
     let base = DecodedPath::parse("").map_err(MountRefusal::BasePath)?;
+    let url_base = crate::encoding::MountBase::root().encoded();
 
     let document = document()?;
     let body: web_sys::HtmlElement = document.body().ok_or(MountRefusal::NoBody)?;
@@ -817,7 +852,7 @@ where
     let not_found_rc = Rc::new(not_found);
     let set_page_rc = Rc::new(set_page);
     let render_rc = Rc::new(render);
-    let router: Box<WasmRouter<Model, Msg>> = {
+    let enter: Box<WasmRouter<Model, Msg>> = {
         let routes = Rc::clone(&routes_rc);
         let not_found = Rc::clone(&not_found_rc);
         let set_page = Rc::clone(&set_page_rc);
@@ -826,6 +861,11 @@ where
             navigate(&routes, located, &not_found, m, &*set_page, &*render)
         })
     };
+    let url_of: Box<dyn Fn(&Model) -> crate::dom::PageUrl> = {
+        let render = Rc::clone(&render_rc);
+        Box::new(move |m: &Model| page_url(&url_base, (*render)(page_of(m))))
+    };
+    let router = WasmRouting { enter, url_of };
 
     #[cfg(feature = "debugger")]
     let recorder_base = model.clone();
@@ -863,6 +903,8 @@ where
     attach_delegated_listeners(&body, &app)?;
     attach_widget_up_listener(&body, &app)?;
     attach_popstate_listener(&app, base)?;
+    // The entered page's route rewrites the entry the app was loaded at.
+    sync_url(&app, false);
     // The first paint parsed markup; deliver each widget's decoded
     // down-state PROPERTY once here (later changes ride the diff/patch route).
     widget::sync_widget_properties(&document, &app.tree.borrow());
@@ -922,7 +964,7 @@ where
     let Some(crate::web::route::Entered {
         model: new_model,
         cmd,
-    }) = (router)(path, current)
+    }) = (router.enter)(path, current)
     else {
         return;
     };
@@ -931,6 +973,7 @@ where
     let mut new_tree = (app.view)(new_model);
     assign_ipe_ids(&mut new_tree, ROOT_IPE_ID);
     commit_view(app, new_tree, None);
+    sync_url(app, false);
 
     run_cmd(app, cmd);
     resync_subscriptions(app);
@@ -1350,6 +1393,7 @@ where
             None
         };
         commit_view(app, new_tree, target.as_ref());
+        sync_url(app, cause.is_user());
     }
 
     for cmd in cmds {
@@ -1965,6 +2009,47 @@ fn commit_view<Model, Msg: Clone>(
     // PROPERTY (idempotent, bounded by the widget count).
     if let Ok(document) = document() {
         widget::sync_widget_properties(&document, &app.tree.borrow());
+    }
+}
+
+/// Record the route of the page the committed model shows as the location.
+///
+/// A new history entry when `push` (a render of the user's own events),
+/// otherwise the current entry rewritten (mount, `popstate`, navigation, and
+/// every Cmd or Sub result). A route that is already the location writes
+/// nothing, an unrouted app has no route, and a page whose route does not
+/// render leaves the URL as it is and is reported once per commit.
+fn sync_url<Model, Msg>(app: &App<Model, Msg>, push: bool) {
+    let Some(router) = app.router.as_ref() else {
+        return;
+    };
+    let url = (router.url_of)(&app.model.borrow());
+    let path = match &url {
+        crate::dom::PageUrl::Routed(path) => path.as_str(),
+        crate::dom::PageUrl::Unrouted => return,
+        crate::dom::PageUrl::Unrenderable(refusal) => {
+            console_warn(&format!(
+                "route.unrenderable: the page's URL is left unchanged: {refusal}"
+            ));
+            return;
+        }
+    };
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    if window.location().pathname().ok().as_deref() == Some(path) {
+        return;
+    }
+    let Ok(history) = window.history() else {
+        return;
+    };
+    let written = if push {
+        history.push_state_with_url(&JsValue::NULL, "", Some(path))
+    } else {
+        history.replace_state_with_url(&JsValue::NULL, "", Some(path))
+    };
+    if written.is_err() {
+        console_warn("route.history: the browser refused the page's URL");
     }
 }
 

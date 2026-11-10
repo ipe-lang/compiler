@@ -458,6 +458,7 @@ fn emit_web_app_inner(
                 generics,
             )?;
             let handler = &update.handler;
+            let page_of = page_of_closure(&model_ty_s);
             let call = format!(
                 "ipe_runtime::wasm::wasm_app_routed(\
                  {init_s}, \
@@ -468,6 +469,7 @@ fn emit_web_app_inner(
                  routes: {routes_s}, \
                  not_found: {not_found_s}, \
                  set_page: {set_page}, \
+                 page_of: {page_of}, \
                  render: {render_s} \
                  }}\
                  )"
@@ -568,9 +570,10 @@ fn emit_routed_web_leaf(
         granted_web_features_register_stmt(ctx)
     );
     let handler = &update.handler;
+    let page_of = page_of_closure(&model_ty_s);
     let args = format!(
         "{init_s}, {handler}, {view_s}, {subs_s}, {routes_s}, {not_found_s}, {set_page}, \
-         {render_s}, {WEB_STORE_ARGS}"
+         {page_of}, {render_s}, {WEB_STORE_ARGS}"
     );
     let handle = if mountable {
         format!("ipe_runtime::web::web_embed_routed({args})")
@@ -584,6 +587,14 @@ fn emit_routed_web_leaf(
     Ok(Some(format!(
         "{{ {register}{tag_const} {prelude}{handle} }}"
     )))
+}
+
+/// The emitted read of a routed model's page, the URL every commit records.
+///
+/// Wrapped in the runtime's `page_of` so the closure borrows the page out of
+/// the model rather than cloning it.
+fn page_of_closure(model_ty_s: &str) -> String {
+    format!("ipe_runtime::web::route::page_of(|__model: &{model_ty_s}| &__model.page)")
 }
 
 /// Emit the single-page (non-routed) `WebApp` leaf.

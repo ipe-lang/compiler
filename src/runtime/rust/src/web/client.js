@@ -314,8 +314,9 @@ function __ipeCounterOrder(a, b) {
 // against a nonce this document does not hold: it is never applied, and the
 // document is stale.
 //
-// An applied render then reconciles the URL with the path it declares.
-function __ipeAdoptFullBody(token, applyFn) {
+// An applied render then records the route it was committed with as the
+// location, rewriting the current entry.
+function __ipeAdoptFullBody(token, applyFn, route) {
   if (__ipeStale) return false;
   var next = __ipeOwnEpoch(token);
   if (!next) {
@@ -327,7 +328,7 @@ function __ipeAdoptFullBody(token, applyFn) {
   __ipeKeepFocus(function() {
     applyFn();
     __ipeEpoch = token;
-    __ipeRunPaths();
+    __ipeSyncRoute(route, false, next);
   });
   return true;
 }
@@ -343,16 +344,35 @@ function __ipePatchStep(from, to) {
   return from === __ipeEpoch ? "next" : "behind";
 }
 // Apply the patches `frame` carries and adopt its `to`, only as the next step
-// from the render on screen, then move focus as the frame addresses it. The
-// one caller of `__ipeApplyPatches`.
+// from the render on screen, record the route it was committed with, then
+// move focus as the frame addresses it. The route is a new history entry only
+// in the tab whose own event made the commit; every other tab rewrites its
+// current entry. The one caller of `__ipeApplyPatches`.
 function __ipeAdoptPatches(frame) {
   if (__ipeStale || __ipePatchStep(frame.from, frame.to) !== "next") return;
+  var own = frame.history === "push" && !!__ipeTabId && frame.tab === __ipeTabId;
   __ipeKeepFocus(function() {
     __ipeApplyPatches(frame.patches);
     __ipeEpoch = frame.to;
-    __ipeRunPaths();
+    __ipeSyncRoute(frame.route, own, __ipeOwnEpoch(frame.to));
     __ipeFocusAddressed(frame);
   });
+}
+// Record `route`, the browser path a render at epoch `at` was committed with,
+// as the location: a new entry when `push`, otherwise the current entry
+// rewritten. A route that is not a same-origin path under this app's base is
+// never recorded, and a route that is already the location's path records
+// nothing, so its query and fragment stay. A render with no route (an
+// unrouted app, or a page whose route does not render) leaves the URL as it is.
+function __ipeSyncRoute(route, push, at) {
+  if (typeof route !== "string" || !at) return;
+  if (route.charAt(0) !== "/" || route.charAt(1) === "/") return;
+  if (__ipeBase && route !== __ipeBase && route.indexOf(__ipeBase + "/") !== 0) return;
+  var u;
+  try { u = new URL(route, window.location.href); } catch (_) { return; }
+  if (u.origin !== window.location.origin) return;
+  if (u.pathname === window.location.pathname) return;
+  __ipeRecordNav(u.pathname, push, at);
 }
 // Set once this document has refused a render of another history: from then
 // on it applies no patch and no full render.
@@ -1622,7 +1642,7 @@ function __ipePostEvent(body, fromQueue) {
           if (!data || typeof data.body !== "string") return;
           // The epoch gate orders this render against the DOM on screen; the
           // seq it carries is the session's, which an earlier ack may equal.
-          __ipeAdoptFullBody(data.epoch, function() { __ipePatch(data.body); });
+          __ipeAdoptFullBody(data.epoch, function() { __ipePatch(data.body); }, data.route);
         }).catch(function() { __ipeLoaderEnd(); });
       case __IPE_EVENT_ANSWER.SESSION_LOST:
         // The marked 404 no DOM may show. The probe confirms it and reloads,
@@ -2004,31 +2024,6 @@ function __ipeBindEvents() {
   }
 }
 
-// __ipeRunPaths: the CSP-friendly alternative to data-ipe-eval for
-// "update the address bar after a render". Each [data-ipe-path] element of
-// the render on screen names its location: a path other than the current one
-// is a new history entry, the current path with a query rewrites the current
-// entry. No new Function(), no eval: the value is a URL path, recorded
-// through `__ipeRecordNav` at the render's epoch, never executed.
-//
-// The element is intentionally NOT removed after running — Ipe.Web's
-// patches identify elements by ipe-id and look them up via
-// querySelector; removing the data-ipe-path element would orphan its
-// ipe-id, and the next attribute patch (when the path changes) would
-// silently skip. The path-check makes the call idempotent, so leaving
-// the element in place is cheap — at most one comparison per render.
-function __ipeRunPaths() {
-  var at = __ipeOwnEpoch(__ipeEpoch);
-  if (!at) return;
-  var els = __ipeDoc.queryAll("[data-ipe-path]");
-  for (var i = 0; i < els.length; i++) {
-    var p = els[i].getAttribute("data-ipe-path");
-    if (!p) continue;
-    if (window.location.pathname !== p) __ipeRecordNav(p, true, at);
-    else if (window.location.search) __ipeRecordNav(p, false, at);
-  }
-}
-
 // The elements already carrying the client's listener, per event name. Kept
 // beside the elements, never on them: a form's control named after a marker
 // property would answer for it.
@@ -2385,7 +2380,8 @@ __ipeDoc.on("click", function(ev) {
     .then(function(r) {
       var url = __ipeFollowed(r, target);
       var epoch = r.headers.get("X-Ipe-Epoch");
-      return r.text().then(function(t) { return { t: t, url: url, epoch: epoch }; });
+      var route = r.headers.get("X-Ipe-Route");
+      return r.text().then(function(t) { return { t: t, url: url, epoch: epoch, route: route }; });
     })
     .then(function(res) {
       // An answer of no history or of another one is not this document's to
@@ -2397,12 +2393,12 @@ __ipeDoc.on("click", function(ev) {
         __ipeLoadNav(intent, target);
         return;
       }
-      // The answer applies unless the screen already shows a later render; its
-      // URL is recorded either way, unless a later answer or render already
-      // named the location.
+      // The answer's URL is recorded, unless a later answer or render already
+      // named the location; the answer then applies unless the screen already
+      // shows a later render, and its route rewrites the entry just recorded.
       __ipeSettleNav(intent);
-      __ipeAdoptFullBody(res.epoch, function() { __ipePatch(res.t, "nav"); });
       __ipeRecordNav(res.url, true, next);
+      __ipeAdoptFullBody(res.epoch, function() { __ipePatch(res.t, "nav"); }, res.route);
     })
     .catch(function() { __ipeLoadNav(intent, target); });
 });
@@ -2434,7 +2430,8 @@ window.addEventListener("popstate", function() {
     .then(function(r) {
       var url = __ipeFollowed(r, popped);
       var epoch = r.headers.get("X-Ipe-Epoch");
-      return r.text().then(function(t) { return { t: t, url: url, epoch: epoch }; });
+      var route = r.headers.get("X-Ipe-Route");
+      return r.text().then(function(t) { return { t: t, url: url, epoch: epoch, route: route }; });
     })
     .then(function(res) {
       // An answer of no history or of another one is not this document's to
@@ -2446,14 +2443,16 @@ window.addEventListener("popstate", function() {
         return;
       }
       // The answer rewrites the current entry to its URL, unless a later
-      // answer or render already named the location.
+      // answer or render already named the location, then to its route.
       __ipeSettleNav(intent);
-      __ipeAdoptFullBody(res.epoch, function() { __ipePatch(res.t, "nav"); });
       __ipeRecordNav(res.url, false, next);
+      __ipeAdoptFullBody(res.epoch, function() { __ipePatch(res.t, "nav"); }, res.route);
     })
     // With no answer to show, the browser loads the popped entry itself.
     .catch(function() { __ipeLoadNav(intent, popped); });
 });
+// The served page's route rewrites the entry it was served at.
+__ipeSyncRoute(__ipeBoot["route"], false, __ipeOwnEpoch(__ipeEpoch));
 // ── Status banner (connection state) ─────────────────────────
 // Single bottom-pinned element rendered by the runtime (NOT by the
 // user's view) showing connection health. State machine:
@@ -2928,7 +2927,7 @@ var __ipeLiveFrames = {
         if (!frame.body) return;
         var body = frame.body.replace(/\\n/g, "\n");
         var apply = function() {
-          __ipeAdoptFullBody(frame.epoch, function() { __ipePatch(body); });
+          __ipeAdoptFullBody(frame.epoch, function() { __ipePatch(body); }, frame.route);
         };
         if (__ipeSelectOpen()) __ipeHoldRender(apply);
         else {

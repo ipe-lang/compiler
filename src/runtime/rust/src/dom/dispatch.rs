@@ -288,13 +288,111 @@ pub enum StaleEpoch {
     Future,
 }
 
-/// The epochs one [`Rendered::commit`] moved between.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Why a page has no URL its own route table reads back to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderRefusal {
+    /// The rendered path is claimed by an earlier route, so it would not
+    /// read back to this page's route.
+    Shadowed,
+    /// A text param is empty, so its segment would vanish from the path.
+    EmptySegment,
+    /// A text param is `.` or `..`, which a client normalizes away.
+    DotSegment,
+    /// A float param is NaN or infinite, which no route param reads back.
+    NonFinite,
+    /// The rendered path is longer than `MAX_URL_COMPONENT_LEN`.
+    TooLong,
+    /// The route index or param count does not fit the table: the emitted
+    /// renderer and the table disagree.
+    NoRoute,
+}
+
+impl std::fmt::Display for RenderRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Shadowed => "the page's path is claimed by an earlier route",
+            Self::EmptySegment => "an empty text cannot be a path segment",
+            Self::DotSegment => "`.` and `..` cannot be path segments",
+            Self::NonFinite => "a NaN or infinite float cannot be a path segment",
+            Self::TooLong => "the page's path is too long",
+            Self::NoRoute => "the page's route is not in the route table",
+        })
+    }
+}
+
+/// A routed page's path in the browser: the mount base, then the page's route.
+///
+/// Built only by `BrowserPath::of`, the one join of a base and a route path,
+/// which the canonical redirect shares.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowserPath(String);
+
+impl BrowserPath {
+    /// The path text: the base, then the route's encoded segments.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[cfg(feature = "web-core")]
+impl BrowserPath {
+    /// The one join of a mount base and a page's route path.
+    ///
+    /// The base is empty or `/seg…` with no trailing `/`, and the route path
+    /// starts with `/`, so the join never doubles a `/`.
+    #[must_use]
+    pub fn of(base: &crate::encoding::EncodedBase, route: &crate::web::route::RoutePath) -> Self {
+        let mut text =
+            String::with_capacity(base.as_str().len().saturating_add(route.as_str().len()));
+        text.push_str(base.as_str());
+        text.push_str(route.as_str());
+        Self(text)
+    }
+}
+
+/// The URL a committed page answers to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PageUrl {
+    /// A routed page whose route renders: the browser shows this path.
+    Routed(BrowserPath),
+    /// A single-page app: the browser's URL is never written.
+    Unrouted,
+    /// A routed page whose route does not render: the URL is left as it is.
+    Unrenderable(RenderRefusal),
+}
+
+impl PageUrl {
+    /// The path the browser is to show, when the page has one.
+    ///
+    /// The one serializer of a page's URL: every carrier the client reads
+    /// takes the route from here.
+    #[must_use]
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Self::Routed(path) => Some(path.as_str()),
+            Self::Unrouted | Self::Unrenderable(_) => None,
+        }
+    }
+}
+
+/// The epochs one [`Rendered::commit`] moved between, and the page's URL.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct EpochStep {
     /// The epoch the client held before the commit.
     pub from: RenderEpoch,
     /// The epoch the commit minted.
     pub to: RenderEpoch,
+    /// The URL of the committed page, minted with `to`.
+    route: PageUrl,
+}
+
+impl EpochStep {
+    /// The URL of the committed page.
+    #[must_use]
+    pub const fn route(&self) -> &PageUrl {
+        &self.route
+    }
 }
 
 /// One retained render: its counter, its handler index, and the index's
@@ -316,6 +414,8 @@ pub struct Rendered<M> {
     /// The measure of `last_view`, written only where `last_view` is.
     view_bytes: Option<Bytes>,
     history: VecDeque<RetainedRender<M>>,
+    /// The URL of the current view, minted with its epoch.
+    route: PageUrl,
 }
 
 impl<M: RetainedBytes> Rendered<M> {
@@ -372,11 +472,11 @@ impl<M: Clone + RetainedBytes> Rendered<M> {
     ///
     /// `keys` are the history's for its whole life: no method replaces them.
     #[must_use]
-    pub fn first(keys: SessionKeys, tree: Html<M>) -> Self {
-        Self::starting_at(keys, NonZeroU64::MIN, tree)
+    pub fn first(keys: SessionKeys, tree: Html<M>, route: PageUrl) -> Self {
+        Self::starting_at(keys, NonZeroU64::MIN, tree, route)
     }
 
-    fn starting_at(keys: SessionKeys, n: NonZeroU64, tree: Html<M>) -> Self {
+    fn starting_at(keys: SessionKeys, n: NonZeroU64, tree: Html<M>, route: PageUrl) -> Self {
         let SessionKeys {
             incarnation,
             style_nonce,
@@ -392,10 +492,14 @@ impl<M: Clone + RetainedBytes> Rendered<M> {
             view_bytes: tree.view_bytes(),
             last_view: tree,
             history,
+            route,
         }
     }
 
     /// Install `tree` as the current view under a newly minted epoch.
+    ///
+    /// `route` is the committed page's URL: it is minted with the epoch, so
+    /// no view is committed without one.
     ///
     /// The oldest retained index is evicted before the new one is kept once
     /// the history holds [`RENDER_HISTORY_DEPTH`] renders, so the history
@@ -405,7 +509,7 @@ impl<M: Clone + RetainedBytes> Rendered<M> {
     ///
     /// Returns [`EpochExhausted`] when the counter would overflow; the view is
     /// left unchanged and the caller drops the whole history.
-    pub fn commit(&mut self, tree: Html<M>) -> Result<EpochStep, EpochExhausted> {
+    pub fn commit(&mut self, tree: Html<M>, route: PageUrl) -> Result<EpochStep, EpochExhausted> {
         let from = self.epoch();
         let next = self.current.checked_add(1).ok_or(EpochExhausted)?;
         let index = build_index(&tree);
@@ -417,9 +521,11 @@ impl<M: Clone + RetainedBytes> Rendered<M> {
         self.current = next;
         self.view_bytes = tree.view_bytes();
         self.last_view = tree;
+        self.route = route;
         Ok(EpochStep {
             from,
             to: self.epoch(),
+            route: self.route.clone(),
         })
     }
 }
@@ -432,6 +538,12 @@ impl<M: Clone> Rendered<M> {
             incarnation: self.incarnation,
             n: self.current,
         }
+    }
+
+    /// The URL of the current view.
+    #[must_use]
+    pub const fn route(&self) -> &PageUrl {
+        &self.route
     }
 
     /// The current view.
@@ -539,7 +651,7 @@ mod tests {
     // index, up to the history depth and no further.
     #[test]
     fn a_rendered_history_counts_its_view_and_every_index() {
-        let mut rendered = Rendered::first(keys(), tree());
+        let mut rendered = Rendered::first(keys(), tree(), PageUrl::Unrouted);
         let first = rendered.resident_bytes().map(Bytes::get);
         let view = tree().view_bytes().map(Bytes::get);
         assert!(
@@ -548,7 +660,7 @@ mod tests {
         );
         let mut seen = Vec::new();
         for _ in 0..RENDER_HISTORY_DEPTH.get() + 4 {
-            assert!(rendered.commit(tree()).is_ok());
+            assert!(rendered.commit(tree(), PageUrl::Unrouted).is_ok());
             seen.push(rendered.resident_bytes().map(Bytes::get));
         }
         let depth = RENDER_HISTORY_DEPTH.get();
@@ -582,9 +694,11 @@ mod tests {
     /// The bytes a full render history of `drawn(lines, handlers)` keeps
     /// resident beyond its current view.
     fn history_bytes(lines: usize, handlers: bool) -> Option<u64> {
-        let mut rendered = Rendered::first(keys(), drawn(lines, handlers));
+        let mut rendered = Rendered::first(keys(), drawn(lines, handlers), PageUrl::Unrouted);
         for _ in 0..RENDER_HISTORY_DEPTH.get() {
-            rendered.commit(drawn(lines, handlers)).ok()?;
+            rendered
+                .commit(drawn(lines, handlers), PageUrl::Unrouted)
+                .ok()?;
         }
         let all = rendered.resident_bytes()?.get();
         all.checked_sub(rendered.last_view().view_bytes()?.get())
@@ -594,10 +708,10 @@ mod tests {
     // capacity it started with, and every slot it is charged for holds a render.
     #[test]
     fn a_full_history_keeps_its_starting_capacity() {
-        let mut rendered = Rendered::first(keys(), tree());
+        let mut rendered = Rendered::first(keys(), tree(), PageUrl::Unrouted);
         let start = rendered.history.capacity();
         for _ in 0..RENDER_HISTORY_DEPTH.get() + 4 {
-            assert!(rendered.commit(tree()).is_ok());
+            assert!(rendered.commit(tree(), PageUrl::Unrouted).is_ok());
         }
         assert_eq!(rendered.history.len(), RENDER_HISTORY_DEPTH.get());
         assert_eq!(rendered.history.capacity(), start);
@@ -874,11 +988,15 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)] // a commit below u64::MAX always mints an epoch
     fn ring_evicts_the_oldest_render_and_keeps_the_rest() {
-        let mut r = Rendered::first(keys(), labelled("e1"));
+        let mut r = Rendered::first(keys(), labelled("e1"), PageUrl::Unrouted);
         let e1 = r.epoch();
-        let e2 = r.commit(labelled("e2")).expect("second commit").to;
+        let e2 = r
+            .commit(labelled("e2"), PageUrl::Unrouted)
+            .expect("second commit")
+            .to;
         for k in 3..=RENDER_HISTORY_DEPTH.get() + 1 {
-            r.commit(labelled(&format!("e{k}"))).expect("commit");
+            r.commit(labelled(&format!("e{k}")), PageUrl::Unrouted)
+                .expect("commit");
         }
         assert_eq!(
             r.resolve(&e1, "r_0_button", "click", &[]),
@@ -899,7 +1017,7 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)] // the tokens are built well-formed
     fn future_and_other_incarnation_refuse_with_their_own_variant() {
-        let r = Rendered::first(keys(), labelled("only"));
+        let r = Rendered::first(keys(), labelled("only"), PageUrl::Unrouted);
         let current = r.epoch().to_token();
         let (hex, _) = current.split_once('.').expect("a token has a dot");
         let future = RenderEpoch::parse(&format!("{hex}.2")).expect("future token");
@@ -952,20 +1070,47 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)] // the token was minted by `to_token`
     fn epoch_token_round_trips() {
-        let mut r = Rendered::first(keys(), labelled("a"));
+        let mut r = Rendered::first(keys(), labelled("a"), PageUrl::Unrouted);
         let first = r.epoch();
         assert_eq!(RenderEpoch::parse(&first.to_token()), Ok(first));
-        let step = r.commit(labelled("b")).expect("commit");
+        let step = r.commit(labelled("b"), PageUrl::Unrouted).expect("commit");
         assert_eq!(step.from, first);
         assert_eq!(RenderEpoch::parse(&step.to.to_token()), Ok(step.to));
         assert_ne!(step.from, step.to);
     }
 
+    /// A commit takes the page's URL and hands it back with the epoch it
+    /// mints; the step's route has no setter, so no step carries another.
+    #[test]
+    #[allow(clippy::expect_used)] // a fresh history commits
+    fn commit_without_route_is_unconstructible() {
+        let refused = PageUrl::Unrenderable(RenderRefusal::EmptySegment);
+        let mut r = Rendered::first(keys(), labelled("a"), PageUrl::Unrouted);
+        assert_eq!(r.route(), &PageUrl::Unrouted);
+        let step = r.commit(labelled("b"), refused.clone()).expect("commit");
+        assert_eq!(step.route(), &refused);
+        assert_eq!(r.route(), &refused);
+        assert_eq!(
+            step.route().path(),
+            None,
+            "an unrenderable page has no path"
+        );
+        assert_eq!(
+            PageUrl::Unrouted.path(),
+            None,
+            "an unrouted page has no path"
+        );
+    }
+
     #[test]
     fn commit_at_the_last_counter_is_exhausted_and_keeps_the_view() {
-        let mut r = Rendered::starting_at(keys(), NonZeroU64::MAX, labelled("last"));
+        let mut r =
+            Rendered::starting_at(keys(), NonZeroU64::MAX, labelled("last"), PageUrl::Unrouted);
         let before = r.epoch();
-        assert_eq!(r.commit(labelled("past")), Err(EpochExhausted));
+        assert_eq!(
+            r.commit(labelled("past"), PageUrl::Unrouted),
+            Err(EpochExhausted)
+        );
         assert_eq!(r.epoch(), before);
         assert_eq!(
             r.resolve(&before, "r_0_button", "click", &[]),
