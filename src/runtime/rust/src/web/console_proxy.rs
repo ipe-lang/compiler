@@ -552,7 +552,7 @@ pub(crate) async fn ensure_console_proxy(mount: &super::MountContext) -> bool {
 ///
 /// The proxy serves every routable method, never the router's every-method
 /// wildcard, so its paths name their methods in `Allow` like every route.
-pub(crate) fn proxy_routes<S>(router: crate::server::RouteTable<S>) -> crate::server::RouteTable<S>
+pub fn proxy_routes<S>(router: crate::server::RouteTable<S>) -> crate::server::RouteTable<S>
 where
     S: Clone + Send + Sync + 'static,
 {

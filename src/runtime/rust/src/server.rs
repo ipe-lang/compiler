@@ -2194,7 +2194,7 @@ impl<S: Clone + Send + Sync + 'static> Endpoint<S> {
 /// [`RouteTable::try_route`] as an [`Endpoint`], and every nested service as
 /// a [`ServedRouter`], so the oracle holds exactly the paths and methods the
 /// router serves.
-pub(crate) struct RouteTable<S = ()> {
+pub struct RouteTable<S = ()> {
     router: axum::Router<S>,
     paths: std::collections::BTreeMap<String, MethodSet>,
     #[cfg(feature = "web")]

@@ -213,7 +213,7 @@ fn asset_response(content_type: &'static str, body: axum::body::Body) -> axum::r
 /// once per mounted app and shared by every answer through [`Bytes`].
 ///
 /// [`Bytes`]: axum::body::Bytes
-pub(crate) fn mount_routes<S>(
+pub fn mount_routes<S>(
     router: crate::server::RouteTable<S>,
     offer: Option<&'static InstallOffer>,
     base: &MountBase,
