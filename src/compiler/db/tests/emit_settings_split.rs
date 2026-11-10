@@ -142,7 +142,7 @@ fn split_root(db: &IpeDatabase, lib: SourceFile, main: SourceFile) -> SourceRoot
 
 /// Dependency-model settings: the debugger module lives only in the linked
 /// runtime crate, so both the plain and the debugger build link one.
-fn settings(debugger: bool, host: EmitHost) -> EmitSettings {
+const fn settings(debugger: bool, host: EmitHost) -> EmitSettings {
     EmitSettings {
         db_driver: DbDriver::Sqlite,
         ffi: None,

@@ -77,7 +77,7 @@ fn minimal_native_program() -> (Program, Interner) {
 ///
 /// The identity never reaches the emitted manifest, so any value selects the
 /// dep-model branch without affecting the emitted text.
-fn dummy_runtime_dep() -> RuntimeDep {
+const fn dummy_runtime_dep() -> RuntimeDep {
     RuntimeDep {
         content: RuntimeContentId::from_digest_bytes([0; 16]),
     }
