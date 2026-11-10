@@ -1082,7 +1082,7 @@ fn run_inner(
         })?;
     }
 
-    let runtime_dep = watch_runtime_dep(&opts)?;
+    let runtime_dep = watch_runtime_dep(opts)?;
 
     // The DEV-ONLY blue-green front proxy. When engaged it binds the user's port
     // up front and holds it for the whole session; the app binaries run behind it
