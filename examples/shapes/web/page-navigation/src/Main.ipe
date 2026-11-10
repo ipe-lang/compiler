@@ -1,0 +1,104 @@
+module Main exposing (main)
+
+-- | page-navigation — a routed app whose browser URL follows the page it shows.
+--
+-- The `page` field of the Model is the app's location. Whatever changes it, the
+-- URL follows: a button's `update` (a new history entry, so Back returns to the
+-- page before), or a subscription (the current entry is rewritten, since no
+-- reader asked to go anywhere). A path typed or reloaded enters its page
+-- through the route table, and Back and Forward restore the page each entry
+-- names.
+--
+-- The same program runs served (`web`) and as the browser bundle
+-- (`web client`); the URL follows the page in both.
+
+import Ipe.String as String
+import Ipe.Tea.Web as Web
+import Ipe.Tea.Web.Cmd as Cmd
+import Ipe.Tea.Web.Sub as Sub
+import Ipe.Ui as Ui
+
+
+type Page
+    = HomePage
+    | EntryPage Int
+    | AboutPage
+
+
+type alias Model =
+    { page : Page
+    , leaving : Bool
+    }
+
+
+type Msg
+    = Open Page
+    | LeaveSoon
+    | Left
+
+
+init : WebReq -> ( Model, Cmd.Cmd Msg )
+init _req =
+    ( { page = HomePage, leaving = False }, Cmd.none )
+
+
+update : Msg -> Model -> ( Model, Cmd.Cmd Msg )
+update msg model =
+    case msg of
+        Open page ->
+            ( { model | page = page }, Cmd.none )
+
+        LeaveSoon ->
+            ( { model | leaving = True }, Cmd.none )
+
+        Left ->
+            ( { model | page = AboutPage, leaving = False }, Cmd.none )
+
+
+-- | While the reader waits to leave, a timer moves the app to the about page:
+-- a page change no click of the reader's made.
+subscriptions : Model -> Sub.Sub Msg
+subscriptions model =
+    if model.leaving then
+        Sub.every 300 Left
+
+    else
+        Sub.none
+
+
+view : Model -> Element Msg
+view model =
+    Ui.column []
+        [ heading model.page
+        , Ui.button [ Ui.id "open-home" ] { onPress = Just (Open HomePage), label = Ui.text "Home" }
+        , Ui.button [ Ui.id "open-entry" ] { onPress = Just (Open (EntryPage 1)), label = Ui.text "Entry 1" }
+        , Ui.button [ Ui.id "leave-soon" ] { onPress = Just LeaveSoon, label = Ui.text "About, soon" }
+        ]
+
+
+heading : Page -> Element Msg
+heading page =
+    case page of
+        HomePage ->
+            Ui.el [ Ui.id "page" ] (Ui.text "home")
+
+        EntryPage n ->
+            Ui.el [ Ui.id "page" ] (Ui.text ("entry " ++ String.fromInt n))
+
+        AboutPage ->
+            Ui.el [ Ui.id "page" ] (Ui.text "about")
+
+
+main =
+    Web.tea
+        { init = init
+        , update = update
+        , view = view
+        , subscriptions = subscriptions
+        , routes =
+            [ Web.route "/" HomePage
+            , Web.route "/entry/:id" EntryPage
+            , Web.route "/about" AboutPage
+            ]
+        , notFound = HomePage
+        }

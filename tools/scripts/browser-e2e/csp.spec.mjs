@@ -24,8 +24,8 @@
  *   5. Navigation — the URL follows the render on screen: an older answer to a
  *      navigation a later one superseded moves neither the DOM nor the URL,
  *      whichever order the answers arrive in; a popstate answer that applies
- *      after a link's answer names the URL; a render's `data-ipe-path` is one
- *      history entry that Back leaves; and a popstate whose fetch fails or
+ *      after a link's answer names the URL; a render's route is one history
+ *      entry that Back leaves; and a popstate whose fetch fails or
  *      whose answer is of no history is a full browser load of the entry it
  *      popped, even after a link's answer moved the URL meanwhile, unless the
  *      reader followed a later link. A document gone stale while a link's
@@ -358,13 +358,11 @@ async function addNavLink(page, name, path) {
   );
 }
 
-/** A navigation answer at `epoch` whose render is `body`. */
-function navAnswer(epoch, body) {
-  return {
-    status: 200,
-    headers: { "content-type": "text/html", "x-ipe-web": "1", "x-ipe-epoch": epoch },
-    body,
-  };
+/** A navigation answer at `epoch` whose render is `body`, committed at `route` when given. */
+function navAnswer(epoch, body, route) {
+  const headers = { "content-type": "text/html", "x-ipe-web": "1", "x-ipe-epoch": epoch };
+  if (route) headers["x-ipe-route"] = route;
+  return { status: 200, headers, body };
 }
 
 test("render history: patches in an event answer never apply", async ({ page }) => {
@@ -540,7 +538,7 @@ test("navigation: an answer older than one already applied leaves the URL on the
   expect(await page.locator("#e2e-second").count()).toBe(0);
 });
 
-test("navigation: a render's data-ipe-path is one history entry, and Back leaves it", async ({
+test("navigation: a render's route is one history entry, and Back leaves it", async ({
   page,
 }) => {
   const { later } = await openLive(page);
@@ -552,7 +550,7 @@ test("navigation: a render's data-ipe-path is one history entry, and Back leaves
       if (route.request().headers()["x-ipe-nav"] !== "1") return route.continue();
       if (new URL(route.request().url()).pathname === "/e2e-path") {
         return route.fulfill(
-          navAnswer(at(1), '<div id="e2e-path" data-ipe-path="/e2e-path">path</div>'),
+          navAnswer(at(1), '<div id="e2e-path">path</div>', "/e2e-path"),
         );
       }
       return route.fulfill(navAnswer(at(2), '<div id="e2e-home">home</div>'));

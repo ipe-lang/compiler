@@ -7,7 +7,9 @@
  * refusals on the geo-clipboard app, and the wasm-client port round-trip and
  * glue refusals on the serverless wasm-client-clipboard bundle, and the worker
  * gate, the port-tag and the port-correlation refusals on the geo-clipboard
- * app, and the install offer on the install-offer / install-offer-off apps).
+ * app, the install offer on the install-offer / install-offer-off apps, and
+ * the URL that follows the page on the page-navigation app, served and as its
+ * browser bundle).
  *
  * A single Chromium project — the only browser target for these tests.
  * The geo/clipboard browser APIs (navigator.geolocation,
@@ -39,6 +41,7 @@ export default {
     "install.spec.mjs",
     "port-tag-gate.spec.mjs",
     "port-correlation.spec.mjs",
+    "page-navigation.spec.mjs",
   ],
   timeout: 30_000,
   retries: 0,
