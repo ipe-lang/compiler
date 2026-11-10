@@ -22,6 +22,7 @@
 use std::collections::BTreeSet;
 
 use crate::EmitCtx;
+use crate::crate_specs::{TokioFeature, tokio_base_features};
 
 /// One runtime-crate cargo feature. Every variant maps to a feature declared in
 /// `src/runtime/rust/Cargo.toml`'s `[features]` table; [`Self::as_str`] is that
@@ -346,6 +347,100 @@ impl RuntimeFeature {
     }
 }
 
+/// The tokio half of one runtime feature, as the runtime manifest resolves it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TokioProjection {
+    /// Whether the feature, transitively, enables the optional `tokio` dependency.
+    pub enables_tokio: bool,
+    /// The `tokio/x` and `tokio?/x` sub-features the feature resolves to.
+    ///
+    /// A weak `tokio?/x` counts only when some selected feature enables `tokio`.
+    pub features: &'static [TokioFeature],
+}
+
+impl TokioProjection {
+    const NONE: Self = Self {
+        enables_tokio: false,
+        features: &[],
+    };
+    const SPINE: Self = Self {
+        enables_tokio: true,
+        features: &[],
+    };
+}
+
+impl RuntimeFeature {
+    /// The transitive tokio resolution of this feature in `src/runtime/rust/Cargo.toml`.
+    ///
+    /// The `tokio_projection_matches_the_runtime_manifest` seal asserts every
+    /// row against the manifest in both directions.
+    pub const fn tokio_projection(self) -> TokioProjection {
+        use TokioFeature::{Fs, IoUtil, Net, Process, Signal, Sync};
+        match self {
+            Self::Json
+            | Self::Locale
+            | Self::Url
+            | Self::Config
+            | Self::Encoding
+            | Self::Regex
+            | Self::Uuid
+            | Self::Random
+            | Self::Log
+            | Self::TimeCore
+            | Self::Decimal
+            | Self::CharCategory
+            | Self::CryptoCore
+            | Self::Secret
+            | Self::Crypto
+            | Self::Jwt
+            | Self::WasmClient
+            | Self::DevPosture => TokioProjection::NONE,
+            Self::Async
+            | Self::Tui
+            | Self::Webview
+            | Self::Compression
+            | Self::CsvKernel
+            | Self::CacheKernel => TokioProjection::SPINE,
+            Self::DbSqlite | Self::DbPostgres => TokioProjection {
+                enables_tokio: true,
+                features: &[Sync, Net],
+            },
+            Self::Server => TokioProjection {
+                enables_tokio: true,
+                features: &[Net, Sync, Signal],
+            },
+            Self::Web => TokioProjection {
+                enables_tokio: true,
+                features: &[Net, Sync, Signal, Process, IoUtil, Fs],
+            },
+            Self::WebsocketClient => TokioProjection {
+                enables_tokio: true,
+                features: &[Net, Sync],
+            },
+            Self::Email | Self::HttpClient => TokioProjection {
+                enables_tokio: true,
+                features: &[Net],
+            },
+            Self::Debugger => TokioProjection {
+                enables_tokio: true,
+                features: &[Net, IoUtil],
+            },
+            Self::ControlWire => TokioProjection {
+                enables_tokio: false,
+                features: &[Net, IoUtil],
+            },
+        }
+    }
+}
+
+/// Every runtime feature with its tokio projection, for the manifest seal.
+pub fn tokio_projection_table() -> Vec<(&'static str, TokioProjection)> {
+    RuntimeFeature::ALL
+        .iter()
+        .map(|f| (f.as_str(), f.tokio_projection()))
+        .collect()
+}
+
 /// The set of runtime-crate features a program selects. A thin newtype over a
 /// sorted, deduplicated [`BTreeSet`] so callers get a canonical, stable
 /// `features = [...]` order and cannot construct a set from arbitrary strings.
@@ -357,6 +452,28 @@ impl RuntimeFeatureSet {
     /// list a dependency-model manifest would write.
     pub fn as_feature_names(&self) -> Vec<&'static str> {
         self.0.iter().map(|f| f.as_str()).collect()
+    }
+
+    /// The tokio features the selected set resolves to, or `None` when no
+    /// member enables `tokio`.
+    ///
+    /// The set is the runtime base line plus every member's projection, which
+    /// is what Cargo resolves for the runtime crate under the same selection.
+    pub fn tokio_features(&self) -> Option<BTreeSet<TokioFeature>> {
+        if !self.0.iter().any(|f| f.tokio_projection().enables_tokio) {
+            return None;
+        }
+        let mut set = tokio_base_features();
+        for f in &self.0 {
+            set.extend(f.tokio_projection().features.iter().copied());
+        }
+        Some(set)
+    }
+}
+
+impl FromIterator<RuntimeFeature> for RuntimeFeatureSet {
+    fn from_iter<I: IntoIterator<Item = RuntimeFeature>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
     }
 }
 
@@ -461,6 +578,7 @@ pub fn runtime_features(ctx: &EmitCtx) -> RuntimeFeatureSet {
 #[cfg(test)]
 mod tests {
     use super::{RuntimeFeature, runtime_features};
+    use crate::crate_specs::tokio_dependency_line;
     use crate::{DbDriver, RustBackend};
     use ipe_intern::Interner;
     use ipe_ir::{ModPath, Module, Program};
@@ -635,65 +753,137 @@ mod tests {
         );
     }
 
-    /// A vendored native emit gives tokio `"signal"` exactly once.
+    /// One program shape: its name and the flags it sets.
+    type Shape = (&'static str, fn(&mut Module));
+
+    /// Every flag-driven program shape whose runtime features reach tokio.
+    const TOKIO_SHAPES: &[Shape] = &[
+        ("async", |m| m.uses_async_runtime = true),
+        ("tea", |m| {
+            m.uses_tea = true;
+            m.uses_async_runtime = true;
+        }),
+        ("server", |m| {
+            m.uses_server = true;
+            m.uses_async_runtime = true;
+        }),
+        ("web", |m| {
+            m.uses_server = true;
+            m.uses_web = true;
+            m.uses_async_runtime = true;
+        }),
+        ("tui", |m| {
+            m.uses_tui = true;
+            m.uses_ui = true;
+            m.uses_async_runtime = true;
+        }),
+        ("console", |m| {
+            m.uses_console = true;
+            m.uses_async_runtime = true;
+        }),
+        ("websocket", |m| {
+            m.uses_websocket = true;
+            m.uses_async_runtime = true;
+        }),
+        ("http", |m| {
+            m.uses_http = true;
+            m.uses_async_runtime = true;
+        }),
+        ("email", |m| {
+            m.uses_email = true;
+            m.uses_async_runtime = true;
+        }),
+        ("compression", |m| m.uses_compression = true),
+        ("csv", |m| m.uses_csv = true),
+        ("cache", |m| m.uses_cache = true),
+    ];
+
+    /// The `tokio = { … }` lines of `toml`.
+    fn tokio_lines(toml: &str) -> Vec<&str> {
+        toml.lines()
+            .filter(|l| l.starts_with("tokio = {"))
+            .collect()
+    }
+
+    /// The vendored manifest of a single-module program and its projected tokio line.
+    fn vendored_toml_and_projection(
+        configure: impl FnOnce(&mut Module),
+    ) -> (String, Option<String>) {
+        let mut interner = Interner::new();
+        let main = interner.intern("Main").expect("intern Main");
+        let prog = Program {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: std::collections::BTreeSet::new(),
+            modules: vec![ctx_module(main, configure)],
+        };
+        let backend = RustBackend::new(&interner);
+        let ctx = backend.emit_ctx_for_tests(&prog).expect("build EmitCtx");
+        let projected = runtime_features(&ctx)
+            .tokio_features()
+            .filter(|_| ctx.uses_async_runtime)
+            .map(|set| tokio_dependency_line(&set));
+        let toml = crate::project::assemble_project_files(&ctx, Vec::new())
+            .expect("a vendored native emit assembles")
+            .cargo_toml;
+        (toml, projected)
+    }
+
+    /// A reactor-only vendored emit declares tokio `"sync"` and `"signal"`.
     ///
-    /// The stop-signal relay compiles wherever the runtime's `tokio` feature
-    /// does, so every async shape (worker, Tui, console, server) must declare
-    /// it through the real assembly path, and a pure program keeps no `tokio`
-    /// line at all.
+    /// The runtime's `system.rs` stop-signal relay compiles under the `tokio`
+    /// feature alone and names `tokio::sync::mpsc` and `tokio::signal`, so a
+    /// `Task`-only program with no tea, server, Tui or socket surface needs both.
     #[test]
-    fn vendored_async_emit_declares_tokio_signal() {
-        /// One async program shape: its name and the flags it sets.
-        type Shape = (&'static str, fn(&mut Module));
-        let tokio_line = |toml: &str| {
-            toml.lines()
-                .find(|l| l.starts_with("tokio = {"))
-                .map(str::to_owned)
-        };
-        let emit_toml = |configure: fn(&mut Module)| {
-            let mut interner = Interner::new();
-            let main = interner.intern("Main").expect("intern Main");
-            let prog = Program {
-                imports_unsafe_submodule: false,
-                imported_web_capabilities: std::collections::BTreeSet::new(),
-                modules: vec![ctx_module(main, configure)],
-            };
-            let backend = RustBackend::new(&interner);
-            let ctx = backend.emit_ctx_for_tests(&prog).expect("build EmitCtx");
-            crate::project::assemble_project_files(&ctx, Vec::new())
-                .expect("a vendored native emit assembles")
-                .cargo_toml
-        };
-        let shapes: [Shape; 4] = [
-            ("worker", |m| m.uses_async_runtime = true),
-            ("tui", |m| {
-                m.uses_tui = true;
-                m.uses_ui = true;
-                m.uses_async_runtime = true;
-            }),
-            ("console", |m| {
-                m.uses_console = true;
-                m.uses_async_runtime = true;
-            }),
-            ("server", |m| {
-                m.uses_server = true;
-                m.uses_async_runtime = true;
-            }),
-        ];
-        for (shape, configure) in shapes {
-            let toml = emit_toml(configure);
-            let line = tokio_line(&toml).unwrap_or_default();
-            assert_eq!(
-                line.matches(r#""signal""#).count(),
-                1,
-                "a vendored {shape} emit must declare tokio \"signal\" exactly once: {line:?}"
-            );
-        }
-        let pure = emit_toml(|_| {});
+    fn an_async_only_vendored_emit_declares_tokio_sync() {
+        let (toml, _) = vendored_toml_and_projection(|m| m.uses_async_runtime = true);
+        let lines = tokio_lines(&toml);
+        assert_eq!(lines.len(), 1, "exactly one tokio line: {toml}");
+        let line = lines.first().copied().unwrap_or_default();
         assert!(
-            tokio_line(&pure).is_none(),
-            "a pure vendored emit must keep the tokio-free base: {pure}"
+            line.contains(r#""sync""#) && line.contains(r#""signal""#),
+            "an async-only vendored emit must declare tokio sync + signal: {line:?}"
         );
+    }
+
+    /// The vendored tokio line is the projection of the program's runtime features.
+    ///
+    /// For the pure program, each tokio-reaching shape alone and all of them at
+    /// once, the manifest carries exactly the line
+    /// `tokio_dependency_line(runtime_features(ctx).tokio_features())` when the
+    /// program reaches the reactor, and no line otherwise.
+    #[test]
+    fn vendored_tokio_line_is_the_runtime_feature_projection() {
+        let check = |shape: &str, toml: &str, projected: Option<String>| {
+            let lines = tokio_lines(toml);
+            match projected {
+                Some(want) => assert_eq!(
+                    lines,
+                    vec![want.as_str()],
+                    "a vendored {shape} emit must declare exactly the projected tokio line"
+                ),
+                None => assert!(
+                    lines.is_empty(),
+                    "a reactor-free vendored {shape} emit must keep no tokio line: {lines:?}"
+                ),
+            }
+        };
+        let (pure, projected) = vendored_toml_and_projection(|_| {});
+        assert!(projected.is_none(), "a pure program projects no tokio line");
+        check("pure", &pure, projected);
+        for (shape, configure) in TOKIO_SHAPES {
+            let (toml, projected) = vendored_toml_and_projection(configure);
+            check(shape, &toml, projected);
+        }
+        let (all, projected) = vendored_toml_and_projection(|m| {
+            for (_, configure) in TOKIO_SHAPES {
+                configure(m);
+            }
+        });
+        assert!(
+            projected.is_some(),
+            "the all-on program reaches the reactor"
+        );
+        check("all-on", &all, projected);
     }
 
     /// Compute the selected feature names for an empty program emitted under

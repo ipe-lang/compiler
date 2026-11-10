@@ -18,6 +18,8 @@
 //! in both directions, and, for any crate the golden base manifest still
 //! declares, the version against `tests/golden/basics/Cargo.toml`.
 
+use std::collections::BTreeSet;
+
 /// One authoritative crate version. The emitter composes this crate's features.
 #[derive(Clone, Copy, Debug)]
 pub struct CrateSpec {
@@ -67,6 +69,91 @@ pub const TOKIO: CrateSpec = CrateSpec {
     name: "tokio",
     version: "1",
 };
+
+/// One tokio cargo feature the runtime uses.
+///
+/// Declaration order is render order on the emitted `tokio` line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TokioFeature {
+    Rt,
+    RtMultiThread,
+    Macros,
+    Time,
+    Sync,
+    Signal,
+    Net,
+    IoUtil,
+    Process,
+    Fs,
+}
+
+impl TokioFeature {
+    /// Every variant, in render order.
+    pub const ALL: &'static [Self] = &[
+        Self::Rt,
+        Self::RtMultiThread,
+        Self::Macros,
+        Self::Time,
+        Self::Sync,
+        Self::Signal,
+        Self::Net,
+        Self::IoUtil,
+        Self::Process,
+        Self::Fs,
+    ];
+
+    /// The cargo feature name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rt => "rt",
+            Self::RtMultiThread => "rt-multi-thread",
+            Self::Macros => "macros",
+            Self::Time => "time",
+            Self::Sync => "sync",
+            Self::Signal => "signal",
+            Self::Net => "net",
+            Self::IoUtil => "io-util",
+            Self::Process => "process",
+            Self::Fs => "fs",
+        }
+    }
+
+    /// The variant a cargo feature name denotes, if the runtime uses it.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|f| f.as_str() == name)
+    }
+}
+
+/// The features on the runtime crate's own `tokio` dependency line.
+pub const TOKIO_BASE_FEATURES: &[TokioFeature] = &[
+    TokioFeature::Rt,
+    TokioFeature::RtMultiThread,
+    TokioFeature::Macros,
+    TokioFeature::Time,
+    TokioFeature::Sync,
+    TokioFeature::Signal,
+];
+
+/// [`TOKIO_BASE_FEATURES`] as a set.
+#[must_use]
+pub fn tokio_base_features() -> BTreeSet<TokioFeature> {
+    TOKIO_BASE_FEATURES.iter().copied().collect()
+}
+
+/// The emitted `tokio` dependency line enabling exactly `features`.
+#[must_use]
+pub fn tokio_dependency_line(features: &BTreeSet<TokioFeature>) -> String {
+    let names: Vec<&str> = features.iter().map(|f| f.as_str()).collect();
+    PinnedCrate {
+        spec: TOKIO,
+        default_features: true,
+        features: &[],
+    }
+    .dependency_line(&names)
+}
+
 /// `sqlx` with defaults off (no `any`, `macros` or `migrate`), on tokio, with
 /// TLS through rustls on `ring` trusting `webpki-roots` 1.x.
 pub const SQLX: PinnedCrate = PinnedCrate {

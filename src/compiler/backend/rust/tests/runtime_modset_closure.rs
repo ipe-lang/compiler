@@ -21,6 +21,11 @@
 //! refused. It is the fast counterpart to the ground-truth `ipe`-crate
 //! `seal_modset` E2E gate (which does the actual `cargo build`).
 //!
+//! The same walk reads every `tokio::` path a compiled module names. Each
+//! required path maps through a closed classification to the tokio features it
+//! needs, and each must be enabled by the emitted `tokio` dependency line; a
+//! path the classification does not know is refused.
+//!
 //! ## Why not an exhaustive `2^FLAG_COUNT` sweep
 //!
 //! Brute-forcing every flag mask is `O(2^FLAG_COUNT)` — infeasible as the
@@ -36,6 +41,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use ipe_backend::Backend;
+use ipe_backend_rust::crate_specs::TokioFeature;
 use ipe_backend_rust::{BuildIntent, RustBackend};
 use ipe_intern::Interner;
 use ipe_ir::{ModPath, Module, Program, Target};
@@ -505,6 +511,13 @@ fn manifest_env(cargo_toml: &str, wasm: bool) -> CfgEnv {
 /// feature (`x/y`) enables `x`; a `dep:x` or weak `x?/y` entry enables no
 /// feature. A manifest with no `default` entry enables none.
 fn enabled_features(cargo_toml: &str) -> BTreeSet<String> {
+    let table = feature_table(cargo_toml);
+    let seeds = table.get("default").cloned().unwrap_or_default();
+    close_features(&table, seeds).0
+}
+
+/// The `[features]` table of `cargo_toml`: each feature and its raw entries.
+fn feature_table(cargo_toml: &str) -> HashMap<String, Vec<String>> {
     let quoted = |value: &str| -> Vec<String> {
         value
             .split('"')
@@ -541,9 +554,25 @@ fn enabled_features(cargo_toml: &str) -> BTreeSet<String> {
             open = Some((key, value.to_owned()));
         }
     }
+    table
+}
+
+/// The features `seeds` enable, closed under `table`, with the `tokio`
+/// sub-features (`tokio/x`, weak `tokio?/x`) the closure's entries name.
+fn close_features(
+    table: &HashMap<String, Vec<String>>,
+    seeds: Vec<String>,
+) -> (BTreeSet<String>, BTreeSet<String>) {
     let mut enabled = BTreeSet::new();
-    let mut work = table.get("default").cloned().unwrap_or_default();
+    let mut tokio = BTreeSet::new();
+    let mut work = seeds;
     while let Some(entry) = work.pop() {
+        if let Some(sub) = entry
+            .strip_prefix("tokio/")
+            .or_else(|| entry.strip_prefix("tokio?/"))
+        {
+            tokio.insert(sub.to_owned());
+        }
         if entry.starts_with("dep:") || entry.contains("?/") {
             continue;
         }
@@ -554,16 +583,27 @@ fn enabled_features(cargo_toml: &str) -> BTreeSet<String> {
             work.extend(implied.iter().cloned());
         }
     }
-    enabled
+    (enabled, tokio)
 }
 
 // ── gated `crate::` reference scan ───────────────────────────────────────────
 
-/// One crate-root reference and the predicate it is compiled under.
+/// What a gated reference names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefKind {
+    /// A crate-root module segment.
+    Crate,
+    /// A whole `tokio::` path, its segments joined by `::`.
+    Tokio,
+}
+
+/// One crate-root or `tokio::` reference and the predicate it is compiled under.
 #[derive(Clone, Debug)]
 struct GatedRef {
-    /// The first segment after the crate root (`crate::<seg>`), or a
-    /// `<no file ..>` marker for a `mod` declaration whose file is absent.
+    kind: RefKind,
+    /// For [`RefKind::Crate`], the first segment after the crate root
+    /// (`crate::<seg>`), or a `<no file ..>` marker for a `mod` declaration
+    /// whose file is absent; for [`RefKind::Tokio`], the path.
     seg: String,
     cond: Cfg,
 }
@@ -643,17 +683,43 @@ impl<'r> RefScanner<'r> {
     }
 
     fn push_ref(&mut self, seg: String) {
-        let cond = Cfg::All(self.conds.clone());
-        self.refs.push(GatedRef { seg, cond });
+        self.push(RefKind::Crate, seg);
     }
 
-    /// Record the crate-root segment of the path `segs` (`continues`: a glob
-    /// follows it). `crate::<seg>` and an exact `super::` chain back to the
+    fn push(&mut self, kind: RefKind, seg: String) {
+        let cond = Cfg::All(self.conds.clone());
+        self.refs.push(GatedRef { kind, seg, cond });
+    }
+
+    /// Record `segs` when it is a `tokio::` path (`continues`: a glob follows
+    /// it), and report whether it was one. A `self` segment names its parent.
+    fn record_tokio(&mut self, segs: &[String], continues: bool) -> bool {
+        if segs.first().map(String::as_str) != Some("tokio") || (segs.len() < 2 && !continues) {
+            return false;
+        }
+        let mut path = segs
+            .iter()
+            .filter(|s| *s != "self")
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("::");
+        if continues {
+            path.push_str("::*");
+        }
+        self.push(RefKind::Tokio, path);
+        true
+    }
+
+    /// Record the path `segs` (`continues`: a glob follows it): a `tokio::`
+    /// path whole, otherwise its crate-root segment. `crate::<seg>` and an exact `super::` chain back to the
     /// crate root both reach `<seg>`; a shorter `super::` chain names an
     /// intermediate module. A last segment is recorded only when it names a
     /// runtime module (`use crate::encoding;`): a bare root item is resolved by
     /// no module.
     fn record_path(&mut self, segs: &[String], continues: bool) {
+        if self.record_tokio(segs, continues) {
+            return;
+        }
         let reach = match segs.first().map(String::as_str) {
             Some("crate") => 1,
             Some("super") => {
@@ -717,7 +783,15 @@ impl<'r> RefScanner<'r> {
                     i += 1;
                 }
                 TokenTree::Ident(ident) => {
-                    let mid_path = i >= 2 && is_colon(i - 1) && is_colon(i - 2);
+                    let follows_segment =
+                        i.checked_sub(3)
+                            .and_then(|k| toks.get(k))
+                            .is_some_and(|t| match t {
+                                TokenTree::Ident(_) => true,
+                                TokenTree::Punct(p) => p.as_char() == '>',
+                                TokenTree::Group(_) | TokenTree::Literal(_) => false,
+                            });
+                    let mid_path = i >= 2 && is_colon(i - 1) && is_colon(i - 2) && follows_segment;
                     let mut segs = vec![ident.to_string()];
                     let mut next = i + 1;
                     let mut glob = false;
@@ -844,29 +918,33 @@ macro_rules! cfg_scoped {
 
 impl<'ast> syn::visit::Visit<'ast> for RefScanner<'_> {
     fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
-        if attr.path().is_ident("cfg")
-            && !self.consumed.contains(&(std::ptr::from_ref(attr) as usize))
-        {
-            self.errors.push(format!(
-                "{}: a `#[cfg(..)]` on a node the scan does not scope",
-                self.file.display()
-            ));
+        if attr.path().is_ident("cfg") {
+            if !self.consumed.contains(&(std::ptr::from_ref(attr) as usize)) {
+                self.errors.push(format!(
+                    "{}: a `#[cfg(..)]` on a node the scan does not scope",
+                    self.file.display()
+                ));
+            }
+        } else {
+            let segs: Vec<String> = attr
+                .path()
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            self.record_tokio(&segs, false);
         }
     }
 
     fn visit_path(&mut self, path: &'ast syn::Path) {
-        if path.leading_colon.is_none() {
-            let segs: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
-            self.record_path(&segs, false);
-        }
+        let segs: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+        self.record_path(&segs, false);
         syn::visit::visit_path(self, path);
     }
 
     fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
         self.gated(&node.attrs, |scanner| {
-            if node.leading_colon.is_none() {
-                scanner.use_tree(&node.tree, &mut Vec::new());
-            }
+            scanner.use_tree(&node.tree, &mut Vec::new());
         });
     }
 
@@ -1051,11 +1129,144 @@ fn module_refs(
 /// The crate-root segments `decl`'s module requires in the build `env`: every
 /// reference whose predicate (with the declaration's) does not fail.
 fn required_segs(refs: &[GatedRef], decl_cond: &Cfg, env: &CfgEnv) -> BTreeSet<String> {
+    required_of(RefKind::Crate, refs, decl_cond, env)
+}
+
+/// The references of `kind` among `refs` whose predicate (with the
+/// declaration's) does not fail in `env`.
+fn required_of(
+    kind: RefKind,
+    refs: &[GatedRef],
+    decl_cond: &Cfg,
+    env: &CfgEnv,
+) -> BTreeSet<String> {
     let decl = env.eval(decl_cond);
     refs.iter()
-        .filter(|r| decl.and(env.eval(&r.cond)) != Truth::Fails)
+        .filter(|r| r.kind == kind && decl.and(env.eval(&r.cond)) != Truth::Fails)
         .map(|r| r.seg.clone())
         .collect()
+}
+
+// ── `tokio::` path classification ────────────────────────────────────────────
+
+/// The prefix of every tokio-feature violation, so a check can select them.
+const TOKIO_BREACH: &str = "tokio feature breach:";
+
+/// The tokio features the `tokio::` path `path` needs to compile.
+///
+/// The classification is closed: a path it does not name is an `Err`, never a
+/// path that needs nothing.
+fn tokio_need(path: &str) -> Result<&'static [TokioFeature], String> {
+    use TokioFeature as F;
+    const NO_FEATURE_IO: &[&str] = &[
+        "AsyncRead",
+        "AsyncWrite",
+        "AsyncBufRead",
+        "AsyncSeek",
+        "ReadBuf",
+        "Interest",
+        "Ready",
+        "Error",
+        "ErrorKind",
+        "Result",
+    ];
+    const IO_UTIL: &[&str] = &[
+        "BufReader",
+        "BufWriter",
+        "BufStream",
+        "duplex",
+        "DuplexStream",
+        "split",
+        "ReadHalf",
+        "WriteHalf",
+        "empty",
+        "repeat",
+        "sink",
+        "Lines",
+        "Take",
+        "Chain",
+    ];
+    let segs: Vec<&str> = path.split("::").skip(1).collect();
+    match segs.as_slice() {
+        ["sync", ..] => Ok(&[F::Sync]),
+        ["net", ..] | ["io", "unix", ..] => Ok(&[F::Net]),
+        ["signal", ..] => Ok(&[F::Signal]),
+        ["process", ..] => Ok(&[F::Process]),
+        ["fs", ..] => Ok(&[F::Fs]),
+        ["time", "advance" | "pause" | "resume", ..] => Err(format!(
+            "`{path}` needs tokio `test-util`, which no runtime feature enables"
+        )),
+        ["time", ..] => Ok(&[F::Time]),
+        ["task", "block_in_place", ..] | ["runtime", "Builder", "new_multi_thread", ..] => {
+            Ok(&[F::RtMultiThread])
+        }
+        ["spawn" | "task_local"] | ["task" | "runtime", ..] => Ok(&[F::Rt]),
+        ["main"] => Ok(&[F::Macros, F::RtMultiThread]),
+        ["select" | "join" | "try_join" | "test"] => Ok(&[F::Macros]),
+        ["pin"] | ["io"] => Ok(&[]),
+        ["io", item, ..] if NO_FEATURE_IO.contains(item) => Ok(&[]),
+        ["io", item, ..]
+            if IO_UTIL.contains(item)
+                || item.starts_with("copy")
+                || (item.starts_with("Async") && item.ends_with("Ext")) =>
+        {
+            Ok(&[F::IoUtil])
+        }
+        _ => Err(format!("`{path}` is an unclassified tokio path")),
+    }
+}
+
+/// The tokio features the emitted `tokio = { .. }` dependency line of
+/// `cargo_toml` enables, or `None` when it declares no `tokio` dependency.
+fn tokio_line_features(cargo_toml: &str) -> Option<BTreeSet<TokioFeature>> {
+    let line = cargo_toml
+        .lines()
+        .find(|l| l.trim_start().starts_with("tokio = {"))?;
+    let list = line
+        .split_once("features = [")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map_or("", |(list, _)| list);
+    Some(
+        list.split('"')
+            .skip(1)
+            .step_by(2)
+            .filter_map(TokioFeature::from_name)
+            .collect(),
+    )
+}
+
+/// Every required `tokio::` path of the module `decl_name` that the enabled
+/// set `declared` (`None`: no `tokio` dependency) does not cover.
+fn tokio_violations(
+    decl_name: &str,
+    required: &BTreeSet<String>,
+    declared: Option<&BTreeSet<TokioFeature>>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for path in required {
+        match (tokio_need(path), declared) {
+            (Err(e), _) => out.push(format!("{TOKIO_BREACH} `{decl_name}`: {e}")),
+            (Ok(_), None) => out.push(format!(
+                "{TOKIO_BREACH} `{decl_name}` names `{path}`, but the emitted manifest \
+                 declares no `tokio` dependency"
+            )),
+            (Ok(need), Some(enabled)) => {
+                let missing: Vec<&str> = need
+                    .iter()
+                    .filter(|f| !enabled.contains(*f))
+                    .map(|f| f.as_str())
+                    .collect();
+                if !missing.is_empty() {
+                    out.push(format!(
+                        "{TOKIO_BREACH} `{decl_name}` names `{path}`, which needs tokio \
+                         {missing:?}, but the emitted `tokio` line enables only {:?}",
+                        enabled.iter().map(|f| f.as_str()).collect::<Vec<_>>()
+                    ));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The crate-root segments the file-backed module `name` requires in `env`.
@@ -1487,8 +1698,10 @@ fn mod_rs_for_mask(interner: &Interner, main: ipe_intern::Symbol, mask: u32) -> 
 /// Every way one emitted `mod.rs` fails to build in the configuration `env`:
 /// a module it compiles reaches `crate::<seg>` under a predicate that does not
 /// fail, and the module supplying `<seg>` is not declared under a predicate
-/// that holds (or under the referencing module's own predicate). A source the
-/// scan cannot parse and a predicate it cannot read are violations too.
+/// that holds (or under the referencing module's own predicate); or it names a
+/// `tokio::` path under such a predicate that the emitted `tokio` line (none on
+/// wasm) does not enable. A source the scan cannot parse, a predicate it cannot
+/// read and an unclassified `tokio::` path are violations too.
 fn closure_violations(
     runtime_root: &Path,
     emit: &Emit,
@@ -1510,6 +1723,11 @@ fn closure_violations(
         .collect();
     let conds: HashMap<&str, &Cfg> = decls.iter().map(|d| (d.name.as_str(), &d.cond)).collect();
     let scope = RootScope::new(runtime_root, &emit.mod_rs);
+    let tokio = if env.wasm {
+        None
+    } else {
+        tokio_line_features(&emit.cargo_toml)
+    };
     let mut out = Vec::new();
     for decl in &decls {
         if env.eval(&decl.cond) == Truth::Fails {
@@ -1536,6 +1754,11 @@ fn closure_violations(
             )
         };
         out.extend(errors.iter().map(|e| format!("`{}`: {e}", decl.name)));
+        out.extend(tokio_violations(
+            &decl.name,
+            &required_of(RefKind::Tokio, &refs, &decl.cond, env),
+            tokio.as_ref(),
+        ));
         let required = required_segs(&refs, &decl.cond, env);
         for (seg, dep) in scope.deps_of(&required, &mut cache.defs) {
             let declared = conds
@@ -1731,54 +1954,6 @@ fn composed_full_modset_is_closed() {
 
     let mut dep_cache = ScanCache::default();
     assert_mask_closed(&runtime_root, &interner, main, all, &mut dep_cache);
-}
-
-/// A vendored `revocation` module publishes on `tokio::sync::watch` whenever the
-/// `tokio` feature is on, so every emitted manifest that declares the module and
-/// enables `tokio` must extend the `tokio` dependency with `"sync"`. Checked on
-/// the featureless base, every singleton, and the all-on mask.
-#[test]
-fn declared_revocation_module_implies_tokio_sync() {
-    let mut interner = Interner::new();
-    let main = interner.intern("Main").expect("intern Main");
-    let all: u32 = (1u32 << FLAG_COUNT) - 1;
-    let masks = std::iter::once(0u32)
-        .chain((0..FLAG_COUNT).map(|bit| 1u32 << bit))
-        .chain(std::iter::once(all));
-    let mut revocation_cases = 0usize;
-    for mask in masks {
-        let prog = Program {
-            imports_unsafe_submodule: false,
-            imported_web_capabilities: std::collections::BTreeSet::new(),
-            modules: vec![module_for_mask(main, mask)],
-        };
-        let emitted = RustBackend::new(&interner)
-            .emit(&prog)
-            .expect("emit must succeed for a body-free program");
-        let mod_rs = emitted.files.get("src/ipe_runtime/mod.rs").expect("mod.rs");
-        let cargo = &emitted.cargo_toml;
-        let tokio_on = cargo
-            .lines()
-            .any(|l| l.starts_with("default = [") && l.contains("\"tokio\""));
-        if !declared_modules(mod_rs).contains("revocation") || !tokio_on {
-            continue;
-        }
-        revocation_cases += 1;
-        let tokio_dep = cargo
-            .lines()
-            .find(|l| l.starts_with("tokio = {"))
-            .expect("a manifest with the tokio feature on must declare the tokio dependency");
-        assert!(
-            tokio_dep.contains("\"sync\""),
-            "SEAL breach: `revocation` is declared with the tokio feature on, but the \
-             tokio dependency lacks `sync` (`tokio::sync::watch` would not compile) \
-             - flag mask {mask:#019b}: {tokio_dep}"
-        );
-    }
-    assert!(
-        revocation_cases > 0,
-        "no sampled mask declared `revocation` on a tokio runtime - the check proved nothing"
-    );
 }
 
 // ── the sampled full-mask backstop (redundancy, not the proof) ──────────────
@@ -1986,7 +2161,8 @@ fn http_kernel_shape_declares_http_stream() {
 /// not reach this set: they emit through the native template and its appends.
 ///
 /// An inline module (`pub mod web { pub mod route; }`) compiles only the
-/// children it declares, never the rest of its directory.
+/// children it declares, never the rest of its directory, and a required
+/// `tokio::` path is refused: tokio is native-only.
 #[test]
 fn wasm_vendored_modset_is_closed() {
     let runtime_root = e2e_support::require_runtime().into_path_buf();
@@ -2641,15 +2817,32 @@ fn closure_fixture(tag: &str, files: &[(&str, &str)]) -> PathBuf {
 
 /// The violations of the fixture `mod_rs` with exactly `features` on.
 fn fixture_violations(root: &Path, mod_rs: &str, features: &[&str]) -> Vec<String> {
+    tokio_fixture_violations(root, mod_rs, features, None)
+}
+
+/// The violations of the fixture `mod_rs` with exactly `features` on and the
+/// emitted `tokio` line enabling `tokio` (`None`: no `tokio` dependency).
+fn tokio_fixture_violations(
+    root: &Path,
+    mod_rs: &str,
+    features: &[&str],
+    tokio: Option<&[&str]>,
+) -> Vec<String> {
     let env = CfgEnv {
         features: features.iter().map(|f| (*f).to_owned()).collect(),
         wasm: false,
     };
-    closure_violations(
-        root,
-        &Emit::of_mod_rs(mod_rs),
-        &env,
-        &mut ScanCache::default(),
+    let mut emit = Emit::of_mod_rs(mod_rs);
+    emit.cargo_toml = tokio.map_or_else(String::new, tokio_line);
+    closure_violations(root, &emit, &env, &mut ScanCache::default())
+}
+
+/// A `tokio = { .. }` dependency line enabling exactly `features`.
+fn tokio_line(features: &[&str]) -> String {
+    let quoted: Vec<String> = features.iter().map(|f| format!("\"{f}\"")).collect();
+    format!(
+        "[dependencies]\ntokio = {{ version = \"1\", features = [{}] }}\n",
+        quoted.join(", ")
     )
 }
 
@@ -2818,4 +3011,210 @@ fn enabled_features_close_the_default_list() {
         enabled_features("[package]\nname = \"x\"\n").is_empty(),
         "no `default` entry enables nothing"
     );
+}
+
+// ── `tokio::` paths: the runtime crate and the classification ───────────────
+
+/// Every required `tokio::` path in the runtime crate is enabled by the tokio
+/// features its own manifest resolves for the selection.
+///
+/// For the empty selection, each runtime feature alone, and every native
+/// feature at once, the runtime's own `mod.rs` is scanned under the features
+/// the runtime `[features]` table closes the selection to, against the base
+/// `tokio` line plus every `tokio/x` and `tokio?/x` entry of that closure. The
+/// table is read from the runtime `Cargo.toml`, independent of the backend's
+/// projection.
+#[test]
+#[allow(clippy::expect_used)] // test scaffolding: the runtime sources are part of the checkout
+fn runtime_crate_tokio_references_are_declared() {
+    let runtime_root = e2e_support::require_runtime().into_path_buf();
+    let crate_root = e2e_support::require_runtime_crate();
+    let manifest =
+        std::fs::read_to_string(crate_root.join("Cargo.toml")).expect("read runtime Cargo.toml");
+    let mod_rs = std::fs::read_to_string(runtime_root.join("mod.rs")).expect("read runtime mod.rs");
+    let base = tokio_line_features(&manifest).expect("the runtime declares a tokio dependency");
+    let table = feature_table(&manifest);
+    let names: Vec<&str> = ipe_backend_rust::tokio_projection_table()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let native: Vec<String> = names
+        .iter()
+        .filter(|n| **n != "wasm-client")
+        .map(|n| (*n).to_owned())
+        .collect();
+    let selections = std::iter::once(Vec::new())
+        .chain(names.iter().map(|n| vec![(*n).to_owned()]))
+        .chain(std::iter::once(native));
+    let mut cache = ScanCache::default();
+    let mut breaches = Vec::new();
+    for selection in selections {
+        let (features, subs) = close_features(&table, selection.clone());
+        let mut enabled: Vec<&str> = base.iter().map(|f| f.as_str()).collect();
+        enabled.extend(subs.iter().map(String::as_str));
+        let emit = Emit {
+            mod_rs: mod_rs.clone(),
+            cargo_toml: if features.contains("tokio") {
+                tokio_line(&enabled)
+            } else {
+                String::new()
+            },
+            runtime_files: BTreeMap::new(),
+        };
+        let env = CfgEnv {
+            features,
+            wasm: false,
+        };
+        breaches.extend(
+            closure_violations(&runtime_root, &emit, &env, &mut cache)
+                .into_iter()
+                .filter(|v| v.starts_with(TOKIO_BREACH))
+                .map(|v| format!("selection {selection:?}: {v}")),
+        );
+    }
+    assert!(
+        breaches.is_empty(),
+        "the runtime crate names a tokio API its manifest does not enable for the \
+         selection; add the `tokio/x` entry to the runtime `[features]` row and the \
+         `RuntimeFeature::tokio_projection` arm:\n{}",
+        breaches.join("\n")
+    );
+}
+
+/// A `tokio::` path under a predicate that holds needs its feature in the
+/// emitted `tokio` line.
+#[test]
+fn a_tokio_path_under_a_holding_cfg_needs_its_feature() {
+    let root = closure_fixture(
+        "tokio_holding",
+        &[(
+            "a.rs",
+            "#[cfg(feature = \"tokio\")]\nmod m { use tokio::sync::mpsc; }\n",
+        )],
+    );
+    let lacking = tokio_fixture_violations(&root, "pub mod a;\n", &["tokio"], Some(&["rt"]));
+    let declared =
+        tokio_fixture_violations(&root, "pub mod a;\n", &["tokio"], Some(&["rt", "sync"]));
+    let absent = tokio_fixture_violations(&root, "pub mod a;\n", &["tokio"], None);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        lacking
+            .iter()
+            .any(|v| v.starts_with(TOKIO_BREACH) && v.contains("tokio::sync::mpsc")),
+        "`tokio::sync` with a line lacking `sync`: {lacking:?}"
+    );
+    assert!(declared.is_empty(), "`sync` declared: {declared:?}");
+    assert!(
+        absent
+            .iter()
+            .any(|v| v.contains("declares no `tokio` dependency")),
+        "no tokio line at all: {absent:?}"
+    );
+}
+
+/// A `tokio::` path under a predicate that fails is not required.
+#[test]
+fn a_tokio_path_under_a_failing_cfg_is_not_required() {
+    let root = closure_fixture(
+        "tokio_failing",
+        &[(
+            "a.rs",
+            "#[cfg(feature = \"web\")]\npub fn f() { let _ = tokio::process::Command::new(\"x\"); }\n\
+             #[cfg(test)]\nmod t { use tokio::time::advance; }\n",
+        )],
+    );
+    let off = tokio_fixture_violations(&root, "pub mod a;\n", &[], Some(&["rt"]));
+    let on = tokio_fixture_violations(&root, "pub mod a;\n", &["web"], Some(&["rt"]));
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(off.is_empty(), "both paths compile out: {off:?}");
+    assert!(
+        on.iter()
+            .any(|v| v.contains("tokio::process::Command::new")),
+        "the scan reads the `web`-gated path once `web` is on: {on:?}"
+    );
+    assert!(
+        !on.iter().any(|v| v.contains("advance")),
+        "a `cfg(test)` path is never required: {on:?}"
+    );
+}
+
+/// A `tokio::` path under a predicate the build host decides is required.
+#[test]
+fn a_host_gated_tokio_path_is_required() {
+    let root = closure_fixture(
+        "tokio_host",
+        &[(
+            "a.rs",
+            "#[cfg(unix)]\npub fn f() { let _ = tokio::signal::unix::SignalKind::terminate(); }\n",
+        )],
+    );
+    let lacking = tokio_fixture_violations(&root, "pub mod a;\n", &[], Some(&["rt"]));
+    let declared = tokio_fixture_violations(&root, "pub mod a;\n", &[], Some(&["rt", "signal"]));
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        lacking.iter().any(|v| v.contains("tokio::signal::unix")),
+        "a `cfg(unix)` signal path with a line lacking `signal`: {lacking:?}"
+    );
+    assert!(declared.is_empty(), "`signal` declared: {declared:?}");
+}
+
+/// A `tokio::` path the classification does not name is refused, whatever the
+/// emitted line enables.
+#[test]
+fn an_unclassified_tokio_path_is_refused() {
+    let root = closure_fixture(
+        "tokio_unclassified",
+        &[
+            ("a.rs", "pub fn f() { let _ = tokio::io::stdin(); }\n"),
+            ("b.rs", "use tokio::*;\n"),
+        ],
+    );
+    let every: Vec<&str> = TokioFeature::ALL.iter().map(|f| f.as_str()).collect();
+    let refused = tokio_fixture_violations(&root, "pub mod a;\npub mod b;\n", &[], Some(&every));
+    let _ = std::fs::remove_dir_all(&root);
+    for path in ["tokio::io::stdin", "tokio::*"] {
+        assert!(
+            refused
+                .iter()
+                .any(|v| v.contains(&format!("`{path}` is an unclassified tokio path"))),
+            "`{path}` must be refused: {refused:?}"
+        );
+    }
+}
+
+/// Grouped and renamed imports, macro paths, a leading-colon path inside macro
+/// tokens and an attribute path are each read as `tokio::` paths.
+#[test]
+fn grouped_renamed_macro_and_attribute_tokio_paths_are_read() {
+    let root = closure_fixture(
+        "tokio_forms",
+        &[(
+            "a.rs",
+            "use tokio::{net::TcpListener, sync as s};\n\
+             pub fn f() { tokio::select! { _ = async {} => {} } }\n\
+             pub fn g() { let _ = vec![::tokio::time::Instant::now()]; }\n\
+             #[tokio::main]\npub async fn h() {}\n",
+        )],
+    );
+    let bare = tokio_fixture_violations(&root, "pub mod a;\n", &[], Some(&[]));
+    let full = tokio_fixture_violations(
+        &root,
+        "pub mod a;\n",
+        &[],
+        Some(&["rt", "rt-multi-thread", "macros", "time", "sync", "net"]),
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    for path in [
+        "`tokio::net::TcpListener`",
+        "`tokio::sync`",
+        "`tokio::select`",
+        "`tokio::time::Instant::now`",
+        "`tokio::main`",
+    ] {
+        assert!(
+            bare.iter().any(|v| v.contains(path)),
+            "{path} must be read: {bare:?}"
+        );
+    }
+    assert!(full.is_empty(), "every feature declared: {full:?}");
 }

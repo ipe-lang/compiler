@@ -641,6 +641,28 @@ fn tui_app_vendored_builds() {
     );
 }
 
+/// A `Task`-only program: no `Cmd`, `Sub`, server or `Tui` surface.
+const TASK_MAIN: &str = "module Main exposing (main)\n\
+    import Ipe.Io as Io\n\
+    main : Task Error ()\n\
+    main = Io.println \"task\"\n";
+
+/// Under the vendored emit model a `Task`-only program must cargo-build.
+///
+/// Its runtime reaches the stop-signal relay in `system.rs`, which names
+/// `tokio::sync` and `tokio::signal`; the vendored `tokio` line is the runtime
+/// feature projection, so it carries both.
+#[test]
+fn task_main_vendored_builds() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    emit_and_build_vendored("task_main_vendored", TASK_MAIN).expect(
+        "a Task-only main must cargo-build under the vendored emit model \
+         (the vendored tokio line must carry sync and signal)",
+    );
+}
+
 /// The runtime source tree the SEAL tests above vendor and build must resolve
 /// to the ACTUAL runtime module tree — not merely to some directory.
 /// `e2e_support::require_runtime` returns the module-tree root (the crate's `src/`), which

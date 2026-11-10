@@ -75,7 +75,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use ipe_backend::Backend;
-use ipe_backend_rust::{RuntimeDep, RustBackend};
+use ipe_backend_rust::crate_specs::{TOKIO_BASE_FEATURES, TokioFeature};
+use ipe_backend_rust::{RuntimeDep, RustBackend, TokioProjection, tokio_projection_table};
 use ipe_diagnostics::DResult;
 use ipe_intern::Interner;
 use ipe_ir::{
@@ -1594,4 +1595,154 @@ fn time_programs_emit_no_dead_feature_or_chrono_tz() {
             );
         }
     }
+}
+
+// ── the vendored tokio projection mirrors the runtime manifest ──────────────
+
+/// The tokio sub-features the resolution of `feature` names, and whether it
+/// enables the optional `tokio` dependency itself.
+fn manifest_tokio(
+    feature: &str,
+    table: &BTreeMap<String, Vec<String>>,
+) -> (bool, BTreeSet<String>) {
+    let resolved = resolve_features(&[feature], table);
+    let subs = resolved
+        .iter()
+        .filter_map(|tok| {
+            tok.strip_prefix("tokio/")
+                .or_else(|| tok.strip_prefix("tokio?/"))
+                .map(str::to_owned)
+        })
+        .collect();
+    (resolved.contains("tokio"), subs)
+}
+
+/// Every disagreement between the backend's tokio `projection` and the runtime
+/// feature `table`, in both directions.
+fn tokio_projection_mismatches(
+    projection: &[(&str, TokioProjection)],
+    table: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (feature, proj) in projection {
+        let (enables, subs) = manifest_tokio(feature, table);
+        let projected: BTreeSet<String> = proj
+            .features
+            .iter()
+            .map(|f| f.as_str().to_owned())
+            .collect();
+        if enables != proj.enables_tokio {
+            out.push(format!(
+                "`{feature}`: the manifest enables tokio = {enables}, the projection {}",
+                proj.enables_tokio
+            ));
+        }
+        if subs != projected {
+            out.push(format!(
+                "`{feature}`: the manifest resolves tokio {subs:?}, the projection {projected:?}"
+            ));
+        }
+    }
+    out
+}
+
+/// The tokio features of the `tokio = { .. }` dependency line of `cargo_toml`.
+fn manifest_tokio_line(cargo_toml: &str) -> Option<BTreeSet<String>> {
+    let line = cargo_toml.lines().find(|l| l.starts_with("tokio = {"))?;
+    let list = line
+        .split_once("features = [")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map_or("", |(list, _)| list);
+    Some(
+        list.split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+/// The backend's tokio projection is the runtime manifest's, feature by feature.
+///
+/// `TOKIO_BASE_FEATURES` equals the runtime `tokio` dependency line, and for
+/// every runtime feature the projection's sub-features and tokio enablement
+/// equal the `tokio/x` and `tokio?/x` entries of the feature's resolution in the
+/// runtime `[features]` table. An extra or a missing feature on either side is
+/// a mismatch.
+#[test]
+#[allow(clippy::expect_used)] // test scaffolding: the runtime manifest is part of the checkout
+fn tokio_projection_matches_the_runtime_manifest() {
+    let crate_root = e2e_support::require_runtime_crate();
+    let manifest =
+        std::fs::read_to_string(crate_root.join("Cargo.toml")).expect("read runtime Cargo.toml");
+    let base: BTreeSet<String> = TOKIO_BASE_FEATURES
+        .iter()
+        .map(|f| f.as_str().to_owned())
+        .collect();
+    assert_eq!(
+        manifest_tokio_line(&manifest),
+        Some(base),
+        "`TOKIO_BASE_FEATURES` must equal the runtime `tokio` dependency line"
+    );
+    let table = raw_feature_table(&manifest);
+    let mismatches = tokio_projection_mismatches(&tokio_projection_table(), &table);
+    assert!(
+        mismatches.is_empty(),
+        "`RuntimeFeature::tokio_projection` drifted from the runtime `[features]` \
+         table:\n{}",
+        mismatches.join("\n")
+    );
+}
+
+/// The comparator refuses a manifest row naming a tokio feature the projection
+/// lacks, and a projection naming one the row lacks.
+#[test]
+fn tokio_projection_comparator_refuses_drift() {
+    let table = raw_feature_table(
+        "[features]\nweb = [\"tokio\", \"tokio/net\", \"tokio/fs\"]\ntokio = []\n",
+    );
+    let net_only = [(
+        "web",
+        TokioProjection {
+            enables_tokio: true,
+            features: &[TokioFeature::Net],
+        },
+    )];
+    let undeclared = tokio_projection_mismatches(&net_only, &table);
+    assert!(
+        undeclared.iter().any(|m| m.contains("\"fs\"")),
+        "an undeclared `tokio/fs` must be a mismatch: {undeclared:?}"
+    );
+    let extra = [(
+        "web",
+        TokioProjection {
+            enables_tokio: true,
+            features: &[TokioFeature::Net, TokioFeature::Fs, TokioFeature::Process],
+        },
+    )];
+    let surplus = tokio_projection_mismatches(&extra, &table);
+    assert!(
+        surplus.iter().any(|m| m.contains("\"process\"")),
+        "a projected feature the row lacks must be a mismatch: {surplus:?}"
+    );
+    let off = [(
+        "web",
+        TokioProjection {
+            enables_tokio: false,
+            features: &[TokioFeature::Net, TokioFeature::Fs],
+        },
+    )];
+    let enablement = tokio_projection_mismatches(&off, &table);
+    assert!(
+        enablement.iter().any(|m| m.contains("enables tokio")),
+        "a tokio enablement drift must be a mismatch: {enablement:?}"
+    );
+    let exact = [(
+        "web",
+        TokioProjection {
+            enables_tokio: true,
+            features: &[TokioFeature::Net, TokioFeature::Fs],
+        },
+    )];
+    assert!(tokio_projection_mismatches(&exact, &table).is_empty());
 }
