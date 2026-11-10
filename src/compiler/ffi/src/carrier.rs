@@ -674,9 +674,9 @@ impl EnumDef {
 /// A closure's declared return, after the total-carrier-return soundness rule.
 ///
 /// A SYNC return has three shapes; an ASYNC (`Future`-returning) return has
-/// exactly two. A total return is scalar-only (MF-2): an opaque handle has no
-/// default to yield on a panic-abort, so it is legal only inside the fallible
-/// shapes, where a failed call folds to `Err`/`None`.
+/// exactly two. A total return is scalar-only (MF-2): it has no failure channel,
+/// so any unwind in it ends the process typed, and an opaque handle is legal
+/// only inside the fallible shapes.
 ///
 /// An ASYNC return is ALWAYS fallible (`AsyncResult`/`AsyncOption`) — there is
 /// deliberately no `AsyncTotal`. A panic while POLLING the returned future has
@@ -688,22 +688,25 @@ impl EnumDef {
 /// never be asked to produce it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClosureRet {
-    /// A total scalar sync return (`-> i64`). A panic in the Ipê closure aborts
-    /// the process — a total signature has no error channel to fold into.
+    /// A total scalar sync return (`-> i64`). It has no error channel, so a
+    /// runtime trip or a panic in the Ipê closure ends the process typed
+    /// (status 1).
     Total(ScalarCarrier),
-    /// A sync `Result<B, E>` return. A panic folds to `Err` via the runtime
-    /// error funnel; `B` may be any carrier (opaque included).
+    /// A sync `Result<B, E>` return. Any unwind folds to `Err` via the runtime
+    /// error funnel, a runtime trip keeping its kind; `B` may be any carrier
+    /// (opaque included).
     Result(Carrier),
-    /// A sync `Option<B>` return. A panic folds to `None`; `B` may be any
-    /// carrier.
+    /// A sync `Option<B>` return. A foreign panic folds to `None`; a runtime
+    /// trip ends the process typed. `B` may be any carrier.
     Option(Carrier),
     /// An async `-> impl Future<Output = Result<B, E>>` return. The returned
-    /// future is awaited under a spawned task; a poll-panic folds to `Err` via
-    /// the `JoinError` funnel, and a synchronous panic while PRODUCING the
-    /// future folds to `Err` too. `B` may be any carrier (opaque included).
+    /// future is awaited under a spawned task; a poll-time or production-time
+    /// unwind folds to `Err`, a runtime trip keeping its kind. `B` may be any
+    /// carrier (opaque included).
     AsyncResult(Carrier),
-    /// An async `-> impl Future<Output = Option<B>>` return. A poll-panic or a
-    /// production-panic folds to `None`. `B` may be any carrier.
+    /// An async `-> impl Future<Output = Option<B>>` return. A poll-time or
+    /// production-time foreign panic folds to `None`; a runtime trip ends the
+    /// process typed. `B` may be any carrier.
     AsyncOption(Carrier),
 }
 

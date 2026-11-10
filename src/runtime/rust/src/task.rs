@@ -102,19 +102,15 @@ impl Drop for AbortOnDrop {
 /// guard before it can abort a task that already finished.
 ///
 /// PANIC HONESTY. A poll-time panic inside the foreign future surfaces as a
-/// `JoinError`. Its payload is foreign-controlled (it can echo secrets / PII /
-/// internal paths just like a foreign error's `Debug`), so it is NEVER returned
-/// to Ipê: the panic payload routes through the redacting `ipe_error_from_panic`
-/// funnel (raw detail logged server-side under a correlation id, a generic typed
-/// message to Ipê); a non-panic `JoinError` (a cancel that still resolved a join)
-/// routes through `ipe_error_from_foreign`. Either way the caller gets a typed
-/// `Err`, never a process abort and never a silent hang.
+/// `JoinError`, classified once into a [`GuardedEnd`]: the runtime's own
+/// [`RuntimeTrip`] keeps its type, any other payload is foreign-controlled and
+/// is never shown to Ipê. Each caller folds that one outcome into its own
+/// channel ([`ffi_spawn_guarded`], [`ffi_spawn_guarded_unchanneled`]).
 ///
 /// The success value `T` is returned verbatim (`Ok(T)`); the caller applies its
-/// own shape-specific lift/fold to it (`ok_res`, the fallible `Result` unwrap,
-/// the `Option` fold). TOTALITY: no unwrap/expect/panic/indexing.
+/// own shape-specific lift/fold to it. TOTALITY: no unwrap/expect/panic/indexing.
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
-pub async fn ffi_spawn_guarded<F>(future: F) -> Result<F::Output, IpeError>
+pub async fn spawn_guarded_raw<F>(future: F) -> Result<F::Output, GuardedEnd>
 where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
@@ -123,12 +119,91 @@ where
     let guard = AbortOnDrop::new(handle.abort_handle());
     let joined = handle.await;
     guard.defuse();
-    match joined {
-        Ok(output) => Ok(output),
-        Err(join_err) => match join_err.try_into_panic() {
-            Ok(payload) => Err(ipe_error_from_panic("foreign async task panicked", payload)),
-            Err(join_err) => Err(ipe_error_from_foreign(join_err)),
+    joined.map_err(|join_err| match join_err.try_into_panic() {
+        Ok(payload) => match closure_unwind(payload) {
+            ClosureUnwind::Trip(fault) => GuardedEnd::Trip(fault),
+            ClosureUnwind::Foreign(payload) => GuardedEnd::Panicked(payload),
         },
+        Err(join_err) => GuardedEnd::Cancelled(join_err),
+    })
+}
+
+/// How a task spawned by [`spawn_guarded_raw`] ended without its output.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+#[derive(Debug)]
+pub enum GuardedEnd {
+    /// The task's Ipê code raised the runtime's typed trip.
+    Trip(RuntimeTrip),
+    /// The task panicked with any other payload; foreign-controlled text.
+    Panicked(Box<dyn std::any::Any + Send>),
+    /// The join resolved without a panic (the task was cancelled).
+    Cancelled(tokio::task::JoinError),
+}
+
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+impl GuardedEnd {
+    /// The typed error a caller with an error channel hands the program.
+    ///
+    /// A trip keeps its kind; a panic payload is logged server-side and
+    /// redacted; a cancel routes through the foreign-error funnel.
+    #[must_use]
+    pub fn into_ipe_error(self) -> IpeError {
+        match self {
+            Self::Trip(fault) => fault.to_ipe_error(),
+            Self::Panicked(payload) => ipe_error_from_panic("foreign async task panicked", payload),
+            Self::Cancelled(join_err) => ipe_error_from_foreign(join_err),
+        }
+    }
+}
+
+/// Spawn a guarded task whose failure reaches the caller as a typed `Err`.
+///
+/// Every outcome of [`spawn_guarded_raw`] other than the output becomes its
+/// [`GuardedEnd::into_ipe_error`]: never a process abort, never a silent hang.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+pub async fn ffi_spawn_guarded<F>(future: F) -> Result<F::Output, IpeError>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    spawn_guarded_raw(future)
+        .await
+        .map_err(GuardedEnd::into_ipe_error)
+}
+
+/// Spawn a guarded task for a caller whose only failure channel is `None`.
+///
+/// A foreign panic or a cancel is logged and folds to `None`; a trip has no
+/// `None` that would be true, so it ends the process typed through
+/// [`end_on_unchanneled_unwind`].
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+pub async fn ffi_spawn_guarded_unchanneled<F, T>(future: F) -> Option<T>
+where
+    F: std::future::Future<Output = Option<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    match unchanneled_outcome(spawn_guarded_raw(future).await) {
+        Ok(output) => output,
+        Err(fault) => {
+            end_on_unchanneled_unwind("foreign async closure tripped", ClosureUnwind::Trip(fault))
+        }
+    }
+}
+
+/// Fold a guarded task's outcome into the `None` channel, keeping a trip apart.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+fn unchanneled_outcome<T>(raw: Result<Option<T>, GuardedEnd>) -> Result<Option<T>, RuntimeTrip> {
+    match raw {
+        Ok(output) => Ok(output),
+        Err(GuardedEnd::Trip(fault)) => Err(fault),
+        Err(GuardedEnd::Panicked(payload)) => {
+            note_foreign_panic("foreign async task panicked", payload);
+            Ok(None)
+        }
+        Err(GuardedEnd::Cancelled(join_err)) => {
+            note_foreign_error(join_err);
+            Ok(None)
+        }
     }
 }
 
@@ -2381,6 +2456,57 @@ mod web_session_carrier_tests {
         assert!(
             matches!(&result, Ok(Ok((sid, None))) if sid.is_empty()),
             "a child spawned outside any session sees no session scope"
+        );
+    }
+}
+
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+#[cfg(test)]
+mod unchanneled_join_tests {
+    use super::*;
+
+    fn tripping() -> Option<i64> {
+        crate::core::trip(RuntimeTrip::RecursionLimit)
+    }
+
+    fn foreign_panic() -> Option<i64> {
+        std::panic::resume_unwind(Box::new("sk_live_SECRET"))
+    }
+
+    // A trip in a task whose caller can only say `None` stays a trip (and ends
+    // the process typed), while a foreign panic folds to `None`.
+    #[tokio::test]
+    async fn unchanneled_join_ends_on_a_trip_and_folds_a_foreign_panic() {
+        let tripped = spawn_guarded_raw(async { tripping() }).await;
+        assert!(matches!(
+            tripped,
+            Err(GuardedEnd::Trip(RuntimeTrip::RecursionLimit))
+        ));
+        assert!(matches!(
+            unchanneled_outcome(tripped),
+            Err(RuntimeTrip::RecursionLimit)
+        ));
+        let panicked = spawn_guarded_raw(async { foreign_panic() }).await;
+        assert!(matches!(panicked, Err(GuardedEnd::Panicked(_))));
+        assert!(matches!(unchanneled_outcome(panicked), Ok(None)));
+        let fine = spawn_guarded_raw(async { Some(7_i64) }).await;
+        assert!(matches!(unchanneled_outcome(fine), Ok(Some(7))));
+    }
+
+    // The typed-channel fold keeps a trip's kind, so a `Result` adapter hands
+    // the foreign caller `LimitExceeded`, not a redacted foreign panic.
+    #[tokio::test]
+    async fn the_typed_fold_keeps_a_trips_kind() {
+        let joined = ffi_spawn_guarded(async { tripping() }).await;
+        assert!(
+            matches!(
+                joined,
+                Err(crate::IpeError::Error(
+                    crate::IpeErrorKind::LimitExceeded,
+                    _
+                ))
+            ),
+            "{joined:?}"
         );
     }
 }
