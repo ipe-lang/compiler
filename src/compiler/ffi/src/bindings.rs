@@ -1840,23 +1840,22 @@ fn closure_adapter_lines(
     let forwarded_args = forwarded.join(", ");
     // The output the awaited work yields, for an async return — the fallible
     // carrier the future resolves to (`Result<T, IpeError>` / `Option<T>`).
-    let async_output = match &sig.ret {
-        ClosureRet::AsyncResult(_) => Some(format!("Result<{inner_ret}, IpeError>")),
-        ClosureRet::AsyncOption(_) => Some(format!("Option<{inner_ret}>")),
-        _ => None,
-    };
     // The return type the crate closure yields (and the Ipê fn value produces).
-    // An async return is the concrete boxed future the `IpeTask` value carries;
-    // its inner `Send + 'static` is part of the type, so the received box IS the
-    // Send/'static-across-await proof — the adapter never re-derives it.
+    // An async return is the concrete boxed future the `IpeTask` value carries,
+    // over the fallible carrier it resolves to; its inner `Send + 'static` is
+    // part of the type, so the received box IS the Send/'static-across-await
+    // proof — the adapter never re-derives it.
+    let boxed_future = |output: &str| -> String {
+        format!(
+            "::std::pin::Pin<Box<dyn ::std::future::Future<Output = {output}> + Send + 'static>>"
+        )
+    };
     let crate_ret = match &sig.ret {
         ClosureRet::Total(_) => inner_ret,
         ClosureRet::Result(_) => format!("Result<{inner_ret}, IpeError>"),
         ClosureRet::Option(_) => format!("Option<{inner_ret}>"),
-        ClosureRet::AsyncResult(_) | ClosureRet::AsyncOption(_) => format!(
-            "::std::pin::Pin<Box<dyn ::std::future::Future<Output = {}> + Send + 'static>>",
-            async_output.as_deref().unwrap_or("")
-        ),
+        ClosureRet::AsyncResult(_) => boxed_future(&format!("Result<{inner_ret}, IpeError>")),
+        ClosureRet::AsyncOption(_) => boxed_future(&format!("Option<{inner_ret}>")),
     };
     let bounds = sig.bounds.rust_suffix();
     let dyn_fn = |ret: &str| -> String {
@@ -1941,39 +1940,41 @@ fn closure_per_call_body(ret: &ClosureRet, call: &str, wrapper: &str) -> Vec<Str
             "        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {call})) \
              {{ Ok(inner) => inner, Err(__p) => {OPTION_UNWIND_FOLD} }}"
         )],
-        ClosureRet::AsyncResult(_) | ClosureRet::AsyncOption(_) => {
-            // The production seam (building the future) keeps its own
-            // `catch_unwind`; the spawn + cancel-guard + join funnel is the
-            // runtime's one raw join, read by the fold of the shape's channel.
-            let (prod_fold, join) = if matches!(ret, ClosureRet::AsyncResult(_)) {
-                (
-                    "{ let __e = ipe_error_from_panic(\"foreign closure panicked\", __p); \
-                     return Box::pin(async move { Err(__e) }); }"
-                        .to_owned(),
-                    "            match ffi_spawn_guarded(__fut).await \
-                     { Ok(inner) => inner, Err(__e) => Err(__e) }",
-                )
-            } else {
-                (
-                    format!(
-                        "{{ let __none = {OPTION_UNWIND_FOLD}; \
-                         return Box::pin(async move {{ __none }}); }}"
-                    ),
-                    "            ffi_spawn_guarded_unchanneled(__fut).await",
-                )
-            };
-            vec![
-                format!(
-                    "        let __fut = match std::panic::catch_unwind(\
-                     std::panic::AssertUnwindSafe(move || {call})) \
-                     {{ Ok(f) => f, Err(__p) => {prod_fold} }};"
-                ),
-                "        Box::pin(async move {".to_owned(),
-                join.to_owned(),
-                "        })".to_owned(),
-            ]
-        }
+        // The production seam (building the future) keeps its own
+        // `catch_unwind`; the spawn + cancel-guard + join funnel is the
+        // runtime's one raw join, read by the fold of the shape's channel.
+        ClosureRet::AsyncResult(_) => async_adapter_body(
+            call,
+            "{ let __e = ipe_error_from_panic(\"foreign closure panicked\", __p); \
+             return Box::pin(async move { Err(__e) }); }",
+            "            match ffi_spawn_guarded(__fut).await \
+             { Ok(inner) => inner, Err(__e) => Err(__e) }",
+        ),
+        ClosureRet::AsyncOption(_) => async_adapter_body(
+            call,
+            &format!(
+                "{{ let __none = {OPTION_UNWIND_FOLD}; \
+                 return Box::pin(async move {{ __none }}); }}"
+            ),
+            "            ffi_spawn_guarded_unchanneled(__fut).await",
+        ),
     }
+}
+
+/// The per-call body of an async closure adapter: the future is produced under
+/// `catch_unwind` (`prod_fold` answers a production-time unwind), then awaited
+/// through `join`, the shape's fold of the runtime's one guarded join.
+fn async_adapter_body(call: &str, prod_fold: &str, join: &str) -> Vec<String> {
+    vec![
+        format!(
+            "        let __fut = match std::panic::catch_unwind(\
+             std::panic::AssertUnwindSafe(move || {call})) \
+             {{ Ok(f) => f, Err(__p) => {prod_fold} }};"
+        ),
+        "        Box::pin(async move {".to_owned(),
+        join.to_owned(),
+        "        })".to_owned(),
+    ]
 }
 
 /// The `[rust.define.struct]` definition + constructor wrapper.
@@ -3127,23 +3128,60 @@ pub fn semver_major_field_from_version(arg0: ::semver::Version) -> i64 {
         assert!(!out.contains("Err(_) => None"), "{out}");
     }
 
-    /// Every adapter shape a foreign caller can reach without an error channel.
-    const UNCHANNELED_SIGS: &[&str] = &[
+    /// One signature per [`ClosureRet`] shape the adapter emitter renders.
+    const ADAPTER_SIGS: &[&str] = &[
         "Fn(Int, Bool) -> Int + Send + Sync + 'static",
+        "Fn(Int) -> Result<Int, Error> + Send + Sync + 'static",
         "Fn(Int) -> Option<Int> + Send + Sync + 'static",
+        "Fn(Int) -> impl Future<Output = Result<Int, Error>> + Send + Sync + 'static",
         "Fn(Int) -> impl Future<Output = Option<Int>> + Send + Sync + 'static",
     ];
 
+    /// The position of `ret`'s shape among all shapes, and whether it has an
+    /// error channel. Exhaustive, so a new shape fails to compile here until
+    /// [`ADAPTER_SIGS`] covers it.
+    const fn shape_of(ret: &ClosureRet) -> (usize, bool) {
+        match ret {
+            ClosureRet::Total(_) => (0, false),
+            ClosureRet::Result(_) => (1, true),
+            ClosureRet::Option(_) => (2, false),
+            ClosureRet::AsyncResult(_) => (3, true),
+            ClosureRet::AsyncOption(_) => (4, false),
+        }
+    }
+
+    /// The signatures whose shape has no error channel.
+    fn unchanneled_sigs() -> Vec<&'static str> {
+        ADAPTER_SIGS
+            .iter()
+            .copied()
+            .filter(|sig| {
+                let parsed = ClosureSig::parse(sig).expect("a fixture signature parses");
+                !shape_of(&parsed.ret).1
+            })
+            .collect()
+    }
+
+    #[test]
+    fn adapter_sigs_cover_every_closure_shape() {
+        let mut seen = [false; 5];
+        for sig in ADAPTER_SIGS {
+            let parsed = ClosureSig::parse(sig).expect("a fixture signature parses");
+            let (index, _) = shape_of(&parsed.ret);
+            if let Some(slot) = seen.get_mut(index) {
+                *slot = true;
+            }
+        }
+        assert!(seen.iter().all(|s| *s), "uncovered shape: {seen:?}");
+    }
+
     #[test]
     fn no_closure_or_getter_adapter_aborts() {
-        for sig in UNCHANNELED_SIGS.iter().chain([
-            &"Fn(Int) -> Result<Int, Error> + Send + Sync + 'static",
-            &"Fn(Int) -> impl Future<Output = Result<Int, Error>> + Send + Sync + 'static",
-        ]) {
+        for sig in ADAPTER_SIGS {
             let out = closure_region(sig);
             assert!(!out.contains("abort()"), "{sig}: {out}");
         }
-        for sig in UNCHANNELED_SIGS {
+        for sig in unchanneled_sigs() {
             let out = closure_region(sig);
             assert!(out.contains("closure_unwind(__p)"), "{sig}: {out}");
             assert!(out.contains("end_on_unchanneled_unwind("), "{sig}: {out}");
@@ -3166,7 +3204,13 @@ pub fn semver_major_field_from_version(arg0: ::semver::Version) -> i64 {
     fn option_adapter_never_folds_a_trip_to_none() {
         let trip_ends = "ClosureUnwind::Trip(__t) => end_on_unchanneled_unwind(\"foreign closure \
                          tripped\", ClosureUnwind::Trip(__t))";
-        for sig in UNCHANNELED_SIGS.iter().skip(1) {
+        let option_sigs = unchanneled_sigs().into_iter().filter(|sig| {
+            !matches!(
+                ClosureSig::parse(sig).map(|parsed| parsed.ret),
+                Ok(ClosureRet::Total(_))
+            )
+        });
+        for sig in option_sigs {
             let out = closure_region(sig);
             assert!(out.contains(trip_ends), "{sig}: {out}");
             // The only `None` the adapter yields on an unwind is the foreign arm's.
