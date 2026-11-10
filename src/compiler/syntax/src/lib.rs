@@ -10,12 +10,12 @@ mod triple;
 
 pub use ast::{
     Ctor, DocString, Exposed, Exposing, Expr, Expr_, ForeignDecl, Import, LetBinding, Module,
-    Pattern, Pattern_, Privacy, TypeAlias, TypeAnnotation, Union, Value,
+    Pattern, Pattern_, Privacy, Template, TemplatePart, TypeAlias, TypeAnnotation, Union, Value,
 };
 pub use fixity::{Assoc, BinOp, Fixity};
 pub use literal::{ESCAPES, escape_char_body, escape_str_body};
 pub use triple::{
-    Column, Judged, Opener, Piece, TripleRefusal, TripleStr, extent, interpolation_pieces, judge,
+    Column, Judged, Opener, Segment, TripleRefusal, TripleStr, extent, judge, mapped_span, segments,
 };
 
 #[cfg(test)]

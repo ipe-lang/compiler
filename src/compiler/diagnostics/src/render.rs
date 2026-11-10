@@ -33,10 +33,10 @@ use crate::code::{Severity, issue_tracker_url, title};
 use crate::diagnostic::{
     AppShape, Applicability, ArgCount, CaseDefect, CodecAutoRejection, ConsentError, CtorWithheld,
     Diagnostic, Expected, ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach,
-    HazardRefusal, HeaderDefect, HelpLine, Hint, IfDefect, ImportedAs, LetDefect, LowerError,
-    MountPrefixFault, NameError, OpenerText, ParseError, RoutePatternDefect, SandboxError,
-    SealRejection, SpanRole, StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion,
-    TokenKind, TripleStringDefect, TyDoc, TypeDeclDefect, TypeError, TypeSizeOrigin,
+    HazardRefusal, HeaderDefect, HelpLine, Hint, IfDefect, ImportedAs, InterpolationDefect,
+    LetDefect, LowerError, MountPrefixFault, NameError, OpenerText, ParseError, RoutePatternDefect,
+    SandboxError, SealRejection, SpanRole, StoreEqAccessorDefect, StoreSelectProjectionDefect,
+    Suggestion, TokenKind, TripleStringDefect, TyDoc, TypeDeclDefect, TypeError, TypeSizeOrigin,
     WildcardDependence, intercept_context_phrase,
 };
 use crate::span::Span;
@@ -441,7 +441,61 @@ fn parse_prose(msg: &ParseError) -> String {
              module qualifier — only the bare name `{bare}` is matched here."
         ),
         ParseError::MalformedTripleString(defect) => triple_string_prose(*defect),
+        ParseError::MalformedInterpolation(defect) => interpolation_prose(*defect),
     }
+}
+
+/// The prose band for a malformed `{{…}}` interpolation.
+fn interpolation_prose(defect: InterpolationDefect) -> String {
+    const RULE: &str = "A `{{…}}` in a `\"\"\"` string holds one expression, and the \
+         first `}}` after the `{{` ends it.";
+    let what = match defect {
+        InterpolationDefect::Empty => "This interpolation holds no expression.",
+        InterpolationDefect::Unclosed => "This `{{` has no `}}` after it in the string.",
+        InterpolationDefect::TrailingTokens => "This interpolation holds more than one expression.",
+        InterpolationDefect::BodyEnded => {
+            "The first `}}` ends this interpolation before its expression is complete."
+        }
+        InterpolationDefect::InPattern => {
+            "A pattern matches a fixed string, so it can't interpolate a value."
+        }
+    };
+    format!("{what} {RULE}")
+}
+
+/// The primary label for a malformed `{{…}}` interpolation.
+fn interpolation_label(defect: InterpolationDefect) -> String {
+    match defect {
+        InterpolationDefect::Empty => "an interpolation with no expression",
+        InterpolationDefect::Unclosed => "this `{{` is never closed",
+        InterpolationDefect::TrailingTokens => "the expression ends before this",
+        InterpolationDefect::BodyEnded => "this `}}` ends the interpolation",
+        InterpolationDefect::InPattern => "an interpolation in a pattern",
+    }
+    .to_string()
+}
+
+/// The one fix for a malformed `{{…}}` interpolation.
+fn interpolation_fix(defect: InterpolationDefect) -> String {
+    match defect {
+        InterpolationDefect::Empty => {
+            "put an expression between `{{` and `}}`, or write `\\{{` for a literal `{{`"
+        }
+        InterpolationDefect::Unclosed => {
+            "close the interpolation with `}}`, or write `\\{{` for a literal `{{`"
+        }
+        InterpolationDefect::TrailingTokens => {
+            "remove the extra tokens, or wrap the expression in parentheses"
+        }
+        InterpolationDefect::BodyEnded => {
+            "the first `}}` ends the interpolation; balance the brackets or bind the \
+             expression to a name"
+        }
+        InterpolationDefect::InPattern => {
+            "compare the string with `==` instead, or write `\\{{` for a literal `{{`"
+        }
+    }
+    .to_string()
 }
 
 /// The prose band for a malformed `"""` string: which of the two forms it breaks.
@@ -637,7 +691,8 @@ fn lexical_prose(msg: &ParseError) -> String {
         | ParseError::AnnotationWithoutBinding { .. }
         | ParseError::DuplicateAnnotation { .. }
         | ParseError::QualifiedCtorInPattern { .. }
-        | ParseError::MalformedTripleString(_) => {
+        | ParseError::MalformedTripleString(_)
+        | ParseError::MalformedInterpolation(_) => {
             "I couldn't make sense of this part of the file.".to_string()
         }
     }
@@ -1795,6 +1850,7 @@ fn parse_label(msg: &ParseError) -> Option<String> {
             "patterns match the bare name `{bare}`, not the qualified one"
         )),
         ParseError::MalformedTripleString(defect) => Some(triple_string_label(*defect)),
+        ParseError::MalformedInterpolation(defect) => Some(interpolation_label(*defect)),
         ParseError::Unexpected
         | ParseError::TooDeep
         | ParseError::SteplessDo
@@ -2802,6 +2858,7 @@ fn hint_text(hint: Hint) -> String {
              `import Module exposing (Type(..))`, then match the bare name"
             .to_string(),
         Hint::TripleStringFix(defect) => triple_string_fix(defect),
+        Hint::InterpolationFix(defect) => interpolation_fix(defect),
     }
 }
 

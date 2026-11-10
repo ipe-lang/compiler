@@ -1,0 +1,12 @@
+-- A MALFORMED STRING INTERPOLATION ------------------------ test.ipe
+
+This interpolation holds no expression. A `{{…}}` in a `"""` string holds one expression, and the first `}}` after the `{{` ends it.
+
+ --> test.ipe:4:10
+  |
+4 |     """a {{}} b"""
+  |          ^^^^ an interpolation with no expression
+  |
+  = help: put an expression between `{{` and `}}`, or write `\{{` for a literal `{{`
+
+IPE-P0077 · run `ipe doc IPE-P0077`

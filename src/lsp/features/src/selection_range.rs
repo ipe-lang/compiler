@@ -170,6 +170,11 @@ fn collect_expr_spans(expr: &ipe_syntax::Expr, byte: u32, out: &mut Vec<Span>) {
         Expr_::Access(inner, _field) => {
             collect_expr_spans(inner, byte, out);
         }
+        Expr_::Template(template) => {
+            for part in template.exprs() {
+                collect_expr_spans(part, byte, out);
+            }
+        }
         // Leaf expressions — span already pushed above.
         Expr_::VarLocal(_)
         | Expr_::VarQual(_, _)
@@ -177,7 +182,6 @@ fn collect_expr_spans(expr: &ipe_syntax::Expr, byte: u32, out: &mut Vec<Span>) {
         | Expr_::Int(_)
         | Expr_::Float(_)
         | Expr_::Str(_)
-        | Expr_::MultilineStr { .. }
         | Expr_::Char(_)
         | Expr_::Unit => {}
     }
