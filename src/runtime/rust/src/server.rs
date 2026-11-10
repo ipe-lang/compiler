@@ -2554,13 +2554,15 @@ fn respell_path(
     Ok(())
 }
 
-/// `router` behind the listener's [`CanonicalUrl`], still an `axum::Router`.
+/// `served` behind the listener's [`CanonicalUrl`], still an `axum::Router`.
 ///
 /// A test drives a router the way a listener serves it: an outer router with
-/// no route hands every request, untouched, to its fallback service.
+/// no route hands every request, untouched, to its fallback service, and a
+/// refused method is answered by the served router's own oracle.
 #[cfg(test)]
-pub(crate) fn behind_listener(router: axum::Router) -> axum::Router {
-    axum::Router::new().fallback_service(CanonicalUrl::new(router))
+pub(crate) fn behind_listener(served: impl Into<ServedRouter>) -> axum::Router {
+    let ServedRouter { router, allow } = served.into();
+    axum::Router::new().fallback_service(CanonicalUrl::with_allow(router, allow))
 }
 
 /// What a static-file mount may serve for one request path.

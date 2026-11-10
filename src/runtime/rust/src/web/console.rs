@@ -734,7 +734,9 @@ mod tests {
     async fn every_console_api_route_answers_no_store() {
         use tower::ServiceExt;
         assert!(!API_ROUTES.is_empty());
-        let router: axum::Router = mount_inline(axum::Router::new());
+        let router = mount_inline(crate::server::RouteTable::new())
+            .into_served(|router| router)
+            .into_router();
         for &(path, _) in API_ROUTES {
             let req = axum::http::Request::builder()
                 .uri(path)
