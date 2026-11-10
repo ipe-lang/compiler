@@ -3651,7 +3651,7 @@ impl ServedRouter {
     }
 
     /// The served router, for a test that drives it below its own prefix.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "web"))]
     pub(crate) fn into_router(self) -> axum::Router {
         self.router
     }
