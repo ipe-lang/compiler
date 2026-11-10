@@ -8382,23 +8382,49 @@ mod tests {
         assert_eq!(KERNEL_SCHEMA_CACHE, SchemaCache::for_engine(KERNEL_ENGINE));
     }
 
-    /// The production code of a source file: none when its prelude carries
-    /// `#![cfg(test)]`, else everything before its first `#[cfg(test)]` module.
-    fn production_part(source: &str) -> &str {
-        let test_only = source
+    /// The production code of a source file: none when the first line after
+    /// its leading line comments and blank lines is `#![cfg(test)]`, else the
+    /// file less each `#[cfg(test)] mod x;` line and each inline
+    /// `#[cfg(test)] mod x {` block, which ends at its first `}` line at
+    /// column zero. A block with no such line stays scanned.
+    fn production_part(source: &str) -> String {
+        const TEST_MOD: &str = "\n#[cfg(test)]\nmod ";
+        let mut opening = source
             .lines()
-            .take_while(|line| line.is_empty() || line.starts_with("//") || line.starts_with("#!"))
-            .any(|line| line == "#![cfg(test)]");
-        if test_only {
-            return "";
+            .skip_while(|line| line.is_empty() || line.starts_with("//"));
+        if opening.next() == Some("#![cfg(test)]") {
+            return String::new();
         }
-        source
-            .split_once("\n#[cfg(test)]\nmod ")
-            .map_or(source, |(head, _)| head)
+        let mut production = String::new();
+        let mut rest = source;
+        while let Some((head, tail)) = rest.split_once(TEST_MOD) {
+            production.push_str(head);
+            production.push('\n');
+            let (first, body) = tail.split_once('\n').unwrap_or((tail, ""));
+            if first.trim_end().ends_with(';') {
+                rest = body;
+                continue;
+            }
+            let mut consumed = 0;
+            let closed = first.trim_end().ends_with('{')
+                && body.split_inclusive('\n').any(|line| {
+                    consumed += line.len();
+                    line.trim_end_matches(['\r', '\n']) == "}"
+                });
+            if closed {
+                rest = body.get(consumed..).unwrap_or_default();
+            } else {
+                production.push_str(TEST_MOD.trim_start_matches('\n'));
+                rest = tail;
+            }
+        }
+        production.push_str(rest);
+        production
     }
 
     /// A file is test-only exactly when its prelude says so: the attribute
-    /// after an item, or a cfg that is not plain `test`, leaves the file production.
+    /// after an item, inside a string or a block comment, or a cfg that is
+    /// not plain `test`, leaves the file production.
     #[test]
     fn only_a_test_cfg_prelude_makes_a_file_test_only() {
         let pool = "fn open() { let _ = PoolOptions::new(); }\n";
@@ -8410,13 +8436,34 @@ mod tests {
             format!("//! Fixtures.\n\n{pool}#![cfg(test)]\n"),
             format!("#![cfg(not(test))]\n{pool}"),
             format!("#![cfg(any(test, feature = \"db\"))]\n{pool}"),
+            format!("#![doc = \"\n#![cfg(test)]\n\"]\n{pool}"),
+            format!("#![allow(dead_code)] /*\n#![cfg(test)]\n*/\n{pool}"),
+            format!("/* x */\n#![cfg(test)]\n{pool}"),
         ] {
             assert!(production_part(&source).contains("PoolOptions"), "{source}");
         }
         assert_eq!(
-            production_part(&format!("{pool}\n#[cfg(test)]\nmod tests {{}}\n")),
-            pool
+            production_part(&format!("{pool}\n#[cfg(test)]\nmod tests {{\n}}\n")),
+            format!("{pool}\n")
         );
+    }
+
+    /// Only the test module itself leaves the scan: production code after
+    /// it, after an out-of-line test module, or under a test module whose
+    /// end is not a column-zero `}` is scanned.
+    #[test]
+    fn production_after_a_test_module_is_scanned() {
+        let pool = "fn open() { let _ = PoolOptions::new(); }\n";
+        for source in [
+            format!("fn a() {{}}\n#[cfg(test)]\nmod tests {{\n    fn t() {{}}\n}}\n{pool}"),
+            format!("fn a() {{}}\n#[cfg(test)]\nmod tests;\n{pool}"),
+            format!("fn a() {{}}\n#[cfg(test)]\nmod tests {{\n    {pool}}} // tests\n"),
+            format!("fn a() {{}}\n#[cfg(test)]\nmod tests {{}}\n{pool}"),
+        ] {
+            assert!(production_part(&source).contains("PoolOptions"), "{source}");
+        }
+        let gated = format!("fn a() {{}}\n#[cfg(test)]\nmod tests {{\n    {pool}}}\nfn b() {{}}\n");
+        assert!(!production_part(&gated).contains("PoolOptions"), "{gated}");
     }
 
     /// Every pool production runtime code builds takes [`vetted_pool_options`],

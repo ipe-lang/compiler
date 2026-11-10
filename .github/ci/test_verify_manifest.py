@@ -9412,8 +9412,33 @@ class TestRuntimeClippyAllTargets(unittest.TestCase):
             "cargo clippy -p ipe --features full -- -D warnings",
             "cargo clippy -p ipe-runtime-rust --target wasm32-unknown-unknown --lib -- -D warnings",
             "cargo build -p ipe-runtime-rust --lib",
+            "cargo clippy --workspace --exclude ipe-runtime-rust -- -D warnings",
+            "cargo clippy -p ipe-runtime-rust --target=wasm32-wasip1 --lib -- -D warnings",
         ]
         self.assertEqual(self.errors("\n".join(rows), rows), [])
+
+    def test_a_host_target_row_is_held(self) -> None:
+        for target in ("--target x86_64-unknown-linux-gnu", "--target=aarch64-apple-darwin",
+                       "--target wasm32-unknown-unknown --target x86_64-unknown-linux-gnu"):
+            row = f"cargo clippy -p ipe-runtime-rust {target} --lib -- -D warnings"
+            self.assertEqual(len(self.errors(row, [])), 1, row)
+
+    def test_a_row_naming_no_package_reaches_the_runtime(self) -> None:
+        for row in ("cargo clippy --workspace -- -D warnings", "cargo clippy -- -D warnings",
+                    "cargo clippy --workspace --exclude ipe -- -D warnings"):
+            self.assertEqual(len(self.errors(row, [])), 1, row)
+
+    def test_a_clippy_after_another_command_is_read(self) -> None:
+        for row in ("cargo build -p ipe && cargo clippy -p ipe-runtime-rust -- -D warnings",
+                    "true;cargo clippy -p ipe-runtime-rust -- -D warnings",
+                    "(cargo clippy -p ipe-runtime-rust -- -D warnings)"):
+            self.assertEqual(len(self.errors(row, [])), 1, row)
+
+    def test_an_unsplittable_clippy_line_is_refused(self) -> None:
+        row = "cargo clippy -p ipe-runtime-rust --features 'db -- -D warnings"
+        errors = self.errors(_RCA_PG, [row])
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("cannot be split", errors[0])
 
     def test_runtime_clippy_rows_accept_current_tree(self) -> None:
         errors: list[str] = []

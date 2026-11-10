@@ -560,15 +560,19 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       is refused.  So a rustc warning or clippy lint that fires only under
       a wasm32 cfg cannot merge.  LIMIT: native (target, feature) legs have
       no such check.
-  26. Every host `cargo clippy` of `ipe-runtime-rust` lints every target:
-      each such line of a workflow step's `run:` (backslash continuations
-      joined) and of a manifest entry's `local.run` that names no
-      `--target` carries `--all-targets`, its package named by `-p X`,
-      `-pX`, `--package X` or `--package=X`.  A library-only host row
-      leaves the runtime's test code unlinted under that row's cfg set,
-      where it rots unseen.  A `--target` row is a cross-target leg, whose
-      test sets check 25 holds.  LIMIT: a line `shlex` cannot split, or a
-      cargo reached through a variable or script, is not read.
+  26. Every host `cargo clippy` that can reach `ipe-runtime-rust` lints
+      every target: each `cargo clippy` command of a workflow step's `run:`
+      line (backslash continuations joined; `;`, `&&`, `||`, `|` split it
+      into commands) and of a manifest entry's `local.run` carries
+      `--all-targets` before `--`, unless it names only other packages
+      (`-p X`, `-pX`, `--package X`, `--package=X`), excludes the runtime
+      from a `--workspace`, or lints only `wasm32-*` targets.  A clippy
+      naming no package reaches every workspace member, the runtime
+      included.  A library-only host row leaves the runtime's test code
+      unlinted under that row's cfg set, where it rots unseen; a wasm32
+      row is a cross-target leg whose test sets check 25 holds.  A line
+      naming `clippy` that `shlex` cannot split is refused.  LIMIT: a cargo
+      reached through a variable or script is not read.
   LIMIT (checks 15, 16, 20, 22): a cargo line is read as run, not proven
   to reach its step's exit status — `cargo .. || true`, an `exit 0` before
   it, `set +e`, `if ! cargo ..` or a pipeline without `pipefail` are not
@@ -8580,51 +8584,92 @@ def _joined_lines(text: str) -> list[str]:
     return out
 
 
-def _clippy_packages(words: list[str]) -> set[str] | None:
-    """The packages a `cargo clippy` word list names before `--`, or None
-    when the words are not a `cargo clippy`."""
+_SHELL_PUNCTUATION = frozenset(";&|()")
+
+
+def _shell_commands(line: str) -> list[list[str]] | None:
+    """The word lists of the commands one shell line runs, split at `;`,
+    `&&`, `||`, `|`, `&` and parentheses, or None when `shlex` cannot split it."""
+    lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
     try:
-        at = words.index("cargo")
+        words = list(lexer)
     except ValueError:
         return None
-    rest = words[at + 1:]
-    if rest and rest[0].startswith("+"):
-        rest = rest[1:]
-    if not rest or rest[0] != "clippy":
-        return None
-    packages: set[str] = set()
-    args = rest[1:]
+    commands: list[list[str]] = [[]]
+    for word in words:
+        if word and set(word) <= _SHELL_PUNCTUATION:
+            commands.append([])
+        else:
+            commands[-1].append(word)
+    return [command for command in commands if command]
+
+
+def _clippy_flags(words: list[str]) -> list[str] | None:
+    """The words a `cargo clippy` command passes cargo (those before `--`),
+    or None when the command is not a `cargo clippy`."""
+    for at, word in enumerate(words):
+        if word != "cargo" and not word.endswith("/cargo"):
+            continue
+        rest = words[at + 1:]
+        if rest and rest[0].startswith("+"):
+            rest = rest[1:]
+        if rest and rest[0] == "clippy":
+            args = rest[1:]
+            return args[: args.index("--")] if "--" in args else args
+    return None
+
+
+def _flag_values(flags: list[str], long: str, short: str | None) -> list[str]:
+    """Every value `flags` gives `long` (`--x V`, `--x=V`) or `short` (`-s V`, `-sV`)."""
+    values: list[str] = []
     i = 0
-    while i < len(args) and args[i] != "--":
-        word = args[i]
-        if word in ("-p", "--package") and i + 1 < len(args):
-            packages.add(args[i + 1])
+    while i < len(flags):
+        word = flags[i]
+        if word == long or word == short:
+            if i + 1 < len(flags):
+                values.append(flags[i + 1])
             i += 2
             continue
-        if word.startswith("--package="):
-            packages.add(word.removeprefix("--package="))
-        elif word.startswith("-p") and not word.startswith("--") and len(word) > 2:
-            packages.add(word[2:])
+        if word.startswith(long + "="):
+            values.append(word.removeprefix(long + "="))
+        elif short is not None and word.startswith(short) and not word.startswith("--"):
+            values.append(word.removeprefix(short))
         i += 1
-    return packages
+    return values
+
+
+def _clippy_reaches_runtime(flags: list[str]) -> bool:
+    """Whether a `cargo clippy` with these cargo flags can lint the runtime:
+    it names it, or names no package and does not exclude it."""
+    packages = _flag_values(flags, "--package", "-p")
+    if packages:
+        return RUNTIME_PACKAGE in packages
+    return RUNTIME_PACKAGE not in _flag_values(flags, "--exclude", None)
 
 
 def _runtime_clippy_refusal(line: str, where: str) -> str | None:
     """Check 26's refusal of one shell line, or None."""
-    try:
-        words = shlex.split(line, comments=True)
-    except ValueError:
-        return None
-    packages = _clippy_packages(words)
-    if packages is None or RUNTIME_PACKAGE not in packages:
-        return None
-    flags = words[: words.index("--")] if "--" in words else words
-    if "--all-targets" in flags or any(f == "--target" or f.startswith("--target=") for f in flags):
-        return None
-    return (
-        f"check 26: {where}: `{line.strip()}` lints `{RUNTIME_PACKAGE}` without "
-        "`--all-targets`, so its test code goes unlinted under that cfg set"
-    )
+    commands = _shell_commands(line)
+    if commands is None:
+        if "clippy" not in line:
+            return None
+        return (
+            f"check 26: {where}: `{line.strip()}` names `clippy` but cannot be "
+            "split, so the targets it lints are unread"
+        )
+    for words in commands:
+        flags = _clippy_flags(words)
+        if flags is None or not _clippy_reaches_runtime(flags) or "--all-targets" in flags:
+            continue
+        targets = _flag_values(flags, "--target", None)
+        if targets and all(target.startswith("wasm32-") for target in targets):
+            continue
+        return (
+            f"check 26: {where}: `{line.strip()}` lints `{RUNTIME_PACKAGE}` without "
+            "`--all-targets`, so its test code goes unlinted under that cfg set"
+        )
+    return None
 
 
 def check_runtime_clippy_all_targets(wfs: WorkflowSet, entries: object, errors: list[str]) -> None:
