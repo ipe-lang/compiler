@@ -20,7 +20,7 @@ pub use crate::output_dir::held::{BackupName, Unread};
 pub use crate::project::NoProject;
 
 /// The guide, embedded once; every consumer reads this constant.
-pub const ASSET: &str = include_str!("../templates/AGENTS.md.in");
+pub const ASSET: &str = include_str!("../../templates/AGENTS.md.in");
 
 /// The guide's key in the `guide:` doc kind.
 pub const GUIDE_KEY: &str = "agents";
@@ -665,6 +665,8 @@ pub(crate) fn apply_consented(
         }
     }
 }
+
+mod claims;
 
 #[cfg(test)]
 mod tests {

@@ -27,16 +27,16 @@ ipe dev run                   # build + run
 | You are building | Shape | Entry |
 |---|---|---|
 | one-shot CLI, cron, batch | script | `main : Task Error ()` |
-| line-oriented REPL | cli | `Cli.tea { ... }` |
-| terminal UI | tui | `Tui.tea { ... }` |
+| line-oriented REPL | cli | `Ipe.Tea.Cli.tea { ... }` |
+| terminal UI | tui | `Ipe.Tea.Tui.tea { ... }` |
 | HTTP/JSON API, SSE, WebSocket | server | `Server.listen 8000 [ ... ]` |
-| web app (TEA) | web | `Web.tea { ... }` |
-| desktop / mobile | web + host | `Web.tea` + `ipe dev build web desktop` / `ipe release build web client ios` |
-| view-less managed loop | worker | `Worker.tea { ... }` |
+| web app (TEA) | web | `Ipe.Tea.Web.tea { ... }` |
+| desktop / mobile | web + host | `Ipe.Tea.Web.tea` + `ipe dev build web desktop` / `ipe release build web client ios` |
+| view-less managed loop | worker | `Ipe.Tea.Worker.tea { ... }` |
 
 `ipe init [<dir>] [<shape>]` scaffolds. Shapes: `script | cli | tui | server | web | worker` (default `web`).
 
-Do not import `Ipe.Tea.*` into a plain-`main` script (IPE-N0033). A desktop or mobile app is the `web` shape delivered to a host, not a separate shape.
+Do not import a TEA shape module such as `Ipe.Tea.Web` into a plain-`main` script (IPE-N0033). A desktop or mobile app is the `web` shape delivered to a host, not a separate shape.
 
 ## 2. Modules, imports, scope
 
@@ -51,7 +51,7 @@ Do not import `Ipe.Tea.*` into a plain-`main` script (IPE-N0033). A desktop or m
 - Everything is immutable. `{ record | field = value }` returns a copy.
 - ADTs + exhaustive `case`:
 
-```elm
+```ipe
 type Shape
     = Circle Float
     | Rect Float Float
@@ -90,7 +90,11 @@ Every observable side effect returns `Task Error a`.
 
 Use `do` when a sequence has **two or more** `Task.andThen` steps. One `andThen` is fine; two or more should be a `do` block.
 
-```elm
+```ipe
+import Ipe.Io as Io
+import Ipe.String as String
+import Ipe.Task as Task
+
 main : Task Error ()
 main =
     do
@@ -102,7 +106,11 @@ main =
 
 Instead of:
 
-```elm
+```ipe
+import Ipe.Io as Io
+import Ipe.String as String
+import Ipe.Task as Task
+
 main =
     Task.succeed "hello"
         |> Task.andThen (\first -> Io.println (String.toUpper first))
@@ -122,7 +130,10 @@ Use `Task.map`, `mapError`, `onError`, `andThenResult` for transformations and r
 
 When a value goes through two or more transformations, write a pipe chain. Do not nest calls outside-in.
 
-```elm
+```ipe
+import Ipe.List as List
+import Ipe.String as String
+
 report : List String -> String
 report xs =
     xs
@@ -133,8 +144,13 @@ report xs =
 
 Avoid:
 
-```elm
-String.join ", " (List.filter (\n -> String.length n > 3) (List.map String.toUpper xs))
+```ipe
+import Ipe.List as List
+import Ipe.String as String
+
+report : List String -> String
+report xs =
+    String.join ", " (List.filter (\n -> String.length n > 3) (List.map String.toUpper xs))
 ```
 
 - `x |> f` is `f x`; `f <| x` is `f x` in the other direction.
@@ -145,7 +161,7 @@ String.join ", " (List.filter (\n -> String.length n > 3) (List.map String.toUpp
 
 Never use `Result String a` or `Task String a` as the error channel. Model the failure.
 
-```elm
+```ipe
 type FieldError
     = Required
     | InvalidEmail
@@ -172,8 +188,8 @@ errorText err =
 ## 7. UI and forms (`Ipe.Ui`)
 
 - Default to `Ipe.Ui`; use `Ipe.Html` only to wrap raw markup. No `data-ipe-eval`.
-- `Web.tea` view is `Model -> Element Msg`; `Tui.tea` uses `Screen Msg` (terminal-only).
-- **Do not over-split.** One `Main.ipe` is fine for a small app. Split only when the module becomes hard to navigate (roughly 400+ lines or 25+ polymorphic `Element msg` helpers). Canonical split: `State` (types + pure logic, no Ui), `Update`, `View`, `Main`. Do not turn a 300-line app into four files.
+- `Ipe.Tea.Web.tea` view is `Model -> Element Msg`; `Ipe.Tea.Tui.tea` uses `Screen Msg` (terminal-only).
+- **Do not over-split.** One `Main` module is fine for a small app. Split only when the module becomes hard to navigate (roughly 400+ lines or 25+ polymorphic `Element msg` helpers). Canonical split: `State` (types + pure logic, no Ui), `Update`, `View`, `Main`. Do not turn a 300-line app into four files.
 - Page-free app: `routes = []`, Model has no page field, `notFound = ()` is valid. Routed app: closed `Page` ADT; every constructor needs a route; the first route is canonical. Do not add a `Page` ADT when there are no routes.
 
 ### 7.1 Forms
@@ -182,9 +198,9 @@ errorText err =
 - Put a real submit control **inside** the form. A `Ui.button` with `onPress = Nothing` renders `disabled`.
 - Preferred submit control: `Ui.input [ Ui.htmlAttribute "type" "submit", Ui.htmlAttribute "value" "Save" ]`.
 - An `onSubmit` on a form with no submit control inside is dead code: keyboard submit may never fire.
-- Every input: a visible label (`Input.labelAbove` / `labelLeft`) or `Input.labelHidden "..."`.
+- Every input: a visible label (`Ipe.Ui.Input.labelAbove` / `labelLeft`) or `Ipe.Ui.Input.labelHidden "..."`.
 - Tie errors to fields: `Ui.ariaInvalid`, `Ui.ariaDescribedby "email-err"`, `Ui.id "email-err"`.
-- Use `Region.heading n` for headings, `Ui.name` on inputs, and ARIA where it applies. Accessibility is part of "done".
+- Use `Ipe.Ui.Region.heading n` for headings, `Ui.name` on inputs, and ARIA where it applies. Accessibility is part of "done".
 - Password fields: keep them uncontrolled (no `value`, no per-keystroke `onInput`); submit a typed record via `onSubmit`.
 
 ## 8. Defaults
@@ -199,9 +215,9 @@ errorText err =
 | Forms with passwords | `Ui.form` + `onSubmit` + typed record; password uncontrolled |
 | Observability | `Ipe.Log`; dev console at `/_ipe/console` |
 | Secrets | typed; never `Debug` or log them |
-| Concurrency | `Cmd.batch` / `Task.parallel`; pub/sub via `Cmd.publish` + `Sub.subscribeTopic` |
+| Concurrency | `Ipe.Tea.Web.Cmd.batch` / `Task.parallel`; pub/sub via `Ipe.Tea.Web.Cmd.publish` + `Ipe.Tea.Web.Sub.subscribeTopic` |
 
-Production gate: set `ENV=production`; `IPE_AUTH_TOKEN_SECRET` >= 32 bytes; `IPE_ADMIN_TOKEN` set; session store not `memory` with more than one replica.
+Production gate: set `IPE_ENV=production`; `IPE_AUTH_TOKEN_SECRET` >= 32 bytes; `IPE_ADMIN_TOKEN` set; session store not `memory` with more than one replica.
 
 ## 9. Commands
 
@@ -246,7 +262,7 @@ ipe health                     # toolchain diagnosis
 - `--json`: stable machine-readable envelope.
 - A miss prints the closest entries with the exact term that opens each one.
 - `ipe doc` is embedded and offline; no network.
-- `ipe doc --json` applies only to `list`, `<module>`, and `<key>` lookups.
+- `--json` applies only to `list`, `<module>`, and `<key>` lookups.
 - Before using an API you have not used in this session, look it up. Do not guess signatures.
 
 ## 11. Gotchas and limits
@@ -254,12 +270,12 @@ ipe health                     # toolchain diagnosis
 - `{ model.draft | name = value }` is **not** valid (IPE-P0001). Bind first: `draft = model.draft`, then `{ model | draft = { draft | name = value } }`, or use a setter function.
 - An interpolation body is any expression, and it ends at the first `}}`: a record closing there (`{{ f {a = {b = 1}} }}`) is IPE-P0077. Space the braces (`{b = 1} }`) or bind the value to a name first.
 - No custom operators, no `where`, no higher-kinded types.
-- `Debug.*` is dev-only; `ipe release` rejects it (IPE-L0140).
+- `Ipe.Debug` is dev-only; `ipe release` rejects it (IPE-L0140).
 - Non-tail-recursive list operations are O(N) on the call stack. For 200k+ elements, use a tail-recursive accumulator (`foldl`).
 - `ipe capabilities` needs a project; `ipe doc list` works outside one.
 - `Ui.button` with `onPress = Nothing` renders disabled.
 - `Ui.form` + `Ui.onSubmit` without a submit control inside is likely dead code.
-- `ipe doc --json` alone is an error; pair it with a key, module, or `list`.
+- `ipe doc` with only `--json` is an error; pair it with a key, module, or `list`.
 - When a doc file and the compiler disagree, the compiler wins.
 
 ## 12. Done means verified
