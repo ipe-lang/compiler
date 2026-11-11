@@ -96,7 +96,7 @@ const fn refused(diagnostics: String) -> CompileOutcome {
 enum PlaygroundFailure {
     /// A compiler diagnostic, with the module source it renders against.
     Diagnostic {
-        diag: ipe_diagnostics::Diagnostic,
+        diag: Box<ipe_diagnostics::Diagnostic>,
         blame: Blame,
     },
     /// The entry module the source declared is absent from the source root.
@@ -145,7 +145,10 @@ impl Blame {
 
     /// `diag` blamed on this module.
     fn on(self, diag: ipe_diagnostics::Diagnostic) -> PlaygroundFailure {
-        PlaygroundFailure::Diagnostic { diag, blame: self }
+        PlaygroundFailure::Diagnostic {
+            diag: Box::new(diag),
+            blame: self,
+        }
     }
 }
 
