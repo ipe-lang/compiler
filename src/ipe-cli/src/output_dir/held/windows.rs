@@ -264,10 +264,10 @@ pub fn create_private(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
     create_new(dir, name)
 }
 
-/// Give `staged` the judged file's permissions; on Windows it already has them, so `Ok(true)`.
+/// Give `staged` the judged file's permissions; Windows carries none, so `Ok(true)`.
 ///
-/// The staged file inherits the directory's access list, as the judged file
-/// did; a read-only judged file refuses the rename over it.
+/// The staged file takes the access list the directory hands down; an
+/// access list set on the judged file itself is not carried.
 pub const fn carry_mode(
     _dir: &HeldDir,
     _name: &EntryName,

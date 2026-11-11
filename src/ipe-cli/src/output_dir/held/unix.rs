@@ -7,7 +7,7 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
 use ipe_fs_open::{EntryName, FileId, HeldDir};
 use rustix::fs::{AtFlags, Mode, OFlags};
@@ -89,9 +89,24 @@ fn stat_flags() -> OFlags {
 /// Setuid, setgid and the sticky bit are never carried to new content.
 const CARRIED_BITS: u32 = 0o777;
 
-/// Give `staged` the permission bits of the entry `name` of `dir`, only while it is the file `judged`.
+/// The group's read, write and execute bits.
+const GROUP_BITS: u32 = 0o070;
+
+/// The bits a replacement of a file with permission bits `mode` takes.
 ///
-/// `Ok(false)` when the entry is gone, a link, or another object than
+/// The group bits grant the file's group: they are carried only when the
+/// replacement belongs to the judged file's group, so they never open the
+/// content to another group.
+pub(super) const fn carried_bits(mode: u32, same_group: bool) -> u32 {
+    let bits = mode & CARRIED_BITS;
+    if same_group { bits } else { bits & !GROUP_BITS }
+}
+
+/// Give `staged` the group and permission bits of the entry `name` of `dir`, only while it is the file `judged`.
+///
+/// The staged file takes the judged file's group when this user may give
+/// it that group; otherwise it keeps its own group and none of the group
+/// bits. `Ok(false)` when the entry is gone, a link, or another object than
 /// `judged`; `staged` is untouched then.
 pub fn carry_mode(
     dir: &HeldDir,
@@ -110,7 +125,11 @@ pub fn carry_mode(
     if FileId::of_file(&current).map_err(ipe_fs_open::OpenRefusal::into_io)? != judged {
         return Ok(false);
     }
-    let bits = current.metadata()?.permissions().mode() & CARRIED_BITS;
+    let judged_meta = current.metadata()?;
+    let group = judged_meta.gid();
+    let same_group = staged.metadata()?.gid() == group
+        || std::os::unix::fs::fchown(staged, None, Some(group)).is_ok();
+    let bits = carried_bits(judged_meta.permissions().mode(), same_group);
     staged.set_permissions(std::fs::Permissions::from_mode(bits))?;
     Ok(true)
 }

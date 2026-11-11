@@ -1811,8 +1811,9 @@ impl HeldDir {
     /// Stage `fill`, run `keep`, re-prove the judged file, then rename over it; undo all on any other end.
     ///
     /// The staged file is created owner-only and synced before the re-proof,
-    /// takes the judged file's permission bits (no setuid, setgid or sticky
-    /// bit) only after it, and the directory is synced after the rename: a
+    /// takes the judged file's group and permission bits (no setuid, setgid or
+    /// sticky bit, and no group bits when it cannot take the group) only after
+    /// it, and the directory is synced after the rename: a
     /// crash leaves the old or the new content, and the new content is never
     /// more readable than the old.
     fn replace_judged<T, E>(
@@ -4035,6 +4036,38 @@ mod tests {
             0o755,
             "only the read, write and execute bits are carried"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The group bits are carried only to a replacement of the judged file's group.
+    #[cfg(unix)]
+    #[test]
+    fn carried_bits_drop_group_of_another_group() {
+        assert_eq!(sys::carried_bits(0o7660, true), 0o660);
+        assert_eq!(
+            sys::carried_bits(0o660, false),
+            0o600,
+            "another group never takes the judged group's bits"
+        );
+        assert_eq!(sys::carried_bits(0o4775, false), 0o705);
+    }
+
+    /// A replace gives the new content the judged file's group, with its group bits.
+    #[cfg(unix)]
+    #[test]
+    fn replace_keeps_judged_group() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let base = scratch("keeps_group");
+        let (held, id, text) = judged_n(&base, "old");
+        std::fs::set_permissions(base.join("N"), std::fs::Permissions::from_mode(0o640))
+            .expect("set the judged mode");
+        let group = std::fs::metadata(base.join("N")).expect("judged").gid();
+        let done =
+            held.replace_if_unchanged(OsStr::new("N"), id, &text, byte_cap(4096), fill_unsynced);
+        assert_eq!(done.ok(), Some(Replaced::Done));
+        let meta = std::fs::metadata(base.join("N")).expect("replaced");
+        assert_eq!(meta.gid(), group);
+        assert_eq!(mode_at(&base.join("N")), 0o640);
         let _ = std::fs::remove_dir_all(&base);
     }
 
