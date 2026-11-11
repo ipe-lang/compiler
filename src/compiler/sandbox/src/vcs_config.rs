@@ -1106,10 +1106,9 @@ fn operands_proven(line: &Line<'_>, appends: Appends, regime: Regime) -> Result<
         }
     };
     let contract = match appends {
-        Appends::Nothing | Appends::Ungranted => return Ok(()),
         Appends::Granted(contract) => contract,
         Appends::Substitutes(contract) if text.contains('%') => contract,
-        Appends::Substitutes(_) => return Ok(()),
+        Appends::Nothing | Appends::Ungranted | Appends::Substitutes(_) => return Ok(()),
     };
     let Some((program, rest)) = words.split_first() else {
         return Ok(());
@@ -3641,10 +3640,9 @@ fn is_git_scalar(value: &str) -> bool {
 fn is_scalar(syntax: Syntax, value: &str) -> bool {
     match syntax {
         Syntax::Git => is_git_scalar(value),
-        Syntax::Hg => is_hg_scalar(value),
         // No row decides yet how Jujutsu or Darcs consumes a setting: a value
         // Mercurial reads as a boolean or a number names no file there either.
-        Syntax::Toml | Syntax::Darcs => is_hg_scalar(value),
+        Syntax::Hg | Syntax::Toml | Syntax::Darcs => is_hg_scalar(value),
         // Every line of a remote file has a decided route, so none is unknown.
         Syntax::GitRemote => false,
     }
