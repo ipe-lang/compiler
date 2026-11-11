@@ -42,16 +42,18 @@ fn as_str(path: &Path) -> &str {
     path.to_str().unwrap_or_default()
 }
 
-/// A fresh, unique temp directory for one test (removed first if present).
-fn fresh_dir(tag: &str) -> PathBuf {
+/// A fresh, unique, existing temp directory for one test (emptied first if
+/// present), so a test can run `ipe` in it without creating it first.
+fn fresh_dir(tag: &str) -> io::Result<PathBuf> {
     let dir = crate::support::scratch_root().join(format!("ipe_doc_test_{tag}"));
     e2e_support::scratch::fresh(&dir);
-    dir
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
 }
 
 /// Write a fully-documented one-module package under `dir/src` and return `dir`.
 fn documented_package(tag: &str) -> io::Result<PathBuf> {
-    let dir = fresh_dir(tag);
+    let dir = fresh_dir(tag)?;
     let src = dir.join("src");
     fs::create_dir_all(&src)?;
     fs::write(
@@ -72,11 +74,12 @@ fn documented_package(tag: &str) -> io::Result<PathBuf> {
 /// `ipe doc guide:agents --plain` prints the embedded guide byte for byte, so
 /// redirecting it to `AGENTS.md` yields a current guide.
 #[test]
-fn guide_agents_plain_is_asset_bytes() {
-    let dir = fresh_dir("guide_agents_plain");
+fn guide_agents_plain_is_asset_bytes() -> io::Result<()> {
+    let dir = fresh_dir("guide_agents_plain")?;
     let (ok, stdout, stderr) = run_in(&dir, &["doc", ipe::agents_guide::GUIDE_TERM, "--plain"]);
     assert!(ok, "doc guide:agents must succeed: {stderr}");
     assert_eq!(stdout, ipe::agents_guide::ASSET);
+    Ok(())
 }
 
 #[test]
@@ -189,8 +192,7 @@ fn docs_json_records_resolved_cross_references() -> io::Result<()> {
 fn generate_without_project_documents_stdlib() -> io::Result<()> {
     // In an empty directory (no package manifest), `ipe doc --write-format html`
     // must succeed and produce doc/html/ containing stdlib module pages.
-    let dir = fresh_dir("stdlib_no_project");
-    fs::create_dir_all(&dir)?;
+    let dir = fresh_dir("stdlib_no_project")?;
     let out = dir.join("out");
     let (ok, stdout, stderr) = run_in(
         &dir,
@@ -383,8 +385,7 @@ fn every_listed_module_is_queryable() -> io::Result<()> {
     // registry drift this guards against. Run from an empty dir so the listing is
     // stdlib only — no project modules to shadow it, and no path positional (a
     // `<module>` query takes only the module name).
-    let dir = fresh_dir("listed_queryable");
-    fs::create_dir_all(&dir)?;
+    let dir = fresh_dir("listed_queryable")?;
 
     let (ok, listed, stderr) = run_in(&dir, &["doc", "--list", "--plain"]);
     assert!(ok, "`ipe doc --list` must succeed:\n{listed}\n{stderr}");
@@ -484,7 +485,7 @@ fn check_passes_when_every_binding_is_documented() -> io::Result<()> {
 
 #[test]
 fn check_fails_and_names_the_undocumented_binding() -> io::Result<()> {
-    let dir = fresh_dir("check_fail");
+    let dir = fresh_dir("check_fail")?;
     let src = dir.join("src");
     fs::create_dir_all(&src)?;
     // `shout` is exposed but carries no `-- |` comment.
@@ -583,8 +584,7 @@ fn help_page_describes_the_shipped_surface() {
 /// compiled-source stdlib module included — never "unknown module".
 #[test]
 fn a_qualified_member_resolves_to_its_doc() -> io::Result<()> {
-    let dir = fresh_dir("member_lookup");
-    fs::create_dir_all(&dir)?;
+    let dir = fresh_dir("member_lookup")?;
     for key in ["Ipe.Time.unixMillis", "Time.unixMillis", "Ipe.List.map"] {
         let (ok, stdout, stderr) = run_in(&dir, &["doc", key, "--plain"]);
         assert!(ok, "`ipe doc {key}` must resolve:\n{stdout}\n{stderr}");
@@ -607,8 +607,7 @@ fn a_qualified_member_resolves_to_its_doc() -> io::Result<()> {
 /// frame, without the command's usage page.
 #[test]
 fn a_miss_lists_the_closest_matches_as_commands() -> io::Result<()> {
-    let dir = fresh_dir("miss_suggestions");
-    fs::create_dir_all(&dir)?;
+    let dir = fresh_dir("miss_suggestions")?;
     let (ok, stdout, stderr) = run_in(&dir, &["doc", "unixMilis"]);
     assert!(!ok, "a miss exits non-zero");
     assert!(
@@ -639,8 +638,7 @@ fn a_miss_lists_the_closest_matches_as_commands() -> io::Result<()> {
 /// name lists every module member of that name.
 #[test]
 fn every_miss_suggests_something_and_bare_names_find_members() -> io::Result<()> {
-    let dir = fresh_dir("miss_nearest");
-    fs::create_dir_all(&dir)?;
+    let dir = fresh_dir("miss_nearest")?;
     let (ok, _stdout, stderr) = run_in(&dir, &["doc", "qqqqzzzzxxxx"]);
     assert!(!ok);
     let suggested = stderr.matches("ipe doc ").count();
@@ -661,8 +659,7 @@ fn every_miss_suggests_something_and_bare_names_find_members() -> io::Result<()>
 /// stderr, nothing on stdout, never the human frame.
 #[test]
 fn a_miss_under_json_is_the_machine_error_envelope() -> io::Result<()> {
-    let dir = fresh_dir("miss_json");
-    fs::create_dir_all(&dir)?;
+    let dir = fresh_dir("miss_json")?;
     let (ok, stdout, stderr) = run_in(&dir, &["doc", "qqqqzzzzxxxx", "--json"]);
     assert!(!ok);
     assert!(stdout.is_empty(), "{stdout}");
@@ -679,8 +676,7 @@ fn a_miss_under_json_is_the_machine_error_envelope() -> io::Result<()> {
 /// run ends at once with the entries listed, each as the command that opens it.
 #[test]
 fn a_piped_miss_lists_numbered_entries_without_prompting() -> io::Result<()> {
-    let dir = fresh_dir("miss_numbered");
-    fs::create_dir_all(&dir)?;
+    let dir = fresh_dir("miss_numbered")?;
     let (ok, stdout, stderr) = run_in(&dir, &["doc", "unixMilis"]);
     assert!(!ok, "a miss exits non-zero");
     assert!(stdout.is_empty(), "{stdout}");
@@ -699,8 +695,7 @@ fn a_piped_miss_lists_numbered_entries_without_prompting() -> io::Result<()> {
 /// entry on stderr, and the first field passed back to `ipe doc` opens it.
 #[test]
 fn a_plain_miss_lists_terms_that_rerun() -> io::Result<()> {
-    let dir = fresh_dir("miss_plain");
-    fs::create_dir_all(&dir)?;
+    let dir = fresh_dir("miss_plain")?;
     let (ok, stdout, stderr) = run_in(&dir, &["doc", "unixMilis", "--plain"]);
     assert!(!ok, "a miss exits non-zero");
     assert!(stdout.is_empty(), "{stdout}");
@@ -734,8 +729,7 @@ fn a_plain_miss_lists_terms_that_rerun() -> io::Result<()> {
 /// payload: `query`, `closeness`, `truncated`, and `results` in order.
 #[test]
 fn a_json_miss_carries_the_ranked_terms() -> io::Result<()> {
-    let dir = fresh_dir("miss_json_results");
-    fs::create_dir_all(&dir)?;
+    let dir = fresh_dir("miss_json_results")?;
     let (ok, stdout, stderr) = run_in(&dir, &["doc", "unixMilis", "--json"]);
     assert!(!ok);
     assert!(stdout.is_empty(), "{stdout}");
@@ -774,8 +768,7 @@ fn a_json_miss_carries_the_ranked_terms() -> io::Result<()> {
 /// A `kind:key` term opens that entry directly, never a generate run.
 #[test]
 fn a_qualified_term_opens_its_entry() -> io::Result<()> {
-    let dir = fresh_dir("qualified_term");
-    fs::create_dir_all(&dir)?;
+    let dir = fresh_dir("qualified_term")?;
     let (ok, stdout, stderr) = run_in(&dir, &["doc", "construct:case", "--plain"]);
     assert!(ok, "`construct:case` must open:\n{stdout}\n{stderr}");
     assert!(!stdout.is_empty(), "the entry is printed:\n{stderr}");
@@ -786,8 +779,7 @@ fn a_qualified_term_opens_its_entry() -> io::Result<()> {
 /// error before any lookup runs.
 #[test]
 fn a_blank_term_is_refused() -> io::Result<()> {
-    let dir = fresh_dir("blank_term");
-    fs::create_dir_all(&dir)?;
+    let dir = fresh_dir("blank_term")?;
     for term in ["", "   ", "topic:", "topic:   "] {
         let (ok, stdout, stderr) = run_in(&dir, &["doc", term]);
         assert!(!ok, "{term:?} must be refused");
@@ -807,7 +799,7 @@ fn a_blank_term_is_refused() -> io::Result<()> {
 /// short and full forms name two different, independently reachable entries.
 #[test]
 fn a_project_module_shadows_stdlib_by_short_name_only() -> io::Result<()> {
-    let dir = fresh_dir("shadow_list");
+    let dir = fresh_dir("shadow_list")?;
     let src = dir.join("src");
     fs::create_dir_all(&src)?;
     fs::write(
@@ -843,8 +835,7 @@ fn a_project_module_shadows_stdlib_by_short_name_only() -> io::Result<()> {
 /// module".
 #[test]
 fn an_unknown_module_key_misses_with_a_suggestion() -> io::Result<()> {
-    let dir = fresh_dir("unknown_module");
-    fs::create_dir_all(&dir)?;
+    let dir = fresh_dir("unknown_module")?;
     for key in ["NotAModule", "Ipe.Nope"] {
         let (ok, stdout, stderr) = run_in(&dir, &["doc", key]);
         assert!(!ok, "`ipe doc {key}` must miss:\n{stdout}\n{stderr}");
@@ -905,8 +896,7 @@ fn help_doc_examples_all_resolve() -> io::Result<()> {
         extract_backtick_example(&help)?,
     ];
 
-    let dir = fresh_dir("help_examples");
-    fs::create_dir_all(&dir)?;
+    let dir = fresh_dir("help_examples")?;
     for key in &examples {
         let (ok, stdout, stderr) = run_in(&dir, &["doc", key]);
         assert!(
@@ -926,8 +916,7 @@ fn help_doc_examples_all_resolve() -> io::Result<()> {
 /// listing).
 #[test]
 fn doc_basics_to_float_member_page_renders_int_to_float() -> io::Result<()> {
-    let dir = fresh_dir("basics_to_float_member");
-    fs::create_dir_all(&dir)?;
+    let dir = fresh_dir("basics_to_float_member")?;
 
     let (ok, stdout, stderr) = run_in(&dir, &["doc", "Basics.toFloat", "--plain"]);
     assert!(
@@ -960,8 +949,7 @@ fn doc_basics_to_float_member_page_renders_int_to_float() -> io::Result<()> {
 /// entry, and this test would go red.
 #[test]
 fn doc_bare_to_float_lists_every_home() -> io::Result<()> {
-    let dir = fresh_dir("bare_to_float");
-    fs::create_dir_all(&dir)?;
+    let dir = fresh_dir("bare_to_float")?;
     let (ok, stdout, stderr) = run_in(&dir, &["doc", "toFloat", "--plain"]);
     assert!(!ok, "a bare `toFloat` must not resolve to a single home");
     assert!(stdout.is_empty(), "{stdout}");
@@ -985,8 +973,7 @@ fn doc_bare_to_float_lists_every_home() -> io::Result<()> {
 /// Decimal stays the exact-arithmetic route, not the conversion route.
 #[test]
 fn doc_math_header_names_to_float() -> io::Result<()> {
-    let dir = fresh_dir("math_header_to_float");
-    fs::create_dir_all(&dir)?;
+    let dir = fresh_dir("math_header_to_float")?;
     let (ok, stdout, stderr) = run_in(&dir, &["doc", "Math"]);
     assert!(ok, "`ipe doc Math` must resolve:\n{stdout}\n{stderr}");
     assert!(

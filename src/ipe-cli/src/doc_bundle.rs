@@ -1813,9 +1813,9 @@ mod tests {
         }
     }
 
-    /// Each embedded corpus file count must match what the directory contains.
-    /// This pins the expectation so adding a file without updating the embed
-    /// path produces a clear failure at test time rather than a silent runtime gap.
+    /// Each kind's entry count must equal its embedded directory's slug files
+    /// plus its [`EMBEDDED_ASSETS`] rows, so a file the embed path drops, or
+    /// an entry no declared source names, fails here rather than at runtime.
     #[test]
     fn embedded_corpus_file_counts_match_embedded_dirs() {
         // Count valid-slug `.md` entries in each embedded Dir.
@@ -1837,11 +1837,17 @@ mod tests {
             .expect("bundle builds from embedded corpus");
 
         for ((_, kind), dir) in OVERLAY_KINDS.iter().zip(EMBEDDED_PAGES) {
-            let expected = slug_count(dir);
+            let slugs = slug_count(dir);
+            let assets = EMBEDDED_ASSETS
+                .iter()
+                .filter(|(asset_kind, ..)| asset_kind == kind)
+                .count();
+            let expected = slugs + assets;
             let actual = bundle.entries_for_kind(*kind).count();
             assert_eq!(
                 actual, expected,
-                "{kind}: bundle has {actual} entries but embedded dir has {expected} slug files"
+                "{kind}: bundle has {actual} entries but embedded dir has {slugs} slug files \
+                 plus {assets} embedded assets"
             );
         }
     }

@@ -996,7 +996,7 @@ fn hand_edited_guides() -> Vec<(String, &'static str)> {
     let (stamp, body) = stamped.split_once('\n').expect("a stamped guide");
     vec![
         (format!("{stamp}\n{body}edit\n"), "edited by hand"),
-        (body.to_owned(), "no ipe stamp"),
+        (format!("{body}edit\n"), "no ipe stamp"),
         (
             format!("<!-- ipe-guide:2 whatever -->\n{body}"),
             "unrecognised stamp",
@@ -1023,6 +1023,27 @@ fn agents_hand_edited_refused_without_terminal() {
             !dir.join(".ipe-backup").exists(),
             "{phrase}: nothing backed up"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// The guide's bytes with no stamp are the current guide in every output
+/// mode: nothing asked, nothing written, exit 0.
+#[test]
+fn agents_unstamped_asset_is_current() {
+    for format in [None, Some("--plain"), Some("--json")] {
+        let dir = guide_project("unstamped_asset");
+        fs::write(dir.join("AGENTS.md"), ipe::agents_guide::ASSET).expect("plant the guide");
+        let mut args = vec!["upgrade", "--agents"];
+        args.extend(format);
+        let r = run_piped(&dir, &args, "y\n");
+        assert!(r.ok, "{format:?}: current; stderr: {}", r.stderr);
+        assert!(!r.stdout.contains("Back it up"), "{format:?}: {}", r.stdout);
+        assert_eq!(
+            fs::read_to_string(dir.join("AGENTS.md")).ok().as_deref(),
+            Some(ipe::agents_guide::ASSET)
+        );
+        assert!(!dir.join(".ipe-backup").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }
