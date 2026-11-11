@@ -1502,12 +1502,15 @@ jobs:
         timeout-minutes: 20
         run: |
           mkdir -p "$RUNNER_TEMP/apt-archives/partial"
+          # Each attempt first completes any install the previous attempt's cap
+          # interrupted mid-unpack; otherwise dpkg refuses the retry outright.
           for attempt in 1 2; do
-            if sudo timeout 360 apt-get -o Acquire::Retries=3 update \
+            if sudo timeout 360 dpkg --configure -a \
+              && sudo timeout 360 apt-get -o Acquire::Retries=3 update \
               && sudo timeout 360 apt-get -o Acquire::Retries=3 -o Dir::Cache::archives="$RUNNER_TEMP/apt-archives" install -y --no-install-recommends libwebkit2gtk-4.1-dev libsoup-3.0-dev; then
               exit 0
             fi
-            echo "apt attempt $attempt did not finish within its 6 minute cap"
+            echo "apt attempt $attempt failed or did not finish within its 6 minute cap"
             sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' /etc/apt/apt-mirrors.txt
           done
           exit 1
