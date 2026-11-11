@@ -14,8 +14,18 @@
 //!
 //! Every sum and product is checked. `None` is the overflow refusal: a caller
 //! budgeting memory treats it as over every budget.
+//!
+//! The walk is bounded in depth as well as in count. Every measure that
+//! descends into a part does so through [`Bytes::plus`], which holds one level
+//! of [`MEASURE_DEPTH`] for as long as the part is measured; a value nested
+//! deeper than the ceiling measures `None`, the same refusal as an overflow,
+//! before its nesting can exhaust the measuring thread's stack. Siblings are
+//! measured one after another, so a wide value spends one level, not one per
+//! item.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use crate::basics::IpeOrder;
@@ -95,19 +105,67 @@ impl Bytes {
         self.checked_add(Self::count(n)?)
     }
 
-    /// `self` plus the bytes `value` retains, or `None` on overflow.
+    /// `self` plus the bytes `value` retains, or `None` on overflow or past [`MEASURE_DEPTH`].
+    ///
+    /// The one place a measure descends into a part: `value` is measured one
+    /// level deeper than the caller, and the level is released when its measure
+    /// returns, whatever it answers.
     #[must_use]
     pub fn plus<T: RetainedBytes + ?Sized>(self, value: &T) -> Option<Self> {
+        let _level = Descent::enter()?;
         self.checked_add(value.retained_bytes()?)
     }
 
-    /// `self` plus the bytes every item retains, or `None` on overflow.
+    /// `self` plus the bytes every item retains, or `None` on overflow or past [`MEASURE_DEPTH`].
+    ///
+    /// Each item is measured through [`Bytes::plus`] in turn, so the items
+    /// share one level of depth.
     #[must_use]
     pub fn plus_all<'a, T: RetainedBytes + 'a>(
         self,
         items: impl IntoIterator<Item = &'a T>,
     ) -> Option<Self> {
         items.into_iter().try_fold(self, Self::plus)
+    }
+}
+
+/// The deepest nesting of parts a measure walks before it answers `None`.
+///
+/// A level is one [`Bytes::plus`] call live on the measuring thread's stack.
+/// Each level costs a few small frames, so the ceiling's stack stays well
+/// under the 2 MiB a tokio worker thread runs on.
+pub const MEASURE_DEPTH: NonZeroU32 = match NonZeroU32::new(4096) {
+    Some(n) => n,
+    None => NonZeroU32::MIN,
+};
+
+thread_local! {
+    /// The levels of [`MEASURE_DEPTH`] the measures running on this thread hold.
+    static DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// One level of [`MEASURE_DEPTH`], held while one part is measured.
+///
+/// Released on drop, so the thread's count returns to where it was however the
+/// part's measure ends, refusal or unwind included.
+struct Descent(());
+
+impl Descent {
+    /// Take one more level, or `None` when the thread already holds [`MEASURE_DEPTH`].
+    fn enter() -> Option<Self> {
+        DEPTH.with(|depth| {
+            let held = depth.get();
+            (held < MEASURE_DEPTH.get()).then(|| {
+                depth.set(held.saturating_add(1));
+                Self(())
+            })
+        })
+    }
+}
+
+impl Drop for Descent {
+    fn drop(&mut self) {
+        DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
     }
 }
 
@@ -423,6 +481,7 @@ impl RetainedBytes for IpeError {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+    use super::depth_fixture::{Link, chain};
     use super::*;
 
     /// A value whose measure is the largest count, so any sum with it overflows.
@@ -583,5 +642,192 @@ mod tests {
     fn a_mebibyte_is_two_to_the_twentieth() {
         assert_eq!(Bytes::mib(1).get(), 1 << 20);
         assert_eq!(Bytes::mib(u16::MAX).get(), u64::from(u16::MAX) << 20);
+    }
+
+    /// The levels of [`MEASURE_DEPTH`] this thread holds.
+    fn held_depth() -> u32 {
+        DEPTH.with(Cell::get)
+    }
+
+    /// A chain measured through the generic `Option` and `Box` impls, as an emitted recursive type is.
+    struct Boxed {
+        next: Option<Box<Self>>,
+    }
+
+    impl Drop for Boxed {
+        // Unlinked one link at a time, so a deep chain drops without recursion.
+        fn drop(&mut self) {
+            let mut next = self.next.take();
+            while let Some(mut link) = next {
+                next = link.next.take();
+            }
+        }
+    }
+
+    impl RetainedBytes for Boxed {
+        fn retained_bytes(&self) -> Option<Bytes> {
+            Bytes::inline::<Self>()?.plus(&self.next)
+        }
+    }
+
+    /// A `Boxed` chain of `links` links, which `Bytes::plus` measures three levels a link.
+    fn boxed(links: u32) -> Boxed {
+        let mut head = Boxed { next: None };
+        for _ in 1..links {
+            head = Boxed {
+                next: Some(Box::new(head)),
+            };
+        }
+        head
+    }
+
+    // Refusal: one level past the ceiling measures `None`; the ceiling itself
+    // measures.
+    #[test]
+    fn a_value_nested_past_the_depth_ceiling_measures_none() {
+        let at = MEASURE_DEPTH.get();
+        assert!(Bytes::ZERO.plus(&chain(at)).is_some());
+        assert_eq!(Bytes::ZERO.plus(&chain(at + 1)), None);
+        // A root measure holds no level for the root itself.
+        assert!(chain(at + 1).retained_bytes().is_some());
+        assert_eq!(chain(at + 2).retained_bytes(), None);
+        // A container spends a level of its own, and a too-deep part refuses
+        // the whole container.
+        assert!(Bytes::ZERO.plus(&vec![chain(at - 1)]).is_some());
+        assert_eq!(Bytes::ZERO.plus(&vec![chain(at)]), None);
+        assert_eq!(Bytes::ZERO.plus(&(1_u8, Some(chain(at - 1)))), None);
+    }
+
+    // Siblings share one level: a wide, shallow value never reads as deep.
+    #[test]
+    fn siblings_spend_one_level_not_one_each() {
+        let at = MEASURE_DEPTH.get();
+        let siblings: Vec<Link> = (0..3).map(|_| chain(at - 1)).collect();
+        assert!(Bytes::ZERO.plus(&siblings).is_some());
+        let wide: Vec<Link> = (0..100_000).map(|_| chain(1)).collect();
+        assert!(wide.retained_bytes().is_some());
+        let dict: HashMap<u32, Vec<String>> =
+            (0..10_000).map(|k| (k, vec![k.to_string()])).collect();
+        assert!(dict.retained_bytes().is_some());
+    }
+
+    // A refused measure releases every level it took, so the thread's next
+    // measure starts from the top and answers the same.
+    #[test]
+    fn a_refused_measure_leaves_no_level_held() {
+        let at = MEASURE_DEPTH.get();
+        let deep = chain(at + 1);
+        let fits = chain(at);
+        assert_eq!(held_depth(), 0);
+        assert_eq!(Bytes::ZERO.plus(&deep), None);
+        assert_eq!(held_depth(), 0);
+        assert_eq!(Bytes::ZERO.plus(&deep), None);
+        let first = Bytes::ZERO.plus(&fits);
+        assert!(first.is_some());
+        assert_eq!(held_depth(), 0);
+        assert_eq!(Bytes::ZERO.plus(&deep), None);
+        assert_eq!(Bytes::ZERO.plus(&fits), first);
+        assert_eq!(held_depth(), 0);
+    }
+
+    // The ceiling's stack fits the 2 MiB a tokio worker runs on, through the
+    // generic impls an emitted recursive type measures with, and a chain far
+    // past it is refused on that stack rather than overflowing it.
+    #[test]
+    #[allow(clippy::expect_used)] // test: a failed spawn or a crashed measuring thread is the failure
+    fn the_depth_ceiling_fits_a_worker_thread_stack() {
+        let measured = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let at = MEASURE_DEPTH.get();
+                let links = at / 3;
+                (
+                    Bytes::ZERO.plus(&boxed(links)).is_some(),
+                    Bytes::ZERO.plus(&boxed(links + 1)),
+                    Bytes::ZERO.plus(&chain(at)).is_some(),
+                    Bytes::ZERO.plus(&chain(1_000_000)),
+                )
+            })
+            .expect("a measuring thread spawns")
+            .join()
+            .expect("the measuring thread returns");
+        assert_eq!(measured, (true, None, true, None));
+    }
+
+    // The choke point is the only descent: no measure in this file reaches a
+    // part's `retained_bytes` except through `Bytes::plus`, so every recursion
+    // holds a level of the ceiling.
+    #[test]
+    fn plus_is_the_only_descent_in_this_file() {
+        let source = include_str!("retained.rs");
+        let production = source
+            .split("#[cfg(all(test, not(target_arch = \"wasm32\")))]")
+            .next()
+            .unwrap_or_default();
+        assert!(production.contains("pub fn plus<"));
+        let code: Vec<&str> = production
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .collect();
+        let descents: Vec<&str> = code
+            .iter()
+            .copied()
+            .filter(|line| line.contains("retained_bytes()"))
+            .collect();
+        assert_eq!(
+            descents,
+            vec!["self.checked_add(value.retained_bytes()?)"],
+            "only `Bytes::plus` measures a part"
+        );
+        assert!(
+            !code
+                .iter()
+                .any(|line| line.contains("::retained_bytes") || line.contains("retained_bytes)")),
+            "no measure is passed or called by path around `Bytes::plus`"
+        );
+    }
+}
+
+/// A chain value whose nesting depth a test picks, measured one level a link.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) mod depth_fixture {
+    use super::{Bytes, RetainedBytes};
+
+    /// One link of a chain; dropping it unlinks the rest iteratively.
+    #[derive(Clone)]
+    pub(crate) struct Link {
+        next: Option<Box<Self>>,
+    }
+
+    impl Drop for Link {
+        // Unlinked one link at a time, so a deep chain drops without recursion.
+        fn drop(&mut self) {
+            let mut next = self.next.take();
+            while let Some(mut link) = next {
+                next = link.next.take();
+            }
+        }
+    }
+
+    impl RetainedBytes for Link {
+        fn retained_bytes(&self) -> Option<Bytes> {
+            let inline = Bytes::inline::<Self>()?;
+            match &self.next {
+                Some(next) => inline.plus(&**next),
+                None => Some(inline),
+            }
+        }
+    }
+
+    /// A chain of `links` links (at least one), which `Bytes::plus` measures `links` levels deep.
+    pub(crate) fn chain(links: u32) -> Link {
+        let mut head = Link { next: None };
+        for _ in 1..links {
+            head = Link {
+                next: Some(Box::new(head)),
+            };
+        }
+        head
     }
 }
