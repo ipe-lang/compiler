@@ -1126,3 +1126,23 @@ fn app_crate_feature_gate_is_refused() {
         "the dependency-model app crate declares no `db` feature"
     );
 }
+
+/// The db-backed Auth wrappers are emitted exactly when the program uses both
+/// Auth and Db; Auth alone emits only the Db-free wrappers.
+#[test]
+fn auth_wrappers_follow_auth_and_db() {
+    let text = |auth, db| super::auth_wrapper_texts(auth, db).concat();
+    let db_backed = ["fn auth_register(", "fn auth_login(", "fn auth_set_role("];
+    assert!(text(false, true).is_empty());
+    assert!(text(false, false).is_empty());
+    let auth_only = text(true, false);
+    assert!(auth_only.contains("fn auth_hash_password("));
+    for name in db_backed {
+        assert!(!auth_only.contains(name), "{name} emitted without Db");
+    }
+    let auth_db = text(true, true);
+    assert!(auth_db.contains("fn auth_hash_password("));
+    for name in db_backed {
+        assert!(auth_db.contains(name), "{name} missing with Auth and Db");
+    }
+}

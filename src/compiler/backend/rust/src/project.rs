@@ -1434,6 +1434,19 @@ pub fn auth_set_role(conn: Db, user_id: i64, role: String) -> IpeTask<()> {\n   
 }\n\
 ";
 
+const AUTH_ONLY: &[&str] = &[AUTH_WRAPPERS];
+const AUTH_WITH_DB: &[&str] = &[AUTH_WRAPPERS, AUTH_DB_WRAPPERS];
+
+/// The Auth wrapper texts a program emits: none without Auth, the db-backed
+/// ones only when the program also uses Db.
+const fn auth_wrapper_texts(uses_auth: bool, uses_db: bool) -> &'static [&'static str] {
+    match (uses_auth, uses_db) {
+        (false, _) => &[],
+        (true, false) => AUTH_ONLY,
+        (true, true) => AUTH_WITH_DB,
+    }
+}
+
 /// The `ipe_runtime/config.rs` emitted for db-enabled programs targeting
 /// `SQLite` (the default driver). Replaces the no-op default stub with the `SQLite`
 /// type aliases + helper fns the `db.rs` module requires. Mirrors
@@ -1719,11 +1732,8 @@ fn prelude_section(ctx: &EmitCtx) -> DResult<String> {
         section.push(TEA_TYPE_ALIASES);
     }
     // Ipe.Auth kernels → concrete E = IpeError wrappers.
-    if ctx.uses_auth {
-        section.push(AUTH_WRAPPERS);
-        if ctx.uses_db {
-            section.push(AUTH_DB_WRAPPERS);
-        }
+    for wrappers in auth_wrapper_texts(ctx.uses_auth, ctx.uses_db) {
+        section.push(wrappers);
     }
     Ok(section.render())
 }
