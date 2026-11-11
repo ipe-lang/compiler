@@ -79,9 +79,9 @@ jobs:
       # capability-bearing run is refused (IPE-F4413), which the gated
       # `ipe dev run --static` e2e exercises.
       - name: Install musl C toolchain and jail primitives
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools bubblewrap util-linux
+        uses: ./.github/actions/apt-install
+        with:
+          packages: musl-tools bubblewrap util-linux
 
       - name: Restore cargo target
         id: cargo-cache
@@ -203,9 +203,9 @@ jobs:
       # musl-tools provides musl-libc headers; qemu-user-static enables
       # transparent execution of aarch64 binaries on x86_64.
       - name: Install aarch64 musl C toolchain + QEMU
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools qemu-user-static
+        uses: ./.github/actions/apt-install
+        with:
+          packages: gcc-aarch64-linux-gnu musl-tools qemu-user-static
 
       - name: Restore cargo target
         id: cargo-cache

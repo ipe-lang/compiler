@@ -471,14 +471,15 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       run nothing else.  Each pinned step is compared key for key both ways,
       typed (`1` is not `true`, nor `'1'`), a `name` that is a literal string
       the one key set aside; the shared loader refuses a plain scalar YAML
-      1.1 and 1.2 read differently (`yes`, `0x2`, `010`).  Both local
-      actions the shared step runs, it and `rust-toolchain-pinned`, are
-      pinned the same way: their inputs (descriptions aside) and their steps
-      (names aside) are exactly the toolchain channel read from
-      `rust-toolchain.toml`, the commit-pinned `dtolnay/rust-toolchain`,
-      `rustc --version`, the commit-pinned `Swatinem/rust-cache`, and the
-      musl install on a musl target; nothing else runs before a cargo
-      command.  The job keys are only `name`, `needs`, `if`,
+      1.1 and 1.2 read differently (`yes`, `0x2`, `010`).  Every local
+      action the shared step runs, it, `rust-toolchain-pinned` and
+      `apt-install`, is pinned the same way: their inputs (descriptions
+      aside) and their steps (names aside) are exactly the toolchain channel
+      read from `rust-toolchain.toml`, the commit-pinned
+      `dtolnay/rust-toolchain`, `rustc --version`, the commit-pinned
+      `Swatinem/rust-cache`, and `apt-install` of `musl-tools` on a musl
+      target, its one `run` text pinned line for line; nothing else runs
+      before a cargo command.  The job keys are only `name`, `needs`, `if`,
       `timeout-minutes`, `strategy` (native jobs only, a boolean `fail-fast`
       and an `include` list) and `steps`, `runs-on` exactly `${{ matrix.os
       }}` or `ubuntu-latest`; the workflow keys are only `name`, `run-name`,
@@ -573,6 +574,15 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       row is a cross-target leg whose test sets check 25 holds.  A line
       naming `clippy` that `shlex` cannot split is refused.  LIMIT: a cargo
       reached through a variable or script is not read.
+  27. Every apt package install runs `.github/actions/apt-install`, the one
+      install that completes an interrupted dpkg, retries with a per-command
+      time cap and falls back from the Azure Ubuntu mirror: no `run:` of a
+      workflow (`.yml` or `.yaml`) or of another local composite action
+      names an apt front end (`apt`, `apt-get`, `aptitude`, bare or under a
+      path) as a word, as written or quote-removed (`ap""t-get`), in any
+      position (a comment line included).  A file it cannot read is
+      refused.  LIMIT: an apt reached through a variable, a script or a
+      third-party action is not read.
   LIMIT (checks 15, 16, 20, 22): a cargo line is read as run, not proven
   to reach its step's exit status — `cargo .. || true`, an `exit 0` before
   it, `set +e`, `if ! cargo ..` or a pipeline without `pipefail` are not
@@ -7863,6 +7873,8 @@ _TOOLCHAIN_ACTION = "./.github/actions/rust-toolchain-pinned"
 # The one step both native jobs run between their checkout and their cargo
 # command: the toolchain, the dependency cache and the musl tools.
 RELEASE_TARGET_ACTION = "./.github/actions/release-target-toolchain"
+# The one action every CI apt package install runs (check 27).
+APT_INSTALL_ACTION = "./.github/actions/apt-install"
 _RELEASE_EXPECTED = re.compile(r'expected="([^"]*)"')
 # The feature release binaries ship: `ipe dev run --target wasi` needs it, and
 # its refusal text promises it "in release packaging".
@@ -7938,7 +7950,53 @@ _TOOLCHAIN_CHANNEL_RUN = (
     'echo "Pinned toolchain channel: ${channel}"',
     'echo "channel=${channel}" >> "$GITHUB_OUTPUT"',
 )
-_MUSL_INSTALL_RUN = ("sudo apt-get update && sudo apt-get install -y musl-tools",)
+# The body of `APT_INSTALL_ACTION`, which `RELEASE_TARGET_ACTION` runs on a
+# musl target: its `run` text line for line.
+_APT_INSTALL_RUN = (
+    'set -euo pipefail',
+    'read -r -a packages <<< "$APT_PACKAGES"',
+    'if [[ ${#packages[@]} -eq 0 ]]; then',
+    '  echo "::error::apt-install: no package named" >&2',
+    '  exit 1',
+    'fi',
+    'for package in "${packages[@]}"; do',
+    '  if [[ ! "$package" =~ ^[a-z0-9][a-z0-9.+:-]*$ ]]; then',
+    '    echo "::error::apt-install: \'${package}\' is not a Debian package name" >&2',
+    '    exit 1',
+    '  fi',
+    'done',
+    'install_flags=(-y)',
+    'case "$APT_NO_RECOMMENDS" in',
+    '  true) install_flags+=(--no-install-recommends) ;;',
+    '  false) ;;',
+    '  *)',
+    '    echo "::error::apt-install: no-install-recommends must be true or false" >&2',
+    '    exit 1',
+    '    ;;',
+    'esac',
+    'if [[ -n "$APT_ARCHIVES" ]]; then',
+    '  if [[ "$APT_ARCHIVES" != /* ]]; then',
+    '    echo "::error::apt-install: archives must be an absolute directory" >&2',
+    '    exit 1',
+    '  fi',
+    '  mkdir -p "$APT_ARCHIVES/partial"',
+    '  install_flags+=(-o "Dir::Cache::archives=$APT_ARCHIVES")',
+    'fi',
+    'for attempt in 1 2; do',
+    '  if sudo timeout 360 dpkg --configure -a \\',
+    '    && sudo timeout 360 apt-get -o Acquire::Retries=3 update \\',
+    '    && sudo timeout 360 apt-get -o Acquire::Retries=3 "${install_flags[@]}" install "${packages[@]}"; then',
+    '    exit 0',
+    '  fi',
+    '  echo "apt attempt $attempt failed or did not finish within its 6 minute cap"',
+    '  for list in /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do',
+    '    if [[ -f "$list" ]]; then',
+    '      sudo sed -i \'s|azure\\.archive\\.ubuntu\\.com|archive.ubuntu.com|g\' "$list"',
+    '    fi',
+    '  done',
+    'done',
+    'exit 1',
+)
 
 
 class _Pin:
@@ -8285,7 +8343,25 @@ _LOCAL_ACTION_PINS: dict[str, tuple[dict, list[dict]]] = {
         [
             {"uses": _TOOLCHAIN_ACTION, "with": {"targets": "${{ inputs.target }}"}},
             {"uses": _Pin(_RUST_CACHE_PIN_RE), "with": {"save-if": RUST_CACHE_SAVE_IF}},
-            {"if": "contains(inputs.target, 'musl')", "shell": _RELEASE_TARGET_SHELL, "run": _Lines(_MUSL_INSTALL_RUN)},
+            {"if": "contains(inputs.target, 'musl')", "uses": APT_INSTALL_ACTION, "with": {"packages": "musl-tools"}},
+        ],
+    ),
+    APT_INSTALL_ACTION: (
+        {
+            "packages": {"required": True},
+            "archives": {"required": False, "default": ""},
+            "no-install-recommends": {"required": False, "default": "false"},
+        },
+        [
+            {
+                "shell": _RELEASE_TARGET_SHELL,
+                "env": {
+                    "APT_PACKAGES": "${{ inputs.packages }}",
+                    "APT_ARCHIVES": "${{ inputs.archives }}",
+                    "APT_NO_RECOMMENDS": "${{ inputs.no-install-recommends }}",
+                },
+                "run": _Lines(_APT_INSTALL_RUN),
+            },
         ],
     ),
     _TOOLCHAIN_ACTION: (
@@ -8697,6 +8773,50 @@ def check_runtime_clippy_all_targets(wfs: WorkflowSet, entries: object, errors: 
                     errors.append(why)
 
 
+# Check 27: the one local action that runs apt, and the front-end words no
+# other `run:` may name (a path prefix allowed, `apt-cache`, `/etc/apt/` and
+# `apt-mirrors.txt` not words of it).
+APT_INSTALL_ACTION_FILE = "actions/apt-install/action.yml"
+_APT_FRONTEND_RE = re.compile(r"(?<![\w.-])(?:apt-get|aptitude|apt)(?![\w./-])")
+
+
+def _names_apt(text: str) -> bool:
+    """`text` names an apt front end as a word, as written or quote-removed."""
+    return any(_APT_FRONTEND_RE.search(t) for t in [text, *_quote_removed([text])])
+
+
+def check_apt_one_path(wfs: WorkflowSet, errors: list[str]) -> None:
+    """Check 27 (see the module docstring). Refuses, never skips, an action
+    file it cannot read; a workflow the load refused is absent from `wfs`,
+    its refusal on record."""
+    root = wfs.root
+    fix = f"install apt packages with `uses: {APT_INSTALL_ACTION}`"
+    sources: list[tuple[str, list[tuple[str, object]]]] = [
+        (os.path.join("workflows", wf.fname), [(f"job {wj.job_id!r}", wj.raw.get("steps")) for wj in wf.jobs])
+        for wf in wfs.workflows
+    ]
+    for path in _local_action_files(root):
+        name = os.path.relpath(path, root)
+        if name == APT_INSTALL_ACTION_FILE:
+            continue
+        try:
+            doc = _read_action(path)
+        except (OSError, yaml.YAMLError) as e:
+            errors.append(f"check 27: cannot read {path}: {e}")
+            continue
+        if not isinstance(doc, dict):
+            errors.append(f"check 27: {name} is not a mapping; refused")
+            continue
+        runs_ = doc.get("runs")
+        sources.append((name, [("composite steps", runs_.get("steps"))] if isinstance(runs_, dict) else []))
+    for name, groups in sources:
+        for what, steps in groups:
+            for n, st in enumerate(steps if isinstance(steps, list) else [], start=1):
+                run = st.get("run") if isinstance(st, dict) else None
+                if isinstance(run, str) and _names_apt(run):
+                    errors.append(f"check 27: {name} {what} step {n} runs apt outside the one apt action; {fix}")
+
+
 def read_manifest(path: str) -> object:
     """`check-manifest.yml` at `path`, parsed: the one manifest load. Raises
     `OSError`/`yaml.YAMLError` for the caller to refuse."""
@@ -8876,6 +8996,9 @@ def main() -> int:
 
     # ---- 26. every runtime clippy row lints every target ----
     check_runtime_clippy_all_targets(workflows, entries, errors)
+
+    # ---- 27. every apt package install runs the one apt action ----
+    check_apt_one_path(workflows, errors)
 
     # ---- 3. fail-closed dependency surfacing ----
     def surfaced_dispositions(job: Job) -> set[str]:
