@@ -149,7 +149,50 @@ impl Contract {
             Self::CredentialHelper => base.starts_with("git-credential-"),
         }
     }
+
+    /// Whether `option`, written without an argument, takes none from the
+    /// program `base` this contract admits, so the word after it, or the
+    /// operand the tool appends, stays an operand.
+    ///
+    /// Any other option may read the next word as its argument (`ssh -F`
+    /// reads the appended `-o` as a configuration file), so it is proven only
+    /// when a path follows it.
+    pub fn takes_no_argument(self, base: &str, option: &str) -> bool {
+        let options: &[&str] = match self {
+            Self::SshClient
+                if base.eq_ignore_ascii_case("ssh") || base.eq_ignore_ascii_case("ssh.exe") =>
+            {
+                OPENSSH_FLAGS
+            }
+            Self::SshClient => PLINK_FLAGS,
+            Self::Gpg if base == "gpg" || base == "gpgsm" => GPG_FLAGS,
+            Self::None | Self::Gpg | Self::CredentialHelper => &[],
+        };
+        options.contains(&option)
+    }
 }
+
+/// The options `OpenSSH`'s `ssh` takes without an argument (its `getopt` string).
+const OPENSSH_FLAGS: &[&str] = &[
+    "-4", "-6", "-A", "-a", "-C", "-f", "-G", "-g", "-K", "-k", "-M", "-N", "-n", "-q", "-s", "-T",
+    "-t", "-V", "-v", "-X", "-x", "-Y", "-y",
+];
+
+/// The one-letter options `plink` and `tortoiseplink` take without an argument.
+const PLINK_FLAGS: &[&str] = &[
+    "-1", "-2", "-4", "-6", "-A", "-a", "-C", "-N", "-T", "-t", "-V", "-v", "-X", "-x",
+];
+
+/// The options `gpg` and `gpgsm` take without an argument.
+const GPG_FLAGS: &[&str] = &[
+    "--batch",
+    "--no-tty",
+    "--quiet",
+    "--verbose",
+    "--yes",
+    "-q",
+    "-v",
+];
 
 /// How a tool composes a program name from a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1082,18 +1082,20 @@ const COMMAND_OPERATORS: [char; 8] = [';', '&', '|', '(', ')', '<', '>', '\n'];
 /// anywhere) whose program's last path component the contract names and
 /// whose every later word is an option or a path, judged already as one.
 fn operands_proven(line: &Line<'_>, appends: Appends, regime: Regime) -> Result<(), Unprovable> {
-    let (text, words) = match line {
-        Line::Shell(text) => (text, shell_words(text, regime)),
+    let (text, readings) = match line {
+        Line::Shell(text) => (text, shell_readings(text, regime)),
         // The prefix lands on the first word: an option there fails every contract.
         Line::Split {
             text,
             command_prefix,
         } => {
-            let mut words = shell_words(text, regime);
-            if let Some(first) = words.first_mut() {
-                first.insert_str(0, command_prefix);
+            let mut readings = shell_readings(text, regime);
+            for words in &mut readings {
+                if let Some(first) = words.first_mut() {
+                    first.insert_str(0, command_prefix);
+                }
             }
-            (text, words)
+            (text, readings)
         }
         Line::Exec(text) => {
             let program = text.trim_matches(is_c_space);
@@ -1102,7 +1104,7 @@ fn operands_proven(line: &Line<'_>, appends: Appends, regime: Regime) -> Result<
             } else {
                 vec![program.to_owned()]
             };
-            (text, words)
+            (text, vec![words])
         }
     };
     let contract = match appends {
@@ -1110,23 +1112,42 @@ fn operands_proven(line: &Line<'_>, appends: Appends, regime: Regime) -> Result<
         Appends::Substitutes(contract) if text.contains('%') => contract,
         Appends::Nothing | Appends::Ungranted | Appends::Substitutes(_) => return Ok(()),
     };
-    let Some((program, rest)) = words.split_first() else {
-        return Ok(());
-    };
-    let base = program
-        .rsplit(|c| is_separator(c, regime))
-        .next()
-        .unwrap_or(program);
     let proven = !text.contains(COMMAND_OPERATORS)
-        && contract.admits(base)
-        && rest
+        && readings
             .iter()
-            .all(|word| option_argument(word).is_some() || is_path_shaped(word, regime));
+            .all(|words| simple_command_proven(words, contract, regime));
     if proven {
         Ok(())
     } else {
         Err(Unprovable::GrantedOperand)
     }
+}
+
+/// Whether the simple command `words` keeps `contract`.
+///
+/// It does when it has no program word, or when the contract names its
+/// program and every later word is an option or a path. An option written
+/// without an argument that the program may still take one for reads the
+/// next word, or the operand the tool appends, as that argument, so it is
+/// proven only when a path follows it or the contract knows it takes none.
+fn simple_command_proven(words: &[String], contract: Contract, regime: Regime) -> bool {
+    let Some((program, rest)) = words.split_first() else {
+        return true;
+    };
+    let base = program
+        .rsplit(|c| is_separator(c, regime))
+        .next()
+        .unwrap_or(program);
+    let nexts = rest.iter().skip(1).map(Some).chain([None]);
+    contract.admits(base)
+        && rest.iter().zip(nexts).all(|(word, next)| {
+            if takes_next(word) {
+                contract.takes_no_argument(base, word)
+                    || next.is_some_and(|path| is_path_shaped(path, regime))
+            } else {
+                option_argument(word).is_some() || is_path_shaped(word, regime)
+            }
+        })
 }
 
 /// Git's `is_absolute_path` under `regime`: a leading separator, or under Windows an ASCII-letter drive prefix.
@@ -3219,7 +3240,8 @@ impl Words {
         Ok(())
     }
 
-    /// Push the shell words of `text` under `regime`, the first at `first` and the rest as arguments.
+    /// Push the shell words of `text` under `regime`, under every reading
+    /// ([`shell_readings`]), the first at `first` and the rest as arguments.
     ///
     /// A word whose leading `~` was quoted or escaped arrives as `./~...`
     /// ([`shell_words`]); one whose leading `~` was not is read as the shell
@@ -3231,15 +3253,23 @@ impl Words {
         tilde: Tilde,
         regime: Regime,
     ) -> Result<(), Unprovable> {
-        for (index, word) in shell_words(text, regime).into_iter().enumerate().rev() {
-            let position = if index == 0 {
-                first
-            } else {
-                Position::Argument
-            };
-            match tilde {
-                Tilde::Shell => self.push(word, position)?,
-                Tilde::Verbatim => self.push_forms(word, position)?,
+        for words in shell_readings(text, regime) {
+            let swallowed: Vec<bool> = std::iter::once(false)
+                .chain(words.iter().map(|word| takes_next(word)))
+                .collect();
+            for (index, word) in words.into_iter().enumerate().rev() {
+                let position = if index == 0 {
+                    first
+                } else {
+                    Position::Argument
+                };
+                if swallowed.get(index).copied().unwrap_or(true) && word.starts_with('-') {
+                    self.push(format!("./{word}"), Position::Argument)?;
+                }
+                match tilde {
+                    Tilde::Shell => self.push(word, position)?,
+                    Tilde::Verbatim => self.push_forms(word, position)?,
+                }
             }
         }
         Ok(())
@@ -3444,6 +3474,15 @@ fn option_argument(word: &str) -> Option<&str> {
     Some(rest.strip_prefix('=').unwrap_or(rest))
 }
 
+/// Whether `word` is an option written without an argument, which a program may read the next word as.
+///
+/// `-u -N` may hand `-N` to `-u` as a file name, and a trailing `-F` the
+/// operand the tool appends: the word after such an option is judged as the
+/// relative path it may name as well ([`Words::push_split`]).
+fn takes_next(word: &str) -> bool {
+    option_argument(word) == Some("") && !word.contains('=')
+}
+
 /// Whether `word` is shaped like a path: it holds a separator, starts with `~` or (under Windows) a drive, or is `.` or `..`.
 fn is_path_shaped(word: &str, regime: Regime) -> bool {
     word.contains(|c| is_separator(c, regime))
@@ -3453,7 +3492,33 @@ fn is_path_shaped(word: &str, regime: Regime) -> bool {
         || word == ".."
 }
 
-/// `value` split into shell words: quotes group, a backslash escapes, whitespace separates.
+/// Which backslashes a word splitter consumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Escapes {
+    /// A POSIX shell's: an unquoted backslash escapes any character, one
+    /// inside double quotes only `$`, `` ` ``, `"`, `\` and a newline and is
+    /// kept before any other, and a backslash-newline is removed.
+    Posix,
+    /// Git's `split_cmdline`: a backslash outside single quotes escapes any character.
+    Git,
+}
+
+/// Every word list a tool may split `value` into: the POSIX shell's, and Git's own where it differs.
+///
+/// A value is judged under both readings, so a word whose meaning hangs on
+/// which splitter runs it (`"\/x"`: the shell runs the relative `\/x`,
+/// Git the absolute `/x`) is judged as both.
+fn shell_readings(value: &str, regime: Regime) -> Vec<Vec<String>> {
+    let posix = shell_words(value, regime, Escapes::Posix);
+    let git = shell_words(value, regime, Escapes::Git);
+    if posix == git {
+        vec![posix]
+    } else {
+        vec![posix, git]
+    }
+}
+
+/// `value` split into shell words: quotes group, a backslash escapes as `escapes` reads it, whitespace separates.
 ///
 /// An unterminated quote ends the last word at the end of the value, so its
 /// text is still judged. The shell expands a leading `~` only when every
@@ -3462,7 +3527,7 @@ fn is_path_shaped(word: &str, regime: Regime) -> bool {
 /// (`'~/x'`, `"~/x"`, `\~/x`, `''~/x`), or whose prefix holds a quote or an
 /// escape (`~"/x"`, `~\/x`, `~''/x`), names the relative path `~/x`, so it
 /// comes back as `./~/x`.
-fn shell_words(value: &str, regime: Regime) -> Vec<String> {
+fn shell_words(value: &str, regime: Regime, escapes: Escapes) -> Vec<String> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut in_word = false;
@@ -3486,9 +3551,24 @@ fn shell_words(value: &str, regime: Regime) -> Vec<String> {
                 false
             }
             (Some('"') | None, '\\') => {
-                in_word = true;
-                if let Some(escaped) = chars.next() {
-                    word.push(escaped);
+                match (escapes, quote, chars.next()) {
+                    (Escapes::Posix, _, Some('\n')) => {}
+                    (Escapes::Posix, Some(_), Some(kept))
+                        if !matches!(kept, '$' | '`' | '"' | '\\') =>
+                    {
+                        in_word = true;
+                        word.push('\\');
+                        word.push(kept);
+                    }
+                    (Escapes::Posix | Escapes::Git, _, Some(literal)) => {
+                        in_word = true;
+                        word.push(literal);
+                    }
+                    (Escapes::Posix, _, None) => {
+                        in_word = true;
+                        word.push('\\');
+                    }
+                    (Escapes::Git, _, None) => in_word = true,
                 }
                 false
             }
@@ -5925,7 +6005,10 @@ mod tests {
                     );
                 }
             }
-            let admitted = format!("{runner}less -R -n --quit-if-one-screen --pattern {out}/x");
+            // An option-shaped word right after an option written without its
+            // argument may be that argument, a relative file: the options here
+            // each stand before a path or carry their argument.
+            let admitted = format!("{runner}less -R {out}/x -n {out}/y --pattern {out}/z");
             git_config(&f, &format!("{line} = {}\n", git_quoted(&admitted)));
             assert_eq!(scan_git(&f), Ok(()), "{line:?}");
         }
@@ -6959,12 +7042,26 @@ mod tests {
     #[test]
     fn ssh_command_non_ssh_refused() {
         let f = fixture("sshcontract");
-        assert_granted_operand(
-            git_text(&f),
-            &[
-                "[core]\n\tsshCommand = sh\n".to_owned(),
-                format!("[core]\n\tsshCommand = {}\n", git_quoted("ssh; sh")),
-            ],
+        assert_granted_operand(git_text(&f), &["[core]\n\tsshCommand = sh\n".to_owned()]);
+        // A second command fails the contract even when its words pass.
+        for text in ["ssh; sh", "ssh -C;ssh", "ssh <x/y", "ssh\nsh"] {
+            assert_eq!(
+                operands_proven(
+                    &Line::Shell(Cow::Borrowed(text)),
+                    Appends::Granted(Contract::SshClient),
+                    Regime::Unix
+                ),
+                Err(Unprovable::GrantedOperand),
+                "{text:?}"
+            );
+        }
+        assert_eq!(
+            operands_proven(
+                &Line::Shell(Cow::Borrowed("ssh -C")),
+                Appends::Granted(Contract::SshClient),
+                Regime::Unix
+            ),
+            Ok(())
         );
         assert_admitted(
             git_text(&f),
@@ -7061,6 +7158,71 @@ mod tests {
         let f = fixture("hgssh");
         assert_granted_operand(hg_text(&f), &owned(&["[ui]\nssh = sh\n"]));
         assert_admitted(hg_text(&f), &owned(&["[ui]\nssh = ssh -C\n"]));
+    }
+
+    #[test]
+    fn option_swallowing_the_appended_operand_refused() {
+        let f = fixture("swallow");
+        assert_granted_operand(
+            git_text(&f),
+            &owned(&[
+                "[core]\n\tsshCommand = ssh -F\n",
+                "[core]\n\tsshCommand = plink -P\n",
+            ]),
+        );
+        assert_granted_operand(hg_text(&f), &owned(&["[gpg]\ncmd = gpg --options\n"]));
+        assert_admitted(
+            git_text(&f),
+            &owned(&[
+                "[core]\n\tsshCommand = ssh -C\n",
+                "[core]\n\tsshCommand = ssh -F ~/cfg\n",
+                "[core]\n\tsshCommand = plink -v\n",
+            ]),
+        );
+        assert_admitted(hg_text(&f), &owned(&["[gpg]\ncmd = gpg --batch\n"]));
+    }
+
+    #[test]
+    fn option_argument_after_an_argless_option_judged_as_a_path() {
+        let f = fixture("optarg");
+        for text in [
+            "[core]\n\tpager = less -k -x\n",
+            "[alias]\n\tx = !vim -u -N\n",
+            "[core]\n\tsshCommand = ssh -F -C\n",
+        ] {
+            git_config(&f, text);
+            let result = scan_git(&f);
+            assert!(
+                in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+                "{text:?}: {result:?}"
+            );
+        }
+        for text in [
+            "[core]\n\tpager = less -R\n",
+            "[core]\n\tpager = less -k ~/keys\n",
+        ] {
+            git_config(&f, text);
+            assert_eq!(scan_git(&f), Ok(()), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn shell_backslash_read_as_the_shell_reads_it() {
+        let f = fixture("dqescape");
+        let tree = f.tree.display();
+        for value in ["\"\\/usr/bin/less\"".to_owned(), format!("{tree}\\\n/x")] {
+            git_config(&f, &format!("[core]\n\tpager = {}\n", git_quoted(&value)));
+            let result = scan_git(&f);
+            assert!(
+                in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+                "{value:?}: {result:?}"
+            );
+        }
+        git_config(
+            &f,
+            &format!("[core]\n\tpager = {}\n", git_quoted("\"/usr/bin/less\"")),
+        );
+        assert_eq!(scan_git(&f), Ok(()));
     }
 
     #[test]
@@ -7175,9 +7337,17 @@ mod tests {
                  [branch \"main\"]\n\tremote = o.x\n"
             ),
         );
+        // The helper the remote `o.x` names is fed the URL, which the grant decides.
         let result = scan_git(&f);
         assert!(
-            in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+            matches!(
+                &result,
+                Err(ConfigRefusal::NamesWritableCode {
+                    setting: ConfigSetting::Key { section, subsection: Some(name), key },
+                    named: Named::Unprovable(Unprovable::GrantedOperand),
+                    ..
+                }) if &**section == "remote" && &**name == "o.x" && &**key == "vcs"
+            ),
             "{result:?}"
         );
         git_config(&f, "[url.a \"/evil\"]\n\tinsteadOf = gh:\n");
