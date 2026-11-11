@@ -50,7 +50,7 @@ use ipe_diagnostics::{
 use ipe_intern::{Interner, Symbol};
 
 pub use constrain::{Builtins, KernelScheme, KernelSchemeTable, kernel_type_table};
-pub use doc::{VarNamer, canon_type_to_doc, letters, ty_to_doc};
+pub use doc::{VarLabel, VarNamer, canon_type_to_doc, letters, ty_to_doc};
 pub use homed::{HomedWarning, InferError, ModuleHome, ProgramDiag};
 pub use pairing::{ArgPairs, ConHead, EmittedHeads, HeadIdentity, TyPairs, paired_ty_children};
 pub use solve::{BUDGET_ENV, Budget, DEFAULT_SOLVER_BUDGET, SolverSteps, SolverStepsError};
@@ -1001,7 +1001,7 @@ fn infer_core(
             // Ordering / equality flexes carry no numeric default, so an unpinned
             // one is left generic (matching the reference compiler).
             Content::Super {
-                rigid: false,
+                rigid: None,
                 bounds,
             } if bounds.has_number() => {
                 let int_ty = Ty::Con {
@@ -1029,7 +1029,7 @@ fn infer_core(
             // An unpinned SQL-bind-parameter flex defaults to `SqlValue` — see
             // the doc comment above `sqlvalue_sym`.
             Content::Super {
-                rigid: false,
+                rigid: None,
                 bounds,
             } if bounds.has_sql_param() && !generic_roots.contains(&root) => {
                 let sqlvalue_ty = Ty::Con {
@@ -1057,7 +1057,7 @@ fn infer_core(
             // An unpinned interpolation flex defaults to `String` — see the
             // doc comment above `string_sym`.
             Content::Super {
-                rigid: false,
+                rigid: None,
                 bounds,
             } if bounds.has_interpolable() && !generic_roots.contains(&root) => {
                 let string_ty = Ty::Con {
@@ -1087,7 +1087,7 @@ fn infer_core(
             // `Super`, pins to a `Structure`, or adopts a skolem's rigidity as a
             // rigid `Super`), but those arms are covered for totality and need no
             // action either.
-            Content::Super { .. } | Content::Flex | Content::Rigid => {}
+            Content::Super { .. } | Content::Flex | Content::Rigid(_) => {}
             // The variable pinned to a concrete type during solving: checked
             // below, once every default has been applied.
             Content::Structure(_) => pinned.push((root, *orig_bounds, *span, home)),
@@ -1219,7 +1219,7 @@ fn infer_core(
                                     break;
                                 }
                             }
-                            Content::Structure(_) | Content::Rigid | Content::Super { .. } => {
+                            Content::Structure(_) | Content::Rigid(_) | Content::Super { .. } => {
                                 pinned = true;
                                 break;
                             }
@@ -1295,7 +1295,6 @@ fn infer_core(
                 bounds.entry(entry.key.clone()).or_default().insert(sym, b);
             }
         }
-        let rigid_names = poly_var_map.get(&entry.key);
         let mut pins = BTreeMap::new();
         // Solved root of each free (or row-record) parameter wildcard → its
         // 1-based parameter, so a second wildcard on that root is refused.
@@ -1310,12 +1309,7 @@ fn infer_core(
             let parameter = param.saturating_add(1);
             for (i, wildcard) in wildcards.by_ref().take(count) {
                 let fact = lift!(classify_param_wildcard(
-                    &mut uf,
-                    budget,
-                    interner,
-                    rigid_names,
-                    *wildcard,
-                    bare
+                    &mut uf, budget, interner, *wildcard, bare
                 ));
                 let dependence = match fact {
                     WildcardFact::Pinned(ty) => {
@@ -2017,7 +2011,7 @@ fn msg_slot_classes<'a>(
             };
             let rep = uf.find(var.var())?;
             match uf.content(rep)? {
-                Content::Rigid | Content::Super { .. } => anchored = true,
+                Content::Rigid(_) | Content::Super { .. } => anchored = true,
                 Content::Flex => {
                     if always_generic.contains(&rep) {
                         anchored = true;
@@ -2313,7 +2307,7 @@ fn solved_is_ground(
             continue;
         }
         match uf.root_content(root)? {
-            Content::Flex | Content::Rigid | Content::Super { .. } => return Ok(false),
+            Content::Flex | Content::Rigid(_) | Content::Super { .. } => return Ok(false),
             Content::Structure(FlatType::Unit | FlatType::EmptyRecord) => {}
             Content::Structure(FlatType::Fun(arg, result)) => {
                 work.push(*arg);
@@ -2347,27 +2341,34 @@ enum WildcardFact {
 
 /// Classify one parameter wildcard by its solved root.
 ///
-/// `rigid_names` maps the binding's solver-tagged signature-variable roots to
-/// their names;
-/// `bare` says whether the wildcard is the parameter's whole annotation.
+/// A root on a signature type variable is named by the annotation name its
+/// rigid carries; `bare` says whether the wildcard is the parameter's whole
+/// annotation.
 fn classify_param_wildcard(
     uf: &mut UnionFind<Content>,
     budget: &mut Budget,
     interner: &Interner,
-    rigid_names: Option<&BTreeMap<SolverVar, Symbol>>,
     wildcard: VarId,
     bare: bool,
 ) -> DResult<WildcardFact> {
     match uf.content(wildcard)? {
-        Content::Flex | Content::Super { rigid: false, .. } => Ok(WildcardFact::Free),
-        Content::Rigid | Content::Super { rigid: true, .. } => {
-            let root = uf.find(wildcard)?;
-            let name = rigid_names
-                .and_then(|names| names.get(&SolverVar::from_var(root)))
-                .and_then(|sym| interner.resolve(*sym))
-                .map(Box::from);
+        Content::Flex | Content::Super { rigid: None, .. } => Ok(WildcardFact::Free),
+        Content::Rigid(name)
+        | Content::Super {
+            rigid: Some(name), ..
+        } => {
+            let spelling =
+                interner
+                    .resolve(name.symbol())
+                    .ok_or_else(|| Diagnostic::CompilerBug {
+                        where_: "intern.resolve",
+                        detail: format!(
+                            "no backing string for annotation variable symbol {}",
+                            name.symbol().as_raw()
+                        ),
+                    })?;
             Ok(WildcardFact::Dependent(WildcardDependence::TypeVariable {
-                name,
+                name: Some(Box::from(spelling)),
             }))
         }
         Content::Structure(flat) => {
@@ -3314,11 +3315,11 @@ fn base_state(content: &Content) -> BaseState {
     match content {
         Content::Flex => BaseState::Flex,
         Content::Super {
-            rigid: false,
+            rigid: None,
             bounds,
         } if super_admits_record(*bounds) => BaseState::PinnableSuper,
         Content::Super { .. }
-        | Content::Rigid
+        | Content::Rigid(_)
         | Content::Structure(
             FlatType::Fun(_, _)
             | FlatType::Con { .. }
@@ -3386,7 +3387,7 @@ fn field_access_state(
         // a genuine "no field".
         content @ (Content::Flex
         | Content::Super { .. }
-        | Content::Rigid
+        | Content::Rigid(_)
         | Content::Structure(
             FlatType::Fun(_, _)
             | FlatType::Con { .. }
@@ -3636,7 +3637,7 @@ fn resolve_one_record_update(
         // non-record base is a genuine "no field".
         content @ (Content::Flex
         | Content::Super { .. }
-        | Content::Rigid
+        | Content::Rigid(_)
         | Content::Structure(
             FlatType::Fun(_, _)
             | FlatType::Con { .. }
@@ -5380,6 +5381,46 @@ mod tests {
             unmet,
             Some(None),
             "two concrete types disagreeing owe no class"
+        );
+    }
+
+    /// A body adding a literal to an annotation variable reads by the user's
+    /// spelling, never as a second minted `number1`.
+    #[test]
+    fn a_literal_added_to_an_annotation_variable_reads_by_its_spelling() {
+        let src = "module Main exposing (main)\n\
+                   f : x -> x\n\
+                   f v =\n    v + 1\n\
+                   main =\n    f 2\n";
+        let docs = class_mismatch_of(src).map(|(expected, found, _)| [expected, found]);
+        assert!(docs.is_some(), "the body must be refused as a mismatch");
+        let Some(docs) = docs else { return };
+        assert!(
+            docs.contains(&var_doc("x")),
+            "the annotation variable must read `x`, got {docs:?}"
+        );
+        assert!(
+            docs.contains(&var_doc("number")),
+            "the literal must read `number`, got {docs:?}"
+        );
+        assert!(
+            !docs.contains(&var_doc("number1")),
+            "no minted `number1` may stand for the annotation variable"
+        );
+    }
+
+    /// A body returning a concrete type where the signature promised an
+    /// annotation variable reads "expecting `x`, but `String`".
+    #[test]
+    fn a_concrete_body_for_an_annotation_variable_reads_by_its_spelling() {
+        let src = "module Main exposing (main)\n\
+                   f : x -> x\n\
+                   f v =\n    \"s\"\n\
+                   main =\n    f 2\n";
+        assert_eq!(
+            class_mismatch_of(src).map(|(expected, found, _)| (expected, found)),
+            Some((var_doc("x"), con_doc("String"))),
+            "the rigid must print the user's `x`, never a minted letter"
         );
     }
 
