@@ -152,11 +152,7 @@ fn collect_items(items: &[Item], out: &mut BTreeMap<String, Vec<Signature>>) {
 }
 
 /// Parses every `.rs` file under `dir` into `out`, refusing an unreadable or unparsable file.
-fn collect_dir(
-    dir: &Path,
-    depth: usize,
-    out: &mut BTreeMap<String, Vec<Signature>>,
-) -> Result<(), String> {
+fn collect_dir(dir: &Path, depth: usize, out: &mut Scan) -> Result<(), String> {
     if depth > MAX_DEPTH {
         return Err(format!("{}: deeper than {MAX_DEPTH} levels", dir.display()));
     }
@@ -173,17 +169,32 @@ fn collect_dir(
             let source =
                 std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
             let file = syn::parse_file(&source).map_err(|e| format!("{}: {e}", path.display()))?;
-            collect_items(&file.items, out);
+            collect_items(&file.items, &mut out.signatures);
+            out.sources.push(source);
         }
     }
     Ok(())
 }
 
-/// Every bare runtime `pub fn`, by name, with each `cfg` variant's signature.
-fn runtime_signatures() -> Result<BTreeMap<String, Vec<Signature>>, String> {
-    let mut out = BTreeMap::new();
+/// The runtime source as the scan read it.
+#[derive(Default)]
+struct Scan {
+    /// Every bare runtime `pub fn`, by name, with each `cfg` variant's signature.
+    signatures: BTreeMap<String, Vec<Signature>>,
+    /// The text of every runtime source file.
+    sources: Vec<String>,
+}
+
+/// Parses the whole runtime source tree.
+fn runtime_scan() -> Result<Scan, String> {
+    let mut out = Scan::default();
     collect_dir(&runtime_src_root(), 0, &mut out)?;
     Ok(out)
+}
+
+/// Every bare runtime `pub fn`, by name, with each `cfg` variant's signature.
+fn runtime_signatures() -> Result<BTreeMap<String, Vec<Signature>>, String> {
+    runtime_scan().map(|scan| scan.signatures)
 }
 
 /// The union of every row of `kernel`'s table.
@@ -211,11 +222,43 @@ fn ipe_index(order: ArgOrder, arity: usize, param: usize) -> Option<usize> {
     }
 }
 
+/// Kernels the type checker refuses at every reference (IPE-L0108), so no program reaches their runtime function.
+///
+/// `Web.appRouted` is unschemed until its lowering lands (the type checker's
+/// `REACHABLE_BUT_UNLOWERED` bucket pins it so); without a scheme shape it
+/// cannot carry a row. The exemption holds only while the kernel has no
+/// shape: once it gains one, the forward check reads it like every other
+/// kernel and its rows must be declared.
+const REFUSED_BEFORE_LOWERING: [StdlibKernel; 1] = [StdlibKernel::WebAppRouted];
+
+/// Whether the forward check passes over `kernel`: refused before lowering and still shapeless.
+fn refused_before_lowering(kernel: StdlibKernel) -> bool {
+    REFUSED_BEFORE_LOWERING.contains(&kernel) && kernel.scheme_shape().is_none()
+}
+
+#[test]
+fn every_refused_kernel_is_shapeless_and_rowless() {
+    for kernel in REFUSED_BEFORE_LOWERING {
+        assert!(
+            refused_before_lowering(kernel),
+            "{kernel:?} has a scheme shape"
+        );
+        assert!(
+            kernel.runtime_bounds().is_empty(),
+            "{kernel:?} declares a row"
+        );
+    }
+    assert!(!refused_before_lowering(StdlibKernel::WebApp));
+}
+
 #[test]
 fn every_runtime_bound_is_declared() {
     let scanned = runtime_signatures().expect("the runtime source must parse");
     let mut failures = Vec::new();
     for &kernel in StdlibKernel::ALL {
+        if refused_before_lowering(kernel) {
+            continue;
+        }
         let def = kernel.def();
         let Some(signatures) = scanned.get(def.runtime_fn) else {
             continue;
@@ -317,6 +360,52 @@ fn every_declared_bound_has_a_runtime_generic() {
         "a `StdlibKernel::runtime_bounds` row is stale:\n{}",
         failures.join("\n")
     );
+}
+
+/// A kernel whose runtime function the scan cannot read has no generic definition there.
+///
+/// The forward check passes over a kernel whose `runtime_fn` is no bare
+/// `pub fn` (a method, a function a macro body defines). Such a function
+/// spelled with type parameters anywhere in the runtime source carries bounds
+/// the scan never reads, so it is refused here.
+#[test]
+fn no_unscanned_runtime_fn_is_generic() {
+    let scan = runtime_scan().expect("the runtime source must parse");
+    let unread: Vec<&str> = StdlibKernel::ALL
+        .iter()
+        .map(|kernel| kernel.def().runtime_fn)
+        .filter(|name| !scan.signatures.contains_key(*name))
+        .filter(|name| {
+            scan.sources
+                .iter()
+                .any(|source| spells_generic_fn(source, name))
+        })
+        .collect();
+    assert!(
+        unread.is_empty(),
+        "a generic runtime function the bound scan cannot read: {unread:?}"
+    );
+}
+
+/// Whether `source` defines `fn name` with a type parameter or an `impl Trait` argument.
+///
+/// Reads the text from `fn name` to the body's opening brace, so a generic
+/// spelled as `fn name<T>` or as `fn name(x: impl Clone)` is found alike.
+fn spells_generic_fn(source: &str, name: &str) -> bool {
+    let needle = format!("fn {name}");
+    source.match_indices(&needle).any(|(at, _)| {
+        let rest = source.get(at.saturating_add(needle.len())..).unwrap_or("");
+        let header = rest.split('{').next().unwrap_or("");
+        header.starts_with('<') || (header.starts_with('(') && header.contains("impl "))
+    })
+}
+
+#[test]
+fn the_generic_spelling_check_reads_both_forms() {
+    assert!(spells_generic_fn("pub fn f<T: Clone>(x: T) {}", "f"));
+    assert!(spells_generic_fn("pub fn f(x: impl Clone) {}", "f"));
+    assert!(!spells_generic_fn("pub fn f(x: i64) {}", "f"));
+    assert!(!spells_generic_fn("pub fn fg<T>(x: T) {}", "f"));
 }
 
 /// The scan reads real signatures: `list_repeat` is found and its element generic copies.

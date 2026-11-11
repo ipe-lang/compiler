@@ -14120,10 +14120,12 @@ impl StdlibKernel {
     pub const fn runtime_bounds(self) -> &'static [(u8, RuntimeBounds)] {
         const C: RuntimeBounds = RuntimeBounds::CLONE;
         const EQ: RuntimeBounds = RuntimeBounds::PARTIAL_EQ;
+        const CLONE_EQ_SYNC: RuntimeBounds = RuntimeBounds::CLONE_EQ.with(RuntimeBounds::SYNC);
         match self {
             Self::ListFilter
             | Self::ListFind
             | Self::ListPartition
+            | Self::ListIntersperse
             | Self::ListRepeat
             | Self::ListSortBy
             | Self::ListSortWith
@@ -14183,6 +14185,7 @@ impl StdlibKernel {
             Self::InputCheckbox | Self::InputRadio | Self::InputRadioRow => {
                 &[(0, RuntimeBounds::CLONE_SYNC)]
             }
+            Self::WebApp | Self::WebEmbed => &[(0, CLONE_EQ_SYNC), (1, RuntimeBounds::CLONE_SYNC)],
             // Every other kernel's runtime function puts no row bound on a
             // scheme variable, or the kernel has no runtime function; the scan
             // in `tests/kernel_row/runtime_bounds.rs` pins every kernel, so a new

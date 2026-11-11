@@ -8,6 +8,12 @@
 //! `Color`) made `ipe` exit 0 and then `cargo build` fail on the missing trait
 //! bound. The gate converts that into a fail-closed `IPE-L0120` diagnostic.
 //!
+//! A Model holding a value the runtime cannot copy (`Cmd` / `Sub` / `Task`)
+//! is refused one stage earlier: the app kernel's `Clone` row on the Model
+//! variable fails lower's instance check with `IPE-L0164`. The Model gate
+//! still decides every copyable value outside its bound (`Decoder`, `Html`,
+//! `Secret`, a `CustomElement` handle), and those fixtures pin `IPE-L0120`.
+//!
 //! These tests are COMPILE-ONLY (they run the `ipe` pipeline + write the
 //! project, but never invoke `cargo`), so they are fast and NOT gated on
 //! `IPE_E2E`.
@@ -345,6 +351,53 @@ main =
         }
 ";
 
+const TUI_DECODER_MODEL: &str = r"module Main exposing (main)
+
+import Ipe.Tea.Tui as Tui
+import Ipe.Ui.Cells as Cells
+import Ipe.Ui.Cells exposing (Screen)
+import Ipe.Tea.Terminal.Cmd
+import Ipe.String
+import Ipe.Tea.Tui.Sub
+import Ipe.Config as Config exposing (Decoder)
+
+type Msg = Increment | NoOp
+
+type alias Model = { count : Int, parse : Decoder Int }
+
+init : () -> ( Model, Cmd Msg )
+init _unit =
+    ( { count = 0, parse = Config.succeed 0 }, Cmd.none )
+
+update : Msg -> Model -> ( Model, Cmd Msg )
+update msg model =
+    case msg of
+        Increment ->
+            ( { model | count = model.count + 1 }, Cmd.none )
+        NoOp ->
+            ( model, Cmd.none )
+
+view : Model -> Screen Msg
+view model =
+    Cells.column [] [ Cells.el [] (Cells.text (String.fromInt model.count)) ]
+
+subscriptions : Model -> Sub Msg
+subscriptions _model =
+    Sub.onKey onKey
+
+type alias KeyEvent = { kind : String, value : String }
+
+onKey : KeyEvent -> Msg
+onKey _event =
+    NoOp
+
+main =
+    Tui.tea
+        { init = init, update = update, view = view
+        , subscriptions = subscriptions
+        }
+";
+
 const TUI_CMD_MODEL: &str = r"module Main exposing (main)
 
 import Ipe.Tea.Tui as Tui
@@ -396,9 +449,10 @@ fn live_plain_data_model_is_accepted() -> Result<(), BoxError> {
     assert_accepted("live_good", LIVE_GOOD)
 }
 
+/// A `Cmd` in a Web Model fails the app kernel's `Clone` row before the Model gate.
 #[test]
 fn live_model_with_cmd_field_is_rejected() -> Result<(), BoxError> {
-    assert_rejected_with("live_cmd", LIVE_CMD_MODEL, "IPE-L0120")
+    assert_rejected_with("live_cmd", LIVE_CMD_MODEL, "IPE-L0164")
 }
 
 /// The CDPeq-but-not-serde case: `Html` is `Clone`/`PartialEq` but not `serde`,
@@ -439,9 +493,16 @@ fn tui_plain_data_model_is_accepted() -> Result<(), BoxError> {
     assert_accepted("tui_good", TUI_GOOD)
 }
 
+/// A `Cmd` in a Tui Model fails the app kernel's `Clone` row before the Model gate.
 #[test]
 fn tui_model_with_cmd_field_is_rejected() -> Result<(), BoxError> {
-    assert_rejected_with("tui_cmd", TUI_CMD_MODEL, "IPE-L0120")
+    assert_rejected_with("tui_cmd", TUI_CMD_MODEL, "IPE-L0164")
+}
+
+/// A `Decoder` copies but derives no `PartialEq`, so the Tui Model gate refuses it.
+#[test]
+fn tui_model_with_decoder_field_is_rejected() -> Result<(), BoxError> {
+    assert_rejected_with("tui_decoder", TUI_DECODER_MODEL, "IPE-L0120")
 }
 
 // ── lambda-`view` gate-bypass regressions ────────────────────────────────
@@ -455,9 +516,8 @@ fn tui_model_with_cmd_field_is_rejected() -> Result<(), BoxError> {
 // `view` with a bad Model, and does NOT false-reject a lambda `view` with a
 // plain Model.
 
-/// Model has a `Cmd` field AND `view` is an inline lambda. A `FuncValue`-only
-/// gate would skip this (ipe-0 then cargo-fail); the Lambda-aware gate rejects
-/// it with IPE-L0120.
+/// Model has a `Cmd` field AND `view` is an inline lambda; lower's instance check
+/// refuses it with IPE-L0164 whatever form `view` takes.
 const LIVE_LAMBDA_VIEW_CMD_MODEL: &str = r"module Main exposing (main)
 
 import Ipe.Tea.Web as Web
@@ -492,6 +552,44 @@ main =
         , routes = [], notFound = Tick
         }
 ";
+
+/// Model has an `Html` field (copyable, so lower's instance check passes it) AND
+/// `view` is an inline lambda. A `FuncValue`-only gate would skip this (ipe-0
+/// then cargo-fail); the Lambda-aware gate rejects it with IPE-L0120.
+const LIVE_LAMBDA_VIEW_HTML_MODEL: &str = r#"module Main exposing (main)
+
+import Ipe.Tea.Web as Web
+import Ipe.Ui as Ui
+import Ipe.Tea.Web.Cmd
+import Ipe.String
+import Ipe.Tea.Web.Sub
+
+type Msg = Tick
+
+type alias Model = { count : Int, cached : Html Msg }
+
+init : WebReq -> ( Model, Cmd Msg )
+init _req =
+    ( { count = 0, cached = Ui.layout [] (Ui.text "x") }, Cmd.none )
+
+update : Msg -> Model -> ( Model, Cmd Msg )
+update msg model =
+    case msg of
+        Tick ->
+            ( { model | count = model.count + 1 }, Cmd.none )
+
+subscriptions : Model -> Sub Msg
+subscriptions _model =
+    Sub.none
+
+main =
+    Web.tea
+        { init = init, update = update
+        , view = \model -> Ui.text (String.fromInt model.count)
+        , subscriptions = subscriptions
+        , routes = [], notFound = Tick
+        }
+"#;
 
 /// Non-regression control: plain-data Model + lambda `view` must be
 /// ACCEPTED — proves the Lambda arm recovers the Model without false-rejecting.
@@ -532,7 +630,12 @@ main =
 
 #[test]
 fn live_lambda_view_with_cmd_model_is_rejected() -> Result<(), BoxError> {
-    assert_rejected_with("live_lambda_cmd", LIVE_LAMBDA_VIEW_CMD_MODEL, "IPE-L0120")
+    assert_rejected_with("live_lambda_cmd", LIVE_LAMBDA_VIEW_CMD_MODEL, "IPE-L0164")
+}
+
+#[test]
+fn live_lambda_view_with_html_model_is_rejected() -> Result<(), BoxError> {
+    assert_rejected_with("live_lambda_html", LIVE_LAMBDA_VIEW_HTML_MODEL, "IPE-L0120")
 }
 
 #[test]
