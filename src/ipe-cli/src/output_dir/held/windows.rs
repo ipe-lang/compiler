@@ -259,6 +259,11 @@ pub fn create_new(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
     open_at(dir, name, &options)
 }
 
+/// Exclusively create the new file `name` in `dir` for writing; it inherits the directory's access list.
+pub fn create_private(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
+    create_new(dir, name)
+}
+
 /// Options opening the claim file to read, write, and lock, sharing every access and never following a reparse point.
 ///
 /// Delete sharing lets the holder unlink the name while another claimant
@@ -317,6 +322,14 @@ pub fn rename_noreplace(dir: &HeldDir, from: &EntryName, to: &EntryName) -> io::
         return Err(io::ErrorKind::AlreadyExists.into());
     }
     std::fs::rename(from_path, to_path)
+}
+
+/// Rename the regular file `from` to the absent name `to`, both in `dir`, refusing an entry at `to`.
+///
+/// The same proof and window as [`rename_noreplace`]: a hard link could not
+/// close it, since the staged name stays undeletable while its writer holds it open.
+pub fn rename_file_noreplace(dir: &HeldDir, from: &EntryName, to: &EntryName) -> io::Result<()> {
+    rename_noreplace(dir, from, to)
 }
 
 /// Swap the entries `a` and `b` of `dir` in one atomic step; Windows has none, so `Ok(false)`.

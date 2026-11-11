@@ -187,6 +187,12 @@ const ADMITTED: &[(&str, &str, usize, &str)] = &[
         1,
         "a `--publisher` value that is not a GitHub login",
     ),
+    (
+        "driver/commands_pkg.rs",
+        "parse_upgrade",
+        3,
+        "`--plain` with `--json`, or `--agents` with a flag of the binary upgrade",
+    ),
 ];
 
 /// Each `Usage` site that is neither command-line misuse nor project state, so
@@ -509,12 +515,6 @@ const UNROUTED: &[(&str, &str, usize, &str)] = &[
         "driver/commands_pkg.rs",
         "run_package",
         1,
-        "built in a file another lane owns; its route is decided there",
-    ),
-    (
-        "driver/commands_pkg.rs",
-        "run_upgrade",
-        2,
         "built in a file another lane owns; its route is decided there",
     ),
     (

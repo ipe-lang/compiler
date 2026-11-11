@@ -67,6 +67,17 @@ pub fn create_new(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
     Ok(File::from(fd))
 }
 
+/// Exclusively create the new file `name` in `dir` for writing, readable by its owner only.
+pub fn create_private(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
+    let fd = rustix::fs::openat(
+        dir.handle(),
+        name.as_os_str(),
+        new_file_flags(),
+        claim_mode(),
+    )?;
+    Ok(File::from(fd))
+}
+
 /// Exclusively create the claim file `name` in `dir`, open to read, write, and lock.
 pub fn create_claim(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
     let fd = rustix::fs::openat(
@@ -103,11 +114,43 @@ pub fn rename(dir: &HeldDir, from: &EntryName, to: &EntryName) -> io::Result<()>
 /// Rename the entry `from` to the absent name `to`, both in `dir`, never replacing an entry there.
 ///
 /// Linux refuses an existing `to` atomically (`RENAME_NOREPLACE`). Elsewhere,
-/// and on a Linux filesystem without the flag, the caller has proven `to`
-/// absent and a plain `renameat` follows: in that window an empty directory
-/// planted at `to` is replaced, and anything else there refuses the rename.
+/// and on a filesystem without the flag,
+/// the caller has proven `to` absent and a plain `renameat` follows: in that
+/// window an entry of `from`'s kind planted at `to` is replaced (a file over a
+/// file, a directory over an empty directory). A regular file is placed
+/// through [`rename_file_noreplace`], which closes that window wherever the
+/// filesystem has hard links.
 pub fn rename_noreplace(dir: &HeldDir, from: &EntryName, to: &EntryName) -> io::Result<()> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if renamed_exclusively(dir, from, to)? {
+        return Ok(());
+    }
+    rename(dir, from, to)
+}
+
+/// Rename the regular file `from` to the absent name `to`, both in `dir`, never replacing an entry there.
+///
+/// Where the rename cannot refuse an existing `to` itself, `from` is
+/// hard-linked at `to` (a link never replaces an entry) and then unlinked.
+/// Only on a filesystem with neither does the caller's absence proof stand
+/// alone, as for [`rename_noreplace`].
+pub fn rename_file_noreplace(dir: &HeldDir, from: &EntryName, to: &EntryName) -> io::Result<()> {
+    if renamed_exclusively(dir, from, to)? {
+        return Ok(());
+    }
+    if link_noreplace(dir, from, to)? {
+        // `to` holds the file now; a failed unlink leaves only a second name for it under the staged name.
+        let _ = unlink(dir, from);
+        return Ok(());
+    }
+    rename(dir, from, to)
+}
+
+/// Rename `from` to `to` through the system's own refusal of an existing `to`.
+///
+/// `Ok(false)` when the kernel or filesystem has no `RENAME_NOREPLACE`
+/// (`EINVAL`, `ENOSYS`), with nothing changed.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn renamed_exclusively(dir: &HeldDir, from: &EntryName, to: &EntryName) -> io::Result<bool> {
     match rustix::fs::renameat_with(
         dir.handle(),
         from.as_os_str(),
@@ -115,10 +158,53 @@ pub fn rename_noreplace(dir: &HeldDir, from: &EntryName, to: &EntryName) -> io::
         to.as_os_str(),
         rustix::fs::RenameFlags::NOREPLACE,
     ) {
-        Err(rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS) => {}
-        other => return other.map_err(io::Error::from),
+        Ok(()) => Ok(true),
+        Err(rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS) => Ok(false),
+        Err(errno) => Err(errno.into()),
     }
-    rename(dir, from, to)
+}
+
+/// Rename `from` to `to` through the system's own refusal of an existing `to`; none is reachable here, so `Ok(false)`.
+///
+/// The `rustix` this crate builds against exposes the exclusive rename on
+/// Linux kernels only, so every other Unix places a file through
+/// [`link_noreplace`].
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub const fn renamed_exclusively(
+    _dir: &HeldDir,
+    _from: &EntryName,
+    _to: &EntryName,
+) -> io::Result<bool> {
+    Ok(false)
+}
+
+/// Hard-link the regular file `from` at the absent name `to`, both in `dir`, never replacing an entry there.
+///
+/// `Ok(false)` when the filesystem gives the file no further link, with
+/// nothing changed; an entry at `to` is [`io::ErrorKind::AlreadyExists`].
+pub fn link_noreplace(dir: &HeldDir, from: &EntryName, to: &EntryName) -> io::Result<bool> {
+    match rustix::fs::linkat(
+        dir.handle(),
+        from.as_os_str(),
+        dir.handle(),
+        to.as_os_str(),
+        AtFlags::empty(),
+    ) {
+        Ok(()) => Ok(true),
+        Err(errno) if link_unsupported(errno) => Ok(false),
+        Err(errno) => Err(errno.into()),
+    }
+}
+
+/// Whether `errno` says the filesystem gives no further hard link, rather than refusing this one.
+fn link_unsupported(errno: rustix::io::Errno) -> bool {
+    [
+        rustix::io::Errno::PERM,
+        rustix::io::Errno::OPNOTSUPP,
+        rustix::io::Errno::MLINK,
+        rustix::io::Errno::NOTSUP,
+    ]
+    .contains(&errno)
 }
 
 /// Swap the entries `a` and `b` of `dir` in one atomic step.
