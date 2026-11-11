@@ -795,6 +795,9 @@ pub fn run_with_stdin_deadline(
     stdin_bytes: &[u8],
     deadline: std::time::Duration,
 ) -> TimedRunOutcome {
+    // The clock starts before the spawn, so the measured wall time bounds the
+    // child's whole lifetime from above.
+    let started = std::time::Instant::now();
     let child = Command::new(exe)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -809,7 +812,6 @@ pub fn run_with_stdin_deadline(
     let Ok(mut child) = child else {
         return TimedRunOutcome::failed();
     };
-    let started = std::time::Instant::now();
     let stdout = child.stdout.take().map(drain_on_thread);
     let stderr = child.stderr.take().map(drain_on_thread);
     // The write runs on its own thread so a child that stops reading cannot
