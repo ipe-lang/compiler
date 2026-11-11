@@ -55,7 +55,7 @@ src/runtime/rust/src/trace.rs 2
 src/runtime/rust/src/ui/render.rs 2
 src/runtime/rust/src/web/console.rs 6
 src/runtime/rust/src/web/console_proxy.rs 12
-src/runtime/rust/src/web/mod.rs 24
+src/runtime/rust/src/web/mod.rs 22
 src/runtime/rust/src/web/observability.rs 3
 src/runtime/rust/src/web/push_exporter.rs 9
 src/runtime/rust/src/web/sse.rs 1

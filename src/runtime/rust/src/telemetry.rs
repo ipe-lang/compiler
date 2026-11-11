@@ -896,6 +896,12 @@ pub fn frame_ancestors_config() -> Result<Option<&'static FrameAncestors>, Frame
     }
 }
 
+/// Fixes the process's `IPE_WEB_FRAME_ANCESTORS` reading before the program's
+/// first line, so a value the program writes later never opens framing.
+pub fn fix_frame_ancestors() {
+    let _ = frame_ancestors_config();
+}
+
 /// `Some` when responses run in cross-origin-iframe mode.
 ///
 /// A refused value is `None`: cookies keep the same-site default, and the
@@ -1912,6 +1918,18 @@ mod tests {
         assert!(dev_intent_from_env().is_none());
         assert!(dev_surface_from_env().is_none());
         crate::system::locked_remove_var("ENV");
+    }
+
+    // An embed allow-list the program writes after startup opens no framing:
+    // the startup check fixed the operator's (unset) reading.
+    #[test]
+    fn frame_ancestors_written_after_startup_open_no_framing() {
+        crate::system::locked_remove_var(FRAME_ANCESTORS_ENV);
+        assert!(crate::env_registry::startup_check().is_ok());
+        crate::system::locked_set_var(FRAME_ANCESTORS_ENV, "https://planted.example");
+        let read = frame_ancestors_config().map(|fa| fa.map(FrameAncestors::sources));
+        crate::system::locked_remove_var(FRAME_ANCESTORS_ENV);
+        assert_eq!(read, Ok(None));
     }
 
     // The banner advertises the console, so without a dev surface it is

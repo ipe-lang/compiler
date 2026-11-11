@@ -3659,22 +3659,14 @@ impl MountContext {
         !matches!(self, Self::Root)
     }
 
-    /// The standalone app's context, read from `IPE_WEB_BASE_PATH` once at startup.
-    ///
-    /// A value that is not Unicode is judged by its lossy spelling, whose
-    /// `U+FFFD` the grammar refuses, so it never reads as unset.
+    /// The standalone app's context, from the `IPE_WEB_BASE_PATH` reading fixed
+    /// before the program's first line.
     ///
     /// # Errors
     ///
     /// [`StartupRefusal::MountBase`] for a value outside the mount-base grammar.
     fn from_env() -> Result<Self, StartupRefusal> {
-        match crate::system::read_env_var("IPE_WEB_BASE_PATH") {
-            Ok(raw) => Self::standalone(Some(&raw)),
-            Err(std::env::VarError::NotPresent) => Self::standalone(None),
-            Err(std::env::VarError::NotUnicode(raw)) => {
-                Self::standalone(Some(&raw.to_string_lossy()))
-            }
-        }
+        Self::standalone(launched_base_path())
     }
 
     /// The standalone app's context for the variable's value `raw`, `None` when unset.
@@ -3690,6 +3682,30 @@ impl MountContext {
             Self::ProxiedChild { base }
         })
     }
+}
+
+/// The process's `IPE_WEB_BASE_PATH`, read once before the program's first
+/// line, so a base the program writes later never re-scopes its URLs or
+/// session cookie. `None` when unset. A value that is not Unicode is kept by
+/// its lossy spelling, whose `U+FFFD` the mount-base grammar refuses, so it
+/// never reads as unset.
+#[cfg(feature = "web")]
+fn launched_base_path() -> Option<&'static str> {
+    static BASE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    BASE.get_or_init(|| match crate::system::read_env_var("IPE_WEB_BASE_PATH") {
+        Ok(raw) => Some(raw),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(raw)) => Some(raw.to_string_lossy().into_owned()),
+    })
+    .as_deref()
+}
+
+/// Fixes the process's web reading (`IPE_WEB_BASE_PATH`, `IPE_WEB_STATIC_DIR`)
+/// before the program's first line.
+#[cfg(feature = "web")]
+pub(crate) fn fix_launch_env() {
+    let _ = launched_base_path();
+    let _ = launched_static_dir();
 }
 
 /// The session cookie name of the app served at `base`. At the root,
@@ -5224,6 +5240,20 @@ fn is_browser_noise_path(p: &str) -> bool {
     .any(|ext| p.ends_with(ext))
 }
 
+/// The directory `IPE_WEB_STATIC_DIR` names for `/static`, read once before
+/// the program's first line, so a directory the program writes later is never
+/// served. `None` when unset or empty.
+#[cfg(feature = "web")]
+fn launched_static_dir() -> Option<&'static str> {
+    static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        crate::system::read_env_var("IPE_WEB_STATIC_DIR")
+            .ok()
+            .filter(|d| !d.is_empty())
+    })
+    .as_deref()
+}
+
 /// Serve an unrouted browser-noise file from the static dir's root when it
 /// exists there.
 ///
@@ -5235,11 +5265,8 @@ fn is_browser_noise_path(p: &str) -> bool {
 #[cfg(feature = "web")]
 async fn serve_noise_from_static_root(path: &str) -> Option<axum::response::Response> {
     use axum::response::IntoResponse;
-    // IPE_WEB_STATIC_DIR: a non-empty value mounts the named directory at /static.
-    let dir = crate::system::read_env_var("IPE_WEB_STATIC_DIR")
-        .ok()
-        .filter(|d| !d.is_empty())?;
-    let (candidate, mime) = noise_candidate(&dir, path, crate::path_core::HOST)?;
+    let dir = launched_static_dir()?;
+    let (candidate, mime) = noise_candidate(dir, path, crate::path_core::HOST)?;
     let bytes = tokio::fs::read(&candidate).await.ok()?;
     Some(crate::server::with_security_headers(
         (
@@ -8287,11 +8314,7 @@ where
     // it FOLLOWS symlinks inside the dir — the dir is operator-controlled
     // (`IPE_WEB_STATIC_DIR`), so that is the intended contract, NOT a
     // confinement guarantee. Absent/empty → no static mount.
-    // IPE_WEB_STATIC_DIR: non-empty value mounts the named directory at /static.
-    if let Some(dir) = crate::system::read_env_var("IPE_WEB_STATIC_DIR")
-        .ok()
-        .filter(|d| !d.is_empty())
-    {
+    if let Some(dir) = launched_static_dir() {
         router = router.nest_served("/static", web_static_mount(std::path::PathBuf::from(dir))?);
     }
 
@@ -19378,6 +19401,34 @@ mod route_entry_cmd_tests {
             })
             .await;
         });
+    }
+
+    /// A static directory the program writes after startup is never served.
+    #[test]
+    fn a_static_dir_written_after_startup_is_not_served() {
+        crate::system::locked_remove_var("IPE_WEB_STATIC_DIR");
+        assert!(crate::env_registry::startup_check().is_ok());
+        run(false, || async {
+            with_static_worker_file(|| async {
+                for path in ["/static/sw.js", "/sw.js"] {
+                    let (status, _, body) = fetch_with(router(memory()), path, &[]).await;
+                    assert_ne!(status, StatusCode::OK, "{path} served a planted dir");
+                    assert_ne!(body, b"self.planted=1;", "{path}");
+                }
+            })
+            .await;
+        });
+    }
+
+    /// A base path the program writes after startup never re-bases the app.
+    #[test]
+    fn a_base_path_written_after_startup_does_not_rebase_the_app() {
+        crate::system::locked_remove_var("IPE_WEB_BASE_PATH");
+        assert!(crate::env_registry::startup_check().is_ok());
+        crate::system::locked_set_var("IPE_WEB_BASE_PATH", "/planted");
+        let context = MountContext::from_env();
+        crate::system::locked_remove_var("IPE_WEB_BASE_PATH");
+        assert!(matches!(context, Ok(MountContext::Root)), "{context:?}");
     }
 
     /// A page, routed or the root, is never a worker.

@@ -993,7 +993,8 @@ static HAND_TABLE: &[EnvVar] = &[
                   `X-Frame-Options: SAMEORIGIN`). Set, it enables embedding \
                   this app in a third-party iframe; also sets `SameSite=None; Secure` on session \
                   cookies. A value holding a control or non-ASCII byte, a `;` or `,`, \
-                  or only whitespace refuses to start the server.",
+                  or only whitespace refuses to start the server. Read once \
+                  at startup.",
         subsystem: Subsystem::Web,
         class: Class::SecurityTunable,
     },
@@ -1100,7 +1101,7 @@ static HAND_TABLE: &[EnvVar] = &[
         name: "IPE_WEB_STATIC_DIR",
         default: Cow::Borrowed("unset"),
         purpose: "Directory served at `/static/*`, set by whoever runs the app. \
-                  Path traversal is blocked by construction.",
+                  Read once at startup. Path traversal is blocked by construction.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },

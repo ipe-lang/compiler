@@ -723,6 +723,9 @@ pub fn startup_check() -> Result<(), Vec<EnvRefusal>> {
         }
         security::fix_posture();
         crate::telemetry::fix_deployment_posture();
+        crate::telemetry::fix_frame_ancestors();
+        #[cfg(feature = "web")]
+        crate::web::fix_launch_env();
         #[cfg(any(feature = "web", feature = "debugger", feature = "control-wire"))]
         crate::control::transport::fix_control_token();
         #[cfg(feature = "server")]
@@ -990,6 +993,40 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The body of the `fn {name}` item in `text`, up to its closing brace at
+    /// column 0, or `None` when `text` declares no such item.
+    fn item_body<'t>(text: &'t str, name: &str) -> Option<&'t str> {
+        let start = text.find(&format!("fn {name}"))?;
+        let rest = text.get(start..)?;
+        let end = rest.find("\n}\n")?;
+        rest.get(..end)
+    }
+
+    /// The browser entry judges the environment before the program's first
+    /// line, as a native `main` does, and a program whose environment was
+    /// refused or never judged does not start.
+    #[test]
+    fn the_browser_entry_runs_the_startup_check_before_the_program() {
+        let sources = runtime_sources();
+        let wasm = sources
+            .iter()
+            .find(|(file, _)| file == "wasm/mod.rs")
+            .map(|(_, text)| text.as_str());
+        let hook = wasm.and_then(|text| item_body(text, "install_panic_hook()"));
+        assert!(
+            hook.is_some_and(|body| body.contains("crate::env_registry::startup_check()")
+                && body.contains("STARTUP_ACCEPTED.set(")),
+            "the browser entry hook must judge the environment: {hook:?}"
+        );
+        let start = wasm.and_then(|text| item_body(text, "run_start<"));
+        let gate = start.and_then(|body| body.find("STARTUP_ACCEPTED.get() != Some(&true)"));
+        let spawn = start.and_then(|body| body.find("spawn_local("));
+        assert!(
+            matches!((gate, spawn), (Some(g), Some(s)) if g < s),
+            "the browser entry must not start an unjudged program: {start:?}"
+        );
     }
 
     /// A registered variable is read only through its key: no runtime source
