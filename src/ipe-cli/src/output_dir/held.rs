@@ -407,12 +407,8 @@ impl HeldDir {
     /// open; [`CliError::FileTooLarge`] past `cap`; [`CliError::Io`] for an
     /// absent entry, content that is not UTF-8, or another failure.
     pub fn read_file_capped(&self, name: &EntryName, cap: ByteCap) -> Result<String, CliError> {
-        let path = self.path.join(name.as_os_str());
-        let file = self
-            .dir
-            .open_regular(name)
-            .map_err(|refusal| refusal_error(&path, refusal))?;
-        read_proven(file, &path, cap)
+        self.read_file_capped_identified(name, cap)
+            .map(|(text, _)| text)
     }
 
     /// Open the subdirectory `name`, refusing a link or a non-directory.
@@ -971,7 +967,7 @@ impl HeldDir {
         if self.kind_of(&self.entry(name)?)? == EntryKind::Symlink {
             return Err(OutputRefusal::Symlink(self.path.join(name)).into());
         }
-        let tmp = format!(".{}.ipe-tmp.{}", name.to_string_lossy(), temp_suffix());
+        let tmp = stage_name(name);
         self.replace_file(name, OsStr::new(&tmp), permissions, fill)
     }
 
@@ -1449,6 +1445,480 @@ impl HeldDir {
             }
         }
         Ok(None)
+    }
+}
+
+/// How many backup names one file has: `<name>.bak`, then `<name>.bak.1` to `<name>.bak.99`.
+pub const BACKUP_SLOTS: u8 = 100;
+
+/// A backup slot one replace created and wrote, inside the backup directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupName(EntryName);
+
+impl BackupName {
+    /// The slot's name inside the backup directory.
+    #[must_use]
+    pub const fn slot(&self) -> &EntryName {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for BackupName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}/{}",
+            crate::driver::BACKUP_DIR,
+            self.0.as_os_str().to_string_lossy()
+        )
+    }
+}
+
+/// What [`HeldDir::replace_if_unchanged`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replaced {
+    /// The judged file was replaced.
+    Done,
+    /// The entry no longer is the judged file holding the judged bytes; nothing was replaced.
+    Changed,
+}
+
+/// What [`HeldDir::replace_backed_up`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackedUp {
+    /// The judged bytes were kept in the slot, then the file was replaced.
+    Done(BackupName),
+    /// The entry no longer is the judged file holding the judged bytes; nothing was kept or replaced.
+    Changed,
+    /// Every backup slot is taken; nothing was replaced.
+    BackupSlotsFull,
+}
+
+/// What [`HeldDir::create_if_absent`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Created {
+    /// The file was created.
+    Done,
+    /// An entry already had the name; it was left in place.
+    Exists,
+}
+
+/// Every backup slot is taken.
+struct SlotsFull;
+
+/// What a replace's keep step made, removed again when the replace does not happen.
+enum Undo {
+    /// Nothing was made.
+    Nothing,
+    /// The backup slot `name` of `dir`, whose identity is `id`.
+    Slot {
+        dir: HeldDir,
+        name: EntryName,
+        id: FileId,
+    },
+}
+
+impl Undo {
+    /// Remove what was made, only while its name still names it.
+    fn run(self) {
+        match self {
+            Self::Nothing => {}
+            Self::Slot { dir, name, id } => {
+                let _ = dir.unlink_ours(&name, id);
+            }
+        }
+    }
+}
+
+/// How a judged replace ended.
+enum Step<T, E> {
+    /// The file was replaced; `T` is what the keep step made.
+    Done(T),
+    /// The entry no longer is the judged file holding the judged bytes.
+    Changed,
+    /// The keep step refused.
+    Kept(E),
+}
+
+/// The temp name a write of `name` stages its content under.
+fn stage_name(name: &OsStr) -> String {
+    format!(".{}.ipe-tmp.{}", name.to_string_lossy(), temp_suffix())
+}
+
+/// The name of backup slot `slot` of the file `name`.
+fn backup_slot(name: &EntryName, slot: u8) -> String {
+    let name = name.as_os_str().to_string_lossy();
+    if slot == 0 {
+        format!("{name}.bak")
+    } else {
+        format!("{name}.bak.{slot}")
+    }
+}
+
+impl HeldDir {
+    /// Read the regular file `name` under `cap`, with the identity of the very handle read.
+    ///
+    /// # Errors
+    /// As [`HeldDir::read_file_capped`].
+    pub fn read_file_capped_identified(
+        &self,
+        name: &EntryName,
+        cap: ByteCap,
+    ) -> Result<(String, FileId), CliError> {
+        let path = self.path.join(name.as_os_str());
+        let file = self
+            .dir
+            .open_regular(name)
+            .map_err(|refusal| refusal_error(&path, refusal))?;
+        let id = file.id().map_err(|refusal| refusal_error(&path, refusal))?;
+        Ok((read_proven(file, &path, cap)?, id))
+    }
+
+    /// Whether `name` still is the regular file `id` holding exactly `judged`, read again without following a link.
+    fn still_judged(&self, name: &EntryName, id: FileId, judged: &str, cap: ByteCap) -> bool {
+        matches!(
+            self.read_file_capped_identified(name, cap),
+            Ok((now, now_id)) if now_id == id && now == judged
+        )
+    }
+
+    /// Replace the file `name` with `fill`'s content, only while it still is the judged file.
+    ///
+    /// The entry must still be the regular file `judged_id` holding exactly
+    /// `judged` (re-read under `cap`, never through a link) right before the
+    /// rename; otherwise it is left in place and the call is
+    /// [`Replaced::Changed`]. `fill` writes and syncs the staged file.
+    ///
+    /// # Errors
+    /// [`OutputRefusal::UnsafeComponent`] for the marker or claim name;
+    /// [`CliError::Io`] on a filesystem failure, the entry at `name` untouched.
+    pub fn replace_if_unchanged(
+        &self,
+        name: &OsStr,
+        judged_id: FileId,
+        judged: &str,
+        cap: ByteCap,
+        fill: impl FnOnce(&mut File) -> io::Result<()>,
+    ) -> Result<Replaced, CliError> {
+        let keep_nothing =
+            |_: &Self,
+             _: &EntryName|
+             -> Result<Result<((), Undo), std::convert::Infallible>, CliError> {
+                Ok(Ok(((), Undo::Nothing)))
+            };
+        Ok(
+            match self.replace_judged(name, judged_id, judged, cap, fill, keep_nothing)? {
+                Step::Done(()) => Replaced::Done,
+                Step::Changed => Replaced::Changed,
+                Step::Kept(never) => match never {},
+            },
+        )
+    }
+
+    /// Keep the judged bytes in a new backup slot, then replace the file `name` as [`HeldDir::replace_if_unchanged`] does.
+    ///
+    /// The slot is the first free one of [`BACKUP_SLOTS`] names in the
+    /// backup directory, created exclusively and owner-only; an existing
+    /// slot (a file, a link or a directory) is skipped, never opened. The
+    /// slot is removed again when the file is not replaced.
+    ///
+    /// # Errors
+    /// [`OutputRefusal::Symlink`] or [`OutputRefusal::NotADirectory`] for the
+    /// backup directory; otherwise as [`HeldDir::replace_if_unchanged`].
+    pub fn replace_backed_up(
+        &self,
+        name: &OsStr,
+        judged_id: FileId,
+        judged: &str,
+        cap: ByteCap,
+        fill: impl FnOnce(&mut File) -> io::Result<()>,
+    ) -> Result<BackedUp, CliError> {
+        let keep = |dir: &Self, target: &EntryName| dir.keep_backup(target, judged);
+        Ok(
+            match self.replace_judged(name, judged_id, judged, cap, fill, keep)? {
+                Step::Done(backup) => BackedUp::Done(backup),
+                Step::Changed => BackedUp::Changed,
+                Step::Kept(SlotsFull) => BackedUp::BackupSlotsFull,
+            },
+        )
+    }
+
+    /// Write `judged` to the first free backup slot of `target`.
+    fn keep_backup(
+        &self,
+        target: &EntryName,
+        judged: &str,
+    ) -> Result<Result<(BackupName, Undo), SlotsFull>, CliError> {
+        let (backups, _) = self.create_child(OsStr::new(crate::driver::BACKUP_DIR))?;
+        for slot in 0..BACKUP_SLOTS {
+            let slot_name = backup_slot(target, slot);
+            let entry = backups.entry(OsStr::new(&slot_name))?;
+            let path = backups.path.join(&slot_name);
+            let mut file = match sys::create_private(&backups.dir, &entry) {
+                Ok(file) => file,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(act_err(&path, e)),
+            };
+            let id = FileId::of_file(&file).map_err(|refusal| refused(&path, refusal))?;
+            let written = file
+                .write_all(judged.as_bytes())
+                .and_then(|()| file.sync_all());
+            drop(file);
+            let undo = Undo::Slot {
+                dir: backups,
+                name: entry.clone(),
+                id,
+            };
+            if let Err(e) = written {
+                undo.run();
+                return Err(act_err(&path, e));
+            }
+            return Ok(Ok((BackupName(entry), undo)));
+        }
+        Ok(Err(SlotsFull))
+    }
+
+    /// Stage `fill`, run `keep`, re-prove the judged file, then rename over it; undo all on any other end.
+    fn replace_judged<T, E>(
+        &self,
+        name: &OsStr,
+        judged_id: FileId,
+        judged: &str,
+        cap: ByteCap,
+        fill: impl FnOnce(&mut File) -> io::Result<()>,
+        keep: impl FnOnce(&Self, &EntryName) -> Result<Result<(T, Undo), E>, CliError>,
+    ) -> Result<Step<T, E>, CliError> {
+        if Self::is_reserved(name) {
+            return Err(OutputRefusal::UnsafeComponent(self.path.join(name)).into());
+        }
+        let target = self.entry(name)?;
+        let tmp = stage_name(name);
+        let staging = self.entry(OsStr::new(&tmp))?;
+        let tmp_path = self.path.join(&tmp);
+        let mut staged = sys::create_new(&self.dir, &staging).map_err(|e| act_err(&tmp_path, e))?;
+        let filled = fill(&mut staged);
+        drop(staged);
+        let mut undo = Undo::Nothing;
+        let result = match filled {
+            Err(e) => Err(act_err(&tmp_path, e)),
+            Ok(()) => match keep(self, &target) {
+                Err(e) => Err(e),
+                Ok(Err(refusal)) => Ok(Step::Kept(refusal)),
+                Ok(Ok((made, made_undo))) => {
+                    undo = made_undo;
+                    if self.still_judged(&target, judged_id, judged, cap) {
+                        sys::rename(&self.dir, &staging, &target)
+                            .map(|()| Step::Done(made))
+                            .map_err(|e| act_err(&self.path.join(name), e))
+                    } else {
+                        Ok(Step::Changed)
+                    }
+                }
+            },
+        };
+        match result {
+            Ok(Step::Done(made)) => Ok(Step::Done(made)),
+            other => {
+                let _ = sys::unlink(&self.dir, &staging);
+                undo.run();
+                other
+            }
+        }
+    }
+
+    /// Create the file `name` with `fill`'s content, never replacing an entry already there.
+    ///
+    /// # Errors
+    /// [`OutputRefusal::UnsafeComponent`] for the marker or claim name;
+    /// [`CliError::Io`] on a filesystem failure.
+    pub fn create_if_absent(
+        &self,
+        name: &OsStr,
+        fill: impl FnOnce(&mut File) -> io::Result<()>,
+    ) -> Result<Created, CliError> {
+        if Self::is_reserved(name) {
+            return Err(OutputRefusal::UnsafeComponent(self.path.join(name)).into());
+        }
+        let target = self.entry(name)?;
+        let tmp = stage_name(name);
+        let staging = self.entry(OsStr::new(&tmp))?;
+        let tmp_path = self.path.join(&tmp);
+        let mut staged = sys::create_new(&self.dir, &staging).map_err(|e| act_err(&tmp_path, e))?;
+        let filled = fill(&mut staged);
+        drop(staged);
+        let result = filled
+            .map_err(|e| act_err(&tmp_path, e))
+            .and_then(|()| self.rename_new(&staging, &target, name));
+        if !matches!(result, Ok(Created::Done)) {
+            let _ = sys::unlink(&self.dir, &staging);
+        }
+        result
+    }
+
+    /// Rename `staging` to the absent `target`; an entry at `target` is [`Created::Exists`].
+    fn rename_new(
+        &self,
+        staging: &EntryName,
+        target: &EntryName,
+        name: &OsStr,
+    ) -> Result<Created, CliError> {
+        let path = self.path.join(name);
+        match self.dir.entry_id(target) {
+            Ok(None) => {}
+            Ok(Some(_)) => return Ok(Created::Exists),
+            Err(refusal) => return Err(refused(&path, refusal)),
+        }
+        match sys::rename_file_noreplace(&self.dir, staging, target) {
+            Ok(()) => Ok(Created::Done),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(Created::Exists),
+            Err(e) => Err(act_err(&path, e)),
+        }
+    }
+}
+
+/// Why a file that is present was not read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unread {
+    /// The name is a symbolic link (or a reparse point), never followed.
+    Link,
+    /// The name is a FIFO, device, socket or directory.
+    NotRegular,
+    /// The file is larger than the read's cap.
+    TooLarge,
+    /// The file is not UTF-8.
+    NotUtf8,
+    /// The process may not open the file.
+    Denied,
+    /// The read failed for another reason.
+    Io,
+}
+
+/// Why a capped read of a named file returned no text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadMiss {
+    /// No entry has the name.
+    Absent,
+    /// An entry has the name and was not read.
+    Unread(Unread),
+}
+
+/// Classify a failed capped read by its typed variant, never by message text.
+#[must_use]
+pub fn read_miss(err: &CliError) -> ReadMiss {
+    use crate::io_bounded::SourceRefusal;
+    match err {
+        CliError::Io { source, .. } => match source.kind() {
+            io::ErrorKind::NotFound => ReadMiss::Absent,
+            io::ErrorKind::InvalidData => ReadMiss::Unread(Unread::NotUtf8),
+            // `io::ErrorKind` is non-exhaustive: every other kind is a failed read.
+            _ => ReadMiss::Unread(Unread::Io),
+        },
+        CliError::SourceRefused { reason, .. } => ReadMiss::Unread(match reason {
+            SourceRefusal::Symlink => Unread::Link,
+            SourceRefusal::NotRegularFile => Unread::NotRegular,
+            SourceRefusal::AccessDenied => Unread::Denied,
+        }),
+        CliError::FileTooLarge { .. } => ReadMiss::Unread(Unread::TooLarge),
+        // No other variant comes out of a capped read; any that did is a failed
+        // read. Each is named, so a new variant is judged here, not swallowed.
+        CliError::Usage(..)
+        | CliError::ProjectRefused(..)
+        | CliError::DependencyNotCompiled { .. }
+        | CliError::CheckFailed(..)
+        | CliError::UnknownCommand { .. }
+        | CliError::ScratchUnavailable { .. }
+        | CliError::Pipeline { .. }
+        | CliError::RuntimeDirInvalid { .. }
+        | CliError::RuntimeHomeUnknown
+        | CliError::CacheHomeUnknown
+        | CliError::EnvDirNotAbsolute { .. }
+        | CliError::EnvSwitchNotRecognised { .. }
+        | CliError::EnvRefused(..)
+        | CliError::ServePortTaken { .. }
+        | CliError::RuntimeMaterializeFailed { .. }
+        | CliError::RuntimeVersionMismatch { .. }
+        | CliError::EmittedBuildFailed { .. }
+        | CliError::CargoBuildTimedOut { .. }
+        | CliError::TargetDirUnlinkable { .. }
+        | CliError::BundledManifest { .. }
+        | CliError::TestRunnerStale { .. }
+        | CliError::TestRunKeyUnavailable { .. }
+        | CliError::TestTargetBusy { .. }
+        | CliError::UnknownCode { .. }
+        | CliError::DocNotFound { .. }
+        | CliError::StaticRefusal(..)
+        | CliError::CapabilityMismatch { .. }
+        | CliError::Resolve(..)
+        | CliError::LockRefused(..)
+        | CliError::IndexEntryRefused(..)
+        | CliError::HashMismatch { .. }
+        | CliError::Diff(..)
+        | CliError::SemverRejected { .. }
+        | CliError::PackageAudit(..)
+        | CliError::Publish(..)
+        | CliError::VersionRefused { .. }
+        | CliError::DocCoverage(..)
+        | CliError::DocExamplesFailed(..)
+        | CliError::CommandUsage { .. }
+        | CliError::UnknownGroupSub { .. }
+        | CliError::GroupRequired { .. }
+        | CliError::NoRunForm { .. }
+        | CliError::WrapperSourceRefused(..)
+        | CliError::AgentsGuideRefused(..)
+        | CliError::VerifyFailed { .. }
+        | CliError::TestFailed { .. }
+        | CliError::UpgradeNoPrebuilt { .. }
+        | CliError::ToolchainMissing(..)
+        | CliError::HealthCritical
+        | CliError::LintGateFailed
+        | CliError::EjectUnsupported { .. }
+        | CliError::DiagnosticJsonEmitted
+        | CliError::FmtOutputTooLarge { .. }
+        | CliError::RemoteIngestExceeded(..)
+        | CliError::LocalLimitExceeded(..)
+        | CliError::ChildPipeHeld(..)
+        | CliError::ThreadRefused { .. }
+        | CliError::ChildPipeUnread(..)
+        | CliError::Interrupted
+        | CliError::PathEscape { .. }
+        | CliError::NoManifest { .. }
+        | CliError::NoSrcDir { .. }
+        | CliError::EntryMissing { .. }
+        | CliError::NoDefaultEntry { .. }
+        | CliError::EntryEscapes { .. }
+        | CliError::ExposedModuleMissing { .. }
+        | CliError::SourceTree(..)
+        | CliError::SymlinkInSource { .. }
+        | CliError::FileOutsideRoot { .. }
+        | CliError::DirectoryExpected { .. }
+        | CliError::OutputRefused(..)
+        | CliError::DiscoveryLimitReached { .. }
+        | CliError::TrustRefused(..)
+        | CliError::FfiPrep(..)
+        | CliError::DeviceNamedModule { .. }
+        | CliError::UpgradeFeedUnreachable
+        | CliError::UpgradeCheckExit { .. }
+        | CliError::AdvisoryVulnerable(_)
+        | CliError::AdvisoryDbUnreachable { .. }
+        | CliError::AdvisoryDbMalformed { .. }
+        | CliError::WasiRunFeatureDisabled
+        | CliError::WasiRunFailed { .. }
+        | CliError::WasiRunExited { .. } => ReadMiss::Unread(Unread::Io),
+    }
+}
+
+impl Unread {
+    /// The fixed reason phrase; `cap` is the read's ceiling.
+    #[must_use]
+    pub fn phrase(self, cap: ByteCap) -> String {
+        match self {
+            Self::Link => "a link".to_owned(),
+            Self::NotRegular => "not a regular file".to_owned(),
+            Self::TooLarge => format!("larger than {} bytes", cap.get()),
+            Self::NotUtf8 => "not UTF-8".to_owned(),
+            Self::Denied => "permission denied".to_owned(),
+            Self::Io => "read failed".to_owned(),
+        }
     }
 }
 
@@ -2910,6 +3380,360 @@ mod tests {
         assert!(
             matches!(&listing, Err(CliError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound),
             "a removed directory is refused, got {listing:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Each capped-read failure maps to its reason by typed variant.
+    #[test]
+    fn read_miss_maps_each_typed_variant() {
+        use crate::io_bounded::SourceRefusal;
+        let path = PathBuf::from("AGENTS.md");
+        let io_of = |kind| CliError::Io {
+            path: path.clone(),
+            source: io::Error::from(kind),
+        };
+        let refused = |reason| CliError::SourceRefused {
+            path: path.clone(),
+            reason,
+        };
+        let cases = [
+            (io_of(io::ErrorKind::NotFound), ReadMiss::Absent),
+            (
+                io_of(io::ErrorKind::InvalidData),
+                ReadMiss::Unread(Unread::NotUtf8),
+            ),
+            (io_of(io::ErrorKind::Other), ReadMiss::Unread(Unread::Io)),
+            (
+                refused(SourceRefusal::Symlink),
+                ReadMiss::Unread(Unread::Link),
+            ),
+            (
+                refused(SourceRefusal::NotRegularFile),
+                ReadMiss::Unread(Unread::NotRegular),
+            ),
+            (
+                refused(SourceRefusal::AccessDenied),
+                ReadMiss::Unread(Unread::Denied),
+            ),
+            (
+                CliError::FileTooLarge {
+                    path: path.clone(),
+                    max: 1,
+                },
+                ReadMiss::Unread(Unread::TooLarge),
+            ),
+        ];
+        for (err, want) in cases {
+            assert_eq!(read_miss(&err), want, "{err:?}");
+        }
+    }
+
+    /// The names in `dir`, sorted; an absent directory lists nothing.
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// The staged temp names a write left in `dir`.
+    fn staged_in(dir: &Path) -> Vec<String> {
+        names_in(dir)
+            .into_iter()
+            .filter(|name| name.contains(".ipe-tmp."))
+            .collect()
+    }
+
+    /// Plant `N` holding `old` in `base` and judge it: the held parent, its identity and its text.
+    fn judged_n(base: &Path, old: &str) -> (HeldDir, FileId, String) {
+        std::fs::write(base.join("N"), old).expect("plant N");
+        let held = held_at(base);
+        let (text, id) = held
+            .read_file_capped_identified(&name("N"), byte_cap(4096))
+            .expect("judge N");
+        (held, id, text)
+    }
+
+    /// Write `new` into the staged file.
+    fn fill_new(file: &mut File) -> io::Result<()> {
+        file.write_all(b"new")?;
+        file.sync_all()
+    }
+
+    /// A link at a backup slot is skipped, never written through.
+    #[cfg(unix)]
+    #[test]
+    fn replace_backed_up_slot_link_not_followed() {
+        let base = scratch("bak_slot_link");
+        let outside = scratch("bak_slot_link_outside");
+        std::fs::write(outside.join("victim"), "outside").expect("plant outside file");
+        std::fs::create_dir(base.join(crate::driver::BACKUP_DIR)).expect("make backups");
+        std::os::unix::fs::symlink(
+            outside.join("victim"),
+            base.join(crate::driver::BACKUP_DIR).join("N.bak"),
+        )
+        .expect("plant slot link");
+        let (held, id, text) = judged_n(&base, "old");
+        let done = held.replace_backed_up(OsStr::new("N"), id, &text, byte_cap(4096), fill_new);
+        assert!(
+            matches!(&done, Ok(BackedUp::Done(backup)) if backup.slot().as_os_str() == "N.bak.1"),
+            "the linked slot is skipped, got {done:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("victim"))
+                .ok()
+                .as_deref(),
+            Some("outside")
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join(crate::driver::BACKUP_DIR).join("N.bak.1"))
+                .ok()
+                .as_deref(),
+            Some("old")
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("N")).ok().as_deref(),
+            Some("new")
+        );
+        assert!(staged_in(&base).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// A linked backup directory is refused; nothing lands outside and nothing is replaced.
+    #[cfg(unix)]
+    #[test]
+    fn replace_backed_up_backup_dir_link_refused() {
+        let base = scratch("bak_dir_link");
+        let outside = scratch("bak_dir_link_outside");
+        std::os::unix::fs::symlink(&outside, base.join(crate::driver::BACKUP_DIR))
+            .expect("plant backup dir link");
+        let (held, id, text) = judged_n(&base, "old");
+        let refused = held.replace_backed_up(OsStr::new("N"), id, &text, byte_cap(4096), fill_new);
+        assert!(
+            matches!(
+                refused,
+                Err(CliError::OutputRefused(OutputRefusal::Symlink(_)))
+            ),
+            "a linked backup directory is refused, got {refused:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("N")).ok().as_deref(),
+            Some("old")
+        );
+        assert_eq!(file_id_at(&base.join("N")), Some(id));
+        assert!(names_in(&outside).is_empty(), "nothing lands outside");
+        assert!(staged_in(&base).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// A backup path that is a file is refused as not a directory; nothing is written.
+    #[test]
+    fn replace_backed_up_backup_dir_not_a_directory() {
+        let base = scratch("bak_dir_file");
+        std::fs::write(base.join(crate::driver::BACKUP_DIR), "a file").expect("plant file");
+        let (held, id, text) = judged_n(&base, "old");
+        let refused = held.replace_backed_up(OsStr::new("N"), id, &text, byte_cap(4096), fill_new);
+        assert!(
+            matches!(
+                refused,
+                Err(CliError::OutputRefused(OutputRefusal::NotADirectory(_)))
+            ),
+            "a file at the backup path is refused, got {refused:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("N")).ok().as_deref(),
+            Some("old")
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join(crate::driver::BACKUP_DIR))
+                .ok()
+                .as_deref(),
+            Some("a file")
+        );
+        assert!(staged_in(&base).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The backup slot is readable by its owner only, whatever the original's mode.
+    #[cfg(unix)]
+    #[test]
+    fn replace_backed_up_slot_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = scratch("bak_owner_only");
+        let (held, id, text) = judged_n(&base, "old");
+        std::fs::set_permissions(base.join("N"), std::fs::Permissions::from_mode(0o644))
+            .expect("open up N");
+        let done = held.replace_backed_up(OsStr::new("N"), id, &text, byte_cap(4096), fill_new);
+        assert!(matches!(done, Ok(BackedUp::Done(_))), "{done:?}");
+        let mode = std::fs::metadata(base.join(crate::driver::BACKUP_DIR).join("N.bak"))
+            .expect("the slot exists")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "the slot has no group or other bit: {mode:o}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A replace that does not happen removes the slot it made and keeps earlier ones.
+    #[test]
+    fn replace_backed_up_changed_removes_its_slot() {
+        let base = scratch("bak_changed");
+        let backups = base.join(crate::driver::BACKUP_DIR);
+        std::fs::create_dir(&backups).expect("make backups");
+        std::fs::write(backups.join("N.bak"), "earlier").expect("plant earlier slot");
+        let (held, id, _) = judged_n(&base, "old");
+        let changed =
+            held.replace_backed_up(OsStr::new("N"), id, "other", byte_cap(4096), fill_new);
+        assert!(matches!(changed, Ok(BackedUp::Changed)), "{changed:?}");
+        assert_eq!(names_in(&backups), vec!["N.bak".to_owned()]);
+        assert_eq!(
+            std::fs::read_to_string(backups.join("N.bak"))
+                .ok()
+                .as_deref(),
+            Some("earlier")
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("N")).ok().as_deref(),
+            Some("old")
+        );
+        assert!(staged_in(&base).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// With every slot taken the call stops at the last slot and replaces nothing.
+    #[test]
+    fn replace_backed_up_slot_bound() {
+        let base = scratch("bak_bound");
+        let backups = base.join(crate::driver::BACKUP_DIR);
+        std::fs::create_dir(&backups).expect("make backups");
+        let target = name("N");
+        for slot in 0..BACKUP_SLOTS {
+            std::fs::write(backups.join(backup_slot(&target, slot)), "taken").expect("take slot");
+        }
+        let before = names_in(&backups);
+        let (held, id, text) = judged_n(&base, "old");
+        let full = held.replace_backed_up(OsStr::new("N"), id, &text, byte_cap(4096), fill_new);
+        assert!(matches!(full, Ok(BackedUp::BackupSlotsFull)), "{full:?}");
+        assert_eq!(names_in(&backups), before, "no slot past the last");
+        assert_eq!(before.len(), usize::from(BACKUP_SLOTS));
+        assert_eq!(
+            std::fs::read_to_string(base.join("N")).ok().as_deref(),
+            Some("old")
+        );
+        assert!(staged_in(&base).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The link leg of a file's no-replace rename refuses a file planted at its target, leaving it untouched.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_file_refuses_the_no_replace_link() {
+        let base = scratch("link_noreplace");
+        std::fs::write(base.join("staged"), "new").expect("staged file");
+        std::fs::write(base.join("target"), "old").expect("planted file");
+        let held = held_at(&base);
+        let linked = sys::link_noreplace(&held.dir, &name("staged"), &name("target"));
+        assert_eq!(
+            linked.map_err(|e| e.kind()),
+            Err(io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("target")).ok().as_deref(),
+            Some("old")
+        );
+        let renamed = sys::rename_file_noreplace(&held.dir, &name("staged"), &name("target"));
+        assert_eq!(
+            renamed.map_err(|e| e.kind()),
+            Err(io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("target")).ok().as_deref(),
+            Some("old")
+        );
+        assert_eq!(
+            sys::link_noreplace(&held.dir, &name("staged"), &name("fresh")).ok(),
+            Some(true)
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("fresh")).ok().as_deref(),
+            Some("new")
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The no-replace link names a symbolic link itself, never the file it points at.
+    #[cfg(unix)]
+    #[test]
+    fn the_no_replace_link_never_follows_a_link_at_its_source() {
+        let base = scratch("link_nofollow");
+        std::fs::write(base.join("outside"), "victim").expect("pointed-at file");
+        std::os::unix::fs::symlink("outside", base.join("staged")).expect("symlink");
+        let held = held_at(&base);
+        assert_eq!(
+            sys::link_noreplace(&held.dir, &name("staged"), &name("placed")).ok(),
+            Some(true)
+        );
+        let placed = std::fs::symlink_metadata(base.join("placed")).expect("placed entry");
+        assert!(placed.file_type().is_symlink());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A placed file leaves no second name under its staged name.
+    #[cfg(unix)]
+    #[test]
+    fn a_no_replace_file_rename_leaves_only_the_target() {
+        let base = scratch("file_noreplace_done");
+        std::fs::write(base.join("staged"), "new").expect("staged file");
+        let held = held_at(&base);
+        assert!(sys::rename_file_noreplace(&held.dir, &name("staged"), &name("target")).is_ok());
+        assert!(std::fs::symlink_metadata(base.join("staged")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(base.join("target")).ok().as_deref(),
+            Some("new")
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Linux's exclusive rename refuses a planted file and a planted empty directory itself, before any link or probe.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn the_exclusive_rename_refuses_a_planted_entry() {
+        let base = scratch("exclusive_rename");
+        std::fs::write(base.join("staged"), "new").expect("staged file");
+        std::fs::write(base.join("target"), "old").expect("planted file");
+        std::fs::create_dir(base.join("from_dir")).expect("directory to move");
+        std::fs::create_dir(base.join("planted_dir")).expect("planted empty directory");
+        let held = held_at(&base);
+        assert_eq!(
+            sys::renamed_exclusively(&held.dir, &name("staged"), &name("target"))
+                .map_err(|e| e.kind()),
+            Err(io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("target")).ok().as_deref(),
+            Some("old")
+        );
+        assert_eq!(
+            sys::rename_noreplace(&held.dir, &name("from_dir"), &name("planted_dir"))
+                .map_err(|e| e.kind()),
+            Err(io::ErrorKind::AlreadyExists)
+        );
+        assert!(base.join("from_dir").is_dir());
+        assert_eq!(
+            sys::renamed_exclusively(&held.dir, &name("staged"), &name("fresh")).ok(),
+            Some(true)
         );
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -1214,6 +1214,44 @@ messages! {
     upgrade_available(current, latest) = "upgrade-available";
     /// `ipe upgrade`'s confirmation prompt.
     upgrade_confirm = "upgrade-confirm";
+    /// `ipe upgrade --agents` given a flag of the binary upgrade.
+    upgrade_agents_alone(flag) = "upgrade-agents-alone";
+    /// `ipe upgrade --agents`'s question before replacing a hand-edited guide.
+    upgrade_agents_ask(file) = "upgrade-agents-ask";
+    /// `ipe upgrade --agents` found the guide current.
+    upgrade_agents_current(file, running) = "upgrade-agents-current";
+    /// `ipe upgrade --agents` replaced an older untouched guide.
+    upgrade_agents_rewritten(file, from, running) = "upgrade-agents-rewritten";
+    /// `ipe upgrade --agents` wrote a missing guide.
+    upgrade_agents_created(file, running) = "upgrade-agents-created";
+    /// `ipe upgrade --agents` backed up a hand-edited guide and replaced it.
+    upgrade_agents_replaced(file, backup, running) = "upgrade-agents-replaced";
+    /// `ipe upgrade` installed a new ipe, whose guide each project takes on its own.
+    upgrade_agents_each_project(hint, file) = "upgrade-agents-each-project";
+    /// `ipe upgrade` found this project's guide stale; `--agents` refreshes it.
+    upgrade_guide_refresh(file, phrase, hint) = "upgrade-guide-refresh";
+    /// `ipe upgrade` found this project's guide stale; `ipe health` says how to refresh it.
+    upgrade_guide_see_health(file, phrase) = "upgrade-guide-see-health";
+    /// `ipe upgrade --agents` outside a project.
+    agents_guide_no_manifest(hint) = "agents-guide-no-manifest";
+    /// `ipe upgrade --agents` could not open the project directory.
+    agents_guide_unheld(file) = "agents-guide-unheld";
+    /// `ipe upgrade --agents` left a hand-edited guide unchanged.
+    agents_guide_hand_edited(file, reason, term, hint) = "agents-guide-hand-edited";
+    /// `ipe upgrade --agents` left a newer ipe's guide unchanged.
+    agents_guide_newer(file, written_by, running) = "agents-guide-newer";
+    /// `ipe upgrade --agents` could not read the guide.
+    agents_guide_unread(file, reason) = "agents-guide-unread";
+    /// `ipe upgrade --agents` found the guide changed after judging it.
+    agents_guide_changed(file, hint) = "agents-guide-changed";
+    /// `ipe upgrade --agents` found every backup slot taken.
+    agents_guide_backups_full(file, dir, slots, hint) = "agents-guide-backups-full";
+    /// `ipe health`'s remedy for a missing or older guide.
+    health_guide_refresh(hint) = "health-guide-refresh";
+    /// `ipe health`'s remedy for a guide a newer ipe wrote.
+    health_guide_upgrade_first(hint) = "health-guide-upgrade-first";
+    /// `ipe health`'s remedy for a hand-edited guide.
+    health_guide_hand_edited(term, hint) = "health-guide-hand-edited";
     /// `ipe release` wrote a single self-jailing binary.
     release_embedded(path) = "release-embedded";
     /// `ipe release build --bundle` wrote a wrapper and app pair.
@@ -1588,6 +1626,30 @@ messages! {
     init_unknown_runtime_choice(word, runtime) = "init-unknown-runtime-choice";
     /// `ipe init` could not derive a project name.
     init_no_project_name(target) = "init-no-project-name";
+    /// `ipe init`'s question before restoring a missing managed file.
+    init_restore_ask(file) = "init-restore-ask";
+    /// `ipe init`'s question before replacing an existing managed file.
+    init_overwrite_ask(file) = "init-overwrite-ask";
+    /// `ipe init` wrote a missing managed file.
+    init_restored(file) = "init-restored";
+    /// `ipe init` backed up a managed file, then replaced it.
+    init_backed_up(file, backup) = "init-backed-up";
+    /// `ipe init` kept an existing managed file as asked.
+    init_kept_unchanged(file) = "init-kept-unchanged";
+    /// `ipe init` kept an existing managed file with no terminal to ask on.
+    init_kept_no_tty(file) = "init-kept-no-tty";
+    /// `ipe init` kept a managed name it did not read.
+    init_kept_unread(file, reason) = "init-kept-unread";
+    /// `ipe init` kept a managed file created while it was writing it.
+    init_kept_appeared(file) = "init-kept-appeared";
+    /// `ipe init` kept a managed file changed while it was replacing it.
+    init_kept_changed(file) = "init-kept-changed";
+    /// `ipe init` kept a managed file with every backup slot taken.
+    init_kept_backups_full(file, dir) = "init-kept-backups-full";
+    /// `ipe init` found every managed file in place.
+    init_nothing_to_do = "init-nothing-to-do";
+    /// `ipe init`'s pointer to the coding-agent authoring guide.
+    init_guide_pointer(term) = "init-guide-pointer";
     /// GitHub returned a verification URL off `https://github.com`.
     login_verification_url_refused = "login-verification-url-refused";
     /// The device code expired before approval.

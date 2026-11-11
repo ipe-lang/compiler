@@ -124,6 +124,7 @@ fn load_error(err: &CliError) -> LoadError {
         | CliError::GroupRequired { .. }
         | CliError::NoRunForm { .. }
         | CliError::WrapperSourceRefused(_)
+        | CliError::AgentsGuideRefused(_)
         | CliError::VerifyFailed { .. }
         | CliError::TestFailed { .. }
         | CliError::UpgradeNoPrebuilt { .. }

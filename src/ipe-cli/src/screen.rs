@@ -405,6 +405,31 @@ pub fn prompt(question: &str) {
     Stream::Stdout.write(&style::gutter(safe.as_str()));
 }
 
+/// Proof that stdin and stdout are both terminals, so a question can be asked and answered.
+///
+/// Built only by [`Interactive::detect`]; a pipe, a file or a machine-output
+/// run holds none, so it can never be asked.
+#[derive(Debug)]
+pub struct Interactive(());
+
+impl Interactive {
+    /// The proof, when stdin and stdout are both terminals.
+    #[must_use]
+    pub fn detect() -> Option<Self> {
+        use std::io::IsTerminal as _;
+        (std::io::stdin().is_terminal() && std::io::stdout().is_terminal()).then_some(Self(()))
+    }
+
+    /// Ask a `[Y/n]` / `[y/N]` question and read the answer; end of input or a read error is `default`.
+    #[must_use]
+    pub fn ask_yes_no(&self, question: &str, default: bool) -> bool {
+        let hint = if default { "[Y/n]" } else { "[y/N]" };
+        prompt(&format!("{question} {hint} "));
+        let _ = std::io::stdout().flush();
+        crate::read_yes_no_default(default)
+    }
+}
+
 /// Report a failed command on stderr in the one error frame.
 ///
 /// The header (when not yet shown), the error in its [`Fault`]'s tone — or, for

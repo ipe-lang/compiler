@@ -192,10 +192,11 @@ pub fn gate<R: std::io::BufRead, W: Write>(
         "warning[IPE-S0001]: {body}{remedy}\n  Proceed and accept these risks? [y/N] "
     );
     let _ = stderr.flush();
-    let mut answer = String::new();
-    // A closed stdin (EOF) reads zero bytes → empty answer → refusal, never a hang.
-    let _ = stdin.read_line(&mut answer);
-    if answer.trim().eq_ignore_ascii_case("y") {
+    // A closed stdin (EOF), an empty or refused answer, or anything but `y` is
+    // a refusal, never a hang.
+    if let crate::prompt_reply::Reply::Line(answer) = crate::prompt_reply::read_reply(stdin)
+        && answer.trim().eq_ignore_ascii_case("y")
+    {
         return Ok(());
     }
     let diag = SharedDiag::Consent {

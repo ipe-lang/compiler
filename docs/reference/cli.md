@@ -177,7 +177,7 @@ Look up documentation, generate API docs (docs.json + Markdown + HTML), query th
 ipe doc [list | serve | check | <key> | <Module.Name>] [<path>]
 ```
 
-**Arguments:** Without a subcommand: generate docs.json + renderings for the project and stdlib. `<key>`: look up any entity by key — a diagnostic code (IPE-L0107), symbol (List.map), module (List), member (Ipe.Time.unixMillis), language construct (case), CLI command (version), or binary operator (//, its meaning and precedence), bare or as `kind:key` (construct:case); a path spelled like an operator is written ./-prefixed; a key that names nothing lists up to ten of the closest entries of every kind, numbered, each as the exact term that opens it, and on a terminal asks which number to open (Enter cancels). `list`: list all stdlib + project modules (one per line; `--list` is a deprecated alias). `serve`: build the HTML site and preview it on loopback. `check`: verify doc-comment coverage for project modules (stdlib is exempt). `<Module.Name>`: show one module's types and values with signatures (e.g. `ipe doc Ipe.List`).
+**Arguments:** Without a subcommand: generate docs.json + renderings for the project and stdlib. `<key>`: look up any entity by key — a diagnostic code (IPE-L0107), symbol (List.map), module (List), member (Ipe.Time.unixMillis), language construct (case), CLI command (version), or binary operator (//, its meaning and precedence), bare or as `kind:key` (construct:case); a path spelled like an operator is written ./-prefixed; a key that names nothing lists up to ten of the closest entries of every kind, numbered, each as the exact term that opens it, and on a terminal asks which number to open (Enter cancels); `ipe doc guide:agents` opens the coding-agent authoring guide that `ipe init` writes as AGENTS.md. `list`: list all stdlib + project modules (one per line; `--list` is a deprecated alias). `serve`: build the HTML site and preview it on loopback. `check`: verify doc-comment coverage for project modules (stdlib is exempt). `<Module.Name>`: show one module's types and values with signatures (e.g. `ipe doc Ipe.List`).
 
 **Flags:**
 
@@ -231,6 +231,8 @@ Diagnose the build environment and offer consent-gated setup.
 ```
 ipe health
 ```
+
+**Output:** A report on stdout; in a project it also rates the AGENTS.md guide current, stale or missing and never edits it (`ipe upgrade --agents` refreshes it).
 
 **Flags:**
 
@@ -296,6 +298,7 @@ ipe upgrade
 - `[--check --exit-code]` — exit 10 = available, 0 = up-to-date, 2 = feed unreachable
 - `[--yes|-y]` — skip the confirmation prompt (implied by non-TTY stdout)
 - `[--dry-run]` — print the installer command without running it
+- `[--agents]` — `ipe upgrade --agents` upgrades this project's AGENTS.md to this ipe's guide and never ipe itself; for a hand-edited file it asks on a terminal before backing the file up to `.ipe-backup/` and replacing it, and refuses without a terminal; combines only with `[--plain]` / `[--json]`, which never ask
 - `[--plain]` — print one terse status line, flush-left (never prompts)
 - `[--json]` — print the status as JSON (never prompts)
 

@@ -1532,6 +1532,29 @@ pub fn has_only_legacy_toml(dir: &Path) -> bool {
     !dir.join(crate::package_manifest::PACKAGE_IPE).is_file() && dir.join(IPE_TOML).is_file()
 }
 
+/// Why a directory is not a project root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoProject {
+    /// No `package.ipe` and no legacy `ipe.toml`.
+    NoManifest,
+    /// A legacy `ipe.toml` but no `package.ipe`.
+    LegacyToml,
+}
+
+/// Whether `cwd` is a project root: it carries a `package.ipe`.
+///
+/// # Errors
+/// The [`NoProject`] naming what `cwd` carries instead.
+pub fn locate_project(cwd: &Path) -> Result<(), NoProject> {
+    if manifest_in_dir(cwd).is_some() {
+        Ok(())
+    } else if has_only_legacy_toml(cwd) {
+        Err(NoProject::LegacyToml)
+    } else {
+        Err(NoProject::NoManifest)
+    }
+}
+
 /// Parse a project `package.ipe` manifest into a [`ProjectManifest`].
 ///
 /// `package.ipe` is read syntactically (never evaluated) by the Ipê-native
