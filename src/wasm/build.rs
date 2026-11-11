@@ -8,8 +8,7 @@
 //! it to every artifact this package links, the test binaries included.
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
-    #[allow(clippy::disallowed_methods)] // a build script reads cargo's own configuration
-    let arch = std::env::var("CARGO_CFG_TARGET_ARCH");
+    let arch = ipe_env::var("CARGO_CFG_TARGET_ARCH");
     if arch.is_ok_and(|arch| arch == "wasm32") {
         println!(
             "cargo::rustc-link-arg=-zstack-size={}",

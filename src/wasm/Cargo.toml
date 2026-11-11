@@ -39,6 +39,7 @@ js-sys = "0.3"
 # declares, so the module's stack is derived, never hand-synced.
 [build-dependencies]
 ipe_diagnostics = { path = "../compiler/diagnostics" }
+ipe_env = { path = "../compiler/env" }
 
 [dev-dependencies]
 nesting-shapes = { path = "../../tools/nesting-shapes" }

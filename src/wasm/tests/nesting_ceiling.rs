@@ -32,7 +32,7 @@ fn layout_is_stack_first_and_linked_from_the_ssot() {
     let probe = core::hint::black_box(0_u8);
     let at = core::hint::black_box(&raw const probe).addr();
     assert!(
-        at < WASM_SHADOW_STACK_BYTES && at > WASM_SHADOW_STACK_BYTES - HARNESS_FRAMES,
+        (WASM_SHADOW_STACK_BYTES - HARNESS_FRAMES..WASM_SHADOW_STACK_BYTES).contains(&at),
         "a local at {at} must lie just under the {WASM_SHADOW_STACK_BYTES}-byte shadow stack's top"
     );
 }
