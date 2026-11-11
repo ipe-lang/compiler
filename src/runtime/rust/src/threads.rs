@@ -421,9 +421,7 @@ mod tasks {
                             sink.deliver(role, failed);
                         }
                     };
-                    // The watcher runs no Ipê code: it only delivers the
-                    // watched task's end.
-                    #[allow(clippy::disallowed_methods)]
+                    #[allow(clippy::disallowed_methods)] // the watcher runs no Ipê code
                     drop(runtime.spawn(watch));
                 }
             }

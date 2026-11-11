@@ -49,10 +49,6 @@ const _RAND_CORE: () = {
     let _: Option<::aes_gcm::aead::OsRng> = None;
 };
 
-/// The future the task-start namings start.
-#[cfg(feature = "tokio")]
-type Ready = ::std::future::Ready<()>;
-
 #[cfg(feature = "tokio")]
 const _TOKIO: () = {
     #[expect(clippy::disallowed_methods)]
@@ -60,35 +56,51 @@ const _TOKIO: () = {
     #[expect(clippy::disallowed_methods)]
     let _ = ::tokio::runtime::Handle::spawn_blocking::<fn(), ()>;
     #[expect(clippy::disallowed_methods)]
-    let _ = ::tokio::runtime::Handle::spawn::<Ready>;
+    let _ = ::tokio::runtime::Handle::spawn::<::std::future::Ready<()>>;
     #[expect(clippy::disallowed_methods)]
-    let _ = ::tokio::runtime::Runtime::spawn::<Ready>;
+    let _ = ::tokio::runtime::Runtime::spawn::<::std::future::Ready<()>>;
     #[expect(clippy::disallowed_methods)]
-    let _ = ::tokio::task::spawn_local::<Ready>;
+    let _ = ::tokio::task::spawn_local::<::std::future::Ready<()>>;
     #[expect(clippy::disallowed_methods)]
-    let _ = ::tokio::task::LocalSet::spawn_local::<Ready>;
+    let _ = ::tokio::task::LocalSet::spawn_local::<::std::future::Ready<()>>;
     #[expect(clippy::disallowed_types)]
     let _: Option<::tokio::task::JoinSet<()>> = None;
-    #[expect(clippy::disallowed_methods)]
-    let _ = ::tokio::task::JoinSet::<()>::spawn::<Ready>;
-    #[expect(clippy::disallowed_methods)]
-    let _ = ::tokio::task::JoinSet::<()>::spawn_on::<Ready>;
-    #[expect(clippy::disallowed_methods)]
-    let _ = ::tokio::task::JoinSet::<()>::spawn_local::<Ready>;
-    #[expect(clippy::disallowed_methods)]
-    let _ = ::tokio::task::JoinSet::<()>::spawn_local_on::<Ready>;
-    #[expect(clippy::disallowed_methods)]
-    let _ = ::tokio::task::JoinSet::<()>::spawn_blocking::<fn()>;
-    #[expect(clippy::disallowed_methods)]
-    let _ = ::tokio::task::JoinSet::<()>::spawn_blocking_on::<fn()>;
-    #[expect(clippy::disallowed_methods)]
-    let _ = ::tokio::task::JoinSet::<()>::join_next;
-    #[expect(clippy::disallowed_methods)]
-    let _ = ::tokio::task::JoinSet::<()>::try_join_next;
-    #[expect(clippy::disallowed_methods)]
-    let _ = ::tokio::task::JoinSet::<()>::join_next_with_id;
-    #[expect(clippy::disallowed_methods)]
-    let _ = ::tokio::task::JoinSet::<()>::join_all;
+    #[expect(clippy::disallowed_methods, clippy::disallowed_types)]
+    let _: fn(&'static mut ::tokio::task::JoinSet<()>, ::std::future::Ready<()>) -> _ =
+        ::tokio::task::JoinSet::spawn;
+    #[expect(clippy::disallowed_methods, clippy::disallowed_types)]
+    let _: fn(
+        &'static mut ::tokio::task::JoinSet<()>,
+        ::std::future::Ready<()>,
+        &'static ::tokio::runtime::Handle,
+    ) -> _ = ::tokio::task::JoinSet::spawn_on;
+    #[expect(clippy::disallowed_methods, clippy::disallowed_types)]
+    let _: fn(&'static mut ::tokio::task::JoinSet<()>, ::std::future::Ready<()>) -> _ =
+        ::tokio::task::JoinSet::spawn_local;
+    #[expect(clippy::disallowed_methods, clippy::disallowed_types)]
+    let _: fn(
+        &'static mut ::tokio::task::JoinSet<()>,
+        ::std::future::Ready<()>,
+        &'static ::tokio::task::LocalSet,
+    ) -> _ = ::tokio::task::JoinSet::spawn_local_on;
+    #[expect(clippy::disallowed_methods, clippy::disallowed_types)]
+    let _: fn(&'static mut ::tokio::task::JoinSet<()>, fn()) -> _ =
+        ::tokio::task::JoinSet::spawn_blocking;
+    #[expect(clippy::disallowed_methods, clippy::disallowed_types)]
+    let _: fn(
+        &'static mut ::tokio::task::JoinSet<()>,
+        fn(),
+        &'static ::tokio::runtime::Handle,
+    ) -> _ = ::tokio::task::JoinSet::spawn_blocking_on;
+    #[expect(clippy::disallowed_methods, clippy::disallowed_types)]
+    let _: fn(&'static mut ::tokio::task::JoinSet<()>) -> _ = ::tokio::task::JoinSet::join_next;
+    #[expect(clippy::disallowed_methods, clippy::disallowed_types)]
+    let _: fn(&'static mut ::tokio::task::JoinSet<()>) -> _ = ::tokio::task::JoinSet::try_join_next;
+    #[expect(clippy::disallowed_methods, clippy::disallowed_types)]
+    let _: fn(&'static mut ::tokio::task::JoinSet<()>) -> _ =
+        ::tokio::task::JoinSet::join_next_with_id;
+    #[expect(clippy::disallowed_methods, clippy::disallowed_types)]
+    let _: fn(::tokio::task::JoinSet<()>) -> _ = ::tokio::task::JoinSet::join_all;
 };
 
 #[cfg(feature = "encoding")]
