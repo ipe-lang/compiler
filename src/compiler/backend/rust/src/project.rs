@@ -3138,8 +3138,8 @@ fn assemble_project_text(
     // email) is folded into `uses_async_runtime` at its computation site, so the
     // restore is present whenever a surface needs the reactor, even one reached
     // by a reserved-type mention alone. The pure surfaces (crypto / jwt / auth /
-    // url / config / compression / csv) anchor on `[profile.dev]`, never the
-    // tokio line, and keep the tokio-free base.
+    // url / config / compression / csv) append to the `[dependencies]` table, never
+    // edit the tokio line, and keep the tokio-free base.
     let async_base = match vendored_tokio(ctx)? {
         Some(tokio) => async_runtime_cargo_toml(CARGO_TOML, &tokio)?,
         None => CARGO_TOML.to_owned(),
@@ -3992,9 +3992,7 @@ fn db_cargo_toml(base: &str, driver: crate::DbDriver) -> DResult<String> {
     // `crate::app_config::resolve_db_url_override`, which is gated on
     // `#[cfg(feature = "secret")]`. Activating the feature makes it visible.
     const DEFAULT_LINE_DB: &str = r#"default = ["tokio", "json", "db", "secret"]"#;
-    // The sqlx line is appended right before the dev/release profile sections.
-    // Anchoring on `[profile.dev]` is stable (always present in the template).
-    const PROFILE_ANCHOR: &str = "[profile.dev]";
+    // The sqlx line is appended to the `[dependencies]` table.
     // Both drivers are unconditional — see the doc comment above for why. The
     // `driver` parameter controls which config.rs alias is used (DbPool /
     // DbRow), not which sqlx features link.
@@ -4011,17 +4009,11 @@ fn db_cargo_toml(base: &str, driver: crate::DbDriver) -> DResult<String> {
             detail: format!("Cargo.toml anchor {DEFAULT_LINE:?} not found — golden drifted"),
         });
     }
-    let anchor_pos = step1
-        .find(PROFILE_ANCHOR)
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::db_cargo_toml",
-            detail: format!("Cargo.toml anchor {PROFILE_ANCHOR:?} not found — golden drifted"),
-        })?;
-    let mut result = String::with_capacity(step1.len() + sqlx_line.len());
-    result.push_str(step1.get(..anchor_pos).unwrap_or(""));
-    result.push_str(&sqlx_line);
-    result.push_str(step1.get(anchor_pos..).unwrap_or(""));
-    Ok(result)
+    append_dependencies(
+        &step1,
+        &sqlx_line,
+        "ipe_backend_rust::project::db_cargo_toml",
+    )
 }
 
 /// Build the server-enabled `Cargo.toml` from the given base manifest by:
@@ -4029,7 +4021,7 @@ fn db_cargo_toml(base: &str, driver: crate::DbDriver) -> DResult<String> {
 /// 1. Promoting the base manifest's inert `server = []` into the `default`
 ///    feature list.
 /// 2. Appending `axum`, `tower-http` (with `timeout`), and `tower` (with
-///    `limit`) dependency lines before `[profile.dev]` — the latter two back
+///    `limit`) dependency lines to the `[dependencies]` table — the latter two back
 ///    the front-door denial-of-service ceilings (`TimeoutLayer` +
 ///    `GlobalConcurrencyLimitLayer`).
 ///
@@ -4060,7 +4052,7 @@ fn server_cargo_toml(base: &str) -> DResult<String> {
         crate_specs::TOWER.version,
     );
     let promoted = promote_declared_feature(base, "server", WHERE)?;
-    insert_before_profile_dev(&promoted, &server_deps, WHERE)
+    append_dependencies(&promoted, &server_deps, WHERE)
 }
 
 /// Promote `feature` into `default`, refusing a feature the base manifest does
@@ -4088,32 +4080,69 @@ fn promote_declared_feature(base: &str, feature: &str, where_: &'static str) -> 
     promote_default_feature(base, feature, where_)
 }
 
-/// Splice `deps` into the manifest immediately before `[profile.dev]`.
+/// Append `deps` to the manifest's `[dependencies]` table, after its last entry.
+///
+/// The insertion point is read from the table itself, never from the section
+/// that happens to follow it, so a dependency lands in the cross-platform table
+/// whatever comes next — a later `[target.'cfg(…)'.dependencies]` table cannot
+/// capture it and make it target-only. A table header is a line opening with
+/// `[` at column 0.
 ///
 /// # Errors
 ///
 /// Returns [`Diagnostic::CompilerBug`] (attributed to `where_`) when the
-/// `[profile.dev]` anchor is absent — a golden-drift invariant violation.
-fn insert_before_profile_dev(base: &str, deps: &str, where_: &'static str) -> DResult<String> {
-    const PROFILE_ANCHOR: &str = "[profile.dev]";
-    let anchor_pos = base
-        .find(PROFILE_ANCHOR)
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_,
-            detail: format!("Cargo.toml anchor {PROFILE_ANCHOR:?} not found — golden drifted"),
-        })?;
-    let mut result = String::with_capacity(base.len() + deps.len());
-    result.push_str(base.get(..anchor_pos).unwrap_or(""));
-    result.push_str(deps);
-    result.push_str(base.get(anchor_pos..).unwrap_or(""));
-    Ok(result)
+/// manifest does not carry exactly one `[dependencies]` header — a
+/// golden-drift invariant violation.
+fn append_dependencies(base: &str, deps: &str, where_: &'static str) -> DResult<String> {
+    const HEADER: &str = "[dependencies]";
+    let mut headers = 0_usize;
+    let mut in_table = false;
+    let mut table_end = None;
+    let mut offset = 0_usize;
+    for line in base.split_inclusive('\n') {
+        let next = offset + line.len();
+        let text = line.trim();
+        if line.starts_with('[') {
+            in_table = text == HEADER;
+            if in_table {
+                headers += 1;
+                table_end = Some(next);
+            }
+        } else if in_table && !text.is_empty() && !text.starts_with('#') {
+            table_end = Some(next);
+        }
+        offset = next;
+    }
+    let drift = || Diagnostic::CompilerBug {
+        where_,
+        detail: format!(
+            "Cargo.toml carries {headers} `{HEADER}` headers, not exactly one — golden drifted"
+        ),
+    };
+    let (1, Some(at)) = (headers, table_end) else {
+        return Err(drift());
+    };
+    let entries = deps.trim_matches('\n');
+    if entries.is_empty() {
+        return Ok(base.to_owned());
+    }
+    let (head, tail) = base.split_at_checked(at).ok_or_else(drift)?;
+    let mut out = String::with_capacity(base.len() + entries.len() + 2);
+    out.push_str(head);
+    if !head.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(entries);
+    out.push('\n');
+    out.push_str(tail);
+    Ok(out)
 }
 
 /// Build the web-enabled `Cargo.toml` from the given base manifest by:
 ///
 /// 1. Adding `"web"` to the `default` feature list.
 /// 2. Inserting `async-trait` and `serde_urlencoded` as explicit dependencies
-///    before the `[profile.dev]` section.
+///    to the `[dependencies]` table.
 ///
 /// These two crates are required because the runtime's `web` feature enables
 /// code that imports them (`async-trait` in `web/store.rs` and
@@ -4136,7 +4165,6 @@ fn insert_before_profile_dev(base: &str, deps: &str, where_: &'static str) -> DR
 fn web_cargo_toml(base: &str) -> DResult<String> {
     // All consts must precede the first `let` — `items_after_statements` (pedantic).
     const DEFAULT_PREFIX: &str = "default = [";
-    const PROFILE_ANCHOR: &str = "[profile.dev]";
     // `async-trait` is pulled by the runtime's `live` feature gate; the emitted
     // project vendors the runtime source directly, so it must appear as an
     // explicit `[dependencies]` entry.
@@ -4176,25 +4204,19 @@ fn web_cargo_toml(base: &str) -> DResult<String> {
     step1.push_str(r#", "web""#);
     step1.push_str(base.get(close..).unwrap_or(""));
 
-    // Step 2 — inject live-specific deps before `[profile.dev]`.
-    let anchor_pos = step1
-        .find(PROFILE_ANCHOR)
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::web_cargo_toml",
-            detail: format!("Cargo.toml anchor {PROFILE_ANCHOR:?} not found — golden drifted"),
-        })?;
-    let mut result = String::with_capacity(step1.len() + web_deps.len());
-    result.push_str(step1.get(..anchor_pos).unwrap_or(""));
-    result.push_str(&web_deps);
-    result.push_str(step1.get(anchor_pos..).unwrap_or(""));
-    Ok(result)
+    // Step 2 — inject live-specific deps to the `[dependencies]` table.
+    append_dependencies(
+        &step1,
+        &web_deps,
+        "ipe_backend_rust::project::web_cargo_toml",
+    )
 }
 
 /// Build the tui-enabled `Cargo.toml` from the given base manifest by:
 ///
 /// 1. Adding `"tui"` to the `default` feature list.
-/// 2. Appending `crossterm` and `unicode-width` dependencies before
-///    `[profile.dev]`.  These two crates are the compile-time gates on the
+/// 2. Appending `crossterm` and `unicode-width` dependencies to the
+///    `[dependencies]` table.  These two crates are the compile-time gates on the
 ///    runtime's `tui` feature; the emitted project vendors the runtime source
 ///    directly, so they MUST appear as explicit `[dependencies]` entries.
 ///
@@ -4209,7 +4231,6 @@ fn web_cargo_toml(base: &str) -> DResult<String> {
 fn tui_cargo_toml(base: &str) -> DResult<String> {
     // All anchor consts must precede the first `let` statement.
     const DEFAULT_PREFIX: &str = "default = [";
-    const PROFILE_ANCHOR: &str = "[profile.dev]";
     // Versions + names from the SSOT; `tui_deps` are bare `name = "ver"` lines.
     let tui_deps = format!(
         "{} = \"{}\"\n{} = \"{}\"\n\n",
@@ -4241,18 +4262,12 @@ fn tui_cargo_toml(base: &str) -> DResult<String> {
     step1.push_str(r#", "tui""#);
     step1.push_str(base.get(close..).unwrap_or(""));
 
-    // Step 2 — append crossterm + unicode-width before `[profile.dev]`.
-    let anchor_pos = step1
-        .find(PROFILE_ANCHOR)
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::tui_cargo_toml",
-            detail: format!("Cargo.toml anchor {PROFILE_ANCHOR:?} not found — golden drifted"),
-        })?;
-    let mut result = String::with_capacity(step1.len() + tui_deps.len());
-    result.push_str(step1.get(..anchor_pos).unwrap_or(""));
-    result.push_str(&tui_deps);
-    result.push_str(step1.get(anchor_pos..).unwrap_or(""));
-    Ok(result)
+    // Step 2 — append crossterm + unicode-width to the `[dependencies]` table.
+    append_dependencies(
+        &step1,
+        &tui_deps,
+        "ipe_backend_rust::project::tui_cargo_toml",
+    )
 }
 
 /// Build the webview-enabled `Cargo.toml` from the given base manifest by:
@@ -4260,7 +4275,7 @@ fn tui_cargo_toml(base: &str) -> DResult<String> {
 /// 1. Adding `"webview"` to the `default` feature list.
 /// 2. Wiring the `webview = []` feature declaration to actually pull `wry` and
 ///    `tao` (changes it to `webview = ["dep:wry", "dep:tao"]`).
-/// 3. Appending `wry` and `tao` as optional dependencies before `[profile.dev]`.
+/// 3. Appending `wry` and `tao` as optional dependencies to the `[dependencies]` table.
 ///
 /// Called AFTER `server_cargo_toml` and `web_cargo_toml` so the live feature
 /// (which the webview backend imports from) is already promoted.
@@ -4273,7 +4288,6 @@ fn tui_cargo_toml(base: &str) -> DResult<String> {
 fn webview_cargo_toml(base: &str) -> DResult<String> {
     // All anchor consts must precede the first `let` statement.
     const DEFAULT_PREFIX: &str = "default = [";
-    const PROFILE_ANCHOR: &str = "[profile.dev]";
     // Change the empty `webview = []` feature to pull wry + tao when active.
     // The `dep:` prefix is Cargo's "explicit dep" syntax (Cargo ≥1.60), so
     // `webview = ["dep:wry", "dep:tao"]` activates the optional deps ONLY when
@@ -4335,18 +4349,12 @@ fn webview_cargo_toml(base: &str) -> DResult<String> {
         });
     }
 
-    // Step 3 — append wry + tao as optional deps before `[profile.dev]`.
-    let anchor_pos = step2
-        .find(PROFILE_ANCHOR)
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::webview_cargo_toml",
-            detail: format!("Cargo.toml anchor {PROFILE_ANCHOR:?} not found — golden drifted"),
-        })?;
-    let mut result = String::with_capacity(step2.len() + webview_native_deps.len());
-    result.push_str(step2.get(..anchor_pos).unwrap_or(""));
-    result.push_str(&webview_native_deps);
-    result.push_str(step2.get(anchor_pos..).unwrap_or(""));
-    Ok(result)
+    // Step 3 — append wry + tao as optional deps to the `[dependencies]` table.
+    append_dependencies(
+        &step2,
+        &webview_native_deps,
+        "ipe_backend_rust::project::webview_cargo_toml",
+    )
 }
 
 /// Build the websocket-client-enabled `Cargo.toml` from the given base manifest
@@ -4357,7 +4365,7 @@ fn webview_cargo_toml(base: &str) -> DResult<String> {
 ///    (its deps are plain, not `dep:`-activated, so promoting it activates the
 ///    module without any feature→dep wiring).
 /// 2. Appending `tokio-tungstenite` (the handshake only), `tokio-rustls`,
-///    `rustls` and `webpki-roots` before `[profile.dev]`, each rendered from its
+///    `rustls` and `webpki-roots` to the `[dependencies]` table, each rendered from its
 ///    [`crate_specs`] pin: the runtime owns the `wss://` TLS and trusts
 ///    `webpki-roots` alone (`futures-util` and `url`, its other deps, are
 ///    already in the base).
@@ -4369,7 +4377,6 @@ fn webview_cargo_toml(base: &str) -> DResult<String> {
 /// a manifest where `ws_client` compiles without `tokio-tungstenite`).
 fn websocket_cargo_toml(base: &str) -> DResult<String> {
     const DEFAULT_PREFIX: &str = "default = [";
-    const PROFILE_ANCHOR: &str = "[profile.dev]";
     let ws_dep: String = [
         crate_specs::TOKIO_TUNGSTENITE,
         crate_specs::TOKIO_RUSTLS,
@@ -4401,18 +4408,12 @@ fn websocket_cargo_toml(base: &str) -> DResult<String> {
     step1.push_str(r#", "websocket_client""#);
     step1.push_str(base.get(close..).unwrap_or(""));
 
-    // Step 2 — append the socket and TLS crates before `[profile.dev]`.
-    let anchor_pos = step1
-        .find(PROFILE_ANCHOR)
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::websocket_cargo_toml",
-            detail: format!("Cargo.toml anchor {PROFILE_ANCHOR:?} not found — golden drifted"),
-        })?;
-    let mut result = String::with_capacity(step1.len() + ws_dep.len());
-    result.push_str(step1.get(..anchor_pos).unwrap_or(""));
-    result.push_str(&ws_dep);
-    result.push_str(step1.get(anchor_pos..).unwrap_or(""));
-    Ok(result)
+    // Step 2 — append the socket and TLS crates to the `[dependencies]` table.
+    append_dependencies(
+        &step1,
+        &ws_dep,
+        "ipe_backend_rust::project::websocket_cargo_toml",
+    )
 }
 
 /// Build the HTTP-client-enabled `Cargo.toml` by adding the `reqwest`
@@ -4430,37 +4431,18 @@ fn websocket_cargo_toml(base: &str) -> DResult<String> {
 /// under it, and `system::exit_process` flushes those exporters only with it on,
 /// so a web program that leaves it undeclared or off silently drops all three.
 ///
-/// The dependency line is inserted before the
-/// `[target.'cfg(unix)'.dependencies]` header so it lands in the cross-platform
-/// `[dependencies]` table — `reqwest` must compile on every target, not only
-/// unix. The line renders from [`crate_specs::REQWEST`], drift-guarded against
+/// The line renders from [`crate_specs::REQWEST`], drift-guarded against
 /// `runtime/Cargo.toml`.
 ///
 /// # Errors
 ///
-/// Returns [`Diagnostic::CompilerBug`] if the `[dependencies]`-table boundary
-/// anchor is absent — a golden-drift invariant violation (fail-loud).
+/// Returns [`Diagnostic::CompilerBug`] if the `[dependencies]` table or the
+/// `default` anchor is absent — a golden-drift invariant violation (fail-loud).
 fn http_client_cargo_toml(base: &str) -> DResult<String> {
-    // Insert before the unix-only dependency table (and its leading comment) so
-    // `reqwest` joins the main, cross-platform `[dependencies]` table — never
-    // the `cfg(unix)` one — and the unix comment stays attached to its header.
-    const DEPS_END_ANCHOR: &str = "\n\n# Unix-only:";
-    let reqwest_dep = format!("\n{}", crate_specs::REQWEST.dependency_line(&[]));
-    let anchor_pos = base
-        .find(DEPS_END_ANCHOR)
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::http_client_cargo_toml",
-            detail: format!("Cargo.toml anchor {DEPS_END_ANCHOR:?} not found — golden drifted"),
-        })?;
-    let mut result = String::with_capacity(base.len() + reqwest_dep.len());
-    result.push_str(base.get(..anchor_pos).unwrap_or(""));
-    result.push_str(&reqwest_dep);
-    result.push_str(base.get(anchor_pos..).unwrap_or(""));
-    promote_default_feature(
-        &result,
-        "http_client",
-        "ipe_backend_rust::project::http_client_cargo_toml",
-    )
+    const WHERE: &str = "ipe_backend_rust::project::http_client_cargo_toml";
+    let reqwest_dep = crate_specs::REQWEST.dependency_line(&[]);
+    let result = append_dependencies(base, &reqwest_dep, WHERE)?;
+    promote_default_feature(&result, "http_client", WHERE)
 }
 
 /// Add `feature` to the vendored manifest's `default = [...]` list.
@@ -4513,7 +4495,7 @@ fn promote_default_feature(base: &str, feature: &str, where_: &'static str) -> D
 }
 
 /// Build the email-enabled `Cargo.toml` by appending the `lettre` dependency
-/// before `[profile.dev]`.
+/// to the `[dependencies]` table.
 ///
 /// `email.rs` (the vendored `Ipe.Email` runtime module) needs `lettre` for the
 /// SMTP transport; `reqwest` (which it reaches through `http_client`) is added
@@ -4528,21 +4510,15 @@ fn promote_default_feature(base: &str, feature: &str, where_: &'static str) -> D
 ///
 /// # Errors
 ///
-/// Returns [`Diagnostic::CompilerBug`] if the `[profile.dev]` anchor is absent —
+/// Returns [`Diagnostic::CompilerBug`] if the `[dependencies]` table is absent —
 /// a golden-drift invariant violation (fail-loud, never a silent no-op).
 fn email_cargo_toml(base: &str) -> DResult<String> {
-    const PROFILE_ANCHOR: &str = "[profile.dev]";
     let lettre_dep = format!("{}\n\n", crate_specs::LETTRE.dependency_line(&[]));
-    let anchor_pos = base
-        .find(PROFILE_ANCHOR)
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::email_cargo_toml",
-            detail: format!("Cargo.toml anchor {PROFILE_ANCHOR:?} not found — golden drifted"),
-        })?;
-    let mut result = String::with_capacity(base.len() + lettre_dep.len());
-    result.push_str(base.get(..anchor_pos).unwrap_or(""));
-    result.push_str(&lettre_dep);
-    result.push_str(base.get(anchor_pos..).unwrap_or(""));
+    let result = append_dependencies(
+        base,
+        &lettre_dep,
+        "ipe_backend_rust::project::email_cargo_toml",
+    )?;
     promote_default_feature(
         &result,
         "email",
@@ -4559,8 +4535,8 @@ fn email_cargo_toml(base: &str) -> DResult<String> {
 ///    `locale = ["dep:icu_casemap", "dep:icu_locale_core"]`.
 /// 2. Promote `locale` into the `default` feature list so the emitted crate
 ///    activates it without requiring an explicit `--features locale` flag.
-/// 3. Add `icu_casemap` and `icu_locale_core` as optional dependencies before
-///    `[profile.dev]`.
+/// 3. Add `icu_casemap` and `icu_locale_core` as optional dependencies to the
+///    `[dependencies]` table.
 ///
 /// # Errors
 ///
@@ -4588,11 +4564,11 @@ fn locale_cargo_toml(base: &str) -> DResult<String> {
     }
     let upgraded = base.replacen(INERT, ACTIVE, 1);
     let promoted = promote_declared_feature(&upgraded, "locale", WHERE)?;
-    insert_before_profile_dev(&promoted, &icu_deps, WHERE)
+    append_dependencies(&promoted, &icu_deps, WHERE)
 }
 
-/// Build the URL-enabled `Cargo.toml` by appending the `url` dependency before
-/// `[profile.dev]`.
+/// Build the URL-enabled `Cargo.toml` by appending the `url` dependency to the
+/// `[dependencies]` table.
 ///
 /// `url.rs` (the vendored `Ipe.Url` runtime module) parses with the `url` crate,
 /// whose transitive `idna` → ICU4X subtree is the single largest gateable
@@ -4605,10 +4581,9 @@ fn locale_cargo_toml(base: &str) -> DResult<String> {
 ///
 /// # Errors
 ///
-/// Returns [`Diagnostic::CompilerBug`] if the `[profile.dev]` anchor is absent —
+/// Returns [`Diagnostic::CompilerBug`] if the `[dependencies]` table is absent —
 /// a golden-drift invariant violation (fail-loud, never a silent no-op).
 fn url_cargo_toml(base: &str) -> DResult<String> {
-    const PROFILE_ANCHOR: &str = "[profile.dev]";
     // `tinyvec` is a transitive dep of `idna` (pulled by `url 2.x`). Version
     // 1.13+ uses `vec!` in a way that requires the `std` feature; without it
     // the emitted project's `cargo build` fails with "cannot find macro `vec`
@@ -4619,21 +4594,11 @@ fn url_cargo_toml(base: &str) -> DResult<String> {
         crate_specs::URL.name,
         crate_specs::URL.version,
     );
-    let anchor_pos = base
-        .find(PROFILE_ANCHOR)
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::url_cargo_toml",
-            detail: format!("Cargo.toml anchor {PROFILE_ANCHOR:?} not found — golden drifted"),
-        })?;
-    let mut result = String::with_capacity(base.len() + url_dep.len());
-    result.push_str(base.get(..anchor_pos).unwrap_or(""));
-    result.push_str(&url_dep);
-    result.push_str(base.get(anchor_pos..).unwrap_or(""));
-    Ok(result)
+    append_dependencies(base, &url_dep, "ipe_backend_rust::project::url_cargo_toml")
 }
 
 /// Build the config-decoder-enabled `Cargo.toml` by appending the TOML and
-/// YAML parser dependencies before `[profile.dev]`.
+/// YAML parser dependencies to the `[dependencies]` table.
 ///
 /// `config_decode.rs` (the vendored `Ipe.Config` TOML/YAML front-ends) is the
 /// sole consumer of these two crates: `Config.decodeToml` parses with `toml`,
@@ -4649,26 +4614,16 @@ fn url_cargo_toml(base: &str) -> DResult<String> {
 ///
 /// # Errors
 ///
-/// Returns [`Diagnostic::CompilerBug`] if the `[profile.dev]` anchor is absent —
+/// Returns [`Diagnostic::CompilerBug`] if the `[dependencies]` table is absent —
 /// a golden-drift invariant violation (fail-loud, never a silent no-op).
 fn config_cargo_toml(base: &str) -> DResult<String> {
-    const PROFILE_ANCHOR: &str = "[profile.dev]";
     let deps = format!(
         "{} = \"{}\"\n{}\n\n",
         crate_specs::TOML.name,
         crate_specs::TOML.version,
         crate_specs::SERDE_SAPHYR.dependency_line(&[]),
     );
-    let anchor_pos = base
-        .find(PROFILE_ANCHOR)
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::config_cargo_toml",
-            detail: format!("Cargo.toml anchor {PROFILE_ANCHOR:?} not found — golden drifted"),
-        })?;
-    let mut result = String::with_capacity(base.len() + deps.len());
-    result.push_str(base.get(..anchor_pos).unwrap_or(""));
-    result.push_str(&deps);
-    result.push_str(base.get(anchor_pos..).unwrap_or(""));
+    let result = append_dependencies(base, &deps, "ipe_backend_rust::project::config_cargo_toml")?;
     promote_default_feature(
         &result,
         "config",
@@ -4677,7 +4632,7 @@ fn config_cargo_toml(base: &str) -> DResult<String> {
 }
 
 /// Build the compression-enabled `Cargo.toml` by appending the `flate2` and
-/// `zstd` dependencies before `[profile.dev]`.
+/// `zstd` dependencies to the `[dependencies]` table.
 ///
 /// `compression.rs` (the vendored `Ipe.Compression` gzip/zstd kernels) is the
 /// sole consumer of these two crates: `Compression.gzip` / `gunzip` go through
@@ -4690,10 +4645,9 @@ fn config_cargo_toml(base: &str) -> DResult<String> {
 ///
 /// # Errors
 ///
-/// Returns [`Diagnostic::CompilerBug`] if the `[profile.dev]` anchor is absent —
+/// Returns [`Diagnostic::CompilerBug`] if the `[dependencies]` table is absent —
 /// a golden-drift invariant violation (fail-loud, never a silent no-op).
 fn compression_cargo_toml(base: &str) -> DResult<String> {
-    const PROFILE_ANCHOR: &str = "[profile.dev]";
     let deps = format!(
         "{} = \"{}\"\n{} = \"{}\"\n\n",
         crate_specs::FLATE2.name,
@@ -4701,21 +4655,15 @@ fn compression_cargo_toml(base: &str) -> DResult<String> {
         crate_specs::ZSTD.name,
         crate_specs::ZSTD.version,
     );
-    let anchor_pos = base
-        .find(PROFILE_ANCHOR)
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::compression_cargo_toml",
-            detail: format!("Cargo.toml anchor {PROFILE_ANCHOR:?} not found — golden drifted"),
-        })?;
-    let mut result = String::with_capacity(base.len() + deps.len());
-    result.push_str(base.get(..anchor_pos).unwrap_or(""));
-    result.push_str(&deps);
-    result.push_str(base.get(anchor_pos..).unwrap_or(""));
-    Ok(result)
+    append_dependencies(
+        base,
+        &deps,
+        "ipe_backend_rust::project::compression_cargo_toml",
+    )
 }
 
-/// Build the CSV-enabled `Cargo.toml` by appending the `csv` dependency before
-/// `[profile.dev]`.
+/// Build the CSV-enabled `Cargo.toml` by appending the `csv` dependency to the
+/// `[dependencies]` table.
 ///
 /// `csv.rs` (the vendored `Ipe.Csv` parse/encode kernels plus the `CsvDoc`
 /// struct) is the sole consumer of the `csv` crate. It is a leaf dependency
@@ -4727,26 +4675,15 @@ fn compression_cargo_toml(base: &str) -> DResult<String> {
 ///
 /// # Errors
 ///
-/// Returns [`Diagnostic::CompilerBug`] if the `[profile.dev]` anchor is absent —
+/// Returns [`Diagnostic::CompilerBug`] if the `[dependencies]` table is absent —
 /// a golden-drift invariant violation (fail-loud, never a silent no-op).
 fn csv_cargo_toml(base: &str) -> DResult<String> {
-    const PROFILE_ANCHOR: &str = "[profile.dev]";
     let deps = format!(
         "{} = \"{}\"\n\n",
         crate_specs::CSV.name,
         crate_specs::CSV.version,
     );
-    let anchor_pos = base
-        .find(PROFILE_ANCHOR)
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::csv_cargo_toml",
-            detail: format!("Cargo.toml anchor {PROFILE_ANCHOR:?} not found — golden drifted"),
-        })?;
-    let mut result = String::with_capacity(base.len() + deps.len());
-    result.push_str(base.get(..anchor_pos).unwrap_or(""));
-    result.push_str(&deps);
-    result.push_str(base.get(anchor_pos..).unwrap_or(""));
-    Ok(result)
+    append_dependencies(base, &deps, "ipe_backend_rust::project::csv_cargo_toml")
 }
 
 /// Build the heavy-`crypto_core`-enabled `Cargo.toml` by enabling the `crypto`
@@ -4993,7 +4930,7 @@ fn async_runtime_cargo_toml(base: &str, tokio: &BTreeSet<TokioFeature>) -> DResu
 }
 
 /// Build the heavy-`Ipe.Crypto`-enabled `Cargo.toml` by appending the five
-/// crypto-exclusive dependencies before `[profile.dev]`.
+/// crypto-exclusive dependencies to the `[dependencies]` table.
 ///
 /// `crypto.rs` (the gated heavy `Ipe.Crypto` kernels) is the sole consumer of
 /// `sha1`, `md-5`, `aes-gcm`, `chacha20poly1305`, and `pbkdf2`. These are leaves
@@ -5008,10 +4945,9 @@ fn async_runtime_cargo_toml(base: &str, tokio: &BTreeSet<TokioFeature>) -> DResu
 ///
 /// # Errors
 ///
-/// Returns [`Diagnostic::CompilerBug`] if the `[profile.dev]` anchor is absent —
+/// Returns [`Diagnostic::CompilerBug`] if the `[dependencies]` table is absent —
 /// a golden-drift invariant violation (fail-loud, never a silent no-op).
 fn crypto_cargo_toml(base: &str) -> DResult<String> {
-    const PROFILE_ANCHOR: &str = "[profile.dev]";
     let deps = format!(
         "{} = \"{}\"\n{} = \"{}\"\n{} = \"{}\"\n{} = \"{}\"\n{} = \"{}\"\n\n",
         crate_specs::SHA1.name,
@@ -5025,17 +4961,7 @@ fn crypto_cargo_toml(base: &str) -> DResult<String> {
         crate_specs::PBKDF2.name,
         crate_specs::PBKDF2.version,
     );
-    let anchor_pos = base
-        .find(PROFILE_ANCHOR)
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::crypto_cargo_toml",
-            detail: format!("Cargo.toml anchor {PROFILE_ANCHOR:?} not found — golden drifted"),
-        })?;
-    let mut result = String::with_capacity(base.len() + deps.len());
-    result.push_str(base.get(..anchor_pos).unwrap_or(""));
-    result.push_str(&deps);
-    result.push_str(base.get(anchor_pos..).unwrap_or(""));
-    Ok(result)
+    append_dependencies(base, &deps, "ipe_backend_rust::project::crypto_cargo_toml")
 }
 
 /// Build the JWT-enabled `Cargo.toml` from the given base manifest by:
@@ -5046,7 +4972,7 @@ fn crypto_cargo_toml(base: &str) -> DResult<String> {
 ///    and the JWT sign/verify helpers. Without `"jwt"` in `default`, those
 ///    items are compiled out and `main.rs` references to `AuthConfig` fail with
 ///    E0425 (ipe exit 0, cargo fails — a SEAL breach).
-/// 2. Appending the `jsonwebtoken` dependency before `[profile.dev]`.
+/// 2. Appending the `jsonwebtoken` dependency to the `[dependencies]` table.
 ///
 /// `jwt.rs` (and `auth.rs`, which reaches `crate::jwt`) is the sole consumer of
 /// `jsonwebtoken`. The crate is a leaf — a program that never encodes or
@@ -5067,7 +4993,7 @@ fn jwt_cargo_toml(base: &str) -> DResult<String> {
         crate_specs::JSONWEBTOKEN.version,
     );
     let promoted = promote_declared_feature(base, "jwt", WHERE)?;
-    insert_before_profile_dev(&promoted, &deps, WHERE)
+    append_dependencies(&promoted, &deps, WHERE)
 }
 
 /// Promote the `secret` feature into the vendored manifest's `default = [...]`
@@ -5401,14 +5327,13 @@ fn json_string(s: &str) -> String {
 }
 
 /// Append the bound FFI crates' pinned `[dependencies]` lines (driver-merged,
-/// exact versions, effective feature sets) before the `[profile.dev]` anchor.
+/// exact versions, effective feature sets) to the `[dependencies]` table.
 ///
 /// # Errors
 ///
 /// [`Diagnostic::CompilerBug`] when the FFI emission inputs are absent while
 /// the program uses FFI, or when the manifest anchor drifted.
 fn ffi_cargo_toml(base: &str, ctx: &EmitCtx) -> DResult<String> {
-    const PROFILE_ANCHOR: &str = "[profile.dev]";
     let ffi = ctx.ffi.as_ref().ok_or_else(|| Diagnostic::CompilerBug {
         where_: "ipe_backend_rust::project::ffi_cargo_toml",
         detail: "program lowers foreign-wrapper calls but the driver supplied no FFI \
@@ -5441,17 +5366,11 @@ fn ffi_cargo_toml(base: &str, ctx: &EmitCtx) -> DResult<String> {
         dep_block.push('\n');
     }
     dep_block.push('\n');
-    let anchor_pos = base
-        .find(PROFILE_ANCHOR)
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::ffi_cargo_toml",
-            detail: format!("Cargo.toml anchor {PROFILE_ANCHOR:?} not found — golden drifted"),
-        })?;
-    let mut result = String::with_capacity(base.len() + dep_block.len());
-    result.push_str(base.get(..anchor_pos).unwrap_or(""));
-    result.push_str(&dep_block);
-    result.push_str(base.get(anchor_pos..).unwrap_or(""));
-    Ok(result)
+    append_dependencies(
+        base,
+        &dep_block,
+        "ipe_backend_rust::project::ffi_cargo_toml",
+    )
 }
 
 /// Emit the `into_sql_param` impl for `SqlValue` and `into_field_param` impl

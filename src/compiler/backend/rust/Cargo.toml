@@ -49,6 +49,9 @@ e2e-support = { path = "../../../../tools/e2e-support" }
 # backend source file and reads string-literal values through syn.
 proc-macro2 = { version = "1", features = ["span-locations"] }
 syn = { version = "3", default-features = false, features = ["full", "visit", "parsing"] }
+# The vendored-manifest splice test parses each composed `Cargo.toml` to prove
+# every augmenter's dependency sits in the cross-platform `[dependencies]` table.
+toml = "0.8"
 
 [lints]
 workspace = true

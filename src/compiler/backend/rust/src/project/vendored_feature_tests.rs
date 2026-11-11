@@ -1146,3 +1146,124 @@ fn auth_wrappers_follow_auth_and_db() {
         assert!(auth_db.contains(name), "{name} missing with Auth and Db");
     }
 }
+
+/// The dependency names `manifest`'s cross-platform `[dependencies]` table
+/// declares, and those its `[target.…]` tables declare, read by a TOML parser.
+fn dependency_tables(manifest: &str) -> Result<(BTreeSet<String>, BTreeSet<String>), String> {
+    let parsed: toml::Table = manifest.parse().map_err(|e| format!("not TOML: {e}"))?;
+    let keys = |deps: Option<&toml::Value>| -> BTreeSet<String> {
+        deps.and_then(toml::Value::as_table)
+            .map(|t| t.keys().cloned().collect())
+            .unwrap_or_default()
+    };
+    let main = keys(parsed.get("dependencies"));
+    let target = parsed
+        .get("target")
+        .and_then(toml::Value::as_table)
+        .map(|targets| {
+            targets
+                .values()
+                .flat_map(|t| keys(t.get("dependencies")))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((main, target))
+}
+
+/// Every dependency an augmenter adds lands in the cross-platform
+/// `[dependencies]` table, alone and composed in emit order, so no target's
+/// build loses a crate its vendored sources name; and every composition is
+/// valid TOML (no duplicate key).
+#[test]
+fn augmenter_dependencies_land_in_the_main_table() {
+    let async_base = async_runtime_cargo_toml(CARGO_TOML, &tokio_base_features())
+        .expect("async base must build");
+    let base_tables = dependency_tables(&async_base);
+    assert!(
+        matches!(&base_tables, Ok((main, target)) if !main.is_empty() && !target.is_empty()),
+        "precondition: the base carries both a main and a target-only dependency \
+         table: {base_tables:?}"
+    );
+    let mut drift = Vec::new();
+    let mut check = |name: &str, mode: &str, before: &str, after: &str| match (
+        dependency_tables(before),
+        dependency_tables(after),
+    ) {
+        (Ok((main_before, target_before)), Ok((main_after, target_after))) => {
+            for dep in target_after.difference(&target_before) {
+                drift.push(format!("{name} ({mode}): {dep:?} landed in a target table"));
+            }
+            for dep in main_before.difference(&main_after) {
+                drift.push(format!("{name} ({mode}): {dep:?} left [dependencies]"));
+            }
+        }
+        (before, after) => drift.push(format!("{name} ({mode}): {before:?} -> {after:?}")),
+    };
+    let mut composed = async_base.clone();
+    for (name, augment) in AUGMENTERS {
+        let alone = augment(&async_base);
+        assert!(alone.is_ok(), "{name} augments the async base: {alone:?}");
+        let Ok(alone) = alone else { return };
+        check(name, "alone", &async_base, &alone);
+        let next = augment(&composed);
+        assert!(next.is_ok(), "{name} composes in emit order: {next:?}");
+        let Ok(next) = next else { return };
+        check(name, "composed", &composed, &next);
+        composed = next;
+    }
+    let ffi = super::append_dependencies(&composed, "ffi_probe = \"=1.0.0\"\n", "test");
+    assert!(ffi.is_ok(), "the ffi splice composes last: {ffi:?}");
+    let Ok(ffi) = ffi else { return };
+    check("ffi", "composed", &composed, &ffi);
+    let grown = dependency_tables(&ffi).map(|(main, _)| main.len());
+    let floor = base_tables.map(|(main, _)| main.len() + 20);
+    assert!(
+        matches!((&grown, &floor), (Ok(g), Ok(f)) if g >= f),
+        "precondition: the composition adds the augmenters' dependencies: {grown:?} vs {floor:?}"
+    );
+    assert!(
+        drift.is_empty(),
+        "an augmenter splices a dependency outside the cross-platform \
+         [dependencies] table:\n{}",
+        drift.join("\n")
+    );
+}
+
+/// The dependency splice reads its insertion point from the `[dependencies]`
+/// table, whatever section follows, and refuses a manifest without exactly one.
+#[test]
+fn dependency_splice_targets_the_main_table() {
+    const MANIFEST: &str = "[dependencies]\na = \"1\"\n\n# unix only\n\
+                            [target.'cfg(unix)'.dependencies]\nb = \"1\"\n\n[profile.dev]\n";
+    let out = super::append_dependencies(MANIFEST, "c = \"1\"\n\n", "test");
+    assert!(
+        matches!(&out, Ok(m) if m.starts_with("[dependencies]\na = \"1\"\nc = \"1\"\n\n# unix only\n")),
+        "the line joins [dependencies] after its last entry: {out:?}"
+    );
+    let tables = out
+        .as_deref()
+        .map_err(|e| format!("{e:?}"))
+        .and_then(dependency_tables);
+    assert!(
+        matches!(&tables, Ok((main, target)) if main.contains("c") && !target.contains("c")),
+        "{tables:?}"
+    );
+    let no_newline = super::append_dependencies("[dependencies]\na = \"1\"", "c = \"1\"", "test");
+    assert!(
+        matches!(&no_newline, Ok(m) if m == "[dependencies]\na = \"1\"\nc = \"1\"\n"),
+        "{no_newline:?}"
+    );
+    let nothing = super::append_dependencies(MANIFEST, "\n", "test");
+    assert!(matches!(&nothing, Ok(m) if m == MANIFEST), "{nothing:?}");
+    for drifted in [
+        "[profile.dev]\n".to_owned(),
+        format!("{MANIFEST}[dependencies]\nd = \"1\"\n"),
+        "  [dependencies]\na = \"1\"\n".to_owned(),
+    ] {
+        let refused = super::append_dependencies(&drifted, "c = \"1\"\n", "test");
+        assert!(
+            matches!(refused, Err(Diagnostic::CompilerBug { .. })),
+            "a manifest without exactly one [dependencies] header refuses: {refused:?}"
+        );
+    }
+}
