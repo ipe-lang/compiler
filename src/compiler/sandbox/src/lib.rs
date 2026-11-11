@@ -559,37 +559,28 @@ fn run_in_filtered_bwrap_jail(
     payload: &[OsString],
     allow_subprocess: bool,
 ) -> Result<JailedOutput, SandboxDefect> {
-    // The proof's canary jails run before the seccomp fd below turns
-    // inheritable, so none of them can inherit it.
     let (scope, timeout) = proven_scope(caps)?;
     let Some(program) = seccomp::subprocess_deny_program(allow_subprocess) else {
         // No filter can be compiled here — refuse rather than run unfiltered.
         return Err(SandboxDefect::NoIsolationMechanism);
     };
-    // The memfd is owned in the PARENT so it is closed on return — this launcher
-    // `spawn`s (not `exec`s) and the server is long-lived, so a leaked fd per
-    // request would exhaust the process's file-descriptor limit. The child gets
-    // its own inherited copy across `spawn`, so closing the parent's copy after
-    // the run does not disturb the jailed process.
     let owned = run_jail::write_seccomp_memfd(&program).map_err(|d| SandboxDefect::Spawn {
         program: "seccomp".to_owned(),
         detail: d.to_string(),
     })?;
-    // The sealed seccomp fd MUST be inheritable so bwrap reads the filter from it
-    // across the spawn. Clearing close-on-exec here, in the parent, refuses the
-    // run (fail-closed) when the flag cannot be cleared, rather than run the
-    // payload without its filter.
-    // Known limit: between this close-on-exec clear and the spawn, a sibling child
-    // forked by another thread inherits the same open file description. The seal
-    // blocks writes, not a shared-offset `lseek`/`read`, so this fd must reach only
-    // its one child.
-    let seccomp_fd = owned.make_inheritable().map_err(|e| SandboxDefect::Spawn {
-        program: "seccomp".to_owned(),
-        detail: format!("clearing close-on-exec on the seccomp memfd failed: {e}"),
-    })?;
-    let out = run_bwrap(&scope, timeout, spec, payload, &seccomp_fd);
-    drop(owned);
-    out
+    // The launch hands bwrap stdio and this sealed filter alone. Its parent copy
+    // stays close-on-exec, so no sibling child inherits it, and closes when the
+    // spawn returns, so this long-lived process leaks no descriptor per run.
+    let launch = owned
+        .launch(|fd| bwrap_argv_with_seccomp(&scope, timeout, spec, payload, &fd))
+        .map_err(|refusal| match refusal {
+            run_jail::LaunchRefusal::Render(defect) => defect,
+            run_jail::LaunchRefusal::Handoff(defect) => SandboxDefect::Spawn {
+                program: "bwrap".to_owned(),
+                detail: defect.to_string(),
+            },
+        })?;
+    run_bwrap(launch, spec.limits.out_cap_bytes)
 }
 
 /// Refuse every bubblewrap payload jail on a target with no seccomp filter.
@@ -615,43 +606,25 @@ fn run_in_filtered_bwrap_jail(
     Err(SandboxDefect::NoIsolationMechanism)
 }
 
-/// The shared spawn+drain core for every bubblewrap payload jail.
+/// The shared spawn+drain core for every bubblewrap payload jail: start
+/// `launch` through the runtime descriptor floor with stdin from `/dev/null`,
+/// then drain its piped output under `cap`.
 ///
-/// `--seccomp <fd>` is inserted into the bwrap argv; the caller owns that
-/// sealed fd and has already made it inheritable, so bwrap reads the filter
-/// from it across the exec.
-// Reached only through the seccomp-carrying jail, which exists only where a
-// filter can be compiled; elsewhere nothing calls it.
-#[cfg_attr(
-    not(all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    )),
-    allow(dead_code)
-)]
-fn run_bwrap(
-    scope: &run_jail::NprocScope,
-    timeout: &ToolPath,
-    spec: &JailSpec,
-    payload: &[OsString],
-    seccomp_fd: &run_jail::SeccompFdNumber<'_>,
-) -> Result<JailedOutput, SandboxDefect> {
-    let argv = bwrap_argv_with_seccomp(scope, timeout, spec, payload, seccomp_fd)?;
-    let (program, rest) = argv
-        .args()
-        .split_first()
-        .ok_or(SandboxDefect::NoIsolationMechanism)?;
-    let spawn_err = |e: std::io::Error| SandboxDefect::Spawn {
-        program: program.to_string_lossy().into_owned(),
-        detail: e.to_string(),
-    };
-    let mut cmd = std::process::Command::new(program);
-    cmd.args(rest)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let child = cmd.spawn().map_err(spawn_err)?;
-    drain_and_reap(child, spec.limits.out_cap_bytes, program)
+/// Reached only through the seccomp-carrying jail, which exists only where a
+/// filter can be compiled.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn run_bwrap(launch: run_jail::JailLaunch, cap: u64) -> Result<JailedOutput, SandboxDefect> {
+    let program = launch.program().to_owned();
+    let child = launch
+        .spawn(std::process::Stdio::piped(), std::process::Stdio::piped())
+        .map_err(|defect| SandboxDefect::Spawn {
+            program: program.to_string_lossy().into_owned(),
+            detail: defect.to_string(),
+        })?;
+    drain_and_reap(child, cap, &program)
 }
 
 /// Which jailed stream a drain thread read.
@@ -675,6 +648,15 @@ struct DrainOutcome {
 /// reader. Each stream is read in its own thread, and every thread reports
 /// through one channel so the parent reacts to whichever finishes first rather
 /// than blocking on a fixed join order.
+// Reached only through the seccomp-carrying jail, which exists only where a
+// filter can be compiled; elsewhere nothing calls it.
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )),
+    allow(dead_code)
+)]
 fn drain_and_reap(
     mut child: std::process::Child,
     cap: u64,
@@ -790,6 +772,15 @@ fn drain_and_reap(
 /// argv, the seccomp flag cannot be attached to bwrap — dropping it would run
 /// the payload without its syscall filter (fail-open). The refusal here keeps
 /// the seccomp guarantee: no filter, no run.
+// Reached only through the seccomp-carrying jail, which exists only where a
+// filter can be compiled; elsewhere nothing calls it.
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )),
+    allow(dead_code)
+)]
 fn bwrap_argv_with_seccomp<'fd>(
     scope: &run_jail::NprocScope,
     timeout: &ToolPath,

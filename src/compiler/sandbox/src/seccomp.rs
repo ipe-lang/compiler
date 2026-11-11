@@ -460,7 +460,11 @@ pub fn subprocess_deny_program(allow_subprocess: bool) -> Option<JailProgram> {
 #[derive(Debug, PartialEq, Eq)]
 pub struct JailProgram(Vec<SockFilter>);
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 impl JailProgram {
     /// A real jail program on a fixed ABI, independent of the host arch, for
     /// tests that need a sealed seccomp descriptor but not its decisions.

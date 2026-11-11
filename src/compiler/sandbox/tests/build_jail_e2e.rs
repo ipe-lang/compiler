@@ -40,11 +40,6 @@ use ipe_sandbox::build_jail::{CapabilityAxis, JailOutcome, build_in_jail};
 use ipe_sandbox::run_jail::{BwrapTools, FilesystemScope, RunJailTools, SandboxProfile};
 use ipe_sandbox::{CanonicalPath, JailMounts};
 
-/// The `build_in_jail` seccomp path creates a `memfd` and clears its
-/// close-on-exec flag — a process-global fd-table mutation. Serialize the jailed
-/// runs so parallel `--test-threads` cannot race on fd numbers.
-static JAIL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// The absolute path to the admission probe fixture, from the workspace root
 /// this crate is built within.
 fn fixture_path() -> PathBuf {
@@ -81,7 +76,6 @@ fn jail_can_establish(tools: &RunJailTools) -> bool {
     *CANARY.get_or_init(|| {
         let scoped = fresh_scratch("canary");
         let bound = canonical(&scoped);
-        let _guard = JAIL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let outcome = build_in_jail(
             tools,
             &SandboxProfile::maximally_isolated(),
@@ -172,7 +166,6 @@ fn run_fixture(
         OsString::from("/bin/sh"),
         jailed_fixture.into_os_string(),
     ];
-    let _guard = JAIL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     build_in_jail(tools, profile, &mounts(&bound), &payload)
 }
 
@@ -281,7 +274,6 @@ fn a_missing_fixture_is_a_non_clean_outcome_fail_closed() {
     let scoped = fresh_scratch("missing");
     let bound = canonical(&scoped);
     let outcome = {
-        let _guard = JAIL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         build_in_jail(
             &tools,
             &SandboxProfile::maximally_isolated(),

@@ -3479,6 +3479,7 @@ dependencies = [
  "dunce",
  "e2e-support",
  "getrandom 0.3.4",
+ "ipe-runtime-rust",
  "ipe-test-temp",
  "ipe_diagnostics",
  "ipe_env",
