@@ -408,8 +408,14 @@ mod tests {
             SecurityPosture::from_lookup(lookup(&[("IPE_ADMIN_TOKEN", "hunter2-secret")]));
         let shown = format!("{posture:?}");
         assert!(!shown.contains("hunter2"), "{shown}");
-        assert!(!shown.contains("Set("), "a set credential's reading shown: {shown}");
-        assert_eq!(format!("{INGEST_TOKEN:?}"), "SecretKey(\"IPE_INGEST_TOKEN\")");
+        assert!(
+            !shown.contains("Set("),
+            "a set credential's reading shown: {shown}"
+        );
+        assert_eq!(
+            format!("{INGEST_TOKEN:?}"),
+            "SecretKey(\"IPE_INGEST_TOKEN\")"
+        );
         crate::system::locked_set_var(INGEST_TOKEN.name(), "hunter2-secret");
         let refused = INGEST_TOKEN.entry().check();
         crate::system::locked_remove_var(INGEST_TOKEN.name());
