@@ -391,7 +391,7 @@ impl<R: HostResolver + Send + 'static> reqwest::dns::Resolve for VettingResolver
 /// # Errors
 ///
 /// [`UrlRefusal`] naming why `url` was refused.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "email", not(target_arch = "wasm32")))]
 pub(crate) async fn ssrf_apply(
     builder: reqwest::ClientBuilder,
     url: &str,
