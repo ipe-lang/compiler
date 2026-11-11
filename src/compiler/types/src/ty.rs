@@ -281,17 +281,41 @@ pub const RETRY_POLICY_FIELDS: [&str; 4] = ["baseMs", "maxAttempts", "shouldRetr
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct TyBounds(u16);
 
-impl TyBounds {
-    const ADD: u16 = 1 << 0;
-    const SUB: u16 = 1 << 1;
-    const MUL: u16 = 1 << 2;
-    const ORD: u16 = 1 << 3;
-    const EQ: u16 = 1 << 4;
-    const SET_ELEM: u16 = 1 << 5;
-    const DICT_KEY: u16 = 1 << 6;
-    const SHOW: u16 = 1 << 7;
+/// Declare every obligation flag of [`TyBounds`] exactly once.
+///
+/// Each `NAME = n;` row becomes the private flag const `NAME = 1 << n`, an entry
+/// of [`TyBounds::ALL_BITS`] and a term of the `ALL` union, so a flag cannot be
+/// declared without entering both coverage lists the build-time proofs walk.
+macro_rules! obligation_flags {
+    ($($(#[$doc:meta])* $name:ident = $bit:literal;)+) => {
+        impl TyBounds {
+            $($(#[$doc])* const $name: u16 = 1 << $bit;)+
+
+            /// Every individual obligation bit as a single-bit set, one per flag.
+            ///
+            /// The use-site super-bound gate's completeness test walks this so a newly-added bit that no gate clause covers fails the
+            /// build (an uncovered bit would vacuously admit a function type at a
+            /// generic emission — the ipe-accepts-then-cargo-rejects seal break
+            /// this guards).
+            pub const ALL_BITS: &'static [Self] = &[$(Self(Self::$name)),+];
+
+            /// The OR of every declared obligation flag.
+            const ALL: u16 = $(Self::$name)|+;
+        }
+    };
+}
+
+obligation_flags! {
+    ADD = 0;
+    SUB = 1;
+    MUL = 2;
+    ORD = 3;
+    EQ = 4;
+    SET_ELEM = 5;
+    DICT_KEY = 6;
+    SHOW = 7;
     /// The append obligation (`++` → `Appendable a ⊇ { String, List a }`).
-    const APPEND: u16 = 1 << 8;
+    APPEND = 8;
     /// The higher-order-kernel callback-result obligation.
     ///
     /// This variable is the final RESULT of a callback arrow that a
@@ -312,7 +336,7 @@ impl TyBounds {
     /// a collection-of-functions payload is a different, already-gated
     /// hazard. Fails CLOSED on a bare variable, exactly like every sibling
     /// bit. See `docs/adr/0001-language-semantics-and-types.md`.
-    const HOF_KERNEL_RESULT: u16 = 1 << 9;
+    HOF_KERNEL_RESULT = 9;
     /// The SQL-bind-parameter obligation: this variable is the ELEMENT type of
     /// a `List a` argument bound into `Db.exec` / `Db.query` / `Db.queryDecode`'s
     /// params position (raw scheme-var 0 for `exec`/`query`, var 1 for
@@ -326,7 +350,7 @@ impl TyBounds {
     /// call-site instantiation is left completely unconstrained (an empty
     /// `List a` argument) — see the `sql_param` arm of the numeric-defaulting
     /// loop in `crate::lib`.
-    const SQL_PARAM: u16 = 1 << 10;
+    SQL_PARAM = 10;
     /// The interpolation obligation: this variable is rendered by `{{…}}`
     /// string interpolation or passed as a `Log.*With` attribute. Satisfied by
     /// exactly the closed scalar set in `crate::super_bounds::INTERPOLABLE`
@@ -334,8 +358,10 @@ impl TyBounds {
     /// the sealed runtime trait `IpeInterpolate`, implemented for those five
     /// types only. Defaulted to `String` when a call-site instantiation is
     /// left completely unconstrained (an empty `Log.*With` attribute list).
-    const INTERPOLABLE: u16 = 1 << 11;
+    INTERPOLABLE = 11;
+}
 
+impl TyBounds {
     /// No obligation — a structurally-parametric variable.
     pub const EMPTY: Self = Self(0);
 
@@ -501,45 +527,6 @@ impl TyBounds {
         Self(self.0 | other.0)
     }
 
-    /// Every individual obligation bit as a single-bit set, one entry per raw
-    /// flag. The use-site super-bound gate's completeness test walks this so a
-    /// newly-added bit that no gate clause covers fails the build (an uncovered
-    /// bit would vacuously admit a function type at a generic emission — the
-    /// exact ipe-accepts-then-cargo-rejects seal break this guards).
-    pub const ALL_BITS: &'static [Self] = &[
-        Self(Self::ADD),
-        Self(Self::SUB),
-        Self(Self::MUL),
-        Self(Self::ORD),
-        Self(Self::EQ),
-        Self(Self::SET_ELEM),
-        Self(Self::DICT_KEY),
-        Self(Self::SHOW),
-        Self(Self::APPEND),
-        Self(Self::HOF_KERNEL_RESULT),
-        Self(Self::SQL_PARAM),
-        Self(Self::INTERPOLABLE),
-    ];
-
-    /// The OR of every real obligation flag — the SSOT the completeness link
-    /// checks [`Self::ALL_BITS`] against. A new `1 << n` flag added with its
-    /// `has_*` accessor and gate clause but forgotten in `ALL_BITS` would leave
-    /// the use-site-clause walk vacuous (fail-open — the flag's clause admits a
-    /// function type unchecked); listing the new flag here without also adding
-    /// its `ALL_BITS` entry breaks the `build` below instead.
-    const ALL: u16 = Self::ADD
-        | Self::SUB
-        | Self::MUL
-        | Self::ORD
-        | Self::EQ
-        | Self::SET_ELEM
-        | Self::DICT_KEY
-        | Self::SHOW
-        | Self::APPEND
-        | Self::HOF_KERNEL_RESULT
-        | Self::SQL_PARAM
-        | Self::INTERPOLABLE;
-
     /// The OR-fold of every entry in [`Self::ALL_BITS`] — a `const fn` so the
     /// completeness link below is a compile-time check, not a skippable test.
     const fn all_bits_union() -> u16 {
@@ -553,26 +540,52 @@ impl TyBounds {
     }
 }
 
-/// Build-time completeness link: `ALL_BITS` must enumerate EXACTLY the flags in
-/// `ALL`, each exactly once. The union equality catches a flag left out of (or
-/// duplicated in) `ALL_BITS`; the length-vs-popcount equality additionally
-/// rejects a duplicate entry that would still union to `ALL`. Either drift
-/// fails the build, so the use-site-clause completeness walk can never pass
-/// vacuously over a missing bit.
+/// Build-time completeness link: `ALL_BITS` holds exactly the flags in `ALL`,
+/// each once.
+///
+/// Both lists expand from the one `obligation_flags!` declaration, so a flag
+/// cannot reach one list without the other. The length-vs-popcount equality
+/// refuses two declared flags sharing a bit position, which would union to
+/// `ALL` while listing one duty twice. Either drift fails the build, so the
+/// use-site-clause completeness walk can never pass vacuously over a bit.
 const _: () = {
     // IPE-RUST-AUDIT:ACCEPTED compile-time completeness assert — a `const` build
-    // check evaluated at compile time, never a runtime panic path. The union
-    // equality catches a flag left out of (or duplicated in) `ALL_BITS`; the
-    // length-vs-popcount equality additionally rejects a duplicate that would
-    // still union to `ALL`. Either drift fails the build.
+    // check evaluated at compile time, never a runtime panic path.
     assert!(
         TyBounds::all_bits_union() == TyBounds::ALL
             && TyBounds::ALL_BITS.len() == TyBounds::ALL.count_ones() as usize,
         "TyBounds::ALL_BITS must enumerate exactly the flags in TyBounds::ALL, each \
-         once — a flag added to ALL without an ALL_BITS entry, or a duplicate/missing \
-         single-bit entry, breaks this build"
+         once — two flags declared at one bit position break this build"
     );
 };
+
+/// The annotation type variable a rigid (skolem) solver variable stands for.
+///
+/// Built only from an annotation-space raw ([`Ty::Var`] or an open row tail of
+/// a written signature), which is the interned [`Symbol`] of the variable the
+/// user wrote; a solver-tagged raw has no annotation behind it and builds none.
+/// A rigid therefore always carries the spelling a refusal prints.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SkolemName(Symbol);
+
+impl SkolemName {
+    /// The name of the annotation variable whose raw id is `raw`, or `None` for
+    /// a solver-tagged raw, which names no annotation variable.
+    #[must_use]
+    pub const fn of_annotation_var(raw: u32) -> Option<Self> {
+        if is_solver_var(raw) {
+            None
+        } else {
+            Some(Self(Symbol::from_raw(raw)))
+        }
+    }
+
+    /// The annotation variable's interned spelling.
+    #[must_use]
+    pub const fn symbol(self) -> Symbol {
+        self.0
+    }
+}
 
 /// What a union-find variable resolves to during inference.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -590,12 +603,16 @@ pub enum Content {
     /// union-find identity: two occurrences of the *same* annotation variable
     /// share one rigid node (via the per-signature instantiation map), so they are
     /// `equivalent`; two different variables are separate nodes that cannot unify.
-    Rigid,
+    ///
+    /// The [`SkolemName`] is the annotation variable the rigid stands for, so a
+    /// refusal names it as the user wrote it.
+    Rigid(SkolemName),
     /// A variable constrained to a Ipê super-type ([`TyBounds`]) but not yet
     /// pinned to a concrete structure. `rigid` distinguishes a super-typed
-    /// *annotation skolem* (it must stay generic, surfacing its obligations as
-    /// trait bounds on the emitted type parameter) from a super-typed *flex* (an
-    /// inferred variable that may still pin to a matching concrete type).
+    /// *annotation skolem* (`Some` of its annotation name: it must stay generic,
+    /// surfacing its obligations as trait bounds on the emitted type parameter)
+    /// from a super-typed *flex* (`None`: an inferred variable that may still
+    /// pin to a matching concrete type).
     ///
     /// A super-typed flex pins to any structure that satisfies its obligations
     /// (`Int` / `Float` for Number; the scalar primitives for Comparable; any
@@ -603,7 +620,10 @@ pub enum Content {
     /// super-typed rigid against a concrete structure is a mismatch, exactly as a
     /// plain rigid is — the annotation promised a generic the body is now trying
     /// to pin down.
-    Super { rigid: bool, bounds: TyBounds },
+    Super {
+        rigid: Option<SkolemName>,
+        bounds: TyBounds,
+    },
     /// A resolved concrete structure.
     Structure(FlatType),
 }
@@ -761,5 +781,49 @@ mod var_ceiling_tests {
             assert_eq!(VarCeiling::at_most(nz).get(), n);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod obligation_flag_tests {
+    use super::{SkolemName, TyBounds, tag_solver_var};
+
+    /// Every named obligation constructor is one distinct entry of the macro-derived `ALL_BITS`.
+    #[test]
+    fn all_bits_covers_every_declared_flag_once() {
+        let named = [
+            TyBounds::add(),
+            TyBounds::sub(),
+            TyBounds::mul(),
+            TyBounds::ord(),
+            TyBounds::eq(),
+            TyBounds::set_elem(),
+            TyBounds::dict_key(),
+            TyBounds::show(),
+            TyBounds::appendable(),
+            TyBounds::hof_kernel_result(),
+            TyBounds::sql_param(),
+            TyBounds::interpolable(),
+        ];
+        assert_eq!(TyBounds::ALL_BITS.len(), named.len());
+        for (i, flag) in named.iter().enumerate() {
+            assert!(
+                TyBounds::ALL_BITS.contains(flag),
+                "named flag {i} is missing from ALL_BITS"
+            );
+            assert_eq!(flag.0.count_ones(), 1, "named flag {i} must be one bit");
+            assert_eq!(TyBounds::ALL & flag.0, flag.0, "ALL must hold flag {i}");
+        }
+        let union = named
+            .iter()
+            .fold(TyBounds::EMPTY, |acc, flag| acc.union(*flag));
+        assert_eq!(union.0, TyBounds::ALL, "ALL must hold no undeclared bit");
+    }
+
+    /// A solver-tagged raw names no annotation variable, so it builds no skolem name.
+    #[test]
+    fn a_solver_raw_builds_no_skolem_name() {
+        assert_eq!(SkolemName::of_annotation_var(tag_solver_var(3)), None);
+        assert!(SkolemName::of_annotation_var(3).is_some());
     }
 }

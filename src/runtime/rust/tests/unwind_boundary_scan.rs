@@ -9,10 +9,17 @@
 //! a `CatchPanicLayer` path, a `JoinError::try_into_panic`/`into_panic` call,
 //! and a no-argument `.join()` (a thread `JoinHandle`, whose `Err` is the
 //! payload). [`CATCH_SITES`] lists each `(file, fn, shape)` with its exact
-//! count and its [`Route`]: a site that can see Ipê code must call the named
-//! typed conversion in the same function, and a site that runs no Ipê code
-//! says why. An unlisted site, a stale entry, and a typed route whose callee is
-//! missing all go red.
+//! count and its [`Route`]: a site that can see Ipê code must hand the caught
+//! payload to the named typed conversion in the same function, and a site that
+//! runs no Ipê code says why. An unlisted site, a stale entry, and a typed route
+//! whose callee never receives the payload all go red.
+//!
+//! The same walk keys every async-task start and join on its operation: a call,
+//! a path or a method named in [`TASK_OPS`], on any receiver and outside the
+//! [`FUNNEL_FILES`], is a site that [`TASK_SITES`] must list exactly, so a task
+//! starts and joins only through `threads::spawn_task` and `IpeJoinSet`. An
+//! `#[allow]` or `#[expect]` of `clippy::disallowed_types` outside the funnel
+//! is refused, since it would silence the type-resolved `JoinSet` ban.
 //!
 //! A `#[cfg(...)]` proven test-only removes exactly the node it is attached to;
 //! a `use` names nothing; comments and string literals are never code. A macro
@@ -34,8 +41,9 @@ use proc_macro2::{Delimiter, TokenStream, TokenTree};
 use syn::ext::IdentExt;
 use syn::visit::{self, Visit};
 use syn::{
-    Arm, Attribute, Expr, ExprMethodCall, ExprPath, Field, FieldValue, ImplItem, ImplItemFn, Item,
-    ItemFn, ItemUse, Macro, Path, Stmt, TraitItem, TraitItemFn, UseTree, Variant,
+    Arm, Attribute, Expr, ExprCall, ExprMethodCall, ExprPath, Field, FieldValue, ImplItem,
+    ImplItemFn, Item, ItemFn, ItemUse, Local, Macro, Pat, PatIdent, Path, Stmt, TraitItem,
+    TraitItemFn, UseTree, Variant,
 };
 
 #[path = "support/cfg_scan.rs"]
@@ -75,11 +83,267 @@ fn names_a_type(segment: &str) -> bool {
     segment.chars().next().is_some_and(char::is_uppercase)
 }
 
+/// The last path segments and method names that start or join an async task.
+const TASK_OPS: &[&str] = &[
+    "spawn",
+    "spawn_on",
+    "spawn_local",
+    "spawn_local_on",
+    "spawn_blocking_on",
+    "join_next",
+    "try_join_next",
+    "join_next_with_id",
+    "join_all",
+    "spawn_unmigrated",
+    "spawn_in_current_scope",
+];
+
+/// The files that hold the task funnel; their task operations are its own.
+const FUNNEL_FILES: &[&str] = &["threads.rs"];
+
+/// The file that names each path the runtime `clippy.toml` denies. Its task
+/// paths name a denied path and start nothing, so it is exempt only while it
+/// holds nothing but such namings (see [`names_paths_only`]).
+const PATH_NAMING_FILE: &str = "clippy_paths_resolve.rs";
+
+/// Whether `src` holds only `const _X: () = ..;` items, each under no
+/// attribute but `cfg` or `doc`, whose initializers declare no item but a type
+/// alias and expand no macro. A const initializer runs at compile time, where starting a task
+/// does not compile, and a unit value hands no callable to the code that names
+/// it. An item declared inside the initializer escapes it (an `impl` there adds
+/// a method to an outside type, the `const _` idiom derives use), and a macro or
+/// an attribute macro can expand to one, so either could start a task at run
+/// time; so could a `fn`, `impl`, `static` or typed const at the top level.
+fn names_paths_only(src: &str) -> bool {
+    let Ok(file) = syn::parse_file(src) else {
+        return false;
+    };
+    file.items.iter().all(|item| {
+        let Item::Const(konst) = item else {
+            return false;
+        };
+        let unit = matches!(&*konst.ty, syn::Type::Tuple(t) if t.elems.is_empty());
+        let inert_attrs = konst
+            .attrs
+            .iter()
+            .all(|attr| attr.path().is_ident("cfg") || attr.path().is_ident("doc"));
+        let mut opaque = DeclaresOrExpands::default();
+        opaque.visit_expr(&konst.expr);
+        unit && inert_attrs && !opaque.found && konst.ident.to_string().starts_with('_')
+    })
+}
+
+/// Whether a syntax node declares an item other than a type alias, or invokes
+/// a macro, anywhere inside.
+#[derive(Default)]
+struct DeclaresOrExpands {
+    found: bool,
+}
+
+impl<'ast> Visit<'ast> for DeclaresOrExpands {
+    fn visit_item(&mut self, item: &'ast Item) {
+        // A type alias holds no code; it names a denied type for an expectation.
+        if let Item::Type(alias) = item {
+            visit::visit_item_type(self, alias);
+        } else {
+            self.found = true;
+        }
+    }
+
+    fn visit_macro(&mut self, _: &'ast Macro) {
+        self.found = true;
+    }
+}
+
+/// The files whose raw task sites the next migration slice moves onto the
+/// funnel; only they may hold a [`TaskRoute::Unmigrated`] row.
+const UNMIGRATED_FILES: &[&str] = &[
+    "tea.rs",
+    "system.rs",
+    "web/console_proxy.rs",
+    "task.rs",
+    "ws_client.rs",
+];
+
+/// The directory prefix whose files the next migration slice also moves.
+const UNMIGRATED_DIR: &str = "debugger/";
+
+/// How a ledgered task site stands to the funnel.
+#[derive(Debug, Clone, Copy)]
+enum TaskRoute {
+    /// The name is not a task operation here (an OS-thread or child-process
+    /// start, a closure parameter called `spawn`); the text says what it is.
+    NotATask(&'static str),
+    /// A raw start the next migration slice moves onto the funnel.
+    Unmigrated,
+    /// A task on a target with no unwind, so no trip can be typed there; the
+    /// text says why.
+    NoUnwind(&'static str),
+}
+
+/// One ledgered task site.
+struct TaskSite {
+    /// The file, relative to `src/`.
+    file: &'static str,
+    /// The enclosing function, or [`OUTSIDE_FN`].
+    function: &'static str,
+    /// The operation: one of [`TASK_OPS`].
+    op: &'static str,
+    /// How many times `op` occurs in `function`.
+    count: usize,
+    /// How the site stands to the funnel.
+    route: TaskRoute,
+}
+
+/// What a `wasm32` task start answers for a trip.
+const WASM_NO_UNWIND: &str = "wasm32 has no unwind: a trip traps the instance";
+
+/// A Sub source's start closure, which the binding names `spawn`.
+const SOURCE_START: &str = "a Sub source's start closure, called by its binding's name";
+
+/// Every task-operation name outside the funnel, with how it stands to it.
+const TASK_SITES: &[TaskSite] = &[
+    TaskSite {
+        file: "system.rs",
+        function: OUTSIDE_FN,
+        op: "spawn",
+        count: 1,
+        route: TaskRoute::Unmigrated,
+    },
+    TaskSite {
+        file: "system.rs",
+        function: "request_spawn",
+        op: "spawn",
+        count: 1,
+        route: TaskRoute::NotATask("the spawner job's closure parameter"),
+    },
+    TaskSite {
+        file: "system.rs",
+        function: "spawn_hardened_on",
+        op: "spawn",
+        count: 1,
+        route: TaskRoute::NotATask("`std::process::Command::spawn`, a child process"),
+    },
+    TaskSite {
+        file: "system.rs",
+        function: "spawn_hardened_tokio",
+        op: "spawn",
+        count: 1,
+        route: TaskRoute::NotATask("`tokio::process::Command::spawn`, a child process"),
+    },
+    TaskSite {
+        file: "system.rs",
+        function: "spawner",
+        op: "spawn",
+        count: 1,
+        route: TaskRoute::NotATask("`std::thread::Builder::spawn`, the spawner's OS thread"),
+    },
+    TaskSite {
+        file: "task.rs",
+        function: "spawn_in_current_scope",
+        op: "spawn_unmigrated",
+        count: 1,
+        route: TaskRoute::Unmigrated,
+    },
+    TaskSite {
+        file: "tea.rs",
+        function: "add",
+        op: "spawn",
+        count: 1,
+        route: TaskRoute::NotATask(SOURCE_START),
+    },
+    TaskSite {
+        file: "tea.rs",
+        function: "apply",
+        op: "spawn",
+        count: 1,
+        route: TaskRoute::NotATask(SOURCE_START),
+    },
+    TaskSite {
+        file: "tea.rs",
+        function: "apply",
+        op: "spawn_in_current_scope",
+        count: 1,
+        route: TaskRoute::Unmigrated,
+    },
+    TaskSite {
+        file: "tea.rs",
+        function: "cli_run_cmd_tracked",
+        op: "spawn_in_current_scope",
+        count: 1,
+        route: TaskRoute::Unmigrated,
+    },
+    TaskSite {
+        file: "tea.rs",
+        function: "start_source",
+        op: "spawn_in_current_scope",
+        count: 2,
+        route: TaskRoute::Unmigrated,
+    },
+    TaskSite {
+        file: "tea.rs",
+        function: "sub_map_arc",
+        op: "spawn",
+        count: 1,
+        route: TaskRoute::NotATask(SOURCE_START),
+    },
+    TaskSite {
+        file: "tea.rs",
+        function: "sub_map_rc",
+        op: "spawn",
+        count: 1,
+        route: TaskRoute::NotATask(SOURCE_START),
+    },
+    TaskSite {
+        file: "tea.rs",
+        function: "worker_run_cmd",
+        op: "spawn_in_current_scope",
+        count: 1,
+        route: TaskRoute::Unmigrated,
+    },
+    TaskSite {
+        file: "wasm/mod.rs",
+        function: "enqueue",
+        op: "spawn_local",
+        count: 1,
+        route: TaskRoute::NoUnwind(WASM_NO_UNWIND),
+    },
+    TaskSite {
+        file: "wasm/mod.rs",
+        function: "run_cmd",
+        op: "spawn_local",
+        count: 1,
+        route: TaskRoute::NoUnwind(WASM_NO_UNWIND),
+    },
+    TaskSite {
+        file: "wasm/mod.rs",
+        function: "run_start",
+        op: "spawn_local",
+        count: 1,
+        route: TaskRoute::NoUnwind(WASM_NO_UNWIND),
+    },
+    TaskSite {
+        file: "wasm/subs.rs",
+        function: "update",
+        op: "spawn",
+        count: 1,
+        route: TaskRoute::NotATask(SOURCE_START),
+    },
+    TaskSite {
+        file: "ws_client.rs",
+        function: "start_socket",
+        op: "spawn",
+        count: 1,
+        route: TaskRoute::Unmigrated,
+    },
+];
+
 /// How a ledgered catch site treats a runtime trip.
 #[derive(Debug, Clone, Copy)]
 enum Route {
-    /// The site can see Ipê code and calls this typed conversion in the same
-    /// function, so a trip keeps its kind (or is resumed).
+    /// The site can see Ipê code and hands the caught payload to this typed
+    /// conversion in the same function, so a trip keeps its kind (or is
+    /// resumed).
     Typed(&'static str),
     /// The site catches only runtime or library code, never an Ipê
     /// computation, so no trip can reach it; the text says what it catches.
@@ -179,18 +443,11 @@ const CATCH_SITES: &[CatchSite] = &[
         route: Route::Typed("entry_unwind_error"),
     },
     CatchSite {
-        file: "task.rs",
-        function: "spawn_guarded_raw",
+        file: "threads.rs",
+        function: "classify",
         shape: "try_into_panic",
         count: 1,
         route: Route::Typed("closure_unwind"),
-    },
-    CatchSite {
-        file: "task.rs",
-        function: "parallel_child_failure",
-        shape: "try_into_panic",
-        count: 1,
-        route: Route::Typed("ipe_error_from_unwind"),
     },
     CatchSite {
         file: "threads.rs",
@@ -213,24 +470,23 @@ const CATCH_SITES: &[CatchSite] = &[
         count: 1,
         route: Route::Typed("panic_500_body"),
     },
-    CatchSite {
-        file: "web/mod.rs",
-        function: "serve_page",
-        shape: "try_into_panic",
-        count: 1,
-        route: Route::Typed("panic_500_body"),
-    },
 ];
 
-/// One file's catch sites and the names each function calls.
+/// One file's catch and task sites and the names each function calls.
 #[derive(Default)]
 struct Found {
     /// `(fn, shape)` per catch occurrence.
     sites: Vec<(String, &'static str)>,
     /// Every path's last segment and method name, per function.
     calls: BTreeMap<String, BTreeSet<String>>,
+    /// Per function, every callee handed a caught payload (or a catch itself).
+    routed: BTreeMap<String, BTreeSet<String>>,
     /// `(original, alias)` per `use` that renames a catch name or join handle.
     renames: Vec<(String, String)>,
+    /// `(fn, op)` per task-operation occurrence.
+    tasks: Vec<(String, &'static str)>,
+    /// `(original, alias)` per `use` that renames a task operation.
+    task_renames: Vec<(String, String)>,
 }
 
 /// The `syn` walk of one file's production syntax.
@@ -238,6 +494,56 @@ struct Found {
 struct Scan {
     functions: Vec<String>,
     found: Found,
+    /// Per function, the bindings that hold a caught payload.
+    tainted: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// Whether an expression holds a catch or names a binding of `tainted`.
+struct Touch<'t> {
+    tainted: &'t BTreeSet<String>,
+    hit: bool,
+}
+
+impl<'ast> Visit<'ast> for Touch<'_> {
+    fn visit_expr_method_call(&mut self, call: &'ast ExprMethodCall) {
+        let name = call.method.unraw().to_string();
+        if Scan::catch_shape(&name).is_some() || (name == "join" && call.args.is_empty()) {
+            self.hit = true;
+        }
+        visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_expr_path(&mut self, expr: &'ast ExprPath) {
+        if let Some(segment) = expr.path.segments.first()
+            && expr.path.segments.len() == 1
+            && self.tainted.contains(&segment.ident.unraw().to_string())
+        {
+            self.hit = true;
+        }
+        visit::visit_expr_path(self, expr);
+    }
+
+    fn visit_path(&mut self, path: &'ast Path) {
+        if path
+            .segments
+            .iter()
+            .any(|segment| Scan::catch_shape(&segment.ident.unraw().to_string()).is_some())
+        {
+            self.hit = true;
+        }
+        visit::visit_path(self, path);
+    }
+}
+
+/// Every binding a pattern introduces.
+#[derive(Default)]
+struct Binders(Vec<String>);
+
+impl<'ast> Visit<'ast> for Binders {
+    fn visit_pat_ident(&mut self, pat: &'ast PatIdent) {
+        self.0.push(pat.ident.unraw().to_string());
+        visit::visit_pat_ident(self, pat);
+    }
 }
 
 impl Scan {
@@ -265,7 +571,60 @@ impl Scan {
         if let Some(shape) = Self::catch_shape(name) {
             self.record(shape);
         }
+        self.task(name);
         self.call(name.to_owned());
+    }
+
+    /// Record `name` as a task site when it is a task operation.
+    fn task(&mut self, name: &str) {
+        if let Some(op) = TASK_OPS.iter().copied().find(|op| *op == name) {
+            let function = self.function();
+            self.found.tasks.push((function, op));
+        }
+    }
+
+    /// Whether `expr` holds a catch or a binding that holds a caught payload.
+    fn touches(&self, expr: &Expr) -> bool {
+        let empty = BTreeSet::new();
+        let tainted = self.tainted.get(&self.function()).unwrap_or(&empty);
+        let mut touch = Touch {
+            tainted,
+            hit: false,
+        };
+        touch.visit_expr(expr);
+        touch.hit
+    }
+
+    /// Mark every binding `pat` introduces as holding a caught payload.
+    fn taint(&mut self, pat: &Pat) {
+        let mut binders = Binders::default();
+        binders.visit_pat(pat);
+        let function = self.function();
+        self.tainted.entry(function).or_default().extend(binders.0);
+    }
+
+    /// Mark the parameters of every closure in `args` as holding a caught
+    /// payload.
+    fn taint_closures<'a>(&mut self, args: impl Iterator<Item = &'a Expr>) {
+        for arg in args {
+            if let Expr::Closure(closure) = arg {
+                for input in &closure.inputs {
+                    self.taint(input);
+                }
+            }
+        }
+    }
+
+    /// Record `callee` as handed a caught payload when any of `args` holds one.
+    fn route<'a>(&mut self, callee: String, mut args: impl Iterator<Item = &'a Expr>) {
+        if args.any(|arg| self.touches(arg)) {
+            let function = self.function();
+            self.found
+                .routed
+                .entry(function)
+                .or_default()
+                .insert(callee);
+        }
     }
 
     /// Count the catch shapes in a macro body, token by token.
@@ -355,8 +714,13 @@ impl<'ast> Visit<'ast> for Scan {
                         || JOIN_HANDLES.contains(&original.as_str())
                         || original == "thread"
                         || (from_thread && original == "scope");
+                    let alias = rename.rename.unraw().to_string();
+                    if TASK_OPS.contains(&original.as_str()) {
+                        self.found
+                            .task_renames
+                            .push((original.clone(), alias.clone()));
+                    }
                     if hidden {
-                        let alias = rename.rename.unraw().to_string();
                         self.found.renames.push((original, alias));
                     }
                 }
@@ -420,6 +784,17 @@ impl<'ast> Visit<'ast> for Scan {
         }
     }
 
+    fn visit_local(&mut self, local: &'ast Local) {
+        if local
+            .init
+            .as_ref()
+            .is_some_and(|init| self.touches(&init.expr))
+        {
+            self.taint(&local.pat);
+        }
+        visit::visit_local(self, local);
+    }
+
     fn visit_stmt(&mut self, stmt: &'ast Stmt) {
         let attrs: &[Attribute] = match stmt {
             Stmt::Local(local) => &local.attrs,
@@ -435,10 +810,29 @@ impl<'ast> Visit<'ast> for Scan {
         if cfg_test_only(expr_attrs(expr)) {
             return;
         }
-        if let Expr::Verbatim(tokens) = expr {
-            self.scan_tokens(tokens.clone());
+        match expr {
+            Expr::Verbatim(tokens) => self.scan_tokens(tokens.clone()),
+            Expr::Let(binding) if self.touches(&binding.expr) => self.taint(&binding.pat),
+            Expr::Match(matched) if self.touches(&matched.expr) => {
+                for arm in &matched.arms {
+                    self.taint(&arm.pat);
+                }
+            }
+            _ => {}
         }
         visit::visit_expr(self, expr);
+    }
+
+    fn visit_expr_call(&mut self, call: &'ast ExprCall) {
+        if self.touches(&call.func) {
+            self.taint_closures(call.args.iter());
+        }
+        if let Expr::Path(func) = &*call.func
+            && let Some(last) = func.path.segments.last()
+        {
+            self.route(last.ident.unraw().to_string(), call.args.iter());
+        }
+        visit::visit_expr_call(self, call);
     }
 
     fn visit_expr_method_call(&mut self, call: &'ast ExprMethodCall) {
@@ -447,6 +841,13 @@ impl<'ast> Visit<'ast> for Scan {
             self.record(THREAD_JOIN);
         }
         self.named(&name);
+        if self.touches(&call.receiver) {
+            self.taint_closures(call.args.iter());
+        }
+        self.route(
+            name,
+            std::iter::once(&*call.receiver).chain(call.args.iter()),
+        );
         visit::visit_expr_method_call(self, call);
     }
 
@@ -467,7 +868,9 @@ impl<'ast> Visit<'ast> for Scan {
             previous = Some(name);
         }
         if let Some(last) = path.segments.last() {
-            self.call(last.ident.unraw().to_string());
+            let name = last.ident.unraw().to_string();
+            self.task(&name);
+            self.call(name);
         }
         visit::visit_path(self, path);
     }
@@ -512,7 +915,7 @@ fn scan(name: &str, src: &str) -> Found {
 /// Every difference between the catch sites of `sources` and `ledger`.
 fn violations(sources: &[(String, String)], ledger: &[CatchSite]) -> Vec<String> {
     let mut counts: BTreeMap<(String, String, &'static str), usize> = BTreeMap::new();
-    let mut calls: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    let mut routed: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
     let mut out = Vec::new();
     for (file, src) in sources {
         let found = scan(file, src);
@@ -526,8 +929,8 @@ fn violations(sources: &[(String, String)], ledger: &[CatchSite]) -> Vec<String>
             let count = counts.entry((file.clone(), function, shape)).or_insert(0);
             *count = count.saturating_add(1);
         }
-        for (function, names) in found.calls {
-            calls.insert((file.clone(), function), names);
+        for (function, callees) in found.routed {
+            routed.insert((file.clone(), function), callees);
         }
     }
     for ((file, function, shape), count) in &counts {
@@ -557,12 +960,12 @@ fn violations(sources: &[(String, String)], ledger: &[CatchSite]) -> Vec<String>
         }
         match site.route {
             Route::Typed(callee) => {
-                let called = calls
+                let handed = routed
                     .get(&(site.file.to_owned(), site.function.to_owned()))
-                    .is_some_and(|names| names.contains(callee));
-                if !called {
+                    .is_some_and(|callees| callees.contains(callee));
+                if !handed {
                     out.push(format!(
-                        "{}: `{}` catches through `{}` but never calls `{callee}`",
+                        "{}: `{}` catches through `{}` but never hands its payload to `{callee}`",
                         site.file, site.function, site.shape
                     ));
                 }
@@ -578,6 +981,323 @@ fn violations(sources: &[(String, String)], ledger: &[CatchSite]) -> Vec<String>
         }
     }
     out
+}
+
+/// Whether an attribute's tokens name `disallowed_types` under an `allow`,
+/// an `expect`, or a `cfg_attr` that may expand to one.
+fn silences_disallowed_types(attr: &Attribute) -> bool {
+    fn names(tokens: TokenStream) -> bool {
+        tokens.into_iter().any(|tree| match tree {
+            TokenTree::Ident(id) => id.unraw() == "disallowed_types",
+            TokenTree::Group(group) => names(group.stream()),
+            TokenTree::Punct(_) | TokenTree::Literal(_) => false,
+        })
+    }
+    let lint_level = ["allow", "expect", "cfg_attr"]
+        .iter()
+        .any(|level| attr.path().is_ident(level));
+    lint_level
+        && match &attr.meta {
+            syn::Meta::List(list) => names(list.tokens.clone()),
+            syn::Meta::Path(_) | syn::Meta::NameValue(_) => false,
+        }
+}
+
+/// Every attribute of a file, test code included, that silences
+/// `disallowed_types`.
+#[derive(Default)]
+struct LintAllows(usize);
+
+impl<'ast> Visit<'ast> for LintAllows {
+    fn visit_attribute(&mut self, attr: &'ast Attribute) {
+        if silences_disallowed_types(attr) {
+            self.0 = self.0.saturating_add(1);
+        }
+    }
+}
+
+/// How many attributes of `src` silence `disallowed_types`.
+fn disallowed_type_allows(name: &str, src: &str) -> usize {
+    let parsed = syn::parse_file(src);
+    assert!(
+        parsed.is_ok(),
+        "{name}: does not parse as Rust, so its lint attributes cannot be read"
+    );
+    let mut walk = LintAllows::default();
+    if let Ok(file) = parsed {
+        walk.visit_file(&file);
+    }
+    walk.0
+}
+
+/// Whether `file` is one the next migration slice moves onto the funnel.
+fn awaits_migration(file: &str) -> bool {
+    UNMIGRATED_FILES.contains(&file) || file.starts_with(UNMIGRATED_DIR)
+}
+
+/// Every difference between the task sites of `sources` and `ledger`.
+fn task_violations(sources: &[(String, String)], ledger: &[TaskSite]) -> Vec<String> {
+    let mut counts: BTreeMap<(String, String, &'static str), usize> = BTreeMap::new();
+    let mut out = Vec::new();
+    for (file, src) in sources {
+        if FUNNEL_FILES.contains(&file.as_str()) {
+            continue;
+        }
+        if file == PATH_NAMING_FILE {
+            if names_paths_only(src) {
+                continue;
+            }
+            out.push(format!(
+                "{file}: holds an item other than a `const _X: () = ..;` naming, or one \
+                 that declares an item, expands a macro or carries an attribute other than \
+                 `cfg`, so it may start a task the scan exempts: keep it to namings"
+            ));
+        }
+        let allows = disallowed_type_allows(file, src);
+        if allows > 0 {
+            out.push(format!(
+                "{file}: {allows} attribute(s) silence `clippy::disallowed_types`, which bans \
+                 a raw `JoinSet` outside `threads.rs`: join through `threads::IpeJoinSet`"
+            ));
+        }
+        let found = scan(file, src);
+        for (original, alias) in found.task_renames {
+            out.push(format!(
+                "{file}: `use .. {original} as {alias}` hides a task operation from the scan: \
+                 call it by its own name"
+            ));
+        }
+        for (function, op) in found.tasks {
+            let count = counts.entry((file.clone(), function, op)).or_insert(0);
+            *count = count.saturating_add(1);
+        }
+    }
+    for ((file, function, op), count) in &counts {
+        let listed = ledger
+            .iter()
+            .find(|s| s.file == file.as_str() && s.function == function.as_str() && s.op == *op);
+        match listed {
+            None => out.push(format!(
+                "{file}: `{function}` starts or joins a task through `{op}` {count} time(s) \
+                 unledgered: start it through `threads::spawn_task` (join a set through \
+                 `threads::IpeJoinSet`), or add a `TASK_SITES` row saying why it is not a task"
+            )),
+            Some(site) if site.count != *count => out.push(format!(
+                "{file}: `{function}` `{op}` occurs {count} time(s), ledgered {}",
+                site.count
+            )),
+            Some(_) => {}
+        }
+    }
+    for site in ledger {
+        let key = (site.file.to_owned(), site.function.to_owned(), site.op);
+        if !counts.contains_key(&key) {
+            out.push(format!(
+                "{}: `{}` `{}` ledgered {} time(s), found 0 (stale entry)",
+                site.file, site.function, site.op, site.count
+            ));
+        }
+        match site.route {
+            TaskRoute::Unmigrated if !awaits_migration(site.file) => out.push(format!(
+                "{}: `{}` `{}` is ledgered unmigrated outside the files the next slice migrates",
+                site.file, site.function, site.op
+            )),
+            TaskRoute::NotATask(what) | TaskRoute::NoUnwind(what) if what.trim().is_empty() => {
+                out.push(format!(
+                    "{}: `{}` must say why its `{}` is not a funnel start",
+                    site.file, site.function, site.op
+                ));
+            }
+            TaskRoute::Unmigrated | TaskRoute::NotATask(_) | TaskRoute::NoUnwind(_) => {}
+        }
+    }
+    out
+}
+
+/// The task-local scopes the caller carrier must wrap a task in.
+const CARRIED_SCOPES: &[&str] = &[
+    "carry_web_session",
+    "carry_request_streams",
+    "carry_server_request",
+];
+
+/// Every scope the caller carrier of `task.rs` drops, and every carry the
+/// `block_on` entry thread skips.
+fn carrier_gaps(sources: &[(String, String)]) -> Vec<String> {
+    let Some((_, src)) = sources.iter().find(|(name, _)| name == "task.rs") else {
+        return vec!["task.rs: not read, so the caller carrier cannot be checked".to_owned()];
+    };
+    let calls = scan("task.rs", src).calls;
+    let empty = BTreeSet::new();
+    let carrier = calls.get("on_behalf_of_caller").unwrap_or(&empty);
+    let mut out: Vec<String> = CARRIED_SCOPES
+        .iter()
+        .filter(|scope| !carrier.contains(**scope))
+        .map(|scope| {
+            format!(
+                "task.rs: `on_behalf_of_caller` never calls `{scope}`, so a task drops that scope"
+            )
+        })
+        .collect();
+    out.extend(block_on_carry_gaps(src));
+    out
+}
+
+/// The calls and method calls named `name` in a syntax node.
+struct CallsNamed<'n> {
+    name: &'n str,
+    count: usize,
+}
+
+impl<'ast> Visit<'ast> for CallsNamed<'_> {
+    fn visit_expr_call(&mut self, call: &'ast ExprCall) {
+        if let Expr::Path(callee) = &*call.func
+            && callee
+                .path
+                .segments
+                .last()
+                .is_some_and(|s| s.ident == self.name)
+        {
+            self.count = self.count.saturating_add(1);
+        }
+        visit::visit_expr_call(self, call);
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast ExprMethodCall) {
+        if call.method == self.name {
+            self.count = self.count.saturating_add(1);
+        }
+        visit::visit_expr_method_call(self, call);
+    }
+}
+
+fn calls_named(stmts: &[Stmt], name: &str) -> usize {
+    let mut walk = CallsNamed { name, count: 0 };
+    for stmt in stmts {
+        walk.visit_stmt(stmt);
+    }
+    walk.count
+}
+
+/// Whether a syntax node binds or assigns `name`.
+struct Rebinds<'n> {
+    name: &'n syn::Ident,
+    found: bool,
+}
+
+impl<'ast> Visit<'ast> for Rebinds<'_> {
+    fn visit_pat_ident(&mut self, pat: &'ast PatIdent) {
+        self.found |= pat.ident == *self.name;
+        visit::visit_pat_ident(self, pat);
+    }
+
+    fn visit_expr_assign(&mut self, assign: &'ast syn::ExprAssign) {
+        self.found |= matches!(&*assign.left, Expr::Path(p) if p.path.is_ident(self.name));
+        visit::visit_expr_assign(self, assign);
+    }
+}
+
+/// Whether `stmt` is `let <param> = on_behalf_of_caller(<param>);`.
+fn carries_param(stmt: &Stmt, param: &syn::Ident) -> bool {
+    let Stmt::Local(local) = stmt else {
+        return false;
+    };
+    let Pat::Ident(bound) = &local.pat else {
+        return false;
+    };
+    let Some(init) = local.init.as_ref().filter(|init| init.diverge.is_none()) else {
+        return false;
+    };
+    let Expr::Call(call) = &*init.expr else {
+        return false;
+    };
+    let carrier = matches!(&*call.func, Expr::Path(f) if f.path.segments.last().is_some_and(|s| s.ident == "on_behalf_of_caller"));
+    let mut args = call.args.iter();
+    let of_param =
+        matches!((args.next(), args.next()), (Some(Expr::Path(a)), None) if a.path.is_ident(param));
+    bound.ident == *param && bound.subpat.is_none() && carrier && of_param
+}
+
+/// Every way the `block_on` entry of `src` can start its entry thread on a
+/// future that does not carry the caller's scope.
+///
+/// Exactly one top-level `block_on` spawns through `spawn_sized`, once, and a
+/// statement before that spawn shadows its future parameter with
+/// `on_behalf_of_caller` of itself, with no rebinding of the name between.
+fn block_on_carry_gaps(src: &str) -> Vec<String> {
+    let Ok(file) = syn::parse_file(src) else {
+        return vec!["task.rs: does not parse, so `block_on` cannot be checked".to_owned()];
+    };
+    let entries: Vec<&ItemFn> = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Fn(f)
+                if f.sig.ident == "block_on" && calls_named(&f.block.stmts, "spawn_sized") > 0 =>
+            {
+                Some(f)
+            }
+            _ => None,
+        })
+        .collect();
+    let [entry] = entries.as_slice() else {
+        return vec![format!(
+            "task.rs: {} top-level `block_on` entries start their thread through \
+             `spawn_sized`; exactly one must, so its carry can be checked",
+            entries.len()
+        )];
+    };
+    let stmts = &entry.block.stmts;
+    let spawns = calls_named(stmts, "spawn_sized");
+    if spawns != 1 {
+        return vec![format!(
+            "task.rs: `block_on` calls `spawn_sized` {spawns} times; one carried start is checked"
+        )];
+    }
+    let param = entry.sig.inputs.first().and_then(|arg| match arg {
+        syn::FnArg::Typed(typed) => match &*typed.pat {
+            Pat::Ident(p) => Some(p.ident.clone()),
+            _ => None,
+        },
+        syn::FnArg::Receiver(_) => None,
+    });
+    let Some(param) = param else {
+        return vec!["task.rs: `block_on` takes no named future to carry".to_owned()];
+    };
+    let carried = stmts.iter().position(|stmt| carries_param(stmt, &param));
+    let spawned = stmts
+        .iter()
+        .position(|stmt| calls_named(std::slice::from_ref(stmt), "spawn_sized") > 0);
+    let (Some(carried), Some(spawned)) = (carried, spawned) else {
+        return vec![format!(
+            "task.rs: `block_on` never carries its future through \
+             `let {param} = on_behalf_of_caller({param});`, so its entry thread drops \
+             the caller's scope"
+        )];
+    };
+    if carried >= spawned {
+        return vec![format!(
+            "task.rs: `block_on` carries `{param}` after the `spawn_sized` start, so the \
+             entry thread runs the uncarried future"
+        )];
+    }
+    let mut rebinds = Rebinds {
+        name: &param,
+        found: false,
+    };
+    for stmt in stmts
+        .get(carried.saturating_add(1)..spawned)
+        .unwrap_or_default()
+    {
+        rebinds.visit_stmt(stmt);
+    }
+    if rebinds.found {
+        return vec![format!(
+            "task.rs: `block_on` rebinds `{param}` between its carry and the `spawn_sized` \
+             start, so the entry thread may run an uncarried future"
+        )];
+    }
+    Vec::new()
 }
 
 fn sources(files: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -708,9 +1428,40 @@ fn sort_by_total<T>(result: &mut [T]) {
     assert!(
         found
             .iter()
-            .any(|v| v.contains("never calls `resume_runtime_trip`")),
+            .any(|v| v.contains("never hands its payload to `resume_runtime_trip`")),
         "{found:#?}"
     );
+}
+
+#[test]
+fn a_typed_callee_that_never_sees_the_payload_is_refused() {
+    let src = r"
+fn sort_by_total<T>(result: &mut [T]) {
+    let caught = std::panic::catch_unwind(|| ());
+    drop(crate::core::resume_runtime_trip(Box::new(0)));
+    drop(caught);
+}
+";
+    let found = violations(&sources(&[("list.rs", src)]), SORT_ONLY);
+    assert!(
+        found
+            .iter()
+            .any(|v| v.contains("never hands its payload to `resume_runtime_trip`")),
+        "{found:#?}"
+    );
+    let handed = r"
+fn sort_by_total<T>(result: &mut [T]) {
+    match std::panic::catch_unwind(|| ()) {
+        Ok(()) => {}
+        Err(caught) => {
+            let held = caught;
+            drop(crate::core::resume_runtime_trip(held));
+        }
+    }
+}
+";
+    let found = violations(&sources(&[("list.rs", handed)]), SORT_ONLY);
+    assert!(found.is_empty(), "{found:#?}");
 }
 
 #[test]
@@ -770,6 +1521,246 @@ fn every_runtime_catch_site_is_ledgered_and_routed() {
     assert!(
         violations.is_empty(),
         "unwind-boundary scan:\n{}",
+        violations.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Every async-task start and join goes through the funnel.
+// ---------------------------------------------------------------------------
+
+/// A one-row task ledger for the fixtures.
+const SOCKET_ONLY: &[TaskSite] = &[TaskSite {
+    file: "ws_client.rs",
+    function: "start_socket",
+    op: "spawn",
+    count: 1,
+    route: TaskRoute::Unmigrated,
+}];
+
+#[test]
+fn a_funnel_file_and_a_ledgered_site_pass() {
+    let funnel = r"
+fn spawn_task() { let _ = tokio::runtime::Handle::current().spawn(async {}); }
+#[allow(clippy::disallowed_types)]
+struct IpeJoinSet(tokio::task::JoinSet<()>);
+";
+    let socket = r#"
+fn start_socket() { tokio::spawn(async {}); }
+fn text() -> &'static str { "tokio::spawn( x.join_next()" }
+#[cfg(test)]
+mod tests { fn t() { tokio::spawn(async {}); } }
+"#;
+    let found = task_violations(
+        &sources(&[("threads.rs", funnel), ("ws_client.rs", socket)]),
+        SOCKET_ONLY,
+    );
+    assert!(found.is_empty(), "{found:#?}");
+}
+
+#[test]
+fn a_raw_task_start_and_its_evasions_are_refused() {
+    let src = r"
+use tokio::spawn as go;
+type Set = tokio::task::JoinSet<()>;
+fn via_rename() { go(async {}); }
+fn via_alias(set: &mut Set) { set.spawn(async {}); let _ = set.join_next(); }
+fn via_qself() { let _ = <tokio::task::JoinSet<()>>::spawn; }
+fn via_handle() { tokio::runtime::Handle::current().spawn(async {}); }
+fn via_macro() { m!(tokio::spawn(async {})); }
+#[expect(clippy::disallowed_types)]
+fn silenced() {}
+#[cfg(test)]
+mod tests { fn t() { tokio::spawn(async {}); } }
+";
+    let found = task_violations(&sources(&[("rogue.rs", src)]), &[]);
+    for needle in [
+        "`use .. spawn as go`",
+        "`via_alias` starts or joins a task through `spawn`",
+        "`via_alias` starts or joins a task through `join_next`",
+        "`via_qself` starts or joins a task through `spawn`",
+        "`via_handle` starts or joins a task through `spawn`",
+        "`via_macro` starts or joins a task through `spawn`",
+        "1 attribute(s) silence `clippy::disallowed_types`",
+    ] {
+        assert!(
+            found.iter().any(|v| v.contains(needle)),
+            "{needle} must be refused: {found:#?}"
+        );
+    }
+    assert_eq!(found.len(), 7, "{found:#?}");
+}
+
+#[test]
+fn an_unmigrated_row_outside_the_next_slice_or_a_stale_row_is_refused() {
+    let ledger = &[TaskSite {
+        file: "db.rs",
+        function: "close_within",
+        op: "join_next",
+        count: 1,
+        route: TaskRoute::Unmigrated,
+    }];
+    let src = "async fn close_within(set: &mut S) { let _ = set.join_next().await; }";
+    let found = task_violations(&sources(&[("db.rs", src)]), ledger);
+    assert!(
+        found
+            .iter()
+            .any(|v| v.contains("ledgered unmigrated outside the files the next slice migrates")),
+        "{found:#?}"
+    );
+    let stale = task_violations(
+        &sources(&[("ws_client.rs", "fn start_socket() {}")]),
+        SOCKET_ONLY,
+    );
+    assert!(
+        stale.iter().any(|v| v.contains("(stale entry)")),
+        "{stale:#?}"
+    );
+}
+
+#[test]
+fn a_carrier_that_drops_a_scope_is_refused() {
+    let carried = r"
+fn on_behalf_of_caller<F>(task: F) -> F {
+    carry_web_session(carry_request_streams(carry_server_request(task)))
+}
+fn block_on(future: F) {
+    let future = on_behalf_of_caller(future);
+    crate::threads::spawn_sized(move || future);
+}
+";
+    let found = carrier_gaps(&sources(&[("task.rs", carried)]));
+    assert!(found.is_empty(), "{found:#?}");
+    let dropped = r"
+fn on_behalf_of_caller<F>(task: F) -> F { carry_web_session(carry_request_streams(task)) }
+fn block_on(future: F) { crate::threads::spawn_sized(move || future); }
+";
+    let gaps = carrier_gaps(&sources(&[("task.rs", dropped)]));
+    for needle in [
+        "never calls `carry_server_request`",
+        "`block_on` never carries its future",
+    ] {
+        assert!(
+            gaps.iter().any(|v| v.contains(needle)),
+            "{needle} must be refused: {gaps:#?}"
+        );
+    }
+    assert_eq!(gaps.len(), 2, "{gaps:#?}");
+}
+
+#[test]
+fn a_block_on_carry_out_of_order_or_off_its_future_is_refused() {
+    let refused: &[(&str, &str)] = &[
+        (
+            "fn block_on(future: F) {
+                crate::threads::spawn_sized(move || future);
+                let future = on_behalf_of_caller(future);
+            }",
+            "after the `spawn_sized` start",
+        ),
+        (
+            "fn block_on(future: F) {
+                let carried = on_behalf_of_caller(future);
+                crate::threads::spawn_sized(move || future);
+            }",
+            "never carries its future",
+        ),
+        (
+            "fn block_on(future: F) {
+                let future = on_behalf_of_caller(other);
+                crate::threads::spawn_sized(move || future);
+            }",
+            "never carries its future",
+        ),
+        (
+            "fn block_on(future: F) {
+                let future = on_behalf_of_caller(future);
+                let future = raw(future);
+                crate::threads::spawn_sized(move || future);
+            }",
+            "rebinds `future`",
+        ),
+        (
+            "fn block_on(future: F) {
+                let future = on_behalf_of_caller(future);
+                crate::threads::spawn_sized(move || future);
+                crate::threads::spawn_sized(move || raw);
+            }",
+            "calls `spawn_sized` 2 times",
+        ),
+        (
+            "fn block_on(future: F) {
+                let future = on_behalf_of_caller(future);
+                crate::threads::spawn_sized(move || future);
+            }
+            fn block_on(future: F) { crate::threads::spawn_sized(move || future); }",
+            "2 top-level `block_on` entries",
+        ),
+    ];
+    for (src, needle) in refused {
+        let gaps = block_on_carry_gaps(src);
+        assert!(
+            gaps.len() == 1 && gaps.iter().any(|g| g.contains(needle)),
+            "`{needle}` must be refused:\n{src}\n{gaps:#?}"
+        );
+    }
+}
+
+#[test]
+fn the_path_naming_file_is_exempt_only_while_it_only_names_paths() {
+    let naming = "#[cfg(x)]
+const _UUID: () = {
+    let _ = |context: ::uuid::NoContext| ::uuid::Timestamp::now(context);
+};
+const _TOKIO: () = {
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::tokio::task::spawn_local::<R>;
+    let _: Option<::tokio::task::JoinSet<()>> = None;
+};
+const _AXUM: () = {
+    type QueryAlias<T> = ::axum::extract::Query<T>;
+    let _: Option<QueryAlias<()>> = None;
+};";
+    assert!(names_paths_only(naming));
+    let found = task_violations(&sources(&[(PATH_NAMING_FILE, naming)]), &[]);
+    assert!(found.is_empty(), "{found:#?}");
+    for smuggled in [
+        "const _T: () = { let _ = ::tokio::spawn; };\nfn start() { tokio::spawn(async {}); }",
+        "const _T: fn() = || { tokio::spawn(async {}); };",
+        "static _T: () = ();\nimpl S { fn start() { tokio::spawn(async {}); } }",
+        "const T: () = { let _ = ::tokio::spawn; };",
+        "const _T: () = { impl S { fn start() { tokio::spawn(async {}); } } };",
+        "const _T: () = { let _ = || { fn start() { tokio::spawn(async {}); } }; };",
+        "const _T: () = { spawner!(); };",
+        "const _T: () = { let _ = spawner!(); };",
+        "#[spawner]\nconst _T: () = ();",
+        "#[cfg_attr(all(), spawner)]\nconst _T: () = ();",
+        "const _T: () = { type A = [u8; { spawner!(); 0 }]; };",
+    ] {
+        assert!(!names_paths_only(smuggled), "{smuggled}");
+        let found = task_violations(&sources(&[(PATH_NAMING_FILE, smuggled)]), &[]);
+        assert!(
+            found.iter().any(|v| v.contains("holds an item other than")),
+            "{smuggled}: {found:#?}"
+        );
+    }
+}
+
+#[test]
+fn every_task_start_and_join_is_the_funnel() {
+    let root = e2e_support::manifest_dir!().join("src");
+    let found = rust_sources(&root);
+    for required in ["threads.rs", "task.rs", "web/mod.rs", "db.rs"] {
+        assert!(
+            found.iter().any(|(name, _)| name == required),
+            "the source walk did not read {required}"
+        );
+    }
+    let mut violations = task_violations(&found, TASK_SITES);
+    violations.extend(carrier_gaps(&found));
+    assert!(
+        violations.is_empty(),
+        "task funnel scan:\n{}",
         violations.join("\n")
     );
 }
