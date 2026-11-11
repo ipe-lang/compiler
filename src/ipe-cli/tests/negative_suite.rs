@@ -5697,3 +5697,33 @@ fn remote_import_without_use_compiles() {
                \x20   Io.println \"ok\"\n";
     assert_compiles("remote_import_without_use", src);
 }
+
+/// `List.repeat` copies its element; a `Task` carrier has no `Clone`, so the
+/// instance is refused at `ipe` time rather than failing `cargo` with E0277.
+#[test]
+fn lower_list_repeat_task_refused() {
+    let src = format!(
+        "{HEAD}import Ipe.Io as Io\n\
+         import Ipe.List as List\n\
+         import Ipe.Task as Task\n\
+         main : Task Error ()\n\
+         main =\n\
+         \x20   Task.map (\\_ -> ()) (Task.sequence (List.repeat 3 (Io.println \"x\")))\n"
+    );
+    assert_rejected("list_repeat_task", &src, "IPE-L0164");
+}
+
+/// Every emitted user generic is `Clone`; instantiating one with a `Task` is refused.
+#[test]
+fn lower_user_generic_task_refused() {
+    let src = format!(
+        "{HEAD}import Ipe.Io as Io\n\
+         ident : a -> a\n\
+         ident x =\n\
+         \x20   x\n\
+         main : Task Error ()\n\
+         main =\n\
+         \x20   ident (Io.println \"x\")\n"
+    );
+    assert_rejected("user_generic_task", &src, "IPE-L0164");
+}

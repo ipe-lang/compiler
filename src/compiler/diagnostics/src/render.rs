@@ -1089,6 +1089,11 @@ fn lower_prose(msg: &LowerError) -> String {
             "This attribute name belongs to the Ipê runtime, so it would never reach the page."
                 .to_string()
         }
+        LowerError::CalleeBoundUnmet { callee, demand, .. } => format!(
+            "`{callee}` {} the value it is given, and this value cannot be {}.",
+            demand.phrase(),
+            demand.passive()
+        ),
         LowerError::RouteParamUnsupportedType { .. } => {
             "One of this route's fields has a type I can't read out of a URL.".to_string()
         }
@@ -2440,6 +2445,15 @@ fn lower_label(msg: &LowerError) -> String {
         LowerError::ReservedAttributeName { call, name } => {
             format!("`{call}` names the attribute `{name}`, which the runtime reserves")
         }
+        LowerError::CalleeBoundUnmet {
+            callee,
+            demand,
+            leaf,
+        } => format!(
+            "`{callee}` {} its argument, but the argument holds a `{leaf}`, which cannot be {}",
+            demand.phrase(),
+            demand.passive()
+        ),
         LowerError::RouteParamUnsupportedType {
             field_index,
             type_name,

@@ -22,7 +22,7 @@ pub mod terminal;
 pub use code::*;
 pub use diagnostic::{
     AliasExpansionKind, AliasRowFault, AppShape, Applicability, ArgCount, COMPARABLE_TYPES,
-    Candidates, CaseDefect, CmdSubShapeMismatch, CodecAutoRejection, ConsentError, Construct,
+    CalleeDemand, Candidates, CaseDefect, CmdSubShapeMismatch, CodecAutoRejection, ConsentError, Construct,
     CtorWithheld, DResult, Diagnostic, DutyOrigin, EditTarget, EmitSite, Expected, ExpectedSet,
     ExposingDefect, Feature, FfiError, GENERIC_ORDERED_TYPES, GenericAppEntryReach, HazardRefusal,
     HeaderDefect, HelpLine, Hint, INTERPOLABLE_TYPES, IfDefect, ImportedAs, InterceptContext,

@@ -19,8 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ipe_canon::ast as canon;
 use ipe_diagnostics::{
-    DResult, Diagnostic, Feature, GenericAppEntryReach, InterceptContext, Located, LowerError,
-    MainRetName, NameError, Span, StoreEqAccessorDefect, StoreSelectProjectionDefect,
+    CalleeDemand, DResult, Diagnostic, Feature, GenericAppEntryReach, InterceptContext, Located,
+    LowerError, MainRetName, NameError, Span, StoreEqAccessorDefect, StoreSelectProjectionDefect,
 };
 use ipe_intern::{Interner, Symbol, SynthStem};
 use ipe_ir::free_vars::{
@@ -35,7 +35,7 @@ use ipe_ir::{
     UserPin, Variant, fun_value_arc_promotable, ir_type_has_effect_carrier, ir_type_holds,
     ir_type_is_serde, is_dispatch_free, is_irrefutable,
 };
-use ipe_kernels::FnSlotCarrier;
+use ipe_kernels::{FnSlotCarrier, RuntimeBounds};
 use ipe_types::{
     EmittedHeads, RowTail, SignatureWildcards, SolvedTypes, Ty, TyBounds, ty_is_ground,
 };
@@ -43,6 +43,7 @@ use ipe_types::{
 mod capture_rewrite;
 mod clone_class;
 mod generic_syms;
+mod instance_bounds;
 mod ir_type_mentions;
 mod record_shapes;
 mod signature_bounds;
@@ -5020,13 +5021,15 @@ fn collect_local_derived_tvars(
 ///
 /// Precision — the pass never breaks a caller:
 ///
-///   * It copies only the auto-trait/lifetime bits (`Sync`/`Send`/`'static`),
-///     which hold for every concrete emitted Ipê type — the operator/`Display`/
-///     `IpeRow` bounds are the callee's own body obligations, never a
-///     caller-forwarding concern. Because the copied bits are universally
-///     satisfied, gathering leaves inside a computed argument is deliberately
-///     generous: a leaf that turns out not to reach the callee generic can only
-///     over-tighten a bound harmlessly, never reject a caller.
+///   * It copies only the auto-trait/lifetime bits (`Sync`/`Send`/`'static`)
+///     — the operator/`Display`/`IpeRow` bounds are the callee's own body
+///     obligations, never a caller-forwarding concern. Those bits do not hold
+///     for every concrete type (a `Task` is not `Sync`); a concrete instance
+///     is judged once the bounds are final, by
+///     `instance_bounds::check_user_instances`, never here. Gathering leaves
+///     inside a computed argument is deliberately generous: a leaf that turns
+///     out not to reach the callee generic can only over-tighten a caller
+///     generic's bound, which a concrete instance of it then has to meet.
 ///   * It copies a bound only from a callee position whose parameter type
 ///     REACHES the callee generic bare ([`ir_type_generic_reaches_bare`], which
 ///     stops at opaque `Send + Sync` carriers). A pass-through the callee left
@@ -5400,8 +5403,10 @@ fn align_ret_tvars(sig: &IrType, target: Symbol, site: &IrType, out: &mut Vec<Sy
 enum SiteSlot {
     /// The slot's solved type, lowered.
     Lowered(IrType),
-    /// The slot's solved type does not lower; the def generics it mentions anywhere.
-    Unlowered(Vec<Symbol>),
+    /// The slot's solved type does not lower: the def generics it mentions
+    /// anywhere, and its lowering with every unfixed type variable read as
+    /// `JsonVal` (the carrier its call pin settles to), when that lowers.
+    Unlowered(Vec<Symbol>, Option<IrType>),
 }
 
 /// A lowered definition before its generics' body-derived bounds are folded in.
@@ -5433,6 +5438,8 @@ struct DefParts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CalleeInstance {
     callee: FuncId,
+    /// The reference's source span, where an unmet callee bound is refused.
+    span: Span,
     /// The `i`-th curried arrow parameter of the reference's solved type.
     params: Vec<SiteSlot>,
     /// The solved type left after peeling `d` arrows, at index `d`.
@@ -5440,6 +5447,27 @@ struct CalleeInstance {
     /// Empty when the reference has no solved type, so every lookup misses
     /// and the alignment fails closed.
     tails: Vec<SiteSlot>,
+}
+
+/// A kernel reference whose `Clone`-bounded scheme variable is a direct function at its instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingSharedFn {
+    /// The kernel reference's span.
+    span: Span,
+    /// The kernel.
+    kernel: KernelFn,
+    /// The scheme variable.
+    var: u8,
+}
+
+/// The scheme variables `kernel`'s runtime function bounds `Clone`.
+fn clone_row_vars(kernel: KernelFn) -> Vec<u8> {
+    kernel
+        .runtime_bounds()
+        .iter()
+        .filter(|(_, bounds)| bounds.contains(RuntimeBounds::CLONE))
+        .map(|(var, _)| *var)
+        .collect()
 }
 
 /// The caller generics a callee generic `target` is instantiated with through one signature slot.
@@ -5461,7 +5489,7 @@ fn instance_slot_tvars(
     }
     match site {
         None => caller_tvars.to_vec(),
-        Some(SiteSlot::Unlowered(mentioned)) => mentioned.clone(),
+        Some(SiteSlot::Unlowered(mentioned, _)) => mentioned.clone(),
         Some(SiteSlot::Lowered(site)) => aligned_param_tvars(sig, target, site, caller_tvars)
             .unwrap_or_else(|| {
                 caller_tvars
@@ -8492,12 +8520,21 @@ impl SchemeVarCarriers {
     /// 3. otherwise the target is the bindings below the top, else the
     ///    direct carrier when the bare slots disagree.
     ///
+    /// A variable in `clone_vars` (the runtime bounds it `Clone`) that no
+    /// rule targets, is not held under an opaque constructor, and has a bare
+    /// binding that is a direct function targets the shared carrier of that
+    /// function, the `Clone` one.
+    ///
     /// A variable with a target some bare slot disagrees with is converted:
     /// every bare slot of it goes through [`Lowerer::fn_carrier_coerce`] to
     /// the target, which is also its bound type. Every other variable, and
     /// any with a binding of another role, is bound to its first binding
     /// holding an `Arc` function, and no argument converts.
-    fn plan(shape: &ipe_kernels::TyShape, args: &[Carried]) -> Result<Self, CarrierConflict> {
+    fn plan(
+        shape: &ipe_kernels::TyShape,
+        args: &[Carried],
+        clone_vars: &[u8],
+    ) -> Result<Self, CarrierConflict> {
         let mut bindings: Vec<SchemeBinding> = Vec::new();
         for (index, arg) in args.iter().enumerate() {
             if let (Some(slot), Some(ty)) = (ipe_kernels::spine_arg(shape, index), arg.ty.as_ref())
@@ -8516,12 +8553,23 @@ impl SchemeVarCarriers {
                 .iter()
                 .filter(|binding| binding.var == var)
                 .collect();
-            let target = if of_var.iter().all(|binding| binding.typed) {
-                let opaque = result.is_some_and(|result| var_under_opaque(result, var, false));
+            let typed = of_var.iter().all(|binding| binding.typed);
+            let opaque = result.is_some_and(|result| var_under_opaque(result, var, false));
+            let target = if typed {
                 planned_target(&of_var, opaque)?
             } else {
                 None
             };
+            let target = target.or_else(|| {
+                (typed && !opaque && clone_vars.contains(&var))
+                    .then(|| {
+                        of_var
+                            .iter()
+                            .find(|binding| binding.bare && matches!(binding.ty, IrType::Fun(..)))
+                    })
+                    .flatten()
+                    .map(|binding| flip_fun_in_storage_element(binding.ty.clone()))
+            });
             match target {
                 Some(target)
                     if of_var
@@ -12137,6 +12185,12 @@ pub struct Lowerer<'a> {
     /// [`Self::note_callee_instance`], drained per def into the cross-call
     /// bound propagation ([`propagate_call_site_bounds`]). Cleared per def.
     callee_instances: std::cell::RefCell<Vec<CalleeInstance>>,
+    /// The kernel references whose `Clone`-bounded scheme variable is
+    /// instantiated with a direct function, awaiting the call's carrier plan
+    /// ([`Self::coerce_kernel_fn_args`]) to put it on the `Clone` shared
+    /// carrier. Recorded by [`Self::reject_unmet_kernel_bounds`]; one left
+    /// when its def is lowered is refused (IPE-L0164).
+    pending_shared_fns: std::cell::RefCell<Vec<PendingSharedFn>>,
     /// A `let`-bound local that names a top-level function, mapped to that
     /// function's `(module, name)` key — a point-free alias `let w = wrap`.
     ///
@@ -14373,6 +14427,7 @@ impl<'a> Lowerer<'a> {
             deferred_fun_captures: std::cell::RefCell::new(BTreeMap::new()),
             recorded_bounds: std::cell::RefCell::new(BTreeMap::new()),
             callee_instances: std::cell::RefCell::new(Vec::new()),
+            pending_shared_fns: std::cell::RefCell::new(Vec::new()),
             toplevel_fn_aliases: std::cell::RefCell::new(BTreeMap::new()),
             local_string_literals: std::cell::RefCell::new(BTreeMap::new()),
             local_fn_carriers: std::cell::RefCell::new(BTreeMap::new()),
@@ -16807,6 +16862,20 @@ impl<'a> Lowerer<'a> {
             let mut func = self
                 .lower_def(def, id)
                 .map_err(|d| (d, def.home().to_vec()))?;
+            // A direct-function instance of a `Clone`-bounded kernel variable
+            // no call's carrier plan put on the shared carrier would reach
+            // the runtime on the non-`Clone` one.
+            if let Some(pending) = self.pending_shared_fns.take().first() {
+                return Err((
+                    instance_bounds::callee_bound_unmet(
+                        pending.span,
+                        app_entry_name(pending.kernel),
+                        CalleeDemand::Copies,
+                        "function".into(),
+                    ),
+                    def.home().to_vec(),
+                ));
+            }
             // context suppression, applied UNIFORMLY to every lowered body
             // regardless of which `lower_def` branch produced it (typed / untyped
             // fn / nullary binding). Clears a `task_fail` turbofish pin whose
@@ -16850,6 +16919,17 @@ impl<'a> Lowerer<'a> {
         // proves the bound instead of cargo-failing E0277 (an
         // exit-0-then-cargo-fail SEAL break).
         propagate_call_site_bounds(&mut funcs, &callee_instances);
+        // Every reference instantiates its callee's generics with types that
+        // meet their finalized bounds, or is refused (IPE-L0164).
+        instance_bounds::check_user_instances(&funcs, &callee_instances, self.clone_env())
+            .map_err(|(id, d)| {
+                let home = usize::try_from(id.as_raw())
+                    .ok()
+                    .and_then(|idx| self.m.defs.get(idx))
+                    .map(|def| def.home().to_vec())
+                    .unwrap_or_default();
+                (d, home)
+            })?;
         // Pins settle against the final signatures: only rendered entries stay,
         // and a `JsonVal` reading on a bound `JsonVal` cannot meet is refused.
         user_pins::settle_user_pins(&mut funcs, |id| {
@@ -26470,6 +26550,7 @@ impl<'a> Lowerer<'a> {
         let Callee::Kernel(kernel) = resolved else {
             return Ok(site);
         };
+        let pending = self.take_pending_shared_fns(callee.span);
         let mut site = site;
         for (arg, (canon_arg, slot)) in canon_args.iter().zip(lowered_args.iter_mut()).enumerate() {
             if !matches!(kernel.fn_slot_carrier(arg), Some(FnSlotCarrier::Direct)) {
@@ -26485,12 +26566,23 @@ impl<'a> Lowerer<'a> {
             let read = std::mem::replace(slot, Expr::Unit);
             *slot = self.hoist_stored_fn_read(read, &params, &ret)?;
         }
-        let Some(shape) = kernel.scheme_shape() else {
-            return Ok(site);
+        let refuse_pending = |pending: &PendingSharedFn| {
+            instance_bounds::callee_bound_unmet(
+                pending.span,
+                app_entry_name(pending.kernel),
+                CalleeDemand::Copies,
+                "function".into(),
+            )
         };
-        if !canon_args
-            .iter()
-            .any(|arg| self.region_ty(arg.span).is_some_and(ty_holds_fun))
+        let Some(shape) = kernel.scheme_shape() else {
+            return pending
+                .first()
+                .map_or(Ok(site), |first| Err(refuse_pending(first)));
+        };
+        if pending.is_empty()
+            && !canon_args
+                .iter()
+                .any(|arg| self.region_ty(arg.span).is_some_and(ty_holds_fun))
         {
             return Ok(site);
         }
@@ -26503,8 +26595,27 @@ impl<'a> Lowerer<'a> {
                 )
             })
             .collect();
-        let plan = SchemeVarCarriers::plan(shape, &carried)
+        let plan = SchemeVarCarriers::plan(shape, &carried, &clone_row_vars(*kernel))
             .map_err(|CarrierConflict| unsupported(span, Feature::FnCarrierConflict))?;
+        // A pending variable is discharged once the plan puts it on the
+        // shared carrier and every bare slot of it is an argument the plan
+        // converts; a slot a partial application leaves to an eta binder is
+        // not converted, so it is refused.
+        for demand in &pending {
+            let shared = plan
+                .bound
+                .iter()
+                .any(|(var, ty)| *var == demand.var && matches!(ty, IrType::SharedFun(..)));
+            let unfilled = (canon_args.len()..arity).any(|slot| {
+                matches!(
+                    ipe_kernels::spine_arg(shape, slot),
+                    Some(ipe_kernels::TyShape::Var(var)) if *var == demand.var
+                )
+            });
+            if !shared || unfilled {
+                return Err(refuse_pending(demand));
+            }
+        }
         for (slot, value) in lowered_args.iter_mut().enumerate().take(arity) {
             let Some(ipe_kernels::TyShape::Var(var)) = ipe_kernels::spine_arg(shape, slot) else {
                 continue;
@@ -26884,7 +26995,7 @@ impl<'a> Lowerer<'a> {
         };
         // A conflicting call is refused where it is lowered
         // ([`Self::coerce_kernel_fn_args`]); its prediction keeps `base`.
-        let Ok(plan) = SchemeVarCarriers::plan(shape, &carried) else {
+        let Ok(plan) = SchemeVarCarriers::plan(shape, &carried, &clone_row_vars(kernel)) else {
             return base;
         };
         kernel_result_carrier_type(shape, &plan.bound, carried.len(), base)
@@ -30253,6 +30364,7 @@ impl<'a> Lowerer<'a> {
             Callee::Kernel(kernel) => {
                 // Row generics are refused by the body pre-walk, which alone knows them.
                 self.reject_generic_app_entry(*kernel, callee.span, &BTreeSet::new())?;
+                self.reject_unmet_kernel_bounds(*kernel, callee.span)?;
                 self.note_sync_captures(*kernel, callee.span);
             }
             Callee::Func(id) => self.note_callee_instance(*id, callee.span),
@@ -30260,6 +30372,73 @@ impl<'a> Lowerer<'a> {
         }
         self.note_carrier_sends(callee.span);
         Ok(resolved)
+    }
+
+    /// Refuse a kernel reference whose instance misses a runtime bound of the kernel (IPE-L0164).
+    ///
+    /// Each row of [`KernelFn::runtime_bounds`] names a scheme variable; its
+    /// instance is read off the reference's solved type (`span`'s region
+    /// type) by the alignment [`Self::note_sync_captures`] uses, lowered, and
+    /// judged per bound by [`instance_bounds::bound_met_by`]. A `Clone`
+    /// variable instantiated with a direct function is not refused here: the
+    /// call's carrier plan moves it onto the `Clone` shared carrier, so it is
+    /// recorded ([`PendingSharedFn`]) and discharged or refused by
+    /// [`Self::coerce_kernel_fn_args`].
+    ///
+    /// Fail-closed: a missing region type or a variable with no aligned
+    /// instance is refused, and an instance that lowers neither strictly nor
+    /// with its unfixed variables read as `JsonVal` keeps its lowering error.
+    fn reject_unmet_kernel_bounds(&self, kernel: KernelFn, span: Span) -> DResult<()> {
+        let rows = kernel.runtime_bounds();
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let heads = SchemeHeads {
+            builtins: &self.builtins.kernel_types,
+            interner: self.interner,
+        };
+        let solved = self.region_ty(span);
+        let env = self.clone_env();
+        let refuse = |demand: CalleeDemand, leaf: Box<str>| {
+            instance_bounds::callee_bound_unmet(span, app_entry_name(kernel), demand, leaf)
+        };
+        for &(var, demanded) in rows {
+            let Some(instance) = solved
+                .zip(kernel.scheme_shape())
+                .and_then(|(ty, shape)| scheme_var_instance(shape, ty, var, heads))
+            else {
+                return Err(refuse(CalleeDemand::Copies, "value of unknown type".into()));
+            };
+            let lowered = match self.ir_type_from_ty(instance, span) {
+                Ok(lowered) => lowered,
+                Err(strict) => self
+                    .ir_type_from_ty_json(instance, span)
+                    .map_err(|_| strict)?,
+            };
+            if matches!(lowered, IrType::Fun(..)) && demanded.contains(RuntimeBounds::CLONE) {
+                self.pending_shared_fns
+                    .borrow_mut()
+                    .push(PendingSharedFn { span, kernel, var });
+                continue;
+            }
+            for bound in instance_bounds::Bound::of_runtime(demanded) {
+                if let instance_bounds::Supply::Unmet { demand, leaf } =
+                    instance_bounds::bound_met_by(env, bound, &lowered)
+                {
+                    return Err(refuse(demand, leaf));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The pending shared-function demands recorded at the kernel reference `span`, removed.
+    fn take_pending_shared_fns(&self, span: Span) -> Vec<PendingSharedFn> {
+        let mut all = self.pending_shared_fns.borrow_mut();
+        let (here, rest): (Vec<PendingSharedFn>, Vec<PendingSharedFn>) =
+            all.drain(..).partition(|pending| pending.span == span);
+        *all = rest;
+        here
     }
 
     /// Record a user-function reference with the solved type it instantiates the callee at.
@@ -30270,14 +30449,13 @@ impl<'a> Lowerer<'a> {
     /// curried arrow parameters and the tail left after each peel, each lowered
     /// in the current def's generics; [`propagate_call_site_bounds`] aligns the
     /// callee's signature against them once every callee's bounds are known.
-    /// A slot that does not lower keeps the def generics it mentions; a
-    /// missing region type records no slots, so alignment fails closed. A def
-    /// with no generics has nothing to oblige and records nothing.
+    /// A slot that does not lower keeps the def generics it mentions and its
+    /// `JsonVal` reading; a missing region type records no slots, so
+    /// alignment fails closed. A def with no generics records its references
+    /// too: [`instance_bounds::check_user_instances`] proves each callee's
+    /// bounds at the concrete types they instantiate.
     fn note_callee_instance(&self, callee: FuncId, span: Span) {
         let poly: BTreeSet<Symbol> = self.current_poly_tvars.borrow().values().copied().collect();
-        if poly.is_empty() {
-            return;
-        }
         let slot = |t: &Ty| {
             self.ir_type_from_ty(t, span).map_or_else(
                 |_| {
@@ -30286,6 +30464,7 @@ impl<'a> Lowerer<'a> {
                             .copied()
                             .filter(|tv| self.ty_mentions_poly_tvar(t, *tv))
                             .collect(),
+                        self.ir_type_from_ty_json(t, span).ok(),
                     )
                 },
                 SiteSlot::Lowered,
@@ -30307,6 +30486,7 @@ impl<'a> Lowerer<'a> {
         }
         self.callee_instances.borrow_mut().push(CalleeInstance {
             callee,
+            span,
             params,
             tails,
         });
@@ -30527,7 +30707,7 @@ impl<'a> Lowerer<'a> {
     /// [`Self::lower_callee`], the one hook point.
     ///
     /// A kernel whose runtime signature bounds a scheme variable `Sync`
-    /// ([`KernelFn::sync_obliged_scheme_vars`] — the `msg` of `Input.checkbox`)
+    /// (a `SYNC` row of [`KernelFn::runtime_bounds`] — the `msg` of `Input.checkbox`)
     /// obliges the generics reaching that variable's instantiation the same way;
     /// the instantiation is found by aligning the kernel's
     /// [`KernelFn::scheme_shape`] with the same solved type.
@@ -30538,7 +30718,12 @@ impl<'a> Lowerer<'a> {
     /// every generic it mentions.
     fn note_sync_captures(&self, kernel: KernelFn, span: Span) {
         let captured = kernel.sync_captured_args();
-        let scheme_vars = kernel.sync_obliged_scheme_vars();
+        let scheme_vars: Vec<u8> = kernel
+            .runtime_bounds()
+            .iter()
+            .filter(|(_, bounds)| bounds.contains(RuntimeBounds::SYNC))
+            .map(|(var, _)| *var)
+            .collect();
         if captured.is_empty() && scheme_vars.is_empty() {
             return;
         }
@@ -40940,9 +41125,12 @@ mod tests {
 
     /// `Input.checkbox`'s scheme shape, whose `msg` (var 0) the lowerer obliges `Sync`.
     fn checkbox_shape() -> Option<&'static ipe_kernels::TyShape> {
-        assert_eq!(
-            KernelFn::InputCheckbox.sync_obliged_scheme_vars(),
-            &[0],
+        assert!(
+            KernelFn::InputCheckbox
+                .runtime_bounds()
+                .iter()
+                .any(|(var, bounds)| *var == 0
+                    && bounds.contains(ipe_kernels::RuntimeBounds::SYNC)),
             "Input.checkbox obliges its msg variable Sync"
         );
         let shape = KernelFn::InputCheckbox.scheme_shape();
@@ -41624,6 +41812,7 @@ mod tests {
         let caller = [t, u];
         let instance = |params: Vec<SiteSlot>, tails: Vec<SiteSlot>| CalleeInstance {
             callee: ipe_ir::FuncId::from_raw(0),
+            span: Span::new(0, 1),
             params,
             tails,
         };
@@ -41689,7 +41878,7 @@ mod tests {
             vec![t, u]
         );
         // An unlowered slot obliges the generics it mentions.
-        let site = instance(vec![], vec![SiteSlot::Unlowered(vec![u])]);
+        let site = instance(vec![], vec![SiteSlot::Unlowered(vec![u], None)]);
         assert_eq!(
             super::instance_tvars(&[], &ret, msg, &site, &caller),
             vec![u]
@@ -42307,12 +42496,12 @@ mod tests {
         use super::{CarrierConflict, SchemeVarCarriers};
         let conflict = [typed_maybe(shared_fn()), typed_maybe(direct_fn())];
         assert_eq!(
-            SchemeVarCarriers::plan(&MAYBE_A_TWICE, &conflict),
+            SchemeVarCarriers::plan(&MAYBE_A_TWICE, &conflict, &[]),
             Err(CarrierConflict),
             "payload bindings on `Arc` and `Box` are not refused"
         );
         let agree = [typed_maybe(shared_fn()), typed_maybe(shared_fn())];
-        let plan = SchemeVarCarriers::plan(&MAYBE_A_TWICE, &agree);
+        let plan = SchemeVarCarriers::plan(&MAYBE_A_TWICE, &agree, &[]);
         assert!(
             plan.as_ref().is_ok_and(|plan| plan.conversion(0).is_none()),
             "agreeing payload bindings are refused or converted: {plan:?}"
@@ -42329,12 +42518,37 @@ mod tests {
                 Carried::typed(Some(bare.clone())),
                 typed_maybe(payload.clone()),
             ];
-            let plan = shape.map(|shape| SchemeVarCarriers::plan(shape, &args));
+            let plan = shape.map(|shape| SchemeVarCarriers::plan(shape, &args, &[]));
             assert!(
                 matches!(&plan, Some(Ok(plan)) if plan.conversion(0) == Some(&payload)),
                 "a bare `{bare:?}` slot is not converted to the payload's `{payload:?}`: {plan:?}"
             );
         }
+    }
+
+    /// A `Clone`-bounded variable bare-bound to a direct function converts to the shared carrier.
+    #[test]
+    fn scheme_var_plan_promotes_a_cloned_direct_function() {
+        use super::{Carried, SchemeVarCarriers};
+        let args = [
+            Carried::typed(Some(IrType::Int)),
+            Carried::typed(Some(direct_fn())),
+        ];
+        let shared = shared_fn();
+        let promoted = KernelFn::ListRepeat
+            .scheme_shape()
+            .map(|shape| SchemeVarCarriers::plan(shape, &args, &[0]));
+        assert!(
+            matches!(&promoted, Some(Ok(plan)) if plan.conversion(0) == Some(&shared)),
+            "a `Box` element of `List.repeat` is not moved onto `Arc`: {promoted:?}"
+        );
+        let kept = KernelFn::ListRepeat
+            .scheme_shape()
+            .map(|shape| SchemeVarCarriers::plan(shape, &args, &[]));
+        assert!(
+            matches!(&kept, Some(Ok(plan)) if plan.conversion(0).is_none()),
+            "a variable without a `Clone` row is promoted: {kept:?}"
+        );
     }
 
     /// A variable the result holds under an opaque constructor takes the direct carrier.
@@ -42344,7 +42558,7 @@ mod tests {
         let args = [Carried::typed(Some(shared_fn()))];
         let plan = KernelFn::TaskSucceed
             .scheme_shape()
-            .map(|shape| SchemeVarCarriers::plan(shape, &args));
+            .map(|shape| SchemeVarCarriers::plan(shape, &args, &[]));
         let direct = direct_fn();
         assert!(
             matches!(&plan, Some(Ok(plan)) if plan.conversion(0) == Some(&direct)),
@@ -42352,7 +42566,7 @@ mod tests {
         );
         let nested = [typed_maybe(shared_fn())];
         assert_eq!(
-            SchemeVarCarriers::plan(&MAYBE_A_TO_TASK_A, &nested),
+            SchemeVarCarriers::plan(&MAYBE_A_TO_TASK_A, &nested, &[]),
             Err(CarrierConflict),
             "an `Arc` payload bound under an opaque result is not refused"
         );
@@ -42371,7 +42585,7 @@ mod tests {
         ];
         let plan = KernelFn::MaybeWithDefault
             .scheme_shape()
-            .map(|shape| SchemeVarCarriers::plan(shape, &args));
+            .map(|shape| SchemeVarCarriers::plan(shape, &args, &[]));
         let expected = SchemeVarCarriers {
             bound: vec![(0, shared_fn())],
             converted: Vec::new(),

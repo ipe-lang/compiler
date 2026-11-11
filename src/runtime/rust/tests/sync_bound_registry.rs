@@ -4,8 +4,8 @@
 //! (`input_checkbox_<M: Clone + Send + Sync + 'static>`) obliges the caller's
 //! instantiation `Sync`. The lowerer derives that obligation from the kernel
 //! registries `StdlibKernel::sync_captured_args` (an argument moved into a
-//! `Send + Sync` carrier) and `StdlibKernel::sync_obliged_scheme_vars` (a scheme
-//! variable no argument exposes bare). A runtime bound neither registry records
+//! `Send + Sync` carrier) and the `SYNC` rows of `StdlibKernel::runtime_bounds`
+//! (a scheme variable no argument exposes bare). A runtime bound neither registry records
 //! leaves a generic caller `Send`-only: `ipe` accepts the program and the
 //! emitted crate fails `cargo build` with E0277.
 //!
@@ -23,7 +23,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use ipe_kernels::StdlibKernel;
+use ipe_kernels::{RuntimeBounds, StdlibKernel};
 
 /// How a runtime function with a `Sync`-bounded value type parameter is accounted for.
 enum SyncSite {
@@ -259,7 +259,15 @@ fn walk(dir: &Path, patterns: &Patterns, out: &mut BTreeMap<String, usize>) {
 
 /// The number of `Sync` obligations `kernel`'s registries record.
 const fn registry_len(kernel: StdlibKernel) -> usize {
-    kernel.sync_captured_args().len() + kernel.sync_obliged_scheme_vars().len()
+    let mut synced = 0;
+    let mut rows = kernel.runtime_bounds();
+    while let Some(((_, bounds), rest)) = rows.split_first() {
+        if bounds.contains(RuntimeBounds::SYNC) {
+            synced += 1;
+        }
+        rows = rest;
+    }
+    kernel.sync_captured_args().len() + synced
 }
 
 #[test]
@@ -275,7 +283,7 @@ fn every_sync_bounded_runtime_fn_is_owned_by_a_registry() {
         scanned_names, listed_names,
         "the runtime functions bounding a value type parameter `Sync` must equal SYNC_SITES; \
          classify a new one (and record its kernel's obligation in \
-         `sync_captured_args` / `sync_obliged_scheme_vars`), or drop a stale entry"
+         `sync_captured_args` / the `SYNC` rows of `runtime_bounds`), or drop a stale entry"
     );
 
     for (name, site) in SYNC_SITES {
@@ -287,7 +295,7 @@ fn every_sync_bounded_runtime_fn_is_owned_by_a_registry() {
                         registry_len(kernel),
                         params,
                         "{kernel:?}: `{name}` bounds {params} value type parameter(s) `Sync`, \
-                         so its `sync_captured_args` + `sync_obliged_scheme_vars` must record \
+                         so its `sync_captured_args` + `SYNC` `runtime_bounds` rows must record \
                          exactly that many obligations"
                     );
                 }

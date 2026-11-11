@@ -2550,6 +2550,37 @@ pub(crate) fn concrete_super_ok(
     )
 }
 
+/// Whether the head `(home, name)` is a builtin whose runtime carrier has no `PartialEq`.
+///
+/// The fact is the registry's ([`ipe_kernels::BuiltinRow::derives_partial_eq`]);
+/// a head that is not a builtin row is a user type and answers `false`.
+fn builtin_lacks_partial_eq(interner: &Interner, home: &[Symbol], name: Symbol) -> bool {
+    let Some(name) = interner.resolve(name) else {
+        return false;
+    };
+    let segments: Option<Vec<&str>> = home.iter().map(|s| interner.resolve(*s)).collect();
+    segments.is_some_and(|segments| {
+        ipe_kernels::BuiltinType::of_head(&segments, name)
+            .is_some_and(|builtin| !builtin.row().derives_partial_eq())
+    })
+}
+
+/// Does canonical type `t` embed a builtin head with no `PartialEq` anywhere?
+fn canon_type_embeds_uncomparable(interner: &Interner, t: &canon::Type) -> bool {
+    let walk = |t: &canon::Type| canon_type_embeds_uncomparable(interner, t);
+    match t {
+        canon::Type::Lambda(a, b) => walk(a) || walk(b),
+        canon::Type::Var(_) | canon::Type::Wildcard | canon::Type::Unit => false,
+        canon::Type::Tuple(elems) => elems.iter().any(walk),
+        canon::Type::Con { home, name, args } => {
+            builtin_lacks_partial_eq(interner, home, *name) || args.iter().any(walk)
+        }
+        canon::Type::Record(fields) | canon::Type::RecordOpen(_, fields) => {
+            fields.iter().any(|(_, f)| walk(f))
+        }
+    }
+}
+
 /// Does canonical type `t` embed a function arrow anywhere — a direct `Lambda`,
 /// or one nested in a tuple / record / type-constructor argument?
 fn canon_type_embeds_lambda(t: &canon::Type) -> bool {
@@ -2618,8 +2649,9 @@ fn canon_type_embeds_opaque_handle(
 }
 
 /// The user enums whose DEFINITION holds what a `Ty::Con`'s type arguments
-/// cannot show: a function (`type Handler a = OnClick (Int -> a) | Plain a`) or
-/// an opaque FFI handle in a constructor payload.
+/// cannot show or compare: a function (`type Handler a = OnClick (Int -> a) |
+/// Plain a`), an opaque FFI handle, or a builtin with no `PartialEq` (a `Task`)
+/// in a constructor payload.
 ///
 /// Such an enum is not `Equatable` (a function) or showable (a function or a
 /// handle) however it is applied: its payload is invisible in a `Ty::Con`'s
@@ -2630,8 +2662,8 @@ fn canon_type_embeds_opaque_handle(
 /// Rust that does not build.
 #[derive(Default)]
 pub(crate) struct EnumEmbeds {
-    /// Enums with a function in a payload.
-    fun: BTreeSet<(Vec<Symbol>, Symbol)>,
+    /// Enums with a function or a builtin with no `PartialEq` in a payload.
+    eq_refused: BTreeSet<(Vec<Symbol>, Symbol)>,
     /// Enums with a function or an opaque FFI handle in a payload.
     show_refused: BTreeSet<(Vec<Symbol>, Symbol)>,
     /// The transparent FFI unions ([`ipe_ir::FfiUnion::Transparent`]): each
@@ -2663,8 +2695,8 @@ impl EnumEmbeds {
         for u in unions() {
             let payloads = || u.ctors.iter().flat_map(|c| c.args.iter());
             let fun = payloads().any(canon_type_embeds_lambda);
-            if fun {
-                facts.fun.insert((u.home.clone(), u.name));
+            if fun || payloads().any(|t| canon_type_embeds_uncomparable(interner, t)) {
+                facts.eq_refused.insert((u.home.clone(), u.name));
             }
             if fun || payloads().any(|t| canon_type_embeds_opaque_handle(interner, &facts, t)) {
                 facts.show_refused.insert((u.home.clone(), u.name));
@@ -2684,9 +2716,9 @@ impl EnumEmbeds {
             && !self.transparent_ffi.contains(&(home.to_vec(), name))
     }
 
-    /// Does enum `(home, name)`'s definition embed a function?
-    fn embeds_fn(&self, home: &[Symbol], name: Symbol) -> bool {
-        self.fun.contains(&(home.to_vec(), name))
+    /// Does enum `(home, name)`'s definition embed a function or a builtin with no `PartialEq`?
+    fn refuses_eq(&self, home: &[Symbol], name: Symbol) -> bool {
+        self.eq_refused.contains(&(home.to_vec(), name))
     }
 
     /// Does enum `(home, name)`'s definition embed a leaf with no rendering?
@@ -2732,8 +2764,10 @@ fn ty_is_showable(interner: &Interner, ty: &Ty, enum_embeds: &EnumEmbeds) -> boo
 }
 
 /// Whether a resolved type derives Rust's `PartialEq`: true for every fully
-/// concrete type containing no function anywhere (primitives, unit, tuples,
-/// closed records, and enums all derive `PartialEq`; a function never does). A
+/// concrete type containing no function and no builtin effect carrier or
+/// application handle anywhere (primitives, unit, tuples, closed records, and
+/// enums all derive `PartialEq`; a function, a `Task`, a `Cmd`, a `Sub` and an
+/// application handle never do). A
 /// bare type variable, and a record whose open row tail leaves the rest of the
 /// record unknown, is rejected (fail-closed): an equality obligation that escaped
 /// into an enclosing generic is not yet propagated across binding boundaries.
@@ -2756,11 +2790,14 @@ fn ty_is_equatable(interner: &Interner, ty: &Ty, enum_embeds: &EnumEmbeds) -> bo
         // type parameters. An enum whose DEFINITION embeds a function in a
         // payload (`type Handler a = OnClick (Int -> a) | Plain a`) is therefore
         // not equatable however it is applied, even though every `arg` is
-        // (`Handler Int`'s only arg is `Int`). Consult `enum_embeds.embeds_fn` on the
+        // (`Handler Int`'s only arg is `Int`). Consult `enum_embeds.refuses_eq` on the
         // head, then still recurse the args so a function reaching a type
         // parameter (`Box (Int -> Int)` for `type Box a = Box a`) is caught too.
+        // A builtin head whose runtime carrier has no `PartialEq` (`Task`,
+        // `Cmd`, `Sub`, an application handle) is refused by the registry fact.
         Ty::Con { module, name, args } => {
-            !enum_embeds.embeds_fn(module, *name)
+            !enum_embeds.refuses_eq(module, *name)
+                && !builtin_lacks_partial_eq(interner, module, *name)
                 && (ipe_ir::is_store_row_phantom_union(interner, module, *name)
                     || args
                         .iter()

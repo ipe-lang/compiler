@@ -8,6 +8,23 @@
 use ipe_intern::Symbol;
 use ipe_ir::{BoundSet, IrType, RowParam};
 
+/// The bounds every emitted generic and row variable carries, whatever its body does.
+///
+/// Ipê has value semantics, so a field read or a reused binder emits
+/// `.clone()`: every generic is `Clone`. The multi-use clone rewrite
+/// (`param_is_multiuse_clonable`, `classify_capture_clone`) and the instance
+/// check (`instance_bounds`) read this premise through [`generics_are_clone`],
+/// and every reference instantiating a generic with a non-`Clone` type is
+/// refused (IPE-L0164).
+pub(super) const fn generic_base_bounds(bounds: BoundSet) -> BoundSet {
+    bounds.with_clone()
+}
+
+/// Whether [`generic_base_bounds`] makes every generic `Clone`.
+pub(super) const fn generics_are_clone() -> bool {
+    generic_base_bounds(BoundSet::UNBOUNDED).has_clone()
+}
+
 /// Fold every signature-shape obligation into `type_params` and `row_params`.
 ///
 /// - `Clone` on every generic and row variable: Ipê has value semantics, so a
@@ -27,7 +44,7 @@ pub(super) fn apply_signature_shape_bounds(
 ) {
     let ret_is_task = matches!(ret, IrType::Task(_));
     for (sym, bounds) in type_params.iter_mut() {
-        let mut next = bounds.with_clone();
+        let mut next = generic_base_bounds(*bounds);
         if ret_is_task || type_var_in_fn_param(params, *sym) {
             next = next.with_send();
         }
@@ -37,7 +54,7 @@ pub(super) fn apply_signature_shape_bounds(
         *bounds = next;
     }
     for row in row_params.iter_mut() {
-        let mut next = row.bounds.with_clone();
+        let mut next = generic_base_bounds(row.bounds);
         if ret_is_task {
             next = next.with_send();
         }

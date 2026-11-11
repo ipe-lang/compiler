@@ -32,6 +32,8 @@ e2e-support = { path = "../../../tools/e2e-support" }
 ipe_intern = { path = "../intern" }
 ipe_parse = { path = "../parse" }
 ipe_syntax = { path = "../syntax" }
+# Parses the runtime's signatures in `tests/kernel_runtime_bounds.rs`.
+syn = { version = "3", default-features = false, features = ["full", "visit", "parsing"] }
 
 [lints]
 workspace = true

@@ -20,6 +20,7 @@ use ipe_ir::once_closure::{CaptureScope, MovedCapture};
 use ipe_ir::{EnumPayloadTable, Expr, IrType, ModPath, Pat, SliceOwnership, enum_payload_holds};
 
 use super::capture_rewrite::force_shared_capture_clones;
+use super::signature_bounds::generics_are_clone;
 
 // ── Capture-clone classification ──────────────────────────────────────
 //
@@ -282,7 +283,8 @@ pub(super) fn clone_class(env: CloneEnv<'_>, t: &IrType) -> CloneClass {
 /// no-op (`ir_contains_fun(Generic) == false`), so admitting it here loses no
 /// diagnostic — it only closes the silent double-move.
 pub(super) fn param_is_multiuse_clonable(env: CloneEnv<'_>, ir_ty: &IrType) -> bool {
-    matches!(clone_class(env, ir_ty), CloneClass::CloneOk) || matches!(ir_ty, IrType::Generic(_))
+    matches!(clone_class(env, ir_ty), CloneClass::CloneOk)
+        || (matches!(ir_ty, IrType::Generic(_)) && generics_are_clone())
 }
 
 /// The `Clone`-treatment a captured symbol of type `ir_ty` receives inside a
@@ -298,7 +300,7 @@ pub(super) fn param_is_multiuse_clonable(env: CloneEnv<'_>, ir_ty: &IrType) -> b
 /// TRUTH with `param_is_multiuse_clonable` — both admit a bare `Generic` on the
 /// same emitted `with_clone` bound; if one changes the other must.
 pub(super) fn classify_capture_clone(env: CloneEnv<'_>, ir_ty: &IrType) -> Option<bool> {
-    if matches!(ir_ty, IrType::Generic(_)) {
+    if matches!(ir_ty, IrType::Generic(_)) && generics_are_clone() {
         return Some(true);
     }
     match clone_class(env, ir_ty) {

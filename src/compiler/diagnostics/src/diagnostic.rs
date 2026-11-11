@@ -20,7 +20,7 @@ use crate::code::{
     IPE_L0134, IPE_L0135, IPE_L0136, IPE_L0140, IPE_L0141, IPE_L0142, IPE_L0143, IPE_L0144,
     IPE_L0145, IPE_L0146, IPE_L0147, IPE_L0148, IPE_L0149, IPE_L0150, IPE_L0151, IPE_L0152,
     IPE_L0153, IPE_L0154, IPE_L0155, IPE_L0156, IPE_L0157, IPE_L0158, IPE_L0159, IPE_L0160,
-    IPE_L0161, IPE_L0162, IPE_L0163, IPE_L0200, IPE_L0201, IPE_N0001, IPE_N0002, IPE_N0003,
+    IPE_L0161, IPE_L0162, IPE_L0163, IPE_L0164, IPE_L0200, IPE_L0201, IPE_N0001, IPE_N0002, IPE_N0003,
     IPE_N0004, IPE_N0005, IPE_N0010, IPE_N0011, IPE_N0012, IPE_N0013, IPE_N0020, IPE_N0021,
     IPE_N0022, IPE_N0023, IPE_N0024, IPE_N0025, IPE_N0026, IPE_N0027, IPE_N0028, IPE_N0029,
     IPE_N0030, IPE_N0031, IPE_N0032, IPE_N0033, IPE_N0034, IPE_N0035, IPE_N0036, IPE_N0038,
@@ -1854,6 +1854,46 @@ pub enum ModelLeaf {
     ViewValue,
 }
 
+/// What a referenced function does with a value, as IPE-L0164 names it.
+///
+/// Each variant is one runtime capability a function's compiled code needs
+/// of its argument; the message says it in Ipê words, never as a Rust trait.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum CalleeDemand {
+    /// The function makes copies of the value.
+    Copies,
+    /// The function compares the value for equality.
+    Compares,
+    /// The function shares the value across threads.
+    SharesAcrossThreads,
+    /// The function reads the value as a database row.
+    ReadsAsRow,
+}
+
+impl CalleeDemand {
+    /// The demand as a verb phrase: "copies", "compares", ...
+    #[must_use]
+    pub const fn phrase(self) -> &'static str {
+        match self {
+            Self::Copies => "copies",
+            Self::Compares => "compares",
+            Self::SharesAcrossThreads => "shares across threads",
+            Self::ReadsAsRow => "reads as a database row",
+        }
+    }
+
+    /// What the value cannot be, as an adjective phrase: "copied", "compared", ...
+    #[must_use]
+    pub const fn passive(self) -> &'static str {
+        match self {
+            Self::Copies => "copied",
+            Self::Compares => "compared",
+            Self::SharesAcrossThreads => "shared across threads",
+            Self::ReadsAsRow => "read as a database row",
+        }
+    }
+}
+
 /// Errors raised during lowering / emission: "not supported yet" or
 /// "inadmissible for the target" — distinct from `CompilerBug` ("the compiler is
 /// broken").
@@ -1973,6 +2013,17 @@ pub enum LowerError {
         call: Box<str>,
         /// A bounded, escaped excerpt of the refused name.
         name: Box<str>,
+    },
+    /// A function's compiled code needs a capability of a value that the
+    /// value's type does not have: `List.repeat` copies its element, so a
+    /// `Task` element cannot build. [IPE-L0164]
+    CalleeBoundUnmet {
+        /// The function referenced (e.g. `List.repeat`, or a user function).
+        callee: Box<str>,
+        /// What the function does with the value.
+        demand: CalleeDemand,
+        /// The part of the value's type that lacks the capability (e.g. `Task`).
+        leaf: Box<str>,
     },
     /// A `Web.route` page-constructor payload field has a type that cannot be
     /// decoded from a URL `:param` string (only `String`, `Int`, `Float`, and
@@ -3235,6 +3286,7 @@ const fn lower_code(msg: &LowerError) -> Code {
         LowerError::RoutedPageNotCustomType => IPE_L0161,
         LowerError::OnNavigateWithoutPage => IPE_L0162,
         LowerError::ReservedAttributeName { .. } => IPE_L0163,
+        LowerError::CalleeBoundUnmet { .. } => IPE_L0164,
         LowerError::DevOnlyKernelInProduction { .. } => IPE_L0140,
         LowerError::UiCellsInWebShape(_) => IPE_L0132,
         LowerError::UiCellsInCliShape(_) => IPE_L0153,
@@ -3807,6 +3859,14 @@ fn lower_help(msg: &LowerError) -> Vec<HelpLine> {
              from `nonce`. A routed app's URL already follows `model.page`, so set the page in `update` instead \
              of naming a path; attach events with the `Ui.on*` attributes."
                 .into(),
+        )],
+        LowerError::CalleeBoundUnmet { leaf, .. } => vec![HelpLine::Note(
+            format!(
+                "a `{leaf}` value cannot be copied, compared, or shared, so build each one \
+                 where it is needed instead: for tasks, build each task inside a function, \
+                 e.g. `List.map (\\_ -> Io.println \"x\") (List.range 1 3)`."
+            )
+            .into_boxed_str(),
         )],
         LowerError::RouteParamUnsupportedType {
             field_index,

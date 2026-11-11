@@ -82,6 +82,7 @@ Every observable side effect returns `Task Error a`.
 | diverging | `System.exit : Int -> a` |
 
 - A `Task` is a description: using it twice runs it twice.
+- A `Task`, `Cmd` or `Sub` cannot be copied: a function that copies its argument (`List.repeat`, `List.filter`, `Dict.get`, or your own generic) refuses one (IPE-L0164), and `==` cannot compare one. Repeat the work with `List.map (\_ -> task) (List.repeat n ())`.
 - A top-level `Task` binding re-evaluates on every reference. Resolve once at the entry and thread the value inward.
 - `let _ = task` force-runs a discarded effect.
 - There is no `Result.fromTask` by design. Keep effectful pipelines in `Task`.
