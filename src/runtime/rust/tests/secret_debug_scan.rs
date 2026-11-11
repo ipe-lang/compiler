@@ -405,14 +405,14 @@ const DEBUG_SITES: &[DebugSite] = &[
     },
     DebugSite {
         file: "rust/src/project.rs",
-        func: "jwt_cargo_toml",
-        count: 3,
+        func: "insert_before_profile_dev",
+        count: 1,
         why: DIAGNOSTIC,
     },
     DebugSite {
         file: "rust/src/project.rs",
         func: "locale_cargo_toml",
-        count: 3,
+        count: 1,
         why: DIAGNOSTIC,
     },
     DebugSite {
@@ -437,12 +437,6 @@ const DEBUG_SITES: &[DebugSite] = &[
         file: "rust/src/project.rs",
         func: "secret_cargo_toml",
         count: 1,
-        why: DIAGNOSTIC,
-    },
-    DebugSite {
-        file: "rust/src/project.rs",
-        func: "server_cargo_toml",
-        count: 3,
         why: DIAGNOSTIC,
     },
     DebugSite {
