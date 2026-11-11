@@ -477,13 +477,28 @@ mod tests {
         matches!(bound, Bound::Clone | Bound::Copy | Bound::IpeRow)
     }
 
-    /// Each bound reads exactly its own bit, and every bit has a bound.
+    /// Whether a set carrying `bound` also carries `other` by implication.
+    ///
+    /// `BoundSet::with_send` adds `'static`, and `BoundSet::with_sync` adds
+    /// `Send` and `'static`; no other bound implies another.
+    const fn implied_by(bound: Bound, other: Bound) -> bool {
+        matches!(
+            (bound, other),
+            (Bound::Send, Bound::Static) | (Bound::Sync, Bound::Send | Bound::Static)
+        )
+    }
+
+    /// Each bound reads its own bit and the bits it implies, and every bit has a bound.
     #[test]
     fn every_bound_reads_its_own_bit() {
         for bound in Bound::ALL {
             let set = set_of(bound);
             for other in Bound::ALL {
-                assert_eq!(other.in_set(set), other == bound, "{other:?} in {bound:?}");
+                assert_eq!(
+                    other.in_set(set),
+                    other == bound || implied_by(bound, other),
+                    "{other:?} in {bound:?}"
+                );
             }
         }
         assert!(Bound::ALL.iter().all(|b| b.in_set(full_set())));
@@ -539,10 +554,12 @@ mod tests {
     fn a_generic_is_forwarded() {
         with_env(|env| {
             let mut interner = Interner::new();
-            let Ok(a) = interner.intern("a") else {
-                return;
-            };
-            for ty in [IrType::Generic(a), IrType::RowGeneric(a)] {
+            let a = interner.intern("a");
+            assert!(a.is_ok(), "interning a one-letter name");
+            for ty in a
+                .into_iter()
+                .flat_map(|a| [IrType::Generic(a), IrType::RowGeneric(a)])
+            {
                 for bound in Bound::ALL {
                     let want = if bound == Bound::Clone {
                         Supply::Met
