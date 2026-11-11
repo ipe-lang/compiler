@@ -395,10 +395,10 @@ fn unify<'a>(left: Sided<'a>, right: Sided<'a>, bindings: &mut Bindings<'a>) -> 
         if matches!(rt, IrType::Generic(r) if ls == rs && l == r) {
             return Ok(true);
         }
-        return bind((ls, *l), (rs, rt), bindings);
+        return Ok(bind((ls, *l), (rs, rt), bindings));
     }
     if let IrType::Generic(r) = rt {
-        return bind((rs, *r), (ls, lt), bindings);
+        return Ok(bind((rs, *r), (ls, lt), bindings));
     }
     if let (IrType::Record(lm), IrType::Record(rm)) = (lt, rt) {
         if !lm.keys().eq(rm.keys()) {
@@ -425,12 +425,12 @@ fn unify<'a>(left: Sided<'a>, right: Sided<'a>, bindings: &mut Bindings<'a>) -> 
 }
 
 /// Bind `var` to `ty` unless `ty` holds `var` (the occurs check).
-fn bind<'a>(var: (Side, Symbol), ty: Sided<'a>, bindings: &mut Bindings<'a>) -> DResult<bool> {
+fn bind<'a>(var: (Side, Symbol), ty: Sided<'a>, bindings: &mut Bindings<'a>) -> bool {
     if occurs(var, ty, bindings) {
-        return Ok(false);
+        return false;
     }
     bindings.insert(var, ty);
-    Ok(true)
+    true
 }
 
 /// Does the side-tagged variable `var` occur in `ty` under `bindings`?
