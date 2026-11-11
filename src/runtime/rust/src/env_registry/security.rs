@@ -6,8 +6,8 @@
 //! posture.
 
 use super::{
-    ChoiceKey, DefaultValue, Doc, EnvEntry, Feature, FlagKey, Lifetime, SecretKey, SecretSetting,
-    Subsystem,
+    ChoiceKey, DefaultValue, Doc, EnvEntry, Feature, FlagKey, Lifetime, ScopedFlagKey, SecretKey,
+    SecretSetting, Subsystem,
 };
 use crate::env_grammar::{Class, EnvFlag};
 
@@ -91,9 +91,9 @@ pub const CSV_SANITIZE_FORMULAS: FlagKey = FlagKey::new(
 );
 
 /// Whether outbound dials to private, loopback and link-local addresses are refused.
-pub const HTTP_DENY_PRIVATE: FlagKey = FlagKey::new(
+pub const HTTP_DENY_PRIVATE: ScopedFlagKey = ScopedFlagKey::new(
     "IPE_HTTP_DENY_PRIVATE",
-    EnvFlag::On,
+    "unset (on; off only in a dev binary with no listener beyond loopback)",
     Doc {
         class: Class::SecurityTunable,
         feature: Feature::Dial,
@@ -283,7 +283,7 @@ impl SecurityPosture {
             csrf_origin_check: flag(WEB_CSRF_ORIGIN_CHECK, EnvFlag::On),
             csv_formula_guard: flag(CSV_SANITIZE_FORMULAS, EnvFlag::On),
             deny_private: HTTP_DENY_PRIVATE
-                .parse_explicit(lookup(HTTP_DENY_PRIVATE.name()))
+                .parse(lookup(HTTP_DENY_PRIVATE.name()))
                 .unwrap_or(Some(EnvFlag::On)),
             console_auth: match CONSOLE_AUTH.parse(lookup(CONSOLE_AUTH.name())) {
                 Ok(None) => ConsoleAuthSetting::Unset,
@@ -418,22 +418,39 @@ mod tests {
     /// A malformed switch refuses startup naming the variable.
     #[test]
     fn malformed_switch_refuses_startup_naming_it() {
-        for key in [
-            CSRF,
-            TRUSTED_PROXY,
-            CSV_SANITIZE_FORMULAS,
-            HTTP_DENY_PRIVATE,
+        for entry in [
+            CSRF.entry(),
+            TRUSTED_PROXY.entry(),
+            CSV_SANITIZE_FORMULAS.entry(),
+            HTTP_DENY_PRIVATE.entry(),
         ] {
-            crate::system::locked_set_var(key.name(), "maybe");
-            let refusals = check_entries(&[key.entry()]);
-            crate::system::locked_remove_var(key.name());
-            if key.entry().feature().is_compiled() {
-                assert_eq!(refusals.len(), 1, "{}: {refusals:?}", key.name());
-                assert!(refusals.iter().all(|r| r.name() == key.name()));
+            crate::system::locked_set_var(entry.name(), "maybe");
+            let refusals = check_entries(std::iter::once(&entry));
+            crate::system::locked_remove_var(entry.name());
+            if entry.feature().is_compiled() {
+                assert_eq!(refusals.len(), 1, "{}: {refusals:?}", entry.name());
+                assert!(refusals.iter().all(|r| r.name() == entry.name()));
             } else {
                 assert!(refusals.is_empty(), "{refusals:?}");
             }
         }
+    }
+
+    /// The deny-private switch states no fixed default: unset, the process's
+    /// posture picks, so the reference never shows one position as its default.
+    #[test]
+    fn deny_private_documents_a_posture_scoped_default() {
+        let entry = HTTP_DENY_PRIVATE.entry();
+        assert!(
+            matches!(entry.default(), DefaultValue::Scoped(_)),
+            "{:?}",
+            entry.default()
+        );
+        assert!(entry.default_fits_grammar());
+        let shown = entry.default().to_string();
+        assert!(shown.starts_with("unset"), "{shown}");
+        assert_ne!(shown, DefaultValue::Flag(EnvFlag::On).to_string());
+        assert_eq!(SecurityPosture::from_lookup(lookup(&[])).deny_private, None);
     }
 
     /// Once fixed, the posture ignores a value written after startup.

@@ -10,7 +10,7 @@
 
 use crate::csp::ends_raw_text_early;
 use crate::env_registry::SecretSetting;
-use crate::env_registry::security::{ConsoleAuthSetting, security_posture};
+use crate::env_registry::security::security_posture;
 use crate::telemetry::{self, ConsoleAuthMode, ConsoleAuthResolution, Posture};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
@@ -44,7 +44,7 @@ pub(crate) fn gate_allows(mount: &super::MountContext) -> bool {
     ) {
         return false;
     }
-    let resolved = console_auth_resolution();
+    let resolved = ConsoleAuthResolution::from_env();
     if resolved.mode == ConsoleAuthMode::Off {
         return false;
     }
@@ -246,24 +246,6 @@ impl RoleToken for MetricsToken {
     }
 }
 
-/// The console-auth setting under the process's `IPE_CONSOLE_AUTH` posture.
-///
-/// The variable is read once, before the program's first line; a refused value
-/// resolves to `Off`, the surface declared absent.
-pub fn console_auth_resolution() -> ConsoleAuthResolution {
-    let raw = match security_posture().console_auth {
-        ConsoleAuthSetting::Unset => telemetry::RawEnv::Absent,
-        ConsoleAuthSetting::Named(name) => telemetry::RawEnv::Value(name),
-        ConsoleAuthSetting::Refused => telemetry::RawEnv::NotUnicode,
-    };
-    ConsoleAuthResolution::resolve(
-        raw,
-        telemetry::BuildPosture::COMPILED,
-        Posture::from_env(),
-        telemetry::ProcessScope::current(),
-    )
-}
-
 /// One source in a credential's precedence chain.
 enum TokenSource {
     /// Absent: defer to the next source.
@@ -414,9 +396,9 @@ impl Surface {
 
 /// The console-auth mode label for the `[ipe.console] … mode=<m>` startup log.
 ///
-/// Derived from the one `IPE_CONSOLE_AUTH` reading, [`console_auth_resolution`].
+/// Derived from the one `IPE_CONSOLE_AUTH` reading, [`ConsoleAuthResolution::from_env`].
 pub fn console_auth_mode_label() -> &'static str {
-    console_auth_resolution().mode.label()
+    ConsoleAuthResolution::from_env().mode.label()
 }
 
 /// Per-request auth gate for the console + metrics surface.
@@ -426,9 +408,12 @@ pub fn gate_blocked(
     surface: Surface,
     headers: &axum::http::HeaderMap,
 ) -> Option<axum::response::Response> {
-    gate_decision(console_auth_resolution().mode, surface, headers, || {
-        Credentials::from_env(surface)
-    })
+    gate_decision(
+        ConsoleAuthResolution::from_env().mode,
+        surface,
+        headers,
+        || Credentials::from_env(surface),
+    )
 }
 
 /// The gate as a pure function of the resolved mode and the request.
@@ -716,7 +701,7 @@ mod tests {
     #[test]
     fn release_with_nothing_set_keeps_console_closed() {
         seed_console_env(&[]);
-        let resolved = console_auth_resolution();
+        let resolved = ConsoleAuthResolution::from_env();
         assert_eq!(resolved.mode, ConsoleAuthMode::UnsetProd);
         if !cfg!(feature = "dev-posture") {
             assert_eq!(resolved.posture, Posture::Production);
@@ -738,7 +723,7 @@ mod tests {
     #[test]
     fn dev_posture_off_loopback_keeps_console_closed() {
         seed_console_env(&[("ENV", "dev")]);
-        let resolved = console_auth_resolution();
+        let resolved = ConsoleAuthResolution::from_env();
         let posture = if cfg!(feature = "dev-posture") {
             Posture::Dev
         } else {

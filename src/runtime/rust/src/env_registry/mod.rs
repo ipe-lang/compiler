@@ -108,12 +108,15 @@ pub enum DefaultValue {
     Port(u16),
     /// A boolean switch's position.
     Flag(EnvFlag),
+    /// A boolean switch whose unset position the process's posture picks,
+    /// stated as a phrase.
+    Scoped(&'static str),
 }
 
 impl std::fmt::Display for DefaultValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Text(text) => f.write_str(text),
+            Self::Text(text) | Self::Scoped(text) => f.write_str(text),
             Self::Count(n) => write!(f, "{n}"),
             Self::Port(port) => write!(f, "{port}"),
             Self::Flag(EnvFlag::On) => f.write_str("on"),
@@ -199,10 +202,15 @@ impl EnvEntry {
 
     /// Whether the default's kind is the grammar's.
     ///
-    /// A flag defaults to a switch position, and only a flag does.
+    /// A flag defaults to a switch position or a posture-scoped phrase, and
+    /// only a flag does.
     #[must_use]
     pub const fn default_fits_grammar(&self) -> bool {
-        matches!(self.grammar, Grammar::Flag) == matches!(self.default, DefaultValue::Flag(_))
+        matches!(self.grammar, Grammar::Flag)
+            == matches!(
+                self.default,
+                DefaultValue::Flag(_) | DefaultValue::Scoped(_)
+            )
     }
 
     /// Judges the live value (overlay first) against this entry's grammar.
@@ -415,22 +423,49 @@ impl FlagKey {
     }
 }
 
-impl FlagKey {
+/// A boolean switch variable whose unset position the process's posture picks.
+///
+/// It has no fixed default, so neither a reader nor the reference can state one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScopedFlagKey(EnvEntry);
+
+impl ScopedFlagKey {
+    /// A switch variable named `name`; `unset` states what the posture picks.
+    #[must_use]
+    pub const fn new(name: &'static str, unset: &'static str, doc: Doc) -> Self {
+        Self(EnvEntry {
+            name,
+            grammar: Grammar::Flag,
+            default: DefaultValue::Scoped(unset),
+            doc,
+        })
+    }
+
+    /// The registry entry.
+    #[must_use]
+    pub const fn entry(self) -> EnvEntry {
+        self.0
+    }
+
+    /// The variable's name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        self.0.name
+    }
+
     /// Parses a raw lookup of this variable; `None` when unset.
-    ///
-    /// For a switch whose unset position depends on more than the variable.
     ///
     /// # Errors
     ///
     /// The refusal naming the variable when the value is set but spells no switch.
-    pub fn parse_explicit(
+    pub fn parse(
         self,
         raw: Result<String, std::env::VarError>,
     ) -> Result<Option<EnvFlag>, EnvRefusal> {
         judge(
-            self.entry.name,
+            self.0.name,
             Grammar::Flag,
-            self.entry.doc.class,
+            self.0.doc.class,
             raw,
             EnvFlag::parse,
         )
@@ -687,6 +722,9 @@ pub fn startup_check() -> Result<(), Vec<EnvRefusal>> {
             refusals.push(refusal);
         }
         security::fix_posture();
+        crate::telemetry::fix_deployment_posture();
+        #[cfg(any(feature = "web", feature = "debugger", feature = "control-wire"))]
+        crate::control::transport::fix_control_token();
         #[cfg(feature = "server")]
         crate::server::fix_declared_names();
     }
@@ -912,12 +950,6 @@ mod tests {
         assert!(host_refusals("review.example.com").is_empty());
     }
 
-    /// A registered variable read by name outside the registry, as `(file, name)`.
-    ///
-    /// The startup console banner's `IPE_CONSOLE_AUTH` read suppresses a link
-    /// only; it never decides access.
-    const LITERAL_READS_ALLOWED: [(&str, &str); 1] = [("telemetry.rs", "IPE_CONSOLE_AUTH")];
-
     /// The registered names `text` reads by literal name, outside the registry.
     fn literal_reads(text: &str) -> Vec<&'static str> {
         registry()
@@ -967,27 +999,18 @@ mod tests {
     fn registered_variables_are_read_only_through_their_keys() {
         let sources = runtime_sources();
         assert!(sources.len() > 50, "the scan sees the runtime sources");
-        let mut seen = Vec::new();
-        let mut stray = Vec::new();
-        for (file, text) in &sources {
-            for name in literal_reads(text) {
-                if LITERAL_READS_ALLOWED.contains(&(file.as_str(), name)) {
-                    seen.push((file.clone(), name));
-                } else {
-                    stray.push(format!("{file}: {name}"));
-                }
-            }
-        }
+        let stray: Vec<String> = sources
+            .iter()
+            .flat_map(|(file, text)| {
+                literal_reads(text)
+                    .into_iter()
+                    .map(move |name| format!("{file}: {name}"))
+            })
+            .collect();
         assert!(
             stray.is_empty(),
             "read these through their registered key: {stray:#?}"
         );
-        for (file, name) in LITERAL_READS_ALLOWED {
-            assert!(
-                seen.iter().any(|(f, n)| f == file && *n == name),
-                "{file} no longer reads {name}; drop it from the list"
-            );
-        }
     }
 
     /// The scan names a literal read of a registered security switch.

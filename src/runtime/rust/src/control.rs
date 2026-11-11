@@ -282,13 +282,30 @@ pub mod transport {
         }
     }
 
-    /// Read the control token this process was launched with, treating an empty
+    /// The control token this process was launched with, treating an empty
     /// value as absent (fail-closed: an empty token never authorizes anything).
+    ///
+    /// Read once, at startup, so a token the program writes later never
+    /// authorizes a control request.
     #[must_use]
     pub fn control_token_from_env() -> Option<String> {
-        crate::system::read_env_var(CONTROL_TOKEN_ENV)
-            .ok()
-            .filter(|t| !t.is_empty())
+        launched_control_token().map(str::to_owned)
+    }
+
+    /// Fixes the control token for the process.
+    pub fn fix_control_token() {
+        launched_control_token();
+    }
+
+    fn launched_control_token() -> Option<&'static str> {
+        static TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        TOKEN
+            .get_or_init(|| {
+                crate::system::read_env_var(CONTROL_TOKEN_ENV)
+                    .ok()
+                    .filter(|t| !t.is_empty())
+            })
+            .as_deref()
     }
 
     /// Read the loopback control-socket port this process was launched with, if
@@ -316,6 +333,21 @@ pub mod transport {
                 );
                 assert_eq!(addr.port(), port);
             }
+        }
+
+        // A token the program writes after startup neither replaces nor
+        // mints the launched one.
+        #[test]
+        fn a_token_written_after_startup_is_not_the_control_token() {
+            crate::system::locked_set_var(CONTROL_TOKEN_ENV, "launched");
+            fix_control_token();
+            crate::system::locked_set_var(CONTROL_TOKEN_ENV, "planted-by-the-program");
+            assert_eq!(control_token_from_env().as_deref(), Some("launched"));
+            assert!(!is_authorized(
+                control_token_from_env().as_deref(),
+                Some("planted-by-the-program")
+            ));
+            crate::system::locked_remove_var(CONTROL_TOKEN_ENV);
         }
 
         #[test]

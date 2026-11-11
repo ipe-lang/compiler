@@ -179,7 +179,8 @@ fn spawn_and_wait_ready(
 }
 
 /// Same as `spawn_and_wait_ready`, plus caller-supplied extra environment
-/// variables on the child (e.g. `IPE_TRUSTED_PROXY` / `ENV` for the
+/// variables on the child, an empty value removing the variable instead (an
+/// empty operator switch refuses startup) (e.g. `IPE_TRUSTED_PROXY` / `ENV` for the
 /// CSRF-cookie `Secure`-gating E2E tests, which need a real subprocess
 /// because the runtime's `IPE_TRUSTED_PROXY` trust decision is cached in a
 /// process-wide `OnceLock` — an in-process unit test cannot toggle it
@@ -201,7 +202,11 @@ fn spawn_and_wait_ready_with_env(
         .stderr(Stdio::piped())
         .stdout(Stdio::null());
     for (k, v) in extra_env {
-        cmd.env(k, v);
+        if v.is_empty() {
+            cmd.env_remove(k);
+        } else {
+            cmd.env(k, v);
+        }
     }
     let mut child = cmd.spawn().map_err(|e| -> BoxError {
         format!("{test_name}: cannot spawn server binary: {e}").into()
@@ -1146,8 +1151,8 @@ fn release_web_app_keeps_console_closed_without_auth() -> Result<(), BoxError> {
         ipe_backend_rust::BuildIntent::Release,
     )?;
     let port = pick_ephemeral_port()?;
-    // Empty values read as absent, so an inherited posture or credential mode
-    // cannot open the console behind the test's back.
+    // Each variable is removed from the child, so an inherited posture or
+    // credential mode cannot open the console behind the test's back.
     let _guard = spawn_and_wait_ready_with_env(
         test_name,
         &exe,

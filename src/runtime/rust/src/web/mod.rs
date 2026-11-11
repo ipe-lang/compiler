@@ -6363,9 +6363,7 @@ mod handlers {
         // Per-process control token. Absent token ⇒ the endpoint is unusable
         // (fail closed), so a dev server with the flag set but no token minted
         // cannot be driven by an untrusted caller.
-        let expected = crate::system::read_env_var("IPE_WATCH_HOT_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty());
+        let expected = crate::control::transport::control_token_from_env();
         let presented = headers
             .get("x-ipe-hot-token")
             .and_then(|v| v.to_str().ok())
@@ -6430,9 +6428,7 @@ mod handlers {
         }
         // Per-process control token — same mechanism as `/_ipe/hot-appearance`.
         // Absent expected token → fail closed (endpoint unusable without a token).
-        let expected = crate::system::read_env_var("IPE_WATCH_HOT_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty());
+        let expected = crate::control::transport::control_token_from_env();
         let presented = headers
             .get("x-ipe-hot-token")
             .and_then(|v| v.to_str().ok())
@@ -6508,9 +6504,7 @@ mod handlers {
         }
         // Per-process control token — same mechanism as `/_ipe/hot-transition`.
         // Absent expected token → fail closed (endpoint unusable without a token).
-        let expected = crate::system::read_env_var("IPE_WATCH_HOT_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty());
+        let expected = crate::control::transport::control_token_from_env();
         let presented = headers
             .get("x-ipe-hot-token")
             .and_then(|v| v.to_str().ok())
@@ -6597,9 +6591,7 @@ mod handlers {
         }
         // Per-process control token — same mechanism as `/_ipe/hot-transition`.
         // Absent expected token → fail closed (endpoint unusable without a token).
-        let expected = crate::system::read_env_var("IPE_WATCH_HOT_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty());
+        let expected = crate::control::transport::control_token_from_env();
         let presented = headers
             .get("x-ipe-hot-token")
             .and_then(|v| v.to_str().ok())
@@ -6676,9 +6668,7 @@ mod handlers {
         }
         // Per-process control token — same mechanism as `/_ipe/hot-transition`.
         // Absent expected token → fail closed (endpoint unusable without a token).
-        let expected = crate::system::read_env_var("IPE_WATCH_HOT_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty());
+        let expected = crate::control::transport::control_token_from_env();
         let presented = headers
             .get("x-ipe-hot-token")
             .and_then(|v| v.to_str().ok())
@@ -6755,9 +6745,7 @@ mod handlers {
             return StatusCode::NOT_FOUND.into_response();
         }
         // Per-process control token — same mechanism as `/_ipe/hot-transition`.
-        let expected = crate::system::read_env_var("IPE_WATCH_HOT_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty());
+        let expected = crate::control::transport::control_token_from_env();
         let presented = headers
             .get("x-ipe-hot-token")
             .and_then(|v| v.to_str().ok())
@@ -6818,9 +6806,7 @@ mod handlers {
     {
         // Per-process control token — same mechanism as `/_ipe/hot-appearance`.
         // Absent expected token → fail closed (endpoint unusable without a token).
-        let expected = crate::system::read_env_var("IPE_WATCH_HOT_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty());
+        let expected = crate::control::transport::control_token_from_env();
         let presented = headers
             .get("x-ipe-hot-token")
             .and_then(|v| v.to_str().ok())
@@ -8201,7 +8187,7 @@ where
     // mounted, so its effective posture/mode/source is always logged once.
     crate::system::emit_runtime_log(
         "console",
-        &console::console_auth_resolution().startup_message(),
+        &crate::telemetry::ConsoleAuthResolution::from_env().startup_message(),
     );
 
     // When `http_client` is active and the pre-built console binary is
