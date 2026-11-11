@@ -682,6 +682,88 @@ mod tests {
             .map_err(|(d, _home)| d)
     }
 
+    /// `module Main` importing `Ipe.Secret`, exposing `key`, with `defs` appended.
+    fn secret_module(defs: &str) -> String {
+        format!("module Main exposing (key)\n\nimport Ipe.Secret as Secret\n\n\n{defs}")
+    }
+
+    /// Whether `result` is the IPE-L0150 committed-literal refusal.
+    fn is_secret_literal_refusal(result: &Result<(), Diagnostic>) -> bool {
+        matches!(
+            result,
+            Err(Diagnostic::Lower {
+                msg: LowerError::SecretFromStringLiteral,
+                ..
+            })
+        )
+    }
+
+    #[test]
+    fn secret_from_toplevel_literal_constant_is_refused() {
+        let result = lower_result(&secret_module(
+            "apiKey : String\napiKey =\n    \"sk_live_toplevel\"\n\n\n\
+             key =\n    Secret.fromString apiKey\n",
+        ));
+        assert!(
+            is_secret_literal_refusal(&result),
+            "a top-level literal constant sealed by `Secret.fromString` must be IPE-L0150, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn secret_from_constant_built_from_constants_is_refused() {
+        let result = lower_result(&secret_module(
+            "prefix : String\nprefix =\n    \"sk_live_\"\n\n\n\
+             apiKey : String\napiKey =\n    prefix ++ \"joined\"\n\n\n\
+             key =\n    Secret.fromString apiKey\n",
+        ));
+        assert!(
+            is_secret_literal_refusal(&result),
+            "a constant joined from constants must be IPE-L0150, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn secret_from_let_bound_toplevel_constant_is_refused() {
+        let result = lower_result(&secret_module(
+            "apiKey : String\napiKey =\n    \"sk_live_letbound\"\n\n\n\
+             key =\n    let\n        cred = apiKey\n    in\n    Secret.fromString cred\n",
+        ));
+        assert!(
+            is_secret_literal_refusal(&result),
+            "a `let` alias of a top-level literal constant must be IPE-L0150, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn secret_from_empty_toplevel_constant_is_accepted() {
+        let result = lower_result(&secret_module(
+            "blank : String\nblank =\n    \"\"\n\n\n\
+             key =\n    Secret.fromString blank\n",
+        ));
+        assert!(
+            !is_secret_literal_refusal(&result),
+            "an empty constant carries no key material and must not be IPE-L0150, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn secret_from_constant_chain_past_fold_budget_is_refused() {
+        // Every link is the empty constant, so only the fold ceiling can refuse:
+        // a chain longer than the budget is unproven and fails closed.
+        let chain: String = (0..300)
+            .zip(1..301)
+            .map(|(prev, next)| format!("c{next} : String\nc{next} =\n    c{prev}\n\n\n"))
+            .collect();
+        let result = lower_result(&secret_module(&format!(
+            "c0 : String\nc0 =\n    \"\"\n\n\n{chain}key =\n    Secret.fromString c300\n"
+        )));
+        assert!(
+            is_secret_literal_refusal(&result),
+            "a constant chain past the fold budget must fail closed as IPE-L0150, got {result:?}"
+        );
+    }
+
     #[test]
     fn generic_record_signature_lowers_to_generic_struct_field() {
         // `wrap : a -> { value : a }` — the parameter and the record field both

@@ -135,6 +135,52 @@ impl BinderType {
 /// A top-level binding's fully-qualified key: its `(module, name)`.
 type TopLevelKey = (Vec<Symbol>, Symbol);
 
+/// Node visits one `Secret.fromString` literal fold may spend.
+const LITERAL_FOLD_BUDGET: u32 = 256;
+
+/// What the `Secret.fromString` literal fold proves a string expression denotes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LiteralFold {
+    /// The expression is this compile-time constant.
+    Constant(String),
+    /// The fold spent its budget before settling the expression.
+    Unproven,
+}
+
+impl LiteralFold {
+    /// Whether the seal must refuse this value as committed key material.
+    ///
+    /// A non-empty constant is a committed credential; the empty constant carries
+    /// no secret; an unproven value is refused (fail closed).
+    const fn is_key_material(&self) -> bool {
+        match self {
+            Self::Constant(text) => !text.is_empty(),
+            Self::Unproven => true,
+        }
+    }
+
+    /// The fold of `self ++ next`.
+    fn join(self, next: Self) -> Self {
+        match (self, next) {
+            (Self::Constant(mut head), Self::Constant(tail)) => {
+                head.push_str(&tail);
+                Self::Constant(head)
+            }
+            (Self::Unproven, _) | (_, Self::Unproven) => Self::Unproven,
+        }
+    }
+
+    /// The fold of two branches of one `if`/`case`, or `None` when they differ.
+    ///
+    /// An unproven branch keeps the whole unproven, so a spent budget refuses.
+    fn agree(self, other: Self) -> Option<Self> {
+        match (self, other) {
+            (Self::Unproven, _) | (_, Self::Unproven) => Some(Self::Unproven),
+            (Self::Constant(a), Self::Constant(b)) => (a == b).then_some(Self::Constant(a)),
+        }
+    }
+}
+
 /// Build a [`Diagnostic::CompilerBug`] for a violated lowering invariant.
 ///
 /// Reserved **strictly** for genuinely-unreachable states: a symbol foreign to
@@ -12162,7 +12208,14 @@ pub struct Lowerer<'a> {
     /// cross-function value leaves no entry and stays accepted — the honest
     /// residual. Scoped save/restore per registering `let`; interior mutability so
     /// the lowering walk stays over a shared `&self`.
-    local_string_literals: std::cell::RefCell<BTreeMap<Symbol, String>>,
+    local_string_literals: std::cell::RefCell<BTreeMap<Symbol, LiteralFold>>,
+    /// Node visits left to the current [`Self::fold_string_literal`] walk.
+    ///
+    /// Reset at each fold entry; a walk that spends it settles on
+    /// [`LiteralFold::Unproven`], so a constant chain an input can deepen at will
+    /// (a top-level constant built from other constants) is turned back by a
+    /// declared ceiling rather than walked without bound.
+    literal_fold_budget: Cell<u32>,
     /// Local binders whose function carrier is known where they are bound, keyed to that carrier.
     ///
     /// A pattern binder of an enum-constructor payload, a tuple component, a
@@ -14375,6 +14428,7 @@ impl<'a> Lowerer<'a> {
             callee_instances: std::cell::RefCell::new(Vec::new()),
             toplevel_fn_aliases: std::cell::RefCell::new(BTreeMap::new()),
             local_string_literals: std::cell::RefCell::new(BTreeMap::new()),
+            literal_fold_budget: Cell::new(LITERAL_FOLD_BUDGET),
             local_fn_carriers: std::cell::RefCell::new(BTreeMap::new()),
             #[cfg(test)]
             carrier_walks: std::cell::Cell::new(0),
@@ -24430,15 +24484,17 @@ impl<'a> Lowerer<'a> {
                 Callee::Kernel(KernelFn::SecretFromString) if args.len() == 1 => {
                     // A NON-EMPTY compile-time-constant string is a committed
                     // credential — rejected. The argument is reduced through a
-                    // bounded LOCAL constant-fold ([`Self::fold_string_literal`]):
-                    // a direct literal, a local `let`/`do` binding of one
-                    // (`let cred = "sk_live_…" in Secret.fromString cred`), or a
-                    // literal string join (`"sk_live_" ++ "…"`, `String.append`,
-                    // `String.concat [ … ]`) all denote the same baked-in secret
-                    // and are refused here. The fold stops at the LOCAL scope: a
-                    // function parameter, an env/file/runtime read, or a
-                    // cross-function result does not fold and is ACCEPTED (the
-                    // honest residual — `Secret.fromString runtimeString`).
+                    // bounded constant-fold ([`Self::fold_string_literal`]): a
+                    // direct literal, a local `let`/`do` binding of one
+                    // (`let cred = "sk_live_…" in Secret.fromString cred`), a
+                    // top-level constant whose body folds (`apiKey = "sk_live_…"`
+                    // then `Secret.fromString apiKey`), or a literal string join
+                    // (`"sk_live_" ++ "…"`, `String.append`, `String.concat [ … ]`)
+                    // all denote the same baked-in secret and are refused here. A
+                    // fold that spends its budget is unproven and refused (fail
+                    // closed). A function parameter, an env/file/runtime read, or
+                    // a function result does not fold and is ACCEPTED (the honest
+                    // residual — `Secret.fromString runtimeString`).
                     //
                     // The EMPTY-string literal `""` is exempt: it carries no secret
                     // material, so it cannot leak anything, and it is the
@@ -24449,8 +24505,9 @@ impl<'a> Lowerer<'a> {
                     // own span and carries NO payload — it never echoes the folded
                     // secret text.
                     if let Some(arg0) = args.first()
-                        && let Some(folded) = self.fold_string_literal(arg0)
-                        && !folded.is_empty()
+                        && self
+                            .fold_string_literal(arg0)
+                            .is_some_and(|folded| folded.is_key_material())
                     {
                         return Err(Diagnostic::Lower {
                             span: arg0.span,
@@ -33207,7 +33264,7 @@ impl<'a> Lowerer<'a> {
     /// predecessors already present — canon `let` is sequential (`let*`), so a
     /// chained `let a = "x"  b = a` folds `b` through the earlier `a`. A binding
     /// whose body does NOT fold to a constant string (a parameter, a runtime read,
-    /// a cross-function result) registers as a REMOVAL of any outer entry of that
+    /// a function result) registers as a REMOVAL of any outer entry of that
     /// name, so a rebinding shadowing an outer constant clears it rather than
     /// leaving a stale value visible.
     fn with_local_string_literals<T>(
@@ -33241,69 +33298,77 @@ impl<'a> Lowerer<'a> {
         out
     }
 
-    /// Reduce `arg` through a BOUNDED, LOCAL compile-time constant-fold, returning
-    /// the constant [`String`] it denotes or `None` when it does not fold to one.
-    /// The single source of truth for the `Secret.fromString` committed-literal
-    /// gate (IPE-L0150): a credential baked into source reaches the seal not only
-    /// as an inline `Str` literal but through a local `let`/`do` binding
-    /// (`let cred = "sk_live_…" in Secret.fromString cred`) or a literal string
-    /// join (`"sk_live_" ++ "…"`, `String.append`, `String.concat [ … ]`). All of
-    /// these are the SAME committed-secret violation reached through a fold, so
-    /// the gate resolves them here before deciding.
+    /// Reduce `arg` through a bounded compile-time constant-fold.
     ///
-    /// The fold is deliberately LOCAL and bounded — it never does whole-program or
-    /// cross-function constant propagation:
+    /// Returns what the fold proves `arg` denotes, or `None` when it is not a
+    /// compile-time constant. The single source of truth for the
+    /// `Secret.fromString` committed-literal gate (IPE-L0150): a credential baked
+    /// into source reaches the seal not only as an inline `Str` literal but
+    /// through a local `let`/`do` binding, a top-level constant, or a literal
+    /// string join. All of these are the SAME committed-secret violation reached
+    /// through a fold, so the gate resolves them here before deciding.
+    ///
     /// - a direct [`canon::Expr_::Str`] literal folds to itself;
     /// - a [`canon::Expr_::VarLocal`] folds ONLY through
     ///   [`Self::local_string_literals`], the CURRENT enclosing `let`/`do` scope —
     ///   a function PARAMETER, a `case`/lambda binder, or any name with no
-    ///   constant binding in scope yields `None` (ACCEPTED: the honest residual);
+    ///   constant binding in scope yields `None`;
+    /// - a [`canon::Expr_::VarTopLevel`] naming a zero-parameter definition (a
+    ///   constant) folds through that definition's body, walked with an EMPTY
+    ///   local scope (the reference site's `let` names are not in scope there);
     /// - `String.append a b`, `a ++ b`, and `String.concat [ … ]` fold when EVERY
     ///   operand folds (recursively); any non-folding operand makes the whole
     ///   `None`;
-    /// - an `if`/`case` folds when EVERY branch folds to the SAME constant (a
-    ///   const `if True then "x" else "x"` is still a committed literal; divergent
-    ///   or runtime-selected branches yield `None`).
+    /// - an `if`/`case` folds when EVERY branch folds to the SAME constant.
     ///
-    /// A runtime-derived value (env read, file read, parse result, function
-    /// argument), a cross-function call, or a deliberately-obfuscated construction
-    /// (`String.fromList`, base64 decode, char arithmetic) all fall outside the
-    /// fold and yield `None` — accepted as the honest boundary. The returned
-    /// [`String`] is used ONLY to test emptiness at the gate; it is NEVER placed
-    /// in a diagnostic payload (the gate never echoes secret text).
-    fn fold_string_literal(&self, arg: &canon::Expr) -> Option<String> {
+    /// The walk spends [`Self::literal_fold_budget`] (one unit per node, reset
+    /// here); a walk that runs out settles on [`LiteralFold::Unproven`], which the
+    /// gate refuses — a constant chain past the ceiling is not proven benign.
+    /// A runtime-derived value, a function result, or a deliberately-obfuscated
+    /// construction (`String.fromList`, base64 decode) falls outside the fold and
+    /// yields `None`. The folded text is used ONLY to test emptiness at the gate;
+    /// it is NEVER placed in a diagnostic payload.
+    fn fold_string_literal(&self, arg: &canon::Expr) -> Option<LiteralFold> {
+        self.literal_fold_budget.set(LITERAL_FOLD_BUDGET);
+        self.fold_literal_node(arg)
+    }
+
+    /// One budgeted step of [`Self::fold_string_literal`].
+    fn fold_literal_node(&self, arg: &canon::Expr) -> Option<LiteralFold> {
+        let Some(rest) = self.literal_fold_budget.get().checked_sub(1) else {
+            return Some(LiteralFold::Unproven);
+        };
+        self.literal_fold_budget.set(rest);
         match &arg.value {
-            canon::Expr_::Str(lit) => Some(lit.clone()),
+            canon::Expr_::Str(lit) => Some(LiteralFold::Constant(lit.clone())),
             canon::Expr_::VarLocal(name) => self.local_string_literals.borrow().get(name).cloned(),
+            canon::Expr_::VarTopLevel { module, name } => {
+                self.fold_toplevel_constant(module, *name)
+            }
             // `a ++ b` — canonicalised to a `Binop` whose `func` is `append`.
             canon::Expr_::Binop { func, lhs, rhs, .. }
                 if self.interner.resolve(*func) == Some("append") =>
             {
-                let l = self.fold_string_literal(lhs)?;
-                let r = self.fold_string_literal(rhs)?;
-                Some(l + &r)
+                let l = self.fold_literal_node(lhs)?;
+                let r = self.fold_literal_node(rhs)?;
+                Some(l.join(r))
             }
             canon::Expr_::Call(callee, args) => self.fold_string_join_call(callee, args),
             canon::Expr_::If(arms, default) => {
-                // Every branch (each `then` plus the final `else`) must fold to the
-                // SAME constant — a runtime-selected or divergent value is not a
-                // committed literal and yields `None`.
-                let first = self.fold_string_literal(default)?;
+                let mut folded = self.fold_literal_node(default)?;
                 for (_, branch) in arms {
-                    if self.fold_string_literal(branch)? != first {
-                        return None;
-                    }
+                    folded = folded.agree(self.fold_literal_node(branch)?)?;
                 }
-                Some(first)
+                Some(folded)
             }
             canon::Expr_::Case(_, branches) => {
-                let mut folded: Option<String> = None;
+                let mut folded: Option<LiteralFold> = None;
                 for arm in branches {
-                    let b = self.fold_string_literal(&arm.body)?;
-                    match &folded {
-                        Some(prev) if prev != &b => return None,
-                        _ => folded = Some(b),
-                    }
+                    let b = self.fold_literal_node(&arm.body)?;
+                    folded = Some(match folded {
+                        Some(prev) => prev.agree(b)?,
+                        None => b,
+                    });
                 }
                 folded
             }
@@ -33311,12 +33376,38 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Fold a reference to the top-level constant `(module, name)`, or `None`.
+    ///
+    /// Only a definition with no parameters folds. Its body is walked with an
+    /// EMPTY local scope and the walk's budget still running, so a constant built
+    /// from other constants folds hop by hop and a chain past the ceiling settles
+    /// on [`LiteralFold::Unproven`].
+    fn fold_toplevel_constant(&self, module: &[Symbol], name: Symbol) -> Option<LiteralFold> {
+        let id = self.func_ids.get(&(module.to_vec(), name))?;
+        let def = usize::try_from(id.as_raw())
+            .ok()
+            .and_then(|idx| self.m.defs.get(idx))?;
+        let (canon::Def::Typed { patterns, body, .. } | canon::Def::Untyped { patterns, body, .. }) =
+            def;
+        if !patterns.is_empty() {
+            return None;
+        }
+        let outer = self.local_string_literals.take();
+        let folded = self.fold_literal_node(body);
+        self.local_string_literals.replace(outer);
+        folded
+    }
+
     /// Fold a `String.append` / `String.concat` CALL (the saturated, non-operator
     /// spellings) to a constant string, or `None`. `String.append a b` folds when
     /// both arguments fold; `String.concat [ … ]` folds when the argument is a
     /// LITERAL list whose every element folds. Any other callee — or a
     /// non-literal `concat` argument (a runtime-built list) — yields `None`.
-    fn fold_string_join_call(&self, callee: &canon::Expr, args: &[canon::Expr]) -> Option<String> {
+    fn fold_string_join_call(
+        &self,
+        callee: &canon::Expr,
+        args: &[canon::Expr],
+    ) -> Option<LiteralFold> {
         let (module, name) = match &callee.value {
             canon::Expr_::VarKernel { module, name, .. } => (*module, *name),
             _ => return None,
@@ -33326,17 +33417,17 @@ impl<'a> Lowerer<'a> {
         }
         match self.interner.resolve(name) {
             Some("append") if args.len() == 2 => {
-                let l = self.fold_string_literal(args.first()?)?;
-                let r = self.fold_string_literal(args.get(1)?)?;
-                Some(l + &r)
+                let l = self.fold_literal_node(args.first()?)?;
+                let r = self.fold_literal_node(args.get(1)?)?;
+                Some(l.join(r))
             }
             Some("concat") if args.len() == 1 => {
                 let canon::Expr_::List(elems) = &args.first()?.value else {
                     return None;
                 };
-                let mut out = String::new();
+                let mut out = LiteralFold::Constant(String::new());
                 for e in elems {
-                    out.push_str(&self.fold_string_literal(e)?);
+                    out = out.join(self.fold_literal_node(e)?);
                 }
                 Some(out)
             }
