@@ -1011,9 +1011,14 @@ fn infer_core(
                 };
                 if !concrete_super_ok(interner, bounds, &int_ty, &enum_embeds) {
                     return Err(InferError::sited(
-                        super_unsatisfied(interner, bounds, &int_ty, *span, |b| {
-                            concrete_super_ok(interner, b, &int_ty, &enum_embeds)
-                        }),
+                        super_unsatisfied(
+                            interner,
+                            bounds,
+                            &int_ty,
+                            *span,
+                            &mut VarNamer::new(),
+                            |b| concrete_super_ok(interner, b, &int_ty, &enum_embeds),
+                        ),
                         home,
                     ));
                 }
@@ -1039,9 +1044,14 @@ fn infer_core(
                 };
                 if !concrete_super_ok(interner, bounds, &sqlvalue_ty, &enum_embeds) {
                     return Err(InferError::sited(
-                        super_unsatisfied(interner, bounds, &sqlvalue_ty, *span, |b| {
-                            concrete_super_ok(interner, b, &sqlvalue_ty, &enum_embeds)
-                        }),
+                        super_unsatisfied(
+                            interner,
+                            bounds,
+                            &sqlvalue_ty,
+                            *span,
+                            &mut VarNamer::new(),
+                            |b| concrete_super_ok(interner, b, &sqlvalue_ty, &enum_embeds),
+                        ),
                         home,
                     ));
                 }
@@ -1067,9 +1077,14 @@ fn infer_core(
                 };
                 if !concrete_super_ok(interner, bounds, &string_ty, &enum_embeds) {
                     return Err(InferError::sited(
-                        super_unsatisfied(interner, bounds, &string_ty, *span, |b| {
-                            concrete_super_ok(interner, b, &string_ty, &enum_embeds)
-                        }),
+                        super_unsatisfied(
+                            interner,
+                            bounds,
+                            &string_ty,
+                            *span,
+                            &mut VarNamer::new(),
+                            |b| concrete_super_ok(interner, b, &string_ty, &enum_embeds),
+                        ),
                         home,
                     ));
                 }
@@ -1104,8 +1119,9 @@ fn infer_core(
     for (root, orig_bounds, span, home) in pinned {
         let ty = lift!(zonk_emitted(&mut uf, budget, root));
         if !concrete_super_ok(interner, orig_bounds, &ty, &enum_embeds) {
+            let mut namer = lift!(unify::labelled_namer(&uf, interner, &[&ty]));
             return Err(InferError::sited(
-                super_unsatisfied(interner, orig_bounds, &ty, span, |b| {
+                super_unsatisfied(interner, orig_bounds, &ty, span, &mut namer, |b| {
                     concrete_super_ok(interner, b, &ty, &enum_embeds)
                 }),
                 home,
@@ -2164,6 +2180,8 @@ fn check_scheme_applications(
                         emitted_unmet(interner, *b, &ty, enum_embeds),
                         &ty,
                         app.span,
+                        &mut unify::labelled_namer(uf, interner, &[&ty])
+                            .map_err(InferError::unsited)?,
                     ),
                     &app.use_home,
                 ));
@@ -2241,7 +2259,8 @@ fn check_wildcard_pins(
             };
             let found = zonk(uf, budget, *fresh).map_err(InferError::unsited)?;
             if found != *pinned {
-                let mut namer = VarNamer::new();
+                let mut namer = unify::labelled_namer(uf, interner, &[pinned, &found])
+                    .map_err(InferError::unsited)?;
                 let expected =
                     ty_to_doc(pinned, interner, &mut namer).map_err(InferError::unsited)?;
                 let found = ty_to_doc(&found, interner, &mut namer).map_err(InferError::unsited)?;
@@ -2386,7 +2405,7 @@ fn classify_param_wildcard(
             if ground {
                 Ok(WildcardFact::Pinned(ty))
             } else {
-                let mut namer = VarNamer::new();
+                let mut namer = unify::labelled_namer(uf, interner, &[&ty])?;
                 Ok(WildcardFact::Dependent(
                     WildcardDependence::PartialStructure {
                         found: Box::new(ty_to_doc(&ty, interner, &mut namer)?),
@@ -2815,9 +2834,10 @@ pub(crate) fn super_unsatisfied(
     bounds: TyBounds,
     ty: &Ty,
     span: Span,
+    namer: &mut VarNamer,
     ok: impl Fn(TyBounds) -> bool,
 ) -> Diagnostic {
-    refusal_of_duty(interner, bounds, first_unmet(bounds, ok), ty, span)
+    refusal_of_duty(interner, bounds, first_unmet(bounds, ok), ty, span, namer)
 }
 
 /// The duty `ty` fails among `bounds` at a generic emission. An ordering a
@@ -2853,6 +2873,7 @@ fn refusal_of_duty(
     unmet: Option<Owed>,
     ty: &Ty,
     span: Span,
+    namer: &mut VarNamer,
 ) -> Diagnostic {
     let Some(owed) = unmet else {
         return Diagnostic::CompilerBug {
@@ -2860,7 +2881,7 @@ fn refusal_of_duty(
             detail: format!("refused {ty:?} meets every obligation in {bounds:?}"),
         };
     };
-    super_unsatisfied_named(interner, owed, ty, span, &mut VarNamer::new())
+    super_unsatisfied_named(interner, owed, ty, span, namer)
 }
 
 /// The IPE-T0014 refusal of `ty` for the unmet duty `owed`, rendering `ty`'s
@@ -3932,7 +3953,10 @@ fn no_such_field(
         Ok(t) => t,
         Err(bug) => return bug,
     };
-    let mut namer = VarNamer::new();
+    let mut namer = match unify::labelled_namer(uf, interner, &[&record_ty]) {
+        Ok(namer) => namer,
+        Err(bug) => return bug,
+    };
     let record_doc = match ty_to_doc(&record_ty, interner, &mut namer) {
         Ok(d) => d,
         Err(bug) => return bug,
@@ -5409,6 +5433,21 @@ mod tests {
         );
     }
 
+    /// A signature whose `Task` error channel is an annotation variable reads
+    /// "expecting `Error`, but `x`", never a minted letter.
+    #[test]
+    fn a_task_error_channel_variable_reads_by_its_spelling() {
+        let src = "module Main exposing (main)\n\
+                   f : Task x Int\n\
+                   f =\n    f\n\
+                   main =\n    f\n";
+        assert_eq!(
+            class_mismatch_of(src).map(|(expected, found, _)| (expected, found)),
+            Some((con_doc("Error"), var_doc("x"))),
+            "the error channel must print the user's `x`"
+        );
+    }
+
     /// A body returning a concrete type where the signature promised an
     /// annotation variable reads "expecting `x`, but `String`".
     #[test]
@@ -5422,6 +5461,63 @@ mod tests {
             Some((var_doc("x"), con_doc("String"))),
             "the rigid must print the user's `x`, never a minted letter"
         );
+    }
+
+    /// A missing-field refusal on a record whose field is an annotation
+    /// variable prints that variable by the user's spelling.
+    #[test]
+    fn a_missing_field_refusal_names_the_annotation_variable() {
+        let src = "module Main exposing (main)\n\
+                   f : { r | a : x } -> x\n\
+                   f v =\n    v.b\n\
+                   main =\n    f { a = 1 }\n";
+        let record = canon_src(src).and_then(|(m, mut i)| match infer(&m, &mut i) {
+            Err(Diagnostic::Type {
+                msg: TypeError::NoSuchField { record, .. },
+                ..
+            }) => Some(*record),
+            other => panic_free_debug(&other),
+        });
+        assert_eq!(
+            record,
+            Some(ipe_diagnostics::TyDoc::Record(
+                vec![(Box::from("a"), var_doc("x"))].into_boxed_slice()
+            )),
+            "the field's annotation variable must read `x`, never a minted letter"
+        );
+    }
+
+    /// A duty refusal over a structure holding an annotation variable prints
+    /// that variable by the user's spelling.
+    #[test]
+    fn a_duty_refusal_names_the_annotation_variable() {
+        let src = "module Main exposing (main)\n\
+                   f : (x -> x) -> Bool\n\
+                   f g =\n    ( g, 1 ) == ( g, 1 )\n\
+                   main =\n    f identity\n";
+        let found = canon_src(src).and_then(|(m, mut i)| match infer(&m, &mut i) {
+            Err(Diagnostic::Type {
+                msg: TypeError::SuperTypeUnsatisfied { found, .. },
+                ..
+            }) => Some(*found),
+            other => panic_free_debug(&other),
+        });
+        assert_eq!(
+            found,
+            Some(ipe_diagnostics::TyDoc::Tuple(
+                vec![
+                    ipe_diagnostics::TyDoc::Fun(Box::new(var_doc("x")), Box::new(var_doc("x"))),
+                    con_doc("Int"),
+                ]
+                .into_boxed_slice()
+            )),
+            "the refused tuple must read `( x -> x, Int )`, never minted letters"
+        );
+    }
+
+    fn panic_free_debug<T, U: std::fmt::Debug>(other: &U) -> Option<T> {
+        eprintln!("unexpected inference result: {other:?}");
+        None
     }
 
     #[test]
@@ -8801,9 +8897,16 @@ mod tests {
                     "a Stringify obligation on {ty:?} must be refused at {site:?}"
                 );
             }
-            let refusal = super_unsatisfied(&i, show, &ty, Span::DUMMY, |b| {
-                super_bounds_satisfied(&i, b, &ty, super_bounds::BoundSite::ConcretePin, &embeds)
-            });
+            let refusal =
+                super_unsatisfied(&i, show, &ty, Span::DUMMY, &mut VarNamer::new(), |b| {
+                    super_bounds_satisfied(
+                        &i,
+                        b,
+                        &ty,
+                        super_bounds::BoundSite::ConcretePin,
+                        &embeds,
+                    )
+                });
             assert_eq!(refusal.code().as_str(), "IPE-T0014");
             assert!(
                 matches!(
@@ -9759,7 +9862,10 @@ h x =
         let ty = con_ty(&mut i, &[], "Int");
         for bounds in TyBounds::ALL_BITS {
             assert_eq!(first_unmet(*bounds, |_| true), None);
-            let refusal = super_unsatisfied(&i, *bounds, &ty, Span::DUMMY, |_| true);
+            let refusal =
+                super_unsatisfied(&i, *bounds, &ty, Span::DUMMY, &mut VarNamer::new(), |_| {
+                    true
+                });
             assert!(
                 matches!(refusal, Diagnostic::CompilerBug { .. }),
                 "{bounds:?} met in full must be a compiler bug, got {refusal:?}"

@@ -271,7 +271,7 @@ fn call_arity(
         Ok(t) => t,
         Err(bug) => return Some(bug),
     };
-    let mut namer = match VarNamer::with_labels(var_labels(uf, &[&callee_ty]), interner) {
+    let mut namer = match labelled_namer(uf, interner, &[&callee_ty]) {
         Ok(namer) => namer,
         Err(bug) => return Some(bug),
     };
@@ -338,6 +338,23 @@ fn owed_class(bounds: TyBounds) -> Option<TypeClass> {
         | Owed::SqlParam
         | Owed::Interpolable => None,
     }
+}
+
+/// The namer a refusal renders `tys` with: every annotation variable reads by
+/// the user's spelling and every class-owing flex by its class stem.
+///
+/// Every refusal that renders a solved type with the arena at hand builds its
+/// namer here, so no refusal prints a minted letter for a variable the user
+/// named.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] if an annotation symbol cannot be resolved.
+pub fn labelled_namer(
+    uf: &UnionFind<Content>,
+    interner: &Interner,
+    tys: &[&Ty],
+) -> DResult<VarNamer> {
+    VarNamer::with_labels(var_labels(uf, tys), interner)
 }
 
 /// The label of every solver variable in `tys` a rendering must not name by a
@@ -477,7 +494,7 @@ fn unify_step(
                     Some(duty) => {
                         let structure_var = if a_is_structure { ra } else { rb };
                         let ty = zonk_reported(uf, budget, structure_var, span)?;
-                        let mut namer = VarNamer::with_labels(var_labels(uf, &[&ty]), interner)?;
+                        let mut namer = labelled_namer(uf, interner, &[&ty])?;
                         Err(crate::super_unsatisfied_named(
                             interner, duty, &ty, span, &mut namer,
                         ))
@@ -506,7 +523,7 @@ fn unify_step(
 
 /// Merge two variables NEITHER of which carries a structure descriptor — the
 /// `Flex` / `Rigid` / `Super` combinations. Reads only the trivial `Copy`
-/// payloads (`rigid: bool`, `bounds: TyBounds`) off the borrowed descriptors, so
+/// payloads (`rigid: Option<SkolemName>`, `bounds: TyBounds`) off the borrowed descriptors, so
 /// the common inner-loop step (a numeric literal meeting a variable, two rigids
 /// meeting) never deep-copies a descriptor.
 #[allow(clippy::too_many_arguments)]
@@ -1166,11 +1183,10 @@ fn mismatch_owing(
         Ok(t) => t,
         Err(bug) => return bug,
     };
-    let mut namer =
-        match VarNamer::with_labels(var_labels(uf, &[&expected_ty, &found_ty]), interner) {
-            Ok(namer) => namer,
-            Err(bug) => return bug,
-        };
+    let mut namer = match labelled_namer(uf, interner, &[&expected_ty, &found_ty]) {
+        Ok(namer) => namer,
+        Err(bug) => return bug,
+    };
     // A managed-loop `view` returns `Html` where the shape requires `Element`
     // (or the symmetric case): render the tailored IPE-T0020, which tells the
     // user to return an `Element` or wrap raw `Html` with `Ui.html`, instead of
@@ -1246,22 +1262,25 @@ fn infinite_type(
     var: VarId,
     structure: VarId,
 ) -> Diagnostic {
-    let mut namer = VarNamer::new();
-    // Name the variable first so it reads as `a` and any same var inside the
-    // structure renders consistently.
     let var_ty = match zonk_reported(uf, budget, var, span) {
         Ok(t) => t,
         Err(bug) => return bug,
     };
+    let structure_ty = match zonk_reported(uf, budget, structure, span) {
+        Ok(t) => t,
+        Err(bug) => return bug,
+    };
+    let mut namer = match labelled_namer(uf, interner, &[&var_ty, &structure_ty]) {
+        Ok(namer) => namer,
+        Err(bug) => return bug,
+    };
+    // Name the variable first so it reads as `a` and any same var inside the
+    // structure renders consistently.
     let var_name = match ty_to_doc(&var_ty, interner, &mut namer) {
         Ok(ipe_diagnostics::TyDoc::Var(v)) => v,
         // The occurs target is always flexible at the guard site; any other
         // shape (or a read-back bug) is an internal invariant violation.
         Ok(_) => Box::from("?"),
-        Err(bug) => return bug,
-    };
-    let structure_ty = match zonk_reported(uf, budget, structure, span) {
-        Ok(t) => t,
         Err(bug) => return bug,
     };
     let structure_doc = match ty_to_doc(&structure_ty, interner, &mut namer) {

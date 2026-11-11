@@ -24,6 +24,34 @@ pub enum VarLabel {
     Annotation(Symbol),
 }
 
+/// The label of every annotation-space variable in `tys`, so a refusal over a
+/// written (not yet instantiated) type reads each variable as the user wrote it.
+///
+/// An annotation-space raw is the variable's interned [`Symbol`]; a
+/// solver-tagged raw names no annotation variable and gets no label.
+#[must_use]
+pub fn annotation_labels(tys: &[&Ty]) -> BTreeMap<u32, VarLabel> {
+    let mut labels = BTreeMap::new();
+    let mut stack: Vec<&Ty> = tys.to_vec();
+    while let Some(ty) = stack.pop() {
+        match ty {
+            Ty::Var(raw) => {
+                if let Some(name) = crate::ty::SkolemName::of_annotation_var(*raw) {
+                    labels.insert(*raw, VarLabel::Annotation(name.symbol()));
+                }
+            }
+            Ty::Fun(arg, result) => {
+                stack.push(arg);
+                stack.push(result);
+            }
+            Ty::Con { args, .. } | Ty::Tuple(args) => stack.extend(args.iter()),
+            Ty::Record(fields, _) => stack.extend(fields.values()),
+            Ty::Unit | Ty::Wildcard => {}
+        }
+    }
+    labels
+}
+
 /// A [`VarLabel`] with its annotation spelling already resolved.
 enum ResolvedLabel {
     Class(TypeClass),

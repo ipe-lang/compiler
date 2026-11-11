@@ -75,7 +75,10 @@ impl Builder<'_> {
                             })?;
                             if !self.is_error_ty(&e_ty) {
                                 // Render both sides for a clear IPE-T0001 diagnostic.
-                                let mut namer = VarNamer::new();
+                                let mut namer = VarNamer::with_labels(
+                                    crate::doc::annotation_labels(&[&e_ty]),
+                                    self.interner,
+                                )?;
                                 let expected = ty_to_doc(
                                     &Ty::Con {
                                         module: Vec::new(),
