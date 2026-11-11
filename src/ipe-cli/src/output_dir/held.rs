@@ -1454,35 +1454,14 @@ impl HeldDir {
 /// prefix are refused, so [`HeldDir::descend`] only ever steps into a named
 /// subdirectory, never up and never out.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the walked rewrites of the user's files descend through it"
-    )
-)]
 pub struct RelativeLeaf {
     dirs: Vec<EntryName>,
     leaf: EntryName,
 }
 
 /// The deepest directory nesting a [`RelativeLeaf`] names: the source walk's own ceiling.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the walked rewrites of the user's files descend through it"
-    )
-)]
 pub const MAX_LEAF_DEPTH: usize = crate::project::MAX_DISCOVERY_DEPTH;
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the walked rewrites of the user's files descend through it"
-    )
-)]
 impl RelativeLeaf {
     /// The file `path` names below `root`.
     ///
@@ -1540,13 +1519,6 @@ impl RelativeLeaf {
 
 /// The directory a [`HeldDir::descend`] reached: the root itself, or a level below it.
 #[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the walked rewrites of the user's files descend through it"
-    )
-)]
 pub enum Level<'root> {
     /// The leaf sits directly in the root.
     Root(&'root HeldDir),
@@ -1572,13 +1544,6 @@ impl HeldDir {
     /// [`OutputRefusal::Symlink`] or [`OutputRefusal::NotADirectory`] for a
     /// level that is a link or not a directory; [`CliError::Io`] for an
     /// absent level or another failure.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the walked rewrites of the user's files descend through it"
-        )
-    )]
     pub fn descend<'root>(&'root self, leaf: &RelativeLeaf) -> Result<Level<'root>, CliError> {
         let mut level = Level::Root(self);
         for name in leaf.dirs() {
