@@ -213,13 +213,7 @@ fn ipe_index(order: ArgOrder, arity: usize, param: usize) -> Option<usize> {
 
 #[test]
 fn every_runtime_bound_is_declared() {
-    let scanned = runtime_signatures();
-    assert!(
-        scanned.is_ok(),
-        "the runtime source must parse: {:?}",
-        scanned.as_ref().err()
-    );
-    let Ok(scanned) = scanned else { return };
+    let scanned = runtime_signatures().expect("the runtime source must parse");
     let mut failures = Vec::new();
     for &kernel in StdlibKernel::ALL {
         let def = kernel.def();
@@ -289,13 +283,7 @@ fn every_runtime_bound_is_declared() {
 
 #[test]
 fn every_declared_bound_has_a_runtime_generic() {
-    let scanned = runtime_signatures();
-    assert!(
-        scanned.is_ok(),
-        "the runtime source must parse: {:?}",
-        scanned.as_ref().err()
-    );
-    let Ok(scanned) = scanned else { return };
+    let scanned = runtime_signatures().expect("the runtime source must parse");
     let mut failures = Vec::new();
     for &kernel in StdlibKernel::ALL {
         let declared = declared_union(kernel);
@@ -334,9 +322,7 @@ fn every_declared_bound_has_a_runtime_generic() {
 /// The scan reads real signatures: `list_repeat` is found and its element generic copies.
 #[test]
 fn the_scan_reads_list_repeat() {
-    let scanned = runtime_signatures();
-    assert!(scanned.is_ok(), "the runtime source must parse");
-    let Ok(scanned) = scanned else { return };
+    let scanned = runtime_signatures().expect("the runtime source must parse");
     let repeat = scanned.get(StdlibKernel::ListRepeat.def().runtime_fn);
     assert!(
         repeat.is_some_and(|signatures| {
@@ -358,9 +344,9 @@ fn the_scan_reads_list_repeat() {
 /// A variable only a record argument carries is reached, not positionally aligned.
 #[test]
 fn a_record_only_variable_is_reached() {
-    let shape = StdlibKernel::TerminalAppScreen.scheme_shape();
-    assert!(shape.is_some(), "`Terminal.app.screen` has a scheme shape");
-    let Some(shape) = shape else { return };
+    let shape = StdlibKernel::TerminalAppScreen
+        .scheme_shape()
+        .expect("`Terminal.app.screen` has a scheme shape");
     assert!(!ipe_kernels::shape_aligns_var(shape, 0));
     assert!(ipe_kernels::shape_reaches_var(shape, 0));
     assert!(!ipe_kernels::shape_reaches_var(shape, 9));

@@ -14110,7 +14110,7 @@ impl StdlibKernel {
     /// a value an argument exposes bare (the optional decoders' default) is
     /// recorded once, by [`Self::sync_captured_args`], not here.
     ///
-    /// The table mirrors the runtime's signatures: `tests/kernel_runtime_bounds.rs`
+    /// The table mirrors the runtime's signatures: `tests/kernel_row/runtime_bounds.rs`
     /// parses every runtime `pub fn` and fails while a bound is missing here
     /// or listed here without a runtime generic carrying it. Every row names a
     /// variable [`Self::scheme_shape`] reaches and appears once; the build
@@ -14185,7 +14185,7 @@ impl StdlibKernel {
             }
             // Every other kernel's runtime function puts no row bound on a
             // scheme variable, or the kernel has no runtime function; the scan
-            // in `tests/kernel_runtime_bounds.rs` pins every kernel, so a new
+            // in `tests/kernel_row/runtime_bounds.rs` pins every kernel, so a new
             // bound cannot fall through this arm unseen.
             _ => &[],
         }
