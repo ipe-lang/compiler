@@ -22437,6 +22437,9 @@ mod shutdown_work_tests {
     /// A session Cmd that trips ends its session typed `Ended`, and its driver.
     #[tokio::test]
     async fn a_tripping_session_cmd_ends_its_session() {
+        async fn trips() -> crate::IpeResult<crate::IpeError, i64> {
+            crate::core::trip(crate::core::RuntimeTrip::RecursionLimit)
+        }
         let (armed, _signals) = owner();
         let store = GatedStore::new();
         let applied = Arc::new(AtomicUsize::new(0));
@@ -22447,11 +22450,7 @@ mod shutdown_work_tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             (Arc::clone(&e.cmds), e.liveness.closer.subscribe())
         };
-        let tripping: crate::core::IpeTask<crate::IpeError, i64> = Box::pin(async {
-            let never: crate::IpeResult<crate::IpeError, i64> =
-                crate::core::trip(crate::core::RuntimeTrip::RecursionLimit);
-            never
-        });
+        let tripping: crate::core::IpeTask<crate::IpeError, i64> = Box::pin(trips());
         dispatch_cmd(
             crate::tea::cmd_perform(tripping, |_| 0_i64),
             &msg_tx,
