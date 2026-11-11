@@ -210,6 +210,8 @@ pub enum CliError {
     ReleaseRuntimeOverride {
         /// The named runtime crate root, made absolute.
         path: PathBuf,
+        /// The remedy the refusing surface offers.
+        remedy: crate::runtime_embed::RuntimeRemedy,
     },
     /// Building the emitted Rust project failed — `cargo` exited non-zero while
     /// compiling the program this compiler emitted. This is neither a
@@ -1555,9 +1557,10 @@ pub fn fmt_runtime_install_error(
             f.write_str(&text::cli_runtime_version_unknown(&path))?;
             write!(f, "\n{}", runtime_remedy_line(*remedy))
         }
-        CliError::ReleaseRuntimeOverride { path } => {
+        CliError::ReleaseRuntimeOverride { path, remedy } => {
             let path = path.display();
-            f.write_str(&text::cli_release_runtime_override(&path))
+            f.write_str(&text::cli_release_runtime_override(&path))?;
+            write!(f, "\n{}", release_runtime_remedy_line(*remedy))
         }
         // The caller only dispatches the runtime-install variants here.
         _ => Ok(()),
@@ -1587,6 +1590,17 @@ fn runtime_tree_reason(reason: crate::runtime_embed::RuntimeTreeReason) -> Strin
         RuntimeTreeReason::TreeTooLarge => {
             text::cli_runtime_tree_too_large(&RUNTIME_TREE_BYTES).into()
         }
+    }
+}
+
+/// The help line a release's runtime-override refusal offers on the surface
+/// `remedy` names: the flag only where the command takes it.
+const fn release_runtime_remedy_line(remedy: crate::runtime_embed::RuntimeRemedy) -> &'static str {
+    match remedy {
+        crate::runtime_embed::RuntimeRemedy::WithRuntimeFlag => {
+            text::cli_release_runtime_remedy_with_flag()
+        }
+        crate::runtime_embed::RuntimeRemedy::EnvOnly => text::cli_release_runtime_remedy_env_only(),
     }
 }
 
@@ -1971,24 +1985,70 @@ mod tests {
             }
             .to_string()
         };
+        let refused = |remedy| {
+            CliError::RuntimeTreeRefused {
+                path: PathBuf::from("/linked"),
+                refusal: crate::runtime_embed::RuntimeTreeRefusal {
+                    path: PathBuf::from("src/x.rs"),
+                    reason: crate::runtime_embed::RuntimeTreeReason::Link,
+                },
+                remedy,
+            }
+            .to_string()
+        };
+        let unknown = |remedy| {
+            CliError::RuntimeVersionUnknown {
+                path: PathBuf::from("/unversioned"),
+                remedy,
+            }
+            .to_string()
+        };
+        let release = |remedy| {
+            CliError::ReleaseRuntimeOverride {
+                path: PathBuf::from("/other"),
+                remedy,
+            }
+            .to_string()
+        };
+        let with = RuntimeRemedy::WithRuntimeFlag;
+        let only = RuntimeRemedy::EnvOnly;
         for text in [
-            invalid(RuntimeRemedy::EnvOnly),
-            mismatch(RuntimeRemedy::EnvOnly),
+            invalid(only),
+            mismatch(only),
+            refused(only),
+            unknown(only),
+            release(only),
         ] {
             assert!(
-                text.contains("IPE_RUNTIME_DIR") && !text.contains("--runtime"),
+                text.contains("= help:")
+                    && text.contains("IPE_RUNTIME_DIR")
+                    && !text.contains("--runtime"),
                 "{text}"
             );
         }
         for text in [
-            invalid(RuntimeRemedy::WithRuntimeFlag),
-            mismatch(RuntimeRemedy::WithRuntimeFlag),
+            invalid(with),
+            mismatch(with),
+            refused(with),
+            unknown(with),
+            release(with),
         ] {
             assert!(
-                text.contains("IPE_RUNTIME_DIR") && text.contains("--runtime <dir>"),
+                text.contains("= help:")
+                    && text.contains("IPE_RUNTIME_DIR")
+                    && text.contains("--runtime"),
                 "{text}"
             );
         }
+        let tree = refused(only);
+        assert!(
+            tree.contains("src/x.rs") && tree.contains("is a link"),
+            "the tree refusal names the entry and its reason: {tree}"
+        );
+        assert!(
+            release(only).contains("unset IPE_RUNTIME_DIR"),
+            "a release refusal is cleared by unsetting the override"
+        );
         let switch = crate::runtime_embed::RuntimeEmit::parse(Some(std::ffi::OsStr::new("yes")))
             .map_or_else(|e| e.to_string(), |_| String::new());
         assert!(

@@ -903,6 +903,10 @@ messages! {
     cli_runtime_version_unknown(path) = "cli-runtime-version-unknown";
     /// A release named a runtime crate other than the embedded one.
     cli_release_runtime_override(path) = "cli-release-runtime-override";
+    /// The release runtime-override remedy on a surface without `--runtime`.
+    cli_release_runtime_remedy_env_only = "cli-release-runtime-remedy-env-only";
+    /// The release runtime-override remedy on a surface taking `--runtime`.
+    cli_release_runtime_remedy_with_flag = "cli-release-runtime-remedy-with-flag";
     /// The runtime refusal remedy on a surface without `--runtime`.
     cli_runtime_remedy_env_only = "cli-runtime-remedy-env-only";
     /// The runtime refusal remedy on a surface taking `--runtime`.

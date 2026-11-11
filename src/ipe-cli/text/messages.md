@@ -605,6 +605,13 @@ the Ipe runtime at {path} declares no version this compiler can read: its Cargo.
 ## cli-release-runtime-override
 
 a release links only the runtime embedded in ipe, but the Ipe runtime at {path} differs from it
+
+## cli-release-runtime-remedy-env-only
+
+  = help: unset IPE_RUNTIME_DIR for a release, or use `ipe dev build` to build against that runtime
+
+## cli-release-runtime-remedy-with-flag
+
   = help: unset IPE_RUNTIME_DIR and drop --runtime for a release, or use `ipe dev build` to build against that runtime
 
 ## cli-runtime-remedy-env-only

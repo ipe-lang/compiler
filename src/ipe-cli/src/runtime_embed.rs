@@ -1050,6 +1050,7 @@ impl RuntimeSource {
                 } else {
                     Err(CliError::ReleaseRuntimeOverride {
                         path: proven.root().to_path_buf(),
+                        remedy,
                     })
                 }
             }
