@@ -13,10 +13,17 @@
 //! The scan fails closed. Every setting is judged as the one key table in
 //! [`vcs_keys`](crate::vcs_keys) says its tool consumes the value, and every
 //! value is split into words but where the table decides it never names code.
-//! A Git setting no row decides is judged under every reading at once, which
-//! admits only a boolean or a number. A Mercurial setting whose key names a
-//! program Mercurial runs ([`vcs_keys::hg_key_tool`]) has that name judged as
-//! a tool name first, whatever its value. A path-shaped word is resolved against
+//! A Git or Mercurial setting no row decides, and every Jujutsu or Darcs
+//! string outside the exempt tables, is judged under every reading at once,
+//! which admits only a boolean or a number. A Mercurial setting whose key
+//! names a program Mercurial runs ([`vcs_keys::hg_key_tool`]) has that name
+//! judged as a tool name first, whatever its value, and as a program fed
+//! operands no contract proves. A setting whose program the tool hands an
+//! operand a grant may decide (a commit id, a host, a working-tree or
+//! temporary file) admits only a program whose operand contract the tool's
+//! own source proves, run as one simple command whose later words are options
+//! or paths; a setting holding another setting's operands has every word
+//! judged as an argument. A path-shaped word is resolved against
 //! the configuration file's directory and the working tree, `~` through the
 //! injected [`Home`]; an option's argument is judged as a word of its own and
 //! the option word whole besides; a program name passes, as the
@@ -50,7 +57,7 @@ use ipe_path_core::{Namespace, Regime, Volume, is_sep};
 
 use crate::covers::path_covers;
 use crate::mounts::CanonicalPath;
-use crate::vcs_keys::{self, Compose, Consume, Include, Load};
+use crate::vcs_keys::{self, Appends, Compose, Consume, Contract, Include, Load};
 use crate::vcs_metadata::VcsKind;
 
 /// The longest path-shaped word or link target, in bytes, the resolver takes.
@@ -344,6 +351,13 @@ pub enum Unprovable {
     /// empty, expands a variable (`$`, `%`), or, on Windows, names an entry of
     /// the working tree, where Windows finds a program not on `PATH`.
     ToolPath,
+    /// The tool hands the program an operand a grant may decide, and no contract proves the program reads it as data.
+    ///
+    /// The operand is a file in the working tree, a commit the jailed program
+    /// made, or a word read relative to the directory the tool runs in; a
+    /// program that reads its operand as a script runs a file the jail
+    /// planted under that name.
+    GrantedOperand,
 }
 
 impl fmt::Display for Unprovable {
@@ -418,6 +432,11 @@ impl fmt::Display for Unprovable {
             Self::ToolPath => f.write_str(
                 "it names a tool by a path: the tool resolves the name inside its own directory, \
                  so a separator, `..`, `~`, or `:` may reach a file the jail writes",
+            ),
+            Self::GrantedOperand => f.write_str(
+                "the tool hands this program an operand the jailed program can decide (a file \
+                 in the working tree, a commit it made, a word read from the directory the tool \
+                 runs in), and nothing proves the program reads it as data",
             ),
         }
     }
@@ -909,14 +928,17 @@ struct FileCtx {
 enum Role {
     /// Never names code: not judged.
     Exempt,
-    /// Every word is judged, after the runner prefix the tool consumes.
-    Words(Runner),
+    /// Every word is judged, after the runner prefix the tool consumes, and the program against what the tool appends.
+    Words(Runner, Appends),
+    /// Every word is judged as an argument: the operands of another setting's program.
+    Args,
     /// The words of this text, and this text as one command path whatever its shape.
     ///
     /// The text is the part of the value the tool runs or loads: the whole
     /// value for Git, a Mercurial extension's path without the `!` that
-    /// disables it, a `python:` hook's file without its function.
-    Forced(String),
+    /// disables it, a `python:` hook's file without its function. A program
+    /// run so is judged against what the tool appends.
+    Forced(String, Appends),
     /// The whole value as one path to a file that is then read, as this include reads it.
     Include(Reading),
     /// Every word, and the whole value as one directory that is then listed for links.
@@ -1036,6 +1058,75 @@ impl Runner {
             Self::Exec => Line::Exec(Cow::Borrowed(value)),
             Self::GitRemote => Line::Exec(Cow::Owned(format!("git-remote-{value}"))),
         }
+    }
+
+    /// Whether the tool runs `value` as a program: a [`Runner::Bang`] value without its `!` is data.
+    fn runs(self, value: &str) -> bool {
+        match self {
+            Self::Bang => value.starts_with('!'),
+            Self::Python => !value.starts_with("python:"),
+            Self::None | Self::GitAlias | Self::GitHelper | Self::Exec | Self::GitRemote => true,
+        }
+    }
+}
+
+/// The shell operators that run a further command or redirect one.
+const COMMAND_OPERATORS: [char; 8] = [';', '&', '|', '(', ')', '<', '>', '\n'];
+
+/// Whether the program `line` runs keeps the operand contract `appends` demands.
+///
+/// What the tool appends only matters for a program fed an operand a grant
+/// may decide ([`Appends::Granted`], or [`Appends::Substitutes`] once the
+/// value holds a `%`). Such a line is admitted only when it has no program
+/// word at all, or when it is one simple command (no shell operator
+/// anywhere) whose program's last path component the contract names and
+/// whose every later word is an option or a path, judged already as one.
+fn operands_proven(line: &Line<'_>, appends: Appends, regime: Regime) -> Result<(), Unprovable> {
+    let (text, words) = match line {
+        Line::Shell(text) => (text, shell_words(text, regime)),
+        // The prefix lands on the first word: an option there fails every contract.
+        Line::Split {
+            text,
+            command_prefix,
+        } => {
+            let mut words = shell_words(text, regime);
+            if let Some(first) = words.first_mut() {
+                first.insert_str(0, command_prefix);
+            }
+            (text, words)
+        }
+        Line::Exec(text) => {
+            let program = text.trim_matches(is_c_space);
+            let words = if program.is_empty() {
+                Vec::new()
+            } else {
+                vec![program.to_owned()]
+            };
+            (text, words)
+        }
+    };
+    let contract = match appends {
+        Appends::Nothing | Appends::Ungranted => return Ok(()),
+        Appends::Granted(contract) => contract,
+        Appends::Substitutes(contract) if text.contains('%') => contract,
+        Appends::Substitutes(_) => return Ok(()),
+    };
+    let Some((program, rest)) = words.split_first() else {
+        return Ok(());
+    };
+    let base = program
+        .rsplit(|c| is_separator(c, regime))
+        .next()
+        .unwrap_or(program);
+    let proven = !text.contains(COMMAND_OPERATORS)
+        && contract.admits(base)
+        && rest
+            .iter()
+            .all(|word| option_argument(word).is_some() || is_path_shaped(word, regime));
+    if proven {
+        Ok(())
+    } else {
+        Err(Unprovable::GrantedOperand)
     }
 }
 
@@ -2214,6 +2305,7 @@ impl Scan<'_> {
             if holds_nul(entry) {
                 return Err(refuse(unproven(Unprovable::Nul)));
             }
+            let mut key_tool = None;
             let route = match ctx.syntax {
                 Syntax::Git => {
                     self.judge_git_subsection(ctx, &entry.setting)
@@ -2227,10 +2319,12 @@ impl Scan<'_> {
                         && let Some(name) = vcs_keys::hg_key_tool(section, key)
                     {
                         self.judge(ctx, &Role::KeyTool, name).map_err(&refuse)?;
+                        key_tool = Some(name);
                     }
                     hg_route(&entry.setting, &entry.value)
                 }
-                Syntax::Toml | Syntax::Darcs => Route::Judge(Role::Words(Runner::None)),
+                // No row decides how Jujutsu or Darcs consumes a setting yet.
+                Syntax::Toml | Syntax::Darcs => Route::Judge(Role::Unknown),
                 Syntax::GitRemote => Route::Judge(Role::Url { scp: true }),
             };
             if let Some(rewrite) = rewrite_of(ctx, &entry.setting, &entry.value) {
@@ -2257,8 +2351,9 @@ impl Scan<'_> {
                 }
                 Route::Judge(
                     Role::Exempt
-                    | Role::Words(_)
-                    | Role::Forced(_)
+                    | Role::Words(..)
+                    | Role::Args
+                    | Role::Forced(..)
                     | Role::Include(_)
                     | Role::HooksPath
                     | Role::ToolName
@@ -2290,6 +2385,16 @@ impl Scan<'_> {
                         });
                     }
                 }
+            }
+            // The program a key names runs fed what the tool appends to it,
+            // judged once the value's own words are.
+            if let Some(name) = key_tool {
+                operands_proven(
+                    &Line::Exec(Cow::Borrowed(name)),
+                    vcs_keys::HG_TOOL_APPENDS,
+                    ctx.regime,
+                )
+                .map_err(|why| refuse(unproven(why)))?;
             }
         }
         Ok(())
@@ -2393,10 +2498,10 @@ impl Scan<'_> {
         let network_urls = std::mem::take(&mut self.network_urls);
         if self.helper_remote {
             for item in network_urls {
-                self.judge(&item.ctx, &Role::Forced(item.value.clone()), &item.value)
-                    .map_err(|stop| {
-                        stop.into_refusal(kind, &item.ctx.source, || item.setting.public())
-                    })?;
+                let path = Role::Forced(item.value.clone(), Appends::Nothing);
+                self.judge(&item.ctx, &path, &item.value).map_err(|stop| {
+                    stop.into_refusal(kind, &item.ctx.source, || item.setting.public())
+                })?;
             }
         }
         for item in std::mem::take(&mut self.deferred) {
@@ -2527,9 +2632,9 @@ impl Scan<'_> {
     ///
     /// The walk keeps an explicit stack, so the depth the parser admits never
     /// becomes recursion here; each key is kept once in an arena of
-    /// parent-linked labels, and a setting's text is built only on refusal. A
-    /// string is judged as a command line, an array's items as the words of
-    /// one: the first the program, the rest its arguments.
+    /// parent-linked labels, and a setting's text is built only on refusal.
+    /// No row decides yet how Jujutsu consumes a setting, so every string, an
+    /// array's items included, is judged as [`Role::Unknown`].
     fn judge_toml(&mut self, ctx: &FileCtx, text: &str) -> Result<(), ConfigRefusal> {
         let table: toml::Table = toml::from_str(text).map_err(|e| {
             let line = e.span().map_or(1, |span| line_of(text, span.start));
@@ -2537,9 +2642,9 @@ impl Scan<'_> {
         })?;
         let kind = self.kind;
         let mut labels: Vec<(Option<usize>, &str)> = Vec::new();
-        let mut stack: Vec<(TomlNode<'_>, Option<usize>, bool, TomlPos)> =
-            vec![(TomlNode::Table(&table), None, true, TomlPos::Text)];
-        while let Some((node, label, top, pos)) = stack.pop() {
+        let mut stack: Vec<(TomlNode<'_>, Option<usize>, bool)> =
+            vec![(TomlNode::Table(&table), None, true)];
+        while let Some((node, label, top)) = stack.pop() {
             match node {
                 TomlNode::Table(table) => {
                     for (key, value) in table {
@@ -2549,31 +2654,20 @@ impl Scan<'_> {
                         let index = labels.len();
                         labels.push((label, key.as_str()));
                         let scope = top && key == "--scope";
-                        stack.push((TomlNode::Value(value), Some(index), scope, TomlPos::Text));
+                        stack.push((TomlNode::Value(value), Some(index), scope));
                     }
                 }
                 TomlNode::Value(value) => match value {
                     toml::Value::String(text) => {
-                        let judged = match pos {
-                            TomlPos::Text => self.judge(ctx, &Role::Words(Runner::None), text),
-                            TomlPos::Word(position) => self.judge_word(ctx, text, position),
-                        };
-                        judged.map_err(|stop| {
+                        self.judge(ctx, &Role::Unknown, text).map_err(|stop| {
                             stop.into_refusal(kind, &ctx.source, || toml_setting(&labels, label))
                         })?;
                     }
                     toml::Value::Array(items) => {
-                        stack.extend(items.iter().enumerate().map(|(index, item)| {
-                            let position = if index == 0 {
-                                Position::Program
-                            } else {
-                                Position::Argument
-                            };
-                            (TomlNode::Value(item), label, top, TomlPos::Word(position))
-                        }));
+                        stack.extend(items.iter().map(|item| (TomlNode::Value(item), label, top)));
                     }
                     toml::Value::Table(inner) => {
-                        stack.push((TomlNode::Table(inner), label, top, TomlPos::Text));
+                        stack.push((TomlNode::Table(inner), label, top));
                     }
                     toml::Value::Integer(_)
                     | toml::Value::Float(_)
@@ -2593,10 +2687,20 @@ impl Scan<'_> {
         }
         match role {
             Role::Exempt => Ok(()),
-            Role::Words(runner) => self.judge_words(ctx, value, *runner),
-            Role::Forced(path) => {
+            Role::Words(runner, appends) => {
+                self.judge_words(ctx, value, *runner)?;
+                if runner.runs(value) {
+                    let line = runner.consume(value, ctx.regime);
+                    operands_proven(&line, *appends, ctx.regime).map_err(unproven)?;
+                }
+                Ok(())
+            }
+            Role::Args => self.judge_args(ctx, value),
+            Role::Forced(path, appends) => {
                 self.judge_words(ctx, path, Runner::None)?;
-                self.judge_forced(ctx, path, Reach::Command).map(drop)
+                self.judge_forced(ctx, path, Reach::Command)?;
+                operands_proven(&Line::Exec(Cow::Borrowed(path)), *appends, ctx.regime)
+                    .map_err(unproven)
             }
             Role::Include(include) => {
                 // Queued as named, not as walked: the tool resolves the
@@ -2738,12 +2842,18 @@ impl Scan<'_> {
         self.judge_queue(ctx, &mut words)
     }
 
-    /// Judge `text` as one word of a command, standing at `position`.
-    fn judge_word(&mut self, ctx: &FileCtx, text: &str, position: Position) -> Result<(), Stop> {
-        value_checks(text).map_err(unproven)?;
+    /// Judge every word of `value` as an argument of another setting's program.
+    ///
+    /// Mercurial pastes the words into a shell command line; Git LFS splits
+    /// them itself and expands no `~`, so a leading `~` is judged both ways.
+    fn judge_args(&mut self, ctx: &FileCtx, value: &str) -> Result<(), Stop> {
+        let tilde = match ctx.syntax {
+            Syntax::Hg => Tilde::Shell,
+            Syntax::Git | Syntax::GitRemote | Syntax::Toml | Syntax::Darcs => Tilde::Verbatim,
+        };
         let mut words = Words::default();
         words
-            .push_forms(text.to_owned(), position)
+            .push_split(value, Position::Argument, tilde, ctx.regime)
             .map_err(unproven)?;
         self.judge_queue(ctx, &mut words)
     }
@@ -3178,15 +3288,6 @@ const fn piece_after(separator: char, word: Position) -> Position {
     }
 }
 
-/// Where a TOML node stands: free text, or one word of an argument array.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TomlPos {
-    /// A string judged as a whole command line.
-    Text,
-    /// An array item judged as one word.
-    Word(Position),
-}
-
 /// A node of a parsed TOML document.
 #[derive(Clone, Copy)]
 enum TomlNode<'t> {
@@ -3541,8 +3642,11 @@ fn is_scalar(syntax: Syntax, value: &str) -> bool {
     match syntax {
         Syntax::Git => is_git_scalar(value),
         Syntax::Hg => is_hg_scalar(value),
-        // Every setting of these files has a decided route, so none is unknown.
-        Syntax::GitRemote | Syntax::Toml | Syntax::Darcs => false,
+        // No row decides yet how Jujutsu or Darcs consumes a setting: a value
+        // Mercurial reads as a boolean or a number names no file there either.
+        Syntax::Toml | Syntax::Darcs => is_hg_scalar(value),
+        // Every line of a remote file has a decided route, so none is unknown.
+        Syntax::GitRemote => false,
     }
 }
 
@@ -3573,18 +3677,49 @@ fn git_route(setting: &Setting, value: &str) -> Route {
         })
 }
 
+/// Whether `value` is an absolute path on any host.
+///
+/// Read as Windows reads it, which admits every Unix absolute path too, so a
+/// value one host would run is never taken for a host name.
+fn names_absolute_path(value: &str) -> bool {
+    is_git_absolute(value, Regime::Windows)
+}
+
 /// What becomes of `value`, which its tool consumes as `consume`.
 fn route_of(consume: Consume, value: &str) -> Route {
-    let words = |runner: Runner| Route::Judge(Role::Words(runner));
-    let forced = |path: &str| Route::Judge(Role::Forced(path.to_owned()));
+    let words = |runner: Runner, appends: Appends| Route::Judge(Role::Words(runner, appends));
+    let forced =
+        |path: &str, appends: Appends| Route::Judge(Role::Forced(path.to_owned(), appends));
     match consume {
         Consume::Exempt => Route::Judge(Role::Exempt),
-        Consume::Inert | Consume::Shell => words(Runner::None),
-        Consume::Bang => words(Runner::Bang),
-        Consume::Exec => words(Runner::Exec),
-        Consume::Composed(Compose::Alias) => words(Runner::GitAlias),
-        Consume::Composed(Compose::CredentialHelper) => words(Runner::GitHelper),
-        Consume::Composed(Compose::RemoteHelper) => words(Runner::GitRemote),
+        Consume::Inert => words(Runner::None, Appends::Nothing),
+        Consume::Shell(appends) => words(Runner::None, appends),
+        Consume::Bang(appends) => words(Runner::Bang, appends),
+        Consume::Exec(appends) => words(Runner::Exec, appends),
+        Consume::ExecExpanded(appends) => forced(value, appends),
+        Consume::ExecAbsolute(appends) => {
+            if names_absolute_path(value) {
+                words(Runner::Exec, appends)
+            } else {
+                words(Runner::Exec, Appends::Nothing)
+            }
+        }
+        Consume::Args => Route::Judge(Role::Args),
+        Consume::MergeTool => {
+            if vcs_keys::is_hg_internal_tool(value) {
+                words(Runner::None, Appends::Nothing)
+            } else {
+                forced(value, vcs_keys::HG_TOOL_APPENDS)
+            }
+        }
+        Consume::Composed(compose) => {
+            let runner = match compose {
+                Compose::Alias => Runner::GitAlias,
+                Compose::CredentialHelper => Runner::GitHelper,
+                Compose::RemoteHelper => Runner::GitRemote,
+            };
+            words(runner, compose.appends())
+        }
         Consume::ToolName => Route::Judge(Role::ToolName),
         Consume::Load(Load::Include(Include::Always)) => {
             Route::Judge(Role::Include(Reading::Always))
@@ -3593,16 +3728,19 @@ fn route_of(consume: Consume, value: &str) -> Route {
             Route::Judge(Role::Include(Reading::Conditional))
         }
         Consume::Load(Load::HooksPath) => Route::Judge(Role::HooksPath),
-        Consume::Load(Load::Forced) => forced(value),
+        Consume::Load(Load::Forced) => forced(value, Appends::Nothing),
+        // The hook gets the protocol's version and token (`fsmonitor.c`).
         Consume::Load(Load::ForcedUnlessBool) => {
             if is_git_bool(value) {
-                words(Runner::None)
+                words(Runner::None, Appends::Nothing)
             } else {
-                forced(value)
+                forced(value, Appends::Granted(Contract::None))
             }
         }
         // A leading `!` disables the extension; the path after it is still judged.
-        Consume::Load(Load::ForcedUnbanged) => forced(value.strip_prefix('!').unwrap_or(value)),
+        Consume::Load(Load::ForcedUnbanged) => {
+            forced(value.strip_prefix('!').unwrap_or(value), Appends::Nothing)
+        }
         Consume::Url { scp } => Route::Judge(Role::Url { scp }),
         Consume::UrlList => Route::Judge(Role::UrlList),
         Consume::RemoteName => Route::RemoteName,
@@ -3610,7 +3748,10 @@ fn route_of(consume: Consume, value: &str) -> Route {
         Consume::PythonHook => value
             .strip_prefix("python:")
             .and_then(|rest| rest.rsplit_once(':'))
-            .map_or_else(|| words(Runner::Python), |(path, _)| forced(path)),
+            .map_or_else(
+                || words(Runner::Python, Appends::Nothing),
+                |(path, _)| forced(path, Appends::Nothing),
+            ),
     }
 }
 
@@ -4407,9 +4548,15 @@ mod tests {
             in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
             "{result:?}"
         );
+        // An absolute `smtpServer` runs fed the recipients; any other value is a host.
+        git_config(
+            &f,
+            "[sendemail \"work\"]\n\tsmtpServer = /usr/sbin/sendmail\n",
+        );
+        assert_eq!(unprovable(&scan_git(&f)), Some(Unprovable::GrantedOperand));
         for text in [
             "[credential \"https://h\"]\n\tusername = x\n",
-            "[sendemail \"work\"]\n\tsmtpServer = /usr/sbin/sendmail\n",
+            "[sendemail \"work\"]\n\tsmtpServer = smtp.example.com\n",
         ] {
             git_config(&f, text);
             assert_eq!(scan_git(&f), Ok(()), "{text:?}");
@@ -4482,7 +4629,7 @@ mod tests {
             &f,
             "[hook \"x\"]\n\tcommand = /usr/bin/true\n\tevent = pre-commit\n",
         );
-        assert_eq!(scan_git(&f), Ok(()));
+        assert_eq!(unprovable(&scan_git(&f)), Some(Unprovable::GrantedOperand));
         let tree = f.tree.display();
         git_config(&f, &format!("[hook \"x\"]\n\tcommand = {tree}/evil\n"));
         let result = scan_git(&f);
@@ -4992,11 +5139,16 @@ mod tests {
                 "{text:?}: {result:?}"
             );
         }
+        // A bare name is no path, but the program it names is fed the files Mercurial merges.
         for text in [
             "[merge-tools]\nkdiff3.priority = 1\n",
             "[extdiff]\ncmd.vd =\n",
         ] {
-            assert_eq!(scan_hg(&f, text), Ok(()), "{text:?}");
+            assert_eq!(
+                unprovable(&scan_hg(&f, text)),
+                Some(Unprovable::GrantedOperand),
+                "{text:?}"
+            );
         }
     }
 
@@ -5047,11 +5199,15 @@ mod tests {
     }
 
     #[test]
-    fn hg_key_tool_in_worktree_admitted_under_unix() {
+    fn hg_key_tool_in_worktree_no_path_under_unix() {
         let f = fixture("hgkeyunix");
         write(&f.tree.join("evil.exe"), "");
         let result = scan_hg_under(&f, "[merge-tools]\nevil.priority = 1\n", Regime::Unix);
-        assert_eq!(result, Ok(()), "{result:?}");
+        assert_eq!(
+            unprovable(&result),
+            Some(Unprovable::GrantedOperand),
+            "{result:?}"
+        );
     }
 
     /// [`scan_git`] with every value read under `regime`.
@@ -5426,10 +5582,11 @@ mod tests {
                 "{text:?}: {result:?}"
             );
         }
-        // Mercurial expands `~` in a tool's executable; a program run without a shell does not.
+        // Mercurial expands `~` in a tool's executable, so it names no file in
+        // the tree; the program is still fed the files Mercurial merges.
         assert_eq!(
-            scan_hg(&f, "[merge-tools]\nx.executable = ~/evil\n"),
-            Ok(())
+            unprovable(&scan_hg(&f, "[merge-tools]\nx.executable = ~/evil\n")),
+            Some(Unprovable::GrantedOperand)
         );
         let result = scan_hg(&f, "[profiling]\npy-spy.exe = ~/evil\n");
         assert!(
@@ -5908,7 +6065,7 @@ mod tests {
             &format!("[fix.tools.fmt]\ncommand = [\"{tree}/fmt\", \"--stdin\"]\n"),
         );
         let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
-        assert_eq!(in_grant(&result), Some(f.tree.join("fmt").as_path()));
+        assert_eq!(unprovable(&result), Some(Unprovable::UnknownSetting));
         assert!(
             matches!(
                 &result,
@@ -5928,7 +6085,7 @@ mod tests {
         );
         write(&repo.join("config.toml"), "");
         let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
-        assert_eq!(in_grant(&result), Some(f.tree.join("pager").as_path()));
+        assert_eq!(unprovable(&result), Some(Unprovable::UnknownSetting));
     }
 
     #[test]
@@ -5943,16 +6100,14 @@ mod tests {
             &dot_darcs.join("prefs/prefs"),
             &format!("test {out}/check.sh\n"),
         );
-        assert_eq!(scan_with(&f, &roots, ConfigLimits::DEFAULT), Ok(()));
+        let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
+        assert_eq!(unprovable(&result), Some(Unprovable::UnknownSetting));
         write(&dot_darcs.join("prefs/prefs"), "test sh run\n");
         let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
-        assert_eq!(unprovable(&result), Some(Unprovable::BareWord));
+        assert_eq!(unprovable(&result), Some(Unprovable::UnknownSetting));
         write(&dot_darcs.join("prefs/prefs"), "\ntest ./run-tests.sh\n");
         let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
-        assert_eq!(
-            in_grant(&result),
-            Some(f.tree.join("run-tests.sh").as_path())
-        );
+        assert_eq!(unprovable(&result), Some(Unprovable::UnknownSetting));
         assert!(
             matches!(
                 &result,
@@ -5969,7 +6124,9 @@ mod tests {
             "apply --posthook=./hook\n",
         );
         let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
-        assert_eq!(in_grant(&result), Some(f.tree.join("hook").as_path()));
+        assert_eq!(unprovable(&result), Some(Unprovable::UnknownSetting));
+        write(&dot_darcs.join("prefs/defaults"), "");
+        assert_eq!(scan_with(&f, &roots, ConfigLimits::DEFAULT), Ok(()));
     }
 
     #[cfg(unix)]
@@ -6209,9 +6366,6 @@ mod tests {
             format!("[submodule \"s\"]\n\turl = hg::{tree}/r\n"),
             format!("[branch \"main\"]\n\tremote = hg::{tree}/r\n"),
             format!("[url \"hg::{tree}/r\"]\n\tinsteadOf = x\n"),
-            "[remote \"o\"]\n\tvcs = hg\n\turl = https://example.com/x\n".to_owned(),
-            "[remote \"o\"]\n\turl = https://example.com/x\n[remote \"p\"]\n\tvcs = hg\n"
-                .to_owned(),
         ] {
             git_config(&f, &text);
             let result = scan_git(&f);
@@ -6220,16 +6374,23 @@ mod tests {
                 "{text:?}: {result:?}"
             );
         }
+        // A remote's `vcs` names a helper fed the remote's name and URL, whatever the URL is.
         write(
             &f.tree.join(".git/remotes/o"),
             "URL: https://example.com/x\n",
         );
-        git_config(&f, "[remote \"o\"]\n\tvcs = hg\n");
-        let result = scan_git(&f);
-        assert!(
-            in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
-            "{result:?}"
-        );
+        for text in [
+            "[remote \"o\"]\n\tvcs = hg\n\turl = https://example.com/x\n",
+            "[remote \"o\"]\n\turl = https://example.com/x\n[remote \"p\"]\n\tvcs = hg\n",
+            "[remote \"o\"]\n\tvcs = hg\n",
+        ] {
+            git_config(&f, text);
+            assert_eq!(
+                unprovable(&scan_git(&f)),
+                Some(Unprovable::GrantedOperand),
+                "{text:?}"
+            );
+        }
         std::fs::remove_file(f.tree.join(".git/remotes/o")).expect("remove remote file");
 
         git_config(
@@ -6274,19 +6435,22 @@ mod tests {
             dot_jj: &dot_jj,
             repo: &repo,
         };
+        // No Jujutsu row decides a pager yet, so every spelling is refused alike.
         for text in [
             "[ui]\npager = [\"~/bin/less\"]\n",
             "[ui]\npager = [\"less\", \"~/x\"]\n",
             "[ui]\npager = \"~/bin/less\"\n",
+            "[ui]\npager = \"less -R\"\n",
         ] {
             write(&repo.join("config.toml"), text);
             let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
-            assert!(
-                in_grant(&result).is_some_and(|path| path.starts_with(f.tree.join("~"))),
-                "{text:?}: {result:?}"
+            assert_eq!(
+                unprovable(&result),
+                Some(Unprovable::UnknownSetting),
+                "{text:?}"
             );
         }
-        write(&repo.join("config.toml"), "[ui]\npager = \"less -R\"\n");
+        write(&repo.join("config.toml"), "[ui]\npaginate = true\n");
         assert_eq!(scan_with(&f, &roots, ConfigLimits::DEFAULT), Ok(()));
     }
 
@@ -6509,8 +6673,8 @@ mod tests {
         let out = f.out.display();
         for text in [
             format!("[alias]\n\tx = !{out}/a {out}/b\n"),
-            format!("[credential]\n\thelper = !{out}/helper\n"),
-            format!("[credential \"https://example.com\"]\n\thelper = !{out}/helper\n"),
+            format!("[credential]\n\thelper = !{out}/git-credential-x\n"),
+            format!("[credential \"https://example.com\"]\n\thelper = !{out}/git-credential-x\n"),
         ] {
             git_config(&f, &text);
             assert_eq!(scan_git(&f), Ok(()), "{text:?}");
@@ -6560,8 +6724,8 @@ mod tests {
             format!("[alias \"x\"]\n\tcommand = !{out}/x\n"),
             "[alias]\n\tx = !~/x\n".to_owned(),
             "[credential]\n\thelper = store\n".to_owned(),
-            format!("[credential]\n\thelper = {out}/helper\n"),
-            "[credential]\n\thelper = !~/x\n".to_owned(),
+            format!("[credential]\n\thelper = {out}/git-credential-x\n"),
+            "[credential]\n\thelper = !~/git-credential-x\n".to_owned(),
             "[core]\n\tpager = ~/x\n".to_owned(),
         ] {
             git_config(&f, &text);
@@ -6593,12 +6757,24 @@ mod tests {
                 "{text:?}: {result:?}"
             );
         }
+        // A program outside the grants still refuses when nothing proves the operands it is fed.
         for text in [
             "[gpg]\n\tprogram = gpg2\n".to_owned(),
-            format!("[gpg]\n\tprogram = {out}/gpg\n"),
             format!("[core]\n\taskPass = {out}/askpass\n"),
             "[remote \"o\"]\n\tvcs = hg\n".to_owned(),
             "[core]\n\tsshCommand = ~/x\n".to_owned(),
+        ] {
+            git_config(&f, &text);
+            assert_eq!(
+                unprovable(&scan_git(&f)),
+                Some(Unprovable::GrantedOperand),
+                "{text:?}"
+            );
+        }
+        for text in [
+            "[gpg]\n\tprogram = gpg\n".to_owned(),
+            format!("[gpg]\n\tprogram = {out}/gpg\n"),
+            "[core]\n\tsshCommand = ~/bin/ssh\n".to_owned(),
         ] {
             git_config(&f, &text);
             assert_eq!(scan_git(&f), Ok(()), "{text:?}");
@@ -6609,12 +6785,13 @@ mod tests {
     fn git_tool_path_runs_without_a_shell_refused() {
         let f = fixture("gittoolpath");
         let out = f.out.display();
-        for key in [
-            "[difftool \"t\"]\n\tpath",
-            "[mergetool \"t\"]\n\tpath",
-            "[browser \"t\"]\n\tpath",
-            "[man \"t\"]\n\tpath",
-            "[sendemail]\n\tsmtpServer",
+        // Each key with whether its program, absolute and bare, runs fed only what it is proven to read.
+        for (key, absolute, bare) in [
+            ("[difftool \"t\"]\n\tpath", false, false),
+            ("[mergetool \"t\"]\n\tpath", false, false),
+            ("[browser \"t\"]\n\tpath", true, true),
+            ("[man \"t\"]\n\tpath", false, false),
+            ("[sendemail]\n\tsmtpServer", false, true),
         ] {
             for value in ["~/evil".to_owned(), format!("\"x {out}/y\"")] {
                 let text = format!("{key} = {value}\n");
@@ -6625,10 +6802,20 @@ mod tests {
                     "{text:?}: {result:?}"
                 );
             }
-            for value in [format!("{out}/tool"), "tool".to_owned()] {
+            for (value, admitted) in [(format!("{out}/tool"), absolute), ("tool".to_owned(), bare)]
+            {
                 let text = format!("{key} = {value}\n");
                 git_config(&f, &text);
-                assert_eq!(scan_git(&f), Ok(()), "{text:?}");
+                let result = scan_git(&f);
+                if admitted {
+                    assert_eq!(result, Ok(()), "{text:?}");
+                } else {
+                    assert_eq!(
+                        unprovable(&result),
+                        Some(Unprovable::GrantedOperand),
+                        "{text:?}"
+                    );
+                }
             }
         }
     }
@@ -6649,11 +6836,273 @@ mod tests {
         for text in [
             format!("[submodule \"s\"]\n\tupdate = !{out}/x\n"),
             "[submodule \"s\"]\n\tupdate = !~/x\n".to_owned(),
-            "[submodule \"s\"]\n\tupdate = rebase\n".to_owned(),
         ] {
             git_config(&f, &text);
-            assert_eq!(scan_git(&f), Ok(()), "{text:?}");
+            assert_eq!(
+                unprovable(&scan_git(&f)),
+                Some(Unprovable::GrantedOperand),
+                "{text:?}"
+            );
         }
+        for mode in ["checkout", "rebase", "merge", "none"] {
+            git_config(&f, &format!("[submodule \"s\"]\n\tupdate = {mode}\n"));
+            assert_eq!(scan_git(&f), Ok(()), "{mode:?}");
+        }
+    }
+
+    /// Assert every one of `texts` is refused as feeding its program an unproven operand.
+    fn assert_granted_operand(
+        result_of: impl Fn(&str) -> Result<(), ConfigRefusal>,
+        texts: &[String],
+    ) {
+        for text in texts {
+            let result = result_of(text);
+            assert_eq!(
+                unprovable(&result),
+                Some(Unprovable::GrantedOperand),
+                "{text:?}: {result:?}"
+            );
+        }
+    }
+
+    /// Assert every one of `texts` is admitted.
+    fn assert_admitted(result_of: impl Fn(&str) -> Result<(), ConfigRefusal>, texts: &[String]) {
+        for text in texts {
+            assert_eq!(result_of(text), Ok(()), "{text:?}");
+        }
+    }
+
+    fn git_text(f: &Fixture) -> impl Fn(&str) -> Result<(), ConfigRefusal> + '_ {
+        move |text| {
+            git_config(f, text);
+            scan_git(f)
+        }
+    }
+
+    fn hg_text(f: &Fixture) -> impl Fn(&str) -> Result<(), ConfigRefusal> + '_ {
+        move |text| scan_hg(f, text)
+    }
+
+    fn scan_jj(f: &Fixture, text: &str) -> Result<(), ConfigRefusal> {
+        let dot_jj = f.tree.join(".jj");
+        let repo = dot_jj.join("repo");
+        write(&repo.join("config.toml"), text);
+        let roots = ConfigRoots::Jujutsu {
+            dot_jj: &dot_jj,
+            repo: &repo,
+        };
+        scan_with(f, &roots, ConfigLimits::DEFAULT)
+    }
+
+    fn scan_darcs(f: &Fixture, prefs: &str) -> Result<(), ConfigRefusal> {
+        let dot_darcs = f.tree.join("_darcs");
+        write(&dot_darcs.join("prefs/prefs"), prefs);
+        let roots = ConfigRoots::Darcs {
+            dot_darcs: &dot_darcs,
+        };
+        scan_with(f, &roots, ConfigLimits::DEFAULT)
+    }
+
+    fn owned(texts: &[&str]) -> Vec<String> {
+        texts.iter().map(|text| (*text).to_owned()).collect()
+    }
+
+    #[test]
+    fn submodule_update_bang_bare_refused() {
+        let f = fixture("subupdatebare");
+        assert_granted_operand(
+            git_text(&f),
+            &owned(&["[submodule \"s\"]\n\tupdate = !sh\n"]),
+        );
+        assert_admitted(
+            git_text(&f),
+            &owned(&[
+                "[submodule \"s\"]\n\tupdate = checkout\n",
+                "[submodule \"s\"]\n\tupdate = rebase\n",
+                "[submodule \"s\"]\n\tupdate = none\n",
+            ]),
+        );
+    }
+
+    #[test]
+    fn submodule_update_bang_absolute_refused() {
+        let f = fixture("subupdateabs");
+        assert_granted_operand(
+            git_text(&f),
+            &owned(&["[submodule \"s\"]\n\tupdate = !/bin/sh\n"]),
+        );
+        assert_admitted(
+            git_text(&f),
+            &owned(&["[submodule \"s\"]\n\tupdate = rebase\n"]),
+        );
+    }
+
+    #[test]
+    fn credential_helper_shell_refused() {
+        let f = fixture("helpershell");
+        let out = f.out.display();
+        assert_granted_operand(
+            git_text(&f),
+            &owned(&[
+                "[credential]\n\thelper = !sh\n",
+                "[credential]\n\thelper = /bin/sh\n",
+            ]),
+        );
+        assert_admitted(
+            git_text(&f),
+            &[
+                "[credential]\n\thelper = store\n".to_owned(),
+                format!("[credential]\n\thelper = {out}/git-credential-x\n"),
+                "[credential]\n\thelper =\n".to_owned(),
+            ],
+        );
+    }
+
+    #[test]
+    fn ssh_command_non_ssh_refused() {
+        let f = fixture("sshcontract");
+        assert_granted_operand(
+            git_text(&f),
+            &[
+                "[core]\n\tsshCommand = sh\n".to_owned(),
+                format!("[core]\n\tsshCommand = {}\n", git_quoted("ssh; sh")),
+            ],
+        );
+        assert_admitted(
+            git_text(&f),
+            &owned(&[
+                "[core]\n\tsshCommand = ssh -i ~/k\n",
+                "[core]\n\tsshCommand = PLINK.EXE\n",
+            ]),
+        );
+    }
+
+    #[test]
+    fn textconv_and_external_refused() {
+        let f = fixture("textconv");
+        assert_granted_operand(
+            git_text(&f),
+            &owned(&[
+                "[diff \"x\"]\n\ttextconv = /bin/sh\n",
+                "[diff]\n\texternal = cat\n",
+            ]),
+        );
+        // The same program under a row fed nothing.
+        assert_admitted(git_text(&f), &owned(&["[core]\n\tpager = cat\n"]));
+    }
+
+    #[test]
+    fn placeholder_value_refused() {
+        let f = fixture("placeholder");
+        let out = f.out.display();
+        assert_granted_operand(
+            git_text(&f),
+            &[
+                format!("[filter \"x\"]\n\tclean = sh {out}/%f\n"),
+                format!("[merge \"x\"]\n\tdriver = sh {out}/%A\n"),
+            ],
+        );
+        assert_admitted(
+            git_text(&f),
+            &owned(&[
+                "[filter \"x\"]\n\tclean = cat\n",
+                "[merge \"x\"]\n\tdriver = true\n",
+            ]),
+        );
+    }
+
+    #[test]
+    fn operand_list_row_judged_as_arguments() {
+        let f = fixture("operandlist");
+        let out = f.out.display();
+        for result in [
+            scan_hg(&f, "[merge-tools]\nx.args = evil.sh\n"),
+            scan_hg(&f, "[gpg]\nkey = evil.sh\n"),
+            git_text(&f)("[lfs \"customtransfer.x\"]\n\targs = evil.sh\n"),
+        ] {
+            assert_eq!(
+                unprovable(&result),
+                Some(Unprovable::BareWord),
+                "{result:?}"
+            );
+        }
+        assert_admitted(
+            hg_text(&f),
+            &[
+                "[gpg]\nkey = --auto\n".to_owned(),
+                format!("[gpg]\nkey = {out}/f\n"),
+            ],
+        );
+        assert_admitted(
+            git_text(&f),
+            &[
+                "[lfs \"customtransfer.x\"]\n\targs = --auto\n".to_owned(),
+                format!("[lfs \"customtransfer.x\"]\n\targs = {out}/f\n"),
+            ],
+        );
+    }
+
+    #[test]
+    fn hg_forced_program_granted_refused() {
+        let f = fixture("hgforced");
+        assert_granted_operand(
+            hg_text(&f),
+            &owned(&[
+                "[merge-tools]\nx.executable = /bin/sh\n",
+                "[ui]\nmerge = /bin/sh\n",
+            ]),
+        );
+        assert_admitted(
+            hg_text(&f),
+            &owned(&["[ui]\nmerge = :merge3\n", "[ui]\nmerge = internal:merge\n"]),
+        );
+    }
+
+    #[test]
+    fn hg_ssh_contract() {
+        let f = fixture("hgssh");
+        assert_granted_operand(hg_text(&f), &owned(&["[ui]\nssh = sh\n"]));
+        assert_admitted(hg_text(&f), &owned(&["[ui]\nssh = ssh -C\n"]));
+    }
+
+    #[test]
+    fn jj_untabled_string_refused() {
+        let f = fixture("jjuntabled");
+        let result = scan_jj(&f, "[ui]\neditor = \"sh\"\n");
+        assert_eq!(
+            unprovable(&result),
+            Some(Unprovable::UnknownSetting),
+            "{result:?}"
+        );
+        for text in ["[user]\nemail = \"a@b\"\n", "[x]\nn = 1\n"] {
+            assert_eq!(scan_jj(&f, text), Ok(()), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn darcs_untabled_string_refused() {
+        let f = fixture("darcsuntabled");
+        let result = scan_darcs(&f, "test sh\n");
+        assert_eq!(
+            unprovable(&result),
+            Some(Unprovable::UnknownSetting),
+            "{result:?}"
+        );
+        assert_eq!(scan_darcs(&f, ""), Ok(()));
+    }
+
+    #[test]
+    fn nothing_rows_unchanged() {
+        let f = fixture("nothingrows");
+        assert_admitted(
+            git_text(&f),
+            &owned(&[
+                "[core]\n\tpager = less\n",
+                "[core]\n\teditor = vim\n",
+                "[alias]\n\tx = !sh\n",
+            ]),
+        );
+        assert_admitted(hg_text(&f), &owned(&["[pager]\npager = less\n"]));
     }
 
     #[test]
@@ -6754,7 +7203,7 @@ mod tests {
             "{result:?}"
         );
         git_config(&f, "[remote.o \"x\"]\n\tvcs = hg\n");
-        assert_eq!(scan_git(&f), Ok(()));
+        assert_eq!(unprovable(&scan_git(&f)), Some(Unprovable::GrantedOperand));
     }
 
     #[test]
