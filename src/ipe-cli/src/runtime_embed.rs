@@ -219,25 +219,28 @@ fn runtime_identity(manifest: &str) -> Option<DeclaredVersion> {
     if package.get("name")?.as_str()? != RUNTIME_PACKAGE {
         return None;
     }
-    let version = package.get("version");
-    Some(match version {
-        Some(item) => item.as_str().map_or_else(
-            || {
-                let inherited = item
-                    .as_table_like()
-                    .and_then(|table| table.get("workspace"))
-                    .and_then(toml_edit::Item::as_bool)
-                    == Some(true);
-                if inherited {
-                    DeclaredVersion::Inherited
-                } else {
-                    DeclaredVersion::Unknown
-                }
-            },
-            |concrete| DeclaredVersion::Concrete(concrete.to_owned()),
-        ),
-        None => DeclaredVersion::Unknown,
-    })
+    Some(
+        package
+            .get("version")
+            .map_or(DeclaredVersion::Unknown, declared_version),
+    )
+}
+
+/// The version a `[package].version` item declares.
+fn declared_version(item: &toml_edit::Item) -> DeclaredVersion {
+    if let Some(concrete) = item.as_str() {
+        return DeclaredVersion::Concrete(concrete.to_owned());
+    }
+    let inherited = item
+        .as_table_like()
+        .and_then(|table| table.get("workspace"))
+        .and_then(toml_edit::Item::as_bool)
+        == Some(true);
+    if inherited {
+        DeclaredVersion::Inherited
+    } else {
+        DeclaredVersion::Unknown
+    }
 }
 
 /// The entry name of the manifest.
@@ -1647,9 +1650,11 @@ mod tests {
         .expect("plant the FIFO");
         let (send, receive) = std::sync::mpsc::channel();
         let walked = dir.clone();
-        std::thread::spawn(move || {
-            let _ = send.send(refused_at(&walked, "src/fifo.rs"));
-        });
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = send.send(refused_at(&walked, "src/fifo.rs"));
+            })
+            .expect("spawn the capture thread");
         let reason = receive.recv_timeout(std::time::Duration::from_secs(5));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(reason, Ok(Some(RuntimeTreeReason::NotRegular)));

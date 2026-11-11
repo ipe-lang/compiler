@@ -1,4 +1,4 @@
-use super::{CliError, diag_span, io_err};
+use super::{CliError, diag_span};
 use crate::env_dir::{HomeDir, HomeRefusal};
 use crate::loose_file::LooseFileError;
 #[cfg(not(unix))]
