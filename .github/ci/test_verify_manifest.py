@@ -5888,6 +5888,78 @@ class TestAptOnePath(unittest.TestCase):
         self.assertTrue(any("check 27: cannot read" in e for e in errors), errors)
 
 
+class TestAptInstallScript(unittest.TestCase):
+    """The apt action's own `run` text, executed with `sudo` stubbed (an apt
+    or dpkg command exits `rc`, the mirror edit succeeds): it refuses every
+    input it cannot pass to apt as written, and fails when both attempts
+    fail."""
+
+    def run_script(self, packages: str, archives: str = "", recommends: str = "false", rc: int = 0, lc_all: str = "en_US.UTF-8") -> tuple[int, list[str]]:
+        """Exit status and recorded `sudo` argv lines; `{tmp}` in `archives`
+        is a writable scratch directory."""
+        doc = verify_manifest._read_action(os.path.join(_RT_REPO, ".github", "actions", "apt-install", "action.yml"))
+        script = doc["runs"]["steps"][0]["run"]
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "sudo.log")
+            stub = os.path.join(tmp, "sudo")
+            with open(stub, "w", encoding="utf-8") as f:
+                f.write('#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$SUDO_LOG"\n[ "$1" = timeout ] || exit 0\nexit "$SUDO_RC"\n')
+            os.chmod(stub, 0o755)
+            env = {
+                "PATH": tmp + os.pathsep + os.environ.get("PATH", ""),
+                "SUDO_LOG": log,
+                "SUDO_RC": str(rc),
+                "LC_ALL": lc_all,
+                "APT_PACKAGES": packages,
+                "APT_ARCHIVES": archives.replace("{tmp}", tmp),
+                "APT_NO_RECOMMENDS": recommends,
+            }
+            done = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=60, check=False)
+            calls = open(log, encoding="utf-8").read().splitlines() if os.path.exists(log) else []
+        return done.returncode, calls
+
+    def test_control_installs(self) -> None:
+        with tempfile.TemporaryDirectory() as archives:
+            code, calls = self.run_script("bubblewrap python3", archives=archives, recommends="true")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            calls,
+            [
+                "timeout 360 dpkg --configure -a",
+                "timeout 360 apt-get -o Acquire::Retries=3 update",
+                f"timeout 360 apt-get -o Acquire::Retries=3 -y --no-install-recommends -o Dir::Cache::archives={archives} install bubblewrap python3",
+            ],
+        )
+
+    def test_unpassable_input_refused(self) -> None:
+        for packages, archives, recommends in (
+            ("", "", "false"),
+            ("   ", "", "false"),
+            ("bubblewrap\n-o evil", "", "false"),
+            ("bubblewrap -o", "", "false"),
+            ("-y", "", "false"),
+            ("Bubblewrap", "", "false"),
+            ("caf\u00e9", "", "false"),
+            ("a;b", "", "false"),
+            ("x", "", "yes"),
+            ("x", "relative/dir", "false"),
+            ("x", "{tmp}/../escaped", "false"),
+            ("x", "{tmp}/./x", "false"),
+            ("x", "/tmp/a b", "false"),
+            ("x", "/tmp/x\n/etc", "false"),
+            ("x", "/tmp/x/", "false"),
+        ):
+            with self.subTest(packages=packages, archives=archives, recommends=recommends):
+                code, calls = self.run_script(packages, archives, recommends)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(calls, [])
+
+    def test_both_attempts_failing_fails(self) -> None:
+        code, calls = self.run_script("bubblewrap", rc=1)
+        self.assertNotEqual(code, 0)
+        self.assertEqual([c for c in calls if "dpkg --configure -a" in c], ["timeout 360 dpkg --configure -a"] * 2)
+
+
 _DU_WF = """\
 on: pull_request
 jobs:

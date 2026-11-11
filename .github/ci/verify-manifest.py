@@ -7954,6 +7954,11 @@ _TOOLCHAIN_CHANNEL_RUN = (
 # musl target: its `run` text line for line.
 _APT_INSTALL_RUN = (
     'set -euo pipefail',
+    'export LC_ALL=C',
+    'if [[ "$APT_PACKAGES" == *$\'\\n\'* ]]; then',
+    '  echo "::error::apt-install: packages must be one line" >&2',
+    '  exit 1',
+    'fi',
     'read -r -a packages <<< "$APT_PACKAGES"',
     'if [[ ${#packages[@]} -eq 0 ]]; then',
     '  echo "::error::apt-install: no package named" >&2',
@@ -7975,8 +7980,8 @@ _APT_INSTALL_RUN = (
     '    ;;',
     'esac',
     'if [[ -n "$APT_ARCHIVES" ]]; then',
-    '  if [[ "$APT_ARCHIVES" != /* ]]; then',
-    '    echo "::error::apt-install: archives must be an absolute directory" >&2',
+    '  if [[ ! "$APT_ARCHIVES" =~ ^(/[A-Za-z0-9._-]+)+$ || "$APT_ARCHIVES/" == */../* || "$APT_ARCHIVES/" == */./* ]]; then',
+    '    echo "::error::apt-install: archives must be an absolute directory with no . or .. segment" >&2',
     '    exit 1',
     '  fi',
     '  mkdir -p "$APT_ARCHIVES/partial"',
