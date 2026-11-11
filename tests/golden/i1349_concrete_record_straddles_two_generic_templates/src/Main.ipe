@@ -4,9 +4,9 @@ import Ipe.Io as Io
 import Ipe.String as String
 
 
--- Generic {q:a} (RecQ) and generic {q:(a,a)} (RecQ2) both live.
--- A CONCRETE {q:Int} use must fold into RecQ (a:=Int), NOT RecQ2.
--- A CONCRETE {q:(Int,Int)} use must fold into RecQ2, NOT RecQ.
+-- Generic {q:a}, generic {q:(a,a)}, concrete {q:Int} and concrete
+-- {q:(Int,Int)} all unify with {q:a}, so every one of them is an instance of
+-- the single struct RecQ<T1>.
 wrapOne : a -> a
 wrapOne value =
     let

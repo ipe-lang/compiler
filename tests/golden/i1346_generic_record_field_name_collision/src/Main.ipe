@@ -4,13 +4,10 @@ import Ipe.Io as Io
 import Ipe.String as String
 
 
--- Two GENUINELY-DISTINCT generic record shapes that share the SAME field-name
--- set `{q}`. `wrapOne` surfaces `{ q : a }` from its body; `firstOfPair`
--- surfaces `{ q : ( a, a ) }`. Both are well-typed, so the backend must
--- synthesise TWO distinct structs (`RecQ<T1>` for `{q:a}`, `RecQ2<T1>` for
--- `{q:(a,a)}`) instead of raising IPE-I0001 — the name-set no longer names a
--- parametric record uniquely. The generic template of each shape is folded once
--- (no spurious duplication of alpha-equivalent occurrences).
+-- Two non-alpha-equivalent generic record shapes that share the field-name set
+-- `{q}`. `wrapOne` surfaces `{ q : a }` from its body; `firstOfPair` surfaces
+-- `{ q : ( a, a ) }`. The two unify, so the backend synthesises ONE struct whose
+-- template is their least general generalization (`RecQ<T1>` with `q: T1`).
 wrapOne : a -> a
 wrapOne value =
     let
