@@ -277,7 +277,7 @@ fn whole_type_name(interner: &Interner, ty: &IrType) -> Box<str> {
 }
 
 /// The IPE-L0164 refusal of `callee`'s `demand` at `span`, naming `leaf`.
-pub(super) fn callee_bound_unmet(
+pub(super) const fn callee_bound_unmet(
     span: Span,
     callee: Box<str>,
     demand: CalleeDemand,
@@ -395,7 +395,7 @@ fn check_instance(
 /// another, every other shape through [`ipe_ir::paired_children`]. `false`
 /// when `target` sits under a `sig` shape `site` does not share.
 fn aligned_instances<'s>(
-    sig: &IrType,
+    sig: &'s IrType,
     target: Symbol,
     site: &'s IrType,
     out: &mut Vec<&'s IrType>,
@@ -570,7 +570,7 @@ mod tests {
                 ),
                 (IrType::Maybe(Box::new(task.clone())), "Task"),
                 (IrType::List(Box::new(task.clone())), "Task"),
-                (IrType::Tuple(vec![IrType::Int, task.clone()]), "Task"),
+                (IrType::Tuple(vec![IrType::Int, task]), "Task"),
             ] {
                 assert!(
                     matches!(bound_met_by(env, Bound::Clone, &ty), Supply::Unmet { leaf: ref l, .. } if &**l == leaf),
