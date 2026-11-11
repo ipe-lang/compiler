@@ -10330,6 +10330,45 @@ total =
             Ok(ModuleLookup::Miss)
         ));
     }
+
+    /// A lookup naming the coding-agent guide loosely lists it among the closest entries.
+    #[test]
+    fn lookup_misses_list_guide_agents() {
+        let bundle = build_doc_bundle(&repo_overlay()).expect("the doc bundle builds");
+        for raw in ["agent", "guide:agent", "AGENTS.md", "authoring"] {
+            let query = DocQuery::parse(raw).expect("a valid query");
+            let ranked =
+                crate::doc_search::rank(bundle.all_entries(), bundle.all_aliases(), &query);
+            let err = miss_error(raw, &ranked, OutputFormat::Human);
+            assert!(
+                matches!(err, CliError::DocNotFound { .. }),
+                "{raw:?} is a miss: {err:?}"
+            );
+            let CliError::DocNotFound { miss } = err else {
+                return;
+            };
+            let terms: Vec<&str> = miss.hits.iter().map(|hit| hit.term.as_str()).collect();
+            assert!(
+                terms.contains(&crate::agents_guide::GUIDE_TERM),
+                "{raw:?} lists {}: {terms:?}",
+                crate::agents_guide::GUIDE_TERM
+            );
+        }
+    }
+
+    /// A bare `agents` names exactly the guide, so it opens without a list.
+    #[test]
+    fn bare_agents_opens_guide() {
+        let bundle = build_doc_bundle(&repo_overlay()).expect("the doc bundle builds");
+        let query = DocQuery::parse("agents").expect("a valid query");
+        let only = crate::doc_search::unique_exact(bundle.all_entries(), &query);
+        assert!(
+            only.is_some_and(
+                |entry| entry.kind == DocKind::Guide && entry.key == crate::agents_guide::GUIDE_KEY
+            ),
+            "`agents` opens the guide, got {only:?}"
+        );
+    }
 }
 
 /// The `ipe init` `AGENTS.md` template cannot drift from the compiler it ships

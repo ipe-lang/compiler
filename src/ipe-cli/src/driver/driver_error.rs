@@ -422,6 +422,10 @@ pub enum CliError {
     /// Nothing was built: the wrapper builds only from the verified compiler
     /// workspace this binary was compiled from.
     WrapperSourceRefused(Box<crate::wrapper_source::WrapperSourceRefusal>),
+    /// `ipe upgrade --agents` wrote nothing to the project's `AGENTS.md`.
+    ///
+    /// [`fmt::Display`] names the reason, then its remedy.
+    AgentsGuideRefused(crate::agents_guide::GuideRefusal),
     /// A stage of `ipe verify` failed. Carries the stage name and the stage's
     /// own already-rendered report. Like [`Self::DocCoverage`], this is a
     /// legitimate gate result — the `verify` invocation was valid and the
@@ -898,6 +902,7 @@ impl CliError {
             Self::GroupRequired { .. } => "group-required",
             Self::NoRunForm { .. } => "no-run-form",
             Self::WrapperSourceRefused(_) => "wrapper-source-refused",
+            Self::AgentsGuideRefused(_) => "agents-guide-refused",
             Self::VerifyFailed { .. } => "verify-failed",
             Self::TestFailed { .. } => "test-failed",
             Self::UpgradeNoPrebuilt { .. } => "upgrade-no-prebuilt",
@@ -1007,6 +1012,7 @@ impl CliError {
             | Self::GroupRequired { .. }
             | Self::NoRunForm { .. }
             | Self::WrapperSourceRefused(_)
+            | Self::AgentsGuideRefused(_)
             | Self::VerifyFailed { .. }
             | Self::TestFailed { .. }
             | Self::UpgradeNoPrebuilt { .. }
@@ -1276,6 +1282,7 @@ impl std::fmt::Display for CliError {
                 &refusal.root.display(),
                 &refusal.defect,
             )),
+            Self::AgentsGuideRefused(refusal) => f.write_str(&refusal.message()),
             Self::VerifyFailed { stage, report } => {
                 writeln!(f, "{}", text::cli_verify_failed(stage))?;
                 f.write_str(report.as_str().trim_end_matches('\n'))

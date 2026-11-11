@@ -45,6 +45,7 @@ use ipe_path_core::Regime;
 
 use zeroize::Zeroizing;
 
+use crate::agents_guide::GuideStatus;
 use crate::cli_args::OutputFormat;
 use crate::remote_ingest::{
     InheritedInput, InheritedRole, LINK_PROBE_LIMITS, LocalCeiling, LocalSource, run_inherited,
@@ -116,6 +117,8 @@ pub enum Group {
     Sandbox,
     /// Free disk for the shared target and build cache.
     Disk,
+    /// The project in the working directory.
+    Project,
 }
 
 impl Group {
@@ -128,17 +131,19 @@ impl Group {
             Self::Target => "Shared build target",
             Self::Sandbox => "Sandbox (FFI)",
             Self::Disk => "Disk",
+            Self::Project => "Project",
         }
     }
 
     /// The report order.
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Toolchain,
         Self::Linker,
         Self::Cache,
         Self::Target,
         Self::Sandbox,
         Self::Disk,
+        Self::Project,
     ];
 }
 
@@ -437,7 +442,7 @@ pub fn run_health(rest: &[String]) -> Result<(), CliError> {
 /// to treat it as fatal (the init wizard ignores it, matching `ipe health`'s
 /// non-zero exit only when invoked as a standalone command).
 pub(crate) fn run_health_inline() -> Result<(), CliError> {
-    let report = detect();
+    let report = detect_machine();
     let stdout = std::io::stdout();
     crate::screen::Screen::new(crate::screen::Stream::Stdout)
         .guttered(&render_human(&report, &stdout))
@@ -468,6 +473,63 @@ enum Consent {
 
 /// Run every read-only detector and collect the report, in group order.
 fn detect() -> Report {
+    let mut report = detect_machine();
+    report.checks.extend(check_agents_guide());
+    report
+}
+
+/// The project's `AGENTS.md` row: only in a project root whose directory is held.
+///
+/// Read-only; the file is read once, never through a link, under the guide's cap.
+fn check_agents_guide() -> Option<Check> {
+    let cwd = std::env::current_dir().ok()?;
+    crate::project::locate_project(&cwd).ok()?;
+    let dir = crate::output_dir::held::HeldDir::open(&cwd)
+        .ok()
+        .flatten()?;
+    Some(guide_check(&crate::agents_guide::read_guide(&dir)))
+}
+
+/// The row reporting the project's `AGENTS.md` against this ipe's guide.
+///
+/// Never critical and never fixed here: health reports, `ipe upgrade --agents` writes.
+fn guide_check(status: &GuideStatus) -> Check {
+    use crate::agents_guide::{FILE_NAME, GUIDE_TERM, StaleReason, UPGRADE_HINT};
+    use crate::text::msg;
+    let (state, suggestion) = match status {
+        GuideStatus::Current => (Status::Ok, None),
+        GuideStatus::Missing => (
+            Status::Missing,
+            Some(msg::health_guide_refresh(&UPGRADE_HINT)),
+        ),
+        GuideStatus::Stale(StaleReason::OlderGuide { .. }) => {
+            (Status::Warn, Some(msg::health_guide_refresh(&UPGRADE_HINT)))
+        }
+        GuideStatus::Stale(StaleReason::NewerGuide { .. }) => (
+            Status::Warn,
+            Some(msg::health_guide_upgrade_first(&UPGRADE_HINT)),
+        ),
+        GuideStatus::Stale(StaleReason::HandEdited(_)) => (
+            Status::Warn,
+            Some(msg::health_guide_hand_edited(&GUIDE_TERM, &UPGRADE_HINT)),
+        ),
+        GuideStatus::Unread(_) => (Status::Unknown, None),
+    };
+    Check {
+        group: Group::Project,
+        id: GUIDE_CHECK_ID,
+        status: state,
+        detail: format!("{FILE_NAME} — {}", status.phrase()),
+        suggestion: suggestion.map(|text| text.as_str().to_owned()),
+        fix: None,
+    }
+}
+
+/// The `AGENTS.md` row's machine id.
+const GUIDE_CHECK_ID: &str = "agents-guide";
+
+/// Run every detector of the machine and toolchain, in group order.
+fn detect_machine() -> Report {
     let mut checks = Vec::new();
     checks.push(check_ipe_version());
     checks.extend(check_rust_toolchain());
@@ -1501,15 +1563,12 @@ fn ask(prompt: &str) -> Answer {
     use std::io::Write as _;
     crate::screen::prompt(&format!("{prompt} [Y/n] "));
     let _ = std::io::stdout().flush();
-    let mut line = String::new();
-    match std::io::stdin().read_line(&mut line) {
-        Ok(n) if n > 0 => match line.trim().to_ascii_lowercase().as_str() {
-            "" | "y" | "yes" => Answer::Yes,
-            _ => Answer::No,
-        },
-        // EOF (`Ok(0)`) or a read error: no answer we can trust — decline rather
-        // than assume consent to a trust action.
-        _ => Answer::No,
+    // EOF, a read error, or a refused line: no answer we can trust — decline
+    // rather than assume consent to a trust action.
+    if crate::prompt_reply::read_stdin_yes_no().consents(true, false) {
+        Answer::Yes
+    } else {
+        Answer::No
     }
 }
 
@@ -2588,6 +2647,95 @@ mod tests {
                 _ => Answer::No,
             };
             assert_eq!(got, expect, "answer for {input:?}");
+        }
+    }
+
+    /// Every state the guide row can report.
+    fn every_guide_status() -> Vec<GuideStatus> {
+        use crate::agents_guide::{HandEdit, StaleReason, Unread};
+        let older = semver::Version::new(0, 0, 1);
+        vec![
+            GuideStatus::Current,
+            GuideStatus::Missing,
+            GuideStatus::Stale(StaleReason::OlderGuide {
+                written_by: older.clone(),
+            }),
+            GuideStatus::Stale(StaleReason::NewerGuide { written_by: older }),
+            GuideStatus::Stale(StaleReason::HandEdited(HandEdit::Edited)),
+            GuideStatus::Stale(StaleReason::HandEdited(HandEdit::Unstamped)),
+            GuideStatus::Stale(StaleReason::HandEdited(HandEdit::MalformedStamp)),
+            GuideStatus::Unread(Unread::Link),
+            GuideStatus::Unread(Unread::TooLarge),
+        ]
+    }
+
+    /// The guide row never carries a fix, so `--yes` never writes the guide.
+    #[test]
+    fn guide_row_has_no_fix_and_yes_never_writes() {
+        for status in every_guide_status() {
+            let check = guide_check(&status);
+            assert!(check.fix.is_none(), "{status:?} carries no fix");
+            assert_eq!(check.group, Group::Project);
+            assert_eq!(check.id, GUIDE_CHECK_ID);
+        }
+        let dir = TempDir::new("guide_yes");
+        let guide = dir.path().join(crate::agents_guide::FILE_NAME);
+        std::fs::write(&guide, "my own notes\n").expect("plant a stale guide");
+        let id = || {
+            std::fs::File::open(&guide)
+                .ok()
+                .and_then(|file| ipe_fs_open::FileId::of_file(&file).ok())
+        };
+        let before = id();
+        let held = crate::output_dir::held::HeldDir::open(dir.path())
+            .expect("open project")
+            .expect("project exists");
+        let report = Report {
+            checks: vec![guide_check(&crate::agents_guide::read_guide(&held))],
+        };
+        assert!(report.fixable().next().is_none());
+        let out = std::fs::File::create(dir.path().join("out")).expect("file");
+        apply_fixes(&report, Consent::All, &out);
+        assert_eq!(
+            std::fs::read_to_string(&guide).ok().as_deref(),
+            Some("my own notes\n")
+        );
+        assert_eq!(id(), before);
+    }
+
+    /// Bytes planted in the file never reach any form of the report.
+    #[test]
+    fn guide_row_never_echoes_file_bytes() {
+        let dir = TempDir::new("guide_echo");
+        let planted = "<!-- ipe-guide:1 ipe 1.0.0-\x1b]52;c;UExBTlRFRA==\x07 sha256 00 -->\n\x1b]52;c;UExBTlRFRA==\x07 body\n";
+        std::fs::write(dir.path().join(crate::agents_guide::FILE_NAME), planted)
+            .expect("plant the guide");
+        let held = crate::output_dir::held::HeldDir::open(dir.path())
+            .expect("open project")
+            .expect("project exists");
+        let report = Report {
+            checks: vec![guide_check(&crate::agents_guide::read_guide(&held))],
+        };
+        let stream = std::fs::File::create(dir.path().join("out")).expect("file");
+        for out in [
+            render_human(&report, &stream),
+            render_plain(&report),
+            render_json(&report),
+        ] {
+            for needle in ["\x1b", "]52", "UExBTlRFRA", "\x07", "body"] {
+                assert!(!out.contains(needle), "{needle:?} leaked into {out:?}");
+            }
+        }
+    }
+
+    /// No guide state is a critical failure, so none changes the exit code.
+    #[test]
+    fn health_exit_code_unchanged_by_stale_guide() {
+        for status in every_guide_status() {
+            let report = Report {
+                checks: vec![guide_check(&status)],
+            };
+            assert!(!report.has_critical_failure(), "{status:?}");
         }
     }
 }

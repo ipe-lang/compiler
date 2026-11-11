@@ -15,6 +15,50 @@ fn fresh_dir(tag: &str) -> PathBuf {
     dir
 }
 
+/// `ipe init --force` keeps a linked `AGENTS.md` unread: the link and its
+/// target stay as they were and nothing is backed up.
+#[cfg(unix)]
+#[test]
+fn init_force_does_not_follow_linked_agents_md() {
+    let dir = fresh_dir("force_linked_agents");
+    let target = dir.join("app");
+    let outside = dir.join("outside");
+    fs::create_dir_all(&target).expect("make target");
+    fs::create_dir_all(&outside).expect("make outside");
+    let victim = outside.join("victim.md");
+    fs::write(&victim, "outside bytes\n").expect("plant the outside file");
+    std::os::unix::fs::symlink(&victim, target.join("AGENTS.md")).expect("plant the link");
+    let output = std::process::Command::new(e2e_support::cargo_bin!("ipe").into_path_buf())
+        .args(["init", "--force"])
+        .arg(&target)
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run ipe init");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "init --force succeeds; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("kept AGENTS.md (not read: a link)"),
+        "stdout: {stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(&victim).ok().as_deref(),
+        Some("outside bytes\n")
+    );
+    assert_eq!(fs::read_link(target.join("AGENTS.md")).ok(), Some(victim));
+    let backups = fs::read_dir(target.join(".ipe-backup")).map_or(0, Iterator::count);
+    assert_eq!(backups, 0, "nothing is backed up");
+    assert!(
+        target.join("package.ipe").is_file(),
+        "the rest is scaffolded"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// `ipe init <name>` scaffolds the four project files, with the project name
 /// threaded into `package.ipe`.
 #[test]
@@ -50,6 +94,21 @@ fn init_scaffolds_project_files() {
         "Main.ipe must be the Ipe.Tea.Web counter"
     );
 
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `ipe init` writes `AGENTS.md` as exactly the stamp line and the embedded guide.
+#[test]
+fn rendered_is_stamp_plus_asset() {
+    let dir = fresh_dir("agents_rendered");
+    let target = dir.join("guided");
+    let args = vec!["init".to_owned(), target.to_string_lossy().into_owned()];
+    assert!(ipe::run_cli(&args).is_ok(), "init must succeed");
+    let written = fs::read_to_string(target.join("AGENTS.md")).unwrap_or_default();
+    assert_eq!(written, ipe::agents_guide::rendered());
+    let (stamp, body) = written.split_once('\n').unwrap_or_default();
+    assert!(stamp.starts_with("<!-- ipe-guide:1 ipe "), "{stamp}");
+    assert_eq!(body, ipe::agents_guide::ASSET);
     let _ = fs::remove_dir_all(&dir);
 }
 

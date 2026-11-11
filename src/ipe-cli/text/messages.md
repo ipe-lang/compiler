@@ -2167,6 +2167,54 @@ ipe init: unknown runtime `{word}` — expected 1-2, or `{runtime}` (press Enter
 
 init: cannot derive a project name from target {target}
 
+## init-restore-ask
+
+Restore {file}?
+
+## init-overwrite-ask
+
+Overwrite {file}?
+
+## init-restored
+
+restored {file}
+
+## init-backed-up
+
+backed up {file} to {backup}
+
+## init-kept-unchanged
+
+kept {file} (unchanged)
+
+## init-kept-no-tty
+
+would overwrite {file} (skipped: no TTY)
+
+## init-kept-unread
+
+kept {file} (not read: {reason})
+
+## init-kept-appeared
+
+kept {file} (appeared while ipe was writing it)
+
+## init-kept-changed
+
+kept {file} (changed while ipe was writing it)
+
+## init-kept-backups-full
+
+kept {file} (no free backup name in {dir}/)
+
+## init-nothing-to-do
+
+nothing to do.
+
+## init-guide-pointer
+
+Coding agents: run  ipe doc {term}  for the authoring guide.
+
 # ipe login
 
 ## login-verification-url-refused
@@ -2738,6 +2786,83 @@ ipe {current} → {latest} available
 ## upgrade-confirm
 
 Upgrade now? [Y/n]
+
+## upgrade-agents-alone
+
+`--agents` upgrades only this project's guide; it does not combine with `{flag}`
+
+## upgrade-agents-ask
+
+{file} was edited by hand. Back it up and overwrite?
+
+## upgrade-agents-current
+
+{file} is current (ipe {running})
+
+## upgrade-agents-rewritten
+
+{file} updated from ipe {from} to ipe {running}
+
+## upgrade-agents-created
+
+{file} written (ipe {running})
+
+## upgrade-agents-replaced
+
+{file} backed up to {backup} and replaced with the guide of ipe {running}
+
+## upgrade-agents-each-project
+
+Run `{hint}` in each project to refresh its {file}
+
+## upgrade-guide-refresh
+
+{file}: {phrase}; run `{hint}` to refresh it
+
+## upgrade-guide-see-health
+
+{file}: {phrase}; `ipe health` shows how to refresh it
+
+## agents-guide-no-manifest
+
+no package.ipe in this directory; run `{hint}` from an Ipê project root
+
+## agents-guide-unheld
+
+the project directory could not be opened; {file} was not read
+
+## agents-guide-hand-edited
+
+{file} differs from the guide ipe generated ({reason}); left unchanged
+compare with `ipe doc {term}`; run `{hint}` on a terminal and answer yes to back it up and replace it
+
+## agents-guide-newer
+
+{file} was written by ipe {written_by}, newer than this ipe {running}; run `ipe upgrade` first
+
+## agents-guide-unread
+
+{file} not read ({reason}); left unchanged
+
+## agents-guide-changed
+
+{file} changed while ipe was upgrading it; nothing was written; run `{hint}` again
+
+## agents-guide-backups-full
+
+no free backup name for {file} in `{dir}/` ({slots} taken); nothing was written; remove old backups there and run `{hint}` again
+
+## health-guide-refresh
+
+run `{hint}` here
+
+## health-guide-upgrade-first
+
+upgrade ipe (`ipe upgrade`), then run `{hint}`
+
+## health-guide-hand-edited
+
+compare with `ipe doc {term}`; to take the guide, run `{hint}` here on a terminal and answer yes (it backs the old file up first)
 
 ## release-embedded
 
