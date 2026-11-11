@@ -716,7 +716,7 @@ mod tests {
     #[test]
     fn release_with_nothing_set_keeps_console_closed() {
         seed_console_env(&[]);
-        let resolved = ConsoleAuthResolution::from_env();
+        let resolved = console_auth_resolution();
         assert_eq!(resolved.mode, ConsoleAuthMode::UnsetProd);
         if !cfg!(feature = "dev-posture") {
             assert_eq!(resolved.posture, Posture::Production);
@@ -738,7 +738,7 @@ mod tests {
     #[test]
     fn dev_posture_off_loopback_keeps_console_closed() {
         seed_console_env(&[("ENV", "dev")]);
-        let resolved = ConsoleAuthResolution::from_env();
+        let resolved = console_auth_resolution();
         let posture = if cfg!(feature = "dev-posture") {
             Posture::Dev
         } else {
@@ -1233,14 +1233,11 @@ mod tests {
     }
 
     #[test]
-    fn non_unicode_token_source_refuses_the_role() {
-        // A garbled higher-precedence token never falls through to a
+    fn refused_token_source_refuses_the_role() {
+        // A refused higher-precedence token never falls through to a
         // lower-precedence one.
         let admin = Credential::resolve(
-            [
-                TokenSource::NotUnicode,
-                TokenSource::Set("s3cret".to_owned()),
-            ],
+            [TokenSource::Refused, TokenSource::Set("s3cret".to_owned())],
             AdminToken,
         );
         assert!(matches!(admin, Credential::Unusable));
@@ -1248,10 +1245,7 @@ mod tests {
         assert!(!admin.admits(&Presented("s3cret".to_owned())));
         let creds = || Credentials {
             admin: Credential::resolve(
-                [
-                    TokenSource::NotUnicode,
-                    TokenSource::Set("s3cret".to_owned()),
-                ],
+                [TokenSource::Refused, TokenSource::Set("s3cret".to_owned())],
                 AdminToken,
             ),
             metrics: Credential::Unset,
