@@ -96,6 +96,9 @@ fn load_error(err: &CliError) -> LoadError {
         | CliError::ServePortTaken { .. }
         | CliError::RuntimeMaterializeFailed { .. }
         | CliError::RuntimeVersionMismatch { .. }
+        | CliError::RuntimeTreeRefused { .. }
+        | CliError::RuntimeVersionUnknown { .. }
+        | CliError::ReleaseRuntimeOverride { .. }
         | CliError::EmittedBuildFailed { .. }
         | CliError::CargoBuildTimedOut { .. }
         | CliError::TargetDirUnlinkable { .. }

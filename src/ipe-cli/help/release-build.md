@@ -14,7 +14,7 @@ A project directory (default: the current directory). shape/runtime/host are the
 - `[--target <triple>]` — a musl-static native <triple> (default: x86_64-unknown-linux-musl). The browser bundle is `web client`, never a target; a `web client` or app-bundle delivery takes no target.
 - @--static
 - @--emit-permissions
-- `[--runtime <dir>]` — vendor the Ipê runtime source from <dir>
+- `[--runtime <dir>]` — build against the Ipê runtime crate at <dir> (same as IPE_RUNTIME_DIR); a release refuses a runtime other than the embedded one
 - `[--bundle]` — native-bearing only: multi-file opt-out — wrapper + app + profile as siblings (app binary can be run directly, bypassing the sandbox)
 - `[--embed]` — native-bearing only: default single self-jailing binary (app + profile fused into wrapper)
 - `[--plain|--json]` — the layout of a refusal: the terse flush-left record or one stable JSON object

@@ -3669,6 +3669,57 @@ fn an_explicit_runtime_root_of_another_version_is_refused_for_every_emit_model()
     assert_eq!(vendored, (true, false), "a vendored build refuses the root");
 }
 
+/// A linked build with an explicit runtime root bundles that root's captured
+/// crate under `ipe_runtime_dep/`, never the embedded copy, and a vendored one
+/// copies the same capture into `src/ipe_runtime/`.
+#[test]
+fn an_explicit_runtime_root_is_the_crate_every_emit_model_bundles() {
+    let tmp = ipe_test_temp::temp_root().join("ipe_build_bundles_runtime_override");
+    let _ = fs::remove_dir_all(&tmp);
+    let project = tmp.join("app");
+    let runtime = tmp.join("runtime");
+    fs::create_dir_all(project.join("src")).expect("create src/");
+    fs::create_dir_all(runtime.join("src")).expect("create runtime src/");
+    fs::write(
+        runtime.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"ipe-runtime-rust\"\nversion = \"{}\"\n",
+            crate::runtime_embed::COMPILER_VERSION
+        ),
+    )
+    .expect("runtime manifest");
+    let marker = "// ipe-runtime-override-marker\n";
+    fs::write(runtime.join("src/lib.rs"), marker).expect("runtime source");
+    fs::write(runtime.join("src/mod.rs"), marker).expect("runtime module root");
+    fs::write(project.join("src/Main.ipe"), CLEAN_MAIN).expect("main");
+    let bundled = |runtime_emit: RuntimeEmit, rel: &str| {
+        let out = tmp.join(format!("out-{runtime_emit:?}"));
+        let result = build_project_with_options(
+            &project.join("src/Main.ipe"),
+            &out,
+            &runtime,
+            &BuildOptions {
+                runtime_emit,
+                ..BuildOptions::default()
+            },
+        );
+        (result.is_ok(), fs::read_to_string(out.join(rel)).ok())
+    };
+    let linked = bundled(RuntimeEmit::Linked, "ipe_runtime_dep/src/lib.rs");
+    let vendored = bundled(RuntimeEmit::Vendored, "src/ipe_runtime/lib.rs");
+    let _ = fs::remove_dir_all(&tmp);
+    assert_eq!(
+        linked,
+        (true, Some(marker.to_owned())),
+        "linked bundles the root"
+    );
+    assert_eq!(
+        vendored,
+        (true, Some(marker.to_owned())),
+        "vendored copies the root"
+    );
+}
+
 // =========================================================================
 // `ipe package audit-entry` — argument parsing and fail-closed schema gate
 // =========================================================================

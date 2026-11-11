@@ -180,6 +180,37 @@ pub enum CliError {
         /// The remedy the refusing surface offers.
         remedy: crate::runtime_embed::RuntimeRemedy,
     },
+    /// A named runtime crate holds an entry the capture refuses to build from.
+    ///
+    /// The capture never follows a link below the root, never opens a FIFO,
+    /// socket or device, never reads a file shared through a hard link, and
+    /// stops at the tree ceilings, so a crate it refuses is never linked.
+    RuntimeTreeRefused {
+        /// The runtime crate root, made absolute.
+        path: PathBuf,
+        /// The refused entry and why.
+        refusal: crate::runtime_embed::RuntimeTreeRefusal,
+        /// The remedy the refusing surface offers.
+        remedy: crate::runtime_embed::RuntimeRemedy,
+    },
+    /// A named runtime crate declares no version this compiler can read.
+    ///
+    /// No version key, a value of another shape, or `version.workspace = true`
+    /// with no readable enclosing workspace version: an unread version is
+    /// refused, never taken for the compiler's own.
+    RuntimeVersionUnknown {
+        /// The runtime crate root, made absolute.
+        path: PathBuf,
+        /// The remedy the refusing surface offers.
+        remedy: crate::runtime_embed::RuntimeRemedy,
+    },
+    /// A release named a runtime crate other than the one embedded in `ipe`.
+    ///
+    /// A shipped artifact links only the compiler's embedded runtime.
+    ReleaseRuntimeOverride {
+        /// The named runtime crate root, made absolute.
+        path: PathBuf,
+    },
     /// Building the emitted Rust project failed — `cargo` exited non-zero while
     /// compiling the program this compiler emitted. This is neither a
     /// command-line misuse (so it never shows the command's `--help` page) nor a
@@ -835,6 +866,9 @@ impl CliError {
             Self::ServePortTaken { .. } => "serve-port-taken",
             Self::RuntimeMaterializeFailed { .. } => "runtime-materialize-failed",
             Self::RuntimeVersionMismatch { .. } => "runtime-version-mismatch",
+            Self::RuntimeTreeRefused { .. } => "runtime-tree-refused",
+            Self::RuntimeVersionUnknown { .. } => "runtime-version-unknown",
+            Self::ReleaseRuntimeOverride { .. } => "release-runtime-override",
             Self::EmittedBuildFailed { .. } => "emitted-build-failed",
             Self::CargoBuildTimedOut { .. } => "cargo-build-timed-out",
             Self::TargetDirUnlinkable { .. } => "target-dir-unlinkable",
@@ -941,6 +975,9 @@ impl CliError {
             | Self::ScratchUnavailable { .. }
             | Self::Pipeline { .. }
             | Self::RuntimeDirInvalid { .. }
+            | Self::RuntimeTreeRefused { .. }
+            | Self::RuntimeVersionUnknown { .. }
+            | Self::ReleaseRuntimeOverride { .. }
             | Self::RuntimeHomeUnknown
             | Self::CacheHomeUnknown
             | Self::EnvDirNotAbsolute { .. }
@@ -1099,6 +1136,9 @@ impl std::fmt::Display for CliError {
                 &ipe_runtime_rust::env_registry::web::WEB_PORT.name(),
             )),
             Self::RuntimeDirInvalid { .. }
+            | Self::RuntimeTreeRefused { .. }
+            | Self::RuntimeVersionUnknown { .. }
+            | Self::ReleaseRuntimeOverride { .. }
             | Self::RuntimeHomeUnknown
             | Self::RuntimeMaterializeFailed { .. }
             | Self::RuntimeVersionMismatch { .. } => fmt_runtime_install_error(self, f),
@@ -1496,8 +1536,57 @@ pub fn fmt_runtime_install_error(
             f.write_str(&text::cli_runtime_version_mismatch(&path, found, expected))?;
             write!(f, "\n{}", runtime_remedy_line(*remedy))
         }
+        CliError::RuntimeTreeRefused {
+            path,
+            refusal,
+            remedy,
+        } => {
+            let root = path.display();
+            let entry = refusal.path.display();
+            f.write_str(&text::cli_runtime_tree_refused(
+                &root,
+                &entry,
+                &runtime_tree_reason(refusal.reason),
+            ))?;
+            write!(f, "\n{}", runtime_remedy_line(*remedy))
+        }
+        CliError::RuntimeVersionUnknown { path, remedy } => {
+            let path = path.display();
+            f.write_str(&text::cli_runtime_version_unknown(&path))?;
+            write!(f, "\n{}", runtime_remedy_line(*remedy))
+        }
+        CliError::ReleaseRuntimeOverride { path } => {
+            let path = path.display();
+            f.write_str(&text::cli_release_runtime_override(&path))
+        }
         // The caller only dispatches the runtime-install variants here.
         _ => Ok(()),
+    }
+}
+
+/// The phrase naming why a runtime tree entry was refused.
+fn runtime_tree_reason(reason: crate::runtime_embed::RuntimeTreeReason) -> String {
+    use crate::runtime_embed::{
+        RUNTIME_FILE_BYTES, RUNTIME_TREE_BYTES, RUNTIME_TREE_DEPTH, RUNTIME_TREE_ENTRIES,
+        RuntimeTreeReason,
+    };
+    match reason {
+        RuntimeTreeReason::Link => text::cli_runtime_tree_link().to_owned(),
+        RuntimeTreeReason::NotRegular => text::cli_runtime_tree_not_regular().to_owned(),
+        RuntimeTreeReason::HardLinked => text::cli_runtime_tree_hard_linked().to_owned(),
+        RuntimeTreeReason::NotUtf8 => text::cli_runtime_tree_not_utf8().to_owned(),
+        RuntimeTreeReason::Unreadable => text::cli_runtime_tree_unreadable().to_owned(),
+        RuntimeTreeReason::Absent => text::cli_runtime_tree_absent().to_owned(),
+        RuntimeTreeReason::TooDeep => text::cli_runtime_tree_too_deep(&RUNTIME_TREE_DEPTH).into(),
+        RuntimeTreeReason::TooManyEntries => {
+            text::cli_runtime_tree_too_many_entries(&RUNTIME_TREE_ENTRIES).into()
+        }
+        RuntimeTreeReason::FileTooLarge => {
+            text::cli_runtime_tree_file_too_large(&RUNTIME_FILE_BYTES).into()
+        }
+        RuntimeTreeReason::TreeTooLarge => {
+            text::cli_runtime_tree_too_large(&RUNTIME_TREE_BYTES).into()
+        }
     }
 }
 

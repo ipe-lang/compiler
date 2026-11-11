@@ -453,8 +453,14 @@ impl<'a> BundleAssembler<'a> {
         out: OutTarget<'_>,
         webview: delivery::WebViewProof,
     ) -> Result<EmittedCrate, CliError> {
+        // A release bundle links the compiler's embedded runtime only.
+        let runtime_origin = match self.finish {
+            BundleFinish::Dev { .. } => crate::runtime_embed::RuntimeOrigin::Developer,
+            BundleFinish::Release { .. } => crate::runtime_embed::RuntimeOrigin::Release,
+        };
         let options = BuildOptions {
             intent: self.profile.build_intent(),
+            runtime_origin,
             ..BuildOptions::from_env()?
         };
         let runtime = crate::runtime_embed::RuntimeSource::resolve(
