@@ -1273,14 +1273,19 @@ mod pinned_relay {
             // A failed bind drops `socket`, which removes the directory.
             let listener = UnixListener::bind(&socket.path).map_err(|_| RelayUnavailable)?;
             let (stop, stopped) = oneshot::channel();
-            tokio::spawn(serve(
-                listener,
-                socket,
-                target,
-                owner,
-                relay_ceiling(max_connections),
-                stopped,
-            ));
+            crate::threads::spawn_service(
+                "db relay",
+                "the database socket relay's accept loop",
+                serve(
+                    listener,
+                    socket,
+                    target,
+                    owner,
+                    relay_ceiling(max_connections),
+                    stopped,
+                ),
+            )
+            .map_err(|_| RelayUnavailable)?;
             Ok(Self {
                 socket_dir,
                 target,
@@ -1300,14 +1305,23 @@ mod pinned_relay {
         }
 
         /// Keep the relay running until `closed` completes.
+        ///
+        /// With no runtime to hold it on, the relay stops at once.
         pub fn hold_until<F>(self, closed: F)
         where
             F: Future<Output = ()> + Send + 'static,
         {
-            tokio::spawn(async move {
-                closed.await;
-                drop(self);
-            });
+            let held = crate::threads::spawn_service(
+                "db relay hold",
+                "it holds the database socket relay until its pool closes",
+                async move {
+                    closed.await;
+                    drop(self);
+                },
+            );
+            if let Err(refused) = held {
+                crate::system::emit_runtime_log("db", &refused.to_string());
+            }
         }
     }
 
@@ -1421,7 +1435,14 @@ mod pinned_relay {
                 continue;
             };
             if client.peer_cred().is_ok_and(|cred| cred.uid() == owner) {
-                tokio::spawn(relay_connection(client, target, permit));
+                let relayed = crate::threads::spawn_service(
+                    "db relay connection",
+                    "one relayed database connection",
+                    relay_connection(client, target, permit),
+                );
+                if let Err(refused) = relayed {
+                    crate::system::emit_runtime_log("db", &refused.to_string());
+                }
             }
         }
         drop(listener);
