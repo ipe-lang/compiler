@@ -6839,32 +6839,38 @@ fn fn_body_tokens(
     None
 }
 
-/// The compact body of the first match arm in `stream` whose pattern opens with `owner::variant`.
-fn arm_body(stream: proc_macro2::TokenStream, owner: &str, variant: &str) -> Option<String> {
+/// The compact bodies of every match arm in `stream` whose pattern opens with `owner::variant`.
+///
+/// Every arm is returned, so an earlier arm over the same variant cannot hide a
+/// later one from the scan.
+fn arm_bodies(stream: proc_macro2::TokenStream, owner: &str, variant: &str) -> Vec<String> {
     use proc_macro2::{Delimiter, TokenTree};
     let trees: Vec<TokenTree> = stream.into_iter().collect();
     let punct =
         |at: usize, c: char| matches!(trees.get(at), Some(TokenTree::Punct(p)) if p.as_char() == c);
     let ident =
         |at: usize, name: &str| matches!(trees.get(at), Some(TokenTree::Ident(i)) if *i == name);
+    let mut bodies = Vec::new();
     for (at, tree) in trees.iter().enumerate() {
         if let TokenTree::Group(group) = tree {
-            if let Some(body) = arm_body(group.stream(), owner, variant) {
-                return Some(body);
-            }
+            bodies.extend(arm_bodies(group.stream(), owner, variant));
             continue;
         }
         if !(ident(at, owner) && punct(at + 1, ':') && punct(at + 2, ':') && ident(at + 3, variant))
         {
             continue;
         }
-        let arrow = (at + 4..trees.len()).find(|&i| punct(i, '=') && punct(i + 1, '>'))?;
+        let Some(arrow) = (at + 4..trees.len()).find(|&i| punct(i, '=') && punct(i + 1, '>'))
+        else {
+            continue;
+        };
         if let Some(TokenTree::Group(group)) = trees.get(arrow + 2)
             && group.delimiter() == Delimiter::Brace
         {
-            return Some(compact(group.stream()));
+            bodies.push(compact(group.stream()));
+            continue;
         }
-        return Some(compact(
+        bodies.push(compact(
             trees
                 .iter()
                 .skip(arrow + 2)
@@ -6873,7 +6879,7 @@ fn arm_body(stream: proc_macro2::TokenStream, owner: &str, variant: &str) -> Opt
                 .collect(),
         ));
     }
-    None
+    bodies
 }
 
 /// How `consent_on` opens the judged front end: over the held read, on the caller's database only.
@@ -6916,10 +6922,11 @@ fn release_bodies_name_no_second_front_end() {
     );
     let pipeline = fn_body_tokens(commands, "release_pipeline").map(compact);
     let desktop = fn_body_tokens(bundles, "emit_desktop")
-        .and_then(|body| arm_body(body, "BundleFinish", "Release"));
+        .map(|body| arm_bodies(body, "BundleFinish", "Release").concat())
+        .filter(|arms| !arms.is_empty());
     for (site, body, judged) in [
         ("release_pipeline", pipeline, "release.emit("),
-        ("emit_desktop's release arm", desktop, "judged.emit("),
+        ("emit_desktop's release arms", desktop, "judged.emit("),
     ] {
         assert!(body.is_some(), "{site} is found");
         let Some(body) = body else {
@@ -6974,11 +6981,22 @@ fn the_second_front_end_scan_sees_every_banned_path() {
                 BundleFinish::Release { judged, .. } => held.emit(b), } }";
     let arm = rust_tokens(arms)
         .and_then(|tokens| fn_body_tokens(tokens, "emit_desktop"))
-        .and_then(|body| arm_body(body, "BundleFinish", "Release"));
+        .map(|body| arm_bodies(body, "BundleFinish", "Release").concat());
     assert!(
         arm.as_deref()
             .is_some_and(|arm| second_front_ends(arm) == ["held.emit("]),
         "the release arm alone is scanned: {arm:?}"
+    );
+    let shadowed = "fn emit_desktop() { let o = match f { BundleFinish::Release { .. } => 1, \
+                    BundleFinish::Dev { .. } => 0, }; match f { BundleFinish::Dev { .. } => 0, \
+                    BundleFinish::Release { judged, .. } => held.emit(b), } }";
+    let arms = rust_tokens(shadowed)
+        .and_then(|tokens| fn_body_tokens(tokens, "emit_desktop"))
+        .map(|body| arm_bodies(body, "BundleFinish", "Release").concat());
+    assert!(
+        arms.as_deref()
+            .is_some_and(|arms| second_front_ends(arms) == ["held.emit("]),
+        "an earlier release arm hides no later one: {arms:?}"
     );
 }
 
