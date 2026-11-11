@@ -139,12 +139,13 @@ struct Outcome {
     stderr: String,
 }
 
-/// Compile the seccomp program for a profile and place it on an inheritable fd,
-/// then build + run the jail argv for `payload`, returning the exit status code.
+/// Compile the seccomp program for a profile into a sealed memfd, then build +
+/// run the jail argv for `payload`, returning the exit status code.
 ///
 /// This mirrors `exec_in_run_jail` but *spawns* (waits) instead of `exec`-ing,
-/// so the test can assert on the outcome. The seccomp fd is created with
-/// `memfd_create` and its close-on-exec flag cleared so `bwrap` inherits it.
+/// so the test can assert on the outcome. The memfd stays close-on-exec here;
+/// the launch names it, so `bwrap` alone inherits it, at the number its argv
+/// carries.
 fn run_jailed(tools: &RunJailTools, profile: &SandboxProfile, payload: &[OsString]) -> Option<i32> {
     // The assertions inherit stderr (a diagnostic when one fails); only the
     // canary captures it.

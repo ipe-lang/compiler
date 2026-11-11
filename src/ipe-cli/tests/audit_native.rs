@@ -294,8 +294,9 @@ mod real_jail {
     use ipe_sandbox::run_jail::{RunJailTools, SandboxProfile};
     use ipe_sandbox::{CanonicalPath, HostTool, JailMounts, host_tool};
 
-    /// `build_in_jail` mutates the process-global fd table (a `memfd`) on Linux;
-    /// serialize the jailed runs so parallel `--test-threads` cannot race.
+    /// Serializes the jailed runs. Each `build_in_jail` holds no state another
+    /// run shares; the lock bounds the host load, since every run is a full
+    /// jailed build and parallel `--test-threads` would multiply it.
     static JAIL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Probe the host for the jail primitive, returning the [`RunJailTools`] the

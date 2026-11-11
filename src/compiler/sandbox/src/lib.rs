@@ -1469,4 +1469,201 @@ mod tests {
             .count();
         assert_eq!(seccomp_flags, 1, "the payload argv must carry the filter");
     }
+
+    /// The std calls that start a process from a bare `Command`, bypassing the
+    /// runtime descriptor floor: a child started through any of them inherits
+    /// every descriptor this process holds without close-on-exec. Matched on
+    /// code with every whitespace character removed, in method and path form;
+    /// `CommandExt` is the trait reaching `exec` and `pre_exec`, and
+    /// `Commandas` is a renaming import of `Command`.
+    const RAW_PROCESS_STARTS: [&str; 8] = [
+        ".spawn()",
+        ".status()",
+        ".output()",
+        "::spawn(&",
+        "::status(&",
+        "::output(&",
+        "CommandExt",
+        "Commandas",
+    ];
+
+    /// The one construction a bare `Command` has.
+    const COMMAND_BUILD: &str = "Command::new";
+
+    /// Every production file that builds a `Command`, with how many it builds;
+    /// each hands its `Command` to `JailLaunch` or to
+    /// `ipe_runtime_rust::system::spawn_hardened`.
+    const COMMAND_BUILD_SITES: [(&str, usize); 3] = [
+        // `JailArgv::command`, consumed only by `JailLaunch::new`.
+        ("run_jail/mod.rs", 1),
+        // `ToolPath::command`, the closed host-tool set.
+        ("host_tool.rs", 1),
+        // The FreeBSD `mount`/`umount`/`rctl` calls, each through `run_host_tool`.
+        ("build_jail.rs", 6),
+    ];
+
+    /// Every `.rs` file under `dir`, recursively.
+    fn rust_sources(dir: &Path, found: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                rust_sources(&path, found)?;
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                found.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    /// The non-test code of `source`: the text after the first `mod tests {`
+    /// cut, comments and string and character literals dropped, every
+    /// whitespace character removed.
+    fn production_code(source: &str) -> String {
+        let production = source
+            .find("\nmod tests {")
+            .and_then(|at| source.get(..at))
+            .unwrap_or(source);
+        let chars: Vec<char> = production.chars().collect();
+        let at = |i: usize| chars.get(i).copied();
+        let mut code = String::with_capacity(production.len());
+        let mut i = 0_usize;
+        while let Some(c) = at(i) {
+            let next = at(i.saturating_add(1));
+            i = match (c, next) {
+                ('/', Some('/')) => {
+                    let mut end = i;
+                    while at(end).is_some_and(|c| c != '\n') {
+                        end = end.saturating_add(1);
+                    }
+                    end
+                }
+                ('/', Some('*')) => {
+                    let mut end = i.saturating_add(2);
+                    while at(end).is_some()
+                        && !(at(end) == Some('*') && at(end.saturating_add(1)) == Some('/'))
+                    {
+                        end = end.saturating_add(1);
+                    }
+                    end.saturating_add(2)
+                }
+                ('"', _) => {
+                    let mut end = i.saturating_add(1);
+                    loop {
+                        match at(end) {
+                            Some('\\') => end = end.saturating_add(2),
+                            Some('"') | None => break end.saturating_add(1),
+                            Some(_) => end = end.saturating_add(1),
+                        }
+                    }
+                }
+                ('\'', Some('\\')) => {
+                    let mut end = i.saturating_add(2);
+                    while at(end).is_some_and(|c| c != '\'') {
+                        end = end.saturating_add(1);
+                    }
+                    end.saturating_add(1)
+                }
+                ('\'', Some(_)) if at(i.saturating_add(2)) == Some('\'') => i.saturating_add(3),
+                _ => {
+                    if !c.is_whitespace() {
+                        code.push(c);
+                    }
+                    i.saturating_add(1)
+                }
+            };
+        }
+        code
+    }
+
+    /// What one file's production code holds: each raw process start, and how
+    /// many `Command`s it builds.
+    fn process_starts(source: &str) -> (Vec<&'static str>, usize) {
+        let code = production_code(source);
+        let raw = RAW_PROCESS_STARTS
+            .iter()
+            .flat_map(|&needle| code.matches(needle).map(move |_| needle))
+            .collect();
+        (raw, code.matches(COMMAND_BUILD).count())
+    }
+
+    #[test]
+    fn every_process_this_crate_starts_goes_through_the_descriptor_floor() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        let walked = rust_sources(&src, &mut files);
+        assert!(
+            walked.is_ok(),
+            "could not list {}: {walked:?}",
+            src.display()
+        );
+        assert!(
+            files.len() > 10,
+            "the scan found only {} source files under {}",
+            files.len(),
+            src.display()
+        );
+        let mut violations = Vec::new();
+        let mut builds: Vec<(String, usize)> = Vec::new();
+        for file in &files {
+            let relative = file
+                .strip_prefix(&src)
+                .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            match std::fs::read_to_string(file) {
+                Ok(source) => {
+                    let (raw, built) = process_starts(&source);
+                    violations.extend(raw.iter().map(|needle| format!("{relative}: `{needle}`")));
+                    if built > 0 {
+                        builds.push((relative, built));
+                    }
+                }
+                Err(e) => violations.push(format!("{relative}: unreadable: {e}")),
+            }
+        }
+        builds.sort();
+        let mut admitted: Vec<(String, usize)> = COMMAND_BUILD_SITES
+            .iter()
+            .map(|&(file, count)| (file.to_owned(), count))
+            .collect();
+        admitted.sort();
+        assert!(
+            violations.is_empty(),
+            "a process start bypasses the runtime descriptor floor \
+             (route it through `JailLaunch` or `ipe_runtime_rust::system::spawn_hardened`):\n{}",
+            violations.join("\n")
+        );
+        assert_eq!(
+            builds, admitted,
+            "the files building a `Command` drifted from the admitted sites"
+        );
+    }
+
+    #[test]
+    fn the_process_start_scan_refuses_each_raw_start() {
+        let control = "fn a() { cmd.spawn(); }\n\
+                       fn b() { let _ = cmd\n    .status (); }\n\
+                       fn c() { Command::output(&mut cmd); }\n\
+                       use std::os::unix::process::CommandExt as _;\n\
+                       use std::process::Command as Spawn;\n\
+                       fn d() { launch.spawn(a, b); } // cmd.spawn() Command::new\n\
+                       fn e() { [p].map(Command::new); }\n\
+                       fn g() { f(\"a//b\", '\"'); cmd.spawn(); /* cmd.output() */ }\n\
+                       const H: &str = \"Command::new cmd.spawn()\";\n\
+                       mod tests {\n\
+                       fn f() { cmd.spawn(); Command::new(p); }\n";
+        assert_eq!(
+            process_starts(control),
+            (
+                vec![
+                    ".spawn()",
+                    ".spawn()",
+                    ".status()",
+                    "::output(&",
+                    "CommandExt",
+                    "Commandas"
+                ],
+                1
+            )
+        );
+    }
 }

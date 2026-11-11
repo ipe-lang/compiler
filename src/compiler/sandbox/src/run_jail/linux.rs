@@ -78,13 +78,12 @@ pub fn netns_jail_available(bwrap: &std::path::Path) -> bool {
     // Exit 0 → the netns came up cleanly. Any non-zero (including the
     // "loopback: Failed RTM_NEWADDR: Operation not permitted" bwrap error)
     // → the netns jail cannot be established on this host.
-    std::process::Command::new(bwrap)
-        .args(["--unshare-net", "--ro-bind", "/", "/", "--", "/bin/true"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    // The probe starts through the runtime descriptor floor like every jail.
+    let mut argv = vec![bwrap.as_os_str().to_owned()];
+    argv.extend(["--unshare-net", "--ro-bind", "/", "/", "--", "/bin/true"].map(OsString::from));
+    JailLaunch::fd_free(&JailArgv::fd_free(argv))
+        .and_then(|launch| launch.spawn(std::process::Stdio::null(), std::process::Stdio::null()))
+        .is_ok_and(|mut child| child.wait().is_ok_and(|s| s.success()))
 }
 
 /// The read-only binds re-exposing the app binary past the home/tmp tmpfs masks.
