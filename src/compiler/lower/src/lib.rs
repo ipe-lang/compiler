@@ -751,10 +751,21 @@ mod tests {
     fn secret_from_constant_chain_past_fold_budget_is_refused() {
         // Every link is the empty constant, so only the fold ceiling can refuse:
         // a chain longer than the budget is unproven and fails closed.
-        let chain: String = (0..300)
-            .zip(1..301)
-            .map(|(prev, next)| format!("c{next} : String\nc{next} =\n    c{prev}\n\n\n"))
-            .collect();
+        let mut chain = String::new();
+        for (prev, next) in (0..300).zip(1..301) {
+            let (prev, next) = (prev.to_string(), next.to_string());
+            for part in [
+                "c",
+                &next,
+                " : String\nc",
+                &next,
+                " =\n    c",
+                &prev,
+                "\n\n\n",
+            ] {
+                chain.push_str(part);
+            }
+        }
         let result = lower_result(&secret_module(&format!(
             "c0 : String\nc0 =\n    \"\"\n\n\n{chain}key =\n    Secret.fromString c300\n"
         )));
