@@ -16,6 +16,9 @@
 //! - `i3658_record_lgg_shared_fun`: a reused record of shared functions keyed on
 //!   a type variable merges with a sibling; its clone and `'static` bound rest
 //!   on the instantiation.
+//! - `i3658_record_lgg_nested_record`: two `{q}` occurrences hold `{r}` records
+//!   no member generalizes, and `{ r : ( String, String ) }` is a sibling `{r}`
+//!   struct; the `{q}` template reaches its `{r}` record through a parameter.
 //!
 //! Each emits `main.rs` byte-identical to its golden with exactly one struct for
 //! the name set, and behind `IPE_E2E=1` builds and prints its `expected.txt`.
@@ -163,4 +166,31 @@ fn shared_fun_emits_one_struct() {
 #[test]
 fn shared_fun_end_to_end() {
     end_to_end(SHARED_FUN);
+}
+
+const NESTED_RECORD: &str = "i3658_record_lgg_nested_record";
+
+#[test]
+fn nested_record_column_is_a_parameter() {
+    let main_rs = emit_matches_golden(NESTED_RECORD);
+    assert_eq!(struct_count(&main_rs, "RecQ"), 1, "one struct for {{q}}");
+    // The `{q}` template reaches its inner `{r}` record through a parameter, so
+    // each use site names the `{r}` struct its own record resolves to.
+    assert!(
+        main_rs.contains("pub struct RecQ<T1, T2> {\n    q: (T1, T2),"),
+        "the nested record column is a type parameter"
+    );
+    assert!(
+        main_rs.contains("RecQ<RecR<i64, T1>, i64>"),
+        "`left` instantiates the parameter with its own `{{r}}` struct"
+    );
+    assert!(
+        main_rs.contains("RecQ<RecR<T1, i64>, T2>"),
+        "`right` instantiates the parameter with its own `{{r}}` struct"
+    );
+}
+
+#[test]
+fn nested_record_end_to_end() {
+    end_to_end(NESTED_RECORD);
 }

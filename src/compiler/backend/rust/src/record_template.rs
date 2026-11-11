@@ -199,7 +199,12 @@ fn generalize(column: &[&IrType], vars: &mut Variables) -> DResult<IrType> {
         let same_keys = rest.iter().all(
             |ty| matches!(ty, IrType::Record(fields) if fields.keys().eq(first_fields.keys())),
         );
-        if same_keys {
+        // A nested record resolves to its own struct by unification, so the
+        // template may spell it only as a renaming of an occurrence: descend
+        // only when one member generalizes the whole column, whose
+        // generalization is then that member renamed. Any other column of
+        // records is a type parameter, instantiated by each member's record.
+        if same_keys && has_most_general(column) {
             let mut out = BTreeMap::new();
             for key in first_fields.keys() {
                 let mut sub = Vec::with_capacity(column.len());
@@ -237,6 +242,46 @@ fn generalize(column: &[&IrType], vars: &mut Variables) -> DResult<IrType> {
         *slot = generalize(sub, vars)?;
     }
     Ok(node)
+}
+
+/// Does one type of `column` generalize every other one?
+fn has_most_general(column: &[&IrType]) -> bool {
+    column.iter().any(|general| {
+        column
+            .iter()
+            .all(|specific| instance_of(general, specific, &mut BTreeMap::new()))
+    })
+}
+
+/// Is `specific` an instance of `general`: does binding the variables of
+/// `general` alone make the two equal? The variables of `specific` are
+/// constants here.
+fn instance_of<'a>(
+    general: &'a IrType,
+    specific: &'a IrType,
+    subst: &mut BTreeMap<Symbol, &'a IrType>,
+) -> bool {
+    match general {
+        IrType::Generic(sym) => match subst.get(sym) {
+            Some(bound) => *bound == specific,
+            None => {
+                subst.insert(*sym, specific);
+                true
+            }
+        },
+        IrType::RowGeneric(_) => false,
+        IrType::Record(gm) => match specific {
+            IrType::Record(sm) if gm.keys().eq(sm.keys()) => gm
+                .values()
+                .zip(sm.values())
+                .all(|(g, s)| instance_of(g, s, subst)),
+            _ => false,
+        },
+        _ => match ipe_ir::paired_children(general, specific) {
+            Some(mut pairs) => pairs.all(|(g, s)| instance_of(g, s, subst)),
+            None => general == specific,
+        },
+    }
 }
 
 /// Does `ty` hold a type variable anywhere?
@@ -594,6 +639,76 @@ mod tests {
         let row = q(IrType::RowGeneric(r));
         assert!(fields_unify(&row, &q(IrType::Int)).is_err());
         assert!(reconcile(&["q".to_owned()], &[row], interner.len()).is_err());
+        Ok(())
+    }
+
+    /// A column of nested records no member generalizes becomes one type
+    /// parameter: a generalized `{r:(V1,V2)}` would be no occurrence's
+    /// renaming and could unify with a sibling `{r}` struct
+    /// (`{r:(String,String)}`), so its use site would resolve to two structs.
+    #[test]
+    fn nested_record_column_without_a_most_general_member_is_a_parameter() -> DResult<()> {
+        let mut interner = Interner::new();
+        let a = interner.intern("a")?;
+        let b = interner.intern("b")?;
+        let c = interner.intern("c")?;
+        let r = interner.intern("r")?;
+        let inner =
+            |x: IrType, y: IrType| IrType::Record(BTreeMap::from([(r, IrType::Tuple(vec![x, y]))]));
+        let left = q(IrType::Tuple(vec![
+            inner(IrType::Int, IrType::Generic(a)),
+            IrType::Int,
+        ]));
+        let right = q(IrType::Tuple(vec![
+            inner(IrType::Generic(b), IrType::Int),
+            IrType::Generic(c),
+        ]));
+        let out = reconcile(&["q".to_owned()], &[left, right], interner.len())?;
+        let [class] = out.as_slice() else {
+            return Err(bug(format!("expected one class, got {out:?}")));
+        };
+        let Some((_, IrType::Tuple(elems))) = class.template.first() else {
+            return Err(bug(format!(
+                "expected a tuple field, got {:?}",
+                class.template
+            )));
+        };
+        assert!(
+            matches!(elems.first(), Some(IrType::Generic(_))),
+            "the record column is a parameter, got {elems:?}"
+        );
+        Ok(())
+    }
+
+    /// A column of nested records one member generalizes keeps that member's
+    /// shape, renamed: `{q:({r:a},Int)}` and `{q:({r:Int},Str)}` give
+    /// `{q:({r:V1},V2)}`.
+    #[test]
+    fn nested_record_column_with_a_most_general_member_keeps_its_shape() -> DResult<()> {
+        let mut interner = Interner::new();
+        let a = interner.intern("a")?;
+        let r = interner.intern("r")?;
+        let inner = |x: IrType| IrType::Record(BTreeMap::from([(r, x)]));
+        let generic = q(IrType::Tuple(vec![inner(IrType::Generic(a)), IrType::Int]));
+        let concrete = q(IrType::Tuple(vec![inner(IrType::Int), IrType::Generic(a)]));
+        let out = reconcile(&["q".to_owned()], &[generic, concrete], interner.len())?;
+        let [class] = out.as_slice() else {
+            return Err(bug(format!("expected one class, got {out:?}")));
+        };
+        let Some((_, IrType::Tuple(elems))) = class.template.first() else {
+            return Err(bug(format!(
+                "expected a tuple field, got {:?}",
+                class.template
+            )));
+        };
+        let inner_var = matches!(
+            elems.first(),
+            Some(IrType::Record(fields)) if matches!(fields.get(&r), Some(IrType::Generic(_)))
+        );
+        assert!(
+            inner_var,
+            "the record column keeps the general member's shape, got {elems:?}"
+        );
         Ok(())
     }
 
