@@ -53,6 +53,7 @@ const RETIRED: &[&str] = &[
     "runtime_dep_from_env",
     "resolve_runtime",
     "resolve_vendored_runtime_dir",
+    "collect_dir_text",
 ];
 
 /// The harness locator: walks up from an anchor to the checkout's runtime
@@ -853,5 +854,107 @@ fn the_admitted_shape_passes() -> Result<(), String> {
     let unbounded_outside_a_locator = "fn walk_up(p: &Path) { for d in p.ancestors() {} }\n";
     let refused = planted("src/ipe-cli/src/cache.rs", unbounded_outside_a_locator)?;
     assert!(refused.is_empty(), "{}", refused.join("\n"));
+    Ok(())
+}
+
+/// The spellings that carry a runtime by its path where its content belongs,
+/// whitespace removed.
+const PATH_CARRIERS: &[&str] = &["RuntimeDep{root", "path_bytes(&dep.root)"];
+
+/// The file reads a runtime collection must not make: it bundles the capture.
+const REREADS: &[&str] = &["read_dir", "read_to_string"];
+
+/// The function that collects the runtime an emit bundles.
+const COLLECTOR: &str = "build_emit_manifest";
+
+/// Each [`PATH_CARRIERS`] spelling in `source`, labelled with `rel`.
+fn path_carriers(rel: &str, source: &str) -> Vec<String> {
+    let squeezed: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    PATH_CARRIERS
+        .iter()
+        .filter(|carrier| squeezed.contains(*carrier))
+        .map(|carrier| format!("{rel}: `{carrier}` carries the runtime by its path"))
+        .collect()
+}
+
+/// Each [`REREADS`] call in the body of [`COLLECTOR`] in `source`, or a
+/// refusal when the collector is not found.
+fn collector_rereads(source: &str) -> Result<Vec<String>, String> {
+    let file = syn::parse_file(source).map_err(|e| format!("{PIPELINE}: {e}"))?;
+    let collector = file.items.iter().find_map(|item| match item {
+        syn::Item::Fn(item) if item.sig.ident == COLLECTOR => Some(item),
+        _ => None,
+    });
+    let Some(collector) = collector else {
+        return Ok(vec![format!("{PIPELINE}: `{COLLECTOR}` is not found")]);
+    };
+    let mut called = CalledNames::default();
+    called.visit_block(&collector.block);
+    Ok(REREADS
+        .iter()
+        .filter(|read| called.0.iter().any(|name| name == *read))
+        .map(|read| format!("{PIPELINE}: `{COLLECTOR}` calls `{read}`; it bundles the capture"))
+        .collect())
+}
+
+/// Every function or method name a block calls.
+#[derive(Default)]
+struct CalledNames(Vec<String>);
+
+impl<'ast> Visit<'ast> for CalledNames {
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(path) = &*call.func
+            && let Some(last) = path.path.segments.last()
+        {
+            self.0.push(last.ident.to_string());
+        }
+        visit::visit_expr_call(self, call);
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        self.0.push(call.method.to_string());
+        visit::visit_expr_method_call(self, call);
+    }
+}
+
+/// The runtime reaches the emit as captured content: no dependency carries
+/// the root's path, and the collector rereads no file.
+#[test]
+fn the_runtime_is_carried_as_content_never_as_a_path() -> Result<(), String> {
+    let root = repo_root();
+    let mut refused = Vec::new();
+    for tree in member_trees(&root)? {
+        let files = panic_scan::rust_sources(&tree, panic_scan::Want::RustFiles)
+            .map_err(|e| format!("{}: {e}", tree.display()))?;
+        for file in files {
+            let source =
+                std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+            refused.extend(path_carriers(&file.display().to_string(), &source));
+        }
+    }
+    let pipeline =
+        std::fs::read_to_string(root.join(PIPELINE)).map_err(|e| format!("{PIPELINE}: {e}"))?;
+    refused.extend(collector_rereads(&pipeline)?);
+    assert!(refused.is_empty(), "{}", refused.join("\n"));
+    Ok(())
+}
+
+/// A planted path carrier, and a planted reread in the collector, are refused.
+#[test]
+fn a_planted_path_carrier_or_reread_is_refused() -> Result<(), String> {
+    for planted in [
+        "fn f() { RuntimeDep { root: r }; }",
+        "fn f() { h.write(path_bytes( &dep.root)); }",
+    ] {
+        assert_eq!(path_carriers("planted.rs", planted).len(), 1, "{planted}");
+    }
+    for read in REREADS {
+        let planted = format!("pub fn {COLLECTOR}() {{ fs::{read}(p); }}");
+        assert_eq!(collector_rereads(&planted)?.len(), 1, "{planted}");
+    }
+    assert_eq!(collector_rereads("pub fn other() {}")?.len(), 1);
+    assert!(
+        collector_rereads(&format!("pub fn {COLLECTOR}() {{ runtime.bundled(r); }}"))?.is_empty()
+    );
     Ok(())
 }

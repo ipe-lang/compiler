@@ -3669,6 +3669,62 @@ fn an_explicit_runtime_root_of_another_version_is_refused_for_every_emit_model()
     assert_eq!(vendored, (true, false), "a vendored build refuses the root");
 }
 
+/// A linked build with an explicit runtime root bundles that root's captured
+/// crate under `ipe_runtime_dep/`, never the embedded copy, and a vendored one
+/// copies the same capture into `src/ipe_runtime/`.
+#[test]
+fn an_explicit_runtime_root_is_the_crate_every_emit_model_bundles() {
+    let tmp = ipe_test_temp::temp_root().join("ipe_build_bundles_runtime_override");
+    let _ = fs::remove_dir_all(&tmp);
+    let project = tmp.join("app");
+    let runtime = tmp.join("runtime");
+    fs::create_dir_all(project.join("src")).expect("create src/");
+    fs::create_dir_all(runtime.join("src")).expect("create runtime src/");
+    fs::write(
+        runtime.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"ipe-runtime-rust\"\nversion = \"{}\"\n",
+            crate::runtime_embed::COMPILER_VERSION
+        ),
+    )
+    .expect("runtime manifest");
+    let marker = "// ipe-runtime-override-marker\n";
+    fs::write(runtime.join("src/lib.rs"), marker).expect("runtime source");
+    fs::write(runtime.join("src/mod.rs"), marker).expect("runtime module root");
+    fs::write(
+        project.join("package.ipe"),
+        "module Package exposing (package)\n\n\npackage =\n    { name = \"app\" }\n",
+    )
+    .expect("pkg");
+    fs::write(project.join("src/Main.ipe"), CLEAN_MAIN).expect("main");
+    let bundled = |runtime_emit: RuntimeEmit, rel: &str| {
+        let out = tmp.join(format!("out-{runtime_emit:?}"));
+        let result = build_project_with_options(
+            &project.join("package.ipe"),
+            &out,
+            &runtime,
+            &BuildOptions {
+                runtime_emit,
+                ..BuildOptions::default()
+            },
+        );
+        (result.is_ok(), fs::read_to_string(out.join(rel)).ok())
+    };
+    let linked = bundled(RuntimeEmit::Linked, "ipe_runtime_dep/src/lib.rs");
+    let vendored = bundled(RuntimeEmit::Vendored, "src/ipe_runtime/lib.rs");
+    let _ = fs::remove_dir_all(&tmp);
+    assert_eq!(
+        linked,
+        (true, Some(marker.to_owned())),
+        "linked bundles the root"
+    );
+    assert_eq!(
+        vendored,
+        (true, Some(marker.to_owned())),
+        "vendored copies the root"
+    );
+}
+
 // =========================================================================
 // `ipe package audit-entry` — argument parsing and fail-closed schema gate
 // =========================================================================
@@ -6783,32 +6839,38 @@ fn fn_body_tokens(
     None
 }
 
-/// The compact body of the first match arm in `stream` whose pattern opens with `owner::variant`.
-fn arm_body(stream: proc_macro2::TokenStream, owner: &str, variant: &str) -> Option<String> {
+/// The compact bodies of every match arm in `stream` whose pattern opens with `owner::variant`.
+///
+/// Every arm is returned, so an earlier arm over the same variant cannot hide a
+/// later one from the scan.
+fn arm_bodies(stream: proc_macro2::TokenStream, owner: &str, variant: &str) -> Vec<String> {
     use proc_macro2::{Delimiter, TokenTree};
     let trees: Vec<TokenTree> = stream.into_iter().collect();
     let punct =
         |at: usize, c: char| matches!(trees.get(at), Some(TokenTree::Punct(p)) if p.as_char() == c);
     let ident =
         |at: usize, name: &str| matches!(trees.get(at), Some(TokenTree::Ident(i)) if *i == name);
+    let mut bodies = Vec::new();
     for (at, tree) in trees.iter().enumerate() {
         if let TokenTree::Group(group) = tree {
-            if let Some(body) = arm_body(group.stream(), owner, variant) {
-                return Some(body);
-            }
+            bodies.extend(arm_bodies(group.stream(), owner, variant));
             continue;
         }
         if !(ident(at, owner) && punct(at + 1, ':') && punct(at + 2, ':') && ident(at + 3, variant))
         {
             continue;
         }
-        let arrow = (at + 4..trees.len()).find(|&i| punct(i, '=') && punct(i + 1, '>'))?;
+        let Some(arrow) = (at + 4..trees.len()).find(|&i| punct(i, '=') && punct(i + 1, '>'))
+        else {
+            continue;
+        };
         if let Some(TokenTree::Group(group)) = trees.get(arrow + 2)
             && group.delimiter() == Delimiter::Brace
         {
-            return Some(compact(group.stream()));
+            bodies.push(compact(group.stream()));
+            continue;
         }
-        return Some(compact(
+        bodies.push(compact(
             trees
                 .iter()
                 .skip(arrow + 2)
@@ -6817,7 +6879,7 @@ fn arm_body(stream: proc_macro2::TokenStream, owner: &str, variant: &str) -> Opt
                 .collect(),
         ));
     }
-    None
+    bodies
 }
 
 /// How `consent_on` opens the judged front end: over the held read, on the caller's database only.
@@ -6860,10 +6922,11 @@ fn release_bodies_name_no_second_front_end() {
     );
     let pipeline = fn_body_tokens(commands, "release_pipeline").map(compact);
     let desktop = fn_body_tokens(bundles, "emit_desktop")
-        .and_then(|body| arm_body(body, "BundleFinish", "Release"));
+        .map(|body| arm_bodies(body, "BundleFinish", "Release").concat())
+        .filter(|arms| !arms.is_empty());
     for (site, body, judged) in [
         ("release_pipeline", pipeline, "release.emit("),
-        ("emit_desktop's release arm", desktop, "judged.emit("),
+        ("emit_desktop's release arms", desktop, "judged.emit("),
     ] {
         assert!(body.is_some(), "{site} is found");
         let Some(body) = body else {
@@ -6918,11 +6981,22 @@ fn the_second_front_end_scan_sees_every_banned_path() {
                 BundleFinish::Release { judged, .. } => held.emit(b), } }";
     let arm = rust_tokens(arms)
         .and_then(|tokens| fn_body_tokens(tokens, "emit_desktop"))
-        .and_then(|body| arm_body(body, "BundleFinish", "Release"));
+        .map(|body| arm_bodies(body, "BundleFinish", "Release").concat());
     assert!(
         arm.as_deref()
             .is_some_and(|arm| second_front_ends(arm) == ["held.emit("]),
         "the release arm alone is scanned: {arm:?}"
+    );
+    let shadowed = "fn emit_desktop() { let o = match f { BundleFinish::Release { .. } => 1, \
+                    BundleFinish::Dev { .. } => 0, }; match f { BundleFinish::Dev { .. } => 0, \
+                    BundleFinish::Release { judged, .. } => held.emit(b), } }";
+    let arms = rust_tokens(shadowed)
+        .and_then(|tokens| fn_body_tokens(tokens, "emit_desktop"))
+        .map(|body| arm_bodies(body, "BundleFinish", "Release").concat());
+    assert!(
+        arms.as_deref()
+            .is_some_and(|arms| second_front_ends(arms) == ["held.emit("]),
+        "an earlier release arm hides no later one: {arms:?}"
     );
 }
 
