@@ -20,20 +20,20 @@ use crate::code::{
     IPE_L0134, IPE_L0135, IPE_L0136, IPE_L0140, IPE_L0141, IPE_L0142, IPE_L0143, IPE_L0144,
     IPE_L0145, IPE_L0146, IPE_L0147, IPE_L0148, IPE_L0149, IPE_L0150, IPE_L0151, IPE_L0152,
     IPE_L0153, IPE_L0154, IPE_L0155, IPE_L0156, IPE_L0157, IPE_L0158, IPE_L0159, IPE_L0160,
-    IPE_L0161, IPE_L0162, IPE_L0200, IPE_L0201, IPE_N0001, IPE_N0002, IPE_N0003, IPE_N0004,
-    IPE_N0005, IPE_N0010, IPE_N0011, IPE_N0012, IPE_N0013, IPE_N0020, IPE_N0021, IPE_N0022,
-    IPE_N0023, IPE_N0024, IPE_N0025, IPE_N0026, IPE_N0027, IPE_N0028, IPE_N0029, IPE_N0030,
-    IPE_N0031, IPE_N0032, IPE_N0033, IPE_N0034, IPE_N0035, IPE_N0036, IPE_N0038, IPE_N0039,
-    IPE_N0040, IPE_N0041, IPE_N0042, IPE_N0043, IPE_N0044, IPE_N0045, IPE_N0046, IPE_N0047,
-    IPE_N0048, IPE_N0049, IPE_N0050, IPE_N0051, IPE_N0052, IPE_N0053, IPE_P0001, IPE_P0002,
-    IPE_P0003, IPE_P0010, IPE_P0011, IPE_P0012, IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016,
-    IPE_P0017, IPE_P0018, IPE_P0020, IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041,
-    IPE_P0050, IPE_P0060, IPE_P0061, IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066,
-    IPE_P0067, IPE_P0068, IPE_P0069, IPE_P0070, IPE_P0071, IPE_P0072, IPE_P0073, IPE_P0074,
-    IPE_P0075, IPE_P0076, IPE_P0077, IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004, IPE_T0001,
-    IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014,
-    IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021, IPE_T0022,
-    IPE_T0023, IPE_T0024, Severity,
+    IPE_L0161, IPE_L0162, IPE_L0163, IPE_L0200, IPE_L0201, IPE_N0001, IPE_N0002, IPE_N0003,
+    IPE_N0004, IPE_N0005, IPE_N0010, IPE_N0011, IPE_N0012, IPE_N0013, IPE_N0020, IPE_N0021,
+    IPE_N0022, IPE_N0023, IPE_N0024, IPE_N0025, IPE_N0026, IPE_N0027, IPE_N0028, IPE_N0029,
+    IPE_N0030, IPE_N0031, IPE_N0032, IPE_N0033, IPE_N0034, IPE_N0035, IPE_N0036, IPE_N0038,
+    IPE_N0039, IPE_N0040, IPE_N0041, IPE_N0042, IPE_N0043, IPE_N0044, IPE_N0045, IPE_N0046,
+    IPE_N0047, IPE_N0048, IPE_N0049, IPE_N0050, IPE_N0051, IPE_N0052, IPE_N0053, IPE_P0001,
+    IPE_P0002, IPE_P0003, IPE_P0010, IPE_P0011, IPE_P0012, IPE_P0013, IPE_P0014, IPE_P0015,
+    IPE_P0016, IPE_P0017, IPE_P0018, IPE_P0020, IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040,
+    IPE_P0041, IPE_P0050, IPE_P0060, IPE_P0061, IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065,
+    IPE_P0066, IPE_P0067, IPE_P0068, IPE_P0069, IPE_P0070, IPE_P0071, IPE_P0072, IPE_P0073,
+    IPE_P0074, IPE_P0075, IPE_P0076, IPE_P0077, IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004,
+    IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012, IPE_T0013,
+    IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021,
+    IPE_T0022, IPE_T0023, IPE_T0024, Severity,
 };
 use crate::span::Span;
 use crate::suggest::{Confidence, Hit};
@@ -1964,6 +1964,16 @@ pub enum LowerError {
     /// An app sets `onNavigate` but its Model has no `page` field, so nothing
     /// would ever call it. [IPE-L0162]
     OnNavigateWithoutPage,
+    /// A view spells, as a literal, an attribute name the runtime owns: an
+    /// `ipe-*` marker, `nonce`, or any `data-ipe-*` name. The runtime's
+    /// attribute constructors drop such a name, so the attribute would never
+    /// reach the page. [IPE-L0163]
+    ReservedAttributeName {
+        /// The dotted call that received the name (e.g. `Attr.attribute`).
+        call: Box<str>,
+        /// A bounded, escaped excerpt of the refused name.
+        name: Box<str>,
+    },
     /// A `Web.route` page-constructor payload field has a type that cannot be
     /// decoded from a URL `:param` string (only `String`, `Int`, `Float`, and
     /// `Bool` are supported). [IPE-L0123]
@@ -3224,6 +3234,7 @@ const fn lower_code(msg: &LowerError) -> Code {
         LowerError::RouteTableOpaque => IPE_L0160,
         LowerError::RoutedPageNotCustomType => IPE_L0161,
         LowerError::OnNavigateWithoutPage => IPE_L0162,
+        LowerError::ReservedAttributeName { .. } => IPE_L0163,
         LowerError::DevOnlyKernelInProduction { .. } => IPE_L0140,
         LowerError::UiCellsInWebShape(_) => IPE_L0132,
         LowerError::UiCellsInCliShape(_) => IPE_L0153,
@@ -3790,6 +3801,12 @@ fn lower_help(msg: &LowerError) -> Vec<HelpLine> {
         )],
         LowerError::OnNavigateWithoutPage => vec![HelpLine::Note(
             "add a `page` field to the Model to route the app, or remove `onNavigate`.".into(),
+        )],
+        LowerError::ReservedAttributeName { .. } => vec![HelpLine::Note(
+            "rename the attribute out of the `ipe-` and `data-ipe-` namespaces and away \
+             from `nonce`. A routed app's URL already follows `model.page`, so set the page in `update` instead \
+             of naming a path; attach events with the `Ui.on*` attributes."
+                .into(),
         )],
         LowerError::RouteParamUnsupportedType {
             field_index,

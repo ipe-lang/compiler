@@ -145,7 +145,6 @@ view model =
         , Ui.el
             [ Ui.describe Ui.descMain, Ui.width Ui.fill, Ui.height Ui.fill, Ui.padding 24, Font.color (Ui.rgb 190 190 200) ]
             (pageBody model)
-        , urlSync model
         ]
 
 
@@ -825,25 +824,6 @@ decisionBadge d =
 
         StoredRefused _ ->
             chipColored (SafeText.literal "✗ Refused") (Ui.rgb 130 45 45)
-
-
-currentPath : Model -> String
-currentPath model =
-    case model.page of
-        QueuePage ->
-            "/"
-
-        HistoryPage ->
-            "/history"
-
-        UnitPage uid ->
-            "/unit/" ++ uid
-
-
-urlSync : Model -> Ui.Element Msg
-urlSync model =
-    Ui.html
-        (Html.node "div" [ Attr.attribute "data-ipe-path" (currentPath model) ] [])
 
 
 unitCard : RefuseControls -> Maybe DecisionSlot.DecidableRow -> Queue.QueueState -> Selected.SelectedView -> UnitLabel -> Queue.QueuedUnit -> Ui.Element Msg
