@@ -283,9 +283,11 @@ fn checked_cargo_build(mut cmd: Command, label: &str, app_package: &str) -> Resu
     Ok(json_stdout)
 }
 
-/// Run the cargo build `cmd` (a [`target::cargo_command`] with its subcommand,
-/// `build` or `check`, and any arguments set) in `project_dir`, failing on a
-/// cargo failure or on any warning from the runtime crate or the app crate.
+/// Run a cargo build in `project_dir`, failing on any runtime or app warning.
+///
+/// `cmd` is a [`target::cargo_command`] with its subcommand (`build` or
+/// `check`) and any arguments set. It fails on a cargo failure or on any
+/// warning from the runtime crate or the app crate.
 ///
 /// The app crate is the package `project_dir/Cargo.toml` declares, read from
 /// that manifest rather than named by the caller, and the build must report an
