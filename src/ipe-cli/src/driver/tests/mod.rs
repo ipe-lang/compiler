@@ -3691,11 +3691,16 @@ fn an_explicit_runtime_root_is_the_crate_every_emit_model_bundles() {
     let marker = "// ipe-runtime-override-marker\n";
     fs::write(runtime.join("src/lib.rs"), marker).expect("runtime source");
     fs::write(runtime.join("src/mod.rs"), marker).expect("runtime module root");
+    fs::write(
+        project.join("package.ipe"),
+        "module Package exposing (package)\n\n\npackage =\n    { name = \"app\" }\n",
+    )
+    .expect("pkg");
     fs::write(project.join("src/Main.ipe"), CLEAN_MAIN).expect("main");
     let bundled = |runtime_emit: RuntimeEmit, rel: &str| {
         let out = tmp.join(format!("out-{runtime_emit:?}"));
         let result = build_project_with_options(
-            &project.join("src/Main.ipe"),
+            &project.join("package.ipe"),
             &out,
             &runtime,
             &BuildOptions {
