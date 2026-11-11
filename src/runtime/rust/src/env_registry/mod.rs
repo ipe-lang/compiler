@@ -28,6 +28,10 @@ pub enum Feature {
     Server,
     /// Read by the served `Ipe.Web` listener.
     Web,
+    /// Read by CSV serialisation.
+    Csv,
+    /// Read by the deny-private gate every outbound network dial passes.
+    Dial,
 }
 
 impl Feature {
@@ -39,6 +43,14 @@ impl Feature {
             Self::Log => cfg!(feature = "log"),
             Self::Server => cfg!(feature = "server"),
             Self::Web => cfg!(feature = "web"),
+            Self::Csv => cfg!(feature = "csv"),
+            Self::Dial => cfg!(any(
+                feature = "http_client",
+                feature = "websocket_client",
+                feature = "db",
+                feature = "db-sqlite",
+                feature = "db-postgres",
+            )),
         }
     }
 }
@@ -403,6 +415,104 @@ impl FlagKey {
     }
 }
 
+impl FlagKey {
+    /// Parses a raw lookup of this variable; `None` when unset.
+    ///
+    /// For a switch whose unset position depends on more than the variable.
+    ///
+    /// # Errors
+    ///
+    /// The refusal naming the variable when the value is set but spells no switch.
+    pub fn parse_explicit(
+        self,
+        raw: Result<String, std::env::VarError>,
+    ) -> Result<Option<EnvFlag>, EnvRefusal> {
+        judge(
+            self.entry.name,
+            Grammar::Flag,
+            self.entry.doc.class,
+            raw,
+            EnvFlag::parse,
+        )
+    }
+}
+
+/// A credential an operator sets; its text never reaches a message or a log line.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OperatorSecret(String);
+
+impl OperatorSecret {
+    /// The credential's text, for the one constant-time comparison that uses it.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for OperatorSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OperatorSecret(<redacted>)")
+    }
+}
+
+/// A credential variable's reading.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SecretSetting {
+    /// The variable is unset.
+    Unset,
+    /// The variable holds a non-empty Unicode value.
+    Set(OperatorSecret),
+    /// The variable is set but refused (empty or not Unicode): no credential of
+    /// its role is accepted.
+    Refused,
+}
+
+/// A credential variable: any non-empty Unicode value, never shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SecretKey(EnvEntry);
+
+impl SecretKey {
+    /// A credential variable named `name`; unset, its role has no credential.
+    #[must_use]
+    pub const fn new(name: &'static str, doc: Doc) -> Self {
+        Self(EnvEntry {
+            name,
+            grammar: Grammar::Secret,
+            default: DefaultValue::Text("unset"),
+            doc,
+        })
+    }
+
+    /// The registry entry.
+    #[must_use]
+    pub const fn entry(self) -> EnvEntry {
+        self.0
+    }
+
+    /// The variable's name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        self.0.name
+    }
+
+    /// Reads a raw lookup of this variable; a refused value reads [`SecretSetting::Refused`].
+    #[must_use]
+    pub fn parse(self, raw: Result<String, std::env::VarError>) -> SecretSetting {
+        let judged = judge(
+            self.0.name,
+            Grammar::Secret,
+            self.0.doc.class,
+            raw,
+            |value| Some(OperatorSecret(value.to_owned())),
+        );
+        match judged {
+            Ok(None) => SecretSetting::Unset,
+            Ok(Some(secret)) => SecretSetting::Set(secret),
+            Err(_) => SecretSetting::Refused,
+        }
+    }
+}
+
 /// A variable holding a decimal ceiling; its name and default are the ceiling's own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CeilingKey {
@@ -576,8 +686,7 @@ pub fn startup_check() -> Result<(), Vec<EnvRefusal>> {
         if let Err(refusal) = crate::log::startup_check() {
             refusals.push(refusal);
         }
-        #[cfg(feature = "web")]
-        crate::web::csrf::fix_origin_check();
+        security::fix_posture();
         #[cfg(feature = "server")]
         crate::server::fix_declared_names();
     }
@@ -801,5 +910,101 @@ mod tests {
             assert!(refused.is_empty(), "{refused:?}");
         }
         assert!(host_refusals("review.example.com").is_empty());
+    }
+
+    /// A registered variable read by name outside the registry, as `(file, name)`.
+    ///
+    /// The startup console banner's `IPE_CONSOLE_AUTH` read suppresses a link
+    /// only; it never decides access.
+    const LITERAL_READS_ALLOWED: [(&str, &str); 1] = [("telemetry.rs", "IPE_CONSOLE_AUTH")];
+
+    /// The registered names `text` reads by literal name, outside the registry.
+    fn literal_reads(text: &str) -> Vec<&'static str> {
+        registry()
+            .map(EnvEntry::name)
+            .filter(|name| {
+                [
+                    concat!("read_env_var", "(\""),
+                    concat!("read_env_var_os", "(\""),
+                ]
+                .iter()
+                .any(|read| text.contains(&format!("{read}{name}\")")))
+            })
+            .collect()
+    }
+
+    /// Every runtime source file outside the registry, as `(path under src/, text)`.
+    #[allow(clippy::expect_used)] // a test reading its own crate's source tree
+    fn runtime_sources() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut pending = vec![root.clone()];
+        let mut out = Vec::new();
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("the runtime source tree is readable") {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let rel = path
+                        .strip_prefix(&root)
+                        .expect("under src/")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    if !rel.starts_with("env_registry/") {
+                        let text = std::fs::read_to_string(&path).expect("a UTF-8 source file");
+                        out.push((rel, text));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// A registered variable is read only through its key: no runtime source
+    /// reads one by its literal name, so a lazy read a running program's
+    /// `System.setenv` could steer has no spelling to hide behind.
+    #[test]
+    fn registered_variables_are_read_only_through_their_keys() {
+        let sources = runtime_sources();
+        assert!(sources.len() > 50, "the scan sees the runtime sources");
+        let mut seen = Vec::new();
+        let mut stray = Vec::new();
+        for (file, text) in &sources {
+            for name in literal_reads(text) {
+                if LITERAL_READS_ALLOWED.contains(&(file.as_str(), name)) {
+                    seen.push((file.clone(), name));
+                } else {
+                    stray.push(format!("{file}: {name}"));
+                }
+            }
+        }
+        assert!(
+            stray.is_empty(),
+            "read these through their registered key: {stray:#?}"
+        );
+        for (file, name) in LITERAL_READS_ALLOWED {
+            assert!(
+                seen.iter().any(|(f, n)| f == file && *n == name),
+                "{file} no longer reads {name}; drop it from the list"
+            );
+        }
+    }
+
+    /// The scan names a literal read of a registered security switch.
+    #[test]
+    fn the_literal_read_scan_catches_a_posture_read() {
+        let text = concat!(
+            "let on = crate::system::",
+            "read_env_var",
+            "(\"IPE_CSRF\");"
+        );
+        assert_eq!(literal_reads(text), vec!["IPE_CSRF"]);
+        let os = concat!(
+            "crate::system::",
+            "read_env_var_os",
+            "(\"IPE_TRUSTED_PROXY\")"
+        );
+        assert_eq!(literal_reads(os), vec!["IPE_TRUSTED_PROXY"]);
+        assert!(literal_reads(concat!("read_env_var", "(\"IPE_CSRF_X\")")).is_empty());
     }
 }

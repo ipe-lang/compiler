@@ -9,6 +9,8 @@
 //! router — no extra process, same data. No panic vectors.
 
 use crate::csp::ends_raw_text_early;
+use crate::env_registry::SecretSetting;
+use crate::env_registry::security::{ConsoleAuthSetting, security_posture};
 use crate::telemetry::{self, ConsoleAuthMode, ConsoleAuthResolution, Posture};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
@@ -42,7 +44,7 @@ pub(crate) fn gate_allows(mount: &super::MountContext) -> bool {
     ) {
         return false;
     }
-    let resolved = ConsoleAuthResolution::from_env();
+    let resolved = console_auth_resolution();
     if resolved.mode == ConsoleAuthMode::Off {
         return false;
     }
@@ -244,23 +246,41 @@ impl RoleToken for MetricsToken {
     }
 }
 
+/// The console-auth setting under the process's `IPE_CONSOLE_AUTH` posture.
+///
+/// The variable is read once, before the program's first line; a refused value
+/// resolves to `Off`, the surface declared absent.
+pub fn console_auth_resolution() -> ConsoleAuthResolution {
+    let raw = match security_posture().console_auth {
+        ConsoleAuthSetting::Unset => telemetry::RawEnv::Absent,
+        ConsoleAuthSetting::Named(name) => telemetry::RawEnv::Value(name),
+        ConsoleAuthSetting::Refused => telemetry::RawEnv::NotUnicode,
+    };
+    ConsoleAuthResolution::resolve(
+        raw,
+        telemetry::BuildPosture::COMPILED,
+        Posture::from_env(),
+        telemetry::ProcessScope::current(),
+    )
+}
+
 /// One source in a credential's precedence chain.
 enum TokenSource {
-    /// Absent or empty: defer to the next source.
+    /// Absent: defer to the next source.
     Unset,
     /// A non-empty token.
     Set(String),
-    /// Present but not valid UTF-8: the role is refused, never deferred.
-    NotUnicode,
+    /// Present but refused: the role is refused, never deferred.
+    Refused,
 }
 
 impl TokenSource {
-    fn env(name: &str) -> Self {
-        match crate::system::read_env_var(name) {
-            Ok(token) if token.is_empty() => Self::Unset,
-            Ok(token) => Self::Set(token),
-            Err(std::env::VarError::NotPresent) => Self::Unset,
-            Err(std::env::VarError::NotUnicode(_)) => Self::NotUnicode,
+    /// The source an operator credential of the process's posture is.
+    fn operator(setting: &SecretSetting) -> Self {
+        match setting {
+            SecretSetting::Unset => Self::Unset,
+            SecretSetting::Set(token) => Self::Set(token.expose().to_owned()),
+            SecretSetting::Refused => Self::Refused,
         }
     }
 
@@ -286,13 +306,13 @@ enum Credential<T> {
 
 impl<T: RoleToken> Credential<T> {
     /// Walk `chain` in precedence order. The first `Set` source wins; a
-    /// `NotUnicode` source ahead of it makes the role `Unusable`.
+    /// `Refused` source ahead of it makes the role `Unusable`.
     fn resolve(chain: impl IntoIterator<Item = TokenSource>, wrap: fn(String) -> T) -> Self {
         for source in chain {
             match source {
                 TokenSource::Unset => {}
                 TokenSource::Set(token) => return Self::Configured(wrap(token)),
-                TokenSource::NotUnicode => return Self::Unusable,
+                TokenSource::Refused => return Self::Unusable,
             }
         }
         Self::Unset
@@ -319,12 +339,12 @@ impl<T: RoleToken> Credential<T> {
 fn admin_credential() -> Credential<AdminToken> {
     use crate::app_config::ConsoleTokenKind;
     Credential::resolve(
-        std::iter::once_with(|| TokenSource::env("IPE_ADMIN_TOKEN"))
+        std::iter::once_with(|| TokenSource::operator(&security_posture().admin_token))
             .chain(std::iter::once_with(|| {
                 TokenSource::in_code(ConsoleTokenKind::Admin)
             }))
             .chain(std::iter::once_with(|| {
-                TokenSource::env("IPE_CONSOLE_TOKEN")
+                TokenSource::operator(&security_posture().console_token)
             })),
         AdminToken,
     )
@@ -334,9 +354,9 @@ fn admin_credential() -> Credential<AdminToken> {
 fn metrics_credential() -> Credential<MetricsToken> {
     use crate::app_config::ConsoleTokenKind;
     Credential::resolve(
-        std::iter::once_with(|| TokenSource::env("IPE_METRICS_TOKEN")).chain(std::iter::once_with(
-            || TokenSource::in_code(ConsoleTokenKind::Metrics),
-        )),
+        std::iter::once_with(|| TokenSource::operator(&security_posture().metrics_token)).chain(
+            std::iter::once_with(|| TokenSource::in_code(ConsoleTokenKind::Metrics)),
+        ),
         MetricsToken,
     )
 }
@@ -394,9 +414,9 @@ impl Surface {
 
 /// The console-auth mode label for the `[ipe.console] … mode=<m>` startup log.
 ///
-/// Derived from the one `IPE_CONSOLE_AUTH` parse, `ConsoleAuthMode::from_env`.
+/// Derived from the one `IPE_CONSOLE_AUTH` reading, [`console_auth_resolution`].
 pub fn console_auth_mode_label() -> &'static str {
-    ConsoleAuthMode::from_env().label()
+    console_auth_resolution().mode.label()
 }
 
 /// Per-request auth gate for the console + metrics surface.
@@ -406,7 +426,7 @@ pub fn gate_blocked(
     surface: Surface,
     headers: &axum::http::HeaderMap,
 ) -> Option<axum::response::Response> {
-    gate_decision(ConsoleAuthMode::from_env(), surface, headers, || {
+    gate_decision(console_auth_resolution().mode, surface, headers, || {
         Credentials::from_env(surface)
     })
 }
@@ -568,19 +588,31 @@ fn is_cross_origin_ingest(head: &axum::http::request::Parts) -> bool {
         .is_cross_origin(crate::http_header::RequestAuthority::of(head))
 }
 
-/// The ingest gate over the process environment: the configured
-/// `IPE_INGEST_TOKEN` (env, then in-code `Console.ingestToken`) and
+/// The ingest gate over the process's posture: the configured
+/// `IPE_INGEST_TOKEN` (the operator's, then in-code `Console.ingestToken`) and
 /// [`telemetry::dev_surface_from_env`].
+///
+/// A refused operator token admits no push.
 fn ingest_token_blocked(head: &axum::http::request::Parts) -> Option<axum::response::Response> {
-    let want = crate::system::read_env_var("IPE_INGEST_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
-        // In-code `Console.ingestToken` (a sealed `Secret`) below the env
-        // override — env wins; the token is revealed only here, never logged.
-        .or_else(|| {
+    let want = match &security_posture().ingest_token {
+        SecretSetting::Set(token) => Some(token.expose().to_owned()),
+        SecretSetting::Refused => {
+            return Some(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "observability ingest: IPE_INGEST_TOKEN is refused",
+                )
+                    .into_response(),
+            );
+        }
+        // In-code `Console.ingestToken` (a sealed `Secret`) below the
+        // operator's — the operator wins; the token is revealed only here,
+        // never logged.
+        SecretSetting::Unset => {
             crate::app_config::resolve_console_token(crate::app_config::ConsoleTokenKind::Ingest)
                 .filter(|t| !t.is_empty())
-        });
+        }
+    };
     ingest_decision(
         head,
         want.as_deref(),

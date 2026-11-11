@@ -3776,17 +3776,13 @@ fn session_set_cookie(
 /// client-supplied header must never be trusted by default — an operator opts
 /// in only when a real reverse proxy sits in front of this process).
 ///
-/// Snapshotted once (env is stable at process start; same rationale as
-/// `csrf::cookies_secure()` — avoids a per-request global env-lock read).
+/// Read from the process's security posture, fixed before the program's
+/// first line.
 #[cfg(feature = "web")]
 fn trust_proxy_headers() -> bool {
-    use std::sync::OnceLock;
-    static TRUST: OnceLock<bool> = OnceLock::new();
-    *TRUST.get_or_init(|| {
-        crate::system::read_env_var("IPE_TRUSTED_PROXY")
-            .map(|v| !v.is_empty() && v != "0" && v != "false")
-            .unwrap_or(false)
-    })
+    crate::env_registry::security::security_posture()
+        .trusted_proxy
+        .trusts()
 }
 
 /// Request-scoped HTTPS detection, parameterised on the trust decision so it's
@@ -8205,7 +8201,7 @@ where
     // mounted, so its effective posture/mode/source is always logged once.
     crate::system::emit_runtime_log(
         "console",
-        &crate::telemetry::ConsoleAuthResolution::from_env().startup_message(),
+        &console::console_auth_resolution().startup_message(),
     );
 
     // When `http_client` is active and the pre-built console binary is
@@ -11481,28 +11477,30 @@ mod security_env_tests {
 
     // ── IPE_WEB_CSRF_ORIGIN_CHECK ─────────────────────────────────────────────
     //
-    // `origin_check_enabled()` is memoized in a `OnceLock`, so we cannot test
-    // it via the production `origin_mismatch` path in the same process run. We
-    // test the env-read layer directly via `read_env_var`.
+    // The switch is part of the process's security posture, fixed once; its
+    // name is read through the registered key.
 
     #[test]
     fn csrf_origin_check_new_name_takes_effect() {
-        crate::system::locked_remove_var("IPE_WEB_CSRF_ORIGIN_CHECK");
-
-        // (a) set → "on"
-        crate::system::locked_set_var("IPE_WEB_CSRF_ORIGIN_CHECK", "on");
+        use crate::env_grammar::EnvFlag;
+        use crate::env_registry::security::WEB_CSRF_ORIGIN_CHECK;
+        let posture = |pairs: &'static [(&str, &str)]| {
+            crate::env_registry::security::SecurityPosture::from_lookup(|name| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned())
+                    .ok_or(std::env::VarError::NotPresent)
+            })
+        };
+        assert_eq!(WEB_CSRF_ORIGIN_CHECK.name(), "IPE_WEB_CSRF_ORIGIN_CHECK");
+        // (a) set → "off" takes effect.
         assert_eq!(
-            crate::system::read_env_var("IPE_WEB_CSRF_ORIGIN_CHECK").as_deref(),
-            Ok("on"),
-            "IPE_WEB_CSRF_ORIGIN_CHECK must be read"
+            posture(&[("IPE_WEB_CSRF_ORIGIN_CHECK", "off")]).csrf_origin_check,
+            EnvFlag::Off
         );
-        crate::system::locked_remove_var("IPE_WEB_CSRF_ORIGIN_CHECK");
-
-        // (b) unset → Err (origin check stays OFF — secure default)
-        assert!(
-            crate::system::read_env_var("IPE_WEB_CSRF_ORIGIN_CHECK").is_err(),
-            "unset → Err; origin check defaults to OFF"
-        );
+        // (b) unset → on, the secure default.
+        assert_eq!(posture(&[]).csrf_origin_check, EnvFlag::On);
     }
 
     // ── IPE_WEB_FRAME_ANCESTORS ───────────────────────────────────────────────
