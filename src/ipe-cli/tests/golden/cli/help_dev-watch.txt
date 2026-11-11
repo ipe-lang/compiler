@@ -12,7 +12,7 @@ exit: 0
 
   Options:
     [--out <dir>]      put build output under <dir> (default: out/ in the project); on Windows a drive or `\\server\share` path is accepted, a device (`\\.\pipe`), object-namespace (`\\?\GLOBALROOT`), or volume-GUID (`\\?\Volume{..}`) path is not
-    [--runtime <dir>]  vendor the Ipê runtime from <dir>
+    [--runtime <dir>]  build against the Ipê runtime crate at <dir> (same as IPE_RUNTIME_DIR)
     [--port <n>]       serve on port <n> (default: 8000)
     [--debugger]       compile the in-app time-travelling debugger overlay into the served app
     [--reset-state]    force every returning session to a fresh init instead of preserving prior state

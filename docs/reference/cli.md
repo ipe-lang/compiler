@@ -336,7 +336,7 @@ ipe dev build [<dir>] [<shape>] [<runtime>] [<host>] [<target>]
 **Flags:**
 
 - `[--out <dir>]` — put build output under <dir> (default: out/ in the project); on Windows a drive or `\\server\share` path is accepted, a device (`\\.\pipe`), object-namespace (`\\?\GLOBALROOT`), or volume-GUID (`\\?\Volume{..}`) path is not
-- `[--runtime <dir>]` — vendor the Ipê runtime from <dir>
+- `[--runtime <dir>]` — build against the Ipê runtime crate at <dir> (same as IPE_RUNTIME_DIR)
 - `[--emit-ir]` — also emit the intermediate representation
 - `[--fix]` — apply machine-applicable fixes before building
 - `[--static]` — produce a statically linked binary
@@ -360,7 +360,7 @@ ipe dev run [<dir>]
 **Flags:**
 
 - `[--out <dir>]` — put build output under <dir> (default: out/ in the project); on Windows a drive or `\\server\share` path is accepted, a device (`\\.\pipe`), object-namespace (`\\?\GLOBALROOT`), or volume-GUID (`\\?\Volume{..}`) path is not
-- `[--runtime <dir>]` — vendor the Ipê runtime from <dir>
+- `[--runtime <dir>]` — build against the Ipê runtime crate at <dir> (same as IPE_RUNTIME_DIR)
 - `[--static]` — produce a statically linked binary
 - `[--target <wasm|wasi|triple>]` — compile for `wasm` (the browser bundle, which `web client` already derives; any other delivery refuses it), `wasi` (a wasm32-wasip1 module), or a musl-static native <triple>; a native triple needs --static on `dev build` and `dev run`; `dev run` cannot execute `wasm`
 - `[--allocator <auto|system|dlmalloc|talc|mimalloc>]` — select the global allocator (default: auto); `system` is the target libc's malloc, which on musl is several times slower than the default on allocation-heavy work
@@ -385,7 +385,7 @@ ipe dev watch [<dir>]
 **Flags:**
 
 - `[--out <dir>]` — put build output under <dir> (default: out/ in the project); on Windows a drive or `\\server\share` path is accepted, a device (`\\.\pipe`), object-namespace (`\\?\GLOBALROOT`), or volume-GUID (`\\?\Volume{..}`) path is not
-- `[--runtime <dir>]` — vendor the Ipê runtime from <dir>
+- `[--runtime <dir>]` — build against the Ipê runtime crate at <dir> (same as IPE_RUNTIME_DIR)
 - `[--port <n>]` — serve on port <n> (default: 8000)
 - `[--debugger]` — compile the in-app time-travelling debugger overlay into the served app
 - `[--reset-state]` — force every returning session to a fresh init instead of preserving prior state
@@ -409,7 +409,7 @@ ipe release build [<dir>] [<shape>] [<runtime>] [<host>]
 - `[--target <triple>]` — a musl-static native <triple> (default: x86_64-unknown-linux-musl). The browser bundle is `web client`, never a target; a `web client` or app-bundle delivery takes no target.
 - `[--static]` — produce a statically linked binary
 - `[--emit-permissions <ios|macos|android>]` — read-only: print the OS-permission declarations the app's accepted web capabilities derive on the platform, and build nothing
-- `[--runtime <dir>]` — vendor the Ipê runtime source from <dir>
+- `[--runtime <dir>]` — build against the Ipê runtime crate at <dir> (same as IPE_RUNTIME_DIR); a release refuses a runtime other than the embedded one
 - `[--bundle]` — native-bearing only: multi-file opt-out — wrapper + app + profile as siblings (app binary can be run directly, bypassing the sandbox)
 - `[--embed]` — native-bearing only: default single self-jailing binary (app + profile fused into wrapper)
 - `[--plain|--json]` — the layout of a refusal: the terse flush-left record or one stable JSON object
@@ -428,7 +428,7 @@ ipe release run [<dir>|<artifact-dir>]
 
 - `[--out <dir>]` — put the artifact under <dir>/release/<delivery>/ (default: out/ in the project)
 - `[--target <triple>]` — a musl-static native <triple> (default: x86_64-unknown-linux-musl). The browser bundle is `web client`, never a target; a `web client` or app-bundle delivery takes no target.
-- `[--runtime <dir>]` — vendor the Ipê runtime source from <dir>
+- `[--runtime <dir>]` — build against the Ipê runtime crate at <dir> (same as IPE_RUNTIME_DIR); a release refuses a runtime other than the embedded one
 - `[-- <args>...]` — forward <args> to the artifact
 
 ### `ipe release eject`
@@ -444,5 +444,5 @@ ipe release eject [<dir>]
 **Flags:**
 
 - `--out <dir>` — write the standalone project to <dir>, which must be absent or empty and outside out/, .ipe/ and any other ipe-owned tree (required)
-- `[--runtime <dir>]` — vendor the Ipê runtime source from <dir>
+- `[--runtime <dir>]` — build against the Ipê runtime crate at <dir> (same as IPE_RUNTIME_DIR); a release refuses a runtime other than the embedded one
 
