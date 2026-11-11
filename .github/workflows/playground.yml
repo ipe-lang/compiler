@@ -101,7 +101,7 @@ jobs:
         shell: bash
         env:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
-        run: cargo test -p ipe-wasm --target wasm32-unknown-unknown --release --test nesting_ceiling | python3 tools/scripts/wasm-test/wasm_test_count.py 3
+        run: cargo test -p ipe-wasm --target wasm32-unknown-unknown --release --test nesting_ceiling | python3 tools/scripts/wasm-test/wasm_test_count.py 5
 
       - name: Build playground-jail-runner
         run: cargo build -p playground-jail-runner

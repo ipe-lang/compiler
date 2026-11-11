@@ -40,4 +40,4 @@ cells:
     platform: wasm32-unknown-unknown
     features: []
     owner: build
-    expect_tests: 3
+    expect_tests: 5
