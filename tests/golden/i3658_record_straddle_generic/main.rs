@@ -48,23 +48,6 @@ impl<T1: RetainedBytes> RetainedBytes for RecQ<T1> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct RecQ2<T1> {
-    q: (T1, T1),
-}
-
-impl<T1: IpeStringify> IpeStringify for RecQ2<T1> {
-    fn ipe_show(&self) -> String {
-        format!("{{{}}}", IpeStringify::ipe_show(&self.q))
-    }
-}
-
-impl<T1: RetainedBytes> RetainedBytes for RecQ2<T1> {
-    fn retained_bytes(&self) -> Option<Bytes> {
-        Bytes::inline::<Self>()?.plus(&self.q)
-    }
-}
-
 pub use ipe_runtime::error::IpeError;
 
 pub fn str_err(s: &str) -> IpeError {
@@ -281,7 +264,7 @@ pub fn main_f<T1: Clone>(r: RecQ<T1>) -> i64 {
     1i64
 }
 
-pub fn main_g<T1: Clone>(r: RecQ2<T1>) -> i64 {
+pub fn main_g<T1: Clone>(r: RecQ<(T1, T1)>) -> i64 {
     let _ipe_recursion_guard = crate::recursion_guard();
     2i64
 }
@@ -289,9 +272,10 @@ pub fn main_g<T1: Clone>(r: RecQ2<T1>) -> i64 {
 pub fn ipe_main() -> IpeTask<()> {
     let _ipe_recursion_guard = crate::recursion_guard();
     io_println(string_from_int(ipe_runtime::math::ipe_int_add(
-        ipe_runtime::math::ipe_int_add(crate::main_f(RecQ2 { q: (1i64, 1i64) }), crate::main_g(
-            RecQ2 { q: (3i64, 4i64) },
-        )),
+        ipe_runtime::math::ipe_int_add(
+            crate::main_f(RecQ { q: (1i64, 1i64) }),
+            crate::main_g(RecQ { q: (3i64, 4i64) }),
+        ),
         crate::main_f(RecQ { q: 5i64 }),
     )))
 }

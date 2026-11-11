@@ -89,7 +89,7 @@ use ipe_diagnostics::{DResult, Diagnostic, NameError, RustNameFoldKind, Span};
 use ipe_intern::{Interner, Symbol};
 use ipe_ir::{
     CallPin, Callee, EnumTraits, Expr, FuncId, IrType, KernelFn, ModPath, Program,
-    RuntimeBridgedEnum, TypeDef, UserPin, collect_generics,
+    RuntimeBridgedEnum, TypeDef, UserPin,
 };
 
 pub use emit_doc::{SweepDivergence, native_vs_legacy_sweep};
@@ -4404,129 +4404,6 @@ fn type_reaches_enum(
         }
         // `Ui { ctor, msg }` — descend into `msg`.
         IrType::Ui { msg, .. } => type_reaches_enum(msg, target, enums, visited),
-    }
-}
-
-/// Does this type contain an [`IrType::Generic`] anywhere (a field that is — or
-/// structurally carries — a type variable)?
-fn contains_generic(ty: &IrType) -> bool {
-    match ty {
-        IrType::Generic(_) => true,
-        IrType::Tuple(elems) => elems.iter().any(contains_generic),
-        IrType::Record(map) => map.values().any(contains_generic),
-        IrType::Fun(params, ret)
-        | IrType::SharedFun(params, ret)
-        | IrType::FnOnceChain(params, ret) => {
-            params.iter().any(contains_generic) || contains_generic(ret)
-        }
-        IrType::Enum { args, .. } => args.iter().any(contains_generic),
-        IrType::Maybe(elem) | IrType::List(elem) => contains_generic(elem),
-        IrType::Result(err, ok) => contains_generic(err) || contains_generic(ok),
-        IrType::Dict(k, v) => contains_generic(k) || contains_generic(v),
-        IrType::Set(a) => contains_generic(a),
-        IrType::Decoder(inner) | IrType::Task(inner) | IrType::Cmd(inner) | IrType::Sub(inner) => {
-            contains_generic(inner)
-        }
-        IrType::Int
-        | IrType::Float
-        | IrType::Bool
-        | IrType::Str
-        | IrType::Char
-        | IrType::Unit
-        | IrType::Bytes
-        | IrType::Json
-        // `Db` is an opaque monomorphic handle — no generic parameters.
-        | IrType::Db
-        // Opaque server types are monomorphic — no generic parameters.
-        | IrType::ServerRequest
-        | IrType::ServerResponse
-        | IrType::ServerRoute
-        | IrType::ServerCookie
-        // `StreamWriter` is monomorphic — no generic parameters.
-        | IrType::StreamWriter
-        // `HttpRequest` is monomorphic — no generic parameters.
-        | IrType::HttpRequest
-        // `Regex` is a monomorphic opaque handle — no generic parameters.
-        | IrType::Regex
-        // `WsHandle` / `WsServerCfg` are monomorphic — no generic parameters.
-        | IrType::WebSocketServer
-        | IrType::WebSocketServerCfg
-        // nullary plain types and the opaque live request handle are
-        // monomorphic.
-        | IrType::UiPlain(_)
-        | IrType::WebReq
-        | IrType::SessionHandle
-        // `Order` is monomorphic — no generic parameters.
-        // `HttpMethod` is monomorphic — no generic parameters.
-        // `Decimal` is monomorphic — no generic parameters.
-        // `BackoffStrategy` is monomorphic — no generic parameters.
-        | IrType::BackoffStrategy
-        | IrType::Order
-        | IrType::HttpMethod
-        | IrType::Decimal
-        | IrType::ErrorKind
-        | IrType::Error
-        | IrType::ErrorDetails
-        // Nominal error-payload leaves (SEAL fix) — monomorphic
-        // runtime structs, same classification as `Error`/`ErrorDetails`.
-        | IrType::ErrorInfo
-        | IrType::PanicInfo
-        | IrType::TypeInfo
-        // `SqlFragment` is monomorphic — no generic parameters.
-        // `Secret` is monomorphic — no generic parameters.
-        | IrType::SqlFragment
-        | IrType::Secret
-        | IrType::Path
-        // `Url` is a monomorphic opaque wrapper — no generic parameters.
-        | IrType::Url
-        | IrType::UrlRelative
-        // `Dsn` is a monomorphic opaque wrapper — no generic parameters.
-        | IrType::Dsn
-        | IrType::DbLocation
-        | IrType::Connection
-        | IrType::ConnReadOnly
-        | IrType::ConnReadWrite
-        | IrType::Setting | IrType::ShapeWeb | IrType::ShapeWebView | IrType::ShapeTerminal
-        // Process-run-with cfg + Cache config / stats + Csv document are
-        // monomorphic — no generic parameters.
-        | IrType::ProcessRunWithCfg
-        | IrType::ProcessRunInPtyCfg
-        | IrType::CacheCfg
-        | IrType::WebSocketClientCfg
-        | IrType::CacheStats
-        | IrType::CsvDoc
-        // Ipe.Email records + provider ADT are monomorphic — no generic
-        // parameters.
-        | IrType::EmailMessage
-        | IrType::EmailAttachment
-        | IrType::EmailSesConfig
-        | IrType::EmailSmtpConfig
-        | IrType::EmailProvider
-        // Typed security newtypes are monomorphic opaque wrappers — no generic
-        // parameters.
-        | IrType::CryptoKey
-        | IrType::CryptoMac
-        | IrType::EmailAddress
-        // `Locale` is monomorphic — no generic parameters.
-        | IrType::Locale
-        // `Principal` is monomorphic — no generic parameters.
-        | IrType::Principal
-        // `AuthConfig` / `TokenSource` are monomorphic — no generic parameters.
-        | IrType::AuthConfig
-        | IrType::TokenSource
-        // Shape opaque app leaves — monomorphic, no generic parameters.
-        | IrType::WebApp | IrType::TuiApp | IrType::CliApp | IrType::WorkerApp
-        // A row variable is a SEPARATE row generic (`R{n}`), never an ordinary
-        // `T{n}` record-struct parameter, and never appears inside a record-
-        // struct field. It contributes no `<T>` clause here.
-        | IrType::RowGeneric(_) => false,
-        // `WebRoute page` is parametric on `page`; check if it carries a
-        // generic.
-        IrType::WebRoute(page) => contains_generic(page),
-        IrType::CustomElement { down, up } => contains_generic(down) || contains_generic(up),
-        // `Ui { ctor, msg }` is parametric on `msg`; check if `msg` carries
-        // a generic.
-        IrType::Ui { msg, .. } => contains_generic(msg),
     }
 }
 
