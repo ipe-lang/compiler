@@ -6,9 +6,9 @@ description: >-
   WebKitGTK/GStreamer runtime libraries as hard dependencies, a download that
   varies from seconds to tens of minutes with the mirror. The fetched archives
   are cached (only `main` saves, as everywhere else) so a restored run installs
-  from disk and only a cold or stale cache pays the mirror; each apt call is
-  capped at 6 minutes, two attempts, so even that case stays inside the job
-  budget.
+  from disk and only a cold or stale cache pays the mirror; the install goes
+  through the `apt-install` action, whose bounded attempts keep even that case
+  inside the job budget.
 
 runs:
   using: composite
@@ -24,18 +24,11 @@ runs:
         path: ${{ runner.temp }}/apt-archives
         key: ${{ runner.os }}-${{ runner.arch }}-apt-webview-${{ steps.apt-image.outputs.image }}
     - name: Install webview link deps (wry/tao — GLib/GTK/WebKit)
-      shell: bash
-      run: |
-        mkdir -p "$RUNNER_TEMP/apt-archives/partial"
-        for attempt in 1 2; do
-          if sudo timeout 360 apt-get -o Acquire::Retries=3 update \
-            && sudo timeout 360 apt-get -o Acquire::Retries=3 -o Dir::Cache::archives="$RUNNER_TEMP/apt-archives" install -y --no-install-recommends libwebkit2gtk-4.1-dev libsoup-3.0-dev; then
-            exit 0
-          fi
-          echo "apt attempt $attempt did not finish within its 6 minute cap"
-          sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' /etc/apt/apt-mirrors.txt
-        done
-        exit 1
+      uses: ./.github/actions/apt-install
+      with:
+        packages: libwebkit2gtk-4.1-dev libsoup-3.0-dev
+        archives: ${{ runner.temp }}/apt-archives
+        no-install-recommends: "true"
     - name: Save webview link dep archives
       if: github.ref == 'refs/heads/main' && steps.apt-cache.outputs.cache-hit != 'true'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
