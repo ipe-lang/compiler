@@ -370,7 +370,8 @@ static HAND_TABLE: &[EnvVar] = &[
         purpose: "Per-process control token for the dev-only appearance-hot-swap \
                   endpoint. `ipe dev watch` sets it and sends it as `X-Ipe-Hot-Token`; a \
                   request whose token does not constant-time-match is refused. \
-                  Dev-only; the endpoint is never mounted in a release build.",
+                  Dev-only; the endpoint is never mounted in a release build. Read once \
+                  at process start.",
         subsystem: Subsystem::Build,
         class: Class::Secret,
     },
@@ -792,7 +793,7 @@ static HAND_TABLE: &[EnvVar] = &[
                   binaries read as development, `ipe release` artifacts as production. \
                   An `ipe release` artifact is production whatever this says: a dev \
                   marker there opens no dev-only surface and logs one notice. Also \
-                  accepted as bare `ENV`.",
+                  accepted as bare `ENV`. Read once at process start.",
         subsystem: Subsystem::Observability,
         class: Class::Tunable,
     },
