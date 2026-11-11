@@ -7,7 +7,7 @@
 //! least general generalization (anti-unification) of every member, so each
 //! member instantiates it through `match_template`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map};
 
 use ipe_diagnostics::{DResult, Diagnostic};
 use ipe_intern::Symbol;
@@ -262,10 +262,10 @@ fn instance_of<'a>(
     subst: &mut BTreeMap<Symbol, &'a IrType>,
 ) -> bool {
     match general {
-        IrType::Generic(sym) => match subst.get(sym) {
-            Some(bound) => *bound == specific,
-            None => {
-                subst.insert(*sym, specific);
+        IrType::Generic(sym) => match subst.entry(*sym) {
+            btree_map::Entry::Occupied(bound) => *bound.get() == specific,
+            btree_map::Entry::Vacant(slot) => {
+                slot.insert(specific);
                 true
             }
         },
@@ -277,10 +277,10 @@ fn instance_of<'a>(
                 .all(|(g, s)| instance_of(g, s, subst)),
             _ => false,
         },
-        _ => match ipe_ir::paired_children(general, specific) {
-            Some(mut pairs) => pairs.all(|(g, s)| instance_of(g, s, subst)),
-            None => general == specific,
-        },
+        _ => ipe_ir::paired_children(general, specific).map_or_else(
+            || general == specific,
+            |mut pairs| pairs.all(|(g, s)| instance_of(g, s, subst)),
+        ),
     }
 }
 
