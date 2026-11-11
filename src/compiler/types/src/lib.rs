@@ -2922,11 +2922,11 @@ pub(crate) fn duty_refusal(
     refusal_naming(interner, owed, stated, ty, blamed, namer)
 }
 
-/// Whether the obligation `owes` includes the duty `owed`.
-fn imposes(owes: TyBounds, owed: Owed) -> bool {
+/// Whether the obligation `obligation` includes the duty `duty`.
+fn imposes(obligation: TyBounds, duty: Owed) -> bool {
     TyBounds::ALL_BITS
         .iter()
-        .any(|bit| owes.union(*bit) == owes && owed_of_bit(*bit) == Some(owed))
+        .any(|bit| obligation.union(*bit) == obligation && owed_of_bit(*bit) == Some(duty))
 }
 
 /// The origin as a refusal states it: the kernel as the user reads it

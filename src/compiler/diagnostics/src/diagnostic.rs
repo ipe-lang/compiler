@@ -3482,6 +3482,7 @@ fn mismatch_help(definition: Option<Span>, unmet_class: Option<TypeClass>) -> Ve
     lines
 }
 
+#[allow(clippy::too_many_lines)] // one arm per TypeError variant — mechanical dispatch
 fn type_help(msg: &TypeError) -> Vec<HelpLine> {
     match msg {
         TypeError::TypeMismatch {
