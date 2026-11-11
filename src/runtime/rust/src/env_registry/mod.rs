@@ -503,8 +503,16 @@ pub enum SecretSetting {
 }
 
 /// A credential variable: any non-empty Unicode value, never shown.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// The key holds the variable's name, never its value; `Debug` shows the name only.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SecretKey(EnvEntry);
+
+impl std::fmt::Debug for SecretKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SecretKey").field(&self.0.name).finish()
+    }
+}
 
 impl SecretKey {
     /// A credential variable named `name`; unset, its role has no credential.

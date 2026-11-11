@@ -242,7 +242,9 @@ pub enum ConsoleAuthSetting {
 }
 
 /// The security posture the operator's environment sets, read once per process.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Debug` masks every credential setting, whatever its reading.
+#[derive(Clone, PartialEq, Eq)]
 pub struct SecurityPosture {
     /// `IPE_TRUSTED_PROXY`.
     pub trusted_proxy: ProxyTrust,
@@ -265,6 +267,18 @@ pub struct SecurityPosture {
     /// `IPE_INGEST_TOKEN`.
     pub ingest_token: SecretSetting,
 }
+
+crate::redact::redacting_debug!(SecurityPosture {
+    shown: [
+        trusted_proxy,
+        csrf,
+        csrf_origin_check,
+        csv_formula_guard,
+        deny_private,
+        console_auth,
+    ],
+    masked: [admin_token, console_token, metrics_token, ingest_token],
+});
 
 impl SecurityPosture {
     /// The posture `lookup` reports, each variable judged by its registered grammar.
@@ -392,7 +406,10 @@ mod tests {
     fn credentials_are_never_shown() {
         let posture =
             SecurityPosture::from_lookup(lookup(&[("IPE_ADMIN_TOKEN", "hunter2-secret")]));
-        assert!(!format!("{posture:?}").contains("hunter2"));
+        let shown = format!("{posture:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(!shown.contains("Set("), "a set credential's reading shown: {shown}");
+        assert_eq!(format!("{INGEST_TOKEN:?}"), "SecretKey(\"IPE_INGEST_TOKEN\")");
         crate::system::locked_set_var(INGEST_TOKEN.name(), "hunter2-secret");
         let refused = INGEST_TOKEN.entry().check();
         crate::system::locked_remove_var(INGEST_TOKEN.name());
