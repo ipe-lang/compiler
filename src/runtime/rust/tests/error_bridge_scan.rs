@@ -175,19 +175,21 @@ const UNCLASSIFIED_SITES: &[Unclassified] = &[
                  E3 classifies each variant and removes this entry",
     },
     Unclassified {
-        file: "task.rs",
-        function: "parallel_child_failure",
-        needle: "IpeError::unexpected",
-        count: 1,
-        reason: "a `Task.parallel` child cancelled outside any guarded foreign call \
-                 (a panicked child routes through `ipe_error_from_unwind`)",
-    },
-    Unclassified {
         file: "threads.rs",
         function: "into_error",
         needle: "IpeError::unexpected",
+        count: 2,
+        reason: "panic in runtime blocking work, or a joined task cancelled outside \
+                 its joiner (a panicked task routes through `ipe_error_from_unwind`): \
+                 a runtime defect",
+    },
+    Unclassified {
+        file: "threads.rs",
+        function: "to_ipe_error",
+        needle: "IpeError::unexpected",
         count: 1,
-        reason: "panic or cancel in runtime blocking work: a runtime defect",
+        reason: "a detached Ipê-owned task panicked outside any trip: a defect, \
+                 answered to its owner by role and correlation id only",
     },
     Unclassified {
         file: "js_port.rs",
