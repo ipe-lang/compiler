@@ -717,6 +717,9 @@ code! {
     /// an app sets `onNavigate` but its Model has no `page` field, so nothing
     /// would ever call it.
     IPE_L0162 = "IPE-L0162", "`onNavigate` is set but the Model has no `page` field", "IPE-L0162";
+    /// a view spells, as a literal, an attribute name the runtime owns (an
+    /// `ipe-*` marker, `nonce`, or any `data-ipe-*` name such as `data-ipe-path`).
+    IPE_L0163 = "IPE-L0163", "a literal attribute name is reserved for the runtime", "IPE-L0163";
     /// expression nests too deeply for the backend
     IPE_L0200 = "IPE-L0200", "expression nests too deeply for the backend", "IPE-L0200";
     /// a type nests too deeply for the backend

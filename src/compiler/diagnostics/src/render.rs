@@ -1085,6 +1085,10 @@ fn lower_prose(msg: &LowerError) -> String {
         LowerError::OnNavigateWithoutPage => {
             "`onNavigate` is set, but your Model has no `page` field to route.".to_string()
         }
+        LowerError::ReservedAttributeName { .. } => {
+            "This attribute name belongs to the Ipê runtime, so it would never reach the page."
+                .to_string()
+        }
         LowerError::RouteParamUnsupportedType { .. } => {
             "One of this route's fields has a type I can't read out of a URL.".to_string()
         }
@@ -2432,6 +2436,9 @@ fn lower_label(msg: &LowerError) -> String {
         }
         LowerError::OnNavigateWithoutPage => {
             "`onNavigate` is set but the Model has no `page` field".to_string()
+        }
+        LowerError::ReservedAttributeName { call, name } => {
+            format!("`{call}` names the attribute `{name}`, which the runtime reserves")
         }
         LowerError::RouteParamUnsupportedType {
             field_index,

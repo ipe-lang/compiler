@@ -1208,16 +1208,48 @@ pub(crate) const HANDLER_ID_ATTR: &str = "data-ipe-hid";
 /// admits styles by.
 const NONCE_ATTR: &str = "nonce";
 
+/// The attribute a page would use to name its own URL.
+///
+/// A routed app's URL is the route of its committed page, written by the
+/// runtime alone; a program-built one names no location, so it is reserved and
+/// never reaches the page.
+const PAGE_PATH_ATTR: &str = "data-ipe-path";
+
+/// The attribute-name namespace the runtime's own markers live in.
+///
+/// Runtime-rendered markers (`data-ipe-hid`, the `Ipe.Ui` style and event
+/// markers) and the client's own state flags are spelled under it, so no
+/// program spells a literal name in it.
+const RUNTIME_ATTR_NAMESPACE: &[u8] = b"data-ipe-";
+
+/// True when `name` starts with `prefix`, compared ASCII-case-insensitively.
+fn has_ascii_prefix(name: &str, prefix: &[u8]) -> bool {
+    name.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
 /// True for a name only the runtime writes, compared ASCII-case-insensitively.
 ///
 /// That is a name starting with [`RESERVED_ATTR_PREFIX`], [`HANDLER_ID_ATTR`],
-/// or [`NONCE_ATTR`].
+/// [`NONCE_ATTR`], or [`PAGE_PATH_ATTR`].
 fn is_reserved_attr_name(name: &str) -> bool {
-    name.as_bytes()
-        .get(..RESERVED_ATTR_PREFIX.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_ATTR_PREFIX))
+    has_ascii_prefix(name, RESERVED_ATTR_PREFIX)
         || name.eq_ignore_ascii_case(HANDLER_ID_ATTR)
         || name.eq_ignore_ascii_case(NONCE_ATTR)
+        || name.eq_ignore_ascii_case(PAGE_PATH_ATTR)
+}
+
+/// True for an attribute name a program may not spell as a literal.
+///
+/// That is every reserved name but the exact `ipe-key` the stamper reads a
+/// key from, and every name in [`RUNTIME_ATTR_NAMESPACE`]. The compiler
+/// refuses a literal attribute name through this predicate, so the
+/// compile-time refusal and the render sink share one reserved set.
+#[must_use]
+pub fn is_runtime_owned_attr_name(name: &str) -> bool {
+    (name != KEY_ATTR && is_reserved_attr_name(name))
+        || has_ascii_prefix(name, RUNTIME_ATTR_NAMESPACE)
 }
 
 /// A validated HTML **attribute** name (parse-don't-validate). The ONLY way to
@@ -1623,18 +1655,29 @@ pub fn html_render_<M>(node: Html<M>) -> String {
 /// `Ipe.Html.Attributes.{class,id,href,…}` and the generic
 /// `attribute k v` — a string-valued HTML attribute. The key is a literal for
 /// the fixed-key builders and a runtime string for `attribute`; both are gated
-/// at the render sink.
+/// at the render sink. A runtime-owned name
+/// ([`is_runtime_owned_attr_name`]) builds no attribute: the program never
+/// sets a marker the runtime or its client reads.
 #[must_use]
 pub fn html_named_attr_<M>(key: String, val: String) -> Attribute<M> {
-    Attribute::Attr(key, val)
+    if is_runtime_owned_attr_name(&key) {
+        Attribute::NoAttr
+    } else {
+        Attribute::Attr(key, val)
+    }
 }
 
 /// `Ipe.Html.Attributes.{checked,disabled,…}` and the generic
 /// `boolAttribute k b` — a boolean HTML attribute. Renders as `key="true"`
 /// when `on` is `true`; omitted when `false` (via the `BoolAttr` render path).
+/// A runtime-owned name builds no attribute, as in [`html_named_attr_`].
 #[must_use]
 pub fn html_bool_named_attr_<M>(key: String, on: bool) -> Attribute<M> {
-    Attribute::BoolAttr(key, on)
+    if is_runtime_owned_attr_name(&key) {
+        Attribute::NoAttr
+    } else {
+        Attribute::BoolAttr(key, on)
+    }
 }
 
 /// `Ipe.Html.Attributes.noAttr` — the identity attribute (renders nothing).
@@ -3383,6 +3426,56 @@ mod tests {
         assert!(SafeAttrName::parse("data-ipe-x").is_some());
     }
 
+    /// A program-built page-path attribute, in any ASCII case, reaches no sink.
+    #[test]
+    fn reserved_path_attr_dropped() {
+        for name in [PAGE_PATH_ATTR, "DATA-IPE-PATH", "Data-Ipe-Path"] {
+            assert!(SafeAttrName::parse(name).is_none(), "{name}");
+            assert!(safe_patch_attr(name, "/planted").is_none(), "{name}");
+            let t: Html<()> = Html::HElement(
+                "div".into(),
+                vec![Attribute::Attr(name.into(), "/planted".into())],
+                vec![],
+            );
+            let low = render_html(&t).to_ascii_lowercase();
+            assert!(
+                !low.contains("data-ipe-path") && !low.contains("/planted"),
+                "{low}"
+            );
+        }
+        assert!(SafeAttrName::parse("data-ipe-paths").is_some());
+    }
+
+    /// The literal names the compiler refuses are the reserved set, less the
+    /// exact `ipe-key`, plus the whole `data-ipe-` namespace.
+    #[test]
+    fn runtime_owned_attr_names_cover_the_reserved_set() {
+        for name in [
+            "ipe-id",
+            "IPE-KEY",
+            "ipe-click",
+            "nonce",
+            "NONCE",
+            HANDLER_ID_ATTR,
+            PAGE_PATH_ATTR,
+            "DATA-IPE-PATH",
+            "data-ipe-mq-rules",
+            "Data-Ipe-On",
+        ] {
+            assert!(is_runtime_owned_attr_name(name), "{name}");
+        }
+        for name in [
+            KEY_ATTR,
+            "ipe",
+            "data-ipe",
+            "data-ip-path",
+            "title",
+            "data-x",
+        ] {
+            assert!(!is_runtime_owned_attr_name(name), "{name}");
+        }
+    }
+
     /// An unstamped tree still drops every program-built reserved name other
     /// than the exact stamped-id spelling.
     #[test]
@@ -3485,6 +3578,71 @@ mod tests {
             vec![],
         );
         assert!(!render_html(&unstamped).contains("r_9_button"));
+    }
+
+    /// Prove the refusal: a program-built name in the runtime's namespace
+    /// (computed, so no compile-time check reads it) builds no attribute in
+    /// any case spelling, through every program-facing constructor. The
+    /// keyed-list `ipe-key` and ordinary names are kept.
+    #[test]
+    fn program_attribute_constructors_drop_runtime_owned_names() {
+        use crate::ui::helpers::{ui_el_, ui_html_attribute_, ui_text_};
+        let owned = [
+            "data-ipe-mq-rules",
+            "Data-Ipe-Ev-Ipe-File-Max-Size",
+            "DATA-IPE-SCRIPT-REVIVED",
+            "data-ipe-path",
+            "ipe-click",
+            "nonce",
+        ];
+        for name in owned {
+            assert!(
+                matches!(
+                    html_named_attr_::<()>(name.into(), "x".into()),
+                    Attribute::NoAttr
+                ),
+                "{name}"
+            );
+            assert!(
+                matches!(
+                    html_bool_named_attr_::<()>(name.into(), true),
+                    Attribute::NoAttr
+                ),
+                "{name}"
+            );
+            assert!(
+                matches!(
+                    ui_html_attribute_::<()>(name.into(), "x".into()),
+                    crate::ui::element::Attribute::NoAttribute
+                ),
+                "{name}"
+            );
+        }
+        for name in ["ipe-key", "data-x", "data-ipe", "title"] {
+            assert!(
+                matches!(
+                    html_named_attr_::<()>(name.into(), "x".into()),
+                    Attribute::Attr(..)
+                ),
+                "{name}"
+            );
+            assert!(
+                matches!(
+                    ui_html_attribute_::<()>(name.into(), "x".into()),
+                    crate::ui::element::Attribute::AttrAttribute(..)
+                ),
+                "{name}"
+            );
+        }
+        let elem = ui_el_::<()>(
+            vec![ui_html_attribute_(
+                "data-ipe-mq-rules".into(),
+                "@media{}".into(),
+            )],
+            ui_text_("t".into()),
+        );
+        let out = render_html(&crate::ui::render::ui_layout(vec![], elem));
+        assert!(!out.contains("@media{}"), "{out}");
     }
 
     #[test]

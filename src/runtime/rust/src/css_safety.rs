@@ -599,12 +599,10 @@ pub(crate) fn should_report_stripped(origin: CssValueOrigin) -> bool {
 /// carried by the `data-ipe-mq-rules` / `data-ipe-pc-rules` style markers.
 ///
 /// The PRODUCER (`ui_media_query_` / `ui_on_pseudo_`) builds this string from
-/// [`SafeCssValue`]-gated declarations, but a caller can FORGE the marker
-/// directly with `Ui.htmlAttribute "data-ipe-mq-rules" "…}[x]{@import url(…)"`,
-/// which never passes through the producer at all. The raw marker String is
-/// therefore the real untrusted boundary — parse, don't validate — so the SINK
-/// must re-validate rather than trust an upstream that a generic `htmlAttribute`
-/// escape hatch can side-step.
+/// [`SafeCssValue`]-gated declarations. The program-facing attribute
+/// constructors drop a `data-ipe-*` name, but the marker is a raw String whose
+/// type carries no proof it came from the producer, so the SINK re-validates
+/// rather than trust one upstream gate (defend in depth).
 ///
 /// Splits on `;` into declarations and each declaration on its FIRST `:` into a
 /// `property:value` pair (parse, don't validate — a declaration IS that pair),

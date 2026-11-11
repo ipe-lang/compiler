@@ -125,7 +125,7 @@ pub fn copy_var(
                         fresh_map.insert(root, fresh);
                         results.push(fresh);
                     }
-                    Content::Flex | Content::Rigid | Content::Super { .. } => {
+                    Content::Flex | Content::Rigid(_) | Content::Super { .. } => {
                         // Not quantified: shared program-wide, no copy.
                         fresh_map.insert(root, root);
                         results.push(root);
@@ -256,7 +256,7 @@ pub fn reachable_flex_roots(
             Content::Flex => {
                 flex.insert(here);
             }
-            Content::Rigid
+            Content::Rigid(_)
             | Content::Super { .. }
             | Content::Structure(FlatType::Unit | FlatType::EmptyRecord) => {}
             Content::Structure(FlatType::Fun(a, b)) => {
@@ -518,7 +518,7 @@ pub fn reify_scheme(
                     }
                     // A residual non-quantified variable: an importer may
                     // still pin it, so the scheme is open.
-                    Content::Flex | Content::Rigid | Content::Super { .. } => {
+                    Content::Flex | Content::Rigid(_) | Content::Super { .. } => {
                         return Ok(None);
                     }
                     // `EmptyRecord` is only reachable on a direct call over a
@@ -703,7 +703,7 @@ fn zonk_visit(
         // back as a type variable named by its representative's id. (A
         // super-typed variable is still a variable; its obligations are read
         // separately when generalising — see [`crate::SolvedTypes::bounds`].)
-        Content::Flex | Content::Rigid | Content::Super { .. } => {
+        Content::Flex | Content::Rigid(_) | Content::Super { .. } => {
             // Tag so this solver-representative id can never be mistaken for an
             // annotation-symbol raw if this zonked `Ty` is ever fed back
             // through instantiation.
@@ -858,12 +858,12 @@ fn zonk_row(
         let tail_root = uf.find(ext)?;
         ext = match uf.root_content(tail_root)? {
             Content::Structure(FlatType::EmptyRecord) => return Ok(RowTail::Closed),
-            Content::Flex | Content::Super { rigid: false, .. }
+            Content::Flex | Content::Super { rigid: None, .. }
                 if reading == RowReading::Emitted =>
             {
                 return Ok(RowTail::Closed);
             }
-            Content::Flex | Content::Rigid | Content::Super { .. } => {
+            Content::Flex | Content::Rigid(_) | Content::Super { .. } => {
                 return Ok(RowTail::Open(tag_solver_var(tail_root)));
             }
             Content::Structure(FlatType::Record(more, next)) => {
@@ -1216,7 +1216,7 @@ impl<'l> TypeMeasures<'l> {
         }
         let (own, children, ext) = match uf.root_content(root)? {
             Content::Flex
-            | Content::Rigid
+            | Content::Rigid(_)
             | Content::Super { .. }
             | Content::Structure(FlatType::Unit | FlatType::EmptyRecord) => (0, Vec::new(), None),
             Content::Structure(FlatType::Fun(a, b)) => (TYPE_LEVELS_PER_ARROW, vec![*a, *b], None),

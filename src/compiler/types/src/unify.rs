@@ -31,7 +31,7 @@ use ipe_diagnostics::{ArgCount, DResult, Diagnostic, Owed, Span, TypeClass, Type
 use ipe_intern::Interner;
 
 use crate::constrain::zonk_reported;
-use crate::doc::{VarNamer, ty_to_doc};
+use crate::doc::{VarLabel, VarNamer, ty_to_doc};
 use crate::homed::{InferError, ModuleHome};
 use crate::solve::{Budget, CalleeName, Constraint, ConstraintOrigin};
 use crate::ty::{Content, FlatType, SolverVar, Ty, TyBounds};
@@ -271,7 +271,10 @@ fn call_arity(
         Ok(t) => t,
         Err(bug) => return Some(bug),
     };
-    let mut namer = VarNamer::with_classes(owed_classes(uf, &[&callee_ty]));
+    let mut namer = match labelled_namer(uf, interner, &[&callee_ty]) {
+        Ok(namer) => namer,
+        Err(bug) => return Some(bug),
+    };
     let signature = match ty_to_doc(&callee_ty, interner, &mut namer) {
         Ok(d) => d,
         Err(bug) => return Some(bug),
@@ -337,22 +340,50 @@ fn owed_class(bounds: TyBounds) -> Option<TypeClass> {
     }
 }
 
-/// Every solver variable in `tys` still owing a named class, keyed by the raw
-/// its [`Ty::Var`] carries, so a rendering names it by the class stem.
-fn owed_classes(uf: &UnionFind<Content>, tys: &[&Ty]) -> BTreeMap<u32, TypeClass> {
-    let mut classes = BTreeMap::new();
+/// The namer a refusal renders `tys` with: every annotation variable reads by
+/// the user's spelling and every class-owing flex by its class stem.
+///
+/// Every refusal that renders a solved type with the arena at hand builds its
+/// namer here, so no refusal prints a minted letter for a variable the user
+/// named.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] if an annotation symbol cannot be resolved.
+pub fn labelled_namer(
+    uf: &UnionFind<Content>,
+    interner: &Interner,
+    tys: &[&Ty],
+) -> DResult<VarNamer> {
+    VarNamer::with_labels(var_labels(uf, tys), interner)
+}
+
+/// The label of every solver variable in `tys` a rendering must not name by a
+/// minted letter, keyed by the raw its [`Ty::Var`] carries.
+///
+/// A rigid is labelled by the annotation variable it stands for, which wins
+/// over any class it owes: the user wrote that name. A flex still owing a named
+/// class is labelled by the class, so it reads by the class stem.
+fn var_labels(uf: &UnionFind<Content>, tys: &[&Ty]) -> BTreeMap<u32, VarLabel> {
+    let mut labels = BTreeMap::new();
     let mut stack: Vec<&Ty> = tys.to_vec();
     while let Some(ty) = stack.pop() {
         match ty {
             Ty::Var(raw) => {
-                let owed = SolverVar::from_raw(*raw)
+                let label = SolverVar::from_raw(*raw)
                     .and_then(|var| uf.root_content(var.var()).ok())
                     .and_then(|content| match content {
-                        Content::Super { bounds, .. } => owed_class(*bounds),
-                        _ => None,
+                        Content::Rigid(name)
+                        | Content::Super {
+                            rigid: Some(name), ..
+                        } => Some(VarLabel::Annotation(name.symbol())),
+                        Content::Super {
+                            rigid: None,
+                            bounds,
+                        } => owed_class(*bounds).map(VarLabel::Class),
+                        Content::Flex | Content::Structure(_) => None,
                     });
-                if let Some(class) = owed {
-                    classes.insert(*raw, class);
+                if let Some(label) = label {
+                    labels.insert(*raw, label);
                 }
             }
             Ty::Fun(arg, result) => {
@@ -364,7 +395,7 @@ fn owed_classes(uf: &UnionFind<Content>, tys: &[&Ty]) -> BTreeMap<u32, TypeClass
             Ty::Unit | Ty::Wildcard => {}
         }
     }
-    classes
+    labels
 }
 
 /// Process a single `(found, expected)` obligation: agree the two heads and
@@ -393,14 +424,14 @@ fn unify_step(
     // Clone a structure descriptor only when an arm actually MOVES one into the
     // union: peek both roots by reference and, if neither side carries a
     // structure, dispatch on the trivial `Flex`/`Rigid`/`Super` descriptors
-    // (`bool` + `Copy` bounds) without ever deep-copying a record's field map or
+    // (`Copy` skolem names + bounds) without ever deep-copying a record's field map or
     // a `Con`'s argument vector. Only the structure arms fetch an owned `Content`.
     let peek_a = uf.root_content(ra)?;
     if !matches!(peek_a, Content::Structure(_)) {
         let peek_b = uf.root_content(rb)?;
         if !matches!(peek_b, Content::Structure(_)) {
             // Both descriptors are the trivial `Flex`/`Rigid`/`Super` shapes
-            // (a `bool` + `Copy` bounds); cloning them copies no heap data.
+            // (`Copy` skolem names + bounds); cloning them copies no heap data.
             let owned_a = peek_a.clone();
             let owned_b = peek_b.clone();
             return unify_nonstructure(uf, budget, interner, span, ra, rb, &owned_a, &owned_b);
@@ -427,7 +458,9 @@ fn unify_step(
         (Content::Super { rigid, bounds }, structure @ Content::Structure(_))
         | (structure @ Content::Structure(_), Content::Super { rigid, bounds }) => {
             let pins = match &structure {
-                Content::Structure(flat) => !rigid && super_concrete_ok(interner, bounds, flat),
+                Content::Structure(flat) => {
+                    rigid.is_none() && super_concrete_ok(interner, bounds, flat)
+                }
                 _ => false,
             };
             if pins {
@@ -442,7 +475,7 @@ fn unify_step(
                 // code its deferred check gives the same duty. A rigid cannot
                 // pin at all, so it is a plain mismatch.
                 let unmet = match &structure {
-                    Content::Structure(flat) if !rigid => {
+                    Content::Structure(flat) if rigid.is_none() => {
                         let head = SuperHead::of(interner, flat);
                         crate::first_unmet(bounds, |bit| super_head_ok(bit, head))
                     }
@@ -461,7 +494,7 @@ fn unify_step(
                     Some(duty) => {
                         let structure_var = if a_is_structure { ra } else { rb };
                         let ty = zonk_reported(uf, budget, structure_var, span)?;
-                        let mut namer = VarNamer::with_classes(owed_classes(uf, &[&ty]));
+                        let mut namer = labelled_namer(uf, interner, &[&ty])?;
                         Err(crate::super_unsatisfied_named(
                             interner, duty, &ty, span, &mut namer,
                         ))
@@ -473,7 +506,7 @@ fn unify_step(
         // A rigid against a concrete structure is a mismatch — the annotation
         // promised a fully parametric variable the body is now trying to pin
         // down.
-        (Content::Rigid, Content::Structure(_)) | (Content::Structure(_), Content::Rigid) => {
+        (Content::Rigid(_), Content::Structure(_)) | (Content::Structure(_), Content::Rigid(_)) => {
             Err(mismatch(uf, budget, interner, span, ra, rb))
         }
         (Content::Structure(fa), Content::Structure(fb)) => {
@@ -490,7 +523,7 @@ fn unify_step(
 
 /// Merge two variables NEITHER of which carries a structure descriptor — the
 /// `Flex` / `Rigid` / `Super` combinations. Reads only the trivial `Copy`
-/// payloads (`rigid: bool`, `bounds: TyBounds`) off the borrowed descriptors, so
+/// payloads (`rigid: Option<SkolemName>`, `bounds: TyBounds`) off the borrowed descriptors, so
 /// the common inner-loop step (a numeric literal meeting a variable, two rigids
 /// meeting) never deep-copies a descriptor.
 #[allow(clippy::too_many_arguments)]
@@ -510,8 +543,8 @@ fn unify_nonstructure(
         // A flex adopts the other side's rigid (skolem). No occurs check is
         // needed: a rigid carries no transitive structure, so the merge cannot
         // build a cycle.
-        (Content::Flex, Content::Rigid) | (Content::Rigid, Content::Flex) => {
-            uf.union(ra, rb, Content::Rigid)
+        (Content::Flex, Content::Rigid(name)) | (Content::Rigid(name), Content::Flex) => {
+            uf.union(ra, rb, Content::Rigid(*name))
         }
         // A flex adopts a super-typed variable's obligations wholesale.
         (Content::Super { rigid, bounds }, Content::Flex)
@@ -568,13 +601,14 @@ fn unify_nonstructure(
             // accumulate across rigidity and survive as trait bounds on the param.
             let concrete_dispatch =
                 b1.has_number() || b2.has_number() || b1.has_append() || b2.has_append();
-            let can_union = !(*r1 && *r2) && ((r1 == r2) || !concrete_dispatch);
+            let can_union = !(r1.is_some() && r2.is_some())
+                && ((r1.is_some() == r2.is_some()) || !concrete_dispatch);
             if can_union {
                 uf.union(
                     ra,
                     rb,
                     Content::Super {
-                        rigid: *r1 || *r2,
+                        rigid: r1.or(*r2),
                         bounds: b1.union(*b2),
                     },
                 )
@@ -587,22 +621,22 @@ fn unify_nonstructure(
         // annotated `a` becomes a trait bound on `a` rather than a rejection.
         (
             Content::Super {
-                rigid: false,
+                rigid: None,
                 bounds,
             },
-            Content::Rigid,
+            Content::Rigid(name),
         )
         | (
-            Content::Rigid,
+            Content::Rigid(name),
             Content::Super {
-                rigid: false,
+                rigid: None,
                 bounds,
             },
         ) => uf.union(
             ra,
             rb,
             Content::Super {
-                rigid: true,
+                rigid: Some(*name),
                 bounds: *bounds,
             },
         ),
@@ -1081,7 +1115,7 @@ fn occurs(
             // Leaves: a flexible, rigid, or super-typed variable, `Unit`, and the
             // `EmptyRecord` closed-tail sentinel carry no children.
             Content::Flex
-            | Content::Rigid
+            | Content::Rigid(_)
             | Content::Super { .. }
             | Content::Structure(FlatType::Unit | FlatType::EmptyRecord) => {}
             Content::Structure(FlatType::Fun(a, r)) => {
@@ -1149,7 +1183,10 @@ fn mismatch_owing(
         Ok(t) => t,
         Err(bug) => return bug,
     };
-    let mut namer = VarNamer::with_classes(owed_classes(uf, &[&expected_ty, &found_ty]));
+    let mut namer = match labelled_namer(uf, interner, &[&expected_ty, &found_ty]) {
+        Ok(namer) => namer,
+        Err(bug) => return bug,
+    };
     // A managed-loop `view` returns `Html` where the shape requires `Element`
     // (or the symmetric case): render the tailored IPE-T0020, which tells the
     // user to return an `Element` or wrap raw `Html` with `Ui.html`, instead of
@@ -1225,22 +1262,25 @@ fn infinite_type(
     var: VarId,
     structure: VarId,
 ) -> Diagnostic {
-    let mut namer = VarNamer::new();
-    // Name the variable first so it reads as `a` and any same var inside the
-    // structure renders consistently.
     let var_ty = match zonk_reported(uf, budget, var, span) {
         Ok(t) => t,
         Err(bug) => return bug,
     };
+    let structure_ty = match zonk_reported(uf, budget, structure, span) {
+        Ok(t) => t,
+        Err(bug) => return bug,
+    };
+    let mut namer = match labelled_namer(uf, interner, &[&var_ty, &structure_ty]) {
+        Ok(namer) => namer,
+        Err(bug) => return bug,
+    };
+    // Name the variable first so it reads as `a` and any same var inside the
+    // structure renders consistently.
     let var_name = match ty_to_doc(&var_ty, interner, &mut namer) {
         Ok(ipe_diagnostics::TyDoc::Var(v)) => v,
         // The occurs target is always flexible at the guard site; any other
         // shape (or a read-back bug) is an internal invariant violation.
         Ok(_) => Box::from("?"),
-        Err(bug) => return bug,
-    };
-    let structure_ty = match zonk_reported(uf, budget, structure, span) {
-        Ok(t) => t,
         Err(bug) => return bug,
     };
     let structure_doc = match ty_to_doc(&structure_ty, interner, &mut namer) {
@@ -1263,12 +1303,21 @@ mod tests {
 
     use super::*;
     use crate::solve::Budget;
-    use crate::ty::TyBounds;
+    use crate::ty::{SkolemName, TyBounds};
     use crate::unionfind::UnionFind;
 
-    fn super_var(uf: &mut UnionFind<Content>, rigid: bool, bounds: TyBounds) -> VarId {
+    fn super_var(
+        uf: &mut UnionFind<Content>,
+        rigid: Option<SkolemName>,
+        bounds: TyBounds,
+    ) -> VarId {
         uf.fresh(Content::Super { rigid, bounds })
             .expect("fresh var")
+    }
+
+    /// The skolem name of the annotation variable with raw id `raw`.
+    fn skolem(raw: u32) -> Option<SkolemName> {
+        SkolemName::of_annotation_var(raw)
     }
 
     /// `super_admits_record` is `super_concrete_ok`'s verdict on a record head.
@@ -1313,19 +1362,19 @@ mod tests {
     }
 
     /// Eq (rigid) ∪ Stringify (flex) — both are pure trait-bound obligations,
-    /// so cross-rigidity union is allowed. Result: rigid:true, bounds = Eq|SHOW.
+    /// so cross-rigidity union is allowed. Result: the rigid skolem, bounds = Eq|SHOW.
     #[test]
     fn super_super_eq_rigid_stringify_flex_unions() {
         let mut uf = UnionFind::new();
-        let a = super_var(&mut uf, true, TyBounds::eq());
-        let b = super_var(&mut uf, false, TyBounds::show());
+        let a = super_var(&mut uf, skolem(1), TyBounds::eq());
+        let b = super_var(&mut uf, None, TyBounds::show());
         assert!(do_unify(&mut uf, a, b).is_ok(), "Eq+Stringify should union");
         let rep = uf.find(a).expect("find");
         let content = uf.content(rep).expect("content");
         assert_eq!(
             content,
             Content::Super {
-                rigid: true,
+                rigid: skolem(1),
                 bounds: TyBounds::eq().union(TyBounds::show()),
             },
             "merged content must be rigid with Eq|SHOW"
@@ -1337,8 +1386,8 @@ mod tests {
     #[test]
     fn super_super_number_rigid_number_flex_mismatch() {
         let mut uf = UnionFind::new();
-        let a = super_var(&mut uf, true, TyBounds::add());
-        let b = super_var(&mut uf, false, TyBounds::add());
+        let a = super_var(&mut uf, skolem(1), TyBounds::add());
+        let b = super_var(&mut uf, None, TyBounds::add());
         assert!(
             do_unify(&mut uf, a, b).is_err(),
             "Add rigid+flex cross-rigidity must mismatch"
@@ -1350,8 +1399,8 @@ mod tests {
     #[test]
     fn super_super_append_rigid_eq_flex_mismatch() {
         let mut uf = UnionFind::new();
-        let a = super_var(&mut uf, true, TyBounds::appendable());
-        let b = super_var(&mut uf, false, TyBounds::eq());
+        let a = super_var(&mut uf, skolem(1), TyBounds::appendable());
+        let b = super_var(&mut uf, None, TyBounds::eq());
         assert!(
             do_unify(&mut uf, a, b).is_err(),
             "Append (rigid) ∪ Eq (flex) must mismatch"
@@ -1363,8 +1412,8 @@ mod tests {
     #[test]
     fn super_super_same_rigidity_always_unions() {
         let mut uf = UnionFind::new();
-        let a = super_var(&mut uf, false, TyBounds::eq());
-        let b = super_var(&mut uf, false, TyBounds::ord());
+        let a = super_var(&mut uf, None, TyBounds::eq());
+        let b = super_var(&mut uf, None, TyBounds::ord());
         assert!(
             do_unify(&mut uf, a, b).is_ok(),
             "same-rigidity must always union"
@@ -1374,7 +1423,7 @@ mod tests {
         assert_eq!(
             content,
             Content::Super {
-                rigid: false,
+                rigid: None,
                 bounds: TyBounds::eq().union(TyBounds::ord()),
             },
         );
@@ -1389,8 +1438,8 @@ mod tests {
     #[test]
     fn super_super_both_rigid_eq_mismatch() {
         let mut uf = UnionFind::new();
-        let a = super_var(&mut uf, true, TyBounds::eq());
-        let b = super_var(&mut uf, true, TyBounds::eq());
+        let a = super_var(&mut uf, skolem(1), TyBounds::eq());
+        let b = super_var(&mut uf, skolem(2), TyBounds::eq());
         assert!(
             do_unify(&mut uf, a, b).is_err(),
             "two distinct rigid annotation skolems must never merge"

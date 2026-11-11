@@ -129,8 +129,17 @@ pub async fn enable_from_env() {
         return; // lost an enable race; the other winner owns the batcher
     }
     let svc = service_name();
-    tokio::spawn(batcher(pool.clone(), rx, svc));
-    tokio::spawn(pruner(pool));
+    let started = crate::threads::spawn_service(
+        "spill batcher",
+        "the telemetry spill's batch writer",
+        batcher(pool.clone(), rx, svc),
+    )
+    .and_then(|()| {
+        crate::threads::spawn_service("spill pruner", "the telemetry spill's pruner", pruner(pool))
+    });
+    if let Err(refused) = started {
+        crate::system::emit_runtime_log("spill", &refused.to_string());
+    }
 }
 
 /// Write one entry to the spill (the unit of work the batcher repeats). Mapping

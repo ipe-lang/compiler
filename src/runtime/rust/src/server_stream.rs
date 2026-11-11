@@ -488,8 +488,9 @@ impl ServerPendingStream {
             .unwrap_or_else(PoisonError::into_inner)
             .insert(id, tx);
         let slot = StreamSlot(id);
-        let task = spawn_stream_handler(handler, credentials, slot, work);
-        let handler = crate::task::AbortOnDrop::new(task.abort_handle());
+        let Ok(handler) = spawn_stream_handler(handler, credentials, slot, work) else {
+            return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        };
         Ok(stream_body(rx, gate, drain, live, handler))
     }
 }
@@ -514,20 +515,68 @@ impl Drop for StreamSlot {
 /// stream terminates even if the handler forgot to call `finish`. The task
 /// runs outside the request's stream table, so a `stream` call inside the
 /// handler is refused.
+///
+/// # Errors
+///
+/// No tokio runtime is running on the calling thread.
 fn spawn_stream_handler(
     handler: ErasedStreamHandler,
     credentials: crate::server::ChannelCredentials,
     slot: StreamSlot,
     mut work: crate::server::shutdown::WorkGuard,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let id = slot.0;
-        let _ = work
-            .unless_cancelled(credentials.scoped(|| handler(StreamWriter::StreamWriter(id))))
-            .await;
-        drop(work);
-        drop(slot);
-    })
+) -> Result<StreamHandler, crate::threads::ThreadRefused> {
+    crate::threads::spawn_task(
+        "stream handler",
+        crate::threads::TaskScope::RuntimeOwned(
+            "the handler runs in the credentials it is handed, outside the request's stream table",
+        ),
+        async move {
+            let id = slot.0;
+            let _ = work
+                .unless_cancelled(credentials.scoped(|| handler(StreamWriter::StreamWriter(id))))
+                .await;
+            drop(work);
+            drop(slot);
+        },
+    )
+}
+
+/// A running stream handler: aborted when dropped, joined when its body ends.
+type StreamHandler = crate::threads::TaskHandle<()>;
+
+/// The body's error for a handler that ended by a trip, a panic or a cancel.
+fn handler_failed(unjoined: crate::threads::Unjoined) -> std::io::Error {
+    let error = match unjoined {
+        crate::threads::Unjoined::Trip(fault) => fault.to_ipe_error(),
+        crate::threads::Unjoined::Ended(ended) => ended.into_error::<IpeError>("stream handler"),
+    };
+    std::io::Error::other(crate::ipe_error_message(error))
+}
+
+/// Leave `handler` to the shutdown's grace, its end joined and logged.
+///
+/// With no runtime to join on, the handler is aborted.
+fn leave_to_grace(handler: StreamHandler) {
+    let joiner = crate::threads::spawn_task(
+        "stream handler grace",
+        crate::threads::TaskScope::RuntimeOwned("a draining server's stream outlives its body"),
+        async move {
+            if let Err(unjoined) = handler.join_contained().await {
+                crate::system::emit_runtime_log(
+                    "stream",
+                    &format!(
+                        "a draining stream's handler failed: {}",
+                        handler_failed(unjoined)
+                    ),
+                );
+            }
+        },
+    );
+    if let Ok(joiner) = joiner {
+        joiner.detach(crate::threads::Detached::NoIpeCode(
+            "it joins the stream handler and logs its end",
+        ));
+    }
 }
 
 /// A served stream's body: the handler's chunks until it ends, the gate denies, or the server drains.
@@ -535,7 +584,9 @@ fn spawn_stream_handler(
 /// `None` ends the body once every sender has dropped (finish / handler
 /// exit), once the gate denies, or once the server drains; each drops the
 /// receiver, and the end drops `live`. A body the drain ends leaves `handler`
-/// to the grace; any other end, or a drop unended, aborts it. A chunk is
+/// to the grace; a denial, or a drop unended, aborts it; a handler that
+/// ended by a trip, a panic or a cancel ends the body with an error, so the
+/// stream never reads as complete. A chunk is
 /// written only after the gate settles, so a credential the handler bound, or
 /// a revocation already due, is proved before the chunk leaves.
 fn stream_body(
@@ -543,23 +594,30 @@ fn stream_body(
     gate: Option<crate::server::ChannelGate>,
     drain: crate::server::shutdown::Drain,
     live: crate::server::shutdown::LiveGuard,
-    handler: crate::task::AbortOnDrop,
+    handler: StreamHandler,
 ) -> impl futures_util::Stream<Item = Result<String, std::io::Error>> + Send + 'static {
     futures_util::stream::unfold(
-        (rx, gate, drain, live, handler),
+        (rx, gate, drain, live, Some(handler)),
         |(mut rx, mut gate, mut drain, live, handler)| async move {
+            let handler = handler?;
             tokio::select! {
                 biased;
                 () = crate::server::channel_denial(&mut gate) => None,
                 () = drain.wait() => {
-                    handler.defuse();
+                    leave_to_grace(handler);
                     None
                 }
                 chunk = rx.recv() => match chunk {
                     Some(chunk) if !crate::server::channel_unsettled(&mut gate) => {
-                        Some((Ok(chunk), (rx, gate, drain, live, handler)))
+                        Some((Ok(chunk), (rx, gate, drain, live, Some(handler))))
                     }
-                    Some(_) | None => None,
+                    Some(_) => None,
+                    None => match handler.join_contained().await {
+                        Ok(()) => None,
+                        Err(unjoined) => {
+                            Some((Err(handler_failed(unjoined)), (rx, gate, drain, live, None)))
+                        }
+                    },
                 },
             }
         },
@@ -586,8 +644,16 @@ mod tests {
             return;
         };
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(STREAM_CHAN_BUFFER);
-        let idle = tokio::spawn(std::future::pending::<()>());
-        let handler = crate::task::AbortOnDrop::new(idle.abort_handle());
+        let handler = crate::threads::spawn_task(
+            "ipe-test-idle",
+            crate::threads::TaskScope::RuntimeOwned("test"),
+            std::future::pending::<()>(),
+        );
+        assert!(handler.is_ok(), "a runtime is running");
+        let Ok(handler) = handler else {
+            return;
+        };
+        let idle = handler.abort_handle();
         let mut body = Box::pin(stream_body(rx, None, drain, live, handler));
         assert!(tx.send("chunk".to_owned()).await.is_ok());
         let first = body.next().await;
@@ -611,6 +677,48 @@ mod tests {
             "a body the drain ends leaves its handler to the grace"
         );
         drop(tx);
+    }
+
+    /// Raises the runtime's typed trip.
+    fn tripped() {
+        crate::core::trip(crate::core::RuntimeTrip::RecursionLimit)
+    }
+
+    /// A body whose handler tripped ends with an error, never as complete.
+    #[tokio::test]
+    async fn a_tripped_handler_ends_its_body_with_an_error() {
+        let (armed, _signals) = crate::server::shutdown::tests::armed_with(
+            crate::server::shutdown::ShutdownPlan::bare("test"),
+            std::time::Duration::from_secs(5),
+            Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        );
+        let drain = armed.drain();
+        let live = drain.hold();
+        assert!(live.is_some(), "a serving server admits the stream");
+        let Some(live) = live else {
+            return;
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(STREAM_CHAN_BUFFER);
+        let handler = crate::threads::spawn_task(
+            "ipe-test-tripping",
+            crate::threads::TaskScope::RuntimeOwned("test"),
+            async move {
+                let _sender = tx;
+                tripped();
+            },
+        );
+        assert!(handler.is_ok(), "a runtime is running");
+        let Ok(handler) = handler else {
+            return;
+        };
+        let mut body = Box::pin(stream_body(rx, None, drain, live, handler));
+        let end = tokio::time::timeout(std::time::Duration::from_secs(5), body.next()).await;
+        assert!(
+            matches!(end, Ok(Some(Err(_)))),
+            "a tripped handler ends its body with an error: {end:?}"
+        );
+        let after = tokio::time::timeout(std::time::Duration::from_secs(5), body.next()).await;
+        assert!(matches!(after, Ok(None)), "the errored body then ends");
     }
 
     /// The kind and message of a refused task, or `None` when it succeeded.
@@ -664,6 +772,10 @@ mod tests {
             StreamSlot(id),
             work,
         );
+        assert!(task.is_ok(), "a runtime is running");
+        let Ok(task) = task else {
+            return;
+        };
         let began =
             tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified()).await;
         assert!(began.is_ok(), "the handler runs");
@@ -673,7 +785,7 @@ mod tests {
             started.elapsed() < crate::server::shutdown::WORK_CANCEL_DEADLINE,
             "the cancelled handler releases its unit before the cancel deadline"
         );
-        let ended = tokio::time::timeout(std::time::Duration::from_secs(1), task).await;
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(1), task.joined()).await;
         assert!(
             matches!(ended, Ok(Ok(()))),
             "the close ends the handler task"
