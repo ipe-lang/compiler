@@ -425,7 +425,12 @@ async fn shielded<T: Send + 'static>(
     ) else {
         return Err(sqlx::Error::PoolClosed);
     };
-    match task.join_shielded().await {
+    match task
+        .join_shielded(crate::threads::Detached::NoIpeCode(
+            "a pool operation runs no Ipê code",
+        ))
+        .await
+    {
         Ok(done) => done,
         Err(crate::threads::Unjoined::Ended(ended)) if ended.is_cancelled() => {
             Err(sqlx::Error::PoolClosed)

@@ -98,9 +98,44 @@ const TASK_OPS: &[&str] = &[
     "spawn_in_current_scope",
 ];
 
-/// The files that hold the task funnel, or that name each denied path for
-/// clippy; their task operations are the funnel's own.
-const FUNNEL_FILES: &[&str] = &["threads.rs", "clippy_paths_resolve.rs"];
+/// The files that hold the task funnel; their task operations are its own.
+const FUNNEL_FILES: &[&str] = &["threads.rs"];
+
+/// The file that names each path the runtime `clippy.toml` denies. Its task
+/// paths name a denied path and start nothing, so it is exempt only while it
+/// holds nothing but such namings (see [`names_paths_only`]).
+const PATH_NAMING_FILE: &str = "clippy_paths_resolve.rs";
+
+/// Whether `src` holds only `const _X: () = { let _ = <path>; .. };` items:
+/// each names a path and evaluates nothing, so no task can start in it.
+fn names_paths_only(src: &str) -> bool {
+    let Ok(file) = syn::parse_file(src) else {
+        return false;
+    };
+    file.items.iter().all(|item| {
+        let Item::Const(konst) = item else {
+            return false;
+        };
+        let unit = matches!(&*konst.ty, syn::Type::Tuple(t) if t.elems.is_empty());
+        let Expr::Block(body) = &*konst.expr else {
+            return false;
+        };
+        unit && konst.ident.to_string().starts_with('_')
+            && body.block.stmts.iter().all(|stmt| {
+                let Stmt::Local(local) = stmt else {
+                    return false;
+                };
+                let wild = match &local.pat {
+                    Pat::Wild(_) => true,
+                    Pat::Type(typed) => matches!(&*typed.pat, Pat::Wild(_)),
+                    _ => false,
+                };
+                wild && local.init.as_ref().is_some_and(|init| {
+                    init.diverge.is_none() && matches!(&*init.expr, Expr::Path(_))
+                })
+            })
+    })
+}
 
 /// The files whose raw task sites the next migration slice moves onto the
 /// funnel; only they may hold a [`TaskRoute::Unmigrated`] row.
@@ -990,16 +1025,27 @@ fn task_violations(sources: &[(String, String)], ledger: &[TaskSite]) -> Vec<Str
         if FUNNEL_FILES.contains(&file.as_str()) {
             continue;
         }
+        if file == PATH_NAMING_FILE {
+            if names_paths_only(src) {
+                continue;
+            }
+            out.push(format!(
+                "{file}: holds an item other than a `const _X: () = {{ let _ = <path>; }}` \
+                 naming, so it may start a task the scan exempts: keep it to namings"
+            ));
+        }
         let allows = disallowed_type_allows(file, src);
         if allows > 0 {
             out.push(format!(
-                "{file}: {allows} attribute(s) silence `clippy::disallowed_types`, which bans                  a raw `JoinSet` outside `threads.rs`: join through `threads::IpeJoinSet`"
+                "{file}: {allows} attribute(s) silence `clippy::disallowed_types`, which bans \
+                 a raw `JoinSet` outside `threads.rs`: join through `threads::IpeJoinSet`"
             ));
         }
         let found = scan(file, src);
         for (original, alias) in found.task_renames {
             out.push(format!(
-                "{file}: `use .. {original} as {alias}` hides a task operation from the scan:                  call it by its own name"
+                "{file}: `use .. {original} as {alias}` hides a task operation from the scan: \
+                 call it by its own name"
             ));
         }
         for (function, op) in found.tasks {
@@ -1013,7 +1059,9 @@ fn task_violations(sources: &[(String, String)], ledger: &[TaskSite]) -> Vec<Str
             .find(|s| s.file == file.as_str() && s.function == function.as_str() && s.op == *op);
         match listed {
             None => out.push(format!(
-                "{file}: `{function}` starts or joins a task through `{op}` {count} time(s)                  unledgered: start it through `threads::spawn_task` (join a set through                  `threads::IpeJoinSet`), or add a `TASK_SITES` row saying why it is not a task"
+                "{file}: `{function}` starts or joins a task through `{op}` {count} time(s) \
+                 unledgered: start it through `threads::spawn_task` (join a set through \
+                 `threads::IpeJoinSet`), or add a `TASK_SITES` row saying why it is not a task"
             )),
             Some(site) if site.count != *count => out.push(format!(
                 "{file}: `{function}` `{op}` occurs {count} time(s), ledgered {}",
@@ -1072,15 +1120,165 @@ fn carrier_gaps(sources: &[(String, String)]) -> Vec<String> {
             )
         })
         .collect();
-    let entry = calls.get("block_on").unwrap_or(&empty);
-    for needed in ["on_behalf_of_caller", "spawn_sized"] {
-        if !entry.contains(needed) {
-            out.push(format!(
-                "task.rs: `block_on` never calls `{needed}`, so its entry thread does not carry                  the caller's scope"
-            ));
-        }
-    }
+    out.extend(block_on_carry_gaps(src));
     out
+}
+
+/// The calls and method calls named `name` in a syntax node.
+struct CallsNamed<'n> {
+    name: &'n str,
+    count: usize,
+}
+
+impl<'ast> Visit<'ast> for CallsNamed<'_> {
+    fn visit_expr_call(&mut self, call: &'ast ExprCall) {
+        if let Expr::Path(callee) = &*call.func
+            && callee
+                .path
+                .segments
+                .last()
+                .is_some_and(|s| s.ident == self.name)
+        {
+            self.count = self.count.saturating_add(1);
+        }
+        visit::visit_expr_call(self, call);
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast ExprMethodCall) {
+        if call.method == self.name {
+            self.count = self.count.saturating_add(1);
+        }
+        visit::visit_expr_method_call(self, call);
+    }
+}
+
+fn calls_named(stmts: &[Stmt], name: &str) -> usize {
+    let mut walk = CallsNamed { name, count: 0 };
+    for stmt in stmts {
+        walk.visit_stmt(stmt);
+    }
+    walk.count
+}
+
+/// Whether a syntax node binds or assigns `name`.
+struct Rebinds<'n> {
+    name: &'n syn::Ident,
+    found: bool,
+}
+
+impl<'ast> Visit<'ast> for Rebinds<'_> {
+    fn visit_pat_ident(&mut self, pat: &'ast PatIdent) {
+        self.found |= pat.ident == *self.name;
+        visit::visit_pat_ident(self, pat);
+    }
+
+    fn visit_expr_assign(&mut self, assign: &'ast syn::ExprAssign) {
+        self.found |= matches!(&*assign.left, Expr::Path(p) if p.path.is_ident(self.name));
+        visit::visit_expr_assign(self, assign);
+    }
+}
+
+/// Whether `stmt` is `let <param> = on_behalf_of_caller(<param>);`.
+fn carries_param(stmt: &Stmt, param: &syn::Ident) -> bool {
+    let Stmt::Local(local) = stmt else {
+        return false;
+    };
+    let Pat::Ident(bound) = &local.pat else {
+        return false;
+    };
+    let Some(init) = local.init.as_ref().filter(|init| init.diverge.is_none()) else {
+        return false;
+    };
+    let Expr::Call(call) = &*init.expr else {
+        return false;
+    };
+    let carrier = matches!(&*call.func, Expr::Path(f) if f.path.segments.last().is_some_and(|s| s.ident == "on_behalf_of_caller"));
+    let mut args = call.args.iter();
+    let of_param =
+        matches!((args.next(), args.next()), (Some(Expr::Path(a)), None) if a.path.is_ident(param));
+    bound.ident == *param && bound.subpat.is_none() && carrier && of_param
+}
+
+/// Every way the `block_on` entry of `src` can start its entry thread on a
+/// future that does not carry the caller's scope.
+///
+/// Exactly one top-level `block_on` spawns through `spawn_sized`, once, and a
+/// statement before that spawn shadows its future parameter with
+/// `on_behalf_of_caller` of itself, with no rebinding of the name between.
+fn block_on_carry_gaps(src: &str) -> Vec<String> {
+    let Ok(file) = syn::parse_file(src) else {
+        return vec!["task.rs: does not parse, so `block_on` cannot be checked".to_owned()];
+    };
+    let entries: Vec<&ItemFn> = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Fn(f)
+                if f.sig.ident == "block_on" && calls_named(&f.block.stmts, "spawn_sized") > 0 =>
+            {
+                Some(f)
+            }
+            _ => None,
+        })
+        .collect();
+    let [entry] = entries.as_slice() else {
+        return vec![format!(
+            "task.rs: {} top-level `block_on` entries start their thread through \
+             `spawn_sized`; exactly one must, so its carry can be checked",
+            entries.len()
+        )];
+    };
+    let stmts = &entry.block.stmts;
+    let spawns = calls_named(stmts, "spawn_sized");
+    if spawns != 1 {
+        return vec![format!(
+            "task.rs: `block_on` calls `spawn_sized` {spawns} times; one carried start is checked"
+        )];
+    }
+    let param = entry.sig.inputs.first().and_then(|arg| match arg {
+        syn::FnArg::Typed(typed) => match &*typed.pat {
+            Pat::Ident(p) => Some(p.ident.clone()),
+            _ => None,
+        },
+        syn::FnArg::Receiver(_) => None,
+    });
+    let Some(param) = param else {
+        return vec!["task.rs: `block_on` takes no named future to carry".to_owned()];
+    };
+    let carried = stmts.iter().position(|stmt| carries_param(stmt, &param));
+    let spawned = stmts
+        .iter()
+        .position(|stmt| calls_named(std::slice::from_ref(stmt), "spawn_sized") > 0);
+    let (Some(carried), Some(spawned)) = (carried, spawned) else {
+        return vec![format!(
+            "task.rs: `block_on` never carries its future through \
+             `let {param} = on_behalf_of_caller({param});`, so its entry thread drops \
+             the caller's scope"
+        )];
+    };
+    if carried >= spawned {
+        return vec![format!(
+            "task.rs: `block_on` carries `{param}` after the `spawn_sized` start, so the \
+             entry thread runs the uncarried future"
+        )];
+    }
+    let mut rebinds = Rebinds {
+        name: &param,
+        found: false,
+    };
+    for stmt in stmts
+        .get(carried.saturating_add(1)..spawned)
+        .unwrap_or_default()
+    {
+        rebinds.visit_stmt(stmt);
+    }
+    if rebinds.found {
+        return vec![format!(
+            "task.rs: `block_on` rebinds `{param}` between its carry and the `spawn_sized` \
+             start, so the entry thread may run an uncarried future"
+        )];
+    }
+    Vec::new()
 }
 
 fn sources(files: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -1407,17 +1605,21 @@ fn a_carrier_that_drops_a_scope_is_refused() {
 fn on_behalf_of_caller<F>(task: F) -> F {
     carry_web_session(carry_request_streams(carry_server_request(task)))
 }
-fn block_on() { let future = on_behalf_of_caller(f); crate::threads::spawn_sized(future); }
+fn block_on(future: F) {
+    let future = on_behalf_of_caller(future);
+    crate::threads::spawn_sized(move || future);
+}
 ";
-    assert!(carrier_gaps(&sources(&[("task.rs", carried)])).is_empty());
+    let found = carrier_gaps(&sources(&[("task.rs", carried)]));
+    assert!(found.is_empty(), "{found:#?}");
     let dropped = r"
 fn on_behalf_of_caller<F>(task: F) -> F { carry_web_session(carry_request_streams(task)) }
-fn block_on() { crate::threads::spawn_sized(f); }
+fn block_on(future: F) { crate::threads::spawn_sized(move || future); }
 ";
     let gaps = carrier_gaps(&sources(&[("task.rs", dropped)]));
     for needle in [
         "never calls `carry_server_request`",
-        "`block_on` never calls `on_behalf_of_caller`",
+        "`block_on` never carries its future",
     ] {
         assert!(
             gaps.iter().any(|v| v.contains(needle)),
@@ -1425,6 +1627,90 @@ fn block_on() { crate::threads::spawn_sized(f); }
         );
     }
     assert_eq!(gaps.len(), 2, "{gaps:#?}");
+}
+
+#[test]
+fn a_block_on_carry_out_of_order_or_off_its_future_is_refused() {
+    let refused: &[(&str, &str)] = &[
+        (
+            "fn block_on(future: F) {
+                crate::threads::spawn_sized(move || future);
+                let future = on_behalf_of_caller(future);
+            }",
+            "after the `spawn_sized` start",
+        ),
+        (
+            "fn block_on(future: F) {
+                let carried = on_behalf_of_caller(future);
+                crate::threads::spawn_sized(move || future);
+            }",
+            "never carries its future",
+        ),
+        (
+            "fn block_on(future: F) {
+                let future = on_behalf_of_caller(other);
+                crate::threads::spawn_sized(move || future);
+            }",
+            "never carries its future",
+        ),
+        (
+            "fn block_on(future: F) {
+                let future = on_behalf_of_caller(future);
+                let future = raw(future);
+                crate::threads::spawn_sized(move || future);
+            }",
+            "rebinds `future`",
+        ),
+        (
+            "fn block_on(future: F) {
+                let future = on_behalf_of_caller(future);
+                crate::threads::spawn_sized(move || future);
+                crate::threads::spawn_sized(move || raw);
+            }",
+            "calls `spawn_sized` 2 times",
+        ),
+        (
+            "fn block_on(future: F) {
+                let future = on_behalf_of_caller(future);
+                crate::threads::spawn_sized(move || future);
+            }
+            fn block_on(future: F) { crate::threads::spawn_sized(move || future); }",
+            "2 top-level `block_on` entries",
+        ),
+    ];
+    for (src, needle) in refused {
+        let gaps = block_on_carry_gaps(src);
+        assert!(
+            gaps.len() == 1 && gaps.iter().any(|g| g.contains(needle)),
+            "`{needle}` must be refused:\n{src}\n{gaps:#?}"
+        );
+    }
+}
+
+#[test]
+fn the_path_naming_file_is_exempt_only_while_it_only_names_paths() {
+    let naming = "#[cfg(x)]
+const _TOKIO: () = {
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::tokio::task::spawn_local::<R>;
+    let _: Option<::tokio::task::JoinSet<()>> = None;
+};";
+    assert!(names_paths_only(naming));
+    let found = task_violations(&sources(&[(PATH_NAMING_FILE, naming)]), &[]);
+    assert!(found.is_empty(), "{found:#?}");
+    for smuggled in [
+        "const _T: () = { let _ = ::tokio::spawn(async {}); };",
+        "const _T: () = { let _ = ::tokio::spawn; };\nfn start() { tokio::spawn(async {}); }",
+        "const T: () = { let _ = ::tokio::spawn; };",
+        "const _T: () = { let x = ::tokio::spawn; };",
+    ] {
+        assert!(!names_paths_only(smuggled), "{smuggled}");
+        let found = task_violations(&sources(&[(PATH_NAMING_FILE, smuggled)]), &[]);
+        assert!(
+            found.iter().any(|v| v.contains("holds an item other than")),
+            "{smuggled}: {found:#?}"
+        );
+    }
 }
 
 #[test]

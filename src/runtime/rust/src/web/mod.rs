@@ -3263,6 +3263,9 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
     scope: pubsub::SessionScope,
     // The session's in-flight Cmd budget, shared with the page handler's seed Cmd.
     cmds: Arc<budget::SessionCmds>,
+    // The one owner of `cmds`' trip sink, taken by the page handler before any
+    // Cmd can start: a Cmd's trip or panic delivered there ends the session.
+    cmd_ends: crate::threads::TripOwner,
     // Subscribed by the page handler before the session's first credential was
     // admitted, so no revocation between that admission and this start is missed.
     mut revocation: RevocationWatch,
@@ -3288,10 +3291,6 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
     FSubs: Fn(Model) -> IpeSub<Msg> + Send + Sync + 'static,
 {
     let sid = scope.sid().to_owned();
-    // The session's Cmd tasks deliver a trip or a panic here; one ends the session.
-    let Ok(cmd_ends) = cmds.ends().owner() else {
-        return;
-    };
     // One keyed subscription runtime per session: a re-evaluation keeps a
     // still-requested `Sub.every` timer and its phase.
     let mut sub_runtime = SubRuntime::new(msg_tx.clone());
@@ -5739,6 +5738,12 @@ mod handlers {
         // user-driven events, and at least the session's Cmd ceiling.
         let (msg_tx, msg_rx) = mpsc::channel::<Msg>(MSG_QUEUE_CAP);
         let cmds = Arc::new(budget::SessionCmds::new());
+        // The session's Cmd tasks deliver a trip or a panic to this one owner,
+        // which the driver holds; a fresh budget's sink has no other.
+        let Ok(cmd_ends) = cmds.ends().owner() else {
+            return entry_unavailable();
+        };
+        let publication_ends = cmds.ends();
         let (event_tx, event_rx) = mpsc::channel::<QueuedEvent<Msg>>(EVENT_QUEUE_CAP);
         let (enter_tx, enter_rx) = mpsc::channel::<EnterRequest>(ENTER_QUEUE_CAP.get());
         #[cfg(feature = "debugger")]
@@ -5850,6 +5855,7 @@ mod handlers {
                         store.clone(),
                         scope.clone(),
                         Arc::clone(&cmds),
+                        cmd_ends,
                         revocation,
                         drain,
                         port_lease,
@@ -5876,7 +5882,10 @@ mod handlers {
             return entry_unavailable();
         };
         // The publication runs to its end even when this request is dropped.
-        match commit.join_shielded().await {
+        match commit
+            .join_shielded(crate::threads::Detached::IpeOwned(publication_ends))
+            .await
+        {
             Ok(Some(store::Installed::Held | store::Installed::Diverged(_))) => {}
             // The store cannot persist the session: nothing was published,
             // no cookie is set, and the claim is released.
@@ -22289,6 +22298,7 @@ mod shutdown_work_tests {
     /// A session driven by `drive_session` under `drain`, its Msg sender and the driver task.
     ///
     /// `update` adds the Msg to the model and counts itself in `applied`.
+    #[allow(clippy::panic)] // test helper: a fresh budget's sink always yields its owner
     fn spawn_driver(
         store: Arc<GatedStore>,
         drain: Drain,
@@ -22303,6 +22313,9 @@ mod shutdown_work_tests {
         let (event_tx, event_rx) = mpsc::channel::<QueuedEvent<i64>>(1);
         let (enter_tx, enter_rx) = mpsc::channel::<EnterRequest>(1);
         let cmds = Arc::new(budget::SessionCmds::new());
+        let Ok(cmd_ends) = cmds.ends().owner() else {
+            panic!("a fresh budget's sink has no owner");
+        };
         let entry = Arc::new(Mutex::new(SessionEntry {
             model: 0_i64,
             rendered: Rendered::first(
@@ -22358,7 +22371,8 @@ mod shutdown_work_tests {
             unrouted_page_url(),
             store,
             scope,
-            cmds,
+            Arc::clone(&cmds),
+            cmd_ends,
             RevocationWatch::subscribe(),
             drain,
             port_lease,
@@ -22418,6 +22432,46 @@ mod shutdown_work_tests {
         );
         assert_eq!(store.sets.load(Ordering::SeqCst), 1, "one checkpoint write");
         assert_eq!(model_of(&entry), 1, "the closing turn's model is committed");
+    }
+
+    /// A session Cmd that trips ends its session typed `Ended`, and its driver.
+    #[tokio::test]
+    async fn a_tripping_session_cmd_ends_its_session() {
+        let (armed, _signals) = owner();
+        let store = GatedStore::new();
+        let applied = Arc::new(AtomicUsize::new(0));
+        let (entry, msg_tx, driver) = spawn_driver(Arc::clone(&store), armed.drain(), applied);
+        let (cmds, mut closer) = {
+            let e = entry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (Arc::clone(&e.cmds), e.liveness.closer.subscribe())
+        };
+        let tripping: crate::core::IpeTask<crate::IpeError, i64> = Box::pin(async {
+            let never: crate::IpeResult<crate::IpeError, i64> =
+                crate::core::trip(crate::core::RuntimeTrip::RecursionLimit);
+            never
+        });
+        dispatch_cmd(
+            crate::tea::cmd_perform(tripping, |_| 0_i64),
+            &msg_tx,
+            &pubsub::SessionScope::new(new_sid()),
+            &cmds,
+        );
+        let closed = tokio::time::timeout(
+            BUDGET,
+            closer.wait_for(|l| matches!(l.closed(), Some(CloseReason::Ended))),
+        )
+        .await;
+        assert!(
+            matches!(closed, Ok(Ok(_))),
+            "the Cmd's trip reaches the driver, which ends the session"
+        );
+        let ended = tokio::time::timeout(BUDGET, driver).await;
+        assert!(
+            matches!(ended, Ok(Ok(()))),
+            "the driver ends with its session"
+        );
     }
 
     /// A Msg a parked driver takes after the close ends it before `update` or a checkpoint runs.

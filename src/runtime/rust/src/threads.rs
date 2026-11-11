@@ -373,18 +373,6 @@ mod tasks {
             joined.map_err(classify)
         }
 
-        /// The task's output as [`Self::join_contained`] gives it, the task
-        /// running on to its end when this join is dropped first.
-        ///
-        /// # Errors
-        ///
-        /// The task tripped, panicked, or was cancelled.
-        pub async fn join_shielded(self) -> Result<T, Unjoined> {
-            let Self { handle, guard, .. } = self;
-            guard.defuse();
-            handle.await.map_err(classify)
-        }
-
         /// A handle that aborts the task without joining it.
         #[must_use]
         pub fn abort_handle(&self) -> tokio::task::AbortHandle {
@@ -413,17 +401,91 @@ mod tasks {
                 runtime,
             } = self;
             guard.defuse();
-            match owner {
-                Detached::NoIpeCode(_) => drop(handle),
-                Detached::IpeOwned(sink) => {
-                    let watch = async move {
-                        if let Err(failed) = handle.await {
-                            sink.deliver(role, failed);
-                        }
-                    };
-                    #[allow(clippy::disallowed_methods)] // the watcher runs no Ipê code
-                    drop(runtime.spawn(watch));
-                }
+            leave_to(role, handle, owner, &runtime);
+        }
+
+        /// The task's output as [`Self::join_contained`] gives it. Dropped
+        /// before the task ends, the join leaves the task running, answered
+        /// for by `if_dropped`.
+        pub fn join_shielded(self, if_dropped: Detached) -> ShieldedJoin<T> {
+            let Self {
+                role,
+                handle,
+                guard,
+                runtime,
+            } = self;
+            guard.defuse();
+            ShieldedJoin {
+                role,
+                handle: Some(handle),
+                if_dropped: Some(if_dropped),
+                runtime,
+            }
+        }
+    }
+
+    /// Leaves `handle` running unjoined, its end delivered to `owner`.
+    fn leave_to<T: Send + 'static>(
+        role: &'static str,
+        handle: tokio::task::JoinHandle<T>,
+        owner: Detached,
+        runtime: &tokio::runtime::Handle,
+    ) {
+        match owner {
+            Detached::NoIpeCode(_) => drop(handle),
+            Detached::IpeOwned(sink) => {
+                let watch = async move {
+                    if let Err(failed) = handle.await {
+                        sink.deliver(role, failed);
+                    }
+                };
+                #[allow(clippy::disallowed_methods)] // the watcher runs no Ipê code
+                drop(runtime.spawn(watch));
+            }
+        }
+    }
+
+    /// A join that, dropped before its task ends, detaches the task to the
+    /// owner it names instead of aborting it. Its output is `Err` when the
+    /// task tripped, panicked, or was cancelled.
+    #[must_use = "a dropped shielded join detaches its task to its owner"]
+    pub struct ShieldedJoin<T: Send + 'static> {
+        role: &'static str,
+        handle: Option<tokio::task::JoinHandle<T>>,
+        if_dropped: Option<Detached>,
+        runtime: tokio::runtime::Handle,
+    }
+
+    impl<T: Send + 'static> fmt::Debug for ShieldedJoin<T> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("ShieldedJoin")
+                .field("role", &self.role)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl<T: Send + 'static> Future for ShieldedJoin<T> {
+        type Output = Result<T, Unjoined>;
+
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            // Polled again after its end, the join stays pending.
+            let Some(handle) = self.handle.as_mut() else {
+                return std::task::Poll::Pending;
+            };
+            let joined = std::task::ready!(std::pin::Pin::new(handle).poll(cx));
+            self.handle = None;
+            self.if_dropped = None;
+            std::task::Poll::Ready(joined.map_err(classify))
+        }
+    }
+
+    impl<T: Send + 'static> Drop for ShieldedJoin<T> {
+        fn drop(&mut self) {
+            if let (Some(handle), Some(owner)) = (self.handle.take(), self.if_dropped.take()) {
+                leave_to(self.role, handle, owner, &self.runtime);
             }
         }
     }
@@ -672,8 +734,8 @@ mod tasks {
 
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 pub use tasks::{
-    Detached, IpeJoinSet, OwnerEnd, TaskEnded, TaskHandle, TaskScope, TripOwner, TripSink,
-    TripSinkTaken, Unjoined, spawn_service, spawn_task, spawn_task_on, spawn_unmigrated,
+    Detached, IpeJoinSet, OwnerEnd, ShieldedJoin, TaskEnded, TaskHandle, TaskScope, TripOwner,
+    TripSink, TripSinkTaken, Unjoined, spawn_service, spawn_task, spawn_task_on, spawn_unmigrated,
 };
 
 /// Runs `f` inline: without a blocking pool there is no thread to start.
@@ -984,6 +1046,35 @@ mod tests {
             crate::IpeErrorKind::Unexpected
         );
         assert!(!crate::ipe_error_message(err).contains("sk_live_SECRET"));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn a_dropped_shielded_join_hands_the_end_to_its_owner() {
+        let sink = TripSink::new();
+        let owner = sink.owner();
+        assert!(owner.is_ok(), "a fresh sink has no owner");
+        let Ok(owner) = owner else { return };
+        let (go, gate) = tokio::sync::oneshot::channel::<()>();
+        let started = spawn_task("ipe-test-shielded", TaskScope::Caller, async move {
+            let _ = gate.await;
+            tripping()
+        });
+        assert!(started.is_ok(), "a runtime is running");
+        let Ok(started) = started else { return };
+        drop(started.join_shielded(Detached::IpeOwned(sink)));
+        assert!(
+            go.send(()).is_ok(),
+            "a dropped shielded join leaves its task running"
+        );
+        let ended = tokio::time::timeout(DEADLINE, owner.ended()).await;
+        assert!(
+            matches!(
+                &ended,
+                Ok(OwnerEnd::Trip(crate::core::RuntimeTrip::RecursionLimit))
+            ),
+            "the task's trip reaches the owner the dropped join named: {ended:?}"
+        );
     }
 
     #[cfg(feature = "tokio")]
