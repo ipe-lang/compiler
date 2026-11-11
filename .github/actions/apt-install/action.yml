@@ -1,0 +1,83 @@
+name: Install apt packages
+description: >-
+  The one apt package install every CI job runs (ci/verify-manifest.py check
+  27 refuses any other). Each of two attempts first completes an install an
+  earlier cap interrupted mid-unpack, then updates and installs with apt's own
+  download retries, each command capped at six minutes; a failed attempt
+  repoints the runner from the Azure Ubuntu mirror to archive.ubuntu.com
+  before the next.
+
+inputs:
+  packages:
+    description: Space-separated Debian package names on one line (lower-case ASCII letters, digits and `.+:-`, never a leading `-`).
+    required: true
+  archives:
+    description: >-
+      An absolute directory apt keeps fetched archives in, for a job that
+      caches them (ASCII letters, digits and `._-` segments, none `.` or
+      `..`); empty keeps apt's default.
+    required: false
+    default: ""
+  no-install-recommends:
+    description: "`true` installs no recommended packages; `false` keeps apt's default."
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Install the packages
+      shell: bash
+      env:
+        APT_PACKAGES: ${{ inputs.packages }}
+        APT_ARCHIVES: ${{ inputs.archives }}
+        APT_NO_RECOMMENDS: ${{ inputs.no-install-recommends }}
+      run: |
+        set -euo pipefail
+        export LC_ALL=C
+        if [[ "$APT_PACKAGES" == *$'\n'* ]]; then
+          echo "::error::apt-install: packages must be one line" >&2
+          exit 1
+        fi
+        read -r -a packages <<< "$APT_PACKAGES"
+        if [[ ${#packages[@]} -eq 0 ]]; then
+          echo "::error::apt-install: no package named" >&2
+          exit 1
+        fi
+        for package in "${packages[@]}"; do
+          if [[ ! "$package" =~ ^[a-z0-9][a-z0-9.+:-]*$ ]]; then
+            echo "::error::apt-install: '${package}' is not a Debian package name" >&2
+            exit 1
+          fi
+        done
+        install_flags=(-y)
+        case "$APT_NO_RECOMMENDS" in
+          true) install_flags+=(--no-install-recommends) ;;
+          false) ;;
+          *)
+            echo "::error::apt-install: no-install-recommends must be true or false" >&2
+            exit 1
+            ;;
+        esac
+        if [[ -n "$APT_ARCHIVES" ]]; then
+          if [[ ! "$APT_ARCHIVES" =~ ^(/[A-Za-z0-9._-]+)+$ || "$APT_ARCHIVES/" == */../* || "$APT_ARCHIVES/" == */./* ]]; then
+            echo "::error::apt-install: archives must be an absolute directory with no . or .. segment" >&2
+            exit 1
+          fi
+          mkdir -p "$APT_ARCHIVES/partial"
+          install_flags+=(-o "Dir::Cache::archives=$APT_ARCHIVES")
+        fi
+        for attempt in 1 2; do
+          if sudo timeout 360 dpkg --configure -a \
+            && sudo timeout 360 apt-get -o Acquire::Retries=3 update \
+            && sudo timeout 360 apt-get -o Acquire::Retries=3 "${install_flags[@]}" install "${packages[@]}"; then
+            exit 0
+          fi
+          echo "apt attempt $attempt failed or did not finish within its 6 minute cap"
+          for list in /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+            if [[ -f "$list" ]]; then
+              sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' "$list"
+            fi
+          done
+        done
+        exit 1
