@@ -4788,6 +4788,66 @@ fn well_formed_routed_tables_compile() {
     );
 }
 
+/// A routed view that spells `data-ipe-path` (any case) or another
+/// runtime-owned name as a literal attribute name is refused with IPE-L0163.
+///
+/// Each attribute-name kernel is driven; the same view with an unreserved name
+/// compiles.
+#[test]
+fn data_ipe_path_attribute_refused() {
+    let with_view = |view: &str| {
+        routed_fixture(
+            "type Page = HomePage | AboutPage",
+            r#"[ Web.route "/" HomePage, Web.route "/about" AboutPage ]"#,
+            "HomePage",
+            "",
+        )
+        .replace(
+            "import Ipe.Ui as Ui\n",
+            "import Ipe.Ui as Ui\nimport Ipe.Html as Html\nimport Ipe.Html.Attributes as Attr\nimport Ipe.List as List\n",
+        )
+        .replace("view _model = Ui.text \"hi\"", view)
+    };
+    for (name, view) in [
+        (
+            "data_ipe_path_attribute",
+            r#"view _model = Ui.html (Html.node "div" [ Attr.attribute "data-ipe-path" "/about" ] [])"#,
+        ),
+        (
+            "data_ipe_path_attribute_upper",
+            r#"view _model = Ui.html (Html.node "div" [ Attr.attribute "DATA-IPE-PATH" "/about" ] [])"#,
+        ),
+        (
+            "data_ipe_path_bool_attribute",
+            r#"view _model = Ui.html (Html.node "div" [ Attr.boolAttribute "data-ipe-path" True ] [])"#,
+        ),
+        (
+            "data_ipe_path_ui_html_attribute",
+            r#"view _model = Ui.el [ Ui.htmlAttribute "data-ipe-path" "/about" ] (Ui.text "hi")"#,
+        ),
+        (
+            "data_ipe_hid_attribute",
+            r#"view _model = Ui.html (Html.node "div" [ Attr.attribute "data-ipe-hid" "1" ] [])"#,
+        ),
+        (
+            "data_ipe_attribute_partially_applied",
+            r#"view _model = Ui.html (Html.node "div" (List.map (Attr.attribute "data-ipe-mq-rules") [ "a" ]) [])"#,
+        ),
+        (
+            "data_ipe_attribute_let_bound",
+            "view _model =\n    let\n        name = \"data-ipe-path\"\n    in\n    Ui.el [ Ui.htmlAttribute name \"/about\" ] (Ui.text \"hi\")",
+        ),
+    ] {
+        assert_rejected(name, &with_view(view), "IPE-L0163");
+    }
+    assert_compiles(
+        "data_section_attribute_accepted",
+        &with_view(
+            r#"view _model = Ui.html (Html.node "div" [ Attr.attribute "data-section" "/about" ] [])"#,
+        ),
+    );
+}
+
 /// The contrapositive: well-formed literal paths still compile.
 #[test]
 fn well_formed_route_paths_compile() {

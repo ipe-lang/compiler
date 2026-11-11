@@ -137,16 +137,23 @@ pub async fn enable_from_env() {
         ),
     );
     record_exporter_runtime();
-    tokio::spawn(batcher(
-        rx,
-        HubTarget {
-            client,
-            base,
-            token,
-            service,
-        },
-        interval_ms,
-    ));
+    let started = crate::threads::spawn_service(
+        "hub exporter",
+        "the hub's OTLP batch exporter",
+        batcher(
+            rx,
+            HubTarget {
+                client,
+                base,
+                token,
+                service,
+            },
+            interval_ms,
+        ),
+    );
+    if let Err(refused) = started {
+        crate::system::emit_runtime_log("hub", &refused.to_string());
+    }
 }
 
 /// A ready-to-push OTLP/JSON payload for one signal endpoint.

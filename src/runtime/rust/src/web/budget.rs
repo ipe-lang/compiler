@@ -348,6 +348,9 @@ pub struct SessionCmds {
     /// The [`Turn`]s alive now: inputs taken off the session's queues whose
     /// Cmds do not yet hold their own units.
     turns: AtomicUsize,
+    /// Where this session's Cmd tasks deliver a trip or a panic; the session
+    /// driver owns it.
+    ends: crate::threads::TripSink,
 }
 
 /// The driver's hold on one input it took off a session queue, from the take
@@ -387,7 +390,13 @@ impl SessionCmds {
             warned: AtomicBool::new(false),
             dropped_warned: AtomicBool::new(false),
             turns: AtomicUsize::new(0),
+            ends: crate::threads::TripSink::new(),
         }
+    }
+
+    /// The sink this session's Cmd tasks deliver their trip or panic to.
+    pub(crate) fn ends(&self) -> crate::threads::TripSink {
+        self.ends.clone()
     }
 
     /// Begin a turn on this session: an input was taken whose Cmds have not
