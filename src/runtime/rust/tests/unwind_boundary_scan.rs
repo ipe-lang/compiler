@@ -106,11 +106,14 @@ const FUNNEL_FILES: &[&str] = &["threads.rs"];
 /// holds nothing but such namings (see [`names_paths_only`]).
 const PATH_NAMING_FILE: &str = "clippy_paths_resolve.rs";
 
-/// Whether `src` holds only `const _X: () = ..;` items. A const initializer
-/// runs at compile time, where starting a task does not compile, and a unit
-/// value hands no callable to the code that names it, so nothing in such a
-/// file can start a task at run time; a `fn`, `impl`, `static` or a typed
-/// const could.
+/// Whether `src` holds only `const _X: () = ..;` items, each under no
+/// attribute but `cfg` or `doc`, whose initializers declare no item but a type
+/// alias and expand no macro. A const initializer runs at compile time, where starting a task
+/// does not compile, and a unit value hands no callable to the code that names
+/// it. An item declared inside the initializer escapes it (an `impl` there adds
+/// a method to an outside type, the `const _` idiom derives use), and a macro or
+/// an attribute macro can expand to one, so either could start a task at run
+/// time; so could a `fn`, `impl`, `static` or typed const at the top level.
 fn names_paths_only(src: &str) -> bool {
     let Ok(file) = syn::parse_file(src) else {
         return false;
@@ -120,8 +123,36 @@ fn names_paths_only(src: &str) -> bool {
             return false;
         };
         let unit = matches!(&*konst.ty, syn::Type::Tuple(t) if t.elems.is_empty());
-        unit && konst.ident.to_string().starts_with('_')
+        let inert_attrs = konst
+            .attrs
+            .iter()
+            .all(|attr| attr.path().is_ident("cfg") || attr.path().is_ident("doc"));
+        let mut opaque = DeclaresOrExpands::default();
+        opaque.visit_expr(&konst.expr);
+        unit && inert_attrs && !opaque.found && konst.ident.to_string().starts_with('_')
     })
+}
+
+/// Whether a syntax node declares an item other than a type alias, or invokes
+/// a macro, anywhere inside.
+#[derive(Default)]
+struct DeclaresOrExpands {
+    found: bool,
+}
+
+impl<'ast> Visit<'ast> for DeclaresOrExpands {
+    fn visit_item(&mut self, item: &'ast Item) {
+        // A type alias holds no code; it names a denied type for an expectation.
+        if let Item::Type(alias) = item {
+            visit::visit_item_type(self, alias);
+        } else {
+            self.found = true;
+        }
+    }
+
+    fn visit_macro(&mut self, _: &'ast Macro) {
+        self.found = true;
+    }
 }
 
 /// The files whose raw task sites the next migration slice moves onto the
@@ -1017,8 +1048,9 @@ fn task_violations(sources: &[(String, String)], ledger: &[TaskSite]) -> Vec<Str
                 continue;
             }
             out.push(format!(
-                "{file}: holds an item other than a `const _X: () = ..;` naming, so it may \
-                 start a task the scan exempts: keep it to namings"
+                "{file}: holds an item other than a `const _X: () = ..;` naming, or one \
+                 that declares an item, expands a macro or carries an attribute other than \
+                 `cfg`, so it may start a task the scan exempts: keep it to namings"
             ));
         }
         let allows = disallowed_type_allows(file, src);
@@ -1684,6 +1716,10 @@ const _TOKIO: () = {
     #[expect(clippy::disallowed_methods)]
     let _ = ::tokio::task::spawn_local::<R>;
     let _: Option<::tokio::task::JoinSet<()>> = None;
+};
+const _AXUM: () = {
+    type QueryAlias<T> = ::axum::extract::Query<T>;
+    let _: Option<QueryAlias<()>> = None;
 };";
     assert!(names_paths_only(naming));
     let found = task_violations(&sources(&[(PATH_NAMING_FILE, naming)]), &[]);
@@ -1693,6 +1729,13 @@ const _TOKIO: () = {
         "const _T: fn() = || { tokio::spawn(async {}); };",
         "static _T: () = ();\nimpl S { fn start() { tokio::spawn(async {}); } }",
         "const T: () = { let _ = ::tokio::spawn; };",
+        "const _T: () = { impl S { fn start() { tokio::spawn(async {}); } } };",
+        "const _T: () = { let _ = || { fn start() { tokio::spawn(async {}); } }; };",
+        "const _T: () = { spawner!(); };",
+        "const _T: () = { let _ = spawner!(); };",
+        "#[spawner]\nconst _T: () = ();",
+        "#[cfg_attr(all(), spawner)]\nconst _T: () = ();",
+        "const _T: () = { type A = [u8; { spawner!(); 0 }]; };",
     ] {
         assert!(!names_paths_only(smuggled), "{smuggled}");
         let found = task_violations(&sources(&[(PATH_NAMING_FILE, smuggled)]), &[]);
