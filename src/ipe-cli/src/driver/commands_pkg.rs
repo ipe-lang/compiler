@@ -2244,22 +2244,73 @@ fn read_installer_tag(tag_file: Option<&mut crate::scratch::ScratchFile>) -> Opt
 /// [`CliError::UpgradeFeedUnreachable`] when the release feed is offline and
 /// `--check`/`--exit-code` are not in use.
 /// [`CliError::UpgradeCheckExit`] for `--check --exit-code` numeric signals.
-#[allow(clippy::too_many_lines)]
 pub fn run_upgrade(rest: &[String]) -> Result<(), CliError> {
-    use std::io::IsTerminal as _;
+    match parse_upgrade(rest)? {
+        UpgradeRequest::Agents { format } => run_upgrade_agents(format),
+        UpgradeRequest::Binary {
+            dry_run,
+            yes,
+            check,
+            format,
+        } => run_upgrade_binary(dry_run, yes, check, format),
+    }
+}
 
+/// What `ipe upgrade` was asked to do, parsed once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpgradeRequest {
+    /// Upgrade the ipe binary.
+    Binary {
+        /// Show the installer command and stop.
+        dry_run: bool,
+        /// Install without asking.
+        yes: bool,
+        /// Whether to install or only report.
+        check: CheckMode,
+        /// The output format.
+        format: cli_args::OutputFormat,
+    },
+    /// Upgrade this project's `AGENTS.md` to this ipe's guide; never the binary.
+    Agents {
+        /// The output format.
+        format: cli_args::OutputFormat,
+    },
+}
+
+/// Whether a binary upgrade installs or only reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckMode {
+    /// Install a newer release (`--exit-code` without `--check` changes nothing).
+    Install,
+    /// `--check`: report only.
+    Report,
+    /// `--check --exit-code`: report only, and signal the result in the exit code.
+    ReportExitCode,
+}
+
+/// Parse `ipe upgrade`'s arguments into one closed request.
+///
+/// # Errors
+/// [`CliError::Usage`] on an unknown flag or argument, `--plain` with
+/// `--json`, or `--agents` with a flag of the binary upgrade (the first one
+/// given is named).
+fn parse_upgrade(rest: &[String]) -> Result<UpgradeRequest, CliError> {
     let mut dry_run = false;
     let mut yes = false;
     let mut check = false;
     let mut exit_code_flag = false;
+    let mut agents = false;
+    let mut binary_flag: Option<&str> = None;
     let mut format: Option<cli_args::OutputFormat> = None;
 
     for arg in rest {
-        match arg.as_str() {
+        let flag = arg.as_str();
+        match flag {
             "--dry-run" => dry_run = true,
             "--yes" | "-y" => yes = true,
             "--check" => check = true,
             "--exit-code" => exit_code_flag = true,
+            "--agents" => agents = true,
             "--plain" => {
                 if format.is_some() {
                     return Err(CliError::Usage(text::msg::plain_json_exclusive(&"upgrade")));
@@ -2279,9 +2330,45 @@ pub fn run_upgrade(rest: &[String]) -> Result<(), CliError> {
                 return Err(cli_args::usage_unexpected_argument("upgrade", other));
             }
         }
+        if matches!(
+            flag,
+            "--dry-run" | "--yes" | "-y" | "--check" | "--exit-code"
+        ) {
+            binary_flag = binary_flag.or(Some(flag));
+        }
     }
 
-    let fmt = format.unwrap_or_default();
+    let format = format.unwrap_or_default();
+    if agents {
+        return binary_flag.map_or(Ok(UpgradeRequest::Agents { format }), |flag| {
+            Err(CliError::Usage(text::msg::upgrade_agents_alone(&flag)))
+        });
+    }
+    let check = match (check, exit_code_flag) {
+        (false, true | false) => CheckMode::Install,
+        (true, false) => CheckMode::Report,
+        (true, true) => CheckMode::ReportExitCode,
+    };
+    Ok(UpgradeRequest::Binary {
+        dry_run,
+        yes,
+        check,
+        format,
+    })
+}
+
+/// `ipe upgrade` without `--agents`: install a newer ipe, or report.
+#[allow(clippy::too_many_lines)]
+fn run_upgrade_binary(
+    dry_run: bool,
+    yes: bool,
+    check_mode: CheckMode,
+    fmt: cli_args::OutputFormat,
+) -> Result<(), CliError> {
+    use std::io::IsTerminal as _;
+
+    let check = check_mode != CheckMode::Install;
+    let exit_code_flag = check_mode == CheckMode::ReportExitCode;
 
     // --dry-run: show the installer command and stop — no version check needed.
     if dry_run {
@@ -2327,6 +2414,9 @@ pub fn run_upgrade(rest: &[String]) -> Result<(), CliError> {
                 return Err(CliError::UpgradeCheckExit {
                     code: check_exit_code(&version_check::UpgradeAction::UpToDate),
                 });
+            }
+            if !check {
+                suggest_guide_refresh();
             }
             return Ok(());
         }
@@ -2379,13 +2469,7 @@ pub fn run_upgrade(rest: &[String]) -> Result<(), CliError> {
         use std::io::Write as _;
         crate::screen::prompt(&format!("{}{} ", style::GUTTER, text::upgrade_confirm()));
         let _ = std::io::stdout().flush();
-        let mut line = String::new();
-        match std::io::stdin().read_line(&mut line) {
-            Ok(n) if n > 0 => {
-                matches!(line.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes")
-            }
-            _ => false,
-        }
+        crate::prompt_reply::read_stdin_yes_no().consents(true, false)
     } else {
         // Non-TTY stdout or --yes: treat as confirmed.
         yes || !stdout_is_tty
@@ -2395,7 +2479,162 @@ pub fn run_upgrade(rest: &[String]) -> Result<(), CliError> {
         return Ok(());
     }
 
-    run_installer()
+    run_installer()?;
+    crate::screen::Screen::new(crate::screen::Stream::Stdout)
+        .line(
+            crate::screen::Tone::Aux,
+            &text::upgrade_agents_each_project(
+                &crate::agents_guide::UPGRADE_HINT,
+                &crate::agents_guide::FILE_NAME,
+            ),
+        )
+        .emit();
+    Ok(())
+}
+
+/// After an up-to-date `ipe upgrade` in a project, one line when its `AGENTS.md` is not this ipe's guide.
+///
+/// Read-only and silent outside a held project root, for a current guide, and
+/// for an unread one (`ipe health` reports that).
+fn suggest_guide_refresh() {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    if crate::project::locate_project(&cwd).is_err() {
+        return;
+    }
+    let Ok(Some(dir)) = crate::output_dir::held::HeldDir::open(&cwd) else {
+        return;
+    };
+    let Some(line) = guide_suggestion(&crate::agents_guide::read_guide(&dir)) else {
+        return;
+    };
+    crate::screen::Screen::new(crate::screen::Stream::Stdout)
+        .line(crate::screen::Tone::Aux, &line)
+        .emit();
+}
+
+/// The line an up-to-date `ipe upgrade` adds for a guide in `status`, or none.
+fn guide_suggestion(status: &crate::agents_guide::GuideStatus) -> Option<text::Message> {
+    use crate::agents_guide::{FILE_NAME, GuideStatus, StaleReason, UPGRADE_HINT};
+    match status {
+        GuideStatus::Missing | GuideStatus::Stale(StaleReason::OlderGuide { .. }) => Some(
+            text::upgrade_guide_refresh(&FILE_NAME, &status.phrase(), &UPGRADE_HINT),
+        ),
+        GuideStatus::Stale(StaleReason::NewerGuide { .. } | StaleReason::HandEdited(_)) => {
+            Some(text::upgrade_guide_see_health(&FILE_NAME, &status.phrase()))
+        }
+        GuideStatus::Current | GuideStatus::Unread(_) => None,
+    }
+}
+
+/// `ipe upgrade --agents`: bring this project's `AGENTS.md` to this ipe's guide.
+///
+/// Never touches the release feed or another ipe. A hand-edited file is
+/// replaced only on a terminal, after a yes, and only after its bytes are
+/// kept in `.ipe-backup/`.
+///
+/// # Errors
+/// [`CliError::AgentsGuideRefused`] when nothing was written;
+/// [`CliError::Io`] on a filesystem failure, the file left intact.
+fn run_upgrade_agents(format: cli_args::OutputFormat) -> Result<(), CliError> {
+    use crate::agents_guide::{self as guide, Answer, GuideRefusal, Planned};
+    let cwd = std::env::current_dir().map_err(|e| io_err(Path::new("."), e))?;
+    crate::project::locate_project(&cwd)
+        .map_err(|no| CliError::AgentsGuideRefused(GuideRefusal::OutsideProject(no)))?;
+    let dir = crate::output_dir::held::HeldDir::open(&cwd)?
+        .ok_or(CliError::AgentsGuideRefused(GuideRefusal::ProjectUnheld))?;
+    let outcome = match guide::plan(&dir).map_err(CliError::AgentsGuideRefused)? {
+        Planned::Ready(plan) => guide::apply(&dir, plan)?,
+        Planned::NeedsConsent(hand_edited) => {
+            let answer = match (format, crate::screen::Interactive::detect()) {
+                (cli_args::OutputFormat::Plain | cli_args::OutputFormat::Json, _) => {
+                    Answer::MachineOutput
+                }
+                (cli_args::OutputFormat::Human, None) => Answer::NoTerminal,
+                (cli_args::OutputFormat::Human, Some(tty)) => {
+                    if tty.ask_yes_no(&text::upgrade_agents_ask(&guide::FILE_NAME), false) {
+                        Answer::Yes
+                    } else {
+                        Answer::No
+                    }
+                }
+            };
+            match guide::consent(answer) {
+                Some(consent) => guide::apply_consented(&dir, hand_edited, consent)?,
+                None => return Err(CliError::AgentsGuideRefused(hand_edited.refuse())),
+            }
+        }
+    };
+    render_upgrade_agents(&outcome, format);
+    Ok(())
+}
+
+/// Print an `ipe upgrade --agents` outcome in `format`.
+fn render_upgrade_agents(
+    outcome: &crate::agents_guide::UpgradeOutcome,
+    format: cli_args::OutputFormat,
+) {
+    use crate::screen::{Screen, Stream, Tone, emit_machine};
+    match format {
+        cli_args::OutputFormat::Human => {
+            Screen::new(Stream::Stdout)
+                .line(Tone::Success, &upgrade_agents_human(outcome))
+                .emit();
+        }
+        cli_args::OutputFormat::Plain => {
+            emit_machine(Stream::Stdout, &upgrade_agents_plain(outcome));
+        }
+        cli_args::OutputFormat::Json => {
+            emit_machine(Stream::Stdout, &upgrade_agents_json(outcome));
+        }
+    }
+}
+
+/// The human line of an `ipe upgrade --agents` outcome.
+fn upgrade_agents_human(outcome: &crate::agents_guide::UpgradeOutcome) -> text::Message {
+    use crate::agents_guide::{FILE_NAME, UpgradeOutcome};
+    let running = version_check::current_version();
+    match outcome {
+        UpgradeOutcome::Current => text::upgrade_agents_current(&FILE_NAME, &running),
+        UpgradeOutcome::Rewritten { from } => {
+            text::upgrade_agents_rewritten(&FILE_NAME, from, &running)
+        }
+        UpgradeOutcome::Created => text::upgrade_agents_created(&FILE_NAME, &running),
+        UpgradeOutcome::Replaced { backup } => {
+            text::upgrade_agents_replaced(&FILE_NAME, backup, &running)
+        }
+    }
+}
+
+/// The `--plain` line of an `ipe upgrade --agents` outcome.
+fn upgrade_agents_plain(outcome: &crate::agents_guide::UpgradeOutcome) -> String {
+    use crate::agents_guide::UpgradeOutcome;
+    match outcome {
+        UpgradeOutcome::Current => "current\n".to_owned(),
+        UpgradeOutcome::Rewritten { from } => format!("rewritten {from}\n"),
+        UpgradeOutcome::Created => "created\n".to_owned(),
+        UpgradeOutcome::Replaced { backup } => format!("replaced {backup}\n"),
+    }
+}
+
+/// The `--json` object of an `ipe upgrade --agents` outcome.
+fn upgrade_agents_json(outcome: &crate::agents_guide::UpgradeOutcome) -> String {
+    use crate::agents_guide::{FILE_NAME, UpgradeOutcome};
+    let (tag, from, backup) = match outcome {
+        UpgradeOutcome::Current => ("current", None, None),
+        UpgradeOutcome::Rewritten { from } => ("rewritten", Some(from.to_string()), None),
+        UpgradeOutcome::Created => ("created", None, None),
+        UpgradeOutcome::Replaced { backup } => ("replaced", None, Some(backup.to_string())),
+    };
+    let object = serde_json::json!({
+        "file": FILE_NAME,
+        "outcome": tag,
+        "from": from,
+        "backup": backup,
+        "ipe": version_check::current_version().to_string(),
+    });
+    format!("{object}\n")
 }
 
 /// The installer hand-off `ipe upgrade` performs, as a shell command a user can run by hand.
@@ -3773,20 +4012,10 @@ pub fn read_yes_no() -> bool {
 /// Read a line from stdin and interpret it as a yes/no answer, taking `default`
 /// when the answer is empty (a bare Enter). An explicit `y`/`yes` or `n`/`no`
 /// overrides the default; EOF or any read error takes the default, so the caller
-/// controls the fail-safe direction (default `false` for a mutating action).
+/// controls the fail-safe direction (default `false` for a mutating action). A
+/// line over the answer cap or not UTF-8 is never consent.
 pub fn read_yes_no_default(default: bool) -> bool {
-    let mut line = String::new();
-    match std::io::stdin().read_line(&mut line) {
-        Ok(_) => {
-            let a = line.trim();
-            if a.is_empty() {
-                default
-            } else {
-                a.eq_ignore_ascii_case("y") || a.eq_ignore_ascii_case("yes")
-            }
-        }
-        Err(_) => default,
-    }
+    crate::prompt_reply::read_stdin_yes_no().consents(default, default)
 }
 
 /// Replace a user-owned file atomically.
@@ -5303,5 +5532,180 @@ mod test_runner_key_tests {
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))),
             "malformed marker: {marker}"
         );
+    }
+}
+
+#[cfg(test)]
+mod upgrade_agents_tests {
+    use super::*;
+    use crate::agents_guide::{
+        self as guide, Answer, FILE_NAME, GuideStatus, HandEdit, Planned, StaleReason,
+        UPGRADE_HINT, Unread, UpgradeOutcome,
+    };
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|arg| (*arg).to_owned()).collect()
+    }
+
+    /// `--agents` with any flag of the binary upgrade is a usage error naming that flag.
+    #[test]
+    fn agents_flag_conflicts_refused() {
+        for flag in ["--check", "--exit-code", "--dry-run", "--yes", "-y"] {
+            for order in [["--agents", flag], [flag, "--agents"]] {
+                let parsed = parse_upgrade(&args(&order));
+                assert!(
+                    matches!(&parsed, Err(CliError::Usage(message)) if message.as_str().contains(flag)),
+                    "{order:?} must be refused naming {flag}, got {parsed:?}"
+                );
+            }
+        }
+        for (given, want) in [
+            (vec!["--agents"], cli_args::OutputFormat::Human),
+            (vec!["--agents", "--plain"], cli_args::OutputFormat::Plain),
+            (vec!["--json", "--agents"], cli_args::OutputFormat::Json),
+        ] {
+            let parsed = parse_upgrade(&args(&given));
+            assert!(
+                matches!(&parsed, Ok(UpgradeRequest::Agents { format }) if *format == want),
+                "{given:?} is an agents upgrade, got {parsed:?}"
+            );
+        }
+    }
+
+    /// Without `--agents` the flags keep their binary-upgrade meaning.
+    #[test]
+    fn binary_flags_parse_without_agents() {
+        let parsed = parse_upgrade(&args(&["--check", "--exit-code"]));
+        assert!(
+            matches!(
+                parsed,
+                Ok(UpgradeRequest::Binary {
+                    check: CheckMode::ReportExitCode,
+                    dry_run: false,
+                    yes: false,
+                    ..
+                })
+            ),
+            "{parsed:?}"
+        );
+        let parsed = parse_upgrade(&args(&["--exit-code"]));
+        assert!(
+            matches!(
+                parsed,
+                Ok(UpgradeRequest::Binary {
+                    check: CheckMode::Install,
+                    ..
+                })
+            ),
+            "{parsed:?}"
+        );
+    }
+
+    /// No answer but yes gives consent.
+    #[test]
+    fn agents_declined_is_hand_edited() {
+        assert!(guide::consent(Answer::Yes).is_some());
+        for answer in [Answer::No, Answer::NoTerminal, Answer::MachineOutput] {
+            assert!(
+                guide::consent(answer).is_none(),
+                "{answer:?} gives no consent"
+            );
+        }
+    }
+
+    /// The `replaced` outcome renders its backup in both machine forms.
+    #[test]
+    fn replaced_renders_its_backup_in_plain_and_json() {
+        let base = ipe_test_temp::temp_root()
+            .join(format!("ipe_upgrade_agents_render_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("make scratch");
+        std::fs::write(base.join(FILE_NAME), "my own notes\n").expect("plant the file");
+        let dir = crate::output_dir::held::HeldDir::open(&base)
+            .expect("open scratch")
+            .expect("scratch exists");
+        let planned = guide::plan(&dir);
+        assert!(
+            matches!(planned, Ok(Planned::NeedsConsent(_))),
+            "{planned:?}"
+        );
+        let Ok(Planned::NeedsConsent(hand_edited)) = planned else {
+            return;
+        };
+        let consent = guide::consent(Answer::Yes).expect("yes consents");
+        let outcome = guide::apply_consented(&dir, hand_edited, consent).expect("replaced");
+        assert!(
+            matches!(outcome, UpgradeOutcome::Replaced { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            upgrade_agents_plain(&outcome),
+            "replaced .ipe-backup/AGENTS.md.bak\n"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&upgrade_agents_json(&outcome)).expect("one JSON object");
+        assert_eq!(
+            json.get("outcome"),
+            Some(&serde_json::Value::from("replaced"))
+        );
+        assert_eq!(
+            json.get("backup"),
+            Some(&serde_json::Value::from(".ipe-backup/AGENTS.md.bak"))
+        );
+        assert_eq!(json.get("file"), Some(&serde_json::Value::from(FILE_NAME)));
+        assert_eq!(json.get("from"), Some(&serde_json::Value::Null));
+        assert_eq!(
+            json.get("ipe"),
+            Some(&serde_json::Value::from(
+                version_check::current_version().to_string()
+            ))
+        );
+        assert_eq!(json.as_object().map(serde_json::Map::len), Some(5));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The other outcomes' plain forms.
+    #[test]
+    fn outcomes_render_in_plain() {
+        let from = semver::Version::new(0, 0, 1);
+        assert_eq!(upgrade_agents_plain(&UpgradeOutcome::Current), "current\n");
+        assert_eq!(upgrade_agents_plain(&UpgradeOutcome::Created), "created\n");
+        assert_eq!(
+            upgrade_agents_plain(&UpgradeOutcome::Rewritten { from }),
+            "rewritten 0.0.1\n"
+        );
+    }
+
+    /// An up-to-date upgrade points a missing or older guide at the hint, a newer or edited one at health, and says nothing otherwise.
+    #[test]
+    fn up_to_date_suggestion_by_guide_state() {
+        let from = semver::Version::new(0, 0, 1);
+        for status in [
+            GuideStatus::Missing,
+            GuideStatus::Stale(StaleReason::OlderGuide {
+                written_by: from.clone(),
+            }),
+        ] {
+            let line = guide_suggestion(&status);
+            assert!(
+                line.as_ref()
+                    .is_some_and(|line| line.as_str().contains(UPGRADE_HINT)),
+                "{status:?} suggests {UPGRADE_HINT}, got {line:?}"
+            );
+        }
+        for status in [
+            GuideStatus::Stale(StaleReason::NewerGuide { written_by: from }),
+            GuideStatus::Stale(StaleReason::HandEdited(HandEdit::Edited)),
+        ] {
+            let line = guide_suggestion(&status);
+            assert!(
+                line.as_ref()
+                    .is_some_and(|line| line.as_str().contains("ipe health")),
+                "{status:?} points at health, got {line:?}"
+            );
+        }
+        for status in [GuideStatus::Current, GuideStatus::Unread(Unread::Link)] {
+            assert!(guide_suggestion(&status).is_none(), "{status:?} is silent");
+        }
     }
 }

@@ -979,7 +979,7 @@ jobs:
           tool: nextest@0.9.146
       - name: Test the transfer containment and linkable build directory on Windows
         shell: bash
-        run: cargo nextest run --locked -p ipe --lib --profile ci -E 'test(remote_ingest::) | test(target_dir::) | test(driver_error::link_failure) | test(compile_stack::)'
+        run: cargo nextest run --locked -p ipe --lib --profile ci -E 'test(remote_ingest::) | test(target_dir::) | test(driver_error::link_failure) | test(compile_stack::) | test(agents_guide::) | test(output_dir::held::) | test(init::tests::managed_write_)'
 
   # Required aggregation gate for `test`: green only when every shard, the
   # doctest job (in test-prep), the feature job `wasi-run` and the Windows job
