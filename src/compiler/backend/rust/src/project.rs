@@ -229,6 +229,12 @@ lto = true
 panic = "abort"
 strip = true
 
+# The custom cfg names the vendored sources test, mirroring the
+# `cargo::rustc-check-cfg` lines of the runtime crate's `build.rs`. This crate
+# has no build script, so each stays unset (off) and is only declared here.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(ipe_asan)"] }
+
 # Detach this generated crate from any ancestor cargo workspace so it builds
 # hermetically even when emitted inside another workspace tree.
 [workspace]
@@ -1383,13 +1389,7 @@ const TEA_TYPE_ALIASES: &str = "pub type IpeCmd<M> = ipe_runtime::tea::IpeCmd<M>
 /// unchanged (it has no dependency on `secret.rs`); the typed boundary lives
 /// entirely at this Ipê-facing wrapper, matching the fix spec's design.
 ///
-/// `auth_register`, `auth_login`, and `auth_set_role` are gated on
-/// `#[cfg(feature = "db")]` in the runtime source, so the three wrappers
-/// here are also gated.  A non-db Auth-only program (using only `hashPassword`
-/// / `verifyPassword` / `signToken` / `verifyToken`) will compile the four
-/// ungated wrappers + the `passwordStrength` helper and ignore the db-gated
-/// three.  When `uses_db` is also true the `db` feature is in the generated
-/// project's defaults and the db-gated wrappers become active.
+/// The db-backed wrappers live in [`AUTH_DB_WRAPPERS`], chosen at emit time.
 const AUTH_WRAPPERS: &str = "\
 pub fn auth_hash_password(pw: String) -> IpeResult<IpeError, String> {\n    \
     ipe_runtime::auth::auth_hash_password(pw)\n\
@@ -1410,16 +1410,25 @@ pub fn auth_sign_token(\n    \
 }\n\n\
 pub fn auth_verify_token(secret: ipe_runtime::secret::Secret, token: String) -> IpeResult<ipe_runtime::IpeAuthError, HashMap<String, String>> {\n    \
     ipe_runtime::auth::auth_verify_token(ipe_runtime::secret::secret_reveal(secret), token)\n\
-}\n\n\
-#[cfg(feature = \"db\")]\n\
+}\n\
+";
+
+/// The `Ipe.Auth` wrappers over the runtime's db-backed account store.
+///
+/// The runtime compiles `auth_register` / `auth_login` / `auth_set_role` only
+/// with its `db` feature, which is on exactly when the program uses Db (in
+/// both the vendored and the dependency emit model). The emitter therefore
+/// appends these wrappers only for a program that uses both Auth and Db, so
+/// the emitted `main.rs` tests no feature of its own: the app crate of the
+/// dependency model declares no `db` feature, and a source gate there would
+/// silently compile the wrappers out.
+const AUTH_DB_WRAPPERS: &str = "\
 pub fn auth_register(conn: Db, email: String, password: String) -> IpeTask<i64> {\n    \
     ipe_runtime::auth::auth_register(conn, email, password)\n\
 }\n\n\
-#[cfg(feature = \"db\")]\n\
 pub fn auth_login(conn: Db, email: String, password: String) -> IpeTask<i64> {\n    \
     ipe_runtime::auth::auth_login(conn, email, password)\n\
 }\n\n\
-#[cfg(feature = \"db\")]\n\
 pub fn auth_set_role(conn: Db, user_id: i64, role: String) -> IpeTask<()> {\n    \
     ipe_runtime::auth::auth_set_role(conn, user_id, role)\n\
 }\n\
@@ -1712,6 +1721,9 @@ fn prelude_section(ctx: &EmitCtx) -> DResult<String> {
     // Ipe.Auth kernels → concrete E = IpeError wrappers.
     if ctx.uses_auth {
         section.push(AUTH_WRAPPERS);
+        if ctx.uses_db {
+            section.push(AUTH_DB_WRAPPERS);
+        }
     }
     Ok(section.render())
 }
@@ -4004,11 +4016,15 @@ fn db_cargo_toml(base: &str, driver: crate::DbDriver) -> DResult<String> {
 
 /// Build the server-enabled `Cargo.toml` from the given base manifest by:
 ///
-/// 1. Adding `"server"` to the `default` feature list.
+/// 1. Promoting the base manifest's inert `server = []` into the `default`
+///    feature list.
 /// 2. Appending `axum`, `tower-http` (with `timeout`), and `tower` (with
 ///    `limit`) dependency lines before `[profile.dev]` — the latter two back
 ///    the front-door denial-of-service ceilings (`TimeoutLayer` +
 ///    `GlobalConcurrencyLimitLayer`).
+///
+/// The base manifest declares `server`, so a non-server emit tests the gate as
+/// a known-off feature; this augmenter only switches it on.
 ///
 /// Takes the current manifest string so it can be composed with
 /// [`db_cargo_toml`] when a program uses both Db and Server kernels.
@@ -4018,12 +4034,7 @@ fn db_cargo_toml(base: &str, driver: crate::DbDriver) -> DResult<String> {
 /// Returns [`Diagnostic::CompilerBug`] if any anchor string is absent —
 /// a golden-drift invariant violation.
 fn server_cargo_toml(base: &str) -> DResult<String> {
-    // All anchor consts up front — items_after_statements lint requires items
-    // to precede any `let` statement in the same scope.
-    const DEFAULT_PREFIX: &str = "default = [";
-    const DB_FEATURE: &str = "db = []";
-    const DB_SERVER_FEATURE: &str = "db = []\nserver = []";
-    const PROFILE_ANCHOR: &str = "[profile.dev]";
+    const WHERE: &str = "ipe_backend_rust::project::server_cargo_toml";
     // `tower` (`limit`) backs the front-door concurrency cap
     // (`GlobalConcurrencyLimitLayer`); `tower-http`'s `timeout` backs the
     // per-request slowloris timeout (`TimeoutLayer`). Both are referenced in
@@ -4038,63 +4049,53 @@ fn server_cargo_toml(base: &str) -> DResult<String> {
         crate_specs::TOWER.name,
         crate_specs::TOWER.version,
     );
+    let promoted = promote_declared_feature(base, "server", WHERE)?;
+    insert_before_profile_dev(&promoted, &server_deps, WHERE)
+}
 
-    // Step 1a — insert `"server"` as the LAST element of the `default = [...]`
-    // feature list, immediately before its closing `]`.
-    //
-    // This generic anchor handles every composition:
-    //   non-db:  `default = ["tokio", "crypto", "json"]`
-    //            → `default = ["tokio", "crypto", "json", "server"]`
-    //   db:      `default = ["tokio", "json", "db", "secret"]`
-    //            → `default = ["tokio", "json", "db", "secret", "server"]`
-    //   any future feature:  likewise, without needing a new anchor string.
-    //
-    // Fail-closed: if the prefix or the closing `]` is absent the manifest
-    // has drifted from the golden and we surface a CompilerBug rather than
-    // silently emitting an invalid manifest.
-    let pfx = base
-        .find(DEFAULT_PREFIX)
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::server_cargo_toml",
-            detail: format!("Cargo.toml anchor {DEFAULT_PREFIX:?} not found — golden drifted"),
-        })?;
-    let search_from = pfx + DEFAULT_PREFIX.len();
-    let rel = base
-        .get(search_from..)
-        .and_then(|s| s.find(']'))
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::server_cargo_toml",
-            detail: "default feature list has no closing ']' — golden drifted".to_owned(),
-        })?;
-    let close = search_from + rel;
-    let mut step1a = String::with_capacity(base.len() + 12);
-    step1a.push_str(base.get(..close).unwrap_or(""));
-    step1a.push_str(r#", "server""#);
-    step1a.push_str(base.get(close..).unwrap_or(""));
-
-    // Step 1b — define the `server = []` feature flag so that "server" in
-    // `default = [...]` refers to a declared feature rather than an undeclared
-    // name (Cargo rejects an undeclared feature reference with E0015).
-    // Anchor on the `db = []` line which is always present in the base manifest.
-    let step1 = step1a.replacen(DB_FEATURE, DB_SERVER_FEATURE, 1);
-    if step1 == step1a {
+/// Promote `feature` into `default`, refusing a feature the base manifest does
+/// not declare.
+///
+/// Every gate name the emitted sources test is declared once, inert, by the
+/// base manifest; an augmenter only switches it on. A missing declaration is a
+/// drifted base template, surfaced as [`Diagnostic::CompilerBug`] rather than
+/// a `default` entry naming an unknown feature.
+///
+/// # Errors
+///
+/// Returns [`Diagnostic::CompilerBug`] (attributed to `where_`) when the base
+/// does not declare `feature` or the `default` anchor is absent.
+fn promote_declared_feature(base: &str, feature: &str, where_: &'static str) -> DResult<String> {
+    let declaration = format!("\n{feature} = [");
+    if !base.contains(&declaration) {
         return Err(Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::server_cargo_toml",
-            detail: format!("Cargo.toml anchor {DB_FEATURE:?} not found — golden drifted"),
+            where_,
+            detail: format!(
+                "base Cargo.toml does not declare feature `{feature}` — golden drifted"
+            ),
         });
     }
+    promote_default_feature(base, feature, where_)
+}
 
-    // Step 2 — append axum + tower-http before `[profile.dev]`.
-    let anchor_pos = step1
+/// Splice `deps` into the manifest immediately before `[profile.dev]`.
+///
+/// # Errors
+///
+/// Returns [`Diagnostic::CompilerBug`] (attributed to `where_`) when the
+/// `[profile.dev]` anchor is absent — a golden-drift invariant violation.
+fn insert_before_profile_dev(base: &str, deps: &str, where_: &'static str) -> DResult<String> {
+    const PROFILE_ANCHOR: &str = "[profile.dev]";
+    let anchor_pos = base
         .find(PROFILE_ANCHOR)
         .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::server_cargo_toml",
+            where_,
             detail: format!("Cargo.toml anchor {PROFILE_ANCHOR:?} not found — golden drifted"),
         })?;
-    let mut result = String::with_capacity(step1.len() + server_deps.len());
-    result.push_str(step1.get(..anchor_pos).unwrap_or(""));
-    result.push_str(&server_deps);
-    result.push_str(step1.get(anchor_pos..).unwrap_or(""));
+    let mut result = String::with_capacity(base.len() + deps.len());
+    result.push_str(base.get(..anchor_pos).unwrap_or(""));
+    result.push_str(deps);
+    result.push_str(base.get(anchor_pos..).unwrap_or(""));
     Ok(result)
 }
 
@@ -4544,8 +4545,8 @@ fn email_cargo_toml(base: &str) -> DResult<String> {
 /// Three mutations are needed (dep model uses the `locale` runtime feature
 /// instead, so this path applies only to the vendored fallback):
 ///
-/// 1. Add `locale = ["dep:icu_casemap", "dep:icu_locale_core"]` to `[features]`
-///    so that `locale.rs`'s `#[cfg(feature = "locale")]` paths compile.
+/// 1. Upgrade the base manifest's inert `locale = []` to
+///    `locale = ["dep:icu_casemap", "dep:icu_locale_core"]`.
 /// 2. Promote `locale` into the `default` feature list so the emitted crate
 ///    activates it without requiring an explicit `--features locale` flag.
 /// 3. Add `icu_casemap` and `icu_locale_core` as optional dependencies before
@@ -4556,9 +4557,9 @@ fn email_cargo_toml(base: &str) -> DResult<String> {
 /// Returns [`Diagnostic::CompilerBug`] if any expected anchor is absent — a
 /// golden-drift invariant violation (fail-loud, never a silent no-op).
 fn locale_cargo_toml(base: &str) -> DResult<String> {
-    const DEFAULT_PREFIX: &str = "default = [";
-    const FEATURES_ANCHOR: &str = "[features]";
-    const PROFILE_ANCHOR: &str = "[profile.dev]";
+    const WHERE: &str = "ipe_backend_rust::project::locale_cargo_toml";
+    const INERT: &str = "\nlocale = []\n";
+    const ACTIVE: &str = "\nlocale = [\"dep:icu_casemap\", \"dep:icu_locale_core\"]\n";
 
     let icu_deps = format!(
         "{} = {{ version = \"{}\", optional = true }}\n\
@@ -4569,62 +4570,15 @@ fn locale_cargo_toml(base: &str) -> DResult<String> {
         crate_specs::ICU_LOCALE_CORE.version,
     );
 
-    // Step 1 — promote `locale` into the `default = [...]` list.
-    let pfx = base
-        .find(DEFAULT_PREFIX)
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::locale_cargo_toml",
-            detail: format!("Cargo.toml anchor {DEFAULT_PREFIX:?} not found — golden drifted"),
-        })?;
-    let search_from = pfx + DEFAULT_PREFIX.len();
-    let rel = base
-        .get(search_from..)
-        .and_then(|s| s.find(']'))
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::locale_cargo_toml",
-            detail: "default feature list has no closing ']' — golden drifted".to_owned(),
-        })?;
-    let close = search_from + rel;
-    let mut step1 = String::with_capacity(base.len() + 128);
-    step1.push_str(base.get(..close).unwrap_or(""));
-    step1.push_str(r#", "locale""#);
-    step1.push_str(base.get(close..).unwrap_or(""));
-
-    // Step 2 — add the `locale` feature entry after `[features]`.
-    let locale_feature = "locale = [\"dep:icu_casemap\", \"dep:icu_locale_core\"]\n";
-    let features_pos = step1
-        .find(FEATURES_ANCHOR)
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::locale_cargo_toml",
-            detail: format!("Cargo.toml anchor {FEATURES_ANCHOR:?} not found — golden drifted"),
-        })?;
-    let after_features = features_pos + FEATURES_ANCHOR.len();
-    // Insert the feature declaration right after the `[features]` header line.
-    let newline_pos = step1
-        .get(after_features..)
-        .and_then(|s| s.find('\n'))
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::locale_cargo_toml",
-            detail: "no newline after [features] — golden drifted".to_owned(),
-        })?;
-    let insert_at = after_features + newline_pos + 1;
-    let mut step2 = String::with_capacity(step1.len() + locale_feature.len());
-    step2.push_str(step1.get(..insert_at).unwrap_or(""));
-    step2.push_str(locale_feature);
-    step2.push_str(step1.get(insert_at..).unwrap_or(""));
-
-    // Step 3 — add the optional ICU4X deps before `[profile.dev]`.
-    let anchor_pos = step2
-        .find(PROFILE_ANCHOR)
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::locale_cargo_toml",
-            detail: format!("Cargo.toml anchor {PROFILE_ANCHOR:?} not found — golden drifted"),
-        })?;
-    let mut result = String::with_capacity(step2.len() + icu_deps.len());
-    result.push_str(step2.get(..anchor_pos).unwrap_or(""));
-    result.push_str(&icu_deps);
-    result.push_str(step2.get(anchor_pos..).unwrap_or(""));
-    Ok(result)
+    if !base.contains(INERT) {
+        return Err(Diagnostic::CompilerBug {
+            where_: WHERE,
+            detail: format!("Cargo.toml anchor {INERT:?} not found — golden drifted"),
+        });
+    }
+    let upgraded = base.replacen(INERT, ACTIVE, 1);
+    let promoted = promote_declared_feature(&upgraded, "locale", WHERE)?;
+    insert_before_profile_dev(&promoted, &icu_deps, WHERE)
 }
 
 /// Build the URL-enabled `Cargo.toml` by appending the `url` dependency before
@@ -5076,16 +5030,13 @@ fn crypto_cargo_toml(base: &str) -> DResult<String> {
 
 /// Build the JWT-enabled `Cargo.toml` from the given base manifest by:
 ///
-/// 1. Adding `"jwt"` to the `default` feature list — `auth.rs` and `server.rs`
-///    in the vendored runtime carry `#[cfg(feature = "jwt")]` guards over
-///    `AuthConfig`, `server_get_authed`, and the JWT sign/verify helpers.
-///    Without `"jwt"` in `default`, those items are compiled out and `main.rs`
-///    references to `AuthConfig` fail with E0425 (ipe exit 0, cargo fails —
-///    a SEAL breach).
-/// 2. Declaring `jwt = []` in the `[features]` table (anchoring on `db = []`,
-///    always present in the base manifest), so the `"jwt"` entry in `default`
-///    refers to a declared feature rather than an undeclared name.
-/// 3. Appending the `jsonwebtoken` dependency before `[profile.dev]`.
+/// 1. Promoting the base manifest's inert `jwt = []` into the `default` feature
+///    list — `auth.rs` and `server.rs` in the vendored runtime carry
+///    `#[cfg(feature = "jwt")]` guards over `AuthConfig`, `server_get_authed`,
+///    and the JWT sign/verify helpers. Without `"jwt"` in `default`, those
+///    items are compiled out and `main.rs` references to `AuthConfig` fail with
+///    E0425 (ipe exit 0, cargo fails — a SEAL breach).
+/// 2. Appending the `jsonwebtoken` dependency before `[profile.dev]`.
 ///
 /// `jwt.rs` (and `auth.rs`, which reaches `crate::jwt`) is the sole consumer of
 /// `jsonwebtoken`. The crate is a leaf — a program that never encodes or
@@ -5099,62 +5050,14 @@ fn crypto_cargo_toml(base: &str) -> DResult<String> {
 /// Returns [`Diagnostic::CompilerBug`] if any anchor string is absent —
 /// a golden-drift invariant violation (fail-loud, never a silent no-op).
 fn jwt_cargo_toml(base: &str) -> DResult<String> {
-    const DEFAULT_PREFIX: &str = "default = [";
-    const DB_FEATURE: &str = "db = []";
-    const DB_JWT_FEATURE: &str = "db = []\njwt = []";
-    const PROFILE_ANCHOR: &str = "[profile.dev]";
+    const WHERE: &str = "ipe_backend_rust::project::jwt_cargo_toml";
     let deps = format!(
         "{} = \"{}\"\n\n",
         crate_specs::JSONWEBTOKEN.name,
         crate_specs::JSONWEBTOKEN.version,
     );
-
-    // Step 1a — insert `"jwt"` as the last element of the `default = [...]`
-    // feature list, immediately before its closing `]`.
-    let pfx = base
-        .find(DEFAULT_PREFIX)
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::jwt_cargo_toml",
-            detail: format!("Cargo.toml anchor {DEFAULT_PREFIX:?} not found — golden drifted"),
-        })?;
-    let search_from = pfx + DEFAULT_PREFIX.len();
-    let rel = base
-        .get(search_from..)
-        .and_then(|s| s.find(']'))
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::jwt_cargo_toml",
-            detail: "default feature list has no closing ']' — golden drifted".to_owned(),
-        })?;
-    let close = search_from + rel;
-    let mut step1a = String::with_capacity(base.len() + deps.len() + 16);
-    step1a.push_str(base.get(..close).unwrap_or(""));
-    step1a.push_str(r#", "jwt""#);
-    step1a.push_str(base.get(close..).unwrap_or(""));
-
-    // Step 1b — declare `jwt = []` in the `[features]` table so that `"jwt"` in
-    // `default = [...]` refers to a declared feature (Cargo rejects an undeclared
-    // feature reference). Anchor on the `db = []` line, always present in the
-    // base manifest.
-    let step1 = step1a.replacen(DB_FEATURE, DB_JWT_FEATURE, 1);
-    if step1 == step1a {
-        return Err(Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::jwt_cargo_toml",
-            detail: format!("Cargo.toml anchor {DB_FEATURE:?} not found — golden drifted"),
-        });
-    }
-
-    // Step 2 — append `jsonwebtoken` before `[profile.dev]`.
-    let anchor_pos = step1
-        .find(PROFILE_ANCHOR)
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::jwt_cargo_toml",
-            detail: format!("Cargo.toml anchor {PROFILE_ANCHOR:?} not found — golden drifted"),
-        })?;
-    let mut result = String::with_capacity(step1.len() + deps.len());
-    result.push_str(step1.get(..anchor_pos).unwrap_or(""));
-    result.push_str(&deps);
-    result.push_str(step1.get(anchor_pos..).unwrap_or(""));
-    Ok(result)
+    let promoted = promote_declared_feature(base, "jwt", WHERE)?;
+    insert_before_profile_dev(&promoted, &deps, WHERE)
 }
 
 /// Promote the `secret` feature into the vendored manifest's `default = [...]`

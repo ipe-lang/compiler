@@ -1,5 +1,4 @@
-//! Every cargo feature a vendored runtime file names in a `cfg` is one the
-//! vendored manifest declares.
+//! Every cfg name an emitted crate's sources test is one its manifest declares.
 //!
 //! rustc evaluates a `feature = "x"` predicate naming an undeclared feature to
 //! false, with only an `unexpected_cfgs` warning, so a gate naming a feature the
@@ -7,16 +6,25 @@
 //! build without a word. The scan lexes each vendored source (the runtime tree
 //! the driver copies into `src/ipe_runtime/`, the trimmed `ipe_runtime/mod.rs`
 //! and stub `config.rs` templates, and the `RUNTIME_MOD_RS_*` appends) and
-//! refuses any feature name outside the set the vendored manifest and its
-//! augmenters declare. The converse holds too: every feature an app manifest
-//! declares is read by some compiled gate, so none is selected for nothing.
+//! refuses any feature name the BASE vendored manifest leaves undeclared. The
+//! augmenters never declare a name, only promote or upgrade one the base
+//! declares inert, so the base table is the declared set of every augmenter
+//! combination. Custom cfg names (`ipe_asan`) are held to the manifest's
+//! `check-cfg` list, itself held equal to the runtime build script's. The
+//! emitted `main.rs` text tests only features every native app manifest
+//! declares. The converse holds too: every feature an app manifest declares is
+//! read by some compiled gate, so none is selected for nothing.
 
 #![cfg(test)]
 
 use super::{
     CARGO_DEP_TOML, CARGO_TOML, CARGO_WASM_DEP_TOML, GOLDEN as MAIN_RS, RUNTIME_CONFIG_RS,
-    RUNTIME_MOD_RS, WASM_CARGO_TOML, async_runtime_cargo_toml, jwt_cargo_toml, locale_cargo_toml,
-    server_cargo_toml, vendored_tokio_for,
+    RUNTIME_MOD_RS, WASM_CARGO_TOML, async_runtime_cargo_toml, compression_cargo_toml,
+    config_cargo_toml, crypto_cargo_toml, crypto_core_heavy_cargo_toml, csv_cargo_toml,
+    db_cargo_toml, dev_posture_cargo_toml, email_cargo_toml, http_client_cargo_toml,
+    jwt_cargo_toml, locale_cargo_toml, promote_declared_feature, secret_cargo_toml,
+    server_cargo_toml, tui_cargo_toml, url_cargo_toml, vendored_tokio_for, web_cargo_toml,
+    websocket_cargo_toml, webview_cargo_toml,
 };
 use crate::crate_specs::tokio_base_features;
 use crate::runtime_features::{RuntimeFeature, RuntimeFeatureSet};
@@ -151,20 +159,13 @@ fn rust_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// The union of features the vendored manifest declares in any emit: the
-/// template's own table plus the entries the augmenters insert.
+/// The features every vendored emit declares: the base template's own table.
+///
+/// No augmenter declares a name (see `augmenters_declare_no_feature`), so this
+/// is the declared set of every augmenter combination, and a gate the base
+/// leaves undeclared warns in the emits that skip its augmenter.
 fn vendored_declared() -> BTreeSet<String> {
-    let async_base = async_runtime_cargo_toml(CARGO_TOML, &tokio_base_features())
-        .expect("async base must build");
-    let mut declared = declared_features(CARGO_TOML);
-    for manifest in [
-        server_cargo_toml(&async_base).expect("server manifest must build"),
-        jwt_cargo_toml(CARGO_TOML).expect("jwt manifest must build"),
-        locale_cargo_toml(CARGO_TOML).expect("locale manifest must build"),
-    ] {
-        declared.extend(declared_features(&manifest));
-    }
-    declared
+    declared_features(CARGO_TOML)
 }
 
 /// The vendored runtime tree, the `mod.rs` template and every append name only
@@ -229,9 +230,10 @@ fn vendored_cfg_features_are_declared() {
     );
     assert!(
         drift.is_empty(),
-        "vendored sources name features the vendored Cargo.toml never declares, so \
-         rustc compiles their gates off in every vendored build; declare each in \
-         templates/Cargo.toml (or the augmenter that promotes it) or restate the gate:\n{}",
+        "vendored sources name features the base vendored Cargo.toml never declares, \
+         so rustc warns on their gates in every emit that skips the promoting \
+         augmenter; declare each inert in templates/Cargo.toml (its augmenter only \
+         promotes it) or restate the gate:\n{}",
         drift.join("\n")
     );
 }
@@ -573,4 +575,554 @@ fn wasip1_vendored_tokio_is_never_declared() {
             "the browser target never resolves a vendored tokio line: {browser:?}"
         );
     }
+}
+
+/// The db augmenter for the sqlite driver, as a one-argument augmenter.
+fn sqlite_db_cargo_toml(base: &str) -> DResult<String> {
+    db_cargo_toml(base, crate::DbDriver::Sqlite)
+}
+
+/// One vendored manifest augmenter, named for its failure messages.
+type Augmenter = (&'static str, fn(&str) -> DResult<String>);
+
+/// Every vendored `Cargo.toml` augmenter in its emit order (`ffi_cargo_toml`,
+/// which only splices dependency lines, needs an emit context and is absent).
+const AUGMENTERS: &[Augmenter] = &[
+    ("db", sqlite_db_cargo_toml),
+    ("server", server_cargo_toml),
+    ("web", web_cargo_toml),
+    ("tui", tui_cargo_toml),
+    ("webview", webview_cargo_toml),
+    ("websocket", websocket_cargo_toml),
+    ("email", email_cargo_toml),
+    ("locale", locale_cargo_toml),
+    ("http_client", http_client_cargo_toml),
+    ("url", url_cargo_toml),
+    ("config", config_cargo_toml),
+    ("compression", compression_cargo_toml),
+    ("csv", csv_cargo_toml),
+    ("crypto", crypto_cargo_toml),
+    ("jwt", jwt_cargo_toml),
+    ("crypto_core_heavy", crypto_core_heavy_cargo_toml),
+    ("secret", secret_cargo_toml),
+    ("dev_posture", dev_posture_cargo_toml),
+];
+
+/// The feature names `augmented` declares that `base` does not.
+fn augmenter_introduced(base: &str, augmented: &str) -> Vec<String> {
+    let before = declared_features(base);
+    declared_features(augmented)
+        .into_iter()
+        .filter(|name| !before.contains(name))
+        .collect()
+}
+
+/// The names a manifest's `default = [...]` line lists.
+fn default_features(manifest: &str) -> Vec<String> {
+    manifest
+        .lines()
+        .find_map(|l| l.strip_prefix("default = ["))
+        .and_then(|rest| rest.split_once(']'))
+        .map(|(list, _)| {
+            list.split(',')
+                .map(|n| n.trim().trim_matches('"').to_owned())
+                .filter(|n| !n.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// No augmenter declares a feature, alone or composed in emit order, and every
+/// name an augmented `default` lists is declared.
+///
+/// The base manifest is therefore the declared set of every augmenter
+/// combination, which is what lets `vendored_cfg_features_are_declared` judge
+/// the base alone.
+#[test]
+fn augmenters_declare_no_feature() {
+    let async_base = async_runtime_cargo_toml(CARGO_TOML, &tokio_base_features())
+        .expect("async base must build");
+    assert!(
+        augmenter_introduced(CARGO_TOML, &async_base).is_empty(),
+        "the tokio restore declares no feature"
+    );
+    let mut drift = Vec::new();
+    let mut composed = async_base.clone();
+    for (name, augment) in AUGMENTERS {
+        let alone = augment(&async_base);
+        assert!(alone.is_ok(), "{name} augments the async base: {alone:?}");
+        let Ok(alone) = alone else { return };
+        for feature in augmenter_introduced(&async_base, &alone) {
+            drift.push(format!("{name} (alone): declares {feature:?}"));
+        }
+        let next = augment(&composed);
+        assert!(next.is_ok(), "{name} composes in emit order: {next:?}");
+        let Ok(next) = next else { return };
+        for feature in augmenter_introduced(&composed, &next) {
+            drift.push(format!("{name} (composed): declares {feature:?}"));
+        }
+        composed = next;
+    }
+    let declared = declared_features(&composed);
+    for feature in default_features(&composed) {
+        if !declared.contains(&feature) {
+            drift.push(format!("composed default lists undeclared {feature:?}"));
+        }
+    }
+    assert!(
+        default_features(&composed).len() > 10,
+        "precondition: the composition promotes the augmenters' features: {composed}"
+    );
+    assert!(
+        drift.is_empty(),
+        "an augmenter declares a feature the base manifest does not, so the emits \
+         that skip it test that gate as an unknown name; declare it inert in \
+         templates/Cargo.toml and only promote it:\n{}",
+        drift.join("\n")
+    );
+}
+
+/// An augmenter that declares a name is reported, and promoting a name the base
+/// does not declare refuses at `ipe` time.
+#[test]
+fn augmenter_declaring_a_feature_is_refused() {
+    const BASE: &str = "[features]\ndefault = []\njson = []\n\n[dependencies]\n";
+    let declaring = BASE.replacen("json = []\n", "json = []\nserver = []\n", 1);
+    assert_eq!(augmenter_introduced(BASE, &declaring), ["server"]);
+    assert!(augmenter_introduced(BASE, BASE).is_empty());
+    let undeclared = promote_declared_feature(BASE, "server", "test");
+    assert!(
+        matches!(undeclared, Err(Diagnostic::CompilerBug { .. })),
+        "promoting an undeclared feature must refuse: {undeclared:?}"
+    );
+    let promoted = promote_declared_feature(&declaring, "server", "test");
+    assert!(
+        matches!(&promoted, Ok(m) if default_features(m) == ["server"]),
+        "promoting a declared feature lists it in default: {promoted:?}"
+    );
+    let without = CARGO_TOML.replacen("\nserver = []\n", "\n", 1);
+    assert_ne!(
+        without, CARGO_TOML,
+        "precondition: the base declares server"
+    );
+    assert!(
+        matches!(
+            server_cargo_toml(&without),
+            Err(Diagnostic::CompilerBug { .. })
+        ),
+        "the server augmenter refuses a base that does not declare server"
+    );
+    let without = CARGO_TOML.replacen("\nlocale = []\n", "\n", 1);
+    assert_ne!(
+        without, CARGO_TOML,
+        "precondition: the base declares locale"
+    );
+    assert!(
+        matches!(
+            locale_cargo_toml(&without),
+            Err(Diagnostic::CompilerBug { .. })
+        ),
+        "the locale augmenter refuses a base that does not declare locale"
+    );
+}
+
+/// The base manifest declares the augmenter-promoted gates inert and off.
+///
+/// A non-server, non-jwt, non-locale emit tests each as a known name without
+/// switching its code on.
+#[test]
+fn base_manifest_declares_gates_inert() {
+    let declared = declared_features(CARGO_TOML);
+    for gate in ["server", "jwt", "db", "locale"] {
+        assert!(
+            declared.contains(gate),
+            "templates/Cargo.toml must declare {gate:?}"
+        );
+        assert!(
+            CARGO_TOML.lines().any(|l| l == format!("{gate} = []")),
+            "templates/Cargo.toml must declare {gate:?} inert"
+        );
+    }
+    assert_eq!(default_features(CARGO_TOML), ["json"]);
+    assert!(
+        check_cfg_names(CARGO_TOML).contains("ipe_asan"),
+        "templates/Cargo.toml must declare the `ipe_asan` check-cfg"
+    );
+    let jwt = jwt_cargo_toml(CARGO_TOML).expect("jwt manifest must build");
+    assert!(
+        !default_features(&jwt).contains(&"server".to_owned()),
+        "a jwt emit leaves server off"
+    );
+    let locale = locale_cargo_toml(CARGO_TOML).expect("locale manifest must build");
+    assert!(
+        locale
+            .lines()
+            .any(|l| l == r#"locale = ["dep:icu_casemap", "dep:icu_locale_core"]"#)
+            && !locale.lines().any(|l| l == "locale = []")
+            && default_features(&locale).contains(&"locale".to_owned()),
+        "the locale augmenter upgrades the inert entry and promotes it: {locale}"
+    );
+}
+
+/// The cfg option names rustc knows without a `check-cfg` declaration.
+const WELL_KNOWN_CFGS: &[&str] = &[
+    "clippy",
+    "debug_assertions",
+    "doc",
+    "doctest",
+    "feature",
+    "fmt_debug",
+    "miri",
+    "overflow_checks",
+    "panic",
+    "proc_macro",
+    "relocation_model",
+    "rustfmt",
+    "sanitize",
+    "sanitizer_cfi_generalize_pointers",
+    "sanitizer_cfi_normalize_integers",
+    "target_abi",
+    "target_arch",
+    "target_endian",
+    "target_env",
+    "target_family",
+    "target_feature",
+    "target_has_atomic",
+    "target_has_atomic_equal_alignment",
+    "target_has_atomic_load_store",
+    "target_os",
+    "target_pointer_width",
+    "target_thread_local",
+    "target_vendor",
+    "test",
+    "ub_checks",
+    "unix",
+    "windows",
+];
+
+/// Every cfg option name a `cfg` / `cfg_attr` predicate or a `cfg!` macro in
+/// `src` tests, `feature` included, with its line.
+///
+/// A `cfg_attr` contributes only its predicate, never the attributes it
+/// applies. A `cfg` whose body holds a `macro_rules!` metavariable (`$cfg`) is a
+/// template, not a predicate, and is skipped. `#[cfg(test)]` items are read: a
+/// test build of the emitted crate compiles them.
+fn cfg_names(src: &str) -> Vec<(usize, String)> {
+    let toks = lex(src);
+    let mut found = Vec::new();
+    let mut i = 0usize;
+    while let Some((_, tok)) = toks.get(i) {
+        let is_cfg = matches!(tok, Tok::Ident(w) if w == "cfg" || w == "cfg_attr");
+        let in_attr = i
+            .checked_sub(1)
+            .is_some_and(|prev| matches!(toks.get(prev), Some((_, Tok::Punct('[')))));
+        let as_macro = matches!(toks.get(i + 1), Some((_, Tok::Punct('!'))));
+        let open = if as_macro { i + 2 } else { i + 1 };
+        if is_cfg && (in_attr || as_macro) && matches!(toks.get(open), Some((_, Tok::Punct('(')))) {
+            let close = matching_paren(&toks, open);
+            let body = toks.get(open + 1..close).unwrap_or(&[]);
+            if !body.iter().any(|(_, t)| matches!(t, Tok::Punct('$'))) {
+                predicate_names(body, &mut found);
+            }
+            i = close;
+        }
+        i += 1;
+    }
+    found
+}
+
+/// The index of the `)` closing the `(` at `open`, or the token count when the
+/// source ends first.
+fn matching_paren(toks: &[(usize, Tok)], open: usize) -> usize {
+    let mut depth = 0usize;
+    for (k, (_, tok)) in toks.iter().enumerate().skip(open) {
+        match tok {
+            Tok::Punct('(') => depth += 1,
+            Tok::Punct(')') => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return k;
+                }
+            }
+            _ => {}
+        }
+    }
+    toks.len()
+}
+
+/// The option names of the first predicate in `body`: every identifier that is
+/// not an `all` / `any` / `not` combinator, up to the first top-level comma.
+fn predicate_names(body: &[(usize, Tok)], found: &mut Vec<(usize, String)>) {
+    let mut depth = 0usize;
+    for (k, (line, tok)) in body.iter().enumerate() {
+        match tok {
+            Tok::Punct('(') => depth += 1,
+            Tok::Punct(')') => depth = depth.saturating_sub(1),
+            Tok::Punct(',') if depth == 0 => return,
+            Tok::Ident(name) => {
+                let combinator = matches!(body.get(k + 1), Some((_, Tok::Punct('('))));
+                if !combinator {
+                    found.push((*line, name.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The custom cfg names a manifest's `[lints.rust] unexpected_cfgs` entry
+/// declares through `check-cfg`.
+fn check_cfg_names(manifest: &str) -> BTreeSet<String> {
+    manifest
+        .lines()
+        .filter(|l| l.trim_start().starts_with("unexpected_cfgs"))
+        .flat_map(|l| l.split("cfg(").skip(1))
+        .filter_map(|rest| rest.split_once(')').map(|(name, _)| name.trim().to_owned()))
+        .collect()
+}
+
+/// The custom cfg names the runtime crate's build script declares.
+fn runtime_build_check_cfg_names() -> BTreeSet<String> {
+    let path = runtime_src().join("../build.rs");
+    let build_rs = std::fs::read_to_string(&path)
+        .map_err(|error| format!("{}: {error}", path.display()))
+        .expect("the runtime build script reads");
+    build_rs
+        .lines()
+        .filter(|l| l.contains("rustc-check-cfg="))
+        .flat_map(|l| l.split("cfg(").skip(1))
+        .filter_map(|rest| rest.split_once(')').map(|(name, _)| name.trim().to_owned()))
+        .collect()
+}
+
+/// The names in `found` that are neither well-known nor in `declared`.
+fn undeclared_custom_cfgs(
+    found: &[(usize, String)],
+    declared: &BTreeSet<String>,
+) -> Vec<(usize, String)> {
+    found
+        .iter()
+        .filter(|(_, n)| !WELL_KNOWN_CFGS.contains(&n.as_str()) && !declared.contains(n))
+        .cloned()
+        .collect()
+}
+
+/// Every custom cfg name a vendored source tests is in the vendored manifests'
+/// `check-cfg` list, and that list is the runtime build script's.
+#[test]
+fn vendored_custom_cfgs_are_declared() {
+    let from_build = runtime_build_check_cfg_names();
+    assert!(
+        from_build.contains("ipe_asan"),
+        "precondition: the runtime build script declares `ipe_asan`: {from_build:?}"
+    );
+    for (name, manifest) in [
+        ("templates/Cargo.toml", CARGO_TOML),
+        ("WASM_CARGO_TOML", WASM_CARGO_TOML),
+    ] {
+        assert_eq!(
+            check_cfg_names(manifest),
+            from_build,
+            "{name}: the check-cfg list must equal the runtime build script's"
+        );
+    }
+    let declared = check_cfg_names(CARGO_TOML);
+    let root = runtime_src();
+    let mut drift = Vec::new();
+    let mut custom = 0usize;
+    for rel in rust_files(&root) {
+        let rel_s = rel.to_string_lossy().replace('\\', "/");
+        if REPLACED.contains(&rel_s.as_str()) || EXCLUDED.iter().any(|(f, _)| *f == rel_s) {
+            continue;
+        }
+        let src = std::fs::read_to_string(root.join(rel)).expect("runtime source must read");
+        let found = cfg_names(&src);
+        custom += found.iter().filter(|(_, n)| declared.contains(n)).count();
+        for (line, name) in undeclared_custom_cfgs(&found, &declared) {
+            drift.push(format!("{rel_s}:{line}: cfg {name:?}"));
+        }
+    }
+    for (template, text) in [
+        ("templates/ipe_runtime/mod.rs", RUNTIME_MOD_RS),
+        ("templates/ipe_runtime/config.rs", RUNTIME_CONFIG_RS),
+        ("templates/main.rs", MAIN_RS),
+    ] {
+        for (line, name) in undeclared_custom_cfgs(&cfg_names(text), &declared) {
+            drift.push(format!("{template}:{line}: cfg {name:?}"));
+        }
+    }
+    for body in emitted_strings(PROJECT_RS) {
+        for (_, name) in undeclared_custom_cfgs(&cfg_names(&body), &declared) {
+            drift.push(format!("project.rs emitted string: cfg {name:?}"));
+        }
+    }
+    assert!(
+        custom > 0,
+        "precondition: the scan reads the runtime's `ipe_asan` gates"
+    );
+    assert!(
+        drift.is_empty(),
+        "vendored sources test cfg names the vendored manifests never declare; add \
+         each to the runtime build script's check-cfg and to the vendored \
+         manifests' `[lints.rust]` check-cfg list:\n{}",
+        drift.join("\n")
+    );
+}
+
+/// The cfg-name scan reads predicates only, skips macro templates, and an
+/// undeclared custom name is reported.
+#[test]
+fn custom_cfg_scan_reads_predicates() {
+    let src = r#"
+        #[cfg_attr(ipe_asan, sanitize(address = "off"), inline(never))]
+        #[cfg_attr(not(ipe_asan), inline)]
+        fn f() { if cfg!(unix) {} }
+        #[cfg(all(target_os = "linux", feature = "web", not(custom_flag)))]
+        fn g() {}
+        macro_rules! m { ($(#[cfg($cfg:meta)])? $v:ident) => { $(#[cfg($cfg)])? fn $v() {} }; }
+        // #[cfg(in_comment)]
+    "#;
+    let names: Vec<String> = cfg_names(src).into_iter().map(|(_, n)| n).collect();
+    assert_eq!(
+        names,
+        [
+            "ipe_asan",
+            "ipe_asan",
+            "unix",
+            "target_os",
+            "feature",
+            "custom_flag"
+        ]
+    );
+    let declared = check_cfg_names(
+        "[lints.rust]\nunexpected_cfgs = { level = \"warn\", check-cfg = [\"cfg(ipe_asan)\"] }\n",
+    );
+    assert_eq!(declared, BTreeSet::from(["ipe_asan".to_owned()]));
+    let undeclared: Vec<String> = undeclared_custom_cfgs(&cfg_names(src), &declared)
+        .into_iter()
+        .map(|(_, n)| n)
+        .collect();
+    assert_eq!(undeclared, ["custom_flag"]);
+    let none = undeclared_custom_cfgs(&cfg_names(src), &BTreeSet::new());
+    assert!(
+        none.iter().any(|(_, n)| n == "ipe_asan"),
+        "a manifest without the check-cfg leaves `ipe_asan` undeclared"
+    );
+}
+
+/// The string literals of `project.rs` that reach the emitted app crate's own
+/// sources (`main.rs` and its split modules), outside `#[cfg(test)]` items.
+///
+/// The vendored `ipe_runtime/mod.rs` texts (`RUNTIME_MOD_RS*`,
+/// `WASM_RUNTIME_MOD_RS`) and the manifest texts (`*CARGO_TOML`) are excluded:
+/// the first are read by the vendored scan, the second are not Rust.
+fn app_crate_strings(src: &str) -> Vec<String> {
+    let toks = lex(src);
+    let mut out = Vec::new();
+    let mut current_const: Option<&str> = None;
+    let mut i = 0usize;
+    while let Some((_, tok)) = toks.get(i) {
+        if let Some(end) = test_only_item_end(&toks, i) {
+            i = end + 1;
+            continue;
+        }
+        match tok {
+            Tok::Ident(kw) if kw == "const" => {
+                if let (Some((_, Tok::Ident(name))), Some((_, Tok::Punct(':')))) =
+                    (toks.get(i + 1), toks.get(i + 2))
+                {
+                    current_const = Some(name.as_str());
+                }
+            }
+            Tok::Punct(';') => current_const = None,
+            Tok::Str(s) => {
+                let excluded = current_const.is_some_and(|name| {
+                    name.starts_with("RUNTIME_MOD_RS")
+                        || name.starts_with("WASM_RUNTIME_MOD_RS")
+                        || name.ends_with("CARGO_TOML")
+                });
+                if !excluded {
+                    out.push(s.clone());
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Every feature the emitted `main.rs` text tests is declared by both native
+/// app manifests.
+///
+/// The dependency-model app crate declares only its allocator features, so a
+/// runtime feature gate in emitted app code (such as `db` over the db-backed
+/// auth wrappers) is an unknown name there and compiles its code out; the
+/// emitter selects such code at emit time instead.
+#[test]
+fn app_crate_gates_are_declared() {
+    let declared: BTreeSet<String> = declared_features(CARGO_TOML)
+        .intersection(&declared_features(CARGO_DEP_TOML))
+        .cloned()
+        .collect();
+    assert!(
+        declared.contains("alloc_dlmalloc") && declared.contains("alloc_mimalloc"),
+        "precondition: both native manifests declare the allocator features: {declared:?}"
+    );
+    let strings = app_crate_strings(PROJECT_RS);
+    assert!(
+        strings.iter().any(|s| s.contains("fn auth_hash_password")),
+        "precondition: the scan reads the emitted wrapper texts"
+    );
+    let mut drift = Vec::new();
+    let mut scanned = 0usize;
+    let texts = std::iter::once(("templates/main.rs", MAIN_RS.to_owned())).chain(
+        strings
+            .into_iter()
+            .map(|s| ("project.rs emitted string", s)),
+    );
+    for (origin, text) in texts {
+        for (line, name) in gate_features(&text, true) {
+            scanned += 1;
+            if !declared.contains(&name) {
+                drift.push(format!("{origin}:{line}: feature {name:?}"));
+            }
+        }
+        for (line, name) in undeclared_custom_cfgs(&cfg_names(&text), &BTreeSet::new()) {
+            drift.push(format!("{origin}:{line}: cfg {name:?}"));
+        }
+    }
+    assert!(
+        scanned >= 2,
+        "precondition: the scan reads `main.rs`'s allocator gates"
+    );
+    assert!(
+        drift.is_empty(),
+        "emitted app code tests a name a native app manifest does not declare; \
+         select the code at emit time instead of gating it:\n{}",
+        drift.join("\n")
+    );
+}
+
+/// A runtime feature gate in an emitted app text is reported, and a manifest
+/// const's text is not read as app code.
+#[test]
+fn app_crate_feature_gate_is_refused() {
+    let src = concat!(
+        "const W: &str = \"#[cfg(feature = \\\"db\\\")]\\npub fn w() {}\\n\";\n",
+        "const X_CARGO_TOML: &str = \"#[cfg(feature = \\\"web\\\")]\";\n",
+        "const RUNTIME_MOD_RS_Y: &str = \"#[cfg(feature = \\\"tui\\\")]\";\n",
+    );
+    let strings = app_crate_strings(src);
+    assert_eq!(strings.len(), 1, "only the app text is read: {strings:?}");
+    let gates: Vec<String> = strings
+        .iter()
+        .flat_map(|s| gate_features(s, true))
+        .map(|(_, n)| n)
+        .collect();
+    assert_eq!(gates, ["db"]);
+    assert!(
+        !declared_features(CARGO_DEP_TOML).contains("db"),
+        "the dependency-model app crate declares no `db` feature"
+    );
 }
