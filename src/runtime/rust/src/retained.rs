@@ -18,8 +18,9 @@
 //! The walk is bounded in depth as well as in count. Every measure that
 //! descends into a part does so through [`Bytes::plus`], which holds one level
 //! of [`MEASURE_DEPTH`] for as long as the part is measured; a value nested
-//! deeper than the ceiling measures `None`, the same refusal as an overflow,
-//! before its nesting can exhaust the measuring thread's stack. Siblings are
+//! deeper than the ceiling, or whose levels spend more than `MEASURE_STACK`
+//! bytes of stack, measures `None`, the same refusal as an overflow, before its
+//! nesting can exhaust the measuring thread's stack. Siblings are
 //! measured one after another, so a wide value spends one level, not one per
 //! item.
 
@@ -132,16 +133,67 @@ impl Bytes {
 /// The deepest nesting of parts a measure walks before it answers `None`.
 ///
 /// A level is one [`Bytes::plus`] call live on the measuring thread's stack.
-/// Each level costs a few small frames, so the ceiling's stack stays well
-/// under the 2 MiB a tokio worker thread runs on.
+/// The ceiling counts levels; `MEASURE_STACK` bounds the bytes they take, so a
+/// walk stops at whichever it reaches first.
 pub const MEASURE_DEPTH: NonZeroU32 = match NonZeroU32::new(4096) {
     Some(n) => n,
     None => NonZeroU32::MIN,
 };
 
+/// The most stack, in bytes, one measure spends below the frame its first level starts in.
+///
+/// A level's frame is as large as the measured type's measure makes it: an
+/// unoptimized measure of an enum with many payload-carrying variants takes
+/// kilobytes a level, so [`MEASURE_DEPTH`] alone does not bound the stack. Past
+/// this many bytes the measure answers `None`, however few levels it holds.
+/// Half the 2 MiB a tokio worker thread runs on, so the measure's caller keeps
+/// the other half.
+#[cfg(not(target_arch = "wasm32"))]
+pub const MEASURE_STACK: usize = 1 << 20;
+
 thread_local! {
     /// The levels of [`MEASURE_DEPTH`] the measures running on this thread hold.
     static DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// The stack address the outermost level held on this thread started at.
+    #[cfg(not(target_arch = "wasm32"))]
+    static ANCHOR: Cell<usize> = const { Cell::new(0) };
+}
+
+/// An approximation of the stack pointer: the address of a stack local.
+///
+/// The same probe as the recursion guard's (`core::approx_stack_pointer`),
+/// kept off AddressSanitizer's fake stack the same way, so the anchor and every
+/// later probe read the real stack. The address is read, never dereferenced.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(ipe_asan, sanitize(address = "off"), inline(never))]
+#[cfg_attr(not(ipe_asan), inline)]
+fn stack_address() -> usize {
+    let anchor: u8 = 0;
+    std::ptr::from_ref(&anchor).addr()
+}
+
+/// Whether a level taken now stays within [`MEASURE_STACK`] of the outermost level.
+///
+/// The outermost level (`held == 0`) records where the measure starts and is
+/// always within.
+#[cfg(not(target_arch = "wasm32"))]
+fn within_stack(held: u32) -> bool {
+    let here = stack_address();
+    ANCHOR.with(|anchor| {
+        if held == 0 {
+            anchor.set(here);
+            true
+        } else {
+            anchor.get().abs_diff(here) <= MEASURE_STACK
+        }
+    })
+}
+
+/// Every level is within the stack bound on wasm32, whose engine stack is not
+/// addressable; [`MEASURE_DEPTH`] alone bounds the walk there.
+#[cfg(target_arch = "wasm32")]
+const fn within_stack(_held: u32) -> bool {
+    true
 }
 
 /// One level of [`MEASURE_DEPTH`], held while one part is measured.
@@ -151,11 +203,12 @@ thread_local! {
 struct Descent(());
 
 impl Descent {
-    /// Take one more level, or `None` when the thread already holds [`MEASURE_DEPTH`].
+    /// Take one more level, or `None` when the thread already holds
+    /// [`MEASURE_DEPTH`] levels or the walk has spent `MEASURE_STACK`.
     fn enter() -> Option<Self> {
         DEPTH.with(|depth| {
             let held = depth.get();
-            (held < MEASURE_DEPTH.get()).then(|| {
+            (held < MEASURE_DEPTH.get() && within_stack(held)).then(|| {
                 depth.set(held.saturating_add(1));
                 Self(())
             })
@@ -752,6 +805,79 @@ mod tests {
             .join()
             .expect("the measuring thread returns");
         assert_eq!(measured, (true, None, true, None));
+    }
+
+    /// A chain whose measure keeps an 8 KiB local live at every level, as an
+    /// unoptimized measure of a many-variant enum does.
+    struct Fat {
+        next: Option<Box<Self>>,
+    }
+
+    impl Drop for Fat {
+        // Unlinked one link at a time, so a deep chain drops without recursion.
+        fn drop(&mut self) {
+            let mut next = self.next.take();
+            while let Some(mut link) = next {
+                next = link.next.take();
+            }
+        }
+    }
+
+    impl RetainedBytes for Fat {
+        fn retained_bytes(&self) -> Option<Bytes> {
+            let pad = std::hint::black_box([0_u8; 8 * 1024]);
+            Bytes::inline::<Self>()?
+                .plus_count(usize::from(pad.first().copied().unwrap_or_default()))?
+                .plus(&self.next)
+        }
+    }
+
+    /// A `Fat` chain of `links` links.
+    fn fat(links: u32) -> Fat {
+        let mut head = Fat { next: None };
+        for _ in 1..links {
+            head = Fat {
+                next: Some(Box::new(head)),
+            };
+        }
+        head
+    }
+
+    // Refusal: levels whose frames are large spend the stack bound long before
+    // the depth ceiling. A chain of 8 KiB frames, a third of the ceiling deep,
+    // would take over 10 MiB of stack; on a 2 MiB stack it measures `None`
+    // instead, and releases every level it took.
+    #[test]
+    #[allow(clippy::expect_used)] // test: a failed spawn or a crashed measuring thread is the failure
+    fn fat_frames_are_refused_at_the_stack_bound_before_the_depth_ceiling() {
+        let measured = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let shallow = fat(8);
+                let deep = fat(MEASURE_DEPTH.get() / 3);
+                let fits = Bytes::ZERO.plus(&shallow).is_some();
+                let refused = Bytes::ZERO.plus(&deep);
+                let held_after = held_depth();
+                (
+                    fits,
+                    refused,
+                    held_after,
+                    Bytes::ZERO.plus(&shallow).is_some(),
+                )
+            })
+            .expect("a measuring thread spawns")
+            .join()
+            .expect("the measuring thread returns");
+        assert_eq!(measured, (true, None, 0, true));
+    }
+
+    // The stack bound reads the same stack the recursion guard's red-zone
+    // probe reads: both probes, taken in one frame, land within one page.
+    #[test]
+    fn the_stack_probe_agrees_with_the_recursion_guard_probe() {
+        let ours = stack_address();
+        let guard = crate::core::stack_pointer_for_test();
+        assert!(ours.abs_diff(guard) <= 4096, "{ours:#x} vs {guard:#x}");
     }
 
     // The choke point is the only descent: no measure in this file reaches a
