@@ -911,6 +911,41 @@ const _: () = assert!(
     "a KERNEL_TYPE_ALIASES body is not a closed tree of empty-home builtins",
 );
 
+/// Whether scheme variable `var` occurs in `shape` at a position a reader holding the interner aligns.
+///
+/// Every position [`shape_aligns_var`] counts, plus a record field: the
+/// lowerer resolves a field's [`FieldTag::text`] against the solved record's
+/// field names, so a variable a record argument alone carries (a TEA app
+/// config's model) is still read at a reference.
+#[must_use]
+pub const fn shape_reaches_var(shape: &TyShape, var: u8) -> bool {
+    match shape {
+        TyShape::Var(v) => *v == var,
+        TyShape::Fun(arg, res) => shape_reaches_var(arg, var) || shape_reaches_var(res, var),
+        TyShape::Con(_, items) | TyShape::Tuple(items) => {
+            let mut rest: &[TyShape] = items;
+            while let Some((item, tail)) = rest.split_first() {
+                if shape_reaches_var(item, var) {
+                    return true;
+                }
+                rest = tail;
+            }
+            false
+        }
+        TyShape::Record { fields, .. } => {
+            let mut rest = *fields;
+            while let Some(((_, field), tail)) = rest.split_first() {
+                if shape_reaches_var(field, var) {
+                    return true;
+                }
+                rest = tail;
+            }
+            false
+        }
+        TyShape::Unit => false,
+    }
+}
+
 /// Whether scheme variable `var` occurs in `shape` at a position that aligns positionally with a solved type.
 ///
 /// An arrow side, a constructor argument, and a tuple element align by
@@ -1351,7 +1386,7 @@ const _: () = assert!(
 /// Whether every [`StdlibKernel::runtime_bounds`] row of `kernels` names a variable aligned in its scheme.
 ///
 /// A kernel with a row must carry a [`StdlibKernel::scheme_shape`] in which
-/// [`shape_aligns_var`] finds the row's variable, and each row must declare at
+/// [`shape_reaches_var`] finds the row's variable, and each row must declare at
 /// least one bound; otherwise the lowerer cannot read the variable's instance
 /// at a call site, or the row states nothing.
 #[must_use]
@@ -1364,7 +1399,7 @@ pub const fn runtime_bound_vars_are_aligned(kernels: &[StdlibKernel]) -> bool {
                 return false;
             };
             while let Some(((var, bounds), more)) = rows.split_first() {
-                if bounds.is_empty() || !shape_aligns_var(shape, *var) {
+                if bounds.is_empty() || !shape_reaches_var(shape, *var) {
                     return false;
                 }
                 rows = more;
@@ -14078,7 +14113,7 @@ impl StdlibKernel {
     /// The table mirrors the runtime's signatures: `tests/kernel_runtime_bounds.rs`
     /// parses every runtime `pub fn` and fails while a bound is missing here
     /// or listed here without a runtime generic carrying it. Every row names a
-    /// variable aligned in [`Self::scheme_shape`] and appears once; the build
+    /// variable [`Self::scheme_shape`] reaches and appears once; the build
     /// asserts both ([`runtime_bound_vars_are_aligned`],
     /// [`runtime_bound_vars_are_distinct`]).
     #[must_use]
@@ -14145,9 +14180,9 @@ impl StdlibKernel {
             | Self::CmdPublish
             | Self::CmdPublishNoEcho
             | Self::SubSubscribeTopic => &[(1, C)],
-            Self::InputCheckbox
-            | Self::InputRadio
-            | Self::InputRadioRow => &[(0, RuntimeBounds::CLONE_SYNC)],
+            Self::InputCheckbox | Self::InputRadio | Self::InputRadioRow => {
+                &[(0, RuntimeBounds::CLONE_SYNC)]
+            }
             // Every other kernel's runtime function puts no row bound on a
             // scheme variable, or the kernel has no runtime function; the scan
             // in `tests/kernel_runtime_bounds.rs` pins every kernel, so a new

@@ -330,9 +330,9 @@ struct SchemeHeads<'h> {
 
 /// The solved type scheme variable `var` is instantiated to, found by walking `shape` alongside `solved`.
 ///
-/// Aligns exactly the positions [`ipe_kernels::shape_aligns_var`] counts — an
-/// arrow side, a constructor argument, a tuple element; a record field is keyed
-/// by an interned symbol the shape cannot name, so it is skipped. A constructor
+/// Aligns exactly the positions [`ipe_kernels::shape_reaches_var`] counts: an
+/// arrow side, a constructor argument, a tuple element, and a record field
+/// whose [`ipe_kernels::FieldTag::text`] names a field of the solved record. A constructor
 /// aligns only when its full head (tag and home) is the solved one, by the rule
 /// unification applies, and its arity agrees. `None` when no aligned occurrence
 /// exists or the two trees disagree in structure. The walk is bounded by the
@@ -368,6 +368,16 @@ fn scheme_var_instance<'t>(
         (TyShape::Tuple(items), Ty::Tuple(solved_items)) => (items.len() == solved_items.len())
             .then(|| items.iter().zip(solved_items.as_slice()))
             .and_then(first_instance),
+        (TyShape::Record { fields, .. }, Ty::Record(solved_fields, _)) => {
+            fields.iter().find_map(|(tag, field)| {
+                solved_fields
+                    .iter()
+                    .find(|(name, _)| heads.interner.resolve(**name) == Some(tag.text()))
+                    .and_then(|(_, solved_field)| {
+                        scheme_var_instance(field, solved_field, var, heads)
+                    })
+            })
+        }
         _ => None,
     }
 }

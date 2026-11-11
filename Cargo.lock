@@ -3390,6 +3390,7 @@ dependencies = [
  "ipe_syntax",
  "serde",
  "strum 0.26.3",
+ "syn 3.0.9",
 ]
 
 [[package]]

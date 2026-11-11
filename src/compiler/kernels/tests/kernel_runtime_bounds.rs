@@ -214,7 +214,11 @@ fn ipe_index(order: ArgOrder, arity: usize, param: usize) -> Option<usize> {
 #[test]
 fn every_runtime_bound_is_declared() {
     let scanned = runtime_signatures();
-    assert!(scanned.is_ok(), "the runtime source must parse: {:?}", scanned.as_ref().err());
+    assert!(
+        scanned.is_ok(),
+        "the runtime source must parse: {:?}",
+        scanned.as_ref().err()
+    );
     let Ok(scanned) = scanned else { return };
     let mut failures = Vec::new();
     for &kernel in StdlibKernel::ALL {
@@ -286,7 +290,11 @@ fn every_runtime_bound_is_declared() {
 #[test]
 fn every_declared_bound_has_a_runtime_generic() {
     let scanned = runtime_signatures();
-    assert!(scanned.is_ok(), "the runtime source must parse: {:?}", scanned.as_ref().err());
+    assert!(
+        scanned.is_ok(),
+        "the runtime source must parse: {:?}",
+        scanned.as_ref().err()
+    );
     let Ok(scanned) = scanned else { return };
     let mut failures = Vec::new();
     for &kernel in StdlibKernel::ALL {
@@ -345,4 +353,15 @@ fn the_scan_reads_list_repeat() {
         declared_on(StdlibKernel::ListRepeat, 0).contains(RuntimeBounds::CLONE),
         "`List.repeat` copies its element"
     );
+}
+
+/// A variable only a record argument carries is reached, not positionally aligned.
+#[test]
+fn a_record_only_variable_is_reached() {
+    let shape = StdlibKernel::TerminalAppScreen.scheme_shape();
+    assert!(shape.is_some(), "`Terminal.app.screen` has a scheme shape");
+    let Some(shape) = shape else { return };
+    assert!(!ipe_kernels::shape_aligns_var(shape, 0));
+    assert!(ipe_kernels::shape_reaches_var(shape, 0));
+    assert!(!ipe_kernels::shape_reaches_var(shape, 9));
 }
