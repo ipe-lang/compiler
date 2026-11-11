@@ -1448,6 +1448,150 @@ impl HeldDir {
     }
 }
 
+/// A file below a held root, named by plain directory names and a leaf name, at most [`MAX_LEAF_DEPTH`] directories deep.
+///
+/// Parsed once from a path relative to the root: `.`, `..`, a root and a
+/// prefix are refused, so [`HeldDir::descend`] only ever steps into a named
+/// subdirectory, never up and never out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the walked rewrites of the user's files descend through it"
+    )
+)]
+pub struct RelativeLeaf {
+    dirs: Vec<EntryName>,
+    leaf: EntryName,
+}
+
+/// The deepest directory nesting a [`RelativeLeaf`] names: the source walk's own ceiling.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the walked rewrites of the user's files descend through it"
+    )
+)]
+pub const MAX_LEAF_DEPTH: usize = crate::project::MAX_DISCOVERY_DEPTH;
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the walked rewrites of the user's files descend through it"
+    )
+)]
+impl RelativeLeaf {
+    /// The file `path` names below `root`.
+    ///
+    /// # Errors
+    /// [`OutputRefusal::OutsideProject`] when `path` does not start with
+    /// `root`; otherwise as [`RelativeLeaf::parse`].
+    pub fn under(root: &Path, path: &Path) -> Result<Self, CliError> {
+        let rel = path
+            .strip_prefix(root)
+            .map_err(|_| OutputRefusal::OutsideProject {
+                path: path.to_path_buf(),
+                root: root.to_path_buf(),
+            })?;
+        Self::parse(rel)
+    }
+
+    /// The file the relative path `rel` names.
+    ///
+    /// # Errors
+    /// [`OutputRefusal::UnsafeComponent`] for an empty path or a component
+    /// other than a plain name; [`OutputRefusal::TooDeep`] for more than
+    /// [`MAX_LEAF_DEPTH`] directories.
+    pub fn parse(rel: &Path) -> Result<Self, CliError> {
+        let unsafe_component = || CliError::from(OutputRefusal::UnsafeComponent(rel.to_path_buf()));
+        let mut names = Vec::new();
+        for component in rel.components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(unsafe_component());
+            };
+            if names.len() > MAX_LEAF_DEPTH {
+                return Err(OutputRefusal::TooDeep {
+                    path: rel.to_path_buf(),
+                    limit: MAX_LEAF_DEPTH,
+                }
+                .into());
+            }
+            names.push(EntryName::new(name).ok_or_else(unsafe_component)?);
+        }
+        let leaf = names.pop().ok_or_else(unsafe_component)?;
+        Ok(Self { dirs: names, leaf })
+    }
+
+    /// The directories from the root down to the leaf's parent.
+    #[must_use]
+    pub fn dirs(&self) -> &[EntryName] {
+        &self.dirs
+    }
+
+    /// The leaf's name inside its parent.
+    #[must_use]
+    pub const fn leaf(&self) -> &EntryName {
+        &self.leaf
+    }
+}
+
+/// The directory a [`HeldDir::descend`] reached: the root itself, or a level below it.
+#[derive(Debug)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the walked rewrites of the user's files descend through it"
+    )
+)]
+pub enum Level<'root> {
+    /// The leaf sits directly in the root.
+    Root(&'root HeldDir),
+    /// The leaf sits in a directory below the root, held here.
+    Below(HeldDir),
+}
+
+impl std::ops::Deref for Level<'_> {
+    type Target = HeldDir;
+
+    fn deref(&self) -> &HeldDir {
+        match self {
+            Self::Root(dir) => dir,
+            Self::Below(dir) => dir,
+        }
+    }
+}
+
+impl HeldDir {
+    /// Hold the parent of `leaf` by stepping down through each named subdirectory, never through a link.
+    ///
+    /// # Errors
+    /// [`OutputRefusal::Symlink`] or [`OutputRefusal::NotADirectory`] for a
+    /// level that is a link or not a directory; [`CliError::Io`] for an
+    /// absent level or another failure.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the walked rewrites of the user's files descend through it"
+        )
+    )]
+    pub fn descend<'root>(&'root self, leaf: &RelativeLeaf) -> Result<Level<'root>, CliError> {
+        let mut level = Level::Root(self);
+        for name in leaf.dirs() {
+            let path = level.path.join(name.as_os_str());
+            let below = level
+                .child(name.as_os_str())?
+                .ok_or_else(|| act_err(&path, io::ErrorKind::NotFound.into()))?;
+            level = Level::Below(below);
+        }
+        Ok(level)
+    }
+}
+
 /// How many backup names one file has: `<name>.bak`, then `<name>.bak.1` to `<name>.bak.99`.
 pub const BACKUP_SLOTS: u8 = 100;
 
@@ -1555,6 +1699,19 @@ fn backup_slot(name: &EntryName, slot: u8) -> String {
     }
 }
 
+/// Run the caller's `fill` on the staged file at `path`, then sync it: the writer owns durability.
+fn fill_synced(
+    staged: &mut File,
+    fill: impl FnOnce(&mut File) -> io::Result<()>,
+    path: &Path,
+) -> Result<(), CliError> {
+    fill(staged)
+        .and_then(|()| staged.sync_all())
+        .map_err(|e| act_err(path, e))?;
+    durable(Synced::Staged, path);
+    Ok(())
+}
+
 impl HeldDir {
     /// Read the regular file `name` under `cap`, with the identity of the very handle read.
     ///
@@ -1587,11 +1744,15 @@ impl HeldDir {
     /// The entry must still be the regular file `judged_id` holding exactly
     /// `judged` (re-read under `cap`, never through a link) right before the
     /// rename; otherwise it is left in place and the call is
-    /// [`Replaced::Changed`]. `fill` writes and syncs the staged file.
+    /// [`Replaced::Changed`]. `fill` writes the staged file; the writer syncs
+    /// it, gives it the judged file's permission bits, and syncs the directory
+    /// after the rename.
     ///
     /// # Errors
     /// [`OutputRefusal::UnsafeComponent`] for the marker or claim name;
-    /// [`CliError::Io`] on a filesystem failure, the entry at `name` untouched.
+    /// [`CliError::Io`] on a filesystem failure, the entry at `name` untouched,
+    /// except a failed sync of the directory after the rename, which names
+    /// the directory: the new content is in place, its durability unconfirmed.
     pub fn replace_if_unchanged(
         &self,
         name: &OsStr,
@@ -1649,7 +1810,7 @@ impl HeldDir {
         target: &EntryName,
         judged: &str,
     ) -> Result<Result<(BackupName, Undo), SlotsFull>, CliError> {
-        let (backups, _) = self.create_child(OsStr::new(crate::driver::BACKUP_DIR))?;
+        let (backups, created) = self.create_child(OsStr::new(crate::driver::BACKUP_DIR))?;
         for slot in 0..BACKUP_SLOTS {
             let slot_name = backup_slot(target, slot);
             let entry = backups.entry(OsStr::new(&slot_name))?;
@@ -1664,6 +1825,10 @@ impl HeldDir {
                 .write_all(judged.as_bytes())
                 .and_then(|()| file.sync_all());
             drop(file);
+            let written = written
+                .map_err(|e| act_err(&path, e))
+                .and_then(|()| backups.sync())
+                .and_then(|()| if created { self.sync() } else { Ok(()) });
             let undo = Undo::Slot {
                 dir: backups,
                 name: entry.clone(),
@@ -1671,7 +1836,7 @@ impl HeldDir {
             };
             if let Err(e) = written {
                 undo.run();
-                return Err(act_err(&path, e));
+                return Err(e);
             }
             return Ok(Ok((BackupName(entry), undo)));
         }
@@ -1679,6 +1844,12 @@ impl HeldDir {
     }
 
     /// Stage `fill`, run `keep`, re-prove the judged file, then rename over it; undo all on any other end.
+    ///
+    /// The staged file is created owner-only and synced before the re-proof,
+    /// takes the judged file's permission bits (no setuid, setgid or sticky
+    /// bit) only after it, and the directory is synced after the rename: a
+    /// crash leaves the old or the new content, and the new content is never
+    /// more readable than the old.
     fn replace_judged<T, E>(
         &self,
         name: &OsStr,
@@ -1695,29 +1866,33 @@ impl HeldDir {
         let tmp = stage_name(name);
         let staging = self.entry(OsStr::new(&tmp))?;
         let tmp_path = self.path.join(&tmp);
-        let mut staged = sys::create_new(&self.dir, &staging).map_err(|e| act_err(&tmp_path, e))?;
-        let filled = fill(&mut staged);
-        drop(staged);
+        let mut staged =
+            sys::create_private(&self.dir, &staging).map_err(|e| act_err(&tmp_path, e))?;
+        let filled = fill_synced(&mut staged, fill, &tmp_path);
         let mut undo = Undo::Nothing;
-        let result = match filled {
-            Err(e) => Err(act_err(&tmp_path, e)),
-            Ok(()) => match keep(self, &target) {
-                Err(e) => Err(e),
-                Ok(Err(refusal)) => Ok(Step::Kept(refusal)),
-                Ok(Ok((made, made_undo))) => {
-                    undo = made_undo;
-                    if self.still_judged(&target, judged_id, judged, cap) {
-                        sys::rename(&self.dir, &staging, &target)
-                            .map(|()| Step::Done(made))
-                            .map_err(|e| act_err(&self.path.join(name), e))
-                    } else {
-                        Ok(Step::Changed)
-                    }
-                }
-            },
+        let result = match filled.and_then(|()| keep(self, &target)) {
+            Ok(Ok((made, made_undo))) => {
+                undo = made_undo;
+                self.rename_judged(staged, &staging, &target, judged_id, judged, cap)
+                    .map(|renamed| {
+                        if renamed {
+                            Step::Done(made)
+                        } else {
+                            Step::Changed
+                        }
+                    })
+            }
+            Ok(Err(refusal)) => {
+                drop(staged);
+                Ok(Step::Kept(refusal))
+            }
+            Err(e) => {
+                drop(staged);
+                Err(e)
+            }
         };
         match result {
-            Ok(Step::Done(made)) => Ok(Step::Done(made)),
+            Ok(Step::Done(made)) => self.sync().map(|()| Step::Done(made)),
             other => {
                 let _ = sys::unlink(&self.dir, &staging);
                 undo.run();
@@ -1726,11 +1901,50 @@ impl HeldDir {
         }
     }
 
+    /// Re-prove the judged file, give `staged` its permission bits, then rename `staging` over it.
+    ///
+    /// `Ok(false)` when the entry no longer is the judged file holding the
+    /// judged bytes; nothing is renamed then.
+    fn rename_judged(
+        &self,
+        staged: File,
+        staging: &EntryName,
+        target: &EntryName,
+        judged_id: FileId,
+        judged: &str,
+        cap: ByteCap,
+    ) -> Result<bool, CliError> {
+        let path = self.path.join(target.as_os_str());
+        if !self.still_judged(target, judged_id, judged, cap) {
+            return Ok(false);
+        }
+        if !sys::carry_mode(&self.dir, target, judged_id, &staged).map_err(|e| act_err(&path, e))? {
+            return Ok(false);
+        }
+        drop(staged);
+        sys::rename(&self.dir, staging, target).map_err(|e| act_err(&path, e))?;
+        Ok(true)
+    }
+
+    /// Sync this directory, so the entries last renamed or created in it survive a crash.
+    ///
+    /// # Errors
+    /// [`CliError::Io`] naming the directory when the sync fails.
+    fn sync(&self) -> Result<(), CliError> {
+        sys::sync_dir(&self.dir).map_err(|e| act_err(&self.path, e))?;
+        durable(Synced::Directory, &self.path);
+        Ok(())
+    }
+
     /// Create the file `name` with `fill`'s content, never replacing an entry already there.
+    ///
+    /// The new file keeps the default creation mode; the writer syncs it, and
+    /// the directory after the rename.
     ///
     /// # Errors
     /// [`OutputRefusal::UnsafeComponent`] for the marker or claim name;
-    /// [`CliError::Io`] on a filesystem failure.
+    /// [`CliError::Io`] on a filesystem failure; a failed sync of the
+    /// directory after the rename names the directory, the file in place.
     pub fn create_if_absent(
         &self,
         name: &OsStr,
@@ -1744,15 +1958,15 @@ impl HeldDir {
         let staging = self.entry(OsStr::new(&tmp))?;
         let tmp_path = self.path.join(&tmp);
         let mut staged = sys::create_new(&self.dir, &staging).map_err(|e| act_err(&tmp_path, e))?;
-        let filled = fill(&mut staged);
+        let filled = fill_synced(&mut staged, fill, &tmp_path);
         drop(staged);
-        let result = filled
-            .map_err(|e| act_err(&tmp_path, e))
-            .and_then(|()| self.rename_new(&staging, &target, name));
-        if !matches!(result, Ok(Created::Done)) {
-            let _ = sys::unlink(&self.dir, &staging);
+        match filled.and_then(|()| self.rename_new(&staging, &target, name)) {
+            Ok(Created::Done) => self.sync().map(|()| Created::Done),
+            other => {
+                let _ = sys::unlink(&self.dir, &staging);
+                other
+            }
         }
-        result
     }
 
     /// Rename `staging` to the absent `target`; an entry at `target` is [`Created::Exists`].
@@ -2009,6 +2223,49 @@ fn claim_reached(point: ClaimPoint, path: &Path) {
 /// Outside tests there is no hook: a claim point has no side effect.
 #[cfg(not(test))]
 const fn claim_reached(_point: ClaimPoint, _path: &Path) {}
+
+/// What the writer synced, reported to the test hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Synced {
+    /// The staged file, after the caller's fill and before the rename.
+    Staged,
+    /// The directory, after the rename (or a backup slot's directory, after the slot).
+    Directory,
+}
+
+/// Test-only hook run after each sync the writer makes.
+#[cfg(test)]
+pub type SyncHook = Box<dyn FnMut(Synced, &Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static SYNC_HOOK: std::cell::RefCell<Option<SyncHook>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Install (or clear) the hook run after each sync the writer makes on this thread.
+#[cfg(test)]
+pub fn set_sync_hook(hook: Option<SyncHook>) {
+    SYNC_HOOK.with(|slot| *slot.borrow_mut() = hook);
+}
+
+/// Run the sync hook, if any, for what was synced at `path`.
+#[cfg(test)]
+fn durable(synced: Synced, path: &Path) {
+    let taken = SYNC_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(mut hook) = taken {
+        hook(synced, path);
+        SYNC_HOOK.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(hook);
+            }
+        });
+    }
+}
+
+/// Outside tests there is no hook: a sync has no further side effect.
+#[cfg(not(test))]
+const fn durable(_synced: Synced, _path: &Path) {}
 
 /// Test-only hook run after a subdirectory is re-proven and released, before its removal.
 #[cfg(test)]
@@ -3734,6 +3991,262 @@ mod tests {
         assert_eq!(
             sys::renamed_exclusively(&held.dir, &name("staged"), &name("fresh")).ok(),
             Some(true)
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Write `new` into the staged file without syncing it: the writer must sync it.
+    fn fill_unsynced(file: &mut File) -> io::Result<()> {
+        file.write_all(b"new")
+    }
+
+    /// The permission bits of the file at `path`, special bits included.
+    #[cfg(unix)]
+    fn mode_at(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path)
+            .expect("the file exists")
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    /// A replace keeps the judged file's mode, and the staged file is owner-only while filled.
+    #[cfg(unix)]
+    #[test]
+    fn replace_keeps_judged_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        for judged_mode in [0o600, 0o640, 0o644] {
+            let base = scratch(&format!("keeps_mode_{judged_mode:o}"));
+            let (held, id, text) = judged_n(&base, "old");
+            std::fs::set_permissions(base.join("N"), std::fs::Permissions::from_mode(judged_mode))
+                .expect("set the judged mode");
+            let staged_mode = Rc::new(Cell::new(None));
+            let seen = Rc::clone(&staged_mode);
+            let done = held.replace_if_unchanged(
+                OsStr::new("N"),
+                id,
+                &text,
+                byte_cap(4096),
+                move |file: &mut File| {
+                    seen.set(Some(file.metadata()?.permissions().mode() & 0o7777));
+                    file.write_all(b"new")
+                },
+            );
+            assert_eq!(done.ok(), Some(Replaced::Done));
+            assert_eq!(
+                staged_mode.get(),
+                Some(0o600),
+                "the staged file is owner-only while filled"
+            );
+            assert_eq!(
+                mode_at(&base.join("N")),
+                judged_mode,
+                "the replacement keeps {judged_mode:o}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(base.join("N")).ok().as_deref(),
+                Some("new")
+            );
+            assert!(staged_in(&base).is_empty());
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// A replace never carries setuid, setgid or the sticky bit to the new content.
+    #[cfg(unix)]
+    #[test]
+    fn replace_strips_setuid() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = scratch("strips_setuid");
+        let (held, id, text) = judged_n(&base, "old");
+        std::fs::set_permissions(base.join("N"), std::fs::Permissions::from_mode(0o7755))
+            .expect("set special bits");
+        let done =
+            held.replace_if_unchanged(OsStr::new("N"), id, &text, byte_cap(4096), fill_unsynced);
+        assert_eq!(done.ok(), Some(Replaced::Done));
+        assert_eq!(
+            mode_at(&base.join("N")),
+            0o755,
+            "only the read, write and execute bits are carried"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Record every sync the writer makes on this thread.
+    fn record_syncs() -> Rc<std::cell::RefCell<Vec<(Synced, PathBuf)>>> {
+        let synced = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = Rc::clone(&synced);
+        set_sync_hook(Some(Box::new(move |what: Synced, at: &Path| {
+            seen.borrow_mut().push((what, at.to_path_buf()));
+        })));
+        synced
+    }
+
+    /// The writer syncs the staged file before the rename and the directory after it; the caller syncs nothing.
+    #[test]
+    fn replace_syncs_temp() {
+        let base = scratch("syncs_temp");
+        let (held, id, text) = judged_n(&base, "old");
+        let synced = record_syncs();
+        let done =
+            held.replace_if_unchanged(OsStr::new("N"), id, &text, byte_cap(4096), fill_unsynced);
+        let created = held.create_if_absent(OsStr::new("M"), fill_unsynced);
+        set_sync_hook(None);
+        assert_eq!(done.ok(), Some(Replaced::Done));
+        assert_eq!(created.ok(), Some(Created::Done));
+        let synced = synced.borrow();
+        let kinds: Vec<Synced> = synced.iter().map(|(what, _)| *what).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                Synced::Staged,
+                Synced::Directory,
+                Synced::Staged,
+                Synced::Directory
+            ],
+            "staged file before the rename, directory after: {synced:?}"
+        );
+        for (what, at) in synced.iter() {
+            match what {
+                Synced::Staged => assert!(
+                    at.parent() == Some(base.as_path())
+                        && at.to_string_lossy().contains(".ipe-tmp."),
+                    "the staged file is synced, got {at:?}"
+                ),
+                Synced::Directory => assert_eq!(at, &base, "the directory is synced"),
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(base.join("N")).ok().as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("M")).ok().as_deref(),
+            Some("new")
+        );
+        assert!(staged_in(&base).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Whether `parsed` is the unsafe-component refusal.
+    fn is_unsafe_component(parsed: &Result<RelativeLeaf, CliError>) -> bool {
+        matches!(
+            parsed,
+            Err(CliError::OutputRefused(OutputRefusal::UnsafeComponent(_)))
+        )
+    }
+
+    /// A relative leaf never names a parent step, wherever it sits.
+    #[test]
+    fn relative_leaf_refuses_dotdot() {
+        for spelled in ["..", "../f", "a/../f", "a/..", "a/b/../../../f"] {
+            let parsed = RelativeLeaf::parse(Path::new(spelled));
+            assert!(is_unsafe_component(&parsed), "{spelled:?}: {parsed:?}");
+        }
+    }
+
+    /// A relative leaf never names a root, and a path outside the root is refused as outside.
+    #[test]
+    fn relative_leaf_refuses_root() {
+        for spelled in ["/", "/f", "/a/f"] {
+            let parsed = RelativeLeaf::parse(Path::new(spelled));
+            assert!(is_unsafe_component(&parsed), "{spelled:?}: {parsed:?}");
+        }
+        let base = scratch("leaf_root");
+        let outside = RelativeLeaf::under(&base, Path::new("/elsewhere/f"));
+        assert!(
+            matches!(
+                outside,
+                Err(CliError::OutputRefused(
+                    OutputRefusal::OutsideProject { .. }
+                ))
+            ),
+            "{outside:?}"
+        );
+        let own = RelativeLeaf::under(&base, &base);
+        assert!(
+            is_unsafe_component(&own),
+            "the root itself is no leaf: {own:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A relative leaf never names the current directory, nor nothing at all.
+    #[test]
+    fn relative_leaf_refuses_curdir() {
+        for spelled in ["", ".", "./f", "./a/f"] {
+            let parsed = RelativeLeaf::parse(Path::new(spelled));
+            assert!(is_unsafe_component(&parsed), "{spelled:?}: {parsed:?}");
+        }
+    }
+
+    /// Descending holds the leaf's parent, the root itself for a top-level leaf.
+    #[test]
+    fn descend_holds_the_leaf_parent() {
+        let base = scratch("descend_parent");
+        std::fs::create_dir_all(base.join("a").join("b")).expect("make a/b");
+        let held = held_at(&base);
+        let deep =
+            RelativeLeaf::under(&base, &base.join("a").join("b").join("f")).expect("a plain leaf");
+        assert_eq!(deep.leaf(), &name("f"));
+        let level = held.descend(&deep).expect("descend to a/b");
+        assert!(matches!(level, Level::Below(_)), "{level:?}");
+        assert_eq!(level.path, base.join("a").join("b"));
+        let top = RelativeLeaf::parse(Path::new("f")).expect("a plain leaf");
+        let level = held.descend(&top).expect("the root holds f");
+        assert!(matches!(level, Level::Root(_)), "{level:?}");
+        let absent = RelativeLeaf::parse(Path::new("gone/f")).expect("a plain leaf");
+        let missing = held.descend(&absent);
+        assert!(
+            matches!(&missing, Err(CliError::Io { .. })),
+            "an absent level is an I/O error: {missing:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Descending never steps through a link to a directory.
+    #[cfg(unix)]
+    #[test]
+    fn descend_refuses_link_dir() {
+        let base = scratch("descend_link");
+        let outside = scratch("descend_link_outside");
+        std::fs::write(outside.join("f"), "outside").expect("plant outside file");
+        std::os::unix::fs::symlink(&outside, base.join("a")).expect("plant dir link");
+        let held = held_at(&base);
+        let leaf = RelativeLeaf::parse(Path::new("a/f")).expect("a plain leaf");
+        let refused = held.descend(&leaf);
+        assert!(
+            matches!(
+                refused,
+                Err(CliError::OutputRefused(OutputRefusal::Symlink(ref at))) if at == &base.join("a")
+            ),
+            "a linked level is refused, got {refused:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// A leaf [`MAX_LEAF_DEPTH`] directories deep is reached; one more directory is refused.
+    #[test]
+    fn descend_depth_ceiling() {
+        let base = scratch("descend_depth");
+        let deepest: PathBuf = std::iter::repeat_n("d", MAX_LEAF_DEPTH).collect();
+        std::fs::create_dir_all(base.join(&deepest)).expect("make the deepest level");
+        let held = held_at(&base);
+        let at_ceiling = RelativeLeaf::parse(&deepest.join("f")).expect("at the ceiling");
+        assert_eq!(at_ceiling.dirs().len(), MAX_LEAF_DEPTH);
+        let level = held.descend(&at_ceiling).expect("descend to the ceiling");
+        assert_eq!(level.path, base.join(&deepest));
+        let past = deepest.join("d").join("f");
+        let refused = RelativeLeaf::parse(&past);
+        assert!(
+            matches!(
+                refused,
+                Err(CliError::OutputRefused(OutputRefusal::TooDeep { limit, .. }))
+                    if limit == MAX_LEAF_DEPTH
+            ),
+            "one directory past the ceiling is refused, got {refused:?}"
         );
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -33,7 +33,7 @@ use cap_primitives::fs::{OpenOptions, OpenOptionsExt as _};
 use ipe_fs_open::reparse::{
     FILE_ATTRIBUTE_DIRECTORY as ATTR_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT as ATTR_REPARSE_POINT,
 };
-use ipe_fs_open::{EntryName, HeldDir, OpenRefusal};
+use ipe_fs_open::{EntryName, FileId, HeldDir, OpenRefusal};
 
 use super::Listed;
 
@@ -262,6 +262,24 @@ pub fn create_new(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
 /// Exclusively create the new file `name` in `dir` for writing; it inherits the directory's access list.
 pub fn create_private(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
     create_new(dir, name)
+}
+
+/// Give `staged` the judged file's permissions; on Windows it already has them, so `Ok(true)`.
+///
+/// The staged file inherits the directory's access list, as the judged file
+/// did; a read-only judged file refuses the rename over it.
+pub const fn carry_mode(
+    _dir: &HeldDir,
+    _name: &EntryName,
+    _judged: FileId,
+    _staged: &File,
+) -> io::Result<bool> {
+    Ok(true)
+}
+
+/// Sync the directory `dir`; no safe directory flush is reachable on Windows, so `Ok(())`.
+pub const fn sync_dir(_dir: &HeldDir) -> io::Result<()> {
+    Ok(())
 }
 
 /// Options opening the claim file to read, write, and lock, sharing every access and never following a reparse point.

@@ -7,8 +7,9 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
 use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::PermissionsExt as _;
 
-use ipe_fs_open::{EntryName, HeldDir};
+use ipe_fs_open::{EntryName, FileId, HeldDir};
 use rustix::fs::{AtFlags, Mode, OFlags};
 
 use super::Listed;
@@ -76,6 +77,47 @@ pub fn create_private(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
         claim_mode(),
     )?;
     Ok(File::from(fd))
+}
+
+/// Flags opening an existing entry only to stat it, never through a link, a FIFO, or a terminal.
+fn stat_flags() -> OFlags {
+    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC
+}
+
+/// The permission bits a replacement carries over: read, write and execute only.
+///
+/// Setuid, setgid and the sticky bit are never carried to new content.
+const CARRIED_BITS: u32 = 0o777;
+
+/// Give `staged` the permission bits of the entry `name` of `dir`, only while it is the file `judged`.
+///
+/// `Ok(false)` when the entry is gone, a link, or another object than
+/// `judged`; `staged` is untouched then.
+pub fn carry_mode(
+    dir: &HeldDir,
+    name: &EntryName,
+    judged: FileId,
+    staged: &File,
+) -> io::Result<bool> {
+    let fd = match rustix::fs::openat(dir.handle(), name.as_os_str(), stat_flags(), Mode::empty()) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT | rustix::io::Errno::LOOP | rustix::io::Errno::MLINK) => {
+            return Ok(false);
+        }
+        Err(errno) => return Err(errno.into()),
+    };
+    let current = File::from(fd);
+    if FileId::of_file(&current).map_err(ipe_fs_open::OpenRefusal::into_io)? != judged {
+        return Ok(false);
+    }
+    let bits = current.metadata()?.permissions().mode() & CARRIED_BITS;
+    staged.set_permissions(std::fs::Permissions::from_mode(bits))?;
+    Ok(true)
+}
+
+/// Sync the directory `dir`, so the entries last renamed or created in it survive a crash.
+pub fn sync_dir(dir: &HeldDir) -> io::Result<()> {
+    Ok(rustix::fs::fsync(dir.handle())?)
 }
 
 /// Exclusively create the claim file `name` in `dir`, open to read, write, and lock.
