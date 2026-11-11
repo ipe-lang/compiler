@@ -6,7 +6,7 @@
 //! [`crate::constrain`] call into here at the exact site a type fails to unify,
 //! resolving every [`Symbol`] into an owned `Box<str>`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ipe_canon::ast as canon;
 use ipe_diagnostics::{DResult, Diagnostic, TyDoc, TypeClass};
@@ -14,21 +14,70 @@ use ipe_intern::{Interner, Symbol};
 
 use crate::ty::Ty;
 
-/// Deterministic naming for flexible type variables that survived solving.
+/// What a rendering knows about a solver variable beyond its arena id.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VarLabel {
+    /// The variable still owes a named class and reads by the class stem.
+    Class(TypeClass),
+    /// The variable is the skolem of an annotation variable and reads by the
+    /// spelling the user wrote.
+    Annotation(Symbol),
+}
+
+/// The label of every annotation-space variable in `tys`, so a refusal over a
+/// written (not yet instantiated) type reads each variable as the user wrote it.
+///
+/// An annotation-space raw is the variable's interned [`Symbol`]; a
+/// solver-tagged raw names no annotation variable and gets no label.
+#[must_use]
+pub fn annotation_labels(tys: &[&Ty]) -> BTreeMap<u32, VarLabel> {
+    let mut labels = BTreeMap::new();
+    let mut stack: Vec<&Ty> = tys.to_vec();
+    while let Some(ty) = stack.pop() {
+        match ty {
+            Ty::Var(raw) => {
+                if let Some(name) = crate::ty::SkolemName::of_annotation_var(*raw) {
+                    labels.insert(*raw, VarLabel::Annotation(name.symbol()));
+                }
+            }
+            Ty::Fun(arg, result) => {
+                stack.push(arg);
+                stack.push(result);
+            }
+            Ty::Con { args, .. } | Ty::Tuple(args) => stack.extend(args.iter()),
+            Ty::Record(fields, _) => stack.extend(fields.values()),
+            Ty::Unit | Ty::Wildcard => {}
+        }
+    }
+    labels
+}
+
+/// A [`VarLabel`] with its annotation spelling already resolved.
+enum ResolvedLabel {
+    Class(TypeClass),
+    Annotation(Box<str>),
+}
+
+/// Deterministic naming for type variables that survived solving.
 ///
 /// A solved [`Ty::Var`] carries an opaque arena id, not a source name; rendering
 /// it verbatim would leak an unstable integer. Instead each distinct id is
 /// assigned a stable name in **first-seen order**, shared across the
 /// expected/found pair of a single diagnostic so the same variable reads
-/// identically on both sides. A variable owing a [`TypeClass`] is named by the
-/// class stem (`number`, `number1`, `comparable`, …); every other variable gets
-/// a letter (`a`, `b`, …, `z`, `a1`, `b1`, …).
+/// identically on both sides. A variable standing for an annotation variable
+/// reads by the user's spelling (`x`, then `x1` for a second distinct `x`); a
+/// variable owing a [`TypeClass`] is named by the class stem (`number`,
+/// `number1`, `comparable`, …); every other variable gets a letter (`a`, `b`,
+/// …, `z`, `a1`, `b1`, …). No two ids share a name, and no minted name equals
+/// an annotation spelling the same rendering prints.
 #[derive(Default)]
 pub struct VarNamer {
     map: BTreeMap<u32, Box<str>>,
     next: u32,
-    classes: BTreeMap<u32, TypeClass>,
+    labels: BTreeMap<u32, ResolvedLabel>,
     stem_next: BTreeMap<TypeClass, u32>,
+    reserved: BTreeSet<Box<str>>,
+    issued: BTreeSet<Box<str>>,
 }
 
 impl VarNamer {
@@ -38,20 +87,31 @@ impl VarNamer {
         Self {
             map: BTreeMap::new(),
             next: 0,
-            classes: BTreeMap::new(),
+            labels: BTreeMap::new(),
             stem_next: BTreeMap::new(),
+            reserved: BTreeSet::new(),
+            issued: BTreeSet::new(),
         }
     }
 
-    /// A fresh namer that names each id in `classes` by its class stem.
-    #[must_use]
-    pub const fn with_classes(classes: BTreeMap<u32, TypeClass>) -> Self {
-        Self {
-            map: BTreeMap::new(),
-            next: 0,
-            classes,
-            stem_next: BTreeMap::new(),
+    /// A fresh namer that names each id in `labels` by its label.
+    ///
+    /// # Errors
+    /// [`Diagnostic::CompilerBug`] if an annotation symbol cannot be resolved.
+    pub fn with_labels(labels: BTreeMap<u32, VarLabel>, interner: &Interner) -> DResult<Self> {
+        let mut namer = Self::new();
+        for (id, label) in labels {
+            let resolved = match label {
+                VarLabel::Class(class) => ResolvedLabel::Class(class),
+                VarLabel::Annotation(sym) => {
+                    let spelling = resolve(interner, sym)?;
+                    namer.reserved.insert(spelling.clone());
+                    ResolvedLabel::Annotation(spelling)
+                }
+            };
+            namer.labels.insert(id, resolved);
         }
+        Ok(namer)
     }
 
     /// The stable name for arena id `id`, minting one on first sight.
@@ -59,21 +119,63 @@ impl VarNamer {
         if let Some(existing) = self.map.get(&id) {
             return existing.clone();
         }
-        let name = self.classes.get(&id).map_or_else(
-            || {
-                let name = letters(self.next);
-                self.next = self.next.saturating_add(1);
+        let name = match self.labels.get(&id) {
+            Some(ResolvedLabel::Annotation(spelling)) => {
+                let spelling = spelling.clone();
+                self.first_free(0, |k| suffixed(&spelling, k), |k| k == 0).1
+            }
+            Some(ResolvedLabel::Class(class)) => {
+                let class = *class;
+                let start = self.stem_next.get(&class).copied().unwrap_or(0);
+                let (k, name) = self.first_free(start, |k| stem_name(class, k), |_| false);
+                self.stem_next.insert(class, k.saturating_add(1));
                 name
-            },
-            |class| {
-                let n = self.stem_next.entry(*class).or_insert(0);
-                let name = stem_name(*class, *n);
-                *n = n.saturating_add(1);
+            }
+            None => {
+                let (k, name) = self.first_free(self.next, letters, |_| false);
+                self.next = k.saturating_add(1);
                 name
-            },
-        );
+            }
+        };
+        self.issued.insert(name.clone());
         self.map.insert(id, name.clone());
         name
+    }
+
+    /// The first `candidate(k)`, `k >= start`, no other id holds.
+    ///
+    /// A candidate equal to an annotation spelling is taken unless
+    /// `may_take_reserved(k)` (only an annotation variable's own bare spelling
+    /// may). `candidate` is injective, so at most `issued + reserved` candidates
+    /// are taken and the bounded walk always ends on a free one.
+    fn first_free(
+        &self,
+        start: u32,
+        candidate: impl Fn(u32) -> Box<str>,
+        may_take_reserved: impl Fn(u32) -> bool,
+    ) -> (u32, Box<str>) {
+        let bound = self.issued.len().saturating_add(self.reserved.len());
+        let mut k = start;
+        let mut name = candidate(k);
+        for _ in 0..bound {
+            let taken = self.issued.contains(&name)
+                || (!may_take_reserved(k) && self.reserved.contains(&name));
+            if !taken {
+                break;
+            }
+            k = k.saturating_add(1);
+            name = candidate(k);
+        }
+        (k, name)
+    }
+}
+
+/// `(x, 0) → x`, `(x, 1) → x1`, … — the `k`-th distinct variable spelled `x`.
+fn suffixed(spelling: &str, k: u32) -> Box<str> {
+    if k == 0 {
+        spelling.into()
+    } else {
+        format!("{spelling}{k}").into_boxed_str()
     }
 }
 
@@ -262,18 +364,104 @@ mod tests {
 
     #[test]
     fn namer_names_a_class_owing_id_by_its_stem() {
-        let classes = BTreeMap::from([
-            (1, TypeClass::Number),
-            (2, TypeClass::Number),
-            (3, TypeClass::Comparable),
+        let labels = BTreeMap::from([
+            (1, VarLabel::Class(TypeClass::Number)),
+            (2, VarLabel::Class(TypeClass::Number)),
+            (3, VarLabel::Class(TypeClass::Comparable)),
         ]);
-        let mut n = VarNamer::with_classes(classes);
+        let Ok(mut n) = VarNamer::with_labels(labels, &Interner::new()) else {
+            return;
+        };
         assert_eq!(&*n.name(9), "a");
         assert_eq!(&*n.name(1), "number");
         assert_eq!(&*n.name(2), "number1");
         assert_eq!(&*n.name(3), "comparable");
         assert_eq!(&*n.name(1), "number", "same id must reuse its stem name");
         assert_eq!(&*n.name(8), "b", "a stem name must not consume a letter");
+    }
+
+    #[test]
+    fn namer_names_an_annotation_id_by_its_spelling() {
+        let mut i = Interner::new();
+        let Ok(x) = i.intern("x") else {
+            return;
+        };
+        let labels = BTreeMap::from([(5, VarLabel::Annotation(x))]);
+        let Ok(mut n) = VarNamer::with_labels(labels, &i) else {
+            return;
+        };
+        assert_eq!(&*n.name(5), "x");
+        assert_eq!(&*n.name(5), "x", "same id must reuse its spelling");
+    }
+
+    #[test]
+    fn two_annotation_ids_with_one_spelling_read_x_and_x1() {
+        let mut i = Interner::new();
+        let Ok(x) = i.intern("x") else {
+            return;
+        };
+        let labels = BTreeMap::from([(5, VarLabel::Annotation(x)), (6, VarLabel::Annotation(x))]);
+        let Ok(mut n) = VarNamer::with_labels(labels, &i) else {
+            return;
+        };
+        assert_eq!(&*n.name(5), "x");
+        assert_eq!(
+            &*n.name(6),
+            "x1",
+            "a second distinct `x` must not print as `x`"
+        );
+    }
+
+    #[test]
+    fn a_suffixed_spelling_skips_another_annotation_spelling() {
+        let mut i = Interner::new();
+        let (Ok(x), Ok(x1)) = (i.intern("x"), i.intern("x1")) else {
+            return;
+        };
+        let labels = BTreeMap::from([
+            (5, VarLabel::Annotation(x)),
+            (6, VarLabel::Annotation(x)),
+            (7, VarLabel::Annotation(x1)),
+        ]);
+        let Ok(mut n) = VarNamer::with_labels(labels, &i) else {
+            return;
+        };
+        assert_eq!(&*n.name(5), "x");
+        assert_eq!(&*n.name(6), "x2", "`x1` is the user's own spelling");
+        assert_eq!(&*n.name(7), "x1");
+    }
+
+    #[test]
+    fn a_minted_letter_never_equals_an_annotation_spelling() {
+        let mut i = Interner::new();
+        let (Ok(a), Ok(c)) = (i.intern("a"), i.intern("c")) else {
+            return;
+        };
+        let labels = BTreeMap::from([(1, VarLabel::Annotation(a)), (2, VarLabel::Annotation(c))]);
+        let Ok(mut n) = VarNamer::with_labels(labels, &i) else {
+            return;
+        };
+        assert_eq!(&*n.name(9), "b", "letter `a` is the user's spelling");
+        assert_eq!(&*n.name(8), "d", "letter `c` is the user's spelling");
+        assert_eq!(&*n.name(1), "a");
+        assert_eq!(&*n.name(2), "c");
+    }
+
+    #[test]
+    fn a_minted_stem_never_equals_an_annotation_spelling() {
+        let mut i = Interner::new();
+        let Ok(number) = i.intern("number") else {
+            return;
+        };
+        let labels = BTreeMap::from([
+            (1, VarLabel::Annotation(number)),
+            (2, VarLabel::Class(TypeClass::Number)),
+        ]);
+        let Ok(mut n) = VarNamer::with_labels(labels, &i) else {
+            return;
+        };
+        assert_eq!(&*n.name(2), "number1", "`number` is the user's spelling");
+        assert_eq!(&*n.name(1), "number");
     }
 
     #[test]

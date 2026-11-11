@@ -889,9 +889,17 @@ pub fn ui_aspect_ratio_wh_<M>(w: i64, h: i64) -> Attribute<M> {
 }
 
 /// `Ui.htmlAttribute : String -> String -> Attribute msg`
+///
+/// A runtime-owned name (`html::is_runtime_owned_attr_name`) builds no
+/// attribute: the program never sets a marker the runtime or its client
+/// reads. The runtime's own markers build their variants directly.
 #[must_use]
 pub fn ui_html_attribute_<M>(key: String, value: String) -> Attribute<M> {
-    Attribute::AttrAttribute(key, value)
+    if crate::html::is_runtime_owned_attr_name(&key) {
+        Attribute::NoAttribute
+    } else {
+        Attribute::AttrAttribute(key, value)
+    }
 }
 
 // Background pseudo-class colour attrs

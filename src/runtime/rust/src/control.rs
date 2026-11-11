@@ -625,14 +625,27 @@ pub mod server {
     /// read deadline (a peer that connects but never completes a record is dropped
     /// when it fires), and any outcome is discarded (a bad peer never propagates a
     /// failure into the loop). The handler is shared across tasks behind an `Arc`.
+    /// A start refused for want of a runtime drops the connection.
     fn spawn_conn<H, Fut>(stream: TcpStream, handler: Arc<H>, deadline: Duration)
     where
         H: Fn(ControlFrame) -> Fut + Send + Sync + 'static,
         Fut: core::future::Future<Output = ControlFrame> + Send,
     {
-        tokio::spawn(async move {
-            let _ = tokio::time::timeout(deadline, serve_conn(stream, &*handler)).await;
-        });
+        let started = crate::threads::spawn_task(
+            "dev control connection",
+            crate::threads::TaskScope::RuntimeOwned(
+                "a dev-loop peer connection, outside any request",
+            ),
+            async move {
+                let _ = tokio::time::timeout(deadline, serve_conn(stream, &*handler)).await;
+            },
+        );
+        if let Ok(task) = started {
+            task.detach(crate::threads::Detached::NoIpeCode(
+                "a control connection: it decodes one frame and hands it to the handler, \
+                 which only enqueues it",
+            ));
+        }
     }
 
     /// The echo/ack handler: reply to every frame with a positive
