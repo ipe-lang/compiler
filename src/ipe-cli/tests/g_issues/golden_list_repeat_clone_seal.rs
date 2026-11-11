@@ -686,6 +686,10 @@ fn every_clone_family_is_a_clone_carrier() {
                 ipe_ir::carrier_is_clone(&sample, &payloads),
                 "{family:?} is a Clone carrier"
             );
+            assert!(
+                !family.values().is_empty(),
+                "{family:?} has a value in the fixture"
+            );
         }
     }
 }
