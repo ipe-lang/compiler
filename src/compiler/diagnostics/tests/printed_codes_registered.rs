@@ -73,8 +73,12 @@ fn unregistered(text: &str) -> Vec<&str> {
 ///
 /// Only lines provably inside a test item drop out (see [`skip_test_item`]);
 /// anything the reading cannot place stays in view, so a misread item can only
-/// fail this test, never hide a production string from it.
+/// fail this test, never hide a production string from it. A file whose header
+/// carries `#![cfg(test)]` is a test module whole and drops out entirely.
 fn without_test_items(source: &str) -> String {
+    if is_test_only_file(source) {
+        return String::new();
+    }
     let lines: Vec<&str> = source.lines().collect();
     let mut kept = String::new();
     let mut at = 0;
@@ -88,6 +92,18 @@ fn without_test_items(source: &str) -> String {
         }
     }
     kept
+}
+
+/// Whether `source` opens with an inner `#![cfg(test)]` before its first item.
+///
+/// Only the header counts: blank lines, comments and inner attributes. A
+/// `#![cfg(test)]` anywhere else is not a file-level attribute and gates nothing.
+fn is_test_only_file(source: &str) -> bool {
+    source
+        .lines()
+        .map(str::trim)
+        .take_while(|line| line.is_empty() || line.starts_with("//") || line.starts_with("#!["))
+        .any(|line| line == "#![cfg(test)]")
 }
 
 /// Width of `line`'s leading whitespace.
@@ -340,6 +356,31 @@ const D: &str = \"IPE-S9986\";
         ],
         "every production string after a test field, variant, arm, statement or \
          multi-line attribute stays in view"
+    );
+}
+
+#[test]
+fn a_test_only_file_drops_out_and_a_late_inner_attribute_does_not() {
+    let test_only = "\
+//! Test-only module.
+
+#![cfg(test)]
+
+const A: &str = \"IPE-S9984\";
+";
+    assert!(
+        unregistered(&without_test_items(test_only)).is_empty(),
+        "a file gated whole by `#![cfg(test)]` prints nothing"
+    );
+    let production = "\
+const A: &str = \"IPE-S9983\";
+#![cfg(test)]
+const B: &str = \"IPE-S9982\";
+";
+    assert_eq!(
+        unregistered(&without_test_items(production)),
+        ["IPE-S9983", "IPE-S9982"],
+        "an inner attribute past the first item gates nothing: every line stays in view"
     );
 }
 

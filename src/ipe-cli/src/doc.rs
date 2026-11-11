@@ -702,7 +702,7 @@ fn has_host_path_syntax(s: &str) -> bool {
 /// in `doc_bundle`) that feeds `DocBundle::build`, so `ipe doc <key>` and the
 /// HTML site are always in sync. Commands are injected from `help.rs`'s
 /// `COMMANDS` registry.
-fn build_index() -> Result<Index, CliError> {
+pub(crate) fn build_index() -> Result<Index, CliError> {
     use ipe_docs::IndexBuilder;
     let mut builder = IndexBuilder::new();
 
@@ -794,6 +794,19 @@ fn construct_index_entries(dir: &include_dir::Dir<'_>) -> Result<Vec<DocEntry>, 
 /// key the embedded corpus does not hold (a new page previewed before it is
 /// committed); [`DocsOverlay::Embedded`] adds nothing.
 fn build_doc_bundle(overlay: &DocsOverlay) -> Result<DocBundle, CliError> {
+    build_doc_bundle_over(&build_index()?, overlay)
+}
+
+/// [`build_doc_bundle`] over an already built `idx`, so a lookup that holds the
+/// index builds it once.
+///
+/// # Errors
+///
+/// The bundle error of a source the bundle refuses.
+pub(crate) fn build_doc_bundle_over(
+    idx: &Index,
+    overlay: &DocsOverlay,
+) -> Result<DocBundle, CliError> {
     // Modules: one entry per stdlib module name.
     let module_sources: Vec<BundleSource> = stdlib_module_names()
         .into_iter()
@@ -808,7 +821,6 @@ fn build_doc_bundle(overlay: &DocsOverlay) -> Result<DocBundle, CliError> {
     // The index is the one `build_index` lookups resolve against, so a listed
     // key and a resolved key come from the same producer.
     let symbol_sources: Vec<BundleSource> = {
-        let idx = build_index()?;
         let mut by_canonical: std::collections::BTreeMap<&str, (&str, Vec<String>)> =
             std::collections::BTreeMap::new();
         for key in idx.keys() {
@@ -890,6 +902,72 @@ fn bundle_build_error(error: BundleError) -> CliError {
     }
 }
 
+/// The entry a lookup term opens: an index entry or a bundle entry.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Hit<'a> {
+    /// An exact key of the content index (a code, symbol, module, command, operator).
+    Indexed(&'a ipe_docs::Entry),
+    /// A bundle entry (a `kind:key` term, or a unique exact key of any kind).
+    Bundled(&'a crate::doc_bundle::DocEntry),
+}
+
+/// Why a lookup term opens no entry.
+#[derive(Debug)]
+pub(crate) enum TermMiss {
+    /// A `kind:key` term the bundle refuses: an unknown kind or key.
+    Qualified(BundleError),
+    /// A bare term no index key and no unique bundle key matches.
+    Bare,
+}
+
+/// The entry `term` opens in the embedded docs, or why it opens none.
+///
+/// A `kind:key` term resolves within that kind alone; a bare term tries the
+/// content index, then a unique exact key of any bundle kind. A project
+/// module member is not part of the embedded docs: the bare lookup tries it
+/// between the two steps, from the working directory.
+pub(crate) fn resolve_term<'a>(
+    bundle: &'a DocBundle,
+    index: &'a Index,
+    term: &LookupTerm,
+) -> Result<Hit<'a>, TermMiss> {
+    match term {
+        LookupTerm::Qualified { term, .. } => bundle
+            .resolve_qualified(term.text())
+            .map(Hit::Bundled)
+            .map_err(TermMiss::Qualified),
+        LookupTerm::Bare(query) => index.resolve(query.text()).map_or_else(
+            || {
+                crate::doc_search::unique_exact(bundle.all_entries(), query)
+                    .map(Hit::Bundled)
+                    .ok_or(TermMiss::Bare)
+            },
+            |entry| Ok(Hit::Indexed(entry)),
+        ),
+    }
+}
+
+/// Render the entry a lookup term opened.
+fn render_hit(hit: Hit<'_>, format: OutputFormat) {
+    match hit {
+        Hit::Bundled(entry) => render_bundle_entry(entry, format),
+        Hit::Indexed(entry) => {
+            use crate::screen::{Screen, Stream, emit_machine};
+            match format {
+                OutputFormat::Plain => {
+                    emit_machine(Stream::Stdout, &render_doc_entry_plain(entry));
+                }
+                OutputFormat::Json => emit_machine(Stream::Stdout, &render_doc_entry_json(entry)),
+                OutputFormat::Human => {
+                    let mut screen = Screen::new(Stream::Stdout);
+                    let body = render_doc_entry_human(entry, screen.palette());
+                    screen.styled(&body).emit();
+                }
+            }
+        }
+    }
+}
+
 /// `ipe doc kind:key` -- exact scoped bundle lookup.
 ///
 /// Resolves a `kind:key` qualified reference against the unified bundle and
@@ -900,17 +978,22 @@ fn run_bundle_lookup(
     key: &DocQuery,
     format: OutputFormat,
 ) -> Result<(), CliError> {
-    let bundle = build_doc_bundle(&DocsOverlay::Embedded)?;
+    let index = build_index()?;
+    let bundle = build_doc_bundle_over(&index, &DocsOverlay::Embedded)?;
+    let lookup = LookupTerm::Qualified {
+        term: term.clone(),
+        key: key.clone(),
+    };
 
-    match bundle.resolve_qualified(term.text()) {
-        Ok(entry) => {
-            render_bundle_entry(entry, format);
+    match resolve_term(&bundle, &index, &lookup) {
+        Ok(hit) => {
+            render_hit(hit, format);
             Ok(())
         }
-        Err(crate::doc_bundle::BundleError::UnknownKind(prefix)) => {
+        Err(TermMiss::Qualified(BundleError::UnknownKind(prefix))) => {
             Err(CliError::Usage(text::msg::doc_unknown_kind(&prefix)))
         }
-        Err(crate::doc_bundle::BundleError::UnknownKey { kind, .. }) => {
+        Err(TermMiss::Qualified(BundleError::UnknownKey { kind, .. })) => {
             let ranked = crate::doc_search::rank(
                 bundle.entries_for_kind(kind),
                 bundle.aliases_for_kind(kind),
@@ -918,7 +1001,8 @@ fn run_bundle_lookup(
             );
             Err(miss_error(term.text(), &ranked, format))
         }
-        Err(e) => Err(CliError::Usage(text::msg::command_refusal(&"doc", &e))),
+        Err(TermMiss::Qualified(e)) => Err(CliError::Usage(text::msg::command_refusal(&"doc", &e))),
+        Err(TermMiss::Bare) => Err(doc_miss(term, &bundle, format)),
     }
 }
 
@@ -930,19 +1014,11 @@ fn run_bundle_lookup(
 /// ranking run, so a precise hit never has a list put in front of it.
 fn run_doc_lookup_with_fuzzy(query: &DocQuery, format: OutputFormat) -> Result<(), CliError> {
     let key = query.text();
-    // Try the legacy exact index first.
+    // An exact index key opens before a project member is tried; the bundle
+    // is built only past both.
     let index = build_index()?;
     if let Some(entry) = index.resolve(key) {
-        use crate::screen::{Screen, Stream, emit_machine};
-        match format {
-            OutputFormat::Plain => emit_machine(Stream::Stdout, &render_doc_entry_plain(entry)),
-            OutputFormat::Json => emit_machine(Stream::Stdout, &render_doc_entry_json(entry)),
-            OutputFormat::Human => {
-                let mut screen = Screen::new(Stream::Stdout);
-                let body = render_doc_entry_human(entry, screen.palette());
-                screen.styled(&body).emit();
-            }
-        }
+        render_hit(Hit::Indexed(entry), format);
         return Ok(());
     }
 
@@ -961,12 +1037,15 @@ fn run_doc_lookup_with_fuzzy(query: &DocQuery, format: OutputFormat) -> Result<(
     // No exact match: a unique exact key of a kind the index does not carry (a
     // topic, guide, or idiom) opens directly; anything else is a miss that
     // lists the closest entries of every kind.
-    let bundle = build_doc_bundle(&DocsOverlay::Embedded)?;
-    if let Some(only) = crate::doc_search::unique_exact(bundle.all_entries(), query) {
-        render_bundle_entry(only, format);
-        return Ok(());
-    }
-    Err(doc_miss(query, &bundle, format))
+    let bundle = build_doc_bundle_over(&index, &DocsOverlay::Embedded)?;
+    let lookup = LookupTerm::Bare(query.clone());
+    resolve_term(&bundle, &index, &lookup).map_or_else(
+        |_| Err(doc_miss(query, &bundle, format)),
+        |hit| {
+            render_hit(hit, format);
+            Ok(())
+        },
+    )
 }
 
 /// The error for a query that named no entry: [`CliError::DocNotFound`] with the entries of any
@@ -1046,11 +1125,14 @@ fn in_reserved_namespace(module_name: &str) -> bool {
 }
 
 /// One `Module.member` resolution's outcome.
-enum MemberResolution {
+#[derive(Debug)]
+pub(crate) enum MemberResolution {
+    /// The owning module and the member's name.
     Found(ModuleDoc, String),
     /// The module part's short name matched more than one dotted stdlib
     /// module; every match, sorted.
     Ambiguous(Vec<String>),
+    /// No module of that name exposes the member.
     Miss,
 }
 
@@ -1077,7 +1159,7 @@ fn ambiguous_module_error(query: &str, candidates: &[String], format: OutputForm
 ///
 /// # Errors
 /// [`CliError`] when the matched stdlib module cannot be documented.
-fn resolve_member(key: &str) -> Result<MemberResolution, CliError> {
+pub(crate) fn resolve_member(key: &str) -> Result<MemberResolution, CliError> {
     let Some((module_name, member)) = key.rsplit_once('.') else {
         return Ok(MemberResolution::Miss);
     };
@@ -2457,7 +2539,13 @@ fn list_modules(path: &Path, format: OutputFormat) {
 /// Returns an empty vec when the project cannot be read or typed, so `query`
 /// can still serve stdlib modules when no project is present.
 fn query_project_modules() -> Vec<ModuleDoc> {
-    read_tree(Path::new(DEFAULT_PATH)).map_or_else(
+    project_modules_at(Path::new(DEFAULT_PATH))
+}
+
+/// The documented modules of the project at `path`, empty when it holds none
+/// that extract.
+pub(crate) fn project_modules_at(path: &Path) -> Vec<ModuleDoc> {
+    read_tree(path).map_or_else(
         |_| Vec::new(),
         |walked| {
             let Ok(api) = extract_walked(&walked) else {
@@ -2527,50 +2615,77 @@ fn render_module_human(module: &ModuleDoc, index: &AnchorIndex) {
         .emit();
 }
 
-/// Query one module's API and render it per `format`.
+/// What an `ipe doc <Module>` query opens.
+#[derive(Debug)]
+pub(crate) enum ModuleQuery {
+    /// A project or stdlib module.
+    Module(ModuleDoc),
+    /// One member of a module: `Module.member`.
+    Member(ModuleDoc, String),
+    /// The short name matched more than one dotted module; every match, sorted.
+    Ambiguous(Vec<String>),
+    /// No module and no member.
+    Miss,
+}
+
+/// Resolve an `ipe doc <Module>` query against `project` and the stdlib.
 ///
-/// Resolves `term` against stdlib + project (project overrides stdlib on
-/// a name collision). Errors with a typed message on an unknown module.
-fn query_module(term: &DocQuery, format: OutputFormat) -> Result<(), CliError> {
-    let module_name = term.text();
-    // Project wins over stdlib on name collision. Project modules are already a
-    // single resolved pass; the stdlib side is resolved lazily so a single-name
-    // query type-checks one module, not all ~130 compiled-source modules.
-    // A reserved-namespace name is never a project module's, so it skips the
-    // project side and always opens the stdlib module it names.
+/// The project wins over the stdlib on a name collision, and a reserved-namespace
+/// name never reads `project`. A name that is no module tries a
+/// `Module.member` resolution.
+///
+/// # Errors
+///
+/// The error of a stdlib module that fails to extract.
+pub(crate) fn resolve_module_query(
+    module_name: &str,
+    project: impl FnOnce() -> Vec<ModuleDoc>,
+) -> Result<ModuleQuery, CliError> {
+    // Project modules are already a single resolved pass; the stdlib side is
+    // resolved lazily so a single-name query type-checks one module, not all
+    // ~130 compiled-source modules.
     let project = if in_reserved_namespace(module_name) {
         Vec::new()
     } else {
-        query_project_modules()
+        project()
     };
     if let Some(module) = project.into_iter().find(|m| m.name == module_name) {
-        render_query_module(&module, format);
-        return Ok(());
+        return Ok(ModuleQuery::Module(module));
     }
+    Ok(match query_single_stdlib_module(module_name)? {
+        StdlibModuleLookup::Found(module) => ModuleQuery::Module(module),
+        StdlibModuleLookup::Ambiguous(candidates) => ModuleQuery::Ambiguous(candidates),
+        StdlibModuleLookup::Miss => match resolve_member(module_name)? {
+            MemberResolution::Found(owner, member) => ModuleQuery::Member(owner, member),
+            MemberResolution::Ambiguous(candidates) => ModuleQuery::Ambiguous(candidates),
+            MemberResolution::Miss => ModuleQuery::Miss,
+        },
+    })
+}
 
-    match query_single_stdlib_module(module_name)? {
-        StdlibModuleLookup::Found(module) => {
+/// Query one module's API and render it per `format`.
+///
+/// Resolves `term` as [`resolve_module_query`] does, against the stdlib and the
+/// working directory's project. Errors with a typed message on an unknown
+/// module.
+fn query_module(term: &DocQuery, format: OutputFormat) -> Result<(), CliError> {
+    let module_name = term.text();
+    match resolve_module_query(module_name, query_project_modules)? {
+        ModuleQuery::Module(module) => {
             render_query_module(&module, format);
             Ok(())
         }
-        StdlibModuleLookup::Ambiguous(candidates) => {
+        ModuleQuery::Member(owner, member) => {
+            render_member(&owner, &member, format);
+            Ok(())
+        }
+        ModuleQuery::Ambiguous(candidates) => {
             Err(ambiguous_module_error(module_name, &candidates, format))
         }
-        // `Module.member` (a type or an uppercase-led value path) or a miss:
-        // resolve the member, else suggest the closest entries of any kind.
-        StdlibModuleLookup::Miss => match resolve_member(module_name)? {
-            MemberResolution::Found(owner, member) => {
-                render_member(&owner, &member, format);
-                Ok(())
-            }
-            MemberResolution::Ambiguous(candidates) => {
-                Err(ambiguous_module_error(module_name, &candidates, format))
-            }
-            MemberResolution::Miss => {
-                let bundle = build_doc_bundle(&DocsOverlay::Embedded)?;
-                Err(doc_miss(term, &bundle, format))
-            }
-        },
+        ModuleQuery::Miss => {
+            let bundle = build_doc_bundle(&DocsOverlay::Embedded)?;
+            Err(doc_miss(term, &bundle, format))
+        }
     }
 }
 
@@ -10368,120 +10483,5 @@ total =
             ),
             "`agents` opens the guide, got {only:?}"
         );
-    }
-}
-
-/// The `ipe init` `AGENTS.md` template cannot drift from the compiler it ships
-/// with: every function section 2 claims as a `Ipe.Basics` (Tier A) export
-/// must be a live export of that module, and every `ipe <word>` invocation in
-/// section 9's commands block must be a command or group+verb pair the CLI
-/// dispatcher ([`crate::help`]) actually recognises.
-#[cfg(test)]
-mod agents_template_truth {
-    use std::collections::BTreeSet;
-
-    use super::build_stdlib_docs;
-
-    const TEMPLATE: &str = include_str!("../templates/AGENTS.md.in");
-
-    /// The backtick-quoted function names on section 2's Tier A bullet —
-    /// the names the template claims are `Ipe.Basics` exports.
-    fn tier_a_function_claims() -> Vec<&'static str> {
-        let marker = "own exports";
-        let line = TEMPLATE
-            .lines()
-            .find(|l| l.contains(marker))
-            .expect("section 2 must still claim `Ipe.Basics`'s own exports");
-        let after_marker =
-            &line[line.find(marker).expect("marker was just matched") + marker.len()..];
-        let open = after_marker
-            .find('`')
-            .expect("the Tier A exports claim must be a code span");
-        let rest = &after_marker[open + 1..];
-        let close = rest
-            .find('`')
-            .expect("the Tier A exports code span must close");
-        rest[..close].split_whitespace().collect()
-    }
-
-    #[test]
-    fn every_tier_a_function_claim_is_a_live_basics_export() {
-        // `Ipe.Basics` is compiled-source stdlib (a real `.ipe` module), not a
-        // kernel qualifier, so its doc comes from `build_stdlib_docs`, not
-        // `build_kernel_module_docs` (which only covers kernel qualifiers).
-        let docs = build_stdlib_docs().expect("the live stdlib docs must build");
-        let basics: BTreeSet<&str> = docs
-            .iter()
-            .find(|m| m.name == "Ipe.Basics")
-            .expect("Ipe.Basics must be a documented module")
-            .values
-            .iter()
-            .map(|v| v.name.as_str())
-            .collect();
-        let claims = tier_a_function_claims();
-        assert!(
-            !claims.is_empty(),
-            "the Tier A exports claim must name at least one function"
-        );
-        for name in claims {
-            assert!(
-                basics.contains(name),
-                "AGENTS.md.in claims `{name}` is a Tier A (`Ipe.Basics`) export, \
-                 but the live module does not export it"
-            );
-        }
-    }
-
-    /// The `sh`-fenced command block under section 9 (`## 9. Commands`).
-    fn commands_block() -> &'static str {
-        let heading = "## 9. Commands";
-        let start = TEMPLATE
-            .find(heading)
-            .expect("section 9 (Commands) must exist");
-        let after = &TEMPLATE[start..];
-        let fence_open = after
-            .find("```sh")
-            .expect("section 9 must open a `sh` fence")
-            + "```sh".len();
-        let fence_rest = &after[fence_open..];
-        let fence_close = fence_rest
-            .find("```")
-            .expect("section 9's fence must close");
-        &fence_rest[..fence_close]
-    }
-
-    #[test]
-    #[allow(clippy::panic)] // an unrecognised command block line is the test failure
-    fn every_commands_block_line_is_a_real_ipe_invocation() {
-        for raw in commands_block().lines() {
-            let line = raw.split('#').next().unwrap_or("").trim();
-            if line.is_empty() {
-                continue;
-            }
-            let mut words = line.split_whitespace();
-            assert_eq!(
-                words.next(),
-                Some("ipe"),
-                "every command block line must start with `ipe`: {raw:?}"
-            );
-            let verb = words
-                .next()
-                .unwrap_or_else(|| panic!("a bare `ipe` line names no command: {raw:?}"));
-            if crate::help::is_command(verb) {
-                continue;
-            }
-            if crate::help::is_group(verb) {
-                let members = crate::help::group_members(verb).unwrap_or_default();
-                let sub = words.next().unwrap_or_else(|| {
-                    panic!("`ipe {verb}` names group `{verb}`, which needs a member verb: {raw:?}")
-                });
-                assert!(
-                    members.contains(&sub),
-                    "`ipe {verb} {sub}` is not a member of group `{verb}` ({members:?}): {raw:?}"
-                );
-                continue;
-            }
-            panic!("`ipe {verb}` is not a known top-level command or group: {raw:?}");
-        }
     }
 }
