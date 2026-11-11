@@ -405,6 +405,9 @@ fn scan_env_vars(text: &str, out: &mut Extracted) {
 /// The embedded docs a lookup reads.
 type Docs = Result<(ipe_docs::Index, DocBundle), String>;
 
+/// Whether a claim is of one variant.
+type ClaimTest = fn(&Claim) -> bool;
+
 /// The CLI's producers, each built on first use.
 struct Producers {
     /// Every command's help entry.
@@ -678,7 +681,7 @@ fn every_guide_claim_resolves() {
     );
 
     let claims = extract(ASSET).claims;
-    let kinds: [(&str, fn(&Claim) -> bool); 7] = [
+    let kinds: [(&str, ClaimTest); 7] = [
         ("command", |c| matches!(c, Claim::Command { .. })),
         ("doc term", |c| matches!(c, Claim::DocTerm(_))),
         ("code", |c| matches!(c, Claim::Code(_))),

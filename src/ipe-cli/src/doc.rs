@@ -903,7 +903,7 @@ fn bundle_build_error(error: BundleError) -> CliError {
 }
 
 /// The entry a lookup term opens: an index entry or a bundle entry.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum Hit<'a> {
     /// An exact key of the content index (a code, symbol, module, command, operator).
     Indexed(&'a ipe_docs::Entry),
@@ -1039,13 +1039,13 @@ fn run_doc_lookup_with_fuzzy(query: &DocQuery, format: OutputFormat) -> Result<(
     // lists the closest entries of every kind.
     let bundle = build_doc_bundle_over(&index, &DocsOverlay::Embedded)?;
     let lookup = LookupTerm::Bare(query.clone());
-    match resolve_term(&bundle, &index, &lookup) {
-        Ok(hit) => {
+    resolve_term(&bundle, &index, &lookup).map_or_else(
+        |_| Err(doc_miss(query, &bundle, format)),
+        |hit| {
             render_hit(hit, format);
             Ok(())
-        }
-        Err(_) => Err(doc_miss(query, &bundle, format)),
-    }
+        },
+    )
 }
 
 /// The error for a query that named no entry: [`CliError::DocNotFound`] with the entries of any
