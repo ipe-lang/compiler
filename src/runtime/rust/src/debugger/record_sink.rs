@@ -1045,8 +1045,9 @@ mod tests {
     }
 
     /// An `update` that ends the step the way `Debug.todo` does: by unwinding.
+    #[allow(clippy::panic)] // test: the unwind stands in for `Debug.todo` inside `update`
     fn diverging<M, D>(_: M, _: D) -> (D, IpeCmd<M>) {
-        std::panic::panic_any("update diverged")
+        panic!("update diverged")
     }
 
     /// Run `recording.step` with an `update` that unwinds, catching it.
