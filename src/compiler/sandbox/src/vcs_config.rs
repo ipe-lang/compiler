@@ -1077,11 +1077,17 @@ const COMMAND_OPERATORS: [char; 8] = [';', '&', '|', '(', ')', '<', '>', '\n'];
 ///
 /// What the tool appends only matters for a program fed an operand a grant
 /// may decide ([`Appends::Granted`], or [`Appends::Substitutes`] once the
-/// value holds a `%`). Such a line is admitted only when it has no program
-/// word at all, or when it is one simple command (no shell operator
-/// anywhere) whose program's last path component the contract names and
-/// whose every later word is an option or a path, judged already as one.
-fn operands_proven(line: &Line<'_>, appends: Appends, regime: Regime) -> Result<(), Unprovable> {
+/// value holds a `%`). Such a line is admitted only when it is one simple
+/// command (no shell operator anywhere) whose program's last path component
+/// the contract names and whose every later word is an option or a path,
+/// judged already as one; or when it has no program word and `syntax`'s tool
+/// runs it as nothing ([`blank_line_proven`]).
+fn operands_proven(
+    line: &Line<'_>,
+    appends: Appends,
+    syntax: Syntax,
+    regime: Regime,
+) -> Result<(), Unprovable> {
     let (text, readings) = match line {
         Line::Shell(text) => (text, shell_readings(text, regime)),
         // The prefix lands on the first word: an option there fails every contract.
@@ -1113,9 +1119,10 @@ fn operands_proven(line: &Line<'_>, appends: Appends, regime: Regime) -> Result<
         Appends::Nothing | Appends::Ungranted | Appends::Substitutes(_) => return Ok(()),
     };
     let proven = !text.contains(COMMAND_OPERATORS)
-        && readings
-            .iter()
-            .all(|words| simple_command_proven(words, contract, regime));
+        && readings.iter().all(|words| match words.split_first() {
+            None => blank_line_proven(text, syntax),
+            Some((program, rest)) => simple_command_proven(program, rest, contract, regime),
+        });
     if proven {
         Ok(())
     } else {
@@ -1123,17 +1130,33 @@ fn operands_proven(line: &Line<'_>, appends: Appends, regime: Regime) -> Result<
     }
 }
 
-/// Whether the simple command `words` keeps `contract`.
+/// Whether a command line `text` with no program word runs nothing under `syntax`'s tool.
 ///
-/// It does when it has no program word, or when the contract names its
-/// program and every later word is an option or a path. An option written
+/// A blank line is no program only to a tool that runs it as the empty
+/// program name: Git execs an empty line without a shell, which fails. Text
+/// of whitespace alone, or a comment, Git hands to `sh -c '<text> "$@"'`, and
+/// Mercurial and Darcs paste the operands they append after the value, so
+/// either makes the first appended operand the program.
+const fn blank_line_proven(text: &str, syntax: Syntax) -> bool {
+    match syntax {
+        Syntax::Git => text.is_empty(),
+        Syntax::Hg | Syntax::Toml | Syntax::Darcs | Syntax::GitRemote => false,
+    }
+}
+
+/// Whether the simple command `program` `rest` keeps `contract`.
+///
+/// It does when the contract names its program and every later word is an
+/// option or a path. An option written
 /// without an argument that the program may still take one for reads the
 /// next word, or the operand the tool appends, as that argument, so it is
 /// proven only when a path follows it or the contract knows it takes none.
-fn simple_command_proven(words: &[String], contract: Contract, regime: Regime) -> bool {
-    let Some((program, rest)) = words.split_first() else {
-        return true;
-    };
+fn simple_command_proven(
+    program: &str,
+    rest: &[String],
+    contract: Contract,
+    regime: Regime,
+) -> bool {
     let base = program
         .rsplit(|c| is_separator(c, regime))
         .next()
@@ -2412,6 +2435,7 @@ impl Scan<'_> {
                 operands_proven(
                     &Line::Exec(Cow::Borrowed(name)),
                     vcs_keys::HG_TOOL_APPENDS,
+                    ctx.syntax,
                     ctx.regime,
                 )
                 .map_err(|why| refuse(unproven(why)))?;
@@ -2711,7 +2735,7 @@ impl Scan<'_> {
                 self.judge_words(ctx, value, *runner)?;
                 if runner.runs(value) {
                     let line = runner.consume(value, ctx.regime);
-                    operands_proven(&line, *appends, ctx.regime).map_err(unproven)?;
+                    operands_proven(&line, *appends, ctx.syntax, ctx.regime).map_err(unproven)?;
                 }
                 Ok(())
             }
@@ -2719,8 +2743,13 @@ impl Scan<'_> {
             Role::Forced(path, appends) => {
                 self.judge_words(ctx, path, Runner::None)?;
                 self.judge_forced(ctx, path, Reach::Command)?;
-                operands_proven(&Line::Exec(Cow::Borrowed(path)), *appends, ctx.regime)
-                    .map_err(unproven)
+                operands_proven(
+                    &Line::Exec(Cow::Borrowed(path)),
+                    *appends,
+                    ctx.syntax,
+                    ctx.regime,
+                )
+                .map_err(unproven)
             }
             Role::Include(include) => {
                 // Queued as named, not as walked: the tool resolves the
@@ -2915,6 +2944,14 @@ impl Scan<'_> {
                 words
                     .push_staged(word, position, Stage::ArgumentQueued)
                     .map_err(unproven)?;
+                if let Some(stripped) = argument
+                    .strip_prefix('=')
+                    .filter(|stripped| !stripped.is_empty())
+                {
+                    words
+                        .push_forms(stripped.to_owned(), Position::Argument)
+                        .map_err(unproven)?;
+                }
                 words
                     .push_forms(argument, Position::Argument)
                     .map_err(unproven)?;
@@ -3459,7 +3496,9 @@ fn is_option_name(name: &str) -> bool {
 ///
 /// An option is `--name`, or `--name=` and an argument, with an
 /// [`is_option_name`] name; or `-`, one ASCII letter or digit, and an attached
-/// argument after an optional `=`. The text beside the argument is then only
+/// argument. A short option's argument keeps a leading `=`: `getopt` hands
+/// `-F=x` the argument `=x`, a relative path ([`Scan::judge_queue`] judges
+/// the form past the `=` too). The text beside the argument is then only
 /// those characters. Any other word starting with `-` (`--x;/tree/evil.sh`,
 /// `-;evil`, `--`, `-`) is not an option. Being an option only admits a word
 /// whose whole text no other rule refuses ([`Scan::judge_queue`]).
@@ -3471,16 +3510,18 @@ fn option_argument(word: &str) -> Option<&str> {
     let rest = word
         .strip_prefix('-')?
         .strip_prefix(|c: char| c.is_ascii_alphanumeric())?;
-    Some(rest.strip_prefix('=').unwrap_or(rest))
+    Some(rest)
 }
 
 /// Whether `word` is an option written without an argument, which a program may read the next word as.
 ///
 /// `-u -N` may hand `-N` to `-u` as a file name, and a trailing `-F` the
 /// operand the tool appends: the word after such an option is judged as the
-/// relative path it may name as well ([`Words::push_split`]).
+/// relative path it may name as well ([`Words::push_split`]). A long option
+/// ending in `=` counts too, as a parser reading `--name=` as `--name` takes
+/// the next word.
 fn takes_next(word: &str) -> bool {
-    option_argument(word) == Some("") && !word.contains('=')
+    option_argument(word) == Some("")
 }
 
 /// Whether `word` is shaped like a path: it holds a separator, starts with `~` or (under Windows) a drive, or is `.` or `..`.
@@ -7049,6 +7090,7 @@ mod tests {
                 operands_proven(
                     &Line::Shell(Cow::Borrowed(text)),
                     Appends::Granted(Contract::SshClient),
+                    Syntax::Git,
                     Regime::Unix
                 ),
                 Err(Unprovable::GrantedOperand),
@@ -7059,6 +7101,7 @@ mod tests {
             operands_proven(
                 &Line::Shell(Cow::Borrowed("ssh -C")),
                 Appends::Granted(Contract::SshClient),
+                Syntax::Git,
                 Regime::Unix
             ),
             Ok(())
@@ -7158,6 +7201,90 @@ mod tests {
         let f = fixture("hgssh");
         assert_granted_operand(hg_text(&f), &owned(&["[ui]\nssh = sh\n"]));
         assert_admitted(hg_text(&f), &owned(&["[ui]\nssh = ssh -C\n"]));
+    }
+
+    #[test]
+    fn blank_command_line_fed_an_operand_refused() {
+        let f = fixture("blankline");
+        // Git runs whitespace or a comment as `sh -c '<text> "$@"'`, and
+        // Mercurial pastes its operands after an empty value: either runs the
+        // first appended operand as the program.
+        assert_granted_operand(
+            git_text(&f),
+            &owned(&[
+                "[diff \"x\"]\n\ttextconv = \"  \"\n",
+                "[diff \"x\"]\n\ttextconv = \"\\t\"\n",
+                "[diff \"x\"]\n\ttextconv = \"#\"\n",
+                "[core]\n\tsshCommand = \" \"\n",
+                "[core]\n\taskPass = \" \"\n",
+                "[credential]\n\thelper = \"! \"\n",
+                "[submodule \"x\"]\n\tupdate = \"! \"\n",
+            ]),
+        );
+        assert_granted_operand(
+            hg_text(&f),
+            &owned(&["[ui]\nssh =\n", "[ui]\neditor =\n", "[gpg]\ncmd =\n"]),
+        );
+        for syntax in [Syntax::Hg, Syntax::Darcs, Syntax::Toml, Syntax::GitRemote] {
+            assert_eq!(
+                operands_proven(
+                    &Line::Shell(Cow::Borrowed("")),
+                    Appends::Granted(Contract::None),
+                    syntax,
+                    Regime::Unix
+                ),
+                Err(Unprovable::GrantedOperand),
+                "{syntax:?}"
+            );
+        }
+        // Git execs an empty line as the program `""`, which no exec finds.
+        assert_admitted(
+            git_text(&f),
+            &owned(&[
+                "[diff \"x\"]\n\ttextconv = \"\"\n",
+                "[credential]\n\thelper = \"\"\n",
+                "[submodule \"x\"]\n\tupdate = \"!\"\n",
+            ]),
+        );
+    }
+
+    #[test]
+    fn short_option_argument_read_with_its_equals_sign() {
+        let f = fixture("eqarg");
+        // `getopt` hands `-F=` the relative file `=`, and `-F=/x` the relative `=/x`.
+        for text in [
+            "[core]\n\tsshCommand = ssh -F=\n",
+            "[core]\n\tpager = less -k=\n",
+            "[core]\n\tsshCommand = ssh -F=x\n",
+        ] {
+            git_config(&f, text);
+            let result = scan_git(&f);
+            assert!(
+                matches!(
+                    &result,
+                    Err(ConfigRefusal::NamesWritableCode {
+                        named: Named::Unprovable(Unprovable::BareWord),
+                        ..
+                    })
+                ),
+                "{text:?}: {result:?}"
+            );
+        }
+        git_config(&f, "[core]\n\tsshCommand = ssh -F=/usr/x\n");
+        let result = scan_git(&f);
+        assert!(
+            in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+            "{result:?}"
+        );
+        assert_eq!(option_argument("-F=x"), Some("=x"));
+        assert!(takes_next("--lesskey-file="));
+        assert_admitted(
+            git_text(&f),
+            &owned(&[
+                "[core]\n\tsshCommand = ssh -F /usr/x\n",
+                "[core]\n\tsshCommand = ssh -i ~/k\n",
+            ]),
+        );
     }
 
     #[test]
