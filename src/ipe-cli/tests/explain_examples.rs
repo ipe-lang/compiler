@@ -7,7 +7,9 @@
 //! [`ipe::doc_bundle::SERVED_PAGE_DIRS`] — the exact table that drives what
 //! `ipe doc` serves, so a kind added to the bundle is scanned here the moment
 //! it is served ([`every_served_kind_is_scanned`] proves the two sets stay
-//! equal). Each block is judged through [`ipe::doc_fence::scan`]:
+//! equal), plus every page [`ipe::doc_bundle::EMBEDDED_ASSETS`] serves from a
+//! body another command also writes. Each block is judged through
+//! [`ipe::doc_fence::scan`]:
 //!
 //! - a check block (` ```ipe `) must be accepted;
 //! - an error block must be refused with its expected code: the page's own
@@ -398,6 +400,32 @@ doc_corpora! {
     guide_pages => "guide",
 }
 
+/// The ledger and report name of an embedded asset page: `asset/<kind>:<key>`.
+fn asset_page_name(kind: ipe::doc_bundle::DocKind, key: &str) -> String {
+    format!("asset/{}:{key}", kind.prefix())
+}
+
+/// Every page [`ipe::doc_bundle::EMBEDDED_ASSETS`] serves, named and with its body.
+fn asset_corpus() -> Vec<(String, &'static str)> {
+    ipe::doc_bundle::EMBEDDED_ASSETS
+        .iter()
+        .map(|&(kind, key, _, body)| (asset_page_name(kind, key), body))
+        .collect()
+}
+
+#[test]
+fn asset_pages() {
+    let scratch = scratch("asset");
+    let mismatches: Vec<Mismatch> = asset_corpus()
+        .into_iter()
+        .flat_map(|(name, body)| judge_page(&name, body, Page::Doc, &scratch))
+        .collect();
+    assert_clean(
+        "asset-page",
+        &reconcile("asset/", &mismatches, &ledger(KNOWN_ROT)),
+    );
+}
+
 #[test]
 #[allow(clippy::expect_used)] // an unreadable explain directory IS the failure
 fn every_registered_code_page_was_visited() {
@@ -424,9 +452,10 @@ fn every_registered_code_page_was_visited() {
     );
 }
 
-/// This file's `docs/<dir>` corpora must match exactly what `ipe doc` serves —
-/// the checker SSOT: a kind [`ipe::doc_bundle::OVERLAY_KINDS`] gains is scanned
-/// here the moment it is served, never discovered later as a silent gap.
+/// This file's corpora must match exactly what `ipe doc` serves — the checker
+/// SSOT: a kind [`ipe::doc_bundle::OVERLAY_KINDS`] gains, or a row
+/// [`ipe::doc_bundle::EMBEDDED_ASSETS`] gains, is scanned here the moment it is
+/// served, never discovered later as a silent gap.
 #[test]
 fn every_served_kind_is_scanned() {
     let served: BTreeSet<&str> = ipe::doc_bundle::SERVED_PAGE_DIRS.iter().copied().collect();
@@ -435,11 +464,26 @@ fn every_served_kind_is_scanned() {
         scanned, served,
         "this file's docs/<dir> corpora must match every directory ipe doc serves"
     );
+    let served_assets: BTreeSet<String> = ipe::doc_bundle::EMBEDDED_ASSETS
+        .iter()
+        .map(|&(kind, key, _, _)| asset_page_name(kind, key))
+        .collect();
+    let scanned_assets: Vec<String> = asset_corpus().into_iter().map(|(name, _)| name).collect();
+    assert_eq!(
+        scanned_assets.len(),
+        served_assets.len(),
+        "every embedded asset page has its own name"
+    );
+    assert_eq!(
+        scanned_assets.into_iter().collect::<BTreeSet<_>>(),
+        served_assets,
+        "this file's asset corpus must match every embedded asset ipe doc serves"
+    );
 }
 
 #[test]
 fn every_ledger_entry_names_a_scanned_corpus() {
-    let mut prefixes = vec!["explain/".to_owned()];
+    let mut prefixes = vec!["explain/".to_owned(), "asset/".to_owned()];
     prefixes.extend(SCANNED_DOC_DIRS.iter().map(|d| format!("docs/{d}/")));
     let stray: Vec<&str> = ledger(KNOWN_ROT)
         .into_iter()

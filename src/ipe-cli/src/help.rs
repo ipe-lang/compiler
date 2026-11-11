@@ -177,6 +177,25 @@ pub struct FlagSpec {
     pub desc: &'static str,
 }
 
+impl FlagSpec {
+    /// The dashed option names this flag's synopsis advertises.
+    pub fn names(&self) -> impl Iterator<Item = &'static str> + use<> {
+        flag_names(self.flag)
+    }
+}
+
+/// The dashed option names a flag synopsis advertises.
+///
+/// `[-q|--quiet]` gives `-q` and `--quiet`; `[--out <dir>]` gives `--out`. The
+/// brackets, the `<value>` placeholders, an `=<value>` tail and the bare `--`
+/// forwarding separator (which no parser treats as an option) are dropped.
+pub fn flag_names(synopsis: &str) -> impl Iterator<Item = &str> {
+    synopsis
+        .split(['|', ' ', '[', ']'])
+        .map(|token| token.split_once('=').map_or(token, |(name, _)| name))
+        .filter(|token| token.starts_with('-') && !matches!(*token, "-" | "--"))
+}
+
 /// A command's public metadata, projected from [`COMMANDS`] for the CLI
 /// coverage surface.
 #[derive(Clone, Debug)]
@@ -1260,19 +1279,10 @@ mod tests {
         );
     }
 
-    /// Split a help `Opt.flag` field (`[-q|--quiet]`, `[--out <dir>]`,
-    /// `[-- <args>...]`) into the dashed option tokens it advertises, dropping the
-    /// surrounding brackets, the `<value>` placeholders, and the bare `--`
-    /// forwarding separator (which no parser treats as an option).
+    /// The dashed option tokens a help `Opt.flag` field advertises, as
+    /// [`super::flag_names`] reads them.
     fn advertised_flag_tokens(field: &str) -> Vec<String> {
-        field
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .split(['|', ' '])
-            .map(str::trim)
-            .filter(|tok| tok.starts_with('-') && *tok != "--")
-            .map(str::to_owned)
-            .collect()
+        super::flag_names(field).map(str::to_owned).collect()
     }
 
     /// A flag advertised in help must be accepted by the command's parser: run
