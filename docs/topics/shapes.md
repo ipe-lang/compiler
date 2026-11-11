@@ -103,6 +103,15 @@ main =
 `Web.appRouted` and `Web.appWith` (a `List (Setting Web)` prefix) are the same
 shape with URL routing / settings.
 
+In a routed app (a non-empty `routes` list), the browser URL follows
+`model.page`. When `update` sets a new page, the runtime writes that page's
+route to the address bar. A click or other act of the user adds a history entry,
+so Back returns to the previous page. A page change from anything else replaces
+the current entry: loading the page, Back and Forward, or a subscription. The
+view never names its own path. The `ipe-*`, `nonce` and `data-ipe-*` attribute
+names belong to the runtime, and a view that spells one as a literal is refused
+(`ipe doc IPE-L0163`).
+
 ### Delivery: runtime × host
 
 Web is the only shape with a **delivery** choice — two axes ([full

@@ -518,11 +518,16 @@ fn control_bridge_channel() -> (
 #[cfg(all(feature = "control-wire", not(target_arch = "wasm32")))]
 fn spawn_control_bridge() -> tokio::sync::mpsc::UnboundedReceiver<ControlRequest> {
     let (handler, req_rx) = control_bridge_channel();
-    tokio::spawn(async move {
-        // A bind failure (no port/token, or a lost race for the loopback port) is
-        // not fatal: the child simply runs with no control surface.
-        let _ = crate::control::server::serve_control(handler).await;
-    });
+    // A bind failure (no port/token, or a lost race for the loopback port), or
+    // no runtime to serve on, is not fatal: the child simply runs with no
+    // control surface.
+    let _ = crate::threads::spawn_service(
+        "dev control bridge",
+        "the dev-loop control accept loop, whose handler only enqueues a frame",
+        async move {
+            let _ = crate::control::server::serve_control(handler).await;
+        },
+    );
     req_rx
 }
 
