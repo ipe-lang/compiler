@@ -222,6 +222,17 @@ main =
 }
 
 #[test]
+fn list_intersperse_task_refused() {
+    let src = program(
+        "main : Task Error ()
+main =
+    Task.map (\\_ -> ()) (Task.sequence (List.intersperse (Io.println \"x\") [ Io.println \"y\" ]))
+",
+    );
+    assert_l0164("list_intersperse_task", &src);
+}
+
+#[test]
 fn random_shuffle_task_refused() {
     let src = program(
         "import Ipe.Random as Random
@@ -296,6 +307,61 @@ main =
 #[test]
 fn cmd_publish_task_payload_refused() {
     assert_l0164("cmd_publish_task_payload", CMD_PUBLISH_TASK);
+}
+
+/// A Tui TEA app whose model holds a `Task`: the terminal loop clones the model each frame.
+const TUI_MODEL_TASK: &str = "module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.Tea.Terminal.Cmd
+import Ipe.Tea.Tui as Tui
+import Ipe.Tea.Tui.Sub
+import Ipe.Ui.Cells as Cells
+import Ipe.Ui.Cells exposing (Screen)
+
+
+type Msg
+    = NoOp
+
+
+type alias Model =
+    { pending : Task Error () }
+
+
+init : () -> ( Model, Cmd Msg )
+init _unit =
+    ( { pending = Io.println \"x\" }, Cmd.none )
+
+
+update : Msg -> Model -> ( Model, Cmd Msg )
+update msg model =
+    case msg of
+        NoOp ->
+            ( model, Cmd.none )
+
+
+view : Model -> Screen Msg
+view _model =
+    Cells.text \"ok\"
+
+
+subscriptions : Model -> Sub Msg
+subscriptions _model =
+    Sub.none
+
+
+main =
+    Tui.tea
+        { init = init
+        , update = update
+        , view = view
+        , subscriptions = subscriptions
+        }
+";
+
+#[test]
+fn tui_model_holding_task_refused() {
+    assert_l0164("tui_model_holding_task", TUI_MODEL_TASK);
 }
 
 #[test]
@@ -414,9 +480,227 @@ main =
     assert_accepted("mapper_rewrite", &src, "x\nx\nx");
 }
 
+/// One family of `Clone` carriers a program reaches through the shared prelude.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CloneFamily {
+    Int,
+    Float,
+    Bool,
+    Str,
+    Char,
+    Unit,
+    Order,
+    Maybe,
+    Result,
+    List,
+    Tuple,
+    Record,
+    Enum,
+    Dict,
+}
+
+impl CloneFamily {
+    /// Every family, each an entry of the `repeat_every_clone_carrier` fixture.
+    const ALL: [Self; 14] = [
+        Self::Int,
+        Self::Float,
+        Self::Bool,
+        Self::Str,
+        Self::Char,
+        Self::Unit,
+        Self::Order,
+        Self::Maybe,
+        Self::Result,
+        Self::List,
+        Self::Tuple,
+        Self::Record,
+        Self::Enum,
+        Self::Dict,
+    ];
+
+    /// The Ipê values the fixture repeats for this family.
+    const fn values(self) -> &'static [&'static str] {
+        match self {
+            Self::Int => &["1"],
+            Self::Float => &["1.5"],
+            Self::Bool => &["True"],
+            Self::Str => &["\"s\""],
+            Self::Char => &["'c'"],
+            Self::Unit => &["()"],
+            Self::Order => &["(compare 1 2)"],
+            Self::Maybe => &["(Just 1)"],
+            Self::Result => &["okOne"],
+            Self::List => &["[ 1 ]"],
+            Self::Tuple => &["( 1, \"t\" )"],
+            Self::Record => &["{ n = 1 }"],
+            Self::Enum => &["(Dark 1)", "Light"],
+            Self::Dict => &["(Dict.fromList [ ( \"k\", 1 ) ])"],
+        }
+    }
+
+    /// A lowered type of this family; `name` is the record field and the union name.
+    fn sample(self, name: ipe_intern::Symbol) -> ipe_ir::IrType {
+        use ipe_ir::IrType;
+        match self {
+            Self::Int => IrType::Int,
+            Self::Float => IrType::Float,
+            Self::Bool => IrType::Bool,
+            Self::Str => IrType::Str,
+            Self::Char => IrType::Char,
+            Self::Unit => IrType::Unit,
+            Self::Order => IrType::Order,
+            Self::Maybe => IrType::Maybe(Box::new(IrType::Int)),
+            Self::Result => IrType::Result(Box::new(IrType::Str), Box::new(IrType::Int)),
+            Self::List => IrType::List(Box::new(IrType::Int)),
+            Self::Tuple => IrType::Tuple(vec![IrType::Int, IrType::Str]),
+            Self::Record => IrType::Record(std::iter::once((name, IrType::Int)).collect()),
+            Self::Enum => IrType::Enum {
+                home: ipe_ir::ModPath(vec![name]),
+                name,
+                args: Vec::new(),
+            },
+            Self::Dict => IrType::Dict(Box::new(IrType::Str), Box::new(IrType::Int)),
+        }
+    }
+}
+
+/// The prelude family of a lowered type, `None` when it is not `Clone` or the
+/// fixture's imports cannot reach it.
+///
+/// Exhaustive over [`ipe_ir::IrType`]: a new variant does not compile here
+/// until it is placed in a family or named as out of reach.
+const fn clone_family(ty: &ipe_ir::IrType) -> Option<CloneFamily> {
+    use ipe_ir::IrType;
+    match ty {
+        IrType::Int => Some(CloneFamily::Int),
+        IrType::Float => Some(CloneFamily::Float),
+        IrType::Bool => Some(CloneFamily::Bool),
+        IrType::Str => Some(CloneFamily::Str),
+        IrType::Char => Some(CloneFamily::Char),
+        IrType::Unit => Some(CloneFamily::Unit),
+        IrType::Order => Some(CloneFamily::Order),
+        IrType::Maybe(_) => Some(CloneFamily::Maybe),
+        IrType::Result(_, _) => Some(CloneFamily::Result),
+        IrType::List(_) => Some(CloneFamily::List),
+        IrType::Tuple(_) => Some(CloneFamily::Tuple),
+        IrType::Record(_) => Some(CloneFamily::Record),
+        IrType::Enum { .. } => Some(CloneFamily::Enum),
+        IrType::Dict(_, _) => Some(CloneFamily::Dict),
+        // Not `Clone` on the default carrier: the IPE-L0164 cases above.
+        IrType::Task(_)
+        | IrType::Cmd(_)
+        | IrType::Sub(_)
+        | IrType::Fun(_, _)
+        | IrType::FnOnceChain(_, _)
+        | IrType::WebApp
+        | IrType::TuiApp
+        | IrType::CliApp
+        | IrType::WorkerApp
+        // A generic belongs to the referencing function: forwarded, never an instance.
+        | IrType::Generic(_)
+        | IrType::RowGeneric(_)
+        // A promoted function carrier is a lowering choice, not a written value.
+        | IrType::SharedFun(_, _)
+        // Reached only through a module or an application shape the prelude
+        // does not import.
+        | IrType::Set(_)
+        | IrType::Bytes
+        | IrType::Json
+        | IrType::Decoder(_)
+        | IrType::Db
+        | IrType::ServerRequest
+        | IrType::ServerResponse
+        | IrType::ServerRoute
+        | IrType::ServerCookie
+        | IrType::StreamWriter
+        | IrType::HttpRequest
+        | IrType::WebSocketServer
+        | IrType::WebSocketServerCfg
+        | IrType::Ui { .. }
+        | IrType::UiPlain(_)
+        | IrType::WebReq
+        | IrType::SessionHandle
+        | IrType::WebRoute(_)
+        | IrType::CustomElement { .. }
+        | IrType::BackoffStrategy
+        | IrType::HttpMethod
+        | IrType::Decimal
+        | IrType::Principal
+        | IrType::AuthConfig
+        | IrType::TokenSource
+        | IrType::ErrorKind
+        | IrType::Error
+        | IrType::ErrorDetails
+        | IrType::ErrorInfo
+        | IrType::PanicInfo
+        | IrType::TypeInfo
+        | IrType::SqlFragment
+        | IrType::Secret
+        | IrType::Path
+        | IrType::Regex
+        | IrType::ProcessRunWithCfg
+        | IrType::ProcessRunInPtyCfg
+        | IrType::CacheCfg
+        | IrType::CacheStats
+        | IrType::WebSocketClientCfg
+        | IrType::CsvDoc
+        | IrType::EmailMessage
+        | IrType::EmailAttachment
+        | IrType::EmailSesConfig
+        | IrType::EmailSmtpConfig
+        | IrType::EmailProvider
+        | IrType::CryptoKey
+        | IrType::CryptoMac
+        | IrType::EmailAddress
+        | IrType::Url
+        | IrType::UrlRelative
+        | IrType::Dsn
+        | IrType::DbLocation
+        | IrType::Connection
+        | IrType::ConnReadOnly
+        | IrType::ConnReadWrite
+        | IrType::Setting
+        | IrType::ShapeWeb
+        | IrType::ShapeWebView
+        | IrType::ShapeTerminal
+        | IrType::Locale => None,
+    }
+}
+
+/// Every prelude family is a `Clone` carrier and names itself back.
 #[test]
-fn repeat_every_clone_carrier_builds() {
-    let src = program(
+fn every_clone_family_is_a_clone_carrier() {
+    let mut interner = ipe_intern::Interner::new();
+    let name = interner.intern("n");
+    assert!(name.is_ok(), "interning a one-letter name");
+    if let Ok(name) = name {
+        let payloads = ipe_ir::EnumPayloadTable::new();
+        for family in CloneFamily::ALL {
+            let sample = family.sample(name);
+            assert_eq!(
+                clone_family(&sample),
+                Some(family),
+                "{family:?} round-trips"
+            );
+            assert!(
+                ipe_ir::carrier_is_clone(&sample, &payloads),
+                "{family:?} is a Clone carrier"
+            );
+        }
+    }
+}
+
+/// The `repeat_every_clone_carrier` source, one `List.repeat 2` per family value, and its total length.
+fn every_clone_carrier_program() -> (String, usize) {
+    let values: Vec<&str> = CloneFamily::ALL
+        .into_iter()
+        .flat_map(|family| family.values().iter().copied())
+        .collect();
+    let entries: Vec<String> = values
+        .iter()
+        .map(|value| format!("List.length (List.repeat 2 {value})"))
+        .collect();
+    let body = format!(
         "okOne : Result String Int
 okOne =
     Ok 1
@@ -431,24 +715,27 @@ main : Task Error ()
 main =
     let
         lengths =
-            [ List.length (List.repeat 2 1)
-            , List.length (List.repeat 2 1.5)
-            , List.length (List.repeat 2 True)
-            , List.length (List.repeat 2 \"s\")
-            , List.length (List.repeat 2 'c')
-            , List.length (List.repeat 2 ())
-            , List.length (List.repeat 2 (Just 1))
-            , List.length (List.repeat 2 okOne)
-            , List.length (List.repeat 2 [ 1 ])
-            , List.length (List.repeat 2 ( 1, \"t\" ))
-            , List.length (List.repeat 2 { n = 1 })
-            , List.length (List.repeat 2 (Dark 1))
-            , List.length (List.repeat 2 Light)
-            , List.length (List.repeat 2 (Dict.fromList [ ( \"k\", 1 ) ]))
+            [ {}
             ]
     in
     Io.println (String.fromInt (List.sum lengths))
 ",
+        entries.join("\n            , ")
     );
-    assert_accepted("repeat_every_clone_carrier", &src, "28");
+    (program(&body), values.len() * 2)
+}
+
+/// Every prelude family repeats, builds and runs: no over-refusal of a `Clone` carrier.
+#[test]
+fn repeat_every_clone_carrier_builds() {
+    let (src, total) = every_clone_carrier_program();
+    for family in CloneFamily::ALL {
+        for value in family.values() {
+            assert!(
+                src.contains(&format!("List.repeat 2 {value})")),
+                "{family:?} has a fixture entry"
+            );
+        }
+    }
+    assert_accepted("repeat_every_clone_carrier", &src, &total.to_string());
 }
