@@ -48,6 +48,15 @@
 -- The compiler treats a `foreign` declaration as inert — it takes no part in
 -- name resolution, type-checking, or lowering — so it is documented in prose
 -- here rather than as a value member of this module.
+--
+-- A closure handle carries an Ipê function into Rust. Its declared return is the
+-- only channel a failure inside the Ipê function can take back to the Rust
+-- caller. With a `Result` return, a runtime limit (recursion depth, an output
+-- ceiling) arrives as an `Err` the caller can recover from. With an `Option` or
+-- a bare scalar return there is no channel for it, so the limit ends the program
+-- with its typed error (exit status 1). A panic inside the Rust code itself
+-- still yields `None` from an `Option` closure. Declare `Result` wherever the
+-- caller must survive a limit, such as one failing request in a server.
 module Ipe.Ffi.Rust exposing (fn, const)
 
 
