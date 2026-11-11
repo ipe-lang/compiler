@@ -106,8 +106,11 @@ const FUNNEL_FILES: &[&str] = &["threads.rs"];
 /// holds nothing but such namings (see [`names_paths_only`]).
 const PATH_NAMING_FILE: &str = "clippy_paths_resolve.rs";
 
-/// Whether `src` holds only `const _X: () = { let _ = <path>; .. };` items:
-/// each names a path and evaluates nothing, so no task can start in it.
+/// Whether `src` holds only `const _X: () = ..;` items. A const initializer
+/// runs at compile time, where starting a task does not compile, and a unit
+/// value hands no callable to the code that names it, so nothing in such a
+/// file can start a task at run time; a `fn`, `impl`, `static` or a typed
+/// const could.
 fn names_paths_only(src: &str) -> bool {
     let Ok(file) = syn::parse_file(src) else {
         return false;
@@ -117,23 +120,7 @@ fn names_paths_only(src: &str) -> bool {
             return false;
         };
         let unit = matches!(&*konst.ty, syn::Type::Tuple(t) if t.elems.is_empty());
-        let Expr::Block(body) = &*konst.expr else {
-            return false;
-        };
         unit && konst.ident.to_string().starts_with('_')
-            && body.block.stmts.iter().all(|stmt| {
-                let Stmt::Local(local) = stmt else {
-                    return false;
-                };
-                let wild = match &local.pat {
-                    Pat::Wild(_) => true,
-                    Pat::Type(typed) => matches!(&*typed.pat, Pat::Wild(_)),
-                    _ => false,
-                };
-                wild && local.init.as_ref().is_some_and(|init| {
-                    init.diverge.is_none() && matches!(&*init.expr, Expr::Path(_))
-                })
-            })
     })
 }
 
@@ -1030,8 +1017,8 @@ fn task_violations(sources: &[(String, String)], ledger: &[TaskSite]) -> Vec<Str
                 continue;
             }
             out.push(format!(
-                "{file}: holds an item other than a `const _X: () = {{ let _ = <path>; }}` \
-                 naming, so it may start a task the scan exempts: keep it to namings"
+                "{file}: holds an item other than a `const _X: () = ..;` naming, so it may \
+                 start a task the scan exempts: keep it to namings"
             ));
         }
         let allows = disallowed_type_allows(file, src);
@@ -1690,6 +1677,9 @@ fn a_block_on_carry_out_of_order_or_off_its_future_is_refused() {
 #[test]
 fn the_path_naming_file_is_exempt_only_while_it_only_names_paths() {
     let naming = "#[cfg(x)]
+const _UUID: () = {
+    let _ = |context: ::uuid::NoContext| ::uuid::Timestamp::now(context);
+};
 const _TOKIO: () = {
     #[expect(clippy::disallowed_methods)]
     let _ = ::tokio::task::spawn_local::<R>;
@@ -1699,10 +1689,10 @@ const _TOKIO: () = {
     let found = task_violations(&sources(&[(PATH_NAMING_FILE, naming)]), &[]);
     assert!(found.is_empty(), "{found:#?}");
     for smuggled in [
-        "const _T: () = { let _ = ::tokio::spawn(async {}); };",
         "const _T: () = { let _ = ::tokio::spawn; };\nfn start() { tokio::spawn(async {}); }",
+        "const _T: fn() = || { tokio::spawn(async {}); };",
+        "static _T: () = ();\nimpl S { fn start() { tokio::spawn(async {}); } }",
         "const T: () = { let _ = ::tokio::spawn; };",
-        "const _T: () = { let x = ::tokio::spawn; };",
     ] {
         assert!(!names_paths_only(smuggled), "{smuggled}");
         let found = task_violations(&sources(&[(PATH_NAMING_FILE, smuggled)]), &[]);
