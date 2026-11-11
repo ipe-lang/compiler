@@ -986,14 +986,20 @@ fn infer_core(
     // `n + 1` defaults `n` to `Int`). The checks therefore run after every
     // default, so the verdict never depends on the order the obligations were
     // generated in.
-    let mut pinned: Vec<(VarId, TyBounds, Span, &ModuleHome)> = Vec::new();
+    let mut pinned: Vec<(VarId, TyBounds, RefusalSite<'_>)> = Vec::new();
     for SuperVar {
         var: v,
         bounds: orig_bounds,
         span,
         home,
+        origin,
     } in &generated.super_vars
     {
+        let site = RefusalSite {
+            span: *span,
+            home,
+            origin: origin.as_ref(),
+        };
         let root = lift!(uf.find(*v));
         match lift!(uf.content(root)) {
             // An unpinned `Number` flex defaults to `Int` — an untyped
@@ -1016,7 +1022,7 @@ fn infer_core(
                             interner,
                             bounds,
                             &int_ty,
-                            *span,
+                            site,
                             &mut VarNamer::new(),
                             |b| concrete_super_ok(interner, b, &int_ty, &enum_embeds),
                         ),
@@ -1050,7 +1056,7 @@ fn infer_core(
                             interner,
                             bounds,
                             &sqlvalue_ty,
-                            *span,
+                            site,
                             &mut VarNamer::new(),
                             |b| concrete_super_ok(interner, b, &sqlvalue_ty, &enum_embeds),
                         ),
@@ -1084,7 +1090,7 @@ fn infer_core(
                             interner,
                             bounds,
                             &string_ty,
-                            *span,
+                            site,
                             &mut VarNamer::new(),
                             |b| concrete_super_ok(interner, b, &string_ty, &enum_embeds),
                         ),
@@ -1108,7 +1114,7 @@ fn infer_core(
             Content::Super { .. } | Content::Flex | Content::Rigid(_) => {}
             // The variable pinned to a concrete type during solving: checked
             // below, once every default has been applied.
-            Content::Structure(_) => pinned.push((root, *orig_bounds, *span, home)),
+            Content::Structure(_) => pinned.push((root, *orig_bounds, site)),
         }
     }
     // Verify — deeply, against the fully-resolved type — that each pinned type
@@ -1119,15 +1125,15 @@ fn infer_core(
     // The type judged is the one emitted (`zonk_emitted`): a record the deferred
     // pass left over a residual row is its known fields, whichever operand
     // settled it first.
-    for (root, orig_bounds, span, home) in pinned {
+    for (root, orig_bounds, site) in pinned {
         let ty = lift!(zonk_emitted(&mut uf, budget, root));
         if !concrete_super_ok(interner, orig_bounds, &ty, &enum_embeds) {
             let mut namer = lift!(unify::labelled_namer(&uf, interner, &[&ty]));
             return Err(InferError::sited(
-                super_unsatisfied(interner, orig_bounds, &ty, span, &mut namer, |b| {
+                super_unsatisfied(interner, orig_bounds, &ty, site, &mut namer, |b| {
                     concrete_super_ok(interner, b, &ty, &enum_embeds)
                 }),
-                home,
+                site.home,
             ));
         }
     }
@@ -2176,17 +2182,22 @@ fn check_scheme_applications(
             };
             let ty = zonk_emitted(uf, budget, *fresh).map_err(InferError::unsited)?;
             if !emitted_bound_satisfied(interner, *b, &ty, enum_embeds) {
+                let site = RefusalSite {
+                    span: app.span,
+                    home: &app.use_home,
+                    origin: None,
+                };
                 return Err(InferError::sited(
                     refusal_of_duty(
                         interner,
                         *b,
                         emitted_unmet(interner, *b, &ty, enum_embeds),
                         &ty,
-                        app.span,
+                        site,
                         &mut unify::labelled_namer(uf, interner, &[&ty])
                             .map_err(InferError::unsited)?,
                     ),
-                    &app.use_home,
+                    site.home,
                 ));
             }
         }
@@ -2836,11 +2847,11 @@ pub(crate) fn super_unsatisfied(
     interner: &Interner,
     bounds: TyBounds,
     ty: &Ty,
-    span: Span,
+    site: RefusalSite<'_>,
     namer: &mut VarNamer,
     ok: impl Fn(TyBounds) -> bool,
 ) -> Diagnostic {
-    refusal_of_duty(interner, bounds, first_unmet(bounds, ok), ty, span, namer)
+    refusal_of_duty(interner, bounds, first_unmet(bounds, ok), ty, site, namer)
 }
 
 /// The duty `ty` fails among `bounds` at a generic emission. An ordering a
@@ -2875,7 +2886,7 @@ fn refusal_of_duty(
     bounds: TyBounds,
     unmet: Option<Owed>,
     ty: &Ty,
-    span: Span,
+    site: RefusalSite<'_>,
     namer: &mut VarNamer,
 ) -> Diagnostic {
     let Some(owed) = unmet else {
@@ -2884,19 +2895,20 @@ fn refusal_of_duty(
             detail: format!("refused {ty:?} meets every obligation in {bounds:?}"),
         };
     };
-    super_unsatisfied_named(interner, owed, ty, span, namer)
+    duty_refusal(interner, owed, ty, site, namer)
 }
 
-/// The IPE-T0014 refusal of `ty` for the unmet duty `owed`, rendering `ty`'s
-/// variables through `namer`.
-pub(crate) fn super_unsatisfied_named(
-    interner: &Interner,
-    owed: Owed,
-    ty: &Ty,
-    span: Span,
-    namer: &mut VarNamer,
-) -> Diagnostic {
-    refusal_naming(interner, owed, None, ty, span, namer)
+/// Where a refusal of a duty is sited: `span` in `home`'s file, and the kernel
+/// reference that imposed the refused obligation, when one did.
+///
+/// A linked program's spans are offsets every module shares, so the origin is
+/// stated only when it frames against the same `home`: an origin minted in
+/// another module would point into the wrong file.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RefusalSite<'a> {
+    pub(crate) span: Span,
+    pub(crate) home: &'a ModuleHome,
+    pub(crate) origin: Option<&'a DutyOrigin>,
 }
 
 /// The IPE-T0014 refusal of `ty` for the unmet duty `owed` of a variable a
@@ -2911,13 +2923,14 @@ pub(crate) fn super_unsatisfied_named(
 pub(crate) fn duty_refusal(
     interner: &Interner,
     owed: Owed,
-    origin: Option<DutyOrigin>,
     ty: &Ty,
-    span: Span,
+    site: RefusalSite<'_>,
     namer: &mut VarNamer,
 ) -> Diagnostic {
-    let origin = origin.filter(|o| imposes(o.owes(), owed));
-    let blamed = origin.and_then(DutyOrigin::blame).unwrap_or(span);
+    let origin = site
+        .origin
+        .filter(|o| o.framed_in(site.home) && imposes(o.owes(), owed));
+    let blamed = origin.and_then(DutyOrigin::blame).unwrap_or(site.span);
     let stated = origin.and_then(stated_origin);
     refusal_naming(interner, owed, stated, ty, blamed, namer)
 }
@@ -2933,7 +2946,7 @@ fn imposes(obligation: TyBounds, duty: Owed) -> bool {
 /// (`Dict.map`) and its reference. An internal kernel (a qualifier starting
 /// `_`, such as the `{{…}}` desugaring) has no name the user wrote, so it
 /// states none.
-fn stated_origin(origin: DutyOrigin) -> Option<ipe_diagnostics::DutyOrigin> {
+fn stated_origin(origin: &DutyOrigin) -> Option<ipe_diagnostics::DutyOrigin> {
     let decl = origin.kernel().decl();
     if decl.qualifier.is_empty() || decl.qualifier.starts_with('_') {
         return None;
@@ -8951,6 +8964,13 @@ mod tests {
         };
         let show = TyBounds::show();
         let embeds = EnumEmbeds::default();
+        let main = i.intern("Main").expect("intern Main");
+        let home = ModuleHome::new(vec![main]).expect("non-empty home");
+        let site = RefusalSite {
+            span: Span::DUMMY,
+            home: &home,
+            origin: None,
+        };
         for ty in [handle, fn_list] {
             for site in BOTH_SITES {
                 assert!(
@@ -8958,16 +8978,9 @@ mod tests {
                     "a Stringify obligation on {ty:?} must be refused at {site:?}"
                 );
             }
-            let refusal =
-                super_unsatisfied(&i, show, &ty, Span::DUMMY, &mut VarNamer::new(), |b| {
-                    super_bounds_satisfied(
-                        &i,
-                        b,
-                        &ty,
-                        super_bounds::BoundSite::ConcretePin,
-                        &embeds,
-                    )
-                });
+            let refusal = super_unsatisfied(&i, show, &ty, site, &mut VarNamer::new(), |b| {
+                super_bounds_satisfied(&i, b, &ty, super_bounds::BoundSite::ConcretePin, &embeds)
+            });
             assert_eq!(refusal.code().as_str(), "IPE-T0014");
             assert!(
                 matches!(
@@ -9941,6 +9954,87 @@ h x =
         );
     }
 
+    /// A duty the deferred deep check refuses (a function nested in a tuple
+    /// handed to `Debug.log`, whose head the unifier admits) states the kernel
+    /// that imposed it, exactly as a refusal at unification does.
+    #[test]
+    #[allow(clippy::panic)] // a refusal of any other shape fails with its result
+    fn a_deferred_duty_refusal_names_its_kernel() {
+        let src = "module Main exposing (main)\n\nimport Ipe.Debug as Debug\n\n\
+                   main =\n    Debug.log \"f\" ( 1, \\n -> n + 1 )\n";
+        let Some(Err(d)) = infer_over_duty_stdlib(src) else {
+            panic!("the nested function must be refused");
+        };
+        let Diagnostic::Type {
+            msg: TypeError::SuperTypeUnsatisfied { owed, origin, .. },
+            ..
+        } = &d
+        else {
+            panic!("the refusal must be IPE-T0014: {d:?}");
+        };
+        assert_eq!(*owed, Owed::Stringify);
+        let Some(origin) = origin else {
+            panic!("the deferred refusal must state its kernel: {d:?}");
+        };
+        assert_eq!(&*origin.kernel_label, "Debug.log");
+        assert_eq!(spanned(src, origin.at), Some("Debug.log"));
+        let rendered = ipe_diagnostics::render(&d, "Main.ipe", src);
+        assert!(rendered.contains("`Debug.log` needs it"), "{rendered}");
+    }
+
+    /// A duty a kernel reference in `Dep` imposed, refused where `Main` uses
+    /// `Dep`'s untyped helper, frames every span against `Main`'s file: the
+    /// refusal is sited in `Main`, so it neither blames nor labels a `Dep`
+    /// offset (a kernel origin from another module states no kernel).
+    #[test]
+    #[allow(clippy::panic)] // a refusal of any other shape fails with its result
+    fn a_duty_imposed_in_another_module_frames_against_the_refusing_module() {
+        let dep = "module Dep exposing (shout)\n\nimport Ipe.Debug as Debug\n\n\
+                   shout =\n    Debug.log \"shouted\"\n";
+        let main = "module Main exposing (go)\n\nimport Dep\n\n\
+                    go : Int -> Int\n\
+                    go =\n    Dep.shout (\\n -> n)\n";
+        let mut modules = DUTY_STDLIB.to_vec();
+        modules.push(("Dep", dep));
+        modules.push(("Main", main));
+        let mut i = Interner::new();
+        let Some(canon) = canon_with_stdlib_origin(&modules, &mut i) else {
+            panic!("the fixture must canonicalise");
+        };
+        let Some(entry) = canon.last().map(|(path, _, _)| path.clone()) else {
+            panic!("the fixture has an entry module");
+        };
+        let Ok(linked) =
+            ipe_canon::link::link(entry, canon.into_iter().map(|(_, cm, _)| cm).collect(), &i)
+        else {
+            panic!("the fixture must link");
+        };
+        let Err(err) = infer_attributed(&linked, &mut i) else {
+            panic!("the function handed to `Debug.log` must be refused");
+        };
+        let home: Option<Vec<&str>> = err.home().map(|home| {
+            home.path()
+                .iter()
+                .filter_map(|seg| i.resolve(*seg))
+                .collect()
+        });
+        assert_eq!(home, Some(vec!["Main"]), "{err:?}");
+        let Diagnostic::Type {
+            span,
+            msg: TypeError::SuperTypeUnsatisfied { owed, origin, .. },
+        } = err.into_diagnostic()
+        else {
+            panic!("the refusal must be IPE-T0014");
+        };
+        assert_eq!(owed, Owed::Stringify);
+        assert_eq!(origin, None, "a `Dep` reference cannot frame in `Main`");
+        let blamed = spanned(main, span).unwrap_or("");
+        assert!(
+            blamed.contains("Dep.shout") || blamed.contains("\\n -> n"),
+            "the refusal must blame a `Main` expression, not `{blamed}`"
+        );
+    }
+
     /// A record bound as a SQL parameter is refused as the SQL-parameter duty,
     /// never as a class a record satisfies.
     #[test]
@@ -9980,12 +10074,16 @@ h x =
     fn a_refusal_with_no_unmet_duty_is_a_compiler_bug() {
         let mut i = Interner::new();
         let ty = con_ty(&mut i, &[], "Int");
+        let main = i.intern("Main").expect("intern Main");
+        let home = ModuleHome::new(vec![main]).expect("non-empty home");
+        let site = RefusalSite {
+            span: Span::DUMMY,
+            home: &home,
+            origin: None,
+        };
         for bounds in TyBounds::ALL_BITS {
             assert_eq!(first_unmet(*bounds, |_| true), None);
-            let refusal =
-                super_unsatisfied(&i, *bounds, &ty, Span::DUMMY, &mut VarNamer::new(), |_| {
-                    true
-                });
+            let refusal = super_unsatisfied(&i, *bounds, &ty, site, &mut VarNamer::new(), |_| true);
             assert!(
                 matches!(refusal, Diagnostic::CompilerBug { .. }),
                 "{bounds:?} met in full must be a compiler bug, got {refusal:?}"

@@ -158,6 +158,7 @@ fn unify(
     uf: &mut UnionFind<Content>,
     budget: &mut Budget,
     interner: &Interner,
+    home: &ModuleHome,
     span: Span,
     a: VarId,
     b: VarId,
@@ -170,7 +171,7 @@ fn unify(
     // performs, so the ordering is load-bearing, not cosmetic.
     let mut stack: Vec<(VarId, VarId)> = vec![(a, b)];
     while let Some((a, b)) = stack.pop() {
-        unify_step(uf, budget, interner, span, a, b, &mut stack)?;
+        unify_step(uf, budget, interner, home, span, a, b, &mut stack)?;
     }
     Ok(())
 }
@@ -193,7 +194,7 @@ pub fn unify_at(
     a: VarId,
     b: VarId,
 ) -> Result<(), InferError> {
-    unify(uf, budget, interner, span, a, b).map_err(|diag| InferError::sited(diag, home))
+    unify(uf, budget, interner, home, span, a, b).map_err(|diag| InferError::sited(diag, home))
 }
 
 /// Solve one constraint, siting any failure in the constraint's module.
@@ -211,7 +212,7 @@ pub fn unify_constraint(
     interner: &Interner,
     c: &Constraint,
 ) -> Result<(), InferError> {
-    match unify(uf, budget, interner, c.span, c.lhs, c.rhs) {
+    match unify(uf, budget, interner, &c.home, c.span, c.lhs, c.rhs) {
         Ok(()) => Ok(()),
         Err(diag) => {
             let diag = if matches!(
@@ -408,6 +409,7 @@ fn unify_step(
     uf: &mut UnionFind<Content>,
     budget: &mut Budget,
     interner: &Interner,
+    home: &ModuleHome,
     span: Span,
     a: VarId,
     b: VarId,
@@ -432,10 +434,13 @@ fn unify_step(
         let peek_b = uf.root_content(rb)?;
         if !matches!(peek_b, Content::Structure(_)) {
             // Both descriptors are the trivial `Flex`/`Rigid`/`Super` shapes
-            // (`Copy` skolem names + bounds); cloning them copies no heap data.
+            // (`Copy` skolem names + bounds, a refcounted duty origin); cloning
+            // them copies no heap data.
             let owned_a = peek_a.clone();
             let owned_b = peek_b.clone();
-            return unify_nonstructure(uf, budget, interner, span, ra, rb, &owned_a, &owned_b);
+            return unify_nonstructure(
+                uf, budget, interner, home, span, ra, rb, &owned_a, &owned_b,
+            );
         }
     }
 
@@ -510,9 +515,12 @@ fn unify_step(
                         let structure_var = if a_is_structure { ra } else { rb };
                         let ty = zonk_reported(uf, budget, structure_var, span)?;
                         let mut namer = labelled_namer(uf, interner, &[&ty])?;
-                        Err(crate::duty_refusal(
-                            interner, duty, origin, &ty, span, &mut namer,
-                        ))
+                        let site = crate::RefusalSite {
+                            span,
+                            home,
+                            origin: origin.as_ref(),
+                        };
+                        Err(crate::duty_refusal(interner, duty, &ty, site, &mut namer))
                     }
                     None => Err(mismatch_owing(uf, budget, interner, span, ra, rb, None)),
                 }
@@ -532,7 +540,7 @@ fn unify_step(
         // a `Flex`/`Rigid`/`Super` already handled by an arm above. Delegating the
         // trivial descriptors keeps the match total without duplicating the
         // non-structure logic.
-        (a, b) => unify_nonstructure(uf, budget, interner, span, ra, rb, &a, &b),
+        (a, b) => unify_nonstructure(uf, budget, interner, home, span, ra, rb, &a, &b),
     }
 }
 
@@ -546,6 +554,7 @@ fn unify_nonstructure(
     uf: &mut UnionFind<Content>,
     budget: &mut Budget,
     interner: &Interner,
+    home: &ModuleHome,
     span: Span,
     ra: VarId,
     rb: VarId,
@@ -583,7 +592,7 @@ fn unify_nonstructure(
             Content::Super {
                 rigid: *rigid,
                 bounds: *bounds,
-                origin: origin.map(|o| o.met_at(span)),
+                origin: origin.as_ref().map(|o| o.met_at(span, home)),
             },
         ),
         // Two super-typed variables meet.
@@ -642,7 +651,7 @@ fn unify_nonstructure(
                     Content::Super {
                         rigid: r1.or(*r2),
                         bounds: b1.union(*b2),
-                        origin: merged_origin(*o1, *o2, span),
+                        origin: merged_origin(o1.as_ref(), o2.as_ref(), span, home),
                     },
                 )
             } else {
@@ -673,7 +682,7 @@ fn unify_nonstructure(
             Content::Super {
                 rigid: Some(*name),
                 bounds: *bounds,
-                origin: origin.map(|o| o.met_at(span)),
+                origin: origin.as_ref().map(|o| o.met_at(span, home)),
             },
         ),
         // Mismatch for everything left: two distinct rigid skolems (a same-class
@@ -1342,6 +1351,25 @@ mod tests {
     use crate::ty::{SkolemName, TyBounds};
     use crate::unionfind::UnionFind;
 
+    /// The module every unification in these tests is sited in.
+    fn test_home() -> ModuleHome {
+        let mut interner = Interner::new();
+        let main = interner.intern("Main").expect("intern");
+        ModuleHome::new(vec![main]).expect("non-empty home")
+    }
+
+    /// [`super::unify`] sited in [`test_home`].
+    fn unify(
+        uf: &mut UnionFind<Content>,
+        budget: &mut Budget,
+        interner: &Interner,
+        span: Span,
+        a: VarId,
+        b: VarId,
+    ) -> ipe_diagnostics::DResult<()> {
+        super::unify(uf, budget, interner, &test_home(), span, a, b)
+    }
+
     fn super_var(
         uf: &mut UnionFind<Content>,
         rigid: Option<SkolemName>,
@@ -1422,7 +1450,8 @@ mod tests {
         );
     }
 
-    /// A flexible super-typed variable owing `bounds`, imposed by `kernel` at `at`.
+    /// A flexible super-typed variable owing `bounds`, imposed by `kernel` at
+    /// `at` in [`test_home`].
     fn kernel_duty(
         uf: &mut UnionFind<Content>,
         kernel: ipe_kernels::StdlibKernel,
@@ -1432,7 +1461,12 @@ mod tests {
         uf.fresh(Content::Super {
             rigid: None,
             bounds,
-            origin: Some(crate::ty::DutyOrigin::new(kernel, bounds, at)),
+            origin: Some(crate::ty::DutyOrigin::new(
+                kernel,
+                bounds,
+                std::sync::Arc::new(test_home()),
+                at,
+            )),
         })
         .expect("fresh var")
     }
@@ -1515,7 +1549,7 @@ mod tests {
         assert!(unify(&mut uf, &mut budget, &interner, met, callback, shown).is_ok());
         let rep = uf.find(shown).expect("find");
         let kept = match uf.content(rep).expect("content") {
-            Content::Super { origin, .. } => origin.map(crate::ty::DutyOrigin::kernel),
+            Content::Super { origin, .. } => origin.as_ref().map(crate::ty::DutyOrigin::kernel),
             _ => None,
         };
         assert_eq!(kept, Some(ipe_kernels::StdlibKernel::DictMap));

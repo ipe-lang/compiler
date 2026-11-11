@@ -27,12 +27,14 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 
 use ipe_canon::ast as canon;
 use ipe_diagnostics::Span;
 use ipe_intern::Symbol;
 use ipe_kernels::StdlibKernel;
 
+use crate::homed::ModuleHome;
 use crate::unionfind::VarId;
 
 /// A resolved type (post-solve, immutable).
@@ -594,25 +596,34 @@ impl SkolemName {
 /// Minted only where a kernel reference ties one of its scheme variables to an
 /// obligation, so an operator or literal obligation carries none. `owes` is the
 /// obligation that kernel imposed, which a merge never widens: a refusal names
-/// the kernel only for a duty in `owes`. `blame` is the first expression the
-/// duty attached to apart from the reference itself (a higher-order kernel's
-/// callback), the place a refusal points at.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// the kernel only for a duty in `owes`. `home` is the module whose file `at`
+/// and `blame` frame against: a linked program's spans are offsets every
+/// module shares, so a span without its home names no place. `blame` is the
+/// first expression in `home` the duty attached to apart from the reference
+/// itself (a higher-order kernel's callback), the place a refusal points at.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DutyOrigin {
     kernel: StdlibKernel,
     owes: TyBounds,
+    home: Arc<ModuleHome>,
     at: Span,
     blame: Option<Span>,
 }
 
 impl DutyOrigin {
-    /// The duty `owes` imposed by the reference to `kernel` at `at`, blamed
-    /// on no expression yet.
+    /// The duty `owes` imposed by the reference to `kernel` at `at` in
+    /// `home`, blamed on no expression yet.
     #[must_use]
-    pub const fn new(kernel: StdlibKernel, owes: TyBounds, at: Span) -> Self {
+    pub const fn new(
+        kernel: StdlibKernel,
+        owes: TyBounds,
+        home: Arc<ModuleHome>,
+        at: Span,
+    ) -> Self {
         Self {
             kernel,
             owes,
+            home,
             at,
             blame: None,
         }
@@ -620,53 +631,60 @@ impl DutyOrigin {
 
     /// The kernel that imposed the duty.
     #[must_use]
-    pub const fn kernel(self) -> StdlibKernel {
+    pub const fn kernel(&self) -> StdlibKernel {
         self.kernel
     }
 
     /// The obligation the kernel imposed.
     #[must_use]
-    pub const fn owes(self) -> TyBounds {
+    pub const fn owes(&self) -> TyBounds {
         self.owes
+    }
+
+    /// Whether this origin's spans frame against `home`'s file.
+    #[must_use]
+    pub fn framed_in(&self, home: &ModuleHome) -> bool {
+        *self.home == *home
     }
 
     /// The reference to the kernel.
     #[must_use]
-    pub const fn at(self) -> Span {
+    pub const fn at(&self) -> Span {
         self.at
     }
 
     /// The expression the duty first attached to, if any.
     #[must_use]
-    pub const fn blame(self) -> Option<Span> {
+    pub const fn blame(&self) -> Option<Span> {
         self.blame
     }
 
-    /// This origin after its variable meets another at `span`: the first such
-    /// meeting away from the kernel reference names the blamed expression,
-    /// and every later one keeps it.
+    /// This origin after its variable meets another at `span` in `home`: the
+    /// first such meeting in the origin's own module away from the kernel
+    /// reference names the blamed expression, and every later one keeps it.
+    /// A meeting in another module frames against another file, so it blames
+    /// nothing.
     #[must_use]
-    pub fn met_at(self, span: Span) -> Self {
-        if self.blame.is_some() || span == self.at || span == Span::DUMMY {
-            self
-        } else {
-            Self {
-                blame: Some(span),
-                ..self
-            }
+    pub fn met_at(&self, span: Span, home: &ModuleHome) -> Self {
+        let blames =
+            self.blame.is_none() && span != self.at && span != Span::DUMMY && self.framed_in(home);
+        Self {
+            blame: if blames { Some(span) } else { self.blame },
+            ..self.clone()
         }
     }
 }
 
-/// The origin a variable keeps after a merge at `span`: the first of `first`
-/// and `second` that has one, the order the two met in.
+/// The origin a variable keeps after a merge at `span` in `home`: the first of
+/// `first` and `second` that has one, the order the two met in.
 #[must_use]
 pub fn merged_origin(
-    first: Option<DutyOrigin>,
-    second: Option<DutyOrigin>,
+    first: Option<&DutyOrigin>,
+    second: Option<&DutyOrigin>,
     span: Span,
+    home: &ModuleHome,
 ) -> Option<DutyOrigin> {
-    first.or(second).map(|origin| origin.met_at(span))
+    first.or(second).map(|origin| origin.met_at(span, home))
 }
 
 /// What a union-find variable resolves to during inference.

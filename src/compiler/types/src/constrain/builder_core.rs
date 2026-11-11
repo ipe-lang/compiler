@@ -2,6 +2,8 @@ use strum::EnumCount as _;
 
 use ipe_diagnostics::Located;
 
+use std::sync::Arc;
+
 use crate::ty::{DutyOrigin, SkolemName};
 
 use super::{
@@ -364,7 +366,8 @@ impl<'a> Builder<'a> {
         bounds: TyBounds,
         span: Span,
     ) -> DResult<VarId> {
-        self.obligated_var(bounds, span, Some(DutyOrigin::new(k, bounds, span)))
+        let home = Arc::new(self.home()?);
+        self.obligated_var(bounds, span, Some(DutyOrigin::new(k, bounds, home, span)))
     }
 
     /// Mint a super-typed flexible variable owing `bounds`, imposed by
@@ -378,7 +381,7 @@ impl<'a> Builder<'a> {
         let v = self.uf.fresh(Content::Super {
             rigid: None,
             bounds,
-            origin,
+            origin: origin.clone(),
         })?;
         let home = self.home()?;
         self.super_vars.push(SuperVar {
@@ -386,6 +389,7 @@ impl<'a> Builder<'a> {
             bounds,
             span,
             home,
+            origin,
         });
         Ok(v)
     }
