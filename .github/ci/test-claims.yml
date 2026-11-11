@@ -35,3 +35,9 @@ cells:
     features: [wasm-client]
     owner: browser-e2e
     expect_tests: 1
+  - package: ipe-wasm
+    target: {test: nesting_ceiling}
+    platform: wasm32-unknown-unknown
+    features: []
+    owner: build
+    expect_tests: 3

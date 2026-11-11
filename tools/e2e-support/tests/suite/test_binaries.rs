@@ -585,6 +585,7 @@ const TEST_BINARIES: &[(&str, &str, Reason)] = &[
         Reason::Unconsolidated,
     ),
     ("ipe-runtime-rust", "worker_scan", Reason::Unconsolidated),
+    ("ipe-wasm", "nesting_ceiling", Reason::ForeignTarget),
     ("ipe_backend_rust", "adts", Reason::Unconsolidated),
     (
         "ipe_backend_rust",

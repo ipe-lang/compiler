@@ -88,11 +88,17 @@ SCOPES: dict[str, tuple[str, ...]] = {
         "src/compiler/types/**",
         "src/ffi-bindgen-macro/**",
     ),
-    "wasm": _RUNTIME
+    # The wasm32 runtime builds, plus `ipe-wasm`'s wasm32 clippy leg: the
+    # whole front end and backend it compiles.
+    "wasm": _EMIT
     + (
-        "src/compiler/backend/**",
-        "src/compiler/kernels/**",
-        "src/stdlib/**",
+        "src/compiler/canon/**",
+        "src/compiler/db/**",
+        # The backend's own funnel scan reads the FFI crate's sources.
+        "src/compiler/ffi/**",
+        "src/compiler/types/**",
+        # A backend unit test reads the driver's command table.
+        "src/ipe-cli/src/driver/commands.rs",
         "src/wasm/**",
         "**/*wasm*",
     ),

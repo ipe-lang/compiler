@@ -25,12 +25,20 @@
 //! ordinary compiler diagnostic, never a crash. The compile target is
 //! [`ipe_ir::Target::WasmClient`] so the browser-bundle security gates
 //! (server-effect kernels denied) are exactly the ones exercised.
+//!
+//! ## The stack it runs on
+//!
+//! The front end recurses as deep as the source nesting it admits, so it runs
+//! only behind [`ipe_diagnostics::nesting::on_compile_stack`]. The build script
+//! links the module's shadow stack at
+//! [`ipe_diagnostics::nesting::WASM_SHADOW_STACK_BYTES`], and the door refuses
+//! to start the front end with less than it needs at the ceiling left.
 #![forbid(unsafe_code)]
 
 mod stdlib_inject;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The outcome of an in-browser compile: either the emitted Rust project or a
 /// rendered diagnostic. Plain owned data so the wasm-bindgen boundary can hand
@@ -56,21 +64,88 @@ pub struct CompileOutcome {
 /// function of `source` (no hidden inputs); FFI is disabled and the target is
 /// [`ipe_ir::Target::WasmClient`].
 ///
-/// Never panics: every fallible step maps to a rendered [`CompileOutcome`] with
-/// `ok == false`.
+/// Every refusal — a compiler diagnostic, a stack the door cannot provide, an
+/// internal inconsistency — maps to a rendered [`CompileOutcome`] with
+/// `ok == false`. The front end runs behind the compile-stack door, so source
+/// nested up to the parser's ceiling compiles and one level deeper is refused
+/// by the parser, never by exhausting the stack.
 #[must_use]
 pub fn compile(source: &str) -> CompileOutcome {
-    match compile_inner(source) {
-        Ok(emitted) => CompileOutcome {
+    let compiled = ipe_diagnostics::nesting::on_compile_stack(|_stack| compile_inner(source));
+    match compiled {
+        Ok(Ok(emitted)) => CompileOutcome {
             ok: true,
             diagnostics: String::new(),
             emitted_rust: render_emitted(&emitted),
         },
-        Err(rendered) => CompileOutcome {
-            ok: false,
-            diagnostics: rendered,
-            emitted_rust: String::new(),
-        },
+        Ok(Err(failure)) => refused(failure.render()),
+        Err(stack) => refused(stack.to_string()),
+    }
+}
+
+/// A rejected compile carrying the rendered reason.
+const fn refused(diagnostics: String) -> CompileOutcome {
+    CompileOutcome {
+        ok: false,
+        diagnostics,
+        emitted_rust: String::new(),
+    }
+}
+
+/// Why the in-browser front end produced no Rust.
+enum PlaygroundFailure {
+    /// A compiler diagnostic, with the module source it renders against.
+    Diagnostic {
+        diag: ipe_diagnostics::Diagnostic,
+        blame: Blame,
+    },
+    /// The entry module the source declared is absent from the source root.
+    EntryMissing,
+    /// A module the dependency order names is absent from the source map.
+    TopoModuleMissing,
+}
+
+impl PlaygroundFailure {
+    /// The failure as the text the playground shows.
+    fn render(&self) -> String {
+        match self {
+            Self::Diagnostic { diag, blame } => {
+                ipe_diagnostics::render(diag, &blame.file, &blame.source)
+            }
+            Self::EntryMissing => "internal: entry module missing from source map".to_owned(),
+            Self::TopoModuleMissing => {
+                "internal: module in topo order missing from source map".to_owned()
+            }
+        }
+    }
+}
+
+/// The module file and source a diagnostic renders against.
+struct Blame {
+    file: String,
+    source: String,
+}
+
+impl Blame {
+    /// The blame of module `file` with source `source`.
+    fn of(file: &Path, source: &str) -> Self {
+        Self {
+            file: file.to_string_lossy().into_owned(),
+            source: source.to_owned(),
+        }
+    }
+
+    /// The blame of the entry module, read before the source map exists.
+    fn entry(source: &str) -> Self {
+        Self {
+            file: ENTRY_BLAME.to_owned(),
+            source: source.to_owned(),
+        }
+    }
+
+    /// `diag` blamed on this module.
+    fn on(self, diag: ipe_diagnostics::Diagnostic) -> PlaygroundFailure {
+        PlaygroundFailure::Diagnostic { diag, blame: self }
     }
 }
 
@@ -78,13 +153,13 @@ pub fn compile(source: &str) -> CompileOutcome {
 /// Never read from disk — the source text is carried in memory.
 const ENTRY_BLAME: &str = "<playground>/Main.ipe";
 
-fn compile_inner(source: &str) -> Result<ipe_backend::EmittedProject, String> {
+fn compile_inner(source: &str) -> Result<ipe_backend::EmittedProject, PlaygroundFailure> {
     // Parse ONCE with a throwaway interner to learn the entry's declared module
     // path, exactly as the native single-file driver does. A parse failure here
     // renders against the entry file.
     let mut name_interner = ipe_intern::Interner::new();
     let parsed = ipe_parse::parse_module(source, &mut name_interner)
-        .map_err(|diag| ipe_diagnostics::render(&diag, ENTRY_BLAME, source))?;
+        .map_err(|diag| Blame::entry(source).on(diag))?;
     let entry_path: Vec<String> = parsed
         .name
         .value
@@ -110,7 +185,7 @@ fn compile_inner(source: &str) -> Result<ipe_backend::EmittedProject, String> {
     let source_root = build_source_root(&db, &sources, &injected);
 
     let Some(entry_file) = source_root.files(&db).get(&entry_path).copied() else {
-        return Err("internal: entry module missing from source map".to_owned());
+        return Err(PlaygroundFailure::EntryMissing);
     };
 
     // Compile target = WasmClient so the browser-bundle security gates run.
@@ -146,17 +221,17 @@ fn compile_inner(source: &str) -> Result<ipe_backend::EmittedProject, String> {
     // canon errors render against the owning module.
     let topo = ipe_db::topo_order(&db, source_root, entry_file)
         .clone()
-        .map_err(|diag| render_for_module(&diag, &sources, &entry_path, source))?;
+        .map_err(|diag| entry_blame(&sources, &entry_path, source).on(diag))?;
     for mod_path in topo.iter() {
         let (Some((path, src)), Some(file_handle)) = (
             sources.get(mod_path),
             source_root.files(&db).get(mod_path).copied(),
         ) else {
-            return Err("internal: module in topo order missing from source map".to_owned());
+            return Err(PlaygroundFailure::TopoModuleMissing);
         };
         ipe_db::canonicalize(&db, source_root, file_handle)
             .clone()
-            .map_err(|diag| ipe_diagnostics::render(&diag, &path.to_string_lossy(), src))?;
+            .map_err(|diag| Blame::of(path, src).on(diag))?;
     }
 
     // The emit demand: transitively link → typecheck → lower → emit. Any error
@@ -164,9 +239,7 @@ fn compile_inner(source: &str) -> Result<ipe_backend::EmittedProject, String> {
     // (falling back to the entry file when the home is empty or unknown).
     let emitted = ipe_db::emit_manifest(&db, source_root, entry_file, config)
         .clone()
-        .map_err(|(diag, home)| {
-            render_for_home(&db, &diag, &home, &sources, &entry_path, source)
-        })?;
+        .map_err(|(diag, home)| home_blame(&db, &home, &sources, &entry_path, source).on(diag))?;
     Ok((*emitted).clone())
 }
 
@@ -196,32 +269,29 @@ fn build_source_root(
     ipe_db::SourceRoot::new(db, file_handles)
 }
 
-/// Render a diagnostic against the entry module's source (used for whole-program
-/// errors — topo cycles — that no single module owns).
-fn render_for_module(
-    diag: &ipe_diagnostics::Diagnostic,
+/// The entry module's blame (used for whole-program errors — topo cycles —
+/// that no single module owns).
+fn entry_blame(
     sources: &BTreeMap<Vec<String>, (PathBuf, String)>,
     entry_path: &[String],
     entry_src: &str,
-) -> String {
-    let (file, src) = sources.get(entry_path).map_or_else(
-        || (ENTRY_BLAME.to_owned(), entry_src.to_owned()),
-        |(p, s)| (p.to_string_lossy().into_owned(), s.clone()),
-    );
-    ipe_diagnostics::render(diag, &file, &src)
+) -> Blame {
+    sources.get(entry_path).map_or_else(
+        || Blame::entry(entry_src),
+        |(path, src)| Blame::of(path, src),
+    )
 }
 
-/// Render a diagnostic carrying an owning-module `home`: resolve `home` (a
-/// symbol path) back to its source file so a dep-module error renders against
-/// its own source, not the entry file. Empty/unknown home falls back to entry.
-fn render_for_home(
+/// The blame of an owning-module `home`: resolve `home` (a symbol path) back
+/// to its source file so a dep-module error renders against its own source,
+/// not the entry file. Empty/unknown home falls back to entry.
+fn home_blame(
     db: &ipe_db::IpeDatabase,
-    diag: &ipe_diagnostics::Diagnostic,
     home: &[ipe_intern::Symbol],
     sources: &BTreeMap<Vec<String>, (PathBuf, String)>,
     entry_path: &[String],
     entry_src: &str,
-) -> String {
+) -> Blame {
     if !home.is_empty() {
         let interner = ipe_db::Db::interner(db).lock();
         let home_str: Option<Vec<String>> = home
@@ -232,10 +302,10 @@ fn render_for_home(
         if let Some(home_str) = home_str
             && let Some((path, src)) = sources.get(&home_str)
         {
-            return ipe_diagnostics::render(diag, &path.to_string_lossy(), src);
+            return Blame::of(path, src);
         }
     }
-    render_for_module(diag, sources, entry_path, entry_src)
+    entry_blame(sources, entry_path, entry_src)
 }
 
 /// Render an [`ipe_backend::EmittedProject`] as human-readable Rust: each file
