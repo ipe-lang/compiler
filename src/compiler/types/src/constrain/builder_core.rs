@@ -2,7 +2,7 @@ use strum::EnumCount as _;
 
 use ipe_diagnostics::Located;
 
-use crate::ty::SkolemName;
+use crate::ty::{DutyOrigin, SkolemName};
 
 use super::{
     BTreeMap, BTreeSet, BinopClass, Builder, Builtins, CallSite, Constraint, ConstraintOrigin,
@@ -352,9 +352,33 @@ impl<'a> Builder<'a> {
     /// `span` is the operand span blamed if the variable later pins to a
     /// concrete type that does not actually support the operation.
     pub fn super_var(&mut self, bounds: TyBounds, span: Span) -> DResult<VarId> {
+        self.obligated_var(bounds, span, None)
+    }
+
+    /// Mint a super-typed flexible variable carrying the duty `bounds` the
+    /// reference to kernel `k` at `span` imposes, so a refusal of it can name
+    /// the kernel and blame the expression the duty attached to.
+    pub fn kernel_duty_var(
+        &mut self,
+        k: StdlibKernel,
+        bounds: TyBounds,
+        span: Span,
+    ) -> DResult<VarId> {
+        self.obligated_var(bounds, span, Some(DutyOrigin::new(k, bounds, span)))
+    }
+
+    /// Mint a super-typed flexible variable owing `bounds`, imposed by
+    /// `origin` when a kernel reference imposed it.
+    fn obligated_var(
+        &mut self,
+        bounds: TyBounds,
+        span: Span,
+        origin: Option<DutyOrigin>,
+    ) -> DResult<VarId> {
         let v = self.uf.fresh(Content::Super {
             rigid: None,
             bounds,
+            origin,
         })?;
         let home = self.home()?;
         self.super_vars.push(SuperVar {

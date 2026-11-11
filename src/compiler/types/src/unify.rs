@@ -34,7 +34,7 @@ use crate::constrain::zonk_reported;
 use crate::doc::{VarLabel, VarNamer, ty_to_doc};
 use crate::homed::{InferError, ModuleHome};
 use crate::solve::{Budget, CalleeName, Constraint, ConstraintOrigin};
-use crate::ty::{Content, FlatType, SolverVar, Ty, TyBounds};
+use crate::ty::{Content, FlatType, SolverVar, Ty, TyBounds, merged_origin};
 use crate::unionfind::{UnionFind, VarId};
 
 /// Whether a concrete structure `flat` satisfies a variable's super-type
@@ -379,6 +379,7 @@ fn var_labels(uf: &UnionFind<Content>, tys: &[&Ty]) -> BTreeMap<u32, VarLabel> {
                         Content::Super {
                             rigid: None,
                             bounds,
+                            ..
                         } => owed_class(*bounds).map(VarLabel::Class),
                         Content::Flex | Content::Structure(_) => None,
                     });
@@ -455,8 +456,22 @@ fn unify_step(
         // structure when it satisfies the obligations; a rigid cannot be pinned
         // (the annotation promised a generic), and a structure that fails the
         // obligations is a mismatch either way.
-        (Content::Super { rigid, bounds }, structure @ Content::Structure(_))
-        | (structure @ Content::Structure(_), Content::Super { rigid, bounds }) => {
+        (
+            Content::Super {
+                rigid,
+                bounds,
+                origin,
+            },
+            structure @ Content::Structure(_),
+        )
+        | (
+            structure @ Content::Structure(_),
+            Content::Super {
+                rigid,
+                bounds,
+                origin,
+            },
+        ) => {
             let pins = match &structure {
                 Content::Structure(flat) => {
                     rigid.is_none() && super_concrete_ok(interner, bounds, flat)
@@ -495,8 +510,8 @@ fn unify_step(
                         let structure_var = if a_is_structure { ra } else { rb };
                         let ty = zonk_reported(uf, budget, structure_var, span)?;
                         let mut namer = labelled_namer(uf, interner, &[&ty])?;
-                        Err(crate::super_unsatisfied_named(
-                            interner, duty, &ty, span, &mut namer,
+                        Err(crate::duty_refusal(
+                            interner, duty, origin, &ty, span, &mut namer,
                         ))
                     }
                     None => Err(mismatch_owing(uf, budget, interner, span, ra, rb, None)),
@@ -547,13 +562,28 @@ fn unify_nonstructure(
             uf.union(ra, rb, Content::Rigid(*name))
         }
         // A flex adopts a super-typed variable's obligations wholesale.
-        (Content::Super { rigid, bounds }, Content::Flex)
-        | (Content::Flex, Content::Super { rigid, bounds }) => uf.union(
+        (
+            Content::Super {
+                rigid,
+                bounds,
+                origin,
+            },
+            Content::Flex,
+        )
+        | (
+            Content::Flex,
+            Content::Super {
+                rigid,
+                bounds,
+                origin,
+            },
+        ) => uf.union(
             ra,
             rb,
             Content::Super {
                 rigid: *rigid,
                 bounds: *bounds,
+                origin: origin.map(|o| o.met_at(span)),
             },
         ),
         // Two super-typed variables meet.
@@ -578,10 +608,12 @@ fn unify_nonstructure(
             Content::Super {
                 rigid: r1,
                 bounds: b1,
+                origin: o1,
             },
             Content::Super {
                 rigid: r2,
                 bounds: b2,
+                origin: o2,
             },
         ) => {
             // Two RIGID supers are two distinct annotation skolems — a same-class
@@ -610,6 +642,7 @@ fn unify_nonstructure(
                     Content::Super {
                         rigid: r1.or(*r2),
                         bounds: b1.union(*b2),
+                        origin: merged_origin(*o1, *o2, span),
                     },
                 )
             } else {
@@ -623,6 +656,7 @@ fn unify_nonstructure(
             Content::Super {
                 rigid: None,
                 bounds,
+                origin,
             },
             Content::Rigid(name),
         )
@@ -631,6 +665,7 @@ fn unify_nonstructure(
             Content::Super {
                 rigid: None,
                 bounds,
+                origin,
             },
         ) => uf.union(
             ra,
@@ -638,6 +673,7 @@ fn unify_nonstructure(
             Content::Super {
                 rigid: Some(*name),
                 bounds: *bounds,
+                origin: origin.map(|o| o.met_at(span)),
             },
         ),
         // Mismatch for everything left: two distinct rigid skolems (a same-class
@@ -1311,8 +1347,12 @@ mod tests {
         rigid: Option<SkolemName>,
         bounds: TyBounds,
     ) -> VarId {
-        uf.fresh(Content::Super { rigid, bounds })
-            .expect("fresh var")
+        uf.fresh(Content::Super {
+            rigid,
+            bounds,
+            origin: None,
+        })
+        .expect("fresh var")
     }
 
     /// The skolem name of the annotation variable with raw id `raw`.
@@ -1376,9 +1416,111 @@ mod tests {
             Content::Super {
                 rigid: skolem(1),
                 bounds: TyBounds::eq().union(TyBounds::show()),
+                origin: None,
             },
             "merged content must be rigid with Eq|SHOW"
         );
+    }
+
+    /// A flexible super-typed variable owing `bounds`, imposed by `kernel` at `at`.
+    fn kernel_duty(
+        uf: &mut UnionFind<Content>,
+        kernel: ipe_kernels::StdlibKernel,
+        bounds: TyBounds,
+        at: Span,
+    ) -> VarId {
+        uf.fresh(Content::Super {
+            rigid: None,
+            bounds,
+            origin: Some(crate::ty::DutyOrigin::new(kernel, bounds, at)),
+        })
+        .expect("fresh var")
+    }
+
+    /// The duty, stated origin and blamed span of the refusal of `duty_var`
+    /// meeting `() -> ()` at `span`; `None` when it is not an IPE-T0014.
+    fn refuse_with_function(
+        uf: &mut UnionFind<Content>,
+        duty_var: VarId,
+        span: Span,
+    ) -> Option<(Owed, Option<ipe_diagnostics::DutyOrigin>, Span)> {
+        let unit = uf.fresh(Content::Structure(FlatType::Unit)).ok()?;
+        let fun = uf
+            .fresh(Content::Structure(FlatType::Fun(unit, unit)))
+            .ok()?;
+        let mut budget = Budget::unbounded();
+        let interner = Interner::new();
+        match unify(uf, &mut budget, &interner, span, duty_var, fun) {
+            Err(Diagnostic::Type {
+                span,
+                msg: TypeError::SuperTypeUnsatisfied { owed, origin, .. },
+            }) => Some((owed, origin, span)),
+            _ => None,
+        }
+    }
+
+    /// A kernel duty met by another variable keeps its kernel, and its refusal
+    /// names the kernel and blames the site the duty was met at.
+    #[test]
+    fn a_kernel_duty_refusal_names_the_kernel_and_blames_where_it_was_met() {
+        let mut uf = UnionFind::new();
+        let at = Span::new(10, 18);
+        let met = Span::new(20, 30);
+        let duty = kernel_duty(
+            &mut uf,
+            ipe_kernels::StdlibKernel::DictMap,
+            TyBounds::hof_kernel_result(),
+            at,
+        );
+        let flex = uf.fresh(Content::Flex).expect("fresh var");
+        let mut budget = Budget::unbounded();
+        let interner = Interner::new();
+        assert!(unify(&mut uf, &mut budget, &interner, met, duty, flex).is_ok());
+        let refusal = refuse_with_function(&mut uf, flex, Span::new(40, 48));
+        assert_eq!(
+            refusal,
+            Some((
+                Owed::PlainCallbackResult,
+                Some(ipe_diagnostics::DutyOrigin {
+                    kernel_label: "Dict.map".into(),
+                    at,
+                }),
+                met,
+            ))
+        );
+    }
+
+    /// Two kernel duties merge keeping the first kernel's origin; a refusal of
+    /// the merged variable whose unmet duty is the second kernel's names no
+    /// kernel and blames the refused expression.
+    #[test]
+    fn a_merged_duty_names_no_kernel_for_a_duty_its_origin_does_not_owe() {
+        let mut uf = UnionFind::new();
+        let refused = Span::new(40, 48);
+        let callback = kernel_duty(
+            &mut uf,
+            ipe_kernels::StdlibKernel::DictMap,
+            TyBounds::hof_kernel_result(),
+            Span::new(10, 18),
+        );
+        let shown = kernel_duty(
+            &mut uf,
+            ipe_kernels::StdlibKernel::DebugLog,
+            TyBounds::show(),
+            Span::new(50, 59),
+        );
+        let mut budget = Budget::unbounded();
+        let interner = Interner::new();
+        let met = Span::new(20, 30);
+        assert!(unify(&mut uf, &mut budget, &interner, met, callback, shown).is_ok());
+        let rep = uf.find(shown).expect("find");
+        let kept = match uf.content(rep).expect("content") {
+            Content::Super { origin, .. } => origin.map(crate::ty::DutyOrigin::kernel),
+            _ => None,
+        };
+        assert_eq!(kept, Some(ipe_kernels::StdlibKernel::DictMap));
+        let refusal = refuse_with_function(&mut uf, shown, refused);
+        assert_eq!(refusal, Some((Owed::Stringify, None, refused)));
     }
 
     /// Add (rigid) ∪ Add (flex) — Add is a concrete-dispatch (Number) obligation.
@@ -1425,6 +1567,7 @@ mod tests {
             Content::Super {
                 rigid: None,
                 bounds: TyBounds::eq().union(TyBounds::ord()),
+                origin: None,
             },
         );
     }

@@ -65,7 +65,7 @@ use constrain::{
     zonk_reported,
 };
 use solve::solve_attributed;
-use ty::{Content, FlatType};
+use ty::{Content, DutyOrigin, FlatType};
 pub use unify::{STDLIB_DISTINCT_UNIONS, con_heads_compatible};
 use unify::{occurs_guard, super_admits_record, unify_at};
 use unionfind::{UnionFind, VarId};
@@ -1003,6 +1003,7 @@ fn infer_core(
             Content::Super {
                 rigid: None,
                 bounds,
+                ..
             } if bounds.has_number() => {
                 let int_ty = Ty::Con {
                     module: Vec::new(),
@@ -1036,6 +1037,7 @@ fn infer_core(
             Content::Super {
                 rigid: None,
                 bounds,
+                ..
             } if bounds.has_sql_param() && !generic_roots.contains(&root) => {
                 let sqlvalue_ty = Ty::Con {
                     module: Vec::new(),
@@ -1069,6 +1071,7 @@ fn infer_core(
             Content::Super {
                 rigid: None,
                 bounds,
+                ..
             } if bounds.has_interpolable() && !generic_roots.contains(&root) => {
                 let string_ty = Ty::Con {
                     module: Vec::new(),
@@ -2893,6 +2896,63 @@ pub(crate) fn super_unsatisfied_named(
     span: Span,
     namer: &mut VarNamer,
 ) -> Diagnostic {
+    refusal_naming(interner, owed, None, ty, span, namer)
+}
+
+/// The IPE-T0014 refusal of `ty` for the unmet duty `owed` of a variable a
+/// kernel reference may have obligated (`origin`).
+///
+/// The origin is stated only when the duty `ty` fails is one its kernel
+/// imposed: a variable whose obligations merged from several sources keeps
+/// the first kernel's origin, and naming that kernel for another source's
+/// duty would be false, so such a refusal names no kernel. An applying
+/// origin blames the expression its duty attached to (a higher-order
+/// kernel's callback) rather than the one whose type broke it at `span`.
+pub(crate) fn duty_refusal(
+    interner: &Interner,
+    owed: Owed,
+    origin: Option<DutyOrigin>,
+    ty: &Ty,
+    span: Span,
+    namer: &mut VarNamer,
+) -> Diagnostic {
+    let origin = origin.filter(|o| imposes(o.owes(), owed));
+    let blamed = origin.and_then(DutyOrigin::blame).unwrap_or(span);
+    let stated = origin.and_then(stated_origin);
+    refusal_naming(interner, owed, stated, ty, blamed, namer)
+}
+
+/// Whether the obligation `owes` includes the duty `owed`.
+fn imposes(owes: TyBounds, owed: Owed) -> bool {
+    TyBounds::ALL_BITS
+        .iter()
+        .any(|bit| owes.union(*bit) == owes && owed_of_bit(*bit) == Some(owed))
+}
+
+/// The origin as a refusal states it: the kernel as the user reads it
+/// (`Dict.map`) and its reference. An internal kernel (a qualifier starting
+/// `_`, such as the `{{…}}` desugaring) has no name the user wrote, so it
+/// states none.
+fn stated_origin(origin: DutyOrigin) -> Option<ipe_diagnostics::DutyOrigin> {
+    let decl = origin.kernel().decl();
+    if decl.qualifier.is_empty() || decl.qualifier.starts_with('_') {
+        return None;
+    }
+    Some(ipe_diagnostics::DutyOrigin {
+        kernel_label: format!("{}.{}", decl.qualifier, decl.name).into_boxed_str(),
+        at: origin.at(),
+    })
+}
+
+/// The IPE-T0014 refusal of `ty` for `owed` at `span`, stating `origin`.
+fn refusal_naming(
+    interner: &Interner,
+    owed: Owed,
+    origin: Option<ipe_diagnostics::DutyOrigin>,
+    ty: &Ty,
+    span: Span,
+    namer: &mut VarNamer,
+) -> Diagnostic {
     let found = match ty_to_doc(ty, interner, namer) {
         Ok(d) => d,
         Err(bug) => return bug,
@@ -2902,7 +2962,7 @@ pub(crate) fn super_unsatisfied_named(
         msg: TypeError::SuperTypeUnsatisfied {
             owed,
             found: Box::new(found),
-            origin: None,
+            origin,
         },
     }
 }
@@ -3338,6 +3398,7 @@ fn base_state(content: &Content) -> BaseState {
         Content::Super {
             rigid: None,
             bounds,
+            ..
         } if super_admits_record(*bounds) => BaseState::PinnableSuper,
         Content::Super { .. }
         | Content::Rigid(_)
@@ -9819,6 +9880,65 @@ h x =
                 "{what} names a variable the user never wrote:\n{rendered}"
             );
         }
+    }
+
+    /// The text of `src` that `span` covers.
+    fn spanned(src: &str, span: Span) -> Option<&str> {
+        src.get(usize::try_from(span.lo).ok()?..usize::try_from(span.hi).ok()?)
+    }
+
+    /// A callback returning a function to `Dict.map` is refused naming
+    /// `Dict.map`, blames the callback rather than the dictionary whose type
+    /// exposed it, and labels the `Dict.map` reference.
+    #[test]
+    #[allow(clippy::panic)] // a refusal of any other shape fails with its result
+    fn a_callback_duty_refusal_names_its_kernel_and_blames_the_callback() {
+        let src = "module Main exposing (go)\n\nimport Ipe.Dict as Dict\n\n\
+                   go : Dict String (Int -> Int) -> Dict String (Int -> Int)\n\
+                   go handlers =\n    Dict.map (\\_ f -> f) handlers\n";
+        let Some(Err(d)) = infer_over_duty_stdlib(src) else {
+            panic!("the callback must be refused");
+        };
+        let Diagnostic::Type {
+            span,
+            msg:
+                TypeError::SuperTypeUnsatisfied {
+                    owed,
+                    origin: Some(origin),
+                    ..
+                },
+        } = &d
+        else {
+            panic!("the refusal must be IPE-T0014 with its kernel origin: {d:?}");
+        };
+        assert_eq!(*owed, Owed::PlainCallbackResult);
+        assert_eq!(&*origin.kernel_label, "Dict.map");
+        let reference = src.rfind("Dict.map").unwrap_or(0);
+        let reference_text = spanned(src, origin.at).unwrap_or("");
+        assert!(
+            "Dict.map".ends_with(reference_text)
+                && !reference_text.is_empty()
+                && usize::try_from(origin.at.lo).is_ok_and(|lo| lo >= reference),
+            "the origin must sit on the `Dict.map` reference, not `{reference_text}`"
+        );
+        let blamed = spanned(src, *span).unwrap_or("");
+        assert!(
+            blamed.contains("\\_ f -> f") && !blamed.contains("handlers"),
+            "the refusal must blame the callback, not `{blamed}`"
+        );
+        let rendered = ipe_diagnostics::render(&d, "Main.ipe", src);
+        assert!(
+            rendered.contains("`Dict.map` needs its callback to return a plain value"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("this callback returns `Int -> Int`"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("the requirement comes from this function"),
+            "{rendered}"
+        );
     }
 
     /// A record bound as a SQL parameter is refused as the SQL-parameter duty,

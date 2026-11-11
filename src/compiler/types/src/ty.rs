@@ -29,7 +29,9 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 
 use ipe_canon::ast as canon;
+use ipe_diagnostics::Span;
 use ipe_intern::Symbol;
+use ipe_kernels::StdlibKernel;
 
 use crate::unionfind::VarId;
 
@@ -587,6 +589,86 @@ impl SkolemName {
     }
 }
 
+/// The kernel reference that imposed a duty on a super-typed variable.
+///
+/// Minted only where a kernel reference ties one of its scheme variables to an
+/// obligation, so an operator or literal obligation carries none. `owes` is the
+/// obligation that kernel imposed, which a merge never widens: a refusal names
+/// the kernel only for a duty in `owes`. `blame` is the first expression the
+/// duty attached to apart from the reference itself (a higher-order kernel's
+/// callback), the place a refusal points at.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DutyOrigin {
+    kernel: StdlibKernel,
+    owes: TyBounds,
+    at: Span,
+    blame: Option<Span>,
+}
+
+impl DutyOrigin {
+    /// The duty `owes` imposed by the reference to `kernel` at `at`, blamed
+    /// on no expression yet.
+    #[must_use]
+    pub const fn new(kernel: StdlibKernel, owes: TyBounds, at: Span) -> Self {
+        Self {
+            kernel,
+            owes,
+            at,
+            blame: None,
+        }
+    }
+
+    /// The kernel that imposed the duty.
+    #[must_use]
+    pub const fn kernel(self) -> StdlibKernel {
+        self.kernel
+    }
+
+    /// The obligation the kernel imposed.
+    #[must_use]
+    pub const fn owes(self) -> TyBounds {
+        self.owes
+    }
+
+    /// The reference to the kernel.
+    #[must_use]
+    pub const fn at(self) -> Span {
+        self.at
+    }
+
+    /// The expression the duty first attached to, if any.
+    #[must_use]
+    pub const fn blame(self) -> Option<Span> {
+        self.blame
+    }
+
+    /// This origin after its variable meets another at `span`: the first such
+    /// meeting away from the kernel reference names the blamed expression,
+    /// and every later one keeps it.
+    #[must_use]
+    pub fn met_at(self, span: Span) -> Self {
+        if self.blame.is_some() || span == self.at || span == Span::DUMMY {
+            self
+        } else {
+            Self {
+                blame: Some(span),
+                ..self
+            }
+        }
+    }
+}
+
+/// The origin a variable keeps after a merge at `span`: the first of `first`
+/// and `second` that has one, the order the two met in.
+#[must_use]
+pub fn merged_origin(
+    first: Option<DutyOrigin>,
+    second: Option<DutyOrigin>,
+    span: Span,
+) -> Option<DutyOrigin> {
+    first.or(second).map(|origin| origin.met_at(span))
+}
+
 /// What a union-find variable resolves to during inference.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Content {
@@ -620,9 +702,13 @@ pub enum Content {
     /// super-typed rigid against a concrete structure is a mismatch, exactly as a
     /// plain rigid is — the annotation promised a generic the body is now trying
     /// to pin down.
+    ///
+    /// `origin` is the kernel reference that imposed the obligation, when one
+    /// did (see [`DutyOrigin`]).
     Super {
         rigid: Option<SkolemName>,
         bounds: TyBounds,
+        origin: Option<DutyOrigin>,
     },
     /// A resolved concrete structure.
     Structure(FlatType),
