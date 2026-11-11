@@ -1,0 +1,44 @@
+name: Install the webview link deps
+description: >-
+  Install the GLib/GTK/WebKitGTK development packages that wry and tao build
+  and link against, so a webview build script finds them through pkg-config.
+  This is the one place a job installs them. The `-dev` packages pull in the
+  WebKitGTK/GStreamer runtime libraries as hard dependencies, a download that
+  varies from seconds to tens of minutes with the mirror. The fetched archives
+  are cached (only `main` saves, as everywhere else) so a restored run installs
+  from disk and only a cold or stale cache pays the mirror; each apt call is
+  capped at 6 minutes, two attempts, so even that case stays inside the job
+  budget.
+
+runs:
+  using: composite
+  steps:
+    - name: Identify the runner image
+      id: apt-image
+      shell: bash
+      run: echo "image=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+    - name: Restore webview link dep archives
+      id: apt-cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      with:
+        path: ${{ runner.temp }}/apt-archives
+        key: ${{ runner.os }}-${{ runner.arch }}-apt-webview-${{ steps.apt-image.outputs.image }}
+    - name: Install webview link deps (wry/tao — GLib/GTK/WebKit)
+      shell: bash
+      run: |
+        mkdir -p "$RUNNER_TEMP/apt-archives/partial"
+        for attempt in 1 2; do
+          if sudo timeout 360 apt-get -o Acquire::Retries=3 update \
+            && sudo timeout 360 apt-get -o Acquire::Retries=3 -o Dir::Cache::archives="$RUNNER_TEMP/apt-archives" install -y --no-install-recommends libwebkit2gtk-4.1-dev libsoup-3.0-dev; then
+            exit 0
+          fi
+          echo "apt attempt $attempt did not finish within its 6 minute cap"
+          sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' /etc/apt/apt-mirrors.txt
+        done
+        exit 1
+    - name: Save webview link dep archives
+      if: github.ref == 'refs/heads/main' && steps.apt-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      with:
+        path: ${{ runner.temp }}/apt-archives
+        key: ${{ steps.apt-cache.outputs.cache-primary-key }}
