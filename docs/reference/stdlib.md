@@ -1851,11 +1851,11 @@ Ipe.Email — provider-abstract email send.
 | `withContent` | `withContent bytes att` — replace the attachment body bytes. |
 | `defaultSesConfig` | `defaultSesConfig "us-east-1"` — SesConfig with the region set; |
 | `withSesKey` | `withSesKey "AKIA..." cfg` — replace the SES access-key id (the IAM |
-| `withSesSecret` | `withSesSecret (Secret.fromString "...") cfg` — replace the SES secret |
+| `withSesSecret` | `withSesSecret (App.fromEnvRequired "SES_SECRET") cfg` — replace the SES secret |
 | `defaultSmtpConfig` | `defaultSmtpConfig "smtp.example.com"` — SmtpConfig with host |
 | `withSmtpPort` | `withSmtpPort (Net.fromInt 465 \|> Result.withDefault Net.min) cfg` — replace |
 | `withSmtpUser` | `withSmtpUser "user" cfg` — replace the SMTP username. |
-| `withSmtpPass` | `withSmtpPass (Secret.fromString "...") cfg` — replace the SMTP password. |
+| `withSmtpPass` | `withSmtpPass (App.fromEnvRequired "SMTP_PASS") cfg` — replace the SMTP password. |
 | `withCc` | Override CC. |
 | `withBcc` | Override BCC. |
 | `withTextBody` | Override the plain-text body. |

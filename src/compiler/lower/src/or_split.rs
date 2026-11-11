@@ -36,6 +36,7 @@
 //! | `fn_row_params` | (a) idempotent: written once per definition, after its body |
 //! | `promotable_fn_binders`, `local_string_literals`, `toplevel_fn_aliases`, `shared_fn_reads`, `current_poly_tvars`, `fn_is_async` | (b) saved and restored around the scope that sets them |
 //! | `current_home` | (b) set per definition |
+//! | `literal_fold_budget` | (b) reset at each `Secret.fromString` literal fold |
 //! | `eta_base`, `param_cursor`, `any_param_cursor`, `projection_decode_cursor`, `destructure_thunk_cursor`, `nested_cons_cursor`, `nested_strlit_cursor`, `tuple_elem_cursor` | (c) per-definition monotonic cursors: each copy draws a disjoint block |
 //! | `carrier_walks` | (c) a monotonic budget: each copy is charged, an overrun fails closed |
 //!

@@ -682,6 +682,238 @@ mod tests {
             .map_err(|(d, _home)| d)
     }
 
+    /// `module Main` importing `Ipe.Secret`, exposing `key`, with `defs` appended.
+    fn secret_module(defs: &str) -> String {
+        format!("module Main exposing (key)\n\nimport Ipe.Secret as Secret\n\n\n{defs}")
+    }
+
+    /// Whether `result` is the IPE-L0150 committed-literal refusal.
+    fn is_secret_literal_refusal(result: &Result<(), Diagnostic>) -> bool {
+        matches!(
+            result,
+            Err(Diagnostic::Lower {
+                msg: LowerError::SecretFromStringLiteral,
+                ..
+            })
+        )
+    }
+
+    #[test]
+    fn secret_from_toplevel_literal_constant_is_refused() {
+        let result = lower_result(&secret_module(
+            "apiKey : String\napiKey =\n    \"sk_live_toplevel\"\n\n\n\
+             key =\n    Secret.fromString apiKey\n",
+        ));
+        assert!(
+            is_secret_literal_refusal(&result),
+            "a top-level literal constant sealed by `Secret.fromString` must be IPE-L0150, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn secret_from_constant_built_from_constants_is_refused() {
+        let result = lower_result(&secret_module(
+            "prefix : String\nprefix =\n    \"sk_live_\"\n\n\n\
+             apiKey : String\napiKey =\n    prefix ++ \"joined\"\n\n\n\
+             key =\n    Secret.fromString apiKey\n",
+        ));
+        assert!(
+            is_secret_literal_refusal(&result),
+            "a constant joined from constants must be IPE-L0150, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn secret_from_let_bound_toplevel_constant_is_refused() {
+        let result = lower_result(&secret_module(
+            "apiKey : String\napiKey =\n    \"sk_live_letbound\"\n\n\n\
+             key =\n    let\n        cred = apiKey\n    in\n    Secret.fromString cred\n",
+        ));
+        assert!(
+            is_secret_literal_refusal(&result),
+            "a `let` alias of a top-level literal constant must be IPE-L0150, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn secret_from_empty_toplevel_constant_is_accepted() {
+        let result = lower_result(&secret_module(
+            "blank : String\nblank =\n    \"\"\n\n\n\
+             key =\n    Secret.fromString blank\n",
+        ));
+        assert!(
+            !is_secret_literal_refusal(&result),
+            "an empty constant carries no key material and must not be IPE-L0150, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn secret_from_constant_chain_past_fold_budget_is_refused() {
+        // Every link is the empty constant, so only the fold ceiling can refuse:
+        // a chain longer than the budget is unproven and fails closed.
+        let mut chain = String::new();
+        for (prev, next) in (0..300).zip(1..301) {
+            let (prev, next) = (prev.to_string(), next.to_string());
+            for part in [
+                "c",
+                &next,
+                " : String\nc",
+                &next,
+                " =\n    c",
+                &prev,
+                "\n\n\n",
+            ] {
+                chain.push_str(part);
+            }
+        }
+        let result = lower_result(&secret_module(&format!(
+            "c0 : String\nc0 =\n    \"\"\n\n\n{chain}key =\n    Secret.fromString c300\n"
+        )));
+        assert!(
+            is_secret_literal_refusal(&result),
+            "a constant chain past the fold budget must fail closed as IPE-L0150, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn secret_from_divergent_literal_branches_is_refused() {
+        let result = lower_result(&secret_module(
+            "key flag =\n    Secret.fromString (if flag then \"sk_live_a\" else \"sk_live_b\")\n",
+        ));
+        assert!(
+            is_secret_literal_refusal(&result),
+            "every branch a committed literal is a committed key, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn secret_from_case_with_one_literal_arm_is_refused() {
+        let result = lower_result(&secret_module(
+            "key n =\n    Secret.fromString\n        (case n of\n            0 ->\n                \"sk_live_a\"\n\n            _ ->\n                \"\"\n        )\n",
+        ));
+        assert!(
+            is_secret_literal_refusal(&result),
+            "a `case` whose arms are literals, one non-empty, is a committed key, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn secret_from_all_empty_branches_is_accepted() {
+        let result = lower_result(&secret_module(
+            "key flag =\n    Secret.fromString (if flag then \"\" else \"\")\n",
+        ));
+        assert!(
+            result.is_ok(),
+            "only empty branches carry no key, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn secret_from_inline_let_expression_is_refused() {
+        let result = lower_result(&secret_module(
+            "key =\n    Secret.fromString\n        (let\n            cred =\n                \"sk_live_inline\"\n         in\n         cred\n        )\n",
+        ));
+        assert!(
+            is_secret_literal_refusal(&result),
+            "a `let` expression folding to a literal must be IPE-L0150, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn secret_from_constant_with_let_body_is_refused() {
+        let result = lower_result(&secret_module(
+            "apiKey : String\napiKey =\n    let\n        prefix =\n            \"sk_live_\"\n    in\n    prefix ++ \"body\"\n\n\n\
+             key =\n    Secret.fromString apiKey\n",
+        ));
+        assert!(
+            is_secret_literal_refusal(&result),
+            "a constant whose `let` body folds to a literal must be IPE-L0150, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn secret_from_doubling_let_chain_is_refused() {
+        // Each binding doubles the previous one; the fold tracks emptiness, not
+        // text, so the chain costs one step per binding.
+        let mut lets = String::from("        d0 =\n            \"k\"\n\n");
+        for (prev, next) in (0..20).zip(1..21) {
+            let (prev, next) = (prev.to_string(), next.to_string());
+            for part in [
+                "        d",
+                &next,
+                " =\n            d",
+                &prev,
+                " ++ d",
+                &prev,
+                "\n\n",
+            ] {
+                lets.push_str(part);
+            }
+        }
+        let result = lower_result(&secret_module(&format!(
+            "key =\n    let\n{lets}    in\n    Secret.fromString d20\n"
+        )));
+        assert!(
+            is_secret_literal_refusal(&result),
+            "a doubling literal chain must be IPE-L0150, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn secret_from_case_binder_shadowing_let_literal_is_accepted() {
+        let result = lower_result(&secret_module(
+            "key x =\n    let\n        k =\n            \"sk_live_outer\"\n    in\n    case x of\n        k ->\n            Secret.fromString k\n",
+        ));
+        assert!(
+            result.is_ok(),
+            "a `case` binder shadowing a literal `let` is the runtime value, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn secret_from_case_expression_binder_shadowing_let_literal_is_accepted() {
+        let result = lower_result(&secret_module(
+            "key x =\n    let\n        k =\n            \"sk_live_outer\"\n    in\n    Secret.fromString\n        (case x of\n            k ->\n                k\n        )\n",
+        ));
+        assert!(
+            result.is_ok(),
+            "a folded `case` arm binder shadowing a literal `let` is the runtime value, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn secret_from_inline_let_destructure_shadowing_literal_is_accepted() {
+        let result = lower_result(&secret_module(
+            "key x =\n    let\n        k =\n            \"sk_live_outer\"\n    in\n    Secret.fromString\n        (let\n            ( k, j ) =\n                ( x, x )\n         in\n         k\n        )\n",
+        ));
+        assert!(
+            result.is_ok(),
+            "a folded `let` destructure binder shadowing a literal is the runtime value, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn secret_from_lambda_param_shadowing_let_literal_is_accepted() {
+        let result = lower_result(&secret_module(
+            "key x =\n    let\n        k =\n            \"sk_live_outer\"\n    in\n    (\\k -> Secret.fromString k) x\n",
+        ));
+        assert!(
+            result.is_ok(),
+            "a lambda parameter shadowing a literal `let` is the runtime value, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn secret_from_destructure_shadowing_let_literal_is_accepted() {
+        let result = lower_result(&secret_module(
+            "key x =\n    let\n        k =\n            \"sk_live_outer\"\n    in\n    let\n        ( k, j ) =\n            ( x, x )\n    in\n    Secret.fromString k\n",
+        ));
+        assert!(
+            result.is_ok(),
+            "a destructure binder shadowing a literal `let` is the runtime value, got {result:?}"
+        );
+    }
+
     #[test]
     fn generic_record_signature_lowers_to_generic_struct_field() {
         // `wrap : a -> { value : a }` — the parameter and the record field both
