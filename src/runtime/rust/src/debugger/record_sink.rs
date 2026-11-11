@@ -456,8 +456,10 @@ impl<Msg: Clone, Model: Clone> Recording<'_, Msg, Model> {
     /// Run one step of the program and record it.
     ///
     /// `msg` is noted in flight before `update` runs and settled after it
-    /// returns, so an exit inside `update` still dumps it. No recorder lock is
-    /// held while `update` runs.
+    /// returns, so an exit inside `update` still dumps it. `update` runs once
+    /// per step, here, with no recorder lock held: settling a step past the
+    /// ring's cap advances the base to the evicted step's recorded model
+    /// ([`RecordBuffer::record_settled`]), never by re-running `update`.
     pub fn step<F>(&self, msg: Msg, model: Model, update: &F) -> (Model, IpeCmd<Msg>)
     where
         F: Fn(Msg, Model) -> (Model, IpeCmd<Msg>),
@@ -469,7 +471,7 @@ impl<Msg: Clone, Model: Clone> Recording<'_, Msg, Model> {
         let (next, cmd) = update(msg.clone(), model);
         let mut session = self.session.lock().unwrap_or_else(PoisonError::into_inner);
         session.in_flight = None;
-        session.buf.record(msg, next.clone(), update);
+        session.buf.record_settled(msg, next.clone());
         drop(session);
         (next, cmd)
     }
@@ -1295,5 +1297,54 @@ mod tests {
             "a hazard survived: {blob:?}"
         );
         assert_eq!(blob, plain_line(&in_flight_line("a[31mb")));
+    }
+
+    // Past the ring's cap a step still runs `update` once, with no recorder
+    // lock held: the base advances to the evicted step's recorded model, never
+    // by re-running `update` under the lock the exit-time dump waits on.
+    #[test]
+    fn a_step_past_the_ring_cap_runs_update_once_and_unlocked() {
+        use crate::debugger::session_log::{TraceOnly, Unreplayable};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let stages = &PreExitStages::new();
+        let started = start_in::<Msg, Model, _>(
+            stages,
+            Some(RecordDest::Stderr),
+            Model { n: 0 },
+            TraceOnly(Unreplayable::MsgNotEncodable),
+        );
+        assert!(started.is_ok(), "the recorder did not start");
+        let Ok(recording) = started else { return };
+        let session = Arc::clone(&recording.session);
+        let calls = AtomicUsize::new(0);
+        let ran_locked = AtomicBool::new(false);
+        let watched = |msg: Msg, model: Model| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            if matches!(session.try_lock(), Err(TryLockError::WouldBlock)) {
+                ran_locked.store(true, Ordering::SeqCst);
+            }
+            update(msg, model)
+        };
+        let steps = crate::debugger::DEFAULT_HISTORY_CAP.saturating_add(2);
+        let mut model = Model { n: 0 };
+        for _ in 0..steps {
+            model = recording.step(Msg::Add(1), model, &watched).0;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            steps,
+            "the recorder ran `update` beyond the live step"
+        );
+        assert!(
+            !ran_locked.load(Ordering::SeqCst),
+            "`update` ran under the recorder lock"
+        );
+        let held = session.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(held.buf.overflowed(), "the ring never evicted a step");
+        assert_eq!(
+            held.buf.base(),
+            &Model { n: 2 },
+            "the base is the model after the two evicted steps"
+        );
     }
 }

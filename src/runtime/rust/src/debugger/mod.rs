@@ -177,6 +177,11 @@ mod marked {
         pub fn into_msg(self) -> Msg {
             self.msg
         }
+
+        /// The model that followed the message, dropping the rest of the step.
+        pub fn into_model_after(self) -> Model {
+            self.model_after
+        }
     }
 
     /// The rolling base model and its mark.
@@ -329,6 +334,23 @@ impl<Msg: Clone, Model: Clone, K: StepMark<Msg, Model>> RecordBuffer<Msg, Model,
         {
             let (advanced, _cmd) = update(oldest.into_msg(), self.base.model().clone());
             self.base.set::<Msg>(advanced);
+            self.overflowed = true;
+        }
+        self.log.push_back(Step::new(msg, model_after));
+    }
+
+    /// Record one step whose model the live pass already computed.
+    ///
+    /// On overflow the base advances to the evicted step's recorded model, so
+    /// no `update` runs here: a recorder whose lock another thread reads (the
+    /// exit-time session dump) never runs program code under that lock, and
+    /// the base is the model the run produced, not a re-computation of it.
+    /// The new step is measured once, here, and so is an advanced base.
+    pub fn record_settled(&mut self, msg: Msg, model_after: Model) {
+        if self.log.len() >= self.cap
+            && let Some(oldest) = self.log.pop_front()
+        {
+            self.base.set::<Msg>(oldest.into_model_after());
             self.overflowed = true;
         }
         self.log.push_back(Step::new(msg, model_after));
