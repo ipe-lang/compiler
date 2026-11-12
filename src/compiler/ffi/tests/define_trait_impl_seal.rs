@@ -213,59 +213,32 @@ fn the_marker_surfaces_the_type_and_the_emitted_crate_builds_and_runs() {
     //    its crate-absolute path, and it depends on the wrapper by the driver's
     //    `path` dep line (rewritten to point at the crate we just wrote).
     let bindings = emit_bindings(&pkg);
-    let spawn = wrapper_region(&bindings, "spawn");
-    let label = wrapper_region(&bindings, "label");
-    let iface = crate_interface(&pkg);
-    let mut aliases = String::new();
-    for (name, path) in &iface.opaque_types {
-        use std::fmt::Write as _;
-        let _ = writeln!(aliases, "pub type {name} = {path};");
-    }
-
-    std::fs::create_dir_all(root.join("src")).expect("mkdir app");
+    let ffi_rs = e2e_support::ffi_app::package_module("sprite_wrap", &bindings);
     let wrapper_abs = wrapper_dir.to_string_lossy().to_string();
-    std::fs::write(
-        root.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"define_seal\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
-             [[bin]]\nname = \"define_seal\"\npath = \"src/main.rs\"\n\
-             [dependencies]\nsprite_wrap = {{ path = {wrapper_abs:?} }}\n",
-        ),
-    )
-    .expect("app Cargo.toml");
+    let dependencies = [format!("sprite_wrap = {{ path = {wrapper_abs:?} }}")];
 
-    let main_rs = format!(
-        r#"#![allow(unused_imports, unused_mut, dead_code)]
-pub enum IpeResult<E, T> {{ Ok(T), Err(E) }}
-pub struct IpeError(String);
-pub fn ok_res<T>(t: T) -> IpeResult<IpeError, T> {{ IpeResult::Ok(t) }}
-pub fn str_err(s: &str) -> IpeError {{ IpeError(s.to_string()) }}
-pub fn ipe_error_from_panic(c: &str, _p: Box<dyn std::any::Any + Send>) -> IpeError {{ IpeError(c.to_string()) }}
-pub fn note_foreign_panic(_c: &str, _p: Box<dyn std::any::Any + Send>) -> String {{ String::new() }}
-pub fn note_foreign_error<T: std::fmt::Debug>(_e: T) -> String {{ String::new() }}
-pub fn ipe_error_from_foreign<T: std::fmt::Debug>(_e: T) -> IpeError {{ IpeError("external operation failed".to_string()) }}
-
-{aliases}
-
-{spawn}
-
-{label}
-
-#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
-fn main() {{
-    let sprite = match sprite_wrap_spawn(3) {{
+    let main_rs = r#"#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
+fn main() {
+    let sprite = match ffi::sprite_wrap_spawn(3) {
         IpeResult::Ok(s) => s,
         IpeResult::Err(_) => panic!("spawn failed"),
-    }};
-    let text = match sprite_wrap_label(sprite) {{
+    };
+    let text = match ffi::sprite_wrap_label(sprite) {
         IpeResult::Ok(s) => s,
         IpeResult::Err(_) => panic!("label failed"),
-    }};
-    println!("{{}}", text);
-}}
-"#,
-    );
-    std::fs::write(root.join("src").join("main.rs"), main_rs).expect("app main.rs");
+    };
+    println!("{}", text);
+}
+"#;
+    e2e_support::ffi_app::FfiApp {
+        name: "define_seal",
+        runtime_features: &[],
+        dependencies: &dependencies,
+        ffi_rs: &ffi_rs,
+        main_rs,
+    }
+    .write(&root)
+    .expect("the app crate is written");
 
     let ran = e2e_support::build_and_run_rust("ffi_define_trait_impl", &root);
     assert!(
@@ -377,26 +350,4 @@ fn locate_inspector() -> Option<std::path::PathBuf> {
     let profile_dir = exe.parent()?.parent()?;
     let candidate = profile_dir.join("ipe-ffi-inspector");
     candidate.is_file().then_some(candidate)
-}
-
-/// Extract the sentinel-bracketed wrapper region for `ref_name` from an emitted
-/// `_bindings.rs`, without the preamble.
-fn wrapper_region(bindings: &str, ref_name: &str) -> String {
-    let begin = format!("// IPE-FFI-WRAPPER BEGIN {ref_name}");
-    let mut keep = false;
-    let mut out = String::new();
-    for line in bindings.lines() {
-        if line.trim_end() == begin {
-            keep = true;
-            continue;
-        }
-        if line.trim_end() == "// IPE-FFI-WRAPPER END" && keep {
-            break;
-        }
-        if keep {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out
 }

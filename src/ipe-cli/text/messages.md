@@ -554,6 +554,66 @@ could not bundle the Ipe runtime: {detail}
 
 the Ipe runtime at {path} is version {found}, but this compiler is {expected}; a program emitted by this compiler cannot link a different runtime.
 
+## cli-runtime-tree-refused
+
+the Ipe runtime at {root} cannot be built from: {entry} {reason}
+
+## cli-runtime-tree-link
+
+is a link; replace it with the file or directory it points to, or remove it
+
+## cli-runtime-tree-not-regular
+
+is not a regular file or directory; remove it
+
+## cli-runtime-tree-hard-linked
+
+has more than one hard link; replace it with a copy of its own
+
+## cli-runtime-tree-not-utf8
+
+is not UTF-8 text; rename it or remove it
+
+## cli-runtime-tree-unreadable
+
+cannot be opened or read; check its permissions
+
+## cli-runtime-tree-absent
+
+vanished while it was read, or the crate holds no Cargo.toml; build again once the tree is settled
+
+## cli-runtime-tree-too-deep
+
+nests deeper than {limit} directories
+
+## cli-runtime-tree-too-many-entries
+
+passes the limit of {limit} files and directories in one runtime crate
+
+## cli-runtime-tree-file-too-large
+
+is larger than the limit of {limit} bytes for one runtime file
+
+## cli-runtime-tree-too-large
+
+takes the runtime crate's files past the limit of {limit} bytes together
+
+## cli-runtime-version-unknown
+
+the Ipe runtime at {path} declares no version this compiler can read: its Cargo.toml needs `version = "..."`, or `version.workspace = true` under a workspace that sets `[workspace.package].version`
+
+## cli-release-runtime-override
+
+a release links only the runtime embedded in ipe, but the Ipe runtime at {path} differs from it
+
+## cli-release-runtime-remedy-env-only
+
+  = help: unset IPE_RUNTIME_DIR for a release, or use `ipe dev build` to build against that runtime
+
+## cli-release-runtime-remedy-with-flag
+
+  = help: unset IPE_RUNTIME_DIR and drop --runtime for a release, or use `ipe dev build` to build against that runtime
+
 ## cli-runtime-remedy-env-only
 
   = help: point IPE_RUNTIME_DIR at a runtime crate root of this compiler's version, or unset it to use the runtime embedded in ipe

@@ -1228,7 +1228,8 @@ pub const PRELUDE_QUALIFIERS: &[(&str, &[&str])] = &[
         // `Log` is observability-only — line printing lives in `Ipe.Io`
         // (`Io.println` / `Io.eprintln`).
         // `Ipe.App` — runtime-config front door. `fromEnv` seals an env var
-        // into a `Secret` (the ONLY way to get a config secret);
+        // into a `Secret` (the config-secret source: `Secret.fromString` over a
+        // value that folds to a non-empty literal is refused, IPE-L0150);
         // `fromEnvRequired` is its fail-closed variant (a missing/empty var
         // is a named load-time `ConfigError`, not an empty secret).
         ("App", &["fromEnv", "fromEnvRequired"]),

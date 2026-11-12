@@ -12,4 +12,4 @@ exit: 0
 
   Options:
     --out <dir>        write the standalone project to <dir>, which must be absent or empty and outside out/, .ipe/ and any other ipe-owned tree (required)
-    [--runtime <dir>]  vendor the Ipê runtime source from <dir>
+    [--runtime <dir>]  build against the Ipê runtime crate at <dir> (same as IPE_RUNTIME_DIR); a release refuses a runtime other than the embedded one

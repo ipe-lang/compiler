@@ -109,7 +109,10 @@ jobs:
           tool: nextest@0.9.146
 
       - name: Install bubblewrap
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends bubblewrap
+        uses: ./.github/actions/apt-install
+        with:
+          packages: bubblewrap
+          no-install-recommends: "true"
 
       - name: Build ipe (needed by sandbox_security.rs emit helpers)
         run: cargo build -p ipe

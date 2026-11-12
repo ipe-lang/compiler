@@ -8,6 +8,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod build_warnings;
 mod resolve;
 mod skip_scan;
 mod target_scan;

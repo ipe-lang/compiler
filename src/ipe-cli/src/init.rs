@@ -1059,10 +1059,9 @@ fn place_all<'f>(
         .collect()
 }
 
-/// Write the file's content to the staged file and sync it.
+/// Write the file's content to the staged file; the held writer syncs it.
 fn fill_with(file: &mut std::fs::File, content: &str) -> std::io::Result<()> {
-    file.write_all(content.as_bytes())?;
-    file.sync_all()
+    file.write_all(content.as_bytes())
 }
 
 /// Place one managed file in the held `dir` under the given policy.

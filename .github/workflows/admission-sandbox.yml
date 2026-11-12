@@ -118,9 +118,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install bubblewrap and python3
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends bubblewrap python3
+        uses: ./.github/actions/apt-install
+        with:
+          packages: bubblewrap python3
+          no-install-recommends: "true"
 
       - name: Make scripts executable
         run: chmod +x tools/scripts/admission/jail-linux.sh tests/fixtures/admission/untrusted-build.sh
@@ -174,9 +175,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install bubblewrap and python3
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends bubblewrap python3
+        uses: ./.github/actions/apt-install
+        with:
+          packages: bubblewrap python3
+          no-install-recommends: "true"
 
       - name: Make scripts executable
         run: chmod +x tools/scripts/admission/jail-linux.sh tests/fixtures/admission/untrusted-build.sh

@@ -145,35 +145,26 @@ fn define_enum_builds_and_runs() {
         ]),
         &serde_json::json!(["Clone"]),
     );
-    let msg = wrapper_region(&region, "msg");
+    let ffi_rs = e2e_support::ffi_app::package_module("demo", &region);
 
     let dir = ipe_test_temp::temp_root().join(format!("ipe_ffi_enum_seal_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("src")).expect("mkdir");
-    std::fs::write(
-        dir.join("Cargo.toml"),
-        "[package]\nname = \"enum_seal\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
-         [[bin]]\nname = \"enum_seal\"\npath = \"src/main.rs\"\n",
-    )
-    .expect("Cargo.toml");
+    let main_rs = r#"use ffi::demo::Message;
 
-    let main_rs = format!(
-        r#"// A tiny "crate" fn that consumes the Ipê-defined sum and folds it —
+// A tiny "crate" fn that consumes the Ipê-defined sum and folds it —
 // the exact shape an Iced `update : Message -> Model -> Model` would.
-fn apply(m: &Message, acc: i64) -> i64 {{
-    match m {{
+fn apply(m: &Message, acc: i64) -> i64 {
+    match m {
         Message::Increment => acc + 1,
         Message::Decrement => acc - 1,
         Message::SetValue(v) => *v,
-    }}
-}}
+    }
+}
 
-{msg}
-
-fn main() {{
-    let inc = demo_msg_increment(());
-    let dec = demo_msg_decrement(());
-    let set = demo_msg_set_value(40);
+fn main() {
+    let inc = ffi::demo_msg_increment(());
+    let dec = ffi::demo_msg_decrement(());
+    let set = ffi::demo_msg_set_value(40);
     // The derived `Clone` resolves; each variant constructs; the match folds.
     let inc2 = inc.clone();
     let mut acc = 0;
@@ -182,11 +173,18 @@ fn main() {{
     acc = apply(&dec, acc);
     acc = apply(&set, acc);
     // 0 +1 +1 -1, then SetValue(40) overrides → 40; print 42.
-    println!("{{}}", acc + 2);
-}}
-"#,
-    );
-    std::fs::write(dir.join("src").join("main.rs"), main_rs).expect("main.rs");
+    println!("{}", acc + 2);
+}
+"#;
+    e2e_support::ffi_app::FfiApp {
+        name: "enum_seal",
+        runtime_features: &[],
+        dependencies: &[],
+        ffi_rs: &ffi_rs,
+        main_rs,
+    }
+    .write(&dir)
+    .expect("the app crate is written");
 
     let ran = e2e_support::build_and_run_rust("ffi_define_enum", &dir);
     assert!(
@@ -207,26 +205,4 @@ fn main() {{
         "the constructed variants must construct and match-fold.\nstdout: {stdout}"
     );
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Extract the sentinel-bracketed wrapper region for `ref_name` from an emitted
-/// `_bindings.rs`, without the preamble.
-fn wrapper_region(bindings: &str, ref_name: &str) -> String {
-    let begin = format!("// IPE-FFI-WRAPPER BEGIN {ref_name}");
-    let mut keep = false;
-    let mut out = String::new();
-    for line in bindings.lines() {
-        if line.trim_end() == begin {
-            keep = true;
-            continue;
-        }
-        if line.trim_end() == "// IPE-FFI-WRAPPER END" && keep {
-            break;
-        }
-        if keep {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out
 }

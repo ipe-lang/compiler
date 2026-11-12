@@ -12,9 +12,11 @@
 #![forbid(unsafe_code)]
 
 pub mod bin;
+pub mod ffi_app;
 pub mod live_page;
 pub mod scratch;
 pub mod target;
+pub mod warnings;
 
 pub use bin::{
     ProvenBin, ProvenRuntime, ResolveError, Tier, e2e_tier, require_manifest_dir, require_runtime,
@@ -130,36 +132,56 @@ fn rewrite_package_name(emitted_dir: &Path, golden_name: &str) -> Result<String,
     Ok(unique)
 }
 
-/// Replace the package name in a `Cargo.toml` text with `unique`, returning the
-/// rewritten text (or `None` if no `[package]` `name = "..."` line is present).
+/// The index, among `manifest`'s lines, of the `[package]` table's
+/// `name = "..."` line.
 ///
 /// The `[package]` table is the first section of every emitted manifest, so the
 /// first `name = "..."` line at or after a `[package]` header is the package
 /// name; a `name = ` under `[dependencies]`/`[features]` never precedes it.
-fn replace_package_name(manifest: &str, unique: &str) -> Option<String> {
+fn package_name_line(manifest: &str) -> Option<usize> {
     let mut in_package = false;
-    let mut done = false;
+    for (index, line) in manifest.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            in_package = trimmed.starts_with("[package]");
+        } else if in_package
+            && let Some((lhs, _)) = line.split_once('=')
+            && lhs.trim() == "name"
+        {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// Replace the package name in a `Cargo.toml` text with `unique`, returning the
+/// rewritten text (or `None` if no `[package]` `name = "..."` line is present).
+fn replace_package_name(manifest: &str, unique: &str) -> Option<String> {
+    let target = package_name_line(manifest)?;
     let out = manifest
         .lines()
-        .map(|line| {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with('[') {
-                in_package = trimmed.starts_with("[package]");
-            } else if in_package
-                && !done
-                && trimmed.starts_with("name")
-                && let Some((lhs, _)) = line.split_once('=')
-                && lhs.trim() == "name"
-            {
-                done = true;
-                return format!("name = \"{unique}\"");
+        .enumerate()
+        .map(|(index, line)| {
+            if index == target {
+                format!("name = \"{unique}\"")
+            } else {
+                line.to_owned()
             }
-            line.to_owned()
         })
         .collect::<Vec<_>>()
         .join("\n")
         + if manifest.ends_with('\n') { "\n" } else { "" };
-    done.then_some(out)
+    Some(out)
+}
+
+/// The package name a `Cargo.toml` text declares in its `[package]` table: the
+/// quoted value of the line [`replace_package_name`] rewrites, or `None` when
+/// that line is absent or not a plain non-empty quoted string.
+fn package_name_value(manifest: &str) -> Option<&str> {
+    let line = manifest.lines().nth(package_name_line(manifest)?)?;
+    let (_, value) = line.split_once('=')?;
+    let name = value.trim().strip_prefix('"')?.strip_suffix('"')?;
+    (!name.is_empty() && !name.contains('"')).then_some(name)
 }
 
 /// Parse `cargo build --message-format=json` stdout for the produced binary.
@@ -232,27 +254,81 @@ fn build_emitted_binary_with_env(
     let mut cmd = target::cargo_command(&build_target);
     cmd.arg("build")
         .arg("--locked")
-        .arg("--message-format=json")
         .current_dir(emitted_dir)
         .envs(envs.iter().copied());
-    let build = run_bounded_build(
-        cmd,
-        golden_name,
-        emitted_build_timeout(),
-        emitted_build_idle(),
-    )?;
-    if !build.status.success() {
-        return Err(format!(
-            "{golden_name}: emitted project must build\n--- cargo stderr ---\n{}",
-            String::from_utf8_lossy(&build.stderr)
-        ));
-    }
-
-    let json_stdout = String::from_utf8_lossy(&build.stdout);
+    let json_stdout = checked_cargo_build(cmd, golden_name, &unique_pkg)?;
     let exe = find_executable(&json_stdout, &unique_pkg).ok_or_else(|| {
         format!("{golden_name}: no `executable` artifact for package `{unique_pkg}` in cargo JSON")
     })?;
     Ok(SharedBuild::new(exe, build_target, &unique_pkg))
+}
+
+/// Run the `cargo build` in `cmd` with `--message-format=json` under the build
+/// ceilings, returning cargo's JSON stdout.
+///
+/// The build fails when cargo fails, and also when it prints any warning
+/// attributed to the runtime crate or to `app_package` (see [`warnings`]).
+fn checked_cargo_build(mut cmd: Command, label: &str, app_package: &str) -> Result<String, String> {
+    cmd.arg("--message-format=json");
+    let build = run_bounded_build(cmd, label, emitted_build_timeout(), emitted_build_idle())?;
+    if !build.status.success() {
+        return Err(format!(
+            "{label}: emitted project must build\n--- cargo stderr ---\n{}",
+            String::from_utf8_lossy(&build.stderr)
+        ));
+    }
+    let json_stdout = String::from_utf8_lossy(&build.stdout).into_owned();
+    warnings::refuse_owned_warnings(&json_stdout, app_package).map_err(|refusal| {
+        format!("{label}: emitted project must build without warnings\n{refusal}")
+    })?;
+    Ok(json_stdout)
+}
+
+/// Run a cargo build in `project_dir`, failing on any runtime or app warning.
+///
+/// `cmd` is a [`target::cargo_command`] with its subcommand (`build` or
+/// `check`) and any arguments set. It fails on a cargo failure or on any
+/// warning from the runtime crate or the app crate.
+///
+/// The app crate is the package `project_dir/Cargo.toml` declares, read from
+/// that manifest rather than named by the caller, and the build must report an
+/// artifact for it: a judge keyed on a package the build never compiled would
+/// admit every app warning.
+///
+/// # Errors
+/// Returns a message carrying cargo's stderr when the build fails, every
+/// rendered warning when the runtime or the app crate printed one, or the
+/// reason the app crate could not be identified in the manifest or the build.
+pub fn checked_build(mut cmd: Command, label: &str, project_dir: &Path) -> Result<String, String> {
+    let manifest = project_dir.join("Cargo.toml");
+    let text = std::fs::read_to_string(&manifest)
+        .map_err(|e| format!("{label}: cannot read {}: {e}", manifest.display()))?;
+    let app_package = package_name_value(&text).ok_or_else(|| {
+        format!(
+            "{label}: {} declares no plain `[package]` name",
+            manifest.display()
+        )
+    })?;
+    cmd.current_dir(project_dir);
+    checked_cargo_build(cmd, label, app_package)
+}
+
+/// Build the Cargo project at `project_dir` into `build_target` through
+/// [`checked_build`].
+///
+/// For an emitted project whose package name is fixed by the command under
+/// test, so it cannot go through the renaming [`build_rust_binary`] path.
+///
+/// # Errors
+/// As [`checked_build`].
+pub fn build_project_checked(
+    label: &str,
+    project_dir: &Path,
+    build_target: &target::BuildTarget,
+) -> Result<(), String> {
+    let mut cmd = target::cargo_command(build_target);
+    cmd.arg("build");
+    checked_build(cmd, label, project_dir).map(drop)
 }
 
 /// Resolve the emitted crate's dependency graph ONCE into a per-emit
@@ -746,8 +822,8 @@ mod tests {
     use super::{
         BoundedRun, BoundedRunError, DEFAULT_EMITTED_BUILD_IDLE_SECS,
         DEFAULT_EMITTED_BUILD_TIMEOUT_SECS, OutStream, emitted_build_idle, emitted_build_timeout,
-        ran_exactly_one_passing_test, replace_package_name, rerun_this_test_exact, run_bounded,
-        run_bounded_build, wait_for,
+        package_name_value, ran_exactly_one_passing_test, replace_package_name,
+        rerun_this_test_exact, run_bounded, run_bounded_build, wait_for,
     };
     use std::process::Command;
     use std::time::{Duration, Instant};
@@ -932,6 +1008,16 @@ mod tests {
         let out = replace_package_name(manifest, "uniq").expect("has a package name");
         assert!(out.contains("name = \"uniq\""));
         assert!(out.contains("name = \"other\""));
+    }
+
+    #[test]
+    fn reads_the_package_name_the_rewrite_targets() {
+        let manifest =
+            "[package]\nname = \"app\"\n\n[[bin]]\nname = \"other\"\npath = \"src/main.rs\"\n";
+        assert_eq!(package_name_value(manifest), Some("app"));
+        assert_eq!(package_name_value("[package]\nname = app\n"), None);
+        assert_eq!(package_name_value("[package]\nname = \"\"\n"), None);
+        assert_eq!(package_name_value("[dependencies]\nname = \"x\"\n"), None);
     }
 
     #[test]

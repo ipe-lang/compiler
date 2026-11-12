@@ -87,8 +87,8 @@ pub(crate) fn principal_mint(subject: String) -> Principal {
 /// calls this only on the success branch of token verification, so every
 /// `Principal` in existence carries a subject a valid session proved and
 /// exactly the token's verified payload. Not a registered kernel and not
-/// reachable from Ipê. Gated on `jwt` to match that caller.
-#[cfg(any(feature = "jwt", test))]
+/// reachable from Ipê. Gated on `server` + `jwt`, the caller's own gate.
+#[cfg(any(all(feature = "server", feature = "jwt"), test))]
 #[must_use]
 pub(crate) fn principal_mint_with_claims(
     subject: String,

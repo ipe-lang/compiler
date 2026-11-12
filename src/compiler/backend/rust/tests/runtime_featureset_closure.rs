@@ -63,6 +63,7 @@
 //! an injected drift (a feature dropped from a reference's gate) MUST make the
 //! coverage check fail.
 
+mod native_featureset_closure;
 mod seal_e2e;
 
 #[path = "support/cfg.rs"]

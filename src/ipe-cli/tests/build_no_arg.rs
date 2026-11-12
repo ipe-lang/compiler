@@ -128,14 +128,12 @@ fn build_no_arg_in_project_dir_succeeds() {
         panic!("isolated build target: {isolated:?}")
     };
     let target = e2e_support::target::BuildTarget::Isolated(isolated);
-    let cargo_status = e2e_support::target::cargo_command(&target)
-        .arg("build")
-        .current_dir(&out_dir)
-        .env("IPE_RUNTIME_DIR", &runtime_dir)
-        .status();
+    let mut cargo = e2e_support::target::cargo_command(&target);
+    cargo.arg("build").env("IPE_RUNTIME_DIR", &runtime_dir);
+    let cargo_build = e2e_support::checked_build(cargo, "build_no_arg", &out_dir);
     assert!(
-        matches!(&cargo_status, Ok(s) if s.success()),
-        "cargo build on the emitted project must succeed: {cargo_status:?}"
+        cargo_build.is_ok(),
+        "cargo build on the emitted project must succeed without warnings: {cargo_build:?}"
     );
 
     let _ = fs::remove_dir_all(&dir);
@@ -187,14 +185,12 @@ fn build_flag_first_no_entry_resolves_default() {
         panic!("isolated build target: {isolated:?}")
     };
     let target = e2e_support::target::BuildTarget::Isolated(isolated);
-    let cargo_status = e2e_support::target::cargo_command(&target)
-        .arg("build")
-        .current_dir(&crate_dir)
-        .env("IPE_RUNTIME_DIR", &runtime_dir)
-        .status();
+    let mut cargo = e2e_support::target::cargo_command(&target);
+    cargo.arg("build").env("IPE_RUNTIME_DIR", &runtime_dir);
+    let cargo_build = e2e_support::checked_build(cargo, "build_flagfirst", &crate_dir);
     assert!(
-        matches!(&cargo_status, Ok(s) if s.success()),
-        "cargo build on the emitted project must succeed: {cargo_status:?}"
+        cargo_build.is_ok(),
+        "cargo build on the emitted project must succeed without warnings: {cargo_build:?}"
     );
 
     let _ = fs::remove_dir_all(&dir);

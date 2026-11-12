@@ -8,8 +8,8 @@
 //! it — the result round-trips.
 //!
 //! Three return shapes are exercised — `Total(scalar)`, `Result` and
-//! `Option` — against a tiny shim standing in for `use crate::*`. A second
-//! build links the REAL runtime crate and drives an Ipê closure that recurses
+//! `Option` — in an app crate linked against the real runtime. A second
+//! build drives an Ipê closure that recurses
 //! past the depth limit through the `Total` and `Option` adapters: the
 //! process ends typed (status 1, the limit on stderr), never by `abort` and
 //! never as a silent `None`.
@@ -121,111 +121,64 @@ fn closure_adapter_builds_and_runs() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let total_region = emit_closure("Fn(Int) -> Int + Send + Sync + 'static");
-    let result_region = emit_closure("Fn(Int) -> Result<Int, Error> + Send + Sync + 'static");
-    let option_region = emit_closure("Fn(Int) -> Option<Int> + Send + Sync + 'static");
-    // Keep only the sentinel-bracketed wrapper regions; drop the emitted
-    // preamble (`use crate::*;`, the panic fence) — this fixture supplies its
-    // own minimal glue instead of the runtime crate.
-    let total_fn = wrapper_region(&total_region, "apply_fn");
-    let result_fn = wrapper_region(&result_region, "apply_fn");
-    let option_fn = wrapper_region(&option_region, "apply_fn");
+    // One module per return shape: each holds the whole emitted bindings, so
+    // the three `demo_apply_fn` adapters coexist without renaming.
+    let ffi_rs = format!(
+        "pub mod total {{\n{}}}\npub mod result {{\n{}}}\npub mod option {{\n{}}}\n",
+        emit_closure("Fn(Int) -> Int + Send + Sync + 'static"),
+        emit_closure("Fn(Int) -> Result<Int, Error> + Send + Sync + 'static"),
+        emit_closure("Fn(Int) -> Option<Int> + Send + Sync + 'static"),
+    );
 
     let dir =
         ipe_test_temp::temp_root().join(format!("ipe_ffi_closure_seal_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("src")).expect("mkdir");
-    std::fs::write(
-        dir.join("Cargo.toml"),
-        "[package]\nname = \"closure_seal\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
-         [[bin]]\nname = \"closure_seal\"\npath = \"src/main.rs\"\n\
-         # catch_unwind soundness requires panic=unwind (the emitter's own fence)\n\
-         [profile.dev]\npanic = \"unwind\"\n",
-    )
-    .expect("Cargo.toml");
-
-    // A minimal stand-in for the runtime glue the emitted arms name
-    // (`str_err`, `IpeError`, the panic funnel, the unwind classifier and the
-    // no-error-channel terminal), with the runtime's signatures.
-    let main_rs = format!(
-        r#"// Minimal runtime glue the emitted Result adapter references.
-#[derive(Debug)]
-pub struct IpeError(String);
-pub fn str_err<E: From<String>>(s: &str) -> E {{ s.to_string().into() }}
-pub fn ipe_error_from_panic<E: From<String>>(c: &str, _p: Box<dyn std::any::Any + Send>) -> E {{ c.to_string().into() }}
-pub fn note_foreign_panic(_c: &str, _p: Box<dyn std::any::Any + Send>) -> String {{ String::new() }}
-pub fn note_foreign_error<T: std::fmt::Debug>(_e: T) -> String {{ String::new() }}
-pub fn ipe_error_from_foreign<T: std::fmt::Debug, E: From<String>>(_e: T) -> E {{ "external operation failed".to_string().into() }}
-impl From<String> for IpeError {{ fn from(s: String) -> Self {{ IpeError(s) }} }}
-#[derive(Debug, Clone, Copy)]
-pub struct RuntimeTrip;
-pub enum ClosureUnwind {{ Trip(RuntimeTrip), Foreign(Box<dyn std::any::Any + Send>) }}
-pub fn closure_unwind(p: Box<dyn std::any::Any + Send>) -> ClosureUnwind {{
-    match p.downcast::<RuntimeTrip>() {{ Ok(t) => ClosureUnwind::Trip(*t), Err(p) => ClosureUnwind::Foreign(p) }}
-}}
-pub fn end_on_unchanneled_unwind(_c: &'static str, _u: ClosureUnwind) -> ! {{ std::process::exit(1) }}
-
-// A tiny "crate" fn that takes the boxed closure and calls it — the exact
+    let main_rs = r#"// A tiny "crate" fn that takes the boxed closure and calls it — the exact
 // shape an Iced `update` / Ratatui `draw` driver would.
-fn crate_takes_total(f: Box<dyn Fn(i64) -> i64 + Send + Sync + 'static>) -> i64 {{
+fn crate_takes_total(f: Box<dyn Fn(i64) -> i64 + Send + Sync + 'static>) -> i64 {
     // Multi-call: the boxed closure fires more than once.
     f(20) + f(22)
-}}
+}
 fn crate_takes_result(
     f: Box<dyn Fn(i64) -> Result<i64, IpeError> + Send + Sync + 'static>,
-) -> i64 {{
+) -> i64 {
     f(41).map(|n| n + 1).unwrap_or(-1)
-}}
-fn crate_takes_option(f: Box<dyn Fn(i64) -> Option<i64> + Send + Sync + 'static>) -> i64 {{
+}
+fn crate_takes_option(f: Box<dyn Fn(i64) -> Option<i64> + Send + Sync + 'static>) -> i64 {
     f(5).unwrap_or(-1)
-}}
+}
 
-{total_fn}
-
-{result_fn}
-
-{option_fn}
-
-fn main() {{
+fn main() {
     // The Ipê function value: on the app side this is exactly a
     // `Box<dyn Fn(..) -> R + Send + Sync + 'static>`. Supply one and pass it
     // through the adapter, then hand the crate the boxed closure it returns.
     let ipe_total: Box<dyn Fn(i64) -> i64 + Send + Sync + 'static> = Box::new(|x| x + 1);
-    let adapted_total = demo_apply_fn_total(ipe_total);
-    let total = crate_takes_total(adapted_total);
+    let total = crate_takes_total(ffi::total::demo_apply_fn(ipe_total));
 
     let ipe_result: Box<dyn Fn(i64) -> Result<i64, IpeError> + Send + Sync + 'static> =
-        Box::new(|x| Ok(x));
-    let adapted_result = demo_apply_fn_result(ipe_result);
-    let result = crate_takes_result(adapted_result);
+        Box::new(Ok);
+    let result = crate_takes_result(ffi::result::demo_apply_fn(ipe_result));
 
     let ipe_option: Box<dyn Fn(i64) -> Option<i64> + Send + Sync + 'static> =
         Box::new(|x| Some(x * 2));
-    let option = crate_takes_option(demo_apply_fn_option(ipe_option));
+    let option = crate_takes_option(ffi::option::demo_apply_fn(ipe_option));
     assert_eq!(option, 10, "option-return closure round-trip");
 
     // (20+1) + (22+1) = 43 ; (41 -> Ok(41)) + 1 = 42
     assert_eq!(total, 44, "total-return closure round-trip");
     assert_eq!(result, 42, "result-return closure round-trip");
-    println!("{{total}} {{result}}");
-}}
-"#,
-        // Rename the two wrappers AND their handle aliases so both regions can
-        // coexist in one bin (the alias name is region-derived, so both emit
-        // `ApplyFnClosure` — disambiguate them here). A type alias IS the
-        // underlying box, so the renamed-alias return still passes to the
-        // `crate_takes_*` fns that take the raw `Box<dyn Fn …>`.
-        total_fn = total_fn
-            .replace("pub fn demo_apply_fn(", "pub fn demo_apply_fn_total(")
-            .replace("ApplyFnClosure", "ApplyFnClosureTotal"),
-        result_fn = result_fn
-            .replace("pub fn demo_apply_fn(", "pub fn demo_apply_fn_result(")
-            .replace("ApplyFnClosure", "ApplyFnClosureResult"),
-        option_fn = option_fn
-            .replace("pub fn demo_apply_fn(", "pub fn demo_apply_fn_option(")
-            .replace("ApplyFnClosure", "ApplyFnClosureOption"),
-    );
-    std::fs::write(dir.join("src").join("main.rs"), main_rs).expect("main.rs");
+    println!("{total} {result}");
+}
+"#;
+    e2e_support::ffi_app::FfiApp {
+        name: "closure_seal",
+        runtime_features: &[],
+        dependencies: &[],
+        ffi_rs: &ffi_rs,
+        main_rs,
+    }
+    .write(&dir)
+    .expect("the app crate is written");
 
     let ran = e2e_support::build_and_run_rust("ffi_closure_adapter", &dir);
     assert!(
@@ -248,28 +201,6 @@ fn main() {{
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Extract the sentinel-bracketed wrapper region for `ref_name` from an emitted
-/// `_bindings.rs`, without the preamble.
-fn wrapper_region(bindings: &str, ref_name: &str) -> String {
-    let begin = format!("// IPE-FFI-WRAPPER BEGIN {ref_name}");
-    let mut keep = false;
-    let mut out = String::new();
-    for line in bindings.lines() {
-        if line.trim_end() == begin {
-            keep = true;
-            continue;
-        }
-        if line.trim_end() == "// IPE-FFI-WRAPPER END" && keep {
-            break;
-        }
-        if keep {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out
-}
-
 /// SEAL proof under `IPE_E2E=1`: the emitted `Total` and `Option` adapters,
 /// linked against the real runtime, end the process typed when the Ipê closure
 /// they call trips the recursion limit — status 1 (never 134), the limit named
@@ -279,68 +210,50 @@ fn ffi_closure_trip_ends_typed() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let total_fn = wrapper_region(
-        &emit_closure("Fn(Int) -> Int + Send + Sync + 'static"),
-        "apply_fn",
-    )
-    .replace("pub fn demo_apply_fn(", "pub fn demo_apply_fn_total(")
-    .replace("ApplyFnClosure", "ApplyFnClosureTotal");
-    let option_fn = wrapper_region(
-        &emit_closure("Fn(Int) -> Option<Int> + Send + Sync + 'static"),
-        "apply_fn",
-    )
-    .replace("pub fn demo_apply_fn(", "pub fn demo_apply_fn_option(")
-    .replace("ApplyFnClosure", "ApplyFnClosureOption");
+    let ffi_rs = format!(
+        "pub mod total {{\n{}}}\npub mod option {{\n{}}}\n",
+        emit_closure("Fn(Int) -> Int + Send + Sync + 'static"),
+        emit_closure("Fn(Int) -> Option<Int> + Send + Sync + 'static"),
+    );
 
-    let runtime = e2e_support::require_runtime_crate();
     let dir =
         ipe_test_temp::temp_root().join(format!("ipe_ffi_closure_trip_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("src")).expect("mkdir");
-    std::fs::write(
-        dir.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"closure_trip\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\
-             [[bin]]\nname = \"closure_trip\"\npath = \"src/main.rs\"\n\
-             [dependencies]\nipe-runtime-rust = {{ path = {:?} }}\n\
-             [profile.dev]\npanic = \"unwind\"\n",
-            runtime.display().to_string()
-        ),
-    )
-    .expect("Cargo.toml");
 
     // `deep` is the shape every emitted Ipê function body takes: a depth guard
-    // at the top, then the (here unbounded) recursive call.
-    let main_rs = format!(
-        r#"#![allow(unused_imports, unconditional_recursion)]
-use ipe_runtime_rust::*;
-
-fn deep(n: i64) -> i64 {{
+    // at the top, then a recursive call no input in this fixture ever stops.
+    let main_rs = r#"fn deep(n: i64) -> i64 {
     let _guard = recursion_guard();
+    if n < 0 {
+        return n;
+    }
     deep(n.wrapping_add(1)).wrapping_add(1)
-}}
+}
 
-{total_fn}
-
-{option_fn}
-
-fn main() {{
+fn main() {
     println!("start");
-    match std::env::args().nth(1).as_deref() {{
-        Some("total") => {{
-            let f = demo_apply_fn_total(Box::new(deep));
-            println!("total returned {{}}", f(0));
-        }}
-        Some("option") => {{
-            let f = demo_apply_fn_option(Box::new(|n| Some(deep(n))));
-            println!("option returned {{:?}}", f(0));
-        }}
+    match std::env::args().nth(1).as_deref() {
+        Some("total") => {
+            let f = ffi::total::demo_apply_fn(Box::new(deep));
+            println!("total returned {}", f(0));
+        }
+        Some("option") => {
+            let f = ffi::option::demo_apply_fn(Box::new(|n| Some(deep(n))));
+            println!("option returned {:?}", f(0));
+        }
         _ => println!("unknown mode"),
-    }}
-}}
-"#
-    );
-    std::fs::write(dir.join("src").join("main.rs"), main_rs).expect("main.rs");
+    }
+}
+"#;
+    e2e_support::ffi_app::FfiApp {
+        name: "closure_trip",
+        runtime_features: &[],
+        dependencies: &[],
+        ffi_rs: &ffi_rs,
+        main_rs,
+    }
+    .write(&dir)
+    .expect("the app crate is written");
 
     let outcome = e2e_support::build_rust_binary("ffi_closure_trip", &dir);
     assert!(

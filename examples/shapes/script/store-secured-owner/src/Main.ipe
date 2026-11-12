@@ -28,6 +28,7 @@ module Main exposing (main)
 -- served. The SEAL is that the emitted crate `cargo build`s under `IPE_E2E=1` —
 -- `ipe` accepting this program (exit 0) must imply a buildable emitted crate.
 
+import Ipe.App as App
 import Ipe.Auth as Auth
 import Ipe.Codec as Codec exposing (Codec)
 import Ipe.Db as Db exposing (Db)
@@ -38,9 +39,7 @@ import Ipe.Http.Server exposing (Request, Response)
 import Ipe.Io as Io
 import Ipe.List as List
 import Ipe.Result as Result exposing (Result(..))
-import Ipe.Secret as Secret
 import Ipe.String as String
-import Ipe.System as System
 import Ipe.Task as Task exposing (Task)
 
 
@@ -136,7 +135,7 @@ handleMyNotes _ principal =
 authCfg : Server.AuthConfig
 authCfg =
     Server.authConfig
-        (Secret.fromString (System.getenvOr "SIGNING_KEY" "this-is-a-32-byte-or-longer-secret-key-value"))
+        (App.fromEnvRequired "SIGNING_KEY")
         Server.bearerToken
 
 

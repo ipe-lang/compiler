@@ -958,12 +958,14 @@ static HAND_TABLE: &[EnvVar] = &[
     EnvVar {
         name: "IPE_RUNTIME_DIR",
         default: Cow::Borrowed("unset (the runtime embedded in the compiler)"),
-        purpose: "Path to a runtime crate root, or to a path under one, for a \
-                  developer build; `--runtime` wins over it. The root found by a \
-                  bounded upward walk must declare the compiler's version, or the \
-                  build is refused. A vendored build copies that root's module \
-                  tree; a linked build bundles the compiler's own runtime. A \
-                  package gate ignores it.",
+        purpose: "Path to a runtime crate root, or to a path under one; \
+                  `--runtime` wins over it. The root found by a bounded upward walk \
+                  is captured once and must declare the compiler's version, or the \
+                  build is refused; a link, a non-regular file, or a tree past its \
+                  ceilings is refused too. Both shapes build that crate: a vendored \
+                  build copies its module tree, a linked build bundles it. A release \
+                  refuses a runtime other than the embedded one, and a package gate \
+                  ignores it.",
         subsystem: Subsystem::Runtime,
         class: Class::Tunable,
     },

@@ -23,11 +23,13 @@
 //! 3. `$HOME/.ipe` — the default, when `HOME` is absolute.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use include_dir::{Dir, include_dir};
 use ipe_backend_rust::RuntimeContentId;
+use ipe_fs_open::{ByteCap, EntryCap, EntryName, FileKind, HeldDir, OpenRefusal};
 
 use crate::CliError;
 
@@ -51,51 +53,93 @@ pub const COMPILER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// — never walked past to a wrong runtime.
 pub const RUNTIME_PACKAGE: &str = "ipe-runtime-rust";
 
-/// A runtime crate root an operator named, proved by the override walk.
+/// A runtime crate root an operator named, proved and captured by the override walk.
 ///
 /// The only constructor is that walk: it found, within
 /// [`RUNTIME_LOOKUP_CEILING`] ancestors of the named path, a `Cargo.toml`
-/// declaring [`RUNTIME_PACKAGE`] at [`COMPILER_VERSION`]. An empty,
-/// wrong-package or other-version directory has no `ProvenRoot`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// declaring [`RUNTIME_PACKAGE`], captured the crate through held handles,
+/// and read [`COMPILER_VERSION`] from the captured manifest. An empty,
+/// wrong-package, other-version or unreadable directory has no `ProvenRoot`.
+/// The capture is the proof and the payload: nothing rereads the root.
+#[derive(Clone, Debug)]
 pub struct ProvenRoot {
+    /// The named root, made absolute, for display only.
     root: PathBuf,
+    /// The captured crate and its per-role stamps.
+    captured: Arc<CapturedRuntime>,
+}
+
+impl PartialEq for ProvenRoot {
+    fn eq(&self, other: &Self) -> bool {
+        self.root == other.root && self.captured.tree.digest == other.captured.tree.digest
+    }
+}
+
+impl Eq for ProvenRoot {}
+
+/// One captured runtime crate and the stamps computed from it for this command.
+#[derive(Debug)]
+struct CapturedRuntime {
+    /// The captured crate.
+    tree: RuntimeTree,
+    /// The capture stamped for [`BundleRole::Out`], computed on first use.
+    out: OnceLock<Result<BundledRuntime, BundleFault>>,
+    /// The capture stamped for [`BundleRole::Scratch`], computed on first use.
+    scratch: OnceLock<Result<BundledRuntime, BundleFault>>,
+}
+
+impl CapturedRuntime {
+    /// The capture stamped for `role`, computed once per command.
+    fn bundled(&self, role: BundleRole) -> Result<&BundledRuntime, CliError> {
+        let slot = match role {
+            BundleRole::Out => &self.out,
+            BundleRole::Scratch => &self.scratch,
+        };
+        slot.get_or_init(|| self.tree.stamp(role))
+            .as_ref()
+            .map_err(BundleFault::to_error)
+    }
 }
 
 impl ProvenRoot {
-    /// The canonical crate root.
+    /// The named crate root, made absolute; a display name, never reopened.
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// Prove the runtime crate root at or above `path`.
+    /// The captured crate.
+    #[must_use]
+    pub fn tree(&self) -> &RuntimeTree {
+        &self.captured.tree
+    }
+
+    /// Prove and capture the runtime crate root at or above `path`.
     ///
     /// # Errors
     /// [`CliError::RuntimeDirInvalid`] when no runtime crate root lies within
-    /// the ceiling at or above `path`; [`CliError::RuntimeVersionMismatch`]
-    /// when the nearest one declares another version; [`CliError::Io`] when it
-    /// cannot be canonicalized. Each refusal offers `remedy`.
+    /// the ceiling at or above `path`; [`CliError::RuntimeTreeRefused`] when the
+    /// nearest one cannot be captured; [`CliError::RuntimeVersionMismatch`]
+    /// when it declares another version; [`CliError::RuntimeVersionUnknown`]
+    /// when its version cannot be read. Each refusal offers `remedy`.
     fn prove(path: &Path, remedy: RuntimeRemedy) -> Result<Self, CliError> {
         // The crate root itself or any path inside it (`…/rust/src`,
         // `…/src/ipe_runtime`) names the crate.
         for dir in RUNTIME_LOOKUP_CEILING.ancestors(path) {
-            let Some(version) = runtime_version_at(dir) else {
+            let Ok(held) = HeldDir::open_root(dir) else {
                 continue;
             };
-            let root = dir.canonicalize().map_err(|e| CliError::Io {
-                path: dir.to_path_buf(),
-                source: e,
-            })?;
-            if version != COMPILER_VERSION {
-                return Err(CliError::RuntimeVersionMismatch {
-                    path: root,
-                    found: version,
-                    expected: COMPILER_VERSION.to_owned(),
-                    remedy,
-                });
+            let display = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+            let refused = |refusal: RuntimeTreeRefusal| CliError::RuntimeTreeRefused {
+                path: display.clone(),
+                refusal,
+                remedy,
+            };
+            if !declares_runtime_package(&held).map_err(refused)? {
+                continue;
             }
-            return Ok(Self { root });
+            let raw = capture_tree(&held).map_err(refused)?;
+            return Self::from_capture(&held, raw, display, remedy);
         }
         let points_at_inner = path.file_name() == Some(std::ffi::OsStr::new("ipe_runtime"))
             || path.ends_with("rust/src")
@@ -106,34 +150,431 @@ impl ProvenRoot {
             remedy,
         })
     }
+
+    /// The proven root over the capture `raw` of `held`, its identity and
+    /// version read from the captured manifest.
+    fn from_capture(
+        held: &HeldDir,
+        raw: BTreeMap<PathBuf, String>,
+        root: PathBuf,
+        remedy: RuntimeRemedy,
+    ) -> Result<Self, CliError> {
+        let declared = raw
+            .get(Path::new(MANIFEST))
+            .and_then(|manifest| runtime_identity(manifest));
+        let found = match declared {
+            None => {
+                return Err(CliError::RuntimeDirInvalid {
+                    path: root,
+                    points_at_inner: false,
+                    remedy,
+                });
+            }
+            Some(DeclaredVersion::Concrete(version)) => Some(version),
+            Some(DeclaredVersion::Inherited) => workspace_version(held),
+            Some(DeclaredVersion::Unknown) => None,
+        };
+        let Some(found) = found else {
+            return Err(CliError::RuntimeVersionUnknown { path: root, remedy });
+        };
+        if found != COMPILER_VERSION {
+            return Err(CliError::RuntimeVersionMismatch {
+                path: root,
+                found,
+                expected: COMPILER_VERSION.to_owned(),
+                remedy,
+            });
+        }
+        let tree = RuntimeTree::from_raw(raw).map_err(|fault| fault.to_error())?;
+        Ok(Self {
+            root,
+            captured: Arc::new(CapturedRuntime {
+                tree,
+                out: OnceLock::new(),
+                scratch: OnceLock::new(),
+            }),
+        })
+    }
 }
 
 /// The relative path, from a runtime crate root, of the manifest.
 const MANIFEST: &str = "Cargo.toml";
 
-/// Read a candidate crate root's manifest and return its declared version iff the
-/// manifest declares the runtime package. `None` means "not a runtime crate
-/// root" — the caller treats that as a hard refusal, never a walk-on.
-fn runtime_version_at(root: &Path) -> Option<String> {
-    let text =
-        crate::io_bounded::read_named_in(root, &[MANIFEST], crate::io_bounded::SMALL_FILE_CAP)
-            .ok()?;
-    let declares_package = text
-        .lines()
-        .any(|l| l.trim() == format!("name = \"{RUNTIME_PACKAGE}\""));
-    if !declares_package {
+/// The version a runtime manifest declares.
+#[derive(Debug, PartialEq, Eq)]
+enum DeclaredVersion {
+    /// `version = "…"`.
+    Concrete(String),
+    /// `version.workspace = true`: the enclosing workspace's version.
+    Inherited,
+    /// No version key, or one of another shape.
+    Unknown,
+}
+
+/// The version `manifest` declares when its `[package].name` is
+/// [`RUNTIME_PACKAGE`]; `None` when it is not the runtime crate's manifest.
+fn runtime_identity(manifest: &str) -> Option<DeclaredVersion> {
+    let doc = manifest.parse::<toml_edit::DocumentMut>().ok()?;
+    let package = doc.get("package")?.as_table_like()?;
+    if package.get("name")?.as_str()? != RUNTIME_PACKAGE {
         return None;
     }
-    // A standalone crate carries a concrete `version = "…"`; an in-repo crate
-    // inherits it via `version.workspace = true`. In-repo, the version is the
-    // compiler's own (both are the workspace version), so report that.
-    let concrete = text.lines().find_map(|l| {
-        let l = l.trim();
-        l.strip_prefix("version = \"")
-            .and_then(|rest| rest.strip_suffix('"'))
-            .map(str::to_owned)
-    });
-    Some(concrete.unwrap_or_else(|| COMPILER_VERSION.to_owned()))
+    Some(
+        package
+            .get("version")
+            .map_or(DeclaredVersion::Unknown, declared_version),
+    )
+}
+
+/// The version a `[package].version` item declares.
+fn declared_version(item: &toml_edit::Item) -> DeclaredVersion {
+    if let Some(concrete) = item.as_str() {
+        return DeclaredVersion::Concrete(concrete.to_owned());
+    }
+    let inherited = item
+        .as_table_like()
+        .and_then(|table| table.get("workspace"))
+        .and_then(toml_edit::Item::as_bool)
+        == Some(true);
+    if inherited {
+        DeclaredVersion::Inherited
+    } else {
+        DeclaredVersion::Unknown
+    }
+}
+
+/// The entry name of the manifest.
+fn manifest_name() -> Option<EntryName> {
+    EntryName::new(std::ffi::OsStr::new(MANIFEST))
+}
+
+/// Whether `held` holds a manifest declaring [`RUNTIME_PACKAGE`].
+///
+/// An absent manifest is "not a runtime root"; a manifest present but not
+/// readable as a regular file is refused, never walked past.
+fn declares_runtime_package(held: &HeldDir) -> Result<bool, RuntimeTreeRefusal> {
+    let refusal = |reason| RuntimeTreeRefusal {
+        path: PathBuf::from(MANIFEST),
+        reason,
+    };
+    let name = manifest_name().ok_or_else(|| refusal(RuntimeTreeReason::Unreadable))?;
+    let file = match held.open_regular(&name) {
+        Ok(file) => file,
+        Err(OpenRefusal::Absent | OpenRefusal::NotRegular(FileKind::Dir)) => return Ok(false),
+        Err(other) => return Err(refusal(RuntimeTreeReason::of(other))),
+    };
+    let text = file
+        .read_utf8(crate::io_bounded::SMALL_FILE_CAP)
+        .map_err(|e| refusal(RuntimeTreeReason::of(e)))?;
+    Ok(runtime_identity(&text).is_some())
+}
+
+/// The `[workspace.package].version` of the first manifest above `root`
+/// holding a `[workspace]` table, each level opened through the held parent
+/// and never through a link; `None` when there is none within the ceiling or
+/// a level cannot be read.
+fn workspace_version(root: &HeldDir) -> Option<String> {
+    let name = manifest_name()?;
+    let AncestorCeiling(ceiling) = RUNTIME_LOOKUP_CEILING;
+    let mut level = root.parent().ok()??;
+    for _ in 1..ceiling {
+        match level.open_regular(&name) {
+            Ok(file) => {
+                let text = file.read_utf8(crate::io_bounded::SMALL_FILE_CAP).ok()?;
+                let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
+                if let Some(workspace) = doc.get("workspace") {
+                    return workspace
+                        .as_table_like()?
+                        .get("package")?
+                        .as_table_like()?
+                        .get("version")?
+                        .as_str()
+                        .map(str::to_owned);
+                }
+            }
+            Err(OpenRefusal::Absent) => {}
+            Err(_) => return None,
+        }
+        level = level.parent().ok()??;
+    }
+    None
+}
+
+/// The root directories neither the embedded bundle nor a capture carries.
+///
+/// `tests/` is not needed to build the crate as a path dependency, and
+/// `target/` is a build's output, never its source.
+const SKIPPED_ROOT_DIRS: &[&str] = &["tests", "target"];
+
+/// The deepest directory nesting a captured runtime tree may hold.
+pub const RUNTIME_TREE_DEPTH: usize = 16;
+
+/// The most entries, files and directories together, a captured runtime tree may hold.
+pub const RUNTIME_TREE_ENTRIES: u32 = 4096;
+
+/// The largest single file a captured runtime tree may hold, in bytes.
+pub const RUNTIME_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The most bytes all files of a captured runtime tree may hold together.
+pub const RUNTIME_TREE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// [`RUNTIME_FILE_BYTES`] as a [`ByteCap`].
+const RUNTIME_FILE_CAP: ByteCap =
+    ByteCap::from_nonzero(const { NonZeroU64::MIN.saturating_add(RUNTIME_FILE_BYTES - 1) });
+
+/// Why a runtime tree was not captured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeTreeReason {
+    /// A link (or reparse point) stands below the root.
+    Link,
+    /// A FIFO, socket, device or other non-regular entry.
+    NotRegular,
+    /// A file with more than one hard link, so it may be shared with a path outside the tree.
+    HardLinked,
+    /// A file, or an entry name, that is not UTF-8.
+    NotUtf8,
+    /// The entry could not be opened or read.
+    Unreadable,
+    /// A directory nested deeper than [`RUNTIME_TREE_DEPTH`].
+    TooDeep,
+    /// More than [`RUNTIME_TREE_ENTRIES`] entries.
+    TooManyEntries,
+    /// A file larger than [`RUNTIME_FILE_BYTES`].
+    FileTooLarge,
+    /// Files larger than [`RUNTIME_TREE_BYTES`] together.
+    TreeTooLarge,
+    /// The root vanished, or holds no manifest.
+    Absent,
+}
+
+impl RuntimeTreeReason {
+    /// The reason an open or read refusal names.
+    const fn of(refusal: OpenRefusal) -> Self {
+        match refusal {
+            OpenRefusal::Absent => Self::Absent,
+            OpenRefusal::Link => Self::Link,
+            OpenRefusal::NotRegular(_) => Self::NotRegular,
+            OpenRefusal::NotUtf8 => Self::NotUtf8,
+            OpenRefusal::TooLarge(_) => Self::FileTooLarge,
+            OpenRefusal::TooManyEntries(_) => Self::TooManyEntries,
+            OpenRefusal::Denied
+            | OpenRefusal::InUse
+            | OpenRefusal::BadName
+            | OpenRefusal::Io(_) => Self::Unreadable,
+        }
+    }
+}
+
+/// A runtime tree refused by the capture: the entry, relative to the crate root, and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeTreeRefusal {
+    /// The refused entry, relative to the crate root.
+    pub path: PathBuf,
+    /// Why it was refused.
+    pub reason: RuntimeTreeReason,
+}
+
+/// The running totals of one capture.
+struct CaptureWalk {
+    /// Every captured file, relative to the crate root, with its text.
+    files: BTreeMap<PathBuf, String>,
+    /// Entries listed so far.
+    entries: u32,
+    /// File bytes read so far.
+    bytes: u64,
+}
+
+/// Capture every file of the runtime crate `root` holds, through held
+/// handles, never following a link below it, under the tree ceilings.
+///
+/// The root directories [`SKIPPED_ROOT_DIRS`] names are not listed.
+fn capture_tree(root: &HeldDir) -> Result<BTreeMap<PathBuf, String>, RuntimeTreeRefusal> {
+    let mut walk = CaptureWalk {
+        files: BTreeMap::new(),
+        entries: 0,
+        bytes: 0,
+    };
+    capture_dir(root, Path::new(""), 0, &mut walk)?;
+    if !walk.files.contains_key(Path::new(MANIFEST)) {
+        return Err(RuntimeTreeRefusal {
+            path: PathBuf::from(MANIFEST),
+            reason: RuntimeTreeReason::Absent,
+        });
+    }
+    Ok(walk.files)
+}
+
+/// Capture `dir`, at `rel` and nesting `depth` below the root, into `walk`.
+fn capture_dir(
+    dir: &HeldDir,
+    rel: &Path,
+    depth: usize,
+    walk: &mut CaptureWalk,
+) -> Result<(), RuntimeTreeRefusal> {
+    let refuse = |path: PathBuf, reason| RuntimeTreeRefusal { path, reason };
+    // Each level lists at most the budget left, so the whole walk holds at
+    // most the tree ceiling of names; the floor of one lets a full budget
+    // still see that one more entry exists.
+    let left = RUNTIME_TREE_ENTRIES.saturating_sub(walk.entries).max(1);
+    let cap = EntryCap::new(left)
+        .ok_or_else(|| refuse(rel.to_path_buf(), RuntimeTreeReason::TooManyEntries))?;
+    let listing = dir
+        .entries(cap)
+        .map_err(|e| refuse(rel.to_path_buf(), RuntimeTreeReason::of(e)))?;
+    for (name, kind) in listing {
+        walk.entries = walk.entries.saturating_add(1);
+        let Some(spelled) = name.as_os_str().to_str() else {
+            return Err(refuse(
+                rel.join(name.as_os_str()),
+                RuntimeTreeReason::NotUtf8,
+            ));
+        };
+        let child = rel.join(spelled);
+        if walk.entries > RUNTIME_TREE_ENTRIES {
+            return Err(refuse(child, RuntimeTreeReason::TooManyEntries));
+        }
+        if depth == 0 && SKIPPED_ROOT_DIRS.contains(&spelled) {
+            continue;
+        }
+        match kind {
+            FileKind::Dir => {
+                if depth >= RUNTIME_TREE_DEPTH {
+                    return Err(refuse(child, RuntimeTreeReason::TooDeep));
+                }
+                let sub = dir
+                    .child_dir(&name)
+                    .map_err(|e| refuse(child.clone(), RuntimeTreeReason::of(e)))?;
+                capture_dir(&sub, &child, depth.saturating_add(1), walk)?;
+            }
+            FileKind::Regular => {
+                let text = capture_file(dir, &name, walk.bytes)
+                    .map_err(|reason| refuse(child.clone(), reason))?;
+                walk.bytes = walk
+                    .bytes
+                    .saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
+                if walk.bytes > RUNTIME_TREE_BYTES {
+                    return Err(refuse(child, RuntimeTreeReason::TreeTooLarge));
+                }
+                walk.files.insert(child, text);
+            }
+            FileKind::Symlink => return Err(refuse(child, RuntimeTreeReason::Link)),
+            FileKind::Fifo | FileKind::Socket | FileKind::Device | FileKind::Other => {
+                return Err(refuse(child, RuntimeTreeReason::NotRegular));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read the regular file `name` of `dir` as text, given `read` bytes already
+/// captured; refused before any read when it would pass a ceiling.
+fn capture_file(dir: &HeldDir, name: &EntryName, read: u64) -> Result<String, RuntimeTreeReason> {
+    let file = dir.open_regular(name).map_err(RuntimeTreeReason::of)?;
+    if file.link_count().map_err(RuntimeTreeReason::of)? != 1 {
+        return Err(RuntimeTreeReason::HardLinked);
+    }
+    if file.len() > RUNTIME_FILE_BYTES {
+        return Err(RuntimeTreeReason::FileTooLarge);
+    }
+    if read.saturating_add(file.len()) > RUNTIME_TREE_BYTES {
+        return Err(RuntimeTreeReason::TreeTooLarge);
+    }
+    file.read_utf8(RUNTIME_FILE_CAP)
+        .map_err(RuntimeTreeReason::of)
+}
+
+/// One runtime crate: every bundled file, the root manifest carrying
+/// [`COMPILER_VERSION`], and the digest of them.
+///
+/// Built only from the embedded crate ([`RuntimeTree::embedded`]) or from a
+/// proven capture ([`ProvenRoot`]), both through one file-set rule
+/// ([`SKIPPED_ROOT_DIRS`]) and one normalization, so the same crate gives the
+/// same digest whichever way it arrived.
+#[derive(Debug)]
+pub struct RuntimeTree {
+    /// Every bundled file, relative to the crate root, with its text.
+    files: BTreeMap<PathBuf, String>,
+    /// The root manifest as read, the base every stamp rewrites.
+    raw_manifest: String,
+    /// The digest of `files`.
+    digest: RuntimeDigest,
+}
+
+impl RuntimeTree {
+    /// The tree over the raw files `raw`, its root manifest normalized to
+    /// [`COMPILER_VERSION`] with no dev dependencies.
+    ///
+    /// # Errors
+    /// [`BundleFault::Manifest`] when the root manifest is missing or does not parse.
+    fn from_raw(mut raw: BTreeMap<PathBuf, String>) -> Result<Self, BundleFault> {
+        let raw_manifest = raw
+            .get(Path::new(MANIFEST))
+            .cloned()
+            .ok_or(BundleFault::Manifest(ManifestFault::NoUtf8Manifest))?;
+        let normalized = prepare_bundled_manifest(&raw_manifest, COMPILER_VERSION)?;
+        raw.insert(PathBuf::from(MANIFEST), normalized);
+        let keys = raw
+            .iter()
+            .map(|(path, text)| (digest_path(path), text.as_str()))
+            .collect::<Vec<_>>();
+        let digest = RuntimeDigest::of(keys.iter().map(|(path, text)| (path.as_str(), *text)));
+        Ok(Self {
+            files: raw,
+            raw_manifest,
+            digest,
+        })
+    }
+
+    /// The runtime crate compiled into this binary.
+    ///
+    /// # Errors
+    /// [`CliError::RuntimeMaterializeFailed`] when an embedded file is not UTF-8;
+    /// [`CliError::BundledManifest`] when the embedded manifest does not parse.
+    pub fn embedded() -> Result<&'static Self, CliError> {
+        unstamped_bundle().as_ref().map_err(BundleFault::to_error)
+    }
+
+    /// Every bundled file, relative to the crate root, with its text.
+    #[must_use]
+    pub const fn files(&self) -> &BTreeMap<PathBuf, String> {
+        &self.files
+    }
+
+    /// The digest of every bundled byte.
+    #[must_use]
+    pub const fn digest(&self) -> RuntimeDigest {
+        self.digest
+    }
+
+    /// The tree bundled for `role`: the manifest's version stamped with the
+    /// role and the digest, dev dependencies removed.
+    ///
+    /// # Errors
+    /// [`BundleFault::Manifest`] when the manifest does not parse.
+    fn stamp(&self, role: BundleRole) -> Result<BundledRuntime, BundleFault> {
+        let mut files = self.files.clone();
+        let stamped =
+            prepare_bundled_manifest(&self.raw_manifest, &stamped_version(role, self.digest))?;
+        files.insert(PathBuf::from(MANIFEST), stamped);
+        Ok(BundledRuntime {
+            files,
+            digest: self.digest,
+        })
+    }
+
+    /// The module tree under the crate's `src/`, keyed relative to `src/`.
+    fn module_tree(&self) -> RuntimeModuleTree {
+        RuntimeModuleTree(
+            self.files
+                .iter()
+                .filter_map(|(path, text)| {
+                    path.strip_prefix(RUNTIME_SRC_DIR)
+                        .ok()
+                        .map(|rel| (rel.to_path_buf(), text.clone()))
+                })
+                .collect(),
+        )
+    }
 }
 
 /// Resolve `IPE_HOME` (see the module doc). The returned path is not created.
@@ -345,21 +786,12 @@ fn prepare_bundled_manifest(manifest: &str, version: &str) -> Result<String, Bun
     Ok(doc.to_string())
 }
 
-/// The embedded runtime crate's files, keyed by path, with their digest.
-type UnstampedBundle = (BTreeMap<PathBuf, String>, RuntimeDigest);
-
-/// The embedded runtime crate's files and their digest, the manifest carrying
-/// [`COMPILER_VERSION`]; the shared base both roles stamp.
-fn unstamped_bundle() -> &'static Result<UnstampedBundle, BundleFault> {
-    static BASE: LazyLock<Result<UnstampedBundle, BundleFault>> = LazyLock::new(|| {
+/// The embedded runtime crate, the shared base both roles stamp.
+fn unstamped_bundle() -> &'static Result<RuntimeTree, BundleFault> {
+    static BASE: LazyLock<Result<RuntimeTree, BundleFault>> = LazyLock::new(|| {
         let mut files = BTreeMap::new();
         collect_dir_text_from_embedded(&RUNTIME_CRATE, Path::new(""), true, &mut files)?;
-        let keys = files
-            .iter()
-            .map(|(path, text)| (digest_path(path), text.as_str()))
-            .collect::<Vec<_>>();
-        let digest = RuntimeDigest::of(keys.iter().map(|(path, text)| (path.as_str(), *text)));
-        Ok((files, digest))
+        RuntimeTree::from_raw(files)
     });
     &BASE
 }
@@ -374,7 +806,7 @@ fn digest_path(path: &Path) -> String {
 
 /// The embedded runtime crate bundled for `role`: its manifest's version
 /// stamped with the role and the content digest, dev dependencies removed,
-/// `tests/` skipped.
+/// [`SKIPPED_ROOT_DIRS`] skipped.
 ///
 /// Computed once per role and reused across every emit.
 ///
@@ -384,18 +816,10 @@ fn digest_path(path: &Path) -> String {
 pub fn bundled_runtime(role: BundleRole) -> Result<&'static BundledRuntime, CliError> {
     /// The bundle of `role`, stamped from the shared base.
     fn stamp(role: BundleRole) -> Result<BundledRuntime, BundleFault> {
-        let (base, digest) = unstamped_bundle().as_ref().map_err(Clone::clone)?;
-        let mut files = base.clone();
-        let manifest = RUNTIME_CRATE
-            .get_file(MANIFEST)
-            .and_then(|file| std::str::from_utf8(file.contents()).ok())
-            .ok_or(BundleFault::Manifest(ManifestFault::NoUtf8Manifest))?;
-        let stamped = prepare_bundled_manifest(manifest, &stamped_version(role, *digest))?;
-        files.insert(PathBuf::from(MANIFEST), stamped);
-        Ok(BundledRuntime {
-            files,
-            digest: *digest,
-        })
+        unstamped_bundle()
+            .as_ref()
+            .map_err(Clone::clone)?
+            .stamp(role)
     }
     static OUT: LazyLock<Result<BundledRuntime, BundleFault>> =
         LazyLock::new(|| stamp(BundleRole::Out));
@@ -410,8 +834,7 @@ pub fn bundled_runtime(role: BundleRole) -> Result<&'static BundledRuntime, CliE
 }
 
 /// Recursive helper for [`unstamped_bundle`]: traverses `dir`, prepending
-/// `prefix` to each entry's relative path; the root manifest carries
-/// [`COMPILER_VERSION`].
+/// `prefix` to each entry's relative path, skipping [`SKIPPED_ROOT_DIRS`] at the root.
 fn collect_dir_text_from_embedded(
     dir: &include_dir::Dir<'_>,
     prefix: &std::path::Path,
@@ -422,7 +845,7 @@ fn collect_dir_text_from_embedded(
         match entry {
             include_dir::DirEntry::Dir(sub) => {
                 let name = sub.path().file_name().unwrap_or_default();
-                if at_root && name == std::ffi::OsStr::new("tests") {
+                if at_root && SKIPPED_ROOT_DIRS.iter().any(|skipped| name == *skipped) {
                     continue;
                 }
                 collect_dir_text_from_embedded(sub, &prefix.join(name), false, out)?;
@@ -432,12 +855,7 @@ fn collect_dir_text_from_embedded(
                 let rel = prefix.join(name);
                 let text = std::str::from_utf8(file.contents())
                     .map_err(|_| BundleFault::NotUtf8(rel.clone()))?;
-                let text = if at_root && name == std::ffi::OsStr::new(MANIFEST) {
-                    prepare_bundled_manifest(text, COMPILER_VERSION)?
-                } else {
-                    text.to_owned()
-                };
-                out.insert(rel, text);
+                out.insert(rel, text.to_owned());
             }
         }
     }
@@ -457,22 +875,29 @@ pub enum RuntimeOrigin {
     /// environment nor a runtime tree the judged package ships can stand in for
     /// it.
     Gate,
+    /// A release build: the compiler's embedded runtime only.
+    ///
+    /// A named root is still proved and captured, and admitted only when its
+    /// bytes are the embedded crate's; any other runtime is refused with
+    /// [`CliError::ReleaseRuntimeOverride`], so a shipped artifact never links
+    /// a runtime the compiler does not carry.
+    Release,
 }
 
-/// The one runtime source a [`RuntimeOrigin::Gate`] admits.
+/// The one runtime source a [`RuntimeOrigin::Gate`] or [`RuntimeOrigin::Release`] admits.
 static EMBEDDED_RUNTIME: RuntimeSource = RuntimeSource::Embedded;
 
 impl RuntimeOrigin {
     /// The runtime source this origin lets an emit carry, given the `runtime`
     /// its caller resolved.
     ///
-    /// A gate carries the embedded copy whatever it was handed, so a caller
-    /// pairing gate options with an override root cannot steer a judged build;
-    /// a developer build carries `runtime` as resolved.
+    /// A gate or a release carries the embedded copy whatever it was handed,
+    /// so a caller pairing their options with an override root cannot steer a
+    /// judged or shipped build; a developer build carries `runtime` as resolved.
     #[must_use]
     pub const fn admitted_runtime(self, runtime: &RuntimeSource) -> &RuntimeSource {
         match self {
-            Self::Gate => &EMBEDDED_RUNTIME,
+            Self::Gate | Self::Release => &EMBEDDED_RUNTIME,
             Self::Developer => runtime,
         }
     }
@@ -587,10 +1012,14 @@ impl RuntimeSource {
     /// `explicit` (the `--runtime` root, or a library caller's root), else
     /// `$IPE_RUNTIME_DIR` (read as raw OS text, so a non-UTF-8 path is still a
     /// path), else [`Self::Embedded`]. A named root must be proved by
-    /// [`ProvenRoot`]'s walk; it is never passed over for another source.
+    /// [`ProvenRoot`]'s walk; it is never passed over for another source. A
+    /// [`RuntimeOrigin::Release`] names a root the same way and takes it only
+    /// when its captured bytes are the embedded crate's, as [`Self::Embedded`].
     ///
     /// # Errors
-    /// The refusals of the override walk, each offering `remedy`.
+    /// The refusals of the override walk, each offering `remedy`;
+    /// [`CliError::ReleaseRuntimeOverride`] for a release naming a runtime
+    /// other than the embedded one.
     pub fn resolve(
         origin: RuntimeOrigin,
         explicit: Option<&Path>,
@@ -607,63 +1036,66 @@ impl RuntimeSource {
         ambient: Option<&std::ffi::OsStr>,
         remedy: RuntimeRemedy,
     ) -> Result<Self, CliError> {
-        match origin {
-            RuntimeOrigin::Gate => Ok(Self::Embedded),
-            RuntimeOrigin::Developer => explicit
-                .or_else(|| ambient.map(Path::new))
-                .map_or(Ok(Self::Embedded), |named| {
-                    ProvenRoot::prove(named, remedy).map(Self::Override)
-                }),
+        let named = explicit.or_else(|| ambient.map(Path::new));
+        match (origin, named) {
+            (RuntimeOrigin::Gate, _)
+            | (RuntimeOrigin::Developer | RuntimeOrigin::Release, None) => Ok(Self::Embedded),
+            (RuntimeOrigin::Developer, Some(named)) => {
+                ProvenRoot::prove(named, remedy).map(Self::Override)
+            }
+            (RuntimeOrigin::Release, Some(named)) => {
+                let proven = ProvenRoot::prove(named, remedy)?;
+                if proven.tree().digest() == RuntimeTree::embedded()?.digest() {
+                    Ok(Self::Embedded)
+                } else {
+                    Err(CliError::ReleaseRuntimeOverride {
+                        path: proven.root().to_path_buf(),
+                        remedy,
+                    })
+                }
+            }
+        }
+    }
+
+    /// The runtime crate this source bundles, captured once.
+    ///
+    /// # Errors
+    /// As [`RuntimeTree::embedded`].
+    pub fn tree(&self) -> Result<&RuntimeTree, CliError> {
+        match self {
+            Self::Embedded => RuntimeTree::embedded(),
+            Self::Override(proven) => Ok(proven.tree()),
+        }
+    }
+
+    /// The runtime crate a linked emit bundles for `role`, its manifest
+    /// stamped with the role and the content digest.
+    ///
+    /// # Errors
+    /// As [`bundled_runtime`].
+    pub fn bundled(&self, role: BundleRole) -> Result<&BundledRuntime, CliError> {
+        match self {
+            Self::Embedded => bundled_runtime(role),
+            Self::Override(proven) => proven.captured.bundled(role),
         }
     }
 
     /// The module tree a vendored emit copies into `src/ipe_runtime/`.
     ///
     /// # Errors
-    /// [`CliError::RuntimeMaterializeFailed`] / [`CliError::BundledManifest`]
-    /// when the embedded tree cannot be bundled; [`CliError::Io`] when an
-    /// override's `src/` cannot be read.
+    /// As [`RuntimeTree::embedded`].
     pub fn module_tree(&self) -> Result<RuntimeModuleTree, CliError> {
-        match self {
-            Self::Embedded => {
-                let (files, _) = unstamped_bundle().as_ref().map_err(BundleFault::to_error)?;
-                Ok(RuntimeModuleTree(
-                    files
-                        .iter()
-                        .filter_map(|(path, text)| {
-                            path.strip_prefix(RUNTIME_SRC_DIR)
-                                .ok()
-                                .map(|rel| (rel.to_path_buf(), text.clone()))
-                        })
-                        .collect(),
-                ))
-            }
-            Self::Override(proven) => {
-                let mut files = BTreeMap::new();
-                crate::driver::collect_dir_text(
-                    &proven.root().join(RUNTIME_SRC_DIR),
-                    Path::new(""),
-                    &mut files,
-                )?;
-                Ok(RuntimeModuleTree(files))
-            }
-        }
+        self.tree().map(RuntimeTree::module_tree)
     }
 
-    /// The content identity of the runtime a linked emit bundles.
-    ///
-    /// A linked emit bundles the embedded tree whatever the source, so the
-    /// identity is the embedded tree's digest.
+    /// The content identity of the runtime this source bundles: the digest of
+    /// its captured bytes.
     ///
     /// # Errors
-    /// As [`bundled_runtime`] when the embedded tree cannot be bundled.
+    /// As [`RuntimeTree::embedded`].
     pub fn content_id(&self) -> Result<RuntimeContentId, CliError> {
-        match self {
-            Self::Embedded | Self::Override(_) => {
-                let (_, digest) = unstamped_bundle().as_ref().map_err(BundleFault::to_error)?;
-                Ok(RuntimeContentId::from_digest_bytes(digest.bytes()))
-            }
-        }
+        self.tree()
+            .map(|tree| RuntimeContentId::from_digest_bytes(tree.digest().bytes()))
     }
 
     /// The source, for a health line or an error's context: `embedded <version>`
@@ -703,10 +1135,9 @@ mod tests {
     /// emitted project can never link a mismatched embedded runtime.
     #[test]
     fn embedded_runtime_version_matches_compiler() {
-        let (files, _) = unstamped_bundle()
-            .as_ref()
-            .expect("the embedded runtime bundles");
-        let manifest = files
+        let embedded = RuntimeTree::embedded().expect("the embedded runtime bundles");
+        let manifest = embedded
+            .files()
             .get(Path::new(MANIFEST))
             .expect("the bundle carries a Cargo.toml");
         let table: toml::Table = manifest.parse().expect("the bundled manifest parses");
@@ -795,10 +1226,10 @@ mod tests {
             None,
             RuntimeRemedy::EnvOnly,
         );
-        let canonical = dir.canonicalize().expect("scratch dir canonicalizes");
+        let absolute = std::path::absolute(&dir).expect("scratch dir is absolute");
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
-            matches!(&resolved, Ok(RuntimeSource::Override(proven)) if proven.root() == canonical),
+            matches!(&resolved, Ok(RuntimeSource::Override(proven)) if proven.root() == absolute),
             "got {resolved:?}"
         );
     }
@@ -1068,19 +1499,475 @@ mod tests {
         assert!(matches!(resolved, Ok(RuntimeSource::Embedded)));
     }
 
-    /// The embedded module tree is the in-repo `src/runtime/rust/src` tree,
-    /// keyed relative to `src/`.
+    /// The in-repo runtime crate root.
+    fn in_repo_runtime() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../runtime/rust")
+    }
+
+    /// The embedded tree is the in-repo crate: capturing `src/runtime/rust`
+    /// through the override walk gives the embedded digest, so both walkers
+    /// share one file-set rule and one normalization.
     #[test]
-    fn the_embedded_module_tree_is_the_in_repo_source_tree() {
-        let tree = RuntimeSource::Embedded
-            .module_tree()
-            .expect("the embedded tree bundles");
-        let in_repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../runtime/rust/src");
-        let mut on_disk = BTreeMap::new();
-        crate::driver::collect_dir_text(&in_repo, Path::new(""), &mut on_disk)
-            .expect("the in-repo runtime source reads");
-        assert!(tree.files().contains_key(Path::new("mod.rs")));
-        assert_eq!(tree.files(), &on_disk);
+    #[allow(clippy::expect_used)] // a refused in-repo capture is the test failure
+    fn the_in_repo_capture_has_the_embedded_digest() {
+        let captured = ProvenRoot::prove(&in_repo_runtime(), RuntimeRemedy::EnvOnly)
+            .expect("the in-repo runtime proves");
+        let embedded = RuntimeTree::embedded().expect("the embedded tree bundles");
+        assert_eq!(captured.tree().files(), embedded.files());
+        assert_eq!(captured.tree().digest(), embedded.digest());
+        assert!(
+            RuntimeSource::Embedded
+                .module_tree()
+                .expect("the embedded tree bundles")
+                .files()
+                .contains_key(Path::new("mod.rs"))
+        );
+    }
+
+    /// Write `text` at `rel` under `root`, creating its parents.
+    #[allow(clippy::expect_used)] // a failed scratch setup is the test failure
+    fn plant(root: &Path, rel: &str, text: &[u8]) {
+        let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create the parent");
+        }
+        std::fs::write(path, text).expect("write the planted file");
+    }
+
+    /// A scratch runtime crate at the compiler's version with one source file.
+    fn valid_crate(tag: &str) -> PathBuf {
+        let dir = runtime_root_at(tag, COMPILER_VERSION);
+        plant(&dir, "src/lib.rs", b"pub fn probe() {}\n");
+        dir
+    }
+
+    /// The capture refusal of the crate at `dir`, if the walk refused one.
+    fn tree_refusal(dir: &Path) -> Option<RuntimeTreeRefusal> {
+        match ProvenRoot::prove(dir, RuntimeRemedy::EnvOnly) {
+            Err(CliError::RuntimeTreeRefused { refusal, .. }) => Some(refusal),
+            _ => None,
+        }
+    }
+
+    /// The reason the capture of `dir` names for the entry `rel`.
+    fn refused_at(dir: &Path, rel: &str) -> Option<RuntimeTreeReason> {
+        tree_refusal(dir)
+            .filter(|refusal| refusal.path == Path::new(rel))
+            .map(|refusal| refusal.reason)
+    }
+
+    /// A file link below the root is refused by name, never followed to its
+    /// target outside the tree, and the source never resolves to an override.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)] // a failed scratch setup is the test failure
+    fn a_file_link_below_the_root_is_refused() {
+        let dir = valid_crate("ipe-runtime-file-link");
+        let outside = crate::scratch::ScratchDir::new("ipe-runtime-file-link-target")
+            .expect("scratch dir")
+            .into_path();
+        plant(&outside, "secret.rs", b"pub const SECRET: u8 = 1;\n");
+        std::os::unix::fs::symlink(outside.join("secret.rs"), dir.join("src/x.rs"))
+            .expect("plant the link");
+        let reason = refused_at(&dir, "src/x.rs");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+        assert_eq!(reason, Some(RuntimeTreeReason::Link));
+    }
+
+    /// A directory link below the root, and a link whose target stays inside
+    /// the tree, are both refused: no link is ever followed.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)] // a failed scratch setup is the test failure
+    fn every_link_below_the_root_is_refused_wherever_it_points() {
+        let dir = valid_crate("ipe-runtime-dir-link");
+        let outside = crate::scratch::ScratchDir::new("ipe-runtime-dir-link-target")
+            .expect("scratch dir")
+            .into_path();
+        plant(&outside, "inner.rs", b"pub fn inner() {}\n");
+        std::os::unix::fs::symlink(&outside, dir.join("src/m")).expect("plant the dir link");
+        let dir_link = refused_at(&dir, "src/m");
+        let _ = std::fs::remove_file(dir.join("src/m"));
+        std::os::unix::fs::symlink(dir.join("src/lib.rs"), dir.join("src/alias.rs"))
+            .expect("plant the inner link");
+        let inner_link = refused_at(&dir, "src/alias.rs");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+        assert_eq!(dir_link, Some(RuntimeTreeReason::Link));
+        assert_eq!(inner_link, Some(RuntimeTreeReason::Link));
+    }
+
+    /// An unreadable manifest, and an unreadable source file, are refused by
+    /// name. Under a privileged euid the read succeeds, and the test asserts
+    /// that it ran privileged rather than passing without the refusal.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)] // a failed scratch setup is the test failure
+    fn an_unreadable_entry_is_refused_by_name() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let locked = std::fs::Permissions::from_mode(0o000);
+        let open = std::fs::Permissions::from_mode(0o644);
+        let dir = valid_crate("ipe-runtime-unreadable");
+        std::fs::set_permissions(dir.join(MANIFEST), locked.clone()).expect("lock the manifest");
+        let privileged = std::fs::read(dir.join(MANIFEST)).is_ok();
+        let manifest = tree_refusal(&dir);
+        std::fs::set_permissions(dir.join(MANIFEST), open.clone()).expect("unlock the manifest");
+        std::fs::set_permissions(dir.join("src/lib.rs"), locked).expect("lock the source");
+        let source = refused_at(&dir, "src/lib.rs");
+        std::fs::set_permissions(dir.join("src/lib.rs"), open).expect("unlock the source");
+        let _ = std::fs::remove_dir_all(&dir);
+        if privileged {
+            assert!(
+                rustix::process::geteuid().is_root() && manifest.is_none() && source.is_none(),
+                "only a root euid reads a mode-000 file, and then nothing is refused"
+            );
+            return;
+        }
+        assert_eq!(
+            manifest,
+            Some(RuntimeTreeRefusal {
+                path: PathBuf::from(MANIFEST),
+                reason: RuntimeTreeReason::Unreadable,
+            })
+        );
+        assert_eq!(source, Some(RuntimeTreeReason::Unreadable));
+    }
+
+    /// A FIFO below the root is refused as not regular, without blocking on
+    /// an open no writer will ever answer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::expect_used)] // a failed scratch setup is the test failure
+    fn a_fifo_below_the_root_is_refused_without_blocking() {
+        let dir = valid_crate("ipe-runtime-fifo");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            dir.join("src/fifo.rs"),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o644),
+            0,
+        )
+        .expect("plant the FIFO");
+        let (send, receive) = std::sync::mpsc::channel();
+        let walked = dir.clone();
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = send.send(refused_at(&walked, "src/fifo.rs"));
+            })
+            .expect("spawn the capture thread");
+        let reason = receive.recv_timeout(std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(reason, Ok(Some(RuntimeTreeReason::NotRegular)));
+    }
+
+    /// A file sharing its inode through a second hard link is refused: its
+    /// bytes may be written through a path outside the tree.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)] // a failed scratch setup is the test failure
+    fn a_hard_linked_file_is_refused() {
+        let dir = valid_crate("ipe-runtime-hard-link");
+        std::fs::hard_link(dir.join("src/lib.rs"), dir.join("src/h.rs"))
+            .expect("plant the hard link");
+        let refusal = tree_refusal(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            refusal.map(|refusal| refusal.reason),
+            Some(RuntimeTreeReason::HardLinked)
+        );
+    }
+
+    /// A content change the mtime does not show changes the digest, the
+    /// stamped version and the content identity: freshness keys on bytes,
+    /// never on the root's path.
+    #[test]
+    #[allow(clippy::expect_used)] // a failed scratch setup is the test failure
+    fn a_content_change_under_a_pinned_mtime_changes_every_key() {
+        let dir = valid_crate("ipe-runtime-content-change");
+        let lib = dir.join("src/lib.rs");
+        let mtime = std::fs::metadata(&lib)
+            .and_then(|meta| meta.modified())
+            .expect("read the mtime");
+        let keys = || {
+            let source = RuntimeSource::resolve_from(
+                RuntimeOrigin::Developer,
+                Some(&dir),
+                None,
+                RuntimeRemedy::EnvOnly,
+            )
+            .expect("the scratch runtime proves");
+            let stamp = source
+                .bundled(BundleRole::Out)
+                .expect("the scratch runtime stamps")
+                .files()
+                .get(Path::new(MANIFEST))
+                .cloned();
+            let content = source.content_id().expect("the content id derives");
+            (source.tree().expect("the tree").digest(), stamp, content)
+        };
+        let before = keys();
+        plant(&dir, "src/lib.rs", b"pub fn probe() { let _ = 2; }\n");
+        std::fs::File::options()
+            .write(true)
+            .open(&lib)
+            .and_then(|file| file.set_modified(mtime))
+            .expect("pin the mtime back");
+        let after = keys();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_ne!(before.0, after.0, "the digest follows the bytes");
+        assert_ne!(before.1, after.1, "the stamped manifest follows the bytes");
+        assert_ne!(before.2, after.2, "the content identity follows the bytes");
+    }
+
+    /// A scratch crate whose manifest is `manifest`, optionally under an outer
+    /// directory holding `workspace` as its manifest; returns the outer
+    /// directory and the crate root.
+    #[allow(clippy::expect_used)] // a failed scratch setup is the test failure
+    fn crate_with(tag: &str, manifest: &str, workspace: Option<&str>) -> (PathBuf, PathBuf) {
+        let outer = crate::scratch::ScratchDir::new(tag)
+            .expect("scratch dir")
+            .into_path();
+        if let Some(workspace) = workspace {
+            plant(&outer, MANIFEST, workspace.as_bytes());
+        }
+        let root = outer.join("rt");
+        plant(&root, MANIFEST, manifest.as_bytes());
+        plant(&root, "src/lib.rs", b"pub fn probe() {}\n");
+        (outer, root)
+    }
+
+    /// The developer resolution of `manifest` under `workspace`.
+    fn resolve_crate(
+        tag: &str,
+        manifest: &str,
+        workspace: Option<&str>,
+    ) -> Result<RuntimeSource, CliError> {
+        let (outer, root) = crate_with(tag, manifest, workspace);
+        let resolved = RuntimeSource::resolve_from(
+            RuntimeOrigin::Developer,
+            Some(&root),
+            None,
+            RuntimeRemedy::EnvOnly,
+        );
+        let _ = std::fs::remove_dir_all(&outer);
+        resolved
+    }
+
+    /// The version is read from the captured manifest's `[package]` table:
+    /// an inherited version from the enclosing workspace, an unreadable one
+    /// refused, and a package name outside `[package]` names no runtime.
+    #[test]
+    fn the_runtime_version_is_read_from_the_captured_manifest() {
+        let package = format!("[package]\nname = \"{RUNTIME_PACKAGE}\"\n");
+        let inherited = format!("{package}version.workspace = true\n");
+        let workspace_at =
+            |version: &str| format!("[workspace]\n[workspace.package]\nversion = \"{version}\"\n");
+        let orphan = resolve_crate("ipe-runtime-orphan-inherit", &inherited, None);
+        let other = resolve_crate(
+            "ipe-runtime-other-workspace",
+            &inherited,
+            Some(&workspace_at("0.0.2")),
+        );
+        let own = resolve_crate(
+            "ipe-runtime-own-workspace",
+            &inherited,
+            Some(&workspace_at(COMPILER_VERSION)),
+        );
+        let unversioned = resolve_crate("ipe-runtime-unversioned", &package, None);
+        let dependency_only = resolve_crate(
+            "ipe-runtime-dependency-only",
+            &format!(
+                "[package]\nname = \"app\"\nversion = \"{COMPILER_VERSION}\"\n\
+                 [dependencies]\nname = \"{RUNTIME_PACKAGE}\"\n"
+            ),
+            None,
+        );
+        assert!(
+            matches!(orphan, Err(CliError::RuntimeVersionUnknown { .. })),
+            "{orphan:?}"
+        );
+        assert!(
+            matches!(&other, Err(CliError::RuntimeVersionMismatch { found, .. }) if found == "0.0.2"),
+            "{other:?}"
+        );
+        assert!(matches!(own, Ok(RuntimeSource::Override(_))), "{own:?}");
+        assert!(
+            matches!(unversioned, Err(CliError::RuntimeVersionUnknown { .. })),
+            "{unversioned:?}"
+        );
+        assert!(
+            matches!(dependency_only, Err(CliError::RuntimeDirInvalid { .. })),
+            "{dependency_only:?}"
+        );
+    }
+
+    /// The capture carries neither the crate's `tests/` nor its `target/`,
+    /// the same file set the embedded bundle carries.
+    #[test]
+    fn the_capture_skips_tests_and_target() {
+        let dir = valid_crate("ipe-runtime-skipped-dirs");
+        plant(&dir, "tests/it.rs", b"#[test]\nfn it() {}\n");
+        plant(&dir, "target/debug/out.rs", b"// build output\n");
+        let proven = ProvenRoot::prove(&dir, RuntimeRemedy::EnvOnly);
+        let _ = std::fs::remove_dir_all(&dir);
+        let files = proven
+            .map(|proven| proven.tree().files().keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        assert_eq!(
+            files,
+            vec![PathBuf::from(MANIFEST), PathBuf::from("src/lib.rs")]
+        );
+    }
+
+    /// One directory past the depth ceiling is refused.
+    #[test]
+    fn a_tree_past_the_depth_ceiling_is_refused() {
+        let dir = valid_crate("ipe-runtime-too-deep");
+        let deep = (0..=RUNTIME_TREE_DEPTH).fold(String::from("src"), |path, _| path + "/d");
+        plant(&dir, &format!("{deep}/x.rs"), b"\n");
+        let refusal = tree_refusal(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            refusal.map(|refusal| refusal.reason),
+            Some(RuntimeTreeReason::TooDeep)
+        );
+    }
+
+    /// One entry past the entry ceiling is refused.
+    #[test]
+    fn a_tree_past_the_entry_ceiling_is_refused() {
+        let dir = valid_crate("ipe-runtime-too-many");
+        for index in 0..RUNTIME_TREE_ENTRIES {
+            plant(&dir, &format!("src/many/f{index}.rs"), b"");
+        }
+        let refusal = tree_refusal(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            refusal.map(|refusal| refusal.reason),
+            Some(RuntimeTreeReason::TooManyEntries)
+        );
+    }
+
+    /// `len` bytes of `a`.
+    fn filler(len: u64) -> Vec<u8> {
+        vec![b'a'; usize::try_from(len).unwrap_or(usize::MAX)]
+    }
+
+    /// One file one byte past the file ceiling is refused by name.
+    #[test]
+    fn a_file_past_the_file_ceiling_is_refused() {
+        let dir = valid_crate("ipe-runtime-file-too-large");
+        plant(
+            &dir,
+            "src/big.rs",
+            &filler(RUNTIME_FILE_BYTES.saturating_add(1)),
+        );
+        let reason = refused_at(&dir, "src/big.rs");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(reason, Some(RuntimeTreeReason::FileTooLarge));
+    }
+
+    /// Files one byte past the tree ceiling together are refused.
+    #[test]
+    fn files_past_the_tree_ceiling_together_are_refused() {
+        let dir = valid_crate("ipe-runtime-tree-too-large");
+        let whole = filler(RUNTIME_FILE_BYTES);
+        for index in 0..RUNTIME_TREE_BYTES / RUNTIME_FILE_BYTES {
+            plant(&dir, &format!("src/big{index}.rs"), &whole);
+        }
+        let refusal = tree_refusal(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            refusal.map(|refusal| refusal.reason),
+            Some(RuntimeTreeReason::TreeTooLarge)
+        );
+    }
+
+    /// The embedded crate fits every tree ceiling with a fourfold headroom.
+    #[test]
+    fn the_embedded_tree_fits_its_ceilings_with_headroom() {
+        let embedded = RuntimeTree::embedded().expect("the embedded tree bundles");
+        let files = embedded.files();
+        let mut dirs = std::collections::BTreeSet::new();
+        for path in files.keys() {
+            dirs.extend(
+                path.ancestors()
+                    .skip(1)
+                    .filter(|dir| !dir.as_os_str().is_empty()),
+            );
+        }
+        let entries = files.len() + dirs.len();
+        let depth = files
+            .keys()
+            .map(|path| path.components().count().saturating_sub(1))
+            .max()
+            .unwrap_or_default();
+        let sizes = files
+            .values()
+            .map(|text| u64::try_from(text.len()).unwrap_or(u64::MAX));
+        let largest = sizes.clone().max().unwrap_or_default();
+        let total = sizes.sum::<u64>();
+        let entry_ceiling = usize::try_from(RUNTIME_TREE_ENTRIES).unwrap_or(usize::MAX);
+        assert!(
+            entries.saturating_mul(4) <= entry_ceiling,
+            "{entries} entries"
+        );
+        assert!(
+            depth.saturating_mul(4) <= RUNTIME_TREE_DEPTH,
+            "{depth} levels"
+        );
+        assert!(
+            largest.saturating_mul(4) <= RUNTIME_FILE_BYTES,
+            "{largest}-byte file"
+        );
+        assert!(
+            total.saturating_mul(4) <= RUNTIME_TREE_BYTES,
+            "{total} bytes"
+        );
+    }
+
+    /// A release takes the embedded crate: a named runtime with the embedded
+    /// bytes resolves as the embedded copy, any other is refused, and a gate
+    /// or a release admits only the embedded copy whatever it is handed.
+    #[test]
+    #[allow(clippy::expect_used)] // a failed scratch setup is the test failure
+    fn a_release_admits_only_the_embedded_runtime() {
+        let dir = valid_crate("ipe-runtime-release-override");
+        let differing = RuntimeSource::resolve_from(
+            RuntimeOrigin::Release,
+            None,
+            Some(dir.as_os_str()),
+            RuntimeRemedy::WithRuntimeFlag,
+        );
+        let handed = ProvenRoot::prove(&dir, RuntimeRemedy::EnvOnly).map(RuntimeSource::Override);
+        let _ = std::fs::remove_dir_all(&dir);
+        let same = RuntimeSource::resolve_from(
+            RuntimeOrigin::Release,
+            Some(&in_repo_runtime()),
+            None,
+            RuntimeRemedy::WithRuntimeFlag,
+        );
+        let unnamed = RuntimeSource::resolve_from(
+            RuntimeOrigin::Release,
+            None,
+            None,
+            RuntimeRemedy::WithRuntimeFlag,
+        );
+        assert!(
+            matches!(differing, Err(CliError::ReleaseRuntimeOverride { .. })),
+            "{differing:?}"
+        );
+        assert!(matches!(same, Ok(RuntimeSource::Embedded)), "{same:?}");
+        assert!(
+            matches!(unnamed, Ok(RuntimeSource::Embedded)),
+            "{unnamed:?}"
+        );
+        let handed = handed.expect("the scratch runtime proves");
+        assert_eq!(
+            RuntimeOrigin::Release.admitted_runtime(&handed),
+            &RuntimeSource::Embedded
+        );
     }
 
     /// `root` with `levels` nested `d` directories below it.

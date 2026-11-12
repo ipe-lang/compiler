@@ -181,7 +181,7 @@ fn closure_driven_loop_builds_and_runs() {
     // wraps the generated bindings in `pub mod <slug> { … } pub use <slug>::*;`.
     // The emitted region carries the `Counter`/`Message` defs, every constructor
     // forwarder, the `UpdateFnClosure` handle alias, AND the `update_fn` adapter.
-    let ffi_rs = format!("pub mod {slug} {{\n{bindings}}}\npub use {slug}::*;\n");
+    let ffi_rs = e2e_support::ffi_app::package_module(slug, &bindings);
 
     // The `main` is the driver a `Main.ipe` compiles to: it builds the Ipê
     // `update` function value, adapts it through the forwarder to get the opaque
@@ -189,20 +189,7 @@ fn closure_driven_loop_builds_and_runs() {
     // messages, update)` loop — the closure-to-run handoff. The loop calls the
     // held closure once per message; the Ipê logic drives every step.
     let main_rs = format!(
-        r#"mod ffi;
-use crate::ffi::{slug}::{{Counter, Message, UpdateFnClosure}};
-
-// The runtime glue the emitted `Result` adapter arm references via `use crate::*`
-// — `str_err` / `IpeError`. The real runtime crate supplies these; the fixture
-// stands them in.
-#[derive(Debug)]
-pub struct IpeError(String);
-pub fn str_err<E: From<String>>(s: &str) -> E {{ s.to_string().into() }}
-pub fn ipe_error_from_panic<E: From<String>>(c: &str, _p: Box<dyn std::any::Any + Send>) -> E {{ c.to_string().into() }}
-pub fn note_foreign_panic(_c: &str, _p: Box<dyn std::any::Any + Send>) -> String {{ String::new() }}
-pub fn note_foreign_error<T: std::fmt::Debug>(_e: T) -> String {{ String::new() }}
-pub fn ipe_error_from_foreign<T: std::fmt::Debug, E: From<String>>(_e: T) -> E {{ "external operation failed".to_string().into() }}
-impl From<String> for IpeError {{ fn from(s: String) -> Self {{ IpeError(s) }} }}
+        r#"use crate::ffi::{slug}::{{Counter, Message, UpdateFnClosure}};
 
 // A foreign `run`-style entrypoint: it OWNS the handoffed closure handle and
 // DRIVES a loop with it — the exact shape `iced::Sandbox::run` / a Bevy system
@@ -261,17 +248,15 @@ fn main() {{
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("src")).expect("mkdir");
-    std::fs::write(
-        dir.join("Cargo.toml"),
-        "[package]\nname = \"closure_handoff_seal\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
-         [[bin]]\nname = \"closure_handoff_seal\"\npath = \"src/main.rs\"\n\
-         # catch_unwind soundness requires panic=unwind (the emitter's own fence)\n\
-         [profile.dev]\npanic = \"unwind\"\n",
-    )
-    .expect("Cargo.toml");
-    std::fs::write(dir.join("src").join("ffi.rs"), ffi_rs).expect("ffi.rs");
-    std::fs::write(dir.join("src").join("main.rs"), main_rs).expect("main.rs");
+    e2e_support::ffi_app::FfiApp {
+        name: "closure_handoff_seal",
+        runtime_features: &[],
+        dependencies: &[],
+        ffi_rs: &ffi_rs,
+        main_rs: &main_rs,
+    }
+    .write(&dir)
+    .expect("the app crate is written");
 
     let ran = e2e_support::build_and_run_rust("ffi_closure_handoff", &dir);
     assert!(

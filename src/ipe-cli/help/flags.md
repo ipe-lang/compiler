@@ -6,6 +6,6 @@ The command-line flags several `ipe` commands share, described once. A command p
 - `[--json]` — emit each diagnostic as a stable JSON object (one per line) instead of the human layout
 - `[--out <dir>]` — put build output under <dir> (default: out/ in the project); on Windows a drive or `\\server\share` path is accepted, a device (`\\.\pipe`), object-namespace (`\\?\GLOBALROOT`), or volume-GUID (`\\?\Volume{..}`) path is not
 - `[-q|--quiet]` — suppress progress chatter; only warnings and errors
-- `[--runtime <dir>]` — vendor the Ipê runtime from <dir>
+- `[--runtime <dir>]` — build against the Ipê runtime crate at <dir> (same as IPE_RUNTIME_DIR)
 - `[--static]` — produce a statically linked binary
 - `[--target <wasm|wasi|triple>]` — compile for `wasm` (the browser bundle, which `web client` already derives; any other delivery refuses it), `wasi` (a wasm32-wasip1 module), or a musl-static native <triple>; a native triple needs --static on `dev build` and `dev run`; `dev run` cannot execute `wasm`

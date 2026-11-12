@@ -146,41 +146,9 @@ pub fn echo_ref_i64(x: &i64) -> i64 { *x }
 pub fn echo_ref_bool(x: &bool) -> bool { !*x }
 ";
 
-/// The app crate. The emitted bindings' preamble is `use crate::*;`, so the
-/// crate root supplies minimal stand-ins for the `ipe_runtime` glue the
-/// wrappers name; `{FFI_BODY}` is replaced by the emitted module.
-const APP_MAIN: &str = r#"// Runtime glue the emitted wrappers reference, at the crate root so the
-// bindings' `use crate::*;` brings it into scope. Minimal stand-ins for
-// `ipe_runtime` with the same length check.
-#[derive(Debug)]
-pub enum IpeResult<E, A> { Ok(A), Err(E) }
-#[derive(Debug)]
-pub struct IpeError(String);
-#[derive(Debug, Clone, PartialEq)]
-pub enum IpeMaybe<T> { Nothing, Just(T) }
-pub fn ipe_maybe_to_option<T>(m: IpeMaybe<T>) -> Option<T> {
-    match m { IpeMaybe::Just(v) => Some(v), IpeMaybe::Nothing => None }
-}
-pub fn ok_res<E, A>(a: A) -> IpeResult<E, A> { IpeResult::Ok(a) }
-pub fn str_err<E: From<String>>(s: &str) -> E { s.to_string().into() }
-pub fn ipe_error_from_panic<E: From<String>>(c: &str, _p: Box<dyn std::any::Any + Send>) -> E { c.to_string().into() }
-pub fn note_foreign_panic(_c: &str, _p: Box<dyn std::any::Any + Send>) -> String { String::new() }
-pub fn note_foreign_error<T: std::fmt::Debug>(_e: T) -> String { String::new() }
-pub fn ipe_error_from_foreign<T: std::fmt::Debug, E: From<String>>(_e: T) -> E { "external operation failed".to_string().into() }
-impl From<String> for IpeError { fn from(s: String) -> Self { IpeError(s) } }
-pub fn to_array<E: From<String>, T: Clone, const N: usize>(xs: &[T]) -> IpeResult<E, [T; N]> {
-    match <[T; N]>::try_from(xs.to_vec()) {
-        Ok(a) => IpeResult::Ok(a),
-        Err(_) => IpeResult::Err(format!("expected array of length {}, got {}", N, xs.len()).into()),
-    }
-}
-
-mod ffi {
-    use crate::*;
-    {FFI_BODY}
-}
-
-const EDGES: [i64; 13] = [i64::MIN, -256, -1, 0, 1, 127, 128, 255, 256, 257, 300, 1 << 32, i64::MAX];
+/// The app crate's program items; the bindings' `use crate::*;` resolves the
+/// runtime items the wrappers name through the crate-root prelude.
+const APP_MAIN: &str = r#"const EDGES: [i64; 13] = [i64::MIN, -256, -1, 0, 1, 127, 128, 255, 256, 257, 300, 1 << 32, i64::MAX];
 
 fn sat(x: i64, lo: i64, hi: i64) -> i64 { x.clamp(lo, hi) }
 
@@ -231,7 +199,7 @@ fn main() {
 "#;
 
 /// The load-bearing SEAL proof: under `IPE_E2E=1`, assemble the emitted
-/// wrappers against a stub `nums` crate + the runtime glue and RUN them,
+/// wrappers against a stub `nums` crate + the real runtime and RUN them,
 /// proving every element narrowing cargo-builds and saturates.
 #[test]
 fn assembled_sequence_wrappers_build_and_saturate() {
@@ -240,7 +208,7 @@ fn assembled_sequence_wrappers_build_and_saturate() {
     }
     let bindings = emit_bindings(&nums_pkg(false));
     let slug = "nums";
-    let ffi_body = format!("pub mod {slug} {{\n{bindings}}}\npub use {slug}::*;\n");
+    let ffi_rs = e2e_support::ffi_app::package_module(slug, &bindings);
 
     let root = ipe_test_temp::temp_root().join(format!("ipe_ffi_seq_seal_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -254,19 +222,15 @@ fn assembled_sequence_wrappers_build_and_saturate() {
     .expect("wrapper Cargo.toml");
     std::fs::write(wrapper_dir.join("src").join("lib.rs"), STUB_LIB).expect("wrapper lib.rs");
 
-    let main_rs = APP_MAIN.replace("{FFI_BODY}", &ffi_body);
-
-    std::fs::create_dir_all(root.join("src")).expect("mkdir app");
-    std::fs::write(
-        root.join("Cargo.toml"),
-        "[package]\nname = \"seq_seal\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
-         [[bin]]\nname = \"seq_seal\"\npath = \"src/main.rs\"\n\
-         [dependencies]\nnums = { path = \"wrappers/nums\" }\n\
-         # catch_unwind soundness requires panic=unwind (the emitter's own fence)\n\
-         [profile.dev]\npanic = \"unwind\"\n",
-    )
-    .expect("Cargo.toml");
-    std::fs::write(root.join("src").join("main.rs"), main_rs).expect("main.rs");
+    e2e_support::ffi_app::FfiApp {
+        name: "seq_seal",
+        runtime_features: &[],
+        dependencies: &["nums = { path = \"wrappers/nums\" }".to_owned()],
+        ffi_rs: &ffi_rs,
+        main_rs: APP_MAIN,
+    }
+    .write(&root)
+    .expect("the app crate is written");
 
     let ran = e2e_support::build_and_run_rust("ffi_seq_narrow", &root);
     assert!(

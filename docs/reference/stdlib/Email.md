@@ -26,14 +26,13 @@ helpers so future field additions don't break record literals.
 
 Example:
 
-    import Ipe.Secret
-    import Ipe.System as System
+    import Ipe.App as App
     import Ipe.Task as Task
     import Ipe.Error as Error
 
     provider : EmailProvider
     provider =
-        Resend (Secret.fromString (System.getenvOr "RESEND_API_KEY" ""))
+        Resend (App.fromEnvRequired "RESEND_API_KEY")
 
     welcome : EmailAddress -> EmailAddress -> EmailMessage
     welcome from to =
@@ -154,7 +153,7 @@ principal identifier — not itself a secret).
 withSesSecret : Secret -> SesConfig -> SesConfig
 ```
 
-`withSesSecret (Secret.fromString "...") cfg` — replace the SES secret
+`withSesSecret (App.fromEnvRequired "SES_SECRET") cfg` — replace the SES secret
 access key.  The value is a sealed `Secret`; it is revealed only at the send
 kernel's SigV4 signing step, never logged.
 
@@ -194,7 +193,7 @@ withSmtpUser : String -> SmtpConfig -> SmtpConfig
 withSmtpPass : Secret -> SmtpConfig -> SmtpConfig
 ```
 
-`withSmtpPass (Secret.fromString "...") cfg` — replace the SMTP password.
+`withSmtpPass (App.fromEnvRequired "SMTP_PASS") cfg` — replace the SMTP password.
 The value is a sealed `Secret`; it is revealed only at the send kernel's SMTP
 AUTH step (over a required-TLS channel when credentials are set), never logged.
 

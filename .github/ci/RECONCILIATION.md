@@ -121,7 +121,7 @@ exactly this block (`test_check_required_set.py` proves it equals
   "max_entries_to_merge": 2,
   "min_entries_to_merge_wait_minutes": 5,
   "grouping_strategy": "ALLGREEN",
-  "check_response_timeout_minutes": 120
+  "check_response_timeout_minutes": 240
 }
 ```
 

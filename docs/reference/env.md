@@ -190,7 +190,7 @@ Every `IPE_*` variable the runtime, CLI, and compiler read. The table is grouped
 | Variable | Default | Effect | Class |
 |----------|---------|--------|-------|
 | `IPE_HOME` | unset ($XDG_DATA_HOME/ipe, then $HOME/.ipe) | Per-user data root for config and cached binaries. Overrides the XDG / home-directory fallback. Must be an absolute path. | `Tunable` |
-| `IPE_RUNTIME_DIR` | unset (the runtime embedded in the compiler) | Path to a runtime crate root, or to a path under one, for a developer build; `--runtime` wins over it. The root found by a bounded upward walk must declare the compiler's version, or the build is refused. A vendored build copies that root's module tree; a linked build bundles the compiler's own runtime. A package gate ignores it. | `Tunable` |
+| `IPE_RUNTIME_DIR` | unset (the runtime embedded in the compiler) | Path to a runtime crate root, or to a path under one; `--runtime` wins over it. The root found by a bounded upward walk is captured once and must declare the compiler's version, or the build is refused; a link, a non-regular file, or a tree past its ceilings is refused too. Both shapes build that crate: a vendored build copies its module tree, a linked build bundles it. A release refuses a runtime other than the embedded one, and a package gate ignores it. | `Tunable` |
 | `IPE_RUNTIME_VENDORED` | unset (linked) | `1` emits the vendored shape: the runtime module tree is copied into the emitted project's `src/ipe_runtime/` instead of linked as a path dependency. `0` keeps the linked shape. Any other value, the empty one included, is refused. | `Tunable` |
 
 ## Web server
