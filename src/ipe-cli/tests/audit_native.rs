@@ -257,6 +257,77 @@ fn the_audit_links_the_embedded_runtime_whatever_the_environment_and_cwd_name() 
     let _ = std::fs::remove_dir_all(&index);
 }
 
+#[test]
+fn the_linked_audit_ignores_a_runtime_override() {
+    // The linked analogue of the plant test above: `IPE_RUNTIME_VENDORED` is
+    // unset, so a developer resolution would link the `IPE_RUNTIME_DIR` crate.
+    // The plant declares this compiler's own version, so the version check
+    // passes; its `src/oversized.rs` passes the per-file ceiling, so only a
+    // capture of the plant refuses. The audit passing proves the gate never
+    // captured it: its emit bundles the embedded runtime.
+    let parent = temp_pkg("runtime-linked");
+    let pkg = parent.join("pkg");
+    std::fs::create_dir_all(pkg.join("src")).expect("create package src");
+    std::fs::write(
+        pkg.join("package.ipe"),
+        "module Package exposing (package)\n\n\npackage =\n    { name = \"pure-pkg\", version = \"0.1.0\" }\n",
+    )
+    .expect("write package.ipe");
+    std::fs::write(pkg.join("src").join("Main.ipe"), PURE_MAIN).expect("write Main");
+    let override_root = parent.join("override").join("rust");
+    std::fs::create_dir_all(override_root.join("src")).expect("create planted runtime src");
+    std::fs::write(
+        override_root.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"ipe-runtime-rust\"\nversion = \"{}\"\n",
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+    .expect("write planted runtime manifest");
+    std::fs::write(
+        override_root.join("src").join("lib.rs"),
+        "compile_error!(\"planted\");\n",
+    )
+    .expect("write planted lib.rs");
+    let oversized = "// planted\n".repeat(4 * 1024 * 1024 / 11 + 1);
+    assert!(
+        oversized.len() > 4 * 1024 * 1024,
+        "the plant passes the file ceiling"
+    );
+    std::fs::write(override_root.join("src").join("oversized.rs"), oversized)
+        .expect("write oversized plant");
+    let ipe_home = parent.join("ipe-home");
+    let index = empty_index("runtime-linked");
+
+    let mut cmd = Command::new(support::ipe_bin());
+    cmd.arg("package")
+        .arg("audit")
+        .arg(&pkg)
+        .arg("--index")
+        .arg(&index)
+        .current_dir(&pkg)
+        .env("IPE_RUNTIME_DIR", &override_root)
+        .env_remove("IPE_RUNTIME_VENDORED")
+        .env("IPE_HOME", &ipe_home);
+    let out = run_child(cmd).expect("run ipe package audit");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let _ = std::fs::remove_dir_all(&parent);
+    let _ = std::fs::remove_dir_all(&index);
+    assert!(
+        out.status.success(),
+        "the linked audit ignores the override; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("all Tier-1 checks passed"),
+        "Tier-1 runs to completion against the embedded runtime; got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("oversized.rs") && !stderr.contains("oversized.rs"),
+        "the planted tree is never captured; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
 // ===========================================================================
 // Real-jail differential confinement (wired platforms + IPE_E2E=1)
 //

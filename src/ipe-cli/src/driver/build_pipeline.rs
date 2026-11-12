@@ -1,4 +1,6 @@
-use super::{CliError, diag_span, io_err};
+#[cfg(not(unix))]
+use super::io_err;
+use super::{CliError, diag_span};
 use crate::env_dir::{HomeDir, HomeRefusal};
 use crate::loose_file::LooseFileError;
 #[cfg(not(unix))]
@@ -2646,19 +2648,19 @@ pub fn remove_stale_static_config(crate_dir: &OwnedDir) -> Result<(), CliError> 
 /// `ipe_runtime/mod.rs` / `config.rs` must win over the fuller copies from
 /// the source tree):
 ///   1. The vendored runtime module tree ([`RuntimeSource::module_tree`],
-///      under `src/ipe_runtime/`) — read at the driver boundary, never inside
-///      a salsa-tracked query. For the dependency model this step is replaced
-///      by bundling the embedded runtime source under `ipe_runtime_dep/` so
-///      the relative path dep in the emitted `Cargo.toml` is always satisfied.
+///      under `src/ipe_runtime/`) — captured at the driver boundary, never
+///      inside a salsa-tracked query. For the dependency model this step is
+///      replaced by bundling the resolved runtime crate
+///      ([`RuntimeSource::bundled`]) under `ipe_runtime_dep/` so the relative
+///      path dep in the emitted `Cargo.toml` is always satisfied.
 ///   2. `Cargo.toml` at the project root.
 ///   3. Every backend-emitted file (`emitted.files`; each key is already a
 ///      validated [`ipe_backend::RelPath`] — relative and `..`-free — so no
 ///      entry here can escape `out_dir`).
 ///
 /// # Errors
-/// The refusals of [`RuntimeSource::module_tree`] for a vendored emit;
-/// [`CliError::RuntimeMaterializeFailed`] when the embedded runtime crate
-/// contains non-UTF-8 files (unexpected for in-repo source).
+/// The refusals of [`RuntimeSource::module_tree`] for a vendored emit and of
+/// [`RuntimeSource::bundled`] for a linked one.
 pub fn build_emit_manifest(
     emitted: &ipe_backend::EmittedProject,
     runtime: &RuntimeSource,
@@ -2692,15 +2694,14 @@ pub fn build_emit_manifest(
         }
     } else {
         // Dependency model: the emitted `Cargo.toml` declares the runtime via
-        // a relative path dep (`path = "ipe_runtime_dep"`). Bundle the embedded
-        // runtime source under that directory so the dep resolves in any
-        // environment — cross-compiler container, offline, CI — without a
-        // host-absolute path. The embedded source is the binary's own version,
-        // identical to the in-repo tree by construction; its manifest version
-        // carries `role` and the bundle's content digest, so cargo never shares
-        // a compiled unit between two bundles that differ.
-        let embedded = runtime_embed::bundled_runtime(role)?;
-        for (rel, text) in embedded.files() {
+        // a relative path dep (`path = "ipe_runtime_dep"`). Bundle the resolved
+        // runtime crate — the embedded copy, or an override's captured tree —
+        // under that directory so the dep resolves in any environment without
+        // a host-absolute path. Its manifest version carries `role` and the
+        // bundle's content digest, so cargo never shares a compiled unit
+        // between two bundles that differ.
+        let bundled = runtime.bundled(role)?;
+        for (rel, text) in bundled.files() {
             manifest.insert(Path::new(RUNTIME_DEP_DIR).join(rel), text.clone());
         }
     }
@@ -2804,29 +2805,6 @@ pub fn declared_modules(mod_rs: &str) -> BTreeSet<String> {
         }
     }
     names
-}
-
-/// Recursively read every file under `src_dir` as UTF-8 text, inserting
-/// `(dst_prefix.join(rel), contents)` into `manifest`.
-pub fn collect_dir_text(
-    src_dir: &Path,
-    dst_prefix: &Path,
-    manifest: &mut BTreeMap<PathBuf, String>,
-) -> Result<(), CliError> {
-    let entries = fs::read_dir(src_dir).map_err(|e| io_err(src_dir, e))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| io_err(src_dir, e))?;
-        let from = entry.path();
-        let dst = dst_prefix.join(entry.file_name());
-        let file_type = entry.file_type().map_err(|e| io_err(&from, e))?;
-        if file_type.is_dir() {
-            collect_dir_text(&from, &dst, manifest)?;
-        } else {
-            let text = fs::read_to_string(&from).map_err(|e| io_err(&from, e))?;
-            manifest.insert(dst, text);
-        }
-    }
-    Ok(())
 }
 
 /// The emitted project's binary files keyed by crate-relative path, beside the
@@ -3391,6 +3369,67 @@ mod tests {
             uses_webview: false,
             assets: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// The manifest carries the bytes the override capture took, never a
+    /// reread of the root: a source file rewritten after resolution reaches
+    /// neither the vendored tree nor the linked bundle.
+    #[test]
+    #[allow(clippy::expect_used)] // a failed scratch setup is the test failure
+    fn the_manifest_carries_the_captured_runtime_never_a_reread() {
+        let root = crate::scratch::ScratchDir::new("ipe-runtime-captured-manifest")
+            .expect("scratch dir")
+            .into_path();
+        fs::create_dir_all(root.join("src")).expect("create runtime src/");
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{}\"\nversion = \"{}\"\n",
+                runtime_embed::RUNTIME_PACKAGE,
+                runtime_embed::COMPILER_VERSION
+            ),
+        )
+        .expect("write the runtime manifest");
+        fs::write(root.join("src/lib.rs"), "// captured\n").expect("write the source");
+        let runtime = RuntimeSource::resolve(
+            runtime_embed::RuntimeOrigin::Developer,
+            Some(&root),
+            RuntimeRemedy::EnvOnly,
+        );
+        fs::write(root.join("src/lib.rs"), "// reread\n").expect("rewrite the source");
+        let _ = fs::remove_dir_all(&root);
+        let runtime = runtime.expect("the scratch runtime proves");
+        let vendored = build_emit_manifest(
+            &vendored_project(&[]),
+            &runtime,
+            false,
+            runtime_embed::BundleRole::Out,
+        )
+        .expect("the vendored manifest builds");
+        let linked = build_emit_manifest(
+            &ipe_backend::EmittedProject {
+                files: BTreeMap::new(),
+                cargo_toml: String::new(),
+                uses_webview: false,
+                assets: BTreeMap::new(),
+            },
+            &runtime,
+            false,
+            runtime_embed::BundleRole::Out,
+        )
+        .expect("the linked manifest builds");
+        assert_eq!(
+            vendored
+                .get(Path::new("src/ipe_runtime/lib.rs"))
+                .map(String::as_str),
+            Some("// captured\n")
+        );
+        assert_eq!(
+            linked
+                .get(&Path::new(RUNTIME_DEP_DIR).join("src/lib.rs"))
+                .map(String::as_str),
+            Some("// captured\n")
+        );
     }
 
     /// The manifest refuses `.rs` text holding a raw bidi control or a bare CR,

@@ -230,9 +230,12 @@ main =
         )
 ```
 
-Running it (`ipe dev run`) prints its name — the store is assembled and the route wired,
-but the never-served `listen` is caught by `Task.onError`, so no live database or
-network is needed to prove the model compiles and the security path type-checks:
+The routes' signing key comes from the environment (`App.fromEnvRequired "SIGNING_KEY"`),
+never from source, and a missing or empty variable stops the program at startup. Run
+with the variable set (`SIGNING_KEY=… ipe dev run`), it prints its name — the store is
+assembled and the route wired, but the never-served `listen` is caught by
+`Task.onError`, so no live database or network is needed to prove the model compiles
+and the security path type-checks:
 
 ```text
 store-secured-owner

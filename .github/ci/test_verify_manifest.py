@@ -55,6 +55,7 @@ check_one_lock_per_graph = verify_manifest.check_one_lock_per_graph
 check_one_ipe_build = verify_manifest.check_one_ipe_build
 check_scoped_package_coverage = verify_manifest.check_scoped_package_coverage
 check_drift_sees_untracked = verify_manifest.check_drift_sees_untracked
+check_apt_one_path = verify_manifest.check_apt_one_path
 check_dependabot_pr_budget = verify_manifest.check_dependabot_pr_budget
 check_workspace_inheritance = verify_manifest.check_workspace_inheritance
 check_test_claims = verify_manifest.check_test_claims
@@ -5808,6 +5809,157 @@ class TestScopedPackageCoverage(unittest.TestCase):
 
 
 
+_APT_WF = """\
+on: pull_request
+jobs:
+  jail:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/apt-install
+        with:
+          packages: bubblewrap
+      - run: {run}
+"""
+_APT_ACTION = """\
+name: x
+description: x
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: {run}
+"""
+
+
+class TestAptOnePath(unittest.TestCase):
+    """Check 27: every apt package install runs the one apt action."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def errors(self, wf_run: str = "bwrap --version", action_run: str = "true", apt_run: str = "sudo apt-get install -y x") -> list[str]:
+        _write(os.path.join(self.root, "workflows", "ci.yml"), _APT_WF.format(run=wf_run))
+        _write(os.path.join(self.root, "actions", "other", "action.yml"), _APT_ACTION.format(run=action_run))
+        _write(os.path.join(self.root, "actions", "apt-install", "action.yml"), _APT_ACTION.format(run=apt_run))
+        errors: list[str] = []
+        check_apt_one_path(_load(self.root, errors), errors)
+        return errors
+
+    def test_control_passes(self) -> None:
+        # The apt action itself runs apt; other runs naming apt paths and
+        # sibling tools pass.
+        self.assertEqual(self.errors(), [])
+        for run in ("apt-cache policy bubblewrap", "cat /etc/apt/apt-mirrors.txt", "echo adapt-get aptly"):
+            with self.subTest(run=run):
+                self.assertEqual(self.errors(wf_run=run, action_run=run), [])
+
+    def test_repo_passes(self) -> None:
+        errors: list[str] = []
+        check_apt_one_path(_load(verify_manifest.REPO_ROOT, errors), errors)
+        self.assertEqual(errors, [])
+
+    def test_bare_install_refused(self) -> None:
+        errors = self.errors(wf_run="sudo apt-get update && sudo apt-get install -y ripgrep")
+        self.assertTrue(any("check 27: workflows/ci.yml job 'jail' step 2 runs apt" in e for e in errors), errors)
+
+    def test_every_spelling_refused(self) -> None:
+        for run in (
+            "sudo apt-get -y install bubblewrap",
+            "sudo apt install -y bubblewrap",
+            "/usr/bin/apt-get install -y x",
+            "sudo timeout 60 aptitude install -y x",
+            'sudo ap""t-get install -y x',
+            "sudo 'apt-get' install -y x",
+            "apt-get update",
+        ):
+            with self.subTest(run=run):
+                errors = self.errors(wf_run=repr(run))
+                self.assertTrue(any("check 27: workflows/ci.yml" in e for e in errors), errors)
+                errors = self.errors(action_run=repr(run))
+                self.assertTrue(any("check 27: actions/other/action.yml composite steps step 1 runs apt" in e for e in errors), errors)
+
+    def test_unreadable_action_refused(self) -> None:
+        _write(os.path.join(self.root, "actions", "broken", "action.yml"), "runs: [\n")
+        errors = self.errors()
+        self.assertTrue(any("check 27: cannot read" in e for e in errors), errors)
+
+
+class TestAptInstallScript(unittest.TestCase):
+    """The apt action's own `run` text, executed with `sudo` stubbed (an apt
+    or dpkg command exits `rc`, the mirror edit succeeds): it refuses every
+    input it cannot pass to apt as written, and fails when both attempts
+    fail."""
+
+    def run_script(self, packages: str, archives: str = "", recommends: str = "false", rc: int = 0, lc_all: str = "en_US.UTF-8") -> tuple[int, list[str]]:
+        """Exit status and recorded `sudo` argv lines; `{tmp}` in `archives`
+        is a writable scratch directory."""
+        doc = verify_manifest._read_action(os.path.join(_RT_REPO, ".github", "actions", "apt-install", "action.yml"))
+        script = doc["runs"]["steps"][0]["run"]
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "sudo.log")
+            stub = os.path.join(tmp, "sudo")
+            with open(stub, "w", encoding="utf-8") as f:
+                f.write('#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$SUDO_LOG"\n[ "$1" = timeout ] || exit 0\nexit "$SUDO_RC"\n')
+            os.chmod(stub, 0o755)
+            env = {
+                "PATH": tmp + os.pathsep + os.environ.get("PATH", ""),
+                "SUDO_LOG": log,
+                "SUDO_RC": str(rc),
+                "LC_ALL": lc_all,
+                "APT_PACKAGES": packages,
+                "APT_ARCHIVES": archives.replace("{tmp}", tmp),
+                "APT_NO_RECOMMENDS": recommends,
+            }
+            done = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=60, check=False)
+            calls = open(log, encoding="utf-8").read().splitlines() if os.path.exists(log) else []
+        return done.returncode, calls
+
+    def test_control_installs(self) -> None:
+        with tempfile.TemporaryDirectory() as archives:
+            code, calls = self.run_script("bubblewrap python3", archives=archives, recommends="true")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            calls,
+            [
+                "timeout 360 dpkg --configure -a",
+                "timeout 360 apt-get -o Acquire::Retries=3 update",
+                f"timeout 360 apt-get -o Acquire::Retries=3 -y --no-install-recommends -o Dir::Cache::archives={archives} install bubblewrap python3",
+            ],
+        )
+
+    def test_unpassable_input_refused(self) -> None:
+        for packages, archives, recommends in (
+            ("", "", "false"),
+            ("   ", "", "false"),
+            ("bubblewrap\n-o evil", "", "false"),
+            ("bubblewrap -o", "", "false"),
+            ("-y", "", "false"),
+            ("Bubblewrap", "", "false"),
+            ("caf\u00e9", "", "false"),
+            ("a;b", "", "false"),
+            ("x", "", "yes"),
+            ("x", "relative/dir", "false"),
+            ("x", "{tmp}/../escaped", "false"),
+            ("x", "{tmp}/./x", "false"),
+            ("x", "/tmp/a b", "false"),
+            ("x", "/tmp/x\n/etc", "false"),
+            ("x", "/tmp/x/", "false"),
+        ):
+            with self.subTest(packages=packages, archives=archives, recommends=recommends):
+                code, calls = self.run_script(packages, archives, recommends)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(calls, [])
+
+    def test_both_attempts_failing_fails(self) -> None:
+        code, calls = self.run_script("bubblewrap", rc=1)
+        self.assertNotEqual(code, 0)
+        self.assertEqual([c for c in calls if "dpkg --configure -a" in c], ["timeout 360 dpkg --configure -a"] * 2)
+
+
 _DU_WF = """\
 on: pull_request
 jobs:
@@ -6714,7 +6866,7 @@ jobs:
           expected="ipe-linux-x64 ipe-darwin-arm64 ipe-freebsd-x64"
           echo done
 """
-# The two local actions the native jobs run, as the repository holds them:
+# The local actions the native jobs run, as the repository holds them:
 # check 23 pins their bodies, so the fixture is the real text.
 _RT_REPO = os.path.dirname(os.path.dirname(HERE))
 
@@ -6726,6 +6878,9 @@ def _rt_action_text(name: str) -> str:
 
 _RT_ACTION = _rt_action_text("rust-toolchain-pinned")
 _RT_TOOLCHAIN = _rt_action_text("release-target-toolchain")
+_RT_APT = _rt_action_text("apt-install")
+# The first line of `_RT_APT`'s one `run` text, where a test splices a line.
+_RT_APT_RUN = "      run: |\n        set -euo pipefail\n"
 
 
 class TestReleaseTargetParity(unittest.TestCase):
@@ -6739,6 +6894,7 @@ class TestReleaseTargetParity(unittest.TestCase):
         release: str = _RT_RELEASE,
         action: str | None = _RT_ACTION,
         toolchain: str | None = _RT_TOOLCHAIN,
+        apt: str | None = _RT_APT,
     ) -> list[str]:
         with tempfile.TemporaryDirectory() as repo:
             root = os.path.join(repo, ".github")
@@ -6748,6 +6904,8 @@ class TestReleaseTargetParity(unittest.TestCase):
                 _write(os.path.join(root, "actions", "rust-toolchain-pinned", "action.yml"), action)
             if toolchain is not None:
                 _write(os.path.join(root, "actions", "release-target-toolchain", "action.yml"), toolchain)
+            if apt is not None:
+                _write(os.path.join(root, "actions", "apt-install", "action.yml"), apt)
             errors: list[str] = []
             check_release_target_parity(_load(root, errors), errors)
             return errors
@@ -6759,8 +6917,9 @@ class TestReleaseTargetParity(unittest.TestCase):
         release: str = _RT_RELEASE,
         action: str | None = _RT_ACTION,
         toolchain: str | None = _RT_TOOLCHAIN,
+        apt: str | None = _RT_APT,
     ) -> None:
-        errors = self.errors(ci, release, action, toolchain)
+        errors = self.errors(ci, release, action, toolchain, apt)
         self.assertTrue(any(needle in e for e in errors), f"expected {needle!r} in {errors}")
 
     @staticmethod
@@ -6768,13 +6927,19 @@ class TestReleaseTargetParity(unittest.TestCase):
         assert text.count(old) >= 1, old
         return text.replace(old, new)
 
+    _APT_PINNED = "apt-install' step 1.run is"
+
+    def apt_first(self, line: str) -> str:
+        """`_RT_APT` with `line` (its continuation lines at the run's
+        indentation) run before its first line."""
+        return self.swap(_RT_APT, _RT_APT_RUN, "      run: |\n        " + line.replace("\n", "\n        ") + "\n        set -euo pipefail\n")
+
     _CI_CARGO = "      - name: Check ipe + ipe-ffi-inspector\n"
     _REL_CARGO = "      - name: Build ipe + ipe-ffi-inspector\n"
     _CI_VM_RUN = "          run: |\n            cargo check"
     _REL_VM_RUN = "          run: |\n            cargo build"
     _CI_CARGO_RUN = "        run: cargo check --release"
     _REL_CARGO_RUN = "        run: cargo build --release"
-    _MUSL_RUN = "      run: sudo apt-get update && sudo apt-get install -y musl-tools\n"
     _MUSL_IF = "contains(inputs.target, 'musl')"
     _NATIVE_3 = ("ci.yml job 'release-targets-run' step 3", "release.yml job 'build' step 3")
 
@@ -6880,8 +7045,22 @@ class TestReleaseTargetParity(unittest.TestCase):
             "ci.yml job 'release-targets-run' step 2.with.target is",
             self.swap(_RT_CI, "          target: ${{ matrix.target }}\n", "          target: x86_64-unknown-linux-musl\n"),
         )
-        toolchain = self.swap(_RT_TOOLCHAIN, "install -y musl-tools", "install -y musl-dev")
-        self.assertRefused("release-target-toolchain' step 3.run is", toolchain=toolchain)
+        toolchain = self.swap(_RT_TOOLCHAIN, "packages: musl-tools", "packages: musl-dev")
+        self.assertRefused("release-target-toolchain' step 3.with.packages is", toolchain=toolchain)
+        toolchain = self.swap(_RT_TOOLCHAIN, "packages: musl-tools", "packages: musl-tools\n        no-install-recommends: \"true\"")
+        self.assertRefused("release-target-toolchain' step 3.with has keys", toolchain=toolchain)
+        for old, new in (
+            ("sudo timeout 360 dpkg --configure -a \\\n", ""),
+            ("timeout 360 apt-get -o Acquire::Retries=3 update", "apt-get update"),
+            ("for attempt in 1 2; do", "for attempt in 1; do"),
+            ("archive.ubuntu.com|g'", "mirror.invalid|g'"),
+        ):
+            with self.subTest(apt=new):
+                self.assertRefused(self._APT_PINNED, apt=self.swap(_RT_APT, old, new))
+        default = self.swap(_RT_APT, '    default: "false"\n', '    default: "true"\n')
+        self.assertRefused("apt-install' inputs (descriptions aside).no-install-recommends.default is", apt=default)
+        env = self.swap(_RT_APT, "APT_PACKAGES: ${{ inputs.packages }}", "APT_PACKAGES: ${{ inputs.packages }} ${{ github.head_ref }}")
+        self.assertRefused("apt-install' step 1.env.APT_PACKAGES is", apt=env)
         toolchain = self.swap(_RT_TOOLCHAIN, self._MUSL_IF, "true")
         self.assertRefused("release-target-toolchain' step 3.if is", toolchain=toolchain)
         toolchain = self.swap(_RT_TOOLCHAIN, "targets: ${{ inputs.target }}", "targets: x86_64-unknown-linux-musl")
@@ -7086,8 +7265,7 @@ class TestReleaseTargetParity(unittest.TestCase):
         # A stale entry is refused.
         self.assertRefused("missing ['CARGO_TERM_COLOR']", self.swap(_RT_CI, "  CARGO_TERM_COLOR: always\n", ""))
         # The name of an allowed difference is read nowhere before the cargo command.
-        toolchain = self.swap(_RT_TOOLCHAIN, "run: sudo apt-get update", "run: test -z \"$CARGO_INCREMENTAL\" || sudo apt-get update")
-        self.assertRefused("release-target-toolchain' step 3.run is", toolchain=toolchain)
+        self.assertRefused(self._APT_PINNED, apt=self.apt_first('test -z "$CARGO_INCREMENTAL" || true'))
         ci = self.swap(_RT_CI, '--target "$TARGET"', '--target "$TARGET$EXT"')
         release = self.swap(_RT_RELEASE, '--target "$TARGET" -p', '--target "$TARGET$EXT" -p')
         self.assertRefused("ci.yml job 'release-targets-run' step 3.run is", ci, release)
@@ -7117,15 +7295,14 @@ class TestReleaseTargetParity(unittest.TestCase):
                 self.assertRefused("release-target-toolchain' step 3.if is", toolchain=self.swap(_RT_TOOLCHAIN, cond, new))
         ref = ("          target: ${{ matrix.target }}\n", "          target: ${{ github.ref_name }}\n")
         self.assertRefused("release.yml job 'build' step 2.with.target is", release=self.swap(_RT_RELEASE, *ref))
-        shell = ("run: sudo apt-get update", "run: test \"$GITHUB_EVENT_NAME\" = x || sudo apt-get update")
-        self.assertRefused("release-target-toolchain' step 3.run is", toolchain=self.swap(_RT_TOOLCHAIN, *shell))
+        self.assertRefused(self._APT_PINNED, apt=self.apt_first('test "$GITHUB_EVENT_NAME" = x || true'))
         save = ("save-if: ${{ github.ref == 'refs/heads/main' }}", "save-if: true")
         self.assertRefused("release-target-toolchain' step 2.with.save-if is", toolchain=self.swap(_RT_TOOLCHAIN, *save))
 
     def test_local_action_context_read_refused(self) -> None:
         action = self.swap(_RT_ACTION, "targets: ${{ inputs.targets }}", "targets: ${{ github.event_name == 'release' && 'x' || inputs.targets }}")
         self.assertRefused("rust-toolchain-pinned' step 2.with.targets is", action=action)
-        for absent in ("action", "toolchain"):
+        for absent in ("action", "toolchain", "apt"):
             with self.subTest(absent=absent):
                 errors = self.errors(**{absent: None})
                 self.assertTrue(any("has no single action.yml" in e for e in errors), errors)
@@ -7158,19 +7335,15 @@ class TestReleaseTargetParity(unittest.TestCase):
         self.assertRefused("outside the runner-label and target-triple grammar", release=release)
 
     def test_name_spliced_across_an_expression_refused(self) -> None:
-        guard = 'run: test -z "{}" || sudo apt-get update'
+        guard = 'test -z "{}" || true'
         for text in ("$${{ matrix.part }}_REF", "$GITHUB${{ matrix.part }}", "$${{ format('{0}_REF', 'GITHUB') }}"):
             with self.subTest(text=text):
-                toolchain = self.swap(_RT_TOOLCHAIN, "run: sudo apt-get update", guard.format(text))
-                self.assertRefused("release-target-toolchain' step 3.run is", toolchain=toolchain)
+                self.assertRefused(self._APT_PINNED, apt=self.apt_first(guard.format(text)))
         ci, release = self.with_leg_key("part: GITHUB")
         self.assertRefused("a matrix leg must hold exactly", ci, release)
 
     def test_actions_runner_variable_refused(self) -> None:
-        toolchain = self.swap(
-            _RT_TOOLCHAIN, "run: sudo apt-get update", 'run: test -z "$ACTIONS_ID_TOKEN_REQUEST_URL" || sudo apt-get update'
-        )
-        self.assertRefused("release-target-toolchain' step 3.run is", toolchain=toolchain)
+        self.assertRefused(self._APT_PINNED, apt=self.apt_first('test -z "$ACTIONS_ID_TOKEN_REQUEST_URL" || true'))
 
     def test_local_action_defaults_and_run_read_no_unscanned_value(self) -> None:
         defaults = self.swap(_RT_ACTION, '    required: false\n    default: ""\n\nruns:', '    required: false\n    default: ${{ github.ref_name }}\n\nruns:')
@@ -7223,12 +7396,8 @@ class TestReleaseTargetParity(unittest.TestCase):
         # Before the cargo command no continuation can be written at all.
         for text in ('$GITHUB\\\n_REF_NAME', '$GIT\\\nHUB_REF', '$GITHUB`\n_REF_NAME'):
             with self.subTest(text=text):
-                toolchain = self.swap(
-                    _RT_TOOLCHAIN,
-                    "      run: sudo apt-get update",
-                    '      run: |\n        echo "RUSTFLAGS=--cfg ' + text.replace("\n", "\n        ") + '" >> "$GITHUB_ENV"\n        sudo apt-get update',
-                )
-                self.assertRefused("release-target-toolchain' step 3.run is", toolchain=toolchain)
+                apt = self.apt_first('echo "RUSTFLAGS=--cfg ' + text + '" >> "$GITHUB_ENV"')
+                self.assertRefused(self._APT_PINNED, apt=apt)
         # After it, the tail scan joins continuations before it names a program.
         for split in ("CAR\\\n            GO build", "car\\\r\n            go build"):
             with self.subTest(split=split):
@@ -7238,8 +7407,7 @@ class TestReleaseTargetParity(unittest.TestCase):
                 self.assertRefused("runs `cargo` after the cargo command", release=release)
 
     def test_runner_variable_refused(self) -> None:
-        toolchain = self.swap(_RT_TOOLCHAIN, "run: sudo apt-get update", 'run: echo "RUSTFLAGS=--cfg d$RUNNER_DEBUG" >> "$GITHUB_ENV" && sudo apt-get update')
-        self.assertRefused("release-target-toolchain' step 3.run is", toolchain=toolchain)
+        self.assertRefused(self._APT_PINNED, apt=self.apt_first('echo "RUSTFLAGS=--cfg d$RUNNER_DEBUG" >> "$GITHUB_ENV"'))
         self.assertRefusedBeforeCargo('echo "RUSTFLAGS=--cfg d$RUNNER_DEBUG" >> "$GITHUB_ENV"')
 
     _TAG_REF = "          ref: ${{ needs.resolve-tag.outputs.tag }}\n"
@@ -7419,16 +7587,17 @@ class TestReleaseTargetParity(unittest.TestCase):
     def test_run_steps_name_bash(self) -> None:
         for shell in ("cmd", "pwsh", "sh", "bash -c 'git checkout main; bash {0}'"):
             with self.subTest(shell=shell):
-                toolchain = self.swap(_RT_TOOLCHAIN, "      shell: bash\n      run: sudo", f"      shell: {shell}\n      run: sudo")
+                apt = self.swap(_RT_APT, "      shell: bash\n      env:", f"      shell: {shell}\n      env:")
                 self.assertRefused(
-                    f"release.yml job 'build' step 2 -> ./.github/actions/release-target-toolchain step 3 runs under `shell: {shell!r}`",
-                    toolchain=toolchain,
+                    "release.yml job 'build' step 2 -> ./.github/actions/release-target-toolchain step 3 -> "
+                    f"./.github/actions/apt-install step 1 runs under `shell: {shell!r}`",
+                    apt=apt,
                 )
                 release = self.swap(_RT_RELEASE, "        shell: bash\n        env:\n          TARGET: ${{ matrix.target }}\n          EXT:", f"        shell: {shell}\n        env:\n          TARGET: ${{{{ matrix.target }}}}\n          EXT:")
                 self.assertRefused(f"release.yml job 'build' step 4 runs under `shell: {shell!r}`", release=release)
         # The runner's default shell is PowerShell on Windows.
-        toolchain = self.swap(_RT_TOOLCHAIN, "      shell: bash\n      run: sudo", "      run: sudo")
-        self.assertRefused("release-target-toolchain step 3 runs under `shell: None`", toolchain=toolchain)
+        apt = self.swap(_RT_APT, "      shell: bash\n      env:", "      env:")
+        self.assertRefused("apt-install step 1 runs under `shell: None`", apt=apt)
         later = "      - run: echo after\n"
         release = self.swap(_RT_RELEASE, "  build-freebsd:\n", later + "  build-freebsd:\n")
         self.assertRefused("release.yml job 'build' step 5 runs under `shell: None`", release=release)

@@ -1702,3 +1702,192 @@ fn a_vendored_test_outside_a_checkout_runs_on_the_embedded_runtime() -> TestResu
     );
     Ok(())
 }
+
+/// The probe line an override's `src/basics.rs` gains, holding `value`.
+fn probe_line(value: u32) -> String {
+    format!("\npub const IPE_PROBE: u32 = {value};\n")
+}
+
+/// Copy the runtime crate `from` to `to`, leaving out the root `tests` and
+/// `target` directories the capture skips, and pin its version to this
+/// compiler's so the copy stands outside the workspace it inherits from.
+fn copy_runtime_crate(from: &Path, to: &Path) -> Result<(), Box<dyn Error>> {
+    let mut pending = vec![(from.to_path_buf(), to.to_path_buf(), 0_usize)];
+    let mut visited = 0_usize;
+    while let Some((src, dst, depth)) = pending.pop() {
+        visited += 1;
+        assert!(visited < 100_000, "the runtime crate is unbounded");
+        std::fs::create_dir_all(&dst)?;
+        for entry in std::fs::read_dir(&src)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if depth == 0 && (name == "tests" || name == "target") {
+                continue;
+            }
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push((entry.path(), dst.join(&name), depth + 1));
+            } else if kind.is_file() {
+                std::fs::copy(entry.path(), dst.join(&name))?;
+            } else {
+                return Err(format!("unexpected entry {}", entry.path().display()).into());
+            }
+        }
+    }
+    let manifest = to.join("Cargo.toml");
+    let text = std::fs::read_to_string(&manifest)?;
+    let pinned = text.replacen(
+        "version.workspace = true",
+        &format!("version = \"{}\"", env!("CARGO_PKG_VERSION")),
+        1,
+    );
+    assert_ne!(pinned, text, "the runtime manifest inherits its version");
+    std::fs::write(&manifest, pinned)?;
+    Ok(())
+}
+
+/// Every compiled rlib of the library `lib` in any profile of `target`.
+fn rlibs_in_any_profile(target: &Path, lib: &str) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+    let prefix = format!("lib{lib}-");
+    let mut found = Vec::new();
+    for profile in ["debug", "release"] {
+        let deps = target.join(profile).join("deps");
+        if !deps.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&deps)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&prefix)
+                && entry.path().extension().is_some_and(|ext| ext == "rlib")
+            {
+                found.push(entry.path());
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// Build `project` with `ipe dev build` into `out` against the override
+/// `runtime`, under the emit model `vendored` names.
+fn dev_build_with_override(
+    project: &Path,
+    out: &Path,
+    runtime: &Path,
+    cache: &Path,
+    target: &e2e_support::target::BuildTarget,
+    vendored: bool,
+) -> Result<(bool, String, String), Box<dyn Error>> {
+    let mut cmd = e2e_support::target::ipe_command(&support::ipe_bin(), target);
+    cmd.arg("dev")
+        .arg("build")
+        .arg(project)
+        .arg("--out")
+        .arg(out)
+        .env("IPE_RUNTIME_DIR", runtime)
+        .env("XDG_CACHE_HOME", cache)
+        .env("CARGO_BUILD_RUSTC_WRAPPER", "")
+        .env("RUSTC_WRAPPER", "")
+        .env("NO_COLOR", "1");
+    if vendored {
+        cmd.env("IPE_RUNTIME_VENDORED", "1");
+    } else {
+        cmd.env_remove("IPE_RUNTIME_VENDORED");
+    }
+    run_captured(cmd)
+}
+
+/// An override edited with its mtime pinned back is rebuilt from its new bytes.
+///
+/// Build 1 bundles the override holding `IPE_PROBE = 1`. The probe is then
+/// flipped to `2`, the file given back its old modification time and every
+/// build record moved a day ahead, so no timestamp shows the edit. Build 2
+/// bundles `2`, and on the linked model cargo compiles a second runtime unit:
+/// the bundle's version stamp carries the captured content digest.
+fn an_override_edit_is_rebuilt(name: &str, vendored: bool) -> TestResult {
+    let base = ipe_test_temp::temp_root().join(format!("{name}_{}", std::process::id()));
+    e2e_support::scratch::fresh(&base);
+    let runtime = base.join("override");
+    copy_runtime_crate(&e2e_support::require_runtime_crate(), &runtime)?;
+    let probed = runtime.join("src").join("basics.rs");
+    let original = std::fs::read_to_string(&probed)?;
+    std::fs::write(&probed, format!("{original}{}", probe_line(1)))?;
+    let project = base.join("project");
+    write_project(&project)?;
+    let out = base.join("out");
+    let cache = base.join("cache");
+    std::fs::create_dir_all(&cache)?;
+    let target = e2e_support::target::BuildTarget::Isolated(e2e_support::target::isolated(
+        e2e_support::target::IsolationReason::FixedPackageName,
+    )?);
+    let rust = out.join("rust");
+    let bundled = if vendored {
+        rust.join("src").join("ipe_runtime").join("basics.rs")
+    } else {
+        rust.join("ipe_runtime_dep").join("src").join("basics.rs")
+    };
+
+    let (ok, _, stderr) =
+        dev_build_with_override(&project, &out, &runtime, &cache, &target, vendored)?;
+    assert!(ok, "build 1 must succeed, got stderr:\n{stderr}");
+    assert!(
+        std::fs::read_to_string(&bundled)?.contains(&probe_line(1)),
+        "build 1 bundles the override's bytes at {}",
+        bundled.display()
+    );
+    let first = rlibs_in_any_profile(target.path(), "ipe_runtime_rust")?;
+    assert_eq!(
+        first.len(),
+        usize::from(!vendored),
+        "build 1 compiles a runtime unit only when linked, got {first:?}"
+    );
+
+    let pinned = std::fs::metadata(&probed)?.modified()?;
+    std::fs::write(&probed, format!("{original}{}", probe_line(2)))?;
+    std::fs::File::options()
+        .write(true)
+        .open(&probed)?
+        .set_modified(pinned)?;
+    age_build_records_forward(target.path())?;
+    age_build_records_forward(&out)?;
+
+    let (ok, _, stderr) =
+        dev_build_with_override(&project, &out, &runtime, &cache, &target, vendored)?;
+    assert!(ok, "build 2 must succeed, got stderr:\n{stderr}");
+    let text = std::fs::read_to_string(&bundled)?;
+    assert!(
+        text.contains(&probe_line(2)) && !text.contains(&probe_line(1)),
+        "build 2 bundles the edited override, never build 1's capture"
+    );
+    if !vendored {
+        let second = rlibs_in_any_profile(target.path(), "ipe_runtime_rust")?;
+        assert!(
+            second.len() == 2 && first.iter().all(|rlib| second.contains(rlib)),
+            "build 2 compiles a runtime unit of its own, got {second:?} after {first:?}"
+        );
+    }
+    drop(target);
+    let _ = std::fs::remove_dir_all(&base);
+    Ok(())
+}
+
+/// A linked `ipe dev build` recompiles an override edited under a pinned mtime.
+#[test]
+fn a_linked_override_edited_under_a_pinned_mtime_recompiles_the_runtime() -> TestResult {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!("skipping: set IPE_E2E=1 to run the linked override freshness E2E");
+        return Ok(());
+    }
+    an_override_edit_is_rebuilt("ipe_override_linked", false)
+}
+
+/// A vendored `ipe dev build` re-vendors an override edited under a pinned mtime.
+#[test]
+fn a_vendored_override_edited_under_a_pinned_mtime_is_revendored() -> TestResult {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!("skipping: set IPE_E2E=1 to run the vendored override freshness E2E");
+        return Ok(());
+    }
+    an_override_edit_is_rebuilt("ipe_override_vendored", true)
+}

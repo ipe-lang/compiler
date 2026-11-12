@@ -877,6 +877,36 @@ messages! {
     cli_runtime_materialize_failed(detail) = "cli-runtime-materialize-failed";
     /// The resolved runtime crate declares a different version than the compiler.
     cli_runtime_version_mismatch(path, found, expected) = "cli-runtime-version-mismatch";
+    /// A named runtime crate holds an entry the capture refuses.
+    cli_runtime_tree_refused(root, entry, reason) = "cli-runtime-tree-refused";
+    /// A runtime tree entry is a link.
+    cli_runtime_tree_link = "cli-runtime-tree-link";
+    /// A runtime tree entry is not a regular file or directory.
+    cli_runtime_tree_not_regular = "cli-runtime-tree-not-regular";
+    /// A runtime tree file has more than one hard link.
+    cli_runtime_tree_hard_linked = "cli-runtime-tree-hard-linked";
+    /// A runtime tree entry name or file is not UTF-8.
+    cli_runtime_tree_not_utf8 = "cli-runtime-tree-not-utf8";
+    /// A runtime tree entry cannot be opened or read.
+    cli_runtime_tree_unreadable = "cli-runtime-tree-unreadable";
+    /// A runtime tree entry vanished during the capture.
+    cli_runtime_tree_absent = "cli-runtime-tree-absent";
+    /// A runtime tree nests deeper than its ceiling.
+    cli_runtime_tree_too_deep(limit) = "cli-runtime-tree-too-deep";
+    /// A runtime tree holds more entries than its ceiling.
+    cli_runtime_tree_too_many_entries(limit) = "cli-runtime-tree-too-many-entries";
+    /// A runtime tree file is larger than its ceiling.
+    cli_runtime_tree_file_too_large(limit) = "cli-runtime-tree-file-too-large";
+    /// A runtime tree's files are larger together than their ceiling.
+    cli_runtime_tree_too_large(limit) = "cli-runtime-tree-too-large";
+    /// A named runtime crate declares no readable version.
+    cli_runtime_version_unknown(path) = "cli-runtime-version-unknown";
+    /// A release named a runtime crate other than the embedded one.
+    cli_release_runtime_override(path) = "cli-release-runtime-override";
+    /// The release runtime-override remedy on a surface without `--runtime`.
+    cli_release_runtime_remedy_env_only = "cli-release-runtime-remedy-env-only";
+    /// The release runtime-override remedy on a surface taking `--runtime`.
+    cli_release_runtime_remedy_with_flag = "cli-release-runtime-remedy-with-flag";
     /// The runtime refusal remedy on a surface without `--runtime`.
     cli_runtime_remedy_env_only = "cli-runtime-remedy-env-only";
     /// The runtime refusal remedy on a surface taking `--runtime`.

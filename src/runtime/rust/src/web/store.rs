@@ -5664,3 +5664,74 @@ mod tests {
         assert!(bounded.is_ok(), "the store answers within the bound");
     }
 }
+
+// The retained-size measure's depth ceiling, driven through a live session's
+// resident recharge: a model nested past it refuses the session's bound, so the
+// caller closes the session as `OverCeiling`.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod measure_depth_tests {
+    use super::*;
+    use crate::retained::MEASURE_DEPTH;
+    use crate::retained::depth_fixture::{Link, chain};
+    use crate::web::Html;
+    use crate::web::budget::OverBudget;
+
+    /// A live session whose model is `model`.
+    fn entry(model: Link) -> SessionHandle<Link, ()> {
+        let tree: Html<()> = Html::HText(String::new());
+        #[cfg(feature = "debugger")]
+        let history = crate::debugger::RecordBuffer::measured(
+            model.clone(),
+            crate::debugger::DEFAULT_HISTORY_CAP,
+        );
+        Arc::new(Mutex::new(SessionEntry {
+            model,
+            rendered: crate::web::Rendered::first(
+                crate::web::SessionKeys::distinct(),
+                tree,
+                crate::web::PageUrl::Unrouted,
+            ),
+            tabs: crate::web::TabSeqs::default(),
+            seq: 0,
+            sse_tx: None,
+            msg_tx: tokio::sync::mpsc::channel(1).0,
+            event_tx: tokio::sync::mpsc::channel(1).0,
+            entered_path: None,
+            enter_tx: tokio::sync::mpsc::channel(1).0,
+            #[cfg(feature = "debugger")]
+            history,
+            #[cfg(feature = "debugger")]
+            debug_cursor: None,
+            liveness: crate::web::SessionLiveness::default(),
+            charge: crate::web::budget::Charge::detached(),
+            cmds: Arc::new(crate::web::budget::SessionCmds::new()),
+            port_life: None,
+        }))
+    }
+
+    // Refusal: the session's measure descends one level into its model, so a
+    // model that takes the whole ceiling stays resident and one a level deeper
+    // is refused at the session's own bound; `keep_resident` then answers that
+    // the session is to be closed.
+    #[test]
+    #[allow(clippy::expect_used)] // test: a runtime that cannot start is the failure
+    fn a_model_nested_past_the_measure_depth_refuses_its_session() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a test runtime builds");
+        let store = MemoryStore::<Link, ()>::new(Duration::from_secs(60));
+        let at = MEASURE_DEPTH.get();
+
+        let fits = entry(chain(at));
+        assert!(runtime.block_on(crate::web::keep_resident(&fits, &store)));
+
+        let deep = entry(chain(at + 1));
+        assert_eq!(
+            deep.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .recharge_resident(),
+            Err(OverBudget::Session)
+        );
+        assert!(!runtime.block_on(crate::web::keep_resident(&deep, &store)));
+    }
+}

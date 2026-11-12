@@ -1745,12 +1745,14 @@ pub fn run_eject(rest: &[String]) -> Result<(), CliError> {
 /// vendored, tree-shaken shape: a self-contained project names no runtime path
 /// dependency ([`RuntimeEmit::Vendored`]) and carries only the reached runtime
 /// source (`tree_shake_vendored = true`). Static/wasm options stay at their
-/// defaults — eject is the plain native standalone shape.
+/// defaults — eject is the plain native standalone shape. It vendors the
+/// compiler's embedded runtime only ([`runtime_embed::RuntimeOrigin::Release`]).
 pub(super) fn eject_options() -> BuildOptions {
     BuildOptions {
         intent: Verb::RELEASE_EJECT.intent(),
         runtime_emit: RuntimeEmit::Vendored,
         tree_shake_vendored: true,
+        runtime_origin: runtime_embed::RuntimeOrigin::Release,
         ..BuildOptions::default()
     }
 }
@@ -2029,8 +2031,8 @@ pub fn release_pipeline(
                     debugger: false,
                     // A release build never carries appearance hot-swap scaffolding.
                     hot_appearance: false,
-                    // A developer build links the runtime its environment names.
-                    runtime_origin: runtime_embed::RuntimeOrigin::Developer,
+                    // A release build links the compiler's embedded runtime only.
+                    runtime_origin: runtime_embed::RuntimeOrigin::Release,
                 };
                 let runtime = RuntimeSource::resolve(
                     options.runtime_origin,
@@ -2113,6 +2115,8 @@ pub fn release_pipeline(
                 intent: verb.intent(),
                 runtime_emit: RuntimeEmit::from_env()?,
                 tree_shake_vendored: false,
+                // A release build links the compiler's embedded runtime only.
+                runtime_origin: runtime_embed::RuntimeOrigin::Release,
                 ..BuildOptions::default()
             };
             let runtime = RuntimeSource::resolve(

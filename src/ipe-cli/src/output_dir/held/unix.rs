@@ -7,8 +7,9 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
 use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
-use ipe_fs_open::{EntryName, HeldDir};
+use ipe_fs_open::{EntryName, FileId, HeldDir};
 use rustix::fs::{AtFlags, Mode, OFlags};
 
 use super::Listed;
@@ -76,6 +77,66 @@ pub fn create_private(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
         claim_mode(),
     )?;
     Ok(File::from(fd))
+}
+
+/// Flags opening an existing entry only to stat it, never through a link, a FIFO, or a terminal.
+fn stat_flags() -> OFlags {
+    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC
+}
+
+/// The permission bits a replacement carries over: read, write and execute only.
+///
+/// Setuid, setgid and the sticky bit are never carried to new content.
+const CARRIED_BITS: u32 = 0o777;
+
+/// The group's read, write and execute bits.
+const GROUP_BITS: u32 = 0o070;
+
+/// The bits a replacement of a file with permission bits `mode` takes.
+///
+/// The group bits grant the file's group: they are carried only when the
+/// replacement belongs to the judged file's group, so they never open the
+/// content to another group.
+pub(super) const fn carried_bits(mode: u32, same_group: bool) -> u32 {
+    let bits = mode & CARRIED_BITS;
+    if same_group { bits } else { bits & !GROUP_BITS }
+}
+
+/// Give `staged` the group and permission bits of the entry `name` of `dir`, only while it is the file `judged`.
+///
+/// The staged file takes the judged file's group when this user may give
+/// it that group; otherwise it keeps its own group and none of the group
+/// bits. `Ok(false)` when the entry is gone, a link, or another object than
+/// `judged`; `staged` is untouched then.
+pub fn carry_mode(
+    dir: &HeldDir,
+    name: &EntryName,
+    judged: FileId,
+    staged: &File,
+) -> io::Result<bool> {
+    let fd = match rustix::fs::openat(dir.handle(), name.as_os_str(), stat_flags(), Mode::empty()) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT | rustix::io::Errno::LOOP | rustix::io::Errno::MLINK) => {
+            return Ok(false);
+        }
+        Err(errno) => return Err(errno.into()),
+    };
+    let current = File::from(fd);
+    if FileId::of_file(&current).map_err(ipe_fs_open::OpenRefusal::into_io)? != judged {
+        return Ok(false);
+    }
+    let judged_meta = current.metadata()?;
+    let group = judged_meta.gid();
+    let same_group = staged.metadata()?.gid() == group
+        || std::os::unix::fs::fchown(staged, None, Some(group)).is_ok();
+    let bits = carried_bits(judged_meta.permissions().mode(), same_group);
+    staged.set_permissions(std::fs::Permissions::from_mode(bits))?;
+    Ok(true)
+}
+
+/// Sync the directory `dir`, so the entries last renamed or created in it survive a crash.
+pub fn sync_dir(dir: &HeldDir) -> io::Result<()> {
+    Ok(rustix::fs::fsync(dir.handle())?)
 }
 
 /// Exclusively create the claim file `name` in `dir`, open to read, write, and lock.

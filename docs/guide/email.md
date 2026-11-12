@@ -37,15 +37,15 @@ addition does not break call sites). The provider carries its credential read
 from the environment at runtime:
 
 ```ipe
+import Ipe.App as App
 import Ipe.Email as Email
-import Ipe.Secret
-import Ipe.System as System
 
 
 provider : Email.EmailProvider
 provider =
     -- A Secret is read at runtime — a committed literal is refused (IPE-L0150).
-    Email.Resend (Secret.fromString (System.getenvOr "RESEND_API_KEY" ""))
+    -- A missing or empty variable stops startup rather than sealing "".
+    Email.Resend (App.fromEnvRequired "RESEND_API_KEY")
 
 
 send : Email.EmailAddress -> Email.EmailAddress -> Task Error String

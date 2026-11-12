@@ -647,7 +647,7 @@ pub struct BuildArgs {
     /// The delivery positionals (`[shape] [runtime] [host]`) that follow the
     /// entry — the shape cross-check and the web runtime/host selection.
     pub delivery: DeliveryArgs,
-    /// `--runtime <dir>` — vendor the runtime from here.
+    /// `--runtime <dir>` — build against the Ipê runtime crate at `<dir>` (same as `IPE_RUNTIME_DIR`).
     pub runtime: Option<String>,
     /// `--fix` — apply machine-applicable fixes before building.
     pub fix: bool,
@@ -825,7 +825,7 @@ pub struct RunArgs {
     pub delivery: DeliveryArgs,
     /// `--out <dir>`.
     pub out: Option<String>,
-    /// `--runtime <dir>`.
+    /// `--runtime <dir>` — build against the Ipê runtime crate at `<dir>` (same as `IPE_RUNTIME_DIR`).
     pub runtime: Option<String>,
     /// The native static-request layer.
     pub static_layer: StaticRequestLayer,
@@ -979,8 +979,8 @@ pub struct EjectArgs {
     pub entry: Option<String>,
     /// `--out <dir>` — where to write the self-contained project (required).
     pub out: String,
-    /// `--runtime <dir>` — vendor the Ipê runtime source from here instead of
-    /// the resolved in-repo / installed tree.
+    /// `--runtime <dir>` — the Ipê runtime crate at `<dir>` (same as
+    /// `IPE_RUNTIME_DIR`); a release refuses one other than the embedded runtime.
     pub runtime: Option<String>,
 }
 
@@ -1082,7 +1082,7 @@ pub struct ReleaseArgs {
     /// `--out <dir>` — where to write the artifact (optional; defaults to
     /// `release/`).
     pub out: Option<String>,
-    /// `--runtime <dir>` — vendor the Ipê runtime from here.
+    /// `--runtime <dir>` — build against the Ipê runtime crate at `<dir>` (same as `IPE_RUNTIME_DIR`).
     pub runtime: Option<String>,
     /// `--target <triple>` — a musl-static native triple, or `None` for the
     /// default. The type holds no wasm target: the browser bundle is derived
@@ -1340,7 +1340,7 @@ pub struct WatchArgs {
     pub delivery: DeliveryArgs,
     /// `--out <dir>`.
     pub out: Option<String>,
-    /// `--runtime <dir>`.
+    /// `--runtime <dir>` — build against the Ipê runtime crate at `<dir>` (same as `IPE_RUNTIME_DIR`).
     pub runtime: Option<String>,
     /// `--port <n>` — the parsed, in-range port (default 8000).
     pub port: u16,
