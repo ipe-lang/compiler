@@ -103,11 +103,13 @@ char-category = []
 # a wasm32 build ever activates it, via the WASM manifest template).
 wasm-client = []
 # Declared inert so every gate the vendored sources test names a known feature,
-# off unless its augmenter runs: `server_cargo_toml` / `jwt_cargo_toml` promote
-# `server` / `jwt` into `default`; `locale_cargo_toml` gives the inert `locale`
-# entry its ICU dep edges and promotes it. An augmenter never declares a name.
+# off unless its augmenter runs: `server_cargo_toml` / `jwt_cargo_toml` /
+# `csv_cargo_toml` promote `server` / `jwt` / `csv` into `default`;
+# `locale_cargo_toml` gives the inert `locale` entry its ICU dep edges and
+# promotes it. An augmenter never declares a name.
 server = []
 jwt = []
+csv = []
 locale = []
 alloc_dlmalloc = ["dep:dlmalloc"]
 alloc_mimalloc = ["dep:mimalloc"]
