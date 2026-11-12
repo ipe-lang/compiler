@@ -46,11 +46,7 @@ use ipe_sandbox::run_jail::{
 };
 use ipe_sandbox::{CanonicalPath, JailMounts};
 
-/// Serialize the jailed runs: each creates an inheritable `memfd`, which is a
-/// process-global fd-table mutation — running two in parallel races on fd
-/// numbers. A single lock makes the whole harness deterministic regardless of
-/// `--test-threads`.
-static JAIL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+mod jail_fd_floor_e2e;
 
 /// Skip unless `IPE_E2E=1`, the jail tools are present, AND a jail can actually
 /// be established in this environment.
@@ -72,12 +68,7 @@ fn e2e_tools() -> Option<RunJailTools> {
         prlimit,
         timeout: caps.timeout,
     });
-    // The proof's canaries spawn children, so they run under the lock that
-    // keeps every inheritable memfd to its one jail.
-    let proven = {
-        let _guard = JAIL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        prove(&tools)
-    };
+    let proven = prove(&tools);
     // A host whose jail can boot but whose cap counts the whole user (or no
     // one) is exactly the host production refuses: a real failure here.
     assert!(
@@ -148,12 +139,13 @@ struct Outcome {
     stderr: String,
 }
 
-/// Compile the seccomp program for a profile and place it on an inheritable fd,
-/// then build + run the jail argv for `payload`, returning the exit status code.
+/// Compile the seccomp program for a profile into a sealed memfd, then build +
+/// run the jail argv for `payload`, returning the exit status code.
 ///
 /// This mirrors `exec_in_run_jail` but *spawns* (waits) instead of `exec`-ing,
-/// so the test can assert on the outcome. The seccomp fd is created with
-/// `memfd_create` and its close-on-exec flag cleared so `bwrap` inherits it.
+/// so the test can assert on the outcome. The memfd stays close-on-exec here;
+/// the launch names it, so `bwrap` alone inherits it, at the number its argv
+/// carries.
 fn run_jailed(tools: &RunJailTools, profile: &SandboxProfile, payload: &[OsString]) -> Option<i32> {
     // The assertions inherit stderr (a diagnostic when one fails); only the
     // canary captures it.
@@ -194,18 +186,17 @@ fn run_jailed_inner(
     capture_stderr: bool,
     after: impl FnOnce(&Path),
 ) -> Outcome {
-    // Hold the global lock across the whole spawn — the memfd + cloexec-clear is
-    // a process-wide fd-table mutation.
-    let _guard = JAIL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // One scratch per run: concurrent runs in one process never share it.
+    static RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     let program = ipe_sandbox::seccomp::subprocess_deny_program(profile.subprocess)
         .expect("x86_64 seccomp program");
 
     // memfd for the seccomp program, through the launcher's own safe writer.
     let seccomp = ipe_sandbox::run_jail::write_seccomp_memfd(&program).expect("seccomp memfd");
-    let fd = seccomp.make_inheritable().expect("seccomp fd inheritable");
 
-    let scoped = ipe_test_temp::temp_root().join(format!("ipe-e2e-{}", std::process::id()));
+    let run = RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let scoped = ipe_test_temp::temp_root().join(format!("ipe-e2e-{}-{run}", std::process::id()));
     std::fs::create_dir_all(&scoped).expect("scoped tmp");
     let scoped = CanonicalPath::resolve(&scoped).expect("scoped tmp resolves");
     let system_bins = [Path::new("/usr/bin"), Path::new("/bin")]
@@ -220,17 +211,19 @@ fn run_jailed_inner(
     // but a home variable, and no profile in this file grants one.
     let host_env = |k: &str| ipe_env::var_os(k);
     let scope = prove(tools).expect("the process cap is proven scoped to the jail");
-    let argv =
-        run_jail_argv(&scope, profile, &mounts, fd, &host_env, payload).expect("the argv builds");
-    let (prog, rest) = argv.args().split_first().expect("non-empty argv");
-    let mut cmd = Command::new(prog);
-    cmd.args(rest);
-    if capture_stderr {
-        cmd.stderr(std::process::Stdio::piped());
-    }
-    let out = cmd.output().expect("spawn jailed process");
-    // Reap the memfd.
-    drop(seccomp);
+    let launch = seccomp
+        .launch(|fd| run_jail_argv(&scope, profile, &mounts, fd, &host_env, payload))
+        .expect("the argv builds");
+    let stderr = if capture_stderr {
+        std::process::Stdio::piped()
+    } else {
+        std::process::Stdio::inherit()
+    };
+    let out = launch
+        .spawn(std::process::Stdio::piped(), stderr)
+        .expect("spawn jailed process")
+        .wait_with_output()
+        .expect("reap jailed process");
     after(scoped.as_path());
     let _ = std::fs::remove_dir_all(&scoped);
     Outcome {
@@ -631,17 +624,13 @@ fn the_inspection_jail_refuses_unshare() {
     // the host's user-namespace policy, so this probe goes red without the
     // filter even where the host itself already refuses a nested namespace.
     let clone3 = python3().map(|py| errno_probe(py, NR_CLONE3, "0,0", ENOSYS));
-    let (control, refused, clone3) = {
-        let _guard = JAIL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let control = ipe_sandbox::run_in_bwrap_jail(&caps, &spec, &[OsString::from("/bin/true")]);
-        let refused = ipe_sandbox::run_in_bwrap_jail(
-            &caps,
-            &spec,
-            &[unshare, "-U", "/bin/true"].map(OsString::from),
-        );
-        let clone3 = clone3.map(|probe| ipe_sandbox::run_in_bwrap_jail(&caps, &spec, &probe));
-        (control, refused, clone3)
-    };
+    let control = ipe_sandbox::run_in_bwrap_jail(&caps, &spec, &[OsString::from("/bin/true")]);
+    let refused = ipe_sandbox::run_in_bwrap_jail(
+        &caps,
+        &spec,
+        &[unshare, "-U", "/bin/true"].map(OsString::from),
+    );
+    let clone3 = clone3.map(|probe| ipe_sandbox::run_in_bwrap_jail(&caps, &spec, &probe));
     let _ = std::fs::remove_dir_all(&scoped);
     // Control: the inspection jail runs a payload, so the refusal below is the
     // filter's, not a jail that never started.

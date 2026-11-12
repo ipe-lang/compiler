@@ -113,28 +113,27 @@ pub use windows::*;
 pub use windows::WindowsBaseEnv;
 pub use windows::windows_scrubbed_env;
 
-/// The number of a sealed, inheritable descriptor `bwrap` reads from.
+/// The number of a sealed descriptor `bwrap` reads from.
 ///
 /// As itself it names the `--file <fd> <dest>` app delivery; wrapped in a
 /// [`SeccompFdNumber`] it names the `--seccomp <fd>` filter. Only a sealed memfd
-/// owner mints one (`SealedApp::make_inheritable`, and inside a
-/// [`SeccompFdNumber`] `SealedSeccompFd::make_inheritable`), and only after
-/// sealing and clearing close-on-exec, so a jail argv can never name a
-/// writable, unsealed, or non-inherited descriptor.
+/// owner mints one, and only inside its launch (`SealedSeccompFd::launch` and
+/// `SealedSeccompFd::launch_delivering`), so a jail argv can never name a
+/// writable or unsealed descriptor, nor one its launch does not hand over.
 ///
 /// It borrows the owner's descriptor, is neither `Copy` nor `Clone`, and renders
-/// only into a [`JailArgv`] carrying that same borrow. Every spawn and exec
-/// builds its `Command` from a borrowed [`JailArgv`], so the owner is held open
-/// through the hand-off to `bwrap` and a closed-then-reused fd number cannot
-/// reach a jail. A copy of the rendered strings (`args().to_vec()`, `Debug`)
-/// carries no borrow; the guarantee covers the spawn paths, which never take one. Both rejections — a number
-/// outliving its owner, an owner dropped before its argv is consumed — are
-/// pinned as `compile_fail` doctests on `SealedSeccompFd`.
+/// only into a [`JailArgv`] carrying that same borrow. The launch builds its
+/// `Command` while that borrow is live, then moves the owner itself into the
+/// [`JailLaunch`]: the descriptor keeps its number, stays close-on-exec in this
+/// process, and turns inheritable only in the child the runtime descriptor floor
+/// forks, so the number the argv names is the descriptor `bwrap` reads and no
+/// sibling child inherits it. A number escaping its launch is pinned as a
+/// `compile_fail` doctest on `SealedSeccompFd`.
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct SealedFdNumber<'fd>(std::os::fd::BorrowedFd<'fd>);
 
-/// The number of a sealed, inheritable descriptor `bwrap` reads from.
+/// The number of a sealed descriptor `bwrap` reads from.
 ///
 /// Uninhabited off Unix: a target without file descriptors mints none, so no
 /// jail argv there can name a sealed fd.
@@ -145,7 +144,7 @@ pub struct SealedFdNumber<'fd>(std::convert::Infallible, std::marker::PhantomDat
 /// The number of the sealed descriptor holding the jail's seccomp program, as
 /// `bwrap --seccomp <fd>` reads it.
 ///
-/// Minted only by `SealedSeccompFd::make_inheritable`, whose descriptor is
+/// Minted only inside `SealedSeccompFd`'s launch, whose descriptor is
 /// written only from a [`crate::seccomp::JailProgram`], so the role (the filter,
 /// never the delivered app) and the content (the program this crate built,
 /// never arbitrary bytes) are both in the type. A builder taking both a filter
@@ -174,9 +173,10 @@ impl SealedFdNumber<'_> {
 ///
 /// Every `--seccomp <fd>` / `--file <fd>` it names was rendered from a
 /// [`SealedFdNumber`] and its `'fd` is carried here, so while the argv, or the
-/// slice [`Self::args`] borrows from it, is live, every owner is live. The spawn
-/// and exec paths take `&JailArgv` and build their `Command` inside that borrow,
-/// so no owner can be dropped before `bwrap` receives its descriptor.
+/// slice [`Self::args`] borrows from it, is live, every owner is live. A
+/// [`JailLaunch`] builds its `Command` inside that borrow and then takes the
+/// owners themselves, so no owner closes before `bwrap` receives its
+/// descriptor.
 #[derive(Debug)]
 pub struct JailArgv<'fd> {
     argv: Vec<OsString>,
@@ -216,6 +216,163 @@ impl<'fd> JailArgv<'fd> {
     #[must_use]
     pub const fn args(&self) -> &[OsString] {
         self.argv.as_slice()
+    }
+}
+
+#[cfg(unix)]
+impl JailArgv<'_> {
+    /// The `Command` this argv runs: its first element is the program, the
+    /// rest its arguments.
+    ///
+    /// # Errors
+    ///
+    /// [`RunJailDefect::Spawn`] for an empty argv.
+    pub(crate) fn command(&self) -> Result<std::process::Command, RunJailDefect> {
+        let Some((program, rest)) = self.argv.split_first() else {
+            return Err(RunJailDefect::Spawn {
+                detail: "empty jail argv".to_owned(),
+            });
+        };
+        let mut command = std::process::Command::new(program);
+        command.args(rest);
+        Ok(command)
+    }
+}
+
+/// Why a jail launch was not built: its argv did not render, or the argv or
+/// the sealed descriptors it names could not be handed to the runtime
+/// descriptor floor. Nothing was spawned.
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum LaunchRefusal<E> {
+    /// The argv renderer refused.
+    Render(E),
+    /// The rendered argv was empty, or a descriptor it names was refused a
+    /// place in the child's named set.
+    Handoff(RunJailDefect),
+}
+
+#[cfg(unix)]
+impl LaunchRefusal<RunJailDefect> {
+    /// The refusal as the run jail's defect.
+    #[must_use]
+    pub fn into_defect(self) -> RunJailDefect {
+        match self {
+            Self::Render(defect) | Self::Handoff(defect) => defect,
+        }
+    }
+}
+
+/// A jail ready to start: the `Command` its argv renders and the sealed
+/// descriptors that argv names.
+///
+/// Every start goes through the runtime descriptor floor
+/// (`ipe_runtime_rust::system`): the child inherits stdio and the named
+/// descriptors, each at the number the argv names, and no other descriptor of
+/// this process, whether this process opened it or inherited it from its own
+/// parent. The named descriptors stay close-on-exec here, so a sibling child
+/// another thread forks never inherits one; they close in this process when
+/// the start returns.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct JailLaunch {
+    command: std::process::Command,
+    named: ipe_runtime_rust::system::NamedFds,
+}
+
+#[cfg(unix)]
+impl JailLaunch {
+    /// A launch running `command` and handing the child `named`.
+    pub(crate) const fn new(
+        command: std::process::Command,
+        named: ipe_runtime_rust::system::NamedFds,
+    ) -> Self {
+        Self { command, named }
+    }
+
+    /// A launch whose argv names no sealed descriptor: the child inherits
+    /// stdio alone.
+    ///
+    /// # Errors
+    ///
+    /// [`RunJailDefect::Spawn`] for an empty argv.
+    pub(crate) fn fd_free(argv: &JailArgv<'static>) -> Result<Self, RunJailDefect> {
+        Ok(Self::new(
+            argv.command()?,
+            ipe_runtime_rust::system::NamedFds::none(),
+        ))
+    }
+
+    /// Add `owner` to the descriptors the child inherits.
+    ///
+    /// # Errors
+    ///
+    /// [`RunJailDefect::Spawn`] when the floor refuses it (inheritable here, a
+    /// stdio number, or the set is full); `owner` is closed.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub(crate) fn name(&mut self, owner: std::os::fd::OwnedFd) -> Result<(), RunJailDefect> {
+        self.named
+            .push(owner)
+            .map_err(|(refusal, _closed)| RunJailDefect::Spawn {
+                detail: refusal.to_string(),
+            })
+    }
+
+    /// The program the launch starts.
+    #[must_use]
+    pub fn program(&self) -> &std::ffi::OsStr {
+        self.command.get_program()
+    }
+
+    /// The arguments after the program.
+    pub fn args(&self) -> std::process::CommandArgs<'_> {
+        self.command.get_args()
+    }
+
+    /// Clear the inherited environment and set exactly `pairs`.
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    pub(crate) fn scrub_env(&mut self, pairs: &[(OsString, OsString)]) {
+        self.command.env_clear();
+        for (name, value) in pairs {
+            self.command.env(name, value);
+        }
+    }
+
+    /// Start the jail with stdin from `/dev/null` and the given stdout and
+    /// stderr.
+    ///
+    /// # Errors
+    ///
+    /// [`RunJailDefect::Spawn`] when the runtime refuses the spawn; no child
+    /// is left running.
+    pub fn spawn(
+        mut self,
+        stdout: std::process::Stdio,
+        stderr: std::process::Stdio,
+    ) -> Result<std::process::Child, RunJailDefect> {
+        self.command
+            .stdin(std::process::Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr);
+        ipe_runtime_rust::system::spawn_hardened_naming(self.command, self.named).map_err(
+            |refusal| RunJailDefect::Spawn {
+                detail: refusal.to_string(),
+            },
+        )
+    }
+
+    /// Replace this process with the jail, keeping its stdio. Returns only
+    /// when the replacement did not happen.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[must_use]
+    pub fn exec(self) -> RunJailDefect {
+        let err = ipe_runtime_rust::system::exec_naming(self.command, self.named);
+        RunJailDefect::Spawn {
+            detail: err.to_string(),
+        }
     }
 }
 
@@ -307,8 +464,8 @@ impl RunJailTools {
 /// visible, and none of them exposes the cargo home. Every path is canonical,
 /// so the `--chdir` and `TMPDIR` the payload receives are exactly the paths
 /// bound.
-/// `seccomp_fd` is the sealed, inheritable descriptor carrying the compiled
-/// seccomp program (passed to `bwrap --seccomp <fd>`). It is not optional: a
+/// `seccomp_fd` is the sealed descriptor carrying the compiled seccomp
+/// program, handed to the child by the launch that minted it (passed to `bwrap --seccomp <fd>`). It is not optional: a
 /// payload jail argv without its filter is unrepresentable.
 ///
 /// The env is scrubbed with `--clearenv`; only the fixed minimal allowlist

@@ -227,6 +227,36 @@ const ENV_SKIPS: &[(&str, &str, &str)] = &[
         JAIL_ABSENT,
     ),
     (
+        "src/compiler/sandbox/tests/jail_fd_floor_e2e/mod.rs",
+        "the_inspection_jail_payload_inherits_only_stdio",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/compiler/sandbox/tests/jail_fd_floor_e2e/mod.rs",
+        "the_subprocess_denying_jail_payload_inherits_only_stdio",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/compiler/sandbox/tests/jail_fd_floor_e2e/mod.rs",
+        "the_build_jail_payload_inherits_only_stdio",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/compiler/sandbox/tests/jail_fd_floor_e2e/mod.rs",
+        "the_exec_run_jail_payload_inherits_only_stdio",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/compiler/sandbox/tests/jail_fd_floor_e2e/mod.rs",
+        "a_sibling_child_never_inherits_a_jail_seccomp_descriptor",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/compiler/sandbox/tests/jail_fd_floor_e2e/mod.rs",
+        "exec_jail_child",
+        "an exec-path payload host, inert unless its parent test re-executes it",
+    ),
+    (
         "src/ipe-cli/tests/wasm_target_gate.rs",
         "hydrate_glue_type_name_matches_emitted_struct_and_compiles_for_wasm",
         "the wasm32 rustup target is not installed",

@@ -31,14 +31,17 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::JailMounts;
+#[cfg(target_os = "macos")]
+use crate::run_jail::JailArgv;
 #[cfg(any(
     all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ),
-    target_os = "macos"
+    target_os = "macos",
+    target_os = "freebsd"
 ))]
-use crate::run_jail::JailArgv;
+use crate::run_jail::JailLaunch;
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -331,6 +334,11 @@ fn recheck_mounts(mounts: &JailMounts) -> Result<(), JailOutcome> {
 /// [`JailOutcome::Unavailable`] — the untrusted payload is never run unconfined
 /// on any path.
 ///
+/// The jail starts through the runtime descriptor floor, so it inherits stdio
+/// and the sealed seccomp fd and nothing else of this process. That includes a
+/// jobserver pipe a parent `make` or cargo handed this process: a jailed cargo
+/// sees no jobserver and schedules its own jobs.
+///
 /// # Errors
 ///
 /// This function does not return `Err`: every failure to establish or run the
@@ -351,8 +359,7 @@ pub fn build_in_jail(
     if let Err(outcome) = recheck_mounts(mounts) {
         return outcome;
     }
-    // The process cap must count only the jail's tasks; its canary jails run
-    // before the seccomp fd below turns inheritable.
+    // The process cap must count only the jail's tasks.
     let scope = match crate::run_jail::prove(tools) {
         Ok(scope) => scope,
         Err(defect) => return JailOutcome::Unavailable { defect },
@@ -364,48 +371,26 @@ pub fn build_in_jail(
             },
         };
     };
-    // The memfd is owned so it is closed when this function returns. bwrap reads the
-    // seccomp filter by fd number during jail setup — before the child runs — so
-    // closing it after the child is waited on is safe. Unlike the run jail
-    // (which `exec`s and never returns), this build jail RETURNS and is called
-    // once per axis in the audit tightening loop; a raw fd would leak one memfd
-    // per call in the long-lived audit/CI process. It is sealed and born
-    // close-on-exec; clearing the flag only now, right before the spawn, lets
-    // bwrap inherit it. A failure refuses rather than run the build unfiltered.
     let seccomp_owned = match crate::run_jail::write_seccomp_memfd(&program) {
         Ok(fd) => fd,
         Err(defect) => return JailOutcome::Unavailable { defect },
     };
-    // Known limit: between this close-on-exec clear and the spawn, a sibling child
-    // forked by another thread inherits the same open file description. The seal
-    // blocks writes, not a shared-offset `lseek`/`read`, so this fd must reach only
-    // its one child.
-    let seccomp_fd = match seccomp_owned.make_inheritable() {
-        Ok(fd) => fd,
-        Err(e) => {
-            return JailOutcome::Unavailable {
-                defect: RunJailDefect::Spawn {
-                    detail: format!("clearing close-on-exec on the seccomp memfd failed: {e}"),
-                },
-            };
-        }
-    };
-
+    // The launch takes the sealed filter: its copy here stays close-on-exec, so
+    // no sibling child inherits it, and closes once the jail is spawned, so the
+    // audit's per-axis loop leaks no descriptor per call. The Linux jail's env
+    // is scrubbed inside the bwrap argv (`--clearenv` + allowlisted re-export).
     let host_env = crate::host_env::granted;
-    let argv = match run_jail_argv(&scope, profile, mounts, seccomp_fd, &host_env, payload) {
-        Ok(argv) => argv,
-        Err(e) => {
+    let launch = match seccomp_owned.launch(|fd| {
+        run_jail_argv(&scope, profile, mounts, fd, &host_env, payload).map_err(RunJailDefect::Path)
+    }) {
+        Ok(launch) => launch,
+        Err(refusal) => {
             return JailOutcome::Unavailable {
-                defect: RunJailDefect::Path(e),
+                defect: refusal.into_defect(),
             };
         }
     };
-
-    // The Linux jail's env is scrubbed inside the bwrap argv (`--clearenv` +
-    // allowlisted re-export), so no launcher-side env override is needed here.
-    // `argv` borrows `seccomp_owned`, so the memfd stays open until the child is
-    // waited on inside `spawn_and_decode` and closes when this function returns.
-    spawn_and_decode(&argv, None)
+    spawn_and_decode(launch)
 }
 
 /// Run `payload` inside a `sandbox-exec` Seatbelt jail lowered from `profile`,
@@ -477,15 +462,18 @@ pub fn build_in_jail(
     argv.push("-p".into());
     argv.push(sbpl.into());
     argv.extend(payload.iter().cloned());
-    let argv = JailArgv::fd_free(argv);
+    let mut launch = match JailLaunch::fd_free(&JailArgv::fd_free(argv)) {
+        Ok(launch) => launch,
+        Err(defect) => return JailOutcome::Unavailable { defect },
+    };
 
     // Enforce the `env` axis in the launcher (Seatbelt cannot scrub env),
     // mirroring the run jail and the Linux build jail's bwrap `--clearenv`, so a
     // Tier-2 build is confined on the env axis exactly as the shipped app is.
     let host_env = crate::host_env::granted;
-    let scrubbed_env = macos_scrubbed_env(profile, scoped_tmp, &host_env);
+    launch.scrub_env(&macos_scrubbed_env(profile, scoped_tmp, &host_env));
 
-    spawn_and_decode(&argv, Some(&scrubbed_env))
+    spawn_and_decode(launch)
 }
 
 /// Run `payload` inside a Windows Job Object + AppContainer jail lowered from
@@ -680,51 +668,28 @@ pub fn build_in_jail(
     }
 }
 
-/// Spawn the jail argv, wait, and decode the exit into a [`JailOutcome`].
+/// Start the jail through the runtime descriptor floor, wait, and decode the
+/// exit into a [`JailOutcome`].
 ///
-/// A spawn failure is [`JailOutcome::Unavailable`] (the payload never ran); a
+/// The jail's stdout and stderr are this process's; stdin is `/dev/null`. A
+/// spawn failure is [`JailOutcome::Unavailable`] (the payload never ran); a
 /// wait failure is a [`JailOutcome::BuildFailed`] (the jail ran but its result
 /// is unobservable — never clean).
-///
-/// `env_override`, when `Some`, clears the inherited environment and sets exactly
-/// the given `(name, value)` pairs — the macOS jails' `env`-axis enforcement (the
-/// Linux jail scrubs env inside bwrap, so it passes `None`).
 #[cfg(any(
     all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ),
-    target_os = "macos"
+    target_os = "macos",
+    target_os = "freebsd"
 ))]
-fn spawn_and_decode(
-    argv: &JailArgv<'_>,
-    env_override: Option<&[(OsString, OsString)]>,
-) -> JailOutcome {
-    let Some((program, rest)) = argv.args().split_first() else {
-        return JailOutcome::Unavailable {
-            defect: RunJailDefect::Spawn {
-                detail: "empty jail argv".to_owned(),
-            },
-        };
-    };
-    let mut command = std::process::Command::new(program);
-    command.args(rest).stdin(std::process::Stdio::null());
-    if let Some(pairs) = env_override {
-        command.env_clear();
-        for (name, value) in pairs {
-            command.env(name, value);
-        }
-    }
-    let child = command.spawn();
-    let mut child = match child {
-        Ok(c) => c,
-        Err(e) => {
-            return JailOutcome::Unavailable {
-                defect: RunJailDefect::Spawn {
-                    detail: e.to_string(),
-                },
-            };
-        }
+fn spawn_and_decode(launch: JailLaunch) -> JailOutcome {
+    let mut child = match launch.spawn(
+        std::process::Stdio::inherit(),
+        std::process::Stdio::inherit(),
+    ) {
+        Ok(child) => child,
+        Err(defect) => return JailOutcome::Unavailable { defect },
     };
     match child.wait() {
         Ok(status) => JailOutcome::decode(status.code()),
@@ -1590,7 +1555,7 @@ mod freebsd_jail {
     use crate::JailMounts;
     use crate::host_tool::{self, HostTool};
     use crate::mounts::{TreeBind, jail_binds, mount_plan};
-    use crate::run_jail::{RunJailDefect, SandboxProfile};
+    use crate::run_jail::{JailArgv, JailLaunch, RunJailDefect, SandboxProfile};
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
@@ -1722,7 +1687,13 @@ mod freebsd_jail {
             None => None,
         };
 
-        let outcome = spawn_and_decode(&argv, &scrubbed);
+        let outcome = match JailLaunch::fd_free(&JailArgv::fd_free(argv)) {
+            Ok(mut launch) => {
+                launch.scrub_env(&scrubbed);
+                super::spawn_and_decode(launch)
+            }
+            Err(defect) => JailOutcome::Unavailable { defect },
+        };
         // The jail is `persist=0`, so it is torn down when the payload exits. The
         // read-only root's nullfs mounts and the rctl rule are unmounted/removed by
         // their guards on drop (in reverse order) as this scope ends, leaving no
@@ -1811,7 +1782,9 @@ mod freebsd_jail {
                 missing: vec![HostTool::Chown.name()],
             });
         };
-        let status = chown.command().arg(spec).arg(path).status();
+        let mut command = chown.command();
+        command.arg(spec).arg(path);
+        let status = run_host_tool(command);
         match status {
             Ok(s) if s.success() => Ok(()),
             Ok(s) => Err(RunJailDefect::Spawn {
@@ -1883,7 +1856,8 @@ mod freebsd_jail {
         if read_only {
             command.arg("-o").arg("ro");
         }
-        let status = command.arg(source).arg(target).status();
+        command.arg(source).arg(target);
+        let status = run_host_tool(command);
         match status {
             Ok(s) if s.success() => Ok(()),
             Ok(s) => Err(RunJailDefect::MountFailed {
@@ -1914,12 +1888,9 @@ mod freebsd_jail {
     /// via `mount -t devfs devfs <target>` (the `mount(8)` binary, which IS a
     /// stable base-system primitive on every supported FreeBSD release).
     fn mount_devfs(mount_bin: &Path, target: &Path) -> Result<(), RunJailDefect> {
-        let status = std::process::Command::new(mount_bin)
-            .arg("-t")
-            .arg("devfs")
-            .arg("devfs")
-            .arg(target)
-            .status();
+        let mut command = std::process::Command::new(mount_bin);
+        command.arg("-t").arg("devfs").arg("devfs").arg(target);
+        let status = run_host_tool(command);
         match status {
             Ok(s) if s.success() => Ok(()),
             Ok(s) => Err(RunJailDefect::MountFailed {
@@ -1943,14 +1914,15 @@ mod freebsd_jail {
     /// stable base-system primitive, the same binary used for devfs — carries the
     /// tmpfs type on every supported FreeBSD release.
     fn mount_tmpfs(mount_bin: &Path, target: &Path) -> Result<(), RunJailDefect> {
-        let status = std::process::Command::new(mount_bin)
+        let mut command = std::process::Command::new(mount_bin);
+        command
             .arg("-t")
             .arg("tmpfs")
             .arg("-o")
             .arg(JAIL_TMPFS_OPTIONS)
             .arg("tmpfs")
-            .arg(target)
-            .status();
+            .arg(target);
+        let status = run_host_tool(command);
         match status {
             Ok(s) if s.success() => Ok(()),
             Ok(s) => Err(RunJailDefect::MountFailed {
@@ -2297,10 +2269,9 @@ mod freebsd_jail {
             // `persist=0` jail is already gone, and a leftover mount on a torn-down
             // scratch is inert — but clean up so the audit loop leaves no residue.
             for target in self.mounted.iter().rev() {
-                let _ = std::process::Command::new(&self.umount_bin)
-                    .arg("-f")
-                    .arg(target)
-                    .status();
+                let mut command = std::process::Command::new(&self.umount_bin);
+                command.arg("-f").arg(target);
+                let _ = run_host_tool(command);
             }
             let _ = std::fs::remove_dir(&self.root);
             // Remove the `/proc`-mask source dir (a sibling of the root, outside the
@@ -2471,10 +2442,9 @@ mod freebsd_jail {
     impl RctlRule {
         fn apply(rctl_bin: &Path, jail_name: &str) -> Result<Self, RunJailDefect> {
             let rule = format!("jail:{jail_name}:maxproc:deny=1");
-            let status = std::process::Command::new(rctl_bin)
-                .arg("-a")
-                .arg(&rule)
-                .status();
+            let mut command = std::process::Command::new(rctl_bin);
+            command.arg("-a").arg(&rule);
+            let status = run_host_tool(command);
             match status {
                 Ok(s) if s.success() => Ok(Self {
                     rctl_bin: rctl_bin.to_path_buf(),
@@ -2498,49 +2468,19 @@ mod freebsd_jail {
             // Best-effort removal of the rule this guard added; a leftover rule on a
             // torn-down (`persist=0`) jail is inert, but remove it so the audit loop
             // leaves no residue.
-            let _ = std::process::Command::new(&self.rctl_bin)
-                .arg("-r")
-                .arg(&self.rule)
-                .status();
+            let mut command = std::process::Command::new(&self.rctl_bin);
+            command.arg("-r").arg(&self.rule);
+            let _ = run_host_tool(command);
         }
     }
 
-    /// Spawn the jail argv with the scrubbed environment, wait, and decode the exit
-    /// into a [`JailOutcome`]. A spawn failure is `Unavailable` (the payload never
-    /// ran); a wait failure is `BuildFailed` (the jail ran but its result is
-    /// unobservable — never clean); the exit code decodes through the SAME
-    /// [`JailOutcome::decode`] the other arms use.
-    fn spawn_and_decode(argv: &[OsString], scrubbed: &[(OsString, OsString)]) -> JailOutcome {
-        let Some((program, rest)) = argv.split_first() else {
-            return JailOutcome::Unavailable {
-                defect: RunJailDefect::Spawn {
-                    detail: "empty jail argv".to_owned(),
-                },
-            };
-        };
-        let mut command = std::process::Command::new(program);
-        command.args(rest).stdin(std::process::Stdio::null());
-        command.env_clear();
-        for (name, value) in scrubbed {
-            command.env(name, value);
-        }
-        let child = match command.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                return JailOutcome::Unavailable {
-                    defect: RunJailDefect::Spawn {
-                        detail: e.to_string(),
-                    },
-                };
-            }
-        };
-        let mut child = child;
-        match child.wait() {
-            Ok(status) => JailOutcome::decode(status.code()),
-            Err(e) => JailOutcome::BuildFailed {
-                reason: format!("could not await the jailed probe: {e}"),
-            },
-        }
+    /// Run a trusted host administration tool (`chown`, `mount`, `umount`,
+    /// `rctl`) through the runtime descriptor floor and wait for its exit: like
+    /// every process this crate starts, it inherits stdio and nothing else.
+    fn run_host_tool(command: std::process::Command) -> std::io::Result<std::process::ExitStatus> {
+        ipe_runtime_rust::system::spawn_hardened(command)
+            .map_err(std::io::Error::other)?
+            .wait()
     }
 }
 
