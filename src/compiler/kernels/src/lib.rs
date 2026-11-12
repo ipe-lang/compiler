@@ -1821,6 +1821,38 @@ const _: () = assert!(
     "a kernel whose scheme yields a Program / WebApp carrier must be StdlibKernel::is_app_entry, and only those",
 );
 
+/// The scheme variable an app entry binds to its app's `Model`.
+pub const APP_MODEL_VAR: u8 = 0;
+
+/// The scheme variable an app entry binds to its app's `Msg`.
+pub const APP_MSG_VAR: u8 = 1;
+
+/// Whether every schemed app entry of `kernels` reaches both [`APP_MODEL_VAR`] and [`APP_MSG_VAR`].
+///
+/// An unschemed entry has no reference that lowers (IPE-L0108), so it has no
+/// role to read.
+#[must_use]
+pub const fn app_entries_reach_their_roles(kernels: &[StdlibKernel]) -> bool {
+    let mut rest = kernels;
+    while let Some((kernel, tail)) = rest.split_first() {
+        if kernel.is_app_entry()
+            && let Some(shape) = kernel.scheme_shape()
+            && !(shape_reaches_var(shape, APP_MODEL_VAR) && shape_reaches_var(shape, APP_MSG_VAR))
+        {
+            return false;
+        }
+        rest = tail;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if an app entry's scheme does not carry its Model and Msg at the role variables the lowerer's app-role gate reads [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    app_entries_reach_their_roles(StdlibKernel::ALL),
+    "every app entry's scheme must reach APP_MODEL_VAR and APP_MSG_VAR",
+);
+
 /// Whether every [`ArgOrder::ContainerFirst`] kernel of `kernels` has arity 2 and a scheme taking a function then a non-function.
 ///
 /// The backend swaps exactly the first two rendered arguments of such a kernel

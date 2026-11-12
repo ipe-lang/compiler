@@ -359,9 +359,14 @@ main =
         }
 ";
 
+/// A `Task` in a Tui Model is refused as a Model (IPE-L0120), not as the app kernel's `Clone` bound.
 #[test]
 fn tui_model_holding_task_refused() {
-    assert_l0164("tui_model_holding_task", TUI_MODEL_TASK);
+    assert_rejected(
+        "tui_model_holding_task",
+        TUI_MODEL_TASK,
+        ipe_diagnostics::IPE_L0120,
+    );
 }
 
 #[test]

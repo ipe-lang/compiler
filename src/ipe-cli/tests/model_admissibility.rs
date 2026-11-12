@@ -9,10 +9,9 @@
 //! bound. The gate converts that into a fail-closed `IPE-L0120` diagnostic.
 //!
 //! A Model holding a value the runtime cannot copy (`Cmd` / `Sub` / `Task`)
-//! is refused one stage earlier: the app kernel's `Clone` row on the Model
-//! variable fails lower's instance check with `IPE-L0164`. The Model gate
-//! still decides every copyable value outside its bound (`Decoder`, `Html`,
-//! `Secret`, a `CustomElement` handle), and those fixtures pin `IPE-L0120`.
+//! is refused by lower's app-role pass with the same `IPE-L0120`, before any
+//! callee bound is proven; the backend gate decides every copyable value
+//! outside its bound (`Decoder`, `Html`, `Secret`, a `CustomElement` handle).
 //!
 //! These tests are COMPILE-ONLY (they run the `ipe` pipeline + write the
 //! project, but never invoke `cargo`), so they are fast and NOT gated on
@@ -449,10 +448,10 @@ fn live_plain_data_model_is_accepted() -> Result<(), BoxError> {
     assert_accepted("live_good", LIVE_GOOD)
 }
 
-/// A `Cmd` in a Web Model fails the app kernel's `Clone` row before the Model gate.
+/// A `Cmd` in a Web Model is refused as a Model, not as the app kernel's `Clone` bound.
 #[test]
 fn live_model_with_cmd_field_is_rejected() -> Result<(), BoxError> {
-    assert_rejected_with("live_cmd", LIVE_CMD_MODEL, "IPE-L0164")
+    assert_rejected_with("live_cmd", LIVE_CMD_MODEL, "IPE-L0120")
 }
 
 /// The CDPeq-but-not-serde case: `Html` is `Clone`/`PartialEq` but not `serde`,
@@ -493,10 +492,10 @@ fn tui_plain_data_model_is_accepted() -> Result<(), BoxError> {
     assert_accepted("tui_good", TUI_GOOD)
 }
 
-/// A `Cmd` in a Tui Model fails the app kernel's `Clone` row before the Model gate.
+/// A `Cmd` in a Tui Model is refused as a Model, not as the app kernel's `Clone` bound.
 #[test]
 fn tui_model_with_cmd_field_is_rejected() -> Result<(), BoxError> {
-    assert_rejected_with("tui_cmd", TUI_CMD_MODEL, "IPE-L0164")
+    assert_rejected_with("tui_cmd", TUI_CMD_MODEL, "IPE-L0120")
 }
 
 /// A `Decoder` copies but derives no `PartialEq`, so the Tui Model gate refuses it.
@@ -516,8 +515,8 @@ fn tui_model_with_decoder_field_is_rejected() -> Result<(), BoxError> {
 // `view` with a bad Model, and does NOT false-reject a lambda `view` with a
 // plain Model.
 
-/// Model has a `Cmd` field AND `view` is an inline lambda; lower's instance check
-/// refuses it with IPE-L0164 whatever form `view` takes.
+/// Model has a `Cmd` field AND `view` is an inline lambda; the Model is refused
+/// with IPE-L0120 whatever form `view` takes.
 const LIVE_LAMBDA_VIEW_CMD_MODEL: &str = r"module Main exposing (main)
 
 import Ipe.Tea.Web as Web
@@ -630,7 +629,7 @@ main =
 
 #[test]
 fn live_lambda_view_with_cmd_model_is_rejected() -> Result<(), BoxError> {
-    assert_rejected_with("live_lambda_cmd", LIVE_LAMBDA_VIEW_CMD_MODEL, "IPE-L0164")
+    assert_rejected_with("live_lambda_cmd", LIVE_LAMBDA_VIEW_CMD_MODEL, "IPE-L0120")
 }
 
 #[test]

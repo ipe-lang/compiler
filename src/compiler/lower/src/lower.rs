@@ -368,6 +368,105 @@ const fn mapper_param_binds_fn_element(
         && ipe_kernels::mapper_param_binds_stored_element(shape, arity, arg, param)
 }
 
+/// Every app-entry kernel reference in `body`, with its span, in source order.
+///
+/// The walk is an explicit work stack over the canonical tree, whose size
+/// the parser's limits already bound.
+fn app_entry_refs(body: &canon::Expr) -> Vec<(KernelFn, Span)> {
+    let mut refs = Vec::new();
+    let mut work: Vec<&canon::Expr> = vec![body];
+    while let Some(e) = work.pop() {
+        match &e.value {
+            canon::Expr_::VarKernel {
+                id: Some(kernel), ..
+            } => {
+                if kernel.is_app_entry() {
+                    refs.push((*kernel, e.span));
+                }
+            }
+            canon::Expr_::Lambda(_, inner) | canon::Expr_::Access(inner, _) => {
+                work.push(inner);
+            }
+            canon::Expr_::Call(callee, args) => {
+                work.extend(args.iter().rev());
+                work.push(callee);
+            }
+            canon::Expr_::ForeignCall { args, .. }
+            | canon::Expr_::Tuple(args)
+            | canon::Expr_::List(args) => work.extend(args.iter().rev()),
+            canon::Expr_::Binop { lhs, rhs, .. } | canon::Expr_::Cons(lhs, rhs) => {
+                work.push(rhs);
+                work.push(lhs);
+            }
+            canon::Expr_::Case(scrutinee, branches) => {
+                work.extend(branches.iter().rev().map(|b| &b.body));
+                work.push(scrutinee);
+            }
+            canon::Expr_::Let(bindings, inner) => {
+                work.push(inner);
+                work.extend(bindings.iter().rev().map(|b| &b.body));
+            }
+            canon::Expr_::If(branches, else_expr) => {
+                work.push(else_expr);
+                for (cond, then) in branches.iter().rev() {
+                    work.push(then);
+                    work.push(cond);
+                }
+            }
+            canon::Expr_::Record(fields) => work.extend(fields.iter().rev().map(|(_, v)| v)),
+            canon::Expr_::Update(base, fields) => {
+                work.extend(fields.iter().rev().map(|(_, v)| v));
+                work.push(base);
+            }
+            canon::Expr_::VarKernel { id: None, .. }
+            | canon::Expr_::VarLocal(_)
+            | canon::Expr_::VarTopLevel { .. }
+            | canon::Expr_::VarCtor { .. }
+            | canon::Expr_::Int(_)
+            | canon::Expr_::Float(_)
+            | canon::Expr_::Str(_)
+            | canon::Expr_::CustomElementCtor(_)
+            | canon::Expr_::Char(_)
+            | canon::Expr_::Unit => {}
+        }
+    }
+    refs
+}
+
+/// A value an app entry threads through its cfg, judged by its app shape's gate.
+#[derive(Clone, Copy)]
+enum AppRole {
+    /// The state `init` builds and `update` returns (IPE-L0120).
+    Model,
+    /// The message `update` takes (IPE-L0125).
+    Msg,
+}
+
+/// The app shape whose admissibility gate judges each role of a surface's app, if one does.
+///
+/// Mirrors the backend's gates: every app-shaped surface gates its Model;
+/// only the Web and Tui loops gate their Msg; a worker or script has no gate.
+#[derive(Clone, Copy)]
+struct AppRoleGates {
+    model: Option<ipe_diagnostics::AppShape>,
+    msg: Option<ipe_diagnostics::AppShape>,
+}
+
+impl AppRoleGates {
+    const fn of(surface: ipe_kernels::AppSurface) -> Self {
+        use ipe_diagnostics::AppShape;
+        use ipe_kernels::AppSurface;
+        let (model, msg) = match surface {
+            AppSurface::Web => (Some(AppShape::Web), Some(AppShape::Web)),
+            AppSurface::WebView => (Some(AppShape::WebView), Some(AppShape::WebView)),
+            AppSurface::Tui => (Some(AppShape::Tui), Some(AppShape::Tui)),
+            AppSurface::Cli => (Some(AppShape::Cli), None),
+            AppSurface::Worker | AppSurface::Script => (None, None),
+        };
+        Self { model, msg }
+    }
+}
+
 /// The qualified surface name of app entry `kernel` (`Web.embed`), as diagnostics print it.
 fn app_entry_name(kernel: KernelFn) -> Box<str> {
     let def = kernel.def();
@@ -16968,6 +17067,9 @@ impl<'a> Lowerer<'a> {
         let mut callee_instances: std::collections::HashMap<FuncId, Vec<CalleeInstance>> =
             std::collections::HashMap::with_capacity(self.m.defs.len());
         let select_to_ids = self.select_to_ids();
+        // A Model or Msg its app shape refuses is reported by that shape's
+        // gate before any reference's callee bounds are proven.
+        self.reject_inadmissible_app_roles()?;
         for (idx, def) in self.m.defs.iter().enumerate() {
             // Positional id: `func_ids` was assigned from this very
             // enumeration order in `new()` under the unique-`(home, name)`
@@ -30756,58 +30858,75 @@ impl<'a> Lowerer<'a> {
         body: &canon::Expr,
         row_vars: &BTreeSet<Symbol>,
     ) -> DResult<()> {
-        let mut work: Vec<&canon::Expr> = vec![body];
-        while let Some(e) = work.pop() {
-            match &e.value {
-                canon::Expr_::VarKernel {
-                    id: Some(kernel), ..
-                } => {
-                    self.reject_generic_app_entry(*kernel, e.span, row_vars)?;
-                }
-                canon::Expr_::Lambda(_, inner) | canon::Expr_::Access(inner, _) => {
-                    work.push(inner);
-                }
-                canon::Expr_::Call(callee, args) => {
-                    work.extend(args.iter().rev());
-                    work.push(callee);
-                }
-                canon::Expr_::ForeignCall { args, .. }
-                | canon::Expr_::Tuple(args)
-                | canon::Expr_::List(args) => work.extend(args.iter().rev()),
-                canon::Expr_::Binop { lhs, rhs, .. } | canon::Expr_::Cons(lhs, rhs) => {
-                    work.push(rhs);
-                    work.push(lhs);
-                }
-                canon::Expr_::Case(scrutinee, branches) => {
-                    work.extend(branches.iter().rev().map(|b| &b.body));
-                    work.push(scrutinee);
-                }
-                canon::Expr_::Let(bindings, inner) => {
-                    work.push(inner);
-                    work.extend(bindings.iter().rev().map(|b| &b.body));
-                }
-                canon::Expr_::If(branches, else_expr) => {
-                    work.push(else_expr);
-                    for (cond, then) in branches.iter().rev() {
-                        work.push(then);
-                        work.push(cond);
-                    }
-                }
-                canon::Expr_::Record(fields) => work.extend(fields.iter().rev().map(|(_, v)| v)),
-                canon::Expr_::Update(base, fields) => {
-                    work.extend(fields.iter().rev().map(|(_, v)| v));
-                    work.push(base);
-                }
-                canon::Expr_::VarKernel { id: None, .. }
-                | canon::Expr_::VarLocal(_)
-                | canon::Expr_::VarTopLevel { .. }
-                | canon::Expr_::VarCtor { .. }
-                | canon::Expr_::Int(_)
-                | canon::Expr_::Float(_)
-                | canon::Expr_::Str(_)
-                | canon::Expr_::CustomElementCtor(_)
-                | canon::Expr_::Char(_)
-                | canon::Expr_::Unit => {}
+        app_entry_refs(body)
+            .into_iter()
+            .try_for_each(|(kernel, span)| self.reject_generic_app_entry(kernel, span, row_vars))
+    }
+
+    /// Refuse an app entry whose Model or Msg its app shape cannot hold, before any definition is lowered.
+    ///
+    /// A Model or Msg holding a part with no `Clone` (a `Cmd`, a `Task`, a
+    /// function) is refused by its app shape's own gate, IPE-L0120 or
+    /// IPE-L0125, which names the role and the field. Every callee-bound
+    /// refusal (IPE-L0164) of the same type, at the entry, at a view kernel
+    /// copying the message, or at a user generic, follows from that one
+    /// declaration, so the role gates run first, over the whole module.
+    ///
+    /// This only chooses the diagnostic: an entry whose Model or Msg it cannot
+    /// read (no region, an unfixed type, a type that does not lower) is left
+    /// to the per-reference checks, which fail closed. The shape's stronger
+    /// predicates (serde for a Web Model, derivable for a Msg) stay with the
+    /// backend gates.
+    fn reject_inadmissible_app_roles(&self) -> Result<(), (Diagnostic, Vec<Symbol>)> {
+        for def in &self.m.defs {
+            let (canon::Def::Untyped { body, .. } | canon::Def::Typed { body, .. }) = def;
+            *self.current_home.borrow_mut() = def.home().to_vec();
+            for (kernel, span) in app_entry_refs(body) {
+                self.reject_inadmissible_app_role(kernel, span)
+                    .map_err(|d| (d, def.home().to_vec()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The app-role refusal of the app entry `kernel` referenced at `span`, if its Model or Msg has no `Clone`.
+    fn reject_inadmissible_app_role(&self, kernel: KernelFn, span: Span) -> DResult<()> {
+        let Some(surface) = kernel.app_entry_surface() else {
+            return Ok(());
+        };
+        let (Some(solved), Some(shape)) = (self.region_ty(span), kernel.scheme_shape()) else {
+            return Ok(());
+        };
+        if !ty_is_ground(solved) {
+            return Ok(());
+        }
+        let heads = SchemeHeads {
+            builtins: &self.builtins.kernel_types,
+            interner: self.interner,
+        };
+        let gates = AppRoleGates::of(surface);
+        let roles = [
+            (ipe_kernels::APP_MODEL_VAR, gates.model, AppRole::Model),
+            (ipe_kernels::APP_MSG_VAR, gates.msg, AppRole::Msg),
+        ];
+        for (var, gate, role) in roles {
+            let Some(app) = gate else {
+                continue;
+            };
+            let Some(instance) = scheme_var_instance(shape, solved, var, heads) else {
+                continue;
+            };
+            let Ok(lowered) = self.ir_type_from_ty(instance, span) else {
+                continue;
+            };
+            if let Some((field, leaf)) =
+                instance_bounds::nonclone_role_blame(self.clone_env(), &lowered)
+            {
+                let msg = match role {
+                    AppRole::Model => LowerError::InadmissibleAppModel { app, field, leaf },
+                    AppRole::Msg => LowerError::InadmissibleAppMsg { app, field, leaf },
+                };
+                return Err(Diagnostic::Lower { span, msg });
             }
         }
         Ok(())

@@ -11,7 +11,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use ipe_diagnostics::{CalleeDemand, Diagnostic, LowerError, Span};
+use ipe_diagnostics::{CalleeDemand, Diagnostic, LowerError, ModelLeaf, Span};
 use ipe_intern::{Interner, Symbol};
 use ipe_ir::{BoundSet, CarrierLeaf, Func, FuncId, IrType};
 
@@ -222,24 +222,58 @@ fn is_copy(env: CloneEnv<'_>, ty: &IrType) -> bool {
 
 /// The name of the first non-`Clone` part of `ty`, as IPE-L0164 prints it.
 fn nonclone_leaf_name(env: CloneEnv<'_>, ty: &IrType) -> Box<str> {
-    let found: RefCell<Option<Box<str>>> = RefCell::new(None);
+    let leaf = first_nonclone_leaf(env, ty);
+    whole_type_name(env.interner, leaf.as_ref().unwrap_or(ty))
+}
+
+/// The first part of `ty` with no `Clone` of its own, in the shared held walk's order.
+fn first_nonclone_leaf(env: CloneEnv<'_>, ty: &IrType) -> Option<IrType> {
+    let found: RefCell<Option<IrType>> = RefCell::new(None);
     let held = ipe_ir::ir_type_holds(ty, env.payloads, &|t| {
-        let opaque_ffi = matches!(t, IrType::Enum { home, name, .. }
-            if enum_is_opaque_ffi_handle(env, home, *name));
-        let leaf = opaque_ffi
-            || (matches!(ipe_ir::carrier_leaf(t), CarrierLeaf::NonClone)
-                && !matches!(t, IrType::Generic(_) | IrType::RowGeneric(_)));
+        let leaf = is_nonclone_leaf(env, t);
         if leaf {
-            found
-                .borrow_mut()
-                .get_or_insert_with(|| whole_type_name(env.interner, t));
+            found.borrow_mut().get_or_insert_with(|| t.clone());
         }
         leaf
     });
-    found
-        .into_inner()
-        .filter(|_| held)
-        .unwrap_or_else(|| whole_type_name(env.interner, ty))
+    found.into_inner().filter(|_| held)
+}
+
+/// Whether `t` itself lacks `Clone`: a non-`Clone` default carrier or an opaque FFI handle.
+fn is_nonclone_leaf(env: CloneEnv<'_>, t: &IrType) -> bool {
+    let opaque_ffi = matches!(t, IrType::Enum { home, name, .. }
+        if enum_is_opaque_ffi_handle(env, home, *name));
+    opaque_ffi
+        || (matches!(ipe_ir::carrier_leaf(t), CarrierLeaf::NonClone)
+            && !matches!(t, IrType::Generic(_) | IrType::RowGeneric(_)))
+}
+
+/// What an app-role refusal blames in a non-`Clone` Model or Msg `ty`.
+///
+/// The record field holding the first non-`Clone` part (empty when `ty` is
+/// no record) and that part's kind. `None` when `ty` is `Clone`, so the role
+/// check refuses exactly what the callee-bound `Clone` check would.
+pub(super) fn nonclone_role_blame(env: CloneEnv<'_>, ty: &IrType) -> Option<(Box<str>, ModelLeaf)> {
+    if !bounded_nonclone(env, ty) {
+        return None;
+    }
+    let field = match ty {
+        IrType::Record(fields) => fields
+            .iter()
+            .find(|(_, field_ty)| bounded_nonclone(env, field_ty))
+            .and_then(|(sym, _)| env.interner.resolve(*sym))
+            .unwrap_or(""),
+        _ => "",
+    };
+    let leaf = first_nonclone_leaf(env, ty).map_or(ModelLeaf::Handle, |leaf| match leaf {
+        IrType::Fun(..) | IrType::FnOnceChain(..) => ModelLeaf::Function,
+        IrType::Cmd(_) => ModelLeaf::Command,
+        IrType::Sub(_) => ModelLeaf::Subscription,
+        IrType::Task(_) => ModelLeaf::Task,
+        // The remaining non-`Clone` leaves: an app handle or an opaque FFI handle.
+        _ => ModelLeaf::Handle,
+    });
+    Some((field.into(), leaf))
 }
 
 /// The head of `ty` in Ipê words: `Task`, `function`, a union's own name.
