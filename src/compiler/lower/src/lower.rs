@@ -11955,6 +11955,9 @@ struct StoreCondIds {
     opeq_variant: Symbol,
 }
 
+/// A span in its home module, the key of the solver's region map.
+type RegionKey = (Vec<Symbol>, Span);
+
 /// The lowering pass over a single canonical module.
 pub struct Lowerer<'a> {
     m: &'a canon::Module,
@@ -12259,7 +12262,7 @@ pub struct Lowerer<'a> {
     /// call's result, so the head's instance is rebuilt from the call's
     /// argument and result regions ([`Self::note_span_shared_head`]); `None`
     /// when one of those regions is missing. Read by [`Self::callee_ty`].
-    span_shared_heads: std::cell::RefCell<BTreeMap<(Vec<Symbol>, Span), Option<Ty>>>,
+    span_shared_heads: std::cell::RefCell<BTreeMap<RegionKey, Option<Ty>>>,
     /// A `let`-bound local that names a top-level function, mapped to that
     /// function's `(module, name)` key — a point-free alias `let w = wrap`.
     ///
@@ -14971,18 +14974,16 @@ impl<'a> Lowerer<'a> {
         if callee.span != call_span {
             return;
         }
-        let rebuild = || {
-            let mut ty = self.region_ty(call_span)?.clone();
-            for arg in args.iter().rev() {
-                ty = Ty::Fun(Box::new(self.region_ty(arg.span)?.clone()), Box::new(ty));
-            }
-            Some(ty)
-        };
-        let rebuilt = rebuild();
+        let head_ty = self.region_ty(call_span).and_then(|result| {
+            args.iter().rev().try_fold(result.clone(), |acc, arg| {
+                let arg_ty = self.region_ty(arg.span)?.clone();
+                Some(Ty::Fun(Box::new(arg_ty), Box::new(acc)))
+            })
+        });
         let home = self.current_home.borrow().clone();
         self.span_shared_heads
             .borrow_mut()
-            .insert((home, call_span), rebuilt);
+            .insert((home, call_span), head_ty);
     }
 
     /// Refuse (IPE-L0135) an alias at `span` whose binding `inner` would share a non-`Clone` part.
