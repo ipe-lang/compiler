@@ -1,0 +1,43 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.String as String
+
+
+-- `{ q : ( { r : ( Int, a ) }, Int ) }` and `{ q : ( { r : ( b, Int ) }, c ) }`
+-- unify, so they share one `{q}` struct; their inner `{r}` records differ, and
+-- `{ r : ( String, String ) }` unifies with neither. The `{q}` template must
+-- reach its inner `{r}` record through a type parameter, never through a
+-- generalized `{ r : ( T1, T2 ) }` that unifies with both `{r}` structs.
+left : { q : ( { r : ( Int, a ) }, Int ) } -> Int
+left x =
+    case x.q of
+        ( _, n ) ->
+            n
+
+
+right : { q : ( { r : ( b, Int ) }, c ) } -> Int
+right x =
+    case x.q of
+        ( inner, _ ) ->
+            case inner.r of
+                ( _, n ) ->
+                    n
+
+
+size : { r : ( String, String ) } -> Int
+size x =
+    case x.r of
+        ( a, b ) ->
+            String.length a + String.length b
+
+
+main : Task Error ()
+main =
+    Io.println
+        (String.fromInt
+            (left { q = ( { r = ( 1, 2 ) }, 40 ) }
+                + right { q = ( { r = ( 3, 1 ) }, "s" ) }
+                + size { r = ( "a", "b" ) }
+            )
+        )

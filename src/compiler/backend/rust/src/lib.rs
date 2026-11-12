@@ -55,6 +55,7 @@ mod layout_sweep;
 mod naming;
 mod preamble;
 mod project;
+mod record_template;
 mod render;
 mod route_grammar;
 mod runtime_features;
@@ -88,7 +89,7 @@ use ipe_diagnostics::{DResult, Diagnostic, NameError, RustNameFoldKind, Span};
 use ipe_intern::{Interner, Symbol};
 use ipe_ir::{
     CallPin, Callee, EnumTraits, Expr, FuncId, IrType, KernelFn, ModPath, Program,
-    RuntimeBridgedEnum, TypeDef, UserPin, collect_generics,
+    RuntimeBridgedEnum, TypeDef, UserPin,
 };
 
 pub use emit_doc::{SweepDivergence, native_vs_legacy_sweep};
@@ -825,13 +826,8 @@ type VariantList = Vec<(Symbol, Vec<IrType>)>;
 type RecordFields = Vec<(String, IrType)>;
 
 /// Every DISTINCT field-type shape observed for one field-name set, in
-/// first-occurrence order — a generic template and/or its concrete
-/// instantiations, reconciled by [`canonicalise_shape`].
+/// first-occurrence order, reconciled by [`record_template::reconcile`].
 type ShapeOccurrences = Vec<RecordFields>;
-
-/// A synthesised struct's reconciled form: its canonical field template and its
-/// generic parameter symbols (empty for a monomorphic record).
-type CanonicalShape = (RecordFields, Vec<Symbol>);
 
 /// A synthesised Rust struct for one distinct CLOSED record shape.
 ///
@@ -887,6 +883,11 @@ pub(crate) struct RecordStruct {
     /// (SEAL break). `is_derivable ⇒ is_clone` (a `CDPeq` type is `Clone`), so
     /// the two flags never disagree in the derivable direction.
     pub is_clone: bool,
+    /// Every occurrence of the field-name set that shares this struct: the
+    /// record types that unify with one another, each an instance of
+    /// [`Self::fields`]. A use site resolves to the struct whose members its
+    /// shape unifies with.
+    pub members: Vec<RecordFields>,
 }
 
 /// Per-function scratch for the dev appearance hot-swap emit (Step 1).
@@ -1971,7 +1972,7 @@ impl<'a> EmitCtx<'a> {
         // Each field-name set maps to the LIST of distinct field-type shapes seen
         // for it. A set may carry both a generic template (`{ value : a }`, from a
         // parametric signature) and concrete instantiations (`{ value : Int }`):
-        // [`canonicalise_shape`] reconciles them into a single struct.
+        // [`record_template::reconcile`] reconciles them into a single struct.
         let mut shapes: BTreeMap<Vec<String>, ShapeOccurrences> = BTreeMap::new();
         // seal: rustc refuses an enum type parameter no field uses (E0392).
         // The lowerer erases every such parameter through the same table, so
@@ -2062,10 +2063,15 @@ impl<'a> EmitCtx<'a> {
         let mut record_by_fieldset: BTreeMap<Vec<String>, Vec<usize>> = BTreeMap::new();
         let mut used_names: BTreeSet<String> = BTreeSet::new();
         for (key, occurrences) in shapes {
-            // A field-name set may reconcile to MORE than one struct when two
-            // structurally-distinct records share only their field names; each
-            // gets its own struct, deterministically named.
-            for (fields, type_params) in reconcile_shapes(&key, &occurrences)? {
+            // One struct per class of unifiable occurrences: a value flows only
+            // between unifiable record types, so every flow stays inside one
+            // struct, whose template generalizes each member.
+            for record_template::RecordClass {
+                template: fields,
+                type_params,
+                members,
+            } in record_template::reconcile(&key, &occurrences, interner.len())?
+            {
                 let name = unique_struct_name(naming::record_struct_name(&key), &mut used_names);
                 // seal: a record struct is derivable iff every field type is,
                 // consulting the enum fixpoint for referenced user enums.
@@ -2117,6 +2123,7 @@ impl<'a> EmitCtx<'a> {
                     is_derivable,
                     is_serde,
                     is_clone,
+                    members,
                 });
             }
         }
@@ -3401,57 +3408,16 @@ impl<'a> EmitCtx<'a> {
         self.record_by_fieldset.contains_key(&key)
     }
 
-    /// Among the candidate structs for one field-name set, the one whose field
-    /// template is ALPHA-EQUIVALENT to `shape_by_name`
-    /// ([`ipe_ir::alpha_equivalent_fields`]). Two distinct generic siblings
-    /// (`{q:a}` and `{q:(a,a)}`) both instantiation-match a generic use site, so
-    /// the alpha-equivalence match is what makes the resolution unambiguous. `None` when no
-    /// candidate is alpha-equivalent — a concrete instantiation of a lone generic
-    /// template, left to the caller's instantiation scan.
-    fn record_struct_alpha_equivalent(
-        &self,
-        key: &[String],
-        indices: &[usize],
-        shape_by_name: &BTreeMap<&str, &IrType>,
-    ) -> DResult<Option<&RecordStruct>> {
-        let mut named: Vec<(String, IrType)> = shape_by_name
-            .iter()
-            .map(|(n, t)| ((*n).to_owned(), (*t).clone()))
-            .collect();
-        named.sort_by(|a, b| a.0.cmp(&b.0));
-        for &i in indices {
-            let rec = self
-                .record_structs
-                .get(i)
-                .ok_or_else(|| Diagnostic::CompilerBug {
-                    where_: "ipe_backend_rust::EmitCtx::record_name",
-                    detail: format!(
-                        "dangling struct index for record shape {{{}}}",
-                        key.join(", ")
-                    ),
-                })?;
-            if ipe_ir::alpha_equivalent_fields(&rec.fields, &named) {
-                return Ok(Some(rec));
-            }
-        }
-        Ok(None)
-    }
-
     /// Resolve a (sorted) field-name set to its synthesised [`RecordStruct`],
     /// disambiguating by the record's full field-type `shape` when the name set
     /// is shared by more than one struct.
     ///
     /// * One struct for the set → return it; `shape` is unneeded (the common
     ///   case — no field-name collision).
-    /// * Several structs → `shape` MUST be present and select one: a struct
-    ///   whose field template is alpha-equivalent to the shape, else a
-    ///   monomorphic struct whose field types equal the shape, or a generic
-    ///   struct the shape instantiates. A CONCRETE shape can instantiate two
-    ///   distinct generic siblings at once (`{q:(Int,Int)}` matches both `{q:a}`
-    ///   and `{q:(a,a)}`); it resolves to the MOST-SPECIFIC template (the one
-    ///   with the most concrete constructors — `{q:(a,a)}` here — so the value
-    ///   is emitted with the struct carrying its true field types). A missing
-    ///   `shape`, no match, or two equally-specific matches is a surfaced
+    /// * Several structs → `shape` MUST be present and select the one struct
+    ///   whose members it unifies with. The structs of one name set are the
+    ///   classes of mutually non-unifiable occurrences, so a shape drawn from
+    ///   the program unifies with exactly one; none or several is a surfaced
     ///   invariant violation, never a silent pick.
     ///
     /// A miss (no struct for the set) means the shape never appeared in a
@@ -3494,76 +3460,11 @@ impl<'a> EmitCtx<'a> {
                 indices.len()
             ),
         })?;
-        // Compare the shape (by field name) against each candidate's canonical
-        // field template: a monomorphic candidate matches by concrete equality, a
-        // generic one by instantiation.
-        let mut shape_by_name: BTreeMap<&str, &IrType> = BTreeMap::new();
+        let mut named: RecordFields = Vec::with_capacity(shape.len());
         for (sym, ty) in shape {
-            shape_by_name.insert(self.resolve_ident(*sym)?, ty);
+            named.push((self.resolve_ident(*sym)?.to_owned(), ty.clone()));
         }
-        // Two GENERIC candidates can share a name set yet differ structurally
-        // (`{q:a}` vs `{q:(a,a)}`, reconciled to distinct structs). A generic
-        // use-site shape (`{q:(a,a)}`) instantiation-matches BOTH the exact struct
-        // AND any strictly-more-general one (`{q:a}` binds `a := (a,a)`), which
-        // would read as an ambiguous "matched more than one". The exact struct is
-        // the alpha-equivalent one: a renaming of the shape's type variables. Prefer that —
-        // it is the canonical, most-specific choice — and only fall back to the
-        // instantiation scan when no candidate is alpha-equivalent (a genuine
-        // monomorphic instantiation of a single generic template).
-        if let Some(rec) = self.record_struct_alpha_equivalent(key, indices, &shape_by_name)? {
-            return Ok(rec);
-        }
-        self.record_struct_most_specific(key, indices, &shape_by_name)
-    }
-
-    /// Among the candidate structs a non-alpha-equivalent `shape_by_name`
-    /// instantiation-matches, return the MOST-SPECIFIC one.
-    ///
-    /// A CONCRETE shape (`{q:(Int,Int)}`) can instantiation-match TWO distinct
-    /// generic siblings at once: `{q:a}` binds `a := (Int,Int)`, while `{q:(a,a)}`
-    /// binds `a := Int`. Both are legitimate instantiations, so a "first match wins"
-    /// rule would produce declaration-order-dependent results (IPE-I0001 on some
-    /// orderings, wrong struct on others). Resolve deterministically by a two-pass
-    /// scan over the FULL candidate set: first find the global maximum
-    /// [`template_specificity`], then collect every candidate that achieves it.
-    /// If exactly one achieves the max, it wins regardless of declaration order.
-    /// If two or more tie AT the max, they are genuinely ambiguous — no single
-    /// concrete use-site can uniquely instantiate both — and the tie is surfaced
-    /// as an ambiguity error (IPE-I0001). A tie strictly below the max is
-    /// unambiguous: the deeper (max) candidate covers it.
-    fn record_struct_most_specific(
-        &self,
-        key: &[String],
-        indices: &[usize],
-        shape_by_name: &BTreeMap<&str, &IrType>,
-    ) -> DResult<&RecordStruct> {
-        let candidate_specificity = |rec: &RecordStruct| -> Option<usize> {
-            if rec.fields.len() != shape_by_name.len() {
-                return None;
-            }
-            let instantiates = if rec.type_params.is_empty() {
-                rec.fields
-                    .iter()
-                    .all(|(n, t)| shape_by_name.get(n.as_str()) == Some(&t))
-            } else {
-                let mut subst: BTreeMap<Symbol, IrType> = BTreeMap::new();
-                rec.fields.iter().all(|(n, t)| {
-                    shape_by_name
-                        .get(n.as_str())
-                        .is_some_and(|u| match_template(t, u, &mut subst).is_ok())
-                })
-            };
-            if instantiates {
-                Some(
-                    rec.fields
-                        .iter()
-                        .map(|(_, t)| template_specificity(t))
-                        .sum(),
-                )
-            } else {
-                None
-            }
-        };
+        named.sort_by(|a, b| a.0.cmp(&b.0));
         let dangling = || Diagnostic::CompilerBug {
             where_: "ipe_backend_rust::EmitCtx::record_name",
             detail: format!(
@@ -3571,45 +3472,30 @@ impl<'a> EmitCtx<'a> {
                 key.join(", ")
             ),
         };
-
-        // Pass 1: collect (index, specificity) for every matching candidate and
-        // find the global maximum specificity.
-        let mut matching: Vec<(usize, usize)> = Vec::new();
-        let mut max_spec: usize = 0;
+        let mut matching: Vec<&RecordStruct> = Vec::new();
         for &i in indices {
             let rec = self.record_structs.get(i).ok_or_else(dangling)?;
-            if let Some(spec) = candidate_specificity(rec) {
-                if spec > max_spec {
-                    max_spec = spec;
+            let mut unifies = false;
+            for member in &rec.members {
+                if record_template::fields_unify(member, &named)? {
+                    unifies = true;
+                    break;
                 }
-                matching.push((i, spec));
+            }
+            if unifies {
+                matching.push(rec);
             }
         }
-
-        // Pass 2: keep only the candidates at the global maximum.
-        let at_max: Vec<usize> = matching
-            .into_iter()
-            .filter_map(|(i, spec)| (spec == max_spec).then_some(i))
-            .collect();
-
-        match at_max.as_slice() {
-            [] => Err(Diagnostic::CompilerBug {
+        match matching.as_slice() {
+            [rec] => Ok(rec),
+            others => Err(Diagnostic::CompilerBug {
                 where_: "ipe_backend_rust::EmitCtx::record_name",
                 detail: format!(
-                    "record shape {{{}}} matched no synthesised struct among {} candidates",
+                    "record shape {{{}}} unifies with the members of {} of its {} synthesised \
+                     structs; a program shape unifies with exactly one",
                     key.join(", "),
+                    others.len(),
                     indices.len()
-                ),
-            }),
-            [i] => self.record_structs.get(*i).ok_or_else(dangling),
-            _ => Err(Diagnostic::CompilerBug {
-                where_: "ipe_backend_rust::EmitCtx::record_name",
-                detail: format!(
-                    "record shape {{{}}} matched {} synthesised structs at equal maximum \
-                     specificity — the concrete use site does not uniquely instantiate \
-                     any single template",
-                    key.join(", "),
-                    at_max.len()
                 ),
             }),
         }
@@ -4186,7 +4072,7 @@ const fn ir_type_is_record_shape_leaf(ty: &IrType) -> bool {
 ///
 /// One set can legitimately carry several entries — a generic template
 /// (`{ value : a }`) plus concrete instantiations (`{ value : Int }`). The later
-/// [`canonicalise_shape`] pass reconciles them into one struct. Storing every
+/// [`record_template::reconcile`] pass reconciles them into one struct. Storing every
 /// distinct occurrence (rather than rejecting the second) is what makes the
 /// generic-plus-concrete merge representable.
 #[allow(clippy::too_many_lines)] // exhaustive per-variant IrType classification — one arm per opaque leaf
@@ -4521,129 +4407,6 @@ fn type_reaches_enum(
     }
 }
 
-/// Does this type contain an [`IrType::Generic`] anywhere (a field that is — or
-/// structurally carries — a type variable)?
-fn contains_generic(ty: &IrType) -> bool {
-    match ty {
-        IrType::Generic(_) => true,
-        IrType::Tuple(elems) => elems.iter().any(contains_generic),
-        IrType::Record(map) => map.values().any(contains_generic),
-        IrType::Fun(params, ret)
-        | IrType::SharedFun(params, ret)
-        | IrType::FnOnceChain(params, ret) => {
-            params.iter().any(contains_generic) || contains_generic(ret)
-        }
-        IrType::Enum { args, .. } => args.iter().any(contains_generic),
-        IrType::Maybe(elem) | IrType::List(elem) => contains_generic(elem),
-        IrType::Result(err, ok) => contains_generic(err) || contains_generic(ok),
-        IrType::Dict(k, v) => contains_generic(k) || contains_generic(v),
-        IrType::Set(a) => contains_generic(a),
-        IrType::Decoder(inner) | IrType::Task(inner) | IrType::Cmd(inner) | IrType::Sub(inner) => {
-            contains_generic(inner)
-        }
-        IrType::Int
-        | IrType::Float
-        | IrType::Bool
-        | IrType::Str
-        | IrType::Char
-        | IrType::Unit
-        | IrType::Bytes
-        | IrType::Json
-        // `Db` is an opaque monomorphic handle — no generic parameters.
-        | IrType::Db
-        // Opaque server types are monomorphic — no generic parameters.
-        | IrType::ServerRequest
-        | IrType::ServerResponse
-        | IrType::ServerRoute
-        | IrType::ServerCookie
-        // `StreamWriter` is monomorphic — no generic parameters.
-        | IrType::StreamWriter
-        // `HttpRequest` is monomorphic — no generic parameters.
-        | IrType::HttpRequest
-        // `Regex` is a monomorphic opaque handle — no generic parameters.
-        | IrType::Regex
-        // `WsHandle` / `WsServerCfg` are monomorphic — no generic parameters.
-        | IrType::WebSocketServer
-        | IrType::WebSocketServerCfg
-        // nullary plain types and the opaque live request handle are
-        // monomorphic.
-        | IrType::UiPlain(_)
-        | IrType::WebReq
-        | IrType::SessionHandle
-        // `Order` is monomorphic — no generic parameters.
-        // `HttpMethod` is monomorphic — no generic parameters.
-        // `Decimal` is monomorphic — no generic parameters.
-        // `BackoffStrategy` is monomorphic — no generic parameters.
-        | IrType::BackoffStrategy
-        | IrType::Order
-        | IrType::HttpMethod
-        | IrType::Decimal
-        | IrType::ErrorKind
-        | IrType::Error
-        | IrType::ErrorDetails
-        // Nominal error-payload leaves (SEAL fix) — monomorphic
-        // runtime structs, same classification as `Error`/`ErrorDetails`.
-        | IrType::ErrorInfo
-        | IrType::PanicInfo
-        | IrType::TypeInfo
-        // `SqlFragment` is monomorphic — no generic parameters.
-        // `Secret` is monomorphic — no generic parameters.
-        | IrType::SqlFragment
-        | IrType::Secret
-        | IrType::Path
-        // `Url` is a monomorphic opaque wrapper — no generic parameters.
-        | IrType::Url
-        | IrType::UrlRelative
-        // `Dsn` is a monomorphic opaque wrapper — no generic parameters.
-        | IrType::Dsn
-        | IrType::DbLocation
-        | IrType::Connection
-        | IrType::ConnReadOnly
-        | IrType::ConnReadWrite
-        | IrType::Setting | IrType::ShapeWeb | IrType::ShapeWebView | IrType::ShapeTerminal
-        // Process-run-with cfg + Cache config / stats + Csv document are
-        // monomorphic — no generic parameters.
-        | IrType::ProcessRunWithCfg
-        | IrType::ProcessRunInPtyCfg
-        | IrType::CacheCfg
-        | IrType::WebSocketClientCfg
-        | IrType::CacheStats
-        | IrType::CsvDoc
-        // Ipe.Email records + provider ADT are monomorphic — no generic
-        // parameters.
-        | IrType::EmailMessage
-        | IrType::EmailAttachment
-        | IrType::EmailSesConfig
-        | IrType::EmailSmtpConfig
-        | IrType::EmailProvider
-        // Typed security newtypes are monomorphic opaque wrappers — no generic
-        // parameters.
-        | IrType::CryptoKey
-        | IrType::CryptoMac
-        | IrType::EmailAddress
-        // `Locale` is monomorphic — no generic parameters.
-        | IrType::Locale
-        // `Principal` is monomorphic — no generic parameters.
-        | IrType::Principal
-        // `AuthConfig` / `TokenSource` are monomorphic — no generic parameters.
-        | IrType::AuthConfig
-        | IrType::TokenSource
-        // Shape opaque app leaves — monomorphic, no generic parameters.
-        | IrType::WebApp | IrType::TuiApp | IrType::CliApp | IrType::WorkerApp
-        // A row variable is a SEPARATE row generic (`R{n}`), never an ordinary
-        // `T{n}` record-struct parameter, and never appears inside a record-
-        // struct field. It contributes no `<T>` clause here.
-        | IrType::RowGeneric(_) => false,
-        // `WebRoute page` is parametric on `page`; check if it carries a
-        // generic.
-        IrType::WebRoute(page) => contains_generic(page),
-        IrType::CustomElement { down, up } => contains_generic(down) || contains_generic(up),
-        // `Ui { ctor, msg }` is parametric on `msg`; check if `msg` carries
-        // a generic.
-        IrType::Ui { msg, .. } => contains_generic(msg),
-    }
-}
-
 /// The app surface the program's entry `main` pins, from its lowered return type.
 ///
 /// A `WebApp` leaf under a webview host is the `WebView` surface; an entry that
@@ -4844,137 +4607,6 @@ fn match_template(
                 .to_owned(),
         }),
     }
-}
-
-/// Count the concrete (non-generic) type constructors in a record-struct field
-/// template, used to rank two generic templates that a single CONCRETE use-site
-/// shape instantiation-matches at once. A [`IrType::Generic`] parameter absorbs
-/// arbitrary structure and so contributes 0; every other node contributes 1 for
-/// itself plus the specificity of its children. A strictly-higher total means a
-/// strictly-more-specific template — the concrete shape `{q:(Int,Int)}` scores
-/// the tuple template `{q:(a,a)}` (specificity 1: the `Tuple` node, its two
-/// generic leaves scoring 0) above the pass-through `{q:a}` (specificity 0),
-/// resolving the value to the struct whose fields carry its true types.
-fn template_specificity(ty: &IrType) -> usize {
-    match ty {
-        IrType::Generic(_) | IrType::RowGeneric(_) => 0,
-        IrType::Record(map) => 1 + map.values().map(template_specificity).sum::<usize>(),
-        // Every other node is one head plus its children, which the head-identity
-        // SSOT `paired_children` enumerates exhaustively (a node paired with
-        // itself); a leaf has none.
-        _ => {
-            1 + ipe_ir::paired_children(ty, ty).map_or(0, |children| {
-                children.map(|(child, _)| template_specificity(child)).sum()
-            })
-        }
-    }
-}
-
-/// Reconcile every distinct field-type shape observed for one field-name set
-/// into ONE OR MORE synthesised structs — each returned as its canonical
-/// `(field name, type)` template plus its generic parameter list — in stable
-/// first-occurrence order.
-///
-/// A single field-name set can legitimately carry several STRUCTURALLY DISTINCT
-/// shapes that share only their field names (e.g. `{ x : Int }` in one place and
-/// `{ x : String }` in another). Both type-check, so each must synthesise its
-/// own struct rather than collapse; the resolution site disambiguates a literal
-/// by its solved shape. Occurrences are grouped:
-///
-/// * A GENERIC template (a shape carrying a type variable) forms one struct.
-///   Every alpha-equivalent generic occurrence and every concrete occurrence
-///   that INSTANTIATES the template (verified via [`match_template`]) joins it —
-///   this is the parametric-record path (`wrap : a -> { value : a }` plus its
-///   `{ value : Int }` instantiations), preserved exactly.
-/// * A concrete occurrence that instantiates no generic template joins the
-///   MONOMORPHIC class of its structurally-identical peers, or opens a new class
-///   if none matches. Each concrete class is one monomorphic struct.
-///
-/// Ordering is by each class's first-occurrence index, so the emitted struct set
-/// (and thus the disambiguated struct names) is deterministic regardless of map
-/// iteration.
-fn reconcile_shapes(key: &[String], occurrences: &[RecordFields]) -> DResult<Vec<CanonicalShape>> {
-    if occurrences.is_empty() {
-        return Err(Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::reconcile_shapes",
-            detail: format!(
-                "record field set {{{}}} has no collected shape",
-                key.join(", ")
-            ),
-        });
-    }
-
-    let is_generic = |fields: &[(String, IrType)]| fields.iter().any(|(_, t)| contains_generic(t));
-
-    // The generic templates for this name set, one per distinct shape modulo
-    // alpha-equivalence. A field-name set does NOT name a parametric record
-    // uniquely: body-local shape surfacing (and signatures generally) can feed
-    // two GENUINELY-DISTINCT generic shapes under one set — `{ q = a }` (shape
-    // `{q:a}`) in one function and `{ q = (a, a) }` (shape `{q:(a,a)}`) in
-    // another. Both are well-typed, so each synthesises its own struct.
-    // Alpha-EQUIVALENT occurrences (`ipe_ir::alpha_equivalent_fields`) fold to a
-    // single struct — no spurious duplication. This mirrors the monomorphic-sibling path below, where
-    // structurally-distinct concrete shapes sharing a name set each get a struct.
-    let mut templates: Vec<CanonicalShape> = Vec::new();
-    for occ in occurrences.iter().filter(|f| is_generic(f)) {
-        if templates
-            .iter()
-            .any(|(template, _)| ipe_ir::alpha_equivalent_fields(template, occ))
-        {
-            // An alpha-equivalent generic occurrence: already has its struct.
-            continue;
-        }
-        let mut type_params: Vec<Symbol> = Vec::new();
-        for (_, ty) in occ {
-            collect_generics(ty, &mut type_params);
-        }
-        templates.push((occ.clone(), type_params));
-    }
-
-    let mut classes: Vec<CanonicalShape> = Vec::new();
-    for occ in occurrences {
-        if is_generic(occ) {
-            // Folds into its own generic struct (grouped above by alpha-equivalence).
-            continue;
-        }
-        // A concrete occurrence that instantiates SOME generic template belongs to
-        // that generic struct — not its own concrete one.
-        if templates
-            .iter()
-            .any(|(template, _)| template_instantiated_by(template, occ))
-        {
-            continue;
-        }
-        // Otherwise it is a monomorphic shape: join its structurally-identical
-        // class, or open a new one. Concrete records carry no type variables, so
-        // structural identity is plain equality of the sorted field-type list.
-        if !classes.iter().any(|(existing, _)| existing == occ) {
-            classes.push((occ.clone(), Vec::new()));
-        }
-    }
-
-    // The generic structs lead (each template is its alpha-equivalence class's
-    // first generic occurrence, in first-occurrence order); genuinely-distinct concrete
-    // siblings follow, also in first-occurrence order.
-    let mut out = Vec::with_capacity(templates.len() + classes.len());
-    out.extend(templates);
-    out.extend(classes);
-    Ok(out)
-}
-
-/// Does the concrete occurrence `concrete` instantiate the generic `template`
-/// (same field-type shape modulo binding each type variable to a concrete type)?
-/// A scratch substitution is discarded either way — this is a pure classifier,
-/// so a failed match is a plain `false`, never a surfaced error.
-fn template_instantiated_by(template: &[(String, IrType)], concrete: &[(String, IrType)]) -> bool {
-    if template.len() != concrete.len() {
-        return false;
-    }
-    let mut subst: BTreeMap<Symbol, IrType> = BTreeMap::new();
-    template
-        .iter()
-        .zip(concrete.iter())
-        .all(|((tn, tv), (cn, cv))| tn == cn && match_template(tv, cv, &mut subst).is_ok())
 }
 
 /// Return `base` if unused, else the first `base<n>` (n ≥ 2) that is free,
@@ -5469,70 +5101,6 @@ mod record_struct_namespace_tests {
             ctx.assert_row_witness_names_disjoint(&distinct, &BTreeSet::new())
                 .is_ok(),
             "a single field name has no collision to report"
-        );
-        Ok(())
-    }
-
-    /// Two GENUINELY-DISTINCT generic shapes under one field-name set (`{q:a}`
-    /// and `{q:(a,a)}`) reconcile to TWO structs, not a `CompilerBug`. This is the
-    /// generic twin of the monomorphic-sibling path: distinct shapes sharing a
-    /// name set each get a struct. Regression for the IPE-I0001 ICE.
-    #[test]
-    fn distinct_generic_shapes_one_field_set_reconcile_to_two_structs() -> DResult<()> {
-        let mut interner = Interner::new();
-        let a = interner.intern("a")?;
-        let scalar: RecordFields = vec![("q".to_owned(), IrType::Generic(a))];
-        let pair: RecordFields = vec![(
-            "q".to_owned(),
-            IrType::Tuple(vec![IrType::Generic(a), IrType::Generic(a)]),
-        )];
-
-        let out = reconcile_shapes(&["q".to_owned()], &[scalar.clone(), pair.clone()])?;
-        // Each distinct generic shape gets its own struct, in first-occurrence
-        // order, and both are generic (carry the type parameter `a`) — no
-        // monomorphic class, no `CompilerBug`.
-        assert_eq!(
-            out,
-            vec![(scalar, vec![a]), (pair, vec![a])],
-            "each distinct generic shape gets its own generic struct"
-        );
-        Ok(())
-    }
-
-    /// Alpha-EQUIVALENT generic occurrences of ONE shape (`{q:a}` and `{q:b}`,
-    /// distinct type-var symbols) fold to a SINGLE struct — the fix disambiguates
-    /// only genuinely-distinct shapes and never spuriously duplicates.
-    #[test]
-    fn alpha_equivalent_generic_shapes_fold_to_one_struct() -> DResult<()> {
-        let mut interner = Interner::new();
-        let a = interner.intern("a")?;
-        let b = interner.intern("b")?;
-        let with_a: RecordFields = vec![("q".to_owned(), IrType::Generic(a))];
-        let with_b: RecordFields = vec![("q".to_owned(), IrType::Generic(b))];
-
-        let out = reconcile_shapes(&["q".to_owned()], &[with_a.clone(), with_b])?;
-        assert_eq!(
-            out,
-            vec![(with_a, vec![a])],
-            "alpha-equivalent shapes fold to one generic struct"
-        );
-        Ok(())
-    }
-
-    /// A concrete instantiation of a single generic template folds INTO that
-    /// template's struct (the parametric-record path), leaving exactly one struct.
-    #[test]
-    fn concrete_instantiation_folds_into_its_generic_template() -> DResult<()> {
-        let mut interner = Interner::new();
-        let a = interner.intern("a")?;
-        let generic: RecordFields = vec![("q".to_owned(), IrType::Generic(a))];
-        let concrete: RecordFields = vec![("q".to_owned(), IrType::Int)];
-
-        let out = reconcile_shapes(&["q".to_owned()], &[generic.clone(), concrete])?;
-        assert_eq!(
-            out,
-            vec![(generic, vec![a])],
-            "the concrete shape instantiates the lone generic template"
         );
         Ok(())
     }

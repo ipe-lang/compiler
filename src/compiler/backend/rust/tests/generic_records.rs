@@ -432,18 +432,13 @@ fn end_to_end_builds_and_prints_forty_two() -> DResult<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Regression: order-independent most-specific resolution
+// One struct per unification class, whatever the declaration order
 // ---------------------------------------------------------------------------
 //
-// Three templates share the field-name set `{ q }`:
-//   T0: `{ q : a }`              specificity 0  (one generic)
-//   T1: `{ q : (a, a) }`         specificity 1  (tuple of two generics)
-//   T2: `{ q : ((a,a),(a,a)) }`  specificity 3  (nested tuple)
-//
-// A concrete use site `{ q : ((Int,Int),(Int,Int)) }` instantiation-matches all
-// three.  T2 is the uniquely most-specific.  A single-pass scan that stops at
-// the first equal-specificity pair produces declaration-order-dependent results.
-// The two-pass fix always picks T2 regardless of order.
+// Three templates share the field-name set `{ q }` and unify with each other:
+//   T0: `{ q : a }`, T1: `{ q : (a, a) }`, T2: `{ q : ((a,a),(a,a)) }`.
+// The concrete use site `{ q : ((Int,Int),(Int,Int)) }` unifies with all three,
+// so the four occurrences form one class and the set emits one struct.
 
 /// Build a `{ q : <ty> }` record type.
 fn q_record(q: Symbol, ty: IrType) -> IrType {
@@ -531,26 +526,23 @@ fn three_template_program(interner: &mut Interner, deepest_pos: usize) -> DResul
     Ok(program(main_mod, funcs, vec![], None))
 }
 
-/// Deepest template (specificity 3) defined LAST: a single-pass scan tied T0
-/// and T1 before reaching T2, producing a spurious IPE-I0001.  After the
-/// two-pass fix this must succeed and resolve the concrete shape to the
-/// most-specific struct.
+/// Deepest template declared last: the class still emits exactly one struct.
 #[test]
-fn most_specific_resolution_order_independent_deepest_last() -> DResult<()> {
+fn unifiable_templates_share_one_struct_deepest_last() -> DResult<()> {
     let mut interner = Interner::new();
     let prog = three_template_program(&mut interner, 2)?;
     let out = emit(&interner, &prog)?;
-    assert!(
-        out.contains("RecQ"),
-        "concrete use site must resolve to the most-specific struct:\n{out}"
+    assert_eq!(
+        out.matches("pub struct RecQ").count(),
+        1,
+        "one unification class must emit one struct:\n{out}"
     );
     Ok(())
 }
 
-/// Deepest template defined FIRST: was already correct under the old scan.
-/// Both orderings must produce the same outcome.
+/// Both declaration orders emit the same single struct.
 #[test]
-fn most_specific_resolution_order_independent_deepest_first() -> DResult<()> {
+fn unifiable_templates_share_one_struct_order_independent() -> DResult<()> {
     let mut interner_first = Interner::new();
     let prog_first = three_template_program(&mut interner_first, 0)?;
     let out_first = emit(&interner_first, &prog_first)?;
@@ -559,25 +551,26 @@ fn most_specific_resolution_order_independent_deepest_first() -> DResult<()> {
     let prog_last = three_template_program(&mut interner_last, 2)?;
     let out_last = emit(&interner_last, &prog_last)?;
 
-    assert!(
-        out_first.contains("RecQ"),
-        "deepest-first must resolve to a struct:\n{out_first}"
+    assert_eq!(
+        out_first.matches("pub struct RecQ").count(),
+        1,
+        "deepest-first must emit one struct:\n{out_first}"
     );
-    assert!(
-        out_last.contains("RecQ"),
-        "deepest-last must resolve to a struct:\n{out_last}"
+    assert_eq!(
+        out_last.matches("pub struct RecQ").count(),
+        1,
+        "deepest-last must emit one struct:\n{out_last}"
     );
     Ok(())
 }
 
-/// True ambiguity: two templates at the same maximum specificity, both
-/// matching a single concrete use site.  The two-pass fix must still surface
-/// this as a `CompilerBug` rather than silently picking either one.
+/// Templates no renaming relates still fold when they unify.
 ///
-/// Templates: `{ q : (a, Int) }` and `{ q : (Int, a) }`, both specificity 2.
-/// Concrete: `{ q : (Int, Int) }` — instantiation-matches both.
+/// `{ q : (a, Int) }`, `{ q : (Int, a) }` and the concrete `{ q : (Int, Int) }`
+/// unify pairwise, so they are one class whose template is their least general
+/// generalization `{ q : (a, b) }`; every site resolves to that one struct.
 #[test]
-fn true_tie_at_max_specificity_is_ambiguity_error() -> DResult<()> {
+fn crossed_templates_fold_into_their_least_general_generalization() -> DResult<()> {
     let mut interner = Interner::new();
     let main_mod = interner.intern("Main")?;
     let q = interner.intern("q")?;
@@ -626,10 +619,15 @@ fn true_tie_at_max_specificity_is_ambiguity_error() -> DResult<()> {
     };
 
     let prog = program(main_mod, vec![fn_a, fn_b, fn_conc], vec![], None);
-    let res = emit(&interner, &prog);
+    let out = emit(&interner, &prog)?;
+    assert_eq!(
+        out.matches("pub struct RecQ").count(),
+        1,
+        "one unification class must emit one struct:\n{out}"
+    );
     assert!(
-        matches!(res, Err(Diagnostic::CompilerBug { .. })),
-        "a true max-specificity tie must surface as CompilerBug, got {res:?}"
+        out.contains("pub struct RecQ<T1, T2>"),
+        "the struct's template must be the generalization `{{ q : (a, b) }}`:\n{out}"
     );
     Ok(())
 }

@@ -1,0 +1,19 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.String as String
+
+
+f : { q : a } -> Int
+f r =
+    1
+
+
+g : { q : ( a, a ) } -> Int
+g r =
+    2
+
+
+main : Task Error ()
+main =
+    Io.println (String.fromInt (f { q = ( 1, 1 ) } + g { q = ( 3, 4 ) } + f { q = 5 }))

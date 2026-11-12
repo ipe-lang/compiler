@@ -1,0 +1,28 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.String as String
+
+
+-- `render` reuses its record, so its `format` field is a shared function keyed
+-- on `a`. `{ format : a -> String, count : a }` unifies with
+-- `{ format : b, count : Int }`, so both share one struct whose template
+-- generalizes both fields; cloning the reused record and the `'static` bound
+-- its shared function needs rest on the instantiation, not on the struct.
+render : { format : a -> String, count : a } -> String
+render c =
+    c.format c.count ++ "/" ++ c.format c.count
+
+
+total : { format : b, count : Int } -> Int
+total r =
+    r.count
+
+
+main : Task Error ()
+main =
+    Io.println
+        (render { format = String.fromInt, count = 3 }
+            ++ " "
+            ++ String.fromInt (total { format = "x", count = 4 })
+        )

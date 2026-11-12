@@ -1,12 +1,12 @@
-//! SEAL: generic record templates fold exactly when one renames the other's type variables.
+//! SEAL: generic record templates that unify share one struct.
 //!
-//! A field-name set synthesises one struct per generic template modulo
-//! alpha-equivalence. `{ items : List b }` (a signature) and `{ items : List a }`
-//! (a literal in another function) are one template, so the literal must build
-//! the signature's struct; a second struct for the literal is a type mismatch
-//! rustc rejects (E0308) after ipe accepted the program. Conversely
-//! `{ x : List a, y : a }` and `{ x : List a, y : b }` are distinct templates (a
-//! variable nested in `List` binds its sibling), so each keeps its own struct.
+//! A field-name set synthesises one struct per unification class.
+//! `{ items : List b }` (a signature) and `{ items : List a }` (a literal in
+//! another function) are alpha-equivalent, so the literal must build the
+//! signature's struct; a second struct for the literal is a type mismatch rustc
+//! rejects (E0308) after ipe accepted the program. `{ x : List a, y : a }` and
+//! `{ x : List a, y : b }` are not alpha-equivalent but unify, so they too share
+//! one struct whose template is their generalization `{ x : List a, y : b }`.
 //!
 //! The emit gate counts the structs per name set; under `IPE_E2E=1` each
 //! emitted crate must build and print its result.
@@ -36,7 +36,7 @@ main =
     Io.println (String.fromInt (wrapCount 1))
 ";
 
-/// Two generic templates sharing a name set that no renaming makes one.
+/// Two generic templates sharing a name set that no renaming makes one, yet that unify.
 const DISTINCT: &str = r#"module Main exposing (main)
 
 import Ipe.Io as Io
@@ -100,15 +100,15 @@ fn alpha_equivalent_templates_fold_emitted() {
     );
 }
 
-/// Emit gate: templates no renaming relates keep a struct each.
+/// Emit gate: templates no renaming relates but that unify share one struct.
 #[test]
-fn distinct_templates_stay_apart_emitted() {
+fn unifiable_templates_share_one_struct_emitted() {
     let out = build("alpha_record_distinct", DISTINCT, "emit");
     let emitted = crate::support::read_all_emitted_src(&out);
     assert_eq!(
         struct_count(&emitted, "RecXY"),
-        2,
-        "`{{ x : List a, y : a }}` and `{{ x : List a, y : b }}` must stay two structs; got:\n{emitted}"
+        1,
+        "`{{ x : List a, y : a }}` and `{{ x : List a, y : b }}` unify, so must share one struct; got:\n{emitted}"
     );
 }
 

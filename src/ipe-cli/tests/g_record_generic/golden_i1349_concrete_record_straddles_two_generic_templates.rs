@@ -1,31 +1,21 @@
 //! A CONCRETE record use straddling two distinct generic siblings (regression
 //! for IPE-I0001).
 //!
-//! Alongside the two generic shapes of `i1346` — `{ q : a }` (`RecQ`) and
-//! `{ q : ( a, a ) }` (`RecQ2`), which share the field-name set `{q}` yet are
-//! genuinely distinct — this source adds two CONCRETE uses: `concreteScalar`
+//! Alongside the two generic shapes of `i1346` — `{ q : a }` and
+//! `{ q : ( a, a ) }` — this source adds two CONCRETE uses: `concreteScalar`
 //! surfaces `{ q : Int }` and `concretePair` surfaces `{ q : ( Int, Int ) }`.
 //!
-//! The concrete pair `{ q : ( Int, Int ) }` instantiation-matches BOTH generic
-//! templates at once — `RecQ` binds `a := ( Int, Int )`, and `RecQ2` binds
-//! `a := Int`. A "first duplicate is ambiguous" resolution rule surfaced this as
-//! `Diagnostic::CompilerBug` → IPE-I0001 ("record shape {q} matched more than one
-//! synthesised struct") on well-typed source — an ICE, a Principle-3 soundness
-//! violation.
-//!
-//! The fix resolves the straddle to the MOST-SPECIFIC template: the one whose
-//! field skeleton carries the most concrete constructors. `{ q : ( a, a ) }`
-//! (specificity 1: its `Tuple` node) outranks `{ q : a }` (specificity 0), so the
-//! concrete pair emits with `RecQ2` — the struct whose `q` field really is a
-//! `(Int, Int)` pair — never the over-general `RecQ` (which would type `q` as the
-//! whole tuple and read the wrong field types). The concrete scalar
-//! `{ q : Int }` matches only `RecQ` (it is not a tuple) and emits with `RecQ`.
+//! The concrete pair instantiates BOTH generic shapes at once, so no choice
+//! between per-shape structs can be right for every flow. Every occurrence of
+//! `{q}` here unifies with `{ q : a }`, so all four share ONE struct whose
+//! template is their least general generalization, `struct RecQ<T1> { q: T1 }`:
+//! `concreteScalar` emits `RecQ { q: 100 }` and `concretePair` emits
+//! `RecQ { q: (40, 2) }`.
 //!
 //! `ipe` must emit `main.rs` byte-identical to the checked-in golden — exactly
-//! TWO generic structs, no spurious duplication — with `concreteScalar` using
-//! `RecQ { q: 100 }` and `concretePair` using `RecQ2 { q: (40, 2) }`. Behind
-//! `IPE_E2E=1` the emitted project must build and print `145`
-//! (`wrapOne 1 + firstOfPair 2 + concreteScalar 100 + concretePair 42`).
+//! ONE struct for `{q}` — and behind `IPE_E2E=1` the emitted project must build
+//! and print `145` (`wrapOne 1 + firstOfPair 2 + concreteScalar 100 +
+//! concretePair 42`).
 //!
 //! Oracle: Ipe's own output. `1 + 2 + 100 + 42` is `145\n`, exit 0 — the value
 //! checked into `expected.txt`.
