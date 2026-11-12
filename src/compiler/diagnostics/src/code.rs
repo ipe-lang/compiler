@@ -720,6 +720,9 @@ code! {
     /// a view spells, as a literal, an attribute name the runtime owns (an
     /// `ipe-*` marker, `nonce`, or any `data-ipe-*` name such as `data-ipe-path`).
     IPE_L0163 = "IPE-L0163", "a literal attribute name is reserved for the runtime", "IPE-L0163";
+    /// a function needs to copy, compare, or share a value whose type cannot
+    /// be copied, compared, or shared (a `Task` handed to `List.repeat`).
+    IPE_L0164 = "IPE-L0164", "a function needs to copy a value that cannot be copied", "IPE-L0164";
     /// expression nests too deeply for the backend
     IPE_L0200 = "IPE-L0200", "expression nests too deeply for the backend", "IPE-L0200";
     /// a type nests too deeply for the backend

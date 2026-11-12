@@ -13,6 +13,9 @@ use std::path::PathBuf;
 
 use ipe_kernels::{RuntimeModule, StdlibKernel};
 
+#[path = "kernel_row/runtime_bounds.rs"]
+mod runtime_bounds;
+
 /// `def()` is a pure projection: every field must equal what the authoritative
 /// method it delegates to returns.
 #[test]

@@ -333,6 +333,20 @@ impl BuiltinRow {
         self.tag
     }
 
+    /// Whether the head's runtime carrier implements `PartialEq`.
+    ///
+    /// An effect carrier (`Task`, `Cmd`, `Sub`) is a boxed future or a
+    /// boxed callback, and an application handle holds its callbacks; none
+    /// can be compared, so an equality over one has no Rust to emit.
+    #[must_use]
+    pub const fn derives_partial_eq(&self) -> bool {
+        !matches!(self.seal, SealClass::EffectCarrier)
+            && !matches!(
+                self.tag,
+                Some(BuiltinTag::CliApp | BuiltinTag::TuiApp | BuiltinTag::WebApp)
+            )
+    }
+
     const fn via(self, qualifiers: &'static [&'static str]) -> Self {
         Self {
             qualified_via: qualifiers,

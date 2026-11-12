@@ -121,6 +121,7 @@ fn lower_any_call(
     let caller = interner.intern("caller").unwrap();
 
     let caller_sig_span = Span::new(50, 51);
+    let callee_span = Span::new(52, 59);
     let field_val_span = Span::new(60, 62);
     let caller_rec_span = Span::new(60, 70);
     let call_span = Span::new(52, 70);
@@ -134,7 +135,7 @@ fn lower_any_call(
         )]),
     );
     let callee_ref = ipe_diagnostics::Located::new(
-        caller_sig_span,
+        callee_span,
         canon::Expr_::VarTopLevel {
             module: vec![],
             name: get_name,
@@ -172,10 +173,13 @@ fn lower_any_call(
     regions.insert((vec![], gn_access_span), solved_string(interner));
     let mut rec_fields = BTreeMap::new();
     rec_fields.insert(name_field, field_solved_ty);
+    let rec_ty = Ty::Record(rec_fields, RowTail::Closed);
+    // The checker records every callee reference's instance: `{ name : T } -> String`.
     regions.insert(
-        (vec![], caller_rec_span),
-        Ty::Record(rec_fields, RowTail::Closed),
+        (vec![], callee_span),
+        Ty::Fun(Box::new(rec_ty.clone()), Box::new(solved_string(interner))),
     );
+    regions.insert((vec![], caller_rec_span), rec_ty);
     regions.insert((vec![], call_span), solved_string(interner));
 
     let m = canon::Module {
@@ -246,6 +250,7 @@ fn extra_field_beyond_required_is_accepted() {
     let age_field = i.intern("age").unwrap();
 
     let caller_sig_span = Span::new(50, 51);
+    let callee_span = Span::new(52, 59);
     let caller_rec_span = Span::new(60, 70);
     let call_span = Span::new(52, 70);
 
@@ -263,7 +268,7 @@ fn extra_field_beyond_required_is_accepted() {
         ]),
     );
     let callee_ref = ipe_diagnostics::Located::new(
-        caller_sig_span,
+        callee_span,
         canon::Expr_::VarTopLevel {
             module: vec![],
             name: get_name,
@@ -300,10 +305,13 @@ fn extra_field_beyond_required_is_accepted() {
     let mut rec_fields = BTreeMap::new();
     rec_fields.insert(name_field, solved_string(&mut i));
     rec_fields.insert(age_field, solved_int(&mut i));
+    let rec_ty = Ty::Record(rec_fields, RowTail::Closed);
+    // The checker records every callee reference's instance: `{ name, age } -> String`.
     regions.insert(
-        (vec![], caller_rec_span),
-        Ty::Record(rec_fields, RowTail::Closed),
+        (vec![], callee_span),
+        Ty::Fun(Box::new(rec_ty.clone()), Box::new(solved_string(&mut i))),
     );
+    regions.insert((vec![], caller_rec_span), rec_ty);
     regions.insert((vec![], call_span), solved_string(&mut i));
 
     let m = canon::Module {

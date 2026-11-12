@@ -4,7 +4,7 @@
 //! `input_radio_` / `input_radio_row_`, each `M: Clone + Send + Sync`. A view
 //! helper generic over `msg` exposes `msg` only inside its `onChange` callback
 //! and its `Element msg` result, never bare, so the obligation is keyed on the
-//! kernel's scheme variable (`sync_obliged_scheme_vars`) and read off the solved
+//! kernel's scheme variable (a `SYNC` row of `runtime_bounds`) and read off the solved
 //! call-site type. Without it the helper's `T1` is `Send`-only and the emitted
 //! crate is ipe-accepted but fails `cargo build` with E0277.
 //!

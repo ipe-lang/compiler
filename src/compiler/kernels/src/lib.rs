@@ -911,6 +911,41 @@ const _: () = assert!(
     "a KERNEL_TYPE_ALIASES body is not a closed tree of empty-home builtins",
 );
 
+/// Whether scheme variable `var` occurs in `shape` at a position a reader holding the interner aligns.
+///
+/// Every position [`shape_aligns_var`] counts, plus a record field: the
+/// lowerer resolves a field's [`FieldTag::text`] against the solved record's
+/// field names, so a variable a record argument alone carries (a TEA app
+/// config's model) is still read at a reference.
+#[must_use]
+pub const fn shape_reaches_var(shape: &TyShape, var: u8) -> bool {
+    match shape {
+        TyShape::Var(v) => *v == var,
+        TyShape::Fun(arg, res) => shape_reaches_var(arg, var) || shape_reaches_var(res, var),
+        TyShape::Con(_, items) | TyShape::Tuple(items) => {
+            let mut rest: &[TyShape] = items;
+            while let Some((item, tail)) = rest.split_first() {
+                if shape_reaches_var(item, var) {
+                    return true;
+                }
+                rest = tail;
+            }
+            false
+        }
+        TyShape::Record { fields, .. } => {
+            let mut rest = *fields;
+            while let Some(((_, field), tail)) = rest.split_first() {
+                if shape_reaches_var(field, var) {
+                    return true;
+                }
+                rest = tail;
+            }
+            false
+        }
+        TyShape::Unit => false,
+    }
+}
+
 /// Whether scheme variable `var` occurs in `shape` at a position that aligns positionally with a solved type.
 ///
 /// An arrow side, a constructor argument, and a tuple element align by
@@ -1348,25 +1383,26 @@ const _: () = assert!(
     "a kernel callback returns a scheme variable past CallbackResults::CAPACITY or at no aligned position",
 );
 
-/// Whether every [`StdlibKernel::sync_obliged_scheme_vars`] entry of `kernels` aligns in its scheme.
+/// Whether every [`StdlibKernel::runtime_bounds`] row of `kernels` names a variable aligned in its scheme.
 ///
-/// A kernel listing a variable must carry a [`StdlibKernel::scheme_shape`] in
-/// which [`shape_aligns_var`] finds that variable; otherwise the lowerer cannot
-/// read the variable's instantiation at a call site.
+/// A kernel with a row must carry a [`StdlibKernel::scheme_shape`] in which
+/// [`shape_reaches_var`] finds the row's variable, and each row must declare at
+/// least one bound; otherwise the lowerer cannot read the variable's instance
+/// at a call site, or the row states nothing.
 #[must_use]
-pub const fn sync_obliged_scheme_vars_are_aligned(kernels: &[StdlibKernel]) -> bool {
+pub const fn runtime_bound_vars_are_aligned(kernels: &[StdlibKernel]) -> bool {
     let mut rest = kernels;
     while let Some((kernel, tail)) = rest.split_first() {
-        let mut vars = kernel.sync_obliged_scheme_vars();
-        if !vars.is_empty() {
+        let mut rows = kernel.runtime_bounds();
+        if !rows.is_empty() {
             let Some(shape) = kernel.scheme_shape() else {
                 return false;
             };
-            while let Some((var, more)) = vars.split_first() {
-                if !shape_aligns_var(shape, *var) {
+            while let Some(((var, bounds), more)) = rows.split_first() {
+                if bounds.is_empty() || !shape_reaches_var(shape, *var) {
                     return false;
                 }
-                vars = more;
+                rows = more;
             }
         }
         rest = tail;
@@ -1374,12 +1410,87 @@ pub const fn sync_obliged_scheme_vars_are_aligned(kernels: &[StdlibKernel]) -> b
     true
 }
 
-// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a `sync_obliged_scheme_vars` entry has no aligned occurrence in its kernel's scheme, the capture-`Sync` SEAL invariant [ledger #boundary]
+/// Whether no kernel of `kernels` lists one scheme variable in two [`StdlibKernel::runtime_bounds`] rows.
+///
+/// One row per variable keeps the demand a single fact: a reader taking the
+/// first row of a variable sees every bound the runtime puts on it.
+#[must_use]
+pub const fn runtime_bound_vars_are_distinct(kernels: &[StdlibKernel]) -> bool {
+    let mut rest = kernels;
+    while let Some((kernel, tail)) = rest.split_first() {
+        let mut rows = kernel.runtime_bounds();
+        while let Some(((var, _), more)) = rows.split_first() {
+            let mut later = more;
+            while let Some(((other, _), after)) = later.split_first() {
+                if *other == *var {
+                    return false;
+                }
+                later = after;
+            }
+            rows = more;
+        }
+        rest = tail;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a `runtime_bounds` row names no bound or a variable with no aligned occurrence in its kernel's scheme, so its instance could not be checked [ledger #boundary]
 #[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
 const _: () = assert!(
-    sync_obliged_scheme_vars_are_aligned(StdlibKernel::ALL),
-    "a kernel's sync_obliged_scheme_vars names a variable its scheme_shape does not carry at an aligned position",
+    runtime_bound_vars_are_aligned(StdlibKernel::ALL),
+    "a kernel's runtime_bounds row is empty or names a variable its scheme_shape does not carry at an aligned position",
 );
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a kernel lists one scheme variable in two `runtime_bounds` rows, which would split one demand fact [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    runtime_bound_vars_are_distinct(StdlibKernel::ALL),
+    "a kernel's runtime_bounds lists one scheme variable twice",
+);
+
+/// The Rust trait bounds a kernel's runtime function puts on the instance of one scheme variable.
+///
+/// Only the bounds a concrete Ipê type can fail are listed: `Clone`,
+/// `PartialEq` and `Sync`. Every emitted carrier is `Send + 'static`, so
+/// those bounds are not rows. A bound the type checker already proves
+/// (`Ord`, `Hash`, `Display`) is not a row either.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeBounds(u8);
+
+impl RuntimeBounds {
+    /// No bound.
+    pub const NONE: Self = Self(0);
+    /// The runtime copies the value (`T: Clone`).
+    pub const CLONE: Self = Self(1);
+    /// The runtime compares the value (`T: PartialEq`).
+    pub const PARTIAL_EQ: Self = Self(1 << 1);
+    /// The runtime shares the value across threads (`T: Sync`).
+    pub const SYNC: Self = Self(1 << 2);
+    /// `Clone` and `PartialEq`.
+    pub const CLONE_EQ: Self = Self::CLONE.with(Self::PARTIAL_EQ);
+    /// `Clone` and `Sync`.
+    pub const CLONE_SYNC: Self = Self::CLONE.with(Self::SYNC);
+    /// Every bound a row can carry, in order.
+    pub const ALL: [Self; 3] = [Self::CLONE, Self::PARTIAL_EQ, Self::SYNC];
+
+    /// The union of `self` and `other`.
+    #[must_use]
+    pub const fn with(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Whether every bound of `other` is in `self`.
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Whether the set holds no bound.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
 
 /// How a function-typed kernel argument slot receives a function value.
 ///
@@ -1708,6 +1819,38 @@ pub const fn app_entries_match_their_schemes(kernels: &[StdlibKernel]) -> bool {
 const _: () = assert!(
     app_entries_match_their_schemes(StdlibKernel::ALL),
     "a kernel whose scheme yields a Program / WebApp carrier must be StdlibKernel::is_app_entry, and only those",
+);
+
+/// The scheme variable an app entry binds to its app's `Model`.
+pub const APP_MODEL_VAR: u8 = 0;
+
+/// The scheme variable an app entry binds to its app's `Msg`.
+pub const APP_MSG_VAR: u8 = 1;
+
+/// Whether every schemed app entry of `kernels` reaches both [`APP_MODEL_VAR`] and [`APP_MSG_VAR`].
+///
+/// An unschemed entry has no reference that lowers (IPE-L0108), so it has no
+/// role to read.
+#[must_use]
+pub const fn app_entries_reach_their_roles(kernels: &[StdlibKernel]) -> bool {
+    let mut rest = kernels;
+    while let Some((kernel, tail)) = rest.split_first() {
+        if kernel.is_app_entry()
+            && let Some(shape) = kernel.scheme_shape()
+            && !(shape_reaches_var(shape, APP_MODEL_VAR) && shape_reaches_var(shape, APP_MSG_VAR))
+        {
+            return false;
+        }
+        rest = tail;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if an app entry's scheme does not carry its Model and Msg at the role variables the lowerer's app-role gate reads [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    app_entries_reach_their_roles(StdlibKernel::ALL),
+    "every app entry's scheme must reach APP_MODEL_VAR and APP_MSG_VAR",
 );
 
 /// Whether every [`ArgOrder::ContainerFirst`] kernel of `kernels` has arity 2 and a scheme taking a function then a non-function.
@@ -13989,27 +14132,96 @@ impl StdlibKernel {
         }
     }
 
-    /// The scheme variables ([`TyShape::Var`] indices) this kernel's runtime call bounds `Sync`.
+    /// The bounds this kernel's runtime function puts on each scheme variable ([`TyShape::Var`] index).
     ///
-    /// The sibling of [`Self::sync_captured_args`] for a `Sync` bound no argument
-    /// exposes bare: the runtime function puts `Sync` on a type parameter the Ipê
-    /// scheme spells only as a constructor argument (the `msg` of `Element msg`),
-    /// so the obligation is keyed on the scheme variable. The lowerer reads the
-    /// variable's instantiation off the call site's solved kernel type, and every
-    /// generic reaching that instantiation bare becomes `Send + Sync`.
+    /// The demand side of the callee-bound check: at every reference the
+    /// lowerer reads each listed variable's instance off the solved kernel
+    /// type and proves the bounds of its row there, and a generic reaching a
+    /// `SYNC` instance bare becomes `Send + Sync`. A variable the runtime
+    /// bounds by none of [`RuntimeBounds::ALL`] has no row. A `Sync` bound on
+    /// a value an argument exposes bare (the optional decoders' default) is
+    /// recorded once, by [`Self::sync_captured_args`], not here.
     ///
-    /// * `Input.checkbox` / `Input.radio` / `Input.radioRow` — var 0, the `msg`
-    ///   bound `M: Clone + Send + Sync` by `input_checkbox_` / `input_radio_` /
-    ///   `input_radio_row_`.
-    ///
-    /// Every listed variable occurs in the kernel's [`Self::scheme_shape`] at a
-    /// position the lowerer aligns (an arrow, constructor-argument, or tuple
-    /// slot — not only under a record field); the build asserts it
-    /// ([`sync_obliged_scheme_vars_are_aligned`]).
+    /// The table mirrors the runtime's signatures: `tests/kernel_row/runtime_bounds.rs`
+    /// parses every runtime `pub fn` and fails while a bound is missing here
+    /// or listed here without a runtime generic carrying it. Every row names a
+    /// variable [`Self::scheme_shape`] reaches and appears once; the build
+    /// asserts both ([`runtime_bound_vars_are_aligned`],
+    /// [`runtime_bound_vars_are_distinct`]).
     #[must_use]
-    pub const fn sync_obliged_scheme_vars(self) -> &'static [u8] {
+    pub const fn runtime_bounds(self) -> &'static [(u8, RuntimeBounds)] {
+        const C: RuntimeBounds = RuntimeBounds::CLONE;
+        const EQ: RuntimeBounds = RuntimeBounds::PARTIAL_EQ;
+        const CLONE_EQ_SYNC: RuntimeBounds = RuntimeBounds::CLONE_EQ.with(RuntimeBounds::SYNC);
         match self {
-            Self::InputCheckbox | Self::InputRadio | Self::InputRadioRow => &[0],
+            Self::ListFilter
+            | Self::ListFind
+            | Self::ListPartition
+            | Self::ListIntersperse
+            | Self::ListRepeat
+            | Self::ListSortBy
+            | Self::ListSortWith
+            | Self::SetFilter
+            | Self::SetPartition
+            | Self::RandomChoiceMaybe
+            | Self::RandomSeededChoice
+            | Self::RandomShuffle
+            | Self::RandomWeighted
+            | Self::PubSubPublish
+            | Self::PubSubPublishNoEcho
+            | Self::CliUiLine
+            | Self::CliUiLines
+            | Self::KeyedColumn
+            | Self::KeyedRow
+            | Self::InputCurrentPassword
+            | Self::InputEmail
+            | Self::InputMultiline
+            | Self::InputNewPassword
+            | Self::InputSearch
+            | Self::InputSlider
+            | Self::InputText
+            | Self::InputUsername
+            | Self::UiAbove
+            | Self::UiBehind
+            | Self::UiBelow
+            | Self::UiBreakpoint
+            | Self::UiButton
+            | Self::UiHtml
+            | Self::UiImage
+            | Self::UiInFront
+            | Self::UiLayout
+            | Self::UiLink
+            | Self::UiMediaQuery
+            | Self::UiOnLeft
+            | Self::UiOnPseudo
+            | Self::UiOnRight
+            | Self::UiCellsColumn
+            | Self::UiCellsEl
+            | Self::UiCellsRow
+            | Self::JsonDecPOptional
+            | Self::DbDecOptional => &[(0, C)],
+            Self::ListMember | Self::CachePut | Self::CacheRemove => &[(0, EQ)],
+            Self::ListUnique => &[(0, RuntimeBounds::CLONE_EQ)],
+            Self::CacheGet => &[(0, EQ), (1, C)],
+            Self::DictFilter
+            | Self::DictMap
+            | Self::DictPartition
+            | Self::DictUnion
+            | Self::TerminalAppScreen => &[(0, C), (1, C)],
+            Self::DictGet
+            | Self::DictToList
+            | Self::DictValues
+            | Self::CmdPublish
+            | Self::CmdPublishNoEcho
+            | Self::SubSubscribeTopic => &[(1, C)],
+            Self::InputCheckbox | Self::InputRadio | Self::InputRadioRow => {
+                &[(0, RuntimeBounds::CLONE_SYNC)]
+            }
+            Self::WebApp | Self::WebEmbed => &[(0, CLONE_EQ_SYNC), (1, RuntimeBounds::CLONE_SYNC)],
+            // Every other kernel's runtime function puts no row bound on a
+            // scheme variable, or the kernel has no runtime function; the scan
+            // in `tests/kernel_row/runtime_bounds.rs` pins every kernel, so a new
+            // bound cannot fall through this arm unseen.
             _ => &[],
         }
     }
@@ -18999,6 +19211,33 @@ mod tests {
                 && ElementCapability::RequiresOrd.forbids_function_element()
                 && !ElementCapability::CloneOk.forbids_function_element()
         );
+    }
+
+    /// A kernel comparing its element declares `PARTIAL_EQ` on the element variable.
+    ///
+    /// The element-capability gate and the runtime-bound table state one fact
+    /// twice (defence in depth); this pins them together, both ways, over the
+    /// `List` element (var 0). A `Cache` key also carries `PARTIAL_EQ` on var 0
+    /// but is not a collection element, so the reverse direction is `List`-only.
+    #[test]
+    fn requires_partial_eq_declares_partial_eq() {
+        use super::{ElementCapability, RuntimeBounds};
+        for kernel in StdlibKernel::ALL.iter().copied() {
+            let compares =
+                kernel.element_capability() == Some(ElementCapability::RequiresPartialEq);
+            let element_eq = kernel
+                .runtime_bounds()
+                .iter()
+                .any(|(var, bounds)| *var == 0 && bounds.contains(RuntimeBounds::PARTIAL_EQ));
+            assert!(
+                !compares || element_eq,
+                "{kernel:?}: `RequiresPartialEq` needs a `PARTIAL_EQ` row on its element"
+            );
+            assert!(
+                !element_eq || kernel.def().qualifier != "List" || compares,
+                "{kernel:?}: a `PARTIAL_EQ` element row needs `RequiresPartialEq`"
+            );
+        }
     }
 
     /// The mapper frontier is derived from each scheme: over every wired kernel,

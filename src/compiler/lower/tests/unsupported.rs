@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use ipe_canon::ast as canon;
 use ipe_diagnostics::{
     Code, DResult, Diagnostic, Feature, IPE_L0101, IPE_L0102, IPE_L0107, IPE_L0108, IPE_L0119,
-    IPE_L0154, Located, LowerError, Span,
+    IPE_L0154, Located, LowerError, ModelLeaf, Span,
 };
 use ipe_intern::{Interner, Symbol};
 use ipe_ir::{BoundSet, Callee, Expr, FuncId, IrType, KernelFn};
@@ -2386,8 +2386,28 @@ fn let_bound_live_app_cfg_is_unsupported() -> DResult<()> {
         body,
         ty: con_int(&mut i)?, // body type is irrelevant to the intercept
     };
+    // The checker records the reference's instance; its `update : Int -> Int -> _`
+    // pins both of `Web.tea`'s runtime-bound vars to `Int`, so the bound check
+    // passes and the cfg intercept is what refuses.
+    let update = i.intern("update")?;
+    let int = ty_int(&mut i)?;
+    let update_ty = Ty::Fun(
+        Box::new(int.clone()),
+        Box::new(Ty::Fun(Box::new(int.clone()), Box::new(int.clone()))),
+    );
+    let cfg_ty = Ty::Record(
+        BTreeMap::from([(update, update_ty)]),
+        ipe_types::RowTail::Closed,
+    );
+    let regions = BTreeMap::from([
+        (
+            Span::new(10, 18),
+            Ty::Fun(Box::new(cfg_ty.clone()), Box::new(int)),
+        ),
+        (arg_span, cfg_ty),
+    ]);
     assert_unsupported(
-        run(Vec::new(), vec![def], BTreeMap::new(), &mut i),
+        run_with_regions(Vec::new(), vec![def], BTreeMap::new(), regions, &mut i),
         Feature::LetBoundAppCfg,
         IPE_L0119,
         arg_span,
@@ -2522,6 +2542,89 @@ fn list_map2_two_argument_callback_passes_backstop() -> DResult<()> {
     assert!(
         !is_hof_callback_refusal(&res),
         "a full-arity `map2` callback must not trip IPE-L0154: {res:?}"
+    );
+    Ok(())
+}
+
+/// Lower `main = Web.tea` referenced with `update : msg -> model -> Int` solved at `msg` and `model`.
+fn lower_web_tea_update(
+    msg: Ty,
+    model: Ty,
+    i: &mut Interner,
+) -> DResult<(DResult<ipe_ir::Program>, Span)> {
+    let body_span = Span::new(90, 97);
+    let main = i.intern("main")?;
+    let update = i.intern("update")?;
+    let def = canon::Def::Typed {
+        home: vec![],
+        name: Located::new(Span::new(83, 87), main),
+        free_vars: Vec::new(),
+        patterns: Vec::new(),
+        body: Located::new(
+            body_span,
+            canon::Expr_::VarKernel {
+                id: Some(KernelFn::WebApp),
+                module: i.intern("Web")?,
+                name: i.intern("tea")?,
+            },
+        ),
+        ty: con_int(i)?,
+    };
+    let int = ty_int(i)?;
+    let cfg = Ty::Record(
+        BTreeMap::from([(update, arrow(msg, arrow(model, int.clone())))]),
+        ipe_types::RowTail::Closed,
+    );
+    let regions = BTreeMap::from([(body_span, arrow(cfg, int))]);
+    let res = run_with_regions(Vec::new(), vec![def], BTreeMap::new(), regions, i);
+    Ok((res, body_span))
+}
+
+/// The solved `Task Int`.
+fn ty_task_int(i: &mut Interner) -> DResult<Ty> {
+    Ok(Ty::Con {
+        module: Vec::new(),
+        name: i.intern("Task")?,
+        args: vec![ty_int(i)?],
+    })
+}
+
+/// A `Task` Msg is refused as the app's Msg (IPE-L0125), not as `Web.tea`'s `Clone` bound (IPE-L0164).
+#[test]
+fn web_msg_without_clone_is_refused_as_a_msg() -> DResult<()> {
+    let mut i = Interner::new();
+    let task = ty_task_int(&mut i)?;
+    let int = ty_int(&mut i)?;
+    let (res, span) = lower_web_tea_update(task, int, &mut i)?;
+    assert!(
+        matches!(
+            res.as_ref(),
+            Err(Diagnostic::Lower {
+                span: s,
+                msg: LowerError::InadmissibleAppMsg { leaf: ModelLeaf::Task, .. },
+            }) if *s == span
+        ),
+        "expected IPE-L0125 blaming the Task at the entry, got {res:?}"
+    );
+    Ok(())
+}
+
+/// A `Task` Model is refused as the app's Model (IPE-L0120), not as `Web.tea`'s `Clone` bound (IPE-L0164).
+#[test]
+fn web_model_without_clone_is_refused_as_a_model() -> DResult<()> {
+    let mut i = Interner::new();
+    let task = ty_task_int(&mut i)?;
+    let int = ty_int(&mut i)?;
+    let (res, span) = lower_web_tea_update(int, task, &mut i)?;
+    assert!(
+        matches!(
+            res.as_ref(),
+            Err(Diagnostic::Lower {
+                span: s,
+                msg: LowerError::InadmissibleAppModel { leaf: ModelLeaf::Task, .. },
+            }) if *s == span
+        ),
+        "expected IPE-L0120 blaming the Task at the entry, got {res:?}"
     );
     Ok(())
 }
