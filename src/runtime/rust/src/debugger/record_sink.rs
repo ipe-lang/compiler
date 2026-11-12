@@ -11,6 +11,13 @@
 //! [`TRACE_MAX_BYTES`] for the trace, and the decoder's own cap for the typed
 //! log.
 //!
+//! The recorder runs each step ([`Recording::step`]): it notes the message as
+//! in flight before `update` runs and settles it after `update` returns, so a
+//! process that ends inside `update` still dumps the message that was running,
+//! as the trace's newest line ([`TRACE_IN_FLIGHT`]). The typed log holds only
+//! settled steps: replaying the in-flight message would end the replay the way
+//! it ended the run.
+//!
 //! Beside a file destination it also writes the session's typed log (same
 //! stem, extension [`crate::TYPED_LOG_EXTENSION`]) through the program's
 //! [`SessionCodec`] — the replayable form `ipe dev run --replay` reads. A program
@@ -65,6 +72,10 @@ pub const TRACE_MAX_BYTES: usize = crate::seal_codec::DEFAULT_SEAL_MAX_INPUT_BYT
 /// between the count of omitted steps and the cap.
 const TRACE_OMITTED: &str = "earlier steps omitted: trace limit";
 
+/// The model half of the trace line of a message whose `update` had not
+/// returned when the process ended.
+pub const TRACE_IN_FLIGHT: &str = "(update had not returned when the process ended)";
+
 /// The sentinel `IPE_DEBUGGER_RECORD` value that selects stderr over a file.
 const STDERR_SENTINEL: &str = "-";
 
@@ -108,19 +119,44 @@ pub fn plain_line(body: &str) -> String {
     plain
 }
 
-/// Render the whole replay log as one plain, control-free blob — one
-/// `"<msg> => <model>"` line per retained step, each through [`plain_line`],
-/// held to [`TRACE_MAX_BYTES`] (see [`render_capped`]).
+/// A recorded session: the settled steps and the message whose `update` runs.
 ///
-/// Pure: it reads the recorded models, runs no `update`, fires no `Cmd` and
-/// does no I/O.
+/// One lock guards both, so a dump never sees a message both in flight and
+/// settled.
+pub struct Session<Msg, Model> {
+    /// The settled steps.
+    buf: RecordBuffer<Msg, Model>,
+    /// The message whose `update` has not returned yet.
+    in_flight: Option<Msg>,
+}
+
+impl<Msg: Clone, Model: Clone> Session<Msg, Model> {
+    /// An empty session starting from `initial`.
+    fn new(initial: Model) -> Self {
+        Self {
+            buf: RecordBuffer::new(initial, crate::debugger::DEFAULT_HISTORY_CAP),
+            in_flight: None,
+        }
+    }
+}
+
+/// The shared recorder of one run.
+type SharedSession<Msg, Model> = Arc<Mutex<Session<Msg, Model>>>;
+
+/// Render the whole session as one plain, control-free blob.
+///
+/// One `"<msg> => <model>"` line per retained step and, when a message's
+/// `update` had not returned, a newest `"<msg> => "` + [`TRACE_IN_FLIGHT`]
+/// line, each through [`plain_line`], held to [`TRACE_MAX_BYTES`] (see
+/// [`render_capped`]). Pure: it reads the recorded values, runs no `update`,
+/// fires no `Cmd` and does no I/O.
 #[must_use]
-pub fn render_replay_blob<Msg, Model>(buf: &RecordBuffer<Msg, Model>) -> String
+pub fn render_replay_blob<Msg, Model>(session: &Session<Msg, Model>) -> String
 where
     Msg: Clone + IpeStringify,
     Model: Clone + IpeStringify,
 {
-    render_capped(buf, TRACE_MAX_BYTES)
+    render_capped(session, TRACE_MAX_BYTES)
 }
 
 /// The line that opens a trace from which `omitted` steps were cut at `cap`.
@@ -130,20 +166,32 @@ fn omitted_line(omitted: usize, cap: usize) -> String {
 
 /// The replay blob in at most `cap` bytes: the newest whole lines that fit.
 ///
-/// When every line fits, the blob is every line. Otherwise it renders from
-/// the newest step back, stops at the first line that does not fit, and
-/// opens with one [`omitted_line`] that counts against `cap`. At most one
-/// line past the kept ones is ever rendered, so the peak is `cap` plus one
-/// line.
-fn render_capped<Msg, Model>(buf: &RecordBuffer<Msg, Model>, cap: usize) -> String
+/// The in-flight line, when present, is the newest line. When every line
+/// fits, the blob is every line. Otherwise it renders from the newest line
+/// back, stops at the first line that does not fit, and opens with one
+/// [`omitted_line`] that counts against `cap` and names every line cut, the
+/// in-flight one included. At most one line past the kept ones is ever
+/// rendered, so the peak is `cap` plus one line.
+fn render_capped<Msg, Model>(session: &Session<Msg, Model>, cap: usize) -> String
 where
     Msg: Clone + IpeStringify,
     Model: Clone + IpeStringify,
 {
-    let total = buf.len();
+    let in_flight = session
+        .in_flight
+        .as_ref()
+        .map(|msg| format!("{} => {TRACE_IN_FLIGHT}", msg.ipe_show()));
+    let total = session
+        .buf
+        .len()
+        .saturating_add(usize::from(in_flight.is_some()));
+    let newest_first = in_flight
+        .into_iter()
+        .chain(session.buf.replay_lines().rev())
+        .map(|line| plain_line(&line));
     let mut kept: Vec<String> = Vec::new();
     let mut used = 0usize;
-    for line in buf.replay_lines().rev().map(|line| plain_line(&line)) {
+    for line in newest_first {
         match used.checked_add(line.len()) {
             Some(next) if next <= cap => {
                 used = next;
@@ -336,18 +384,18 @@ fn lock_within<T>(buf: &Mutex<T>, wait: Duration) -> Result<Held<'_, T>, DumpSki
     }
 }
 
-/// Dump the session `buf` holds to `dest`, waiting at most `wait` for it.
+/// Dump `session` to `dest`, waiting at most `wait` for it.
 ///
-/// The plain trace is rendered by [`render_replay_blob`] and written to
-/// `dest`, so a redirected log or file receives only plain, control-free
-/// lines. A file destination also gets the typed log beside it (see
-/// [`write_typed_log`]).
+/// The plain trace, in-flight line included, is rendered by
+/// [`render_replay_blob`] and written to `dest`, so a redirected log or file
+/// receives only plain, control-free lines. A file destination also gets the
+/// typed log of the settled steps beside it (see [`write_typed_log`]).
 ///
 /// # Errors
 /// [`DumpSkipped::RecorderBusy`] when the recorder stays locked past `wait`;
 /// [`DumpSkipped::Interrupted`] when a panic left it torn.
 fn dump_recorded<Msg, Model, C>(
-    buf: &Mutex<RecordBuffer<Msg, Model>>,
+    session: &Mutex<Session<Msg, Model>>,
     codec: &C,
     dest: &RecordDest,
     wait: Duration,
@@ -357,16 +405,16 @@ where
     Model: Clone + IpeStringify,
     C: SessionCodec<Msg, Model>,
 {
-    match lock_within(buf, wait)? {
-        Held::Whole(buf) => {
-            write_blob(dest, &render_replay_blob(&buf));
+    match lock_within(session, wait)? {
+        Held::Whole(session) => {
+            write_blob(dest, &render_replay_blob(&session));
             if let RecordDest::Path(path) = dest {
-                write_typed_log(path, &buf, codec);
+                write_typed_log(path, &session.buf, codec);
             }
             Ok(())
         }
-        Held::Torn(buf) => {
-            write_blob(dest, &render_replay_blob(&buf));
+        Held::Torn(session) => {
+            write_blob(dest, &render_replay_blob(&session));
             if let RecordDest::Path(path) = dest
                 && let Some(typed) = typed_log_path(path)
             {
@@ -379,7 +427,7 @@ where
 
 /// The session-dump exit stage of one recorded run.
 struct SessionDump<Msg, Model, C> {
-    buf: Arc<Mutex<RecordBuffer<Msg, Model>>>,
+    session: SharedSession<Msg, Model>,
     codec: C,
     dest: RecordDest,
 }
@@ -391,7 +439,8 @@ where
     C: SessionCodec<Msg, Model>,
 {
     fn dump(self: Box<Self>) {
-        if let Err(skipped) = dump_recorded(&self.buf, &self.codec, &self.dest, DUMP_LOCK_WAIT) {
+        if let Err(skipped) = dump_recorded(&self.session, &self.codec, &self.dest, DUMP_LOCK_WAIT)
+        {
             crate::system::emit_runtime_log("debugger", &skipped.to_string());
         }
     }
@@ -399,20 +448,32 @@ where
 
 /// A run being recorded: the recorder and the hold on its dump stage.
 pub struct Recording<'s, Msg, Model> {
-    buf: Arc<Mutex<RecordBuffer<Msg, Model>>>,
+    session: SharedSession<Msg, Model>,
     ticket: StageTicket<'s>,
 }
 
 impl<Msg: Clone, Model: Clone> Recording<'_, Msg, Model> {
-    /// Record one accepted step. The recorder is locked only for the step.
-    pub fn record<F>(&self, msg: Msg, model_after: Model, update: &F)
+    /// Run one step of the program and record it.
+    ///
+    /// `msg` is noted in flight before `update` runs and settled after it
+    /// returns, so an exit inside `update` still dumps it. `update` runs once
+    /// per step, here, with no recorder lock held: settling a step past the
+    /// ring's cap advances the base to the evicted step's recorded model
+    /// ([`RecordBuffer::record_settled`]), never by re-running `update`.
+    pub fn step<F>(&self, msg: Msg, model: Model, update: &F) -> (Model, IpeCmd<Msg>)
     where
         F: Fn(Msg, Model) -> (Model, IpeCmd<Msg>),
     {
-        self.buf
+        self.session
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .record(msg, model_after, update);
+            .in_flight = Some(msg.clone());
+        let (next, cmd) = update(msg.clone(), model);
+        let mut session = self.session.lock().unwrap_or_else(PoisonError::into_inner);
+        session.in_flight = None;
+        session.buf.record_settled(msg, next.clone());
+        drop(session);
+        (next, cmd)
     }
 
     /// Dump the session now, at the run's normal end, unless the exit already
@@ -452,19 +513,16 @@ where
     C: SessionCodec<Msg, Model> + Send + 'static,
 {
     let dest = dest.ok_or(NotRecording::Unset)?;
-    let buf = Arc::new(Mutex::new(RecordBuffer::new(
-        initial,
-        crate::debugger::DEFAULT_HISTORY_CAP,
-    )));
+    let session = Arc::new(Mutex::new(Session::new(initial)));
     let stage = SessionDump {
-        buf: Arc::clone(&buf),
+        session: Arc::clone(&session),
         codec,
         dest,
     };
     let ticket = stages
         .register(Registration::SessionDump(Box::new(stage)))
         .map_err(NotRecording::Refused)?;
-    Ok(Recording { buf, ticket })
+    Ok(Recording { session, ticket })
 }
 
 /// Start recording a run from `initial`, when `IPE_DEBUGGER_RECORD` names a
@@ -498,11 +556,11 @@ where
 mod tests {
     use super::*;
 
-    #[derive(Clone, Debug, PartialEq)]
+    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
     enum Msg {
         Add(i64),
     }
-    #[derive(Clone, Debug, PartialEq)]
+    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
     struct Model {
         n: i64,
     }
@@ -520,6 +578,14 @@ mod tests {
     fn update(msg: Msg, m: Model) -> (Model, IpeCmd<Msg>) {
         let Msg::Add(v) = msg;
         (Model { n: m.n + v }, IpeCmd::None)
+    }
+
+    /// A session of `buf`'s settled steps, nothing in flight.
+    fn settled<M, D>(buf: RecordBuffer<M, D>) -> Session<M, D> {
+        Session {
+            buf,
+            in_flight: None,
+        }
     }
 
     // plain_line strips every control byte and settles with exactly one newline
@@ -576,7 +642,7 @@ mod tests {
             live = next.clone();
             buf.record(msg.clone(), next, &update);
         }
-        let blob = render_replay_blob(&buf);
+        let blob = render_replay_blob(&settled(buf));
         assert_eq!(
             blob,
             "Add(2) => Model { n = 2 }\nAdd(5) => Model { n = 7 }\n"
@@ -591,7 +657,7 @@ mod tests {
     #[test]
     fn render_replay_blob_empty_session_is_empty() {
         let buf: RecordBuffer<Msg, Model> = RecordBuffer::new(Model { n: 0 }, 8);
-        assert_eq!(render_replay_blob(&buf), "");
+        assert_eq!(render_replay_blob(&settled(buf)), "");
     }
 
     // The `-` sentinel parses to stderr; anything else is a path.
@@ -617,7 +683,7 @@ mod tests {
             live = next.clone();
             buf.record(Msg::Add(i), next, &update);
         }
-        let blob = render_replay_blob(&buf);
+        let blob = render_replay_blob(&settled(buf));
         let lines = blob.lines().count();
         assert_eq!(lines, cap, "rendered blob must hold exactly cap lines");
     }
@@ -746,7 +812,7 @@ mod tests {
             buf.record(Msg::Add(i), next, &counting);
         }
         let before = CALLS.load(Ordering::SeqCst);
-        let blob = render_replay_blob(&buf);
+        let blob = render_replay_blob(&settled(buf));
         assert_eq!(blob.lines().count(), 5);
         assert_eq!(CALLS.load(Ordering::SeqCst), before, "the dump ran update");
     }
@@ -755,7 +821,8 @@ mod tests {
     // marker naming exactly how many older steps it omitted.
     #[test]
     fn trace_keeps_the_newest_steps_within_the_cap() {
-        let buf = padded(40, 200);
+        let session = settled(padded(40, 200));
+        let buf = &session.buf;
         let line = 205usize;
         assert_eq!(
             buf.replay_lines().map(|l| plain_line(&l).len()).max(),
@@ -763,7 +830,7 @@ mod tests {
         );
         // Ten whole lines fill the cap exactly, so the marker evicts one.
         let cap = line * 10;
-        let blob = render_capped(&buf, cap);
+        let blob = render_capped(&session, cap);
         assert!(blob.len() <= cap, "{} > {cap}", blob.len());
         let lines: Vec<&str> = blob.lines().collect();
         let kept = lines.len().saturating_sub(1);
@@ -781,11 +848,11 @@ mod tests {
     // under it omits exactly the oldest step.
     #[test]
     fn trace_one_line_past_the_cap_omits_exactly_one() {
-        let buf = padded(6, 200);
-        let whole = render_capped(&buf, usize::MAX);
-        let at_cap = render_capped(&buf, whole.len());
+        let session = settled(padded(6, 200));
+        let whole = render_capped(&session, usize::MAX);
+        let at_cap = render_capped(&session, whole.len());
         assert_eq!(at_cap, whole, "a trace at the cap keeps every line");
-        let past = render_capped(&buf, whole.len() - 1);
+        let past = render_capped(&session, whole.len() - 1);
         let lines: Vec<&str> = past.lines().collect();
         assert_eq!(
             lines.first().copied(),
@@ -799,8 +866,8 @@ mod tests {
     // past it.
     #[test]
     fn trace_cap_below_the_marker_writes_nothing() {
-        let buf = padded(3, 200);
-        assert_eq!(render_capped(&buf, 8), "");
+        let session = settled(padded(3, 200));
+        assert_eq!(render_capped(&session, 8), "");
     }
 
     // A typed log past the decoder's cap is refused at encode: no file is
@@ -837,10 +904,10 @@ mod tests {
         use crate::debugger::session_log::{TraceOnly, Unreplayable};
         let dir = scratch("busy");
         let trace = dir.join("session.ipelog");
-        let buf = Arc::new(Mutex::new(RecordBuffer::<Msg, Model>::new(
+        let buf = Arc::new(Mutex::new(settled(RecordBuffer::<Msg, Model>::new(
             Model { n: 0 },
             8,
-        )));
+        ))));
         let held = buf.lock().unwrap_or_else(PoisonError::into_inner);
         let dumping = Arc::clone(&buf);
         let dest = RecordDest::Path(trace.clone());
@@ -878,7 +945,7 @@ mod tests {
         let trace = dir.join("session.ipelog");
         let typed = dir.join(format!("session.{TYPED_LOG_EXTENSION}"));
         assert!(std::fs::write(&typed, "stale").is_ok(), "plant stale log");
-        let buf = Arc::new(Mutex::new(padded(2, 8)));
+        let buf = Arc::new(Mutex::new(settled(padded(2, 8))));
         let poisoner = Arc::clone(&buf);
         let poisoning = std::thread::Builder::new().spawn(move || {
             let _held = poisoner.lock();
@@ -919,10 +986,7 @@ mod tests {
         );
         assert!(matches!(started, Err(NotRecording::Unset)));
         let free = stages.register(Registration::SessionDump(Box::new(SessionDump {
-            buf: Arc::new(Mutex::new(RecordBuffer::<Msg, Model>::new(
-                Model { n: 0 },
-                1,
-            ))),
+            session: Arc::new(Mutex::new(Session::<Msg, Model>::new(Model { n: 0 }))),
             codec: TraceOnly(Unreplayable::MsgNotEncodable),
             dest: RecordDest::Stderr,
         })));
@@ -980,5 +1044,307 @@ mod tests {
             "the stale typed log must be removed"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An `update` that ends the step the way `Debug.todo` does: by unwinding.
+    #[allow(clippy::panic)] // test: the unwind stands in for `Debug.todo` inside `update`
+    fn diverging<M, D>(_: M, _: D) -> (D, IpeCmd<M>) {
+        panic!("update diverged")
+    }
+
+    /// Run `recording.step` with an `update` that unwinds, catching it.
+    fn step_diverging<M: Clone, D: Clone>(recording: &Recording<'_, M, D>, msg: M, model: D) {
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            recording.step(msg, model, &diverging::<M, D>)
+        }));
+        assert!(caught.is_err(), "the diverging update returned");
+    }
+
+    /// The trace line of `msg` while its `update` runs.
+    fn in_flight_line(msg: &str) -> String {
+        format!("{msg} => {TRACE_IN_FLIGHT}")
+    }
+
+    // The message whose `update` ended the run is the trace's newest line, and
+    // the typed log holds only the settled steps before it.
+    #[test]
+    fn a_step_whose_update_panics_dumps_its_message() {
+        use crate::debugger::session_log::Full;
+        let dir = scratch("in_flight_panic");
+        let trace = dir.join("session.ipelog");
+        let typed = dir.join(format!("session.{TYPED_LOG_EXTENSION}"));
+        let codec = Full::new([1; 32], [2; 32]);
+        let stages = &PreExitStages::new();
+        let started = start_in::<Msg, Model, _>(
+            stages,
+            Some(RecordDest::Path(trace.clone())),
+            Model { n: 0 },
+            Full::new([1; 32], [2; 32]),
+        );
+        assert!(started.is_ok(), "the recorder did not start");
+        let Ok(recording) = started else { return };
+        let (model, _) = recording.step(Msg::Add(2), Model { n: 0 }, &update);
+        assert_eq!(model, Model { n: 2 });
+        step_diverging(&recording, Msg::Add(5), model);
+        recording.finish();
+
+        let lines = std::fs::read_to_string(&trace)
+            .ok()
+            .map(|t| t.lines().map(str::to_owned).collect::<Vec<_>>());
+        assert_eq!(
+            lines,
+            Some(vec![
+                "Add(2) => Model { n = 2 }".to_owned(),
+                in_flight_line("Add(5)"),
+            ])
+        );
+        let mut settled_only = RecordBuffer::new(Model { n: 0 }, 8);
+        settled_only.record(Msg::Add(2), Model { n: 2 }, &update);
+        let written = std::fs::read(&typed).ok();
+        assert!(
+            written
+                .as_deref()
+                .is_some_and(|bytes| SessionCodec::<Msg, Model>::decode(&codec, bytes).is_ok()),
+            "the typed log decodes"
+        );
+        assert_eq!(
+            written,
+            SessionCodec::<Msg, Model>::encode(&codec, &settled_only).ok(),
+            "the typed log holds the settled steps only"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A settled step leaves no in-flight line; one diverging step past them
+    // leaves exactly one.
+    #[test]
+    fn a_settled_step_leaves_no_in_flight_line() {
+        use crate::debugger::session_log::{TraceOnly, Unreplayable};
+        let stages = &PreExitStages::new();
+        let started = start_in::<Msg, Model, _>(
+            stages,
+            Some(RecordDest::Stderr),
+            Model { n: 0 },
+            TraceOnly(Unreplayable::MsgNotEncodable),
+        );
+        assert!(started.is_ok(), "the recorder did not start");
+        let Ok(recording) = started else { return };
+        let (model, _) = recording.step(Msg::Add(1), Model { n: 0 }, &update);
+        let (model, _) = recording.step(Msg::Add(2), model, &update);
+        let in_flight_lines = |r: &Recording<'_, Msg, Model>| {
+            let session = r.session.lock().unwrap_or_else(PoisonError::into_inner);
+            render_replay_blob(&session)
+                .lines()
+                .filter(|l| l.contains(TRACE_IN_FLIGHT))
+                .count()
+        };
+        assert_eq!(in_flight_lines(&recording), 0);
+        step_diverging(&recording, Msg::Add(3), model);
+        assert_eq!(in_flight_lines(&recording), 1);
+        let session = recording
+            .session
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(
+            render_replay_blob(&session).lines().last(),
+            Some(in_flight_line("Add(3)").as_str())
+        );
+        assert_eq!(session.buf.len(), 2, "the diverged step never settles");
+    }
+
+    // A dump taken while `update` runs sees its message in flight, within the
+    // wait: `step` holds no recorder lock across program code.
+    #[test]
+    fn the_dump_sees_a_running_update_as_in_flight() {
+        use crate::debugger::session_log::{TraceOnly, Unreplayable};
+        use std::sync::Barrier;
+        let dir = scratch("in_flight_running");
+        let trace = dir.join("session.ipelog");
+        let stages = &PreExitStages::new();
+        let started = start_in::<Msg, Model, _>(
+            stages,
+            Some(RecordDest::Stderr),
+            Model { n: 0 },
+            TraceOnly(Unreplayable::MsgNotEncodable),
+        );
+        assert!(started.is_ok(), "the recorder did not start");
+        let Ok(recording) = started else { return };
+        let entered = Barrier::new(2);
+        let released = Barrier::new(2);
+        let session = Arc::clone(&recording.session);
+        let dest = RecordDest::Path(trace.clone());
+        let blocking = |msg: Msg, model: Model| {
+            entered.wait();
+            released.wait();
+            update(msg, model)
+        };
+        let dumped = std::thread::scope(|scope| {
+            let dumper = std::thread::Builder::new().spawn_scoped(scope, || {
+                entered.wait();
+                let started = Instant::now();
+                let outcome = dump_recorded(
+                    &session,
+                    &TraceOnly(Unreplayable::MsgNotEncodable),
+                    &dest,
+                    DUMP_LOCK_WAIT,
+                );
+                let elapsed = started.elapsed();
+                released.wait();
+                (outcome, elapsed)
+            });
+            assert!(dumper.is_ok(), "spawn the dumper");
+            let (model, _) = recording.step(Msg::Add(4), Model { n: 0 }, &blocking);
+            assert_eq!(model, Model { n: 4 });
+            dumper.map(std::thread::ScopedJoinHandle::join)
+        });
+        assert!(matches!(dumped, Ok(Ok(_))), "the dumper failed");
+        let Ok(Ok((outcome, elapsed))) = dumped else {
+            return;
+        };
+        assert_eq!(outcome, Ok(()));
+        assert!(elapsed < DUMP_LOCK_WAIT * 2, "waited {elapsed:?}");
+        assert_eq!(
+            std::fs::read_to_string(&trace).ok(),
+            Some(plain_line(&in_flight_line("Add(4)")))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A `Secret` in the in-flight message is shown redacted, and a session of
+    // a Msg carrying one writes no typed log.
+    #[cfg(feature = "secret")]
+    #[test]
+    fn an_in_flight_secret_is_redacted() {
+        use crate::debugger::session_log::{TraceOnly, Unreplayable};
+        use crate::secret::secret_from_string;
+
+        #[derive(Clone, Debug)]
+        struct Login(crate::secret::Secret);
+        impl IpeStringify for Login {
+            fn ipe_show(&self) -> String {
+                format!("Login({})", self.0.ipe_show())
+            }
+        }
+
+        let dir = scratch("in_flight_secret");
+        let trace = dir.join("session.ipelog");
+        let typed = dir.join(format!("session.{TYPED_LOG_EXTENSION}"));
+        let stages = &PreExitStages::new();
+        let started = start_in::<Login, Model, _>(
+            stages,
+            Some(RecordDest::Path(trace.clone())),
+            Model { n: 0 },
+            TraceOnly(Unreplayable::MsgNotEncodable),
+        );
+        assert!(started.is_ok(), "the recorder did not start");
+        let Ok(recording) = started else { return };
+        step_diverging(
+            &recording,
+            Login(secret_from_string("hunter2".to_owned())),
+            Model { n: 0 },
+        );
+        recording.finish();
+        let text = std::fs::read_to_string(&trace).unwrap_or_default();
+        assert!(text.contains("<redacted>"), "{text:?}");
+        assert!(!text.contains("hunter2"), "{text:?}");
+        assert!(text.contains(TRACE_IN_FLIGHT), "{text:?}");
+        assert!(
+            std::fs::symlink_metadata(&typed).is_err(),
+            "a Msg carrying a Secret writes no typed log"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The in-flight line counts against the cap: it is kept as the newest
+    // line, and the marker counts exactly the settled steps it evicted. A line
+    // longer than the cap leaves the marker alone, counting every line.
+    #[test]
+    fn an_in_flight_line_counts_against_the_trace_cap() {
+        let mut session = settled(padded(10, 200));
+        let cap = render_capped(&session, usize::MAX).len();
+        session.in_flight = Some(Pad("running".to_owned()));
+        let blob = render_capped(&session, cap);
+        assert!(blob.len() <= cap, "{} > {cap}", blob.len());
+        let lines: Vec<&str> = blob.lines().collect();
+        let newest = in_flight_line("running");
+        assert_eq!(lines.last().copied(), Some(newest.as_str()));
+        let kept_settled = lines.len().saturating_sub(2);
+        assert!(kept_settled < 10, "a settled step was evicted");
+        assert_eq!(
+            lines.first().copied(),
+            Some(omitted_line(10 - kept_settled, cap).trim_end()),
+            "the marker counts exactly the evicted settled steps"
+        );
+
+        let small = 200usize;
+        session.in_flight = Some(Pad("x".repeat(small)));
+        assert_eq!(
+            render_capped(&session, small),
+            omitted_line(11, small),
+            "an in-flight line past the cap leaves the marker alone"
+        );
+    }
+
+    // The in-flight line goes through the output boundary: no escape, carriage
+    // return or bidi override survives.
+    #[test]
+    fn an_in_flight_line_is_hazard_free() {
+        let mut session = settled(RecordBuffer::<Pad, Pad>::new(Pad(String::new()), 4));
+        session.in_flight = Some(Pad("a\u{1b}[31m\r\u{202E}b".to_owned()));
+        let blob = render_replay_blob(&session);
+        assert!(
+            !blob.contains(['\u{1b}', '\r', '\u{202E}']),
+            "a hazard survived: {blob:?}"
+        );
+        assert_eq!(blob, plain_line(&in_flight_line("a[31mb")));
+    }
+
+    // Past the ring's cap a step still runs `update` once, with no recorder
+    // lock held: the base advances to the evicted step's recorded model, never
+    // by re-running `update` under the lock the exit-time dump waits on.
+    #[test]
+    fn a_step_past_the_ring_cap_runs_update_once_and_unlocked() {
+        use crate::debugger::session_log::{TraceOnly, Unreplayable};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let stages = &PreExitStages::new();
+        let started = start_in::<Msg, Model, _>(
+            stages,
+            Some(RecordDest::Stderr),
+            Model { n: 0 },
+            TraceOnly(Unreplayable::MsgNotEncodable),
+        );
+        assert!(started.is_ok(), "the recorder did not start");
+        let Ok(recording) = started else { return };
+        let session = Arc::clone(&recording.session);
+        let calls = AtomicUsize::new(0);
+        let ran_locked = AtomicBool::new(false);
+        let watched = |msg: Msg, model: Model| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            if matches!(session.try_lock(), Err(TryLockError::WouldBlock)) {
+                ran_locked.store(true, Ordering::SeqCst);
+            }
+            update(msg, model)
+        };
+        let steps = crate::debugger::DEFAULT_HISTORY_CAP.saturating_add(2);
+        let mut model = Model { n: 0 };
+        for _ in 0..steps {
+            model = recording.step(Msg::Add(1), model, &watched).0;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            steps,
+            "the recorder ran `update` beyond the live step"
+        );
+        assert!(
+            !ran_locked.load(Ordering::SeqCst),
+            "`update` ran under the recorder lock"
+        );
+        let held = session.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(held.buf.overflowed(), "the ring never evicted a step");
+        assert_eq!(
+            held.buf.base(),
+            &Model { n: 2 },
+            "the base is the model after the two evicted steps"
+        );
     }
 }
