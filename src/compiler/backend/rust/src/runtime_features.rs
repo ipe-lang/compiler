@@ -470,6 +470,11 @@ impl RuntimeFeatureSet {
         }
         Some(set)
     }
+
+    /// Whether `feature` is selected.
+    pub fn contains(&self, feature: RuntimeFeature) -> bool {
+        self.0.contains(&feature)
+    }
 }
 
 impl FromIterator<RuntimeFeature> for RuntimeFeatureSet {

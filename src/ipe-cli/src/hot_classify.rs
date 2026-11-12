@@ -205,18 +205,22 @@ pub fn classify(prev: &EmittedProject, next: &EmittedProject) -> Classification 
         files: prev_files,
         cargo_toml: prev_cargo_toml,
         uses_webview: prev_uses_webview,
+        links_web_runtime: prev_links_web_runtime,
         assets: prev_assets,
     } = prev;
     let EmittedProject {
         files: next_files,
         cargo_toml: next_cargo_toml,
         uses_webview: next_uses_webview,
+        links_web_runtime: next_links_web_runtime,
         assets: next_assets,
     } = next;
-    // The Cargo.toml is code (deps, features), the host is code, and a binary
-    // file is compiled in by `include_bytes!` — any change in them is Logic.
+    // The Cargo.toml is code (deps, features), the host and the linked runtime
+    // surface are code, and a binary file is compiled in by `include_bytes!` —
+    // any change in them is Logic.
     if prev_cargo_toml != next_cargo_toml
         || prev_uses_webview != next_uses_webview
+        || prev_links_web_runtime != next_links_web_runtime
         || prev_assets != next_assets
     {
         return Classification::Logic;
@@ -1140,6 +1144,7 @@ mod tests {
             files: map,
             cargo_toml: cargo.to_owned(),
             uses_webview: false,
+            links_web_runtime: false,
             assets: std::collections::BTreeMap::new(),
         }
     }
