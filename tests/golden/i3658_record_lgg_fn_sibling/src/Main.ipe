@@ -1,0 +1,37 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.String as String
+
+
+-- `{ f : Int -> Int, x : a }` and `{ f : b, x : Int }` unify, so every `{f, x}`
+-- record shares one struct whose template generalizes both fields: the
+-- function field is a type parameter. Showing an all-`Int` instance, measuring
+-- it, and reading `x` through a row witness each rest on the instantiation's
+-- bounds, not on the function type a sibling occurrence holds.
+applyF : { f : Int -> Int, x : a } -> Int
+applyF r =
+    r.f 41
+
+
+label : { f : b, x : Int } -> Int
+label r =
+    r.x
+
+
+readX : { r | x : Int } -> Int
+readX rec =
+    rec.x
+
+
+main : Task Error ()
+main =
+    Io.println
+        (errorToString { f = 1, x = 2 }
+            ++ " "
+            ++ String.fromInt (applyF { f = \n -> n + 1, x = "s" })
+            ++ " "
+            ++ String.fromInt (label { f = 3.5, x = 7 })
+            ++ " "
+            ++ String.fromInt (readX { f = True, x = 9 })
+        )

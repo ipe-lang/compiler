@@ -22,6 +22,8 @@ mod golden_generic_records;
 mod golden_i1346_generic_record_field_name_collision;
 #[path = "g_record_generic/golden_i1349_concrete_record_straddles_two_generic_templates.rs"]
 mod golden_i1349_concrete_record_straddles_two_generic_templates;
+#[path = "g_record_generic/golden_i3658_record_template_lgg.rs"]
+mod golden_i3658_record_template_lgg;
 #[path = "g_record_generic/golden_param_patterns.rs"]
 mod golden_param_patterns;
 #[path = "g_record_generic/golden_parametric.rs"]

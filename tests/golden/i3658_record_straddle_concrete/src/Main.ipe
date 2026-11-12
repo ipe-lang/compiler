@@ -1,0 +1,23 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.String as String
+
+
+left : { q : ( a, Int ) } -> Int
+left r =
+    case r.q of
+        ( _, n ) ->
+            n
+
+
+right : { q : ( Int, a ) } -> Int
+right r =
+    case r.q of
+        ( n, _ ) ->
+            n
+
+
+main : Task Error ()
+main =
+    Io.println (String.fromInt (left { q = ( 40, 1 ) } + right { q = ( 2, 7 ) }))

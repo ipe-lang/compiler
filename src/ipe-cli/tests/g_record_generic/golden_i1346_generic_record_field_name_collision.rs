@@ -3,25 +3,15 @@
 //!
 //! `wrapOne : a -> a` surfaces the body-local generic shape `{ q : a }`;
 //! `firstOfPair : a -> a` surfaces `{ q : ( a, a ) }`. Both records share the
-//! field-name set `{q}` yet are GENUINELY DISTINCT (not alpha-equivalent). Before
-//! the fix, `reconcile_shapes` assumed a parametric record's field-name set names
-//! it uniquely and raised `Diagnostic::CompilerBug` → IPE-I0001 ("record field
-//! set {q} maps to two non-alpha-equivalent generic shapes") on this well-typed
-//! source — an ICE, a Principle-3 soundness violation.
+//! field-name set `{q}` without being alpha-equivalent, and a well-typed program
+//! with such a pair must never raise `Diagnostic::CompilerBug` (IPE-I0001).
 //!
-//! The fix groups generic occurrences by alpha-equivalence
-//! (`ipe_ir::alpha_equivalent_fields`) and emits ONE struct per class, mirroring
-//! the monomorphic-sibling path that already disambiguates concrete records
-//! sharing a field-name set. `ipe` must emit `main.rs` byte-identical to the
-//! checked-in golden — TWO generic structs `struct RecQ<T1> { q: T1 }` and
-//! `struct RecQ2<T1> { q: (T1, T1) }`, disambiguated at their use sites by the
-//! solved field-type shape — and (behind `IPE_E2E=1`) the emitted project must
-//! build and print `10` (`wrapOne 7 + firstOfPair 3`).
-//!
-//! Alpha-EQUIVALENT occurrences of one shape still fold to a single struct: the
-//! sibling `body_local_generic_record` golden (whose `{ q : a }` appears once)
-//! stays exactly one struct — this fix disambiguates only genuinely-distinct
-//! shapes, it does not duplicate.
+//! The two shapes unify (`a := ( b, b )`), so a value may flow from one to the
+//! other: they share ONE struct whose template is their least general
+//! generalization, `struct RecQ<T1> { q: T1 }`. `ipe` must emit `main.rs`
+//! byte-identical to the checked-in golden — that single struct, no `RecQ2` —
+//! and (behind `IPE_E2E=1`) the emitted project must build and print `10`
+//! (`wrapOne 7 + firstOfPair 3`).
 //!
 //! Oracle: Ipe's own output. `wrapOne 7` is `7`, `firstOfPair 3` is `3`, so
 //! `main` prints `10\n`, exit 0 — the value checked into `expected.txt`.

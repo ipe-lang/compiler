@@ -48,23 +48,6 @@ impl<T1: RetainedBytes> RetainedBytes for RecQ<T1> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct RecQ2<T1> {
-    q: (T1, T1),
-}
-
-impl<T1: IpeStringify> IpeStringify for RecQ2<T1> {
-    fn ipe_show(&self) -> String {
-        format!("{{{}}}", IpeStringify::ipe_show(&self.q))
-    }
-}
-
-impl<T1: RetainedBytes> RetainedBytes for RecQ2<T1> {
-    fn retained_bytes(&self) -> Option<Bytes> {
-        Bytes::inline::<Self>()?.plus(&self.q)
-    }
-}
-
 pub use ipe_runtime::error::IpeError;
 
 pub fn str_err(s: &str) -> IpeError {
@@ -287,7 +270,7 @@ pub fn main_wrap_one<T1: Clone>(value: T1) -> T1 {
 pub fn main_first_of_pair<T1: Clone>(value: T1) -> T1 {
     let _ipe_recursion_guard = crate::recursion_guard();
     ({
-        let r = RecQ2 {
+        let r = RecQ {
             q: (value.clone(), value),
         };
         ({
@@ -314,7 +297,7 @@ pub fn main_concrete_pair() -> i64 {
     static CELL: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
     CELL.get_or_init(|| {
         ({
-            let r = RecQ2 { q: (40i64, 2i64) };
+            let r = RecQ { q: (40i64, 2i64) };
             ({
                 let (x, y) = (r).q.clone();
                 ipe_runtime::math::ipe_int_add(x, y)
