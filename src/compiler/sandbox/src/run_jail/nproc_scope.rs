@@ -14,7 +14,7 @@
 
 use std::ffi::OsString;
 use std::io::Read as _;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -298,21 +298,28 @@ fn run_canary(
     let no_env = |_: &str| -> Option<OsString> { None };
     let argv = jail_argv_unproven(tools, profile, mounts, None, None, &no_env, payload)
         .map_err(RunJailDefect::Path)?;
-    let Some((program, rest)) = argv.args().split_first() else {
-        return Err(RunJailDefect::Spawn {
-            detail: "the process-cap canary argv is empty".to_owned(),
-        });
-    };
-    let mut child = Command::new(program)
-        .args(rest)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(stderr)
-        .spawn()
-        .map_err(|e| RunJailDefect::Spawn {
-            detail: format!("the process-cap canary jail could not be spawned: {e}"),
-        })?;
+    let mut child = spawn_canary(&argv, stderr)?;
     await_canary(&mut child, CANARY_WALL)
+}
+
+/// Start a canary jail through the runtime descriptor floor: like every jail,
+/// it inherits stdio and no other descriptor of this process.
+#[cfg(unix)]
+fn spawn_canary(argv: &super::JailArgv<'static>, stderr: Stdio) -> Result<Child, RunJailDefect> {
+    super::JailLaunch::fd_free(argv)?
+        .spawn(Stdio::null(), stderr)
+        .map_err(|defect| RunJailDefect::Spawn {
+            detail: format!("the process-cap canary jail could not be spawned: {defect}"),
+        })
+}
+
+/// No bubblewrap canary runs off Unix: the descriptor floor every jail starts
+/// through exists only there.
+#[cfg(not(unix))]
+fn spawn_canary(_argv: &super::JailArgv<'static>, _stderr: Stdio) -> Result<Child, RunJailDefect> {
+    Err(RunJailDefect::UnsupportedPlatform {
+        reason: "the bubblewrap process-cap canary runs only on Unix",
+    })
 }
 
 /// Wait for a canary, killing and reaping it once `wall` has passed.
