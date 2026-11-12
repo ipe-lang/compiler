@@ -232,9 +232,9 @@ MERGE_QUEUE: dict[str, object] = {
     # the queue builds every entry on the combined tree, and `HEADGREEN` would
     # land the group's inner commits with no green run of their own.
     "grouping_strategy": "ALLGREEN",
-    # The longest full run fits inside it; a context that never reports fails
-    # the entry rather than holding the queue.
-    "check_response_timeout_minutes": 120,
+    # The longest full run plus the wait for a free runner fits inside it; a
+    # context that never reports fails the entry rather than holding the queue.
+    "check_response_timeout_minutes": 240,
 }
 _STATUS_PARAMS = frozenset(
     {"strict_required_status_checks_policy", "do_not_enforce_on_create", "required_status_checks"}
