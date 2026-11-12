@@ -12101,6 +12101,12 @@ pub struct Lowerer<'a> {
     /// enum holds — the same table shape the backend's enum-`Clone` fixpoint
     /// reads, so both stages agree on which enums are `Clone`.
     enum_payloads: EnumPayloadTable,
+    /// The `PartialEq` fact of every enum in [`Self::enum_payloads`].
+    ///
+    /// Filled with it, by the fixpoint the backend derives by
+    /// ([`ipe_ir::enum_derivable_fixpoint`]), so an `==` the lowerer admits is
+    /// one the emitted enum can answer.
+    enum_derivable: BTreeMap<(ModPath, Symbol), bool>,
     /// Which type parameters of the program's enums a field uses.
     ///
     /// Filled once every union is lowered, before any def body: an unused
@@ -14571,6 +14577,7 @@ impl<'a> Lowerer<'a> {
             ctor_arity,
             transparent_ffi_unions,
             enum_payloads: EnumPayloadTable::new(),
+            enum_derivable: BTreeMap::new(),
             enum_param_use: ipe_ir::EnumParamUse::default(),
             transparent_ffi_ctors,
             eta_params,
@@ -17055,6 +17062,7 @@ impl<'a> Lowerer<'a> {
                 })
                 .chain(prelude_enums.iter()),
         );
+        self.enum_derivable = ipe_ir::enum_derivable_fixpoint(self.interner, &self.enum_payloads);
 
         let mut funcs = Vec::with_capacity(self.m.defs.len());
         let mut entry = None;
@@ -18040,6 +18048,44 @@ impl<'a> Lowerer<'a> {
         home.first()
             .and_then(|s| self.interner.resolve(*s))
             .is_some_and(|s| s == "Rust")
+    }
+
+    /// Refuse an `==` or `/=` whose operands have no `PartialEq` (IPE-L0164).
+    ///
+    /// The type checker's `Equatable` obligation refuses these first
+    /// (IPE-T0014); this second boundary judges the lowered operand type by
+    /// the predicate the backend derives `PartialEq` by
+    /// ([`instance_bounds::eq_supplied`]), so no admitted comparison meets
+    /// rustc's E0369. An operand type with an unfixed variable is read as
+    /// `JsonVal`, as a kernel bound reads it; one that lowers neither way
+    /// keeps its lowering error.
+    fn reject_uncomparable_operands(
+        &self,
+        op: BinOp,
+        lhs: &canon::Expr,
+        span: Span,
+    ) -> DResult<()> {
+        let Some(ty) = self.region_ty(lhs.span) else {
+            return Ok(());
+        };
+        let lowered = match self.ir_type_from_ty(ty, lhs.span) {
+            Ok(lowered) => lowered,
+            Err(strict) => self
+                .ir_type_from_ty_json(ty, lhs.span)
+                .map_err(|_| strict)?,
+        };
+        match instance_bounds::eq_supplied(self.clone_env(), Some(&self.enum_derivable), &lowered) {
+            instance_bounds::Supply::Unmet { demand, leaf } => {
+                let operator = if matches!(op, BinOp::Neq) { "/=" } else { "==" };
+                Err(instance_bounds::callee_bound_unmet(
+                    span,
+                    operator.into(),
+                    demand,
+                    leaf,
+                ))
+            }
+            instance_bounds::Supply::Met | instance_bounds::Supply::Forwarded => Ok(()),
+        }
     }
 
     /// The clone-classification context for this module.
@@ -23690,8 +23736,12 @@ impl<'a> Lowerer<'a> {
                         })
                     }
                 } else {
+                    let op = self.binop(*func, e.span)?;
+                    if matches!(op, BinOp::Eq | BinOp::Neq) {
+                        self.reject_uncomparable_operands(op, lhs, e.span)?;
+                    }
                     Ok(Expr::BinOp {
-                        op: self.binop(*func, e.span)?,
+                        op,
                         lhs: Box::new(self.lower_expr(lhs)?),
                         rhs: Box::new(self.lower_expr(rhs)?),
                     })
