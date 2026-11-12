@@ -6980,7 +6980,6 @@ mod non_serde_tests {
                     cargo_toml: String::new(),
                     uses_webview: false,
                     links_web_runtime: false,
-                    links_web_runtime: false,
                     assets: std::collections::BTreeMap::new(),
                 };
             };
