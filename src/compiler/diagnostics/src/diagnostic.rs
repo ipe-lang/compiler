@@ -2710,6 +2710,8 @@ pub enum SpanRole {
     Definition,
     /// The opening `"""` whose column is a block string's margin.
     MarginOpener,
+    /// The reference to the function that imposed an unmet duty.
+    DutyOrigin,
 }
 
 /// A fixed, payload-free guidance line. Keeping these as an enum (not a
@@ -3532,6 +3534,7 @@ fn mismatch_help(definition: Option<Span>, unmet_class: Option<TypeClass>) -> Ve
     lines
 }
 
+#[allow(clippy::too_many_lines)] // one arm per TypeError variant — mechanical dispatch
 fn type_help(msg: &TypeError) -> Vec<HelpLine> {
     match msg {
         TypeError::TypeMismatch {
@@ -3619,6 +3622,13 @@ fn type_help(msg: &TypeError) -> Vec<HelpLine> {
              write the concrete type the body needs (`List Int` instead of `any`)."
                 .into(),
         )],
+        TypeError::SuperTypeUnsatisfied {
+            origin: Some(origin),
+            ..
+        } => vec![HelpLine::SecondarySpan {
+            span: origin.at,
+            role: SpanRole::DutyOrigin,
+        }],
         TypeError::Mismatch
         | TypeError::InfiniteType { .. }
         | TypeError::TooManyParameters { .. }
@@ -3626,7 +3636,7 @@ fn type_help(msg: &TypeError) -> Vec<HelpLine> {
         | TypeError::NoSuchField { .. }
         | TypeError::BuiltinRecordUpdate { .. }
         | TypeError::CtorPatternArity { .. }
-        | TypeError::SuperTypeUnsatisfied { .. }
+        | TypeError::SuperTypeUnsatisfied { origin: None, .. }
         | TypeError::TaskArity { .. } => Vec::new(),
     }
 }
