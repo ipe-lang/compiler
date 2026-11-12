@@ -410,9 +410,9 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       `taiki-e/install-action` at the `Cargo.lock` version before the claim
       step; every `wasm-bindgen` tool pin in any workflow names that
       version, and no step `cargo install`s the runner.  A count piped from
-      a command that tests no cell is refused.  The owner job's context is a
-      required `gate` or a `nightly-gate` of the manifest, produced by that
-      workflow.  Any other cargo test run on a wasm32 `--target` in any job
+      a command that tests no cell is refused.  The owner job's own context,
+      or an entry whose `aggregates:` names it, is a required `gate` or a
+      `nightly-gate` of the manifest, produced by that workflow.  Any other cargo test run on a wasm32 `--target` in any job
       is refused as unclaimed.  LIMIT: a target set through
       `CARGO_BUILD_TARGET` rather than `--target` is not seen as a run; a
       cargo config above the checkout or under `$CARGO_HOME`, a `Cargo.toml`
@@ -4470,17 +4470,22 @@ def check_test_claims(wfs: WorkflowSet, errors: list[str]) -> None:
         if not isinstance(name, str) or "${{" in name:
             errors.append(f"check 20: owner job {job_id!r} has no literal context name; refused")
             continue
-        # An owner job reports either as its own context or through the one
-        # entry whose `aggregates:` names it (check 1), whose verdict it inherits.
-        entry = next((e for e in entries if e.get("context") == name), None) or next(
-            (e for e in entries if e.get("producer") == fname and job_id in (e.get("aggregates") or [])), None
-        )
-        disp = entry.get("disposition") if entry else None
-        if entry is None or entry.get("producer") != fname:
+        # An owner job reports as its own context and through every entry
+        # whose `aggregates:` names it (check 1), whose verdict it feeds: its
+        # red count blocks a merge when any of them is a required gate or a
+        # nightly-gate of this workflow.
+        own = [e for e in entries if e.get("context") == name and e.get("producer") == fname]
+        aggregating = [e for e in entries if e.get("producer") == fname and job_id in (e.get("aggregates") or [])]
+        reporting = own + aggregating
+        if not reporting:
             errors.append(f"check 20: owner job {job_id!r} ({name!r}) has no manifest entry produced by {fname}; refused")
-        elif not (disp == "gate" and entry.get("context") in required) and disp != "nightly-gate":
+        elif not any(
+            (e.get("disposition") == "gate" and e.get("context") in required) or e.get("disposition") == "nightly-gate"
+            for e in reporting
+        ):
+            disps = ", ".join(f"{e.get('context')!r} is {e.get('disposition')!r}" for e in reporting)
             errors.append(
-                f"check 20: owner job {job_id!r} ({name!r}) is {disp!r}, not a required gate or a "
+                f"check 20: owner job {job_id!r} ({name!r}) reports through {disps}, none a required gate or a "
                 "nightly-gate, so its red count blocks nothing; refused"
             )
 

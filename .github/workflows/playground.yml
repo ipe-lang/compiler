@@ -11,7 +11,11 @@ name: Playground jail
 #
 #   build                — cargo build -p ipe-wasm (wasm32) and
 #                          -p playground-jail-runner: the bundle and jail-runner
-#                          compile end-to-end.
+#                          compile end-to-end; then ipe-wasm's nesting_ceiling
+#                          test runs on wasm32 under node, proving every
+#                          nesting shape at the parser's ceiling compiles in
+#                          the engine and one level deeper is refused, never
+#                          trapped (cell in .github/ci/test-claims.yml).
 #   playground-jail-run  — cargo nextest run -p playground-jail-runner, which
 #                          includes sandbox_security.rs (IPE_PLAYGROUND_E2E=1).
 #   playground-jail      — the required verdict over both.
@@ -85,6 +89,19 @@ jobs:
 
       - name: Build ipe-wasm (wasm32-unknown-unknown)
         run: cargo build -p ipe-wasm --target wasm32-unknown-unknown --release
+
+      # The wasm test runner, pinned to the Cargo.lock wasm-bindgen version
+      # (a runner of another version refuses the test binary).
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        with:
+          tool: wasm-bindgen@0.2.126
+      # The step is red unless the runner reports exactly the cell's
+      # `expect_tests` passing tests (verify-manifest check 20).
+      - name: Run the ipe-wasm nesting ceiling (node)
+        shell: bash
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: cargo test -p ipe-wasm --target wasm32-unknown-unknown --release --test nesting_ceiling | python3 tools/scripts/wasm-test/wasm_test_count.py 5
 
       - name: Build playground-jail-runner
         run: cargo build -p playground-jail-runner
