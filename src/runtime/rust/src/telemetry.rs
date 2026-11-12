@@ -338,21 +338,20 @@ impl Posture {
         }
     }
 
-    /// Resolve the posture from the process environment and compiled intent.
+    /// The process posture: `ENV`/`IPE_ENV` as read once at startup, judged
+    /// under the compiled intent.
     ///
-    /// A release binary that reads a dev marker logs, once, that it ignores it.
+    /// A release binary that read a dev marker logs, once, that it ignores it.
     #[must_use]
     pub fn from_env() -> Self {
-        let env = crate::system::read_env_var("ENV");
-        let ipe_env = crate::system::read_env_var("IPE_ENV");
-        let (env, ipe_env) = (RawEnv::from_read(&env), RawEnv::from_read(&ipe_env));
-        if release_ignores_dev_marker(env, ipe_env, BuildPosture::COMPILED) {
+        let reading = deployment_reading();
+        if reading.ignored_dev_marker {
             static DEV_MARKER_NOTICE: std::sync::Once = std::sync::Once::new();
             DEV_MARKER_NOTICE.call_once(|| {
                 crate::system::emit_runtime_log("posture", RELEASE_IGNORES_DEV_MARKER);
             });
         }
-        Self::parse(env, ipe_env, BuildPosture::COMPILED)
+        reading.posture
     }
 
     /// The label logged at startup (`posture=<label>`).
@@ -363,6 +362,33 @@ impl Posture {
             Self::Production => "production",
         }
     }
+}
+
+/// `ENV`/`IPE_ENV` as judged once per process.
+struct DeploymentReading {
+    posture: Posture,
+    ignored_dev_marker: bool,
+}
+
+/// The one read of `ENV`/`IPE_ENV`, fixed by the startup check before the
+/// program's first line, so a marker the program writes later never moves
+/// the posture.
+fn deployment_reading() -> &'static DeploymentReading {
+    static READING: std::sync::OnceLock<DeploymentReading> = std::sync::OnceLock::new();
+    READING.get_or_init(|| {
+        let env = crate::system::read_env_var("ENV");
+        let ipe_env = crate::system::read_env_var("IPE_ENV");
+        let (env, ipe_env) = (RawEnv::from_read(&env), RawEnv::from_read(&ipe_env));
+        DeploymentReading {
+            posture: Posture::parse(env, ipe_env, BuildPosture::COMPILED),
+            ignored_dev_marker: release_ignores_dev_marker(env, ipe_env, BuildPosture::COMPILED),
+        }
+    })
+}
+
+/// Fixes the process's deployment posture.
+pub fn fix_deployment_posture() {
+    deployment_reading();
 }
 
 /// The one-line notice a release binary logs when it reads a dev marker.
@@ -620,12 +646,20 @@ impl ConsoleAuthResolution {
         }
     }
 
-    /// Resolve the setting from the process environment.
+    /// Resolve the setting under the process's `IPE_CONSOLE_AUTH` posture.
+    ///
+    /// The variable is read once, before the program's first line; a refused
+    /// value resolves to `Off`, the surface declared absent.
     #[must_use]
     pub fn from_env() -> Self {
-        let read = crate::system::read_env_var("IPE_CONSOLE_AUTH");
+        use crate::env_registry::security::{ConsoleAuthSetting, security_posture};
+        let raw = match security_posture().console_auth {
+            ConsoleAuthSetting::Unset => RawEnv::Absent,
+            ConsoleAuthSetting::Named(name) => RawEnv::Value(name),
+            ConsoleAuthSetting::Refused => RawEnv::NotUnicode,
+        };
         Self::resolve(
-            RawEnv::from_read(&read),
+            raw,
             BuildPosture::COMPILED,
             Posture::from_env(),
             ProcessScope::current(),
@@ -860,6 +894,12 @@ pub fn frame_ancestors_config() -> Result<Option<&'static FrameAncestors>, Frame
         Ok(fa) => Ok(fa.as_ref()),
         Err(refusal) => Err(*refusal),
     }
+}
+
+/// Fixes the process's `IPE_WEB_FRAME_ANCESTORS` reading before the program's
+/// first line, so a value the program writes later never opens framing.
+pub fn fix_frame_ancestors() {
+    let _ = frame_ancestors_config();
 }
 
 /// `Some` when responses run in cross-origin-iframe mode.
@@ -1862,6 +1902,34 @@ mod tests {
         assert!(dev_surface_from_env().is_none());
         assert_eq!(dev_console_banner(""), "");
         assert!(dev_intent_from_env().is_some());
+    }
+
+    // A dev marker the program writes after startup leaves an operator's
+    // production posture in place: no dev intent, no dev surface.
+    #[cfg(feature = "dev-posture")]
+    #[test]
+    fn dev_posture_pin_a_dev_marker_written_after_startup_stays_production() {
+        crate::system::locked_set_var("ENV", "production");
+        crate::system::locked_remove_var("IPE_ENV");
+        fix_deployment_posture();
+        crate::system::locked_set_var("ENV", "dev");
+        record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        assert_eq!(Posture::from_env(), Posture::Production);
+        assert!(dev_intent_from_env().is_none());
+        assert!(dev_surface_from_env().is_none());
+        crate::system::locked_remove_var("ENV");
+    }
+
+    // An embed allow-list the program writes after startup opens no framing:
+    // the startup check fixed the operator's (unset) reading.
+    #[test]
+    fn frame_ancestors_written_after_startup_open_no_framing() {
+        crate::system::locked_remove_var(FRAME_ANCESTORS_ENV);
+        assert!(crate::env_registry::startup_check().is_ok());
+        crate::system::locked_set_var(FRAME_ANCESTORS_ENV, "https://planted.example");
+        let read = frame_ancestors_config().map(|fa| fa.map(FrameAncestors::sources));
+        crate::system::locked_remove_var(FRAME_ANCESTORS_ENV);
+        assert_eq!(read, Ok(None));
     }
 
     // The banner advertises the console, so without a dev surface it is

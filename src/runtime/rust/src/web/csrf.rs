@@ -15,7 +15,7 @@
 //! reading the request body — no buffering, no body-consumption hazard.
 
 use crate::env_grammar::EnvFlag;
-use crate::env_registry::security::WEB_CSRF_ORIGIN_CHECK;
+use crate::env_registry::security::security_posture;
 use crate::http_header::RequestAuthority;
 use crate::telemetry;
 use axum::http::{HeaderMap, StatusCode, request::Parts};
@@ -55,22 +55,17 @@ pub fn csrf_cookie_name_for(base: &crate::encoding::MountBase) -> crate::server:
 pub const CSRF_HEADER: &str = "x-ipe-csrf";
 
 /// Whether CSRF protection is on, under the one config precedence with a
-/// stricter-only floor for the in-code setting. CSRF is ON by default;
-/// `IPE_CSRF=off|0|false` (the operator env override, top of precedence)
-/// disables it; a `Web.csrf` setting may only ENFORCE it, never disable it (a
-/// setting cannot lower the posture below the fail-closed default). The decision
-/// is snapshotted once into a `OnceLock` on first call (env + installed settings
-/// are both stable at process start; same rationale as `cookies_secure()` —
-/// eliminates a per-request `getenv` + global env-lock acquisition on every
-/// mutating request).
+/// stricter-only floor for the in-code setting.
+///
+/// CSRF is on by default; the process's `IPE_CSRF` posture (the operator
+/// override, top of precedence, fixed before the program's first line) may turn
+/// it off; a `Web.csrf` setting may only enforce it, never disable it. The
+/// decision is fixed on first call.
 pub fn csrf_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        let env_enabled = !matches!(
-            crate::system::read_env_var("IPE_CSRF").ok().as_deref(),
-            Some("off") | Some("0") | Some("false")
-        );
+        let env_enabled = matches!(security_posture().csrf, EnvFlag::On);
         // Built-in default is on (fail-closed); a setting can only strengthen.
         crate::app_config::resolve_csrf_enabled(env_enabled, true)
     })
@@ -214,19 +209,9 @@ pub fn is_exempt_path(path: &str) -> bool {
         || path.starts_with("/_ipe/console/")
 }
 
-/// The origin-check switch, read once per process.
-///
-/// A refused value reads as `On`: the startup check has already refused the
-/// start, and a check that cannot read its switch stays closed.
+/// The origin-check switch of the process's security posture.
 fn origin_check() -> EnvFlag {
-    use std::sync::OnceLock;
-    static CHECK: OnceLock<EnvFlag> = OnceLock::new();
-    *CHECK.get_or_init(|| WEB_CSRF_ORIGIN_CHECK.read().unwrap_or(EnvFlag::On))
-}
-
-/// Fixes the origin-check switch at startup, so a later `System.setenv` cannot move it.
-pub fn fix_origin_check() {
-    origin_check();
+    security_posture().csrf_origin_check
 }
 
 /// Whether the `Origin` check refuses a request under the switch `check`.
@@ -297,6 +282,7 @@ pub(crate) async fn csrf_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::env_registry::security::WEB_CSRF_ORIGIN_CHECK;
 
     /// The head of a request to `uri` carrying each of `origins` as an `Origin`
     /// header and each of `hosts` as a `Host` header.
