@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bin;
+pub mod ffi_app;
 pub mod live_page;
 pub mod scratch;
 pub mod target;

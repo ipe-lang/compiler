@@ -234,38 +234,32 @@ fn the_fail_closed_opaque_representation_builds() {
         "the member field keeps the opaque nominal:\n{bindings}"
     );
     let slug = "demo";
-    let ffi_body = format!("pub mod {slug} {{\n{bindings}}}\npub use {slug}::*;\n");
+    let ffi_rs = e2e_support::ffi_app::package_module(slug, &bindings);
 
     let dir =
         ipe_test_temp::temp_root().join(format!("ipe_ffi_fixpoint_seal_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("src")).expect("mkdir");
-    std::fs::write(
-        dir.join("Cargo.toml"),
-        "[package]\nname = \"fixpoint_seal\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
-         [[bin]]\nname = \"fixpoint_seal\"\npath = \"src/main.rs\"\n",
-    )
-    .expect("Cargo.toml");
+    let main_rs = r#"use ffi::demo::{Counter, Model};
 
-    let main_rs = format!(
-        r#"mod ffi {{
-    {ffi_body}
-}}
-
-use ffi::demo::{{Counter, Model}};
-
-fn main() {{
+fn main() {
     // The fail-closed representation: a Model holds a Counter as an opaque
     // nominal, both built through the emitted constructors. This compiles
     // because neither is a transparent record over the member.
     let m: Model = ffi::demo_model_new(ffi::demo_counter_new(7), 0);
     let _c: Counter = m.counter.clone();
     assert_eq!(m.counter.value, 7, "the opaque member round-trips");
-    println!("{{}}", m.counter.value);
-}}
-"#
-    );
-    std::fs::write(dir.join("src").join("main.rs"), main_rs).expect("main.rs");
+    println!("{}", m.counter.value);
+}
+"#;
+    e2e_support::ffi_app::FfiApp {
+        name: "fixpoint_seal",
+        runtime_features: &[],
+        dependencies: &[],
+        ffi_rs: &ffi_rs,
+        main_rs,
+    }
+    .write(&dir)
+    .expect("the app crate is written");
 
     let ran = e2e_support::build_and_run_rust("ffi_transparency_fixpoint", &dir);
     assert!(

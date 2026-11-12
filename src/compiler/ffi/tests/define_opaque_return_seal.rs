@@ -127,66 +127,36 @@ fn opaque_return_closure_builds_and_runs() {
     // opaque-return adapter, wrapped as the backend's `pub mod <slug>` region.
     let bindings = emit_bindings(&counter_update_pkg());
     let slug = "demo";
-    let ffi_body = format!("pub mod {slug} {{\n{bindings}}}\npub use {slug}::*;\n");
+    let ffi_rs = e2e_support::ffi_app::package_module(slug, &bindings);
 
     let dir =
         ipe_test_temp::temp_root().join(format!("ipe_ffi_opaque_ret_seal_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("src")).expect("mkdir");
-    std::fs::write(
-        dir.join("Cargo.toml"),
-        "[package]\nname = \"opaque_ret_seal\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
-         [[bin]]\nname = \"opaque_ret_seal\"\npath = \"src/main.rs\"\n\
-         # catch_unwind soundness requires panic=unwind (the emitter's own fence)\n\
-         [profile.dev]\npanic = \"unwind\"\n",
-    )
-    .expect("Cargo.toml");
-
-    // The emitted bindings' preamble is `use crate::*;`, so the crate root must
-    // supply the runtime glue the adapter names (`IpeError`, `str_err`). A
-    // minimal stand-in stands in for the real `ipe_runtime`.
-    let main_rs = format!(
-        r#"// Minimal runtime glue the emitted Result adapter references, at the
-// crate root so the bindings' `use crate::*;` brings it into scope.
-#[derive(Debug)]
-pub struct IpeError(String);
-pub fn str_err<E: From<String>>(s: &str) -> E {{ s.to_string().into() }}
-pub fn ipe_error_from_panic<E: From<String>>(c: &str, _p: Box<dyn std::any::Any + Send>) -> E {{ c.to_string().into() }}
-pub fn note_foreign_panic(_c: &str, _p: Box<dyn std::any::Any + Send>) -> String {{ String::new() }}
-pub fn note_foreign_error<T: std::fmt::Debug>(_e: T) -> String {{ String::new() }}
-pub fn ipe_error_from_foreign<T: std::fmt::Debug, E: From<String>>(_e: T) -> E {{ "external operation failed".to_string().into() }}
-impl From<String> for IpeError {{ fn from(s: String) -> Self {{ IpeError(s) }} }}
-
-mod ffi {{
-    use crate::*;
-    {ffi_body}
-}}
-
-use ffi::demo::Counter;
+    let main_rs = r#"use ffi::demo::Counter;
 
 // A tiny "crate" driver that takes the boxed closure the adapter returns and
 // folds a model with it — the exact shape an Iced `update` loop would.
 fn crate_folds(
     f: Box<dyn Fn(Counter) -> Result<Counter, IpeError> + Send + Sync + 'static>,
-) -> i64 {{
+) -> i64 {
     let mut c = ffi::demo_counter_new(0);
-    for _ in 0..3 {{
+    for _ in 0..3 {
         c = f(c).unwrap_or_else(|_| ffi::demo_counter_new(-100));
-    }}
+    }
     c.value
-}}
+}
 fn crate_folds_panicking(
     f: Box<dyn Fn(Counter) -> Result<Counter, IpeError> + Send + Sync + 'static>,
-) -> i64 {{
+) -> i64 {
     // A panicking Ipê closure must fold to Err, never abort the process.
-    match f(ffi::demo_counter_new(0)) {{
+    match f(ffi::demo_counter_new(0)) {
         Ok(c) => c.value,
         Err(_) => -1,
-    }}
-}}
+    }
+}
 
 #[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
-fn main() {{
+fn main() {
     // The Ipê function value: on the app side, exactly a
     // `Box<dyn Fn(Counter) -> Result<Counter, IpeError> + Send + Sync + 'static>`.
     let ipe_ok: Box<dyn Fn(Counter) -> Result<Counter, IpeError> + Send + Sync + 'static> =
@@ -201,11 +171,18 @@ fn main() {{
 
     assert_eq!(folded, 3, "opaque-return closure folds the model");
     assert_eq!(panicked, -1, "a panicking closure folds to Err, never aborts");
-    println!("{{folded}} {{panicked}}");
-}}
-"#
-    );
-    std::fs::write(dir.join("src").join("main.rs"), main_rs).expect("main.rs");
+    println!("{folded} {panicked}");
+}
+"#;
+    e2e_support::ffi_app::FfiApp {
+        name: "opaque_ret_seal",
+        runtime_features: &[],
+        dependencies: &[],
+        ffi_rs: &ffi_rs,
+        main_rs,
+    }
+    .write(&dir)
+    .expect("the app crate is written");
 
     let ran = e2e_support::build_and_run_rust("ffi_opaque_return", &dir);
     assert!(

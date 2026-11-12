@@ -116,17 +116,13 @@ fn assembled_module_tree_builds_and_runs() {
     let bindings = emit_bindings(&pkg);
     let slug = "demo";
 
-    // Mirror `ipe_backend_rust::project` + `ipe-cli::assemble_emit`: `src/ffi.rs`
-    // wraps the generated bindings in `pub mod <slug> { … } pub use <slug>::*;`.
-    let ffi_rs = format!("pub mod {slug} {{\n{bindings}}}\npub use {slug}::*;\n");
+    let ffi_rs = e2e_support::ffi_app::package_module(slug, &bindings);
 
     // The `main` references the define types at their CRATE-ABSOLUTE path — the
     // exact `foreign_types` value `assemble_emit` renders (`crate::ffi::<slug>::T`)
     // — and calls each forwarder fn (also under `crate::ffi::`).
     let main_rs = format!(
-        r#"mod ffi;
-
-fn apply(m: &crate::ffi::{slug}::Message, c: crate::ffi::{slug}::Counter) -> crate::ffi::{slug}::Counter {{
+        r#"fn apply(m: &crate::ffi::{slug}::Message, c: crate::ffi::{slug}::Counter) -> crate::ffi::{slug}::Counter {{
     match m {{
         crate::ffi::{slug}::Message::Increment => crate::ffi::demo_counter_new(c.value + 1),
         crate::ffi::{slug}::Message::SetValue(v) => crate::ffi::demo_counter_new(*v),
@@ -150,15 +146,15 @@ fn main() {{
     let dir =
         ipe_test_temp::temp_root().join(format!("ipe_ffi_forwarder_seal_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("src")).expect("mkdir");
-    std::fs::write(
-        dir.join("Cargo.toml"),
-        "[package]\nname = \"forwarder_seal\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
-         [[bin]]\nname = \"forwarder_seal\"\npath = \"src/main.rs\"\n",
-    )
-    .expect("Cargo.toml");
-    std::fs::write(dir.join("src").join("ffi.rs"), ffi_rs).expect("ffi.rs");
-    std::fs::write(dir.join("src").join("main.rs"), main_rs).expect("main.rs");
+    e2e_support::ffi_app::FfiApp {
+        name: "forwarder_seal",
+        runtime_features: &[],
+        dependencies: &[],
+        ffi_rs: &ffi_rs,
+        main_rs: &main_rs,
+    }
+    .write(&dir)
+    .expect("the app crate is written");
 
     let ran = e2e_support::build_and_run_rust("ffi_define_forwarder", &dir);
     assert!(

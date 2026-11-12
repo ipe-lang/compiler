@@ -204,36 +204,30 @@ fn a_non_recursive_chain_builds_and_runs() {
     }
     let bindings = emit_bindings(&non_recursive_chain_pkg());
     let slug = "demo";
-    let ffi_body = format!("pub mod {slug} {{\n{bindings}}}\npub use {slug}::*;\n");
+    let ffi_rs = e2e_support::ffi_app::package_module(slug, &bindings);
 
     let dir =
         ipe_test_temp::temp_root().join(format!("ipe_ffi_recursive_seal_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("src")).expect("mkdir");
-    std::fs::write(
-        dir.join("Cargo.toml"),
-        "[package]\nname = \"recursive_seal\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
-         [[bin]]\nname = \"recursive_seal\"\npath = \"src/main.rs\"\n",
-    )
-    .expect("Cargo.toml");
+    let main_rs = r#"use ffi::demo::A;
 
-    let main_rs = format!(
-        r#"mod ffi {{
-    {ffi_body}
-}}
-
-use ffi::demo::{{A, B}};
-
-fn main() {{
+fn main() {
     // The acyclic chain: an `A` holds a `B` holds a scalar, all built through
     // the emitted constructors.
     let a: A = ffi::demo_a_new(ffi::demo_b_new(7));
     assert_eq!(a.b.c, 7, "the acyclic chain round-trips");
-    println!("{{}}", a.b.c);
-}}
-"#
-    );
-    std::fs::write(dir.join("src").join("main.rs"), main_rs).expect("main.rs");
+    println!("{}", a.b.c);
+}
+"#;
+    e2e_support::ffi_app::FfiApp {
+        name: "recursive_seal",
+        runtime_features: &[],
+        dependencies: &[],
+        ffi_rs: &ffi_rs,
+        main_rs,
+    }
+    .write(&dir)
+    .expect("the app crate is written");
 
     let ran = e2e_support::build_and_run_rust("ffi_define_recursive", &dir);
     assert!(

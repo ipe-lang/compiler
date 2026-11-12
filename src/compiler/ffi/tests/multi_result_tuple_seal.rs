@@ -104,7 +104,7 @@ fn assembled_tuple_wrapper_builds_and_runs() {
     let pkg = PkgInfo::decode_json(&doc).expect("extent-only surface decodes");
     let bindings = emit_bindings(&pkg);
     let slug = "geom";
-    let ffi_body = format!("pub mod {slug} {{\n{bindings}}}\npub use {slug}::*;\n");
+    let ffi_rs = e2e_support::ffi_app::package_module(slug, &bindings);
 
     let root =
         ipe_test_temp::temp_root().join(format!("ipe_ffi_tuple_seal_{}", std::process::id()));
@@ -126,56 +126,32 @@ fn assembled_tuple_wrapper_builds_and_runs() {
     )
     .expect("wrapper lib.rs");
 
-    // The app crate: the emitted bindings' preamble is `use crate::*;`, so the
-    // crate root supplies the runtime glue the wrapper names (`IpeResult`,
-    // `IpeError`, `ok_res`, `str_err`). Minimal stand-ins for `ipe_runtime`.
-    let main_rs = format!(
-        r#"// Runtime glue the emitted wrapper references, at the crate root so the
-// bindings' `use crate::*;` brings it into scope.
-#[derive(Debug)]
-pub enum IpeResult<E, A> {{ Ok(A), Err(E) }}
-#[derive(Debug)]
-pub struct IpeError(String);
-pub fn ok_res<E, A>(a: A) -> IpeResult<E, A> {{ IpeResult::Ok(a) }}
-pub fn str_err<E: From<String>>(s: &str) -> E {{ s.to_string().into() }}
-pub fn ipe_error_from_panic<E: From<String>>(c: &str, _p: Box<dyn std::any::Any + Send>) -> E {{ c.to_string().into() }}
-pub fn note_foreign_panic(_c: &str, _p: Box<dyn std::any::Any + Send>) -> String {{ String::new() }}
-pub fn note_foreign_error<T: std::fmt::Debug>(_e: T) -> String {{ String::new() }}
-pub fn ipe_error_from_foreign<T: std::fmt::Debug, E: From<String>>(_e: T) -> E {{ "external operation failed".to_string().into() }}
-impl From<String> for IpeError {{ fn from(s: String) -> Self {{ IpeError(s) }} }}
-
-mod ffi {{
-    use crate::*;
-    {ffi_body}
-}}
-
-#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
-fn main() {{
-    match ffi::geom_extent(()) {{
-        IpeResult::Ok((n, s, b)) => {{
+    // The app crate: the bindings' `use crate::*;` resolves the runtime items
+    // the wrapper names through the crate-root prelude.
+    let main_rs = r#"#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
+fn main() {
+    match ffi::geom_extent(()) {
+        IpeResult::Ok((n, s, b)) => {
             // u64::MAX saturates to i64::MAX; the String + bool are preserved.
             assert_eq!(n, i64::MAX, "wide unsigned saturates into the Int carrier");
             assert_eq!(s, "wide", "owned String rides identity");
             assert!(b, "bool rides identity");
-            println!("ok {{}} {{}} {{}}", n, s, b);
-        }}
-        IpeResult::Err(e) => panic!("unexpected Err: {{:?}}", e),
-    }}
-}}
-"#
-    );
+            println!("ok {} {} {}", n, s, b);
+        }
+        IpeResult::Err(e) => panic!("unexpected Err: {:?}", e),
+    }
+}
+"#;
 
-    std::fs::create_dir_all(root.join("src")).expect("mkdir app");
-    std::fs::write(
-        root.join("Cargo.toml"),
-        "[package]\nname = \"tuple_seal\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
-         [[bin]]\nname = \"tuple_seal\"\npath = \"src/main.rs\"\n\
-         [dependencies]\ngeom = { path = \"wrappers/geom\" }\n\
-         # catch_unwind soundness requires panic=unwind (the emitter's own fence)\n\
-         [profile.dev]\npanic = \"unwind\"\n",
-    )
-    .expect("Cargo.toml");
-    std::fs::write(root.join("src").join("main.rs"), main_rs).expect("main.rs");
+    e2e_support::ffi_app::FfiApp {
+        name: "tuple_seal",
+        runtime_features: &[],
+        dependencies: &["geom = { path = \"wrappers/geom\" }".to_owned()],
+        ffi_rs: &ffi_rs,
+        main_rs,
+    }
+    .write(&root)
+    .expect("the app crate is written");
 
     let ran = e2e_support::build_and_run_rust("ffi_multi_result_tuple", &root);
     assert!(

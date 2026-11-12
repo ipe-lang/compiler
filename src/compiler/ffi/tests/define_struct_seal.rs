@@ -118,40 +118,38 @@ fn define_struct_builds_and_runs() {
         &serde_json::json!([{ "name": "value", "type": "i64" }]),
         &serde_json::json!(["Default", "Clone"]),
     );
-    let make = wrapper_region(&region, "make");
+    let ffi_rs = e2e_support::ffi_app::package_module("demo", &region);
 
     let dir =
         ipe_test_temp::temp_root().join(format!("ipe_ffi_struct_seal_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("src")).expect("mkdir");
-    std::fs::write(
-        dir.join("Cargo.toml"),
-        "[package]\nname = \"struct_seal\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
-         [[bin]]\nname = \"struct_seal\"\npath = \"src/main.rs\"\n",
-    )
-    .expect("Cargo.toml");
+    let main_rs = r#"use ffi::demo::Counter;
 
-    let main_rs = format!(
-        r#"// A tiny "crate" fn that consumes the Ipê-defined type and reads a
+// A tiny "crate" fn that consumes the Ipê-defined type and reads a
 // field back — the exact shape a Bevy `Resource` / Iced `Model` would.
-fn crate_reads_value(c: &Counter) -> i64 {{ c.value }}
+fn crate_reads_value(c: &Counter) -> i64 { c.value }
 
-{make}
-
-fn main() {{
+fn main() {
     // The Ipê-side constructor builds the nominal Rust type from an inbound
     // value; the derived `Default`/`Clone` and the field read all resolve.
-    let c = demo_make(41);
+    let c = ffi::demo_make(41);
     let c2 = c.clone();
     let d = Counter::default();
     assert_eq!(crate_reads_value(&c), 41, "field round-trip");
     assert_eq!(crate_reads_value(&c2), 41, "derived Clone round-trip");
     assert_eq!(crate_reads_value(&d), 0, "derived Default is zero");
-    println!("{{}} {{}}", c.value + 1, d.value);
-}}
-"#,
-    );
-    std::fs::write(dir.join("src").join("main.rs"), main_rs).expect("main.rs");
+    println!("{} {}", c.value + 1, d.value);
+}
+"#;
+    e2e_support::ffi_app::FfiApp {
+        name: "struct_seal",
+        runtime_features: &[],
+        dependencies: &[],
+        ffi_rs: &ffi_rs,
+        main_rs,
+    }
+    .write(&dir)
+    .expect("the app crate is written");
 
     let ran = e2e_support::build_and_run_rust("ffi_define_struct", &dir);
     assert!(
@@ -172,26 +170,4 @@ fn main() {{
         "the constructed struct's field must round-trip.\nstdout: {stdout}"
     );
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Extract the sentinel-bracketed wrapper region for `ref_name` from an emitted
-/// `_bindings.rs`, without the preamble.
-fn wrapper_region(bindings: &str, ref_name: &str) -> String {
-    let begin = format!("// IPE-FFI-WRAPPER BEGIN {ref_name}");
-    let mut keep = false;
-    let mut out = String::new();
-    for line in bindings.lines() {
-        if line.trim_end() == begin {
-            keep = true;
-            continue;
-        }
-        if line.trim_end() == "// IPE-FFI-WRAPPER END" && keep {
-            break;
-        }
-        if keep {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out
 }
