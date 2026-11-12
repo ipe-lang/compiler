@@ -2386,8 +2386,28 @@ fn let_bound_live_app_cfg_is_unsupported() -> DResult<()> {
         body,
         ty: con_int(&mut i)?, // body type is irrelevant to the intercept
     };
+    // The checker records the reference's instance; its `update : Int -> Int -> _`
+    // pins both of `Web.tea`'s runtime-bound vars to `Int`, so the bound check
+    // passes and the cfg intercept is what refuses.
+    let update = i.intern("update")?;
+    let int = ty_int(&mut i)?;
+    let update_ty = Ty::Fun(
+        Box::new(int.clone()),
+        Box::new(Ty::Fun(Box::new(int.clone()), Box::new(int.clone()))),
+    );
+    let cfg_ty = Ty::Record(
+        BTreeMap::from([(update, update_ty)]),
+        ipe_types::RowTail::Closed,
+    );
+    let regions = BTreeMap::from([
+        (
+            Span::new(10, 18),
+            Ty::Fun(Box::new(cfg_ty.clone()), Box::new(int)),
+        ),
+        (arg_span, cfg_ty),
+    ]);
     assert_unsupported(
-        run(Vec::new(), vec![def], BTreeMap::new(), &mut i),
+        run_with_regions(Vec::new(), vec![def], BTreeMap::new(), regions, &mut i),
         Feature::LetBoundAppCfg,
         IPE_L0119,
         arg_span,

@@ -401,6 +401,53 @@ main =
     assert_l0164("user_generic_forwarded_then_concrete", &src);
 }
 
+/// The prelude of the `Ipe.Parser` operator fixtures: `a |= b` desugars to
+/// `Ipe.Parser.ignore a b`, whose head carries the call's own span.
+const PARSER_HEAD: &str = "module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.Parser as Parser exposing (Parser)
+import Ipe.String as String
+
+";
+
+#[test]
+fn parser_operator_task_instance_refused() {
+    let src = format!(
+        "{PARSER_HEAD}taskAfterComma : Parser (Task Error ())
+taskAfterComma =
+    Parser.symbol \",\" |= Parser.succeed (Io.println \"x\")
+
+
+main : Task Error ()
+main =
+    Io.println \"x\"
+"
+    );
+    assert_l0164("parser_operator_task_instance", &src);
+}
+
+#[test]
+fn parser_operator_concrete_instance_builds() {
+    let src = format!(
+        "{PARSER_HEAD}commaThenInt : Parser Int
+commaThenInt =
+    Parser.symbol \",\" |= Parser.int
+
+
+main : Task Error ()
+main =
+    case Parser.run commaThenInt \",42\" of
+        Ok n ->
+            Io.println (String.fromInt n)
+
+        Err _ ->
+            Io.println \"no parse\"
+"
+    );
+    assert_accepted("parser_operator_concrete_instance", &src, "42");
+}
+
 #[test]
 fn task_equality_refused() {
     let src = program(

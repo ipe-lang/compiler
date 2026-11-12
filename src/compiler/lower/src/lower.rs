@@ -12254,6 +12254,12 @@ pub struct Lowerer<'a> {
     /// carrier. Recorded by [`Self::reject_unmet_kernel_bounds`]; one left
     /// when its def is lowered is refused (IPE-L0164).
     pending_shared_fns: std::cell::RefCell<Vec<PendingSharedFn>>,
+    /// The solved type of each call head whose span is its call's own, keyed
+    /// like the region map. The region map holds one type per span, the
+    /// call's result, so the head's instance is rebuilt from the call's
+    /// argument and result regions ([`Self::note_span_shared_head`]); `None`
+    /// when one of those regions is missing. Read by [`Self::callee_ty`].
+    span_shared_heads: std::cell::RefCell<BTreeMap<(Vec<Symbol>, Span), Option<Ty>>>,
     /// A `let`-bound local that names a top-level function, mapped to that
     /// function's `(module, name)` key — a point-free alias `let w = wrap`.
     ///
@@ -14500,6 +14506,7 @@ impl<'a> Lowerer<'a> {
             recorded_bounds: std::cell::RefCell::new(BTreeMap::new()),
             callee_instances: std::cell::RefCell::new(Vec::new()),
             pending_shared_fns: std::cell::RefCell::new(Vec::new()),
+            span_shared_heads: std::cell::RefCell::new(BTreeMap::new()),
             toplevel_fn_aliases: std::cell::RefCell::new(BTreeMap::new()),
             local_string_literals: std::cell::RefCell::new(BTreeMap::new()),
             literal_fold_budget: Cell::new(LITERAL_FOLD_BUDGET),
@@ -14936,6 +14943,46 @@ impl<'a> Lowerer<'a> {
     fn region_ty(&self, span: Span) -> Option<&Ty> {
         let home = self.current_home.borrow().clone();
         self.types.regions.get(&(home, span))
+    }
+
+    /// The solved type of the callee reference at `span`.
+    ///
+    /// The reference's own region type, unless the reference heads a call
+    /// that shares its span ([`Self::note_span_shared_head`]): that region is
+    /// the call's result, so the head's rebuilt type is read instead, and
+    /// `None` when it could not be rebuilt.
+    fn callee_ty(&self, span: Span) -> Option<std::borrow::Cow<'_, Ty>> {
+        let home = self.current_home.borrow().clone();
+        if let Some(rebuilt) = self.span_shared_heads.borrow().get(&(home, span)) {
+            return rebuilt.clone().map(std::borrow::Cow::Owned);
+        }
+        self.region_ty(span).map(std::borrow::Cow::Borrowed)
+    }
+
+    /// Record the solved type of `callee` when it heads a call sharing its span.
+    ///
+    /// A desugared call (`a |= b` to `Ipe.Parser.ignore a b`) gives its head
+    /// the call's own span, so the region map's entry there is the call's
+    /// result and the head's instantiation is lost. The type checker equates
+    /// the head with `arg_1 -> ... -> arg_n -> result`, so that arrow, built
+    /// from each argument's region and the call's, is the head's solved type.
+    /// A missing region records `None`, which every reader refuses.
+    fn note_span_shared_head(&self, callee: &canon::Expr, args: &[canon::Expr], call_span: Span) {
+        if callee.span != call_span {
+            return;
+        }
+        let rebuild = || {
+            let mut ty = self.region_ty(call_span)?.clone();
+            for arg in args.iter().rev() {
+                ty = Ty::Fun(Box::new(self.region_ty(arg.span)?.clone()), Box::new(ty));
+            }
+            Some(ty)
+        };
+        let rebuilt = rebuild();
+        let home = self.current_home.borrow().clone();
+        self.span_shared_heads
+            .borrow_mut()
+            .insert((home, call_span), rebuilt);
     }
 
     /// Refuse (IPE-L0135) an alias at `span` whose binding `inner` would share a non-`Clone` part.
@@ -24051,8 +24098,8 @@ impl<'a> Lowerer<'a> {
         if results.is_empty() {
             return Ok(());
         }
-        let (Some(shape), Some(solved)) = (kernel.scheme_shape(), self.region_ty(callee.span))
-        else {
+        let solved = self.callee_ty(callee.span);
+        let (Some(shape), Some(solved)) = (kernel.scheme_shape(), solved.as_deref()) else {
             return Err(unsupported(callee.span, Feature::HofCallbackFunctionResult));
         };
         let heads = SchemeHeads {
@@ -24091,8 +24138,8 @@ impl<'a> Lowerer<'a> {
         let Some(state_var) = kernel.plain_data_scheme_var() else {
             return Ok(());
         };
-        let (Some(shape), Some(solved)) = (kernel.scheme_shape(), self.region_ty(callee.span))
-        else {
+        let solved = self.callee_ty(callee.span);
+        let (Some(shape), Some(solved)) = (kernel.scheme_shape(), solved.as_deref()) else {
             return Err(unsupported(callee.span, Feature::TaskLoopFunctionState));
         };
         let heads = SchemeHeads {
@@ -24379,6 +24426,7 @@ impl<'a> Lowerer<'a> {
         // A Set / Dict produced by inference (no annotation driving an
         // `ir_type_from_ty` conversion) is gated here on its own region type.
         self.reject_float_keyed_collection(call_span)?;
+        self.note_span_shared_head(callee, args, call_span);
 
         // Flatten a curried call spine ONLY when its head is a kernel whose
         // gate must observe the SATURATED call: an accessor-intercept
@@ -24452,6 +24500,7 @@ impl<'a> Lowerer<'a> {
         let mut head = callee;
         let mut offset = 0_usize;
         while let canon::Expr_::Call(inner, inner_args) = &head.value {
+            self.note_span_shared_head(inner, inner_args, head.span);
             offset = offset.saturating_add(inner_args.len());
             head = inner;
         }
@@ -30492,7 +30541,8 @@ impl<'a> Lowerer<'a> {
             builtins: &self.builtins.kernel_types,
             interner: self.interner,
         };
-        let solved = self.region_ty(span);
+        let solved = self.callee_ty(span);
+        let solved = solved.as_deref();
         let env = self.clone_env();
         let refuse = |demand: CalleeDemand, leaf: Box<str>| {
             instance_bounds::callee_bound_unmet(span, app_entry_name(kernel), demand, leaf)
@@ -30568,7 +30618,8 @@ impl<'a> Lowerer<'a> {
         let mut params = Vec::new();
         let mut tails = Vec::new();
         // Bounded by the solved type's own arrow depth.
-        let mut cur = self.region_ty(span);
+        let solved = self.callee_ty(span);
+        let mut cur = solved.as_deref();
         while let Some(t) = cur {
             tails.push(slot(t));
             cur = match t {
@@ -30634,7 +30685,7 @@ impl<'a> Lowerer<'a> {
                 GenericAppEntryReach::Undetermined,
             ));
         }
-        if self.region_ty(span).is_some_and(|ty| !ty_is_ground(ty)) {
+        if self.callee_ty(span).is_some_and(|ty| !ty_is_ground(&ty)) {
             return Err(Diagnostic::Name {
                 span,
                 msg: NameError::UnpinnedAppEntry {
@@ -30826,7 +30877,8 @@ impl<'a> Lowerer<'a> {
         if poly.is_empty() {
             return;
         }
-        let solved = self.region_ty(span);
+        let solved = self.callee_ty(span);
+        let solved = solved.as_deref();
         // A missing region type yields no parameters and no instantiations, so
         // every listed entry falls to the fail-closed arm below.
         let arg_tys: Vec<&Ty> = solved.map(arrow_params).unwrap_or_default();
@@ -30903,7 +30955,7 @@ impl<'a> Lowerer<'a> {
         if poly.is_empty() {
             return;
         }
-        let obliged: Vec<Symbol> = self.region_ty(span).map_or_else(
+        let obliged: Vec<Symbol> = self.callee_ty(span).as_deref().map_or_else(
             || poly.iter().copied().collect(),
             |solved| {
                 self.ir_type_from_ty(solved, span).map_or_else(
@@ -37015,11 +37067,13 @@ mod tests {
             // No region is recorded here, so the gated funnel must refuse every
             // higher-order kernel (no solved type proves its callback results
             // non-functional) and every plain-data-state kernel (no solved type
-            // proves its state function-free), and pass every other kernel
-            // through unchanged.
+            // proves its state function-free), every kernel with a runtime-bound
+            // row (no solved type proves its instance meets the bound), and
+            // pass every other kernel through unchanged.
             let gated = lowerer.lower_callee(&node).ok();
             let expected = (sk.hof_result_vars().is_empty()
-                && sk.plain_data_scheme_var().is_none())
+                && sk.plain_data_scheme_var().is_none()
+                && sk.runtime_bounds().is_empty())
             .then_some(Callee::Kernel(sk));
             assert_eq!(
                 gated, expected,
