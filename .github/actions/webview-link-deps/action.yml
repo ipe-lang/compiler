@@ -1,0 +1,37 @@
+name: Install the webview link deps
+description: >-
+  Install the GLib/GTK/WebKitGTK development packages that wry and tao build
+  and link against, so a webview build script finds them through pkg-config.
+  This is the one place a job installs them. The `-dev` packages pull in the
+  WebKitGTK/GStreamer runtime libraries as hard dependencies, a download that
+  varies from seconds to tens of minutes with the mirror. The fetched archives
+  are cached (only `main` saves, as everywhere else) so a restored run installs
+  from disk and only a cold or stale cache pays the mirror; the install goes
+  through the `apt-install` action, whose bounded attempts keep even that case
+  inside the job budget.
+
+runs:
+  using: composite
+  steps:
+    - name: Identify the runner image
+      id: apt-image
+      shell: bash
+      run: echo "image=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+    - name: Restore webview link dep archives
+      id: apt-cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      with:
+        path: ${{ runner.temp }}/apt-archives
+        key: ${{ runner.os }}-${{ runner.arch }}-apt-webview-${{ steps.apt-image.outputs.image }}
+    - name: Install webview link deps (wry/tao — GLib/GTK/WebKit)
+      uses: ./.github/actions/apt-install
+      with:
+        packages: libwebkit2gtk-4.1-dev libsoup-3.0-dev
+        archives: ${{ runner.temp }}/apt-archives
+        no-install-recommends: "true"
+    - name: Save webview link dep archives
+      if: github.ref == 'refs/heads/main' && steps.apt-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      with:
+        path: ${{ runner.temp }}/apt-archives
+        key: ${{ steps.apt-cache.outputs.cache-primary-key }}

@@ -164,7 +164,7 @@ fn a_borrowed_return_fn_over_drops_with_a_diagnostic() {
 
 /// The load-bearing SEAL proof: under `IPE_E2E=1`, assemble a real wrapper crate
 /// plus an app crate that depends on it by `path` and contains the emitted
-/// wrapper regions, then build and run it. `ipe` exit 0 ⇒ this crate compiles;
+/// bindings, then build and run it. `ipe` exit 0 ⇒ this crate compiles;
 /// the run asserts the constructor and reader round-trip through the wrapper.
 #[test]
 fn the_emitted_crate_and_wrapper_path_dep_build_and_run() {
@@ -202,68 +202,33 @@ fn the_emitted_crate_and_wrapper_path_dep_build_and_run() {
         "the wrapper renders as a path dependency: {dep_lines:?}"
     );
     let bindings = emit_bindings(&pkg);
-    let make = wrapper_region(&bindings, "make");
-    let describe = wrapper_region(&bindings, "describe");
+    let ffi_rs = e2e_support::ffi_app::package_module("engine_wrap", &bindings);
 
-    // The emitted app crate aliases each opaque foreign type to its wrapper-crate
-    // path, exactly as the backend does from the interface's opaque-type map. The
-    // wrapper regions reference the bare nominal (`Engine`); the alias resolves it.
-    let iface = crate_interface(&pkg);
-    let mut aliases = String::new();
-    for (name, path) in &iface.opaque_types {
-        use std::fmt::Write as _;
-        let _ = writeln!(aliases, "pub type {name} = {path};");
-    }
-
-    std::fs::create_dir_all(root.join("src")).expect("mkdir app");
-    std::fs::write(
-        root.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"wrapper_seal\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
-             [[bin]]\nname = \"wrapper_seal\"\npath = \"src/main.rs\"\n\
-             [dependencies]\n{}\n",
-            dep_lines.join("\n")
-        ),
-    )
-    .expect("app Cargo.toml");
-
-    // Minimal runtime glue the emitted pure-plain wrappers reference
-    // (`IpeResult`, `IpeError`, `ok_res`, `str_err`) — a stand-in for the
-    // vendored `use crate::*;`.
-    let main_rs = format!(
-        r#"#![allow(unused_imports, unused_mut, dead_code)]
-pub enum IpeResult<E, T> {{ Ok(T), Err(E) }}
-pub struct IpeError(String);
-pub fn ok_res<T>(t: T) -> IpeResult<IpeError, T> {{ IpeResult::Ok(t) }}
-pub fn str_err(s: &str) -> IpeError {{ IpeError(s.to_string()) }}
-pub fn ipe_error_from_panic(c: &str, _p: Box<dyn std::any::Any + Send>) -> IpeError {{ IpeError(c.to_string()) }}
-pub fn note_foreign_panic(_c: &str, _p: Box<dyn std::any::Any + Send>) -> String {{ String::new() }}
-pub fn note_foreign_error<T: std::fmt::Debug>(_e: T) -> String {{ String::new() }}
-pub fn ipe_error_from_foreign<T: std::fmt::Debug>(_e: T) -> IpeError {{ IpeError("external operation failed".to_string()) }}
-
-// Opaque foreign-type aliases the backend emits from the interface map.
-{aliases}
-
-{make}
-
-{describe}
-
-#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
-fn main() {{
+    // The bindings name the wrapper crate's opaque `Engine` at its
+    // crate-absolute path, so the app's own code needs no alias.
+    let main_rs = r#"#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
+fn main() {
     // The constructor builds a real wrapper-crate value; the reader consumes it.
-    let engine = match engine_wrap_make(7) {{
+    let engine = match ffi::engine_wrap_make(7) {
         IpeResult::Ok(e) => e,
         IpeResult::Err(_) => panic!("make failed"),
-    }};
-    let text = match engine_wrap_describe(engine) {{
+    };
+    let text = match ffi::engine_wrap_describe(engine) {
         IpeResult::Ok(s) => s,
         IpeResult::Err(_) => panic!("describe failed"),
-    }};
-    println!("{{}}", text);
-}}
-"#,
-    );
-    std::fs::write(root.join("src").join("main.rs"), main_rs).expect("app main.rs");
+    };
+    println!("{}", text);
+}
+"#;
+    e2e_support::ffi_app::FfiApp {
+        name: "wrapper_seal",
+        runtime_features: &[],
+        dependencies: &dep_lines,
+        ffi_rs: &ffi_rs,
+        main_rs,
+    }
+    .write(&root)
+    .expect("the app crate is written");
 
     let ran = e2e_support::build_and_run_rust("ffi_wrapper_crate", &root);
     assert!(
@@ -284,26 +249,4 @@ fn main() {{
         "the value must round-trip through the wrapper crate.\nstdout: {stdout}"
     );
     let _ = std::fs::remove_dir_all(&root);
-}
-
-/// Extract the sentinel-bracketed wrapper region for `ref_name` from an emitted
-/// `_bindings.rs`, without the preamble.
-fn wrapper_region(bindings: &str, ref_name: &str) -> String {
-    let begin = format!("// IPE-FFI-WRAPPER BEGIN {ref_name}");
-    let mut keep = false;
-    let mut out = String::new();
-    for line in bindings.lines() {
-        if line.trim_end() == begin {
-            keep = true;
-            continue;
-        }
-        if line.trim_end() == "// IPE-FFI-WRAPPER END" && keep {
-            break;
-        }
-        if keep {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out
 }

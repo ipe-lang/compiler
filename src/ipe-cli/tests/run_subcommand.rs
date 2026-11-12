@@ -106,13 +106,13 @@ fn run_subcommand_builds_and_executes_hello_program() {
             panic!("isolated build target: {isolated:?}")
         };
         let target = e2e_support::target::BuildTarget::Isolated(isolated);
-        let cargo_status = e2e_support::target::cargo_command(&target)
-            .arg("build")
-            .current_dir(&out_dir)
-            .status();
+        // The checked build refuses a cargo failure and any warning from the
+        // runtime or the app crate, so a warning-bearing build fails the SEAL.
+        let cargo_build =
+            e2e_support::build_project_checked("run_subcommand_hello", &out_dir, &target);
         assert!(
-            matches!(&cargo_status, Ok(s) if s.success()),
-            "cargo build on emitted project must succeed: {cargo_status:?}"
+            cargo_build.is_ok(),
+            "cargo build on emitted project must succeed without warnings: {cargo_build:?}"
         );
 
         // --- Step 3: run the binary, capture stdout ---

@@ -641,6 +641,49 @@ jobs:
       # `Db` is one, and every other test compiles against the PostgreSQL `Db`.
       - run: cargo clippy -p ipe-runtime-rust --no-default-features --features db-postgres --all-targets -- -D warnings
       - run: cargo clippy -p ipe-runtime-rust --features full,db-postgres --all-targets -- -D warnings
+      # The native feature sets the backend selects, one leg each, with no
+      # default features: every surface alone, each database driver, and each
+      # dev-loop build mode. A runtime warning that fires only under one set
+      # would otherwise reach the emitted build's output. The set list is
+      # pinned by `native_featureset_closure`, which reads the backend's
+      # feature selection and prints any leg a new feature set needs.
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,random --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,crypto-core,encoding,random,server,uuid --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,crypto-core,encoding,json,random,server,time-core,uuid,web --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,random,tui --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features tui --all-targets -- -D warnings
+      # The webview leg builds glib-sys/gobject-sys, whose build scripts need the
+      # GLib/GTK/WebKit pkg-config files.
+      - uses: ./.github/actions/webview-link-deps
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,crypto-core,encoding,json,random,time-core,uuid,webview --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features crypto-core,encoding,json,jwt,secret,uuid --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,random,url,websocket_client --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,crypto-core,email,encoding,http_client,random,url --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features locale --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features time-core --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,encoding,http_client,random,url --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features config,json --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features compression --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features csv_kernel --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features cache_kernel --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features encoding --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features regex --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features uuid --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features random --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features log,time-core --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features decimal --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features char-category --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features crypto-core --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features crypto-core,secret --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features json --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features crypto,crypto-core,encoding --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features url --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,crypto-core,db-sqlite,decimal,encoding,json,random,time-core,url --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,crypto-core,db-postgres,decimal,encoding,json,random,time-core,url --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features dev-posture --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features debugger,dev-posture --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,control-wire,dev-posture,random,tui --all-targets -- -D warnings
 
   # Required context for `runtime-feature-combos-run`: the phase verdict (see the header).
   runtime-feature-combos:
@@ -1487,34 +1530,7 @@ jobs:
       # cargo tries to link the emitted Webview project — pkg-config cannot find
       # gobject-2.0 and the build exits non-zero (THE SEAL breach in CI only,
       # not in the emitter).
-      # The `-dev` packages pull in the WebKitGTK/GStreamer runtime libraries as
-      # hard dependencies, a download that varies from seconds to tens of
-      # minutes with the mirror. The fetched archives are cached (only `main`
-      # saves, as everywhere else) so a restored run installs from disk and only
-      # a cold or stale cache pays the mirror; the step ceiling keeps even that
-      # case inside the job budget.
-      - name: Identify the runner image
-        id: apt-image
-        run: echo "image=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
-      - name: Restore webview link dep archives
-        id: apt-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: ${{ runner.temp }}/apt-archives
-          key: ${{ runner.os }}-${{ runner.arch }}-apt-webview-${{ steps.apt-image.outputs.image }}
-      - name: Install webview link deps (wry/tao — GLib/GTK/WebKit)
-        timeout-minutes: 20
-        uses: ./.github/actions/apt-install
-        with:
-          packages: libwebkit2gtk-4.1-dev libsoup-3.0-dev
-          archives: ${{ runner.temp }}/apt-archives
-          no-install-recommends: "true"
-      - name: Save webview link dep archives
-        if: github.ref == 'refs/heads/main' && steps.apt-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: ${{ runner.temp }}/apt-archives
-          key: ${{ steps.apt-cache.outputs.cache-primary-key }}
+      - uses: ./.github/actions/webview-link-deps
       # Refuse a runner that cannot hold the shard's bounded peak before any
       # test runs (`e2e_shard.py` `DISK_FLOOR_BYTES`, summed from its terms).
       - name: Check the shard's disk floor

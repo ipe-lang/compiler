@@ -128,165 +128,81 @@ fn an_async_total_return_over_drops() {
 /// the future round-trips, a poll-panic folds to `Err`, and cancellation aborts
 /// the inner task (no side effect after drop).
 #[test]
-#[allow(clippy::too_many_lines)] // one linear E2E-crate assembly (manifest + runtime-glue stand-in + driver + build/run); splitting would scatter the fixture
 fn async_closure_adapter_builds_and_runs() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let result_region = emit_async_closure(
-        "Fn(Int) -> impl Future<Output = Result<Int, Error>> + Send + Sync + 'static",
+    // One module per return shape: each holds the whole emitted bindings, so
+    // both `demo_handler_fn` adapters coexist without renaming.
+    let ffi_rs = format!(
+        "pub mod result {{\n{}}}\npub mod option {{\n{}}}\n",
+        emit_async_closure(
+            "Fn(Int) -> impl Future<Output = Result<Int, Error>> + Send + Sync + 'static",
+        ),
+        emit_async_closure("Fn(Int) -> impl Future<Output = Option<Int>> + Send + Sync + 'static"),
     );
-    let result_fn = wrapper_region(&result_region, "handler_fn");
-    let option_region =
-        emit_async_closure("Fn(Int) -> impl Future<Output = Option<Int>> + Send + Sync + 'static");
-    let option_fn = wrapper_region(&option_region, "handler_fn")
-        .replace("pub fn demo_handler_fn(", "pub fn demo_handler_fn_option(")
-        .replace("HandlerFnClosure", "HandlerFnClosureOption");
 
     let dir = ipe_test_temp::temp_root()
         .join(format!("ipe_ffi_async_closure_seal_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("src")).expect("mkdir");
-    std::fs::write(
-        dir.join("Cargo.toml"),
-        "[package]\nname = \"async_closure_seal\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
-         [[bin]]\nname = \"async_closure_seal\"\npath = \"src/main.rs\"\n\
-         [dependencies]\ntokio = { version = \"1\", features = [\"rt\", \"rt-multi-thread\", \"macros\", \"time\"] }\n\
-         # catch_unwind soundness requires panic=unwind (the emitter's own fence)\n\
-         [profile.dev]\npanic = \"unwind\"\n",
-    )
-    .expect("Cargo.toml");
+    let main_rs = r#"use std::future::Future;
+use std::pin::Pin;
 
-    // A minimal stand-in for the runtime glue the emitted async adapter names
-    // (`str_err`, `IpeError`, and the `AbortOnDrop` cancel guard). These mirror
-    // `ipe_runtime`'s real definitions; the fixture supplies its own so it need
-    // not depend on the whole runtime crate.
-    let main_rs = format!(
-        r#"use std::pin::Pin;
-use std::future::Future;
-
-#[derive(Debug)]
-pub struct IpeError(String);
-pub fn str_err<E: From<String>>(s: &str) -> E {{ s.to_string().into() }}
-pub fn ipe_error_from_panic<E: From<String>>(c: &str, _p: Box<dyn std::any::Any + Send>) -> E {{ c.to_string().into() }}
-pub fn note_foreign_panic(_c: &str, _p: Box<dyn std::any::Any + Send>) -> String {{ String::new() }}
-pub fn note_foreign_error<T: std::fmt::Debug>(_e: T) -> String {{ String::new() }}
-pub fn ipe_error_from_foreign<T: std::fmt::Debug, E: From<String>>(_e: T) -> E {{ "external operation failed".to_string().into() }}
-impl From<String> for IpeError {{ fn from(s: String) -> Self {{ IpeError(s) }} }}
-#[derive(Debug, Clone, Copy)]
-pub struct RuntimeTrip;
-pub enum ClosureUnwind {{ Trip(RuntimeTrip), Foreign(Box<dyn std::any::Any + Send>) }}
-pub fn closure_unwind(p: Box<dyn std::any::Any + Send>) -> ClosureUnwind {{
-    match p.downcast::<RuntimeTrip>() {{ Ok(t) => ClosureUnwind::Trip(*t), Err(p) => ClosureUnwind::Foreign(p) }}
-}}
-pub fn end_on_unchanneled_unwind(_c: &'static str, _u: ClosureUnwind) -> ! {{ std::process::exit(1) }}
-
-// The cancel guard the emitted async adapter arms around its spawned task: its
-// Drop aborts the inner task unless defused (matches `ipe_runtime::AbortOnDrop`).
-pub struct AbortOnDrop(Option<tokio::task::AbortHandle>);
-impl AbortOnDrop {{
-    pub fn new(h: tokio::task::AbortHandle) -> Self {{ Self(Some(h)) }}
-    pub fn defuse(mut self) {{ self.0 = None; }}
-}}
-impl Drop for AbortOnDrop {{
-    fn drop(&mut self) {{ if let Some(h) = self.0.take() {{ h.abort(); }} }}
-}}
-
-// The single spawn choke-point the emitted async adapter routes through: spawn
-// the foreign future, arm the cancel guard, await, defuse, funnel the JoinError
-// (matches `ipe_runtime::ffi_spawn_guarded`). Spawn + arm are one step here too.
-pub async fn ffi_spawn_guarded<F>(future: F) -> Result<F::Output, IpeError>
-where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
-{{
-    let handle = tokio::task::spawn(future);
-    let guard = AbortOnDrop::new(handle.abort_handle());
-    let joined = handle.await;
-    guard.defuse();
-    match joined {{
-        Ok(output) => Ok(output),
-        Err(join_err) => match join_err.try_into_panic() {{
-            Ok(payload) => Err(ipe_error_from_panic("foreign async task panicked", payload)),
-            Err(join_err) => Err(ipe_error_from_foreign(join_err)),
-        }},
-    }}
-}}
-
-// The `Option`-shape join (matches `ipe_runtime::ffi_spawn_guarded_unchanneled`):
-// a trip ends the process typed; a foreign panic or a cancel is `None`.
-pub async fn ffi_spawn_guarded_unchanneled<F, T>(future: F) -> Option<T>
-where
-    F: Future<Output = Option<T>> + Send + 'static,
-    T: Send + 'static,
-{{
-    let handle = tokio::task::spawn(future);
-    let guard = AbortOnDrop::new(handle.abort_handle());
-    let joined = handle.await;
-    guard.defuse();
-    match joined {{
-        Ok(output) => output,
-        Err(join_err) => match join_err.try_into_panic() {{
-            Ok(payload) => match closure_unwind(payload) {{
-                ClosureUnwind::Trip(t) => end_on_unchanneled_unwind("foreign async closure tripped", ClosureUnwind::Trip(t)),
-                ClosureUnwind::Foreign(p) => {{ note_foreign_panic("foreign async task panicked", p); None }}
-            }},
-            Err(join_err) => {{ note_foreign_error(join_err); None }}
-        }},
-    }}
-}}
+/// The app-side shape of an Ipê async function value.
+type AsyncFn<R> = Box<dyn Fn(i64) -> Pin<Box<dyn Future<Output = R> + Send + 'static>> + Send + Sync + 'static>;
 
 // A tiny async "crate" that takes the boxed handler the adapter returns and
 // awaits it — the exact shape an Axum/Hyper route handler driver would.
-async fn crate_awaits(
-    f: Box<dyn Fn(i64) -> Pin<Box<dyn Future<Output = Result<i64, IpeError>> + Send + 'static>> + Send + Sync + 'static>,
-) -> i64 {{
+async fn crate_awaits(f: AsyncFn<Result<i64, IpeError>>) -> i64 {
     // Multi-call: the boxed handler fires more than once.
     let a = f(20).await.unwrap_or(-1);
     let b = f(22).await.unwrap_or(-1);
     a + b
-}}
+}
 
-{result_fn}
-
-{option_fn}
-
-#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
-fn main() {{
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(async {{
+fn main() {
+    let Ok(rt) = tokio::runtime::Runtime::new() else {
+        std::process::exit(2);
+    };
+    rt.block_on(async {
         // The Ipê async fn value: on the app side, exactly a boxed `Fn` whose
         // return is the concrete `IpeTask`-shaped boxed future.
-        let ipe_ok: Box<dyn Fn(i64) -> Pin<Box<dyn Future<Output = Result<i64, IpeError>> + Send + 'static>> + Send + Sync + 'static> =
-            Box::new(|x| Box::pin(async move {{ Ok(x + 1) }}));
-        let adapted = demo_handler_fn(ipe_ok);
-        let summed = crate_awaits(adapted).await; // (20+1) + (22+1) = 43
+        let ipe_ok: AsyncFn<Result<i64, IpeError>> =
+            Box::new(|x| Box::pin(async move { Ok(x + 1) }));
+        let summed = crate_awaits(ffi::result::demo_handler_fn(ipe_ok)).await; // (20+1) + (22+1) = 43
 
         // A handler whose future PANICS while polling must fold to Err (the
         // spawned-await JoinError arm), never abort the whole executor.
-        let ipe_panics: Box<dyn Fn(i64) -> Pin<Box<dyn Future<Output = Result<i64, IpeError>> + Send + 'static>> + Send + Sync + 'static> =
-            Box::new(|_| Box::pin(async move {{ panic!("boom in the future") }}));
-        let adapted_panic = demo_handler_fn(ipe_panics);
-        let folded = adapted_panic(1).await.map(|_| 0).unwrap_or(-7);
+        let ipe_panics: AsyncFn<Result<i64, IpeError>> =
+            Box::new(|_| Box::pin(async move { panic!("boom in the future") }));
+        let folded = ffi::result::demo_handler_fn(ipe_panics)(1).await.map(|_| 0).unwrap_or(-7);
 
         // The `Option` shape round-trips, and a foreign poll-panic is `None`.
-        let ipe_opt: Box<dyn Fn(i64) -> Pin<Box<dyn Future<Output = Option<i64>> + Send + 'static>> + Send + Sync + 'static> =
-            Box::new(|x| Box::pin(async move {{ Some(x * 3) }}));
-        let tripled = demo_handler_fn_option(ipe_opt)(5).await.unwrap_or(-1);
-        let ipe_opt_panics: Box<dyn Fn(i64) -> Pin<Box<dyn Future<Output = Option<i64>> + Send + 'static>> + Send + Sync + 'static> =
-            Box::new(|_| Box::pin(async move {{ panic!("foreign boom") }}));
-        let none = demo_handler_fn_option(ipe_opt_panics)(1).await.unwrap_or(-9);
+        let ipe_opt: AsyncFn<Option<i64>> = Box::new(|x| Box::pin(async move { Some(x * 3) }));
+        let tripled = ffi::option::demo_handler_fn(ipe_opt)(5).await.unwrap_or(-1);
+        let ipe_opt_panics: AsyncFn<Option<i64>> =
+            Box::new(|_| Box::pin(async move { panic!("foreign boom") }));
+        let none = ffi::option::demo_handler_fn(ipe_opt_panics)(1).await.unwrap_or(-9);
         assert_eq!(tripled, 15, "async option closure round-trips");
         assert_eq!(none, -9, "a foreign poll-panic folds to None");
 
         assert_eq!(summed, 44, "async closure round-trips its awaited value");
         assert_eq!(folded, -7, "a poll-panic folds to Err, never aborts the executor");
-        println!("{{summed}} {{folded}}");
-    }});
-}}
-"#,
-    );
-    std::fs::write(dir.join("src").join("main.rs"), main_rs).expect("main.rs");
+        println!("{summed} {folded}");
+    });
+}
+"#;
+    let tokio = "tokio = { version = \"1\", features = [\"rt\", \"rt-multi-thread\", \"macros\", \"time\"] }"
+        .to_owned();
+    e2e_support::ffi_app::FfiApp {
+        name: "async_closure_seal",
+        runtime_features: &["async"],
+        dependencies: &[tokio],
+        ffi_rs: &ffi_rs,
+        main_rs,
+    }
+    .write(&dir)
+    .expect("the app crate is written");
 
     let ran = e2e_support::build_and_run_rust("ffi_async_closure", &dir);
     assert!(
@@ -307,26 +223,4 @@ fn main() {{
         "the async closure must round-trip and fold a poll-panic to Err.\nstdout: {stdout}"
     );
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Extract the sentinel-bracketed wrapper region for `ref_name` from an emitted
-/// `_bindings.rs`, without the preamble.
-fn wrapper_region(bindings: &str, ref_name: &str) -> String {
-    let begin = format!("// IPE-FFI-WRAPPER BEGIN {ref_name}");
-    let mut keep = false;
-    let mut out = String::new();
-    for line in bindings.lines() {
-        if line.trim_end() == begin {
-            keep = true;
-            continue;
-        }
-        if line.trim_end() == "// IPE-FFI-WRAPPER END" && keep {
-            break;
-        }
-        if keep {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out
 }

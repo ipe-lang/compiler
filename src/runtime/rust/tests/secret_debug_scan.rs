@@ -315,38 +315,14 @@ const DEBUG_SITES: &[DebugSite] = &[
     },
     DebugSite {
         file: "rust/src/project.rs",
-        func: "compression_cargo_toml",
-        count: 1,
-        why: DIAGNOSTIC,
-    },
-    DebugSite {
-        file: "rust/src/project.rs",
-        func: "config_cargo_toml",
-        count: 1,
-        why: DIAGNOSTIC,
-    },
-    DebugSite {
-        file: "rust/src/project.rs",
-        func: "crypto_cargo_toml",
-        count: 1,
-        why: DIAGNOSTIC,
-    },
-    DebugSite {
-        file: "rust/src/project.rs",
         func: "crypto_core_heavy_cargo_toml",
         count: 2,
         why: DIAGNOSTIC,
     },
     DebugSite {
         file: "rust/src/project.rs",
-        func: "csv_cargo_toml",
-        count: 1,
-        why: DIAGNOSTIC,
-    },
-    DebugSite {
-        file: "rust/src/project.rs",
         func: "db_cargo_toml",
-        count: 2,
+        count: 1,
         why: DIAGNOSTIC,
     },
     DebugSite {
@@ -363,12 +339,6 @@ const DEBUG_SITES: &[DebugSite] = &[
     },
     DebugSite {
         file: "rust/src/project.rs",
-        func: "email_cargo_toml",
-        count: 1,
-        why: DIAGNOSTIC,
-    },
-    DebugSite {
-        file: "rust/src/project.rs",
         func: "emit_program",
         count: 1,
         why: DIAGNOSTIC,
@@ -376,18 +346,6 @@ const DEBUG_SITES: &[DebugSite] = &[
     DebugSite {
         file: "rust/src/project.rs",
         func: "emit_spine",
-        count: 1,
-        why: DIAGNOSTIC,
-    },
-    DebugSite {
-        file: "rust/src/project.rs",
-        func: "ffi_cargo_toml",
-        count: 1,
-        why: DIAGNOSTIC,
-    },
-    DebugSite {
-        file: "rust/src/project.rs",
-        func: "http_client_cargo_toml",
         count: 1,
         why: DIAGNOSTIC,
     },
@@ -405,14 +363,8 @@ const DEBUG_SITES: &[DebugSite] = &[
     },
     DebugSite {
         file: "rust/src/project.rs",
-        func: "jwt_cargo_toml",
-        count: 3,
-        why: DIAGNOSTIC,
-    },
-    DebugSite {
-        file: "rust/src/project.rs",
         func: "locale_cargo_toml",
-        count: 3,
+        count: 1,
         why: DIAGNOSTIC,
     },
     DebugSite {
@@ -441,12 +393,6 @@ const DEBUG_SITES: &[DebugSite] = &[
     },
     DebugSite {
         file: "rust/src/project.rs",
-        func: "server_cargo_toml",
-        count: 3,
-        why: DIAGNOSTIC,
-    },
-    DebugSite {
-        file: "rust/src/project.rs",
         func: "substitute_dep_manifest_anchors",
         count: 1,
         why: DIAGNOSTIC,
@@ -454,18 +400,12 @@ const DEBUG_SITES: &[DebugSite] = &[
     DebugSite {
         file: "rust/src/project.rs",
         func: "tui_cargo_toml",
-        count: 2,
-        why: DIAGNOSTIC,
-    },
-    DebugSite {
-        file: "rust/src/project.rs",
-        func: "unclassified_wrapper",
         count: 1,
         why: DIAGNOSTIC,
     },
     DebugSite {
         file: "rust/src/project.rs",
-        func: "url_cargo_toml",
+        func: "unclassified_wrapper",
         count: 1,
         why: DIAGNOSTIC,
     },
@@ -478,19 +418,19 @@ const DEBUG_SITES: &[DebugSite] = &[
     DebugSite {
         file: "rust/src/project.rs",
         func: "web_cargo_toml",
-        count: 2,
+        count: 1,
         why: DIAGNOSTIC,
     },
     DebugSite {
         file: "rust/src/project.rs",
         func: "websocket_cargo_toml",
-        count: 2,
+        count: 1,
         why: DIAGNOSTIC,
     },
     DebugSite {
         file: "rust/src/project.rs",
         func: "webview_cargo_toml",
-        count: 3,
+        count: 2,
         why: DIAGNOSTIC,
     },
     DebugSite {

@@ -338,39 +338,26 @@ fn opaque_field_and_payload_build_and_run() {
     // wrapped as the backend's `pub mod <slug>` region.
     let bindings = emit_bindings(&model_message_pkg());
     let slug = "demo";
-    let ffi_body = format!("pub mod {slug} {{\n{bindings}}}\npub use {slug}::*;\n");
+    let ffi_rs = e2e_support::ffi_app::package_module(slug, &bindings);
 
     let dir = ipe_test_temp::temp_root()
         .join(format!("ipe_ffi_opaque_field_seal_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("src")).expect("mkdir");
-    std::fs::write(
-        dir.join("Cargo.toml"),
-        "[package]\nname = \"opaque_field_seal\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
-         [[bin]]\nname = \"opaque_field_seal\"\npath = \"src/main.rs\"\n",
-    )
-    .expect("Cargo.toml");
-
-    let main_rs = format!(
-        r#"mod ffi {{
-    {ffi_body}
-}}
-
-use ffi::demo::{{Counter, Message, Model}};
+    let main_rs = r#"use ffi::demo::{Message, Model};
 
 // A tiny "crate" fn that consumes the Ipê-defined model + message — the exact
 // shape an Iced/TEA `update : Message -> Model -> Model` loop would.
-fn crate_update(model: Model, msg: Message) -> Model {{
-    match msg {{
+fn crate_update(model: Model, msg: Message) -> Model {
+    match msg {
         Message::Increment => ffi::demo_model_new(
             ffi::demo_counter_new(model.counter.value + 1),
             model.tick + 1,
         ),
         Message::SetCounter(c) => ffi::demo_model_new(c, model.tick + 1),
-    }}
-}}
+    }
+}
 
-fn main() {{
+fn main() {
     // The opaque field: a Model holds a Counter (a nominal defined in the same
     // crate), built through the emitted constructors.
     let m0: Model = ffi::demo_model_new(ffi::demo_counter_new(10), 0);
@@ -380,11 +367,18 @@ fn main() {{
     assert_eq!(m0.counter.value, 10, "opaque field round-trips");
     assert_eq!(m2.counter.value, 99, "opaque payload round-trips through update");
     assert_eq!(m2.tick, 2, "the scalar field advances alongside the opaque one");
-    println!("{{}} {{}}", m2.counter.value, m2.tick);
-}}
-"#
-    );
-    std::fs::write(dir.join("src").join("main.rs"), main_rs).expect("main.rs");
+    println!("{} {}", m2.counter.value, m2.tick);
+}
+"#;
+    e2e_support::ffi_app::FfiApp {
+        name: "opaque_field_seal",
+        runtime_features: &[],
+        dependencies: &[],
+        ffi_rs: &ffi_rs,
+        main_rs,
+    }
+    .write(&dir)
+    .expect("the app crate is written");
 
     let ran = e2e_support::build_and_run_rust("ffi_opaque_field", &dir);
     assert!(

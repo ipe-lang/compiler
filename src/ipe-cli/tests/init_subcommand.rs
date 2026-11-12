@@ -309,14 +309,15 @@ fn assert_scaffold_builds(
         panic!("[{tag}] isolated build target: {isolated:?}")
     };
     let build_target = e2e_support::target::BuildTarget::Isolated(isolated);
-    let cargo_status = e2e_support::target::cargo_command(&build_target)
-        .arg("build")
-        .current_dir(&out_dir)
-        .status();
+    // The checked build is bounded and refuses any warning from the runtime
+    // or the scaffold's app crate.
+    let mut cargo = e2e_support::target::cargo_command(&build_target);
+    cargo.arg("build");
+    let cargo_build = e2e_support::checked_build(cargo, tag, &out_dir);
     assert!(
-        matches!(&cargo_status, Ok(s) if s.success()),
-        "[{tag}] cargo build on the emitted scaffold must succeed (SEAL: \
-         ipe-accepts must imply cargo-builds): {cargo_status:?}"
+        cargo_build.is_ok(),
+        "[{tag}] cargo build on the emitted scaffold must succeed without warnings \
+         (SEAL: ipe-accepts must imply cargo-builds): {cargo_build:?}"
     );
 
     let _ = fs::remove_dir_all(&dir);
