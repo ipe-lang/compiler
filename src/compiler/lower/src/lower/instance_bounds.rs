@@ -8,12 +8,12 @@
 //! unmet demand with IPE-L0164 at the reference, so `cargo` never meets an
 //! instance `ipe` accepted and the trait refuses.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cell::{Cell, OnceCell, RefCell};
+use std::collections::{BTreeMap, HashMap};
 
 use ipe_diagnostics::{CalleeDemand, Diagnostic, LowerError, ModelLeaf, Span};
 use ipe_intern::{Interner, Symbol};
-use ipe_ir::{BoundSet, CarrierLeaf, Func, FuncId, IrType};
+use ipe_ir::{BoundSet, CarrierLeaf, Func, FuncId, IrType, ModPath};
 
 use super::clone_class::{
     CloneClass, CloneEnv, bounded_nonclone, clone_class, enum_is_opaque_ffi_handle,
@@ -150,8 +150,11 @@ pub(super) enum Supply {
 ///   first.
 /// - `IpeRow`: the runtime implements it for exactly `Dict String String`
 ///   and `WebReq`.
-/// - Arithmetic, ordering, equality, hashing, rendering, interpolation and
-///   SQL parameters are proven by the type checker's obligations before
+/// - `PartialEq`: the type is derivable by the predicate the backend derives
+///   by ([`eq_supplied`]); the type checker's `Equatable` obligation refuses
+///   the same types first (IPE-T0014), so this is the second boundary.
+/// - Arithmetic, ordering, hashing, rendering, interpolation and SQL
+///   parameters are proven by the type checker's obligations before
 ///   lowering (`TyBounds`, IPE-T0014), so they are met here.
 pub(super) fn bound_met_by(env: CloneEnv<'_>, bound: Bound, ty: &IrType) -> Supply {
     if matches!(ty, IrType::Generic(_) | IrType::RowGeneric(_)) {
@@ -194,6 +197,7 @@ pub(super) fn bound_met_by(env: CloneEnv<'_>, bound: Bound, ty: &IrType) -> Supp
                 }
             }
         }
+        Bound::Eq => eq_supplied(env, None, ty),
         Bound::Static
         | Bound::Send
         | Bound::Sync
@@ -201,12 +205,44 @@ pub(super) fn bound_met_by(env: CloneEnv<'_>, bound: Bound, ty: &IrType) -> Supp
         | Bound::Sub
         | Bound::Mul
         | Bound::Ord
-        | Bound::Eq
         | Bound::OrdTotal
         | Bound::Hash
         | Bound::Show
         | Bound::SqlParam
         | Bound::Interpolable => Supply::Met,
+    }
+}
+
+/// Whether a value of `ty` supplies `PartialEq`.
+///
+/// Judged by [`ipe_ir::ir_type_is_derivable`], the predicate the backend
+/// derives an enum's `PartialEq` by: a registered enum answers its
+/// [`ipe_ir::enum_derivable_fixpoint`] fact (`enum_derivable` when the caller
+/// holds it, else computed once here and only when the walk meets an enum),
+/// any other enum [`ipe_ir::unregistered_enum_derivable`]. A generic is
+/// derivable: its `PartialEq` is the referencing function's own bound.
+pub(super) fn eq_supplied(
+    env: CloneEnv<'_>,
+    enum_derivable: Option<&BTreeMap<(ModPath, Symbol), bool>>,
+    ty: &IrType,
+) -> Supply {
+    let computed: OnceCell<BTreeMap<(ModPath, Symbol), bool>> = OnceCell::new();
+    let lookup = |home: &ModPath, name: Symbol| {
+        enum_derivable
+            .unwrap_or_else(|| {
+                computed.get_or_init(|| ipe_ir::enum_derivable_fixpoint(env.interner, env.payloads))
+            })
+            .get(&(home.clone(), name))
+            .copied()
+            .unwrap_or_else(|| ipe_ir::unregistered_enum_derivable(env.interner, home, name))
+    };
+    if ipe_ir::ir_type_is_derivable(ty, &lookup) {
+        Supply::Met
+    } else {
+        Supply::Unmet {
+            demand: CalleeDemand::Compares,
+            leaf: whole_type_name(env.interner, ty),
+        }
     }
 }
 
@@ -253,7 +289,7 @@ fn is_nonclone_leaf(env: CloneEnv<'_>, t: &IrType) -> bool {
 /// The record field holding the first non-`Clone` part (empty when `ty` is
 /// no record) and that part's kind. `None` when `ty` is `Clone`, so the role
 /// check refuses exactly what the callee-bound `Clone` check would.
-pub(super) fn nonclone_role_blame(env: CloneEnv<'_>, ty: &IrType) -> Option<(Box<str>, ModelLeaf)> {
+fn nonclone_role_blame(env: CloneEnv<'_>, ty: &IrType) -> Option<(Box<str>, ModelLeaf)> {
     if !bounded_nonclone(env, ty) {
         return None;
     }
@@ -265,15 +301,73 @@ pub(super) fn nonclone_role_blame(env: CloneEnv<'_>, ty: &IrType) -> Option<(Box
             .unwrap_or(""),
         _ => "",
     };
-    let leaf = first_nonclone_leaf(env, ty).map_or(ModelLeaf::Handle, |leaf| match leaf {
-        IrType::Fun(..) | IrType::FnOnceChain(..) => ModelLeaf::Function,
-        IrType::Cmd(_) => ModelLeaf::Command,
-        IrType::Sub(_) => ModelLeaf::Subscription,
-        IrType::Task(_) => ModelLeaf::Task,
+    let leaf = first_nonclone_leaf(env, ty)
+        .and_then(|leaf| leaf_kind(&leaf))
         // The remaining non-`Clone` leaves: an app handle or an opaque FFI handle.
-        _ => ModelLeaf::Handle,
-    });
+        .unwrap_or(ModelLeaf::Handle);
     Some((field.into(), leaf))
+}
+
+/// What an app-role refusal blames in a Model or Msg `ty` that misses `bound`.
+///
+/// The record field holding the first part that misses it (empty when `ty`
+/// is no record) and that part's kind. `None` when `ty` supplies `bound`
+/// ([`bound_met_by`], with `PartialEq` judged by the module's
+/// `enum_derivable` facts), so the role gate refuses exactly what the app
+/// entry's callee-bound check would.
+pub(super) fn role_blame(
+    env: CloneEnv<'_>,
+    enum_derivable: &BTreeMap<(ModPath, Symbol), bool>,
+    bound: Bound,
+    ty: &IrType,
+) -> Option<(Box<str>, ModelLeaf)> {
+    if bound == Bound::Clone {
+        return nonclone_role_blame(env, ty);
+    }
+    let misses = |t: &IrType| {
+        let supply = if bound == Bound::Eq {
+            eq_supplied(env, Some(enum_derivable), t)
+        } else {
+            bound_met_by(env, bound, t)
+        };
+        matches!(supply, Supply::Unmet { .. })
+    };
+    if !misses(ty) {
+        return None;
+    }
+    let field = match ty {
+        IrType::Record(fields) => fields
+            .iter()
+            .find(|(_, field_ty)| misses(field_ty))
+            .and_then(|(sym, _)| env.interner.resolve(*sym))
+            .unwrap_or(""),
+        _ => "",
+    };
+    let found: Cell<Option<ModelLeaf>> = Cell::new(None);
+    let held = ipe_ir::ir_type_holds(ty, env.payloads, &|t| {
+        let kind = leaf_kind(t);
+        if found.get().is_none() {
+            found.set(kind);
+        }
+        kind.is_some()
+    });
+    // A miss with no function, effect or decoder part is an opaque handle's.
+    let leaf = found.get().filter(|_| held).unwrap_or(ModelLeaf::Handle);
+    Some((field.into(), leaf))
+}
+
+/// The kind an app-role refusal names `t` by, when `t` is a function, an effect or a decoder.
+const fn leaf_kind(t: &IrType) -> Option<ModelLeaf> {
+    match t {
+        IrType::Fun(..) | IrType::FnOnceChain(..) | IrType::SharedFun(..) => {
+            Some(ModelLeaf::Function)
+        }
+        IrType::Cmd(_) => Some(ModelLeaf::Command),
+        IrType::Sub(_) => Some(ModelLeaf::Subscription),
+        IrType::Task(_) => Some(ModelLeaf::Task),
+        IrType::Decoder(_) => Some(ModelLeaf::Decoder),
+        _ => None,
+    }
 }
 
 /// The head of `ty` in Ipê words: `Task`, `function`, a union's own name.
@@ -464,12 +558,13 @@ fn aligned_instances<'s>(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
+    use ipe_diagnostics::{CalleeDemand, ModelLeaf};
     use ipe_intern::Interner;
-    use ipe_ir::{BoundSet, EnumPayloadTable, IrType};
+    use ipe_ir::{BoundSet, EnumPayloadTable, IrType, ModPath};
 
-    use super::{Bound, CloneEnv, Supply, bound_met_by};
+    use super::{Bound, CloneEnv, Supply, bound_met_by, role_blame};
 
     /// Run `check` with an empty classification context.
     fn with_env(check: impl FnOnce(CloneEnv<'_>)) {
@@ -508,7 +603,10 @@ mod tests {
 
     /// The bounds [`bound_met_by`] decides from the type rather than the type checker.
     const fn decided_here(bound: Bound) -> bool {
-        matches!(bound, Bound::Clone | Bound::Copy | Bound::IpeRow)
+        matches!(
+            bound,
+            Bound::Clone | Bound::Copy | Bound::IpeRow | Bound::Eq
+        )
     }
 
     /// Whether a set carrying `bound` also carries `other` by implication.
@@ -632,6 +730,142 @@ mod tests {
             assert_eq!(bound_met_by(env, Bound::Clone, &shared), Supply::Met);
             assert_eq!(bound_met_by(env, Bound::Clone, &IrType::Str), Supply::Met);
         });
+    }
+
+    /// `PartialEq` is refused for a decoder, a function and a database handle,
+    /// bare or nested, and supplied for a list of integers.
+    #[test]
+    fn equality_is_refused_for_a_decoder_and_supplied_for_values() {
+        with_env(|env| {
+            let decoder = IrType::Decoder(Box::new(IrType::Int));
+            for ty in [
+                decoder.clone(),
+                IrType::List(Box::new(decoder.clone())),
+                IrType::Maybe(Box::new(decoder)),
+                IrType::Db,
+                IrType::Regex,
+                IrType::Fun(vec![IrType::Int], Box::new(IrType::Int)),
+            ] {
+                assert!(
+                    matches!(
+                        bound_met_by(env, Bound::Eq, &ty),
+                        Supply::Unmet {
+                            demand: CalleeDemand::Compares,
+                            ..
+                        }
+                    ),
+                    "{ty:?}"
+                );
+            }
+            let ints = IrType::List(Box::new(IrType::Int));
+            assert_eq!(bound_met_by(env, Bound::Eq, &ints), Supply::Met);
+        });
+    }
+
+    /// An opaque `Rust.*` handle has no `PartialEq`; a registered enum
+    /// holding only integers has it, and one holding the handle does not.
+    #[test]
+    fn equality_is_refused_for_an_opaque_handle_and_its_holders() {
+        let mut interner = Interner::new();
+        let names =
+            ["Rust", "Zstd", "Encoder", "Main", "Plain", "Holds", "A"].map(|n| interner.intern(n));
+        assert!(
+            names.iter().all(Result::is_ok),
+            "interning the fixture names"
+        );
+        let [
+            Ok(rust),
+            Ok(zstd),
+            Ok(encoder),
+            Ok(main),
+            Ok(plain),
+            Ok(holds),
+            Ok(ctor),
+        ] = names
+        else {
+            return;
+        };
+        let handle = IrType::Enum {
+            home: ModPath(vec![rust, zstd]),
+            name: encoder,
+            args: Vec::new(),
+        };
+        let main_home = ModPath(vec![main]);
+        let mut payloads = EnumPayloadTable::new();
+        payloads.insert((main_home.clone(), plain), vec![(ctor, vec![IrType::Int])]);
+        payloads.insert(
+            (main_home.clone(), holds),
+            vec![(ctor, vec![handle.clone()])],
+        );
+        let ffi = BTreeSet::new();
+        let env = CloneEnv {
+            interner: &interner,
+            transparent_ffi: &ffi,
+            payloads: &payloads,
+        };
+        let main_enum = |name| IrType::Enum {
+            home: main_home.clone(),
+            name,
+            args: Vec::new(),
+        };
+        for (ty, met) in [
+            (handle, false),
+            (main_enum(plain), true),
+            (main_enum(holds), false),
+        ] {
+            assert_eq!(
+                bound_met_by(env, Bound::Eq, &ty) == Supply::Met,
+                met,
+                "{ty:?}"
+            );
+        }
+    }
+
+    /// A Model missing `PartialEq` is blamed by the role gate, naming the field
+    /// and its leaf, while a `Clone`-only judgement admits it.
+    #[test]
+    fn role_blame_names_the_field_a_model_misses_equality_by() {
+        let mut interner = Interner::new();
+        let names = ["count", "widget", "parse"].map(|n| interner.intern(n));
+        assert!(
+            names.iter().all(Result::is_ok),
+            "interning the fixture names"
+        );
+        let [Ok(count), Ok(widget), Ok(parse)] = names else {
+            return;
+        };
+        let ffi = BTreeSet::new();
+        let payloads = EnumPayloadTable::new();
+        let env = CloneEnv {
+            interner: &interner,
+            transparent_ffi: &ffi,
+            payloads: &payloads,
+        };
+        let derivable = BTreeMap::new();
+        let element = IrType::CustomElement {
+            down: Box::new(IrType::Int),
+            up: Box::new(IrType::Str),
+        };
+        let with_element =
+            IrType::Record(BTreeMap::from([(count, IrType::Int), (widget, element)]));
+        let with_decoder = IrType::Record(BTreeMap::from([
+            (count, IrType::Int),
+            (parse, IrType::Decoder(Box::new(IrType::Int))),
+        ]));
+        assert_eq!(
+            role_blame(env, &derivable, Bound::Clone, &with_element),
+            None
+        );
+        assert_eq!(
+            role_blame(env, &derivable, Bound::Eq, &with_element),
+            Some(("widget".into(), ModelLeaf::Handle))
+        );
+        assert_eq!(
+            role_blame(env, &derivable, Bound::Eq, &with_decoder),
+            Some(("parse".into(), ModelLeaf::Decoder))
+        );
+        let plain = IrType::Record(BTreeMap::from([(count, IrType::Int)]));
+        assert_eq!(role_blame(env, &derivable, Bound::Eq, &plain), None);
     }
 
     /// `Copy` is supplied by the scalars only; `IpeRow` by its two runtime rows only.

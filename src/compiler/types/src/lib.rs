@@ -48,6 +48,7 @@ use ipe_diagnostics::{
     DResult, Diagnostic, LowerError, Owed, Span, TypeClass, TypeError, WildcardDependence,
 };
 use ipe_intern::{Interner, Symbol};
+use ipe_kernels::HeadEq;
 
 pub use constrain::{Builtins, KernelScheme, KernelSchemeTable, kernel_type_table};
 pub use doc::{VarLabel, VarNamer, canon_type_to_doc, letters, ty_to_doc};
@@ -2564,31 +2565,72 @@ pub(crate) fn concrete_super_ok(
     )
 }
 
-/// Whether the head `(home, name)` is a builtin whose runtime carrier has no `PartialEq`.
+/// The registry's equality fact for the head `(home, name)`, if it is a builtin row.
 ///
-/// The fact is the registry's ([`ipe_kernels::BuiltinRow::derives_partial_eq`]);
-/// a head that is not a builtin row is a user type and answers `false`.
-fn builtin_lacks_partial_eq(interner: &Interner, home: &[Symbol], name: Symbol) -> bool {
+/// The fact is [`ipe_kernels::BuiltinRow::equality`]; a head that is not a
+/// builtin row is a user or stdlib-source type and answers `None`, so its own
+/// definition decides.
+fn builtin_head_eq(interner: &Interner, home: &[Symbol], name: Symbol) -> Option<HeadEq> {
+    let name = interner.resolve(name)?;
+    let segments: Vec<&str> = home
+        .iter()
+        .map(|s| interner.resolve(*s))
+        .collect::<Option<_>>()?;
+    ipe_kernels::BuiltinType::of_head(&segments, name).map(|builtin| builtin.row().equality())
+}
+
+/// Whether `(home, name)` is a runtime-bridged enum whose runtime type has no `PartialEq`.
+///
+/// `Ipe.Config.Decoder` is a source union the backend never declares: it
+/// names the runtime's decoder, which holds a parse function. The fact is the
+/// lowerer's ([`ipe_ir::RuntimeBridgedEnum::traits`]), so the checker refuses
+/// exactly the comparisons the emitted crate could not build.
+fn bridged_lacks_partial_eq(interner: &Interner, home: &[Symbol], name: Symbol) -> bool {
     let Some(name) = interner.resolve(name) else {
         return false;
     };
     let segments: Option<Vec<&str>> = home.iter().map(|s| interner.resolve(*s)).collect();
     segments.is_some_and(|segments| {
-        ipe_kernels::BuiltinType::of_head(&segments, name)
-            .is_some_and(|builtin| !builtin.row().derives_partial_eq())
+        ipe_ir::RuntimeBridgedEnum::classify(&segments, name)
+            .is_some_and(|bridged| !bridged.traits().derivable)
     })
 }
 
-/// Does canonical type `t` embed a builtin head with no `PartialEq` anywhere?
-fn canon_type_embeds_uncomparable(interner: &Interner, t: &canon::Type) -> bool {
-    let walk = |t: &canon::Type| canon_type_embeds_uncomparable(interner, t);
+/// Whether the named head `(home, name)` refuses `PartialEq` whatever its
+/// arguments: an opaque FFI handle, a runtime-bridged enum without it, or an
+/// enum whose definition embeds a leaf without it ([`EnumEmbeds::refuses_eq`]).
+fn head_refuses_eq(
+    interner: &Interner,
+    embeds: &EnumEmbeds,
+    home: &[Symbol],
+    name: Symbol,
+) -> bool {
+    embeds.is_opaque_handle(interner, home, name)
+        || embeds.refuses_eq(home, name)
+        || bridged_lacks_partial_eq(interner, home, name)
+}
+
+/// Does canonical payload type `t` hold a leaf with no `PartialEq` anywhere?
+///
+/// The canonical twin of [`ty_is_equatable`]: a function, a builtin row whose
+/// [`HeadEq`] refuses, and a head [`head_refuses_eq`] refuses. A type
+/// variable is decided where the enum is applied, by the argument walk.
+fn canon_type_lacks_eq(interner: &Interner, embeds: &EnumEmbeds, t: &canon::Type) -> bool {
+    let walk = |t: &canon::Type| canon_type_lacks_eq(interner, embeds, t);
     match t {
-        canon::Type::Lambda(a, b) => walk(a) || walk(b),
+        canon::Type::Lambda(_, _) => true,
         canon::Type::Var(_) | canon::Type::Wildcard | canon::Type::Unit => false,
         canon::Type::Tuple(elems) => elems.iter().any(walk),
-        canon::Type::Con { home, name, args } => {
-            builtin_lacks_partial_eq(interner, home, *name) || args.iter().any(walk)
-        }
+        canon::Type::Con { home, name, args } => match builtin_head_eq(interner, home, *name) {
+            Some(HeadEq::Never) => true,
+            Some(HeadEq::Erased) => false,
+            Some(HeadEq::Structural) => args.iter().any(walk),
+            Some(HeadEq::ByDefinition) | None => {
+                head_refuses_eq(interner, embeds, home, *name)
+                    || (!ipe_ir::is_store_row_phantom_union(interner, home, *name)
+                        && args.iter().any(walk))
+            }
+        },
         canon::Type::Record(fields) | canon::Type::RecordOpen(_, fields) => {
             fields.iter().any(|(_, f)| walk(f))
         }
@@ -2676,7 +2718,8 @@ fn canon_type_embeds_opaque_handle(
 /// Rust that does not build.
 #[derive(Default)]
 pub(crate) struct EnumEmbeds {
-    /// Enums with a function or a builtin with no `PartialEq` in a payload.
+    /// Enums with a leaf with no `PartialEq` in a payload, directly or
+    /// through another such enum ([`canon_type_lacks_eq`]).
     eq_refused: BTreeSet<(Vec<Symbol>, Symbol)>,
     /// Enums with a function or an opaque FFI handle in a payload.
     show_refused: BTreeSet<(Vec<Symbol>, Symbol)>,
@@ -2709,14 +2752,30 @@ impl EnumEmbeds {
         for u in unions() {
             let payloads = || u.ctors.iter().flat_map(|c| c.args.iter());
             let fun = payloads().any(canon_type_embeds_lambda);
-            if fun || payloads().any(|t| canon_type_embeds_uncomparable(interner, t)) {
-                facts.eq_refused.insert((u.home.clone(), u.name));
-            }
             if fun || payloads().any(|t| canon_type_embeds_opaque_handle(interner, &facts, t)) {
                 facts.show_refused.insert((u.home.clone(), u.name));
             }
         }
-        facts
+        // The least fixpoint of `eq_refused`: a union is refused once a payload
+        // lacks `PartialEq`, which may be another union refused in an earlier
+        // pass. Each pass refuses at least one more union or stops, so at most
+        // one pass per union plus the final one runs.
+        loop {
+            let refused: Vec<(Vec<Symbol>, Symbol)> = unions()
+                .filter(|u| !facts.refuses_eq(&u.home, u.name))
+                .filter(|u| {
+                    u.ctors
+                        .iter()
+                        .flat_map(|c| c.args.iter())
+                        .any(|t| canon_type_lacks_eq(interner, &facts, t))
+                })
+                .map(|u| (u.home.clone(), u.name))
+                .collect();
+            if refused.is_empty() {
+                return facts;
+            }
+            facts.eq_refused.extend(refused);
+        }
     }
 
     /// Is `(home, name)` an opaque FFI handle: a type under an FFI interface
@@ -2730,7 +2789,7 @@ impl EnumEmbeds {
             && !self.transparent_ffi.contains(&(home.to_vec(), name))
     }
 
-    /// Does enum `(home, name)`'s definition embed a function or a builtin with no `PartialEq`?
+    /// Does enum `(home, name)`'s definition embed a leaf with no `PartialEq`?
     fn refuses_eq(&self, home: &[Symbol], name: Symbol) -> bool {
         self.eq_refused.contains(&(home.to_vec(), name))
     }
@@ -2778,10 +2837,9 @@ fn ty_is_showable(interner: &Interner, ty: &Ty, enum_embeds: &EnumEmbeds) -> boo
 }
 
 /// Whether a resolved type derives Rust's `PartialEq`: true for every fully
-/// concrete type containing no function and no builtin effect carrier or
-/// application handle anywhere (primitives, unit, tuples, closed records, and
-/// enums all derive `PartialEq`; a function, a `Task`, a `Cmd`, a `Sub` and an
-/// application handle never do). A
+/// concrete type containing no function, no builtin head whose [`HeadEq`]
+/// refuses (an effect carrier, a decoder, a handle), no opaque FFI handle and
+/// no enum whose definition holds one of those. A
 /// bare type variable, and a record whose open row tail leaves the rest of the
 /// record unknown, is rejected (fail-closed): an equality obligation that escaped
 /// into an enclosing generic is not yet propagated across binding boundaries.
@@ -2799,23 +2857,27 @@ fn ty_is_equatable(interner: &Interner, ty: &Ty, enum_embeds: &EnumEmbeds) -> bo
         Ty::Record(fields, RowTail::Closed) => fields
             .values()
             .all(|f| ty_is_equatable(interner, f, enum_embeds)),
-        // A `Ty::Con` head names a user enum (or a builtin like `Maybe`) whose
-        // variant payloads are NOT in `args` — `args` carries only the applied
-        // type parameters. An enum whose DEFINITION embeds a function in a
-        // payload (`type Handler a = OnClick (Int -> a) | Plain a`) is therefore
-        // not equatable however it is applied, even though every `arg` is
-        // (`Handler Int`'s only arg is `Int`). Consult `enum_embeds.refuses_eq` on the
-        // head, then still recurse the args so a function reaching a type
-        // parameter (`Box (Int -> Int)` for `type Box a = Box a`) is caught too.
-        // A builtin head whose runtime carrier has no `PartialEq` (`Task`,
-        // `Cmd`, `Sub`, an application handle) is refused by the registry fact.
+        // A builtin head answers by its registry row ([`HeadEq`]). Any other
+        // head names an enum whose variant payloads are NOT in `args` (`args`
+        // carries only the applied type parameters), so its definition is
+        // consulted out of band ([`head_refuses_eq`]); the args are still
+        // walked so a function reaching a type parameter (`Box (Int -> Int)`
+        // for `type Box a = Box a`) is caught too.
         Ty::Con { module, name, args } => {
-            !enum_embeds.refuses_eq(module, *name)
-                && !builtin_lacks_partial_eq(interner, module, *name)
-                && (ipe_ir::is_store_row_phantom_union(interner, module, *name)
-                    || args
-                        .iter()
-                        .all(|a| ty_is_equatable(interner, a, enum_embeds)))
+            let args_ok = || {
+                args.iter()
+                    .all(|a| ty_is_equatable(interner, a, enum_embeds))
+            };
+            match builtin_head_eq(interner, module, *name) {
+                Some(HeadEq::Never) => false,
+                Some(HeadEq::Erased) => true,
+                Some(HeadEq::Structural) => args_ok(),
+                Some(HeadEq::ByDefinition) | None => {
+                    !head_refuses_eq(interner, enum_embeds, module, *name)
+                        && (ipe_ir::is_store_row_phantom_union(interner, module, *name)
+                            || args_ok())
+                }
+            }
         }
     }
 }
@@ -9141,9 +9203,8 @@ mod tests {
         }
     }
 
-    /// An enum whose definition holds a `Rust.*` handle is not showable but
-    /// stays equatable; one holding a function is neither; one holding an
-    /// `Int` is both. The handle and the function are invisible in the enum's
+    /// An enum whose definition holds a `Rust.*` handle or a function is
+    /// neither showable nor equatable; one holding an `Int` is both. The handle and the function are invisible in the enum's
     /// `Ty::Con` arguments, so only the definition lookup can refuse them.
     #[test]
     fn an_enum_holding_a_handle_or_a_function_is_not_showable() {
@@ -9170,7 +9231,7 @@ mod tests {
         let holds_fn = ty_of(&mut i, "HoldsFn");
         let holds_int = ty_of(&mut i, "HoldsInt");
         assert!(!ty_is_showable(&i, &holds_handle, &embeds));
-        assert!(ty_is_equatable(&i, &holds_handle, &embeds));
+        assert!(!ty_is_equatable(&i, &holds_handle, &embeds));
         assert!(!ty_is_showable(&i, &holds_fn, &embeds));
         assert!(!ty_is_equatable(&i, &holds_fn, &embeds));
         assert!(ty_is_showable(&i, &holds_int, &embeds));
@@ -9210,6 +9271,90 @@ mod tests {
         }
         let maybe = applied(&mut i, &[], "Maybe");
         assert!(!ty_is_equatable(&i, &maybe, &embeds));
+    }
+
+    /// Equality follows each builtin row's [`HeadEq`], the runtime-bridged
+    /// facts, and an enum's definition through any depth of nesting.
+    ///
+    /// A `Decoder` row and the bridged `Ipe.Config.Decoder` refuse `==`; a
+    /// `Topic` erases its argument; `List` walks it. A union holding a union
+    /// that holds a decoder (or an opaque handle) is refused by the fixpoint,
+    /// though its own payload names only the inner union.
+    #[test]
+    fn equality_follows_the_row_fact_the_bridge_and_nested_definitions() {
+        let mut i = Interner::new();
+        let canon_con = |i: &mut Interner, home: &[&str], name: &str, args: Vec<canon::Type>| {
+            canon::Type::Con {
+                home: home
+                    .iter()
+                    .map(|seg| i.intern(seg).expect("intern home segment"))
+                    .collect(),
+                name: i.intern(name).expect("intern type name"),
+                args,
+            }
+        };
+        let int = canon_con(&mut i, &[], "Int", Vec::new());
+        let config_decoder = canon_con(&mut i, &["Ipe", "Config"], "Decoder", vec![int.clone()]);
+        let handle = canon_con(&mut i, &["Rust", "Zstd"], "Encoder", Vec::new());
+        let inner = canon_con(&mut i, &["Main"], "Inner", Vec::new());
+        let inner_handle = canon_con(&mut i, &["Main"], "InnerHandle", Vec::new());
+        let unions = vec![
+            union_with(&mut i, &["Main"], "Outer", vec![("Outer", vec![inner])]),
+            union_with(
+                &mut i,
+                &["Main"],
+                "Inner",
+                vec![("Inner", vec![config_decoder])],
+            ),
+            union_with(
+                &mut i,
+                &["Main"],
+                "OuterHandle",
+                vec![("OuterHandle", vec![inner_handle])],
+            ),
+            union_with(
+                &mut i,
+                &["Main"],
+                "InnerHandle",
+                vec![("InnerHandle", vec![handle])],
+            ),
+            union_with(&mut i, &["Main"], "Plain", vec![("Plain", vec![int])]),
+        ];
+        let embeds = EnumEmbeds::of(&i, &unions, &[]);
+        let applied = |i: &mut Interner, home: &[&str], name: &str, args: Vec<Ty>| {
+            let Ty::Con { module, name, .. } = con_ty(i, home, name) else {
+                return Ty::Unit;
+            };
+            Ty::Con { module, name, args }
+        };
+        let int_ty = con_ty(&mut i, &[], "Int");
+        let fun = int_fn_ty(&mut i);
+        for (home, name, args, equal) in [
+            (&[][..], "Decoder", vec![int_ty.clone()], false),
+            (
+                &["Ipe", "Config"][..],
+                "Decoder",
+                vec![int_ty.clone()],
+                false,
+            ),
+            (&[][..], "Regex", Vec::new(), false),
+            (&[][..], "Db", Vec::new(), false),
+            (&["Rust", "Zstd"][..], "Encoder", Vec::new(), false),
+            (&[][..], "Topic", vec![fun.clone()], true),
+            (&[][..], "List", vec![fun], false),
+            (&[][..], "List", vec![int_ty], true),
+            (&["Main"][..], "Outer", Vec::new(), false),
+            (&["Main"][..], "Inner", Vec::new(), false),
+            (&["Main"][..], "OuterHandle", Vec::new(), false),
+            (&["Main"][..], "Plain", Vec::new(), true),
+        ] {
+            let ty = applied(&mut i, home, name, args);
+            assert_eq!(
+                ty_is_equatable(&i, &ty, &embeds),
+                equal,
+                "equality of {home:?}.{name}"
+            );
+        }
     }
 
     /// A union `name` under `home` with constructors `ctors`, each `(name, payloads)`.
