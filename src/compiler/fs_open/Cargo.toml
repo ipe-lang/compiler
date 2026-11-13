@@ -10,7 +10,7 @@ publish = false
 rustix = { version = "0.38", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
-cap-primitives = "3.4.6"
+cap-primitives = "4.0.3"
 winapi-util = "0.1"
 
 [dev-dependencies]
