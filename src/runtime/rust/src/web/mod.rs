@@ -3659,22 +3659,14 @@ impl MountContext {
         !matches!(self, Self::Root)
     }
 
-    /// The standalone app's context, read from `IPE_WEB_BASE_PATH` once at startup.
-    ///
-    /// A value that is not Unicode is judged by its lossy spelling, whose
-    /// `U+FFFD` the grammar refuses, so it never reads as unset.
+    /// The standalone app's context, from the `IPE_WEB_BASE_PATH` reading fixed
+    /// before the program's first line.
     ///
     /// # Errors
     ///
     /// [`StartupRefusal::MountBase`] for a value outside the mount-base grammar.
     fn from_env() -> Result<Self, StartupRefusal> {
-        match crate::system::read_env_var("IPE_WEB_BASE_PATH") {
-            Ok(raw) => Self::standalone(Some(&raw)),
-            Err(std::env::VarError::NotPresent) => Self::standalone(None),
-            Err(std::env::VarError::NotUnicode(raw)) => {
-                Self::standalone(Some(&raw.to_string_lossy()))
-            }
-        }
+        Self::standalone(launched_base_path())
     }
 
     /// The standalone app's context for the variable's value `raw`, `None` when unset.
@@ -3690,6 +3682,30 @@ impl MountContext {
             Self::ProxiedChild { base }
         })
     }
+}
+
+/// The process's `IPE_WEB_BASE_PATH`, read once before the program's first
+/// line, so a base the program writes later never re-scopes its URLs or
+/// session cookie. `None` when unset. A value that is not Unicode is kept by
+/// its lossy spelling, whose `U+FFFD` the mount-base grammar refuses, so it
+/// never reads as unset.
+#[cfg(feature = "web")]
+fn launched_base_path() -> Option<&'static str> {
+    static BASE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    BASE.get_or_init(|| match crate::system::read_env_var("IPE_WEB_BASE_PATH") {
+        Ok(raw) => Some(raw),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(raw)) => Some(raw.to_string_lossy().into_owned()),
+    })
+    .as_deref()
+}
+
+/// Fixes the process's web reading (`IPE_WEB_BASE_PATH`, `IPE_WEB_STATIC_DIR`)
+/// before the program's first line.
+#[cfg(feature = "web")]
+pub(crate) fn fix_launch_env() {
+    let _ = launched_base_path();
+    let _ = launched_static_dir();
 }
 
 /// The session cookie name of the app served at `base`. At the root,
@@ -3776,17 +3792,13 @@ fn session_set_cookie(
 /// client-supplied header must never be trusted by default — an operator opts
 /// in only when a real reverse proxy sits in front of this process).
 ///
-/// Snapshotted once (env is stable at process start; same rationale as
-/// `csrf::cookies_secure()` — avoids a per-request global env-lock read).
+/// Read from the process's security posture, fixed before the program's
+/// first line.
 #[cfg(feature = "web")]
 fn trust_proxy_headers() -> bool {
-    use std::sync::OnceLock;
-    static TRUST: OnceLock<bool> = OnceLock::new();
-    *TRUST.get_or_init(|| {
-        crate::system::read_env_var("IPE_TRUSTED_PROXY")
-            .map(|v| !v.is_empty() && v != "0" && v != "false")
-            .unwrap_or(false)
-    })
+    crate::env_registry::security::security_posture()
+        .trusted_proxy
+        .trusts()
 }
 
 /// Request-scoped HTTPS detection, parameterised on the trust decision so it's
@@ -5228,6 +5240,20 @@ fn is_browser_noise_path(p: &str) -> bool {
     .any(|ext| p.ends_with(ext))
 }
 
+/// The directory `IPE_WEB_STATIC_DIR` names for `/static`, read once before
+/// the program's first line, so a directory the program writes later is never
+/// served. `None` when unset or empty.
+#[cfg(feature = "web")]
+fn launched_static_dir() -> Option<&'static str> {
+    static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        crate::system::read_env_var("IPE_WEB_STATIC_DIR")
+            .ok()
+            .filter(|d| !d.is_empty())
+    })
+    .as_deref()
+}
+
 /// Serve an unrouted browser-noise file from the static dir's root when it
 /// exists there.
 ///
@@ -5239,11 +5265,8 @@ fn is_browser_noise_path(p: &str) -> bool {
 #[cfg(feature = "web")]
 async fn serve_noise_from_static_root(path: &str) -> Option<axum::response::Response> {
     use axum::response::IntoResponse;
-    // IPE_WEB_STATIC_DIR: a non-empty value mounts the named directory at /static.
-    let dir = crate::system::read_env_var("IPE_WEB_STATIC_DIR")
-        .ok()
-        .filter(|d| !d.is_empty())?;
-    let (candidate, mime) = noise_candidate(&dir, path, crate::path_core::HOST)?;
+    let dir = launched_static_dir()?;
+    let (candidate, mime) = noise_candidate(dir, path, crate::path_core::HOST)?;
     let bytes = tokio::fs::read(&candidate).await.ok()?;
     Some(crate::server::with_security_headers(
         (
@@ -6367,9 +6390,7 @@ mod handlers {
         // Per-process control token. Absent token ⇒ the endpoint is unusable
         // (fail closed), so a dev server with the flag set but no token minted
         // cannot be driven by an untrusted caller.
-        let expected = crate::system::read_env_var("IPE_WATCH_HOT_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty());
+        let expected = crate::control::transport::control_token_from_env();
         let presented = headers
             .get("x-ipe-hot-token")
             .and_then(|v| v.to_str().ok())
@@ -6434,9 +6455,7 @@ mod handlers {
         }
         // Per-process control token — same mechanism as `/_ipe/hot-appearance`.
         // Absent expected token → fail closed (endpoint unusable without a token).
-        let expected = crate::system::read_env_var("IPE_WATCH_HOT_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty());
+        let expected = crate::control::transport::control_token_from_env();
         let presented = headers
             .get("x-ipe-hot-token")
             .and_then(|v| v.to_str().ok())
@@ -6512,9 +6531,7 @@ mod handlers {
         }
         // Per-process control token — same mechanism as `/_ipe/hot-transition`.
         // Absent expected token → fail closed (endpoint unusable without a token).
-        let expected = crate::system::read_env_var("IPE_WATCH_HOT_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty());
+        let expected = crate::control::transport::control_token_from_env();
         let presented = headers
             .get("x-ipe-hot-token")
             .and_then(|v| v.to_str().ok())
@@ -6601,9 +6618,7 @@ mod handlers {
         }
         // Per-process control token — same mechanism as `/_ipe/hot-transition`.
         // Absent expected token → fail closed (endpoint unusable without a token).
-        let expected = crate::system::read_env_var("IPE_WATCH_HOT_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty());
+        let expected = crate::control::transport::control_token_from_env();
         let presented = headers
             .get("x-ipe-hot-token")
             .and_then(|v| v.to_str().ok())
@@ -6680,9 +6695,7 @@ mod handlers {
         }
         // Per-process control token — same mechanism as `/_ipe/hot-transition`.
         // Absent expected token → fail closed (endpoint unusable without a token).
-        let expected = crate::system::read_env_var("IPE_WATCH_HOT_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty());
+        let expected = crate::control::transport::control_token_from_env();
         let presented = headers
             .get("x-ipe-hot-token")
             .and_then(|v| v.to_str().ok())
@@ -6759,9 +6772,7 @@ mod handlers {
             return StatusCode::NOT_FOUND.into_response();
         }
         // Per-process control token — same mechanism as `/_ipe/hot-transition`.
-        let expected = crate::system::read_env_var("IPE_WATCH_HOT_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty());
+        let expected = crate::control::transport::control_token_from_env();
         let presented = headers
             .get("x-ipe-hot-token")
             .and_then(|v| v.to_str().ok())
@@ -6822,9 +6833,7 @@ mod handlers {
     {
         // Per-process control token — same mechanism as `/_ipe/hot-appearance`.
         // Absent expected token → fail closed (endpoint unusable without a token).
-        let expected = crate::system::read_env_var("IPE_WATCH_HOT_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty());
+        let expected = crate::control::transport::control_token_from_env();
         let presented = headers
             .get("x-ipe-hot-token")
             .and_then(|v| v.to_str().ok())
@@ -8305,11 +8314,7 @@ where
     // it FOLLOWS symlinks inside the dir — the dir is operator-controlled
     // (`IPE_WEB_STATIC_DIR`), so that is the intended contract, NOT a
     // confinement guarantee. Absent/empty → no static mount.
-    // IPE_WEB_STATIC_DIR: non-empty value mounts the named directory at /static.
-    if let Some(dir) = crate::system::read_env_var("IPE_WEB_STATIC_DIR")
-        .ok()
-        .filter(|d| !d.is_empty())
-    {
+    if let Some(dir) = launched_static_dir() {
         router = router.nest_served("/static", web_static_mount(std::path::PathBuf::from(dir))?);
     }
 
@@ -11481,28 +11486,30 @@ mod security_env_tests {
 
     // ── IPE_WEB_CSRF_ORIGIN_CHECK ─────────────────────────────────────────────
     //
-    // `origin_check_enabled()` is memoized in a `OnceLock`, so we cannot test
-    // it via the production `origin_mismatch` path in the same process run. We
-    // test the env-read layer directly via `read_env_var`.
+    // The switch is part of the process's security posture, fixed once; its
+    // name is read through the registered key.
 
     #[test]
     fn csrf_origin_check_new_name_takes_effect() {
-        crate::system::locked_remove_var("IPE_WEB_CSRF_ORIGIN_CHECK");
-
-        // (a) set → "on"
-        crate::system::locked_set_var("IPE_WEB_CSRF_ORIGIN_CHECK", "on");
+        use crate::env_grammar::EnvFlag;
+        use crate::env_registry::security::WEB_CSRF_ORIGIN_CHECK;
+        let posture = |pairs: &'static [(&str, &str)]| {
+            crate::env_registry::security::SecurityPosture::from_lookup(|name| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned())
+                    .ok_or(std::env::VarError::NotPresent)
+            })
+        };
+        assert_eq!(WEB_CSRF_ORIGIN_CHECK.name(), "IPE_WEB_CSRF_ORIGIN_CHECK");
+        // (a) set → "off" takes effect.
         assert_eq!(
-            crate::system::read_env_var("IPE_WEB_CSRF_ORIGIN_CHECK").as_deref(),
-            Ok("on"),
-            "IPE_WEB_CSRF_ORIGIN_CHECK must be read"
+            posture(&[("IPE_WEB_CSRF_ORIGIN_CHECK", "off")]).csrf_origin_check,
+            EnvFlag::Off
         );
-        crate::system::locked_remove_var("IPE_WEB_CSRF_ORIGIN_CHECK");
-
-        // (b) unset → Err (origin check stays OFF — secure default)
-        assert!(
-            crate::system::read_env_var("IPE_WEB_CSRF_ORIGIN_CHECK").is_err(),
-            "unset → Err; origin check defaults to OFF"
-        );
+        // (b) unset → on, the secure default.
+        assert_eq!(posture(&[]).csrf_origin_check, EnvFlag::On);
     }
 
     // ── IPE_WEB_FRAME_ANCESTORS ───────────────────────────────────────────────
@@ -19394,6 +19401,34 @@ mod route_entry_cmd_tests {
             })
             .await;
         });
+    }
+
+    /// A static directory the program writes after startup is never served.
+    #[test]
+    fn a_static_dir_written_after_startup_is_not_served() {
+        crate::system::locked_remove_var("IPE_WEB_STATIC_DIR");
+        assert!(crate::env_registry::startup_check().is_ok());
+        run(false, || async {
+            with_static_worker_file(|| async {
+                for path in ["/static/sw.js", "/sw.js"] {
+                    let (status, _, body) = fetch_with(router(memory()), path, &[]).await;
+                    assert_ne!(status, StatusCode::OK, "{path} served a planted dir");
+                    assert_ne!(body, b"self.planted=1;", "{path}");
+                }
+            })
+            .await;
+        });
+    }
+
+    /// A base path the program writes after startup never re-bases the app.
+    #[test]
+    fn a_base_path_written_after_startup_does_not_rebase_the_app() {
+        crate::system::locked_remove_var("IPE_WEB_BASE_PATH");
+        assert!(crate::env_registry::startup_check().is_ok());
+        crate::system::locked_set_var("IPE_WEB_BASE_PATH", "/planted");
+        let context = MountContext::from_env();
+        crate::system::locked_remove_var("IPE_WEB_BASE_PATH");
+        assert!(matches!(context, Ok(MountContext::Root)), "{context:?}");
     }
 
     /// A page, routed or the root, is never a worker.

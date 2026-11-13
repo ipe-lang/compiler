@@ -1105,10 +1105,14 @@ fn recursion_limit() -> usize {
 /// about. `#[inline(never)]` is required with the exclusion: an inlined body
 /// would take its caller's (instrumented) frame and the local would move back
 /// onto the fake stack.
+///
+/// `pub(crate)`: the retained-size measure's [`crate::retained::within_stack`]
+/// reads this same probe, so the recursion guard's floor and the measure's
+/// depth backstop read one stack address, never two that could drift.
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg_attr(ipe_asan, sanitize(address = "off"), inline(never))]
 #[cfg_attr(not(ipe_asan), inline)]
-fn approx_stack_pointer() -> usize {
+pub(crate) fn approx_stack_pointer() -> usize {
     let anchor: u8 = 0;
     std::ptr::from_ref(&anchor) as usize
 }

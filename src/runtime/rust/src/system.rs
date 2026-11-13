@@ -5846,7 +5846,7 @@ mod env_ceiling_tests {
 
     /// The functions that read the environment and parse a number without
     /// [`EnvCeiling`], as `(file, fn, why)`.
-    const NON_CEILING_READS: [(&str, &str, &str); 3] = [
+    const NON_CEILING_READS: [(&str, &str, &str); 2] = [
         (
             "control.rs",
             "control_port_from_env",
@@ -5856,11 +5856,6 @@ mod env_ceiling_tests {
             "system.rs",
             "system_getenv_int",
             "`Env.getInt`: the parse failure is the kernel's own `Err` result",
-        ),
-        (
-            "server.rs",
-            "build_request",
-            "the number parsed is a request's `Content-Length`; the environment read is `IPE_TRUSTED_PROXY`",
         ),
     ];
 

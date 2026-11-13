@@ -1437,6 +1437,7 @@ pub fn render_json(d: &Diagnostic, file: &str, source: &str) -> String {
                         SpanRole::Opener => "opener",
                         SpanRole::Definition => "definition",
                         SpanRole::MarginOpener => "margin_opener",
+                        SpanRole::DutyOrigin => "duty_origin",
                     };
                     secondary_json_parts.push(format!(
                         "{{\"file\":{},\"byte_lo\":{},\"byte_hi\":{},\
@@ -2194,8 +2195,22 @@ fn import_required_label(qualifier: &str, candidates: &[Box<str>]) -> String {
 }
 
 /// The label of an IPE-T0014 refusal: the duty `owed`, stated against the
-/// offending type `found`.
-fn unmet_duty_label(owed: crate::diagnostic::Owed, found: &str) -> String {
+/// offending type `found` and naming the function `imposer` that imposed it
+/// when the refusal knows it.
+fn unmet_duty_label(owed: crate::diagnostic::Owed, found: &str, imposer: Option<&str>) -> String {
+    use crate::diagnostic::Owed;
+    match (owed, imposer) {
+        (Owed::PlainCallbackResult, Some(kernel)) => format!(
+            "`{kernel}` needs its callback to return a plain value, not a function; \
+             this callback returns `{found}`"
+        ),
+        (_, Some(kernel)) => format!("{}; `{kernel}` needs it", duty_label(owed, found)),
+        (_, None) => duty_label(owed, found),
+    }
+}
+
+/// The duty `owed`, stated against the offending type `found`.
+fn duty_label(owed: crate::diagnostic::Owed, found: &str) -> String {
     use crate::diagnostic::{
         GENERIC_ORDERED_TYPES, INTERPOLABLE_TYPES, Owed, SQL_PARAM_TYPES, TypeClass,
     };
@@ -2287,9 +2302,15 @@ fn type_label(msg: &TypeError) -> Option<String> {
         } => Some(format!(
             "`{ctor}` binds {found} field(s) but its declaration has {expected}"
         )),
-        TypeError::SuperTypeUnsatisfied { owed, found, .. } => {
-            Some(unmet_duty_label(*owed, &ty_to_string(found)))
-        }
+        TypeError::SuperTypeUnsatisfied {
+            owed,
+            found,
+            origin,
+        } => Some(unmet_duty_label(
+            *owed,
+            &ty_to_string(found),
+            origin.as_ref().map(|o| o.kernel_label.as_ref()),
+        )),
         TypeError::RefutablePatternParameter => {
             Some("this parameter pattern can fail to match".to_string())
         }
@@ -2738,6 +2759,7 @@ const fn role_label(role: SpanRole) -> &'static str {
         SpanRole::Opener => "the unclosed delimiter opened here",
         SpanRole::Definition => "the type was fixed here",
         SpanRole::MarginOpener => "this `\"\"\"` sets the margin column",
+        SpanRole::DutyOrigin => "the requirement comes from this function",
     }
 }
 
@@ -3652,6 +3674,57 @@ mod tests {
         );
         assert!(!out.contains("may itself"), "{out}");
         assert!(!out.contains("List.map"), "{out}");
+    }
+
+    /// The IPE-T0014 refusal of `found` for `owed`, imposed by `kernel` at the
+    /// `main` reference.
+    fn kernel_duty(owed: crate::diagnostic::Owed, kernel: &str, found: TyDoc) -> Diagnostic {
+        Diagnostic::Type {
+            span: Span::new(40, 43),
+            msg: TypeError::SuperTypeUnsatisfied {
+                owed,
+                found: Box::new(found),
+                origin: Some(crate::diagnostic::DutyOrigin {
+                    kernel_label: kernel.into(),
+                    at: Span::new(29, 33),
+                }),
+            },
+        }
+    }
+
+    /// A duty refusal that knows its kernel names it in the label and labels
+    /// the kernel reference as a secondary span, in the terminal and in JSON.
+    #[test]
+    fn a_kernel_duty_names_the_kernel_and_labels_its_reference() {
+        use crate::diagnostic::Owed;
+        let src = "module Main exposing (main)\n\nmain =\n    foo\n";
+        let d = kernel_duty(Owed::PlainCallbackResult, "Dict.map", int_to_int());
+        let out = render(&d, "test.ipe", src);
+        assert!(
+            out.contains("`Dict.map` needs its callback to return a plain value"),
+            "kernel label missing:\n{out}"
+        );
+        assert!(
+            out.contains("this callback returns `Int -> Int`"),
+            "found type missing:\n{out}"
+        );
+        assert!(
+            out.contains("the requirement comes from this function"),
+            "kernel reference label missing:\n{out}"
+        );
+        let json = render_json(&d, "test.ipe", src);
+        assert!(json.contains("\"duty_origin\""), "{json}");
+
+        let shown = render(
+            &kernel_duty(Owed::Stringify, "Debug.log", int_to_int()),
+            "test.ipe",
+            src,
+        );
+        assert!(
+            shown.contains("`Int -> Int` has no text rendering, so it cannot be shown as text"),
+            "{shown}"
+        );
+        assert!(shown.contains("`Debug.log` needs it"), "{shown}");
     }
 
     /// The SQL-parameter duty lists every bindable type and names no class.

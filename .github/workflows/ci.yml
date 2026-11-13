@@ -778,6 +778,10 @@ jobs:
         run: cargo clippy -p ipe-runtime-rust --target wasm32-wasip1 --no-default-features --features time-core,log,json,uuid,random,decimal,regex,crypto-core,secret,char-category --lib -- -D warnings
       - if: needs.changes.outputs.release_only != 'true'
         run: cargo clippy -p ipe-runtime-rust --target wasm32-wasip1 --no-default-features --lib -- -D warnings
+      # The in-browser compiler's own wasm32 cfg (the compile-stack door's
+      # shadow-stack probe, its nesting_ceiling test) is linted here.
+      - if: needs.changes.outputs.release_only != 'true'
+        run: cargo clippy -p ipe-wasm --target wasm32-unknown-unknown --all-targets -- -D warnings
       # The wasm test runner, pinned to the Cargo.lock wasm-bindgen version
       # (a runner of another version refuses the test binary).
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2

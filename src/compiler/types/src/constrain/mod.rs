@@ -16,6 +16,7 @@
 pub use crate::doc::{VarNamer, canon_type_to_doc, ty_to_doc};
 pub use crate::homed::{InferError, ModuleHome};
 pub use crate::solve::{Budget, CallSite, CalleeName, Constraint, ConstraintOrigin};
+use crate::ty::DutyOrigin;
 pub use crate::ty::{Content, FlatType, RowTail, Ty, TyBounds, from_canon, tag_solver_var};
 pub use crate::unify::unify_at;
 pub use crate::unionfind::{UnionFind, VarId};
@@ -513,6 +514,8 @@ pub struct SuperVar {
     pub span: Span,
     /// The module owning `span`.
     pub home: ModuleHome,
+    /// The kernel reference that imposed `bounds`, when one did.
+    pub origin: Option<DutyOrigin>,
 }
 
 /// A reference to a wildcard-`any`-return binding, tied to its body later.

@@ -1,0 +1,17 @@
+[package]
+name = "nesting-shapes"
+description = "Every source nesting shape at the parser's ceiling: the one table the native and in-browser compile-stack tests share"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "nesting_shapes"
+path = "src/lib.rs"
+
+[dependencies]
+ipe_diagnostics = { path = "../../src/compiler/diagnostics" }
+
+[lints]
+workspace = true

@@ -575,7 +575,7 @@ impl Builder<'_> {
                 span,
                 msg: LowerError::Unsupported(Feature::Kernels),
             })?;
-            let s = self.super_var(TyBounds::hof_kernel_result(), span)?;
+            let s = self.kernel_duty_var(k, TyBounds::hof_kernel_result(), span)?;
             self.eq(span, result_var, s)?;
         }
         Ok(())
@@ -608,7 +608,7 @@ impl Builder<'_> {
                 span,
                 msg: LowerError::Unsupported(Feature::Kernels),
             })?;
-            let s = self.super_var(bound, span)?;
+            let s = self.kernel_duty_var(k, bound, span)?;
             self.eq(span, slot_var, s)?;
         }
         Ok(())
@@ -679,7 +679,7 @@ impl Builder<'_> {
             // has three independent `var(0)`s and the gate needs all three tied
             // to one bounded var.
             if matches!(k, StdlibKernel::MathMin | StdlibKernel::MathMax) {
-                let s = self.super_var(TyBounds::ord(), span)?;
+                let s = self.kernel_duty_var(k, TyBounds::ord(), span)?;
                 let inner = self.structure(FlatType::Fun(s, s))?;
                 return self.structure(FlatType::Fun(s, inner));
             }
@@ -692,7 +692,7 @@ impl Builder<'_> {
             // `stdlib_scheme` + tie) because the base scheme has three
             // independent `var(0)`s that must collapse to one bounded var.
             if matches!(k, StdlibKernel::BasicsClamp) {
-                let s = self.super_var(TyBounds::ord(), span)?;
+                let s = self.kernel_duty_var(k, TyBounds::ord(), span)?;
                 let inner1 = self.structure(FlatType::Fun(s, s))?;
                 let inner2 = self.structure(FlatType::Fun(s, inner1))?;
                 return self.structure(FlatType::Fun(s, inner2));
@@ -703,7 +703,7 @@ impl Builder<'_> {
             // argument fails closed (T0001) before reaching a runtime that would
             // panic. Base scheme for the totality gate is in `stdlib_scheme`.
             if matches!(k, StdlibKernel::BasicsNegate | StdlibKernel::BasicsAbs) {
-                let s = self.super_var(TyBounds::sub(), span)?;
+                let s = self.kernel_duty_var(k, TyBounds::sub(), span)?;
                 return self.structure(FlatType::Fun(s, s));
             }
             // `Store.add / .sub / .mul : number a => a -> a -> a` — the
@@ -721,7 +721,7 @@ impl Builder<'_> {
                 StdlibKernel::StoreMul => Some(TyBounds::mul()),
                 _ => None,
             } {
-                let s = self.super_var(bound, span)?;
+                let s = self.kernel_duty_var(k, bound, span)?;
                 let inner = self.structure(FlatType::Fun(s, s))?;
                 return self.structure(FlatType::Fun(s, inner));
             }
@@ -730,7 +730,7 @@ impl Builder<'_> {
             // `stdlib_scheme` + tie) so all three positions collapse to ONE
             // bounded super-var, rejecting function / record arguments closed.
             if matches!(k, StdlibKernel::BasicsMin | StdlibKernel::BasicsMax) {
-                let s = self.super_var(TyBounds::ord(), span)?;
+                let s = self.kernel_duty_var(k, TyBounds::ord(), span)?;
                 let inner = self.structure(FlatType::Fun(s, s))?;
                 return self.structure(FlatType::Fun(s, inner));
             }
@@ -738,7 +738,7 @@ impl Builder<'_> {
             // (not stdlib_scheme + tie): both argument positions share one
             // Ord-bounded super-var; the return is the monomorphic Order type.
             if matches!(k, StdlibKernel::BasicsCompare) {
-                let s = self.super_var(TyBounds::ord(), span)?;
+                let s = self.kernel_duty_var(k, TyBounds::ord(), span)?;
                 let order_var = self.structure(FlatType::Con {
                     module: Vec::new(),
                     name: self.builtins.order,
@@ -760,7 +760,7 @@ impl Builder<'_> {
                 } else {
                     TyBounds::mul()
                 };
-                let s = self.super_var(bound, span)?;
+                let s = self.kernel_duty_var(k, bound, span)?;
                 let list_s = self.list_var(s)?;
                 return self.structure(FlatType::Fun(list_s, s));
             }
@@ -769,7 +769,7 @@ impl Builder<'_> {
             // the result is `Maybe a` over that bounded var. Direct-build so the
             // element and the Maybe payload share the one bounded super-var.
             if matches!(k, StdlibKernel::ListMaximum | StdlibKernel::ListMinimum) {
-                let s = self.super_var(TyBounds::ord(), span)?;
+                let s = self.kernel_duty_var(k, TyBounds::ord(), span)?;
                 let list_s = self.list_var(s)?;
                 let maybe_s = self.structure(FlatType::Con {
                     module: Vec::new(),
@@ -782,7 +782,7 @@ impl Builder<'_> {
             // the ORDERING obligation; input and output share the one bounded
             // super-var. Direct-build (not `stdlib_scheme` + tie).
             if matches!(k, StdlibKernel::ListSort) {
-                let s = self.super_var(TyBounds::ord(), span)?;
+                let s = self.kernel_duty_var(k, TyBounds::ord(), span)?;
                 let list_s = self.list_var(s)?;
                 let list_s2 = self.list_var(s)?;
                 return self.structure(FlatType::Fun(list_s, list_s2));
@@ -797,7 +797,7 @@ impl Builder<'_> {
             // `cargo` rejects. Direct-build (not stdlib_scheme + tie): only the
             // argument position is bounded.
             if matches!(k, StdlibKernel::Interpolate) {
-                let s = self.super_var(TyBounds::interpolable(), span)?;
+                let s = self.kernel_duty_var(k, TyBounds::interpolable(), span)?;
                 let string_ty = self.string_var()?;
                 return self.structure(FlatType::Fun(s, string_ty));
             }
@@ -805,7 +805,7 @@ impl Builder<'_> {
             // (a bounded super-var → Rust `IpeStringify`): a bare function (or a
             // value nesting one) fails CLOSED at type-check.
             if matches!(k, StdlibKernel::ErrorToString) {
-                let s = self.super_var(TyBounds::show(), span)?;
+                let s = self.kernel_duty_var(k, TyBounds::show(), span)?;
                 let string_ty = self.string_var()?;
                 return self.structure(FlatType::Fun(s, string_ty));
             }
@@ -840,7 +840,7 @@ impl Builder<'_> {
                 // the instant a keyed kernel is unpinned — the `Dict.singleton`
                 // hole this closes; slot 0 cannot drift out of coverage.
                 if let Some(&key_var) = vars.get(&0) {
-                    let s = self.super_var(bound, span)?;
+                    let s = self.kernel_duty_var(k, bound, span)?;
                     self.eq(span, key_var, s)?;
                 }
                 // `Set.map : (a -> b) -> Set a -> Set b` — the RESULT element
@@ -859,7 +859,7 @@ impl Builder<'_> {
                         span,
                         msg: LowerError::Unsupported(Feature::Kernels),
                     })?;
-                    let s = self.super_var(bound, span)?;
+                    let s = self.kernel_duty_var(k, bound, span)?;
                     self.eq(span, res_var, s)?;
                 }
                 return Ok(var);
@@ -890,7 +890,7 @@ impl Builder<'_> {
                     span,
                     msg: LowerError::Unsupported(Feature::Kernels),
                 })?;
-                let s = self.super_var(TyBounds::sql_param(), span)?;
+                let s = self.kernel_duty_var(k, TyBounds::sql_param(), span)?;
                 self.eq(span, params_var, s)?;
                 return Ok(var);
             }
@@ -924,7 +924,7 @@ impl Builder<'_> {
                     span,
                     msg: LowerError::Unsupported(Feature::Kernels),
                 })?;
-                let s = self.super_var(TyBounds::interpolable(), span)?;
+                let s = self.kernel_duty_var(k, TyBounds::interpolable(), span)?;
                 self.eq(span, elem_var, s)?;
                 return Ok(var);
             }
@@ -951,7 +951,7 @@ impl Builder<'_> {
                     span,
                     msg: LowerError::Unsupported(Feature::Kernels),
                 })?;
-                let s = self.super_var(TyBounds::show(), span)?;
+                let s = self.kernel_duty_var(k, TyBounds::show(), span)?;
                 self.eq(span, value_var, s)?;
                 return Ok(var);
             }

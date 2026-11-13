@@ -2951,6 +2951,7 @@ mod zonk_row_tail_tests {
                 Content::Super {
                     rigid: None,
                     bounds: TyBounds::eq(),
+                    origin: None,
                 },
                 true,
             ),
@@ -2959,6 +2960,7 @@ mod zonk_row_tail_tests {
                 Content::Super {
                     rigid: Some(name),
                     bounds: TyBounds::eq(),
+                    origin: None,
                 },
                 false,
             ),

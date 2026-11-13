@@ -3071,6 +3071,7 @@ dependencies = [
  "ipe_syntax",
  "ipe_types",
  "ipe_watch",
+ "nesting-shapes",
  "notify",
  "panic-scan",
  "proc-macro2",
@@ -3194,13 +3195,16 @@ dependencies = [
  "ipe_canon",
  "ipe_db",
  "ipe_diagnostics",
+ "ipe_env",
  "ipe_intern",
  "ipe_ir",
  "ipe_kernels",
  "ipe_parse",
  "ipe_stdlib",
  "js-sys",
+ "nesting-shapes",
  "wasm-bindgen",
+ "wasm-bindgen-test",
 ]
 
 [[package]]
@@ -4186,6 +4190,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
+]
+
+[[package]]
+name = "nesting-shapes"
+version = "0.7.3"
+dependencies = [
+ "ipe_diagnostics",
 ]
 
 [[package]]

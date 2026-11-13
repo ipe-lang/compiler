@@ -212,6 +212,8 @@ win32job = "2"
 # Turns on `test-fixtures` for this package's own test targets.
 ipe = { path = ".", features = ["test-fixtures"] }
 ipe-test-temp = { path = "../../tools/test-temp" }
+# The nesting shapes at the parser's ceiling, shared with the in-browser test.
+nesting-shapes = { path = "../../tools/nesting-shapes" }
 # Build + run plumbing shared by the golden E2E tests (tests/support/mod.rs).
 # `cargo build --message-format=json` parsing that locates the produced binary
 # lives in the `e2e_support` crate, so serde_json is pulled in transitively.

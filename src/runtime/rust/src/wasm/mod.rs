@@ -98,16 +98,38 @@ pub fn console_warn(detail: &str) {
     web_sys::console::warn_1(&JsValue::from_str(&line));
 }
 
+/// The startup judgement: `Some(true)` once every registered variable was
+/// accepted and the values read once per process were fixed. Unset means the
+/// entry never judged the environment, and the program does not start.
+static STARTUP_ACCEPTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 /// Install `console_error_panic_hook` so a residual trap (e.g. stack
 /// exhaustion from a non-TCO fold — the documented reachable residual)
 /// dies with a classified `console.error`, never a silent white screen.
+/// Then judge the environment and fix the values read once per process,
+/// before the program's first line, as a native `main` does.
 pub fn install_panic_hook() {
     console_error_panic_hook::set_once();
+    let accepted = match crate::env_registry::startup_check() {
+        Ok(()) => true,
+        Err(refusals) => {
+            for refusal in &refusals {
+                console_fatal("StartupRefused", &refusal.to_string());
+            }
+            false
+        }
+    };
+    let _ = STARTUP_ACCEPTED.set(accepted);
 }
 
 /// Drive the program's entry task on the browser microtask queue.
 /// The `Err` arm logs a classified diagnostic (there is no process to exit).
+/// A program whose environment was refused, or never judged, does not start.
 pub fn run_start<E: std::fmt::Display + 'static>(task: IpeTask<E, ()>) {
+    if STARTUP_ACCEPTED.get() != Some(&true) {
+        console_fatal("StartupRefused", "the program did not start");
+        return;
+    }
     wasm_bindgen_futures::spawn_local(async move {
         if let IpeResult::Err(e) = task.await {
             console_fatal("EntryFailed", &e.to_string());

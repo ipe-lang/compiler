@@ -31,6 +31,8 @@ pub enum Grammar {
     Ceiling(crate::system::EnvCeiling),
     /// A host list under [`crate::inbound_authority::DeclaredNames::parse`]'s rules.
     HostNames,
+    /// A credential: any non-empty Unicode text, never shown in a refusal.
+    Secret,
     /// A name no longer read; setting it is refused.
     Retired {
         /// The variable that replaced it, if any.
@@ -50,6 +52,7 @@ impl Grammar {
             Self::HostNames => {
                 "a comma-separated list of DNS names or dot-prefixed DNS suffixes".to_owned()
             }
+            Self::Secret => "a non-empty value".to_owned(),
             Self::Retired { use_instead } => use_instead.map_or_else(
                 || "unset (it is no longer read)".to_owned(),
                 |name| format!("unset (it is no longer read; use {name})"),
@@ -75,6 +78,7 @@ impl Grammar {
             Self::Choice(names) => judge(name, self, class, raw, |v| choose(names, v)).map(drop),
             Self::Ceiling(ceiling) => ceiling.parse(raw).map(drop).map_err(EnvRefusal::Ceiling),
             Self::HostNames => host_names(name, raw).map(drop),
+            Self::Secret => judge(name, self, class, raw, |_| Some(())).map(drop),
             Self::Retired { use_instead } => match raw {
                 Err(std::env::VarError::NotPresent) => Ok(()),
                 Ok(_) | Err(std::env::VarError::NotUnicode(_)) => {

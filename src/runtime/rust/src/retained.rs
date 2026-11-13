@@ -159,26 +159,16 @@ thread_local! {
     static ANCHOR: Cell<usize> = const { Cell::new(0) };
 }
 
-/// An approximation of the stack pointer: the address of a stack local.
-///
-/// The same probe as the recursion guard's (`core::approx_stack_pointer`),
-/// kept off AddressSanitizer's fake stack the same way, so the anchor and every
-/// later probe read the real stack. The address is read, never dereferenced.
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg_attr(ipe_asan, sanitize(address = "off"), inline(never))]
-#[cfg_attr(not(ipe_asan), inline)]
-fn stack_address() -> usize {
-    let anchor: u8 = 0;
-    std::ptr::from_ref(&anchor).addr()
-}
-
 /// Whether a level taken now stays within [`MEASURE_STACK`] of the outermost level.
 ///
 /// The outermost level (`held == 0`) records where the measure starts and is
-/// always within.
+/// always within. Reads the recursion guard's own stack probe
+/// ([`crate::core::approx_stack_pointer`]), so the depth backstop and the
+/// guard's red-zone check reason about one stack address, never two that
+/// could drift.
 #[cfg(not(target_arch = "wasm32"))]
 fn within_stack(held: u32) -> bool {
-    let here = stack_address();
+    let here = crate::core::approx_stack_pointer();
     ANCHOR.with(|anchor| {
         if held == 0 {
             anchor.set(here);
@@ -869,15 +859,6 @@ mod tests {
             .join()
             .expect("the measuring thread returns");
         assert_eq!(measured, (true, None, 0, true));
-    }
-
-    // The stack bound reads the same stack the recursion guard's red-zone
-    // probe reads: both probes, taken in one frame, land within one page.
-    #[test]
-    fn the_stack_probe_agrees_with_the_recursion_guard_probe() {
-        let ours = stack_address();
-        let guard = crate::core::stack_pointer_for_test();
-        assert!(ours.abs_diff(guard) <= 4096, "{ours:#x} vs {guard:#x}");
     }
 
     // The choke point is the only descent: no measure in this file reaches a
