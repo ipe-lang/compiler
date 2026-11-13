@@ -5610,6 +5610,29 @@ mod fix_tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A file named through a link is fixed at its real location, the link left a link.
+    ///
+    /// The backup sits beside the real file, never beside the link.
+    #[cfg(unix)]
+    #[test]
+    fn named_link_fix_writes_the_real_file() {
+        let (dir, real) = project("named-link");
+        let named = dir.join("named");
+        assert!(fs::create_dir_all(&named).is_ok());
+        let link = named.join("Link.ipe");
+        assert!(std::os::unix::fs::symlink(&real, &link).is_ok());
+        let resolved = fs::canonicalize(&link).unwrap_or_default();
+        let real_dir = resolved.parent().map(Path::to_path_buf).unwrap_or_default();
+        let res = write_fix(&link, &resolved, DIAGNOSED, PATCHED);
+        let backup = real_dir.join(BACKUP_DIR).join("Main.ipe.bak");
+        assert_eq!(res.ok(), Some(FixWrite::Applied(backup.clone())));
+        assert_eq!(fs::read_to_string(&real).unwrap_or_default(), PATCHED);
+        assert_eq!(fs::read_to_string(&backup).unwrap_or_default(), DIAGNOSED);
+        assert!(fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink()));
+        assert_eq!(entries(&named), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// A backup directory that is a link is refused, the file and the link's target untouched.
     #[cfg(unix)]
     #[test]
