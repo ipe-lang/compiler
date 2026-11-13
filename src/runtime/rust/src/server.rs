@@ -2880,9 +2880,9 @@ async fn build_request(
     // `server_header` (which canonicalises its lookup key) matches any caller
     // casing and the dict agrees with `Ipe.Web`'s.
     let headers = strict.headers().as_dict().clone();
-    let trust_proxy = crate::system::read_env_var("IPE_TRUSTED_PROXY")
-        .map(|v| !v.is_empty() && v != "0" && v != "false")
-        .unwrap_or(false);
+    let trust_proxy = crate::env_registry::security::security_posture()
+        .trusted_proxy
+        .trusts();
     let peer = req
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
@@ -5722,24 +5722,14 @@ where
 }
 
 /// Whether to trust `X-Forwarded-Proto` (and friends) for TLS-termination
-/// detection. Mirrors `build_request`'s existing `IPE_TRUSTED_PROXY` gate for
-/// `remoteAddr` (line ~497 above) and `live/mod.rs`'s `trust_proxy_headers()`
-/// for the session cookie's `Secure` gate — same env var, same rationale: a
-/// client-supplied header must never be trusted by default, an operator opts
-/// in only when a real reverse proxy sits in front of this process.
-///
-/// Snapshotted once (env is stable at process start; same rationale as
-/// `csrf_cookie_name`'s production check being re-read per call is fine
-/// because it's a plain fn call, but this one backs a per-request hot path so
-/// it's cached like `live/mod.rs`'s twin).
+/// detection: the process's `IPE_TRUSTED_PROXY` posture, the same one
+/// `build_request` reads for `remoteAddr`. A client-supplied header is never
+/// trusted by default; an operator opts in only when a real reverse proxy sits
+/// in front of this process.
 fn trust_proxy_headers() -> bool {
-    use std::sync::OnceLock;
-    static TRUST: OnceLock<bool> = OnceLock::new();
-    *TRUST.get_or_init(|| {
-        crate::system::read_env_var("IPE_TRUSTED_PROXY")
-            .map(|v| !v.is_empty() && v != "0" && v != "false")
-            .unwrap_or(false)
-    })
+    crate::env_registry::security::security_posture()
+        .trusted_proxy
+        .trusts()
 }
 
 /// Request-scoped HTTPS detection, parameterised on the trust decision so

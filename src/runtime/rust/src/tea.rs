@@ -1335,9 +1335,9 @@ where
         let mut eof_seen = false;
 
         let (mut model, cmd0) = init(());
-        // Time-travel recorder above the sink: cfg-gated, records each accepted
-        // `(msg, model)` after `update` while `IPE_DEBUGGER_RECORD` names a
-        // destination. Bounded ring (`DEFAULT_HISTORY_CAP`); zero code when the
+        // Time-travel recorder above the sink: cfg-gated, runs each `update`
+        // as a recorded step (in flight before, settled after) while
+        // `IPE_DEBUGGER_RECORD` names a destination. Bounded ring (`DEFAULT_HISTORY_CAP`); zero code when the
         // feature is off.
         #[cfg(feature = "debugger")]
         let recorder = crate::debugger::record_sink::start(model.clone(), codec);
@@ -1440,13 +1440,13 @@ where
             let mut cmds = Vec::with_capacity(msgs.len());
             for msg in msgs {
                 #[cfg(feature = "debugger")]
-                let msg_for_recorder = recorder.as_ref().map(|_| msg.clone());
+                let (next, cmd) = match &recorder {
+                    Some(recording) => recording.step(msg, model, &update),
+                    None => update(msg, model),
+                };
+                #[cfg(not(feature = "debugger"))]
                 let (next, cmd) = update(msg, model);
                 model = next;
-                #[cfg(feature = "debugger")]
-                if let (Some(recording), Some(msg)) = (&recorder, msg_for_recorder) {
-                    recording.record(msg, model.clone(), &update);
-                }
                 cmds.push(cmd);
                 submgr.update(subscriptions(model.clone()));
             }
@@ -1744,8 +1744,8 @@ where
 
         let (mut model, cmd0) = init(());
         // Time-travel recorder above the view-less worker sink: cfg-gated,
-        // records each accepted `(msg, model)` after `update`. Bounded ring
-        // (`DEFAULT_HISTORY_CAP`); zero code when the feature is off. A worker has
+        // runs each `update` as a recorded step (in flight before, settled
+        // after). Bounded ring (`DEFAULT_HISTORY_CAP`); zero code when the feature is off. A worker has
         // no view surface, so no appearance hot-swap applies — the recorder is
         // for replay/inspection only.
         #[cfg(feature = "debugger")]
@@ -1774,13 +1774,13 @@ where
                 }
             };
             #[cfg(feature = "debugger")]
-            let msg_for_recorder = recorder.as_ref().map(|_| msg.clone());
+            let (next, cmd) = match &recorder {
+                Some(recording) => recording.step(msg, model, &update),
+                None => update(msg, model),
+            };
+            #[cfg(not(feature = "debugger"))]
             let (next, cmd) = update(msg, model);
             model = next;
-            #[cfg(feature = "debugger")]
-            if let (Some(recording), Some(msg)) = (&recorder, msg_for_recorder) {
-                recording.record(msg, model.clone(), &update);
-            }
             worker_run_cmd(cmd, &tx, &outstanding);
             subs.reconcile(subscriptions(model.clone()));
             live_subs = subs.live();

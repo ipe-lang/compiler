@@ -370,7 +370,8 @@ static HAND_TABLE: &[EnvVar] = &[
         purpose: "Per-process control token for the dev-only appearance-hot-swap \
                   endpoint. `ipe dev watch` sets it and sends it as `X-Ipe-Hot-Token`; a \
                   request whose token does not constant-time-match is refused. \
-                  Dev-only; the endpoint is never mounted in a release build.",
+                  Dev-only; the endpoint is never mounted in a release build. Read once \
+                  at process start.",
         subsystem: Subsystem::Build,
         class: Class::Secret,
     },
@@ -420,36 +421,6 @@ static HAND_TABLE: &[EnvVar] = &[
         class: Class::Tunable,
     },
     // ── Console ───────────────────────────────────────────────────────────────
-    EnvVar {
-        name: "IPE_ADMIN_TOKEN",
-        default: Cow::Borrowed("unset"),
-        purpose: "Admin token (`Bearer`, or the `Basic` password) granting access to the \
-                  embedded developer console and `/_ipe/metrics` in production or under \
-                  `IPE_CONSOLE_AUTH=token`. Provide via your secret manager; never commit. \
-                  Falls back to the in-code `Console.adminToken`, then `IPE_CONSOLE_TOKEN`. \
-                  A non-UTF-8 value refuses every admin request and keeps the console \
-                  unmounted in production.",
-        subsystem: Subsystem::Console,
-        class: Class::Secret,
-    },
-    EnvVar {
-        name: "IPE_CONSOLE_AUTH",
-        default: Cow::Borrowed("unset (token; open only in a dev build on loopback)"),
-        purpose: "Console authentication mode: `token` (admin-token gate, enforced in \
-                  every posture, dev included), `off` (console disabled), `app` (app \
-                  callback; mounted but answers 501 on the Rust runtime). The posture \
-                  picks the default only when the variable is unset or blank: a binary \
-                  from `ipe dev build`, `ipe dev run`, `ipe test` or `ipe dev watch` in development \
-                  posture bound to loopback defaults open; every other binary, including \
-                  every `ipe release` artifact, and every exposed bind default to \
-                  `token`, so the console stays closed until a credential is set. Any other \
-                  value (including a non-UTF-8 one) disables the console. The effective \
-                  posture, mode, and source are logged once at startup \
-                  (`[ipe.console] auth posture=… mode=… source=env|env-invalid|posture-default`); \
-                  no token is ever logged.",
-        subsystem: Subsystem::Console,
-        class: Class::SecurityTunable,
-    },
     EnvVar {
         name: "IPE_CONSOLE_BATCH_INTERVAL_MS",
         default: Cow::Borrowed("2000"),
@@ -510,14 +481,6 @@ static HAND_TABLE: &[EnvVar] = &[
         class: Class::Secret,
     },
     EnvVar {
-        name: "IPE_CONSOLE_TOKEN",
-        default: Cow::Borrowed("unset"),
-        purpose: "Deprecated alias for `IPE_ADMIN_TOKEN`. Prefer `IPE_ADMIN_TOKEN`. \
-                  Provide via your secret manager; never commit.",
-        subsystem: Subsystem::Console,
-        class: Class::Secret,
-    },
-    EnvVar {
         name: "IPE_CONSOLE_URL",
         default: Cow::Borrowed("unset (auto-detected sub-path)"),
         purpose: "Explicit URL at which the developer console is reachable. Overrides \
@@ -532,26 +495,6 @@ static HAND_TABLE: &[EnvVar] = &[
                   into HTML responses. The banner is never shown in production.",
         subsystem: Subsystem::Console,
         class: Class::Tunable,
-    },
-    EnvVar {
-        name: "IPE_INGEST_TOKEN",
-        default: Cow::Borrowed("unset"),
-        purpose: "Bearer token the parent ingest gate checks on `X-Ipê-Ingest-Token`. \
-                  Required when a sub-app pushes telemetry to a parent app's \
-                  `/_ipe/ingest` endpoint. Provide via your secret manager.",
-        subsystem: Subsystem::Console,
-        class: Class::Secret,
-    },
-    EnvVar {
-        name: "IPE_METRICS_TOKEN",
-        default: Cow::Borrowed("unset"),
-        purpose: "Metrics-scrape token (`Bearer`, or the `Basic` password) authorizing \
-                  `/_ipe/metrics` only, never the console; the admin token is accepted \
-                  there too. Falls back to the in-code `Console.metricsToken`. A non-UTF-8 \
-                  value refuses every metrics-token request. Provide via your secret \
-                  manager; never commit.",
-        subsystem: Subsystem::Console,
-        class: Class::Secret,
     },
     // ── Compiler ──────────────────────────────────────────────────────────────
     EnvVar {
@@ -619,15 +562,6 @@ static HAND_TABLE: &[EnvVar] = &[
                   unbounded CSV streams.",
         subsystem: Subsystem::Csv,
         class: Class::Tunable,
-    },
-    EnvVar {
-        name: "IPE_CSV_SANITIZE_FORMULAS",
-        default: Cow::Borrowed("unset (false)"),
-        purpose: "Set to `1`, `on`, `true`, or `yes` to prefix formula-injection \
-                  characters (`=`, `+`, `-`, `@`) with a single quote in CSV output, \
-                  preventing spreadsheet formula injection.",
-        subsystem: Subsystem::Csv,
-        class: Class::SecurityTunable,
     },
     // ── Regex ─────────────────────────────────────────────────────────────────
     EnvVar {
@@ -812,19 +746,6 @@ static HAND_TABLE: &[EnvVar] = &[
         class: Class::SecurityTunable,
     },
     EnvVar {
-        name: "IPE_HTTP_DENY_PRIVATE",
-        default: Cow::Borrowed("unset (on, except a development binary with no exposed listener)"),
-        purpose: "Set to `1`, `on`, or `true` to block all outbound HTTP / SMTP / \
-                  database connections to RFC-1918 private, loopback, and link-local \
-                  addresses, closing the SSRF attack surface; `0`, `off`, or `false` \
-                  disables it. Unset, the guard is on in every `ipe release` artifact \
-                  and production posture, and off only in a development binary in a \
-                  dev posture that has bound no listener beyond loopback. Any other \
-                  value turns the guard on and logs one warning.",
-        subsystem: Subsystem::Http,
-        class: Class::SecurityTunable,
-    },
-    EnvVar {
         name: "IPE_HTTP_DNS_TIMEOUT_MS",
         default: Cow::Borrowed("5000 (5 s)"),
         purpose: "Deadline (ms) for each SSRF-gate DNS resolve (HTTP, WebSocket, database, \
@@ -872,7 +793,7 @@ static HAND_TABLE: &[EnvVar] = &[
                   binaries read as development, `ipe release` artifacts as production. \
                   An `ipe release` artifact is production whatever this says: a dev \
                   marker there opens no dev-only surface and logs one notice. Also \
-                  accepted as bare `ENV`.",
+                  accepted as bare `ENV`. Read once at process start.",
         subsystem: Subsystem::Observability,
         class: Class::Tunable,
     },
@@ -1031,15 +952,6 @@ static HAND_TABLE: &[EnvVar] = &[
         class: Class::Secret,
     },
     EnvVar {
-        name: "IPE_CSRF",
-        default: Cow::Borrowed("unset (on)"),
-        purpose: "Set to `off`, `0`, or `false` to disable CSRF protection. \
-                  Disabling widens the trust boundary — only safe on loopback in \
-                  automated tests.",
-        subsystem: Subsystem::Web,
-        class: Class::SecurityTunable,
-    },
-    EnvVar {
         name: "IPE_REVOCATION_CAPACITY",
         default: Cow::Borrowed("1048576 (2^20)"),
         purpose: "Maximum number of entries in the per-process token revocation store. \
@@ -1047,16 +959,6 @@ static HAND_TABLE: &[EnvVar] = &[
                   for very high user volumes with token revocation enabled.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
-    },
-    EnvVar {
-        name: "IPE_TRUSTED_PROXY",
-        default: Cow::Borrowed("unset (false)"),
-        purpose: "Set to any truthy value to trust `X-Forwarded-For` / \
-                  `X-Forwarded-Proto` headers for remote-address and TLS detection. \
-                  Enable only when a trusted reverse proxy sits in front of this \
-                  process; leaving unset prevents clients from forging these headers.",
-        subsystem: Subsystem::Web,
-        class: Class::SecurityTunable,
     },
     EnvVar {
         name: "IPE_WEB_BANNER",
@@ -1093,7 +995,8 @@ static HAND_TABLE: &[EnvVar] = &[
                   `X-Frame-Options: SAMEORIGIN`). Set, it enables embedding \
                   this app in a third-party iframe; also sets `SameSite=None; Secure` on session \
                   cookies. A value holding a control or non-ASCII byte, a `;` or `,`, \
-                  or only whitespace refuses to start the server.",
+                  or only whitespace refuses to start the server. Read once \
+                  at startup.",
         subsystem: Subsystem::Web,
         class: Class::SecurityTunable,
     },
@@ -1200,7 +1103,7 @@ static HAND_TABLE: &[EnvVar] = &[
         name: "IPE_WEB_STATIC_DIR",
         default: Cow::Borrowed("unset"),
         purpose: "Directory served at `/static/*`, set by whoever runs the app. \
-                  Path traversal is blocked by construction.",
+                  Read once at startup. Path traversal is blocked by construction.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
