@@ -312,6 +312,10 @@ package.ipe: could not locate the `package` record's closing `}` to add a depend
 
 package.ipe: the `package` record's closing `}` is out of range
 
+## package-manifest-changed
+
+package.ipe changed while ipe was editing its dependencies; nothing was written; run the command again
+
 ## init-shape-needs-value
 
 ipe init: `--shape` requires a value: script, tui, cli, worker, server, web
@@ -1160,6 +1164,14 @@ package `{package}`: path dependency "{raw}" names a Windows device (`CON`, `NUL
 ## lock-non-utf8-local-path
 
 package `{package}`: path dependency `{path}` is not valid UTF-8 and cannot be recorded in ipe.lock
+
+## lock-changed
+
+ipe.lock changed while ipe was writing it; nothing was written to it; run the command again
+
+## lock-behind-manifest
+
+package.ipe was updated but ipe.lock was not; run the command again to bring ipe.lock in line
 
 # Version refusals
 

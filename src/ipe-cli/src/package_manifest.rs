@@ -45,10 +45,12 @@
 //! the allocator vocabulary, and the wrapper path jail.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use ipe_diagnostics::{Located, Span};
+use ipe_fs_open::FileId;
 use ipe_intern::Interner;
 use ipe_syntax::{Expr, Expr_, Module};
 
@@ -61,6 +63,7 @@ use ipe_runtime_rust::encoding::{
 
 use crate::CliError;
 use crate::delivery_set::{BinaryTarget, ShipEntry};
+use crate::output_dir::held::{HeldDir, Replaced};
 use crate::project::{
     ApnsEnvironment, BUNDLE_ID_EXAMPLE, BrowserDelivery, BundleId, BundleIdRefusal, Capability,
     DeliveryConfig, DesktopDelivery, EntryShape, FcmApiKey, FcmApplicationId, FcmIdentifierRefusal,
@@ -2204,7 +2207,58 @@ const fn allocator_ctor_name(alloc: crate::build_plan::AllocatorChoice) -> &'sta
 // its formatting, comments, and sibling entries. A full re-render is avoided
 // deliberately — it would reflow the entire file.
 
-/// Upsert an INDEX dependency `dep "<name>" "<req>"` into a `package.ipe`'s
+/// A `package.ipe` dependency edit planned against the bytes read, written only while they are still there.
+///
+/// Planned by [`upsert_index_dependency`] or [`remove_manifest_dependency`]
+/// from one read through the held project directory; [`ManifestEdit::apply`]
+/// replaces the file through the held writer, re-proving the judged file
+/// right before the rename.
+#[derive(Debug)]
+#[must_use = "a planned manifest edit writes nothing until it is applied"]
+pub struct ManifestEdit {
+    /// The identity of the handle the manifest was read through.
+    id: FileId,
+    /// The exact text read.
+    judged: String,
+    /// The text after the edit.
+    updated: String,
+}
+
+impl ManifestEdit {
+    /// Write the edit, only while `package.ipe` still is the judged file holding the judged text.
+    ///
+    /// An edit that changes nothing writes nothing.
+    ///
+    /// # Errors
+    /// [`CliError::ProjectRefused`] when the manifest changed since it was
+    /// read, nothing written; [`CliError::Io`] on a filesystem failure, the
+    /// manifest untouched.
+    pub(crate) fn apply(self, project: &HeldDir) -> Result<(), CliError> {
+        if self.updated == self.judged {
+            return Ok(());
+        }
+        let updated = self.updated;
+        let fill = |file: &mut std::fs::File| std::io::Write::write_all(file, updated.as_bytes());
+        match project.replace_if_unchanged(
+            OsStr::new(PACKAGE_IPE),
+            self.id,
+            &self.judged,
+            crate::io_bounded::MANIFEST_CAP,
+            fill,
+        )? {
+            Replaced::Done => Ok(()),
+            Replaced::Changed => Err(refused(text::msg::package_manifest_changed())),
+        }
+    }
+}
+
+/// Read the `package.ipe` of the held project directory `project`, never through a link, with the identity of the handle read.
+fn read_judged_manifest(project: &HeldDir) -> Result<(String, FileId), CliError> {
+    let name = project.entry(OsStr::new(PACKAGE_IPE))?;
+    project.read_file_capped_identified(&name, crate::io_bounded::MANIFEST_CAP)
+}
+
+/// Plan an INDEX dependency `dep "<name>" "<req>"` upserted into a `package.ipe`'s
 /// `dependencies` list, preserving the author's formatting.
 ///
 /// Idempotent by construction: an absent `dependencies` field gains one holding
@@ -2214,47 +2268,53 @@ const fn allocator_ctor_name(alloc: crate::build_plan::AllocatorChoice) -> &'sta
 /// NEVER overwritten or converted — the escape is author-owned and lockfile-only
 /// by design, so `ipe add` for an index dep that collides with an escape is a
 /// typed refusal rather than a silent corruption. The emitted entry re-parses
-/// through [`read_package_manifest`] (the round-trip SEAL).
+/// through [`read_package_manifest`] (the round-trip SEAL). The manifest is
+/// read once through `project`, never through a link; nothing is written
+/// until the returned edit is applied.
 ///
 /// # Errors
-/// [`CliError::Io`] if the manifest cannot be read or written;
+/// [`CliError::Io`] if the manifest cannot be read;
+/// [`CliError::SourceRefused`] if it is a link or not a regular file;
 /// [`CliError::Pipeline`] if the manifest does not parse; [`CliError::ProjectRefused`]
 /// if the manifest shape is unexpected (no `package` record, a non-list
 /// `dependencies`) or the name collides with an author-written escape entry.
-pub fn upsert_index_dependency(
-    manifest_path: &Path,
+pub(crate) fn upsert_index_dependency(
+    project: &HeldDir,
     name: &str,
     req: &semver::VersionReq,
-) -> Result<(), CliError> {
-    let text =
-        crate::io_bounded::read_leaf_capped(manifest_path, crate::io_bounded::MANIFEST_READ_CAP)?;
+) -> Result<ManifestEdit, CliError> {
+    let (judged, id) = read_judged_manifest(project)?;
     let entry = format!("dep {} {}", quote(name), quote(&req.to_string()));
-    let updated = edit_dependencies_list(&text, manifest_path, name, Some(&entry))?;
-    write_manifest_file(manifest_path, &updated)
+    let manifest_path = project.path().join(PACKAGE_IPE);
+    let updated = edit_dependencies_list(&judged, &manifest_path, name, Some(&entry))?;
+    Ok(ManifestEdit {
+        id,
+        judged,
+        updated,
+    })
 }
 
-/// Remove an index (or escape) dependency entry named `name` from a
+/// Plan an index (or escape) dependency entry named `name` removed from a
 /// `package.ipe`'s `dependencies` list, preserving the rest of the file.
 ///
-/// A name that is not present is a no-op (the file is rewritten unchanged), so an
+/// A name that is not present is a no-op (the edit writes nothing), so an
 /// add→remove cycle leaves the manifest as it began.
 ///
 /// # Errors
 /// As [`upsert_index_dependency`], minus the escape-collision refusal (a remove
 /// legitimately drops any matching entry, escape or index).
-pub fn remove_manifest_dependency(manifest_path: &Path, name: &str) -> Result<(), CliError> {
-    let text =
-        crate::io_bounded::read_leaf_capped(manifest_path, crate::io_bounded::MANIFEST_READ_CAP)?;
-    let updated = edit_dependencies_list(&text, manifest_path, name, None)?;
-    write_manifest_file(manifest_path, &updated)
-}
-
-/// Write `text` to the user's `manifest_path` atomically, never truncating in place.
-///
-/// The edit is the one dependency entry the user asked to add or drop, with the
-/// rest of the file preserved, so no backup is kept.
-fn write_manifest_file(manifest_path: &Path, text: &str) -> Result<(), CliError> {
-    crate::rewrite_user_file(manifest_path, text, crate::RewriteKind::Lossless).map(|_| ())
+pub(crate) fn remove_manifest_dependency(
+    project: &HeldDir,
+    name: &str,
+) -> Result<ManifestEdit, CliError> {
+    let (judged, id) = read_judged_manifest(project)?;
+    let manifest_path = project.path().join(PACKAGE_IPE);
+    let updated = edit_dependencies_list(&judged, &manifest_path, name, None)?;
+    Ok(ManifestEdit {
+        id,
+        judged,
+        updated,
+    })
 }
 
 /// The located byte span of a dependency entry inside the `dependencies` list,
@@ -4450,18 +4510,26 @@ mod tests {
     fn write_and_read_manifest(
         test_name: &str,
         source: &str,
-        edit: impl FnOnce(&Path) -> Result<(), CliError>,
+        edit: impl FnOnce(&HeldDir) -> Result<ManifestEdit, CliError>,
     ) -> (String, Result<ProjectManifest, CliError>) {
         let root = fresh_project(test_name);
         let path = root.join(PACKAGE_IPE);
         std::fs::write(&path, source).expect("write package.ipe");
-        let edit_result = edit(&path);
+        let project = held_project(&root);
+        let edit_result = edit(&project).and_then(|planned| planned.apply(&project));
         let text = std::fs::read_to_string(&path).expect("read back");
         // Re-parse the rewritten manifest through the reader — the round-trip SEAL.
         let reparsed = parse_package_manifest(&path);
         let _ = std::fs::remove_dir_all(&root);
         edit_result.expect("the edit itself must succeed for these fixtures");
         (text, reparsed)
+    }
+
+    /// Hold the project directory `root`.
+    fn held_project(root: &Path) -> HeldDir {
+        HeldDir::open_following(root)
+            .expect("open the project directory")
+            .expect("the project directory exists")
     }
 
     fn req(s: &str) -> semver::VersionReq {
@@ -4547,7 +4615,7 @@ mod tests {
         let root = fresh_project("writer_escape_refuse");
         let path = root.join(PACKAGE_IPE);
         std::fs::write(&path, &source).expect("write");
-        let err = upsert_index_dependency(&path, "locallib", &req("^1"))
+        let err = upsert_index_dependency(&held_project(&root), "locallib", &req("^1"))
             .expect_err("an index add over an escape name must be refused");
         let after = std::fs::read_to_string(&path).expect("read back");
         let _ = std::fs::remove_dir_all(&root);
@@ -4611,6 +4679,32 @@ mod tests {
         );
         let m = reparsed.expect("re-parses");
         assert_eq!(m.declared().len(), 1);
+    }
+
+    /// A manifest edited after `ipe add` read it is left as edited, nothing written over it.
+    #[test]
+    fn concurrent_edit_refused() {
+        let source =
+            format!("{MANIFEST_HEADER}package : Package\npackage =\n    {{ name = \"app\" }}\n");
+        let edited = format!(
+            "{MANIFEST_HEADER}package : Package\npackage =\n    {{ name = \"app-renamed\" }}\n"
+        );
+        let root = fresh_project("writer_concurrent_edit");
+        let path = root.join(PACKAGE_IPE);
+        std::fs::write(&path, &source).expect("write package.ipe");
+        let project = held_project(&root);
+        let planned = upsert_index_dependency(&project, "http-extras", &req("^1"))
+            .expect("the add is planned against the bytes read");
+        std::fs::write(&path, &edited).expect("edit package.ipe meanwhile");
+        let applied = planned.apply(&project);
+        let after = std::fs::read_to_string(&path).expect("read back");
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            matches!(&applied, Err(CliError::ProjectRefused(msg))
+                if msg.to_string() == text::package_manifest_changed()),
+            "a manifest changed since it was read is refused: {applied:?}"
+        );
+        assert_eq!(after, edited, "the concurrent edit survives");
     }
 
     /// A dependency name declared twice is refused at the entry, never resolved

@@ -765,6 +765,8 @@ messages! {
     package_manifest_deps_brace_not_found = "package-manifest-deps-brace-not-found";
     /// `ipe add` found the `package` record's closing brace out of range.
     package_manifest_deps_brace_out_of_range = "package-manifest-deps-brace-out-of-range";
+    /// `ipe add`/`ipe remove` found `package.ipe` changed after reading it.
+    package_manifest_changed = "package-manifest-changed";
     /// `ipe health --yes` with a data form.
     health_yes_with_format = "health-yes-with-format";
     /// `ipe fmt --stdin` with a path.
@@ -1172,6 +1174,10 @@ messages! {
     lock_local_source_device(package, raw) = "lock-local-source-device";
     /// A path dependency's path is not valid UTF-8.
     lock_non_utf8_local_path(package, path) = "lock-non-utf8-local-path";
+    /// `ipe.lock` changed after it was read for a rewrite.
+    lock_changed = "lock-changed";
+    /// `package.ipe` was written but `ipe.lock` was not.
+    lock_behind_manifest = "lock-behind-manifest";
     /// A version string that is not valid semver.
     version_refused_malformed(raw, reason) = "version-refused-malformed";
     /// A version carrying build metadata.
