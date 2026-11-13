@@ -22,7 +22,8 @@ use ipe_ir::Capability;
 
 use crate::CliError;
 use crate::index::{self, EntryVersion, PinnedRev, Sha256Hex, SourceUrl};
-use crate::lockfile::{LockedDep, LockedOrigin, Lockfile};
+use crate::lockfile::{JudgedLock, LockedDep, LockedOrigin, Lockfile};
+use crate::output_dir::held::HeldDir;
 use crate::package_name::PackageName;
 use crate::published_version::PublishedVersion;
 use crate::remote_ingest::{
@@ -153,12 +154,15 @@ fn resolve_and_add_within(
 /// and `ipe.lock`. A clean add→remove cycle leaves both files as they began.
 ///
 /// # Errors
-/// [`CliError::Io`] if the manifest or lockfile cannot be read or written.
+/// [`CliError::Io`] if the manifest or lockfile cannot be read or written;
+/// [`CliError::SourceRefused`] for a link at either; a refusal when either
+/// changed since it was read, as [`write_both`] reports it.
 pub fn resolve_and_remove(project_root: &Path, name: &str) -> Result<(), CliError> {
-    crate::package_manifest::remove_manifest_dependency(&manifest_path(project_root), name)?;
-    let mut lock = Lockfile::read(project_root)?;
+    let project = held_project(project_root)?;
+    let manifest = crate::package_manifest::remove_manifest_dependency(&project, name)?;
+    let (mut lock, judged_lock) = Lockfile::read_judged(&project)?;
     let was_locked = lock.remove(name);
-    lock.write(project_root)?;
+    write_both(&project, manifest, &lock, judged_lock)?;
     if was_locked {
         crate::screen::Screen::new(crate::screen::Stream::Stdout)
             .line(crate::screen::Tone::Text, &format!("Removed `{name}`."))
@@ -350,13 +354,46 @@ fn signature_verifier() -> Box<dyn crate::signing::SignatureVerifier> {
     Box::new(crate::signing::UnavailableVerifier)
 }
 
-/// The manifest path for a project root — the `package.ipe` the toolchain reads.
+/// Hold the project root `ipe add` and `ipe remove` rewrite `package.ipe` and `ipe.lock` in.
 ///
-/// `ipe add` must record the requirement in this file (not a legacy `ipe.toml`),
-/// or a fresh clone + resolve would lose the dependency: the lockfile pins an
-/// exact version but is regenerated from the manifest's requirements.
-fn manifest_path(project_root: &Path) -> PathBuf {
-    project_root.join(crate::package_manifest::PACKAGE_IPE)
+/// Both files are read and written through this one held directory, so a
+/// swapped path between the read and the write reaches neither.
+///
+/// # Errors
+/// [`CliError::Io`] when the project root is absent or cannot be opened;
+/// [`CliError::OutputRefused`] when it is not a directory.
+fn held_project(project_root: &Path) -> Result<HeldDir, CliError> {
+    HeldDir::open_following(project_root)?.ok_or_else(|| CliError::Io {
+        path: project_root.to_path_buf(),
+        source: std::io::ErrorKind::NotFound.into(),
+    })
+}
+
+/// Write the planned `manifest` edit, then `lock` over what `judged_lock` says `ipe.lock` held.
+///
+/// Both files were read before either is written, so a refused read (a link,
+/// a malformed lockfile) leaves both untouched. A lockfile write that fails
+/// after the manifest was written says so before its own error, never a silent
+/// half state: running the command again brings `ipe.lock` in line, since
+/// both edits are idempotent.
+///
+/// # Errors
+/// As [`crate::package_manifest::ManifestEdit::apply`] and
+/// [`Lockfile::write_over`].
+fn write_both(
+    project: &HeldDir,
+    manifest: crate::package_manifest::ManifestEdit,
+    lock: &Lockfile,
+    judged_lock: JudgedLock,
+) -> Result<(), CliError> {
+    manifest.apply(project)?;
+    lock.write_over(project, judged_lock).inspect_err(|_| {
+        crate::screen::chatter(
+            crate::screen::Stream::Stderr,
+            crate::screen::Tone::UserError,
+            crate::text::lock_behind_manifest(),
+        );
+    })
 }
 
 /// Which fetched source a package cache directory holds.
@@ -953,16 +990,18 @@ fn write_records(
     locked: &LockedDep,
     req: &semver::VersionReq,
 ) -> Result<(), CliError> {
-    // Write the manifest FIRST: the rewrite fails closed (e.g. an index add
-    // that collides with an author-written escape is refused), and doing it
-    // before the lockfile keeps the two files consistent — a refusal leaves
-    // BOTH untouched rather than a lockfile pin with no manifest requirement.
-    // Only an INDEX requirement is written into the manifest: a `depGit` or
-    // `depPath` entry is author-written, never recorded here.
-    crate::package_manifest::upsert_index_dependency(&manifest_path(project_root), name, req)?;
-    let mut lock = Lockfile::read(project_root)?;
+    // Plan the manifest edit and read the lockfile BEFORE writing either: the
+    // manifest edit fails closed (an index add that collides with an
+    // author-written escape is refused) and the lockfile read refuses a link
+    // or a malformed file, so every refusal leaves BOTH untouched rather than
+    // a lockfile pin with no manifest requirement. Only an INDEX requirement
+    // is written into the manifest: a `depGit` or `depPath` entry is
+    // author-written, never recorded here.
+    let project = held_project(project_root)?;
+    let manifest = crate::package_manifest::upsert_index_dependency(&project, name, req)?;
+    let (mut lock, judged_lock) = Lockfile::read_judged(&project)?;
     lock.upsert(locked.clone());
-    lock.write(project_root)
+    write_both(&project, manifest, &lock, judged_lock)
 }
 
 /// Print the resolved version and its capability set for consent.
@@ -1017,7 +1056,7 @@ mod tests {
     use super::{
         CacheSlot, GitStepError, INDEX_DIR_ENV, Wanted, added_report, cache_base_from, cache_dir,
         dep_cache_dir, fetch_advertised, fetch_and_verify_index_version_within, fetch_git_into,
-        hash_checkout, hash_source_tree, index_root_from, parse_advertisement,
+        hash_checkout, hash_source_tree, held_project, index_root_from, parse_advertisement,
         resolve_and_add_within, resolve_and_remove, stage_origin, verify_hash,
         verify_locked_hashes, verify_lockfile_hashes,
     };
@@ -1194,7 +1233,9 @@ mod tests {
             },
             sha256: Sha256Hex::of_tree(&cache).expect("hash"),
         });
-        lock.write(proj).expect("lock written");
+        let project = held_project(proj).expect("hold the project");
+        let (_, judged) = Lockfile::read_judged(&project).expect("read the lock judged");
+        lock.write_over(&project, judged).expect("lock written");
         lock
     }
 

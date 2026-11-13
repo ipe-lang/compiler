@@ -18,13 +18,16 @@
 //! so two runs that resolve the same set produce byte-identical lockfiles (a
 //! stable diff, no spurious churn).
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use ipe_diagnostics::terminal::DisplayHazard;
+use ipe_fs_open::FileId;
 
 use crate::CliError;
 use crate::index::{PinnedRev, RemotePath, RevSite, Sha256Hex, SourceUrl};
 use crate::line_grammar::{LineFault, LineKey, LineShape, TextLine};
+use crate::output_dir::held::{self, Created, HeldDir, ReadMiss, Replaced};
 use crate::package_name::PackageName;
 use crate::published_version::PublishedVersion;
 
@@ -134,6 +137,8 @@ pub enum LockRefusal {
         /// The first hazardous character and its position in the comment.
         hazard: DisplayHazard,
     },
+    /// `ipe.lock` is no longer the file read, or no longer holds the bytes read; nothing was written.
+    ChangedSinceRead,
 }
 
 /// The header opening one `[[package]]` record.
@@ -268,6 +273,7 @@ impl std::fmt::Display for LockRefusal {
                 &format!("{:04X}", u32::from(hazard.ch())),
                 &crate::text::lock_remedy(),
             ),
+            Self::ChangedSinceRead => crate::text::msg::lock_changed(),
         })
     }
 }
@@ -469,6 +475,20 @@ pub struct Lockfile {
     packages: Vec<LockedDep>,
 }
 
+/// What `ipe.lock` held when [`Lockfile::read_judged`] read it, the only ground a rewrite replaces.
+#[derive(Debug)]
+pub enum JudgedLock {
+    /// No entry had the name.
+    Absent,
+    /// The regular file `id` held exactly `text`.
+    Present {
+        /// The identity of the handle read.
+        id: FileId,
+        /// The exact text read.
+        text: String,
+    },
+}
+
 impl Lockfile {
     /// Read the lockfile at `project_root/ipe.lock`.
     ///
@@ -509,15 +529,62 @@ impl Lockfile {
         parse(text)
     }
 
-    /// Write the lockfile to `project_root/ipe.lock`, packages sorted by name.
+    /// Read the `ipe.lock` of the held project directory `project` for a rewrite, with what it held.
     ///
-    /// The write is atomic, so an interrupted write never leaves a truncated
-    /// lockfile.
+    /// The file is opened through `project` without following a link and
+    /// under [`crate::io_bounded::SMALL_FILE_CAP`]; a missing lockfile is an
+    /// empty lockfile judged [`JudgedLock::Absent`].
     ///
     /// # Errors
+    /// As [`Lockfile::read`]: a link or a non-regular file at `ipe.lock` is
+    /// [`CliError::SourceRefused`].
+    pub(crate) fn read_judged(project: &HeldDir) -> Result<(Self, JudgedLock), CliError> {
+        let name = project.entry(OsStr::new(LOCKFILE_NAME))?;
+        match project.read_file_capped_identified(&name, crate::io_bounded::SMALL_FILE_CAP) {
+            Ok((text, id)) => Ok((Self::from_text(&text)?, JudgedLock::Present { id, text })),
+            Err(e) if held::read_miss(&e) == ReadMiss::Absent => {
+                Ok((Self::default(), JudgedLock::Absent))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Write the lockfile over what `judged` says `ipe.lock` held, packages sorted by name.
+    ///
+    /// Through the held writer: an absent lockfile is created, never replacing
+    /// an entry that appeared since; a present one is replaced only while it
+    /// still is the judged file holding the judged bytes. A link at `ipe.lock`
+    /// is never followed or replaced. An unchanged rendering writes nothing.
+    ///
+    /// # Errors
+    /// [`CliError::LockRefused`] with [`LockRefusal::ChangedSinceRead`] when
+    /// `ipe.lock` changed since it was judged, nothing written;
     /// [`CliError::Io`] if the file cannot be written.
-    pub fn write(&self, project_root: &Path) -> Result<(), CliError> {
-        crate::driver::write_atomic(&Self::path(project_root), &self.render())
+    pub(crate) fn write_over(&self, project: &HeldDir, judged: JudgedLock) -> Result<(), CliError> {
+        let rendered = self.render();
+        let fill = |file: &mut std::fs::File| std::io::Write::write_all(file, rendered.as_bytes());
+        let name = OsStr::new(LOCKFILE_NAME);
+        let written = match judged {
+            JudgedLock::Absent => matches!(project.create_if_absent(name, fill)?, Created::Done),
+            JudgedLock::Present { id, text } => {
+                text == rendered
+                    || matches!(
+                        project.replace_if_unchanged(
+                            name,
+                            id,
+                            &text,
+                            crate::io_bounded::SMALL_FILE_CAP,
+                            fill
+                        )?,
+                        Replaced::Done
+                    )
+            }
+        };
+        if written {
+            Ok(())
+        } else {
+            Err(LockRefusal::ChangedSinceRead.into())
+        }
     }
 
     /// Insert `dep`, replacing any existing entry with the same name.
@@ -550,11 +617,6 @@ impl Lockfile {
     #[must_use]
     pub fn packages(&self) -> &[LockedDep] {
         &self.packages
-    }
-
-    /// The lockfile path for a project root.
-    fn path(project_root: &Path) -> PathBuf {
-        project_root.join(LOCKFILE_NAME)
     }
 
     /// Render the lockfile as deterministic TOML, one table per dependency.
@@ -725,8 +787,8 @@ impl RawLocked {
 #[cfg(test)]
 mod tests {
     use super::{
-        LocalSource, LockKey, LockRefusal, LockedDep, LockedOrigin, Lockfile, MAX_LOCAL_SOURCE_LEN,
-        TextLine,
+        HeldDir, JudgedLock, LOCKFILE_NAME, LocalSource, LockKey, LockRefusal, LockedDep,
+        LockedOrigin, Lockfile, MAX_LOCAL_SOURCE_LEN, TextLine,
     };
     use crate::CliError;
     use crate::index::{PinnedRev, RemotePath, Sha256Hex, SourceUrl};
@@ -734,7 +796,7 @@ mod tests {
     use crate::package_name::PackageName;
     use crate::published_version::{PublishedVersion, VersionRefusal};
     use ipe_path_core::Regime;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     /// A valid 40-hex commit SHA used in fixtures.
     const FIXTURE_SHA: &str = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
@@ -800,6 +862,20 @@ mod tests {
         dir
     }
 
+    /// Hold the project directory `root`.
+    fn held(root: &Path) -> HeldDir {
+        HeldDir::open_following(root)
+            .expect("open the project directory")
+            .expect("the project directory exists")
+    }
+
+    /// Write `lock` over whatever `root/ipe.lock` holds now, through the held writer.
+    fn write_fresh(lock: &Lockfile, root: &Path) -> Result<(), CliError> {
+        let project = held(root);
+        let (_, judged) = Lockfile::read_judged(&project)?;
+        lock.write_over(&project, judged)
+    }
+
     /// Read `text` as a project's `ipe.lock`.
     fn read_text(tag: &str, text: &str) -> Result<Lockfile, CliError> {
         let root = temp_dir(tag);
@@ -831,7 +907,7 @@ mod tests {
         lock.upsert(dep("json-tools", "0.4.1"));
         lock.upsert(escape_dep("myescape"));
         lock.upsert(path_dep("mylocal"));
-        lock.write(&root).expect("write");
+        write_fresh(&lock, &root).expect("write");
 
         let read = Lockfile::read(&root).expect("read");
         assert_eq!(read, lock);
@@ -851,8 +927,8 @@ mod tests {
         let mut b = Lockfile::default();
         b.upsert(dep("alpha", "2.0.0"));
         b.upsert(dep("zeta", "1.0.0"));
-        a.write(&root_a).expect("write a");
-        b.write(&root_b).expect("write b");
+        write_fresh(&a, &root_a).expect("write a");
+        write_fresh(&b, &root_b).expect("write b");
         let text_a = std::fs::read_to_string(root_a.join("ipe.lock")).expect("read a");
         let text_b = std::fs::read_to_string(root_b.join("ipe.lock")).expect("read b");
         assert_eq!(text_a, text_b);
@@ -901,7 +977,7 @@ mod tests {
         let root = temp_dir("path-local-rev");
         let mut lock = Lockfile::default();
         lock.upsert(path_dep("mylocal"));
-        lock.write(&root).expect("write");
+        write_fresh(&lock, &root).expect("write");
         let text = std::fs::read_to_string(root.join("ipe.lock")).expect("read");
         assert!(text.contains("rev = \"local\"\n"), "{text}");
         assert!(text.contains("kind = \"escape\"\n"), "{text}");
@@ -1283,6 +1359,76 @@ mod tests {
             ),
             "a symlinked lockfile is refused: {read:?}"
         );
+    }
+
+    /// A link at `ipe.lock` is refused by the rewrite's read and never replaced by its write.
+    #[cfg(unix)]
+    #[test]
+    fn link_at_lock_refused() {
+        let root = temp_dir("link-at-lock");
+        let shared = root.join("shared.lock");
+        std::fs::write(&shared, "# shared\n").expect("write the link target");
+        let lock_path = root.join(LOCKFILE_NAME);
+        std::os::unix::fs::symlink(&shared, &lock_path).expect("link ipe.lock");
+        let project = held(&root);
+        let read = Lockfile::read_judged(&project).map(|_| ());
+
+        let mut lock = Lockfile::default();
+        lock.upsert(dep("http-extras", "1.2.0"));
+        let written = lock.write_over(&project, JudgedLock::Absent);
+
+        let still_link = std::fs::symlink_metadata(&lock_path)
+            .expect("ipe.lock is still there")
+            .file_type()
+            .is_symlink();
+        let target = std::fs::read_to_string(&shared).expect("read the link target");
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            matches!(
+                read,
+                Err(CliError::SourceRefused {
+                    reason: crate::io_bounded::SourceRefusal::Symlink,
+                    ..
+                })
+            ),
+            "the rewrite's read refuses a link at ipe.lock: {read:?}"
+        );
+        assert!(
+            matches!(&written, Err(CliError::LockRefused(refusal))
+                if **refusal == LockRefusal::ChangedSinceRead),
+            "a link at ipe.lock is never replaced: {written:?}"
+        );
+        assert!(still_link, "ipe.lock is still the link");
+        assert_eq!(target, "# shared\n", "the link target is untouched");
+    }
+
+    /// A lockfile edited after it was judged is left as edited, nothing written over it.
+    #[test]
+    fn lock_changed_since_read_is_refused() {
+        let root = temp_dir("lock-changed");
+        let mut first = Lockfile::default();
+        first.upsert(dep("alpha", "1.0.0"));
+        write_fresh(&first, &root).expect("write the first lockfile");
+        let project = held(&root);
+        let (mut lock, judged) = Lockfile::read_judged(&project).expect("read judged");
+        let edited = one_package(
+            "beta",
+            "2.0.0",
+            "https://example.invalid/beta",
+            FIXTURE_SHA,
+            "kind = \"index\"\n",
+        );
+        std::fs::write(root.join(LOCKFILE_NAME), &edited).expect("edit ipe.lock meanwhile");
+        lock.upsert(dep("gamma", "3.0.0"));
+        let written = lock.write_over(&project, judged);
+        let after = std::fs::read_to_string(root.join(LOCKFILE_NAME)).expect("read back");
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            matches!(&written, Err(CliError::LockRefused(refusal))
+                if **refusal == LockRefusal::ChangedSinceRead),
+            "a lockfile changed since it was read is refused: {written:?}"
+        );
+        assert_eq!(after, edited, "the concurrent edit survives");
     }
 
     /// Parsing text already read yields exactly what reading the file at the path yields.
