@@ -813,6 +813,7 @@ mod tests {
             "button",
             &[],
             &[Attribute::Attr("data-ipe-hid".into(), "r_9_button".into())],
+            &RenderCtx::Unstamped,
             &mut patch,
         );
         assert!(patch.attrs.is_empty(), "{patch:?}");
