@@ -3949,7 +3949,10 @@ fn write_fix(shown: &Path, real: &Path, source: &str, patched: &str) -> Result<F
         crate::io_bounded::SOURCE_CAP,
         |staged| staged.write_all(patched.as_bytes()),
     )? {
-        BackedUp::Done(backup) => Ok(FixWrite::Applied(backups.join(backup.slot().as_os_str()))),
+        BackedUp::Done { backup, durability } => {
+            durability.report(shown);
+            Ok(FixWrite::Applied(backups.join(backup.slot().as_os_str())))
+        }
         BackedUp::Changed => Ok(FixWrite::Changed),
         BackedUp::BackupSlotsFull => Err(CliError::ProjectRefused(text::msg::fix_backups_full(
             &shown.display(),

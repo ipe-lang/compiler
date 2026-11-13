@@ -1178,6 +1178,8 @@ messages! {
     lock_changed = "lock-changed";
     /// `package.ipe` was written but `ipe.lock` was not.
     lock_behind_manifest = "lock-behind-manifest";
+    /// A file was written, but syncing its directory after the rename failed.
+    write_unsynced(path, kind) = "write-unsynced";
     /// A version string that is not valid semver.
     version_refused_malformed(raw, reason) = "version-refused-malformed";
     /// A version carrying build metadata.

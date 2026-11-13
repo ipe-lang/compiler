@@ -1951,22 +1951,31 @@ fn edit_config(
     let fill = |file: &mut std::fs::File| file.write_all(rendered.as_bytes());
     Ok(match judged {
         None => match dir.create_if_absent(name, fill)? {
-            Created::Done => Ok(ConfigEdited::Written),
+            Created::Done(durability) => {
+                durability.report(path);
+                Ok(ConfigEdited::Written)
+            }
             Created::Exists => Err(ConfigRefusal::ChangedSinceRead),
         },
         // An empty original holds nothing a backup would keep.
         Some((text, id)) if text.is_empty() => {
             match dir.replace_if_unchanged(name, id, &text, SMALL_FILE_CAP, fill)? {
-                Replaced::Done => Ok(ConfigEdited::Written),
+                Replaced::Done(durability) => {
+                    durability.report(path);
+                    Ok(ConfigEdited::Written)
+                }
                 Replaced::Changed => Err(ConfigRefusal::ChangedSinceRead),
             }
         }
         Some((text, id)) => match dir.replace_backed_up(name, id, &text, SMALL_FILE_CAP, fill)? {
-            BackedUp::Done(backup) => Ok(ConfigEdited::BackedUp(
-                dir.path()
-                    .join(crate::driver::BACKUP_DIR)
-                    .join(backup.slot().as_os_str()),
-            )),
+            BackedUp::Done { backup, durability } => {
+                durability.report(path);
+                Ok(ConfigEdited::BackedUp(
+                    dir.path()
+                        .join(crate::driver::BACKUP_DIR)
+                        .join(backup.slot().as_os_str()),
+                ))
+            }
             BackedUp::Changed => Err(ConfigRefusal::ChangedSinceRead),
             BackedUp::BackupSlotsFull => Err(ConfigRefusal::BackupSlotsFull),
         },

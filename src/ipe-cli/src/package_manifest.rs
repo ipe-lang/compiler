@@ -2246,7 +2246,10 @@ impl ManifestEdit {
             crate::io_bounded::MANIFEST_CAP,
             fill,
         )? {
-            Replaced::Done => Ok(()),
+            Replaced::Done(durability) => {
+                durability.report(&project.path().join(PACKAGE_IPE));
+                Ok(())
+            }
             Replaced::Changed => Err(refused(text::msg::package_manifest_changed())),
         }
     }

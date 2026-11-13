@@ -1173,6 +1173,10 @@ ipe.lock changed while ipe was writing it; nothing was written to it; run the co
 
 package.ipe was updated but ipe.lock was not; run the command again to bring ipe.lock in line
 
+## write-unsynced
+
+{path} was written, but syncing its directory failed ({kind}); a crash before the system flushes it may still lose the change
+
 # Version refusals
 
 ## version-refused-malformed

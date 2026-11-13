@@ -1583,11 +1583,40 @@ impl std::fmt::Display for BackupName {
     }
 }
 
+/// Whether a write's new entry is confirmed to survive a crash.
+///
+/// The writer syncs the directory after the rename that put the new content
+/// in place. When that sync fails the content is already there and nothing
+/// is undone, so the write is not a failure; but a crash may still lose the
+/// rename. The caller reports that through [`Durability::report`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "an unconfirmed write is reported, never dropped"]
+pub enum Durability {
+    /// The directory was synced after the rename.
+    Synced,
+    /// The new content is in place; syncing its directory failed with this kind of error.
+    Unconfirmed(io::ErrorKind),
+}
+
+impl Durability {
+    /// Say on stderr that the write of `path` is in place but unconfirmed; a synced write says nothing.
+    pub fn report(self, path: &Path) {
+        match self {
+            Self::Synced => {}
+            Self::Unconfirmed(kind) => crate::screen::chatter(
+                crate::screen::Stream::Stderr,
+                crate::screen::Tone::UserError,
+                &crate::text::write_unsynced(&path.display(), &kind),
+            ),
+        }
+    }
+}
+
 /// What [`HeldDir::replace_if_unchanged`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Replaced {
     /// The judged file was replaced.
-    Done,
+    Done(Durability),
     /// The entry no longer is the judged file holding the judged bytes; nothing was replaced.
     Changed,
 }
@@ -1595,8 +1624,13 @@ pub enum Replaced {
 /// What [`HeldDir::replace_backed_up`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackedUp {
-    /// The judged bytes were kept in the slot, then the file was replaced.
-    Done(BackupName),
+    /// The judged bytes were kept in a backup slot, then the file was replaced.
+    Done {
+        /// The slot the judged bytes were kept in.
+        backup: BackupName,
+        /// Whether the replace is confirmed durable.
+        durability: Durability,
+    },
     /// The entry no longer is the judged file holding the judged bytes; nothing was kept or replaced.
     Changed,
     /// Every backup slot is taken; nothing was replaced.
@@ -1607,7 +1641,7 @@ pub enum BackedUp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Created {
     /// The file was created.
-    Done,
+    Done(Durability),
     /// An entry already had the name; it was left in place.
     Exists,
 }
@@ -1642,7 +1676,7 @@ impl Undo {
 /// How a judged replace ended.
 enum Step<T, E> {
     /// The file was replaced; `T` is what the keep step made.
-    Done(T),
+    Done(T, Durability),
     /// The entry no longer is the judged file holding the judged bytes.
     Changed,
     /// The keep step refused.
@@ -1715,9 +1749,10 @@ impl HeldDir {
     ///
     /// # Errors
     /// [`OutputRefusal::UnsafeComponent`] for the marker or claim name;
-    /// [`CliError::Io`] on a filesystem failure, the entry at `name` untouched,
-    /// except a failed sync of the directory after the rename, which names
-    /// the directory: the new content is in place, its durability unconfirmed.
+    /// [`CliError::Io`] on a filesystem failure, the entry at `name` untouched.
+    /// A failed sync of the directory after the rename is no error: the new
+    /// content is in place, and the call is [`Replaced::Done`] with
+    /// [`Durability::Unconfirmed`].
     pub fn replace_if_unchanged(
         &self,
         name: &OsStr,
@@ -1734,7 +1769,7 @@ impl HeldDir {
             };
         Ok(
             match self.replace_judged(name, judged_id, judged, cap, fill, keep_nothing)? {
-                Step::Done(()) => Replaced::Done,
+                Step::Done((), durability) => Replaced::Done(durability),
                 Step::Changed => Replaced::Changed,
                 Step::Kept(never) => match never {},
             },
@@ -1762,7 +1797,7 @@ impl HeldDir {
         let keep = |dir: &Self, target: &EntryName| dir.keep_backup(target, judged);
         Ok(
             match self.replace_judged(name, judged_id, judged, cap, fill, keep)? {
-                Step::Done(backup) => BackedUp::Done(backup),
+                Step::Done(backup, durability) => BackedUp::Done { backup, durability },
                 Step::Changed => BackedUp::Changed,
                 Step::Kept(SlotsFull) => BackedUp::BackupSlotsFull,
             },
@@ -1842,7 +1877,7 @@ impl HeldDir {
                 self.rename_judged(staged, &staging, &target, judged_id, judged, cap)
                     .map(|renamed| {
                         if renamed {
-                            Step::Done(made)
+                            Step::Done(made, self.settle())
                         } else {
                             Step::Changed
                         }
@@ -1858,7 +1893,7 @@ impl HeldDir {
             }
         };
         match result {
-            Ok(Step::Done(made)) => self.sync().map(|()| Step::Done(made)),
+            Ok(Step::Done(made, durability)) => Ok(Step::Done(made, durability)),
             other => {
                 let _ = sys::unlink(&self.dir, &staging);
                 undo.run();
@@ -1902,6 +1937,17 @@ impl HeldDir {
         Ok(())
     }
 
+    /// Sync this directory after a rename already put new content in place: a failure is [`Durability::Unconfirmed`], never an error.
+    fn settle(&self) -> Durability {
+        match dir_sync_fault().map_or_else(|| sys::sync_dir(&self.dir), Err) {
+            Ok(()) => {
+                durable(Synced::Directory, &self.path);
+                Durability::Synced
+            }
+            Err(e) => Durability::Unconfirmed(e.kind()),
+        }
+    }
+
     /// Create the file `name` with `fill`'s content, never replacing an entry already there.
     ///
     /// The new file keeps the default creation mode; the writer syncs it, and
@@ -1909,8 +1955,9 @@ impl HeldDir {
     ///
     /// # Errors
     /// [`OutputRefusal::UnsafeComponent`] for the marker or claim name;
-    /// [`CliError::Io`] on a filesystem failure; a failed sync of the
-    /// directory after the rename names the directory, the file in place.
+    /// [`CliError::Io`] on a filesystem failure. A failed sync of the
+    /// directory after the rename is no error: the file is in place, and the
+    /// call is [`Created::Done`] with [`Durability::Unconfirmed`].
     pub fn create_if_absent(
         &self,
         name: &OsStr,
@@ -1927,7 +1974,7 @@ impl HeldDir {
         let filled = fill_synced(&mut staged, fill, &tmp_path);
         drop(staged);
         match filled.and_then(|()| self.rename_new(&staging, &target, name)) {
-            Ok(Created::Done) => self.sync().map(|()| Created::Done),
+            Ok(Created::Done(durability)) => Ok(Created::Done(durability)),
             other => {
                 let _ = sys::unlink(&self.dir, &staging);
                 other
@@ -1949,7 +1996,7 @@ impl HeldDir {
             Err(refusal) => return Err(refused(&path, refusal)),
         }
         match sys::rename_file_noreplace(&self.dir, staging, target) {
-            Ok(()) => Ok(Created::Done),
+            Ok(()) => Ok(Created::Done(self.settle())),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(Created::Exists),
             Err(e) => Err(act_err(&path, e)),
         }
@@ -2235,6 +2282,31 @@ fn durable(synced: Synced, path: &Path) {
 /// Outside tests there is no hook: a sync has no further side effect.
 #[cfg(not(test))]
 const fn durable(_synced: Synced, _path: &Path) {}
+
+#[cfg(test)]
+thread_local! {
+    static DIR_SYNC_FAULT: std::cell::Cell<Option<io::ErrorKind>> = const { std::cell::Cell::new(None) };
+}
+
+/// Make the next directory sync after a rename on this thread fail with `kind`.
+#[cfg(test)]
+pub fn fail_next_dir_sync(kind: io::ErrorKind) {
+    DIR_SYNC_FAULT.with(|slot| slot.set(Some(kind)));
+}
+
+/// The injected failure of this directory sync after a rename, if a test asked for one.
+#[cfg(test)]
+fn dir_sync_fault() -> Option<io::Error> {
+    DIR_SYNC_FAULT
+        .with(std::cell::Cell::take)
+        .map(io::Error::from)
+}
+
+/// Outside tests no directory sync is made to fail.
+#[cfg(not(test))]
+const fn dir_sync_fault() -> Option<io::Error> {
+    None
+}
 
 /// Test-only hook run after a subdirectory is re-proven and released, before its removal.
 #[cfg(test)]
@@ -3709,7 +3781,7 @@ mod tests {
         let (held, id, text) = judged_n(&base, "old");
         let done = held.replace_backed_up(OsStr::new("N"), id, &text, byte_cap(4096), fill_new);
         assert!(
-            matches!(&done, Ok(BackedUp::Done(backup)) if backup.slot().as_os_str() == "N.bak.1"),
+            matches!(&done, Ok(BackedUp::Done { backup, durability: Durability::Synced }) if backup.slot().as_os_str() == "N.bak.1"),
             "the linked slot is skipped, got {done:?}"
         );
         assert_eq!(
@@ -3799,7 +3871,7 @@ mod tests {
         std::fs::set_permissions(base.join("N"), std::fs::Permissions::from_mode(0o644))
             .expect("open up N");
         let done = held.replace_backed_up(OsStr::new("N"), id, &text, byte_cap(4096), fill_new);
-        assert!(matches!(done, Ok(BackedUp::Done(_))), "{done:?}");
+        assert!(matches!(done, Ok(BackedUp::Done { .. })), "{done:?}");
         let mode = std::fs::metadata(base.join(crate::driver::BACKUP_DIR).join("N.bak"))
             .expect("the slot exists")
             .permissions()
@@ -4002,7 +4074,7 @@ mod tests {
                     file.write_all(b"new")
                 },
             );
-            assert_eq!(done.ok(), Some(Replaced::Done));
+            assert_eq!(done.ok(), Some(Replaced::Done(Durability::Synced)));
             assert_eq!(
                 staged_mode.get(),
                 Some(0o600),
@@ -4033,7 +4105,7 @@ mod tests {
             .expect("set special bits");
         let done =
             held.replace_if_unchanged(OsStr::new("N"), id, &text, byte_cap(4096), fill_unsynced);
-        assert_eq!(done.ok(), Some(Replaced::Done));
+        assert_eq!(done.ok(), Some(Replaced::Done(Durability::Synced)));
         assert_eq!(
             mode_at(&base.join("N")),
             0o755,
@@ -4067,7 +4139,7 @@ mod tests {
         let group = std::fs::metadata(base.join("N")).expect("judged").gid();
         let done =
             held.replace_if_unchanged(OsStr::new("N"), id, &text, byte_cap(4096), fill_unsynced);
-        assert_eq!(done.ok(), Some(Replaced::Done));
+        assert_eq!(done.ok(), Some(Replaced::Done(Durability::Synced)));
         let meta = std::fs::metadata(base.join("N")).expect("replaced");
         assert_eq!(meta.gid(), group);
         assert_eq!(mode_at(&base.join("N")), 0o640);
@@ -4094,8 +4166,8 @@ mod tests {
             held.replace_if_unchanged(OsStr::new("N"), id, &text, byte_cap(4096), fill_unsynced);
         let created = held.create_if_absent(OsStr::new("M"), fill_unsynced);
         set_sync_hook(None);
-        assert_eq!(done.ok(), Some(Replaced::Done));
-        assert_eq!(created.ok(), Some(Created::Done));
+        assert_eq!(done.ok(), Some(Replaced::Done(Durability::Synced)));
+        assert_eq!(created.ok(), Some(Created::Done(Durability::Synced)));
         let synced = synced.borrow();
         let kinds: Vec<Synced> = synced.iter().map(|(what, _)| *what).collect();
         assert_eq!(
@@ -4125,6 +4197,53 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(base.join("M")).ok().as_deref(),
             Some("new")
+        );
+        assert!(staged_in(&base).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A failed directory sync after the rename is a done write with unconfirmed durability: nothing undone, never an error.
+    #[test]
+    fn unsynced_directory_is_done_unconfirmed() {
+        let base = scratch("unsynced_dir");
+        let (held, id, text) = judged_n(&base, "old");
+        fail_next_dir_sync(io::ErrorKind::StorageFull);
+        let replaced =
+            held.replace_if_unchanged(OsStr::new("N"), id, &text, byte_cap(4096), fill_unsynced);
+        fail_next_dir_sync(io::ErrorKind::StorageFull);
+        let created = held.create_if_absent(OsStr::new("M"), fill_unsynced);
+        std::fs::write(base.join("B"), "kept").expect("plant B");
+        let (b_text, b_id) = held
+            .read_file_capped_identified(&name("B"), byte_cap(4096))
+            .expect("judge B");
+        fail_next_dir_sync(io::ErrorKind::StorageFull);
+        let backed = held.replace_backed_up(
+            OsStr::new("B"),
+            b_id,
+            &b_text,
+            byte_cap(4096),
+            fill_unsynced,
+        );
+        let unconfirmed = Durability::Unconfirmed(io::ErrorKind::StorageFull);
+        assert_eq!(replaced.ok(), Some(Replaced::Done(unconfirmed)));
+        assert_eq!(created.ok(), Some(Created::Done(unconfirmed)));
+        assert!(
+            matches!(&backed, Ok(BackedUp::Done { durability, .. }) if *durability == unconfirmed),
+            "{backed:?}"
+        );
+        for file in ["N", "M", "B"] {
+            assert_eq!(
+                std::fs::read_to_string(base.join(file)).ok().as_deref(),
+                Some("new"),
+                "{file} holds the new content"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(base.join(crate::driver::BACKUP_DIR).join("B.bak"))
+                .ok()
+                .as_deref(),
+            Some("kept"),
+            "the backup of a done replace is kept"
         );
         assert!(staged_in(&base).is_empty());
         let _ = std::fs::remove_dir_all(&base);

@@ -692,7 +692,8 @@ fn write_fixes(
             )
             .map_err(FixStop::Failed)?
         {
-            BackedUp::Done(backup) => {
+            BackedUp::Done { backup, durability } => {
+                durability.report(fix.path);
                 out.line(
                     Tone::Text,
                     &format!("lint --fix: rewrote {}", fix.path.display()),

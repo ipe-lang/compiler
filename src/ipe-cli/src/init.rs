@@ -1114,7 +1114,10 @@ fn place_managed(
             }
             let write_content = |staged: &mut std::fs::File| fill_with(staged, &file.content);
             match dir.replace_backed_up(name.as_os_str(), id, &bytes, file.cap, write_content)? {
-                BackedUp::Done(backup) => Ok(Placed::Replaced(backup)),
+                BackedUp::Done { backup, durability } => {
+                    durability.report(&dir.path().join(name.as_os_str()));
+                    Ok(Placed::Replaced(backup))
+                }
                 BackedUp::Changed => Ok(Placed::Kept(Kept::Changed)),
                 BackedUp::BackupSlotsFull => Ok(Placed::Kept(Kept::BackupSlotsFull)),
             }
@@ -1129,7 +1132,10 @@ fn place_managed(
 fn create_managed(dir: &HeldDir, file: &ManagedFile) -> Result<Placed, CliError> {
     let write_content = |staged: &mut std::fs::File| fill_with(staged, &file.content);
     match dir.create_if_absent(OsStr::new(&file.name), write_content)? {
-        Created::Done => Ok(Placed::Created),
+        Created::Done(durability) => {
+            durability.report(&dir.path().join(&file.name));
+            Ok(Placed::Created)
+        }
         Created::Exists => Ok(Placed::Kept(Kept::Appeared)),
     }
 }

@@ -323,7 +323,13 @@ fn write_rewrite(rewrite: &Rewrite<'_>) -> Result<bool, CliError> {
         crate::io_bounded::SOURCE_CAP,
         |staged| staged.write_all(formatted),
     )?;
-    Ok(matches!(replaced, Replaced::Done))
+    Ok(match replaced {
+        Replaced::Done(durability) => {
+            durability.report(&file.path);
+            true
+        }
+        Replaced::Changed => false,
+    })
 }
 
 /// Read `file` through its held parent, with the identity of the very file read.

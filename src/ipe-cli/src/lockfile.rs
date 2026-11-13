@@ -27,7 +27,7 @@ use ipe_fs_open::FileId;
 use crate::CliError;
 use crate::index::{PinnedRev, RemotePath, RevSite, Sha256Hex, SourceUrl};
 use crate::line_grammar::{LineFault, LineKey, LineShape, TextLine};
-use crate::output_dir::held::{self, Created, HeldDir, ReadMiss, Replaced};
+use crate::output_dir::held::{self, Created, Durability, HeldDir, ReadMiss, Replaced};
 use crate::package_name::PackageName;
 use crate::published_version::PublishedVersion;
 
@@ -565,25 +565,28 @@ impl Lockfile {
         let fill = |file: &mut std::fs::File| std::io::Write::write_all(file, rendered.as_bytes());
         let name = OsStr::new(LOCKFILE_NAME);
         let written = match judged {
-            JudgedLock::Absent => matches!(project.create_if_absent(name, fill)?, Created::Done),
-            JudgedLock::Present { id, text } => {
-                text == rendered
-                    || matches!(
-                        project.replace_if_unchanged(
-                            name,
-                            id,
-                            &text,
-                            crate::io_bounded::SMALL_FILE_CAP,
-                            fill
-                        )?,
-                        Replaced::Done
-                    )
-            }
+            JudgedLock::Absent => match project.create_if_absent(name, fill)? {
+                Created::Done(durability) => Some(durability),
+                Created::Exists => None,
+            },
+            JudgedLock::Present { text, .. } if text == rendered => Some(Durability::Synced),
+            JudgedLock::Present { id, text } => match project.replace_if_unchanged(
+                name,
+                id,
+                &text,
+                crate::io_bounded::SMALL_FILE_CAP,
+                fill,
+            )? {
+                Replaced::Done(durability) => Some(durability),
+                Replaced::Changed => None,
+            },
         };
-        if written {
-            Ok(())
-        } else {
-            Err(LockRefusal::ChangedSinceRead.into())
+        match written {
+            Some(durability) => {
+                durability.report(&project.path().join(LOCKFILE_NAME));
+                Ok(())
+            }
+            None => Err(LockRefusal::ChangedSinceRead.into()),
         }
     }
 
@@ -1400,6 +1403,20 @@ mod tests {
         );
         assert!(still_link, "ipe.lock is still the link");
         assert_eq!(target, "# shared\n", "the link target is untouched");
+    }
+
+    /// A lockfile whose directory sync fails after the rename is written, never reported as a failed write.
+    #[test]
+    fn unsynced_lock_write_is_written() {
+        let root = temp_dir("lock-unsynced");
+        let mut lock = Lockfile::default();
+        lock.upsert(dep("alpha", "1.0.0"));
+        crate::output_dir::held::fail_next_dir_sync(std::io::ErrorKind::StorageFull);
+        let written = write_fresh(&lock, &root);
+        let read = Lockfile::read(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(written.is_ok(), "the lockfile is in place: {written:?}");
+        assert_eq!(read.ok(), Some(lock));
     }
 
     /// A lockfile edited after it was judged is left as edited, nothing written over it.

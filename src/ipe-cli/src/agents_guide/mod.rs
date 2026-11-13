@@ -623,12 +623,18 @@ pub(crate) fn apply(dir: &HeldDir, plan: UpgradePlan) -> Result<UpgradeOutcome, 
     match plan {
         UpgradePlan::Current => Ok(UpgradeOutcome::Current),
         UpgradePlan::Create => match dir.create_if_absent(name, fill)? {
-            Created::Done => Ok(UpgradeOutcome::Created),
+            Created::Done(durability) => {
+                durability.report(&dir.path().join(name));
+                Ok(UpgradeOutcome::Created)
+            }
             Created::Exists => Err(CliError::AgentsGuideRefused(GuideRefusal::ChangedSinceRead)),
         },
         UpgradePlan::Replace { from, judged } => {
             match dir.replace_if_unchanged(name, judged.id, &judged.bytes, GUIDE_READ_CAP, fill)? {
-                Replaced::Done => Ok(UpgradeOutcome::Rewritten { from }),
+                Replaced::Done(durability) => {
+                    durability.report(&dir.path().join(name));
+                    Ok(UpgradeOutcome::Rewritten { from })
+                }
                 Replaced::Changed => {
                     Err(CliError::AgentsGuideRefused(GuideRefusal::ChangedSinceRead))
                 }
@@ -657,7 +663,10 @@ pub(crate) fn apply_consented(
         GUIDE_READ_CAP,
         fill,
     )? {
-        BackedUp::Done(backup) => Ok(UpgradeOutcome::Replaced { backup }),
+        BackedUp::Done { backup, durability } => {
+            durability.report(&dir.path().join(FILE_NAME));
+            Ok(UpgradeOutcome::Replaced { backup })
+        }
         BackedUp::Changed => Err(CliError::AgentsGuideRefused(GuideRefusal::ChangedSinceRead)),
         BackedUp::BackupSlotsFull => {
             Err(CliError::AgentsGuideRefused(GuideRefusal::BackupSlotsFull))
