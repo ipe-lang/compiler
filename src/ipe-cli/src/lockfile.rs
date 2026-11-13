@@ -581,13 +581,9 @@ impl Lockfile {
                 Replaced::Changed => None,
             },
         };
-        match written {
-            Some(durability) => {
-                durability.report(&project.path().join(LOCKFILE_NAME));
-                Ok(())
-            }
-            None => Err(LockRefusal::ChangedSinceRead.into()),
-        }
+        let durability = written.ok_or(LockRefusal::ChangedSinceRead)?;
+        durability.report(&project.path().join(LOCKFILE_NAME));
+        Ok(())
     }
 
     /// Insert `dep`, replacing any existing entry with the same name.
