@@ -1926,26 +1926,27 @@ fn custom_element_ctor_wrong_position_rejected() {
 /// The imports and runnable Web entry of a program that links the browser
 /// runtime, so a `CustomElement` defined after it is refused only for its own
 /// file, never for its placement or for a non-runnable `main`.
-const WEB_ENTRY: &str = r#"import Ipe.Server.Http as Server
-import Ipe.Task as Task exposing (Task)
-import Ipe.Tea.Web as Web
-import Ipe.Tea.Web.Cmd as Cmd
-import Ipe.Tea.Web.Sub as Sub
+const WEB_ENTRY: &str = r#"import Ipe.Tea.Web as Web
 import Ipe.Ui as Ui
+import Ipe.Tea.Web.Cmd
+import Ipe.Tea.Web.Sub
+type Page = HomePage
 type Msg = Noop
-app : Web.WebApp
-app =
-    Web.embed
-        { init = \_ -> ( { count = 0 }, Cmd.none )
-        , update = \_ m -> ( m, Cmd.none )
-        , view = \_ -> Ui.text "hi"
-        , subscriptions = \_ -> Sub.none
-        , routes = []
-        , notFound = Noop
-        }
-main : Task Error ()
+type alias Model = { count : Int }
+init : WebReq -> ( Model, Cmd Msg )
+init _req = ( { count = 0 }, Cmd.none )
+update : Msg -> Model -> ( Model, Cmd Msg )
+update _msg model = ( model, Cmd.none )
+view : Model -> Element Msg
+view _model = Ui.text "hi"
+subscriptions : Model -> Sub Msg
+subscriptions _model = Sub.none
 main =
-    Server.listen 8000 [ Server.mountApp "/" app ]
+    Web.tea
+        { init = init, update = update, view = view
+        , subscriptions = subscriptions
+        , routes = [], notFound = HomePage
+        }
 "#;
 
 /// (c) `customElement "does/not/exist.js"` with no such file is rejected: a widget
