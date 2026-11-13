@@ -1271,11 +1271,12 @@ const _: () = assert!(
 
 #[cfg(test)]
 mod tests {
-    use super::TypeParams::{Exact, OptionalMessage};
+    use super::TypeParams::{Exact, InferredCarrier, OptionalMessage};
     use super::{
-        BUILTIN_TYPES, BuiltinRole, BuiltinRow, BuiltinTag, BuiltinType, KernelHome, SealClass,
-        TyShape, bare, every_tag_names_one_row, heads_strictly_ascending, homed,
-        kernel_schemes_fit_params, roles_partition, shape_fits_params,
+        BUILTIN_TYPES, BuiltinRole, BuiltinRow, BuiltinTag, BuiltinType, HeadEq, KernelHome,
+        SealClass, TyShape, bare, effects_and_apps_never_equal, every_tag_names_one_row,
+        heads_strictly_ascending, homed, kernel_schemes_fit_params, roles_partition,
+        shape_fits_params,
     };
     use crate::StdlibKernel;
 
@@ -1355,6 +1356,42 @@ mod tests {
             ([ws_cfg, ws], "a name before its own prefix"),
         ] {
             assert!(!heads_strictly_ascending(&rows), "{why} must be refused");
+        }
+    }
+
+    #[test]
+    fn an_effect_or_app_row_claiming_equality_is_refused() {
+        assert!(effects_and_apps_never_equal(BUILTIN_TYPES));
+        let task = bare(
+            "Task",
+            BuiltinRole::Reserved,
+            SealClass::EffectCarrier,
+            InferredCarrier,
+        );
+        let web_app = homed(
+            "Ipe.Tea",
+            "WebApp",
+            BuiltinRole::KernelImplicit,
+            SealClass::Opaque,
+            Exact(0),
+        )
+        .tagged(BuiltinTag::WebApp);
+        assert!(
+            effects_and_apps_never_equal(&[task, web_app]),
+            "a carrier row stating nothing is `HeadEq::Never`"
+        );
+        let int = bare("Int", BuiltinRole::Reserved, SealClass::Plain, Exact(0))
+            .compares(HeadEq::Structural);
+        assert!(effects_and_apps_never_equal(&[int]));
+        for eq in [HeadEq::Structural, HeadEq::Erased, HeadEq::ByDefinition] {
+            assert!(
+                !effects_and_apps_never_equal(&[task.compares(eq)]),
+                "an effect carrier claiming {eq:?} must be refused"
+            );
+            assert!(
+                !effects_and_apps_never_equal(&[web_app.compares(eq)]),
+                "an application handle claiming {eq:?} must be refused"
+            );
         }
     }
 

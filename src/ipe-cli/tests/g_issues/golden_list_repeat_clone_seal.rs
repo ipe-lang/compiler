@@ -485,33 +485,6 @@ main =
     assert_rejected("list_member_task", &src, ipe_diagnostics::IPE_T0014);
 }
 
-/// Assert `source` is refused by `ipe` with one of `expected`, before any Rust is emitted.
-///
-/// For a comparison whose refusal boundary depends on where its type becomes
-/// concrete: the type checker (IPE-T0014) or the lowering backstop (IPE-L0164).
-#[track_caller]
-fn assert_rejected_by_either(name: &str, source: &str, expected: [ipe_diagnostics::Code; 2]) {
-    let fixture = crate::root_fixture::main(source);
-    let out = out_dir(name);
-    let runtime = e2e_support::require_runtime().into_path_buf();
-    match crate::root_fixture::build(&fixture, &out, &runtime) {
-        Err(CliError::Pipeline { diag, .. }) => assert!(
-            expected.contains(&diag.code()),
-            "{name}: expected a fail-closed {expected:?}, got {}",
-            diag.code().as_str()
-        ),
-        Ok(()) => assert!(
-            false_marker(),
-            "{name}: ipe ACCEPTED an `==` over a type with no `PartialEq` \
-             (exit 0); the emitted crate fails cargo with E0369, a SEAL break"
-        ),
-        Err(other) => assert!(
-            false_marker(),
-            "{name}: non-pipeline build error: {other:?}"
-        ),
-    }
-}
-
 /// `HEAD` plus `imports`, a two-argument `same` comparing values of `ty`, and a
 /// `main` that never calls it: the comparison is refused in `same`'s body.
 fn compare_program(imports: &str, ty: &str) -> String {
@@ -578,15 +551,11 @@ fn regex_equality_refused() {
 }
 
 /// `HttpRequest` is a record alias the lowerer folds to the runtime's request
-/// descriptor, so its refusal may land at either boundary.
+/// descriptor, whose builtin row has no equality, so the checker refuses it.
 #[test]
 fn http_request_equality_refused() {
     let src = compare_program("import Ipe.Http as Http\n", "Http.HttpRequest");
-    assert_rejected_by_either(
-        "http_request_equality",
-        &src,
-        [ipe_diagnostics::IPE_T0014, ipe_diagnostics::IPE_L0164],
-    );
+    assert_rejected("http_request_equality", &src, ipe_diagnostics::IPE_T0014);
 }
 
 #[test]
@@ -642,8 +611,7 @@ fn union_holding_decoder_equality_refused() {
 }
 
 /// The `Equatable` bound of an unannotated generic reaches its decoder
-/// instance at the call: refused by the checker's call-site obligation, or by
-/// the lowering backstop once the instance is concrete.
+/// instance at the call, refused by the checker's call-site obligation.
 #[test]
 fn generic_eq_at_decoder_refused() {
     let src = if_program(
@@ -654,11 +622,7 @@ fn generic_eq_at_decoder_refused() {
 ",
         "same Config.int Config.int",
     );
-    assert_rejected_by_either(
-        "generic_eq_at_decoder",
-        &src,
-        [ipe_diagnostics::IPE_T0014, ipe_diagnostics::IPE_L0164],
-    );
+    assert_rejected("generic_eq_at_decoder", &src, ipe_diagnostics::IPE_T0014);
 }
 
 #[test]
