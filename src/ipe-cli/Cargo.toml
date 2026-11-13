@@ -191,7 +191,7 @@ wasmtime-wasi = { version = "45", default-features = false, features = ["p1"], o
 # check adds no new vetted crate. Unix-only: the query has no portable analogue
 # on the non-Unix targets this CLI builds for.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "0.38", features = ["fs", "process", "termios"] }
+rustix = { version = "1.1", features = ["fs", "process", "termios"] }
 # A remote transfer's child runs in its own process group so a refusal can kill
 # every process it spawned; the group is then outside the terminal's reach, so
 # the interrupt, quit, hangup and stop keys are relayed to it through
