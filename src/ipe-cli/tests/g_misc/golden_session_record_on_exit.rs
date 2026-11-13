@@ -10,8 +10,7 @@
 //! * `boom` calls `Debug.todo`: the run exits non-zero, and the trace holds
 //!   the same `hello` step then `Boom` as the message in flight.
 //!
-//! An in-flight line is matched by its message and by naming no model field;
-//! its exact phrase is pinned by the runtime's `record_sink` unit tests.
+//! An in-flight line is `<msg> => ` + `ipe_runtime_rust::TRACE_IN_FLIGHT`.
 //!
 //! Gated on `IPE_E2E=1`:
 //!
@@ -48,14 +47,10 @@ fn run_with(exe: &Path, var: &str, value: &Path, stdin: &[u8]) -> Option<(Option
     Some((output.status.code(), output.stdout))
 }
 
-/// The model field the fixture's settled steps render.
-const MODEL_FIELD: &str = "count";
-
-/// Whether `line` is the in-flight line of the message rendered `msg`.
-fn is_in_flight(line: &str, msg: &str) -> bool {
-    line.strip_prefix(msg)
-        .and_then(|rest| rest.strip_prefix(" => "))
-        .is_some_and(|rest| !rest.is_empty() && !line.contains(MODEL_FIELD))
+/// The trace line of the message rendered `msg` whose `update` had not
+/// returned when the process ended.
+fn in_flight_line(msg: &str) -> String {
+    format!("{msg} => {}", ipe_runtime_rust::TRACE_IN_FLIGHT)
 }
 
 /// Whether `lines` is the settled `hello` step then `msg` in flight.
@@ -63,9 +58,9 @@ fn hello_then_in_flight(lines: Option<&Vec<String>>, msg: &str) -> bool {
     lines.is_some_and(|lines| {
         matches!(
             lines.as_slice(),
-            [hello, last] if hello.contains("hello")
-                && hello.contains(MODEL_FIELD)
-                && is_in_flight(last, msg)
+            [hello, last] if hello.starts_with("Echo hello => ")
+                && !hello.contains(ipe_runtime_rust::TRACE_IN_FLIGHT)
+                && *last == in_flight_line(msg)
         )
     })
 }

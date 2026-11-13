@@ -116,6 +116,11 @@ pub const REPLAY_ENV: &str = "IPE_DEBUGGER_REPLAY";
 ///
 /// `session.ipelog` gets the sibling `session.ipemsgs`.
 pub const TYPED_LOG_EXTENSION: &str = "ipemsgs";
+/// The model half of a [`RECORD_ENV`] trace line whose message's `update` had
+/// not returned when the process ended.
+///
+/// Ungated for the same single-wire-name reason as [`RECORD_ENV`].
+pub const TRACE_IN_FLIGHT: &str = "(update had not returned when the process ended)";
 // Development-only TEA time-travelling debugger core. Only present when the
 // `debugger` feature is active (`ipe dev build/run --debugger`). Zero code emitted
 // for a non-`--debugger` build. NOT part of the emitted `mod.rs` template —

@@ -57,7 +57,7 @@ use crate::debugger::session_log::{ReplayError, SessionCodec};
 use crate::stringify::IpeStringify;
 use crate::system::pre_exit::{ExitDump, PreExitStages, Registration, StageRefused, StageTicket};
 use crate::tea::IpeCmd;
-use crate::{RECORD_ENV, TYPED_LOG_EXTENSION};
+use crate::{RECORD_ENV, TRACE_IN_FLIGHT, TYPED_LOG_EXTENSION};
 
 /// How long the dump waits for the recorder before it skips the session.
 pub const DUMP_LOCK_WAIT: Duration = Duration::from_millis(250);
@@ -71,10 +71,6 @@ pub const TRACE_MAX_BYTES: usize = crate::seal_codec::DEFAULT_SEAL_MAX_INPUT_BYT
 /// The phrase of the line that opens a trace cut to [`TRACE_MAX_BYTES`],
 /// between the count of omitted steps and the cap.
 const TRACE_OMITTED: &str = "earlier steps omitted: trace limit";
-
-/// The model half of the trace line of a message whose `update` had not
-/// returned when the process ended.
-pub const TRACE_IN_FLIGHT: &str = "(update had not returned when the process ended)";
 
 /// The sentinel `IPE_DEBUGGER_RECORD` value that selects stderr over a file.
 const STDERR_SENTINEL: &str = "-";
