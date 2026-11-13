@@ -606,11 +606,10 @@ pub(crate) fn plan(dir: &HeldDir) -> Result<Planned, GuideRefusal> {
     }
 }
 
-/// Write [`rendered`] to the staged file and sync it.
+/// Write [`rendered`] to the staged file; the held writer syncs it.
 fn fill(file: &mut std::fs::File) -> std::io::Result<()> {
     use std::io::Write as _;
-    file.write_all(rendered().as_bytes())?;
-    file.sync_all()
+    file.write_all(rendered().as_bytes())
 }
 
 /// Carry out a plan that needs no consent.

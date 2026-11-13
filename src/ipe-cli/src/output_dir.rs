@@ -1425,29 +1425,6 @@ fn temp_suffix() -> String {
     )
 }
 
-/// The canonical `path`, proven to lie under the canonical `root`.
-///
-/// A directory walk (fmt or `lint --fix` over a tree) rewrites only files that
-/// stay inside the project; a symlink leading out of it is refused. An explicitly
-/// named file is the user's own choice and does not go through this check.
-///
-/// # Errors
-/// [`OutputRefusal::OutsideProject`] when `path` escapes `root`;
-/// [`CliError::Io`] when either cannot be canonicalised.
-pub fn contained_in(root: &Path, path: &Path) -> Result<PathBuf, CliError> {
-    let real_root = std::fs::canonicalize(root).map_err(|e| io_err(root, e))?;
-    let real = std::fs::canonicalize(path).map_err(|e| io_err(path, e))?;
-    if real.starts_with(&real_root) {
-        Ok(real)
-    } else {
-        Err(OutputRefusal::OutsideProject {
-            path: path.to_path_buf(),
-            root: real_root,
-        }
-        .into())
-    }
-}
-
 /// Decide, without writing, whether the held level at `path` may become ipe output.
 ///
 /// Absent (`None`) or a directory that is marked, being claimed, or empty
@@ -4266,28 +4243,6 @@ mod tests {
             matches!(refused(&result), Some(OutputRefusal::InsideSources { .. })),
             "a case variant of the source root must be refused, got {result:?}"
         );
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn walk_containment_refuses_a_symlink_out_of_the_project() {
-        let base = scratch("contain");
-        let proj = project(&base);
-        let outside = base.join("outside.ipe");
-        std::fs::write(&outside, "module X\n").expect("outside file");
-        let link = proj.root.join("src").join("Link.ipe");
-        plant_link(&outside, &link);
-        let result = contained_in(&proj.root, &link);
-        assert!(
-            matches!(
-                result,
-                Err(CliError::OutputRefused(
-                    OutputRefusal::OutsideProject { .. }
-                ))
-            ),
-            "a walk must not reach outside the project, got {result:?}"
-        );
-        assert!(contained_in(&proj.root, &proj.root.join("src").join("Main.ipe")).is_ok());
         let _ = std::fs::remove_dir_all(&base);
     }
 
