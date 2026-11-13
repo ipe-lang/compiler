@@ -2395,7 +2395,7 @@ mod tests {
         std::fs::remove_file(&cfg).expect("drop the link");
         std::fs::write(&cfg, "[build]\njobs = 4\n").expect("seed the config");
         let (swap_at, swap_to) = (cfg.clone(), target.clone());
-        held::set_sync_hook(Some(Box::new(move |synced, _| {
+        held::set_sync_hook(Some(Box::new(move |synced: held::Synced, _: &Path| {
             if synced == held::Synced::Staged {
                 let _ = std::fs::remove_file(&swap_at);
                 let _ = std::os::unix::fs::symlink(&swap_to, &swap_at);
