@@ -1638,6 +1638,34 @@ lint --fix: module `{module}` has no project file this run read; no file was rew
 
 lint --fix: {path} changed while it was being fixed — it and every file not reported as rewritten were left unchanged; run lint --fix again
 
+## lint-fix-sig-withheld
+
+lint --fix: signature fixes withheld: they rewrite modules other than the one named; run lint --fix without a file to apply them
+
+## lint-fix-none
+
+lint --fix: no machine-applicable fixes
+
+## lint-fix-applied-one
+
+lint --fix: applied 1 fix
+
+## lint-fix-applied
+
+lint --fix: applied {count} fixes
+
+## lint-fix-manual-review
+
+lint --fix: manual review needed for `{symbol}` ({rule}) — {reason}
+
+## lint-fix-rewrote
+
+lint --fix: rewrote {path}
+
+## lint-fix-kept
+
+lint --fix: original kept at {backup}
+
 ## lint-fix-backups-full
 
 lint --fix: no free backup name for {path} in `{dir}/` ({slots} taken); it and every file not reported as rewritten were left unchanged; remove old backups there and run lint --fix again

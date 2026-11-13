@@ -1403,6 +1403,20 @@ messages! {
     lint_fix_changed(path) = "lint-fix-changed";
     /// `ipe lint --fix` found every backup slot of a file taken.
     lint_fix_backups_full(path, dir, slots) = "lint-fix-backups-full";
+    /// `lint --fix` on one file withheld signature fixes that rewrite other modules.
+    lint_fix_sig_withheld = "lint-fix-sig-withheld";
+    /// `lint --fix` found nothing to apply.
+    lint_fix_none = "lint-fix-none";
+    /// `lint --fix` applied exactly one fix.
+    lint_fix_applied_one = "lint-fix-applied-one";
+    /// `lint --fix` applied several fixes.
+    lint_fix_applied(count) = "lint-fix-applied";
+    /// A signature fix `lint --fix` leaves to the author.
+    lint_fix_manual_review(symbol, rule, reason) = "lint-fix-manual-review";
+    /// A file `lint --fix` rewrote.
+    lint_fix_rewrote(path) = "lint-fix-rewrote";
+    /// Where `lint --fix` kept the rewritten file's original.
+    lint_fix_kept(backup) = "lint-fix-kept";
     /// The language server failed.
     lsp_failed(detail) = "lsp-failed";
     /// `ipe dev watch` could not start its filesystem watcher.

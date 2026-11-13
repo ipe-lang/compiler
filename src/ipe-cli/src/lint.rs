@@ -466,10 +466,7 @@ fn apply_and_report(
     {
         sig_outcome.rewritten.clear();
         sig_outcome.applied = 0;
-        out.line(
-            Tone::UserError,
-            "lint --fix: signature fixes withheld: they rewrite modules other than the one named; run lint --fix without a file to apply them",
-        );
+        out.line(Tone::UserError, crate::text::lint_fix_sig_withheld());
     }
 
     let total = if scope.focus.is_some() {
@@ -478,7 +475,7 @@ fn apply_and_report(
         local_outcome.applied + sig_outcome.applied
     };
     if total == 0 && sig_outcome.manual_reviews.is_empty() {
-        out.line(Tone::Text, "lint --fix: no machine-applicable fixes");
+        out.line(Tone::Text, crate::text::lint_fix_none());
         out.emit();
         return Ok(());
     }
@@ -500,23 +497,19 @@ fn apply_and_report(
     }
 
     if total > 0 && scope.focus.is_none() {
-        out.line(
-            Tone::Success,
-            &format!(
-                "lint --fix: applied {} fix{}",
-                total,
-                if total == 1 { "" } else { "es" }
-            ),
-        );
+        let applied = if total == 1 {
+            crate::text::msg::lint_fix_applied_one()
+        } else {
+            crate::text::msg::lint_fix_applied(&total)
+        };
+        out.line(Tone::Success, applied.as_str());
     }
 
     for mr in &sig_outcome.manual_reviews {
         out.line(
             Tone::UserError,
-            &format!(
-                "lint --fix: manual review needed for `{}` ({}) — {}",
-                mr.symbol_name, mr.rule, mr.reason
-            ),
+            crate::text::msg::lint_fix_manual_review(&mr.symbol_name, &mr.rule, &mr.reason)
+                .as_str(),
         );
     }
 
@@ -696,14 +689,14 @@ fn write_fixes(
                 durability.report(fix.path);
                 out.line(
                     Tone::Text,
-                    &format!("lint --fix: rewrote {}", fix.path.display()),
+                    crate::text::msg::lint_fix_rewrote(&fix.path.display()).as_str(),
                 );
                 out.line(
                     Tone::Text,
-                    &format!(
-                        "lint --fix: original kept at {}",
-                        backups.join(backup.slot().as_os_str()).display()
-                    ),
+                    crate::text::msg::lint_fix_kept(
+                        &backups.join(backup.slot().as_os_str()).display(),
+                    )
+                    .as_str(),
                 );
             }
             BackedUp::Changed => {
@@ -728,6 +721,28 @@ mod tests {
 
     use super::*;
     use crate::output_dir::held::{Synced, set_sync_hook};
+
+    /// Every `lint --fix` report is a catalog message: no literal report text is spelled outside these tests.
+    #[test]
+    fn lint_fix_reports_come_from_the_catalog() {
+        let needle = ["\"lint", " --fix:"].concat();
+        let source = include_str!("lint.rs");
+        let tests_at = ["#[cfg(test)]", "\nmod tests {"].concat();
+        let production = source.split(tests_at.as_str()).next().unwrap_or(source);
+        let spelled: Vec<&str> = production
+            .lines()
+            .filter(|line| line.contains(needle.as_str()))
+            .collect();
+        assert!(spelled.is_empty(), "{spelled:#?}");
+        assert_eq!(
+            crate::text::msg::lint_fix_applied(&2).as_str(),
+            "lint --fix: applied 2 fixes"
+        );
+        assert_eq!(
+            crate::text::lint_fix_applied_one(),
+            "lint --fix: applied 1 fix"
+        );
+    }
 
     /// A fresh `src/` directory holding `Main.ipe` with `text`, and the directory's held handle.
     #[allow(clippy::expect_used)] // a fixture that cannot be built is a broken test host
