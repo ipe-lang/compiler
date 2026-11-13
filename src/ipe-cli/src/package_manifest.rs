@@ -4701,7 +4701,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         assert!(
             matches!(&applied, Err(CliError::ProjectRefused(msg))
-                if msg.to_string() == text::package_manifest_changed()),
+                if *msg == text::package_manifest_changed()),
             "a manifest changed since it was read is refused: {applied:?}"
         );
         assert_eq!(after, edited, "the concurrent edit survives");

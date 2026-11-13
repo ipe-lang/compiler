@@ -2408,9 +2408,7 @@ mod tests {
             "a link swapped in after the read is refused: {after_read:?}"
         );
         assert!(
-            std::fs::symlink_metadata(&cfg)
-                .map(|m| m.file_type().is_symlink())
-                .unwrap_or(false),
+            std::fs::symlink_metadata(&cfg).is_ok_and(|m| m.file_type().is_symlink()),
             "the link is left as is"
         );
         assert_eq!(
@@ -2708,9 +2706,7 @@ mod tests {
             "the link target is untouched"
         );
         assert!(
-            std::fs::symlink_metadata(&cache)
-                .map(|m| m.file_type().is_symlink())
-                .unwrap_or(false),
+            std::fs::symlink_metadata(&cache).is_ok_and(|m| m.file_type().is_symlink()),
             "the link is left as is"
         );
     }
