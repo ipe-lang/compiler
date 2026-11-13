@@ -324,8 +324,40 @@ pub enum Fix {
 /// config), which the user can clear.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedTargetSetup {
-    /// The absolute shared-target directory to configure.
-    pub target_dir: PathBuf,
+    /// The `$IPE_HOME` the shared target lies directly under.
+    pub home: PathBuf,
+}
+
+/// The name of the shared build target directory under `$IPE_HOME`.
+const SHARED_TARGET_DIR: &str = "target";
+
+impl SharedTargetSetup {
+    /// The shared-target directory to configure.
+    #[must_use]
+    pub fn target_dir(&self) -> PathBuf {
+        self.home.join(SHARED_TARGET_DIR)
+    }
+
+    /// Create the shared target in the held home, refusing a link or a non-directory at its name.
+    ///
+    /// The home itself is followed as named, as the config edit beside it is.
+    ///
+    /// # Errors
+    /// [`OutputRefusal::Symlink`] or [`OutputRefusal::NotADirectory`] for the
+    /// entry at the shared target's name; [`CliError::Io`] on a filesystem
+    /// failure.
+    fn create_target(&self) -> Result<PathBuf, CliError> {
+        std::fs::create_dir_all(&self.home).map_err(|e| CliError::Io {
+            path: self.home.clone(),
+            source: e,
+        })?;
+        let home = HeldDir::open_following(&self.home)?.ok_or_else(|| CliError::Io {
+            path: self.home.clone(),
+            source: std::io::ErrorKind::NotFound.into(),
+        })?;
+        let (target, _) = home.create_child(OsStr::new(SHARED_TARGET_DIR))?;
+        Ok(target.path().to_path_buf())
+    }
 }
 
 /// One diagnostic. Carries its group, a stable id, its status, a human detail,
@@ -1115,8 +1147,9 @@ fn check_shared_target() -> Check {
             fix: None,
         },
         HomeConfigValue::Unset => {
-            let target_dir = runtime_embed::ipe_home()
-                .map_or_else(|_| PathBuf::from("target"), |h| h.join("target"));
+            let fix = runtime_embed::ipe_home()
+                .ok()
+                .map(|home| Fix::HomeSetup(SharedTargetSetup { home }));
             Check {
                 group: Group::Target,
                 id: "shared-target",
@@ -1126,7 +1159,7 @@ fn check_shared_target() -> Check {
                 suggestion: Some(
                     "configure a shared target so projects reuse one warm build cache".to_owned(),
                 ),
-                fix: Some(Fix::HomeSetup(SharedTargetSetup { target_dir })),
+                fix,
             }
         }
     }
@@ -1732,7 +1765,7 @@ fn fix_change(fix: &Fix) -> FixChange {
             },
         },
         Fix::HomeSetup(setup) => FixChange {
-            change: format!("build.target-dir = {:?}", setup.target_dir.display()),
+            change: format!("build.target-dir = {:?}", setup.target_dir().display()),
             file: Some(config_path_label(ConfigTarget::IpeHome)),
         },
         Fix::RunUpgrade { current, latest } => FixChange {
@@ -1774,15 +1807,12 @@ fn apply_one(fix: &Fix) -> Result<String, CliError> {
         },
         Fix::HomeSetup(setup) => {
             let path = ConfigTarget::IpeHome.path()?;
-            std::fs::create_dir_all(&setup.target_dir).map_err(|e| CliError::Io {
-                path: setup.target_dir.clone(),
-                source: e,
-            })?;
-            let value = ConfigValue::Str(setup.target_dir.display().to_string());
+            let target_dir = setup.create_target()?;
+            let value = ConfigValue::Str(target_dir.display().to_string());
             let edited = apply_config_edit(&path, &["build", "target-dir"], &value)?;
             Ok(edited.outcome(format!(
                 "shared target configured at {}",
-                setup.target_dir.display()
+                target_dir.display()
             )))
         }
         Fix::RunUpgrade { latest, .. } => {
@@ -2403,6 +2433,33 @@ mod tests {
         );
     }
 
+    /// The shared target is created in the held home; a link at its name is refused, never followed.
+    #[cfg(unix)]
+    #[test]
+    fn shared_target_link_refused() {
+        let dir = TempDir::new("shared_target");
+        let home = dir.path().join("home");
+        let setup = SharedTargetSetup { home: home.clone() };
+        let made = setup.create_target();
+        assert_eq!(made.ok(), Some(home.join(SHARED_TARGET_DIR)));
+        assert!(
+            home.join(SHARED_TARGET_DIR).is_dir(),
+            "the target is created"
+        );
+
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("make the link target");
+        std::fs::remove_dir(home.join(SHARED_TARGET_DIR)).expect("drop the target");
+        std::os::unix::fs::symlink(&elsewhere, home.join(SHARED_TARGET_DIR))
+            .expect("plant the link");
+        let linked = setup.create_target();
+        assert!(
+            matches!(&linked, Err(CliError::OutputRefused(OutputRefusal::Symlink(p)))
+                if *p == home.join(SHARED_TARGET_DIR)),
+            "a link at the shared target is refused: {linked:?}"
+        );
+    }
+
     /// A config that is not TOML is refused by its line, the parser's text (which quotes the file) never echoed.
     #[test]
     fn config_not_toml_names_line_not_content() {
@@ -2903,7 +2960,7 @@ mod tests {
             detail: "no shared build target".to_owned(),
             suggestion: None,
             fix: Some(Fix::HomeSetup(SharedTargetSetup {
-                target_dir: PathBuf::from("/tmp/t"),
+                home: PathBuf::from("/tmp/h"),
             })),
         };
         let fix = check.fix.clone().expect("fix");
