@@ -408,6 +408,13 @@ pub enum Attribute<M> {
     AttrAnimation(String, String, String, bool),
     /// `Font.whiteSpace` — the closed white-space mode of a text box.
     AttrFontWhiteSpace(WhiteSpace),
+    /// A page link's target route.
+    ///
+    /// Only `ui::helpers::web_page_link` builds one, never an Ipê-visible
+    /// constructor; it lowers to `html::Attribute::PageHref`, the one
+    /// producer of the `ipe-nav` marker.
+    #[cfg(feature = "web-core")]
+    PageHref(crate::web::route::RoutePath),
 }
 
 /// `Ipe.Ui.Element msg` — the layout tree. Variant order matches
@@ -548,6 +555,8 @@ fn attribute_is_inert<M>(attr: &Attribute<M>) -> bool {
         | Attribute::AttrPseudoRule(_, _)
         | Attribute::AttrGridTracks(_, _)
         | Attribute::AttrAnimation(..) => false,
+        #[cfg(feature = "web-core")]
+        Attribute::PageHref(_) => false,
     }
 }
 

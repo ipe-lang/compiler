@@ -2366,6 +2366,10 @@ __ipeDoc.on("click", function(ev) {
   while (el && __ipeNode.tag(el) !== "A") el = __ipeNode.parent(el);
   if (!el) return;
   if (!el.hasAttribute("ipe-nav")) return;
+  // A link that opens elsewhere or downloads is the browser's to follow.
+  var linkTarget = el.getAttribute("target");
+  if (linkTarget && linkTarget.toLowerCase() !== "_self") return;
+  if (el.hasAttribute("download")) return;
   // A stale document applies no render, so its links are left to the
   // browser, whose full load joins the live history.
   if (__ipeStale) return;

@@ -251,6 +251,9 @@ fn template_of_at<M>(node: &Html<M>, depth: usize) -> Option<Template> {
                     Attribute::EventAttr(_) | Attribute::BoolAttr(..) | Attribute::NoAttr => {
                         return None;
                     }
+                    // A page link renders under the session's base at the sink,
+                    // never as a static string.
+                    Attribute::PageHref(_) => return None,
                 }
             }
             let mut template_children = Vec::with_capacity(children.len());

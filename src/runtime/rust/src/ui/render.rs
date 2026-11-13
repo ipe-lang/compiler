@@ -346,6 +346,8 @@ pub(crate) fn build_style_string<M>(attrs: &[Attribute<M>]) -> String {
             | Attribute::AttrAttribute(_, _)
             | Attribute::AttrChecked(_)
             | Attribute::AttrPseudoRule(_, _) => {}
+            #[cfg(feature = "web-core")]
+            Attribute::PageHref(_) => {}
         }
     }
 
@@ -385,6 +387,10 @@ fn collect_html_attrs<M: Clone>(attrs: &[Attribute<M>]) -> Vec<HtmlAttribute<M>>
             }
             Attribute::AttrEvent(html_attr) => {
                 out.push(html_attr.clone());
+            }
+            #[cfg(feature = "web-core")]
+            Attribute::PageHref(route) => {
+                out.push(HtmlAttribute::PageHref(route.clone()));
             }
             // Checkedness is a boolean attribute: present when true, absent when
             // false, never the string "false".

@@ -176,20 +176,69 @@ pub fn ui_button_<M: Clone>(
 /// link without it.
 #[must_use]
 pub fn ui_link_<M: Clone>(attrs: Vec<Attribute<M>>, url: String, label: Element<M>) -> Element<M> {
+    let rel = opener_severance(&attrs);
+    let mut full = Vec::with_capacity(attrs.len() + 1 + usize::from(rel.is_some()));
+    full.push(Attribute::AttrAttribute("href".into(), url));
+    full.extend(attrs);
+    full.extend(rel);
+    Element::TaggedNode("a".into(), Description::NoDescription, full, vec![label])
+}
+
+/// The `rel="noopener noreferrer"` a new-tab anchor without its own `rel` gets.
+///
+/// Every anchor sink appends it, so no link opens a new tab holding
+/// `window.opener`.
+fn opener_severance<M>(attrs: &[Attribute<M>]) -> Option<Attribute<M>> {
     let opens_new_tab = attrs.iter().any(|a| {
         matches!(a, Attribute::AttrAttribute(name, value) if name == "target" && value == "_blank")
     });
     let has_rel = attrs
         .iter()
         .any(|a| matches!(a, Attribute::AttrAttribute(name, _) if name == "rel"));
-    let extra = usize::from(opens_new_tab && !has_rel);
-    let mut full = Vec::with_capacity(attrs.len() + 1 + extra);
-    full.push(Attribute::AttrAttribute("href".into(), url));
-    full.extend(attrs);
-    if opens_new_tab && !has_rel {
+    (opens_new_tab && !has_rel)
+        .then(|| Attribute::AttrAttribute("rel".into(), "noopener noreferrer".into()))
+}
+
+/// `Web.pageLink : List (WebRoute page) -> List (Attribute msg) -> { to : page, current : page, label : Element msg } -> Element msg`
+///
+/// The emitted call passes `to` and `current` already rendered through the
+/// table's one renderer. A rendered `to` becomes the link's typed
+/// [`Attribute::PageHref`], which the render sink alone base-joins and marks
+/// `ipe-nav`; `aria-current="page"` follows when `current` renders to the same
+/// path. The link owns `href` and `aria-current`, so a program attribute of
+/// either name, in any ASCII case, is dropped. A `to` with no route renders a
+/// placeholder `<a>` with no `href`: inert, never a guessed URL.
+#[cfg(feature = "web-core")]
+#[must_use]
+pub fn web_page_link<M: Clone>(
+    attrs: Vec<Attribute<M>>,
+    to: Result<crate::web::route::RoutePath, crate::web::route::RenderRefusal>,
+    current: Result<crate::web::route::RoutePath, crate::web::route::RenderRefusal>,
+    label: Element<M>,
+) -> Element<M> {
+    let kept: Vec<Attribute<M>> = attrs
+        .into_iter()
+        .filter(|a| {
+            !matches!(a, Attribute::AttrAttribute(name, _)
+                if name.eq_ignore_ascii_case("href") || name.eq_ignore_ascii_case("aria-current"))
+        })
+        .collect();
+    let rel = opener_severance(&kept);
+    let mut full = Vec::with_capacity(kept.len() + 3);
+    let here = match to {
+        Ok(path) => {
+            let here = current.as_ref() == Ok(&path);
+            full.push(Attribute::PageHref(path));
+            here
+        }
+        Err(_) => false,
+    };
+    full.extend(kept);
+    full.extend(rel);
+    if here {
         full.push(Attribute::AttrAttribute(
-            "rel".into(),
-            "noopener noreferrer".into(),
+            "aria-current".into(),
+            "page".into(),
         ));
     }
     Element::TaggedNode("a".into(), Description::NoDescription, full, vec![label])
@@ -2051,5 +2100,216 @@ mod white_space_helper_tests {
             })
             .collect();
         assert_eq!(carried, WhiteSpace::ALL.to_vec());
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "web-core")]
+mod page_link_tests {
+    use super::{Description, Element, web_page_link};
+    use crate::dom::dispatch::BrowserPath;
+    use crate::encoding::{EncodedBase, MountBase};
+    use crate::html::{Html, RenderCtx, SessionMarks, assign_ipe_ids, render_stamped};
+    use crate::ui::element::Attribute;
+    use crate::ui::render::ui_layout;
+    use crate::web::route::{RenderArg, RenderRefusal, Route, RoutePath, render_route};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Page {
+        Home,
+        Unit(String),
+    }
+
+    fn routes() -> Vec<Route<Page>> {
+        vec![
+            Route::new("/", |_| Some(Page::Home)),
+            Route::new("/unit/:uid", |p| p.first().cloned().map(Page::Unit)),
+        ]
+    }
+
+    fn render(page: &Page) -> Result<RoutePath, RenderRefusal> {
+        match page {
+            Page::Home => render_route(&routes(), 0, &[]),
+            Page::Unit(uid) => render_route(&routes(), 1, &[RenderArg::Text(uid)]),
+        }
+    }
+
+    fn base(text: &str) -> EncodedBase {
+        MountBase::parse(text)
+            .expect("a test base parses")
+            .encoded()
+    }
+
+    fn marks(base: EncodedBase) -> SessionMarks {
+        SessionMarks::new(crate::csp::StyleNonce::from_random_bytes([0x3c; 16])).under(base)
+    }
+
+    fn link(attrs: Vec<Attribute<()>>, to: &Page, current: &Page) -> Element<()> {
+        web_page_link(
+            attrs,
+            render(to),
+            render(current),
+            Element::Text("go".into()),
+        )
+    }
+
+    fn view(el: Element<()>) -> Html<()> {
+        let mut tree = ui_layout(vec![], el);
+        assign_ipe_ids(&mut tree, "r");
+        tree
+    }
+
+    fn page_markup(el: Element<()>, under: &EncodedBase) -> String {
+        render_stamped(&view(el), &marks(under.clone()))
+            .as_str()
+            .to_owned()
+    }
+
+    fn named<'a>(attrs: &'a [Attribute<()>], name: &str) -> Vec<&'a str> {
+        attrs
+            .iter()
+            .filter_map(|a| match a {
+                Attribute::AttrAttribute(k, v) if k.eq_ignore_ascii_case(name) => Some(v.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn link_attrs(el: &Element<()>) -> &[Attribute<()>] {
+        match el {
+            Element::TaggedNode(_, Description::NoDescription, attrs, _) => attrs,
+            _ => &[],
+        }
+    }
+
+    /// The link owns `href` and `aria-current`: a program attribute of either
+    /// name is dropped in any ASCII case, and `aria-current` marks the link
+    /// to the page on screen only (CI job `runtime-full-features`).
+    #[test]
+    fn page_link_drops_program_href_and_aria_current() {
+        let program = vec![
+            Attribute::AttrAttribute("href".into(), "javascript:alert(1)".into()),
+            Attribute::AttrAttribute("HREF".into(), "//evil.example".into()),
+            Attribute::AttrAttribute("Aria-Current".into(), "step".into()),
+            Attribute::AttrAttribute("class".into(), "nav".into()),
+        ];
+        let here = link(program.clone(), &Page::Home, &Page::Home);
+        let attrs = link_attrs(&here);
+        let expected = render(&Page::Home).expect("the root renders");
+        assert!(matches!(attrs.first(), Some(Attribute::PageHref(p)) if *p == expected));
+        assert!(named(attrs, "href").is_empty());
+        assert_eq!(named(attrs, "aria-current"), vec!["page"]);
+        assert_eq!(named(attrs, "class"), vec!["nav"]);
+
+        let away = link(program, &Page::Home, &Page::Unit("u1".into()));
+        assert!(named(link_attrs(&away), "aria-current").is_empty());
+    }
+
+    /// A page with no route renders a placeholder `<a>`: no `href`, no
+    /// `ipe-nav` and no `aria-current` (CI job `runtime-full-features`).
+    #[test]
+    fn page_link_without_a_route_is_a_placeholder() {
+        let el = link(
+            vec![Attribute::AttrAttribute("href".into(), "/x".into())],
+            &Page::Unit(String::new()),
+            &Page::Unit(String::new()),
+        );
+        assert!(
+            link_attrs(&el)
+                .iter()
+                .all(|a| !matches!(a, Attribute::PageHref(_)))
+        );
+        let html = page_markup(el, &base("/app"));
+        assert!(html.contains("<a"), "{html}");
+        assert!(!html.contains("href"), "{html}");
+        assert!(!html.contains("ipe-nav"), "{html}");
+        assert!(!html.contains("aria-current"), "{html}");
+    }
+
+    /// Under a non-root base the full render and the patch both write the
+    /// href `BrowserPath::of` joins, with the `ipe-nav` marker (CI job
+    /// `runtime-full-features`).
+    #[test]
+    fn page_href_joins_the_session_base_in_render_and_patch() {
+        let under = base("/app/v1");
+        let to = Page::Unit("u 7".into());
+        let path = render(&to).expect("the unit page renders");
+        let joined = BrowserPath::of(&under, &path).as_str().to_owned();
+        assert!(joined.starts_with("/app/v1/unit/"), "{joined}");
+
+        let html = page_markup(link(vec![], &to, &Page::Home), &under);
+        assert!(html.contains(&format!("href=\"{joined}\"")), "{html}");
+        assert!(html.contains("ipe-nav"), "{html}");
+
+        let old = view(link(vec![], &Page::Unit(String::new()), &Page::Home));
+        let new = view(link(vec![], &to, &Page::Home));
+        let sm = marks(under);
+        let patches = crate::dom::diff::diff(&old, &new, &RenderCtx::Session(&sm));
+        let set = |name: &str| {
+            patches
+                .iter()
+                .find_map(|p| p.attrs.get(name).cloned())
+                .flatten()
+        };
+        assert_eq!(set("href"), Some(joined));
+        assert_eq!(set("ipe-nav"), Some(String::new()));
+    }
+
+    /// A hostile param never forms a scheme, an authority or a backslash
+    /// path: its href is percent-encoded or the link is a placeholder (CI job
+    /// `runtime-full-features`).
+    #[test]
+    fn hostile_params_never_escape_the_base() {
+        let under = base("/app");
+        for param in ["a/b?c#d%", ".", "", "\\host", "..", "x:y", "//h"] {
+            let page = Page::Unit(param.into());
+            let html = page_markup(link(vec![], &page, &Page::Home), &under);
+            match render(&page) {
+                Ok(path) => {
+                    let joined = BrowserPath::of(&under, &path).as_str().to_owned();
+                    let past_base = joined.strip_prefix("/app").unwrap_or_default();
+                    assert!(past_base.starts_with('/'), "{joined}");
+                    assert!(!past_base.contains("//"), "{joined}");
+                    assert!(!past_base.contains(':'), "{joined}");
+                    assert!(!past_base.contains('\\'), "{joined}");
+                    assert!(html.contains(&format!("href=\"{joined}\"")), "{html}");
+                }
+                Err(_) => {
+                    assert!(!html.contains("href"), "{param}: {html}");
+                    assert!(!html.contains("ipe-nav"), "{param}: {html}");
+                }
+            }
+        }
+        assert!(render(&Page::Unit(".".into())).is_err());
+        assert!(render(&Page::Unit(String::new())).is_err());
+    }
+
+    /// A program-built `ipe-nav` still never reaches the markup, beside a
+    /// page link or on its placeholder: only `PageHref` writes the marker (CI
+    /// job `runtime-full-features`).
+    #[test]
+    fn program_ipe_nav_is_never_written() {
+        let forged = || {
+            vec![
+                Attribute::AttrAttribute("ipe-nav".into(), String::new()),
+                Attribute::AttrAttribute("IPE-NAV".into(), String::new()),
+            ]
+        };
+        let under = base("/app");
+        let placeholder = page_markup(
+            link(forged(), &Page::Unit(String::new()), &Page::Home),
+            &under,
+        );
+        assert!(
+            !placeholder.to_ascii_lowercase().contains("ipe-nav"),
+            "{placeholder}"
+        );
+
+        let real = page_markup(link(forged(), &Page::Home, &Page::Home), &under);
+        assert_eq!(
+            real.to_ascii_lowercase().matches("ipe-nav").count(),
+            1,
+            "{real}"
+        );
     }
 }

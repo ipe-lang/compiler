@@ -3051,7 +3051,7 @@ where
         return EntryCommit::SessionGone;
     };
     let EnterRequest { path, mode, reply } = request;
-    let (model, stamp) = {
+    let (model, marks) = {
         let g = strong.lock().unwrap_or_else(|e| e.into_inner());
         let already_entered = match mode {
             EnterMode::Load => false,
@@ -3060,14 +3060,14 @@ where
         if already_entered {
             return EntryCommit::AlreadyEntered;
         }
-        (g.model.clone(), g.rendered.stamp())
+        (g.model.clone(), g.rendered.marks())
     };
     let sid = scope.sid();
     let entered = pubsub::with_session(scope, || route_entry(model, &path));
     let mut tree = pubsub::with_session(scope, || view(entered.model.clone()));
     assign_ipe_ids(&mut tree, "r");
     style_inject::apply_style_injections(&mut tree);
-    let html = render_stamped(&tree, &stamp);
+    let html = render_stamped(&tree, &marks);
     let route = page_url(&entered.model);
     // Re-prove after user code ran: a revocation that landed meanwhile drops
     // the entry, its reply and its Cmd.
@@ -5751,7 +5751,11 @@ mod handlers {
         let Ok(keys) = SessionKeys::mint() else {
             return entry_unavailable();
         };
-        let rendered = Rendered::first(keys, tree, (st.page_url)(&model));
+        let rendered = Rendered::first(
+            keys.under(mount.base().encoded()),
+            tree,
+            (st.page_url)(&model),
+        );
         log_unrenderable(rendered.route());
         let page = PageRender::current(&rendered);
 

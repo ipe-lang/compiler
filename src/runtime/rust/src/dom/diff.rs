@@ -186,6 +186,8 @@ fn has_autofocus<M>(attrs: &[Attribute<M>]) -> bool {
     attrs.iter().any(|a| match a {
         Attribute::Attr(k, _) | Attribute::BoolAttr(k, true) => k.eq_ignore_ascii_case("autofocus"),
         Attribute::BoolAttr(_, false) | Attribute::EventAttr(_) | Attribute::NoAttr => false,
+        #[cfg(feature = "web-core")]
+        Attribute::PageHref(_) => false,
     })
 }
 
@@ -378,7 +380,7 @@ fn diff_node_depth<M>(
 
     // Attribute + event delta.
     let mut p = Patch::for_id(id.unwrap_or_default());
-    diff_attrs(child_ctx, nt, oa, na, &mut p);
+    diff_attrs(child_ctx, nt, oa, na, stamp, &mut p);
     if !p.attrs.is_empty() {
         if id.is_none() {
             return Reach::Unaddressed;
@@ -462,6 +464,7 @@ fn diff_attrs<M>(
     tag: &str,
     old: &[Attribute<M>],
     new: &[Attribute<M>],
+    stamp: &RenderCtx<'_>,
     p: &mut Patch,
 ) {
     // Borrowed keys and values: only `insert_safe_attr` (which copies,
@@ -471,24 +474,41 @@ fn diff_attrs<M>(
         child_ctx: ParseContext,
         tag: &str,
         xs: &'a [Attribute<M>],
+        stamp: &RenderCtx<'_>,
     ) -> HashMap<Cow<'a, str>, Cow<'a, str>> {
-        attribute_pairs(child_ctx, tag, xs)
+        attribute_pairs(child_ctx, tag, xs, stamp)
             .into_iter()
             .filter(|(k, _)| *k != STAMPED_ID_ATTR)
             .collect()
     }
-    let (om, nm) = (collect(child_ctx, tag, old), collect(child_ctx, tag, new));
+    let (om, nm) = (
+        collect(child_ctx, tag, old, stamp),
+        collect(child_ctx, tag, new, stamp),
+    );
     for (k, v) in &nm {
         if om.get(k) != Some(v) {
-            insert_safe_attr(p, k, Some(v.as_ref()));
+            insert_pair(p, k, Some(v.as_ref()));
         }
     }
     for k in om.keys() {
         if !nm.contains_key(k) {
-            insert_safe_attr(p, k, None);
+            insert_pair(p, k, None);
         }
     }
     diff_events(old, new, p);
+}
+
+/// Insert one of [`attribute_pairs`]' pairs into a patch.
+///
+/// The page-link marker is a pair only a `PageHref` yields, since
+/// `attribute_pairs` drops every program-built reserved name, so it takes the
+/// runtime marker gate; every other pair takes [`insert_safe_attr`].
+fn insert_pair(p: &mut Patch, key: &str, val: Option<&str>) {
+    if key == crate::html::PAGE_NAV_ATTR {
+        insert_marker_attr(p, key, val);
+    } else {
+        insert_safe_attr(p, key, val);
+    }
 }
 
 /// Insert an attribute into a patch ONLY if it passes the same XSS policy the
@@ -1415,7 +1435,11 @@ mod tests {
         let mut new: Html<()> = Html::HElement("div".into(), vec![], vec![style("p{}")]);
         ids(&mut old);
         ids(&mut new);
-        let stamped = diff(&old, &new, &RenderCtx::Session(&nonce));
+        let stamped = diff(
+            &old,
+            &new,
+            &RenderCtx::Session(&crate::html::SessionMarks::new(nonce.clone())),
+        );
         let html: Vec<&str> = stamped.iter().filter_map(|p| p.html.as_deref()).collect();
         assert_eq!(html.len(), 1, "{stamped:?}");
         let want = format!("nonce=\"{token}\"");
@@ -1434,7 +1458,11 @@ mod tests {
         let mut new = Html::HElement("div".into(), vec![], vec![style("a{}")]);
         ids(&mut old);
         ids(&mut new);
-        let patches = diff(&old, &new, &RenderCtx::Session(&nonce));
+        let patches = diff(
+            &old,
+            &new,
+            &RenderCtx::Session(&crate::html::SessionMarks::new(nonce.clone())),
+        );
         let texts: Vec<&str> = patches.iter().filter_map(|p| p.text.as_deref()).collect();
         assert_eq!(texts, vec!["a{}"], "{patches:?}");
         assert!(
@@ -1468,7 +1496,9 @@ mod tests {
                 diff(
                     &old,
                     &new,
-                    &RenderCtx::Session(&crate::csp::StyleNonce::from_random_bytes([0x11; 16])),
+                    &RenderCtx::Session(&crate::html::SessionMarks::new(
+                        crate::csp::StyleNonce::from_random_bytes([0x11; 16]),
+                    )),
                 ),
             ] {
                 assert!(
