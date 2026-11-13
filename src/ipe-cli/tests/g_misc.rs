@@ -66,6 +66,8 @@ mod golden_email_send_nominal_fold_seal;
 mod golden_enum_fn_payload_reuse_seal;
 #[path = "g_misc/golden_enum_payload_nonclone_seal.rs"]
 mod golden_enum_payload_nonclone_seal;
+#[path = "g_misc/golden_eq_opaque_handle_gate.rs"]
+mod golden_eq_opaque_handle_gate;
 #[path = "g_misc/golden_ffi_kernel_alias_seal.rs"]
 mod golden_ffi_kernel_alias_seal;
 #[path = "g_misc/golden_ffi_nonclone_handle_reuse_seal.rs"]

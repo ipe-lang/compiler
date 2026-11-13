@@ -10,9 +10,12 @@
 //! unions lowered without an `EnumDef` and the set the backend knows the facts
 //! of cannot drift.
 
+use std::collections::BTreeMap;
+
 use ipe_intern::{Interner, Symbol};
 
-use crate::ir::{CarrierLeaf, IrType, carrier_leaf};
+use crate::held::EnumPayloadTable;
+use crate::ir::{CarrierLeaf, IrType, ModPath, carrier_leaf};
 use crate::show_policy::{ShowLeaf, show_leaf};
 
 /// Which trait families a named enum's rendered Rust type implements.
@@ -191,6 +194,118 @@ pub fn home_is_ffi_interface(interner: &Interner, home: &[Symbol]) -> bool {
     home.first()
         .and_then(|s| interner.resolve(*s))
         .is_some_and(|s| s == "Rust")
+}
+
+/// How a named enum's Rust type is provided, and so which traits it implements.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EnumFacts {
+    /// A registered `EnumDef` the emitted crate declares, with its fixpoint traits.
+    Registered(EnumTraits),
+    /// An opaque `Rust.*` FFI handle: the foreign crate's type, assumed to implement nothing.
+    OpaqueForeign,
+    /// An enum the runtime defines, with the runtime type's own traits.
+    RuntimeBridged(RuntimeBridgedEnum),
+}
+
+impl EnumFacts {
+    /// The traits the enum's Rust type implements.
+    #[must_use]
+    pub const fn traits(self) -> EnumTraits {
+        match self {
+            Self::Registered(traits) => traits,
+            Self::OpaqueForeign => EnumTraits::NONE,
+            Self::RuntimeBridged(bridged) => bridged.traits(),
+        }
+    }
+}
+
+/// The facts of a named enum with no registered `EnumDef`, if it is classified.
+///
+/// A `Rust.*` home is an opaque FFI handle (a transparent import has a
+/// registered `EnumDef` and never reaches here). Otherwise the enum must be a
+/// [`RuntimeBridgedEnum`]; any other enum, and a name the interner cannot
+/// resolve, is unclassified (`None`), so no trait can be claimed for it.
+#[must_use]
+pub fn classify_unregistered_enum(
+    interner: &Interner,
+    home: &ModPath,
+    name: Symbol,
+) -> Option<EnumFacts> {
+    if home_is_ffi_interface(interner, &home.0) {
+        return Some(EnumFacts::OpaqueForeign);
+    }
+    let name = interner.resolve(name)?;
+    let segs: Vec<&str> = home
+        .0
+        .iter()
+        .map(|s| interner.resolve(*s))
+        .collect::<Option<_>>()?;
+    RuntimeBridgedEnum::classify(&segs, name).map(EnumFacts::RuntimeBridged)
+}
+
+/// Whether the unregistered enum `(home, name)` derives `Clone + Debug + PartialEq`.
+///
+/// An unclassified enum answers `false` (fail closed).
+#[must_use]
+pub fn unregistered_enum_derivable(interner: &Interner, home: &ModPath, name: Symbol) -> bool {
+    classify_unregistered_enum(interner, home, name).is_some_and(|f| f.traits().derivable)
+}
+
+/// The greatest fixpoint of one trait over every registered enum.
+///
+/// Every registered enum starts with the trait and is demoted once some variant
+/// payload field fails `field_ok`, which consults the current estimate for
+/// referenced registered enums and `unregistered` for every other enum. The
+/// lattice only descends, so each pass demotes at least one enum or stops: at
+/// most one pass per enum plus the final one.
+pub fn enum_trait_fixpoint(
+    enum_variants: &EnumPayloadTable,
+    unregistered: impl Fn(&ModPath, Symbol) -> bool,
+    field_ok: impl Fn(&IrType, &dyn Fn(&ModPath, Symbol) -> bool) -> bool,
+) -> BTreeMap<(ModPath, Symbol), bool> {
+    let mut facts: BTreeMap<(ModPath, Symbol), bool> =
+        enum_variants.keys().map(|k| (k.clone(), true)).collect();
+    loop {
+        let demote: Vec<(ModPath, Symbol)> = {
+            let lookup = |home: &ModPath, name: Symbol| {
+                facts
+                    .get(&(home.clone(), name))
+                    .map_or_else(|| unregistered(home, name), |held| *held)
+            };
+            enum_variants
+                .iter()
+                .filter(|(key, _)| facts.get(*key).copied() == Some(true))
+                .filter(|(_, variants)| {
+                    !variants
+                        .iter()
+                        .all(|(_, fields)| fields.iter().all(|f| field_ok(f, &lookup)))
+                })
+                .map(|(key, _)| key.clone())
+                .collect()
+        };
+        if demote.is_empty() {
+            return facts;
+        }
+        for key in demote {
+            facts.insert(key, false);
+        }
+    }
+}
+
+/// The `PartialEq` fact (the full derive set) of every registered enum in `enum_variants`.
+///
+/// The one equality fixpoint the backend derives by and the lowerer refuses
+/// `==` by. An unregistered enum answers [`unregistered_enum_derivable`].
+#[must_use]
+pub fn enum_derivable_fixpoint(
+    interner: &Interner,
+    enum_variants: &EnumPayloadTable,
+) -> BTreeMap<(ModPath, Symbol), bool> {
+    enum_trait_fixpoint(
+        enum_variants,
+        |home, name| unregistered_enum_derivable(interner, home, name),
+        |f, lookup| crate::ir::ir_type_is_derivable(f, &lookup),
+    )
 }
 
 /// The `Ipe.Db.Store` unions whose `row` type parameter is phantom.

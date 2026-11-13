@@ -12101,6 +12101,12 @@ pub struct Lowerer<'a> {
     /// enum holds — the same table shape the backend's enum-`Clone` fixpoint
     /// reads, so both stages agree on which enums are `Clone`.
     enum_payloads: EnumPayloadTable,
+    /// The `PartialEq` fact of every enum in [`Self::enum_payloads`].
+    ///
+    /// Filled with it, by the fixpoint the backend derives by
+    /// ([`ipe_ir::enum_derivable_fixpoint`]), so an `==` the lowerer admits is
+    /// one the emitted enum can answer.
+    enum_derivable: BTreeMap<(ModPath, Symbol), bool>,
     /// Which type parameters of the program's enums a field uses.
     ///
     /// Filled once every union is lowered, before any def body: an unused
@@ -14571,6 +14577,7 @@ impl<'a> Lowerer<'a> {
             ctor_arity,
             transparent_ffi_unions,
             enum_payloads: EnumPayloadTable::new(),
+            enum_derivable: BTreeMap::new(),
             enum_param_use: ipe_ir::EnumParamUse::default(),
             transparent_ffi_ctors,
             eta_params,
@@ -17055,6 +17062,7 @@ impl<'a> Lowerer<'a> {
                 })
                 .chain(prelude_enums.iter()),
         );
+        self.enum_derivable = ipe_ir::enum_derivable_fixpoint(self.interner, &self.enum_payloads);
 
         let mut funcs = Vec::with_capacity(self.m.defs.len());
         let mut entry = None;
@@ -18040,6 +18048,44 @@ impl<'a> Lowerer<'a> {
         home.first()
             .and_then(|s| self.interner.resolve(*s))
             .is_some_and(|s| s == "Rust")
+    }
+
+    /// Refuse an `==` or `/=` whose operands have no `PartialEq` (IPE-L0164).
+    ///
+    /// The type checker's `Equatable` obligation refuses these first
+    /// (IPE-T0014); this second boundary judges the lowered operand type by
+    /// the predicate the backend derives `PartialEq` by
+    /// ([`instance_bounds::eq_supplied`]), so no admitted comparison meets
+    /// rustc's E0369. An operand type with an unfixed variable is read as
+    /// `JsonVal`, as a kernel bound reads it; one that lowers neither way
+    /// keeps its lowering error.
+    fn reject_uncomparable_operands(
+        &self,
+        op: BinOp,
+        lhs: &canon::Expr,
+        span: Span,
+    ) -> DResult<()> {
+        let Some(ty) = self.region_ty(lhs.span) else {
+            return Ok(());
+        };
+        let lowered = match self.ir_type_from_ty(ty, lhs.span) {
+            Ok(lowered) => lowered,
+            Err(strict) => self
+                .ir_type_from_ty_json(ty, lhs.span)
+                .map_err(|_| strict)?,
+        };
+        match instance_bounds::eq_supplied(self.clone_env(), Some(&self.enum_derivable), &lowered) {
+            instance_bounds::Supply::Unmet { demand, leaf } => {
+                let operator = if matches!(op, BinOp::Neq) { "/=" } else { "==" };
+                Err(instance_bounds::callee_bound_unmet(
+                    span,
+                    operator.into(),
+                    demand,
+                    leaf,
+                ))
+            }
+            instance_bounds::Supply::Met | instance_bounds::Supply::Forwarded => Ok(()),
+        }
     }
 
     /// The clone-classification context for this module.
@@ -23690,8 +23736,12 @@ impl<'a> Lowerer<'a> {
                         })
                     }
                 } else {
+                    let op = self.binop(*func, e.span)?;
+                    if matches!(op, BinOp::Eq | BinOp::Neq) {
+                        self.reject_uncomparable_operands(op, lhs, e.span)?;
+                    }
                     Ok(Expr::BinOp {
-                        op: self.binop(*func, e.span)?,
+                        op,
                         lhs: Box::new(self.lower_expr(lhs)?),
                         rhs: Box::new(self.lower_expr(rhs)?),
                     })
@@ -30866,11 +30916,14 @@ impl<'a> Lowerer<'a> {
     /// Refuse an app entry whose Model or Msg its app shape cannot hold, before any definition is lowered.
     ///
     /// A Model or Msg holding a part with no `Clone` (a `Cmd`, a `Task`, a
-    /// function) is refused by its app shape's own gate, IPE-L0120 or
+    /// function), or missing any other bound the entry's own runtime row
+    /// ([`KernelFn::runtime_bounds`]) puts on that role (a Web Model's
+    /// `PartialEq`), is refused by its app shape's own gate, IPE-L0120 or
     /// IPE-L0125, which names the role and the field. Every callee-bound
     /// refusal (IPE-L0164) of the same type, at the entry, at a view kernel
     /// copying the message, or at a user generic, follows from that one
-    /// declaration, so the role gates run first, over the whole module.
+    /// declaration, so the role gates run first, over the whole module, and
+    /// judge every bound the entry's callee-bound check would.
     ///
     /// This only chooses the diagnostic: an entry whose Model or Msg it cannot
     /// read (no region, an unfixed type, a type that does not lower) is left
@@ -30919,14 +30972,25 @@ impl<'a> Lowerer<'a> {
             let Ok(lowered) = self.ir_type_from_ty(instance, span) else {
                 continue;
             };
-            if let Some((field, leaf)) =
-                instance_bounds::nonclone_role_blame(self.clone_env(), &lowered)
-            {
-                let msg = match role {
-                    AppRole::Model => LowerError::InadmissibleAppModel { app, field, leaf },
-                    AppRole::Msg => LowerError::InadmissibleAppMsg { app, field, leaf },
-                };
-                return Err(Diagnostic::Lower { span, msg });
+            let demanded = kernel
+                .runtime_bounds()
+                .iter()
+                .filter(|(row_var, _)| *row_var == var)
+                .flat_map(|(_, row)| instance_bounds::Bound::of_runtime(*row))
+                .filter(|bound| *bound != instance_bounds::Bound::Clone);
+            for bound in std::iter::once(instance_bounds::Bound::Clone).chain(demanded) {
+                if let Some((field, leaf)) = instance_bounds::role_blame(
+                    self.clone_env(),
+                    &self.enum_derivable,
+                    bound,
+                    &lowered,
+                ) {
+                    let msg = match role {
+                        AppRole::Model => LowerError::InadmissibleAppModel { app, field, leaf },
+                        AppRole::Msg => LowerError::InadmissibleAppMsg { app, field, leaf },
+                    };
+                    return Err(Diagnostic::Lower { span, msg });
+                }
             }
         }
         Ok(())
@@ -41165,6 +41229,179 @@ mod tests {
         assert!(
             bugs.is_empty(),
             "reserved empty-home rows reach the lowerer's catch-all: {bugs:?}"
+        );
+    }
+
+    /// Whether a row's [`ipe_kernels::HeadEq`] agrees with its lowerings.
+    ///
+    /// `plain` is the head at `Unit` arguments, `with_fn` the head with a
+    /// function as its last argument (`None` for a head with none), and
+    /// `derivable` the backend's `PartialEq` predicate. A refused lowering
+    /// agrees only with `Never`, and with a function argument only with
+    /// `Structural`.
+    fn equality_agrees(
+        eq: ipe_kernels::HeadEq,
+        plain: &ipe_diagnostics::DResult<IrType>,
+        with_fn: Option<&ipe_diagnostics::DResult<IrType>>,
+        derivable: &dyn Fn(&IrType) -> bool,
+    ) -> bool {
+        use ipe_kernels::HeadEq;
+        match (eq, plain) {
+            (HeadEq::Never, Ok(ty)) => !derivable(ty),
+            (HeadEq::Never, Err(_)) => true,
+            (HeadEq::Structural | HeadEq::Erased | HeadEq::ByDefinition, Err(_)) => false,
+            (HeadEq::ByDefinition, Ok(ty)) => matches!(ty, IrType::Enum { .. }),
+            (HeadEq::Structural, Ok(ty)) => {
+                derivable(ty) && with_fn.is_none_or(|t| !matches!(t, Ok(t) if derivable(t)))
+            }
+            (HeadEq::Erased, Ok(ty)) => {
+                derivable(ty) && with_fn.is_none_or(|t| matches!(t, Ok(t) if derivable(t)))
+            }
+        }
+    }
+
+    /// Every `BUILTIN_TYPES` row's equality fact agrees with the backend's
+    /// `PartialEq` predicate over the row's lowering, through the annotation
+    /// path and the inferred path alike.
+    ///
+    /// The type checker refuses `==` by the row fact and the backend derives
+    /// `PartialEq` by `ir_type_is_derivable`; a row whose fact drifts from its
+    /// lowering would admit a comparison rustc refuses (E0369). Each homed
+    /// `ByDefinition` row is given a stub union, as its stdlib source declares
+    /// one. A synthetic `Structural` claim for `Decoder` must disagree, so the
+    /// check can go red.
+    #[test]
+    #[allow(clippy::panic)] // test assertion: a failed intern IS the failure
+    #[allow(clippy::too_many_lines)] // one walk over every row, through both lowering paths
+    fn every_builtin_row_equality_agrees_with_its_lowering() {
+        use ipe_kernels::{HeadEq, KernelHome};
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        let mut intern = |text: &str| {
+            let Ok(sym) = interner.intern(text) else {
+                panic!("interning `{text}` failed");
+            };
+            sym
+        };
+        let web = intern("Web");
+        let rows: Vec<(&ipe_kernels::BuiltinRow, Vec<Symbol>, Symbol)> = ipe_kernels::BUILTIN_TYPES
+            .iter()
+            .map(|row| {
+                let home = match row.home() {
+                    KernelHome::Builtin => Vec::new(),
+                    KernelHome::Module(path) => path.split('.').map(&mut intern).collect(),
+                };
+                (row, home, intern(row.name()))
+            })
+            .collect();
+        let vars: Vec<Symbol> = (0..4).map(|n| intern(&format!("a{n}"))).collect();
+        let stub_ctor = intern("AgreementStub");
+        let unions: Vec<canon::Union> = rows
+            .iter()
+            .filter(|(row, home, _)| row.equality() == HeadEq::ByDefinition && !home.is_empty())
+            .map(|(row, home, name)| {
+                covers_fixture_union(
+                    home.clone(),
+                    *name,
+                    vars.iter()
+                        .copied()
+                        .take(row.params().in_schemes())
+                        .collect(),
+                    stub_ctor,
+                )
+            })
+            .collect();
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            name: vec![],
+            unions,
+            defs: vec![],
+        };
+        let types = empty_solved_types();
+        let lowerer = covers_fixture_lowerer(&module, &types, &interner, &builtins);
+        let derivable = |ty: &IrType| {
+            ipe_ir::ir_type_is_derivable(ty, &|home: &ipe_ir::ModPath, name| {
+                ipe_ir::unregistered_enum_derivable(&interner, home, name)
+            })
+        };
+        let canon_fn =
+            canon::Type::Lambda(Box::new(canon::Type::Unit), Box::new(canon::Type::Unit));
+        let ty_fn = Ty::Fun(Box::new(Ty::Unit), Box::new(Ty::Unit));
+        let to_ty = |t: &canon::Type| match t {
+            canon::Type::Con { home, name, .. } => Ty::Con {
+                module: home.clone(),
+                name: *name,
+                args: Vec::new(),
+            },
+            _ => Ty::Unit,
+        };
+        let mut drift = Vec::new();
+        for (row, home, name) in &rows {
+            let args = declared_args(row, web);
+            let fn_args = (!args.is_empty()).then(|| {
+                let mut args = args.clone();
+                if let Some(last) = args.last_mut() {
+                    *last = canon_fn.clone();
+                }
+                args
+            });
+            let by_canon = |args: Vec<canon::Type>| {
+                lowerer.ir_type_from_canon(
+                    &canon::Type::Con {
+                        home: home.clone(),
+                        name: *name,
+                        args,
+                    },
+                    &[],
+                )
+            };
+            let by_ty = |last_fn: bool| {
+                let mut ty_args: Vec<Ty> = args.iter().map(to_ty).collect();
+                if last_fn && let Some(last) = ty_args.last_mut() {
+                    *last = ty_fn.clone();
+                }
+                lowerer.ir_type_from_ty(
+                    &Ty::Con {
+                        module: home.clone(),
+                        name: *name,
+                        args: ty_args,
+                    },
+                    Span::DUMMY,
+                )
+            };
+            let canon_plain = by_canon(args.clone());
+            let canon_with_fn = fn_args.clone().map(by_canon);
+            let ty_plain = by_ty(false);
+            let ty_with_fn = fn_args.as_ref().map(|_| by_ty(true));
+            for (path, plain, with_fn) in [
+                ("annotation", &canon_plain, canon_with_fn.as_ref()),
+                ("inferred", &ty_plain, ty_with_fn.as_ref()),
+            ] {
+                if !equality_agrees(row.equality(), plain, with_fn, &derivable) {
+                    drift.push(format!(
+                        "{:?}.{} claims {:?} but lowers ({path}) to {plain:?} / {with_fn:?}",
+                        row.home(),
+                        row.name(),
+                        row.equality()
+                    ));
+                }
+            }
+            if row.name() == "Decoder" && row.home() == KernelHome::Builtin {
+                assert!(
+                    !equality_agrees(
+                        HeadEq::Structural,
+                        &canon_plain,
+                        canon_with_fn.as_ref(),
+                        &derivable
+                    ),
+                    "a Structural claim for Decoder must disagree with its lowering"
+                );
+            }
+        }
+        assert!(
+            drift.is_empty(),
+            "builtin rows whose equality fact drifts from the backend: {drift:#?}"
         );
     }
 

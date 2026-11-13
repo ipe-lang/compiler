@@ -88,8 +88,8 @@ use ipe_backend::{Backend, EmittedProject};
 use ipe_diagnostics::{DResult, Diagnostic, NameError, RustNameFoldKind, Span};
 use ipe_intern::{Interner, Symbol};
 use ipe_ir::{
-    CallPin, Callee, EnumTraits, Expr, FuncId, IrType, KernelFn, ModPath, Program,
-    RuntimeBridgedEnum, TypeDef, UserPin,
+    CallPin, Callee, EnumFacts, EnumTraits, Expr, FuncId, IrType, KernelFn, ModPath, Program,
+    TypeDef, UserPin,
 };
 
 pub use emit_doc::{SweepDivergence, native_vs_legacy_sweep};
@@ -1476,7 +1476,7 @@ pub(crate) struct EmitCtx<'a> {
     /// Registered enum `(home, name)` → the traits its emitted Rust type implements.
     ///
     /// Each trait is a monotone whole-program fixpoint computed at
-    /// [`EmitCtx::build`] (see [`enum_trait_fixpoint`]): an enum loses a trait
+    /// [`EmitCtx::build`] (see [`ipe_ir::enum_trait_fixpoint`]): an enum loses a trait
     /// iff some variant payload reaches a leaf without it (a function, an opaque
     /// effect or FFI handle, or an enum already known to lack it). `derivable`
     /// is the full `Clone + Debug + PartialEq` derive set; `serde` additionally
@@ -1553,44 +1553,11 @@ pub(crate) struct EmitCtx<'a> {
     web_capabilities: BTreeSet<ipe_kernels::WebCapability>,
 }
 
-/// How a named enum's Rust type is provided, and so which traits it implements.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum EnumFacts {
-    /// A registered `EnumDef` the emitted crate declares, with its fixpoint traits.
-    Registered(EnumTraits),
-    /// An opaque `Rust.*` FFI handle: the foreign crate's type, assumed to implement nothing.
-    OpaqueForeign,
-    /// An enum the runtime defines, with the runtime type's own traits.
-    RuntimeBridged(RuntimeBridgedEnum),
-}
-
-impl EnumFacts {
-    /// The traits the enum's Rust type implements.
-    pub(crate) const fn traits(self) -> EnumTraits {
-        match self {
-            Self::Registered(traits) => traits,
-            Self::OpaqueForeign => EnumTraits::NONE,
-            Self::RuntimeBridged(bridged) => bridged.traits(),
-        }
-    }
-}
-
-/// Is `home` a driver-generated FFI interface module (`Rust.*`)?
-///
-/// The `Rust.*` namespace is origin-reserved at canonicalisation, so the home
-/// prefix IS the provenance.
-fn home_is_foreign_interface(interner: &Interner, home: &ModPath) -> bool {
-    home.0
-        .first()
-        .and_then(|s| interner.resolve(*s))
-        .is_some_and(|s| s == "Rust")
-}
-
 /// The facts of a named enum with no registered `EnumDef`.
 ///
 /// A `Rust.*` home is an opaque FFI handle (a transparent import has a
 /// registered `EnumDef` and never reaches here). Otherwise the enum must be a
-/// [`RuntimeBridgedEnum`].
+/// [`ipe_ir::RuntimeBridgedEnum`].
 ///
 /// # Errors
 ///
@@ -1607,19 +1574,16 @@ fn unregistered_enum_facts(
         .iter()
         .map(|s| resolve_sym(interner, *s))
         .collect::<DResult<Vec<&str>>>()?;
-    if home_is_foreign_interface(interner, home) {
-        return Ok(EnumFacts::OpaqueForeign);
-    }
-    RuntimeBridgedEnum::classify(&segs, name_str)
-        .map(EnumFacts::RuntimeBridged)
-        .ok_or_else(|| Diagnostic::CompilerBug {
+    ipe_ir::classify_unregistered_enum(interner, home, name).ok_or_else(|| {
+        Diagnostic::CompilerBug {
             where_: "ipe_backend_rust::unregistered_enum_facts",
             detail: format!(
                 "enum `{}.{name_str}` has no EnumDef and is neither an opaque FFI handle \
                  nor a runtime-bridged enum",
                 segs.join(".")
             ),
-        })
+        }
+    })
 }
 
 /// The facts of named enum `(home, name)`: registered traits first, else [`unregistered_enum_facts`].
@@ -1637,47 +1601,6 @@ fn enum_facts_in(
         || unregistered_enum_facts(interner, home, name),
         |traits| Ok(EnumFacts::Registered(*traits)),
     )
-}
-
-/// The greatest fixpoint of one trait over every registered enum.
-///
-/// Every registered enum starts with the trait and is demoted once some variant
-/// payload field fails `field_ok`, which consults the current estimate for
-/// referenced registered enums and `unregistered` for every other enum. The
-/// lattice only descends, so each pass demotes at least one enum or stops: at
-/// most one pass per enum plus the final one.
-fn enum_trait_fixpoint(
-    enum_variants: &ipe_ir::EnumPayloadTable,
-    unregistered: impl Fn(&ModPath, Symbol) -> bool,
-    field_ok: impl Fn(&IrType, &dyn Fn(&ModPath, Symbol) -> bool) -> bool,
-) -> BTreeMap<(ModPath, Symbol), bool> {
-    let mut facts: BTreeMap<(ModPath, Symbol), bool> =
-        enum_variants.keys().map(|k| (k.clone(), true)).collect();
-    loop {
-        let demote: Vec<(ModPath, Symbol)> = {
-            let lookup = |home: &ModPath, name: Symbol| {
-                facts
-                    .get(&(home.clone(), name))
-                    .map_or_else(|| unregistered(home, name), |held| *held)
-            };
-            enum_variants
-                .iter()
-                .filter(|(key, _)| facts.get(*key).copied() == Some(true))
-                .filter(|(_, variants)| {
-                    !variants
-                        .iter()
-                        .all(|(_, fields)| fields.iter().all(|f| field_ok(f, &lookup)))
-                })
-                .map(|(key, _)| key.clone())
-                .collect()
-        };
-        if demote.is_empty() {
-            return facts;
-        }
-        for key in demote {
-            facts.insert(key, false);
-        }
-    }
 }
 
 /// Refuse a named enum reachable from `ty` whose trait facts are unknown.
@@ -2018,17 +1941,13 @@ impl<'a> EmitCtx<'a> {
                 unregistered_enum_facts(interner, home, name).is_ok_and(|f| trait_of(f.traits()))
             }
         };
-        let enum_derivable = enum_trait_fixpoint(
-            &enum_variants,
-            unregistered_has(|t| t.derivable),
-            |f, lookup| ipe_ir::ir_type_is_derivable(f, &lookup),
-        );
-        let enum_serde = enum_trait_fixpoint(
+        let enum_derivable = ipe_ir::enum_derivable_fixpoint(interner, &enum_variants);
+        let enum_serde = ipe_ir::enum_trait_fixpoint(
             &enum_variants,
             unregistered_has(|t| t.serde),
             |f, lookup| ipe_ir::ir_type_is_serde(f, &lookup),
         );
-        let enum_clone = enum_trait_fixpoint(
+        let enum_clone = ipe_ir::enum_trait_fixpoint(
             &enum_variants,
             unregistered_has(|t| t.clone),
             field_is_clone,
@@ -2640,7 +2559,7 @@ impl<'a> EmitCtx<'a> {
 
     /// Is `home` a driver-generated FFI interface module (`Rust.*`)?
     pub(crate) fn is_foreign_interface_home(&self, home: &ModPath) -> bool {
-        home_is_foreign_interface(self.interner, home)
+        ipe_ir::home_is_ffi_interface(self.interner, &home.0)
     }
 
     /// `true` when the emitted crate reaches the `http_client` runtime module —

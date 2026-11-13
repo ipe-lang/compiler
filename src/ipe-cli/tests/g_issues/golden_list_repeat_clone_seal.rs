@@ -6,7 +6,9 @@
 //! with a type whose carrier lacks the bound (a `Task`, a `Cmd`, a boxed
 //! function) would pass `ipe` and fail `cargo build` with E0277. Every such
 //! instance is refused at `ipe` time with IPE-L0164; the comparison case
-//! (`==`, `List.member`) is refused by the type checker's `Equatable` rule.
+//! (`==`, `List.member`) is refused by the type checker's `Equatable` rule,
+//! for a `Task`, a decoder, and every handle alike, bare or held in a record
+//! or a union, with the lowering backstop (IPE-L0164) behind it.
 //!
 //! The refusals run without `IPE_E2E` (no Rust is emitted); the acceptances
 //! build and run the emitted crate under `IPE_E2E=1`, so the gate never
@@ -481,6 +483,175 @@ main =
 ",
     );
     assert_rejected("list_member_task", &src, ipe_diagnostics::IPE_T0014);
+}
+
+/// `HEAD` plus `imports`, a two-argument `same` comparing values of `ty`, and a
+/// `main` that never calls it: the comparison is refused in `same`'s body.
+fn compare_program(imports: &str, ty: &str) -> String {
+    program(&format!(
+        "{imports}
+same : {ty} -> {ty} -> Bool
+same a b =
+    a == b
+
+
+main : Task Error ()
+main =
+    Io.println \"x\"
+"
+    ))
+}
+
+/// A `main` printing whether `condition` holds.
+fn if_program(imports: &str, decls: &str, condition: &str) -> String {
+    program(&format!(
+        "{imports}
+{decls}
+main : Task Error ()
+main =
+    if {condition} then
+        Io.println \"same\"
+
+    else
+        Io.println \"different\"
+"
+    ))
+}
+
+#[test]
+fn decoder_equality_refused() {
+    let src = if_program(
+        "import Ipe.Config as Config\n",
+        "",
+        "Config.int == Config.int",
+    );
+    assert_rejected("decoder_equality", &src, ipe_diagnostics::IPE_T0014);
+}
+
+#[test]
+fn decoder_member_refused() {
+    let src = if_program(
+        "import Ipe.Config as Config\n",
+        "",
+        "List.member Config.int [ Config.int ]",
+    );
+    assert_rejected("decoder_member", &src, ipe_diagnostics::IPE_T0014);
+}
+
+#[test]
+fn db_equality_refused() {
+    let src = compare_program("import Ipe.Db as Db exposing (Db)\n", "Db");
+    assert_rejected("db_equality", &src, ipe_diagnostics::IPE_T0014);
+}
+
+#[test]
+fn regex_equality_refused() {
+    let src = compare_program("import Ipe.Regex as Regex\n", "Regex");
+    assert_rejected("regex_equality", &src, ipe_diagnostics::IPE_T0014);
+}
+
+/// `HttpRequest` is a record alias the lowerer folds to the runtime's request
+/// descriptor, whose builtin row has no equality, so the checker refuses it.
+#[test]
+fn http_request_equality_refused() {
+    let src = compare_program("import Ipe.Http as Http\n", "Http.HttpRequest");
+    assert_rejected("http_request_equality", &src, ipe_diagnostics::IPE_T0014);
+}
+
+#[test]
+fn setting_equality_refused() {
+    let src = compare_program("", "Setting Int");
+    assert_rejected("setting_equality", &src, ipe_diagnostics::IPE_T0014);
+}
+
+#[test]
+fn auth_config_equality_refused() {
+    let src = compare_program("import Ipe.Http.Server as Server\n", "Server.AuthConfig");
+    assert_rejected("auth_config_equality", &src, ipe_diagnostics::IPE_T0014);
+}
+
+#[test]
+fn html_attribute_equality_refused() {
+    let src = compare_program(
+        "import Ipe.Html as Html exposing (Attribute)\n",
+        "Attribute Int",
+    );
+    assert_rejected("html_attribute_equality", &src, ipe_diagnostics::IPE_T0014);
+}
+
+#[test]
+fn record_holding_decoder_equality_refused() {
+    let src = if_program(
+        "import Ipe.Config as Config\n",
+        "",
+        "{ d = Config.int } == { d = Config.int }",
+    );
+    assert_rejected(
+        "record_holding_decoder_equality",
+        &src,
+        ipe_diagnostics::IPE_T0014,
+    );
+}
+
+#[test]
+fn union_holding_decoder_equality_refused() {
+    let src = if_program(
+        "import Ipe.Config as Config\n",
+        "type Field
+    = Field (Config.Decoder Int)
+
+",
+        "Field Config.int == Field Config.int",
+    );
+    assert_rejected(
+        "union_holding_decoder_equality",
+        &src,
+        ipe_diagnostics::IPE_T0014,
+    );
+}
+
+/// The `Equatable` bound of an unannotated generic reaches its decoder
+/// instance at the call, refused by the checker's call-site obligation.
+#[test]
+fn generic_eq_at_decoder_refused() {
+    let src = if_program(
+        "import Ipe.Config as Config\n",
+        "same a b =
+    a == b
+
+",
+        "same Config.int Config.int",
+    );
+    assert_rejected("generic_eq_at_decoder", &src, ipe_diagnostics::IPE_T0014);
+}
+
+#[test]
+fn decoded_values_compare_builds() {
+    let src = if_program(
+        "import Ipe.Config as Config\n",
+        "",
+        "Config.decodeJson \"1\" Config.int == Ok 1",
+    );
+    assert_accepted("decoded_values_compare", &src, "same");
+}
+
+#[test]
+fn int_field_record_compare_builds() {
+    let src = if_program("", "", "{ n = 1, s = \"x\" } == { n = 1, s = \"x\" }");
+    assert_accepted("int_field_record_compare", &src, "same");
+}
+
+#[test]
+fn sql_value_union_compare_builds() {
+    let src = if_program(
+        "import Ipe.Db as Db\n",
+        "type Cell
+    = Cell SqlValue
+
+",
+        "Cell (SqlInt 1) == Cell (SqlInt 1)",
+    );
+    assert_accepted("sql_value_union_compare", &src, "same");
 }
 
 #[test]

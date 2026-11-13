@@ -31,8 +31,10 @@ pub use alpha::alpha_equivalent_fields;
 pub use borrow::{Param, ParamPass};
 pub use carrier::wants_arc_ctor;
 pub use enum_facts::{
-    EnumTraits, FfiUnion, RuntimeBridgedEnum, STORE_ROW_PHANTOM_UNIONS, home_is_ffi_interface,
-    is_store_row_phantom_union, payload_leaf_is_clone,
+    EnumFacts, EnumTraits, FfiUnion, RuntimeBridgedEnum, STORE_ROW_PHANTOM_UNIONS,
+    classify_unregistered_enum, enum_derivable_fixpoint, enum_trait_fixpoint,
+    home_is_ffi_interface, is_store_row_phantom_union, payload_leaf_is_clone,
+    unregistered_enum_derivable,
 };
 pub use enum_params::EnumParamUse;
 pub use held::{

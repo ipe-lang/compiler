@@ -257,6 +257,24 @@ impl TypeParams {
     }
 }
 
+/// How a builtin head's runtime carrier answers `PartialEq`.
+///
+/// Every row states it; a row that states nothing is [`HeadEq::Never`], so a
+/// head added without a decision refuses `==` rather than emitting a
+/// comparison its carrier cannot build. The lowerer's `ir_type_is_derivable`
+/// over the head's lowering is the consumer each row is tested against.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HeadEq {
+    /// The carrier derives `PartialEq` exactly when every type argument does.
+    Structural,
+    /// The carrier erases its type arguments and always derives `PartialEq`.
+    Erased,
+    /// The carrier never implements `PartialEq`, whatever its arguments.
+    Never,
+    /// The head lowers to an enum whose own definition decides `PartialEq`.
+    ByDefinition,
+}
+
 /// One builtin type head and every fact the compiler keeps about it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BuiltinRow {
@@ -268,6 +286,7 @@ pub struct BuiltinRow {
     qualified_via: &'static [&'static str],
     declared_in: Option<&'static str>,
     tag: Option<BuiltinTag>,
+    eq: HeadEq,
 }
 
 impl BuiltinRow {
@@ -333,18 +352,10 @@ impl BuiltinRow {
         self.tag
     }
 
-    /// Whether the head's runtime carrier implements `PartialEq`.
-    ///
-    /// An effect carrier (`Task`, `Cmd`, `Sub`) is a boxed future or a
-    /// boxed callback, and an application handle holds its callbacks; none
-    /// can be compared, so an equality over one has no Rust to emit.
+    /// How the head's runtime carrier answers `PartialEq` ([`HeadEq`]).
     #[must_use]
-    pub const fn derives_partial_eq(&self) -> bool {
-        !matches!(self.seal, SealClass::EffectCarrier)
-            && !matches!(
-                self.tag,
-                Some(BuiltinTag::CliApp | BuiltinTag::TuiApp | BuiltinTag::WebApp)
-            )
+    pub const fn equality(&self) -> HeadEq {
+        self.eq
     }
 
     const fn via(self, qualifiers: &'static [&'static str]) -> Self {
@@ -366,6 +377,10 @@ impl BuiltinRow {
             tag: Some(tag),
             ..self
         }
+    }
+
+    const fn compares(self, eq: HeadEq) -> Self {
+        Self { eq, ..self }
     }
 }
 
@@ -444,6 +459,7 @@ const fn bare(
         qualified_via: &[],
         declared_in: None,
         tag: None,
+        eq: HeadEq::Never,
     }
 }
 
@@ -463,6 +479,7 @@ const fn homed(
         qualified_via: &[],
         declared_in: None,
         tag: None,
+        eq: HeadEq::Never,
     }
 }
 
@@ -474,27 +491,43 @@ const fn homed(
 /// on the name a user would declare.
 pub const BUILTIN_TYPES: &[BuiltinRow] = &[
     // `Ipe.Jwt`'s signing-algorithm descriptor; sealed, no rendering of key material.
-    bare("Algorithm", Reserved, SealedHandle, Exact(0)).tagged(BuiltinTag::Algorithm),
-    bare("AnsiColor", Reserved, Opaque, Exact(0)).tagged(BuiltinTag::AnsiColor),
-    bare("ArithOp", Reserved, Opaque, Exact(0)),
-    bare("Attribute", Reserved, View, OptionalMessage).tagged(BuiltinTag::UiAttribute),
+    bare("Algorithm", Reserved, SealedHandle, Exact(0))
+        .tagged(BuiltinTag::Algorithm)
+        .compares(HeadEq::Structural),
+    bare("AnsiColor", Reserved, Opaque, Exact(0))
+        .tagged(BuiltinTag::AnsiColor)
+        .compares(HeadEq::Structural),
+    bare("ArithOp", Reserved, Opaque, Exact(0)).compares(HeadEq::ByDefinition),
+    bare("Attribute", Reserved, View, OptionalMessage)
+        .tagged(BuiltinTag::UiAttribute)
+        .compares(HeadEq::Structural),
     // `Ipe.Server`'s authed-route descriptors: `AuthConfig` carries the token-verification `Secret`.
     bare("AuthConfig", Reserved, Opaque, Exact(0))
         .via(&["Server"])
-        .tagged(BuiltinTag::AuthConfig),
+        .tagged(BuiltinTag::AuthConfig)
+        .compares(HeadEq::Never),
     // `Ipe.Auth`'s closed token-refusal ADT, the error of `Auth.verifyToken`; its constructors are `Auth.`-qualified.
     bare("AuthError", LoweredBelowGuard, Opaque, Exact(0))
         .via(&["Auth"])
-        .tagged(BuiltinTag::AuthError),
-    bare("Bool", Reserved, Plain, Exact(0)).tagged(BuiltinTag::Bool),
+        .tagged(BuiltinTag::AuthError)
+        .compares(HeadEq::ByDefinition),
+    bare("Bool", Reserved, Plain, Exact(0))
+        .tagged(BuiltinTag::Bool)
+        .compares(HeadEq::Structural),
     bare("Bytes", Reserved, Plain, Exact(0))
         .declared_in_module("Ipe.Bytes")
-        .tagged(BuiltinTag::Bytes),
+        .tagged(BuiltinTag::Bytes)
+        .compares(HeadEq::Structural),
     bare("Char", Reserved, Plain, Exact(0))
         .declared_in_module("Ipe.Char")
-        .tagged(BuiltinTag::Char),
-    bare("ChunkEvent", Reserved, SealedHandle, Exact(0)).via(&["HttpStream"]),
-    bare("CliAttr", Reserved, Opaque, Exact(1)).tagged(BuiltinTag::CliAttr),
+        .tagged(BuiltinTag::Char)
+        .compares(HeadEq::Structural),
+    bare("ChunkEvent", Reserved, SealedHandle, Exact(0))
+        .via(&["HttpStream"])
+        .compares(HeadEq::ByDefinition),
+    bare("CliAttr", Reserved, Opaque, Exact(1))
+        .tagged(BuiltinTag::CliAttr)
+        .compares(HeadEq::Never),
     bare("Cmd", Reserved, EffectCarrier, InferredCarrier)
         .via(&[
             "TeaCliCmd",
@@ -503,162 +536,266 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
             "TeaWebCmd",
             "TeaWorkerCmd",
         ])
-        .tagged(BuiltinTag::Cmd),
+        .tagged(BuiltinTag::Cmd)
+        .compares(HeadEq::Never),
     // The unified colour value; a program `type Color` wins by its own home.
-    bare("Color", LoweredBelowGuard, View, Exact(0)).tagged(BuiltinTag::Color),
+    bare("Color", LoweredBelowGuard, View, Exact(0))
+        .tagged(BuiltinTag::Color)
+        .compares(HeadEq::Structural),
     // `Ipe.Color`'s companions, each a fixed `ipe_runtime::color` carrier built only through `Ipe.Color` kernels.
-    bare("ColorError", Reserved, Opaque, Exact(0)).tagged(BuiltinTag::ColorError),
+    bare("ColorError", Reserved, Opaque, Exact(0))
+        .tagged(BuiltinTag::ColorError)
+        .compares(HeadEq::Structural),
     // `Ipe.Db`'s external connection and its phantom access modes: the read-only-by-type write barrier.
-    bare("Connection", Reserved, SealedHandle, Exact(1)).tagged(BuiltinTag::Connection),
-    bare("Cookie", Reserved, Opaque, Exact(0)).tagged(BuiltinTag::ServerCookie),
-    bare("CsrfMode", Reserved, Opaque, Exact(0)).tagged(BuiltinTag::CsrfMode),
+    bare("Connection", Reserved, SealedHandle, Exact(1))
+        .tagged(BuiltinTag::Connection)
+        .compares(HeadEq::Never),
+    bare("Cookie", Reserved, Opaque, Exact(0))
+        .tagged(BuiltinTag::ServerCookie)
+        .compares(HeadEq::Never),
+    bare("CsrfMode", Reserved, Opaque, Exact(0))
+        .tagged(BuiltinTag::CsrfMode)
+        .compares(HeadEq::Structural),
     // The JS-widget boundary `CustomElement down up`: a use resolves only through the arity gate (IPE-N0031) and the plain-value seal (IPE-N0039).
     bare("CustomElement", Reserved, Opaque, Exact(2))
         .declared_in_module("Ipe.Ffi.Js.CustomElement")
-        .tagged(BuiltinTag::CustomElement),
+        .tagged(BuiltinTag::CustomElement)
+        .compares(HeadEq::Never),
     bare("Db", Reserved, Opaque, Exact(0))
         .via(&["Db"])
-        .tagged(BuiltinTag::Db),
+        .tagged(BuiltinTag::Db)
+        .compares(HeadEq::Never),
     // `Ipe.Db`'s closed failure-cause ADT, carried by `ErrorDetails.Database`; its constructors are `Db.`-qualified.
     bare("DbFailure", LoweredBelowGuard, Opaque, Exact(0))
         .via(&["Db"])
-        .tagged(BuiltinTag::DbFailure),
+        .tagged(BuiltinTag::DbFailure)
+        .compares(HeadEq::ByDefinition),
     // `Ipe.Db.Location`'s typed database location: may carry a `Dsn` and its `Secret` password.
-    bare("DbLocation", Reserved, SecretOrSink, Exact(0)).tagged(BuiltinTag::DbLocation),
-    bare("Decimal", LoweredBelowGuard, Opaque, Exact(0)).tagged(BuiltinTag::Decimal),
+    bare("DbLocation", Reserved, SecretOrSink, Exact(0))
+        .tagged(BuiltinTag::DbLocation)
+        .compares(HeadEq::Structural),
+    bare("Decimal", LoweredBelowGuard, Opaque, Exact(0))
+        .tagged(BuiltinTag::Decimal)
+        .compares(HeadEq::Structural),
     bare("Decoder", Reserved, Opaque, Exact(1))
         .via(&["Db.Decode", "JsonDec"])
-        .tagged(BuiltinTag::Decoder),
-    bare("Deficiency", Reserved, Opaque, Exact(0)).tagged(BuiltinTag::Deficiency),
-    bare("Description", Reserved, View, Exact(0)).tagged(BuiltinTag::UiDescription),
+        .tagged(BuiltinTag::Decoder)
+        .compares(HeadEq::Never),
+    bare("Deficiency", Reserved, Opaque, Exact(0))
+        .tagged(BuiltinTag::Deficiency)
+        .compares(HeadEq::Structural),
+    bare("Description", Reserved, View, Exact(0))
+        .tagged(BuiltinTag::UiDescription)
+        .compares(HeadEq::Structural),
     bare("Dict", Reserved, ValueContainer, Exact(2))
         .declared_in_module("Ipe.Dict")
-        .tagged(BuiltinTag::Dict),
+        .tagged(BuiltinTag::Dict)
+        .compares(HeadEq::Structural),
     // `Ipe.Db.Dsn`'s connection descriptor: carries a `Secret` password and a fail-closed TLS posture.
     bare("Dsn", Reserved, SecretOrSink, Exact(0))
         .declared_in_module("Ipe.Db.Dsn")
-        .tagged(BuiltinTag::Dsn),
-    bare("Element", Reserved, View, OptionalMessage).tagged(BuiltinTag::UiElement),
+        .tagged(BuiltinTag::Dsn)
+        .compares(HeadEq::Structural),
+    bare("Element", Reserved, View, OptionalMessage)
+        .tagged(BuiltinTag::UiElement)
+        .compares(HeadEq::Structural),
     // `Ipe.Email`'s validated address.
     bare("EmailAddress", Reserved, SecretOrSink, Exact(0))
         .declared_in_module("Ipe.Email")
-        .tagged(BuiltinTag::EmailAddress),
+        .tagged(BuiltinTag::EmailAddress)
+        .compares(HeadEq::Structural),
     bare("Error", Reserved, Opaque, Exact(0))
         .declared_in_module("Ipe.Error")
-        .tagged(BuiltinTag::Error),
-    bare("ErrorDetails", LoweredBelowGuard, Opaque, Exact(0)).tagged(BuiltinTag::ErrorDetails),
-    bare("ErrorInfo", LoweredBelowGuard, Opaque, Exact(0)),
-    bare("ErrorKind", LoweredBelowGuard, Opaque, Exact(0)).tagged(BuiltinTag::ErrorKind),
-    bare("Event", Reserved, View, Exact(1)),
-    bare("Float", Reserved, Plain, Exact(0)).tagged(BuiltinTag::Float),
-    bare("HAlign", Reserved, View, Exact(0)),
-    bare("Handler", KernelImplicit, Opaque, Exact(0)).via(&["Server"]),
+        .tagged(BuiltinTag::Error)
+        .compares(HeadEq::Structural),
+    bare("ErrorDetails", LoweredBelowGuard, Opaque, Exact(0))
+        .tagged(BuiltinTag::ErrorDetails)
+        .compares(HeadEq::Structural),
+    bare("ErrorInfo", LoweredBelowGuard, Opaque, Exact(0)).compares(HeadEq::Structural),
+    bare("ErrorKind", LoweredBelowGuard, Opaque, Exact(0))
+        .tagged(BuiltinTag::ErrorKind)
+        .compares(HeadEq::Structural),
+    bare("Event", Reserved, View, Exact(1)).compares(HeadEq::Never),
+    bare("Float", Reserved, Plain, Exact(0))
+        .tagged(BuiltinTag::Float)
+        .compares(HeadEq::Structural),
+    bare("HAlign", Reserved, View, Exact(0)).compares(HeadEq::Structural),
+    bare("Handler", KernelImplicit, Opaque, Exact(0))
+        .via(&["Server"])
+        .compares(HeadEq::Structural),
     // Closed config-tag ADTs, built only through their constructor kernels; `CsrfMode` has no disabling variant.
-    bare("HostMode", Reserved, Opaque, Exact(0)).tagged(BuiltinTag::HostMode),
-    bare("Html", Reserved, View, OptionalMessage).tagged(BuiltinTag::Html),
+    bare("HostMode", Reserved, Opaque, Exact(0))
+        .tagged(BuiltinTag::HostMode)
+        .compares(HeadEq::Structural),
+    bare("Html", Reserved, View, OptionalMessage)
+        .tagged(BuiltinTag::Html)
+        .compares(HeadEq::Structural),
     // `Ipe.Http`'s closed verb ADT, lowered to a fixed enum.
     bare("HttpMethod", Reserved, SealedHandle, Exact(0))
         .via(&["Http"])
-        .tagged(BuiltinTag::HttpMethod),
-    bare("HttpRequest", LoweredBelowGuard, Opaque, Exact(0)).via(&["Http"]),
-    bare("Int", Reserved, Plain, Exact(0)).tagged(BuiltinTag::Int),
+        .tagged(BuiltinTag::HttpMethod)
+        .compares(HeadEq::Structural),
+    bare("HttpRequest", LoweredBelowGuard, Opaque, Exact(0))
+        .via(&["Http"])
+        .compares(HeadEq::Never),
+    bare("Int", Reserved, Plain, Exact(0))
+        .tagged(BuiltinTag::Int)
+        .compares(HeadEq::Structural),
     // `Ipe.Crypto`'s role-typed key and HMAC output.
     bare("Key", Reserved, SecretOrSink, Exact(0))
         .via(&["Crypto"])
-        .tagged(BuiltinTag::CryptoKey),
-    bare("Label", LoweredBelowGuard, Opaque, Exact(1)).tagged(BuiltinTag::InputLabel),
-    bare("LayoutContext", Reserved, View, Exact(0)),
+        .tagged(BuiltinTag::CryptoKey)
+        .compares(HeadEq::Structural),
+    bare("Label", LoweredBelowGuard, Opaque, Exact(1))
+        .tagged(BuiltinTag::InputLabel)
+        .compares(HeadEq::Structural),
+    bare("LayoutContext", Reserved, View, Exact(0)).compares(HeadEq::Structural),
     // The nullary `Ipe.Ui` names; trusted stdlib may define them (`STDLIB_DEFINABLE_UI_TYPES`).
-    bare("Length", Reserved, View, Exact(0)).tagged(BuiltinTag::UiLength),
+    bare("Length", Reserved, View, Exact(0))
+        .tagged(BuiltinTag::UiLength)
+        .compares(HeadEq::Structural),
     // `Ipe.Ui.Cli`'s line view `Lines msg` and its line-native attribute.
-    bare("Lines", Reserved, Opaque, OptionalMessage).tagged(BuiltinTag::CliLines),
+    bare("Lines", Reserved, Opaque, OptionalMessage)
+        .tagged(BuiltinTag::CliLines)
+        .compares(HeadEq::Never),
     bare("List", Reserved, ValueContainer, Exact(1))
         .declared_in_module("Ipe.List")
-        .tagged(BuiltinTag::List),
+        .tagged(BuiltinTag::List)
+        .compares(HeadEq::Structural),
     // `Ipe.Locale`'s BCP-47 handle.
     bare("Locale", Reserved, SecretOrSink, Exact(0))
         .declared_in_module("Ipe.Locale")
-        .tagged(BuiltinTag::Locale),
-    bare("Location", Reserved, View, Exact(0)),
-    bare("LogLevel", Reserved, Opaque, Exact(0)).tagged(BuiltinTag::LogLevel),
+        .tagged(BuiltinTag::Locale)
+        .compares(HeadEq::Structural),
+    bare("Location", Reserved, View, Exact(0)).compares(HeadEq::Structural),
+    bare("LogLevel", Reserved, Opaque, Exact(0))
+        .tagged(BuiltinTag::LogLevel)
+        .compares(HeadEq::Structural),
     bare("Mac", Reserved, SecretOrSink, Exact(0))
         .via(&["Crypto"])
-        .tagged(BuiltinTag::CryptoMac),
+        .tagged(BuiltinTag::CryptoMac)
+        .compares(HeadEq::Structural),
     bare("Maybe", Reserved, ValueContainer, Exact(1))
         .declared_in_module("Ipe.Maybe")
-        .tagged(BuiltinTag::Maybe),
-    bare("Middleware", KernelImplicit, Opaque, Exact(0)),
-    bare("Migration", LoweredBelowGuard, Opaque, Exact(0)).via(&["Db"]),
+        .tagged(BuiltinTag::Maybe)
+        .compares(HeadEq::Structural),
+    bare("Middleware", KernelImplicit, Opaque, Exact(0)).compares(HeadEq::Structural),
+    bare("Migration", LoweredBelowGuard, Opaque, Exact(0))
+        .via(&["Db"])
+        .compares(HeadEq::Structural),
     // `Basics.Order` names this row through the compiled-source `Ipe.Basics`
     // home, not a kernel qualifier, so the row carries no `via`.
-    bare("Order", LoweredBelowGuard, Opaque, Exact(0)).tagged(BuiltinTag::Order),
-    bare("PanicInfo", LoweredBelowGuard, Opaque, Exact(0)),
+    bare("Order", LoweredBelowGuard, Opaque, Exact(0))
+        .tagged(BuiltinTag::Order)
+        .compares(HeadEq::Structural),
+    bare("PanicInfo", LoweredBelowGuard, Opaque, Exact(0)).compares(HeadEq::Structural),
     // `Ipe.Path`'s validated path: the traversal and NUL refusal boundary.
     bare("Path", Reserved, SecretOrSink, Exact(0))
         .declared_in_module("Ipe.Path")
-        .tagged(BuiltinTag::Path),
-    bare("Placeholder", LoweredBelowGuard, Opaque, Exact(1)).tagged(BuiltinTag::InputPlaceholder),
+        .tagged(BuiltinTag::Path)
+        .compares(HeadEq::Structural),
+    bare("Placeholder", LoweredBelowGuard, Opaque, Exact(1))
+        .tagged(BuiltinTag::InputPlaceholder)
+        .compares(HeadEq::Structural),
     // `Ipe.Auth`'s authenticated subject: the auth mint is its only origin.
     bare("Principal", Reserved, Opaque, Exact(0))
         .via(&["Auth"])
-        .tagged(BuiltinTag::Principal),
+        .tagged(BuiltinTag::Principal)
+        .compares(HeadEq::Structural),
     // `Program shape msg`, the TEA shape carrier every `<Shape>.app` entry returns.
-    bare("Program", Reserved, Opaque, Exact(2)).tagged(BuiltinTag::Program),
-    bare("ProjectionOperand", Reserved, Opaque, Exact(0)).tagged(BuiltinTag::ProjectionOperand),
+    bare("Program", Reserved, Opaque, Exact(2))
+        .tagged(BuiltinTag::Program)
+        .compares(HeadEq::Never),
+    bare("ProjectionOperand", Reserved, Opaque, Exact(0))
+        .tagged(BuiltinTag::ProjectionOperand)
+        .compares(HeadEq::ByDefinition),
     // `Ipe.Db.Store`'s projection-descriptor ADTs: a user union of the name would override the synthetic `EnumDef` the lowerer injects.
-    bare("ProjectionTerm", Reserved, Opaque, Exact(0)).tagged(BuiltinTag::ProjectionTerm),
-    bare("PseudoClass", Reserved, View, Exact(0)).tagged(BuiltinTag::UiPseudoClass),
-    bare("ReadOnly", Reserved, SealedHandle, Exact(0)).tagged(BuiltinTag::ConnReadOnly),
-    bare("ReadWrite", Reserved, SealedHandle, Exact(0)).tagged(BuiltinTag::ConnReadWrite),
+    bare("ProjectionTerm", Reserved, Opaque, Exact(0))
+        .tagged(BuiltinTag::ProjectionTerm)
+        .compares(HeadEq::ByDefinition),
+    bare("PseudoClass", Reserved, View, Exact(0))
+        .tagged(BuiltinTag::UiPseudoClass)
+        .compares(HeadEq::Structural),
+    bare("ReadOnly", Reserved, SealedHandle, Exact(0))
+        .tagged(BuiltinTag::ConnReadOnly)
+        .compares(HeadEq::Never),
+    bare("ReadWrite", Reserved, SealedHandle, Exact(0))
+        .tagged(BuiltinTag::ConnReadWrite)
+        .compares(HeadEq::Never),
     // `Ipe.Regex`'s compiled pattern: `Regex.compile`'s typed refusal is its only origin.
     bare("Regex", Reserved, SecretOrSink, Exact(0))
         .declared_in_module("Ipe.Regex")
-        .tagged(BuiltinTag::Regex),
+        .tagged(BuiltinTag::Regex)
+        .compares(HeadEq::Never),
     // `Ipe.Url`'s same-origin relative reference: the browser-href SSRF boundary.
     bare("Relative", Reserved, SecretOrSink, Exact(0))
         .declared_in_module("Ipe.Url")
-        .tagged(BuiltinTag::UrlRelative),
+        .tagged(BuiltinTag::UrlRelative)
+        .compares(HeadEq::Structural),
     bare("Request", Reserved, Opaque, Exact(0))
         .via(&["Server"])
-        .tagged(BuiltinTag::ServerRequest),
-    bare("Response", Reserved, Opaque, Exact(0)).via(&["Server"]),
+        .tagged(BuiltinTag::ServerRequest)
+        .compares(HeadEq::Never),
+    bare("Response", Reserved, Opaque, Exact(0))
+        .via(&["Server"])
+        .compares(HeadEq::Never),
     bare("Result", Reserved, ValueContainer, Exact(2))
         .declared_in_module("Ipe.Result")
-        .tagged(BuiltinTag::Result),
-    bare("RevocationMode", Reserved, Opaque, Exact(0)).tagged(BuiltinTag::RevocationMode),
+        .tagged(BuiltinTag::Result)
+        .compares(HeadEq::Structural),
+    bare("RevocationMode", Reserved, Opaque, Exact(0))
+        .tagged(BuiltinTag::RevocationMode)
+        .compares(HeadEq::Structural),
     bare("Route", Reserved, Opaque, Exact(0))
         .via(&["Server"])
-        .tagged(BuiltinTag::ServerRoute),
+        .tagged(BuiltinTag::ServerRoute)
+        .compares(HeadEq::Never),
     // `Ipe.Ui.Tui`'s view `Screen msg`, the cell-grid rendering model.
-    bare("Screen", Reserved, Opaque, OptionalMessage).tagged(BuiltinTag::Cells),
+    bare("Screen", Reserved, Opaque, OptionalMessage)
+        .tagged(BuiltinTag::Cells)
+        .compares(HeadEq::Structural),
     // `Ipe.Secret`'s sealed secret string, a security-tier type.
     bare("Secret", Reserved, SecretOrSink, Exact(0))
         .via(&["Secret"])
-        .tagged(BuiltinTag::Secret),
-    bare("Session", KernelImplicit, Opaque, Exact(0)),
+        .tagged(BuiltinTag::Secret)
+        .compares(HeadEq::Structural),
+    bare("Session", KernelImplicit, Opaque, Exact(0)).compares(HeadEq::Structural),
     // `Ipe.Ffi.Js`'s session-stream address: `Js.openSession` is its only origin.
     bare("SessionHandle", Reserved, Opaque, Exact(0))
         .declared_in_module("Ipe.Ffi.Js")
-        .tagged(BuiltinTag::SessionHandle),
+        .tagged(BuiltinTag::SessionHandle)
+        .compares(HeadEq::Structural),
     bare("Set", Reserved, ValueContainer, Exact(1))
         .declared_in_module("Ipe.Set")
-        .tagged(BuiltinTag::Set),
+        .tagged(BuiltinTag::Set)
+        .compares(HeadEq::Structural),
     // `Ipe.App`'s config carrier `Setting shape`: the phantom shape keeps a `Web`-only setting out of another shape.
-    bare("Setting", Reserved, Opaque, Exact(1)).tagged(BuiltinTag::Setting),
-    bare("SqlField", Reserved, SecretOrSink, Exact(0)).tagged(BuiltinTag::SqlField),
+    bare("Setting", Reserved, Opaque, Exact(1))
+        .tagged(BuiltinTag::Setting)
+        .compares(HeadEq::Never),
+    bare("SqlField", Reserved, SecretOrSink, Exact(0))
+        .tagged(BuiltinTag::SqlField)
+        .compares(HeadEq::ByDefinition),
     // `Ipe.Db.Sql`'s opaque WHERE fragment, a security-tier sink.
-    bare("SqlFragment", Reserved, SecretOrSink, Exact(0)).tagged(BuiltinTag::SqlFragment),
-    bare("SqlValue", Reserved, SecretOrSink, Exact(0)).tagged(BuiltinTag::SqlValue),
-    bare("Store", KernelImplicit, Opaque, Exact(0)),
+    bare("SqlFragment", Reserved, SecretOrSink, Exact(0))
+        .tagged(BuiltinTag::SqlFragment)
+        .compares(HeadEq::Structural),
+    bare("SqlValue", Reserved, SecretOrSink, Exact(0))
+        .tagged(BuiltinTag::SqlValue)
+        .compares(HeadEq::ByDefinition),
+    bare("Store", KernelImplicit, Opaque, Exact(0)).compares(HeadEq::Structural),
     bare("StreamId", Reserved, SealedHandle, Exact(0))
         .via(&["HttpStream"])
-        .tagged(BuiltinTag::StreamId),
+        .tagged(BuiltinTag::StreamId)
+        .compares(HeadEq::ByDefinition),
     bare("StreamWriter", LoweredBelowGuard, Opaque, Exact(0))
         .via(&["Stream"])
-        .tagged(BuiltinTag::StreamWriter),
+        .tagged(BuiltinTag::StreamWriter)
+        .compares(HeadEq::Never),
     bare("String", Reserved, Plain, Exact(0))
         .declared_in_module("Ipe.String")
-        .tagged(BuiltinTag::String),
+        .tagged(BuiltinTag::String)
+        .compares(HeadEq::Structural),
     bare("Sub", Reserved, EffectCarrier, InferredCarrier)
         .via(&[
             "TeaCliSub",
@@ -667,47 +804,83 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
             "TeaWebSub",
             "TeaWorkerSub",
         ])
-        .tagged(BuiltinTag::Sub),
+        .tagged(BuiltinTag::Sub)
+        .compares(HeadEq::Never),
     bare("Task", Reserved, EffectCarrier, InferredCarrier)
         .declared_in_module("Ipe.Task")
-        .tagged(BuiltinTag::Task),
-    bare("TermProfile", Reserved, Opaque, Exact(0)).tagged(BuiltinTag::TermProfile),
-    bare("TextSize", Reserved, Opaque, Exact(0)).tagged(BuiltinTag::TextSize),
-    bare("TokenSource", Reserved, Opaque, Exact(0)).tagged(BuiltinTag::TokenSource),
+        .tagged(BuiltinTag::Task)
+        .compares(HeadEq::Never),
+    bare("TermProfile", Reserved, Opaque, Exact(0))
+        .tagged(BuiltinTag::TermProfile)
+        .compares(HeadEq::Structural),
+    bare("TextSize", Reserved, Opaque, Exact(0))
+        .tagged(BuiltinTag::TextSize)
+        .compares(HeadEq::Structural),
+    bare("TokenSource", Reserved, Opaque, Exact(0))
+        .tagged(BuiltinTag::TokenSource)
+        .compares(HeadEq::Never),
     // `Ipe.PubSub`'s phantom topic handle.
     bare("Topic", Reserved, SealedHandle, Exact(1))
         .declared_in_module("Ipe.PubSub")
-        .tagged(BuiltinTag::Topic),
-    bare("TuiAttr", Reserved, Opaque, Exact(1)).tagged(BuiltinTag::TuiAttr),
-    bare("TypeInfo", LoweredBelowGuard, Opaque, Exact(0)),
+        .tagged(BuiltinTag::Topic)
+        .compares(HeadEq::Erased),
+    bare("TuiAttr", Reserved, Opaque, Exact(1))
+        .tagged(BuiltinTag::TuiAttr)
+        .compares(HeadEq::Never),
+    bare("TypeInfo", LoweredBelowGuard, Opaque, Exact(0)).compares(HeadEq::Structural),
     // `Ipe.Url`'s validated URL: the scheme and SSRF parse boundary.
     bare("Url", Reserved, SecretOrSink, Exact(0))
         .declared_in_module("Ipe.Url")
-        .tagged(BuiltinTag::Url),
-    bare("VAlign", Reserved, View, Exact(0)),
-    bare("VNode", KernelImplicit, Opaque, Exact(0)),
+        .tagged(BuiltinTag::Url)
+        .compares(HeadEq::Structural),
+    bare("VAlign", Reserved, View, Exact(0)).compares(HeadEq::Structural),
+    bare("VNode", KernelImplicit, Opaque, Exact(0)).compares(HeadEq::Structural),
     bare("Value", KernelImplicit, Opaque, Exact(0))
         .via(&["JsonEnc"])
-        .tagged(BuiltinTag::JsonValue),
+        .tagged(BuiltinTag::JsonValue)
+        .compares(HeadEq::Structural),
     // `View engine msg`, the engine-tagged view carrier over the closed `{Web, Tui, Cli}` tag set.
-    bare("View", Reserved, View, Exact(2)).tagged(BuiltinTag::View),
-    bare("WcagLevel", Reserved, Opaque, Exact(0)).tagged(BuiltinTag::WcagLevel),
+    bare("View", Reserved, View, Exact(2))
+        .tagged(BuiltinTag::View)
+        .compares(HeadEq::Structural),
+    bare("WcagLevel", Reserved, Opaque, Exact(0))
+        .tagged(BuiltinTag::WcagLevel)
+        .compares(HeadEq::Structural),
     bare("WebReq", Reserved, Opaque, Exact(0))
         .via(&["Web"])
-        .tagged(BuiltinTag::WebReq),
-    bare("WebRoute", LoweredBelowGuard, Opaque, Exact(1)).tagged(BuiltinTag::WebRoute),
+        .tagged(BuiltinTag::WebReq)
+        .compares(HeadEq::Never),
+    bare("WebRoute", LoweredBelowGuard, Opaque, Exact(1))
+        .tagged(BuiltinTag::WebRoute)
+        .compares(HeadEq::Never),
     bare("WebSocketServer", LoweredBelowGuard, Opaque, Exact(0))
         .via(&["Ws"])
-        .tagged(BuiltinTag::WsServer),
-    bare("WebSocketServerCfg", LoweredBelowGuard, Opaque, Exact(0)).tagged(BuiltinTag::WsServerCfg),
-    homed("Html", "Attribute", KernelImplicit, Opaque, Exact(1)).tagged(BuiltinTag::HtmlAttribute),
+        .tagged(BuiltinTag::WsServer)
+        .compares(HeadEq::Never),
+    bare("WebSocketServerCfg", LoweredBelowGuard, Opaque, Exact(0))
+        .tagged(BuiltinTag::WsServerCfg)
+        .compares(HeadEq::Never),
+    homed("Html", "Attribute", KernelImplicit, Opaque, Exact(1))
+        .tagged(BuiltinTag::HtmlAttribute)
+        .compares(HeadEq::Never),
     homed("Ipe.App", "Terminal", KernelImplicit, Opaque, Exact(0))
-        .tagged(BuiltinTag::ShapeTerminal),
-    homed("Ipe.App", "Web", KernelImplicit, Opaque, Exact(0)).tagged(BuiltinTag::ShapeWeb),
-    homed("Ipe.App", "WebView", KernelImplicit, Opaque, Exact(0)).tagged(BuiltinTag::ShapeWebView),
-    homed("Ipe.Codec", "Codec", LoweredBelowGuard, Opaque, Exact(1)).tagged(BuiltinTag::Codec),
-    homed("Ipe.Db.Store", "Cond", LoweredBelowGuard, Opaque, Exact(1)).tagged(BuiltinTag::DbCond),
-    homed("Ipe.Db.Store", "Draft", LoweredBelowGuard, Opaque, Exact(1)).tagged(BuiltinTag::DbDraft),
+        .tagged(BuiltinTag::ShapeTerminal)
+        .compares(HeadEq::Never),
+    homed("Ipe.App", "Web", KernelImplicit, Opaque, Exact(0))
+        .tagged(BuiltinTag::ShapeWeb)
+        .compares(HeadEq::Never),
+    homed("Ipe.App", "WebView", KernelImplicit, Opaque, Exact(0))
+        .tagged(BuiltinTag::ShapeWebView)
+        .compares(HeadEq::Never),
+    homed("Ipe.Codec", "Codec", LoweredBelowGuard, Opaque, Exact(1))
+        .tagged(BuiltinTag::Codec)
+        .compares(HeadEq::ByDefinition),
+    homed("Ipe.Db.Store", "Cond", LoweredBelowGuard, Opaque, Exact(1))
+        .tagged(BuiltinTag::DbCond)
+        .compares(HeadEq::ByDefinition),
+    homed("Ipe.Db.Store", "Draft", LoweredBelowGuard, Opaque, Exact(1))
+        .tagged(BuiltinTag::DbDraft)
+        .compares(HeadEq::ByDefinition),
     homed(
         "Ipe.Db.Store",
         "Joined",
@@ -715,8 +888,11 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
         Opaque,
         Exact(2),
     )
-    .tagged(BuiltinTag::DbJoined),
-    homed("Ipe.Db.Store", "Order", LoweredBelowGuard, Opaque, Exact(0)).tagged(BuiltinTag::DbOrder),
+    .tagged(BuiltinTag::DbJoined)
+    .compares(HeadEq::ByDefinition),
+    homed("Ipe.Db.Store", "Order", LoweredBelowGuard, Opaque, Exact(0))
+        .tagged(BuiltinTag::DbOrder)
+        .compares(HeadEq::ByDefinition),
     homed(
         "Ipe.Db.Store",
         "Policy",
@@ -724,8 +900,11 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
         Opaque,
         Exact(1),
     )
-    .tagged(BuiltinTag::DbPolicy),
-    homed("Ipe.Db.Store", "Pred", LoweredBelowGuard, Opaque, Exact(1)).tagged(BuiltinTag::DbPred),
+    .tagged(BuiltinTag::DbPolicy)
+    .compares(HeadEq::ByDefinition),
+    homed("Ipe.Db.Store", "Pred", LoweredBelowGuard, Opaque, Exact(1))
+        .tagged(BuiltinTag::DbPred)
+        .compares(HeadEq::ByDefinition),
     homed(
         "Ipe.Db.Store",
         "Secured",
@@ -733,7 +912,8 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
         Opaque,
         Exact(1),
     )
-    .tagged(BuiltinTag::DbSecured),
+    .tagged(BuiltinTag::DbSecured)
+    .compares(HeadEq::ByDefinition),
     homed(
         "Ipe.Db.Store",
         "Select",
@@ -741,8 +921,11 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
         Opaque,
         Exact(1),
     )
-    .tagged(BuiltinTag::DbSelect),
-    homed("Ipe.Db.Store", "Store", LoweredBelowGuard, Opaque, Exact(1)).tagged(BuiltinTag::DbStore),
+    .tagged(BuiltinTag::DbSelect)
+    .compares(HeadEq::ByDefinition),
+    homed("Ipe.Db.Store", "Store", LoweredBelowGuard, Opaque, Exact(1))
+        .tagged(BuiltinTag::DbStore)
+        .compares(HeadEq::ByDefinition),
     homed(
         "Ipe.Duration",
         "Duration",
@@ -750,7 +933,8 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
         Opaque,
         Exact(0),
     )
-    .tagged(BuiltinTag::Duration),
+    .tagged(BuiltinTag::Duration)
+    .compares(HeadEq::ByDefinition),
     homed(
         "Ipe.Email",
         "EmailProvider",
@@ -758,7 +942,8 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
         Opaque,
         Exact(0),
     )
-    .tagged(BuiltinTag::EmailProvider),
+    .tagged(BuiltinTag::EmailProvider)
+    .compares(HeadEq::Never),
     homed(
         "Ipe.Http",
         "RedirectPolicy",
@@ -766,9 +951,14 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
         Opaque,
         Exact(0),
     )
-    .tagged(BuiltinTag::RedirectPolicy),
-    homed("Ipe.Jwt", "Claims", KernelImplicit, Opaque, Exact(0)).tagged(BuiltinTag::Claims),
-    homed("Ipe.Remote", "Remote", LoweredBelowGuard, Opaque, Exact(2)).tagged(BuiltinTag::Remote),
+    .tagged(BuiltinTag::RedirectPolicy)
+    .compares(HeadEq::Never),
+    homed("Ipe.Jwt", "Claims", KernelImplicit, Opaque, Exact(0))
+        .tagged(BuiltinTag::Claims)
+        .compares(HeadEq::Structural),
+    homed("Ipe.Remote", "Remote", LoweredBelowGuard, Opaque, Exact(2))
+        .tagged(BuiltinTag::Remote)
+        .compares(HeadEq::Never),
     homed(
         "Ipe.Remote",
         "RemoteAuth",
@@ -776,7 +966,8 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
         Opaque,
         Exact(0),
     )
-    .tagged(BuiltinTag::RemoteAuth),
+    .tagged(BuiltinTag::RemoteAuth)
+    .compares(HeadEq::Never),
     homed(
         "Ipe.Task",
         "BackoffStrategy",
@@ -784,19 +975,36 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
         Opaque,
         Exact(0),
     )
-    .tagged(BuiltinTag::BackoffStrategy),
-    homed("Ipe.Task", "Step", LoweredBelowGuard, Opaque, Exact(2)).tagged(BuiltinTag::TaskStep),
-    homed("Ipe.Tea", "Cli", KernelImplicit, Opaque, Exact(0)).tagged(BuiltinTag::ProgramShapeCli),
-    homed("Ipe.Tea", "CliApp", KernelImplicit, Opaque, Exact(0)).tagged(BuiltinTag::CliApp),
-    homed("Ipe.Tea", "Tui", KernelImplicit, Opaque, Exact(0)).tagged(BuiltinTag::ProgramShapeTui),
-    homed("Ipe.Tea", "TuiApp", KernelImplicit, Opaque, Exact(0)).tagged(BuiltinTag::TuiApp),
-    homed("Ipe.Tea", "Web", KernelImplicit, Opaque, Exact(0)).tagged(BuiltinTag::ProgramShapeWeb),
+    .tagged(BuiltinTag::BackoffStrategy)
+    .compares(HeadEq::Structural),
+    homed("Ipe.Task", "Step", LoweredBelowGuard, Opaque, Exact(2))
+        .tagged(BuiltinTag::TaskStep)
+        .compares(HeadEq::ByDefinition),
+    homed("Ipe.Tea", "Cli", KernelImplicit, Opaque, Exact(0))
+        .tagged(BuiltinTag::ProgramShapeCli)
+        .compares(HeadEq::Never),
+    homed("Ipe.Tea", "CliApp", KernelImplicit, Opaque, Exact(0))
+        .tagged(BuiltinTag::CliApp)
+        .compares(HeadEq::Never),
+    homed("Ipe.Tea", "Tui", KernelImplicit, Opaque, Exact(0))
+        .tagged(BuiltinTag::ProgramShapeTui)
+        .compares(HeadEq::Never),
+    homed("Ipe.Tea", "TuiApp", KernelImplicit, Opaque, Exact(0))
+        .tagged(BuiltinTag::TuiApp)
+        .compares(HeadEq::Never),
+    homed("Ipe.Tea", "Web", KernelImplicit, Opaque, Exact(0))
+        .tagged(BuiltinTag::ProgramShapeWeb)
+        .compares(HeadEq::Never),
     homed("Ipe.Tea", "WebApp", KernelImplicit, Opaque, Exact(0))
         .via(&["Web"])
-        .tagged(BuiltinTag::WebApp),
+        .tagged(BuiltinTag::WebApp)
+        .compares(HeadEq::Never),
     homed("Ipe.Tea", "Worker", KernelImplicit, Opaque, Exact(0))
-        .tagged(BuiltinTag::ProgramShapeWorker),
-    homed("Ipe.Ui", "Color", LoweredBelowGuard, Opaque, Exact(0)).tagged(BuiltinTag::UiColor),
+        .tagged(BuiltinTag::ProgramShapeWorker)
+        .compares(HeadEq::Never),
+    homed("Ipe.Ui", "Color", LoweredBelowGuard, Opaque, Exact(0))
+        .tagged(BuiltinTag::UiColor)
+        .compares(HeadEq::Structural),
     homed(
         "Ipe.Ui.Input",
         "RadioOption",
@@ -804,7 +1012,8 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
         Opaque,
         Exact(1),
     )
-    .tagged(BuiltinTag::InputRadioOption),
+    .tagged(BuiltinTag::InputRadioOption)
+    .compares(HeadEq::Structural),
 ];
 
 /// The number of empty-home rows: the prefix [`BuiltinType::of_bare_name`]
@@ -964,6 +1173,32 @@ const _: () = assert!(
     "a BUILTIN_TYPES row's role disagrees with its seal, arity or home",
 );
 
+/// Whether every effect carrier and application handle refuses `PartialEq`.
+///
+/// A boxed future, a boxed callback and an application's callbacks have no
+/// equality, whatever a row's [`HeadEq`] claims.
+const fn effects_and_apps_never_equal(mut rows: &[BuiltinRow]) -> bool {
+    while let Some((row, tail)) = rows.split_first() {
+        let carrier = matches!(row.seal, SealClass::EffectCarrier)
+            || matches!(
+                row.tag,
+                Some(BuiltinTag::CliApp | BuiltinTag::TuiApp | BuiltinTag::WebApp)
+            );
+        if carrier && !matches!(row.eq, HeadEq::Never) {
+            return false;
+        }
+        rows = tail;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if an effect carrier or application handle row claims `PartialEq` [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    effects_and_apps_never_equal(BUILTIN_TYPES),
+    "an effect carrier or application handle BUILTIN_TYPES row must be HeadEq::Never",
+);
+
 /// The row a kernel scheme names by `tag`; [`every_tag_names_one_row`] makes
 /// it unique.
 const fn row_of_tag(tag: BuiltinTag) -> Option<&'static BuiltinRow> {
@@ -1036,11 +1271,12 @@ const _: () = assert!(
 
 #[cfg(test)]
 mod tests {
-    use super::TypeParams::{Exact, OptionalMessage};
+    use super::TypeParams::{Exact, InferredCarrier, OptionalMessage};
     use super::{
-        BUILTIN_TYPES, BuiltinRole, BuiltinRow, BuiltinTag, BuiltinType, KernelHome, SealClass,
-        TyShape, bare, every_tag_names_one_row, heads_strictly_ascending, homed,
-        kernel_schemes_fit_params, roles_partition, shape_fits_params,
+        BUILTIN_TYPES, BuiltinRole, BuiltinRow, BuiltinTag, BuiltinType, HeadEq, KernelHome,
+        SealClass, TyShape, bare, effects_and_apps_never_equal, every_tag_names_one_row,
+        heads_strictly_ascending, homed, kernel_schemes_fit_params, roles_partition,
+        shape_fits_params,
     };
     use crate::StdlibKernel;
 
@@ -1120,6 +1356,42 @@ mod tests {
             ([ws_cfg, ws], "a name before its own prefix"),
         ] {
             assert!(!heads_strictly_ascending(&rows), "{why} must be refused");
+        }
+    }
+
+    #[test]
+    fn an_effect_or_app_row_claiming_equality_is_refused() {
+        assert!(effects_and_apps_never_equal(BUILTIN_TYPES));
+        let task = bare(
+            "Task",
+            BuiltinRole::Reserved,
+            SealClass::EffectCarrier,
+            InferredCarrier,
+        );
+        let web_app = homed(
+            "Ipe.Tea",
+            "WebApp",
+            BuiltinRole::KernelImplicit,
+            SealClass::Opaque,
+            Exact(0),
+        )
+        .tagged(BuiltinTag::WebApp);
+        assert!(
+            effects_and_apps_never_equal(&[task, web_app]),
+            "a carrier row stating nothing is `HeadEq::Never`"
+        );
+        let int = bare("Int", BuiltinRole::Reserved, SealClass::Plain, Exact(0))
+            .compares(HeadEq::Structural);
+        assert!(effects_and_apps_never_equal(&[int]));
+        for eq in [HeadEq::Structural, HeadEq::Erased, HeadEq::ByDefinition] {
+            assert!(
+                !effects_and_apps_never_equal(&[task.compares(eq)]),
+                "an effect carrier claiming {eq:?} must be refused"
+            );
+            assert!(
+                !effects_and_apps_never_equal(&[web_app.compares(eq)]),
+                "an application handle claiming {eq:?} must be refused"
+            );
         }
     }
 
