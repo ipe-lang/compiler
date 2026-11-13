@@ -107,28 +107,24 @@ fn union_holding_int_equality_builds() {
         .expect("the control fixture project resolves");
     let runtime = e2e_support::require_runtime().into_path_buf();
     let out = out_dir(name);
-    match ipe::build_fixture(&fixture, &out, &runtime) {
-        Ok(_) => {}
-        Err(err) => {
-            assert!(
-                false_marker(),
-                "{name}: ipe REJECTED a comparable union, a false refusal: {err}"
-            );
-            return;
-        }
+    let built = ipe::build_fixture(&fixture, &out, &runtime);
+    if let Err(err) = &built {
+        assert!(
+            false_marker(),
+            "{name}: ipe REJECTED a comparable union, a false refusal: {err}"
+        );
     }
-    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
-        return;
+    if built.is_ok() && e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let outcome = crate::support::build_and_run_emitted(name, &out);
+        assert_eq!(
+            outcome.exit_code,
+            Some(0),
+            "{name}: emitted crate must build and run to exit 0"
+        );
+        assert_eq!(
+            outcome.stdout.trim_end(),
+            "same",
+            "{name}: emitted crate built (SEAL held) but ran to the wrong output"
+        );
     }
-    let outcome = crate::support::build_and_run_emitted(name, &out);
-    assert_eq!(
-        outcome.exit_code,
-        Some(0),
-        "{name}: emitted crate must build and run to exit 0"
-    );
-    assert_eq!(
-        outcome.stdout.trim_end(),
-        "same",
-        "{name}: emitted crate built (SEAL held) but ran to the wrong output"
-    );
 }
