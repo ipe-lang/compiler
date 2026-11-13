@@ -8,7 +8,7 @@
 //! unmet demand with IPE-L0164 at the reference, so `cargo` never meets an
 //! instance `ipe` accepted and the trait refuses.
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 
 use ipe_diagnostics::{CalleeDemand, Diagnostic, LowerError, ModelLeaf, Span};
@@ -289,7 +289,7 @@ fn is_nonclone_leaf(env: CloneEnv<'_>, t: &IrType) -> bool {
 /// The record field holding the first non-`Clone` part (empty when `ty` is
 /// no record) and that part's kind. `None` when `ty` is `Clone`, so the role
 /// check refuses exactly what the callee-bound `Clone` check would.
-pub(super) fn nonclone_role_blame(env: CloneEnv<'_>, ty: &IrType) -> Option<(Box<str>, ModelLeaf)> {
+fn nonclone_role_blame(env: CloneEnv<'_>, ty: &IrType) -> Option<(Box<str>, ModelLeaf)> {
     if !bounded_nonclone(env, ty) {
         return None;
     }
@@ -301,15 +301,73 @@ pub(super) fn nonclone_role_blame(env: CloneEnv<'_>, ty: &IrType) -> Option<(Box
             .unwrap_or(""),
         _ => "",
     };
-    let leaf = first_nonclone_leaf(env, ty).map_or(ModelLeaf::Handle, |leaf| match leaf {
-        IrType::Fun(..) | IrType::FnOnceChain(..) => ModelLeaf::Function,
-        IrType::Cmd(_) => ModelLeaf::Command,
-        IrType::Sub(_) => ModelLeaf::Subscription,
-        IrType::Task(_) => ModelLeaf::Task,
+    let leaf = first_nonclone_leaf(env, ty)
+        .and_then(|leaf| leaf_kind(&leaf))
         // The remaining non-`Clone` leaves: an app handle or an opaque FFI handle.
-        _ => ModelLeaf::Handle,
-    });
+        .unwrap_or(ModelLeaf::Handle);
     Some((field.into(), leaf))
+}
+
+/// What an app-role refusal blames in a Model or Msg `ty` that misses `bound`.
+///
+/// The record field holding the first part that misses it (empty when `ty`
+/// is no record) and that part's kind. `None` when `ty` supplies `bound`
+/// ([`bound_met_by`], with `PartialEq` judged by the module's
+/// `enum_derivable` facts), so the role gate refuses exactly what the app
+/// entry's callee-bound check would.
+pub(super) fn role_blame(
+    env: CloneEnv<'_>,
+    enum_derivable: &BTreeMap<(ModPath, Symbol), bool>,
+    bound: Bound,
+    ty: &IrType,
+) -> Option<(Box<str>, ModelLeaf)> {
+    if bound == Bound::Clone {
+        return nonclone_role_blame(env, ty);
+    }
+    let misses = |t: &IrType| {
+        let supply = if bound == Bound::Eq {
+            eq_supplied(env, Some(enum_derivable), t)
+        } else {
+            bound_met_by(env, bound, t)
+        };
+        matches!(supply, Supply::Unmet { .. })
+    };
+    if !misses(ty) {
+        return None;
+    }
+    let field = match ty {
+        IrType::Record(fields) => fields
+            .iter()
+            .find(|(_, field_ty)| misses(field_ty))
+            .and_then(|(sym, _)| env.interner.resolve(*sym))
+            .unwrap_or(""),
+        _ => "",
+    };
+    let found: Cell<Option<ModelLeaf>> = Cell::new(None);
+    let held = ipe_ir::ir_type_holds(ty, env.payloads, &|t| {
+        let kind = leaf_kind(t);
+        if found.get().is_none() {
+            found.set(kind);
+        }
+        kind.is_some()
+    });
+    // A miss with no function, effect or decoder part is an opaque handle's.
+    let leaf = found.get().filter(|_| held).unwrap_or(ModelLeaf::Handle);
+    Some((field.into(), leaf))
+}
+
+/// The kind an app-role refusal names `t` by, when `t` is a function, an effect or a decoder.
+const fn leaf_kind(t: &IrType) -> Option<ModelLeaf> {
+    match t {
+        IrType::Fun(..) | IrType::FnOnceChain(..) | IrType::SharedFun(..) => {
+            Some(ModelLeaf::Function)
+        }
+        IrType::Cmd(_) => Some(ModelLeaf::Command),
+        IrType::Sub(_) => Some(ModelLeaf::Subscription),
+        IrType::Task(_) => Some(ModelLeaf::Task),
+        IrType::Decoder(_) => Some(ModelLeaf::Decoder),
+        _ => None,
+    }
 }
 
 /// The head of `ty` in Ipê words: `Task`, `function`, a union's own name.
@@ -500,13 +558,13 @@ fn aligned_instances<'s>(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
-    use ipe_diagnostics::CalleeDemand;
+    use ipe_diagnostics::{CalleeDemand, ModelLeaf};
     use ipe_intern::Interner;
     use ipe_ir::{BoundSet, EnumPayloadTable, IrType, ModPath};
 
-    use super::{Bound, CloneEnv, Supply, bound_met_by};
+    use super::{Bound, CloneEnv, Supply, bound_met_by, role_blame};
 
     /// Run `check` with an empty classification context.
     fn with_env(check: impl FnOnce(CloneEnv<'_>)) {
@@ -745,18 +803,69 @@ mod tests {
             transparent_ffi: &ffi,
             payloads: &payloads,
         };
-        let named = |name| IrType::Enum {
+        let main_enum = |name| IrType::Enum {
             home: main_home.clone(),
             name,
             args: Vec::new(),
         };
-        for (ty, met) in [(handle, false), (named(plain), true), (named(holds), false)] {
+        for (ty, met) in [
+            (handle, false),
+            (main_enum(plain), true),
+            (main_enum(holds), false),
+        ] {
             assert_eq!(
                 bound_met_by(env, Bound::Eq, &ty) == Supply::Met,
                 met,
                 "{ty:?}"
             );
         }
+    }
+
+    /// A Model missing `PartialEq` is blamed by the role gate, naming the field
+    /// and its leaf, while a `Clone`-only judgement admits it.
+    #[test]
+    fn role_blame_names_the_field_a_model_misses_equality_by() {
+        let mut interner = Interner::new();
+        let names = ["count", "widget", "parse"].map(|n| interner.intern(n));
+        assert!(
+            names.iter().all(Result::is_ok),
+            "interning the fixture names"
+        );
+        let [Ok(count), Ok(widget), Ok(parse)] = names else {
+            return;
+        };
+        let ffi = BTreeSet::new();
+        let payloads = EnumPayloadTable::new();
+        let env = CloneEnv {
+            interner: &interner,
+            transparent_ffi: &ffi,
+            payloads: &payloads,
+        };
+        let derivable = BTreeMap::new();
+        let element = IrType::CustomElement {
+            down: Box::new(IrType::Int),
+            up: Box::new(IrType::Str),
+        };
+        let with_element =
+            IrType::Record(BTreeMap::from([(count, IrType::Int), (widget, element)]));
+        let with_decoder = IrType::Record(BTreeMap::from([
+            (count, IrType::Int),
+            (parse, IrType::Decoder(Box::new(IrType::Int))),
+        ]));
+        assert_eq!(
+            role_blame(env, &derivable, Bound::Clone, &with_element),
+            None
+        );
+        assert_eq!(
+            role_blame(env, &derivable, Bound::Eq, &with_element),
+            Some(("widget".into(), ModelLeaf::Handle))
+        );
+        assert_eq!(
+            role_blame(env, &derivable, Bound::Eq, &with_decoder),
+            Some(("parse".into(), ModelLeaf::Decoder))
+        );
+        let plain = IrType::Record(BTreeMap::from([(count, IrType::Int)]));
+        assert_eq!(role_blame(env, &derivable, Bound::Eq, &plain), None);
     }
 
     /// `Copy` is supplied by the scalars only; `IpeRow` by its two runtime rows only.

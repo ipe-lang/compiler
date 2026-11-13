@@ -30916,11 +30916,14 @@ impl<'a> Lowerer<'a> {
     /// Refuse an app entry whose Model or Msg its app shape cannot hold, before any definition is lowered.
     ///
     /// A Model or Msg holding a part with no `Clone` (a `Cmd`, a `Task`, a
-    /// function) is refused by its app shape's own gate, IPE-L0120 or
+    /// function), or missing any other bound the entry's own runtime row
+    /// ([`KernelFn::runtime_bounds`]) puts on that role (a Web Model's
+    /// `PartialEq`), is refused by its app shape's own gate, IPE-L0120 or
     /// IPE-L0125, which names the role and the field. Every callee-bound
     /// refusal (IPE-L0164) of the same type, at the entry, at a view kernel
     /// copying the message, or at a user generic, follows from that one
-    /// declaration, so the role gates run first, over the whole module.
+    /// declaration, so the role gates run first, over the whole module, and
+    /// judge every bound the entry's callee-bound check would.
     ///
     /// This only chooses the diagnostic: an entry whose Model or Msg it cannot
     /// read (no region, an unfixed type, a type that does not lower) is left
@@ -30969,14 +30972,25 @@ impl<'a> Lowerer<'a> {
             let Ok(lowered) = self.ir_type_from_ty(instance, span) else {
                 continue;
             };
-            if let Some((field, leaf)) =
-                instance_bounds::nonclone_role_blame(self.clone_env(), &lowered)
-            {
-                let msg = match role {
-                    AppRole::Model => LowerError::InadmissibleAppModel { app, field, leaf },
-                    AppRole::Msg => LowerError::InadmissibleAppMsg { app, field, leaf },
-                };
-                return Err(Diagnostic::Lower { span, msg });
+            let demanded = kernel
+                .runtime_bounds()
+                .iter()
+                .filter(|(row_var, _)| *row_var == var)
+                .flat_map(|(_, row)| instance_bounds::Bound::of_runtime(*row))
+                .filter(|bound| *bound != instance_bounds::Bound::Clone);
+            for bound in std::iter::once(instance_bounds::Bound::Clone).chain(demanded) {
+                if let Some((field, leaf)) = instance_bounds::role_blame(
+                    self.clone_env(),
+                    &self.enum_derivable,
+                    bound,
+                    &lowered,
+                ) {
+                    let msg = match role {
+                        AppRole::Model => LowerError::InadmissibleAppModel { app, field, leaf },
+                        AppRole::Msg => LowerError::InadmissibleAppMsg { app, field, leaf },
+                    };
+                    return Err(Diagnostic::Lower { span, msg });
+                }
             }
         }
         Ok(())
