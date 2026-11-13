@@ -3803,8 +3803,9 @@ pub fn line_col(src: &str, offset: usize) -> (usize, usize) {
 /// [`SourceSnapshot`](crate::source_snapshot::SourceSnapshot) of `root` —
 /// never by a reduced single-module resolution, so a name the build binds
 /// through an import is never "corrected". No file names every entry of the
-/// project, each fixed in turn. A diagnostic another module owns is reported,
-/// never patched.
+/// project, each fixed in turn: an entry's refusal never stops the next, and
+/// the refusals are returned once every entry was tried. A diagnostic another
+/// module owns is reported, never patched.
 ///
 /// `auto` (set by `--yes` / `--fix`) is durable authorization to apply every
 /// edit without prompting; otherwise each edit is confirmed interactively on
@@ -3820,7 +3821,8 @@ pub fn line_col(src: &str, offset: usize) -> (usize, usize) {
 /// The refusal of a project context that cannot be built (an unreadable or
 /// malformed manifest, a module that cannot be read); [`CliError::Io`] on a
 /// filesystem failure; [`CliError::ThreadRefused`] when the OS refuses the
-/// compile thread.
+/// compile thread; past the entries, the one entry's refusal, or
+/// [`CliError::ProjectRefused`] when several entries were left unfixed.
 pub fn apply_fixes_cmd<W: Write + Send>(
     root: &ProjectRoot,
     file: Option<&FileArg>,
@@ -3829,11 +3831,40 @@ pub fn apply_fixes_cmd<W: Write + Send>(
 ) -> Result<(), CliError> {
     let target = analysis_target(root, file)?;
     crate::threads::run_compile(|| {
-        for graph in analysis_graphs(&target)? {
-            fix_entry(graph, auto, w)?;
-        }
-        Ok(())
+        let failed: Vec<CliError> = analysis_graphs(&target)?
+            .into_iter()
+            .filter_map(|graph| fix_entry(graph, auto, w).err())
+            .collect();
+        entries_outcome(failed, w)
     })?
+}
+
+/// The outcome of fixing every entry, each tried whatever another's fate: the one refusal as it is, several reported on `w` and refused together.
+///
+/// # Errors
+/// The lone entry's own refusal; [`CliError::ProjectRefused`] naming how many
+/// entries were left unfixed when more than one was.
+pub(super) fn entries_outcome<W: Write>(
+    mut failed: Vec<CliError>,
+    w: &mut W,
+) -> Result<(), CliError> {
+    match failed.len() {
+        0 => Ok(()),
+        1 => failed.pop().map_or(Ok(()), Err),
+        count => {
+            for error in failed {
+                writeln!(w, "{}", text::msg::fix_entry_failed(&error)).map_err(|e| {
+                    CliError::Io {
+                        path: PathBuf::from("<stdout>"),
+                        source: e,
+                    }
+                })?;
+            }
+            Err(CliError::ProjectRefused(text::msg::fix_entries_failed(
+                &count,
+            )))
+        }
+    }
 }
 
 /// Fix the entry of one source graph; every report names the entry's file.

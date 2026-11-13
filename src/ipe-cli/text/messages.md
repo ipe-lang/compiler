@@ -104,6 +104,14 @@ usage: ipe fix <path> [--yes]
 
 no free backup name for {file} in `{dir}/` ({slots} taken); file left unchanged; remove old backups there and run `ipe fix` again
 
+## fix-entry-failed
+
+fix: {error}
+
+## fix-entries-failed
+
+ipe fix: {count} entries were left unfixed (each reported above); the other entries were fixed as reported
+
 ## lsp-takes-no-arguments
 
 ipe lsp takes no arguments

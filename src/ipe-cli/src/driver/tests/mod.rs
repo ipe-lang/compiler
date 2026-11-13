@@ -646,6 +646,85 @@ fn ipe_fix_corrects_a_misspelling_no_import_binds() {
     );
 }
 
+/// A report sink whose first write fails, every later one kept.
+struct FailingOnce {
+    failed: bool,
+    kept: Vec<u8>,
+}
+
+impl std::io::Write for FailingOnce {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.failed {
+            std::io::Write::write(&mut self.kept, buf)
+        } else {
+            self.failed = true;
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// One entry's refusal never stops the next: the other entry is fixed, the refusal still returned.
+#[test]
+fn ipe_fix_tries_every_entry_past_a_refusal() {
+    let dir = fix_project(
+        "fix_every_entry",
+        "module Package exposing (package)\n\n\npackage =\n    { name = \"fix\", exposedModules = [ \"Clean\", \"Helpers\" ] }\n",
+        &[
+            ("Clean.ipe", "module Clean exposing (y)\n\ny : Int\ny = 1\n"),
+            ("Helpers.ipe", HELPERS_MISSPELLING_LENGTH),
+        ],
+    );
+    let mut out = FailingOnce {
+        failed: false,
+        kept: Vec::new(),
+    };
+    let fixed = analysis_root(&dir, None)
+        .and_then(|(root, file)| apply_fixes_cmd(&root, file.as_ref(), true, &mut out));
+    let helpers_after = fs::read_to_string(dir.join("src").join("Helpers.ipe")).ok();
+    let _ = fs::remove_dir_all(&dir);
+    let out = String::from_utf8_lossy(&out.kept);
+    assert!(
+        matches!(&fixed, Err(CliError::Io { path, .. }) if path.ends_with("Clean.ipe")),
+        "the first entry's refusal is returned: {fixed:?}\n{out}"
+    );
+    assert_eq!(
+        helpers_after.as_deref(),
+        Some("module Helpers exposing (x)\n\nlength : Int\nlength = 2\n\nx = length\n"),
+        "the entry after the refused one is still fixed: {out}"
+    );
+}
+
+/// Several entries left unfixed are each reported, then refused together.
+#[test]
+fn ipe_fix_reports_every_unfixed_entry() {
+    let mut out = Vec::new();
+    let refused = |name: &str| CliError::Io {
+        path: PathBuf::from(name),
+        source: std::io::ErrorKind::NotFound.into(),
+    };
+    let none = super::commands_pkg::entries_outcome(Vec::new(), &mut out);
+    assert!(none.is_ok(), "{none:?}");
+    let one = super::commands_pkg::entries_outcome(vec![refused("a.ipe")], &mut out);
+    assert!(
+        matches!(&one, Err(CliError::Io { path, .. }) if path == Path::new("a.ipe")),
+        "{one:?}"
+    );
+    assert!(out.is_empty(), "a lone refusal is returned, not reported");
+    let two =
+        super::commands_pkg::entries_outcome(vec![refused("a.ipe"), refused("b.ipe")], &mut out);
+    let out = String::from_utf8_lossy(&out);
+    assert!(
+        matches!(&two, Err(CliError::ProjectRefused(m))
+            if *m == crate::text::msg::fix_entries_failed(&2)),
+        "{two:?}"
+    );
+    assert!(out.contains("a.ipe") && out.contains("b.ipe"), "{out}");
+}
+
 /// A project whose context cannot be built is refused with the manifest's own
 /// typed error, never diagnosed by a reduced resolution: the file is untouched.
 #[test]

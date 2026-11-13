@@ -657,6 +657,10 @@ messages! {
     fix_usage = "fix-usage";
     /// `ipe fix` found every backup slot taken.
     fix_backups_full(file, dir, slots) = "fix-backups-full";
+    /// One entry `ipe fix` could not fix, among several.
+    fix_entry_failed(error) = "fix-entry-failed";
+    /// `ipe fix` left more than one entry unfixed.
+    fix_entries_failed(count) = "fix-entries-failed";
     /// `ipe lsp` given any arguments.
     lsp_takes_no_arguments = "lsp-takes-no-arguments";
     /// `ipe lint` given more than one path.
