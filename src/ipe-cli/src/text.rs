@@ -1381,6 +1381,12 @@ messages! {
     health_config_not_toml(path, detail) = "health-config-not-toml";
     /// `ipe health`'s edited config did not re-parse.
     health_config_edit_unparsable(path) = "health-config-edit-unparsable";
+    /// `ipe health`'s config changed between its read and the replace.
+    health_config_changed(path) = "health-config-changed";
+    /// `ipe health` found every backup slot of a config taken.
+    health_config_backups_full(path, dir, slots) = "health-config-backups-full";
+    /// Where `ipe health` kept a replaced config's original.
+    health_config_original_kept(path) = "health-config-original-kept";
     /// `ipe lint --fix` with a data form.
     lint_fix_with_format = "lint-fix-with-format";
     /// `ipe lint --fix` rewrote a module with no project file.

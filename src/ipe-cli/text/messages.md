@@ -1594,6 +1594,18 @@ health: {path} is not valid TOML ({detail}); refusing to overwrite it
 
 health: the edited config for {path} did not re-parse; no change was made
 
+## health-config-changed
+
+health: {path} changed while it was being edited; nothing was written — run `ipe health` again
+
+## health-config-backups-full
+
+health: no free backup name for {path} in `{dir}/` ({slots} taken); nothing was written; remove old backups there and run `ipe health` again
+
+## health-config-original-kept
+
+original kept at {path}
+
 ## lint-fix-with-format
 
 ipe lint: --fix and a data form (--json/--plain) are mutually exclusive — a data form reports without mutating

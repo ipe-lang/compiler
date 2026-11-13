@@ -36,8 +36,10 @@
 //! install runs a fixed `argv`; a package-manager command (which needs
 //! elevation the command deliberately does not take) is shown, never run.
 
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::io::IsTerminal;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -47,6 +49,9 @@ use zeroize::Zeroizing;
 
 use crate::agents_guide::GuideStatus;
 use crate::cli_args::OutputFormat;
+use crate::io_bounded::SMALL_FILE_CAP;
+use crate::output_dir::OutputRefusal;
+use crate::output_dir::held::{self, BackedUp, Created, HeldDir, ReadMiss, Replaced};
 use crate::remote_ingest::{
     InheritedInput, InheritedRole, LINK_PROBE_LIMITS, LocalCeiling, LocalSource, run_inherited,
     run_local_fed,
@@ -952,11 +957,14 @@ fn run_link_probe_with(
     })
 }
 
+/// The linker-probe cache file's name under `$IPE_HOME`.
+const PROBE_CACHE_FILE: &str = "linker-probe.toml";
+
 /// The path of the linker-probe cache file: `$IPE_HOME/linker-probe.toml`.
 fn probe_cache_path() -> Option<PathBuf> {
     runtime_embed::ipe_home()
         .ok()
-        .map(|h| h.join("linker-probe.toml"))
+        .map(|h| h.join(PROBE_CACHE_FILE))
 }
 
 /// Read a cached probe result for `(name, toolchain_key)`. Returns `None` when
@@ -981,18 +989,39 @@ fn read_probe_cache(name: &str, toolchain_key: Option<&str>) -> Option<LinkerPro
     }
 }
 
-/// Write a probe result to the cache. Failures are silently ignored: a missing
-/// cache only costs a re-probe on the next run; a caching error must not fail
-/// `ipe health`.
+/// Write a probe result to the cache under `$IPE_HOME`.
+///
+/// Failures are silently ignored: a missing cache only costs a re-probe on the
+/// next run; a caching error must not fail `ipe health`.
 fn write_probe_cache(name: &str, toolchain_key: Option<&str>, result: &LinkerProbeResult) {
-    let Some(path) = probe_cache_path() else {
+    if let Ok(home) = runtime_embed::ipe_home() {
+        write_probe_cache_in(&home, name, toolchain_key, result);
+    }
+}
+
+/// Write a probe result to the cache file in `home`, read and replaced through the held directory.
+///
+/// A link at the cache name is neither read nor written through: the read
+/// yields no prior entries and the held write refuses the link, so its
+/// target is never touched. Every failure is ignored, as for any cache.
+fn write_probe_cache_in(
+    home: &Path,
+    name: &str,
+    toolchain_key: Option<&str>,
+    result: &LinkerProbeResult,
+) {
+    let _ = std::fs::create_dir_all(home);
+    let Ok(Some(dir)) = HeldDir::open_following(home) else {
+        return;
+    };
+    let Ok(cache) = dir.entry(OsStr::new(PROBE_CACHE_FILE)) else {
         return;
     };
     let accepted = matches!(result, LinkerProbeResult::Accepted);
     // Read the existing cache (if any) so we preserve other linkers' entries.
-    let existing =
-        crate::io_bounded::read_leaf_capped(&path, crate::io_bounded::SMALL_FILE_READ_CAP)
-            .unwrap_or_default();
+    let existing = dir
+        .read_file_capped(&cache, SMALL_FILE_CAP)
+        .unwrap_or_default();
     let mut doc = existing
         .parse::<toml_edit::DocumentMut>()
         .unwrap_or_default();
@@ -1005,10 +1034,10 @@ fn write_probe_cache(name: &str, toolchain_key: Option<&str>, result: &LinkerPro
             t.insert("toolchain", toml_edit::value(key));
         }
     }
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(&path, doc.to_string());
+    let rendered = doc.to_string();
+    let _ = dir.write_file(OsStr::new(PROBE_CACHE_FILE), None, |file| {
+        file.write_all(rendered.as_bytes())
+    });
 }
 
 /// The `~/.cargo/config.toml` edit that wires a fast linker for the host
@@ -1727,12 +1756,12 @@ fn apply_one(fix: &Fix) -> Result<String, CliError> {
     match fix {
         Fix::ConfigEdit(edit) => {
             let path = edit.target.path()?;
-            apply_config_edit(&path, &edit.key, &edit.value)?;
-            Ok(format!(
+            let edited = apply_config_edit(&path, &edit.key, &edit.value)?;
+            Ok(edited.outcome(format!(
                 "set {} in {}",
                 edit.key.join("."),
                 edit.target.label()
-            ))
+            )))
         }
         Fix::Install(install) => match &install.method {
             InstallMethod::Direct { argv } => {
@@ -1750,11 +1779,11 @@ fn apply_one(fix: &Fix) -> Result<String, CliError> {
                 source: e,
             })?;
             let value = ConfigValue::Str(setup.target_dir.display().to_string());
-            apply_config_edit(&path, &["build", "target-dir"], &value)?;
-            Ok(format!(
+            let edited = apply_config_edit(&path, &["build", "target-dir"], &value)?;
+            Ok(edited.outcome(format!(
                 "shared target configured at {}",
                 setup.target_dir.display()
-            ))
+            )))
         }
         Fix::RunUpgrade { latest, .. } => {
             crate::run_installer()?;
@@ -1791,33 +1820,110 @@ fn run_install(argv: &[String]) -> Result<(), CliError> {
     }
 }
 
-/// Set a dotted key in a TOML config file, format-preserving and idempotent:
-/// - Parse the existing document (empty when the file is absent).
-/// - If the key already holds exactly the requested value, do nothing.
-/// - Otherwise back up the current file to a numbered sibling
-///   (`config.toml.bak`, `.bak.1`, …), set exactly that key (every other line,
-///   comment, and layout preserved), and write the result atomically.
-/// - Re-parse what was written; if it does not parse, roll the backup back so
-///   the user is never left with a broken config.
+/// What a config edit did.
+#[derive(Debug, PartialEq, Eq)]
+enum ConfigEdited {
+    /// The key already held the value; nothing was written.
+    Unchanged,
+    /// The file was absent or empty and now holds the key; nothing was lost.
+    Written,
+    /// The file was replaced; its prior bytes are kept at this path.
+    BackedUp(PathBuf),
+}
+
+impl ConfigEdited {
+    /// The report line for a fix whose success reads `done`, naming the kept original.
+    fn outcome(&self, done: String) -> String {
+        match self {
+            Self::Unchanged | Self::Written => done,
+            Self::BackedUp(backup) => format!(
+                "{done}; {}",
+                crate::text::msg::health_config_original_kept(&backup.display())
+            ),
+        }
+    }
+}
+
+/// Why a config edit wrote nothing although the file parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigRefusal {
+    /// The file is no longer the one read, or no longer holds the bytes read.
+    ChangedSinceRead,
+    /// Every backup slot of the file is taken.
+    BackupSlotsFull,
+}
+
+impl ConfigRefusal {
+    /// The refusal's message for the config at `path`.
+    fn message(self, path: &Path) -> crate::text::Message {
+        match self {
+            Self::ChangedSinceRead => crate::text::msg::health_config_changed(&path.display()),
+            Self::BackupSlotsFull => crate::text::msg::health_config_backups_full(
+                &path.display(),
+                &path.with_file_name(crate::driver::BACKUP_DIR).display(),
+                &held::BACKUP_SLOTS,
+            ),
+        }
+    }
+}
+
+/// Set a dotted key in a TOML config file, format-preserving and idempotent.
 ///
-/// A conflicting existing value is NOT silently overwritten in place: the
-/// numbered backup captures the prior state first, so the change is reversible.
+/// The refusals of [`edit_config`] become a usage error naming the file.
 ///
 /// # Errors
-/// [`CliError::Io`] on a filesystem failure; [`CliError::Usage`] when the
-/// existing file does not parse as TOML (the command will not blindly overwrite
-/// a file it cannot understand).
-fn apply_config_edit(path: &Path, key: &[&str], value: &ConfigValue) -> Result<(), CliError> {
-    let existing =
-        match crate::io_bounded::read_leaf_capped(path, crate::io_bounded::SMALL_FILE_READ_CAP) {
-            Ok(text) => text,
-            Err(CliError::Io { ref source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                String::new()
-            }
-            Err(e) => return Err(e),
-        };
+/// As [`edit_config`]; [`CliError::Usage`] for a [`ConfigRefusal`].
+fn apply_config_edit(
+    path: &Path,
+    key: &[&str],
+    value: &ConfigValue,
+) -> Result<ConfigEdited, CliError> {
+    edit_config(path, key, value)?.map_err(|refusal| CliError::Usage(refusal.message(path)))
+}
+
+/// Set a dotted key in the TOML file at `path` through its held directory.
+///
+/// - Create the directory, hold it, and read the file through it, never
+///   through a link (absent reads as empty).
+/// - If the key already holds exactly the requested value, do nothing.
+/// - Otherwise set exactly that key (every other line, comment and layout
+///   preserved) and check the result re-parses before anything is written.
+/// - Create an absent file; replace a present one only while it is still the
+///   file read, holding the bytes read. A non-empty original is first kept in
+///   a bounded backup slot under `.ipe-backup/` beside it; the replace is an
+///   atomic rename, so a failure leaves the original in place.
+///
+/// # Errors
+/// [`CliError::SourceRefused`] for a link or a non-regular file at `path`;
+/// [`CliError::Usage`] when the existing file does not parse as TOML (the
+/// command will not blindly overwrite a file it cannot understand);
+/// [`CliError::Io`] or an [`OutputRefusal`] on a filesystem failure.
+fn edit_config(
+    path: &Path,
+    key: &[&str],
+    value: &ConfigValue,
+) -> Result<Result<ConfigEdited, ConfigRefusal>, CliError> {
+    let (Some(parent), Some(name)) = (
+        path.parent().filter(|p| !p.as_os_str().is_empty()),
+        path.file_name(),
+    ) else {
+        return Err(OutputRefusal::UnnameableEntry(path.to_path_buf()).into());
+    };
+    std::fs::create_dir_all(parent).map_err(|e| CliError::Io {
+        path: parent.to_path_buf(),
+        source: e,
+    })?;
+    let dir = HeldDir::open_following(parent)?.ok_or_else(|| CliError::Io {
+        path: parent.to_path_buf(),
+        source: std::io::ErrorKind::NotFound.into(),
+    })?;
+    let entry = dir.entry(name)?;
+    let judged = match dir.read_file_capped_identified(&entry, SMALL_FILE_CAP) {
+        Ok(read) => Some(read),
+        Err(e) if held::read_miss(&e) == ReadMiss::Absent => None,
+        Err(e) => return Err(e),
+    };
+    let existing = judged.as_ref().map_or("", |(text, _)| text.as_str());
 
     let mut doc = existing.parse::<toml_edit::DocumentMut>().map_err(|e| {
         CliError::Usage(crate::text::msg::health_config_not_toml(
@@ -1829,46 +1935,42 @@ fn apply_config_edit(path: &Path, key: &[&str], value: &ConfigValue) -> Result<(
     // Idempotent: if the key already holds exactly this value, no write, no
     // backup — running health twice changes nothing.
     if dotted_value_matches(&doc, key, value) {
-        return Ok(());
+        return Ok(Ok(ConfigEdited::Unchanged));
     }
-
-    // Back up the prior state before any change, so a conflicting overwrite is
-    // reversible.
-    let backup = if existing.is_empty() {
-        None
-    } else {
-        Some(numbered_backup(path, &existing)?)
-    };
 
     set_dotted(&mut doc, key, value);
     let rendered = doc.to_string();
 
-    // Parse-verify BEFORE the write becomes live: a render that does not
-    // round-trip is a bug, and we roll back rather than write it.
+    // A render that does not round-trip is a bug: refuse it before any write.
     if rendered.parse::<toml_edit::DocumentMut>().is_err() {
         return Err(CliError::Usage(
             crate::text::msg::health_config_edit_unparsable(&path.display()),
         ));
     }
 
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent).map_err(|e| CliError::Io {
-            path: parent.to_path_buf(),
-            source: e,
-        })?;
-    }
-
-    match write_atomic_config(path, &rendered) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // Roll the backup back so a failed write never leaves the user with
-            // a truncated or missing config.
-            if let Some(backup_path) = &backup {
-                let _ = std::fs::copy(backup_path, path);
+    let fill = |file: &mut std::fs::File| file.write_all(rendered.as_bytes());
+    Ok(match judged {
+        None => match dir.create_if_absent(name, fill)? {
+            Created::Done => Ok(ConfigEdited::Written),
+            Created::Exists => Err(ConfigRefusal::ChangedSinceRead),
+        },
+        // An empty original holds nothing a backup would keep.
+        Some((text, id)) if text.is_empty() => {
+            match dir.replace_if_unchanged(name, id, &text, SMALL_FILE_CAP, fill)? {
+                Replaced::Done => Ok(ConfigEdited::Written),
+                Replaced::Changed => Err(ConfigRefusal::ChangedSinceRead),
             }
-            Err(e)
         }
-    }
+        Some((text, id)) => match dir.replace_backed_up(name, id, &text, SMALL_FILE_CAP, fill)? {
+            BackedUp::Done(backup) => Ok(ConfigEdited::BackedUp(
+                dir.path()
+                    .join(crate::driver::BACKUP_DIR)
+                    .join(backup.slot().as_os_str()),
+            )),
+            BackedUp::Changed => Err(ConfigRefusal::ChangedSinceRead),
+            BackedUp::BackupSlotsFull => Err(ConfigRefusal::BackupSlotsFull),
+        },
+    })
 }
 
 /// Whether the dotted key in `doc` already holds exactly `value` (idempotency
@@ -1931,60 +2033,6 @@ fn set_dotted(doc: &mut toml_edit::DocumentMut, key: &[&str], value: &ConfigValu
             table.insert(last, toml_edit::value(arr));
         }
     }
-}
-
-/// Back up `contents` to the first free numbered sibling of `path`
-/// (`<name>.bak`, `<name>.bak.1`, …). Returns the backup path.
-///
-/// The free slot is claimed with an exclusive `create_new` open, not a
-/// check-then-write: a concurrent `ipe health` that raced to the same slot loses
-/// the open with `AlreadyExists` and this loop advances to the next number, so a
-/// backup is never truncated over an existing one.
-fn numbered_backup(path: &Path, contents: &str) -> Result<PathBuf, CliError> {
-    use std::io::Write as _;
-    let base = {
-        let mut s = path.as_os_str().to_owned();
-        s.push(".bak");
-        PathBuf::from(s)
-    };
-    let mut candidate = base.clone();
-    let mut n = 1u32;
-    loop {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(mut file) => {
-                file.write_all(contents.as_bytes())
-                    .map_err(|e| CliError::Io {
-                        path: candidate.clone(),
-                        source: e,
-                    })?;
-                return Ok(candidate);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let mut s = base.as_os_str().to_owned();
-                s.push(format!(".{n}"));
-                candidate = PathBuf::from(s);
-                n = n.saturating_add(1);
-            }
-            Err(e) => {
-                return Err(CliError::Io {
-                    path: candidate,
-                    source: e,
-                });
-            }
-        }
-    }
-}
-
-/// Write `contents` to `path` through the driver's one atomic writer.
-///
-/// An exclusively created sibling temp file is renamed over `path`, so the
-/// config is never truncated in place.
-fn write_atomic_config(path: &Path, contents: &str) -> Result<(), CliError> {
-    crate::driver::write_atomic(path, contents)
 }
 
 #[cfg(test)]
@@ -2286,22 +2334,135 @@ mod tests {
         std::fs::write(&cfg, "# my config\n[build]\njobs = 4\n").expect("seed");
 
         // First edit: sets the key, preserves the comment + the sibling key,
-        // and writes a numbered backup of the prior file.
+        // and keeps the prior bytes in the first slot under `.ipe-backup/`.
         let val = ConfigValue::Str("sccache".to_owned());
-        apply_config_edit(&cfg, &["build", "rustc-wrapper"], &val).expect("first edit");
+        let first = apply_config_edit(&cfg, &["build", "rustc-wrapper"], &val).expect("first edit");
         let after = std::fs::read_to_string(&cfg).expect("read");
         assert!(after.contains("# my config"), "comment preserved");
         assert!(after.contains("jobs = 4"), "sibling key preserved");
         assert!(after.contains("rustc-wrapper = \"sccache\""));
-        let backup = dir.path().join("config.toml.bak");
-        assert!(backup.exists(), "prior file backed up");
+        let backups = dir.path().join(crate::driver::BACKUP_DIR);
+        let backup = backups.join("config.toml.bak");
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("read backup"),
+            "# my config\n[build]\njobs = 4\n",
+            "the backup holds the bytes read"
+        );
+        assert_eq!(
+            first,
+            ConfigEdited::BackedUp(backup),
+            "the outcome names the slot"
+        );
+        assert!(
+            !dir.path().join("config.toml.bak").exists(),
+            "no sibling backup is written"
+        );
 
         // Second, identical edit: idempotent — no change, no new backup.
-        apply_config_edit(&cfg, &["build", "rustc-wrapper"], &val).expect("idempotent");
+        let second =
+            apply_config_edit(&cfg, &["build", "rustc-wrapper"], &val).expect("idempotent");
+        assert_eq!(second, ConfigEdited::Unchanged);
         assert!(
-            !dir.path().join("config.toml.bak.1").exists(),
+            !backups.join("config.toml.bak.1").exists(),
             "idempotent edit writes no second backup"
         );
+    }
+
+    /// A link at the config name is never replaced, whether there at the read or swapped in after it.
+    #[cfg(unix)]
+    #[test]
+    fn config_link_leaf_refused() {
+        let dir = TempDir::new("cfg_link");
+        let cfg = dir.path().join("config.toml");
+        let target = dir.path().join("elsewhere.toml");
+        let planted = "# not the config\n";
+        std::fs::write(&target, planted).expect("seed the link target");
+        let val = ConfigValue::Str("sccache".to_owned());
+
+        std::os::unix::fs::symlink(&target, &cfg).expect("plant the link");
+        let at_read = edit_config(&cfg, &["build", "rustc-wrapper"], &val);
+        assert!(
+            matches!(
+                &at_read,
+                Err(CliError::SourceRefused {
+                    reason: crate::io_bounded::SourceRefusal::Symlink,
+                    ..
+                })
+            ),
+            "a link at the read is refused: {at_read:?}"
+        );
+
+        std::fs::remove_file(&cfg).expect("drop the link");
+        std::fs::write(&cfg, "[build]\njobs = 4\n").expect("seed the config");
+        let (swap_at, swap_to) = (cfg.clone(), target.clone());
+        held::set_sync_hook(Some(Box::new(move |synced: held::Synced, _: &Path| {
+            if synced == held::Synced::Staged {
+                let _ = std::fs::remove_file(&swap_at);
+                let _ = std::os::unix::fs::symlink(&swap_to, &swap_at);
+            }
+        })));
+        let after_read = edit_config(&cfg, &["build", "rustc-wrapper"], &val);
+        held::set_sync_hook(None);
+        assert!(
+            matches!(after_read, Ok(Err(ConfigRefusal::ChangedSinceRead))),
+            "a link swapped in after the read is refused: {after_read:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&cfg)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false),
+            "the link is left as is"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read the link target"),
+            planted,
+            "the link target is untouched"
+        );
+        assert!(
+            !dir.path()
+                .join(crate::driver::BACKUP_DIR)
+                .join("config.toml.bak")
+                .exists(),
+            "an edit that did not happen leaves no backup"
+        );
+    }
+
+    /// With every backup slot taken the edit is refused, the config unchanged, no slot past the bound.
+    #[test]
+    fn config_backup_bounded() {
+        let dir = TempDir::new("cfg_slots");
+        let cfg = dir.path().join("config.toml");
+        let original = "[build]\njobs = 4\n";
+        std::fs::write(&cfg, original).expect("seed");
+        let backups = dir.path().join(crate::driver::BACKUP_DIR);
+        std::fs::create_dir_all(&backups).expect("make the backup dir");
+        for slot in 0..held::BACKUP_SLOTS {
+            let name = if slot == 0 {
+                "config.toml.bak".to_owned()
+            } else {
+                format!("config.toml.bak.{slot}")
+            };
+            std::fs::write(backups.join(name), "older").expect("fill a slot");
+        }
+        let val = ConfigValue::Str("sccache".to_owned());
+        let full = edit_config(&cfg, &["build", "rustc-wrapper"], &val);
+        assert!(
+            matches!(full, Ok(Err(ConfigRefusal::BackupSlotsFull))),
+            "{full:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&cfg).expect("read"),
+            original,
+            "the config is left unchanged"
+        );
+        assert!(
+            !backups
+                .join(format!("config.toml.bak.{}", held::BACKUP_SLOTS))
+                .exists(),
+            "no slot past the bound is created"
+        );
+        let reported = apply_config_edit(&cfg, &["build", "rustc-wrapper"], &val);
+        assert!(matches!(reported, Err(CliError::Usage(_))), "{reported:?}");
     }
 
     #[test]
@@ -2313,7 +2474,7 @@ mod tests {
         let text = std::fs::read_to_string(&cfg).expect("read");
         assert!(text.contains("target-dir = \"/tmp/shared\""));
         assert!(
-            !dir.path().join("config.toml.bak").exists(),
+            !dir.path().join(crate::driver::BACKUP_DIR).exists(),
             "a fresh file has nothing to back up"
         );
     }
@@ -2359,8 +2520,8 @@ mod tests {
         )
         .expect("idempotent");
         assert!(
-            !dir.path().join("config.toml.bak.1").exists(),
-            "idempotent array edit writes no second backup"
+            !dir.path().join(crate::driver::BACKUP_DIR).exists(),
+            "an identical array edit writes no backup"
         );
     }
 
@@ -2498,6 +2659,60 @@ mod tests {
             "a probe past its wall is no linker verdict"
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    /// A probe write keeps the other linkers' entries and adds its own.
+    #[test]
+    fn probe_cache_write_keeps_other_entries() {
+        let home = TempDir::new("probe_write");
+        let cache = home.path().join(PROBE_CACHE_FILE);
+        std::fs::write(&cache, "[lld]\naccepted = false\n").expect("seed the cache");
+        write_probe_cache_in(
+            home.path(),
+            "mold",
+            Some("release: 1.99.0"),
+            &LinkerProbeResult::Accepted,
+        );
+        let doc: toml::Table = std::fs::read_to_string(&cache)
+            .expect("read the cache")
+            .parse()
+            .expect("parse the cache");
+        assert!(doc.get("lld").is_some(), "the other entry is kept: {doc:?}");
+        assert_eq!(
+            doc.get("mold")
+                .and_then(|m| m.get("accepted"))
+                .and_then(toml::Value::as_bool),
+            Some(true),
+            "{doc:?}"
+        );
+    }
+
+    /// A link at the cache name is never written through: its target is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn probe_cache_link_not_followed() {
+        let home = TempDir::new("probe_link");
+        let victim = home.path().join("victim.toml");
+        std::fs::write(&victim, "victim\n").expect("seed the link target");
+        let cache = home.path().join(PROBE_CACHE_FILE);
+        std::os::unix::fs::symlink(&victim, &cache).expect("plant the link");
+        write_probe_cache_in(
+            home.path(),
+            "mold",
+            Some("release: 1.99.0"),
+            &LinkerProbeResult::Accepted,
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read the link target"),
+            "victim\n",
+            "the link target is untouched"
+        );
+        assert!(
+            std::fs::symlink_metadata(&cache)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false),
+            "the link is left as is"
+        );
     }
 
     #[test]
