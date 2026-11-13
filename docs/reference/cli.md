@@ -366,7 +366,7 @@ ipe dev run [<dir>]
 - `[--allocator <auto|system|dlmalloc|talc|mimalloc>]` — select the global allocator (default: auto); `system` is the target libc's malloc, which on musl is several times slower than the default on allocation-heavy work
 - `[--cfree]` — build without linking any C code (incompatible with allocators that require C, e.g. mimalloc)
 - `[--debugger]` — compile the in-app time-travelling debugger overlay into the run app
-- `[--record]` — cli/worker apps: record the TEA session to out/session.ipelog (one plain `<msg> => <model>` line per step) and, when its Msg is encodable, a replayable out/session.ipemsgs
+- `[--record]` — cli/worker apps: record the TEA session to out/session.ipelog (one plain `<msg> => <model>` line per step and, when the process ended inside `update`, a last line naming the message that was running) and, when its Msg is encodable, a replayable out/session.ipemsgs
 - `[--replay [<log>]]` — cli/worker apps: re-fold a recorded session (default: out/session.ipemsgs) from init with no Cmd fired, printing each step and the final model; a log from a changed program is refused. A plain trace (.ipelog, the default when no typed log was recorded, e.g. a Msg carrying a Secret) is shown instead, labelled, with every control character stripped and nothing re-run
 - `[-q|--quiet]` — suppress progress chatter; only warnings and errors
 - `[--json]` — emit each diagnostic as a stable JSON object (one per line) instead of the human layout

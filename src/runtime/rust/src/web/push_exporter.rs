@@ -239,12 +239,14 @@ impl IngestToken {
         Ok(Self(hex))
     }
 
-    /// The operator-configured `IPE_INGEST_TOKEN`; `None` when unset or empty.
+    /// The operator's `IPE_INGEST_TOKEN` of the process's security posture,
+    /// fixed before the program's first line; `None` when unset or refused.
     fn from_env() -> Option<Self> {
-        ExporterEnv::IngestToken
-            .read()
-            .filter(|t| !t.is_empty())
-            .map(Self)
+        use crate::env_registry::SecretSetting;
+        match &crate::env_registry::security::security_posture().ingest_token {
+            SecretSetting::Set(token) => Some(Self(token.expose().to_owned())),
+            SecretSetting::Unset | SecretSetting::Refused => None,
+        }
     }
 
     /// The token text, for the one header (or child env) write that carries it.
@@ -821,6 +823,19 @@ mod tests {
         assert!(refused.is_err(), "a refused draw mints no token");
         let minted = IngestToken::mint_with(|_| Ok(()));
         assert!(minted.is_ok_and(|t| t.expose() == "0".repeat(64)));
+    }
+
+    /// The pushed credential is the operator's, fixed before the program ran:
+    /// a token written while it runs is never carried upstream.
+    #[test]
+    fn a_token_written_after_startup_is_not_pushed() {
+        let name = ExporterEnv::IngestToken.name();
+        crate::system::locked_remove_var(name);
+        crate::env_registry::security::fix_posture();
+        crate::system::locked_set_var(name, "planted-by-the-program");
+        let token = IngestToken::from_env();
+        crate::system::locked_remove_var(name);
+        assert!(token.is_none(), "a token written after startup was pushed");
     }
 
     #[test]

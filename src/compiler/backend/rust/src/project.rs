@@ -4662,8 +4662,11 @@ fn compression_cargo_toml(base: &str) -> DResult<String> {
     )
 }
 
-/// Build the CSV-enabled `Cargo.toml` by appending the `csv` dependency to the
-/// `[dependencies]` table.
+/// Build the CSV-enabled `Cargo.toml` by promoting the `csv` feature and appending
+/// the `csv` dependency to the `[dependencies]` table.
+///
+/// The promoted feature turns on the vendored runtime's `csv` gates, so the
+/// startup environment check judges the CSV limits the program reads.
 ///
 /// `csv.rs` (the vendored `Ipe.Csv` parse/encode kernels plus the `CsvDoc`
 /// struct) is the sole consumer of the `csv` crate. It is a leaf dependency
@@ -4675,15 +4678,18 @@ fn compression_cargo_toml(base: &str) -> DResult<String> {
 ///
 /// # Errors
 ///
-/// Returns [`Diagnostic::CompilerBug`] if the `[dependencies]` table is absent —
-/// a golden-drift invariant violation (fail-loud, never a silent no-op).
+/// Returns [`Diagnostic::CompilerBug`] if the `csv` feature declaration or the
+/// `[dependencies]` table is absent — a golden-drift invariant violation
+/// (fail-loud, never a silent no-op).
 fn csv_cargo_toml(base: &str) -> DResult<String> {
+    const WHERE: &str = "ipe_backend_rust::project::csv_cargo_toml";
     let deps = format!(
         "{} = \"{}\"\n\n",
         crate_specs::CSV.name,
         crate_specs::CSV.version,
     );
-    append_dependencies(base, &deps, "ipe_backend_rust::project::csv_cargo_toml")
+    let promoted = promote_declared_feature(base, "csv", WHERE)?;
+    append_dependencies(&promoted, &deps, WHERE)
 }
 
 /// Build the heavy-`crypto_core`-enabled `Cargo.toml` by enabling the `crypto`

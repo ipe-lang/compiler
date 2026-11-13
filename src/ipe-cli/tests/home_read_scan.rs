@@ -1381,11 +1381,6 @@ mod lexical {
             reason: "callers pass flag-name literals, which the literal rule scans",
         },
         Allowed {
-            file: "src/runtime/rust/src/web/console.rs",
-            func: "env",
-            reason: "callers pass `IPE_*_TOKEN` literals, which the literal rule scans",
-        },
-        Allowed {
             file: "src/runtime/rust/src/env_registry/mod.rs",
             func: "check",
             reason: "reads one registry entry, and every registered name carries the `IPE_` prefix",

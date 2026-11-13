@@ -8,6 +8,7 @@
 //! record constructor resolve straight onto these `pub` fields.
 
 use super::*;
+use crate::env_grammar::EnvFlag;
 
 // ── shared blocking-pool helper ───────────────────────────────────────
 //
@@ -180,13 +181,10 @@ fn record_refusal<E: FromIpeError>(error: &::csv::Error) -> E {
 /// cell with `'`) is LOSSY: it alters exported data (e.g. `-5` → `'-5`) and breaks
 /// the lossless parse↔encode round-trip. Default OFF preserves round-trip; the
 /// caller opts in when serving CSV to spreadsheet users, accepting the tradeoff.
-fn csv_formula_guard_enabled() -> bool {
-    matches!(
-        crate::system::read_env_var("IPE_CSV_SANITIZE_FORMULAS")
-            .ok()
-            .as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
-    )
+/// Read from the process's security posture, fixed before the program's first
+/// line.
+fn csv_formula_guard() -> EnvFlag {
+    crate::env_registry::security::security_posture().csv_formula_guard
 }
 
 fn guard_formula(cell: &str) -> std::borrow::Cow<'_, str> {
@@ -198,8 +196,13 @@ fn guard_formula(cell: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-#[allow(clippy::disallowed_methods)] // the writer is fed only `String` fields, so its bytes are UTF-8
 fn encode_delim(doc: &CsvDoc, delim: u8) -> String {
+    encode_delim_guarded(doc, delim, csv_formula_guard())
+}
+
+/// Encodes `doc` with `delim`, prefixing formula-leading cells while `guard` is on.
+#[allow(clippy::disallowed_methods)] // the writer is fed only `String` fields, so its bytes are UTF-8
+fn encode_delim_guarded(doc: &CsvDoc, delim: u8, guard: EnvFlag) -> String {
     // flexible(true): a parsed-then-encoded doc may carry ragged rows (row width ≠
     // header width) since the reader is flexible. Without this the writer errors on
     // the first mismatch and the swallowed error silently DROPS that row — breaking
@@ -208,9 +211,8 @@ fn encode_delim(doc: &CsvDoc, delim: u8) -> String {
         .delimiter(delim)
         .flexible(true)
         .from_writer(vec![]);
-    let guard = csv_formula_guard_enabled();
     for row in std::iter::once(&doc.header).chain(doc.rows.iter()) {
-        if guard {
+        if matches!(guard, EnvFlag::On) {
             let safe: Vec<String> = row.iter().map(|c| guard_formula(c).into_owned()).collect();
             let _ = wtr.write_record(&safe);
         } else {
@@ -376,13 +378,18 @@ mod tests {
             header: vec!["a".into()],
             rows: vec![vec!["=SUM(A1)".into()]],
         };
-        // Default OFF: lossless (formula cell emitted verbatim, just CSV-quoted).
+        // Off: lossless (formula cell emitted verbatim, just CSV-quoted).
+        let off = encode_delim_guarded(&doc, b',', EnvFlag::Off);
+        assert!(off.contains("=SUM(A1)") && !off.contains("'=SUM(A1)"));
+        // On: dangerous-leading cell is prefixed with a single quote.
+        assert!(encode_delim_guarded(&doc, b',', EnvFlag::On).contains("'=SUM(A1)"));
+        // Default off, and a value written after the posture is fixed is not read.
         crate::system::locked_remove_var("IPE_CSV_SANITIZE_FORMULAS");
-        assert!(encode_delim(&doc, b',').contains("=SUM(A1)"));
-        // ON: dangerous-leading cell is prefixed with a single quote.
+        crate::env_registry::security::fix_posture();
         crate::system::locked_set_var("IPE_CSV_SANITIZE_FORMULAS", "1");
-        assert!(encode_delim(&doc, b',').contains("'=SUM(A1)"));
+        let after = encode_delim(&doc, b',');
         crate::system::locked_remove_var("IPE_CSV_SANITIZE_FORMULAS");
+        assert!(!after.contains("'=SUM(A1)"), "{after}");
     }
 
     /// Bounded by construction (PRINCIPLES §3): a CSV whose decoded field bytes

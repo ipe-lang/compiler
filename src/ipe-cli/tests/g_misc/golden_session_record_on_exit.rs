@@ -4,10 +4,13 @@
 //! then ends a recording run two ways, each from inside `update`:
 //!
 //! * `quit` calls `System.exit 0`: the run exits 0, the trace holds the
-//!   `hello` step, the typed log replays byte-identically twice, and stdout
-//!   carries the piped frames with nothing after them;
-//! * `boom` calls `Debug.todo`: the run exits non-zero and the same trace is
-//!   still written.
+//!   settled `hello` step then `Quit` as the message in flight, the typed log
+//!   (settled steps only) replays byte-identically twice, and stdout carries
+//!   the piped frames with nothing after them;
+//! * `boom` calls `Debug.todo`: the run exits non-zero, and the trace holds
+//!   the same `hello` step then `Boom` as the message in flight.
+//!
+//! An in-flight line is `<msg> => ` + `ipe_runtime_rust::TRACE_IN_FLIGHT`.
 //!
 //! Gated on `IPE_E2E=1`:
 //!
@@ -42,6 +45,24 @@ fn run_with(exe: &Path, var: &str, value: &Path, stdin: &[u8]) -> Option<(Option
     }
     let output = child.wait_with_output().ok()?;
     Some((output.status.code(), output.stdout))
+}
+
+/// The trace line of the message rendered `msg` whose `update` had not
+/// returned when the process ended.
+fn in_flight_line(msg: &str) -> String {
+    format!("{msg} => {}", ipe_runtime_rust::TRACE_IN_FLIGHT)
+}
+
+/// Whether `lines` is the settled `hello` step then `msg` in flight.
+fn hello_then_in_flight(lines: Option<&Vec<String>>, msg: &str) -> bool {
+    lines.is_some_and(|lines| {
+        matches!(
+            lines.as_slice(),
+            [hello, last] if hello.starts_with("Echo hello => ")
+                && !hello.contains(ipe_runtime_rust::TRACE_IN_FLIGHT)
+                && *last == in_flight_line(msg)
+        )
+    })
 }
 
 /// The trace's lines, or none when no trace was written.
@@ -102,10 +123,9 @@ fn a_session_is_recorded_through_system_exit_and_debug_todo() {
     );
     let quit_trace = trace_lines(&trace);
     assert!(
-        quit_trace.as_ref().is_some_and(
-            |lines| lines.len() == 1 && lines.first().is_some_and(|l| l.contains("hello"))
-        ),
-        "the trace of a `System.exit` run holds the `hello` step: {quit_trace:?}"
+        hello_then_in_flight(quit_trace.as_ref(), "Quit"),
+        "the trace of a `System.exit` run holds the `hello` step then `Quit` in flight: \
+         {quit_trace:?}"
     );
     assert!(typed.is_file(), "the typed log is written beside the trace");
     let first = run_with(&exe, ipe_runtime_rust::REPLAY_ENV, &typed, b"");
@@ -128,10 +148,16 @@ fn a_session_is_recorded_through_system_exit_and_debug_todo() {
             .is_some_and(|(code, _)| code.is_some_and(|c| c != 0)),
         "a `Debug.todo` run exits non-zero: {boom:?}"
     );
+    let boom_trace = trace_lines(&boom_trace_path);
+    assert!(
+        hello_then_in_flight(boom_trace.as_ref(), "Boom"),
+        "the trace of a `Debug.todo` run holds the `hello` step then `Boom` in flight: \
+         {boom_trace:?}"
+    );
     assert_eq!(
-        trace_lines(&boom_trace_path),
-        quit_trace,
-        "a `Debug.todo` run dumps the same trace"
+        boom_trace.as_ref().and_then(|lines| lines.first()),
+        quit_trace.as_ref().and_then(|lines| lines.first()),
+        "a `Debug.todo` run dumps the same settled step"
     );
 
     let _ = std::fs::remove_dir_all(&logs);
