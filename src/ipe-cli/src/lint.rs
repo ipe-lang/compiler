@@ -20,13 +20,16 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use ipe_lint::{LINT_CONFIG_FILE as LINT_IPE, LintConfig, SourceModule};
 
 use crate::api_surface::ModulePath;
 use crate::driver::{analysis_root, analysis_target, module_missing, working_dir};
-use crate::project_root::{AnalysisTarget, SourceDir};
+use crate::io_bounded::SOURCE_CAP;
+use crate::output_dir::held::{BACKUP_SLOTS, BackedUp, HeldDir, Level, RelativeLeaf};
+use crate::project_root::{AnalysisTarget, ProjectRoot, SourceDir};
 use crate::screen::{self, Screen, Stream, Tone};
 use crate::source_snapshot::{Limits, SnapshotModule, SourceOrigin, SourceSnapshot};
 use crate::{CliError, cli_args, text};
@@ -103,7 +106,7 @@ pub(crate) fn run_lint_in(cwd: &Path, rest: &[String]) -> Result<(), CliError> {
     let config = load_config(root.path())?;
     let scope = LintScope::of(&analysis_target(&root, file.as_ref())?)?;
     if args.fix {
-        return apply_and_report(&scope, &config, root.path());
+        return apply_and_report(&scope, &config, &SourceRoots::of(&root));
     }
     report_findings(&scope, &config, args.format)
 }
@@ -113,7 +116,7 @@ struct LintScope {
     /// Every project module the rules see, in module-path order.
     modules: Vec<SourceModule>,
     /// The file each module was read from, for rendering and rewriting.
-    paths: BTreeMap<ModulePath, PathBuf>,
+    files: BTreeMap<ModulePath, ModuleFile>,
     /// The module a file argument named; `None` reports every module.
     focus: Option<ModulePath>,
 }
@@ -156,12 +159,18 @@ impl LintScope {
     /// The project's own modules of `held`, reporting `focus` alone when given.
     fn over(held: &BTreeMap<ModulePath, SnapshotModule>, focus: Option<ModulePath>) -> Self {
         let mut modules = Vec::new();
-        let mut paths = BTreeMap::new();
+        let mut files = BTreeMap::new();
         for (module, held) in held {
-            if !matches!(held.origin(), SourceOrigin::Own(_)) {
+            let SourceOrigin::Own(dir) = held.origin() else {
                 continue;
-            }
-            paths.insert(module.clone(), held.path().to_path_buf());
+            };
+            files.insert(
+                module.clone(),
+                ModuleFile {
+                    dir,
+                    path: held.path().to_path_buf(),
+                },
+            );
             modules.push(SourceModule {
                 module: module.clone(),
                 source: held.text().to_owned(),
@@ -169,7 +178,7 @@ impl LintScope {
         }
         Self {
             modules,
-            paths,
+            files,
             focus,
         }
     }
@@ -178,6 +187,14 @@ impl LintScope {
     fn reports(&self, module: &[String]) -> bool {
         self.focus.as_deref().is_none_or(|focus| focus == module)
     }
+}
+
+/// A project file one lint read: the source directory it lies under and its path.
+struct ModuleFile {
+    /// The source directory the file lies under.
+    dir: SourceDir,
+    /// The file's path, below that directory.
+    path: PathBuf,
 }
 
 /// Read `lint.ipe` from the project root `dir`, returning defaults when none exists.
@@ -229,7 +246,7 @@ fn report_findings(
     use crate::cli_args::json;
     use cli_args::OutputFormat::{Human, Json, Plain};
 
-    let LintScope { modules, paths, .. } = scope;
+    let LintScope { modules, files, .. } = scope;
     let Ok(mut report) = ipe_lint::run(modules, config, &ipe_lint::NeverCancel);
     report.findings.retain(|f| scope.reports(&f.module));
     let source_of: BTreeMap<&[String], &str> = modules
@@ -246,9 +263,9 @@ fn report_findings(
                 .findings
                 .iter()
                 .map(|f| {
-                    let file = paths
+                    let file = files
                         .get(&f.module)
-                        .map_or_else(|| f.module.join("."), |p| p.display().to_string());
+                        .map_or_else(|| f.module.join("."), |m| m.path.display().to_string());
                     let source = source_of.get(f.module.as_slice()).copied().unwrap_or("");
                     let severity = config.severity_of(f.rule);
                     // Resolve line/col from the byte offset in source.
@@ -295,9 +312,9 @@ fn report_findings(
             // One line per finding: `<severity>:<file>:<line>:<col>: <message>`.
             let mut lines = String::new();
             for f in &report.findings {
-                let file = paths
+                let file = files
                     .get(&f.module)
-                    .map_or_else(|| f.module.join("."), |p| p.display().to_string());
+                    .map_or_else(|| f.module.join("."), |m| m.path.display().to_string());
                 let source = source_of.get(f.module.as_slice()).copied().unwrap_or("");
                 let severity = config.severity_of(f.rule);
                 let (line, col) = byte_to_line_col(source, f.span.lo);
@@ -325,9 +342,10 @@ fn report_findings(
             }
 
             for finding in &report.findings {
-                let file = paths
-                    .get(&finding.module)
-                    .map_or_else(|| finding.module.join("."), |p| p.display().to_string());
+                let file = files.get(&finding.module).map_or_else(
+                    || finding.module.join("."),
+                    |m| m.path.display().to_string(),
+                );
                 let source = source_of
                     .get(finding.module.as_slice())
                     .copied()
@@ -411,8 +429,12 @@ fn byte_to_line_col(source: &str, offset: u32) -> (usize, usize) {
 /// A lint focused on one module rewrites that module's file alone: a
 /// signature fix whose call-site rewrites reach another module is withheld
 /// whole, and reported, so no partial change leaves a caller out of step.
-fn apply_and_report(scope: &LintScope, config: &LintConfig, root: &Path) -> Result<(), CliError> {
-    let LintScope { modules, paths, .. } = scope;
+fn apply_and_report(
+    scope: &LintScope,
+    config: &LintConfig,
+    roots: &SourceRoots<'_>,
+) -> Result<(), CliError> {
+    let LintScope { modules, .. } = scope;
     let mut local_outcome = ipe_lint::apply_fixes(modules, config);
     if scope.focus.is_some() {
         local_outcome
@@ -464,34 +486,17 @@ fn apply_and_report(scope: &LintScope, config: &LintConfig, root: &Path) -> Resu
     // Merge: start with local rewrites; compose sig-fix rewrites on top.
     // Sig-fixes were already applied to the locally-fixed source, so inserting
     // them directly gives the fully-composed result per module.
-    let mut merged: BTreeMap<Vec<String>, String> = local_outcome.rewritten;
+    let mut merged: BTreeMap<ModulePath, String> = local_outcome.rewritten;
     for (module, rewritten) in sig_outcome.rewritten {
         merged.insert(module, rewritten);
     }
 
-    for (module, rewritten) in &merged {
-        let Some(path) = paths.get(module) else {
-            continue;
-        };
-        let backup =
-            match crate::rewrite_walked_file(root, path, rewritten, crate::RewriteKind::Lossy) {
-                Ok(backup) => backup,
-                Err(err) => {
-                    // Report the files already rewritten before the failure.
-                    out.emit();
-                    return Err(err);
-                }
-            };
-        out.line(
-            Tone::Text,
-            &format!("lint --fix: rewrote {}", path.display()),
-        );
-        if let Some(backup) = backup {
-            out.line(
-                Tone::Text,
-                &format!("lint --fix: original kept at {}", backup.display()),
-            );
-        }
+    // The count below is reached only once every rewritten file is written:
+    // a refusal returns before it, so no fix of an unwritten file is counted.
+    if let Err(stop) = write_fixes(roots, scope, &merged, &mut out) {
+        // Report the files already rewritten before the refusal.
+        out.emit();
+        return Err(stop.into());
     }
 
     if total > 0 && scope.focus.is_none() {
@@ -517,4 +522,334 @@ fn apply_and_report(scope: &LintScope, config: &LintConfig, root: &Path) -> Resu
 
     out.emit();
     Ok(())
+}
+
+/// The held source directories `lint --fix` writes through: the very handles the snapshot read.
+struct SourceRoots<'r> {
+    /// The held `src/` directory.
+    src: &'r HeldDir,
+    /// The held `tests/` directory, when the project has one.
+    tests: Option<&'r HeldDir>,
+}
+
+impl<'r> SourceRoots<'r> {
+    /// The source directories `root` holds.
+    const fn of(root: &'r ProjectRoot) -> Self {
+        Self {
+            src: root.src(),
+            tests: root.tests(),
+        }
+    }
+
+    /// The held directory `dir` names, when the project has it.
+    const fn held(&self, dir: SourceDir) -> Option<&'r HeldDir> {
+        match dir {
+            SourceDir::Src => Some(self.src),
+            SourceDir::Tests => self.tests,
+        }
+    }
+}
+
+/// Why `lint --fix` left a file as it is and wrote no file after it.
+#[derive(Debug, PartialEq, Eq)]
+enum FixRefusal {
+    /// A rewritten module has no project file this run read.
+    NoFile(ModulePath),
+    /// The file no longer holds the text the rules judged.
+    Changed(PathBuf),
+    /// Every backup slot of the file, in the backup directory `dir`, is taken.
+    BackupSlotsFull {
+        /// The file left as it is.
+        path: PathBuf,
+        /// The backup directory whose slots are taken.
+        dir: PathBuf,
+    },
+}
+
+impl FixRefusal {
+    /// The catalog message stating the refusal.
+    fn message(&self) -> text::Message {
+        match self {
+            Self::NoFile(module) => text::msg::lint_fix_no_file(&module.join(".")),
+            Self::Changed(path) => text::msg::lint_fix_changed(&path.display()),
+            Self::BackupSlotsFull { path, dir } => {
+                text::msg::lint_fix_backups_full(&path.display(), &dir.display(), &BACKUP_SLOTS)
+            }
+        }
+    }
+}
+
+/// Why a `lint --fix` batch stopped.
+#[derive(Debug)]
+enum FixStop {
+    /// A file was refused; it and every file not yet written are left as they are.
+    Refused(FixRefusal),
+    /// A filesystem failure; every file not yet written is left as it is.
+    Failed(CliError),
+}
+
+impl From<FixStop> for CliError {
+    fn from(stop: FixStop) -> Self {
+        match stop {
+            FixStop::Refused(refusal) => Self::ProjectRefused(refusal.message()),
+            FixStop::Failed(error) => error,
+        }
+    }
+}
+
+/// One file a fix batch rewrites: where it lies, the text the rules judged, and the text they produced.
+struct PlannedFix<'a> {
+    /// The held source directory the file lies under.
+    held: &'a HeldDir,
+    /// The file below `held`.
+    leaf: RelativeLeaf,
+    /// The file's path, for reports.
+    path: &'a Path,
+    /// The text the rules read and judged.
+    judged: &'a str,
+    /// The text the fixes produced.
+    rewritten: &'a str,
+}
+
+impl PlannedFix<'_> {
+    /// Hold the file's directory and prove the file still holds the judged text.
+    ///
+    /// Returns the held directory and the identity of the file read, for the
+    /// writer's re-proof right before its rename.
+    fn judge(&self) -> Result<(Level<'_>, ipe_fs_open::FileId), FixStop> {
+        let level = self.held.descend(&self.leaf).map_err(FixStop::Failed)?;
+        let (now, id) = level
+            .read_file_capped_identified(self.leaf.leaf(), SOURCE_CAP)
+            .map_err(FixStop::Failed)?;
+        if now != self.judged {
+            return Err(FixStop::Refused(FixRefusal::Changed(
+                self.path.to_path_buf(),
+            )));
+        }
+        Ok((level, id))
+    }
+}
+
+/// Plan the rewrite of every module in `merged`; a module with no file the run read is refused.
+fn plan_fixes<'a>(
+    roots: &SourceRoots<'a>,
+    scope: &'a LintScope,
+    merged: &'a BTreeMap<ModulePath, String>,
+) -> Result<Vec<PlannedFix<'a>>, FixStop> {
+    let judged_of: BTreeMap<&[String], &str> = scope
+        .modules
+        .iter()
+        .map(|m| (m.module.as_slice(), m.source.as_str()))
+        .collect();
+    let mut planned = Vec::with_capacity(merged.len());
+    for (module, rewritten) in merged {
+        let no_file = || FixStop::Refused(FixRefusal::NoFile(module.clone()));
+        let file = scope.files.get(module).ok_or_else(no_file)?;
+        let judged = judged_of.get(module.as_slice()).ok_or_else(no_file)?;
+        let held = roots.held(file.dir).ok_or_else(no_file)?;
+        let leaf = RelativeLeaf::under(held.path(), &file.path).map_err(FixStop::Failed)?;
+        planned.push(PlannedFix {
+            held,
+            leaf,
+            path: &file.path,
+            judged,
+            rewritten,
+        });
+    }
+    Ok(planned)
+}
+
+/// Write every rewritten module of `merged` through the held writer, keeping each original in a backup slot.
+///
+/// The batch is all-or-nothing up to the first write: every file is planned
+/// and judged before any is written, so a module with no file, a file edited
+/// since the lint read it, or a level that cannot be held stops the batch with
+/// nothing written. A write that is refused or fails stops the batch too,
+/// leaving the files after it as they are: signature fixes rewrite a
+/// definition and its callers in different modules, so writing the rest past
+/// one refused file would leave callers out of step with the definition.
+fn write_fixes(
+    roots: &SourceRoots<'_>,
+    scope: &LintScope,
+    merged: &BTreeMap<ModulePath, String>,
+    out: &mut Screen,
+) -> Result<(), FixStop> {
+    let planned = plan_fixes(roots, scope, merged)?;
+    for fix in &planned {
+        fix.judge()?;
+    }
+    for fix in &planned {
+        let (level, id) = fix.judge()?;
+        let fill = |file: &mut std::fs::File| file.write_all(fix.rewritten.as_bytes());
+        let backups = level.path().join(crate::driver::BACKUP_DIR);
+        match level
+            .replace_backed_up(
+                fix.leaf.leaf().as_os_str(),
+                id,
+                fix.judged,
+                SOURCE_CAP,
+                fill,
+            )
+            .map_err(FixStop::Failed)?
+        {
+            BackedUp::Done(backup) => {
+                out.line(
+                    Tone::Text,
+                    &format!("lint --fix: rewrote {}", fix.path.display()),
+                );
+                out.line(
+                    Tone::Text,
+                    &format!(
+                        "lint --fix: original kept at {}",
+                        backups.join(backup.slot().as_os_str()).display()
+                    ),
+                );
+            }
+            BackedUp::Changed => {
+                return Err(FixStop::Refused(FixRefusal::Changed(
+                    fix.path.to_path_buf(),
+                )));
+            }
+            BackedUp::BackupSlotsFull => {
+                return Err(FixStop::Refused(FixRefusal::BackupSlotsFull {
+                    path: fix.path.to_path_buf(),
+                    dir: backups,
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+    use crate::output_dir::held::{Synced, set_sync_hook};
+
+    /// A fresh `src/` directory holding `Main.ipe` with `text`, and the directory's held handle.
+    #[allow(clippy::expect_used)] // a fixture that cannot be built is a broken test host
+    fn src_with_main(tag: &str, text: &str) -> (PathBuf, HeldDir) {
+        let base =
+            ipe_test_temp::temp_root().join(format!("ipe_lint_fix_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        std::fs::create_dir_all(&src).expect("make src");
+        let src = std::fs::canonicalize(&src).expect("canonicalize src");
+        std::fs::write(src.join("Main.ipe"), text).expect("write Main.ipe");
+        let held = HeldDir::open(&src).expect("open src").expect("src exists");
+        (src, held)
+    }
+
+    /// A scope over `Main` (and `Other`, read with no file) judged at `judged`.
+    fn scope_of(src: &Path, judged: &str) -> LintScope {
+        let module = |name: &str| vec![name.to_owned()];
+        LintScope {
+            modules: vec![
+                SourceModule {
+                    module: module("Main"),
+                    source: judged.to_owned(),
+                },
+                SourceModule {
+                    module: module("Other"),
+                    source: "module Other exposing (..)\n".to_owned(),
+                },
+            ],
+            files: BTreeMap::from([(
+                module("Main"),
+                ModuleFile {
+                    dir: SourceDir::Src,
+                    path: src.join("Main.ipe"),
+                },
+            )]),
+            focus: None,
+        }
+    }
+
+    fn read(path: &Path) -> Option<String> {
+        std::fs::read_to_string(path).ok()
+    }
+
+    /// An edit landing between the judgement and the rename survives, is refused, and leaves no backup slot.
+    #[test]
+    #[allow(clippy::expect_used)] // the hook's concurrent edit must land for the refusal to mean anything
+    fn fix_changed_reported_not_overwritten() {
+        let (src, held) = src_with_main("changed", "old\n");
+        let main = src.join("Main.ipe");
+        let roots = SourceRoots {
+            src: &held,
+            tests: None,
+        };
+        let scope = scope_of(&src, "old\n");
+        let merged = BTreeMap::from([(vec!["Main".to_owned()], "new\n".to_owned())]);
+
+        // Control: the same batch, with no edit in the window, writes and keeps the original.
+        let mut out = Screen::new(Stream::Stdout);
+        let written = write_fixes(&roots, &scope, &merged, &mut out);
+        assert!(written.is_ok(), "{written:?}");
+        assert_eq!(read(&main).as_deref(), Some("new\n"));
+        let backups = src.join(crate::driver::BACKUP_DIR);
+        assert_eq!(
+            read(&backups.join("Main.ipe.bak")).as_deref(),
+            Some("old\n")
+        );
+        std::fs::write(&main, "old\n").expect("reset Main.ipe");
+        std::fs::remove_file(backups.join("Main.ipe.bak")).expect("clear the control's slot");
+
+        let target = main.clone();
+        set_sync_hook(Some(Box::new(move |what: Synced, _at: &Path| {
+            if what == Synced::Staged {
+                std::fs::write(&target, "edited\n").expect("concurrent edit");
+            }
+        })));
+        let mut out = Screen::new(Stream::Stdout);
+        let stopped = write_fixes(&roots, &scope, &merged, &mut out);
+        set_sync_hook(None);
+
+        assert!(
+            matches!(&stopped, Err(FixStop::Refused(FixRefusal::Changed(path))) if *path == main),
+            "{stopped:?}"
+        );
+        assert_eq!(read(&main).as_deref(), Some("edited\n"));
+        assert_eq!(read(&backups.join("Main.ipe.bak")), None);
+        let _ = std::fs::remove_dir_all(src.parent().unwrap_or(&src));
+    }
+
+    /// A rewritten module with no file is refused before any file is written, so nothing is counted.
+    #[test]
+    fn fix_missing_path_refused_and_not_counted() {
+        let (src, held) = src_with_main("no_path", "old\n");
+        let main = src.join("Main.ipe");
+        let roots = SourceRoots {
+            src: &held,
+            tests: None,
+        };
+        let scope = scope_of(&src, "old\n");
+        // `Main` sorts before `Other`: a skipped `Other` would leave `Main` written.
+        let merged = BTreeMap::from([
+            (vec!["Main".to_owned()], "new\n".to_owned()),
+            (vec!["Other".to_owned()], "module Other\n".to_owned()),
+        ]);
+
+        let mut out = Screen::new(Stream::Stdout);
+        let stopped = write_fixes(&roots, &scope, &merged, &mut out);
+
+        assert!(
+            matches!(
+                &stopped,
+                Err(FixStop::Refused(FixRefusal::NoFile(module))) if *module == ["Other"]
+            ),
+            "{stopped:?}"
+        );
+        assert_eq!(read(&main).as_deref(), Some("old\n"));
+        assert!(!src.join(crate::driver::BACKUP_DIR).exists());
+
+        // Control: with only `Main` the batch writes it.
+        let merged = BTreeMap::from([(vec!["Main".to_owned()], "new\n".to_owned())]);
+        let written = write_fixes(&roots, &scope, &merged, &mut out);
+        assert!(written.is_ok(), "{written:?}");
+        assert_eq!(read(&main).as_deref(), Some("new\n"));
+        let _ = std::fs::remove_dir_all(src.parent().unwrap_or(&src));
+    }
 }

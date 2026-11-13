@@ -1377,6 +1377,12 @@ messages! {
     health_config_edit_unparsable(path) = "health-config-edit-unparsable";
     /// `ipe lint --fix` with a data form.
     lint_fix_with_format = "lint-fix-with-format";
+    /// `ipe lint --fix` rewrote a module with no project file.
+    lint_fix_no_file(module) = "lint-fix-no-file";
+    /// `ipe lint --fix` found a file changed since the lint read it.
+    lint_fix_changed(path) = "lint-fix-changed";
+    /// `ipe lint --fix` found every backup slot of a file taken.
+    lint_fix_backups_full(path, dir, slots) = "lint-fix-backups-full";
     /// The language server failed.
     lsp_failed(detail) = "lsp-failed";
     /// `ipe dev watch` could not start its filesystem watcher.
