@@ -193,6 +193,12 @@ impl JailMounts {
     pub const fn homes(&self) -> &HomeMasks {
         &self.homes
     }
+
+    /// The cargo home every path was checked against.
+    #[must_use]
+    pub fn cargo_home(&self) -> &Path {
+        self.cargo_home.as_path()
+    }
 }
 
 /// The home a version-control tool expands `~` against for the user `home`,
