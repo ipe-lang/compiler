@@ -1923,9 +1923,9 @@ fn custom_element_ctor_wrong_position_rejected() {
     assert_rejected("custom_element_wrong_pos", &src, "IPE-N0044");
 }
 
-/// A runnable Web entry that links the browser runtime, so a `CustomElement`
-/// defined beside it is refused only for its own file, never for its placement
-/// or for a non-runnable `main`.
+/// The imports and runnable Web entry of a program that links the browser
+/// runtime, so a `CustomElement` defined after it is refused only for its own
+/// file, never for its placement or for a non-runnable `main`.
 const WEB_ENTRY: &str = r#"import Ipe.Server.Http as Server
 import Ipe.Task as Task exposing (Task)
 import Ipe.Tea.Web as Web
@@ -1955,9 +1955,9 @@ main =
 fn custom_element_ctor_missing_file_rejected() {
     let src = format!(
         "{HEAD}import Ipe.Ffi.Js.CustomElement as CustomElement\n\
+         {WEB_ENTRY}\
          editor : CustomElement Int String\n\
-         editor = CustomElement.fromFile \"js/does-not-exist.js\"\n\
-         {WEB_ENTRY}"
+         editor = CustomElement.fromFile \"js/does-not-exist.js\"\n"
     );
     // No extra files written — the named path is absent.
     assert_rejected_with_files("custom_element_missing_file", &src, &[], "IPE-N0044");
@@ -2173,9 +2173,9 @@ fn custom_element_ctor_symlink_escape_rejected_at_build_gate() {
     );
     let src = format!(
         "{HEAD}import Ipe.Ffi.Js.CustomElement as CustomElement\n\
+         {WEB_ENTRY}\
          editor : CustomElement Int String\n\
-         editor = CustomElement.fromFile \"js/evil.js\"\n\
-         {WEB_ENTRY}"
+         editor = CustomElement.fromFile \"js/evil.js\"\n"
     );
     let fixture = write_fixture(&src);
     // In-tree `js` (beside the entry module, under `src/`) is a SYMLINK to the
