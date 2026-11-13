@@ -10,6 +10,50 @@ Entries below the header are maintained by
 section is generated from Conventional Commit messages and prepended when the
 standing release pull request is merged.
 
+## [0.7.4](https://github.com/ipe-lang/compiler/compare/ipe-v0.7.3...ipe-v0.7.4) (2026-11-13)
+
+
+### Features
+
+* **cli:** ipe dev run serves a web client bundle on loopback ([#4062](https://github.com/ipe-lang/compiler/issues/4062)) ([34f0ff8](https://github.com/ipe-lang/compiler/commit/34f0ff8f6afe3c16e744656492a56a6a65d937b8))
+
+
+### Bug Fixes
+
+* **backend:** one record struct per unification class, its template the least general generalization ([#4137](https://github.com/ipe-lang/compiler/issues/4137)) ([b3b0a94](https://github.com/ipe-lang/compiler/commit/b3b0a9423a4cd491a1f0f3f87bc5096febae81a8))
+* **build:** a runtime or app warning fails the emitted-build check for every native feature set ([#4111](https://github.com/ipe-lang/compiler/issues/4111)) ([2645b37](https://github.com/ipe-lang/compiler/commit/2645b376b3c09a2b68748e719c05413ef23bc16e))
+* **cli:** every AGENTS.md guide claim and sample resolves through the doc lookup ([#4118](https://github.com/ipe-lang/compiler/issues/4118)) ([b4dea4e](https://github.com/ipe-lang/compiler/commit/b4dea4e87438892dda11e3c68c136ce60afa5139))
+* **cli:** one AGENTS.md guide for init, doc, health and upgrade, written through one held writer ([#4110](https://github.com/ipe-lang/compiler/issues/4110)) ([7a5e807](https://github.com/ipe-lang/compiler/commit/7a5e807ca19405c5f2e92aef81c037fe1a8e34bb))
+* **cli:** one typed runtime source resolved once per command; no ambient runtime lookup ([#4098](https://github.com/ipe-lang/compiler/issues/4098)) ([37feefe](https://github.com/ipe-lang/compiler/commit/37feefef036a976c2eb19b736ad174c31f385382))
+* **cli:** the held user-file writer stages privately, syncs, and carries the judged file's permissions ([#4113](https://github.com/ipe-lang/compiler/issues/4113)) ([921b9d3](https://github.com/ipe-lang/compiler/commit/921b9d32df3ba93d115686cff603ea1266e08ead))
+* **deps:** rustix 1.1.6 closes RUSTSEC-2026-0486 ([#4122](https://github.com/ipe-lang/compiler/issues/4122)) ([96ffd3c](https://github.com/ipe-lang/compiler/commit/96ffd3c54f6c81a4929f649257551e75c6838fe6))
+* **driver:** a widget registration is spliced only into a project that links the web runtime ([#4152](https://github.com/ipe-lang/compiler/issues/4152)) ([7f56457](https://github.com/ipe-lang/compiler/commit/7f56457668492406a6caf3635c0ed4d490ddf711))
+* **lower:** fold Secret.fromString arguments through every binder and branch ([#4124](https://github.com/ipe-lang/compiler/issues/4124)) ([d072b22](https://github.com/ipe-lang/compiler/commit/d072b2288d40f55eca99f374860a2e13df15005e))
+* **lower:** refuse a kernel instance that lacks the runtime's Clone/PartialEq/Sync bound ([#4140](https://github.com/ipe-lang/compiler/issues/4140)) ([78e8238](https://github.com/ipe-lang/compiler/commit/78e82386de2aa6125d77530609503d6c66f739f0))
+* **parse:** interpolation bodies are full expressions, walked by every pass ([#4093](https://github.com/ipe-lang/compiler/issues/4093)) ([7c351bc](https://github.com/ipe-lang/compiler/commit/7c351bccad469d845a1453d47ef20932945c59fc))
+* **parse:** triple-quoted strings have exactly two forms ([#4085](https://github.com/ipe-lang/compiler/issues/4085)) ([09b76c9](https://github.com/ipe-lang/compiler/commit/09b76c96417f20b6619b7919e6a31bb7a3d7d934))
+* **release:** one front end judges and emits every release member ([#4087](https://github.com/ipe-lang/compiler/issues/4087)) ([4efada6](https://github.com/ipe-lang/compiler/commit/4efada6cab7ecdd8eb378a91efddb79a3a59445d))
+* **runtime:** a stage ticket borrows the stages it holds, so no test leaks one ([#4082](https://github.com/ipe-lang/compiler/issues/4082)) ([ce7d94b](https://github.com/ipe-lang/compiler/commit/ce7d94b0af2843d5a23a20a5bf86f51ba100c88d))
+* **runtime:** a trip in an FFI-called closure ends typed on every adapter shape ([#4106](https://github.com/ipe-lang/compiler/issues/4106)) ([0ff79a9](https://github.com/ipe-lang/compiler/commit/0ff79a9bdeab150c2b843ff979c69a53c8e53757))
+* **runtime:** an emitted manifest names only the runtime features its code uses ([#4096](https://github.com/ipe-lang/compiler/issues/4096)) ([956c5cb](https://github.com/ipe-lang/compiler/commit/956c5cb03d6d16804f3a336835543960bebe6d4b))
+* **runtime:** compile the captured runtime bytes, never a reread of the root ([#4117](https://github.com/ipe-lang/compiler/issues/4117)) ([c11a3e7](https://github.com/ipe-lang/compiler/commit/c11a3e73aff1c62e22633446fe5b0df8286a4bd6))
+* **runtime:** every runtime task starts and joins through one funnel that keeps a trip typed ([#4115](https://github.com/ipe-lang/compiler/issues/4115)) ([716c395](https://github.com/ipe-lang/compiler/commit/716c3958756bfcb1e7831b2d236881991f610845))
+* **runtime:** read security switches once at startup; a session dump names the in-flight message ([#4142](https://github.com/ipe-lang/compiler/issues/4142)) ([da62125](https://github.com/ipe-lang/compiler/commit/da621255d9242423dd19e0d235711f61f0be8162))
+* **runtime:** stop signals outside a TTY, exact Ipe.Time calendar kernels, one cfg grammar ([#4086](https://github.com/ipe-lang/compiler/issues/4086)) ([ebba1c7](https://github.com/ipe-lang/compiler/commit/ebba1c71e9c18c4c6ca25891ddb86ebb9437e7c9))
+* **runtime:** the retained-size depth backstop reads the recursion guard's own stack probe ([#4150](https://github.com/ipe-lang/compiler/issues/4150)) ([7418bc5](https://github.com/ipe-lang/compiler/commit/7418bc5719dae5e22f7ba23d28abc1741f09319d))
+* **runtime:** the retained-size measure walks a bounded depth and stack ([#4121](https://github.com/ipe-lang/compiler/issues/4121)) ([03ce6c6](https://github.com/ipe-lang/compiler/commit/03ce6c62b9d5f3f874cf416edd502f69c849103d))
+* **runtime:** the runtime's tests compile under db-postgres and every host clippy row lints them ([#4104](https://github.com/ipe-lang/compiler/issues/4104)) ([ea6a19e](https://github.com/ipe-lang/compiler/commit/ea6a19e5dd5b3b979329f66784119ff9f9cdcb52))
+* **sandbox:** jails start through the descriptor floor; VCS config rows declare appended operands ([#4141](https://github.com/ipe-lang/compiler/issues/4141)) ([482bbc2](https://github.com/ipe-lang/compiler/commit/482bbc2dc364a0bb54a2fa4f631b7ec42d0e1c0b))
+* **server:** every 405 names its path's methods, and an unserved path answers 404 ([#4101](https://github.com/ipe-lang/compiler/issues/4101)) ([83f7d2e](https://github.com/ipe-lang/compiler/commit/83f7d2e08a87ac913a22bea2070debfe66c09eac))
+* **server:** one parsed request method set, and every stdlib doc example compiles as written ([#4095](https://github.com/ipe-lang/compiler/issues/4095)) ([45878dd](https://github.com/ipe-lang/compiler/commit/45878dd997d7228bea28d9bda5c2d0c5dea71739))
+* **types:** a kernel-duty refusal states its typed duty through one IPE-T0014 path ([#4069](https://github.com/ipe-lang/compiler/issues/4069)) ([444ca99](https://github.com/ipe-lang/compiler/commit/444ca99ad4fa4fe8c57a10ec9a99db18b19fb187))
+* **types:** an IPE-T0014 refusal names the kernel that owed the unmet duty ([#4145](https://github.com/ipe-lang/compiler/issues/4145)) ([03a0461](https://github.com/ipe-lang/compiler/commit/03a04619428d6fb7b7a66e7903999c4140e29a2f))
+* **types:** equality is refused by ipe wherever the backend cannot derive it ([#4151](https://github.com/ipe-lang/compiler/issues/4151)) ([bd74965](https://github.com/ipe-lang/compiler/commit/bd7496550c536551ccacfb66bc8fc8400c4d07a6))
+* **types:** every type refusal names a rigid by the user's spelling ([#4114](https://github.com/ipe-lang/compiler/issues/4114)) ([bbd7440](https://github.com/ipe-lang/compiler/commit/bbd7440d3f294acf38161569eec35ebc782a5678))
+* **wasm:** the in-browser front end compiles only on a stack it has proven it has ([#4144](https://github.com/ipe-lang/compiler/issues/4144)) ([aa279c0](https://github.com/ipe-lang/compiler/commit/aa279c037db8a62ea14b4a4a7ca3cdffcce9ed6e))
+* **web:** a routed app's URL always names the page on screen ([#4099](https://github.com/ipe-lang/compiler/issues/4099)) ([d4c31f0](https://github.com/ipe-lang/compiler/commit/d4c31f054ebcfecd81f622d04a82ac8bc9f3677c))
+* **web:** a runtime-owned attribute name never reaches the page ([#4109](https://github.com/ipe-lang/compiler/issues/4109)) ([24fbc83](https://github.com/ipe-lang/compiler/commit/24fbc83b6bb1a04deeee4ea68d7bc390e9d0cb94))
+
 ## [0.7.3](https://github.com/ipe-lang/compiler/compare/ipe-v0.7.2...ipe-v0.7.3) (2026-11-04)
 
 
