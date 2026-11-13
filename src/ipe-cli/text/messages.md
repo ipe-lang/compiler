@@ -1582,6 +1582,18 @@ health: the edited config for {path} did not re-parse; no change was made
 
 ipe lint: --fix and a data form (--json/--plain) are mutually exclusive — a data form reports without mutating
 
+## lint-fix-no-file
+
+lint --fix: module `{module}` has no project file this run read; no file was rewritten
+
+## lint-fix-changed
+
+lint --fix: {path} changed while it was being fixed — it and every file not reported as rewritten were left unchanged; run lint --fix again
+
+## lint-fix-backups-full
+
+lint --fix: no free backup name for {path} in `{dir}/` ({slots} taken); it and every file not reported as rewritten were left unchanged; remove old backups there and run lint --fix again
+
 ## lsp-failed
 
 lsp: {detail}
