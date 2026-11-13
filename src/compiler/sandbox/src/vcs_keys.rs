@@ -3,9 +3,15 @@
 //! One table per tool maps a setting, spelled as the tool's documentation
 //! spells it (`diff.<driver>.textconv`, `alias.*`), to the one way the tool
 //! consumes its value: through a shell, as one program run without a shell,
-//! composed into a program name, as a path it loads, as a URL, or as data.
-//! Every tool reading a value runs in the working tree, a directory under it,
-//! or the carved metadata directory, and each reading's judge relies on that.
+//! composed into a program name, as the operands of another setting's
+//! program, as a path it loads, as a URL, or as data. Every tool reading a
+//! value runs in the working tree, a directory under it, or the carved
+//! metadata directory, and each reading's judge relies on that.
+//!
+//! A setting whose value runs a program also states what the tool appends to
+//! that program ([`Appends`]): an operand a grant may decide is admitted only
+//! for a program whose operand contract the tool's own source proves
+//! ([`Contract`]).
 //!
 //! A spelling parses to the triple the configuration parser produces: the
 //! section, the subsection, and the key. A setting takes the row that matches
@@ -26,12 +32,33 @@ pub enum Consume {
     Exempt,
     /// Read as data; its words are still judged as a shell's would be.
     Inert,
-    /// Run through a shell as a command line.
-    Shell,
+    /// Run through a shell as a command line, followed by what the tool appends.
+    Shell(Appends),
     /// One leading `!` makes the rest a shell command; otherwise the value is data.
-    Bang,
-    /// Run without a shell as one program: a `~`, a quote, or a space is part of its path.
-    Exec,
+    ///
+    /// The shell command is followed by what the tool appends.
+    Bang(Appends),
+    /// Run without a shell as one program, followed by what the tool appends.
+    ///
+    /// A `~`, a quote, or a space is part of the program's path.
+    Exec(Appends),
+    /// Run as one program whatever its shape, followed by what the tool appends.
+    ///
+    /// The tool expands `~` and variables in the path first.
+    ExecExpanded(Appends),
+    /// Run without a shell as one program only when the value is an absolute
+    /// path, followed by what the tool appends; any other value is a host name.
+    ///
+    /// Every value is still judged as [`Consume::Exec`] would judge it
+    /// (`git-send-email.perl` `file_name_is_absolute($smtp_server)`).
+    ExecAbsolute(Appends),
+    /// The operands of another setting's program: every word is an argument, none a program.
+    Args,
+    /// A Mercurial merge tool: one `filemerge.py` implements itself runs nothing.
+    ///
+    /// Any other name runs as [`Consume::ExecExpanded`], fed the files it
+    /// merges (`filemerge.py:202-215`, `:985`).
+    MergeTool,
     /// Composed into a program name before it runs.
     Composed(Compose),
     /// A name the tool resolves inside its own directory or table (`merge.tool` sources `<exec-path>/mergetools/<name>`).
@@ -47,9 +74,125 @@ pub enum Consume {
     UrlList,
     /// The name of a Git remote.
     RemoteName,
-    /// A Mercurial `[hooks]` value: `python:<file>:<fn>` loads the file, anything else runs.
+    /// A Mercurial `[hooks]` value: `python:<file>:<fn>` loads the file, anything else runs with no operand.
     PythonHook,
 }
+
+/// What the tool hands the configured program after the value's own words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Appends {
+    /// No operand, or operands only through `$`-forms the scan already refuses.
+    Nothing,
+    /// Only operands no grant decides.
+    ///
+    /// These are words the user typed on the tool's command line, or an
+    /// absolute path the tool builds inside its carved metadata directory.
+    Ungranted,
+    /// An operand a grant may decide, admitted only for a program the contract names.
+    ///
+    /// The operand is a fixed or tool-chosen word read relative to the
+    /// directory the tool runs in (a commit id, `get`, a host), a working-tree
+    /// path, or a temporary file in a host directory the scan cannot see.
+    Granted(Contract),
+    /// Operands a grant may decide, substituted for `%` placeholders in the value.
+    ///
+    /// The tool appends nothing: a value with no `%` reads as
+    /// [`Appends::Nothing`], one with a `%` as [`Appends::Granted`].
+    Substitutes(Contract),
+}
+
+/// The programs whose operand contract the tool's own source proves is data, never code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Contract {
+    /// None proven: every program refuses.
+    None,
+    /// An SSH client, whose host operand is a destination.
+    ///
+    /// `ssh`, `ssh.exe`, `plink`, `plink.exe`, `tortoiseplink`,
+    /// `tortoiseplink.exe`, compared ignoring ASCII case: the names Git's
+    /// `determine_ssh_variant` recognises (`connect.c:1154-1161`).
+    SshClient,
+    /// A signing program, whose temporary file is a signature to verify.
+    ///
+    /// `gpg`, `gpgsm`, `ssh-keygen`: the defaults of Git's three signing
+    /// formats (`gpg-interface.c:75/85/95`).
+    Gpg,
+    /// A Git credential helper, whose operand is the operation word its protocol reads.
+    ///
+    /// A basename starting `git-credential-`: the helper namespace Git
+    /// composes a bare helper name into (`credential.c:324`).
+    CredentialHelper,
+}
+
+/// The program names Git's `determine_ssh_variant` recognises, compared ignoring ASCII case.
+const SSH_CLIENTS: &[&str] = &[
+    "ssh",
+    "ssh.exe",
+    "plink",
+    "plink.exe",
+    "tortoiseplink",
+    "tortoiseplink.exe",
+];
+
+/// The default programs of Git's `openpgp`, `x509`, and `ssh` signing formats.
+const SIGNERS: &[&str] = &["gpg", "gpgsm", "ssh-keygen"];
+
+impl Contract {
+    /// Whether the program whose last path component is `base` keeps this contract.
+    pub fn admits(self, base: &str) -> bool {
+        match self {
+            Self::None => false,
+            Self::SshClient => SSH_CLIENTS
+                .iter()
+                .any(|name| base.eq_ignore_ascii_case(name)),
+            Self::Gpg => SIGNERS.contains(&base),
+            Self::CredentialHelper => base.starts_with("git-credential-"),
+        }
+    }
+
+    /// Whether `option`, written without an argument, takes none from the
+    /// program `base` this contract admits, so the word after it, or the
+    /// operand the tool appends, stays an operand.
+    ///
+    /// Any other option may read the next word as its argument (`ssh -F`
+    /// reads the appended `-o` as a configuration file), so it is proven only
+    /// when a path follows it.
+    pub fn takes_no_argument(self, base: &str, option: &str) -> bool {
+        let options: &[&str] = match self {
+            Self::SshClient
+                if base.eq_ignore_ascii_case("ssh") || base.eq_ignore_ascii_case("ssh.exe") =>
+            {
+                OPENSSH_FLAGS
+            }
+            Self::SshClient => PLINK_FLAGS,
+            Self::Gpg if base == "gpg" || base == "gpgsm" => GPG_FLAGS,
+            Self::None | Self::Gpg | Self::CredentialHelper => &[],
+        };
+        options.contains(&option)
+    }
+}
+
+/// The options `OpenSSH`'s `ssh` takes without an argument (its `getopt` string).
+const OPENSSH_FLAGS: &[&str] = &[
+    "-4", "-6", "-A", "-a", "-C", "-f", "-G", "-g", "-K", "-k", "-M", "-N", "-n", "-q", "-s", "-T",
+    "-t", "-V", "-v", "-X", "-x", "-Y", "-y",
+];
+
+/// The one-letter options `plink` and `tortoiseplink` take without an argument.
+const PLINK_FLAGS: &[&str] = &[
+    "-1", "-2", "-4", "-6", "-A", "-a", "-C", "-N", "-T", "-t", "-V", "-v", "-X", "-x",
+];
+
+/// The options `gpg` and `gpgsm` take without an argument.
+const GPG_FLAGS: &[&str] = &[
+    "--batch",
+    "--no-tty",
+    "--quiet",
+    "--verbose",
+    "--yes",
+    "-q",
+    "-v",
+];
 
 /// How a tool composes a program name from a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +205,47 @@ pub enum Compose {
     RemoteHelper,
 }
 
+impl Compose {
+    /// What the tool appends to the program it composes.
+    ///
+    /// An alias gets only the user's own arguments (`git.c`
+    /// `handle_alias`); a credential helper the operation word its protocol
+    /// reads (`credential.c:313-327`); a remote helper the remote's name and
+    /// URL (`transport-helper.c`), which `ext` runs a command from.
+    pub const fn appends(self) -> Appends {
+        match self {
+            Self::Alias => Appends::Ungranted,
+            Self::CredentialHelper => Appends::Granted(Contract::CredentialHelper),
+            Self::RemoteHelper => Appends::Granted(Contract::None),
+        }
+    }
+}
+
+/// The merge tools Mercurial's `filemerge.py` implements itself (`@internaltool`, `:304-673`).
+const HG_INTERNAL_TOOLS: &[&str] = &[
+    "dump",
+    "fail",
+    "forcedump",
+    "local",
+    "merge",
+    "merge-local",
+    "merge-other",
+    "merge3",
+    "mergediff",
+    "other",
+    "prompt",
+    "tagmerge",
+    "union",
+];
+
+/// Whether Mercurial runs `value` as one of its own merge tools: `:<name>` or `internal:<name>`.
+pub fn is_hg_internal_tool(value: &str) -> bool {
+    value
+        .strip_prefix(':')
+        .or_else(|| value.strip_prefix("internal:"))
+        .is_some_and(|name| HG_INTERNAL_TOOLS.contains(&name))
+}
+
 /// How a tool loads a value as a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Load {
@@ -69,9 +253,12 @@ pub enum Load {
     Include(Include),
     /// A directory whose hooks the tool runs.
     HooksPath,
-    /// A path the tool runs or loads whatever its shape.
+    /// A path the tool loads whatever its shape.
     Forced,
     /// A path the tool runs whatever its shape, unless the value is a Git boolean.
+    ///
+    /// The program gets the hook protocol's version and token as operands
+    /// (`fsmonitor.c`), which no contract proves it reads as data.
     ForcedUnlessBool,
     /// A path the tool loads whatever its shape, after a leading `!` that disables it.
     ForcedUnbanged,
@@ -104,17 +291,32 @@ enum Rule {
     AsUnscoped,
 }
 
+/// The number naming what a tool appends, below `0x10`, equal exactly when the decisions are.
+const fn appends_code(appends: Appends) -> u16 {
+    match appends {
+        Appends::Nothing => 0,
+        Appends::Ungranted => 1,
+        Appends::Granted(Contract::None) => 2,
+        Appends::Granted(Contract::SshClient) => 3,
+        Appends::Granted(Contract::Gpg) => 4,
+        Appends::Granted(Contract::CredentialHelper) => 5,
+        Appends::Substitutes(Contract::None) => 6,
+        Appends::Substitutes(Contract::SshClient) => 7,
+        Appends::Substitutes(Contract::Gpg) => 8,
+        Appends::Substitutes(Contract::CredentialHelper) => 9,
+    }
+}
+
 /// The number naming a rule, equal exactly when the rules are.
-const fn code(rule: Rule) -> u8 {
+const fn code(rule: Rule) -> u16 {
     match rule {
         Rule::Consume(Consume::Exempt) => 0,
         Rule::Consume(Consume::Inert) => 1,
-        Rule::Consume(Consume::Bang) => 2,
-        Rule::Consume(Consume::Exec) => 3,
+        Rule::Consume(Consume::Args) => 2,
+        Rule::Consume(Consume::MergeTool) => 3,
         Rule::Consume(Consume::Composed(Compose::Alias)) => 4,
         Rule::Consume(Consume::Composed(Compose::CredentialHelper)) => 5,
         Rule::Consume(Consume::Composed(Compose::RemoteHelper)) => 6,
-        Rule::Consume(Consume::Shell) => 7,
         Rule::Consume(Consume::ToolName) => 8,
         Rule::Consume(Consume::Load(Load::Include(Include::Always))) => 9,
         Rule::Consume(Consume::Load(Load::Include(Include::Conditional))) => 10,
@@ -128,16 +330,34 @@ const fn code(rule: Rule) -> u8 {
         Rule::Consume(Consume::RemoteName) => 18,
         Rule::Consume(Consume::PythonHook) => 19,
         Rule::AsUnscoped => 20,
+        Rule::Consume(Consume::Shell(appends)) => 0x100 | appends_code(appends),
+        Rule::Consume(Consume::Bang(appends)) => 0x200 | appends_code(appends),
+        Rule::Consume(Consume::Exec(appends)) => 0x300 | appends_code(appends),
+        Rule::Consume(Consume::ExecExpanded(appends)) => 0x400 | appends_code(appends),
+        Rule::Consume(Consume::ExecAbsolute(appends)) => 0x500 | appends_code(appends),
     }
 }
 
 const EXEMPT: Rule = Rule::Consume(Consume::Exempt);
 const INERT: Rule = Rule::Consume(Consume::Inert);
-const SHELL: Rule = Rule::Consume(Consume::Shell);
+const ARGS: Rule = Rule::Consume(Consume::Args);
+const MERGE_TOOL: Rule = Rule::Consume(Consume::MergeTool);
+const SHELL_NOTHING: Rule = Rule::Consume(Consume::Shell(Appends::Nothing));
+const SHELL_UNGRANTED: Rule = Rule::Consume(Consume::Shell(Appends::Ungranted));
+const SHELL_GRANTED: Rule = Rule::Consume(Consume::Shell(Appends::Granted(Contract::None)));
+const SHELL_SSH: Rule = Rule::Consume(Consume::Shell(Appends::Granted(Contract::SshClient)));
+const SHELL_GPG: Rule = Rule::Consume(Consume::Shell(Appends::Granted(Contract::Gpg)));
+const SHELL_SUBSTITUTES: Rule = Rule::Consume(Consume::Shell(Appends::Substitutes(Contract::None)));
+const BANG_UNGRANTED: Rule = Rule::Consume(Consume::Bang(Appends::Ungranted));
+const BANG_GRANTED: Rule = Rule::Consume(Consume::Bang(Appends::Granted(Contract::None)));
+const EXEC_NOTHING: Rule = Rule::Consume(Consume::Exec(Appends::Nothing));
+const EXEC_UNGRANTED: Rule = Rule::Consume(Consume::Exec(Appends::Ungranted));
+const EXEC_GRANTED: Rule = Rule::Consume(Consume::Exec(Appends::Granted(Contract::None)));
+const EXEC_GPG: Rule = Rule::Consume(Consume::Exec(Appends::Granted(Contract::Gpg)));
+const EXEC_EXPANDED: Rule = Rule::Consume(Consume::ExecExpanded(Appends::Granted(Contract::None)));
+const EXEC_ABSOLUTE: Rule = Rule::Consume(Consume::ExecAbsolute(Appends::Granted(Contract::None)));
 const TOOL_NAME: Rule = Rule::Consume(Consume::ToolName);
 const UNSCOPED: Rule = Rule::AsUnscoped;
-const BANG: Rule = Rule::Consume(Consume::Bang);
-const EXEC: Rule = Rule::Consume(Consume::Exec);
 const ALIAS: Rule = Rule::Consume(Consume::Composed(Compose::Alias));
 const HELPER: Rule = Rule::Consume(Consume::Composed(Compose::CredentialHelper));
 const REMOTE_HELPER: Rule = Rule::Consume(Consume::Composed(Compose::RemoteHelper));
@@ -229,8 +449,8 @@ const GIT: &[Row] = &[
     ("branch.autoSetupMerge", EXEMPT),
     ("branch.autoSetupRebase", EXEMPT),
     ("branch.sort", EXEMPT),
-    ("browser.<tool>.cmd", SHELL),
-    ("browser.<tool>.path", EXEC),
+    ("browser.<tool>.cmd", SHELL_UNGRANTED),
+    ("browser.<tool>.path", EXEC_UNGRANTED),
     ("checkout.defaultRemote", INERT),
     ("checkout.guess", INERT),
     ("checkout.thresholdForParallelism", INERT),
@@ -345,9 +565,9 @@ const GIT: &[Row] = &[
     ("committer.name", INERT),
     ("completion.commands", INERT),
     ("core.abbrev", INERT),
-    ("core.alternateRefsCommand", SHELL),
+    ("core.alternateRefsCommand", SHELL_GRANTED),
     ("core.alternateRefsPrefixes", INERT),
-    ("core.askPass", EXEC),
+    ("core.askPass", EXEC_GRANTED),
     ("core.attributesFile", EXEMPT),
     ("core.autocrlf", INERT),
     ("core.bare", INERT),
@@ -359,7 +579,7 @@ const GIT: &[Row] = &[
     ("core.compression", INERT),
     ("core.createObject", INERT),
     ("core.deltaBaseCacheLimit", INERT),
-    ("core.editor", SHELL),
+    ("core.editor", SHELL_UNGRANTED),
     ("core.eol", INERT),
     ("core.excludesFile", EXEMPT),
     ("core.fileMode", INERT),
@@ -367,7 +587,7 @@ const GIT: &[Row] = &[
     ("core.fsmonitor", FORCED_UNLESS_BOOL),
     ("core.fsmonitorHookVersion", INERT),
     ("core.fsyncObjectFiles", INERT),
-    ("core.gitProxy", EXEC),
+    ("core.gitProxy", EXEC_GRANTED),
     ("core.hideDotFiles", INERT),
     ("core.hooksPath", HOOKS_PATH),
     ("core.ignoreCase", INERT),
@@ -379,7 +599,7 @@ const GIT: &[Row] = &[
     ("core.packedGitLimit", INERT),
     ("core.packedGitWindowSize", INERT),
     ("core.packedRefsTimeout", INERT),
-    ("core.pager", SHELL),
+    ("core.pager", SHELL_NOTHING),
     ("core.precomposeUnicode", INERT),
     ("core.preferSymlinkRefs", INERT),
     ("core.preloadIndex", INERT),
@@ -393,7 +613,7 @@ const GIT: &[Row] = &[
     ("core.sparseCheckout", INERT),
     ("core.sparseCheckoutCone", INERT),
     ("core.splitIndex", INERT),
-    ("core.sshCommand", SHELL),
+    ("core.sshCommand", SHELL_SSH),
     ("core.symlinks", INERT),
     ("core.trustctime", INERT),
     ("core.unsetenvvars", INERT),
@@ -412,8 +632,8 @@ const GIT: &[Row] = &[
     ("credentialStore.lockTimeoutMS", INERT),
     ("diff.<driver>.binary", INERT),
     ("diff.<driver>.cachetextconv", INERT),
-    ("diff.<driver>.command", SHELL),
-    ("diff.<driver>.textconv", SHELL),
+    ("diff.<driver>.command", SHELL_GRANTED),
+    ("diff.<driver>.textconv", SHELL_GRANTED),
     ("diff.<driver>.wordRegex", INERT),
     ("diff.<driver>.xfuncname", INERT),
     ("diff.algorithm", INERT),
@@ -422,7 +642,7 @@ const GIT: &[Row] = &[
     ("diff.colorMovedWS", INERT),
     ("diff.context", INERT),
     ("diff.dirstat", INERT),
-    ("diff.external", SHELL),
+    ("diff.external", SHELL_GRANTED),
     ("diff.guitool", TOOL_NAME),
     ("diff.ignoreSubmodules", INERT),
     ("diff.indentHeuristic", INERT),
@@ -439,8 +659,8 @@ const GIT: &[Row] = &[
     ("diff.tool", TOOL_NAME),
     ("diff.wordRegex", INERT),
     ("diff.wsErrorHighlight", INERT),
-    ("difftool.<tool>.cmd", SHELL),
-    ("difftool.<tool>.path", EXEC),
+    ("difftool.<tool>.cmd", SHELL_NOTHING),
+    ("difftool.<tool>.path", EXEC_GRANTED),
     ("difftool.prompt", INERT),
     ("extensions.*", INERT),
     ("extensions.objectFormat", INERT),
@@ -461,10 +681,10 @@ const GIT: &[Row] = &[
     ("fetch.showForcedUpdates", INERT),
     ("fetch.unpackLimit", INERT),
     ("fetch.writeCommitGraph", INERT),
-    ("filter.<driver>.clean", SHELL),
-    ("filter.<driver>.process", SHELL),
+    ("filter.<driver>.clean", SHELL_SUBSTITUTES),
+    ("filter.<driver>.process", SHELL_NOTHING),
     ("filter.<driver>.required", INERT),
-    ("filter.<driver>.smudge", SHELL),
+    ("filter.<driver>.smudge", SHELL_SUBSTITUTES),
     ("format.attach", INERT),
     ("format.cc", INERT),
     ("format.coverFromDescription", INERT),
@@ -585,12 +805,12 @@ const GIT: &[Row] = &[
     ("gitweb.showSizes", INERT),
     ("gitweb.snapshot", INERT),
     ("gitweb.url", INERT),
-    ("gpg.<format>.program", EXEC),
+    ("gpg.<format>.program", EXEC_GPG),
     ("gpg.format", INERT),
     ("gpg.minTrustLevel", INERT),
-    ("gpg.program", EXEC),
+    ("gpg.program", EXEC_GPG),
     ("gpg.ssh.allowedSignersFile", INERT),
-    ("gpg.ssh.defaultKeyCommand", EXEC),
+    ("gpg.ssh.defaultKeyCommand", EXEC_NOTHING),
     ("gpg.ssh.revocationFile", INERT),
     ("grep.column", INERT),
     ("grep.extendedRegexp", INERT),
@@ -612,7 +832,7 @@ const GIT: &[Row] = &[
     ("gui.spellingDictionary", INERT),
     ("gui.trustmtime", INERT),
     ("guitool.<name>.argPrompt", INERT),
-    ("guitool.<name>.cmd", SHELL),
+    ("guitool.<name>.cmd", SHELL_NOTHING),
     ("guitool.<name>.confirm", INERT),
     ("guitool.<name>.needsFile", INERT),
     ("guitool.<name>.noConsole", INERT),
@@ -625,7 +845,7 @@ const GIT: &[Row] = &[
     ("help.browser", TOOL_NAME),
     ("help.format", INERT),
     ("help.htmlPath", INERT),
-    ("hook.<name>.command", SHELL),
+    ("hook.<name>.command", SHELL_GRANTED),
     ("hook.<name>.event", INERT),
     ("http.<url>.*", UNSCOPED),
     ("http.cookieFile", INERT),
@@ -670,7 +890,7 @@ const GIT: &[Row] = &[
     ("imap.port", INERT),
     ("imap.preformattedHTML", INERT),
     ("imap.sslverify", INERT),
-    ("imap.tunnel", SHELL),
+    ("imap.tunnel", SHELL_NOTHING),
     ("imap.user", INERT),
     ("include.path", INCLUDE),
     ("includeIf.<condition>.path", INCLUDE_IF),
@@ -682,11 +902,11 @@ const GIT: &[Row] = &[
     ("init.defaultBranch", INERT),
     ("init.templateDir", FORCED),
     ("instaweb.browser", TOOL_NAME),
-    ("instaweb.httpd", SHELL),
+    ("instaweb.httpd", SHELL_UNGRANTED),
     ("instaweb.local", INERT),
     ("instaweb.modulePath", FORCED),
     ("instaweb.port", INERT),
-    ("interactive.diffFilter", SHELL),
+    ("interactive.diffFilter", SHELL_NOTHING),
     ("interactive.singleKey", INERT),
     ("lfs.<url>.access", INERT),
     ("lfs.<url>.contenttype", INERT),
@@ -697,15 +917,15 @@ const GIT: &[Row] = &[
     ("lfs.cachecredentials", INERT),
     ("lfs.concurrenttransfers", INERT),
     ("lfs.contenttype", INERT),
-    ("lfs.customtransfer.<name>.args", SHELL),
+    ("lfs.customtransfer.<name>.args", ARGS),
     ("lfs.customtransfer.<name>.concurrent", INERT),
     ("lfs.customtransfer.<name>.direction", INERT),
-    ("lfs.customtransfer.<name>.path", EXEC),
+    ("lfs.customtransfer.<name>.path", EXEC_NOTHING),
     ("lfs.defaulttokenttl", INERT),
     ("lfs.dialtimeout", INERT),
-    ("lfs.extension.<name>.clean", SHELL),
+    ("lfs.extension.<name>.clean", SHELL_SUBSTITUTES),
     ("lfs.extension.<name>.priority", INERT),
-    ("lfs.extension.<name>.smudge", SHELL),
+    ("lfs.extension.<name>.smudge", SHELL_SUBSTITUTES),
     ("lfs.fetchexclude", INERT),
     ("lfs.fetchinclude", INERT),
     ("lfs.fetchrecentalways", INERT),
@@ -755,10 +975,10 @@ const GIT: &[Row] = &[
     ("maintenance.incremental-repack.auto", INERT),
     ("maintenance.loose-objects.auto", INERT),
     ("maintenance.strategy", INERT),
-    ("man.<tool>.cmd", SHELL),
-    ("man.<tool>.path", EXEC),
+    ("man.<tool>.cmd", SHELL_GRANTED),
+    ("man.<tool>.path", EXEC_GRANTED),
     ("man.viewer", TOOL_NAME),
-    ("merge.<driver>.driver", SHELL),
+    ("merge.<driver>.driver", SHELL_SUBSTITUTES),
     ("merge.<driver>.name", INERT),
     ("merge.<driver>.recursive", INERT),
     ("merge.autoStash", INERT),
@@ -777,9 +997,9 @@ const GIT: &[Row] = &[
     ("merge.tool", TOOL_NAME),
     ("merge.verbosity", INERT),
     ("merge.verifySignatures", INERT),
-    ("mergetool.<tool>.cmd", SHELL),
+    ("mergetool.<tool>.cmd", SHELL_NOTHING),
     ("mergetool.<tool>.hideResolved", INERT),
-    ("mergetool.<tool>.path", EXEC),
+    ("mergetool.<tool>.path", EXEC_GRANTED),
     ("mergetool.<tool>.trustExitCode", INERT),
     ("mergetool.hideResolved", INERT),
     ("mergetool.keepBackup", INERT),
@@ -811,7 +1031,7 @@ const GIT: &[Row] = &[
     ("pack.windowMemory", INERT),
     ("pack.writeBitmapHashCache", INERT),
     ("pack.writeReverseIndex", INERT),
-    ("pager.<cmd>", SHELL),
+    ("pager.<cmd>", SHELL_NOTHING),
     ("pretty.<name>", INERT),
     ("protocol.<name>.allow", INERT),
     ("protocol.allow", INERT),
@@ -923,11 +1143,11 @@ const GIT: &[Row] = &[
     ("remote.<name>.pruneTags", INERT),
     ("remote.<name>.push", EXEMPT),
     ("remote.<name>.pushurl", URL_SCP),
-    ("remote.<name>.receivepack", SHELL),
+    ("remote.<name>.receivepack", SHELL_GRANTED),
     ("remote.<name>.skipDefaultUpdate", INERT),
     ("remote.<name>.skipFetchAll", INERT),
     ("remote.<name>.tagOpt", INERT),
-    ("remote.<name>.uploadpack", SHELL),
+    ("remote.<name>.uploadpack", SHELL_GRANTED),
     ("remote.<name>.url", URL_SCP),
     ("remote.<name>.vcs", REMOTE_HELPER),
     ("remote.lfsdefault", REMOTE_NAME),
@@ -948,7 +1168,7 @@ const GIT: &[Row] = &[
     ("sendemail.annotate", INERT),
     ("sendemail.bcc", INERT),
     ("sendemail.cc", INERT),
-    ("sendemail.ccCmd", SHELL),
+    ("sendemail.ccCmd", SHELL_GRANTED),
     ("sendemail.chainReplyTo", INERT),
     ("sendemail.confirm", INERT),
     ("sendemail.envelopeSender", INERT),
@@ -956,14 +1176,14 @@ const GIT: &[Row] = &[
     ("sendemail.from", INERT),
     ("sendemail.identity", INERT),
     ("sendemail.multiEdit", INERT),
-    ("sendemail.sendmailCmd", SHELL),
+    ("sendemail.sendmailCmd", SHELL_GRANTED),
     ("sendemail.signedoffbycc", INERT),
     ("sendemail.smtpBatchSize", INERT),
     ("sendemail.smtpDomain", INERT),
     ("sendemail.smtpEncryption", INERT),
     ("sendemail.smtpPass", INERT),
     ("sendemail.smtpReloginDelay", INERT),
-    ("sendemail.smtpServer", EXEC),
+    ("sendemail.smtpServer", EXEC_ABSOLUTE),
     ("sendemail.smtpServerOption", INERT),
     ("sendemail.smtpServerPort", INERT),
     ("sendemail.smtpsslcertpath", INERT),
@@ -972,11 +1192,11 @@ const GIT: &[Row] = &[
     ("sendemail.suppressFrom", INERT),
     ("sendemail.thread", INERT),
     ("sendemail.to", INERT),
-    ("sendemail.tocmd", SHELL),
+    ("sendemail.tocmd", SHELL_GRANTED),
     ("sendemail.transferEncoding", INERT),
     ("sendemail.validate", INERT),
     ("sendemail.xmailer", INERT),
-    ("sequence.editor", SHELL),
+    ("sequence.editor", SHELL_UNGRANTED),
     ("showBranch.default", INERT),
     ("splitIndex.maxPercentChange", INERT),
     ("splitIndex.sharedIndexExpire", INERT),
@@ -1001,7 +1221,7 @@ const GIT: &[Row] = &[
     ("submodule.<name>.ignore", INERT),
     ("submodule.<name>.path", INERT),
     ("submodule.<name>.shallow", INERT),
-    ("submodule.<name>.update", BANG),
+    ("submodule.<name>.update", BANG_GRANTED),
     ("submodule.<name>.url", URL_SCP),
     ("submodule.active", INERT),
     ("submodule.alternateErrorStrategy", INERT),
@@ -1012,7 +1232,7 @@ const GIT: &[Row] = &[
     ("tag.forceSignAnnotated", INERT),
     ("tag.gpgSign", INERT),
     ("tag.sort", INERT),
-    ("tar.<format>.command", SHELL),
+    ("tar.<format>.command", SHELL_NOTHING),
     ("tar.<format>.remote", INERT),
     ("tar.umask", INERT),
     ("trace2.configParams", INERT),
@@ -1026,8 +1246,8 @@ const GIT: &[Row] = &[
     ("trace2.normalTarget", INERT),
     ("trace2.perfBrief", INERT),
     ("trace2.perfTarget", INERT),
-    ("trailer.<token>.cmd", SHELL),
-    ("trailer.<token>.command", SHELL),
+    ("trailer.<token>.cmd", SHELL_GRANTED),
+    ("trailer.<token>.command", SHELL_NOTHING),
     ("trailer.<token>.ifexists", INERT),
     ("trailer.<token>.ifmissing", INERT),
     ("trailer.<token>.key", INERT),
@@ -1048,7 +1268,7 @@ const GIT: &[Row] = &[
     ("uploadpack.allowTipSHA1InWant", INERT),
     ("uploadpack.hideRefs", INERT),
     ("uploadpack.keepAlive", INERT),
-    ("uploadpack.packObjectsHook", SHELL),
+    ("uploadpack.packObjectsHook", SHELL_GRANTED),
     ("uploadpackfilter.<filter>.allow", INERT),
     ("uploadpackfilter.allow", INERT),
     ("uploadpackfilter.tree.maxDepth", INERT),
@@ -1196,73 +1416,73 @@ const GIT_UNDOCUMENTED: &[(&str, &str)] = &[
 /// reads in place of one it was given, `.hgsub` sources included. A setting no
 /// row decides is unknown.
 const HG: &[Row] = &[
-    ("absorb.add-noise", INERT),          // hgext/absorb.py:928 configbool
-    ("absorb.max-stack-size", INERT),     // hgext/absorb.py:1021 configint
-    ("acl.sources", INERT),               // hgext/acl.py:380 configlist
-    ("alias.*", BANG),                    // mercurial/dispatch.py:765
-    ("alias.*:category", INERT),          // mercurial/dispatch.py:647 alias help text
-    ("alias.*:doc", INERT),               // mercurial/dispatch.py:647 alias help text
-    ("alias.*:help", INERT),              // mercurial/dispatch.py:647 alias help text
-    ("annotate.git", INERT),              // mercurial/diffutil.py:73 difffeatureopts
-    ("annotate.ignoreblanklines", INERT), // mercurial/diffutil.py:73 difffeatureopts
-    ("annotate.ignorews", INERT),         // mercurial/diffutil.py:73 difffeatureopts
-    ("annotate.ignorewsamount", INERT),   // mercurial/diffutil.py:73 difffeatureopts
-    ("annotate.ignorewseol", INERT),      // mercurial/diffutil.py:73 difffeatureopts
-    ("annotate.nobinary", INERT),         // mercurial/diffutil.py:73 difffeatureopts
-    ("annotate.nodates", INERT),          // mercurial/diffutil.py:73 difffeatureopts
-    ("annotate.noprefix", INERT),         // mercurial/diffutil.py:73 difffeatureopts
-    ("annotate.showfunc", INERT),         // mercurial/diffutil.py:73 difffeatureopts
-    ("annotate.unified", INERT),          // mercurial/diffutil.py:73 difffeatureopts
-    ("annotate.word-diff", INERT),        // mercurial/diffutil.py:73 difffeatureopts
-    ("auth.cookiefile", INERT),           // mercurial/url.py:473 config
-    ("automv.similarity", INERT),         // hgext/automv.py:64 configint
-    ("blackbox.date-format", INERT),      // hgext/blackbox.py:102 config
-    ("blackbox.debug.to-stderr", INERT),  // hgext/blackbox.py:103 configbool
-    ("blackbox.dirty", INERT),            // hgext/blackbox.py:117 configbool
-    ("blackbox.ignore", INERT),           // hgext/blackbox.py:78 configlist
-    ("blackbox.logsource", INERT),        // hgext/blackbox.py:121 configbool
-    ("blackbox.maxfiles", INERT),         // hgext/blackbox.py:79 configint
-    ("blackbox.maxsize", INERT),          // hgext/blackbox.py:80 configbytes
-    ("blackbox.track", INERT),            // hgext/blackbox.py:77 configlist
-    ("bookmarks.pushing", INERT),         // mercurial/discovery.py:420 configlist
-    ("bugzilla.apikey", INERT),           // hgext/bugzilla.py:973 config
-    ("bugzilla.bzdir", SHELL), // hgext/bugzilla.py:588 popen, substituted into bugzilla.notify
+    ("absorb.add-noise", INERT),            // hgext/absorb.py:928 configbool
+    ("absorb.max-stack-size", INERT),       // hgext/absorb.py:1021 configint
+    ("acl.sources", INERT),                 // hgext/acl.py:380 configlist
+    ("alias.*", BANG_UNGRANTED),            // mercurial/dispatch.py:765
+    ("alias.*:category", INERT),            // mercurial/dispatch.py:647 alias help text
+    ("alias.*:doc", INERT),                 // mercurial/dispatch.py:647 alias help text
+    ("alias.*:help", INERT),                // mercurial/dispatch.py:647 alias help text
+    ("annotate.git", INERT),                // mercurial/diffutil.py:73 difffeatureopts
+    ("annotate.ignoreblanklines", INERT),   // mercurial/diffutil.py:73 difffeatureopts
+    ("annotate.ignorews", INERT),           // mercurial/diffutil.py:73 difffeatureopts
+    ("annotate.ignorewsamount", INERT),     // mercurial/diffutil.py:73 difffeatureopts
+    ("annotate.ignorewseol", INERT),        // mercurial/diffutil.py:73 difffeatureopts
+    ("annotate.nobinary", INERT),           // mercurial/diffutil.py:73 difffeatureopts
+    ("annotate.nodates", INERT),            // mercurial/diffutil.py:73 difffeatureopts
+    ("annotate.noprefix", INERT),           // mercurial/diffutil.py:73 difffeatureopts
+    ("annotate.showfunc", INERT),           // mercurial/diffutil.py:73 difffeatureopts
+    ("annotate.unified", INERT),            // mercurial/diffutil.py:73 difffeatureopts
+    ("annotate.word-diff", INERT),          // mercurial/diffutil.py:73 difffeatureopts
+    ("auth.cookiefile", INERT),             // mercurial/url.py:473 config
+    ("automv.similarity", INERT),           // hgext/automv.py:64 configint
+    ("blackbox.date-format", INERT),        // hgext/blackbox.py:102 config
+    ("blackbox.debug.to-stderr", INERT),    // hgext/blackbox.py:103 configbool
+    ("blackbox.dirty", INERT),              // hgext/blackbox.py:117 configbool
+    ("blackbox.ignore", INERT),             // hgext/blackbox.py:78 configlist
+    ("blackbox.logsource", INERT),          // hgext/blackbox.py:121 configbool
+    ("blackbox.maxfiles", INERT),           // hgext/blackbox.py:79 configint
+    ("blackbox.maxsize", INERT),            // hgext/blackbox.py:80 configbytes
+    ("blackbox.track", INERT),              // hgext/blackbox.py:77 configlist
+    ("bookmarks.pushing", INERT),           // mercurial/discovery.py:420 configlist
+    ("bugzilla.apikey", INERT),             // hgext/bugzilla.py:973 config
+    ("bugzilla.bzdir", ARGS), // hgext/bugzilla.py:588 popen, substituted into bugzilla.notify
     ("bugzilla.bzemail", INERT), // hgext/bugzilla.py:896 config
     ("bugzilla.bzurl", INERT), // hgext/bugzilla.py:789 config
-    ("bugzilla.bzuser", SHELL), // hgext/bugzilla.py:588 popen, substituted into bugzilla.notify
-    ("bugzilla.db", INERT),    // hgext/bugzilla.py:515 config
+    ("bugzilla.bzuser", ARGS), // hgext/bugzilla.py:588 popen, substituted into bugzilla.notify
+    ("bugzilla.db", INERT),   // hgext/bugzilla.py:515 config
     ("bugzilla.fixresolution", INERT), // hgext/bugzilla.py:796 config
     ("bugzilla.fixstatus", INERT), // hgext/bugzilla.py:795 config
-    ("bugzilla.host", INERT),  // hgext/bugzilla.py:512 config
-    ("bugzilla.notify", SHELL), // hgext/bugzilla.py:588 popen
+    ("bugzilla.host", INERT), // hgext/bugzilla.py:512 config
+    ("bugzilla.notify", SHELL_SUBSTITUTES), // hgext/bugzilla.py:588 popen
     ("bugzilla.password", INERT), // hgext/bugzilla.py:514 config
     ("bugzilla.strip", INERT), // hgext/bugzilla.py:1195 configint
     ("bugzilla.style", INERT), // hgext/bugzilla.py:1208 config
     ("bugzilla.template", INERT), // hgext/bugzilla.py:1206 config
     ("bugzilla.timeout", INERT), // hgext/bugzilla.py:516 configint
-    ("bugzilla.user", INERT),  // hgext/bugzilla.py:513 config
+    ("bugzilla.user", INERT), // hgext/bugzilla.py:513 config
     ("bugzilla.version", INERT), // hgext/bugzilla.py:1115 config
     ("bundle.mainreporoot", INERT), // mercurial/bundlerepo.py:599 config
-    ("censor.policy", INERT),  // mercurial/repo/vfs_options.py:287 config
+    ("censor.policy", INERT), // mercurial/repo/vfs_options.py:287 config
     ("chgserver.idletimeout", INERT), // mercurial/chgserver.py:681 configint
     ("chgserver.skiphash", INERT), // mercurial/chgserver.py:693 configbool
     ("clone-bundles.auto-generate.formats", INERT), // hgext/clonebundles.py:844 configlist
     ("clone-bundles.auto-generate.on-change", INERT), // hgext/clonebundles.py:971 configbool
     ("clone-bundles.auto-generate.serve-inline", INERT), // hgext/clonebundles.py:775 config
-    ("clone-bundles.delete-command", SHELL), // hgext/clonebundles.py:825 ui.system
+    ("clone-bundles.delete-command", SHELL_GRANTED), // hgext/clonebundles.py:825 ui.system
     ("clone-bundles.trigger.below-bundled-ratio", INERT), // hgext/clonebundles.py:846 config
     ("clone-bundles.trigger.revs", INERT), // hgext/clonebundles.py:848 configint
-    ("clone-bundles.upload-command", SHELL), // hgext/clonebundles.py:786 ui.system
+    ("clone-bundles.upload-command", SHELL_GRANTED), // hgext/clonebundles.py:786 ui.system
     ("clone-bundles.url-template", INERT), // hgext/clonebundles.py:787 config
-    ("cmdserver.log", INERT),  // mercurial/commandserver.py:253 config
+    ("cmdserver.log", INERT), // mercurial/commandserver.py:253 config
     ("cmdserver.max-log-files", INERT), // mercurial/commandserver.py:448 configint
     ("cmdserver.max-log-size", INERT), // mercurial/commandserver.py:450 configbytes
     ("cmdserver.max-repo-cache", INERT), // mercurial/commandserver.py:637 configint
     ("cmdserver.message-encodings", INERT), // mercurial/commandserver.py:204 configlist
     ("cmdserver.shutdown-on-interrupt", INERT), // mercurial/commandserver.py:272 configbool
     ("cmdserver.track-log", INERT), // mercurial/commandserver.py:439 configlist
-    ("color.*", INERT),        // mercurial/color.py:169 configitems
-    ("color.mode", INERT),     // mercurial/color.py:241 config
+    ("color.*", INERT),       // mercurial/color.py:169 configitems
+    ("color.mode", INERT),    // mercurial/color.py:241 config
     ("color.pagermode", INERT), // mercurial/color.py:245 config
     ("command-templates.graphnode", INERT), // mercurial/logcmdutil.py:1248 config
     ("command-templates.log", INERT), // mercurial/logcmdutil.py:693 config
@@ -1398,32 +1618,32 @@ const HG: &[Row] = &[
     ("devel.warn-config-default", INERT),             // mercurial/ui.py:2387 configbool
     ("devel.warn-config-unknown", INERT),             // mercurial/ui.py:2387 configbool
     ("devel.warn-empty-changegroup", INERT),          // mercurial/ui.py:2387 configbool
-    ("diff-tools.<name>.diffargs", SHELL), // hgext/extdiff.py:801 appended to the command line
-    ("diff-tools.<name>.gui", INERT),      // hgext/extdiff.py:808 configbool
-    ("diff.git", INERT),                   // mercurial/diffutil.py:73 difffeatureopts
-    ("diff.ignoreblanklines", INERT),      // mercurial/diffutil.py:73 difffeatureopts
-    ("diff.ignorews", INERT),              // mercurial/diffutil.py:73 difffeatureopts
-    ("diff.ignorewsamount", INERT),        // mercurial/diffutil.py:73 difffeatureopts
-    ("diff.ignorewseol", INERT),           // mercurial/diffutil.py:73 difffeatureopts
-    ("diff.merge", INERT),                 // mercurial/merge_utils/diff.py:26 configbool
-    ("diff.nobinary", INERT),              // mercurial/diffutil.py:73 difffeatureopts
-    ("diff.nodates", INERT),               // mercurial/diffutil.py:73 difffeatureopts
-    ("diff.noprefix", INERT),              // mercurial/diffutil.py:73 difffeatureopts
-    ("diff.showfunc", INERT),              // mercurial/diffutil.py:73 difffeatureopts
-    ("diff.unified", INERT),               // mercurial/diffutil.py:73 difffeatureopts
-    ("diff.word-diff", INERT),             // mercurial/diffutil.py:73 difffeatureopts
-    ("email.bcc", INERT),                  // hgext/patchbomb.py:890 addresses
-    ("email.cc", INERT),                   // hgext/patchbomb.py:890 addresses
-    ("email.charsets", INERT),             // mercurial/mail.py:335 configlist
-    ("email.from", INERT),                 // hgext/hooklib/changeset_obsoleted.py:115 config
-    ("email.method", SHELL),               // mercurial/mail.py:201 popen
-    ("email.reply-to", INERT),             // hgext/patchbomb.py:890 addresses
-    ("email.to", INERT),                   // hgext/patchbomb.py:890 addresses
-    ("eol.fix-trailing-newline", INERT),   // hgext/eol.py:152 configbool
-    ("eol.native", INERT),                 // hgext/eol.py:212 config
-    ("eol.only-consistent", INERT),        // hgext/eol.py:149 configbool
+    ("diff-tools.<name>.diffargs", ARGS), // hgext/extdiff.py:801 appended to the command line
+    ("diff-tools.<name>.gui", INERT),     // hgext/extdiff.py:808 configbool
+    ("diff.git", INERT),                  // mercurial/diffutil.py:73 difffeatureopts
+    ("diff.ignoreblanklines", INERT),     // mercurial/diffutil.py:73 difffeatureopts
+    ("diff.ignorews", INERT),             // mercurial/diffutil.py:73 difffeatureopts
+    ("diff.ignorewsamount", INERT),       // mercurial/diffutil.py:73 difffeatureopts
+    ("diff.ignorewseol", INERT),          // mercurial/diffutil.py:73 difffeatureopts
+    ("diff.merge", INERT),                // mercurial/merge_utils/diff.py:26 configbool
+    ("diff.nobinary", INERT),             // mercurial/diffutil.py:73 difffeatureopts
+    ("diff.nodates", INERT),              // mercurial/diffutil.py:73 difffeatureopts
+    ("diff.noprefix", INERT),             // mercurial/diffutil.py:73 difffeatureopts
+    ("diff.showfunc", INERT),             // mercurial/diffutil.py:73 difffeatureopts
+    ("diff.unified", INERT),              // mercurial/diffutil.py:73 difffeatureopts
+    ("diff.word-diff", INERT),            // mercurial/diffutil.py:73 difffeatureopts
+    ("email.bcc", INERT),                 // hgext/patchbomb.py:890 addresses
+    ("email.cc", INERT),                  // hgext/patchbomb.py:890 addresses
+    ("email.charsets", INERT),            // mercurial/mail.py:335 configlist
+    ("email.from", INERT),                // hgext/hooklib/changeset_obsoleted.py:115 config
+    ("email.method", SHELL_GRANTED),      // mercurial/mail.py:201 popen
+    ("email.reply-to", INERT),            // hgext/patchbomb.py:890 addresses
+    ("email.to", INERT),                  // hgext/patchbomb.py:890 addresses
+    ("eol.fix-trailing-newline", INERT),  // hgext/eol.py:152 configbool
+    ("eol.native", INERT),                // hgext/eol.py:212 config
+    ("eol.only-consistent", INERT),       // hgext/eol.py:149 configbool
     ("experimental.archivemetatemplate", INERT), // mercurial/archival.py:119 config
-    ("experimental.auto-publish", INERT),  // mercurial/exchange.py:236 config
+    ("experimental.auto-publish", INERT), // mercurial/exchange.py:236 config
     ("experimental.branch-cache-v3", INERT), // mercurial/branchmap.py:1059 configbool
     ("experimental.bundle-phases", INERT), // mercurial/cmd_impls/bundle.py:214 configbool
     ("experimental.bundle2-advertise", INERT), // mercurial/localrepo.py:1286 configbool
@@ -1440,8 +1660,8 @@ const HG: &[Row] = &[
     ("experimental.bundlecompthreads.gzip", INERT), // mercurial/cmd_impls/bundle.py:197 configint
     ("experimental.bundlecompthreads.none", INERT), // mercurial/cmd_impls/bundle.py:197 configint
     ("experimental.bundlecompthreads.zstd", INERT), // mercurial/cmd_impls/bundle.py:197 configint
-    ("experimental.changegroup4", INERT),  // mercurial/changegroup.py:2633 configbool
-    ("experimental.changegroup5", INERT),  // mercurial/changegroup.py:2614 configbool
+    ("experimental.changegroup4", INERT), // mercurial/changegroup.py:2633 configbool
+    ("experimental.changegroup5", INERT), // mercurial/changegroup.py:2614 configbool
     ("experimental.changelog-v2.compute-rank", INERT), // mercurial/repo/vfs_options.py:147 configbool
     ("experimental.cleanup-as-archived", INERT),       // mercurial/cmdutil.py:934 config
     ("experimental.clientcompressionengines", INERT),  // mercurial/wireprototypes.py:412 configlist
@@ -1521,39 +1741,39 @@ const HG: &[Row] = &[
     ("experimental.worker.repository-upgrade", INERT), // mercurial/upgrade_utils/engine.py:50 configbool
     ("experimental.worker.wdir-get-thread-safe", INERT), // mercurial/merge_utils/update.py:145 configbool
     ("experimental.xdiff", INERT),                       // mercurial/diffutil.py:102 configbool
-    ("extdiff.*", SHELL),                                // hgext/extdiff.py:788 the command line
-    ("extdiff.cmd.<name>", FORCED),                      // hgext/extdiff.py:772 expandpath
+    ("extdiff.*", SHELL_GRANTED),                        // hgext/extdiff.py:788 the command line
+    ("extdiff.cmd.<name>", EXEC_EXPANDED),               // hgext/extdiff.py:772 expandpath
     ("extdiff.gui.<name>", INERT),                       // hgext/extdiff.py:782 configbool
-    ("extdiff.opts.<name>", SHELL), // hgext/extdiff.py:779 appended to the command line
+    ("extdiff.opts.<name>", ARGS), // hgext/extdiff.py:779 appended to the command line
     ("extensions.*:required", INERT), // mercurial/extensions.py:344 parsebool
     ("extensions.<name>", FORCED_UNBANGED), // mercurial/extensions.py:303 loadall
-    ("factotum.executable", SHELL), // hgext/factotum.py:94 os.system
+    ("factotum.executable", SHELL_GRANTED), // hgext/factotum.py:94 os.system
     ("factotum.mountpoint", INERT), // hgext/factotum.py:159 config
-    ("factotum.service", INERT),    // hgext/factotum.py:161 config
+    ("factotum.service", INERT),   // hgext/factotum.py:161 config
     ("fastannotate.client", INERT), // hgext/fastannotate/__init__.py:174 configbool
     ("fastannotate.clientfetchthreshold", INERT), // hgext/fastannotate/protocol.py:222 configint
     ("fastannotate.defaultformat", INERT), // hgext/fastannotate/commands.py:201 configlist
     ("fastannotate.forcefollow", INERT), // hgext/fastannotate/context.py:865 configbool
     ("fastannotate.forcetext", INERT), // hgext/fastannotate/commands.py:275 configbool
     ("fastannotate.mainbranch", INERT), // hgext/fastannotate/commands.py:217 config
-    ("fastannotate.modes", INERT),  // hgext/fastannotate/__init__.py:145 configlist
+    ("fastannotate.modes", INERT), // hgext/fastannotate/__init__.py:145 configlist
     ("fastannotate.perfhack", INERT), // hgext/fastannotate/commands.py:39 configbool
     ("fastannotate.server", INERT), // hgext/fastannotate/__init__.py:163 configbool
     ("fastannotate.serverbuildondemand", INERT), // hgext/fastannotate/protocol.py:59 configbool
     ("fastannotate.unfilteredrepo", INERT), // hgext/fastannotate/commands.py:178 configbool
     ("fastexport.on-pre-existing-gitmodules", INERT), // hgext/fastexport.py:149 config
-    ("fix.*:command", SHELL),       // hgext/fix.py:741 Popen shell=True
-    ("fix.*:enabled", INERT),       // hgext/fix.py:940 configitems
-    ("fix.*:linerange", SHELL),     // hgext/fix.py:741 Popen shell=True
-    ("fix.*:metadata", INERT),      // hgext/fix.py:940 configitems
-    ("fix.*:pattern", INERT),       // hgext/fix.py:940 configitems
-    ("fix.*:priority", INERT),      // hgext/fix.py:940 configitems
-    ("fix.*:skipclean", INERT),     // hgext/fix.py:940 configitems
-    ("fix.failure", INERT),         // hgext/fix.py:206 config
-    ("fix.maxfilesize", INERT),     // hgext/fix.py:421 configbytes
+    ("fix.*:command", SHELL_NOTHING), // hgext/fix.py:741 Popen shell=True
+    ("fix.*:enabled", INERT),      // hgext/fix.py:940 configitems
+    ("fix.*:linerange", ARGS),     // hgext/fix.py:741 Popen shell=True
+    ("fix.*:metadata", INERT),     // hgext/fix.py:940 configitems
+    ("fix.*:pattern", INERT),      // hgext/fix.py:940 configitems
+    ("fix.*:priority", INERT),     // hgext/fix.py:940 configitems
+    ("fix.*:skipclean", INERT),    // hgext/fix.py:940 configitems
+    ("fix.failure", INERT),        // hgext/fix.py:206 config
+    ("fix.maxfilesize", INERT),    // hgext/fix.py:421 configbytes
     ("format.bookmarks-in-store", INERT), // mercurial/repo/creation.py:204 configbool
     ("format.chunkcachesize", INERT), // mercurial/repo/vfs_options.py:158 configint
-    ("format.dotencode", INERT),    // mercurial/repo/creation.py:86 configbool
+    ("format.dotencode", INERT),   // mercurial/repo/creation.py:86 configbool
     ("format.exp-archived-phase", INERT), // mercurial/repo/creation.py:195 configbool
     ("format.exp-use-changelog-v2", INERT), // mercurial/repo/creation.py:179 config
     ("format.exp-use-copies-side-data-changeset", INERT), // mercurial/repo/creation.py:173 configbool
@@ -1610,14 +1830,14 @@ const HG: &[Row] = &[
     ("fsmonitor.warn_update_file_count", INERT), // mercurial/merge.py:1210 configint
     ("fsmonitor.warn_update_file_count_rust", INERT), // mercurial/merge.py:1218 configint
     ("fsmonitor.warn_when_unused", INERT), // mercurial/merge.py:1209 configbool
-    ("fsmonitor.watchman_exe", FORCED),  // hgext/fsmonitor/watchmanclient.py:99 configpath
+    ("fsmonitor.watchman_exe", EXEC_EXPANDED), // hgext/fsmonitor/watchmanclient.py:99 configpath
     ("git.log-index-cache-miss", INERT), // hgext/git/__init__.py:307 configbool
     ("gpg.*", INERT),                    // hgext/gpg.py:260 a key comment
-    ("gpg.cmd", SHELL),                  // hgext/gpg.py:74 the gpg command line
-    ("gpg.key", SHELL),                  // hgext/gpg.py:74 the gpg command line
+    ("gpg.cmd", SHELL_GPG),              // hgext/gpg.py:74 the gpg command line
+    ("gpg.key", ARGS),                   // hgext/gpg.py:74 the gpg command line
     ("help.hidden-command.<name>", INERT), // mercurial/help.py:280 configbool
     ("help.hidden-topic.<name>", INERT), // mercurial/help.py:287 configbool
-    ("hgk.path", SHELL),                 // hgext/hgk.py:386 ui.system
+    ("hgk.path", SHELL_UNGRANTED),       // hgext/hgk.py:386 ui.system
     ("histedit.defaultrev", INERT),      // mercurial/destutil.py:409 config
     ("histedit.dropmissing", INERT),     // hgext/histedit.py:2506 configbool
     ("histedit.later-commits-first", INERT), // hgext/histedit.py:1263 configbool
@@ -1650,148 +1870,148 @@ const HG: &[Row] = &[
     ("lfs.track", INERT),                // hgext/lfs/__init__.py:300 config
     ("lfs.url", URL),                    // hgext/lfs/blobstore.py:750 the blob store URL
     ("lfs.usercache", INERT),            // hgext/largefiles/lfutil.py:83 a cache directory
-    ("logtoprocess.*", SHELL),           // hgext/logtoprocess.py:79 runbgcommand shell=True
-    ("logtoprocess.command", SHELL),     // hgext/logtoprocess.py:79 runbgcommand shell=True
-    ("logtoprocess.commandexception", SHELL), // hgext/logtoprocess.py:79 runbgcommand shell=True
-    ("logtoprocess.commandfinish", SHELL), // hgext/logtoprocess.py:79 runbgcommand shell=True
-    ("logtoprocess.develwarn", SHELL),   // hgext/logtoprocess.py:79 runbgcommand shell=True
-    ("logtoprocess.uiblocked", SHELL),   // hgext/logtoprocess.py:79 runbgcommand shell=True
-    ("merge-patterns.*", FORCED),        // mercurial/filemerge.py:227 findexternaltool
-    ("merge-tools.<name>.args", SHELL),  // mercurial/filemerge.py:765 appended to the command line
+    ("logtoprocess.*", SHELL_NOTHING),   // hgext/logtoprocess.py:79 runbgcommand shell=True
+    ("logtoprocess.command", SHELL_NOTHING), // hgext/logtoprocess.py:79 runbgcommand shell=True
+    ("logtoprocess.commandexception", SHELL_NOTHING), // hgext/logtoprocess.py:79 runbgcommand shell=True
+    ("logtoprocess.commandfinish", SHELL_NOTHING), // hgext/logtoprocess.py:79 runbgcommand shell=True
+    ("logtoprocess.develwarn", SHELL_NOTHING), // hgext/logtoprocess.py:79 runbgcommand shell=True
+    ("logtoprocess.uiblocked", SHELL_NOTHING), // hgext/logtoprocess.py:79 runbgcommand shell=True
+    ("merge-patterns.*", MERGE_TOOL),          // mercurial/filemerge.py:227 findexternaltool
+    ("merge-tools.<name>.args", ARGS), // mercurial/filemerge.py:765 appended to the command line
     ("merge-tools.<name>.binary", INERT), // mercurial/filemerge.py:188 _toolstr
     ("merge-tools.<name>.check", INERT), // mercurial/filemerge.py:1251 _toolstr
     ("merge-tools.<name>.checkchanged", INERT), // mercurial/filemerge.py:1270 _toolstr
-    ("merge-tools.<name>.diffargs", SHELL), // hgext/extdiff.py:801 appended to the command line
-    ("merge-tools.<name>.executable", FORCED), // mercurial/filemerge.py:162 findexe(expandpath)
-    ("merge-tools.<name>.fixeol", INERT), // mercurial/filemerge.py:1286 _toolstr
-    ("merge-tools.<name>.gui", INERT),   // mercurial/filemerge.py:194 _toolstr
-    ("merge-tools.<name>.mergemarkers", INERT), // mercurial/filemerge.py:43 _toolstr
+    ("merge-tools.<name>.diffargs", ARGS), // hgext/extdiff.py:801 appended to the command line
+    ("merge-tools.<name>.executable", EXEC_EXPANDED), // mercurial/filemerge.py:162 findexe(expandpath)
+    ("merge-tools.<name>.fixeol", INERT),             // mercurial/filemerge.py:1286 _toolstr
+    ("merge-tools.<name>.gui", INERT),                // mercurial/filemerge.py:194 _toolstr
+    ("merge-tools.<name>.mergemarkers", INERT),       // mercurial/filemerge.py:43 _toolstr
     ("merge-tools.<name>.mergemarkertemplate", INERT), // mercurial/filemerge.py:43 _toolstr
-    ("merge-tools.<name>.premerge", INERT), // mercurial/filemerge.py:421 _toolstr
-    ("merge-tools.<name>.priority", INERT), // mercurial/filemerge.py:249 _toolstr
-    ("merge-tools.<name>.symlink", INERT), // mercurial/filemerge.py:186 _toolstr
-    ("merge.checkignored", INERT),       // mercurial/merge.py:1705 config
-    ("merge.checkunknown", INERT),       // mercurial/merge.py:1706 config
-    ("merge.disable-partial-tools", INERT), // mercurial/filemerge.py:1145 configbool
-    ("merge.followcopies", INERT),       // mercurial/merge.py:1422 configbool
-    ("merge.on-failure", INERT),         // mercurial/filemerge.py:1221 config
-    ("merge.preferancestor", INERT),     // mercurial/context.py:830 configlist
-    ("merge.strict-capability-check", INERT), // mercurial/filemerge.py:167 configbool
-    ("mq.git", INERT),                   // hgext/mq.py:532 config
-    ("mq.keepchanges", INERT),           // hgext/mq.py:2565 configbool
-    ("mq.plain", INERT),                 // hgext/mq.py:541 configbool
-    ("mq.secret", INERT),                // hgext/mq.py:1218 configbool
-    ("notify.changegroup", INERT),       // hgext/notify.py:352 a template
-    ("notify.diffstat", INERT),          // hgext/notify.py:559 configbool
-    ("notify.domain", INERT),            // hgext/hooklib/changeset_obsoleted.py:66 config
-    ("notify.fromauthor", INERT),        // hgext/notify.py:633 config
-    ("notify.incoming", INERT),          // hgext/notify.py:352 a template
-    ("notify.maxdiff", INERT),           // hgext/notify.py:548 configint
-    ("notify.maxdiffstat", INERT),       // hgext/notify.py:560 configint
-    ("notify.maxsubject", INERT),        // hgext/notify.py:488 configint
-    ("notify.mbox", INERT),              // hgext/notify.py:331 config
-    ("notify.merge", INERT),             // hgext/notify.py:335 configbool
-    ("notify.messageidseed", INERT),     // hgext/hooklib/changeset_obsoleted.py:71 config
-    ("notify.outgoing", INERT),          // hgext/notify.py:352 a template
+    ("merge-tools.<name>.premerge", INERT),           // mercurial/filemerge.py:421 _toolstr
+    ("merge-tools.<name>.priority", INERT),           // mercurial/filemerge.py:249 _toolstr
+    ("merge-tools.<name>.symlink", INERT),            // mercurial/filemerge.py:186 _toolstr
+    ("merge.checkignored", INERT),                    // mercurial/merge.py:1705 config
+    ("merge.checkunknown", INERT),                    // mercurial/merge.py:1706 config
+    ("merge.disable-partial-tools", INERT),           // mercurial/filemerge.py:1145 configbool
+    ("merge.followcopies", INERT),                    // mercurial/merge.py:1422 configbool
+    ("merge.on-failure", INERT),                      // mercurial/filemerge.py:1221 config
+    ("merge.preferancestor", INERT),                  // mercurial/context.py:830 configlist
+    ("merge.strict-capability-check", INERT),         // mercurial/filemerge.py:167 configbool
+    ("mq.git", INERT),                                // hgext/mq.py:532 config
+    ("mq.keepchanges", INERT),                        // hgext/mq.py:2565 configbool
+    ("mq.plain", INERT),                              // hgext/mq.py:541 configbool
+    ("mq.secret", INERT),                             // hgext/mq.py:1218 configbool
+    ("notify.changegroup", INERT),                    // hgext/notify.py:352 a template
+    ("notify.diffstat", INERT),                       // hgext/notify.py:559 configbool
+    ("notify.domain", INERT), // hgext/hooklib/changeset_obsoleted.py:66 config
+    ("notify.fromauthor", INERT), // hgext/notify.py:633 config
+    ("notify.incoming", INERT), // hgext/notify.py:352 a template
+    ("notify.maxdiff", INERT), // hgext/notify.py:548 configint
+    ("notify.maxdiffstat", INERT), // hgext/notify.py:560 configint
+    ("notify.maxsubject", INERT), // hgext/notify.py:488 configint
+    ("notify.mbox", INERT),   // hgext/notify.py:331 config
+    ("notify.merge", INERT),  // hgext/notify.py:335 configbool
+    ("notify.messageidseed", INERT), // hgext/hooklib/changeset_obsoleted.py:71 config
+    ("notify.outgoing", INERT), // hgext/notify.py:352 a template
     ("notify.reply-to-predecessor", INERT), // hgext/notify.py:338 configbool
-    ("notify.showfunc", INERT),          // hgext/notify.py:336 configbool
-    ("notify.sources", INERT),           // hgext/notify.py:427 config
-    ("notify.strip", INERT),             // hgext/notify.py:328 configint
-    ("notify.style", INERT),             // hgext/notify.py:356 config
-    ("notify.template", INERT),          // hgext/notify.py:352 config
-    ("notify.test", INERT),              // hgext/hooklib/changeset_obsoleted.py:122 configbool
-    ("notify_obsoleted.domain", INERT),  // hgext/hooklib/changeset_obsoleted.py:66 config
+    ("notify.showfunc", INERT), // hgext/notify.py:336 configbool
+    ("notify.sources", INERT), // hgext/notify.py:427 config
+    ("notify.strip", INERT),  // hgext/notify.py:328 configint
+    ("notify.style", INERT),  // hgext/notify.py:356 config
+    ("notify.template", INERT), // hgext/notify.py:352 config
+    ("notify.test", INERT),   // hgext/hooklib/changeset_obsoleted.py:122 configbool
+    ("notify_obsoleted.domain", INERT), // hgext/hooklib/changeset_obsoleted.py:66 config
     ("notify_obsoleted.messageidseed", INERT), // hgext/hooklib/changeset_obsoleted.py:69 config
     ("notify_obsoleted.template", INERT), // hgext/hooklib/changeset_obsoleted.py:72 config
-    ("notify_published.domain", INERT),  // hgext/hooklib/changeset_published.py:65 config
+    ("notify_published.domain", INERT), // hgext/hooklib/changeset_published.py:65 config
     ("notify_published.messageidseed", INERT), // hgext/hooklib/changeset_published.py:68 config
     ("notify_published.template", INERT), // hgext/hooklib/changeset_published.py:71 config
-    ("packs.maxchainlen", INERT),        // hgext/remotefilelog/repack.py:591 configint
-    ("packs.maxpacksize", INERT),        // hgext/remotefilelog/repack.py:181 configbytes
-    ("pager.attend", INERT),             // hgext/pager.py:56 configlist
-    ("pager.attend-<name>", INERT),      // mercurial/ui.py:1587 configbool
-    ("pager.ignore", INERT),             // hgext/pager.py:57 configlist
-    ("pager.pager", SHELL),              // mercurial/ui.py:1610 the pager command
-    ("partial-merge-tools.<name>.args", SHELL), // mercurial/filemerge.py:1167 appended to the command line
+    ("packs.maxchainlen", INERT), // hgext/remotefilelog/repack.py:591 configint
+    ("packs.maxpacksize", INERT), // hgext/remotefilelog/repack.py:181 configbytes
+    ("pager.attend", INERT),  // hgext/pager.py:56 configlist
+    ("pager.attend-<name>", INERT), // mercurial/ui.py:1587 configbool
+    ("pager.ignore", INERT),  // hgext/pager.py:57 configlist
+    ("pager.pager", SHELL_NOTHING), // mercurial/ui.py:1610 the pager command
+    ("partial-merge-tools.<name>.args", ARGS), // mercurial/filemerge.py:1167 appended to the command line
     ("partial-merge-tools.<name>.disable", INERT), // mercurial/filemerge.py:1163 configbool
-    ("partial-merge-tools.<name>.executable", EXEC), // mercurial/filemerge.py:1166 shellquote
+    ("partial-merge-tools.<name>.executable", EXEC_GRANTED), // mercurial/filemerge.py:1166 shellquote
     ("partial-merge-tools.<name>.order", INERT), // mercurial/filemerge.py:1165 configint
     ("partial-merge-tools.<name>.patterns", INERT), // mercurial/filemerge.py:1155 configlist
-    ("patch.eol", INERT),                       // mercurial/patch.py:2390 config
-    ("patch.fuzz", INERT),                      // mercurial/patch.py:876 configint
-    ("patchbomb.bcc", INERT),                   // hgext/patchbomb.py:890 addresses
-    ("patchbomb.bundletype", INERT),            // hgext/patchbomb.py:387 config
-    ("patchbomb.cc", INERT),                    // hgext/patchbomb.py:890 addresses
-    ("patchbomb.confirm", INERT),               // hgext/patchbomb.py:925 configbool
-    ("patchbomb.flagtemplate", INERT),          // hgext/patchbomb.py:230 config
-    ("patchbomb.from", INERT),                  // hgext/patchbomb.py:875 config
-    ("patchbomb.intro", INERT),                 // hgext/patchbomb.py:210 config
-    ("patchbomb.publicurl", INERT),             // hgext/patchbomb.py:181 config
-    ("patchbomb.reply-to", INERT),              // hgext/patchbomb.py:890 addresses
-    ("patchbomb.to", INERT),                    // hgext/patchbomb.py:890 addresses
-    ("paths.*:bookmarks.mode", INERT),          // mercurial/utils/urlutil.py:747 pathsuboption
-    ("paths.*:multi-urls", INERT),              // mercurial/utils/urlutil.py:790 pathsuboption
+    ("patch.eol", INERT),                        // mercurial/patch.py:2390 config
+    ("patch.fuzz", INERT),                       // mercurial/patch.py:876 configint
+    ("patchbomb.bcc", INERT),                    // hgext/patchbomb.py:890 addresses
+    ("patchbomb.bundletype", INERT),             // hgext/patchbomb.py:387 config
+    ("patchbomb.cc", INERT),                     // hgext/patchbomb.py:890 addresses
+    ("patchbomb.confirm", INERT),                // hgext/patchbomb.py:925 configbool
+    ("patchbomb.flagtemplate", INERT),           // hgext/patchbomb.py:230 config
+    ("patchbomb.from", INERT),                   // hgext/patchbomb.py:875 config
+    ("patchbomb.intro", INERT),                  // hgext/patchbomb.py:210 config
+    ("patchbomb.publicurl", INERT),              // hgext/patchbomb.py:181 config
+    ("patchbomb.reply-to", INERT),               // hgext/patchbomb.py:890 addresses
+    ("patchbomb.to", INERT),                     // hgext/patchbomb.py:890 addresses
+    ("paths.*:bookmarks.mode", INERT),           // mercurial/utils/urlutil.py:747 pathsuboption
+    ("paths.*:multi-urls", INERT),               // mercurial/utils/urlutil.py:790 pathsuboption
     ("paths.*:pulled-delta-reuse-policy", INERT), // mercurial/utils/urlutil.py:772 pathsuboption
-    ("paths.*:pushrev", EXEMPT),                // mercurial/utils/urlutil.py:735 a revset
-    ("paths.*:pushurl", URL_LIST),              // mercurial/utils/urlutil.py:710 pathsuboption
-    ("paths.<name>", URL_LIST),                 // mercurial/utils/urlutil.py:834 path
-    ("paths.default", URL_LIST),                // mercurial/utils/urlutil.py:834 path
-    ("paths.default-push", URL_LIST),           // mercurial/utils/urlutil.py:834 path
-    ("phabimport.obsolete", INERT),             // hgext/phabricator.py:2202 configbool
-    ("phabimport.secret", INERT),               // hgext/phabricator.py:2200 configbool
-    ("phabricator.batchsize", INERT),           // hgext/phabricator.py:1909 configint
-    ("phabricator.callsign", INERT),            // hgext/phabricator.py:503 config
-    ("phabricator.curlcmd", SHELL),             // hgext/phabricator.py:429 popen2
-    ("phabricator.debug", INERT),               // hgext/phabricator.py:345 configbool
-    ("phabricator.repophid", INERT),            // hgext/phabricator.py:500 config
-    ("phabricator.retry", INERT),               // hgext/phabricator.py:440 configint
-    ("phabricator.retry.interval", INERT),      // hgext/phabricator.py:457 configint
-    ("phabricator.url", INERT),                 // hgext/phabricator.py:2332 config
-    ("phabsend.confirm", INERT),                // hgext/phabricator.py:1429 configbool
-    ("phases.checksubrepos", INERT),            // mercurial/subrepoutil.py:491 config
-    ("phases.new-commit", INERT),               // mercurial/phases.py:1249 config
-    ("phases.publish", INERT),                  // mercurial/localrepo.py:2065 configbool
-    ("profiling.enabled", INERT),               // mercurial/dispatch.py:967 configbool
-    ("profiling.format", INERT),                // mercurial/profiling.py:42 config
-    ("profiling.freq", INERT),                  // mercurial/profiling.py:111 configint
-    ("profiling.limit", INERT),                 // mercurial/profiling.py:44 configint
-    ("profiling.nested", INERT),                // mercurial/profiling.py:45 configint
-    ("profiling.output", INERT),                // mercurial/profiling.py:304 config
-    ("profiling.output-dir", INERT),            // mercurial/profiling.py:311 config
-    ("profiling.output-dir:create", INERT),     // mercurial/profiling.py:314 configbool
-    ("profiling.py-spy.exe", EXEC),             // mercurial/profiling.py:203 Popen
-    ("profiling.py-spy.format", INERT),         // mercurial/profiling.py:207 config
-    ("profiling.py-spy.freq", INERT),           // mercurial/profiling.py:205 configint
-    ("profiling.showmax", INERT),               // mercurial/profiling.py:188 configwith
-    ("profiling.showmin", INERT),               // mercurial/profiling.py:187 configwith
-    ("profiling.showtime", INERT),              // mercurial/profiling.py:194 configbool
-    ("profiling.sort", INERT),                  // mercurial/profiling.py:43 config
-    ("profiling.statformat", INERT),            // mercurial/profiling.py:157 config
-    ("profiling.time-track", INERT),            // mercurial/profiling.py:147 config
-    ("profiling.type", INERT),                  // mercurial/profiling.py:294 config
-    ("progress.assume-tty", INERT),             // mercurial/progress.py:23 configbool
-    ("progress.changedelay", INERT),            // mercurial/progress.py:88 config
-    ("progress.clear-complete", INERT),         // mercurial/progress.py:184 configbool
-    ("progress.debug", INERT),                  // mercurial/scmutil.py:1870 configbool
-    ("progress.delay", INERT),                  // mercurial/progress.py:81 config
-    ("progress.disable", INERT),                // mercurial/ui.py:2282 configbool
-    ("progress.estimateinterval", INERT),       // mercurial/progress.py:91 configwith
-    ("progress.format", INERT),                 // mercurial/progress.py:90 configlist
-    ("progress.refresh", INERT),                // mercurial/progress.py:86 config
-    ("progress.width", INERT),                  // mercurial/progress.py:198 configint
-    ("pull.confirm", INERT),                    // mercurial/exchange.py:1800 configbool
-    ("push.pushvars.server", INERT),            // mercurial/bundle2_part_handlers.py:610 configbool
-    ("rebase.experimental.inmemory", INERT),    // hgext/rebase.py:1057 configbool
-    ("rebase.singletransaction", INERT),        // hgext/rebase.py:1261 configbool
-    ("rebase.store-source", INERT),             // hgext/rebase.py:541 configbool
+    ("paths.*:pushrev", EXEMPT),                 // mercurial/utils/urlutil.py:735 a revset
+    ("paths.*:pushurl", URL_LIST),               // mercurial/utils/urlutil.py:710 pathsuboption
+    ("paths.<name>", URL_LIST),                  // mercurial/utils/urlutil.py:834 path
+    ("paths.default", URL_LIST),                 // mercurial/utils/urlutil.py:834 path
+    ("paths.default-push", URL_LIST),            // mercurial/utils/urlutil.py:834 path
+    ("phabimport.obsolete", INERT),              // hgext/phabricator.py:2202 configbool
+    ("phabimport.secret", INERT),                // hgext/phabricator.py:2200 configbool
+    ("phabricator.batchsize", INERT),            // hgext/phabricator.py:1909 configint
+    ("phabricator.callsign", INERT),             // hgext/phabricator.py:503 config
+    ("phabricator.curlcmd", SHELL_GRANTED),      // hgext/phabricator.py:429 popen2
+    ("phabricator.debug", INERT),                // hgext/phabricator.py:345 configbool
+    ("phabricator.repophid", INERT),             // hgext/phabricator.py:500 config
+    ("phabricator.retry", INERT),                // hgext/phabricator.py:440 configint
+    ("phabricator.retry.interval", INERT),       // hgext/phabricator.py:457 configint
+    ("phabricator.url", INERT),                  // hgext/phabricator.py:2332 config
+    ("phabsend.confirm", INERT),                 // hgext/phabricator.py:1429 configbool
+    ("phases.checksubrepos", INERT),             // mercurial/subrepoutil.py:491 config
+    ("phases.new-commit", INERT),                // mercurial/phases.py:1249 config
+    ("phases.publish", INERT),                   // mercurial/localrepo.py:2065 configbool
+    ("profiling.enabled", INERT),                // mercurial/dispatch.py:967 configbool
+    ("profiling.format", INERT),                 // mercurial/profiling.py:42 config
+    ("profiling.freq", INERT),                   // mercurial/profiling.py:111 configint
+    ("profiling.limit", INERT),                  // mercurial/profiling.py:44 configint
+    ("profiling.nested", INERT),                 // mercurial/profiling.py:45 configint
+    ("profiling.output", INERT),                 // mercurial/profiling.py:304 config
+    ("profiling.output-dir", INERT),             // mercurial/profiling.py:311 config
+    ("profiling.output-dir:create", INERT),      // mercurial/profiling.py:314 configbool
+    ("profiling.py-spy.exe", EXEC_GRANTED),      // mercurial/profiling.py:203 Popen
+    ("profiling.py-spy.format", INERT),          // mercurial/profiling.py:207 config
+    ("profiling.py-spy.freq", INERT),            // mercurial/profiling.py:205 configint
+    ("profiling.showmax", INERT),                // mercurial/profiling.py:188 configwith
+    ("profiling.showmin", INERT),                // mercurial/profiling.py:187 configwith
+    ("profiling.showtime", INERT),               // mercurial/profiling.py:194 configbool
+    ("profiling.sort", INERT),                   // mercurial/profiling.py:43 config
+    ("profiling.statformat", INERT),             // mercurial/profiling.py:157 config
+    ("profiling.time-track", INERT),             // mercurial/profiling.py:147 config
+    ("profiling.type", INERT),                   // mercurial/profiling.py:294 config
+    ("progress.assume-tty", INERT),              // mercurial/progress.py:23 configbool
+    ("progress.changedelay", INERT),             // mercurial/progress.py:88 config
+    ("progress.clear-complete", INERT),          // mercurial/progress.py:184 configbool
+    ("progress.debug", INERT),                   // mercurial/scmutil.py:1870 configbool
+    ("progress.delay", INERT),                   // mercurial/progress.py:81 config
+    ("progress.disable", INERT),                 // mercurial/ui.py:2282 configbool
+    ("progress.estimateinterval", INERT),        // mercurial/progress.py:91 configwith
+    ("progress.format", INERT),                  // mercurial/progress.py:90 configlist
+    ("progress.refresh", INERT),                 // mercurial/progress.py:86 config
+    ("progress.width", INERT),                   // mercurial/progress.py:198 configint
+    ("pull.confirm", INERT),                     // mercurial/exchange.py:1800 configbool
+    ("push.pushvars.server", INERT), // mercurial/bundle2_part_handlers.py:610 configbool
+    ("rebase.experimental.inmemory", INERT), // hgext/rebase.py:1057 configbool
+    ("rebase.singletransaction", INERT), // hgext/rebase.py:1261 configbool
+    ("rebase.store-source", INERT),  // hgext/rebase.py:541 configbool
     ("remotefilelog.backgroundprefetch", INERT), // hgext/remotefilelog/__init__.py:1060 configbool
-    ("remotefilelog.backgroundrepack", INERT),  // hgext/remotefilelog/__init__.py:1040 configbool
+    ("remotefilelog.backgroundrepack", INERT), // hgext/remotefilelog/__init__.py:1040 configbool
     ("remotefilelog.batchsize", INERT), // hgext/remotefilelog/fileserverclient.py:449 configint
     ("remotefilelog.bgprefetchrevs", INERT), // hgext/remotefilelog/__init__.py:1034 config
     ("remotefilelog.cachegroup", INERT), // hgext/remotefilelog/shallowutil.py:486 config
     ("remotefilelog.cachelimit", INERT), // hgext/remotefilelog/basestore.py:373 configbytes
     ("remotefilelog.cachepath", INERT), // hgext/remotefilelog/shallowutil.py:51 config
-    ("remotefilelog.cacheprocess", SHELL), // hgext/remotefilelog/fileserverclient.py:317 popen4
+    ("remotefilelog.cacheprocess", SHELL_GRANTED), // hgext/remotefilelog/fileserverclient.py:317 popen4
     ("remotefilelog.cacheprocess.includepath", INERT), // hgext/remotefilelog/fileserverclient.py:323 configbool
     ("remotefilelog.data.gencountlimit", INERT), // hgext/remotefilelog/repack.py:273 configint
     ("remotefilelog.data.generations", INERT),   // hgext/remotefilelog/repack.py:274 configlist
@@ -1831,7 +2051,7 @@ const HG: &[Row] = &[
     ("rewrite.empty-successor", INERT),        // mercurial/rewriteutil.py:198 config
     ("rewrite.update-timestamp", INERT),       // hgext/histedit.py:604 configbool
     ("rhg.cat", INERT),                        // rust/rhg/src/main.rs:374 config
-    ("rhg.fallback-executable", EXEC),         // rust/rhg/src/main.rs:967 Command::new
+    ("rhg.fallback-executable", EXEC_UNGRANTED), // rust/rhg/src/main.rs:967 Command::new
     ("rhg.fallback-immediately", INERT),       // rust/rhg/src/main.rs:374 config
     ("rhg.ignored-extensions", INERT),         // rust/rhg/src/main.rs:374 config
     ("rhg.on-unsupported", INERT),             // rust/rhg/src/main.rs:374 config
@@ -1917,7 +2137,7 @@ const HG: &[Row] = &[
     ("templatealias.*", INERT),                    // mercurial/formatter.py:672 configitems
     ("templateconfig.*", INERT), // mercurial/templatefuncs.py:363 the config() template function
     ("templates.*", INERT),      // mercurial/formatter.py:677 configitems
-    ("transplant.filter", SHELL), // hgext/transplant.py:806 ui.system
+    ("transplant.filter", SHELL_GRANTED), // hgext/transplant.py:806 ui.system
     ("transplant.log", INERT),   // hgext/transplant.py:803 config
     ("trusted.groups", INERT),   // mercurial/ui.py:673 configlist
     ("trusted.users", INERT),    // mercurial/ui.py:672 configlist
@@ -1933,10 +2153,10 @@ const HG: &[Row] = &[
     ("ui.commitsubrepos", INERT), // mercurial/commands.py:2008 configbool
     ("ui.debug", INERT),         // mercurial/ui.py:658 configbool
     ("ui.detailed-exit-code", INERT), // mercurial/chgserver.py:552 configbool
-    ("ui.editor", SHELL),        // mercurial/ui.py:2273 ui.system
+    ("ui.editor", SHELL_GRANTED), // mercurial/ui.py:2273 ui.system
     ("ui.fallbackencoding", INERT), // mercurial/dispatch.py:998 config
     ("ui.forcecwd", INERT),      // mercurial/dirstate.py:592 config
-    ("ui.forcemerge", FORCED),   // mercurial/filemerge.py:202 findexternaltool
+    ("ui.forcemerge", MERGE_TOOL), // mercurial/filemerge.py:202 findexternaltool
     ("ui.formatdebug", INERT),   // mercurial/formatter.py:841 configbool
     ("ui.formatjson", INERT),    // mercurial/formatter.py:844 configbool
     ("ui.formatted", INERT),     // hgext/mq.py:2257 configbool/plain
@@ -1946,24 +2166,24 @@ const HG: &[Row] = &[
     ("ui.interface.histedit", INERT), // mercurial/ui.py:1792 config
     ("ui.large-file-limit", INERT), // mercurial/context.py:1841 configbytes
     ("ui.logblockedtimes", INERT), // mercurial/ui.py:668 configbool
-    ("ui.merge", FORCED),        // mercurial/filemerge.py:256 findexternaltool
+    ("ui.merge", MERGE_TOOL),    // mercurial/filemerge.py:256 findexternaltool
     ("ui.mergemarkers", INERT),  // mercurial/filemerge.py:1070 config
     ("ui.message-output", INERT), // mercurial/commandserver.py:260 config
     ("ui.nontty", INERT),        // mercurial/ui.py:1525 configbool
     ("ui.origbackuppath", INERT), // mercurial/merge.py:1779 config
     ("ui.paginate", INERT),      // mercurial/ui.py:1586 configbool
-    ("ui.patch", SHELL),         // mercurial/patch.py:2458 popen
+    ("ui.patch", SHELL_GRANTED), // mercurial/patch.py:2458 popen
     ("ui.portablefilenames", INERT), // mercurial/scmutil.py:384 config
     ("ui.promptecho", INERT),    // mercurial/ui.py:1977 configbool
     ("ui.quiet", INERT),         // mercurial/ui.py:660 configbool
     ("ui.quietbookmarkmove", INERT), // mercurial/bookmarks.py:720 configbool
     ("ui.relative-paths", INERT), // mercurial/scmutil.py:1029 config
-    ("ui.remotecmd", SHELL),     // mercurial/sshpeer.py:687 the ssh command line
+    ("ui.remotecmd", SHELL_GRANTED), // mercurial/sshpeer.py:687 the ssh command line
     ("ui.report_untrusted", INERT), // mercurial/ui.py:663 configbool
     ("ui.rollback", INERT),      // mercurial/commands.py:6031 configbool
     ("ui.signal-safe-lock", INERT), // mercurial/localrepo.py:2906 configbool
     ("ui.slash", INERT),         // mercurial/debugcommands.py:4430 configbool
-    ("ui.ssh", SHELL),           // mercurial/sshpeer.py:686 the ssh command line
+    ("ui.ssh", SHELL_SSH),       // mercurial/sshpeer.py:686 the ssh command line
     ("ui.ssherrorhint", INERT),  // mercurial/sshpeer.py:270 config
     ("ui.statuscopies", INERT),  // mercurial/commands.py:6596 configbool
     ("ui.strict", INERT),        // mercurial/dispatch.py:790 configbool
@@ -2193,6 +2413,9 @@ const HG_KEY_TOOLS: &[(&str, KeyTool)] = &[
     ("merge-tools", KeyTool::FirstSegment), // mercurial/filemerge.py:247 _picktool
     ("partial-merge-tools", KeyTool::FirstSegment), // mercurial/filemerge.py:1152
 ];
+
+/// What Mercurial appends to a program a key names: the files it merges or compares, as to a tool's `.executable` (`filemerge.py:765`, `extdiff.py:252`).
+pub const HG_TOOL_APPENDS: Appends = Appends::Granted(Contract::None);
 
 /// The Mercurial sections whose keys carry a name (`<name>`, `*`) that runs no program, each with why.
 const HG_NAME_NOT_PROGRAM: &[(&str, &str)] = &[
@@ -2954,27 +3177,33 @@ mod tests {
     fn rows_disjoint_rejects_overlap() {
         // `a.b.k` matches both, and neither row is more specific in both parts.
         assert!(!decided(
-            &[("a.<n>.k", EXEC), ("a.b.*", EXEMPT)],
+            &[("a.<n>.k", EXEC_GRANTED), ("a.b.*", EXEMPT)],
             Shape::Git
         ));
         // Controls: the rows agree, or one is more specific in both parts.
-        assert!(decided(&[("a.<n>.k", EXEC), ("a.b.*", EXEC)], Shape::Git));
         assert!(decided(
-            &[("a.<n>.*", EXEMPT), ("a.<n>.k", EXEC)],
+            &[("a.<n>.k", EXEC_GRANTED), ("a.b.*", EXEC_GRANTED)],
             Shape::Git
         ));
-        assert!(decided(&[("a.<n>.k", EXEC), ("b.c.*", EXEMPT)], Shape::Git));
+        assert!(decided(
+            &[("a.<n>.*", EXEMPT), ("a.<n>.k", EXEC_GRANTED)],
+            Shape::Git
+        ));
+        assert!(decided(
+            &[("a.<n>.k", EXEC_GRANTED), ("b.c.*", EXEMPT)],
+            Shape::Git
+        ));
         // A prefixed subsection is more specific than any subsection.
         assert!(decided(
-            &[("a.<n>.*", EXEMPT), ("a.p.<n>.k", EXEC)],
+            &[("a.<n>.*", EXEMPT), ("a.p.<n>.k", EXEC_GRANTED)],
             Shape::Git
         ));
         assert!(!decided(
-            &[("a.p.<n>.k", EXEMPT), ("a.p.q.*", EXEC)],
+            &[("a.p.<n>.k", EXEMPT), ("a.p.q.*", EXEC_GRANTED)],
             Shape::Git
         ));
         assert!(decided(
-            &[("a.p.<n>.k", EXEMPT), ("a.pq.*", EXEC)],
+            &[("a.p.<n>.k", EXEMPT), ("a.pq.*", EXEC_GRANTED)],
             Shape::Git
         ));
         // A Mercurial `<name>` key and a `*:<option>` key never match one key, and a named key is more specific than either.
@@ -2992,34 +3221,46 @@ mod tests {
         ));
         // `p.x.y.k` has both prefixes, `p.x.b.a` both suffixes, `p.x.<n>.a` a prefix and a suffix.
         assert!(!decided(
-            &[("p.x.<n>", EXEC), ("p.x.y.<n>", EXEMPT)],
+            &[("p.x.<n>", EXEC_GRANTED), ("p.x.y.<n>", EXEMPT)],
             Shape::Hg
         ));
         assert!(!decided(
-            &[("p.<n>.a", EXEC), ("p.<n>.b.a", EXEMPT)],
+            &[("p.<n>.a", EXEC_GRANTED), ("p.<n>.b.a", EXEMPT)],
             Shape::Hg
         ));
         assert!(!decided(
-            &[("p.<n>.a", EXEC), ("p.x.<n>", EXEMPT)],
+            &[("p.<n>.a", EXEC_GRANTED), ("p.x.<n>", EXEMPT)],
             Shape::Hg
         ));
         // Controls: no key has both affixes, or one row is more specific.
         assert!(decided(
-            &[("p.x.<n>", EXEC), ("p.xy.<n>", EXEMPT)],
+            &[("p.x.<n>", EXEC_GRANTED), ("p.xy.<n>", EXEMPT)],
             Shape::Hg
         ));
         assert!(decided(
-            &[("p.<n>.a", EXEC), ("p.<n>.ba", EXEMPT)],
+            &[("p.<n>.a", EXEC_GRANTED), ("p.<n>.ba", EXEMPT)],
             Shape::Hg
         ));
-        assert!(decided(&[("p.<n>", EXEMPT), ("p.x.<n>", EXEC)], Shape::Hg));
-        assert!(decided(&[("p.<n>.a", EXEC), ("p.k.a", EXEMPT)], Shape::Hg));
+        assert!(decided(
+            &[("p.<n>", EXEMPT), ("p.x.<n>", EXEC_GRANTED)],
+            Shape::Hg
+        ));
+        assert!(decided(
+            &[("p.<n>.a", EXEC_GRANTED), ("p.k.a", EXEMPT)],
+            Shape::Hg
+        ));
     }
 
     #[test]
     fn malformed_or_unordered_rows_refused() {
-        assert!(!decided(&[("a.z", EXEC), ("a.b", EXEC)], Shape::Git));
-        assert!(!decided(&[("a.B", EXEC), ("a.b", EXEMPT)], Shape::Git));
+        assert!(!decided(
+            &[("a.z", EXEC_GRANTED), ("a.b", EXEC_GRANTED)],
+            Shape::Git
+        ));
+        assert!(!decided(
+            &[("a.B", EXEC_GRANTED), ("a.b", EXEMPT)],
+            Shape::Git
+        ));
         for spelling in [
             "a..b",
             "a.<n.k",
@@ -3029,7 +3270,10 @@ mod tests {
             "a.<n>x.k",
             "a.<n>.<m>.k",
         ] {
-            assert!(!decided(&[(spelling, EXEC)], Shape::Git), "{spelling}");
+            assert!(
+                !decided(&[(spelling, EXEC_GRANTED)], Shape::Git),
+                "{spelling}"
+            );
         }
         for spelling in [
             "a.*:",
@@ -3043,14 +3287,23 @@ mod tests {
             "a.x.<>",
             "a.x.<n>.<m>",
         ] {
-            assert!(!decided(&[(spelling, EXEC)], Shape::Hg), "{spelling}");
+            assert!(
+                !decided(&[(spelling, EXEC_GRANTED)], Shape::Hg),
+                "{spelling}"
+            );
         }
         // Controls.
-        assert!(decided(&[("a.b", EXEC), ("a.z", EXEC)], Shape::Git));
-        assert!(decided(&[("a.p.<n>.k", EXEC)], Shape::Git));
-        assert!(decided(&[("a.b.c", EXEC)], Shape::Hg));
+        assert!(decided(
+            &[("a.b", EXEC_GRANTED), ("a.z", EXEC_GRANTED)],
+            Shape::Git
+        ));
+        assert!(decided(&[("a.p.<n>.k", EXEC_GRANTED)], Shape::Git));
+        assert!(decided(&[("a.b.c", EXEC_GRANTED)], Shape::Hg));
         for spelling in ["a.x.<n>", "a.x-<n>", "a.<n>.y.z", "a.*:y.z"] {
-            assert!(decided(&[(spelling, EXEC)], Shape::Hg), "{spelling}");
+            assert!(
+                decided(&[(spelling, EXEC_GRANTED)], Shape::Hg),
+                "{spelling}"
+            );
         }
     }
 
@@ -3113,6 +3366,182 @@ mod tests {
         assert_eq!(git("http", Some("https://h"), "frobnicate"), None);
     }
 
+    /// Every program row admitting more than `Granted(Contract::None)` does, with the tool source proving it.
+    const APPENDS_CITED: &[(&str, &str, &str)] = &[
+        ("git", "core.pager", "pager.c:98 stdin only"),
+        (
+            "git",
+            "core.sshCommand",
+            "connect.c:1154-1161 determine_ssh_variant; :1295-1340 options and host",
+        ),
+        (
+            "git",
+            "difftool.<tool>.cmd",
+            "git-mergetool--lib.sh eval; operands only as $LOCAL",
+        ),
+        (
+            "git",
+            "filter.<driver>.process",
+            "sub-process.c:87 the command alone",
+        ),
+        (
+            "git",
+            "gpg.<format>.program",
+            "gpg-interface.c:75/85/95 defaults; :338-342, :929 temp files",
+        ),
+        (
+            "git",
+            "gpg.program",
+            "gpg-interface.c:75/85/95 defaults; :338-342, :929 temp files",
+        ),
+        (
+            "git",
+            "gpg.ssh.defaultKeyCommand",
+            "gpg-interface.c:760-771 split_cmdline, no operand",
+        ),
+        (
+            "git",
+            "guitool.<name>.cmd",
+            "git-gui/lib/tools.tcl:113/120 sh -c, environment only",
+        ),
+        ("git", "imap.tunnel", "imap-send.c stdin and stdout tunnel"),
+        ("git", "interactive.diffFilter", "add-patch.c:441-445 stdin"),
+        (
+            "git",
+            "lfs.customtransfer.<name>.path",
+            "git-lfs tq/custom.go: operands from .args only",
+        ),
+        (
+            "git",
+            "mergetool.<tool>.cmd",
+            "git-mergetool--lib.sh eval; operands only as $LOCAL",
+        ),
+        ("git", "pager.<cmd>", "pager.c:98 stdin only"),
+        ("git", "tar.<format>.command", "archive-tar.c stdin"),
+        (
+            "git",
+            "trailer.<token>.command",
+            "trailer.c: $ARG substitution only",
+        ),
+        ("hg", "fix.*:command", "hgext/fix.py:741 stdin"),
+        ("hg", "gpg.cmd", "hgext/gpg.py:74/90-98 temp files"),
+        (
+            "hg",
+            "logtoprocess.*",
+            "hgext/logtoprocess.py:79 environment",
+        ),
+        (
+            "hg",
+            "logtoprocess.command",
+            "hgext/logtoprocess.py:79 environment",
+        ),
+        (
+            "hg",
+            "logtoprocess.commandexception",
+            "hgext/logtoprocess.py:79 environment",
+        ),
+        (
+            "hg",
+            "logtoprocess.commandfinish",
+            "hgext/logtoprocess.py:79 environment",
+        ),
+        (
+            "hg",
+            "logtoprocess.develwarn",
+            "hgext/logtoprocess.py:79 environment",
+        ),
+        (
+            "hg",
+            "logtoprocess.uiblocked",
+            "hgext/logtoprocess.py:79 environment",
+        ),
+        ("hg", "pager.pager", "mercurial/ui.py:1610 stdin"),
+        ("hg", "ui.ssh", "mercurial/sshpeer.py:686 host"),
+    ];
+
+    /// Whether `rule` runs a program fed nothing, or fed operands a named contract proves.
+    const fn admits_beyond_none(rule: Rule) -> bool {
+        let appends = match rule {
+            Rule::Consume(
+                Consume::Shell(appends)
+                | Consume::Bang(appends)
+                | Consume::Exec(appends)
+                | Consume::ExecExpanded(appends)
+                | Consume::ExecAbsolute(appends),
+            ) => appends,
+            Rule::Consume(
+                Consume::Exempt
+                | Consume::Inert
+                | Consume::Args
+                | Consume::MergeTool
+                | Consume::Composed(_)
+                | Consume::ToolName
+                | Consume::Load(_)
+                | Consume::Url { .. }
+                | Consume::UrlList
+                | Consume::RemoteName
+                | Consume::PythonHook,
+            )
+            | Rule::AsUnscoped => return false,
+        };
+        matches!(
+            appends,
+            Appends::Nothing
+                | Appends::Granted(
+                    Contract::SshClient | Contract::Gpg | Contract::CredentialHelper
+                )
+                | Appends::Substitutes(
+                    Contract::SshClient | Contract::Gpg | Contract::CredentialHelper
+                )
+        )
+    }
+
+    #[test]
+    fn appends_rows_cited() {
+        let rowed: Vec<(&str, &str)> = [("git", GIT), ("hg", HG)]
+            .into_iter()
+            .flat_map(|(tool, rows)| {
+                rows.iter()
+                    .filter(|(_, rule)| admits_beyond_none(*rule))
+                    .map(move |(spelling, _)| (tool, *spelling))
+            })
+            .collect();
+        let cited: Vec<(&str, &str)> = APPENDS_CITED
+            .iter()
+            .map(|(tool, spelling, source)| {
+                assert!(!source.is_empty(), "{spelling}");
+                (*tool, *spelling)
+            })
+            .collect();
+        let uncited: Vec<&(&str, &str)> = rowed.iter().filter(|row| !cited.contains(row)).collect();
+        let unrowed: Vec<&(&str, &str)> = cited.iter().filter(|row| !rowed.contains(row)).collect();
+        assert!(uncited.is_empty(), "rows without a citation: {uncited:?}");
+        assert!(unrowed.is_empty(), "citations without a row: {unrowed:?}");
+    }
+
+    #[test]
+    fn contracts_admit_only_their_programs() {
+        assert!(Contract::SshClient.admits("ssh"));
+        assert!(Contract::SshClient.admits("PLINK.EXE"));
+        assert!(Contract::SshClient.admits("TortoisePlink.exe"));
+        assert!(!Contract::SshClient.admits("sh"));
+        assert!(!Contract::SshClient.admits("ssh-keygen"));
+        assert!(Contract::Gpg.admits("gpg"));
+        assert!(Contract::Gpg.admits("gpgsm"));
+        assert!(Contract::Gpg.admits("ssh-keygen"));
+        assert!(!Contract::Gpg.admits("gpg2"));
+        assert!(!Contract::Gpg.admits("GPG"));
+        assert!(Contract::CredentialHelper.admits("git-credential-store"));
+        assert!(!Contract::CredentialHelper.admits("sh"));
+        assert!(!Contract::None.admits("ssh"));
+        assert!(!Contract::None.admits(""));
+        assert!(is_hg_internal_tool(":merge3"));
+        assert!(is_hg_internal_tool("internal:merge"));
+        assert!(!is_hg_internal_tool("merge3"));
+        assert!(!is_hg_internal_tool(":evil"));
+        assert!(!is_hg_internal_tool("internal:"));
+    }
+
     #[test]
     fn every_documented_hg_key_has_one_row_or_a_reason() {
         let documented = hg_snapshot();
@@ -3172,7 +3601,7 @@ mod tests {
     fn scoped_key_takes_the_unscoped_row() {
         assert_eq!(
             git("sendemail", Some("work"), "tocmd"),
-            Some(Consume::Shell)
+            Some(Consume::Shell(Appends::Granted(Contract::None)))
         );
         assert_eq!(
             git("credential", Some("https://h"), "helper"),
@@ -3185,7 +3614,7 @@ mod tests {
         assert_eq!(git("merge", None, "TOOL"), Some(Consume::ToolName));
         assert_eq!(
             git("lfs", Some("customtransfer.x"), "path"),
-            Some(Consume::Exec)
+            Some(Consume::Exec(Appends::Nothing))
         );
         assert_eq!(
             git("gitflow", Some("path"), "hooks"),
@@ -3213,20 +3642,26 @@ mod tests {
         assert_eq!(hg("paths", "default:pushurl"), Some(Consume::UrlList));
         assert_eq!(hg("paths", "default:pushrev"), Some(Consume::Exempt));
         assert_eq!(hg("paths", "default:bookmarks.mode"), Some(Consume::Inert));
-        assert_eq!(hg("merge-tools", "kdiff3.args"), Some(Consume::Shell));
+        assert_eq!(hg("merge-tools", "kdiff3.args"), Some(Consume::Args));
         assert_eq!(
             hg("merge-tools", "kdiff3.executable"),
-            Some(Consume::Load(Load::Forced))
+            Some(Consume::ExecExpanded(Appends::Granted(Contract::None)))
         );
         assert_eq!(hg("merge-tools", "kdiff3.priority"), Some(Consume::Inert));
-        assert_eq!(hg("extdiff", "opts.vd"), Some(Consume::Shell));
+        assert_eq!(hg("extdiff", "opts.vd"), Some(Consume::Args));
         assert_eq!(hg("extdiff", "gui.vd"), Some(Consume::Inert));
-        assert_eq!(hg("extdiff", "cmd.vd"), Some(Consume::Load(Load::Forced)));
-        assert_eq!(hg("extdiff", "vd"), Some(Consume::Shell));
+        assert_eq!(
+            hg("extdiff", "cmd.vd"),
+            Some(Consume::ExecExpanded(Appends::Granted(Contract::None)))
+        );
+        assert_eq!(
+            hg("extdiff", "vd"),
+            Some(Consume::Shell(Appends::Granted(Contract::None)))
+        );
         assert_eq!(hg("hooks", "commit"), Some(Consume::PythonHook));
         assert_eq!(hg("hooks", "priority.commit"), Some(Consume::Inert));
         assert_eq!(hg("hooks", "commit:run-with-plain"), Some(Consume::Inert));
-        assert_eq!(hg("alias", "st"), Some(Consume::Bang));
+        assert_eq!(hg("alias", "st"), Some(Consume::Bang(Appends::Ungranted)));
         assert_eq!(hg("alias", "st:doc"), Some(Consume::Inert));
         assert_eq!(
             hg("extensions", "rebase"),
@@ -3234,7 +3669,10 @@ mod tests {
         );
         assert_eq!(hg("extensions", "rebase:required"), Some(Consume::Inert));
         assert_eq!(hg("pager", "attend-log"), Some(Consume::Inert));
-        assert_eq!(hg("fix", "black:command"), Some(Consume::Shell));
+        assert_eq!(
+            hg("fix", "black:command"),
+            Some(Consume::Shell(Appends::Nothing))
+        );
         assert_eq!(hg("ui", "mergemarkers"), Some(Consume::Inert));
         assert_eq!(hg("UI", "username"), None);
         assert!(jj_exempt("templates"));
@@ -3257,7 +3695,11 @@ mod tests {
     #[test]
     fn hg_name_sections_all_decided() {
         assert!(name_sections_decided(HG, HG_KEY_TOOLS, HG_NAME_NOT_PROGRAM));
-        let rows: &[Row] = &[("a.<name>.k", INERT), ("b.*", SHELL), ("c.k", INERT)];
+        let rows: &[Row] = &[
+            ("a.<name>.k", INERT),
+            ("b.*", SHELL_NOTHING),
+            ("c.k", INERT),
+        ];
         let tools: &[(&str, KeyTool)] = &[("a", KeyTool::FirstSegment)];
         assert!(name_sections_decided(rows, tools, &[("b", "why")]));
         // A section whose keys carry a name, decided by neither list.

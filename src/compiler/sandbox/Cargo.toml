@@ -31,6 +31,10 @@ toml = "0.8"
 # private-scratch and jail-dir ownership checks compare against, obtained
 # without `unsafe`.
 rustix = { version = "0.38", features = ["fs", "process"] }
+# The runtime descriptor floor every jail spawn and exec goes through: the child
+# inherits stdio and only the sealed descriptors its argv names, which stay
+# close-on-exec in this process.
+ipe-runtime-rust = { path = "../../runtime/rust", default-features = false }
 
 # The Windows run-jail arm builds its confinement primitives through the Win32
 # kernel API (Job Object, AppContainer lowbox token, capability SIDs, ACLs,

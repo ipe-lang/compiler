@@ -31,6 +31,7 @@ members = [
     "src/ipe-docs",
     "tools/e2e-support",
     "tools/test-temp",
+    "tools/nesting-shapes",
     "src/runtime/rust",
     "tools/ipe-ffi-inspector",
     "tools/regen-goldens",

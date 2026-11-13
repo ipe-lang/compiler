@@ -559,37 +559,28 @@ fn run_in_filtered_bwrap_jail(
     payload: &[OsString],
     allow_subprocess: bool,
 ) -> Result<JailedOutput, SandboxDefect> {
-    // The proof's canary jails run before the seccomp fd below turns
-    // inheritable, so none of them can inherit it.
     let (scope, timeout) = proven_scope(caps)?;
     let Some(program) = seccomp::subprocess_deny_program(allow_subprocess) else {
         // No filter can be compiled here — refuse rather than run unfiltered.
         return Err(SandboxDefect::NoIsolationMechanism);
     };
-    // The memfd is owned in the PARENT so it is closed on return — this launcher
-    // `spawn`s (not `exec`s) and the server is long-lived, so a leaked fd per
-    // request would exhaust the process's file-descriptor limit. The child gets
-    // its own inherited copy across `spawn`, so closing the parent's copy after
-    // the run does not disturb the jailed process.
     let owned = run_jail::write_seccomp_memfd(&program).map_err(|d| SandboxDefect::Spawn {
         program: "seccomp".to_owned(),
         detail: d.to_string(),
     })?;
-    // The sealed seccomp fd MUST be inheritable so bwrap reads the filter from it
-    // across the spawn. Clearing close-on-exec here, in the parent, refuses the
-    // run (fail-closed) when the flag cannot be cleared, rather than run the
-    // payload without its filter.
-    // Known limit: between this close-on-exec clear and the spawn, a sibling child
-    // forked by another thread inherits the same open file description. The seal
-    // blocks writes, not a shared-offset `lseek`/`read`, so this fd must reach only
-    // its one child.
-    let seccomp_fd = owned.make_inheritable().map_err(|e| SandboxDefect::Spawn {
-        program: "seccomp".to_owned(),
-        detail: format!("clearing close-on-exec on the seccomp memfd failed: {e}"),
-    })?;
-    let out = run_bwrap(&scope, timeout, spec, payload, &seccomp_fd);
-    drop(owned);
-    out
+    // The launch hands bwrap stdio and this sealed filter alone. Its parent copy
+    // stays close-on-exec, so no sibling child inherits it, and closes when the
+    // spawn returns, so this long-lived process leaks no descriptor per run.
+    let launch = owned
+        .launch(|fd| bwrap_argv_with_seccomp(&scope, timeout, spec, payload, &fd))
+        .map_err(|refusal| match refusal {
+            run_jail::LaunchRefusal::Render(defect) => defect,
+            run_jail::LaunchRefusal::Handoff(defect) => SandboxDefect::Spawn {
+                program: "bwrap".to_owned(),
+                detail: defect.to_string(),
+            },
+        })?;
+    run_bwrap(launch, spec.limits.out_cap_bytes)
 }
 
 /// Refuse every bubblewrap payload jail on a target with no seccomp filter.
@@ -615,43 +606,25 @@ fn run_in_filtered_bwrap_jail(
     Err(SandboxDefect::NoIsolationMechanism)
 }
 
-/// The shared spawn+drain core for every bubblewrap payload jail.
+/// The shared spawn+drain core for every bubblewrap payload jail: start
+/// `launch` through the runtime descriptor floor with stdin from `/dev/null`,
+/// then drain its piped output under `cap`.
 ///
-/// `--seccomp <fd>` is inserted into the bwrap argv; the caller owns that
-/// sealed fd and has already made it inheritable, so bwrap reads the filter
-/// from it across the exec.
-// Reached only through the seccomp-carrying jail, which exists only where a
-// filter can be compiled; elsewhere nothing calls it.
-#[cfg_attr(
-    not(all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    )),
-    allow(dead_code)
-)]
-fn run_bwrap(
-    scope: &run_jail::NprocScope,
-    timeout: &ToolPath,
-    spec: &JailSpec,
-    payload: &[OsString],
-    seccomp_fd: &run_jail::SeccompFdNumber<'_>,
-) -> Result<JailedOutput, SandboxDefect> {
-    let argv = bwrap_argv_with_seccomp(scope, timeout, spec, payload, seccomp_fd)?;
-    let (program, rest) = argv
-        .args()
-        .split_first()
-        .ok_or(SandboxDefect::NoIsolationMechanism)?;
-    let spawn_err = |e: std::io::Error| SandboxDefect::Spawn {
-        program: program.to_string_lossy().into_owned(),
-        detail: e.to_string(),
-    };
-    let mut cmd = std::process::Command::new(program);
-    cmd.args(rest)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let child = cmd.spawn().map_err(spawn_err)?;
-    drain_and_reap(child, spec.limits.out_cap_bytes, program)
+/// Reached only through the seccomp-carrying jail, which exists only where a
+/// filter can be compiled.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn run_bwrap(launch: run_jail::JailLaunch, cap: u64) -> Result<JailedOutput, SandboxDefect> {
+    let program = launch.program().to_owned();
+    let child = launch
+        .spawn(std::process::Stdio::piped(), std::process::Stdio::piped())
+        .map_err(|defect| SandboxDefect::Spawn {
+            program: program.to_string_lossy().into_owned(),
+            detail: defect.to_string(),
+        })?;
+    drain_and_reap(child, cap, &program)
 }
 
 /// Which jailed stream a drain thread read.
@@ -675,6 +648,15 @@ struct DrainOutcome {
 /// reader. Each stream is read in its own thread, and every thread reports
 /// through one channel so the parent reacts to whichever finishes first rather
 /// than blocking on a fixed join order.
+// Reached only through the seccomp-carrying jail, which exists only where a
+// filter can be compiled; elsewhere nothing calls it.
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )),
+    allow(dead_code)
+)]
 fn drain_and_reap(
     mut child: std::process::Child,
     cap: u64,
@@ -790,6 +772,15 @@ fn drain_and_reap(
 /// argv, the seccomp flag cannot be attached to bwrap — dropping it would run
 /// the payload without its syscall filter (fail-open). The refusal here keeps
 /// the seccomp guarantee: no filter, no run.
+// Reached only through the seccomp-carrying jail, which exists only where a
+// filter can be compiled; elsewhere nothing calls it.
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )),
+    allow(dead_code)
+)]
 fn bwrap_argv_with_seccomp<'fd>(
     scope: &run_jail::NprocScope,
     timeout: &ToolPath,
@@ -1477,5 +1468,468 @@ mod tests {
             .filter(|a| a.as_os_str() == "--seccomp")
             .count();
         assert_eq!(seccomp_flags, 1, "the payload argv must carry the filter");
+    }
+
+    /// One token of Rust source: a word (an identifier, keyword or number; a
+    /// raw `r#` identifier without its prefix) or one punctuation character.
+    /// Whitespace, comments, and string and character literals yield none.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Token<'s> {
+        Word(&'s str),
+        Punct(char),
+    }
+
+    /// The tokens of `source`.
+    fn lex(source: &str) -> Vec<Token<'_>> {
+        let chars: Vec<(usize, char)> = source.char_indices().collect();
+        let at = |i: usize| chars.get(i).map(|&(_, c)| c);
+        let offset = |i: usize| chars.get(i).map_or(source.len(), |&(o, _)| o);
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let word_end = |mut i: usize| {
+            while at(i).is_some_and(is_word) {
+                i = i.saturating_add(1);
+            }
+            i
+        };
+        // The index past a string body starting at `i`: an escaped string
+        // closes at an unescaped `"`, a raw one at `"` and its `#`s.
+        let string_end = |mut i: usize, raw_hashes: Option<usize>| loop {
+            match (at(i), raw_hashes) {
+                (None, _) => break i,
+                (Some('\\'), None) => i = i.saturating_add(2),
+                (Some('"'), None) => break i.saturating_add(1),
+                (Some('"'), Some(hashes)) => {
+                    let tail = i.saturating_add(1);
+                    if (0..hashes).all(|k| at(tail.saturating_add(k)) == Some('#')) {
+                        break tail.saturating_add(hashes);
+                    }
+                    i = tail;
+                }
+                (Some(_), _) => i = i.saturating_add(1),
+            }
+        };
+        let mut tokens = Vec::new();
+        let mut i = 0_usize;
+        while let Some(c) = at(i) {
+            let next = at(i.saturating_add(1));
+            i = match (c, next) {
+                ('/', Some('/')) => {
+                    let mut end = i;
+                    while at(end).is_some_and(|c| c != '\n') {
+                        end = end.saturating_add(1);
+                    }
+                    end
+                }
+                ('/', Some('*')) => {
+                    let mut depth = 1_usize;
+                    let mut end = i.saturating_add(2);
+                    while depth > 0 {
+                        match (at(end), at(end.saturating_add(1))) {
+                            (None, _) => break,
+                            (Some('/'), Some('*')) => {
+                                depth = depth.saturating_add(1);
+                                end = end.saturating_add(2);
+                            }
+                            (Some('*'), Some('/')) => {
+                                depth = depth.saturating_sub(1);
+                                end = end.saturating_add(2);
+                            }
+                            _ => end = end.saturating_add(1),
+                        }
+                    }
+                    end
+                }
+                ('"', _) => string_end(i.saturating_add(1), None),
+                ('\'', Some('\\')) => {
+                    let mut end = i.saturating_add(3);
+                    while at(end).is_some_and(|c| c != '\'') {
+                        end = end.saturating_add(1);
+                    }
+                    end.saturating_add(1)
+                }
+                ('\'', Some(_)) if at(i.saturating_add(2)) == Some('\'') => i.saturating_add(3),
+                _ if is_word(c) => {
+                    let end = word_end(i);
+                    let word = source.get(offset(i)..offset(end)).unwrap_or_default();
+                    let mut hashes = 0_usize;
+                    while at(end.saturating_add(hashes)) == Some('#') {
+                        hashes = hashes.saturating_add(1);
+                    }
+                    let after = end.saturating_add(hashes);
+                    match (word, at(after)) {
+                        ("r" | "br" | "cr", Some('"')) => {
+                            string_end(after.saturating_add(1), Some(hashes))
+                        }
+                        ("b" | "c", Some('"')) if hashes == 0 => {
+                            string_end(after.saturating_add(1), None)
+                        }
+                        ("r", Some(first)) if hashes == 1 && is_word(first) => {
+                            let stop = word_end(after);
+                            let raw = source.get(offset(after)..offset(stop)).unwrap_or_default();
+                            tokens.push(Token::Word(raw));
+                            stop
+                        }
+                        _ => {
+                            tokens.push(Token::Word(word));
+                            end
+                        }
+                    }
+                }
+                _ if c.is_whitespace() => i.saturating_add(1),
+                _ => {
+                    tokens.push(Token::Punct(c));
+                    i.saturating_add(1)
+                }
+            };
+        }
+        tokens
+    }
+
+    /// The index past the bracket group opening at `open`, or `None` when
+    /// `open` holds no opener or the group never closes.
+    fn group_end(tokens: &[Token<'_>], open: usize) -> Option<usize> {
+        let (opener, closer) = match tokens.get(open)? {
+            Token::Punct('(') => ('(', ')'),
+            Token::Punct('[') => ('[', ']'),
+            Token::Punct('{') => ('{', '}'),
+            _ => return None,
+        };
+        let mut depth = 0_usize;
+        for (k, token) in tokens.iter().enumerate().skip(open) {
+            match token {
+                Token::Punct(c) if *c == opener => depth = depth.saturating_add(1),
+                Token::Punct(c) if *c == closer => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return k.checked_add(1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The index past the test-only module whose attributes open at `i`: a
+    /// `#[cfg(test)]` or `#[cfg(all(test, ..))]` then any further outer
+    /// attributes, then `mod <name> { .. }`. `None` when none opens there.
+    fn test_module_end(tokens: &[Token<'_>], i: usize) -> Option<usize> {
+        use Token::{Punct, Word};
+        if tokens.get(i..i.checked_add(4)?)? != [Punct('#'), Punct('['), Word("cfg"), Punct('(')] {
+            return None;
+        }
+        let mut first = i.checked_add(4)?;
+        if tokens.get(first..first.checked_add(2)?)? == [Word("all"), Punct('(')] {
+            first = first.checked_add(2)?;
+        }
+        if tokens.get(first)? != &Word("test") {
+            return None;
+        }
+        let mut k = group_end(tokens, i.checked_add(1)?)?;
+        while tokens.get(k..k.checked_add(2)?)? == [Punct('#'), Punct('[')] {
+            k = group_end(tokens, k.checked_add(1)?)?;
+        }
+        let (Word("mod"), Word(_)) = (tokens.get(k)?, tokens.get(k.checked_add(1)?)?) else {
+            return None;
+        };
+        group_end(tokens, k.checked_add(2)?)
+    }
+
+    /// The tokens of `source` outside its test-only modules.
+    fn production_tokens(source: &str) -> Vec<Token<'_>> {
+        let all = lex(source);
+        let mut kept = Vec::with_capacity(all.len());
+        let mut i = 0_usize;
+        while let Some(&token) = all.get(i) {
+            if let Some(end) = test_module_end(&all, i) {
+                i = end;
+            } else {
+                kept.push(token);
+                i = i.saturating_add(1);
+            }
+        }
+        kept
+    }
+
+    /// The `std`/`tokio` `Command` methods that start a process from a bare
+    /// `Command`: a child started through one inherits every descriptor this
+    /// process holds without close-on-exec.
+    const START_METHODS: [&str; 3] = ["spawn", "status", "output"];
+
+    /// The names a path-form call or a function value reaches a start through:
+    /// the start methods, and `CommandExt`'s `exec` and `pre_exec`.
+    const START_PATH_NAMES: [&str; 5] = ["spawn", "status", "output", "exec", "pre_exec"];
+
+    /// The process-free paths ending in a start name: the thread spawns
+    /// `clippy_paths_resolve.rs` names to prove the root bans fire.
+    const START_PATH_EXEMPT: [&[&str]; 2] = [
+        &["std", "thread", "spawn"],
+        &["std", "thread", "Scope", "spawn"],
+    ];
+
+    /// The crate-local modules a glob `use` may name. Any other glob could
+    /// bring `CommandExt` into scope unnamed (`std::os::unix::prelude::*`).
+    const GLOB_USE_MODULES: [&str; 5] = ["profile", "linux", "macos", "windows", "scratch_core"];
+
+    /// Every production file that builds a `Command`, with how many it builds;
+    /// each hands its `Command` to `JailLaunch` or to
+    /// `ipe_runtime_rust::system::spawn_hardened`.
+    const COMMAND_BUILD_SITES: [(&str, usize); 3] = [
+        // `JailArgv::command`, consumed only by `JailLaunch::new`.
+        ("run_jail/mod.rs", 1),
+        // `ToolPath::command`, the closed host-tool set.
+        ("host_tool.rs", 1),
+        // The FreeBSD `mount`/`umount`/`rctl` calls, each through `run_host_tool`.
+        ("build_jail.rs", 6),
+    ];
+
+    /// Every `.rs` file under `dir`, recursively.
+    fn rust_sources(dir: &Path, found: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                rust_sources(&path, found)?;
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                found.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    /// The path segments ending at the word at `end`, read backwards across
+    /// `::` separators, leading `::` dropped.
+    fn path_ending_at<'s>(tokens: &[Token<'s>], end: usize) -> Vec<&'s str> {
+        let mut segments = Vec::new();
+        let mut k = end;
+        while let Some(Token::Word(word)) = tokens.get(k) {
+            segments.push(*word);
+            let Some(before) = k.checked_sub(3) else {
+                break;
+            };
+            if tokens.get(before.saturating_add(1)..k)
+                != Some(&[Token::Punct(':'), Token::Punct(':')][..])
+            {
+                break;
+            }
+            k = before;
+        }
+        segments.reverse();
+        segments
+    }
+
+    /// The path segments starting at the word at `start`, read forwards across
+    /// `::` separators.
+    fn path_starting_at<'s>(tokens: &[Token<'s>], start: usize) -> Vec<&'s str> {
+        let mut segments = Vec::new();
+        let mut k = start;
+        while let Some(Token::Word(word)) = tokens.get(k) {
+            segments.push(*word);
+            let after = k.saturating_add(1);
+            if tokens.get(after..after.saturating_add(2))
+                != Some(&[Token::Punct(':'), Token::Punct(':')][..])
+            {
+                break;
+            }
+            k = after.saturating_add(2);
+        }
+        segments
+    }
+
+    /// What one file's production code holds: each raw process start, and how
+    /// many `Command`s it builds.
+    fn process_starts(source: &str) -> (Vec<String>, usize) {
+        use Token::{Punct, Word};
+        let tokens = production_tokens(source);
+        let mut raw = Vec::new();
+        let mut built = 0_usize;
+        for (i, token) in tokens.iter().enumerate() {
+            let ahead = |n: usize| tokens.get(i.saturating_add(n)).copied();
+            match (*token, ahead(1), ahead(2), ahead(3)) {
+                (Punct('.'), Some(Word(m)), Some(Punct('(')), Some(Punct(')')))
+                    if START_METHODS.contains(&m) =>
+                {
+                    raw.push(format!(".{m}()"));
+                }
+                (Punct(':'), Some(Punct(':')), Some(Word(m)), _)
+                    if START_PATH_NAMES.contains(&m) =>
+                {
+                    let path = path_ending_at(&tokens, i.saturating_add(2));
+                    if !START_PATH_EXEMPT.contains(&path.as_slice()) {
+                        raw.push(format!("::{m}"));
+                    }
+                }
+                (Punct('.'), Some(Punct('$')), _, _) => raw.push("macro method".to_owned()),
+                (Punct(':'), Some(Punct(':')), Some(Punct('$')), _)
+                    if i.checked_sub(1).and_then(|k| tokens.get(k)) != Some(&Word("Self")) =>
+                {
+                    raw.push("macro method".to_owned());
+                }
+                (Word("for"), Some(Word(_)), _, _)
+                    if path_starting_at(&tokens, i.saturating_add(1)).last()
+                        == Some(&"Command") =>
+                {
+                    raw.push("impl for Command".to_owned());
+                }
+                (Word("CommandExt"), _, _, _) => raw.push("CommandExt".to_owned()),
+                (Word("Command"), Some(Word("as")), _, _) => raw.push("Command as".to_owned()),
+                (Word("Command"), Some(Punct(':')), Some(Punct(':')), Some(Word("new"))) => {
+                    built = built.saturating_add(1);
+                }
+                (Word("use"), _, _, _) => {
+                    let statement: Vec<Token<'_>> = tokens
+                        .iter()
+                        .skip(i)
+                        .take_while(|t| **t != Punct(';'))
+                        .copied()
+                        .collect();
+                    let local_glob = matches!(
+                        statement.as_slice(),
+                        [Word("use"), Word(m), Punct(':'), Punct(':'), Punct('*')]
+                            if GLOB_USE_MODULES.contains(m)
+                    );
+                    if statement.contains(&Punct('*')) && !local_glob {
+                        raw.push("glob use".to_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+        (raw, built)
+    }
+
+    #[test]
+    fn every_process_this_crate_starts_goes_through_the_descriptor_floor() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        let walked = rust_sources(&src, &mut files);
+        assert!(
+            walked.is_ok(),
+            "could not list {}: {walked:?}",
+            src.display()
+        );
+        assert!(
+            files.len() > 10,
+            "the scan found only {} source files under {}",
+            files.len(),
+            src.display()
+        );
+        let mut violations = Vec::new();
+        let mut builds: Vec<(String, usize)> = Vec::new();
+        for file in &files {
+            let relative = file
+                .strip_prefix(&src)
+                .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            match std::fs::read_to_string(file) {
+                Ok(source) => {
+                    let (raw, built) = process_starts(&source);
+                    violations.extend(raw.iter().map(|needle| format!("{relative}: `{needle}`")));
+                    if built > 0 {
+                        builds.push((relative, built));
+                    }
+                }
+                Err(e) => violations.push(format!("{relative}: unreadable: {e}")),
+            }
+        }
+        builds.sort();
+        let mut admitted: Vec<(String, usize)> = COMMAND_BUILD_SITES
+            .iter()
+            .map(|&(file, count)| (file.to_owned(), count))
+            .collect();
+        admitted.sort();
+        assert!(
+            violations.is_empty(),
+            "a process start bypasses the runtime descriptor floor \
+             (route it through `JailLaunch` or `ipe_runtime_rust::system::spawn_hardened`):\n{}",
+            violations.join("\n")
+        );
+        assert_eq!(
+            builds, admitted,
+            "the files building a `Command` drifted from the admitted sites"
+        );
+    }
+
+    #[test]
+    fn the_process_start_scan_refuses_each_raw_start() {
+        // Each case is legal Rust starting a process past the floor (or naming
+        // the trait that does), paired with what the scan must report.
+        let cases: [(&str, &[&str]); 19] = [
+            (
+                "macro_rules! go { ($m:ident) => { Command::$m(&mut cmd) } }",
+                &["macro method"],
+            ),
+            (
+                "impl Start for std::process::Command { fn go(&mut self) {} }",
+                &["impl for Command"],
+            ),
+            (
+                "macro_rules! all { ($($v:ident),+) => { [$(Self::$v),+] } }",
+                &[],
+            ),
+            ("fn a() { cmd.spawn(); }", &[".spawn()"]),
+            ("fn b() { let _ = cmd\n    .status (); }", &[".status()"]),
+            ("fn c() { Command::output(&mut cmd); }", &["::output"]),
+            (
+                "fn c(c: &mut Command) { let _ = Command::status(c); }",
+                &["::status"],
+            ),
+            (
+                "fn c() { cmds.iter_mut().map(Command::spawn); }",
+                &["::spawn"],
+            ),
+            ("fn c() { let _ = cmd.r#spawn(); }", &[".spawn()"]),
+            (
+                "use std::os::unix::process::CommandExt as _;",
+                &["CommandExt"],
+            ),
+            (
+                "use std::os::unix::prelude::*;\nfn e(mut c: Command) { let _ = c.exec(); }",
+                &["glob use"],
+            ),
+            ("use std::os::unix::process::{self as p, *};", &["glob use"]),
+            ("use std::process::Command as Spawn;", &["Command as"]),
+            (
+                "macro_rules! go { ($c:expr, $m:ident) => { $c.$m() } }\nfn g() { go!(cmd, spawn); }",
+                &["macro method"],
+            ),
+            (
+                "const S: &str = r#\"say \"hi\"#;\nfn d() { cmd.spawn(); }\nconst T: &str = \"x\";",
+                &[".spawn()"],
+            ),
+            (
+                "const S: &str = r\"C:\\\";\nfn d() { cmd.output(); }\nconst T: &str = \"x\";",
+                &[".output()"],
+            ),
+            (
+                "#[cfg(test)]\nmod tests {\n}\nfn e() { cmd.spawn(); }",
+                &[".spawn()"],
+            ),
+            (
+                "#[cfg(any(test, unix))]\nmod helpers { fn f() { cmd.status(); } }",
+                &[".status()"],
+            ),
+            (
+                "fn g() { f(\"a//b\", '\"', '\\'', b'\"'); cmd.spawn(); /* /* */ cmd.output() */ }",
+                &[".spawn()"],
+            ),
+        ];
+        for (source, expected) in cases {
+            let (raw, _) = process_starts(source);
+            assert_eq!(raw, expected.to_vec(), "scanning {source:?}");
+        }
+
+        // Neither a test-only module, a comment, a literal, a floor launch, a
+        // local glob nor the proven thread-spawn path is a raw start; each
+        // `Command::new` outside a test module counts.
+        let clean = "pub use profile::*;\n\
+                     fn d() { launch.spawn(a, b); } // cmd.spawn() Command::new\n\
+                     fn e() { [p].map(Command::new); }\n\
+                     const H: &str = \"Command::new cmd.spawn()\";\n\
+                     const _T: () = { let _ = ::std::thread::spawn::<fn(), ()>; };\n\
+                     #[cfg(all(test, unix))]\n\
+                     #[allow(clippy::panic)]\n\
+                     mod tests { fn f() { cmd.spawn(); Command::new(p); } }\n\
+                     fn h() { let _ = std::process::Command::new(p); }\n";
+        assert_eq!(process_starts(clean), (Vec::<String>::new(), 2));
     }
 }
