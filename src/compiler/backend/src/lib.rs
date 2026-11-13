@@ -232,6 +232,14 @@ pub struct EmittedProject {
     /// even on a cache-deserialized project.
     #[serde(default)]
     pub uses_webview: bool,
+    /// Whether this project links the runtime's web surface, the module set
+    /// `ipe_runtime::web::widget_assets` lives in. The typed source of truth the
+    /// driver reads before splicing widget-asset registration into `main.rs`;
+    /// a project without it has no registration target. Set by the backend from
+    /// the resolved runtime feature set. A missing field reads `false`, so a
+    /// project that never stated it is refused a splice, never handed one.
+    #[serde(default)]
+    pub links_web_runtime: bool,
     /// Validated relative path -> binary file bytes, written beside
     /// [`Self::files`]. No key is also a key of [`Self::files`]; the writer
     /// refuses a project where one is.
@@ -364,6 +372,7 @@ mod tests {
             files,
             cargo_toml: "[package]\nname = \"app\"\n".to_owned(),
             uses_webview: false,
+            links_web_runtime: true,
             assets: BTreeMap::from([(
                 RelPath::new("src/icon.png")?,
                 Asset::new(vec![0x00, 0x89, 0xAB, 0xFF]),

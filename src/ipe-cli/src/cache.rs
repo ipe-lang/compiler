@@ -2197,6 +2197,7 @@ mod tests {
             files,
             cargo_toml: "[package]\nname = \"x\"\n".to_owned(),
             uses_webview: false,
+            links_web_runtime: false,
             assets: std::collections::BTreeMap::new(),
         };
 
@@ -2507,6 +2508,7 @@ mod tests {
             files,
             cargo_toml: "[package]\nname = \"x\"\n".to_owned(),
             uses_webview: false,
+            links_web_runtime: false,
             assets: std::collections::BTreeMap::new(),
         }
     }

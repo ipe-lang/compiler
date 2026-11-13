@@ -16,6 +16,12 @@
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+/// The per-test directory the emitted project is written to.
+fn out_dir(test_name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("ui_widget_gate_{test_name}_out"))
+}
+
 /// Compile a `CustomElement.node` fixture as a two-file project (`Main.ipe` + a JS file
 /// the `customElement` constructor references), returning the pipeline result.
 /// The emitted project is written to a per-test temp dir; `cargo` is never
@@ -36,18 +42,36 @@ fn compile_with_files(
         std::fs::write(&path, contents)?;
     }
 
-    let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("ui_widget_gate_{test_name}_out"));
+    let out_dir = out_dir(test_name);
     e2e_support::scratch::fresh(&out_dir);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     Ok(ipe::build_fixture(&fixture, &out_dir, &runtime).map(drop))
 }
 
-/// Assert compilation succeeded (ipe-0).
+/// The process-start registration call the driver splices into an accepted
+/// widget program's `main.rs`.
+const REGISTRATION_CALL: &str = "ipe_runtime::web::widget_assets::register(";
+
+/// Assert compilation succeeded (ipe-0) and the emitted `main.rs` registers the
+/// widget assets.
+///
+/// The driver splices the registration only into a project whose
+/// `links_web_runtime` fact holds and refuses any other with a compiler bug, so
+/// an accepted build that carries the call is one that links the `web` runtime.
 fn assert_accepted(test_name: &str, source: &str, extra: &[(&str, &str)]) -> Result<(), BoxError> {
     match compile_with_files(test_name, source, extra)? {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            let main = std::fs::read_to_string(out_dir(test_name).join("src/main.rs"))?;
+            if main.contains(REGISTRATION_CALL) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{test_name}: accepted, but main.rs carries no `{REGISTRATION_CALL}` call"
+                )
+                .into())
+            }
+        }
         Err(e) => Err(format!("{test_name}: expected ipec success, got {e:?}").into()),
     }
 }
@@ -378,6 +402,36 @@ fn script_with_unmounted_widget_is_refused_at_build() -> Result<(), BoxError> {
         "script_unmounted_widget",
         SCRIPT_UNMOUNTED_WIDGET,
         &[("js/x.js", WIDGET_JS)],
+        "Main.ipe",
+    )
+}
+
+/// A script that mounts a handle through `Html.toString`, whose JS file is
+/// absent from the project.
+const SCRIPT_RENDERED_WIDGET_NO_JS: &str = r#"module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.Html as Html
+import Ipe.Ui as Ui
+import Ipe.Ffi.Js.CustomElement as CustomElement
+
+editor : CustomElement String String
+editor =
+    CustomElement.fromFile "js/editor.js"
+
+main =
+    Io.println (Html.toString (Ui.layout [] (CustomElement.node editor "x" identity)))
+"#;
+
+/// The placement refusal precedes the widget-file check: with the JS file
+/// missing, the script is refused IPE-L0147 at the constructor, never IPE-N0044
+/// advising it to create a file the placement gate would then refuse.
+#[test]
+fn placement_refusal_precedes_the_missing_widget_file() -> Result<(), BoxError> {
+    assert_placement_refused(
+        "script_rendered_widget_no_js",
+        SCRIPT_RENDERED_WIDGET_NO_JS,
+        &[],
         "Main.ipe",
     )
 }

@@ -1923,6 +1923,32 @@ fn custom_element_ctor_wrong_position_rejected() {
     assert_rejected("custom_element_wrong_pos", &src, "IPE-N0044");
 }
 
+/// The imports and runnable Web entry of a program that links the browser
+/// runtime, so a `CustomElement` defined after it is refused only for its own
+/// file, never for its placement or for a non-runnable `main`.
+const WEB_ENTRY: &str = r#"import Ipe.Tea.Web as Web
+import Ipe.Ui as Ui
+import Ipe.Tea.Web.Cmd
+import Ipe.Tea.Web.Sub
+type Page = HomePage
+type Msg = Noop
+type alias Model = { count : Int }
+init : WebReq -> ( Model, Cmd Msg )
+init _req = ( { count = 0 }, Cmd.none )
+update : Msg -> Model -> ( Model, Cmd Msg )
+update _msg model = ( model, Cmd.none )
+view : Model -> Element Msg
+view _model = Ui.text "hi"
+subscriptions : Model -> Sub Msg
+subscriptions _model = Sub.none
+main =
+    Web.tea
+        { init = init, update = update, view = view
+        , subscriptions = subscriptions
+        , routes = [], notFound = HomePage
+        }
+"#;
+
 /// (c) `customElement "does/not/exist.js"` with no such file is rejected: a widget
 /// cannot register against a file that is not there (IPE-N0044, checked at the
 /// build stage that owns the project root).
@@ -1930,12 +1956,43 @@ fn custom_element_ctor_wrong_position_rejected() {
 fn custom_element_ctor_missing_file_rejected() {
     let src = format!(
         "{HEAD}import Ipe.Ffi.Js.CustomElement as CustomElement\n\
+         {WEB_ENTRY}\
          editor : CustomElement Int String\n\
-         editor = CustomElement.fromFile \"js/does-not-exist.js\"\n\
-         main = 1\n"
+         editor = CustomElement.fromFile \"js/does-not-exist.js\"\n"
     );
     // No extra files written — the named path is absent.
     assert_rejected_with_files("custom_element_missing_file", &src, &[], "IPE-N0044");
+}
+
+/// The control for the [`WEB_ENTRY`] file refusals: the same program with its
+/// widget-hook file present compiles, so each of those refusals is caused by
+/// the file alone, never by the entry around it.
+#[test]
+fn custom_element_web_entry_with_its_file_compiles() {
+    let src = format!(
+        "{HEAD}import Ipe.Ffi.Js.CustomElement as CustomElement\n\
+         {WEB_ENTRY}\
+         editor : CustomElement Int String\n\
+         editor = CustomElement.fromFile \"js/present.js\"\n"
+    );
+    match compile_with_files(
+        "custom_element_web_entry_control",
+        &src,
+        &[(
+            "js/present.js",
+            "export function mount(host, emit) { return {}; }\n",
+        )],
+    ) {
+        Outcome::Accepted(how) if how.starts_with("compiled successfully") => {}
+        Outcome::Accepted(how) => assert!(
+            false_marker(),
+            "custom_element_web_entry_control: expected a clean compile, got ({how})"
+        ),
+        Outcome::Rejected(got) => assert!(
+            false_marker(),
+            "custom_element_web_entry_control: expected a clean compile, got {got}"
+        ),
+    }
 }
 
 /// (d) `customElement "../escape.js"` is rejected by the shared path seal — a `..`
@@ -2148,9 +2205,9 @@ fn custom_element_ctor_symlink_escape_rejected_at_build_gate() {
     );
     let src = format!(
         "{HEAD}import Ipe.Ffi.Js.CustomElement as CustomElement\n\
+         {WEB_ENTRY}\
          editor : CustomElement Int String\n\
-         editor = CustomElement.fromFile \"js/evil.js\"\n\
-         main = 1\n"
+         editor = CustomElement.fromFile \"js/evil.js\"\n"
     );
     let fixture = write_fixture(&src);
     // In-tree `js` (beside the entry module, under `src/`) is a SYMLINK to the

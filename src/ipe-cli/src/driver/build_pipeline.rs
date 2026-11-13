@@ -1925,91 +1925,6 @@ pub fn compile_prepared(
         source_for_span_in_linked(linked, &home_to_source, &entry, span)
     };
 
-    // Widget-file gate (IPE-N0044, Security #1). The `customElement` constructor's
-    // shape + lexical path seals (traversal IPE-P0063, absolute/rooted IPE-N0044)
-    // already ran in canon; here — the one stage that owns the project root — two
-    // FILESYSTEM invariants are enforced, defence-in-depth against the lexical
-    // seals:
-    //   1. Containment: the resolved path must lie strictly INSIDE the project
-    //      root. `ContainedRelPath::parse` canonicalises the join and asserts it
-    //      is a descendant of the canonical root, so a symlink UNDER the root that
-    //      points OUTSIDE it (which the lexical seals cannot see) is refused. A
-    //      bare `Path::join`/`is_file` would instead FOLLOW that symlink and stat
-    //      an out-of-project file — the escape this check closes.
-    //   2. Existence: the contained path must name a real file, so a widget never
-    //      registers against a file that is not there.
-    // Both fail closed with IPE-N0044; the widget seam never reaches emission on
-    // an out-of-project or absent file.
-    let widget_root = widget_file_root(&entry_src_path);
-    // The program's widget manifest: one entry per DISTINCT reached
-    // `customElement "<path>"`, carrying the lowerer-minted `ipe-ce-<hex>` tag
-    // (so the served-glue registration targets the SAME tag the view node
-    // renders) and the author hook file's verbatim content (WP5 serves it
-    // content-addressed + SRI). Populated as the containment/existence gate
-    // proves each file; deduplicated by tag so two views of one widget register
-    // once. Empty for a program that uses no `CustomElement.node`.
-    let mut widget_manifest: BTreeMap<String, String> = BTreeMap::new();
-    // The cleaned path that first minted each tag. The tag is a 64-bit FNV-1a
-    // digest, so two DISTINCT hook paths can collide onto one tag; keying the
-    // manifest by tag alone would then silently drop the second widget's JS and
-    // serve the first's code under both view nodes. Recording the origin path
-    // lets a collision from a distinct path fail the build closed instead.
-    let mut tag_origin: BTreeMap<String, String> = BTreeMap::new();
-    for widget in ipe_canon::custom_element_gate::collect_widget_files(linked) {
-        let reject = |detail: String| {
-            let (file, src) = source_for_span(widget.span);
-            CliError::Pipeline {
-                file,
-                src,
-                diag: Box::new(ipe_diagnostics::Diagnostic::Name {
-                    span: widget.span,
-                    msg: ipe_diagnostics::NameError::CustomElementCtorMalformed {
-                        detail: detail.into_boxed_str(),
-                    },
-                }),
-            }
-        };
-        let contained = contained_path::ContainedRelPath::parse(widget_root, &widget.cleaned_path)
-            .map_err(|_| {
-                reject(format!(
-                    "the widget-hook file `{}` resolves outside the project directory \
-                         (an absolute path, a `..` climb, or a symlink pointing above the \
-                         project root) and is refused",
-                    widget.cleaned_path
-                ))
-            })?;
-        // A read failure fails the build closed: the widget seam never reaches
-        // emission on a file we could not read whole.
-        let content = read_widget_hook(widget_root, contained.resolved()).map_err(|e| {
-            if matches!(&e, CliError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound)
-            {
-                reject(format!(
-                    "the widget-hook file `{}` does not exist in the project",
-                    widget.cleaned_path
-                ))
-            } else {
-                reject(format!(
-                    "the widget-hook file `{}` could not be read: {e}",
-                    widget.cleaned_path
-                ))
-            }
-        })?;
-        // The tag is the SINGLE lowerer definition, keyed on the same cleaned
-        // path the view node hashed — never a second, drift-prone hash here.
-        let tag = ipe_lower::custom_element_tag(&widget.cleaned_path);
-        if let Err(collision) =
-            record_widget_tag_origin(&mut tag_origin, &tag, &widget.cleaned_path)
-        {
-            return Err(reject(format!(
-                "the widget-hook files `{}` and `{}` hash to the same \
-                 custom-element tag `{tag}`; register one under a distinct \
-                 path so their element names cannot collide",
-                collision.existing_path, collision.new_path
-            )));
-        }
-        widget_manifest.entry(tag).or_insert(content);
-    }
-
     // Layer-2 wasm security gate (IPE-N0030, M5): the client entry's closure
     // (`ipe_canon::reach::EntryClosure`, the defs the emitted crate is cut down
     // to) must not reach a server-only def in another module. Runs BEFORE
@@ -2138,11 +2053,9 @@ pub fn compile_prepared(
     gate_decoder_pipelines(linked).map_err(span_attributed_err)?;
 
     // `ipe_db::program_metadata` — the whole-program DCE-reachability seam
-    // over `lower_program`.
-    // Its own dependency on `lower_program` is what forces the lowering pass
-    // to execute here; a standalone `lower_program` demand alongside this one
-    // would be a redundant duplicate of the SAME memoized query (its error
-    // maps through the same `span_attributed_err` closure either way).
+    // over `lower_program`. Its dependency on `lower_program` executes the
+    // lowering pass here; the widget-file gate below demands the SAME memoized
+    // query again for its own ordering, which re-reads the memo.
     // Demanded here, on the production path, purely as a FORWARD SEAM:
     // nothing downstream consumes its value yet (see the query's own doc for
     // the honestly-recorded scope), matching the `kernel_types` precedent
@@ -2153,6 +2066,103 @@ pub fn compile_prepared(
     ipe_db::program_metadata(db, source_root, entry_file)
         .clone()
         .map_err(homed_err)?;
+
+    // Widget-file gate (IPE-N0044, Security #1). The `customElement` constructor's
+    // shape + lexical path seals (traversal IPE-P0063, absolute/rooted IPE-N0044)
+    // already ran in canon; here — the one stage that owns the project root — two
+    // FILESYSTEM invariants are enforced, defence-in-depth against the lexical
+    // seals:
+    //   1. Containment: the resolved path must lie strictly INSIDE the project
+    //      root. `ContainedRelPath::parse` canonicalises the join and asserts it
+    //      is a descendant of the canonical root, so a symlink UNDER the root that
+    //      points OUTSIDE it (which the lexical seals cannot see) is refused. A
+    //      bare `Path::join`/`is_file` would instead FOLLOW that symlink and stat
+    //      an out-of-project file — the escape this check closes.
+    //   2. Existence: the contained path must name a real file, so a widget never
+    //      registers against a file that is not there.
+    // Both fail closed with IPE-N0044; the widget seam never reaches emission on
+    // an out-of-project or absent file.
+    //
+    // The gate runs only on a program lowering admitted. Lowering's admission
+    // holds the IPE-L0147 placement gate, so a constructor the program may not
+    // ship is refused at its span before this gate could advise creating a file
+    // the placement gate would then refuse. The demand is memoized: it reuses
+    // the lowering `program_metadata` executed above.
+    ipe_db::lower_program(db, source_root, entry_file)
+        .clone()
+        .map_err(|err| match err {
+            ipe_db::PipelineError::Lower(diag, home) => homed_err((diag, home)),
+            infer @ ipe_db::PipelineError::Infer(_) => span_attributed_err(infer),
+        })?;
+    let widget_root = widget_file_root(&entry_src_path);
+    // The program's widget manifest: one entry per DISTINCT reached
+    // `customElement "<path>"`, carrying the lowerer-minted `ipe-ce-<hex>` tag
+    // (so the served-glue registration targets the SAME tag the view node
+    // renders) and the author hook file's verbatim content (WP5 serves it
+    // content-addressed + SRI). Populated as the containment/existence gate
+    // proves each file; deduplicated by tag so two views of one widget register
+    // once. Empty for a program that uses no `CustomElement.node`.
+    let mut widget_manifest: BTreeMap<String, String> = BTreeMap::new();
+    // The cleaned path that first minted each tag. The tag is a 64-bit FNV-1a
+    // digest, so two DISTINCT hook paths can collide onto one tag; keying the
+    // manifest by tag alone would then silently drop the second widget's JS and
+    // serve the first's code under both view nodes. Recording the origin path
+    // lets a collision from a distinct path fail the build closed instead.
+    let mut tag_origin: BTreeMap<String, String> = BTreeMap::new();
+    for widget in ipe_canon::custom_element_gate::collect_widget_files(linked) {
+        let reject = |detail: String| {
+            let (file, src) = source_for_span(widget.span);
+            CliError::Pipeline {
+                file,
+                src,
+                diag: Box::new(ipe_diagnostics::Diagnostic::Name {
+                    span: widget.span,
+                    msg: ipe_diagnostics::NameError::CustomElementCtorMalformed {
+                        detail: detail.into_boxed_str(),
+                    },
+                }),
+            }
+        };
+        let contained = contained_path::ContainedRelPath::parse(widget_root, &widget.cleaned_path)
+            .map_err(|_| {
+                reject(format!(
+                    "the widget-hook file `{}` resolves outside the project directory \
+                         (an absolute path, a `..` climb, or a symlink pointing above the \
+                         project root) and is refused",
+                    widget.cleaned_path
+                ))
+            })?;
+        // A read failure fails the build closed: the widget seam never reaches
+        // emission on a file we could not read whole.
+        let content = read_widget_hook(widget_root, contained.resolved()).map_err(|e| {
+            if matches!(&e, CliError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound)
+            {
+                reject(format!(
+                    "the widget-hook file `{}` does not exist in the project",
+                    widget.cleaned_path
+                ))
+            } else {
+                reject(format!(
+                    "the widget-hook file `{}` could not be read: {e}",
+                    widget.cleaned_path
+                ))
+            }
+        })?;
+        // The tag is the SINGLE lowerer definition, keyed on the same cleaned
+        // path the view node hashed — never a second, drift-prone hash here.
+        let tag = ipe_lower::custom_element_tag(&widget.cleaned_path);
+        if let Err(collision) =
+            record_widget_tag_origin(&mut tag_origin, &tag, &widget.cleaned_path)
+        {
+            return Err(reject(format!(
+                "the widget-hook files `{}` and `{}` hash to the same \
+                 custom-element tag `{tag}`; register one under a distinct \
+                 path so their element names cannot collide",
+                collision.existing_path, collision.new_path
+            )));
+        }
+        widget_manifest.entry(tag).or_insert(content);
+    }
 
     // Post-lowering wasm gate (IPE-N0029): re-judge every function lowering
     // kept, the exact set the emitted crate contains, against the target's
@@ -2263,10 +2273,14 @@ pub fn compile_prepared(
 /// exactly as it is data in the browser).
 ///
 /// # Errors
-/// [`CliError`] carrying a [`Diagnostic::CompilerBug`] if `src/main.rs` is absent
-/// from the emitted file set or the `install_panic_classifier();` anchor the
-/// splice keys on is missing — a drifted emit template, surfaced loudly rather
-/// than silently emitting a program that never registers its widgets.
+/// [`CliError`] carrying a [`Diagnostic::CompilerBug`] if the manifest is
+/// non-empty but the project does not link the runtime's web surface
+/// ([`ipe_backend::EmittedProject::links_web_runtime`]) — the call would name a
+/// module the build lacks, so `main.rs` is left untouched; or if `src/main.rs`
+/// is absent from the emitted file set or the `install_panic_classifier();`
+/// anchor the splice keys on is missing — a drifted emit template, surfaced
+/// loudly rather than silently emitting a program that never registers its
+/// widgets.
 pub fn inject_widget_registration(
     emitted: &mut ipe_backend::EmittedProject,
     manifest: &BTreeMap<String, String>,
@@ -2282,6 +2296,15 @@ pub fn inject_widget_registration(
             detail: detail.to_owned(),
         }),
     };
+    // The registration call names `ipe_runtime::web::widget_assets`; a project
+    // that does not link the web surface has no such module, so splicing it
+    // would hand cargo a program it cannot build.
+    if !manifest.is_empty() && !emitted.links_web_runtime {
+        return Err(bug(
+            "widget registration reached a project that does not link the runtime's web \
+             surface — the widget-placement gate admitted a program it must refuse",
+        ));
+    }
     let main = emitted
         .files
         .get_mut("src/main.rs")
@@ -3335,6 +3358,7 @@ mod tests {
             files,
             cargo_toml: String::new(),
             uses_webview: false,
+            links_web_runtime: true,
             assets: std::collections::BTreeMap::new(),
         };
         let manifest = BTreeMap::from([(
@@ -3355,6 +3379,43 @@ mod tests {
         );
     }
 
+    /// A widget manifest reaching a project that does not link the web runtime
+    /// is a compiler bug, and `main.rs` is left byte-identical.
+    #[test]
+    #[allow(clippy::expect_used)] // a literal path; a refusal is a test-setup bug
+    fn widget_registration_refuses_a_project_without_the_web_runtime() {
+        let original = "fn main() {\n    install_panic_classifier();\n}\n";
+        let rel = ipe_backend::RelPath::new("src/main.rs").expect("valid rel path");
+        let mut emitted = ipe_backend::EmittedProject {
+            files: BTreeMap::from([(rel, original.to_owned())]),
+            cargo_toml: String::new(),
+            uses_webview: false,
+            links_web_runtime: false,
+            assets: std::collections::BTreeMap::new(),
+        };
+        let manifest = BTreeMap::from([("x-w".to_owned(), "export {}".to_owned())]);
+        let result = inject_widget_registration(&mut emitted, &manifest);
+        assert!(
+            matches!(
+                &result,
+                Err(CliError::Pipeline { diag, .. })
+                    if matches!(
+                        diag.as_ref(),
+                        ipe_diagnostics::Diagnostic::CompilerBug {
+                            where_: "ipe_cli::inject_widget_registration",
+                            ..
+                        }
+                    )
+            ),
+            "a manifest without the web runtime must be a compiler bug: {result:?}"
+        );
+        assert_eq!(
+            emitted.files.get("src/main.rs").map(String::as_str),
+            Some(original),
+            "a refused splice must leave main.rs byte-identical"
+        );
+    }
+
     /// An emitted project for the manifest: a vendored `mod.rs` that declares
     /// no runtime module, so the scan sees only `files` and reads no disk.
     fn vendored_project(files: &[(&str, &str)]) -> ipe_backend::EmittedProject {
@@ -3367,6 +3428,7 @@ mod tests {
             files: map,
             cargo_toml: String::new(),
             uses_webview: false,
+            links_web_runtime: false,
             assets: std::collections::BTreeMap::new(),
         }
     }
@@ -3411,6 +3473,7 @@ mod tests {
                 files: BTreeMap::new(),
                 cargo_toml: String::new(),
                 uses_webview: false,
+                links_web_runtime: false,
                 assets: BTreeMap::new(),
             },
             &runtime,
@@ -4090,6 +4153,7 @@ main =
             files,
             cargo_toml: String::new(),
             uses_webview: false,
+            links_web_runtime: false,
             assets,
         }
     }

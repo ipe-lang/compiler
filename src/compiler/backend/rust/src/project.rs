@@ -3003,6 +3003,7 @@ fn assemble_project_text(
                 files,
                 cargo_toml,
                 uses_webview: ctx.uses_webview,
+                links_web_runtime: links_web_runtime(ctx),
                 assets,
             });
         }
@@ -3035,6 +3036,7 @@ fn assemble_project_text(
             files,
             cargo_toml: wasm_cargo_toml,
             uses_webview: ctx.uses_webview,
+            links_web_runtime: links_web_runtime(ctx),
             assets,
         });
     }
@@ -3107,6 +3109,7 @@ fn assemble_project_text(
             files,
             cargo_toml,
             uses_webview: ctx.uses_webview,
+            links_web_runtime: links_web_runtime(ctx),
             assets,
         });
     }
@@ -3414,8 +3417,18 @@ fn assemble_project_text(
         files,
         cargo_toml,
         uses_webview: ctx.uses_webview,
+        links_web_runtime: links_web_runtime(ctx),
         assets,
     })
+}
+
+/// Whether the project links the runtime's web surface, read off the
+/// [`crate::runtime_features`] SSOT selection. The `web` feature is the one that
+/// exposes `ipe_runtime::web::widget_assets`; `web-core` alone (the webview
+/// host) does not.
+fn links_web_runtime(ctx: &EmitCtx) -> bool {
+    crate::runtime_features::runtime_features(ctx)
+        .contains(crate::runtime_features::RuntimeFeature::Web)
 }
 
 /// Return `true` when a value of type `ty` holds a server-surface or non-serde
@@ -6972,6 +6985,7 @@ mod non_serde_tests {
                     files: BTreeMap::new(),
                     cargo_toml: String::new(),
                     uses_webview: false,
+                    links_web_runtime: false,
                     assets: std::collections::BTreeMap::new(),
                 };
             };
@@ -6981,6 +6995,7 @@ mod non_serde_tests {
             files: map,
             cargo_toml: String::new(),
             uses_webview: false,
+            links_web_runtime: false,
             assets: std::collections::BTreeMap::new(),
         }
     }

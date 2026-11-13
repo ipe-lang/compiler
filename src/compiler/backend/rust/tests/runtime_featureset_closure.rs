@@ -1749,3 +1749,104 @@ fn tokio_projection_comparator_refuses_drift() {
     )];
     assert!(tokio_projection_mismatches(&exact, &table).is_empty());
 }
+
+// ── the widget-registration target fact ─────────────────────────────────────
+
+/// The predicate the runtime crate re-exports `widget_assets` under inside
+/// `web/mod.rs` — the `ipe_runtime::web::widget_assets` path the driver's
+/// widget-registration splice names.
+#[allow(clippy::expect_used)] // test scaffolding: the crate sources always parse
+fn web_widget_assets_reexport(crate_root: &Path) -> cfg::Cfg {
+    let web_rs = std::fs::read_to_string(crate_root.join("src").join("web").join("mod.rs"))
+        .expect("read src/web/mod.rs");
+    let file = syn::parse_file(&web_rs).expect("runtime src/web/mod.rs must parse");
+    let names_widget_assets = |item: &syn::ItemUse| {
+        let syn::UseTree::Path(root) = &item.tree else {
+            return false;
+        };
+        let syn::UseTree::Name(leaf) = root.tree.as_ref() else {
+            return false;
+        };
+        root.ident == "crate" && leaf.ident == "widget_assets"
+    };
+    let reexports: Vec<cfg::Cfg> = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Use(u) if names_widget_assets(u) => Some(u),
+            _ => None,
+        })
+        .map(|u| {
+            cfg::attrs_cfg(&u.attrs)
+                .expect("the re-export's predicate must parse")
+                .unwrap_or(cfg::Cfg::All(Vec::new()))
+        })
+        .collect();
+    assert_eq!(
+        reexports.len(),
+        1,
+        "src/web/mod.rs must re-export `crate::widget_assets` exactly once"
+    );
+    cfg::Cfg::Any(reexports)
+}
+
+/// `EmittedProject::links_web_runtime` holds exactly when the runtime the
+/// project selects compiles `ipe_runtime::web::widget_assets`.
+///
+/// The expectation is read off the runtime crate's own sources — the `web` and
+/// `widget_assets` module gates and the re-export's predicate — under the
+/// project's resolved feature set, so the emitted fact cannot drift from the
+/// module the driver's registration splice names. Swept over the empty mask
+/// and every single flag, the webview host included, in both directions.
+#[test]
+#[allow(clippy::expect_used)] // test scaffolding: a body-free emit cannot fail
+fn links_web_runtime_is_the_widget_registration_target() {
+    let fx = load_fixtures();
+    let reexport = web_widget_assets_reexport(&e2e_support::require_runtime_crate());
+    let mut interner = Interner::new();
+    let main = interner.intern("Main").expect("intern Main");
+    let mut seen = BTreeSet::new();
+    for mask in std::iter::once(0).chain((0..FLAG_COUNT).map(|bit| 1u32 << bit)) {
+        let prog = Program {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: std::collections::BTreeSet::new(),
+            modules: vec![module_for_mask(main, mask)],
+        };
+        let emitted = RustBackend::new(&interner)
+            .emit(&prog)
+            .expect("emit must succeed for a body-free program");
+        let selected = selected_features(&interner, main, mask);
+        let env = native_env(&resolve_features(&selected, &fx.table));
+        let target = fx
+            .gates
+            .truth("web", &env)
+            .and(fx.gates.truth("widget_assets", &env))
+            .and(env.eval(&reexport));
+        assert_ne!(
+            target,
+            cfg::Truth::Varies,
+            "mask {mask:#x}: the registration target must not vary by host"
+        );
+        let compiled = target == cfg::Truth::Holds;
+        assert_eq!(
+            emitted.links_web_runtime,
+            compiled,
+            "mask {mask:#x}: `links_web_runtime` is {} but the selected runtime {} \
+             `ipe_runtime::web::widget_assets` (features {selected:?})",
+            emitted.links_web_runtime,
+            if compiled { "compiles" } else { "lacks" },
+        );
+        if mask == 1 << 5 {
+            assert!(
+                !emitted.links_web_runtime,
+                "the webview host alone links `web-core`, never the registration target"
+            );
+        }
+        seen.insert(emitted.links_web_runtime);
+    }
+    assert_eq!(
+        seen,
+        BTreeSet::from([false, true]),
+        "the sweep must reach both a project that links the web runtime and one that does not"
+    );
+}

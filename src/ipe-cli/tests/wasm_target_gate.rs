@@ -641,6 +641,55 @@ fn transitive_server_import_fails_naming_the_exact_chain() {
     );
 }
 
+/// Where a client entry both reaches a server module (IPE-N0030) and names a
+/// widget-hook file that is absent (IPE-N0044), the reachability refusal is the
+/// one reported: the client security gates judge the linked program before the
+/// widget-file gate touches the project tree.
+#[test]
+#[allow(clippy::panic)] // test assertion: a non-pipeline error variant IS the failure
+fn server_reachability_precedes_the_missing_widget_file() {
+    let dir = scratch("wasm_gate_reachability_before_widget_file");
+    let tree = ipe::project_root::SourceTree::new()
+        .module(
+            "Data",
+            "module Data exposing (load)\n\
+             import Ipe.File as File\n\
+             import Ipe.Path as Path\n\
+             import Ipe.Task as Task\n\
+             \n\
+             load : Task Error String\n\
+             load =\n\
+             \x20   case Path.fromString \"/etc/passwd\" of\n\
+             \x20       Ok p -> File.readFile p\n\
+             \x20       Err e -> Task.fail e\n",
+        )
+        .module(
+            "Main",
+            "module Main exposing (main)\n\
+             import Data exposing (load)\n\
+             import Ipe.Ffi.Js.CustomElement as CustomElement\n\
+             \n\
+             editor : CustomElement Int String\n\
+             editor = CustomElement.fromFile \"js/absent.js\"\n\
+             \n\
+             main =\n\
+             \x20   load\n",
+        );
+    let fixture = ipe::RootFixture::from_tree(&tree).expect("write the project fixture");
+    let out = dir.join("out");
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let err = ipe::build_fixture_with_options(&fixture, &out, &runtime, &wasm_options())
+        .expect_err("a client entry reaching Data's File.readFile must be refused");
+    let CliError::Pipeline { diag, .. } = err else {
+        panic!("expected a pipeline diagnostic, got: {err:?}");
+    };
+    assert_eq!(
+        diag.code().as_str(),
+        "IPE-N0030",
+        "the reachability refusal must precede the widget-file check: {diag:?}"
+    );
+}
+
 /// A TEA app around [`PURE_UI_APP`]'s shape that also imports `extra_imports`,
 /// carries `extra_defs` as top-level definitions, and answers `Increment` with
 /// `increment_cmd` (a `Cmd Msg`). `Msg` gains `Got (Result Error Int)`.
