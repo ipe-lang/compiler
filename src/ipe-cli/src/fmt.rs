@@ -56,10 +56,11 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 
 use ipe_diagnostics::Diagnostic;
+use ipe_fs_open::FileId;
 
 // The formatting engine lives in the `ipe_fmt` crate so both this CLI and the
 // LSP formatting provider can share it. Re-export its public surface so
@@ -67,6 +68,8 @@ use ipe_diagnostics::Diagnostic;
 pub use ipe_fmt::{FmtError, FmtLimit, OutputCap, format_source};
 
 use crate::CliError;
+use crate::output_dir::held::{HeldDir, RelativeLeaf, Replaced};
+
 /// Run the `fmt` subcommand.
 ///
 /// # Errors
@@ -184,7 +187,7 @@ fn run_fmt_inplace(
     }
     if check {
         let mut unformatted: Vec<PathBuf> = Vec::new();
-        format_each(&files, sink, |file, _, _| {
+        format_each(&files, sink, |file, _, _, _| {
             unformatted.push(file.path.clone());
             Ok(())
         })
@@ -193,7 +196,7 @@ fn run_fmt_inplace(
     }
     let mut plan: Vec<Rewrite<'_>> = Vec::new();
     let mut held: u64 = 0;
-    format_each(&files, sink, |file, source, formatted| {
+    format_each(&files, sink, |file, source, id, formatted| {
         hold_rewrite(
             &mut held,
             HELD_REWRITE_BYTES,
@@ -204,6 +207,7 @@ fn run_fmt_inplace(
         plan.push(Rewrite {
             file,
             source,
+            id,
             formatted,
         });
         Ok(())
@@ -217,6 +221,8 @@ struct Rewrite<'f> {
     file: &'f FmtFile,
     /// The source exactly as read.
     source: String,
+    /// The identity of the very file `source` was read from.
+    id: FileId,
     /// The formatter's output for `source`.
     formatted: String,
 }
@@ -229,21 +235,21 @@ struct Rewrite<'f> {
 fn format_each<'f>(
     files: &'f [FmtFile],
     sink: RefusalSink,
-    mut changed: impl FnMut(&'f FmtFile, String, String) -> Result<(), CliError>,
+    mut changed: impl FnMut(&'f FmtFile, String, FileId, String) -> Result<(), CliError>,
 ) -> Result<(), CliError> {
     let mut refusal: Option<CliError> = None;
     for file in files {
-        let outcome = read_fmt_file(file).and_then(|source| {
+        let outcome = read_fmt_file(file).and_then(|(source, id)| {
             format_source(&source)
-                .map(|formatted| (source, formatted))
+                .map(|formatted| (source, id, formatted))
                 .map_err(|e| fmt_err_to_cli(&file.path, e))
         });
         match outcome {
             Err(err) => sink.keep(&mut refusal, err),
             // After a refusal nothing is written; the rest are formatted only
             // to report their own refusals.
-            Ok((source, formatted)) if source != formatted && refusal.is_none() => {
-                changed(file, source, formatted)?;
+            Ok((source, id, formatted)) if source != formatted && refusal.is_none() => {
+                changed(file, source, id, formatted)?;
             }
             Ok(_) => {}
         }
@@ -300,42 +306,42 @@ fn write_rewrites(plan: Vec<Rewrite<'_>>, sink: RefusalSink) -> Result<(), CliEr
     refusal.map_or(Ok(()), Err)
 }
 
-/// Write one planned rewrite; `false` when its file no longer holds the source it was formatted from.
+/// Write one planned rewrite; `false` when its file no longer is the file, holding the source, it was formatted from.
+///
+/// The file's parent is reached from its anchor without following a link,
+/// and the writer replaces the leaf only while it still is the very file
+/// read, holding the very bytes read.
 fn write_rewrite(rewrite: &Rewrite<'_>) -> Result<bool, CliError> {
     let file = rewrite.file;
-    match &file.origin {
-        FmtOrigin::Named => Ok(matches!(
-            crate::driver::rewrite_user_file_if_unchanged(
-                &file.path,
-                &rewrite.source,
-                &rewrite.formatted,
-                crate::RewriteKind::Lossless,
-            )?,
-            crate::driver::IfUnchanged::Written(_)
-        )),
-        FmtOrigin::Walked(root) => {
-            if crate::io_bounded::read_walked_source(&file.path)? != rewrite.source {
-                return Ok(false);
-            }
-            crate::rewrite_walked_file(
-                root,
-                &file.path,
-                &rewrite.formatted,
-                crate::RewriteKind::Lossless,
-            )?;
-            Ok(true)
-        }
-    }
+    let anchor = hold_anchor(&file.anchor)?;
+    let parent = anchor.descend(&file.leaf)?;
+    let formatted = rewrite.formatted.as_bytes();
+    let replaced = parent.replace_if_unchanged(
+        file.leaf.leaf().as_os_str(),
+        rewrite.id,
+        &rewrite.source,
+        crate::io_bounded::SOURCE_CAP,
+        |staged| staged.write_all(formatted),
+    )?;
+    Ok(matches!(replaced, Replaced::Done))
 }
 
-/// Read `file` the way its [`FmtOrigin`] allows.
-fn read_fmt_file(file: &FmtFile) -> Result<String, CliError> {
-    match file.origin {
-        FmtOrigin::Named => {
-            crate::io_bounded::read_user_named(&file.path, crate::io_bounded::SOURCE_CAP)
-        }
-        FmtOrigin::Walked(_) => crate::io_bounded::read_walked_source(&file.path),
-    }
+/// Read `file` through its held parent, with the identity of the very file read.
+fn read_fmt_file(file: &FmtFile) -> Result<(String, FileId), CliError> {
+    let anchor = hold_anchor(&file.anchor)?;
+    let parent = anchor.descend(&file.leaf)?;
+    parent.read_file_capped_identified(file.leaf.leaf(), crate::io_bounded::SOURCE_CAP)
+}
+
+/// Hold the directory `anchor` names, following a link there.
+///
+/// The anchor is a directory the user named, or a named file's canonical
+/// parent; only the levels below it are refused as links.
+fn hold_anchor(anchor: &Path) -> Result<HeldDir, CliError> {
+    HeldDir::open_following(anchor)?.ok_or_else(|| CliError::Io {
+        path: anchor.to_path_buf(),
+        source: std::io::ErrorKind::NotFound.into(),
+    })
 }
 
 /// Report a `--check` scan's result in the requested [`OutputFormat`].
@@ -503,20 +509,48 @@ fn fmt_err_to_cli(file: &Path, e: FmtError) -> CliError {
     }
 }
 
-/// How one file reached an `ipe fmt` run, which decides how it is read and rewritten.
-enum FmtOrigin {
-    /// Named on the command line: a final symlink is followed.
-    Named,
-    /// Found by walking this named directory: it must resolve inside it.
-    Walked(PathBuf),
-}
-
 /// One file an `ipe fmt` run formats.
+///
+/// Every read and write opens `anchor` following a link, then steps down to
+/// the leaf without following one: a named file's anchor is its canonical
+/// parent (its links followed once, at collection), a walked file's is the
+/// directory the user named.
 struct FmtFile {
     /// The path as the user named it or the walk reached it.
     path: PathBuf,
-    /// How it reached the run.
-    origin: FmtOrigin,
+    /// The directory every read and write starts from.
+    anchor: PathBuf,
+    /// The file below `anchor`.
+    leaf: RelativeLeaf,
+}
+
+impl FmtFile {
+    /// The file the user named at `path`, its links followed once.
+    fn named(path: &Path) -> Result<Self, CliError> {
+        let real = fs::canonicalize(path).map_err(|e| CliError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        let anchor = real
+            .parent()
+            .map_or_else(|| real.clone(), Path::to_path_buf);
+        let leaf = RelativeLeaf::under(&anchor, &real)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            anchor,
+            leaf,
+        })
+    }
+
+    /// The file a walk of `root` reached at `path`.
+    fn walked(root: &Path, path: PathBuf) -> Result<Self, CliError> {
+        let leaf = RelativeLeaf::under(root, &path)?;
+        Ok(Self {
+            path,
+            anchor: root.to_path_buf(),
+            leaf,
+        })
+    }
 }
 
 /// The ceilings one `ipe fmt` run's file collection is held to, summed over every root.
@@ -578,10 +612,7 @@ impl FmtWalk {
         self.examine(root)?;
         if root.is_file() {
             self.find(root)?;
-            return Ok(vec![FmtFile {
-                path: root.to_path_buf(),
-                origin: FmtOrigin::Named,
-            }]);
+            return Ok(vec![FmtFile::named(root)?]);
         }
         if !root.is_dir() {
             return Err(CliError::Usage(crate::text::msg::fmt_no_such_path(
@@ -622,10 +653,7 @@ impl FmtWalk {
                     && path.extension().and_then(|e| e.to_str()) == Some("ipe")
                 {
                     self.find(&dir)?;
-                    out.push(FmtFile {
-                        path,
-                        origin: FmtOrigin::Walked(root.to_path_buf()),
-                    });
+                    out.push(FmtFile::walked(root, path)?);
                 }
             }
         }
@@ -802,64 +830,176 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Every file a walk of `dir` collects.
+    fn walked(dir: &Path) -> Vec<FmtFile> {
+        collect_fmt_files(&[dir.to_path_buf()], limits(|_| {})).unwrap_or_default()
+    }
+
+    /// `file` read as a run reads it, planned to become `formatted`.
+    fn planned<'f>(file: &'f FmtFile, formatted: &str) -> Option<Rewrite<'f>> {
+        let (source, id) = read_fmt_file(file).ok()?;
+        Some(Rewrite {
+            file,
+            source,
+            id,
+            formatted: formatted.to_owned(),
+        })
+    }
+
+    /// Whether `res` is the changed-while-formatting refusal naming `name`.
+    fn left_and_named(res: &Result<(), CliError>, name: &str) -> bool {
+        matches!(res, Err(CliError::Usage(m)) if m.contains(name))
+    }
+
     /// A write that fails leaves the files after it written, and is reported.
     #[test]
     fn a_failed_write_does_not_stop_the_rest() {
         let dir = scratch("write-continues");
+        assert!(fs::write(dir.join("Kept.ipe"), UNFORMATTED).is_ok());
+        let files = walked(&dir);
+        assert_eq!(files.len(), 1);
+        let [kept] = files.as_slice() else {
+            return;
+        };
+        let kept = planned(kept, "formatted\n");
+        assert!(kept.is_some());
+        let Some(kept) = kept else {
+            return;
+        };
+        let leaf = RelativeLeaf::parse(Path::new("Gone.ipe"));
+        assert!(leaf.is_ok(), "{leaf:?}");
+        let Ok(leaf) = leaf else {
+            return;
+        };
         let gone = FmtFile {
-            path: dir.join("Gone.ipe"),
-            origin: FmtOrigin::Named,
+            path: dir.join("missing").join("Gone.ipe"),
+            anchor: dir.join("missing"),
+            leaf,
         };
-        let kept = FmtFile {
-            path: dir.join("Kept.ipe"),
-            origin: FmtOrigin::Named,
-        };
-        assert!(fs::write(&kept.path, UNFORMATTED).is_ok());
         let plan = vec![
             Rewrite {
                 file: &gone,
                 source: UNFORMATTED.to_owned(),
+                id: kept.id,
                 formatted: String::from("formatted\n"),
             },
-            Rewrite {
-                file: &kept,
-                source: UNFORMATTED.to_owned(),
-                formatted: String::from("formatted\n"),
-            },
+            kept,
         ];
         let res = write_rewrites(plan, RefusalSink::Human);
         assert!(matches!(res, Err(CliError::Io { .. })), "{res:?}");
         assert_eq!(
-            fs::read_to_string(&kept.path).unwrap_or_default(),
+            fs::read_to_string(dir.join("Kept.ipe")).unwrap_or_default(),
             "formatted\n"
         );
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A file edited since it was read is left as it is and named.
+    /// A walked file edited in place since it was read is left as it is and named.
     #[test]
-    fn a_file_changed_since_it_was_read_is_left_and_named() {
+    fn walked_changed_left_alone() {
         let dir = scratch("write-changed");
-        let edited = FmtFile {
-            path: dir.join("Edited.ipe"),
-            origin: FmtOrigin::Walked(dir.clone()),
-        };
-        assert!(fs::write(&edited.path, "edited\n").is_ok());
-        let plan = vec![Rewrite {
-            file: &edited,
-            source: UNFORMATTED.to_owned(),
-            formatted: String::from("formatted\n"),
-        }];
+        let edited = dir.join("Edited.ipe");
+        assert!(fs::write(&edited, UNFORMATTED).is_ok());
+        let files = walked(&dir);
+        let plan: Vec<Rewrite<'_>> = files
+            .iter()
+            .filter_map(|f| planned(f, "formatted\n"))
+            .collect();
+        assert_eq!(plan.len(), 1);
+        assert!(fs::write(&edited, "edited\n").is_ok());
+        let res = write_rewrites(plan, RefusalSink::Human);
+        assert!(left_and_named(&res, "Edited.ipe"), "{res:?}");
+        assert_eq!(fs::read_to_string(&edited).unwrap_or_default(), "edited\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A walked file replaced by another file holding the same bytes is left as it is.
+    ///
+    /// The judgment is the identity read, not only the bytes: a byte compare
+    /// alone would take the stand-in for the file read and write over it.
+    #[test]
+    fn walked_replaced_same_bytes_left_alone() {
+        let dir = scratch("write-replaced");
+        let file = dir.join("Swapped.ipe");
+        assert!(fs::write(&file, UNFORMATTED).is_ok());
+        let files = walked(&dir);
+        let plan: Vec<Rewrite<'_>> = files
+            .iter()
+            .filter_map(|f| planned(f, "formatted\n"))
+            .collect();
+        assert_eq!(plan.len(), 1);
+        let stand_in = dir.join("stand-in");
+        assert!(fs::write(&stand_in, UNFORMATTED).is_ok());
+        assert!(fs::rename(&stand_in, &file).is_ok());
+        let res = write_rewrites(plan, RefusalSink::Human);
+        assert!(left_and_named(&res, "Swapped.ipe"), "{res:?}");
+        assert_eq!(fs::read_to_string(&file).unwrap_or_default(), UNFORMATTED);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A walked file swapped for a link to a file with the same bytes is left as it is, and so is the link's target.
+    #[cfg(unix)]
+    #[test]
+    fn walked_link_leaf_refused() {
+        let dir = scratch("write-link-leaf");
+        let outside = scratch("write-link-leaf-outside");
+        let file = dir.join("Linked.ipe");
+        let target = outside.join("Target.ipe");
+        assert!(fs::write(&file, UNFORMATTED).is_ok());
+        assert!(fs::write(&target, UNFORMATTED).is_ok());
+        let files = walked(&dir);
+        let plan: Vec<Rewrite<'_>> = files
+            .iter()
+            .filter_map(|f| planned(f, "formatted\n"))
+            .collect();
+        assert_eq!(plan.len(), 1);
+        assert!(fs::remove_file(&file).is_ok());
+        assert!(std::os::unix::fs::symlink(&target, &file).is_ok());
+        let res = write_rewrites(plan, RefusalSink::Human);
+        assert!(left_and_named(&res, "Linked.ipe"), "{res:?}");
+        assert_eq!(fs::read_to_string(&target).unwrap_or_default(), UNFORMATTED);
+        assert!(
+            fs::symlink_metadata(&file).is_ok_and(|m| m.file_type().is_symlink()),
+            "the link must stay a link"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    /// A walked file whose directory was swapped for a link is refused, the link's target untouched.
+    #[cfg(unix)]
+    #[test]
+    fn walked_link_dir_refused() {
+        let dir = scratch("write-link-dir");
+        let outside = scratch("write-link-dir-outside");
+        let sub = dir.join("sub");
+        assert!(fs::create_dir_all(&sub).is_ok());
+        assert!(fs::write(sub.join("Deep.ipe"), UNFORMATTED).is_ok());
+        assert!(fs::write(outside.join("Deep.ipe"), UNFORMATTED).is_ok());
+        let files = walked(&dir);
+        let plan: Vec<Rewrite<'_>> = files
+            .iter()
+            .filter_map(|f| planned(f, "formatted\n"))
+            .collect();
+        assert_eq!(plan.len(), 1);
+        assert!(fs::remove_dir_all(&sub).is_ok());
+        assert!(std::os::unix::fs::symlink(&outside, &sub).is_ok());
         let res = write_rewrites(plan, RefusalSink::Human);
         assert!(
-            matches!(&res, Err(CliError::Usage(m)) if m.contains("Edited.ipe")),
+            matches!(
+                res,
+                Err(CliError::OutputRefused(
+                    crate::output_dir::OutputRefusal::Symlink(_)
+                ))
+            ),
             "{res:?}"
         );
         assert_eq!(
-            fs::read_to_string(&edited.path).unwrap_or_default(),
-            "edited\n"
+            fs::read_to_string(outside.join("Deep.ipe")).unwrap_or_default(),
+            UNFORMATTED
         );
         let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
     }
 
     /// A malformed command line still renders the usage page.

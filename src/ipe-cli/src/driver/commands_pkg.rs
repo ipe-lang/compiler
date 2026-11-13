@@ -8,6 +8,7 @@ use super::{
     runtime_context_for_message, working_dir,
 };
 use crate::cargo_step::{CargoOutput, CargoTarget, TestRunKey, Verbosity};
+use crate::output_dir::held::{BACKUP_SLOTS, BackedUp, HeldDir, RelativeLeaf};
 use crate::output_dir::{
     EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths, ReleaseMember,
 };
@@ -3889,9 +3890,7 @@ fn fix_entry<W: Write>(mut graph: SourceGraph, auto: bool, w: &mut W) -> Result<
         return Ok(());
     }
 
-    let IfUnchanged::Written(backup) =
-        rewrite_user_file_if_unchanged(&entry_real, &source, &patched, RewriteKind::Lossy)?
-    else {
+    let FixWrite::Applied(backup) = write_fix(entry, &entry_real, &source, &patched)? else {
         writeln!(
             w,
             "fix: {} changed while it was being fixed — file left unchanged",
@@ -3907,10 +3906,57 @@ fn fix_entry<W: Write>(mut graph: SourceGraph, auto: bool, w: &mut W) -> Result<
         entry.display()
     )
     .map_err(|e| io_err(entry, e))?;
-    if let Some(backup) = backup {
-        writeln!(w, "fix: original kept at {}", backup.display()).map_err(|e| io_err(entry, e))?;
-    }
+    writeln!(w, "fix: original kept at {}", backup.display()).map_err(|e| io_err(entry, e))?;
     Ok(())
+}
+
+/// What writing one fix did.
+#[derive(Debug, PartialEq, Eq)]
+enum FixWrite {
+    /// The patch is in place; the diagnosed source is kept at this backup.
+    Applied(PathBuf),
+    /// The file no longer is the file holding the diagnosed source; nothing was written.
+    Changed,
+}
+
+/// Replace the fixed file at `real` with `patched`, only while it still is a file holding the diagnosed `source`.
+///
+/// The file is judged at write time, through its held parent: its bytes are
+/// compared with `source` and its identity handed to the writer, which keeps
+/// the judged bytes (never the file as it is by then) in a backup slot and
+/// replaces the file only while it still is the one judged. `shown` is the
+/// path the user named, for the refusal.
+///
+/// # Errors
+/// [`CliError::ProjectRefused`] when every backup slot is taken;
+/// [`crate::output_dir::OutputRefusal::Symlink`] for a linked backup
+/// directory; otherwise the read's or the writer's own refusal.
+fn write_fix(shown: &Path, real: &Path, source: &str, patched: &str) -> Result<FixWrite, CliError> {
+    let parent_path = real.parent().unwrap_or(real);
+    let leaf = RelativeLeaf::under(parent_path, real)?;
+    let parent = HeldDir::open_following(parent_path)?
+        .ok_or_else(|| io_err(parent_path, std::io::ErrorKind::NotFound.into()))?;
+    let name = leaf.leaf();
+    let (now, id) = parent.read_file_capped_identified(name, crate::io_bounded::SOURCE_CAP)?;
+    if now != source {
+        return Ok(FixWrite::Changed);
+    }
+    let backups = parent.path().join(BACKUP_DIR);
+    match parent.replace_backed_up(
+        name.as_os_str(),
+        id,
+        source,
+        crate::io_bounded::SOURCE_CAP,
+        |staged| staged.write_all(patched.as_bytes()),
+    )? {
+        BackedUp::Done(backup) => Ok(FixWrite::Applied(backups.join(backup.slot().as_os_str()))),
+        BackedUp::Changed => Ok(FixWrite::Changed),
+        BackedUp::BackupSlotsFull => Err(CliError::ProjectRefused(text::msg::fix_backups_full(
+            &shown.display(),
+            &backups.display(),
+            &BACKUP_SLOTS,
+        ))),
+    }
 }
 
 /// The diagnostic `ipe fix` may answer from `check`, or `None` once it has said why there is none.
@@ -4138,6 +4184,8 @@ pub fn rewrite_user_file(
 
 /// A rewrite conditioned on the file still holding the bytes it was judged by.
 #[derive(Debug, PartialEq, Eq)]
+// Unreached outside tests: `ipe fix` writes through the held writer.
+#[cfg_attr(not(test), allow(dead_code))]
 pub enum IfUnchanged {
     /// The file was replaced; carries the backup path when one was made.
     Written(Option<PathBuf>),
@@ -4152,6 +4200,8 @@ pub enum IfUnchanged {
 ///
 /// # Errors
 /// The re-read's own refusal; otherwise as [`rewrite_user_file`].
+// Unreached outside tests: `ipe fix` writes through the held writer.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn rewrite_user_file_if_unchanged(
     path: &Path,
     expected: &str,
@@ -5713,5 +5763,121 @@ mod upgrade_agents_tests {
         for status in [GuideStatus::Current, GuideStatus::Unread(Unread::Link)] {
             assert!(guide_suggestion(&status).is_none(), "{status:?} is silent");
         }
+    }
+}
+
+#[cfg(test)]
+mod fix_tests {
+    use super::*;
+    use crate::output_dir::OutputRefusal;
+    use crate::output_dir::held::{Synced, set_sync_hook};
+
+    const DIAGNOSED: &str = "diagnosed\n";
+    const PATCHED: &str = "patched\n";
+
+    /// A fresh scratch directory holding `Main.ipe` with the diagnosed source, and that file.
+    fn project(name: &str) -> (PathBuf, PathBuf) {
+        let dir = ipe_test_temp::temp_root().join(format!("ipe-fix-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(fs::create_dir_all(&dir).is_ok(), "{}", dir.display());
+        let file = dir.join("Main.ipe");
+        assert!(fs::write(&file, DIAGNOSED).is_ok());
+        (dir, file)
+    }
+
+    /// How many entries `dir` lists.
+    fn entries(dir: &Path) -> usize {
+        fs::read_dir(dir).map_or(0, Iterator::count)
+    }
+
+    /// A fix of an unchanged file is written, the diagnosed source kept in a backup slot.
+    #[test]
+    fn fix_written_with_backup() {
+        let (dir, file) = project("written");
+        let res = write_fix(&file, &file, DIAGNOSED, PATCHED);
+        let backup = dir.join(BACKUP_DIR).join("Main.ipe.bak");
+        assert_eq!(res.ok(), Some(FixWrite::Applied(backup.clone())));
+        assert_eq!(fs::read_to_string(&file).unwrap_or_default(), PATCHED);
+        assert_eq!(fs::read_to_string(&backup).unwrap_or_default(), DIAGNOSED);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A file edited since it was diagnosed is left as it is, and no backup is made.
+    #[test]
+    fn fix_changed_left_alone() {
+        let (dir, file) = project("changed");
+        assert!(fs::write(&file, "edited\n").is_ok());
+        let res = write_fix(&file, &file, DIAGNOSED, PATCHED);
+        assert_eq!(res.ok(), Some(FixWrite::Changed));
+        assert_eq!(fs::read_to_string(&file).unwrap_or_default(), "edited\n");
+        assert_eq!(entries(&dir.join(BACKUP_DIR)), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The backup holds the bytes the fix was judged against, not the file as it was while the backup was made.
+    ///
+    /// The file is edited in place once the patch is staged and restored once
+    /// the backup slot is synced: a backup copied from the file would hold the
+    /// edit, the judged bytes never do.
+    #[test]
+    fn backup_from_judged_bytes() {
+        let (dir, file) = project("judged");
+        let edited = file.clone();
+        let mut restored = false;
+        set_sync_hook(Some(Box::new(move |synced, _| match synced {
+            Synced::Staged => {
+                let _ = fs::write(&edited, "edited\n");
+            }
+            Synced::Directory if !restored => {
+                restored = true;
+                let _ = fs::write(&edited, DIAGNOSED);
+            }
+            Synced::Directory => {}
+        })));
+        let res = write_fix(&file, &file, DIAGNOSED, PATCHED);
+        set_sync_hook(None);
+        let backup = dir.join(BACKUP_DIR).join("Main.ipe.bak");
+        assert_eq!(res.ok(), Some(FixWrite::Applied(backup.clone())));
+        assert_eq!(fs::read_to_string(&backup).unwrap_or_default(), DIAGNOSED);
+        assert_eq!(fs::read_to_string(&file).unwrap_or_default(), PATCHED);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A backup directory that is a link is refused, the file and the link's target untouched.
+    #[cfg(unix)]
+    #[test]
+    fn backup_dir_link_refused() {
+        let (dir, file) = project("backup-link");
+        let elsewhere = dir.join("elsewhere");
+        assert!(fs::create_dir_all(&elsewhere).is_ok());
+        assert!(std::os::unix::fs::symlink(&elsewhere, dir.join(BACKUP_DIR)).is_ok());
+        let res = write_fix(&file, &file, DIAGNOSED, PATCHED);
+        assert!(
+            matches!(res, Err(CliError::OutputRefused(OutputRefusal::Symlink(_)))),
+            "{res:?}"
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap_or_default(), DIAGNOSED);
+        assert_eq!(entries(&elsewhere), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Every backup slot taken refuses the fix, the file untouched and no slot added.
+    #[test]
+    fn slots_full_refused() {
+        let (dir, file) = project("slots-full");
+        let backups = dir.join(BACKUP_DIR);
+        assert!(fs::create_dir_all(&backups).is_ok());
+        assert!(fs::write(backups.join("Main.ipe.bak"), "old\n").is_ok());
+        for n in 1..BACKUP_SLOTS {
+            assert!(fs::write(backups.join(format!("Main.ipe.bak.{n}")), "old\n").is_ok());
+        }
+        let res = write_fix(&file, &file, DIAGNOSED, PATCHED);
+        assert!(
+            matches!(&res, Err(CliError::ProjectRefused(m)) if m.contains(BACKUP_DIR) && m.contains("Main.ipe")),
+            "{res:?}"
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap_or_default(), DIAGNOSED);
+        assert_eq!(entries(&backups), usize::from(BACKUP_SLOTS));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

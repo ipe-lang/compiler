@@ -100,6 +100,10 @@ ipe {command}: --port `{value}` is not a port number (1-65535)
 
 usage: ipe fix <path> [--yes]
 
+## fix-backups-full
+
+no free backup name for {file} in `{dir}/` ({slots} taken); file left unchanged; remove old backups there and run `ipe fix` again
+
 ## lsp-takes-no-arguments
 
 ipe lsp takes no arguments

@@ -655,6 +655,8 @@ messages! {
     port_invalid(command, value) = "port-invalid";
     /// `ipe fix` without its path.
     fix_usage = "fix-usage";
+    /// `ipe fix` found every backup slot taken.
+    fix_backups_full(file, dir, slots) = "fix-backups-full";
     /// `ipe lsp` given any arguments.
     lsp_takes_no_arguments = "lsp-takes-no-arguments";
     /// `ipe lint` given more than one path.
