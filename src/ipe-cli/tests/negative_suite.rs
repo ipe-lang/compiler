@@ -1964,6 +1964,37 @@ fn custom_element_ctor_missing_file_rejected() {
     assert_rejected_with_files("custom_element_missing_file", &src, &[], "IPE-N0044");
 }
 
+/// The control for the [`WEB_ENTRY`] file refusals: the same program with its
+/// widget-hook file present compiles, so each of those refusals is caused by
+/// the file alone, never by the entry around it.
+#[test]
+fn custom_element_web_entry_with_its_file_compiles() {
+    let src = format!(
+        "{HEAD}import Ipe.Ffi.Js.CustomElement as CustomElement\n\
+         {WEB_ENTRY}\
+         editor : CustomElement Int String\n\
+         editor = CustomElement.fromFile \"js/present.js\"\n"
+    );
+    match compile_with_files(
+        "custom_element_web_entry_control",
+        &src,
+        &[(
+            "js/present.js",
+            "export function mount(host, emit) { return {}; }\n",
+        )],
+    ) {
+        Outcome::Accepted(how) if how.starts_with("compiled successfully") => {}
+        Outcome::Accepted(how) => assert!(
+            false_marker(),
+            "custom_element_web_entry_control: expected a clean compile, got ({how})"
+        ),
+        Outcome::Rejected(got) => assert!(
+            false_marker(),
+            "custom_element_web_entry_control: expected a clean compile, got {got}"
+        ),
+    }
+}
+
 /// (d) `customElement "../escape.js"` is rejected by the shared path seal — a `..`
 /// that climbs out of the project root is refused at build (IPE-P0063).
 #[test]
