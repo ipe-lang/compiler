@@ -1523,6 +1523,9 @@ fn claim_attr<M>(html_attrs: &mut Vec<HtmlAttribute<M>>, attr: HtmlAttribute<M>)
                 !k.trim().eq_ignore_ascii_case(name)
             }
             HtmlAttribute::EventAttr(_) | HtmlAttribute::NoAttr => true,
+            // A page link's href is an `href` the claim replaces too.
+            #[cfg(feature = "web-core")]
+            HtmlAttribute::PageHref(_) => !name.trim().eq_ignore_ascii_case("href"),
         });
     }
     html_attrs.push(attr);

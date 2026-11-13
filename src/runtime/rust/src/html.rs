@@ -3673,6 +3673,8 @@ mod tests {
                 | Attribute::BoolAttr(..)
                 | Attribute::EventAttr(_)
                 | Attribute::NoAttr => None,
+                #[cfg(feature = "web-core")]
+                Attribute::PageHref(_) => None,
             })
             .collect();
         assert_eq!(reserved, vec![(STAMPED_ID_ATTR, "r")]);
