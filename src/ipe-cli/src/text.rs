@@ -1380,7 +1380,9 @@ messages! {
     /// An `ipe health` install command exited non-zero.
     health_install_failed(program) = "health-install-failed";
     /// `ipe health` refused to overwrite a malformed config.
-    health_config_not_toml(path, detail) = "health-config-not-toml";
+    health_config_not_toml(path, line) = "health-config-not-toml";
+    /// `ipe health` refused to overwrite a malformed config the parser named no line of.
+    health_config_not_toml_unplaced(path) = "health-config-not-toml-unplaced";
     /// `ipe health`'s edited config did not re-parse.
     health_config_edit_unparsable(path) = "health-config-edit-unparsable";
     /// `ipe health`'s config changed between its read and the replace.

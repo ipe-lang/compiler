@@ -1898,6 +1898,35 @@ fn apply_config_edit(
 /// [`CliError::Usage`] when the existing file does not parse as TOML (the
 /// command will not blindly overwrite a file it cannot understand);
 /// [`CliError::Io`] or an [`OutputRefusal`] on a filesystem failure.
+/// Where an existing config failed to parse: a line number, never the parser's text, which quotes the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigFault {
+    /// The parse failed on this 1-based line.
+    Line(usize),
+    /// The parser named no place in the file.
+    Unplaced,
+}
+
+impl ConfigFault {
+    /// The place in `text` that `error` names.
+    fn of(text: &str, error: &toml_edit::TomlError) -> Self {
+        error
+            .span()
+            .and_then(|span| text.get(..span.start))
+            .map_or(Self::Unplaced, |before| {
+                Self::Line(before.matches('\n').count().saturating_add(1))
+            })
+    }
+
+    /// The refusal to overwrite the config at `path`.
+    fn message(self, path: &Path) -> crate::text::Message {
+        match self {
+            Self::Line(line) => crate::text::msg::health_config_not_toml(&path.display(), &line),
+            Self::Unplaced => crate::text::msg::health_config_not_toml_unplaced(&path.display()),
+        }
+    }
+}
+
 fn edit_config(
     path: &Path,
     key: &[&str],
@@ -1925,12 +1954,9 @@ fn edit_config(
     };
     let existing = judged.as_ref().map_or("", |(text, _)| text.as_str());
 
-    let mut doc = existing.parse::<toml_edit::DocumentMut>().map_err(|e| {
-        CliError::Usage(crate::text::msg::health_config_not_toml(
-            &path.display(),
-            &e,
-        ))
-    })?;
+    let mut doc = existing
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| CliError::Usage(ConfigFault::of(existing, &e).message(path)))?;
 
     // Idempotent: if the key already holds exactly this value, no write, no
     // backup — running health twice changes nothing.
@@ -2374,6 +2400,45 @@ mod tests {
         assert!(
             !backups.join("config.toml.bak.1").exists(),
             "idempotent edit writes no second backup"
+        );
+    }
+
+    /// A config that is not TOML is refused by its line, the parser's text (which quotes the file) never echoed.
+    #[test]
+    fn config_not_toml_names_line_not_content() {
+        let dir = TempDir::new("cfg_not_toml");
+        let cfg = dir.path().join("config.toml");
+        let quoted = "SENTINEL-VALUE-NOT-ECHOED";
+        let source = format!("[build]\njobs = 4\n[registry]\ntoken = {quoted}\n");
+        std::fs::write(&cfg, &source).expect("seed the config");
+        let val = ConfigValue::Str("sccache".to_owned());
+        let refused = edit_config(&cfg, &["build", "rustc-wrapper"], &val);
+        let after = std::fs::read_to_string(&cfg).expect("read back");
+        let message = match &refused {
+            Err(CliError::Usage(message)) => message.to_string(),
+            other => format!("not a usage refusal: {other:?}"),
+        };
+        assert!(
+            !message.contains(quoted),
+            "the file is never quoted: {message}"
+        );
+        assert_eq!(
+            message,
+            crate::text::msg::health_config_not_toml(&cfg.display(), &4).to_string()
+        );
+        assert_eq!(after, source, "the config is left as it was");
+    }
+
+    /// A parse failure past the text, or at no place, names no line.
+    #[test]
+    fn config_fault_line_is_bounded() {
+        let error = "[x".parse::<toml_edit::DocumentMut>().err();
+        let fault = error.as_ref().map(|e| ConfigFault::of("[x", e));
+        assert_eq!(fault, Some(ConfigFault::Line(1)));
+        let past = error.as_ref().map(|e| ConfigFault::of("", e));
+        assert!(
+            matches!(past, Some(ConfigFault::Unplaced | ConfigFault::Line(1))),
+            "{past:?}"
         );
     }
 

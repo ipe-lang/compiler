@@ -1596,7 +1596,11 @@ health: `{program}` exited non-zero — nothing was changed
 
 ## health-config-not-toml
 
-health: {path} is not valid TOML ({detail}); refusing to overwrite it
+health: {path} is not valid TOML (line {line}); refusing to overwrite it
+
+## health-config-not-toml-unplaced
+
+health: {path} is not valid TOML; refusing to overwrite it
 
 ## health-config-edit-unparsable
 
