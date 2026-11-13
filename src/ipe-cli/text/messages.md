@@ -1402,6 +1402,10 @@ the source root {path} cannot be resolved — ipe cannot prove the output stays 
 
 {path} is held open by another program (an editor, a file indexer, or antivirus) — close it there or let that program finish, then run the command again
 
+## output-replace-denied
+
+{path} cannot be replaced: it is read-only or its permissions refuse this user; it was left as it was — clear its read-only attribute or fix its permissions, then run the command again
+
 ## output-claim-busy
 
 {path} is being claimed by another ipe process, still in progress after {waited}s — let that run finish, then run the command again; if no ipe process is active, another program holds `{claim}` locked: delete `{claim}` in {path} and run the command again

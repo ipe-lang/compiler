@@ -87,6 +87,12 @@ pub fn is_in_use(error: &io::Error) -> bool {
     )
 }
 
+/// Whether `error` is access denied: a read-only entry, an access list refusing this user, or a name pending deletion.
+#[must_use]
+pub fn is_access_denied(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(ERROR_ACCESS_DENIED)
+}
+
 /// The [`io::Error`] a refused re-proof of a held directory stands for.
 ///
 /// A held directory that became a reparse point answers the raw reparse

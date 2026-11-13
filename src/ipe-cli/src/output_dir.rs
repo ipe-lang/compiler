@@ -482,6 +482,11 @@ pub enum OutputRefusal {
     /// On Windows an editor, a file indexer, or antivirus holding a file or
     /// directory without delete sharing blocks its removal until released.
     InUse(PathBuf),
+    /// A file the system refuses to let ipe replace.
+    ///
+    /// On Windows a read-only file, or one whose access list refuses this
+    /// user, cannot be renamed over; it is left as it was.
+    ReplaceDenied(PathBuf),
     /// Another ipe process still holds the directory's claim after the wait bound.
     ClaimBusy {
         /// The directory being claimed.
@@ -555,6 +560,7 @@ impl std::fmt::Display for OutputRefusal {
             Self::TooDeep { path, limit } => text::output_too_deep(&path.display(), limit),
             Self::ReparsePoint(p) => text::output_reparse_point(&p.display()),
             Self::InUse(p) => text::output_in_use(&p.display()),
+            Self::ReplaceDenied(p) => text::output_replace_denied(&p.display()),
             Self::ClaimBusy { dir, waited } => {
                 text::output_claim_busy(&dir.display(), &waited.as_secs(), &CLAIM_FILE)
             }

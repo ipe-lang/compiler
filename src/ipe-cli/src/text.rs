@@ -2007,6 +2007,8 @@ messages! {
     output_reparse_point(path) = "output-reparse-point";
     /// An entry another program holds open, so ipe cannot remove or replace it.
     output_in_use(path) = "output-in-use";
+    /// A file the system refuses to let ipe replace.
+    output_replace_denied(path) = "output-replace-denied";
     /// An output directory another ipe process is still claiming past the wait bound.
     output_claim_busy(path, waited, claim) = "output-claim-busy";
     /// An output directory on a filesystem that refused the claim's file lock.

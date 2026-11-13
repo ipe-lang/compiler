@@ -249,6 +249,20 @@ fn act_err(path: &Path, error: io::Error) -> CliError {
     io_err(path, error)
 }
 
+/// The error for a rename that replaces the judged file at `path`, failed with `error`.
+///
+/// Windows refuses to rename over a read-only file, or one whose access list
+/// refuses this user, with access denied: [`OutputRefusal::ReplaceDenied`],
+/// whose message names the fix. A name pending deletion answers the same and
+/// is told apart before this mapping. Anything else is as [`act_err`].
+fn replace_err(path: &Path, error: io::Error) -> CliError {
+    #[cfg(windows)]
+    if sys::is_access_denied(&error) {
+        return OutputRefusal::ReplaceDenied(path.to_path_buf()).into();
+    }
+    act_err(path, error)
+}
+
 /// The error for an open or read of `path` that `refusal` turned back.
 ///
 /// An entry another program holds open is refused with
@@ -1923,8 +1937,12 @@ impl HeldDir {
             return Ok(false);
         }
         drop(staged);
-        sys::rename(&self.dir, staging, target).map_err(|e| act_err(&path, e))?;
-        Ok(true)
+        match sys::rename(&self.dir, staging, target) {
+            Ok(()) => Ok(true),
+            // A judged file another program is deleting no longer is the judged file.
+            Err(e) if sys::is_claim_pending(&self.dir, target, &e) => Ok(false),
+            Err(e) => Err(replace_err(&path, e)),
+        }
     }
 
     /// Sync this directory, so the entries last renamed or created in it survive a crash.
@@ -4247,6 +4265,55 @@ mod tests {
         );
         assert!(staged_in(&base).is_empty());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Windows: a read-only judged file is a typed refusal, left as it was, nothing staged left behind.
+    #[cfg(windows)]
+    #[test]
+    fn read_only_target_replace_denied() {
+        let base = scratch("read_only_target");
+        let (held, id, text) = judged_n(&base, "old");
+        let mut read_only = std::fs::metadata(base.join("N"))
+            .expect("judged")
+            .permissions();
+        read_only.set_readonly(true);
+        std::fs::set_permissions(base.join("N"), read_only).expect("make N read-only");
+        let done =
+            held.replace_if_unchanged(OsStr::new("N"), id, &text, byte_cap(4096), fill_unsynced);
+        assert!(
+            matches!(
+                &done,
+                Err(CliError::OutputRefused(OutputRefusal::ReplaceDenied(p))) if p == &base.join("N")
+            ),
+            "{done:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("N")).ok().as_deref(),
+            Some("old")
+        );
+        assert!(staged_in(&base).is_empty());
+        let mut writable = std::fs::metadata(base.join("N"))
+            .expect("judged")
+            .permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        // reason: undo the test's read-only bit so the scratch can be removed
+        writable.set_readonly(false);
+        let _ = std::fs::set_permissions(base.join("N"), writable);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Windows: access denied on the replacing rename maps to the typed refusal; any other failure stays I/O.
+    #[cfg(windows)]
+    #[test]
+    fn replace_err_maps_access_denied() {
+        let path = Path::new("N");
+        let denied = replace_err(path, io::Error::from_raw_os_error(5));
+        assert!(
+            matches!(&denied, CliError::OutputRefused(OutputRefusal::ReplaceDenied(p)) if p == path),
+            "{denied:?}"
+        );
+        let other = replace_err(path, io::Error::from(io::ErrorKind::StorageFull));
+        assert!(matches!(other, CliError::Io { .. }), "{other:?}");
     }
 
     /// Whether `parsed` is the unsafe-component refusal.
