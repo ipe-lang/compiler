@@ -44,10 +44,66 @@ pub const ANDROID_ASSET_HOST: &str = android_asset_host!();
 /// It is a public `https` host name the shell answers locally.
 pub const ANDROID_ASSET_ORIGIN: &str = concat!("https://", android_asset_host!());
 
+/// Expands to the custom URL scheme a packaged shell serves its bundle under,
+/// so every origin built from it is one spelling.
+macro_rules! app_scheme {
+    () => {
+        "ipe-app"
+    };
+}
+
+/// The custom URL scheme the iOS and desktop shells serve their bundle under.
+pub const APP_SCHEME: &str = app_scheme!();
+
 /// The page origin of a packaged iOS bundle.
 ///
 /// The shell's custom URL scheme handler serves it.
-pub const IOS_SCHEME_ORIGIN: &str = "ipe-app://app";
+pub const IOS_SCHEME_ORIGIN: &str = concat!(app_scheme!(), "://app");
+
+/// The page origin of a desktop shell whose webview serves a custom scheme as
+/// `<scheme>://<host>`.
+pub const DESKTOP_SCHEME_ORIGIN: &str = concat!(app_scheme!(), "://localhost");
+
+/// The page origin of a desktop shell whose webview serves a custom scheme as
+/// `https://<scheme>.<host>`.
+///
+/// The host is under `.localhost`, the one reserved name that is never public.
+pub const DESKTOP_HTTPS_HOST_ORIGIN: &str = concat!("https://", app_scheme!(), ".localhost");
+
+/// How a desktop webview spells the shell's custom-scheme origin.
+///
+/// Closed: each spelling renders exactly one origin through [`Self::origin`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchemeSpelling {
+    /// `ipe-app://localhost` (WebKitGTK, WKWebView).
+    Scheme,
+    /// `https://ipe-app.localhost` (WebView2 under its `https` scheme mode).
+    HttpsHost,
+}
+
+impl SchemeSpelling {
+    /// Every spelling, in declaration order.
+    pub const ALL: [Self; 2] = [Self::Scheme, Self::HttpsHost];
+
+    /// The page origin the spelling names.
+    #[must_use]
+    pub const fn origin(self) -> &'static str {
+        match self {
+            Self::Scheme => DESKTOP_SCHEME_ORIGIN,
+            Self::HttpsHost => DESKTOP_HTTPS_HOST_ORIGIN,
+        }
+    }
+
+    /// The spelling the webview of the compiling OS uses.
+    #[must_use]
+    pub const fn native() -> Self {
+        if cfg!(windows) {
+            Self::HttpsHost
+        } else {
+            Self::Scheme
+        }
+    }
+}
 
 /// The host that serves a static browser bundle's page.
 ///
@@ -61,11 +117,19 @@ pub enum BundleHost {
     AndroidAssets,
     /// The iOS shell, serving the bundle from [`IOS_SCHEME_ORIGIN`].
     IosScheme,
+    /// A desktop shell, serving the bundle from its spelling's origin.
+    DesktopScheme(SchemeSpelling),
 }
 
 impl BundleHost {
     /// Every host, in declaration order.
-    pub const ALL: [Self; 3] = [Self::Served, Self::AndroidAssets, Self::IosScheme];
+    pub const ALL: [Self; 5] = [
+        Self::Served,
+        Self::AndroidAssets,
+        Self::IosScheme,
+        Self::DesktopScheme(SchemeSpelling::Scheme),
+        Self::DesktopScheme(SchemeSpelling::HttpsHost),
+    ];
 }
 
 /// A policy directive the runtime emits.
@@ -254,6 +318,9 @@ pub enum Source<'a> {
     /// [`ANDROID_ASSET_ORIGIN`], the Android shell's page origin, named
     /// explicitly so its `wss` twin is not admitted.
     AssetOrigin,
+    /// A desktop shell's page origin, named explicitly so its `wss` twin is
+    /// not admitted.
+    SchemeOrigin(SchemeSpelling),
     /// One parsed server origin in its `https` form.
     #[cfg(feature = "encoding")]
     Origin(&'a ServerOrigin),
@@ -275,6 +342,7 @@ impl Source<'_> {
             Self::Embed(framing) => framing.sources(),
             Self::WasmUnsafeEval => "'wasm-unsafe-eval'",
             Self::AssetOrigin => ANDROID_ASSET_ORIGIN,
+            Self::SchemeOrigin(spelling) => spelling.origin(),
             Self::Nonce(nonce) => {
                 out.push_str("'nonce-");
                 nonce.write_token(out);
@@ -318,6 +386,10 @@ pub enum ConnectSource<'a> {
     SelfOrigin,
     /// [`ANDROID_ASSET_ORIGIN`], named explicitly.
     AndroidAssets,
+    /// A desktop shell's page origin, named explicitly: under the `https`
+    /// spelling `'self'` would also admit the origin's `wss` twin, which a
+    /// browser resolves to loopback.
+    DesktopScheme(SchemeSpelling),
     /// A pinned server origin in its `https` form.
     Https(&'a ServerOrigin),
     /// A pinned server origin in its `wss` form.
@@ -332,6 +404,7 @@ impl<'a> ConnectSource<'a> {
         match self {
             Self::SelfOrigin => Source::SelfOrigin,
             Self::AndroidAssets => Source::AssetOrigin,
+            Self::DesktopScheme(spelling) => Source::SchemeOrigin(spelling),
             Self::Https(origin) => Source::Origin(origin),
             Self::Wss(origin) => Source::WsOrigin(origin),
         }
@@ -342,8 +415,9 @@ impl<'a> ConnectSource<'a> {
 #[cfg(feature = "encoding")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReachRefusal {
-    /// A server names the Android asset host, which the shell answers
-    /// locally, so the local origin and a network origin would be one.
+    /// A server names a host the shell answers locally (the Android asset
+    /// host, or the loopback family under a desktop shell), so the local
+    /// origin and a network origin would be one.
     LocalOriginListed {
         /// The refused server origin.
         origin: ServerOrigin,
@@ -356,7 +430,7 @@ impl std::fmt::Display for ReachRefusal {
         match self {
             Self::LocalOriginListed { origin } => write!(
                 f,
-                "server origin {} names the Android shell's local asset host",
+                "server origin {} names the shell's local origin",
                 origin.https()
             ),
         }
@@ -385,21 +459,23 @@ impl<'a> BundleReach<'a> {
     /// # Errors
     ///
     /// `LocalOriginListed` when `host` is [`BundleHost::AndroidAssets`] and a
-    /// server's host is [`ANDROID_ASSET_HOST`], at any port. Under every other
+    /// server's host is [`ANDROID_ASSET_HOST`], or `host` is
+    /// [`BundleHost::DesktopScheme`] and a server's host is `localhost`, a
+    /// `*.localhost` name or an IP literal, at any port. Under every other
     /// host the reach is always built.
     pub fn new(host: BundleHost, servers: &'a ServerOrigins) -> Result<Self, ReachRefusal> {
-        match host {
-            BundleHost::Served | BundleHost::IosScheme => {}
-            BundleHost::AndroidAssets => {
-                if let Some(origin) = servers
-                    .origins()
-                    .find(|origin| names_asset_host(origin.authority()))
-                {
-                    return Err(ReachRefusal::LocalOriginListed {
-                        origin: origin.clone(),
-                    });
-                }
-            }
+        let names_local: fn(&str) -> bool = match host {
+            BundleHost::Served | BundleHost::IosScheme => |_| false,
+            BundleHost::AndroidAssets => names_asset_host,
+            BundleHost::DesktopScheme(_) => names_loopback_host,
+        };
+        if let Some(origin) = servers
+            .origins()
+            .find(|origin| names_local(origin.authority()))
+        {
+            return Err(ReachRefusal::LocalOriginListed {
+                origin: origin.clone(),
+            });
         }
         Ok(Self { host, servers })
     }
@@ -424,6 +500,7 @@ impl<'a> BundleReach<'a> {
         match self.host {
             BundleHost::Served | BundleHost::IosScheme => ConnectSource::SelfOrigin,
             BundleHost::AndroidAssets => ConnectSource::AndroidAssets,
+            BundleHost::DesktopScheme(spelling) => ConnectSource::DesktopScheme(spelling),
         }
     }
 
@@ -453,15 +530,38 @@ impl<'a> BundleReach<'a> {
 /// already refuses each, so this holds without trusting that it does.
 #[cfg(feature = "encoding")]
 fn names_asset_host(authority: &str) -> bool {
+    authority_host(authority).eq_ignore_ascii_case(ANDROID_ASSET_HOST)
+}
+
+/// Whether `authority` names `localhost`, a `*.localhost` name or an IP
+/// literal, at any port.
+///
+/// It reads the host as [`names_asset_host`] does, so every spelling a
+/// resolver reads as the same host is judged alike.
+#[cfg(feature = "encoding")]
+fn names_loopback_host(authority: &str) -> bool {
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host_port)| host_port);
+    if host_port.starts_with('[') {
+        return true;
+    }
+    let host = authority_host(authority).to_ascii_lowercase();
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host.parse::<std::net::Ipv4Addr>().is_ok()
+}
+
+/// The host of `authority`, without any `user@`, `:port` or one trailing `.`.
+#[cfg(feature = "encoding")]
+fn authority_host(authority: &str) -> &str {
     let host_port = authority
         .rsplit_once('@')
         .map_or(authority, |(_, host_port)| host_port);
     let host = host_port
         .split_once(':')
         .map_or(host_port, |(host, _)| host);
-    host.strip_suffix('.')
-        .unwrap_or(host)
-        .eq_ignore_ascii_case(ANDROID_ASSET_HOST)
+    host.strip_suffix('.').unwrap_or(host)
 }
 
 /// Declares [`Profile`] and [`Profile::ALL`] from one variant list.
@@ -1271,6 +1371,7 @@ mod tests {
 #[cfg(all(test, feature = "encoding", not(target_arch = "wasm32")))]
 mod bundle_tests {
     use super::*;
+    use crate::encoding::ServerOriginRefusal;
 
     /// The offline bundle's policy: today's shell, byte for byte.
     const OFFLINE: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
@@ -1355,6 +1456,8 @@ mod bundle_tests {
         match host {
             BundleHost::Served | BundleHost::IosScheme => "'self'",
             BundleHost::AndroidAssets => "https://appassets.androidplatform.net",
+            BundleHost::DesktopScheme(SchemeSpelling::Scheme) => "ipe-app://localhost",
+            BundleHost::DesktopScheme(SchemeSpelling::HttpsHost) => "https://ipe-app.localhost",
         }
     }
 
@@ -1368,7 +1471,7 @@ mod bundle_tests {
         );
         assert_eq!(IOS_SCHEME_ORIGIN, "ipe-app://app");
         assert_eq!(HEADER_NAME, "Content-Security-Policy");
-        assert_eq!(BundleHost::ALL.len(), 3);
+        assert_eq!(BundleHost::ALL.len(), 5);
         for (i, h) in BundleHost::ALL.iter().enumerate() {
             assert_eq!(
                 BundleHost::ALL.iter().position(|g| g == h),
@@ -1527,6 +1630,116 @@ mod bundle_tests {
                     "{host:?} {admitted}"
                 );
             }
+        }
+    }
+
+    /// Each desktop spelling renders its one exact origin, and every shell
+    /// origin is built from the one [`APP_SCHEME`].
+    #[test]
+    fn scheme_spelling_origins_are_exact() {
+        assert_eq!(APP_SCHEME, "ipe-app");
+        assert_eq!(SchemeSpelling::Scheme.origin(), "ipe-app://localhost");
+        assert_eq!(
+            SchemeSpelling::HttpsHost.origin(),
+            "https://ipe-app.localhost"
+        );
+        assert_eq!(IOS_SCHEME_ORIGIN, format!("{APP_SCHEME}://app"));
+        assert_eq!(DESKTOP_SCHEME_ORIGIN, format!("{APP_SCHEME}://localhost"));
+        assert_eq!(
+            DESKTOP_HTTPS_HOST_ORIGIN,
+            format!("https://{APP_SCHEME}.localhost")
+        );
+        assert_eq!(
+            SchemeSpelling::native(),
+            if cfg!(windows) {
+                SchemeSpelling::HttpsHost
+            } else {
+                SchemeSpelling::Scheme
+            }
+        );
+    }
+
+    /// Under a desktop shell `connect-src` names the shell origin explicitly
+    /// and never `'self'`, whose `wss` twin a browser resolves to loopback.
+    #[test]
+    fn desktop_scheme_connect_src_names_the_origin_not_self() {
+        for spelling in SchemeSpelling::ALL {
+            for servers in &server_lists() {
+                let value = ContentSecurityPolicy::for_bundle(
+                    &reach(BundleHost::DesktopScheme(spelling), servers),
+                    BundleWorker::None,
+                )
+                .header_value();
+                let tokens = connect_tokens(&value);
+                assert_eq!(tokens.first(), Some(&spelling.origin()), "{value}");
+                assert!(!tokens.contains(&"'self'"), "{value}");
+                assert!(
+                    !tokens
+                        .iter()
+                        .any(|token| token.contains("localhost") && *token != spelling.origin()),
+                    "{value}"
+                );
+            }
+        }
+    }
+
+    /// A desktop reach refuses a server in the loopback family, which the
+    /// webview would read as its own machine.
+    #[test]
+    #[allow(clippy::expect_used)] // every origin here is well-formed
+    fn desktop_scheme_refuses_a_loopback_server() {
+        let parse = |text: &str| ServerOrigin::parse(text).expect("origin");
+        for refused in [
+            "https://localhost",
+            "https://localhost:8443",
+            "https://api.localhost",
+        ] {
+            let origin = parse(refused);
+            let servers =
+                ServerOrigins::new([parse("https://api.example"), origin.clone()]).expect("list");
+            for spelling in SchemeSpelling::ALL {
+                assert_eq!(
+                    BundleReach::new(BundleHost::DesktopScheme(spelling), &servers),
+                    Err(ReachRefusal::LocalOriginListed {
+                        origin: origin.clone()
+                    }),
+                    "{spelling:?} {refused}"
+                );
+            }
+        }
+        for literal in ["https://127.0.0.1", "https://[::1]"] {
+            assert_eq!(
+                ServerOrigin::parse(literal),
+                Err(ServerOriginRefusal::IpLiteral),
+                "{literal}"
+            );
+        }
+        for authority in [
+            "127.0.0.1",
+            "127.0.0.1:80",
+            "[::1]",
+            "[::1]:443",
+            "LOCALHOST",
+            "localhost.",
+            "a.LocalHost",
+            "u@localhost",
+        ] {
+            assert!(names_loopback_host(authority), "{authority}");
+        }
+        for authority in ["localhost.example", "xlocalhost", "api.example"] {
+            assert!(!names_loopback_host(authority), "{authority}");
+        }
+    }
+
+    /// `BundleHost::ALL` lists both desktop spellings, so every test over
+    /// `ALL` judges them.
+    #[test]
+    fn bundle_host_all_lists_desktop_scheme() {
+        for spelling in SchemeSpelling::ALL {
+            assert!(
+                BundleHost::ALL.contains(&BundleHost::DesktopScheme(spelling)),
+                "{spelling:?}"
+            );
         }
     }
 
