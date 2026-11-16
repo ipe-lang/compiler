@@ -6113,6 +6113,7 @@ mod bind_tests {
 
     const SOURCE: &str = "/usr/home/u/project";
 
+    #[allow(clippy::unwrap_used)] // a test fixture directory always opens
     fn held_id(path: &Path) -> ipe_fs_open::FileId {
         hold_canonical(&SafeMountPath::new(path).unwrap())
             .unwrap()
