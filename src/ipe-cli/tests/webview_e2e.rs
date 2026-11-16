@@ -269,8 +269,9 @@ fn is_missing_linux_webview_system_libs(err: &str) -> bool {
 /// - emit: a webview-hosted `Web.tea` renders the `WebViewApp` executor with the
 ///   delivery-host window, and the `fn main` epilogue switches to `run_blocking`.
 /// - manifest: the emitted crate promotes `"webview"` to its default features,
-///   wires `webview = ["dep:wry", "dep:tao"]`, and the runtime `mod.rs` gets the
-///   `webview` module line.
+///   wires `webview` to the runtime crate's own feature edges (its
+///   `webview-shell` pulling the native webview dependencies), and the runtime
+///   `mod.rs` gets the `webview` module line.
 #[test]
 fn webview_counter_build_only() -> Result<(), BoxError> {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
