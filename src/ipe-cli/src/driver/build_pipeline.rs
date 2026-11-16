@@ -1837,7 +1837,7 @@ impl WidgetManifest {
 
     /// Whether no widget-hook file was admitted.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
@@ -1866,7 +1866,7 @@ fn admit_widget_file(
     manifest: &mut WidgetManifest,
 ) -> Result<(), WidgetFileRefusal> {
     let contained = contained_path::ContainedRelPath::parse(widget_root, cleaned_path)
-        .map_err(|escape| WidgetFileRefusal::Escapes(widget_path_escape(escape)))?;
+        .map_err(|escape| WidgetFileRefusal::Escapes(widget_path_escape(&escape)))?;
     let content = crate::io_bounded::read_beneath(
         widget_root,
         contained.resolved(),
@@ -1877,7 +1877,7 @@ fn admit_widget_file(
 }
 
 /// The diagnostic's mirror of a containment escape.
-const fn widget_path_escape(escape: contained_path::PathEscape) -> WidgetPathEscape {
+const fn widget_path_escape(escape: &contained_path::PathEscape) -> WidgetPathEscape {
     match escape {
         contained_path::PathEscape::ParentTraversal => WidgetPathEscape::ParentTraversal,
         contained_path::PathEscape::Absolute => WidgetPathEscape::Absolute,
