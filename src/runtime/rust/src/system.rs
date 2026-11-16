@@ -679,11 +679,16 @@ pub(crate) fn shown_env_value(raw: &[u8]) -> String {
 /// Reads the shared platform variable [`super::home_core::HOME_VAR`]
 /// (`USERPROFILE` on Windows, `HOME` elsewhere), overlay-aware like
 /// [`read_env_var`]. Gated to its readers: the console proxy's cached-binary
-/// lookup, and off Unix the scratch primitive's profile-containment check.
+/// lookup, the desktop shell's app-data root, and off Unix the scratch
+/// primitive's profile-containment check.
 ///
 /// # Errors
 /// The [`HomeRefusal`](super::home_core::HomeRefusal) the variable earns.
-#[cfg(any(all(feature = "web", feature = "http_client"), not(unix)))]
+#[cfg(any(
+    all(feature = "web", feature = "http_client"),
+    feature = "webview-shell",
+    not(unix)
+))]
 pub(crate) fn home_dir() -> Result<super::home_core::HomeDir, super::home_core::HomeRefusal> {
     home_dir_from_var(read_env_var(super::home_core::HOME_VAR))
 }
@@ -695,7 +700,11 @@ pub(crate) fn home_dir() -> Result<super::home_core::HomeDir, super::home_core::
 /// `None`, a non-Unicode one keeps its raw value), so that parser owns every
 /// decision about what counts as a home directory and which refusal a bad
 /// value earns; this function makes none of them itself.
-#[cfg(any(all(feature = "web", feature = "http_client"), not(unix)))]
+#[cfg(any(
+    all(feature = "web", feature = "http_client"),
+    feature = "webview-shell",
+    not(unix)
+))]
 fn home_dir_from_var(
     raw: Result<String, std::env::VarError>,
 ) -> Result<super::home_core::HomeDir, super::home_core::HomeRefusal> {

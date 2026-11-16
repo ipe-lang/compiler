@@ -148,13 +148,14 @@ pub enum AppDataVar {
 }
 
 impl AppDataVar {
-    /// The variable's name.
+    /// The variable's name; `None` for the home variable, which the home
+    /// refusal names itself.
     #[must_use]
-    pub const fn name(self) -> &'static str {
+    pub const fn name(self) -> Option<&'static str> {
         match self {
-            Self::XdgDataHome => "XDG_DATA_HOME",
-            Self::Home => "HOME",
-            Self::LocalAppData => "LOCALAPPDATA",
+            Self::XdgDataHome => Some("XDG_DATA_HOME"),
+            Self::Home => None,
+            Self::LocalAppData => Some("LOCALAPPDATA"),
         }
     }
 }
@@ -170,7 +171,10 @@ pub struct AppDataRefusal {
 
 impl fmt::Display for AppDataRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "`{}` {}", self.var.name(), self.refusal.reason())
+        match self.var.name() {
+            Some(name) => write!(f, "`{name}` {}", self.refusal.reason()),
+            None => write!(f, "{}", self.refusal),
+        }
     }
 }
 
@@ -199,6 +203,21 @@ impl AppDataRoot {
         home: Option<OsString>,
         local_app_data: Option<OsString>,
     ) -> Result<Self, AppDataRefusal> {
+        Self::from_parts(
+            os,
+            xdg_data_home,
+            || HomeDir::try_parse(home),
+            local_app_data,
+        )
+    }
+
+    /// [`Self::from_vars`] with the home directory read only when it is the root.
+    fn from_parts(
+        os: AppDataOs,
+        xdg_data_home: Option<OsString>,
+        home: impl FnOnce() -> Result<HomeDir, HomeRefusal>,
+        local_app_data: Option<OsString>,
+    ) -> Result<Self, AppDataRefusal> {
         let parse = |var: AppDataVar, raw: Option<OsString>| {
             HomeDir::try_parse(raw).map_err(|refusal| AppDataRefusal { var, refusal })
         };
@@ -209,9 +228,12 @@ impl AppDataRoot {
             AppDataOs::Unix => match xdg_data_home.filter(|raw| !raw.is_empty()) {
                 Some(raw) => parse(AppDataVar::XdgDataHome, Some(raw))
                     .map(|dir| Self::Dir(dir.as_path().to_path_buf())),
-                None => {
-                    parse(AppDataVar::Home, home).map(|dir| Self::Dir(dir.join(".local/share")))
-                }
+                None => home()
+                    .map_err(|refusal| AppDataRefusal {
+                        var: AppDataVar::Home,
+                        refusal,
+                    })
+                    .map(|dir| Self::Dir(dir.join(".local/share"))),
             },
         }
     }
@@ -223,11 +245,11 @@ impl AppDataRoot {
     #[cfg(feature = "webview-shell")]
     pub fn from_env() -> Result<Self, AppDataRefusal> {
         use crate::system::read_env_var_os;
-        Self::from_vars(
+        Self::from_parts(
             AppDataOs::HOST,
-            read_env_var_os(AppDataVar::XdgDataHome.name()),
-            read_env_var_os(AppDataVar::Home.name()),
-            read_env_var_os(AppDataVar::LocalAppData.name()),
+            read_env_var_os("XDG_DATA_HOME"),
+            crate::system::home_dir,
+            read_env_var_os("LOCALAPPDATA"),
         )
     }
 }

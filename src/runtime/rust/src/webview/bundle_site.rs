@@ -132,7 +132,7 @@ pub const ALLOW: &str = "Allow";
 pub type SiteHeader = (&'static str, &'static str);
 
 /// One answer of a site.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SiteResponse {
     /// The status.
     pub status: SiteStatus,
