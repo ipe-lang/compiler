@@ -570,7 +570,6 @@ fn run_shell_with_xdg(
 #[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn client_desktop_shell_boots_and_loads_wasm() -> Result<(), BoxError> {
-    use std::os::unix::fs::PermissionsExt as _;
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
@@ -595,7 +594,7 @@ fn client_desktop_shell_boots_and_loads_wasm() -> Result<(), BoxError> {
         let meta = std::fs::symlink_metadata(dir)?;
         assert!(meta.is_dir(), "{} is a real directory", dir.display());
         assert_eq!(
-            meta.permissions().mode() & 0o777,
+            std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o777,
             0o700,
             "{}",
             dir.display()
