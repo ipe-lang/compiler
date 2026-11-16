@@ -30,18 +30,18 @@ pub const SHELL_WWW_DIR: &str = "www";
 const INDEX: &str = "index.html";
 
 /// The fixed entry point of every shell crate.
+///
+/// Its `fn main() {` line is the one anchor the packer writes the capability
+/// floor reference under, so it stays exactly that line.
 const SHELL_MAIN_RS: &str = "\
 //! The `client desktop` shell: one window over the embedded bundle.
 
 mod site;
 
-fn main() -> std::process::ExitCode {
-    match ipe_runtime::webview::bundle_app(&site::SITE_CONFIG) {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!(\"{error}\");
-            std::process::ExitCode::FAILURE
-        }
+fn main() {
+    if let Err(error) = ipe_runtime::webview::bundle_app(&site::SITE_CONFIG) {
+        eprintln!(\"{error}\");
+        std::process::exit(1);
     }
 }
 ";
@@ -286,6 +286,7 @@ mod tests {
         };
         assert_eq!(file(&project, "src/main.rs"), Some(SHELL_MAIN_RS));
         assert!(SHELL_MAIN_RS.contains("ipe_runtime::webview::bundle_app(&site::SITE_CONFIG)"));
+        assert_eq!(SHELL_MAIN_RS.matches("\nfn main() {\n").count(), 1);
         assert_eq!(project.files.len(), 2);
         assert!(project.assets.is_empty());
     }

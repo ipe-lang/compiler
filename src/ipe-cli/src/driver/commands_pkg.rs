@@ -106,6 +106,17 @@ impl<'a> BundleFinish<'a> {
         }
     }
 
+    /// The client desktop shell crate's place, `client-shell/` under the root
+    /// or the member, claimed when the crate is written.
+    fn shell_target(&self) -> EmitTarget {
+        match self {
+            Self::Dev { output } => EmitTarget::Area(output.area(&[OutputArea::ClientShell])),
+            Self::Release { member, .. } => {
+                EmitTarget::Member(member.area(OutputArea::ClientShell))
+            }
+        }
+    }
+
     /// Claim the directory the packaged bundles go in: `dist/` under the
     /// root or the member.
     fn dist_dir(&self) -> Result<OwnedDir, CliError> {
@@ -168,8 +179,10 @@ impl<'a> BundleFinish<'a> {
 /// delivery — the single entry point `build`/`release` call once they know the
 /// bundle host and profile.
 ///
-/// `web desktop` lays out a webview-native desktop bundle; `web client ios|android`
-/// builds the client-wasm SPA and lays out a native mobile system-webview shell.
+/// `web desktop` lays out a webview-native desktop bundle; `web client desktop`
+/// builds the client-wasm SPA and packs it into a fixed native desktop shell;
+/// `web client ios|android` builds the client-wasm SPA and lays out a native
+/// mobile system-webview shell.
 /// The permission-manifest derivation ([`pack::permissions`]) remains the single
 /// source of truth for what each bundle may do — this routing never authors a
 /// permission, only chooses which packager runs.
@@ -185,6 +198,7 @@ pub fn bundle_delivery(
 ) -> Result<(), CliError> {
     match host {
         BundleHost::Desktop => pack_desktop(finish, held),
+        BundleHost::ClientDesktop => pack_client_desktop(finish, held),
         BundleHost::Mobile(os) => pack_mobile(os, finish, held),
     }
 }
@@ -305,6 +319,119 @@ pub fn validate_mobile_pack(
     Ok(())
 }
 
+/// Why a `web client desktop` bundle is refused before any build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BundleRefusal {
+    /// The project accepts push or names push identifiers: a custom scheme is
+    /// not a secure context for a push service worker on every desktop
+    /// webview, so a push worker has no desktop representation.
+    ClientDesktopPush,
+    /// The bundle id cannot name the app's private storage directory.
+    ClientDesktopStorageKey {
+        /// The refused bundle id.
+        id: String,
+        /// Why it is not a storage key.
+        reason: ipe_runtime_rust::app_data::StorageKeyRefusal,
+    },
+    /// `delivery.servers` names an origin the shell's local origin would be
+    /// one with.
+    ClientDesktopLocalOrigin {
+        /// The refused origin, in its `https` form.
+        origin: String,
+    },
+}
+
+impl std::fmt::Display for BundleRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ClientDesktopPush => f.write_str(text::client_desktop_push()),
+            Self::ClientDesktopStorageKey { id, reason } => {
+                f.write_str(&text::client_desktop_storage_key(id, reason))
+            }
+            Self::ClientDesktopLocalOrigin { origin } => {
+                f.write_str(&text::client_desktop_local_origin(origin))
+            }
+        }
+    }
+}
+
+impl BundleRefusal {
+    /// The refusal as the project refusal the command reports.
+    fn into_cli(self) -> CliError {
+        CliError::ProjectRefused(text::Message::relay(&self))
+    }
+}
+
+/// Every refusal [`BundleAssembler::gate_client_desktop`] runs before it
+/// mints a [`GatedClientDesktop`]: the client bundle shape gate
+/// ([`validate_mobile_shape`], the one check every client-bundle packer runs),
+/// then push, then the storage key the bundle id must parse as.
+///
+/// Returns the parsed storage key, the only form the shell is handed.
+///
+/// # Errors
+/// [`CliError::Usage`] wrapping a [`pack::mobile::MobileRefusal`] when the
+/// shape is not a `Web` app; [`CliError::ProjectRefused`] carrying
+/// [`BundleRefusal::ClientDesktopPush`] when the project accepts push or
+/// names push identifiers, and [`BundleRefusal::ClientDesktopStorageKey`]
+/// when the bundle id is not a storage key.
+pub fn validate_client_desktop_pack(
+    manifest: &project::ProjectManifest,
+    built: delivery::Shape,
+) -> Result<ipe_runtime_rust::app_data::StorageKey, CliError> {
+    validate_mobile_shape(manifest.default_program().and_then(|p| p.shape), built)?;
+    let accepts_push = manifest
+        .capabilities_accept
+        .contains(&ipe_ir::Capability::JsPort(ipe_ir::WebCapability::Push));
+    if accepts_push || manifest.delivery.mobile.push.is_some() {
+        return Err(BundleRefusal::ClientDesktopPush.into_cli());
+    }
+    let id = client_desktop_bundle_id(manifest);
+    ipe_runtime_rust::app_data::StorageKey::parse(id.as_str()).map_err(|reason| {
+        BundleRefusal::ClientDesktopStorageKey {
+            id: id.as_str().to_owned(),
+            reason,
+        }
+        .into_cli()
+    })
+}
+
+/// The bundle id of a `web client desktop` app: the declared
+/// `delivery.mobile.bundleId`, else the one derived from the name, as every
+/// app bundle resolves it.
+fn client_desktop_bundle_id(manifest: &project::ProjectManifest) -> project::BundleId {
+    manifest
+        .delivery
+        .mobile
+        .bundle_id
+        .clone()
+        .unwrap_or_else(|| project::BundleId::derived(&manifest.name))
+}
+
+/// The summary a packed desktop bundle prints: what was packed, where, the
+/// webview runtime note and, off Linux, the runner note.
+fn desktop_summary(name: &str, os: pack::desktop::DesktopOs, root: &Path) -> String {
+    use std::fmt::Write as _;
+
+    let mut body = format!(
+        "packaged `{name}` for {} → {}\n  {}\n",
+        os.as_str(),
+        root.display(),
+        os.webview_runtime_note()
+    );
+    if os != pack::desktop::DesktopOs::Linux {
+        let _ = writeln!(
+            body,
+            "  note: the {} bundle layout is written here, but a signed, runnable {} \
+             artifact must be produced on a {} runner (unsigned; cross-tooling out of scope).",
+            os.as_str(),
+            os.as_str(),
+            os.as_str()
+        );
+    }
+    body
+}
+
 // ── Assembly seam ─────────────────────────────────────────────────────────────
 //
 // `BundleAssembler` owns the cargo-spawn and filesystem I/O that must happen
@@ -340,6 +467,28 @@ pub struct GatedDesktop<'a> {
 /// [`BundleAssembler::gate_mobile`], which runs the gate first; its
 /// [`assemble`](GatedMobile::assemble) is the sole entry to mobile assembly.
 pub struct GatedMobile<'a>(BundleAssembler<'a>);
+
+/// A client-desktop gate witness: proof that [`validate_client_desktop_pack`]
+/// passed for the wrapped assembler, carrying the storage key it parsed. The
+/// ONLY way to obtain one is [`BundleAssembler::gate_client_desktop`]; its
+/// [`assemble`](GatedClientDesktop::assemble) is the sole entry to
+/// client-desktop assembly.
+pub struct GatedClientDesktop<'a> {
+    assembler: BundleAssembler<'a>,
+    storage_key: ipe_runtime_rust::app_data::StorageKey,
+}
+
+impl GatedClientDesktop<'_> {
+    /// Build the wasm SPA and pack it into the desktop shell. Reachable only
+    /// by holding this witness, so the gate is already proven passed.
+    ///
+    /// # Errors
+    /// As [`BundleAssembler::assemble_client_desktop`].
+    pub fn assemble(self, os: pack::desktop::DesktopOs) -> Result<(), CliError> {
+        self.assembler
+            .assemble_client_desktop(os, &self.storage_key)
+    }
+}
 
 impl GatedDesktop<'_> {
     /// Emit + compile the app and materialise the desktop bundle. Reachable
@@ -444,6 +593,23 @@ impl<'a> BundleAssembler<'a> {
         Ok(GatedMobile(Self::new(held, finish)))
     }
 
+    /// Run the client-desktop gate ([`validate_client_desktop_pack`]) and,
+    /// only when it passes, mint a [`GatedClientDesktop`] witness. The sole
+    /// constructor of a runnable client-desktop assembler.
+    ///
+    /// # Errors
+    /// As [`validate_client_desktop_pack`].
+    pub fn gate_client_desktop(
+        held: &'a HeldBuild,
+        finish: BundleFinish<'a>,
+    ) -> Result<GatedClientDesktop<'a>, CliError> {
+        let storage_key = validate_client_desktop_pack(held.root().manifest(), held.shape())?;
+        Ok(GatedClientDesktop {
+            assembler: Self::new(held, finish),
+            storage_key,
+        })
+    }
+
     /// Emit the desktop app's crate into `out` for the webview host `webview`
     /// proves.
     ///
@@ -489,8 +655,6 @@ impl<'a> BundleAssembler<'a> {
         os: pack::desktop::DesktopOs,
         webview: delivery::WebViewProof,
     ) -> Result<(), CliError> {
-        use std::fmt::Write as _;
-
         let manifest = self.manifest();
         let identity = pack::desktop::BundleIdentity::new(
             &manifest.name,
@@ -547,23 +711,7 @@ impl<'a> BundleAssembler<'a> {
         let dist = self.finish.dist_dir()?.child(os.as_str())?;
         let bundle_root = pack::desktop::materialise(&layout, &binary, icon, &dist)?;
 
-        let mut body = format!(
-            "packaged `{}` for {} → {}\n  {}\n",
-            manifest.name,
-            os.as_str(),
-            bundle_root.display(),
-            os.webview_runtime_note()
-        );
-        if os != pack::desktop::DesktopOs::Linux {
-            let _ = writeln!(
-                body,
-                "  note: the {} bundle layout is written here, but a signed, runnable {} \
-                 artifact must be produced on a {} runner (unsigned; cross-tooling out of scope).",
-                os.as_str(),
-                os.as_str(),
-                os.as_str()
-            );
-        }
+        let body = desktop_summary(&manifest.name, os, &bundle_root);
         crate::screen::Screen::new(crate::screen::Stream::Stdout)
             .line(crate::screen::Tone::Text, &body)
             .emit();
@@ -623,6 +771,140 @@ impl<'a> BundleAssembler<'a> {
                     shell_root.display()
                 ),
             )
+            .emit();
+        Ok(())
+    }
+
+    /// Build the wasm SPA, pack it into the fixed desktop shell crate, build
+    /// the shell, and lay the desktop bundle out around its binary. Private:
+    /// reached only through a [`GatedClientDesktop`] witness.
+    ///
+    /// The bundle's page policy and the shell's `Content-Security-Policy`
+    /// header are one rendered value: the page's served meta is swapped for
+    /// it, and the shell table carries it as the header.
+    ///
+    /// # Errors
+    /// [`CliError::ProjectRefused`] carrying
+    /// [`BundleRefusal::ClientDesktopLocalOrigin`] for a pinned loopback
+    /// server; the wasm build's own errors; [`CliError::Usage`] wrapping
+    /// [`pack::mobile::MobileRefusal::ManifestChanged`] when a pinned manifest
+    /// field changed during the build; [`CliError::ProjectRefused`] carrying
+    /// the [`crate::bundle_www::BundleError`] the policed publish refuses; the
+    /// shell build's errors; [`CliError::Io`] on any filesystem failure.
+    fn assemble_client_desktop(
+        &self,
+        os: pack::desktop::DesktopOs,
+        storage_key: &ipe_runtime_rust::app_data::StorageKey,
+    ) -> Result<(), CliError> {
+        use ipe_runtime_rust::csp;
+
+        let manifest = self.manifest();
+        let pin = pack::mobile::ManifestPin::of(manifest);
+        let reach = pin
+            .reach(csp::BundleHost::DesktopScheme(os.scheme_spelling()))
+            .map_err(|refusal| match refusal {
+                pack::mobile::MobileRefusal::AssetOriginListed { origin } => {
+                    BundleRefusal::ClientDesktopLocalOrigin {
+                        origin: origin.https(),
+                    }
+                    .into_cli()
+                }
+                other => CliError::Usage(text::Message::relay(&other)),
+            })?;
+        let policy = csp::ContentSecurityPolicy::for_bundle(&reach, csp::BundleWorker::None);
+        let swaps = pin.policy_swaps(&reach);
+
+        let project = ProjectPaths::from_manifest(manifest);
+        let wasm_root = self.finish.wasm_root()?;
+        let manifest_path = self.held.manifest_path();
+        build_under_pinned_manifest(manifest_path, &pin, || {
+            build_wasm_for_mobile(manifest_path, &wasm_root, self.profile)
+        })?;
+        let wasm_crate = self.finish.wasm_crate(&project)?;
+
+        // The shell crate is written first, then its `www/` from one held
+        // read of the bundle; the table names exactly the paths that read
+        // published, so the embedded files and the table cannot disagree.
+        let runtime_origin = match self.finish {
+            BundleFinish::Dev { .. } => crate::runtime_embed::RuntimeOrigin::Developer,
+            BundleFinish::Release { .. } => crate::runtime_embed::RuntimeOrigin::Release,
+        };
+        let runtime = crate::runtime_embed::RuntimeSource::resolve(
+            runtime_origin,
+            None,
+            crate::runtime_embed::RuntimeRemedy::EnvOnly,
+        )?;
+        let floor =
+            crate::run_sandbox::EmitFloor::of(self.profile.build_intent(), ipe_ir::Target::Native);
+        let shell_target = self.finish.shell_target();
+        let shell_dir = shell_target.claim()?;
+        let (_, paths) = crate::bundle_www::publish_policed_www(&wasm_crate, &shell_dir, &swaps)?;
+        let site = ipe_backend_rust::client_shell::ShellSite::new(
+            &manifest.name,
+            &**storage_key,
+            pin.base().clone(),
+            &policy.header_value(),
+            paths,
+        )
+        .map_err(|refusal| {
+            backend_invariant_err(ipe_diagnostics::Diagnostic::CompilerBug {
+                where_: "client desktop shell table",
+                detail: format!("the published bundle is not a shell table: {refusal}"),
+            })
+        })?;
+        let emitted = ipe_backend_rust::client_shell::emit_client_shell(&site)
+            .map_err(backend_invariant_err)?;
+        let crate_dir = write_emitted_project(
+            &emitted,
+            &crate::output_dir::EmitTarget::Claimed(shell_dir),
+            &runtime,
+            None,
+            false,
+            floor,
+        )?;
+
+        let identity = pack::desktop::BundleIdentity::new(
+            &manifest.name,
+            manifest
+                .version
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            client_desktop_bundle_id(manifest),
+        );
+        let icon = manifest.icon.as_deref();
+        let layout = pack::desktop::layout(os, &identity, pin.accepts(), icon)?;
+
+        let cargo_bin = toolchain::require_cargo(toolchain::ToolIntent::Build)?;
+        let target_dir = crate::target_dir::LinkableTargetDir::for_crate(
+            cargo_bin.path(),
+            crate_dir.path(),
+            None,
+        )?;
+        let build = FlooredBuild {
+            cargo: &cargo_bin,
+            crate_dir: &crate_dir,
+            finish: self.finish.native(),
+            target: CargoTarget::Host,
+            target_dir: &target_dir,
+            output: CargoOutput::Human(Verbosity::Progress),
+            what: "the desktop shell",
+            runtime: None,
+        };
+        let artifacts = build.artifact_dir();
+        build.run()?;
+        let binary = artifacts.join(emitted_bin_filename(crate_dir.path())?);
+        if !binary.is_file() {
+            return Err(CliError::Usage(text::msg::app_binary_missing(
+                &binary.display(),
+            )));
+        }
+
+        let dist = self.finish.dist_dir()?.child(os.as_str())?;
+        let bundle_root = pack::desktop::materialise(&layout, &binary, icon, &dist)?;
+        let body = desktop_summary(&manifest.name, os, &bundle_root);
+        crate::screen::Screen::new(crate::screen::Stream::Stdout)
+            .line(crate::screen::Tone::Text, &body)
             .emit();
         Ok(())
     }
@@ -718,6 +1000,24 @@ pub fn pack_mobile(
     // The witness constructor runs the gate and is the only way to obtain a
     // runnable assembler — assembling an ungated shape has no representation.
     BundleAssembler::gate_mobile(held, finish)?.assemble(os)
+}
+
+/// `build|release web client desktop [<path>]` — build the client-wasm SPA
+/// and pack it into a fixed native desktop shell for the host OS.
+///
+/// The shell serves the bundle from memory on one local origin; it holds no
+/// path, opens no file and registers no IPC. A non-`Web` shape, a push
+/// configuration, and a bundle id that cannot key the app's storage are
+/// refused before any build.
+///
+/// # Errors
+/// [`CliError::Usage`] wrapping a [`pack::desktop::DesktopRefusal`] on a host
+/// that is not a desktop; the refusals of [`validate_client_desktop_pack`]
+/// and [`BundleAssembler::assemble_client_desktop`].
+pub fn pack_client_desktop(finish: BundleFinish<'_>, held: &HeldBuild) -> Result<(), CliError> {
+    let os = pack::desktop::resolve_os(None)
+        .map_err(|r| CliError::Usage(crate::text::Message::relay(&r)))?;
+    BundleAssembler::gate_client_desktop(held, finish)?.assemble(os)
 }
 
 /// The delivery the mobile bundle build is re-invoked with: the browser
@@ -4569,6 +4869,106 @@ mod mobile_base_tests {
         );
         let result = validate_mobile_pack(&configured, delivery::Shape::Web);
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// A `web client desktop` pack of a project that accepts push, or names
+    /// push identifiers, is refused by the gate itself, before any build.
+    #[test]
+    fn client_desktop_refuses_a_push_configuration_before_any_build() {
+        let refusal = text::Message::relay(&BundleRefusal::ClientDesktopPush);
+        let configured = push_project(
+            "client_desktop_push_configured",
+            "{ bundleId = \"io.acme.app\", push = { apns = Development, fcm = { \
+             projectId = \"example-app\", applicationId = \"1:123:android:abc\", \
+             apiKey = \"AIza-key_1\", senderId = \"123\" } } }",
+        );
+        let unconfigured = push_project(
+            "client_desktop_push_unconfigured",
+            "{ bundleId = \"io.acme.app\" }",
+        );
+        for manifest in [configured, unconfigured] {
+            let result = validate_client_desktop_pack(&manifest, delivery::Shape::Web);
+            assert!(
+                matches!(&result, Err(CliError::ProjectRefused(shown)) if *shown == refusal),
+                "{result:?}"
+            );
+        }
+    }
+
+    /// The manifest of a `Web` project named `x` whose `delivery.mobile` is
+    /// the record `mobile`.
+    fn client_desktop_project(test_name: &str, mobile: &str) -> project::ProjectManifest {
+        let manifest = write_project(test_name, "/");
+        std::fs::write(
+            &manifest,
+            format!(
+                "module Package exposing (package)\n\npackage =\n    {{ name = \"x\"\n    \
+                 , delivery = {{ mobile = {mobile} }}\n    }}\n"
+            ),
+        )
+        .expect("write package.ipe");
+        let parsed = project::parse_manifest(&manifest);
+        let _ = std::fs::remove_dir_all(manifest.parent().expect("project root"));
+        parsed.expect("a client desktop manifest reads")
+    }
+
+    /// The storage key is the bundle id, case-folded; a bundle id the bundle
+    /// grammar admits but no OS can name a directory by is refused before any
+    /// build.
+    #[test]
+    fn client_desktop_storage_key_is_the_bundle_id_or_a_refusal() {
+        let declared =
+            client_desktop_project("client_desktop_key", "{ bundleId = \"io.Acme.App\" }");
+        let key = validate_client_desktop_pack(&declared, delivery::Shape::Web);
+        assert!(
+            matches!(&key, Ok(key) if &**key == "io.acme.app"),
+            "{key:?}"
+        );
+
+        let device = client_desktop_project("client_desktop_device", "{ bundleId = \"con.acme\" }");
+        assert!(project::BundleId::parse("con.acme").is_ok());
+        let result = validate_client_desktop_pack(&device, delivery::Shape::Web);
+        let Err(reason) = ipe_runtime_rust::app_data::StorageKey::parse("con.acme") else {
+            assert!(ipe_runtime_rust::app_data::StorageKey::parse("con.acme").is_err());
+            return;
+        };
+        let refusal = text::Message::relay(&BundleRefusal::ClientDesktopStorageKey {
+            id: "con.acme".to_owned(),
+            reason,
+        });
+        assert!(
+            matches!(&result, Err(CliError::ProjectRefused(shown)) if *shown == refusal),
+            "{result:?}"
+        );
+    }
+
+    /// Every derived bundle id is a storage key, so a project that declares no
+    /// bundle id is never refused for its storage directory.
+    #[test]
+    fn derived_bundle_ids_are_storage_keys() {
+        for name in [
+            "x",
+            "My Shop",
+            "con",
+            "aux",
+            "1st",
+            "class",
+            "n".repeat(400).as_str(),
+        ] {
+            let id = project::BundleId::derived(name);
+            let key = ipe_runtime_rust::app_data::StorageKey::parse(id.as_str());
+            assert!(key.is_ok(), "{name}: {id:?} -> {key:?}");
+        }
+    }
+
+    /// The bundle a shell crate embeds is published in the directory its table
+    /// names.
+    #[test]
+    fn client_shell_www_is_the_published_www() {
+        assert_eq!(
+            OutputArea::Www.dir_name(),
+            ipe_backend_rust::client_shell::SHELL_WWW_DIR
+        );
     }
 
     /// An unchanged base passes once the build has run.

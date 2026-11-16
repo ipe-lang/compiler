@@ -87,7 +87,7 @@ ipe_watch = { path = "../compiler/watch" }
 # `encode_frame`/`decode_frame`), so `ipe dev watch`'s `send_control_frame` builds
 # and parses frames from the ONE wire definition (SSOT) over its own std sockets
 # — no tokio server pulled into the CLI.
-ipe-runtime-rust = { path = "../runtime/rust", default-features = false, features = ["widget-assets", "control-wire"] }
+ipe-runtime-rust = { path = "../runtime/rust", default-features = false, features = ["widget-assets", "control-wire", "browser-open"] }
 salsa = "=0.28.5"
 notify = "8"
 # On-disk build cache (`src/cache.rs`) — content hashing of the whole-project

@@ -142,6 +142,7 @@ pub(crate) fn clean_root(root: &Path) -> Result<Vec<String>, CliError> {
 const RELOCATABLE_CRATES: &[crate::output_dir::OutputArea] = &[
     crate::output_dir::OutputArea::Rust,
     crate::output_dir::OutputArea::App,
+    crate::output_dir::OutputArea::ClientShell,
 ];
 
 /// The most release members `clean` reads under `out/release/`.

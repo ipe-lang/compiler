@@ -58,6 +58,20 @@ impl DesktopOs {
         }
     }
 
+    /// How a `web client desktop` shell built for this OS spells its local origin.
+    ///
+    /// `WebView2` serves a custom scheme only as an `https` host; `WebKitGTK`
+    /// and `WKWebView` serve it as its own scheme. The shell picks the same
+    /// spelling at compile time
+    /// ([`SchemeSpelling::native`](ipe_runtime_rust::csp::SchemeSpelling::native)).
+    #[must_use]
+    pub const fn scheme_spelling(self) -> ipe_runtime_rust::csp::SchemeSpelling {
+        match self {
+            Self::Linux | Self::MacOs => ipe_runtime_rust::csp::SchemeSpelling::Scheme,
+            Self::Windows => ipe_runtime_rust::csp::SchemeSpelling::HttpsHost,
+        }
+    }
+
     /// The desktop OS of the host this binary runs on — the OS a `web desktop`
     /// bundle targets (the grammar carries no cross-OS override).
     ///
@@ -687,6 +701,23 @@ mod tests {
     }
 
     // ── OS resolution ─────────────────────────────────────────────────────────
+
+    /// The pack's spelling for the host OS is the one the shell compiles in,
+    /// and the two spellings are each some OS's.
+    #[test]
+    fn scheme_spelling_of_desktop_os_matches_the_shell() {
+        use ipe_runtime_rust::csp::SchemeSpelling;
+        let all = [DesktopOs::Linux, DesktopOs::MacOs, DesktopOs::Windows];
+        if let Some(host) = DesktopOs::host() {
+            assert_eq!(host.scheme_spelling(), SchemeSpelling::native());
+        }
+        for spelling in [SchemeSpelling::Scheme, SchemeSpelling::HttpsHost] {
+            assert!(
+                all.iter().any(|os| os.scheme_spelling() == spelling),
+                "{spelling:?} is some OS's spelling"
+            );
+        }
+    }
 
     #[test]
     fn explicit_os_parses() {
