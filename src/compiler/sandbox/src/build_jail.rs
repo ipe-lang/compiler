@@ -1900,12 +1900,12 @@ fn umount_argv(bin: &Path, record: &MountRecord) -> [std::ffi::OsString; 3] {
 
 /// Whether the target of `record` still shows the filesystem it recorded.
 ///
-/// `now` is the id read at the target at teardown. Teardown unmounts only a
-/// target that passes: one whose id moved or cannot be read is left alone,
-/// never unmounted by its name.
+/// `now` is the id read at the target at teardown, `None` when unreadable.
+/// Teardown unmounts only a target that passes: one whose id moved or cannot
+/// be read is left alone, never unmounted by its name.
 #[cfg(any(target_os = "freebsd", test))]
-fn still_mounted_there(record: &MountRecord, now: Result<u64, RunJailDefect>) -> bool {
-    matches!(now, Ok(fsid) if fsid == record.fsid)
+fn still_mounted_there(record: &MountRecord, now: Option<u64>) -> bool {
+    now == Some(record.fsid)
 }
 
 /// The filesystem id (`st_dev`) the directory `target` reports.
@@ -3164,7 +3164,7 @@ mod freebsd_jail {
             // recorded at mount time; one whose id moved is left alone, so a
             // name swapped since the mount never directs root's unmount.
             for record in self.mounted.iter().rev() {
-                if still_mounted_there(record, held_fsid(&record.target)) {
+                if still_mounted_there(record, held_fsid(&record.target).ok()) {
                     let [bin, flag, target] = umount_argv(&self.umount_bin, record);
                     let mut command = std::process::Command::new(bin);
                     command.arg(flag).arg(target);
@@ -5626,13 +5626,9 @@ mod chain_tests {
                 std::ffi::OsString::from("/jailroot/dev"),
             ]
         );
-        assert!(still_mounted_there(&record, Ok(7)));
-        assert!(!still_mounted_there(&record, Ok(8)));
-        let moved = Err(RunJailDefect::MountFailed {
-            target: record.target.clone(),
-            detail: "moved".to_owned(),
-        });
-        assert!(!still_mounted_there(&record, moved));
+        assert!(still_mounted_there(&record, Some(7)));
+        assert!(!still_mounted_there(&record, Some(8)));
+        assert!(!still_mounted_there(&record, None));
     }
 
     #[test]
