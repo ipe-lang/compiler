@@ -321,13 +321,13 @@ pub fn validate_mobile_pack(
 
 /// Why a `web client desktop` bundle is refused before any build.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BundleRefusal {
+pub enum ClientDesktopRefusal {
     /// The project accepts push or names push identifiers: a custom scheme is
     /// not a secure context for a push service worker on every desktop
     /// webview, so a push worker has no desktop representation.
-    ClientDesktopPush,
+    Push,
     /// The bundle id cannot name the app's private storage directory.
-    ClientDesktopStorageKey {
+    StorageKey {
         /// The refused bundle id.
         id: String,
         /// Why it is not a storage key.
@@ -335,27 +335,25 @@ pub enum BundleRefusal {
     },
     /// `delivery.servers` names an origin the shell's local origin would be
     /// one with.
-    ClientDesktopLocalOrigin {
+    LocalOrigin {
         /// The refused origin, in its `https` form.
         origin: String,
     },
 }
 
-impl std::fmt::Display for BundleRefusal {
+impl std::fmt::Display for ClientDesktopRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ClientDesktopPush => f.write_str(text::client_desktop_push()),
-            Self::ClientDesktopStorageKey { id, reason } => {
+            Self::Push => f.write_str(text::client_desktop_push()),
+            Self::StorageKey { id, reason } => {
                 f.write_str(&text::client_desktop_storage_key(id, reason))
             }
-            Self::ClientDesktopLocalOrigin { origin } => {
-                f.write_str(&text::client_desktop_local_origin(origin))
-            }
+            Self::LocalOrigin { origin } => f.write_str(&text::client_desktop_local_origin(origin)),
         }
     }
 }
 
-impl BundleRefusal {
+impl ClientDesktopRefusal {
     /// The refusal as the project refusal the command reports.
     fn into_cli(self) -> CliError {
         CliError::ProjectRefused(text::Message::relay(&self))
@@ -372,8 +370,8 @@ impl BundleRefusal {
 /// # Errors
 /// [`CliError::Usage`] wrapping a [`pack::mobile::MobileRefusal`] when the
 /// shape is not a `Web` app; [`CliError::ProjectRefused`] carrying
-/// [`BundleRefusal::ClientDesktopPush`] when the project accepts push or
-/// names push identifiers, and [`BundleRefusal::ClientDesktopStorageKey`]
+/// [`ClientDesktopRefusal::Push`] when the project accepts push or
+/// names push identifiers, and [`ClientDesktopRefusal::StorageKey`]
 /// when the bundle id is not a storage key.
 pub fn validate_client_desktop_pack(
     manifest: &project::ProjectManifest,
@@ -384,11 +382,11 @@ pub fn validate_client_desktop_pack(
         .capabilities_accept
         .contains(&ipe_ir::Capability::JsPort(ipe_ir::WebCapability::Push));
     if accepts_push || manifest.delivery.mobile.push.is_some() {
-        return Err(BundleRefusal::ClientDesktopPush.into_cli());
+        return Err(ClientDesktopRefusal::Push.into_cli());
     }
     let id = client_desktop_bundle_id(manifest);
     ipe_runtime_rust::app_data::StorageKey::parse(id.as_str()).map_err(|reason| {
-        BundleRefusal::ClientDesktopStorageKey {
+        ClientDesktopRefusal::StorageKey {
             id: id.as_str().to_owned(),
             reason,
         }
@@ -775,6 +773,34 @@ impl<'a> BundleAssembler<'a> {
         Ok(())
     }
 
+    /// The runtime the desktop shell crate links and the floor its `main`
+    /// carries, both of this build's profile.
+    ///
+    /// # Errors
+    /// The runtime resolver's refusal.
+    fn shell_runtime(
+        &self,
+    ) -> Result<
+        (
+            crate::runtime_embed::RuntimeSource,
+            crate::run_sandbox::EmitFloor,
+        ),
+        CliError,
+    > {
+        let runtime_origin = match self.finish {
+            BundleFinish::Dev { .. } => crate::runtime_embed::RuntimeOrigin::Developer,
+            BundleFinish::Release { .. } => crate::runtime_embed::RuntimeOrigin::Release,
+        };
+        let runtime = crate::runtime_embed::RuntimeSource::resolve(
+            runtime_origin,
+            None,
+            crate::runtime_embed::RuntimeRemedy::EnvOnly,
+        )?;
+        let floor =
+            crate::run_sandbox::EmitFloor::of(self.profile.build_intent(), ipe_ir::Target::Native);
+        Ok((runtime, floor))
+    }
+
     /// Build the wasm SPA, pack it into the fixed desktop shell crate, build
     /// the shell, and lay the desktop bundle out around its binary. Private:
     /// reached only through a [`GatedClientDesktop`] witness.
@@ -785,7 +811,7 @@ impl<'a> BundleAssembler<'a> {
     ///
     /// # Errors
     /// [`CliError::ProjectRefused`] carrying
-    /// [`BundleRefusal::ClientDesktopLocalOrigin`] for a pinned loopback
+    /// [`ClientDesktopRefusal::LocalOrigin`] for a pinned loopback
     /// server; the wasm build's own errors; [`CliError::Usage`] wrapping
     /// [`pack::mobile::MobileRefusal::ManifestChanged`] when a pinned manifest
     /// field changed during the build; [`CliError::ProjectRefused`] carrying
@@ -804,7 +830,7 @@ impl<'a> BundleAssembler<'a> {
             .reach(csp::BundleHost::DesktopScheme(os.scheme_spelling()))
             .map_err(|refusal| match refusal {
                 pack::mobile::MobileRefusal::AssetOriginListed { origin } => {
-                    BundleRefusal::ClientDesktopLocalOrigin {
+                    ClientDesktopRefusal::LocalOrigin {
                         origin: origin.https(),
                     }
                     .into_cli()
@@ -825,23 +851,13 @@ impl<'a> BundleAssembler<'a> {
         // The shell crate is written first, then its `www/` from one held
         // read of the bundle; the table names exactly the paths that read
         // published, so the embedded files and the table cannot disagree.
-        let runtime_origin = match self.finish {
-            BundleFinish::Dev { .. } => crate::runtime_embed::RuntimeOrigin::Developer,
-            BundleFinish::Release { .. } => crate::runtime_embed::RuntimeOrigin::Release,
-        };
-        let runtime = crate::runtime_embed::RuntimeSource::resolve(
-            runtime_origin,
-            None,
-            crate::runtime_embed::RuntimeRemedy::EnvOnly,
-        )?;
-        let floor =
-            crate::run_sandbox::EmitFloor::of(self.profile.build_intent(), ipe_ir::Target::Native);
+        let (runtime, floor) = self.shell_runtime()?;
         let shell_target = self.finish.shell_target();
         let shell_dir = shell_target.claim()?;
         let (_, paths) = crate::bundle_www::publish_policed_www(&wasm_crate, &shell_dir, &swaps)?;
         let site = ipe_backend_rust::client_shell::ShellSite::new(
             &manifest.name,
-            &**storage_key,
+            storage_key,
             pin.base().clone(),
             &policy.header_value(),
             paths,
@@ -4875,7 +4891,7 @@ mod mobile_base_tests {
     /// push identifiers, is refused by the gate itself, before any build.
     #[test]
     fn client_desktop_refuses_a_push_configuration_before_any_build() {
-        let refusal = text::Message::relay(&BundleRefusal::ClientDesktopPush);
+        let refusal = text::Message::relay(&ClientDesktopRefusal::Push);
         let configured = push_project(
             "client_desktop_push_configured",
             "{ bundleId = \"io.acme.app\", push = { apns = Development, fcm = { \
@@ -4932,7 +4948,7 @@ mod mobile_base_tests {
             assert!(ipe_runtime_rust::app_data::StorageKey::parse("con.acme").is_err());
             return;
         };
-        let refusal = text::Message::relay(&BundleRefusal::ClientDesktopStorageKey {
+        let refusal = text::Message::relay(&ClientDesktopRefusal::StorageKey {
             id: "con.acme".to_owned(),
             reason,
         });

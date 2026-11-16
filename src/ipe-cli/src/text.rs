@@ -124,7 +124,7 @@ relayable!(
     crate::pack::mobile::MobileRefusal,
     crate::bundle_www::BundleError,
     crate::pack::desktop::DesktopRefusal,
-    crate::driver::BundleRefusal,
+    crate::driver::ClientDesktopRefusal,
     crate::ffi::WrapperRefusal,
     crate::ffi::BuildScriptsBanner,
     ipe_watch::ScopeError,

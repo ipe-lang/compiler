@@ -133,13 +133,7 @@ fn publish_www_with(
     limits: AssetLimits,
     keep: impl FnMut(&AssetPath, &[u8]) -> Result<(), BundleError>,
 ) -> Result<PathBuf, CliError> {
-    publish_www_read(
-        crate_dir,
-        into,
-        limits,
-        |www, asset| www.read_asset(asset),
-        keep,
-    )
+    publish_www_read(crate_dir, into, limits, HeldSpa::read_asset, keep)
 }
 
 /// [`publish_www_with`], reading each asset's published bytes through `read`.
