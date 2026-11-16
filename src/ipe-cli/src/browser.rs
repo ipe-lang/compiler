@@ -8,7 +8,10 @@
 //! breaking away, the opener starts inside the CLI's job.
 
 use ipe_runtime_rust::browser_open::Breakaway;
-pub use ipe_runtime_rust::browser_open::{BrowserOrigin, BrowserUrl, OpenOutcome, OpenerRefusal};
+/// The opener's refusal, named by the loopback server's tests.
+#[cfg(test)]
+pub use ipe_runtime_rust::browser_open::OpenerRefusal;
+pub use ipe_runtime_rust::browser_open::{BrowserOrigin, BrowserUrl, OpenOutcome};
 
 /// Open `url` in the desktop's browser through the runtime's one opener, never through a shell.
 ///
