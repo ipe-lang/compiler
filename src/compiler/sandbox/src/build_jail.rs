@@ -1794,7 +1794,7 @@ impl Primitive {
 }
 
 /// Every program the FreeBSD jail launcher runs, with its spelling.
-#[cfg(any(target_os = "freebsd", test))]
+#[cfg(test)]
 const FREEBSD_PRIMITIVES: [(Primitive, &str); 5] = [
     (Primitive::Jail, Primitive::Jail.spelling()),
     (Primitive::MountNullfs, Primitive::MountNullfs.spelling()),
@@ -2779,7 +2779,7 @@ mod freebsd_jail {
 
         let jail_name = per_run_jail_name();
         let argv = jail_argv(
-            &jail_bin,
+            jail_bin,
             &jail_name,
             jail_root.root(),
             &jail_user,
@@ -3158,8 +3158,8 @@ mod freebsd_jail {
                 &root_target,
                 &BindExpect::of(&host_root, None),
                 || mount_nullfs(&mount_nullfs_bin, true, Path::new("/"), &root_target),
-                mounted_facts,
-                rehold,
+                Self::mounted_facts,
+                Self::rehold,
             )?;
 
             // 2. A FRESH minimal devfs over the jail's `/dev`, layered on top of the
@@ -3199,8 +3199,8 @@ mod freebsd_jail {
                 &proc_target,
                 &BindExpect::of(&held_mask_source, None),
                 || mount_nullfs(&mount_nullfs_bin, true, &proc_mask_source, &proc_target),
-                mounted_facts,
-                rehold,
+                Self::mounted_facts,
+                Self::rehold,
             )?;
 
             // 4. The mount plan shared with the bwrap arm: every home and static
@@ -3263,8 +3263,8 @@ mod freebsd_jail {
                 target,
                 &BindExpect::of(bind, rw_owner),
                 || mount_nullfs(mount_nullfs_bin, read_only, source, target),
-                mounted_facts,
-                rehold,
+                Self::mounted_facts,
+                Self::rehold,
             )
         }
 
