@@ -285,10 +285,7 @@ pub mod scratch_host;
 
 // The `client desktop` shell's storage key and private app-data directory,
 // keyed by the bundle id.
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    any(feature = "webview-shell", test)
-))]
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "webview-shell", test)))]
 pub mod app_data;
 
 // The one way to hand a URL to the system browser: a typed URL grammar per

@@ -204,10 +204,8 @@ impl BundleSite {
     /// hands the scheme handler back in the site's spelling.
     #[must_use]
     pub fn start_url(&self, spelling: SchemeSpelling) -> String {
-        let index = BundlePath::parse(INDEX).map_or_else(
-            |_| self.base.as_str().to_owned(),
-            |index| self.base.url_of(&index),
-        );
+        let index = BundlePath::parse(INDEX)
+            .map_or_else(|_| self.base.dir_url(), |index| self.base.url_of(&index));
         format!("{}{index}", spelling.origin())
     }
 
