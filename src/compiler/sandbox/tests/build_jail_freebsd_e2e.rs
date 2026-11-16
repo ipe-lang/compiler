@@ -22,7 +22,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use ipe_sandbox::build_jail::{CapabilityAxis, JailOutcome, build_in_jail};
-use ipe_sandbox::run_jail::{FilesystemScope, RunJailTools, SandboxProfile};
+use ipe_sandbox::run_jail::{FilesystemScope, RunJailDefect, RunJailTools, SandboxProfile};
 use ipe_sandbox::{CanonicalPath, JailMounts};
 
 fn fixture_path() -> PathBuf {
@@ -156,4 +156,42 @@ fn a_benign_in_scratch_write_is_clean() {
         "a benign in-scratch build must be Clean (the only admit-eligible outcome)"
     );
     assert!(outcome.is_clean());
+}
+
+/// A writable bind inside a read-only bind, below a level a user can write:
+/// its mountpoint would need a tmpfs inside the read-only bind, hiding part of
+/// what that bind shows, so the jail refuses to establish.
+#[test]
+fn a_mountpoint_tmpfs_inside_an_earlier_bind_refuses_the_jail() {
+    use std::os::unix::fs::PermissionsExt;
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let outer = scratch_dir("hide-bind");
+    let open = outer.join("open");
+    let scoped = open.join("scratch");
+    std::fs::create_dir_all(&scoped).expect("scratch");
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777))
+        .expect("a user-writable level");
+    let outer_canonical = CanonicalPath::resolve(&outer).expect("canonical outer");
+    let canonical = CanonicalPath::resolve(&scoped).expect("canonical scratch");
+    let mounts = JailMounts::of_invoker(canonical.clone(), canonical, vec![outer_canonical])
+        .expect("checked jail mounts");
+    let payload = vec![OsString::from("/usr/bin/true")];
+    let outcome = build_in_jail(
+        &inert_tools(),
+        &probe_profile(false, FilesystemScope::Isolated),
+        &mounts,
+        &payload,
+    );
+    let _ = std::fs::remove_dir_all(&outer);
+    assert!(
+        matches!(
+            &outcome,
+            JailOutcome::Unavailable {
+                defect: RunJailDefect::MountFailed { detail, .. }
+            } if detail.contains("would hide an earlier mount")
+        ),
+        "{outcome:?}"
+    );
 }
