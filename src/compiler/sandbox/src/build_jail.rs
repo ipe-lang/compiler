@@ -1760,6 +1760,65 @@ pub(crate) fn require_trusted_chain(
     })
 }
 
+/// The facts a spelled level is judged by: a root-owned link stands for a
+/// root-only directory, since only root can change where it points and the
+/// level above it already passed; every other level is judged as read.
+#[cfg(any(target_os = "freebsd", test))]
+const fn spelled_level(facts: DirFacts) -> DirFacts {
+    match facts.kind {
+        LevelKind::Link if facts.uid == ROOT_UID => DirFacts {
+            kind: LevelKind::Dir,
+            uid: ROOT_UID,
+            mode: 0o755,
+        },
+        LevelKind::Link | LevelKind::Dir | LevelKind::Regular | LevelKind::Other => facts,
+    }
+}
+
+/// The canonical spelling of the jail-directory parent `parent`, admitted
+/// only when no user but root or the launcher (`euid`) can redirect it.
+///
+/// The deepest existing ancestor is judged twice: along its spelled chain,
+/// each level read by `read` without following a final link (a root-owned
+/// link passes, see [`spelled_level`]), and along the chain `resolve` gives
+/// it. A link a user planted on the spelled path therefore refuses even when
+/// its target is root-only, so the launcher never creates a directory where
+/// another user pointed it.
+///
+/// # Errors
+///
+/// [`RunJailDefect::MountFailed`] when no level of `parent` exists, a level
+/// cannot be read or resolved, or either chain is refused.
+#[cfg(any(target_os = "freebsd", test))]
+pub(crate) fn trusted_jail_parent(
+    parent: &Path,
+    euid: u32,
+    mut read: impl FnMut(&Path) -> std::io::Result<DirFacts>,
+    resolve: impl FnOnce(&Path) -> std::io::Result<PathBuf>,
+) -> Result<PathBuf, RunJailDefect> {
+    let refuse = |detail: String| RunJailDefect::MountFailed {
+        target: parent.to_path_buf(),
+        detail: format!("{detail}; {JAIL_DIR_HOME_HINT}"),
+    };
+    let Some(existing) = parent.ancestors().find(|ancestor| read(ancestor).is_ok()) else {
+        return Err(refuse(
+            "no directory on the jail directory's path exists".to_owned(),
+        ));
+    };
+    require_trusted_chain(existing, euid, |dir| read(dir).map(spelled_level))?;
+    let resolved = resolve(existing).map_err(|e| {
+        refuse(format!(
+            "{} on the jail directory's path cannot be resolved ({e})",
+            existing.display()
+        ))
+    })?;
+    require_trusted_chain(&resolved, euid, read)?;
+    let rest = parent.strip_prefix(existing).map_err(|_| {
+        refuse("the jail directory's path does not extend its existing ancestor".to_owned())
+    })?;
+    Ok(resolved.join(rest))
+}
+
 /// A program the FreeBSD jail launcher runs as root.
 #[cfg(any(target_os = "freebsd", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2614,11 +2673,11 @@ mod freebsd_jail {
     use super::{
         BindExpect, FreebsdMountOp, HeldBind, HeldJailDirs, HeldOwnership, JAIL_TMPFS_OPTIONS,
         JailOutcome, JailUser, JailUserRefusal, MountRecord, MountedFacts, Primitive,
-        SafeMountPath, ViewDirTrust, apply_mount_ops, c_name, canonical_prefix_spelling,
-        fchown_held, freebsd_mount_ops, give_held, held_chain_facts, held_fsid, held_refusal,
-        hold_canonical, lstat_facts, macos_scrubbed_env, mount_bind_recorded, mount_recorded,
-        outcome_after_restore, parse_jail_user, primitive_verdict, require_trusted_chain,
-        still_mounted_there, umount_argv, under_root, view_trust,
+        SafeMountPath, ViewDirTrust, apply_mount_ops, c_name, fchown_held, freebsd_mount_ops,
+        give_held, held_chain_facts, held_fsid, held_refusal, hold_canonical, lstat_facts,
+        macos_scrubbed_env, mount_bind_recorded, mount_recorded, outcome_after_restore,
+        parse_jail_user, primitive_verdict, require_trusted_chain, still_mounted_there,
+        trusted_jail_parent, umount_argv, under_root, view_trust,
     };
     use crate::JailMounts;
     use crate::mounts::{TreeBind, jail_binds, mount_plan};
@@ -3491,14 +3550,10 @@ mod freebsd_jail {
         use std::os::unix::fs::DirBuilderExt as _;
 
         let euid = rustix::process::geteuid().as_raw();
-        let parent = canonical_prefix_spelling(parent);
+        let parent = trusted_jail_parent(parent, euid, lstat_facts, |dir: &Path| {
+            std::fs::canonicalize(dir)
+        })?;
         let parent = parent.as_path();
-        if let Some(existing) = parent
-            .ancestors()
-            .find(|ancestor| std::fs::symlink_metadata(ancestor).is_ok())
-        {
-            require_trusted_chain(existing, euid, lstat_facts)?;
-        }
         if let Err(e) = std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o755)
@@ -6057,6 +6112,119 @@ mod chain_tests {
                 "{kind:?}"
             );
         }
+    }
+
+    /// Judge `parent` under root against the `levels` table, resolving the
+    /// deepest existing ancestor through `resolved`.
+    fn jail_parent(
+        parent: &str,
+        levels: &[(&str, DirFacts)],
+        resolved: &[(&str, &str)],
+    ) -> Result<PathBuf, RunJailDefect> {
+        let read = |dir: &Path| {
+            levels
+                .iter()
+                .find(|(spelled, _)| Path::new(spelled) == dir)
+                .map(|(_, facts)| *facts)
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+        };
+        let resolve = |dir: &Path| {
+            resolved
+                .iter()
+                .find(|(spelled, _)| Path::new(spelled) == dir)
+                .map(|(_, target)| PathBuf::from(target))
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+        };
+        trusted_jail_parent(Path::new(parent), ROOT_UID, read, resolve)
+    }
+
+    const ROOT_LINK: DirFacts = DirFacts {
+        kind: LevelKind::Link,
+        uid: ROOT_UID,
+        mode: 0o777,
+    };
+    const USER_LINK: DirFacts = DirFacts {
+        uid: USER,
+        ..ROOT_LINK
+    };
+
+    #[test]
+    fn a_user_planted_link_to_a_root_only_dir_refuses_the_jail_parent() {
+        let user_home = DirFacts {
+            uid: USER,
+            ..ROOT_DIR
+        };
+        let levels = [
+            ("/", ROOT_DIR),
+            ("/home", ROOT_DIR),
+            ("/home/u", user_home),
+            ("/home/u/.cache", USER_LINK),
+            ("/etc", ROOT_DIR),
+        ];
+        let resolved = [("/home/u/.cache", "/etc")];
+        let outcome = jail_parent("/home/u/.cache/ipe/jail", &levels, &resolved);
+        assert!(
+            matches!(&outcome, Err(RunJailDefect::MountFailed { detail, .. }) if detail.contains("/home/u")),
+            "{outcome:?}"
+        );
+        let in_root_dir = [
+            ("/", ROOT_DIR),
+            ("/root", ROOT_DIR),
+            ("/root/.cache", USER_LINK),
+            ("/etc", ROOT_DIR),
+        ];
+        let resolved = [("/root/.cache", "/etc")];
+        let outcome = jail_parent("/root/.cache/ipe/jail", &in_root_dir, &resolved);
+        assert!(
+            matches!(&outcome, Err(RunJailDefect::MountFailed { detail, .. }) if detail.contains("/root/.cache on the jail directory's path is a symbolic link")),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_root_owned_link_on_the_jail_parent_resolves_to_its_target() {
+        let levels = [
+            ("/", ROOT_DIR),
+            ("/home", ROOT_LINK),
+            ("/home/r", ROOT_DIR),
+            ("/usr", ROOT_DIR),
+            ("/usr/home", ROOT_DIR),
+            ("/usr/home/r", ROOT_DIR),
+        ];
+        let resolved = [("/home/r", "/usr/home/r")];
+        assert_eq!(
+            jail_parent("/home/r/.cache/ipe/jail", &levels, &resolved).unwrap(),
+            PathBuf::from("/usr/home/r/.cache/ipe/jail")
+        );
+    }
+
+    #[test]
+    fn a_jail_parent_resolving_through_a_user_owned_dir_refuses() {
+        let levels = [
+            ("/", ROOT_DIR),
+            ("/home", ROOT_LINK),
+            ("/home/r", ROOT_DIR),
+            ("/usr", ROOT_DIR),
+            (
+                "/usr/home",
+                DirFacts {
+                    uid: USER,
+                    ..ROOT_DIR
+                },
+            ),
+            ("/usr/home/r", ROOT_DIR),
+        ];
+        let resolved = [("/home/r", "/usr/home/r")];
+        let outcome = jail_parent("/home/r/jail", &levels, &resolved);
+        assert!(
+            matches!(&outcome, Err(RunJailDefect::MountFailed { detail, .. }) if detail.contains("/usr/home on the jail directory's path belongs")),
+            "{outcome:?}"
+        );
+        let outcome = jail_parent("/nowhere/jail", &[], &[]);
+        assert!(
+            matches!(&outcome, Err(RunJailDefect::MountFailed { .. })),
+            "{outcome:?}"
+        );
     }
 }
 
