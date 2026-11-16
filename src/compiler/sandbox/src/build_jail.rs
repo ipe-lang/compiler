@@ -5290,7 +5290,8 @@ mod tests {
         use crate::mounts::{Bind, CanonicalPath, HomeMasks, mount_plan};
         let root = Path::new("/jailroot");
         // The plan keeps the binds' order, so a read-only bind comes before a
-        // writable bind it contains.
+        // writable bind it contains (both ahead of the static masks, which
+        // contain neither).
         let (outer, inner) = (
             CanonicalPath::assumed("/srv/x"),
             CanonicalPath::assumed("/srv/x/u/tree"),
@@ -5298,7 +5299,11 @@ mod tests {
         let binds = [Bind::ReadOnly(&outer), Bind::ReadWrite(&inner)];
         let plan = mount_plan(&HomeMasks::unmasked(), &binds).expect("no carve");
         let ops = freebsd_mount_ops(root, &plan).expect("re-rooted");
-        let targets: Vec<&Path> = ops.iter().map(FreebsdMountOp::target).collect();
+        let targets: Vec<&Path> = ops
+            .iter()
+            .filter(|op| !matches!(op, FreebsdMountOp::Mask { .. }))
+            .map(FreebsdMountOp::target)
+            .collect();
         assert_eq!(
             targets,
             [
