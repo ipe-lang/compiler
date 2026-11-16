@@ -1515,6 +1515,21 @@ pub(crate) fn untrusted_mount_ancestor(
     Ok(None)
 }
 
+/// Whether a fresh tmpfs over `dir` would hide what an earlier mount shows.
+///
+/// It would when `dir` is or holds an earlier mount's target (`earlier`), or
+/// lies inside an earlier bind of the plan (`binds`): the tmpfs then replaces
+/// the bound host directory below `dir` with an empty one, so the jail would
+/// silently see less of that bind than the plan grants.
+#[cfg(any(target_os = "freebsd", test))]
+pub(crate) fn tmpfs_would_hide<'p>(
+    dir: &Path,
+    mut earlier: impl Iterator<Item = &'p Path>,
+    binds: &[PathBuf],
+) -> bool {
+    earlier.any(|target| target.starts_with(dir)) || binds.iter().any(|bind| dir.starts_with(bind))
+}
+
 /// How to move the jail directories, which live under `$HOME/.cache/ipe/jail`,
 /// below a home only root can write.
 #[cfg(any(target_os = "freebsd", test))]
@@ -2283,61 +2298,21 @@ pub(crate) fn hold_canonical(path: &SafeMountPath) -> Result<ipe_fs_open::HeldDi
     walk_held(path, |_| Ok(()))
 }
 
-/// The identities of `/` and of every directory below it on `path` that
-/// exists, `/` first; the walk ends at the first missing level.
+/// Whether the held bind `bind` is, by identity, the cargo home or a
+/// directory above it, as recorded when the mounts were checked or as the
+/// cargo home's name reaches now.
 ///
-/// # Errors
-///
-/// [`crate::JailPathError::Moved`] when a level is a link or not a directory;
-/// [`RunJailDefect::MountFailed`] on another failure.
+/// The name-level exposure check sees spellings only. A cargo home renamed
+/// onto a bind's spelling after that check leaves its own name empty, so only
+/// the `recorded` chain still names it; a directory renamed into the cargo
+/// home's path is caught by the `live` one.
 #[cfg(any(target_os = "freebsd", all(test, unix)))]
-fn existing_chain_ids(path: &SafeMountPath) -> Result<Vec<ipe_fs_open::FileId>, RunJailDefect> {
-    use ipe_fs_open::{EntryName, HeldDir, OpenRefusal};
-    use std::path::Component;
-    let spelling = path.as_path();
-    let refuse = |refusal| held_refusal(spelling, refusal);
-    let mut held = HeldDir::open_root(Path::new("/")).map_err(refuse)?;
-    let mut ids = vec![held.id().map_err(refuse)?];
-    for component in spelling.components() {
-        let name = match component {
-            Component::RootDir => continue,
-            Component::Normal(name) => EntryName::parse(name).map_err(refuse)?,
-            Component::Prefix(_) | Component::CurDir | Component::ParentDir => {
-                return Err(not_below_root(spelling));
-            }
-        };
-        held = match held.child_dir(&name) {
-            Ok(child) => child,
-            Err(OpenRefusal::Absent) => break,
-            Err(refusal) => return Err(refuse(refusal)),
-        };
-        ids.push(held.id().map_err(refuse)?);
-    }
-    Ok(ids)
-}
-
-/// `path` with its deepest existing ancestor replaced by that ancestor's
-/// canonical form, so a held walk of it meets no link the host ships (such as
-/// FreeBSD's `/home`).
-#[cfg(any(target_os = "freebsd", all(test, unix)))]
-fn canonical_prefix_spelling(path: &Path) -> PathBuf {
-    path.ancestors()
-        .find_map(|ancestor| {
-            let resolved = std::fs::canonicalize(ancestor).ok()?;
-            let rest = path.strip_prefix(ancestor).ok()?;
-            Some(resolved.join(rest))
-        })
-        .unwrap_or_else(|| path.to_path_buf())
-}
-
-/// Whether any held bind is, by identity, the cargo home or a directory
-/// above it.
-///
-/// The name-level exposure check sees spellings only; a cargo home renamed
-/// to a bind's spelling between that check and the hold is caught here.
-#[cfg(any(target_os = "freebsd", all(test, unix)))]
-fn exposes_by_identity(binds: &[ipe_fs_open::FileId], cargo_chain: &[ipe_fs_open::FileId]) -> bool {
-    binds.iter().any(|bind| cargo_chain.contains(bind))
+fn exposes_by_identity(
+    bind: &ipe_fs_open::FileId,
+    recorded: &crate::covers::CargoHomeIdentity,
+    live: &crate::covers::CargoHomeIdentity,
+) -> bool {
+    recorded.contains(bind) || live.contains(bind)
 }
 
 /// A bind source held open from `/` down, with the identity it had when held.
@@ -2426,7 +2401,7 @@ impl HeldJailDirs {
                 .map(hold_source)
                 .collect::<Result<_, _>>()?,
         };
-        held.refuse_cargo_identity(mounts.cargo_home())?;
+        held.refuse_cargo_identity(mounts)?;
         Ok(held)
     }
 
@@ -2437,12 +2412,14 @@ impl HeldJailDirs {
             .chain(&self.read_only)
     }
 
-    /// Refuse when a held bind is, by identity, `cargo_home` or above it.
-    fn refuse_cargo_identity(&self, cargo_home: &Path) -> Result<(), RunJailDefect> {
-        let spelling = SafeMountPath::new(&canonical_prefix_spelling(cargo_home))?;
-        let chain = existing_chain_ids(&spelling)?;
+    /// Refuse when a held bind is, by identity, the cargo home of `mounts` or
+    /// a directory above it.
+    fn refuse_cargo_identity(&self, mounts: &JailMounts) -> Result<(), RunJailDefect> {
+        let cargo_home = mounts.cargo_home();
+        let live =
+            crate::covers::CargoHomeIdentity::read(cargo_home).map_err(RunJailDefect::Path)?;
         self.binds()
-            .find(|bind| exposes_by_identity(std::slice::from_ref(&bind.id), &chain))
+            .find(|bind| exposes_by_identity(&bind.id, mounts.cargo_identity(), &live))
             .map_or(Ok(()), |bind| {
                 Err(RunJailDefect::Path(
                     crate::JailPathError::ExposesCargoHome {
@@ -3157,6 +3134,9 @@ mod freebsd_jail {
         /// provisioned by a single tmpfs. Each is also recorded in `mounted` so it
         /// is unmounted on drop.
         tmpfs_parents: Vec<PathBuf>,
+        /// The targets of the plan's binds mounted so far, which no later tmpfs
+        /// may be layered inside.
+        bind_targets: Vec<PathBuf>,
     }
 
     impl RoRootMount {
@@ -3217,6 +3197,7 @@ mod freebsd_jail {
                 proc_mask_source,
                 mounted: Vec::new(),
                 tmpfs_parents: Vec::new(),
+                bind_targets: Vec::new(),
             };
 
             // 1. The whole host `/`, READ-ONLY, as the jail root. Everything the
@@ -3332,6 +3313,7 @@ mod freebsd_jail {
                     detail: format!("the bind source {} was not held", source.display()),
                 })?;
             let rw_owner = (!read_only).then_some(jail_uid);
+            self.bind_targets.push(target.to_path_buf());
             mount_bind_recorded(
                 &mut self.mounted,
                 target,
@@ -3450,9 +3432,10 @@ mod freebsd_jail {
         /// # Errors
         ///
         /// [`RunJailDefect::MountFailed`] when `dir` is the jail root, is or holds
-        /// an earlier mount (a tmpfs there would hide it), when the tmpfs mount
-        /// fails, or when the leaf cannot be created — fail-closed: the payload
-        /// never runs against a half-built root.
+        /// an earlier mount or lies inside an earlier bind (a tmpfs there would
+        /// hide it, [`super::tmpfs_would_hide`]), when the tmpfs mount fails, or
+        /// when the leaf cannot be created — fail-closed: the payload never runs
+        /// against a half-built root.
         fn provision_tmpfs_over(
             &mut self,
             mount_bin: &Path,
@@ -3468,11 +3451,11 @@ mod freebsd_jail {
                         detail: "provisioning this mountpoint would hide the jail root".to_owned(),
                     });
                 }
-                if self
-                    .mounted
-                    .iter()
-                    .any(|earlier| earlier.target.starts_with(dir))
-                {
+                if super::tmpfs_would_hide(
+                    dir,
+                    self.mounted.iter().map(|earlier| earlier.target.as_path()),
+                    &self.bind_targets,
+                ) {
                     return Err(RunJailDefect::MountFailed {
                         target: target.to_path_buf(),
                         detail: "provisioning this mountpoint would hide an earlier mount"
@@ -5303,6 +5286,60 @@ mod tests {
     }
 
     #[test]
+    fn a_tmpfs_inside_an_earlier_bind_is_refused() {
+        use crate::mounts::{Bind, CanonicalPath, HomeMasks, mount_plan};
+        let root = Path::new("/jailroot");
+        // The plan keeps the binds' order, so a read-only bind comes before a
+        // writable bind it contains.
+        let (outer, inner) = (
+            CanonicalPath::assumed("/srv/x"),
+            CanonicalPath::assumed("/srv/x/u/tree"),
+        );
+        let binds = [Bind::ReadOnly(&outer), Bind::ReadWrite(&inner)];
+        let plan = mount_plan(&HomeMasks::unmasked(), &binds).expect("no carve");
+        let ops = freebsd_mount_ops(root, &plan).expect("re-rooted");
+        let targets: Vec<&Path> = ops.iter().map(FreebsdMountOp::target).collect();
+        assert_eq!(
+            targets,
+            [
+                Path::new("/jailroot/srv/x"),
+                Path::new("/jailroot/srv/x/u/tree")
+            ]
+        );
+        // The outer bind is root-only at its top and writable by a user below,
+        // so the inner bind's mountpoint is provisioned inside the outer bind.
+        let anchor = untrusted_mount_ancestor(root, Path::new("/jailroot/srv/x/u/tree"), |dir| {
+            if dir.starts_with("/jailroot/srv/x/u") {
+                ViewDirTrust::Writable
+            } else {
+                ViewDirTrust::RootOnly
+            }
+        })
+        .expect("inside the root")
+        .expect("a writable level");
+        assert_eq!(anchor, Path::new("/jailroot/srv/x/u"));
+        let earlier = [root, Path::new("/jailroot/srv/x")];
+        let bound = [PathBuf::from("/jailroot/srv/x")];
+        assert!(
+            !earlier.iter().any(|target| target.starts_with(&anchor)),
+            "no earlier target lies inside the anchor"
+        );
+        assert!(tmpfs_would_hide(&anchor, earlier.into_iter(), &bound));
+        // A tmpfs outside every bind, holding no earlier mount, hides nothing.
+        assert!(!tmpfs_would_hide(
+            Path::new("/jailroot/srv/y"),
+            earlier.into_iter(),
+            &bound
+        ));
+        // One holding an earlier mount still hides it.
+        assert!(tmpfs_would_hide(
+            Path::new("/jailroot/srv"),
+            earlier.into_iter(),
+            &bound
+        ));
+    }
+
+    #[test]
     fn a_root_only_mount_path_needs_no_provisioning() {
         let root = Path::new("/jailroot");
         let mut seen: Vec<PathBuf> = Vec::new();
@@ -5745,13 +5782,20 @@ mod held_tests {
         let (home, other) = (t.path().join("home"), t.path().join("other"));
         std::fs::create_dir_all(home.join(".cargo")).unwrap();
         std::fs::create_dir(&other).unwrap();
-        let chain = existing_chain_ids(&safe(&home.join(".cargo"))).unwrap();
-        assert!(exposes_by_identity(&[id_of(&home)], &chain));
-        assert!(exposes_by_identity(&[id_of(&home.join(".cargo"))], &chain));
-        assert!(!exposes_by_identity(&[id_of(&other)], &chain));
+        let cargo = crate::covers::CargoHomeIdentity::read(&home.join(".cargo")).unwrap();
+        let none = crate::covers::CargoHomeIdentity::read(&other.join("absent/.cargo")).unwrap();
+        for (recorded, live) in [(&cargo, &none), (&none, &cargo)] {
+            assert!(exposes_by_identity(&id_of(&home), recorded, live));
+            assert!(exposes_by_identity(
+                &id_of(&home.join(".cargo")),
+                recorded,
+                live
+            ));
+        }
         // A missing tail ends the chain at the deepest existing directory.
-        let partial = existing_chain_ids(&safe(&other.join("absent/.cargo"))).unwrap();
-        assert_eq!(partial.last(), Some(&id_of(&other)));
+        assert!(none.contains(&id_of(&other)));
+        assert!(!none.contains(&id_of(&home)));
+        assert!(!exposes_by_identity(&id_of(&home), &none, &none));
     }
 
     #[test]
@@ -5794,6 +5838,79 @@ mod held_tests {
                 ))
             ),
             "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn held_jail_dirs_refuse_a_cargo_home_renamed_onto_the_tree() {
+        let t = TestDir::new("held-cargo-renamed").unwrap();
+        let (scratch, tree, home) = (
+            t.path().join("scratch"),
+            t.path().join("tree"),
+            t.path().join("home"),
+        );
+        let cargo_home = home.join(".cargo");
+        for dir in [&scratch, &tree, &cargo_home] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let canonical = |path: &Path| crate::CanonicalPath::resolve(path).unwrap();
+        let mounts = JailMounts::checked_against(
+            canonical(&scratch),
+            canonical(&tree),
+            Vec::new(),
+            crate::HomeMasks::unmasked(),
+            canonical(&cargo_home).as_path(),
+        )
+        .unwrap();
+        let granted = crate::mounts::TreeBind::granted_by(
+            &crate::run_jail::FilesystemScope::WorkingTreeReadWrite,
+            &mounts,
+        )
+        .unwrap();
+
+        // After the name check, the tree's spelling now names the cargo home
+        // and the cargo home's own spelling names nothing.
+        std::fs::rename(&tree, t.path().join("tree.bak")).unwrap();
+        std::fs::rename(&cargo_home, &tree).unwrap();
+        let refused = HeldJailDirs::hold(&mounts, &granted);
+        assert!(
+            matches!(
+                refused,
+                Err(RunJailDefect::Path(
+                    crate::JailPathError::ExposesCargoHome { .. }
+                ))
+            ),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn a_recheck_refuses_a_cargo_home_renamed_since_the_check() {
+        let t = TestDir::new("recheck-cargo-renamed").unwrap();
+        let (scratch, tree, home) = (
+            t.path().join("scratch"),
+            t.path().join("tree"),
+            t.path().join("home"),
+        );
+        let cargo_home = home.join(".cargo");
+        for dir in [&scratch, &tree, &cargo_home] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let canonical = |path: &Path| crate::CanonicalPath::resolve(path).unwrap();
+        let mounts = JailMounts::checked_against(
+            canonical(&scratch),
+            canonical(&tree),
+            Vec::new(),
+            crate::HomeMasks::unmasked(),
+            canonical(&cargo_home).as_path(),
+        )
+        .unwrap();
+        assert_eq!(mounts.recheck(), Ok(()));
+        std::fs::rename(&cargo_home, home.join("elsewhere")).unwrap();
+        assert!(
+            matches!(mounts.recheck(), Err(crate::JailPathError::Moved { .. })),
+            "{:?}",
+            mounts.recheck()
         );
     }
 }

@@ -26,6 +26,9 @@ pub struct JailMounts {
     read_only: Vec<CanonicalPath>,
     homes: HomeMasks,
     cargo_home: PathBuf,
+    /// The cargo home's directory identities when the paths were checked.
+    #[cfg(any(target_os = "freebsd", all(test, unix)))]
+    cargo_identity: CargoHomeIdentity,
     vcs_home: Home,
 }
 
@@ -41,6 +44,8 @@ impl JailMounts {
     /// - [`JailPathError::ToolHomeRelative`] when `CARGO_HOME` is relative.
     /// - [`JailPathError::ExposesCargoHome`] when a path equals or contains the
     ///   cargo home.
+    /// - Where a root launcher holds the binds (FreeBSD), any error of
+    ///   [`CargoHomeIdentity::read`].
     pub fn of_invoker(
         scoped_tmp: CanonicalPath,
         working_tree: CanonicalPath,
@@ -68,7 +73,8 @@ impl JailMounts {
     ///
     /// # Errors
     /// [`JailPathError::ExposesCargoHome`] when a path equals or contains
-    /// `cargo_home`.
+    /// `cargo_home`; where a root launcher holds the binds, any error of
+    /// [`CargoHomeIdentity::read`].
     fn checked(
         scoped_tmp: CanonicalPath,
         working_tree: CanonicalPath,
@@ -77,12 +83,16 @@ impl JailMounts {
         cargo_home: PathBuf,
         vcs_home: Home,
     ) -> Result<Self, JailPathError> {
+        #[cfg(any(target_os = "freebsd", all(test, unix)))]
+        let cargo_identity = CargoHomeIdentity::read(&cargo_home)?;
         let mounts = Self {
             scoped_tmp,
             working_tree,
             read_only,
             homes,
             cargo_home,
+            #[cfg(any(target_os = "freebsd", all(test, unix)))]
+            cargo_identity,
             vcs_home,
         };
         mounts.refuse_exposing()?;
@@ -114,15 +124,19 @@ impl JailMounts {
     }
 
     /// Confirm every path still resolves to itself and still exposes no cargo
-    /// home.
+    /// home, and, where a root launcher holds the binds, that the cargo home's
+    /// directories are still the ones checked.
     ///
     /// # Errors
-    /// [`JailPathError::Moved`] when a path changed since it was resolved;
-    /// [`JailPathError::ExposesCargoHome`] when one now covers the cargo home.
+    /// [`JailPathError::Moved`] when a path, or a directory of the cargo home,
+    /// changed since it was resolved; [`JailPathError::ExposesCargoHome`] when
+    /// one now covers the cargo home.
     pub fn recheck(&self) -> Result<(), JailPathError> {
         for path in self.all() {
             path.recheck()?;
         }
+        #[cfg(any(target_os = "freebsd", all(test, unix)))]
+        self.cargo_identity.recheck(&self.cargo_home)?;
         self.refuse_exposing()
     }
 
@@ -199,6 +213,117 @@ impl JailMounts {
     pub fn cargo_home(&self) -> &Path {
         self.cargo_home.as_path()
     }
+
+    /// The cargo home's directory identities when the paths were checked.
+    #[cfg(any(target_os = "freebsd", all(test, unix)))]
+    #[must_use]
+    pub const fn cargo_identity(&self) -> &CargoHomeIdentity {
+        &self.cargo_identity
+    }
+}
+
+/// The identities of `/` and of every existing directory down to the cargo
+/// home, `/` first, read through held handles.
+///
+/// Recorded when [`JailMounts`] is checked, so a root launcher that holds the
+/// binds later compares them with the directories that were checked, not only
+/// with whatever the cargo home's name reaches by then: a cargo home renamed
+/// onto a bind's spelling leaves its own name empty, and only its recorded
+/// identity still names it.
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CargoHomeIdentity {
+    chain: Vec<ipe_fs_open::FileId>,
+}
+
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+impl CargoHomeIdentity {
+    /// The chain of `cargo_home` now, walked from `/` without following a
+    /// link along its spelling with the deepest existing ancestor
+    /// canonicalised, ending at the first missing level.
+    ///
+    /// # Errors
+    /// [`JailPathError::Moved`] when a level is a link or not a directory;
+    /// [`JailPathError::Unresolved`] when a level cannot be opened or named.
+    pub fn read(cargo_home: &Path) -> Result<Self, JailPathError> {
+        use ipe_fs_open::{EntryName, HeldDir, OpenRefusal};
+        use std::path::Component;
+        let spelling = canonical_prefix_spelling(cargo_home);
+        let refuse = |refusal: OpenRefusal| match refusal {
+            OpenRefusal::Link | OpenRefusal::NotRegular(_) => JailPathError::Moved {
+                path: cargo_home.to_path_buf(),
+            },
+            OpenRefusal::Absent
+            | OpenRefusal::Denied
+            | OpenRefusal::InUse
+            | OpenRefusal::TooLarge(_)
+            | OpenRefusal::TooManyEntries(_)
+            | OpenRefusal::BadName
+            | OpenRefusal::NotUtf8
+            | OpenRefusal::Io(_) => JailPathError::Unresolved {
+                path: cargo_home.to_path_buf(),
+                kind: refusal.kind(),
+            },
+        };
+        let mut held = HeldDir::open_root(Path::new("/")).map_err(refuse)?;
+        let mut chain = vec![held.id().map_err(refuse)?];
+        for component in spelling.components() {
+            let name = match component {
+                Component::RootDir => continue,
+                Component::Normal(name) => EntryName::parse(name).map_err(refuse)?,
+                Component::Prefix(_) | Component::CurDir | Component::ParentDir => {
+                    return Err(JailPathError::Unresolved {
+                        path: cargo_home.to_path_buf(),
+                        kind: std::io::ErrorKind::InvalidInput,
+                    });
+                }
+            };
+            held = match held.child_dir(&name) {
+                Ok(child) => child,
+                Err(OpenRefusal::Absent) => break,
+                Err(refusal) => return Err(refuse(refusal)),
+            };
+            chain.push(held.id().map_err(refuse)?);
+        }
+        Ok(Self { chain })
+    }
+
+    /// Whether `id` is the cargo home or a directory above it.
+    #[must_use]
+    pub fn contains(&self, id: &ipe_fs_open::FileId) -> bool {
+        self.chain.contains(id)
+    }
+
+    /// Confirm every recorded directory still leads, in order, to the cargo
+    /// home. A level created since (a cargo home made after the check) may
+    /// extend the chain; none may change.
+    ///
+    /// # Errors
+    /// [`JailPathError::Moved`] when a recorded directory is no longer on the
+    /// cargo home's path; any error of [`Self::read`].
+    pub fn recheck(&self, cargo_home: &Path) -> Result<(), JailPathError> {
+        if Self::read(cargo_home)?.chain.starts_with(&self.chain) {
+            Ok(())
+        } else {
+            Err(JailPathError::Moved {
+                path: cargo_home.to_path_buf(),
+            })
+        }
+    }
+}
+
+/// `path` with its deepest existing ancestor replaced by that ancestor's
+/// canonical form, so a held walk of it meets no link the host ships (such as
+/// FreeBSD's `/home`).
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+fn canonical_prefix_spelling(path: &Path) -> PathBuf {
+    path.ancestors()
+        .find_map(|ancestor| {
+            let resolved = std::fs::canonicalize(ancestor).ok()?;
+            let rest = path.strip_prefix(ancestor).ok()?;
+            Some(resolved.join(rest))
+        })
+        .unwrap_or_else(|| path.to_path_buf())
 }
 
 /// The home a version-control tool expands `~` against for the user `home`,
