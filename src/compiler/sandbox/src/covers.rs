@@ -244,7 +244,8 @@ impl CargoHomeIdentity {
     ///
     /// # Errors
     /// [`JailPathError::Moved`] when a level is a link or not a directory;
-    /// [`JailPathError::Unresolved`] when a level cannot be opened or named.
+    /// [`JailPathError::Unresolved`] when the spelling is not absolute or a
+    /// level cannot be opened or named.
     pub fn read(cargo_home: &Path) -> Result<Self, JailPathError> {
         use ipe_fs_open::{EntryName, HeldDir, OpenRefusal};
         use std::path::Component;
@@ -265,18 +266,23 @@ impl CargoHomeIdentity {
                 kind: refusal.kind(),
             },
         };
+        let unnamed = || JailPathError::Unresolved {
+            path: cargo_home.to_path_buf(),
+            kind: std::io::ErrorKind::InvalidInput,
+        };
+        let mut components = spelling.components();
+        if components.next() != Some(Component::RootDir) {
+            return Err(unnamed());
+        }
         let mut held = HeldDir::open_root(Path::new("/")).map_err(refuse)?;
         let mut chain = vec![held.id().map_err(refuse)?];
-        for component in spelling.components() {
+        for component in components {
             let name = match component {
-                Component::RootDir => continue,
                 Component::Normal(name) => EntryName::parse(name).map_err(refuse)?,
-                Component::Prefix(_) | Component::CurDir | Component::ParentDir => {
-                    return Err(JailPathError::Unresolved {
-                        path: cargo_home.to_path_buf(),
-                        kind: std::io::ErrorKind::InvalidInput,
-                    });
-                }
+                Component::RootDir
+                | Component::Prefix(_)
+                | Component::CurDir
+                | Component::ParentDir => return Err(unnamed()),
             };
             held = match held.child_dir(&name) {
                 Ok(child) => child,
@@ -446,6 +452,24 @@ mod tests {
 
     fn make_dir(path: &Path) {
         std::fs::create_dir_all(path).expect("create dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cargo_home_identity_refuses_a_relative_spelling() {
+        let read = super::CargoHomeIdentity::read(std::path::Path::new(
+            "ipe-no-such-relative-cargo-parent/.cargo",
+        ));
+        assert!(
+            matches!(
+                read,
+                Err(JailPathError::Unresolved {
+                    kind: std::io::ErrorKind::InvalidInput,
+                    ..
+                })
+            ),
+            "{read:?}"
+        );
     }
 
     #[cfg(unix)]
