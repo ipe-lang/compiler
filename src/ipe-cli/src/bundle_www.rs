@@ -127,13 +127,21 @@ pub fn publish_policed_www(
 
 /// [`publish_www`] under the ceilings `limits`, handing `keep` each asset's
 /// path and bytes before they are staged.
+// The method path names one `HeldSpa` lifetime; the reader must hold for all.
+#[allow(clippy::redundant_closure_for_method_calls)]
 fn publish_www_with(
     crate_dir: &OwnedDir,
     into: &OwnedDir,
     limits: AssetLimits,
     keep: impl FnMut(&AssetPath, &[u8]) -> Result<(), BundleError>,
 ) -> Result<PathBuf, CliError> {
-    publish_www_read(crate_dir, into, limits, HeldSpa::read_asset, keep)
+    publish_www_read(
+        crate_dir,
+        into,
+        limits,
+        |www, asset| www.read_asset(asset),
+        keep,
+    )
 }
 
 /// [`publish_www_with`], reading each asset's published bytes through `read`.

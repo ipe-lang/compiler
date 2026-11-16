@@ -378,10 +378,13 @@ pub fn validate_client_desktop_pack(
     built: delivery::Shape,
 ) -> Result<ipe_runtime_rust::app_data::StorageKey, CliError> {
     validate_mobile_shape(manifest.default_program().and_then(|p| p.shape), built)?;
-    let accepts_push = manifest
-        .capabilities_accept
+    // Read through the pin the pack later builds from, so the refusal and the
+    // pack judge one reading of the manifest.
+    let pin = pack::mobile::ManifestPin::of(manifest);
+    let accepts_push = pin
+        .accepts()
         .contains(&ipe_ir::Capability::JsPort(ipe_ir::WebCapability::Push));
-    if accepts_push || manifest.delivery.mobile.push.is_some() {
+    if accepts_push || pin.push().is_some() {
         return Err(ClientDesktopRefusal::Push.into_cli());
     }
     let id = client_desktop_bundle_id(manifest);
@@ -835,7 +838,7 @@ impl<'a> BundleAssembler<'a> {
                     }
                     .into_cli()
                 }
-                other => CliError::Usage(text::Message::relay(&other)),
+                other => CliError::ProjectRefused(text::Message::relay(&other)),
             })?;
         let policy = csp::ContentSecurityPolicy::for_bundle(&reach, csp::BundleWorker::None);
         let swaps = pin.policy_swaps(&reach);
@@ -911,7 +914,7 @@ impl<'a> BundleAssembler<'a> {
         build.run()?;
         let binary = artifacts.join(emitted_bin_filename(crate_dir.path())?);
         if !binary.is_file() {
-            return Err(CliError::Usage(text::msg::app_binary_missing(
+            return Err(CliError::ProjectRefused(text::msg::app_binary_missing(
                 &binary.display(),
             )));
         }
@@ -1027,12 +1030,12 @@ pub fn pack_mobile(
 /// refused before any build.
 ///
 /// # Errors
-/// [`CliError::Usage`] wrapping a [`pack::desktop::DesktopRefusal`] on a host
-/// that is not a desktop; the refusals of [`validate_client_desktop_pack`]
+/// [`CliError::ProjectRefused`] wrapping a [`pack::desktop::DesktopRefusal`] on
+/// a host that is not a desktop; the refusals of [`validate_client_desktop_pack`]
 /// and [`BundleAssembler::assemble_client_desktop`].
 pub fn pack_client_desktop(finish: BundleFinish<'_>, held: &HeldBuild) -> Result<(), CliError> {
     let os = pack::desktop::resolve_os(None)
-        .map_err(|r| CliError::Usage(crate::text::Message::relay(&r)))?;
+        .map_err(|r| CliError::ProjectRefused(crate::text::Message::relay(&r)))?;
     BundleAssembler::gate_client_desktop(held, finish)?.assemble(os)
 }
 
