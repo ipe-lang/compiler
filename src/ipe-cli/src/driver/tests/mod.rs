@@ -48,23 +48,6 @@ fn emit_target(out: &Path) -> EmitTarget {
 }
 
 #[test]
-fn widget_tag_collision_from_distinct_paths_is_refused() {
-    let mut origins: BTreeMap<String, String> = BTreeMap::new();
-    // First path claims the tag.
-    assert!(record_widget_tag_origin(&mut origins, "ipe-ce-dead", "src/Widget/A.js").is_ok());
-    // The SAME path (a second view node of one widget) is the legitimate
-    // dedup case.
-    assert!(record_widget_tag_origin(&mut origins, "ipe-ce-dead", "src/Widget/A.js").is_ok());
-    // A DIFFERENT path colliding onto the same tag must fail closed.
-    let collision = record_widget_tag_origin(&mut origins, "ipe-ce-dead", "src/Widget/B.js")
-        .expect_err("a distinct path on an occupied tag must be refused");
-    assert_eq!(collision.existing_path, "src/Widget/A.js");
-    assert_eq!(collision.new_path, "src/Widget/B.js");
-    // A distinct tag is unaffected.
-    assert!(record_widget_tag_origin(&mut origins, "ipe-ce-beef", "src/Widget/B.js").is_ok());
-}
-
-#[test]
 fn bluegreen_defaults_on_when_no_env_set() {
     // No opt-out, no explicit choice → on (the new default).
     assert!(bluegreen_from_env_values(None, None));

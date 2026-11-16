@@ -32,12 +32,13 @@ use core::fmt::Write as _;
 use crate::code::{Severity, issue_tracker_url, title};
 use crate::diagnostic::{
     AppShape, Applicability, ArgCount, CaseDefect, CodecAutoRejection, ConsentError, CtorWithheld,
-    Diagnostic, Expected, ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach,
-    HazardRefusal, HeaderDefect, HelpLine, Hint, IfDefect, ImportedAs, InterpolationDefect,
-    LetDefect, LowerError, MountPrefixFault, NameError, OpenerText, ParseError, RoutePatternDefect,
-    SandboxError, SealRejection, SpanRole, StoreEqAccessorDefect, StoreSelectProjectionDefect,
-    Suggestion, TokenKind, TripleStringDefect, TyDoc, TypeDeclDefect, TypeError, TypeSizeOrigin,
-    WildcardDependence, intercept_context_phrase,
+    CustomElementRefusal, CustomElementShape, Diagnostic, Expected, ExpectedSet, ExposingDefect,
+    Feature, FfiError, GenericAppEntryReach, HazardRefusal, HeaderDefect, HelpLine, Hint, IfDefect,
+    ImportedAs, InterpolationDefect, LetDefect, LowerError, MountPrefixFault, NameError,
+    OpenerText, ParseError, RoutePatternDefect, SandboxError, SealRejection, SpanRole,
+    StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion, TokenKind, TripleStringDefect,
+    TyDoc, TypeDeclDefect, TypeError, TypeSizeOrigin, WidgetFileRefusal, WidgetPathEscape,
+    WidgetUnreadable, WildcardDependence, intercept_context_phrase,
 };
 use crate::span::Span;
 use crate::terminal::BIDI_ISOLATE_CLOSER;
@@ -828,10 +829,15 @@ fn name_prose(msg: &NameError) -> String {
         NameError::AssertedCallMalformed { .. } => {
             "I can't read this `Rust.Ffi.call` — it isn't in the one shape I accept.".to_string()
         }
-        NameError::CustomElementCtorMalformed { .. } => {
-            "I can't read this `CustomElement.fromFile` — it isn't in the one shape I accept."
-                .to_string()
-        }
+        NameError::CustomElementCtorMalformed { cause } => match cause {
+            CustomElementRefusal::Shape(_) => {
+                "I can't read this `CustomElement.fromFile` — it isn't in the one shape I accept."
+                    .to_string()
+            }
+            CustomElementRefusal::File { path, .. } => {
+                format!("I can't use the widget-hook file `{path}`.")
+            }
+        },
         NameError::BoundarySealIllegal { seal_type, .. } => {
             format!("`{seal_type}` can't cross the boundary between Ipê and JavaScript.")
         }
@@ -1870,6 +1876,114 @@ fn parse_label(msg: &ParseError) -> Option<String> {
     }
 }
 
+/// The label of an IPE-N0044 refusal, laid out once for every producer.
+fn custom_element_label(cause: &CustomElementRefusal) -> String {
+    match cause {
+        CustomElementRefusal::Shape(shape) => format!(
+            "this `CustomElement.fromFile` is malformed: {}. The one accepted shape is a \
+             `CustomElement`-annotated binding whose whole body is `CustomElement.fromFile \
+             \"<js-path>\"` — a single string literal naming a widget-hook JS file \
+             inside your project (no `..` escape), and the file must exist",
+            custom_element_shape_why(*shape)
+        ),
+        CustomElementRefusal::File { path, refusal } => match refusal {
+            WidgetFileRefusal::Escapes(escape) => format!(
+                "`{path}` resolves outside the project directory ({}); keep the widget-hook \
+                 file inside the project",
+                widget_escape_phrase(*escape)
+            ),
+            WidgetFileRefusal::Missing => format!(
+                "`{path}` does not exist; create it beside the entry module at that relative \
+                 path, or correct the path"
+            ),
+            WidgetFileRefusal::Unreadable(unreadable) => format!(
+                "`{path}` could not be read: {}",
+                widget_unreadable_phrase(*unreadable)
+            ),
+            WidgetFileRefusal::TagCollision { other_path, tag } => format!(
+                "`{other_path}` and `{path}` both map to the custom-element tag `{tag}`; \
+                 rename one of the two files"
+            ),
+        },
+    }
+}
+
+/// The rule a malformed `CustomElement.fromFile` use site breaks.
+const fn custom_element_shape_why(shape: CustomElementShape) -> &'static str {
+    match shape {
+        CustomElementShape::Unapplied => {
+            "`CustomElement.fromFile` is legal only as the whole body of a \
+             `CustomElement`-annotated binding, applied to a single string literal"
+        }
+        CustomElementShape::TakesParameters => {
+            "`CustomElement.fromFile` is a value constructor and takes no binding parameters"
+        }
+        CustomElementShape::NoAnnotation => {
+            "`CustomElement.fromFile` is legal only as the body of a binding annotated \
+             `CustomElement down up`; this binding has no such annotation"
+        }
+        CustomElementShape::NotCustomElementAnnotation => {
+            "`CustomElement.fromFile` is legal only as the body of a binding annotated \
+             `CustomElement down up`"
+        }
+        CustomElementShape::ArgumentCount => {
+            "`CustomElement.fromFile` takes exactly one argument — a single string literal \
+             naming the widget-hook JS file"
+        }
+        CustomElementShape::NonLiteralArgument => {
+            "the `CustomElement.fromFile` argument must be a single string literal, not a \
+             variable or expression (the path is read at build time)"
+        }
+        CustomElementShape::RootedPath => {
+            "the `CustomElement.fromFile` widget path must be project-root-relative — an \
+             absolute path (a leading `/` or `\\`, a `C:` drive, or a UNC \
+             `\\\\server\\share` prefix) would resolve outside the project and is refused"
+        }
+    }
+}
+
+/// How a widget-hook path leaves the project, in the user's terms.
+const fn widget_escape_phrase(escape: WidgetPathEscape) -> &'static str {
+    match escape {
+        WidgetPathEscape::ParentTraversal => "it climbs with `..`",
+        WidgetPathEscape::Absolute => "it is an absolute path",
+        WidgetPathEscape::OutsideRoot => "a link on the way points above the project root",
+    }
+}
+
+/// Why an existing widget-hook file cannot be read, each with the remedy that clears it.
+fn widget_unreadable_phrase(unreadable: WidgetUnreadable) -> String {
+    match unreadable {
+        WidgetUnreadable::Link => "it is a symbolic link, which is never followed here; replace \
+                                   the link with the file itself"
+            .to_owned(),
+        WidgetUnreadable::NotRegularFile => "it is not a regular file (it is a FIFO, device, \
+                                             socket or directory); replace it with a regular \
+                                             UTF-8 file"
+            .to_owned(),
+        WidgetUnreadable::Denied => {
+            "permission denied; check its permissions so the build can read it".to_owned()
+        }
+        WidgetUnreadable::InUse => {
+            "another program holds it open; close that program and build again".to_owned()
+        }
+        WidgetUnreadable::TooLarge { cap_bytes } => format!(
+            "it is larger than {cap_bytes} bytes; keep the widget-hook file under that size"
+        ),
+        WidgetUnreadable::TooManyEntries { cap } => format!(
+            "a directory on its path holds more than {cap} entries; move the file into a \
+             directory with fewer entries"
+        ),
+        WidgetUnreadable::NotPlainName => "a level of its path is not one plain name; rename \
+                                           that level to a plain file or directory name"
+            .to_owned(),
+        WidgetUnreadable::NotUtf8 => "it is not valid UTF-8; save it as UTF-8 text".to_owned(),
+        WidgetUnreadable::Io(kind) => format!(
+            "the filesystem reported \"{kind}\"; check that the file is readable and build again"
+        ),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn name_label(msg: &NameError) -> Option<String> {
     match msg {
@@ -2032,12 +2146,7 @@ fn name_label(msg: &NameError) -> Option<String> {
              top-level annotated definition whose whole body is `Rust.Ffi.call \
              \"<crate>::<function>\"`"
         )),
-        NameError::CustomElementCtorMalformed { detail } => Some(format!(
-            "this `CustomElement.fromFile` is malformed: {detail}. The one accepted shape is a \
-             `CustomElement`-annotated binding whose whole body is `CustomElement.fromFile \
-             \"<js-path>\"` — a single string literal naming a widget-hook JS file \
-             inside your project (no `..` escape), and the file must exist"
-        )),
+        NameError::CustomElementCtorMalformed { cause } => Some(custom_element_label(cause)),
         NameError::BoundarySealIllegal { seal_type, reason } => {
             let why = match reason {
                 SealRejection::Function => {
@@ -4677,5 +4786,71 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every widget-file refusal labels the authored path with a fixed phrase and no other path.
+    #[test]
+    fn custom_element_file_labels_name_no_host_path() {
+        let unreadable = [
+            WidgetUnreadable::Link,
+            WidgetUnreadable::NotRegularFile,
+            WidgetUnreadable::Denied,
+            WidgetUnreadable::InUse,
+            WidgetUnreadable::TooLarge { cap_bytes: 1024 },
+            WidgetUnreadable::TooManyEntries { cap: 64 },
+            WidgetUnreadable::NotPlainName,
+            WidgetUnreadable::NotUtf8,
+            WidgetUnreadable::Io(std::io::ErrorKind::Other),
+            WidgetUnreadable::Io(std::io::ErrorKind::TimedOut),
+        ];
+        let refusals = [
+            WidgetFileRefusal::Escapes(WidgetPathEscape::ParentTraversal),
+            WidgetFileRefusal::Escapes(WidgetPathEscape::Absolute),
+            WidgetFileRefusal::Escapes(WidgetPathEscape::OutsideRoot),
+            WidgetFileRefusal::Missing,
+            WidgetFileRefusal::TagCollision {
+                other_path: "js/other.js".into(),
+                tag: "ipe-ce-0123456789abcdef".into(),
+            },
+        ]
+        .into_iter()
+        .chain(unreadable.into_iter().map(WidgetFileRefusal::Unreadable));
+        for refusal in refusals {
+            let label = custom_element_label(&CustomElementRefusal::File {
+                path: "js/w.js".into(),
+                refusal: refusal.clone(),
+            });
+            assert!(
+                label.contains("`js/w.js`"),
+                "{refusal:?}: the label names the authored path: {label}"
+            );
+            let foreign = label.replace("js/w.js", "").replace("js/other.js", "");
+            assert!(
+                !foreign.contains('/') && !foreign.contains('\\'),
+                "{refusal:?}: the label carries no path beyond the authored ones: {label}"
+            );
+        }
+    }
+
+    /// The headline follows the refusal family: a shape headline never names a file, and back.
+    #[test]
+    fn custom_element_headline_by_family() {
+        let shape = name_prose(&NameError::CustomElementCtorMalformed {
+            cause: CustomElementRefusal::Shape(CustomElementShape::NonLiteralArgument),
+        });
+        assert!(
+            shape.contains("one shape I accept"),
+            "a shape refusal keeps the shape headline: {shape}"
+        );
+        let file = name_prose(&NameError::CustomElementCtorMalformed {
+            cause: CustomElementRefusal::File {
+                path: "js/w.js".into(),
+                refusal: WidgetFileRefusal::Missing,
+            },
+        });
+        assert!(
+            file.contains("`js/w.js`") && !file.contains("shape"),
+            "a file refusal names the file, never a shape: {file}"
+        );
     }
 }

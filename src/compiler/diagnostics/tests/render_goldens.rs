@@ -18,9 +18,10 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use ipe_diagnostics::{
-    AliasExpansionKind, Candidates, Construct, Diagnostic, EditTarget, Expected, ExpectedSet,
-    Feature, InterpolationDefect, LowerError, NameError, OpenerText, ParseError, SortedNames, Span,
-    TokenKind, TripleStringDefect, TyDoc, TypeError, suggest,
+    AliasExpansionKind, Candidates, Construct, CustomElementRefusal, CustomElementShape,
+    Diagnostic, EditTarget, Expected, ExpectedSet, Feature, InterpolationDefect, LowerError,
+    NameError, OpenerText, ParseError, SortedNames, Span, TokenKind, TripleStringDefect, TyDoc,
+    TypeError, WidgetFileRefusal, suggest,
 };
 
 // ---------------------------------------------------------------------------
@@ -682,4 +683,52 @@ fn golden_security_alias_expansion_too_deep() -> Result<(), Box<dyn std::error::
         },
     };
     check_golden("name_alias_expansion_too_deep", &d, "test.ipe", source)
+}
+
+#[test]
+fn golden_custom_element_shape_non_literal() -> Result<(), Box<dyn std::error::Error>> {
+    // IPE-N0044 shape family: the widget path is a variable, not a literal.
+    let source = "module Main exposing (main)\n\nimport Ipe.Ffi.Js.CustomElement as CustomElement\n\ncodeEditor : CustomElement Int String\ncodeEditor =\n    CustomElement.fromFile whichFile\n";
+    let d = Diagnostic::Name {
+        span: Span::new(157, 166), // the `whichFile` argument.
+        msg: NameError::CustomElementCtorMalformed {
+            cause: CustomElementRefusal::Shape(CustomElementShape::NonLiteralArgument),
+        },
+    };
+    check_golden("custom_element_shape_non_literal", &d, "test.ipe", source)
+}
+
+#[test]
+fn golden_custom_element_file_missing() -> Result<(), Box<dyn std::error::Error>> {
+    // IPE-N0044 file family: the named widget-hook file does not exist.
+    let source = "module Main exposing (main)\n\nimport Ipe.Ffi.Js.CustomElement as CustomElement\n\ncodeEditor : CustomElement Int String\ncodeEditor =\n    CustomElement.fromFile \"js/editor.js\"\n";
+    let d = Diagnostic::Name {
+        span: Span::new(157, 171), // the `"js/editor.js"` literal.
+        msg: NameError::CustomElementCtorMalformed {
+            cause: CustomElementRefusal::File {
+                path: "js/editor.js".into(),
+                refusal: WidgetFileRefusal::Missing,
+            },
+        },
+    };
+    check_golden("custom_element_file_missing", &d, "test.ipe", source)
+}
+
+#[test]
+fn golden_custom_element_file_tag_collision() -> Result<(), Box<dyn std::error::Error>> {
+    // IPE-N0044 file family: two distinct widget-hook files map to one tag.
+    let source = "module Main exposing (main)\n\nimport Ipe.Ffi.Js.CustomElement as CustomElement\n\ncodeEditor : CustomElement Int String\ncodeEditor =\n    CustomElement.fromFile \"js/b.js\"\n";
+    let d = Diagnostic::Name {
+        span: Span::new(157, 166), // the `"js/b.js"` literal.
+        msg: NameError::CustomElementCtorMalformed {
+            cause: CustomElementRefusal::File {
+                path: "js/b.js".into(),
+                refusal: WidgetFileRefusal::TagCollision {
+                    other_path: "js/a.js".into(),
+                    tag: "ipe-ce-0123456789abcdef".into(),
+                },
+            },
+        },
+    };
+    check_golden("custom_element_file_tag_collision", &d, "test.ipe", source)
 }
