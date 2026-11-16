@@ -395,7 +395,7 @@ mod real_jail {
     /// `build_in_jail` resolves itself.
     #[cfg(target_os = "freebsd")]
     fn probe_tools() -> Option<RunJailTools> {
-        host_tool::resolve(HostTool::Jail).ok()?;
+        ipe_sandbox::build_jail::require_jail_primitive().ok()?;
         Some(RunJailTools::Native)
     }
 

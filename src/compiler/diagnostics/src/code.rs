@@ -450,7 +450,7 @@ code! {
     /// site — applied to a non-literal, referenced bare (unapplied), given a
     /// traversing path, its named file absent, or placed anywhere other than the
     /// whole body of a `CustomElement`-annotated binding (fail-closed at build)
-    IPE_N0044 = "IPE-N0044", "the CustomElement.fromFile constructor is malformed at its use site", "IPE-N0044";
+    IPE_N0044 = "IPE-N0044", "a CustomElement.fromFile use is malformed or its widget-hook file is refused", "IPE-N0044";
     /// `main` chooses its shape at runtime — its head is an `if` / `case`
     /// whose branches reach app entries — but a program's shape is a
     /// compile-time choice, pinned by the entry head, not a runtime value

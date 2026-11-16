@@ -814,13 +814,8 @@ fn establish_jail_tools() -> Result<RunJailTools, CliError> {
 /// unconfined build proceed.
 #[cfg(target_os = "freebsd")]
 fn establish_jail_tools() -> Result<RunJailTools, CliError> {
-    if ipe_sandbox::host_tool::resolve(ipe_sandbox::HostTool::Jail).is_err() {
-        return Err(CliError::PackageAudit(sandbox_unavailable(
-            &RunJailDefect::PrimitiveUnavailable {
-                missing: vec![ipe_sandbox::HostTool::Jail.name()],
-            },
-        )));
-    }
+    ipe_sandbox::build_jail::require_jail_primitive()
+        .map_err(|defect| CliError::PackageAudit(sandbox_unavailable(&defect)))?;
     Ok(RunJailTools::Native)
 }
 
