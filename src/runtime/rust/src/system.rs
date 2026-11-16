@@ -1248,8 +1248,9 @@ pub(crate) fn listen_port_from_env(
 /// (`debugger` — the replay-root probe; `tui`'s colour decision reads the typed
 /// `TermProfile` through `read_env_var` instead, never `var_os`); widen the gate
 /// when another feature gains a `var_os` reader, so it never sits as dead code
-/// under `-D warnings`. A temp-root key reads as unset, as in `read_env_var`.
-#[cfg(feature = "debugger")]
+/// under `-D warnings`; `webview-shell` reads the app-data root variables
+/// through it. A temp-root key reads as unset, as in `read_env_var`.
+#[cfg(any(feature = "debugger", feature = "webview-shell"))]
 pub(crate) fn read_env_var_os(key: &str) -> Option<std::ffi::OsString> {
     if super::scratch_core::is_temp_root_key(key) {
         return None;

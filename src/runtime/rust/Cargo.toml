@@ -473,7 +473,15 @@ web-core = ["dep:serde_json", "json", "serde", "dep:serde_urlencoded", "encoding
 # from `random`'s LCG (`super::random::lcg_next`) — every tokio-enabling feature
 # must also enable `random` or the module is absent (same invariant as `async`).
 # The no-server floor is machine-checked by `tests/webview_dep_floor.rs`.
-webview = ["wry", "tao", "web-core", "tokio", "random"]
+webview = ["webview-shell", "web-core", "tokio", "random"]
+# The `client desktop` shell: a native window serving an embedded bundle under
+# the shell's custom scheme, with no async runtime and no server. `encoding`
+# carries the bundle path grammar; `browser-open` the system-browser opener
+# its link policy hands public `https` links to.
+webview-shell = ["wry", "tao", "encoding", "browser-open"]
+# The system-browser opener: a typed URL per origin and the platform opener,
+# started through the hardened spawner. Std-only.
+browser-open = []
 config = ["json", "toml", "dep:serde-saphyr"]
 # `tokio/net`+`tokio/sync`: axum binds a listener (`tokio::net`) and the
 # server/live loop uses `tokio::sync`.

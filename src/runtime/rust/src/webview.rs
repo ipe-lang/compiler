@@ -27,9 +27,28 @@
 //! `Err` is compiled, so a `web desktop` build always links + never panics. No
 //! panic vectors: the stub returns `Err`; the real path routes every fallible
 //! call through `Err`.
+//!
+//! [`bundle_app`] is the `client desktop` shell: one window serving an
+//! embedded bundle from memory under the shell's custom scheme, behind the
+//! `webview-shell` feature, with no IPC channel and no injected script. Both
+//! hosts install the one navigation policy of [`nav_policy::attach_policy`].
 
+#[cfg(any(
+    feature = "webview-shell",
+    all(test, feature = "encoding", not(target_arch = "wasm32"))
+))]
+pub mod bundle_site;
+#[cfg(any(
+    feature = "webview-shell",
+    all(test, feature = "browser-open", not(target_arch = "wasm32"))
+))]
+pub mod nav_policy;
+
+#[cfg(feature = "tokio")]
 use super::core::IpeTask;
+#[cfg(feature = "tokio")]
 use super::html::Html;
+#[cfg(feature = "tokio")]
 use super::tea::{IpeCmd, IpeSub};
 
 /// Window configuration — mirrors Ipê's closed `WindowCfg { title, size }`.
@@ -40,6 +59,7 @@ use super::tea::{IpeCmd, IpeSub};
 /// with the content rect (the same Cocoa API that backs `NSWindow.contentView`),
 /// so a `size = (800, 500)` config gives exactly 800×500 px of content regardless
 /// of the native title-bar height.
+#[cfg(feature = "tokio")]
 #[allow(non_snake_case)]
 #[derive(Clone, Debug)]
 pub struct WebViewWindowCfg {
@@ -49,6 +69,7 @@ pub struct WebViewWindowCfg {
 
 /// Phantom marker for Ipê's `AppCfg model msg` record alias (destructured at the
 /// call site, never built in Rust). See the codegen `markerCfgAliases`.
+#[cfg(feature = "tokio")]
 pub struct WebViewAppCfg;
 
 // Bridge JS: delegated event listeners on the document forward DOM events on
@@ -189,9 +210,207 @@ mod tests {
             "the chain is bounded, cut at raw markup, and matched by id and tag at one child per depth"
         );
     }
+
+    /// The source text of `bundle_app`, up to the end of its body.
+    fn bundle_app_body() -> Option<&'static str> {
+        include_str!("webview.rs")
+            .split_once(concat!("pub fn ", "bundle_app("))
+            .and_then(|(_, rest)| rest.split_once("\n    }\n"))
+            .map(|(body, _)| body)
+    }
+
+    /// The bundle shell opens no channel from the page to the host and runs
+    /// no script of its own: the page is only what the bundle serves.
+    #[test]
+    fn bundle_shell_registers_no_ipc_or_injected_script() {
+        let body = bundle_app_body();
+        let Some(body) = body else {
+            assert!(body.is_some(), "bundle_app is defined in webview.rs");
+            return;
+        };
+        for banned in [
+            "with_ipc_handler",
+            "with_initialization_script",
+            "evaluate_script",
+            "with_html",
+            "with_incognito",
+        ] {
+            assert!(!body.contains(banned), "bundle_app must not call {banned}");
+        }
+        for required in [
+            "attach_policy(",
+            "with_devtools(false)",
+            "new_with_web_context(",
+            "with_custom_protocol(",
+        ] {
+            assert_eq!(body.matches(required).count(), 1, "{required}");
+        }
+    }
+
+    /// The served host installs the same policy, on its inline document.
+    #[test]
+    fn served_webview_attaches_the_policy() {
+        let source = include_str!("webview.rs");
+        assert!(source.contains(concat!("LocalOrigin::", "InlineDocument,")));
+        assert_eq!(
+            source
+                .matches(concat!("nav_policy::", "attach_policy("))
+                .count(),
+            2
+        );
+    }
 }
 
-#[cfg(not(feature = "webview"))]
+/// The window and webview steps both hosts share.
+#[cfg(feature = "webview-shell")]
+mod shell {
+    /// Build `builder`'s webview into `window`.
+    ///
+    /// Off Linux through the raw window handle; on Linux packed into the
+    /// window's default vertical `gtk::Box` when present (a tao window is a
+    /// single-child `GtkBin` already holding that box), else the window.
+    pub fn attach_webview(
+        builder: wry::WebViewBuilder<'_>,
+        window: &tao::window::Window,
+    ) -> wry::Result<wry::WebView> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            builder.build(window)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use tao::platform::unix::WindowExtUnix;
+            use wry::WebViewBuilderExtUnix;
+            match window.default_vbox() {
+                Some(vbox) => builder.build_gtk(vbox),
+                None => builder.build_gtk(window.gtk_window()),
+            }
+        }
+    }
+}
+
+/// Why the bundle shell did not open.
+#[cfg(feature = "webview-shell")]
+#[derive(Debug)]
+pub enum BundleShellError {
+    /// The window could not be created.
+    Window(tao::error::OsError),
+    /// The webview could not be created.
+    Webview(wry::Error),
+    /// The embedded table is malformed.
+    BadSite(bundle_site::SiteRefusal),
+    /// The webview's storage could not be set up.
+    Storage(crate::app_data::StorageRefusal),
+    /// The link opener thread could not start.
+    ThreadRefused(std::io::ErrorKind),
+}
+
+#[cfg(feature = "webview-shell")]
+impl std::fmt::Display for BundleShellError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Window(e) => write!(f, "the window could not open: {e}"),
+            Self::Webview(e) => write!(f, "the webview could not start: {e}"),
+            Self::BadSite(refusal) => write!(f, "the embedded app is malformed: {refusal}"),
+            Self::Storage(refusal) => write!(f, "{refusal}"),
+            Self::ThreadRefused(kind) => write!(f, "the link opener could not start ({kind})"),
+        }
+    }
+}
+
+#[cfg(feature = "webview-shell")]
+mod bundle_imp {
+    use super::BundleShellError;
+    use super::bundle_site::{BundleSite, SiteConfig};
+    use super::nav_policy::{ExternalOpener, LocalOrigin};
+    use crate::app_data::{AppDataRoot, StoragePlan, StorageRefusal};
+    use crate::csp::{APP_SCHEME, SchemeSpelling};
+    use std::borrow::Cow;
+
+    /// Convert a site answer into the webview's response.
+    fn to_response(
+        answer: super::bundle_site::SiteResponse,
+    ) -> wry::http::Response<Cow<'static, [u8]>> {
+        let mut builder = wry::http::Response::builder().status(answer.status.code());
+        for (name, value) in answer.headers {
+            builder = builder.header(name, value);
+        }
+        builder
+            .body(Cow::Borrowed(answer.body))
+            .unwrap_or_else(|_| {
+                let mut fallback = wry::http::Response::new(Cow::Borrowed(&[][..]));
+                *fallback.status_mut() = wry::http::StatusCode::INTERNAL_SERVER_ERROR;
+                fallback
+            })
+    }
+
+    /// Open the `client desktop` window over the embedded bundle `config`.
+    ///
+    /// The bundle is served from memory under the shell's scheme; navigation
+    /// stays on that exact origin, public `https` links open in the system
+    /// browser, and the webview keeps its data in the bundle id's private
+    /// directory. Runs the event loop on the calling (main) thread and returns
+    /// only on a startup failure.
+    ///
+    /// # Errors
+    /// The [`BundleShellError`] of the first step that failed.
+    pub fn bundle_app(config: &SiteConfig) -> Result<(), BundleShellError> {
+        use tao::event::{Event, WindowEvent};
+        use tao::event_loop::{ControlFlow, EventLoopBuilder};
+        use tao::window::WindowBuilder;
+        use wry::{WebContext, WebViewBuilder};
+
+        let native = SchemeSpelling::native();
+        let site =
+            BundleSite::parse(config, SchemeSpelling::Scheme).map_err(BundleShellError::BadSite)?;
+        let root = AppDataRoot::from_env()
+            .map_err(|refusal| BundleShellError::Storage(StorageRefusal::Root(refusal)))?;
+        let plan =
+            StoragePlan::resolve(&root, site.storage_key()).map_err(BundleShellError::Storage)?;
+        let mut context = WebContext::new(match plan {
+            StoragePlan::Private(dir) => Some(dir.as_path().to_path_buf()),
+            StoragePlan::BundleStore => None,
+        });
+        let opener =
+            ExternalOpener::start().map_err(|e| BundleShellError::ThreadRefused(e.kind()))?;
+        let start = site.start_url(native);
+
+        let event_loop = EventLoopBuilder::new().build();
+        let window = WindowBuilder::new()
+            .with_title(site.title())
+            .build(&event_loop)
+            .map_err(BundleShellError::Window)?;
+        let builder = WebViewBuilder::new_with_web_context(&mut context)
+            .with_custom_protocol(APP_SCHEME.to_owned(), move |_id, request| {
+                to_response(site.respond(request.method().as_str(), &request.uri().to_string()))
+            })
+            .with_devtools(false)
+            .with_url(start);
+        #[cfg(windows)]
+        let builder = wry::WebViewBuilderExtWindows::with_https_scheme(builder, true);
+        let builder =
+            super::nav_policy::attach_policy(builder, LocalOrigin::BundleScheme(native), opener);
+        let webview =
+            super::shell::attach_webview(builder, &window).map_err(BundleShellError::Webview)?;
+
+        event_loop.run(move |event, _target, control_flow| {
+            let _keep = (&webview, &context);
+            *control_flow = ControlFlow::Wait;
+            if let Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } = event
+            {
+                *control_flow = ControlFlow::Exit;
+            }
+        })
+    }
+}
+
+#[cfg(feature = "webview-shell")]
+pub use bundle_imp::bundle_app;
+
+#[cfg(all(feature = "tokio", not(feature = "webview")))]
 mod imp {
     use super::*;
     use crate::core::IpeResult;
@@ -326,12 +545,8 @@ mod imp {
             use tao::dpi::LogicalSize;
             use tao::event::{Event, WindowEvent};
             use tao::event_loop::{ControlFlow, EventLoopBuilder};
-            #[cfg(target_os = "linux")]
-            use tao::platform::unix::WindowExtUnix;
             use tao::window::WindowBuilder;
             use wry::WebViewBuilder;
-            #[cfg(target_os = "linux")]
-            use wry::WebViewBuilderExtUnix;
 
             #[derive(Debug)]
             enum UserEvent {
@@ -383,21 +598,18 @@ mod imp {
                     let _ = proxy.send_event(UserEvent::Ipc(req.into_body()));
                 },
             );
-            // Build per-OS: raw-window-handle path off Linux, gtk widget on Linux
-            // (so Wayland + X11 both work). Both return `wry::Result<WebView>`.
-            #[cfg(not(target_os = "linux"))]
-            let built: wry::Result<wry::WebView> = builder.build(&win);
-            #[cfg(target_os = "linux")]
-            // Pack into the window's default vertical `gtk::Box` when present —
-            // a tao `gtk::ApplicationWindow` is a single-child `GtkBin` that
-            // already holds that box, so adding the WebKitWebView to the window
-            // directly is a GTK contract violation (the "can only contain one
-            // widget" warning). The box is the correct container; fall back to
-            // the window only if the default vbox was disabled.
-            let built: wry::Result<wry::WebView> = match win.default_vbox() {
-                Some(vbox) => builder.build_gtk(vbox),
-                None => builder.build_gtk(win.gtk_window()),
+            let opener = match super::nav_policy::ExternalOpener::start() {
+                Ok(opener) => opener,
+                Err(e) => {
+                    return IpeResult::Err(format!("Webview.app: link opener: {e}").into());
+                }
             };
+            let builder = super::nav_policy::attach_policy(
+                builder,
+                super::nav_policy::LocalOrigin::InlineDocument,
+                opener,
+            );
+            let built = super::shell::attach_webview(builder, &win);
             let webview = match built {
                 Ok(wv) => wv,
                 Err(e) => return IpeResult::Err(format!("Webview.app: webview: {e}").into()),
@@ -436,4 +648,5 @@ mod imp {
     }
 }
 
+#[cfg(feature = "tokio")]
 pub use imp::webview_app;

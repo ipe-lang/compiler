@@ -103,6 +103,22 @@ impl SchemeSpelling {
             Self::Scheme
         }
     }
+
+    /// The request target `url` names on this spelling's origin, or `None` off it.
+    ///
+    /// The authority must be exactly the origin's: the origin is followed by
+    /// the end, `/`, `?` or `#`, so a longer host, a port or userinfo never
+    /// passes. An empty target is `/`.
+    #[must_use]
+    pub fn local_target(self, url: &str) -> Option<std::borrow::Cow<'_, str>> {
+        let rest = url.strip_prefix(self.origin())?;
+        match rest.as_bytes().first() {
+            None => Some(std::borrow::Cow::Borrowed("/")),
+            Some(b'/') => Some(std::borrow::Cow::Borrowed(rest)),
+            Some(b'?' | b'#') => Some(std::borrow::Cow::Owned(format!("/{rest}"))),
+            Some(_) => None,
+        }
+    }
 }
 
 /// The host that serves a static browser bundle's page.
@@ -172,6 +188,35 @@ pub enum Directive {
 }
 
 impl Directive {
+    /// Every directive, in declaration order.
+    pub const ALL: [Self; 17] = [
+        Self::DefaultSrc,
+        Self::ScriptSrc,
+        Self::ScriptSrcAttr,
+        Self::StyleSrc,
+        Self::StyleSrcElem,
+        Self::StyleSrcAttr,
+        Self::ImgSrc,
+        Self::FontSrc,
+        Self::MediaSrc,
+        Self::ConnectSrc,
+        Self::ManifestSrc,
+        Self::WorkerSrc,
+        Self::FrameSrc,
+        Self::ObjectSrc,
+        Self::BaseUri,
+        Self::FormAction,
+        Self::FrameAncestors,
+    ];
+
+    /// The directive the header spells `name`, if the runtime emits one.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|directive| directive.name() == name)
+    }
+
     /// The directive name as the header spells it.
     #[must_use]
     pub const fn name(self) -> &'static str {
