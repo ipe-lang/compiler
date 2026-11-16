@@ -380,7 +380,7 @@ impl Launcher for SystemLauncher {
         crate::browser_open::start_opener(
             url,
             crate::browser_open::Platform::HOST,
-            crate::browser_open::Breakaway::PreferOutsideJob,
+            crate::browser_open::Breakaway::Never,
         )
         .ok()
     }
