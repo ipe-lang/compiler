@@ -476,7 +476,11 @@ fn spawn_opener(mut command: Command) -> Result<Child, OpenOutcome> {
 }
 
 /// Start `command` hardened with null stdio and watch it for at most `grace`.
-pub fn run_opener(command: Command, exit_is_verdict: bool, grace: Duration) -> OpenOutcome {
+///
+/// Test-only: production reaches a process only through [`open_url`] or
+/// [`start_opener`], so only a parsed [`BrowserUrl`] starts an opener.
+#[cfg(test)]
+fn run_opener(command: Command, exit_is_verdict: bool, grace: Duration) -> OpenOutcome {
     match spawn_opener(command) {
         Ok(child) => watch_opener(child, exit_is_verdict, grace),
         Err(outcome) => outcome,
@@ -966,6 +970,55 @@ mod tests {
             Duration::from_secs(30),
         );
         assert!(matches!(outcome, OpenOutcome::OpenerMissing), "{outcome}");
+    }
+
+    /// The production text of a module: everything before its test module.
+    fn production(source: &'static str) -> &'static str {
+        source
+            .split_once(concat!("#[cfg(all(test, ", "not(target_arch"))
+            .map_or(source, |(production, _)| production)
+    }
+
+    /// The opener and the link worker reach a process only through the one hardened runner.
+    ///
+    /// `browser_open.rs` names one `Command::new` and one `spawn_hardened`
+    /// call; `nav_policy.rs` reaches it only through `start_opener` from one
+    /// named thread; neither starts a child or a thread any other way.
+    #[test]
+    fn browser_open_spawns_only_through_spawn_hardened() {
+        let opener = production(include_str!("browser_open.rs"));
+        let link_worker = production(include_str!("webview/nav_policy.rs"));
+        for (file, source) in [("browser_open.rs", opener), ("nav_policy.rs", link_worker)] {
+            for banned in [
+                "Command::spawn",
+                ".spawn()",
+                ".output()",
+                ".status()",
+                ".exec(",
+                "std::thread::spawn",
+                "thread::Builder",
+                "spawn_hardened_naming(",
+                "spawn_hardened_tokio(",
+                "exec_naming(",
+            ] {
+                assert!(!source.contains(banned), "{file} must not name {banned}");
+            }
+        }
+        for (file, source, call, count) in [
+            ("browser_open.rs", opener, "Command::new(", 1),
+            ("browser_open.rs", opener, "spawn_hardened(", 1),
+            ("nav_policy.rs", link_worker, "Command::new(", 0),
+            ("nav_policy.rs", link_worker, "spawn_hardened(", 0),
+            (
+                "nav_policy.rs",
+                link_worker,
+                "browser_open::start_opener(",
+                1,
+            ),
+            ("nav_policy.rs", link_worker, "threads::spawn_named(", 1),
+        ] {
+            assert_eq!(source.matches(call).count(), count, "{file}: {call}");
+        }
     }
 
     /// The opener writes its marker three seconds after the grace ends, so only an

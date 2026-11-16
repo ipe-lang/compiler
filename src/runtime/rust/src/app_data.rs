@@ -495,34 +495,98 @@ mod tests {
         );
     }
 
+    /// What a refusal case plants at a path under the root before `ensure` runs.
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum Plant {
+        /// A symlink to a real directory elsewhere under the root.
+        Link,
+        /// A directory with these mode bits.
+        Dir(u32),
+        /// A regular file.
+        File,
+    }
+
     #[cfg(unix)]
     #[test]
     #[allow(clippy::expect_used)] // a fixture the test cannot plant is a test failure
     fn private_data_dir_refuses_a_symlinked_or_foreign_leaf() {
         use std::os::unix::fs::PermissionsExt as _;
-        let Ok(key) = StorageKey::parse("com.acme.notes") else {
+        let key = StorageKey::parse("com.acme.notes");
+        let Ok(key) = key else {
+            assert!(key.is_ok(), "{key:?}");
             return;
         };
-        let root = fresh_dir("symlink");
-        let elsewhere = root.join("elsewhere");
-        std::fs::create_dir(&elsewhere).expect("create target");
-        std::os::unix::fs::symlink(&elsewhere, root.join("com.acme.notes")).expect("plant link");
-        assert_eq!(
-            PrivateDataDir::ensure(&root, &key),
-            Err(StorageRefusal::NotPrivate(ScratchRefusal::NotADirectory))
-        );
-
-        let open = fresh_dir("open");
-        let key_dir = open.join("com.acme.notes");
-        std::fs::create_dir(&key_dir).expect("create key dir");
-        std::fs::set_permissions(&key_dir, std::fs::Permissions::from_mode(0o755))
-            .expect("open the key dir");
-        assert_eq!(
-            PrivateDataDir::ensure(&open, &key),
-            Err(StorageRefusal::NotPrivate(ScratchRefusal::NotPrivate))
-        );
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&open);
+        let cases = [
+            (
+                "key-link",
+                "com.acme.notes",
+                Plant::Link,
+                ScratchRefusal::NotADirectory,
+            ),
+            (
+                "leaf-link",
+                "com.acme.notes/webview",
+                Plant::Link,
+                ScratchRefusal::NotADirectory,
+            ),
+            (
+                "key-open",
+                "com.acme.notes",
+                Plant::Dir(0o755),
+                ScratchRefusal::NotPrivate,
+            ),
+            (
+                "leaf-group",
+                "com.acme.notes/webview",
+                Plant::Dir(0o770),
+                ScratchRefusal::NotPrivate,
+            ),
+            (
+                "key-file",
+                "com.acme.notes",
+                Plant::File,
+                ScratchRefusal::NotADirectory,
+            ),
+            (
+                "leaf-file",
+                "com.acme.notes/webview",
+                Plant::File,
+                ScratchRefusal::NotADirectory,
+            ),
+        ];
+        for (tag, rel, plant, refusal) in cases {
+            let root = fresh_dir(tag);
+            let elsewhere = root.join("elsewhere");
+            std::fs::create_dir(&elsewhere).expect("create target");
+            let key_dir = root.join("com.acme.notes");
+            let at = root.join(rel);
+            if at != key_dir {
+                std::fs::create_dir(&key_dir).expect("create key dir");
+                std::fs::set_permissions(&key_dir, std::fs::Permissions::from_mode(0o700))
+                    .expect("close the key dir");
+            }
+            match plant {
+                Plant::Link => std::os::unix::fs::symlink(&elsewhere, &at).expect("plant link"),
+                Plant::Dir(bits) => {
+                    std::fs::create_dir(&at).expect("create dir");
+                    std::fs::set_permissions(&at, std::fs::Permissions::from_mode(bits))
+                        .expect("open the dir");
+                }
+                Plant::File => std::fs::write(&at, b"").expect("plant file"),
+            }
+            assert_eq!(
+                PrivateDataDir::ensure(&root, &key),
+                Err(StorageRefusal::NotPrivate(refusal)),
+                "{tag}"
+            );
+            assert_eq!(
+                std::fs::read_dir(&elsewhere).map(Iterator::count).ok(),
+                Some(0),
+                "{tag}: nothing is created through the link"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[cfg(unix)]

@@ -630,7 +630,11 @@ mod tests {
         );
     }
 
-    /// Every policy handler is installed by the one `attach_policy`.
+    /// Every policy handler is installed by the one `attach_policy`, which both hosts reach.
+    ///
+    /// `bundle_app` and `webview_app` each call `attach_policy` once, and
+    /// `webview.rs` outside its tests names none of the handler setters, so
+    /// no host can install its own handler beside or instead of the policy.
     #[test]
     fn attach_policy_installs_every_policy_handler() {
         let source = include_str!("nav_policy.rs");
@@ -642,6 +646,35 @@ mod tests {
             assert!(body.is_some(), "attach_policy is defined here");
             return;
         };
+        let webview = include_str!("../webview.rs");
+        let hosts = webview
+            .split_once(concat!("#[cfg(all(test, ", "not(target_arch"))
+            .and_then(|(head, rest)| {
+                let (_, after_tests) = rest.split_once("\n}\n")?;
+                Some(format!("{head}{after_tests}"))
+            });
+        let Some(hosts) = hosts else {
+            assert!(hosts.is_some(), "webview.rs has one test module");
+            return;
+        };
+        let bundle = hosts
+            .split_once(concat!("pub fn ", "bundle_app("))
+            .and_then(|(_, rest)| rest.split_once("\n    }\n"))
+            .map(|(body, _)| body);
+        assert_eq!(
+            bundle.map(|b| b.matches(concat!("nav_policy::", "attach_policy(")).count()),
+            Some(1),
+            "bundle_app reaches attach_policy once"
+        );
+        let served = hosts
+            .split(concat!("pub fn ", "webview_app<"))
+            .skip(1)
+            .filter(|rest| rest.contains(concat!("nav_policy::", "attach_policy(")))
+            .count();
+        assert_eq!(
+            served, 1,
+            "the webview-backed webview_app reaches attach_policy"
+        );
         for handler in [
             ".with_navigation_handler(",
             ".with_new_window_req_handler(",
@@ -649,6 +682,10 @@ mod tests {
             ".with_drag_drop_handler(",
         ] {
             assert_eq!(body.matches(handler).count(), 1, "{handler}");
+            assert!(
+                !hosts.contains(handler),
+                "webview.rs must not call {handler}"
+            );
         }
         assert!(body.contains("wry::NewWindowResponse::Deny"));
         assert!(!body.contains("NewWindowResponse::Allow"));

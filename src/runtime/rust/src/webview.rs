@@ -219,8 +219,42 @@ mod tests {
             .map(|(body, _)| body)
     }
 
-    /// The bundle shell opens no channel from the page to the host and runs
-    /// no script of its own: the page is only what the bundle serves.
+    /// The text of the item that starts at `head`, up to the first line closing it at `close`.
+    fn item_body(source: &'static str, head: &str, close: &str) -> Option<&'static str> {
+        source
+            .split_once(head)
+            .and_then(|(_, rest)| rest.split_once(close))
+            .map(|(body, _)| body)
+    }
+
+    /// Every `with_*` builder call `source` names, in order of appearance.
+    fn builder_calls(source: &str) -> Vec<&str> {
+        let mut calls = Vec::new();
+        let mut rest = source;
+        while let Some(at) = rest.find("with_") {
+            let (before, from) = rest.split_at(at);
+            let end = from
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(from.len());
+            let (name, after) = from.split_at(end);
+            let preceded = before
+                .chars()
+                .next_back()
+                .is_some_and(|c| c == '.' || c == ':');
+            if preceded && after.starts_with('(') {
+                calls.push(name);
+            }
+            rest = after;
+        }
+        calls
+    }
+
+    /// The bundle shell opens no channel from the page to the host and runs no script of its own.
+    ///
+    /// `bundle_app` and its callees (`attach_policy`, `attach_webview`) build
+    /// the webview through exactly the admitted builder call list, from the one
+    /// admitted constructor `new_with_web_context`; `bundle_site.rs`, the
+    /// handler's whole surface, names no injected-content or file spelling.
     #[test]
     fn bundle_shell_registers_no_ipc_or_injected_script() {
         let body = bundle_app_body();
@@ -228,22 +262,86 @@ mod tests {
             assert!(body.is_some(), "bundle_app is defined in webview.rs");
             return;
         };
-        for banned in [
-            "with_ipc_handler",
-            "with_initialization_script",
-            "evaluate_script",
-            "with_html",
-            "with_incognito",
+        let attach = item_body(
+            include_str!("webview.rs"),
+            concat!("pub fn ", "attach_webview("),
+            "\n    }\n",
+        );
+        let Some(attach) = attach else {
+            assert!(attach.is_some(), "attach_webview is defined in webview.rs");
+            return;
+        };
+        let policy = item_body(
+            include_str!("webview/nav_policy.rs"),
+            concat!("pub fn ", "attach_policy("),
+            "\n}\n",
+        );
+        let Some(policy) = policy else {
+            assert!(
+                policy.is_some(),
+                "attach_policy is defined in nav_policy.rs"
+            );
+            return;
+        };
+        let site = include_str!("webview/bundle_site.rs")
+            .split_once(concat!("#[cfg(all(test, ", "not(target_arch"))
+            .map(|(production, _)| production);
+        let Some(site) = site else {
+            assert!(site.is_some(), "bundle_site.rs has a test module");
+            return;
+        };
+        assert_eq!(
+            body.matches(concat!("shell::", "attach_webview(")).count(),
+            1
+        );
+        assert_eq!(
+            body.matches(concat!("nav_policy::", "attach_policy("))
+                .count(),
+            1
+        );
+        let mut calls = builder_calls(body);
+        calls.extend(builder_calls(attach));
+        calls.extend(builder_calls(policy));
+        calls.sort_unstable();
+        assert_eq!(
+            calls,
+            [
+                "with_custom_protocol",
+                "with_devtools",
+                "with_download_started_handler",
+                "with_drag_drop_handler",
+                "with_https_scheme",
+                "with_navigation_handler",
+                "with_new_window_req_handler",
+                "with_title",
+                "with_url",
+            ],
+            "the one admitted builder call list"
+        );
+        assert_eq!(body.matches("WebViewBuilder::").count(), 1);
+        assert_eq!(
+            body.matches("WebViewBuilder::new_with_web_context(")
+                .count(),
+            1
+        );
+        assert_eq!(body.matches("with_devtools(false)").count(), 1);
+        for (part, text) in [
+            ("bundle_app", body),
+            ("attach_webview", attach),
+            ("attach_policy", policy),
+            ("bundle_site.rs", site),
         ] {
-            assert!(!body.contains(banned), "bundle_app must not call {banned}");
-        }
-        for required in [
-            "attach_policy(",
-            "with_devtools(false)",
-            "new_with_web_context(",
-            "with_custom_protocol(",
-        ] {
-            assert_eq!(body.matches(required).count(), 1, "{required}");
+            for banned in [
+                "with_ipc_handler",
+                "with_initialization_script",
+                "evaluate_script",
+                "with_html",
+                "file://",
+                "with_incognito",
+                "WebViewBuilder::new(",
+            ] {
+                assert!(!text.contains(banned), "{part} must not name {banned}");
+            }
         }
     }
 
