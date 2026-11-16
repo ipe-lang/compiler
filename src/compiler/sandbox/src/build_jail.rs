@@ -1524,10 +1524,20 @@ pub(crate) fn untrusted_mount_ancestor(
 #[cfg(any(target_os = "freebsd", test))]
 pub(crate) fn tmpfs_would_hide<'p>(
     dir: &Path,
-    mut earlier: impl Iterator<Item = &'p Path>,
+    earlier: impl Iterator<Item = &'p Path>,
     binds: &[PathBuf],
 ) -> bool {
-    earlier.any(|target| target.starts_with(dir)) || binds.iter().any(|bind| dir.starts_with(bind))
+    holds_earlier_mount(dir, earlier) || binds.iter().any(|bind| dir.starts_with(bind))
+}
+
+/// Whether `dir` is or holds one of the `earlier` mount targets, so a mount
+/// over `dir` would hide it.
+#[cfg(any(target_os = "freebsd", test))]
+pub(crate) fn holds_earlier_mount<'p>(
+    dir: &Path,
+    mut earlier: impl Iterator<Item = &'p Path>,
+) -> bool {
+    earlier.any(|target| target.starts_with(dir))
 }
 
 /// How to move the jail directories, which live under `$HOME/.cache/ipe/jail`,
@@ -3287,9 +3297,10 @@ mod freebsd_jail {
         ///
         /// # Errors
         ///
-        /// [`RunJailDefect::MountFailed`] when the mountpoint cannot be made ready,
-        /// a bind source was not held, the mount itself fails, or the target does
-        /// not show the held source.
+        /// [`RunJailDefect::MountFailed`] when a mask would hide an earlier
+        /// mount, the mountpoint cannot be made ready, a bind source was not
+        /// held, the mount itself fails, or the target does not show the held
+        /// source.
         fn mount_op(
             &mut self,
             mount_nullfs_bin: &Path,
@@ -3299,6 +3310,20 @@ mod freebsd_jail {
             jail_uid: u32,
         ) -> Result<(), RunJailDefect> {
             let target = op.target();
+            // The plan puts every mask before the binds it contains; a mask
+            // that still lands on an earlier mount would hide it, so the jail
+            // would silently see less than the plan grants.
+            if matches!(op, FreebsdMountOp::Mask { .. })
+                && super::holds_earlier_mount(
+                    target,
+                    self.mounted.iter().map(|earlier| earlier.target.as_path()),
+                )
+            {
+                return Err(RunJailDefect::MountFailed {
+                    target: target.to_path_buf(),
+                    detail: "this mask would hide an earlier mount".to_owned(),
+                });
+            }
             self.ensure_mountpoint(mount_bin, target)?;
             let (source, read_only) = match op {
                 FreebsdMountOp::Mask { .. } => {
@@ -5290,6 +5315,42 @@ mod tests {
         };
         let anchor = untrusted_mount_ancestor(root, target, trust);
         assert_eq!(anchor, Ok(Some(PathBuf::from("/jailroot/srv/u"))));
+    }
+
+    #[test]
+    fn a_mask_over_an_earlier_mount_is_refused() {
+        use crate::mounts::{Bind, CanonicalPath, HomeMasks, mount_plan};
+        let root = Path::new("/jailroot");
+        // The plan masks `/tmp` before the bind inside it, so applying the
+        // plan in order never trips the check below.
+        let inner = CanonicalPath::assumed("/tmp/scratch");
+        let binds = [Bind::ReadWrite(&inner)];
+        let plan = mount_plan(&HomeMasks::unmasked(), &binds).expect("no carve");
+        let ops = freebsd_mount_ops(root, &plan).expect("re-rooted");
+        let mut earlier: Vec<&Path> = vec![root];
+        for op in &ops {
+            if matches!(op, FreebsdMountOp::Mask { .. }) {
+                assert!(
+                    !holds_earlier_mount(op.target(), earlier.iter().copied()),
+                    "{op:?} after {earlier:?}"
+                );
+            }
+            earlier.push(op.target());
+        }
+        // A mask that does land on or over an earlier mount would hide it.
+        let bound = [root, Path::new("/jailroot/tmp/scratch")];
+        assert!(holds_earlier_mount(
+            Path::new("/jailroot/tmp"),
+            bound.into_iter()
+        ));
+        assert!(holds_earlier_mount(
+            Path::new("/jailroot/tmp/scratch"),
+            bound.into_iter()
+        ));
+        assert!(!holds_earlier_mount(
+            Path::new("/jailroot/home"),
+            bound.into_iter()
+        ));
     }
 
     #[test]
