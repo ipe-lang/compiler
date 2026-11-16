@@ -493,3 +493,199 @@ fn client_desktop_shell_builds() -> Result<(), BoxError> {
     );
     Ok(())
 }
+
+/// The storage key the client desktop fixtures' bundle id folds to.
+#[cfg(all(unix, not(target_os = "macos")))]
+const CLIENT_DESKTOP_KEY: &str = "io.acme.counter";
+
+/// A fresh, empty, owner-only directory for `tag`.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn private_scratch(tag: &str) -> Result<std::path::PathBuf, BoxError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir =
+        ipe_test_temp::temp_root().join(format!("ipe_webview_e2e_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(dir)
+}
+
+/// The shell binary `ipe dev build web client desktop` packed for Linux under
+/// `project`: `out/dist/linux/<app>/bin/<app>`, the one bundle there.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn client_desktop_binary(project: &std::path::Path) -> Result<std::path::PathBuf, BoxError> {
+    let dist = project.join("out").join("dist").join("linux");
+    let roots = std::fs::read_dir(&dist)?.collect::<Result<Vec<_>, _>>()?;
+    let [root] = roots.as_slice() else {
+        return Err(format!("one bundle under {}: {roots:?}", dist.display()).into());
+    };
+    let binary = root.path().join("bin").join(root.file_name());
+    if binary.is_file() {
+        Ok(binary)
+    } else {
+        Err(format!("no shell binary at {}", binary.display()).into())
+    }
+}
+
+/// The counter's client desktop shell, built: its fixture and its binary.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn built_client_desktop(
+    test_name: &str,
+) -> Result<(ipe::RootFixture, std::path::PathBuf), BoxError> {
+    let fixture = client_desktop_fixture(test_name, "{ bundleId = \"io.acme.counter\" }")?;
+    let out = dev_build_client_desktop(fixture.path())?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("{test_name}: the client desktop build failed:\n{stderr}").into());
+    }
+    let binary = client_desktop_binary(fixture.path())?;
+    Ok((fixture, binary))
+}
+
+/// Run `binary` under `timeout 10` from `cwd`, its `XDG_DATA_HOME` set to `xdg`.
+///
+/// The bound keeps a shell whose storage guard is gone from holding the test
+/// open on a host with a display; a refused shell exits long before it.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn run_shell_with_xdg(
+    binary: &std::path::Path,
+    xdg: &std::ffi::OsStr,
+    cwd: &std::path::Path,
+) -> Result<std::process::Output, BoxError> {
+    Ok(std::process::Command::new("timeout")
+        .arg("10")
+        .arg(binary)
+        .env("XDG_DATA_HOME", xdg)
+        .current_dir(cwd)
+        .output()?)
+}
+
+/// Tier-B: the client desktop shell starts under `xvfb-run`, loads its bundle,
+/// and exits only by the timeout; its webview data lives in the storage key's
+/// private directory under the `XDG_DATA_HOME` it was given.
+///
+/// Exit 124 is the only pass: an exit by the shell's own error is 1, and a
+/// shell that closed on its own is 0. Afterwards `<xdg>/<key>/webview` exists,
+/// is mode 0o700 like `<xdg>/<key>`, and holds the engine's data.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn client_desktop_shell_boots_and_loads_wasm() -> Result<(), BoxError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return Ok(());
+    }
+    let test_name = "client_desktop_shell_boots";
+    let xvfb = std::process::Command::new("which")
+        .arg("xvfb-run")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !xvfb {
+        return Err(
+            format!("{test_name}: `xvfb-run` is not on PATH; the `e2e` job installs it").into(),
+        );
+    }
+    let (_fixture, binary) = built_client_desktop(test_name)?;
+    let xdg = private_scratch(test_name)?;
+    let result = std::process::Command::new("xvfb-run")
+        .args(["-a", "timeout", "10"])
+        .arg(&binary)
+        .env("XDG_DATA_HOME", &xdg)
+        .output()?;
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(
+        result.status.code(),
+        Some(124),
+        "the shell exits only by the timeout:\n{stderr}"
+    );
+
+    let key_dir = xdg.join(CLIENT_DESKTOP_KEY);
+    let data_dir = key_dir.join("webview");
+    for dir in [&key_dir, &data_dir] {
+        let meta = std::fs::symlink_metadata(dir)?;
+        assert!(meta.is_dir(), "{} is a real directory", dir.display());
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o700,
+            "{}",
+            dir.display()
+        );
+    }
+    assert!(
+        std::fs::read_dir(&data_dir)?.next().is_some(),
+        "the engine keeps its data in {}",
+        data_dir.display()
+    );
+    let _ = std::fs::remove_dir_all(&xdg);
+    Ok(())
+}
+
+/// A relative `XDG_DATA_HOME` is refused before any window: the shell exits 1
+/// naming the variable, and creates nothing relative to its working directory.
+///
+/// Without the refusal the shell would fall back to `$HOME/.local/share` and
+/// go on to open a window, so the exit and the line both go red.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn client_desktop_shell_refuses_a_relative_xdg_data_home() -> Result<(), BoxError> {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return Ok(());
+    }
+    let test_name = "client_desktop_relative_xdg";
+    let (_fixture, binary) = built_client_desktop(test_name)?;
+    let cwd = private_scratch(test_name)?;
+    let result = run_shell_with_xdg(&binary, std::ffi::OsStr::new("rel"), &cwd)?;
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line == "no app-data directory: `XDG_DATA_HOME` is not an absolute path"),
+        "{stderr}"
+    );
+    assert!(
+        std::fs::read_dir(&cwd)?.next().is_none(),
+        "nothing is created under the working directory"
+    );
+    let _ = std::fs::remove_dir_all(&cwd);
+    Ok(())
+}
+
+/// A storage key directory planted as a symlink is refused, never followed:
+/// the shell exits 1 with the not-a-real-directory refusal, and the link's
+/// target stays empty.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn client_desktop_shell_refuses_a_symlinked_storage_dir() -> Result<(), BoxError> {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return Ok(());
+    }
+    let test_name = "client_desktop_symlinked_storage";
+    let (_fixture, binary) = built_client_desktop(test_name)?;
+    let scratch = private_scratch(test_name)?;
+    let xdg = scratch.join("data");
+    let elsewhere = scratch.join("elsewhere");
+    std::fs::create_dir(&xdg)?;
+    std::fs::create_dir(&elsewhere)?;
+    let key_dir = xdg.join(CLIENT_DESKTOP_KEY);
+    std::os::unix::fs::symlink(&elsewhere, &key_dir)?;
+    let result = run_shell_with_xdg(&binary, xdg.as_os_str(), &scratch)?;
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line == "the app-data directory is not a real directory"),
+        "{stderr}"
+    );
+    assert!(
+        std::fs::symlink_metadata(&key_dir)?
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        std::fs::read_dir(&elsewhere)?.next().is_none(),
+        "the link's target is never written"
+    );
+    let _ = std::fs::remove_dir_all(&scratch);
+    Ok(())
+}
