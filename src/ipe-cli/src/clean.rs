@@ -787,22 +787,21 @@ mod tests {
         let of = |member: &str, area: &str| {
             crate::target_dir::user_cache_target(&base, &release.join(member).join(area))
         };
-        for (member, area) in [
-            ("web", "rust"),
-            ("web", "app"),
-            ("web-client", "rust"),
-            ("web-client", "app"),
-        ] {
-            assert!(
-                named.contains(&of(member, area)),
-                "{member}/{area}: {named:?}"
-            );
+        for member in ["web", "web-client"] {
+            for area in RELOCATABLE_CRATES {
+                let area = area.dir_name();
+                assert!(
+                    named.contains(&of(member, area)),
+                    "{member}/{area}: {named:?}"
+                );
+            }
         }
         assert!(named.contains(&relocated(&root, &base)), "{named:?}");
         for stray in ["Not-A-Slug", "notes.txt"] {
             assert!(!named.contains(&of(stray, "rust")), "{stray}: {named:?}");
         }
-        assert_eq!(named.len(), 6, "{named:?}");
+        // The project root and its two members, each with every relocatable crate.
+        assert_eq!(named.len(), 3 * RELOCATABLE_CRATES.len(), "{named:?}");
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
@@ -827,7 +826,9 @@ mod tests {
         }
         let past = crate::target_dir::user_cache_target(&base, &too_deep.join("rust"));
         assert!(!named.contains(&past), "{named:?}");
-        assert_eq!(named.len(), 6, "{named:?}");
+        // The project root, the shell and its nested member, each with every
+        // relocatable crate.
+        assert_eq!(named.len(), 3 * RELOCATABLE_CRATES.len(), "{named:?}");
         let _ = std::fs::remove_dir_all(&scratch);
     }
 

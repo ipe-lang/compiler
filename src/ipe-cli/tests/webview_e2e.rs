@@ -511,11 +511,18 @@ fn private_scratch(tag: &str) -> Result<std::path::PathBuf, BoxError> {
 }
 
 /// The shell binary `ipe dev build web client desktop` packed for Linux under
-/// `project`: `out/dist/linux/<app>/bin/<app>`, the one bundle there.
+/// `project`: `out/dist/linux/<app>/bin/<app>`, the one bundle directory there
+/// (the output root's ownership marker beside it is a file).
 #[cfg(all(unix, not(target_os = "macos")))]
 fn client_desktop_binary(project: &std::path::Path) -> Result<std::path::PathBuf, BoxError> {
     let dist = project.join("out").join("dist").join("linux");
-    let roots = std::fs::read_dir(&dist)?.collect::<Result<Vec<_>, _>>()?;
+    let mut roots = Vec::new();
+    for entry in std::fs::read_dir(&dist)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            roots.push(entry);
+        }
+    }
     let [root] = roots.as_slice() else {
         return Err(format!("one bundle under {}: {roots:?}", dist.display()).into());
     };
