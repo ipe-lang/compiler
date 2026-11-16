@@ -2122,7 +2122,7 @@ fn escape_toml_basic(s: &str) -> String {
 /// — a drifted dep-model manifest template, surfaced loudly rather than emitting
 /// a manifest that names no runtime.
 fn dep_model_cargo_toml(ctx: &EmitCtx) -> DResult<String> {
-    let mut manifest = substitute_dep_manifest_anchors(
+    let mut manifest = substitute_program_features(
         CARGO_DEP_TOML,
         ctx,
         "ipe_backend_rust::project::dep_model_cargo_toml",
@@ -2165,7 +2165,7 @@ fn dep_model_cargo_toml(ctx: &EmitCtx) -> DResult<String> {
 /// splice keys on has drifted — each surfaced loudly rather than emitting a
 /// manifest that names no runtime or drops a referenced crate.
 fn dep_model_wasm_cargo_toml(ctx: &EmitCtx) -> DResult<String> {
-    let mut manifest = substitute_dep_manifest_anchors(
+    let mut manifest = substitute_program_features(
         CARGO_WASM_DEP_TOML,
         ctx,
         "ipe_backend_rust::project::dep_model_wasm_cargo_toml",
@@ -2203,13 +2203,13 @@ fn dep_model_wasm_cargo_toml(ctx: &EmitCtx) -> DResult<String> {
 /// Returns [`Diagnostic::CompilerBug`] (tagged `where_`) if the features
 /// placeholder is absent from `template` — a drifted manifest template,
 /// surfaced loudly rather than emitting a manifest that names no runtime.
-fn substitute_dep_manifest_anchors(
+fn substitute_program_features(
     template: &str,
     ctx: &EmitCtx,
     where_: &'static str,
 ) -> DResult<String> {
     let features = crate::runtime_features::runtime_features(ctx);
-    substitute_features_anchor(template, &features.as_feature_names(), where_)
+    substitute_dep_manifest_anchors(template, &features.as_feature_names(), where_)
 }
 
 /// Render the native dependency-model `Cargo.toml` ([`CARGO_DEP_TOML`]) with
@@ -2220,9 +2220,9 @@ fn substitute_dep_manifest_anchors(
 ///
 /// # Errors
 ///
-/// As [`substitute_features_anchor`].
-pub(crate) fn dep_manifest_selecting(features: &[&str], where_: &'static str) -> DResult<String> {
-    substitute_features_anchor(CARGO_DEP_TOML, features, where_)
+/// As [`substitute_dep_manifest_anchors`].
+pub fn dep_manifest_selecting(features: &[&str], where_: &'static str) -> DResult<String> {
+    substitute_dep_manifest_anchors(CARGO_DEP_TOML, features, where_)
 }
 
 /// Substitute the `__IPE_RUNTIME_FEATURES__` anchor in `template` with
@@ -2231,7 +2231,7 @@ pub(crate) fn dep_manifest_selecting(features: &[&str], where_: &'static str) ->
 /// # Errors
 ///
 /// Returns [`Diagnostic::CompilerBug`] (tagged `where_`) if the anchor is absent.
-fn substitute_features_anchor(
+fn substitute_dep_manifest_anchors(
     template: &str,
     features: &[&str],
     where_: &'static str,

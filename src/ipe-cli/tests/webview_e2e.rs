@@ -406,13 +406,22 @@ fn client_desktop_fixture(test_name: &str, mobile: &str) -> Result<ipe::RootFixt
 }
 
 /// `ipe dev build <project> web client desktop`, its output captured.
-fn dev_build_client_desktop(project: &std::path::Path) -> std::io::Result<std::process::Output> {
-    std::process::Command::new(e2e_support::cargo_bin!("ipe").into_path_buf())
-        .arg("dev")
-        .arg("build")
+///
+/// The build runs in an exclusive target: `ipe dev build` emits fixed package
+/// names a concurrent build in the shared target would collide with.
+fn dev_build_client_desktop(project: &std::path::Path) -> Result<std::process::Output, BoxError> {
+    let isolated =
+        e2e_support::target::isolated(e2e_support::target::IsolationReason::FixedPackageName);
+    let Ok(isolated) = isolated else {
+        return Err(format!("isolated build target: {isolated:?}").into());
+    };
+    let target = e2e_support::target::BuildTarget::Isolated(isolated);
+    let ipe_bin = e2e_support::cargo_bin!("ipe").into_path_buf();
+    Ok(e2e_support::target::ipe_command(&ipe_bin, &target)
+        .args(["dev", "build"])
         .arg(project)
         .args(["web", "client", "desktop"])
-        .output()
+        .output()?)
 }
 
 /// A bundle id the bundle grammar admits but no OS can name a directory by is
@@ -459,15 +468,9 @@ fn client_desktop_shell_builds() -> Result<(), BoxError> {
     let test_name = "client_desktop_shell_builds";
     let fixture = client_desktop_fixture(test_name, "{ bundleId = \"io.acme.counter\" }")?;
     let out = dev_build_client_desktop(fixture.path())?;
+    // The shell links the system webview (Linux: `libwebkit2gtk-4.1-dev`), so a
+    // host without it fails here rather than passing unproven.
     let stderr = String::from_utf8_lossy(&out.stderr);
-    if !out.status.success() && stderr.contains("pkg-config exited with status code 1") {
-        println!(
-            "LOUD-SKIP: Tier-A (client desktop shell build) — system `webkit2gtk`/`glib` \
-             dev packages not installed on this runner. Install \
-             `libwebkit2gtk-4.1-dev libglib2.0-dev` to run this test for real."
-        );
-        return Ok(());
-    }
     assert!(out.status.success(), "{stderr}");
 
     let shell = fixture.path().join("out").join("client-shell");

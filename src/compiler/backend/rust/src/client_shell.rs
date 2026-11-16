@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use ipe_backend::{EmittedProject, RelPath};
-use ipe_diagnostics::{DResult, Diagnostic};
+use ipe_diagnostics::DResult;
 use ipe_intern::rust_str_lit;
 use ipe_runtime_rust::encoding::{BundlePath, MountBase};
 
@@ -118,7 +118,7 @@ impl ShellSite {
 /// below [`SHELL_WWW_DIR`] from the same read [`ShellSite`] was built from.
 ///
 /// # Errors
-/// [`Diagnostic::CompilerBug`] when the manifest template has drifted.
+/// [`ipe_diagnostics::Diagnostic::CompilerBug`] when the manifest template has drifted.
 pub fn emit_client_shell(site: &ShellSite) -> DResult<EmittedProject> {
     let cargo_toml = crate::project::dep_manifest_selecting(
         &[SHELL_RUNTIME_FEATURE],

@@ -1,11 +1,11 @@
 use super::{
     BuildOptions, CliError, EmittedCrate, FlooredBuild, HeldBuild, NativeFinish, OutTarget,
     SourceGraph, analysis_graphs, analysis_root, analysis_target, attribute_canon_errors,
-    attribute_post_link_error, build_root_into, build_test_into,
+    attribute_post_link_error, backend_invariant_err, build_root_into, build_test_into,
     capabilities_including_served_widgets, create_source_root, emit_machine_error,
     emitted_bin_filename, entry_modules, frame_infer_error, home_to_source_map,
     lowering_check_query, lowering_check_target, program_constructs_a_widget, run_build,
-    runtime_context_for_message, working_dir,
+    runtime_context_for_message, working_dir, write_emitted_project,
 };
 use crate::cargo_step::{CargoOutput, CargoTarget, TestRunKey, Verbosity};
 use crate::output_dir::held::{BACKUP_SLOTS, BackedUp, HeldDir, RelativeLeaf};
