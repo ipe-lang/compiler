@@ -213,22 +213,209 @@ mod tests {
             .map(|(_, text)| text.as_str())
     }
 
+    /// The value of `SITE_CONFIG`'s string field `name`, read back through Rust's own grammar.
+    fn config_field(site_rs: &str, name: &str) -> Option<String> {
+        let file = syn::parse_file(site_rs).ok()?;
+        let config = file.items.iter().find_map(|item| match item {
+            syn::Item::Static(item) if item.ident == "SITE_CONFIG" => Some(item.expr.as_ref()),
+            _ => None,
+        })?;
+        let syn::Expr::Struct(config) = config else {
+            return None;
+        };
+        let field = config
+            .fields
+            .iter()
+            .find(|field| matches!(&field.member, syn::Member::Named(id) if id == name))?;
+        match &field.expr {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(lit),
+                ..
+            }) => Some(lit.value()),
+            _ => None,
+        }
+    }
+
+    /// How many items `site.rs` declares and how many fields `SITE_CONFIG` sets.
+    fn config_shape(site_rs: &str) -> Option<(usize, usize)> {
+        let file = syn::parse_file(site_rs).ok()?;
+        let fields = file.items.iter().find_map(|item| match item {
+            syn::Item::Static(item) if item.ident == "SITE_CONFIG" => match item.expr.as_ref() {
+                syn::Expr::Struct(config) => Some(config.fields.len()),
+                _ => None,
+            },
+            _ => None,
+        })?;
+        Some((file.items.len(), fields))
+    }
+
+    /// The `site.rs` the shell crate for `shell` holds.
+    fn site_rs_of(shell: &ShellSite) -> Option<String> {
+        let project = emitted(shell)?;
+        file(&project, "src/site.rs").map(str::to_owned)
+    }
+
+    /// The shell manifest selects the runtime with its defaults off and exactly the shell feature on.
+    ///
+    /// Every other dependency is an optional allocator no default feature
+    /// reaches, so the shell links no runtime surface beyond the webview shell.
     #[test]
-    fn client_shell_manifest_selects_only_the_shell_feature() {
+    fn client_shell_cargo_toml_enables_only_webview_shell() {
         let Some(project) = site("App", &["index.html"]).as_ref().and_then(emitted) else {
             assert!(site("App", &["index.html"]).is_some());
             return;
         };
-        assert!(
-            project
-                .cargo_toml
-                .contains("default-features = false, features = [\"webview-shell\"] }"),
-            "{}",
-            project.cargo_toml
+        let parsed = project.cargo_toml.parse::<toml::Table>();
+        let Ok(manifest) = parsed else {
+            assert!(parsed.is_ok(), "{parsed:?}");
+            return;
+        };
+        let deps = manifest.get("dependencies").and_then(toml::Value::as_table);
+        let runtime = deps
+            .and_then(|deps| deps.get("ipe_runtime"))
+            .and_then(toml::Value::as_table);
+        let key = |name: &str| runtime.and_then(|runtime| runtime.get(name));
+        assert_eq!(
+            key("package").and_then(toml::Value::as_str),
+            Some("ipe-runtime-rust")
         );
-        assert!(project.cargo_toml.contains("edition = \"2024\""));
+        assert_eq!(
+            key("default-features").and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        let features: Option<Vec<&str>> = key("features")
+            .and_then(toml::Value::as_array)
+            .map(|list| list.iter().filter_map(toml::Value::as_str).collect());
+        assert_eq!(features, Some(vec![SHELL_RUNTIME_FEATURE]));
+        let required: Vec<&str> = deps
+            .map(|deps| {
+                deps.iter()
+                    .filter(|(_, dep)| {
+                        dep.get("optional").and_then(toml::Value::as_bool) != Some(true)
+                    })
+                    .map(|(name, _)| name.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(required, ["ipe_runtime"]);
+        assert_eq!(
+            manifest
+                .get("features")
+                .and_then(|features| features.get("default"))
+                .and_then(toml::Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(
+            manifest
+                .get("package")
+                .and_then(|package| package.get("edition"))
+                .and_then(toml::Value::as_str),
+            Some("2024")
+        );
         assert!(project.uses_webview);
         assert!(!project.links_web_runtime);
+    }
+
+    /// The shell manifest is the program manifest template with only its feature list set.
+    ///
+    /// The template bytes around the `__IPE_RUNTIME_FEATURES__` anchor render
+    /// unchanged for every program feature, alone and together, so the shared
+    /// renderer leaves each program manifest as it was; and no program feature
+    /// is the shell's, so no program selects the shell.
+    #[test]
+    fn client_shell_emit_changes_no_existing_project_output() {
+        const TEMPLATE: &str = include_str!("../templates/Cargo.dep.toml");
+        const ANCHOR: &str = "__IPE_RUNTIME_FEATURES__";
+        let Some((head, tail)) = TEMPLATE.split_once(ANCHOR) else {
+            assert!(TEMPLATE.contains(ANCHOR));
+            return;
+        };
+        assert!(!tail.contains(ANCHOR));
+        let quoted = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| format!("\"{name}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let all: Vec<&str> = crate::runtime_features::RuntimeFeature::ALL
+            .iter()
+            .map(|feature| feature.as_str())
+            .collect();
+        assert!(!all.contains(&SHELL_RUNTIME_FEATURE), "{all:?}");
+        let mut selections: Vec<Vec<&str>> = all.iter().map(|name| vec![*name]).collect();
+        selections.push(all.clone());
+        selections.push(Vec::new());
+        for selection in selections {
+            let rendered = crate::project::dep_manifest_selecting(&selection, "test");
+            assert_eq!(
+                rendered.ok(),
+                Some(format!("{head}{}{tail}", quoted(&selection))),
+                "{selection:?}"
+            );
+        }
+        let Some(project) = site("App", &["index.html"]).as_ref().and_then(emitted) else {
+            assert!(site("App", &["index.html"]).is_some());
+            return;
+        };
+        assert_eq!(
+            project.cargo_toml,
+            format!("{head}{}{tail}", quoted(&[SHELL_RUNTIME_FEATURE]))
+        );
+    }
+
+    /// The storage key reaches `site.rs` as one literal Rust reads back unchanged, never as syntax.
+    #[test]
+    fn client_shell_site_renders_storage_key_through_rust_string_literal() {
+        for key in [
+            "com.acme.notes",
+            "a.b\", title: \"evil\", assets: &[] }; fn main() {} //\n\\",
+        ] {
+            let shell = ShellSite::new(
+                "App",
+                key,
+                MountBase::root(),
+                "default-src 'none'",
+                path("index.html"),
+            );
+            let Some(site_rs) = shell.as_ref().ok().and_then(site_rs_of) else {
+                assert!(shell.is_ok(), "{shell:?}");
+                return;
+            };
+            assert_eq!(config_shape(&site_rs), Some((3, 5)), "{site_rs}");
+            assert_eq!(config_field(&site_rs, "storage_key").as_deref(), Some(key));
+            assert_eq!(config_field(&site_rs, "title").as_deref(), Some("App"));
+            let line = format!("    storage_key: {},", rust_str_lit(key));
+            assert_eq!(
+                site_rs.lines().filter(|l| *l == line).count(),
+                1,
+                "{site_rs}"
+            );
+        }
+    }
+
+    /// Each adversarial title reads back from `site.rs` as exactly the title, in one literal.
+    ///
+    /// The expected value is what Rust's own lexer decodes from the
+    /// `str::escape_default` rendering of the title, never a hand-written
+    /// escape; `site.rs` keeps its three items and five config fields, so no
+    /// title closes the literal and opens Rust syntax.
+    #[test]
+    fn rust_string_literal_round_trips_adversarial_titles() {
+        for title in ["\"", "\\", "\"); panic!(\"", "a\nb", "a\u{2028}b", "a\0b"] {
+            let oracle = syn::parse_str::<syn::LitStr>(&format!("\"{}\"", title.escape_default()))
+                .map(|lit| lit.value());
+            assert_eq!(oracle.as_deref().ok(), Some(title), "{title:?}");
+            let Some(site_rs) = site(title, &["index.html"]).as_ref().and_then(site_rs_of) else {
+                assert!(site(title, &["index.html"]).is_some(), "{title:?}");
+                return;
+            };
+            assert_eq!(config_shape(&site_rs), Some((3, 5)), "{site_rs}");
+            assert_eq!(config_field(&site_rs, "title"), oracle.ok(), "{site_rs}");
+            assert!(!site_rs.contains('\u{2028}'), "{site_rs}");
+            assert!(!site_rs.contains('\0'), "{site_rs}");
+        }
     }
 
     #[test]
