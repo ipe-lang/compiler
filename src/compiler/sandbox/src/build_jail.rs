@@ -1406,15 +1406,28 @@ pub(crate) fn apply_mount_ops(
 ///
 /// A tmpfs root takes its owner from the directory it covers unless told
 /// otherwise; the explicit root owner keeps every mask and provisioned
-/// directory writable by root alone, so [`root_only_dir`] holds for it.
+/// directory writable by root alone, so [`view_trust`] judges it root-only.
 #[cfg(any(target_os = "freebsd", test))]
 const JAIL_TMPFS_OPTIONS: &str = "uid=0,gid=0,mode=0755";
 
 /// Whether a directory owned by `uid` with permission bits `mode` lets no user
 /// but root create, rename, or remove its entries.
-#[cfg(any(target_os = "freebsd", test))]
+///
+/// It is [`level_verdict`] for a directory and a root launcher, the one
+/// verdict every root-only walk shares.
+#[cfg(test)]
 const fn root_only_dir(uid: u32, mode: u32) -> bool {
-    uid == 0 && mode & 0o022 == 0
+    matches!(
+        level_verdict(
+            DirFacts {
+                kind: LevelKind::Dir,
+                uid,
+                mode,
+            },
+            ROOT_UID,
+        ),
+        Ok(())
+    )
 }
 
 /// What a directory on a mount target's path inside the jail view guarantees
@@ -1493,52 +1506,427 @@ pub(crate) fn untrusted_mount_ancestor(
 const JAIL_DIR_HOME_HINT: &str = "the jail directories live under $HOME/.cache/ipe/jail, so run \
      with HOME set to a home only root can write (for example `sudo -H`)";
 
-/// Refuse `path` unless every directory above it, from `/` down, is a
-/// directory only root can rename entries in, judged by `trust`.
-///
-/// The root-run launcher names the jail root and the `/proc`-mask source by
-/// path on every mount; a directory above either that another user can write
-/// would let that user swap the next name and redirect every mount.
+/// What one level of a directory chain is, read without following a link.
+#[cfg(any(target_os = "freebsd", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LevelKind {
+    /// A directory.
+    Dir,
+    /// A symbolic link.
+    Link,
+    /// A regular file.
+    Regular,
+    /// Anything else.
+    Other,
+}
+
+/// The kind, owner, and permission bits of one level of a directory chain.
+#[cfg(any(target_os = "freebsd", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirFacts {
+    /// What the level is.
+    kind: LevelKind,
+    /// Its owner.
+    uid: u32,
+    /// Its permission bits.
+    mode: u32,
+}
+
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+impl DirFacts {
+    /// The facts `meta` reports, read without following a link.
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        let file_type = meta.file_type();
+        let kind = if file_type.is_symlink() {
+            LevelKind::Link
+        } else if file_type.is_dir() {
+            LevelKind::Dir
+        } else if file_type.is_file() {
+            LevelKind::Regular
+        } else {
+            LevelKind::Other
+        };
+        Self {
+            kind,
+            uid: meta.uid(),
+            mode: meta.mode(),
+        }
+    }
+}
+
+/// The facts of `dir`, read without following a final link.
 ///
 /// # Errors
 ///
-/// [`RunJailDefect::MountFailed`] when `path` is not absolute, or a directory
-/// above it is [`ViewDirTrust::Writable`], missing, or not a directory.
+/// The error of the `lstat`.
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+fn lstat_facts(dir: &Path) -> std::io::Result<DirFacts> {
+    std::fs::symlink_metadata(dir).map(|meta| DirFacts::of(&meta))
+}
+
+/// The facts of `/` and of every directory below it on `path`, `/` first.
+///
+/// Each level is read from its held handle, so no level can be swapped
+/// between two reads.
+///
+/// # Errors
+///
+/// As [`walk_held`], or [`RunJailDefect::MountFailed`] when a held level
+/// cannot be stat'd.
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+fn held_chain_facts(path: &SafeMountPath) -> Result<Vec<DirFacts>, RunJailDefect> {
+    let mut chain = Vec::new();
+    walk_held(path, |held| {
+        let meta = held
+            .handle()
+            .metadata()
+            .map_err(|e| RunJailDefect::MountFailed {
+                target: path.as_path().to_path_buf(),
+                detail: format!("could not stat a held directory on the path: {e}"),
+            })?;
+        chain.push(DirFacts::of(&meta));
+        Ok(())
+    })?;
+    Ok(chain)
+}
+
+/// The user id of root.
 #[cfg(any(target_os = "freebsd", test))]
-pub(crate) fn require_root_only_ancestors(
-    path: &Path,
-    mut trust: impl FnMut(&Path) -> ViewDirTrust,
-) -> Result<(), RunJailDefect> {
-    let refuse = |detail: String| RunJailDefect::MountFailed {
-        target: path.to_path_buf(),
-        detail,
+const ROOT_UID: u32 = 0;
+
+/// Why a level of a directory chain lets a user other than the launcher swap
+/// a name below it.
+#[cfg(any(target_os = "freebsd", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChainCause {
+    /// The level is a symbolic link.
+    Link,
+    /// The level is not a directory.
+    NotADirectory,
+    /// The level belongs to a user other than root or the launcher.
+    ForeignOwner,
+    /// The level is writable by its group or by other users.
+    Writable,
+    /// The last level, the launcher's own directory, belongs to another user.
+    LeafNotOwned,
+    /// The chain has no level.
+    Empty,
+}
+
+#[cfg(any(target_os = "freebsd", test))]
+impl std::fmt::Display for ChainCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Link => "is a symbolic link",
+            Self::NotADirectory => "is not a directory",
+            Self::ForeignOwner => "belongs to a user other than root or the launching user",
+            Self::Writable => "is writable by a user other than its owner",
+            Self::LeafNotOwned => "is not owned by the launching user",
+            Self::Empty => "names no directory",
+        })
+    }
+}
+
+/// The one verdict on whether a directory keeps its names for the launcher.
+///
+/// Only root or the launcher (`euid`) may own it, and neither its group nor
+/// other users may write it. With `euid` root a level passes only when root
+/// alone can change it; the jail-view walk and the jail-base walk both judge
+/// every level through it.
+///
+/// # Errors
+///
+/// The [`ChainCause`] of a level that lets another user swap a name in it.
+#[cfg(any(target_os = "freebsd", test))]
+const fn level_verdict(facts: DirFacts, euid: u32) -> Result<(), ChainCause> {
+    match facts.kind {
+        LevelKind::Link => Err(ChainCause::Link),
+        LevelKind::Regular | LevelKind::Other => Err(ChainCause::NotADirectory),
+        LevelKind::Dir if facts.uid != ROOT_UID && facts.uid != euid => {
+            Err(ChainCause::ForeignOwner)
+        }
+        LevelKind::Dir if facts.mode & 0o022 != 0 => Err(ChainCause::Writable),
+        LevelKind::Dir => Ok(()),
+    }
+}
+
+/// Why a jail directory's chain from `/` refuses, and at which level.
+#[cfg(any(target_os = "freebsd", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BaseChainRefusal {
+    /// The refused level, `/` being level 0.
+    level: usize,
+    /// Why it refuses.
+    cause: ChainCause,
+}
+
+/// Admit a jail directory whose chain from `/` no user but root or the
+/// launcher (`euid`) can change.
+///
+/// `chain` lists `/` first and the directory itself last. Every level passes
+/// [`level_verdict`], and the directory itself belongs to the launcher. With
+/// `euid` root every level is root-only; for another `euid` the launcher's
+/// own levels are admitted too.
+///
+/// # Errors
+///
+/// The first refused level and its [`ChainCause`].
+#[cfg(any(target_os = "freebsd", test))]
+pub(crate) fn base_chain_verdict(chain: &[DirFacts], euid: u32) -> Result<(), BaseChainRefusal> {
+    let Some(leaf) = chain.last() else {
+        return Err(BaseChainRefusal {
+            level: 0,
+            cause: ChainCause::Empty,
+        });
     };
-    let parent = path
-        .parent()
-        .filter(|_| path.is_absolute())
-        .ok_or_else(|| refuse("the jail directory is not an absolute path below /".to_owned()))?;
-    let mut dir = PathBuf::new();
-    for component in parent.components() {
-        dir.push(component);
-        match trust(&dir) {
-            ViewDirTrust::RootOnly => {}
-            ViewDirTrust::Writable => {
-                return Err(refuse(format!(
-                    "{} above the jail directory is writable by a user other than root; \
-                     {JAIL_DIR_HOME_HINT}",
-                    dir.display()
-                )));
-            }
-            ViewDirTrust::Missing | ViewDirTrust::Unusable => {
-                return Err(refuse(format!(
-                    "{} above the jail directory is not a usable directory; \
-                     {JAIL_DIR_HOME_HINT}",
-                    dir.display()
-                )));
-            }
+    chain.iter().enumerate().try_for_each(|(level, facts)| {
+        level_verdict(*facts, euid).map_err(|cause| BaseChainRefusal { level, cause })
+    })?;
+    if leaf.uid == euid {
+        Ok(())
+    } else {
+        Err(BaseChainRefusal {
+            level: chain.len().saturating_sub(1),
+            cause: ChainCause::LeafNotOwned,
+        })
+    }
+}
+
+/// The jail-view trust of a directory the launcher looked up.
+///
+/// `None` is a directory absent from the view.
+#[cfg(any(target_os = "freebsd", test))]
+pub(crate) const fn view_trust(facts: Option<DirFacts>) -> ViewDirTrust {
+    let Some(facts) = facts else {
+        return ViewDirTrust::Missing;
+    };
+    match level_verdict(facts, ROOT_UID) {
+        Ok(()) => ViewDirTrust::RootOnly,
+        Err(ChainCause::ForeignOwner | ChainCause::Writable) => ViewDirTrust::Writable,
+        Err(
+            ChainCause::Link
+            | ChainCause::NotADirectory
+            | ChainCause::LeafNotOwned
+            | ChainCause::Empty,
+        ) => ViewDirTrust::Unusable,
+    }
+}
+
+/// Every directory from `/` down to `path` itself, `/` first.
+#[cfg(any(target_os = "freebsd", test))]
+fn chain_levels(path: &Path) -> Vec<PathBuf> {
+    let mut levels: Vec<PathBuf> = path.ancestors().map(Path::to_path_buf).collect();
+    levels.reverse();
+    levels
+}
+
+/// Refuse the jail directory `path` unless [`base_chain_verdict`] admits its
+/// chain from `/`, each level read by `read`.
+///
+/// The root-run launcher names the jail root and the `/proc`-mask source by
+/// path on every mount; a directory on either chain that another user can
+/// write would let that user swap the next name and redirect every mount.
+///
+/// # Errors
+///
+/// [`RunJailDefect::MountFailed`] naming the refused directory and how to run
+/// with a home only root can write, when `path` is not absolute, a level
+/// cannot be read, or the verdict refuses.
+#[cfg(any(target_os = "freebsd", test))]
+pub(crate) fn require_trusted_chain(
+    path: &Path,
+    euid: u32,
+    mut read: impl FnMut(&Path) -> std::io::Result<DirFacts>,
+) -> Result<(), RunJailDefect> {
+    let refuse = |dir: &Path, why: String| RunJailDefect::MountFailed {
+        target: path.to_path_buf(),
+        detail: format!(
+            "{} on the jail directory's path {why}; {JAIL_DIR_HOME_HINT}",
+            dir.display()
+        ),
+    };
+    if !path.is_absolute() {
+        return Err(refuse(path, "is not an absolute path".to_owned()));
+    }
+    let levels = chain_levels(path);
+    let chain = levels
+        .iter()
+        .map(|dir| read(dir).map_err(|e| refuse(dir, format!("cannot be read ({e})"))))
+        .collect::<Result<Vec<_>, _>>()?;
+    base_chain_verdict(&chain, euid).map_err(|refusal| {
+        let dir = levels.get(refusal.level).map_or(path, PathBuf::as_path);
+        refuse(dir, refusal.cause.to_string())
+    })
+}
+
+/// A program the FreeBSD jail launcher runs as root.
+#[cfg(any(target_os = "freebsd", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Primitive {
+    /// `jail(8)`.
+    Jail,
+    /// `mount_nullfs(8)`.
+    MountNullfs,
+    /// `mount(8)`, for devfs and tmpfs.
+    Mount,
+    /// `umount(8)`.
+    Umount,
+    /// `rctl(8)`.
+    Rctl,
+}
+
+#[cfg(any(target_os = "freebsd", test))]
+impl Primitive {
+    /// The one absolute spelling the launcher runs this program by.
+    ///
+    /// Each lives in a base-system directory only root can write; the
+    /// invoker's `PATH` is never consulted.
+    const fn spelling(self) -> &'static str {
+        match self {
+            Self::Jail => "/usr/sbin/jail",
+            Self::MountNullfs => "/sbin/mount_nullfs",
+            Self::Mount => "/sbin/mount",
+            Self::Umount => "/sbin/umount",
+            Self::Rctl => "/usr/bin/rctl",
         }
     }
+}
+
+/// Every program the FreeBSD jail launcher runs, with its spelling.
+#[cfg(any(target_os = "freebsd", test))]
+const FREEBSD_PRIMITIVES: [(Primitive, &str); 5] = [
+    (Primitive::Jail, Primitive::Jail.spelling()),
+    (Primitive::MountNullfs, Primitive::MountNullfs.spelling()),
+    (Primitive::Mount, Primitive::Mount.spelling()),
+    (Primitive::Umount, Primitive::Umount.spelling()),
+    (Primitive::Rctl, Primitive::Rctl.spelling()),
+];
+
+/// Why a primitive's file or directory chain is not root's alone.
+#[cfg(any(target_os = "freebsd", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrimitiveRefusal {
+    /// A directory on its path lets another user swap a name.
+    Chain(BaseChainRefusal),
+    /// The file is not a regular file.
+    NotRegular,
+    /// The file belongs to a user other than root.
+    ForeignOwner,
+    /// The file is writable by its group or by other users.
+    Writable,
+}
+
+#[cfg(any(target_os = "freebsd", test))]
+impl std::fmt::Display for PrimitiveRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Chain(refusal) => write!(
+                f,
+                "directory level {} of its path {}",
+                refusal.level, refusal.cause
+            ),
+            Self::NotRegular => f.write_str("it is not a regular file"),
+            Self::ForeignOwner => f.write_str("it belongs to a user other than root"),
+            Self::Writable => f.write_str("it is writable by a user other than root"),
+        }
+    }
+}
+
+/// Admit a primitive whose directory chain and file only root can change.
+///
+/// `dirs` lists `/` first and the primitive's directory last.
+///
+/// # Errors
+///
+/// The [`PrimitiveRefusal`] of the first level or file fact that another user
+/// could change.
+#[cfg(any(target_os = "freebsd", test))]
+pub(crate) fn primitive_verdict(dirs: &[DirFacts], file: DirFacts) -> Result<(), PrimitiveRefusal> {
+    base_chain_verdict(dirs, ROOT_UID).map_err(PrimitiveRefusal::Chain)?;
+    match file.kind {
+        LevelKind::Regular if file.uid != ROOT_UID => Err(PrimitiveRefusal::ForeignOwner),
+        LevelKind::Regular if file.mode & 0o022 != 0 => Err(PrimitiveRefusal::Writable),
+        LevelKind::Regular => Ok(()),
+        LevelKind::Dir | LevelKind::Link | LevelKind::Other => Err(PrimitiveRefusal::NotRegular),
+    }
+}
+
+/// A mount the jail made, with the filesystem id its target reported once
+/// mounted.
+#[cfg(any(target_os = "freebsd", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MountRecord {
+    /// The mountpoint inside the jail root.
+    target: PathBuf,
+    /// The filesystem id (`st_dev`) the mounted target reported.
+    fsid: u64,
+}
+
+/// Mount through `mount`, then record `target` with the filesystem id
+/// `observe` reads of it.
+///
+/// A mount whose id cannot be read is never recorded: the jail refuses, and
+/// teardown never unmounts a target it holds no id for.
+///
+/// # Errors
+///
+/// The error of `mount`, or of `observe` (with nothing recorded).
+#[cfg(any(target_os = "freebsd", test))]
+pub(crate) fn mount_recorded(
+    mounted: &mut Vec<MountRecord>,
+    target: &Path,
+    mount: impl FnOnce() -> Result<(), RunJailDefect>,
+    observe: impl FnOnce(&Path) -> Result<u64, RunJailDefect>,
+) -> Result<(), RunJailDefect> {
+    mount()?;
+    let fsid = observe(target)?;
+    mounted.push(MountRecord {
+        target: target.to_path_buf(),
+        fsid,
+    });
     Ok(())
+}
+
+/// The `umount(8)` argv that tears down `record`: the program, `-f`, the target.
+#[cfg(any(target_os = "freebsd", test))]
+fn umount_argv(bin: &Path, record: &MountRecord) -> [std::ffi::OsString; 3] {
+    [
+        bin.as_os_str().to_owned(),
+        std::ffi::OsString::from("-f"),
+        record.target.as_os_str().to_owned(),
+    ]
+}
+
+/// Whether the target of `record` still shows the filesystem it recorded.
+///
+/// `now` is the id read at the target at teardown. Teardown unmounts only a
+/// target that passes: one whose id moved or cannot be read is left alone,
+/// never unmounted by its name.
+#[cfg(any(target_os = "freebsd", test))]
+fn still_mounted_there(record: &MountRecord, now: Result<u64, RunJailDefect>) -> bool {
+    matches!(now, Ok(fsid) if fsid == record.fsid)
+}
+
+/// The filesystem id (`st_dev`) the directory `target` reports.
+///
+/// It is read through a held walk from `/`, never following a link.
+///
+/// # Errors
+///
+/// As [`hold_canonical`], or [`RunJailDefect::MountFailed`] when the held
+/// target cannot be stat'd.
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+fn held_fsid(target: &Path) -> Result<u64, RunJailDefect> {
+    use std::os::unix::fs::MetadataExt as _;
+    hold_canonical(&SafeMountPath::new(target)?)?
+        .handle()
+        .metadata()
+        .map(|meta| meta.dev())
+        .map_err(|e| RunJailDefect::MountFailed {
+            target: target.to_path_buf(),
+            detail: format!("could not read the mounted filesystem's id: {e}"),
+        })
 }
 
 // ── held handles for the FreeBSD jail's root acts ────────────────────────────
@@ -2029,12 +2417,13 @@ pub(crate) fn parse_jail_user(
 mod freebsd_jail {
     use super::{
         FreebsdMountOp, HeldJailDirs, HeldOwnership, JAIL_TMPFS_OPTIONS, JailOutcome, JailUser,
-        JailUserRefusal, SafeMountPath, ViewDirTrust, apply_mount_ops, fchown_held,
-        freebsd_mount_ops, give_held, hold_canonical, macos_scrubbed_env, outcome_after_restore,
-        parse_jail_user, require_root_only_ancestors, root_only_dir, under_root,
+        JailUserRefusal, MountRecord, Primitive, SafeMountPath, ViewDirTrust, apply_mount_ops,
+        canonical_prefix_spelling, fchown_held, freebsd_mount_ops, give_held, held_chain_facts,
+        held_fsid, hold_canonical, lstat_facts, macos_scrubbed_env, mount_recorded,
+        outcome_after_restore, parse_jail_user, primitive_verdict, require_trusted_chain,
+        still_mounted_there, umount_argv, under_root, view_trust,
     };
     use crate::JailMounts;
-    use crate::host_tool::{self, HostTool};
     use crate::mounts::{TreeBind, jail_binds, mount_plan};
     use crate::run_jail::{JailArgv, JailLaunch, RunJailDefect, SandboxProfile};
     use std::ffi::OsString;
@@ -2098,14 +2487,11 @@ mod freebsd_jail {
         mounts: &JailMounts,
         payload: &[OsString],
     ) -> JailOutcome {
-        // `jail` is the mandatory primitive. Absent ⇒ refuse; the untrusted build
-        // is never run unconfined.
-        let Ok(jail_bin) = host_tool::resolve(HostTool::Jail) else {
-            return JailOutcome::Unavailable {
-                defect: RunJailDefect::PrimitiveUnavailable {
-                    missing: vec![HostTool::Jail.name()],
-                },
-            };
+        // `jail` is the mandatory primitive. Absent or not root's alone ⇒ refuse;
+        // the untrusted build is never run unconfined.
+        let jail_bin = match resolve_primitive(Primitive::Jail) {
+            Ok(bin) => bin,
+            Err(defect) => return JailOutcome::Unavailable { defect },
         };
         let jail_bin = jail_bin.as_path();
 
@@ -2186,17 +2572,11 @@ mod freebsd_jail {
         let rctl = if profile.subprocess {
             None
         } else {
-            match host_tool::resolve(HostTool::Rctl) {
-                Ok(rctl) => Some(rctl.as_path()),
-                Err(_) => {
-                    return JailOutcome::Unavailable {
-                        defect: RunJailDefect::PrimitiveUnavailable {
-                            // Without rctl a withheld-subprocess jail cannot deny
-                            // process creation — a refuse-gap, never an unconfined run.
-                            missing: vec![HostTool::Rctl.name()],
-                        },
-                    };
-                }
+            // Without rctl a withheld-subprocess jail cannot deny process
+            // creation — a refuse-gap, never an unconfined run.
+            match resolve_primitive(Primitive::Rctl) {
+                Ok(rctl) => Some(rctl),
+                Err(defect) => return JailOutcome::Unavailable { defect },
             }
         };
 
@@ -2415,13 +2795,14 @@ mod freebsd_jail {
     /// OUTSIDE the writable scratch (a per-run sibling of the jail root) so the
     /// payload has no mount into it — the `/proc` mask is immutable to the payload.
     ///
-    /// Uses `create_dir` (not `create_dir_all`) so a pre-existing entry at the
-    /// exact leaf path is an error, not a silent reuse. The parent is already an
-    /// exclusively-created private directory (`proc_mask_source_dir`), so
-    /// `create_dir_all` on the parent is safe; only the leaf must be exclusive.
+    /// The leaf is created non-recursively with mode `0755`, so a pre-existing
+    /// entry at the exact leaf path is an error, not a silent reuse. The parent
+    /// is already an exclusively-created private directory
+    /// (`proc_mask_source_dir`); only the leaf must be exclusive.
     fn mount_dir_under(parent: &Path, name: &str) -> Result<PathBuf, RunJailDefect> {
+        use std::os::unix::fs::DirBuilderExt as _;
         let dir = parent.join(name);
-        match std::fs::create_dir(&dir) {
+        match std::fs::DirBuilder::new().mode(0o755).create(&dir) {
             Ok(()) => Ok(dir),
             Err(e) => Err(RunJailDefect::MountFailed {
                 target: dir,
@@ -2433,14 +2814,41 @@ mod freebsd_jail {
     /// How far the directory `dir` of the jail view can be trusted to keep its
     /// entries: root-owned and writable by no group or other user, or not.
     fn view_dir_trust(dir: &Path) -> ViewDirTrust {
-        use std::os::unix::fs::MetadataExt as _;
-        match std::fs::symlink_metadata(dir) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ViewDirTrust::Missing,
+        match lstat_facts(dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => view_trust(None),
             Err(_) => ViewDirTrust::Unusable,
-            Ok(meta) if !meta.file_type().is_dir() => ViewDirTrust::Unusable,
-            Ok(meta) if root_only_dir(meta.uid(), meta.mode()) => ViewDirTrust::RootOnly,
-            Ok(_) => ViewDirTrust::Writable,
+            Ok(facts) => view_trust(Some(facts)),
         }
+    }
+
+    /// The absolute path of `primitive`, admitted only when root alone can
+    /// change its file and every directory above it.
+    ///
+    /// The directory chain is read through held handles from `/`; the
+    /// invoker's `PATH` is never consulted.
+    ///
+    /// # Errors
+    ///
+    /// [`RunJailDefect::PrimitiveUnavailable`] when the file is absent, or
+    /// [`RunJailDefect::Spawn`] when [`primitive_verdict`] refuses it.
+    fn resolve_primitive(primitive: Primitive) -> Result<PathBuf, RunJailDefect> {
+        let spelling = primitive.spelling();
+        let path = PathBuf::from(spelling);
+        let unavailable = || RunJailDefect::PrimitiveUnavailable {
+            missing: vec![spelling],
+        };
+        let refuse = |why: String| RunJailDefect::Spawn {
+            detail: format!("refusing to run {spelling} as root: {why}"),
+        };
+        let dir = path.parent().ok_or_else(unavailable)?;
+        let dirs = held_chain_facts(&SafeMountPath::new(dir)?)?;
+        let file = match lstat_facts(&path) {
+            Ok(facts) => facts,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(unavailable()),
+            Err(e) => return Err(refuse(format!("it cannot be read ({e})"))),
+        };
+        primitive_verdict(&dirs, file).map_err(|refusal| refuse(refusal.to_string()))?;
+        Ok(path)
     }
 
     /// The read-only jail root, built from one [`JailMounts`] value.
@@ -2468,8 +2876,9 @@ mod freebsd_jail {
         /// read-write inside the chroot — has no mount to it and cannot write it, so
         /// the `/proc` mask stays immutable to the payload. Removed on drop.
         proc_mask_source: PathBuf,
-        /// Every mounted target, in mount order; unmounted in reverse on drop.
-        mounted: Vec<PathBuf>,
+        /// Every mount with the filesystem id its target reported, in mount
+        /// order; unmounted in reverse on drop while its target still shows it.
+        mounted: Vec<MountRecord>,
         /// In-root directories a fresh tmpfs has been layered over, so a mountpoint
         /// can be created on a filesystem only this jail reaches (the read-only
         /// host view is `EROFS`, and a user-writable directory in it lets that user
@@ -2487,18 +2896,12 @@ mod freebsd_jail {
         /// (`Err`), so the payload never runs against an incompletely-confined or
         /// unmasked root.
         fn establish(mounts: &JailMounts, tree: &TreeBind) -> Result<Self, RunJailDefect> {
-            let resolve = |tool: HostTool| {
-                host_tool::resolve(tool)
-                    .map(|found| found.as_path())
-                    .map_err(|_| RunJailDefect::PrimitiveUnavailable {
-                        missing: vec![tool.name()],
-                    })
-            };
-            let mount_nullfs_bin = resolve(HostTool::MountNullfs)?;
+            let mount_nullfs_bin = resolve_primitive(Primitive::MountNullfs)?;
             // `mount` is the stable primitive; FreeBSD does not ship a standalone
             // `mount_devfs` binary — devfs is mounted via `mount -t devfs devfs`.
-            let mount_devfs_bin = resolve(HostTool::Mount)?;
-            let umount_bin = resolve(HostTool::Umount)?;
+            let mount_devfs_bin = resolve_primitive(Primitive::Mount)?;
+            let umount_bin = resolve_primitive(Primitive::Umount)?;
+            let euid = rustix::process::geteuid().as_raw();
 
             // The jail root is created exclusively under the private cache root
             // (`~/.cache/ipe/jail/`), not world-writable `/tmp`, so a local attacker
@@ -2511,7 +2914,7 @@ mod freebsd_jail {
                 target: created.clone(),
                 detail: format!("could not resolve the jail root: {e}"),
             })?;
-            require_root_only_ancestors(&root, view_dir_trust)?;
+            require_trusted_chain(&root, euid, lstat_facts)?;
 
             // The `/proc`-mask source: an empty dir rooted OUTSIDE the writable
             // scratch, under the same private cache root as the jail root. It is NOT
@@ -2527,7 +2930,7 @@ mod freebsd_jail {
                     detail: format!("could not resolve the /proc mask source: {e}"),
                 }
             })?;
-            require_root_only_ancestors(&proc_mask_source, view_dir_trust)?;
+            require_trusted_chain(&proc_mask_source, euid, lstat_facts)?;
 
             let mut mount = Self {
                 umount_bin,
@@ -2543,8 +2946,13 @@ mod freebsd_jail {
             //    steps 2–3 layer a FRESH minimal `/dev` and an EMPTY `/proc` over them
             //    before the jailed process starts — matching the Linux arm's fresh
             //    `--dev`/`--proc`, which mask the ro-bound host nodes.
-            mount_nullfs(&mount_nullfs_bin, true, Path::new("/"), &mount.root)?;
-            mount.mounted.push(mount.root.clone());
+            let root_target = mount.root.clone();
+            mount_recorded(
+                &mut mount.mounted,
+                &root_target,
+                || mount_nullfs(&mount_nullfs_bin, true, Path::new("/"), &root_target),
+                held_fsid,
+            )?;
 
             // 2. A FRESH minimal devfs over the jail's `/dev`, layered on top of the
             //    read-only host `/dev` the ro-root exposed. Without this the jail sees
@@ -2554,8 +2962,12 @@ mod freebsd_jail {
             //    ruleset (null/zero/random/…), NOT the host's, matching the Linux
             //    arm's fresh `--dev /dev`.
             let dev_target = under_root(&mount.root, &SafeMountPath::new(Path::new("/dev"))?);
-            mount_devfs(&mount_devfs_bin, &dev_target)?;
-            mount.mounted.push(dev_target);
+            mount_recorded(
+                &mut mount.mounted,
+                &dev_target,
+                || mount_devfs(&mount_devfs_bin, &dev_target),
+                held_fsid,
+            )?;
 
             // 3. Mask the jail's `/proc` with a FRESH EMPTY read-only nullfs of an
             //    empty dir rooted OUTSIDE the writable scratch, layered over the
@@ -2572,13 +2984,13 @@ mod freebsd_jail {
             //    no mount to it and cannot surface files under its own `/proc`. The
             //    mount is read-only regardless, so `/proc` is truly immutable.
             let proc_target = under_root(&mount.root, &SafeMountPath::new(Path::new("/proc"))?);
-            mount_nullfs(
-                &mount_nullfs_bin,
-                true,
-                &mount.proc_mask_source,
+            let proc_mask_source = mount.proc_mask_source.clone();
+            mount_recorded(
+                &mut mount.mounted,
                 &proc_target,
+                || mount_nullfs(&mount_nullfs_bin, true, &proc_mask_source, &proc_target),
+                held_fsid,
             )?;
-            mount.mounted.push(proc_target);
 
             // 4. The mount plan shared with the bwrap arm: every home and static
             //    mask as a fresh root-owned tmpfs, each bind right after the mask
@@ -2609,17 +3021,20 @@ mod freebsd_jail {
         ) -> Result<(), RunJailDefect> {
             let target = op.target();
             self.ensure_mountpoint(mount_bin, target)?;
-            match op {
-                FreebsdMountOp::Mask { .. } => mount_tmpfs(mount_bin, target)?,
-                FreebsdMountOp::ReadOnlyBind { source, .. } => {
-                    mount_nullfs(mount_nullfs_bin, true, source, target)?;
-                }
-                FreebsdMountOp::ReadWriteBind { source, .. } => {
-                    mount_nullfs(mount_nullfs_bin, false, source, target)?;
-                }
-            }
-            self.mounted.push(target.to_path_buf());
-            Ok(())
+            mount_recorded(
+                &mut self.mounted,
+                target,
+                || match op {
+                    FreebsdMountOp::Mask { .. } => mount_tmpfs(mount_bin, target),
+                    FreebsdMountOp::ReadOnlyBind { source, .. } => {
+                        mount_nullfs(mount_nullfs_bin, true, source, target)
+                    }
+                    FreebsdMountOp::ReadWriteBind { source, .. } => {
+                        mount_nullfs(mount_nullfs_bin, false, source, target)
+                    }
+                },
+                held_fsid,
+            )
         }
 
         /// Make `target` an existing directory that resolves to itself, named
@@ -2707,17 +3122,26 @@ mod freebsd_jail {
                         detail: "provisioning this mountpoint would hide the jail root".to_owned(),
                     });
                 }
-                if self.mounted.iter().any(|earlier| earlier.starts_with(dir)) {
+                if self
+                    .mounted
+                    .iter()
+                    .any(|earlier| earlier.target.starts_with(dir))
+                {
                     return Err(RunJailDefect::MountFailed {
                         target: target.to_path_buf(),
                         detail: "provisioning this mountpoint would hide an earlier mount"
                             .to_owned(),
                     });
                 }
-                mount_tmpfs(mount_bin, dir)?;
+                // Recorded with its filesystem id, so it is unmounted in reverse
+                // mount order on drop with the rest.
+                mount_recorded(
+                    &mut self.mounted,
+                    dir,
+                    || mount_tmpfs(mount_bin, dir),
+                    held_fsid,
+                )?;
                 self.tmpfs_parents.push(dir.to_path_buf());
-                // Unmounted in reverse mount order on drop with the rest.
-                self.mounted.push(dir.to_path_buf());
             }
             std::fs::create_dir_all(target).map_err(|e| RunJailDefect::MountFailed {
                 target: target.to_path_buf(),
@@ -2736,10 +3160,16 @@ mod freebsd_jail {
             // contains them), then remove the now-empty root dir. Best-effort: a
             // `persist=0` jail is already gone, and a leftover mount on a torn-down
             // scratch is inert — but clean up so the audit loop leaves no residue.
-            for target in self.mounted.iter().rev() {
-                let mut command = std::process::Command::new(&self.umount_bin);
-                command.arg("-f").arg(target);
-                let _ = run_host_tool(command);
+            // A target is unmounted only while it still shows the filesystem
+            // recorded at mount time; one whose id moved is left alone, so a
+            // name swapped since the mount never directs root's unmount.
+            for record in self.mounted.iter().rev() {
+                if still_mounted_there(record, held_fsid(&record.target)) {
+                    let [bin, flag, target] = umount_argv(&self.umount_bin, record);
+                    let mut command = std::process::Command::new(bin);
+                    command.arg(flag).arg(target);
+                    let _ = run_host_tool(command);
+                }
             }
             let _ = std::fs::remove_dir(&self.root);
             // Remove the `/proc`-mask source dir (a sibling of the root, outside the
@@ -2772,25 +3202,36 @@ mod freebsd_jail {
     /// closes the TOCTOU window that `create_dir_all` leaves open on a pre-planted
     /// or symlinked path.
     ///
-    /// After creation each component of the returned path is verified to be a real
-    /// directory owned by the current uid via `symlink_metadata`, so a symlink
-    /// planted between the `create_dir` and the use is caught.
+    /// The existing part of `parent` is judged by [`require_trusted_chain`]
+    /// before anything is created in it, and the whole chain down to the
+    /// created leaf is judged again after, so no level another user can write
+    /// ever names a directory the root launcher mounts.
     ///
     /// # Errors
     ///
     /// [`RunJailDefect::MountFailed`] when the parent cannot be created, when the
-    /// exclusive leaf creation fails (including pre-existing), or when any
-    /// component fails the ownership check.
+    /// exclusive leaf creation fails (including pre-existing), or when the
+    /// chain is refused.
     fn create_exclusive_private_dir(
         parent: &std::path::Path,
         prefix: &str,
     ) -> Result<PathBuf, RunJailDefect> {
-        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::DirBuilderExt as _;
 
-        // Ensure the private parent exists. `create_dir_all` is safe here: the
-        // parent (`~/.cache/ipe/jail/`) is user-owned and not itself a
-        // security boundary — it is the LEAF that must be exclusive.
-        if let Err(e) = std::fs::create_dir_all(parent) {
+        let euid = rustix::process::geteuid().as_raw();
+        let parent = canonical_prefix_spelling(parent);
+        let parent = parent.as_path();
+        if let Some(existing) = parent
+            .ancestors()
+            .find(|ancestor| std::fs::symlink_metadata(ancestor).is_ok())
+        {
+            require_trusted_chain(existing, euid, lstat_facts)?;
+        }
+        if let Err(e) = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(parent)
+        {
             return Err(RunJailDefect::MountFailed {
                 target: parent.to_path_buf(),
                 detail: format!("could not create private cache parent: {e}"),
@@ -2825,6 +3266,7 @@ mod freebsd_jail {
         // fail closed rather than reuse an entry we did not create.
         std::fs::DirBuilder::new()
             .recursive(false)
+            .mode(0o700)
             .create(&leaf)
             .map_err(|e| RunJailDefect::MountFailed {
                 target: leaf.clone(),
@@ -2834,38 +3276,10 @@ mod freebsd_jail {
                 ),
             })?;
 
-        // Verify every newly-created component is a real directory owned by the
-        // current uid. `symlink_metadata` does NOT follow symlinks, so a symlink
-        // planted between `create_dir` and here is caught as a non-directory
-        // entry and refused.
-        // The effective uid owns what this process creates.
-        let current_uid = rustix::process::geteuid().as_raw();
-        for ancestor in [parent, leaf.as_path()] {
-            let meta =
-                std::fs::symlink_metadata(ancestor).map_err(|e| RunJailDefect::MountFailed {
-                    target: ancestor.to_path_buf(),
-                    detail: format!("could not stat jail dir component: {e}"),
-                })?;
-            if !meta.is_dir() {
-                return Err(RunJailDefect::MountFailed {
-                    target: ancestor.to_path_buf(),
-                    detail: "jail dir component is not a real directory (symlink or file \
-                             present at expected location)"
-                        .to_owned(),
-                });
-            }
-            if meta.uid() != current_uid {
-                return Err(RunJailDefect::MountFailed {
-                    target: ancestor.to_path_buf(),
-                    detail: format!(
-                        "jail dir component is owned by uid {} not the current uid {}; \
-                         refusing to use a directory we do not own",
-                        meta.uid(),
-                        current_uid,
-                    ),
-                });
-            }
-        }
+        // The whole chain, read without following a link, down to the leaf
+        // this process owns: a link or a writable level planted since the
+        // create is refused.
+        require_trusted_chain(&leaf, euid, lstat_facts)?;
 
         Ok(leaf)
     }
@@ -4588,12 +5002,20 @@ mod tests {
     #[test]
     fn a_jail_dir_below_a_user_writable_or_non_directory_ancestor_refuses() {
         let jail = Path::new("/usr/home/u/.cache/ipe/jail/jailroot-1");
+        let root_dir = DirFacts {
+            kind: LevelKind::Dir,
+            uid: ROOT_UID,
+            mode: 0o755,
+        };
         let mut seen: Vec<PathBuf> = Vec::new();
-        let ok =
-            require_root_only_ancestors(Path::new("/root/.cache/ipe/jail/jailroot-1"), |dir| {
+        let ok = require_trusted_chain(
+            Path::new("/root/.cache/ipe/jail/jailroot-1"),
+            ROOT_UID,
+            |dir| {
                 seen.push(dir.to_path_buf());
-                ViewDirTrust::RootOnly
-            });
+                Ok(root_dir)
+            },
+        );
         assert_eq!(ok, Ok(()));
         assert_eq!(
             seen.first().map(PathBuf::as_path),
@@ -4602,29 +5024,51 @@ mod tests {
         );
         assert_eq!(
             seen.last().map(PathBuf::as_path),
-            Some(Path::new("/root/.cache/ipe/jail")),
-            "the jail directory itself is not judged: {seen:?}"
+            Some(Path::new("/root/.cache/ipe/jail/jailroot-1")),
+            "the jail directory itself is judged: {seen:?}"
         );
-        for refused in [
-            ViewDirTrust::Writable,
-            ViewDirTrust::Missing,
-            ViewDirTrust::Unusable,
-        ] {
-            let outcome = require_root_only_ancestors(jail, |dir| {
-                if dir == Path::new("/usr/home/u") {
+        let user_dir = DirFacts {
+            uid: 1000,
+            ..root_dir
+        };
+        let group_writable = DirFacts {
+            mode: 0o775,
+            ..root_dir
+        };
+        let link = DirFacts {
+            kind: LevelKind::Link,
+            ..root_dir
+        };
+        let file = DirFacts {
+            kind: LevelKind::Regular,
+            ..root_dir
+        };
+        for refused in [user_dir, group_writable, link, file] {
+            let outcome = require_trusted_chain(jail, ROOT_UID, |dir| {
+                Ok(if dir == Path::new("/usr/home/u") {
                     refused
                 } else {
-                    ViewDirTrust::RootOnly
-                }
+                    root_dir
+                })
             });
             assert!(
                 matches!(&outcome, Err(RunJailDefect::MountFailed { detail, .. }) if detail.contains("/usr/home/u ") && detail.contains(JAIL_DIR_HOME_HINT)),
                 "{refused:?}: {outcome:?}"
             );
         }
-        for relative in ["jail", "a/jail", "/"] {
-            let outcome =
-                require_root_only_ancestors(Path::new(relative), |_| ViewDirTrust::RootOnly);
+        let unreadable = require_trusted_chain(jail, ROOT_UID, |dir| {
+            if dir == Path::new("/usr/home/u") {
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            } else {
+                Ok(root_dir)
+            }
+        });
+        assert!(
+            matches!(&unreadable, Err(RunJailDefect::MountFailed { detail, .. }) if detail.contains("/usr/home/u ") && detail.contains(JAIL_DIR_HOME_HINT)),
+            "{unreadable:?}"
+        );
+        for relative in ["jail", "a/jail"] {
+            let outcome = require_trusted_chain(Path::new(relative), ROOT_UID, |_| Ok(root_dir));
             assert!(
                 matches!(outcome, Err(RunJailDefect::MountFailed { .. })),
                 "{relative}: {outcome:?}"
@@ -5009,5 +5453,386 @@ mod held_tests {
             ),
             "{refused:?}"
         );
+    }
+}
+
+/// The one root-only verdict of the FreeBSD jail: base chains, view
+/// directories, primitives, and recorded mounts.
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+
+    const ROOT_DIR: DirFacts = DirFacts {
+        kind: LevelKind::Dir,
+        uid: ROOT_UID,
+        mode: 0o755,
+    };
+    const USER: u32 = 1000;
+
+    /// A chain of `/`, `/usr`, `/usr/home`, `/usr/home/u`, and the jail
+    /// directory, every level root's but `/usr/home/u`, which is `level`.
+    fn home_chain(level: DirFacts) -> [DirFacts; 5] {
+        [ROOT_DIR, ROOT_DIR, ROOT_DIR, level, ROOT_DIR]
+    }
+
+    fn refusal(level: usize, cause: ChainCause) -> Result<(), BaseChainRefusal> {
+        Err(BaseChainRefusal { level, cause })
+    }
+
+    #[test]
+    fn base_chain_refuses_a_user_owned_ancestor_under_root_euid() {
+        let user_home = DirFacts {
+            uid: USER,
+            ..ROOT_DIR
+        };
+        assert_eq!(
+            base_chain_verdict(&home_chain(user_home), ROOT_UID),
+            refusal(3, ChainCause::ForeignOwner)
+        );
+    }
+
+    #[test]
+    fn base_chain_refuses_a_group_writable_ancestor() {
+        let level = DirFacts {
+            mode: 0o775,
+            ..ROOT_DIR
+        };
+        assert_eq!(
+            base_chain_verdict(&home_chain(level), ROOT_UID),
+            refusal(3, ChainCause::Writable)
+        );
+    }
+
+    #[test]
+    fn base_chain_refuses_an_other_writable_ancestor() {
+        for mode in [0o757, 0o1777] {
+            let level = DirFacts { mode, ..ROOT_DIR };
+            assert_eq!(
+                base_chain_verdict(&home_chain(level), ROOT_UID),
+                refusal(3, ChainCause::Writable),
+                "{mode:o}"
+            );
+        }
+    }
+
+    #[test]
+    fn base_chain_refuses_a_symlink_ancestor() {
+        let link = DirFacts {
+            kind: LevelKind::Link,
+            ..ROOT_DIR
+        };
+        assert_eq!(
+            base_chain_verdict(&home_chain(link), ROOT_UID),
+            refusal(3, ChainCause::Link)
+        );
+        let file = DirFacts {
+            kind: LevelKind::Regular,
+            ..ROOT_DIR
+        };
+        assert_eq!(
+            base_chain_verdict(&home_chain(file), ROOT_UID),
+            refusal(3, ChainCause::NotADirectory)
+        );
+    }
+
+    #[test]
+    fn base_chain_accepts_root_0755_chain() {
+        assert_eq!(base_chain_verdict(&[ROOT_DIR; 5], ROOT_UID), Ok(()));
+        assert_eq!(
+            base_chain_verdict(&[], ROOT_UID),
+            refusal(0, ChainCause::Empty)
+        );
+    }
+
+    #[test]
+    fn base_chain_keeps_the_owner_rule_for_a_non_root_euid() {
+        let own = DirFacts {
+            uid: USER,
+            ..ROOT_DIR
+        };
+        let chain = [ROOT_DIR, ROOT_DIR, ROOT_DIR, own, own];
+        assert_eq!(base_chain_verdict(&chain, USER), Ok(()));
+        let other = DirFacts {
+            uid: USER + 1,
+            ..ROOT_DIR
+        };
+        assert_eq!(
+            base_chain_verdict(&[ROOT_DIR, other, own], USER),
+            refusal(1, ChainCause::ForeignOwner)
+        );
+        assert_eq!(
+            base_chain_verdict(&[ROOT_DIR, own, ROOT_DIR], USER),
+            refusal(2, ChainCause::LeafNotOwned)
+        );
+        let writable_own = DirFacts { mode: 0o775, ..own };
+        assert_eq!(
+            base_chain_verdict(&[ROOT_DIR, writable_own, own], USER),
+            refusal(1, ChainCause::Writable)
+        );
+    }
+
+    #[test]
+    fn view_and_base_walks_share_one_verdict() {
+        let kinds = [
+            LevelKind::Dir,
+            LevelKind::Link,
+            LevelKind::Regular,
+            LevelKind::Other,
+        ];
+        for kind in kinds {
+            for uid in [ROOT_UID, USER] {
+                for mode in [0o755, 0o700, 0o775, 0o757, 0o1777, 0o555] {
+                    let facts = DirFacts { kind, uid, mode };
+                    let base = base_chain_verdict(&[ROOT_DIR, facts, ROOT_DIR], ROOT_UID);
+                    let view = view_trust(Some(facts));
+                    assert_eq!(
+                        base.is_ok(),
+                        view == ViewDirTrust::RootOnly,
+                        "{facts:?}: {base:?} {view:?}"
+                    );
+                    assert_eq!(
+                        root_only_dir(uid, mode) && kind == LevelKind::Dir,
+                        view == ViewDirTrust::RootOnly,
+                        "{facts:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(view_trust(None), ViewDirTrust::Missing);
+        let link = DirFacts {
+            kind: LevelKind::Link,
+            ..ROOT_DIR
+        };
+        assert_eq!(view_trust(Some(link)), ViewDirTrust::Unusable);
+        let user_dir = DirFacts {
+            uid: USER,
+            ..ROOT_DIR
+        };
+        assert_eq!(view_trust(Some(user_dir)), ViewDirTrust::Writable);
+    }
+
+    #[test]
+    fn umount_argv_names_the_recorded_target_and_teardown_checks_its_fsid() {
+        let record = MountRecord {
+            target: PathBuf::from("/jailroot/dev"),
+            fsid: 7,
+        };
+        let argv = umount_argv(Path::new("/sbin/umount"), &record);
+        assert_eq!(
+            argv,
+            [
+                std::ffi::OsString::from("/sbin/umount"),
+                std::ffi::OsString::from("-f"),
+                std::ffi::OsString::from("/jailroot/dev"),
+            ]
+        );
+        assert!(still_mounted_there(&record, Ok(7)));
+        assert!(!still_mounted_there(&record, Ok(8)));
+        let moved = Err(RunJailDefect::MountFailed {
+            target: record.target.clone(),
+            detail: "moved".to_owned(),
+        });
+        assert!(!still_mounted_there(&record, moved));
+    }
+
+    #[test]
+    fn a_mount_whose_fsid_is_unread_is_never_recorded() {
+        let mut mounted = Vec::new();
+        let target = Path::new("/jailroot/proc");
+        let unread = mount_recorded(
+            &mut mounted,
+            target,
+            || Ok(()),
+            |at| {
+                Err(RunJailDefect::MountFailed {
+                    target: at.to_path_buf(),
+                    detail: "unreadable".to_owned(),
+                })
+            },
+        );
+        assert!(
+            matches!(unread, Err(RunJailDefect::MountFailed { .. })),
+            "{unread:?}"
+        );
+        assert!(mounted.is_empty(), "{mounted:?}");
+
+        let failed = mount_recorded(
+            &mut mounted,
+            target,
+            || {
+                Err(RunJailDefect::MountFailed {
+                    target: target.to_path_buf(),
+                    detail: "mount failed".to_owned(),
+                })
+            },
+            |_| Ok(3),
+        );
+        assert!(
+            matches!(failed, Err(RunJailDefect::MountFailed { .. })),
+            "{failed:?}"
+        );
+        assert!(mounted.is_empty(), "{mounted:?}");
+
+        assert_eq!(
+            mount_recorded(&mut mounted, target, || Ok(()), |_| Ok(3)),
+            Ok(())
+        );
+        assert_eq!(
+            mounted,
+            vec![MountRecord {
+                target: target.to_path_buf(),
+                fsid: 3,
+            }]
+        );
+    }
+
+    #[test]
+    fn freebsd_primitives_are_absolute_and_exhaustive() {
+        for (primitive, spelling) in FREEBSD_PRIMITIVES {
+            assert_eq!(primitive.spelling(), spelling);
+            let path = Path::new(spelling);
+            assert!(path.is_absolute(), "{spelling}");
+            assert!(
+                path.components().all(|c| matches!(
+                    c,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                )),
+                "{spelling}"
+            );
+            assert!(
+                ["/sbin", "/usr/sbin", "/usr/bin"]
+                    .iter()
+                    .any(|dir| path.parent() == Some(Path::new(dir))),
+                "{spelling}"
+            );
+        }
+        // Every variant is listed once: a new primitive without a row fails
+        // to match here.
+        let listed = |primitive: Primitive| {
+            FREEBSD_PRIMITIVES
+                .iter()
+                .filter(|(listed, _)| *listed == primitive)
+                .count()
+        };
+        for primitive in [
+            Primitive::Jail,
+            Primitive::MountNullfs,
+            Primitive::Mount,
+            Primitive::Umount,
+            Primitive::Rctl,
+        ] {
+            let exhaustive = match primitive {
+                Primitive::Jail
+                | Primitive::MountNullfs
+                | Primitive::Mount
+                | Primitive::Umount
+                | Primitive::Rctl => listed(primitive),
+            };
+            assert_eq!(exhaustive, 1, "{primitive:?}");
+        }
+    }
+
+    #[test]
+    fn a_primitive_in_a_user_writable_dir_refuses() {
+        let root_file = DirFacts {
+            kind: LevelKind::Regular,
+            ..ROOT_DIR
+        };
+        let base = [ROOT_DIR, ROOT_DIR, ROOT_DIR];
+        assert_eq!(primitive_verdict(&base, root_file), Ok(()));
+        let user_dir = DirFacts {
+            uid: USER,
+            ..ROOT_DIR
+        };
+        assert_eq!(
+            primitive_verdict(&[ROOT_DIR, user_dir, ROOT_DIR], root_file),
+            Err(PrimitiveRefusal::Chain(BaseChainRefusal {
+                level: 1,
+                cause: ChainCause::ForeignOwner,
+            }))
+        );
+        let writable_dir = DirFacts {
+            mode: 0o777,
+            ..ROOT_DIR
+        };
+        assert_eq!(
+            primitive_verdict(&[ROOT_DIR, ROOT_DIR, writable_dir], root_file),
+            Err(PrimitiveRefusal::Chain(BaseChainRefusal {
+                level: 2,
+                cause: ChainCause::Writable,
+            }))
+        );
+        assert_eq!(
+            primitive_verdict(
+                &base,
+                DirFacts {
+                    uid: USER,
+                    ..root_file
+                }
+            ),
+            Err(PrimitiveRefusal::ForeignOwner)
+        );
+        assert_eq!(
+            primitive_verdict(
+                &base,
+                DirFacts {
+                    mode: 0o775,
+                    ..root_file
+                }
+            ),
+            Err(PrimitiveRefusal::Writable)
+        );
+        for kind in [LevelKind::Link, LevelKind::Dir, LevelKind::Other] {
+            assert_eq!(
+                primitive_verdict(&base, DirFacts { kind, ..root_file }),
+                Err(PrimitiveRefusal::NotRegular),
+                "{kind:?}"
+            );
+        }
+    }
+}
+
+/// The held and `lstat` readers the FreeBSD jail's verdicts consume, run over
+/// real directories on any unix host.
+#[cfg(all(test, unix))]
+mod held_chain_tests {
+    use super::*;
+    use crate::test_dir::TestDir;
+    use std::os::unix::fs::MetadataExt as _;
+
+    #[test]
+    fn held_and_lstat_readers_report_the_same_chain() {
+        let t = TestDir::new("held-chain").unwrap();
+        let leaf = std::fs::canonicalize(t.path()).unwrap().join("a");
+        std::fs::create_dir(&leaf).unwrap();
+        let held = held_chain_facts(&SafeMountPath::new(&leaf).unwrap()).unwrap();
+        let lstat: Vec<DirFacts> = chain_levels(&leaf)
+            .iter()
+            .map(|dir| lstat_facts(dir).unwrap())
+            .collect();
+        assert_eq!(held, lstat);
+        assert_eq!(held.last().map(|facts| facts.kind), Some(LevelKind::Dir));
+        assert_eq!(
+            held_fsid(&leaf).unwrap(),
+            std::fs::metadata(&leaf).unwrap().dev()
+        );
+    }
+
+    #[test]
+    fn a_chain_with_a_symlink_level_is_refused_by_the_lstat_reader() {
+        let t = TestDir::new("chain-link").unwrap();
+        let base = std::fs::canonicalize(t.path()).unwrap();
+        let (real, link) = (base.join("real"), base.join("link"));
+        std::fs::create_dir_all(real.join("jail")).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let euid = rustix::process::geteuid().as_raw();
+        let outcome = require_trusted_chain(&link.join("jail"), euid, lstat_facts);
+        assert!(
+            matches!(&outcome, Err(RunJailDefect::MountFailed { detail, .. }) if detail.contains(JAIL_DIR_HOME_HINT)),
+            "{outcome:?}"
+        );
+        assert_eq!(lstat_facts(&link).unwrap().kind, LevelKind::Link);
+        let unread = held_fsid(&link.join("jail"));
+        assert!(matches!(unread, Err(RunJailDefect::Path(_))), "{unread:?}");
     }
 }
