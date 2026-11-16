@@ -302,7 +302,18 @@ impl CargoHomeIdentity {
     /// [`JailPathError::Moved`] when a recorded directory is no longer on the
     /// cargo home's path; any error of [`Self::read`].
     pub fn recheck(&self, cargo_home: &Path) -> Result<(), JailPathError> {
-        if Self::read(cargo_home)?.chain.starts_with(&self.chain) {
+        self.confirmed_by(&Self::read(cargo_home)?, cargo_home)
+    }
+
+    /// Confirm the `live` chain of `cargo_home`, read since, still extends
+    /// this recorded one.
+    ///
+    /// # Errors
+    /// [`JailPathError::Moved`] when a recorded directory is no longer on the
+    /// cargo home's path: the cargo home, or a directory above it, was moved
+    /// since it was recorded, possibly into a bind.
+    pub fn confirmed_by(&self, live: &Self, cargo_home: &Path) -> Result<(), JailPathError> {
+        if live.chain.starts_with(&self.chain) {
             Ok(())
         } else {
             Err(JailPathError::Moved {

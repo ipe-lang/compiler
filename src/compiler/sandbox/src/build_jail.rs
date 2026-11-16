@@ -2413,21 +2413,28 @@ impl HeldJailDirs {
     }
 
     /// Refuse when a held bind is, by identity, the cargo home of `mounts` or
-    /// a directory above it.
+    /// a directory above it, or when the cargo home's directories are no
+    /// longer the ones checked (the cargo home may since lie inside a bind,
+    /// which no identity of the bind itself reveals).
     fn refuse_cargo_identity(&self, mounts: &JailMounts) -> Result<(), RunJailDefect> {
         let cargo_home = mounts.cargo_home();
+        let recorded = mounts.cargo_identity();
         let live =
             crate::covers::CargoHomeIdentity::read(cargo_home).map_err(RunJailDefect::Path)?;
-        self.binds()
-            .find(|bind| exposes_by_identity(&bind.id, mounts.cargo_identity(), &live))
-            .map_or(Ok(()), |bind| {
-                Err(RunJailDefect::Path(
-                    crate::JailPathError::ExposesCargoHome {
-                        bind: bind.spelling.as_path().to_path_buf(),
-                        cargo_home: cargo_home.to_path_buf(),
-                    },
-                ))
-            })
+        if let Some(bind) = self
+            .binds()
+            .find(|bind| exposes_by_identity(&bind.id, recorded, &live))
+        {
+            return Err(RunJailDefect::Path(
+                crate::JailPathError::ExposesCargoHome {
+                    bind: bind.spelling.as_path().to_path_buf(),
+                    cargo_home: cargo_home.to_path_buf(),
+                },
+            ));
+        }
+        recorded
+            .confirmed_by(&live, cargo_home)
+            .map_err(RunJailDefect::Path)
     }
 }
 
@@ -5916,6 +5923,46 @@ mod held_tests {
             matches!(mounts.recheck(), Err(crate::JailPathError::Moved { .. })),
             "{:?}",
             mounts.recheck()
+        );
+    }
+
+    #[test]
+    fn held_jail_dirs_refuse_a_cargo_home_moved_into_the_tree() {
+        let t = TestDir::new("held-cargo-into-tree").unwrap();
+        let (scratch, tree, home) = (
+            t.path().join("scratch"),
+            t.path().join("tree"),
+            t.path().join("home"),
+        );
+        let cargo_home = home.join(".cargo");
+        for dir in [&scratch, &tree, &cargo_home] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let canonical = |path: &Path| crate::CanonicalPath::resolve(path).unwrap();
+        let mounts = JailMounts::checked_against(
+            canonical(&scratch),
+            canonical(&tree),
+            Vec::new(),
+            crate::HomeMasks::unmasked(),
+            canonical(&cargo_home).as_path(),
+        )
+        .unwrap();
+        let granted = crate::mounts::TreeBind::granted_by(
+            &crate::run_jail::FilesystemScope::WorkingTreeReadWrite,
+            &mounts,
+        )
+        .unwrap();
+
+        // After the name check, the cargo home lies inside the tree: no bind is
+        // the cargo home or above it, yet binding the tree would expose it.
+        std::fs::rename(&cargo_home, tree.join("x")).unwrap();
+        let refused = HeldJailDirs::hold(&mounts, &granted);
+        assert!(
+            matches!(
+                refused,
+                Err(RunJailDefect::Path(crate::JailPathError::Moved { .. }))
+            ),
+            "{refused:?}"
         );
     }
 }
