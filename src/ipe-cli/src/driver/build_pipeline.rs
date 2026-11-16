@@ -4099,6 +4099,29 @@ mod tests {
         );
     }
 
+    /// A path naming the project directory itself (`""` and `"."` both clean to `.`)
+    /// is refused as not a regular file, never as a malformed entry name.
+    #[test]
+    fn admit_widget_file_refuses_the_root_directory() {
+        let dir = widget_scratch("root_dir");
+        for raw in [".", ""] {
+            let mut manifest = WidgetManifest::default();
+            let result = admit_widget_file(&dir, raw, &mut manifest);
+            assert_eq!(
+                result,
+                Err(WidgetFileRefusal::Unreadable(
+                    WidgetUnreadable::NotRegularFile
+                )),
+                "{raw:?} names the project directory, not a file"
+            );
+            assert!(
+                manifest.is_empty(),
+                "a refused file never enters the manifest"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// The control: a present in-project hook is admitted under its minted tag.
     #[test]
     fn admit_widget_file_admits_present_file() {

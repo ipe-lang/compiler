@@ -18,7 +18,7 @@ use std::fs::File;
 use std::num::NonZeroU64;
 use std::path::{Component, Path, PathBuf};
 
-use ipe_fs_open::{ByteCap, EntryName, HeldDir, OpenRefusal, RegularFile};
+use ipe_fs_open::{ByteCap, EntryName, FileKind, HeldDir, OpenRefusal, RegularFile};
 
 use crate::CliError;
 
@@ -336,8 +336,10 @@ pub fn read_named_in(dir: &Path, names: &[&str], cap: ByteCap) -> Result<String,
 ///
 /// # Errors
 ///
-/// - [`OpenRefusal::BadName`] when `path` is not below `root`, names `root`
-///   itself, or a level is not one plain entry name.
+/// - [`OpenRefusal::BadName`] when `path` is not below `root` or a level is
+///   not one plain entry name.
+/// - [`OpenRefusal::NotRegular`] with [`FileKind::Dir`] when `path` names
+///   `root` itself.
 /// - [`OpenRefusal::Absent`] when `root` or a level of `path` does not exist.
 /// - [`OpenRefusal::Link`] for a link at or below `root`'s held level.
 /// - [`OpenRefusal::NotRegular`] for a FIFO, device, socket or directory.
@@ -374,8 +376,9 @@ fn open_beneath(root: &Path, path: &Path) -> Result<(RegularFile, PathBuf), CliE
 ///
 /// # Errors
 ///
-/// [`OpenRefusal::BadName`] when `path` is not below `root`, names `root`
-/// itself, or a level is not one plain entry name.
+/// [`OpenRefusal::BadName`] when `path` is not below `root` or a level is not
+/// one plain entry name; [`OpenRefusal::NotRegular`] with [`FileKind::Dir`]
+/// when `path` names `root` itself, a directory that is never a readable file.
 fn names_beneath(root: &Path, path: &Path) -> Result<(PathBuf, Vec<EntryName>), OpenRefusal> {
     let (base, rel) = if let Ok(rel) = path.strip_prefix(root) {
         (root.to_path_buf(), rel)
@@ -398,7 +401,7 @@ fn names_beneath(root: &Path, path: &Path) -> Result<(PathBuf, Vec<EntryName>), 
         })
         .collect::<Result<Vec<_>, _>>()?;
     if names.is_empty() {
-        return Err(OpenRefusal::BadName);
+        return Err(OpenRefusal::NotRegular(FileKind::Dir));
     }
     Ok((base, names))
 }
