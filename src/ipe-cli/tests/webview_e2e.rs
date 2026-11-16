@@ -575,15 +575,6 @@ fn client_desktop_shell_boots_and_loads_wasm() -> Result<(), BoxError> {
         return Ok(());
     }
     let test_name = "client_desktop_shell_boots";
-    let xvfb = std::process::Command::new("which")
-        .arg("xvfb-run")
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if !xvfb {
-        return Err(
-            format!("{test_name}: `xvfb-run` is not on PATH; the `e2e` job installs it").into(),
-        );
-    }
     let (_fixture, binary) = built_client_desktop(test_name)?;
     let xdg = private_scratch(test_name)?;
     let result = std::process::Command::new("xvfb-run")
