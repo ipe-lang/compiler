@@ -2208,11 +2208,37 @@ fn substitute_dep_manifest_anchors(
     ctx: &EmitCtx,
     where_: &'static str,
 ) -> DResult<String> {
+    let features = crate::runtime_features::runtime_features(ctx);
+    substitute_features_anchor(template, &features.as_feature_names(), where_)
+}
+
+/// Render the native dependency-model `Cargo.toml` ([`CARGO_DEP_TOML`]) with
+/// exactly `features` selected on the runtime.
+///
+/// The manifest of a crate that is not an Ipê program, such as the
+/// `client desktop` shell.
+///
+/// # Errors
+///
+/// As [`substitute_features_anchor`].
+pub(crate) fn dep_manifest_selecting(features: &[&str], where_: &'static str) -> DResult<String> {
+    substitute_features_anchor(CARGO_DEP_TOML, features, where_)
+}
+
+/// Substitute the `__IPE_RUNTIME_FEATURES__` anchor in `template` with
+/// `features`, quoted and comma-separated.
+///
+/// # Errors
+///
+/// Returns [`Diagnostic::CompilerBug`] (tagged `where_`) if the anchor is absent.
+fn substitute_features_anchor(
+    template: &str,
+    features: &[&str],
+    where_: &'static str,
+) -> DResult<String> {
     const FEATURES_ANCHOR: &str = "__IPE_RUNTIME_FEATURES__";
 
-    let features = crate::runtime_features::runtime_features(ctx);
     let feature_list = features
-        .as_feature_names()
         .iter()
         .map(|f| format!("\"{f}\""))
         .collect::<Vec<_>>()
