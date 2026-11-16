@@ -8,9 +8,9 @@ use std::rc::Rc;
 use ipe_diagnostics::suggest::{Cap, Hit, Policy, Query, Shape, Spelling, Threshold, rank};
 use ipe_diagnostics::{
     AliasExpansionKind, AliasRowFault, Candidates, CmdSubShapeMismatch, CodecAutoRejection,
-    CtorWithheld, DResult, Diagnostic, EditTarget, ImportedAs, Located, ModulePlacementReason,
-    ModulePlacementRejection, NameError, ParseError, SealRejection, SortedNames, Span, StdlibReach,
-    TypeError,
+    CtorWithheld, CustomElementRefusal, CustomElementShape, DResult, Diagnostic, EditTarget,
+    ImportedAs, Located, ModulePlacementReason, ModulePlacementRejection, NameError, ParseError,
+    SealRejection, SortedNames, Span, StdlibReach, TypeError,
 };
 use ipe_intern::{Interner, Symbol, SynthStem};
 use ipe_kernels::{
@@ -6290,10 +6290,7 @@ fn reject_bare_reserved_constructor(
         return Some(Diagnostic::Name {
             span,
             msg: NameError::CustomElementCtorMalformed {
-                detail: Box::<str>::from(
-                    "`CustomElement.fromFile` is legal only as the whole body of a \
-                     `CustomElement`-annotated binding, applied to a single string literal",
-                ),
+                cause: CustomElementRefusal::Shape(CustomElementShape::Unapplied),
             },
         });
     }
@@ -8325,13 +8322,12 @@ fn canonicalise_asserted_call(
     )))
 }
 
-/// The offending-argument shape a `CustomElement.fromFile` body rejects, each naming the
-/// specific rule broken for the IPE-N0044 diagnostic detail.
-fn custom_element_ctor_error(span: Span, detail: &'static str) -> Diagnostic {
+/// The IPE-N0044 diagnostic for a `CustomElement.fromFile` use site breaking `shape`.
+const fn custom_element_ctor_error(span: Span, shape: CustomElementShape) -> Diagnostic {
     Diagnostic::Name {
         span,
         msg: NameError::CustomElementCtorMalformed {
-            detail: Box::<str>::from(detail),
+            cause: CustomElementRefusal::Shape(shape),
         },
     }
 }
@@ -8434,7 +8430,7 @@ fn detect_custom_element_constructor(
     if !val.patterns.is_empty() {
         return Err(custom_element_ctor_error(
             val.body.span,
-            "`CustomElement.fromFile` is a value constructor and takes no binding parameters",
+            CustomElementShape::TakesParameters,
         ));
     }
 
@@ -8445,15 +8441,13 @@ fn detect_custom_element_constructor(
     let Some(ann) = &val.type_annotation else {
         return Err(custom_element_ctor_error(
             val.body.span,
-            "`CustomElement.fromFile` is legal only as the body of a binding annotated \
-             `CustomElement down up`; this binding has no such annotation",
+            CustomElementShape::NoAnnotation,
         ));
     };
     if annotation_head_name(&ann.value, interner) != Some(CUSTOM_ELEMENT_TYPE) {
         return Err(custom_element_ctor_error(
             val.body.span,
-            "`CustomElement.fromFile` is legal only as the body of a binding annotated \
-             `CustomElement down up`",
+            CustomElementShape::NotCustomElementAnnotation,
         ));
     }
 
@@ -8512,15 +8506,13 @@ fn custom_element_widget_path(args: &[src::Expr], body_span: Span) -> DResult<St
     let [arg] = args else {
         return Err(custom_element_ctor_error(
             body_span,
-            "`CustomElement.fromFile` takes exactly one argument — a single string literal \
-             naming the widget-hook JS file",
+            CustomElementShape::ArgumentCount,
         ));
     };
     let src::Expr_::Str(raw) = &arg.value else {
         return Err(custom_element_ctor_error(
             arg.span,
-            "the `CustomElement.fromFile` argument must be a single string literal, not a \
-             variable or expression (the path is read at build time)",
+            CustomElementShape::NonLiteralArgument,
         ));
     };
 
@@ -8561,9 +8553,7 @@ fn custom_element_widget_path(args: &[src::Expr], body_span: Span) -> DResult<St
     if is_rooted_widget_path(raw.as_str()) {
         return Err(custom_element_ctor_error(
             arg.span,
-            "the `CustomElement.fromFile` widget path must be project-root-relative — an \
-             absolute path (a leading `/` or `\\`, a `C:` drive, or a UNC \
-             `\\\\server\\share` prefix) would resolve outside the project and is refused",
+            CustomElementShape::RootedPath,
         ));
     }
     Ok(cleaned)

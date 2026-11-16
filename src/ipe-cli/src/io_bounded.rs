@@ -324,28 +324,39 @@ pub fn read_named_in(dir: &Path, names: &[&str], cap: ByteCap) -> Result<String,
     read_in(dir, &rel, cap)
 }
 
-/// [`read_in`] for a `path` below `root`, spelled under `root` as written or as canonicalised.
+/// Read the file at `path` below `root` to a `String` under `cap`, refusing with the typed cause.
 ///
 /// For a convention file whose full path was derived from a trusted root (a
-/// manifest's source root, a containment-checked project file): every level
-/// below `root` is opened through the held level above it and never followed,
-/// so a link swapped in after the path was derived is refused.
+/// containment-checked project file), spelled under `root` as written or as
+/// canonicalised: every level below `root` is opened through the held level
+/// above it and never followed, so a link swapped in after the path was
+/// derived is refused, and the file is opened non-blocking and proven regular.
+/// The refusal stays the typed [`OpenRefusal`], so the caller maps it once,
+/// with no host path or OS text attached.
+///
+/// # Errors
+///
+/// - [`OpenRefusal::BadName`] when `path` is not below `root`, names `root`
+///   itself, or a level is not one plain entry name.
+/// - [`OpenRefusal::Absent`] when `root` or a level of `path` does not exist.
+/// - [`OpenRefusal::Link`] for a link at or below `root`'s held level.
+/// - [`OpenRefusal::NotRegular`] for a FIFO, device, socket or directory.
+/// - [`OpenRefusal::Denied`] or [`OpenRefusal::InUse`] when the open is refused.
+/// - [`OpenRefusal::TooLarge`] past `cap`; [`OpenRefusal::NotUtf8`] for content
+///   that is not UTF-8; [`OpenRefusal::Io`] for any other failure.
+pub fn read_beneath(root: &Path, path: &Path, cap: ByteCap) -> Result<String, OpenRefusal> {
+    let (base, names) = names_beneath(root, path)?;
+    HeldDir::open_root(&base)?.open_rel(&names)?.read_utf8(cap)
+}
+
+/// Read the file at `path` below `root` as raw bytes, through the same held-directory open.
 ///
 /// # Errors
 ///
 /// [`CliError::SourceRefused`] with [`SourceRefusal::NotRegularFile`] when
 /// `path` is not below `root` or a level is not one plain entry name;
-/// otherwise as [`read_in`].
-pub fn read_beneath(root: &Path, path: &Path, cap: ByteCap) -> Result<String, CliError> {
-    let (file, named) = open_beneath(root, path)?;
-    read_proven(file, &named, cap)
-}
-
-/// [`read_beneath`] for raw bytes: the same held-directory open, decoded as bytes, not UTF-8.
-///
-/// # Errors
-///
-/// As [`read_beneath`], except that content is never refused for not being UTF-8.
+/// otherwise as [`read_in`], except that content is never refused for not
+/// being UTF-8.
 pub fn read_bytes_beneath(root: &Path, path: &Path, cap: ByteCap) -> Result<Vec<u8>, CliError> {
     let (file, named) = open_beneath(root, path)?;
     file.read_bytes(cap)
@@ -354,12 +365,25 @@ pub fn read_bytes_beneath(root: &Path, path: &Path, cap: ByteCap) -> Result<Vec<
 
 /// Open `path` below `root` through held directory levels, never following a link below `root`.
 fn open_beneath(root: &Path, path: &Path) -> Result<(RegularFile, PathBuf), CliError> {
-    let not_below = || refusal_error(path, OpenRefusal::BadName);
+    let (base, names) =
+        names_beneath(root, path).map_err(|refusal| refusal_error(path, refusal))?;
+    open_in(&base, &names)
+}
+
+/// The held base and the entry names that spell `path` below `root`, as written or as canonicalised.
+///
+/// # Errors
+///
+/// [`OpenRefusal::BadName`] when `path` is not below `root`, names `root`
+/// itself, or a level is not one plain entry name.
+fn names_beneath(root: &Path, path: &Path) -> Result<(PathBuf, Vec<EntryName>), OpenRefusal> {
     let (base, rel) = if let Ok(rel) = path.strip_prefix(root) {
         (root.to_path_buf(), rel)
     } else {
-        let canonical = std::fs::canonicalize(root).map_err(|_| not_below())?;
-        let rel = path.strip_prefix(&canonical).map_err(|_| not_below())?;
+        let canonical = std::fs::canonicalize(root).map_err(|_| OpenRefusal::BadName)?;
+        let rel = path
+            .strip_prefix(&canonical)
+            .map_err(|_| OpenRefusal::BadName)?;
         (canonical, rel)
     };
     let names = rel
@@ -372,12 +396,11 @@ fn open_beneath(root: &Path, path: &Path) -> Result<(RegularFile, PathBuf), CliE
             | Component::CurDir
             | Component::ParentDir => Err(OpenRefusal::BadName),
         })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|refusal| refusal_error(path, refusal))?;
+        .collect::<Result<Vec<_>, _>>()?;
     if names.is_empty() {
-        return Err(not_below());
+        return Err(OpenRefusal::BadName);
     }
-    open_in(&base, &names)
+    Ok((base, names))
 }
 
 /// Read the file the invoking user named at `path` to a `String` under `cap`.

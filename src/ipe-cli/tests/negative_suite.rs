@@ -1848,6 +1848,15 @@ fn canon_custom_element_seal_rejects_type_variable() {
 /// [`Outcome`] the shared harness produces — used for the widget-file-exists path,
 /// which needs a real JS file on disk next to the entry.
 fn compile_with_files(name: &str, source: &str, extra: &[(&str, &str)]) -> Outcome {
+    match build_with_files(name, source, extra) {
+        Ok(()) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
+        Err(CliError::Pipeline { diag, .. }) => Outcome::Rejected(diag.code().as_str()),
+        Err(other) => Outcome::Accepted(format!("non-pipeline error: {other:?}")),
+    }
+}
+
+/// Build a fixture whose `Main.ipe` sits beside the given extra files, keeping the whole error.
+fn build_with_files(name: &str, source: &str, extra: &[(&str, &str)]) -> Result<(), CliError> {
     let fixture = write_fixture(source);
     // Widget hooks resolve beside the entry module, under the project's `src/`.
     let dir = fixture.path().join("src");
@@ -1863,10 +1872,72 @@ fn compile_with_files(name: &str, source: &str, extra: &[(&str, &str)]) -> Outco
         .join(name);
     e2e_support::scratch::fresh(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    match ipe::build_fixture_with_options(&fixture, &out, &runtime, &BuildOptions::default()) {
-        Ok(_) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
-        Err(CliError::Pipeline { diag, .. }) => Outcome::Rejected(diag.code().as_str()),
-        Err(other) => Outcome::Accepted(format!("non-pipeline error: {other:?}")),
+    ipe::build_fixture_with_options(&fixture, &out, &runtime, &BuildOptions::default()).map(drop)
+}
+
+/// The typed IPE-N0044 cause a build refused with, or the [`Outcome`] when it was anything else.
+fn custom_element_cause<T>(
+    built: Result<T, CliError>,
+) -> Result<ipe_diagnostics::CustomElementRefusal, Outcome> {
+    match built {
+        Ok(_) => Err(Outcome::Accepted(
+            "compiled successfully (exit 0)".to_owned(),
+        )),
+        Err(CliError::Pipeline { diag, .. }) => match *diag {
+            ipe_diagnostics::Diagnostic::Name {
+                msg: ipe_diagnostics::NameError::CustomElementCtorMalformed { cause },
+                ..
+            } => Ok(cause),
+            other => Err(Outcome::Rejected(other.code().as_str())),
+        },
+        Err(other) => Err(Outcome::Accepted(format!("non-pipeline error: {other:?}"))),
+    }
+}
+
+/// The typed IPE-N0044 cause of compiling `source` beside `extra` files.
+fn compile_cause(
+    name: &str,
+    source: &str,
+    extra: &[(&str, &str)],
+) -> Result<ipe_diagnostics::CustomElementRefusal, Outcome> {
+    custom_element_cause(build_with_files(name, source, extra))
+}
+
+/// Assert a refusal is IPE-N0044 carrying exactly the `expected` typed cause.
+#[track_caller]
+fn assert_cause(
+    name: &str,
+    got: Result<ipe_diagnostics::CustomElementRefusal, Outcome>,
+    expected: &ipe_diagnostics::CustomElementRefusal,
+) {
+    match got {
+        Ok(cause) => assert_eq!(
+            &cause, expected,
+            "{name}: IPE-N0044 refused for the WRONG cause"
+        ),
+        Err(Outcome::Rejected(code)) => assert!(
+            false_marker(),
+            "{name}: expected IPE-N0044 {expected:?}, got {code} — a rejection for the WRONG reason"
+        ),
+        Err(Outcome::Accepted(how)) => fail_accepted(name, "IPE-N0044", &how),
+    }
+}
+
+/// An IPE-N0044 shape refusal for `shape`.
+const fn shape(
+    which: ipe_diagnostics::CustomElementShape,
+) -> ipe_diagnostics::CustomElementRefusal {
+    ipe_diagnostics::CustomElementRefusal::Shape(which)
+}
+
+/// An IPE-N0044 file refusal for the widget-hook file at `path`.
+fn file_refusal(
+    path: &str,
+    refusal: ipe_diagnostics::WidgetFileRefusal,
+) -> ipe_diagnostics::CustomElementRefusal {
+    ipe_diagnostics::CustomElementRefusal::File {
+        path: path.into(),
+        refusal,
     }
 }
 
@@ -1894,7 +1965,12 @@ fn custom_element_ctor_non_literal_rejected() {
          editor = CustomElement.fromFile src\n\
          main = 1\n"
     );
-    assert_rejected("custom_element_non_literal", &src, "IPE-N0044");
+    let name = "custom_element_non_literal";
+    assert_cause(
+        name,
+        compile_cause(name, &src, &[]),
+        &shape(ipe_diagnostics::CustomElementShape::NonLiteralArgument),
+    );
 }
 
 /// (b) A bare `customElement` value (referenced without its literal argument) is
@@ -1907,7 +1983,12 @@ fn custom_element_ctor_bare_value_rejected() {
          editor = CustomElement.fromFile\n\
          main = 1\n"
     );
-    assert_rejected("custom_element_bare", &src, "IPE-N0044");
+    let name = "custom_element_bare";
+    assert_cause(
+        name,
+        compile_cause(name, &src, &[]),
+        &shape(ipe_diagnostics::CustomElementShape::ArgumentCount),
+    );
 }
 
 /// `customElement` outside a `CustomElement`-annotated binding body is rejected:
@@ -1920,7 +2001,66 @@ fn custom_element_ctor_wrong_position_rejected() {
          oops = CustomElement.fromFile \"js/x.js\"\n\
          main = 1\n"
     );
-    assert_rejected("custom_element_wrong_pos", &src, "IPE-N0044");
+    let name = "custom_element_wrong_pos";
+    assert_cause(
+        name,
+        compile_cause(name, &src, &[]),
+        &shape(ipe_diagnostics::CustomElementShape::NoAnnotation),
+    );
+}
+
+/// `CustomElement.fromFile` nested under another application, unapplied, is
+/// refused: it is legal only as the whole body (IPE-N0044).
+#[test]
+fn custom_element_ctor_nested_rejected() {
+    let src = format!(
+        "{HEAD}import Ipe.Ffi.Js.CustomElement as CustomElement\n\
+         editor : CustomElement Int String\n\
+         editor = identity CustomElement.fromFile\n\
+         main = 1\n"
+    );
+    let name = "custom_element_nested";
+    assert_cause(
+        name,
+        compile_cause(name, &src, &[]),
+        &shape(ipe_diagnostics::CustomElementShape::Unapplied),
+    );
+}
+
+/// A binding with parameters whose body is `CustomElement.fromFile` is refused:
+/// the constructor is a value and takes no binding parameters (IPE-N0044).
+#[test]
+fn custom_element_ctor_with_params_rejected() {
+    let src = format!(
+        "{HEAD}import Ipe.Ffi.Js.CustomElement as CustomElement\n\
+         editor : Int -> CustomElement Int String\n\
+         editor _n = CustomElement.fromFile \"js/x.js\"\n\
+         main = 1\n"
+    );
+    let name = "custom_element_with_params";
+    assert_cause(
+        name,
+        compile_cause(name, &src, &[]),
+        &shape(ipe_diagnostics::CustomElementShape::TakesParameters),
+    );
+}
+
+/// A binding annotated with a type other than `CustomElement down up` is
+/// refused as the constructor's home (IPE-N0044).
+#[test]
+fn custom_element_ctor_other_annotation_rejected() {
+    let src = format!(
+        "{HEAD}import Ipe.Ffi.Js.CustomElement as CustomElement\n\
+         editor : Int\n\
+         editor = CustomElement.fromFile \"js/x.js\"\n\
+         main = 1\n"
+    );
+    let name = "custom_element_other_annotation";
+    assert_cause(
+        name,
+        compile_cause(name, &src, &[]),
+        &shape(ipe_diagnostics::CustomElementShape::NotCustomElementAnnotation),
+    );
 }
 
 /// The imports and runnable Web entry of a program that links the browser
@@ -1961,7 +2101,60 @@ fn custom_element_ctor_missing_file_rejected() {
          editor = CustomElement.fromFile \"js/does-not-exist.js\"\n"
     );
     // No extra files written — the named path is absent.
-    assert_rejected_with_files("custom_element_missing_file", &src, &[], "IPE-N0044");
+    let name = "custom_element_missing_file";
+    assert_cause(
+        name,
+        compile_cause(name, &src, &[]),
+        &file_refusal(
+            "js/does-not-exist.js",
+            ipe_diagnostics::WidgetFileRefusal::Missing,
+        ),
+    );
+}
+
+/// A widget-hook file that is a FIFO is refused as not a regular file, never
+/// waited on for a writer (IPE-N0044, checked at the build stage).
+#[cfg(unix)]
+#[test]
+fn custom_element_ctor_fifo_rejected() {
+    let name = "custom_element_fifo";
+    let src = format!(
+        "{HEAD}import Ipe.Ffi.Js.CustomElement as CustomElement\n\
+         {WEB_ENTRY}\
+         editor : CustomElement Int String\n\
+         editor = CustomElement.fromFile \"js/hook.js\"\n"
+    );
+    let fixture = write_fixture(&src);
+    let js = fixture.path().join("src").join("js");
+    crate::support::expect_scratch_step(name, std::fs::create_dir_all(&js));
+    let made = std::process::Command::new("mkfifo")
+        .arg(js.join("hook.js"))
+        .status();
+    assert!(
+        made.is_ok_and(|status| status.success()),
+        "{name}: mkfifo creates the fixture"
+    );
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("negsuite-ce-out")
+        .join(name);
+    e2e_support::scratch::fresh(&out);
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let got = custom_element_cause(ipe::build_fixture_with_options(
+        &fixture,
+        &out,
+        &runtime,
+        &BuildOptions::default(),
+    ));
+    assert_cause(
+        name,
+        got,
+        &file_refusal(
+            "js/hook.js",
+            ipe_diagnostics::WidgetFileRefusal::Unreadable(
+                ipe_diagnostics::WidgetUnreadable::NotRegularFile,
+            ),
+        ),
+    );
 }
 
 /// The control for the [`WEB_ENTRY`] file refusals: the same program with its
@@ -2138,10 +2331,11 @@ fn custom_element_ctor_absolute_path_rejected_at_canon() {
         // Single-file `compile` reaches canon and stops there on rejection, so no
         // JS file is written — the verdict must be identical for both the
         // host-existing and the host-missing absolute target.
-        assert_rejected(
-            &format!("custom_element_absolute_{label}"),
-            &src,
-            "IPE-N0044",
+        let name = format!("custom_element_absolute_{label}");
+        assert_cause(
+            &name,
+            compile_cause(&name, &src, &[]),
+            &shape(ipe_diagnostics::CustomElementShape::RootedPath),
         );
     }
 }
@@ -2165,10 +2359,11 @@ fn custom_element_ctor_windows_rooted_path_rejected_at_canon() {
              editor = CustomElement.fromFile \"{rooted}\"\n\
              main = 1\n"
         );
-        assert_rejected(
-            &format!("custom_element_win_rooted_{label}"),
-            &src,
-            "IPE-N0044",
+        let name = format!("custom_element_win_rooted_{label}");
+        assert_cause(
+            &name,
+            compile_cause(&name, &src, &[]),
+            &shape(ipe_diagnostics::CustomElementShape::RootedPath),
         );
     }
 }
@@ -2219,20 +2414,23 @@ fn custom_element_ctor_symlink_escape_rejected_at_build_gate() {
     let out = base.join("out");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let outcome =
-        match ipe::build_fixture_with_options(&fixture, &out, &runtime, &BuildOptions::default()) {
-            Ok(_) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
-            Err(CliError::Pipeline { diag, .. }) => Outcome::Rejected(diag.code().as_str()),
-            Err(other) => Outcome::Accepted(format!("non-pipeline error: {other:?}")),
-        };
+    let got = custom_element_cause(ipe::build_fixture_with_options(
+        &fixture,
+        &out,
+        &runtime,
+        &BuildOptions::default(),
+    ));
     let _ = std::fs::remove_dir_all(&base);
-    match outcome {
-        Outcome::Rejected(got) => assert_eq!(
-            got, "IPE-N0044",
-            "custom_element_symlink_escape: expected IPE-N0044 (containment), got {got}"
+    assert_cause(
+        name,
+        got,
+        &file_refusal(
+            "js/evil.js",
+            ipe_diagnostics::WidgetFileRefusal::Escapes(
+                ipe_diagnostics::WidgetPathEscape::OutsideRoot,
+            ),
         ),
-        Outcome::Accepted(how) => fail_accepted("custom_element_symlink_escape", "IPE-N0044", &how),
-    }
+    );
 }
 
 /// WP4 SEAL golden (ipe-accept half): a real Web-shape program that PLACES a

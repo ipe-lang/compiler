@@ -15,6 +15,9 @@ use crate::{
     project, render, runtime_embed, text,
 };
 use ipe_backend_rust::rust_str_lit;
+use ipe_diagnostics::{
+    CustomElementRefusal, WidgetFileRefusal, WidgetPathEscape, WidgetUnreadable,
+};
 use ipe_runtime_rust::encoding::MountBase;
 
 /// Options modifying a build beyond plain source compilation — some (the
@@ -1766,48 +1769,144 @@ pub fn widget_file_root(entry_src_path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-/// Two distinct widget-hook paths that hashed to one custom-element tag.
-pub struct WidgetTagCollision {
-    pub existing_path: String,
-    pub new_path: String,
+/// The program's widget manifest: each custom-element tag with the file that minted it and its content.
+///
+/// The only mutator, [`WidgetManifest::insert`], mints the tag from the
+/// cleaned path through [`ipe_lower::custom_element_tag`] (the same tag the
+/// view node renders) and owns the collision rule, so no entry can hold
+/// content without its origin or under a tag its path did not mint.
+#[derive(Debug, Default)]
+pub struct WidgetManifest(BTreeMap<String, WidgetEntry>);
+
+/// One manifest entry: the cleaned path that minted its tag, and that file's content.
+#[derive(Debug)]
+struct WidgetEntry {
+    origin: String,
+    content: String,
 }
 
-/// Read the containment-checked widget-hook file at `resolved` below `widget_root`.
+impl WidgetManifest {
+    /// Admit the widget-hook file at `cleaned_path` under the tag its path mints.
+    ///
+    /// The same path again (two view nodes of one widget) is accepted and keeps
+    /// the first content.
+    ///
+    /// # Errors
+    ///
+    /// [`WidgetFileRefusal::TagCollision`] when a distinct path already holds
+    /// the tag; the manifest is left unchanged.
+    pub fn insert(&mut self, cleaned_path: &str, content: String) -> Result<(), WidgetFileRefusal> {
+        self.insert_minted(
+            ipe_lower::custom_element_tag(cleaned_path),
+            cleaned_path,
+            content,
+        )
+    }
+
+    /// The collision rule over an already-minted `tag`.
+    ///
+    /// The tag is a 64-bit FNV-1a digest, which is not collision-free: a
+    /// distinct path on an occupied tag fails closed rather than serve one
+    /// widget's code under another's element name.
+    fn insert_minted(
+        &mut self,
+        tag: String,
+        cleaned_path: &str,
+        content: String,
+    ) -> Result<(), WidgetFileRefusal> {
+        match self.0.entry(tag) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(WidgetEntry {
+                    origin: cleaned_path.to_owned(),
+                    content,
+                });
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(slot) => {
+                if slot.get().origin == cleaned_path {
+                    Ok(())
+                } else {
+                    Err(WidgetFileRefusal::TagCollision {
+                        other_path: slot.get().origin.as_str().into(),
+                        tag: slot.key().as_str().into(),
+                    })
+                }
+            }
+        }
+    }
+
+    /// Whether no widget-hook file was admitted.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Each `(tag, content)`, in tag order, so the emit is byte-stable across builds.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0
+            .iter()
+            .map(|(tag, entry)| (tag.as_str(), entry.content.as_str()))
+    }
+}
+
+/// Contain, read and admit the widget-hook file at `cleaned_path` into `manifest`.
 ///
-/// Every level below the root is opened through the held level above it and
-/// never followed, and the file is opened non-blocking and proven regular: a
-/// link swapped in after the containment check is refused, and a FIFO is
-/// refused rather than waited on.
+/// The path must resolve strictly inside `widget_root` (a link under the root
+/// pointing outside it is refused), the file is read through held directory
+/// levels that are never followed, non-blocking and proven regular, and the
+/// manifest's one insert mints its tag and refuses a collision.
 ///
 /// # Errors
 ///
-/// As [`crate::io_bounded::read_beneath`] under [`crate::io_bounded::SMALL_FILE_CAP`].
-fn read_widget_hook(widget_root: &Path, resolved: &Path) -> Result<String, CliError> {
-    crate::io_bounded::read_beneath(widget_root, resolved, crate::io_bounded::SMALL_FILE_CAP)
+/// The typed [`WidgetFileRefusal`]: the path escapes, the file is missing or
+/// unreadable, or its tag is held by another file.
+fn admit_widget_file(
+    widget_root: &Path,
+    cleaned_path: &str,
+    manifest: &mut WidgetManifest,
+) -> Result<(), WidgetFileRefusal> {
+    let contained = contained_path::ContainedRelPath::parse(widget_root, cleaned_path)
+        .map_err(|escape| WidgetFileRefusal::Escapes(widget_path_escape(escape)))?;
+    let content = crate::io_bounded::read_beneath(
+        widget_root,
+        contained.resolved(),
+        crate::io_bounded::SMALL_FILE_CAP,
+    )
+    .map_err(widget_read_refusal)?;
+    manifest.insert(cleaned_path, content)
 }
 
-/// Record `cleaned_path` as the origin of `tag`, or report a collision.
-///
-/// The custom-element tag is a 64-bit FNV-1a digest, which is not collision-free.
-/// Two DISTINCT hook paths hashing to one tag must fail the build closed rather
-/// than let a tag-keyed manifest silently serve one widget's code under the
-/// other's element name. Re-recording the SAME path for a tag is the legitimate
-/// dedup of two view nodes of one widget and is accepted.
-pub fn record_widget_tag_origin(
-    origins: &mut BTreeMap<String, String>,
-    tag: &str,
-    cleaned_path: &str,
-) -> Result<(), WidgetTagCollision> {
-    match origins.get(tag) {
-        Some(existing) if existing != cleaned_path => Err(WidgetTagCollision {
-            existing_path: existing.clone(),
-            new_path: cleaned_path.to_owned(),
-        }),
-        Some(_) => Ok(()),
-        None => {
-            origins.insert(tag.to_owned(), cleaned_path.to_owned());
-            Ok(())
+/// The diagnostic's mirror of a containment escape.
+const fn widget_path_escape(escape: contained_path::PathEscape) -> WidgetPathEscape {
+    match escape {
+        contained_path::PathEscape::ParentTraversal => WidgetPathEscape::ParentTraversal,
+        contained_path::PathEscape::Absolute => WidgetPathEscape::Absolute,
+        contained_path::PathEscape::NotUnderRoot => WidgetPathEscape::OutsideRoot,
+    }
+}
+
+/// The diagnostic's mirror of a held-open refusal, carrying no host path or OS text.
+fn widget_read_refusal(refusal: ipe_fs_open::OpenRefusal) -> WidgetFileRefusal {
+    use ipe_fs_open::OpenRefusal;
+    match refusal {
+        OpenRefusal::Absent => WidgetFileRefusal::Missing,
+        OpenRefusal::Link => WidgetFileRefusal::Unreadable(WidgetUnreadable::Link),
+        OpenRefusal::NotRegular(_) => {
+            WidgetFileRefusal::Unreadable(WidgetUnreadable::NotRegularFile)
         }
+        OpenRefusal::Denied => WidgetFileRefusal::Unreadable(WidgetUnreadable::Denied),
+        OpenRefusal::InUse => WidgetFileRefusal::Unreadable(WidgetUnreadable::InUse),
+        OpenRefusal::TooLarge(cap) => WidgetFileRefusal::Unreadable(WidgetUnreadable::TooLarge {
+            cap_bytes: cap.get(),
+        }),
+        OpenRefusal::TooManyEntries(cap) => {
+            WidgetFileRefusal::Unreadable(WidgetUnreadable::TooManyEntries {
+                cap: u64::from(cap.get()),
+            })
+        }
+        OpenRefusal::BadName => WidgetFileRefusal::Unreadable(WidgetUnreadable::NotPlainName),
+        OpenRefusal::NotUtf8 => WidgetFileRefusal::Unreadable(WidgetUnreadable::NotUtf8),
+        OpenRefusal::Io(kind) => WidgetFileRefusal::Unreadable(WidgetUnreadable::Io(kind)),
     }
 }
 
@@ -2067,21 +2166,23 @@ pub fn compile_prepared(
         .clone()
         .map_err(homed_err)?;
 
-    // Widget-file gate (IPE-N0044, Security #1). The `customElement` constructor's
-    // shape + lexical path seals (traversal IPE-P0063, absolute/rooted IPE-N0044)
-    // already ran in canon; here — the one stage that owns the project root — two
-    // FILESYSTEM invariants are enforced, defence-in-depth against the lexical
-    // seals:
-    //   1. Containment: the resolved path must lie strictly INSIDE the project
-    //      root. `ContainedRelPath::parse` canonicalises the join and asserts it
-    //      is a descendant of the canonical root, so a symlink UNDER the root that
-    //      points OUTSIDE it (which the lexical seals cannot see) is refused. A
-    //      bare `Path::join`/`is_file` would instead FOLLOW that symlink and stat
-    //      an out-of-project file — the escape this check closes.
-    //   2. Existence: the contained path must name a real file, so a widget never
-    //      registers against a file that is not there.
-    // Both fail closed with IPE-N0044; the widget seam never reaches emission on
-    // an out-of-project or absent file.
+    // Widget-file gate (IPE-N0044, Security #1). The `CustomElement.fromFile`
+    // constructor's shape + lexical path seals (traversal IPE-P0063,
+    // absolute/rooted IPE-N0044) already ran in canon; here — the one stage that
+    // owns the project root — each named file is admitted through
+    // `admit_widget_file`, defence-in-depth against the lexical seals:
+    //   1. Containment: `ContainedRelPath::parse` canonicalises the join and
+    //      asserts it is a descendant of the canonical root, so a symlink UNDER
+    //      the root that points OUTSIDE it (which the lexical seals cannot see)
+    //      is refused.
+    //   2. Read: the file is opened through held directory levels, never
+    //      followed, non-blocking and proven regular, and read whole under a cap;
+    //      the typed refusal (missing, unreadable) is carried, never re-derived.
+    //   3. Uniqueness: `WidgetManifest::insert` mints the tag from the path and
+    //      refuses a distinct path on an occupied tag.
+    // Each refusal fails closed with IPE-N0044 carrying its typed cause; the
+    // widget seam never reaches emission on an out-of-project, absent,
+    // unreadable or colliding file.
     //
     // The gate runs only on a program lowering admitted. Lowering's admission
     // holds the IPE-L0147 placement gate, so a constructor the program may not
@@ -2096,72 +2197,30 @@ pub fn compile_prepared(
         })?;
     let widget_root = widget_file_root(&entry_src_path);
     // The program's widget manifest: one entry per DISTINCT reached
-    // `customElement "<path>"`, carrying the lowerer-minted `ipe-ce-<hex>` tag
-    // (so the served-glue registration targets the SAME tag the view node
-    // renders) and the author hook file's verbatim content (WP5 serves it
-    // content-addressed + SRI). Populated as the containment/existence gate
-    // proves each file; deduplicated by tag so two views of one widget register
-    // once. Empty for a program that uses no `CustomElement.node`.
-    let mut widget_manifest: BTreeMap<String, String> = BTreeMap::new();
-    // The cleaned path that first minted each tag. The tag is a 64-bit FNV-1a
-    // digest, so two DISTINCT hook paths can collide onto one tag; keying the
-    // manifest by tag alone would then silently drop the second widget's JS and
-    // serve the first's code under both view nodes. Recording the origin path
-    // lets a collision from a distinct path fail the build closed instead.
-    let mut tag_origin: BTreeMap<String, String> = BTreeMap::new();
+    // `CustomElement.fromFile "<path>"`, keyed by the tag its path mints (the
+    // tag the view node renders) and carrying the author hook file's verbatim
+    // content, which the emit serves content-addressed + SRI. Two views of one
+    // widget register once. Empty for a program that uses no widget.
+    let mut widget_manifest = WidgetManifest::default();
     for widget in ipe_canon::custom_element_gate::collect_widget_files(linked) {
-        let reject = |detail: String| {
+        if let Err(refusal) =
+            admit_widget_file(widget_root, &widget.cleaned_path, &mut widget_manifest)
+        {
             let (file, src) = source_for_span(widget.span);
-            CliError::Pipeline {
+            return Err(CliError::Pipeline {
                 file,
                 src,
                 diag: Box::new(ipe_diagnostics::Diagnostic::Name {
                     span: widget.span,
                     msg: ipe_diagnostics::NameError::CustomElementCtorMalformed {
-                        detail: detail.into_boxed_str(),
+                        cause: CustomElementRefusal::File {
+                            path: widget.cleaned_path.as_str().into(),
+                            refusal,
+                        },
                     },
                 }),
-            }
-        };
-        let contained = contained_path::ContainedRelPath::parse(widget_root, &widget.cleaned_path)
-            .map_err(|_| {
-                reject(format!(
-                    "the widget-hook file `{}` resolves outside the project directory \
-                         (an absolute path, a `..` climb, or a symlink pointing above the \
-                         project root) and is refused",
-                    widget.cleaned_path
-                ))
-            })?;
-        // A read failure fails the build closed: the widget seam never reaches
-        // emission on a file we could not read whole.
-        let content = read_widget_hook(widget_root, contained.resolved()).map_err(|e| {
-            if matches!(&e, CliError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound)
-            {
-                reject(format!(
-                    "the widget-hook file `{}` does not exist in the project",
-                    widget.cleaned_path
-                ))
-            } else {
-                reject(format!(
-                    "the widget-hook file `{}` could not be read: {e}",
-                    widget.cleaned_path
-                ))
-            }
-        })?;
-        // The tag is the SINGLE lowerer definition, keyed on the same cleaned
-        // path the view node hashed — never a second, drift-prone hash here.
-        let tag = ipe_lower::custom_element_tag(&widget.cleaned_path);
-        if let Err(collision) =
-            record_widget_tag_origin(&mut tag_origin, &tag, &widget.cleaned_path)
-        {
-            return Err(reject(format!(
-                "the widget-hook files `{}` and `{}` hash to the same \
-                 custom-element tag `{tag}`; register one under a distinct \
-                 path so their element names cannot collide",
-                collision.existing_path, collision.new_path
-            )));
+            });
         }
-        widget_manifest.entry(tag).or_insert(content);
     }
 
     // Post-lowering wasm gate (IPE-N0029): re-judge every function lowering
@@ -2283,7 +2342,7 @@ pub fn compile_prepared(
 /// widgets.
 pub fn inject_widget_registration(
     emitted: &mut ipe_backend::EmittedProject,
-    manifest: &BTreeMap<String, String>,
+    manifest: &WidgetManifest,
 ) -> Result<(), CliError> {
     // The splice point: the first line of the generated `main()`, before any task
     // runs, so the registry is populated before the web server binds.
@@ -2311,9 +2370,9 @@ pub fn inject_widget_registration(
         .ok_or_else(|| bug("no src/main.rs in the emitted file set for widget registration"))?;
 
     // Build the `register(&[(tag, content), …])` argument list. Deterministic
-    // order (BTreeMap iteration) keeps the emit byte-stable across builds.
+    // order (tag order) keeps the emit byte-stable across builds.
     let mut entries = String::new();
-    for (tag, content) in manifest {
+    for (tag, content) in manifest.entries() {
         entries.push_str("        (");
         entries.push_str(&rust_str_lit(tag));
         entries.push_str(", ");
@@ -2359,7 +2418,7 @@ pub fn inject_widget_registration(
 /// wasm emit template, surfaced loudly.
 pub fn inject_wasm_widget_bundle(
     emitted: &mut ipe_backend::EmittedProject,
-    manifest: &BTreeMap<String, String>,
+    manifest: &WidgetManifest,
     base: &MountBase,
 ) -> Result<(), CliError> {
     use ipe_runtime_rust::encoding::BundlePath;
@@ -2394,13 +2453,13 @@ pub fn inject_wasm_widget_bundle(
         })
     };
 
-    // Rebuild the explicit asset slice (deterministic BTreeMap order → byte-stable
+    // Rebuild the explicit asset slice (deterministic tag order → byte-stable
     // emit) the registry-free generator consumes.
     let assets: Vec<WidgetAsset> = manifest
-        .iter()
+        .entries()
         .map(|(tag, content)| WidgetAsset {
-            tag: tag.clone(),
-            content: content.clone(),
+            tag: tag.to_owned(),
+            content: content.to_owned(),
         })
         .collect();
 
@@ -3361,10 +3420,17 @@ mod tests {
             links_web_runtime: true,
             assets: std::collections::BTreeMap::new(),
         };
-        let manifest = BTreeMap::from([(
-            "x-w\u{202E}".to_owned(),
-            "/* \u{202E}evil\u{2066} */ a\rb \"#\"## c\\d".to_owned(),
-        )]);
+        let mut manifest = WidgetManifest::default();
+        assert!(
+            manifest
+                .insert_minted(
+                    "x-w\u{202E}".to_owned(),
+                    "js/w.js",
+                    "/* \u{202E}evil\u{2066} */ a\rb \"#\"## c\\d".to_owned(),
+                )
+                .is_ok(),
+            "a vacant tag is admitted"
+        );
         assert!(inject_widget_registration(&mut emitted, &manifest).is_ok());
         let main = emitted.files.get("src/main.rs").map_or("", String::as_str);
         assert!(
@@ -3393,7 +3459,13 @@ mod tests {
             links_web_runtime: false,
             assets: std::collections::BTreeMap::new(),
         };
-        let manifest = BTreeMap::from([("x-w".to_owned(), "export {}".to_owned())]);
+        let mut manifest = WidgetManifest::default();
+        assert!(
+            manifest
+                .insert_minted("x-w".to_owned(), "js/w.js", "export {}".to_owned())
+                .is_ok(),
+            "a vacant tag is admitted"
+        );
         let result = inject_widget_registration(&mut emitted, &manifest);
         assert!(
             matches!(
@@ -3813,10 +3885,143 @@ mod tests {
         dir
     }
 
+    /// A distinct path on an occupied tag is refused and leaves the manifest unchanged.
+    #[test]
+    fn widget_manifest_refuses_distinct_path_on_occupied_tag() {
+        let mut manifest = WidgetManifest::default();
+        assert_eq!(
+            manifest.insert_minted("ipe-ce-dead".to_owned(), "A.js", "a".to_owned()),
+            Ok(())
+        );
+        // The SAME path (a second view node of one widget) is the legitimate dedup.
+        assert_eq!(
+            manifest.insert_minted("ipe-ce-dead".to_owned(), "A.js", "a2".to_owned()),
+            Ok(())
+        );
+        assert_eq!(
+            manifest.insert_minted("ipe-ce-dead".to_owned(), "B.js", "b".to_owned()),
+            Err(WidgetFileRefusal::TagCollision {
+                other_path: "A.js".into(),
+                tag: "ipe-ce-dead".into(),
+            })
+        );
+        assert_eq!(
+            manifest.entries().collect::<Vec<_>>(),
+            vec![("ipe-ce-dead", "a")],
+            "the first path's first content stays; the colliding file never enters"
+        );
+    }
+
+    /// The manifest keys an admitted file by the tag the lowered view node renders.
+    #[test]
+    fn widget_manifest_mints_the_lowerer_tag() {
+        let mut manifest = WidgetManifest::default();
+        assert_eq!(manifest.insert("js/a.js", "c".to_owned()), Ok(()));
+        let tag = ipe_lower::custom_element_tag("js/a.js");
+        assert_eq!(
+            manifest.entries().collect::<Vec<_>>(),
+            vec![(tag.as_str(), "c")]
+        );
+    }
+
+    /// A widget project root inside a fresh scratch directory, with a planted file beside it.
+    fn widget_root_beside_planted(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = widget_scratch(tag);
+        let root = dir.join("root");
+        assert!(fs::create_dir_all(&root).is_ok(), "make project root");
+        assert!(
+            fs::write(dir.join("x.js"), "export {}").is_ok(),
+            "plant the outside file"
+        );
+        (dir, root)
+    }
+
+    /// A `..` climb to a planted file above the root is refused as an escape, never read.
+    #[test]
+    fn admit_widget_file_refuses_parent_traversal() {
+        let (dir, root) = widget_root_beside_planted("traversal");
+        let mut manifest = WidgetManifest::default();
+        let result = admit_widget_file(&root, "../x.js", &mut manifest);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            result,
+            Err(WidgetFileRefusal::Escapes(
+                WidgetPathEscape::ParentTraversal
+            ))
+        );
+        assert!(
+            manifest.is_empty(),
+            "a refused file never enters the manifest"
+        );
+    }
+
+    /// The absolute path of a planted outside file is refused as an escape, never read.
+    #[test]
+    fn admit_widget_file_refuses_absolute_path() {
+        let (dir, root) = widget_root_beside_planted("absolute");
+        let outside = dir.join("x.js");
+        let mut manifest = WidgetManifest::default();
+        let result = admit_widget_file(&root, &outside.to_string_lossy(), &mut manifest);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            result,
+            Err(WidgetFileRefusal::Escapes(WidgetPathEscape::Absolute))
+        );
+        assert!(
+            manifest.is_empty(),
+            "a refused file never enters the manifest"
+        );
+    }
+
+    /// A directory link under the root pointing outside it is refused as an escape.
+    #[cfg(unix)]
+    #[test]
+    fn admit_widget_file_refuses_link_out_of_root() {
+        let dir = widget_scratch("link_out");
+        let root = dir.join("root");
+        let outside = dir.join("outside");
+        assert!(fs::create_dir_all(&root).is_ok(), "make project root");
+        assert!(fs::create_dir_all(&outside).is_ok(), "make outside dir");
+        assert!(
+            fs::write(outside.join("x.js"), "export {}").is_ok(),
+            "plant the outside file"
+        );
+        assert!(
+            std::os::unix::fs::symlink(&outside, root.join("js")).is_ok(),
+            "link js out of the root"
+        );
+        let mut manifest = WidgetManifest::default();
+        let result = admit_widget_file(&root, "js/x.js", &mut manifest);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            result,
+            Err(WidgetFileRefusal::Escapes(WidgetPathEscape::OutsideRoot))
+        );
+        assert!(
+            manifest.is_empty(),
+            "a refused file never enters the manifest"
+        );
+    }
+
+    /// An absent widget-hook file is reported missing, from the typed refusal.
+    #[test]
+    fn admit_widget_file_reports_missing() {
+        let dir = widget_scratch("missing");
+        let mut manifest = WidgetManifest::default();
+        let result = admit_widget_file(&dir, "js/none.js", &mut manifest);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(result, Err(WidgetFileRefusal::Missing));
+        assert!(
+            manifest.is_empty(),
+            "a refused file never enters the manifest"
+        );
+    }
+
     /// A widget hook that is a FIFO is refused at once, never waited on for a writer.
     #[cfg(unix)]
     #[test]
-    fn a_fifo_widget_hook_is_refused_not_hung() {
+    #[allow(clippy::expect_used)] // a failed thread spawn is a test-setup failure
+    fn admit_widget_file_refuses_fifo_without_blocking() {
         let dir = widget_scratch("fifo");
         let hook = dir.join("hook.js");
         let made = std::process::Command::new("mkfifo").arg(&hook).status();
@@ -3824,34 +4029,93 @@ mod tests {
             made.is_ok_and(|status| status.success()),
             "mkfifo creates the fixture"
         );
-        let contained = contained_path::ContainedRelPath::parse(&dir, "hook.js");
-        assert!(contained.is_ok(), "the FIFO lies inside the project");
-        let Ok(contained) = contained else {
-            return;
-        };
         let (sender, receiver) = std::sync::mpsc::channel();
         let root = dir.clone();
-        let resolved = contained.resolved().to_path_buf();
         std::thread::Builder::new()
             .spawn(move || {
-                let _ = sender.send(read_widget_hook(&root, &resolved));
+                let mut manifest = WidgetManifest::default();
+                let _ = sender.send(admit_widget_file(&root, "hook.js", &mut manifest));
             })
             .expect("spawn the bounded reader thread");
-        let result = receiver.recv_timeout(std::time::Duration::from_secs(10));
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(5));
         if result.is_err() {
             // A writer releases a reader stuck on the FIFO, so the process can exit.
             let _ = fs::OpenOptions::new().write(true).open(&hook);
         }
         let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            result,
+            Ok(Err(WidgetFileRefusal::Unreadable(
+                WidgetUnreadable::NotRegularFile
+            ))),
+            "a FIFO widget hook must be refused without blocking"
+        );
+    }
+
+    /// A widget hook one byte past the read cap is refused, naming the cap.
+    #[test]
+    #[allow(clippy::expect_used)] // the cap fits a host `usize`; a failure is a test-setup bug
+    fn admit_widget_file_refuses_oversized() {
+        let dir = widget_scratch("oversized");
+        let len = usize::try_from(crate::io_bounded::SMALL_FILE_READ_CAP + 1)
+            .expect("the cap fits usize");
         assert!(
-            matches!(
-                result,
-                Ok(Err(CliError::SourceRefused {
-                    reason: crate::io_bounded::SourceRefusal::NotRegularFile,
-                    ..
-                }))
-            ),
-            "a FIFO widget hook must be refused without blocking: {result:?}"
+            fs::write(dir.join("hook.js"), vec![b'a'; len]).is_ok(),
+            "write the oversized hook"
+        );
+        let mut manifest = WidgetManifest::default();
+        let result = admit_widget_file(&dir, "hook.js", &mut manifest);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            result,
+            Err(WidgetFileRefusal::Unreadable(WidgetUnreadable::TooLarge {
+                cap_bytes: crate::io_bounded::SMALL_FILE_READ_CAP,
+            }))
+        );
+        assert!(
+            manifest.is_empty(),
+            "a refused file never enters the manifest"
+        );
+    }
+
+    /// A widget hook that is not UTF-8 is refused by the typed UTF-8 proof.
+    #[test]
+    fn admit_widget_file_refuses_non_utf8() {
+        let dir = widget_scratch("non_utf8");
+        assert!(
+            fs::write(dir.join("hook.js"), [0xff_u8]).is_ok(),
+            "write the non-UTF-8 hook"
+        );
+        let mut manifest = WidgetManifest::default();
+        let result = admit_widget_file(&dir, "hook.js", &mut manifest);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            result,
+            Err(WidgetFileRefusal::Unreadable(WidgetUnreadable::NotUtf8))
+        );
+        assert!(
+            manifest.is_empty(),
+            "a refused file never enters the manifest"
+        );
+    }
+
+    /// The control: a present in-project hook is admitted under its minted tag.
+    #[test]
+    fn admit_widget_file_admits_present_file() {
+        let dir = widget_scratch("present");
+        assert!(fs::create_dir_all(dir.join("js")).is_ok(), "make js dir");
+        assert!(
+            fs::write(dir.join("js").join("a.js"), "customElements;").is_ok(),
+            "write the hook"
+        );
+        let mut manifest = WidgetManifest::default();
+        let result = admit_widget_file(&dir, "js/a.js", &mut manifest);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(result, Ok(()));
+        let tag = ipe_lower::custom_element_tag("js/a.js");
+        assert_eq!(
+            manifest.entries().collect::<Vec<_>>(),
+            vec![(tag.as_str(), "customElements;")]
         );
     }
 
@@ -3870,30 +4134,25 @@ mod tests {
         let Ok(contained) = contained else {
             return;
         };
-        let before = read_widget_hook(&dir, contained.resolved());
-        assert!(
-            before
-                .as_deref()
-                .is_ok_and(|text| text == "customElements;"),
-            "a regular in-project hook is read: {before:?}"
+        let cap = crate::io_bounded::SMALL_FILE_CAP;
+        let before = crate::io_bounded::read_beneath(&dir, contained.resolved(), cap);
+        assert_eq!(
+            before.as_deref(),
+            Ok("customElements;"),
+            "a regular in-project hook is read"
         );
         assert!(fs::remove_file(&hook).is_ok(), "remove hook");
         assert!(
             std::os::unix::fs::symlink(&planted, &hook).is_ok(),
             "swap in a link"
         );
-        let after = read_widget_hook(&dir, contained.resolved());
+        let after = crate::io_bounded::read_beneath(&dir, contained.resolved(), cap);
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&outside);
-        assert!(
-            matches!(
-                after,
-                Err(CliError::SourceRefused {
-                    reason: crate::io_bounded::SourceRefusal::Symlink,
-                    ..
-                })
-            ),
-            "a hook swapped for a link must be refused: {after:?}"
+        assert_eq!(
+            after,
+            Err(ipe_fs_open::OpenRefusal::Link),
+            "a hook swapped for a link must be refused"
         );
     }
 
