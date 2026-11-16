@@ -1929,6 +1929,202 @@ fn held_fsid(target: &Path) -> Result<u64, RunJailDefect> {
         })
 }
 
+/// The longest mount source name the kernel keeps whole (`MNAMELEN`).
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+const MNAMELEN: usize = 1024;
+
+/// What a nullfs bind of a held source must show once mounted.
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BindExpect<'a> {
+    /// The canonical spelling the bind is mounted from.
+    spelling: &'a Path,
+    /// The held source's identity.
+    id: ipe_fs_open::FileId,
+    /// The held source's inode number.
+    ino: u64,
+    /// The jail user's uid, for a read-write bind given to it.
+    rw_owner: Option<u32>,
+}
+
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+impl<'a> BindExpect<'a> {
+    /// The facts a bind of `held` must show, owned by `rw_owner` when given.
+    fn of(held: &'a HeldBind, rw_owner: Option<u32>) -> Self {
+        Self {
+            spelling: held.spelling.as_path(),
+            id: held.id,
+            ino: held.ino,
+            rw_owner,
+        }
+    }
+}
+
+/// What a mounted target reports, read through a held walk from `/`.
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MountedFacts {
+    /// The inode number of the mounted root.
+    ino: u64,
+    /// The owner of the mounted root.
+    uid: u32,
+    /// The filesystem id (`st_dev`) of the mounted root.
+    fsid: u64,
+    /// The filesystem id of the directory holding the target.
+    covered_fsid: u64,
+    /// The filesystem type name (`f_fstypename`).
+    fstype: Vec<u8>,
+    /// The mount source name (`f_mntfromname`).
+    mntfrom: Vec<u8>,
+}
+
+/// How a mounted bind differs from the source the launcher held.
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MountSubstituted {
+    /// The target shows a filesystem other than nullfs.
+    NotNullfs,
+    /// The target shows the filesystem of the directory holding it: no new
+    /// mount landed there.
+    NotANewMount,
+    /// The mount names a source other than the held spelling.
+    SpellingMismatch,
+    /// The held spelling is too long for the kernel to keep whole.
+    SpellingTooLong,
+    /// The mounted root is not the held source's inode.
+    InodeMismatch,
+    /// A read-write bind is not owned by the jail user.
+    OwnerMismatch,
+    /// The source spelling no longer names the held directory.
+    SourceMoved,
+}
+
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+impl std::fmt::Display for MountSubstituted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotNullfs => "the bind target does not show a nullfs mount",
+            Self::NotANewMount => "no new mount landed on the bind target",
+            Self::SpellingMismatch => "the bind names a source other than the held directory",
+            Self::SpellingTooLong => {
+                "the bind source path is too long for the kernel to record whole"
+            }
+            Self::InodeMismatch => "the bind target is not the held source directory",
+            Self::OwnerMismatch => "the writable bind is not owned by the jail user",
+            Self::SourceMoved => "the bind source no longer names the held directory",
+        })
+    }
+}
+
+/// Refuse a source spelling the kernel would truncate in `f_mntfromname`.
+///
+/// # Errors
+///
+/// [`MountSubstituted::SpellingTooLong`] at [`MNAMELEN`] bytes or more.
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+fn spelling_fits(spelling: &Path) -> Result<(), MountSubstituted> {
+    use std::os::unix::ffi::OsStrExt as _;
+    if spelling.as_os_str().as_bytes().len() >= MNAMELEN {
+        Err(MountSubstituted::SpellingTooLong)
+    } else {
+        Ok(())
+    }
+}
+
+/// Admit a mounted bind only when the target shows the held source.
+///
+/// The target must be a new nullfs mount named by the held spelling, its root
+/// the held inode, and a read-write bind owned by the jail user.
+///
+/// # Errors
+///
+/// The first [`MountSubstituted`] fact that differs.
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+pub(crate) fn verify_bind(
+    expected: &BindExpect<'_>,
+    observed: &MountedFacts,
+) -> Result<(), MountSubstituted> {
+    use std::os::unix::ffi::OsStrExt as _;
+    spelling_fits(expected.spelling)?;
+    if observed.fstype.as_slice() != b"nullfs" {
+        return Err(MountSubstituted::NotNullfs);
+    }
+    if observed.fsid == observed.covered_fsid {
+        return Err(MountSubstituted::NotANewMount);
+    }
+    if observed.mntfrom.as_slice() != expected.spelling.as_os_str().as_bytes() {
+        return Err(MountSubstituted::SpellingMismatch);
+    }
+    if observed.ino != expected.ino {
+        return Err(MountSubstituted::InodeMismatch);
+    }
+    if expected.rw_owner.is_some_and(|uid| uid != observed.uid) {
+        return Err(MountSubstituted::OwnerMismatch);
+    }
+    Ok(())
+}
+
+/// Admit a source re-held after its mount only when it is the held directory.
+///
+/// # Errors
+///
+/// [`MountSubstituted::SourceMoved`] when the identities differ.
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+fn rehold_verdict(
+    held: ipe_fs_open::FileId,
+    now: ipe_fs_open::FileId,
+) -> Result<(), MountSubstituted> {
+    if held == now {
+        Ok(())
+    } else {
+        Err(MountSubstituted::SourceMoved)
+    }
+}
+
+/// The bytes of a NUL-terminated C name, up to its first NUL.
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+fn c_name(chars: &[std::ffi::c_char]) -> Vec<u8> {
+    chars
+        .iter()
+        .map(|c| u8::from_ne_bytes(c.to_ne_bytes()))
+        .take_while(|byte| *byte != 0)
+        .collect()
+}
+
+/// Mount a nullfs bind through `mount`, record it for teardown, then refuse
+/// unless the target shows the held source `expected`.
+///
+/// The record is pushed before the verdict, so a substituted bind is still
+/// torn down; a mount whose facts cannot be read is never recorded.
+///
+/// # Errors
+///
+/// [`RunJailDefect::MountFailed`] naming the [`MountSubstituted`] fact, or the
+/// error of `mount`, `observe`, or `rehold`.
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+pub(crate) fn mount_bind_recorded(
+    mounted: &mut Vec<MountRecord>,
+    target: &Path,
+    expected: &BindExpect<'_>,
+    mount: impl FnOnce() -> Result<(), RunJailDefect>,
+    observe: impl FnOnce(&Path) -> Result<MountedFacts, RunJailDefect>,
+    rehold: impl FnOnce(&Path) -> Result<ipe_fs_open::FileId, RunJailDefect>,
+) -> Result<(), RunJailDefect> {
+    let substituted = |why: MountSubstituted| RunJailDefect::MountFailed {
+        target: target.to_path_buf(),
+        detail: why.to_string(),
+    };
+    spelling_fits(expected.spelling).map_err(substituted)?;
+    mount()?;
+    let facts = observe(target)?;
+    mounted.push(MountRecord {
+        target: target.to_path_buf(),
+        fsid: facts.fsid,
+    });
+    verify_bind(expected, &facts).map_err(substituted)?;
+    rehold_verdict(expected.id, rehold(expected.spelling)?).map_err(substituted)
+}
+
 // ── held handles for the FreeBSD jail's root acts ────────────────────────────
 
 /// The jail defect for the held-handle `refusal` met while holding `path`.
@@ -2416,10 +2612,11 @@ pub(crate) fn parse_jail_user(
 #[cfg(target_os = "freebsd")]
 mod freebsd_jail {
     use super::{
-        FreebsdMountOp, HeldJailDirs, HeldOwnership, JAIL_TMPFS_OPTIONS, JailOutcome, JailUser,
-        JailUserRefusal, MountRecord, Primitive, SafeMountPath, ViewDirTrust, apply_mount_ops,
-        canonical_prefix_spelling, fchown_held, freebsd_mount_ops, give_held, held_chain_facts,
-        held_fsid, hold_canonical, lstat_facts, macos_scrubbed_env, mount_recorded,
+        BindExpect, FreebsdMountOp, HeldBind, HeldJailDirs, HeldOwnership, JAIL_TMPFS_OPTIONS,
+        JailOutcome, JailUser, JailUserRefusal, MountRecord, MountedFacts, Primitive,
+        SafeMountPath, ViewDirTrust, apply_mount_ops, c_name, canonical_prefix_spelling,
+        fchown_held, freebsd_mount_ops, give_held, held_chain_facts, held_fsid, held_refusal,
+        hold_canonical, lstat_facts, macos_scrubbed_env, mount_bind_recorded, mount_recorded,
         outcome_after_restore, parse_jail_user, primitive_verdict, require_trusted_chain,
         still_mounted_there, umount_argv, under_root, view_trust,
     };
@@ -2550,7 +2747,7 @@ mod freebsd_jail {
             Ok(owner) => owner,
             Err(defect) => return JailOutcome::Unavailable { defect },
         };
-        let jail_root = match RoRootMount::establish(mounts, &tree) {
+        let jail_root = match RoRootMount::establish(mounts, &tree, &held, jail_user.uid.get()) {
             Ok(root) => root,
             Err(defect) => return JailOutcome::Unavailable { defect },
         };
@@ -2894,8 +3091,16 @@ mod freebsd_jail {
         ///
         /// Any missing primitive or failed mount — a mask included — refuses
         /// (`Err`), so the payload never runs against an incompletely-confined or
-        /// unmasked root.
-        fn establish(mounts: &JailMounts, tree: &TreeBind) -> Result<Self, RunJailDefect> {
+        /// unmasked root. Every nullfs bind mounts a source in `held` (or the
+        /// host root and the `/proc` mask source, held here) and is admitted only
+        /// when its target shows that held source, a writable one owned by
+        /// `jail_uid`.
+        fn establish(
+            mounts: &JailMounts,
+            tree: &TreeBind,
+            held: &HeldJailDirs,
+            jail_uid: u32,
+        ) -> Result<Self, RunJailDefect> {
             let mount_nullfs_bin = resolve_primitive(Primitive::MountNullfs)?;
             // `mount` is the stable primitive; FreeBSD does not ship a standalone
             // `mount_devfs` binary — devfs is mounted via `mount -t devfs devfs`.
@@ -2947,11 +3152,14 @@ mod freebsd_jail {
             //    before the jailed process starts — matching the Linux arm's fresh
             //    `--dev`/`--proc`, which mask the ro-bound host nodes.
             let root_target = mount.root.clone();
-            mount_recorded(
+            let host_root = HeldBind::hold(SafeMountPath::new(Path::new("/"))?)?;
+            mount_bind_recorded(
                 &mut mount.mounted,
                 &root_target,
+                &BindExpect::of(&host_root, None),
                 || mount_nullfs(&mount_nullfs_bin, true, Path::new("/"), &root_target),
-                held_fsid,
+                mounted_facts,
+                rehold,
             )?;
 
             // 2. A FRESH minimal devfs over the jail's `/dev`, layered on top of the
@@ -2985,11 +3193,14 @@ mod freebsd_jail {
             //    mount is read-only regardless, so `/proc` is truly immutable.
             let proc_target = under_root(&mount.root, &SafeMountPath::new(Path::new("/proc"))?);
             let proc_mask_source = mount.proc_mask_source.clone();
-            mount_recorded(
+            let held_mask_source = HeldBind::hold(SafeMountPath::new(&proc_mask_source)?)?;
+            mount_bind_recorded(
                 &mut mount.mounted,
                 &proc_target,
+                &BindExpect::of(&held_mask_source, None),
                 || mount_nullfs(&mount_nullfs_bin, true, &proc_mask_source, &proc_target),
-                held_fsid,
+                mounted_facts,
+                rehold,
             )?;
 
             // 4. The mount plan shared with the bwrap arm: every home and static
@@ -3001,7 +3212,7 @@ mod freebsd_jail {
             let plan = mount_plan(mounts.homes(), &binds).map_err(RunJailDefect::Path)?;
             let ops = freebsd_mount_ops(&mount.root, &plan)?;
             apply_mount_ops(&ops, |op| {
-                mount.mount_op(&mount_nullfs_bin, &mount_devfs_bin, op)
+                mount.mount_op(&mount_nullfs_bin, &mount_devfs_bin, op, held, jail_uid)
             })?;
 
             Ok(mount)
@@ -3009,32 +3220,93 @@ mod freebsd_jail {
 
         /// Apply one planned mount under the root and record it for teardown.
         ///
+        /// A bind mounts only a source in `held` and is admitted only when its
+        /// target shows that source, a writable one owned by `jail_uid`.
+        ///
         /// # Errors
         ///
-        /// [`RunJailDefect::MountFailed`] when the mountpoint cannot be made ready
-        /// or the mount itself fails.
+        /// [`RunJailDefect::MountFailed`] when the mountpoint cannot be made ready,
+        /// a bind source was not held, the mount itself fails, or the target does
+        /// not show the held source.
         fn mount_op(
             &mut self,
             mount_nullfs_bin: &Path,
             mount_bin: &Path,
             op: &FreebsdMountOp,
+            held: &HeldJailDirs,
+            jail_uid: u32,
         ) -> Result<(), RunJailDefect> {
             let target = op.target();
             self.ensure_mountpoint(mount_bin, target)?;
-            mount_recorded(
+            let (source, read_only) = match op {
+                FreebsdMountOp::Mask { .. } => {
+                    return mount_recorded(
+                        &mut self.mounted,
+                        target,
+                        || mount_tmpfs(mount_bin, target),
+                        held_fsid,
+                    );
+                }
+                FreebsdMountOp::ReadOnlyBind { source, .. } => (source, true),
+                FreebsdMountOp::ReadWriteBind { source, .. } => (source, false),
+            };
+            let bind = held
+                .binds()
+                .find(|bind| bind.spelling.as_path() == source.as_path())
+                .ok_or_else(|| RunJailDefect::MountFailed {
+                    target: target.to_path_buf(),
+                    detail: format!("the bind source {} was not held", source.display()),
+                })?;
+            let rw_owner = (!read_only).then_some(jail_uid);
+            mount_bind_recorded(
                 &mut self.mounted,
                 target,
-                || match op {
-                    FreebsdMountOp::Mask { .. } => mount_tmpfs(mount_bin, target),
-                    FreebsdMountOp::ReadOnlyBind { source, .. } => {
-                        mount_nullfs(mount_nullfs_bin, true, source, target)
-                    }
-                    FreebsdMountOp::ReadWriteBind { source, .. } => {
-                        mount_nullfs(mount_nullfs_bin, false, source, target)
-                    }
-                },
-                held_fsid,
+                &BindExpect::of(bind, rw_owner),
+                || mount_nullfs(mount_nullfs_bin, read_only, source, target),
+                mounted_facts,
+                rehold,
             )
+        }
+
+        /// What `target` shows once mounted, read through a held walk from `/`.
+        ///
+        /// # Errors
+        ///
+        /// As [`hold_canonical`], or [`RunJailDefect::MountFailed`] when the
+        /// target or its filesystem cannot be read.
+        fn mounted_facts(target: &Path) -> Result<MountedFacts, RunJailDefect> {
+            use std::os::unix::fs::MetadataExt as _;
+            let unreadable = |e: std::io::Error| RunJailDefect::MountFailed {
+                target: target.to_path_buf(),
+                detail: format!("could not read the mounted bind: {e}"),
+            };
+            let covered = target.parent().ok_or_else(|| RunJailDefect::MountFailed {
+                target: target.to_path_buf(),
+                detail: "a bind target names no directory holding it".to_owned(),
+            })?;
+            let mounted = hold_canonical(&SafeMountPath::new(target)?)?;
+            let meta = mounted.handle().metadata().map_err(unreadable)?;
+            let stat = rustix::fs::fstatfs(mounted.handle())
+                .map_err(|e| unreadable(std::io::Error::from(e)))?;
+            Ok(MountedFacts {
+                ino: meta.ino(),
+                uid: meta.uid(),
+                fsid: meta.dev(),
+                covered_fsid: held_fsid(covered)?,
+                fstype: c_name(&stat.f_fstypename),
+                mntfrom: c_name(&stat.f_mntfromname),
+            })
+        }
+
+        /// The identity `spelling` names now, re-held through a walk from `/`.
+        ///
+        /// # Errors
+        ///
+        /// As [`hold_canonical`], or the refusal of reading the held identity.
+        fn rehold(spelling: &Path) -> Result<ipe_fs_open::FileId, RunJailDefect> {
+            hold_canonical(&SafeMountPath::new(spelling)?)?
+                .id()
+                .map_err(|refusal| held_refusal(spelling, refusal))
         }
 
         /// Make `target` an existing directory that resolves to itself, named
@@ -5830,5 +6102,252 @@ mod held_chain_tests {
         assert_eq!(lstat_facts(&link).unwrap().kind, LevelKind::Link);
         let unread = held_fsid(&link.join("jail"));
         assert!(matches!(unread, Err(RunJailDefect::Path(_))), "{unread:?}");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod bind_tests {
+    use super::*;
+    use crate::test_dir::TestDir;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    const SOURCE: &str = "/usr/home/u/project";
+
+    fn held_id(path: &Path) -> ipe_fs_open::FileId {
+        hold_canonical(&SafeMountPath::new(path).unwrap())
+            .unwrap()
+            .id()
+            .unwrap()
+    }
+
+    fn expect(rw_owner: Option<u32>) -> BindExpect<'static> {
+        BindExpect {
+            spelling: Path::new(SOURCE),
+            id: held_id(Path::new("/")),
+            ino: 42,
+            rw_owner,
+        }
+    }
+
+    fn matching() -> MountedFacts {
+        MountedFacts {
+            ino: 42,
+            uid: 65534,
+            fsid: 7,
+            covered_fsid: 3,
+            fstype: b"nullfs".to_vec(),
+            mntfrom: SOURCE.as_bytes().to_vec(),
+        }
+    }
+
+    fn too_long() -> PathBuf {
+        PathBuf::from(format!("/{}", "a".repeat(MNAMELEN - 1)))
+    }
+
+    #[test]
+    fn verify_bind_accepts_the_matching_facts() {
+        assert_eq!(verify_bind(&expect(None), &matching()), Ok(()));
+        assert_eq!(verify_bind(&expect(Some(65534)), &matching()), Ok(()));
+    }
+
+    #[test]
+    fn verify_bind_refuses_an_inode_mismatch() {
+        let facts = MountedFacts {
+            ino: 43,
+            ..matching()
+        };
+        assert_eq!(
+            verify_bind(&expect(None), &facts),
+            Err(MountSubstituted::InodeMismatch)
+        );
+    }
+
+    #[test]
+    fn verify_bind_refuses_a_non_nullfs_mount() {
+        let facts = MountedFacts {
+            fstype: b"tmpfs".to_vec(),
+            ..matching()
+        };
+        assert_eq!(
+            verify_bind(&expect(None), &facts),
+            Err(MountSubstituted::NotNullfs)
+        );
+    }
+
+    #[test]
+    fn verify_bind_refuses_a_mount_sharing_the_covered_fsid() {
+        let facts = MountedFacts {
+            covered_fsid: 7,
+            ..matching()
+        };
+        assert_eq!(
+            verify_bind(&expect(None), &facts),
+            Err(MountSubstituted::NotANewMount)
+        );
+    }
+
+    #[test]
+    fn verify_bind_refuses_a_different_mntfrom_spelling() {
+        for other in ["/usr/home/u/project2", "/usr/home/u", "/tmp/project"] {
+            let facts = MountedFacts {
+                mntfrom: other.as_bytes().to_vec(),
+                ..matching()
+            };
+            assert_eq!(
+                verify_bind(&expect(None), &facts),
+                Err(MountSubstituted::SpellingMismatch),
+                "{other}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_bind_refuses_a_spelling_at_mnamelen() {
+        let at = too_long();
+        assert_eq!(at.as_os_str().as_bytes().len(), MNAMELEN);
+        let below = PathBuf::from(format!("/{}", "a".repeat(MNAMELEN - 2)));
+        assert_eq!(spelling_fits(&below), Ok(()));
+        let expected = BindExpect {
+            spelling: &at,
+            ..expect(None)
+        };
+        let facts = MountedFacts {
+            mntfrom: at.as_os_str().as_bytes().to_vec(),
+            ..matching()
+        };
+        assert_eq!(
+            verify_bind(&expected, &facts),
+            Err(MountSubstituted::SpellingTooLong)
+        );
+    }
+
+    #[test]
+    fn verify_bind_refuses_an_rw_bind_not_owned_by_the_jail_user() {
+        assert_eq!(
+            verify_bind(&expect(Some(1001)), &matching()),
+            Err(MountSubstituted::OwnerMismatch)
+        );
+    }
+
+    #[test]
+    fn c_name_stops_at_the_first_nul() {
+        let chars = |bytes: &[u8]| -> Vec<std::ffi::c_char> {
+            bytes
+                .iter()
+                .map(|byte| std::ffi::c_char::from_ne_bytes(byte.to_ne_bytes()))
+                .collect()
+        };
+        assert_eq!(c_name(&chars(b"nullfs\0junk")), b"nullfs".to_vec());
+        assert_eq!(c_name(&chars(b"ab")), b"ab".to_vec());
+    }
+
+    #[test]
+    fn a_substituted_bind_is_recorded_for_teardown_before_refusal() {
+        let target = Path::new("/jail/root/usr/home/u/project");
+        let mut mounted = Vec::new();
+        let mut reheld = false;
+        let outcome = mount_bind_recorded(
+            &mut mounted,
+            target,
+            &expect(None),
+            || Ok(()),
+            |_| {
+                Ok(MountedFacts {
+                    ino: 99,
+                    ..matching()
+                })
+            },
+            |_| {
+                reheld = true;
+                Ok(held_id(Path::new("/")))
+            },
+        );
+        let refused = MountSubstituted::InodeMismatch.to_string();
+        assert!(
+            matches!(&outcome, Err(RunJailDefect::MountFailed { target: at, detail }) if at == target && *detail == refused),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            mounted,
+            vec![MountRecord {
+                target: target.to_path_buf(),
+                fsid: 7,
+            }]
+        );
+        assert!(!reheld, "a refused bind is not re-held");
+    }
+
+    #[test]
+    fn a_too_long_spelling_refuses_before_any_mount() {
+        let at = too_long();
+        let expected = BindExpect {
+            spelling: &at,
+            ..expect(None)
+        };
+        let mut mounted = Vec::new();
+        let mut ran = false;
+        let outcome = mount_bind_recorded(
+            &mut mounted,
+            Path::new("/jail/root/a"),
+            &expected,
+            || {
+                ran = true;
+                Ok(())
+            },
+            |_| Ok(matching()),
+            |_| Ok(held_id(Path::new("/"))),
+        );
+        assert!(
+            matches!(&outcome, Err(RunJailDefect::MountFailed { .. })),
+            "{outcome:?}"
+        );
+        assert!(!ran, "the mount never runs");
+        assert!(mounted.is_empty());
+    }
+
+    #[test]
+    fn a_source_rehold_with_another_id_refuses() {
+        let t = TestDir::new("bind-rehold").unwrap();
+        let base = std::fs::canonicalize(t.path()).unwrap();
+        let (held_dir, other) = (base.join("held"), base.join("other"));
+        std::fs::create_dir(&held_dir).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let held = HeldBind::hold(SafeMountPath::new(&held_dir).unwrap()).unwrap();
+        let other_id = held_id(&other);
+        assert_eq!(rehold_verdict(held.id, held_id(&held_dir)), Ok(()));
+        assert_eq!(
+            rehold_verdict(held.id, other_id),
+            Err(MountSubstituted::SourceMoved)
+        );
+        let target = Path::new("/jail/root/held");
+        let facts = || MountedFacts {
+            ino: held.ino,
+            mntfrom: held_dir.as_os_str().as_bytes().to_vec(),
+            ..matching()
+        };
+        let mut mounted = Vec::new();
+        let outcome = mount_bind_recorded(
+            &mut mounted,
+            target,
+            &BindExpect::of(&held, None),
+            || Ok(()),
+            |_| Ok(facts()),
+            |_| Ok(other_id),
+        );
+        let moved = MountSubstituted::SourceMoved.to_string();
+        assert!(
+            matches!(&outcome, Err(RunJailDefect::MountFailed { detail, .. }) if *detail == moved),
+            "{outcome:?}"
+        );
+        assert_eq!(mounted.len(), 1, "the moved bind is still torn down");
+        let admitted = mount_bind_recorded(
+            &mut Vec::new(),
+            target,
+            &BindExpect::of(&held, None),
+            || Ok(()),
+            |_| Ok(facts()),
+            |spelling| Ok(held_id(spelling)),
+        );
+        assert_eq!(admitted, Ok(()));
     }
 }
