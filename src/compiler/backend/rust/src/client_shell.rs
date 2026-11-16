@@ -418,6 +418,64 @@ mod tests {
         }
     }
 
+    /// The items `site.rs` declares, by kind and name, and `SITE_CONFIG`'s
+    /// fields with their string values.
+    ///
+    /// Read through Rust's own grammar, so text inside a literal is never
+    /// mistaken for syntax; a field whose value is not a string literal reads
+    /// as `None`.
+    fn site_structure(site_rs: &str) -> Option<SiteStructure> {
+        let file = syn::parse_file(site_rs).ok()?;
+        let items = file
+            .items
+            .iter()
+            .map(|item| match item {
+                syn::Item::Use(_) => "use".to_owned(),
+                syn::Item::Static(item) => format!("static {}", item.ident),
+                _ => "other".to_owned(),
+            })
+            .collect();
+        let config = file.items.iter().find_map(|item| match item {
+            syn::Item::Static(item) if item.ident == "SITE_CONFIG" => Some(item.expr.as_ref()),
+            _ => None,
+        })?;
+        let syn::Expr::Struct(config) = config else {
+            return None;
+        };
+        if config.rest.is_some() {
+            return None;
+        }
+        let fields = config
+            .fields
+            .iter()
+            .map(|field| {
+                let name = match &field.member {
+                    syn::Member::Named(id) => id.to_string(),
+                    syn::Member::Unnamed(index) => index.index.to_string(),
+                };
+                let value = match &field.expr {
+                    syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(lit),
+                        ..
+                    }) => Some(lit.value()),
+                    _ => None,
+                };
+                (name, value)
+            })
+            .collect();
+        Some(SiteStructure { items, fields })
+    }
+
+    /// What [`site_structure`] reads from a `site.rs`.
+    #[derive(Debug, PartialEq, Eq)]
+    struct SiteStructure {
+        items: Vec<String>,
+        fields: Vec<(String, Option<String>)>,
+    }
+
+    /// A hostile title stays inside the `title` literal: `site.rs` parses to
+    /// its three items and `SITE_CONFIG` to its five fields, each once, with
+    /// the title and storage key read back unchanged.
     #[test]
     fn client_shell_title_is_one_escaped_literal() {
         let hostile = "x\", storage_key: \"evil\" }; fn main() {} //\n\u{202e}\\";
@@ -429,18 +487,23 @@ mod tests {
             assert!(file(&project, "src/site.rs").is_some());
             return;
         };
-        let title_line = site_rs
-            .lines()
-            .find(|line| line.trim_start().starts_with("title: "))
-            .unwrap_or_default();
-        assert_eq!(
-            title_line.trim(),
-            format!("title: {},", rust_str_lit(hostile)),
-            "{site_rs}"
-        );
-        assert_eq!(site_rs.matches("storage_key: ").count(), 1, "{site_rs}");
+        let field = |name: &str, value: Option<&str>| (name.to_owned(), value.map(str::to_owned));
+        let expected = SiteStructure {
+            items: vec![
+                "use".to_owned(),
+                "static ASSETS".to_owned(),
+                "static SITE_CONFIG".to_owned(),
+            ],
+            fields: vec![
+                field("title", Some(hostile)),
+                field("storage_key", Some("dev.ipe.example")),
+                field("base", Some(MountBase::root().prefix())),
+                field("csp", Some("default-src 'none'")),
+                field("assets", None),
+            ],
+        };
+        assert_eq!(site_structure(site_rs), Some(expected), "{site_rs}");
         assert!(!site_rs.contains('\u{202e}'), "{site_rs}");
-        assert!(!site_rs.contains("fn main"), "{site_rs}");
     }
 
     #[test]
