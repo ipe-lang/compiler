@@ -1753,19 +1753,19 @@ impl HeldJailDirs {
         mounts: &JailMounts,
         tree: &crate::mounts::TreeBind,
     ) -> Result<Self, RunJailDefect> {
-        let hold = |path: &crate::CanonicalPath| {
+        let hold_source = |path: &crate::CanonicalPath| {
             SafeMountPath::new(path.as_path()).and_then(HeldBind::hold)
         };
         let held = Self {
-            scratch: hold(mounts.scoped_tmp())?,
+            scratch: hold_source(mounts.scoped_tmp())?,
             tree: tree
                 .writable()
-                .map(|writable| hold(writable.tree()))
+                .map(|writable| hold_source(writable.tree()))
                 .transpose()?,
             read_only: mounts
                 .read_only()
                 .iter()
-                .map(hold)
+                .map(hold_source)
                 .collect::<Result<_, _>>()?,
         };
         held.refuse_cargo_identity(mounts.cargo_home())?;
@@ -4735,10 +4735,12 @@ mod held_tests {
         Ok(())
     }
 
+    #[allow(clippy::unwrap_used)] // a test fixture path is always mountable
     fn safe(path: &Path) -> SafeMountPath {
         SafeMountPath::new(path).unwrap()
     }
 
+    #[allow(clippy::unwrap_used)] // a test fixture directory always opens
     fn id_of(path: &Path) -> FileId {
         HeldDir::open_root(path).unwrap().id().unwrap()
     }
