@@ -825,23 +825,9 @@ impl<'a> BundleAssembler<'a> {
         os: pack::desktop::DesktopOs,
         storage_key: &ipe_runtime_rust::app_data::StorageKey,
     ) -> Result<(), CliError> {
-        use ipe_runtime_rust::csp;
-
         let manifest = self.manifest();
         let pin = pack::mobile::ManifestPin::of(manifest);
-        let reach = pin
-            .reach(csp::BundleHost::DesktopScheme(os.scheme_spelling()))
-            .map_err(|refusal| match refusal {
-                pack::mobile::MobileRefusal::AssetOriginListed { origin } => {
-                    ClientDesktopRefusal::LocalOrigin {
-                        origin: origin.https(),
-                    }
-                    .into_cli()
-                }
-                other => CliError::ProjectRefused(text::Message::relay(&other)),
-            })?;
-        let policy = csp::ContentSecurityPolicy::for_bundle(&reach, csp::BundleWorker::None);
-        let swaps = pin.policy_swaps(&reach);
+        let (swaps, header) = client_desktop_policy(&pin, os)?;
 
         let project = ProjectPaths::from_manifest(manifest);
         let wasm_root = self.finish.wasm_root()?;
@@ -858,19 +844,7 @@ impl<'a> BundleAssembler<'a> {
         let shell_target = self.finish.shell_target();
         let shell_dir = shell_target.claim()?;
         let (_, paths) = crate::bundle_www::publish_policed_www(&wasm_crate, &shell_dir, &swaps)?;
-        let site = ipe_backend_rust::client_shell::ShellSite::new(
-            &manifest.name,
-            storage_key,
-            pin.base().clone(),
-            &policy.header_value(),
-            paths,
-        )
-        .map_err(|refusal| {
-            backend_invariant_err(ipe_diagnostics::Diagnostic::CompilerBug {
-                where_: "client desktop shell table",
-                detail: format!("the published bundle is not a shell table: {refusal}"),
-            })
-        })?;
+        let site = client_shell_site(&manifest.name, storage_key, &pin, &header, paths)?;
         let emitted = ipe_backend_rust::client_shell::emit_client_shell(&site)
             .map_err(backend_invariant_err)?;
         let crate_dir = write_emitted_project(
@@ -927,6 +901,64 @@ impl<'a> BundleAssembler<'a> {
             .emit();
         Ok(())
     }
+}
+
+/// The client desktop page's policy swaps and its shell's header, rendered from one reach.
+///
+/// The header is the worker-free bundle policy. The gate refuses push, so the
+/// one served meta the page can hold is the worker-free one, and its swap
+/// renders the same value the header carries.
+///
+/// # Errors
+/// [`CliError::ProjectRefused`] carrying [`ClientDesktopRefusal::LocalOrigin`]
+/// for a pinned loopback server, or relaying the reach's other refusal.
+fn client_desktop_policy(
+    pin: &pack::mobile::ManifestPin,
+    os: pack::desktop::DesktopOs,
+) -> Result<(Vec<crate::bundle_www::PolicySwap>, String), CliError> {
+    use ipe_runtime_rust::csp;
+
+    let reach = pin
+        .reach(csp::BundleHost::DesktopScheme(os.scheme_spelling()))
+        .map_err(|refusal| match refusal {
+            pack::mobile::MobileRefusal::AssetOriginListed { origin } => {
+                ClientDesktopRefusal::LocalOrigin {
+                    origin: origin.https(),
+                }
+                .into_cli()
+            }
+            other => CliError::ProjectRefused(text::Message::relay(&other)),
+        })?;
+    let header =
+        csp::ContentSecurityPolicy::for_bundle(&reach, csp::BundleWorker::None).header_value();
+    Ok((pin.policy_swaps(&reach), header))
+}
+
+/// The shell table for the bundle published at `paths`, keyed by `storage_key`.
+///
+/// # Errors
+/// A compiler bug when the published bundle is not a shell table: a
+/// published `www/` always holds `index.html` and no path twice.
+fn client_shell_site(
+    name: &str,
+    storage_key: &ipe_runtime_rust::app_data::StorageKey,
+    pin: &pack::mobile::ManifestPin,
+    header: &str,
+    paths: Vec<ipe_runtime_rust::encoding::BundlePath>,
+) -> Result<ipe_backend_rust::client_shell::ShellSite, CliError> {
+    ipe_backend_rust::client_shell::ShellSite::new(
+        name,
+        storage_key,
+        pin.base().clone(),
+        header,
+        paths,
+    )
+    .map_err(|refusal| {
+        backend_invariant_err(ipe_diagnostics::Diagnostic::CompilerBug {
+            where_: "client desktop shell table",
+            detail: format!("the published bundle is not a shell table: {refusal}"),
+        })
+    })
 }
 
 /// The note shown under a materialised mobile shell: the platform note, and —
@@ -5002,6 +5034,295 @@ mod mobile_base_tests {
         let _ = std::fs::remove_dir_all(manifest.parent().expect("project root"));
         assert!(result.is_ok(), "{result:?}");
         assert!(built.get(), "the build step runs before the re-read");
+    }
+
+    /// The bundle id grammar implies the storage key grammar, refused only as a device name.
+    ///
+    /// Over a generated corpus (every one- to three-label join of labels that
+    /// cover each refusal class, ids at the length ceiling, foreign bytes, and
+    /// a seeded sweep over the bundle id alphabet), an id `BundleId` accepts is
+    /// a `StorageKey` or is refused only as a DOS device name; and an id
+    /// `BundleId` refuses for a reason the two grammars share is refused by
+    /// `StorageKey` for that same reason.
+    #[test]
+    fn bundle_id_grammar_implies_storage_key() {
+        use ipe_runtime_rust::app_data::{MAX_BUNDLE_ID_LEN, StorageKey, StorageKeyRefusal};
+        use ipe_runtime_rust::path_core::ElementRefusal;
+        use project::BundleIdRefusal;
+
+        const LABELS: &[&str] = &[
+            "", "a", "acme", "Acme", "1st", "a1", "con", "CON", "Con", "nul", "aux", "prn", "com1",
+            "COM9", "lpt1", "com0", "conx", "class", "java", "x", "Z9",
+        ];
+        const ALPHABET: &[u8] =
+            b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789....";
+        let mut corpus: Vec<String> = Vec::new();
+        for a in LABELS {
+            corpus.push((*a).to_owned());
+            for b in LABELS {
+                corpus.push(format!("{a}.{b}"));
+                for c in LABELS {
+                    corpus.push(format!("{a}.{b}.{c}"));
+                }
+            }
+        }
+        for len in [MAX_BUNDLE_ID_LEN, MAX_BUNDLE_ID_LEN + 1] {
+            corpus.push(format!("a.{}", "b".repeat(len - 2)));
+            corpus.push(format!("con.{}", "b".repeat(len - 4)));
+        }
+        for foreign in [
+            "a-b.c",
+            "a_b.c",
+            "a b.c",
+            "a/b.c",
+            "a\\b.c",
+            "caf\u{e9}.a",
+            "a:b.c",
+        ] {
+            corpus.push(foreign.to_owned());
+        }
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            usize::try_from(state >> 33).unwrap_or_default()
+        };
+        for _ in 0..20_000 {
+            let len = next() % 24 + 1;
+            let id: String = (0..len)
+                .filter_map(|_| {
+                    ALPHABET
+                        .get(next() % ALPHABET.len())
+                        .copied()
+                        .map(char::from)
+                })
+                .collect();
+            corpus.push(id);
+        }
+
+        let (mut accepted, mut devices) = (0_usize, 0_usize);
+        for id in &corpus {
+            let key = StorageKey::parse(id);
+            match project::BundleId::parse(id) {
+                Ok(_) => {
+                    accepted += 1;
+                    if key == Err(StorageKeyRefusal::Element(ElementRefusal::DosDevice)) {
+                        devices += 1;
+                    } else {
+                        assert!(key.is_ok(), "{id:?} is a bundle id: {key:?}");
+                    }
+                }
+                Err(refusal) => {
+                    let shared = match refusal {
+                        BundleIdRefusal::Empty => Some(StorageKeyRefusal::Empty),
+                        BundleIdRefusal::TooLong { .. } => Some(StorageKeyRefusal::TooLong),
+                        BundleIdRefusal::Byte { .. } => Some(StorageKeyRefusal::Byte),
+                        BundleIdRefusal::EmptyLabel => Some(StorageKeyRefusal::EmptyLabel),
+                        BundleIdRefusal::OneLabel => Some(StorageKeyRefusal::OneLabel),
+                        BundleIdRefusal::LabelStartsWithDigit
+                        | BundleIdRefusal::ReservedWord { .. }
+                        | BundleIdRefusal::JavaPlatformPackage
+                        | BundleIdRefusal::StoreReserved { .. } => None,
+                    };
+                    if let Some(expected) = shared {
+                        assert_eq!(key, Err(expected), "{id:?} is refused as {refusal:?}");
+                    }
+                }
+            }
+        }
+        assert!(
+            devices > 0,
+            "the corpus reaches a device name the bundle grammar admits"
+        );
+        assert!(
+            accepted > devices,
+            "the corpus reaches an admitted storage key"
+        );
+    }
+
+    /// A claimed wasm crate whose `www/` holds `index.html` as `page` plus `extra`, and a claimed shell crate.
+    fn client_bundle(
+        tag: &str,
+        page: &str,
+        extra: &[&str],
+    ) -> (
+        PathBuf,
+        crate::output_dir::OwnedDir,
+        crate::output_dir::OwnedDir,
+    ) {
+        let root = ipe_test_temp::temp_root()
+            .join(format!("ipe_client_desktop_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create the scratch root");
+        let wasm_crate =
+            crate::output_dir::OwnedDir::claim(&root.join("rust")).expect("claim the wasm crate");
+        let www = wasm_crate.path().join("www");
+        std::fs::create_dir_all(&www).expect("create www/");
+        std::fs::write(www.join("index.html"), page).expect("write index.html");
+        for name in extra {
+            std::fs::write(www.join(name), b"x").expect("write the asset");
+        }
+        let shell =
+            crate::output_dir::OwnedDir::claim(&root.join("shell")).expect("claim the shell");
+        (root, wasm_crate, shell)
+    }
+
+    /// The page a client desktop's wasm build renders: its served bundle policy meta, worker-free.
+    fn served_page(pin: &pack::mobile::ManifestPin) -> Option<String> {
+        use ipe_runtime_rust::csp;
+        let reach = pin.reach(csp::BundleHost::Served).ok()?;
+        let meta =
+            csp::ContentSecurityPolicy::for_bundle(&reach, csp::BundleWorker::None).meta_element();
+        Some(format!("<html><head>{meta}</head><body></body></html>"))
+    }
+
+    /// The value of the one `<meta http-equiv="Content-Security-Policy">` in `page`.
+    fn meta_policy(page: &str) -> Option<&str> {
+        let (_, after) = page.split_once("http-equiv=\"Content-Security-Policy\" content=\"")?;
+        after.split_once('"').map(|(value, _)| value)
+    }
+
+    /// The packed page's policy meta and the shell's header carry one value, on every desktop OS.
+    ///
+    /// The page holds the meta the wasm build renders; the client desktop's
+    /// own publish swaps it under the swaps [`client_desktop_policy`] returns,
+    /// and the swapped meta's value is the header it returns beside them.
+    #[test]
+    fn client_desktop_page_and_header_carry_one_policy() {
+        let manifest = client_desktop_project(
+            "client_desktop_one_policy",
+            "{ bundleId = \"io.acme.app\" }",
+        );
+        let gated = validate_client_desktop_pack(&manifest, delivery::Shape::Web);
+        assert!(gated.is_ok(), "{gated:?}");
+        let pin = pack::mobile::ManifestPin::of(&manifest);
+        let Some(page) = served_page(&pin) else {
+            assert!(served_page(&pin).is_some());
+            return;
+        };
+        for os in [
+            pack::desktop::DesktopOs::Linux,
+            pack::desktop::DesktopOs::MacOs,
+            pack::desktop::DesktopOs::Windows,
+        ] {
+            let policy = client_desktop_policy(&pin, os);
+            let Ok((swaps, header)) = policy else {
+                assert!(policy.is_ok(), "{os:?}: {policy:?}");
+                return;
+            };
+            let (root, wasm_crate, shell) =
+                client_bundle(&format!("one_policy_{}", os.as_str()), &page, &[]);
+            let published = crate::bundle_www::publish_policed_www(&wasm_crate, &shell, &swaps);
+            let packed = published
+                .as_ref()
+                .ok()
+                .and_then(|(www, _)| std::fs::read_to_string(www.join("index.html")).ok());
+            let _ = std::fs::remove_dir_all(&root);
+            let Some(packed) = packed else {
+                assert!(published.is_ok(), "{os:?}: {published:?}");
+                return;
+            };
+            let shown = ipe_runtime_rust::escape::html_attr(&header);
+            assert_eq!(
+                meta_policy(&packed),
+                Some(shown.as_str()),
+                "{os:?}: {packed}"
+            );
+            assert_eq!(
+                packed
+                    .matches("http-equiv=\"Content-Security-Policy\"")
+                    .count(),
+                1,
+                "{packed}"
+            );
+        }
+    }
+
+    /// The client desktop's publish refuses an asset whose name the bundle path grammar cannot carry.
+    ///
+    /// The refusal is the exact `NotABundlePath` for that name, and no `www/`
+    /// is published into the shell crate.
+    #[test]
+    fn client_desktop_refuses_an_asset_outside_the_bundle_path_grammar() {
+        use ipe_runtime_rust::encoding::BundlePathRefusal;
+        let manifest =
+            client_desktop_project("client_desktop_bad_asset", "{ bundleId = \"io.acme.app\" }");
+        let pin = pack::mobile::ManifestPin::of(&manifest);
+        let policy = client_desktop_policy(&pin, pack::desktop::DesktopOs::Linux);
+        let (Some(page), Ok((swaps, _))) = (served_page(&pin), &policy) else {
+            assert!(policy.is_ok(), "{policy:?}");
+            assert!(served_page(&pin).is_some());
+            return;
+        };
+        for (tag, name, byte) in [
+            ("space", "a b.js", b' '),
+            ("non_ascii", "caf\u{e9}.js", 0xC3),
+        ] {
+            let (root, wasm_crate, shell) =
+                client_bundle(&format!("bad_asset_{tag}"), &page, &[name]);
+            let published = crate::bundle_www::publish_policed_www(&wasm_crate, &shell, swaps);
+            let www_published = shell.path().join("www").exists();
+            let _ = std::fs::remove_dir_all(&root);
+            let refusal = text::Message::relay(&crate::bundle_www::BundleError::NotABundlePath {
+                path: name.to_owned(),
+                reason: BundlePathRefusal::Reserved { byte },
+            });
+            assert!(
+                matches!(&published, Err(CliError::ProjectRefused(shown)) if shown.as_str() == refusal.as_str()),
+                "{name}: {published:?}"
+            );
+            assert!(!www_published, "{name}: nothing is published");
+        }
+    }
+
+    /// The shell table carries the folded storage key the gate proved, never the bundle id as written.
+    #[test]
+    fn client_desktop_site_carries_the_storage_key() {
+        let manifest =
+            client_desktop_project("client_desktop_site_key", "{ bundleId = \"io.Acme.App\" }");
+        let key = validate_client_desktop_pack(&manifest, delivery::Shape::Web);
+        let Ok(key) = key else {
+            assert!(key.is_ok(), "{key:?}");
+            return;
+        };
+        let pin = pack::mobile::ManifestPin::of(&manifest);
+        let index = ipe_runtime_rust::encoding::BundlePath::parse("index.html");
+        let Ok(index) = index else {
+            assert!(index.is_ok(), "{index:?}");
+            return;
+        };
+        let site = client_shell_site(
+            &manifest.name,
+            &key,
+            &pin,
+            "default-src 'none'",
+            vec![index],
+        );
+        let emitted = site
+            .as_ref()
+            .ok()
+            .and_then(|site| ipe_backend_rust::client_shell::emit_client_shell(site).ok());
+        let Some(emitted) = emitted else {
+            assert!(site.is_ok(), "{site:?}");
+            return;
+        };
+        let site_rs = emitted
+            .files
+            .iter()
+            .find(|(path, _)| path.as_str() == "src/site.rs")
+            .map(|(_, text)| text.as_str())
+            .unwrap_or_default();
+        let line = format!(
+            "    storage_key: {},",
+            ipe_intern::rust_str_lit("io.acme.app")
+        );
+        assert_eq!(
+            site_rs.lines().filter(|l| *l == line).count(),
+            1,
+            "{site_rs}"
+        );
+        assert!(!site_rs.contains("io.Acme.App"), "{site_rs}");
     }
 }
 
