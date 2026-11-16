@@ -19,6 +19,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::indexing_slicing)]
 
 use std::ffi::{OsStr, OsString};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use ipe_sandbox::build_jail::{CapabilityAxis, JailOutcome, build_in_jail};
@@ -163,7 +164,6 @@ fn a_benign_in_scratch_write_is_clean() {
 /// what that bind shows, so the jail refuses to establish.
 #[test]
 fn a_mountpoint_tmpfs_inside_an_earlier_bind_refuses_the_jail() {
-    use std::os::unix::fs::PermissionsExt;
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
