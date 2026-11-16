@@ -688,6 +688,12 @@ const UNROUTED: &[(&str, &str, usize, &str)] = &[
     (
         "health.rs",
         "apply_config_edit",
+        1,
+        "a toolchain or tool-install failure: neither an argument nor the project",
+    ),
+    (
+        "health.rs",
+        "edit_config",
         2,
         "a toolchain or tool-install failure: neither an argument nor the project",
     ),

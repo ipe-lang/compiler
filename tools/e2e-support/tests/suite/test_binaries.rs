@@ -380,6 +380,7 @@ const TEST_BINARIES: &[(&str, &str, Reason)] = &[
         Reason::Unconsolidated,
     ),
     ("ipe", "usage_route_scan", Reason::Unconsolidated),
+    ("ipe", "user_file_write_scan", Reason::DedicatedJob),
     ("ipe", "verb_prose_ratchet", Reason::Unconsolidated),
     ("ipe", "verify", Reason::Unconsolidated),
     ("ipe", "wasi_run_ceilings", Reason::Unconsolidated),

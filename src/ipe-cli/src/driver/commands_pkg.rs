@@ -8,6 +8,7 @@ use super::{
     runtime_context_for_message, working_dir,
 };
 use crate::cargo_step::{CargoOutput, CargoTarget, TestRunKey, Verbosity};
+use crate::output_dir::held::{BACKUP_SLOTS, BackedUp, HeldDir, RelativeLeaf};
 use crate::output_dir::{
     EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths, ReleaseMember,
 };
@@ -3802,8 +3803,9 @@ pub fn line_col(src: &str, offset: usize) -> (usize, usize) {
 /// [`SourceSnapshot`](crate::source_snapshot::SourceSnapshot) of `root` —
 /// never by a reduced single-module resolution, so a name the build binds
 /// through an import is never "corrected". No file names every entry of the
-/// project, each fixed in turn. A diagnostic another module owns is reported,
-/// never patched.
+/// project, each fixed in turn: an entry's refusal never stops the next, and
+/// the refusals are returned once every entry was tried. A diagnostic another
+/// module owns is reported, never patched.
 ///
 /// `auto` (set by `--yes` / `--fix`) is durable authorization to apply every
 /// edit without prompting; otherwise each edit is confirmed interactively on
@@ -3819,7 +3821,8 @@ pub fn line_col(src: &str, offset: usize) -> (usize, usize) {
 /// The refusal of a project context that cannot be built (an unreadable or
 /// malformed manifest, a module that cannot be read); [`CliError::Io`] on a
 /// filesystem failure; [`CliError::ThreadRefused`] when the OS refuses the
-/// compile thread.
+/// compile thread; past the entries, the one entry's refusal, or
+/// [`CliError::ProjectRefused`] when several entries were left unfixed.
 pub fn apply_fixes_cmd<W: Write + Send>(
     root: &ProjectRoot,
     file: Option<&FileArg>,
@@ -3828,11 +3831,40 @@ pub fn apply_fixes_cmd<W: Write + Send>(
 ) -> Result<(), CliError> {
     let target = analysis_target(root, file)?;
     crate::threads::run_compile(|| {
-        for graph in analysis_graphs(&target)? {
-            fix_entry(graph, auto, w)?;
-        }
-        Ok(())
+        let failed: Vec<CliError> = analysis_graphs(&target)?
+            .into_iter()
+            .filter_map(|graph| fix_entry(graph, auto, w).err())
+            .collect();
+        entries_outcome(failed, w)
     })?
+}
+
+/// The outcome of fixing every entry, each tried whatever another's fate: the one refusal as it is, several reported on `w` and refused together.
+///
+/// # Errors
+/// The lone entry's own refusal; [`CliError::ProjectRefused`] naming how many
+/// entries were left unfixed when more than one was.
+pub(super) fn entries_outcome<W: Write>(
+    mut failed: Vec<CliError>,
+    w: &mut W,
+) -> Result<(), CliError> {
+    match failed.len() {
+        0 => Ok(()),
+        1 => failed.pop().map_or(Ok(()), Err),
+        count => {
+            for error in failed {
+                writeln!(w, "{}", text::msg::fix_entry_failed(&error)).map_err(|e| {
+                    CliError::Io {
+                        path: PathBuf::from("<stdout>"),
+                        source: e,
+                    }
+                })?;
+            }
+            Err(CliError::ProjectRefused(text::msg::fix_entries_failed(
+                &count,
+            )))
+        }
+    }
 }
 
 /// Fix the entry of one source graph; every report names the entry's file.
@@ -3889,9 +3921,7 @@ fn fix_entry<W: Write>(mut graph: SourceGraph, auto: bool, w: &mut W) -> Result<
         return Ok(());
     }
 
-    let IfUnchanged::Written(backup) =
-        rewrite_user_file_if_unchanged(&entry_real, &source, &patched, RewriteKind::Lossy)?
-    else {
+    let FixWrite::Applied(backup) = write_fix(entry, &entry_real, &source, &patched)? else {
         writeln!(
             w,
             "fix: {} changed while it was being fixed — file left unchanged",
@@ -3907,10 +3937,60 @@ fn fix_entry<W: Write>(mut graph: SourceGraph, auto: bool, w: &mut W) -> Result<
         entry.display()
     )
     .map_err(|e| io_err(entry, e))?;
-    if let Some(backup) = backup {
-        writeln!(w, "fix: original kept at {}", backup.display()).map_err(|e| io_err(entry, e))?;
-    }
+    writeln!(w, "fix: original kept at {}", backup.display()).map_err(|e| io_err(entry, e))?;
     Ok(())
+}
+
+/// What writing one fix did.
+#[derive(Debug, PartialEq, Eq)]
+enum FixWrite {
+    /// The patch is in place; the diagnosed source is kept at this backup.
+    Applied(PathBuf),
+    /// The file no longer is the file holding the diagnosed source; nothing was written.
+    Changed,
+}
+
+/// Replace the fixed file at `real` with `patched`, only while it still is a file holding the diagnosed `source`.
+///
+/// The file is judged at write time, through its held parent: its bytes are
+/// compared with `source` and its identity handed to the writer, which keeps
+/// the judged bytes (never the file as it is by then) in a backup slot and
+/// replaces the file only while it still is the one judged. `shown` is the
+/// path the user named, for the refusal.
+///
+/// # Errors
+/// [`CliError::ProjectRefused`] when every backup slot is taken;
+/// [`crate::output_dir::OutputRefusal::Symlink`] for a linked backup
+/// directory; otherwise the read's or the writer's own refusal.
+fn write_fix(shown: &Path, real: &Path, source: &str, patched: &str) -> Result<FixWrite, CliError> {
+    let parent_path = real.parent().unwrap_or(real);
+    let leaf = RelativeLeaf::under(parent_path, real)?;
+    let parent = HeldDir::open_following(parent_path)?
+        .ok_or_else(|| io_err(parent_path, std::io::ErrorKind::NotFound.into()))?;
+    let name = leaf.leaf();
+    let (now, id) = parent.read_file_capped_identified(name, crate::io_bounded::SOURCE_CAP)?;
+    if now != source {
+        return Ok(FixWrite::Changed);
+    }
+    let backups = parent.path().join(BACKUP_DIR);
+    match parent.replace_backed_up(
+        name.as_os_str(),
+        id,
+        source,
+        crate::io_bounded::SOURCE_CAP,
+        |staged| staged.write_all(patched.as_bytes()),
+    )? {
+        BackedUp::Done { backup, durability } => {
+            durability.report(shown);
+            Ok(FixWrite::Applied(backups.join(backup.slot().as_os_str())))
+        }
+        BackedUp::Changed => Ok(FixWrite::Changed),
+        BackedUp::BackupSlotsFull => Err(CliError::ProjectRefused(text::msg::fix_backups_full(
+            &shown.display(),
+            &backups.display(),
+            &BACKUP_SLOTS,
+        ))),
+    }
 }
 
 /// The diagnostic `ipe fix` may answer from `check`, or `None` once it has said why there is none.
@@ -4024,237 +4104,8 @@ pub fn read_yes_no_default(default: bool) -> bool {
     crate::prompt_reply::read_stdin_yes_no().consents(default, default)
 }
 
-/// Replace a user-owned file atomically.
-///
-/// Used for `ipe.lock`, a rewritten source, and a health config.
-///
-/// A sibling temp file is created exclusively and renamed over `target`
-/// (atomic on a single filesystem); on failure the temp file is removed.
-/// Build products never come here — they go through
-/// [`crate::output_dir::OwnedPath`]. Retries once, recreating the parent
-/// directory, when the write or rename fails with `NotFound`.
-///
-/// # Errors
-/// [`CliError::Io`] on a filesystem failure.
-pub fn write_atomic(target: &Path, contents: &str) -> Result<(), CliError> {
-    // Unique per process, call, and instant: the temp file is created
-    // exclusively, so a stale leftover of an earlier run can never collide.
-    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let dir = target.parent().filter(|p| !p.as_os_str().is_empty());
-    let name = target.file_name().map_or_else(
-        || String::from("source.ipe"),
-        |n| n.to_string_lossy().into_owned(),
-    );
-    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos());
-    let tmp_name = format!(".{name}.ipec-fix.{}.{seq}.{nanos}.tmp", std::process::id());
-    let tmp = match dir {
-        Some(d) => d.join(tmp_name),
-        None => PathBuf::from(tmp_name),
-    };
-
-    match write_and_rename(&tmp, target, contents) {
-        Ok(()) => Ok(()),
-        Err(CliError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(d) = dir {
-                fs::create_dir_all(d).map_err(|e| io_err(d, e))?;
-            }
-            write_and_rename(&tmp, target, contents)
-        }
-        Err(e) => Err(e),
-    }
-}
-
-/// Write `contents` to `tmp`, then rename it over `target`.
-///
-/// On a rename failure the temp file is removed so no debris is left behind.
-///
-/// `tmp` is created exclusively (`create_new`): a pre-existing file or symlink
-/// at that name is never truncated or written through. The replacement keeps
-/// `target`'s permission bits, so a rewrite never changes a file's mode.
-pub fn write_and_rename(tmp: &Path, target: &Path, contents: &str) -> Result<(), CliError> {
-    let written = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(tmp)
-        .and_then(|mut file| {
-            file.write_all(contents.as_bytes())?;
-            if let Ok(meta) = fs::metadata(target) {
-                file.set_permissions(meta.permissions())?;
-            }
-            Ok(())
-        });
-    if let Err(e) = written {
-        if e.kind() != std::io::ErrorKind::AlreadyExists {
-            let _ = fs::remove_file(tmp);
-        }
-        return Err(io_err(tmp, e));
-    }
-    if let Err(e) = fs::rename(tmp, target) {
-        let _ = fs::remove_file(tmp);
-        return Err(io_err(target, e));
-    }
-    Ok(())
-}
-
-/// Whether rewriting a user file can lose information the user may want back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RewriteKind {
-    /// Layout only, proven meaning-preserving (`ipe fmt`'s round-trip guard).
-    Lossless,
-    /// A change to the code itself (`ipe fix`, `lint --fix`, `init --force`).
-    ///
-    /// The original is copied to a backup first.
-    Lossy,
-}
-
 /// The directory, beside a rewritten file, that holds ipe's backup copies.
 pub const BACKUP_DIR: &str = ".ipe-backup";
-
-/// The most backup names tried for one file within the same nanosecond.
-const BACKUP_NAME_ATTEMPTS: u32 = 16;
-
-/// Rewrite a user-owned file the user named explicitly.
-///
-/// A symlink is resolved to the real file (the file the user edits); the
-/// original is copied to a backup first when the rewrite is
-/// [`RewriteKind::Lossy`]; then the file is replaced atomically — never
-/// truncated in place, so a crash mid-write leaves the original intact. Returns
-/// the backup path when one was made.
-///
-/// # Errors
-/// [`CliError::Io`] when the backup or the replacement fails; the original is
-/// untouched in either case.
-pub fn rewrite_user_file(
-    path: &Path,
-    contents: &str,
-    kind: RewriteKind,
-) -> Result<Option<PathBuf>, CliError> {
-    let real = fs::canonicalize(path).map_err(|e| io_err(path, e))?;
-    rewrite_real_file(&real, contents, kind)
-}
-
-/// A rewrite conditioned on the file still holding the bytes it was judged by.
-#[derive(Debug, PartialEq, Eq)]
-pub enum IfUnchanged {
-    /// The file was replaced; carries the backup path when one was made.
-    Written(Option<PathBuf>),
-    /// The file no longer holds the expected bytes and was left as it is.
-    Changed,
-}
-
-/// Rewrite the user-named file at `path` only while it still holds `expected`.
-///
-/// The file is re-read immediately before it is backed up and replaced, so an
-/// edit made to it after it was judged is never overwritten.
-///
-/// # Errors
-/// The re-read's own refusal; otherwise as [`rewrite_user_file`].
-pub fn rewrite_user_file_if_unchanged(
-    path: &Path,
-    expected: &str,
-    contents: &str,
-    kind: RewriteKind,
-) -> Result<IfUnchanged, CliError> {
-    let real = fs::canonicalize(path).map_err(|e| io_err(path, e))?;
-    let current = crate::io_bounded::read_user_named(&real, crate::io_bounded::SOURCE_CAP)?;
-    if current != expected {
-        return Ok(IfUnchanged::Changed);
-    }
-    rewrite_real_file(&real, contents, kind).map(IfUnchanged::Written)
-}
-
-/// Rewrite a user-owned file a directory walk under `root` reached.
-///
-/// As [`rewrite_user_file`], but the file must resolve inside `root`: a
-/// symlink leading out of the project is refused, never followed.
-///
-/// # Errors
-/// [`crate::output_dir::OutputRefusal::OutsideProject`] for a file escaping
-/// `root`; otherwise as [`rewrite_user_file`].
-pub fn rewrite_walked_file(
-    root: &Path,
-    path: &Path,
-    contents: &str,
-    kind: RewriteKind,
-) -> Result<Option<PathBuf>, CliError> {
-    let real = crate::output_dir::contained_in(root, path)?;
-    rewrite_real_file(&real, contents, kind)
-}
-
-/// Back `real` up when `kind` is lossy, then replace it atomically.
-fn rewrite_real_file(
-    real: &Path,
-    contents: &str,
-    kind: RewriteKind,
-) -> Result<Option<PathBuf>, CliError> {
-    let backup = match kind {
-        RewriteKind::Lossless => None,
-        RewriteKind::Lossy => Some(backup_user_file(real)?),
-    };
-    write_atomic(real, contents)?;
-    Ok(backup)
-}
-
-/// Copy `real` to `<its dir>/.ipe-backup/<name>.<nanos>.<n>`.
-///
-/// Each backup name is created exclusively, so no existing backup is replaced.
-/// The copy is created owner-only and then given the original's permission
-/// bits, so a private file never has a more readable backup, even briefly. A
-/// symlinked `.ipe-backup` is refused.
-///
-/// # Errors
-/// [`CliError::OutputRefused`] for a symlinked backup directory;
-/// [`CliError::Io`] on any filesystem failure, or when every candidate name is
-/// taken.
-pub fn backup_user_file(real: &Path) -> Result<PathBuf, CliError> {
-    let dir = real
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let name = real.file_name().map_or_else(
-        || String::from("source"),
-        |n| n.to_string_lossy().into_owned(),
-    );
-    let backup_dir = dir.join(BACKUP_DIR);
-    if fs::symlink_metadata(&backup_dir).is_ok_and(|m| m.file_type().is_symlink()) {
-        return Err(crate::output_dir::OutputRefusal::Symlink(backup_dir).into());
-    }
-    fs::create_dir_all(&backup_dir).map_err(|e| io_err(&backup_dir, e))?;
-    let permissions = fs::metadata(real)
-        .map_err(|e| io_err(real, e))?
-        .permissions();
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    for attempt in 0..BACKUP_NAME_ATTEMPTS {
-        let dest = backup_dir.join(format!("{name}.{stamp}.{attempt}"));
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        match options.open(&dest) {
-            Ok(mut copy) => {
-                let mut original = fs::File::open(real).map_err(|e| io_err(real, e))?;
-                std::io::copy(&mut original, &mut copy).map_err(|e| io_err(&dest, e))?;
-                copy.set_permissions(permissions)
-                    .map_err(|e| io_err(&dest, e))?;
-                return Ok(dest);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(io_err(&dest, e)),
-        }
-    }
-    Err(io_err(
-        &backup_dir,
-        std::io::Error::from(std::io::ErrorKind::AlreadyExists),
-    ))
-}
 
 pub fn io_err(path: &Path, source: std::io::Error) -> CliError {
     CliError::Io {
@@ -5713,5 +5564,144 @@ mod upgrade_agents_tests {
         for status in [GuideStatus::Current, GuideStatus::Unread(Unread::Link)] {
             assert!(guide_suggestion(&status).is_none(), "{status:?} is silent");
         }
+    }
+}
+
+#[cfg(test)]
+mod fix_tests {
+    use super::*;
+    use crate::output_dir::OutputRefusal;
+    use crate::output_dir::held::{Synced, set_sync_hook};
+
+    const DIAGNOSED: &str = "diagnosed\n";
+    const PATCHED: &str = "patched\n";
+
+    /// A fresh scratch directory holding `Main.ipe` with the diagnosed source, and that file.
+    fn project(name: &str) -> (PathBuf, PathBuf) {
+        let dir = ipe_test_temp::temp_root().join(format!("ipe-fix-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(fs::create_dir_all(&dir).is_ok(), "{}", dir.display());
+        let file = dir.join("Main.ipe");
+        assert!(fs::write(&file, DIAGNOSED).is_ok());
+        (dir, file)
+    }
+
+    /// How many entries `dir` lists.
+    fn entries(dir: &Path) -> usize {
+        fs::read_dir(dir).map_or(0, Iterator::count)
+    }
+
+    /// A fix of an unchanged file is written, the diagnosed source kept in a backup slot.
+    #[test]
+    fn fix_written_with_backup() {
+        let (dir, file) = project("written");
+        let res = write_fix(&file, &file, DIAGNOSED, PATCHED);
+        let backup = dir.join(BACKUP_DIR).join("Main.ipe.bak");
+        assert_eq!(res.ok(), Some(FixWrite::Applied(backup.clone())));
+        assert_eq!(fs::read_to_string(&file).unwrap_or_default(), PATCHED);
+        assert_eq!(fs::read_to_string(&backup).unwrap_or_default(), DIAGNOSED);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A file edited since it was diagnosed is left as it is, and no backup is made.
+    #[test]
+    fn fix_changed_left_alone() {
+        let (dir, file) = project("changed");
+        assert!(fs::write(&file, "edited\n").is_ok());
+        let res = write_fix(&file, &file, DIAGNOSED, PATCHED);
+        assert_eq!(res.ok(), Some(FixWrite::Changed));
+        assert_eq!(fs::read_to_string(&file).unwrap_or_default(), "edited\n");
+        assert_eq!(entries(&dir.join(BACKUP_DIR)), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The backup holds the bytes the fix was judged against, not the file as it was while the backup was made.
+    ///
+    /// The file is edited in place once the patch is staged and restored once
+    /// the backup slot is synced: a backup copied from the file would hold the
+    /// edit, the judged bytes never do.
+    #[test]
+    fn backup_from_judged_bytes() {
+        let (dir, file) = project("judged");
+        let edited = file.clone();
+        let mut restored = false;
+        set_sync_hook(Some(Box::new(move |synced, _| match synced {
+            Synced::Staged => {
+                let _ = fs::write(&edited, "edited\n");
+            }
+            Synced::Directory if !restored => {
+                restored = true;
+                let _ = fs::write(&edited, DIAGNOSED);
+            }
+            Synced::Directory => {}
+        })));
+        let res = write_fix(&file, &file, DIAGNOSED, PATCHED);
+        set_sync_hook(None);
+        let backup = dir.join(BACKUP_DIR).join("Main.ipe.bak");
+        assert_eq!(res.ok(), Some(FixWrite::Applied(backup.clone())));
+        assert_eq!(fs::read_to_string(&backup).unwrap_or_default(), DIAGNOSED);
+        assert_eq!(fs::read_to_string(&file).unwrap_or_default(), PATCHED);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A file named through a link is fixed at its real location, the link left a link.
+    ///
+    /// The backup sits beside the real file, never beside the link.
+    #[cfg(unix)]
+    #[test]
+    fn named_link_fix_writes_the_real_file() {
+        let (dir, real) = project("named-link");
+        let named = dir.join("named");
+        assert!(fs::create_dir_all(&named).is_ok());
+        let link = named.join("Link.ipe");
+        assert!(std::os::unix::fs::symlink(&real, &link).is_ok());
+        let resolved = fs::canonicalize(&link).unwrap_or_default();
+        let real_dir = resolved.parent().map(Path::to_path_buf).unwrap_or_default();
+        let res = write_fix(&link, &resolved, DIAGNOSED, PATCHED);
+        let backup = real_dir.join(BACKUP_DIR).join("Main.ipe.bak");
+        assert_eq!(res.ok(), Some(FixWrite::Applied(backup.clone())));
+        assert_eq!(fs::read_to_string(&real).unwrap_or_default(), PATCHED);
+        assert_eq!(fs::read_to_string(&backup).unwrap_or_default(), DIAGNOSED);
+        assert!(fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink()));
+        assert_eq!(entries(&named), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A backup directory that is a link is refused, the file and the link's target untouched.
+    #[cfg(unix)]
+    #[test]
+    fn backup_dir_link_refused() {
+        let (dir, file) = project("backup-link");
+        let elsewhere = dir.join("elsewhere");
+        assert!(fs::create_dir_all(&elsewhere).is_ok());
+        assert!(std::os::unix::fs::symlink(&elsewhere, dir.join(BACKUP_DIR)).is_ok());
+        let res = write_fix(&file, &file, DIAGNOSED, PATCHED);
+        assert!(
+            matches!(res, Err(CliError::OutputRefused(OutputRefusal::Symlink(_)))),
+            "{res:?}"
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap_or_default(), DIAGNOSED);
+        assert_eq!(entries(&elsewhere), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Every backup slot taken refuses the fix, the file untouched and no slot added.
+    #[test]
+    fn slots_full_refused() {
+        let (dir, file) = project("slots-full");
+        let backups = dir.join(BACKUP_DIR);
+        assert!(fs::create_dir_all(&backups).is_ok());
+        assert!(fs::write(backups.join("Main.ipe.bak"), "old\n").is_ok());
+        for n in 1..BACKUP_SLOTS {
+            assert!(fs::write(backups.join(format!("Main.ipe.bak.{n}")), "old\n").is_ok());
+        }
+        let res = write_fix(&file, &file, DIAGNOSED, PATCHED);
+        assert!(
+            matches!(&res, Err(CliError::ProjectRefused(m)) if m.contains(BACKUP_DIR) && m.contains("Main.ipe")),
+            "{res:?}"
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap_or_default(), DIAGNOSED);
+        assert_eq!(entries(&backups), usize::from(BACKUP_SLOTS));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

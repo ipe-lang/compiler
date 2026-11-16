@@ -482,6 +482,11 @@ pub enum OutputRefusal {
     /// On Windows an editor, a file indexer, or antivirus holding a file or
     /// directory without delete sharing blocks its removal until released.
     InUse(PathBuf),
+    /// A file the system refuses to let ipe replace.
+    ///
+    /// On Windows a read-only file, or one whose access list refuses this
+    /// user, cannot be renamed over; it is left as it was.
+    ReplaceDenied(PathBuf),
     /// Another ipe process still holds the directory's claim after the wait bound.
     ClaimBusy {
         /// The directory being claimed.
@@ -555,6 +560,7 @@ impl std::fmt::Display for OutputRefusal {
             Self::TooDeep { path, limit } => text::output_too_deep(&path.display(), limit),
             Self::ReparsePoint(p) => text::output_reparse_point(&p.display()),
             Self::InUse(p) => text::output_in_use(&p.display()),
+            Self::ReplaceDenied(p) => text::output_replace_denied(&p.display()),
             Self::ClaimBusy { dir, waited } => {
                 text::output_claim_busy(&dir.display(), &waited.as_secs(), &CLAIM_FILE)
             }
@@ -1423,29 +1429,6 @@ fn temp_suffix() -> String {
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     )
-}
-
-/// The canonical `path`, proven to lie under the canonical `root`.
-///
-/// A directory walk (fmt or `lint --fix` over a tree) rewrites only files that
-/// stay inside the project; a symlink leading out of it is refused. An explicitly
-/// named file is the user's own choice and does not go through this check.
-///
-/// # Errors
-/// [`OutputRefusal::OutsideProject`] when `path` escapes `root`;
-/// [`CliError::Io`] when either cannot be canonicalised.
-pub fn contained_in(root: &Path, path: &Path) -> Result<PathBuf, CliError> {
-    let real_root = std::fs::canonicalize(root).map_err(|e| io_err(root, e))?;
-    let real = std::fs::canonicalize(path).map_err(|e| io_err(path, e))?;
-    if real.starts_with(&real_root) {
-        Ok(real)
-    } else {
-        Err(OutputRefusal::OutsideProject {
-            path: path.to_path_buf(),
-            root: real_root,
-        }
-        .into())
-    }
 }
 
 /// Decide, without writing, whether the held level at `path` may become ipe output.
@@ -4266,28 +4249,6 @@ mod tests {
             matches!(refused(&result), Some(OutputRefusal::InsideSources { .. })),
             "a case variant of the source root must be refused, got {result:?}"
         );
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn walk_containment_refuses_a_symlink_out_of_the_project() {
-        let base = scratch("contain");
-        let proj = project(&base);
-        let outside = base.join("outside.ipe");
-        std::fs::write(&outside, "module X\n").expect("outside file");
-        let link = proj.root.join("src").join("Link.ipe");
-        plant_link(&outside, &link);
-        let result = contained_in(&proj.root, &link);
-        assert!(
-            matches!(
-                result,
-                Err(CliError::OutputRefused(
-                    OutputRefusal::OutsideProject { .. }
-                ))
-            ),
-            "a walk must not reach outside the project, got {result:?}"
-        );
-        assert!(contained_in(&proj.root, &proj.root.join("src").join("Main.ipe")).is_ok());
         let _ = std::fs::remove_dir_all(&base);
     }
 
