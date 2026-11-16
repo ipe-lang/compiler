@@ -395,3 +395,98 @@ fn webview_counter_tier_b() -> Result<(), BoxError> {
         .into())
     }
 }
+
+/// A `web client desktop` project with the counter as its program and
+/// `mobile` as its `delivery.mobile` record.
+fn client_desktop_fixture(test_name: &str, mobile: &str) -> Result<ipe::RootFixture, BoxError> {
+    let tree = ipe::project_root::SourceTree::main(IPE_WEB_COUNTER)
+        .field(&format!("delivery = {{ mobile = {mobile} }}"));
+    ipe::RootFixture::from_tree(&tree)
+        .map_err(|e| -> BoxError { format!("{test_name}: fixture: {e}").into() })
+}
+
+/// `ipe dev build <project> web client desktop`, its output captured.
+fn dev_build_client_desktop(project: &std::path::Path) -> std::io::Result<std::process::Output> {
+    std::process::Command::new(e2e_support::cargo_bin!("ipe").into_path_buf())
+        .arg("dev")
+        .arg("build")
+        .arg(project)
+        .args(["web", "client", "desktop"])
+        .output()
+}
+
+/// A bundle id the bundle grammar admits but no OS can name a directory by is
+/// refused before any build: the command fails, names the id, and writes no
+/// shell crate.
+#[test]
+fn client_desktop_refuses_a_dos_device_bundle_id() -> Result<(), BoxError> {
+    let test_name = "client_desktop_dos_device";
+    let fixture = client_desktop_fixture(test_name, "{ bundleId = \"con.acme\" }")?;
+    let out = dev_build_client_desktop(fixture.path())?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("con.acme"), "{stderr}");
+    assert!(
+        !fixture.path().join("out").join("client-shell").exists(),
+        "no shell crate is written for a refused bundle id"
+    );
+    Ok(())
+}
+
+/// The policy value one `<meta http-equiv="Content-Security-Policy">` in
+/// `page` carries.
+fn meta_policy(page: &str) -> Option<&str> {
+    let (_, after) = page.split_once("http-equiv=\"Content-Security-Policy\" content=\"")?;
+    after.split_once('"').map(|(value, _)| value)
+}
+
+/// The `csp` literal `site.rs` carries, still in its Rust-literal form.
+fn site_policy(site_rs: &str) -> Option<&str> {
+    site_rs
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("csp: \""))
+        .and_then(|rest| rest.strip_suffix("\","))
+}
+
+/// SEAL, Tier-A: `ipe dev build web client desktop` on the counter builds the
+/// wasm client, writes the shell crate with every published file in its table
+/// and one policy for the page and the header, and the shell crate builds.
+#[test]
+fn client_desktop_shell_builds() -> Result<(), BoxError> {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return Ok(());
+    }
+    let test_name = "client_desktop_shell_builds";
+    let fixture = client_desktop_fixture(test_name, "{ bundleId = \"io.acme.counter\" }")?;
+    let out = dev_build_client_desktop(fixture.path())?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() && stderr.contains("pkg-config exited with status code 1") {
+        println!(
+            "LOUD-SKIP: Tier-A (client desktop shell build) — system `webkit2gtk`/`glib` \
+             dev packages not installed on this runner. Install \
+             `libwebkit2gtk-4.1-dev libglib2.0-dev` to run this test for real."
+        );
+        return Ok(());
+    }
+    assert!(out.status.success(), "{stderr}");
+
+    let shell = fixture.path().join("out").join("client-shell");
+    let site_rs = std::fs::read_to_string(shell.join("src").join("site.rs"))?;
+    let index = std::fs::read_to_string(shell.join("www").join("index.html"))?;
+    assert!(
+        site_rs.contains("storage_key: \"io.acme.counter\","),
+        "{site_rs}"
+    );
+    assert!(site_rs.contains("path: \"index.html\","), "{site_rs}");
+    // A policy value holds no `"` or backslash, so its Rust literal is its text.
+    let Some(header) = site_policy(&site_rs).filter(|value| !value.contains('\\')) else {
+        return Err(format!("{test_name}: no plain `csp` literal in site.rs:\n{site_rs}").into());
+    };
+    let shown = ipe_runtime_rust::escape::html_attr(header);
+    assert_eq!(
+        meta_policy(&index),
+        Some(shown.as_str()),
+        "the page and the header carry one policy"
+    );
+    Ok(())
+}

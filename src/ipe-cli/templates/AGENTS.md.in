@@ -31,7 +31,7 @@ ipe dev run                   # build + run
 | terminal UI | tui | `Ipe.Tea.Tui.tea { ... }` |
 | HTTP/JSON API, SSE, WebSocket | server | `Server.listen 8000 [ ... ]` |
 | web app (TEA) | web | `Ipe.Tea.Web.tea { ... }` |
-| desktop / mobile | web + host | `Ipe.Tea.Web.tea` + `ipe dev build web desktop` / `ipe release build web client ios` |
+| desktop / mobile | web + host | `Ipe.Tea.Web.tea` + `ipe dev build web desktop` / `ipe release build web client desktop` / `ipe release build web client ios` |
 | view-less managed loop | worker | `Ipe.Tea.Worker.tea { ... }` |
 
 `ipe init [<dir>] [<shape>]` scaffolds. Shapes: `script | cli | tui | server | web | worker` (default `web`).
