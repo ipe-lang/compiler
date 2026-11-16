@@ -250,17 +250,18 @@ pub enum Handled {
     Started,
     /// An earlier opener is still running.
     Busy,
-    /// An opener started less than [`OPENER_INTERVAL`] ago.
+    /// An opener launch was attempted less than [`OPENER_INTERVAL`] ago.
     RateLimited,
     /// No opener started.
     Failed,
 }
 
-/// The opener worker's state: at most one live opener, at most one start per interval.
+/// The opener worker's state: at most one live opener, at most one launch attempt per interval.
 pub struct OpenerWorker<C: Clock, L: Launcher> {
     clock: C,
     launcher: L,
     live: Option<L::Live>,
+    /// When the last launch was attempted, whether or not an opener started.
     last_start: Option<Duration>,
 }
 
@@ -295,10 +296,11 @@ impl<C: Clock, L: Launcher> OpenerWorker<C, L> {
         {
             return Handled::RateLimited;
         }
+        // A failed launch still forked: the interval bounds attempts, not successes.
+        self.last_start = Some(now);
         match self.launcher.launch(url) {
             Some(live) => {
                 self.live = Some(live);
-                self.last_start = Some(now);
                 Handled::Started
             }
             None => Handled::Failed,
@@ -606,6 +608,42 @@ mod tests {
             opener.offer(url.clone());
         }
         assert_eq!(rx.try_iter().count(), 1, "one offer queued at most");
+    }
+
+    struct FailingLauncher(Rc<Cell<usize>>);
+
+    impl Launcher for FailingLauncher {
+        type Live = FakeLive;
+
+        fn launch(&mut self, _url: &BrowserUrl) -> Option<FakeLive> {
+            self.0.set(self.0.get().saturating_add(1));
+            None
+        }
+    }
+
+    /// A launch that starts no opener still spends the interval, so a page
+    /// looping `window.open` on a host with no working opener cannot drive an
+    /// unbounded spawn rate.
+    #[test]
+    fn failed_opener_launch_is_rate_limited() {
+        let Ok(url) = BrowserUrl::parse("https://example.com/", BrowserOrigin::ExternalHttps)
+        else {
+            return;
+        };
+        let time = Rc::new(Cell::new(Duration::from_secs(10)));
+        let attempts = Rc::new(Cell::new(0));
+        let mut worker = OpenerWorker::new(
+            FakeClock(Rc::clone(&time)),
+            FailingLauncher(Rc::clone(&attempts)),
+        );
+        assert_eq!(worker.handle(&url), Handled::Failed);
+        for _ in 0..100 {
+            assert_eq!(worker.handle(&url), Handled::RateLimited);
+        }
+        assert_eq!(attempts.get(), 1, "one launch attempt per interval");
+        time.set(Duration::from_millis(11_000));
+        assert_eq!(worker.handle(&url), Handled::Failed);
+        assert_eq!(attempts.get(), 2);
     }
 
     #[test]
